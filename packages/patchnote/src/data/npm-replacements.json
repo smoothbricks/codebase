@@ -1,0 +1,572 @@
+{
+  "airbnb-prop-types": {
+    "replacementName": "prop-types-tools",
+    "replacementVersion": "2.17.0",
+    "description": "`airbnb-prop-types` was given to a new maintainer and renamed to `prop-types-tools`."
+  },
+  "apollo-server": {
+    "replacementName": "@apollo/server",
+    "replacementVersion": "4.0.0",
+    "description": "`apollo-server` packages became scoped."
+  },
+  "apollo-server-core": {
+    "replacementName": "@apollo/server",
+    "replacementVersion": "4.0.0",
+    "description": "`apollo-server` packages became scoped."
+  },
+  "apollo-server-express": {
+    "replacementName": "@apollo/server",
+    "replacementVersion": "4.0.0",
+    "description": "`apollo-server` packages became scoped."
+  },
+  "apollo-server-errors": {
+    "replacementName": "@apollo/server",
+    "replacementVersion": "4.0.0",
+    "description": "`apollo-server` packages became scoped."
+  },
+  "apollo-server-types": {
+    "replacementName": "@apollo/server",
+    "replacementVersion": "4.0.0",
+    "description": "`apollo-server` packages became scoped."
+  },
+  "apollo-server-plugin-base": {
+    "replacementName": "@apollo/server",
+    "replacementVersion": "4.0.0",
+    "description": "`apollo-server` packages became scoped."
+  },
+  "apollo-datasource-rest": {
+    "replacementName": "@apollo/datasource-rest",
+    "replacementVersion": "4.0.0",
+    "description": "`apollo-server` packages became scoped."
+  },
+  "apollo-server-plugin-response-cache": {
+    "replacementName": "@apollo/server-plugin-response-cache",
+    "replacementVersion": "4.0.0",
+    "description": "`apollo-server` packages became scoped."
+  },
+  "apollo-server-plugin-operation-registry": {
+    "replacementName": "@apollo/server-plugin-operation-registry",
+    "replacementVersion": "3.5.6",
+    "description": "`apollo-server` packages became scoped."
+  },
+  "apollo-reporting-protobuf": {
+    "replacementName": "@apollo/usage-reporting-protobuf",
+    "replacementVersion": "4.0.0",
+    "description": "`apollo-server` packages became scoped."
+  },
+  "babel-eslint": {
+    "replacementName": "@babel/eslint-parser",
+    "replacementVersion": "7.11.0",
+    "description": "`babel-eslint` was renamed under the `@babel` scope."
+  },
+  "@base-ui-components/react": {
+    "replacementName": "@base-ui/react",
+    "replacementVersion": "1.0.0",
+    "description": "`@base-ui-components/react` was renamed to `@base-ui/react`."
+  },
+  "clang-format": {
+    "replacementName": "clang-format-node",
+    "replacementVersion": "2.0.0",
+    "description": "Maintenance fork of `clang-format`"
+  },
+  "cpx": {
+    "replacementName": "cpx2",
+    "replacementVersion": "2.0.0",
+    "description": "Maintenance fork of `cpx`"
+  },
+  "cucumber": {
+    "replacementName": "@cucumber/cucumber",
+    "replacementVersion": "7.0.0",
+    "description": "`cucumber` became scoped."
+  },
+  "eslint-config-standard-with-typescript": {
+    "replacementName": "eslint-config-love",
+    "replacementVersion": "43.1.0",
+    "description": "`eslint-config-standard-with-typescript` was renamed to `eslint-config-love`."
+  },
+  "eslint-plugin-eslint-comments": {
+    "replacementName": "@eslint-community/eslint-plugin-eslint-comments",
+    "replacementVersion": "3.2.0",
+    "description": "Replace `eslint-plugin-eslint-comments` with a maintained fork: `@eslint-community/eslint-plugin-eslint-comments`."
+  },
+  "eslint-plugin-node": {
+    "replacementName": "eslint-plugin-n",
+    "replacementVersion": "14.0.0",
+    "description": "Replace stale `eslint-plugin-node` with a maintained fork: `eslint-plugin-n`."
+  },
+  "eslint-plugin-vitest": {
+    "replacementName": "@vitest/eslint-plugin",
+    "replacementVersion": "1.0.1",
+    "description": "`eslint-plugin-vitest` became scoped."
+  },
+  "express-mung": {
+    "replacementName": "express-response-middleware",
+    "replacementVersion": "1.0.0",
+    "description": "Replace stale `express-mung` with a maintained fork: `express-response-middleware`."
+  },
+  "faker": {
+    "replacementName": "@faker-js/faker",
+    "replacementVersion": "1.1.0",
+    "description": "`fakerjs` packages became scoped."
+  },
+  "fastify-accepts-serializer": {
+    "replacementName": "@fastify/accepts-serializer",
+    "replacementVersion": "4.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-accepts": {
+    "replacementName": "@fastify/accepts",
+    "replacementVersion": "3.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-auth": {
+    "replacementName": "@fastify/auth",
+    "replacementVersion": "2.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-autoload": {
+    "replacementName": "@fastify/autoload",
+    "replacementVersion": "4.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-awilix": {
+    "replacementName": "@fastify/awilix",
+    "replacementVersion": "2.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-basic-auth": {
+    "replacementName": "@fastify/basic-auth",
+    "replacementVersion": "3.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-bearer-auth": {
+    "replacementName": "@fastify/bearer-auth",
+    "replacementVersion": "7.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-caching": {
+    "replacementName": "@fastify/caching",
+    "replacementVersion": "7.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-circuit-breaker": {
+    "replacementName": "@fastify/circuit-breaker",
+    "replacementVersion": "2.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-compress": {
+    "replacementName": "@fastify/compress",
+    "replacementVersion": "5.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-cookie": {
+    "replacementName": "@fastify/cookie",
+    "replacementVersion": "6.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-cors": {
+    "replacementName": "@fastify/cors",
+    "replacementVersion": "7.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-diagnostics-channel": {
+    "replacementName": "@fastify/diagnostics-channel",
+    "replacementVersion": "2.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-elasticsearch": {
+    "replacementName": "@fastify/elasticsearch",
+    "replacementVersion": "2.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-env": {
+    "replacementName": "@fastify/env",
+    "replacementVersion": "3.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-error": {
+    "replacementName": "@fastify/error",
+    "replacementVersion": "2.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-etag": {
+    "replacementName": "@fastify/etag",
+    "replacementVersion": "3.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-express": {
+    "replacementName": "@fastify/express",
+    "replacementVersion": "1.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-flash": {
+    "replacementName": "@fastify/flash",
+    "replacementVersion": "4.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-formbody": {
+    "replacementName": "@fastify/formbody",
+    "replacementVersion": "6.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-funky": {
+    "replacementName": "@fastify/funky",
+    "replacementVersion": "2.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-helmet": {
+    "replacementName": "@fastify/helmet",
+    "replacementVersion": "8.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-hotwire": {
+    "replacementName": "@fastify/hotwire",
+    "replacementVersion": "1.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-http-proxy": {
+    "replacementName": "@fastify/http-proxy",
+    "replacementVersion": "7.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-jwt": {
+    "replacementName": "@fastify/jwt",
+    "replacementVersion": "5.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-kafka": {
+    "replacementName": "@fastify/kafka",
+    "replacementVersion": "1.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-leveldb": {
+    "replacementName": "@fastify/leveldb",
+    "replacementVersion": "4.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-mongodb": {
+    "replacementName": "@fastify/mongodb",
+    "replacementVersion": "5.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-multipart": {
+    "replacementName": "@fastify/multipart",
+    "replacementVersion": "6.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-mysql": {
+    "replacementName": "@fastify/mysql",
+    "replacementVersion": "3.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-nextjs": {
+    "replacementName": "@fastify/nextjs",
+    "replacementVersion": "8.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-oauth2": {
+    "replacementName": "@fastify/oauth2",
+    "replacementVersion": "5.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-passport": {
+    "replacementName": "@fastify/passport",
+    "replacementVersion": "1.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-postgres": {
+    "replacementName": "@fastify/postgres",
+    "replacementVersion": "4.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-rate-limit": {
+    "replacementName": "@fastify/rate-limit",
+    "replacementVersion": "6.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-redis": {
+    "replacementName": "@fastify/redis",
+    "replacementVersion": "5.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-reply-from": {
+    "replacementName": "@fastify/reply-from",
+    "replacementVersion": "7.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-request-context": {
+    "replacementName": "@fastify/request-context",
+    "replacementVersion": "3.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-response-validation": {
+    "replacementName": "@fastify/response-validation",
+    "replacementVersion": "1.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-routes-stats": {
+    "replacementName": "@fastify/routes-stats",
+    "replacementVersion": "3.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-routes": {
+    "replacementName": "@fastify/routes",
+    "replacementVersion": "4.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-schedule": {
+    "replacementName": "@fastify/schedule",
+    "replacementVersion": "2.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-secure-session": {
+    "replacementName": "@fastify/secure-session",
+    "replacementVersion": "4.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-sensible": {
+    "replacementName": "@fastify/sensible",
+    "replacementVersion": "4.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-soap-client": {
+    "replacementName": "@fastify/soap-client",
+    "replacementVersion": "1.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-static": {
+    "replacementName": "@fastify/static",
+    "replacementVersion": "5.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-swagger": {
+    "replacementName": "@fastify/swagger",
+    "replacementVersion": "6.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-url-data": {
+    "replacementName": "@fastify/url-data",
+    "replacementVersion": "4.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-websocket": {
+    "replacementName": "@fastify/websocket",
+    "replacementVersion": "5.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "fastify-zipkin": {
+    "replacementName": "@fastify/zipkin",
+    "replacementVersion": "3.0.0",
+    "description": "`fastify` packages became scoped."
+  },
+  "framer-motion": {
+    "replacementName": "motion",
+    "replacementVersion": "",
+    "description": "`framer-motion` and Motion One have merged under the package name `motion`, though `framer-motion` is still being published. `motion` is now the recommended name."
+  },
+  "hapi": {
+    "replacementName": "@hapi/hapi",
+    "replacementVersion": "18.2.0",
+    "description": "`hapi` became scoped."
+  },
+  "jade": {
+    "replacementName": "pug",
+    "replacementVersion": "2.0.0",
+    "description": "Jade was renamed to Pug."
+  },
+  "joi": {
+    "replacementName": "@hapi/joi",
+    "replacementVersion": "14.4.0",
+    "description": "`joi` became scoped under the `hapi` organization."
+  },
+  "@hapi/joi": {
+    "replacementName": "joi",
+    "replacementVersion": "17.1.1",
+    "description": "`joi` was moved out of the `hapi` organization."
+  },
+  "mem": {
+    "replacementName": "memoize",
+    "replacementVersion": "10.0.0",
+    "description": "`mem` was renamed to `memoize`."
+  },
+  "middie": {
+    "replacementName": "@fastify/middie",
+    "replacementVersion": "8.0.0",
+    "description": "`middie` became scoped."
+  },
+  "now": {
+    "replacementName": "vercel",
+    "replacementVersion": "21.0.0",
+    "description": "`now` was renamed to `vercel`."
+  },
+  "npm-run-all": {
+    "replacementName": "npm-run-all2",
+    "replacementVersion": "5.0.0",
+    "description": "Maintenance fork of `npm-run-all`"
+  },
+  "@parcel/css": {
+    "replacementName": "lightningcss",
+    "replacementVersion": "1.14.0",
+    "description": "`@parcel/css` was renamed to `lightningcss`."
+  },
+  "passport-saml": {
+    "replacementName": "@node-saml/passport-saml",
+    "replacementVersion": "4.0.4",
+    "description": "`passport-saml` was renamed to `@node-saml/passport-saml`."
+  },
+  "react-query/devtools": {
+    "replacementName": "@tanstack/react-query-devtools",
+    "replacementVersion": "4.0.0",
+    "description": "`react-query/devtools` became scoped under the `tanstack` organization."
+  },
+  "react-query": {
+    "replacementName": "@tanstack/react-query",
+    "replacementVersion": "4.0.5",
+    "description": "`react-query` became scoped under the `tanstack` organization."
+  },
+  "react-scripts-ts": {
+    "replacementName": "react-scripts",
+    "replacementVersion": "2.1.8",
+    "description": "`react-scripts` supports TypeScript since version `2.1.0`."
+  },
+  "read-pkg-up": {
+    "replacementName": "read-package-up",
+    "replacementVersion": "11.0.0",
+    "description": "`read-pkg-up` was renamed to `read-package-up`."
+  },
+  "redux-devtools-extension": {
+    "replacementName": "@redux-devtools/extension",
+    "replacementVersion": "3.0.0",
+    "description": "The `redux-devtools-extension` package was renamed to `@redux-devtools/extension`."
+  },
+  "@renovate/pep440": {
+    "replacementName": "@renovatebot/pep440",
+    "replacementVersion": "1.0.0",
+    "description": "The `@renovate/pep440` package was renamed to `@renovatebot/pep440`."
+  },
+  "rolldown-vite": {
+    "replacementName": "vite",
+    "replacementVersion": "8.0.0",
+    "description": "`rolldown-vite` was merged to `vite` in version 8.0.0."
+  },
+  "rollup-plugin-babel": {
+    "replacementName": "@rollup/plugin-babel",
+    "replacementVersion": "5.0.0",
+    "description": "The babel plugin for rollup became scoped."
+  },
+  "rollup-plugin-json": {
+    "replacementName": "@rollup/plugin-json",
+    "replacementVersion": "4.0.0",
+    "description": "The json plugin for rollup became scoped."
+  },
+  "rollup-plugin-node-resolve": {
+    "replacementName": "@rollup/plugin-node-resolve",
+    "replacementVersion": "6.0.0",
+    "description": "The node-resolve plugin for rollup became scoped."
+  },
+  "rollup-plugin-terser": {
+    "replacementName": "@rollup/plugin-terser",
+    "replacementVersion": "0.1.0",
+    "description": "The terser plugin for rollup became scoped."
+  },
+  "rome": {
+    "replacementName": "@biomejs/biome",
+    "replacementVersion": "1.0.0",
+    "description": "The Rome repository is archived, and Biome is the community replacement. Read [the Biome announcement](https://biomejs.dev/blog/annoucing-biome/) for migration instructions."
+  },
+  "@google/semantic-release-replace-plugin": {
+    "replacementName": "semantic-release-replace-plugin",
+    "replacementVersion": "1.2.1",
+    "description": "`semantic-release-replace-plugin` was moved out of the `google` organization."
+  },
+  "standard-version": {
+    "replacementName": "commit-and-tag-version",
+    "replacementVersion": "9.5.0",
+    "description": "`standard-version` is now maintained as `commit-and-tag-version`."
+  },
+  "@tsconfig/node10": {
+    "replacementName": "@tsconfig/node12",
+    "replacementVersion": "12.1.0",
+    "description": "`@tsconfig-bases` node updates."
+  },
+  "@tsconfig/node12": {
+    "replacementName": "@tsconfig/node14",
+    "replacementVersion": "14.1.0",
+    "description": "`@tsconfig-bases` node updates."
+  },
+  "@tsconfig/node14": {
+    "replacementName": "@tsconfig/node16",
+    "replacementVersion": "16.1.0",
+    "description": "`@tsconfig-bases` node updates."
+  },
+  "@tsconfig/node16": {
+    "replacementName": "@tsconfig/node18",
+    "replacementVersion": "18.2.0",
+    "description": "`@tsconfig-bases` node updates."
+  },
+  "@tsconfig/node17": {
+    "replacementName": "@tsconfig/node18",
+    "replacementVersion": "18.2.0",
+    "description": "`@tsconfig-bases` node updates."
+  },
+  "@tsconfig/node18": {
+    "replacementName": "@tsconfig/node20",
+    "replacementVersion": "20.1.0",
+    "description": "`@tsconfig-bases` node updates."
+  },
+  "@tsconfig/node19": {
+    "replacementName": "@tsconfig/node20",
+    "replacementVersion": "20.1.0",
+    "description": "`@tsconfig-bases` node updates."
+  },
+  "@tsconfig/node20": {
+    "replacementName": "@tsconfig/node22",
+    "replacementVersion": "22.0.0",
+    "description": "`@tsconfig-bases` node updates."
+  },
+  "@tsconfig/node21": {
+    "replacementName": "@tsconfig/node22",
+    "replacementVersion": "22.0.0",
+    "description": "`@tsconfig-bases` node updates."
+  },
+  "@tsconfig/node22": {
+    "replacementName": "@tsconfig/node24",
+    "replacementVersion": "24.0.0",
+    "description": "`@tsconfig-bases` node updates."
+  },
+  "@tsconfig/node23": {
+    "replacementName": "@tsconfig/node24",
+    "replacementVersion": "24.0.0",
+    "description": "`@tsconfig-bases` node updates."
+  },
+  "typeorm-seeding": {
+    "replacementName": "@jorgebodega/typeorm-seeding",
+    "replacementVersion": "2.0.0",
+    "description": "`typeorm-seeding` is now maintained as scoped package."
+  },
+  "@vitest/coverage-c8": {
+    "replacementName": "@vitest/coverage-v8",
+    "replacementVersion": "0.33.0",
+    "description": "`@vitest/coverage-c8` was renamed to `@vitest/coverage-v8`."
+  },
+  "vso-task-lib": {
+    "replacementName": "azure-pipelines-task-lib",
+    "replacementVersion": "3.4.0",
+    "description": "The `vso-task-lib` package is now published as `azure-pipelines-task-lib`."
+  },
+  "vsts-task-lib": {
+    "replacementName": "azure-pipelines-task-lib",
+    "replacementVersion": "3.4.0",
+    "description": "The `vsts-task-lib` package is now published as `azure-pipelines-task-lib`."
+  },
+  "xmldom": {
+    "replacementName": "@xmldom/xmldom",
+    "replacementVersion": "0.7.5",
+    "description": "The `xmldom` package is now published as `@xmldom/xmldom`."
+  },
+  "xmldom-alpha": {
+    "replacementName": "@xmldom/xmldom",
+    "replacementVersion": "0.7.5",
+    "description": "The `xmldom` package is now published as `@xmldom/xmldom`."
+  }
+}

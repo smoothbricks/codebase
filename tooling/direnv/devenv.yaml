@@ -8,7 +8,7 @@ inputs:
     overlays:
       - default
   git-format-staged:
-    url: github:smoothbricks/git-format-staged
+    url: github:smoothbricks/git-format-staged/v1.0.0
     flake: true
   zig:
     url: github:mitchellh/zig-overlay

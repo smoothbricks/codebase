@@ -69,6 +69,10 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      # Step 15
+      - name: 🚀 Smoke Tests
+        run: ./github-ci.sh nx-affected smoke-test "Smoke Tests" 15
+
       # --- Cleanup ------------------------------------------------------------
 
       # Step 10

@@ -1,0 +1,109 @@
+name: 'patchnote Action'
+description: 'Run patchnote in GitHub Actions using the smoothbricks monorepo subpath action'
+author: 'smoothbricks'
+
+inputs:
+  config-path:
+    description: 'Path to a patchnote config file relative to the repository root'
+    required: false
+    default: ''
+  dry-run:
+    description: 'Run patchnote without creating branches, commits, or PRs'
+    required: false
+    default: 'false'
+  skip-ai:
+    description: 'Skip AI changelog analysis'
+    required: false
+    default: 'false'
+  token:
+    description: 'GitHub token for gh CLI operations; falls back to github.token when omitted'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ inputs.token || github.token }}
+
+    - name: Install Nix
+      if: ${{ hashFiles('**/devenv.yaml') != '' }}
+      uses: DeterminateSystems/nix-installer-action@main
+
+    - name: Setup Nix cache
+      if: ${{ hashFiles('**/devenv.yaml') != '' }}
+      uses: DeterminateSystems/magic-nix-cache-action@main
+
+    - name: Install devenv and nvfetcher
+      if: ${{ hashFiles('**/devenv.yaml') != '' }}
+      shell: bash
+      run: nix profile install nixpkgs#devenv nixpkgs#nvfetcher
+
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: latest
+
+    - name: Configure git
+      shell: bash
+      run: |
+        git config user.name 'github-actions[bot]'
+        git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+    - name: Install action dependencies
+      shell: bash
+      env:
+        ACTION_REPO_ROOT: ${{ github.action_path }}/../..
+      run: bun install --cwd "$ACTION_REPO_ROOT" --frozen-lockfile
+
+    - name: Build local patchnote CLI
+      shell: bash
+      env:
+        ACTION_REPO_ROOT: ${{ github.action_path }}/../..
+      run: bun run --cwd "$ACTION_REPO_ROOT/packages/patchnote" build
+
+    - name: Run patchnote
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token || github.token }}
+        ACTION_REPO_ROOT: ${{ github.action_path }}/../..
+      run: |
+        set -euo pipefail
+
+        CLI="$ACTION_REPO_ROOT/packages/patchnote/dist/cli.js"
+
+        # Build base args from inputs
+        EXTRA_ARGS=()
+        if [[ "${{ inputs.dry-run }}" == 'true' ]]; then
+          EXTRA_ARGS+=(--dry-run)
+        fi
+        if [[ "${{ inputs.skip-ai }}" == 'true' ]]; then
+          EXTRA_ARGS+=(--skip-ai)
+        fi
+        if [[ -n "${{ inputs.config-path }}" ]]; then
+          EXTRA_ARGS+=(--config-path "${{ inputs.config-path }}")
+        fi
+
+        # Route: no config -> onboard, config + onboarding PR -> skip, config -> update-deps
+        if [[ ! -f "tooling/patchnote.json" ]] && [[ ! -f "tooling/patchnote.ts" ]]; then
+          echo "::notice::No patchnote config found. Creating onboarding PR."
+          node "$CLI" onboard --verbose "${EXTRA_ARGS[@]}"
+        else
+          # Check if onboarding PR is still open (guard against running updates before config is reviewed)
+          ONBOARD_PR=$(gh pr list --head chore/configure-patchnote --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [[ -n "$ONBOARD_PR" ]]; then
+            echo "::notice::Onboarding PR #$ONBOARD_PR is still open. Skipping dependency updates until it is merged."
+
+            # Re-render onboarding PR body with fresh preview
+            node "$CLI" onboard --verbose "${EXTRA_ARGS[@]}"
+          else
+            node "$CLI" update-deps --verbose "${EXTRA_ARGS[@]}"
+          fi
+        fi
+
+branding:
+  icon: 'git-pull-request'
+  color: 'blue'

@@ -1,0 +1,104 @@
+# Automated dependency updates with patchnote{{AI_HEADER_SUFFIX}}
+#
+# This workflow is intentionally thin. The runtime logic lives in the
+# published patchnote action at `smoothbricks/codebase/packages/patchnote-action@feat/add-dep-updater-package`.
+#
+# Authentication: Auto-detected at runtime
+#   - If PATCHNOTE_APP_ID is set -> GitHub App mode (recommended)
+#   - Otherwise -> PAT mode (uses PATCHNOTE_TOKEN secret)
+#
+# Setup options:
+#
+#   Zero config: Works out of the box using the built-in GITHUB_TOKEN.
+#     Note: PRs created this way won't trigger other workflows (GitHub limitation).
+#
+#   Option A: Personal Access Token (5 minutes)
+#     1. Generate PAT: https://github.com/settings/tokens/new (scope: repo)
+#     2. Add organization secret: PATCHNOTE_TOKEN
+#
+#   Option B: GitHub App (15 minutes, recommended for organizations)
+#     1. Create GitHub App with permissions: contents:write, pull-requests:write
+#     2. Install app to repository
+#     3. Add organization variable: PATCHNOTE_APP_ID
+#     4. Add organization secret: PATCHNOTE_APP_PRIVATE_KEY
+#
+# Optional: AI Changelog Analysis
+#   - Free: Add GEMINI_API_KEY secret (get free key at aistudio.google.com/apikey)
+#   - Paid: Add ZAI_API_KEY secret for Z.AI GLM-5-Turbo{{AI_SETUP_NOTE}}
+#   - Disable: Set repository variable PATCHNOTE_SKIP_AI=true
+#
+# 📖 Full guide: https://github.com/smoothbricks/smoothbricks/blob/main/packages/patchnote/docs/GETTING-STARTED.md
+
+name: {{WORKFLOW_NAME}}
+
+on:
+  push:
+    branches: ['{{BASE_BRANCH}}']
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '{{SCHEDULE}}'
+  workflow_dispatch:
+    inputs:
+      command:
+        description: 'Command to run'
+        required: false
+        default: 'update-deps'
+        type: choice
+        options:
+          - update-deps
+          - rebase-open-prs
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-deps:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.command == 'update-deps' || inputs.command == ''))
+    runs-on: ubuntu-latest
+
+    steps:
+      # GitHub App token generation (skipped if PATCHNOTE_APP_ID not set)
+      - name: Generate GitHub App token
+        if: ${{ vars.PATCHNOTE_APP_ID != '' }}
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.PATCHNOTE_APP_ID }}
+          private-key: ${{ secrets.PATCHNOTE_APP_PRIVATE_KEY }}
+
+      - name: Run patchnote action
+        uses: smoothbricks/codebase/packages/patchnote-action@feat/add-dep-updater-package
+        with:
+          token: ${{ steps.app-token.outputs.token || secrets.PATCHNOTE_TOKEN || github.token }}
+          skip-ai: "{{SKIP_AI_INPUT}}"{{CONFIG_PATH_BLOCK}}{{AI_ENV_VAR}}
+
+  rebase-open-prs:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.command == 'rebase-open-prs')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: patchnote-rebase
+      cancel-in-progress: true
+
+    steps:
+      - name: Generate GitHub App token
+        if: ${{ vars.PATCHNOTE_APP_ID != '' }}
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.PATCHNOTE_APP_ID }}
+          private-key: ${{ secrets.PATCHNOTE_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token || secrets.PATCHNOTE_TOKEN || github.token }}
+
+      - uses: oven-sh/setup-bun@v2
+
+      - run: bun install --frozen-lockfile
+
+      - name: Rebase open PRs
+        run: bunx @smoothbricks/patchnote rebase-open-prs
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.PATCHNOTE_TOKEN || github.token }}
