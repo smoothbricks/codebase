@@ -48,6 +48,8 @@ export class SQLiteTraceWriter {
   }
 
   private init(): void {
+    // Parallel Bun test workers share one trace DB, so wait for short SQLite writer locks instead of failing setup.
+    this.db.exec('PRAGMA busy_timeout = 10000');
     this.db.exec(SPANS_TABLE_INIT_SQL);
 
     this.refreshKnownColumns();
