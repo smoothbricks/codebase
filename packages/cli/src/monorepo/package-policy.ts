@@ -130,6 +130,16 @@ export function validateNxReleaseConfig(root: string): number {
     console.error('nx.json release.version.specifierSource must be conventional-commits');
     failures++;
   }
+  // Nx requires git-tag as the primary resolver when deriving versions from
+  // conventional commits. Disk is only a fallback for initial untagged packages.
+  if (version && stringProperty(version, 'currentVersionResolver') !== 'git-tag') {
+    console.error('nx.json release.version.currentVersionResolver must be git-tag');
+    failures++;
+  }
+  if (version && stringProperty(version, 'fallbackCurrentVersionResolver') !== 'disk') {
+    console.error('nx.json release.version.fallbackCurrentVersionResolver must be disk');
+    failures++;
+  }
   if (version && !stringProperty(version, 'preVersionCommand')) {
     console.error('nx.json release.version.preVersionCommand must be defined');
     failures++;

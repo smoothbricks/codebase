@@ -36,6 +36,9 @@
     "@uwdata/flechette": "^2.3.0",
     "tslib": "^2.8.1"
   },
+  "devDependencies": {
+    "@smoothbricks/validation": "workspace:*"
+  },
   "nx": {
     "sourceRoot": "packages/arrow-builder/src",
     "projectType": "library",

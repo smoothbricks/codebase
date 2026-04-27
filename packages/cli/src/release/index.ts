@@ -40,7 +40,7 @@ export async function releaseVersion(root: string, options: ReleaseVersionOption
   if (bump !== 'auto') {
     nxArgs.push(bump);
   }
-  nxArgs.push(`--projects=${projects}`, '--yes');
+  nxArgs.push(`--projects=${projects}`);
   if (options.dryRun) {
     nxArgs.push('--dryRun');
   }
@@ -63,14 +63,18 @@ export async function releaseVersion(root: string, options: ReleaseVersionOption
 }
 
 export async function releasePublish(root: string, options: ReleasePublishOptions): Promise<void> {
+  if (options.dryRun) {
+    // Bun still requires npm authentication for `bun publish --dry-run`.
+    // Package packing is already validated by `smoo monorepo validate`, so dry
+    // runs stop before the network/auth boundary.
+    console.log('Dry run; skipping npm publish.');
+    return;
+  }
   const tag = releaseNpmTagArg(options);
   const projects = listPublicPackages(root)
     .map((pkg) => pkg.name)
     .join(',');
   const nxArgs = ['release', 'publish', `--projects=${projects}`, '--tag', tag];
-  if (options.dryRun) {
-    nxArgs.push('--dryRun');
-  }
   await run('nx', nxArgs, root);
 }
 

@@ -33,6 +33,7 @@
     "test": "bun test --pass-with-no-tests"
   },
   "devDependencies": {
+    "@smoothbricks/lmao": "workspace:*",
     "@smoothbricks/validation": "workspace:*"
   },
   "nx": {

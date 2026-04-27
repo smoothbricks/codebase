@@ -128,6 +128,8 @@
     "projectsRelationship": "independent",
     "version": {
       "specifierSource": "conventional-commits",
+      "currentVersionResolver": "git-tag",
+      "fallbackCurrentVersionResolver": "disk",
       "preVersionCommand": "nx run-many -t build"
     }
   }

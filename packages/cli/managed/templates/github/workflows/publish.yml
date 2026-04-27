@@ -36,70 +36,69 @@ jobs:
     steps:
       # --- Setup --------------------------------------------------------------
 
+      # Step 1: GitHub adds "Set up job" automatically
+      # Step 2
       - name: 📥 Checkout
-        uses: ./.github/actions/checkout
-
-      - name: ❄️ Install Nix
-        uses: DeterminateSystems/nix-installer-action@v21
-
-      - name: 🧊 Cache Nix profiles, devenv and direnv
-        uses: ./.github/actions/cache-nix-devenv
-
-      - name: ♻️ Restore Nix store from NAR
-        run: ./github-actions-bootstrap.sh restore-store
-
-      - name: ⚡ Enable Cachix
-        uses: cachix/cachix-action@v16
+        uses: actions/checkout@v6.0.2
         with:
-          name: devenv
+          filter: tree:0
+          fetch-depth: 0
 
-      - name: 🧰 Install devenv
-        run: ./github-actions-bootstrap.sh install-devenv
-
-      - name: 📦 Cache node_modules
-        uses: ./.github/actions/cache-node-modules
-
-      - name: 🐚 Build devenv shell
-        run: ./github-actions-bootstrap.sh build-shell
-
-      - name: 🧭 Set Nx SHAs
-        uses: nrwl/nx-set-shas@v4.4.0
+      # Step 3. Composite action internals do not affect top-level job step
+      # anchors; update these comments if top-level steps move.
+      - name: 🧱 Setup Nix/devenv
+        id: setup
+        uses: ./.github/actions/setup-devenv
 
       # --- Validation ---------------------------------------------------------
 
-      - name: ✅ Validate monorepo config
-        run: smoo monorepo validate
+      # Step 4
+      - name: ✅ Check managed monorepo files
+        run: smoo monorepo check
 
+      # Step 5
       - name: 📦 Resolve release projects
         id: projects
         run: echo "projects=$(smoo monorepo list-public-projects)" >> "$GITHUB_OUTPUT"
 
+      # Step 6
       - name: 🔍 Lint
         run: smoo github-ci nx-run-many --targets lint --projects "${{ steps.projects.outputs.projects }}"
 
+      # Step 7
       - name: 🧪 Unit Tests
         run: smoo github-ci nx-run-many --targets test --projects "${{ steps.projects.outputs.projects }}"
 
+      # Step 8
       - name: 🔨 Build
         run: smoo github-ci nx-run-many --targets build --projects "${{ steps.projects.outputs.projects }}"
 
+      # Step 9
+      - name: ✅ Validate monorepo config
+        run: smoo monorepo validate
+
       # --- Release ------------------------------------------------------------
 
+      # Step 10
       - name: 🤖 Configure release author
         run:
           git config user.name "github-actions[bot]" && git config user.email
           "41898282+github-actions[bot]@users.noreply.github.com"
 
+      # Step 11
       - name: 🏷️ Version packages
         run: smoo release version --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"
 
+      # Step 12
       - name: 🔖 Collect release tags
         id: tags
         run: echo "tags=$(git tag --points-at HEAD | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
 
+      # Step 13
       - name: 📦 Publish packages
         run: smoo release publish --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"
 
+      # Step 14
       - name: 🚀 Create or update GitHub Releases
         if: ${{ inputs.dry_run != true }}
         run:
@@ -108,5 +107,10 @@ jobs:
 
       # --- Cleanup ------------------------------------------------------------
 
-      - name: 🧹 Cleanup and cache Nix store
-        run: smoo github-ci cleanup-cache
+      # Step 15
+      - name: 🧹 Cleanup and cache Nix/devenv
+        if: ${{ always() }}
+        uses: ./.github/actions/save-nix-devenv
+        with:
+          nix-cache-hit: ${{ steps.setup.outputs.nix-cache-hit }}
+          devenv-cache-hit: ${{ steps.setup.outputs.devenv-cache-hit }}

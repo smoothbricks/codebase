@@ -1,6 +1,6 @@
-/// <reference types="bun-types" />
+/// <reference types="bun" />
 
-// WHY: bun-types reference is needed because the lib tsconfig has "types": [],
+// WHY: Bun types are opt-in because the lib tsconfig has "types": [],
 // but this plugin entry point runs in Bun and needs node:fs APIs.
 
 import { readFile as nodeReadFile, writeFile as nodeWriteFile, readdir } from 'node:fs/promises';

@@ -53,13 +53,18 @@ const managedFiles: ManagedFile[] = [
   },
   {
     kind: 'template',
-    source: 'github/actions/checkout/action.yml',
-    target: '.github/actions/checkout/action.yml',
+    source: 'github/actions/cache-nix-devenv/action.yml',
+    target: '.github/actions/cache-nix-devenv/action.yml',
   },
   {
     kind: 'template',
-    source: 'github/actions/cache-nix-devenv/action.yml',
-    target: '.github/actions/cache-nix-devenv/action.yml',
+    source: 'github/actions/setup-devenv/action.yml',
+    target: '.github/actions/setup-devenv/action.yml',
+  },
+  {
+    kind: 'template',
+    source: 'github/actions/save-nix-devenv/action.yml',
+    target: '.github/actions/save-nix-devenv/action.yml',
   },
   {
     kind: 'template',
@@ -121,8 +126,8 @@ function renderTemplate(root: string, template: string): string {
   const packageJson = readPackageJson(join(root, 'package.json'));
   const repoName = packageJson?.name ?? 'monorepo';
   const nodeModulesCacheKey = existsSync(join(root, 'bun.lock'))
-    ? `$${"{{ hashFiles('bun.lock') }}"}`
-    : `$${"{{ hashFiles('bun.lockb') }}"}`;
+    ? `$${"{{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json') }}"}`
+    : `$${"{{ hashFiles('bun.lockb', 'package.json', 'packages/*/package.json') }}"}`;
   return template.replaceAll('{{REPO_NAME}}', repoName).replaceAll('{{NODE_MODULES_CACHE_KEY}}', nodeModulesCacheKey);
 }
 

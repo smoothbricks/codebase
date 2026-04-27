@@ -1,12 +1,12 @@
 # Check Devenv is installed
 if ! has devenv; then
-  nix profile install --accept-flake-config nixpkgs#devenv
+  nix profile add --accept-flake-config nixpkgs#devenv
 else
   # Check Devenv is new enough
   if [[ $(devenv version | cut -d ' ' -f 2 | cut -d '.' -f 1) -lt 1 ]]; then
     echo "Devenv version is less than 1.0: Please update devenv."
     echo "# nix profile remove .\*devenv"
-    echo "# nix profile install --accept-flake-config nixpkgs#devenv"
+    echo "# nix profile add --accept-flake-config nixpkgs#devenv"
     exit 1
   fi
 fi

@@ -1,26 +1,114 @@
+import { existsSync } from 'node:fs';
+import { appendFile, mkdtemp, realpath, rename, rm } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { $ } from 'bun';
 import { decode, run, runStatus } from '../lib/run.js';
 
 export async function cleanupGithubCiCache(root: string): Promise<void> {
-  await run('nix-collect-garbage', ['--quiet'], root);
+  const githubOutput = process.env.GITHUB_OUTPUT;
+  const markCacheReady = async (ready: boolean): Promise<void> => {
+    if (githubOutput) {
+      await appendFile(githubOutput, `cache-ready=${ready ? 'true' : 'false'}\n`);
+    }
+  };
+
   const nar = process.env.NIX_STORE_NAR;
   if (!nar) {
+    console.warn('NIX_STORE_NAR is not set; skipping Nix cache save.');
+    await markCacheReady(false);
     return;
   }
-  await runStatus('/nix/var/nix/profiles/default/bin/nix-store', ['--verify', '--check-contents', '--repair'], root);
-  const rootsResult = await $`sudo find /nix/var/nix/gcroots -type l -exec readlink {} ;`.cwd(root).quiet().nothrow();
-  const roots = decode(rootsResult.stdout)
-    .split('\n')
-    .map((entry) => entry.trim())
-    .filter(Boolean)
-    .sort()
-    .join(' ');
-  if (!roots) {
+  const nixStore = '/nix/var/nix/profiles/default/bin/nix-store';
+  const devenvProfile = `${root}/tooling/direnv/.devenv/profile`;
+  if (!existsSync(devenvProfile)) {
+    console.warn(`${devenvProfile} is missing; skipping Nix cache save.`);
+    await markCacheReady(false);
     return;
   }
-  await $`bash -lc ${`sudo /nix/var/nix/profiles/default/bin/nix-store --export --quiet $(sudo /nix/var/nix/profiles/default/bin/nix-store -qR ${roots} 2>/dev/null) > "${nar}" || true`}`.cwd(
-    root,
-  );
+  await runStatus(nixStore, ['--verify', '--check-contents', '--repair'], root);
+  await exportNixStoreCache(root, nar, nixStore, devenvProfile);
+  await markCacheReady(true);
+}
+
+async function exportNixStoreCache(root: string, nar: string, nixStore: string, devenvProfile: string): Promise<void> {
+  const gcRootDir = '/nix/var/nix/gcroots/smoothbricks-cache-roots';
+  const tmpDir = await mkdtemp(join(dirname(nar), '.smoo-nix-cache-'));
+  const tmpNar = join(tmpDir, 'nix-store.nar');
+  const roots = new Set<string>();
+
+  try {
+    await $`rm -f ${nar}`.cwd(root);
+    await $`sudo rm -rf ${gcRootDir}`.cwd(root);
+    await $`sudo mkdir -p ${gcRootDir}`.cwd(root);
+
+    // The Nix cache must include every live store path referenced by the
+    // restored shell state, not just the devenv profile. .direnv stores paths to
+    // derivations like devenv-shell.drv; omitting those makes a cache hit restore
+    // metadata that points at missing store paths.
+    await addRoot(roots, devenvProfile);
+    const home = process.env.HOME;
+    if (home) {
+      const nixProfile = join(home, '.nix-profile');
+      await addRoot(roots, nixProfile);
+      await addReferencesFrom(roots, nixProfile, root);
+    }
+    await addReferencesFrom(roots, join(root, 'tooling/direnv/.devenv'), root);
+    await addReferencesFrom(roots, join(root, 'tooling/direnv/.direnv'), root);
+
+    const rootLinks: string[] = [];
+    let index = 0;
+    for (const target of roots) {
+      const link = `${gcRootDir}/root-${index}`;
+      await $`sudo ln -s ${target} ${link}`.cwd(root);
+      rootLinks.push(link);
+      index += 1;
+    }
+
+    if (rootLinks.length === 0) {
+      throw new Error('No live Nix store roots found; skipping Nix cache save.');
+    }
+
+    await $`nix-collect-garbage --quiet`.cwd(root);
+    const closureOutput = await $`sudo ${nixStore} -qR ${rootLinks}`.cwd(root).quiet();
+    const closure = decode(closureOutput.stdout)
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (closure.length === 0) {
+      throw new Error('No Nix store closure paths found; skipping Nix cache save.');
+    }
+
+    await $`sudo ${nixStore} --export --quiet ${closure} > ${tmpNar}`.cwd(root);
+    await $`test -s ${tmpNar}`.cwd(root);
+    await rename(tmpNar, nar);
+  } finally {
+    await $`sudo rm -rf ${gcRootDir}`.cwd(root).nothrow();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+}
+
+async function addRoot(roots: Set<string>, candidate: string): Promise<void> {
+  if (!existsSync(candidate)) {
+    return;
+  }
+  const target = await realpath(candidate);
+  if (existsSync(target)) {
+    roots.add(target);
+  }
+}
+
+async function addReferencesFrom(roots: Set<string>, path: string, cwd: string): Promise<void> {
+  if (!existsSync(path)) {
+    return;
+  }
+  const storePathPattern = '/nix/store/[a-z0-9]{32}-[A-Za-z0-9+._?=-]+';
+  const result = await $`grep -rahoE ${storePathPattern} ${path}`.cwd(cwd).quiet().nothrow();
+  for (const line of decode(result.stdout).split('\n')) {
+    const candidate = line.trim();
+    if (candidate && existsSync(candidate)) {
+      roots.add(candidate);
+    }
+  }
 }
 
 export async function githubCiNxSmart(

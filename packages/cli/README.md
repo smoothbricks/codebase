@@ -39,8 +39,8 @@ smoo monorepo validate-public-tags
 smoo monorepo release-state
 
 smoo release version --bump <auto|patch|minor|major|prerelease> [--dry-run]
-smoo release publish --bump <auto|patch|minor|major|prerelease> [--dry-run]
-smoo release github-release --tags <tags> --bump <auto|patch|minor|major|prerelease>
+smoo release publish --bump <auto|patch|minor|major|prerelease> [--tag <tag>] [--npm-tag <tag>] [--dry-run]
+smoo release github-release --tags <tags> --bump <auto|patch|minor|major|prerelease> [--tag <tag>] [--npm-tag <tag>] [--dry-run]
 
 smoo github-ci cleanup-cache
 smoo github-ci nx-smart --target <target> --name <check-name> --step <number>
@@ -170,15 +170,38 @@ This keeps hook behavior consistent with CI and avoids duplicating commit messag
 
 ## GitHub Actions
 
-The generated workflows keep readable YAML and named steps, while larger logic lives in `smoo` commands or the small
-pre-smoo bootstrap script.
+The generated workflows keep readable YAML and named top-level steps, while larger logic lives in `smoo` commands,
+post-checkout composite actions, or the small pre-smoo bootstrap script. Checkout stays inline in each workflow because
+repository-local composite actions do not exist until `actions/checkout` has populated the working tree.
 
 CI uses explicit lint, test, and build phases. The publish workflow does the same before running release commands so
 GitHub output remains readable even though Nx release also has its own `preVersionCommand` safety net.
 
+CI status deeplinks depend on GitHub's top-level job step anchors. The generated CI workflow keeps `# Step N` comments
+next to each top-level step, and the `smoo github-ci nx-smart --step <number>` values for lint, test, and build must
+stay synchronized with those comments. Composite action internals do not change the top-level step numbers.
+
+Managed CI setup is split across local composite actions:
+
+- `setup-devenv` installs Nix, restores the Nix cache segment, imports the store NAR, restores `.devenv`/`.direnv` only
+  after an exact Nix cache hit, enables Cachix, installs devenv, restores `node_modules`, and builds the shell.
+- `save-nix-devenv` runs under `always()`, calls `smoo github-ci cleanup-cache`, and explicitly saves cache segments
+  only when cleanup reports `cache-ready=true`.
+- `cache-nix-devenv` is the shared restore/save primitive for the separate `nix` and `devenv` cache segments.
+
+The cache split is intentional. The Nix segment contains the profile, Nix state, and exported store NAR. It is large and
+keyed by the expensive shell closure inputs. The `.devenv`/`.direnv` segment is small, but it contains absolute
+`/nix/store` pointers, so restoring it without the exact matching Nix store can leave metadata pointing at missing store
+paths.
+
+`smoo github-ci cleanup-cache` prepares the Nix segment for saving. It verifies and repairs the store, scans `.devenv`,
+`.direnv`, and `~/.nix-profile` for embedded `/nix/store/...` references, protects the live paths with temporary GC
+roots, runs garbage collection, and exports the resulting closure to `NIX_STORE_NAR`. The command writes
+`cache-ready=true` or `cache-ready=false` to `GITHUB_OUTPUT` so the save action can avoid uploading incomplete caches.
+
 The bootstrap script is intentionally small. It only handles work required before `smoo` can run in GitHub Actions:
 
-- Restore Nix store cache state.
+- Restore Nix store cache state, clearing `.devenv` and `.direnv` if the matching NAR is missing or fails to import.
 - Install `devenv`.
 - Build the devenv shell and add repo-local tooling to `GITHUB_PATH`.
 
@@ -191,12 +214,17 @@ Versioning:
 - `--bump auto` uses Nx conventional-commit versioning.
 - `--bump patch|minor|major|prerelease` forces the release specifier.
 - Release projects are discovered from `npm:public` packages.
+- Nx release config must use `currentVersionResolver: "git-tag"` with `fallbackCurrentVersionResolver: "disk"`.
+  Conventional-commit versioning requires git tags as the primary source, while the disk fallback supports initial
+  releases before package tags exist.
 
 Publishing:
 
 - `prerelease` publishes with npm dist-tag `next`.
 - Stable bumps publish with npm dist-tag `latest`.
 - Conflicting explicit dist-tags are rejected.
+- `--dry-run` skips npm publishing entirely. Bun still requires npm authentication for `bun publish --dry-run`, and
+  publish artifact validation is already covered by `smoo monorepo validate`.
 
 GitHub Releases:
 

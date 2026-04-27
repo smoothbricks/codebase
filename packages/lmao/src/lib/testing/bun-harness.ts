@@ -93,11 +93,17 @@ function writeDescribeTag(tag: unknown, describePath: string | null): void {
 }
 
 type TestBody = () => unknown | Promise<unknown>;
+type DoneTestBody = (done: (err?: unknown) => void) => unknown | Promise<unknown>;
 type HarnessSpanContext<B extends OpContextBinding> = SpanContext<OpContextOf<B>>;
 type BunTestHarnessBuiltins = { describe: ReturnType<typeof S.category> };
 type HarnessSchema<TExt extends SchemaFields> = BunTestHarnessBuiltins & TExt;
 type BunDescribe = typeof _describe;
 type BunIt = typeof _it;
+type BunDescribeLabel = Parameters<BunDescribe>[0];
+type BunTestOptions = Parameters<BunIt>[2];
+
+const ciOnlyDisabledMessage =
+  '.only is disabled in CI environments to prevent accidentally skipping tests. To override, set the environment variable CI=false.';
 
 export interface BunTestModuleShape {
   describe: BunDescribe;
@@ -404,12 +410,12 @@ function createTestTracerInstance<B extends OpContextBinding, TExt extends Schem
     return tracer;
   }
 
-  function runTracedTest(name: string, fn: TestBody, describePath: string | null): Promise<unknown> {
+  function runTracedTest(name: string, fn: TestBody | DoneTestBody, describePath: string | null): Promise<unknown> {
     const currentRoot = assertRootCtx();
     return currentRoot.span(name, async (ctx) => {
       writeDescribeTag(ctx.tag, describePath);
       try {
-        await als.run(ctx, fn);
+        await als.run(ctx, () => fn(() => undefined));
         return ctx.ok(undefined); // pass -> span-ok
       } catch (error) {
         if (isExpectError(error)) {
@@ -421,34 +427,73 @@ function createTestTracerInstance<B extends OpContextBinding, TExt extends Schem
     });
   }
 
-  function createWrappedDescribe(origDescribe: typeof _describe, describeStack: string[]): typeof _describe {
-    const wrappedDescribeBase = (name: string, fn: () => void) =>
-      origDescribe(name, () => {
-        describeStack.push(name);
+  function createWrappedDescribe(origDescribe: typeof _describe, describeStack: string[]) {
+    function wrappedDescribeBase(fn: () => void): void;
+    function wrappedDescribeBase(name: BunDescribeLabel, fn: () => void): void;
+    function wrappedDescribeBase(nameOrFn: BunDescribeLabel | (() => void), fn?: () => void): void {
+      if (fn === undefined && typeof nameOrFn === 'function') {
+        origDescribe(() => nameOrFn());
+        return;
+      }
+      const describeFn = fn;
+      if (!describeFn) {
+        throw new TypeError('describe callback is required');
+      }
+
+      origDescribe(nameOrFn, () => {
+        describeStack.push(String(nameOrFn));
         try {
-          fn();
+          describeFn();
         } finally {
           describeStack.pop();
         }
       });
+    }
 
-    const wrappedDescribe: typeof _describe = Object.assign(wrappedDescribeBase, origDescribe);
-    wrappedDescribe.each = origDescribe.each.bind(origDescribe);
+    const wrappedDescribe = Object.assign(wrappedDescribeBase, {
+      skip: origDescribe.skip,
+      only: process.env.CI ? createDisabledDescribe(origDescribe) : origDescribe.only,
+      todo: origDescribe.todo,
+      concurrent: origDescribe.concurrent,
+      serial: origDescribe.serial,
+      if: origDescribe.if,
+      skipIf: origDescribe.skipIf,
+      todoIf: origDescribe.todoIf,
+      each: origDescribe.each,
+    });
+    assignOnly(wrappedDescribe, origDescribe, origDescribe);
+    assignOptionalBoundTestFunction(wrappedDescribe, 'each', origDescribe, origDescribe);
     wrappedDescribe.skipIf = (condition: boolean) => (condition ? origDescribe.skip : wrappedDescribe);
     wrappedDescribe.if = (condition: boolean) => (condition ? wrappedDescribe : origDescribe.skip);
 
     return wrappedDescribe;
   }
 
-  function createWrappedIt(origIt: typeof _it, describeStack: string[]): typeof _it {
-    const wrappedItBase = (name: string, fn: TestBody) => {
+  function createWrappedIt(origIt: typeof _it, describeStack: string[]) {
+    function wrappedItBase(name: string, fn: TestBody, options?: BunTestOptions): void;
+    function wrappedItBase(name: string, fn: DoneTestBody, options?: BunTestOptions): void;
+    function wrappedItBase(name: string, fn: TestBody | DoneTestBody, options?: BunTestOptions): void {
       const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
-      return origIt(name, () => runTracedTest(name, fn, describePath));
-    };
+      origIt(name, () => runTracedTest(name, fn, describePath), options);
+    }
 
-    const wrappedIt: typeof _it = Object.assign(wrappedItBase, origIt);
-    wrappedIt.each = origIt.each.bind(origIt);
-    wrappedIt.todo = origIt.todo?.bind(origIt);
+    const wrappedIt = Object.assign(wrappedItBase, {
+      skip: origIt.skip,
+      only: process.env.CI ? createDisabledIt(origIt) : origIt.only,
+      todo: origIt.todo?.bind(origIt),
+      failing: origIt.failing,
+      concurrent: origIt.concurrent,
+      serial: origIt.serial,
+      if: origIt.if,
+      skipIf: origIt.skipIf,
+      todoIf: origIt.todoIf,
+      failingIf: origIt.failingIf,
+      concurrentIf: origIt.concurrentIf,
+      serialIf: origIt.serialIf,
+      each: origIt.each,
+    });
+    assignOnly(wrappedIt, origIt, origIt);
+    assignOptionalBoundTestFunction(wrappedIt, 'each', origIt, origIt);
     wrappedIt.skipIf = (condition: boolean) => (condition ? origIt.skip : wrappedIt);
     wrappedIt.if = (condition: boolean) => (condition ? wrappedIt : origIt.skip);
 
@@ -657,12 +702,12 @@ export function createBunTestMock<TModule extends BunTestModuleShape>(bunTestMod
   // so that describe-path tracking stays active for nested it() calls.
   Object.assign(wrappedDescribe, {
     skip: origDescribe.skip,
-    only: origDescribe.only,
     todo: origDescribe.todo,
-    each: origDescribe.each.bind(origDescribe),
     skipIf: (condition: boolean) => (condition ? origDescribe.skip : wrappedDescribe),
     if: (condition: boolean) => (condition ? wrappedDescribe : origDescribe.skip),
   });
+  assignOnly(wrappedDescribe, origDescribe, origDescribe);
+  assignOptionalBoundTestFunction(wrappedDescribe, 'each', origDescribe, origDescribe);
 
   function wrappedIt(name: string, fn: TestBody) {
     // Capture describe path at registration time (synchronous)
@@ -687,12 +732,12 @@ export function createBunTestMock<TModule extends BunTestModuleShape>(bunTestMod
   // so the ALS context is set up and useTestSpan() works inside the test body.
   Object.assign(wrappedIt, {
     skip: origIt.skip,
-    only: origIt.only,
     todo: origIt.todo,
-    each: origIt.each.bind(origIt),
     skipIf: (condition: boolean) => (condition ? origIt.skip : wrappedIt),
     if: (condition: boolean) => (condition ? wrappedIt : origIt.skip),
   });
+  assignOnly(wrappedIt, origIt, origIt);
+  assignOptionalBoundTestFunction(wrappedIt, 'each', origIt, origIt);
 
   return {
     ...bunTestModule,
@@ -761,10 +806,59 @@ function assignOptionalBoundTestFunction(target: object, key: string, source: ob
   }
 }
 
+function disabledOnly(): never {
+  throw new Error(ciOnlyDisabledMessage);
+}
+
+function createDisabledDescribe(source: typeof _describe): typeof _describe {
+  const disabledDescribe: typeof _describe = Object.assign((_label: unknown, _fn?: unknown) => disabledOnly(), {
+    skip: source.skip,
+    only: source.skip,
+    todo: source.todo,
+    concurrent: source.concurrent,
+    serial: source.serial,
+    if: source.if,
+    skipIf: source.skipIf,
+    todoIf: source.todoIf,
+    each: source.each,
+  });
+  disabledDescribe.only = disabledDescribe;
+  return disabledDescribe;
+}
+
+function createDisabledIt(source: typeof _it): typeof _it {
+  const disabledIt: typeof _it = Object.assign((_label: string, _fn?: unknown, _options?: unknown) => disabledOnly(), {
+    skip: source.skip,
+    only: source.skip,
+    todo: source.todo,
+    failing: source.failing,
+    concurrent: source.concurrent,
+    serial: source.serial,
+    if: source.if,
+    skipIf: source.skipIf,
+    todoIf: source.todoIf,
+    failingIf: source.failingIf,
+    concurrentIf: source.concurrentIf,
+    serialIf: source.serialIf,
+    each: source.each,
+  });
+  disabledIt.only = disabledIt;
+  return disabledIt;
+}
+
+function assignOnly(target: object, source: object, thisArg: unknown): void {
+  if (process.env.CI) {
+    Reflect.set(target, 'only', disabledOnly);
+    return;
+  }
+
+  assignOptionalBoundTestFunction(target, 'only', source, thisArg);
+}
+
 describe.skip = _describe.skip;
-describe.only = _describe.only;
+assignOnly(describe, _describe, _describe);
 describe.todo = _describe.todo;
-describe.each = _describe.each;
+assignOptionalBoundTestFunction(describe, 'each', _describe, _describe);
 assignOptionalBoundTestFunction(describe, 'skipIf', _describe, _describe);
 assignOptionalBoundTestFunction(describe, 'if', _describe, _describe);
 
@@ -787,9 +881,9 @@ export function it(name: string, fn: () => void | Promise<void>): void {
 }
 
 it.skip = _it.skip;
-it.only = _it.only;
+assignOnly(it, _it, _it);
 it.todo = _it.todo;
-it.each = _it.each;
+assignOptionalBoundTestFunction(it, 'each', _it, _it);
 assignOptionalBoundTestFunction(it, 'skipIf', _it, _it);
 assignOptionalBoundTestFunction(it, 'if', _it, _it);
 

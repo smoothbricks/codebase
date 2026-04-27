@@ -19,12 +19,14 @@
     },
     "./monorepo/runtime": {
       "types": "./dist/monorepo/runtime.d.ts",
+      "bun": "./src/monorepo/runtime.ts",
       "development": "./src/monorepo/runtime.ts",
       "import": "./dist/monorepo/runtime.js",
       "default": "./dist/monorepo/runtime.js"
     },
     "./monorepo/git-config": {
       "types": "./dist/monorepo/git-config.d.ts",
+      "bun": "./src/monorepo/git-config.ts",
       "development": "./src/monorepo/git-config.ts",
       "import": "./dist/monorepo/git-config.js",
       "default": "./dist/monorepo/git-config.js"

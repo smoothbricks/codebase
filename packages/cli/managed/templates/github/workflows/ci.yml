@@ -23,73 +23,46 @@ jobs:
       # Step 1: GitHub adds "Set up job" automatically
       # Step 2
       - name: 📥 Checkout
-        uses: ./.github/actions/checkout
-
-      # --- Nix ----------------------------------------------------------------
-
-      # Step 3
-      - name: ❄️ Install Nix
-        uses: DeterminateSystems/nix-installer-action@v21
+        uses: actions/checkout@v6.0.2
         with:
-          extra-conf: |
-            keep-outputs = true
-            keep-derivations = true
-            gc-keep-derivations = true
-            gc-keep-outputs = true
+          filter: tree:0
+          fetch-depth: 0
 
-      # Step 4
-      # Cache Nix profiles, devenv and direnv
-      - name: 🧊 Cache Nix profiles, devenv and direnv
-        uses: ./.github/actions/cache-nix-devenv
-
-      # Step 5
-      - name: ♻️ Restore Nix store from NAR
-        run: ./github-actions-bootstrap.sh restore-store
-
-      # --- devenv shell -------------------------------------------------------
-
-      # Step 6
-      - name: ⚡ Enable Cachix
-        uses: cachix/cachix-action@v16
-        with:
-          name: devenv
-
-      # Step 7
-      - name: 🧰 Install devenv
-        run: ./github-actions-bootstrap.sh install-devenv
-
-      # Step 8
-      - name: 📦 Cache node_modules
-        uses: ./.github/actions/cache-node-modules
-
-      # Step 9
-      - name: 🐚 Build devenv shell
-        run: ./github-actions-bootstrap.sh build-shell
+      # Step 3. Composite action internals do not affect top-level job step
+      # anchors; update the nx-smart --step values below if top-level steps move.
+      - name: 🧱 Setup Nix/devenv
+        id: setup
+        uses: ./.github/actions/setup-devenv
 
       # --- Nx -----------------------------------------------------------------
 
-      # Step 10
+      # Step 4
       # Sets the base and head SHAs required for the nx affected commands
       - name: 🧭 Set Nx SHAs
-        uses: nrwl/nx-set-shas@v4.4.0
+        uses: nrwl/nx-set-shas@v5.0.1
 
-      # Step 11
+      # Step 5
       - name: 🧠 Cache Nx
         uses: ./.github/actions/cache-nx
 
-      # Step 12
+      # Step 6
       - name: 🔍 Lint
-        run: smoo github-ci nx-smart --target lint --name "Lint" --step 12
+        run: smoo github-ci nx-smart --target lint --name "Lint" --step 6
 
-      # Step 13
+      # Step 7
       - name: 🧪 Unit Tests
-        run: smoo github-ci nx-smart --target test --name "Unit Tests" --step 13
+        run: smoo github-ci nx-smart --target test --name "Unit Tests" --step 7
 
-      # Step 14
+      # Step 8
       - name: 🔨 Build
-        run: smoo github-ci nx-smart --target build --name "Build" --step 14
+        run: smoo github-ci nx-smart --target build --name "Build" --step 8
 
       # --- Cleanup ------------------------------------------------------------
 
-      - name: 🧹 Cleanup and cache Nix store
-        run: smoo github-ci cleanup-cache
+      # Step 9
+      - name: 🧹 Cleanup and cache Nix/devenv
+        if: ${{ always() }}
+        uses: ./.github/actions/save-nix-devenv
+        with:
+          nix-cache-hit: ${{ steps.setup.outputs.nix-cache-hit }}
+          devenv-cache-hit: ${{ steps.setup.outputs.devenv-cache-hit }}

@@ -3,29 +3,42 @@ set -euo pipefail
 
 NIX_STORE_NAR="${NIX_STORE_NAR:-/tmp/nix-store.nar}"
 nix_store_cmd="/nix/var/nix/profiles/default/bin/nix-store"
+# Resolve from this script's location, not the caller's cwd. GitHub Actions
+# runs this from tooling/direnv today, but direct cwd-changing helpers are easy
+# to misuse and break on repeated calls.
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/../.." && pwd)"
+
+clear_devenv_cache_state() {
+  rm -rf "$repo_root/tooling/direnv/.devenv" "$repo_root/tooling/direnv/.direnv"
+}
 
 add_repo_paths() {
-  local root
-  root="$(cd ../.. && pwd)"
   {
-    echo "$root/tooling"
-    echo "$root/node_modules/.bin"
-    echo "$root/tooling/direnv/.devenv/profile/bin"
+    echo "$repo_root/tooling/direnv/.devenv/profile/bin"
+    echo "$repo_root/node_modules/.bin"
+    echo "$repo_root/tooling"
   } >> "$GITHUB_PATH"
 }
 
 restore_nix_store() {
-  if [ -f "$NIX_STORE_NAR" ]; then
-    sudo "$nix_store_cmd" --import --quiet < "$NIX_STORE_NAR"
+  if [ -s "$NIX_STORE_NAR" ]; then
+    if ! sudo "$nix_store_cmd" --import --quiet < "$NIX_STORE_NAR"; then
+      # .devenv/.direnv contain absolute /nix/store references. If importing the
+      # matching store closure fails, clearing them prevents incoherent restores.
+      clear_devenv_cache_state
+      exit 1
+    fi
   else
-    echo "No NAR file found, skipping import"
+    echo "No NAR file found; clearing devenv cache state"
+    clear_devenv_cache_state
   fi
 }
 
 install_devenv() {
   sudo mkdir -p /nix/var/nix/gcroots/ci
   if ! command -v devenv >/dev/null 2>&1; then
-    nix profile install --accept-flake-config nixpkgs#devenv
+    nix profile add --accept-flake-config nixpkgs#devenv
   fi
   echo "$HOME/.nix-profile/bin" >> "$GITHUB_PATH"
   sudo ln -sf "$HOME/.nix-profile" /nix/var/nix/gcroots/ci/profile
@@ -33,6 +46,8 @@ install_devenv() {
 
 build_devenv_shell() {
   devenv shell --verbose -- date
+  # Add repo-local tools only after the shell exists; cleanup steps use an
+  # explicit PATH because failures before this point must still refresh caches.
   add_repo_paths
 }
 
