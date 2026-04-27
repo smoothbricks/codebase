@@ -46,16 +46,16 @@ jobs:
         uses: ./.github/actions/cache-nx
 
       # Step 6
-      - name: 🔍 Lint
-        run: smoo github-ci nx-smart --target lint --name "Lint" --step 6
+      - name: 🔨 Build
+        run: smoo github-ci nx-smart --target build --name "Build" --step 6
 
       # Step 7
-      - name: 🧪 Unit Tests
-        run: smoo github-ci nx-smart --target test --name "Unit Tests" --step 7
+      - name: 🔍 Lint
+        run: smoo github-ci nx-smart --target lint --name "Lint" --step 7
 
       # Step 8
-      - name: 🔨 Build
-        run: smoo github-ci nx-smart --target build --name "Build" --step 8
+      - name: 🧪 Unit Tests
+        run: smoo github-ci nx-smart --target test --name "Unit Tests" --step 8
 
       # --- Cleanup ------------------------------------------------------------
 

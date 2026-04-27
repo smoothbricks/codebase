@@ -62,16 +62,16 @@ jobs:
         run: echo "projects=$(smoo monorepo list-public-projects)" >> "$GITHUB_OUTPUT"
 
       # Step 6
+      - name: 🔨 Build
+        run: smoo github-ci nx-run-many --targets build --projects "${{ steps.projects.outputs.projects }}"
+
+      # Step 7
       - name: 🔍 Lint
         run: smoo github-ci nx-run-many --targets lint --projects "${{ steps.projects.outputs.projects }}"
 
-      # Step 7
+      # Step 8
       - name: 🧪 Unit Tests
         run: smoo github-ci nx-run-many --targets test --projects "${{ steps.projects.outputs.projects }}"
-
-      # Step 8
-      - name: 🔨 Build
-        run: smoo github-ci nx-run-many --targets build --projects "${{ steps.projects.outputs.projects }}"
 
       # Step 9
       - name: ✅ Validate monorepo config
