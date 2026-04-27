@@ -44,7 +44,8 @@ jobs:
           workflow-id: ci.yml
 
       # Step 5
-      - name: 🧠 Cache Nx
+      - name: 🧠 Restore Nx cache
+        id: nx-cache
         uses: ./.github/actions/cache-nx
 
       # Step 6
@@ -60,6 +61,22 @@ jobs:
         run: smoo github-ci nx-smart --target test --name "Unit Tests" --step 8
 
       # Step 9
+      # Nx's database cache needs artifact files and .nx/workspace-data DB
+      # metadata restored together; GitHub Actions cache is only the archive
+      # transport. Save runs only after build/lint/test succeed on the default
+      # branch, so PRs may restore shared cache but cannot publish it.
+      - name: 💾 Save Nx cache
+        if:
+          ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}',
+          github.event.repository.default_branch) && steps.nx-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v5.0.5
+        with:
+          path: |
+            .nx/cache
+            .nx/workspace-data/*.db*
+          key: ${{ runner.os }}-nx-db-v1-${{ github.sha }}
+
+      # Step 10
       - name: 📎 Upload trace DBs
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
@@ -72,7 +89,7 @@ jobs:
 
       # --- Cleanup ------------------------------------------------------------
 
-      # Step 10
+      # Step 11
       - name: 🧹 Cleanup and cache Nix/devenv
         if: ${{ always() }}
         uses: ./.github/actions/save-nix-devenv

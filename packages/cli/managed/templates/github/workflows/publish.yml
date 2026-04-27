@@ -53,6 +53,10 @@ jobs:
 
       # --- Validation ---------------------------------------------------------
 
+      # Release validation intentionally does not restore persisted Nx task
+      # cache. Nx may reuse tasks produced earlier in this same job, but publish
+      # never relies on task outputs restored from CI cache.
+
       # Step 4
       - name: ✅ Check managed monorepo files
         run: smoo monorepo check
