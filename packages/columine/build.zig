@@ -4,6 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // The npm package publishes WASM only. Native dylibs are not part of the
+    // supported JS runtime surface unless a future loader/package split wires
+    // them explicitly, so default install/build:zig should not compile them.
+    const wasm_step = b.step("wasm", "Build package WASM artifacts");
+    const native_step = b.step("native", "Build native FFI dylibs");
+    const all_step = b.step("all", "Build WASM and native artifacts");
+    all_step.dependOn(wasm_step);
+    all_step.dependOn(native_step);
+
     // ==========================================================================
     // Dependencies - zig-msgpack
     // ==========================================================================
@@ -101,6 +110,7 @@ pub fn build(b: *std.Build) void {
         .{ .custom = "../dist" },
         "columine.wasm",
     );
+    wasm_step.dependOn(&copy_wasm.step);
     b.getInstallStep().dependOn(&copy_wasm.step);
 
     // ==========================================================================
@@ -120,14 +130,12 @@ pub fn build(b: *std.Build) void {
     columine_ffi.root_module.addImport("msgpack", msgpack_dep.module("msgpack"));
     columine_ffi.root_module.addImport("rawr", rawr_native_dep.module("rawr"));
 
-    b.installArtifact(columine_ffi);
-
     const copy_ffi = b.addInstallFileWithDir(
         columine_ffi.getEmittedBin(),
         .{ .custom = "../dist" },
         "libcolumine.dylib",
     );
-    b.getInstallStep().dependOn(&copy_ffi.step);
+    native_step.dependOn(&copy_ffi.step);
 
     // ==========================================================================
     // EventProcessor WASM - Parse + Compact pipeline (no dedup)
@@ -162,6 +170,7 @@ pub fn build(b: *std.Build) void {
         .{ .custom = "../dist" },
         "event_processor.wasm",
     );
+    wasm_step.dependOn(&copy_ep_wasm.step);
     b.getInstallStep().dependOn(&copy_ep_wasm.step);
 
     // ==========================================================================
@@ -185,14 +194,12 @@ pub fn build(b: *std.Build) void {
     ep_ffi.root_module.addOptions("build_options", build_opts_simdjzon);
     addParsingModules(b, ep_ffi.root_module, build_opts_simdjzon, simdjzon_mod);
 
-    b.installArtifact(ep_ffi);
-
     const copy_ep_ffi = b.addInstallFileWithDir(
         ep_ffi.getEmittedBin(),
         .{ .custom = "../dist" },
         "libevent_processor.dylib",
     );
-    b.getInstallStep().dependOn(&copy_ep_ffi.step);
+    native_step.dependOn(&copy_ep_ffi.step);
 
     // ==========================================================================
     // Test step - runs VM and EventProcessor tests on native target

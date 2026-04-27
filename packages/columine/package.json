@@ -19,7 +19,7 @@
     "dist"
   ],
   "scripts": {
-    "build:zig": "zig build",
+    "build:zig": "zig build wasm",
     "build:ts": "tsc --build tsconfig.lib.json",
     "build": "bun run build:ts && bun run build:zig",
     "test": "bun test src/__tests__/columine-integration.test.ts"

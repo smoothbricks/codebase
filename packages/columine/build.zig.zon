@@ -14,8 +14,8 @@
             .hash = "zig_msgpack-0.0.14-evvueEc7BQATytDqy8wFvDb883Jv3yLk_8cF5EoYaKFB",
         },
         .simdjzon = .{
-            .url = "git+https://github.com/smoothbricks/simdjzon#d53d9b301fefd2cdf3327ff65b3b9f5771ba680d",
-            .hash = "simdjzon-0.0.1-7uNSgOOABQDE9lo1T3fgUBuki3LvKcGWnt6u0hMuhFte",
+            .url = "git+https://github.com/smoothbricks/simdjzon#353b71a46cbb12746515066fe807cab6f67ef4a3",
+            .hash = "simdjzon-0.0.1-7uNSgOKABQDF2ML0g2FynnmtlTLoB2Pbwxz-4Jlt0258",
         },
         .rawr = .{
             .url = "git+https://github.com/smoothbricks/rawr#75619edcc8a2255d01a8dd89c844065794ab7775",
