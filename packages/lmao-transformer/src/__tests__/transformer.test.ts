@@ -1,17 +1,21 @@
 import { describe, expect, it } from 'bun:test';
+import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { createLmaoTransformer } from '../transformer.js';
 
-function transform(source: string): string {
+function transform(source: string, options?: { fileName?: string; projectRoot?: string }): string {
   const result = ts.transpileModule(source, {
+    fileName: options?.fileName,
     compilerOptions: {
       module: ts.ModuleKind.ESNext,
       target: ts.ScriptTarget.ESNext,
     },
-    transformers: { before: [createLmaoTransformer()] },
+    transformers: { before: [createLmaoTransformer({ projectRoot: options?.projectRoot })] },
   });
   return result.outputText;
 }
+
+const thisTestFile = fileURLToPath(import.meta.url);
 
 /**
  * Normalize whitespace for comparison - removes extra spaces and normalizes quotes
@@ -282,9 +286,29 @@ return ctx.ok({ done: true });`;
       const input = ['defineModule({', '  logSchema: schema,', '});'].join('\n');
       const output = transform(input);
       expect(output).toContain('metadata');
-      expect(output).toContain('git_sha');
-      expect(output).toContain('package_name');
-      expect(output).toContain('package_file');
+      expect(output).toContain('git_sha: "unknown"');
+      expect(output).toContain('package_name: "unknown"');
+      expect(output).toContain('package_file: "module.ts"');
+    });
+
+    it('should inject real file metadata when source file exists', () => {
+      const input = ['defineModule({', '  logSchema: schema,', '});'].join('\n');
+      const output = transform(input, { fileName: thisTestFile });
+      expect(output).toMatch(/git_sha: "[0-9a-f]{40}"/);
+      expect(output).toContain('package_name: "@smoothbricks/lmao-transformer"');
+      expect(output).toContain('package_file: "src/__tests__/transformer.test.ts"');
+    });
+
+    it('should reject multiple defineModule declarations in one source file', () => {
+      const input = [
+        'defineModule({',
+        '  logSchema: schema,',
+        '});',
+        'defineModule({',
+        '  logSchema: schema,',
+        '});',
+      ].join('\n');
+      expect(() => transform(input)).toThrow('contains multiple defineModule() declarations');
     });
 
     it('should not overwrite existing metadata', () => {

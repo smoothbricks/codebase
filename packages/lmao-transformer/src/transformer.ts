@@ -1,4 +1,4 @@
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import path from 'node:path';
 import ts from 'typescript';
@@ -44,9 +44,9 @@ type PackageLocation = {
  */
 function getGitRoot(): string | undefined {
   try {
-    const result = execSync('git rev-parse --show-toplevel', {
+    const result = execFileSync('git', ['rev-parse', '--show-toplevel'], {
       encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
     return result.trim() || undefined;
   } catch {
@@ -54,7 +54,7 @@ function getGitRoot(): string | undefined {
   }
 }
 
-// Cache the git root to avoid repeated execSync calls
+// Cache the git root to avoid repeated git process calls.
 let cachedGitRoot: string | undefined | null = null;
 
 /**
@@ -67,15 +67,42 @@ function getCachedGitRoot(): string | undefined {
   return cachedGitRoot;
 }
 
+function isPathInside(parent: string, child: string): boolean {
+  const relativePath = path.relative(parent, child);
+  return relativePath !== '' && !relativePath.startsWith('..') && !path.isAbsolute(relativePath);
+}
+
+function resolveRealSourceFilePath(fileName: string, projectRoot: string): string | undefined {
+  const absoluteProjectRoot = path.resolve(projectRoot);
+  const absoluteFilePath = path.isAbsolute(fileName)
+    ? path.resolve(fileName)
+    : path.resolve(absoluteProjectRoot, fileName);
+
+  if (!isPathInside(absoluteProjectRoot, absoluteFilePath)) {
+    return undefined;
+  }
+
+  try {
+    const stat = fs.statSync(absoluteFilePath);
+    return stat.isFile() ? absoluteFilePath : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
- * Get the last git commit SHA that modified the given file.
+ * Get the last git commit SHA that modified the given real source file.
  * Returns 'unknown' if git is not available or the file has no history.
  */
-function getLastGitCommit(filePath: string): string {
+function getLastGitCommit(filePath: string, projectRoot: string): string {
+  const absoluteProjectRoot = path.resolve(projectRoot);
+  const relativePath = path.relative(absoluteProjectRoot, filePath).split(path.sep).join('/');
+
   try {
-    const result = execSync(`git log -1 --format=%H -- "${filePath}"`, {
+    const result = execFileSync('git', ['-C', absoluteProjectRoot, 'rev-list', '-1', 'HEAD', '--', relativePath], {
       encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 2000,
     });
     return result.trim() || 'unknown';
   } catch {
@@ -136,6 +163,10 @@ function hasMetadataProperty(objectLiteral: ts.ObjectLiteralExpression): boolean
   );
 }
 
+function isDefineModuleObjectCall(node: ts.CallExpression): boolean {
+  return isDefineModuleCall(node) && node.arguments.length > 0 && ts.isObjectLiteralExpression(node.arguments[0]);
+}
+
 /**
  * Try to transform defineModule() to inject metadata.
  *
@@ -152,7 +183,7 @@ function tryTransformDefineModuleCall(
   node: ts.CallExpression,
   sourceFile: ts.SourceFile,
   factory: ts.NodeFactory,
-  _projectRoot: string,
+  projectRoot: string,
 ): ts.CallExpression | null {
   if (!isDefineModuleCall(node)) {
     return null;
@@ -173,16 +204,16 @@ function tryTransformDefineModuleCall(
     return null;
   }
 
-  const absoluteFilePath = sourceFile.fileName;
-  const gitSha = getLastGitCommit(absoluteFilePath);
-  const packageInfo = findNearestPackage(absoluteFilePath);
+  const realSourceFilePath = resolveRealSourceFilePath(sourceFile.fileName, projectRoot);
+  const gitSha = realSourceFilePath ? getLastGitCommit(realSourceFilePath, projectRoot) : 'unknown';
+  const packageInfo = realSourceFilePath ? findNearestPackage(realSourceFilePath) : undefined;
 
   // packageName: npm package name (e.g., '@smoothbricks/lmao')
   // packagePath: path within package, relative to package.json (e.g., 'src/services/user.ts')
   const packageName = packageInfo?.packageName ?? 'unknown';
   const packagePath = packageInfo
-    ? path.relative(packageInfo.packageDir, absoluteFilePath)
-    : path.basename(absoluteFilePath);
+    ? path.relative(packageInfo.packageDir, realSourceFilePath ?? sourceFile.fileName)
+    : path.basename(sourceFile.fileName);
 
   // Create the metadata object literal
   const metadataObject = factory.createObjectLiteralExpression(
@@ -237,6 +268,7 @@ export function createLmaoTransformer(options: LmaoTransformerOptions = {}): ts.
       // Track original nodes that are part of a chain we've already processed
       // This prevents re-transformation when we visit children of a transformed chain
       const processedCalls = new WeakSet<ts.CallExpression>();
+      let seenDefineModuleObjectCall = false;
 
       const visitor = (node: ts.Node): ts.Node => {
         // Check for ExpressionStatement containing a ctx.tag chain
@@ -270,6 +302,16 @@ export function createLmaoTransformer(options: LmaoTransformerOptions = {}): ts.
         }
 
         // Check for defineModule() pattern
+        if (isDefineModuleObjectCall(node)) {
+          if (seenDefineModuleObjectCall) {
+            throw new Error(
+              `Invariant violation: ${sourceFile.fileName} contains multiple defineModule() declarations. ` +
+                'A module source file must own exactly one module definition.',
+            );
+          }
+          seenDefineModuleObjectCall = true;
+        }
+
         const moduleContextTransformed = tryTransformDefineModuleCall(node, sourceFile, factory, projectRoot);
         if (moduleContextTransformed) {
           return ts.visitEachChild(moduleContextTransformed, visitor, context);

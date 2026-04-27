@@ -74,31 +74,41 @@ jobs:
         run: smoo github-ci nx-run-many --targets test --projects "${{ steps.projects.outputs.projects }}"
 
       # Step 9
+      - name: 📎 Upload trace DBs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: trace-results-${{ github.run_id }}
+          path: packages/*/.trace-results.db
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # Step 10
       - name: ✅ Validate monorepo config
         run: smoo monorepo validate
 
       # --- Release ------------------------------------------------------------
 
-      # Step 10
+      # Step 11
       - name: 🤖 Configure release author
         run:
           git config user.name "github-actions[bot]" && git config user.email
           "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # Step 11
+      # Step 12
       - name: 🏷️ Version packages
         run: smoo release version --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"
 
-      # Step 12
+      # Step 13
       - name: 🔖 Collect release tags
         id: tags
         run: echo "tags=$(git tag --points-at HEAD | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
 
-      # Step 13
+      # Step 14
       - name: 📦 Publish packages
         run: smoo release publish --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"
 
-      # Step 14
+      # Step 15
       - name: 🚀 Create or update GitHub Releases
         if: ${{ inputs.dry_run != true }}
         run:
@@ -107,7 +117,7 @@ jobs:
 
       # --- Cleanup ------------------------------------------------------------
 
-      # Step 15
+      # Step 16
       - name: 🧹 Cleanup and cache Nix/devenv
         if: ${{ always() }}
         uses: ./.github/actions/save-nix-devenv
