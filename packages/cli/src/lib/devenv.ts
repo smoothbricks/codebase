@@ -7,9 +7,9 @@ import { decode } from './run.js';
 type EnvSnapshot = Record<string, string>;
 
 export async function withDevenvEnv<T>(root: string, runWithEnv: () => Promise<T>): Promise<T> {
-  const env = await loadDevenvEnv(root);
   const snapshot = snapshotProcessEnv();
-  replaceProcessEnv(env);
+  const env = await loadDevenvEnv(root);
+  replaceProcessEnv(mergeDevenvEnv(snapshot, env));
   try {
     return await runWithEnv();
   } finally {
@@ -54,6 +54,10 @@ export function parseNulEnv(bytes: Uint8Array): EnvSnapshot {
     entryStart = index + 1;
   }
   return env;
+}
+
+export function mergeDevenvEnv(baseEnv: EnvSnapshot, devenvEnv: EnvSnapshot): EnvSnapshot {
+  return { ...baseEnv, ...devenvEnv };
 }
 
 function snapshotProcessEnv(): EnvSnapshot {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { parseNulEnv } from './devenv.js';
+import { mergeDevenvEnv, parseNulEnv } from './devenv.js';
 
 describe('devenv environment loader', () => {
   it('parses NUL-separated env output without splitting values on newlines or equals signs', () => {
@@ -9,6 +9,20 @@ describe('devenv environment loader', () => {
       SIMPLE: 'value',
       MULTILINE: 'line 1\nline 2',
       TOKEN: 'a=b=c',
+    });
+  });
+
+  it('merges devenv output over the existing environment instead of replacing it', () => {
+    expect(
+      mergeDevenvEnv(
+        { GH_TOKEN: 'existing-token', NODE_AUTH_TOKEN: 'npm-token', PATH: '/usr/bin' },
+        { DEVENV_ROOT: '/repo/tooling/direnv', PATH: '/nix/bin' },
+      ),
+    ).toEqual({
+      DEVENV_ROOT: '/repo/tooling/direnv',
+      GH_TOKEN: 'existing-token',
+      NODE_AUTH_TOKEN: 'npm-token',
+      PATH: '/nix/bin',
     });
   });
 });

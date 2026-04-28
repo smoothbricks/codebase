@@ -115,10 +115,17 @@ export async function releasePublish(root: string, options: ReleasePublishOption
 export async function releaseRepairPending(root: string, options: ReleaseRepairPendingOptions): Promise<void> {
   const branch = await releaseBranch(root);
   const remote = await releaseRemote(root, branch);
+  console.log(`Repair pending releases: fetching ${remote}/${branch} and tags.`);
   await fetchReleaseRefs(root, remote, branch);
   const remoteRef = `${remote}/${branch}`;
   const restoreRef = (await gitRefExists(root, remoteRef)) ? remoteRef : await gitHead(root);
+  console.log(`Repair pending releases: planning from ${restoreRef}.`);
   const targets = await listPendingReleaseTargets(root, restoreRef);
+  console.log(
+    targets.length === 0
+      ? 'Repair pending releases: no pending durable state repairs found.'
+      : `Repair pending releases: ${targets.length} release target${targets.length === 1 ? '' : 's'} need repair.`,
+  );
   const summaries = await repairPendingTargets(releaseRepairShell(root), targets, restoreRef, options.dryRun === true);
   await writeRepairSummary(summaries, options.dryRun === true);
 }
@@ -516,15 +523,28 @@ async function listPendingReleaseTargets(root: string, ref: string): Promise<Rel
 }
 
 async function listOwnedReleaseTagRecords(root: string, ref: string): Promise<ReleaseTagRecord[]> {
+  const tags = await gitReleaseTagsByCreatorDate(root);
+  console.log(`Repair pending releases: scanning ${tags.length} local tag${tags.length === 1 ? '' : 's'}.`);
   return collectOwnedReleaseTagRecords(releasePackages(root), ref, {
-    listReleaseTagsByCreatorDate: () => gitReleaseTagsByCreatorDate(root),
+    listReleaseTagsByCreatorDate: async () => tags,
     isAncestor: (ancestor, descendant) => gitIsAncestor(root, ancestor, descendant),
     packageVersionAtRef: (packagePath, tagRef) => packageVersionAtRef(root, packagePath, tagRef),
-    durableTagState: async (pkg, tag) => ({
-      npmPublished: await npmVersionExists(root, pkg.name, pkg.version),
-      githubReleaseExists: await githubReleaseExists(root, tag),
-    }),
+    durableTagState: (pkg, tag) => durableReleaseTagState(root, pkg, tag),
   });
+}
+
+async function durableReleaseTagState(root: string, pkg: Pick<ReleasePackage, 'name' | 'version'>, tag: string) {
+  const packageVersion = `${pkg.name}@${pkg.version}`;
+  const start = Date.now();
+  console.log(`${packageVersion}: checking durable state (npm + GitHub Release ${tag}).`);
+  const [npmPublished, githubReleasePresent] = await Promise.all([
+    npmVersionExists(root, pkg.name, pkg.version),
+    githubReleaseExists(root, tag),
+  ]);
+  console.log(
+    `${packageVersion}: durable state npm=${yesNo(npmPublished)} github=${yesNo(githubReleasePresent)} (${Date.now() - start}ms).`,
+  );
+  return { npmPublished, githubReleaseExists: githubReleasePresent };
 }
 
 async function gitReleaseTagsByCreatorDate(root: string): Promise<GitReleaseTagInfo[]> {
@@ -563,6 +583,8 @@ async function listMissingGithubReleasePackages(root: string, packages: ReleaseP
 
 async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: boolean): Promise<void> {
   const currentTag = releaseTag(pkg);
+  console.log(`${pkg.name}@${pkg.version}: creating GitHub Release for ${currentTag}.`);
+  console.log(`GitHub release auth: ${envPresence('GH_TOKEN')}, ${envPresence('GITHUB_TOKEN')}.`);
   if (!dryRun) {
     await assertRemoteTagExists(root, currentTag);
   }
@@ -586,6 +608,14 @@ async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: bo
     args.push('--dry-run');
   }
   await run('nx', args, root);
+}
+
+function envPresence(name: string): string {
+  return `${name}=${process.env[name] ? 'present' : 'missing'}`;
+}
+
+function yesNo(value: boolean): string {
+  return value ? 'yes' : 'no';
 }
 
 async function newerCommitsRemain(root: string): Promise<boolean> {
