@@ -1,0 +1,202 @@
+import { describe, expect, it } from 'bun:test';
+import type { ReleasePackageInfo, ReleaseTarget } from '../core.js';
+import {
+  completeReleaseAtHead,
+  type ReleaseRepairShell,
+  type ReleaseVersionShell,
+  repairPendingTargets,
+  runReleaseVersion,
+} from '../orchestration.js';
+
+const stable: ReleasePackageInfo = { name: '@scope/stable', path: 'packages/stable', version: '1.0.0' };
+const prerelease: ReleasePackageInfo = {
+  name: '@scope/prerelease',
+  path: 'packages/prerelease',
+  version: '2.0.0-beta.1',
+};
+
+describe('release orchestration', () => {
+  it('repairs an older target with one checkout, one direnv load, npm-only build, and GitHub create calls', async () => {
+    const target = releaseTarget('older-release', [stable, prerelease], [stable], [prerelease]);
+    const shell = new RecordingRepairShell();
+
+    const summaries = await repairPendingTargets(shell, [target], 'restore-ref', false);
+
+    expect(shell.checkouts).toEqual(['older-release', 'restore-ref']);
+    expect(shell.direnvLoads).toBe(1);
+    expect(shell.builds).toEqual([['@scope/stable']]);
+    expect(shell.publishes).toEqual([{ name: '@scope/stable', distTag: 'latest', dryRun: false }]);
+    expect(shell.githubCreates).toEqual([{ name: '@scope/prerelease', dryRun: false }]);
+    expect(shell.pushes).toEqual([['@scope/stable', '@scope/prerelease']]);
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]?.published.map((pkg) => pkg.name)).toEqual(['@scope/stable']);
+    expect(summaries[0]?.githubReleases.map((pkg) => pkg.name)).toEqual(['@scope/prerelease']);
+  });
+
+  it('skips build and publish for GitHub-only repair targets', async () => {
+    const target = releaseTarget('github-only', [prerelease], [], [prerelease]);
+    const shell = new RecordingRepairShell();
+
+    await repairPendingTargets(shell, [target], 'restore-ref', false);
+
+    expect(shell.builds).toEqual([]);
+    expect(shell.publishes).toEqual([]);
+    expect(shell.githubCreates).toEqual([{ name: '@scope/prerelease', dryRun: false }]);
+  });
+
+  it('publishes a partial HEAD release by building npm-missing packages and creating missing GitHub Releases', async () => {
+    const shell = new RecordingRepairShell({ npmMissing: ['@scope/stable'], githubMissing: ['@scope/prerelease'] });
+
+    const summary = await completeReleaseAtHead(shell, [stable, prerelease], false, true);
+
+    expect(shell.checkouts).toEqual([]);
+    expect(shell.direnvLoads).toBe(0);
+    expect(shell.builds).toEqual([['@scope/stable']]);
+    expect(shell.publishes).toEqual([{ name: '@scope/stable', distTag: 'latest', dryRun: false }]);
+    expect(shell.githubCreates).toEqual([{ name: '@scope/prerelease', dryRun: false }]);
+    expect(summary.published.map((pkg) => pkg.name)).toEqual(['@scope/stable']);
+    expect(summary.alreadyPublished.map((pkg) => pkg.name)).toEqual(['@scope/prerelease']);
+    expect(summary.githubReleases.map((pkg) => pkg.name)).toEqual(['@scope/prerelease']);
+    expect(summary.rerunRequired).toBe(true);
+  });
+
+  it('leaves a complete HEAD release idempotent', async () => {
+    const shell = new RecordingRepairShell();
+
+    const summary = await completeReleaseAtHead(shell, [stable, prerelease], false, false);
+
+    expect(shell.builds).toEqual([]);
+    expect(shell.publishes).toEqual([]);
+    expect(shell.githubCreates).toEqual([]);
+    expect(summary.published).toEqual([]);
+    expect(summary.alreadyPublished.map((pkg) => pkg.name)).toEqual(['@scope/stable', '@scope/prerelease']);
+    expect(summary.githubReleases).toEqual([]);
+  });
+
+  it('does not run Nx versioning when HEAD is already a release target', async () => {
+    const shell = new RecordingVersionShell({ releasePackagesAtHead: [[stable]] });
+
+    const result = await runReleaseVersion(shell, { bump: 'patch', dryRun: false });
+
+    expect(result).toEqual({ mode: 'none', packages: [stable], status: 'already-release-target' });
+    expect(shell.nxRuns).toEqual([]);
+    expect(shell.ensureCalls).toEqual([['@scope/stable']]);
+  });
+
+  it('runs forced Nx versioning for an untagged HEAD and reports a new release commit', async () => {
+    const shell = new RecordingVersionShell({ releasePackagesAtHead: [[], [stable]], heads: ['before', 'after'] });
+
+    const result = await runReleaseVersion(shell, { bump: 'patch', dryRun: false });
+
+    expect(result).toEqual({ mode: 'new', packages: [stable], status: 'new-release' });
+    expect(shell.nxRuns).toEqual([{ bump: 'patch', dryRun: false }]);
+    expect(shell.cleanChecks).toBe(1);
+    expect(shell.ensureCalls).toEqual([['@scope/stable']]);
+  });
+});
+
+function releaseTarget(
+  sha: string,
+  packages: ReleasePackageInfo[],
+  npmPackages: ReleasePackageInfo[],
+  githubPackages: ReleasePackageInfo[],
+): ReleaseTarget<ReleasePackageInfo> {
+  return { sha, timestamp: 1, packages, npmPackages, githubPackages };
+}
+
+class RecordingRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
+  readonly checkouts: string[] = [];
+  readonly pushes: string[][] = [];
+  readonly builds: string[][] = [];
+  readonly publishes: Array<{ name: string; distTag: string; dryRun: boolean }> = [];
+  readonly githubCreates: Array<{ name: string; dryRun: boolean }> = [];
+  readonly npmQueries: string[][] = [];
+  readonly githubQueries: string[][] = [];
+  direnvLoads = 0;
+  currentRef = 'head';
+  private readonly npmMissing: Set<string>;
+  private readonly githubMissing: Set<string>;
+
+  constructor(options: { npmMissing?: string[]; githubMissing?: string[] } = {}) {
+    this.npmMissing = new Set(options.npmMissing ?? []);
+    this.githubMissing = new Set(options.githubMissing ?? []);
+  }
+
+  async gitHead(): Promise<string> {
+    return this.currentRef;
+  }
+
+  async pushReleaseRefs(packages: ReleasePackageInfo[]): Promise<boolean> {
+    this.pushes.push(packageNames(packages));
+    return true;
+  }
+
+  async listNpmMissingPackages(packages: ReleasePackageInfo[]): Promise<ReleasePackageInfo[]> {
+    this.npmQueries.push(packageNames(packages));
+    return packages.filter((pkg) => this.npmMissing.has(pkg.name));
+  }
+
+  async buildReleaseCandidate(packages: ReleasePackageInfo[]): Promise<void> {
+    this.builds.push(packageNames(packages));
+  }
+
+  async publishPackage(pkg: ReleasePackageInfo, distTag: string, dryRun: boolean): Promise<void> {
+    this.publishes.push({ name: pkg.name, distTag, dryRun });
+  }
+
+  async listGithubMissingPackages(packages: ReleasePackageInfo[]): Promise<ReleasePackageInfo[]> {
+    this.githubQueries.push(packageNames(packages));
+    return packages.filter((pkg) => this.githubMissing.has(pkg.name));
+  }
+
+  async createGithubRelease(pkg: ReleasePackageInfo, dryRun: boolean): Promise<void> {
+    this.githubCreates.push({ name: pkg.name, dryRun });
+  }
+
+  async checkout(ref: string): Promise<void> {
+    this.currentRef = ref;
+    this.checkouts.push(ref);
+  }
+
+  async withDirenvEnv<T>(runWithEnv: () => Promise<T>): Promise<T> {
+    this.direnvLoads += 1;
+    return runWithEnv();
+  }
+}
+
+class RecordingVersionShell implements ReleaseVersionShell<ReleasePackageInfo> {
+  readonly ensureCalls: string[][] = [];
+  readonly nxRuns: Array<{ bump: string; dryRun: boolean }> = [];
+  cleanChecks = 0;
+  private readonly releaseBatches: ReleasePackageInfo[][];
+  private readonly heads: string[];
+
+  constructor(options: { releasePackagesAtHead: ReleasePackageInfo[][]; heads?: string[] }) {
+    this.releaseBatches = [...options.releasePackagesAtHead];
+    this.heads = [...(options.heads ?? [])];
+  }
+
+  async releasePackagesAtHead(): Promise<ReleasePackageInfo[]> {
+    return this.releaseBatches.shift() ?? [];
+  }
+
+  async ensureLocalReleaseTags(packages: ReleasePackageInfo[]): Promise<void> {
+    this.ensureCalls.push(packageNames(packages));
+  }
+
+  async gitHead(): Promise<string> {
+    return this.heads.shift() ?? 'head';
+  }
+
+  async runNxReleaseVersion(bump: string, dryRun: boolean): Promise<void> {
+    this.nxRuns.push({ bump, dryRun });
+  }
+
+  async assertCleanGitTree(): Promise<void> {
+    this.cleanChecks += 1;
+  }
+}
+
+function packageNames(packages: ReleasePackageInfo[]): string[] {
+  return packages.map((pkg) => pkg.name);
+}

@@ -9,6 +9,22 @@ import { isRecord, stringProperty } from '../lib/json.js';
 import { decode, run, runStatus } from '../lib/run.js';
 import { listReleasePackages, readPackageJson, repositoryInfo } from '../lib/workspace.js';
 import { readPackedPackageJson, validatePackedWorkspaceDependencies } from '../monorepo/packed-manifest.js';
+import {
+  type ReleaseTagRecord as CoreReleaseTagRecord,
+  type ReleaseTarget as CoreReleaseTarget,
+  collectOwnedReleaseTagRecords,
+  type GitReleaseTagInfo,
+  pendingReleaseTargets,
+  releaseTag,
+} from './core.js';
+import {
+  completeReleaseAtHead as completeReleaseAtHeadWithShell,
+  type ReleaseCompletionShell,
+  type ReleaseSummary,
+  type ReleaseVersionMode,
+  repairPendingTargets,
+  runReleaseVersion,
+} from './orchestration.js';
 
 export interface ReleaseVersionOptions {
   bump: string;
@@ -25,8 +41,6 @@ export interface ReleaseRepairPendingOptions {
   dryRun?: boolean;
 }
 
-type ReleaseVersionMode = 'new' | 'none';
-
 export interface ReleaseTrustPublisherOptions {
   dryRun?: boolean;
   otp?: string;
@@ -37,59 +51,22 @@ export async function releaseVersion(root: string, options: ReleaseVersionOption
   const bump = releaseBumpArg(options.bump);
   const packages = releasePackages(root);
   const projects = releasePackageProjects(packages);
-
-  if (!options.dryRun) {
-    const localRelease = await releasePackagesAtHead(root, packages);
-    if (localRelease.length > 0) {
-      await ensureLocalReleaseTags(root, localRelease);
-      console.log('HEAD is already a release target; publish will complete any missing durable state.');
-      await writeReleaseGithubOutput(options.githubOutput, localRelease, 'none');
-      return;
-    }
-  }
-
-  const headBeforeVersioning = await gitHead(root);
-
-  // Nx owns local release mutation: package versions, bun.lock updates, the
-  // release commit, and annotated tags. smoo owns remote publication after the
-  // workflow validates the exact release commit Nx produced.
-  const nxArgs = ['release', 'version'];
-  if (bump !== 'auto') {
-    nxArgs.push(bump);
-  }
-  nxArgs.push(`--projects=${projects}`, '--git-commit=true', '--git-tag=true', '--git-push=false');
-  if (options.dryRun) {
-    nxArgs.push('--dry-run');
-  }
-  await run('nx', nxArgs, root);
-  if (options.dryRun) {
-    await writeReleaseGithubOutput(options.githubOutput, [], 'none');
-    return;
-  }
-
-  // Guard against future Nx/config regressions that leave release files, such
-  // as bun.lock, outside the release commit after tagging/pushing.
-  await assertCleanGitTree(root);
-  const headAfterVersioning = await gitHead(root);
-  const releasedPackages = await releasePackagesAtHead(root, releasePackages(root));
-  await ensureLocalReleaseTags(root, releasedPackages);
-  if (headAfterVersioning === headBeforeVersioning) {
-    if (releasedPackages.length > 0) {
-      console.log('HEAD is already a release target; publish will complete any missing durable state.');
-      await writeReleaseGithubOutput(options.githubOutput, releasedPackages, 'none');
-      return;
-    }
-    if (bump !== 'auto') {
-      throw new Error(`Nx did not create a release commit for forced --bump ${bump}.`);
-    }
+  const result = await runReleaseVersion(
+    {
+      releasePackagesAtHead: () => releasePackagesAtHead(root, packages),
+      ensureLocalReleaseTags: (releasePackages) => ensureLocalReleaseTags(root, releasePackages),
+      gitHead: () => gitHead(root),
+      runNxReleaseVersion: (releaseBump, dryRun) => runNxReleaseVersion(root, projects, releaseBump, dryRun),
+      assertCleanGitTree: () => assertCleanGitTree(root),
+    },
+    { bump, dryRun: options.dryRun === true },
+  );
+  if (result.status === 'already-release-target') {
+    console.log('HEAD is already a release target; publish will complete any missing durable state.');
+  } else if (result.status === 'no-release-needed') {
     console.log('Nx did not create a release commit; no release needed.');
-    await writeReleaseGithubOutput(options.githubOutput, [], 'none');
-    return;
   }
-  if (releasedPackages.length === 0) {
-    throw new Error('Nx created a release commit without current package release tags at HEAD.');
-  }
-  await writeReleaseGithubOutput(options.githubOutput, releasedPackages, 'new');
+  await writeReleaseGithubOutput(options.githubOutput, result.packages, result.mode);
 }
 
 export async function releasePublish(root: string, options: ReleasePublishOptions): Promise<void> {
@@ -98,7 +75,7 @@ export async function releasePublish(root: string, options: ReleasePublishOption
   if (packages.length === 0) {
     if (bump === 'auto') {
       console.log('No release tags found at HEAD; no release to publish.');
-      const summary: ReleaseSummary = {
+      const summary: ReleaseSummary<ReleasePackage> = {
         sha: await gitHead(root),
         dryRun: options.dryRun === true,
         packages,
@@ -114,7 +91,12 @@ export async function releasePublish(root: string, options: ReleasePublishOption
     }
     throw new Error('No release tags found at HEAD for current package versions. Run smoo release version first.');
   }
-  const summary = await completeReleaseAtHead(root, packages, options.dryRun === true, await newerCommitsRemain(root));
+  const summary = await completeReleaseAtHeadWithShell(
+    releaseCompletionShell(root),
+    packages,
+    options.dryRun === true,
+    await newerCommitsRemain(root),
+  );
   await writeReleaseSummary(summary);
 }
 
@@ -125,26 +107,7 @@ export async function releaseRepairPending(root: string, options: ReleaseRepairP
   const remoteRef = `${remote}/${branch}`;
   const restoreRef = (await gitRefExists(root, remoteRef)) ? remoteRef : await gitHead(root);
   const targets = await listPendingReleaseTargets(root, restoreRef);
-  const summaries: ReleaseSummary[] = [];
-  try {
-    for (const target of targets) {
-      await run('git', ['switch', '--detach', target.sha], root);
-      const packages = target.packages;
-      if (packages.length === 0) {
-        throw new Error(`Release commit ${target.sha} has no release packages after checkout.`);
-      }
-      console.log(`::group::Repair pending release ${target.sha.slice(0, 12)} (${packageSummary(packages)})`);
-      try {
-        await withDirenvEnv(root, async () => {
-          summaries.push(await completeRepairTargetAtHead(root, target, options.dryRun === true));
-        });
-      } finally {
-        console.log('::endgroup::');
-      }
-    }
-  } finally {
-    await run('git', ['switch', '--detach', restoreRef], root);
-  }
+  const summaries = await repairPendingTargets(releaseRepairShell(root), targets, restoreRef, options.dryRun === true);
   await writeRepairSummary(summaries, options.dryRun === true);
 }
 
@@ -196,39 +159,8 @@ interface ReleaseState {
 
 type ReleasePackage = ReturnType<typeof listReleasePackages>[number];
 
-interface ReleaseSummary {
-  sha: string;
-  dryRun: boolean;
-  packages: ReleasePackage[];
-  pushed: boolean;
-  published: ReleasePackage[];
-  alreadyPublished: ReleasePackage[];
-  githubReleases: ReleasePackage[];
-  rerunRequired: boolean;
-  noRelease: boolean;
-}
-
-interface PublishReleasePackagesResult {
-  published: ReleasePackage[];
-  alreadyPublished: ReleasePackage[];
-}
-
-interface ReleaseTarget {
-  sha: string;
-  timestamp: number;
-  packages: ReleasePackage[];
-  npmPackages: ReleasePackage[];
-  githubPackages: ReleasePackage[];
-}
-
-interface ReleaseTagRecord {
-  tag: string;
-  sha: string;
-  timestamp: number;
-  pkg: ReleasePackage;
-  needsNpmPublish: boolean;
-  needsGithubRelease: boolean;
-}
+type ReleaseTarget = CoreReleaseTarget<ReleasePackage>;
+type ReleaseTagRecord = CoreReleaseTagRecord<ReleasePackage>;
 
 async function getReleaseState(root: string): Promise<ReleaseState> {
   return getReleaseStateForPackages(root, listReleasePackages(root));
@@ -310,12 +242,23 @@ function releasePackageProjects(packages: ReleasePackage[]): string {
   return packages.map((pkg) => pkg.name).join(',');
 }
 
-async function releasePackagesAtHead(root: string, packages: ReleasePackage[]): Promise<ReleasePackage[]> {
-  return releasePackagesAtRef(root, packages, 'HEAD');
+async function runNxReleaseVersion(root: string, projects: string, bump: string, dryRun: boolean): Promise<void> {
+  // Nx owns local release mutation: package versions, bun.lock updates, the
+  // release commit, and annotated tags. smoo owns remote publication after the
+  // workflow validates the exact release commit Nx produced.
+  const nxArgs = ['release', 'version'];
+  if (bump !== 'auto') {
+    nxArgs.push(bump);
+  }
+  nxArgs.push(`--projects=${projects}`, '--git-commit=true', '--git-tag=true', '--git-push=false');
+  if (dryRun) {
+    nxArgs.push('--dry-run');
+  }
+  await run('nx', nxArgs, root);
 }
 
-function releaseTag(pkg: ReleasePackage): string {
-  return `${pkg.name}@${pkg.version}`;
+async function releasePackagesAtHead(root: string, packages: ReleasePackage[]): Promise<ReleasePackage[]> {
+  return releasePackagesAtRef(root, packages, 'HEAD');
 }
 
 async function writeReleaseGithubOutput(
@@ -449,152 +392,58 @@ async function pushReleaseRefs(root: string, packages: ReleasePackage[]): Promis
   return true;
 }
 
-async function completeReleaseAtHead(
-  root: string,
-  packages: ReleasePackage[],
-  dryRun: boolean,
-  rerunRequired: boolean,
-): Promise<ReleaseSummary> {
-  const summary: ReleaseSummary = {
-    sha: await gitHead(root),
-    dryRun,
-    packages,
-    pushed: false,
-    published: [],
-    alreadyPublished: [],
-    githubReleases: [],
-    rerunRequired,
-    noRelease: false,
+function releaseCompletionShell(root: string): ReleaseCompletionShell<ReleasePackage> {
+  return {
+    gitHead: () => gitHead(root),
+    pushReleaseRefs: (packages) => pushReleaseRefs(root, packages),
+    listNpmMissingPackages: (packages) => listUnpublishedPackages(root, packages),
+    buildReleaseCandidate: (packages) => buildReleaseCandidate(root, packages),
+    publishPackage: async (pkg, distTag, dryRun) => {
+      const packageExists = dryRun ? true : await npmPackageExists(root, pkg.name);
+      await publishPackedPackage(root, pkg, distTag, dryRun, !dryRun && !packageExists);
+    },
+    listGithubMissingPackages: (packages) => listMissingGithubReleasePackages(root, packages),
+    createGithubRelease: (pkg, dryRun) => createGithubRelease(root, pkg, dryRun),
   };
-  if (!dryRun) {
-    summary.pushed = await pushReleaseRefs(root, packages);
-  }
-  const publishResult = await publishReleasePackages(root, packages, dryRun);
-  summary.published = publishResult.published;
-  summary.alreadyPublished = publishResult.alreadyPublished;
-  summary.githubReleases = await createGithubReleases(root, packages, dryRun);
-  return summary;
 }
 
-async function completeRepairTargetAtHead(
-  root: string,
-  target: ReleaseTarget,
-  dryRun: boolean,
-): Promise<ReleaseSummary> {
-  const summary: ReleaseSummary = {
-    sha: await gitHead(root),
-    dryRun,
-    packages: target.packages,
-    pushed: false,
-    published: [],
-    alreadyPublished: [],
-    githubReleases: [],
-    rerunRequired: false,
-    noRelease: false,
+function releaseRepairShell(root: string): ReleaseCompletionShell<ReleasePackage> & {
+  checkout(ref: string): Promise<void>;
+  withDirenvEnv<T>(runWithEnv: () => Promise<T>): Promise<T>;
+  beforeRepairTarget(target: ReleaseTarget): void;
+  afterRepairTarget(target: ReleaseTarget): void;
+} {
+  return {
+    ...releaseCompletionShell(root),
+    checkout: (ref) => run('git', ['switch', '--detach', ref], root),
+    withDirenvEnv: (runWithEnv) => withDirenvEnv(root, runWithEnv),
+    beforeRepairTarget: (target) => {
+      console.log(`::group::Repair pending release ${target.sha.slice(0, 12)} (${packageSummary(target.packages)})`);
+    },
+    afterRepairTarget: () => {
+      console.log('::endgroup::');
+    },
   };
-  if (!dryRun) {
-    summary.pushed = await pushReleaseRefs(root, target.packages);
-  }
-  const publishResult = await publishReleasePackages(root, target.npmPackages, dryRun);
-  summary.published = publishResult.published;
-  summary.alreadyPublished = publishResult.alreadyPublished;
-  summary.githubReleases = await createGithubReleases(root, target.githubPackages, dryRun);
-  return summary;
-}
-
-function npmDistTagForVersion(version: string): string {
-  return version.includes('-') ? 'next' : 'latest';
 }
 
 async function listPendingReleaseTargets(root: string, ref: string): Promise<ReleaseTarget[]> {
   const head = await gitHead(root);
-  const targets = groupReleaseTargets(await listOwnedReleaseTagRecords(root, ref));
-  const pending: ReleaseTarget[] = [];
-  for (const target of targets) {
-    if (target.sha === head) {
-      continue;
-    }
-    if (target.npmPackages.length === 0 && target.githubPackages.length === 0) {
-      break;
-    }
-    pending.push(target);
-  }
-  return pending.reverse();
+  return pendingReleaseTargets(await listOwnedReleaseTagRecords(root, ref), head);
 }
 
 async function listOwnedReleaseTagRecords(root: string, ref: string): Promise<ReleaseTagRecord[]> {
-  const packages = releasePackages(root);
-  const records: ReleaseTagRecord[] = [];
-  for (const tag of await gitReleaseTagsByCreatorDate(root)) {
-    const match = releasePackageForTag(packages, tag.name);
-    if (!match || !(await gitIsAncestor(root, tag.sha, ref))) {
-      continue;
-    }
-    const versionAtTag = await packageVersionAtRef(root, match.pkg.path, tag.sha);
-    if (versionAtTag !== match.version) {
-      throw new Error(
-        `Release tag ${tag.name} points at ${tag.sha.slice(0, 12)}, but ${match.pkg.path}/package.json has version ${
-          versionAtTag ?? 'missing'
-        }.`,
-      );
-    }
-    records.push({
-      tag: tag.name,
-      sha: tag.sha,
-      timestamp: tag.timestamp,
-      pkg: { ...match.pkg, version: match.version },
-      needsNpmPublish: !(await npmVersionExists(root, match.pkg.name, match.version)),
-      needsGithubRelease: !(await githubReleaseExists(root, tag.name)),
-    });
-  }
-  return records;
+  return collectOwnedReleaseTagRecords(releasePackages(root), ref, {
+    listReleaseTagsByCreatorDate: () => gitReleaseTagsByCreatorDate(root),
+    isAncestor: (ancestor, descendant) => gitIsAncestor(root, ancestor, descendant),
+    packageVersionAtRef: (packagePath, tagRef) => packageVersionAtRef(root, packagePath, tagRef),
+    durableTagState: async (pkg, tag) => ({
+      npmPublished: await npmVersionExists(root, pkg.name, pkg.version),
+      githubReleaseExists: await githubReleaseExists(root, tag),
+    }),
+  });
 }
 
-function groupReleaseTargets(records: ReleaseTagRecord[]): ReleaseTarget[] {
-  const targets = new Map<string, ReleaseTarget>();
-  const packageNamesByTarget = new Map<string, Set<string>>();
-  for (const record of records) {
-    let target = targets.get(record.sha);
-    let packageNames = packageNamesByTarget.get(record.sha);
-    if (!target) {
-      target = { sha: record.sha, timestamp: record.timestamp, packages: [], npmPackages: [], githubPackages: [] };
-      targets.set(record.sha, target);
-      packageNames = new Set<string>();
-      packageNamesByTarget.set(record.sha, packageNames);
-    } else if (record.timestamp > target.timestamp) {
-      target.timestamp = record.timestamp;
-    }
-    if (!packageNames) {
-      throw new Error(`Release target ${record.sha.slice(0, 12)} lost package tracking state.`);
-    }
-    if (packageNames.has(record.pkg.name)) {
-      throw new Error(
-        `Release target ${record.sha.slice(0, 12)} has more than one release tag for ${record.pkg.name}.`,
-      );
-    }
-    packageNames.add(record.pkg.name);
-    if (record.needsNpmPublish || record.needsGithubRelease) {
-      target.packages.push(record.pkg);
-    }
-    if (record.needsNpmPublish) {
-      target.npmPackages.push(record.pkg);
-    }
-    if (record.needsGithubRelease) {
-      target.githubPackages.push(record.pkg);
-    }
-  }
-  return [...targets.values()].sort(
-    (left, right) => right.timestamp - left.timestamp || right.sha.localeCompare(left.sha),
-  );
-}
-
-interface GitReleaseTag {
-  name: string;
-  sha: string;
-  timestamp: number;
-}
-
-async function gitReleaseTagsByCreatorDate(root: string): Promise<GitReleaseTag[]> {
+async function gitReleaseTagsByCreatorDate(root: string): Promise<GitReleaseTagInfo[]> {
   const result =
     await $`git for-each-ref --sort=-creatordate --format=${'%(refname:short)%09%(creatordate:unix)%09%(*objectname)%09%(objectname)'} refs/tags`
       .cwd(root)
@@ -618,63 +467,14 @@ async function gitReleaseTagsByCreatorDate(root: string): Promise<GitReleaseTag[
     });
 }
 
-function releasePackageForTag(
-  packages: ReleasePackage[],
-  tag: string,
-): { pkg: ReleasePackage; version: string } | null {
-  for (const pkg of packages) {
-    const prefix = `${pkg.name}@`;
-    if (tag.startsWith(prefix)) {
-      const version = tag.slice(prefix.length);
-      if (!version) {
-        throw new Error(`Release tag ${tag} does not include a version.`);
-      }
-      return { pkg, version };
-    }
-  }
-  return null;
-}
-
 async function buildReleaseCandidate(root: string, packages: ReleasePackage[]): Promise<void> {
   await run('nx', ['run-many', '-t', 'build', `--projects=${releasePackageProjects(packages)}`], root);
 }
 
-async function publishReleasePackages(
-  root: string,
-  packages: ReleasePackage[],
-  dryRun: boolean,
-): Promise<PublishReleasePackagesResult> {
-  const unpublishedPackages = await listUnpublishedPackages(root, packages);
-  const alreadyPublished = packages.filter((pkg) => !unpublishedPackages.includes(pkg));
-  if (unpublishedPackages.length > 0) {
-    await buildReleaseCandidate(root, unpublishedPackages);
-  }
-  for (const pkg of unpublishedPackages) {
-    const packageExists = dryRun ? true : await npmPackageExists(root, pkg.name);
-    await publishPackedPackage(root, pkg, npmDistTagForVersion(pkg.version), dryRun, !dryRun && !packageExists);
-  }
-  return { published: dryRun ? [] : unpublishedPackages, alreadyPublished };
-}
-
-async function createGithubReleases(
-  root: string,
-  packages: ReleasePackage[],
-  dryRun: boolean,
-): Promise<ReleasePackage[]> {
-  const missing = dryRun
-    ? packages
-    : (
-        await Promise.all(
-          packages.map(async (pkg) => ((await githubReleaseExists(root, releaseTag(pkg))) ? null : pkg)),
-        )
-      ).filter((pkg): pkg is ReleasePackage => pkg !== null);
-  for (const pkg of packages) {
-    if (!missing.includes(pkg)) {
-      continue;
-    }
-    await createGithubRelease(root, pkg, dryRun);
-  }
-  return dryRun ? [] : missing;
+async function listMissingGithubReleasePackages(root: string, packages: ReleasePackage[]): Promise<ReleasePackage[]> {
+  return (
+    await Promise.all(packages.map(async (pkg) => ((await githubReleaseExists(root, releaseTag(pkg))) ? null : pkg)))
+  ).filter((pkg): pkg is ReleasePackage => pkg !== null);
 }
 
 async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: boolean): Promise<void> {
@@ -716,7 +516,7 @@ async function newerCommitsRemain(root: string): Promise<boolean> {
   return head !== (await gitSha(root, remoteRef)) && (await gitIsAncestor(root, head, remoteRef));
 }
 
-async function writeReleaseSummary(summary: ReleaseSummary): Promise<void> {
+async function writeReleaseSummary(summary: ReleaseSummary<ReleasePackage>): Promise<void> {
   const shortSha = summary.sha.slice(0, 12);
   const lines = [
     '## Release Summary',
@@ -746,7 +546,7 @@ async function writeReleaseSummary(summary: ReleaseSummary): Promise<void> {
   }
 }
 
-async function writeRepairSummary(summaries: ReleaseSummary[], dryRun: boolean): Promise<void> {
+async function writeRepairSummary(summaries: Array<ReleaseSummary<ReleasePackage>>, dryRun: boolean): Promise<void> {
   const lines = ['## Pending Release Repair', '', `- Mode: ${dryRun ? 'dry run' : 'release'}`];
   if (summaries.length === 0) {
     lines.push('- Result: no pending releases needed repair');

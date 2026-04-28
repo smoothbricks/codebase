@@ -6,6 +6,9 @@
   "bin": {
     "smoo": "./bin/smoo"
   },
+  "scripts": {
+    "test": "bun test"
+  },
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -55,9 +58,22 @@
     "sherif": "^1.11.1",
     "tslib": "^2.8.1"
   },
+  "devDependencies": {
+    "fast-check": "^4.4.0"
+  },
   "nx": {
     "targets": {
-      "lint": {}
+      "lint": {},
+      "typecheck-tests": {
+        "executor": "nx:run-commands",
+        "options": {
+          "command": "tsc --noEmit -p tsconfig.test.json",
+          "cwd": "packages/cli"
+        },
+        "dependsOn": [
+          "build"
+        ]
+      }
     },
     "tags": [
       "npm:public"
