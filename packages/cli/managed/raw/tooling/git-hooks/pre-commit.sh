@@ -10,10 +10,5 @@ set -e -o pipefail
 git-format-staged
 
 # Adding a workspace package is rare and easy to leave half-wired. Run the
-# full monorepo validator only for newly staged package manifests; --fail-fast
-# keeps pre-commit output focused on the first blocking setup issue.
-if ! git diff --cached --quiet --diff-filter=A -- \
-  'packages/*/package.json' \
-  'targets/*/package.json'; then
-  smoo monorepo validate --fail-fast
-fi
+# full monorepo validator only for newly staged package manifests.
+smoo monorepo validate --fail-fast --only-if-new-workspace-package

@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
 import { $ } from 'bun';
 import { decode, run, runStatus } from '../lib/run.js';
-import { listPublicPackages, readPackageJson, repositoryInfo } from '../lib/workspace.js';
+import { listReleasePackages, readPackageJson, repositoryInfo } from '../lib/workspace.js';
 import { readPackedPackageJson, validatePackedWorkspaceDependencies } from '../monorepo/packed-manifest.js';
 
 export interface ReleaseVersionOptions {
@@ -32,10 +32,9 @@ export interface ReleaseTrustPublisherOptions {
 
 export async function releaseVersion(root: string, options: ReleaseVersionOptions): Promise<void> {
   const bump = releaseBumpArg(options.bump);
-  const projects = listPublicPackages(root)
-    .map((pkg) => pkg.name)
-    .join(',');
-  const state = await getReleaseState(root);
+  const packages = releasePackages(root);
+  const projects = releasePackageProjects(packages);
+  const state = await getReleaseStateForPackages(packages);
   if (state.allPublished) {
     console.log('Current package versions are already published; skipping version bump.');
     return;
@@ -106,9 +105,9 @@ export async function releaseGithubRelease(root: string, options: ReleaseGithubO
 export async function releaseTrustPublisher(root: string, options: ReleaseTrustPublisherOptions): Promise<void> {
   const repository = githubRepositoryFromRootPackage(root);
   const workflow = 'publish.yml';
-  const packages = listPublicPackages(root);
+  const packages = listReleasePackages(root);
   if (packages.length === 0) {
-    throw new Error('No npm:public packages found.');
+    throw new Error('No owned release packages found.');
   }
 
   if (!options.dryRun) {
@@ -149,10 +148,13 @@ interface ReleaseState {
   allPublished: boolean;
 }
 
-type PublicPackage = ReturnType<typeof listPublicPackages>[number];
+type ReleasePackage = ReturnType<typeof listReleasePackages>[number];
 
 async function getReleaseState(root: string): Promise<ReleaseState> {
-  const packages = listPublicPackages(root);
+  return getReleaseStateForPackages(listReleasePackages(root));
+}
+
+async function getReleaseStateForPackages(packages: ReleasePackage[]): Promise<ReleaseState> {
   const states = await Promise.all(
     packages.map(async (pkg) => {
       const published = await npmVersionExists(pkg.name, pkg.version);
@@ -162,15 +164,15 @@ async function getReleaseState(root: string): Promise<ReleaseState> {
   return { packages: states, allPublished: states.every((state) => state.published) };
 }
 
-async function listUnpublishedPackages(root: string): Promise<PublicPackage[]> {
-  const packages = listPublicPackages(root);
+async function listUnpublishedPackages(root: string): Promise<ReleasePackage[]> {
+  const packages = releasePackages(root);
   const states = await Promise.all(
     packages.map(async (pkg) => ({ pkg, published: await npmVersionExists(pkg.name, pkg.version) })),
   );
   return states.filter((state) => !state.published).map((state) => state.pkg);
 }
 
-async function publishPackedPackage(root: string, pkg: PublicPackage, tag: string, dryRun: boolean): Promise<void> {
+async function publishPackedPackage(root: string, pkg: ReleasePackage, tag: string, dryRun: boolean): Promise<void> {
   const tempDir = await mkdtemp(join(tmpdir(), 'smoo-publish-'));
   const tarball = join(tempDir, `${safeTarballPrefix(pkg.name)}-${pkg.version}.tgz`);
   try {
@@ -195,12 +197,24 @@ function safeTarballPrefix(name: string): string {
   return name.replace(/^@/, '').replace(/[^a-zA-Z0-9._-]+/g, '-');
 }
 
-async function assertPackedWorkspaceDependencies(root: string, tarball: string, pkg: PublicPackage): Promise<void> {
+async function assertPackedWorkspaceDependencies(root: string, tarball: string, pkg: ReleasePackage): Promise<void> {
   const manifest = await readPackedPackageJson(root, tarball, pkg.name);
   const failures = validatePackedWorkspaceDependencies(root, pkg, manifest);
   if (failures.length > 0) {
     throw new Error(failures.join('\n'));
   }
+}
+
+function releasePackages(root: string): ReleasePackage[] {
+  const packages = listReleasePackages(root);
+  if (packages.length === 0) {
+    throw new Error('No owned release packages found.');
+  }
+  return packages;
+}
+
+function releasePackageProjects(packages: ReleasePackage[]): string {
+  return packages.map((pkg) => pkg.name).join(',');
 }
 
 async function npmVersionExists(name: string, version: string): Promise<boolean> {

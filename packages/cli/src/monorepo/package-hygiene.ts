@@ -5,7 +5,7 @@ export async function fixPackageHygiene(root: string): Promise<void> {
 }
 
 export async function validatePackageHygiene(root: string): Promise<number> {
-  const status = await runStatus('sherif', [], root);
+  const status = await runStatus('sherif', ['--fail-on-warnings'], root);
   if (status !== 0) {
     console.error('sherif package hygiene validation failed');
     return 1;

@@ -1,7 +1,7 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readPackageJson } from '../lib/workspace.js';
+import { listReleasePackages, readPackageJson } from '../lib/workspace.js';
 
 type ManagedKind = 'raw' | 'template';
 
@@ -10,11 +10,18 @@ interface ManagedFile {
   source: string;
   target: string;
   executable?: boolean;
+  releasePackagesOnly?: boolean;
 }
 
 export interface FileResult {
   target: string;
-  action: 'created' | 'updated' | 'unchanged' | 'skipped-symlink' | 'drifted' | 'ok-symlink';
+  action: 'created' | 'updated' | 'unchanged' | 'skipped' | 'skipped-symlink' | 'drifted' | 'ok-symlink';
+}
+
+interface ManagedFileContext {
+  hasReleasePackages: boolean;
+  nodeModulesCacheKey: string;
+  repoName: string;
 }
 
 const managedFiles: ManagedFile[] = [
@@ -50,6 +57,7 @@ const managedFiles: ManagedFile[] = [
     kind: 'template',
     source: 'github/workflows/publish.yml',
     target: '.github/workflows/publish.yml',
+    releasePackagesOnly: true,
   },
   {
     kind: 'template',
@@ -81,12 +89,21 @@ const managedFiles: ManagedFile[] = [
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 export function applyManagedFiles(root: string, mode: 'update' | 'check' | 'diff'): FileResult[] {
-  return managedFiles.map((file) => applyManagedFile(root, file, mode));
+  const context = getManagedFileContext(root);
+  return managedFiles.map((file) => applyManagedFile(root, file, mode, context));
 }
 
-function applyManagedFile(root: string, file: ManagedFile, mode: 'update' | 'check' | 'diff'): FileResult {
+function applyManagedFile(
+  root: string,
+  file: ManagedFile,
+  mode: 'update' | 'check' | 'diff',
+  context: ManagedFileContext,
+): FileResult {
+  if (file.releasePackagesOnly === true && !context.hasReleasePackages) {
+    return { target: file.target, action: 'skipped' };
+  }
   const target = resolve(root, file.target);
-  const content = getManagedContent(root, file);
+  const content = getManagedContent(file, context);
   if (existsSync(target)) {
     const info = lstatSync(target);
     if (info.isSymbolicLink()) {
@@ -112,23 +129,29 @@ function applyManagedFile(root: string, file: ManagedFile, mode: 'update' | 'che
   return { target: file.target, action: 'created' };
 }
 
-function getManagedContent(root: string, file: ManagedFile): string {
+function getManagedContent(file: ManagedFile, context: ManagedFileContext): string {
   const sourceRoot = file.kind === 'raw' ? 'managed/raw' : 'managed/templates';
   const sourcePath = join(packageRoot, sourceRoot, file.source);
   const content = readFileSync(sourcePath, 'utf8');
   if (file.kind === 'raw') {
     return content;
   }
-  return renderTemplate(root, content);
+  return renderTemplate(context, content);
 }
 
-function renderTemplate(root: string, template: string): string {
+function getManagedFileContext(root: string): ManagedFileContext {
   const packageJson = readPackageJson(join(root, 'package.json'));
   const repoName = packageJson?.name ?? 'monorepo';
   const nodeModulesCacheKey = existsSync(join(root, 'bun.lock'))
     ? `$${"{{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json') }}"}`
     : `$${"{{ hashFiles('bun.lockb', 'package.json', 'packages/*/package.json') }}"}`;
-  return template.replaceAll('{{REPO_NAME}}', repoName).replaceAll('{{NODE_MODULES_CACHE_KEY}}', nodeModulesCacheKey);
+  return { hasReleasePackages: listReleasePackages(root, packageJson).length > 0, nodeModulesCacheKey, repoName };
+}
+
+function renderTemplate(context: ManagedFileContext, template: string): string {
+  return template
+    .replaceAll('{{REPO_NAME}}', context.repoName)
+    .replaceAll('{{NODE_MODULES_CACHE_KEY}}', context.nodeModulesCacheKey);
 }
 
 function writeManagedFile(path: string, content: string, executable: boolean): void {

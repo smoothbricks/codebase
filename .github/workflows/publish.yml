@@ -61,9 +61,9 @@ jobs:
         run: smoo monorepo check
 
       # Step 5
-      - name: 📦 Resolve release projects
+      - name: 📦 Resolve release packages
         id: projects
-        run: echo "projects=$(smoo monorepo list-public-projects)" >> "$GITHUB_OUTPUT"
+        run: smoo monorepo list-release-packages --fail-empty --github-output "$GITHUB_OUTPUT"
 
       # Step 6
       - name: 🔨 Build

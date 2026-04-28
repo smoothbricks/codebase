@@ -15,7 +15,9 @@ import {
   getWorkspacePackages,
   listPackageJsonRecords,
   listPublicPackages,
+  packageRepositoryInfo,
   repositoryInfo,
+  sameRepositoryAfterNormalization,
   workspaceDependencyFields,
 } from '../lib/workspace.js';
 
@@ -25,22 +27,28 @@ export function applyPublicPackageDefaults(root: string): void {
   const rootPackage = requiredJsonObject(join(root, 'package.json'));
   const rootLicense = stringProperty(rootPackage, 'license');
   const rootRepository = repositoryInfo(rootPackage);
-  if (!rootLicense) {
-    throw new Error('Root package.json must define license before public package defaults can be applied.');
-  }
-  if (!rootRepository) {
-    throw new Error('Root package.json must define repository.url before public package defaults can be applied.');
-  }
 
   for (const pkg of listPublicPackages(root)) {
     let changed = false;
-    changed = setMissingStringProperty(pkg.json, 'license', rootLicense) || changed;
+    const existingRepository = packageRepositoryInfo(pkg);
+    if (
+      existingRepository &&
+      rootRepository &&
+      existingRepository.url === rootRepository.url &&
+      rootLicense &&
+      rootLicense !== 'UNLICENSED'
+    ) {
+      changed = setMissingStringProperty(pkg.json, 'license', rootLicense) || changed;
+    }
     const publishConfig = getOrCreateRecord(pkg.json, 'publishConfig');
     changed = setStringProperty(publishConfig, 'access', 'public') || changed;
 
     const repository = getOrCreateRecord(pkg.json, 'repository');
-    changed = setStringProperty(repository, 'type', rootRepository.type) || changed;
-    changed = setStringProperty(repository, 'url', rootRepository.url) || changed;
+    changed =
+      setStringProperty(repository, 'type', existingRepository?.type ?? rootRepository?.type ?? 'git') || changed;
+    if (existingRepository && !stringProperty(repository, 'url')) {
+      changed = setStringProperty(repository, 'url', existingRepository.url) || changed;
+    }
     changed = setStringProperty(repository, 'directory', pkg.path.replaceAll('\\', '/')) || changed;
     changed = normalizeExportConditionOrder(pkg.json.exports) || changed;
     if (hasDevelopmentSourceExport(pkg.json.exports)) {
@@ -182,10 +190,6 @@ export function validatePublicTags(root: string): number {
       console.error(`${pkg.path}: private package must not have nx tag npm:public`);
       failures++;
     }
-    if (!pkg.private && !hasPublicTag) {
-      console.error(`${pkg.path}: public package must have nx tag npm:public`);
-      failures++;
-    }
   }
   if (failures > 0) {
     return failures;
@@ -199,6 +203,10 @@ export function validatePublicPackageMetadata(root: string): number {
   const rootRepository = rootPackage ? repositoryInfo(rootPackage) : null;
   let failures = 0;
   for (const pkg of listPublicPackages(root)) {
+    if (pkg.private) {
+      console.error(`${pkg.path}: npm:public package must not be private`);
+      failures++;
+    }
     if (!stringProperty(pkg.json, 'license')) {
       console.error(`${pkg.path}: public package must define license`);
       failures++;
@@ -209,9 +217,25 @@ export function validatePublicPackageMetadata(root: string): number {
       failures++;
     }
     const repository = recordProperty(pkg.json, 'repository');
-    const packageRepository = repository ? repositoryInfo(pkg.json) : null;
-    if (!rootRepository || !packageRepository || packageRepository.url !== rootRepository.url) {
-      console.error(`${pkg.path}: public package repository.url must match root package.json repository.url`);
+    const packageRepository = packageRepositoryInfo(pkg);
+    if (!packageRepository) {
+      console.error(`${pkg.path}: public package must define repository.url`);
+      failures++;
+    }
+    if (
+      rootRepository &&
+      packageRepository &&
+      packageRepository.url !== rootRepository.url &&
+      sameRepositoryAfterNormalization(packageRepository.url, rootRepository.url)
+    ) {
+      console.error(
+        `${pkg.path}: repository.url refers to the root repository but is not an exact match. ` +
+          `Use ${rootRepository.url}`,
+      );
+      failures++;
+    }
+    if (!repository || !stringProperty(repository, 'type')) {
+      console.error(`${pkg.path}: public package must define repository.type`);
       failures++;
     }
     if (!repository || stringProperty(repository, 'directory') !== pkg.path.replaceAll('\\', '/')) {

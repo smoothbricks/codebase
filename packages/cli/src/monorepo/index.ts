@@ -1,5 +1,7 @@
-import { readFileSync } from 'node:fs';
-import { listPublicPackages } from '../lib/workspace.js';
+import { appendFileSync, readFileSync } from 'node:fs';
+import { $ } from 'bun';
+import { decode } from '../lib/run.js';
+import { escapeRegex, getWorkspacePatterns, listReleasePackages } from '../lib/workspace.js';
 import { validateCommitMessage } from './commit-msg.js';
 import { applyWorkspaceGitConfig } from './git-config.js';
 import { syncBunLockfileVersions } from './lockfile.js';
@@ -15,6 +17,12 @@ export interface InitOptions {
 
 export interface ValidateOptions {
   failFast?: boolean;
+  onlyIfNewWorkspacePackage?: boolean;
+}
+
+export interface ListReleasePackagesOptions {
+  failEmpty?: boolean;
+  githubOutput?: string;
 }
 
 export async function initMonorepo(root: string, options: InitOptions): Promise<void> {
@@ -28,9 +36,13 @@ export async function initMonorepo(root: string, options: InitOptions): Promise<
 }
 
 export async function validateMonorepo(root: string, options: ValidateOptions = {}): Promise<void> {
+  if (options.onlyIfNewWorkspacePackage && !(await hasNewWorkspacePackage(root))) {
+    return;
+  }
   const failures = await runValidatePacks({ root, syncRuntime: false }, options);
   if (failures > 0) {
-    throw new Error(`Monorepo validation failed with ${failures} problem(s).`);
+    const noun = failures === 1 ? 'problem' : 'problems';
+    throw new Error(`\n== summary ==\n❌ Monorepo validation failed with ${failures} ${noun}.`);
   }
   console.log('\n== summary ==');
   console.log('Monorepo configuration is valid.');
@@ -63,10 +75,17 @@ export function validateCommitMessageFile(path: string | undefined): void {
   }
 }
 
-export function listPublicProjects(root: string): string {
-  return listPublicPackages(root)
+export function listReleasePackagesForNx(root: string, options: ListReleasePackagesOptions = {}): string {
+  const packages = listReleasePackages(root)
     .map((pkg) => pkg.name)
     .join(',');
+  if (!packages && options.failEmpty) {
+    throw new Error('No owned release packages found.');
+  }
+  if (options.githubOutput) {
+    appendFileSync(options.githubOutput, `projects=${packages}\n`);
+  }
+  return packages;
 }
 
 export function validatePublicPackageTags(root: string): void {
@@ -76,3 +95,24 @@ export function validatePublicPackageTags(root: string): void {
 }
 
 export { applyWorkspaceGitConfig, syncBunLockfileVersions };
+
+async function hasNewWorkspacePackage(root: string): Promise<boolean> {
+  const result = await $`git diff --cached --name-only --diff-filter=A -- ${'*/package.json'}`
+    .cwd(root)
+    .quiet()
+    .nothrow();
+  if (result.exitCode !== 0) {
+    throw new Error('Unable to inspect staged package manifests.');
+  }
+  const manifests = decode(result.stdout)
+    .split('\n')
+    .map((path) => path.trim())
+    .filter(Boolean);
+  if (manifests.length === 0) {
+    return false;
+  }
+  const patterns = getWorkspacePatterns(root)
+    .filter((pattern) => pattern.endsWith('/*'))
+    .map((pattern) => new RegExp(`^${escapeRegex(pattern.slice(0, -2))}/[^/]+/package\\.json$`));
+  return manifests.some((manifest) => patterns.some((pattern) => pattern.test(manifest)));
+}

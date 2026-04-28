@@ -34,7 +34,8 @@ function buildProgram(): Command {
   monorepo
     .command('validate')
     .option('--fail-fast', 'stop after the first failing validation pack')
-    .action(async (options: { failFast?: boolean }) => {
+    .option('--only-if-new-workspace-package', 'skip validation unless a new workspace package manifest is staged')
+    .action(async (options: { failFast?: boolean; onlyIfNewWorkspacePackage?: boolean }) => {
       const { validateMonorepo } = await import('./monorepo/index.js');
       await validateMonorepo(await findRepoRoot(), options);
     });
@@ -58,20 +59,26 @@ function buildProgram(): Command {
     const { syncBunLockfileVersions } = await import('./monorepo/index.js');
     syncBunLockfileVersions(await findRepoRoot());
   });
-  monorepo.command('list-public-projects').action(async () => {
-    const { listPublicProjects } = await import('./monorepo/index.js');
-    console.log(listPublicProjects(await findRepoRoot()));
-  });
+  monorepo
+    .command('list-release-packages')
+    .option('--fail-empty', 'fail when no owned release packages are found')
+    .option('--github-output <path>', 'append projects=<packages> to a GitHub Actions output file')
+    .action(async (options: { failEmpty?: boolean; githubOutput?: string }) => {
+      const { listReleasePackagesForNx } = await import('./monorepo/index.js');
+      const packages = listReleasePackagesForNx(await findRepoRoot(), options);
+      if (!options.githubOutput) {
+        console.log(packages);
+      }
+    });
   monorepo.command('validate-public-tags').action(async () => {
     const { validatePublicPackageTags } = await import('./monorepo/index.js');
     validatePublicPackageTags(await findRepoRoot());
   });
-  monorepo.command('release-state').action(async () => {
+  const release = program.command('release').description('Version, publish, and create GitHub Releases');
+  release.command('npm-status').action(async () => {
     const { printReleaseState } = await import('./release/index.js');
     await printReleaseState(await findRepoRoot());
   });
-
-  const release = program.command('release').description('Version, publish, and create GitHub Releases');
   release
     .command('version')
     .option('--bump <bump>', 'auto, patch, minor, major, or prerelease', 'auto')
@@ -105,7 +112,7 @@ function buildProgram(): Command {
     );
   release
     .command('trust-publisher')
-    .description('Configure npm trusted publishing for public packages')
+    .description('Configure npm trusted publishing for owned release packages')
     .option('--dry-run [dryRun]', 'show npm trust changes without saving them')
     .option('--otp <otp>', 'npm one-time password for trust operations')
     .option('--skip-login', 'skip npm browser login before configuring trust')

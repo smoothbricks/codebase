@@ -28,16 +28,16 @@ directly. Published installs use the package binary in `bin/smoo`, which imports
 
 ```bash
 smoo monorepo init [--runtime-only] [--sync-runtime]
-smoo monorepo validate
+smoo monorepo validate [--fail-fast] [--only-if-new-workspace-package]
 smoo monorepo update
 smoo monorepo check
 smoo monorepo diff
 smoo monorepo validate-commit-msg <commit-msg-file>
 smoo monorepo sync-bun-lockfile-versions
-smoo monorepo list-public-projects
+smoo monorepo list-release-packages [--fail-empty] [--github-output <path>]
 smoo monorepo validate-public-tags
-smoo monorepo release-state
 
+smoo release npm-status
 smoo release version --bump <auto|patch|minor|major|prerelease> [--dry-run]
 smoo release publish --bump <auto|patch|minor|major|prerelease> [--tag <tag>] [--npm-tag <tag>] [--dry-run]
 smoo release github-release --tags <tags> --bump <auto|patch|minor|major|prerelease> [--tag <tag>] [--npm-tag <tag>] [--dry-run]
@@ -55,10 +55,11 @@ only reporting drift.
 
 It currently:
 
-- Updates managed CI, release, hook, and formatting files.
+- Updates managed CI, release, hook, and formatting files. The publish workflow is only written when the repo has owned
+  release packages.
 - Ensures the local `tooling/smoo` source shim is executable when present.
 - Synchronizes root runtime versions inside devenv, or when `--sync-runtime` is passed.
-- Applies publish metadata defaults to `npm:public` packages.
+- Applies safe publish metadata defaults to `npm:public` packages without inferring package ownership.
 - Normalizes internal workspace dependency ranges to `workspace:*`.
 - Runs [`sherif --fix --select highest`][sherif] for broad monorepo package hygiene.
 - Normalizes conditional export ordering so `types` comes first and `default` comes last.
@@ -91,7 +92,7 @@ It checks:
 - Public package tag policy.
 - Public package metadata.
 - Workspace dependency ranges.
-- [`sherif`] package hygiene.
+- [`sherif`] package hygiene, with warnings treated as validation failures.
 - Packed public package artifacts with [`publint`].
 - Packed public package type resolution with the [`attw`][are-the-types-wrong] CLI.
 
@@ -102,6 +103,11 @@ tarball.
 The [`attw`][are-the-types-wrong] check uses the `node16` profile and ignores the CJS-to-ESM warning. SmoothBricks
 packages are [ESM]-first, so [CommonJS] consumers can use dynamic import. Node 10-only subpath failures are
 intentionally ignored because [Node.js] 10 is not part of the supported package contract.
+
+`smoo monorepo validate --only-if-new-workspace-package` first checks the staged git diff for newly added workspace
+package manifests. If none are staged, it exits successfully without running the full validator. The generated
+pre-commit hook uses this mode so adding a package rechecks conditional managed files, including whether the publish
+workflow is now required, without making every commit pay for full validation.
 
 ## Publishable Packages
 
@@ -115,23 +121,39 @@ Publishability is declared with an [Nx] tag:
 }
 ```
 
-This tag is the source of truth for release selection, metadata validation, and publish artifact validation. `smoo`
-never relies on a second hardcoded package list.
+This tag is the source of truth for public npm metadata and publish artifact validation. Release selection adds one more
+convention: a package is released by the current repository only when its `repository.url` exactly matches the root
+`package.json` `repository.url`. Equivalent-but-different spellings, such as `git+https` vs SSH for the same GitHub
+repo, fail validation because ownership should be explicit and visually obvious. This lets a workspace mirror public
+packages from another repository without publishing them from the mirror.
 
 Rules:
 
-- Publishable packages must not be private.
-- Private packages must not have `npm:public`.
-- Every non-private workspace package must have `npm:public`.
+- `npm:public` packages must not be `private: true`.
+- `private: true` packages must not have `npm:public`.
 - Public packages must define license metadata.
 - Public packages must publish with `publishConfig.access = "public"`.
-- Public package repositories must point at the root repo and include `repository.directory`.
+- Public packages must define `repository.type`, `repository.url`, and `repository.directory`.
 - Public packages must define `files`.
 - Public library packages must define `types`.
 - Public packages must define either `exports` or `bin`.
 
-`smoo monorepo init` fixes the metadata that can be derived from the root package. For example, it copies the root
-license and repository URL, then sets each package's `repository.directory` from its workspace path.
+Owned public packages may inherit the root license when the root license is not `UNLICENSED`. Mirrored public packages
+must carry their own license. `smoo monorepo init` does not copy the root `repository.url` into packages; a missing
+package `repository.url` is a validation failure so new packages must consciously choose whether they are owned by the
+current repository or mirrored from another one. Init still sets `publishConfig.access = "public"`, repository type,
+repository directory, export ordering, and source-file publish entries when those can be derived safely.
+
+`smoo monorepo list-release-packages` prints the comma-separated package names that are both `npm:public` and owned by
+the current repository. Release commands, trusted-publisher setup, and the managed publish workflow use this owned
+release package list instead of every public package in the workspace.
+
+For [GitHub Actions], `smoo monorepo list-release-packages --fail-empty --github-output "$GITHUB_OUTPUT"` appends the
+`projects=<package-list>` output expected by the managed publish workflow and fails with a clear error when no owned
+release packages exist.
+
+`smoo release npm-status` shows whether each owned release package's current `name@version` already exists on npm. It is
+an npm registry check, not a full release workflow status check.
 
 ## Managed Files
 
@@ -148,6 +170,9 @@ Managed files include:
 When a managed target is a symlink, `smoo` leaves it alone. SmoothBricks uses symlinks back to `packages/cli/managed` so
 changes to the CLI package are tested immediately. Downstream repos receive ordinary committed copies.
 
+The publish workflow is conditional. Repositories with no owned release packages skip `.github/workflows/publish.yml` in
+`init`, `check`, and `diff`; adding a new owned package makes the workflow required on the next validation run.
+
 Use:
 
 ```bash
@@ -162,6 +187,10 @@ smoo monorepo diff
 
 The generated pre-commit hook runs [`git-format-staged`][git-format-staged] from the repository root with `tooling`,
 `node_modules/.bin`, and the [devenv] profile on `PATH`.
+
+After formatting, the hook runs `smoo monorepo validate --fail-fast --only-if-new-workspace-package`. This keeps normal
+commits fast while still catching incomplete package setup and conditional managed-file drift when a new workspace
+package manifest is staged.
 
 The generated commit-msg hook delegates conventional commit validation to:
 
@@ -217,7 +246,7 @@ Versioning:
 
 - `--bump auto` uses [Nx Release][nx-release] [Conventional Commits] versioning.
 - `--bump patch|minor|major|prerelease` forces the release specifier.
-- Release projects are discovered from `npm:public` packages.
+- Release packages are discovered from `npm:public` packages whose `repository.url` exactly matches the root package.
 - [Nx Release][nx-release] config must use `currentVersionResolver: "git-tag"` with
   `fallbackCurrentVersionResolver: "disk"`. Conventional-commit versioning requires git tags as the primary source,
   while the disk fallback supports initial releases before package tags exist.
@@ -242,7 +271,7 @@ Publishing:
 - `prerelease` publishes with npm dist-tag `next`.
 - Stable bumps publish with npm dist-tag `latest`.
 - Conflicting explicit dist-tags are rejected.
-- `smoo release publish` checks every current `name@version` for `npm:public` packages before publishing. Already
+- `smoo release publish` checks every current `name@version` for owned release packages before publishing. Already
   published versions are skipped, so reruns after auth or network failures retry only the package versions npm does not
   have yet.
 - Publish uses `bun pm pack` to create package tarballs, then publishes those tarballs with latest npm CLI and
@@ -253,7 +282,7 @@ Publishing:
   [GitHub Actions OIDC][github-actions-oidc] from the workflow's `id-token: write` permission. Before trusted publishing
   exists, the managed workflow passes `secrets.NPM_TOKEN` as `NODE_AUTH_TOKEN` and smoo writes a temporary npm user
   config for bootstrap publishing.
-- `smoo release trust-publisher` configures [npm trusted publishing][npm-trusted-publishing] for every `npm:public`
+- `smoo release trust-publisher` configures [npm trusted publishing][npm-trusted-publishing] for every owned release
   package. It uses the root `package.json` `repository.url` as the GitHub `owner/repo`, uses `publish.yml` as the
   trusted workflow, and runs `npm trust` through `nix shell nixpkgs#nodejs_latest` because the Lambda-pinned Node 24/npm
   toolchain may lag the npm CLI feature. By default it runs `npm login --auth-type=web` first so npm can open a browser
@@ -273,9 +302,10 @@ guarded atomic git push, and npm registry state makes publishing idempotent acro
 
 The important design goal is one source of truth per convention:
 
-- [Nx] `npm:public` tags decide what is publishable.
+- [Nx] `npm:public` tags decide what has a public npm package contract.
+- Matching root/package `repository.url` values decide which public packages are released by the current repo.
 - Managed files decide what generated CI and hooks should look like.
-- Root package metadata provides defaults for public packages.
+- Root package metadata provides defaults only for owned public packages.
 - Actual workspace package names decide which dependency ranges become `workspace:*`.
 - Package manifests decide Bun lockfile workspace versions until Bun stops leaving them stale during releases.
 - [`sherif`] handles broad package hygiene.
