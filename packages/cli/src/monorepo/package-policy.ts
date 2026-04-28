@@ -95,8 +95,14 @@ export function applyNxReleaseDefaults(root: string): void {
   changed = setStringProperty(projectChangelogs, 'createRelease', 'github') || changed;
   changed = setBooleanProperty(projectChangelogs, 'file', false) || changed;
   const renderOptions = getOrCreateRecord(projectChangelogs, 'renderOptions');
-  changed = setBooleanProperty(renderOptions, 'authors', false) || changed;
-  changed = setBooleanProperty(renderOptions, 'applyUsernameToAuthors', false) || changed;
+  if (typeof renderOptions.authors !== 'boolean') {
+    renderOptions.authors = true;
+    changed = true;
+  }
+  if (typeof renderOptions.applyUsernameToAuthors !== 'boolean') {
+    renderOptions.applyUsernameToAuthors = true;
+    changed = true;
+  }
 
   if (changed) {
     writeJsonObject(nxJsonPath, nxJson);
@@ -212,14 +218,6 @@ export function validateNxReleaseConfig(root: string): number {
   }
   if (!renderOptions) {
     console.error('nx.json release.changelog.projectChangelogs.renderOptions config is missing');
-    failures++;
-  }
-  if (renderOptions && renderOptions.authors !== false) {
-    console.error('nx.json release.changelog.projectChangelogs.renderOptions.authors must be false');
-    failures++;
-  }
-  if (renderOptions && renderOptions.applyUsernameToAuthors !== false) {
-    console.error('nx.json release.changelog.projectChangelogs.renderOptions.applyUsernameToAuthors must be false');
     failures++;
   }
   return failures;

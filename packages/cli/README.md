@@ -295,8 +295,8 @@ GitHub Releases:
 
 - `smoo release github-release` delegates to `nx release changelog` for the owned release package projects.
 - Nx project changelogs are configured to create or update GitHub Releases, not local changelog files.
-- Generated release notes are package-scoped Conventional Commit changelogs. Author rendering and GitHub username lookup
-  are disabled so release generation does not depend on author account resolution.
+- Generated release notes are package-scoped Conventional Commit changelogs. Init defaults author rendering and GitHub
+  username lookup on, while validation allows repos to override those render options.
 
 The release flow is designed to be rerun after partial failure. Nx owns local version/tag behavior, `smoo` owns the
 guarded atomic git push, and npm registry state makes publishing idempotent across retries.
