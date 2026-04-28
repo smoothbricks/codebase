@@ -124,6 +124,40 @@ function buildProgram(): Command {
       await releasePublish(await findRepoRoot(), { ...options, dryRun: booleanOption(options.dryRun) });
     });
   release
+    .command('retag-unpublished')
+    .description('Move unpublished owned release tags to a later commit without bumping versions')
+    .argument('<tag...>', 'owned release tags to move, for example @scope/pkg@1.2.3')
+    .option('--to <ref>', 'commit or ref to move tags to', 'HEAD')
+    .option('--push', 'push moved tags with force-with-lease')
+    .option('--dispatch', 'push moved tags and start publish.yml with bump=auto')
+    .option('--remote <remote>', 'git remote used for pushed tags')
+    .option('--branch <branch>', 'branch used for publish workflow dispatch')
+    .option('--dry-run [dryRun]', 'validate and print the retag operation without mutating refs')
+    .action(
+      async (
+        tags: string[],
+        options: {
+          to?: string;
+          push?: boolean;
+          dispatch?: boolean;
+          remote?: string;
+          branch?: string;
+          dryRun?: string | boolean;
+        },
+      ) => {
+        const { releaseRetagUnpublished } = await import('./release/index.js');
+        await releaseRetagUnpublished(await findRepoRoot(), {
+          tags,
+          to: options.to,
+          push: options.push === true,
+          dispatch: options.dispatch === true,
+          remote: options.remote,
+          branch: options.branch,
+          dryRun: booleanOption(options.dryRun),
+        });
+      },
+    );
+  release
     .command('trust-publisher')
     .description('Configure npm trusted publishing for owned release packages')
     .option('--dry-run [dryRun]', 'show npm trust changes without saving them')

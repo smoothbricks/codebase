@@ -26,6 +26,7 @@ import {
   repairPendingTargets,
   runReleaseVersion,
 } from './orchestration.js';
+import { type RetagUnpublishedTagUpdate, retagUnpublished } from './retag-unpublished.js';
 
 export interface ReleaseVersionOptions {
   bump: string;
@@ -46,6 +47,16 @@ export interface ReleaseTrustPublisherOptions {
   dryRun?: boolean;
   otp?: string;
   skipLogin?: boolean;
+}
+
+export interface ReleaseRetagUnpublishedOptions {
+  tags: string[];
+  to?: string;
+  push?: boolean;
+  dispatch?: boolean;
+  dryRun?: boolean;
+  remote?: string;
+  branch?: string;
 }
 
 export async function releaseVersion(root: string, options: ReleaseVersionOptions): Promise<void> {
@@ -147,6 +158,23 @@ export async function releaseTrustPublisher(root: string, options: ReleaseTrustP
     const otp = options.dryRun ? undefined : (options.otp ?? (await promptForNpmOtp(pkg.name)));
     await runLatestNpm(root, args, otp ? { NPM_CONFIG_OTP: otp } : undefined);
   }
+}
+
+export async function releaseRetagUnpublished(root: string, options: ReleaseRetagUnpublishedOptions): Promise<void> {
+  const toRef = options.to ?? 'HEAD';
+  const dispatch = options.dispatch === true;
+  const push = options.push === true || dispatch;
+  const branch = options.branch ?? (await releaseBranch(root));
+  const remote = options.remote ?? (push ? await releaseRemote(root, branch) : 'origin');
+  await retagUnpublished(releaseRetagShell(root, remote), {
+    tags: options.tags,
+    toRef,
+    push,
+    dispatch,
+    dryRun: options.dryRun === true,
+    branch,
+    workflow: 'publish.yml',
+  });
 }
 
 export async function printReleaseState(root: string): Promise<void> {
@@ -442,6 +470,23 @@ function releaseRepairShell(root: string): ReleaseCompletionShell<ReleasePackage
   };
 }
 
+function releaseRetagShell(root: string, remote: string) {
+  return {
+    listReleasePackages: () => releasePackages(root),
+    resolveRef: (ref: string) => gitSha(root, ref),
+    resolveDispatchRef: (branch: string) => remoteBranchSha(root, remote, branch),
+    packageVersionAtRef: (packagePath: string, ref: string) => packageVersionAtRef(root, packagePath, ref),
+    npmVersionExists: (name: string, version: string) => npmVersionExists(root, name, version),
+    githubReleaseExists: (tag: string) => githubReleaseExists(root, tag),
+    remoteTagObject: (tag: string) => remoteReleaseTagObject(root, remote, tag),
+    createOrMoveTag: (tag: string, ref: string) => run('git', ['tag', '-fa', tag, '-m', tag, ref], root),
+    pushTags: (updates: RetagUnpublishedTagUpdate<ReleasePackage>[]) => pushRetaggedReleaseTags(root, remote, updates),
+    dispatchPublishWorkflow: (workflow: string, branch: string) =>
+      run('gh', ['workflow', 'run', workflow, '--ref', branch, '-f', 'bump=auto', '-f', 'dry_run=false'], root),
+    log: (message: string) => console.log(message),
+  };
+}
+
 async function listPendingReleaseTargets(root: string, ref: string): Promise<ReleaseTarget[]> {
   const head = await gitHead(root);
   return pendingReleaseTargets(await listOwnedReleaseTagRecords(root, ref), head);
@@ -623,6 +668,51 @@ async function gitCommitForTag(root: string, tag: string): Promise<string> {
 async function remoteReleaseTagExists(root: string, remote: string, tag: string): Promise<boolean> {
   const result = await $`git ls-remote --exit-code --tags ${remote} ${`refs/tags/${tag}`}`.cwd(root).quiet().nothrow();
   return result.exitCode === 0;
+}
+
+async function remoteReleaseTagObject(root: string, remote: string, tag: string): Promise<string | null> {
+  const result = await $`git ls-remote --exit-code --tags ${remote} ${`refs/tags/${tag}`}`.cwd(root).quiet().nothrow();
+  if (result.exitCode === 2) {
+    return null;
+  }
+  if (result.exitCode !== 0) {
+    throw new Error(`Unable to inspect remote release tag ${tag} on ${remote}.`);
+  }
+  const [object] = decode(result.stdout).trim().split('\t');
+  if (!object) {
+    throw new Error(`Unable to parse remote release tag ${tag} on ${remote}.`);
+  }
+  return object;
+}
+
+async function remoteBranchSha(root: string, remote: string, branch: string): Promise<string | null> {
+  const result = await $`git ls-remote --exit-code --heads ${remote} ${`refs/heads/${branch}`}`
+    .cwd(root)
+    .quiet()
+    .nothrow();
+  if (result.exitCode === 2) {
+    return null;
+  }
+  if (result.exitCode !== 0) {
+    throw new Error(`Unable to inspect remote branch ${branch} on ${remote}.`);
+  }
+  const [sha] = decode(result.stdout).trim().split('\t');
+  if (!sha) {
+    throw new Error(`Unable to parse remote branch ${branch} on ${remote}.`);
+  }
+  return sha;
+}
+
+async function pushRetaggedReleaseTags(
+  root: string,
+  remote: string,
+  updates: Array<RetagUnpublishedTagUpdate<ReleasePackage>>,
+): Promise<void> {
+  const leases = updates.map(
+    (update) => `--force-with-lease=refs/tags/${update.tag}:${update.expectedRemoteObject ?? ''}`,
+  );
+  const refspecs = updates.map((update) => `refs/tags/${update.tag}:refs/tags/${update.tag}`);
+  await run('git', ['push', '--atomic', ...leases, remote, ...refspecs], root);
 }
 
 async function githubReleaseExists(root: string, tag: string): Promise<boolean> {

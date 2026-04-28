@@ -47,6 +47,7 @@ smoo release npm-status
 smoo release repair-pending [--dry-run]
 smoo release version --bump <auto|patch|minor|major|prerelease> [--dry-run] [--github-output <path>]
 smoo release publish --bump <auto|patch|minor|major|prerelease> [--dry-run]
+smoo release retag-unpublished <tag...> [--to <ref>] [--push] [--dispatch] [--remote <remote>] [--branch <branch>] [--dry-run]
 smoo release trust-publisher [--dry-run] [--otp <code>] [--skip-login]
 
 smoo github-ci cleanup-cache
@@ -285,6 +286,13 @@ Versioning:
   [oven-sh/bun#20829](https://github.com/oven-sh/bun/issues/20829).
 - Package release tags must use `{projectName}@{version}`. smoo derives release package/version pairs from that tag
   shape and recreates missing local tags for Nx release commits before repairing remote state.
+- `smoo release retag-unpublished <tag...>` is a break-glass recovery command for the case where Nx already committed a
+  version bump but npm publish failed before the package version became durable. It moves exact owned release tags to
+  `HEAD` by default without bumping package manifests again. It refuses to move a tag when `package@version` already
+  exists on npm, when the GitHub Release exists, or when the target ref's package manifest does not contain the tagged
+  version. Pass `--push` to update remote tags with `--force-with-lease`; pass `--dispatch` to also start `publish.yml`
+  with `bump=auto`. Dispatch validates that the target ref is already the remote branch head so the workflow will
+  publish the same commit that was retagged.
 
 ### Repair Process
 
