@@ -29,6 +29,10 @@ restore_nix_store() {
       clear_devenv_cache_state
       exit 1
     fi
+    # The restored NAR is only the import source. Cleanup exports a fresh NAR for
+    # the next cache save, so remove this workspace scratch file before release
+    # steps run git cleanliness checks.
+    rm -f "$NIX_STORE_NAR"
   else
     echo "No NAR file found; clearing devenv cache state"
     clear_devenv_cache_state
