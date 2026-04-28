@@ -40,17 +40,16 @@ export async function releaseVersion(root: string, options: ReleaseVersionOption
     return;
   }
 
-  // Nx owns release versioning end-to-end: package versions, bun.lock updates,
-  // the release commit, annotated tags, and the remote push. Nx 22.5.4 pushes
-  // with `git push --follow-tags --no-verify --atomic`, so a successful version
-  // step means the branch commit and release tags landed together. Reruns call
-  // Nx again instead of custom tag repair; the git-tag current-version resolver
-  // plus disk fallback covers both first releases and already-tagged releases.
+  const headBeforeVersioning = await gitHead(root);
+
+  // Nx owns local release mutation: package versions, bun.lock updates, the
+  // release commit, and annotated tags. smoo owns the remote push so retries do
+  // not push an older checkout when Nx skips the release commit.
   const nxArgs = ['release', 'version'];
   if (bump !== 'auto') {
     nxArgs.push(bump);
   }
-  nxArgs.push(`--projects=${projects}`, '--git-commit=true', '--git-tag=true', '--git-push=true');
+  nxArgs.push(`--projects=${projects}`, '--git-commit=true', '--git-tag=true', '--git-push=false');
   if (options.dryRun) {
     nxArgs.push('--dryRun');
   }
@@ -59,6 +58,12 @@ export async function releaseVersion(root: string, options: ReleaseVersionOption
     // Guard against future Nx/config regressions that leave release files, such
     // as bun.lock, outside the release commit after tagging/pushing.
     await assertCleanGitTree(root);
+    const headAfterVersioning = await gitHead(root);
+    if (headAfterVersioning === headBeforeVersioning) {
+      console.log('Nx did not create a release commit; skipping git push.');
+      return;
+    }
+    await pushReleaseCommit(root);
   }
 }
 
@@ -222,14 +227,74 @@ async function gitTagsAtHead(root: string): Promise<string[]> {
 }
 
 async function assertCleanGitTree(root: string): Promise<void> {
-  const result = await $`git status --porcelain`.cwd(root).quiet().nothrow();
+  const result = await $`git status --porcelain --untracked-files=no`.cwd(root).quiet().nothrow();
   if (result.exitCode !== 0) {
     throw new Error('Unable to inspect git status after release versioning.');
   }
   const status = decode(result.stdout).trim();
   if (status) {
-    throw new Error(`nx release version left uncommitted changes after tagging/pushing:\n${status}`);
+    throw new Error(`nx release version left tracked changes after tagging:\n${status}`);
   }
+}
+
+async function gitHead(root: string): Promise<string> {
+  const result = await $`git rev-parse HEAD`.cwd(root).quiet().nothrow();
+  if (result.exitCode !== 0) {
+    throw new Error('Unable to resolve git HEAD before release versioning.');
+  }
+  return decode(result.stdout).trim();
+}
+
+async function pushReleaseCommit(root: string): Promise<void> {
+  const branch = await releaseBranch(root);
+  const remote = await releaseRemote(root, branch);
+  await run('git', ['push', '--follow-tags', '--atomic', remote, `HEAD:refs/heads/${branch}`], root);
+}
+
+async function releaseBranch(root: string): Promise<string> {
+  const githubBranch = process.env.GITHUB_REF_NAME?.trim();
+  if (githubBranch) {
+    return githubBranch;
+  }
+  const result = await $`git branch --show-current`.cwd(root).quiet().nothrow();
+  const branch = decode(result.stdout).trim();
+  if (result.exitCode === 0 && branch) {
+    return branch;
+  }
+  throw new Error('Unable to resolve current git branch for release push.');
+}
+
+async function releaseRemote(root: string, branch: string): Promise<string> {
+  const configured = await gitConfigValue(root, `branch.${branch}.remote`);
+  if (configured) {
+    return configured;
+  }
+  if (await gitRemoteExists(root, 'origin')) {
+    return 'origin';
+  }
+  const result = await $`git remote`.cwd(root).quiet().nothrow();
+  if (result.exitCode !== 0) {
+    throw new Error('Unable to list git remotes for release push.');
+  }
+  const remotes = decode(result.stdout)
+    .split('\n')
+    .map((remote) => remote.trim())
+    .filter(Boolean);
+  if (remotes.length === 1 && remotes[0]) {
+    return remotes[0];
+  }
+  throw new Error('Unable to choose git remote for release push. Configure branch upstream or add origin.');
+}
+
+async function gitConfigValue(root: string, key: string): Promise<string | null> {
+  const result = await $`git config --get ${key}`.cwd(root).quiet().nothrow();
+  const value = decode(result.stdout).trim();
+  return result.exitCode === 0 && value ? value : null;
+}
+
+async function gitRemoteExists(root: string, remote: string): Promise<boolean> {
+  const result = await $`git remote get-url ${remote}`.cwd(root).quiet().nothrow();
+  return result.exitCode === 0;
 }
 
 function releaseBumpArg(bump = 'auto'): string {

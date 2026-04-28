@@ -218,11 +218,13 @@ Versioning:
 - Nx release config must use `currentVersionResolver: "git-tag"` with `fallbackCurrentVersionResolver: "disk"`.
   Conventional-commit versioning requires git tags as the primary source, while the disk fallback supports initial
   releases before package tags exist.
-- `smoo release version` lets Nx own package versioning, `bun.lock` updates, the release commit, annotated tags, and the
-  remote push. Nx pushes commits and tags atomically with `git push --follow-tags --no-verify --atomic`, so a successful
-  version step means the release commit and tags landed together.
+- `smoo release version` lets Nx own local package versioning, `bun.lock` updates, the release commit, and annotated
+  tags. smoo records `HEAD` before and after Nx runs, then pushes with `git push --follow-tags --atomic` only if Nx
+  created a new release commit. This keeps the release commit and tags atomic without pushing an older checkout on
+  retries where Nx has nothing new to commit.
 - Reruns call Nx versioning again rather than repairing tags in `smoo`. Nx's git-tag current-version resolver plus disk
-  fallback handles already-tagged releases and first releases before package tags exist.
+  fallback handles already-tagged releases and first releases before package tags exist; smoo skips the remote push when
+  Nx leaves `HEAD` unchanged.
 
 Publishing:
 
@@ -251,8 +253,8 @@ GitHub Releases:
 - `smoo release github-release` creates or updates releases for the selected tags.
 - `latest` status follows the derived npm dist-tag.
 
-The release flow is designed to be rerun after partial failure. Nx owns atomic version/tag/push behavior, while `smoo`
-uses npm registry state to make publishing idempotent across retries.
+The release flow is designed to be rerun after partial failure. Nx owns local version/tag behavior, `smoo` owns the
+guarded atomic git push, and npm registry state makes publishing idempotent across retries.
 
 ## Why This Shape
 
