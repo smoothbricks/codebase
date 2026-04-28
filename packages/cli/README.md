@@ -229,16 +229,15 @@ Publishing:
 - `prerelease` publishes with npm dist-tag `next`.
 - Stable bumps publish with npm dist-tag `latest`.
 - Conflicting explicit dist-tags are rejected.
-- `--dry-run` skips npm publishing entirely. Bun still requires npm authentication for `bun publish --dry-run`, and
-  publish artifact validation is already covered by `smoo monorepo validate`.
-- `smoo release publish` checks every current `name@version` for `npm:public` packages before invoking Nx. Already
+- `smoo release publish` checks every current `name@version` for `npm:public` packages before publishing. Already
   published versions are skipped, so reruns after auth or network failures retry only the package versions npm does not
   have yet.
-- The managed publish workflow passes `secrets.NPM_TOKEN` as `NPM_CONFIG_TOKEN`, which is the token env var used by
-  Bun-backed `nx release publish`. This is needed to bootstrap the first publish before npm trusted publishing can be
-  configured.
-- After trusted publishing is configured, tokenless publishing should be verified against Bun/OIDC support. If Bun
-  cannot use npm trusted publishing directly, the publish implementation should switch to the npm CLI for that step.
+- Publish uses `bun pm pack` to create package tarballs, then publishes those tarballs with latest npm CLI and
+  `--provenance`. Bun pack resolves internal `workspace:*` dependency ranges to real versions in the tarball manifest;
+  smoo fails before publish if a packed manifest still contains `workspace:`.
+- npm CLI owns publish authentication. When trusted publishing is configured, npm uses GitHub Actions OIDC from the
+  workflow's `id-token: write` permission. Before trusted publishing exists, the managed workflow passes
+  `secrets.NPM_TOKEN` as `NODE_AUTH_TOKEN` and smoo writes a temporary npm user config for bootstrap publishing.
 - `smoo release trust-publisher` configures npm trusted publishing for every `npm:public` package. It uses the root
   `package.json` `repository.url` as the GitHub `owner/repo`, uses `publish.yml` as the trusted workflow, and runs
   `npm trust` through `nix shell nixpkgs#nodejs_latest` because the Lambda-pinned Node 24/npm toolchain may lag the npm

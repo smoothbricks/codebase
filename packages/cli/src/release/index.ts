@@ -1,3 +1,5 @@
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
@@ -61,13 +63,6 @@ export async function releaseVersion(root: string, options: ReleaseVersionOption
 }
 
 export async function releasePublish(root: string, options: ReleasePublishOptions): Promise<void> {
-  if (options.dryRun) {
-    // Bun still requires npm authentication for `bun publish --dry-run`.
-    // Package packing is already validated by `smoo monorepo validate`, so dry
-    // runs stop before the network/auth boundary.
-    console.log('Dry run; skipping npm publish.');
-    return;
-  }
   const tag = releaseNpmTagArg(options);
   const unpublishedPackages = await listUnpublishedPackages(root);
   if (unpublishedPackages.length === 0) {
@@ -76,9 +71,9 @@ export async function releasePublish(root: string, options: ReleasePublishOption
   }
   // npm package versions are immutable. Publishing only missing name@version
   // pairs makes auth/network retries idempotent after a partial publish failure.
-  const projects = unpublishedPackages.map((pkg) => pkg.name).join(',');
-  const nxArgs = ['release', 'publish', `--projects=${projects}`, '--tag', tag];
-  await run('nx', nxArgs, root);
+  for (const pkg of unpublishedPackages) {
+    await publishPackedPackage(root, pkg, tag, options.dryRun === true);
+  }
 }
 
 export async function releaseGithubRelease(root: string, options: ReleaseGithubOptions): Promise<void> {
@@ -169,6 +164,42 @@ async function listUnpublishedPackages(root: string): Promise<PublicPackage[]> {
   return states.filter((state) => !state.published).map((state) => state.pkg);
 }
 
+async function publishPackedPackage(root: string, pkg: PublicPackage, tag: string, dryRun: boolean): Promise<void> {
+  const tempDir = await mkdtemp(join(tmpdir(), 'smoo-publish-'));
+  const tarball = join(tempDir, `${safeTarballPrefix(pkg.name)}-${pkg.version}.tgz`);
+  try {
+    console.log(`${pkg.name}@${pkg.version}: packing with bun pm pack`);
+    await run('bun', ['pm', 'pack', '--filename', tarball, '--ignore-scripts', '--quiet'], join(root, pkg.path));
+    await assertNoWorkspaceProtocolInTarball(root, tarball, pkg);
+    // npm CLI owns authentication here: trusted publishing OIDC when configured,
+    // or the temporary NODE_AUTH_TOKEN bootstrap path below before trust exists.
+    // Bun still produces the tarball so workspace:* dependencies are resolved the
+    // same way smoo validates packed packages before release.
+    const args = ['publish', tarball, '--access', 'public', '--tag', tag, '--provenance'];
+    if (dryRun) {
+      args.push('--dry-run');
+    }
+    await runLatestNpmPublish(root, args);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+function safeTarballPrefix(name: string): string {
+  return name.replace(/^@/, '').replace(/[^a-zA-Z0-9._-]+/g, '-');
+}
+
+async function assertNoWorkspaceProtocolInTarball(root: string, tarball: string, pkg: PublicPackage): Promise<void> {
+  const result = await $`tar -xOf ${tarball} package/package.json`.cwd(root).quiet().nothrow();
+  if (result.exitCode !== 0) {
+    throw new Error(`${pkg.name}: unable to inspect packed package.json before publish.`);
+  }
+  const manifest = decode(result.stdout);
+  if (manifest.includes('workspace:')) {
+    throw new Error(`${pkg.name}: packed package.json still contains workspace: dependency references.`);
+  }
+}
+
 async function npmVersionExists(name: string, version: string): Promise<boolean> {
   const result = await $`bun pm view ${`${name}@${version}`} version`.cwd(process.cwd()).quiet().nothrow();
   return result.exitCode === 0 && decode(result.stdout).trim() === version;
@@ -252,6 +283,23 @@ function githubRepositoryFromUrl(url: string): string {
 
 async function runLatestNpm(root: string, npmArgs: string[], env?: Record<string, string>): Promise<void> {
   await run('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...npmArgs], root, env);
+}
+
+async function runLatestNpmPublish(root: string, npmArgs: string[]): Promise<void> {
+  const token = process.env.NODE_AUTH_TOKEN || process.env.NPM_TOKEN;
+  if (!token || process.env.NPM_CONFIG_USERCONFIG) {
+    await runLatestNpm(root, npmArgs);
+    return;
+  }
+
+  const tempDir = await mkdtemp(join(tmpdir(), 'smoo-npm-auth-'));
+  const npmrc = join(tempDir, '.npmrc');
+  try {
+    await writeFile(npmrc, `registry=https://registry.npmjs.org/\n//registry.npmjs.org/:_authToken=${token}\n`);
+    await runLatestNpm(root, npmArgs, { NPM_CONFIG_USERCONFIG: npmrc });
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 }
 
 async function promptForNpmOtp(packageName: string): Promise<string> {

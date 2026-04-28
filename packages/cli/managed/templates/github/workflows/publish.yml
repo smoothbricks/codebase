@@ -111,9 +111,11 @@ jobs:
 
       # Step 14
       - name: 📦 Publish packages
-        # Bun-backed `nx release publish` reads npm auth from NPM_CONFIG_TOKEN.
+        # smoo packs with Bun, then publishes tarballs with npm. npm uses OIDC
+        # trusted publishing when configured; NODE_AUTH_TOKEN is only a temporary
+        # bootstrap fallback before packages have trusted publishers.
         env:
-          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: smoo release publish --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"
 
       # Step 15
