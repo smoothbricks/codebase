@@ -149,14 +149,37 @@ export async function releaseTrustPublisher(root: string, options: ReleaseTrustP
     await runLatestNpm(root, ['login', '--auth-type=web']);
   }
 
+  const failedPackages: string[] = [];
   for (const pkg of packages) {
     console.log(`${pkg.name}: trusting GitHub Actions ${repository}/${workflow}`);
     const args = ['trust', 'github', pkg.name, '--file', workflow, '--repo', repository, '--yes'];
     if (options.dryRun) {
       args.push('--dry-run');
     }
-    const otp = options.dryRun ? undefined : (options.otp ?? (await promptForNpmOtp(pkg.name)));
-    await runLatestNpm(root, args, otp ? { NPM_CONFIG_OTP: otp } : undefined);
+    while (true) {
+      const otp = options.dryRun ? undefined : (options.otp ?? (await promptForNpmOtp(pkg.name)));
+      try {
+        await runLatestNpm(root, args, otp ? { NPM_CONFIG_OTP: otp } : undefined);
+        break;
+      } catch (error) {
+        console.error(`${pkg.name}: npm trusted publisher setup failed.`);
+        console.error(error instanceof Error ? error.message : String(error));
+        if (!options.dryRun) {
+          console.error('npm OTP codes are single-use. Generate a fresh OTP before retrying this package.');
+        }
+        if (options.otp || options.dryRun) {
+          failedPackages.push(pkg.name);
+          break;
+        }
+        console.error('Retrying this package. Press Ctrl-C to stop.');
+      }
+    }
+  }
+  if (failedPackages.length > 0) {
+    console.error(`Trusted publishing was not configured for: ${failedPackages.join(', ')}`);
+    if (options.otp) {
+      console.error('Rerun smoo release trust-publisher without --otp to enter a fresh OTP for each failed package.');
+    }
   }
 }
 
