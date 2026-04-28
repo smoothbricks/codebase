@@ -133,7 +133,7 @@ function applyManagedFile(
 function getManagedContent(file: ManagedFile, context: ManagedFileContext): string {
   if (file.kind === 'generated') {
     if (file.source === 'publish-workflow') {
-      return renderPublishWorkflowYaml();
+      return renderPublishWorkflowYaml({ repoName: context.repoName });
     }
     throw new Error(`Unknown generated managed file source ${file.source}`);
   }

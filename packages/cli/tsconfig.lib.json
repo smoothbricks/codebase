@@ -9,7 +9,7 @@
     "forceConsistentCasingInFileNames": true,
     "types": ["bun", "node"]
   },
-  "include": ["src/**/*.ts"],
+  "include": ["src/**/*.ts", "src/**/*.cts"],
   "exclude": ["src/**/*.test.ts", "src/**/__tests__/**"],
   "references": [
     {

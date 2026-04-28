@@ -6,6 +6,7 @@ export enum PublishWorkflowStepKind {
   Checkout = 'checkout',
   SetupDevenv = 'setup-devenv',
   ConfigureReleaseAuthor = 'configure-release-author',
+  BuildSelfHostedCli = 'build-self-hosted-cli',
   RepairPendingReleases = 'repair-pending-releases',
   VersionRelease = 'version-release',
   CheckManagedMonorepoFiles = 'check-managed-monorepo-files',
@@ -32,6 +33,10 @@ export interface PublishWorkflowDefinition {
   steps: PublishWorkflowStep[];
 }
 
+export interface PublishWorkflowDefinitionOptions {
+  repoName?: string;
+}
+
 export interface PublishWorkflowInputs {
   bump: PublishWorkflowBump;
   dryRun: boolean;
@@ -51,6 +56,7 @@ export interface PublishWorkflowCallbacks {
   checkout(): Promise<void>;
   setupDevenv(): Promise<PublishWorkflowSetupOutputs>;
   configureReleaseAuthor(): Promise<void>;
+  buildSelfHostedCli(): Promise<void>;
   repairPendingReleases(input: { dryRun: boolean; nodeAuthToken: boolean }): Promise<void>;
   versionRelease(input: { bump: PublishWorkflowBump; dryRun: boolean }): Promise<PublishWorkflowVersionOutputs>;
   checkManagedMonorepoFiles(): Promise<void>;
@@ -72,68 +78,72 @@ export interface PublishWorkflowRunResult {
   failed: boolean;
 }
 
-export function definePublishWorkflow(): PublishWorkflowDefinition {
+type PublishWorkflowStepInput = Omit<PublishWorkflowStep, 'number'>;
+
+export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions = {}): PublishWorkflowDefinition {
   const versionMode = githubExpression('steps.version.outputs.mode');
+  const setupSteps: PublishWorkflowStepInput[] = [
+    { kind: PublishWorkflowStepKind.Checkout, name: '📥 Checkout' },
+    { kind: PublishWorkflowStepKind.SetupDevenv, name: '🧱 Setup Nix/devenv', id: 'setup' },
+    { kind: PublishWorkflowStepKind.ConfigureReleaseAuthor, name: '🤖 Configure release author' },
+  ];
+  if (options.repoName === '@smoothbricks/codebase') {
+    setupSteps.push({ kind: PublishWorkflowStepKind.BuildSelfHostedCli, name: '🏗️ Build self-hosted smoo' });
+  }
   return {
-    steps: [
-      { kind: PublishWorkflowStepKind.Checkout, name: '📥 Checkout', number: 2 },
-      { kind: PublishWorkflowStepKind.SetupDevenv, name: '🧱 Setup Nix/devenv', number: 3, id: 'setup' },
-      { kind: PublishWorkflowStepKind.ConfigureReleaseAuthor, name: '🤖 Configure release author', number: 4 },
+    steps: numberWorkflowSteps([
+      ...setupSteps,
       {
         kind: PublishWorkflowStepKind.RepairPendingReleases,
         name: '🧯 Repair pending releases',
-        number: 5,
         needsNodeAuthToken: true,
       },
-      { kind: PublishWorkflowStepKind.VersionRelease, name: '🏷️ Version release', number: 6, id: 'version' },
+      { kind: PublishWorkflowStepKind.VersionRelease, name: '🏷️ Version release', id: 'version' },
       {
         kind: PublishWorkflowStepKind.CheckManagedMonorepoFiles,
         name: `✅ Check managed monorepo files (${versionMode})`,
-        number: 7,
         condition: 'version-mode-not-none',
       },
       {
         kind: PublishWorkflowStepKind.Build,
         name: `🔨 Build (${versionMode})`,
-        number: 8,
         condition: 'version-mode-not-none',
         nxTarget: 'build',
       },
       {
         kind: PublishWorkflowStepKind.Lint,
         name: `🔍 Lint (${versionMode})`,
-        number: 9,
         condition: 'version-mode-not-none',
         nxTarget: 'lint',
       },
       {
         kind: PublishWorkflowStepKind.UnitTests,
         name: `🧪 Unit Tests (${versionMode})`,
-        number: 10,
         condition: 'version-mode-not-none',
         nxTarget: 'test',
       },
-      { kind: PublishWorkflowStepKind.UploadTraceDbs, name: '📎 Upload trace DBs', number: 11, condition: 'failure' },
+      { kind: PublishWorkflowStepKind.UploadTraceDbs, name: '📎 Upload trace DBs', condition: 'failure' },
       {
         kind: PublishWorkflowStepKind.ValidateMonorepoConfig,
         name: `✅ Validate monorepo config (${versionMode})`,
-        number: 12,
         condition: 'version-mode-not-none',
       },
       {
         kind: PublishWorkflowStepKind.PublishRelease,
         name: `📦 Publish release (${versionMode})`,
-        number: 13,
         needsNodeAuthToken: true,
       },
       {
         kind: PublishWorkflowStepKind.SaveNixDevenv,
         name: '🧹 Cleanup and cache Nix/devenv',
-        number: 14,
         condition: 'always',
       },
-    ],
+    ]),
   };
+}
+
+function numberWorkflowSteps(steps: PublishWorkflowStepInput[]): PublishWorkflowStep[] {
+  return steps.map((step, index) => ({ ...step, number: index + 2 }));
 }
 
 export async function runPublishWorkflow(
@@ -158,6 +168,9 @@ export async function runPublishWorkflow(
           break;
         case PublishWorkflowStepKind.ConfigureReleaseAuthor:
           await context.callbacks.configureReleaseAuthor();
+          break;
+        case PublishWorkflowStepKind.BuildSelfHostedCli:
+          await context.callbacks.buildSelfHostedCli();
           break;
         case PublishWorkflowStepKind.RepairPendingReleases:
           await context.callbacks.repairPendingReleases({
@@ -217,8 +230,8 @@ function shouldRunStep(step: PublishWorkflowStep, version: PublishWorkflowVersio
   return true;
 }
 
-export function renderPublishWorkflowYaml(workflow: PublishWorkflowDefinition = definePublishWorkflow()): string {
-  const steps = workflow.steps;
+export function renderPublishWorkflowYaml(options: PublishWorkflowDefinitionOptions = {}): string {
+  const steps = definePublishWorkflow(options).steps;
   return `${renderPublishWorkflowHeader()}${renderPublishWorkflowSteps(steps)}`;
 }
 
@@ -328,6 +341,13 @@ function yamlLinesForStep(step: PublishWorkflowStep): string[] {
         '        run:',
         '          git config user.name "github-actions[bot]" && git config user.email',
         '          "41898282+github-actions[bot]@users.noreply.github.com"',
+      ];
+    case PublishWorkflowStepKind.BuildSelfHostedCli:
+      return [
+        `      - name: ${step.name}`,
+        '        # SmoothBricks self-hosts smoo from source, but Nx release loads',
+        '        # @smoothbricks/cli/nx-version-actions through the built package export.',
+        '        run: nx build @smoothbricks/cli',
       ];
     case PublishWorkflowStepKind.RepairPendingReleases:
       return [

@@ -35,9 +35,9 @@
       "default": "./dist/monorepo/git-config.js"
     },
     "./nx-version-actions": {
-      "types": "./nx-version-actions.d.cts",
-      "require": "./nx-version-actions.cjs",
-      "default": "./nx-version-actions.cjs"
+      "types": "./dist/nx-version-actions.d.cts",
+      "require": "./dist/nx-version-actions.cjs",
+      "default": "./dist/nx-version-actions.cjs"
     }
   },
   "files": [
@@ -45,8 +45,6 @@
     "bin",
     "dist",
     "managed",
-    "nx-version-actions.cjs",
-    "nx-version-actions.d.cts",
     "src",
     "!**/*.tsbuildinfo"
   ],

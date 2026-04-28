@@ -13,11 +13,37 @@ import {
 
 describe('publish workflow definition', () => {
   it('renders the checked-in local publish workflow copy', async () => {
-    const rendered = renderPublishWorkflowYaml();
+    const rendered = renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase' });
     const packageRoot = join(import.meta.dir, '..', '..', '..');
     await expect(readFile(join(packageRoot, '..', '..', '.github/workflows/publish.yml'), 'utf8')).resolves.toBe(
       rendered,
     );
+  });
+
+  it('bootstraps the self-hosted CLI before release commands only for the SmoothBricks repo', async () => {
+    const smoothbricks = await publishWorkflowScenario({
+      repoName: '@smoothbricks/codebase',
+      repairs: [],
+      current: [],
+      bump: 'patch',
+      dryRun: false,
+      version: { mode: 'none', projects: [] },
+    }).run();
+    const downstream = await publishWorkflowScenario({
+      repoName: '@other/repo',
+      repairs: [],
+      current: [],
+      bump: 'patch',
+      dryRun: false,
+      version: { mode: 'none', projects: [] },
+    }).run();
+
+    expect(smoothbricks.selfHostedCliBuilt).toBe(true);
+    expect(smoothbricks.repairSawSelfHostedCli).toBe(true);
+    expect(smoothbricks.versionSawSelfHostedCli).toBe(true);
+    expect(downstream.selfHostedCliBuilt).toBe(false);
+    expect(downstream.repairSawSelfHostedCli).toBe(false);
+    expect(downstream.versionSawSelfHostedCli).toBe(false);
   });
 
   it('repairs older gaps, skips validation for mode none, and still completes current HEAD publish', async () => {
@@ -109,6 +135,7 @@ interface ReleaseGap {
 }
 
 interface WorkflowScenarioConfig {
+  repoName?: string;
   repairs: ReleaseGap[];
   current: ReleaseGap[];
   bump: PublishWorkflowBump;
@@ -119,6 +146,9 @@ interface WorkflowScenarioConfig {
 interface WorkflowOutcome {
   fixtureRepoSetup: boolean;
   releaseAuthorConfigured: boolean;
+  selfHostedCliBuilt: boolean;
+  repairSawSelfHostedCli: boolean;
+  versionSawSelfHostedCli: boolean;
   repairedTags: string[];
   repairBuildArtifacts: string[];
   validation: { checks: number; builds: string[]; lints: string[]; tests: string[]; validates: number };
@@ -132,7 +162,7 @@ function publishWorkflowScenario(config: WorkflowScenarioConfig): { run(): Promi
   return {
     async run() {
       const state = new WorkflowScenarioState(config);
-      await runPublishWorkflow(definePublishWorkflow(), {
+      await runPublishWorkflow(definePublishWorkflow({ repoName: config.repoName }), {
         inputs: { bump: config.bump, dryRun: config.dryRun },
         nodeAuthToken: true,
         callbacks: state.callbacks(),
@@ -145,6 +175,9 @@ function publishWorkflowScenario(config: WorkflowScenarioConfig): { run(): Promi
 class WorkflowScenarioState {
   private fixtureSetup = false;
   private authorConfigured = false;
+  private selfHostedCli = false;
+  private repairObservedSelfHostedCli = false;
+  private versionObservedSelfHostedCli = false;
   private publishReleaseRan = false;
   private publishSawValidation = false;
   private readonly repaired = new Set<string>();
@@ -180,7 +213,11 @@ class WorkflowScenarioState {
       configureReleaseAuthor: async () => {
         this.authorConfigured = true;
       },
+      buildSelfHostedCli: async () => {
+        this.selfHostedCli = true;
+      },
       repairPendingReleases: async ({ dryRun }) => {
+        this.repairObservedSelfHostedCli = this.selfHostedCli;
         if (dryRun) {
           return;
         }
@@ -196,6 +233,7 @@ class WorkflowScenarioState {
         }
       },
       versionRelease: async ({ bump, dryRun }) => {
+        this.versionObservedSelfHostedCli = this.selfHostedCli;
         expect(bump).toBe(this.config.bump);
         expect(dryRun).toBe(this.config.dryRun);
         return this.config.version;
@@ -238,6 +276,9 @@ class WorkflowScenarioState {
     return {
       fixtureRepoSetup: this.fixtureSetup,
       releaseAuthorConfigured: this.authorConfigured,
+      selfHostedCliBuilt: this.selfHostedCli,
+      repairSawSelfHostedCli: this.repairObservedSelfHostedCli,
+      versionSawSelfHostedCli: this.versionObservedSelfHostedCli,
       repairedTags: [...this.repaired].sort(),
       repairBuildArtifacts: [...this.repairBuilds].sort(),
       validation: {

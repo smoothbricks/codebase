@@ -1,8 +1,14 @@
-const nxJsVersionActions = require('@nx/js/src/release/version-actions');
+import type { AfterAllProjectsVersioned, VersionActions } from 'nx/release';
 
-module.exports = nxJsVersionActions.default ?? nxJsVersionActions;
+type VersionActionsModule = typeof VersionActions & {
+  default?: typeof VersionActions & { afterAllProjectsVersioned: AfterAllProjectsVersioned };
+  afterAllProjectsVersioned: AfterAllProjectsVersioned;
+};
 
-module.exports.afterAllProjectsVersioned = async (cwd, options) => {
+const nxJsVersionActions = require('@nx/js/src/release/version-actions') as VersionActionsModule;
+const baseVersionActions = nxJsVersionActions.default ?? nxJsVersionActions;
+
+const afterAllProjectsVersioned: AfterAllProjectsVersioned = async (cwd, options) => {
   const result = await nxJsVersionActions.afterAllProjectsVersioned(cwd, options);
 
   // Temporary Bun workaround. Remove this hook only after all three issues are
@@ -13,7 +19,7 @@ module.exports.afterAllProjectsVersioned = async (cwd, options) => {
   // Nx runs `bun install --lockfile-only`, but Bun currently leaves workspace
   // versions stale in bun.lock. `bun pm pack` then rewrites `workspace:*` using
   // those stale lockfile versions instead of the current package.json versions.
-  const { syncBunLockfileVersions } = await import('./dist/monorepo/lockfile.js');
+  const { syncBunLockfileVersions } = await import('./monorepo/lockfile.js');
   const updated = syncBunLockfileVersions(cwd);
   if (updated === 0) {
     return result;
@@ -24,3 +30,7 @@ module.exports.afterAllProjectsVersioned = async (cwd, options) => {
     deletedFiles: result.deletedFiles,
   };
 };
+
+baseVersionActions.afterAllProjectsVersioned = afterAllProjectsVersioned;
+
+export = baseVersionActions;

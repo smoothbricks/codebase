@@ -57,12 +57,18 @@ jobs:
           "41898282+github-actions[bot]@users.noreply.github.com"
 
       # Step 5
+      - name: 🏗️ Build self-hosted smoo
+        # SmoothBricks self-hosts smoo from source, but Nx release loads
+        # @smoothbricks/cli/nx-version-actions through the built package export.
+        run: nx build @smoothbricks/cli
+
+      # Step 6
       - name: 🧯 Repair pending releases
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: smoo release repair-pending --dry-run "${{ inputs.dry_run }}"
 
-      # Step 6
+      # Step 7
       - name: 🏷️ Version release
         id: version
         run:
@@ -76,27 +82,27 @@ jobs:
       # never relies on task outputs restored from CI cache. version runs before
       # validation so the commit completed below is the commit that was checked.
 
-      # Step 7
+      # Step 8
       - name: ✅ Check managed monorepo files (${{ steps.version.outputs.mode }})
         if: ${{ steps.version.outputs.mode != 'none' }}
         run: smoo monorepo check
 
-      # Step 8
+      # Step 9
       - name: 🔨 Build (${{ steps.version.outputs.mode }})
         if: ${{ steps.version.outputs.mode != 'none' }}
         run: smoo github-ci nx-run-many --targets build --projects "${{ steps.version.outputs.projects }}"
 
-      # Step 9
+      # Step 10
       - name: 🔍 Lint (${{ steps.version.outputs.mode }})
         if: ${{ steps.version.outputs.mode != 'none' }}
         run: smoo github-ci nx-run-many --targets lint --projects "${{ steps.version.outputs.projects }}"
 
-      # Step 10
+      # Step 11
       - name: 🧪 Unit Tests (${{ steps.version.outputs.mode }})
         if: ${{ steps.version.outputs.mode != 'none' }}
         run: smoo github-ci nx-run-many --targets test --projects "${{ steps.version.outputs.projects }}"
 
-      # Step 11
+      # Step 12
       - name: 📎 Upload trace DBs
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
@@ -107,14 +113,14 @@ jobs:
           retention-days: 14
           include-hidden-files: true
 
-      # Step 12
+      # Step 13
       - name: ✅ Validate monorepo config (${{ steps.version.outputs.mode }})
         if: ${{ steps.version.outputs.mode != 'none' }}
         run: smoo monorepo validate
 
       # --- Release ------------------------------------------------------------
 
-      # Step 13
+      # Step 14
       - name: 📦 Publish release (${{ steps.version.outputs.mode }})
         # smoo packs with Bun, then publishes tarballs with npm. Existing
         # packages use trusted publishing/OIDC; first publishes use NODE_AUTH_TOKEN
@@ -125,7 +131,7 @@ jobs:
 
       # --- Cleanup ------------------------------------------------------------
 
-      # Step 14
+      # Step 15
       - name: 🧹 Cleanup and cache Nix/devenv
         if: ${{ always() }}
         uses: ./.github/actions/save-nix-devenv
