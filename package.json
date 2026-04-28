@@ -54,8 +54,7 @@
     "update:nixpkgs-overlay": "cd tooling/direnv/nixpkgs-overlay && nix shell nixpkgs#nvfetcher -c nvfetcher"
   },
   "workspaces": [
-    "packages/*",
-    "targets/*"
+    "packages/*"
   ],
   "nx": {
     "targets": {
