@@ -3,9 +3,9 @@
 `@smoothbricks/cli` provides `smoo`, the SmoothBricks monorepo automation CLI. It is the control plane for shared CI,
 release, Git hook, package metadata, and publish validation conventions across SmoothBricks-style repositories.
 
-The tool is intentionally convention-over-configuration. SmoothBricks repos use Nx, Bun, Nix, devenv, and direnv, so
-`smoo` assumes those pieces exist instead of adding another local config file. Repos should be made correct by running
-the mutating initialization path, then kept correct by the read-only validation path.
+The tool is intentionally convention-over-configuration. SmoothBricks repos use [Nx], [Bun], [Nix], [devenv], and
+[direnv], so `smoo` assumes those pieces exist instead of adding another local config file. Repos should be made correct
+by running the mutating initialization path, then kept correct by the read-only validation path.
 
 ## Install
 
@@ -60,7 +60,7 @@ It currently:
 - Synchronizes root runtime versions inside devenv, or when `--sync-runtime` is passed.
 - Applies publish metadata defaults to `npm:public` packages.
 - Normalizes internal workspace dependency ranges to `workspace:*`.
-- Runs `sherif --fix --select highest` for broad monorepo package hygiene.
+- Runs [`sherif --fix --select highest`][sherif] for broad monorepo package hygiene.
 - Normalizes conditional export ordering so `types` comes first and `default` comes last.
 - Adds `src` to package `files` when development-only exports intentionally point at source files.
 
@@ -86,24 +86,26 @@ It checks:
 - Managed file drift.
 - Root package policy.
 - Root Bun type version matches the Bun package manager version.
-- Nx release policy.
+- Nx release policy, including the temporary Bun lockfile versionActions hook.
+- `bun.lock` workspace versions match package manifests.
 - Public package tag policy.
 - Public package metadata.
 - Workspace dependency ranges.
-- `sherif` package hygiene.
-- Packed public package artifacts with `publint`.
-- Packed public package type resolution with the `attw` CLI.
+- [`sherif`] package hygiene.
+- Packed public package artifacts with [`publint`].
+- Packed public package type resolution with the [`attw`][are-the-types-wrong] CLI.
 
-The packed-package checks validate what npm users will install, not only the source tree. `smoo` packs each `npm:public`
-package with Bun, runs `publint` on the tarball, then runs `attw` on the same tarball.
+The packed-package checks validate what [npm] users will install, not only the source tree. `smoo` packs each
+`npm:public` package with [Bun], runs [`publint`] on the tarball, then runs [`attw`][are-the-types-wrong] on the same
+tarball.
 
-The `attw` check uses the `node16` profile and ignores the CJS-to-ESM warning. SmoothBricks packages are ESM-first, so
-CommonJS consumers can use dynamic import. Node 10-only subpath failures are intentionally ignored because Node 10 is
-not part of the supported package contract.
+The [`attw`][are-the-types-wrong] check uses the `node16` profile and ignores the CJS-to-ESM warning. SmoothBricks
+packages are [ESM]-first, so [CommonJS] consumers can use dynamic import. Node 10-only subpath failures are
+intentionally ignored because [Node.js] 10 is not part of the supported package contract.
 
 ## Publishable Packages
 
-Publishability is declared with an Nx tag:
+Publishability is declared with an [Nx] tag:
 
 ```json
 {
@@ -137,11 +139,11 @@ license and repository URL, then sets each package's `repository.directory` from
 
 Managed files include:
 
-- `.git-format-staged.yml`
+- [`.git-format-staged.yml`][git-format-staged]
 - Git hook scripts under `tooling/git-hooks`
-- direnv/GitHub Actions bootstrap scripts under `tooling/direnv`
-- GitHub Actions workflows under `.github/workflows`
-- Local composite GitHub Actions under `.github/actions`
+- [direnv]/[GitHub Actions] bootstrap scripts under `tooling/direnv`
+- [GitHub Actions] workflows under `.github/workflows`
+- Local composite [GitHub Actions] under `.github/actions`
 
 When a managed target is a symlink, `smoo` leaves it alone. SmoothBricks uses symlinks back to `packages/cli/managed` so
 changes to the CLI package are tested immediately. Downstream repos receive ordinary committed copies.
@@ -158,8 +160,8 @@ smoo monorepo diff
 
 ## Git Hooks
 
-The generated pre-commit hook runs `git-format-staged` from the repository root with `tooling`, `node_modules/.bin`, and
-the devenv profile on `PATH`.
+The generated pre-commit hook runs [`git-format-staged`][git-format-staged] from the repository root with `tooling`,
+`node_modules/.bin`, and the [devenv] profile on `PATH`.
 
 The generated commit-msg hook delegates conventional commit validation to:
 
@@ -171,21 +173,22 @@ This keeps hook behavior consistent with CI and avoids duplicating commit messag
 
 ## GitHub Actions
 
-The generated workflows keep readable YAML and named top-level steps, while larger logic lives in `smoo` commands,
-post-checkout composite actions, or the small pre-smoo bootstrap script. Checkout stays inline in each workflow because
-repository-local composite actions do not exist until `actions/checkout` has populated the working tree.
+The generated [GitHub Actions] workflows keep readable YAML and named top-level steps, while larger logic lives in
+`smoo` commands, post-checkout composite actions, or the small pre-smoo bootstrap script. Checkout stays inline in each
+workflow because repository-local composite actions do not exist until `actions/checkout` has populated the working
+tree.
 
 CI uses explicit lint, test, and build phases. The publish workflow does the same before running release commands so
 GitHub output remains readable even though Nx release also has its own `preVersionCommand` safety net.
 
-CI status deeplinks depend on GitHub's top-level job step anchors. The generated CI workflow keeps `# Step N` comments
-next to each top-level step, and the `smoo github-ci nx-smart --step <number>` values for lint, test, and build must
-stay synchronized with those comments. Composite action internals do not change the top-level step numbers.
+CI status deeplinks depend on [GitHub Actions]' top-level job step anchors. The generated CI workflow keeps `# Step N`
+comments next to each top-level step, and the `smoo github-ci nx-smart --step <number>` values for lint, test, and build
+must stay synchronized with those comments. Composite action internals do not change the top-level step numbers.
 
 Managed CI setup is split across local composite actions:
 
-- `setup-devenv` installs Nix, restores the Nix cache segment, imports the store NAR, restores `.devenv`/`.direnv` only
-  after an exact Nix cache hit, enables Cachix, installs devenv, restores `node_modules`, and builds the shell.
+- `setup-devenv` installs [Nix], restores the Nix cache segment, imports the store NAR, restores `.devenv`/`.direnv`
+  only after an exact Nix cache hit, enables [Cachix], installs [devenv], restores `node_modules`, and builds the shell.
 - `save-nix-devenv` runs under `always()`, calls `smoo github-ci cleanup-cache`, and explicitly saves cache segments
   only when cleanup reports `cache-ready=true`.
 - `cache-nix-devenv` is the shared restore/save primitive for the separate `nix` and `devenv` cache segments.
@@ -208,20 +211,28 @@ The bootstrap script is intentionally small. It only handles work required befor
 
 ## Releases
 
-Release commands wrap Nx release but keep SmoothBricks policy in one place.
+Release commands wrap [Nx Release][nx-release] but keep SmoothBricks policy in one place.
 
 Versioning:
 
-- `--bump auto` uses Nx conventional-commit versioning.
+- `--bump auto` uses [Nx Release][nx-release] [Conventional Commits] versioning.
 - `--bump patch|minor|major|prerelease` forces the release specifier.
 - Release projects are discovered from `npm:public` packages.
-- Nx release config must use `currentVersionResolver: "git-tag"` with `fallbackCurrentVersionResolver: "disk"`.
-  Conventional-commit versioning requires git tags as the primary source, while the disk fallback supports initial
-  releases before package tags exist.
-- `smoo release version` lets Nx own local package versioning, `bun.lock` updates, the release commit, and annotated
-  tags. smoo records `HEAD` before and after Nx runs, then pushes with `git push --follow-tags --atomic` only if Nx
-  created a new release commit. This keeps the release commit and tags atomic without pushing an older checkout on
-  retries where Nx has nothing new to commit.
+- [Nx Release][nx-release] config must use `currentVersionResolver: "git-tag"` with
+  `fallbackCurrentVersionResolver: "disk"`. Conventional-commit versioning requires git tags as the primary source,
+  while the disk fallback supports initial releases before package tags exist.
+- [Nx Release][nx-release] config must use `versionActions: "@smoothbricks/cli/nx-version-actions"`. This wraps Nx's JS
+  version actions and temporarily syncs `bun.lock` workspace versions after Nx runs `bun install --lockfile-only`.
+- `smoo release version` lets [Nx Release][nx-release] own local package versioning, `bun.lock` updates, the release
+  commit, and annotated tags. smoo records `HEAD` before and after Nx runs, then pushes with
+  `git push --follow-tags --atomic` only if Nx created a new release commit. This keeps the release commit and tags
+  atomic without pushing an older checkout on retries where Nx has nothing new to commit.
+- The `nx-version-actions` hook is a temporary Bun workaround. Bun currently leaves `bun.lock` workspace versions stale
+  after package manifest bumps, and `bun pm pack` rewrites `workspace:*` dependencies using those stale lockfile
+  versions. Keep the hook until supported Bun versions resolve these issues:
+  [oven-sh/bun#18906](https://github.com/oven-sh/bun/issues/18906),
+  [oven-sh/bun#20477](https://github.com/oven-sh/bun/issues/20477), and
+  [oven-sh/bun#20829](https://github.com/oven-sh/bun/issues/20829).
 - Reruns call Nx versioning again rather than repairing tags in `smoo`. Nx's git-tag current-version resolver plus disk
   fallback handles already-tagged releases and first releases before package tags exist; smoo skips the remote push when
   Nx leaves `HEAD` unchanged.
@@ -236,17 +247,19 @@ Publishing:
   have yet.
 - Publish uses `bun pm pack` to create package tarballs, then publishes those tarballs with latest npm CLI and
   `--provenance`. Bun pack resolves internal `workspace:*` dependency ranges to real versions in the tarball manifest;
-  smoo fails before publish if a packed manifest still contains `workspace:`.
-- npm CLI owns publish authentication. When trusted publishing is configured, npm uses GitHub Actions OIDC from the
-  workflow's `id-token: write` permission. Before trusted publishing exists, the managed workflow passes
-  `secrets.NPM_TOKEN` as `NODE_AUTH_TOKEN` and smoo writes a temporary npm user config for bootstrap publishing.
-- `smoo release trust-publisher` configures npm trusted publishing for every `npm:public` package. It uses the root
-  `package.json` `repository.url` as the GitHub `owner/repo`, uses `publish.yml` as the trusted workflow, and runs
-  `npm trust` through `nix shell nixpkgs#nodejs_latest` because the Lambda-pinned Node 24/npm toolchain may lag the npm
-  CLI feature. By default it runs `npm login --auth-type=web` first so npm can open a browser login; pass `--skip-login`
-  when the current npm session is already authenticated. Packages must already exist on npm before trust can be
-  configured. npm may still require operation-level 2FA for `npm trust`; smoo prompts for a hidden OTP per package, or
-  you can pass `--otp <code>` for non-interactive use.
+  smoo fails before publish if a packed manifest still contains `workspace:` or if an internal dependency does not match
+  the current workspace package version.
+- [npm CLI][npm] owns publish authentication. When [trusted publishing][npm-trusted-publishing] is configured, npm uses
+  [GitHub Actions OIDC][github-actions-oidc] from the workflow's `id-token: write` permission. Before trusted publishing
+  exists, the managed workflow passes `secrets.NPM_TOKEN` as `NODE_AUTH_TOKEN` and smoo writes a temporary npm user
+  config for bootstrap publishing.
+- `smoo release trust-publisher` configures [npm trusted publishing][npm-trusted-publishing] for every `npm:public`
+  package. It uses the root `package.json` `repository.url` as the GitHub `owner/repo`, uses `publish.yml` as the
+  trusted workflow, and runs `npm trust` through `nix shell nixpkgs#nodejs_latest` because the Lambda-pinned Node 24/npm
+  toolchain may lag the npm CLI feature. By default it runs `npm login --auth-type=web` first so npm can open a browser
+  login; pass `--skip-login` when the current npm session is already authenticated. Packages must already exist on npm
+  before trust can be configured. npm may still require operation-level 2FA for `npm trust`; smoo prompts for a hidden
+  OTP per package, or you can pass `--otp <code>` for non-interactive use.
 
 GitHub Releases:
 
@@ -260,12 +273,13 @@ guarded atomic git push, and npm registry state makes publishing idempotent acro
 
 The important design goal is one source of truth per convention:
 
-- Nx `npm:public` tags decide what is publishable.
+- [Nx] `npm:public` tags decide what is publishable.
 - Managed files decide what generated CI and hooks should look like.
 - Root package metadata provides defaults for public packages.
 - Actual workspace package names decide which dependency ranges become `workspace:*`.
-- `sherif` handles broad package hygiene.
-- `publint` and `attw` validate real packed artifacts.
+- Package manifests decide Bun lockfile workspace versions until Bun stops leaving them stale during releases.
+- [`sherif`] handles broad package hygiene.
+- [`publint`] and [`attw`][are-the-types-wrong] validate real packed artifacts.
 
 This keeps `smoo` small where external tools already do the job, but keeps SmoothBricks-specific policy native where
 generic tools do not know the repo contract. In particular, `sherif` is useful for package hygiene, but it does not know
@@ -287,3 +301,26 @@ If validating packages with Zig build steps from outside the devenv shell, add Z
 ```bash
 nix shell nixpkgs#zig -c nx run-many -t build --projects=<public-projects>
 ```
+
+## Links
+
+[are-the-types-wrong]: https://github.com/arethetypeswrong/arethetypeswrong.github.io/tree/main/packages/cli
+[Bun]: https://bun.sh/
+[Cachix]: https://www.cachix.org/
+[CommonJS]: https://nodejs.org/api/modules.html
+[Conventional Commits]: https://www.conventionalcommits.org/
+[devenv]: https://devenv.sh/
+[direnv]: https://direnv.net/
+[ESM]: https://nodejs.org/api/esm.html
+[git-format-staged]: https://github.com/smoothbricks/git-format-staged
+[GitHub Actions]: https://docs.github.com/actions
+[github-actions-oidc]:
+  https://docs.github.com/actions/deployment/security-hardening-your-deployments/about-security-hardening-with-openid-connect
+[Nix]: https://nixos.org/
+[Node.js]: https://nodejs.org/
+[npm]: https://www.npmjs.com/
+[npm-trusted-publishing]: https://docs.npmjs.com/trusted-publishers
+[Nx]: https://nx.dev/
+[nx-release]: https://nx.dev/features/manage-releases
+[`publint`]: https://publint.dev/
+[`sherif`]: https://github.com/QuiiBz/sherif

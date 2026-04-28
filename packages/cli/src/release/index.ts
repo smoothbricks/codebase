@@ -6,6 +6,7 @@ import { Writable } from 'node:stream';
 import { $ } from 'bun';
 import { decode, run, runStatus } from '../lib/run.js';
 import { listPublicPackages, readPackageJson, repositoryInfo } from '../lib/workspace.js';
+import { readPackedPackageJson, validatePackedWorkspaceDependencies } from '../monorepo/packed-manifest.js';
 
 export interface ReleaseVersionOptions {
   bump: string;
@@ -175,7 +176,7 @@ async function publishPackedPackage(root: string, pkg: PublicPackage, tag: strin
   try {
     console.log(`${pkg.name}@${pkg.version}: packing with bun pm pack`);
     await run('bun', ['pm', 'pack', '--filename', tarball, '--ignore-scripts', '--quiet'], join(root, pkg.path));
-    await assertNoWorkspaceProtocolInTarball(root, tarball, pkg);
+    await assertPackedWorkspaceDependencies(root, tarball, pkg);
     // npm CLI owns authentication here: trusted publishing OIDC when configured,
     // or the temporary NODE_AUTH_TOKEN bootstrap path below before trust exists.
     // Bun still produces the tarball so workspace:* dependencies are resolved the
@@ -194,14 +195,11 @@ function safeTarballPrefix(name: string): string {
   return name.replace(/^@/, '').replace(/[^a-zA-Z0-9._-]+/g, '-');
 }
 
-async function assertNoWorkspaceProtocolInTarball(root: string, tarball: string, pkg: PublicPackage): Promise<void> {
-  const result = await $`tar -xOf ${tarball} package/package.json`.cwd(root).quiet().nothrow();
-  if (result.exitCode !== 0) {
-    throw new Error(`${pkg.name}: unable to inspect packed package.json before publish.`);
-  }
-  const manifest = decode(result.stdout);
-  if (manifest.includes('workspace:')) {
-    throw new Error(`${pkg.name}: packed package.json still contains workspace: dependency references.`);
+async function assertPackedWorkspaceDependencies(root: string, tarball: string, pkg: PublicPackage): Promise<void> {
+  const manifest = await readPackedPackageJson(root, tarball, pkg.name);
+  const failures = validatePackedWorkspaceDependencies(root, pkg, manifest);
+  if (failures.length > 0) {
+    throw new Error(failures.join('\n'));
   }
 }
 

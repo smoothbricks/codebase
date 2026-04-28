@@ -1,9 +1,11 @@
 import { chmodSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { validateBunLockfileVersions } from '../lockfile.js';
 import { validateManagedFiles } from '../managed-files.js';
 import { validateNxSync } from '../nx-sync.js';
 import { fixPackageHygiene, validatePackageHygiene } from '../package-hygiene.js';
 import {
+  applyNxReleaseDefaults,
   applyPublicPackageDefaults,
   applyWorkspaceDependencyDefaults,
   validateNxReleaseConfig,
@@ -35,6 +37,7 @@ const packs: MonorepoPack[] = [
     name: 'core',
     async init(ctx) {
       ensureLocalSmooShim(ctx.root);
+      applyNxReleaseDefaults(ctx.root);
       if (ctx.syncRuntime) {
         await syncRootRuntimeVersions(ctx.root);
       } else {
@@ -46,6 +49,7 @@ const packs: MonorepoPack[] = [
         validateManagedFiles(ctx.root) +
         validateRootPackagePolicy(ctx.root) +
         validateNxReleaseConfig(ctx.root) +
+        validateBunLockfileVersions(ctx.root) +
         (await validateNxSync(ctx.root))
       );
     },

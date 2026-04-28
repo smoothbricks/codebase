@@ -130,6 +130,7 @@
       "specifierSource": "conventional-commits",
       "currentVersionResolver": "git-tag",
       "fallbackCurrentVersionResolver": "disk",
+      "versionActions": "@smoothbricks/cli/nx-version-actions",
       "preVersionCommand": "nx run-many -t build"
     }
   }

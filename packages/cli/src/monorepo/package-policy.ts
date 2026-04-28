@@ -19,6 +19,8 @@ import {
   workspaceDependencyFields,
 } from '../lib/workspace.js';
 
+export const SMOO_NX_VERSION_ACTIONS = '@smoothbricks/cli/nx-version-actions';
+
 export function applyPublicPackageDefaults(root: string): void {
   const rootPackage = requiredJsonObject(join(root, 'package.json'));
   const rootLicense = stringProperty(rootPackage, 'license');
@@ -64,6 +66,27 @@ export function applyWorkspaceDependencyDefaults(root: string): void {
     } else {
       console.log(`unchanged      ${pkg.path}/package.json workspace dependency ranges`);
     }
+  }
+}
+
+export function applyNxReleaseDefaults(root: string): void {
+  const nxJsonPath = join(root, 'nx.json');
+  const nxJson = requiredJsonObject(nxJsonPath);
+  let changed = false;
+  const release = getOrCreateRecord(nxJson, 'release');
+  changed = setStringProperty(release, 'projectsRelationship', 'independent') || changed;
+  const version = getOrCreateRecord(release, 'version');
+  changed = setStringProperty(version, 'specifierSource', 'conventional-commits') || changed;
+  changed = setStringProperty(version, 'currentVersionResolver', 'git-tag') || changed;
+  changed = setStringProperty(version, 'fallbackCurrentVersionResolver', 'disk') || changed;
+  changed = setStringProperty(version, 'versionActions', SMOO_NX_VERSION_ACTIONS) || changed;
+  changed = setMissingStringProperty(version, 'preVersionCommand', 'nx run-many -t build') || changed;
+
+  if (changed) {
+    writeJsonObject(nxJsonPath, nxJson);
+    console.log('updated        nx.json release config');
+  } else {
+    console.log('unchanged      nx.json release config');
   }
 }
 
@@ -138,6 +161,10 @@ export function validateNxReleaseConfig(root: string): number {
   }
   if (version && stringProperty(version, 'fallbackCurrentVersionResolver') !== 'disk') {
     console.error('nx.json release.version.fallbackCurrentVersionResolver must be disk');
+    failures++;
+  }
+  if (version && stringProperty(version, 'versionActions') !== SMOO_NX_VERSION_ACTIONS) {
+    console.error(`nx.json release.version.versionActions must be ${SMOO_NX_VERSION_ACTIONS}`);
     failures++;
   }
   if (version && !stringProperty(version, 'preVersionCommand')) {

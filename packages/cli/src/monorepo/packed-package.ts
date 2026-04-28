@@ -6,6 +6,7 @@ import { isRecord } from '../lib/json.js';
 import { runStatus } from '../lib/run.js';
 import type { PackageInfo } from '../lib/workspace.js';
 import { listPublicPackages } from '../lib/workspace.js';
+import { readPackedPackageJson, validatePackedWorkspaceDependencies } from './packed-manifest.js';
 
 export async function validatePackedPublicPackages(root: string): Promise<number> {
   let failures = 0;
@@ -22,6 +23,12 @@ async function validatePackedPublicPackage(root: string, pkg: PackageInfo): Prom
     const lint = await publint({ pack: { tarball: packed.arrayBuffer }, level: 'warning', strict: true });
     for (const message of lint.messages) {
       console.error(`${pkg.path}: publint ${message.type} ${message.code}: ${formatMessage(message, lint.pkg)}`);
+      failures++;
+    }
+
+    const packedPackage = await readPackedPackageJson(root, packed.path, pkg.name);
+    for (const message of validatePackedWorkspaceDependencies(root, pkg, packedPackage)) {
+      console.error(message);
       failures++;
     }
 
