@@ -17,6 +17,7 @@ import {
   pendingReleaseTargets,
   releaseTag,
 } from './core.js';
+import { publishWithAuthDiagnostics } from './npm-auth.js';
 import {
   completeReleaseAtHead as completeReleaseAtHeadWithShell,
   type ReleaseCompletionShell,
@@ -204,18 +205,33 @@ async function publishPackedPackage(
     if (dryRun) {
       args.push('--dry-run');
     }
-    try {
-      await runLatestNpmPublish(root, args, useBootstrapToken);
-    } catch (error) {
-      if (await npmVersionExists(root, pkg.name, pkg.version)) {
-        console.log(`${pkg.name}@${pkg.version}: publish result already visible on npm; continuing.`);
-        return;
-      }
-      throw error;
-    }
+    await publishWithAuthDiagnostics(
+      pkg,
+      {
+        publish: () => runLatestNpmPublish(root, args, useBootstrapToken),
+        versionExists: () => npmVersionExists(root, pkg.name, pkg.version),
+        log: (message) => console.log(message),
+        error: (message) => console.error(message),
+        appendSummary: async (markdown) => {
+          const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+          if (summaryPath) {
+            await appendFile(summaryPath, `${markdown}\n\n`);
+          }
+        },
+      },
+      {
+        useBootstrapToken,
+        tokenPresent: npmAuthTokenPresent(),
+        repository: githubRepositoryFromRootPackage(root),
+      },
+    );
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+}
+
+function npmAuthTokenPresent(): boolean {
+  return Boolean(process.env.NODE_AUTH_TOKEN || process.env.NPM_TOKEN || process.env.NPM_CONFIG_USERCONFIG);
 }
 
 function safeTarballPrefix(name: string): string {
