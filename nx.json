@@ -138,7 +138,7 @@
     "changelog": {
       "workspaceChangelog": false,
       "projectChangelogs": {
-        "createRelease": "github",
+        "createRelease": false,
         "file": false,
         "renderOptions": {
           "authors": true,

@@ -17,6 +17,7 @@ import {
   pendingReleaseTargets,
   releaseTag,
 } from './core.js';
+import { createOrUpdateGithubRelease, renderNxProjectChangelogContents } from './github-release.js';
 import { publishWithAuthDiagnostics } from './npm-auth.js';
 import {
   completeReleaseAtHead as completeReleaseAtHeadWithShell,
@@ -583,31 +584,22 @@ async function listMissingGithubReleasePackages(root: string, packages: ReleaseP
 
 async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: boolean): Promise<void> {
   const currentTag = releaseTag(pkg);
-  console.log(`${pkg.name}@${pkg.version}: creating GitHub Release for ${currentTag}.`);
+  console.log(`${pkg.name}@${pkg.version}: rendering GitHub Release notes for ${currentTag}.`);
   console.log(`GitHub release auth: ${envPresence('GH_TOKEN')}, ${envPresence('GITHUB_TOKEN')}.`);
   if (!dryRun) {
     await assertRemoteTagExists(root, currentTag);
   }
   const previousTag = await previousReleaseTag(root, pkg, currentTag);
-  const args = [
-    'release',
-    'changelog',
-    pkg.version,
-    `--projects=${pkg.name}`,
-    '--git-commit=false',
-    '--git-tag=false',
-    '--git-push=false',
-    '--stage-changes=false',
-  ];
-  if (previousTag) {
-    args.push(`--from=${previousTag}`);
-  } else {
-    args.push('--first-release');
-  }
   if (dryRun) {
-    args.push('--dry-run');
+    await renderNxProjectChangelogContents({ root, pkg, previousTag, dryRun });
+    return;
   }
-  await run('nx', args, root);
+  const contents = await renderNxProjectChangelogContents({ root, pkg, previousTag, dryRun });
+  await createOrUpdateGithubRelease(pkg, contents, {
+    githubReleaseExists: (tag) => githubReleaseExists(root, tag),
+    runGhRelease: (args) => run('gh', args, root),
+    log: (message) => console.log(message),
+  });
 }
 
 function envPresence(name: string): string {

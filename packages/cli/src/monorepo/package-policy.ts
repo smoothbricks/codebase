@@ -97,7 +97,7 @@ export function applyNxReleaseDefaults(root: string): void {
   const changelog = getOrCreateRecord(release, 'changelog');
   changed = setBooleanProperty(changelog, 'workspaceChangelog', false) || changed;
   const projectChangelogs = getOrCreateRecord(changelog, 'projectChangelogs');
-  changed = setStringProperty(projectChangelogs, 'createRelease', 'github') || changed;
+  changed = setBooleanProperty(projectChangelogs, 'createRelease', false) || changed;
   changed = setBooleanProperty(projectChangelogs, 'file', false) || changed;
   const renderOptions = getOrCreateRecord(projectChangelogs, 'renderOptions');
   if (typeof renderOptions.authors !== 'boolean') {
@@ -224,8 +224,8 @@ export function validateNxReleaseConfig(root: string): number {
     console.error('nx.json release.changelog.projectChangelogs config is missing');
     failures++;
   }
-  if (projectChangelogs && stringProperty(projectChangelogs, 'createRelease') !== 'github') {
-    console.error('nx.json release.changelog.projectChangelogs.createRelease must be github');
+  if (projectChangelogs && projectChangelogs.createRelease !== false) {
+    console.error('nx.json release.changelog.projectChangelogs.createRelease must be false');
     failures++;
   }
   if (projectChangelogs && projectChangelogs.file !== false) {
