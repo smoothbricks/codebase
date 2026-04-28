@@ -218,6 +218,11 @@ Versioning:
 - Nx release config must use `currentVersionResolver: "git-tag"` with `fallbackCurrentVersionResolver: "disk"`.
   Conventional-commit versioning requires git tags as the primary source, while the disk fallback supports initial
   releases before package tags exist.
+- `smoo release version` lets Nx own package versioning, `bun.lock` updates, the release commit, annotated tags, and the
+  remote push. Nx pushes commits and tags atomically with `git push --follow-tags --no-verify --atomic`, so a successful
+  version step means the release commit and tags landed together.
+- Reruns call Nx versioning again rather than repairing tags in `smoo`. Nx's git-tag current-version resolver plus disk
+  fallback handles already-tagged releases and first releases before package tags exist.
 
 Publishing:
 
@@ -226,9 +231,14 @@ Publishing:
 - Conflicting explicit dist-tags are rejected.
 - `--dry-run` skips npm publishing entirely. Bun still requires npm authentication for `bun publish --dry-run`, and
   publish artifact validation is already covered by `smoo monorepo validate`.
-- The managed publish workflow uses `secrets.NPM_TOKEN` when it is defined. This is only needed to bootstrap the first
-  publish before npm trusted publishing can be configured; after trust is configured, remove the secret and revoke the
-  temporary npm token so publishing falls back to GitHub Actions OIDC.
+- `smoo release publish` checks every current `name@version` for `npm:public` packages before invoking Nx. Already
+  published versions are skipped, so reruns after auth or network failures retry only the package versions npm does not
+  have yet.
+- The managed publish workflow passes `secrets.NPM_TOKEN` as `NPM_CONFIG_TOKEN`, which is the token env var used by
+  Bun-backed `nx release publish`. This is needed to bootstrap the first publish before npm trusted publishing can be
+  configured.
+- After trusted publishing is configured, tokenless publishing should be verified against Bun/OIDC support. If Bun
+  cannot use npm trusted publishing directly, the publish implementation should switch to the npm CLI for that step.
 - `smoo release trust-publisher` configures npm trusted publishing for every `npm:public` package. It uses the root
   `package.json` `repository.url` as the GitHub `owner/repo`, uses `publish.yml` as the trusted workflow, and runs
   `npm trust` through `nix shell nixpkgs#nodejs_latest` because the Lambda-pinned Node 24/npm toolchain may lag the npm
@@ -242,8 +252,8 @@ GitHub Releases:
 - `smoo release github-release` creates or updates releases for the selected tags.
 - `latest` status follows the derived npm dist-tag.
 
-The release flow is designed to be rerun after partial failure. It checks the current package versions and tags so a
-rerun can resume publishing instead of blindly bumping again.
+The release flow is designed to be rerun after partial failure. Nx owns atomic version/tag/push behavior, while `smoo`
+uses npm registry state to make publishing idempotent across retries.
 
 ## Why This Shape
 

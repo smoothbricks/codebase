@@ -1,11 +1,9 @@
-import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
 import { $ } from 'bun';
 import { decode, run, runStatus } from '../lib/run.js';
 import { listPublicPackages, readPackageJson, repositoryInfo } from '../lib/workspace.js';
-import { syncBunLockfileVersions } from '../monorepo/lockfile.js';
 
 export interface ReleaseVersionOptions {
   bump: string;
@@ -39,35 +37,27 @@ export async function releaseVersion(root: string, options: ReleaseVersionOption
     console.log('Current package versions are already published; skipping version bump.');
     return;
   }
-  if ((await gitTagsAtHead(root)).length > 0) {
-    console.log('HEAD already has release tags; skipping version bump and resuming publish.');
-    return;
-  }
 
+  // Nx owns release versioning end-to-end: package versions, bun.lock updates,
+  // the release commit, annotated tags, and the remote push. Nx 22.5.4 pushes
+  // with `git push --follow-tags --no-verify --atomic`, so a successful version
+  // step means the branch commit and release tags landed together. Reruns call
+  // Nx again instead of custom tag repair; the git-tag current-version resolver
+  // plus disk fallback covers both first releases and already-tagged releases.
   const nxArgs = ['release', 'version'];
   if (bump !== 'auto') {
     nxArgs.push(bump);
   }
-  nxArgs.push(`--projects=${projects}`);
+  nxArgs.push(`--projects=${projects}`, '--git-commit=true', '--git-tag=true', '--git-push=true');
   if (options.dryRun) {
     nxArgs.push('--dryRun');
   }
   await run('nx', nxArgs, root);
-
-  if (existsSync(join(root, 'bun.lock'))) {
-    syncBunLockfileVersions(root);
+  if (!options.dryRun) {
+    // Guard against future Nx/config regressions that leave release files, such
+    // as bun.lock, outside the release commit after tagging/pushing.
+    await assertCleanGitTree(root);
   }
-  if (options.dryRun) {
-    return;
-  }
-  if (existsSync(join(root, 'bun.lock'))) {
-    await run('git', ['add', 'bun.lock'], root);
-  }
-  if ((await runStatus('git', ['diff', '--cached', '--quiet'], root)) !== 0) {
-    await run('git', ['commit', '-m', 'chore(release): sync bun lockfile versions'], root);
-  }
-  await run('git', ['push'], root);
-  await run('git', ['push', '--tags'], root);
 }
 
 export async function releasePublish(root: string, options: ReleasePublishOptions): Promise<void> {
@@ -79,9 +69,14 @@ export async function releasePublish(root: string, options: ReleasePublishOption
     return;
   }
   const tag = releaseNpmTagArg(options);
-  const projects = listPublicPackages(root)
-    .map((pkg) => pkg.name)
-    .join(',');
+  const unpublishedPackages = await listUnpublishedPackages(root);
+  if (unpublishedPackages.length === 0) {
+    console.log('Current package versions are already published; skipping npm publish.');
+    return;
+  }
+  // npm package versions are immutable. Publishing only missing name@version
+  // pairs makes auth/network retries idempotent after a partial publish failure.
+  const projects = unpublishedPackages.map((pkg) => pkg.name).join(',');
   const nxArgs = ['release', 'publish', `--projects=${projects}`, '--tag', tag];
   await run('nx', nxArgs, root);
 }
@@ -153,6 +148,8 @@ interface ReleaseState {
   allPublished: boolean;
 }
 
+type PublicPackage = ReturnType<typeof listPublicPackages>[number];
+
 async function getReleaseState(root: string): Promise<ReleaseState> {
   const packages = listPublicPackages(root);
   const states = await Promise.all(
@@ -162,6 +159,14 @@ async function getReleaseState(root: string): Promise<ReleaseState> {
     }),
   );
   return { packages: states, allPublished: states.every((state) => state.published) };
+}
+
+async function listUnpublishedPackages(root: string): Promise<PublicPackage[]> {
+  const packages = listPublicPackages(root);
+  const states = await Promise.all(
+    packages.map(async (pkg) => ({ pkg, published: await npmVersionExists(pkg.name, pkg.version) })),
+  );
+  return states.filter((state) => !state.published).map((state) => state.pkg);
 }
 
 async function npmVersionExists(name: string, version: string): Promise<boolean> {
@@ -183,6 +188,17 @@ async function gitTagsAtHead(root: string): Promise<string[]> {
     .split('\n')
     .map((tag) => tag.trim())
     .filter(Boolean);
+}
+
+async function assertCleanGitTree(root: string): Promise<void> {
+  const result = await $`git status --porcelain`.cwd(root).quiet().nothrow();
+  if (result.exitCode !== 0) {
+    throw new Error('Unable to inspect git status after release versioning.');
+  }
+  const status = decode(result.stdout).trim();
+  if (status) {
+    throw new Error(`nx release version left uncommitted changes after tagging/pushing:\n${status}`);
+  }
 }
 
 function releaseBumpArg(bump = 'auto'): string {

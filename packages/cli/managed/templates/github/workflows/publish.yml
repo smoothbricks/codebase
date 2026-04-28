@@ -33,7 +33,6 @@ jobs:
     env:
       NIX_STORE_NAR: ${{ github.workspace }}/nix-store.nar
       GH_TOKEN: ${{ github.token }}
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       # --- Setup --------------------------------------------------------------
 
@@ -102,7 +101,7 @@ jobs:
           "41898282+github-actions[bot]@users.noreply.github.com"
 
       # Step 12
-      - name: 🏷️ Version packages
+      - name: 🏷️ Version, tag, and push packages
         run: smoo release version --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"
 
       # Step 13
@@ -111,18 +110,13 @@ jobs:
         run: echo "tags=$(git tag --points-at HEAD | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
 
       # Step 14
-      - name: 🔐 Configure npm token
-        if: ${{ inputs.dry_run != true && env.NODE_AUTH_TOKEN != '' }}
-        run: |
-          printf 'registry=https://registry.npmjs.org/\n' > "$RUNNER_TEMP/.npmrc"
-          printf '//registry.npmjs.org/:_authToken=%s\n' "$NODE_AUTH_TOKEN" >> "$RUNNER_TEMP/.npmrc"
-          echo "NPM_CONFIG_USERCONFIG=$RUNNER_TEMP/.npmrc" >> "$GITHUB_ENV"
-
-      # Step 15
       - name: 📦 Publish packages
+        # Bun-backed `nx release publish` reads npm auth from NPM_CONFIG_TOKEN.
+        env:
+          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: smoo release publish --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"
 
-      # Step 16
+      # Step 15
       - name: 🚀 Create or update GitHub Releases
         if: ${{ inputs.dry_run != true }}
         run:
@@ -131,7 +125,7 @@ jobs:
 
       # --- Cleanup ------------------------------------------------------------
 
-      # Step 17
+      # Step 16
       - name: 🧹 Cleanup and cache Nix/devenv
         if: ${{ always() }}
         uses: ./.github/actions/save-nix-devenv
