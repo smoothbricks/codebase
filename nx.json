@@ -133,6 +133,9 @@
       "versionActions": "@smoothbricks/cli/nx-version-actions",
       "preVersionCommand": "nx run-many -t build"
     },
+    "releaseTag": {
+      "pattern": "{projectName}@{version}"
+    },
     "changelog": {
       "workspaceChangelog": false,
       "projectChangelogs": {

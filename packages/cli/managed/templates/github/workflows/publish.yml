@@ -50,34 +50,53 @@ jobs:
         id: setup
         uses: ./.github/actions/setup-devenv
 
+      # Step 4
+      - name: 🤖 Configure release author
+        run:
+          git config user.name "github-actions[bot]" && git config user.email
+          "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # Step 5
+      - name: 🧯 Repair pending releases
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: smoo release repair-pending --dry-run "${{ inputs.dry_run }}"
+
+      # Step 6
+      - name: 🏷️ Version release
+        id: version
+        run:
+          smoo release version --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}" --github-output
+          "$GITHUB_OUTPUT"
+
       # --- Validation ---------------------------------------------------------
 
       # Release validation intentionally does not restore persisted Nx task
       # cache. Nx may reuse tasks produced earlier in this same job, but publish
-      # never relies on task outputs restored from CI cache.
-
-      # Step 4
-      - name: ✅ Check managed monorepo files
-        run: smoo monorepo check
-
-      # Step 5
-      - name: 📦 Resolve release packages
-        id: projects
-        run: smoo monorepo list-release-packages --fail-empty --github-output "$GITHUB_OUTPUT"
-
-      # Step 6
-      - name: 🔨 Build
-        run: smoo github-ci nx-run-many --targets build --projects "${{ steps.projects.outputs.projects }}"
+      # never relies on task outputs restored from CI cache. version runs before
+      # validation so the commit completed below is the commit that was checked.
 
       # Step 7
-      - name: 🔍 Lint
-        run: smoo github-ci nx-run-many --targets lint --projects "${{ steps.projects.outputs.projects }}"
+      - name: ✅ Check managed monorepo files (${{ steps.version.outputs.mode }})
+        if: ${{ steps.version.outputs.mode != 'none' }}
+        run: smoo monorepo check
 
       # Step 8
-      - name: 🧪 Unit Tests
-        run: smoo github-ci nx-run-many --targets test --projects "${{ steps.projects.outputs.projects }}"
+      - name: 🔨 Build (${{ steps.version.outputs.mode }})
+        if: ${{ steps.version.outputs.mode != 'none' }}
+        run: smoo github-ci nx-run-many --targets build --projects "${{ steps.version.outputs.projects }}"
 
       # Step 9
+      - name: 🔍 Lint (${{ steps.version.outputs.mode }})
+        if: ${{ steps.version.outputs.mode != 'none' }}
+        run: smoo github-ci nx-run-many --targets lint --projects "${{ steps.version.outputs.projects }}"
+
+      # Step 10
+      - name: 🧪 Unit Tests (${{ steps.version.outputs.mode }})
+        if: ${{ steps.version.outputs.mode != 'none' }}
+        run: smoo github-ci nx-run-many --targets test --projects "${{ steps.version.outputs.projects }}"
+
+      # Step 11
       - name: 📎 Upload trace DBs
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
@@ -88,39 +107,25 @@ jobs:
           retention-days: 14
           include-hidden-files: true
 
-      # Step 10
-      - name: ✅ Validate monorepo config
+      # Step 12
+      - name: ✅ Validate monorepo config (${{ steps.version.outputs.mode }})
+        if: ${{ steps.version.outputs.mode != 'none' }}
         run: smoo monorepo validate
 
       # --- Release ------------------------------------------------------------
 
-      # Step 11
-      - name: 🤖 Configure release author
-        run:
-          git config user.name "github-actions[bot]" && git config user.email
-          "41898282+github-actions[bot]@users.noreply.github.com"
-
-      # Step 12
-      - name: 🏷️ Version, tag, and push packages
-        run: smoo release version --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"
-
       # Step 13
-      - name: 📦 Publish packages
-        # smoo packs with Bun, then publishes tarballs with npm. npm uses OIDC
-        # trusted publishing when configured; NODE_AUTH_TOKEN is only a temporary
-        # bootstrap fallback before packages have trusted publishers.
+      - name: 📦 Publish release (${{ steps.version.outputs.mode }})
+        # smoo packs with Bun, then publishes tarballs with npm. Existing
+        # packages use trusted publishing/OIDC; first publishes use NODE_AUTH_TOKEN
+        # because npm trust can only be configured after a package exists.
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: smoo release publish --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"
 
-      # Step 14
-      - name: 🚀 Create or update GitHub Releases
-        if: ${{ inputs.dry_run != true }}
-        run: smoo release github-release --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"
-
       # --- Cleanup ------------------------------------------------------------
 
-      # Step 15
+      # Step 14
       - name: 🧹 Cleanup and cache Nix/devenv
         if: ${{ always() }}
         uses: ./.github/actions/save-nix-devenv

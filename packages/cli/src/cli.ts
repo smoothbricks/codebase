@@ -22,6 +22,21 @@ function buildProgram(): Command {
   const program = new Command();
   program.name('smoo').description('SmoothBricks monorepo tooling').exitOverride().showHelpAfterError();
 
+  program
+    .command('direnv-run')
+    .description('Run a command with the current direnv environment')
+    .argument('<command...>', 'command and arguments to run')
+    .allowUnknownOption(true)
+    .allowExcessArguments(true)
+    .action(async (command: string[]) => {
+      const { direnvRun } = await import('./lib/direnv.js');
+      const [name, ...args] = command;
+      if (!name) {
+        throw new Error('direnv-run requires a command.');
+      }
+      await direnvRun(await findRepoRoot(), name, args);
+    });
+
   const monorepo = program.command('monorepo').description('Manage SmoothBricks-style monorepos');
   monorepo
     .command('init')
@@ -80,32 +95,37 @@ function buildProgram(): Command {
     await printReleaseState(await findRepoRoot());
   });
   release
+    .command('repair-pending')
+    .description('Repair incomplete older release commits before releasing the current HEAD')
+    .option('--tag <tag>', 'explicit npm dist-tag; must match version-derived tag')
+    .option('--npm-tag <npmTag>', 'explicit npm dist-tag; must match version-derived tag')
+    .option('--dry-run [dryRun]', 'run without pushing, publishing, or writing GitHub Releases')
+    .action(async (options: { tag?: string; npmTag?: string; dryRun?: string | boolean }) => {
+      const { releaseRepairPending } = await import('./release/index.js');
+      await releaseRepairPending(await findRepoRoot(), { ...options, dryRun: booleanOption(options.dryRun) });
+    });
+  release
     .command('version')
     .option('--bump <bump>', 'auto, patch, minor, major, or prerelease', 'auto')
-    .option('--dry-run [dryRun]', 'run without writing versions, tags, or pushes')
-    .action(async (options: { bump: string; dryRun?: string | boolean }) => {
+    .option('--dry-run [dryRun]', 'run without writing versions or tags')
+    .option('--github-output <path>', 'append mode=<mode> and projects=<packages> to a GitHub Actions output file')
+    .action(async (options: { bump: string; dryRun?: string | boolean; githubOutput?: string }) => {
       const { releaseVersion } = await import('./release/index.js');
-      await releaseVersion(await findRepoRoot(), { bump: options.bump, dryRun: booleanOption(options.dryRun) });
+      await releaseVersion(await findRepoRoot(), {
+        bump: options.bump,
+        dryRun: booleanOption(options.dryRun),
+        githubOutput: options.githubOutput,
+      });
     });
   release
     .command('publish')
     .option('--bump <bump>', 'auto, patch, minor, major, or prerelease', 'auto')
     .option('--tag <tag>', 'explicit npm dist-tag; must match bump-derived tag')
     .option('--npm-tag <npmTag>', 'explicit npm dist-tag; must match bump-derived tag')
-    .option('--dry-run [dryRun]', 'run without publishing')
+    .option('--dry-run [dryRun]', 'run without pushing, publishing, or writing GitHub Releases')
     .action(async (options: { bump: string; tag?: string; npmTag?: string; dryRun?: string | boolean }) => {
       const { releasePublish } = await import('./release/index.js');
       await releasePublish(await findRepoRoot(), { ...options, dryRun: booleanOption(options.dryRun) });
-    });
-  release
-    .command('github-release')
-    .option('--bump <bump>', 'auto, patch, minor, major, or prerelease', 'auto')
-    .option('--tag <tag>', 'explicit npm dist-tag; must match bump-derived tag')
-    .option('--npm-tag <npmTag>', 'explicit npm dist-tag; must match bump-derived tag')
-    .option('--dry-run [dryRun]', 'skip GitHub Release writes')
-    .action(async (options: { bump: string; tag?: string; npmTag?: string; dryRun?: string | boolean }) => {
-      const { releaseGithubRelease } = await import('./release/index.js');
-      await releaseGithubRelease(await findRepoRoot(), { ...options, dryRun: booleanOption(options.dryRun) });
     });
   release
     .command('trust-publisher')

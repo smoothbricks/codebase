@@ -22,6 +22,7 @@ import {
 } from '../lib/workspace.js';
 
 export const SMOO_NX_VERSION_ACTIONS = '@smoothbricks/cli/nx-version-actions';
+export const SMOO_NX_RELEASE_TAG_PATTERN = '{projectName}@{version}';
 
 export function applyPublicPackageDefaults(root: string): void {
   const rootPackage = requiredJsonObject(join(root, 'package.json'));
@@ -89,6 +90,8 @@ export function applyNxReleaseDefaults(root: string): void {
   changed = setStringProperty(version, 'fallbackCurrentVersionResolver', 'disk') || changed;
   changed = setStringProperty(version, 'versionActions', SMOO_NX_VERSION_ACTIONS) || changed;
   changed = setMissingStringProperty(version, 'preVersionCommand', 'nx run-many -t build') || changed;
+  const releaseTag = getOrCreateRecord(release, 'releaseTag');
+  changed = setStringProperty(releaseTag, 'pattern', SMOO_NX_RELEASE_TAG_PATTERN) || changed;
   const changelog = getOrCreateRecord(release, 'changelog');
   changed = setBooleanProperty(changelog, 'workspaceChangelog', false) || changed;
   const projectChangelogs = getOrCreateRecord(changelog, 'projectChangelogs');
@@ -158,6 +161,7 @@ export function validateNxReleaseConfig(root: string): number {
   }
   const release = recordProperty(nxJson, 'release');
   const version = release ? recordProperty(release, 'version') : null;
+  const releaseTag = release ? recordProperty(release, 'releaseTag') : null;
   const changelog = release ? recordProperty(release, 'changelog') : null;
   const projectChangelogs = changelog ? recordProperty(changelog, 'projectChangelogs') : null;
   const renderOptions = projectChangelogs ? recordProperty(projectChangelogs, 'renderOptions') : null;
@@ -194,6 +198,14 @@ export function validateNxReleaseConfig(root: string): number {
   }
   if (version && !stringProperty(version, 'preVersionCommand')) {
     console.error('nx.json release.version.preVersionCommand must be defined');
+    failures++;
+  }
+  if (!releaseTag) {
+    console.error('nx.json release.releaseTag config is missing');
+    failures++;
+  }
+  if (releaseTag && stringProperty(releaseTag, 'pattern') !== SMOO_NX_RELEASE_TAG_PATTERN) {
+    console.error(`nx.json release.releaseTag.pattern must be ${SMOO_NX_RELEASE_TAG_PATTERN}`);
     failures++;
   }
   if (!changelog) {
