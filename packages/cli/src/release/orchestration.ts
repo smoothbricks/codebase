@@ -28,7 +28,7 @@ export interface ReleaseCompletionShell<Package extends ReleasePackageInfo = Rel
 export interface ReleaseRepairShell<Package extends ReleasePackageInfo = ReleasePackageInfo>
   extends ReleaseCompletionShell<Package> {
   checkout(ref: string): Promise<void>;
-  withDirenvEnv<T>(runWithEnv: () => Promise<T>): Promise<T>;
+  withDevenvEnv<T>(runWithEnv: () => Promise<T>): Promise<T>;
   beforeRepairTarget?(target: ReleaseTarget<Package>): void;
   afterRepairTarget?(target: ReleaseTarget<Package>): void;
 }
@@ -118,7 +118,7 @@ export async function repairPendingTargets<Package extends ReleasePackageInfo>(
       }
       shell.beforeRepairTarget?.(target);
       try {
-        summaries.push(await shell.withDirenvEnv(() => completeRepairTargetAtHead(shell, target, dryRun)));
+        summaries.push(await shell.withDevenvEnv(() => completeRepairTargetAtHead(shell, target, dryRun)));
       } finally {
         shell.afterRepairTarget?.(target);
       }

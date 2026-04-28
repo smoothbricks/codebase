@@ -85,8 +85,12 @@ export async function collectOwnedReleaseTagRecords<Package extends Omit<Release
   shell: ReleasePlanningShell,
 ): Promise<Array<ReleaseTagRecord<Package & { version: string }>>> {
   const records: Array<ReleaseTagRecord<Package & { version: string }>> = [];
+  const completedPackages = new Set<string>();
   for (const tag of await shell.listReleaseTagsByCreatorDate()) {
     const match = releasePackageForTag(packages, tag.name);
+    if (match && completedPackages.has(match.pkg.name)) {
+      continue;
+    }
     if (!match || !(await shell.isAncestor(tag.sha, ref))) {
       continue;
     }
@@ -99,12 +103,11 @@ export async function collectOwnedReleaseTagRecords<Package extends Omit<Release
       );
     }
     const pkg = { ...match.pkg, version: match.version };
-    records.push(
-      classifyReleaseTag(
-        { tag: tag.name, sha: tag.sha, timestamp: tag.timestamp, pkg },
-        await shell.durableTagState(pkg, tag.name),
-      ),
-    );
+    const state = await shell.durableTagState(pkg, tag.name);
+    records.push(classifyReleaseTag({ tag: tag.name, sha: tag.sha, timestamp: tag.timestamp, pkg }, state));
+    if (state.npmPublished && state.githubReleaseExists) {
+      completedPackages.add(pkg.name);
+    }
   }
   return records;
 }

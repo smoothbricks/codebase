@@ -24,15 +24,9 @@ smoo --help
 SmoothBricks itself self-hosts before `dist` exists by using `tooling/smoo`, which imports `packages/cli/src/cli.ts`
 directly. Published installs use the package binary in `bin/smoo`, which imports built JavaScript from `dist`.
 
-`smoo direnv-run -- <command>` runs a command with the environment from `direnv export json`. smoo snapshots the current
-process environment before applying the direnv diff and restores it afterwards, so repeated internal uses, such as
-release repair across checked-out commits, do not leak env changes between iterations.
-
 ## Core Commands
 
 ```bash
-smoo direnv-run -- <command> [...args]
-
 smoo monorepo init [--runtime-only] [--sync-runtime]
 smoo monorepo validate [--fail-fast] [--only-if-new-workspace-package]
 smoo monorepo update

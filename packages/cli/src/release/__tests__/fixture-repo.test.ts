@@ -170,7 +170,7 @@ describe('release planning with fixture git repositories', () => {
       const summaries = await repairPendingTargets(shell, pending, restoreRef, false);
 
       expect(shell.checkouts).toEqual([githubOnlySha, npmAndGithubSha, restoreRef]);
-      expect(shell.direnvLoads).toBe(2);
+      expect(shell.devenvLoads).toBe(2);
       expect(shell.builds).toEqual([['@scope/b']]);
       expect(shell.publishes).toEqual([{ name: '@scope/b', version: '2.0.0-beta.1', distTag: 'next', dryRun: false }]);
       expect(shell.githubCreates).toEqual([
@@ -227,7 +227,7 @@ class LocalGitRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
   readonly builds: string[][] = [];
   readonly publishes: Array<{ name: string; version: string; distTag: string; dryRun: boolean }> = [];
   readonly githubCreates: Array<{ name: string; version: string; dryRun: boolean }> = [];
-  direnvLoads = 0;
+  devenvLoads = 0;
 
   constructor(private readonly root: string) {}
 
@@ -285,8 +285,8 @@ class LocalGitRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
     this.checkouts.push(ref);
   }
 
-  async withDirenvEnv<T>(runWithEnv: () => Promise<T>): Promise<T> {
-    this.direnvLoads += 1;
+  async withDevenvEnv<T>(runWithEnv: () => Promise<T>): Promise<T> {
+    this.devenvLoads += 1;
     return runWithEnv();
   }
 

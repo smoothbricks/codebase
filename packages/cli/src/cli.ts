@@ -22,21 +22,6 @@ function buildProgram(): Command {
   const program = new Command();
   program.name('smoo').description('SmoothBricks monorepo tooling').exitOverride().showHelpAfterError();
 
-  program
-    .command('direnv-run')
-    .description('Run a command with the current direnv environment')
-    .argument('<command...>', 'command and arguments to run')
-    .allowUnknownOption(true)
-    .allowExcessArguments(true)
-    .action(async (command: string[]) => {
-      const { direnvRun } = await import('./lib/direnv.js');
-      const [name, ...args] = command;
-      if (!name) {
-        throw new Error('direnv-run requires a command.');
-      }
-      await direnvRun(await findRepoRoot(), name, args);
-    });
-
   const monorepo = program.command('monorepo').description('Manage SmoothBricks-style monorepos');
   monorepo
     .command('init')

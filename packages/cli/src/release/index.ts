@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
 import { $ } from 'bun';
-import { withDirenvEnv } from '../lib/direnv.js';
+import { withDevenvEnv } from '../lib/devenv.js';
 import { isRecord, stringProperty } from '../lib/json.js';
 import { decode, run, runStatus } from '../lib/run.js';
 import { listReleasePackages, readPackageJson, repositoryInfo } from '../lib/workspace.js';
@@ -453,14 +453,14 @@ function releaseCompletionShell(root: string): ReleaseCompletionShell<ReleasePac
 
 function releaseRepairShell(root: string): ReleaseCompletionShell<ReleasePackage> & {
   checkout(ref: string): Promise<void>;
-  withDirenvEnv<T>(runWithEnv: () => Promise<T>): Promise<T>;
+  withDevenvEnv<T>(runWithEnv: () => Promise<T>): Promise<T>;
   beforeRepairTarget(target: ReleaseTarget): void;
   afterRepairTarget(target: ReleaseTarget): void;
 } {
   return {
     ...releaseCompletionShell(root),
     checkout: (ref) => run('git', ['switch', '--detach', ref], root),
-    withDirenvEnv: (runWithEnv) => withDirenvEnv(root, runWithEnv),
+    withDevenvEnv: (runWithEnv) => withDevenvEnv(root, runWithEnv),
     beforeRepairTarget: (target) => {
       console.log(`::group::Repair pending release ${target.sha.slice(0, 12)} (${packageSummary(target.packages)})`);
     },
