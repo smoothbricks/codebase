@@ -89,7 +89,9 @@ export function applyNxReleaseDefaults(root: string): void {
   changed = setStringProperty(version, 'currentVersionResolver', 'git-tag') || changed;
   changed = setStringProperty(version, 'fallbackCurrentVersionResolver', 'disk') || changed;
   changed = setStringProperty(version, 'versionActions', SMOO_NX_VERSION_ACTIONS) || changed;
-  changed = setMissingStringProperty(version, 'preVersionCommand', 'nx run-many -t build') || changed;
+  if (delete version.preVersionCommand) {
+    changed = true;
+  }
   const releaseTag = getOrCreateRecord(release, 'releaseTag');
   changed = setStringProperty(releaseTag, 'pattern', SMOO_NX_RELEASE_TAG_PATTERN) || changed;
   const changelog = getOrCreateRecord(release, 'changelog');
@@ -196,8 +198,10 @@ export function validateNxReleaseConfig(root: string): number {
     console.error(`nx.json release.version.versionActions must be ${SMOO_NX_VERSION_ACTIONS}`);
     failures++;
   }
-  if (version && !stringProperty(version, 'preVersionCommand')) {
-    console.error('nx.json release.version.preVersionCommand must be defined');
+  if (version && stringProperty(version, 'preVersionCommand')) {
+    console.error(
+      'nx.json release.version.preVersionCommand must not be defined; smoo builds npm-missing packages before publish',
+    );
     failures++;
   }
   if (!releaseTag) {

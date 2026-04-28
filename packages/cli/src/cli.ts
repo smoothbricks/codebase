@@ -97,10 +97,8 @@ function buildProgram(): Command {
   release
     .command('repair-pending')
     .description('Repair incomplete older release commits before releasing the current HEAD')
-    .option('--tag <tag>', 'explicit npm dist-tag; must match version-derived tag')
-    .option('--npm-tag <npmTag>', 'explicit npm dist-tag; must match version-derived tag')
     .option('--dry-run [dryRun]', 'run without pushing, publishing, or writing GitHub Releases')
-    .action(async (options: { tag?: string; npmTag?: string; dryRun?: string | boolean }) => {
+    .action(async (options: { dryRun?: string | boolean }) => {
       const { releaseRepairPending } = await import('./release/index.js');
       await releaseRepairPending(await findRepoRoot(), { ...options, dryRun: booleanOption(options.dryRun) });
     });
@@ -120,10 +118,8 @@ function buildProgram(): Command {
   release
     .command('publish')
     .option('--bump <bump>', 'auto, patch, minor, major, or prerelease', 'auto')
-    .option('--tag <tag>', 'explicit npm dist-tag; must match bump-derived tag')
-    .option('--npm-tag <npmTag>', 'explicit npm dist-tag; must match bump-derived tag')
     .option('--dry-run [dryRun]', 'run without pushing, publishing, or writing GitHub Releases')
-    .action(async (options: { bump: string; tag?: string; npmTag?: string; dryRun?: string | boolean }) => {
+    .action(async (options: { bump: string; dryRun?: string | boolean }) => {
       const { releasePublish } = await import('./release/index.js');
       await releasePublish(await findRepoRoot(), { ...options, dryRun: booleanOption(options.dryRun) });
     });

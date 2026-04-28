@@ -18,14 +18,10 @@ export interface ReleaseVersionOptions {
 
 export interface ReleasePublishOptions {
   bump: string;
-  tag?: string;
-  npmTag?: string;
   dryRun?: boolean;
 }
 
 export interface ReleaseRepairPendingOptions {
-  tag?: string;
-  npmTag?: string;
   dryRun?: boolean;
 }
 
@@ -44,8 +40,11 @@ export async function releaseVersion(root: string, options: ReleaseVersionOption
 
   if (!options.dryRun) {
     const localRelease = await releasePackagesAtHead(root, packages);
-    if (localRelease.length > 0 && !(await releaseIsComplete(root, localRelease))) {
-      throw new Error('HEAD is already an incomplete release target. Run smoo release repair-pending first.');
+    if (localRelease.length > 0) {
+      await ensureLocalReleaseTags(root, localRelease);
+      console.log('HEAD is already a release target; publish will complete any missing durable state.');
+      await writeReleaseGithubOutput(options.githubOutput, localRelease, 'none');
+      return;
     }
   }
 
@@ -75,8 +74,10 @@ export async function releaseVersion(root: string, options: ReleaseVersionOption
   const releasedPackages = await releasePackagesAtHead(root, releasePackages(root));
   await ensureLocalReleaseTags(root, releasedPackages);
   if (headAfterVersioning === headBeforeVersioning) {
-    if (releasedPackages.length > 0 && !(await releaseIsComplete(root, releasedPackages))) {
-      throw new Error('HEAD is already an incomplete release target. Run smoo release repair-pending first.');
+    if (releasedPackages.length > 0) {
+      console.log('HEAD is already a release target; publish will complete any missing durable state.');
+      await writeReleaseGithubOutput(options.githubOutput, releasedPackages, 'none');
+      return;
     }
     if (bump !== 'auto') {
       throw new Error(`Nx did not create a release commit for forced --bump ${bump}.`);
@@ -93,7 +94,6 @@ export async function releaseVersion(root: string, options: ReleaseVersionOption
 
 export async function releasePublish(root: string, options: ReleasePublishOptions): Promise<void> {
   const bump = releaseBumpArg(options.bump);
-  const tag = releaseNpmTagArg(options);
   const packages = await releasePackagesAtHead(root, releasePackages(root));
   if (packages.length === 0) {
     if (bump === 'auto') {
@@ -114,13 +114,7 @@ export async function releasePublish(root: string, options: ReleasePublishOption
     }
     throw new Error('No release tags found at HEAD for current package versions. Run smoo release version first.');
   }
-  const summary = await completeReleaseAtHead(
-    root,
-    packages,
-    tag,
-    options.dryRun === true,
-    await newerCommitsRemain(root),
-  );
+  const summary = await completeReleaseAtHead(root, packages, options.dryRun === true, await newerCommitsRemain(root));
   await writeReleaseSummary(summary);
 }
 
@@ -130,21 +124,19 @@ export async function releaseRepairPending(root: string, options: ReleaseRepairP
   await fetchReleaseRefs(root, remote, branch);
   const remoteRef = `${remote}/${branch}`;
   const restoreRef = (await gitRefExists(root, remoteRef)) ? remoteRef : await gitHead(root);
-  const candidates = await listIncompleteReleaseCommits(root, restoreRef);
+  const targets = await listPendingReleaseTargets(root, restoreRef);
   const summaries: ReleaseSummary[] = [];
   try {
-    for (const sha of candidates) {
-      await run('git', ['switch', '--detach', sha], root);
-      const packages = await releasePackagesAtHead(root, releasePackages(root));
+    for (const target of targets) {
+      await run('git', ['switch', '--detach', target.sha], root);
+      const packages = target.packages;
       if (packages.length === 0) {
-        throw new Error(`Release commit ${sha} has no release packages after checkout.`);
+        throw new Error(`Release commit ${target.sha} has no release packages after checkout.`);
       }
-      console.log(`::group::Repair pending release ${sha.slice(0, 12)} (${packageSummary(packages)})`);
+      console.log(`::group::Repair pending release ${target.sha.slice(0, 12)} (${packageSummary(packages)})`);
       try {
         await withDirenvEnv(root, async () => {
-          await buildReleaseCandidate(root, packages);
-          const tag = releaseNpmTagForRepair(options, packages);
-          summaries.push(await completeReleaseAtHead(root, packages, tag, options.dryRun === true, false));
+          summaries.push(await completeRepairTargetAtHead(root, target, options.dryRun === true));
         });
       } finally {
         console.log('::endgroup::');
@@ -219,6 +211,23 @@ interface ReleaseSummary {
 interface PublishReleasePackagesResult {
   published: ReleasePackage[];
   alreadyPublished: ReleasePackage[];
+}
+
+interface ReleaseTarget {
+  sha: string;
+  timestamp: number;
+  packages: ReleasePackage[];
+  npmPackages: ReleasePackage[];
+  githubPackages: ReleasePackage[];
+}
+
+interface ReleaseTagRecord {
+  tag: string;
+  sha: string;
+  timestamp: number;
+  pkg: ReleasePackage;
+  needsNpmPublish: boolean;
+  needsGithubRelease: boolean;
 }
 
 async function getReleaseState(root: string): Promise<ReleaseState> {
@@ -402,29 +411,6 @@ async function previousReleaseTag(root: string, pkg: ReleasePackage, currentTag:
   );
 }
 
-async function releaseIsComplete(root: string, packages: ReleasePackage[], ref = 'HEAD'): Promise<boolean> {
-  const sha = await gitSha(root, ref);
-  const branch = await releaseBranch(root);
-  const remote = await releaseRemote(root, branch);
-  await fetchReleaseRefs(root, remote, branch);
-  const remoteRef = `${remote}/${branch}`;
-  if (!(await gitRefExists(root, remoteRef)) || !(await gitIsAncestor(root, sha, remoteRef))) {
-    return false;
-  }
-  for (const pkg of packages) {
-    if (!(await remoteReleaseTagExists(root, remote, releaseTag(pkg)))) {
-      return false;
-    }
-    if (!(await npmVersionExists(root, pkg.name, pkg.version))) {
-      return false;
-    }
-    if (!(await githubReleaseExists(root, releaseTag(pkg)))) {
-      return false;
-    }
-  }
-  return true;
-}
-
 async function ensureLocalReleaseTags(root: string, packages: ReleasePackage[]): Promise<void> {
   for (const pkg of packages) {
     const tag = releaseTag(pkg);
@@ -466,7 +452,6 @@ async function pushReleaseRefs(root: string, packages: ReleasePackage[]): Promis
 async function completeReleaseAtHead(
   root: string,
   packages: ReleasePackage[],
-  tag: string,
   dryRun: boolean,
   rerunRequired: boolean,
 ): Promise<ReleaseSummary> {
@@ -484,60 +469,189 @@ async function completeReleaseAtHead(
   if (!dryRun) {
     summary.pushed = await pushReleaseRefs(root, packages);
   }
-  const publishResult = await publishReleasePackages(root, packages, tag, dryRun);
+  const publishResult = await publishReleasePackages(root, packages, dryRun);
   summary.published = publishResult.published;
   summary.alreadyPublished = publishResult.alreadyPublished;
   summary.githubReleases = await createGithubReleases(root, packages, dryRun);
   return summary;
 }
 
-async function listIncompleteReleaseCommits(root: string, ref: string): Promise<string[]> {
-  const candidates = await firstParentCommits(root, ref);
-  const packages = releasePackages(root);
-  const incomplete: string[] = [];
-  for (const sha of candidates) {
-    const releasePackagesForCommit = await releasePackagesAtRef(root, packages, sha);
-    if (releasePackagesForCommit.length === 0) {
+async function completeRepairTargetAtHead(
+  root: string,
+  target: ReleaseTarget,
+  dryRun: boolean,
+): Promise<ReleaseSummary> {
+  const summary: ReleaseSummary = {
+    sha: await gitHead(root),
+    dryRun,
+    packages: target.packages,
+    pushed: false,
+    published: [],
+    alreadyPublished: [],
+    githubReleases: [],
+    rerunRequired: false,
+    noRelease: false,
+  };
+  if (!dryRun) {
+    summary.pushed = await pushReleaseRefs(root, target.packages);
+  }
+  const publishResult = await publishReleasePackages(root, target.npmPackages, dryRun);
+  summary.published = publishResult.published;
+  summary.alreadyPublished = publishResult.alreadyPublished;
+  summary.githubReleases = await createGithubReleases(root, target.githubPackages, dryRun);
+  return summary;
+}
+
+function npmDistTagForVersion(version: string): string {
+  return version.includes('-') ? 'next' : 'latest';
+}
+
+async function listPendingReleaseTargets(root: string, ref: string): Promise<ReleaseTarget[]> {
+  const head = await gitHead(root);
+  const targets = groupReleaseTargets(await listOwnedReleaseTagRecords(root, ref));
+  const pending: ReleaseTarget[] = [];
+  for (const target of targets) {
+    if (target.sha === head) {
       continue;
     }
-    if (!(await releaseIsComplete(root, releasePackagesForCommit, sha))) {
-      incomplete.push(sha);
+    if (target.npmPackages.length === 0 && target.githubPackages.length === 0) {
+      break;
+    }
+    pending.push(target);
+  }
+  return pending.reverse();
+}
+
+async function listOwnedReleaseTagRecords(root: string, ref: string): Promise<ReleaseTagRecord[]> {
+  const packages = releasePackages(root);
+  const records: ReleaseTagRecord[] = [];
+  for (const tag of await gitReleaseTagsByCreatorDate(root)) {
+    const match = releasePackageForTag(packages, tag.name);
+    if (!match || !(await gitIsAncestor(root, tag.sha, ref))) {
+      continue;
+    }
+    const versionAtTag = await packageVersionAtRef(root, match.pkg.path, tag.sha);
+    if (versionAtTag !== match.version) {
+      throw new Error(
+        `Release tag ${tag.name} points at ${tag.sha.slice(0, 12)}, but ${match.pkg.path}/package.json has version ${
+          versionAtTag ?? 'missing'
+        }.`,
+      );
+    }
+    records.push({
+      tag: tag.name,
+      sha: tag.sha,
+      timestamp: tag.timestamp,
+      pkg: { ...match.pkg, version: match.version },
+      needsNpmPublish: !(await npmVersionExists(root, match.pkg.name, match.version)),
+      needsGithubRelease: !(await githubReleaseExists(root, tag.name)),
+    });
+  }
+  return records;
+}
+
+function groupReleaseTargets(records: ReleaseTagRecord[]): ReleaseTarget[] {
+  const targets = new Map<string, ReleaseTarget>();
+  const packageNamesByTarget = new Map<string, Set<string>>();
+  for (const record of records) {
+    let target = targets.get(record.sha);
+    let packageNames = packageNamesByTarget.get(record.sha);
+    if (!target) {
+      target = { sha: record.sha, timestamp: record.timestamp, packages: [], npmPackages: [], githubPackages: [] };
+      targets.set(record.sha, target);
+      packageNames = new Set<string>();
+      packageNamesByTarget.set(record.sha, packageNames);
+    } else if (record.timestamp > target.timestamp) {
+      target.timestamp = record.timestamp;
+    }
+    if (!packageNames) {
+      throw new Error(`Release target ${record.sha.slice(0, 12)} lost package tracking state.`);
+    }
+    if (packageNames.has(record.pkg.name)) {
+      throw new Error(
+        `Release target ${record.sha.slice(0, 12)} has more than one release tag for ${record.pkg.name}.`,
+      );
+    }
+    packageNames.add(record.pkg.name);
+    if (record.needsNpmPublish || record.needsGithubRelease) {
+      target.packages.push(record.pkg);
+    }
+    if (record.needsNpmPublish) {
+      target.npmPackages.push(record.pkg);
+    }
+    if (record.needsGithubRelease) {
+      target.githubPackages.push(record.pkg);
     }
   }
-  return incomplete;
+  return [...targets.values()].sort(
+    (left, right) => right.timestamp - left.timestamp || right.sha.localeCompare(left.sha),
+  );
+}
+
+interface GitReleaseTag {
+  name: string;
+  sha: string;
+  timestamp: number;
+}
+
+async function gitReleaseTagsByCreatorDate(root: string): Promise<GitReleaseTag[]> {
+  const result =
+    await $`git for-each-ref --sort=-creatordate --format=${'%(refname:short)%09%(creatordate:unix)%09%(*objectname)%09%(objectname)'} refs/tags`
+      .cwd(root)
+      .quiet()
+      .nothrow();
+  if (result.exitCode !== 0) {
+    throw new Error('Unable to list release tags by creator date.');
+  }
+  return decode(result.stdout)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [name, timestampText, peeledSha, objectSha] = line.split('\t');
+      const timestamp = Number(timestampText);
+      const sha = peeledSha || objectSha;
+      if (!name || !sha || !Number.isSafeInteger(timestamp)) {
+        throw new Error(`Unable to parse release tag ref: ${line}`);
+      }
+      return { name, sha, timestamp };
+    });
+}
+
+function releasePackageForTag(
+  packages: ReleasePackage[],
+  tag: string,
+): { pkg: ReleasePackage; version: string } | null {
+  for (const pkg of packages) {
+    const prefix = `${pkg.name}@`;
+    if (tag.startsWith(prefix)) {
+      const version = tag.slice(prefix.length);
+      if (!version) {
+        throw new Error(`Release tag ${tag} does not include a version.`);
+      }
+      return { pkg, version };
+    }
+  }
+  return null;
 }
 
 async function buildReleaseCandidate(root: string, packages: ReleasePackage[]): Promise<void> {
   await run('nx', ['run-many', '-t', 'build', `--projects=${releasePackageProjects(packages)}`], root);
 }
 
-function releaseNpmTagForRepair(options: ReleaseRepairPendingOptions, packages: ReleasePackage[]): string {
-  const derivedTags = new Set(packages.map((pkg) => (pkg.version.includes('-') ? 'next' : 'latest')));
-  if (derivedTags.size !== 1) {
-    throw new Error(`Pending release mixes stable and prerelease package versions: ${packageSummary(packages)}`);
-  }
-  const derivedTag = [...derivedTags][0];
-  if (!derivedTag) {
-    throw new Error('Unable to derive npm dist-tag for pending release.');
-  }
-  const explicitTag = options.tag ?? options.npmTag;
-  if (explicitTag && explicitTag !== derivedTag) {
-    throw new Error(`Pending release publishes with npm dist-tag ${derivedTag}, not ${explicitTag}.`);
-  }
-  return explicitTag ?? derivedTag;
-}
-
 async function publishReleasePackages(
   root: string,
   packages: ReleasePackage[],
-  tag: string,
   dryRun: boolean,
 ): Promise<PublishReleasePackagesResult> {
   const unpublishedPackages = await listUnpublishedPackages(root, packages);
   const alreadyPublished = packages.filter((pkg) => !unpublishedPackages.includes(pkg));
+  if (unpublishedPackages.length > 0) {
+    await buildReleaseCandidate(root, unpublishedPackages);
+  }
   for (const pkg of unpublishedPackages) {
     const packageExists = dryRun ? true : await npmPackageExists(root, pkg.name);
-    await publishPackedPackage(root, pkg, tag, dryRun, !dryRun && !packageExists);
+    await publishPackedPackage(root, pkg, npmDistTagForVersion(pkg.version), dryRun, !dryRun && !packageExists);
   }
   return { published: dryRun ? [] : unpublishedPackages, alreadyPublished };
 }
@@ -547,10 +661,20 @@ async function createGithubReleases(
   packages: ReleasePackage[],
   dryRun: boolean,
 ): Promise<ReleasePackage[]> {
+  const missing = dryRun
+    ? packages
+    : (
+        await Promise.all(
+          packages.map(async (pkg) => ((await githubReleaseExists(root, releaseTag(pkg))) ? null : pkg)),
+        )
+      ).filter((pkg): pkg is ReleasePackage => pkg !== null);
   for (const pkg of packages) {
+    if (!missing.includes(pkg)) {
+      continue;
+    }
     await createGithubRelease(root, pkg, dryRun);
   }
-  return dryRun ? [] : packages;
+  return dryRun ? [] : missing;
 }
 
 async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: boolean): Promise<void> {
@@ -650,17 +774,6 @@ async function fetchReleaseRefs(root: string, remote: string, branch: string): P
   await run('git', ['fetch', '--tags', remote, branch], root);
 }
 
-async function firstParentCommits(root: string, ref: string): Promise<string[]> {
-  const result = await $`git rev-list --first-parent --reverse ${ref}`.cwd(root).quiet().nothrow();
-  if (result.exitCode !== 0) {
-    throw new Error(`Unable to list first-parent release history for ${ref}.`);
-  }
-  return decode(result.stdout)
-    .split('\n')
-    .map((sha) => sha.trim())
-    .filter(Boolean);
-}
-
 async function gitRefExists(root: string, ref: string): Promise<boolean> {
   const result = await $`git rev-parse --verify ${ref}`.cwd(root).quiet().nothrow();
   return result.exitCode === 0;
@@ -680,8 +793,15 @@ async function gitSha(root: string, ref: string): Promise<string> {
 }
 
 async function gitTagPointsAt(root: string, tag: string, ref: string): Promise<boolean> {
+  return (await gitCommitForTag(root, tag)) === (await gitSha(root, ref));
+}
+
+async function gitCommitForTag(root: string, tag: string): Promise<string> {
   const result = await $`git rev-list -n 1 ${tag}`.cwd(root).quiet().nothrow();
-  return result.exitCode === 0 && decode(result.stdout).trim() === (await gitSha(root, ref));
+  if (result.exitCode !== 0) {
+    throw new Error(`Unable to resolve release tag ${tag}.`);
+  }
+  return decode(result.stdout).trim();
 }
 
 async function remoteReleaseTagExists(root: string, remote: string, tag: string): Promise<boolean> {
@@ -781,19 +901,6 @@ function releaseBumpArg(bump = 'auto'): string {
     throw new Error(`Invalid --bump "${bump}". Expected auto, patch, minor, major, or prerelease.`);
   }
   return bump;
-}
-
-function releaseNpmTagArg(options: ReleasePublishOptions): string {
-  const bump = releaseBumpArg(options.bump);
-  const derivedTag = bump === 'prerelease' ? 'next' : 'latest';
-  const explicitTag = options.tag ?? options.npmTag;
-  if (!explicitTag) {
-    return derivedTag;
-  }
-  if (explicitTag !== derivedTag) {
-    throw new Error(`--bump ${bump} publishes with npm dist-tag ${derivedTag}, not ${explicitTag}.`);
-  }
-  return explicitTag;
 }
 
 function githubRepositoryFromRootPackage(root: string): string {
