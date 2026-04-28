@@ -2,8 +2,9 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'n
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { listReleasePackages, readPackageJson } from '../lib/workspace.js';
+import { renderPublishWorkflowYaml } from './publish-workflow.js';
 
-type ManagedKind = 'raw' | 'template';
+type ManagedKind = 'raw' | 'template' | 'generated';
 
 interface ManagedFile {
   kind: ManagedKind;
@@ -54,8 +55,8 @@ const managedFiles: ManagedFile[] = [
     target: '.github/workflows/ci.yml',
   },
   {
-    kind: 'template',
-    source: 'github/workflows/publish.yml',
+    kind: 'generated',
+    source: 'publish-workflow',
     target: '.github/workflows/publish.yml',
     releasePackagesOnly: true,
   },
@@ -130,6 +131,12 @@ function applyManagedFile(
 }
 
 function getManagedContent(file: ManagedFile, context: ManagedFileContext): string {
+  if (file.kind === 'generated') {
+    if (file.source === 'publish-workflow') {
+      return renderPublishWorkflowYaml();
+    }
+    throw new Error(`Unknown generated managed file source ${file.source}`);
+  }
   const sourceRoot = file.kind === 'raw' ? 'managed/raw' : 'managed/templates';
   const sourcePath = join(packageRoot, sourceRoot, file.source);
   const content = readFileSync(sourcePath, 'utf8');
