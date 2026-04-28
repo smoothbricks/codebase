@@ -1,6 +1,6 @@
 {
   "name": "eslint-stdout",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "ESLint formatter that outputs fixed code to stdout and errors to stderr",
   "keywords": [
     "eslint",
