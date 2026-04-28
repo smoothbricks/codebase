@@ -105,11 +105,6 @@ jobs:
         run: smoo release version --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"
 
       # Step 13
-      - name: 🔖 Collect release tags
-        id: tags
-        run: echo "tags=$(git tag --points-at HEAD | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
-
-      # Step 14
       - name: 📦 Publish packages
         # smoo packs with Bun, then publishes tarballs with npm. npm uses OIDC
         # trusted publishing when configured; NODE_AUTH_TOKEN is only a temporary
@@ -118,16 +113,14 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: smoo release publish --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"
 
-      # Step 15
+      # Step 14
       - name: 🚀 Create or update GitHub Releases
         if: ${{ inputs.dry_run != true }}
-        run:
-          smoo release github-release --tags "${{ steps.tags.outputs.tags }}" --bump "${{ inputs.bump }}" --dry-run "${{
-          inputs.dry_run }}"
+        run: smoo release github-release --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"
 
       # --- Cleanup ------------------------------------------------------------
 
-      # Step 16
+      # Step 15
       - name: 🧹 Cleanup and cache Nix/devenv
         if: ${{ always() }}
         uses: ./.github/actions/save-nix-devenv

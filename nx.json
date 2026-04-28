@@ -132,6 +132,17 @@
       "fallbackCurrentVersionResolver": "disk",
       "versionActions": "@smoothbricks/cli/nx-version-actions",
       "preVersionCommand": "nx run-many -t build"
+    },
+    "changelog": {
+      "workspaceChangelog": false,
+      "projectChangelogs": {
+        "createRelease": "github",
+        "file": false,
+        "renderOptions": {
+          "authors": false,
+          "applyUsernameToAuthors": false
+        }
+      }
     }
   }
 }

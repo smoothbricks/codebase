@@ -89,6 +89,14 @@ export function applyNxReleaseDefaults(root: string): void {
   changed = setStringProperty(version, 'fallbackCurrentVersionResolver', 'disk') || changed;
   changed = setStringProperty(version, 'versionActions', SMOO_NX_VERSION_ACTIONS) || changed;
   changed = setMissingStringProperty(version, 'preVersionCommand', 'nx run-many -t build') || changed;
+  const changelog = getOrCreateRecord(release, 'changelog');
+  changed = setBooleanProperty(changelog, 'workspaceChangelog', false) || changed;
+  const projectChangelogs = getOrCreateRecord(changelog, 'projectChangelogs');
+  changed = setStringProperty(projectChangelogs, 'createRelease', 'github') || changed;
+  changed = setBooleanProperty(projectChangelogs, 'file', false) || changed;
+  const renderOptions = getOrCreateRecord(projectChangelogs, 'renderOptions');
+  changed = setBooleanProperty(renderOptions, 'authors', false) || changed;
+  changed = setBooleanProperty(renderOptions, 'applyUsernameToAuthors', false) || changed;
 
   if (changed) {
     writeJsonObject(nxJsonPath, nxJson);
@@ -144,6 +152,9 @@ export function validateNxReleaseConfig(root: string): number {
   }
   const release = recordProperty(nxJson, 'release');
   const version = release ? recordProperty(release, 'version') : null;
+  const changelog = release ? recordProperty(release, 'changelog') : null;
+  const projectChangelogs = changelog ? recordProperty(changelog, 'projectChangelogs') : null;
+  const renderOptions = projectChangelogs ? recordProperty(projectChangelogs, 'renderOptions') : null;
   let failures = 0;
   if (!release) {
     console.error('nx.json release config is missing');
@@ -177,6 +188,38 @@ export function validateNxReleaseConfig(root: string): number {
   }
   if (version && !stringProperty(version, 'preVersionCommand')) {
     console.error('nx.json release.version.preVersionCommand must be defined');
+    failures++;
+  }
+  if (!changelog) {
+    console.error('nx.json release.changelog config is missing');
+    failures++;
+  }
+  if (changelog && changelog.workspaceChangelog !== false) {
+    console.error('nx.json release.changelog.workspaceChangelog must be false');
+    failures++;
+  }
+  if (!projectChangelogs) {
+    console.error('nx.json release.changelog.projectChangelogs config is missing');
+    failures++;
+  }
+  if (projectChangelogs && stringProperty(projectChangelogs, 'createRelease') !== 'github') {
+    console.error('nx.json release.changelog.projectChangelogs.createRelease must be github');
+    failures++;
+  }
+  if (projectChangelogs && projectChangelogs.file !== false) {
+    console.error('nx.json release.changelog.projectChangelogs.file must be false');
+    failures++;
+  }
+  if (!renderOptions) {
+    console.error('nx.json release.changelog.projectChangelogs.renderOptions config is missing');
+    failures++;
+  }
+  if (renderOptions && renderOptions.authors !== false) {
+    console.error('nx.json release.changelog.projectChangelogs.renderOptions.authors must be false');
+    failures++;
+  }
+  if (renderOptions && renderOptions.applyUsernameToAuthors !== false) {
+    console.error('nx.json release.changelog.projectChangelogs.renderOptions.applyUsernameToAuthors must be false');
     failures++;
   }
   return failures;
@@ -296,6 +339,14 @@ function fixWorkspaceDependencyRanges(pkg: Record<string, unknown>, workspaceNam
     }
   }
   return changed;
+}
+
+function setBooleanProperty(record: Record<string, unknown>, key: string, value: boolean): boolean {
+  if (record[key] === value) {
+    return false;
+  }
+  record[key] = value;
+  return true;
 }
 
 function normalizeExportConditionOrder(value: unknown): boolean {

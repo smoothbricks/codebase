@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
 import { $ } from 'bun';
-import { decode, run, runStatus } from '../lib/run.js';
+import { decode, run } from '../lib/run.js';
 import { listReleasePackages, readPackageJson, repositoryInfo } from '../lib/workspace.js';
 import { readPackedPackageJson, validatePackedWorkspaceDependencies } from '../monorepo/packed-manifest.js';
 
@@ -20,9 +20,7 @@ export interface ReleasePublishOptions {
   dryRun?: boolean;
 }
 
-export interface ReleaseGithubOptions extends ReleasePublishOptions {
-  tags?: string;
-}
+export type ReleaseGithubOptions = ReleasePublishOptions;
 
 export interface ReleaseTrustPublisherOptions {
   dryRun?: boolean;
@@ -82,24 +80,21 @@ export async function releasePublish(root: string, options: ReleasePublishOption
 }
 
 export async function releaseGithubRelease(root: string, options: ReleaseGithubOptions): Promise<void> {
+  releaseNpmTagArg(options);
+  const packages = releasePackages(root);
+  const args = [
+    'release',
+    'changelog',
+    `--projects=${releasePackageProjects(packages)}`,
+    '--git-commit=false',
+    '--git-tag=false',
+    '--git-push=false',
+    '--stage-changes=false',
+  ];
   if (options.dryRun) {
-    console.log('Dry run; skipping GitHub Release creation.');
-    return;
+    args.push('--dry-run');
   }
-  const npmTag = releaseNpmTagArg(options);
-  const tags = options.tags ? options.tags.split(/\s+/).filter(Boolean) : await gitTagsAtHead(root);
-  if (tags.length === 0) {
-    throw new Error('No release tags found. Pass --tags or run from a tagged release commit.');
-  }
-  const latestFlag = npmTag === 'latest' ? 'true' : 'false';
-  for (const tag of tags) {
-    const exists = (await runStatus('gh', ['release', 'view', tag], root, true)) === 0;
-    if (exists) {
-      await run('gh', ['release', 'edit', tag, '--title', tag, `--latest=${latestFlag}`], root);
-    } else {
-      await run('gh', ['release', 'create', tag, '--title', tag, '--generate-notes', `--latest=${latestFlag}`], root);
-    }
-  }
+  await run('nx', args, root);
 }
 
 export async function releaseTrustPublisher(root: string, options: ReleaseTrustPublisherOptions): Promise<void> {
@@ -225,17 +220,6 @@ async function npmVersionExists(name: string, version: string): Promise<boolean>
 async function npmPackageExists(name: string): Promise<boolean> {
   const result = await $`bun pm view ${name} name`.cwd(process.cwd()).quiet().nothrow();
   return result.exitCode === 0;
-}
-
-async function gitTagsAtHead(root: string): Promise<string[]> {
-  const result = await $`git tag --points-at HEAD`.cwd(root).quiet().nothrow();
-  if (result.exitCode !== 0) {
-    return [];
-  }
-  return decode(result.stdout)
-    .split('\n')
-    .map((tag) => tag.trim())
-    .filter(Boolean);
 }
 
 async function assertCleanGitTree(root: string): Promise<void> {

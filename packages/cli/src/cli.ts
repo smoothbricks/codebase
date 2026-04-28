@@ -99,17 +99,14 @@ function buildProgram(): Command {
     });
   release
     .command('github-release')
-    .option('--tags <tags>', 'space-separated release tags')
     .option('--bump <bump>', 'auto, patch, minor, major, or prerelease', 'auto')
     .option('--tag <tag>', 'explicit npm dist-tag; must match bump-derived tag')
     .option('--npm-tag <npmTag>', 'explicit npm dist-tag; must match bump-derived tag')
     .option('--dry-run [dryRun]', 'skip GitHub Release writes')
-    .action(
-      async (options: { tags?: string; bump: string; tag?: string; npmTag?: string; dryRun?: string | boolean }) => {
-        const { releaseGithubRelease } = await import('./release/index.js');
-        await releaseGithubRelease(await findRepoRoot(), { ...options, dryRun: booleanOption(options.dryRun) });
-      },
-    );
+    .action(async (options: { bump: string; tag?: string; npmTag?: string; dryRun?: string | boolean }) => {
+      const { releaseGithubRelease } = await import('./release/index.js');
+      await releaseGithubRelease(await findRepoRoot(), { ...options, dryRun: booleanOption(options.dryRun) });
+    });
   release
     .command('trust-publisher')
     .description('Configure npm trusted publishing for owned release packages')

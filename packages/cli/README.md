@@ -40,7 +40,7 @@ smoo monorepo validate-public-tags
 smoo release npm-status
 smoo release version --bump <auto|patch|minor|major|prerelease> [--dry-run]
 smoo release publish --bump <auto|patch|minor|major|prerelease> [--tag <tag>] [--npm-tag <tag>] [--dry-run]
-smoo release github-release --tags <tags> --bump <auto|patch|minor|major|prerelease> [--tag <tag>] [--npm-tag <tag>] [--dry-run]
+smoo release github-release --bump <auto|patch|minor|major|prerelease> [--tag <tag>] [--npm-tag <tag>] [--dry-run]
 smoo release trust-publisher [--dry-run] [--otp <code>] [--skip-login]
 
 smoo github-ci cleanup-cache
@@ -87,7 +87,8 @@ It checks:
 - Managed file drift.
 - Root package policy.
 - Root Bun type version matches the Bun package manager version.
-- Nx release policy, including the temporary Bun lockfile versionActions hook.
+- Nx release policy, including project-level GitHub Release changelogs and the temporary Bun lockfile versionActions
+  hook.
 - `bun.lock` workspace versions match package manifests.
 - Public package tag policy.
 - Public package metadata.
@@ -292,8 +293,10 @@ Publishing:
 
 GitHub Releases:
 
-- `smoo release github-release` creates or updates releases for the selected tags.
-- `latest` status follows the derived npm dist-tag.
+- `smoo release github-release` delegates to `nx release changelog` for the owned release package projects.
+- Nx project changelogs are configured to create or update GitHub Releases, not local changelog files.
+- Generated release notes are package-scoped Conventional Commit changelogs. Author rendering and GitHub username lookup
+  are disabled so release generation does not depend on author account resolution.
 
 The release flow is designed to be rerun after partial failure. Nx owns local version/tag behavior, `smoo` owns the
 guarded atomic git push, and npm registry state makes publishing idempotent across retries.
