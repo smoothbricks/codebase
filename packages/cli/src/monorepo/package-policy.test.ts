@@ -1,14 +1,136 @@
-import { describe, expect, it } from 'bun:test';
+import { afterEach, describe, expect, it, spyOn } from 'bun:test';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
+  applyFixableMonorepoDefaults,
   applyNxProjectNameDefaults,
   applyWorkspaceDependencyDefaults,
   listValidCommitScopes,
   validateNxProjectNames,
+  validateNxReleaseConfig,
+  validateRootPackagePolicy,
   validateWorkspaceDependencies,
 } from './package-policy.js';
+
+describe('root smoo monorepo policy', () => {
+  afterEach(() => {
+    console.error = originalConsoleError;
+  });
+
+  it('fixes root scripts and Nx plugin defaults', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
+    try {
+      await writeJson(join(root, 'package.json'), validRootPackage({ scripts: { lint: 'nx affected -t lint' } }));
+      await writeJson(join(root, 'nx.json'), validNxJson());
+
+      expect(validateRootPackagePolicy(root)).toBe(4);
+      expect(validateNxReleaseConfig(root)).toBe(3);
+
+      applyFixableMonorepoDefaults(root);
+
+      const rootPackage = await readJson(join(root, 'package.json'));
+      const nxJson = await readJson(join(root, 'nx.json'));
+      expect(rootPackage.scripts).toEqual({
+        lint: 'nx run-many -t lint',
+        'lint:fix': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --unstaged',
+        'format:staged': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml',
+        'format:changed': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --also-unstaged',
+      });
+      expect(nxJson.targetDefaults).toEqual({});
+      expect(nxJson.plugins).toEqual([
+        {
+          plugin: '@nx/js/typescript',
+          options: {
+            typecheck: { targetName: 'typecheck' },
+            build: {
+              targetName: 'tsc-js',
+              configName: 'tsconfig.lib.json',
+              buildDepsName: 'build-deps',
+              watchDepsName: 'watch-deps',
+            },
+          },
+        },
+        '@smoothbricks/nx-plugin',
+      ]);
+      expect(validateRootPackagePolicy(root)).toBe(0);
+      expect(validateNxReleaseConfig(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects all colon-style Nx target defaults', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
+    try {
+      await writeJson(join(root, 'package.json'), validRootPackage());
+      await writeJson(join(root, 'nx.json'), {
+        ...validConfiguredNxJson(),
+        targetDefaults: {
+          'build:wasm': {},
+          'lint:fix': {},
+        },
+      });
+
+      expect(validateNxReleaseConfig(root)).toBe(2);
+
+      applyFixableMonorepoDefaults(root);
+
+      const nxJson = await readJson(join(root, 'nx.json'));
+      expect(nxJson.targetDefaults).toEqual({});
+      expect(validateNxReleaseConfig(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('explains Nx plugin conventions when nx.json is not configured', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
+    try {
+      await writeJson(join(root, 'package.json'), validRootPackage());
+      await writeJson(join(root, 'nx.json'), {
+        ...validConfiguredNxJson(),
+        plugins: [],
+      });
+      const errors = captureConsoleErrors();
+
+      expect(validateNxReleaseConfig(root)).toBe(2);
+
+      expect(errors.join('\n')).toContain('Official Nx owns TypeScript library inference');
+      expect(errors.join('\n')).toContain('tsconfig.lib.json produces tsc-js');
+      expect(errors.join('\n')).toContain('Smoo relies on this plugin to infer convention targets');
+      expect(errors.join('\n')).not.toContain('Fix:');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('explains why TypeScript build targetName is tsc-js', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
+    try {
+      await writeJson(join(root, 'package.json'), validRootPackage());
+      await writeJson(join(root, 'nx.json'), {
+        ...validConfiguredNxJson(),
+        plugins: [
+          {
+            plugin: '@nx/js/typescript',
+            options: { build: { targetName: 'build', configName: 'tsconfig.lib.json' } },
+          },
+          '@smoothbricks/nx-plugin',
+        ],
+      });
+      const errors = captureConsoleErrors();
+
+      expect(validateNxReleaseConfig(root)).toBe(1);
+
+      expect(errors.join('\n')).toContain('build.targetName must be tsc-js');
+      expect(errors.join('\n')).toContain('build is reserved for aggregate targets');
+      expect(errors.join('\n')).not.toContain('Fix:');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('Nx project name policy', () => {
   it('fixes same-scope packages without touching external or unscoped packages', async () => {
@@ -40,6 +162,162 @@ describe('Nx project name policy', () => {
 });
 
 describe('workspace package script policy', () => {
+  it('rejects all colon-style package Nx targets', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [
+        {
+          dir: 'native',
+          name: '@smoothbricks/native',
+          nx: { name: 'native', targets: { 'build:ts': {}, 'lint:fix': {} } },
+        },
+      ],
+    });
+    try {
+      expect(validateWorkspaceDependencies(root)).toBe(2);
+
+      applyWorkspaceDependencyDefaults(root);
+
+      const native = await readJson(join(root, 'packages/native/package.json'));
+      expect(native.nx).toEqual({ name: 'native', targets: {} });
+      expect(validateWorkspaceDependencies(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects old test tsconfig output and build.zig without steps', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [{ dir: 'native', name: '@smoothbricks/native', nx: { name: 'native' } }],
+    });
+    try {
+      await writeJson(join(root, 'packages/native/tsconfig.test.json'), {
+        compilerOptions: {
+          composite: true,
+          declaration: true,
+          declarationMap: true,
+          outDir: 'dist-test',
+          tsBuildInfoFile: 'dist-test/tsconfig.test.tsbuildinfo',
+        },
+      });
+      await writeFile(join(root, 'packages/native/build.zig'), 'pub fn build(b: *std.Build) void { _ = b; }\n');
+
+      expect(validateWorkspaceDependencies(root)).toBe(7);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('creates no-emit test typecheck config for packages that use bun test', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [{ dir: 'app', name: '@smoothbricks/app', scripts: { test: 'bun test --pass-with-no-tests' } }],
+    });
+    try {
+      await writeJson(join(root, 'packages/app/tsconfig.json'), {
+        files: [],
+        include: [],
+        references: [{ path: './tsconfig.lib.json' }, { path: './tsconfig.test.json' }],
+      });
+      await writeJson(join(root, 'packages/app/tsconfig.lib.json'), {
+        extends: '../../tsconfig.base.json',
+        compilerOptions: { baseUrl: '.', rootDir: 'src', types: ['node'], outDir: 'dist' },
+      });
+
+      expect(validateWorkspaceDependencies(root)).toBe(1);
+
+      applyWorkspaceDependencyDefaults(root);
+
+      const testTsconfig = await readJson(join(root, 'packages/app/tsconfig.test.json'));
+      expect(testTsconfig).toEqual({
+        extends: '../../tsconfig.base.json',
+        compilerOptions: {
+          baseUrl: '.',
+          rootDir: 'src',
+          composite: false,
+          declaration: false,
+          declarationMap: false,
+          emitDeclarationOnly: false,
+          noEmit: true,
+          types: ['bun'],
+        },
+        include: [
+          'src/**/*.test.ts',
+          'src/**/*.spec.ts',
+          'src/**/__tests__/**/*.ts',
+          'src/**/__tests__/**/*.tsx',
+          'src/test-suite-tracer.ts',
+        ],
+        references: [{ path: './tsconfig.lib.json' }],
+      });
+      const projectTsconfig = await readJson(join(root, 'packages/app/tsconfig.json'));
+      expect(projectTsconfig.references).toEqual([{ path: './tsconfig.lib.json' }]);
+      expect(validateWorkspaceDependencies(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not require tsconfig.test.json for non-Bun test runners', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [{ dir: 'app', name: '@smoothbricks/app', scripts: { test: 'vitest run' } }],
+    });
+    try {
+      expect(validateWorkspaceDependencies(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('detects bun test commands configured directly in Nx targets', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [
+        {
+          dir: 'app',
+          name: '@smoothbricks/app',
+          nx: {
+            name: 'app',
+            targets: {
+              test: { executor: 'nx:run-commands', options: { command: 'bun test', cwd: '{projectRoot}' } },
+            },
+          },
+        },
+      ],
+    });
+    try {
+      expect(validateWorkspaceDependencies(root)).toBe(1);
+
+      applyWorkspaceDependencyDefaults(root);
+
+      const testTsconfig = await readJson(join(root, 'packages/app/tsconfig.test.json'));
+      expect(testTsconfig.compilerOptions).toMatchObject({ noEmit: true, types: ['bun'] });
+      expect(validateWorkspaceDependencies(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts noEmit test tsconfig and build.zig with an explicit step', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [{ dir: 'native', name: '@smoothbricks/native', nx: { name: 'native', targets: { lint: {} } } }],
+    });
+    try {
+      await writeJson(join(root, 'packages/native/tsconfig.test.json'), { compilerOptions: { noEmit: true } });
+      await writeFile(
+        join(root, 'packages/native/build.zig'),
+        'pub fn build(b: *std.Build) void { _ = b.step("build", "Build native artifact"); }\n',
+      );
+
+      expect(validateWorkspaceDependencies(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('rewrites safe scripts that use workspace dependencies into Nx aliases', async () => {
     const root = await createWorkspace({
       rootName: '@smoothbricks/codebase',
@@ -62,7 +340,7 @@ describe('workspace package script policy', () => {
       ],
     });
     try {
-      expect(validateWorkspaceDependencies(root)).toBe(5);
+      expect(validateWorkspaceDependencies(root)).toBe(6);
 
       applyWorkspaceDependencyDefaults(root);
 
@@ -218,7 +496,7 @@ describe('workspace package script policy', () => {
       ],
     });
     try {
-      expect(validateWorkspaceDependencies(root)).toBe(1);
+      expect(validateWorkspaceDependencies(root)).toBe(2);
 
       applyWorkspaceDependencyDefaults(root);
 
@@ -272,6 +550,88 @@ async function createWorkspace(input: {
 
 async function readJson(path: string): Promise<Record<string, unknown>> {
   return JSON.parse(await readFile(path, 'utf8'));
+}
+
+const originalConsoleError = console.error;
+
+function captureConsoleErrors(): string[] {
+  const errors: string[] = [];
+  spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+    errors.push(args.join(' '));
+  });
+  return errors;
+}
+
+function validRootPackage(extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    name: '@smoothbricks/codebase',
+    version: '0.0.0',
+    private: true,
+    license: 'MIT',
+    repository: { type: 'git', url: 'git+https://github.com/smoothbricks/codebase.git' },
+    packageManager: 'bun@1.3.13',
+    engines: { node: '>=24.0.0' },
+    devDependencies: { '@types/bun': '1.3.13' },
+    workspaces: ['packages/*'],
+    ...extra,
+  };
+}
+
+function validNxJson(): Record<string, unknown> {
+  return {
+    targetDefaults: {
+      'lint:fix': { executor: 'nx:run-commands' },
+    },
+    plugins: [
+      {
+        plugin: '@nx/js/typescript',
+        options: {
+          typecheck: { targetName: 'typecheck' },
+          build: { targetName: 'build', configName: 'tsconfig.lib.json' },
+        },
+      },
+    ],
+    release: {
+      projectsRelationship: 'independent',
+      version: {
+        specifierSource: 'conventional-commits',
+        currentVersionResolver: 'git-tag',
+        fallbackCurrentVersionResolver: 'disk',
+        versionActions: '@smoothbricks/cli/nx-version-actions',
+      },
+      releaseTag: { pattern: '{projectName}@{version}' },
+      changelog: {
+        workspaceChangelog: false,
+        projectChangelogs: {
+          createRelease: false,
+          file: false,
+          renderOptions: { authors: true, applyUsernameToAuthors: true },
+        },
+      },
+    },
+  };
+}
+
+function validConfiguredNxJson(): Record<string, unknown> {
+  return {
+    ...validNxJson(),
+    targetDefaults: {},
+    plugins: [
+      {
+        plugin: '@nx/js/typescript',
+        options: {
+          typecheck: { targetName: 'typecheck' },
+          build: {
+            targetName: 'tsc-js',
+            configName: 'tsconfig.lib.json',
+            buildDepsName: 'build-deps',
+            watchDepsName: 'watch-deps',
+          },
+        },
+      },
+      '@smoothbricks/nx-plugin',
+    ],
+  };
 }
 
 async function writeJson(path: string, value: Record<string, unknown>): Promise<void> {

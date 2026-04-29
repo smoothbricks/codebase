@@ -4,11 +4,11 @@
     "baseUrl": ".",
     "rootDir": "src",
     "types": ["bun", "node"],
-    "composite": true,
-    "declaration": true,
-    "declarationMap": true,
-    "outDir": "dist-test",
-    "tsBuildInfoFile": "dist-test/tsconfig.test.tsbuildinfo"
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "emitDeclarationOnly": false,
+    "noEmit": true
   },
   "include": ["src/**/*.test.ts", "src/**/__tests__/**/*.ts"],
   "references": [

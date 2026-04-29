@@ -44,6 +44,7 @@ describe('tool configuration validation', () => {
       const toolingPackage = JSON.parse(await readFile(join(root, 'tooling/package.json'), 'utf8'));
       const devenv = await readFile(join(root, 'tooling/direnv/devenv.nix'), 'utf8');
       expect(rootPackage.devDependencies['@smoothbricks/cli']).toBeUndefined();
+      expect(rootPackage.devDependencies['@smoothbricks/nx-plugin']).toBe('workspace:*');
       expect(rootPackage.devDependencies['eslint-stdout']).toBe('workspace:*');
       expect(rootPackage.devDependencies.nx).toBe('22.5.4');
       expect(rootPackage.workspaces).toContain('tooling');
@@ -68,6 +69,7 @@ describe('tool configuration validation', () => {
         devDependencies: {
           '@biomejs/biome': '^3.0.0',
           '@nx/js': '22.6.0',
+          '@smoothbricks/nx-plugin': '^0.1.0',
           '@types/bun': '1.3.99',
           eslint: '^10.0.0',
           'eslint-stdout': await currentEslintStdoutRange(),
@@ -153,6 +155,7 @@ describe('tool configuration validation', () => {
       const rootPackage = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
       const toolingPackage = JSON.parse(await readFile(join(root, 'tooling/package.json'), 'utf8'));
       expect(rootPackage.devDependencies['eslint-stdout']).toBe(await currentEslintStdoutRange());
+      expect(rootPackage.devDependencies['@smoothbricks/nx-plugin']).toBe(await currentNxPluginRange());
       expect(toolingPackage.name).toBe('@fixture/tooling');
       expect(toolingPackage.dependencies['@smoothbricks/cli']).toBe(await currentCliRange());
     } finally {
@@ -168,6 +171,11 @@ async function currentCliRange(): Promise<string> {
 
 async function currentEslintStdoutRange(): Promise<string> {
   const pkg = JSON.parse(await readFile(new URL('../../../eslint-stdout/package.json', import.meta.url), 'utf8'));
+  return `^${pkg.version}`;
+}
+
+async function currentNxPluginRange(): Promise<string> {
+  const pkg = JSON.parse(await readFile(new URL('../../../nx-plugin/package.json', import.meta.url), 'utf8'));
   return `^${pkg.version}`;
 }
 

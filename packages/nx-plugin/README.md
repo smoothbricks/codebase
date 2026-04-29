@@ -1,25 +1,67 @@
 # Nx Plugin
 
-Local Nx generators for workspace-standard package setup.
+Local Nx plugin for workspace-standard package setup and missing inferred targets.
+
+## Target Ownership
+
+Official `@nx/js/typescript` owns TypeScript library inference. A package `tsconfig.lib.json` becomes the tool-output
+target `tsc-js`; this plugin must not duplicate or rename that target.
+
+`@smoothbricks/nx-plugin` owns only inferred targets Nx does not provide here:
+
+- `typecheck-tests` from `tsconfig.test.json` for packages that use Bun test
+- `zig-*` targets from `build.zig` steps such as `zig-wasm`
+- aggregate `build` and `lint` targets
+
+## Nx Target Naming
+
+Target names are tool-output names. Use names like `tsc-js` and `zig-wasm`; `build` and `lint` are aggregates.
+
+Concrete targets come from concrete files:
+
+- `typecheck-tests` is inferred from `tsconfig.test.json`. Smoo requires that config for packages that use `bun test`
+  because Bun executes tests without typechecking.
+- `zig-*` is inferred from `build.zig`; each explicit `b.step("name", ...)` becomes `zig-name`.
+- `build` is inferred only when the project has at least one concrete build target to run, such as `tsc-js` from the
+  official TypeScript plugin or a `zig-*` target from this plugin.
+
+This is why Zig appears in the convention: the plugin is not guessing from arbitrary Zig source. SmoothBricks requires
+`build.zig` to expose named build steps so Nx can create cacheable, addressable targets from those steps.
+
+Do not use colon-style Nx target names such as `build:wasm` or `lint:fix`. Nx CLI syntax already uses colons for
+`project:target:configuration`, so colon target names are hard to read, easy to confuse with configurations, and awkward
+to expose through package scripts. Package scripts may still use names like `build:wasm`; they should delegate to a real
+target such as `nx run pkg:zig-wasm`.
+
+There is no Nx `lint:fix` target; repository formatting is handled by the root `lint:fix` script.
+
+`typecheck-tests` is inferred only when `tsconfig.test.json` exists. It runs TypeScript with `noEmit`; test typechecking
+must not emit `dist-test`. Smoo validation creates/requires this config for Bun test packages because `bun test` is not
+a typecheck command. Other test runners can satisfy test typechecking through their own toolchain.
+
+`tsconfig.test.json` is not a TypeScript build-mode project. It should reference library tsconfigs it needs to typecheck
+against, but the package root `tsconfig.json` should not reference `./tsconfig.test.json`. Nx runs test typechecking
+through the inferred `typecheck-tests` target, not through `tsc --build`.
+
+Zig targets are inferred only when `build.zig` declares at least one `b.step(...)`. Each step becomes a `zig-*` target,
+so a package `build.zig` must have at least one step.
 
 ## Bun Test Tracing Generator
 
-Configure a package for the Bun test tracing + `dist-test` TypeScript pattern used in this repo.
+Configure a package for the Bun test tracing + no-emit test typechecking pattern used in this repo.
 
 ```bash
 nx generate ./packages/nx-plugin:bun-test-tracing \
   --project @smoothbricks/my-package \
   --opContextModule @smoothbricks/lmao \
   --opContextExport lmaoOpContext \
-  --spanContextModule @smoothbricks/lmao \
-  --spanContextExport LmaoSpanContext
+  --tracerModule @smoothbricks/lmao/testing/bun
 ```
 
 What it wires:
 
-- `bunfig.toml` preload for `test-trace-setup.ts`
-- `test-trace-setup.ts`
+- `bunfig.toml` preloads for the LMAO Bun test tracing setup
 - `src/test-suite-tracer.ts`
-- `tsconfig.test.json` with `dist-test` output
-- package `tsconfig.json` reference to `./tsconfig.test.json`
+- `tsconfig.test.json` with `noEmit` for inferred `typecheck-tests`
+- direct test config references to library tsconfigs; package root `tsconfig.json` is left out of the test config graph
 - package `package.json` test/lint/devDependency wiring needed for the standard pattern

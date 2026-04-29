@@ -41,6 +41,8 @@ formatters:
       - '!*.graphql'
       # Exclude files handled by Alejandra
       - '!*.nix'
+      # Bun lockfiles are generated and should not be rewritten by Prettier
+      - '!bun.lock'
 
   # Alejandra for Nix files
   alejandra:

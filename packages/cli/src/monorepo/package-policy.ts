@@ -1,6 +1,8 @@
-import { join } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { join, relative } from 'node:path';
 import {
   getOrCreateRecord,
+  hasOwn,
   hasOwnString,
   isRecord,
   readJsonObject,
@@ -24,9 +26,62 @@ import {
 export const SMOO_NX_VERSION_ACTIONS = '@smoothbricks/cli/nx-version-actions';
 export const SMOO_NX_RELEASE_TAG_PATTERN = '{projectName}@{version}';
 const extraCommitScopes = ['release'];
+const rootScriptPolicy: Record<string, string> = {
+  lint: 'nx run-many -t lint',
+  'lint:fix': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --unstaged',
+  'format:staged': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml',
+  'format:changed': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --also-unstaged',
+};
+const nxJsTypescriptPlugin = '@nx/js/typescript';
+const smoothBricksNxPlugin = '@smoothbricks/nx-plugin';
 
 export function applyFixableMonorepoDefaults(root: string): void {
+  applyRootScriptDefaults(root);
+  applyNxPluginDefaults(root);
   applyNxProjectNameDefaults(root);
+}
+
+export function applyRootScriptDefaults(root: string): void {
+  const rootPackagePath = join(root, 'package.json');
+  const rootPackage = readJsonObject(rootPackagePath);
+  if (!rootPackage) {
+    return;
+  }
+  const scripts = getOrCreateRecord(rootPackage, 'scripts');
+  let changed = false;
+  for (const [name, command] of Object.entries(rootScriptPolicy)) {
+    changed = setStringProperty(scripts, name, command) || changed;
+  }
+  if (changed) {
+    writeJsonObject(rootPackagePath, rootPackage);
+    console.log('updated        package.json root smoo scripts');
+  } else {
+    console.log('unchanged      package.json root smoo scripts');
+  }
+}
+
+export function applyNxPluginDefaults(root: string): void {
+  const nxJsonPath = join(root, 'nx.json');
+  const nxJson = readJsonObject(nxJsonPath);
+  if (!nxJson) {
+    return;
+  }
+  let changed = removeNxLintFixTargetDefault(nxJson);
+  const currentPlugins = Array.isArray(nxJson.plugins) ? nxJson.plugins : [];
+  const nextPlugins = upsertNxPlugin(
+    upsertNxPlugin(currentPlugins, expectedNxJsTypescriptPlugin()),
+    smoothBricksNxPlugin,
+  );
+  if (JSON.stringify(currentPlugins) !== JSON.stringify(nextPlugins)) {
+    nxJson.plugins = nextPlugins;
+    changed = true;
+  }
+  if (changed) {
+    writeJsonObject(nxJsonPath, nxJson);
+    console.log('updated        nx.json smoo plugin config');
+  } else {
+    console.log('unchanged      nx.json smoo plugin config');
+  }
 }
 
 export function applyPublicPackageDefaults(root: string): void {
@@ -74,6 +129,7 @@ export function applyWorkspaceDependencyDefaults(root: string): void {
   const workspaceNames = new Set(getWorkspacePackages(root).map((pkg) => pkg.name));
   for (const pkg of listPackageJsonRecords(root)) {
     let changed = fixWorkspaceDependencyRanges(pkg.json, workspaceNames);
+    changed = removePackageColonTargets(pkg.json) || changed;
     changed = applyPackageScriptPolicy(pkg.json, pkg.path, workspaceNames) || changed;
     if (changed) {
       writeJsonObject(pkg.packageJsonPath, pkg.json);
@@ -81,6 +137,8 @@ export function applyWorkspaceDependencyDefaults(root: string): void {
     } else {
       console.log(`unchanged      ${pkg.path}/package.json workspace dependency policy`);
     }
+    applyBunTestTsconfigDefaults(root, pkg.path, pkg.json, workspaceNames);
+    applyTsconfigTestReferenceDefaults(root, pkg.path);
   }
 }
 
@@ -184,6 +242,7 @@ export function validateRootPackagePolicy(root: string): number {
     console.error('package.json must define repository.url');
     failures++;
   }
+  failures += validateRootScripts(rootPackage);
   const packageManager = stringProperty(rootPackage, 'packageManager');
   if (!packageManager?.startsWith('bun@')) {
     console.error('package.json packageManager must use bun@<version>');
@@ -220,6 +279,7 @@ export function validateNxReleaseConfig(root: string): number {
     console.error('nx.json release config is missing');
     failures++;
   }
+  failures += validateNxPluginConfig(nxJson);
   if (release && stringProperty(release, 'projectsRelationship') !== 'independent') {
     console.error('nx.json release.projectsRelationship must be independent');
     failures++;
@@ -394,6 +454,11 @@ export function validateWorkspaceDependencies(root: string): number {
   const workspaceNames = new Set(getWorkspacePackages(root).map((pkg) => pkg.name));
   let failures = 0;
   for (const pkg of listPackageJsonRecords(root)) {
+    failures += validateExplicitNxTargets(pkg.json, pkg.path);
+    failures += validateBunTestTsconfigPresence(root, pkg.path, pkg.json);
+    failures += validateTsconfigTestPolicy(root, pkg.path);
+    failures += validateTsconfigTestReferencePolicy(root, pkg.path);
+    failures += validateBuildZigPolicy(root, pkg.path);
     for (const field of workspaceDependencyFields) {
       const dependencies = recordProperty(pkg.json, field);
       if (!dependencies) {
@@ -566,6 +631,425 @@ function fixWorkspaceDependencyRanges(pkg: Record<string, unknown>, workspaceNam
     }
   }
   return changed;
+}
+
+function validateRootScripts(rootPackage: Record<string, unknown>): number {
+  const scripts = recordProperty(rootPackage, 'scripts');
+  let failures = 0;
+  for (const [name, command] of Object.entries(rootScriptPolicy)) {
+    if (scripts?.[name] !== command) {
+      console.error(`package.json scripts.${name} must be ${command}`);
+      failures++;
+    }
+  }
+  return failures;
+}
+
+function validateNxPluginConfig(nxJson: Record<string, unknown>): number {
+  let failures = 0;
+  const targetDefaults = recordProperty(nxJson, 'targetDefaults');
+  if (targetDefaults) {
+    for (const targetName of Object.keys(targetDefaults)) {
+      if (targetName.includes(':')) {
+        console.error(
+          `nx.json targetDefaults.${targetName} must not use colon target names. ` +
+            'Nx CLI syntax already uses project:target:configuration, so smoo Nx target names must be unambiguous tool-output names.',
+        );
+        failures++;
+      }
+    }
+  }
+  const plugins = Array.isArray(nxJson.plugins) ? nxJson.plugins : [];
+  const nxJsPlugin = plugins.find(isNxJsTypescriptPlugin);
+  if (!nxJsPlugin) {
+    console.error(
+      `nx.json plugins must configure ${nxJsTypescriptPlugin}. ` +
+        'Official Nx owns TypeScript library inference; smoo configures it so tsconfig.lib.json produces tsc-js and leaves build available as an aggregate target.',
+    );
+    failures++;
+  } else if (nxJsBuildTargetName(nxJsPlugin) !== 'tsc-js') {
+    console.error(
+      `nx.json ${nxJsTypescriptPlugin} build.targetName must be tsc-js. ` +
+        'TypeScript library output is a concrete tool-output target; build is reserved for aggregate targets that depend on concrete build work.',
+    );
+    failures++;
+  }
+  if (!plugins.includes(smoothBricksNxPlugin) && !plugins.some(isSmoothBricksNxPluginRecord)) {
+    console.error(
+      `nx.json plugins must include ${smoothBricksNxPlugin}. ` +
+        'Smoo relies on this plugin to infer convention targets that official Nx does not provide, including typecheck-tests, non-TypeScript build-tool targets, and aggregate build/lint targets.',
+    );
+    failures++;
+  }
+  return failures;
+}
+
+function validateExplicitNxTargets(pkg: Record<string, unknown>, packagePath: string): number {
+  const nx = recordProperty(pkg, 'nx');
+  const targets = nx ? recordProperty(nx, 'targets') : null;
+  if (!targets) {
+    return 0;
+  }
+  let failures = 0;
+  for (const targetName of Object.keys(targets)) {
+    if (targetName.includes(':')) {
+      console.error(
+        `${packagePath}: package.json nx.targets.${targetName} must not use colon target names. ` +
+          'Nx CLI syntax already uses project:target:configuration; use a concrete tool-output target name and keep colon names only as package-script aliases.',
+      );
+      failures++;
+    }
+  }
+  return failures;
+}
+
+function validateTsconfigTestPolicy(root: string, packagePath: string): number {
+  const path = join(root, packagePath, 'tsconfig.test.json');
+  const tsconfig = readJsonObject(path);
+  if (!tsconfig) {
+    return 0;
+  }
+  const compilerOptions = recordProperty(tsconfig, 'compilerOptions');
+  let failures = 0;
+  if (!compilerOptions || compilerOptions.noEmit !== true) {
+    console.error(`${packagePath}/tsconfig.test.json compilerOptions.noEmit must be true`);
+    failures++;
+  }
+  if (compilerOptions?.composite === true) {
+    console.error(
+      `${packagePath}/tsconfig.test.json must not set compilerOptions.composite = true. ` +
+        'Bun test typechecking is a no-emit validation pass, not a TypeScript build-mode project.',
+    );
+    failures++;
+  }
+  if (compilerOptions?.declaration === true) {
+    console.error(`${packagePath}/tsconfig.test.json must not set compilerOptions.declaration = true`);
+    failures++;
+  }
+  if (compilerOptions?.declarationMap === true) {
+    console.error(`${packagePath}/tsconfig.test.json must not set compilerOptions.declarationMap = true`);
+    failures++;
+  }
+  if (compilerOptions?.outDir === 'dist-test') {
+    console.error(`${packagePath}/tsconfig.test.json must not emit to dist-test`);
+    failures++;
+  }
+  if (typeof compilerOptions?.tsBuildInfoFile === 'string' && compilerOptions.tsBuildInfoFile.includes('dist-test')) {
+    console.error(`${packagePath}/tsconfig.test.json must not write tsbuildinfo under dist-test`);
+    failures++;
+  }
+  return failures;
+}
+
+function validateTsconfigTestReferencePolicy(root: string, packagePath: string): number {
+  const testTsconfigPath = join(root, packagePath, 'tsconfig.test.json');
+  if (!existsSync(testTsconfigPath)) {
+    return 0;
+  }
+  const projectTsconfig = readJsonObject(join(root, packagePath, 'tsconfig.json'));
+  if (!projectTsconfigHasTestReference(projectTsconfig)) {
+    return 0;
+  }
+  console.error(
+    `${packagePath}/tsconfig.json must not reference ./tsconfig.test.json. ` +
+      'Test typechecking is run by the inferred typecheck-tests target with tsc --noEmit, not TypeScript build mode.',
+  );
+  return 1;
+}
+
+function validateBunTestTsconfigPresence(root: string, packagePath: string, pkg: Record<string, unknown>): number {
+  if (!usesBunTest(pkg)) {
+    return 0;
+  }
+  const path = join(root, packagePath, 'tsconfig.test.json');
+  if (existsSync(path)) {
+    return 0;
+  }
+  console.error(
+    `${packagePath}: bun test requires tsconfig.test.json because Bun executes tests without typechecking. ` +
+      'Run smoo monorepo validate --fix to create the no-emit test typecheck config.',
+  );
+  return 1;
+}
+
+function applyBunTestTsconfigDefaults(
+  root: string,
+  packagePath: string,
+  pkg: Record<string, unknown>,
+  workspaceNames: ReadonlySet<string>,
+): void {
+  if (!usesBunTest(pkg)) {
+    return;
+  }
+  const tsconfigTestPath = join(root, packagePath, 'tsconfig.test.json');
+  const existing = readJsonObject(tsconfigTestPath);
+  const tsconfigTest = existing ?? {};
+  let changed = existing === null;
+
+  changed = applyTsconfigTestDefaults(root, packagePath, pkg, tsconfigTest, workspaceNames) || changed;
+  if (changed) {
+    writeJsonObject(tsconfigTestPath, tsconfigTest);
+    console.log(`updated        ${packagePath}/tsconfig.test.json bun test typecheck config`);
+  } else {
+    console.log(`unchanged      ${packagePath}/tsconfig.test.json bun test typecheck config`);
+  }
+}
+
+function applyTsconfigTestReferenceDefaults(root: string, packagePath: string): void {
+  const projectTsconfigPath = join(root, packagePath, 'tsconfig.json');
+  const projectTsconfig = readJsonObject(projectTsconfigPath);
+  if (!projectTsconfig || !projectTsconfigHasTestReference(projectTsconfig)) {
+    return;
+  }
+  const references = Array.isArray(projectTsconfig.references) ? projectTsconfig.references : [];
+  projectTsconfig.references = references.filter((entry) => !isRecord(entry) || entry.path !== './tsconfig.test.json');
+  writeJsonObject(projectTsconfigPath, projectTsconfig);
+  console.log(`updated        ${packagePath}/tsconfig.json removed test project reference`);
+}
+
+function applyTsconfigTestDefaults(
+  root: string,
+  packagePath: string,
+  pkg: Record<string, unknown>,
+  tsconfigTest: Record<string, unknown>,
+  workspaceNames: ReadonlySet<string>,
+): boolean {
+  let changed = setMissingStringProperty(tsconfigTest, 'extends', defaultTsconfigTestExtends(root, packagePath));
+  const compilerOptions = getOrCreateRecord(tsconfigTest, 'compilerOptions');
+  changed = copyLibCompilerOptions(root, packagePath, compilerOptions) || changed;
+  changed = setBooleanProperty(compilerOptions, 'composite', false) || changed;
+  changed = setBooleanProperty(compilerOptions, 'declaration', false) || changed;
+  changed = setBooleanProperty(compilerOptions, 'declarationMap', false) || changed;
+  changed = setBooleanProperty(compilerOptions, 'emitDeclarationOnly', false) || changed;
+  changed = setBooleanProperty(compilerOptions, 'noEmit', true) || changed;
+  changed = mergeStringListProperty(compilerOptions, 'types', ['bun']) || changed;
+  if (delete compilerOptions.outDir) {
+    changed = true;
+  }
+  if (delete compilerOptions.tsBuildInfoFile) {
+    changed = true;
+  }
+  changed =
+    mergeStringListProperty(tsconfigTest, 'include', [
+      'src/**/*.test.ts',
+      'src/**/*.spec.ts',
+      'src/**/__tests__/**/*.ts',
+      'src/**/__tests__/**/*.tsx',
+      'src/test-suite-tracer.ts',
+    ]) || changed;
+  for (const referencePath of collectTsconfigTestReferencePaths(root, packagePath, pkg, workspaceNames)) {
+    changed = addTsconfigReference(tsconfigTest, referencePath) || changed;
+  }
+  return changed;
+}
+
+function defaultTsconfigTestExtends(root: string, packagePath: string): string {
+  const libTsconfig = readJsonObject(join(root, packagePath, 'tsconfig.lib.json'));
+  return stringProperty(libTsconfig ?? {}, 'extends') ?? '../../tsconfig.base.json';
+}
+
+function copyLibCompilerOptions(root: string, packagePath: string, target: Record<string, unknown>): boolean {
+  const libTsconfig = readJsonObject(join(root, packagePath, 'tsconfig.lib.json'));
+  const libCompilerOptions = libTsconfig ? recordProperty(libTsconfig, 'compilerOptions') : null;
+  if (!libCompilerOptions) {
+    return false;
+  }
+  let changed = false;
+  for (const key of ['baseUrl', 'rootDir', 'module', 'moduleResolution', 'jsx', 'lib']) {
+    if (hasOwn(libCompilerOptions, key) && target[key] !== libCompilerOptions[key]) {
+      target[key] = libCompilerOptions[key];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function collectTsconfigTestReferencePaths(
+  root: string,
+  packagePath: string,
+  pkg: Record<string, unknown>,
+  workspaceNames: ReadonlySet<string>,
+): string[] {
+  const paths = existsSync(join(root, packagePath, 'tsconfig.lib.json')) ? ['./tsconfig.lib.json'] : [];
+  const packagesByName = new Map(getWorkspacePackages(root).map((workspacePkg) => [workspacePkg.name, workspacePkg]));
+  for (const field of workspaceDependencyFields) {
+    const dependencies = recordProperty(pkg, field);
+    if (!dependencies) {
+      continue;
+    }
+    for (const dependencyName of Object.keys(dependencies)) {
+      if (!workspaceNames.has(dependencyName)) {
+        continue;
+      }
+      const dependencyPackage = packagesByName.get(dependencyName);
+      if (!dependencyPackage) {
+        continue;
+      }
+      const dependencyTsconfig = join(root, dependencyPackage.path, 'tsconfig.lib.json');
+      if (!existsSync(dependencyTsconfig)) {
+        continue;
+      }
+      const refPath = relative(join(root, packagePath), dependencyTsconfig).replaceAll('\\', '/');
+      if (!paths.includes(refPath)) {
+        paths.push(refPath);
+      }
+    }
+  }
+  return paths;
+}
+
+function usesBunTest(pkg: Record<string, unknown>): boolean {
+  const scripts = recordProperty(pkg, 'scripts');
+  if (scripts && Object.values(scripts).some((command) => typeof command === 'string' && isBunTestCommand(command))) {
+    return true;
+  }
+  const nx = recordProperty(pkg, 'nx');
+  const targets = nx ? recordProperty(nx, 'targets') : null;
+  if (!targets) {
+    return false;
+  }
+  for (const target of Object.values(targets)) {
+    if (!isRecord(target)) {
+      continue;
+    }
+    const options = recordProperty(target, 'options');
+    const command = options ? stringProperty(options, 'command') : null;
+    if (command && isBunTestCommand(command)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isBunTestCommand(command: string): boolean {
+  return /^bun\s+test(?:\s|$)/.test(parseEnvPrefixedCommand(command).command.trim());
+}
+
+function mergeStringListProperty(record: Record<string, unknown>, key: string, values: string[]): boolean {
+  const rawCurrent = record[key];
+  const current = Array.isArray(rawCurrent)
+    ? rawCurrent.filter((entry): entry is string => typeof entry === 'string')
+    : [];
+  const next = [...current];
+  for (const value of values) {
+    if (!next.includes(value)) {
+      next.push(value);
+    }
+  }
+  if (
+    Array.isArray(rawCurrent) &&
+    next.length === rawCurrent.length &&
+    next.every((entry, index) => entry === rawCurrent[index])
+  ) {
+    return false;
+  }
+  record[key] = next;
+  return true;
+}
+
+function addTsconfigReference(tsconfig: Record<string, unknown>, path: string): boolean {
+  const current = Array.isArray(tsconfig.references)
+    ? tsconfig.references.filter((entry): entry is Record<string, unknown> => isRecord(entry))
+    : [];
+  if (current.some((entry) => entry.path === path)) {
+    return false;
+  }
+  tsconfig.references = [...current, { path }];
+  return true;
+}
+
+function projectTsconfigHasTestReference(projectTsconfig: Record<string, unknown> | null): boolean {
+  return Boolean(
+    projectTsconfig &&
+      Array.isArray(projectTsconfig.references) &&
+      projectTsconfig.references.some((entry) => isRecord(entry) && entry.path === './tsconfig.test.json'),
+  );
+}
+
+function validateBuildZigPolicy(root: string, packagePath: string): number {
+  const path = join(root, packagePath, 'build.zig');
+  if (!existsSync(path)) {
+    return 0;
+  }
+  if (/\bb\.step\s*\(/.test(readFileSync(path, 'utf8'))) {
+    return 0;
+  }
+  console.error(`${packagePath}/build.zig must define at least one b.step(...) target`);
+  return 1;
+}
+
+function removeNxLintFixTargetDefault(nxJson: Record<string, unknown>): boolean {
+  const targetDefaults = recordProperty(nxJson, 'targetDefaults');
+  if (!targetDefaults) {
+    return false;
+  }
+  let changed = false;
+  for (const targetName of Object.keys(targetDefaults)) {
+    if (targetName.includes(':')) {
+      delete targetDefaults[targetName];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function removePackageColonTargets(pkg: Record<string, unknown>): boolean {
+  const nx = recordProperty(pkg, 'nx');
+  const targets = nx ? recordProperty(nx, 'targets') : null;
+  if (!targets) {
+    return false;
+  }
+  let changed = false;
+  for (const targetName of Object.keys(targets)) {
+    if (targetName.includes(':')) {
+      delete targets[targetName];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function expectedNxJsTypescriptPlugin(): Record<string, unknown> {
+  return {
+    plugin: nxJsTypescriptPlugin,
+    options: {
+      typecheck: { targetName: 'typecheck' },
+      build: {
+        targetName: 'tsc-js',
+        configName: 'tsconfig.lib.json',
+        buildDepsName: 'build-deps',
+        watchDepsName: 'watch-deps',
+      },
+    },
+  };
+}
+
+function upsertNxPlugin(plugins: readonly unknown[], plugin: string | Record<string, unknown>): unknown[] {
+  const pluginName = typeof plugin === 'string' ? plugin : stringProperty(plugin, 'plugin');
+  const next = plugins.filter((entry) => nxPluginName(entry) !== pluginName);
+  next.push(plugin);
+  return next;
+}
+
+function nxPluginName(value: unknown): string | null {
+  if (typeof value === 'string') {
+    return value;
+  }
+  return isRecord(value) ? stringProperty(value, 'plugin') : null;
+}
+
+function isNxJsTypescriptPlugin(value: unknown): value is Record<string, unknown> {
+  return isRecord(value) && stringProperty(value, 'plugin') === nxJsTypescriptPlugin;
+}
+
+function isSmoothBricksNxPluginRecord(value: unknown): boolean {
+  return isRecord(value) && stringProperty(value, 'plugin') === smoothBricksNxPlugin;
+}
+
+function nxJsBuildTargetName(plugin: Record<string, unknown>): string | null {
+  const options = recordProperty(plugin, 'options');
+  const build = options ? recordProperty(options, 'build') : null;
+  return build ? stringProperty(build, 'targetName') : null;
 }
 
 interface PackageNxConfig {

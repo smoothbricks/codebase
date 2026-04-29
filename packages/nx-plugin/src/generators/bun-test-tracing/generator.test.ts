@@ -72,16 +72,35 @@ describe('bun-test-tracing generator', () => {
 
     const tsconfigTest = readJson(tree, 'packages/example/tsconfig.test.json') as {
       extends?: string;
-      compilerOptions?: { types?: string[]; outDir?: string; tsBuildInfoFile?: string };
+      compilerOptions?: {
+        types?: string[];
+        composite?: boolean;
+        declaration?: boolean;
+        declarationMap?: boolean;
+        emitDeclarationOnly?: boolean;
+        noEmit?: boolean;
+        outDir?: string;
+        tsBuildInfoFile?: string;
+      };
       include?: string[];
       references?: Array<{ path: string }>;
     };
     expect(tsconfigTest.extends).toBe('../../tsconfig.base.json');
     expect(tsconfigTest.compilerOptions?.types).toEqual(['bun']);
-    expect(tsconfigTest.compilerOptions?.outDir).toBe('dist-test');
-    expect(tsconfigTest.compilerOptions?.tsBuildInfoFile).toBe('dist-test/tsconfig.test.tsbuildinfo');
+    expect(tsconfigTest.compilerOptions?.composite).toBe(false);
+    expect(tsconfigTest.compilerOptions?.declaration).toBe(false);
+    expect(tsconfigTest.compilerOptions?.declarationMap).toBe(false);
+    expect(tsconfigTest.compilerOptions?.emitDeclarationOnly).toBe(false);
+    expect(tsconfigTest.compilerOptions?.noEmit).toBe(true);
+    expect(tsconfigTest.compilerOptions?.outDir).toBeUndefined();
+    expect(tsconfigTest.compilerOptions?.tsBuildInfoFile).toBeUndefined();
     expect(tsconfigTest.include).toContain('src/test-suite-tracer.ts');
     expect(referencePaths(tsconfigTest.references)).toContain('./tsconfig.lib.json');
+
+    const projectTsconfig = readJson(tree, 'packages/example/tsconfig.json') as {
+      references?: Array<{ path: string }>;
+    };
+    expect(referencePaths(projectTsconfig.references)).not.toContain('./tsconfig.test.json');
   });
 
   it('should add bunfig.toml if missing', async () => {
@@ -157,12 +176,26 @@ describe('bun-test-tracing generator', () => {
 
     const tsconfigTest = readJson(tree, 'packages/example/tsconfig.test.json') as {
       extends?: string;
-      compilerOptions?: { types?: string[] };
+      compilerOptions?: {
+        types?: string[];
+        composite?: boolean;
+        declaration?: boolean;
+        declarationMap?: boolean;
+        emitDeclarationOnly?: boolean;
+        noEmit?: boolean;
+        outDir?: string;
+      };
       include?: string[];
       references?: Array<{ path: string }>;
     };
     expect(tsconfigTest.extends).toBe('./tsconfig.json');
     expect(readStringArray(tsconfigTest.compilerOptions?.types)).toEqual(['bun']);
+    expect(tsconfigTest.compilerOptions?.composite).toBe(false);
+    expect(tsconfigTest.compilerOptions?.declaration).toBe(false);
+    expect(tsconfigTest.compilerOptions?.declarationMap).toBe(false);
+    expect(tsconfigTest.compilerOptions?.emitDeclarationOnly).toBe(false);
+    expect(tsconfigTest.compilerOptions?.noEmit).toBe(true);
+    expect(tsconfigTest.compilerOptions?.outDir).toBeUndefined();
     expect(tsconfigTest.include).toContain('src/test-suite-tracer.ts');
     expect(referencePaths(tsconfigTest.references)).toContain('./tsconfig.lib.json');
   });
