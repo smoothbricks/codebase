@@ -8,19 +8,34 @@
     "rootDir": "src",
     "jsx": "react-jsx",
     "types": ["bun"],
-    "composite": true,
-    "declaration": true,
-    "declarationMap": true,
-    "outDir": "dist-test",
-    "tsBuildInfoFile": "dist-test/tsconfig.test.tsbuildinfo"
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["es2022", "dom"],
+    "emitDeclarationOnly": false,
+    "noEmit": true
   },
-  "include": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/**/__tests__/*.ts", "src/**/__tests__/*.tsx"],
+  "include": [
+    "src/**/*.test.ts",
+    "src/**/*.test.tsx",
+    "src/**/__tests__/*.ts",
+    "src/**/__tests__/*.tsx",
+    "src/**/*.spec.ts",
+    "src/**/__tests__/**/*.ts",
+    "src/**/__tests__/**/*.tsx",
+    "src/test-suite-tracer.ts"
+  ],
   "references": [
     {
       "path": "../validation/tsconfig.lib.json"
     },
     {
       "path": "./tsconfig.lib.json"
+    },
+    {
+      "path": "../lmao/tsconfig.lib.json"
     }
   ]
 }

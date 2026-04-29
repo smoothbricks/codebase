@@ -7,14 +7,16 @@
     "declaration": false,
     "declarationMap": false,
     "emitDeclarationOnly": false,
-    "noEmit": true
+    "noEmit": true,
+    "rootDir": "src"
   },
   "include": [
     "src/**/*.test.ts",
     "src/**/*.spec.ts",
     "src/**/__tests__/**/*.ts",
     "src/test-suite-tracer.ts",
-    "test-trace-setup.ts"
+    "test-trace-setup.ts",
+    "src/**/__tests__/**/*.tsx"
   ],
   "references": [
     {

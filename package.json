@@ -39,19 +39,23 @@
     "verdaccio": "^6.2.1"
   },
   "scripts": {
-    "prepare": "ts-patch install",
     "build:all": "nx run-many -t build",
     "build:watch": "nx run-many -t build --watch",
     "clean:trace-db": "find * -name .trace-results.db -delete -print",
+    "format:changed": "git-format-staged --config tooling/git-hooks/git-format-staged.yml --also-unstaged",
+    "format:staged": "git-format-staged --config tooling/git-hooks/git-format-staged.yml",
     "link:all": "bun run build:all && for pkg in packages/*; do (cd $pkg && bun link); done",
-    "unlink:all": "for pkg in packages/*; do (cd $pkg && bun unlink); done",
+    "lint": "nx run-many -t lint",
+    "lint:fix": "git-format-staged --config tooling/git-hooks/git-format-staged.yml --unstaged",
     "list:nx-build-targets": "nx show projects | xargs -n1 nx show project --json | jq -r  '.name as $name | .targets | to_entries[] | \"\\($name):\\(.key)\"'",
+    "prepare": "ts-patch install",
     "reload:direnv": "rm -rf tooling/direnv/.{direnv,devenv}; direnv reload",
     "reload:node_modules": "tooling/rm_node_modules; bun install",
     "show:tree": "tree --gitignore -d",
+    "unlink:all": "for pkg in packages/*; do (cd $pkg && bun unlink); done",
     "update:devenv": "cd tooling/direnv; devenv update",
-    "update:npm:interactive": "bunx npm-check-updates -i",
-    "update:nixpkgs-overlay": "cd tooling/direnv/nixpkgs-overlay && nix shell nixpkgs#nvfetcher -c nvfetcher"
+    "update:nixpkgs-overlay": "cd tooling/direnv/nixpkgs-overlay && nix shell nixpkgs#nvfetcher -c nvfetcher",
+    "update:npm:interactive": "bunx npm-check-updates -i"
   },
   "workspaces": [
     "packages/*",
@@ -67,6 +71,7 @@
           "storage": "tmp/local-registry/storage"
         }
       }
-    }
+    },
+    "name": "@smoothbricks/codebase"
   }
 }
