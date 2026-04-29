@@ -46,7 +46,7 @@ const managedFiles: ManagedFile[] = [
   },
   {
     kind: 'raw',
-    source: '.git-format-staged.yml',
+    source: 'git-format-staged.yml',
     target: '.git-format-staged.yml',
   },
   {
