@@ -13,25 +13,25 @@ describe('retag unpublished releases', () => {
   it('moves unpublished owned tags, pushes with a remote lease, and dispatches publish auto', async () => {
     const shell = new RecordingRetagShell({
       versionAtRef: '1.2.3',
-      remoteTagObjects: new Map([['@scope/pkg@1.2.3', 'old-tag-object']]),
+      remoteTagObjects: new Map([['pkg@1.2.3', 'old-tag-object']]),
       dispatchSha: 'target-sha',
     });
 
     const updates = await retagUnpublished(shell, retagOptions({ push: true, dispatch: true }));
 
-    expect(updates).toEqual([{ tag: '@scope/pkg@1.2.3', pkg, expectedRemoteObject: 'old-tag-object' }]);
-    expect(shell.movedTags).toEqual([{ tag: '@scope/pkg@1.2.3', ref: 'HEAD' }]);
-    expect(shell.pushed).toEqual([[{ tag: '@scope/pkg@1.2.3', expectedRemoteObject: 'old-tag-object' }]]);
+    expect(updates).toEqual([{ tag: 'pkg@1.2.3', pkg, expectedRemoteObject: 'old-tag-object' }]);
+    expect(shell.movedTags).toEqual([{ tag: 'pkg@1.2.3', ref: 'HEAD' }]);
+    expect(shell.pushed).toEqual([[{ tag: 'pkg@1.2.3', expectedRemoteObject: 'old-tag-object' }]]);
     expect(shell.dispatched).toEqual([{ workflow: 'publish.yml', branch: 'main' }]);
     expect(shell.dispatchRefLookups).toEqual(['main']);
-    expect(shell.remoteTagLookups).toEqual(['@scope/pkg@1.2.3']);
+    expect(shell.remoteTagLookups).toEqual(['pkg@1.2.3']);
   });
 
   it('rejects tags whose package version already exists on npm', async () => {
     const shell = new RecordingRetagShell({ versionAtRef: '1.2.3', npmPublished: true });
 
     await expect(retagUnpublished(shell, retagOptions())).rejects.toThrow(
-      'Cannot retag @scope/pkg@1.2.3: @scope/pkg@1.2.3 already exists on npm.',
+      'Cannot retag pkg@1.2.3: @scope/pkg@1.2.3 already exists on npm.',
     );
 
     expect(shell.movedTags).toEqual([]);
@@ -42,7 +42,7 @@ describe('retag unpublished releases', () => {
     const shell = new RecordingRetagShell({ versionAtRef: '1.2.4' });
 
     await expect(retagUnpublished(shell, retagOptions())).rejects.toThrow(
-      'Release tag @scope/pkg@1.2.3 cannot move to HEAD: packages/pkg/package.json has version 1.2.4, expected 1.2.3.',
+      'Release tag pkg@1.2.3 cannot move to HEAD: packages/pkg/package.json has version 1.2.4, expected 1.2.3.',
     );
   });
 
@@ -66,7 +66,7 @@ describe('retag unpublished releases', () => {
     expect(shell.movedTags).toEqual([]);
     expect(shell.pushed).toEqual([]);
     expect(shell.dispatched).toEqual([]);
-    expect(shell.logs).toContain('Would move @scope/pkg@1.2.3 to HEAD (target-sha).');
+    expect(shell.logs).toContain('Would move pkg@1.2.3 to HEAD (target-sha).');
     expect(shell.logs).toContain('Would push 1 retagged release tag.');
     expect(shell.logs).toContain('Would dispatch publish.yml on main with bump=auto.');
   });
@@ -74,7 +74,7 @@ describe('retag unpublished releases', () => {
 
 function retagOptions(overrides: Partial<RetagUnpublishedOptions> = {}): RetagUnpublishedOptions {
   return {
-    tags: ['@scope/pkg@1.2.3'],
+    tags: ['pkg@1.2.3'],
     toRef: 'HEAD',
     push: false,
     dispatch: false,

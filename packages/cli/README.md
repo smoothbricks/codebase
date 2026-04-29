@@ -202,8 +202,8 @@ repository directory, export ordering, and source-file publish entries when thos
 `smoo monorepo list-release-packages` prints the comma-separated Nx project names for packages that are both
 `npm:public` and owned by the current repository. Release commands, trusted-publisher setup, and the managed publish
 workflow use this owned release package list instead of every public package in the workspace. smoo keeps both names in
-release metadata: Nx commands receive `projectName`, while npm publish, GitHub Releases, and release tags use the real
-package `name`.
+release metadata: Nx commands, GitHub Release tags, and git release tags use `projectName`, while npm publish checks and
+tarball validation use the real package `name`.
 
 For [GitHub Actions], `smoo monorepo list-release-packages --fail-empty --github-output "$GITHUB_OUTPUT"` appends the
 `projects=<nx-project-list>` output expected by the managed publish workflow and fails with a clear error when no owned
@@ -356,9 +356,9 @@ Versioning:
 
 - `--bump auto` first filters owned release packages to package-local candidates, then lets [Nx Release][nx-release]
   derive the semver bump from [Conventional Commits]. A tagged package is an auto candidate only when files under its
-  package root changed since its current `name@version` release tag. An untagged package is an auto candidate only when
-  its package root has git history. Root-only changes, workflow edits, lockfile-only churn, and other workspace-global
-  changes may still affect Nx tasks, but they do not make unrelated package artifacts releasable.
+  package root changed since its current `projectName@version` release tag. An untagged package is an auto candidate
+  only when its package root has git history. Root-only changes, workflow edits, lockfile-only churn, and other
+  workspace-global changes may still affect Nx tasks, but they do not make unrelated package artifacts releasable.
 - `--bump patch|minor|major|prerelease` forces the release specifier for the full owned release package set. Forced
   bumps intentionally bypass the package-local auto filter.
 - Release packages are discovered from `npm:public` packages whose `repository.url` exactly matches the root package.
@@ -371,8 +371,8 @@ Versioning:
   `"nx": { "name": "money" }`. This lets Nx Release understand commit scopes like `fix(money): ...` without requiring
   the npm org in every commit subject.
 - Nx project names and npm package names are different release identities. Nx project filters, workflow `projects=`
-  outputs, build/lint/test validation, and project changelog lookup use `projectName`. npm publish checks, tarball
-  validation, GitHub Release titles, and durable release tags use package `name`.
+  outputs, build/lint/test validation, project changelog lookup, GitHub Release tags, and durable git release tags use
+  `projectName`. npm publish checks and tarball validation use package `name`.
 - [Nx Release][nx-release] `preVersionCommand` is intentionally not used. smoo builds exactly the packages that still
   need npm publish immediately before packing them, while the managed workflow separately builds, lints, tests, and
   validates newly created release commits.
@@ -398,9 +398,8 @@ Versioning:
   [oven-sh/bun#18906](https://github.com/oven-sh/bun/issues/18906),
   [oven-sh/bun#20477](https://github.com/oven-sh/bun/issues/20477), and
   [oven-sh/bun#20829](https://github.com/oven-sh/bun/issues/20829).
-- Package release tags must use the npm package name and version, for example `@smoothbricks/nx-plugin@0.0.2`. smoo
-  derives release package/version pairs from that tag shape and recreates missing local tags for Nx release commits
-  before repairing remote state. Nx project names are only CLI/project-graph identifiers.
+- Package release tags must use the Nx project name and version, for example `nx-plugin@0.0.2`. smoo derives release
+  package/version pairs from that tag shape and maps project names back to npm package names before checking npm state.
 - `smoo release retag-unpublished <tag...>` is a break-glass recovery command for the case where Nx already committed a
   version bump but npm publish failed before the package version became durable. It moves exact owned release tags to
   `HEAD` by default without bumping package manifests again. It refuses to move a tag when `package@version` already
@@ -416,7 +415,7 @@ the durable record that a package version was selected for release. It only chec
 decide which tags still need work; it does not walk normal commits looking for release-shaped changes.
 
 1. Collect owned release tags from the fetched remote tag set, sorted newest-first by annotated tag `creatordate`. Only
-   tags matching owned package release names are considered, and each tag is peeled to the commit it releases.
+   tags matching owned Nx project release names are considered, and each tag is peeled to the commit it releases.
 2. Classify each owned release tag before grouping by commit. A tag needs npm repair when `package@version` is missing
    from npm, and it needs GitHub repair when the GitHub Release for that tag is missing. Tags needing neither are
    filtered out immediately.

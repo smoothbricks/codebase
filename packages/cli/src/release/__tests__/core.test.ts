@@ -18,7 +18,7 @@ function record(
   needs: { npm?: boolean; github?: boolean },
 ): ReleaseTagRecord {
   return {
-    tag: `${pkg.name}@${pkg.version}`,
+    tag: `${pkg.projectName}@${pkg.version}`,
     sha,
     timestamp,
     pkg,
@@ -29,8 +29,9 @@ function record(
 
 describe('release core planning', () => {
   it('matches owned release tags without semantic version parsing', () => {
-    expect(releasePackageForTag([a], '@scope/a@1.2.3')?.version).toBe('1.2.3');
-    expect(releasePackageForTag([a], '@scope/c@1.2.3')).toBeNull();
+    expect(releasePackageForTag([a], 'a@1.2.3')?.version).toBe('1.2.3');
+    expect(releasePackageForTag([a], '@scope/a@1.2.3')).toBeNull();
+    expect(releasePackageForTag([a], 'c@1.2.3')).toBeNull();
   });
 
   it('groups only repair-needed tags by commit', () => {

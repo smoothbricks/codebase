@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import type { ReleasePackageInfo, ReleaseTarget } from '../core.js';
+import { type ReleasePackageInfo, type ReleaseTarget, releaseTag } from '../core.js';
 import {
   completeReleaseAtHead,
   type ReleaseRepairShell,
@@ -33,7 +33,7 @@ describe('release orchestration', () => {
     expect(shell.builds).toEqual([['@scope/stable']]);
     expect(shell.publishes).toEqual([{ name: '@scope/stable', distTag: 'latest', dryRun: false }]);
     expect(shell.githubCreates).toEqual([{ name: '@scope/prerelease', dryRun: false }]);
-    expect(shell.pushes).toEqual([['@scope/stable', '@scope/prerelease']]);
+    expect(shell.pushes).toEqual([['stable@1.0.0', 'prerelease@2.0.0-beta.1']]);
     expect(summaries).toHaveLength(1);
     expect(summaries[0]?.published.map((pkg) => pkg.name)).toEqual(['@scope/stable']);
     expect(summaries[0]?.githubReleases.map((pkg) => pkg.name)).toEqual(['@scope/prerelease']);
@@ -60,6 +60,7 @@ describe('release orchestration', () => {
     expect(shell.builds).toEqual([['@scope/stable']]);
     expect(shell.publishes).toEqual([{ name: '@scope/stable', distTag: 'latest', dryRun: false }]);
     expect(shell.githubCreates).toEqual([{ name: '@scope/prerelease', dryRun: false }]);
+    expect(shell.pushes).toEqual([['stable@1.0.0', 'prerelease@2.0.0-beta.1']]);
     expect(summary.published.map((pkg) => pkg.name)).toEqual(['@scope/stable']);
     expect(summary.alreadyPublished.map((pkg) => pkg.name)).toEqual(['@scope/prerelease']);
     expect(summary.githubReleases.map((pkg) => pkg.name)).toEqual(['@scope/prerelease']);
@@ -161,7 +162,7 @@ class RecordingRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
   }
 
   async pushReleaseRefs(packages: ReleasePackageInfo[]): Promise<boolean> {
-    this.pushes.push(packageNames(packages));
+    this.pushes.push(packages.map((pkg) => releaseTag(pkg)));
     return true;
   }
 
