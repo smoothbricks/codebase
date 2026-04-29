@@ -47,6 +47,7 @@ export async function writeBuildablePackage(
         name,
         version,
         nx: {
+          name: name.startsWith('@') ? name.slice(name.indexOf('/') + 1) : name,
           targets: {
             build: {
               executor: 'nx:run-commands',

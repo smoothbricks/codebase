@@ -8,8 +8,8 @@ import {
   releasePackageForTag,
 } from '../core.js';
 
-const a: ReleasePackageInfo = { name: '@scope/a', path: 'packages/a', version: '1.0.0' };
-const b: ReleasePackageInfo = { name: '@scope/b', path: 'packages/b', version: '2.0.0-beta.1' };
+const a: ReleasePackageInfo = { name: '@scope/a', projectName: 'a', path: 'packages/a', version: '1.0.0' };
+const b: ReleasePackageInfo = { name: '@scope/b', projectName: 'b', path: 'packages/b', version: '2.0.0-beta.1' };
 
 function record(
   pkg: ReleasePackageInfo,

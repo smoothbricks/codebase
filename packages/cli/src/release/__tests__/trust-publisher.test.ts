@@ -3,8 +3,18 @@ import type { BootstrapNpmPackagesOptions } from '../bootstrap-npm-packages.js';
 import type { ReleasePackageInfo } from '../core.js';
 import { configureTrustedPublishers, type TrustPublisherShell } from '../index.js';
 
-const stable: ReleasePackageInfo = { name: '@scope/stable', path: 'packages/stable', version: '1.2.3' };
-const missing: ReleasePackageInfo = { name: '@scope/missing', path: 'packages/missing', version: '2.0.0' };
+const stable: ReleasePackageInfo = {
+  name: '@scope/stable',
+  projectName: 'stable',
+  path: 'packages/stable',
+  version: '1.2.3',
+};
+const missing: ReleasePackageInfo = {
+  name: '@scope/missing',
+  projectName: 'missing',
+  path: 'packages/missing',
+  version: '2.0.0',
+};
 
 describe('trusted publisher setup', () => {
   it('bootstraps missing npm packages before configuring trust', async () => {

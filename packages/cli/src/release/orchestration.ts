@@ -35,9 +35,10 @@ export interface ReleaseRepairShell<Package extends ReleasePackageInfo = Release
 
 export interface ReleaseVersionShell<Package extends ReleasePackageInfo = ReleasePackageInfo> {
   releasePackagesAtHead(): Promise<Package[]>;
+  releaseVersionPackages(bump: string): Promise<Package[]>;
   ensureLocalReleaseTags(packages: Package[]): Promise<void>;
   gitHead(): Promise<string>;
-  runNxReleaseVersion(bump: string, dryRun: boolean): Promise<void>;
+  runNxReleaseVersion(packages: Package[], bump: string, dryRun: boolean): Promise<void>;
   assertCleanGitTree(): Promise<void>;
 }
 
@@ -59,8 +60,17 @@ export async function runReleaseVersion<Package extends ReleasePackageInfo>(
     }
   }
 
+  const versionPackages = await shell.releaseVersionPackages(options.bump);
+  if (versionPackages.length === 0) {
+    if (options.bump !== 'auto') {
+      // invariant throw: the CLI resolves forced bumps from the full owned release package set.
+      throw new Error(`No release packages were selected for forced --bump ${options.bump}.`);
+    }
+    return { mode: 'none', packages: [], status: 'no-release-needed' };
+  }
+
   const headBeforeVersioning = await shell.gitHead();
-  await shell.runNxReleaseVersion(options.bump, options.dryRun);
+  await shell.runNxReleaseVersion(versionPackages, options.bump, options.dryRun);
   if (options.dryRun) {
     return { mode: 'none', packages: [], status: 'dry-run' };
   }

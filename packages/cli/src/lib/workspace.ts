@@ -5,6 +5,7 @@ import { hasOwn, hasOwnString, isRecord, readJson, readJsonObject, stringPropert
 
 export interface PackageInfo {
   name: string;
+  projectName: string;
   version: string;
   private: boolean;
   tags: string[];
@@ -105,6 +106,7 @@ function getWorkspacePackagesForPatterns(root: string, workspacePatterns: string
       }
       packages.push({
         name: pkg.name,
+        projectName: pkg.projectName,
         version: pkg.version,
         private: pkg.private,
         tags: pkg.tags,
@@ -156,6 +158,7 @@ export function readPackageJson(path: string): PackageInfo | null {
   const tags = getNxTags(parsed);
   return {
     name: parsed.name,
+    projectName: packageNxProjectName(parsed),
     version: parsed.version,
     private: privateValue,
     tags,
@@ -163,6 +166,11 @@ export function readPackageJson(path: string): PackageInfo | null {
     packageJsonPath: path,
     json: parsed,
   };
+}
+
+function packageNxProjectName(pkg: Record<string, unknown>): string {
+  const nx = isRecord(pkg.nx) ? pkg.nx : null;
+  return (nx ? stringProperty(nx, 'name') : null) ?? stringProperty(pkg, 'name') ?? '';
 }
 
 export function readPackageJsonObject(path: string): PackageJson | null {

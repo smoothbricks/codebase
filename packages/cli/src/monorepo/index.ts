@@ -99,9 +99,9 @@ export function validateCommitMessageFile(
   }
 }
 
-export function listReleasePackagesForNx(root: string, options: ListReleasePackagesOptions = {}): string {
+export function listReleaseProjectNamesForNx(root: string, options: ListReleasePackagesOptions = {}): string {
   const packages = listReleasePackages(root)
-    .map((pkg) => pkg.name)
+    .map((pkg) => pkg.projectName)
     .join(',');
   if (!packages && options.failEmpty) {
     throw new Error('No owned release packages found.');

@@ -23,6 +23,7 @@ in {
     gnutar # Tarball inspection for package validation
     coreutils # Provides fmt for commit message wrapping
     git # Git hooks and repository inspection
+    gh # GitHub Actions and release inspection
     # Pin Node.js version to match AWS Lambda runtime
     nodejs_24
     # Bun.sh for javascript dependencies

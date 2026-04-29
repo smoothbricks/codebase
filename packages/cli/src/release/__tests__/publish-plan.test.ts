@@ -2,9 +2,15 @@ import { describe, expect, it } from 'bun:test';
 import type { ReleasePackageInfo } from '../core.js';
 import { planPublishActions } from '../publish-plan.js';
 
-const stable: ReleasePackageInfo = { name: '@scope/stable', path: 'packages/stable', version: '1.0.0' };
+const stable: ReleasePackageInfo = {
+  name: '@scope/stable',
+  projectName: 'stable',
+  path: 'packages/stable',
+  version: '1.0.0',
+};
 const prerelease: ReleasePackageInfo = {
   name: '@scope/prerelease',
+  projectName: 'prerelease',
   path: 'packages/prerelease',
   version: '2.0.0-beta.1',
 };
@@ -27,7 +33,7 @@ describe('publish plan', () => {
       githubMissingPackages: [],
     });
 
-    expect(plan.buildProjects).toEqual(['@scope/stable']);
+    expect(plan.buildProjects).toEqual(['stable']);
     expect(plan.publishPackages).toEqual([{ pkg: stable, distTag: 'latest' }]);
     expect(plan.githubReleasePackages).toEqual([]);
   });
@@ -51,7 +57,7 @@ describe('publish plan', () => {
       githubMissingPackages: [],
     });
 
-    expect(plan.buildProjects).toEqual(['@scope/stable', '@scope/prerelease']);
+    expect(plan.buildProjects).toEqual(['stable', 'prerelease']);
     expect(plan.publishPackages).toEqual([
       { pkg: stable, distTag: 'latest' },
       { pkg: prerelease, distTag: 'next' },

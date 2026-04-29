@@ -1,5 +1,6 @@
 export interface ReleasePackageInfo {
   name: string;
+  projectName: string;
   path: string;
   version: string;
 }
