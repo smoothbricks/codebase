@@ -64,6 +64,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     const targetName = `zig-${step}`;
     targets[targetName] = {
       executor: 'nx:run-commands',
+      cache: true,
       inputs: ['{projectRoot}/src/**/*.zig', '{projectRoot}/build.zig', '{projectRoot}/build.zig.zon'],
       outputs: [
         '{projectRoot}/dist/**/*.wasm',
@@ -84,6 +85,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
   if (buildComponents.length > 0) {
     targets.build = {
       executor: 'nx:noop',
+      cache: true,
       dependsOn: ['^build', ...buildComponents],
     };
   }
@@ -95,6 +97,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
   if (validationTargets.length > 0) {
     targets.lint = {
       executor: 'nx:noop',
+      cache: true,
       dependsOn: validationTargets,
     };
   }

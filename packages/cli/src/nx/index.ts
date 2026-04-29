@@ -83,7 +83,7 @@ export async function cleanCache(root: string): Promise<void> {
   }
 }
 
-async function readProjectTargets(root: string): Promise<ProjectTargets[]> {
+export async function readProjectTargets(root: string): Promise<ProjectTargets[]> {
   const projects = await readNxProjectNames(root);
   return Promise.all(projects.map((project) => readProjectTarget(root, project)));
 }

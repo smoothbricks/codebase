@@ -30,7 +30,7 @@ describe('monorepo validation pack phases', () => {
       },
     ];
 
-    const failures = await runValidatePacks(
+    const result = await runValidatePacks(
       ctx,
       { fix: true },
       {
@@ -42,7 +42,7 @@ describe('monorepo validation pack phases', () => {
       },
     );
 
-    expect(failures).toBe(0);
+    expect(result).toEqual({ failures: 0, failedChecks: 0 });
     expect(events).toEqual(['pre-fix', 'build', 'post-fix', 'pre-validate', 'post-validate']);
   });
 
@@ -65,7 +65,7 @@ describe('monorepo validation pack phases', () => {
       },
     ];
 
-    const failures = await runValidatePacks(
+    const result = await runValidatePacks(
       ctx,
       {},
       {
@@ -77,8 +77,38 @@ describe('monorepo validation pack phases', () => {
       },
     );
 
-    expect(failures).toBe(0);
+    expect(result).toEqual({ failures: 0, failedChecks: 0 });
     expect(events).toEqual(['pre-validate', 'build', 'post-validate']);
+  });
+
+  it('counts separate post-build packs as separate failed checks', async () => {
+    const packs: MonorepoPack[] = [
+      {
+        name: 'workspace-dependencies',
+        validatePostBuild() {
+          return 88;
+        },
+      },
+      {
+        name: 'package-hygiene',
+        validatePostBuild() {
+          return 0;
+        },
+      },
+    ];
+
+    const result = await runValidatePacks(
+      ctx,
+      {},
+      {
+        packs,
+        runBuild() {
+          return 0;
+        },
+      },
+    );
+
+    expect(result).toEqual({ failures: 88, failedChecks: 1 });
   });
 
   it('does not build or run post-build validation after a fail-fast pre-build failure', async () => {
@@ -100,7 +130,7 @@ describe('monorepo validation pack phases', () => {
       },
     ];
 
-    const failures = await runValidatePacks(
+    const result = await runValidatePacks(
       ctx,
       { failFast: true },
       {
@@ -112,7 +142,7 @@ describe('monorepo validation pack phases', () => {
       },
     );
 
-    expect(failures).toBe(2);
+    expect(result).toEqual({ failures: 2, failedChecks: 1 });
     expect(events).toEqual(['pre-validate']);
   });
 
@@ -141,7 +171,7 @@ describe('monorepo validation pack phases', () => {
       },
     ];
 
-    const failures = await runValidatePacks(
+    const result = await runValidatePacks(
       ctx,
       { fix: true },
       {
@@ -153,7 +183,7 @@ describe('monorepo validation pack phases', () => {
       },
     );
 
-    expect(failures).toBe(1);
+    expect(result).toEqual({ failures: 1, failedChecks: 1 });
     expect(events).toEqual(['pre-fix', 'build']);
   });
 });
