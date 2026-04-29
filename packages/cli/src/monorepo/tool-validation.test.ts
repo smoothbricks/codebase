@@ -235,8 +235,24 @@ function compareDotVersions(left: string, right: string): number {
 }
 
 async function currentNxPluginRange(): Promise<string> {
-  const pkg = JSON.parse(await readFile(new URL('../../../nx-plugin/package.json', import.meta.url), 'utf8'));
-  return `^${pkg.version}`;
+  return `^${latestRegistryVersion('@smoothbricks/nx-plugin')}`;
+}
+
+function latestRegistryVersion(packageName: string): string {
+  const versions = registryVersions[packageName];
+  if (!versions) {
+    throw new Error(`missing mocked registry versions for ${packageName}`);
+  }
+  let latest = versions[0];
+  for (const version of versions) {
+    if (!latest || compareDotVersions(version, latest) > 0) {
+      latest = version;
+    }
+  }
+  if (!latest) {
+    throw new Error(`empty mocked registry versions for ${packageName}`);
+  }
+  return latest;
 }
 
 async function writeJson(path: string, value: Record<string, unknown>): Promise<void> {
