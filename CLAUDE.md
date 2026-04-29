@@ -127,8 +127,10 @@ carries only what the **receiver** needs to act. For the full rules with code ex
 
 ### Build and Development
 
-- **Build a project**: `nx build <project-name>`
-- **Type check**: `nx typecheck <project-name>`
+- **Build a project**: `nx build <project-name>`; this is an aggregate over tool-output targets such as `tsc-js` and
+  `zig-wasm`
+- **Type check source**: `nx tsc-js <project-name>`; `@nx/js/typescript` owns the `tsconfig.lib.json` -> `tsc-js`
+  inferred target
 - **Generate a new library**: `nx g @nx/js:lib packages/<name> --publishable --importPath=@my-org/<name>`
 - **Sync TypeScript references**: `nx sync`
 - **Check TypeScript references**: `nx sync:check`
@@ -140,7 +142,8 @@ carries only what the **receiver** needs to act. For the full rules with code ex
 - **Lint before tests:** always `nx lint <project>` first
 - **Test:** `nx test <project>` — ALWAYS through Nx, never bare `bun test`
 - **Test with filter/args:** pass runner args through Nx, e.g. `nx test <project> -- --filter \"test name pattern\"`
-- **Typecheck / build:** `nx typecheck <project>`, `nx build <project>`
+- **Typecheck / build:** `nx tsc-js <project>` for source, `nx typecheck-tests <project>` for tests,
+  `nx build <project>` for the aggregate
 - **After tsconfig or dependency changes:** `nx sync` and `nx sync:check`
 - **Query test results:** Use `.trace-results.db` SQLite databases:
   ```bash
@@ -165,7 +168,7 @@ carries only what the **receiver** needs to act. For the full rules with code ex
 - Code is automatically formatted on commit via Git hooks
 - **Format code**: `bun run format`
 - **Lint code**: `bun run lint`
-- **Fix linting issues**: `bun run lint:fix`
+- **Fix linting issues**: `bun run lint:fix` at the repository root; there is no Nx `lint:fix` target
 
 ### Package Management
 
@@ -222,12 +225,21 @@ This is an Nx-based monorepo using Bun as the package manager, with devenv/diren
   - Alejandra for Nix files
 - **TypeScript** with strict mode and composite projects
 - **Code style**: 2 spaces, single quotes, 120 character line width
-- **Nx uses inferred tasks** - don't add build/typecheck scripts to package.json (Nx infers these from tsconfig), but DO
-  add test scripts
-- **Nx `targetDefaults` don't create targets** - they only configure targets that already exist. Targets defined in
-  `nx.json` `targetDefaults` (like `lint`, `lint:fix`) must be declared as `"lint": {}` in each package's `"nx".targets`
-  in `package.json` for the target to exist. The targetDefault then fills in the executor, options, and dependencies.
-  When creating a new package, always add these stub entries.
+- **Nx uses inferred tasks** - don't add build/typecheck scripts to package.json. Official `@nx/js/typescript` infers
+  `tsconfig.lib.json` as `tsc-js`; `@smoothbricks/nx-plugin` infers only missing targets: `typecheck-tests` from
+  `tsconfig.test.json`, `zig-*` from `build.zig` steps, and aggregate `build` / `lint` targets.
+- **Where targets come from:** `tsc-js` comes from `tsconfig.lib.json`, `typecheck-tests` from `tsconfig.test.json`, and
+  `zig-*` from explicit `b.step("...")` entries in `build.zig`. Aggregate `build` exists only when concrete build
+  targets exist.
+- **Bun test packages require test typechecking:** `bun test` executes tests without typechecking, so packages that use
+  it must have a no-emit `tsconfig.test.json` that infers `typecheck-tests`.
+- **Nx target names are tool-output names** - use `tsc-js` and `zig-wasm`; `build` and `lint` are aggregates. Do not use
+  colon target names such as `build:wasm` or `lint:fix`: Nx CLI syntax already means `project:target:configuration`, so
+  colon target names are ambiguous with configurations. Package scripts may still be named `build:wasm` when they
+  delegate to a real target like `nx run pkg:zig-wasm`.
+- **Test typechecking is no-emit** - `typecheck-tests` is inferred from `tsconfig.test.json`, which must use `noEmit`,
+  must not be `composite`, must not write `dist-test`, and must not be referenced from package root `tsconfig.json`.
+- **Zig package setup** - `build.zig` must declare at least one `b.step(...)`; each step becomes a `zig-*` target.
 - **Run `nx sync`** after modifying tsconfig files or adding/removing package dependencies to keep TypeScript project
   references in sync. Verify with `nx sync:check`.
 

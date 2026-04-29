@@ -173,39 +173,42 @@ tsconfigPath: "/path/to/packages/lmao/tsconfig.lib.json"  ✅
 tsconfigPath: "/path/to/packages/lmao/tsconfig.json"      ❌ (files not found)
 ```
 
-### Nx targetDefaults and New Package Checklist
+### Nx Target Inference And New Package Checklist
 
-**`targetDefaults` in `nx.json` do NOT auto-create targets.** They only provide default configuration (executor,
-options, dependsOn) for targets that already exist from another source (plugin inference, package.json script, or
-explicit `"nx".targets` config). If a package doesn't declare the target, the targetDefault has no effect.
+**Official Nx owns library TypeScript targets.** `@nx/js/typescript` infers `tsconfig.lib.json` as the tool-output
+target `tsc-js`. Do not duplicate that target in package manifests or rename it to a semantic alias.
 
-**When creating a new package**, add these stub entries to `package.json` `"nx".targets`:
+**`@smoothbricks/nx-plugin` owns only missing inferred targets.** It infers `typecheck-tests` from `tsconfig.test.json`,
+`zig-*` targets from `build.zig` steps, and aggregate `build` / `lint` targets. Do not add package-local stubs for these
+targets unless there is a concrete package-specific override.
 
-```json
-{
-  "nx": {
-    "targets": {
-      "lint": {},
-      "typecheck-tests": {
-        "executor": "nx:run-commands",
-        "options": {
-          "command": "tsc --noEmit -p tsconfig.test.json",
-          "cwd": "packages/<name>"
-        },
-        "dependsOn": ["build"]
-      }
-    }
-  }
-}
-```
+Concrete target sources:
+
+- `tsc-js`: official `@nx/js/typescript`, from `tsconfig.lib.json`.
+- `typecheck-tests`: `@smoothbricks/nx-plugin`, from `tsconfig.test.json`; required for packages that use `bun test`
+  because Bun executes tests without typechecking.
+- `zig-*`: `@smoothbricks/nx-plugin`, from named `b.step("...")` entries in `build.zig`.
+- `build`: aggregate inferred only when at least one concrete build target exists.
+- `lint`: aggregate validation target, never a formatter.
+
+**Target names are tool-output names.** Use names like `tsc-js` and `zig-wasm`. `build` and `lint` are aggregates that
+depend on tool-output targets. Do not create colon-style Nx target names such as `build:wasm` or `lint:fix`: Nx CLI
+syntax already uses `project:target:configuration`, so colon target names are ambiguous with configurations and make
+package-script aliases harder to reason about. Package scripts may still be named `build:wasm` if they delegate to a
+real target such as `nx run pkg:zig-wasm`.
+
+**`typecheck-tests` is no-emit only.** Packages that use `bun test` must have `tsconfig.test.json` because Bun executes
+tests without typechecking. That config gets `typecheck-tests`; the test tsconfig must use `noEmit` and must not write
+`dist-test`. It must not be `composite`, and package root `tsconfig.json` must not reference `./tsconfig.test.json`; Nx
+runs it through the inferred `typecheck-tests` target after `build`.
+
+**Zig targets come from `build.zig`.** A package `build.zig` must declare at least one `b.step(...)`; each step becomes
+a `zig-*` tool-output target.
 
 If the package is published to npm, add `"npm:public"` to `package.json` `"nx".tags`. If the package is private or
 internal-only, do not add that tag. `smoo` and release workflows use `npm:public` as the source of truth.
 
-`"lint": {}` — creates the target; `nx.json` targetDefault fills in biome executor + `dependsOn: ["typecheck-tests"]`
-`"typecheck-tests"` — explicit target because it has package-specific `cwd`; runs `tsc --noEmit` on test tsconfig
-
-Also create `tsconfig.test.json` for the package (see existing packages for the pattern: `types: ["bun"]`,
+Also create `tsconfig.test.json` for packages with tests (see existing packages for the pattern: `types: ["bun"]`,
 `composite: false`, `noEmit: true`, includes test globs, references `tsconfig.lib.json`).
 
 **Typia setup for new packages:** Every package that validates data at runtime needs:
@@ -552,15 +555,15 @@ explicitly!
 
 ### Linting (ALWAYS run before tests!)
 
-**Lint**: `nx lint <project>` **Lint Fix**: `nx lint:fix <project>` **⚠️ CRITICAL**: Agents MUST run `nx lint <project>`
-before running tests to catch type errors early
+**Lint**: `nx lint <project>` **Fix linting issues**: `bun run lint:fix` at the repository root. There is no Nx
+`lint:fix` target. **⚠️ CRITICAL**: Agents MUST run `nx lint <project>` before running tests to catch type errors early
 
 ### Testing
 
 - **Test**: `nx test <project>`
 - **Test with filter/args**: pass runner args through Nx, e.g. `nx test <project> -- --filter "test name pattern"`
-- **Note**: Tests no longer depend on `typecheck-tests`; linting handles that. Tests only depend on build. Direct
-  `bun test` is diagnostic-only, not the standard validation path.
+- **Note**: Tests only depend on build. `typecheck-tests` is inferred from `tsconfig.test.json` and is run by linting.
+  Direct `bun test` is diagnostic-only, not the standard validation path.
 
 **Repository requirement:** Every package test suite (except `packages/lmao`) MUST be LMAO-traced and MUST flush traces
 through a SQLite sink (local `.trace-results.db` or worker D1 binding such as `TRACE_RESULTS`). Configure SQLite once in

@@ -26,6 +26,13 @@ export interface ToolContext {
 const rootDevDependencies: RequiredDependency[] = [
   { name: '@biomejs/biome', fallbackVersion: '^2.3.5', minimumVersion: '2.3.0', prefix: '^' },
   { name: '@nx/js', fallbackVersion: '22.0.3', minimumVersion: '22.0.0' },
+  {
+    name: '@smoothbricks/nx-plugin',
+    fallbackVersion: '^0.0.1',
+    minimumVersion: '0.0.1',
+    prefix: '^',
+    useWorkspaceRangeInCodebase: true,
+  },
   { name: 'eslint', fallbackVersion: '^9.39.1', minimumVersion: '9.39.0', prefix: '^' },
   {
     name: 'eslint-stdout',

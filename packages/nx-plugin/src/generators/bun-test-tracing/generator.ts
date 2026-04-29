@@ -69,7 +69,6 @@ export default async function generator(tree: Tree, schema: BunTestTracingGenera
   writeBunfig(tree, resolved.root);
   tree.write(joinPathFragments(resolved.root, 'src/test-suite-tracer.ts'), renderSuiteTracer(options));
   updateTsconfigTest(tree, resolved.root, packageJsonPath, tsconfigPath, libTsconfigPath);
-  updateProjectTsconfig(tree, tsconfigPath);
 }
 
 function normalizeOptions(schema: BunTestTracingGeneratorSchema): Required<BunTestTracingGeneratorSchema> {
@@ -189,11 +188,11 @@ function updateTsconfigTest(
     const compilerOptions: Record<string, unknown> = {
       ...copiedCompilerOptions,
       types: mergeStringArray([], ['bun']),
-      composite: true,
-      declaration: true,
-      declarationMap: true,
-      outDir: 'dist-test',
-      tsBuildInfoFile: 'dist-test/tsconfig.test.tsbuildinfo',
+      composite: false,
+      declaration: false,
+      declarationMap: false,
+      emitDeclarationOnly: false,
+      noEmit: true,
     };
 
     const tsconfigTest: TsConfigJson = {
@@ -213,12 +212,14 @@ function updateTsconfigTest(
       ...copiedCompilerOptions,
       ...tsconfigTest.compilerOptions,
       types: mergeStringArray(readStringArray(tsconfigTest.compilerOptions?.types), ['bun']),
-      composite: true,
-      declaration: true,
-      declarationMap: true,
-      outDir: 'dist-test',
-      tsBuildInfoFile: 'dist-test/tsconfig.test.tsbuildinfo',
+      composite: false,
+      declaration: false,
+      declarationMap: false,
+      emitDeclarationOnly: false,
+      noEmit: true,
     };
+    delete tsconfigTest.compilerOptions.outDir;
+    delete tsconfigTest.compilerOptions.tsBuildInfoFile;
     tsconfigTest.include = mergeStringArray(tsconfigTest.include, DEFAULT_TEST_INCLUDES);
     tsconfigTest.references = mergeReferences(tsconfigTest.references, referencePaths);
     return tsconfigTest;
@@ -322,17 +323,4 @@ function mergeReferences(existing: Array<{ path: string }> | undefined, newPaths
   }
 
   return merged;
-}
-
-function updateProjectTsconfig(tree: Tree, tsconfigPath: string): void {
-  updateJson<TsConfigJson>(tree, tsconfigPath, (tsconfig: TsConfigJson) => {
-    tsconfig.references ??= [];
-
-    const hasTestTsconfig = tsconfig.references.some((ref) => ref.path === './tsconfig.test.json');
-    if (!hasTestTsconfig) {
-      tsconfig.references.push({ path: './tsconfig.test.json' });
-    }
-
-    return tsconfig;
-  });
 }

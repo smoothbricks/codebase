@@ -115,6 +115,7 @@ It checks:
 - Public package metadata.
 - Workspace dependency ranges.
 - Workspace-dependent package scripts delegate safe commands through Nx targets without recursive script runners.
+- Nx target conventions and inferred-task setup.
 - [`sherif`] package hygiene, with warnings treated as validation failures.
 - Packed public package artifacts with [`publint`].
 - Packed public package type resolution with the [`attw`][are-the-types-wrong] CLI.
@@ -178,13 +179,46 @@ release packages exist.
 `smoo release npm-status` shows whether each owned release package's current `name@version` already exists on npm. It is
 an npm registry check, not a full release workflow status check.
 
+## Nx Conventions
+
+`smoo` keeps Nx target names predictable and separates tool work from aggregate workflows.
+
+Official Nx plugins own targets they already know how to infer. For example, `@nx/js/typescript` owns TypeScript library
+builds, so a package `tsconfig.lib.json` produces the concrete target `tsc-js`.
+
+`@smoothbricks/nx-plugin` only fills SmoothBricks convention gaps that official plugins do not provide. Today that means
+Bun test typechecking, non-TypeScript build-tool steps, and aggregate targets.
+
+Concrete targets describe the tool that runs and the artifact or purpose it produces:
+
+- `tsc-js` comes from the official TypeScript plugin and runs `tsc` for package JavaScript/declaration output.
+- Packages that run `bun test` must have `tsconfig.test.json`. Bun executes tests without typechecking, so smoo creates
+  a no-emit `typecheck-tests` target from that config and wires it into validation. Other test runners may own their own
+  typecheck path.
+- Test tsconfigs are validation configs, not TypeScript build-mode projects. They must use `noEmit`, must not set
+  `composite: true`, and package root `tsconfig.json` must not reference `./tsconfig.test.json`. The inferred
+  `typecheck-tests` target runs `tsc --noEmit -p tsconfig.test.json` after `build` instead.
+- Non-TypeScript build steps come from explicit tool configuration. For example, a package `build.zig` must expose named
+  `b.step("name", ...)` entries; each non-reserved step becomes a `zig-name` target such as `zig-wasm`.
+- `build` is an aggregate. It exists only when there is at least one concrete build target such as `tsc-js` or another
+  tool-output target, and it depends on those targets instead of duplicating their commands.
+- `lint` is an aggregate validation target. It is not a formatting target.
+
+Explicit Nx target names must not contain `:`. Nx already uses colon syntax at the CLI boundary:
+`project:target:configuration`. Allowing target names like `build:wasm` makes command parsing and package-script aliases
+look like configurations, and it prevents a clean split between concrete tool-output targets and aggregate targets.
+
+Use tool-output names for concrete targets, such as `tsc-js` and `zig-wasm`. Use `build` and `lint` only as aggregate
+targets. Package scripts may still use developer-friendly colon names, for example `build:wasm`, but those scripts
+should delegate to unambiguous Nx targets such as `nx run pkg:zig-wasm`.
+
 ## Managed Files
 
 `smoo monorepo update` writes the managed files into a repository.
 
 Managed files include:
 
-- [`.git-format-staged.yml`][git-format-staged]
+- [`tooling/git-hooks/git-format-staged.yml`][git-format-staged]
 - Git hook scripts under `tooling/git-hooks`
 - [direnv]/[GitHub Actions] bootstrap scripts under `tooling/direnv`
 - [GitHub Actions] workflows under `.github/workflows`
@@ -206,10 +240,13 @@ smoo monorepo diff
 
 `check` fails when a managed file is missing or stale. `diff` reports drift without writing files.
 
-## Git Hooks
+## Formatting And Git Hooks
 
-The generated pre-commit hook runs [`git-format-staged`][git-format-staged] from the repository root with `tooling`,
-`node_modules/.bin`, and the [devenv] profile on `PATH`.
+The root `lint:fix` script runs [`git-format-staged`][git-format-staged] with
+`--config tooling/git-hooks/git-format-staged.yml --unstaged`. The formatter config intentionally excludes `bun.lock`.
+
+The generated pre-commit hook runs the same formatter path from the repository root with `tooling`, `node_modules/.bin`,
+and the [devenv] profile on `PATH`.
 
 After formatting, the hook runs `smoo monorepo validate --fail-fast --only-if-new-workspace-package`. This keeps normal
 commits fast while still catching incomplete package setup and conditional managed-file drift when a new workspace
