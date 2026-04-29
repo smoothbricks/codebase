@@ -18,6 +18,7 @@ defaults:
 jobs:
   main:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       NIX_STORE_NAR: ${{ github.workspace }}/nix-store.nar
       GH_TOKEN: ${{ github.token }}
