@@ -43,6 +43,15 @@ const rootScriptPolicy: Record<string, string> = {
 };
 const nxJsTypescriptPlugin = '@nx/js/typescript';
 const smoothBricksNxPlugin = '@smoothbricks/nx-plugin';
+const expectedSharedGlobalsNamedInput = ['{workspaceRoot}/.github/workflows/ci.yml'];
+const defaultProductionNamedInput = [
+  '{projectRoot}/src/**/*',
+  '{projectRoot}/package.json',
+  '!{projectRoot}/**/__tests__/**',
+  '!{projectRoot}/**/*.test.*',
+  '!{projectRoot}/**/*.spec.*',
+];
+const impreciseProductionInputs = new Set(['default', '{projectRoot}/**/*', '{projectRoot}/**']);
 
 export function applyFixableMonorepoDefaults(root: string): void {
   applyRootScriptDefaults(root);
@@ -83,6 +92,7 @@ export function applyNxPluginDefaults(root: string): void {
   }
   let changed = removeColonTargetDefaults(nxJson);
   changed = applyBuildTargetDefault(nxJson) || changed;
+  changed = applyNamedInputDefaults(nxJson) || changed;
   const currentPlugins = Array.isArray(nxJson.plugins) ? nxJson.plugins : [];
   const nextPlugins = upsertNxPlugin(
     upsertNxPlugin(currentPlugins, expectedNxJsTypescriptPlugin()),
@@ -725,6 +735,7 @@ function validateNxPluginConfig(nxJson: Record<string, unknown>): number {
     }
   }
   failures += validateBuildTargetDefault(nxJson);
+  failures += validateNamedInputDefaults(nxJson);
   const plugins = Array.isArray(nxJson.plugins) ? nxJson.plugins : [];
   const nxJsPlugin = plugins.find(isNxJsTypescriptPlugin);
   if (!nxJsPlugin) {
@@ -1104,6 +1115,70 @@ function validateBuildTargetDefault(nxJson: Record<string, unknown>): number {
     failures++;
   }
   return failures;
+}
+
+function applyNamedInputDefaults(nxJson: Record<string, unknown>): boolean {
+  const namedInputs = getOrCreateRecord(nxJson, 'namedInputs');
+  let changed = false;
+  if (!Array.isArray(namedInputs.default)) {
+    namedInputs.default = ['{projectRoot}/**/*', 'sharedGlobals'];
+    changed = true;
+  }
+  changed = setStringArrayProperty(namedInputs, 'sharedGlobals', expectedSharedGlobalsNamedInput) || changed;
+  const production = namedInputs.production;
+  if (!Array.isArray(production) || !isPreciseProductionNamedInput(production)) {
+    namedInputs.production = defaultProductionNamedInput;
+    changed = true;
+  }
+  return changed;
+}
+
+function validateNamedInputDefaults(nxJson: Record<string, unknown>): number {
+  const namedInputs = recordProperty(nxJson, 'namedInputs');
+  const production = namedInputs?.production;
+  let failures = 0;
+  if (!namedInputs) {
+    console.error('nx.json namedInputs must be configured so production builds have precise cache inputs.');
+    return 1;
+  }
+  if (!Array.isArray(namedInputs.default)) {
+    console.error(
+      'nx.json namedInputs.default must be an array; smoo allows it to remain broad for non-production tasks.',
+    );
+    failures++;
+  }
+  if (!stringArrayEquals(namedInputs.sharedGlobals, expectedSharedGlobalsNamedInput)) {
+    console.error('nx.json namedInputs.sharedGlobals must include only {workspaceRoot}/.github/workflows/ci.yml');
+    failures++;
+  }
+  if (!Array.isArray(production)) {
+    console.error('nx.json namedInputs.production must be an array of precise production inputs.');
+    return failures + 1;
+  }
+  if (!isPreciseProductionNamedInput(production)) {
+    console.error(
+      'nx.json namedInputs.production must enumerate precise production inputs. Do not include default or broad {projectRoot}/** globs; use language/tool-specific paths such as {projectRoot}/src/**/*, {projectRoot}/Cargo.toml, or {projectRoot}/pyproject.toml.',
+    );
+    failures++;
+  }
+  return failures;
+}
+
+function isPreciseProductionNamedInput(production: unknown[]): boolean {
+  let hasPositiveProjectInput = false;
+  for (const input of production) {
+    if (typeof input !== 'string') {
+      return false;
+    }
+    const normalized = input.startsWith('!') ? input.slice(1) : input;
+    if (impreciseProductionInputs.has(input) || impreciseProductionInputs.has(normalized)) {
+      return false;
+    }
+    if (!input.startsWith('!') && normalized.startsWith('{projectRoot}/')) {
+      hasPositiveProjectInput = true;
+    }
+  }
+  return hasPositiveProjectInput;
 }
 
 function removeColonTargetDefaults(nxJson: Record<string, unknown>): boolean {
@@ -1508,15 +1583,17 @@ function targetExistsInResolvedProject(targetName: string, resolvedTargets?: Rea
 
 function setStringArrayProperty(record: Record<string, unknown>, key: string, value: string[]): boolean {
   const current = record[key];
-  if (
-    Array.isArray(current) &&
-    current.length === value.length &&
-    current.every((entry, index) => entry === value[index])
-  ) {
+  if (stringArrayEquals(current, value)) {
     return false;
   }
   record[key] = value;
   return true;
+}
+
+function stringArrayEquals(value: unknown, expected: readonly string[]): boolean {
+  return (
+    Array.isArray(value) && value.length === expected.length && value.every((entry, index) => entry === expected[index])
+  );
 }
 
 function targetDependsOn(target: Record<string, unknown>, expected: string[]): boolean {

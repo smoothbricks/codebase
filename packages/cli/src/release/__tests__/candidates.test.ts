@@ -115,6 +115,49 @@ describe('auto release candidate filtering', () => {
     });
   });
 
+  it('selects package changes from Nx build input patterns', async () => {
+    await withFixtureRepo(async (root) => {
+      await writePackage(root, a.name, a.path, a.version);
+      await git(root, ['add', '.']);
+      await git(root, ['commit', '-m', 'initial package']);
+      await tag(root, '@scope/a@1.0.0', '2025-01-01T00:00:00Z');
+
+      await mkdir(join(root, a.path, 'generated'), { recursive: true });
+      await writeFile(join(root, a.path, 'generated/schema.ts'), 'export const schema = 1;\n');
+      await git(root, ['add', join(a.path, 'generated/schema.ts')]);
+      await git(root, ['commit', '-m', 'fix(a): update generated build input']);
+
+      await expect(
+        autoReleaseCandidatePackages(gitCandidateShell(root, { buildInputPatterns: ['generated/**/*'] }), [a]),
+      ).resolves.toEqual([a]);
+    });
+  });
+
+  it('uses precise Nx production inputs to ignore config and test-only package paths', async () => {
+    await withFixtureRepo(async (root) => {
+      await writePackage(root, a.name, a.path, a.version);
+      await git(root, ['add', '.']);
+      await git(root, ['commit', '-m', 'initial package']);
+      await tag(root, '@scope/a@1.0.0', '2025-01-01T00:00:00Z');
+
+      const shell = gitCandidateShell(root, { buildInputPatterns: ['src/**/*.ts', '!src/**/*.test.ts'] });
+
+      await mkdir(join(root, a.path, 'src'), { recursive: true });
+      await writeFile(join(root, a.path, 'vite.config.ts'), 'export default {};\n');
+      await writeFile(join(root, a.path, 'src/index.test.ts'), 'export const testOnly = true;\n');
+      await git(root, ['add', join(a.path, 'vite.config.ts'), join(a.path, 'src/index.test.ts')]);
+      await git(root, ['commit', '-m', 'test(a): update local-only inputs']);
+
+      await expect(autoReleaseCandidatePackages(shell, [a])).resolves.toEqual([]);
+
+      await writeFile(join(root, a.path, 'src/index.ts'), 'export const shipped = true;\n');
+      await git(root, ['add', join(a.path, 'src/index.ts')]);
+      await git(root, ['commit', '-m', 'fix(a): update production input']);
+
+      await expect(autoReleaseCandidatePackages(shell, [a])).resolves.toEqual([a]);
+    });
+  });
+
   it('includes untagged packages only when their package path has history', async () => {
     await withFixtureRepo(async (root) => {
       await writePackage(root, c.name, c.path, c.version);
@@ -126,7 +169,7 @@ describe('auto release candidate filtering', () => {
   });
 });
 
-function gitCandidateShell(root: string): AutoReleaseCandidateShell {
+function gitCandidateShell(root: string, options: { buildInputPatterns?: string[] } = {}): AutoReleaseCandidateShell {
   return {
     gitRefExists: async (ref) => {
       const result = await $`git rev-parse --verify ${ref}`.cwd(root).quiet().nothrow();
@@ -154,6 +197,7 @@ function gitCandidateShell(root: string): AutoReleaseCandidateShell {
     },
     currentPackageJson: async (packagePath) =>
       parseJsonObject(await readFile(join(root, packagePath, 'package.json'), 'utf8')),
+    packageBuildInputPatterns: async () => options.buildInputPatterns ?? ['**/*'],
     packageHasHistory: async (packagePath) => {
       const result = await $`git log --format=%H -- ${packagePath}`.cwd(root).quiet().nothrow();
       if (result.exitCode !== 0) {

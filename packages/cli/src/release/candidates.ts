@@ -7,6 +7,7 @@ export interface AutoReleaseCandidateShell {
   packageChangedFilesSince(ref: string, packagePath: string): Promise<string[]>;
   packageJsonAtRef(ref: string, packagePath: string): Promise<Record<string, unknown> | null>;
   currentPackageJson(packagePath: string): Promise<Record<string, unknown> | null>;
+  packageBuildInputPatterns(projectName: string, packagePath: string): Promise<string[]>;
   packageHasHistory(packagePath: string): Promise<boolean>;
 }
 
@@ -74,6 +75,7 @@ async function packageHasReleasableChangesSince<Package extends ReleasePackageIn
     return false;
   }
   const currentManifest = await shell.currentPackageJson(pkg.path);
+  const buildInputPatterns = await shell.packageBuildInputPatterns(pkg.projectName, pkg.path);
   for (const changedFile of changedFiles) {
     if (changedFile === 'package.json') {
       const previousManifest = await shell.packageJsonAtRef(ref, pkg.path);
@@ -82,7 +84,7 @@ async function packageHasReleasableChangesSince<Package extends ReleasePackageIn
       }
       continue;
     }
-    if (isReleasablePackagePath(changedFile, currentManifest)) {
+    if (isReleasablePackagePath(changedFile, currentManifest, buildInputPatterns)) {
       return true;
     }
   }
@@ -101,14 +103,78 @@ function releasableManifestChanged(
   return false;
 }
 
-function isReleasablePackagePath(path: string, manifest: Record<string, unknown> | null): boolean {
+function isReleasablePackagePath(
+  path: string,
+  manifest: Record<string, unknown> | null,
+  buildInputPatterns: string[],
+): boolean {
   return (
-    path.startsWith('src/') ||
-    path.startsWith('bin/') ||
-    path.startsWith('dist/') ||
-    path.startsWith('managed/') ||
-    isPackageMetadataPath(path) ||
-    isManifestFilesPath(path, manifest)
+    isBuildInputPath(path, buildInputPatterns) || isPackageMetadataPath(path) || isManifestFilesPath(path, manifest)
+  );
+}
+
+function isBuildInputPath(path: string, patterns: string[]): boolean {
+  if (isReleaseIgnoredBuildInputPath(path)) {
+    return false;
+  }
+  let matched = false;
+  for (const pattern of patterns) {
+    const excluded = pattern.startsWith('!');
+    const rawPattern = excluded ? pattern.slice(1) : pattern;
+    if (matchesBuildInputPattern(path, rawPattern)) {
+      matched = !excluded;
+    }
+  }
+  return matched;
+}
+
+function matchesBuildInputPattern(path: string, pattern: string): boolean {
+  const normalized = pattern.replace(/^\.\//, '').replace(/\/$/, '');
+  if (!normalized) {
+    return false;
+  }
+  return globPatternToRegExp(normalized).test(path);
+}
+
+function globPatternToRegExp(pattern: string): RegExp {
+  let source = '^';
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index];
+    if (char === '*') {
+      if (pattern[index + 1] === '*') {
+        if (pattern[index + 2] === '/') {
+          source += '(?:.*/)?';
+          index += 2;
+        } else {
+          source += '.*';
+          index += 1;
+        }
+      } else {
+        source += '[^/]*';
+      }
+    } else {
+      source += escapeRegExpChar(char);
+    }
+  }
+  return new RegExp(`${source}$`);
+}
+
+function escapeRegExpChar(char: string | undefined): string {
+  if (!char) {
+    return '';
+  }
+  return /[\\^$+?.()|[\]{}]/.test(char) ? `\\${char}` : char;
+}
+
+function isReleaseIgnoredBuildInputPath(path: string): boolean {
+  return (
+    path === 'package.json' ||
+    path === 'tsconfig.test.json' ||
+    path.includes('/__tests__/') ||
+    path.endsWith('.test.ts') ||
+    path.endsWith('.test.tsx') ||
+    path.endsWith('.spec.ts') ||
+    path.endsWith('.spec.tsx')
   );
 }
 
