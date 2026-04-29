@@ -220,7 +220,12 @@ describe('workspace package script policy', () => {
       ],
     });
     try {
-      expect(validateWorkspaceDependencies(root)).toBe(7);
+      await writeJson(join(root, 'packages/native/tsconfig.lib.json'), {});
+      await writeFile(
+        join(root, 'packages/native/build.zig'),
+        'pub fn build(b: *std.Build) void { _ = b.step("wasm", "Build wasm"); }\n',
+      );
+      expect(validateWorkspaceDependencies(root)).toBe(6);
 
       const resolvedTargetsByProject = new Map([['native', new Set(['build', 'custom', 'tsc-js', 'zig-wasm'])]]);
       applyWorkspaceDependencyDefaults(root, { resolvedTargetsByProject });
@@ -233,7 +238,9 @@ describe('workspace package script policy', () => {
       });
       expect(native.nx).toEqual({
         name: 'native',
-        targets: {},
+        targets: {
+          build: { dependsOn: ['^build', 'tsc-js', 'zig-wasm', 'custom'] },
+        },
       });
       expect(validateWorkspaceDependencies(root, { resolvedTargetsByProject })).toBe(0);
     } finally {
@@ -241,7 +248,7 @@ describe('workspace package script policy', () => {
     }
   });
 
-  it('tells agents to remove explicit aggregate build targets instead of replacing colon targets with build', async () => {
+  it('keeps noop aggregate build targets when they contain unresolved dependency wiring', async () => {
     const root = await createWorkspace({
       rootName: '@smoothbricks/codebase',
       packages: [
@@ -251,26 +258,111 @@ describe('workspace package script policy', () => {
           nx: {
             name: 'native',
             targets: {
-              build: { executor: 'nx:noop', dependsOn: ['^build', 'build:wasm'] },
-              'build:wasm': {},
+              build: { executor: 'nx:noop', dependsOn: ['^build', 'tsc-js', 'zig-wasm', 'custom'] },
             },
           },
         },
       ],
     });
     try {
-      const errors = captureConsoleErrors();
+      await writeJson(join(root, 'packages/native/tsconfig.lib.json'), {});
+      await writeFile(
+        join(root, 'packages/native/build.zig'),
+        'pub fn build(b: *std.Build) void { _ = b.step("wasm", "Build wasm"); }\n',
+      );
+      const resolvedTargetsByProject = new Map([
+        [
+          'native',
+          { targets: new Set(['build', 'tsc-js', 'zig-wasm']), buildDependsOn: ['^build', 'tsc-js', 'zig-wasm'] },
+        ],
+      ]);
 
-      expect(validateWorkspaceDependencies(root)).toBe(3);
+      applyWorkspaceDependencyDefaults(root, { resolvedTargetsByProject });
 
-      const output = errors.join('\n');
-      expect(output).toContain('package.json nx.targets.build must not define the aggregate build target');
-      expect(output).toContain('@smoothbricks/nx-plugin infers build from concrete targets');
-      expect(output).toContain('Remove nx.targets.build and fix the concrete target inference instead');
-      expect(output).toContain('The aggregate build target is inferred; remove package.json nx.targets.build');
-      expect(output).toContain('Remove this target; colon names are only allowed as package-script aliases');
+      const native = await readJson(join(root, 'packages/native/package.json'));
+      expect(native.nx).toEqual({
+        name: 'native',
+        targets: {
+          build: { executor: 'nx:noop', dependsOn: ['^build', 'tsc-js', 'zig-wasm', 'custom'] },
+        },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 
-      applyWorkspaceDependencyDefaults(root);
+  it('keeps non-noop build targets even when their dependencies are resolved', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [
+        {
+          dir: 'native',
+          name: '@smoothbricks/native',
+          nx: {
+            name: 'native',
+            targets: {
+              build: {
+                executor: 'nx:run-commands',
+                options: { command: 'zig build wasm', cwd: '{projectRoot}' },
+                dependsOn: ['^build', 'zig-wasm'],
+              },
+            },
+          },
+        },
+      ],
+    });
+    try {
+      await writeFile(
+        join(root, 'packages/native/build.zig'),
+        'pub fn build(b: *std.Build) void { _ = b.step("wasm", "Build wasm"); }\n',
+      );
+      const resolvedTargetsByProject = new Map([
+        ['native', { targets: new Set(['build', 'zig-wasm']), buildDependsOn: ['^build', 'zig-wasm'] }],
+      ]);
+
+      applyWorkspaceDependencyDefaults(root, { resolvedTargetsByProject });
+
+      const native = await readJson(join(root, 'packages/native/package.json'));
+      expect(native.nx).toEqual({
+        name: 'native',
+        targets: {
+          build: {
+            executor: 'nx:run-commands',
+            options: { command: 'zig build wasm', cwd: '{projectRoot}' },
+            dependsOn: ['^build', 'zig-wasm'],
+          },
+        },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('removes noop aggregate build targets only when they match resolved Nx plugin output', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [
+        {
+          dir: 'native',
+          name: '@smoothbricks/native',
+          nx: {
+            name: 'native',
+            targets: {
+              build: { executor: 'nx:noop', dependsOn: ['^build', 'tsc-js', 'zig-wasm'] },
+            },
+          },
+        },
+      ],
+    });
+    try {
+      const resolvedTargetsByProject = new Map([
+        [
+          'native',
+          { targets: new Set(['build', 'tsc-js', 'zig-wasm']), buildDependsOn: ['^build', 'tsc-js', 'zig-wasm'] },
+        ],
+      ]);
+
+      applyWorkspaceDependencyDefaults(root, { resolvedTargetsByProject });
 
       const native = await readJson(join(root, 'packages/native/package.json'));
       expect(native.nx).toEqual({ name: 'native', targets: {} });

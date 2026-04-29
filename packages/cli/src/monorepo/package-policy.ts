@@ -24,7 +24,12 @@ import {
 } from '../lib/workspace.js';
 
 export interface WorkspaceDependencyDefaultOptions {
-  resolvedTargetsByProject?: ReadonlyMap<string, ReadonlySet<string>>;
+  resolvedTargetsByProject?: ReadonlyMap<string, ReadonlySet<string> | ResolvedProjectTargets>;
+}
+
+export interface ResolvedProjectTargets {
+  targets: ReadonlySet<string>;
+  buildDependsOn?: readonly string[];
 }
 
 export const SMOO_NX_VERSION_ACTIONS = '@smoothbricks/cli/nx-version-actions';
@@ -136,11 +141,12 @@ export function applyWorkspaceDependencyDefaults(root: string, options: Workspac
   for (const pkg of listPackageJsonRecords(root)) {
     let changed = fixWorkspaceDependencyRanges(pkg.json, workspaceNames);
     const projectName = packageNxProjectName(pkg.json);
-    const resolvedTargets = projectName ? options.resolvedTargetsByProject?.get(projectName) : undefined;
+    const resolvedProject = projectName ? options.resolvedTargetsByProject?.get(projectName) : undefined;
+    const resolvedTargets = resolvedProjectTargetNames(resolvedProject);
     changed = migratePackageColonTargets(pkg.json, resolvedTargets) || changed;
     changed = rewriteColonTargetDependenciesInPackage(pkg.json, resolvedTargets) || changed;
     changed = removePackageColonTargets(pkg.json) || changed;
-    changed = removePackageInferredAggregateTargets(pkg.json) || changed;
+    changed = removeRedundantNoopBuildTarget(pkg.json, resolvedProject) || changed;
     changed = applyPackageScriptPolicy(pkg.json, pkg.path, workspaceNames, { resolvedTargets }) || changed;
     if (changed) {
       writeJsonObject(pkg.packageJsonPath, pkg.json);
@@ -466,7 +472,9 @@ export function validateWorkspaceDependencies(root: string, options: WorkspaceDe
   let failures = 0;
   for (const pkg of listPackageJsonRecords(root)) {
     const projectName = packageNxProjectName(pkg.json);
-    const resolvedTargets = projectName ? options.resolvedTargetsByProject?.get(projectName) : undefined;
+    const resolvedTargets = resolvedProjectTargetNames(
+      projectName ? options.resolvedTargetsByProject?.get(projectName) : undefined,
+    );
     failures += validateExplicitNxTargets(pkg.json, pkg.path, resolvedTargets);
     failures += validateBunTestTsconfigPresence(root, pkg.path, pkg.json);
     failures += validateTsconfigTestPolicy(root, pkg.path);
@@ -742,20 +750,12 @@ function validateExplicitNxTargets(
     if (targetName.includes(':')) {
       console.error(
         `${packagePath}: package.json nx.targets.${targetName} must not use colon target names. ` +
-          'Nx CLI syntax already uses project:target:configuration. Remove this target; colon names are only allowed as package-script aliases, and convention targets such as tsc-js, typecheck-tests, zig-<step>, build, and lint are inferred.',
+          'Nx CLI syntax already uses project:target:configuration; use a concrete tool-output target name and keep colon names only as package-script aliases.',
       );
       failures++;
     }
     if (!isRecord(rawTarget)) {
       continue;
-    }
-    if (targetName === 'build' && isInferredAggregateBuildTarget(rawTarget)) {
-      console.error(
-        `${packagePath}: package.json nx.targets.build must not define the aggregate build target. ` +
-          `${smoothBricksNxPlugin} infers build from concrete targets such as tsc-js and zig-<step>. ` +
-          'Remove nx.targets.build and fix the concrete target inference instead.',
-      );
-      failures++;
     }
     failures += validateTargetDependencies(rawTarget, `${packagePath}: nx.targets.${targetName}`, resolvedTargets);
   }
@@ -776,13 +776,7 @@ function validateTargetDependencies(
       continue;
     }
     if (dependency.includes(':')) {
-      const aggregateBuildHint = label.endsWith('nx.targets.build')
-        ? ' The aggregate build target is inferred; remove package.json nx.targets.build and make the concrete target exist instead.'
-        : '';
-      console.error(
-        `${label}.dependsOn must not include colon target dependency ${dependency}. ` +
-          `Colon names are only package-script aliases; use inferred concrete targets such as tsc-js or zig-<step>.${aggregateBuildHint}`,
-      );
+      console.error(`${label}.dependsOn must not include colon target dependency ${dependency}`);
       failures++;
       continue;
     }
@@ -1069,10 +1063,7 @@ function validateBuildZigPolicy(root: string, packagePath: string): number {
   if (/\bb\.step\s*\(/.test(readFileSync(path, 'utf8'))) {
     return 0;
   }
-  console.error(
-    `${packagePath}/build.zig must define at least one b.step(...) target so ${smoothBricksNxPlugin} can infer Zig targets. ` +
-      'For example, b.step("wasm", "...") infers nx target zig-wasm. Do not define package.json nx.targets.build manually.',
-  );
+  console.error(`${packagePath}/build.zig must define at least one b.step(...) target`);
   return 1;
 }
 
@@ -1186,24 +1177,80 @@ function removePackageColonTargets(pkg: Record<string, unknown>): boolean {
   return changed;
 }
 
-function removePackageInferredAggregateTargets(pkg: Record<string, unknown>): boolean {
+function resolvedProjectTargetNames(
+  resolvedProject?: ReadonlySet<string> | ResolvedProjectTargets,
+): ReadonlySet<string> | undefined {
+  if (!resolvedProject) {
+    return undefined;
+  }
+  return isResolvedProjectTargets(resolvedProject) ? resolvedProject.targets : resolvedProject;
+}
+
+function resolvedProjectBuildDependsOn(
+  resolvedProject?: ReadonlySet<string> | ResolvedProjectTargets,
+): readonly string[] | undefined {
+  if (!isResolvedProjectTargets(resolvedProject)) {
+    return undefined;
+  }
+  return resolvedProject.buildDependsOn;
+}
+
+function isResolvedProjectTargets(
+  value: ReadonlySet<string> | ResolvedProjectTargets | undefined,
+): value is ResolvedProjectTargets {
+  return isRecord(value) && value.targets instanceof Set;
+}
+
+function removeRedundantNoopBuildTarget(
+  pkg: Record<string, unknown>,
+  resolvedProject?: ReadonlySet<string> | ResolvedProjectTargets,
+): boolean {
+  const resolvedTargets = resolvedProjectTargetNames(resolvedProject);
+  const resolvedBuildDependsOn = resolvedProjectBuildDependsOn(resolvedProject);
+  if (!resolvedTargets?.has('build') || !resolvedBuildDependsOn) {
+    return false;
+  }
   const nx = recordProperty(pkg, 'nx');
   const targets = nx ? recordProperty(nx, 'targets') : null;
   const build = targets ? recordProperty(targets, 'build') : null;
-  if (!targets || !build || !isInferredAggregateBuildTarget(build)) {
+  if (
+    !targets ||
+    !build ||
+    !isNoopTarget(build) ||
+    !targetDependenciesMatchResolvedBuild(build, resolvedBuildDependsOn)
+  ) {
     return false;
   }
   delete targets.build;
   return true;
 }
 
-function isInferredAggregateBuildTarget(target: Record<string, unknown>): boolean {
-  const options = recordProperty(target, 'options');
-  if (options && stringProperty(options, 'command')) {
+function isNoopTarget(target: Record<string, unknown>): boolean {
+  const executor = stringProperty(target, 'executor');
+  if (executor !== null && executor !== 'nx:noop') {
     return false;
   }
-  const executor = stringProperty(target, 'executor');
-  return executor === null || executor === 'nx:noop';
+  const options = recordProperty(target, 'options');
+  return !options || stringProperty(options, 'command') === null;
+}
+
+function targetDependenciesMatchResolvedBuild(
+  target: Record<string, unknown>,
+  resolvedBuildDependsOn: readonly string[],
+): boolean {
+  if (!Array.isArray(target.dependsOn)) {
+    return false;
+  }
+  const expected = new Set(resolvedBuildDependsOn);
+  if (target.dependsOn.length !== expected.size) {
+    return false;
+  }
+  return target.dependsOn.every((dependency) => {
+    if (typeof dependency !== 'string') {
+      return false;
+    }
+    return expected.has(dependency);
+  });
 }
 
 function migratePackageColonTargets(pkg: Record<string, unknown>, resolvedTargets?: ReadonlySet<string>): boolean {

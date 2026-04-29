@@ -11,6 +11,7 @@ import {
   applyNxReleaseDefaults,
   applyPublicPackageDefaults,
   applyWorkspaceDependencyDefaults,
+  type ResolvedProjectTargets,
   validateNxProjectNames,
   validateNxReleaseConfig,
   validatePublicPackageMetadata,
@@ -382,9 +383,17 @@ function printCapturedOutput(output: CapturedOutput): void {
   }
 }
 
-async function readResolvedTargetsByProject(ctx: MonorepoContext): Promise<Map<string, ReadonlySet<string>>> {
+async function readResolvedTargetsByProject(ctx: MonorepoContext): Promise<Map<string, ResolvedProjectTargets>> {
   const projects = await readProjectTargets(ctx.root);
-  return new Map(projects.map((project) => [project.project, new Set(project.targets)]));
+  return new Map(
+    projects.map((project) => [
+      project.project,
+      {
+        targets: new Set(project.targets),
+        ...(project.buildDependsOn ? { buildDependsOn: project.buildDependsOn } : {}),
+      },
+    ]),
+  );
 }
 
 function ensureLocalSmooShim(root: string): void {
