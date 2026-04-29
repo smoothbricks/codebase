@@ -9,6 +9,7 @@
         "@nx/eslint": "22.0.3",
         "@nx/expo": "22.0.3",
         "@nx/js": "22.0.3",
+        "@smoothbricks/nx-plugin": "workspace:*",
         "@swc-node/register": "~1.9.1",
         "@swc/core": "~1.5.7",
         "@swc/helpers": "~0.5.11",

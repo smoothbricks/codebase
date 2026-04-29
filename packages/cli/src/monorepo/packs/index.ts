@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { runStatus } from '../../lib/run.js';
+import { readProjectTargets } from '../../nx/index.js';
 import { syncBunLockfileVersions, validateBunLockfileVersions } from '../lockfile.js';
 import { validateManagedFiles } from '../managed-files.js';
 import { fixNxSync, validateNxSync } from '../nx-sync.js';
@@ -17,18 +18,24 @@ import {
   validateRootPackagePolicy,
   validateWorkspaceDependencies,
 } from '../package-policy.js';
-import { validatePackedPublicPackages } from '../packed-package.js';
+import {
+  validatePackedPublicPackageManifest,
+  validatePackedPublicPackagePublint,
+  validatePackedPublicPackageTypes,
+} from '../packed-package.js';
 import { syncRootRuntimeVersions } from '../runtime.js';
 import { applyToolConfigDefaults, validateToolConfig } from '../tool-validation.js';
 
 export interface MonorepoContext {
   root: string;
   syncRuntime: boolean;
+  verbose?: boolean;
 }
 
 export interface ValidatePackOptions {
   failFast?: boolean;
   fix?: boolean;
+  verbose?: boolean;
 }
 
 export interface MonorepoPack {
@@ -42,7 +49,17 @@ export interface MonorepoPack {
 
 export interface ValidatePackRunHooks {
   packs?: readonly MonorepoPack[];
-  runBuild?: (ctx: MonorepoContext) => Promise<number> | number;
+  runBuild?: (ctx: MonorepoContext, options?: ValidatePackOptions) => Promise<number> | number;
+}
+
+export interface ValidatePackResult {
+  failures: number;
+  failedChecks: number;
+}
+
+interface CapturedOutput {
+  logs: string[];
+  errors: string[];
 }
 
 const packs: MonorepoPack[] = [
@@ -61,7 +78,8 @@ const packs: MonorepoPack[] = [
       applyFixableMonorepoDefaults(ctx.root);
       await applyToolConfigDefaults(ctx.root);
       syncBunLockfileVersions(ctx.root);
-      await fixNxSync(ctx.root);
+      await fixNxSync(ctx.root, ctx.verbose === true);
+      applyWorkspaceDependencyDefaults(ctx.root, { resolvedTargetsByProject: await readResolvedTargetsByProject(ctx) });
     },
     async validatePreBuild(ctx) {
       return (
@@ -71,7 +89,7 @@ const packs: MonorepoPack[] = [
         validateNxProjectNames(ctx.root) +
         validateNxReleaseConfig(ctx.root) +
         validateBunLockfileVersions(ctx.root) +
-        (await validateNxSync(ctx.root))
+        (await validateNxSync(ctx.root, ctx.verbose === true))
       );
     },
   },
@@ -89,22 +107,46 @@ const packs: MonorepoPack[] = [
   },
   {
     name: 'workspace-dependencies',
-    async init(ctx) {
+    init(ctx) {
       applyWorkspaceDependencyDefaults(ctx.root);
-      await fixPackageHygiene(ctx.root);
     },
     async fixPostBuild(ctx) {
-      applyWorkspaceDependencyDefaults(ctx.root);
-      await fixPackageHygiene(ctx.root);
+      applyWorkspaceDependencyDefaults(ctx.root, { resolvedTargetsByProject: await readResolvedTargetsByProject(ctx) });
     },
     async validatePostBuild(ctx) {
-      return validateWorkspaceDependencies(ctx.root) + (await validatePackageHygiene(ctx.root));
+      return validateWorkspaceDependencies(ctx.root, {
+        resolvedTargetsByProject: await readResolvedTargetsByProject(ctx),
+      });
     },
   },
   {
-    name: 'packed-packages',
+    name: 'package-hygiene',
+    async init(ctx) {
+      await fixPackageHygiene(ctx.root, ctx.verbose === true);
+    },
+    async fixPostBuild(ctx) {
+      await fixPackageHygiene(ctx.root);
+    },
+    async validatePostBuild(ctx) {
+      return validatePackageHygiene(ctx.root, ctx.verbose === true);
+    },
+  },
+  {
+    name: 'packed-package-publint',
     validatePostBuild(ctx) {
-      return validatePackedPublicPackages(ctx.root);
+      return validatePackedPublicPackagePublint(ctx.root);
+    },
+  },
+  {
+    name: 'packed-package-manifest',
+    validatePostBuild(ctx) {
+      return validatePackedPublicPackageManifest(ctx.root);
+    },
+  },
+  {
+    name: 'packed-package-types',
+    validatePostBuild(ctx) {
+      return validatePackedPublicPackageTypes(ctx.root);
     },
   },
 ];
@@ -119,37 +161,31 @@ export async function runValidatePacks(
   ctx: MonorepoContext,
   options: ValidatePackOptions = {},
   hooks: ValidatePackRunHooks = {},
-): Promise<number> {
+): Promise<ValidatePackResult> {
   const selectedPacks = hooks.packs ?? packs;
   const build = hooks.runBuild ?? runBuild;
 
   if (options.fix) {
     await runFixPhase(ctx, selectedPacks, 'pre-build', 'fixPreBuild');
-    const buildFailures = await build(ctx);
+    const buildFailures = await build(ctx, options);
     if (buildFailures > 0) {
-      return buildFailures;
+      return { failures: buildFailures, failedChecks: 1 };
     }
     await runFixPhase(ctx, selectedPacks, 'post-build', 'fixPostBuild');
     return runValidationPhases(ctx, selectedPacks, options, false);
   }
 
-  const preBuildFailures = await runValidationPhase(
-    ctx,
-    selectedPacks,
-    options,
-    'pre-build',
-    'validatePreBuild',
-    false,
-  );
-  if (preBuildFailures > 0 && options.failFast) {
-    return preBuildFailures;
+  const preBuild = await runValidationPhase(ctx, selectedPacks, options, 'pre-build', 'validatePreBuild', false);
+  if (preBuild.failures > 0 && options.failFast) {
+    return preBuild;
   }
-  const buildFailures = await build(ctx);
+  const buildFailures = await build(ctx, options);
   if (buildFailures > 0) {
-    return preBuildFailures + buildFailures;
+    return { failures: preBuild.failures + buildFailures, failedChecks: preBuild.failedChecks + 1 };
   }
-  return (
-    preBuildFailures + (await runValidationPhase(ctx, selectedPacks, options, 'post-build', 'validatePostBuild', true))
+  return sumResults(
+    preBuild,
+    await runValidationPhase(ctx, selectedPacks, options, 'post-build', 'validatePostBuild', true),
   );
 }
 
@@ -158,8 +194,8 @@ async function runValidationPhases(
   selectedPacks: readonly MonorepoPack[],
   options: ValidatePackOptions,
   printedBefore: boolean,
-): Promise<number> {
-  const preBuildFailures = await runValidationPhase(
+): Promise<ValidatePackResult> {
+  const preBuild = await runValidationPhase(
     ctx,
     selectedPacks,
     options,
@@ -167,11 +203,12 @@ async function runValidationPhases(
     'validatePreBuild',
     printedBefore,
   );
-  if (preBuildFailures > 0 && options.failFast) {
-    return preBuildFailures;
+  if (preBuild.failures > 0 && options.failFast) {
+    return preBuild;
   }
-  return (
-    preBuildFailures + (await runValidationPhase(ctx, selectedPacks, options, 'post-build', 'validatePostBuild', true))
+  return sumResults(
+    preBuild,
+    await runValidationPhase(ctx, selectedPacks, options, 'post-build', 'validatePostBuild', true),
   );
 }
 
@@ -182,8 +219,9 @@ async function runValidationPhase(
   phase: 'pre-build' | 'post-build',
   method: 'validatePreBuild' | 'validatePostBuild',
   printedBefore: boolean,
-): Promise<number> {
+): Promise<ValidatePackResult> {
   let failures = 0;
+  let failedChecks = 0;
   let checkedPacks = 0;
   let hasPrinted = printedBefore;
   for (const pack of selectedPacks) {
@@ -191,16 +229,50 @@ async function runValidationPhase(
     if (!validate) {
       continue;
     }
-    console.log(`${hasPrinted || checkedPacks > 0 ? '\n' : ''}== ${pack.name} (${phase}) ==`);
+    const label = `${pack.name} (${phase})`;
+    if (options.verbose) {
+      printCheckHeading(label, hasPrinted || checkedPacks > 0);
+    }
     hasPrinted = true;
     checkedPacks++;
-    const packFailures = await validate(ctx);
+    let packFailures: number;
+    let output = emptyCapturedOutput();
+    try {
+      if (options.verbose) {
+        packFailures = await validate(ctx);
+      } else {
+        const captured = await captureConsoleOutput(() => validate(ctx));
+        packFailures = captured.result;
+        output = captured.output;
+      }
+    } catch (error) {
+      if (!options.verbose) {
+        printCheckHeading(label, true);
+        if (error instanceof CapturedConsoleError) {
+          output = error.output;
+        }
+        printCapturedOutput(output);
+      }
+      throw error instanceof CapturedConsoleError ? error.cause : error;
+    }
     failures += packFailures;
+    if (packFailures > 0) {
+      failedChecks++;
+    }
+    if (!options.verbose && packFailures > 0) {
+      printCheckHeading(label, true);
+      printCapturedOutput(output);
+    }
+    printCheckStatus(label, packFailures);
     if (packFailures > 0 && options.failFast) {
       break;
     }
   }
-  return failures;
+  return { failures, failedChecks };
+}
+
+function sumResults(left: ValidatePackResult, right: ValidatePackResult): ValidatePackResult {
+  return { failures: left.failures + right.failures, failedChecks: left.failedChecks + right.failedChecks };
 }
 
 async function runFixPhase(
@@ -215,20 +287,104 @@ async function runFixPhase(
     if (!fix) {
       continue;
     }
-    console.log(`${checkedPacks === 0 ? '' : '\n'}== ${pack.name} (${phase} fix) ==`);
+    const label = `${pack.name} (${phase} fix)`;
+    if (ctx.verbose) {
+      printCheckHeading(label, checkedPacks > 0);
+    }
     checkedPacks++;
-    await fix(ctx);
+    if (ctx.verbose) {
+      await fix(ctx);
+      continue;
+    }
+    let output = emptyCapturedOutput();
+    try {
+      output = (await captureConsoleOutput(() => fix(ctx))).output;
+    } catch (error) {
+      if (error instanceof CapturedConsoleError) {
+        output = error.output;
+      }
+      printCheckHeading(label, true);
+      printCapturedOutput(output);
+      throw error instanceof CapturedConsoleError ? error.cause : error;
+    }
   }
 }
 
-async function runBuild(ctx: MonorepoContext): Promise<number> {
-  console.log('\n== build ==');
-  const status = await runStatus('nx', ['run-many', '-t', 'build'], ctx.root);
+async function runBuild(ctx: MonorepoContext, options: ValidatePackOptions = {}): Promise<number> {
+  if (options.verbose) {
+    printCheckHeading('build', true);
+  }
+  const status = await runStatus('nx', ['run-many', '-t', 'build'], ctx.root, options.verbose !== true);
   if (status !== 0) {
+    if (!options.verbose) {
+      printCheckHeading('build', true);
+    }
     console.error('nx run-many -t build failed');
+    printCheckStatus('build', 1);
     return 1;
   }
+  printCheckStatus('build', 0);
   return 0;
+}
+
+function printCheckStatus(label: string, failures: number): void {
+  if (failures === 0) {
+    console.log(`🆗 ${label}`);
+    return;
+  }
+  const noun = failures === 1 ? 'problem' : 'problems';
+  console.log(`👎 ${label} (${failures} ${noun})\n`);
+}
+
+function printCheckHeading(label: string, separate: boolean): void {
+  console.log(`${separate ? '\n' : ''}== ${label} ==`);
+}
+
+function emptyCapturedOutput(): CapturedOutput {
+  return { logs: [], errors: [] };
+}
+
+async function captureConsoleOutput<T>(fn: () => Promise<T> | T): Promise<{ result: T; output: CapturedOutput }> {
+  const output = emptyCapturedOutput();
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (...args: unknown[]) => {
+    output.logs.push(args.join(' '));
+  };
+  console.error = (...args: unknown[]) => {
+    output.errors.push(args.join(' '));
+  };
+  try {
+    return { result: await fn(), output };
+  } catch (error) {
+    throw new CapturedConsoleError(error, output);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+}
+
+class CapturedConsoleError extends Error {
+  constructor(
+    public override readonly cause: unknown,
+    public readonly output: CapturedOutput,
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause));
+  }
+}
+
+function printCapturedOutput(output: CapturedOutput): void {
+  for (const line of output.logs) {
+    console.log(line);
+  }
+  for (const line of output.errors) {
+    console.log(line);
+  }
+}
+
+async function readResolvedTargetsByProject(ctx: MonorepoContext): Promise<Map<string, ReadonlySet<string>>> {
+  const projects = await readProjectTargets(ctx.root);
+  return new Map(projects.map((project) => [project.project, new Set(project.targets)]));
 }
 
 function ensureLocalSmooShim(root: string): void {

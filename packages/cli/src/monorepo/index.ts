@@ -19,6 +19,7 @@ export interface ValidateOptions {
   failFast?: boolean;
   onlyIfNewWorkspacePackage?: boolean;
   fix?: boolean;
+  verbose?: boolean;
 }
 
 export interface ValidateCommitMessageOptions {
@@ -44,13 +45,20 @@ export async function validateMonorepo(root: string, options: ValidateOptions = 
   if (options.onlyIfNewWorkspacePackage && !(await hasNewWorkspacePackage(root))) {
     return;
   }
-  const failures = await runValidatePacks({ root, syncRuntime: false }, options);
-  if (failures > 0) {
-    const noun = failures === 1 ? 'problem' : 'problems';
-    throw new Error(`\n== summary ==\n❌ Monorepo validation failed with ${failures} ${noun}.`);
+  const result = await runValidatePacks({ root, syncRuntime: false, verbose: options.verbose === true }, options);
+  if (result.failures > 0) {
+    const checkNoun = result.failedChecks === 1 ? 'check' : 'checks';
+    const problemNoun = result.failures === 1 ? 'problem' : 'problems';
+    throw new Error(
+      `\n🔴 Monorepo validation failed: ${result.failedChecks} ${checkNoun} failed with ${result.failures} ${problemNoun}.`,
+    );
   }
-  console.log('\n== summary ==');
-  console.log('Monorepo configuration is valid.');
+  if (options.verbose) {
+    console.log('\n== summary ==');
+    console.log('Monorepo configuration is valid.');
+  } else {
+    console.log('🟢 Monorepo configuration is valid.');
+  }
 }
 
 export function updateManagedFiles(root: string): void {

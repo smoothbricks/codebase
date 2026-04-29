@@ -21,6 +21,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['tsc-js']).toBeUndefined();
       expect(targets.build).toEqual({
         executor: 'nx:noop',
+        cache: true,
         dependsOn: ['^build', 'tsc-js'],
       });
       expect(targets['typecheck-tests']).toEqual({
@@ -34,6 +35,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       });
       expect(targets.lint).toEqual({
         executor: 'nx:noop',
+        cache: true,
         dependsOn: ['typecheck', 'typecheck-tests'],
       });
     } finally {
@@ -64,6 +66,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       expect(Object.keys(targets).sort()).toEqual(['build', 'zig-native', 'zig-wasm']);
       expect(targets.build?.dependsOn).toEqual(['^build', 'zig-wasm', 'zig-native']);
+      expect(targets.build?.cache).toBe(true);
+      expect(targets['zig-wasm']?.cache).toBe(true);
+      expect(targets['zig-native']?.cache).toBe(true);
       expect(targets['zig-wasm']?.options).toEqual({
         command: 'zig build wasm',
         cwd: 'packages/ziggy',

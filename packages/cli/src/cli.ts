@@ -42,10 +42,18 @@ function buildProgram(): Command {
     .option('--fix', 'apply safe monorepo policy fixes before validation')
     .option('--fail-fast', 'stop after the first failing validation pack')
     .option('--only-if-new-workspace-package', 'skip validation unless a new workspace package manifest is staged')
-    .action(async (options: { fix?: boolean; failFast?: boolean; onlyIfNewWorkspacePackage?: boolean }) => {
-      const { validateMonorepo } = await import('./monorepo/index.js');
-      await validateMonorepo(await findRepoRoot(), options);
-    });
+    .option('--verbose', 'print validation progress and successful checks')
+    .action(
+      async (options: {
+        fix?: boolean;
+        failFast?: boolean;
+        onlyIfNewWorkspacePackage?: boolean;
+        verbose?: boolean;
+      }) => {
+        const { validateMonorepo } = await import('./monorepo/index.js');
+        await validateMonorepo(await findRepoRoot(), options);
+      },
+    );
   monorepo.command('update').action(async () => {
     const { updateManagedFiles } = await import('./monorepo/index.js');
     updateManagedFiles(await findRepoRoot());

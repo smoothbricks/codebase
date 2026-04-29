@@ -116,13 +116,14 @@
           "targetName": "typecheck"
         },
         "build": {
-          "targetName": "build",
+          "targetName": "tsc-js",
           "configName": "tsconfig.lib.json",
           "buildDepsName": "build-deps",
           "watchDepsName": "watch-deps"
         }
       }
-    }
+    },
+    "@smoothbricks/nx-plugin"
   ],
   "release": {
     "projectsRelationship": "independent",

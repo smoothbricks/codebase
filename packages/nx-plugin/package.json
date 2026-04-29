@@ -4,21 +4,32 @@
   "private": true,
   "type": "module",
   "sideEffects": false,
-  "main": "./dist/index.js",
+  "main": "./loader.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "generators": "./generators.json",
   "scripts": {
-    "test": "bun test"
+    "test": "nx run nx-plugin:test"
   },
   "nx": {
     "targets": {
-      "lint": {}
+      "lint": {},
+      "test": {
+        "executor": "nx:run-commands",
+        "dependsOn": [
+          "^build"
+        ],
+        "options": {
+          "command": "bun test",
+          "cwd": "{projectRoot}"
+        }
+      }
     },
     "name": "nx-plugin"
   },
   "files": [
     "dist",
+    "loader.js",
     "generators.json",
     "!**/*.tsbuildinfo"
   ],

@@ -25,19 +25,19 @@ describe('root smoo monorepo policy', () => {
       await writeJson(join(root, 'nx.json'), validNxJson());
 
       expect(validateRootPackagePolicy(root)).toBe(4);
-      expect(validateNxReleaseConfig(root)).toBe(3);
+      expect(validateNxReleaseConfig(root)).toBe(5);
 
       applyFixableMonorepoDefaults(root);
 
       const rootPackage = await readJson(join(root, 'package.json'));
       const nxJson = await readJson(join(root, 'nx.json'));
       expect(rootPackage.scripts).toEqual({
+        'format:changed': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --also-unstaged',
+        'format:staged': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml',
         lint: 'nx run-many -t lint',
         'lint:fix': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --unstaged',
-        'format:staged': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml',
-        'format:changed': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --also-unstaged',
       });
-      expect(nxJson.targetDefaults).toEqual({});
+      expect(nxJson.targetDefaults).toEqual({ build: { cache: true, outputs: ['{projectRoot}/dist'] } });
       expect(nxJson.plugins).toEqual([
         {
           plugin: '@nx/js/typescript',
@@ -72,12 +72,12 @@ describe('root smoo monorepo policy', () => {
         },
       });
 
-      expect(validateNxReleaseConfig(root)).toBe(2);
+      expect(validateNxReleaseConfig(root)).toBe(4);
 
       applyFixableMonorepoDefaults(root);
 
       const nxJson = await readJson(join(root, 'nx.json'));
-      expect(nxJson.targetDefaults).toEqual({});
+      expect(nxJson.targetDefaults).toEqual({ build: { cache: true, outputs: ['{projectRoot}/dist'] } });
       expect(validateNxReleaseConfig(root)).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -176,11 +176,104 @@ describe('workspace package script policy', () => {
     try {
       expect(validateWorkspaceDependencies(root)).toBe(2);
 
-      applyWorkspaceDependencyDefaults(root);
+      const resolvedTargetsByProject = new Map([['native', new Set(['build', 'tsc-js', 'zig-wasm'])]]);
+      applyWorkspaceDependencyDefaults(root, { resolvedTargetsByProject });
 
       const native = await readJson(join(root, 'packages/native/package.json'));
       expect(native.nx).toEqual({ name: 'native', targets: {} });
       expect(validateWorkspaceDependencies(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('migrates colon build target aliases before removing colon targets', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [
+        { dir: 'lib', name: '@smoothbricks/lib', nx: { name: 'lib' } },
+        {
+          dir: 'native',
+          name: '@smoothbricks/native',
+          dependencies: { '@smoothbricks/lib': 'workspace:*' },
+          scripts: {
+            'build:custom': 'nx run native:build:custom',
+            'build:zig': 'nx run native:build:zig',
+            'build:ts': 'nx run native:build:ts',
+          },
+          nx: {
+            name: 'native',
+            targets: {
+              build: { dependsOn: ['^build', 'build:ts', 'build:zig', 'build:custom'] },
+              'build:custom': {},
+              'build:zig': {
+                executor: 'nx:run-commands',
+                options: { command: 'zig build wasm', cwd: '{projectRoot}' },
+              },
+              'build:ts': {
+                executor: 'nx:run-commands',
+                options: { command: 'tsc --build tsconfig.lib.json', cwd: '{projectRoot}' },
+              },
+            },
+          },
+        },
+      ],
+    });
+    try {
+      expect(validateWorkspaceDependencies(root)).toBe(7);
+
+      const resolvedTargetsByProject = new Map([['native', new Set(['build', 'custom', 'tsc-js', 'zig-wasm'])]]);
+      applyWorkspaceDependencyDefaults(root, { resolvedTargetsByProject });
+
+      const native = await readJson(join(root, 'packages/native/package.json'));
+      expect(native.scripts).toEqual({
+        'build:custom': 'nx run native:custom',
+        'build:zig': 'nx run native:zig-wasm',
+        'build:ts': 'nx run native:tsc-js',
+      });
+      expect(native.nx).toEqual({
+        name: 'native',
+        targets: {},
+      });
+      expect(validateWorkspaceDependencies(root, { resolvedTargetsByProject })).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('tells agents to remove explicit aggregate build targets instead of replacing colon targets with build', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [
+        {
+          dir: 'native',
+          name: '@smoothbricks/native',
+          nx: {
+            name: 'native',
+            targets: {
+              build: { executor: 'nx:noop', dependsOn: ['^build', 'build:wasm'] },
+              'build:wasm': {},
+            },
+          },
+        },
+      ],
+    });
+    try {
+      const errors = captureConsoleErrors();
+
+      expect(validateWorkspaceDependencies(root)).toBe(3);
+
+      const output = errors.join('\n');
+      expect(output).toContain('package.json nx.targets.build must not define the aggregate build target');
+      expect(output).toContain('@smoothbricks/nx-plugin infers build from concrete targets');
+      expect(output).toContain('Remove nx.targets.build and fix the concrete target inference instead');
+      expect(output).toContain('The aggregate build target is inferred; remove package.json nx.targets.build');
+      expect(output).toContain('Remove this target; colon names are only allowed as package-script aliases');
+
+      applyWorkspaceDependencyDefaults(root);
+
+      const native = await readJson(join(root, 'packages/native/package.json'));
+      expect(native.nx).toEqual({ name: 'native', targets: {} });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -615,7 +708,7 @@ function validNxJson(): Record<string, unknown> {
 function validConfiguredNxJson(): Record<string, unknown> {
   return {
     ...validNxJson(),
-    targetDefaults: {},
+    targetDefaults: { build: { cache: true, outputs: ['{projectRoot}/dist'] } },
     plugins: [
       {
         plugin: '@nx/js/typescript',

@@ -1,10 +1,21 @@
 #!/usr/bin/env bun
 import { mkdir, rmdir } from 'node:fs/promises';
+import path from 'node:path';
 import { $ } from 'bun';
-import path from 'path';
 
 const devenvRoot = process.env.DEVENV_ROOT;
 const projectRoot = path.resolve(`${devenvRoot}/../..`);
+
+class CapturedCommandError extends Error {
+  constructor(
+    public readonly command: string,
+    public readonly exitCode: number,
+    public readonly stdout: Uint8Array,
+    public readonly stderr: Uint8Array,
+  ) {
+    super(`${command} failed with exit code ${exitCode}`);
+  }
+}
 
 // Go to project root
 process.chdir(projectRoot);
@@ -25,12 +36,6 @@ try {
   } else {
     await installLocalDependencies();
   }
-
-  // Make sure Biome is executable
-  await runSetupCommand(
-    `chmod +x ${projectRoot}/node_modules/@biomejs/biome/bin/biome`,
-    $`chmod +x ${projectRoot}/node_modules/@biomejs/biome/bin/biome`,
-  );
 
   if (!process.env.CI) {
     const { syncRootRuntimeVersions } = await import('@smoothbricks/cli/monorepo/runtime');
@@ -112,16 +117,5 @@ function replayCapturedOutput(error: unknown): void {
   }
   if (error.stderr.length > 0) {
     process.stderr.write(error.stderr);
-  }
-}
-
-class CapturedCommandError extends Error {
-  constructor(
-    public readonly command: string,
-    public readonly exitCode: number,
-    public readonly stdout: Uint8Array,
-    public readonly stderr: Uint8Array,
-  ) {
-    super(`${command} failed with exit code ${exitCode}`);
   }
 }

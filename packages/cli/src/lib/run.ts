@@ -26,6 +26,25 @@ export async function runStatus(
   return result.exitCode;
 }
 
+export async function runResult(
+  command: string,
+  args: string[],
+  cwd: string,
+  env?: Record<string, string>,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const invocation = resolveCommandInvocation(cwd, command, args);
+  let shell = $`${invocation.command} ${invocation.args}`.cwd(cwd).nothrow().quiet();
+  if (env) {
+    shell = shell.env(mergeEnv(env));
+  }
+  const result = await shell;
+  return {
+    exitCode: result.exitCode,
+    stdout: decode(result.stdout),
+    stderr: decode(result.stderr),
+  };
+}
+
 function mergeEnv(env: Record<string, string>): Record<string, string> {
   const merged: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
