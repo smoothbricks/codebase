@@ -41,13 +41,14 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
   const targets: Record<string, TargetConfiguration> = {};
   const buildComponents: string[] = [];
   const validationTargets: string[] = [];
+  const hasLibTsconfig = existsSync(join(absoluteProjectRoot, 'tsconfig.lib.json'));
 
-  if (existsSync(join(absoluteProjectRoot, 'tsconfig.lib.json'))) {
+  if (hasLibTsconfig) {
     buildComponents.push('tsc-js');
-    validationTargets.push('typecheck');
   }
 
-  if (existsSync(join(absoluteProjectRoot, 'tsconfig.test.json'))) {
+  const hasTestTsconfig = existsSync(join(absoluteProjectRoot, 'tsconfig.test.json'));
+  if (hasTestTsconfig) {
     targets['typecheck-tests'] = {
       executor: 'nx:run-commands',
       cache: true,
@@ -57,6 +58,8 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       },
     };
     validationTargets.push('typecheck-tests');
+  } else if (hasLibTsconfig) {
+    validationTargets.push('typecheck');
   }
 
   const zigSteps = await readZigSteps(absoluteProjectRoot, projectRoot);
@@ -90,8 +93,12 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     };
   }
 
-  if (targets['typecheck-tests'] && targets.build) {
-    targets['typecheck-tests'].dependsOn = ['build'];
+  if (targets['typecheck-tests']) {
+    if (hasLibTsconfig) {
+      targets['typecheck-tests'].dependsOn = ['typecheck'];
+    } else if (targets.build) {
+      targets['typecheck-tests'].dependsOn = ['build'];
+    }
   }
 
   if (validationTargets.length > 0) {

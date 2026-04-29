@@ -34,4 +34,7 @@ pub fn build(b: *std.Build) void {
         "allocator.wasm",
     );
     b.getInstallStep().dependOn(&copy_wasm.step);
+
+    const wasm_step = b.step("wasm", "Build allocator WASM");
+    wasm_step.dependOn(&copy_wasm.step);
 }

@@ -3,16 +3,16 @@
   "compilerOptions": {
     "baseUrl": ".",
     "rootDir": "src",
-    "types": ["bun"],
+    "lib": ["es2020", "dom"],
     "composite": false,
     "declaration": false,
     "declarationMap": false,
     "emitDeclarationOnly": false,
-    "noEmit": true
+    "noEmit": true,
+    "types": ["bun"]
   },
   "include": [
     "src/**/*.test.ts",
-    "src/**/__tests__/*.ts",
     "src/**/*.spec.ts",
     "src/**/__tests__/**/*.ts",
     "src/**/__tests__/**/*.tsx",
@@ -20,10 +20,10 @@
   ],
   "references": [
     {
-      "path": "../validation/tsconfig.lib.json"
+      "path": "./tsconfig.lib.json"
     },
     {
-      "path": "./tsconfig.lib.json"
+      "path": "../statebus-core/tsconfig.lib.json"
     }
   ]
 }

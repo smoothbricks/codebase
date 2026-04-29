@@ -4,13 +4,20 @@
     "baseUrl": ".",
     "rootDir": "src",
     "types": ["bun"],
-    "composite": true,
-    "declaration": true,
-    "declarationMap": true,
-    "outDir": "dist-test",
-    "tsBuildInfoFile": "dist-test/tsconfig.test.tsbuildinfo"
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "emitDeclarationOnly": false,
+    "noEmit": true
   },
-  "include": ["src/**/*.test.ts", "src/**/__tests__/*.ts"],
+  "include": [
+    "src/**/*.test.ts",
+    "src/**/__tests__/*.ts",
+    "src/**/*.spec.ts",
+    "src/**/__tests__/**/*.ts",
+    "src/**/__tests__/**/*.tsx",
+    "src/test-suite-tracer.ts"
+  ],
   "references": [
     {
       "path": "./tsconfig.lib.json"

@@ -7,11 +7,21 @@
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
-    "test": "bun test"
+    "test": "nx run money:test"
   },
   "nx": {
     "targets": {
-      "lint": {}
+      "lint": {},
+      "test": {
+        "executor": "nx:run-commands",
+        "dependsOn": [
+          "^build"
+        ],
+        "options": {
+          "command": "bun test",
+          "cwd": "{projectRoot}"
+        }
+      }
     },
     "tags": [
       "npm:public"

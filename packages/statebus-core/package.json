@@ -53,8 +53,7 @@
   },
   "nx": {
     "targets": {
-      "lint": {},
-      "lint:fix": {}
+      "lint": {}
     },
     "tags": [
       "npm:public"

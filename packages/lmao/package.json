@@ -139,24 +139,6 @@
           "^typecheck"
         ]
       },
-      "build:wasm": {
-        "inputs": [
-          "{projectRoot}/src/**/*.zig",
-          "{projectRoot}/build.zig",
-          "{projectRoot}/build.zig.zon"
-        ],
-        "executor": "nx:run-commands",
-        "options": {
-          "command": "zig build -Doptimize=ReleaseSmall",
-          "cwd": "packages/lmao"
-        }
-      },
-      "build": {
-        "dependsOn": [
-          "^build",
-          "build:wasm"
-        ]
-      },
       "test": {
         "executor": "nx:run-commands",
         "options": {

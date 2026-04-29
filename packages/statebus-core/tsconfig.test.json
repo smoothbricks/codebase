@@ -3,25 +3,21 @@
   "compilerOptions": {
     "baseUrl": ".",
     "rootDir": "src",
-    "types": ["bun"],
     "composite": false,
     "declaration": false,
     "declarationMap": false,
     "emitDeclarationOnly": false,
-    "noEmit": true
+    "noEmit": true,
+    "types": ["bun"]
   },
   "include": [
     "src/**/*.test.ts",
-    "src/**/__tests__/*.ts",
     "src/**/*.spec.ts",
     "src/**/__tests__/**/*.ts",
     "src/**/__tests__/**/*.tsx",
     "src/test-suite-tracer.ts"
   ],
   "references": [
-    {
-      "path": "../validation/tsconfig.lib.json"
-    },
     {
       "path": "./tsconfig.lib.json"
     }

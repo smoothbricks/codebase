@@ -1,5 +1,5 @@
 {
-  "name": "tooling",
+  "name": "@smoothbricks/tooling",
   "private": true,
   "dependencies": {
     "@smoothbricks/cli": "workspace:*"

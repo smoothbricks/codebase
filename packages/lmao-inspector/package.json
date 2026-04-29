@@ -30,7 +30,7 @@
     "tamagui": ">=2.0.0-rc.0"
   },
   "scripts": {
-    "test": "bun test --pass-with-no-tests"
+    "test": "nx run lmao-inspector:test"
   },
   "devDependencies": {
     "@smoothbricks/lmao": "workspace:*",
@@ -40,7 +40,17 @@
     "sourceRoot": "packages/lmao-inspector/src",
     "projectType": "library",
     "targets": {
-      "lint": {}
+      "lint": {},
+      "test": {
+        "executor": "nx:run-commands",
+        "dependsOn": [
+          "^build"
+        ],
+        "options": {
+          "command": "bun test --pass-with-no-tests",
+          "cwd": "{projectRoot}"
+        }
+      }
     },
     "tags": [
       "npm:public"

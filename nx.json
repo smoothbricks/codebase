@@ -16,64 +16,6 @@
       "cache": true,
       "outputs": ["{projectRoot}/dist"]
     },
-    "build:node": {
-      "cache": true,
-      "outputs": ["{projectRoot}/dist-node"]
-    },
-    "build:ts": {
-      "cache": true,
-      "outputs": [
-        "{projectRoot}/dist/**/*.js",
-        "{projectRoot}/dist/**/*.cjs",
-        "{projectRoot}/dist/**/*.mjs",
-        "{projectRoot}/dist/**/*.jsx",
-        "{projectRoot}/dist/**/*.js.map",
-        "{projectRoot}/dist/**/*.cjs.map",
-        "{projectRoot}/dist/**/*.mjs.map",
-        "{projectRoot}/dist/**/*.jsx.map",
-        "{projectRoot}/dist/**/*.d.ts",
-        "{projectRoot}/dist/**/*.d.cts",
-        "{projectRoot}/dist/**/*.d.mts",
-        "{projectRoot}/dist/**/*.d.ts.map",
-        "{projectRoot}/dist/**/*.d.cts.map",
-        "{projectRoot}/dist/**/*.d.mts.map",
-        "{projectRoot}/dist/**/*.tsbuildinfo"
-      ]
-    },
-    "build:zig": {
-      "cache": true,
-      "inputs": [
-        "default",
-        {
-          "dependentTasksOutputFiles": "**/*.wasm",
-          "transitive": true
-        }
-      ],
-      "outputs": [
-        "{projectRoot}/dist/**/*.wasm",
-        "{projectRoot}/dist/**/*.node",
-        "{projectRoot}/dist/**/*.dylib",
-        "{projectRoot}/dist/**/*.so",
-        "{projectRoot}/dist/**/*.dll",
-        "{projectRoot}/dist/**/*.a"
-      ]
-    },
-    "build:zig:ios": {
-      "cache": true,
-      "outputs": ["{projectRoot}/dist-ios"]
-    },
-    "build:zig:android": {
-      "cache": true,
-      "outputs": ["{projectRoot}/dist-android"]
-    },
-    "build:ts-plugin": {
-      "cache": true,
-      "outputs": ["{projectRoot}/dist-ts-plugin"]
-    },
-    "build:wasm": {
-      "cache": true,
-      "outputs": ["{projectRoot}/dist/**/*.wasm"]
-    },
     "typecheck": {
       "cache": true
     },
@@ -98,13 +40,6 @@
         "commands": ["biome check --files-ignore-unknown=true {projectRoot}", "eslint {projectRoot}/src"],
         "cwd": "{workspaceRoot}",
         "parallel": false
-      }
-    },
-    "lint:fix": {
-      "executor": "nx:run-commands",
-      "options": {
-        "command": "biome format --write --files-ignore-unknown=true {projectRoot}",
-        "cwd": "{workspaceRoot}"
       }
     }
   },

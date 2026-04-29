@@ -19,37 +19,29 @@
     "dist"
   ],
   "scripts": {
-    "build:zig": "zig build wasm",
-    "build:ts": "tsc --build tsconfig.lib.json",
+    "build:zig": "nx run columine:zig-wasm",
+    "build:ts": "nx run columine:tsc-js",
     "build": "bun run build:ts && bun run build:zig",
-    "test": "bun test src/__tests__/columine-integration.test.ts"
+    "test": "nx run columine:test"
   },
   "nx": {
     "targets": {
       "lint": {},
-      "build": {
-        "executor": "nx:noop",
-        "dependsOn": [
-          "^build",
-          "build:ts",
-          "build:zig"
-        ]
-      },
-      "build:zig": {
-        "inputs": [
-          "{projectRoot}/src/**/*.zig",
-          "{projectRoot}/build.zig",
-          "{projectRoot}/build.zig.zon"
-        ],
-        "outputs": [
-          "{projectRoot}/dist/*.wasm"
-        ]
-      },
       "typecheck": {
         "dependsOn": [
           "build",
           "^typecheck"
         ]
+      },
+      "test": {
+        "executor": "nx:run-commands",
+        "dependsOn": [
+          "^build"
+        ],
+        "options": {
+          "command": "bun test src/__tests__/columine-integration.test.ts",
+          "cwd": "{projectRoot}"
+        }
       }
     },
     "tags": [

@@ -31,12 +31,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           command: 'tsc --noEmit -p tsconfig.test.json',
           cwd: 'packages/example',
         },
-        dependsOn: ['build'],
+        dependsOn: ['typecheck'],
       });
       expect(targets.lint).toEqual({
         executor: 'nx:noop',
         cache: true,
-        dependsOn: ['typecheck', 'typecheck-tests'],
+        dependsOn: ['typecheck-tests'],
       });
     } finally {
       await workspace.cleanup();
