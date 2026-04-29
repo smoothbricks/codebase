@@ -43,6 +43,19 @@ describe('trusted publisher setup', () => {
     ]);
     expect(shell.logins).toBe(1);
   });
+
+  it('treats npm trust conflicts as already configured', async () => {
+    const shell = new RecordingTrustPublisherShell({
+      packages: [stable],
+      existing: [stable.name],
+      alreadyTrusted: [stable.name],
+    });
+
+    await configureTrustedPublishers(shell, { skipLogin: true, otp: '123456' });
+
+    expect(shell.events).toEqual([`exists:${stable.name}`, `trust:${stable.name}:false:123456`]);
+    expect(shell.logs).toContain(`${stable.name}: npm trusted publisher is already configured; skipping.`);
+  });
 });
 
 class RecordingTrustPublisherShell implements TrustPublisherShell<ReleasePackageInfo> {
@@ -54,10 +67,12 @@ class RecordingTrustPublisherShell implements TrustPublisherShell<ReleasePackage
   logins = 0;
   private readonly packages: ReleasePackageInfo[];
   private readonly existing: Set<string>;
+  private readonly alreadyTrusted: Set<string>;
 
-  constructor(options: { packages: ReleasePackageInfo[]; existing: string[] }) {
+  constructor(options: { packages: ReleasePackageInfo[]; existing: string[]; alreadyTrusted?: string[] }) {
     this.packages = options.packages;
     this.existing = new Set(options.existing);
+    this.alreadyTrusted = new Set(options.alreadyTrusted ?? []);
   }
 
   listReleasePackages(): ReleasePackageInfo[] {
@@ -82,8 +97,16 @@ class RecordingTrustPublisherShell implements TrustPublisherShell<ReleasePackage
     this.logins += 1;
   }
 
-  async trustPublisher(pkg: ReleasePackageInfo, dryRun: boolean, env?: Record<string, string>): Promise<void> {
+  async trustPublisher(
+    pkg: ReleasePackageInfo,
+    dryRun: boolean,
+    env?: Record<string, string>,
+  ): Promise<'configured' | 'already-configured'> {
     this.events.push(`trust:${pkg.name}:${dryRun}:${env?.NPM_CONFIG_OTP ?? ''}`);
+    if (this.alreadyTrusted.has(pkg.name)) {
+      return 'already-configured';
+    }
+    return 'configured';
   }
 
   async promptOtp(packageName: string): Promise<string> {

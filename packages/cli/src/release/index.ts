@@ -6,7 +6,7 @@ import { Writable } from 'node:stream';
 import { $ } from 'bun';
 import { withDevenvEnv } from '../lib/devenv.js';
 import { isRecord, stringProperty } from '../lib/json.js';
-import { decode, run, runStatus } from '../lib/run.js';
+import { decode, run, runResult, runStatus } from '../lib/run.js';
 import { listReleasePackages, readPackageJson, repositoryInfo } from '../lib/workspace.js';
 import { readPackedPackageJson, validatePackedWorkspaceDependencies } from '../monorepo/packed-manifest.js';
 import {
@@ -55,12 +55,14 @@ export interface ReleaseTrustPublisherOptions {
   dryRun?: boolean;
   bootstrap?: boolean;
   otp?: string;
+  bootstrapOtp?: string;
   skipLogin?: boolean;
 }
 
 export interface ReleaseBootstrapNpmPackagesOptions {
   dryRun?: boolean;
   skipLogin?: boolean;
+  otp?: string;
   packages?: string[];
 }
 
@@ -160,7 +162,8 @@ export async function releaseTrustPublisher(root: string, options: ReleaseTrustP
             listReleasePackages: () => listReleasePackages(root),
             packageExists: (name) => npmPackageExists(root, name),
             login: () => runLatestNpm(root, ['login', '--auth-type=web']),
-            publishPlaceholder: (pkg) => publishPlaceholderPackage(root, pkg),
+            publishPlaceholder: (pkg, env) => publishPlaceholderPackage(root, pkg, env),
+            promptOtp: (packageName) => promptForNpmOtp(packageName),
             log: (message) => console.log(message),
           },
           bootstrapOptions,
@@ -171,7 +174,7 @@ export async function releaseTrustPublisher(root: string, options: ReleaseTrustP
         if (dryRun) {
           args.push('--dry-run');
         }
-        return runLatestNpm(root, args, env);
+        return runLatestNpmTrust(root, args, env);
       },
       promptOtp: (packageName) => promptForNpmOtp(packageName),
       log: (message) => console.log(message),
@@ -188,11 +191,13 @@ export interface TrustPublisherShell<Package extends ReleasePackageInfo = Releas
   packageExists(name: string): Promise<boolean>;
   bootstrapNpmPackages(options: BootstrapNpmPackagesOptions): Promise<Package[]>;
   login(): Promise<void>;
-  trustPublisher(pkg: Package, dryRun: boolean, env?: Record<string, string>): Promise<void>;
+  trustPublisher(pkg: Package, dryRun: boolean, env?: Record<string, string>): Promise<TrustPublisherResult>;
   promptOtp(packageName: string): Promise<string>;
   log(message: string): void;
   error(message: string): void;
 }
+
+export type TrustPublisherResult = 'configured' | 'already-configured';
 
 export async function configureTrustedPublishers<Package extends ReleasePackageInfo>(
   shell: TrustPublisherShell<Package>,
@@ -208,6 +213,7 @@ export async function configureTrustedPublishers<Package extends ReleasePackageI
     const bootstrapped = await shell.bootstrapNpmPackages({
       dryRun: options.dryRun === true,
       skipLogin: options.skipLogin === true,
+      otp: options.bootstrapOtp,
       packages: [],
     });
     bootstrapLoggedIn = bootstrapped.length > 0 && !options.dryRun && !options.skipLogin;
@@ -237,7 +243,14 @@ export async function configureTrustedPublishers<Package extends ReleasePackageI
     while (true) {
       const otp = options.dryRun ? undefined : (options.otp ?? (await shell.promptOtp(pkg.name)));
       try {
-        await shell.trustPublisher(pkg, options.dryRun === true, otp ? { NPM_CONFIG_OTP: otp } : undefined);
+        const result = await shell.trustPublisher(
+          pkg,
+          options.dryRun === true,
+          otp ? { NPM_CONFIG_OTP: otp } : undefined,
+        );
+        if (result === 'already-configured') {
+          shell.log(`${pkg.name}: npm trusted publisher is already configured; skipping.`);
+        }
         break;
       } catch (error) {
         shell.error(`${pkg.name}: npm trusted publisher setup failed.`);
@@ -270,12 +283,14 @@ export async function releaseBootstrapNpmPackages(
       listReleasePackages: () => listReleasePackages(root),
       packageExists: (name) => npmPackageExists(root, name),
       login: () => runLatestNpm(root, ['login', '--auth-type=web']),
-      publishPlaceholder: (pkg) => publishPlaceholderPackage(root, pkg),
+      publishPlaceholder: (pkg, env) => publishPlaceholderPackage(root, pkg, env),
+      promptOtp: (packageName) => promptForNpmOtp(packageName),
       log: (message) => console.log(message),
     },
     {
       dryRun: options.dryRun === true,
       skipLogin: options.skipLogin === true,
+      otp: options.otp,
       packages: options.packages ?? [],
     },
   );
@@ -375,7 +390,11 @@ function npmAuthTokenPresent(): boolean {
   return Boolean(process.env.NODE_AUTH_TOKEN || process.env.NPM_TOKEN || process.env.NPM_CONFIG_USERCONFIG);
 }
 
-async function publishPlaceholderPackage(root: string, pkg: ReleasePackage): Promise<void> {
+async function publishPlaceholderPackage(
+  root: string,
+  pkg: ReleasePackage,
+  env?: Record<string, string>,
+): Promise<void> {
   const tempDir = await mkdtemp(join(tmpdir(), 'smoo-npm-bootstrap-'));
   try {
     await writeFile(
@@ -397,7 +416,7 @@ async function publishPlaceholderPackage(root: string, pkg: ReleasePackage): Pro
       join(tempDir, 'README.md'),
       `# ${pkg.name}\n\nThis is a bootstrap placeholder. Real package versions are published by SmoothBricks release automation.\n`,
     );
-    await runLatestNpm(root, ['publish', tempDir, '--access', 'public', '--tag', NPM_BOOTSTRAP_DIST_TAG]);
+    await runLatestNpm(root, ['publish', tempDir, '--access', 'public', '--tag', NPM_BOOTSTRAP_DIST_TAG], env);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -998,6 +1017,24 @@ function githubRepositoryFromUrl(url: string): string {
 
 async function runLatestNpm(root: string, npmArgs: string[], env?: Record<string, string>): Promise<void> {
   await run('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...npmArgs], root, env);
+}
+
+async function runLatestNpmTrust(
+  root: string,
+  npmArgs: string[],
+  env?: Record<string, string>,
+): Promise<TrustPublisherResult> {
+  const result = await runResult('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...npmArgs], root, env);
+  if (result.exitCode === 0) {
+    return 'configured';
+  }
+  const output = `${result.stdout}\n${result.stderr}`;
+  if (/\bE409\b|\b409 Conflict\b/.test(output)) {
+    return 'already-configured';
+  }
+  throw new Error(
+    `nix shell nixpkgs#nodejs_latest -c npm ${npmArgs.join(' ')} failed with exit code ${result.exitCode}`,
+  );
 }
 
 async function runLatestNpmPublish(root: string, npmArgs: string[]): Promise<void> {
