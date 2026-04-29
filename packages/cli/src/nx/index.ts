@@ -8,6 +8,7 @@ import { decode, run } from '../lib/run.js';
 export interface ProjectTargets {
   project: string;
   targets: string[];
+  buildDependsOn?: string[];
 }
 
 export interface CommandInvocation {
@@ -30,6 +31,15 @@ export function nxCacheDirectories(root: string): string[] {
 export function targetNamesFromNxProjectJson(value: unknown): string[] {
   const targets = isRecord(value) ? recordProperty(value, 'targets') : null;
   return targets ? Object.keys(targets).sort((a, b) => a.localeCompare(b)) : [];
+}
+
+export function buildDependsOnFromNxProjectJson(value: unknown): string[] | undefined {
+  const targets = isRecord(value) ? recordProperty(value, 'targets') : null;
+  const build = targets ? recordProperty(targets, 'build') : null;
+  if (!Array.isArray(build?.dependsOn) || !build.dependsOn.every((entry) => typeof entry === 'string')) {
+    return undefined;
+  }
+  return build.dependsOn;
 }
 
 export function formatProjectTargetLines(projects: ProjectTargets[]): string {
@@ -101,5 +111,9 @@ async function readProjectTarget(root: string, project: string): Promise<Project
   const command = nxShowProjectCommand(project);
   const result = await $`${command.command} ${command.args}`.cwd(root).quiet();
   const parsed: unknown = JSON.parse(decode(result.stdout));
-  return { project, targets: targetNamesFromNxProjectJson(parsed) };
+  return {
+    project,
+    targets: targetNamesFromNxProjectJson(parsed),
+    buildDependsOn: buildDependsOnFromNxProjectJson(parsed),
+  };
 }
