@@ -20,6 +20,9 @@ in {
 
   # https://devenv.sh/packages/
   packages = with pkgs; [
+    gnutar # Tarball inspection for package validation
+    coreutils # Provides fmt for commit message wrapping
+    git # Git hooks and repository inspection
     # Pin Node.js version to match AWS Lambda runtime
     nodejs_24
     # Bun.sh for javascript dependencies

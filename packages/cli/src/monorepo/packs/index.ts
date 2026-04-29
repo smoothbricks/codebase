@@ -8,6 +8,7 @@ import {
   applyNxReleaseDefaults,
   applyPublicPackageDefaults,
   applyWorkspaceDependencyDefaults,
+  validateNxProjectNames,
   validateNxReleaseConfig,
   validatePublicPackageMetadata,
   validatePublicTags,
@@ -16,6 +17,7 @@ import {
 } from '../package-policy.js';
 import { validatePackedPublicPackages } from '../packed-package.js';
 import { syncRootRuntimeVersions } from '../runtime.js';
+import { validateToolConfig } from '../tool-validation.js';
 
 export interface MonorepoContext {
   root: string;
@@ -48,6 +50,8 @@ const packs: MonorepoPack[] = [
       return (
         validateManagedFiles(ctx.root) +
         validateRootPackagePolicy(ctx.root) +
+        validateToolConfig(ctx.root) +
+        validateNxProjectNames(ctx.root) +
         validateNxReleaseConfig(ctx.root) +
         validateBunLockfileVersions(ctx.root) +
         (await validateNxSync(ctx.root))

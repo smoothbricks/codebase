@@ -10,7 +10,8 @@ directly without `bunx`.
 
 **Use conventional commits:** Release versioning is derived from commit history. Use subjects like
 `feat(statebus-core): add optimistic transactions`, `fix(money): round negative amounts`, or
-`feat!: remove deprecated API`.
+`feat!: remove deprecated API`. Commit scopes use short Nx project names from `package.json` `nx.name`, not scoped npm
+package names.
 
 **Use `npm:public` for publishability:** Every publishable package must have `nx.tags` containing `npm:public`.
 Private/internal packages must not have that tag. Release tooling discovers packages from `npm:public`, never hardcoded

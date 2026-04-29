@@ -6,4 +6,4 @@ export PATH="$TOOLING/git-hooks:$TOOLING:$PWD/node_modules/.bin:$TOOLING/direnv/
 
 set -e -o pipefail
 
-smoo monorepo validate-commit-msg "$1"
+smoo monorepo validate-commit-msg --fix "$1"

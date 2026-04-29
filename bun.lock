@@ -9,7 +9,6 @@
         "@nx/eslint": "22.0.3",
         "@nx/expo": "22.0.3",
         "@nx/js": "22.0.3",
-        "@smoothbricks/cli": "workspace:*",
         "@swc-node/register": "~1.9.1",
         "@swc/core": "~1.5.7",
         "@swc/helpers": "~0.5.11",
@@ -54,6 +53,7 @@
         "@smoothbricks/validation": "workspace:*",
         "commander": "^14.0.3",
         "publint": "^0.3.18",
+        "semver": "^7.7.4",
         "sherif": "^1.11.1",
         "tslib": "^2.8.1",
       },
@@ -224,6 +224,12 @@
       },
       "devDependencies": {
         "@typia/unplugin": "^12.0.1",
+      },
+    },
+    "tooling": {
+      "name": "tooling",
+      "dependencies": {
+        "@smoothbricks/cli": "workspace:*",
       },
     },
   },
@@ -3075,6 +3081,8 @@
     "toidentifier": ["toidentifier@1.0.1", "", {}, "sha512-o5sSPKEkg/DIQNmH43V0/uerLrpzVedkUh8tGNvaeXpfpuwjKenlSox/2O/BTlZUtEe+JG7s5YhEz608PlAHRA=="],
 
     "toml": ["toml@4.1.1", "", {}, "sha512-EBJnVBr3dTXdA89WVFoAIPUqkBjxPMwRqsfuo1r240tKFHXv3zgca4+NJib/h6TyvGF7vOawz0jGuryJCdNHrw=="],
+
+    "tooling": ["tooling@workspace:tooling"],
 
     "tough-cookie": ["tough-cookie@5.1.2", "", { "dependencies": { "tldts": "^6.1.32" } }, "sha512-FVDYdxtnj0G6Qm/DhNPSb8Ju59ULcup3tuJxkFb5K8Bv2pUXILbf0xZWU8PX8Ov19OXljbUyveOFwRMwkXzO+A=="],
 

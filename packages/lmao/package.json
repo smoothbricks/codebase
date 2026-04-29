@@ -167,7 +167,8 @@
     },
     "tags": [
       "npm:public"
-    ]
+    ],
+    "name": "lmao"
   },
   "devDependencies": {
     "fast-check": "^4.4.0",

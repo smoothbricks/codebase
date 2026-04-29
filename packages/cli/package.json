@@ -53,6 +53,7 @@
     "@smoothbricks/validation": "workspace:*",
     "commander": "^14.0.3",
     "publint": "^0.3.18",
+    "semver": "^7.7.4",
     "sherif": "^1.11.1",
     "tslib": "^2.8.1"
   },
@@ -75,7 +76,8 @@
     },
     "tags": [
       "npm:public"
-    ]
+    ],
+    "name": "cli"
   },
   "license": "MIT",
   "publishConfig": {

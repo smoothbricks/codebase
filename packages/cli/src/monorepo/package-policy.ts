@@ -23,6 +23,11 @@ import {
 
 export const SMOO_NX_VERSION_ACTIONS = '@smoothbricks/cli/nx-version-actions';
 export const SMOO_NX_RELEASE_TAG_PATTERN = '{projectName}@{version}';
+const extraCommitScopes = ['release'];
+
+export function applyFixableMonorepoDefaults(root: string): void {
+  applyNxProjectNameDefaults(root);
+}
 
 export function applyPublicPackageDefaults(root: string): void {
   const rootPackage = requiredJsonObject(join(root, 'package.json'));
@@ -115,6 +120,49 @@ export function applyNxReleaseDefaults(root: string): void {
   } else {
     console.log('unchanged      nx.json release config');
   }
+}
+
+export function applyNxProjectNameDefaults(root: string): void {
+  const rootPackage = requiredJsonObject(join(root, 'package.json'));
+  const rootName = stringProperty(rootPackage, 'name');
+  if (!rootName) {
+    return;
+  }
+  for (const pkg of getWorkspacePackages(root)) {
+    const suggestedName = suggestNxProjectName(rootName, pkg.name);
+    if (!suggestedName) {
+      continue;
+    }
+    const nx = getOrCreateRecord(pkg.json, 'nx');
+    const changed = setStringProperty(nx, 'name', suggestedName);
+    if (changed) {
+      writeJsonObject(pkg.packageJsonPath, pkg.json);
+      console.log(`updated        ${pkg.path}/package.json nx.name`);
+    } else {
+      console.log(`unchanged      ${pkg.path}/package.json nx.name`);
+    }
+  }
+}
+
+export function listValidCommitScopes(root: string): ReadonlySet<string> {
+  return new Set([...listNxProjectNames(root), ...extraCommitScopes]);
+}
+
+export function listNxProjectNames(root: string): string[] {
+  const rootPackage = readJsonObject(join(root, 'package.json'));
+  const rootName = rootPackage ? stringProperty(rootPackage, 'name') : null;
+  const names: string[] = [];
+  for (const pkg of getWorkspacePackages(root)) {
+    const nx = recordProperty(pkg.json, 'nx');
+    const configuredName = nx ? stringProperty(nx, 'name') : null;
+    const suggestedName = rootName ? suggestNxProjectName(rootName, pkg.name) : null;
+    if (configuredName) {
+      names.push(configuredName);
+    } else if (suggestedName) {
+      names.push(suggestedName);
+    }
+  }
+  return names;
 }
 
 export function validateRootPackagePolicy(root: string): number {
@@ -239,6 +287,33 @@ export function validateNxReleaseConfig(root: string): number {
   return failures;
 }
 
+export function validateNxProjectNames(root: string): number {
+  const rootPackage = readJsonObject(join(root, 'package.json'));
+  const rootName = rootPackage ? stringProperty(rootPackage, 'name') : null;
+  if (!rootName) {
+    return 0;
+  }
+  let failures = 0;
+  for (const pkg of getWorkspacePackages(root)) {
+    const suggestedName = suggestNxProjectName(rootName, pkg.name);
+    if (!suggestedName) {
+      continue;
+    }
+    const nx = recordProperty(pkg.json, 'nx');
+    const configuredName = nx ? stringProperty(nx, 'name') : null;
+    if (configuredName !== suggestedName) {
+      console.error(
+        `${pkg.path}: package.json nx.name must be "${suggestedName}" so fix(${suggestedName}): maps to this project`,
+      );
+      failures++;
+    }
+  }
+  if (failures === 0) {
+    console.log('Nx project names are valid.');
+  }
+  return failures;
+}
+
 export function validatePublicTags(root: string): number {
   let failures = 0;
   for (const pkg of getWorkspacePackages(root)) {
@@ -353,6 +428,23 @@ function fixWorkspaceDependencyRanges(pkg: Record<string, unknown>, workspaceNam
     }
   }
   return changed;
+}
+
+function suggestNxProjectName(rootPackageName: string, packageName: string): string | null {
+  const rootScope = npmScope(rootPackageName);
+  if (!rootScope || npmScope(packageName) !== rootScope) {
+    return null;
+  }
+  return unscopedPackageName(packageName);
+}
+
+function npmScope(packageName: string): string | null {
+  const match = /^(@[^/]+)\//.exec(packageName);
+  return match?.[1] ?? null;
+}
+
+function unscopedPackageName(packageName: string): string {
+  return packageName.startsWith('@') ? packageName.slice(packageName.indexOf('/') + 1) : packageName;
 }
 
 function setBooleanProperty(record: Record<string, unknown>, key: string, value: boolean): boolean {

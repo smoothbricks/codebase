@@ -33,9 +33,10 @@ function buildProgram(): Command {
     });
   monorepo
     .command('validate')
+    .option('--fix', 'apply safe monorepo policy fixes before validation')
     .option('--fail-fast', 'stop after the first failing validation pack')
     .option('--only-if-new-workspace-package', 'skip validation unless a new workspace package manifest is staged')
-    .action(async (options: { failFast?: boolean; onlyIfNewWorkspacePackage?: boolean }) => {
+    .action(async (options: { fix?: boolean; failFast?: boolean; onlyIfNewWorkspacePackage?: boolean }) => {
       const { validateMonorepo } = await import('./monorepo/index.js');
       await validateMonorepo(await findRepoRoot(), options);
     });
@@ -51,10 +52,13 @@ function buildProgram(): Command {
     const { diffManagedFiles } = await import('./monorepo/index.js');
     diffManagedFiles(await findRepoRoot());
   });
-  monorepo.command('validate-commit-msg <commitMsgFile>').action(async (commitMsgFile: string) => {
-    const { validateCommitMessageFile } = await import('./monorepo/index.js');
-    validateCommitMessageFile(commitMsgFile);
-  });
+  monorepo
+    .command('validate-commit-msg <commitMsgFile>')
+    .option('--fix', 'format the commit message before validation')
+    .action(async (commitMsgFile: string, options: { fix?: boolean }) => {
+      const { validateCommitMessageFile } = await import('./monorepo/index.js');
+      validateCommitMessageFile(commitMsgFile, options, await findRepoRoot());
+    });
   monorepo.command('sync-bun-lockfile-versions').action(async () => {
     const { syncBunLockfileVersions } = await import('./monorepo/index.js');
     syncBunLockfileVersions(await findRepoRoot());

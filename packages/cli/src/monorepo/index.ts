@@ -1,14 +1,15 @@
-import { appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { $ } from 'bun';
 import { decode } from '../lib/run.js';
 import { escapeRegex, getWorkspacePatterns, listReleasePackages } from '../lib/workspace.js';
-import { validateCommitMessage } from './commit-msg.js';
+import { formatCommitMessage, validateCommitMessage } from './commit-msg.js';
 import { applyWorkspaceGitConfig } from './git-config.js';
 import { syncBunLockfileVersions } from './lockfile.js';
 import { applyManagedFiles, printResults } from './managed-files.js';
-import { validatePublicTags } from './package-policy.js';
+import { applyFixableMonorepoDefaults, listValidCommitScopes, validatePublicTags } from './package-policy.js';
 import { runInitPacks, runValidatePacks } from './packs/index.js';
 import { syncRootRuntimeVersions } from './runtime.js';
+import { applyToolConfigDefaults } from './tool-validation.js';
 
 export interface InitOptions {
   runtimeOnly?: boolean;
@@ -18,6 +19,11 @@ export interface InitOptions {
 export interface ValidateOptions {
   failFast?: boolean;
   onlyIfNewWorkspacePackage?: boolean;
+  fix?: boolean;
+}
+
+export interface ValidateCommitMessageOptions {
+  fix?: boolean;
 }
 
 export interface ListReleasePackagesOptions {
@@ -38,6 +44,10 @@ export async function initMonorepo(root: string, options: InitOptions): Promise<
 export async function validateMonorepo(root: string, options: ValidateOptions = {}): Promise<void> {
   if (options.onlyIfNewWorkspacePackage && !(await hasNewWorkspacePackage(root))) {
     return;
+  }
+  if (options.fix) {
+    applyFixableMonorepoDefaults(root);
+    await applyToolConfigDefaults(root);
   }
   const failures = await runValidatePacks({ root, syncRuntime: false }, options);
   if (failures > 0) {
@@ -64,12 +74,23 @@ export function diffManagedFiles(root: string): void {
   printResults(applyManagedFiles(root, 'diff'));
 }
 
-export function validateCommitMessageFile(path: string | undefined): void {
+export function validateCommitMessageFile(
+  path: string | undefined,
+  options: ValidateCommitMessageOptions = {},
+  root = process.cwd(),
+): void {
   if (!path) {
     throw new Error('Usage: smoo monorepo validate-commit-msg <commit-msg-file>');
   }
-  const message = readFileSync(path, 'utf8');
-  const error = validateCommitMessage(message);
+  let message = readFileSync(path, 'utf8');
+  if (options.fix) {
+    const formatted = formatCommitMessage(message);
+    if (formatted !== message) {
+      writeFileSync(path, formatted);
+      message = formatted;
+    }
+  }
+  const error = validateCommitMessage(message, { validScopes: listValidCommitScopes(root) });
   if (error) {
     throw new Error(error);
   }

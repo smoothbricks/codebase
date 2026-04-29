@@ -58,7 +58,8 @@
     },
     "tags": [
       "npm:public"
-    ]
+    ],
+    "name": "statebus-core"
   },
   "publishConfig": {
     "access": "public"

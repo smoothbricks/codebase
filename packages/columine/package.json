@@ -54,7 +54,8 @@
     },
     "tags": [
       "npm:public"
-    ]
+    ],
+    "name": "columine"
   },
   "devDependencies": {
     "@smoothbricks/validation": "workspace:*",

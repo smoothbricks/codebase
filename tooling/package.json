@@ -1,0 +1,7 @@
+{
+  "name": "tooling",
+  "private": true,
+  "dependencies": {
+    "@smoothbricks/cli": "workspace:*"
+  }
+}

@@ -15,7 +15,8 @@
     },
     "tags": [
       "npm:public"
-    ]
+    ],
+    "name": "duration"
   },
   "exports": {
     "./package.json": "./package.json",

@@ -1,0 +1,329 @@
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { gte, maxSatisfying, minVersion } from 'semver';
+import { getOrCreateRecord, readJsonObject, recordProperty, setStringProperty, writeJsonObject } from '../lib/json.js';
+
+interface RequiredDependency {
+  name: string;
+  fallbackVersion: string;
+  minimumVersion?: string;
+  prefix?: string;
+}
+
+const rootDevDependencies: RequiredDependency[] = [
+  { name: '@biomejs/biome', fallbackVersion: '^2.3.5', minimumVersion: '2.3.0', prefix: '^' },
+  { name: '@nx/js', fallbackVersion: '22.0.3', minimumVersion: '22.0.0' },
+  { name: 'eslint', fallbackVersion: '^9.39.1', minimumVersion: '9.39.0', prefix: '^' },
+  { name: 'eslint-stdout', fallbackVersion: 'workspace:*' },
+  { name: 'nx', fallbackVersion: '22.5.4', minimumVersion: '22.5.0' },
+  { name: 'prettier', fallbackVersion: '^3.6.1', minimumVersion: '3.6.0', prefix: '^' },
+  { name: 'typescript', fallbackVersion: '^5.9.3', minimumVersion: '5.9.0', prefix: '^' },
+];
+
+const toolingDependencies = new Map([['@smoothbricks/cli', 'workspace:*']]);
+
+const requiredDevenvPackages = ['bun', 'git', 'git-format-staged', 'jq', 'alejandra', 'coreutils', 'gnutar'];
+const allowedNodePackages = ['nodejs_24', 'nodejs_latest'];
+
+export async function applyToolConfigDefaults(root: string): Promise<void> {
+  await applyRootDevDependencyDefaults(root);
+  applyToolingPackageDefaults(root);
+  applyToolingWorkspaceDefault(root);
+  applyDevenvPackageDefaults(root);
+}
+
+export function validateToolConfig(root: string): number {
+  return (
+    validateRootDevDependencies(root) +
+    validateToolingPackage(root) +
+    validateToolingWorkspace(root) +
+    validateDevenvPackages(root)
+  );
+}
+
+export async function applyRootDevDependencyDefaults(root: string): Promise<void> {
+  const path = join(root, 'package.json');
+  const pkg = readJsonObject(path);
+  if (!pkg) {
+    return;
+  }
+  let changed = false;
+  const devDependencies = getOrCreateRecord(pkg, 'devDependencies');
+  for (const dependency of rootDevDependencies) {
+    const current = devDependencies[dependency.name];
+    if (typeof current !== 'string' || !satisfiesDependencyPolicy(current, dependency)) {
+      const version = await resolveDependencyVersion(dependency);
+      changed = setStringProperty(devDependencies, dependency.name, version) || changed;
+    }
+  }
+  if (delete devDependencies['@smoothbricks/cli']) {
+    changed = true;
+  }
+  if (changed) {
+    writeJsonObject(path, pkg);
+    console.log('updated        package.json workspace tool dependencies');
+  } else {
+    console.log('unchanged      package.json workspace tool dependencies');
+  }
+}
+
+export function applyToolingPackageDefaults(root: string): void {
+  const path = join(root, 'tooling', 'package.json');
+  const pkg = readJsonObject(path) ?? { name: 'tooling', private: true, dependencies: {} };
+  let changed = false;
+  changed = setStringProperty(pkg, 'name', 'tooling') || changed;
+  if (pkg.private !== true) {
+    pkg.private = true;
+    changed = true;
+  }
+  const dependencies = getOrCreateRecord(pkg, 'dependencies');
+  for (const [name, version] of toolingDependencies) {
+    changed = setStringProperty(dependencies, name, version) || changed;
+  }
+  if (changed || !existsSync(path)) {
+    writeJsonObject(path, pkg);
+    console.log('updated        tooling/package.json tooling dependencies');
+  } else {
+    console.log('unchanged      tooling/package.json tooling dependencies');
+  }
+}
+
+export function applyToolingWorkspaceDefault(root: string): void {
+  const path = join(root, 'package.json');
+  const pkg = readJsonObject(path);
+  if (!pkg) {
+    return;
+  }
+  if (addWorkspacePattern(pkg, 'tooling')) {
+    writeJsonObject(path, pkg);
+    console.log('updated        package.json tooling workspace');
+  } else {
+    console.log('unchanged      package.json tooling workspace');
+  }
+}
+
+export function applyDevenvPackageDefaults(root: string): void {
+  const path = join(root, 'tooling', 'direnv', 'devenv.nix');
+  if (!existsSync(path)) {
+    return;
+  }
+  let content = readFileSync(path, 'utf8');
+  let changed = false;
+  if (!allowedNodePackages.some((name) => hasNixPackage(content, name))) {
+    const next = addNixPackage(content, 'nodejs_latest', '# Node.js for workspace tooling');
+    changed = next !== content || changed;
+    content = next;
+  }
+  for (const name of requiredDevenvPackages) {
+    if (hasNixPackage(content, name)) {
+      continue;
+    }
+    const next = addNixPackage(content, name, nixPackageComment(name));
+    changed = next !== content || changed;
+    content = next;
+  }
+  if (changed) {
+    writeFileSync(path, content);
+    console.log('updated        tooling/direnv/devenv.nix packages');
+  } else {
+    console.log('unchanged      tooling/direnv/devenv.nix packages');
+  }
+}
+
+export function validateRootDevDependencies(root: string): number {
+  const pkg = readJsonObject(join(root, 'package.json'));
+  if (!pkg) {
+    console.error('package.json not found or invalid');
+    return 1;
+  }
+  const devDependencies = recordProperty(pkg, 'devDependencies');
+  let failures = 0;
+  for (const dependency of rootDevDependencies) {
+    const version = devDependencies?.[dependency.name];
+    if (typeof version !== 'string') {
+      console.error(`package.json devDependencies.${dependency.name} must be defined`);
+      failures++;
+    } else if (!satisfiesDependencyPolicy(version, dependency)) {
+      console.error(
+        `package.json devDependencies.${dependency.name} must be >= ${formatMinimum(dependency)}; found ${version}`,
+      );
+      failures++;
+    }
+  }
+  if (typeof devDependencies?.['@smoothbricks/cli'] === 'string') {
+    console.error('package.json devDependencies.@smoothbricks/cli must move to tooling/package.json dependencies');
+    failures++;
+  }
+  return failures;
+}
+
+export function validateToolingPackage(root: string): number {
+  const path = join(root, 'tooling', 'package.json');
+  const pkg = readJsonObject(path);
+  if (!pkg) {
+    console.error('tooling/package.json not found or invalid');
+    return 1;
+  }
+  const dependencies = recordProperty(pkg, 'dependencies');
+  let failures = 0;
+  for (const name of toolingDependencies.keys()) {
+    if (typeof dependencies?.[name] !== 'string') {
+      console.error(`tooling/package.json dependencies.${name} must be defined`);
+      failures++;
+    }
+  }
+  return failures;
+}
+
+export function validateToolingWorkspace(root: string): number {
+  const pkg = readJsonObject(join(root, 'package.json'));
+  if (!pkg) {
+    console.error('package.json not found or invalid');
+    return 1;
+  }
+  if (!hasWorkspacePattern(pkg, 'tooling')) {
+    console.error('package.json workspaces must include tooling so tooling/package.json participates in installs');
+    return 1;
+  }
+  return 0;
+}
+
+export function validateDevenvPackages(root: string): number {
+  const path = join(root, 'tooling', 'direnv', 'devenv.nix');
+  if (!existsSync(path)) {
+    console.error('tooling/direnv/devenv.nix not found');
+    return 1;
+  }
+  const content = readFileSync(path, 'utf8');
+  let failures = 0;
+  if (!allowedNodePackages.some((name) => hasNixPackage(content, name))) {
+    console.error(`tooling/direnv/devenv.nix packages must include ${allowedNodePackages.join(' or ')}`);
+    failures++;
+  }
+  for (const name of requiredDevenvPackages) {
+    if (!hasNixPackage(content, name)) {
+      console.error(`tooling/direnv/devenv.nix packages must include ${name}`);
+      failures++;
+    }
+  }
+  return failures;
+}
+
+function addNixPackage(content: string, name: string, comment: string): string {
+  const packageLine = `    ${name}${comment ? ` ${comment}` : ''}\n`;
+  if (hasNixPackage(content, name)) {
+    return content;
+  }
+  const packagesStart = content.indexOf('  packages = with pkgs; [');
+  if (packagesStart === -1) {
+    return content;
+  }
+  const insertAt = content.indexOf('\n', packagesStart) + 1;
+  return `${content.slice(0, insertAt)}${packageLine}${content.slice(insertAt)}`;
+}
+
+function hasNixPackage(content: string, name: string): boolean {
+  return new RegExp(`(^|\\s)${escapeRegex(name)}(\\s|#|$)`, 'm').test(content);
+}
+
+function nixPackageComment(name: string): string {
+  if (name === 'coreutils') {
+    return '# Provides fmt for commit message wrapping';
+  }
+  if (name === 'gnutar') {
+    return '# Tarball inspection for package validation';
+  }
+  if (name === 'git') {
+    return '# Git hooks and repository inspection';
+  }
+  return '';
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function satisfiesDependencyPolicy(version: string, dependency: RequiredDependency): boolean {
+  if (dependency.minimumVersion === undefined) {
+    return version === dependency.fallbackVersion;
+  }
+  const parsed = minVersion(version);
+  if (!parsed) {
+    return false;
+  }
+  return gte(parsed, dependency.minimumVersion);
+}
+
+function formatMinimum(dependency: RequiredDependency): string {
+  return dependency.minimumVersion ?? dependency.fallbackVersion;
+}
+
+async function resolveDependencyVersion(dependency: RequiredDependency): Promise<string> {
+  if (!dependency.minimumVersion) {
+    return dependency.fallbackVersion;
+  }
+  const latest = await fetchLatestPatchVersion(dependency.name, dependency.minimumVersion);
+  return `${dependency.prefix ?? ''}${latest ?? stripRangePrefix(dependency.fallbackVersion)}`;
+}
+
+async function fetchLatestPatchVersion(packageName: string, minimumVersion: string): Promise<string | null> {
+  const minorRange = sameMajorMinorRange(minimumVersion);
+  const url = `https://registry.npmjs.org/${encodeURIComponent(packageName).replace('%40', '@')}`;
+  const response = await fetch(url, { headers: { accept: 'application/vnd.npm.install-v1+json' } });
+  if (!response.ok) {
+    return null;
+  }
+  const body: unknown = await response.json();
+  if (!isRegistryPackument(body)) {
+    return null;
+  }
+  return maxSatisfying(Object.keys(body.versions), minorRange);
+}
+
+function sameMajorMinorRange(minimumVersion: string): string {
+  const parsed = minVersion(minimumVersion);
+  if (!parsed) {
+    return minimumVersion;
+  }
+  return `>=${parsed.version} <${parsed.major}.${parsed.minor + 1}.0`;
+}
+
+function isRegistryPackument(value: unknown): value is { versions: Record<string, unknown> } {
+  return typeof value === 'object' && value !== null && 'versions' in value && isObjectRecord(value.versions);
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function stripRangePrefix(version: string): string {
+  return version.replace(/^[~^]/, '');
+}
+
+function addWorkspacePattern(pkg: Record<string, unknown>, pattern: string): boolean {
+  const workspaces = pkg.workspaces;
+  if (Array.isArray(workspaces)) {
+    if (workspaces.includes(pattern)) {
+      return false;
+    }
+    workspaces.push(pattern);
+    return true;
+  }
+  if (isObjectRecord(workspaces) && Array.isArray(workspaces.packages)) {
+    if (workspaces.packages.includes(pattern)) {
+      return false;
+    }
+    workspaces.packages.push(pattern);
+    return true;
+  }
+  pkg.workspaces = ['packages/*', pattern];
+  return true;
+}
+
+function hasWorkspacePattern(pkg: Record<string, unknown>, pattern: string): boolean {
+  const workspaces = pkg.workspaces;
+  if (Array.isArray(workspaces)) {
+    return workspaces.includes(pattern);
+  }
+  return isObjectRecord(workspaces) && Array.isArray(workspaces.packages) && workspaces.packages.includes(pattern);
+}

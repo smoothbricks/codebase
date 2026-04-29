@@ -40,7 +40,8 @@
     },
     "tags": [
       "npm:public"
-    ]
+    ],
+    "name": "lmao-transformer"
   },
   "license": "MIT",
   "publishConfig": {

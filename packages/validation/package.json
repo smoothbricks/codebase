@@ -15,7 +15,8 @@
     },
     "tags": [
       "npm:public"
-    ]
+    ],
+    "name": "validation"
   },
   "exports": {
     "./package.json": "./package.json",

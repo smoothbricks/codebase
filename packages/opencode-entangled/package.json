@@ -34,7 +34,8 @@
     },
     "tags": [
       "npm:public"
-    ]
+    ],
+    "name": "opencode-entangled"
   },
   "license": "MIT",
   "publishConfig": {

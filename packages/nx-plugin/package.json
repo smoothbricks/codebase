@@ -14,7 +14,8 @@
   "nx": {
     "targets": {
       "lint": {}
-    }
+    },
+    "name": "nx-plugin"
   },
   "files": [
     "dist",

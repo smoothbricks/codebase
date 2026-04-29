@@ -64,7 +64,8 @@
     },
     "tags": [
       "npm:public"
-    ]
+    ],
+    "name": "arrow-builder"
   },
   "license": "MIT",
   "publishConfig": {

@@ -63,7 +63,8 @@
     },
     "tags": [
       "npm:public"
-    ]
+    ],
+    "name": "statebus-react"
   },
   "publishConfig": {
     "access": "public"

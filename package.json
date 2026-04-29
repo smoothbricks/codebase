@@ -16,7 +16,6 @@
     "@nx/eslint": "22.0.3",
     "@nx/expo": "22.0.3",
     "@nx/js": "22.0.3",
-    "@smoothbricks/cli": "workspace:*",
     "@swc-node/register": "~1.9.1",
     "@swc/core": "~1.5.7",
     "@swc/helpers": "~0.5.11",
@@ -54,7 +53,8 @@
     "update:nixpkgs-overlay": "cd tooling/direnv/nixpkgs-overlay && nix shell nixpkgs#nvfetcher -c nvfetcher"
   },
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "tooling"
   ],
   "nx": {
     "targets": {

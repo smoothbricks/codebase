@@ -62,6 +62,8 @@ It currently:
 - Synchronizes root runtime versions inside devenv, or when `--sync-runtime` is passed.
 - Applies safe publish metadata defaults to `npm:public` packages without inferring package ownership.
 - Normalizes internal workspace dependency ranges to `workspace:*`.
+- `smoo monorepo validate --fix` creates/updates `tooling/package.json`, keeps `@smoothbricks/cli` there instead of the
+  root workspace package, and fills required workspace/devenv tool declarations.
 - Runs [`sherif --fix --select highest`][sherif] for broad monorepo package hygiene.
 - Normalizes conditional export ordering so `types` comes first and `default` comes last.
 - Adds `src` to package `files` when development-only exports intentionally point at source files.
@@ -88,6 +90,8 @@ It checks:
 - Managed file drift.
 - Root package policy.
 - Root Bun type version matches the Bun package manager version.
+- Tooling policy: root `package.json` owns workspace-level tools like `nx`, `tooling/package.json` owns `smoo`, and
+  `tooling/direnv/devenv.nix` owns shell-provided tools like `bun`, `git-format-staged`, and `fmt`.
 - Nx release policy, including project package release tags, project-level GitHub Release changelogs, and the temporary
   Bun lockfile versionActions hook.
 - `bun.lock` workspace versions match package manifests.
@@ -197,10 +201,16 @@ package manifest is staged.
 The generated commit-msg hook delegates conventional commit validation to:
 
 ```bash
-smoo monorepo validate-commit-msg <commit-msg-file>
+smoo monorepo validate-commit-msg --fix <commit-msg-file>
 ```
 
-This keeps hook behavior consistent with CI and avoids duplicating commit message parsing in shell.
+This keeps hook behavior consistent with CI and avoids duplicating commit message parsing in shell. With `--fix`, smoo
+wraps prose body paragraphs through `fmt -w 72` while preserving fenced code blocks, quoted markdown, indented blocks,
+bullets, trailers, URLs, and comment lines.
+
+Conventional commit scopes should use Nx project names. For packages in the same npm scope as the root package, smoo
+requires `package.json` `nx.name` to be the unscoped package name, such as `cli` for `@smoothbricks/cli`, so subjects
+like `fix(cli): repair release notes` map cleanly to Nx Release.
 
 ## GitHub Actions
 
@@ -254,6 +264,9 @@ Versioning:
   while the disk fallback supports initial releases before package tags exist.
 - [Nx Release][nx-release] config must use `versionActions: "@smoothbricks/cli/nx-version-actions"`. This wraps Nx's JS
   version actions and temporarily syncs `bun.lock` workspace versions after Nx runs `bun install --lockfile-only`.
+- Same-org scoped packages must define short `package.json` `nx.name` values, for example `@smoothbricks/money` uses
+  `"nx": { "name": "money" }`. This lets Nx Release understand commit scopes like `fix(money): ...` without requiring
+  the npm org in every commit subject.
 - [Nx Release][nx-release] `preVersionCommand` is intentionally not used. smoo builds exactly the packages that still
   need npm publish immediately before packing them, while the managed workflow separately builds, lints, tests, and
   validates newly created release commits.
