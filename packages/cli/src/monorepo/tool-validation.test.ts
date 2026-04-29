@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { applyToolConfigDefaults, validateToolConfig } from './tool-validation.js';
+import { applyToolConfigDefaults, applyToolingPackageDefaults, validateToolConfig } from './tool-validation.js';
 
 describe('tool configuration validation', () => {
   it('fixes root, tooling, and devenv tool declarations', async () => {
@@ -40,7 +40,8 @@ describe('tool configuration validation', () => {
       expect(rootPackage.devDependencies['@smoothbricks/cli']).toBeUndefined();
       expect(rootPackage.devDependencies.nx).toBe('22.5.4');
       expect(rootPackage.workspaces).toContain('tooling');
-      expect(toolingPackage.dependencies['@smoothbricks/cli']).toBe('workspace:*');
+      expect(toolingPackage.name).toBe('@smoothbricks/tooling');
+      expect(toolingPackage.dependencies['@smoothbricks/cli']).toBe(await currentCliRange());
       expect(devenv).toContain('nodejs_latest');
       expect(devenv).toContain('coreutils');
       expect(devenv).toContain('git-format-staged');
@@ -69,9 +70,9 @@ describe('tool configuration validation', () => {
         },
       });
       await writeJson(join(root, 'tooling/package.json'), {
-        name: 'tooling',
+        name: '@smoothbricks/tooling',
         private: true,
-        dependencies: { '@smoothbricks/cli': 'workspace:*' },
+        dependencies: { '@smoothbricks/cli': await currentCliRange() },
       });
       const devenvPath = join(root, 'tooling/direnv/devenv.nix');
       await mkdir(dirname(devenvPath), { recursive: true });
@@ -100,7 +101,36 @@ describe('tool configuration validation', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('uses workspace cli only when @smoothbricks/cli is a real workspace package', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-tool-validation-'));
+    try {
+      await writeJson(join(root, 'package.json'), {
+        name: '@smoothbricks/codebase',
+        version: '0.0.0',
+        private: true,
+        workspaces: ['packages/*', 'tooling'],
+      });
+      await writeJson(join(root, 'packages/cli/package.json'), {
+        name: '@smoothbricks/cli',
+        version: '0.1.1',
+      });
+
+      applyToolingPackageDefaults(root);
+
+      const toolingPackage = JSON.parse(await readFile(join(root, 'tooling/package.json'), 'utf8'));
+      expect(toolingPackage.name).toBe('@smoothbricks/tooling');
+      expect(toolingPackage.dependencies['@smoothbricks/cli']).toBe('workspace:*');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
+
+async function currentCliRange(): Promise<string> {
+  const pkg = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'));
+  return `^${pkg.version}`;
+}
 
 async function writeJson(path: string, value: Record<string, unknown>): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
