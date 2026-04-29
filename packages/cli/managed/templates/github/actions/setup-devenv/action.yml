@@ -16,12 +16,6 @@ runs:
     # exist before actions/checkout has populated the working tree.
     - name: ❄️ Install Nix
       uses: DeterminateSystems/determinate-nix-action@v3
-      with:
-        extra-conf: |
-          keep-outputs = true
-          keep-derivations = true
-          gc-keep-derivations = true
-          gc-keep-outputs = true
 
     - name: 🧊 Cache Nix profiles and store NAR
       id: nix-cache
