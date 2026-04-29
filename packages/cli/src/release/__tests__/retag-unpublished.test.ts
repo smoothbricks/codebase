@@ -7,7 +7,7 @@ import {
   retagUnpublished,
 } from '../retag-unpublished.js';
 
-const pkg: ReleasePackageInfo = { name: '@scope/pkg', path: 'packages/pkg', version: '1.2.3' };
+const pkg: ReleasePackageInfo = { name: '@scope/pkg', projectName: 'pkg', path: 'packages/pkg', version: '1.2.3' };
 
 describe('retag unpublished releases', () => {
   it('moves unpublished owned tags, pushes with a remote lease, and dispatches publish auto', async () => {

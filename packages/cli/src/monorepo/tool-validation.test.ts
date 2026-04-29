@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -10,7 +10,28 @@ import {
   validateToolConfig,
 } from './tool-validation.js';
 
+const registryVersions: Record<string, string[]> = {
+  '@biomejs/biome': ['2.3.5'],
+  '@nx/js': ['22.5.4'],
+  '@smoothbricks/nx-plugin': ['0.0.1'],
+  eslint: ['9.39.1'],
+  'eslint-stdout': ['1.1.1', '1.1.2'],
+  nx: ['22.5.4'],
+  prettier: ['3.6.1'],
+  typescript: ['5.9.3'],
+};
+
+const realFetch = globalThis.fetch;
+
 describe('tool configuration validation', () => {
+  beforeEach(() => {
+    globalThis.fetch = mockRegistryFetch as typeof fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
   it('fixes root, tooling, and devenv tool declarations', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-tool-validation-'));
     try {
@@ -171,7 +192,46 @@ async function currentCliRange(): Promise<string> {
 
 async function currentEslintStdoutRange(): Promise<string> {
   const pkg = JSON.parse(await readFile(new URL('../../../eslint-stdout/package.json', import.meta.url), 'utf8'));
-  return `^${pkg.version}`;
+  return `^${latestPatchVersion('eslint-stdout', pkg.version) ?? pkg.version}`;
+}
+
+function mockRegistryFetch(input: Parameters<typeof fetch>[0]): Promise<Response> {
+  const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+  const packageName = decodeURIComponent(new URL(url).pathname.slice(1));
+  const versions = registryVersions[packageName];
+  if (!versions) {
+    return Promise.resolve(new Response('{}', { status: 404 }));
+  }
+  return Promise.resolve(
+    new Response(JSON.stringify({ versions: Object.fromEntries(versions.map((version) => [version, {}])) }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }),
+  );
+}
+
+function latestPatchVersion(packageName: string, version: string): string | null {
+  const [major, minor] = version.split('.');
+  if (!major || !minor) {
+    return null;
+  }
+  return (
+    (registryVersions[packageName] ?? [])
+      .filter((candidate) => candidate.startsWith(`${major}.${minor}.`))
+      .sort((left, right) => compareDotVersions(right, left))[0] ?? null
+  );
+}
+
+function compareDotVersions(left: string, right: string): number {
+  const leftParts = left.split('.').map(Number);
+  const rightParts = right.split('.').map(Number);
+  for (let index = 0; index < Math.max(leftParts.length, rightParts.length); index += 1) {
+    const diff = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
+    if (diff !== 0) {
+      return diff;
+    }
+  }
+  return 0;
 }
 
 async function currentNxPluginRange(): Promise<string> {

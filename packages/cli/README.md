@@ -168,12 +168,14 @@ package `repository.url` is a validation failure so new packages must consciousl
 current repository or mirrored from another one. Init still sets `publishConfig.access = "public"`, repository type,
 repository directory, export ordering, and source-file publish entries when those can be derived safely.
 
-`smoo monorepo list-release-packages` prints the comma-separated package names that are both `npm:public` and owned by
-the current repository. Release commands, trusted-publisher setup, and the managed publish workflow use this owned
-release package list instead of every public package in the workspace.
+`smoo monorepo list-release-packages` prints the comma-separated Nx project names for packages that are both
+`npm:public` and owned by the current repository. Release commands, trusted-publisher setup, and the managed publish
+workflow use this owned release package list instead of every public package in the workspace. smoo keeps both names in
+release metadata: Nx commands receive `projectName`, while npm publish, GitHub Releases, and release tags use the real
+package `name`.
 
 For [GitHub Actions], `smoo monorepo list-release-packages --fail-empty --github-output "$GITHUB_OUTPUT"` appends the
-`projects=<package-list>` output expected by the managed publish workflow and fails with a clear error when no owned
+`projects=<nx-project-list>` output expected by the managed publish workflow and fails with a clear error when no owned
 release packages exist.
 
 `smoo release npm-status` shows whether each owned release package's current `name@version` already exists on npm. It is
@@ -310,8 +312,13 @@ Release commands wrap [Nx Release][nx-release] but keep SmoothBricks policy in o
 
 Versioning:
 
-- `--bump auto` uses [Nx Release][nx-release] [Conventional Commits] versioning.
-- `--bump patch|minor|major|prerelease` forces the release specifier.
+- `--bump auto` first filters owned release packages to package-local candidates, then lets [Nx Release][nx-release]
+  derive the semver bump from [Conventional Commits]. A tagged package is an auto candidate only when files under its
+  package root changed since its current `name@version` release tag. An untagged package is an auto candidate only when
+  its package root has git history. Root-only changes, workflow edits, lockfile-only churn, and other workspace-global
+  changes may still affect Nx tasks, but they do not make unrelated package artifacts releasable.
+- `--bump patch|minor|major|prerelease` forces the release specifier for the full owned release package set. Forced
+  bumps intentionally bypass the package-local auto filter.
 - Release packages are discovered from `npm:public` packages whose `repository.url` exactly matches the root package.
 - [Nx Release][nx-release] config must use `currentVersionResolver: "git-tag"` with
   `fallbackCurrentVersionResolver: "disk"`. Conventional-commit versioning requires git tags as the primary source,
@@ -321,6 +328,9 @@ Versioning:
 - Same-org scoped packages must define short `package.json` `nx.name` values, for example `@smoothbricks/money` uses
   `"nx": { "name": "money" }`. This lets Nx Release understand commit scopes like `fix(money): ...` without requiring
   the npm org in every commit subject.
+- Nx project names and npm package names are different release identities. Nx project filters, workflow `projects=`
+  outputs, build/lint/test validation, and project changelog lookup use `projectName`. npm publish checks, tarball
+  validation, GitHub Release titles, and durable release tags use package `name`.
 - [Nx Release][nx-release] `preVersionCommand` is intentionally not used. smoo builds exactly the packages that still
   need npm publish immediately before packing them, while the managed workflow separately builds, lints, tests, and
   validates newly created release commits.
@@ -332,8 +342,9 @@ Versioning:
   target, versioning returns `mode=none` and leaves idempotent completion to `smoo release publish`.
 - `smoo release version --github-output "$GITHUB_OUTPUT"` appends `mode=new|none` and `projects=<comma-list>`. The
   managed publish workflow uses `mode != "none"` to build, lint, test, and validate exactly the commit that
-  `smoo release publish` will publish. The validation and publish step names include the selected mode so the [GitHub
-  Actions] run shows whether it is creating a new release or recording a no-op.
+  `smoo release publish` will publish. `projects` is a comma-separated Nx project-name list, not an npm package-name
+  list. The validation and publish step names include the selected mode so the [GitHub Actions] run shows whether it is
+  creating a new release or recording a no-op.
 - Explicit bumps are mandatory when `HEAD` is not already a release target: after pending releases are repaired,
   `bump=patch|minor|major|prerelease` must make Nx create a new release commit. smoo fails if Nx returns without moving
   `HEAD`; `auto` may no-op when there are no releasable conventional commits.
@@ -345,8 +356,9 @@ Versioning:
   [oven-sh/bun#18906](https://github.com/oven-sh/bun/issues/18906),
   [oven-sh/bun#20477](https://github.com/oven-sh/bun/issues/20477), and
   [oven-sh/bun#20829](https://github.com/oven-sh/bun/issues/20829).
-- Package release tags must use `{projectName}@{version}`. smoo derives release package/version pairs from that tag
-  shape and recreates missing local tags for Nx release commits before repairing remote state.
+- Package release tags must use the npm package name and version, for example `@smoothbricks/nx-plugin@0.0.2`. smoo
+  derives release package/version pairs from that tag shape and recreates missing local tags for Nx release commits
+  before repairing remote state. Nx project names are only CLI/project-graph identifiers.
 - `smoo release retag-unpublished <tag...>` is a break-glass recovery command for the case where Nx already committed a
   version bump but npm publish failed before the package version became durable. It moves exact owned release tags to
   `HEAD` by default without bumping package manifests again. It refuses to move a tag when `package@version` already
@@ -372,8 +384,8 @@ decide which tags still need work; it does not walk normal commits looking for r
 4. Sort the remaining repair commits oldest-to-newest. Only after this sorted non-HEAD repair list exists does smoo
    start checking out commits.
 5. For each repair commit, check out the commit once and load that checkout's direnv environment once. If any grouped
-   tag still needs npm publish, run `nx run-many -t build --projects=<comma-separated npm-missing packages>` once, then
-   publish those packages using the npm dist-tag implied by each package version. If the commit only needs GitHub
+   tag still needs npm publish, run `nx run-many -t build --projects=<comma-separated npm-missing Nx projects>` once,
+   then publish those packages using the npm dist-tag implied by each package version. If the commit only needs GitHub
    Releases, skip the build. Finally, create the missing GitHub Releases for the grouped tags that need them.
 
 Pending release state should be a suffix of the release-target timeline because `repair-pending` runs before every
@@ -390,9 +402,9 @@ Publishing:
 - npm registry state gates publish idempotency only. It decides which already-versioned package tarballs still need to
   be published during a real release retry, not whether versioning should run or whether the workflow has a release to
   publish.
-- Before npm publish, smoo runs `nx run-many -t build --projects=<comma-separated npm-missing packages>` for exactly the
-  packages whose `name@version` is not on npm yet. Nx cache makes this cheap when the managed workflow already built the
-  same projects, and it keeps reruns self-sufficient when repairing a previously selected `HEAD` release target.
+- Before npm publish, smoo runs `nx run-many -t build --projects=<comma-separated npm-missing Nx projects>` for exactly
+  the packages whose `name@version` is not on npm yet. Nx cache makes this cheap when the managed workflow already built
+  the same projects, and it keeps reruns self-sufficient when repairing a previously selected `HEAD` release target.
 - Publish uses `bun pm pack` to create package tarballs, then publishes those tarballs with latest npm CLI and
   `--provenance`. Each package uses the npm dist-tag implied by its own version (`next` for prereleases, `latest` for
   stable versions). Bun pack resolves internal `workspace:*` dependency ranges to real versions in the tarball manifest;

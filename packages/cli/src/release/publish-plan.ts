@@ -26,7 +26,7 @@ export function planPublishActions<Package extends ReleasePackageInfo>(
   const githubReleasePackages = input.releasePackages.filter((pkg) => githubMissingNames.has(pkg.name));
 
   return {
-    buildProjects: npmPackages.map((pkg) => pkg.name),
+    buildProjects: npmPackages.map((pkg) => pkg.projectName),
     publishPackages: npmPackages.map((pkg) => ({ pkg, distTag: npmDistTagForVersion(pkg.version) })),
     githubReleasePackages,
   };

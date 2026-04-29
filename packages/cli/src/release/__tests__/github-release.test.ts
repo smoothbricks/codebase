@@ -8,14 +8,19 @@ import {
   projectChangelogContents,
 } from '../github-release.js';
 
-const stable: ReleasePackageInfo = { name: '@scope/pkg', path: 'packages/pkg', version: '1.2.3' };
-const prerelease: ReleasePackageInfo = { name: '@scope/pkg', path: 'packages/pkg', version: '2.0.0-beta.1' };
+const stable: ReleasePackageInfo = { name: '@scope/pkg', projectName: 'pkg', path: 'packages/pkg', version: '1.2.3' };
+const prerelease: ReleasePackageInfo = {
+  name: '@scope/pkg',
+  projectName: 'pkg',
+  path: 'packages/pkg',
+  version: '2.0.0-beta.1',
+};
 
 describe('GitHub release helpers', () => {
   it('configures the Nx changelog API for render-only project changelogs', () => {
     expect(nxProjectChangelogArgs(stable, '@scope/pkg@1.2.2', false)).toEqual({
       version: '1.2.3',
-      projects: ['@scope/pkg'],
+      projects: ['pkg'],
       gitCommit: false,
       gitTag: false,
       gitPush: false,
@@ -30,7 +35,7 @@ describe('GitHub release helpers', () => {
   it('marks the Nx changelog request as a first release when there is no previous tag', () => {
     expect(nxProjectChangelogArgs(stable, null, true)).toEqual({
       version: '1.2.3',
-      projects: ['@scope/pkg'],
+      projects: ['pkg'],
       gitCommit: false,
       gitTag: false,
       gitPush: false,
@@ -47,17 +52,17 @@ describe('GitHub release helpers', () => {
       projectChangelogContents(
         {
           projectChangelogs: {
-            '@scope/pkg': { contents: 'generated release notes' },
+            pkg: { contents: 'generated release notes' },
           },
         },
-        '@scope/pkg',
+        'pkg',
       ),
     ).toBe('generated release notes');
   });
 
   it('fails when Nx omits the requested project changelog', () => {
-    expect(() => projectChangelogContents({ projectChangelogs: {} }, '@scope/pkg')).toThrow(
-      'Nx did not generate a project changelog for @scope/pkg.',
+    expect(() => projectChangelogContents({ projectChangelogs: {} }, 'pkg')).toThrow(
+      'Nx did not generate a project changelog for pkg.',
     );
   });
 

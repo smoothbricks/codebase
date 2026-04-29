@@ -15,6 +15,7 @@ import {
   NPM_BOOTSTRAP_DIST_TAG,
   NPM_BOOTSTRAP_VERSION,
 } from './bootstrap-npm-packages.js';
+import { autoReleaseCandidatePackages } from './candidates.js';
 import {
   type ReleaseTagRecord as CoreReleaseTagRecord,
   type ReleaseTarget as CoreReleaseTarget,
@@ -79,13 +80,14 @@ export interface ReleaseRetagUnpublishedOptions {
 export async function releaseVersion(root: string, options: ReleaseVersionOptions): Promise<void> {
   const bump = releaseBumpArg(options.bump);
   const packages = releasePackages(root);
-  const projects = releasePackageProjects(packages);
   const result = await runReleaseVersion(
     {
       releasePackagesAtHead: () => releasePackagesAtHead(root, packages),
+      releaseVersionPackages: (releaseBump) => releaseVersionPackages(root, packages, releaseBump),
       ensureLocalReleaseTags: (releasePackages) => ensureLocalReleaseTags(root, releasePackages),
       gitHead: () => gitHead(root),
-      runNxReleaseVersion: (releaseBump, dryRun) => runNxReleaseVersion(root, projects, releaseBump, dryRun),
+      runNxReleaseVersion: (releasePackages, releaseBump, dryRun) =>
+        runNxReleaseVersion(root, releasePackageProjects(releasePackages), releaseBump, dryRun),
       assertCleanGitTree: () => assertCleanGitTree(root),
     },
     { bump, dryRun: options.dryRun === true },
@@ -443,7 +445,25 @@ function releasePackages(root: string): ReleasePackage[] {
 }
 
 function releasePackageProjects(packages: ReleasePackage[]): string {
-  return packages.map((pkg) => pkg.name).join(',');
+  return packages.map((pkg) => pkg.projectName).join(',');
+}
+
+async function releaseVersionPackages(
+  root: string,
+  packages: ReleasePackage[],
+  bump: string,
+): Promise<ReleasePackage[]> {
+  if (bump !== 'auto') {
+    return packages;
+  }
+  return autoReleaseCandidatePackages(
+    {
+      gitRefExists: (ref) => gitRefExists(root, ref),
+      packageChangedSince: (ref, packagePath) => packageChangedSince(root, ref, packagePath),
+      packageHasHistory: (packagePath) => packageHasHistory(root, packagePath),
+    },
+    packages,
+  );
 }
 
 async function runNxReleaseVersion(root: string, projects: string, bump: string, dryRun: boolean): Promise<void> {
@@ -815,6 +835,25 @@ async function fetchReleaseRefs(root: string, remote: string, branch: string): P
 async function gitRefExists(root: string, ref: string): Promise<boolean> {
   const result = await $`git rev-parse --verify ${ref}`.cwd(root).quiet().nothrow();
   return result.exitCode === 0;
+}
+
+async function packageChangedSince(root: string, ref: string, packagePath: string): Promise<boolean> {
+  const result = await $`git diff --quiet ${`${ref}..HEAD`} -- ${packagePath}`.cwd(root).quiet().nothrow();
+  if (result.exitCode === 0) {
+    return false;
+  }
+  if (result.exitCode === 1) {
+    return true;
+  }
+  throw new Error(`Unable to inspect package changes under ${packagePath}.`);
+}
+
+async function packageHasHistory(root: string, packagePath: string): Promise<boolean> {
+  const result = await $`git log --format=%H -- ${packagePath}`.cwd(root).quiet().nothrow();
+  if (result.exitCode !== 0) {
+    throw new Error(`Unable to inspect package history under ${packagePath}.`);
+  }
+  return decode(result.stdout).trim().length > 0;
 }
 
 async function gitIsAncestor(root: string, ancestor: string, descendant: string): Promise<boolean> {

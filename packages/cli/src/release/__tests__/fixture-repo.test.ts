@@ -44,8 +44,8 @@ describe('release planning with fixture git repositories', () => {
       const githubReleases = new Set(['@scope/a@1.0.0']);
       const records = await collectOwnedReleaseTagRecords(
         [
-          { name: '@scope/a', path: 'packages/a' },
-          { name: '@scope/b', path: 'packages/b' },
+          { name: '@scope/a', projectName: 'a', path: 'packages/a' },
+          { name: '@scope/b', projectName: 'b', path: 'packages/b' },
         ],
         head,
         {
@@ -83,12 +83,16 @@ describe('release planning with fixture git repositories', () => {
       await git(checkout, ['fetch', '--tags', 'origin', 'main']);
       const head = await gitOutput(checkout, ['rev-parse', 'HEAD']);
 
-      const records = await collectOwnedReleaseTagRecords([{ name: '@scope/a', path: 'packages/a' }], head, {
-        listReleaseTagsByCreatorDate: () => gitReleaseTagsByCreatorDate(checkout),
-        isAncestor: (ancestor, descendant) => gitIsAncestor(checkout, ancestor, descendant),
-        packageVersionAtRef: (packagePath, ref) => packageVersionAtRef(checkout, packagePath, ref),
-        durableTagState: async () => ({ npmPublished: false, githubReleaseExists: false }),
-      });
+      const records = await collectOwnedReleaseTagRecords(
+        [{ name: '@scope/a', projectName: 'a', path: 'packages/a' }],
+        head,
+        {
+          listReleaseTagsByCreatorDate: () => gitReleaseTagsByCreatorDate(checkout),
+          isAncestor: (ancestor, descendant) => gitIsAncestor(checkout, ancestor, descendant),
+          packageVersionAtRef: (packagePath, ref) => packageVersionAtRef(checkout, packagePath, ref),
+          durableTagState: async () => ({ npmPublished: false, githubReleaseExists: false }),
+        },
+      );
 
       expect(records.map((record) => record.tag)).toEqual(['@scope/a@1.0.0']);
       expect(pendingReleaseTargets(records, 'not-head').map((target) => target.sha)).toEqual([head]);
@@ -101,7 +105,7 @@ describe('release planning with fixture git repositories', () => {
       await writeBuildablePackage(root, '@scope/a', 'packages/a');
       await writeBuildablePackage(root, '@scope/b', 'packages/b');
 
-      await $`nx run-many -t build --projects=${'@scope/a,@scope/b'}`.cwd(root).quiet();
+      await $`nx run-many -t build --projects=${'a,b'}`.cwd(root).quiet();
 
       await expect(readFile(join(root, 'packages/a/dist/index.js'), 'utf8')).resolves.toBe('{}\n');
       await expect(readFile(join(root, 'packages/b/dist/index.js'), 'utf8')).resolves.toBe('{}\n');
@@ -197,7 +201,12 @@ describe('release planning with fixture git repositories', () => {
       const runner = join(author, 'runner');
       await git(runner, ['config', 'user.name', 'Test User']);
       await git(runner, ['config', 'user.email', 'test@example.com']);
-      const pkg: ReleasePackageInfo = { name: '@scope/pushed', path: 'packages/pushed', version: '1.0.0' };
+      const pkg: ReleasePackageInfo = {
+        name: '@scope/pushed',
+        projectName: 'pushed',
+        path: 'packages/pushed',
+        version: '1.0.0',
+      };
       const shell = new LocalGitRepairShell(runner);
 
       const summary = await completeReleaseAtHead(shell, [pkg], false, false);
@@ -216,8 +225,8 @@ describe('release planning with fixture git repositories', () => {
 
 function releaseFixturePackages(): ReleasePackageInfo[] {
   return [
-    { name: '@scope/a', path: 'packages/a', version: '0.0.0' },
-    { name: '@scope/b', path: 'packages/b', version: '0.0.0' },
+    { name: '@scope/a', projectName: 'a', path: 'packages/a', version: '0.0.0' },
+    { name: '@scope/b', projectName: 'b', path: 'packages/b', version: '0.0.0' },
   ];
 }
 
@@ -265,7 +274,7 @@ class LocalGitRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
 
   async buildReleaseCandidate(packages: ReleasePackageInfo[]): Promise<void> {
     this.builds.push(packages.map((pkg) => pkg.name));
-    await $`nx run-many -t build --projects=${packages.map((pkg) => pkg.name).join(',')}`.cwd(this.root).quiet();
+    await $`nx run-many -t build --projects=${packages.map((pkg) => pkg.projectName).join(',')}`.cwd(this.root).quiet();
   }
 
   async publishPackage(pkg: ReleasePackageInfo, distTag: string, dryRun: boolean): Promise<void> {

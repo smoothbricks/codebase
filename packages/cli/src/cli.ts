@@ -80,10 +80,10 @@ function buildProgram(): Command {
   monorepo
     .command('list-release-packages')
     .option('--fail-empty', 'fail when no owned release packages are found')
-    .option('--github-output <path>', 'append projects=<packages> to a GitHub Actions output file')
+    .option('--github-output <path>', 'append projects=<nx-projects> to a GitHub Actions output file')
     .action(async (options: { failEmpty?: boolean; githubOutput?: string }) => {
-      const { listReleasePackagesForNx } = await import('./monorepo/index.js');
-      const packages = listReleasePackagesForNx(await findRepoRoot(), options);
+      const { listReleaseProjectNamesForNx } = await import('./monorepo/index.js');
+      const packages = listReleaseProjectNamesForNx(await findRepoRoot(), options);
       if (!options.githubOutput) {
         console.log(packages);
       }
@@ -109,7 +109,7 @@ function buildProgram(): Command {
     .command('version')
     .option('--bump <bump>', 'auto, patch, minor, major, or prerelease', 'auto')
     .option('--dry-run [dryRun]', 'run without writing versions or tags')
-    .option('--github-output <path>', 'append mode=<mode> and projects=<packages> to a GitHub Actions output file')
+    .option('--github-output <path>', 'append mode=<mode> and projects=<nx-projects> to a GitHub Actions output file')
     .action(async (options: { bump: string; dryRun?: string | boolean; githubOutput?: string }) => {
       const { releaseVersion } = await import('./release/index.js');
       await releaseVersion(await findRepoRoot(), {

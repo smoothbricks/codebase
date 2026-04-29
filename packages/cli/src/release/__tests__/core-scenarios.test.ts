@@ -10,9 +10,15 @@ import {
   type ReleaseTagRecord,
 } from '../core.js';
 
-const stablePackage: ReleasePackageInfo = { name: '@scope/stable', path: 'packages/stable', version: '1.0.0' };
+const stablePackage: ReleasePackageInfo = {
+  name: '@scope/stable',
+  projectName: 'stable',
+  path: 'packages/stable',
+  version: '1.0.0',
+};
 const prereleasePackage: ReleasePackageInfo = {
   name: '@scope/prerelease',
+  projectName: 'prerelease',
   path: 'packages/prerelease',
   version: '2.0.0-beta.1',
 };
@@ -109,7 +115,7 @@ describe('release core scenario coverage', () => {
     };
 
     const records = await collectOwnedReleaseTagRecords(
-      [{ name: stablePackage.name, path: stablePackage.path }],
+      [{ name: stablePackage.name, projectName: stablePackage.projectName, path: stablePackage.path }],
       'selected-ref',
       shell,
     );
@@ -142,8 +148,8 @@ describe('release core scenario coverage', () => {
 
     const records = await collectOwnedReleaseTagRecords(
       [
-        { name: stablePackage.name, path: stablePackage.path },
-        { name: prereleasePackage.name, path: prereleasePackage.path },
+        { name: stablePackage.name, projectName: stablePackage.projectName, path: stablePackage.path },
+        { name: prereleasePackage.name, projectName: prereleasePackage.projectName, path: prereleasePackage.path },
       ],
       'selected-ref',
       shell,
@@ -165,7 +171,11 @@ describe('release core scenario coverage', () => {
     };
 
     await expect(
-      collectOwnedReleaseTagRecords([{ name: stablePackage.name, path: stablePackage.path }], 'selected-ref', shell),
+      collectOwnedReleaseTagRecords(
+        [{ name: stablePackage.name, projectName: stablePackage.projectName, path: stablePackage.path }],
+        'selected-ref',
+        shell,
+      ),
     ).rejects.toThrow(
       'Release tag @scope/stable@1.0.0 points at mismatch, but packages/stable/package.json has version 1.0.1.',
     );

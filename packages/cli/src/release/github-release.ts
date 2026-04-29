@@ -39,7 +39,7 @@ export async function renderNxProjectChangelogContents(input: RenderNxProjectCha
       nxRenderOnlyReleaseConfig,
       false,
     )(nxProjectChangelogArgs(input.pkg, input.previousTag, input.dryRun));
-    return projectChangelogContents(result, input.pkg.name);
+    return projectChangelogContents(result, input.pkg.projectName);
   });
 }
 
@@ -65,7 +65,7 @@ export async function createOrUpdateGithubRelease(
 export function nxProjectChangelogArgs(pkg: ReleasePackageInfo, previousTag: string | null, dryRun: boolean) {
   const base = {
     version: pkg.version,
-    projects: [pkg.name],
+    projects: [pkg.projectName],
     gitCommit: false,
     gitTag: false,
     gitPush: false,

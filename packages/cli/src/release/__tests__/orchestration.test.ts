@@ -8,9 +8,15 @@ import {
   runReleaseVersion,
 } from '../orchestration.js';
 
-const stable: ReleasePackageInfo = { name: '@scope/stable', path: 'packages/stable', version: '1.0.0' };
+const stable: ReleasePackageInfo = {
+  name: '@scope/stable',
+  projectName: 'stable',
+  path: 'packages/stable',
+  version: '1.0.0',
+};
 const prerelease: ReleasePackageInfo = {
   name: '@scope/prerelease',
+  projectName: 'prerelease',
   path: 'packages/prerelease',
   version: '2.0.0-beta.1',
 };
@@ -84,14 +90,42 @@ describe('release orchestration', () => {
   });
 
   it('runs forced Nx versioning for an untagged HEAD and reports a new release commit', async () => {
-    const shell = new RecordingVersionShell({ releasePackagesAtHead: [[], [stable]], heads: ['before', 'after'] });
+    const shell = new RecordingVersionShell({
+      releasePackagesAtHead: [[], [stable]],
+      releaseVersionPackages: [stable, prerelease],
+      heads: ['before', 'after'],
+    });
 
     const result = await runReleaseVersion(shell, { bump: 'patch', dryRun: false });
 
     expect(result).toEqual({ mode: 'new', packages: [stable], status: 'new-release' });
-    expect(shell.nxRuns).toEqual([{ bump: 'patch', dryRun: false }]);
+    expect(shell.nxRuns).toEqual([{ packages: ['@scope/stable', '@scope/prerelease'], bump: 'patch', dryRun: false }]);
     expect(shell.cleanChecks).toBe(1);
     expect(shell.ensureCalls).toEqual([['@scope/stable']]);
+  });
+
+  it('skips auto Nx versioning when no package-local candidates exist', async () => {
+    const shell = new RecordingVersionShell({ releasePackagesAtHead: [[]], releaseVersionPackages: [] });
+
+    const result = await runReleaseVersion(shell, { bump: 'auto', dryRun: false });
+
+    expect(result).toEqual({ mode: 'none', packages: [], status: 'no-release-needed' });
+    expect(shell.nxRuns).toEqual([]);
+    expect(shell.cleanChecks).toBe(0);
+    expect(shell.ensureCalls).toEqual([]);
+  });
+
+  it('runs auto Nx versioning only for selected package-local candidates', async () => {
+    const shell = new RecordingVersionShell({
+      releasePackagesAtHead: [[], [stable]],
+      releaseVersionPackages: [stable],
+      heads: ['before', 'after'],
+    });
+
+    const result = await runReleaseVersion(shell, { bump: 'auto', dryRun: false });
+
+    expect(result).toEqual({ mode: 'new', packages: [stable], status: 'new-release' });
+    expect(shell.nxRuns).toEqual([{ packages: ['@scope/stable'], bump: 'auto', dryRun: false }]);
   });
 });
 
@@ -166,18 +200,28 @@ class RecordingRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
 
 class RecordingVersionShell implements ReleaseVersionShell<ReleasePackageInfo> {
   readonly ensureCalls: string[][] = [];
-  readonly nxRuns: Array<{ bump: string; dryRun: boolean }> = [];
+  readonly nxRuns: Array<{ packages: string[]; bump: string; dryRun: boolean }> = [];
   cleanChecks = 0;
   private readonly releaseBatches: ReleasePackageInfo[][];
+  private readonly versionPackages: ReleasePackageInfo[];
   private readonly heads: string[];
 
-  constructor(options: { releasePackagesAtHead: ReleasePackageInfo[][]; heads?: string[] }) {
+  constructor(options: {
+    releasePackagesAtHead: ReleasePackageInfo[][];
+    releaseVersionPackages?: ReleasePackageInfo[];
+    heads?: string[];
+  }) {
     this.releaseBatches = [...options.releasePackagesAtHead];
+    this.versionPackages = options.releaseVersionPackages ?? [stable, prerelease];
     this.heads = [...(options.heads ?? [])];
   }
 
   async releasePackagesAtHead(): Promise<ReleasePackageInfo[]> {
     return this.releaseBatches.shift() ?? [];
+  }
+
+  async releaseVersionPackages(): Promise<ReleasePackageInfo[]> {
+    return this.versionPackages;
   }
 
   async ensureLocalReleaseTags(packages: ReleasePackageInfo[]): Promise<void> {
@@ -188,8 +232,8 @@ class RecordingVersionShell implements ReleaseVersionShell<ReleasePackageInfo> {
     return this.heads.shift() ?? 'head';
   }
 
-  async runNxReleaseVersion(bump: string, dryRun: boolean): Promise<void> {
-    this.nxRuns.push({ bump, dryRun });
+  async runNxReleaseVersion(packages: ReleasePackageInfo[], bump: string, dryRun: boolean): Promise<void> {
+    this.nxRuns.push({ packages: packageNames(packages), bump, dryRun });
   }
 
   async assertCleanGitTree(): Promise<void> {

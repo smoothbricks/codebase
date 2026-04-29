@@ -4,9 +4,9 @@ import { groupReleaseTargets, pendingReleaseTargets, type ReleasePackageInfo, ty
 import { planPublishActions } from '../publish-plan.js';
 
 const packages: ReleasePackageInfo[] = [
-  { name: '@scope/a', path: 'packages/a', version: '1.0.0' },
-  { name: '@scope/b', path: 'packages/b', version: '2.0.0-beta.1' },
-  { name: '@scope/c', path: 'packages/c', version: '3.0.0' },
+  { name: '@scope/a', projectName: 'a', path: 'packages/a', version: '1.0.0' },
+  { name: '@scope/b', projectName: 'b', path: 'packages/b', version: '2.0.0-beta.1' },
+  { name: '@scope/c', projectName: 'c', path: 'packages/c', version: '3.0.0' },
 ];
 
 describe('release core properties', () => {
@@ -77,7 +77,7 @@ describe('release core properties', () => {
       fc.property(packageSubset(), packageSubset(), (npmMissingPackages, githubMissingPackages) => {
         const plan = planPublishActions({ releasePackages: packages, npmMissingPackages, githubMissingPackages });
 
-        expect(plan.buildProjects).toEqual(npmMissingPackages.map((pkg) => pkg.name));
+        expect(plan.buildProjects).toEqual(npmMissingPackages.map((pkg) => pkg.projectName));
         expect(plan.publishPackages.map((action) => action.pkg.name)).toEqual(
           npmMissingPackages.map((pkg) => pkg.name),
         );

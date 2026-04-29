@@ -87,16 +87,16 @@ describe('publish workflow definition', () => {
       ],
       bump: 'patch',
       dryRun: false,
-      version: { mode: 'new', projects: ['@scope/a', '@scope/b'] },
+      version: { mode: 'new', projects: ['a', 'b'] },
     });
 
     const outcome = await scenario.run();
 
     expect(outcome.validation).toEqual({
       checks: 1,
-      builds: ['@scope/a', '@scope/b'],
-      lints: ['@scope/a', '@scope/b'],
-      tests: ['@scope/a', '@scope/b'],
+      builds: ['a', 'b'],
+      lints: ['a', 'b'],
+      tests: ['a', 'b'],
       validates: 1,
     });
     expect(outcome.publishSawValidatedRelease).toBe(true);
@@ -110,7 +110,7 @@ describe('publish workflow definition', () => {
       current: [{ tag: '@scope/a@1.2.0', npmMissing: true, githubMissing: true }],
       bump: 'prerelease',
       dryRun: true,
-      version: { mode: 'new', projects: ['@scope/a'] },
+      version: { mode: 'new', projects: ['a'] },
     });
 
     const outcome = await scenario.run();
@@ -120,9 +120,9 @@ describe('publish workflow definition', () => {
     expect(outcome.repairBuildArtifacts).toEqual([]);
     expect(outcome.validation).toEqual({
       checks: 1,
-      builds: ['@scope/a'],
-      lints: ['@scope/a'],
-      tests: ['@scope/a'],
+      builds: ['a'],
+      lints: ['a'],
+      tests: ['a'],
       validates: 1,
     });
     expect(outcome.publishRan).toBe(true);
