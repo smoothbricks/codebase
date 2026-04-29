@@ -21,10 +21,13 @@ describe('root smoo monorepo policy', () => {
   it('fixes root scripts and Nx plugin defaults', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
     try {
-      await writeJson(join(root, 'package.json'), validRootPackage({ scripts: { lint: 'nx affected -t lint' } }));
+      await writeJson(
+        join(root, 'package.json'),
+        validRootPackage({ scripts: { lint: 'nx affected -t lint' }, nx: {} }),
+      );
       await writeJson(join(root, 'nx.json'), validNxJson());
 
-      expect(validateRootPackagePolicy(root)).toBe(4);
+      expect(validateRootPackagePolicy(root)).toBe(5);
       expect(validateNxReleaseConfig(root)).toBe(5);
 
       applyFixableMonorepoDefaults(root);
@@ -37,6 +40,7 @@ describe('root smoo monorepo policy', () => {
         lint: 'nx run-many -t lint',
         'lint:fix': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --unstaged',
       });
+      expect(rootPackage).toMatchObject({ nx: { includedScripts: [] } });
       expect(nxJson.targetDefaults).toEqual({ build: { cache: true, outputs: ['{projectRoot}/dist'] } });
       expect(nxJson.plugins).toEqual([
         {
@@ -419,7 +423,6 @@ describe('workspace package script policy', () => {
         extends: '../../tsconfig.base.json',
         compilerOptions: {
           baseUrl: '.',
-          rootDir: 'src',
           composite: false,
           declaration: false,
           declarationMap: false,
@@ -757,6 +760,7 @@ function validRootPackage(extra: Record<string, unknown> = {}): Record<string, u
     packageManager: 'bun@1.3.13',
     engines: { node: '>=24.0.0' },
     devDependencies: { '@types/bun': '1.3.13' },
+    nx: { includedScripts: [] },
     workspaces: ['packages/*'],
     ...extra,
   };

@@ -62,6 +62,7 @@
     "tooling"
   ],
   "nx": {
+    "includedScripts": [],
     "targets": {
       "local-registry": {
         "executor": "@nx/js:verdaccio",

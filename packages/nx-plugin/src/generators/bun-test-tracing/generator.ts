@@ -44,7 +44,7 @@ const DEFAULT_TEST_INCLUDES = [
   'src/test-suite-tracer.ts',
 ];
 
-const COPIED_COMPILER_OPTIONS = ['baseUrl', 'rootDir', 'module', 'moduleResolution', 'jsx', 'lib'];
+const COPIED_COMPILER_OPTIONS = ['baseUrl', 'module', 'moduleResolution', 'jsx', 'lib'];
 
 export default async function generator(tree: Tree, schema: BunTestTracingGeneratorSchema): Promise<void> {
   const options = normalizeOptions(schema);

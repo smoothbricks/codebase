@@ -61,6 +61,11 @@ export function applyRootScriptDefaults(root: string): void {
   for (const [name, command] of Object.entries(rootScriptPolicy)) {
     changed = setStringProperty(scripts, name, command) || changed;
   }
+  const nx = getOrCreateRecord(rootPackage, 'nx');
+  if (!Array.isArray(nx.includedScripts) || nx.includedScripts.length !== 0) {
+    nx.includedScripts = [];
+    changed = true;
+  }
   changed = sortRecordInPlace(scripts) || changed;
   if (changed) {
     writeJsonObject(rootPackagePath, rootPackage);
@@ -260,6 +265,7 @@ export function validateRootPackagePolicy(root: string): number {
     failures++;
   }
   failures += validateRootScripts(rootPackage);
+  failures += validateRootNxScriptInference(rootPackage);
   const packageManager = stringProperty(rootPackage, 'packageManager');
   if (!packageManager?.startsWith('bun@')) {
     console.error('package.json packageManager must use bun@<version>');
@@ -695,6 +701,15 @@ function validateRootScripts(rootPackage: Record<string, unknown>): number {
   return failures;
 }
 
+function validateRootNxScriptInference(rootPackage: Record<string, unknown>): number {
+  const nx = recordProperty(rootPackage, 'nx');
+  if (nx && Array.isArray(nx.includedScripts) && nx.includedScripts.length === 0) {
+    return 0;
+  }
+  console.error('package.json nx.includedScripts must be [] so root scripts do not become recursive Nx targets.');
+  return 1;
+}
+
 function validateNxPluginConfig(nxJson: Record<string, unknown>): number {
   let failures = 0;
   const targetDefaults = recordProperty(nxJson, 'targetDefaults');
@@ -944,7 +959,7 @@ function copyLibCompilerOptions(root: string, packagePath: string, target: Recor
     return false;
   }
   let changed = false;
-  for (const key of ['baseUrl', 'rootDir', 'module', 'moduleResolution', 'jsx', 'lib']) {
+  for (const key of ['baseUrl', 'module', 'moduleResolution', 'jsx', 'lib']) {
     if (hasOwn(libCompilerOptions, key) && target[key] !== libCompilerOptions[key]) {
       target[key] = libCompilerOptions[key];
       changed = true;
