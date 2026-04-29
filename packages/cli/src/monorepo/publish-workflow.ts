@@ -1,3 +1,5 @@
+import { isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
+
 export type PublishWorkflowBump = 'auto' | 'patch' | 'minor' | 'major' | 'prerelease';
 export type PublishWorkflowCondition = 'version-mode-not-none' | 'failure' | 'always';
 export type PublishWorkflowNxTarget = 'build' | 'lint' | 'test';
@@ -85,7 +87,7 @@ export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions 
     { kind: PublishWorkflowStepKind.SetupDevenv, name: '🧱 Setup Nix/devenv', id: 'setup' },
     { kind: PublishWorkflowStepKind.ConfigureReleaseAuthor, name: '🤖 Configure release author' },
   ];
-  if (options.repoName === '@smoothbricks/codebase') {
+  if (isSmoothBricksCodebasePackageName(options.repoName)) {
     setupSteps.push({ kind: PublishWorkflowStepKind.BuildSelfHostedCli, name: '🏗️ Build self-hosted smoo' });
   }
   return {

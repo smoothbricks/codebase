@@ -134,8 +134,7 @@ export function applyNxProjectNameDefaults(root: string): void {
     if (!suggestedName) {
       continue;
     }
-    const nx = getOrCreateRecord(pkg.json, 'nx');
-    const changed = setStringProperty(nx, 'name', suggestedName);
+    const changed = applyPackageNxConfig(pkg.json, { projectName: suggestedName }).changed;
     if (changed) {
       writeJsonObject(pkg.packageJsonPath, pkg.json);
       console.log(`updated        ${pkg.path}/package.json nx.name`);
@@ -427,13 +426,13 @@ export function applyPackageScriptPolicy(
   if (!scripts) {
     return false;
   }
-  const nx = getOrCreateRecord(pkg, 'nx');
-  const projectName = stringProperty(nx, 'name') ?? stringProperty(pkg, 'name');
+  const projectName = packageNxProjectName(pkg);
   if (!projectName) {
     return false;
   }
-  const targets = getOrCreateRecord(nx, 'targets');
-  let changed = false;
+  const nxConfig = applyPackageNxConfig(pkg, { projectName, targets: true });
+  const targets = nxConfig.targets;
+  let changed = nxConfig.changed;
   for (const [scriptName, rawCommand] of Object.entries(scripts)) {
     if (typeof rawCommand !== 'string') {
       continue;
@@ -567,6 +566,38 @@ function fixWorkspaceDependencyRanges(pkg: Record<string, unknown>, workspaceNam
     }
   }
   return changed;
+}
+
+interface PackageNxConfig {
+  nx: Record<string, unknown>;
+  targets: Record<string, unknown> | null;
+  changed: boolean;
+}
+
+interface PackageNxTargetsConfig {
+  nx: Record<string, unknown>;
+  targets: Record<string, unknown>;
+  changed: boolean;
+}
+
+function applyPackageNxConfig(
+  pkg: Record<string, unknown>,
+  options: { projectName: string; targets: true },
+): PackageNxTargetsConfig;
+function applyPackageNxConfig(pkg: Record<string, unknown>, options: { projectName: string }): PackageNxConfig;
+function applyPackageNxConfig(
+  pkg: Record<string, unknown>,
+  options: { projectName: string; targets?: boolean },
+): PackageNxConfig {
+  const nx = getOrCreateRecord(pkg, 'nx');
+  const changed = setStringProperty(nx, 'name', options.projectName);
+  const targets = options.targets === true ? getOrCreateRecord(nx, 'targets') : null;
+  return { nx, targets, changed };
+}
+
+function packageNxProjectName(pkg: Record<string, unknown>): string | null {
+  const nx = recordProperty(pkg, 'nx');
+  return (nx ? stringProperty(nx, 'name') : null) ?? stringProperty(pkg, 'name');
 }
 
 interface ScriptRewrite {
