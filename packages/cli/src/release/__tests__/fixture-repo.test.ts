@@ -25,14 +25,14 @@ describe('release planning with fixture git repositories', () => {
       await git(root, ['add', '.']);
       await git(root, ['commit', '-m', 'initial release']);
       const first = await gitOutput(root, ['rev-parse', 'HEAD']);
-      await tag(root, '@scope/a@1.0.0', '2025-01-01T00:00:00Z');
-      await tag(root, '@scope/b@1.0.0', '2025-01-01T00:00:01Z');
+      await tag(root, 'a@1.0.0', '2025-01-01T00:00:00Z');
+      await tag(root, 'b@1.0.0', '2025-01-01T00:00:01Z');
 
       await writePackage(root, '@scope/a', 'packages/a', '1.1.0');
       await git(root, ['add', '.']);
       await git(root, ['commit', '-m', 'second release']);
       const second = await gitOutput(root, ['rev-parse', 'HEAD']);
-      await tag(root, '@scope/a@1.1.0', '2025-01-02T00:00:00Z');
+      await tag(root, 'a@1.1.0', '2025-01-02T00:00:00Z');
 
       await writeFile(join(root, 'readme.md'), 'not a release\n');
       await git(root, ['add', '.']);
@@ -41,7 +41,7 @@ describe('release planning with fixture git repositories', () => {
       await tag(root, 'not-owned@9.9.9', '2025-01-03T00:00:00Z');
 
       const npmPublished = new Set(['@scope/a@1.0.0', '@scope/b@1.0.0']);
-      const githubReleases = new Set(['@scope/a@1.0.0']);
+      const githubReleases = new Set(['a@1.0.0']);
       const records = await collectOwnedReleaseTagRecords(
         [
           { name: '@scope/a', projectName: 'a', path: 'packages/a' },
@@ -59,7 +59,7 @@ describe('release planning with fixture git repositories', () => {
         },
       );
 
-      expect(records.map((record) => record.tag)).toEqual(['@scope/a@1.1.0', '@scope/b@1.0.0', '@scope/a@1.0.0']);
+      expect(records.map((record) => record.tag)).toEqual(['a@1.1.0', 'b@1.0.0', 'a@1.0.0']);
       const pending = pendingReleaseTargets(records, head);
       expect(pending.map((target) => target.sha)).toEqual([first, second]);
       expect(pending[0]?.packages.map((pkg) => pkg.name)).toEqual(['@scope/b']);
@@ -74,7 +74,7 @@ describe('release planning with fixture git repositories', () => {
       await writePackage(root, '@scope/a', 'packages/a', '1.0.0');
       await git(root, ['add', '.']);
       await git(root, ['commit', '-m', 'release a']);
-      await tag(root, '@scope/a@1.0.0', '2025-01-01T00:00:00Z');
+      await tag(root, 'a@1.0.0', '2025-01-01T00:00:00Z');
       await git(root, ['init', '--bare', 'remote.git']);
       await git(root, ['remote', 'add', 'origin', join(root, 'remote.git')]);
       await git(root, ['push', 'origin', 'main', '--tags']);
@@ -94,7 +94,7 @@ describe('release planning with fixture git repositories', () => {
         },
       );
 
-      expect(records.map((record) => record.tag)).toEqual(['@scope/a@1.0.0']);
+      expect(records.map((record) => record.tag)).toEqual(['a@1.0.0']);
       expect(pendingReleaseTargets(records, 'not-head').map((target) => target.sha)).toEqual([head]);
     });
   });
@@ -119,26 +119,26 @@ describe('release planning with fixture git repositories', () => {
       await writeBuildablePackage(author, '@scope/b', 'packages/b', '1.0.0');
       await git(author, ['add', '.']);
       await git(author, ['commit', '-m', 'initial release']);
-      await tag(author, '@scope/a@1.0.0', '2025-01-01T00:00:00Z');
-      await tag(author, '@scope/b@1.0.0', '2025-01-01T00:00:01Z');
+      await tag(author, 'a@1.0.0', '2025-01-01T00:00:00Z');
+      await tag(author, 'b@1.0.0', '2025-01-01T00:00:01Z');
 
       await writeBuildablePackage(author, '@scope/a', 'packages/a', '1.1.0');
       await git(author, ['add', 'packages/a/package.json']);
       await git(author, ['commit', '-m', 'release a 1.1.0']);
       const githubOnlySha = await gitOutput(author, ['rev-parse', 'HEAD']);
-      await tag(author, '@scope/a@1.1.0', '2025-01-02T00:00:00Z');
+      await tag(author, 'a@1.1.0', '2025-01-02T00:00:00Z');
 
       await writeBuildablePackage(author, '@scope/b', 'packages/b', '2.0.0-beta.1');
       await git(author, ['add', 'packages/b/package.json']);
       await git(author, ['commit', '-m', 'release b prerelease']);
       const npmAndGithubSha = await gitOutput(author, ['rev-parse', 'HEAD']);
-      await tag(author, '@scope/b@2.0.0-beta.1', '2025-01-03T00:00:00Z');
+      await tag(author, 'b@2.0.0-beta.1', '2025-01-03T00:00:00Z');
 
       await writeBuildablePackage(author, '@scope/a', 'packages/a', '1.2.0');
       await git(author, ['add', 'packages/a/package.json']);
       await git(author, ['commit', '-m', 'head release a 1.2.0']);
       const headSha = await gitOutput(author, ['rev-parse', 'HEAD']);
-      await tag(author, '@scope/a@1.2.0', '2025-01-04T00:00:00Z');
+      await tag(author, 'a@1.2.0', '2025-01-04T00:00:00Z');
 
       await git(author, ['init', '--bare', 'remote.git']);
       await git(author, ['remote', 'add', 'origin', join(author, 'remote.git')]);
@@ -151,7 +151,7 @@ describe('release planning with fixture git repositories', () => {
       const restoreRef = 'origin/main';
       const packages = releaseFixturePackages();
       const npmPublished = new Set(['@scope/a@1.0.0', '@scope/b@1.0.0', '@scope/a@1.1.0']);
-      const githubReleases = new Set(['@scope/a@1.0.0', '@scope/b@1.0.0']);
+      const githubReleases = new Set(['a@1.0.0', 'b@1.0.0']);
 
       const records = await collectOwnedReleaseTagRecords(packages, restoreRef, {
         listReleaseTagsByCreatorDate: () => gitReleaseTagsByCreatorDate(runner),
@@ -181,7 +181,7 @@ describe('release planning with fixture git repositories', () => {
         { name: '@scope/a', version: '1.1.0', dryRun: false },
         { name: '@scope/b', version: '2.0.0-beta.1', dryRun: false },
       ]);
-      expect(shell.pushes).toEqual([['@scope/a@1.1.0'], ['@scope/b@2.0.0-beta.1']]);
+      expect(shell.pushes).toEqual([['a@1.1.0'], ['b@2.0.0-beta.1']]);
       expect(summaries.map((summary) => summary.sha)).toEqual([githubOnlySha, npmAndGithubSha]);
       await expect(readFile(join(runner, 'packages/b/dist/index.js'), 'utf8')).resolves.toBe('{}\n');
       await expect(readFile(join(runner, 'packages/a/dist/index.js'), 'utf8')).rejects.toThrow();
@@ -212,13 +212,62 @@ describe('release planning with fixture git repositories', () => {
       const summary = await completeReleaseAtHead(shell, [pkg], false, false);
 
       expect(summary.pushed).toBe(true);
-      expect(shell.pushes).toEqual([['@scope/pushed@1.0.0']]);
+      expect(shell.pushes).toEqual([['pushed@1.0.0']]);
       await $`git clone --branch main ${join(author, 'remote.git')} auditor`.cwd(author).quiet();
       const auditor = join(author, 'auditor');
       await git(auditor, ['fetch', '--tags', 'origin', 'main']);
-      await expect(gitOutput(auditor, ['rev-parse', 'refs/tags/@scope/pushed@1.0.0^{}'])).resolves.toBe(
+      await expect(gitOutput(auditor, ['rev-parse', 'refs/tags/pushed@1.0.0^{}'])).resolves.toBe(
         await gitOutput(runner, ['rev-parse', 'HEAD']),
       );
+      await expect(gitSucceeds(auditor, ['rev-parse', '--verify', 'refs/tags/@scope/pushed@1.0.0'])).resolves.toBe(
+        false,
+      );
+    });
+  });
+
+  it('repairs a scoped package from its project-name release tag without creating a package-name tag', async () => {
+    await withFixtureRepo(async (author) => {
+      await writeWorkspace(author);
+      await writeBuildablePackage(author, '@scope/cli', 'packages/cli', '0.2.0');
+      await git(author, ['add', '.']);
+      await git(author, ['commit', '-m', 'release cli 0.2.0']);
+      const releaseSha = await gitOutput(author, ['rev-parse', 'HEAD']);
+      await tag(author, 'cli@0.2.0', '2025-01-01T00:00:00Z');
+
+      await git(author, ['init', '--bare', 'remote.git']);
+      await git(author, ['remote', 'add', 'origin', join(author, 'remote.git')]);
+      await git(author, ['push', 'origin', 'main', '--tags']);
+      await $`git clone --branch main ${join(author, 'remote.git')} runner`.cwd(author).quiet();
+      const runner = join(author, 'runner');
+      await git(runner, ['config', 'user.name', 'Test User']);
+      await git(runner, ['config', 'user.email', 'test@example.com']);
+      await git(runner, ['fetch', '--tags', 'origin', 'main']);
+
+      const pkg: ReleasePackageInfo = {
+        name: '@scope/cli',
+        projectName: 'cli',
+        path: 'packages/cli',
+        version: '0.0.0',
+      };
+      const records = await collectOwnedReleaseTagRecords([pkg], 'origin/main', {
+        listReleaseTagsByCreatorDate: () => gitReleaseTagsByCreatorDate(runner),
+        isAncestor: (ancestor, descendant) => gitIsAncestor(runner, ancestor, descendant),
+        packageVersionAtRef: (packagePath, ref) => packageVersionAtRef(runner, packagePath, ref),
+        durableTagState: async () => ({ npmPublished: false, githubReleaseExists: false }),
+      });
+      const pending = pendingReleaseTargets(records, 'not-head');
+
+      const shell = new LocalGitRepairShell(runner);
+      const summaries = await repairPendingTargets(shell, pending, 'origin/main', false);
+
+      expect(records.map((record) => record.tag)).toEqual(['cli@0.2.0']);
+      expect(pending.map((target) => target.sha)).toEqual([releaseSha]);
+      expect(shell.pushes).toEqual([['cli@0.2.0']]);
+      expect(shell.publishes).toEqual([{ name: '@scope/cli', version: '0.2.0', distTag: 'latest', dryRun: false }]);
+      expect(shell.githubCreates).toEqual([{ name: '@scope/cli', version: '0.2.0', dryRun: false }]);
+      expect(summaries[0]?.packages.map((releasePackage) => releasePackage.name)).toEqual(['@scope/cli']);
+      await expect(gitSucceeds(runner, ['rev-parse', '--verify', 'refs/tags/cli@0.2.0'])).resolves.toBe(true);
+      await expect(gitSucceeds(runner, ['rev-parse', '--verify', 'refs/tags/@scope/cli@0.2.0'])).resolves.toBe(false);
     });
   });
 });
@@ -245,7 +294,7 @@ class LocalGitRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
   }
 
   async pushReleaseRefs(packages: ReleasePackageInfo[]): Promise<boolean> {
-    this.pushes.push(packages.map((pkg) => `${pkg.name}@${pkg.version}`));
+    this.pushes.push(packages.map((pkg) => releaseTag(pkg)));
     await git(this.root, ['fetch', '--tags', 'origin', 'main']);
     for (const pkg of packages) {
       await this.ensureLocalReleaseTag(pkg);

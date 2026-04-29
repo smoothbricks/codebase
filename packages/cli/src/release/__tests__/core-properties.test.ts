@@ -122,7 +122,7 @@ function releaseRecords(): fc.Arbitrary<ReleaseTagRecord[]> {
         }
         seen.add(key);
         records.push({
-          tag: `${pkg.name}@${pkg.version}`,
+          tag: `${pkg.projectName}@${pkg.version}`,
           sha,
           timestamp: row.timestamp,
           pkg,
@@ -139,7 +139,7 @@ function record(pkg: ReleasePackageInfo | undefined, sha: string): ReleaseTagRec
     throw new Error('Missing test package fixture.');
   }
   return {
-    tag: `${pkg.name}@${pkg.version}`,
+    tag: `${pkg.projectName}@${pkg.version}`,
     sha,
     timestamp: 1,
     pkg,

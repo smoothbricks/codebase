@@ -18,7 +18,7 @@ const prerelease: ReleasePackageInfo = {
 
 describe('GitHub release helpers', () => {
   it('configures the Nx changelog API for render-only project changelogs', () => {
-    expect(nxProjectChangelogArgs(stable, '@scope/pkg@1.2.2', false)).toEqual({
+    expect(nxProjectChangelogArgs(stable, 'pkg@1.2.2', false)).toEqual({
       version: '1.2.3',
       projects: ['pkg'],
       gitCommit: false,
@@ -28,7 +28,7 @@ describe('GitHub release helpers', () => {
       createRelease: false,
       deleteVersionPlans: false,
       dryRun: false,
-      from: '@scope/pkg@1.2.2',
+      from: 'pkg@1.2.2',
     });
   });
 
@@ -71,18 +71,11 @@ describe('GitHub release helpers', () => {
 
     await createOrUpdateGithubRelease(stable, 'stable notes', shell);
 
-    expect(shell.existsQueries).toEqual(['@scope/pkg@1.2.3']);
+    expect(shell.existsQueries).toEqual(['pkg@1.2.3']);
     expect(shell.notes).toEqual(['stable notes']);
-    expect(shell.logs).toEqual(['@scope/pkg@1.2.3: creating GitHub Release for @scope/pkg@1.2.3.']);
+    expect(shell.logs).toEqual(['@scope/pkg@1.2.3: creating GitHub Release for pkg@1.2.3.']);
     const command = onlyCommand(shell.commands);
-    expect(command.slice(0, 6)).toEqual([
-      'release',
-      'create',
-      '@scope/pkg@1.2.3',
-      '--title',
-      '@scope/pkg@1.2.3',
-      '--notes-file',
-    ]);
+    expect(command.slice(0, 6)).toEqual(['release', 'create', 'pkg@1.2.3', '--title', 'pkg@1.2.3', '--notes-file']);
     expect(command).toContain('--verify-tag');
     expect(command).toContain('--latest=true');
     expect(command).not.toContain('--prerelease');
@@ -93,16 +86,16 @@ describe('GitHub release helpers', () => {
 
     await createOrUpdateGithubRelease(prerelease, 'prerelease notes', shell);
 
-    expect(shell.existsQueries).toEqual(['@scope/pkg@2.0.0-beta.1']);
+    expect(shell.existsQueries).toEqual(['pkg@2.0.0-beta.1']);
     expect(shell.notes).toEqual(['prerelease notes']);
-    expect(shell.logs).toEqual(['@scope/pkg@2.0.0-beta.1: updating GitHub Release for @scope/pkg@2.0.0-beta.1.']);
+    expect(shell.logs).toEqual(['@scope/pkg@2.0.0-beta.1: updating GitHub Release for pkg@2.0.0-beta.1.']);
     const command = onlyCommand(shell.commands);
     expect(command.slice(0, 6)).toEqual([
       'release',
       'edit',
-      '@scope/pkg@2.0.0-beta.1',
+      'pkg@2.0.0-beta.1',
       '--title',
-      '@scope/pkg@2.0.0-beta.1',
+      'pkg@2.0.0-beta.1',
       '--notes-file',
     ]);
     expect(command).toContain('--verify-tag');

@@ -30,7 +30,7 @@ function record(
   needs: { npm?: boolean; github?: boolean },
 ): ReleaseTagRecord {
   return {
-    tag: `${pkg.name}@${pkg.version}`,
+    tag: `${pkg.projectName}@${pkg.version}`,
     sha,
     timestamp,
     pkg,
@@ -99,9 +99,9 @@ describe('release core scenario coverage', () => {
     ]);
     const shell: ReleasePlanningShell = {
       listReleaseTagsByCreatorDate: async () => [
-        tag('@scope/stable@1.0.0', 'reachable', 30),
+        tag('stable@1.0.0', 'reachable', 30),
         tag('@other/pkg@9.9.9', 'reachable', 20),
-        tag('@scope/stable@1.0.1', 'unreachable', 10),
+        tag('stable@1.0.1', 'unreachable', 10),
       ],
       isAncestor: async (ancestor) => ancestor === 'reachable',
       packageVersionAtRef: async (packagePath, ref) => {
@@ -120,9 +120,9 @@ describe('release core scenario coverage', () => {
       shell,
     );
 
-    expect(records.map((releaseRecord) => releaseRecord.tag)).toEqual(['@scope/stable@1.0.0']);
+    expect(records.map((releaseRecord) => releaseRecord.tag)).toEqual(['stable@1.0.0']);
     expect(packageVersionRefs).toEqual(['packages/stable:reachable']);
-    expect(durableTags).toEqual(['@scope/stable@1.0.0']);
+    expect(durableTags).toEqual(['stable@1.0.0']);
   });
 
   it('stops querying older package tags after the newest tag for that package is fully durable', async () => {
@@ -134,9 +134,9 @@ describe('release core scenario coverage', () => {
     ]);
     const shell: ReleasePlanningShell = {
       listReleaseTagsByCreatorDate: async () => [
-        tag('@scope/stable@1.1.0', 'newer-stable', 30),
-        tag('@scope/prerelease@2.0.0-beta.1', 'older-prerelease', 20),
-        tag('@scope/stable@1.0.0', 'older-stable', 10),
+        tag('stable@1.1.0', 'newer-stable', 30),
+        tag('prerelease@2.0.0-beta.1', 'older-prerelease', 20),
+        tag('stable@1.0.0', 'older-stable', 10),
       ],
       isAncestor: async () => true,
       packageVersionAtRef: async (packagePath, ref) => versions.get(`${packagePath}:${ref}`) ?? null,
@@ -155,16 +155,13 @@ describe('release core scenario coverage', () => {
       shell,
     );
 
-    expect(records.map((releaseRecord) => releaseRecord.tag)).toEqual([
-      '@scope/stable@1.1.0',
-      '@scope/prerelease@2.0.0-beta.1',
-    ]);
-    expect(durableTags).toEqual(['@scope/stable@1.1.0', '@scope/prerelease@2.0.0-beta.1']);
+    expect(records.map((releaseRecord) => releaseRecord.tag)).toEqual(['stable@1.1.0', 'prerelease@2.0.0-beta.1']);
+    expect(durableTags).toEqual(['stable@1.1.0', 'prerelease@2.0.0-beta.1']);
   });
 
   it('throws when a release tag version does not match package.json at the peeled commit', async () => {
     const shell: ReleasePlanningShell = {
-      listReleaseTagsByCreatorDate: async () => [tag('@scope/stable@1.0.0', 'mismatch', 10)],
+      listReleaseTagsByCreatorDate: async () => [tag('stable@1.0.0', 'mismatch', 10)],
       isAncestor: async () => true,
       packageVersionAtRef: async () => '1.0.1',
       durableTagState: async () => ({ npmPublished: true, githubReleaseExists: true }),
@@ -177,7 +174,7 @@ describe('release core scenario coverage', () => {
         shell,
       ),
     ).rejects.toThrow(
-      'Release tag @scope/stable@1.0.0 points at mismatch, but packages/stable/package.json has version 1.0.1.',
+      'Release tag stable@1.0.0 points at mismatch, but packages/stable/package.json has version 1.0.1.',
     );
   });
 });

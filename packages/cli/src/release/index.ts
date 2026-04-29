@@ -610,7 +610,7 @@ async function gitTagsAtRef(root: string, ref: string): Promise<string[]> {
 }
 
 async function previousReleaseTag(root: string, pkg: ReleasePackage, currentTag: string): Promise<string | null> {
-  const result = await $`git tag --list ${`${pkg.name}@*`} --sort=-v:refname --merged ${currentTag}`
+  const result = await $`git tag --list ${`${pkg.projectName}@*`} --sort=-v:refname --merged ${currentTag}`
     .cwd(root)
     .quiet()
     .nothrow();

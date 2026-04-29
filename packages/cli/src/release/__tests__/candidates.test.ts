@@ -11,6 +11,7 @@ const a: ReleasePackageInfo = { name: '@scope/a', projectName: 'a', path: 'packa
 const b: ReleasePackageInfo = { name: '@scope/b', projectName: 'b', path: 'packages/b', version: '1.0.0' };
 const c: ReleasePackageInfo = { name: '@scope/c', projectName: 'c', path: 'packages/c', version: '0.1.0' };
 const d: ReleasePackageInfo = { name: '@scope/d', projectName: 'd', path: 'packages/d', version: '0.1.0' };
+const cli: ReleasePackageInfo = { name: '@scope/cli', projectName: 'cli', path: 'packages/cli', version: '0.2.0' };
 
 describe('auto release candidate filtering', () => {
   it('selects tagged packages only when their package path changed', async () => {
@@ -19,8 +20,8 @@ describe('auto release candidate filtering', () => {
       await writePackage(root, b.name, b.path, b.version);
       await git(root, ['add', '.']);
       await git(root, ['commit', '-m', 'initial packages']);
-      await tag(root, '@scope/a@1.0.0', '2025-01-01T00:00:00Z');
-      await tag(root, '@scope/b@1.0.0', '2025-01-01T00:00:01Z');
+      await tag(root, 'a@1.0.0', '2025-01-01T00:00:00Z');
+      await tag(root, 'b@1.0.0', '2025-01-01T00:00:01Z');
 
       await writeFile(join(root, 'README.md'), 'root-only change\n');
       await git(root, ['add', 'README.md']);
@@ -42,7 +43,7 @@ describe('auto release candidate filtering', () => {
       await writePackage(root, a.name, a.path, a.version);
       await git(root, ['add', '.']);
       await git(root, ['commit', '-m', 'initial package']);
-      await tag(root, '@scope/a@1.0.0', '2025-01-01T00:00:00Z');
+      await tag(root, 'a@1.0.0', '2025-01-01T00:00:00Z');
 
       await mkdir(join(root, a.path), { recursive: true });
       await writeFile(
@@ -72,7 +73,7 @@ describe('auto release candidate filtering', () => {
       await writePackage(root, a.name, a.path, a.version);
       await git(root, ['add', '.']);
       await git(root, ['commit', '-m', 'initial package']);
-      await tag(root, '@scope/a@1.0.0', '2025-01-01T00:00:00Z');
+      await tag(root, 'a@1.0.0', '2025-01-01T00:00:00Z');
 
       await writeFile(
         join(root, a.path, 'package.json'),
@@ -105,7 +106,7 @@ describe('auto release candidate filtering', () => {
       await writeFile(join(root, a.path, 'schema/index.json'), '{}\n');
       await git(root, ['add', '.']);
       await git(root, ['commit', '-m', 'initial package']);
-      await tag(root, '@scope/a@1.0.0', '2025-01-01T00:00:00Z');
+      await tag(root, 'a@1.0.0', '2025-01-01T00:00:00Z');
 
       await writeFile(join(root, a.path, 'schema/index.json'), '{"changed":true}\n');
       await git(root, ['add', join(a.path, 'schema/index.json')]);
@@ -120,7 +121,7 @@ describe('auto release candidate filtering', () => {
       await writePackage(root, a.name, a.path, a.version);
       await git(root, ['add', '.']);
       await git(root, ['commit', '-m', 'initial package']);
-      await tag(root, '@scope/a@1.0.0', '2025-01-01T00:00:00Z');
+      await tag(root, 'a@1.0.0', '2025-01-01T00:00:00Z');
 
       await mkdir(join(root, a.path, 'generated'), { recursive: true });
       await writeFile(join(root, a.path, 'generated/schema.ts'), 'export const schema = 1;\n');
@@ -138,7 +139,7 @@ describe('auto release candidate filtering', () => {
       await writePackage(root, a.name, a.path, a.version);
       await git(root, ['add', '.']);
       await git(root, ['commit', '-m', 'initial package']);
-      await tag(root, '@scope/a@1.0.0', '2025-01-01T00:00:00Z');
+      await tag(root, 'a@1.0.0', '2025-01-01T00:00:00Z');
 
       const shell = gitCandidateShell(root, { buildInputPatterns: ['src/**/*.ts', '!src/**/*.test.ts'] });
 
@@ -167,11 +168,39 @@ describe('auto release candidate filtering', () => {
       await expect(autoReleaseCandidatePackages(gitCandidateShell(root), [c, d])).resolves.toEqual([c]);
     });
   });
+
+  it('uses a repaired project-name tag as the follow-up auto release baseline for a scoped package', async () => {
+    await withFixtureRepo(async (root) => {
+      await writePackage(root, cli.name, cli.path, cli.version);
+      await git(root, ['add', '.']);
+      await git(root, ['commit', '-m', 'chore(release): publish']);
+      await tag(root, 'cli@0.2.0', '2025-01-01T00:00:00Z');
+
+      await mkdir(join(root, cli.path, 'src'), { recursive: true });
+      await writeFile(join(root, cli.path, 'src/index.ts'), 'export const fixed = true;\n');
+      await git(root, ['add', join(cli.path, 'src/index.ts')]);
+      await git(root, ['commit', '-m', 'fix(cli): repair publish flow']);
+
+      const queriedRefs: string[] = [];
+      const candidates = await autoReleaseCandidatePackages(
+        gitCandidateShell(root, { buildInputPatterns: ['src/**/*.ts'], queriedRefs }),
+        [cli],
+      );
+
+      expect(candidates).toEqual([cli]);
+      expect(queriedRefs).toEqual(['refs/tags/cli@0.2.0']);
+      expect(queriedRefs).not.toContain('refs/tags/@scope/cli@0.2.0');
+    });
+  });
 });
 
-function gitCandidateShell(root: string, options: { buildInputPatterns?: string[] } = {}): AutoReleaseCandidateShell {
+function gitCandidateShell(
+  root: string,
+  options: { buildInputPatterns?: string[]; queriedRefs?: string[] } = {},
+): AutoReleaseCandidateShell {
   return {
     gitRefExists: async (ref) => {
+      options.queriedRefs?.push(ref);
       const result = await $`git rev-parse --verify ${ref}`.cwd(root).quiet().nothrow();
       return result.exitCode === 0;
     },

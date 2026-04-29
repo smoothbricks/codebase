@@ -44,8 +44,8 @@ export interface ReleasePlanningShell {
   durableTagState(pkg: ReleasePackageInfo, tag: string): Promise<DurableTagState>;
 }
 
-export function releaseTag(pkg: Pick<ReleasePackageInfo, 'name' | 'version'>): string {
-  return `${pkg.name}@${pkg.version}`;
+export function releaseTag(pkg: Pick<ReleasePackageInfo, 'projectName' | 'version'>): string {
+  return `${pkg.projectName}@${pkg.version}`;
 }
 
 export function npmDistTagForVersion(version: string): string {
@@ -57,7 +57,7 @@ export function releasePackageForTag<Package extends Omit<ReleasePackageInfo, 'v
   tag: string,
 ): { pkg: Package; version: string } | null {
   for (const pkg of packages) {
-    const prefix = `${pkg.name}@`;
+    const prefix = `${pkg.projectName}@`;
     if (tag.startsWith(prefix)) {
       const version = tag.slice(prefix.length);
       if (!version) {
