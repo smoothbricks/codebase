@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,6 +25,30 @@ export async function runStatus(
   }
   const result = quiet ? await shell.quiet() : await shell;
   return result.exitCode;
+}
+
+export async function runInteractiveStatus(
+  command: string,
+  args: string[],
+  cwd: string,
+  env?: Record<string, string>,
+): Promise<number> {
+  const invocation = resolveCommandInvocation(cwd, command, args);
+  return new Promise((resolve, reject) => {
+    const child = spawn(invocation.command, invocation.args, {
+      cwd,
+      env: env ? mergeEnv(env) : process.env,
+      stdio: 'inherit',
+    });
+    child.on('error', reject);
+    child.on('close', (code, signal) => {
+      if (signal) {
+        reject(new Error(`${command} ${args.join(' ')} terminated by signal ${signal}`));
+        return;
+      }
+      resolve(code ?? 1);
+    });
+  });
 }
 
 export async function runResult(

@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'bun:test';
 import type { BootstrapNpmPackagesOptions } from '../bootstrap-npm-packages.js';
 import type { ReleasePackageInfo } from '../core.js';
-import { configureTrustedPublishers, type TrustPublisherShell } from '../index.js';
+import {
+  configureTrustedPublishers,
+  parseTrustedPublishers,
+  type TrustedPublisher,
+  type TrustPublisherShell,
+} from '../index.js';
 
 const stable: ReleasePackageInfo = {
   name: '@scope/stable',
@@ -20,51 +25,85 @@ describe('trusted publisher setup', () => {
   it('bootstraps missing npm packages before configuring trust', async () => {
     const shell = new RecordingTrustPublisherShell({ packages: [stable, missing], existing: [stable.name] });
 
-    await configureTrustedPublishers(shell, { bootstrap: true, skipLogin: false, otp: '123456' });
+    await configureTrustedPublishers(shell, { bootstrap: true, skipLogin: false });
 
     expect(shell.events).toEqual([
       'bootstrap:false:false',
       `exists:${stable.name}`,
       `exists:${missing.name}`,
-      `trust:${stable.name}:false:123456`,
-      `trust:${missing.name}:false:123456`,
+      `list:${stable.name}`,
+      `trust:${stable.name}:false`,
+      `list:${missing.name}`,
+      `trust:${missing.name}:false`,
     ]);
-    expect(shell.logins).toBe(0);
   });
 
   it('directs missing packages to trust-publisher --bootstrap', async () => {
     const shell = new RecordingTrustPublisherShell({ packages: [missing], existing: [] });
 
-    await expect(configureTrustedPublishers(shell, { otp: '123456' })).rejects.toThrow(
+    await expect(configureTrustedPublishers(shell, {})).rejects.toThrow(
       'Run smoo release trust-publisher --bootstrap locally',
     );
     expect(shell.events).toEqual([`exists:${missing.name}`]);
   });
 
-  it('still logs in for trust when bootstrap finds no missing packages', async () => {
+  it('does not pre-login before trust operations', async () => {
     const shell = new RecordingTrustPublisherShell({ packages: [stable], existing: [stable.name] });
 
-    await configureTrustedPublishers(shell, { bootstrap: true, otp: '123456' });
+    await configureTrustedPublishers(shell, { bootstrap: true });
 
     expect(shell.events).toEqual([
       'bootstrap:false:false',
       `exists:${stable.name}`,
-      `trust:${stable.name}:false:123456`,
+      `list:${stable.name}`,
+      `trust:${stable.name}:false`,
     ]);
-    expect(shell.logins).toBe(1);
   });
 
-  it('treats npm trust conflicts as already configured', async () => {
+  it('skips packages with matching trusted publishers', async () => {
     const shell = new RecordingTrustPublisherShell({
       packages: [stable],
       existing: [stable.name],
-      alreadyTrusted: [stable.name],
+      trustedPublishers: {
+        [stable.name]: [{ id: 'trusted-1', type: 'github', file: 'publish.yml', repository: 'scope/repo' }],
+      },
     });
 
-    await configureTrustedPublishers(shell, { skipLogin: true, otp: '123456' });
+    await configureTrustedPublishers(shell, { skipLogin: true });
 
-    expect(shell.events).toEqual([`exists:${stable.name}`, `trust:${stable.name}:false:123456`]);
+    expect(shell.events).toEqual([`exists:${stable.name}`, `list:${stable.name}`]);
     expect(shell.logs).toContain(`${stable.name}: npm trusted publisher is already configured; skipping.`);
+  });
+
+  it('rejects mismatched trusted publishers', async () => {
+    const shell = new RecordingTrustPublisherShell({
+      packages: [stable],
+      existing: [stable.name],
+      trustedPublishers: {
+        [stable.name]: [{ id: 'trusted-1', type: 'github', file: 'other.yml', repository: 'scope/repo' }],
+      },
+    });
+
+    await expect(configureTrustedPublishers(shell, { skipLogin: true })).rejects.toThrow(
+      'npm trusted publisher exists but does not match',
+    );
+    expect(shell.events).toEqual([`exists:${stable.name}`, `list:${stable.name}`]);
+  });
+
+  it('configures only selected packages', async () => {
+    const shell = new RecordingTrustPublisherShell({
+      packages: [stable, missing],
+      existing: [stable.name, missing.name],
+    });
+
+    await configureTrustedPublishers(shell, { skipLogin: true, packages: [missing.name] });
+
+    expect(shell.events).toEqual([`exists:${missing.name}`, `list:${missing.name}`, `trust:${missing.name}:false`]);
+  });
+
+  it('parses empty npm trust list output as no trusted publishers', () => {
+    expect(parseTrustedPublishers('', stable.name)).toEqual([]);
+    expect(parseTrustedPublishers('null', stable.name)).toEqual([]);
   });
 });
 
@@ -74,15 +113,18 @@ class RecordingTrustPublisherShell implements TrustPublisherShell<ReleasePackage
   readonly events: string[] = [];
   readonly logs: string[] = [];
   readonly errors: string[] = [];
-  logins = 0;
   private readonly packages: ReleasePackageInfo[];
   private readonly existing: Set<string>;
-  private readonly alreadyTrusted: Set<string>;
+  private readonly trustedPublisherByPackage: Record<string, TrustedPublisher[]>;
 
-  constructor(options: { packages: ReleasePackageInfo[]; existing: string[]; alreadyTrusted?: string[] }) {
+  constructor(options: {
+    packages: ReleasePackageInfo[];
+    existing: string[];
+    trustedPublishers?: Record<string, TrustedPublisher[]>;
+  }) {
     this.packages = options.packages;
     this.existing = new Set(options.existing);
-    this.alreadyTrusted = new Set(options.alreadyTrusted ?? []);
+    this.trustedPublisherByPackage = options.trustedPublishers ?? {};
   }
 
   listReleasePackages(): ReleasePackageInfo[] {
@@ -103,24 +145,14 @@ class RecordingTrustPublisherShell implements TrustPublisherShell<ReleasePackage
     return missingPackages;
   }
 
-  async login(): Promise<void> {
-    this.logins += 1;
-  }
-
-  async trustPublisher(
-    pkg: ReleasePackageInfo,
-    dryRun: boolean,
-    env?: Record<string, string>,
-  ): Promise<'configured' | 'already-configured'> {
-    this.events.push(`trust:${pkg.name}:${dryRun}:${env?.NPM_CONFIG_OTP ?? ''}`);
-    if (this.alreadyTrusted.has(pkg.name)) {
-      return 'already-configured';
-    }
+  async trustPublisher(pkg: ReleasePackageInfo, dryRun: boolean): Promise<'configured' | 'already-configured'> {
+    this.events.push(`trust:${pkg.name}:${dryRun}`);
     return 'configured';
   }
 
-  async promptOtp(packageName: string): Promise<string> {
-    throw new Error(`unexpected OTP prompt for ${packageName}`);
+  async trustedPublishers(pkg: ReleasePackageInfo): Promise<TrustedPublisher[]> {
+    this.events.push(`list:${pkg.name}`);
+    return this.trustedPublisherByPackage[pkg.name] ?? [];
   }
 
   log(message: string): void {
