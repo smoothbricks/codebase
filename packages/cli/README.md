@@ -181,6 +181,17 @@ release packages exist.
 `smoo release npm-status` shows whether each owned release package's current `name@version` already exists on npm. It is
 an npm registry check, not a full release workflow status check.
 
+`smoo release version --bump auto` first selects direct release candidates, then delegates versioning to [Nx]. Direct
+candidates are owned public packages with package-local changes that can affect published users: files matched by the
+package's resolved Nx `build`/`production` inputs, packaged assets listed in `package.json` `files`, package metadata
+docs such as README/LICENSE/CHANGELOG, or user-visible `package.json` fields such as `exports`, `bin`, `types`,
+`dependencies`, `peerDependencies`, and `publishConfig`. Test-only and local automation changes such as `scripts`, `nx`,
+`devDependencies`, and `tsconfig.test.json` do not select a package by themselves.
+
+Downstream dependency bumps are intentionally left to Nx release. If package A is selected and bumped, Nx may also bump
+public package B when B depends on A, even when B has no direct file changes. `smoo` should not pre-expand direct
+candidates to downstream dependents because that would duplicate Nx's dependency graph and can over-select packages.
+
 ## Nx Conventions
 
 `smoo` keeps Nx target names predictable and separates tool work from aggregate workflows.

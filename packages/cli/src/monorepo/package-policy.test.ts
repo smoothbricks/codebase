@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
   applyFixableMonorepoDefaults,
+  applyNxPluginDefaults,
   applyNxProjectNameDefaults,
   applyWorkspaceDependencyDefaults,
   listValidCommitScopes,
@@ -28,7 +29,7 @@ describe('root smoo monorepo policy', () => {
       await writeJson(join(root, 'nx.json'), validNxJson());
 
       expect(validateRootPackagePolicy(root)).toBe(5);
-      expect(validateNxReleaseConfig(root)).toBe(5);
+      expect(validateNxReleaseConfig(root)).toBe(6);
 
       applyFixableMonorepoDefaults(root);
 
@@ -41,6 +42,7 @@ describe('root smoo monorepo policy', () => {
         'lint:fix': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --unstaged',
       });
       expect(rootPackage).toMatchObject({ nx: { includedScripts: [] } });
+      expect(nxJson.namedInputs).toEqual(validNamedInputs());
       expect(nxJson.targetDefaults).toEqual({ build: { cache: true, outputs: ['{projectRoot}/dist'] } });
       expect(nxJson.plugins).toEqual([
         {
@@ -58,6 +60,57 @@ describe('root smoo monorepo policy', () => {
         '@smoothbricks/nx-plugin',
       ]);
       expect(validateRootPackagePolicy(root)).toBe(0);
+      expect(validateNxReleaseConfig(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects broad production named inputs and fixes them precisely', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
+    try {
+      await writeJson(join(root, 'package.json'), validRootPackage());
+      await writeJson(join(root, 'nx.json'), {
+        ...validConfiguredNxJson(),
+        namedInputs: {
+          default: ['{projectRoot}/**/*', 'sharedGlobals'],
+          production: ['default', '{projectRoot}/**/*'],
+          sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
+        },
+      });
+      const errors = captureConsoleErrors();
+
+      expect(validateNxReleaseConfig(root)).toBe(1);
+      expect(errors.join('\n')).toContain('namedInputs.production must enumerate precise production inputs');
+
+      applyNxPluginDefaults(root);
+
+      const nxJson = await readJson(join(root, 'nx.json'));
+      expect(nxJson.namedInputs).toEqual(validNamedInputs());
+      expect(validateNxReleaseConfig(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts custom precise production named inputs for non-TypeScript tools', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
+    try {
+      await writeJson(join(root, 'package.json'), validRootPackage());
+      await writeJson(join(root, 'nx.json'), {
+        ...validConfiguredNxJson(),
+        namedInputs: {
+          default: ['{projectRoot}/**/*', 'sharedGlobals'],
+          production: [
+            '{projectRoot}/Cargo.toml',
+            '{projectRoot}/src/**/*.rs',
+            '{projectRoot}/pyproject.toml',
+            '{projectRoot}/python/**/*.py',
+          ],
+          sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
+        },
+      });
+
       expect(validateNxReleaseConfig(root)).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -768,6 +821,11 @@ function validRootPackage(extra: Record<string, unknown> = {}): Record<string, u
 
 function validNxJson(): Record<string, unknown> {
   return {
+    namedInputs: {
+      default: ['{projectRoot}/**/*', 'sharedGlobals'],
+      production: ['default'],
+      sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
+    },
     targetDefaults: {
       'lint:fix': { executor: 'nx:run-commands' },
     },
@@ -804,6 +862,7 @@ function validNxJson(): Record<string, unknown> {
 function validConfiguredNxJson(): Record<string, unknown> {
   return {
     ...validNxJson(),
+    namedInputs: validNamedInputs(),
     targetDefaults: { build: { cache: true, outputs: ['{projectRoot}/dist'] } },
     plugins: [
       {
@@ -820,6 +879,20 @@ function validConfiguredNxJson(): Record<string, unknown> {
       },
       '@smoothbricks/nx-plugin',
     ],
+  };
+}
+
+function validNamedInputs(): Record<string, unknown> {
+  return {
+    default: ['{projectRoot}/**/*', 'sharedGlobals'],
+    production: [
+      '{projectRoot}/src/**/*',
+      '{projectRoot}/package.json',
+      '!{projectRoot}/**/__tests__/**',
+      '!{projectRoot}/**/*.test.*',
+      '!{projectRoot}/**/*.spec.*',
+    ],
+    sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
   };
 }
 

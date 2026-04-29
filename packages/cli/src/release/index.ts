@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
 import { $ } from 'bun';
 import { withDevenvEnv } from '../lib/devenv.js';
-import { isRecord, stringProperty } from '../lib/json.js';
+import { isRecord, readJsonObject, stringProperty } from '../lib/json.js';
 import { decode, run, runResult, runStatus } from '../lib/run.js';
 import { listReleasePackages, readPackageJson, repositoryInfo } from '../lib/workspace.js';
 import { readPackedPackageJson, validatePackedWorkspaceDependencies } from '../monorepo/packed-manifest.js';
@@ -462,6 +462,8 @@ async function releaseVersionPackages(
       packageChangedFilesSince: (ref, packagePath) => packageChangedFilesSince(root, ref, packagePath),
       packageJsonAtRef: (ref, packagePath) => packageJsonAtRef(root, ref, packagePath),
       currentPackageJson: (packagePath) => currentPackageJson(root, packagePath),
+      packageBuildInputPatterns: (projectName, packagePath) =>
+        packageBuildInputPatterns(root, projectName, packagePath),
       packageHasHistory: (packagePath) => packageHasHistory(root, packagePath),
     },
     packages,
@@ -871,6 +873,98 @@ async function packageJsonAtRef(
 
 async function currentPackageJson(root: string, packagePath: string): Promise<Record<string, unknown> | null> {
   return readPackageJson(join(root, packagePath, 'package.json'))?.json ?? null;
+}
+
+async function packageBuildInputPatterns(root: string, projectName: string, _packagePath: string): Promise<string[]> {
+  const project = await nxProjectJson(root, projectName);
+  const nxJson = readJsonObject(join(root, 'nx.json')) ?? {};
+  return resolveBuildInputPatterns(project, nxJson);
+}
+
+async function nxProjectJson(root: string, projectName: string): Promise<Record<string, unknown>> {
+  const result = await $`nx show project ${projectName} --json`.cwd(root).quiet();
+  const parsed = JSON.parse(decode(result.stdout));
+  if (!isRecord(parsed)) {
+    throw new Error(`Unable to inspect Nx project ${projectName}.`);
+  }
+  return parsed;
+}
+
+function resolveBuildInputPatterns(project: Record<string, unknown>, nxJson: Record<string, unknown>): string[] {
+  const targets = recordProperty(project, 'targets');
+  if (!targets) {
+    return [];
+  }
+  return normalizeInputPatterns(collectBuildInputs(targets), nxJson);
+}
+
+function collectBuildInputs(targets: Record<string, unknown>): string[] {
+  const build = recordProperty(targets, 'build');
+  if (!build) {
+    return ['production'];
+  }
+  const directInputs = stringArrayProperty(build, 'inputs');
+  if (directInputs.length > 0) {
+    return directInputs;
+  }
+  const inputs: string[] = [];
+  for (const dependency of stringArrayProperty(build, 'dependsOn')) {
+    if (dependency.startsWith('^')) {
+      continue;
+    }
+    const targetName = dependency.includes(':') ? dependency.split(':')[1] : dependency;
+    if (!targetName) {
+      continue;
+    }
+    inputs.push(...stringArrayProperty(recordProperty(targets, targetName), 'inputs'));
+  }
+  return inputs.length > 0 ? inputs : ['production'];
+}
+
+function normalizeInputPatterns(inputs: string[], nxJson: Record<string, unknown>): string[] {
+  const patterns: string[] = [];
+  const seen = new Set<string>();
+  for (const input of inputs) {
+    for (const pattern of expandInputPattern(input, nxJson, seen)) {
+      patterns.push(pattern);
+    }
+  }
+  return patterns;
+}
+
+function expandInputPattern(input: string, nxJson: Record<string, unknown>, seen: Set<string>): string[] {
+  if (seen.has(input)) {
+    return [];
+  }
+  seen.add(input);
+  if (!input.includes('{')) {
+    const namedInputs = recordProperty(nxJson, 'namedInputs');
+    const namedInput = namedInputs?.[input];
+    if (Array.isArray(namedInput)) {
+      return namedInput.flatMap((entry) => (typeof entry === 'string' ? expandInputPattern(entry, nxJson, seen) : []));
+    }
+    return [];
+  }
+  const excluded = input.startsWith('!');
+  const rawInput = excluded ? input.slice(1) : input;
+  if (!rawInput.startsWith('{projectRoot}/')) {
+    return [];
+  }
+  const packageRelative = rawInput.slice('{projectRoot}/'.length);
+  return [`${excluded ? '!' : ''}${packageRelative}`];
+}
+
+function recordProperty(record: Record<string, unknown> | null, key: string): Record<string, unknown> | null {
+  if (!record) {
+    return null;
+  }
+  const value = record[key];
+  return isRecord(value) ? value : null;
+}
+
+function stringArrayProperty(record: Record<string, unknown> | null, key: string): string[] {
+  const value = record?.[key];
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
 }
 
 async function packageHasHistory(root: string, packagePath: string): Promise<boolean> {
