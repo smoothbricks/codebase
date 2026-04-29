@@ -56,6 +56,7 @@ describe('bun-test-tracing generator', () => {
     expect(tree.read('packages/example/bunfig.toml', 'utf-8')).toContain(
       'preload = ["@smoothbricks/lmao/bun/preload", "@smoothbricks/lmao/bun/trace-preload"]',
     );
+    expect(tree.read('packages/example/bunfig.toml', 'utf-8')).toContain('timeout = 30000');
 
     const tracerFile = tree.read('packages/example/src/test-suite-tracer.ts', 'utf-8');
     expect(tracerFile).toContain("import { opContext } from '@smoothbricks/lmao';");
@@ -130,6 +131,7 @@ describe('bun-test-tracing generator', () => {
 
     const bunfig = tree.read('packages/example/bunfig.toml', 'utf-8') ?? '';
     expect(bunfig).toContain('[test]');
+    expect(bunfig).toContain('timeout = 30000');
     expect(bunfig).toContain('preload');
   });
 
