@@ -27,6 +27,12 @@ function isNodeTimer(value: unknown): value is NodeJS.Timeout {
   return typeof value === 'object' && value !== null && typeof Reflect.get(value, 'hasRef') === 'function';
 }
 
+function unrefTimer(timer: unknown): void {
+  if (isNodeTimer(timer)) {
+    timer.unref();
+  }
+}
+
 function mergeTables(first: Table, rest: Table[]): Table {
   if (rest.length === 0) return first;
 
@@ -177,12 +183,14 @@ export class FlushScheduler {
     this.flushTimer = setInterval(() => {
       this.checkFlushConditions();
     }, 1000); // Check every second
+    unrefTimer(this.flushTimer);
 
     // Set up idle detection timer
     if (this.config.idleDetection) {
       this.idleTimer = setInterval(() => {
         this.checkIdleFlush();
       }, this.config.idleTimeout);
+      unrefTimer(this.idleTimer);
     }
 
     // Set up memory pressure timer (Node.js only)
@@ -190,6 +198,7 @@ export class FlushScheduler {
       this.memoryTimer = setInterval(() => {
         this.checkMemoryPressure();
       }, 2000); // Check every 2 seconds
+      unrefTimer(this.memoryTimer);
     }
   }
 

@@ -191,13 +191,20 @@ describe('FlushScheduler', () => {
     describe('failure cases', () => {
       it('should not throw if timers fail to clear', () => {
         scheduler.start();
+        const originalFlushTimer = FlushSchedulerTestUtils.getFlushTimer(scheduler);
 
         // Force internal state corruption - accessing private property for testing
         FlushSchedulerTestUtils.setFlushTimer(scheduler, undefined);
 
-        expect(() => {
-          scheduler.stop();
-        }).not.toThrow();
+        try {
+          expect(() => {
+            scheduler.stop();
+          }).not.toThrow();
+        } finally {
+          if (originalFlushTimer) {
+            clearInterval(originalFlushTimer);
+          }
+        }
       });
     });
   });
