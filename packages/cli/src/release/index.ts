@@ -459,7 +459,9 @@ async function releaseVersionPackages(
   return autoReleaseCandidatePackages(
     {
       gitRefExists: (ref) => gitRefExists(root, ref),
-      packageChangedSince: (ref, packagePath) => packageChangedSince(root, ref, packagePath),
+      packageChangedFilesSince: (ref, packagePath) => packageChangedFilesSince(root, ref, packagePath),
+      packageJsonAtRef: (ref, packagePath) => packageJsonAtRef(root, ref, packagePath),
+      currentPackageJson: (packagePath) => currentPackageJson(root, packagePath),
       packageHasHistory: (packagePath) => packageHasHistory(root, packagePath),
     },
     packages,
@@ -837,15 +839,38 @@ async function gitRefExists(root: string, ref: string): Promise<boolean> {
   return result.exitCode === 0;
 }
 
-async function packageChangedSince(root: string, ref: string, packagePath: string): Promise<boolean> {
-  const result = await $`git diff --quiet ${`${ref}..HEAD`} -- ${packagePath}`.cwd(root).quiet().nothrow();
-  if (result.exitCode === 0) {
-    return false;
+async function packageChangedFilesSince(root: string, ref: string, packagePath: string): Promise<string[]> {
+  const result = await $`git diff --name-only ${`${ref}..HEAD`} -- ${packagePath}`.cwd(root).quiet().nothrow();
+  if (result.exitCode !== 0) {
+    throw new Error(`Unable to inspect package changes under ${packagePath}.`);
   }
-  if (result.exitCode === 1) {
-    return true;
+  const packagePrefix = `${packagePath}/`;
+  return decode(result.stdout)
+    .split('\n')
+    .map((path) => path.trim())
+    .filter(Boolean)
+    .map((path) => (path.startsWith(packagePrefix) ? path.slice(packagePrefix.length) : path));
+}
+
+async function packageJsonAtRef(
+  root: string,
+  ref: string,
+  packagePath: string,
+): Promise<Record<string, unknown> | null> {
+  const result = await $`git show ${`${ref}:${packagePath}/package.json`}`.cwd(root).quiet().nothrow();
+  if (result.exitCode !== 0) {
+    return null;
   }
-  throw new Error(`Unable to inspect package changes under ${packagePath}.`);
+  try {
+    const parsed = JSON.parse(decode(result.stdout));
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function currentPackageJson(root: string, packagePath: string): Promise<Record<string, unknown> | null> {
+  return readPackageJson(join(root, packagePath, 'package.json'))?.json ?? null;
 }
 
 async function packageHasHistory(root: string, packagePath: string): Promise<boolean> {
