@@ -202,6 +202,43 @@ describe('workspace package script policy', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('materializes nx.name when rewriting scripts for packages with existing nx config', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [
+        { dir: 'lib', name: '@smoothbricks/lib', nx: { name: 'lib' } },
+        {
+          dir: 'app',
+          name: '@external/app',
+          dependencies: { '@smoothbricks/lib': 'workspace:*' },
+          scripts: { test: 'bun test --pass-with-no-tests' },
+          nx: { targets: {} },
+        },
+      ],
+    });
+    try {
+      expect(validateWorkspaceDependencies(root)).toBe(1);
+
+      applyWorkspaceDependencyDefaults(root);
+
+      const app = await readJson(join(root, 'packages/app/package.json'));
+      expect(app.scripts).toEqual({ test: 'nx run @external/app:test' });
+      expect(app.nx).toEqual({
+        name: '@external/app',
+        targets: {
+          test: {
+            executor: 'nx:run-commands',
+            dependsOn: ['^build'],
+            options: { command: 'bun test --pass-with-no-tests', cwd: '{projectRoot}' },
+          },
+        },
+      });
+      expect(validateWorkspaceDependencies(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 async function createWorkspace(input: {

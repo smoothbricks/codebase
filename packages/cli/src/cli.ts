@@ -1,6 +1,5 @@
-import { fileURLToPath } from 'node:url';
 import { Command, CommanderError } from 'commander';
-import { readJsonObject, stringProperty } from './lib/json.js';
+import { cliPackageVersion } from './lib/cli-package.js';
 import { findRepoRoot } from './lib/run.js';
 
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
@@ -25,7 +24,7 @@ function buildProgram(): Command {
   program
     .name('smoo')
     .description('SmoothBricks monorepo tooling')
-    .version(cliVersion(), '-v, --version', 'print smoo version')
+    .version(cliPackageVersion, '-v, --version', 'print smoo version')
     .exitOverride()
     .showHelpAfterError();
 
@@ -252,15 +251,6 @@ function buildProgram(): Command {
     });
 
   return program;
-}
-
-function cliVersion(): string {
-  const pkg = readJsonObject(fileURLToPath(new URL('../package.json', import.meta.url)));
-  const version = pkg ? stringProperty(pkg, 'version') : null;
-  if (!version) {
-    throw new Error('Unable to read @smoothbricks/cli package version.');
-  }
-  return version;
 }
 
 function booleanOption(value: string | boolean | undefined): boolean {

@@ -1,21 +1,39 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { cliPackageVersion, isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
 import { getOrCreateRecord, readJsonObject, recordProperty, setStringProperty, writeJsonObject } from '../lib/json.js';
-import { getWorkspacePackages } from '../lib/workspace.js';
+import { type PackageJson, readPackageJsonObject } from '../lib/workspace.js';
 
 interface RequiredDependency {
   name: string;
   fallbackVersion: string;
   minimumVersion?: string;
   prefix?: string;
+  useWorkspaceRangeInCodebase?: boolean;
+}
+
+export interface ToolPolicy {
+  isSmoothBricksCodebase: boolean;
+  toolingPackageName: string;
+  cliDependencyRange: string;
+}
+
+export interface ToolContext {
+  rootPackage: PackageJson | null;
+  policy: ToolPolicy;
 }
 
 const rootDevDependencies: RequiredDependency[] = [
   { name: '@biomejs/biome', fallbackVersion: '^2.3.5', minimumVersion: '2.3.0', prefix: '^' },
   { name: '@nx/js', fallbackVersion: '22.0.3', minimumVersion: '22.0.0' },
   { name: 'eslint', fallbackVersion: '^9.39.1', minimumVersion: '9.39.0', prefix: '^' },
-  { name: 'eslint-stdout', fallbackVersion: 'workspace:*' },
+  {
+    name: 'eslint-stdout',
+    fallbackVersion: '^1.1.1',
+    minimumVersion: '1.1.1',
+    prefix: '^',
+    useWorkspaceRangeInCodebase: true,
+  },
   { name: 'nx', fallbackVersion: '22.5.4', minimumVersion: '22.5.0' },
   { name: 'prettier', fallbackVersion: '^3.6.1', minimumVersion: '3.6.0', prefix: '^' },
   { name: 'typescript', fallbackVersion: '^5.9.3', minimumVersion: '5.9.0', prefix: '^' },
@@ -27,24 +45,24 @@ const requiredDevenvPackages = ['bun', 'git', 'git-format-staged', 'jq', 'alejan
 const allowedNodePackages = ['nodejs_24', 'nodejs_latest'];
 
 export async function applyToolConfigDefaults(root: string): Promise<void> {
-  await applyRootDevDependencyDefaults(root);
-  applyToolingPackageDefaults(root);
-  applyToolingWorkspaceDefault(root);
+  const context = readToolContext(root);
+  await applyRootPackageToolDefaults(root, context);
+  applyToolingPackageDefaults(root, context.policy);
   applyDevenvPackageDefaults(root);
 }
 
 export function validateToolConfig(root: string): number {
+  const context = readToolContext(root);
   return (
-    validateRootDevDependencies(root) +
-    validateToolingPackage(root) +
-    validateToolingWorkspace(root) +
+    validateRootDevDependencies(context.policy, context.rootPackage) +
+    validateToolingPackage(root, context.policy) +
+    validateToolingWorkspace(context.rootPackage) +
     validateDevenvPackages(root)
   );
 }
 
-export async function applyRootDevDependencyDefaults(root: string): Promise<void> {
-  const path = join(root, 'package.json');
-  const pkg = readJsonObject(path);
+export async function applyRootDevDependencyDefaults(root: string, context: ToolContext): Promise<void> {
+  const pkg = context.rootPackage;
   if (!pkg) {
     return;
   }
@@ -52,8 +70,8 @@ export async function applyRootDevDependencyDefaults(root: string): Promise<void
   const devDependencies = getOrCreateRecord(pkg, 'devDependencies');
   for (const dependency of rootDevDependencies) {
     const current = devDependencies[dependency.name];
-    if (typeof current !== 'string' || !satisfiesDependencyPolicy(current, dependency)) {
-      const version = await resolveDependencyVersion(dependency);
+    if (typeof current !== 'string' || !satisfiesDependencyPolicy(context.policy, current, dependency)) {
+      const version = await resolveDependencyVersion(context.policy, dependency);
       changed = setStringProperty(devDependencies, dependency.name, version) || changed;
     }
   }
@@ -61,24 +79,58 @@ export async function applyRootDevDependencyDefaults(root: string): Promise<void
     changed = true;
   }
   if (changed) {
-    writeJsonObject(path, pkg);
+    writeJsonObject(join(root, 'package.json'), pkg);
     console.log('updated        package.json workspace tool dependencies');
   } else {
     console.log('unchanged      package.json workspace tool dependencies');
   }
 }
 
-export function applyToolingPackageDefaults(root: string): void {
+async function applyRootPackageToolDefaults(root: string, context: ToolContext): Promise<void> {
+  const pkg = context.rootPackage;
+  if (!pkg) {
+    return;
+  }
+  let dependencyChanged = false;
+  let workspaceChanged = false;
+  const devDependencies = getOrCreateRecord(pkg, 'devDependencies');
+  for (const dependency of rootDevDependencies) {
+    const current = devDependencies[dependency.name];
+    if (typeof current !== 'string' || !satisfiesDependencyPolicy(context.policy, current, dependency)) {
+      const version = await resolveDependencyVersion(context.policy, dependency);
+      dependencyChanged = setStringProperty(devDependencies, dependency.name, version) || dependencyChanged;
+    }
+  }
+  if (delete devDependencies[cliPackageName]) {
+    dependencyChanged = true;
+  }
+  workspaceChanged = addWorkspacePattern(pkg, 'tooling');
+  if (dependencyChanged || workspaceChanged) {
+    writeJsonObject(join(root, 'package.json'), pkg);
+  }
+  console.log(
+    dependencyChanged
+      ? 'updated        package.json workspace tool dependencies'
+      : 'unchanged      package.json workspace tool dependencies',
+  );
+  console.log(
+    workspaceChanged
+      ? 'updated        package.json tooling workspace'
+      : 'unchanged      package.json tooling workspace',
+  );
+}
+
+export function applyToolingPackageDefaults(root: string, policy: ToolPolicy): void {
   const path = join(root, 'tooling', 'package.json');
-  const pkg = readJsonObject(path) ?? { name: toolingPackageName(root), private: true, dependencies: {} };
+  const pkg = readJsonObject(path) ?? { name: policy.toolingPackageName, private: true, dependencies: {} };
   let changed = false;
-  changed = setStringProperty(pkg, 'name', toolingPackageName(root)) || changed;
+  changed = setStringProperty(pkg, 'name', policy.toolingPackageName) || changed;
   if (pkg.private !== true) {
     pkg.private = true;
     changed = true;
   }
   const dependencies = getOrCreateRecord(pkg, 'dependencies');
-  changed = setStringProperty(dependencies, cliPackageName, cliDependencyRange(root)) || changed;
+  changed = setStringProperty(dependencies, cliPackageName, policy.cliDependencyRange) || changed;
   if (changed || !existsSync(path)) {
     mkdirSync(dirname(path), { recursive: true });
     writeJsonObject(path, pkg);
@@ -130,8 +182,8 @@ export function applyDevenvPackageDefaults(root: string): void {
   }
 }
 
-export function validateRootDevDependencies(root: string): number {
-  const pkg = readJsonObject(join(root, 'package.json'));
+export function validateRootDevDependencies(policy: ToolPolicy, rootPackage: PackageJson | null): number {
+  const pkg = rootPackage;
   if (!pkg) {
     console.error('package.json not found or invalid');
     return 1;
@@ -143,9 +195,9 @@ export function validateRootDevDependencies(root: string): number {
     if (typeof version !== 'string') {
       console.error(`package.json devDependencies.${dependency.name} must be defined`);
       failures++;
-    } else if (!satisfiesDependencyPolicy(version, dependency)) {
+    } else if (!satisfiesDependencyPolicy(policy, version, dependency)) {
       console.error(
-        `package.json devDependencies.${dependency.name} must be >= ${formatMinimum(dependency)}; found ${version}`,
+        `package.json devDependencies.${dependency.name} must be ${formatExpectedDependency(policy, dependency)}; found ${version}`,
       );
       failures++;
     }
@@ -157,7 +209,7 @@ export function validateRootDevDependencies(root: string): number {
   return failures;
 }
 
-export function validateToolingPackage(root: string): number {
+export function validateToolingPackage(root: string, policy: ToolPolicy): number {
   const path = join(root, 'tooling', 'package.json');
   const pkg = readJsonObject(path);
   if (!pkg) {
@@ -166,23 +218,21 @@ export function validateToolingPackage(root: string): number {
   }
   const dependencies = recordProperty(pkg, 'dependencies');
   let failures = 0;
-  const expectedName = toolingPackageName(root);
   const actualName = typeof pkg.name === 'string' ? pkg.name : null;
-  if (actualName !== expectedName) {
-    console.error(`tooling/package.json name must be ${expectedName}`);
+  if (actualName !== policy.toolingPackageName) {
+    console.error(`tooling/package.json name must be ${policy.toolingPackageName}`);
     failures++;
   }
-  const expectedCliRange = cliDependencyRange(root);
   const actualCliRange = dependencies?.[cliPackageName];
-  if (actualCliRange !== expectedCliRange) {
-    console.error(`tooling/package.json dependencies.${cliPackageName} must be ${expectedCliRange}`);
+  if (actualCliRange !== policy.cliDependencyRange) {
+    console.error(`tooling/package.json dependencies.${cliPackageName} must be ${policy.cliDependencyRange}`);
     failures++;
   }
   return failures;
 }
 
-export function validateToolingWorkspace(root: string): number {
-  const pkg = readJsonObject(join(root, 'package.json'));
+export function validateToolingWorkspace(rootPackage: PackageJson | null): number {
+  const pkg = rootPackage;
   if (!pkg) {
     console.error('package.json not found or invalid');
     return 1;
@@ -249,7 +299,10 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function satisfiesDependencyPolicy(version: string, dependency: RequiredDependency): boolean {
+function satisfiesDependencyPolicy(policy: ToolPolicy, version: string, dependency: RequiredDependency): boolean {
+  if (workspaceDependencyExpected(policy, dependency)) {
+    return version === 'workspace:*';
+  }
   if (dependency.minimumVersion === undefined) {
     return version === dependency.fallbackVersion;
   }
@@ -261,39 +314,43 @@ function satisfiesDependencyPolicy(version: string, dependency: RequiredDependen
   return compareVersions(parsed, minimum) >= 0;
 }
 
-function formatMinimum(dependency: RequiredDependency): string {
-  return dependency.minimumVersion ?? dependency.fallbackVersion;
+function formatExpectedDependency(policy: ToolPolicy, dependency: RequiredDependency): string {
+  if (workspaceDependencyExpected(policy, dependency)) {
+    return 'workspace:*';
+  }
+  return dependency.minimumVersion ? `>= ${dependency.minimumVersion}` : dependency.fallbackVersion;
 }
 
-function toolingPackageName(root: string): string {
-  const rootPackage = readJsonObject(join(root, 'package.json'));
+export function readToolContext(root: string): ToolContext {
+  const rootPackage = readPackageJsonObject(join(root, 'package.json'));
+  return { rootPackage, policy: toolPolicy(rootPackage) };
+}
+
+function toolPolicy(rootPackage: PackageJson | null): ToolPolicy {
   const name = typeof rootPackage?.name === 'string' ? rootPackage.name : null;
+  const isCodebase = isSmoothBricksCodebasePackageName(name ?? undefined);
+  const toolingName = toolingPackageName(name);
+  return {
+    isSmoothBricksCodebase: isCodebase,
+    toolingPackageName: toolingName,
+    cliDependencyRange: isCodebase ? 'workspace:*' : `^${cliPackageVersion}`,
+  };
+}
+
+function toolingPackageName(rootName: string | null): string {
+  const name = rootName;
   const scope = name?.match(/^(@[^/]+)\//)?.[1];
   return scope ? `${scope}/tooling` : 'tooling';
 }
 
-function cliDependencyRange(root: string): string {
-  return workspaceHasCliPackage(root) ? 'workspace:*' : `^${currentCliVersion()}`;
+function workspaceDependencyExpected(policy: ToolPolicy, dependency: RequiredDependency): boolean {
+  return dependency.useWorkspaceRangeInCodebase === true && policy.isSmoothBricksCodebase;
 }
 
-function workspaceHasCliPackage(root: string): boolean {
-  try {
-    return getWorkspacePackages(root).some((pkg) => pkg.name === cliPackageName);
-  } catch {
-    return false;
+async function resolveDependencyVersion(policy: ToolPolicy, dependency: RequiredDependency): Promise<string> {
+  if (workspaceDependencyExpected(policy, dependency)) {
+    return 'workspace:*';
   }
-}
-
-function currentCliVersion(): string {
-  const pkg = readJsonObject(fileURLToPath(new URL('../../package.json', import.meta.url)));
-  const version = typeof pkg?.version === 'string' ? pkg.version : null;
-  if (!version) {
-    throw new Error('Unable to read @smoothbricks/cli package version.');
-  }
-  return version;
-}
-
-async function resolveDependencyVersion(dependency: RequiredDependency): Promise<string> {
   if (!dependency.minimumVersion) {
     return dependency.fallbackVersion;
   }
@@ -369,7 +426,7 @@ function stripRangePrefix(version: string): string {
   return version.replace(/^[~^]/, '');
 }
 
-function addWorkspacePattern(pkg: Record<string, unknown>, pattern: string): boolean {
+function addWorkspacePattern(pkg: PackageJson, pattern: string): boolean {
   const workspaces = pkg.workspaces;
   if (Array.isArray(workspaces)) {
     if (workspaces.includes(pattern)) {
@@ -389,7 +446,7 @@ function addWorkspacePattern(pkg: Record<string, unknown>, pattern: string): boo
   return true;
 }
 
-function hasWorkspacePattern(pkg: Record<string, unknown>, pattern: string): boolean {
+function hasWorkspacePattern(pkg: PackageJson, pattern: string): boolean {
   const workspaces = pkg.workspaces;
   if (Array.isArray(workspaces)) {
     return workspaces.includes(pattern);

@@ -1,5 +1,6 @@
 import { readdirSync, statSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
+import { isSmoothBricksCodebasePackageName } from './cli-package.js';
 import { hasOwn, hasOwnString, isRecord, readJson, readJsonObject, stringProperty } from './json.js';
 
 export interface PackageInfo {
@@ -10,6 +11,17 @@ export interface PackageInfo {
   path: string;
   packageJsonPath: string;
   json: Record<string, unknown>;
+}
+
+export interface PackageJson extends Record<string, unknown> {
+  name?: string;
+  version?: string;
+  private?: boolean;
+  workspaces?: unknown;
+  devDependencies?: unknown;
+  dependencies?: unknown;
+  nx?: unknown;
+  repository?: unknown;
 }
 
 export interface RepositoryInfo {
@@ -47,6 +59,15 @@ export function listReleasePackages(
 export function rootRepositoryInfo(root: string): RepositoryInfo | null {
   const rootPackage = readJsonObject(join(root, 'package.json'));
   return rootPackage ? repositoryInfo(rootPackage) : null;
+}
+
+export function rootPackageName(root: string): string | null {
+  const rootPackage = readPackageJsonObject(join(root, 'package.json'));
+  return rootPackage ? stringProperty(rootPackage, 'name') : null;
+}
+
+export function isSmoothBricksCodebase(root: string): boolean {
+  return isSmoothBricksCodebasePackageName(rootPackageName(root) ?? undefined);
 }
 
 export function packageRepositoryInfo(pkg: PackageInfo): RepositoryInfo | null {
@@ -127,7 +148,7 @@ function getWorkspacePatternsFromPackageJson(pkg: Record<string, unknown>): stri
 }
 
 export function readPackageJson(path: string): PackageInfo | null {
-  const parsed = readJsonObject(path);
+  const parsed = readPackageJsonObject(path);
   if (!isRecord(parsed) || !hasOwnString(parsed, 'name') || !hasOwnString(parsed, 'version')) {
     return null;
   }
@@ -142,6 +163,11 @@ export function readPackageJson(path: string): PackageInfo | null {
     packageJsonPath: path,
     json: parsed,
   };
+}
+
+export function readPackageJsonObject(path: string): PackageJson | null {
+  const parsed = readJsonObject(path);
+  return parsed;
 }
 
 export function getNxTags(pkg: Record<string, unknown>): string[] {
