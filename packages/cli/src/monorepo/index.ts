@@ -1,7 +1,7 @@
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { $ } from 'bun';
-import { decode } from '../lib/run.js';
-import { escapeRegex, getWorkspacePatterns, listReleasePackages } from '../lib/workspace.js';
+import { decode, run } from '../lib/run.js';
+import { escapeRegex, getWorkspacePackages, getWorkspacePatterns, listReleasePackages } from '../lib/workspace.js';
 import { formatCommitMessage, validateCommitMessage } from './commit-msg.js';
 import { applyWorkspaceGitConfig } from './git-config.js';
 import { syncBunLockfileVersions } from './lockfile.js';
@@ -29,6 +29,19 @@ export interface ValidateCommitMessageOptions {
 export interface ListReleasePackagesOptions {
   failEmpty?: boolean;
   githubOutput?: string;
+}
+
+export interface SetupTestTracingOptions {
+  all?: boolean;
+  projects?: string;
+  opContextExport?: string;
+  tracerModule?: string;
+  dryRun?: boolean;
+}
+
+export interface SetupTestTracingShell {
+  run(command: string, args: string[], cwd: string): Promise<void>;
+  log(message: string): void;
 }
 
 export async function initMonorepo(root: string, options: InitOptions): Promise<void> {
@@ -118,7 +131,96 @@ export function validatePublicPackageTags(root: string): void {
   }
 }
 
+export async function setupTestTracing(
+  root: string,
+  options: SetupTestTracingOptions,
+  shell: SetupTestTracingShell = defaultSetupTestTracingShell,
+): Promise<void> {
+  const selectedPackages = selectTestTracingPackages(root, options);
+  const opContextExport = options.opContextExport ?? 'opContext';
+  const tracerModule = options.tracerModule ?? '@smoothbricks/lmao/testing/bun';
+
+  if (selectedPackages.length === 0) {
+    throw new Error('No workspace packages matched LMAO test tracing setup selection.');
+  }
+
+  for (const pkg of selectedPackages) {
+    const args = [
+      'g',
+      '@smoothbricks/nx-plugin:bun-test-tracing',
+      '--project',
+      pkg.projectName,
+      '--opContextModule',
+      pkg.name,
+      '--opContextExport',
+      opContextExport,
+      '--tracerModule',
+      tracerModule,
+    ];
+    const commandPreview = `nx ${args.join(' ')}`;
+    if (options.dryRun) {
+      shell.log(`would run      ${commandPreview}`);
+      continue;
+    }
+    shell.log(`running        ${commandPreview}`);
+    await shell.run('nx', args, root);
+  }
+}
+
 export { applyWorkspaceGitConfig, syncBunLockfileVersions };
+
+const defaultSetupTestTracingShell: SetupTestTracingShell = {
+  run,
+  log(message) {
+    console.log(message);
+  },
+};
+
+function selectTestTracingPackages(root: string, options: SetupTestTracingOptions) {
+  const packages = getWorkspacePackages(root);
+  const requested = splitCommaList(options.projects);
+
+  if (options.all && requested.length > 0) {
+    throw new Error('Use either --all or --projects, not both.');
+  }
+  if (!options.all && requested.length === 0) {
+    throw new Error('Pass --all or --projects <projects> to select packages for LMAO test tracing setup.');
+  }
+  if (options.all) {
+    return packages;
+  }
+
+  const bySelector = new Map<string, (typeof packages)[number]>();
+  for (const pkg of packages) {
+    bySelector.set(pkg.projectName, pkg);
+    bySelector.set(pkg.name, pkg);
+    bySelector.set(pkg.path, pkg);
+  }
+
+  const selected = [];
+  const missing = [];
+  for (const selector of requested) {
+    const pkg = bySelector.get(selector);
+    if (pkg) {
+      selected.push(pkg);
+    } else {
+      missing.push(selector);
+    }
+  }
+
+  if (missing.length > 0) {
+    throw new Error(`Unknown workspace package selection for LMAO test tracing setup: ${missing.join(', ')}`);
+  }
+
+  return selected;
+}
+
+function splitCommaList(value: string | undefined): string[] {
+  return (value ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
 
 async function hasNewWorkspacePackage(root: string): Promise<boolean> {
   const result = await $`git diff --cached --name-only --diff-filter=A -- ${'*/package.json'}`

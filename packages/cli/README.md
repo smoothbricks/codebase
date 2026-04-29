@@ -36,6 +36,7 @@ smoo monorepo validate-commit-msg <commit-msg-file>
 smoo monorepo sync-bun-lockfile-versions
 smoo monorepo list-release-packages [--fail-empty] [--github-output <path>]
 smoo monorepo validate-public-tags
+smoo monorepo setup-test-tracing (--all | --projects <projects>) [--dry-run]
 
 smoo release npm-status
 smoo release repair-pending [--dry-run]
@@ -96,6 +97,36 @@ Bun types are also a root runtime policy. The root `@types/bun` version follows 
 while package manifests are not forced to depend on Bun just because a test tsconfig opts into Bun globals. If a package
 does explicitly declare `@types/bun`, `sherif` can keep duplicate declarations consistent, but `smoo` owns the semantic
 root `bun@x.y.z` to `@types/bun x.y.z` relationship.
+
+## LMAO Test Tracing
+
+`smoo monorepo setup-test-tracing` configures LMAO-backed Bun test tracing for workspace packages. It is a bulk wrapper
+around the `@smoothbricks/nx-plugin:bun-test-tracing` generator, so the Nx plugin remains the single source of truth for
+the files written.
+
+Configure every workspace package:
+
+```bash
+smoo monorepo setup-test-tracing --all
+```
+
+Configure selected packages by Nx project name, package name, or package root:
+
+```bash
+smoo monorepo setup-test-tracing --projects cli,@smoothbricks/lmao,packages/nx-plugin
+```
+
+The command infers the op context module from each package's `package.json` `name`, assumes an `opContext` named export,
+and imports `defineTestTracer` from `@smoothbricks/lmao/testing/bun`. Override those defaults when a repository uses a
+different convention:
+
+```bash
+smoo monorepo setup-test-tracing --projects my-lib --op-context-export myOpContext
+smoo monorepo setup-test-tracing --projects my-lib --tracer-module @scope/testing/bun
+```
+
+Use `--dry-run` to print the `nx g @smoothbricks/nx-plugin:bun-test-tracing ...` invocations without writing files.
+After setup, run `smoo monorepo validate --fix` to apply the broader SmoothBricks monorepo policy.
 
 ## Validation
 

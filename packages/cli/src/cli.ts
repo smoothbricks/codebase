@@ -92,6 +92,30 @@ function buildProgram(): Command {
     const { validatePublicPackageTags } = await import('./monorepo/index.js');
     validatePublicPackageTags(await findRepoRoot());
   });
+  monorepo
+    .command('setup-test-tracing')
+    .description('Configure LMAO Bun test tracing for workspace packages')
+    .option('--all', 'configure every workspace package')
+    .option('--projects <projects>', 'comma-separated Nx project names, package names, or package roots')
+    .option('--op-context-export <exportName>', 'named op context export imported by test-suite-tracer', 'opContext')
+    .option(
+      '--tracer-module <module>',
+      'module specifier that exports defineTestTracer',
+      '@smoothbricks/lmao/testing/bun',
+    )
+    .option('--dry-run', 'print generator invocations without writing files')
+    .action(
+      async (options: {
+        all?: boolean;
+        projects?: string;
+        opContextExport?: string;
+        tracerModule?: string;
+        dryRun?: boolean;
+      }) => {
+        const { setupTestTracing } = await import('./monorepo/index.js');
+        await setupTestTracing(await findRepoRoot(), options);
+      },
+    );
   const release = program.command('release').description('Version, publish, and create GitHub Releases');
   release.command('npm-status').action(async () => {
     const { printReleaseState } = await import('./release/index.js');
