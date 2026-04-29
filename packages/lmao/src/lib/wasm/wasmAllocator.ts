@@ -132,9 +132,9 @@ export enum SizeClass {
 }
 
 export interface WasmAllocatorOptions {
-  /** Initial memory pages (64KB each). Default: 17 (~1MB) */
+  /** Initial memory pages (64KB each). Values below the module minimum are clamped. */
   initialPages?: number;
-  /** Maximum memory pages. Default: 16384 (1GB) */
+  /** Maximum memory pages. Values below the effective initial page count are clamped. */
   maxPages?: number;
   /** Default capacity (rows per span buffer). Default: 64 */
   capacity?: number;
@@ -225,7 +225,7 @@ function isWasmExports(value: unknown): value is WasmExports {
 // Implementation
 // =============================================================================
 
-const DEFAULT_INITIAL_PAGES = 17; // ~1MB - matches WASM module minimum
+const MIN_INITIAL_PAGES = 17; // ~1MB - matches WASM module minimum
 const DEFAULT_MAX_PAGES = 16384; // 1GB max (can grow up to this)
 const DEFAULT_CAPACITY = 64;
 
@@ -427,8 +427,8 @@ async function getWasmModule(): Promise<WebAssembly.Module> {
  * Buddy allocation enables efficient memory management across different capacities.
  */
 export async function createWasmAllocator(options?: WasmAllocatorOptions): Promise<WasmAllocator> {
-  const initialPages = options?.initialPages ?? DEFAULT_INITIAL_PAGES;
-  const maxPages = options?.maxPages ?? DEFAULT_MAX_PAGES;
+  const initialPages = Math.max(options?.initialPages ?? MIN_INITIAL_PAGES, MIN_INITIAL_PAGES);
+  const maxPages = Math.max(options?.maxPages ?? DEFAULT_MAX_PAGES, initialPages);
   const capacity = options?.capacity ?? DEFAULT_CAPACITY;
 
   // Create memory
@@ -451,8 +451,8 @@ export async function createWasmAllocator(options?: WasmAllocatorOptions): Promi
  * Synchronous version for when WASM is pre-loaded.
  */
 export function createWasmAllocatorSync(wasmModule: WebAssembly.Module, options?: WasmAllocatorOptions): WasmAllocator {
-  const initialPages = options?.initialPages ?? DEFAULT_INITIAL_PAGES;
-  const maxPages = options?.maxPages ?? DEFAULT_MAX_PAGES;
+  const initialPages = Math.max(options?.initialPages ?? MIN_INITIAL_PAGES, MIN_INITIAL_PAGES);
+  const maxPages = Math.max(options?.maxPages ?? DEFAULT_MAX_PAGES, initialPages);
   const capacity = options?.capacity ?? DEFAULT_CAPACITY;
 
   // Create memory
