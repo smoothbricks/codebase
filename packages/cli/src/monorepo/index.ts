@@ -6,10 +6,9 @@ import { formatCommitMessage, validateCommitMessage } from './commit-msg.js';
 import { applyWorkspaceGitConfig } from './git-config.js';
 import { syncBunLockfileVersions } from './lockfile.js';
 import { applyManagedFiles, printResults } from './managed-files.js';
-import { applyFixableMonorepoDefaults, listValidCommitScopes, validatePublicTags } from './package-policy.js';
+import { listValidCommitScopes, validatePublicTags } from './package-policy.js';
 import { runInitPacks, runValidatePacks } from './packs/index.js';
 import { syncRootRuntimeVersions } from './runtime.js';
-import { applyToolConfigDefaults } from './tool-validation.js';
 
 export interface InitOptions {
   runtimeOnly?: boolean;
@@ -44,10 +43,6 @@ export async function initMonorepo(root: string, options: InitOptions): Promise<
 export async function validateMonorepo(root: string, options: ValidateOptions = {}): Promise<void> {
   if (options.onlyIfNewWorkspacePackage && !(await hasNewWorkspacePackage(root))) {
     return;
-  }
-  if (options.fix) {
-    applyFixableMonorepoDefaults(root);
-    await applyToolConfigDefaults(root);
   }
   const failures = await runValidatePacks({ root, syncRuntime: false }, options);
   if (failures > 0) {

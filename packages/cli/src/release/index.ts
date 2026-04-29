@@ -10,11 +10,18 @@ import { decode, run, runStatus } from '../lib/run.js';
 import { listReleasePackages, readPackageJson, repositoryInfo } from '../lib/workspace.js';
 import { readPackedPackageJson, validatePackedWorkspaceDependencies } from '../monorepo/packed-manifest.js';
 import {
+  type BootstrapNpmPackagesOptions,
+  bootstrapNpmPackages,
+  NPM_BOOTSTRAP_DIST_TAG,
+  NPM_BOOTSTRAP_VERSION,
+} from './bootstrap-npm-packages.js';
+import {
   type ReleaseTagRecord as CoreReleaseTagRecord,
   type ReleaseTarget as CoreReleaseTarget,
   collectOwnedReleaseTagRecords,
   type GitReleaseTagInfo,
   pendingReleaseTargets,
+  type ReleasePackageInfo,
   releaseTag,
 } from './core.js';
 import { createOrUpdateGithubRelease, renderNxProjectChangelogContents } from './github-release.js';
@@ -46,8 +53,15 @@ export interface ReleaseRepairPendingOptions {
 
 export interface ReleaseTrustPublisherOptions {
   dryRun?: boolean;
+  bootstrap?: boolean;
   otp?: string;
   skipLogin?: boolean;
+}
+
+export interface ReleaseBootstrapNpmPackagesOptions {
+  dryRun?: boolean;
+  skipLogin?: boolean;
+  packages?: string[];
 }
 
 export interface ReleaseRetagUnpublishedOptions {
@@ -134,61 +148,137 @@ export async function releaseRepairPending(root: string, options: ReleaseRepairP
 export async function releaseTrustPublisher(root: string, options: ReleaseTrustPublisherOptions): Promise<void> {
   const repository = githubRepositoryFromRootPackage(root);
   const workflow = 'publish.yml';
-  const packages = listReleasePackages(root);
+  await configureTrustedPublishers(
+    {
+      repository,
+      workflow,
+      listReleasePackages: () => listReleasePackages(root),
+      packageExists: (name) => npmPackageExists(root, name),
+      bootstrapNpmPackages: (bootstrapOptions) =>
+        bootstrapNpmPackages(
+          {
+            listReleasePackages: () => listReleasePackages(root),
+            packageExists: (name) => npmPackageExists(root, name),
+            login: () => runLatestNpm(root, ['login', '--auth-type=web']),
+            publishPlaceholder: (pkg) => publishPlaceholderPackage(root, pkg),
+            log: (message) => console.log(message),
+          },
+          bootstrapOptions,
+        ),
+      login: () => runLatestNpm(root, ['login', '--auth-type=web']),
+      trustPublisher: (pkg, dryRun, env) => {
+        const args = ['trust', 'github', pkg.name, '--file', workflow, '--repo', repository, '--yes'];
+        if (dryRun) {
+          args.push('--dry-run');
+        }
+        return runLatestNpm(root, args, env);
+      },
+      promptOtp: (packageName) => promptForNpmOtp(packageName),
+      log: (message) => console.log(message),
+      error: (message) => console.error(message),
+    },
+    options,
+  );
+}
+
+export interface TrustPublisherShell<Package extends ReleasePackageInfo = ReleasePackageInfo> {
+  repository: string;
+  workflow: string;
+  listReleasePackages(): Package[];
+  packageExists(name: string): Promise<boolean>;
+  bootstrapNpmPackages(options: BootstrapNpmPackagesOptions): Promise<Package[]>;
+  login(): Promise<void>;
+  trustPublisher(pkg: Package, dryRun: boolean, env?: Record<string, string>): Promise<void>;
+  promptOtp(packageName: string): Promise<string>;
+  log(message: string): void;
+  error(message: string): void;
+}
+
+export async function configureTrustedPublishers<Package extends ReleasePackageInfo>(
+  shell: TrustPublisherShell<Package>,
+  options: ReleaseTrustPublisherOptions,
+): Promise<void> {
+  const packages = shell.listReleasePackages();
   if (packages.length === 0) {
     throw new Error('No owned release packages found.');
   }
 
+  let bootstrapLoggedIn = false;
+  if (options.bootstrap) {
+    const bootstrapped = await shell.bootstrapNpmPackages({
+      dryRun: options.dryRun === true,
+      skipLogin: options.skipLogin === true,
+      packages: [],
+    });
+    bootstrapLoggedIn = bootstrapped.length > 0 && !options.dryRun && !options.skipLogin;
+  }
+
   if (!options.dryRun) {
     const packageStates = await Promise.all(
-      packages.map(async (pkg) => ((await npmPackageExists(root, pkg.name)) ? null : pkg.name)),
+      packages.map(async (pkg) => ((await shell.packageExists(pkg.name)) ? null : pkg.name)),
     );
     const missingPackages = packageStates.filter((name): name is string => name !== null);
     if (missingPackages.length > 0) {
       throw new Error(
         'npm trusted publishing can only be configured after packages exist on the registry. ' +
-          'Bootstrap the first publish with a temporary NPM_TOKEN, then rerun trust-publisher. ' +
+          'Run smoo release trust-publisher --bootstrap locally. ' +
           `Missing packages: ${missingPackages.join(', ')}`,
       );
     }
   }
 
-  if (!options.dryRun && !options.skipLogin) {
-    await runLatestNpm(root, ['login', '--auth-type=web']);
+  if (!options.dryRun && !options.skipLogin && !bootstrapLoggedIn) {
+    await shell.login();
   }
 
   const failedPackages: string[] = [];
   for (const pkg of packages) {
-    console.log(`${pkg.name}: trusting GitHub Actions ${repository}/${workflow}`);
-    const args = ['trust', 'github', pkg.name, '--file', workflow, '--repo', repository, '--yes'];
-    if (options.dryRun) {
-      args.push('--dry-run');
-    }
+    shell.log(`${pkg.name}: trusting GitHub Actions ${shell.repository}/${shell.workflow}`);
     while (true) {
-      const otp = options.dryRun ? undefined : (options.otp ?? (await promptForNpmOtp(pkg.name)));
+      const otp = options.dryRun ? undefined : (options.otp ?? (await shell.promptOtp(pkg.name)));
       try {
-        await runLatestNpm(root, args, otp ? { NPM_CONFIG_OTP: otp } : undefined);
+        await shell.trustPublisher(pkg, options.dryRun === true, otp ? { NPM_CONFIG_OTP: otp } : undefined);
         break;
       } catch (error) {
-        console.error(`${pkg.name}: npm trusted publisher setup failed.`);
-        console.error(error instanceof Error ? error.message : String(error));
+        shell.error(`${pkg.name}: npm trusted publisher setup failed.`);
+        shell.error(error instanceof Error ? error.message : String(error));
         if (!options.dryRun) {
-          console.error('npm OTP codes are single-use. Generate a fresh OTP before retrying this package.');
+          shell.error('npm OTP codes are single-use. Generate a fresh OTP before retrying this package.');
         }
         if (options.otp || options.dryRun) {
           failedPackages.push(pkg.name);
           break;
         }
-        console.error('Retrying this package. Press Ctrl-C to stop.');
+        shell.error('Retrying this package. Press Ctrl-C to stop.');
       }
     }
   }
   if (failedPackages.length > 0) {
-    console.error(`Trusted publishing was not configured for: ${failedPackages.join(', ')}`);
+    shell.error(`Trusted publishing was not configured for: ${failedPackages.join(', ')}`);
     if (options.otp) {
-      console.error('Rerun smoo release trust-publisher without --otp to enter a fresh OTP for each failed package.');
+      shell.error('Rerun smoo release trust-publisher without --otp to enter a fresh OTP for each failed package.');
     }
   }
+}
+
+export async function releaseBootstrapNpmPackages(
+  root: string,
+  options: ReleaseBootstrapNpmPackagesOptions,
+): Promise<void> {
+  await bootstrapNpmPackages(
+    {
+      listReleasePackages: () => listReleasePackages(root),
+      packageExists: (name) => npmPackageExists(root, name),
+      login: () => runLatestNpm(root, ['login', '--auth-type=web']),
+      publishPlaceholder: (pkg) => publishPlaceholderPackage(root, pkg),
+      log: (message) => console.log(message),
+    },
+    {
+      dryRun: options.dryRun === true,
+      skipLogin: options.skipLogin === true,
+      packages: options.packages ?? [],
+    },
+  );
 }
 
 export async function releaseRetagUnpublished(root: string, options: ReleaseRetagUnpublishedOptions): Promise<void> {
@@ -243,21 +333,14 @@ async function listUnpublishedPackages(root: string, packages: ReleasePackage[])
   return states.filter((state) => !state.published).map((state) => state.pkg);
 }
 
-async function publishPackedPackage(
-  root: string,
-  pkg: ReleasePackage,
-  tag: string,
-  dryRun: boolean,
-  useBootstrapToken: boolean,
-): Promise<void> {
+async function publishPackedPackage(root: string, pkg: ReleasePackage, tag: string, dryRun: boolean): Promise<void> {
   const tempDir = await mkdtemp(join(tmpdir(), 'smoo-publish-'));
   const tarball = join(tempDir, `${safeTarballPrefix(pkg.name)}-${pkg.version}.tgz`);
   try {
     console.log(`${pkg.name}@${pkg.version}: packing with bun pm pack`);
     await run('bun', ['pm', 'pack', '--filename', tarball, '--ignore-scripts', '--quiet'], join(root, pkg.path));
     await assertPackedWorkspaceDependencies(root, tarball, pkg);
-    // npm CLI owns authentication here: trusted publishing OIDC when configured,
-    // or the temporary NODE_AUTH_TOKEN bootstrap path below before trust exists.
+    // npm CLI owns authentication here: trusted publishing OIDC when configured.
     // Bun still produces the tarball so workspace:* dependencies are resolved the
     // same way smoo validates packed packages before release.
     const args = ['publish', tarball, '--access', 'public', '--tag', tag, '--provenance'];
@@ -267,7 +350,7 @@ async function publishPackedPackage(
     await publishWithAuthDiagnostics(
       pkg,
       {
-        publish: () => runLatestNpmPublish(root, args, useBootstrapToken),
+        publish: () => runLatestNpmPublish(root, args),
         versionExists: () => npmVersionExists(root, pkg.name, pkg.version),
         log: (message) => console.log(message),
         error: (message) => console.error(message),
@@ -279,7 +362,6 @@ async function publishPackedPackage(
         },
       },
       {
-        useBootstrapToken,
         tokenPresent: npmAuthTokenPresent(),
         repository: githubRepositoryFromRootPackage(root),
       },
@@ -291,6 +373,34 @@ async function publishPackedPackage(
 
 function npmAuthTokenPresent(): boolean {
   return Boolean(process.env.NODE_AUTH_TOKEN || process.env.NPM_TOKEN || process.env.NPM_CONFIG_USERCONFIG);
+}
+
+async function publishPlaceholderPackage(root: string, pkg: ReleasePackage): Promise<void> {
+  const tempDir = await mkdtemp(join(tmpdir(), 'smoo-npm-bootstrap-'));
+  try {
+    await writeFile(
+      join(tempDir, 'package.json'),
+      `${JSON.stringify(
+        {
+          name: pkg.name,
+          version: NPM_BOOTSTRAP_VERSION,
+          description: `Bootstrap placeholder for ${pkg.name}. Real releases are published by SmoothBricks CI.`,
+          license: stringProperty(pkg.json, 'license') ?? 'UNLICENSED',
+          repository: pkg.json.repository,
+          publishConfig: { access: 'public' },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    await writeFile(
+      join(tempDir, 'README.md'),
+      `# ${pkg.name}\n\nThis is a bootstrap placeholder. Real package versions are published by SmoothBricks release automation.\n`,
+    );
+    await runLatestNpm(root, ['publish', tempDir, '--access', 'public', '--tag', NPM_BOOTSTRAP_DIST_TAG]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 }
 
 function safeTarballPrefix(name: string): string {
@@ -475,7 +585,10 @@ function releaseCompletionShell(root: string): ReleaseCompletionShell<ReleasePac
     buildReleaseCandidate: (packages) => buildReleaseCandidate(root, packages),
     publishPackage: async (pkg, distTag, dryRun) => {
       const packageExists = dryRun ? true : await npmPackageExists(root, pkg.name);
-      await publishPackedPackage(root, pkg, distTag, dryRun, !dryRun && !packageExists);
+      if (!packageExists) {
+        throw new Error(missingNpmPackagePublishGuidance(pkg));
+      }
+      await publishPackedPackage(root, pkg, distTag, dryRun);
     },
     listGithubMissingPackages: (packages) => listMissingGithubReleasePackages(root, packages),
     createGithubRelease: (pkg, dryRun) => createGithubRelease(root, pkg, dryRun),
@@ -887,30 +1000,12 @@ async function runLatestNpm(root: string, npmArgs: string[], env?: Record<string
   await run('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...npmArgs], root, env);
 }
 
-async function runLatestNpmPublish(root: string, npmArgs: string[], useBootstrapToken: boolean): Promise<void> {
-  if (!useBootstrapToken) {
-    await runLatestNpm(root, npmArgs, { NODE_AUTH_TOKEN: '', NPM_TOKEN: '' });
-    return;
-  }
-  const token = process.env.NODE_AUTH_TOKEN || process.env.NPM_TOKEN;
-  if (!token || process.env.NPM_CONFIG_USERCONFIG) {
-    if (!token && !process.env.NPM_CONFIG_USERCONFIG) {
-      throw new Error(
-        'First publish for a package requires NODE_AUTH_TOKEN or NPM_TOKEN until trusted publishing exists.',
-      );
-    }
-    await runLatestNpm(root, npmArgs);
-    return;
-  }
+async function runLatestNpmPublish(root: string, npmArgs: string[]): Promise<void> {
+  await runLatestNpm(root, npmArgs, { NODE_AUTH_TOKEN: '', NPM_TOKEN: '' });
+}
 
-  const tempDir = await mkdtemp(join(tmpdir(), 'smoo-npm-auth-'));
-  const npmrc = join(tempDir, '.npmrc');
-  try {
-    await writeFile(npmrc, `registry=https://registry.npmjs.org/\n//registry.npmjs.org/:_authToken=${token}\n`);
-    await runLatestNpm(root, npmArgs, { NPM_CONFIG_USERCONFIG: npmrc });
-  } finally {
-    await rm(tempDir, { recursive: true, force: true });
-  }
+function missingNpmPackagePublishGuidance(pkg: Pick<ReleasePackage, 'name'>): string {
+  return `${pkg.name} does not exist on npm yet. Run smoo release trust-publisher --bootstrap locally before rerunning the Publish workflow.`;
 }
 
 async function promptForNpmOtp(packageName: string): Promise<string> {

@@ -42,7 +42,8 @@ smoo release repair-pending [--dry-run]
 smoo release version --bump <auto|patch|minor|major|prerelease> [--dry-run] [--github-output <path>]
 smoo release publish --bump <auto|patch|minor|major|prerelease> [--dry-run]
 smoo release retag-unpublished <tag...> [--to <ref>] [--push] [--dispatch] [--remote <remote>] [--branch <branch>] [--dry-run]
-smoo release trust-publisher [--dry-run] [--otp <code>] [--skip-login]
+smoo release bootstrap-npm-packages [--dry-run] [--skip-login] [--package <name...>]
+smoo release trust-publisher [--bootstrap] [--dry-run] [--otp <code>] [--skip-login]
 
 smoo github-ci cleanup-cache
 smoo github-ci nx-smart --target <target> --name <check-name> --step <number>
@@ -62,6 +63,8 @@ It currently:
 - Synchronizes root runtime versions inside devenv, or when `--sync-runtime` is passed.
 - Applies safe publish metadata defaults to `npm:public` packages without inferring package ownership.
 - Normalizes internal workspace dependency ranges to `workspace:*`.
+- Rewrites safe package scripts in packages with workspace dependencies so developer commands like `bun run test` and
+  `bun run dev` stay available while delegating through Nx targets.
 - `smoo monorepo validate --fix` creates/updates `tooling/package.json`, keeps `@smoothbricks/cli` there instead of the
   root workspace package, and fills required workspace/devenv tool declarations.
 - Runs [`sherif --fix --select highest`][sherif] for broad monorepo package hygiene.
@@ -71,6 +74,19 @@ It currently:
 The workspace dependency rule is generic. `smoo` does not know about individual package names such as `eslint-stdout`.
 For every root or workspace `package.json`, if a dependency name matches an actual package in the same workspace, `smoo`
 rewrites that range to `workspace:*`.
+
+Packages with internal workspace dependencies also need Nx-aware scripts so dependent builds run before local commands.
+For safe build, test, typecheck, benchmark, dev, and preview commands, `smoo monorepo validate --fix` moves the real
+command into `package.json` `nx.targets.<target>.options.command`, sets `cwd` to `{projectRoot}`, and replaces the
+script with an `nx run <project>:<target>` alias. Continuous commands such as `astro dev`, `vite dev`, and previews get
+`--tui=false --outputStyle=stream` on the alias and `continuous: true` on the Nx target. Simple leading environment
+assignments are moved into `nx.targets.<target>.options.env` so commands such as
+`NODE_OPTIONS='--import=extensionless/register' astro dev` remain shell-independent.
+
+The rewrite is intentionally conservative. `smoo` does not rewrite deploy, database, release, sync, subtree, publish, or
+pack scripts, and it rejects Nx target commands that recurse through package scripts such as `bun run test`. The reason
+is dependency correctness without hiding unsafe operational commands behind generated Nx targets: workspace-dependent
+packages should get `^build` ordering for ordinary development commands, while publishing and deployment stay explicit.
 
 `smoo monorepo init --runtime-only` only synchronizes root runtime versions. It is used from direnv setup so
 `packageManager`, `engines.node`, and `@types/node` stay aligned with the active devenv shell without duplicating that
@@ -98,6 +114,7 @@ It checks:
 - Public package tag policy.
 - Public package metadata.
 - Workspace dependency ranges.
+- Workspace-dependent package scripts delegate safe commands through Nx targets without recursive script runners.
 - [`sherif`] package hygiene, with warnings treated as validation failures.
 - Packed public package artifacts with [`publint`].
 - Packed public package type resolution with the [`attw`][are-the-types-wrong] CLI.
@@ -344,18 +361,22 @@ Publishing:
   stable versions). Bun pack resolves internal `workspace:*` dependency ranges to real versions in the tarball manifest;
   smoo fails before publish if a packed manifest still contains `workspace:` or if an internal dependency does not match
   the current workspace package version.
-- [npm CLI][npm] owns publish authentication. Existing packages use [trusted publishing][npm-trusted-publishing] with
-  [GitHub Actions OIDC][github-actions-oidc] from the workflow's `id-token: write` permission. Package names that do not
-  exist on npm yet use `secrets.NPM_TOKEN` as `NODE_AUTH_TOKEN` for the first publish, because trusted publishing can
-  only be configured after the package exists. Once `smoo release trust-publisher` succeeds for a package, future
-  publishes for that package use OIDC even if the bootstrap token is still present in repository secrets.
+- [npm CLI][npm] owns publish authentication. Packages use [trusted publishing][npm-trusted-publishing] with [GitHub
+  Actions OIDC][github-actions-oidc] from the workflow's `id-token: write` permission. Package names must exist on npm
+  before CI publish runs; use `smoo release trust-publisher --bootstrap` locally to publish `0.0.0-bootstrap.0` under
+  the `bootstrap` dist-tag for new package names before configuring trust.
+- `smoo release bootstrap-npm-packages` scans owned `npm:public` release packages missing from npm, runs
+  `npm login --auth-type=web` through `nix shell nixpkgs#nodejs_latest` unless `--skip-login` is passed, and publishes a
+  minimal placeholder package with `--access public --tag bootstrap`. It supports `--dry-run` and `--package <name...>`
+  for targeted bootstraps.
 - `smoo release trust-publisher` configures [npm trusted publishing][npm-trusted-publishing] for every owned release
   package. It uses the root `package.json` `repository.url` as the GitHub `owner/repo`, uses `publish.yml` as the
   trusted workflow, and runs `npm trust` through `nix shell nixpkgs#nodejs_latest` because the Lambda-pinned Node 24/npm
   toolchain may lag the npm CLI feature. By default it runs `npm login --auth-type=web` first so npm can open a browser
-  login; pass `--skip-login` when the current npm session is already authenticated. Packages must already exist on npm
-  before trust can be configured. npm may still require operation-level 2FA for `npm trust`; smoo prompts for a hidden
-  OTP per package, or you can pass `--otp <code>` for non-interactive use.
+  login; pass `--skip-login` when the current npm session is already authenticated. Pass `--bootstrap` to create missing
+  npm package names first, then configure trusted publishing in the same command. npm may still require operation-level
+  2FA for `npm trust`; smoo prompts for a hidden OTP per package, or you can pass `--otp <code>` for non-interactive
+  use.
 
 GitHub Releases:
 

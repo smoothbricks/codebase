@@ -20,6 +20,14 @@ describe('publish workflow definition', () => {
     );
   });
 
+  it('does not wire npm token secrets into repair or publish steps', () => {
+    const rendered = renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase' });
+
+    expect(rendered).not.toContain('NODE_AUTH_TOKEN');
+    expect(rendered).not.toContain('secrets.NPM_TOKEN');
+    expect(rendered).toContain('packages must already exist on npm and use trusted publishing/OIDC');
+  });
+
   it('bootstraps the self-hosted CLI before release commands only for the SmoothBricks repo', async () => {
     const smoothbricks = await publishWorkflowScenario({
       repoName: '@smoothbricks/codebase',
@@ -164,7 +172,6 @@ function publishWorkflowScenario(config: WorkflowScenarioConfig): { run(): Promi
       const state = new WorkflowScenarioState(config);
       await runPublishWorkflow(definePublishWorkflow({ repoName: config.repoName }), {
         inputs: { bump: config.bump, dryRun: config.dryRun },
-        nodeAuthToken: true,
         callbacks: state.callbacks(),
       });
       return state.outcome();

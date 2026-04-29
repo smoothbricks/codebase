@@ -17,7 +17,12 @@ export interface RepositoryInfo {
   url: string;
 }
 
-export const workspaceDependencyFields = ['dependencies', 'devDependencies', 'optionalDependencies'] as const;
+export const workspaceDependencyFields = [
+  'dependencies',
+  'devDependencies',
+  'peerDependencies',
+  'optionalDependencies',
+] as const;
 
 export function listPublicPackages(root: string): PackageInfo[] {
   return getWorkspacePackages(root).filter((pkg) => !pkg.private && pkg.tags.includes('npm:public'));

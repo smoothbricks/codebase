@@ -1,7 +1,6 @@
 import type { ReleasePackageInfo } from './core.js';
 
 export interface NpmPublishAuthFailureOptions {
-  useBootstrapToken: boolean;
   tokenPresent: boolean;
   repository?: string;
 }
@@ -30,7 +29,7 @@ export async function publishWithAuthDiagnostics(
     shell.error(npmPublishAuthFailureMessage(pkg, options));
     await shell.appendSummary(npmPublishAuthFailureMarkdown(pkg, options));
     throw new Error(
-      `${packageVersion}: npm publish authentication failed. Run smoo release trust-publisher after the package exists on npm; see the warning banner above for details.`,
+      `${packageVersion}: npm publish authentication failed. Run smoo release trust-publisher; see the warning banner above for details.`,
       { cause: error },
     );
   }
@@ -42,26 +41,11 @@ export function npmPublishAuthFailureMessage(
 ): string {
   const packageVersion = `${pkg.name}@${pkg.version}`;
   const lines = [
-    `::error title=npm publish authentication failed::${packageVersion} could not be published. This usually means npm trusted publishing is not configured for this package/workflow/repo, or the bootstrap NPM_TOKEN is missing/invalid.`,
+    `::error title=npm publish authentication failed::${packageVersion} could not be published. This usually means npm trusted publishing is not configured for this package/workflow/repo.`,
     '',
     `🚨 npm publish authentication failed for ${packageVersion}`,
     '',
   ];
-  if (options.useBootstrapToken) {
-    lines.push(
-      'smoo expected a temporary npm automation token because this package does not exist on npm yet.',
-      options.tokenPresent
-        ? 'NODE_AUTH_TOKEN/NPM_TOKEN is set, but npm still rejected the bootstrap publish. Check that the token is valid, has publish rights for this scope, and is available to this workflow.'
-        : 'NODE_AUTH_TOKEN/NPM_TOKEN is not set. Add a temporary NPM_TOKEN repository secret and rerun the Publish workflow.',
-      '',
-      'After the first successful publish, run:',
-      '  smoo release trust-publisher',
-      '',
-      'Then remove the temporary bootstrap token path for future releases.',
-    );
-    return lines.join('\n');
-  }
-
   lines.push(
     'smoo expected npm trusted publishing/OIDC because this package already exists on npm.',
     options.tokenPresent
@@ -75,7 +59,7 @@ export function npmPublishAuthFailureMessage(
     '   workflow: publish.yml',
     '3. Rerun the Publish workflow.',
     '',
-    'For first-ever package publishes, add a temporary NPM_TOKEN repository secret, publish once, then run smoo release trust-publisher.',
+    'For first-ever package publishes, run locally: smoo release trust-publisher --bootstrap.',
   );
   return lines.join('\n');
 }
@@ -86,19 +70,6 @@ export function npmPublishAuthFailureMarkdown(
 ): string {
   const packageVersion = `${pkg.name}@${pkg.version}`;
   const lines = ['## 🚨 npm Publish Authentication Failed', '', `Package: \`${packageVersion}\``, ''];
-  if (options.useBootstrapToken) {
-    lines.push(
-      'smoo expected a temporary npm automation token because this package does not exist on npm yet.',
-      '',
-      options.tokenPresent
-        ? '`NODE_AUTH_TOKEN`/`NPM_TOKEN` is set, but npm still rejected the bootstrap publish. Check that the token is valid, has publish rights for this scope, and is available to this workflow.'
-        : '`NODE_AUTH_TOKEN`/`NPM_TOKEN` is not set. Add a temporary `NPM_TOKEN` repository secret and rerun the Publish workflow.',
-      '',
-      'After the first successful publish, run `smoo release trust-publisher`, then remove the temporary bootstrap token path for future releases.',
-    );
-    return lines.join('\n');
-  }
-
   lines.push(
     'smoo expected npm trusted publishing/OIDC because this package already exists on npm.',
     '',
@@ -112,7 +83,7 @@ export function npmPublishAuthFailureMarkdown(
     `2. Ensure the npm trusted publisher uses repository \`${trustedPublisherRepository(options)}\` and workflow \`publish.yml\``,
     '3. Rerun the Publish workflow.',
     '',
-    'For first-ever package publishes, add a temporary `NPM_TOKEN` repository secret, publish once, then run `smoo release trust-publisher`.',
+    'For first-ever package publishes, run `smoo release trust-publisher --bootstrap` locally.',
   );
   return lines.join('\n');
 }
