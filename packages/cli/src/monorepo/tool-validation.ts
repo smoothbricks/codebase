@@ -1,6 +1,8 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { getOrCreateRecord, readJsonObject, recordProperty, setStringProperty, writeJsonObject } from '../lib/json.js';
+import { getWorkspacePackages } from '../lib/workspace.js';
 
 interface RequiredDependency {
   name: string;
@@ -19,7 +21,7 @@ const rootDevDependencies: RequiredDependency[] = [
   { name: 'typescript', fallbackVersion: '^5.9.3', minimumVersion: '5.9.0', prefix: '^' },
 ];
 
-const toolingDependencies = new Map([['@smoothbricks/cli', 'workspace:*']]);
+const cliPackageName = '@smoothbricks/cli';
 
 const requiredDevenvPackages = ['bun', 'git', 'git-format-staged', 'jq', 'alejandra', 'coreutils', 'gnutar'];
 const allowedNodePackages = ['nodejs_24', 'nodejs_latest'];
@@ -68,18 +70,17 @@ export async function applyRootDevDependencyDefaults(root: string): Promise<void
 
 export function applyToolingPackageDefaults(root: string): void {
   const path = join(root, 'tooling', 'package.json');
-  const pkg = readJsonObject(path) ?? { name: 'tooling', private: true, dependencies: {} };
+  const pkg = readJsonObject(path) ?? { name: toolingPackageName(root), private: true, dependencies: {} };
   let changed = false;
-  changed = setStringProperty(pkg, 'name', 'tooling') || changed;
+  changed = setStringProperty(pkg, 'name', toolingPackageName(root)) || changed;
   if (pkg.private !== true) {
     pkg.private = true;
     changed = true;
   }
   const dependencies = getOrCreateRecord(pkg, 'dependencies');
-  for (const [name, version] of toolingDependencies) {
-    changed = setStringProperty(dependencies, name, version) || changed;
-  }
+  changed = setStringProperty(dependencies, cliPackageName, cliDependencyRange(root)) || changed;
   if (changed || !existsSync(path)) {
+    mkdirSync(dirname(path), { recursive: true });
     writeJsonObject(path, pkg);
     console.log('updated        tooling/package.json tooling dependencies');
   } else {
@@ -149,8 +150,8 @@ export function validateRootDevDependencies(root: string): number {
       failures++;
     }
   }
-  if (typeof devDependencies?.['@smoothbricks/cli'] === 'string') {
-    console.error('package.json devDependencies.@smoothbricks/cli must move to tooling/package.json dependencies');
+  if (typeof devDependencies?.[cliPackageName] === 'string') {
+    console.error(`package.json devDependencies.${cliPackageName} must move to tooling/package.json dependencies`);
     failures++;
   }
   return failures;
@@ -165,11 +166,17 @@ export function validateToolingPackage(root: string): number {
   }
   const dependencies = recordProperty(pkg, 'dependencies');
   let failures = 0;
-  for (const name of toolingDependencies.keys()) {
-    if (typeof dependencies?.[name] !== 'string') {
-      console.error(`tooling/package.json dependencies.${name} must be defined`);
-      failures++;
-    }
+  const expectedName = toolingPackageName(root);
+  const actualName = typeof pkg.name === 'string' ? pkg.name : null;
+  if (actualName !== expectedName) {
+    console.error(`tooling/package.json name must be ${expectedName}`);
+    failures++;
+  }
+  const expectedCliRange = cliDependencyRange(root);
+  const actualCliRange = dependencies?.[cliPackageName];
+  if (actualCliRange !== expectedCliRange) {
+    console.error(`tooling/package.json dependencies.${cliPackageName} must be ${expectedCliRange}`);
+    failures++;
   }
   return failures;
 }
@@ -256,6 +263,34 @@ function satisfiesDependencyPolicy(version: string, dependency: RequiredDependen
 
 function formatMinimum(dependency: RequiredDependency): string {
   return dependency.minimumVersion ?? dependency.fallbackVersion;
+}
+
+function toolingPackageName(root: string): string {
+  const rootPackage = readJsonObject(join(root, 'package.json'));
+  const name = typeof rootPackage?.name === 'string' ? rootPackage.name : null;
+  const scope = name?.match(/^(@[^/]+)\//)?.[1];
+  return scope ? `${scope}/tooling` : 'tooling';
+}
+
+function cliDependencyRange(root: string): string {
+  return workspaceHasCliPackage(root) ? 'workspace:*' : `^${currentCliVersion()}`;
+}
+
+function workspaceHasCliPackage(root: string): boolean {
+  try {
+    return getWorkspacePackages(root).some((pkg) => pkg.name === cliPackageName);
+  } catch {
+    return false;
+  }
+}
+
+function currentCliVersion(): string {
+  const pkg = readJsonObject(fileURLToPath(new URL('../../package.json', import.meta.url)));
+  const version = typeof pkg?.version === 'string' ? pkg.version : null;
+  if (!version) {
+    throw new Error('Unable to read @smoothbricks/cli package version.');
+  }
+  return version;
 }
 
 async function resolveDependencyVersion(dependency: RequiredDependency): Promise<string> {
