@@ -15,7 +15,7 @@ runs:
     # This action is intentionally post-checkout only. Repo-local actions do not
     # exist before actions/checkout has populated the working tree.
     - name: ❄️ Install Nix
-      uses: DeterminateSystems/nix-installer-action@v22
+      uses: DeterminateSystems/determinate-nix-action@v3
       with:
         extra-conf: |
           keep-outputs = true
