@@ -206,24 +206,24 @@ function buildProgram(): Command {
     .description('Configure npm trusted publishing for owned release packages')
     .option('--dry-run [dryRun]', 'show npm trust changes without saving them')
     .option('--bootstrap', 'publish missing npm placeholder packages before configuring trust')
-    .option('--otp <otp>', 'npm one-time password for trust operations')
     .option('--bootstrap-otp <otp>', 'npm one-time password for placeholder publishes during --bootstrap')
-    .option('--skip-login', 'skip npm browser login before configuring trust')
+    .option('--skip-login', 'skip npm browser login before publishing placeholders during --bootstrap')
+    .option('--package <name...>', 'only configure the selected owned release package names')
     .action(
       async (options: {
         dryRun?: string | boolean;
         bootstrap?: boolean;
-        otp?: string;
         bootstrapOtp?: string;
         skipLogin?: boolean;
+        package?: string[];
       }) => {
         const { releaseTrustPublisher } = await import('./release/index.js');
         await releaseTrustPublisher(await findRepoRoot(), {
           dryRun: booleanOption(options.dryRun),
           bootstrap: options.bootstrap === true,
-          otp: options.otp,
           bootstrapOtp: options.bootstrapOtp,
           skipLogin: options.skipLogin === true,
+          packages: options.package ?? [],
         });
       },
     );

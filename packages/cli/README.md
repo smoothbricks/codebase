@@ -44,7 +44,7 @@ smoo release version --bump <auto|patch|minor|major|prerelease> [--dry-run] [--g
 smoo release publish --bump <auto|patch|minor|major|prerelease> [--dry-run]
 smoo release retag-unpublished <tag...> [--to <ref>] [--push] [--dispatch] [--remote <remote>] [--branch <branch>] [--dry-run]
 smoo release bootstrap-npm-packages [--dry-run] [--skip-login] [--package <name...>]
-smoo release trust-publisher [--bootstrap] [--dry-run] [--otp <code>] [--skip-login]
+smoo release trust-publisher [--bootstrap] [--dry-run] [--skip-login] [--package <name...>]
 
 smoo github-ci cleanup-cache
 smoo github-ci nx-smart --target <target> --name <check-name> --step <number>
@@ -463,11 +463,11 @@ Publishing:
 - `smoo release trust-publisher` configures [npm trusted publishing][npm-trusted-publishing] for every owned release
   package. It uses the root `package.json` `repository.url` as the GitHub `owner/repo`, uses `publish.yml` as the
   trusted workflow, and runs `npm trust` through `nix shell nixpkgs#nodejs_latest` because the Lambda-pinned Node 24/npm
-  toolchain may lag the npm CLI feature. By default it runs `npm login --auth-type=web` first so npm can open a browser
-  login; pass `--skip-login` when the current npm session is already authenticated. Pass `--bootstrap` to create missing
-  npm package names first, then configure trusted publishing in the same command. npm may still require operation-level
-  2FA for `npm trust`; smoo prompts for a hidden OTP per package, or you can pass `--otp <code>` for non-interactive
-  use.
+  toolchain may lag the npm CLI feature. It does not run a separate `npm login` before trust setup; `npm trust list` and
+  `npm trust github` own authentication so npm can offer the 5-minute trust/publish challenge bypass. Pass
+  `--package <name...>` to target specific owned packages. Pass `--bootstrap` to create missing npm package names first,
+  then configure trusted publishing in the same command. With `--bootstrap`, `--skip-login` only skips the placeholder
+  publish login. Existing matching trusted publishers are skipped via `npm trust list <package> --json`.
 
 GitHub Releases:
 

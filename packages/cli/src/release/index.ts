@@ -6,7 +6,7 @@ import { Writable } from 'node:stream';
 import { $ } from 'bun';
 import { withDevenvEnv } from '../lib/devenv.js';
 import { isRecord, readJsonObject, stringProperty } from '../lib/json.js';
-import { decode, run, runResult, runStatus } from '../lib/run.js';
+import { decode, run, runInteractiveStatus, runResult, runStatus } from '../lib/run.js';
 import { listReleasePackages, readPackageJson, repositoryInfo } from '../lib/workspace.js';
 import { readPackedPackageJson, validatePackedWorkspaceDependencies } from '../monorepo/packed-manifest.js';
 import {
@@ -55,9 +55,9 @@ export interface ReleaseRepairPendingOptions {
 export interface ReleaseTrustPublisherOptions {
   dryRun?: boolean;
   bootstrap?: boolean;
-  otp?: string;
   bootstrapOtp?: string;
   skipLogin?: boolean;
+  packages?: string[];
 }
 
 export interface ReleaseBootstrapNpmPackagesOptions {
@@ -170,7 +170,6 @@ export async function releaseTrustPublisher(root: string, options: ReleaseTrustP
           },
           bootstrapOptions,
         ),
-      login: () => runLatestNpm(root, ['login', '--auth-type=web']),
       trustPublisher: (pkg, dryRun, env) => {
         const args = ['trust', 'github', pkg.name, '--file', workflow, '--repo', repository, '--yes'];
         if (dryRun) {
@@ -178,7 +177,7 @@ export async function releaseTrustPublisher(root: string, options: ReleaseTrustP
         }
         return runLatestNpmTrust(root, args, env);
       },
-      promptOtp: (packageName) => promptForNpmOtp(packageName),
+      trustedPublishers: (pkg) => listTrustedPublishers(root, pkg),
       log: (message) => console.log(message),
       error: (message) => console.error(message),
     },
@@ -192,38 +191,43 @@ export interface TrustPublisherShell<Package extends ReleasePackageInfo = Releas
   listReleasePackages(): Package[];
   packageExists(name: string): Promise<boolean>;
   bootstrapNpmPackages(options: BootstrapNpmPackagesOptions): Promise<Package[]>;
-  login(): Promise<void>;
   trustPublisher(pkg: Package, dryRun: boolean, env?: Record<string, string>): Promise<TrustPublisherResult>;
-  promptOtp(packageName: string): Promise<string>;
+  trustedPublishers(pkg: Package): Promise<TrustedPublisher[]>;
   log(message: string): void;
   error(message: string): void;
 }
 
 export type TrustPublisherResult = 'configured' | 'already-configured';
 
+export interface TrustedPublisher {
+  id: string;
+  type: string;
+  file?: string;
+  repository?: string;
+}
+
 export async function configureTrustedPublishers<Package extends ReleasePackageInfo>(
   shell: TrustPublisherShell<Package>,
   options: ReleaseTrustPublisherOptions,
 ): Promise<void> {
   const packages = shell.listReleasePackages();
-  if (packages.length === 0) {
+  const selectedPackages = selectedTrustPublisherPackages(packages, options.packages ?? []);
+  if (selectedPackages.length === 0) {
     throw new Error('No owned release packages found.');
   }
 
-  let bootstrapLoggedIn = false;
   if (options.bootstrap) {
-    const bootstrapped = await shell.bootstrapNpmPackages({
+    await shell.bootstrapNpmPackages({
       dryRun: options.dryRun === true,
       skipLogin: options.skipLogin === true,
       otp: options.bootstrapOtp,
-      packages: [],
+      packages: options.packages ?? [],
     });
-    bootstrapLoggedIn = bootstrapped.length > 0 && !options.dryRun && !options.skipLogin;
   }
 
   if (!options.dryRun) {
     const packageStates = await Promise.all(
-      packages.map(async (pkg) => ((await shell.packageExists(pkg.name)) ? null : pkg.name)),
+      selectedPackages.map(async (pkg) => ((await shell.packageExists(pkg.name)) ? null : pkg.name)),
     );
     const missingPackages = packageStates.filter((name): name is string => name !== null);
     if (missingPackages.length > 0) {
@@ -235,21 +239,26 @@ export async function configureTrustedPublishers<Package extends ReleasePackageI
     }
   }
 
-  if (!options.dryRun && !options.skipLogin && !bootstrapLoggedIn) {
-    await shell.login();
-  }
-
   const failedPackages: string[] = [];
-  for (const pkg of packages) {
+  for (const pkg of selectedPackages) {
+    if (!options.dryRun) {
+      const trustedPublishers = await shell.trustedPublishers(pkg);
+      if (hasMatchingGithubTrustedPublisher(trustedPublishers, shell.repository, shell.workflow)) {
+        shell.log(`${pkg.name}: npm trusted publisher is already configured; skipping.`);
+        continue;
+      }
+      if (trustedPublishers.length > 0) {
+        throw new Error(
+          `${pkg.name}: npm trusted publisher exists but does not match GitHub Actions ${shell.repository}/${shell.workflow}. ` +
+            'Use npm trust list to inspect it and npm trust revoke --id <trust-id> before reconfiguring.',
+        );
+      }
+    }
+
     shell.log(`${pkg.name}: trusting GitHub Actions ${shell.repository}/${shell.workflow}`);
     while (true) {
-      const otp = options.dryRun ? undefined : (options.otp ?? (await shell.promptOtp(pkg.name)));
       try {
-        const result = await shell.trustPublisher(
-          pkg,
-          options.dryRun === true,
-          otp ? { NPM_CONFIG_OTP: otp } : undefined,
-        );
+        const result = await shell.trustPublisher(pkg, options.dryRun === true);
         if (result === 'already-configured') {
           shell.log(`${pkg.name}: npm trusted publisher is already configured; skipping.`);
         }
@@ -258,9 +267,9 @@ export async function configureTrustedPublishers<Package extends ReleasePackageI
         shell.error(`${pkg.name}: npm trusted publisher setup failed.`);
         shell.error(error instanceof Error ? error.message : String(error));
         if (!options.dryRun) {
-          shell.error('npm OTP codes are single-use. Generate a fresh OTP before retrying this package.');
+          shell.error('npm owns trusted publishing authentication. Complete the npm browser challenge, then retry.');
         }
-        if (options.otp || options.dryRun) {
+        if (options.dryRun) {
           failedPackages.push(pkg.name);
           break;
         }
@@ -270,10 +279,44 @@ export async function configureTrustedPublishers<Package extends ReleasePackageI
   }
   if (failedPackages.length > 0) {
     shell.error(`Trusted publishing was not configured for: ${failedPackages.join(', ')}`);
-    if (options.otp) {
-      shell.error('Rerun smoo release trust-publisher without --otp to enter a fresh OTP for each failed package.');
+  }
+}
+
+function selectedTrustPublisherPackages<Package extends ReleasePackageInfo>(
+  packages: Package[],
+  selections: string[],
+): Package[] {
+  if (selections.length === 0) {
+    return packages;
+  }
+  const byName = new Map(packages.map((pkg) => [pkg.name, pkg]));
+  const selected: Package[] = [];
+  const unknown: string[] = [];
+  for (const name of selections) {
+    const pkg = byName.get(name);
+    if (pkg) {
+      selected.push(pkg);
+    } else {
+      unknown.push(name);
     }
   }
+  if (unknown.length > 0) {
+    throw new Error(`Unknown owned release package selection: ${unknown.join(', ')}`);
+  }
+  return selected;
+}
+
+function hasMatchingGithubTrustedPublisher(
+  trustedPublishers: TrustedPublisher[],
+  repository: string,
+  workflow: string,
+): boolean {
+  return trustedPublishers.some(
+    (trustedPublisher) =>
+      trustedPublisher.type === 'github' &&
+      trustedPublisher.repository === repository &&
+      trustedPublisher.file === workflow,
+  );
 }
 
 export async function releaseBootstrapNpmPackages(
@@ -1182,17 +1225,68 @@ async function runLatestNpmTrust(
   npmArgs: string[],
   env?: Record<string, string>,
 ): Promise<TrustPublisherResult> {
-  const result = await runResult('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...npmArgs], root, env);
-  if (result.exitCode === 0) {
+  const status = await runInteractiveStatus(
+    'nix',
+    ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...npmArgs],
+    root,
+    env,
+  );
+  if (status === 0) {
     return 'configured';
   }
-  const output = `${result.stdout}\n${result.stderr}`;
-  if (/\bE409\b|\b409 Conflict\b/.test(output)) {
-    return 'already-configured';
+  throw new Error(`nix shell nixpkgs#nodejs_latest -c npm ${npmArgs.join(' ')} failed with exit code ${status}`);
+}
+
+async function listTrustedPublishers(root: string, pkg: Pick<ReleasePackage, 'name'>): Promise<TrustedPublisher[]> {
+  const args = ['trust', 'list', pkg.name, '--json'];
+  let result = await runResult('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...args], root);
+  if (result.exitCode !== 0 && /\bEOTP\b/.test(`${result.stdout}\n${result.stderr}`)) {
+    const status = await runInteractiveStatus('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...args], root);
+    if (status !== 0) {
+      throw new Error(`nix shell nixpkgs#nodejs_latest -c npm ${args.join(' ')} failed with exit code ${status}`);
+    }
+    result = await runResult('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...args], root);
   }
-  throw new Error(
-    `nix shell nixpkgs#nodejs_latest -c npm ${npmArgs.join(' ')} failed with exit code ${result.exitCode}`,
-  );
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `nix shell nixpkgs#nodejs_latest -c npm ${args.join(' ')} failed with exit code ${result.exitCode}`,
+    );
+  }
+  return parseTrustedPublishers(result.stdout, pkg.name);
+}
+
+export function parseTrustedPublishers(stdout: string, packageName: string): TrustedPublisher[] {
+  if (stdout.trim().length === 0) {
+    return [];
+  }
+  const parsed = JSON.parse(stdout) as unknown;
+  if (parsed === null) {
+    return [];
+  }
+  if (Array.isArray(parsed)) {
+    return parsed.map((value) => parseTrustedPublisher(value, packageName));
+  }
+  if (isRecord(parsed)) {
+    return [parseTrustedPublisher(parsed, packageName)];
+  }
+  throw new Error(`${packageName}: npm trust list returned invalid JSON.`);
+}
+
+function parseTrustedPublisher(value: unknown, packageName: string): TrustedPublisher {
+  if (!isRecord(value)) {
+    throw new Error(`${packageName}: npm trust list returned invalid trusted publisher entry.`);
+  }
+  const id = stringProperty(value, 'id');
+  const type = stringProperty(value, 'type');
+  if (!id || !type) {
+    throw new Error(`${packageName}: npm trust list returned a trusted publisher without id or type.`);
+  }
+  return {
+    id,
+    type,
+    file: stringProperty(value, 'file') ?? undefined,
+    repository: stringProperty(value, 'repository') ?? undefined,
+  };
 }
 
 async function runLatestNpmPublish(root: string, npmArgs: string[]): Promise<void> {
@@ -1206,7 +1300,7 @@ function missingNpmPackagePublishGuidance(pkg: Pick<ReleasePackage, 'name'>): st
 async function promptForNpmOtp(packageName: string): Promise<string> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error(
-      `npm trust requires a one-time password for ${packageName}. Pass --otp <code> in non-interactive shells.`,
+      `npm requires a one-time password for ${packageName}. Pass --otp <code> in non-interactive shells.`,
     );
   }
 
