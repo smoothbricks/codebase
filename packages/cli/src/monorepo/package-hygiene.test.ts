@@ -7,7 +7,7 @@ describe('package hygiene', () => {
 
     await fixPackageHygiene('/repo', shell);
 
-    expect(shell.runs).toEqual([{ command: 'sherif', args: ['-f', '--select', 'highest'], cwd: '/repo' }]);
+    expect(shell.statuses).toEqual([{ command: 'sherif', args: ['-f', '--select', 'highest'], cwd: '/repo' }]);
   });
 
   it('validates sherif warnings as failures', async () => {

@@ -166,12 +166,14 @@ function buildProgram(): Command {
     .description('Publish minimal npm placeholder packages so trusted publishing can be configured')
     .option('--dry-run [dryRun]', 'show placeholder publishes without logging in or publishing')
     .option('--skip-login', 'skip npm browser login before publishing placeholders')
+    .option('--otp <otp>', 'npm one-time password for placeholder publish operations')
     .option('--package <name...>', 'only bootstrap the selected owned release package names')
-    .action(async (options: { dryRun?: string | boolean; skipLogin?: boolean; package?: string[] }) => {
+    .action(async (options: { dryRun?: string | boolean; skipLogin?: boolean; otp?: string; package?: string[] }) => {
       const { releaseBootstrapNpmPackages } = await import('./release/index.js');
       await releaseBootstrapNpmPackages(await findRepoRoot(), {
         dryRun: booleanOption(options.dryRun),
         skipLogin: options.skipLogin === true,
+        otp: options.otp,
         packages: options.package ?? [],
       });
     });
@@ -181,16 +183,26 @@ function buildProgram(): Command {
     .option('--dry-run [dryRun]', 'show npm trust changes without saving them')
     .option('--bootstrap', 'publish missing npm placeholder packages before configuring trust')
     .option('--otp <otp>', 'npm one-time password for trust operations')
+    .option('--bootstrap-otp <otp>', 'npm one-time password for placeholder publishes during --bootstrap')
     .option('--skip-login', 'skip npm browser login before configuring trust')
-    .action(async (options: { dryRun?: string | boolean; bootstrap?: boolean; otp?: string; skipLogin?: boolean }) => {
-      const { releaseTrustPublisher } = await import('./release/index.js');
-      await releaseTrustPublisher(await findRepoRoot(), {
-        dryRun: booleanOption(options.dryRun),
-        bootstrap: options.bootstrap === true,
-        otp: options.otp,
-        skipLogin: options.skipLogin === true,
-      });
-    });
+    .action(
+      async (options: {
+        dryRun?: string | boolean;
+        bootstrap?: boolean;
+        otp?: string;
+        bootstrapOtp?: string;
+        skipLogin?: boolean;
+      }) => {
+        const { releaseTrustPublisher } = await import('./release/index.js');
+        await releaseTrustPublisher(await findRepoRoot(), {
+          dryRun: booleanOption(options.dryRun),
+          bootstrap: options.bootstrap === true,
+          otp: options.otp,
+          bootstrapOtp: options.bootstrapOtp,
+          skipLogin: options.skipLogin === true,
+        });
+      },
+    );
 
   const devenv = program.command('devenv').description('Manage the repository devenv shell');
   devenv.command('update').action(async () => {

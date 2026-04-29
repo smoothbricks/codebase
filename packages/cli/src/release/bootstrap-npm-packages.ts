@@ -7,13 +7,15 @@ export interface BootstrapNpmPackagesOptions {
   dryRun: boolean;
   skipLogin: boolean;
   packages: string[];
+  otp?: string;
 }
 
 export interface BootstrapNpmPackagesShell<Package extends ReleasePackageInfo = ReleasePackageInfo> {
   listReleasePackages(): Package[];
   packageExists(name: string): Promise<boolean>;
   login(): Promise<void>;
-  publishPlaceholder(pkg: Package): Promise<void>;
+  publishPlaceholder(pkg: Package, env?: Record<string, string>): Promise<void>;
+  promptOtp(packageName: string): Promise<string>;
   log(message: string): void;
 }
 
@@ -54,7 +56,8 @@ export async function bootstrapNpmPackages<Package extends ReleasePackageInfo>(
   }
   for (const pkg of missing) {
     shell.log(`${pkg.name}: publishing npm placeholder.`);
-    await shell.publishPlaceholder(pkg);
+    const otp = options.otp ?? (await shell.promptOtp(pkg.name));
+    await shell.publishPlaceholder(pkg, { NPM_CONFIG_OTP: otp });
   }
   shell.log('Bootstrap complete. Run smoo release trust-publisher before the first CI publish.');
   return missing;

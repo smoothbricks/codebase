@@ -1,7 +1,7 @@
 {
   "generators": {
     "bun-test-tracing": {
-      "factory": "./src/generators/bun-test-tracing/generator",
+      "factory": "./dist/generators/bun-test-tracing/generator.js",
       "schema": "./src/generators/bun-test-tracing/schema.json",
       "description": "Configure a package for the workspace Bun test tracing pattern"
     }
