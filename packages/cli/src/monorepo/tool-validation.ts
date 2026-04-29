@@ -1,6 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { gte, maxSatisfying, minVersion } from 'semver';
 import { getOrCreateRecord, readJsonObject, recordProperty, setStringProperty, writeJsonObject } from '../lib/json.js';
 
 interface RequiredDependency {
@@ -247,11 +246,12 @@ function satisfiesDependencyPolicy(version: string, dependency: RequiredDependen
   if (dependency.minimumVersion === undefined) {
     return version === dependency.fallbackVersion;
   }
-  const parsed = minVersion(version);
-  if (!parsed) {
+  const parsed = parseVersion(version);
+  const minimum = parseVersion(dependency.minimumVersion);
+  if (!parsed || !minimum) {
     return false;
   }
-  return gte(parsed, dependency.minimumVersion);
+  return compareVersions(parsed, minimum) >= 0;
 }
 
 function formatMinimum(dependency: RequiredDependency): string {
@@ -277,15 +277,49 @@ async function fetchLatestPatchVersion(packageName: string, minimumVersion: stri
   if (!isRegistryPackument(body)) {
     return null;
   }
-  return maxSatisfying(Object.keys(body.versions), minorRange);
+  return latestVersionInSameMajorMinor(Object.keys(body.versions), minorRange);
 }
 
-function sameMajorMinorRange(minimumVersion: string): string {
-  const parsed = minVersion(minimumVersion);
-  if (!parsed) {
-    return minimumVersion;
+function sameMajorMinorRange(minimumVersion: string): Version | null {
+  return parseVersion(minimumVersion);
+}
+
+interface Version {
+  major: number;
+  minor: number;
+  patch: number;
+}
+
+function parseVersion(version: string): Version | null {
+  const match = /^[~^]?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(version.trim());
+  if (!match?.[1] || !match[2] || !match[3]) {
+    return null;
   }
-  return `>=${parsed.version} <${parsed.major}.${parsed.minor + 1}.0`;
+  return { major: Number(match[1]), minor: Number(match[2]), patch: Number(match[3]) };
+}
+
+function latestVersionInSameMajorMinor(versions: string[], minimum: Version | null): string | null {
+  if (!minimum) {
+    return null;
+  }
+  let latest: Version | null = null;
+  for (const raw of versions) {
+    const version = parseVersion(raw);
+    if (!version || version.major !== minimum.major || version.minor !== minimum.minor) {
+      continue;
+    }
+    if (compareVersions(version, minimum) < 0) {
+      continue;
+    }
+    if (!latest || compareVersions(version, latest) > 0) {
+      latest = version;
+    }
+  }
+  return latest ? `${latest.major}.${latest.minor}.${latest.patch}` : null;
+}
+
+function compareVersions(left: Version, right: Version): number {
+  return left.major - right.major || left.minor - right.minor || left.patch - right.patch;
 }
 
 function isRegistryPackument(value: unknown): value is { versions: Record<string, unknown> } {

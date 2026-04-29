@@ -26,7 +26,6 @@ export interface PublishWorkflowStep {
   id?: string;
   condition?: PublishWorkflowCondition;
   nxTarget?: PublishWorkflowNxTarget;
-  needsNodeAuthToken?: boolean;
 }
 
 export interface PublishWorkflowDefinition {
@@ -57,19 +56,18 @@ export interface PublishWorkflowCallbacks {
   setupDevenv(): Promise<PublishWorkflowSetupOutputs>;
   configureReleaseAuthor(): Promise<void>;
   buildSelfHostedCli(): Promise<void>;
-  repairPendingReleases(input: { dryRun: boolean; nodeAuthToken: boolean }): Promise<void>;
+  repairPendingReleases(input: { dryRun: boolean }): Promise<void>;
   versionRelease(input: { bump: PublishWorkflowBump; dryRun: boolean }): Promise<PublishWorkflowVersionOutputs>;
   checkManagedMonorepoFiles(): Promise<void>;
   nxRunMany(input: { target: PublishWorkflowNxTarget; projects: string[] }): Promise<void>;
   uploadTraceDbs(): Promise<void>;
   validateMonorepoConfig(): Promise<void>;
-  publishRelease(input: { bump: PublishWorkflowBump; dryRun: boolean; nodeAuthToken: boolean }): Promise<void>;
+  publishRelease(input: { bump: PublishWorkflowBump; dryRun: boolean }): Promise<void>;
   saveNixDevenv(input: PublishWorkflowSetupOutputs): Promise<void>;
 }
 
 export interface PublishWorkflowRunContext {
   inputs: PublishWorkflowInputs;
-  nodeAuthToken: boolean;
   callbacks: PublishWorkflowCallbacks;
 }
 
@@ -96,7 +94,6 @@ export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions 
       {
         kind: PublishWorkflowStepKind.RepairPendingReleases,
         name: '🧯 Repair pending releases',
-        needsNodeAuthToken: true,
       },
       { kind: PublishWorkflowStepKind.VersionRelease, name: '🏷️ Version release', id: 'version' },
       {
@@ -131,7 +128,6 @@ export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions 
       {
         kind: PublishWorkflowStepKind.PublishRelease,
         name: `📦 Publish release (${versionMode})`,
-        needsNodeAuthToken: true,
       },
       {
         kind: PublishWorkflowStepKind.SaveNixDevenv,
@@ -175,7 +171,6 @@ export async function runPublishWorkflow(
         case PublishWorkflowStepKind.RepairPendingReleases:
           await context.callbacks.repairPendingReleases({
             dryRun: context.inputs.dryRun,
-            nodeAuthToken: context.nodeAuthToken,
           });
           break;
         case PublishWorkflowStepKind.VersionRelease:
@@ -202,7 +197,6 @@ export async function runPublishWorkflow(
           await context.callbacks.publishRelease({
             bump: context.inputs.bump,
             dryRun: context.inputs.dryRun,
-            nodeAuthToken: context.nodeAuthToken,
           });
           break;
         case PublishWorkflowStepKind.SaveNixDevenv:
@@ -352,8 +346,6 @@ function yamlLinesForStep(step: PublishWorkflowStep): string[] {
     case PublishWorkflowStepKind.RepairPendingReleases:
       return [
         `      - name: ${step.name}`,
-        '        env:',
-        `          NODE_AUTH_TOKEN: ${githubExpression('secrets.NPM_TOKEN')}`,
         `        run: smoo release repair-pending --dry-run "${githubExpression('inputs.dry_run')}"`,
       ];
     case PublishWorkflowStepKind.VersionRelease:
@@ -399,10 +391,8 @@ function yamlLinesForStep(step: PublishWorkflowStep): string[] {
       return [
         `      - name: ${step.name}`,
         '        # smoo packs with Bun, then publishes tarballs with npm. Existing',
-        '        # packages use trusted publishing/OIDC; first publishes use NODE_AUTH_TOKEN',
-        '        # because npm trust can only be configured after a package exists.',
-        '        env:',
-        `          NODE_AUTH_TOKEN: ${githubExpression('secrets.NPM_TOKEN')}`,
+        '        # packages must already exist on npm and use trusted publishing/OIDC.',
+        '        # Missing package names are bootstrapped locally before trust setup.',
         `        run: smoo release publish --bump "${githubExpression('inputs.bump')}" --dry-run "${githubExpression('inputs.dry_run')}"`,
       ];
     case PublishWorkflowStepKind.SaveNixDevenv:

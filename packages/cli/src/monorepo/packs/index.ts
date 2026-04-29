@@ -1,10 +1,12 @@
 import { chmodSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { validateBunLockfileVersions } from '../lockfile.js';
+import { runStatus } from '../../lib/run.js';
+import { syncBunLockfileVersions, validateBunLockfileVersions } from '../lockfile.js';
 import { validateManagedFiles } from '../managed-files.js';
-import { validateNxSync } from '../nx-sync.js';
+import { fixNxSync, validateNxSync } from '../nx-sync.js';
 import { fixPackageHygiene, validatePackageHygiene } from '../package-hygiene.js';
 import {
+  applyFixableMonorepoDefaults,
   applyNxReleaseDefaults,
   applyPublicPackageDefaults,
   applyWorkspaceDependencyDefaults,
@@ -17,7 +19,7 @@ import {
 } from '../package-policy.js';
 import { validatePackedPublicPackages } from '../packed-package.js';
 import { syncRootRuntimeVersions } from '../runtime.js';
-import { validateToolConfig } from '../tool-validation.js';
+import { applyToolConfigDefaults, validateToolConfig } from '../tool-validation.js';
 
 export interface MonorepoContext {
   root: string;
@@ -26,12 +28,21 @@ export interface MonorepoContext {
 
 export interface ValidatePackOptions {
   failFast?: boolean;
+  fix?: boolean;
 }
 
-interface MonorepoPack {
+export interface MonorepoPack {
   name: string;
   init?(ctx: MonorepoContext): Promise<void> | void;
-  validate?(ctx: MonorepoContext): Promise<number> | number;
+  fixPreBuild?(ctx: MonorepoContext): Promise<void> | void;
+  fixPostBuild?(ctx: MonorepoContext): Promise<void> | void;
+  validatePreBuild?(ctx: MonorepoContext): Promise<number> | number;
+  validatePostBuild?(ctx: MonorepoContext): Promise<number> | number;
+}
+
+export interface ValidatePackRunHooks {
+  packs?: readonly MonorepoPack[];
+  runBuild?: (ctx: MonorepoContext) => Promise<number> | number;
 }
 
 const packs: MonorepoPack[] = [
@@ -46,7 +57,13 @@ const packs: MonorepoPack[] = [
         console.log('skip           root runtime versions (outside devenv; pass --sync-runtime to force)');
       }
     },
-    async validate(ctx) {
+    async fixPreBuild(ctx) {
+      applyFixableMonorepoDefaults(ctx.root);
+      await applyToolConfigDefaults(ctx.root);
+      syncBunLockfileVersions(ctx.root);
+      await fixNxSync(ctx.root);
+    },
+    async validatePreBuild(ctx) {
       return (
         validateManagedFiles(ctx.root) +
         validateRootPackagePolicy(ctx.root) +
@@ -63,7 +80,10 @@ const packs: MonorepoPack[] = [
     init(ctx) {
       applyPublicPackageDefaults(ctx.root);
     },
-    validate(ctx) {
+    fixPreBuild(ctx) {
+      applyPublicPackageDefaults(ctx.root);
+    },
+    validatePreBuild(ctx) {
       return validatePublicTags(ctx.root) + validatePublicPackageMetadata(ctx.root);
     },
   },
@@ -73,13 +93,17 @@ const packs: MonorepoPack[] = [
       applyWorkspaceDependencyDefaults(ctx.root);
       await fixPackageHygiene(ctx.root);
     },
-    async validate(ctx) {
+    async fixPostBuild(ctx) {
+      applyWorkspaceDependencyDefaults(ctx.root);
+      await fixPackageHygiene(ctx.root);
+    },
+    async validatePostBuild(ctx) {
       return validateWorkspaceDependencies(ctx.root) + (await validatePackageHygiene(ctx.root));
     },
   },
   {
     name: 'packed-packages',
-    validate(ctx) {
+    validatePostBuild(ctx) {
       return validatePackedPublicPackages(ctx.root);
     },
   },
@@ -91,22 +115,120 @@ export async function runInitPacks(ctx: MonorepoContext): Promise<void> {
   }
 }
 
-export async function runValidatePacks(ctx: MonorepoContext, options: ValidatePackOptions = {}): Promise<number> {
+export async function runValidatePacks(
+  ctx: MonorepoContext,
+  options: ValidatePackOptions = {},
+  hooks: ValidatePackRunHooks = {},
+): Promise<number> {
+  const selectedPacks = hooks.packs ?? packs;
+  const build = hooks.runBuild ?? runBuild;
+
+  if (options.fix) {
+    await runFixPhase(ctx, selectedPacks, 'pre-build', 'fixPreBuild');
+    const buildFailures = await build(ctx);
+    if (buildFailures > 0) {
+      return buildFailures;
+    }
+    await runFixPhase(ctx, selectedPacks, 'post-build', 'fixPostBuild');
+    return runValidationPhases(ctx, selectedPacks, options, false);
+  }
+
+  const preBuildFailures = await runValidationPhase(
+    ctx,
+    selectedPacks,
+    options,
+    'pre-build',
+    'validatePreBuild',
+    false,
+  );
+  if (preBuildFailures > 0 && options.failFast) {
+    return preBuildFailures;
+  }
+  const buildFailures = await build(ctx);
+  if (buildFailures > 0) {
+    return preBuildFailures + buildFailures;
+  }
+  return (
+    preBuildFailures + (await runValidationPhase(ctx, selectedPacks, options, 'post-build', 'validatePostBuild', true))
+  );
+}
+
+async function runValidationPhases(
+  ctx: MonorepoContext,
+  selectedPacks: readonly MonorepoPack[],
+  options: ValidatePackOptions,
+  printedBefore: boolean,
+): Promise<number> {
+  const preBuildFailures = await runValidationPhase(
+    ctx,
+    selectedPacks,
+    options,
+    'pre-build',
+    'validatePreBuild',
+    printedBefore,
+  );
+  if (preBuildFailures > 0 && options.failFast) {
+    return preBuildFailures;
+  }
+  return (
+    preBuildFailures + (await runValidationPhase(ctx, selectedPacks, options, 'post-build', 'validatePostBuild', true))
+  );
+}
+
+async function runValidationPhase(
+  ctx: MonorepoContext,
+  selectedPacks: readonly MonorepoPack[],
+  options: ValidatePackOptions,
+  phase: 'pre-build' | 'post-build',
+  method: 'validatePreBuild' | 'validatePostBuild',
+  printedBefore: boolean,
+): Promise<number> {
   let failures = 0;
   let checkedPacks = 0;
-  for (const pack of packs) {
-    if (!pack.validate) {
+  let hasPrinted = printedBefore;
+  for (const pack of selectedPacks) {
+    const validate = pack[method];
+    if (!validate) {
       continue;
     }
-    console.log(`${checkedPacks === 0 ? '' : '\n'}== ${pack.name} ==`);
+    console.log(`${hasPrinted || checkedPacks > 0 ? '\n' : ''}== ${pack.name} (${phase}) ==`);
+    hasPrinted = true;
     checkedPacks++;
-    const packFailures = await pack.validate(ctx);
+    const packFailures = await validate(ctx);
     failures += packFailures;
     if (packFailures > 0 && options.failFast) {
       break;
     }
   }
   return failures;
+}
+
+async function runFixPhase(
+  ctx: MonorepoContext,
+  selectedPacks: readonly MonorepoPack[],
+  phase: 'pre-build' | 'post-build',
+  method: 'fixPreBuild' | 'fixPostBuild',
+): Promise<void> {
+  let checkedPacks = 0;
+  for (const pack of selectedPacks) {
+    const fix = pack[method];
+    if (!fix) {
+      continue;
+    }
+    console.log(`${checkedPacks === 0 ? '' : '\n'}== ${pack.name} (${phase} fix) ==`);
+    checkedPacks++;
+    await fix(ctx);
+  }
+}
+
+async function runBuild(ctx: MonorepoContext): Promise<number> {
+  console.log('\n== build ==');
+  const status = await runStatus('nx', ['run-many', '-t', 'build'], ctx.root);
+  if (status !== 0) {
+    console.error('nx run-many -t build failed');
+    return 1;
+  }
+  return 0;
 }
 
 function ensureLocalSmooShim(root: string): void {

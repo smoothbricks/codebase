@@ -73,12 +73,13 @@ export function applyPublicPackageDefaults(root: string): void {
 export function applyWorkspaceDependencyDefaults(root: string): void {
   const workspaceNames = new Set(getWorkspacePackages(root).map((pkg) => pkg.name));
   for (const pkg of listPackageJsonRecords(root)) {
-    const changed = fixWorkspaceDependencyRanges(pkg.json, workspaceNames);
+    let changed = fixWorkspaceDependencyRanges(pkg.json, workspaceNames);
+    changed = applyPackageScriptPolicy(pkg.json, pkg.path, workspaceNames) || changed;
     if (changed) {
       writeJsonObject(pkg.packageJsonPath, pkg.json);
-      console.log(`updated        ${pkg.path}/package.json workspace dependency ranges`);
+      console.log(`updated        ${pkg.path}/package.json workspace dependency policy`);
     } else {
-      console.log(`unchanged      ${pkg.path}/package.json workspace dependency ranges`);
+      console.log(`unchanged      ${pkg.path}/package.json workspace dependency policy`);
     }
   }
 }
@@ -406,9 +407,147 @@ export function validateWorkspaceDependencies(root: string): number {
         }
       }
     }
+    failures += validatePackageScriptPolicy(pkg.json, pkg.path, workspaceNames);
   }
   if (failures === 0) {
-    console.log('Workspace dependency ranges are valid.');
+    console.log('Workspace dependency policy is valid.');
+  }
+  return failures;
+}
+
+export function applyPackageScriptPolicy(
+  pkg: Record<string, unknown>,
+  _packagePath: string,
+  workspaceNames: ReadonlySet<string>,
+): boolean {
+  if (!hasWorkspaceDependency(pkg, workspaceNames)) {
+    return false;
+  }
+  const scripts = recordProperty(pkg, 'scripts');
+  if (!scripts) {
+    return false;
+  }
+  const nx = getOrCreateRecord(pkg, 'nx');
+  const projectName = stringProperty(nx, 'name') ?? stringProperty(pkg, 'name');
+  if (!projectName) {
+    return false;
+  }
+  const targets = getOrCreateRecord(nx, 'targets');
+  let changed = false;
+  for (const [scriptName, rawCommand] of Object.entries(scripts)) {
+    if (typeof rawCommand !== 'string') {
+      continue;
+    }
+    const rewrite = classifyScriptRewrite(scriptName, rawCommand);
+    if (!rewrite) {
+      continue;
+    }
+    const targetName = rewrite.targetName;
+    const alias = nxRunAlias(projectName, targetName, rewrite.continuous);
+    const existingTarget = recordProperty(targets, targetName);
+    const existingOptions = existingTarget ? recordProperty(existingTarget, 'options') : null;
+    const existingCommand = existingOptions ? stringProperty(existingOptions, 'command') : null;
+    const command = isScriptRunnerCommand(existingCommand, scriptName)
+      ? rewrite.command
+      : (existingCommand ?? rewrite.command);
+    const target = existingTarget ?? {};
+    changed = setStringProperty(target, 'executor', 'nx:run-commands') || changed;
+    changed = setStringArrayProperty(target, 'dependsOn', expectedTargetDependencies(targetName)) || changed;
+    if (rewrite.continuous && target.continuous !== true) {
+      target.continuous = true;
+      changed = true;
+    }
+    const options = getOrCreateRecord(target, 'options');
+    changed = setStringProperty(options, 'command', command) || changed;
+    changed = setStringProperty(options, 'cwd', '{projectRoot}') || changed;
+    for (const [name, value] of Object.entries(rewrite.env)) {
+      const env = getOrCreateRecord(options, 'env');
+      changed = setStringProperty(env, name, value) || changed;
+    }
+    if (targets[targetName] !== target) {
+      targets[targetName] = target;
+      changed = true;
+    }
+    if (scripts[scriptName] !== alias) {
+      scripts[scriptName] = alias;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+export function validatePackageScriptPolicy(
+  pkg: Record<string, unknown>,
+  packagePath: string,
+  workspaceNames: ReadonlySet<string>,
+): number {
+  if (!hasWorkspaceDependency(pkg, workspaceNames)) {
+    return 0;
+  }
+  const scripts = recordProperty(pkg, 'scripts');
+  if (!scripts) {
+    return 0;
+  }
+  const nx = recordProperty(pkg, 'nx');
+  const projectName = nx ? stringProperty(nx, 'name') : stringProperty(pkg, 'name');
+  const targets = nx ? recordProperty(nx, 'targets') : null;
+  let failures = 0;
+  for (const [scriptName, rawCommand] of Object.entries(scripts)) {
+    if (typeof rawCommand !== 'string') {
+      continue;
+    }
+    const alias = parseNxRunAlias(rawCommand);
+    const rewrite = alias
+      ? { targetName: alias.targetName, continuous: isContinuousTarget(alias.targetName, '') }
+      : classifyScriptRewrite(scriptName, rawCommand);
+    if (!rewrite || (alias && projectName && alias.projectName !== projectName)) {
+      if (alias && projectName && alias.projectName !== projectName) {
+        console.error(`${packagePath}: scripts.${scriptName} must delegate to project ${projectName}`);
+        failures++;
+      }
+      continue;
+    }
+    if (!projectName) {
+      console.error(`${packagePath}: package scripts that use workspace dependencies require package.json nx.name`);
+      failures++;
+      continue;
+    }
+    const expectedAlias = nxRunAlias(projectName, rewrite.targetName, rewrite.continuous);
+    if (rawCommand !== expectedAlias) {
+      console.error(`${packagePath}: scripts.${scriptName} must delegate to ${expectedAlias}`);
+      failures++;
+      continue;
+    }
+    const target = targets ? recordProperty(targets, rewrite.targetName) : null;
+    const options = target ? recordProperty(target, 'options') : null;
+    const command = options ? stringProperty(options, 'command') : null;
+    if (!target || stringProperty(target, 'executor') !== 'nx:run-commands' || !options || !command) {
+      console.error(`${packagePath}: nx.targets.${rewrite.targetName} must use nx:run-commands with options.command`);
+      failures++;
+      continue;
+    }
+    if (stringProperty(options, 'cwd') !== '{projectRoot}') {
+      console.error(`${packagePath}: nx.targets.${rewrite.targetName}.options.cwd must be {projectRoot}`);
+      failures++;
+    }
+    if (!targetDependsOn(target, expectedTargetDependencies(rewrite.targetName))) {
+      console.error(
+        `${packagePath}: nx.targets.${rewrite.targetName}.dependsOn must include ${expectedTargetDependencies(
+          rewrite.targetName,
+        ).join(', ')}`,
+      );
+      failures++;
+    }
+    if (rewrite.continuous && target.continuous !== true) {
+      console.error(`${packagePath}: nx.targets.${rewrite.targetName}.continuous must be true`);
+      failures++;
+    }
+    if (isScriptRunnerCommand(command, scriptName)) {
+      console.error(
+        `${packagePath}: nx.targets.${rewrite.targetName}.options.command must not call scripts.${scriptName}`,
+      );
+      failures++;
+    }
   }
   return failures;
 }
@@ -428,6 +567,169 @@ function fixWorkspaceDependencyRanges(pkg: Record<string, unknown>, workspaceNam
     }
   }
   return changed;
+}
+
+interface ScriptRewrite {
+  targetName: string;
+  continuous: boolean;
+  command: string;
+  env: Record<string, string>;
+}
+
+function classifyScriptRewrite(scriptName: string, command: string): ScriptRewrite | null {
+  if (isNxRunAlias(command) || isBlockedScriptCommand(scriptName, command)) {
+    return null;
+  }
+  const parsed = parseEnvPrefixedCommand(command);
+  const targetName = rewriteTargetName(scriptName, parsed.command);
+  if (!targetName || !isSafeNxScriptCommand(parsed.command)) {
+    return null;
+  }
+  return {
+    targetName,
+    continuous: isContinuousTarget(targetName, parsed.command),
+    command: parsed.command,
+    env: parsed.env,
+  };
+}
+
+function rewriteTargetName(scriptName: string, command: string): string | null {
+  const trimmed = command.trim();
+  if (/^wrangler\s+build(?:\s|$)/.test(trimmed)) {
+    return 'build';
+  }
+  return scriptName;
+}
+
+function nxRunAlias(projectName: string, targetName: string, continuous: boolean): string {
+  const flags = continuous ? ' --tui=false --outputStyle=stream' : '';
+  return `nx run ${projectName}:${targetName}${flags}`;
+}
+
+function expectedTargetDependencies(targetName: string): string[] {
+  return targetName === 'preview' ? ['build'] : ['^build'];
+}
+
+function setStringArrayProperty(record: Record<string, unknown>, key: string, value: string[]): boolean {
+  const current = record[key];
+  if (
+    Array.isArray(current) &&
+    current.length === value.length &&
+    current.every((entry, index) => entry === value[index])
+  ) {
+    return false;
+  }
+  record[key] = value;
+  return true;
+}
+
+function targetDependsOn(target: Record<string, unknown>, expected: string[]): boolean {
+  const dependsOn = target.dependsOn;
+  return Array.isArray(dependsOn) && expected.every((entry) => dependsOn.includes(entry));
+}
+
+function hasWorkspaceDependency(pkg: Record<string, unknown>, workspaceNames: ReadonlySet<string>): boolean {
+  for (const field of workspaceDependencyFields) {
+    const dependencies = recordProperty(pkg, field);
+    if (!dependencies) {
+      continue;
+    }
+    for (const name of Object.keys(dependencies)) {
+      if (workspaceNames.has(name)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function isSafeNxScriptCommand(command: string): boolean {
+  const trimmed = command.trim();
+  return (
+    /^bun\s+test(?:\s|$)/.test(trimmed) ||
+    /^tsc-bun-test(?:\s|$)/.test(trimmed) ||
+    /^vitest(?:\s|$)/.test(trimmed) ||
+    /^tsc\s+(?:--build|--noEmit)(?:\s|$)/.test(trimmed) ||
+    /^tsdown(?:\s|$)/.test(trimmed) ||
+    /^vite\s+(?:build|dev|preview)(?:\s|$)/.test(trimmed) ||
+    /^astro\s+(?:build|dev|preview|check)(?:\s|$)/.test(trimmed) ||
+    /^zig\s+build(?:\s|$)/.test(trimmed) ||
+    /^bun\s+[./\w-]*build[\w.-]*\.ts(?:\s|$)/.test(trimmed) ||
+    /(?:^|\s)(?:bench|benchmark)(?:\s|$)/.test(trimmed) ||
+    /^wrangler\s+build(?:\s|$)/.test(trimmed)
+  );
+}
+
+function isBlockedScriptCommand(scriptName: string, command: string): boolean {
+  if (/^(?:deploy|db|release|sync|subtree|publish|pack)(?::|$)/.test(scriptName)) {
+    return true;
+  }
+  const trimmed = parseEnvPrefixedCommand(command).command;
+  return /^(?:deploy|db|release|sync|subtree|publish|pack)(?:\s|$)/.test(trimmed) || trimmed === 'astro';
+}
+
+function parseEnvPrefixedCommand(command: string): { command: string; env: Record<string, string> } {
+  const env: Record<string, string> = {};
+  let rest = command.trimStart();
+  while (true) {
+    const match = /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(rest);
+    if (!match?.[1]) {
+      return { command: rest.trim(), env };
+    }
+    let index = match[0].length;
+    let value = '';
+    const quote = rest[index];
+    if (quote === '"' || quote === "'") {
+      index += 1;
+      const end = rest.indexOf(quote, index);
+      if (end === -1) {
+        return { command: command.trim(), env: {} };
+      }
+      value = rest.slice(index, end);
+      index = end + 1;
+    } else {
+      const end = rest.slice(index).search(/\s/);
+      const valueEnd = end === -1 ? rest.length : index + end;
+      value = rest.slice(index, valueEnd);
+      index = valueEnd;
+    }
+    if (index < rest.length && !/\s/.test(rest[index] ?? '')) {
+      return { command: command.trim(), env: {} };
+    }
+    env[match[1]] = value;
+    rest = rest.slice(index).trimStart();
+  }
+}
+
+function isContinuousTarget(targetName: string, command: string): boolean {
+  return (
+    /(?:^|:|-)(?:dev|serve|preview|watch)(?:$|:|-)/.test(targetName) ||
+    /(?:^|\s)(?:dev|serve|preview|--watch|-w)(?:\s|$)/.test(command)
+  );
+}
+
+function isNxRunAlias(command: string): boolean {
+  return /^nx\s+run\s+\S+:\S+/.test(command.trim());
+}
+
+function parseNxRunAlias(command: string): { projectName: string; targetName: string } | null {
+  const match = /^nx\s+run\s+(.+):([^\s]+)(?:\s|$)/.exec(command.trim());
+  if (!match?.[1] || !match[2]) {
+    return null;
+  }
+  return { projectName: match[1], targetName: match[2] };
+}
+
+function isScriptRunnerCommand(command: string | null, scriptName: string): boolean {
+  if (!command) {
+    return false;
+  }
+  const escaped = escapeRegex(scriptName);
+  return new RegExp(`^(?:bun|npm)\\s+run\\s+${escaped}(?:\\s|$)`).test(command.trim());
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function suggestNxProjectName(rootPackageName: string, packageName: string): string | null {

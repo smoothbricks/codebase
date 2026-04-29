@@ -147,18 +147,78 @@ function buildProgram(): Command {
       },
     );
   release
+    .command('bootstrap-npm-packages')
+    .alias('bootstrap')
+    .description('Publish minimal npm placeholder packages so trusted publishing can be configured')
+    .option('--dry-run [dryRun]', 'show placeholder publishes without logging in or publishing')
+    .option('--skip-login', 'skip npm browser login before publishing placeholders')
+    .option('--package <name...>', 'only bootstrap the selected owned release package names')
+    .action(async (options: { dryRun?: string | boolean; skipLogin?: boolean; package?: string[] }) => {
+      const { releaseBootstrapNpmPackages } = await import('./release/index.js');
+      await releaseBootstrapNpmPackages(await findRepoRoot(), {
+        dryRun: booleanOption(options.dryRun),
+        skipLogin: options.skipLogin === true,
+        packages: options.package ?? [],
+      });
+    });
+  release
     .command('trust-publisher')
     .description('Configure npm trusted publishing for owned release packages')
     .option('--dry-run [dryRun]', 'show npm trust changes without saving them')
+    .option('--bootstrap', 'publish missing npm placeholder packages before configuring trust')
     .option('--otp <otp>', 'npm one-time password for trust operations')
     .option('--skip-login', 'skip npm browser login before configuring trust')
-    .action(async (options: { dryRun?: string | boolean; otp?: string; skipLogin?: boolean }) => {
+    .action(async (options: { dryRun?: string | boolean; bootstrap?: boolean; otp?: string; skipLogin?: boolean }) => {
       const { releaseTrustPublisher } = await import('./release/index.js');
       await releaseTrustPublisher(await findRepoRoot(), {
         dryRun: booleanOption(options.dryRun),
+        bootstrap: options.bootstrap === true,
         otp: options.otp,
         skipLogin: options.skipLogin === true,
       });
+    });
+
+  const devenv = program.command('devenv').description('Manage the repository devenv shell');
+  devenv.command('update').action(async () => {
+    const { updateDevenv } = await import('./devenv/index.js');
+    await updateDevenv(await findRepoRoot());
+  });
+  devenv.command('reload').action(async () => {
+    const { reloadDevenv } = await import('./devenv/index.js');
+    await reloadDevenv(await findRepoRoot());
+  });
+
+  const nixpkgsOverlay = program.command('nixpkgs-overlay').description('Manage the repository nixpkgs overlay');
+  nixpkgsOverlay.command('update').action(async () => {
+    const { updateNixpkgsOverlay } = await import('./devenv/index.js');
+    await updateNixpkgsOverlay(await findRepoRoot());
+  });
+
+  const nx = program.command('nx').description('Nx workspace helpers');
+  nx.command('list-targets')
+    .description('List project:target entries for every Nx project')
+    .action(async () => {
+      const { listTargets } = await import('./nx/index.js');
+      await listTargets(await findRepoRoot());
+    });
+  nx.command('list-projects')
+    .description('List Nx projects matching filters')
+    .requiredOption('--with-target <target>', 'only include projects defining this target')
+    .action(async (options: { withTarget?: string }) => {
+      const { listProjects } = await import('./nx/index.js');
+      await listProjects(await findRepoRoot(), options);
+    });
+  nx.command('reset-cache')
+    .description('Run nx reset to clear Nx daemon and cache state')
+    .action(async () => {
+      const { resetCache } = await import('./nx/index.js');
+      await resetCache(await findRepoRoot());
+    });
+  nx.command('clean-cache')
+    .description('Remove local Nx cache directories when present')
+    .action(async () => {
+      const { cleanCache } = await import('./nx/index.js');
+      await cleanCache(await findRepoRoot());
     });
 
   const githubCi = program.command('github-ci').description('GitHub Actions helpers');

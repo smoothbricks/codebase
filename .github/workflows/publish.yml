@@ -64,8 +64,6 @@ jobs:
 
       # Step 6
       - name: 🧯 Repair pending releases
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: smoo release repair-pending --dry-run "${{ inputs.dry_run }}"
 
       # Step 7
@@ -123,10 +121,8 @@ jobs:
       # Step 14
       - name: 📦 Publish release (${{ steps.version.outputs.mode }})
         # smoo packs with Bun, then publishes tarballs with npm. Existing
-        # packages use trusted publishing/OIDC; first publishes use NODE_AUTH_TOKEN
-        # because npm trust can only be configured after a package exists.
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # packages must already exist on npm and use trusted publishing/OIDC.
+        # Missing package names are bootstrapped locally before trust setup.
         run: smoo release publish --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"
 
       # --- Cleanup ------------------------------------------------------------
