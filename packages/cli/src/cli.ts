@@ -1,4 +1,5 @@
 import { Command, CommanderError } from 'commander';
+import { variants } from './generate/index.js';
 import { cliPackageVersion } from './lib/cli-package.js';
 import { findRepoRoot } from './lib/run.js';
 
@@ -116,6 +117,22 @@ function buildProgram(): Command {
         await setupTestTracing(await findRepoRoot(), options);
       },
     );
+  // `smoo g` / `smoo generate` — subcommands are driven by the variant
+  // registry in src/generate/index.ts. To add a new variant, add an entry
+  // there; the CLI wiring below picks it up automatically.
+  const g = program.command('g').alias('generate').description('Scaffold workspace packages and components');
+  for (const [variantName, variant] of Object.entries(variants)) {
+    const sub = g.command(`${variantName} <name>`).description(variant.description);
+    for (const opt of variant.options ?? []) {
+      sub.option(opt.flag, opt.description);
+    }
+    sub.option('--dry-run', 'preview changes without writing');
+    sub.action(async (name: string, options: Record<string, unknown>) => {
+      const { generate } = await import('./generate/index.js');
+      await generate(await findRepoRoot(), variantName, name, options);
+    });
+  }
+
   const release = program.command('release').description('Version, publish, and create GitHub Releases');
   release.command('npm-status').action(async () => {
     const { printReleaseState } = await import('./release/index.js');
