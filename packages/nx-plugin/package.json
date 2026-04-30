@@ -24,6 +24,30 @@
       "development": "./src/bounded-test-policy.ts",
       "import": "./dist/bounded-test-policy.js",
       "default": "./dist/bounded-test-policy.js"
+    },
+    "./workspace-config-policy": {
+      "types": "./dist/workspace-config-policy.d.ts",
+      "development": "./src/workspace-config-policy.ts",
+      "import": "./dist/workspace-config-policy.js",
+      "default": "./dist/workspace-config-policy.js"
+    },
+    "./release-config-policy": {
+      "types": "./dist/release-config-policy.d.ts",
+      "development": "./src/release-config-policy.ts",
+      "import": "./dist/release-config-policy.js",
+      "default": "./dist/release-config-policy.js"
+    },
+    "./package-target-policy": {
+      "types": "./dist/package-target-policy.d.ts",
+      "development": "./src/package-target-policy.ts",
+      "import": "./dist/package-target-policy.js",
+      "default": "./dist/package-target-policy.js"
+    },
+    "./typecheck-test-policy": {
+      "types": "./dist/typecheck-test-policy.d.ts",
+      "development": "./src/typecheck-test-policy.ts",
+      "import": "./dist/typecheck-test-policy.js",
+      "default": "./dist/typecheck-test-policy.js"
     }
   },
   "generators": "./generators.json",
