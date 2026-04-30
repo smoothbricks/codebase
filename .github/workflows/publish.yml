@@ -58,8 +58,7 @@ jobs:
 
       # Step 5
       - name: 🏗️ Build self-hosted smoo
-        # SmoothBricks self-hosts smoo from source, but Nx release loads
-        # @smoothbricks/cli/nx-version-actions through the built package export.
+        # SmoothBricks self-hosts smoo from source for release commands.
         run: nx build cli
 
       # Step 6

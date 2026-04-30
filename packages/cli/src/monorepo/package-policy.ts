@@ -32,7 +32,7 @@ export interface ResolvedProjectTargets {
   buildDependsOn?: readonly string[];
 }
 
-export const SMOO_NX_VERSION_ACTIONS = '@smoothbricks/cli/nx-version-actions';
+export const SMOO_NX_VERSION_ACTIONS = '@smoothbricks/nx-plugin/version-actions';
 export const SMOO_NX_RELEASE_TAG_PATTERN = '{projectName}@{version}';
 const extraCommitScopes = ['release'];
 const rootScriptPolicy: Record<string, string> = {

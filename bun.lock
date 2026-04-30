@@ -159,6 +159,7 @@
       "name": "@smoothbricks/nx-plugin",
       "version": "0.1.0",
       "dependencies": {
+        "@nx/js": "22.0.3",
         "nx": "22.5.4",
         "tslib": "^2.8.1",
       },

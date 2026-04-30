@@ -998,7 +998,7 @@ function validNxJson(): Record<string, unknown> {
         specifierSource: 'conventional-commits',
         currentVersionResolver: 'git-tag',
         fallbackCurrentVersionResolver: 'disk',
-        versionActions: '@smoothbricks/cli/nx-version-actions',
+        versionActions: '@smoothbricks/nx-plugin/version-actions',
       },
       releaseTag: { pattern: '{projectName}@{version}' },
       changelog: {
