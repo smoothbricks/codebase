@@ -175,8 +175,48 @@ describe('auto release candidate filtering', () => {
     });
   });
 
-  it('does not auto-release an untagged next prerelease package version', async () => {
+  it('does not auto-release an untagged next prerelease package version with no prior stable release', async () => {
     await withFixtureRepo(async (root) => {
+      await writePackage(root, next.name, next.path, next.version);
+      await git(root, ['add', '.']);
+      await git(root, ['commit', '-m', 'chore(release): prepare next prerelease']);
+
+      await expect(autoReleaseCandidatePackages(gitCandidateShell(root), [next])).resolves.toEqual([]);
+    });
+  });
+
+  it('selects a prerelease package when releasable changes exist since the last stable tag', async () => {
+    await withFixtureRepo(async (root) => {
+      await writePackage(root, next.name, next.path, '1.0.0');
+      await git(root, ['add', '.']);
+      await git(root, ['commit', '-m', 'chore(release): publish']);
+      await tag(root, 'next@1.0.0', '2025-01-01T00:00:00Z');
+
+      // Simulate the post-release prerelease bump
+      await writePackage(root, next.name, next.path, next.version);
+      await git(root, ['add', '.']);
+      await git(root, ['commit', '-m', 'chore(release): prepare next prerelease']);
+
+      // A real fix lands on the prerelease version
+      await mkdir(join(root, next.path, 'src'), { recursive: true });
+      await writeFile(join(root, next.path, 'src/index.ts'), 'export const fix = true;\n');
+      await git(root, ['add', join(next.path, 'src/index.ts')]);
+      await git(root, ['commit', '-m', 'fix(next): repair something']);
+
+      await expect(autoReleaseCandidatePackages(gitCandidateShell(root), [next])).resolves.toEqual([next]);
+    });
+  });
+
+  it('does not select a prerelease package when no releasable changes exist since the last stable tag', async () => {
+    await withFixtureRepo(async (root) => {
+      await writePackage(root, next.name, next.path, '1.0.0');
+      await mkdir(join(root, next.path, 'src'), { recursive: true });
+      await writeFile(join(root, next.path, 'src/index.ts'), 'export const v1 = true;\n');
+      await git(root, ['add', '.']);
+      await git(root, ['commit', '-m', 'chore(release): publish']);
+      await tag(root, 'next@1.0.0', '2025-01-01T00:00:00Z');
+
+      // Only the prerelease bump, no releasable source changes
       await writePackage(root, next.name, next.path, next.version);
       await git(root, ['add', '.']);
       await git(root, ['commit', '-m', 'chore(release): prepare next prerelease']);
@@ -219,6 +259,22 @@ function gitCandidateShell(
       options.queriedRefs?.push(ref);
       const result = await $`git rev-parse --verify ${ref}`.cwd(root).quiet().nothrow();
       return result.exitCode === 0;
+    },
+    latestStableReleaseRef: async (projectName) => {
+      const pattern = `${projectName}@*`;
+      const result = await $`git tag --list ${pattern} --sort=-v:refname`.cwd(root).quiet().nothrow();
+      if (result.exitCode !== 0) {
+        return null;
+      }
+      const prefix = `${projectName}@`;
+      for (const line of new TextDecoder().decode(result.stdout).split('\n')) {
+        const tagName = line.trim();
+        const version = tagName.slice(prefix.length);
+        if (version && !version.includes('-')) {
+          return `refs/tags/${tagName}`;
+        }
+      }
+      return null;
     },
     packageChangedFilesSince: async (ref, packagePath) => {
       const result = await $`git diff --name-only ${`${ref}..HEAD`} -- ${packagePath}`.cwd(root).quiet().nothrow();
