@@ -12,6 +12,9 @@
   "exclude": ["src/**/*.test.ts", "src/**/__tests__/**"],
   "references": [
     {
+      "path": "../nx-plugin/tsconfig.lib.json"
+    },
+    {
       "path": "../validation/tsconfig.lib.json"
     }
   ]

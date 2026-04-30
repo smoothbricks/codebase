@@ -29,6 +29,8 @@
       "@smoothbricks/duration": ["./packages/duration/src/index.ts"],
       "@smoothbricks/lmao": ["./packages/lmao/src/index.ts"],
       "@smoothbricks/lmao-transformer": ["./packages/lmao-transformer/src/index.ts"],
+      "@smoothbricks/nx-plugin": ["./packages/nx-plugin/src/index.ts"],
+      "@smoothbricks/nx-plugin/bounded-test-policy": ["./packages/nx-plugin/src/bounded-test-policy.ts"],
       "@smoothbricks/validation": ["./packages/validation/src/index.ts"]
     }
   }

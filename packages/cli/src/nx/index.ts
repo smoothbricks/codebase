@@ -56,6 +56,30 @@ export function projectNamesWithTarget(projects: ProjectTargets[], target: strin
     .sort((a, b) => a.localeCompare(b));
 }
 
+export function projectNamesFromNxShowProjectsOutput(output: string): string[] {
+  const trimmed = output.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  if (trimmed.startsWith('[')) {
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (Array.isArray(parsed) && parsed.every((entry) => typeof entry === 'string')) {
+        return parsed.sort((a, b) => a.localeCompare(b));
+      }
+    } catch {
+      // Fall through to legacy newline parsing for older Nx output shapes.
+    }
+  }
+
+  return trimmed
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b));
+}
+
 export async function listTargets(root: string): Promise<void> {
   const output = formatProjectTargetLines(await readProjectTargets(root));
   if (output) {
@@ -100,11 +124,7 @@ export async function readProjectTargets(root: string): Promise<ProjectTargets[]
 
 async function readNxProjectNames(root: string): Promise<string[]> {
   const result = await $`nx show projects`.cwd(root).quiet();
-  return decode(result.stdout)
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .sort((a, b) => a.localeCompare(b));
+  return projectNamesFromNxShowProjectsOutput(decode(result.stdout));
 }
 
 async function readProjectTarget(root: string, project: string): Promise<ProjectTargets> {

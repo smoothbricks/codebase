@@ -7,7 +7,7 @@
     "smoo": "./bin/smoo"
   },
   "scripts": {
-    "test": "nx run cli:test"
+    "test": "nx run cli:test --tui=false --outputStyle=stream"
   },
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -45,6 +45,7 @@
   ],
   "dependencies": {
     "@arethetypeswrong/cli": "^0.18.2",
+    "@smoothbricks/nx-plugin": "workspace:*",
     "@smoothbricks/validation": "workspace:*",
     "commander": "^14.0.3",
     "publint": "^0.3.18",
@@ -69,10 +70,12 @@
         ]
       },
       "test": {
-        "executor": "nx:run-commands",
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
           "command": "bun test",
-          "cwd": "{projectRoot}"
+          "cwd": "{projectRoot}",
+          "timeoutMs": 600000,
+          "killAfterMs": 10000
         }
       }
     },

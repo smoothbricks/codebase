@@ -1,6 +1,11 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import {
+  applyWorkspaceBoundedTestTargetPolicy,
+  boundedTestScriptAlias,
+  checkWorkspaceBoundedTestTargetPolicy,
+} from '@smoothbricks/nx-plugin/bounded-test-policy';
+import {
   getOrCreateRecord,
   hasOwn,
   hasOwnString,
@@ -183,6 +188,11 @@ export function applyWorkspaceDependencyDefaults(root: string, options: Workspac
     }
     applyTestTypecheckTsconfigDefaults(root, pkg.path, pkg.json, workspaceNames);
     applyTsconfigTestReferenceDefaults(root, pkg.path);
+  }
+  if (applyWorkspaceBoundedTestTargetPolicy(root)) {
+    console.log('updated        package test targets bounded execution policy');
+  } else {
+    console.log('unchanged      package test targets bounded execution policy');
   }
 }
 
@@ -523,6 +533,10 @@ export function validateWorkspaceDependencies(root: string, options: WorkspaceDe
     }
     failures += validatePackageScriptPolicy(pkg.json, pkg.path, workspaceNames, { resolvedTargets });
   }
+  for (const issue of checkWorkspaceBoundedTestTargetPolicy(root)) {
+    console.error(`${issue.path}: ${issue.message}`);
+    failures++;
+  }
   if (failures === 0) {
     console.log('Workspace dependency policy is valid.');
   }
@@ -553,12 +567,19 @@ export function applyPackageScriptPolicy(
     if (typeof rawCommand !== 'string') {
       continue;
     }
+    const parsedAlias = parseNxRunAlias(rawCommand);
+    if (parsedAlias?.projectName === projectName && parsedAlias.targetName === 'test') {
+      continue;
+    }
     const rewrite = classifyScriptRewrite(scriptName, rawCommand);
     if (!rewrite) {
       continue;
     }
     const targetName = rewrite.targetName;
     const alias = nxRunAlias(projectName, targetName, rewrite.continuous);
+    if (targetName === 'test') {
+      continue;
+    }
     const existingTarget = recordProperty(targets, targetName);
     if (
       !existingTarget &&
@@ -578,7 +599,7 @@ export function applyPackageScriptPolicy(
       : (existingCommand ?? rewrite.command);
     const target = existingTarget ?? {};
     changed = setStringProperty(target, 'executor', 'nx:run-commands') || changed;
-    changed = setStringArrayProperty(target, 'dependsOn', expectedTargetDependencies(targetName)) || changed;
+    changed = applyTargetDependencyPolicy(target, targetName) || changed;
     if (rewrite.continuous && target.continuous !== true) {
       target.continuous = true;
       changed = true;
@@ -656,6 +677,9 @@ export function validatePackageScriptPolicy(
     if (rewrite.targetName.includes(':')) {
       continue;
     }
+    if (rewrite.targetName === 'test') {
+      continue;
+    }
     const targetOptions = target ? recordProperty(target, 'options') : null;
     const command = targetOptions ? stringProperty(targetOptions, 'command') : null;
     if (!target || stringProperty(target, 'executor') !== 'nx:run-commands' || !targetOptions || !command) {
@@ -667,11 +691,10 @@ export function validatePackageScriptPolicy(
       console.error(`${packagePath}: nx.targets.${rewrite.targetName}.options.cwd must be {projectRoot}`);
       failures++;
     }
-    if (!targetDependsOn(target, expectedTargetDependencies(rewrite.targetName))) {
+    const expectedDependencies = expectedTargetDependencies(rewrite.targetName);
+    if (!targetDependsOn(target, expectedDependencies)) {
       console.error(
-        `${packagePath}: nx.targets.${rewrite.targetName}.dependsOn must include ${expectedTargetDependencies(
-          rewrite.targetName,
-        ).join(', ')}`,
+        `${packagePath}: nx.targets.${rewrite.targetName}.dependsOn must include ${expectedDependencies.join(', ')}`,
       );
       failures++;
     }
@@ -1686,12 +1709,19 @@ function targetNameForCommand(command: string): string | null {
 }
 
 function nxRunAlias(projectName: string, targetName: string, continuous: boolean): string {
+  if (targetName === 'test') {
+    return boundedTestScriptAlias(projectName);
+  }
   const flags = continuous || targetName === 'test' ? ' --tui=false --outputStyle=stream' : '';
   return `nx run ${projectName}:${targetName}${flags}`;
 }
 
 function expectedTargetDependencies(targetName: string): string[] {
   return targetName === 'preview' ? ['build'] : ['^build'];
+}
+
+function applyTargetDependencyPolicy(target: Record<string, unknown>, targetName: string): boolean {
+  return setStringArrayProperty(target, 'dependsOn', expectedTargetDependencies(targetName));
 }
 
 function targetExistsInResolvedProject(targetName: string, resolvedTargets?: ReadonlySet<string>): boolean {
