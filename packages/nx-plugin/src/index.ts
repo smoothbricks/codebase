@@ -5,21 +5,11 @@ import { dirname, join } from 'node:path';
 import type { CreateNodesResultV2, CreateNodesV2, TargetConfiguration } from 'nx/src/devkit-exports.js';
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 
+import { BUILD_OUTPUT_DEPENDENCIES } from './workspace-config-policy.js';
+
 const RESERVED_ZIG_STEPS = new Set(['all', 'clean', 'install', 'test']);
 const ZIG_STEP_PATTERN = /\bb\.step\(\s*["']([^"']+)["']\s*,/g;
 const VALID_ZIG_STEP_NAME = /^[A-Za-z0-9_-]+$/;
-const BUILD_OUTPUT_DEPENDENCIES = [
-  '*-js',
-  '*-web',
-  '*-html',
-  '*-css',
-  '*-ios',
-  '*-android',
-  '*-native',
-  '*-napi',
-  '*-bun',
-  '*-wasm',
-];
 const BUILD_OUTPUT_TARGET_PATTERN = /-(?:js|web|html|css|ios|android|native|napi|bun|wasm)$/;
 
 export const createNodesV2: CreateNodesV2 = [
