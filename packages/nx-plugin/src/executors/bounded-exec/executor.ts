@@ -134,7 +134,8 @@ export async function runBoundedExec(
   });
 
   const exit = await exitPromise;
-  state.settled = true;
+  const exitedGracefullyAfterTimeout = state.timedOut && exit.code === 0 && exit.signal === null;
+  state.settled = !state.timedOut || exitedGracefullyAfterTimeout;
   if (timeout) {
     clearTimeout(timeout);
   }
@@ -142,6 +143,7 @@ export async function runBoundedExec(
 
   if (state.timedOut) {
     await timeoutPromise;
+    state.settled = true;
   }
 
   const code = exit.code ?? signalToExitCode(exit.signal);
