@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/schema",
+  "cli": "nx",
+  "title": "Configure bounded test targets",
+  "description": "Normalize a package test target to the workspace bounded command executor",
+  "type": "object",
+  "properties": {
+    "project": {
+      "type": "string",
+      "description": "Nx project name, package name, or project root to configure"
+    }
+  },
+  "required": ["project"]
+}
