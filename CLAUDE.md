@@ -238,6 +238,9 @@ This is an Nx-based monorepo using Bun as the package manager, with devenv/diren
   `*-napi`, `*-bun`, and `*-wasm`. Do not use colon target names such as `build:wasm` or `lint:fix`: Nx CLI syntax
   already means `project:target:configuration`, so colon target names are ambiguous with configurations. Package scripts
   may still be named `build:wasm` when they delegate to a real target like `nx run pkg:zig-wasm`.
+- **Commits must be atomic conventional commits** - release changelogs are generated from commit history, so split
+  unrelated features, fixes, docs, and chores into separate commits with accurate conventional prefixes and scopes. Do
+  not bundle two independent features into one commit just because they were implemented in one session.
 - **Test typechecking is no-emit** - `typecheck-tests` is inferred from `tsconfig.test.json`, which must use `noEmit`,
   must not be `composite`, must not write `dist-test`, and must not be referenced from package root `tsconfig.json`.
 - **Zig package setup** - `build.zig` must declare at least one `b.step(...)`; each step becomes a `zig-*` target.

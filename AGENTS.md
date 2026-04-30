@@ -198,6 +198,10 @@ are aggregates that depend on output-family wildcards such as `*-js`, `*-web`, `
 configurations and make package-script aliases harder to reason about. Package scripts may still be named `build:wasm`
 if they delegate to a real target such as `nx run pkg:zig-wasm`.
 
+**Commits must be atomic conventional commits.** Release changelogs are generated from commit history, so split
+unrelated features, fixes, docs, and chores into separate commits with accurate conventional prefixes and scopes. Do not
+bundle two independent features into one commit just because they were implemented in one session.
+
 **`typecheck-tests` is no-emit only.** Packages that use `bun test` must have `tsconfig.test.json` because Bun executes
 tests without typechecking. That config gets `typecheck-tests`; the test tsconfig must use `noEmit` and must not write
 `dist-test`. It must not be `composite`, and package root `tsconfig.json` must not reference `./tsconfig.test.json`; Nx
