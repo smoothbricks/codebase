@@ -63,6 +63,10 @@ jobs:
       # Step 8
       - name: 🧪 Unit Tests
         run: |
+          ../ci-process-sampler &
+          process_sampler_pid="$!"
+          trap 'kill "$process_sampler_pid" 2>/dev/null || true' EXIT
+
           for repeat in $(seq 1 20); do
             echo "::group::Uncached all Unit Tests repeat ${repeat}/20"
             nx run-many -t test --parallel=5 --skip-nx-cache
