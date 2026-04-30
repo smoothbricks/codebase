@@ -23,7 +23,6 @@ jobs:
     env:
       NIX_STORE_NAR: ${{ github.workspace }}/nix-store.nar
       GH_TOKEN: ${{ github.token }}
-      LMAO_TEST_CLEANUP_DEBUG: '1'
     steps:
       # Step 1: GitHub adds "Set up job" automatically
       # Step 2
@@ -63,16 +62,7 @@ jobs:
 
       # Step 8
       - name: 🧪 Unit Tests
-        run: |
-          ../ci-process-sampler &
-          process_sampler_pid="$!"
-          trap 'kill "$process_sampler_pid" 2>/dev/null || true' EXIT
-
-          for repeat in $(seq 1 20); do
-            echo "::group::Uncached all Unit Tests repeat ${repeat}/20"
-            nx run-many -t test --parallel=5 --skip-nx-cache
-            echo "::endgroup::"
-          done
+        run: smoo github-ci nx-smart --target test --name "Unit Tests" --step 8
 
       # Step 9
       # Nx's database cache needs artifact files and .nx/workspace-data DB

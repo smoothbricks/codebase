@@ -1,6 +1,9 @@
 {
   "name": "@smoothbricks/tooling",
   "private": true,
+  "nx": {
+    "name": "tooling"
+  },
   "dependencies": {
     "@smoothbricks/cli": "workspace:*"
   }
