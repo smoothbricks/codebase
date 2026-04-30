@@ -233,7 +233,7 @@ builds, so a package `tsconfig.lib.json` produces the concrete target `tsc-js`.
 `@smoothbricks/nx-plugin` only fills SmoothBricks convention gaps that official plugins do not provide. Today that means
 Bun test typechecking, non-TypeScript build-tool steps, and aggregate targets.
 
-Concrete targets describe the tool that runs and the artifact or purpose it produces:
+Concrete targets use `{tool}-{output}` names and describe the tool that runs and the artifact or purpose it produces:
 
 - `tsc-js` comes from the official TypeScript plugin and runs `tsc` for package JavaScript/declaration output.
 - Packages that run `bun test` must have `tsconfig.test.json`. Bun executes tests without typechecking, so smoo creates
@@ -244,17 +244,18 @@ Concrete targets describe the tool that runs and the artifact or purpose it prod
   `typecheck-tests` target runs `tsc --noEmit -p tsconfig.test.json` after `build` instead.
 - Non-TypeScript build steps come from explicit tool configuration. For example, a package `build.zig` must expose named
   `b.step("name", ...)` entries; each non-reserved step becomes a `zig-name` target such as `zig-wasm`.
-- `build` is an aggregate. It exists only when there is at least one concrete build target such as `tsc-js` or another
-  tool-output target, and it depends on those targets instead of duplicating their commands.
+- `build` is an aggregate. It exists only when there is at least one concrete build target such as `tsc-js`,
+  `tsdown-js`, or another tool-output target, and it depends on output-family wildcards such as `*-js`, `*-web`,
+  `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`, `*-bun`, and `*-wasm` instead of duplicating commands.
 - `lint` is an aggregate validation target. It is not a formatting target.
 
 Explicit Nx target names must not contain `:`. Nx already uses colon syntax at the CLI boundary:
 `project:target:configuration`. Allowing target names like `build:wasm` makes command parsing and package-script aliases
 look like configurations, and it prevents a clean split between concrete tool-output targets and aggregate targets.
 
-Use tool-output names for concrete targets, such as `tsc-js` and `zig-wasm`. Use `build` and `lint` only as aggregate
-targets. Package scripts may still use developer-friendly colon names, for example `build:wasm`, but those scripts
-should delegate to unambiguous Nx targets such as `nx run pkg:zig-wasm`.
+Use tool-output names for concrete targets, such as `tsc-js`, `tsdown-js`, and `zig-wasm`. Use `build` and `lint` only
+as aggregate targets. Package scripts may still use developer-friendly colon names, for example `build:wasm`, but those
+scripts should delegate to unambiguous Nx targets such as `nx run pkg:zig-wasm`.
 
 ## Managed Files
 
