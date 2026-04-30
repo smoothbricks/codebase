@@ -111,7 +111,7 @@ function buildPackageJson(
     },
     files: ['dist', 'src', '!**/*.tsbuildinfo'],
     scripts: {
-      test: `nx run ${schema.name}:test --tui=false --outputStyle=stream`,
+      test: `nx run ${schema.name}:test --outputStyle=stream`,
     },
     dependencies: {
       tslib: '^2.8.1',

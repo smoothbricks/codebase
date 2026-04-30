@@ -91,4 +91,4 @@ The generator rewrites `package.json` so `nx.targets.test` uses:
 - `cwd: "{projectRoot}"`
 - `timeoutMs: 600000`
 - `killAfterMs: 10000`
-- package script alias `nx run <project>:test --tui=false --outputStyle=stream`
+- package script alias `nx run <project>:test --outputStyle=stream`

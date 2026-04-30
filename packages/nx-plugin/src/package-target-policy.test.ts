@@ -210,7 +210,7 @@ describe('package target policy', () => {
 
       const web = JSON.parse(await readFile(join(root, 'packages/web/package.json'), 'utf8'));
       // dev script should become an Nx alias with streaming flags
-      expect(web.scripts.dev).toBe('nx run web:dev --tui=false --outputStyle=stream');
+      expect(web.scripts.dev).toBe('nx run web:dev --outputStyle=stream');
       // build script should become an Nx alias without streaming flags
       expect(web.scripts.build).toBe('nx run web:build');
       // nx.targets.dev should be created with continuous flag
@@ -237,7 +237,7 @@ describe('package target policy', () => {
         name: '@scope/app',
         dependencies: { '@scope/lib': 'workspace:*' },
         scripts: {
-          dev: 'nx run app:dev --tui=false --outputStyle=stream',
+          dev: 'nx run app:dev --outputStyle=stream',
         },
         nx: {
           name: 'app',
@@ -415,7 +415,7 @@ describe('per-package applyPackageTargets', () => {
 
 describe('nxRunAlias', () => {
   it('generates streaming flags for continuous targets', () => {
-    expect(nxRunAlias('app', 'dev', true)).toBe('nx run app:dev --tui=false --outputStyle=stream');
+    expect(nxRunAlias('app', 'dev', true)).toBe('nx run app:dev --outputStyle=stream');
   });
 
   it('generates plain alias for non-continuous targets', () => {
@@ -423,7 +423,7 @@ describe('nxRunAlias', () => {
   });
 
   it('delegates test targets to boundedTestScriptAlias', () => {
-    expect(nxRunAlias('app', 'test', false)).toBe('nx run app:test --tui=false --outputStyle=stream');
+    expect(nxRunAlias('app', 'test', false)).toBe('nx run app:test --outputStyle=stream');
   });
 });
 
@@ -569,7 +569,7 @@ describe('checkPackageTargetPolicyTree', () => {
       name: '@scope/app',
       dependencies: { '@scope/lib': 'workspace:*' },
       scripts: {
-        dev: 'nx run app:dev --tui=false --outputStyle=stream',
+        dev: 'nx run app:dev --outputStyle=stream',
       },
       nx: {
         name: 'app',
@@ -723,7 +723,7 @@ describe('applyPackageTargetPolicyTree', () => {
     expect(applyPackageTargetPolicyTree(tree)).toBe(true);
 
     const web = readJson(tree, 'packages/web/package.json');
-    expect(web.scripts.dev).toBe('nx run web:dev --tui=false --outputStyle=stream');
+    expect(web.scripts.dev).toBe('nx run web:dev --outputStyle=stream');
     expect(web.scripts.build).toBe('nx run web:build');
     expect(web.nx.targets.dev.continuous).toBe(true);
     expect(web.nx.targets.dev.executor).toBe('nx:run-commands');

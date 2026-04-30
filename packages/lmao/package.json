@@ -127,7 +127,7 @@
     "bench": "bun run benchmarks/*.bench.ts",
     "bench:wasm": "bun run benchmarks/js-vs-wasm.bench.ts",
     "build:wasm": "zig build -Doptimize=ReleaseSmall",
-    "test": "nx run lmao:test --tui=false --outputStyle=stream"
+    "test": "nx run lmao:test --outputStyle=stream"
   },
   "nx": {
     "sourceRoot": "packages/lmao/src",

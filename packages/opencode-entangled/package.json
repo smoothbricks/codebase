@@ -17,7 +17,7 @@
     "agents"
   ],
   "scripts": {
-    "test": "nx run opencode-entangled:test --tui=false --outputStyle=stream"
+    "test": "nx run opencode-entangled:test --outputStyle=stream"
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.3.5",

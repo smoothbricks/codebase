@@ -30,7 +30,7 @@
     "tamagui": ">=2.0.0-rc.0"
   },
   "scripts": {
-    "test": "nx run lmao-inspector:test --tui=false --outputStyle=stream"
+    "test": "nx run lmao-inspector:test --outputStyle=stream"
   },
   "devDependencies": {
     "@smoothbricks/lmao": "workspace:*",

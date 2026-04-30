@@ -7,7 +7,7 @@
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
-    "test": "nx run time:test --tui=false --outputStyle=stream"
+    "test": "nx run time:test --outputStyle=stream"
   },
   "nx": {
     "targets": {

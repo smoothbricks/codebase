@@ -36,7 +36,7 @@ describe('bounded-test-targets generator', () => {
     await generator(tree, { project: '@scope/example' });
 
     const packageJson = readJson(tree, 'packages/example/package.json');
-    expect(packageJson.scripts?.test).toBe('nx run example:test --tui=false --outputStyle=stream');
+    expect(packageJson.scripts?.test).toBe('nx run example:test --outputStyle=stream');
     expect(packageJson.nx?.targets?.test).toEqual({
       executor: BOUNDED_TEST_EXECUTOR,
       dependsOn: ['typecheck-tests', '^build'],
@@ -60,7 +60,7 @@ describe('bounded-test-targets generator', () => {
     await generator(tree, { project: 'packages/example' });
 
     const packageJson = readJson(tree, 'packages/example/package.json');
-    expect(packageJson.scripts?.test).toBe('nx run example:test --tui=false --outputStyle=stream');
+    expect(packageJson.scripts?.test).toBe('nx run example:test --outputStyle=stream');
     expect(packageJson.nx?.targets?.test).toEqual({
       executor: BOUNDED_TEST_EXECUTOR,
       options: {
@@ -101,7 +101,7 @@ describe('bounded-test-targets generator', () => {
 
     const packageJson = readJson(tree, 'packages/example/package.json');
     const projectJson = readJson(tree, 'packages/example/project.json');
-    expect(packageJson.scripts?.test).toBe('nx run example:test --tui=false --outputStyle=stream');
+    expect(packageJson.scripts?.test).toBe('nx run example:test --outputStyle=stream');
     expect(packageJson.nx?.targets?.test).toEqual({
       executor: 'nx:run-commands',
       options: { command: 'bun test --package-target' },

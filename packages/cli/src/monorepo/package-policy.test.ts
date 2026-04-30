@@ -603,7 +603,7 @@ describe('workspace package script policy', () => {
               },
             },
           },
-          scripts: { test: 'nx run native:test --tui=false --outputStyle=stream' },
+          scripts: { test: 'nx run native:test --outputStyle=stream' },
         },
       ],
     });
@@ -800,9 +800,9 @@ describe('workspace package script policy', () => {
       const app = await readJson(join(root, 'packages/app/package.json'));
       expect(app.dependencies).toEqual({ '@smoothbricks/lib': 'workspace:*' });
       expect(app.scripts).toEqual({
-        dev: 'nx run app:dev --tui=false --outputStyle=stream',
-        serve: 'nx run app:serve --tui=false --outputStyle=stream',
-        test: 'nx run app:test --tui=false --outputStyle=stream',
+        dev: 'nx run app:dev --outputStyle=stream',
+        serve: 'nx run app:serve --outputStyle=stream',
+        test: 'nx run app:test --outputStyle=stream',
         build: 'nx run app:build',
         deploy: 'wrangler deploy',
         astro: 'astro',
@@ -853,7 +853,7 @@ describe('workspace package script policy', () => {
           dir: 'app',
           name: '@smoothbricks/app',
           dependencies: { '@smoothbricks/lib': 'workspace:*' },
-          scripts: { test: 'nx run app:test --tui=false --outputStyle=stream' },
+          scripts: { test: 'nx run app:test --outputStyle=stream' },
           nx: {
             name: 'app',
             targets: {
@@ -902,9 +902,9 @@ describe('workspace package script policy', () => {
 
       const website = await readJson(join(root, 'packages/website/package.json'));
       expect(website.scripts).toEqual({
-        dev: 'nx run website:dev --tui=false --outputStyle=stream',
+        dev: 'nx run website:dev --outputStyle=stream',
         build: 'nx run website:build',
-        preview: 'nx run website:preview --tui=false --outputStyle=stream',
+        preview: 'nx run website:preview --outputStyle=stream',
         astro: 'astro',
       });
       expect(website.nx).toEqual({
@@ -963,7 +963,7 @@ describe('workspace package script policy', () => {
       applyWorkspaceDependencyDefaults(root);
 
       const app = await readJson(join(root, 'packages/app/package.json'));
-      expect(app.scripts).toEqual({ test: 'nx run @external/app:test --tui=false --outputStyle=stream' });
+      expect(app.scripts).toEqual({ test: 'nx run @external/app:test --outputStyle=stream' });
       expect(app.nx).toEqual({
         name: '@external/app',
         targets: {

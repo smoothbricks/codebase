@@ -50,7 +50,7 @@ describe('create-package generator', () => {
       });
       expect(pkg.dependencies).toEqual({ tslib: '^2.8.1' });
       expect(pkg.devDependencies).toEqual({ '@smoothbricks/validation': 'workspace:*' });
-      expect(pkg.scripts?.test).toBe('nx run duration:test --tui=false --outputStyle=stream');
+      expect(pkg.scripts?.test).toBe('nx run duration:test --outputStyle=stream');
       expect(pkg.nx?.name).toBe('duration');
       expect(pkg.nx?.targets?.lint).toEqual({});
       expect(pkg.nx?.targets?.test?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
