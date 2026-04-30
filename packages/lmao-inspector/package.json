@@ -43,9 +43,6 @@
       "lint": {},
       "test": {
         "executor": "nx:run-commands",
-        "dependsOn": [
-          "^build"
-        ],
         "options": {
           "command": "bun test --pass-with-no-tests",
           "cwd": "{projectRoot}"

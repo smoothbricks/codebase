@@ -35,9 +35,6 @@
       },
       "test": {
         "executor": "nx:run-commands",
-        "dependsOn": [
-          "^build"
-        ],
         "options": {
           "command": "bun test src/__tests__/columine-integration.test.ts",
           "cwd": "{projectRoot}"
