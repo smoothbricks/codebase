@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/schema",
+  "id": "CreatePackage",
+  "title": "Create a new workspace package",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Unscoped package name (e.g. 'duration'). Scope is derived from root package.json."
+    },
+    "variant": {
+      "type": "string",
+      "description": "Package variant to scaffold.",
+      "enum": ["ts-lib", "ts-zig"],
+      "default": "ts-lib"
+    },
+    "public": {
+      "type": "boolean",
+      "description": "Configure for npm publication (license, publishConfig, npm:public tag).",
+      "default": false
+    }
+  },
+  "required": ["name", "variant"]
+}
