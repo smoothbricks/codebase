@@ -76,10 +76,14 @@ in {
   # - When using the devenv wrapper from tooling/, restore the original working directory
   #   (The wrapper runs devenv from tooling/direnv but we want the shell to start where the user was)
 
-  # Set up PATH first so setup script can find tools
+  # PATH order: most-specific → least-specific.
+  #   1. tooling/     – the repo toolbox
+  #   2. tooling/node_modules/.bin – toolbox installed deps
+  #   3. node_modules/.bin – root workspace deps (Nx, biome, etc.)
+  #   (devenv profile is already on $PATH by the time enterShell runs)
   enterShell = ''
-    cd "$DEVENV_ROOT/../.."
-    export PATH="$PWD/tooling:$PWD/node_modules/.bin:$PATH"
+     cd "$DEVENV_ROOT/../.."
+     export PATH="$PWD/tooling:$PWD/tooling/node_modules/.bin:$PWD/node_modules/.bin:$PATH"
     bun "$DEVENV_ROOT/enter-shell.ts"
 
     # Unset nix CC/CXX so xcodebuild finds Xcode's clang (supports -index-store-path)
