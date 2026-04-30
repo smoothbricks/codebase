@@ -5,17 +5,39 @@ interval="${CI_PROCESS_SAMPLER_INTERVAL_SECONDS:-10}"
 pattern="${CI_PROCESS_SAMPLER_PATTERN:-nx|node|bun|sh|bash|zig|tsc}"
 args_pattern="${CI_PROCESS_SAMPLER_ARGS_PATTERN:-nx|node|bun|zig|tsc}"
 
+redact_args() {
+  sed \
+    -e 's/--api-key[= ][^ ]\+/--api-key=***/g' \
+    -e 's/[A-Za-z_]*\(TOKEN\|token\|KEY\|key\|SECRET\|secret\|PASSWORD\|password\)[A-Za-z_]*=[^ ]\+/***=***/g'
+}
+
+process_cwd() {
+  local pid="$1"
+
+  if [[ -e "/proc/${pid}/cwd" ]]; then
+    readlink "/proc/${pid}/cwd" 2>/dev/null || printf '-'
+    return
+  fi
+
+  printf '-'
+}
+
 while true; do
   echo "::group::process snapshot $(date -Is)"
-  ps -eo pid,ppid,pgid,stat,etime,pcpu,pmem,comm,args | awk -v pattern="$pattern" -v args_pattern="$args_pattern" '
-    NR == 1 { print; next }
-    $8 ~ "(^|/)(" pattern ")$" || $0 ~ "[[:space:]/](" args_pattern ")([[:space:]]|$)" {
-      line = $0
-      gsub(/--api-key[= ][^ ]+/, "--api-key=***", line)
-      gsub(/[A-Za-z_]*(TOKEN|token|KEY|key|SECRET|secret|PASSWORD|password)[A-Za-z_]*=[^ ]+/, "***=***", line)
-      print line
-    }
-  '
+  printf '%8s %8s %8s %-5s %12s %5s %5s %-16s %-40s %s\n' \
+    PID PPID PGID STAT ELAPSED CPU MEM COMMAND CWD ARGS
+
+  while read -r pid ppid pgid stat elapsed pcpu pmem comm args; do
+    command_name="${comm##*/}"
+    if [[ ! "$command_name" =~ ^($pattern)$ && ! "$args" =~ (^|[[:space:]/])($args_pattern)([[:space:]]|$) ]]; then
+      continue
+    fi
+
+    cwd="$(process_cwd "$pid")"
+    args="$(printf '%s' "$args" | redact_args)"
+    printf '%8s %8s %8s %-5s %12s %5s %5s %-16s %-40s %s\n' \
+      "$pid" "$ppid" "$pgid" "$stat" "$elapsed" "$pcpu" "$pmem" "$command_name" "$cwd" "$args"
+  done < <(ps -eo pid=,ppid=,pgid=,stat=,etime=,pcpu=,pmem=,comm=,args=)
   echo "::endgroup::"
   sleep "$interval"
 done
