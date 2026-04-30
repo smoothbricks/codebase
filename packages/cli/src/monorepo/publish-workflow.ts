@@ -379,7 +379,7 @@ function yamlLinesForStep(step: PublishWorkflowStep): string[] {
       return [
         `      - name: ${step.name}`,
         `        if: ${githubExpression('failure()')}`,
-        '        uses: actions/upload-artifact@v4',
+        '        uses: actions/upload-artifact@v7.0.1',
         '        with:',
         `          name: trace-results-${githubExpression('github.run_id')}`,
         '          path: packages/*/.trace-results.db',
