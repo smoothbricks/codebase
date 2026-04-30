@@ -1,11 +1,15 @@
 import { describe, expect, it } from 'bun:test';
 import {
+  collectOwnedReleaseTagRecords,
   groupReleaseTargets,
+  legacyReleaseTag,
   npmDistTagForVersion,
   pendingReleaseTargets,
   type ReleasePackageInfo,
   type ReleaseTagRecord,
   releasePackageForTag,
+  releaseTag,
+  releaseTagAliases,
 } from '../core.js';
 
 const a: ReleasePackageInfo = { name: '@scope/a', projectName: 'a', path: 'packages/a', version: '1.0.0' };
@@ -70,5 +74,47 @@ describe('release core planning', () => {
   it('uses package-version dist-tags instead of commit-level repair tags', () => {
     expect(npmDistTagForVersion('1.0.0')).toBe('latest');
     expect(npmDistTagForVersion('1.0.0-beta.1')).toBe('next');
+  });
+
+  it('keeps project-name release tags canonical while recognizing legacy package-name aliases', () => {
+    const scoped = { name: '@scope/a', projectName: 'a', version: '1.0.0' };
+
+    expect(releaseTag(scoped)).toBe('a@1.0.0');
+    expect(legacyReleaseTag(scoped)).toBe('@scope/a@1.0.0');
+    expect(releaseTagAliases(scoped)).toEqual(['a@1.0.0', '@scope/a@1.0.0']);
+  });
+
+  it('checks durable release state concurrently while preserving tag-order records', async () => {
+    const durableCalls: string[] = [];
+    let active = 0;
+    let maxActive = 0;
+    let unblockDurableCalls: (() => void) | undefined;
+    const durableCallsBlocked = new Promise<void>((resolve) => {
+      unblockDurableCalls = resolve;
+    });
+
+    const records = await collectOwnedReleaseTagRecords([a, b], 'head', {
+      listReleaseTagsByCreatorDate: async () => [
+        { name: 'a@1.0.0', sha: 'newer', timestamp: 2 },
+        { name: 'b@2.0.0-beta.1', sha: 'older', timestamp: 1 },
+      ],
+      isAncestor: async () => true,
+      packageVersionAtRef: async (packagePath) => (packagePath === a.path ? a.version : b.version),
+      durableTagState: async (_pkg, tag) => {
+        durableCalls.push(tag);
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        if (durableCalls.length === 2) {
+          unblockDurableCalls?.();
+        }
+        await durableCallsBlocked;
+        active -= 1;
+        return { npmPublished: false, githubReleaseExists: false };
+      },
+    });
+
+    expect(durableCalls).toEqual(['a@1.0.0', 'b@2.0.0-beta.1']);
+    expect(maxActive).toBeGreaterThan(1);
+    expect(records.map((releaseRecord) => releaseRecord.tag)).toEqual(['a@1.0.0', 'b@2.0.0-beta.1']);
   });
 });

@@ -137,6 +137,10 @@ export async function repairPendingTargets<Package extends ReleasePackageInfo>(
   restoreRef: string,
   dryRun: boolean,
 ): Promise<Array<ReleaseSummary<Package>>> {
+  if (dryRun) {
+    return targets.map((target) => repairDryRunSummary(target));
+  }
+
   const summaries: Array<ReleaseSummary<Package>> = [];
   try {
     for (const target of targets) {
@@ -155,6 +159,22 @@ export async function repairPendingTargets<Package extends ReleasePackageInfo>(
     await shell.checkout(restoreRef);
   }
   return summaries;
+}
+
+function repairDryRunSummary<Package extends ReleasePackageInfo>(
+  target: ReleaseTarget<Package>,
+): ReleaseSummary<Package> {
+  return {
+    sha: target.sha,
+    dryRun: true,
+    packages: target.packages,
+    pushed: false,
+    published: [],
+    alreadyPublished: target.packages.filter((pkg) => !target.npmPackages.includes(pkg)),
+    githubReleases: [],
+    rerunRequired: false,
+    noRelease: false,
+  };
 }
 
 export async function completeRepairTargetAtHead<Package extends ReleasePackageInfo>(

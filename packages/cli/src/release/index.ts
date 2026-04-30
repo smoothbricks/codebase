@@ -24,6 +24,7 @@ import {
   pendingReleaseTargets,
   type ReleasePackageInfo,
   releaseTag,
+  releaseTagAliases,
 } from './core.js';
 import { createOrUpdateGithubRelease, renderNxProjectChangelogContents } from './github-release.js';
 import { publishWithAuthDiagnostics } from './npm-auth.js';
@@ -155,6 +156,9 @@ export async function releaseRepairPending(root: string, options: ReleaseRepairP
       ? 'Repair pending releases: no pending durable state repairs found.'
       : `Repair pending releases: ${targets.length} release target${targets.length === 1 ? '' : 's'} need repair.`,
   );
+  for (const target of targets) {
+    console.log(`Repair pending releases: target ${target.sha.slice(0, 12)} needs ${repairTargetSummary(target)}.`);
+  }
   const summaries = await repairPendingTargets(releaseRepairShell(root), targets, restoreRef, options.dryRun === true);
   await writeRepairSummary(summaries, options.dryRun === true);
 }
@@ -778,16 +782,25 @@ async function listOwnedReleaseTagRecords(root: string, ref: string): Promise<Re
 
 async function durableReleaseTagState(root: string, pkg: Pick<ReleasePackage, 'name' | 'version'>, tag: string) {
   const packageVersion = `${pkg.name}@${pkg.version}`;
+  const githubReleaseTags = releaseTagAliases({ ...pkg, projectName: projectNameFromReleaseTag(tag) });
   const start = Date.now();
-  console.log(`${packageVersion}: checking durable state (npm + GitHub Release ${tag}).`);
+  console.log(`${packageVersion}: checking durable state (npm + GitHub Release ${githubReleaseTags.join(' or ')}).`);
   const [npmPublished, githubReleasePresent] = await Promise.all([
     npmVersionExists(root, pkg.name, pkg.version),
-    githubReleaseExists(root, tag),
+    anyGithubReleaseExists(root, githubReleaseTags),
   ]);
   console.log(
     `${packageVersion}: durable state npm=${yesNo(npmPublished)} github=${yesNo(githubReleasePresent)} (${Date.now() - start}ms).`,
   );
   return { npmPublished, githubReleaseExists: githubReleasePresent };
+}
+
+function projectNameFromReleaseTag(tag: string): string {
+  const versionSeparator = tag.lastIndexOf('@');
+  if (versionSeparator <= 0) {
+    return tag;
+  }
+  return tag.slice(0, versionSeparator);
 }
 
 async function gitReleaseTagsByCreatorDate(root: string): Promise<GitReleaseTagInfo[]> {
@@ -900,7 +913,9 @@ async function writeRepairSummary(summaries: Array<ReleaseSummary<ReleasePackage
     lines.push('- Result: no pending releases needed repair');
   } else {
     for (const summary of summaries) {
-      lines.push(`- Repaired \`${summary.sha.slice(0, 12)}\`: ${packageSummary(summary.packages)}`);
+      lines.push(
+        `- ${dryRun ? 'Would repair' : 'Repaired'} \`${summary.sha.slice(0, 12)}\`: ${packageSummary(summary.packages)}`,
+      );
     }
   }
   const text = `${lines.join('\n')}\n`;
@@ -916,6 +931,23 @@ function packageSummary(packages: ReleasePackage[]): string {
     return 'none';
   }
   return packages.map((pkg) => `${pkg.name}@${pkg.version}`).join(', ');
+}
+
+function repairTargetSummary(target: ReleaseTarget): string {
+  return target.packages
+    .map((pkg) => `${pkg.name}@${pkg.version} (${repairReasons(target, pkg).join(' + ')})`)
+    .join(', ');
+}
+
+function repairReasons(target: ReleaseTarget, pkg: ReleasePackage): string[] {
+  const reasons: string[] = [];
+  if (target.npmPackages.includes(pkg)) {
+    reasons.push('npm missing');
+  }
+  if (target.githubPackages.includes(pkg)) {
+    reasons.push('GitHub Release missing');
+  }
+  return reasons;
 }
 
 async function fetchReleaseRefs(root: string, remote: string, branch: string): Promise<void> {
@@ -1138,6 +1170,15 @@ async function pushRetaggedReleaseTags(
 
 async function githubReleaseExists(root: string, tag: string): Promise<boolean> {
   return (await runStatus('gh', ['release', 'view', tag, '--json', 'tagName'], root, true)) === 0;
+}
+
+async function anyGithubReleaseExists(root: string, tags: string[]): Promise<boolean> {
+  for (const tag of tags) {
+    if (await githubReleaseExists(root, tag)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 async function assertRemoteTagExists(root: string, tag: string): Promise<void> {
