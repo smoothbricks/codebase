@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import {
   getOrCreateRecord,
@@ -169,7 +169,7 @@ export function applyWorkspaceDependencyDefaults(root: string, options: Workspac
     } else {
       console.log(`unchanged      ${pkg.path}/package.json workspace dependency policy`);
     }
-    applyBunTestTsconfigDefaults(root, pkg.path, pkg.json, workspaceNames);
+    applyTestTypecheckTsconfigDefaults(root, pkg.path, pkg.json, workspaceNames);
     applyTsconfigTestReferenceDefaults(root, pkg.path);
   }
 }
@@ -492,7 +492,8 @@ export function validateWorkspaceDependencies(root: string, options: WorkspaceDe
       projectName ? options.resolvedTargetsByProject?.get(projectName) : undefined,
     );
     failures += validateExplicitNxTargets(pkg.json, pkg.path, resolvedTargets);
-    failures += validateBunTestTsconfigPresence(root, pkg.path, pkg.json);
+    failures += validateTestEntrypointPresence(root, pkg.path, pkg.json);
+    failures += validateTestTypecheckTsconfigPresence(root, pkg.path, pkg.json);
     failures += validateTsconfigTestPolicy(root, pkg.path);
     failures += validateTsconfigTestReferencePolicy(root, pkg.path);
     failures += validateBuildZigPolicy(root, pkg.path);
@@ -872,8 +873,27 @@ function validateTsconfigTestReferencePolicy(root: string, packagePath: string):
   return 1;
 }
 
-function validateBunTestTsconfigPresence(root: string, packagePath: string, pkg: Record<string, unknown>): number {
-  if (!usesBunTest(pkg)) {
+function validateTestEntrypointPresence(root: string, packagePath: string, pkg: Record<string, unknown>): number {
+  if (packagePath === '.') {
+    return 0;
+  }
+  if (!packageHasTestFiles(root, packagePath) || hasTestEntrypoint(pkg)) {
+    return 0;
+  }
+  console.error(`${packagePath}: test files require scripts.test or nx.targets.test`);
+  return 1;
+}
+
+function validateTestTypecheckTsconfigPresence(
+  root: string,
+  packagePath: string,
+  pkg: Record<string, unknown>,
+): number {
+  if (packagePath === '.') {
+    return 0;
+  }
+  const testRunners = collectTestRunners(pkg);
+  if (testRunners.size === 0) {
     return 0;
   }
   const path = join(root, packagePath, 'tsconfig.test.json');
@@ -881,19 +901,23 @@ function validateBunTestTsconfigPresence(root: string, packagePath: string, pkg:
     return 0;
   }
   console.error(
-    `${packagePath}: bun test requires tsconfig.test.json because Bun executes tests without typechecking. ` +
+    `${packagePath}: ${formatTestRunnerList(testRunners)} requires tsconfig.test.json because those runners do not typecheck test files by default. ` +
       'Run smoo monorepo validate --fix to create the no-emit test typecheck config.',
   );
   return 1;
 }
 
-function applyBunTestTsconfigDefaults(
+function applyTestTypecheckTsconfigDefaults(
   root: string,
   packagePath: string,
   pkg: Record<string, unknown>,
   workspaceNames: ReadonlySet<string>,
 ): void {
-  if (!usesBunTest(pkg)) {
+  if (packagePath === '.') {
+    return;
+  }
+  const testRunners = collectTestRunners(pkg);
+  if (testRunners.size === 0) {
     return;
   }
   const tsconfigTestPath = join(root, packagePath, 'tsconfig.test.json');
@@ -901,12 +925,12 @@ function applyBunTestTsconfigDefaults(
   const tsconfigTest = existing ?? {};
   let changed = existing === null;
 
-  changed = applyTsconfigTestDefaults(root, packagePath, pkg, tsconfigTest, workspaceNames) || changed;
+  changed = applyTsconfigTestDefaults(root, packagePath, pkg, tsconfigTest, workspaceNames, testRunners) || changed;
   if (changed) {
     writeJsonObject(tsconfigTestPath, tsconfigTest);
-    console.log(`updated        ${packagePath}/tsconfig.test.json bun test typecheck config`);
+    console.log(`updated        ${packagePath}/tsconfig.test.json test typecheck config`);
   } else {
-    console.log(`unchanged      ${packagePath}/tsconfig.test.json bun test typecheck config`);
+    console.log(`unchanged      ${packagePath}/tsconfig.test.json test typecheck config`);
   }
 }
 
@@ -928,6 +952,7 @@ function applyTsconfigTestDefaults(
   pkg: Record<string, unknown>,
   tsconfigTest: Record<string, unknown>,
   workspaceNames: ReadonlySet<string>,
+  testRunners: ReadonlySet<TestRunner>,
 ): boolean {
   let changed = setMissingStringProperty(tsconfigTest, 'extends', defaultTsconfigTestExtends(root, packagePath));
   const compilerOptions = getOrCreateRecord(tsconfigTest, 'compilerOptions');
@@ -937,7 +962,9 @@ function applyTsconfigTestDefaults(
   changed = setBooleanProperty(compilerOptions, 'declarationMap', false) || changed;
   changed = setBooleanProperty(compilerOptions, 'emitDeclarationOnly', false) || changed;
   changed = setBooleanProperty(compilerOptions, 'noEmit', true) || changed;
-  changed = mergeStringListProperty(compilerOptions, 'types', ['bun']) || changed;
+  if (testRunners.has('bun')) {
+    changed = mergeStringListProperty(compilerOptions, 'types', ['bun']) || changed;
+  }
   if (delete compilerOptions.outDir) {
     changed = true;
   }
@@ -1013,15 +1040,26 @@ function collectTsconfigTestReferencePaths(
   return paths;
 }
 
-function usesBunTest(pkg: Record<string, unknown>): boolean {
+type TestRunner = 'bun' | 'vitest';
+
+function collectTestRunners(pkg: Record<string, unknown>): ReadonlySet<TestRunner> {
+  const runners = new Set<TestRunner>();
   const scripts = recordProperty(pkg, 'scripts');
-  if (scripts && Object.values(scripts).some((command) => typeof command === 'string' && isBunTestCommand(command))) {
-    return true;
+  if (scripts) {
+    for (const command of Object.values(scripts)) {
+      if (typeof command !== 'string') {
+        continue;
+      }
+      const runner = detectTestRunnerFromCommand(command);
+      if (runner) {
+        runners.add(runner);
+      }
+    }
   }
   const nx = recordProperty(pkg, 'nx');
   const targets = nx ? recordProperty(nx, 'targets') : null;
   if (!targets) {
-    return false;
+    return runners;
   }
   for (const target of Object.values(targets)) {
     if (!isRecord(target)) {
@@ -1029,15 +1067,74 @@ function usesBunTest(pkg: Record<string, unknown>): boolean {
     }
     const options = recordProperty(target, 'options');
     const command = options ? stringProperty(options, 'command') : null;
-    if (command && isBunTestCommand(command)) {
+    const runner = command ? detectTestRunnerFromCommand(command) : null;
+    if (runner) {
+      runners.add(runner);
+    }
+  }
+  return runners;
+}
+
+function detectTestRunnerFromCommand(command: string): TestRunner | null {
+  const trimmed = parseEnvPrefixedCommand(command).command.trim();
+  if (/^bun\s+test(?:\s|$)/.test(trimmed)) {
+    return 'bun';
+  }
+  if (/^vitest(?:\s|$)/.test(trimmed)) {
+    return 'vitest';
+  }
+  return null;
+}
+
+function formatTestRunnerList(testRunners: ReadonlySet<TestRunner>): string {
+  const labels: string[] = [];
+  if (testRunners.has('bun')) {
+    labels.push('bun test');
+  }
+  if (testRunners.has('vitest')) {
+    labels.push('vitest');
+  }
+  return labels.join(' or ');
+}
+
+function hasTestEntrypoint(pkg: Record<string, unknown>): boolean {
+  const scripts = recordProperty(pkg, 'scripts');
+  if (typeof scripts?.test === 'string') {
+    return true;
+  }
+  const nx = recordProperty(pkg, 'nx');
+  const targets = nx ? recordProperty(nx, 'targets') : null;
+  return Boolean(targets && isRecord(targets.test));
+}
+
+function packageHasTestFiles(root: string, packagePath: string): boolean {
+  return directoryContainsTestFiles(join(root, packagePath));
+}
+
+function directoryContainsTestFiles(path: string): boolean {
+  if (!existsSync(path)) {
+    return false;
+  }
+  for (const entry of readdirSync(path, { withFileTypes: true })) {
+    if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name === 'coverage' || entry.name === '.git') {
+      continue;
+    }
+    const entryPath = join(path, entry.name);
+    if (entry.isDirectory()) {
+      if (directoryContainsTestFiles(entryPath)) {
+        return true;
+      }
+      continue;
+    }
+    const normalizedPath = entryPath.replaceAll('\\', '/');
+    if (normalizedPath.includes('/__tests__/')) {
+      return true;
+    }
+    if (/\.(?:test|spec)\.[cm]?[jt]sx?$/.test(entry.name)) {
       return true;
     }
   }
   return false;
-}
-
-function isBunTestCommand(command: string): boolean {
-  return /^bun\s+test(?:\s|$)/.test(parseEnvPrefixedCommand(command).command.trim());
 }
 
 function mergeStringListProperty(record: Record<string, unknown>, key: string, values: string[]): boolean {
@@ -1569,7 +1666,7 @@ function targetNameForCommand(command: string): string | null {
 }
 
 function nxRunAlias(projectName: string, targetName: string, continuous: boolean): string {
-  const flags = continuous ? ' --tui=false --outputStyle=stream' : '';
+  const flags = continuous || targetName === 'test' ? ' --tui=false --outputStyle=stream' : '';
   return `nx run ${projectName}:${targetName}${flags}`;
 }
 

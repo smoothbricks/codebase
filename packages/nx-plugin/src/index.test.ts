@@ -12,31 +12,67 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
   it('infers validation and aggregate build targets without owning TypeScript lib build', async () => {
     const workspace = await createWorkspace();
     try {
-      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      await workspace.write(
+        'packages/example/package.json',
+        '{"name":"example","scripts":{"test":"bun test --pass-with-no-tests"}}\n',
+      );
       await workspace.write('packages/example/tsconfig.lib.json', '{}\n');
       await workspace.write('packages/example/tsconfig.test.json', '{}\n');
 
       const targets = await inferProjectTargets(workspace, 'packages/example/package.json');
 
       expect(targets['tsc-js']).toBeUndefined();
-      expect(targets.build).toEqual({
-        executor: 'nx:noop',
-        cache: true,
-        dependsOn: ['^build', 'tsc-js'],
+      expect(targets.build?.executor).toBe('nx:noop');
+      expect(targets.build?.cache).toBe(true);
+      expect(targets.build?.dependsOn).toContain('^build');
+      expect(targets.build?.dependsOn).toContain('tsc-js');
+
+      expect(targets['typecheck-tests']?.executor).toBe('nx:run-commands');
+      expect(targets['typecheck-tests']?.cache).toBe(true);
+      expect(targets['typecheck-tests']?.dependsOn).toEqual(['typecheck']);
+      expect(targets['typecheck-tests']?.options).toMatchObject({
+        command: 'tsc --noEmit -p tsconfig.test.json',
+        cwd: 'packages/example',
       });
-      expect(targets['typecheck-tests']).toEqual({
-        executor: 'nx:run-commands',
-        cache: true,
-        options: {
-          command: 'tsc --noEmit -p tsconfig.test.json',
-          cwd: 'packages/example',
-        },
-        dependsOn: ['typecheck'],
+
+      expect(targets['typecheck-tests:watch']?.executor).toBe('nx:run-commands');
+      expect(targets['typecheck-tests:watch']?.continuous).toBe(true);
+      expect(targets['typecheck-tests:watch']?.options).toMatchObject({
+        command: 'tsc --noEmit -p tsconfig.test.json --watch',
+        cwd: 'packages/example',
       });
-      expect(targets.lint).toEqual({
-        executor: 'nx:noop',
-        cache: true,
-        dependsOn: ['typecheck-tests'],
+
+      expect(targets['test:watch']?.executor).toBe('nx:run-commands');
+      expect(targets['test:watch']?.continuous).toBe(true);
+      expect(targets['test:watch']?.dependsOn).toEqual(['typecheck-tests']);
+      expect(targets['test:watch']?.options).toMatchObject({
+        command: 'bun test --watch --pass-with-no-tests',
+        cwd: 'packages/example',
+      });
+
+      expect(targets.lint?.executor).toBe('nx:noop');
+      expect(targets.lint?.cache).toBe(true);
+      expect(targets.lint?.dependsOn).toEqual(['typecheck-tests']);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('infers vitest watch targets from explicit test commands', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write(
+        'packages/example/package.json',
+        '{"name":"example","scripts":{"test":"vitest run --coverage"}}\n',
+      );
+      await workspace.write('packages/example/tsconfig.test.json', '{}\n');
+
+      const targets = await inferProjectTargets(workspace, 'packages/example/package.json');
+
+      expect(targets['test:watch']?.continuous).toBe(true);
+      expect(targets['test:watch']?.options).toMatchObject({
+        command: 'vitest --coverage',
+        cwd: 'packages/example',
       });
     } finally {
       await workspace.cleanup();

@@ -66,7 +66,7 @@ export default async function generator(tree: Tree, schema: BunTestTracingGenera
     throw new Error(`Project ${resolved.name} is missing ${libTsconfigPath}`);
   }
 
-  updatePackageJson(tree, packageJsonPath);
+  updatePackageJson(tree, packageJsonPath, resolved.name);
   writeBunfig(tree, resolved.root);
   tree.write(joinPathFragments(resolved.root, 'src/test-suite-tracer.ts'), renderSuiteTracer(options));
   updateTsconfigTest(tree, resolved.root, packageJsonPath, tsconfigPath, libTsconfigPath);
@@ -107,14 +107,22 @@ function normalizeLookupValue(value: string): string {
   return value.replace(/^\.\//, '').replace(/\\/g, '/');
 }
 
-function updatePackageJson(tree: Tree, packageJsonPath: string): void {
+function updatePackageJson(tree: Tree, packageJsonPath: string, projectName: string): void {
   updateJson<PackageJson>(tree, packageJsonPath, (packageJson: PackageJson) => {
-    packageJson.scripts ??= {};
-    packageJson.scripts.test ??= 'bun test';
-
     packageJson.nx ??= {};
     packageJson.nx.targets ??= {};
+    packageJson.nx.targets.test ??= {
+      executor: 'nx:run-commands',
+      dependsOn: ['typecheck-tests', '^build'],
+      options: {
+        command: 'bun test',
+        cwd: '{projectRoot}',
+      },
+    };
     packageJson.nx.targets.lint ??= {};
+
+    packageJson.scripts ??= {};
+    packageJson.scripts.test = `nx run ${projectName}:test --tui=false --outputStyle=stream`;
 
     const hasLmaoDependency = Boolean(
       packageJson.dependencies?.['@smoothbricks/lmao'] || packageJson.devDependencies?.['@smoothbricks/lmao'],

@@ -10,18 +10,8 @@
     "noEmit": true,
     "rootDir": "src"
   },
-  "include": [
-    "src/**/*.test.ts",
-    "src/**/*.spec.ts",
-    "src/**/__tests__/**/*.ts",
-    "src/test-suite-tracer.ts",
-    "test-trace-setup.ts",
-    "src/**/__tests__/**/*.tsx"
-  ],
+  "include": ["src/**/*.test.ts", "src/**/*.spec.ts", "src/**/__tests__/**/*.ts", "src/**/__tests__/**/*.tsx"],
   "references": [
-    {
-      "path": "../lmao/tsconfig.lib.json"
-    },
     {
       "path": "./tsconfig.lib.json"
     }

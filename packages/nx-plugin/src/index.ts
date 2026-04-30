@@ -35,9 +35,17 @@ export const createNodesV2: CreateNodesV2 = [
 
 export default { createNodesV2 };
 
+interface PackageJson {
+  scripts?: Record<string, unknown>;
+  nx?: {
+    targets?: Record<string, unknown>;
+  };
+}
+
 async function createProjectTargets(packageJsonPath: string, workspaceRoot: string) {
   const projectRoot = dirname(packageJsonPath);
   const absoluteProjectRoot = join(workspaceRoot, projectRoot);
+  const packageJson = await readPackageJson(join(workspaceRoot, packageJsonPath));
   const targets: Record<string, TargetConfiguration> = {};
   const buildComponents: string[] = [];
   const validationTargets: string[] = [];
@@ -57,6 +65,26 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
         cwd: projectRoot,
       },
     };
+    targets['typecheck-tests:watch'] = {
+      executor: 'nx:run-commands',
+      continuous: true,
+      options: {
+        command: 'tsc --noEmit -p tsconfig.test.json --watch',
+        cwd: projectRoot,
+      },
+    };
+    const inferredTestWatchCommand = inferTestWatchCommand(packageJson);
+    if (inferredTestWatchCommand) {
+      targets['test:watch'] = {
+        executor: 'nx:run-commands',
+        continuous: true,
+        dependsOn: ['typecheck-tests'],
+        options: {
+          command: inferredTestWatchCommand,
+          cwd: projectRoot,
+        },
+      };
+    }
     validationTargets.push('typecheck-tests');
   } else if (hasLibTsconfig) {
     validationTargets.push('typecheck');
@@ -114,6 +142,61 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       [projectRoot]: { targets },
     },
   };
+}
+
+async function readPackageJson(packageJsonPath: string): Promise<PackageJson> {
+  return JSON.parse(await readFile(packageJsonPath, 'utf-8')) as PackageJson;
+}
+
+function inferTestWatchCommand(packageJson: PackageJson): string | null {
+  const scriptCommand = packageJson.scripts?.test;
+  if (typeof scriptCommand === 'string') {
+    const watchCommand = watchCommandFromTestCommand(scriptCommand);
+    if (watchCommand) {
+      return watchCommand;
+    }
+  }
+
+  const target = packageJson.nx?.targets?.test;
+  if (!isRecord(target)) {
+    return null;
+  }
+
+  const options = target.options;
+  if (!isRecord(options) || typeof options.command !== 'string') {
+    return null;
+  }
+
+  return watchCommandFromTestCommand(options.command);
+}
+
+function watchCommandFromTestCommand(command: string): string | null {
+  const parsed = parseEnvPrefixedCommand(command);
+  const trimmed = parsed.command.trim();
+
+  if (/^bun\s+test(?:\s|$)/.test(trimmed)) {
+    const suffix = trimmed.slice(trimmed.indexOf('test') + 'test'.length).trim();
+    return `${parsed.envPrefix}bun test --watch${suffix ? ` ${suffix}` : ''}`;
+  }
+
+  if (/^vitest(?:\s+run|\s+--run)?(?:\s|$)/.test(trimmed)) {
+    const suffix = trimmed.replace(/^vitest(?:\s+run|\s+--run)?/, '').trim();
+    return `${parsed.envPrefix}vitest${suffix ? ` ${suffix}` : ''}`;
+  }
+
+  return null;
+}
+
+function parseEnvPrefixedCommand(command: string): { command: string; envPrefix: string } {
+  const match = /^(?:\s*[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+)\s+)+/.exec(command);
+  if (!match?.[0]) {
+    return { command, envPrefix: '' };
+  }
+  return { command: command.slice(match[0].length), envPrefix: match[0] };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object';
 }
 
 async function readZigSteps(absoluteProjectRoot: string, projectRoot: string): Promise<string[]> {
