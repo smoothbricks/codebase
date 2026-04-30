@@ -1,6 +1,8 @@
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { getProjects, readJson, type Tree, updateJson } from 'nx/src/devkit-exports.js';
+
 import { boundedTestScriptAlias } from './bounded-test-policy.js';
 import type { NxPolicyIssue } from './workspace-config-policy.js';
 
@@ -14,10 +16,6 @@ export interface ResolvedProjectTargets {
 export interface PackageTargetPolicyOptions {
   resolvedTargetsByProject?: ReadonlyMap<string, ReadonlySet<string> | ResolvedProjectTargets>;
 }
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 export const BUILD_OUTPUT_DEPENDENCIES = [
   '*-js',
@@ -33,10 +31,6 @@ export const BUILD_OUTPUT_DEPENDENCIES = [
 ];
 
 const workspaceDependencyFields = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'];
-
-// ---------------------------------------------------------------------------
-// JSON helpers (self-contained, mirrors bounded-test-policy pattern)
-// ---------------------------------------------------------------------------
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -97,10 +91,6 @@ function writeJsonObject(path: string, value: Record<string, unknown>): void {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-// ---------------------------------------------------------------------------
-// Workspace walking (mirrors bounded-test-policy pattern)
-// ---------------------------------------------------------------------------
-
 function listWorkspacePackageJsonPaths(root: string): string[] {
   const rootPackagePath = join(root, 'package.json');
   if (!existsSync(rootPackagePath)) {
@@ -160,10 +150,6 @@ function packagePathFromJsonPath(root: string, packageJsonPath: string): string 
   return absolute;
 }
 
-// ---------------------------------------------------------------------------
-// Package Nx name / config helpers
-// ---------------------------------------------------------------------------
-
 export function packageNxProjectName(pkg: Record<string, unknown>): string | null {
   const nx = recordProperty(pkg, 'nx');
   return (nx ? stringProperty(nx, 'name') : null) ?? stringProperty(pkg, 'name');
@@ -195,10 +181,6 @@ function applyPackageNxConfig(
   const targets = options.targets === true ? getOrCreateRecord(nx, 'targets') : null;
   return { nx, targets, changed };
 }
-
-// ---------------------------------------------------------------------------
-// Resolved project helpers
-// ---------------------------------------------------------------------------
 
 function resolvedProjectTargetNames(
   resolvedProject?: ReadonlySet<string> | ResolvedProjectTargets,
@@ -232,10 +214,6 @@ function isBuildOutputDependencyPattern(dependency: string): boolean {
   return BUILD_OUTPUT_DEPENDENCIES.includes(dependency);
 }
 
-// ---------------------------------------------------------------------------
-// Target dependency policy
-// ---------------------------------------------------------------------------
-
 function expectedTargetDependencies(targetName: string): string[] {
   return targetName === 'preview' ? ['build'] : ['^build'];
 }
@@ -248,10 +226,6 @@ function targetDependsOn(target: Record<string, unknown>, expected: string[]): b
   const dependsOn = target.dependsOn;
   return Array.isArray(dependsOn) && expected.every((entry) => dependsOn.includes(entry));
 }
-
-// ---------------------------------------------------------------------------
-// Noop target detection
-// ---------------------------------------------------------------------------
 
 function isNoopTarget(target: Record<string, unknown>): boolean {
   const executor = stringProperty(target, 'executor');
@@ -281,10 +255,6 @@ function targetDependenciesMatchResolvedBuild(
   });
 }
 
-// ---------------------------------------------------------------------------
-// Remove redundant noop build target
-// ---------------------------------------------------------------------------
-
 function removeRedundantNoopBuildTarget(
   pkg: Record<string, unknown>,
   resolvedProject?: ReadonlySet<string> | ResolvedProjectTargets,
@@ -309,10 +279,6 @@ function removeRedundantNoopBuildTarget(
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// Nx run alias helpers
-// ---------------------------------------------------------------------------
-
 function isNxRunAlias(command: string): boolean {
   return /^nx\s+run\s+\S+:\S+/.test(command.trim());
 }
@@ -332,10 +298,6 @@ export function nxRunAlias(projectName: string, targetName: string, continuous: 
   const flags = continuous || targetName === 'test' ? ' --tui=false --outputStyle=stream' : '';
   return `nx run ${projectName}:${targetName}${flags}`;
 }
-
-// ---------------------------------------------------------------------------
-// Command classification helpers
-// ---------------------------------------------------------------------------
 
 function isContinuousTarget(targetName: string, command: string): boolean {
   return (
@@ -410,10 +372,6 @@ function parseEnvPrefixedCommand(command: string): { command: string; env: Recor
   }
 }
 
-// ---------------------------------------------------------------------------
-// Target name mapping
-// ---------------------------------------------------------------------------
-
 function targetNameForCommand(command: string): string | null {
   const trimmed = command.trim();
   if (/^tsc\s+--build\s+tsconfig\.lib\.json(?:\s|$)/.test(trimmed)) {
@@ -482,10 +440,6 @@ function classifyScriptRewrite(scriptName: string, command: string): ScriptRewri
   };
 }
 
-// ---------------------------------------------------------------------------
-// Script → target alias mapping for a single project
-// ---------------------------------------------------------------------------
-
 function scriptTargetAliasesForProject(
   pkg: Record<string, unknown>,
   projectName: string | null,
@@ -510,10 +464,6 @@ function scriptTargetAliasesForProject(
   return aliases;
 }
 
-// ---------------------------------------------------------------------------
-// Workspace dependency check
-// ---------------------------------------------------------------------------
-
 function hasWorkspaceDependency(pkg: Record<string, unknown>, workspaceNames: ReadonlySet<string>): boolean {
   for (const field of workspaceDependencyFields) {
     const dependencies = recordProperty(pkg, field);
@@ -529,18 +479,10 @@ function hasWorkspaceDependency(pkg: Record<string, unknown>, workspaceNames: Re
   return false;
 }
 
-// ---------------------------------------------------------------------------
-// Target command extraction
-// ---------------------------------------------------------------------------
-
 function targetCommand(target: Record<string, unknown>): string | null {
   const options = recordProperty(target, 'options');
   return options ? stringProperty(options, 'command') : null;
 }
-
-// ---------------------------------------------------------------------------
-// Rewrite target dependencies
-// ---------------------------------------------------------------------------
 
 function rewriteTargetDependencies(
   target: Record<string, unknown>,
@@ -563,10 +505,6 @@ function rewriteTargetDependencies(
   });
   return changed;
 }
-
-// ---------------------------------------------------------------------------
-// Test entrypoint detection
-// ---------------------------------------------------------------------------
 
 function hasTestEntrypoint(pkg: Record<string, unknown>): boolean {
   const scripts = recordProperty(pkg, 'scripts');
@@ -608,10 +546,6 @@ function directoryContainsTestFiles(path: string): boolean {
   return false;
 }
 
-// ---------------------------------------------------------------------------
-// build.zig validation
-// ---------------------------------------------------------------------------
-
 function validateBuildZigPolicy(root: string, packagePath: string): NxPolicyIssue[] {
   const path = join(root, packagePath, 'build.zig');
   if (!existsSync(path)) {
@@ -624,10 +558,6 @@ function validateBuildZigPolicy(root: string, packagePath: string): NxPolicyIssu
     { path: join(root, packagePath), message: `${packagePath}/build.zig must define at least one b.step(...) target` },
   ];
 }
-
-// ---------------------------------------------------------------------------
-// Validate explicit Nx targets (colon names, dependsOn)
-// ---------------------------------------------------------------------------
 
 function validateExplicitNxTargets(
   pkg: Record<string, unknown>,
@@ -692,10 +622,6 @@ function validateTargetDependencies(
   return issues;
 }
 
-// ---------------------------------------------------------------------------
-// Validate test entrypoint presence
-// ---------------------------------------------------------------------------
-
 function validateTestEntrypointPresence(
   root: string,
   packagePath: string,
@@ -709,10 +635,6 @@ function validateTestEntrypointPresence(
   }
   return [{ path: packagePath, message: `${packagePath}: test files require scripts.test or nx.targets.test` }];
 }
-
-// ---------------------------------------------------------------------------
-// Validate package script policy
-// ---------------------------------------------------------------------------
 
 function validatePackageScriptPolicy(
   pkg: Record<string, unknown>,
@@ -815,10 +737,6 @@ function validatePackageScriptPolicy(
   return issues;
 }
 
-// ---------------------------------------------------------------------------
-// Migrate colon targets
-// ---------------------------------------------------------------------------
-
 function migratePackageColonTargets(pkg: Record<string, unknown>, resolvedTargets?: ReadonlySet<string>): boolean {
   const nx = recordProperty(pkg, 'nx');
   const targets = nx ? recordProperty(nx, 'targets') : null;
@@ -877,9 +795,135 @@ function migratePackageColonTargets(pkg: Record<string, unknown>, resolvedTarget
   return changed;
 }
 
-// ---------------------------------------------------------------------------
-// Remove remaining colon targets
-// ---------------------------------------------------------------------------
+function collectWorkspaceNamesTree(tree: Tree): Set<string> {
+  const names = new Set<string>();
+  for (const [, config] of getProjects(tree)) {
+    const pkgPath = `${config.root}/package.json`;
+    if (!tree.exists(pkgPath)) {
+      continue;
+    }
+    const pkg = readJson<Record<string, unknown>>(tree, pkgPath);
+    const name = stringProperty(pkg, 'name');
+    if (name) {
+      names.add(name);
+    }
+  }
+  return names;
+}
+
+function directoryContainsTestFilesTree(tree: Tree, path: string): boolean {
+  if (!tree.exists(path)) {
+    return false;
+  }
+  for (const entry of tree.children(path)) {
+    if (entry === 'node_modules' || entry === 'dist' || entry === 'coverage' || entry === '.git') {
+      continue;
+    }
+    const entryPath = `${path}/${entry}`;
+    if (tree.isFile(entryPath)) {
+      const normalizedPath = entryPath.replaceAll('\\', '/');
+      if (normalizedPath.includes('/__tests__/')) {
+        return true;
+      }
+      if (/\.(?:test|spec)\.[cm]?[jt]sx?$/.test(entry)) {
+        return true;
+      }
+    } else {
+      if (directoryContainsTestFilesTree(tree, entryPath)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function validateBuildZigPolicyTree(tree: Tree, packagePath: string): NxPolicyIssue[] {
+  const path = `${packagePath}/build.zig`;
+  if (!tree.exists(path)) {
+    return [];
+  }
+  const content = tree.read(path, 'utf-8');
+  if (content && /\bb\.step\s*\(/.test(content)) {
+    return [];
+  }
+  return [{ path: packagePath, message: `${packagePath}/build.zig must define at least one b.step(...) target` }];
+}
+
+function validateTestEntrypointPresenceTree(
+  tree: Tree,
+  packagePath: string,
+  pkg: Record<string, unknown>,
+): NxPolicyIssue[] {
+  if (packagePath === '.') {
+    return [];
+  }
+  if (!directoryContainsTestFilesTree(tree, packagePath) || hasTestEntrypoint(pkg)) {
+    return [];
+  }
+  return [{ path: packagePath, message: `${packagePath}: test files require scripts.test or nx.targets.test` }];
+}
+
+/**
+ * Check package target policy using an Nx Tree.
+ * Uses `getProjects()` for project discovery instead of manual filesystem walking.
+ */
+export function checkPackageTargetPolicyTree(tree: Tree, options: PackageTargetPolicyOptions = {}): NxPolicyIssue[] {
+  const issues: NxPolicyIssue[] = [];
+  const workspaceNames = collectWorkspaceNamesTree(tree);
+
+  for (const [projectName, config] of getProjects(tree)) {
+    const pkgPath = `${config.root}/package.json`;
+    if (!tree.exists(pkgPath)) {
+      continue;
+    }
+    const pkg = readJson<Record<string, unknown>>(tree, pkgPath);
+    const packagePath = config.root;
+    const resolvedProject = options.resolvedTargetsByProject?.get(projectName);
+    const resolvedTargets = resolvedProjectTargetNames(resolvedProject);
+
+    issues.push(...validateExplicitNxTargets(pkg, packagePath, resolvedTargets));
+    issues.push(...validateTestEntrypointPresenceTree(tree, packagePath, pkg));
+    issues.push(...validateBuildZigPolicyTree(tree, packagePath));
+    issues.push(...validatePackageScriptPolicy(pkg, packagePath, workspaceNames, { resolvedTargets }));
+  }
+
+  return issues;
+}
+
+/**
+ * Apply package target policy using an Nx Tree.
+ * Uses `getProjects()` for project discovery and `updateJson()` for writes.
+ * Returns whether anything changed.
+ */
+export function applyPackageTargetPolicyTree(tree: Tree, options: PackageTargetPolicyOptions = {}): boolean {
+  let changed = false;
+  const workspaceNames = collectWorkspaceNamesTree(tree);
+
+  for (const [projectName, config] of getProjects(tree)) {
+    const pkgPath = `${config.root}/package.json`;
+    if (!tree.exists(pkgPath)) {
+      continue;
+    }
+    const packagePath = config.root;
+    const resolvedProject = options.resolvedTargetsByProject?.get(projectName);
+    const resolvedTargets = resolvedProjectTargetNames(resolvedProject);
+
+    updateJson(tree, pkgPath, (pkg: Record<string, unknown>) => {
+      let packageChanged = migratePackageColonTargets(pkg, resolvedTargets);
+      packageChanged = rewriteColonTargetDependenciesInPackage(pkg, resolvedTargets) || packageChanged;
+      packageChanged = removePackageColonTargets(pkg) || packageChanged;
+      packageChanged = removeRedundantNoopBuildTarget(pkg, resolvedProject) || packageChanged;
+      packageChanged =
+        applyPackageScriptPolicyForPkg(pkg, packagePath, workspaceNames, { resolvedTargets }) || packageChanged;
+      if (packageChanged) {
+        changed = true;
+      }
+      return pkg;
+    });
+  }
+
+  return changed;
+}
 
 function removePackageColonTargets(pkg: Record<string, unknown>): boolean {
   const nx = recordProperty(pkg, 'nx');
@@ -896,10 +940,6 @@ function removePackageColonTargets(pkg: Record<string, unknown>): boolean {
   }
   return changed;
 }
-
-// ---------------------------------------------------------------------------
-// Rewrite colon target dependencies across package
-// ---------------------------------------------------------------------------
 
 function rewriteColonTargetDependenciesInPackage(
   pkg: Record<string, unknown>,
@@ -931,10 +971,6 @@ function rewriteColonTargetDependenciesInPackage(
   }
   return changed;
 }
-
-// ---------------------------------------------------------------------------
-// Apply package script policy (rewrite scripts into Nx target aliases)
-// ---------------------------------------------------------------------------
 
 function applyPackageScriptPolicyForPkg(
   pkg: Record<string, unknown>,
@@ -1016,10 +1052,6 @@ function applyPackageScriptPolicyForPkg(
   return changed;
 }
 
-// ---------------------------------------------------------------------------
-// Per-package check/apply API
-// ---------------------------------------------------------------------------
-
 export function checkPackageTargets(
   pkg: Record<string, unknown>,
   packagePath: string,
@@ -1040,10 +1072,6 @@ export function applyPackageTargets(
   changed = applyPackageScriptPolicyForPkg(pkg, packagePath, workspaceNames, options) || changed;
   return changed;
 }
-
-// ---------------------------------------------------------------------------
-// Workspace-level check
-// ---------------------------------------------------------------------------
 
 export function checkPackageTargetPolicy(root: string, options: PackageTargetPolicyOptions = {}): NxPolicyIssue[] {
   const issues: NxPolicyIssue[] = [];
@@ -1067,10 +1095,6 @@ export function checkPackageTargetPolicy(root: string, options: PackageTargetPol
 
   return issues;
 }
-
-// ---------------------------------------------------------------------------
-// Workspace-level apply
-// ---------------------------------------------------------------------------
 
 export function applyPackageTargetPolicy(root: string, options: PackageTargetPolicyOptions = {}): boolean {
   let changed = false;

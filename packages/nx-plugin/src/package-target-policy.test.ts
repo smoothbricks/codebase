@@ -1,12 +1,17 @@
-import { describe, expect, it } from 'bun:test';
+import { beforeEach, describe, expect, it } from 'bun:test';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
+import { addProjectConfiguration, readJson, type Tree } from 'nx/src/devkit-exports.js';
+import { createTreeWithEmptyWorkspace } from 'nx/src/devkit-testing-exports.js';
+
 import {
   applyPackageTargetPolicy,
+  applyPackageTargetPolicyTree,
   applyPackageTargets,
   checkPackageTargetPolicy,
+  checkPackageTargetPolicyTree,
   checkPackageTargets,
   nxRunAlias,
   packageNxProjectName,
@@ -433,6 +438,337 @@ describe('packageNxProjectName', () => {
 
   it('returns null for anonymous packages', () => {
     expect(packageNxProjectName({})).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tree-based tests
+// ---------------------------------------------------------------------------
+
+function addProject(tree: Tree, name: string, root: string, options: { keepProjectJson?: boolean } = {}): void {
+  addProjectConfiguration(tree, name, {
+    root,
+    sourceRoot: `${root}/src`,
+    projectType: 'library',
+    targets: {},
+  });
+  if (!options.keepProjectJson && tree.exists(`${root}/project.json`)) {
+    tree.delete(`${root}/project.json`);
+  }
+}
+
+function writeJsonFile(tree: Tree, filePath: string, value: unknown): void {
+  tree.write(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+describe('checkPackageTargetPolicyTree', () => {
+  let tree: Tree;
+
+  beforeEach(() => {
+    tree = createTreeWithEmptyWorkspace();
+  });
+
+  it('detects colon-style Nx targets', () => {
+    addProject(tree, 'app', 'packages/app');
+    writeJsonFile(tree, 'packages/app/package.json', {
+      name: '@scope/app',
+      nx: {
+        name: 'app',
+        targets: {
+          'build:ts': {
+            executor: 'nx:run-commands',
+            options: { command: 'tsc --build tsconfig.lib.json', cwd: '{projectRoot}' },
+          },
+          'lint:fix': {
+            executor: 'nx:run-commands',
+            options: { command: 'biome check --apply', cwd: '{projectRoot}' },
+          },
+        },
+      },
+    });
+
+    const issues = checkPackageTargetPolicyTree(tree);
+    expect(issues.length).toBeGreaterThanOrEqual(2);
+    expect(issues.some((i) => i.message.includes('build:ts') && i.message.includes('colon target names'))).toBe(true);
+    expect(issues.some((i) => i.message.includes('lint:fix') && i.message.includes('colon target names'))).toBe(true);
+  });
+
+  it('validates build.zig has steps', () => {
+    addProject(tree, 'wasm', 'packages/wasm');
+    writeJsonFile(tree, 'packages/wasm/package.json', {
+      name: '@scope/wasm',
+      nx: { name: 'wasm' },
+    });
+    tree.write('packages/wasm/build.zig', 'const std = @import("std");\n');
+
+    const issues = checkPackageTargetPolicyTree(tree);
+    expect(issues.some((i) => i.message.includes('build.zig must define at least one b.step'))).toBe(true);
+  });
+
+  it('passes build.zig with valid steps', () => {
+    addProject(tree, 'wasm', 'packages/wasm');
+    writeJsonFile(tree, 'packages/wasm/package.json', {
+      name: '@scope/wasm',
+      nx: { name: 'wasm' },
+    });
+    tree.write('packages/wasm/build.zig', 'const step = b.step("wasm", "Build wasm");\n');
+
+    const issues = checkPackageTargetPolicyTree(tree);
+    expect(issues.filter((i) => i.message.includes('build.zig'))).toEqual([]);
+  });
+
+  it('requires test entrypoint when test files exist', () => {
+    addProject(tree, 'lib', 'packages/lib');
+    writeJsonFile(tree, 'packages/lib/package.json', {
+      name: '@scope/lib',
+      nx: { name: 'lib' },
+    });
+    tree.write('packages/lib/src/example.test.ts', 'import { test } from "bun:test";\n');
+
+    const issues = checkPackageTargetPolicyTree(tree);
+    expect(issues.some((i) => i.message.includes('test files require scripts.test or nx.targets.test'))).toBe(true);
+  });
+
+  it('accepts packages with test entrypoint', () => {
+    addProject(tree, 'lib', 'packages/lib');
+    writeJsonFile(tree, 'packages/lib/package.json', {
+      name: '@scope/lib',
+      scripts: { test: 'bun test' },
+      nx: { name: 'lib' },
+    });
+    tree.write('packages/lib/src/example.test.ts', 'import { test } from "bun:test";\n');
+
+    const issues = checkPackageTargetPolicyTree(tree);
+    expect(issues.filter((i) => i.message.includes('test files require'))).toEqual([]);
+  });
+
+  it('accepts wildcard aggregate build dependencies', () => {
+    addProject(tree, 'lib', 'packages/lib');
+    writeJsonFile(tree, 'packages/lib/package.json', {
+      name: '@scope/lib',
+      nx: {
+        name: 'lib',
+        targets: {
+          build: {
+            executor: 'nx:noop',
+            dependsOn: ['^build', '*-js', '*-wasm'],
+          },
+        },
+      },
+    });
+
+    const issues = checkPackageTargetPolicyTree(tree);
+    const buildIssues = issues.filter((i) => i.message.includes('dependsOn references missing target'));
+    expect(buildIssues).toEqual([]);
+  });
+
+  it('rejects recursive script commands', () => {
+    addProject(tree, 'app', 'packages/app');
+    addProject(tree, 'lib', 'packages/lib');
+    writeJsonFile(tree, 'packages/app/package.json', {
+      name: '@scope/app',
+      dependencies: { '@scope/lib': 'workspace:*' },
+      scripts: {
+        dev: 'nx run app:dev --tui=false --outputStyle=stream',
+      },
+      nx: {
+        name: 'app',
+        targets: {
+          dev: {
+            executor: 'nx:run-commands',
+            dependsOn: ['^build'],
+            continuous: true,
+            options: { command: 'bun run dev', cwd: '{projectRoot}' },
+          },
+        },
+      },
+    });
+    writeJsonFile(tree, 'packages/lib/package.json', {
+      name: '@scope/lib',
+      nx: { name: 'lib' },
+    });
+
+    const issues = checkPackageTargetPolicyTree(tree);
+    expect(issues.some((i) => i.message.includes('options.command must not call scripts.dev'))).toBe(true);
+  });
+});
+
+describe('applyPackageTargetPolicyTree', () => {
+  let tree: Tree;
+
+  beforeEach(() => {
+    tree = createTreeWithEmptyWorkspace();
+  });
+
+  it('migrates colon build targets to tool-output names', () => {
+    addProject(tree, 'lib', 'packages/lib');
+    addProject(tree, 'other', 'packages/other');
+    writeJsonFile(tree, 'packages/lib/package.json', {
+      name: '@scope/lib',
+      dependencies: { '@scope/other': 'workspace:*' },
+      scripts: {
+        'build:ts': 'nx run lib:build:ts',
+      },
+      nx: {
+        name: 'lib',
+        targets: {
+          'build:ts': {
+            executor: 'nx:run-commands',
+            options: { command: 'tsc --build tsconfig.lib.json', cwd: '{projectRoot}' },
+          },
+          build: {
+            executor: 'nx:noop',
+            dependsOn: ['^build', 'build:ts'],
+          },
+        },
+      },
+    });
+    writeJsonFile(tree, 'packages/other/package.json', {
+      name: '@scope/other',
+    });
+
+    expect(applyPackageTargetPolicyTree(tree)).toBe(true);
+
+    const lib = readJson(tree, 'packages/lib/package.json');
+    const targets = lib.nx.targets;
+    expect(targets['build:ts']).toBeUndefined();
+    expect(targets['tsc-js']).toBeDefined();
+    expect(targets['tsc-js'].options.command).toBe('tsc --build tsconfig.lib.json');
+    expect(targets.build.dependsOn).toContain('tsc-js');
+    expect(targets.build.dependsOn).not.toContain('build:ts');
+    expect(lib.scripts['build:ts']).toBe('nx run lib:tsc-js');
+  });
+
+  it('removes noop aggregate build targets matching resolved plugin output', () => {
+    addProject(tree, 'lib', 'packages/lib');
+    writeJsonFile(tree, 'packages/lib/package.json', {
+      name: '@scope/lib',
+      nx: {
+        name: 'lib',
+        targets: {
+          build: {
+            executor: 'nx:noop',
+            dependsOn: ['^build', '*-js'],
+          },
+        },
+      },
+    });
+
+    const resolvedTargetsByProject = new Map<string, ResolvedProjectTargets>([
+      [
+        'lib',
+        {
+          targets: new Set(['build', 'tsc-js']),
+          buildDependsOn: ['^build', '*-js'],
+        },
+      ],
+    ]);
+
+    expect(applyPackageTargetPolicyTree(tree, { resolvedTargetsByProject })).toBe(true);
+
+    const lib = readJson(tree, 'packages/lib/package.json');
+    expect(lib.nx.targets.build).toBeUndefined();
+  });
+
+  it('keeps non-noop build targets even when dependsOn matches', () => {
+    addProject(tree, 'lib', 'packages/lib');
+    writeJsonFile(tree, 'packages/lib/package.json', {
+      name: '@scope/lib',
+      nx: {
+        name: 'lib',
+        targets: {
+          build: {
+            executor: 'nx:run-commands',
+            dependsOn: ['^build', '*-js'],
+            options: { command: 'echo build', cwd: '{projectRoot}' },
+          },
+        },
+      },
+    });
+
+    const resolvedTargetsByProject = new Map<string, ResolvedProjectTargets>([
+      [
+        'lib',
+        {
+          targets: new Set(['build', 'tsc-js']),
+          buildDependsOn: ['^build', '*-js'],
+        },
+      ],
+    ]);
+
+    expect(applyPackageTargetPolicyTree(tree, { resolvedTargetsByProject })).toBe(false);
+
+    const lib = readJson(tree, 'packages/lib/package.json');
+    expect(lib.nx.targets.build).toBeDefined();
+    expect(lib.nx.targets.build.options.command).toBe('echo build');
+  });
+
+  it('rewrites safe scripts into Nx aliases', () => {
+    addProject(tree, 'web', 'packages/web');
+    addProject(tree, 'lib', 'packages/lib');
+    writeJsonFile(tree, 'packages/web/package.json', {
+      name: '@scope/web',
+      dependencies: { '@scope/lib': 'workspace:*' },
+      scripts: {
+        dev: 'astro dev',
+        build: 'astro build',
+      },
+      nx: { name: 'web' },
+    });
+    writeJsonFile(tree, 'packages/lib/package.json', {
+      name: '@scope/lib',
+      nx: { name: 'lib' },
+    });
+
+    expect(applyPackageTargetPolicyTree(tree)).toBe(true);
+
+    const web = readJson(tree, 'packages/web/package.json');
+    expect(web.scripts.dev).toBe('nx run web:dev --tui=false --outputStyle=stream');
+    expect(web.scripts.build).toBe('nx run web:build');
+    expect(web.nx.targets.dev.continuous).toBe(true);
+    expect(web.nx.targets.dev.executor).toBe('nx:run-commands');
+    expect(web.nx.targets.dev.options.command).toBe('astro dev');
+    expect(web.nx.targets.build.executor).toBe('nx:run-commands');
+    expect(web.nx.targets.build.options.command).toBe('astro build');
+  });
+
+  it('moves env assignments into target options', () => {
+    addProject(tree, 'web', 'packages/web');
+    addProject(tree, 'lib', 'packages/lib');
+    writeJsonFile(tree, 'packages/web/package.json', {
+      name: '@scope/web',
+      dependencies: { '@scope/lib': 'workspace:*' },
+      scripts: {
+        dev: "NODE_OPTIONS='--max-old-space-size=4096' astro dev",
+      },
+      nx: { name: 'web' },
+    });
+    writeJsonFile(tree, 'packages/lib/package.json', {
+      name: '@scope/lib',
+      nx: { name: 'lib' },
+    });
+
+    expect(applyPackageTargetPolicyTree(tree)).toBe(true);
+
+    const web = readJson(tree, 'packages/web/package.json');
+    expect(web.nx.targets.dev.options.command).toBe('astro dev');
+    expect(web.nx.targets.dev.options.env).toEqual({ NODE_OPTIONS: '--max-old-space-size=4096' });
+  });
+
+  it('returns false when no changes needed', () => {
+    addProject(tree, 'lib', 'packages/lib');
+    writeJsonFile(tree, 'packages/lib/package.json', {
+      name: '@scope/lib',
+      nx: { name: 'lib' },
+    });
+
+    expect(applyPackageTargetPolicyTree(tree)).toBe(false);
+  });
+
+  it('skips projects without package.json', () => {
+    addProject(tree, 'native', 'packages/native', { keepProjectJson: true });
+    // No package.json written — should not throw
+    expect(applyPackageTargetPolicyTree(tree)).toBe(false);
   });
 });
 
