@@ -7,7 +7,11 @@ import {
   updateJson,
 } from 'nx/src/devkit-exports.js';
 
-import { applyBoundedTestTargetPolicy, type BoundedTestPolicyPackageJson } from '../../bounded-test-policy.js';
+import {
+  applyBoundedTestTargetPolicy,
+  type BoundedTestPolicyPackageJson,
+  type BoundedTestPolicyProjectJson,
+} from '../../bounded-test-policy.js';
 
 interface BoundedTestTargetsGeneratorSchema {
   project: string;
@@ -16,15 +20,24 @@ interface BoundedTestTargetsGeneratorSchema {
 export default async function generator(tree: Tree, schema: BoundedTestTargetsGeneratorSchema): Promise<void> {
   const resolved = resolveProject(tree, schema.project);
   const packageJsonPath = joinPathFragments(resolved.root, 'package.json');
+  const projectJsonPath = joinPathFragments(resolved.root, 'project.json');
 
   if (!tree.exists(packageJsonPath)) {
     throw new Error(`Project ${resolved.name} is missing ${packageJsonPath}`);
   }
 
+  const projectJson = tree.exists(projectJsonPath)
+    ? readJson<BoundedTestPolicyProjectJson>(tree, projectJsonPath)
+    : undefined;
+
   updateJson<BoundedTestPolicyPackageJson>(tree, packageJsonPath, (packageJson) => {
-    applyBoundedTestTargetPolicy(packageJson, { projectName: resolved.name });
+    applyBoundedTestTargetPolicy(packageJson, { projectName: resolved.name, projectJson });
     return packageJson;
   });
+
+  if (projectJson) {
+    updateJson<BoundedTestPolicyProjectJson>(tree, projectJsonPath, () => projectJson);
+  }
 }
 
 function resolveProject(tree: Tree, projectInput: string): { name: string; root: string } {
