@@ -10,7 +10,6 @@ if (!devenvRoot) {
 
 const projectRoot = path.resolve(devenvRoot, '../..');
 process.chdir(projectRoot);
-process.env.PATH = `${path.join(projectRoot, 'tooling')}:${path.join(projectRoot, 'node_modules/.bin')}:${process.env.PATH ?? ''}`;
 
 await import('./setup-environment.ts');
 await rebuildNxPluginIfStale();
