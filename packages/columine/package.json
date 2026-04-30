@@ -22,7 +22,7 @@
     "build:zig": "nx run columine:zig-wasm",
     "build:ts": "nx run columine:tsc-js",
     "build": "bun run build:ts && bun run build:zig",
-    "test": "nx run columine:test"
+    "test": "nx run columine:test --tui=false --outputStyle=stream"
   },
   "nx": {
     "targets": {
@@ -34,10 +34,12 @@
         ]
       },
       "test": {
-        "executor": "nx:run-commands",
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
           "command": "bun test src/__tests__/columine-integration.test.ts",
-          "cwd": "{projectRoot}"
+          "cwd": "{projectRoot}",
+          "timeoutMs": 600000,
+          "killAfterMs": 10000
         }
       }
     },
@@ -48,7 +50,7 @@
   },
   "devDependencies": {
     "@smoothbricks/validation": "workspace:*",
-    "typescript": "^5.9.3"
+    "typescript": "^6.0.3"
   },
   "license": "MIT",
   "publishConfig": {

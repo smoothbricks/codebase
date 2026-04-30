@@ -30,7 +30,7 @@
     "tamagui": ">=2.0.0-rc.0"
   },
   "scripts": {
-    "test": "nx run lmao-inspector:test"
+    "test": "nx run lmao-inspector:test --tui=false --outputStyle=stream"
   },
   "devDependencies": {
     "@smoothbricks/lmao": "workspace:*",
@@ -42,10 +42,12 @@
     "targets": {
       "lint": {},
       "test": {
-        "executor": "nx:run-commands",
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
           "command": "bun test --pass-with-no-tests",
-          "cwd": "{projectRoot}"
+          "cwd": "{projectRoot}",
+          "timeoutMs": 600000,
+          "killAfterMs": 10000
         }
       }
     },

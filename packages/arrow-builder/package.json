@@ -55,10 +55,12 @@
         ]
       },
       "test": {
-        "executor": "nx:run-commands",
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
           "command": "bun test",
-          "cwd": "packages/arrow-builder"
+          "cwd": "{projectRoot}",
+          "timeoutMs": 600000,
+          "killAfterMs": 10000
         }
       }
     },
@@ -75,5 +77,8 @@
     "type": "git",
     "url": "git+https://github.com/smoothbricks/codebase.git",
     "directory": "packages/arrow-builder"
+  },
+  "scripts": {
+    "test": "nx run arrow-builder:test --tui=false --outputStyle=stream"
   }
 }

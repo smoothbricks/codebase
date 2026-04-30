@@ -7,16 +7,18 @@
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
-    "test": "nx run money:test"
+    "test": "nx run money:test --tui=false --outputStyle=stream"
   },
   "nx": {
     "targets": {
       "lint": {},
       "test": {
-        "executor": "nx:run-commands",
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
           "command": "bun test",
-          "cwd": "{projectRoot}"
+          "cwd": "{projectRoot}",
+          "timeoutMs": 600000,
+          "killAfterMs": 10000
         }
       }
     },

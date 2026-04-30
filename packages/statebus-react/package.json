@@ -54,16 +54,18 @@
     "react": ">=18.0.0"
   },
   "scripts": {
-    "test": "nx run statebus-react:test"
+    "test": "nx run statebus-react:test --tui=false --outputStyle=stream"
   },
   "nx": {
     "targets": {
       "lint": {},
       "test": {
-        "executor": "nx:run-commands",
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
           "command": "bun test",
-          "cwd": "{projectRoot}"
+          "cwd": "{projectRoot}",
+          "timeoutMs": 600000,
+          "killAfterMs": 10000
         }
       }
     },
