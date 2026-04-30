@@ -9,7 +9,8 @@ target `tsc-js`; this plugin must not duplicate or rename that target.
 
 `@smoothbricks/nx-plugin` owns only inferred targets Nx does not provide here:
 
-- `typecheck-tests` from `tsconfig.test.json` for packages that use Bun test
+- `typecheck-tests` and `typecheck-tests:watch` from `tsconfig.test.json`
+- `test:watch` from explicit `test` commands for Bun and Vitest packages
 - `zig-*` targets from `build.zig` steps such as `zig-wasm`
 - aggregate `build` and `lint` targets
 
@@ -19,8 +20,10 @@ Target names are tool-output names. Use names like `tsc-js` and `zig-wasm`; `bui
 
 Concrete targets come from concrete files:
 
-- `typecheck-tests` is inferred from `tsconfig.test.json`. Smoo requires that config for packages that use `bun test`
-  because Bun executes tests without typechecking.
+- `typecheck-tests` is inferred from `tsconfig.test.json` and runs `tsc --noEmit -p tsconfig.test.json`.
+- `typecheck-tests:watch` is inferred from `tsconfig.test.json` and runs the same typecheck in watch mode.
+- `test:watch` is inferred when the package already defines an explicit Bun or Vitest `test` command. The plugin derives
+  the corresponding watch command and makes it depend on `typecheck-tests`.
 - `zig-*` is inferred from `build.zig`; each explicit `b.step("name", ...)` becomes `zig-name`.
 - `build` is inferred only when the project has at least one concrete build target to run, such as `tsc-js` from the
   official TypeScript plugin or a `zig-*` target from this plugin.
@@ -35,9 +38,9 @@ target such as `nx run pkg:zig-wasm`.
 
 There is no Nx `lint:fix` target; repository formatting is handled by the root `lint:fix` script.
 
-`typecheck-tests` is inferred only when `tsconfig.test.json` exists. It runs TypeScript with `noEmit`; test typechecking
-must not emit `dist-test`. Smoo validation creates/requires this config for Bun test packages because `bun test` is not
-a typecheck command. Other test runners can satisfy test typechecking through their own toolchain.
+`typecheck-tests` and `typecheck-tests:watch` are inferred only when `tsconfig.test.json` exists. Test typechecking must
+not emit `dist-test`. `test:watch` is continuous and depends on `typecheck-tests` before entering Bun or Vitest watch
+mode. Smoo validation creates/requires this config for test runners that do not typecheck test files by default.
 
 `tsconfig.test.json` is not a TypeScript build-mode project. It should reference library tsconfigs it needs to typecheck
 against, but the package root `tsconfig.json` should not reference `./tsconfig.test.json`. Nx runs test typechecking

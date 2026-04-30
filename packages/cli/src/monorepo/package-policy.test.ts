@@ -500,10 +500,34 @@ describe('workspace package script policy', () => {
     }
   });
 
-  it('does not require tsconfig.test.json for non-Bun test runners', async () => {
+  it('creates no-emit test typecheck config for packages that use vitest', async () => {
     const root = await createWorkspace({
       rootName: '@smoothbricks/codebase',
       packages: [{ dir: 'app', name: '@smoothbricks/app', scripts: { test: 'vitest run' } }],
+    });
+    try {
+      await writeJson(join(root, 'packages/app/tsconfig.lib.json'), {
+        extends: '../../tsconfig.base.json',
+        compilerOptions: { baseUrl: '.', rootDir: 'src', outDir: 'dist' },
+      });
+
+      expect(validateWorkspaceDependencies(root)).toBe(1);
+
+      applyWorkspaceDependencyDefaults(root);
+
+      const testTsconfig = await readJson(join(root, 'packages/app/tsconfig.test.json'));
+      expect(testTsconfig.compilerOptions).toMatchObject({ noEmit: true });
+      expect(testTsconfig.compilerOptions?.types).toBeUndefined();
+      expect(validateWorkspaceDependencies(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not require tsconfig.test.json for other test runners', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [{ dir: 'app', name: '@smoothbricks/app', scripts: { test: 'node --test' } }],
     });
     try {
       expect(validateWorkspaceDependencies(root)).toBe(0);
@@ -559,6 +583,21 @@ describe('workspace package script policy', () => {
     }
   });
 
+  it('requires a test script or target when test files exist', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [{ dir: 'app', name: '@smoothbricks/app' }],
+    });
+    try {
+      await mkdir(join(root, 'packages/app/src'), { recursive: true });
+      await writeFile(join(root, 'packages/app/src/example.test.ts'), 'export const testValue = true;\n');
+
+      expect(validateWorkspaceDependencies(root)).toBe(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('rewrites safe scripts that use workspace dependencies into Nx aliases', async () => {
     const root = await createWorkspace({
       rootName: '@smoothbricks/codebase',
@@ -590,7 +629,7 @@ describe('workspace package script policy', () => {
       expect(app.scripts).toEqual({
         dev: 'nx run app:dev --tui=false --outputStyle=stream',
         serve: 'nx run app:serve --tui=false --outputStyle=stream',
-        test: 'nx run app:test',
+        test: 'nx run app:test --tui=false --outputStyle=stream',
         build: 'nx run app:build',
         deploy: 'wrangler deploy',
         astro: 'astro',
@@ -651,7 +690,7 @@ describe('workspace package script policy', () => {
       ],
     });
     try {
-      expect(validateWorkspaceDependencies(root)).toBe(2);
+      expect(validateWorkspaceDependencies(root)).toBe(1);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -742,7 +781,7 @@ describe('workspace package script policy', () => {
       applyWorkspaceDependencyDefaults(root);
 
       const app = await readJson(join(root, 'packages/app/package.json'));
-      expect(app.scripts).toEqual({ test: 'nx run @external/app:test' });
+      expect(app.scripts).toEqual({ test: 'nx run @external/app:test --tui=false --outputStyle=stream' });
       expect(app.nx).toEqual({
         name: '@external/app',
         targets: {

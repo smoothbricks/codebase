@@ -66,7 +66,15 @@ describe('bun-test-tracing generator', () => {
     );
 
     const packageJson = readJson(tree, 'packages/example/package.json');
-    expect(packageJson.scripts?.test).toBe('bun test');
+    expect(packageJson.scripts?.test).toBe('nx run example:test --tui=false --outputStyle=stream');
+    expect(packageJson.nx?.targets?.test).toEqual({
+      executor: 'nx:run-commands',
+      dependsOn: ['typecheck-tests', '^build'],
+      options: {
+        command: 'bun test',
+        cwd: '{projectRoot}',
+      },
+    });
     expect(
       packageJson.dependencies?.['@smoothbricks/lmao'] ?? packageJson.devDependencies?.['@smoothbricks/lmao'],
     ).toBe('workspace:*');
@@ -148,6 +156,14 @@ describe('bun-test-tracing generator', () => {
       },
       nx: {
         targets: {
+          test: {
+            executor: 'nx:run-commands',
+            dependsOn: ['typecheck-tests', '^build'],
+            options: {
+              command: 'bun test',
+              cwd: '{projectRoot}',
+            },
+          },
           lint: {},
         },
       },
@@ -175,6 +191,9 @@ describe('bun-test-tracing generator', () => {
     expect(bunfig).toContain('timeout = 10');
     expect(bunfig).toContain('@smoothbricks/lmao/bun/preload');
     expect(bunfig).toContain('@smoothbricks/lmao/bun/trace-preload');
+
+    const packageJson = readJson(tree, 'packages/example/package.json');
+    expect(packageJson.scripts?.test).toBe('nx run example:test --tui=false --outputStyle=stream');
 
     const tsconfigTest = readJson(tree, 'packages/example/tsconfig.test.json') as {
       extends?: string;
