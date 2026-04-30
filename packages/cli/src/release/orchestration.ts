@@ -11,6 +11,7 @@ export interface ReleaseSummary<Package extends ReleasePackageInfo = ReleasePack
   published: Package[];
   alreadyPublished: Package[];
   githubReleases: Package[];
+  githubReleaseLinks: Array<{ pkg: Package; url: string }>;
   rerunRequired: boolean;
   noRelease: boolean;
 }
@@ -22,7 +23,7 @@ export interface ReleaseCompletionShell<Package extends ReleasePackageInfo = Rel
   buildReleaseCandidate(packages: Package[]): Promise<void>;
   publishPackage(pkg: Package, distTag: string, dryRun: boolean): Promise<void>;
   listGithubMissingPackages(packages: Package[]): Promise<Package[]>;
-  createGithubRelease(pkg: Package, dryRun: boolean): Promise<void>;
+  createGithubRelease(pkg: Package, dryRun: boolean): Promise<string | null>;
 }
 
 export interface ReleaseNextShell<Package extends ReleasePackageInfo = ReleasePackageInfo> {
@@ -42,7 +43,7 @@ export interface ReleaseVersionShell<Package extends ReleasePackageInfo = Releas
   releaseVersionPackages(bump: string): Promise<Package[]>;
   ensureLocalReleaseTags(packages: Package[]): Promise<void>;
   gitHead(): Promise<string>;
-  runNxReleaseVersion(packages: Package[], bump: string, dryRun: boolean): Promise<void>;
+  runNxReleaseVersion(packages: Package[], bump: string, dryRun: boolean): Promise<Package[]>;
   assertCleanGitTree(): Promise<void>;
 }
 
@@ -74,9 +75,9 @@ export async function runReleaseVersion<Package extends ReleasePackageInfo>(
   }
 
   const headBeforeVersioning = await shell.gitHead();
-  await shell.runNxReleaseVersion(versionPackages, options.bump, options.dryRun);
+  const dryRunPackages = await shell.runNxReleaseVersion(versionPackages, options.bump, options.dryRun);
   if (options.dryRun) {
-    return { mode: 'none', packages: [], status: 'dry-run' };
+    return { mode: 'none', packages: dryRunPackages, status: 'dry-run' };
   }
 
   await shell.assertCleanGitTree();
@@ -172,6 +173,7 @@ function repairDryRunSummary<Package extends ReleasePackageInfo>(
     published: [],
     alreadyPublished: target.packages.filter((pkg) => !target.npmPackages.includes(pkg)),
     githubReleases: [],
+    githubReleaseLinks: [],
     rerunRequired: false,
     noRelease: false,
   };
@@ -216,8 +218,12 @@ async function completePlannedRelease<Package extends ReleasePackageInfo>(
   for (const { pkg, distTag } of plan.publishPackages) {
     await shell.publishPackage(pkg, distTag, input.dryRun);
   }
+  const githubReleaseLinks: Array<{ pkg: Package; url: string }> = [];
   for (const pkg of plan.githubReleasePackages) {
-    await shell.createGithubRelease(pkg, input.dryRun);
+    const url = await shell.createGithubRelease(pkg, input.dryRun);
+    if (url) {
+      githubReleaseLinks.push({ pkg, url });
+    }
   }
 
   return {
@@ -228,6 +234,7 @@ async function completePlannedRelease<Package extends ReleasePackageInfo>(
     published: input.dryRun ? [] : plan.publishPackages.map((action) => action.pkg),
     alreadyPublished: input.packages.filter((pkg) => !input.npmMissingPackages.includes(pkg)),
     githubReleases: input.dryRun ? [] : plan.githubReleasePackages,
+    githubReleaseLinks,
     rerunRequired: input.rerunRequired,
     noRelease: false,
   };

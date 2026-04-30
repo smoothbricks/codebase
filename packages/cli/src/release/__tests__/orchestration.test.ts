@@ -71,6 +71,7 @@ describe('release orchestration', () => {
         published: [],
         alreadyPublished: [prerelease],
         githubReleases: [],
+        githubReleaseLinks: [],
         rerunRequired: false,
         noRelease: false,
       },
@@ -91,6 +92,9 @@ describe('release orchestration', () => {
     expect(summary.published.map((pkg) => pkg.name)).toEqual(['@scope/stable']);
     expect(summary.alreadyPublished.map((pkg) => pkg.name)).toEqual(['@scope/prerelease']);
     expect(summary.githubReleases.map((pkg) => pkg.name)).toEqual(['@scope/prerelease']);
+    expect(summary.githubReleaseLinks).toEqual([
+      { pkg: prerelease, url: 'https://github.test/prerelease@2.0.0-beta.1' },
+    ]);
     expect(summary.rerunRequired).toBe(true);
   });
 
@@ -105,6 +109,7 @@ describe('release orchestration', () => {
     expect(summary.published).toEqual([]);
     expect(summary.alreadyPublished.map((pkg) => pkg.name)).toEqual(['@scope/stable', '@scope/prerelease']);
     expect(summary.githubReleases).toEqual([]);
+    expect(summary.githubReleaseLinks).toEqual([]);
   });
 
   it('does not run Nx versioning when HEAD is already a release target', async () => {
@@ -154,6 +159,16 @@ describe('release orchestration', () => {
 
     expect(result).toEqual({ mode: 'new', packages: [stable], status: 'new-release' });
     expect(shell.nxRuns).toEqual([{ packages: ['@scope/stable'], bump: 'auto', dryRun: false }]);
+  });
+
+  it('reports dry-run version packages resolved by Nx without creating a release mode', async () => {
+    const preview = { ...stable, version: '1.1.0' };
+    const shell = new RecordingVersionShell({ releasePackagesAtHead: [[]], releaseVersionPackages: [stable], preview });
+
+    const result = await runReleaseVersion(shell, { bump: 'auto', dryRun: true });
+
+    expect(result).toEqual({ mode: 'none', packages: [preview], status: 'dry-run' });
+    expect(shell.nxRuns).toEqual([{ packages: ['@scope/stable'], bump: 'auto', dryRun: true }]);
   });
 
   it('bumps stable release packages to next after publish completion', async () => {
@@ -237,8 +252,9 @@ class RecordingRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
     return packages.filter((pkg) => this.githubMissing.has(pkg.name));
   }
 
-  async createGithubRelease(pkg: ReleasePackageInfo, dryRun: boolean): Promise<void> {
+  async createGithubRelease(pkg: ReleasePackageInfo, dryRun: boolean): Promise<string | null> {
     this.githubCreates.push({ name: pkg.name, dryRun });
+    return dryRun ? null : `https://github.test/${releaseTag(pkg)}`;
   }
 
   async checkout(ref: string): Promise<void> {
@@ -259,15 +275,18 @@ class RecordingVersionShell implements ReleaseVersionShell<ReleasePackageInfo> {
   private readonly releaseBatches: ReleasePackageInfo[][];
   private readonly versionPackages: ReleasePackageInfo[];
   private readonly heads: string[];
+  private readonly preview: ReleasePackageInfo[];
 
   constructor(options: {
     releasePackagesAtHead: ReleasePackageInfo[][];
     releaseVersionPackages?: ReleasePackageInfo[];
     heads?: string[];
+    preview?: ReleasePackageInfo | ReleasePackageInfo[];
   }) {
     this.releaseBatches = [...options.releasePackagesAtHead];
     this.versionPackages = options.releaseVersionPackages ?? [stable, prerelease];
     this.heads = [...(options.heads ?? [])];
+    this.preview = Array.isArray(options.preview) ? options.preview : options.preview ? [options.preview] : [];
   }
 
   async releasePackagesAtHead(): Promise<ReleasePackageInfo[]> {
@@ -286,8 +305,13 @@ class RecordingVersionShell implements ReleaseVersionShell<ReleasePackageInfo> {
     return this.heads.shift() ?? 'head';
   }
 
-  async runNxReleaseVersion(packages: ReleasePackageInfo[], bump: string, dryRun: boolean): Promise<void> {
+  async runNxReleaseVersion(
+    packages: ReleasePackageInfo[],
+    bump: string,
+    dryRun: boolean,
+  ): Promise<ReleasePackageInfo[]> {
     this.nxRuns.push({ packages: packageNames(packages), bump, dryRun });
+    return this.preview;
   }
 
   async assertCleanGitTree(): Promise<void> {

@@ -112,7 +112,7 @@ function isPrereleaseVersion(version: string): boolean {
   return version.includes('-');
 }
 
-async function withNxWorkspaceRoot<T>(root: string, run: () => Promise<T>): Promise<T> {
+export async function withNxWorkspaceRoot<T>(root: string, run: () => Promise<T>): Promise<T> {
   const workspaceRootModule = await import('nx/src/utils/workspace-root.js');
   const previousWorkspaceRoot = workspaceRootModule.workspaceRoot;
   const previousEnvWorkspaceRoot = process.env.NX_WORKSPACE_ROOT_PATH;
