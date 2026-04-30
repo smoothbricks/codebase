@@ -1,3 +1,5 @@
+// Promote a private package to npm publication. Invoked by `smoo g make-public <name>`.
+// CLI wiring: packages/cli/src/generate/index.ts (variant registry)
 import {
   getProjects,
   joinPathFragments,

@@ -1,3 +1,5 @@
+// Scaffold a new workspace package. Invoked by `smoo g ts-lib|ts-zig <name>`.
+// CLI wiring: packages/cli/src/generate/index.ts (variant registry)
 import { readJson, type Tree, writeJson } from 'nx/src/devkit-exports.js';
 
 import type { CreatePackageGeneratorSchema } from './schema.js';
