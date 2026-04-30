@@ -134,7 +134,7 @@ export function checkBoundedTestTargetPolicy(
 }
 
 export function boundedTestScriptAlias(projectName: string): string {
-  return `nx run ${projectName}:test --tui=false --outputStyle=stream`;
+  return `nx run ${projectName}:test --outputStyle=stream`;
 }
 
 export function resolveTestCommand(

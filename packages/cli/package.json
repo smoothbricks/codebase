@@ -7,7 +7,7 @@
     "smoo": "./bin/smoo"
   },
   "scripts": {
-    "test": "nx run cli:test --tui=false --outputStyle=stream"
+    "test": "nx run cli:test --outputStyle=stream"
   },
   "main": "./dist/index.js",
   "module": "./dist/index.js",

@@ -79,6 +79,6 @@
     "directory": "packages/arrow-builder"
   },
   "scripts": {
-    "test": "nx run arrow-builder:test --tui=false --outputStyle=stream"
+    "test": "nx run arrow-builder:test --outputStyle=stream"
   }
 }

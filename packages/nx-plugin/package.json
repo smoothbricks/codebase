@@ -53,7 +53,7 @@
   "generators": "./generators.json",
   "executors": "./executors.json",
   "scripts": {
-    "test": "nx run nx-plugin:test --tui=false --outputStyle=stream"
+    "test": "nx run nx-plugin:test --outputStyle=stream"
   },
   "nx": {
     "targets": {

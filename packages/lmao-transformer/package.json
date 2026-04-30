@@ -55,6 +55,6 @@
     "directory": "packages/lmao-transformer"
   },
   "scripts": {
-    "test": "nx run lmao-transformer:test --tui=false --outputStyle=stream"
+    "test": "nx run lmao-transformer:test --outputStyle=stream"
   }
 }

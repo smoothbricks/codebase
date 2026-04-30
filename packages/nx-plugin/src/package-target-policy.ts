@@ -295,7 +295,7 @@ export function nxRunAlias(projectName: string, targetName: string, continuous: 
   if (targetName === 'test') {
     return boundedTestScriptAlias(projectName);
   }
-  const flags = continuous || targetName === 'test' ? ' --tui=false --outputStyle=stream' : '';
+  const flags = continuous || targetName === 'test' ? ' --outputStyle=stream' : '';
   return `nx run ${projectName}:${targetName}${flags}`;
 }
 

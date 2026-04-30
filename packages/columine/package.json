@@ -22,7 +22,7 @@
     "build:zig": "nx run columine:zig-wasm",
     "build:ts": "nx run columine:tsc-js",
     "build": "bun run build:ts && bun run build:zig",
-    "test": "nx run columine:test --tui=false --outputStyle=stream"
+    "test": "nx run columine:test --outputStyle=stream"
   },
   "nx": {
     "targets": {

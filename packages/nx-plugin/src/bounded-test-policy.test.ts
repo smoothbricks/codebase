@@ -44,7 +44,7 @@ describe('bounded test target policy', () => {
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
       },
     });
-    expect(packageJson.scripts?.test).toBe('nx run example:test --tui=false --outputStyle=stream');
+    expect(packageJson.scripts?.test).toBe('nx run example:test --outputStyle=stream');
   });
 
   it('uses a direct test script when no target command exists', () => {
@@ -63,7 +63,7 @@ describe('bounded test target policy', () => {
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
       },
     });
-    expect(packageJson.scripts?.test).toBe('nx run @scope/example:test --tui=false --outputStyle=stream');
+    expect(packageJson.scripts?.test).toBe('nx run @scope/example:test --outputStyle=stream');
   });
 
   it('normalizes project.json targets while reading package test scripts', () => {
@@ -104,7 +104,7 @@ describe('bounded test target policy', () => {
       executor: 'nx:run-commands',
       options: { command: 'bun test --package-target' },
     });
-    expect(packageJson.scripts?.test).toBe('nx run example:test --tui=false --outputStyle=stream');
+    expect(packageJson.scripts?.test).toBe('nx run example:test --outputStyle=stream');
   });
 
   it('creates project.json test targets from package test scripts', () => {
@@ -127,7 +127,7 @@ describe('bounded test target policy', () => {
       },
     });
     expect(packageJson.nx).toBeUndefined();
-    expect(packageJson.scripts?.test).toBe('nx run example:test --tui=false --outputStyle=stream');
+    expect(packageJson.scripts?.test).toBe('nx run example:test --outputStyle=stream');
   });
 
   it('requires bounded targets in project.json when project config exists', () => {
@@ -184,7 +184,7 @@ describe('bounded test target policy', () => {
       expect(applyWorkspaceBoundedTestTargetPolicy(root)).toBe(true);
 
       const app = JSON.parse(await readFile(join(root, 'packages/app/package.json'), 'utf8'));
-      expect(app.scripts.test).toBe('nx run app:test --tui=false --outputStyle=stream');
+      expect(app.scripts.test).toBe('nx run app:test --outputStyle=stream');
       expect(app.nx.targets.test).toEqual({
         executor: BOUNDED_TEST_EXECUTOR,
         options: {
@@ -233,7 +233,7 @@ describe('bounded test target policy', () => {
 
       const appPackage = JSON.parse(await readFile(join(root, 'packages/app/package.json'), 'utf8'));
       const appProject = JSON.parse(await readFile(join(root, 'packages/app/project.json'), 'utf8'));
-      expect(appPackage.scripts.test).toBe('nx run app:test --tui=false --outputStyle=stream');
+      expect(appPackage.scripts.test).toBe('nx run app:test --outputStyle=stream');
       expect(appPackage.nx).toBeUndefined();
       expect(appProject.targets.test).toEqual({
         executor: BOUNDED_TEST_EXECUTOR,

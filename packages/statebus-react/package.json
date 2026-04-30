@@ -54,7 +54,7 @@
     "react": ">=18.0.0"
   },
   "scripts": {
-    "test": "nx run statebus-react:test --tui=false --outputStyle=stream"
+    "test": "nx run statebus-react:test --outputStyle=stream"
   },
   "nx": {
     "targets": {
