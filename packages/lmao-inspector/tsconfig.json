@@ -4,12 +4,6 @@
   "include": [],
   "references": [
     {
-      "path": "../validation"
-    },
-    {
-      "path": "../lmao"
-    },
-    {
       "path": "./tsconfig.lib.json"
     }
   ]
