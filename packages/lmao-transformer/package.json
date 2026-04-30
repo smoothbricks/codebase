@@ -23,7 +23,7 @@
     "@smoothbricks/lmao": "workspace:*",
     "@smoothbricks/validation": "workspace:*",
     "@uwdata/flechette": "^2.3.0",
-    "typescript": "^5.9.3"
+    "typescript": "^6.0.3"
   },
   "nx": {
     "sourceRoot": "packages/lmao-transformer/src",
@@ -31,10 +31,12 @@
     "targets": {
       "lint": {},
       "test": {
-        "executor": "nx:run-commands",
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
           "command": "bun test --parallel=3",
-          "cwd": "packages/lmao-transformer"
+          "cwd": "{projectRoot}",
+          "timeoutMs": 600000,
+          "killAfterMs": 10000
         }
       }
     },
@@ -51,5 +53,8 @@
     "type": "git",
     "url": "git+https://github.com/smoothbricks/codebase.git",
     "directory": "packages/lmao-transformer"
+  },
+  "scripts": {
+    "test": "nx run lmao-transformer:test --tui=false --outputStyle=stream"
   }
 }

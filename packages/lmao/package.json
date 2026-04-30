@@ -126,7 +126,8 @@
   "scripts": {
     "bench": "bun run benchmarks/*.bench.ts",
     "bench:wasm": "bun run benchmarks/js-vs-wasm.bench.ts",
-    "build:wasm": "zig build -Doptimize=ReleaseSmall"
+    "build:wasm": "zig build -Doptimize=ReleaseSmall",
+    "test": "nx run lmao:test --tui=false --outputStyle=stream"
   },
   "nx": {
     "sourceRoot": "packages/lmao/src",
@@ -140,10 +141,12 @@
         ]
       },
       "test": {
-        "executor": "nx:run-commands",
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
           "command": "bun test",
-          "cwd": "packages/lmao"
+          "cwd": "{projectRoot}",
+          "timeoutMs": 600000,
+          "killAfterMs": 10000
         }
       }
     },
