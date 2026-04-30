@@ -2,7 +2,7 @@ import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 export const BOUNDED_TEST_EXECUTOR = '@smoothbricks/nx-plugin:bounded-exec';
-export const BOUNDED_TEST_TIMEOUT_MS = 600_000;
+export const BOUNDED_TEST_TIMEOUT_MS = 120_000;
 export const BOUNDED_TEST_KILL_AFTER_MS = 10_000;
 
 export interface BoundedTestPolicyPackageJson {

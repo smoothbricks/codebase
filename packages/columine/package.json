@@ -38,7 +38,7 @@
         "options": {
           "command": "bun test src/__tests__/columine-integration.test.ts",
           "cwd": "{projectRoot}",
-          "timeoutMs": 600000,
+          "timeoutMs": 120000,
           "killAfterMs": 10000
         }
       }

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from 'bun:test';
 import { addProjectConfiguration, readJson, type Tree } from 'nx/src/devkit-exports.js';
 import { createTreeWithEmptyWorkspace } from 'nx/src/devkit-testing-exports.js';
 
+import { BOUNDED_TEST_KILL_AFTER_MS, BOUNDED_TEST_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import generator from './generator.js';
 
 function referencePaths(references: Array<{ path: string }> | undefined): string[] {
@@ -73,8 +74,8 @@ describe('bun-test-tracing generator', () => {
       options: {
         command: 'bun test',
         cwd: '{projectRoot}',
-        timeoutMs: 600000,
-        killAfterMs: 10000,
+        timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+        killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
       },
     });
     expect(
