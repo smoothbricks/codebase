@@ -26,7 +26,11 @@ import {
   releaseTag,
   releaseTagAliases,
 } from './core.js';
-import { createOrUpdateGithubRelease, renderNxProjectChangelogContents } from './github-release.js';
+import {
+  createOrUpdateGithubRelease,
+  renderNxProjectChangelogContents,
+  withNxWorkspaceRoot,
+} from './github-release.js';
 import { publishWithAuthDiagnostics } from './npm-auth.js';
 import {
   bumpStableReleaseToNext,
@@ -99,6 +103,9 @@ export async function releaseVersion(root: string, options: ReleaseVersionOption
   } else if (result.status === 'no-release-needed') {
     console.log('Nx did not create a release commit; no release needed.');
   }
+  if (result.status === 'dry-run') {
+    await writeReleasePreviewSummary(root, packages, result.packages);
+  }
   await writeReleaseGithubOutput(options.githubOutput, result.packages, result.mode);
 }
 
@@ -107,15 +114,22 @@ export async function releasePublish(root: string, options: ReleasePublishOption
   const packages = await releasePackagesAtHead(root, releasePackages(root));
   if (packages.length === 0) {
     if (bump === 'auto') {
+      if (options.dryRun === true) {
+        console.log(
+          'No release tags found at HEAD because dry-run versioning does not create release commits or tags.',
+        );
+        return;
+      }
       console.log('No release tags found at HEAD; no release to publish.');
       const summary: ReleaseSummary<ReleasePackage> = {
         sha: await gitHead(root),
-        dryRun: options.dryRun === true,
+        dryRun: false,
         packages,
         pushed: false,
         published: [],
         alreadyPublished: [],
         githubReleases: [],
+        githubReleaseLinks: [],
         rerunRequired: false,
         noRelease: true,
       };
@@ -382,6 +396,7 @@ interface ReleaseState {
 }
 
 type ReleasePackage = ReturnType<typeof listReleasePackages>[number];
+const releasePreviewChangelogs = new Map<string, string>();
 
 type ReleaseTarget = CoreReleaseTarget<ReleasePackage>;
 type ReleaseTagRecord = CoreReleaseTagRecord<ReleasePackage>;
@@ -527,7 +542,16 @@ async function releaseVersionPackages(
   );
 }
 
-async function runNxReleaseVersion(root: string, projects: string, bump: string, dryRun: boolean): Promise<void> {
+async function runNxReleaseVersion(
+  root: string,
+  projects: string,
+  bump: string,
+  dryRun: boolean,
+): Promise<ReleasePackage[]> {
+  if (dryRun) {
+    return runNxReleaseVersionPreview(root, projects, bump);
+  }
+
   // Nx owns local release mutation: package versions, bun.lock updates, the
   // release commit, and annotated tags. smoo owns remote publication after the
   // workflow validates the exact release commit Nx produced.
@@ -536,10 +560,60 @@ async function runNxReleaseVersion(root: string, projects: string, bump: string,
     nxArgs.push(bump);
   }
   nxArgs.push(`--projects=${projects}`, '--git-commit=true', '--git-tag=true', '--git-push=false');
-  if (dryRun) {
-    nxArgs.push('--dry-run');
-  }
   await run('nx', nxArgs, root);
+  return [];
+}
+
+async function runNxReleaseVersionPreview(root: string, projects: string, bump: string): Promise<ReleasePackage[]> {
+  return withNxWorkspaceRoot(root, async () => {
+    const { createAPI } = await import('nx/src/command-line/release/version.js');
+    const { createAPI: createChangelogAPI } = await import('nx/src/command-line/release/changelog.js');
+    const projectNames = projects.split(',').filter(Boolean);
+    const result = await createAPI(
+      {},
+      false,
+    )({
+      specifier: bump === 'auto' ? undefined : bump,
+      projects: projectNames,
+      gitCommit: true,
+      gitTag: true,
+      gitPush: false,
+      dryRun: true,
+    });
+    const changelogResult = await createChangelogAPI(
+      {
+        changelog: {
+          workspaceChangelog: false,
+          projectChangelogs: { createRelease: false, file: false },
+        },
+      },
+      false,
+    )({
+      projects: projectNames,
+      versionData: result.projectsVersionData,
+      releaseGraph: result.releaseGraph,
+      gitCommit: false,
+      gitTag: false,
+      gitPush: false,
+      stageChanges: false,
+      createRelease: false,
+      dryRun: true,
+    });
+    releasePreviewChangelogs.clear();
+    for (const [projectName, changelog] of Object.entries(changelogResult.projectChangelogs ?? {})) {
+      releasePreviewChangelogs.set(projectName, changelog.contents);
+    }
+    const packagesByProject = new Map(releasePackages(root).map((pkg) => [pkg.projectName, pkg]));
+    return Object.entries(result.projectsVersionData)
+      .map(([projectName, data]) => {
+        const pkg = packagesByProject.get(projectName);
+        if (!pkg || !data.newVersion) {
+          return null;
+        }
+        return { ...pkg, version: data.newVersion };
+      })
+      .filter((pkg): pkg is ReleasePackage => pkg !== null);
+  });
 }
 
 async function runNxNextPrereleaseVersion(root: string, projects: string): Promise<void> {
@@ -837,7 +911,7 @@ async function listMissingGithubReleasePackages(root: string, packages: ReleaseP
   ).filter((pkg): pkg is ReleasePackage => pkg !== null);
 }
 
-async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: boolean): Promise<void> {
+async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: boolean): Promise<string | null> {
   const currentTag = releaseTag(pkg);
   console.log(`${pkg.name}@${pkg.version}: rendering GitHub Release notes for ${currentTag}.`);
   console.log(`GitHub release auth: ${envPresence('GH_TOKEN')}, ${envPresence('GITHUB_TOKEN')}.`);
@@ -847,7 +921,7 @@ async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: bo
   const previousTag = await previousReleaseTag(root, pkg, currentTag);
   if (dryRun) {
     await renderNxProjectChangelogContents({ root, pkg, previousTag, dryRun });
-    return;
+    return null;
   }
   const contents = await renderNxProjectChangelogContents({ root, pkg, previousTag, dryRun });
   await createOrUpdateGithubRelease(pkg, contents, {
@@ -855,6 +929,7 @@ async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: bo
     runGhRelease: (args) => run('gh', args, root),
     log: (message) => console.log(message),
   });
+  return githubReleaseUrl(root, currentTag);
 }
 
 function envPresence(name: string): string {
@@ -892,12 +967,42 @@ async function writeReleaseSummary(summary: ReleaseSummary<ReleasePackage>): Pro
     lines.push(`- Git refs pushed: ${summary.pushed ? 'yes' : 'already current'}`);
     lines.push(`- npm published: ${packageSummary(summary.published)}`);
     lines.push(`- npm already published: ${packageSummary(summary.alreadyPublished)}`);
-    lines.push(`- GitHub Releases created/updated: ${packageSummary(summary.githubReleases)}`);
+    lines.push(`- GitHub Releases created/updated: ${githubReleaseSummary(summary)}`);
   }
   if (summary.rerunRequired) {
     const message = 'A previous incomplete release was repaired; newer commits remain. Run Publish again.';
     console.log(`::warning::${message}`);
     lines.push(`- Warning: ${message}`);
+  }
+  const text = `${lines.join('\n')}\n`;
+  console.log(text.trimEnd());
+  const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+  if (summaryPath) {
+    await appendFile(summaryPath, `${text}\n`);
+  }
+}
+
+async function writeReleasePreviewSummary(
+  root: string,
+  currentPackages: ReleasePackage[],
+  previewPackages: ReleasePackage[],
+): Promise<void> {
+  const lines = ['## Release Preview', '', `- Commit: \`${(await gitHead(root)).slice(0, 12)}\``, '- Mode: dry run'];
+  if (previewPackages.length === 0) {
+    lines.push('- Result: no release needed');
+  } else {
+    lines.push('- Packages:');
+    const currentByName = new Map(currentPackages.map((pkg) => [pkg.name, pkg]));
+    for (const pkg of previewPackages) {
+      lines.push(`  - \`${pkg.name}\`: \`${currentByName.get(pkg.name)?.version ?? 'unknown'}\` -> \`${pkg.version}\``);
+    }
+    for (const pkg of previewPackages) {
+      const contents = releasePreviewChangelogs.get(pkg.projectName);
+      if (!contents) {
+        throw new Error(`Nx did not generate a project changelog for ${pkg.projectName}.`);
+      }
+      lines.push('', `### ${pkg.name} ${pkg.version}`, '', contents.trim());
+    }
   }
   const text = `${lines.join('\n')}\n`;
   console.log(text.trimEnd());
@@ -931,6 +1036,13 @@ function packageSummary(packages: ReleasePackage[]): string {
     return 'none';
   }
   return packages.map((pkg) => `${pkg.name}@${pkg.version}`).join(', ');
+}
+
+function githubReleaseSummary(summary: ReleaseSummary<ReleasePackage>): string {
+  if (summary.githubReleaseLinks.length > 0) {
+    return summary.githubReleaseLinks.map(({ pkg, url }) => `[${pkg.name}@${pkg.version}](${url})`).join(', ');
+  }
+  return packageSummary(summary.githubReleases);
 }
 
 function repairTargetSummary(target: ReleaseTarget): string {
@@ -1170,6 +1282,10 @@ async function pushRetaggedReleaseTags(
 
 async function githubReleaseExists(root: string, tag: string): Promise<boolean> {
   return (await runStatus('gh', ['release', 'view', tag, '--json', 'tagName'], root, true)) === 0;
+}
+
+function githubReleaseUrl(root: string, tag: string): string {
+  return `https://github.com/${githubRepositoryFromRootPackage(root)}/releases/tag/${encodeURIComponent(tag)}`;
 }
 
 async function anyGithubReleaseExists(root: string, tags: string[]): Promise<boolean> {

@@ -334,8 +334,9 @@ class LocalGitRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
     return [];
   }
 
-  async createGithubRelease(pkg: ReleasePackageInfo, dryRun: boolean): Promise<void> {
+  async createGithubRelease(pkg: ReleasePackageInfo, dryRun: boolean): Promise<string | null> {
     this.githubCreates.push({ name: pkg.name, version: pkg.version, dryRun });
+    return dryRun ? null : `https://github.test/${releaseTag(pkg)}`;
   }
 
   async checkout(ref: string): Promise<void> {
