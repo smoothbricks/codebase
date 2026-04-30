@@ -17,6 +17,7 @@ defaults:
 
 jobs:
   main:
+    name: Validate
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -69,7 +70,7 @@ jobs:
 
           for repeat in $(seq 1 20); do
             echo "::group::Uncached all Unit Tests repeat ${repeat}/20"
-            nx run-many -t test --parallel=5 --skip-nx-cache --outputStyle=stream
+            nx run-many -t test --parallel=5 --skip-nx-cache
             echo "::endgroup::"
           done
 
