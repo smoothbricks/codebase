@@ -13,6 +13,11 @@
       "development": "./src/index.ts",
       "import": "./loader.js",
       "default": "./loader.js"
+    },
+    "./version-actions": {
+      "types": "./dist/version-actions.d.cts",
+      "require": "./dist/version-actions.cjs",
+      "default": "./dist/version-actions.cjs"
     }
   },
   "generators": "./generators.json",
@@ -56,6 +61,7 @@
     "directory": "packages/nx-plugin"
   },
   "dependencies": {
+    "@nx/js": "22.0.3",
     "nx": "22.5.4",
     "tslib": "^2.8.1"
   }

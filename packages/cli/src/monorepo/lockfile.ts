@@ -6,6 +6,15 @@ export interface SyncBunLockfileVersionsOptions {
   log?: boolean;
 }
 
+// Temporary Bun workaround. Delete this sync function, validateBunLockfileVersions,
+// the `smoo monorepo sync-bun-lockfile-versions` command, and the matching Nx
+// versionActions hook once supported Bun versions stop leaving workspace package
+// versions stale in bun.lock after manifest bumps. Until then, `bun pm pack`
+// rewrites `workspace:*` dependencies using those stale lockfile versions instead
+// of the current package.json versions. Track removal against:
+// - https://github.com/oven-sh/bun/issues/18906
+// - https://github.com/oven-sh/bun/issues/20477
+// - https://github.com/oven-sh/bun/issues/20829
 export function syncBunLockfileVersions(root: string, options: SyncBunLockfileVersionsOptions = {}): number {
   const log = options.log ?? true;
   const lockfilePath = join(root, 'bun.lock');

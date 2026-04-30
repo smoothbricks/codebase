@@ -341,8 +341,7 @@ function yamlLinesForStep(step: PublishWorkflowStep): string[] {
     case PublishWorkflowStepKind.BuildSelfHostedCli:
       return [
         `      - name: ${step.name}`,
-        '        # SmoothBricks self-hosts smoo from source, but Nx release loads',
-        '        # @smoothbricks/cli/nx-version-actions through the built package export.',
+        '        # SmoothBricks self-hosts smoo from source for release commands.',
         '        run: nx build cli',
       ];
     case PublishWorkflowStepKind.RepairPendingReleases:

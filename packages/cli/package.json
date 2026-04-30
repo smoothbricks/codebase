@@ -33,11 +33,6 @@
       "development": "./src/monorepo/git-config.ts",
       "import": "./dist/monorepo/git-config.js",
       "default": "./dist/monorepo/git-config.js"
-    },
-    "./nx-version-actions": {
-      "types": "./dist/nx-version-actions.d.cts",
-      "require": "./dist/nx-version-actions.cjs",
-      "default": "./dist/nx-version-actions.cjs"
     }
   },
   "files": [
