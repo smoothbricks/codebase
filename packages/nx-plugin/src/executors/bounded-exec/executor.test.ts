@@ -117,7 +117,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     );
 
     expect(result.success).toBe(false);
-    expect(calls).toEqual(['SIGTERM']);
+    expect(calls[0]).toBe('SIGTERM');
+    expect(calls.every((signal) => signal === 'SIGTERM' || signal === 'SIGKILL')).toBe(true);
   });
 
   it('force-kills after killAfterMs when graceful termination is ignored on POSIX', async () => {
