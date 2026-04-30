@@ -51,6 +51,32 @@ describe('release orchestration', () => {
     expect(shell.githubCreates).toEqual([{ name: '@scope/prerelease', dryRun: false }]);
   });
 
+  it('dry-run repair reports planned targets without checkout, devenv, build, publish, or GitHub calls', async () => {
+    const target = releaseTarget('github-only', [prerelease], [], [prerelease]);
+    const shell = new RecordingRepairShell();
+
+    const summaries = await repairPendingTargets(shell, [target], 'restore-ref', true);
+
+    expect(shell.checkouts).toEqual([]);
+    expect(shell.devenvLoads).toBe(0);
+    expect(shell.builds).toEqual([]);
+    expect(shell.publishes).toEqual([]);
+    expect(shell.githubCreates).toEqual([]);
+    expect(summaries).toEqual([
+      {
+        sha: 'github-only',
+        dryRun: true,
+        packages: [prerelease],
+        pushed: false,
+        published: [],
+        alreadyPublished: [prerelease],
+        githubReleases: [],
+        rerunRequired: false,
+        noRelease: false,
+      },
+    ]);
+  });
+
   it('publishes a partial HEAD release by building npm-missing packages and creating missing GitHub Releases', async () => {
     const shell = new RecordingRepairShell({ npmMissing: ['@scope/stable'], githubMissing: ['@scope/prerelease'] });
 

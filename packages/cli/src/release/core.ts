@@ -48,6 +48,14 @@ export function releaseTag(pkg: Pick<ReleasePackageInfo, 'projectName' | 'versio
   return `${pkg.projectName}@${pkg.version}`;
 }
 
+export function legacyReleaseTag(pkg: Pick<ReleasePackageInfo, 'name' | 'version'>): string {
+  return `${pkg.name}@${pkg.version}`;
+}
+
+export function releaseTagAliases(pkg: Pick<ReleasePackageInfo, 'name' | 'projectName' | 'version'>): string[] {
+  return [...new Set([releaseTag(pkg), legacyReleaseTag(pkg)])];
+}
+
 export function npmDistTagForVersion(version: string): string {
   return version.includes('-') ? 'next' : 'latest';
 }
@@ -85,13 +93,14 @@ export async function collectOwnedReleaseTagRecords<Package extends Omit<Release
   ref: string,
   shell: ReleasePlanningShell,
 ): Promise<Array<ReleaseTagRecord<Package & { version: string }>>> {
-  const records: Array<ReleaseTagRecord<Package & { version: string }>> = [];
-  const completedPackages = new Set<string>();
+  const candidates: Array<{
+    tag: GitReleaseTagInfo;
+    pkg: Package & { version: string };
+  }> = [];
+  const durableStates = new BoundedPromiseRunner(8);
+
   for (const tag of await shell.listReleaseTagsByCreatorDate()) {
     const match = releasePackageForTag(packages, tag.name);
-    if (match && completedPackages.has(match.pkg.name)) {
-      continue;
-    }
     if (!match || !(await shell.isAncestor(tag.sha, ref))) {
       continue;
     }
@@ -104,13 +113,89 @@ export async function collectOwnedReleaseTagRecords<Package extends Omit<Release
       );
     }
     const pkg = { ...match.pkg, version: match.version };
-    const state = await shell.durableTagState(pkg, tag.name);
-    records.push(classifyReleaseTag({ tag: tag.name, sha: tag.sha, timestamp: tag.timestamp, pkg }, state));
+    candidates.push({ tag, pkg });
+  }
+
+  const records: Array<ReleaseTagRecord<Package & { version: string }>> = [];
+  const completedPackages = new Set<string>();
+  const activePackages = new Set<string>();
+  const states = new Map<number, Promise<DurableTagState>>();
+
+  // Run durable-state checks concurrently across packages, but do not query an
+  // older tag for the same package until its newer tag proves incomplete.
+  const scheduleFrom = (startIndex: number) => {
+    for (let index = startIndex; index < candidates.length; index += 1) {
+      if (states.size >= 8) {
+        return;
+      }
+      const candidate = candidates[index];
+      if (!candidate || states.has(index) || completedPackages.has(candidate.pkg.name)) {
+        continue;
+      }
+      if (activePackages.has(candidate.pkg.name)) {
+        continue;
+      }
+      activePackages.add(candidate.pkg.name);
+      states.set(
+        index,
+        durableStates.run(() => shell.durableTagState(candidate.pkg, candidate.tag.name)),
+      );
+    }
+  };
+
+  for (const candidate of candidates) {
+    const index = candidates.indexOf(candidate);
+    scheduleFrom(index);
+    if (completedPackages.has(candidate.pkg.name)) {
+      continue;
+    }
+    const state = await states.get(index);
+    if (!state) {
+      throw new Error(`Release tag ${candidate.tag.name} lost durable state planning.`);
+    }
+    activePackages.delete(candidate.pkg.name);
+    states.delete(index);
+    records.push(
+      classifyReleaseTag(
+        { tag: candidate.tag.name, sha: candidate.tag.sha, timestamp: candidate.tag.timestamp, pkg: candidate.pkg },
+        state,
+      ),
+    );
     if (state.npmPublished && state.githubReleaseExists) {
-      completedPackages.add(pkg.name);
+      completedPackages.add(candidate.pkg.name);
     }
   }
   return records;
+}
+
+class BoundedPromiseRunner {
+  private active = 0;
+  private readonly waiting: Array<() => void> = [];
+
+  constructor(private readonly limit: number) {}
+
+  async run<T>(operation: () => Promise<T>): Promise<T> {
+    await this.acquire();
+    try {
+      return await operation();
+    } finally {
+      this.release();
+    }
+  }
+
+  private async acquire(): Promise<void> {
+    if (this.active < this.limit) {
+      this.active += 1;
+      return;
+    }
+    await new Promise<void>((resolve) => this.waiting.push(resolve));
+    this.active += 1;
+  }
+
+  private release(): void {
+    this.active -= 1;
+    this.waiting.shift()?.();
+  }
 }
 
 export function groupReleaseTargets<Package extends ReleasePackageInfo>(
