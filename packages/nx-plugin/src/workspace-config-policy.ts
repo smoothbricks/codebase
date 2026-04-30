@@ -1,18 +1,12 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
+import type { Tree } from 'nx/src/devkit-exports.js';
+import { readJson, updateJson } from 'nx/src/devkit-exports.js';
 
 export interface NxPolicyIssue {
   path: string;
   message: string;
 }
-
-// ---------------------------------------------------------------------------
-// Public constants
-// ---------------------------------------------------------------------------
 
 export const BUILD_OUTPUT_DEPENDENCIES = [
   '*-js',
@@ -27,10 +21,6 @@ export const BUILD_OUTPUT_DEPENDENCIES = [
   '*-wasm',
 ];
 
-// ---------------------------------------------------------------------------
-// Internal constants
-// ---------------------------------------------------------------------------
-
 const nxJsTypescriptPlugin = '@nx/js/typescript';
 const smoothBricksNxPlugin = '@smoothbricks/nx-plugin';
 const expectedSharedGlobalsNamedInput = ['{workspaceRoot}/.github/workflows/ci.yml'];
@@ -43,19 +33,10 @@ const defaultProductionNamedInput = [
 ];
 const impreciseProductionInputs = new Set(['default', '{projectRoot}/**/*', '{projectRoot}/**']);
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
 /**
- * Check nx.json workspace config policy, returns issues found.
+ * Check workspace config policy on an in-memory nx.json object.
  */
-export function checkWorkspaceConfigPolicy(root: string): NxPolicyIssue[] {
-  const nxJsonPath = join(root, 'nx.json');
-  const nxJson = readJsonObject(nxJsonPath);
-  if (!nxJson) {
-    return [{ path: nxJsonPath, message: 'nx.json not found or invalid' }];
-  }
+export function checkWorkspaceConfig(nxJson: Record<string, unknown>): NxPolicyIssue[] {
   const issues: NxPolicyIssue[] = [];
 
   // Colon target defaults
@@ -64,7 +45,7 @@ export function checkWorkspaceConfigPolicy(root: string): NxPolicyIssue[] {
     for (const targetName of Object.keys(targetDefaults)) {
       if (targetName.includes(':')) {
         issues.push({
-          path: nxJsonPath,
+          path: 'nx.json',
           message:
             `targetDefaults.${targetName} must not use colon target names. ` +
             'Nx CLI syntax already uses project:target:configuration, so smoo Nx target names must be unambiguous tool-output names.',
@@ -74,24 +55,24 @@ export function checkWorkspaceConfigPolicy(root: string): NxPolicyIssue[] {
   }
 
   // Build target default
-  validateBuildTargetDefault(nxJson, nxJsonPath, issues);
+  validateBuildTargetDefault(nxJson, 'nx.json', issues);
 
   // Named input defaults
-  validateNamedInputDefaults(nxJson, nxJsonPath, issues);
+  validateNamedInputDefaults(nxJson, 'nx.json', issues);
 
   // Plugin configuration
   const plugins = Array.isArray(nxJson.plugins) ? nxJson.plugins : [];
   const nxJsPlugin = plugins.find(isNxJsTypescriptPlugin);
   if (!nxJsPlugin) {
     issues.push({
-      path: nxJsonPath,
+      path: 'nx.json',
       message:
         `plugins must configure ${nxJsTypescriptPlugin}. ` +
         'Official Nx owns TypeScript library inference; smoo configures it so tsconfig.lib.json produces tsc-js and leaves build available as an aggregate target.',
     });
   } else if (nxJsBuildTargetName(nxJsPlugin) !== 'tsc-js') {
     issues.push({
-      path: nxJsonPath,
+      path: 'nx.json',
       message:
         `${nxJsTypescriptPlugin} build.targetName must be tsc-js. ` +
         'TypeScript library output is a concrete tool-output target; build is reserved for aggregate targets that depend on concrete build work.',
@@ -99,7 +80,7 @@ export function checkWorkspaceConfigPolicy(root: string): NxPolicyIssue[] {
   }
   if (!plugins.includes(smoothBricksNxPlugin) && !plugins.some(isSmoothBricksNxPluginRecord)) {
     issues.push({
-      path: nxJsonPath,
+      path: 'nx.json',
       message:
         `plugins must include ${smoothBricksNxPlugin}. ` +
         'Smoo relies on this plugin to infer convention targets that official Nx does not provide, including typecheck-tests, non-TypeScript build-tool targets, and aggregate build/lint targets.',
@@ -110,14 +91,10 @@ export function checkWorkspaceConfigPolicy(root: string): NxPolicyIssue[] {
 }
 
 /**
- * Fix nx.json workspace config policy. Returns whether anything changed.
+ * Apply workspace config policy to an in-memory nx.json object.
+ * Mutates in place, returns whether anything changed.
  */
-export function applyWorkspaceConfigPolicy(root: string): boolean {
-  const nxJsonPath = join(root, 'nx.json');
-  const nxJson = readJsonObject(nxJsonPath);
-  if (!nxJson) {
-    return false;
-  }
+export function applyWorkspaceConfig(nxJson: Record<string, unknown>): boolean {
   let changed = removeColonTargetDefaults(nxJson);
   changed = applyBuildTargetDefault(nxJson) || changed;
   changed = applyNamedInputDefaults(nxJson) || changed;
@@ -130,15 +107,67 @@ export function applyWorkspaceConfigPolicy(root: string): boolean {
     nxJson.plugins = nextPlugins;
     changed = true;
   }
+  return changed;
+}
+
+/**
+ * Check workspace config policy using an Nx Tree.
+ */
+export function checkWorkspaceConfigTree(tree: Tree): NxPolicyIssue[] {
+  if (!tree.exists('nx.json')) {
+    return [{ path: 'nx.json', message: 'nx.json not found' }];
+  }
+  return checkWorkspaceConfig(readJson(tree, 'nx.json'));
+}
+
+/**
+ * Apply workspace config policy using an Nx Tree.
+ * Returns whether anything changed.
+ */
+export function applyWorkspaceConfigTree(tree: Tree): boolean {
+  if (!tree.exists('nx.json')) {
+    return false;
+  }
+  let changed = false;
+  updateJson(tree, 'nx.json', (nxJson: Record<string, unknown>) => {
+    changed = applyWorkspaceConfig(nxJson);
+    return nxJson;
+  });
+  return changed;
+}
+
+/**
+ * Check nx.json workspace config policy, returns issues found.
+ */
+export function checkWorkspaceConfigPolicy(root: string): NxPolicyIssue[] {
+  const nxJsonPath = join(root, 'nx.json');
+  const nxJson = readJsonObject(nxJsonPath);
+  if (!nxJson) {
+    return [{ path: nxJsonPath, message: 'nx.json not found or invalid' }];
+  }
+  const coreIssues = checkWorkspaceConfig(nxJson);
+  // Remap 'nx.json' paths to absolute paths for filesystem callers
+  return coreIssues.map((issue) => ({
+    ...issue,
+    path: issue.path === 'nx.json' ? nxJsonPath : issue.path,
+  }));
+}
+
+/**
+ * Fix nx.json workspace config policy. Returns whether anything changed.
+ */
+export function applyWorkspaceConfigPolicy(root: string): boolean {
+  const nxJsonPath = join(root, 'nx.json');
+  const nxJson = readJsonObject(nxJsonPath);
+  if (!nxJson) {
+    return false;
+  }
+  const changed = applyWorkspaceConfig(nxJson);
   if (changed) {
     writeJsonObject(nxJsonPath, nxJson);
   }
   return changed;
 }
-
-// ---------------------------------------------------------------------------
-// Validation helpers
-// ---------------------------------------------------------------------------
 
 function validateBuildTargetDefault(
   nxJson: Record<string, unknown>,
@@ -198,10 +227,6 @@ function validateNamedInputDefaults(
   }
 }
 
-// ---------------------------------------------------------------------------
-// Apply helpers
-// ---------------------------------------------------------------------------
-
 function applyBuildTargetDefault(nxJson: Record<string, unknown>): boolean {
   const targetDefaults = getOrCreateRecord(nxJson, 'targetDefaults');
   const build = getOrCreateRecord(targetDefaults, 'build');
@@ -258,10 +283,6 @@ function isPreciseProductionNamedInput(production: unknown[]): boolean {
   return hasPositiveProjectInput;
 }
 
-// ---------------------------------------------------------------------------
-// Plugin helpers
-// ---------------------------------------------------------------------------
-
 function expectedNxJsTypescriptPlugin(): Record<string, unknown> {
   return {
     plugin: nxJsTypescriptPlugin,
@@ -304,10 +325,6 @@ function nxJsBuildTargetName(plugin: Record<string, unknown>): string | null {
   const build = options ? recordProperty(options, 'build') : null;
   return build ? stringProperty(build, 'targetName') : null;
 }
-
-// ---------------------------------------------------------------------------
-// JSON helpers (self-contained, following bounded-test-policy.ts pattern)
-// ---------------------------------------------------------------------------
 
 function readJsonObject(path: string): Record<string, unknown> | null {
   if (!existsSync(path)) {
