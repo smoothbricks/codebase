@@ -62,7 +62,12 @@ jobs:
 
       # Step 8
       - name: 🧪 Unit Tests
-        run: smoo github-ci nx-smart --target test --name "Unit Tests" --step 8
+        run: |
+          for repeat in $(seq 1 20); do
+            echo "::group::Uncached Unit Tests repeat ${repeat}/20"
+            NX_SKIP_NX_CACHE=true smoo github-ci nx-smart --target test --name "Unit Tests repeat ${repeat}" --step 8
+            echo "::endgroup::"
+          done
 
       # Step 9
       # Nx's database cache needs artifact files and .nx/workspace-data DB
