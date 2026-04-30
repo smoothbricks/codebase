@@ -7,6 +7,7 @@ function transform(source: string, options?: { fileName?: string; projectRoot?: 
   const result = ts.transpileModule(source, {
     fileName: options?.fileName,
     compilerOptions: {
+      alwaysStrict: false,
       module: ts.ModuleKind.ESNext,
       target: ts.ScriptTarget.ESNext,
     },
