@@ -7,6 +7,7 @@
  * @module sqlite-async-writer
  */
 
+import { cleanupDebug } from '../cleanupDiagnostics.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { AnySpanBuffer } from '../types.js';
 import {
@@ -82,6 +83,10 @@ export class SQLiteAsyncTraceWriter {
   }
 
   async flush(rootBuffer: AnySpanBuffer): Promise<void> {
+    cleanupDebug('sqliteAsyncWriter.flush:start', {
+      initialized: this.initialized,
+      statementCacheSize: this.insertStmtCache.size,
+    });
     await this.init();
     for (const segment of walkSpanSegments(rootBuffer)) {
       await this.ensureColumns(segment.buffer._logSchema);
@@ -93,9 +98,12 @@ export class SQLiteAsyncTraceWriter {
         await insertStmt.run(...buildInsertParams(segment, row, activeUserFields));
       }
     }
+    cleanupDebug('sqliteAsyncWriter.flush:end', { statementCacheSize: this.insertStmtCache.size });
   }
 
   async close(): Promise<void> {
+    cleanupDebug('sqliteAsyncWriter.close:start', { statementCacheSize: this.insertStmtCache.size });
     await this.db.close();
+    cleanupDebug('sqliteAsyncWriter.close:end');
   }
 }

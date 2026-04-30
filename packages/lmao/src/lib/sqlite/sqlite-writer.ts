@@ -15,6 +15,7 @@
  * @module sqlite-writer
  */
 
+import { cleanupDebug } from '../cleanupDiagnostics.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { AnySpanBuffer } from '../types.js';
 import {
@@ -112,17 +113,22 @@ export class SQLiteTraceWriter {
 
   /** Write a root SpanBuffer tree to the database */
   flush(rootBuffer: AnySpanBuffer): void {
+    cleanupDebug('sqliteWriter.flush:start', { statementCacheSize: this.insertStmtCache.size });
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.flushAllSegments(rootBuffer);
       this.db.exec('COMMIT');
+      cleanupDebug('sqliteWriter.flush:end', { statementCacheSize: this.insertStmtCache.size });
     } catch (error) {
       this.db.exec('ROLLBACK');
+      cleanupDebug('sqliteWriter.flush:error', { statementCacheSize: this.insertStmtCache.size });
       throw error;
     }
   }
 
   close(): void {
+    cleanupDebug('sqliteWriter.close:start', { statementCacheSize: this.insertStmtCache.size });
     this.db.close();
+    cleanupDebug('sqliteWriter.close:end');
   }
 }

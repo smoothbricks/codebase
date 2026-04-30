@@ -1,3 +1,4 @@
+import { cleanupDebug } from '../cleanupDiagnostics.js';
 import type { OpContextBinding } from '../opContext/types.js';
 import { Tracer, type TracerOptions } from '../tracer.js';
 import type { SpanBuffer } from '../types.js';
@@ -59,7 +60,9 @@ export class CompositeTracer<B extends OpContextBinding = OpContextBinding> exte
 
   override async flush(): Promise<void> {
     for (const tracer of this.delegates) {
+      cleanupDebug('compositeTracer.flush:delegate:start', { tracer: tracer.constructor.name });
       await tracer.flush();
+      cleanupDebug('compositeTracer.flush:delegate:end', { tracer: tracer.constructor.name });
     }
   }
 
@@ -68,7 +71,9 @@ export class CompositeTracer<B extends OpContextBinding = OpContextBinding> exte
       if (hasClose(tracer)) {
         const { close } = tracer;
         if (close) {
+          cleanupDebug('compositeTracer.close:delegate:start', { tracer: tracer.constructor.name });
           await close.call(tracer);
+          cleanupDebug('compositeTracer.close:delegate:end', { tracer: tracer.constructor.name });
         }
       }
     }
