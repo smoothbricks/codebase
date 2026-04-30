@@ -4,6 +4,11 @@
       "factory": "./dist/generators/bun-test-tracing/generator.js",
       "schema": "./src/generators/bun-test-tracing/schema.json",
       "description": "Configure a package for the workspace Bun test tracing pattern"
+    },
+    "bounded-test-targets": {
+      "factory": "./dist/generators/bounded-test-targets/generator.js",
+      "schema": "./src/generators/bounded-test-targets/schema.json",
+      "description": "Normalize package test targets to the bounded command executor"
     }
   }
 }

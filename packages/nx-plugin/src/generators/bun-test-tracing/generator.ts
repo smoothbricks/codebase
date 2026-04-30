@@ -9,6 +9,8 @@ import {
   updateJson,
 } from 'nx/src/devkit-exports.js';
 
+import { applyBoundedTestTargetPolicy } from '../../bounded-test-policy.js';
+
 interface BunTestTracingGeneratorSchema {
   project: string;
   opContextModule: string;
@@ -111,18 +113,9 @@ function updatePackageJson(tree: Tree, packageJsonPath: string, projectName: str
   updateJson<PackageJson>(tree, packageJsonPath, (packageJson: PackageJson) => {
     packageJson.nx ??= {};
     packageJson.nx.targets ??= {};
-    packageJson.nx.targets.test ??= {
-      executor: 'nx:run-commands',
-      dependsOn: ['typecheck-tests', '^build'],
-      options: {
-        command: 'bun test',
-        cwd: '{projectRoot}',
-      },
-    };
+    packageJson.nx.targets.test ??= { dependsOn: ['typecheck-tests', '^build'] };
+    applyBoundedTestTargetPolicy(packageJson, { projectName });
     packageJson.nx.targets.lint ??= {};
-
-    packageJson.scripts ??= {};
-    packageJson.scripts.test = `nx run ${projectName}:test --tui=false --outputStyle=stream`;
 
     const hasLmaoDependency = Boolean(
       packageJson.dependencies?.['@smoothbricks/lmao'] || packageJson.devDependencies?.['@smoothbricks/lmao'],

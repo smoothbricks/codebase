@@ -68,11 +68,13 @@ describe('bun-test-tracing generator', () => {
     const packageJson = readJson(tree, 'packages/example/package.json');
     expect(packageJson.scripts?.test).toBe('nx run example:test --tui=false --outputStyle=stream');
     expect(packageJson.nx?.targets?.test).toEqual({
-      executor: 'nx:run-commands',
+      executor: '@smoothbricks/nx-plugin:bounded-exec',
       dependsOn: ['typecheck-tests', '^build'],
       options: {
         command: 'bun test',
         cwd: '{projectRoot}',
+        timeoutMs: 600000,
+        killAfterMs: 10000,
       },
     });
     expect(
@@ -157,11 +159,13 @@ describe('bun-test-tracing generator', () => {
       nx: {
         targets: {
           test: {
-            executor: 'nx:run-commands',
+            executor: '@smoothbricks/nx-plugin:bounded-exec',
             dependsOn: ['typecheck-tests', '^build'],
             options: {
               command: 'bun test',
               cwd: '{projectRoot}',
+              timeoutMs: 600000,
+              killAfterMs: 10000,
             },
           },
           lint: {},

@@ -71,3 +71,24 @@ What it wires:
 - `tsconfig.test.json` with `noEmit` for inferred `typecheck-tests`
 - direct test config references to library tsconfigs; package root `tsconfig.json` is left out of the test config graph
 - package `package.json` test/lint/devDependency wiring needed for the standard pattern
+
+## Bounded Test Targets
+
+`@smoothbricks/nx-plugin:bounded-exec` runs a shell command with a timeout and force-kill grace period. Test targets use
+this executor so hung test processes fail predictably instead of blocking Nx indefinitely.
+
+The shared policy API is exported from `@smoothbricks/nx-plugin/bounded-test-policy` for generators or other workspace
+tools that need to normalize package JSON consistently.
+
+```bash
+nx generate ./packages/nx-plugin:bounded-test-targets --project @smoothbricks/my-package
+```
+
+The generator rewrites `package.json` so `nx.targets.test` uses:
+
+- executor `@smoothbricks/nx-plugin:bounded-exec`
+- command preserved from an existing `nx:run-commands` test target or direct `scripts.test`
+- `cwd: "{projectRoot}"`
+- `timeoutMs: 600000`
+- `killAfterMs: 10000`
+- package script alias `nx run <project>:test --tui=false --outputStyle=stream`

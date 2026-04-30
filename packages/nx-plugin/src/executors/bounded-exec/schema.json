@@ -1,0 +1,68 @@
+{
+  "version": 2,
+  "title": "Bounded Exec",
+  "description": "Run one shell command with a hard timeout and process-tree cleanup.",
+  "type": "object",
+  "cli": "nx",
+  "outputCapture": "pipe",
+  "additionalProperties": true,
+  "required": ["command", "timeoutMs"],
+  "properties": {
+    "command": {
+      "type": "string",
+      "description": "Shell command to run."
+    },
+    "cwd": {
+      "type": "string",
+      "description": "Working directory. Relative paths are resolved from the workspace root."
+    },
+    "env": {
+      "type": "object",
+      "description": "Environment variables made available to the command.",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "timeoutMs": {
+      "type": "number",
+      "minimum": 1,
+      "description": "Hard wall-clock timeout in milliseconds."
+    },
+    "killAfterMs": {
+      "type": "number",
+      "minimum": 0,
+      "default": 10000,
+      "description": "Milliseconds to wait after graceful termination before force-killing the process tree."
+    },
+    "forwardAllArgs": {
+      "type": "boolean",
+      "default": true,
+      "description": "Append unparsed Nx CLI arguments to the command."
+    },
+    "args": {
+      "description": "Extra arguments appended to the command.",
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "__unparsed__": {
+      "hidden": true,
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "$default": {
+        "$source": "unparsed"
+      },
+      "x-priority": "internal"
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "executors": {
+    "bounded-exec": {
+      "implementation": "./dist/executors/bounded-exec/executor.js",
+      "schema": "./src/executors/bounded-exec/schema.json",
+      "description": "Run a command with bounded timeout and force-kill behavior"
+    }
+  }
+}
