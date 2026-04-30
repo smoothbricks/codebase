@@ -3,6 +3,11 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
+  BOUNDED_TEST_EXECUTOR,
+  BOUNDED_TEST_KILL_AFTER_MS,
+  BOUNDED_TEST_TIMEOUT_MS,
+} from '@smoothbricks/nx-plugin/bounded-test-policy';
+import {
   applyFixableMonorepoDefaults,
   applyNxPluginDefaults,
   applyNxProjectNameDefaults,
@@ -582,7 +587,7 @@ describe('workspace package script policy', () => {
         compilerOptions: { baseUrl: '.', rootDir: 'src', types: ['node'], outDir: 'dist' },
       });
 
-      expect(validateWorkspaceDependencies(root)).toBe(1);
+      expect(validateWorkspaceDependencies(root)).toBe(2);
 
       applyWorkspaceDependencyDefaults(root);
 
@@ -626,7 +631,7 @@ describe('workspace package script policy', () => {
         compilerOptions: { baseUrl: '.', rootDir: 'src', outDir: 'dist' },
       });
 
-      expect(validateWorkspaceDependencies(root)).toBe(1);
+      expect(validateWorkspaceDependencies(root)).toBe(2);
 
       applyWorkspaceDependencyDefaults(root);
 
@@ -639,13 +644,13 @@ describe('workspace package script policy', () => {
     }
   });
 
-  it('does not require tsconfig.test.json for other test runners', async () => {
+  it('does not require tsconfig.test.json for other test runners but still requires bounded execution', async () => {
     const root = await createWorkspace({
       rootName: '@smoothbricks/codebase',
       packages: [{ dir: 'app', name: '@smoothbricks/app', scripts: { test: 'node --test' } }],
     });
     try {
-      expect(validateWorkspaceDependencies(root)).toBe(0);
+      expect(validateWorkspaceDependencies(root)).toBe(1);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -668,7 +673,7 @@ describe('workspace package script policy', () => {
       ],
     });
     try {
-      expect(validateWorkspaceDependencies(root)).toBe(1);
+      expect(validateWorkspaceDependencies(root)).toBe(2);
 
       applyWorkspaceDependencyDefaults(root);
 
@@ -735,7 +740,7 @@ describe('workspace package script policy', () => {
       ],
     });
     try {
-      expect(validateWorkspaceDependencies(root)).toBe(6);
+      expect(validateWorkspaceDependencies(root)).toBe(7);
 
       applyWorkspaceDependencyDefaults(root);
 
@@ -765,9 +770,13 @@ describe('workspace package script policy', () => {
             options: { command: 'vite dev --host 0.0.0.0', cwd: '{projectRoot}' },
           },
           test: {
-            executor: 'nx:run-commands',
-            dependsOn: ['^build'],
-            options: { command: 'bun test --pass-with-no-tests', cwd: '{projectRoot}' },
+            executor: BOUNDED_TEST_EXECUTOR,
+            options: {
+              command: 'bun test --pass-with-no-tests',
+              cwd: '{projectRoot}',
+              timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+              killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
+            },
           },
           build: {
             executor: 'nx:run-commands',
@@ -791,13 +800,18 @@ describe('workspace package script policy', () => {
           dir: 'app',
           name: '@smoothbricks/app',
           dependencies: { '@smoothbricks/lib': 'workspace:*' },
-          scripts: { test: 'nx run app:test' },
+          scripts: { test: 'nx run app:test --tui=false --outputStyle=stream' },
           nx: {
             name: 'app',
             targets: {
               test: {
-                executor: 'nx:run-commands',
-                options: { command: 'bun run test', cwd: '{projectRoot}' },
+                executor: BOUNDED_TEST_EXECUTOR,
+                options: {
+                  command: 'bun run test',
+                  cwd: '{projectRoot}',
+                  timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+                  killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
+                },
               },
             },
           },
@@ -891,7 +905,7 @@ describe('workspace package script policy', () => {
       ],
     });
     try {
-      expect(validateWorkspaceDependencies(root)).toBe(2);
+      expect(validateWorkspaceDependencies(root)).toBe(3);
 
       applyWorkspaceDependencyDefaults(root);
 
@@ -901,9 +915,13 @@ describe('workspace package script policy', () => {
         name: '@external/app',
         targets: {
           test: {
-            executor: 'nx:run-commands',
-            dependsOn: ['^build'],
-            options: { command: 'bun test --pass-with-no-tests', cwd: '{projectRoot}' },
+            executor: BOUNDED_TEST_EXECUTOR,
+            options: {
+              command: 'bun test --pass-with-no-tests',
+              cwd: '{projectRoot}',
+              timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+              killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
+            },
           },
         },
       });

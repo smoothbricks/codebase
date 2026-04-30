@@ -18,6 +18,9 @@
   ],
   "references": [
     {
+      "path": "../nx-plugin/tsconfig.lib.json"
+    },
+    {
       "path": "../validation/tsconfig.lib.json"
     },
     {

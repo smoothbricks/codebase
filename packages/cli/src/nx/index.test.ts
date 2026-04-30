@@ -5,6 +5,7 @@ import {
   nxCacheDirectories,
   nxResetCommand,
   nxShowProjectCommand,
+  projectNamesFromNxShowProjectsOutput,
   projectNamesWithTarget,
   targetNamesFromNxProjectJson,
 } from './index.js';
@@ -48,6 +49,14 @@ describe('Nx helper output formatting', () => {
         'build',
       ),
     ).toEqual(['cli', 'web']);
+  });
+
+  it('parses JSON project lists from nx show projects', () => {
+    expect(projectNamesFromNxShowProjectsOutput('["web","cli"]\n')).toEqual(['cli', 'web']);
+  });
+
+  it('parses legacy newline project lists from nx show projects', () => {
+    expect(projectNamesFromNxShowProjectsOutput('web\ncli\n')).toEqual(['cli', 'web']);
   });
 
   it('extracts sorted target names from Nx project JSON', () => {
