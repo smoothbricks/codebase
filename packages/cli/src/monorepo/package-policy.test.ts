@@ -568,10 +568,44 @@ describe('workspace package script policy', () => {
     }
   });
 
-  it('rejects old test tsconfig output and build.zig without steps', async () => {
+  it('rejects build.zig without steps', async () => {
     const root = await createWorkspace({
       rootName: '@smoothbricks/codebase',
       packages: [{ dir: 'native', name: '@smoothbricks/native', nx: { name: 'native' } }],
+    });
+    try {
+      await writeFile(join(root, 'packages/native/build.zig'), 'pub fn build(b: *std.Build) void { _ = b; }\n');
+
+      expect(validateWorkspaceDependencies(root)).toBe(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects old test tsconfig output for packages with test runners', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [
+        {
+          dir: 'native',
+          name: '@smoothbricks/native',
+          nx: {
+            name: 'native',
+            targets: {
+              test: {
+                executor: BOUNDED_TEST_EXECUTOR,
+                options: {
+                  command: 'bun test',
+                  cwd: '{projectRoot}',
+                  timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+                  killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
+                },
+              },
+            },
+          },
+          scripts: { test: 'nx run native:test --tui=false --outputStyle=stream' },
+        },
+      ],
     });
     try {
       await writeJson(join(root, 'packages/native/tsconfig.test.json'), {
@@ -583,9 +617,8 @@ describe('workspace package script policy', () => {
           tsBuildInfoFile: 'dist-test/tsconfig.test.tsbuildinfo',
         },
       });
-      await writeFile(join(root, 'packages/native/build.zig'), 'pub fn build(b: *std.Build) void { _ = b; }\n');
 
-      expect(validateWorkspaceDependencies(root)).toBe(7);
+      expect(validateWorkspaceDependencies(root)).toBe(6);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -1,13 +1,27 @@
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { join } from 'node:path';
 import {
   applyWorkspaceBoundedTestTargetPolicy,
-  boundedTestScriptAlias,
   checkWorkspaceBoundedTestTargetPolicy,
 } from '@smoothbricks/nx-plugin/bounded-test-policy';
 import {
+  applyPackageTargetPolicy,
+  checkPackageTargetPolicy,
+  type PackageTargetPolicyOptions,
+  type ResolvedProjectTargets,
+} from '@smoothbricks/nx-plugin/package-target-policy';
+import {
+  applyReleaseConfigPolicy,
+  checkReleaseConfigPolicy,
+  SMOO_NX_RELEASE_TAG_PATTERN,
+  SMOO_NX_VERSION_ACTIONS,
+} from '@smoothbricks/nx-plugin/release-config-policy';
+import { applyTypecheckTestPolicy, checkTypecheckTestPolicy } from '@smoothbricks/nx-plugin/typecheck-test-policy';
+import {
+  applyWorkspaceConfigPolicy,
+  checkWorkspaceConfigPolicy,
+} from '@smoothbricks/nx-plugin/workspace-config-policy';
+import {
   getOrCreateRecord,
-  hasOwn,
   hasOwnString,
   isRecord,
   readJsonObject,
@@ -29,17 +43,9 @@ import {
   workspaceDependencyFields,
 } from '../lib/workspace.js';
 
-export interface WorkspaceDependencyDefaultOptions {
-  resolvedTargetsByProject?: ReadonlyMap<string, ReadonlySet<string> | ResolvedProjectTargets>;
-}
+export type { PackageTargetPolicyOptions as WorkspaceDependencyDefaultOptions, ResolvedProjectTargets };
+export { SMOO_NX_RELEASE_TAG_PATTERN, SMOO_NX_VERSION_ACTIONS };
 
-export interface ResolvedProjectTargets {
-  targets: ReadonlySet<string>;
-  buildDependsOn?: readonly string[];
-}
-
-export const SMOO_NX_VERSION_ACTIONS = '@smoothbricks/nx-plugin/version-actions';
-export const SMOO_NX_RELEASE_TAG_PATTERN = '{projectName}@{version}';
 const extraCommitScopes = ['release'];
 const rootScriptPolicy: Record<string, string> = {
   lint: 'nx run-many -t lint',
@@ -47,29 +53,6 @@ const rootScriptPolicy: Record<string, string> = {
   'format:staged': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml',
   'format:changed': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --also-unstaged',
 };
-const nxJsTypescriptPlugin = '@nx/js/typescript';
-const smoothBricksNxPlugin = '@smoothbricks/nx-plugin';
-const expectedSharedGlobalsNamedInput = ['{workspaceRoot}/.github/workflows/ci.yml'];
-const buildOutputDependencies = [
-  '*-js',
-  '*-web',
-  '*-html',
-  '*-css',
-  '*-ios',
-  '*-android',
-  '*-native',
-  '*-napi',
-  '*-bun',
-  '*-wasm',
-];
-const defaultProductionNamedInput = [
-  '{projectRoot}/src/**/*',
-  '{projectRoot}/package.json',
-  '!{projectRoot}/**/__tests__/**',
-  '!{projectRoot}/**/*.test.*',
-  '!{projectRoot}/**/*.spec.*',
-];
-const impreciseProductionInputs = new Set(['default', '{projectRoot}/**/*', '{projectRoot}/**']);
 
 export function applyFixableMonorepoDefaults(root: string): void {
   applyRootScriptDefaults(root);
@@ -103,25 +86,7 @@ export function applyRootScriptDefaults(root: string): void {
 }
 
 export function applyNxPluginDefaults(root: string): void {
-  const nxJsonPath = join(root, 'nx.json');
-  const nxJson = readJsonObject(nxJsonPath);
-  if (!nxJson) {
-    return;
-  }
-  let changed = removeColonTargetDefaults(nxJson);
-  changed = applyBuildTargetDefault(nxJson) || changed;
-  changed = applyNamedInputDefaults(nxJson) || changed;
-  const currentPlugins = Array.isArray(nxJson.plugins) ? nxJson.plugins : [];
-  const nextPlugins = upsertNxPlugin(
-    upsertNxPlugin(currentPlugins, expectedNxJsTypescriptPlugin()),
-    smoothBricksNxPlugin,
-  );
-  if (JSON.stringify(currentPlugins) !== JSON.stringify(nextPlugins)) {
-    nxJson.plugins = nextPlugins;
-    changed = true;
-  }
-  if (changed) {
-    writeJsonObject(nxJsonPath, nxJson);
+  if (applyWorkspaceConfigPolicy(root)) {
     console.log('updated        nx.json smoo plugin config');
   } else {
     console.log('unchanged      nx.json smoo plugin config');
@@ -169,26 +134,24 @@ export function applyPublicPackageDefaults(root: string): void {
   }
 }
 
-export function applyWorkspaceDependencyDefaults(root: string, options: WorkspaceDependencyDefaultOptions = {}): void {
+export function applyWorkspaceDependencyDefaults(root: string, options: PackageTargetPolicyOptions = {}): void {
   const workspaceNames = new Set(getWorkspacePackages(root).map((pkg) => pkg.name));
   for (const pkg of listPackageJsonRecords(root)) {
-    let changed = fixWorkspaceDependencyRanges(pkg.json, workspaceNames);
-    const projectName = packageNxProjectName(pkg.json);
-    const resolvedProject = projectName ? options.resolvedTargetsByProject?.get(projectName) : undefined;
-    const resolvedTargets = resolvedProjectTargetNames(resolvedProject);
-    changed = migratePackageColonTargets(pkg.json, resolvedTargets) || changed;
-    changed = rewriteColonTargetDependenciesInPackage(pkg.json, resolvedTargets) || changed;
-    changed = removePackageColonTargets(pkg.json) || changed;
-    changed = removeRedundantNoopBuildTarget(pkg.json, resolvedProject) || changed;
-    changed = applyPackageScriptPolicy(pkg.json, pkg.path, workspaceNames, { resolvedTargets }) || changed;
+    const changed = fixWorkspaceDependencyRanges(pkg.json, workspaceNames);
     if (changed) {
       writeJsonObject(pkg.packageJsonPath, pkg.json);
-      console.log(`updated        ${pkg.path}/package.json workspace dependency policy`);
-    } else {
-      console.log(`unchanged      ${pkg.path}/package.json workspace dependency policy`);
+      console.log(`updated        ${pkg.path}/package.json workspace dependency ranges`);
     }
-    applyTestTypecheckTsconfigDefaults(root, pkg.path, pkg.json, workspaceNames);
-    applyTsconfigTestReferenceDefaults(root, pkg.path);
+  }
+  if (applyPackageTargetPolicy(root, options)) {
+    console.log('updated        package Nx target policy');
+  } else {
+    console.log('unchanged      package Nx target policy');
+  }
+  if (applyTypecheckTestPolicy(root)) {
+    console.log('updated        tsconfig.test.json policy');
+  } else {
+    console.log('unchanged      tsconfig.test.json policy');
   }
   if (applyWorkspaceBoundedTestTargetPolicy(root)) {
     console.log('updated        package test targets bounded execution policy');
@@ -198,38 +161,7 @@ export function applyWorkspaceDependencyDefaults(root: string, options: Workspac
 }
 
 export function applyNxReleaseDefaults(root: string): void {
-  const nxJsonPath = join(root, 'nx.json');
-  const nxJson = requiredJsonObject(nxJsonPath);
-  let changed = false;
-  const release = getOrCreateRecord(nxJson, 'release');
-  changed = setStringProperty(release, 'projectsRelationship', 'independent') || changed;
-  const version = getOrCreateRecord(release, 'version');
-  changed = setStringProperty(version, 'specifierSource', 'conventional-commits') || changed;
-  changed = setStringProperty(version, 'currentVersionResolver', 'git-tag') || changed;
-  changed = setStringProperty(version, 'fallbackCurrentVersionResolver', 'disk') || changed;
-  changed = setStringProperty(version, 'versionActions', SMOO_NX_VERSION_ACTIONS) || changed;
-  if (delete version.preVersionCommand) {
-    changed = true;
-  }
-  const releaseTag = getOrCreateRecord(release, 'releaseTag');
-  changed = setStringProperty(releaseTag, 'pattern', SMOO_NX_RELEASE_TAG_PATTERN) || changed;
-  const changelog = getOrCreateRecord(release, 'changelog');
-  changed = setBooleanProperty(changelog, 'workspaceChangelog', false) || changed;
-  const projectChangelogs = getOrCreateRecord(changelog, 'projectChangelogs');
-  changed = setBooleanProperty(projectChangelogs, 'createRelease', false) || changed;
-  changed = setBooleanProperty(projectChangelogs, 'file', false) || changed;
-  const renderOptions = getOrCreateRecord(projectChangelogs, 'renderOptions');
-  if (typeof renderOptions.authors !== 'boolean') {
-    renderOptions.authors = true;
-    changed = true;
-  }
-  if (typeof renderOptions.applyUsernameToAuthors !== 'boolean') {
-    renderOptions.applyUsernameToAuthors = true;
-    changed = true;
-  }
-
-  if (changed) {
-    writeJsonObject(nxJsonPath, nxJson);
+  if (applyReleaseConfigPolicy(root)) {
     console.log('updated        nx.json release config');
   } else {
     console.log('unchanged      nx.json release config');
@@ -247,7 +179,8 @@ export function applyNxProjectNameDefaults(root: string): void {
     if (!suggestedName) {
       continue;
     }
-    const changed = applyPackageNxConfig(pkg.json, { projectName: suggestedName }).changed;
+    const nx = getOrCreateRecord(pkg.json, 'nx');
+    const changed = setStringProperty(nx, 'name', suggestedName);
     if (changed) {
       writeJsonObject(pkg.packageJsonPath, pkg.json);
       console.log(`updated        ${pkg.path}/package.json nx.name`);
@@ -319,85 +252,13 @@ export function validateRootPackagePolicy(root: string): number {
 }
 
 export function validateNxReleaseConfig(root: string): number {
-  const nxJson = readJsonObject(join(root, 'nx.json'));
-  if (!nxJson) {
-    console.error('nx.json not found or invalid');
-    return 1;
-  }
-  const release = recordProperty(nxJson, 'release');
-  const version = release ? recordProperty(release, 'version') : null;
-  const releaseTag = release ? recordProperty(release, 'releaseTag') : null;
-  const changelog = release ? recordProperty(release, 'changelog') : null;
-  const projectChangelogs = changelog ? recordProperty(changelog, 'projectChangelogs') : null;
-  const renderOptions = projectChangelogs ? recordProperty(projectChangelogs, 'renderOptions') : null;
   let failures = 0;
-  if (!release) {
-    console.error('nx.json release config is missing');
+  for (const issue of checkWorkspaceConfigPolicy(root)) {
+    console.error(issue.message);
     failures++;
   }
-  failures += validateNxPluginConfig(nxJson);
-  if (release && stringProperty(release, 'projectsRelationship') !== 'independent') {
-    console.error('nx.json release.projectsRelationship must be independent');
-    failures++;
-  }
-  if (!version) {
-    console.error('nx.json release.version config is missing');
-    failures++;
-  }
-  if (version && stringProperty(version, 'specifierSource') !== 'conventional-commits') {
-    console.error('nx.json release.version.specifierSource must be conventional-commits');
-    failures++;
-  }
-  // Nx requires git-tag as the primary resolver when deriving versions from
-  // conventional commits. Disk is only a fallback for initial untagged packages.
-  if (version && stringProperty(version, 'currentVersionResolver') !== 'git-tag') {
-    console.error('nx.json release.version.currentVersionResolver must be git-tag');
-    failures++;
-  }
-  if (version && stringProperty(version, 'fallbackCurrentVersionResolver') !== 'disk') {
-    console.error('nx.json release.version.fallbackCurrentVersionResolver must be disk');
-    failures++;
-  }
-  if (version && stringProperty(version, 'versionActions') !== SMOO_NX_VERSION_ACTIONS) {
-    console.error(`nx.json release.version.versionActions must be ${SMOO_NX_VERSION_ACTIONS}`);
-    failures++;
-  }
-  if (version && stringProperty(version, 'preVersionCommand')) {
-    console.error(
-      'nx.json release.version.preVersionCommand must not be defined; smoo builds npm-missing packages before publish',
-    );
-    failures++;
-  }
-  if (!releaseTag) {
-    console.error('nx.json release.releaseTag config is missing');
-    failures++;
-  }
-  if (releaseTag && stringProperty(releaseTag, 'pattern') !== SMOO_NX_RELEASE_TAG_PATTERN) {
-    console.error(`nx.json release.releaseTag.pattern must be ${SMOO_NX_RELEASE_TAG_PATTERN}`);
-    failures++;
-  }
-  if (!changelog) {
-    console.error('nx.json release.changelog config is missing');
-    failures++;
-  }
-  if (changelog && changelog.workspaceChangelog !== false) {
-    console.error('nx.json release.changelog.workspaceChangelog must be false');
-    failures++;
-  }
-  if (!projectChangelogs) {
-    console.error('nx.json release.changelog.projectChangelogs config is missing');
-    failures++;
-  }
-  if (projectChangelogs && projectChangelogs.createRelease !== false) {
-    console.error('nx.json release.changelog.projectChangelogs.createRelease must be false');
-    failures++;
-  }
-  if (projectChangelogs && projectChangelogs.file !== false) {
-    console.error('nx.json release.changelog.projectChangelogs.file must be false');
-    failures++;
-  }
-  if (!renderOptions) {
-    console.error('nx.json release.changelog.projectChangelogs.renderOptions config is missing');
+  for (const issue of checkReleaseConfigPolicy(root)) {
+    console.error(issue.message);
     failures++;
   }
   return failures;
@@ -506,20 +367,10 @@ export function validatePublicPackageMetadata(root: string): number {
   return failures;
 }
 
-export function validateWorkspaceDependencies(root: string, options: WorkspaceDependencyDefaultOptions = {}): number {
-  const workspaceNames = new Set(getWorkspacePackages(root).map((pkg) => pkg.name));
+export function validateWorkspaceDependencies(root: string, options: PackageTargetPolicyOptions = {}): number {
   let failures = 0;
+  const workspaceNames = new Set(getWorkspacePackages(root).map((pkg) => pkg.name));
   for (const pkg of listPackageJsonRecords(root)) {
-    const projectName = packageNxProjectName(pkg.json);
-    const resolvedTargets = resolvedProjectTargetNames(
-      projectName ? options.resolvedTargetsByProject?.get(projectName) : undefined,
-    );
-    failures += validateExplicitNxTargets(pkg.json, pkg.path, resolvedTargets);
-    failures += validateTestEntrypointPresence(root, pkg.path, pkg.json);
-    failures += validateTestTypecheckTsconfigPresence(root, pkg.path, pkg.json);
-    failures += validateTsconfigTestPolicy(root, pkg.path);
-    failures += validateTsconfigTestReferencePolicy(root, pkg.path);
-    failures += validateBuildZigPolicy(root, pkg.path);
     for (const field of workspaceDependencyFields) {
       const dependencies = recordProperty(pkg.json, field);
       if (!dependencies) {
@@ -532,7 +383,14 @@ export function validateWorkspaceDependencies(root: string, options: WorkspaceDe
         }
       }
     }
-    failures += validatePackageScriptPolicy(pkg.json, pkg.path, workspaceNames, { resolvedTargets });
+  }
+  for (const issue of checkPackageTargetPolicy(root, options)) {
+    console.error(`${issue.path}: ${issue.message}`);
+    failures++;
+  }
+  for (const issue of checkTypecheckTestPolicy(root)) {
+    console.error(`${issue.path}: ${issue.message}`);
+    failures++;
   }
   for (const issue of checkWorkspaceBoundedTestTargetPolicy(root)) {
     console.error(`${issue.path}: ${issue.message}`);
@@ -544,174 +402,9 @@ export function validateWorkspaceDependencies(root: string, options: WorkspaceDe
   return failures;
 }
 
-export function applyPackageScriptPolicy(
-  pkg: Record<string, unknown>,
-  _packagePath: string,
-  workspaceNames: ReadonlySet<string>,
-  options: { resolvedTargets?: ReadonlySet<string> } = {},
-): boolean {
-  if (!hasWorkspaceDependency(pkg, workspaceNames)) {
-    return false;
-  }
-  const scripts = recordProperty(pkg, 'scripts');
-  if (!scripts) {
-    return false;
-  }
-  const projectName = packageNxProjectName(pkg);
-  if (!projectName) {
-    return false;
-  }
-  const nxConfig = applyPackageNxConfig(pkg, { projectName, targets: true });
-  const targets = nxConfig.targets;
-  let changed = nxConfig.changed;
-  for (const [scriptName, rawCommand] of Object.entries(scripts)) {
-    if (typeof rawCommand !== 'string') {
-      continue;
-    }
-    const parsedAlias = parseNxRunAlias(rawCommand);
-    if (parsedAlias?.projectName === projectName && parsedAlias.targetName === 'test') {
-      continue;
-    }
-    const rewrite = classifyScriptRewrite(scriptName, rawCommand);
-    if (!rewrite) {
-      continue;
-    }
-    const targetName = rewrite.targetName;
-    const alias = nxRunAlias(projectName, targetName, rewrite.continuous);
-    if (targetName === 'test') {
-      continue;
-    }
-    const existingTarget = recordProperty(targets, targetName);
-    if (
-      !existingTarget &&
-      targetName !== scriptName &&
-      targetExistsInResolvedProject(targetName, options.resolvedTargets)
-    ) {
-      if (scripts[scriptName] !== alias) {
-        scripts[scriptName] = alias;
-        changed = true;
-      }
-      continue;
-    }
-    const existingOptions = existingTarget ? recordProperty(existingTarget, 'options') : null;
-    const existingCommand = existingOptions ? stringProperty(existingOptions, 'command') : null;
-    const command = isScriptRunnerCommand(existingCommand, scriptName)
-      ? rewrite.command
-      : (existingCommand ?? rewrite.command);
-    const target = existingTarget ?? {};
-    changed = setStringProperty(target, 'executor', 'nx:run-commands') || changed;
-    changed = applyTargetDependencyPolicy(target, targetName) || changed;
-    if (rewrite.continuous && target.continuous !== true) {
-      target.continuous = true;
-      changed = true;
-    }
-    const targetOptions = getOrCreateRecord(target, 'options');
-    changed = setStringProperty(targetOptions, 'command', command) || changed;
-    changed = setStringProperty(targetOptions, 'cwd', '{projectRoot}') || changed;
-    for (const [name, value] of Object.entries(rewrite.env)) {
-      const env = getOrCreateRecord(targetOptions, 'env');
-      changed = setStringProperty(env, name, value) || changed;
-    }
-    if (targets[targetName] !== target) {
-      targets[targetName] = target;
-      changed = true;
-    }
-    if (scripts[scriptName] !== alias) {
-      scripts[scriptName] = alias;
-      changed = true;
-    }
-  }
-  return changed;
-}
-
-export function validatePackageScriptPolicy(
-  pkg: Record<string, unknown>,
-  packagePath: string,
-  workspaceNames: ReadonlySet<string>,
-  options: { resolvedTargets?: ReadonlySet<string> } = {},
-): number {
-  if (!hasWorkspaceDependency(pkg, workspaceNames)) {
-    return 0;
-  }
-  const scripts = recordProperty(pkg, 'scripts');
-  if (!scripts) {
-    return 0;
-  }
-  const nx = recordProperty(pkg, 'nx');
-  const projectName = nx ? stringProperty(nx, 'name') : stringProperty(pkg, 'name');
-  const targets = nx ? recordProperty(nx, 'targets') : null;
-  let failures = 0;
-  for (const [scriptName, rawCommand] of Object.entries(scripts)) {
-    if (typeof rawCommand !== 'string') {
-      continue;
-    }
-    const alias = parseNxRunAlias(rawCommand);
-    const rewrite = alias
-      ? { targetName: alias.targetName, continuous: isContinuousTarget(alias.targetName, '') }
-      : classifyScriptRewrite(scriptName, rawCommand);
-    if (!rewrite || (alias && projectName && alias.projectName !== projectName)) {
-      if (alias && projectName && alias.projectName !== projectName) {
-        console.error(`${packagePath}: scripts.${scriptName} must delegate to project ${projectName}`);
-        failures++;
-      }
-      continue;
-    }
-    if (!projectName) {
-      console.error(`${packagePath}: package scripts that use workspace dependencies require package.json nx.name`);
-      failures++;
-      continue;
-    }
-    const expectedAlias = nxRunAlias(projectName, rewrite.targetName, rewrite.continuous);
-    if (rawCommand !== expectedAlias) {
-      console.error(`${packagePath}: scripts.${scriptName} must delegate to ${expectedAlias}`);
-      failures++;
-      continue;
-    }
-    const target = targets ? recordProperty(targets, rewrite.targetName) : null;
-    if (
-      !target &&
-      rewrite.targetName !== scriptName &&
-      targetExistsInResolvedProject(rewrite.targetName, options.resolvedTargets)
-    ) {
-      continue;
-    }
-    if (rewrite.targetName.includes(':')) {
-      continue;
-    }
-    if (rewrite.targetName === 'test') {
-      continue;
-    }
-    const targetOptions = target ? recordProperty(target, 'options') : null;
-    const command = targetOptions ? stringProperty(targetOptions, 'command') : null;
-    if (!target || stringProperty(target, 'executor') !== 'nx:run-commands' || !targetOptions || !command) {
-      console.error(`${packagePath}: nx.targets.${rewrite.targetName} must use nx:run-commands with options.command`);
-      failures++;
-      continue;
-    }
-    if (stringProperty(targetOptions, 'cwd') !== '{projectRoot}') {
-      console.error(`${packagePath}: nx.targets.${rewrite.targetName}.options.cwd must be {projectRoot}`);
-      failures++;
-    }
-    const expectedDependencies = expectedTargetDependencies(rewrite.targetName);
-    if (!targetDependsOn(target, expectedDependencies)) {
-      console.error(
-        `${packagePath}: nx.targets.${rewrite.targetName}.dependsOn must include ${expectedDependencies.join(', ')}`,
-      );
-      failures++;
-    }
-    if (rewrite.continuous && target.continuous !== true) {
-      console.error(`${packagePath}: nx.targets.${rewrite.targetName}.continuous must be true`);
-      failures++;
-    }
-    if (isScriptRunnerCommand(command, scriptName)) {
-      console.error(
-        `${packagePath}: nx.targets.${rewrite.targetName}.options.command must not call scripts.${scriptName}`,
-      );
-      failures++;
-    }
-  }
-  return failures;
-}
+// ---------------------------------------------------------------------------
+// Helpers kept in CLI (not Nx-specific)
+// ---------------------------------------------------------------------------
 
 function fixWorkspaceDependencyRanges(pkg: Record<string, unknown>, workspaceNames: Set<string>): boolean {
   let changed = false;
@@ -757,1088 +450,21 @@ function validateRootNxScriptInference(rootPackage: Record<string, unknown>): nu
   return 1;
 }
 
-function validateNxPluginConfig(nxJson: Record<string, unknown>): number {
-  let failures = 0;
-  const targetDefaults = recordProperty(nxJson, 'targetDefaults');
-  if (targetDefaults) {
-    for (const targetName of Object.keys(targetDefaults)) {
-      if (targetName.includes(':')) {
-        console.error(
-          `nx.json targetDefaults.${targetName} must not use colon target names. ` +
-            'Nx CLI syntax already uses project:target:configuration, so smoo Nx target names must be unambiguous tool-output names.',
-        );
-        failures++;
-      }
-    }
-  }
-  failures += validateBuildTargetDefault(nxJson);
-  failures += validateNamedInputDefaults(nxJson);
-  const plugins = Array.isArray(nxJson.plugins) ? nxJson.plugins : [];
-  const nxJsPlugin = plugins.find(isNxJsTypescriptPlugin);
-  if (!nxJsPlugin) {
-    console.error(
-      `nx.json plugins must configure ${nxJsTypescriptPlugin}. ` +
-        'Official Nx owns TypeScript library inference; smoo configures it so tsconfig.lib.json produces tsc-js and leaves build available as an aggregate target.',
-    );
-    failures++;
-  } else if (nxJsBuildTargetName(nxJsPlugin) !== 'tsc-js') {
-    console.error(
-      `nx.json ${nxJsTypescriptPlugin} build.targetName must be tsc-js. ` +
-        'TypeScript library output is a concrete tool-output target; build is reserved for aggregate targets that depend on concrete build work.',
-    );
-    failures++;
-  }
-  if (!plugins.includes(smoothBricksNxPlugin) && !plugins.some(isSmoothBricksNxPluginRecord)) {
-    console.error(
-      `nx.json plugins must include ${smoothBricksNxPlugin}. ` +
-        'Smoo relies on this plugin to infer convention targets that official Nx does not provide, including typecheck-tests, non-TypeScript build-tool targets, and aggregate build/lint targets.',
-    );
-    failures++;
-  }
-  return failures;
-}
-
-function validateExplicitNxTargets(
-  pkg: Record<string, unknown>,
-  packagePath: string,
-  resolvedTargets?: ReadonlySet<string>,
-): number {
-  const nx = recordProperty(pkg, 'nx');
-  const targets = nx ? recordProperty(nx, 'targets') : null;
-  if (!targets) {
-    return 0;
-  }
-  let failures = 0;
-  for (const [targetName, rawTarget] of Object.entries(targets)) {
-    if (targetName.includes(':')) {
-      console.error(
-        `${packagePath}: package.json nx.targets.${targetName} must not use colon target names. ` +
-          'Nx CLI syntax already uses project:target:configuration; use a concrete tool-output target name and keep colon names only as package-script aliases.',
-      );
-      failures++;
-    }
-    if (!isRecord(rawTarget)) {
-      continue;
-    }
-    failures += validateTargetDependencies(rawTarget, `${packagePath}: nx.targets.${targetName}`, resolvedTargets);
-  }
-  return failures;
-}
-
-function validateTargetDependencies(
-  target: Record<string, unknown>,
-  label: string,
-  resolvedTargets?: ReadonlySet<string>,
-): number {
-  if (!Array.isArray(target.dependsOn)) {
-    return 0;
-  }
-  let failures = 0;
-  for (const dependency of target.dependsOn) {
-    if (typeof dependency !== 'string') {
-      continue;
-    }
-    if (dependency.includes(':')) {
-      console.error(`${label}.dependsOn must not include colon target dependency ${dependency}`);
-      failures++;
-      continue;
-    }
-    if (
-      label.endsWith('nx.targets.build') &&
-      !dependency.startsWith('^') &&
-      !isBuildOutputDependencyPattern(dependency) &&
-      !targetExistsInResolvedProject(dependency, resolvedTargets)
-    ) {
-      console.error(`${label}.dependsOn references missing target ${dependency}`);
-      failures++;
-    }
-  }
-  return failures;
-}
-
-function validateTsconfigTestPolicy(root: string, packagePath: string): number {
-  const path = join(root, packagePath, 'tsconfig.test.json');
-  const tsconfig = readJsonObject(path);
-  if (!tsconfig) {
-    return 0;
-  }
-  const compilerOptions = recordProperty(tsconfig, 'compilerOptions');
-  let failures = 0;
-  if (!compilerOptions || compilerOptions.noEmit !== true) {
-    console.error(`${packagePath}/tsconfig.test.json compilerOptions.noEmit must be true`);
-    failures++;
-  }
-  if (compilerOptions?.composite === true) {
-    console.error(
-      `${packagePath}/tsconfig.test.json must not set compilerOptions.composite = true. ` +
-        'Bun test typechecking is a no-emit validation pass, not a TypeScript build-mode project.',
-    );
-    failures++;
-  }
-  if (compilerOptions?.declaration === true) {
-    console.error(`${packagePath}/tsconfig.test.json must not set compilerOptions.declaration = true`);
-    failures++;
-  }
-  if (compilerOptions?.declarationMap === true) {
-    console.error(`${packagePath}/tsconfig.test.json must not set compilerOptions.declarationMap = true`);
-    failures++;
-  }
-  if (compilerOptions?.outDir === 'dist-test') {
-    console.error(`${packagePath}/tsconfig.test.json must not emit to dist-test`);
-    failures++;
-  }
-  if (typeof compilerOptions?.tsBuildInfoFile === 'string' && compilerOptions.tsBuildInfoFile.includes('dist-test')) {
-    console.error(`${packagePath}/tsconfig.test.json must not write tsbuildinfo under dist-test`);
-    failures++;
-  }
-  return failures;
-}
-
-function validateTsconfigTestReferencePolicy(root: string, packagePath: string): number {
-  const testTsconfigPath = join(root, packagePath, 'tsconfig.test.json');
-  if (!existsSync(testTsconfigPath)) {
-    return 0;
-  }
-  const projectTsconfig = readJsonObject(join(root, packagePath, 'tsconfig.json'));
-  if (!projectTsconfigHasTestReference(projectTsconfig)) {
-    return 0;
-  }
-  console.error(
-    `${packagePath}/tsconfig.json must not reference ./tsconfig.test.json. ` +
-      'Test typechecking is run by the inferred typecheck-tests target with tsc --noEmit, not TypeScript build mode.',
-  );
-  return 1;
-}
-
-function validateTestEntrypointPresence(root: string, packagePath: string, pkg: Record<string, unknown>): number {
-  if (packagePath === '.') {
-    return 0;
-  }
-  if (!packageHasTestFiles(root, packagePath) || hasTestEntrypoint(pkg)) {
-    return 0;
-  }
-  console.error(`${packagePath}: test files require scripts.test or nx.targets.test`);
-  return 1;
-}
-
-function validateTestTypecheckTsconfigPresence(
-  root: string,
-  packagePath: string,
-  pkg: Record<string, unknown>,
-): number {
-  if (packagePath === '.') {
-    return 0;
-  }
-  const testRunners = collectTestRunners(pkg);
-  if (testRunners.size === 0) {
-    return 0;
-  }
-  const path = join(root, packagePath, 'tsconfig.test.json');
-  if (existsSync(path)) {
-    return 0;
-  }
-  console.error(
-    `${packagePath}: ${formatTestRunnerList(testRunners)} requires tsconfig.test.json because those runners do not typecheck test files by default. ` +
-      'Run smoo monorepo validate --fix to create the no-emit test typecheck config.',
-  );
-  return 1;
-}
-
-function applyTestTypecheckTsconfigDefaults(
-  root: string,
-  packagePath: string,
-  pkg: Record<string, unknown>,
-  workspaceNames: ReadonlySet<string>,
-): void {
-  if (packagePath === '.') {
-    return;
-  }
-  const testRunners = collectTestRunners(pkg);
-  if (testRunners.size === 0) {
-    return;
-  }
-  const tsconfigTestPath = join(root, packagePath, 'tsconfig.test.json');
-  const existing = readJsonObject(tsconfigTestPath);
-  const tsconfigTest = existing ?? {};
-  let changed = existing === null;
-
-  changed = applyTsconfigTestDefaults(root, packagePath, pkg, tsconfigTest, workspaceNames, testRunners) || changed;
-  if (changed) {
-    writeJsonObject(tsconfigTestPath, tsconfigTest);
-    console.log(`updated        ${packagePath}/tsconfig.test.json test typecheck config`);
-  } else {
-    console.log(`unchanged      ${packagePath}/tsconfig.test.json test typecheck config`);
-  }
-}
-
-function applyTsconfigTestReferenceDefaults(root: string, packagePath: string): void {
-  const projectTsconfigPath = join(root, packagePath, 'tsconfig.json');
-  const projectTsconfig = readJsonObject(projectTsconfigPath);
-  if (!projectTsconfig || !projectTsconfigHasTestReference(projectTsconfig)) {
-    return;
-  }
-  const references = Array.isArray(projectTsconfig.references) ? projectTsconfig.references : [];
-  projectTsconfig.references = references.filter((entry) => !isRecord(entry) || entry.path !== './tsconfig.test.json');
-  writeJsonObject(projectTsconfigPath, projectTsconfig);
-  console.log(`updated        ${packagePath}/tsconfig.json removed test project reference`);
-}
-
-function applyTsconfigTestDefaults(
-  root: string,
-  packagePath: string,
-  pkg: Record<string, unknown>,
-  tsconfigTest: Record<string, unknown>,
-  workspaceNames: ReadonlySet<string>,
-  testRunners: ReadonlySet<TestRunner>,
-): boolean {
-  let changed = setMissingStringProperty(tsconfigTest, 'extends', defaultTsconfigTestExtends(root, packagePath));
-  const compilerOptions = getOrCreateRecord(tsconfigTest, 'compilerOptions');
-  changed = copyLibCompilerOptions(root, packagePath, compilerOptions) || changed;
-  changed = setBooleanProperty(compilerOptions, 'composite', false) || changed;
-  changed = setBooleanProperty(compilerOptions, 'declaration', false) || changed;
-  changed = setBooleanProperty(compilerOptions, 'declarationMap', false) || changed;
-  changed = setBooleanProperty(compilerOptions, 'emitDeclarationOnly', false) || changed;
-  changed = setBooleanProperty(compilerOptions, 'noEmit', true) || changed;
-  if (testRunners.has('bun')) {
-    changed = mergeStringListProperty(compilerOptions, 'types', ['bun']) || changed;
-  }
-  if (delete compilerOptions.outDir) {
-    changed = true;
-  }
-  if (delete compilerOptions.tsBuildInfoFile) {
-    changed = true;
-  }
-  changed =
-    mergeStringListProperty(tsconfigTest, 'include', [
-      'src/**/*.test.ts',
-      'src/**/*.spec.ts',
-      'src/**/__tests__/**/*.ts',
-      'src/**/__tests__/**/*.tsx',
-      'src/test-suite-tracer.ts',
-    ]) || changed;
-  for (const referencePath of collectTsconfigTestReferencePaths(root, packagePath, pkg, workspaceNames)) {
-    changed = addTsconfigReference(tsconfigTest, referencePath) || changed;
-  }
-  return changed;
-}
-
-function defaultTsconfigTestExtends(root: string, packagePath: string): string {
-  const libTsconfig = readJsonObject(join(root, packagePath, 'tsconfig.lib.json'));
-  return stringProperty(libTsconfig ?? {}, 'extends') ?? '../../tsconfig.base.json';
-}
-
-function copyLibCompilerOptions(root: string, packagePath: string, target: Record<string, unknown>): boolean {
-  const libTsconfig = readJsonObject(join(root, packagePath, 'tsconfig.lib.json'));
-  const libCompilerOptions = libTsconfig ? recordProperty(libTsconfig, 'compilerOptions') : null;
-  if (!libCompilerOptions) {
-    return false;
-  }
-  let changed = false;
-  for (const key of ['baseUrl', 'module', 'moduleResolution', 'jsx', 'lib']) {
-    if (hasOwn(libCompilerOptions, key) && target[key] !== libCompilerOptions[key]) {
-      target[key] = libCompilerOptions[key];
-      changed = true;
-    }
-  }
-  return changed;
-}
-
-function collectTsconfigTestReferencePaths(
-  root: string,
-  packagePath: string,
-  pkg: Record<string, unknown>,
-  workspaceNames: ReadonlySet<string>,
-): string[] {
-  const paths = existsSync(join(root, packagePath, 'tsconfig.lib.json')) ? ['./tsconfig.lib.json'] : [];
-  const packagesByName = new Map(getWorkspacePackages(root).map((workspacePkg) => [workspacePkg.name, workspacePkg]));
-  for (const field of workspaceDependencyFields) {
-    const dependencies = recordProperty(pkg, field);
-    if (!dependencies) {
-      continue;
-    }
-    for (const dependencyName of Object.keys(dependencies)) {
-      if (!workspaceNames.has(dependencyName)) {
-        continue;
-      }
-      const dependencyPackage = packagesByName.get(dependencyName);
-      if (!dependencyPackage) {
-        continue;
-      }
-      const dependencyTsconfig = join(root, dependencyPackage.path, 'tsconfig.lib.json');
-      if (!existsSync(dependencyTsconfig)) {
-        continue;
-      }
-      const refPath = relative(join(root, packagePath), dependencyTsconfig).replaceAll('\\', '/');
-      if (!paths.includes(refPath)) {
-        paths.push(refPath);
-      }
-    }
-  }
-  return paths;
-}
-
-type TestRunner = 'bun' | 'vitest';
-
-function collectTestRunners(pkg: Record<string, unknown>): ReadonlySet<TestRunner> {
-  const runners = new Set<TestRunner>();
-  const scripts = recordProperty(pkg, 'scripts');
-  if (scripts) {
-    for (const command of Object.values(scripts)) {
-      if (typeof command !== 'string') {
-        continue;
-      }
-      const runner = detectTestRunnerFromCommand(command);
-      if (runner) {
-        runners.add(runner);
-      }
-    }
-  }
-  const nx = recordProperty(pkg, 'nx');
-  const targets = nx ? recordProperty(nx, 'targets') : null;
-  if (!targets) {
-    return runners;
-  }
-  for (const target of Object.values(targets)) {
-    if (!isRecord(target)) {
-      continue;
-    }
-    const options = recordProperty(target, 'options');
-    const command = options ? stringProperty(options, 'command') : null;
-    const runner = command ? detectTestRunnerFromCommand(command) : null;
-    if (runner) {
-      runners.add(runner);
-    }
-  }
-  return runners;
-}
-
-function detectTestRunnerFromCommand(command: string): TestRunner | null {
-  const trimmed = parseEnvPrefixedCommand(command).command.trim();
-  if (/^bun\s+test(?:\s|$)/.test(trimmed)) {
-    return 'bun';
-  }
-  if (/^vitest(?:\s|$)/.test(trimmed)) {
-    return 'vitest';
-  }
-  return null;
-}
-
-function formatTestRunnerList(testRunners: ReadonlySet<TestRunner>): string {
-  const labels: string[] = [];
-  if (testRunners.has('bun')) {
-    labels.push('bun test');
-  }
-  if (testRunners.has('vitest')) {
-    labels.push('vitest');
-  }
-  return labels.join(' or ');
-}
-
-function hasTestEntrypoint(pkg: Record<string, unknown>): boolean {
-  const scripts = recordProperty(pkg, 'scripts');
-  if (typeof scripts?.test === 'string') {
-    return true;
-  }
-  const nx = recordProperty(pkg, 'nx');
-  const targets = nx ? recordProperty(nx, 'targets') : null;
-  return Boolean(targets && isRecord(targets.test));
-}
-
-function packageHasTestFiles(root: string, packagePath: string): boolean {
-  return directoryContainsTestFiles(join(root, packagePath));
-}
-
-function directoryContainsTestFiles(path: string): boolean {
-  if (!existsSync(path)) {
-    return false;
-  }
-  for (const entry of readdirSync(path, { withFileTypes: true })) {
-    if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name === 'coverage' || entry.name === '.git') {
-      continue;
-    }
-    const entryPath = join(path, entry.name);
-    if (entry.isDirectory()) {
-      if (directoryContainsTestFiles(entryPath)) {
-        return true;
-      }
-      continue;
-    }
-    const normalizedPath = entryPath.replaceAll('\\', '/');
-    if (normalizedPath.includes('/__tests__/')) {
-      return true;
-    }
-    if (/\.(?:test|spec)\.[cm]?[jt]sx?$/.test(entry.name)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function mergeStringListProperty(record: Record<string, unknown>, key: string, values: string[]): boolean {
-  const rawCurrent = record[key];
-  const current = Array.isArray(rawCurrent)
-    ? rawCurrent.filter((entry): entry is string => typeof entry === 'string')
-    : [];
-  const next = [...current];
-  for (const value of values) {
-    if (!next.includes(value)) {
-      next.push(value);
-    }
-  }
-  if (
-    Array.isArray(rawCurrent) &&
-    next.length === rawCurrent.length &&
-    next.every((entry, index) => entry === rawCurrent[index])
-  ) {
-    return false;
-  }
-  record[key] = next;
-  return true;
-}
-
-function addTsconfigReference(tsconfig: Record<string, unknown>, path: string): boolean {
-  const current = Array.isArray(tsconfig.references)
-    ? tsconfig.references.filter((entry): entry is Record<string, unknown> => isRecord(entry))
-    : [];
-  if (current.some((entry) => entry.path === path)) {
-    return false;
-  }
-  tsconfig.references = [...current, { path }];
-  return true;
-}
-
-function projectTsconfigHasTestReference(projectTsconfig: Record<string, unknown> | null): boolean {
-  return Boolean(
-    projectTsconfig &&
-      Array.isArray(projectTsconfig.references) &&
-      projectTsconfig.references.some((entry) => isRecord(entry) && entry.path === './tsconfig.test.json'),
-  );
-}
-
-function validateBuildZigPolicy(root: string, packagePath: string): number {
-  const path = join(root, packagePath, 'build.zig');
-  if (!existsSync(path)) {
-    return 0;
-  }
-  if (/\bb\.step\s*\(/.test(readFileSync(path, 'utf8'))) {
-    return 0;
-  }
-  console.error(`${packagePath}/build.zig must define at least one b.step(...) target`);
-  return 1;
-}
-
-function applyBuildTargetDefault(nxJson: Record<string, unknown>): boolean {
-  const targetDefaults = getOrCreateRecord(nxJson, 'targetDefaults');
-  const build = getOrCreateRecord(targetDefaults, 'build');
-  let changed = setBooleanProperty(build, 'cache', true);
-  changed = setStringArrayProperty(build, 'outputs', ['{projectRoot}/dist']) || changed;
-  return changed;
-}
-
-function validateBuildTargetDefault(nxJson: Record<string, unknown>): number {
-  const targetDefaults = recordProperty(nxJson, 'targetDefaults');
-  const build = targetDefaults ? recordProperty(targetDefaults, 'build') : null;
-  let failures = 0;
-  if (!build || build.cache !== true) {
-    console.error('nx.json targetDefaults.build.cache must be true');
-    failures++;
-  }
-  const outputs = build?.outputs;
-  if (!Array.isArray(outputs) || outputs.length !== 1 || outputs[0] !== '{projectRoot}/dist') {
-    console.error('nx.json targetDefaults.build.outputs must be ["{projectRoot}/dist"]');
-    failures++;
-  }
-  return failures;
-}
-
-function applyNamedInputDefaults(nxJson: Record<string, unknown>): boolean {
-  const namedInputs = getOrCreateRecord(nxJson, 'namedInputs');
-  let changed = false;
-  if (!Array.isArray(namedInputs.default)) {
-    namedInputs.default = ['{projectRoot}/**/*', 'sharedGlobals'];
-    changed = true;
-  }
-  changed = setStringArrayProperty(namedInputs, 'sharedGlobals', expectedSharedGlobalsNamedInput) || changed;
-  const production = namedInputs.production;
-  if (!Array.isArray(production) || !isPreciseProductionNamedInput(production)) {
-    namedInputs.production = defaultProductionNamedInput;
-    changed = true;
-  }
-  return changed;
-}
-
-function validateNamedInputDefaults(nxJson: Record<string, unknown>): number {
-  const namedInputs = recordProperty(nxJson, 'namedInputs');
-  const production = namedInputs?.production;
-  let failures = 0;
-  if (!namedInputs) {
-    console.error('nx.json namedInputs must be configured so production builds have precise cache inputs.');
-    return 1;
-  }
-  if (!Array.isArray(namedInputs.default)) {
-    console.error(
-      'nx.json namedInputs.default must be an array; smoo allows it to remain broad for non-production tasks.',
-    );
-    failures++;
-  }
-  if (!stringArrayEquals(namedInputs.sharedGlobals, expectedSharedGlobalsNamedInput)) {
-    console.error('nx.json namedInputs.sharedGlobals must include only {workspaceRoot}/.github/workflows/ci.yml');
-    failures++;
-  }
-  if (!Array.isArray(production)) {
-    console.error('nx.json namedInputs.production must be an array of precise production inputs.');
-    return failures + 1;
-  }
-  if (!isPreciseProductionNamedInput(production)) {
-    console.error(
-      'nx.json namedInputs.production must enumerate precise production inputs. Do not include default or broad {projectRoot}/** globs; use language/tool-specific paths such as {projectRoot}/src/**/*, {projectRoot}/Cargo.toml, or {projectRoot}/pyproject.toml.',
-    );
-    failures++;
-  }
-  return failures;
-}
-
-function isPreciseProductionNamedInput(production: unknown[]): boolean {
-  let hasPositiveProjectInput = false;
-  for (const input of production) {
-    if (typeof input !== 'string') {
-      return false;
-    }
-    const normalized = input.startsWith('!') ? input.slice(1) : input;
-    if (impreciseProductionInputs.has(input) || impreciseProductionInputs.has(normalized)) {
-      return false;
-    }
-    if (!input.startsWith('!') && normalized.startsWith('{projectRoot}/')) {
-      hasPositiveProjectInput = true;
-    }
-  }
-  return hasPositiveProjectInput;
-}
-
-function removeColonTargetDefaults(nxJson: Record<string, unknown>): boolean {
-  const targetDefaults = recordProperty(nxJson, 'targetDefaults');
-  if (!targetDefaults) {
-    return false;
-  }
-  let changed = false;
-  for (const targetName of Object.keys(targetDefaults)) {
-    if (targetName.includes(':')) {
-      delete targetDefaults[targetName];
-      changed = true;
-    }
-  }
-  return changed;
-}
-
-function rewriteColonTargetDependenciesInPackage(
-  pkg: Record<string, unknown>,
-  resolvedTargets?: ReadonlySet<string>,
-): boolean {
-  const nx = recordProperty(pkg, 'nx');
-  const targets = nx ? recordProperty(nx, 'targets') : null;
-  if (!targets) {
-    return false;
-  }
-  const projectName = packageNxProjectName(pkg);
-  const scriptTargetAliases = scriptTargetAliasesForProject(pkg, projectName);
-  let changed = false;
-  for (const target of Object.values(targets)) {
-    if (!isRecord(target) || !Array.isArray(target.dependsOn)) {
-      continue;
-    }
-    target.dependsOn = target.dependsOn.map((dependency) => {
-      if (typeof dependency !== 'string' || !dependency.includes(':')) {
-        return dependency;
-      }
-      const next = scriptTargetAliases.get(dependency) ?? replacementTargetName(dependency, null, resolvedTargets);
-      if (!next) {
-        return dependency;
-      }
-      changed = true;
-      return next;
-    });
-  }
-  return changed;
-}
-
-function scriptTargetAliasesForProject(
-  pkg: Record<string, unknown>,
-  projectName: string | null,
-): ReadonlyMap<string, string> {
-  if (!projectName) {
-    return new Map();
-  }
-  const scripts = recordProperty(pkg, 'scripts');
-  if (!scripts) {
-    return new Map();
-  }
-  const aliases = new Map<string, string>();
-  for (const [scriptName, rawCommand] of Object.entries(scripts)) {
-    if (typeof rawCommand !== 'string' || !scriptName.includes(':')) {
-      continue;
-    }
-    const alias = parseNxRunAlias(rawCommand);
-    if (alias?.projectName === projectName && !alias.targetName.includes(':')) {
-      aliases.set(scriptName, alias.targetName);
-    }
-  }
-  return aliases;
-}
-
-function removePackageColonTargets(pkg: Record<string, unknown>): boolean {
-  const nx = recordProperty(pkg, 'nx');
-  const targets = nx ? recordProperty(nx, 'targets') : null;
-  if (!targets) {
-    return false;
-  }
-  let changed = false;
-  for (const targetName of Object.keys(targets)) {
-    if (targetName.includes(':')) {
-      delete targets[targetName];
-      changed = true;
-    }
-  }
-  return changed;
-}
-
-function resolvedProjectTargetNames(
-  resolvedProject?: ReadonlySet<string> | ResolvedProjectTargets,
-): ReadonlySet<string> | undefined {
-  if (!resolvedProject) {
-    return undefined;
-  }
-  return isResolvedProjectTargets(resolvedProject) ? resolvedProject.targets : resolvedProject;
-}
-
-function resolvedProjectBuildDependsOn(
-  resolvedProject?: ReadonlySet<string> | ResolvedProjectTargets,
-): readonly string[] | undefined {
-  if (!isResolvedProjectTargets(resolvedProject)) {
-    return undefined;
-  }
-  return resolvedProject.buildDependsOn;
-}
-
-function isResolvedProjectTargets(
-  value: ReadonlySet<string> | ResolvedProjectTargets | undefined,
-): value is ResolvedProjectTargets {
-  return isRecord(value) && value.targets instanceof Set;
-}
-
-function removeRedundantNoopBuildTarget(
-  pkg: Record<string, unknown>,
-  resolvedProject?: ReadonlySet<string> | ResolvedProjectTargets,
-): boolean {
-  const resolvedTargets = resolvedProjectTargetNames(resolvedProject);
-  const resolvedBuildDependsOn = resolvedProjectBuildDependsOn(resolvedProject);
-  if (!resolvedTargets?.has('build') || !resolvedBuildDependsOn) {
-    return false;
-  }
-  const nx = recordProperty(pkg, 'nx');
-  const targets = nx ? recordProperty(nx, 'targets') : null;
-  const build = targets ? recordProperty(targets, 'build') : null;
-  if (
-    !targets ||
-    !build ||
-    !isNoopTarget(build) ||
-    !targetDependenciesMatchResolvedBuild(build, resolvedBuildDependsOn)
-  ) {
-    return false;
-  }
-  delete targets.build;
-  return true;
-}
-
-function isNoopTarget(target: Record<string, unknown>): boolean {
-  const executor = stringProperty(target, 'executor');
-  if (executor !== null && executor !== 'nx:noop') {
-    return false;
-  }
-  const options = recordProperty(target, 'options');
-  return !options || stringProperty(options, 'command') === null;
-}
-
-function targetDependenciesMatchResolvedBuild(
-  target: Record<string, unknown>,
-  resolvedBuildDependsOn: readonly string[],
-): boolean {
-  if (!Array.isArray(target.dependsOn)) {
-    return false;
-  }
-  const expected = new Set(resolvedBuildDependsOn);
-  if (target.dependsOn.length !== expected.size) {
-    return false;
-  }
-  return target.dependsOn.every((dependency) => {
-    if (typeof dependency !== 'string') {
-      return false;
-    }
-    return expected.has(dependency);
-  });
-}
-
-function isBuildOutputDependencyPattern(dependency: string): boolean {
-  return buildOutputDependencies.includes(dependency);
-}
-
-function migratePackageColonTargets(pkg: Record<string, unknown>, resolvedTargets?: ReadonlySet<string>): boolean {
-  const nx = recordProperty(pkg, 'nx');
-  const targets = nx ? recordProperty(nx, 'targets') : null;
-  if (!targets) {
-    return false;
-  }
-  const projectName = packageNxProjectName(pkg);
-  const scripts = recordProperty(pkg, 'scripts');
-  let changed = false;
-  const renamedTargets = new Map<string, string>();
-
-  for (const [targetName, rawTarget] of Object.entries(targets)) {
-    if (!targetName.includes(':') || !isRecord(rawTarget)) {
-      continue;
-    }
-    const nextTargetName = replacementTargetName(targetName, targetCommand(rawTarget), resolvedTargets);
-    if (!nextTargetName || nextTargetName.includes(':')) {
-      continue;
-    }
-    if (!targetExistsInResolvedProject(nextTargetName, resolvedTargets)) {
-      targets[nextTargetName] = rawTarget;
-    }
-    delete targets[targetName];
-    renamedTargets.set(targetName, nextTargetName);
-    changed = true;
-  }
-
-  if (renamedTargets.size === 0) {
-    return changed;
-  }
-
-  for (const target of Object.values(targets)) {
-    if (isRecord(target)) {
-      changed = rewriteTargetDependencies(target, renamedTargets) || changed;
-    }
-  }
-
-  if (scripts && projectName) {
-    for (const [scriptName, rawCommand] of Object.entries(scripts)) {
-      if (typeof rawCommand !== 'string') {
-        continue;
-      }
-      const alias = parseNxRunAlias(rawCommand);
-      if (!alias || alias.projectName !== projectName) {
-        continue;
-      }
-      const nextTargetName = renamedTargets.get(alias.targetName);
-      if (!nextTargetName) {
-        continue;
-      }
-      scripts[scriptName] = nxRunAlias(projectName, nextTargetName, isContinuousTarget(nextTargetName, ''));
-      changed = true;
-    }
-  }
-
-  return changed;
-}
-
-function rewriteTargetDependencies(
-  target: Record<string, unknown>,
-  renamedTargets: ReadonlyMap<string, string>,
-): boolean {
-  if (!Array.isArray(target.dependsOn)) {
-    return false;
-  }
-  let changed = false;
-  target.dependsOn = target.dependsOn.map((dependency) => {
-    if (typeof dependency !== 'string') {
-      return dependency;
-    }
-    const next = renamedTargets.get(dependency);
-    if (!next) {
-      return dependency;
-    }
-    changed = true;
-    return next;
-  });
-  return changed;
-}
-
-function targetCommand(target: Record<string, unknown>): string | null {
-  const options = recordProperty(target, 'options');
-  return options ? stringProperty(options, 'command') : null;
-}
-
-function replacementTargetName(
-  targetName: string,
-  command: string | null,
-  resolvedTargets?: ReadonlySet<string>,
-): string | null {
-  if (command) {
-    const commandTargetName = targetNameForCommand(command);
-    if (commandTargetName) {
-      return commandTargetName;
-    }
-  }
-  const suffix = targetName.slice(targetName.lastIndexOf(':') + 1);
-  if (suffix && targetExistsInResolvedProject(suffix, resolvedTargets)) {
-    return suffix;
-  }
-  const dashed = targetName.replaceAll(':', '-');
-  if (targetExistsInResolvedProject(dashed, resolvedTargets)) {
-    return dashed;
-  }
-  return null;
-}
-
-function expectedNxJsTypescriptPlugin(): Record<string, unknown> {
-  return {
-    plugin: nxJsTypescriptPlugin,
-    options: {
-      typecheck: { targetName: 'typecheck' },
-      build: {
-        targetName: 'tsc-js',
-        configName: 'tsconfig.lib.json',
-        buildDepsName: 'build-deps',
-        watchDepsName: 'watch-deps',
-      },
-    },
-  };
-}
-
-function upsertNxPlugin(plugins: readonly unknown[], plugin: string | Record<string, unknown>): unknown[] {
-  const pluginName = typeof plugin === 'string' ? plugin : stringProperty(plugin, 'plugin');
-  const next = plugins.filter((entry) => nxPluginName(entry) !== pluginName);
-  next.push(plugin);
-  return next;
-}
-
-function nxPluginName(value: unknown): string | null {
-  if (typeof value === 'string') {
-    return value;
-  }
-  return isRecord(value) ? stringProperty(value, 'plugin') : null;
-}
-
-function isNxJsTypescriptPlugin(value: unknown): value is Record<string, unknown> {
-  return isRecord(value) && stringProperty(value, 'plugin') === nxJsTypescriptPlugin;
-}
-
-function isSmoothBricksNxPluginRecord(value: unknown): boolean {
-  return isRecord(value) && stringProperty(value, 'plugin') === smoothBricksNxPlugin;
-}
-
-function nxJsBuildTargetName(plugin: Record<string, unknown>): string | null {
-  const options = recordProperty(plugin, 'options');
-  const build = options ? recordProperty(options, 'build') : null;
-  return build ? stringProperty(build, 'targetName') : null;
-}
-
-interface PackageNxConfig {
-  nx: Record<string, unknown>;
-  targets: Record<string, unknown> | null;
-  changed: boolean;
-}
-
-interface PackageNxTargetsConfig {
-  nx: Record<string, unknown>;
-  targets: Record<string, unknown>;
-  changed: boolean;
-}
-
-function applyPackageNxConfig(
-  pkg: Record<string, unknown>,
-  options: { projectName: string; targets: true },
-): PackageNxTargetsConfig;
-function applyPackageNxConfig(pkg: Record<string, unknown>, options: { projectName: string }): PackageNxConfig;
-function applyPackageNxConfig(
-  pkg: Record<string, unknown>,
-  options: { projectName: string; targets?: boolean },
-): PackageNxConfig {
-  const nx = getOrCreateRecord(pkg, 'nx');
-  const changed = setStringProperty(nx, 'name', options.projectName);
-  const targets = options.targets === true ? getOrCreateRecord(nx, 'targets') : null;
-  return { nx, targets, changed };
-}
-
-function packageNxProjectName(pkg: Record<string, unknown>): string | null {
-  const nx = recordProperty(pkg, 'nx');
-  return (nx ? stringProperty(nx, 'name') : null) ?? stringProperty(pkg, 'name');
-}
-
-interface ScriptRewrite {
-  targetName: string;
-  continuous: boolean;
-  command: string;
-  env: Record<string, string>;
-}
-
-function classifyScriptRewrite(scriptName: string, command: string): ScriptRewrite | null {
-  if (isNxRunAlias(command) || isBlockedScriptCommand(scriptName, command)) {
+function suggestNxProjectName(rootPackageName: string, packageName: string): string | null {
+  const rootScope = npmScope(rootPackageName);
+  if (!rootScope || npmScope(packageName) !== rootScope) {
     return null;
   }
-  const parsed = parseEnvPrefixedCommand(command);
-  const targetName = rewriteTargetName(scriptName, parsed.command);
-  if (!targetName || !isSafeNxScriptCommand(parsed.command)) {
-    return null;
-  }
-  return {
-    targetName,
-    continuous: isContinuousTarget(targetName, parsed.command),
-    command: parsed.command,
-    env: parsed.env,
-  };
+  return unscopedPackageName(packageName);
 }
 
-function rewriteTargetName(scriptName: string, command: string): string | null {
-  return targetNameForCommand(command) ?? (scriptName.includes(':') ? null : scriptName);
+function npmScope(packageName: string): string | null {
+  const match = /^(@[^/]+)\//.exec(packageName);
+  return match?.[1] ?? null;
 }
 
-function targetNameForCommand(command: string): string | null {
-  const trimmed = command.trim();
-  if (/^tsc\s+--build\s+tsconfig\.lib\.json(?:\s|$)/.test(trimmed)) {
-    return 'tsc-js';
-  }
-  if (/^tsdown(?:\s|$)/.test(trimmed)) {
-    return 'tsdown-js';
-  }
-  const zigStep = /^zig\s+build\s+([A-Za-z0-9_-]+)(?:\s|$)/.exec(trimmed)?.[1];
-  if (zigStep) {
-    return `zig-${zigStep}`;
-  }
-  if (/^wrangler\s+build(?:\s|$)/.test(trimmed)) {
-    return 'build';
-  }
-  return null;
-}
-
-function nxRunAlias(projectName: string, targetName: string, continuous: boolean): string {
-  if (targetName === 'test') {
-    return boundedTestScriptAlias(projectName);
-  }
-  const flags = continuous || targetName === 'test' ? ' --tui=false --outputStyle=stream' : '';
-  return `nx run ${projectName}:${targetName}${flags}`;
-}
-
-function expectedTargetDependencies(targetName: string): string[] {
-  return targetName === 'preview' ? ['build'] : ['^build'];
-}
-
-function applyTargetDependencyPolicy(target: Record<string, unknown>, targetName: string): boolean {
-  return setStringArrayProperty(target, 'dependsOn', expectedTargetDependencies(targetName));
-}
-
-function targetExistsInResolvedProject(targetName: string, resolvedTargets?: ReadonlySet<string>): boolean {
-  return resolvedTargets?.has(targetName) === true;
-}
-
-function setStringArrayProperty(record: Record<string, unknown>, key: string, value: string[]): boolean {
-  const current = record[key];
-  if (stringArrayEquals(current, value)) {
-    return false;
-  }
-  record[key] = value;
-  return true;
-}
-
-function stringArrayEquals(value: unknown, expected: readonly string[]): boolean {
-  return (
-    Array.isArray(value) && value.length === expected.length && value.every((entry, index) => entry === expected[index])
-  );
-}
-
-function targetDependsOn(target: Record<string, unknown>, expected: string[]): boolean {
-  const dependsOn = target.dependsOn;
-  return Array.isArray(dependsOn) && expected.every((entry) => dependsOn.includes(entry));
-}
-
-function hasWorkspaceDependency(pkg: Record<string, unknown>, workspaceNames: ReadonlySet<string>): boolean {
-  for (const field of workspaceDependencyFields) {
-    const dependencies = recordProperty(pkg, field);
-    if (!dependencies) {
-      continue;
-    }
-    for (const name of Object.keys(dependencies)) {
-      if (workspaceNames.has(name)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-function isSafeNxScriptCommand(command: string): boolean {
-  const trimmed = command.trim();
-  return (
-    /^bun\s+test(?:\s|$)/.test(trimmed) ||
-    /^tsc-bun-test(?:\s|$)/.test(trimmed) ||
-    /^vitest(?:\s|$)/.test(trimmed) ||
-    /^tsc\s+(?:--build|--noEmit)(?:\s|$)/.test(trimmed) ||
-    /^tsdown(?:\s|$)/.test(trimmed) ||
-    /^vite\s+(?:build|dev|preview)(?:\s|$)/.test(trimmed) ||
-    /^astro\s+(?:build|dev|preview|check)(?:\s|$)/.test(trimmed) ||
-    /^zig\s+build(?:\s|$)/.test(trimmed) ||
-    /^bun\s+[./\w-]*build[\w.-]*\.ts(?:\s|$)/.test(trimmed) ||
-    /(?:^|\s)(?:bench|benchmark)(?:\s|$)/.test(trimmed) ||
-    /^wrangler\s+build(?:\s|$)/.test(trimmed)
-  );
-}
-
-function isBlockedScriptCommand(scriptName: string, command: string): boolean {
-  if (/^(?:deploy|db|release|sync|subtree|publish|pack)(?::|$)/.test(scriptName)) {
-    return true;
-  }
-  const trimmed = parseEnvPrefixedCommand(command).command;
-  return /^(?:deploy|db|release|sync|subtree|publish|pack)(?:\s|$)/.test(trimmed) || trimmed === 'astro';
-}
-
-function parseEnvPrefixedCommand(command: string): { command: string; env: Record<string, string> } {
-  const env: Record<string, string> = {};
-  let rest = command.trimStart();
-  while (true) {
-    const match = /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(rest);
-    if (!match?.[1]) {
-      return { command: rest.trim(), env };
-    }
-    let index = match[0].length;
-    let value = '';
-    const quote = rest[index];
-    if (quote === '"' || quote === "'") {
-      index += 1;
-      const end = rest.indexOf(quote, index);
-      if (end === -1) {
-        return { command: command.trim(), env: {} };
-      }
-      value = rest.slice(index, end);
-      index = end + 1;
-    } else {
-      const end = rest.slice(index).search(/\s/);
-      const valueEnd = end === -1 ? rest.length : index + end;
-      value = rest.slice(index, valueEnd);
-      index = valueEnd;
-    }
-    if (index < rest.length && !/\s/.test(rest[index] ?? '')) {
-      return { command: command.trim(), env: {} };
-    }
-    env[match[1]] = value;
-    rest = rest.slice(index).trimStart();
-  }
-}
-
-function isContinuousTarget(targetName: string, command: string): boolean {
-  return (
-    /(?:^|:|-)(?:dev|serve|preview|watch)(?:$|:|-)/.test(targetName) ||
-    /(?:^|\s)(?:dev|serve|preview|--watch|-w)(?:\s|$)/.test(command)
-  );
-}
-
-function isNxRunAlias(command: string): boolean {
-  return /^nx\s+run\s+\S+:\S+/.test(command.trim());
-}
-
-function parseNxRunAlias(command: string): { projectName: string; targetName: string } | null {
-  const match = /^nx\s+run\s+([^:\s]+):([^\s]+)(?:\s|$)/.exec(command.trim());
-  if (!match?.[1] || !match[2]) {
-    return null;
-  }
-  return { projectName: match[1], targetName: match[2] };
+function unscopedPackageName(packageName: string): string {
+  return packageName.startsWith('@') ? packageName.slice(packageName.indexOf('/') + 1) : packageName;
 }
 
 function recordKeysAreSorted(record: Record<string, unknown>): boolean {
@@ -1857,43 +483,6 @@ function sortRecordInPlace(record: Record<string, unknown>): boolean {
   for (const [key, value] of entries) {
     record[key] = value;
   }
-  return true;
-}
-
-function isScriptRunnerCommand(command: string | null, scriptName: string): boolean {
-  if (!command) {
-    return false;
-  }
-  const escaped = escapeRegex(scriptName);
-  return new RegExp(`^(?:bun|npm)\\s+run\\s+${escaped}(?:\\s|$)`).test(command.trim());
-}
-
-function escapeRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function suggestNxProjectName(rootPackageName: string, packageName: string): string | null {
-  const rootScope = npmScope(rootPackageName);
-  if (!rootScope || npmScope(packageName) !== rootScope) {
-    return null;
-  }
-  return unscopedPackageName(packageName);
-}
-
-function npmScope(packageName: string): string | null {
-  const match = /^(@[^/]+)\//.exec(packageName);
-  return match?.[1] ?? null;
-}
-
-function unscopedPackageName(packageName: string): string {
-  return packageName.startsWith('@') ? packageName.slice(packageName.indexOf('/') + 1) : packageName;
-}
-
-function setBooleanProperty(record: Record<string, unknown>, key: string, value: boolean): boolean {
-  if (record[key] === value) {
-    return false;
-  }
-  record[key] = value;
   return true;
 }
 
