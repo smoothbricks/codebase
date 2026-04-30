@@ -19,6 +19,7 @@ import {
   writeJsonObject,
 } from '../lib/json.js';
 import {
+  getWorkspacePackageManifests,
   getWorkspacePackages,
   listPackageJsonRecords,
   listPublicPackages,
@@ -241,7 +242,7 @@ export function applyNxProjectNameDefaults(root: string): void {
   if (!rootName) {
     return;
   }
-  for (const pkg of getWorkspacePackages(root)) {
+  for (const pkg of getWorkspacePackageManifests(root)) {
     const suggestedName = suggestNxProjectName(rootName, pkg.name);
     if (!suggestedName) {
       continue;
@@ -264,7 +265,7 @@ export function listNxProjectNames(root: string): string[] {
   const rootPackage = readJsonObject(join(root, 'package.json'));
   const rootName = rootPackage ? stringProperty(rootPackage, 'name') : null;
   const names: string[] = [];
-  for (const pkg of getWorkspacePackages(root)) {
+  for (const pkg of getWorkspacePackageManifests(root)) {
     const nx = recordProperty(pkg.json, 'nx');
     const configuredName = nx ? stringProperty(nx, 'name') : null;
     const suggestedName = rootName ? suggestNxProjectName(rootName, pkg.name) : null;
@@ -409,7 +410,7 @@ export function validateNxProjectNames(root: string): number {
     return 0;
   }
   let failures = 0;
-  for (const pkg of getWorkspacePackages(root)) {
+  for (const pkg of getWorkspacePackageManifests(root)) {
     const suggestedName = suggestNxProjectName(rootName, pkg.name);
     if (!suggestedName) {
       continue;

@@ -14,6 +14,15 @@ export interface PackageInfo {
   json: Record<string, unknown>;
 }
 
+export interface WorkspacePackageManifest {
+  name: string;
+  projectName: string;
+  private: boolean;
+  path: string;
+  packageJsonPath: string;
+  json: Record<string, unknown>;
+}
+
 export interface PackageJson extends Record<string, unknown> {
   name?: string;
   version?: string;
@@ -88,35 +97,66 @@ export function getWorkspacePackages(root: string): PackageInfo[] {
   return getWorkspacePackagesForPatterns(root, getWorkspacePatternsFromPackageJson(rootPackage.json));
 }
 
+export function getWorkspacePackageManifests(root: string): WorkspacePackageManifest[] {
+  const rootPackage = readPackageJsonObject(join(root, 'package.json'));
+  if (!rootPackage) {
+    throw new Error('package.json not found or invalid');
+  }
+  return getWorkspacePackageManifestsForPatterns(root, getWorkspacePatternsFromPackageJson(rootPackage));
+}
+
 function getWorkspacePackagesForPatterns(root: string, workspacePatterns: string[]): PackageInfo[] {
   const packages: PackageInfo[] = [];
-  for (const pattern of workspacePatterns) {
-    if (!pattern.endsWith('/*')) {
+  for (const pkgPath of listWorkspacePackageJsonPaths(root, workspacePatterns)) {
+    const pkg = readPackageJson(pkgPath);
+    if (!pkg?.name || !pkg.version) {
       continue;
     }
+    packages.push({
+      name: pkg.name,
+      projectName: pkg.projectName,
+      version: pkg.version,
+      private: pkg.private,
+      tags: pkg.tags,
+      path: relative(root, dirname(pkgPath)),
+      packageJsonPath: pkg.packageJsonPath,
+      json: pkg.json,
+    });
+  }
+  return packages.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function getWorkspacePackageManifestsForPatterns(
+  root: string,
+  workspacePatterns: string[],
+): WorkspacePackageManifest[] {
+  const manifests: WorkspacePackageManifest[] = [];
+  for (const pkgPath of listWorkspacePackageJsonPaths(root, workspacePatterns)) {
+    const pkg = readWorkspacePackageManifest(pkgPath);
+    if (pkg) {
+      manifests.push(pkg);
+    }
+  }
+  return manifests.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function listWorkspacePackageJsonPaths(root: string, workspacePatterns: string[]): string[] {
+  const paths: string[] = [];
+  for (const pattern of workspacePatterns) {
+    if (!pattern.endsWith('/*')) {
+      paths.push(join(root, pattern, 'package.json'));
+      continue;
+    }
+
     const parent = join(root, pattern.slice(0, -2));
     if (!statSync(parent, { throwIfNoEntry: false })?.isDirectory()) {
       continue;
     }
     for (const entry of readdirSync(parent)) {
-      const pkgPath = join(parent, entry, 'package.json');
-      const pkg = readPackageJson(pkgPath);
-      if (!pkg?.name || !pkg.version) {
-        continue;
-      }
-      packages.push({
-        name: pkg.name,
-        projectName: pkg.projectName,
-        version: pkg.version,
-        private: pkg.private,
-        tags: pkg.tags,
-        path: relative(root, dirname(pkgPath)),
-        packageJsonPath: pkg.packageJsonPath,
-        json: pkg.json,
-      });
+      paths.push(join(parent, entry, 'package.json'));
     }
   }
-  return packages.sort((a, b) => a.name.localeCompare(b.name));
+  return paths;
 }
 
 export function listPackageJsonRecords(root: string): PackageInfo[] {
@@ -162,6 +202,22 @@ export function readPackageJson(path: string): PackageInfo | null {
     version: parsed.version,
     private: privateValue,
     tags,
+    path: dirname(path),
+    packageJsonPath: path,
+    json: parsed,
+  };
+}
+
+export function readWorkspacePackageManifest(path: string): WorkspacePackageManifest | null {
+  const parsed = readPackageJsonObject(path);
+  if (!isRecord(parsed) || !hasOwnString(parsed, 'name')) {
+    return null;
+  }
+  const privateValue = hasOwn(parsed, 'private') && typeof parsed.private === 'boolean' ? parsed.private : false;
+  return {
+    name: parsed.name,
+    projectName: packageNxProjectName(parsed),
+    private: privateValue,
     path: dirname(path),
     packageJsonPath: path,
     json: parsed,
