@@ -531,6 +531,7 @@ async function releaseVersionPackages(
   return autoReleaseCandidatePackages(
     {
       gitRefExists: (ref) => gitRefExists(root, ref),
+      latestStableReleaseRef: (projectName) => latestStableReleaseRef(root, projectName),
       packageChangedFilesSince: (ref, packagePath) => packageChangedFilesSince(root, ref, packagePath),
       packageJsonAtRef: (ref, packagePath) => packageJsonAtRef(root, ref, packagePath),
       currentPackageJson: (packagePath) => currentPackageJson(root, packagePath),
@@ -1069,6 +1070,28 @@ async function fetchReleaseRefs(root: string, remote: string, branch: string): P
 async function gitRefExists(root: string, ref: string): Promise<boolean> {
   const result = await $`git rev-parse --verify ${ref}`.cwd(root).quiet().nothrow();
   return result.exitCode === 0;
+}
+
+async function latestStableReleaseRef(root: string, projectName: string): Promise<string | null> {
+  // List tags matching <projectName>@* sorted newest-first by version, then
+  // return the first non-prerelease tag as a full ref.
+  const pattern = `${projectName}@*`;
+  const result = await $`git tag --list ${pattern} --sort=-v:refname`.cwd(root).quiet().nothrow();
+  if (result.exitCode !== 0) {
+    return null;
+  }
+  const tags = decode(result.stdout)
+    .split('\n')
+    .map((t) => t.trim())
+    .filter(Boolean);
+  const prefix = `${projectName}@`;
+  for (const tagName of tags) {
+    const version = tagName.slice(prefix.length);
+    if (version && !version.includes('-')) {
+      return `refs/tags/${tagName}`;
+    }
+  }
+  return null;
 }
 
 async function packageChangedFilesSince(root: string, ref: string, packagePath: string): Promise<string[]> {

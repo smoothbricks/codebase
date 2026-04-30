@@ -4,6 +4,7 @@ import { releaseTag } from './core.js';
 
 export interface AutoReleaseCandidateShell {
   gitRefExists(ref: string): Promise<boolean>;
+  latestStableReleaseRef(projectName: string): Promise<string | null>;
   packageChangedFilesSince(ref: string, packagePath: string): Promise<string[]>;
   packageJsonAtRef(ref: string, packagePath: string): Promise<Record<string, unknown> | null>;
   currentPackageJson(packagePath: string): Promise<Record<string, unknown> | null>;
@@ -62,7 +63,19 @@ async function isAutoReleaseCandidate<Package extends ReleasePackageInfo>(
   if (await shell.gitRefExists(tagRef)) {
     return packageHasReleasableChangesSince(shell, tagRef, pkg);
   }
-  return !pkg.version.includes('-') && shell.packageHasHistory(pkg.path);
+  if (pkg.version.includes('-')) {
+    // Prerelease version (e.g. 1.0.1-next.0) without its own tag: check for
+    // releasable changes since the last stable release. The prerelease bump is
+    // added after every release to make it obvious during development that the
+    // working version is unreleased — it should not suppress the next release.
+    const stableRef = await shell.latestStableReleaseRef(pkg.projectName);
+    if (stableRef) {
+      return packageHasReleasableChangesSince(shell, stableRef, pkg);
+    }
+    // No prior stable release — first release must be intentional, not auto.
+    return false;
+  }
+  return shell.packageHasHistory(pkg.path);
 }
 
 async function packageHasReleasableChangesSince<Package extends ReleasePackageInfo>(
