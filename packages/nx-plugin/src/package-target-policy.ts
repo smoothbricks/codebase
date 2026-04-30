@@ -291,12 +291,24 @@ function parseNxRunAlias(command: string): { projectName: string; targetName: st
   return { projectName: match[1], targetName: match[2] };
 }
 
-export function nxRunAlias(projectName: string, targetName: string, continuous: boolean): string {
+export function nxRunAlias(
+  projectName: string,
+  targetName: string,
+  continuous: boolean,
+  command?: string | null,
+): string {
   if (targetName === 'test') {
     return boundedTestScriptAlias(projectName);
   }
-  const flags = continuous || targetName === 'test' ? ' --outputStyle=stream' : '';
+  const flags = continuous ? ` --outputStyle=${nxRunOutputStyle(command)}` : '';
   return `nx run ${projectName}:${targetName}${flags}`;
+}
+
+function nxRunOutputStyle(command?: string | null): 'stream' | 'dynamic-legacy' {
+  if (command && /(?:^|\s)(?:astro|vite)\s+dev(?:\s|$)/.test(command)) {
+    return 'dynamic-legacy';
+  }
+  return 'stream';
 }
 
 function isContinuousTarget(targetName: string, command: string): boolean {
@@ -677,7 +689,11 @@ function validatePackageScriptPolicy(
       });
       continue;
     }
-    const expectedAlias = nxRunAlias(projectName, rewrite.targetName, rewrite.continuous);
+    const target = targets ? recordProperty(targets, rewrite.targetName) : null;
+    const targetOptions = target ? recordProperty(target, 'options') : null;
+    const command = targetOptions ? stringProperty(targetOptions, 'command') : null;
+    const rewriteCommand = 'command' in rewrite ? rewrite.command : null;
+    const expectedAlias = nxRunAlias(projectName, rewrite.targetName, rewrite.continuous, command ?? rewriteCommand);
     if (rawCommand !== expectedAlias) {
       issues.push({
         path: packagePath,
@@ -685,7 +701,6 @@ function validatePackageScriptPolicy(
       });
       continue;
     }
-    const target = targets ? recordProperty(targets, rewrite.targetName) : null;
     if (
       !target &&
       rewrite.targetName !== scriptName &&
@@ -699,8 +714,6 @@ function validatePackageScriptPolicy(
     if (rewrite.targetName === 'test') {
       continue;
     }
-    const targetOptions = target ? recordProperty(target, 'options') : null;
-    const command = targetOptions ? stringProperty(targetOptions, 'command') : null;
     if (!target || stringProperty(target, 'executor') !== 'nx:run-commands' || !targetOptions || !command) {
       issues.push({
         path: packagePath,
@@ -1005,7 +1018,7 @@ function applyPackageScriptPolicyForPkg(
       continue;
     }
     const targetName = rewrite.targetName;
-    const alias = nxRunAlias(projectName, targetName, rewrite.continuous);
+    const alias = nxRunAlias(projectName, targetName, rewrite.continuous, rewrite.command);
     if (targetName === 'test') {
       continue;
     }

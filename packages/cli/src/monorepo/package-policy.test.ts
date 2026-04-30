@@ -800,8 +800,8 @@ describe('workspace package script policy', () => {
       const app = await readJson(join(root, 'packages/app/package.json'));
       expect(app.dependencies).toEqual({ '@smoothbricks/lib': 'workspace:*' });
       expect(app.scripts).toEqual({
-        dev: 'nx run app:dev --outputStyle=stream',
-        serve: 'nx run app:serve --outputStyle=stream',
+        dev: 'nx run app:dev --outputStyle=dynamic-legacy',
+        serve: 'nx run app:serve --outputStyle=dynamic-legacy',
         test: 'nx run app:test --outputStyle=stream',
         build: 'nx run app:build',
         deploy: 'wrangler deploy',
@@ -902,7 +902,7 @@ describe('workspace package script policy', () => {
 
       const website = await readJson(join(root, 'packages/website/package.json'));
       expect(website.scripts).toEqual({
-        dev: 'nx run website:dev --outputStyle=stream',
+        dev: 'nx run website:dev --outputStyle=dynamic-legacy',
         build: 'nx run website:build',
         preview: 'nx run website:preview --outputStyle=stream',
         astro: 'astro',

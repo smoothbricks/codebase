@@ -80,8 +80,9 @@ Packages with internal workspace dependencies also need Nx-aware scripts so depe
 For safe build, test, typecheck, benchmark, dev, and preview commands, `smoo monorepo validate --fix` moves the real
 command into `package.json` `nx.targets.<target>.options.command`, sets `cwd` to `{projectRoot}`, and replaces the
 script with an `nx run <project>:<target>` alias. Continuous commands such as `astro dev`, `vite dev`, and previews get
-`--outputStyle=stream` on the alias and `continuous: true` on the Nx target. Simple leading environment assignments are
-moved into `nx.targets.<target>.options.env` so commands such as
+an explicit output style on the alias and `continuous: true` on the Nx target. Astro/Vite dev servers use
+`--outputStyle=dynamic-legacy`; other continuous targets use `--outputStyle=stream`. Simple leading environment
+assignments are moved into `nx.targets.<target>.options.env` so commands such as
 `NODE_OPTIONS='--import=extensionless/register' astro dev` remain shell-independent.
 
 The rewrite is intentionally conservative. `smoo` does not rewrite deploy, database, release, sync, subtree, publish, or
