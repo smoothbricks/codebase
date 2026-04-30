@@ -191,11 +191,12 @@ Concrete target sources:
 - `build`: aggregate inferred only when at least one concrete build target exists.
 - `lint`: aggregate validation target, never a formatter.
 
-**Target names are tool-output names.** Use names like `tsc-js` and `zig-wasm`. `build` and `lint` are aggregates that
-depend on tool-output targets. Do not create colon-style Nx target names such as `build:wasm` or `lint:fix`: Nx CLI
-syntax already uses `project:target:configuration`, so colon target names are ambiguous with configurations and make
-package-script aliases harder to reason about. Package scripts may still be named `build:wasm` if they delegate to a
-real target such as `nx run pkg:zig-wasm`.
+**Target names are `{tool}-{output}` names.** Use names like `tsc-js`, `tsdown-js`, and `zig-wasm`. `build` and `lint`
+are aggregates that depend on output-family wildcards such as `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`,
+`*-native`, `*-napi`, `*-bun`, and `*-wasm`. Do not create colon-style Nx target names such as `build:wasm` or
+`lint:fix`: Nx CLI syntax already uses `project:target:configuration`, so colon target names are ambiguous with
+configurations and make package-script aliases harder to reason about. Package scripts may still be named `build:wasm`
+if they delegate to a real target such as `nx run pkg:zig-wasm`.
 
 **`typecheck-tests` is no-emit only.** Packages that use `bun test` must have `tsconfig.test.json` because Bun executes
 tests without typechecking. That config gets `typecheck-tests`; the test tsconfig must use `noEmit` and must not write

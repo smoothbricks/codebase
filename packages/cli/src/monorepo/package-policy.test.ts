@@ -14,6 +14,20 @@ import {
   validateWorkspaceDependencies,
 } from './package-policy.js';
 
+const buildOutputDependencies = [
+  '^build',
+  '*-js',
+  '*-web',
+  '*-html',
+  '*-css',
+  '*-ios',
+  '*-android',
+  '*-native',
+  '*-napi',
+  '*-bun',
+  '*-wasm',
+];
+
 describe('root smoo monorepo policy', () => {
   afterEach(() => {
     console.error = originalConsoleError;
@@ -428,6 +442,107 @@ describe('workspace package script policy', () => {
     }
   });
 
+  it('accepts wildcard aggregate build dependencies', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [
+        {
+          dir: 'native',
+          name: '@smoothbricks/native',
+          nx: {
+            name: 'native',
+            targets: {
+              build: { executor: 'nx:noop', dependsOn: buildOutputDependencies },
+            },
+          },
+        },
+      ],
+    });
+    try {
+      expect(validateWorkspaceDependencies(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('removes noop aggregate build targets when wildcard dependencies match resolved Nx plugin output', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [
+        {
+          dir: 'native',
+          name: '@smoothbricks/native',
+          nx: {
+            name: 'native',
+            targets: {
+              build: { executor: 'nx:noop', dependsOn: buildOutputDependencies },
+            },
+          },
+        },
+      ],
+    });
+    try {
+      const resolvedTargetsByProject = new Map([
+        ['native', { targets: new Set(['build', 'tsc-js', 'zig-wasm']), buildDependsOn: buildOutputDependencies }],
+      ]);
+
+      applyWorkspaceDependencyDefaults(root, { resolvedTargetsByProject });
+
+      const native = await readJson(join(root, 'packages/native/package.json'));
+      expect(native.nx).toEqual({ name: 'native', targets: {} });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves explicit repo-local output targets with cache metadata', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [
+        {
+          dir: 'bundled',
+          name: '@smoothbricks/bundled',
+          nx: {
+            name: 'bundled',
+            targets: {
+              build: { executor: 'nx:noop', dependsOn: buildOutputDependencies },
+              'tsdown-js': {
+                executor: 'nx:run-commands',
+                cache: true,
+                inputs: ['production', '^production'],
+                outputs: ['{projectRoot}/dist'],
+                options: { command: 'tsdown', cwd: '{projectRoot}' },
+              },
+            },
+          },
+        },
+      ],
+    });
+    try {
+      expect(validateWorkspaceDependencies(root)).toBe(0);
+
+      applyWorkspaceDependencyDefaults(root);
+
+      const bundled = await readJson(join(root, 'packages/bundled/package.json'));
+      expect(bundled).toMatchObject({
+        nx: {
+          targets: {
+            build: { dependsOn: buildOutputDependencies },
+            'tsdown-js': {
+              executor: 'nx:run-commands',
+              cache: true,
+              inputs: ['production', '^production'],
+              outputs: ['{projectRoot}/dist'],
+              options: { command: 'tsdown', cwd: '{projectRoot}' },
+            },
+          },
+        },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('rejects old test tsconfig output and build.zig without steps', async () => {
     const root = await createWorkspace({
       rootName: '@smoothbricks/codebase',
@@ -516,8 +631,8 @@ describe('workspace package script policy', () => {
       applyWorkspaceDependencyDefaults(root);
 
       const testTsconfig = await readJson(join(root, 'packages/app/tsconfig.test.json'));
-      expect(testTsconfig.compilerOptions).toMatchObject({ noEmit: true });
-      expect(testTsconfig.compilerOptions?.types).toBeUndefined();
+      expect(testTsconfig).toMatchObject({ compilerOptions: { noEmit: true } });
+      expect(testTsconfig).not.toMatchObject({ compilerOptions: { types: expect.anything() } });
       expect(validateWorkspaceDependencies(root)).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });

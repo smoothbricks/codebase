@@ -127,8 +127,8 @@ carries only what the **receiver** needs to act. For the full rules with code ex
 
 ### Build and Development
 
-- **Build a project**: `nx build <project-name>`; this is an aggregate over tool-output targets such as `tsc-js` and
-  `zig-wasm`
+- **Build a project**: `nx build <project-name>`; this is an aggregate over output-family targets such as `tsc-js`,
+  `tsdown-js`, and `zig-wasm`
 - **Type check source**: `nx tsc-js <project-name>`; `@nx/js/typescript` owns the `tsconfig.lib.json` -> `tsc-js`
   inferred target
 - **Generate a new library**: `nx g @nx/js:lib packages/<name> --publishable --importPath=@my-org/<name>`
@@ -233,10 +233,11 @@ This is an Nx-based monorepo using Bun as the package manager, with devenv/diren
   targets exist.
 - **Bun test packages require test typechecking:** `bun test` executes tests without typechecking, so packages that use
   it must have a no-emit `tsconfig.test.json` that infers `typecheck-tests`.
-- **Nx target names are tool-output names** - use `tsc-js` and `zig-wasm`; `build` and `lint` are aggregates. Do not use
-  colon target names such as `build:wasm` or `lint:fix`: Nx CLI syntax already means `project:target:configuration`, so
-  colon target names are ambiguous with configurations. Package scripts may still be named `build:wasm` when they
-  delegate to a real target like `nx run pkg:zig-wasm`.
+- **Nx target names are `{tool}-{output}` names** - use `tsc-js`, `tsdown-js`, and `zig-wasm`; `build` and `lint` are
+  aggregates over output-family wildcards like `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`,
+  `*-napi`, `*-bun`, and `*-wasm`. Do not use colon target names such as `build:wasm` or `lint:fix`: Nx CLI syntax
+  already means `project:target:configuration`, so colon target names are ambiguous with configurations. Package scripts
+  may still be named `build:wasm` when they delegate to a real target like `nx run pkg:zig-wasm`.
 - **Test typechecking is no-emit** - `typecheck-tests` is inferred from `tsconfig.test.json`, which must use `noEmit`,
   must not be `composite`, must not write `dist-test`, and must not be referenced from package root `tsconfig.json`.
 - **Zig package setup** - `build.zig` must declare at least one `b.step(...)`; each step becomes a `zig-*` target.

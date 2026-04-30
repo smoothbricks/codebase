@@ -16,7 +16,8 @@ target `tsc-js`; this plugin must not duplicate or rename that target.
 
 ## Nx Target Naming
 
-Target names are tool-output names. Use names like `tsc-js` and `zig-wasm`; `build` and `lint` are aggregates.
+Target names are `{tool}-{output}` names. Use names like `tsc-js`, `tsdown-js`, and `zig-wasm`; `build` and `lint` are
+aggregates.
 
 Concrete targets come from concrete files:
 
@@ -26,7 +27,9 @@ Concrete targets come from concrete files:
   the corresponding watch command and makes it depend on `typecheck-tests`.
 - `zig-*` is inferred from `build.zig`; each explicit `b.step("name", ...)` becomes `zig-name`.
 - `build` is inferred only when the project has at least one concrete build target to run, such as `tsc-js` from the
-  official TypeScript plugin or a `zig-*` target from this plugin.
+  official TypeScript plugin, a package-local target like `tsdown-js`, or a `zig-*` target from this plugin. It depends
+  on output-family wildcard targets: `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`,
+  `*-bun`, and `*-wasm`.
 
 This is why Zig appears in the convention: the plugin is not guessing from arbitrary Zig source. SmoothBricks requires
 `build.zig` to expose named build steps so Nx can create cacheable, addressable targets from those steps.

@@ -44,6 +44,18 @@ const rootScriptPolicy: Record<string, string> = {
 const nxJsTypescriptPlugin = '@nx/js/typescript';
 const smoothBricksNxPlugin = '@smoothbricks/nx-plugin';
 const expectedSharedGlobalsNamedInput = ['{workspaceRoot}/.github/workflows/ci.yml'];
+const buildOutputDependencies = [
+  '*-js',
+  '*-web',
+  '*-html',
+  '*-css',
+  '*-ios',
+  '*-android',
+  '*-native',
+  '*-napi',
+  '*-bun',
+  '*-wasm',
+];
 const defaultProductionNamedInput = [
   '{projectRoot}/src/**/*',
   '{projectRoot}/package.json',
@@ -810,6 +822,7 @@ function validateTargetDependencies(
     if (
       label.endsWith('nx.targets.build') &&
       !dependency.startsWith('^') &&
+      !isBuildOutputDependencyPattern(dependency) &&
       !targetExistsInResolvedProject(dependency, resolvedTargets)
     ) {
       console.error(`${label}.dependsOn references missing target ${dependency}`);
@@ -1440,6 +1453,10 @@ function targetDependenciesMatchResolvedBuild(
   });
 }
 
+function isBuildOutputDependencyPattern(dependency: string): boolean {
+  return buildOutputDependencies.includes(dependency);
+}
+
 function migratePackageColonTargets(pkg: Record<string, unknown>, resolvedTargets?: ReadonlySet<string>): boolean {
   const nx = recordProperty(pkg, 'nx');
   const targets = nx ? recordProperty(nx, 'targets') : null;
@@ -1654,6 +1671,9 @@ function targetNameForCommand(command: string): string | null {
   const trimmed = command.trim();
   if (/^tsc\s+--build\s+tsconfig\.lib\.json(?:\s|$)/.test(trimmed)) {
     return 'tsc-js';
+  }
+  if (/^tsdown(?:\s|$)/.test(trimmed)) {
+    return 'tsdown-js';
   }
   const zigStep = /^zig\s+build\s+([A-Za-z0-9_-]+)(?:\s|$)/.exec(trimmed)?.[1];
   if (zigStep) {

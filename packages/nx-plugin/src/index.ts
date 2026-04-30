@@ -8,6 +8,19 @@ import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 const RESERVED_ZIG_STEPS = new Set(['all', 'clean', 'install', 'test']);
 const ZIG_STEP_PATTERN = /\bb\.step\(\s*["']([^"']+)["']\s*,/g;
 const VALID_ZIG_STEP_NAME = /^[A-Za-z0-9_-]+$/;
+const BUILD_OUTPUT_DEPENDENCIES = [
+  '*-js',
+  '*-web',
+  '*-html',
+  '*-css',
+  '*-ios',
+  '*-android',
+  '*-native',
+  '*-napi',
+  '*-bun',
+  '*-wasm',
+];
+const BUILD_OUTPUT_TARGET_PATTERN = /-(?:js|web|html|css|ios|android|native|napi|bun|wasm)$/;
 
 export const createNodesV2: CreateNodesV2 = [
   '**/package.json',
@@ -47,13 +60,9 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
   const absoluteProjectRoot = join(workspaceRoot, projectRoot);
   const packageJson = await readPackageJson(join(workspaceRoot, packageJsonPath));
   const targets: Record<string, TargetConfiguration> = {};
-  const buildComponents: string[] = [];
   const validationTargets: string[] = [];
   const hasLibTsconfig = existsSync(join(absoluteProjectRoot, 'tsconfig.lib.json'));
-
-  if (hasLibTsconfig) {
-    buildComponents.push('tsc-js');
-  }
+  let hasBuildOutputTarget = hasLibTsconfig || hasPackageLocalBuildOutputTarget(packageJson);
 
   const hasTestTsconfig = existsSync(join(absoluteProjectRoot, 'tsconfig.test.json'));
   if (hasTestTsconfig) {
@@ -110,14 +119,14 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
         cwd: projectRoot,
       },
     };
-    buildComponents.push(targetName);
+    hasBuildOutputTarget = true;
   }
 
-  if (buildComponents.length > 0) {
+  if (hasBuildOutputTarget) {
     targets.build = {
       executor: 'nx:noop',
       cache: true,
-      dependsOn: ['^build', ...buildComponents],
+      dependsOn: ['^build', ...BUILD_OUTPUT_DEPENDENCIES],
     };
   }
 
@@ -197,6 +206,15 @@ function parseEnvPrefixedCommand(command: string): { command: string; envPrefix:
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object';
+}
+
+function hasPackageLocalBuildOutputTarget(packageJson: PackageJson): boolean {
+  const targets = packageJson.nx?.targets;
+  if (!isRecord(targets)) {
+    return false;
+  }
+
+  return Object.keys(targets).some((targetName) => BUILD_OUTPUT_TARGET_PATTERN.test(targetName));
 }
 
 async function readZigSteps(absoluteProjectRoot: string, projectRoot: string): Promise<string[]> {

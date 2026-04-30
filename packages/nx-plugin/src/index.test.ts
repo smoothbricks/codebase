@@ -7,6 +7,19 @@ import type { CreateNodesContextV2, TargetConfiguration } from 'nx/src/devkit-ex
 import { createNodesV2 } from './index.js';
 
 const [, inferTargets] = createNodesV2;
+const buildOutputDependencies = [
+  '^build',
+  '*-js',
+  '*-web',
+  '*-html',
+  '*-css',
+  '*-ios',
+  '*-android',
+  '*-native',
+  '*-napi',
+  '*-bun',
+  '*-wasm',
+];
 
 describe('@smoothbricks/nx-plugin inferred targets', () => {
   it('infers validation and aggregate build targets without owning TypeScript lib build', async () => {
@@ -24,8 +37,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['tsc-js']).toBeUndefined();
       expect(targets.build?.executor).toBe('nx:noop');
       expect(targets.build?.cache).toBe(true);
-      expect(targets.build?.dependsOn).toContain('^build');
-      expect(targets.build?.dependsOn).toContain('tsc-js');
+      expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
 
       expect(targets['typecheck-tests']?.executor).toBe('nx:run-commands');
       expect(targets['typecheck-tests']?.cache).toBe(true);
@@ -101,7 +113,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const targets = await inferProjectTargets(workspace, 'packages/ziggy/package.json');
 
       expect(Object.keys(targets).sort()).toEqual(['build', 'zig-native', 'zig-wasm']);
-      expect(targets.build?.dependsOn).toEqual(['^build', 'zig-wasm', 'zig-native']);
+      expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
       expect(targets.build?.cache).toBe(true);
       expect(targets['zig-wasm']?.cache).toBe(true);
       expect(targets['zig-native']?.cache).toBe(true);
@@ -113,6 +125,25 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         command: 'zig build native',
         cwd: 'packages/ziggy',
       });
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('infers aggregate build for package-local output targets without owning them', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write(
+        'packages/tsdown/package.json',
+        JSON.stringify({ name: 'tsdown', nx: { targets: { 'tsdown-js': { executor: 'nx:run-commands' } } } }),
+      );
+
+      const targets = await inferProjectTargets(workspace, 'packages/tsdown/package.json');
+
+      expect(targets['tsc-js']).toBeUndefined();
+      expect(targets['tsdown-js']).toBeUndefined();
+      expect(targets.build?.executor).toBe('nx:noop');
+      expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
     } finally {
       await workspace.cleanup();
     }
