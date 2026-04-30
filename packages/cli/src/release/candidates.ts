@@ -62,7 +62,7 @@ async function isAutoReleaseCandidate<Package extends ReleasePackageInfo>(
   if (await shell.gitRefExists(tagRef)) {
     return packageHasReleasableChangesSince(shell, tagRef, pkg);
   }
-  return shell.packageHasHistory(pkg.path);
+  return !pkg.version.includes('-') && shell.packageHasHistory(pkg.path);
 }
 
 async function packageHasReleasableChangesSince<Package extends ReleasePackageInfo>(

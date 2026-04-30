@@ -28,6 +28,7 @@ import {
 import { createOrUpdateGithubRelease, renderNxProjectChangelogContents } from './github-release.js';
 import { publishWithAuthDiagnostics } from './npm-auth.js';
 import {
+  bumpStableReleaseToNext,
   completeReleaseAtHead as completeReleaseAtHeadWithShell,
   type ReleaseCompletionShell,
   type ReleaseSummary,
@@ -129,6 +130,15 @@ export async function releasePublish(root: string, options: ReleasePublishOption
     await newerCommitsRemain(root),
   );
   await writeReleaseSummary(summary);
+  const bumpedPackages = await bumpStableReleaseToNext(
+    releaseNextShell(root),
+    packages,
+    options.dryRun === true,
+    summary.rerunRequired,
+  );
+  if (bumpedPackages.length > 0) {
+    console.log(`Prepared next prerelease for ${packageSummary(bumpedPackages)}.`);
+  }
 }
 
 export async function releaseRepairPending(root: string, options: ReleaseRepairPendingOptions): Promise<void> {
@@ -528,6 +538,24 @@ async function runNxReleaseVersion(root: string, projects: string, bump: string,
   await run('nx', nxArgs, root);
 }
 
+async function runNxNextPrereleaseVersion(root: string, projects: string): Promise<void> {
+  await run(
+    'nx',
+    [
+      'release',
+      'version',
+      'prerelease',
+      `--projects=${projects}`,
+      '--preid=next',
+      '--git-commit=true',
+      '--git-tag=false',
+      '--git-push=false',
+      '--git-commit-message=chore(release): prepare next prerelease',
+    ],
+    root,
+  );
+}
+
 async function releasePackagesAtHead(root: string, packages: ReleasePackage[]): Promise<ReleasePackage[]> {
   return releasePackagesAtRef(root, packages, 'HEAD');
 }
@@ -663,6 +691,12 @@ async function pushReleaseRefs(root: string, packages: ReleasePackage[]): Promis
   return true;
 }
 
+async function pushCurrentBranch(root: string): Promise<void> {
+  const branch = await releaseBranch(root);
+  const remote = await releaseRemote(root, branch);
+  await run('git', ['push', remote, `HEAD:refs/heads/${branch}`], root);
+}
+
 function releaseCompletionShell(root: string): ReleaseCompletionShell<ReleasePackage> {
   return {
     gitHead: () => gitHead(root),
@@ -678,6 +712,15 @@ function releaseCompletionShell(root: string): ReleaseCompletionShell<ReleasePac
     },
     listGithubMissingPackages: (packages) => listMissingGithubReleasePackages(root, packages),
     createGithubRelease: (pkg, dryRun) => createGithubRelease(root, pkg, dryRun),
+  };
+}
+
+function releaseNextShell(root: string): { bumpStablePackagesToNext(packages: ReleasePackage[]): Promise<void> } {
+  return {
+    bumpStablePackagesToNext: async (packages) => {
+      await runNxNextPrereleaseVersion(root, releasePackageProjects(packages));
+      await pushCurrentBranch(root);
+    },
   };
 }
 
