@@ -80,8 +80,7 @@ in {
   enterShell = ''
     cd "$DEVENV_ROOT/../.."
     export PATH="$PWD/tooling:$PWD/node_modules/.bin:$PATH"
-    bun "$DEVENV_ROOT/setup-environment.ts"
-    [ -f "$PWD/packages/nx-plugin/dist/index.js" ] || (nx run nx-plugin:tsc-js && nx reset)
+    bun "$DEVENV_ROOT/enter-shell.ts"
 
     # Unset nix CC/CXX so xcodebuild finds Xcode's clang (supports -index-store-path)
     # Zig has its own toolchain and doesn't use CC; bun/node native addons use node-gyp
