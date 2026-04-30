@@ -8,7 +8,8 @@ opencode.json
 # LLMs
 .opencode
 .serena
-_bmad
+.claude/worktrees
+.cursor/rules/nx-rules.mdc
 
 # compiled output
 dist
@@ -54,9 +55,11 @@ testem.log
 .DS_Store
 Thumbs.db
 
+# Nx
 .nx/cache
+.nx/polygraph
+.nx/self-healing
 .nx/workspace-data
-.cursor/rules/nx-rules.mdc
 .github/instructions/nx.instructions.md
 
 # Jest
@@ -68,5 +71,3 @@ test-output
 # TypeScript build info
 *.tsbuildinfo
 dist-test/
-
-# Vitest worker-generated wasm copies
