@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/schema",
+  "id": "MakePublic",
+  "title": "Promote a private package to public npm publication",
+  "type": "object",
+  "properties": {
+    "project": {
+      "type": "string",
+      "description": "Nx project name, package name, or project root to promote."
+    }
+  },
+  "required": ["project"]
+}

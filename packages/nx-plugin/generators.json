@@ -9,6 +9,16 @@
       "factory": "./dist/generators/bounded-test-targets/generator.js",
       "schema": "./src/generators/bounded-test-targets/schema.json",
       "description": "Normalize package test targets to the bounded command executor"
+    },
+    "create-package": {
+      "factory": "./dist/generators/create-package/generator.js",
+      "schema": "./src/generators/create-package/schema.json",
+      "description": "Scaffold a new workspace package (ts-lib or ts-zig)"
+    },
+    "make-public": {
+      "factory": "./dist/generators/make-public/generator.js",
+      "schema": "./src/generators/make-public/schema.json",
+      "description": "Promote a private package to public npm publication"
     }
   }
 }
