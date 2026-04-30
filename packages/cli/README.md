@@ -358,8 +358,9 @@ Versioning:
 - `--bump auto` first filters owned release packages to package-local candidates, then lets [Nx Release][nx-release]
   derive the semver bump from [Conventional Commits]. A tagged package is an auto candidate only when files under its
   package root changed since its current `projectName@version` release tag. An untagged package is an auto candidate
-  only when its package root has git history. Root-only changes, workflow edits, lockfile-only churn, and other
-  workspace-global changes may still affect Nx tasks, but they do not make unrelated package artifacts releasable.
+  only when its package root has git history and its current version is stable. Root-only changes, workflow edits,
+  lockfile-only churn, untagged next-prerelease preparation commits, and other workspace-global changes may still affect
+  Nx tasks, but they do not make unrelated package artifacts releasable.
 - `--bump patch|minor|major|prerelease` forces the release specifier for the full owned release package set. Forced
   bumps intentionally bypass the package-local auto filter.
 - Release packages are discovered from `npm:public` packages whose `repository.url` exactly matches the root package.
@@ -441,6 +442,9 @@ Publishing:
 - `smoo release publish` pushes missing branch/tag refs, publishes missing npm versions, creates or updates GitHub
   Releases, and writes a GitHub Step Summary. Already published npm versions are skipped, so reruns after auth or
   network failures retry only the package versions npm does not have yet.
+- After a successful non-dry-run stable release at the branch tip, `smoo release publish` runs an untagged
+  `prerelease --preid next` version bump for the released stable packages and pushes that branch commit. This prepares
+  the codebase for the next development prerelease without creating prerelease release tags or publishing npm packages.
 - npm registry state gates publish idempotency only. It decides which already-versioned package tarballs still need to
   be published during a real release retry, not whether versioning should run or whether the workflow has a release to
   publish.

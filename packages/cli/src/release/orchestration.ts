@@ -25,6 +25,10 @@ export interface ReleaseCompletionShell<Package extends ReleasePackageInfo = Rel
   createGithubRelease(pkg: Package, dryRun: boolean): Promise<void>;
 }
 
+export interface ReleaseNextShell<Package extends ReleasePackageInfo = ReleasePackageInfo> {
+  bumpStablePackagesToNext(packages: Package[]): Promise<void>;
+}
+
 export interface ReleaseRepairShell<Package extends ReleasePackageInfo = ReleasePackageInfo>
   extends ReleaseCompletionShell<Package> {
   checkout(ref: string): Promise<void>;
@@ -111,6 +115,20 @@ export async function completeReleaseAtHead<Package extends ReleasePackageInfo>(
     githubMissingPackages,
     rerunRequired,
   });
+}
+
+export async function bumpStableReleaseToNext<Package extends ReleasePackageInfo>(
+  shell: ReleaseNextShell<Package>,
+  packages: Package[],
+  dryRun: boolean,
+  rerunRequired: boolean,
+): Promise<Package[]> {
+  const stablePackages = packages.filter((pkg) => !pkg.version.includes('-'));
+  if (dryRun || rerunRequired || stablePackages.length === 0) {
+    return [];
+  }
+  await shell.bumpStablePackagesToNext(stablePackages);
+  return stablePackages;
 }
 
 export async function repairPendingTargets<Package extends ReleasePackageInfo>(

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { type ReleasePackageInfo, type ReleaseTarget, releaseTag } from '../core.js';
 import {
+  bumpStableReleaseToNext,
   completeReleaseAtHead,
   type ReleaseRepairShell,
   type ReleaseVersionShell,
@@ -128,6 +129,32 @@ describe('release orchestration', () => {
     expect(result).toEqual({ mode: 'new', packages: [stable], status: 'new-release' });
     expect(shell.nxRuns).toEqual([{ packages: ['@scope/stable'], bump: 'auto', dryRun: false }]);
   });
+
+  it('bumps stable release packages to next after publish completion', async () => {
+    const shell = new RecordingNextShell();
+
+    const bumped = await bumpStableReleaseToNext(shell, [stable, prerelease], false, false);
+
+    expect(bumped.map((pkg) => pkg.name)).toEqual(['@scope/stable']);
+    expect(shell.bumped).toEqual([['@scope/stable']]);
+  });
+
+  it('does not bump prerelease-only or dry-run publishes to next', async () => {
+    const shell = new RecordingNextShell();
+
+    await expect(bumpStableReleaseToNext(shell, [prerelease], false, false)).resolves.toEqual([]);
+    await expect(bumpStableReleaseToNext(shell, [stable], true, false)).resolves.toEqual([]);
+
+    expect(shell.bumped).toEqual([]);
+  });
+
+  it('does not bump stable packages to next when newer branch commits remain', async () => {
+    const shell = new RecordingNextShell();
+
+    await expect(bumpStableReleaseToNext(shell, [stable], false, true)).resolves.toEqual([]);
+
+    expect(shell.bumped).toEqual([]);
+  });
 });
 
 function releaseTarget(
@@ -239,6 +266,14 @@ class RecordingVersionShell implements ReleaseVersionShell<ReleasePackageInfo> {
 
   async assertCleanGitTree(): Promise<void> {
     this.cleanChecks += 1;
+  }
+}
+
+class RecordingNextShell {
+  readonly bumped: string[][] = [];
+
+  async bumpStablePackagesToNext(packages: ReleasePackageInfo[]): Promise<void> {
+    this.bumped.push(packageNames(packages));
   }
 }
 

@@ -12,6 +12,12 @@ const b: ReleasePackageInfo = { name: '@scope/b', projectName: 'b', path: 'packa
 const c: ReleasePackageInfo = { name: '@scope/c', projectName: 'c', path: 'packages/c', version: '0.1.0' };
 const d: ReleasePackageInfo = { name: '@scope/d', projectName: 'd', path: 'packages/d', version: '0.1.0' };
 const cli: ReleasePackageInfo = { name: '@scope/cli', projectName: 'cli', path: 'packages/cli', version: '0.2.0' };
+const next: ReleasePackageInfo = {
+  name: '@scope/next',
+  projectName: 'next',
+  path: 'packages/next',
+  version: '1.1.0-next.0',
+};
 
 describe('auto release candidate filtering', () => {
   it('selects tagged packages only when their package path changed', async () => {
@@ -166,6 +172,16 @@ describe('auto release candidate filtering', () => {
       await git(root, ['commit', '-m', 'feat(c): add package']);
 
       await expect(autoReleaseCandidatePackages(gitCandidateShell(root), [c, d])).resolves.toEqual([c]);
+    });
+  });
+
+  it('does not auto-release an untagged next prerelease package version', async () => {
+    await withFixtureRepo(async (root) => {
+      await writePackage(root, next.name, next.path, next.version);
+      await git(root, ['add', '.']);
+      await git(root, ['commit', '-m', 'chore(release): prepare next prerelease']);
+
+      await expect(autoReleaseCandidatePackages(gitCandidateShell(root), [next])).resolves.toEqual([]);
     });
   });
 
