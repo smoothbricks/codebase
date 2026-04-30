@@ -35,7 +35,7 @@
         "options": {
           "command": "bun test --parallel=3",
           "cwd": "{projectRoot}",
-          "timeoutMs": 600000,
+          "timeoutMs": 120000,
           "killAfterMs": 10000
         }
       }

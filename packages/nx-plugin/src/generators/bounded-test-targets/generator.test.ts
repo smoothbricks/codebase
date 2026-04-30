@@ -2,7 +2,11 @@ import { beforeEach, describe, expect, it } from 'bun:test';
 import { addProjectConfiguration, readJson, type Tree } from 'nx/src/devkit-exports.js';
 import { createTreeWithEmptyWorkspace } from 'nx/src/devkit-testing-exports.js';
 
-import { BOUNDED_TEST_EXECUTOR } from '../../bounded-test-policy.js';
+import {
+  BOUNDED_TEST_EXECUTOR,
+  BOUNDED_TEST_KILL_AFTER_MS,
+  BOUNDED_TEST_TIMEOUT_MS,
+} from '../../bounded-test-policy.js';
 import generator from './generator.js';
 
 describe('bounded-test-targets generator', () => {
@@ -39,8 +43,8 @@ describe('bounded-test-targets generator', () => {
       options: {
         command: 'bun test --target',
         cwd: '{projectRoot}',
-        timeoutMs: 600000,
-        killAfterMs: 10000,
+        timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+        killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
       },
     });
   });
@@ -62,8 +66,8 @@ describe('bounded-test-targets generator', () => {
       options: {
         command: 'bun test --script',
         cwd: '{projectRoot}',
-        timeoutMs: 600000,
-        killAfterMs: 10000,
+        timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+        killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
       },
     });
   });
@@ -108,8 +112,8 @@ describe('bounded-test-targets generator', () => {
       options: {
         command: 'bun test --project-target',
         cwd: '{projectRoot}',
-        timeoutMs: 600000,
-        killAfterMs: 10000,
+        timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+        killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
       },
     });
   });

@@ -1,6 +1,5 @@
 import { spawn } from 'node:child_process';
 import { isAbsolute, join } from 'node:path';
-import treeKill from 'tree-kill';
 
 import type { BoundedExecOptions } from './schema.js';
 
@@ -164,14 +163,24 @@ export async function runBoundedExec(
 export function createProcessTreeKiller(): ProcessTreeKiller {
   return {
     kill(pid, signal) {
-      return killTree(pid, signal);
+      return killProcessGroup(pid, signal);
     },
   };
 }
 
-function killTree(pid: number, signal: NodeJS.Signals): Promise<void> {
+function killProcessGroup(pid: number, signal: NodeJS.Signals): Promise<void> {
   return new Promise((resolve) => {
-    treeKill(pid, signal, () => resolve());
+    try {
+      // Send signal to the entire process group (negative PID).
+      // The executor spawns with detached: true on POSIX, which creates a
+      // dedicated process group. Signaling -pid is atomic and catches all
+      // descendants, including grandchildren that tree-walk libraries miss
+      // when parents die and children get reparented to init.
+      process.kill(-pid, signal);
+    } catch {
+      // ESRCH: process group already exited between timeout and kill.
+    }
+    resolve();
   });
 }
 

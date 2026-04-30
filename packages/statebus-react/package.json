@@ -64,7 +64,7 @@
         "options": {
           "command": "bun test",
           "cwd": "{projectRoot}",
-          "timeoutMs": 600000,
+          "timeoutMs": 120000,
           "killAfterMs": 10000
         }
       }
