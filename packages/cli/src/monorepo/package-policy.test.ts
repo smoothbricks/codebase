@@ -235,6 +235,26 @@ describe('Nx project name policy', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('accepts private unversioned workspace projects as commit scopes', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [{ dir: 'tooling', name: '@smoothbricks/tooling', private: true, version: null }],
+    });
+    try {
+      expect(validateNxProjectNames(root)).toBe(1);
+
+      applyNxProjectNameDefaults(root);
+
+      const tooling = JSON.parse(await readFile(join(root, 'packages/tooling/package.json'), 'utf8'));
+      expect(tooling.version).toBeUndefined();
+      expect(tooling.nx).toEqual({ name: 'tooling' });
+      expect(validateNxProjectNames(root)).toBe(0);
+      expect(listValidCommitScopes(root)).toEqual(new Set(['release', 'tooling']));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('workspace package script policy', () => {
@@ -937,6 +957,8 @@ async function createWorkspace(input: {
   packages: Array<{
     dir: string;
     name: string;
+    private?: boolean;
+    version?: string | null;
     dependencies?: Record<string, string>;
     scripts?: Record<string, string>;
     nx?: Record<string, unknown>;
@@ -952,7 +974,8 @@ async function createWorkspace(input: {
   for (const pkg of input.packages) {
     await writeJson(join(root, `packages/${pkg.dir}/package.json`), {
       name: pkg.name,
-      version: '0.0.0',
+      ...(pkg.version === null ? {} : { version: pkg.version ?? '0.0.0' }),
+      ...(pkg.private === undefined ? {} : { private: pkg.private }),
       ...(pkg.dependencies ? { dependencies: pkg.dependencies } : {}),
       ...(pkg.scripts ? { scripts: pkg.scripts } : {}),
       ...(pkg.nx ? { nx: pkg.nx } : {}),
