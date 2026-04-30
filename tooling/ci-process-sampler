@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+interval="${CI_PROCESS_SAMPLER_INTERVAL_SECONDS:-10}"
+pattern="${CI_PROCESS_SAMPLER_PATTERN:-nx|node|bun|sh|bash|zig|tsc}"
+args_pattern="${CI_PROCESS_SAMPLER_ARGS_PATTERN:-nx|node|bun|zig|tsc}"
+
+while true; do
+  echo "::group::process snapshot $(date -Is)"
+  ps -eo pid,ppid,pgid,stat,etime,pcpu,pmem,comm,args | awk -v pattern="$pattern" -v args_pattern="$args_pattern" '
+    NR == 1 { print; next }
+    $8 ~ "(^|/)(" pattern ")$" || $0 ~ "[[:space:]/](" args_pattern ")([[:space:]]|$)" {
+      line = $0
+      gsub(/--api-key[= ][^ ]+/, "--api-key=***", line)
+      gsub(/[A-Za-z_]*(TOKEN|token|KEY|key|SECRET|secret|PASSWORD|password)[A-Za-z_]*=[^ ]+/, "***=***", line)
+      print line
+    }
+  '
+  echo "::endgroup::"
+  sleep "$interval"
+done
