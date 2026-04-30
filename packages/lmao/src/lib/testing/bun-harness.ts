@@ -54,6 +54,7 @@ import {
   mock,
 } from 'bun:test';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { cleanupDebug, cleanupDebugActiveHandles } from '../cleanupDiagnostics.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import type { SpanContext } from '../opContext/spanContextTypes.js';
@@ -270,7 +271,9 @@ function createRootTracer<B extends OpContextBinding>({
 async function closeTracer<B extends OpContextBinding>(tracer: Tracer<B>): Promise<void> {
   const close = Reflect.get(tracer, 'close');
   if (typeof close === 'function') {
+    cleanupDebug('tracer.close:start', { tracer: tracer.constructor.name });
     await close.call(tracer);
+    cleanupDebug('tracer.close:end', { tracer: tracer.constructor.name });
   }
 }
 
@@ -531,19 +534,26 @@ function createTestTracerInstance<B extends OpContextBinding, TExt extends Schem
       });
 
       _afterAll(async () => {
+        cleanupDebug('instance.afterAll:start');
+        cleanupDebugActiveHandles('instance.afterAll:handles:start');
         if (resolveTestRun) {
+          cleanupDebug('instance.rootTrace:resolve');
           resolveTestRun();
           resolveTestRun = null;
         }
 
         if (rootTracePromise) {
+          cleanupDebug('instance.rootTrace:await:start');
           await rootTracePromise;
+          cleanupDebug('instance.rootTrace:await:end');
           rootTracePromise = null;
         }
 
         if (tracer) {
           try {
+            cleanupDebug('instance.tracer.flush:start', { tracer: tracer.constructor.name });
             await tracer.flush();
+            cleanupDebug('instance.tracer.flush:end', { tracer: tracer.constructor.name });
             if (options?.sqlite && rootCtx) {
               const traceId = rootCtx.buffer.trace_id;
               const dbPath = options.sqlite.dbPath ?? '.trace-results.db';
@@ -553,6 +563,8 @@ function createTestTracerInstance<B extends OpContextBinding, TExt extends Schem
             console.error('[lmao/testing] SQLite flush error:', e);
           } finally {
             await closeTracer(tracer);
+            cleanupDebugActiveHandles('instance.afterAll:handles:end');
+            cleanupDebug('instance.afterAll:end');
           }
         }
       });
@@ -635,20 +647,27 @@ export function initTraceTestRun<B extends OpContextBinding>(opContext: B, optio
 
   // Register global teardown — resolve root, wait for span-end, then flush tracer outputs
   _afterAll(async () => {
+    cleanupDebug('global.afterAll:start');
+    cleanupDebugActiveHandles('global.afterAll:handles:start');
     // Resolve the root promise — triggers span-end write via _executeWithContext .then()
     if (_resolveTestRun) {
+      cleanupDebug('global.rootTrace:resolve');
       _resolveTestRun();
       _resolveTestRun = null;
     }
     // Await the trace promise so span-end is written to the buffer before flushing
     if (_rootTracePromise) {
+      cleanupDebug('global.rootTrace:await:start');
       await _rootTracePromise;
+      cleanupDebug('global.rootTrace:await:end');
       _rootTracePromise = null;
     }
 
     if (_tracer) {
       try {
+        cleanupDebug('global.tracer.flush:start', { tracer: _tracer.constructor.name });
         await _tracer.flush();
+        cleanupDebug('global.tracer.flush:end', { tracer: _tracer.constructor.name });
         if (options?.sqlite && _rootCtx) {
           const traceId = _rootCtx.buffer.trace_id;
           const dbPath = options.sqlite.dbPath ?? '.trace-results.db';
@@ -658,6 +677,8 @@ export function initTraceTestRun<B extends OpContextBinding>(opContext: B, optio
         console.error('[lmao/testing] SQLite flush error:', e);
       } finally {
         await closeTracer(_tracer);
+        cleanupDebugActiveHandles('global.afterAll:handles:end');
+        cleanupDebug('global.afterAll:end');
       }
     }
   });

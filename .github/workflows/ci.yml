@@ -22,6 +22,7 @@ jobs:
     env:
       NIX_STORE_NAR: ${{ github.workspace }}/nix-store.nar
       GH_TOKEN: ${{ github.token }}
+      LMAO_TEST_CLEANUP_DEBUG: '1'
     steps:
       # Step 1: GitHub adds "Set up job" automatically
       # Step 2

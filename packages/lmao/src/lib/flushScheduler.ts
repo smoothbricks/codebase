@@ -9,6 +9,7 @@
 
 import { Column, type Table, tableFromColumns } from '@uwdata/flechette';
 import type { CapacityStatsEntry } from './arrow/capacityStats.js';
+import { cleanupDebug } from './cleanupDiagnostics.js';
 import { convertSpanTreeToArrowTable } from './convertToArrow.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
 import type { AnySpanBuffer, OpMetadata } from './types.js';
@@ -178,6 +179,7 @@ export class FlushScheduler {
     this.isRunning = true;
     this.lastFlushTime = Date.now();
     this.lastActivityTime = Date.now();
+    cleanupDebug('flushScheduler.start', this.config);
 
     // Set up periodic flush timer
     this.flushTimer = setInterval(() => {
@@ -208,6 +210,7 @@ export class FlushScheduler {
   stop(): void {
     if (!this.isRunning) return;
 
+    cleanupDebug('flushScheduler.stop:start', { pendingBuffers: this.buffers.size });
     this.isRunning = false;
 
     if (this.flushTimer) {
@@ -224,6 +227,7 @@ export class FlushScheduler {
       clearInterval(this.memoryTimer);
       this.memoryTimer = undefined;
     }
+    cleanupDebug('flushScheduler.stop:end', { pendingBuffers: this.buffers.size });
   }
 
   /**
@@ -443,6 +447,12 @@ export class FlushScheduler {
       }
     } catch (error) {
       console.error('Error in flush handler:', error);
+      cleanupDebug('flushScheduler.doFlush:error', {
+        reason,
+        totalRows,
+        totalBuffers,
+        pendingBuffers: this.buffers.size,
+      });
       // Do NOT reset buffers on failure to avoid data loss
     }
   }

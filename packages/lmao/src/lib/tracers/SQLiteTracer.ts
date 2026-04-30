@@ -1,3 +1,4 @@
+import { cleanupDebug } from '../cleanupDiagnostics.js';
 import type { OpContextBinding } from '../opContext/types.js';
 import { SQLiteAsyncTraceWriter } from '../sqlite/sqlite-async-writer.js';
 import type { AsyncSQLiteDatabase, SyncSQLiteDatabase } from '../sqlite/sqlite-db.js';
@@ -33,7 +34,9 @@ export class SQLiteTracer<B extends OpContextBinding = OpContextBinding> extends
   }
 
   onTraceEnd(rootBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
+    cleanupDebug('sqliteTracer.onTraceEnd:flush:start', { rows: rootBuffer._writeIndex });
     this.writer.flush(rootBuffer);
+    cleanupDebug('sqliteTracer.onTraceEnd:flush:end');
   }
 
   onSpanStart(_childBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
@@ -49,7 +52,9 @@ export class SQLiteTracer<B extends OpContextBinding = OpContextBinding> extends
   }
 
   async close(): Promise<void> {
+    cleanupDebug('sqliteTracer.close:start');
     this.writer.close();
+    cleanupDebug('sqliteTracer.close:end');
   }
 }
 
@@ -96,6 +101,7 @@ export class SQLiteAsyncTracer<B extends OpContextBinding = OpContextBinding> ex
   }
 
   override async flush(): Promise<void> {
+    cleanupDebug('sqliteAsyncTracer.flush:start');
     await this.pendingWrites;
     if (this.pendingErrors.length > 0) {
       const errors = this.pendingErrors;
@@ -105,11 +111,14 @@ export class SQLiteAsyncTracer<B extends OpContextBinding = OpContextBinding> ex
       }
       throw new AggregateError(errors, `SQLiteAsyncTracer flush failed for ${errors.length} trace writes`);
     }
+    cleanupDebug('sqliteAsyncTracer.flush:end');
   }
 
   async close(): Promise<void> {
+    cleanupDebug('sqliteAsyncTracer.close:start');
     await this.flush();
     const writer = await this.writerPromise;
     await writer.close();
+    cleanupDebug('sqliteAsyncTracer.close:end');
   }
 }
