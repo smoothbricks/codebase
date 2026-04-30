@@ -209,8 +209,8 @@ describe('package target policy', () => {
       expect(applyPackageTargetPolicy(root)).toBe(true);
 
       const web = JSON.parse(await readFile(join(root, 'packages/web/package.json'), 'utf8'));
-      // dev script should become an Nx alias with streaming flags
-      expect(web.scripts.dev).toBe('nx run web:dev --outputStyle=stream');
+      // Vite/Astro dev servers render best with dynamic legacy output.
+      expect(web.scripts.dev).toBe('nx run web:dev --outputStyle=dynamic-legacy');
       // build script should become an Nx alias without streaming flags
       expect(web.scripts.build).toBe('nx run web:build');
       // nx.targets.dev should be created with continuous flag
@@ -416,6 +416,13 @@ describe('per-package applyPackageTargets', () => {
 describe('nxRunAlias', () => {
   it('generates streaming flags for continuous targets', () => {
     expect(nxRunAlias('app', 'dev', true)).toBe('nx run app:dev --outputStyle=stream');
+  });
+
+  it('uses dynamic legacy output for Astro and Vite dev targets', () => {
+    expect(nxRunAlias('app', 'dev', true, 'astro dev')).toBe('nx run app:dev --outputStyle=dynamic-legacy');
+    expect(nxRunAlias('app', 'serve', true, 'vite dev --host 0.0.0.0')).toBe(
+      'nx run app:serve --outputStyle=dynamic-legacy',
+    );
   });
 
   it('generates plain alias for non-continuous targets', () => {
@@ -723,7 +730,7 @@ describe('applyPackageTargetPolicyTree', () => {
     expect(applyPackageTargetPolicyTree(tree)).toBe(true);
 
     const web = readJson(tree, 'packages/web/package.json');
-    expect(web.scripts.dev).toBe('nx run web:dev --outputStyle=stream');
+    expect(web.scripts.dev).toBe('nx run web:dev --outputStyle=dynamic-legacy');
     expect(web.scripts.build).toBe('nx run web:build');
     expect(web.nx.targets.dev.continuous).toBe(true);
     expect(web.nx.targets.dev.executor).toBe('nx:run-commands');
