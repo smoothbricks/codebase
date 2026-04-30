@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 export const BOUNDED_TEST_EXECUTOR = '@smoothbricks/nx-plugin:bounded-exec';
 export const BOUNDED_TEST_TIMEOUT_MS = 600_000;
@@ -15,6 +15,11 @@ export interface BoundedTestPolicyPackageJson {
   };
 }
 
+export interface BoundedTestPolicyProjectJson {
+  name?: string;
+  targets?: Record<string, Record<string, unknown>>;
+}
+
 export interface BoundedTestPolicyIssue {
   path: string;
   message: string;
@@ -23,18 +28,19 @@ export interface BoundedTestPolicyIssue {
 export interface ApplyBoundedTestTargetPolicyOptions {
   projectName: string;
   defaultCommand?: string;
+  projectJson?: BoundedTestPolicyProjectJson;
 }
 
 export function applyBoundedTestTargetPolicy(
   packageJson: BoundedTestPolicyPackageJson,
   options: ApplyBoundedTestTargetPolicyOptions,
 ): void {
-  const command = resolveTestCommand(packageJson, options.defaultCommand ?? 'bun test');
+  const command = resolveTestCommand(packageJson, options.defaultCommand ?? 'bun test', options.projectJson);
+  const targetOwner = options.projectJson ?? (packageJson.nx ??= {});
 
-  packageJson.nx ??= {};
-  packageJson.nx.targets ??= {};
+  targetOwner.targets ??= {};
 
-  const existingTestTarget = packageJson.nx.targets.test;
+  const existingTestTarget = targetOwner.targets.test;
   const nextTestTarget: Record<string, unknown> = isRecord(existingTestTarget) ? { ...existingTestTarget } : {};
   nextTestTarget.executor = BOUNDED_TEST_EXECUTOR;
   nextTestTarget.options = {
@@ -44,7 +50,7 @@ export function applyBoundedTestTargetPolicy(
     killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
   };
 
-  packageJson.nx.targets.test = nextTestTarget;
+  targetOwner.targets.test = nextTestTarget;
   packageJson.scripts ??= {};
   packageJson.scripts.test = boundedTestScriptAlias(options.projectName);
 }
@@ -53,19 +59,25 @@ export function applyWorkspaceBoundedTestTargetPolicy(root: string): boolean {
   let changed = false;
   for (const packageJsonPath of listWorkspacePackageJsonPaths(root)) {
     const packageJson = readPackageJson(packageJsonPath);
-    if (!hasTestEntrypoint(packageJson)) {
+    const projectJsonPath = projectJsonPathForPackageJson(packageJsonPath);
+    const projectJson = existsSync(projectJsonPath) ? readProjectJson(projectJsonPath) : undefined;
+    if (!hasTestEntrypoint(packageJson, projectJson)) {
       continue;
     }
-    const projectName = packageProjectName(packageJson);
+    const projectName = packageProjectName(packageJson, projectJson);
     if (!projectName) {
       continue;
     }
-    const before = JSON.stringify(packageJson);
-    applyBoundedTestTargetPolicy(packageJson, { projectName });
-    if (JSON.stringify(packageJson) === before) {
+    const beforePackageJson = JSON.stringify(packageJson);
+    const beforeProjectJson = JSON.stringify(projectJson);
+    applyBoundedTestTargetPolicy(packageJson, { projectName, projectJson });
+    if (JSON.stringify(packageJson) === beforePackageJson && JSON.stringify(projectJson) === beforeProjectJson) {
       continue;
     }
     writePackageJson(packageJsonPath, packageJson);
+    if (projectJson) {
+      writeProjectJson(projectJsonPath, projectJson);
+    }
     changed = true;
   }
   return changed;
@@ -75,18 +87,23 @@ export function checkWorkspaceBoundedTestTargetPolicy(root: string): BoundedTest
   const issues: BoundedTestPolicyIssue[] = [];
   for (const packageJsonPath of listWorkspacePackageJsonPaths(root)) {
     const packageJson = readPackageJson(packageJsonPath);
-    if (!hasTestEntrypoint(packageJson)) {
+    const projectJsonPath = projectJsonPathForPackageJson(packageJsonPath);
+    const projectJson = existsSync(projectJsonPath) ? readProjectJson(projectJsonPath) : undefined;
+    if (!hasTestEntrypoint(packageJson, projectJson)) {
       continue;
     }
-    const projectName = packageProjectName(packageJson);
+    const projectName = packageProjectName(packageJson, projectJson);
     if (!projectName) {
-      issues.push({ path: packageJsonPath, message: 'test entrypoint requires package.json name or nx.name' });
-      continue;
-    }
-    if (!checkBoundedTestTargetPolicy(packageJson, { projectName })) {
       issues.push({
         path: packageJsonPath,
-        message: `nx.targets.test must use ${BOUNDED_TEST_EXECUTOR} with bounded test policy`,
+        message: 'test entrypoint requires package.json name, nx.name, or project.json name',
+      });
+      continue;
+    }
+    if (!checkBoundedTestTargetPolicy(packageJson, { projectName, projectJson })) {
+      issues.push({
+        path: projectJson ? projectJsonPath : packageJsonPath,
+        message: `${projectJson ? 'targets' : 'nx.targets'}.test must use ${BOUNDED_TEST_EXECUTOR} with bounded test policy`,
       });
     }
   }
@@ -97,7 +114,7 @@ export function checkBoundedTestTargetPolicy(
   packageJson: BoundedTestPolicyPackageJson,
   options: ApplyBoundedTestTargetPolicyOptions,
 ): boolean {
-  const testTarget = packageJson.nx?.targets?.test;
+  const testTarget = options.projectJson ? options.projectJson.targets?.test : packageJson.nx?.targets?.test;
   if (!isRecord(testTarget) || testTarget.executor !== BOUNDED_TEST_EXECUTOR) {
     return false;
   }
@@ -120,8 +137,30 @@ export function boundedTestScriptAlias(projectName: string): string {
   return `nx run ${projectName}:test --tui=false --outputStyle=stream`;
 }
 
-export function resolveTestCommand(packageJson: BoundedTestPolicyPackageJson, defaultCommand = 'bun test'): string {
-  const existingTarget = packageJson.nx?.targets?.test;
+export function resolveTestCommand(
+  packageJson: BoundedTestPolicyPackageJson,
+  defaultCommand = 'bun test',
+  projectJson?: BoundedTestPolicyProjectJson,
+): string {
+  const commandFromProjectTarget = resolveTargetCommand(projectJson?.targets?.test);
+  if (commandFromProjectTarget) {
+    return commandFromProjectTarget;
+  }
+
+  const commandFromPackageTarget = resolveTargetCommand(packageJson.nx?.targets?.test);
+  if (commandFromPackageTarget) {
+    return commandFromPackageTarget;
+  }
+
+  const scriptCommand = packageJson.scripts?.test;
+  if (typeof scriptCommand === 'string' && !isNxRunTestAlias(scriptCommand)) {
+    return scriptCommand;
+  }
+
+  return defaultCommand;
+}
+
+function resolveTargetCommand(existingTarget: unknown): string | null {
   if (isRecord(existingTarget)) {
     const targetOptions = existingTarget.options;
     if (
@@ -133,13 +172,7 @@ export function resolveTestCommand(packageJson: BoundedTestPolicyPackageJson, de
       return targetOptions.command;
     }
   }
-
-  const scriptCommand = packageJson.scripts?.test;
-  if (typeof scriptCommand === 'string' && !isNxRunTestAlias(scriptCommand)) {
-    return scriptCommand;
-  }
-
-  return defaultCommand;
+  return null;
 }
 
 function isPackageTestScriptRunnerCommand(command: string): boolean {
@@ -189,12 +222,34 @@ function writePackageJson(path: string, packageJson: BoundedTestPolicyPackageJso
   writeFileSync(path, `${JSON.stringify(packageJson, null, 2)}\n`);
 }
 
-function hasTestEntrypoint(packageJson: BoundedTestPolicyPackageJson): boolean {
-  return typeof packageJson.scripts?.test === 'string' || isRecord(packageJson.nx?.targets?.test);
+function readProjectJson(path: string): BoundedTestPolicyProjectJson {
+  return JSON.parse(readFileSync(path, 'utf8')) as BoundedTestPolicyProjectJson;
 }
 
-function packageProjectName(packageJson: BoundedTestPolicyPackageJson): string | null {
-  return packageJson.nx?.name ?? packageJson.name ?? null;
+function writeProjectJson(path: string, projectJson: BoundedTestPolicyProjectJson): void {
+  writeFileSync(path, `${JSON.stringify(projectJson, null, 2)}\n`);
+}
+
+function hasTestEntrypoint(
+  packageJson: BoundedTestPolicyPackageJson,
+  projectJson: BoundedTestPolicyProjectJson | undefined,
+): boolean {
+  return (
+    typeof packageJson.scripts?.test === 'string' ||
+    isRecord(projectJson?.targets?.test) ||
+    isRecord(packageJson.nx?.targets?.test)
+  );
+}
+
+function packageProjectName(
+  packageJson: BoundedTestPolicyPackageJson,
+  projectJson: BoundedTestPolicyProjectJson | undefined,
+): string | null {
+  return projectJson?.name ?? packageJson.nx?.name ?? packageJson.name ?? null;
+}
+
+function projectJsonPathForPackageJson(packageJsonPath: string): string {
+  return join(dirname(packageJsonPath), 'project.json');
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -18,6 +18,7 @@ describe('bounded-test-targets generator', () => {
       name: '@scope/example',
       scripts: { test: 'bun test --script' },
       nx: {
+        name: 'example',
         targets: {
           test: {
             executor: 'nx:run-commands',
@@ -49,6 +50,7 @@ describe('bounded-test-targets generator', () => {
     writeJsonFile(tree, 'packages/example/package.json', {
       name: '@scope/example',
       scripts: { test: 'bun test --script' },
+      nx: { name: 'example' },
     });
 
     await generator(tree, { project: 'packages/example' });
@@ -65,15 +67,64 @@ describe('bounded-test-targets generator', () => {
       },
     });
   });
+
+  it('normalizes project.json test target and rewrites package script alias', async () => {
+    addProject(tree, 'example', 'packages/example', { keepProjectJson: true });
+    writeJsonFile(tree, 'packages/example/package.json', {
+      name: '@scope/example',
+      scripts: { test: 'bun test --script' },
+      nx: {
+        targets: {
+          test: {
+            executor: 'nx:run-commands',
+            options: { command: 'bun test --package-target' },
+          },
+        },
+      },
+    });
+    writeJsonFile(tree, 'packages/example/project.json', {
+      name: 'example',
+      targets: {
+        test: {
+          executor: 'nx:run-commands',
+          dependsOn: ['typecheck-tests'],
+          options: { command: 'bun test --project-target', cwd: 'packages/example' },
+        },
+      },
+    });
+
+    await generator(tree, { project: 'example' });
+
+    const packageJson = readJson(tree, 'packages/example/package.json');
+    const projectJson = readJson(tree, 'packages/example/project.json');
+    expect(packageJson.scripts?.test).toBe('nx run example:test --tui=false --outputStyle=stream');
+    expect(packageJson.nx?.targets?.test).toEqual({
+      executor: 'nx:run-commands',
+      options: { command: 'bun test --package-target' },
+    });
+    expect(projectJson.targets?.test).toEqual({
+      executor: BOUNDED_TEST_EXECUTOR,
+      dependsOn: ['typecheck-tests'],
+      options: {
+        command: 'bun test --project-target',
+        cwd: '{projectRoot}',
+        timeoutMs: 600000,
+        killAfterMs: 10000,
+      },
+    });
+  });
 });
 
-function addProject(tree: Tree, name: string, root: string): void {
+function addProject(tree: Tree, name: string, root: string, options: { keepProjectJson?: boolean } = {}): void {
   addProjectConfiguration(tree, name, {
     root,
     sourceRoot: `${root}/src`,
     projectType: 'library',
     targets: {},
   });
+  if (!options.keepProjectJson && tree.exists(`${root}/project.json`)) {
+    tree.delete(`${root}/project.json`);
+  }
 }
 
 function writeJsonFile(tree: Tree, filePath: string, value: unknown): void {
