@@ -1,3 +1,4 @@
+import { execSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { escapeRegex, getWorkspacePackages } from '../lib/workspace.js';
@@ -25,6 +26,13 @@ export function syncBunLockfileVersions(root: string, options: SyncBunLockfileVe
   let lockfile = readFileSync(lockfilePath, 'utf8');
   let updated = 0;
   for (const pkg of packages) {
+    // If the package.json version is a prerelease (e.g. 0.2.2-next.0) it may
+    // never have been published.  Use the latest stable git tag version so
+    // that `bun pm pack` writes an installable dependency range for consumers.
+    const targetVersion = pkg.version.includes('-')
+      ? (latestStableTagVersion(root, pkg.projectName) ?? pkg.version)
+      : pkg.version;
+
     const relativePath = pkg.path.replaceAll('\\', '/');
     const escaped = escapeRegex(relativePath);
     const pattern = new RegExp(`("${escaped}":\\s*\\{[^}]*"version":\\s*")([^"]+)(")`);
@@ -36,15 +44,16 @@ export function syncBunLockfileVersions(root: string, options: SyncBunLockfileVe
       continue;
     }
     const lockVersion = match[2];
-    if (lockVersion === pkg.version) {
+    if (lockVersion === targetVersion) {
       if (log) {
-        console.log(`ok:   ${relativePath} = ${pkg.version}`);
+        console.log(`ok:   ${relativePath} = ${targetVersion}`);
       }
       continue;
     }
-    lockfile = lockfile.replace(pattern, `$1${pkg.version}$3`);
+    lockfile = lockfile.replace(pattern, `$1${targetVersion}$3`);
     if (log) {
-      console.log(`fix:  ${relativePath}: ${lockVersion} -> ${pkg.version}`);
+      const suffix = targetVersion !== pkg.version ? ` (latest stable tag; package.json has ${pkg.version})` : '';
+      console.log(`fix:  ${relativePath}: ${lockVersion} -> ${targetVersion}${suffix}`);
     }
     updated++;
   }
@@ -69,6 +78,10 @@ export function validateBunLockfileVersions(root: string): number {
   const lockfile = readFileSync(lockfilePath, 'utf8');
   let failures = 0;
   for (const pkg of packages) {
+    const targetVersion = pkg.version.includes('-')
+      ? (latestStableTagVersion(root, pkg.projectName) ?? pkg.version)
+      : pkg.version;
+
     const relativePath = pkg.path.replaceAll('\\', '/');
     const escaped = escapeRegex(relativePath);
     const pattern = new RegExp(`("${escaped}":\\s*\\{[^}]*"version":\\s*")([^"]+)(")`);
@@ -79,8 +92,8 @@ export function validateBunLockfileVersions(root: string): number {
       continue;
     }
     const lockVersion = match[2];
-    if (lockVersion !== pkg.version) {
-      console.error(`${relativePath}: bun.lock workspace version must be ${pkg.version}, got ${lockVersion}`);
+    if (lockVersion !== targetVersion) {
+      console.error(`${relativePath}: bun.lock workspace version must be ${targetVersion}, got ${lockVersion}`);
       failures++;
     }
   }
@@ -88,4 +101,26 @@ export function validateBunLockfileVersions(root: string): number {
     console.log('bun.lock workspace versions are valid.');
   }
   return failures;
+}
+
+function latestStableTagVersion(root: string, projectName: string): string | null {
+  try {
+    const output = execSync(`git tag --list '${projectName}@*' --sort=-v:refname`, {
+      cwd: root,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const prefix = `${projectName}@`;
+    for (const line of output.split('\n')) {
+      const tag = line.trim();
+      if (!tag.startsWith(prefix)) continue;
+      const version = tag.slice(prefix.length);
+      if (version && !version.includes('-')) {
+        return version;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
