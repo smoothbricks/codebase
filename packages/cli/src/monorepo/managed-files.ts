@@ -28,6 +28,12 @@ interface ManagedFileContext {
 const managedFiles: ManagedFile[] = [
   {
     kind: 'raw',
+    source: 'tooling/direnv/repo-path',
+    target: 'tooling/direnv/repo-path',
+    executable: true,
+  },
+  {
+    kind: 'raw',
     source: 'tooling/direnv/github-actions-bootstrap.sh',
     target: 'tooling/direnv/github-actions-bootstrap.sh',
     executable: true,
