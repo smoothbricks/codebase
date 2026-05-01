@@ -1076,6 +1076,7 @@ function validNxJson(): Record<string, unknown> {
       },
       releaseTag: { pattern: '{projectName}@{version}' },
       changelog: {
+        automaticFromRef: true,
         workspaceChangelog: false,
         projectChangelogs: {
           createRelease: false,

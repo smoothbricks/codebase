@@ -79,6 +79,7 @@
       "pattern": "{projectName}@{version}"
     },
     "changelog": {
+      "automaticFromRef": true,
       "workspaceChangelog": false,
       "projectChangelogs": {
         "createRelease": false,
