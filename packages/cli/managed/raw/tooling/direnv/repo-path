@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Single source of truth for repo-local PATH entries.
+# All tooling that sets up PATH must call this instead of hardcoding paths.
+#
+# Usage:
+#   export PATH="$(tooling/direnv/repo-path)"         # shell
+#   tooling/direnv/repo-path --github-path             # CI — appends to $GITHUB_PATH
+#   tooling/direnv/repo-path --print                   # debug — one entry per line
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# Order: most-specific → least-specific.
+entries=(
+  "$root/tooling/direnv/.devenv/profile/bin"
+  "$root/tooling/git-hooks"
+  "$root/tooling"
+  "$root/tooling/node_modules/.bin"
+  "$root/node_modules/.bin"
+)
+
+case "${1:-}" in
+  --github-path)
+    printf '%s\n' "${entries[@]}" >> "$GITHUB_PATH" ;;
+  --print)
+    printf '%s\n' "${entries[@]}" ;;
+  *)
+    IFS=:
+    echo "${entries[*]}:$PATH" ;;
+esac
