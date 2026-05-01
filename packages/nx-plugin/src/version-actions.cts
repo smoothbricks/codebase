@@ -1,3 +1,4 @@
+import { execSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AfterAllProjectsVersioned, VersionActions } from 'nx/release';
@@ -45,6 +46,13 @@ function syncBunLockfileVersions(root: string): number {
   let lockfile = readFileSync(lockfilePath, 'utf8');
   let updated = 0;
   for (const pkg of packages) {
+    // If the package.json version is a prerelease (e.g. 0.2.2-next.0) it may
+    // never have been published.  Use the latest stable git tag version so
+    // that `bun pm pack` writes an installable dependency range for consumers.
+    const targetVersion = pkg.version.includes('-')
+      ? (latestStableTagVersion(root, pkg.projectName) ?? pkg.version)
+      : pkg.version;
+
     const relativePath = pkg.path.replaceAll('\\', '/');
     const escaped = escapeRegex(relativePath);
     const pattern = new RegExp(`("${escaped}":\\s*\\{[^}]*"version":\\s*")([^"]+)(")`);
@@ -54,12 +62,14 @@ function syncBunLockfileVersions(root: string): number {
       continue;
     }
     const lockVersion = match[2];
-    if (lockVersion === pkg.version) {
-      console.log(`ok:   ${relativePath} = ${pkg.version}`);
+    if (lockVersion === targetVersion) {
+      console.log(`ok:   ${relativePath} = ${targetVersion}`);
       continue;
     }
-    lockfile = lockfile.replace(pattern, `$1${pkg.version}$3`);
-    console.log(`fix:  ${relativePath}: ${lockVersion} -> ${pkg.version}`);
+    lockfile = lockfile.replace(pattern, `$1${targetVersion}$3`);
+    console.log(
+      `fix:  ${relativePath}: ${lockVersion} -> ${targetVersion}${targetVersion !== pkg.version ? ` (latest stable tag; package.json has ${pkg.version})` : ''}`
+    );
     updated++;
   }
   if (updated > 0) {
@@ -71,7 +81,14 @@ function syncBunLockfileVersions(root: string): number {
   return updated;
 }
 
-function workspacePackages(root: string): Array<{ path: string; name: string; version: string }> {
+interface WorkspacePackage {
+  path: string;
+  name: string;
+  projectName: string;
+  version: string;
+}
+
+function workspacePackages(root: string): WorkspacePackage[] {
   const packagesRoot = join(root, 'packages');
   return readdirSync(packagesRoot, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
@@ -82,13 +99,36 @@ function workspacePackages(root: string): Array<{ path: string; name: string; ve
         return null;
       }
       const json = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as Record<string, unknown>;
-      return typeof json.name === 'string' && typeof json.version === 'string'
-        ? { path, name: json.name, version: json.version }
-        : null;
+      if (typeof json.name !== 'string' || typeof json.version !== 'string') return null;
+      const nx = json.nx != null && typeof json.nx === 'object' ? (json.nx as Record<string, unknown>) : null;
+      const projectName = (nx ? (typeof nx.name === 'string' ? nx.name : null) : null) ?? json.name;
+      return { path, name: json.name, projectName, version: json.version };
     })
-    .filter((pkg): pkg is { path: string; name: string; version: string } => pkg !== null);
+    .filter((pkg): pkg is WorkspacePackage => pkg !== null);
 }
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function latestStableTagVersion(root: string, projectName: string): string | null {
+  try {
+    const output = execSync(`git tag --list '${projectName}@*' --sort=-v:refname`, {
+      cwd: root,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const prefix = `${projectName}@`;
+    for (const line of output.split('\n')) {
+      const tag = line.trim();
+      if (!tag.startsWith(prefix)) continue;
+      const version = tag.slice(prefix.length);
+      if (version && !version.includes('-')) {
+        return version;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
