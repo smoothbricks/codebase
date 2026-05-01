@@ -67,6 +67,7 @@
     "@smoothbricks/nx-plugin"
   ],
   "release": {
+    "projects": ["tag:npm:public"],
     "projectsRelationship": "independent",
     "version": {
       "specifierSource": "conventional-commits",
