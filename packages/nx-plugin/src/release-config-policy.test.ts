@@ -35,6 +35,7 @@ function validReleaseNxJson(): Record<string, unknown> {
         pattern: SMOO_NX_RELEASE_TAG_PATTERN,
       },
       changelog: {
+        automaticFromRef: true,
         workspaceChangelog: false,
         projectChangelogs: {
           createRelease: false,
@@ -104,6 +105,7 @@ describe('pure core: checkReleaseConfig', () => {
       'release.version.preVersionCommand must not be defined; smoo builds npm-missing packages before publish',
     );
     expect(messages).toContainEqual(`release.releaseTag.pattern must be ${SMOO_NX_RELEASE_TAG_PATTERN}`);
+    expect(messages).toContainEqual('release.changelog.automaticFromRef must be true');
     expect(messages).toContainEqual('release.changelog.workspaceChangelog must be false');
     expect(messages).toContainEqual('release.changelog.projectChangelogs.createRelease must be false');
     expect(messages).toContainEqual('release.changelog.projectChangelogs.file must be false');
@@ -131,6 +133,7 @@ describe('pure core: applyReleaseConfig', () => {
     const releaseTag = release.releaseTag as Record<string, unknown>;
     expect(releaseTag.pattern).toBe(SMOO_NX_RELEASE_TAG_PATTERN);
     const changelog = release.changelog as Record<string, unknown>;
+    expect(changelog.automaticFromRef).toBe(true);
     expect(changelog.workspaceChangelog).toBe(false);
     const projectChangelogs = changelog.projectChangelogs as Record<string, unknown>;
     expect(projectChangelogs.createRelease).toBe(false);

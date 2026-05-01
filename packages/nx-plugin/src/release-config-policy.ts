@@ -65,6 +65,9 @@ export function checkReleaseConfig(nxJson: Record<string, unknown>): NxPolicyIss
   if (!changelog) {
     issues.push({ path: 'nx.json', message: 'release.changelog config is missing' });
   }
+  if (changelog && changelog.automaticFromRef !== true) {
+    issues.push({ path: 'nx.json', message: 'release.changelog.automaticFromRef must be true' });
+  }
   if (changelog && changelog.workspaceChangelog !== false) {
     issues.push({ path: 'nx.json', message: 'release.changelog.workspaceChangelog must be false' });
   }
@@ -122,6 +125,7 @@ export function applyReleaseConfig(nxJson: Record<string, unknown>): boolean {
   changed = setStringProperty(releaseTag, 'pattern', SMOO_NX_RELEASE_TAG_PATTERN) || changed;
 
   const changelog = getOrCreateRecord(release, 'changelog');
+  changed = setBooleanProperty(changelog, 'automaticFromRef', true) || changed;
   changed = setBooleanProperty(changelog, 'workspaceChangelog', false) || changed;
 
   const projectChangelogs = getOrCreateRecord(changelog, 'projectChangelogs');
