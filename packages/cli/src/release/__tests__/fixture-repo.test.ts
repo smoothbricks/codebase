@@ -190,7 +190,8 @@ describe('release planning with fixture git repositories', () => {
 
   it('pushes current release refs to a local bare remote and another clone can fetch them', async () => {
     await withFixtureRepo(async (author) => {
-      await writePackage(author, '@scope/pushed', 'packages/pushed', '1.0.0');
+      await writeWorkspace(author);
+      await writeBuildablePackage(author, '@scope/pushed', 'packages/pushed', '1.0.0');
       await git(author, ['add', '.']);
       await git(author, ['commit', '-m', 'release pushed package']);
       await git(author, ['init', '--bare', 'remote.git']);
