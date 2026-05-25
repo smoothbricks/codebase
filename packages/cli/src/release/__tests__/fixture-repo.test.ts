@@ -9,6 +9,7 @@ import {
   gitIsAncestor,
   gitOutput,
   gitReleaseTagsByCreatorDate,
+  gitSucceeds,
   packageVersionAtRef,
   tag,
   withFixtureRepo,
@@ -78,7 +79,7 @@ describe('release planning with fixture git repositories', () => {
       await git(root, ['init', '--bare', 'remote.git']);
       await git(root, ['remote', 'add', 'origin', join(root, 'remote.git')]);
       await git(root, ['push', 'origin', 'main', '--tags']);
-      await $`git clone --branch main ${join(root, 'remote.git')} checkout`.cwd(root).quiet();
+      await git(root, ['clone', '--branch', 'main', join(root, 'remote.git'), 'checkout']);
       const checkout = join(root, 'checkout');
       await git(checkout, ['fetch', '--tags', 'origin', 'main']);
       const head = await gitOutput(checkout, ['rev-parse', 'HEAD']);
@@ -143,7 +144,7 @@ describe('release planning with fixture git repositories', () => {
       await git(author, ['init', '--bare', 'remote.git']);
       await git(author, ['remote', 'add', 'origin', join(author, 'remote.git')]);
       await git(author, ['push', 'origin', 'main', '--tags']);
-      await $`git clone --branch main ${join(author, 'remote.git')} runner`.cwd(author).quiet();
+      await git(author, ['clone', '--branch', 'main', join(author, 'remote.git'), 'runner']);
       const runner = join(author, 'runner');
       await git(runner, ['config', 'user.name', 'Test User']);
       await git(runner, ['config', 'user.email', 'test@example.com']);
@@ -197,7 +198,7 @@ describe('release planning with fixture git repositories', () => {
       await git(author, ['init', '--bare', 'remote.git']);
       await git(author, ['remote', 'add', 'origin', join(author, 'remote.git')]);
       await git(author, ['push', 'origin', 'main']);
-      await $`git clone --branch main ${join(author, 'remote.git')} runner`.cwd(author).quiet();
+      await git(author, ['clone', '--branch', 'main', join(author, 'remote.git'), 'runner']);
       const runner = join(author, 'runner');
       await git(runner, ['config', 'user.name', 'Test User']);
       await git(runner, ['config', 'user.email', 'test@example.com']);
@@ -213,7 +214,7 @@ describe('release planning with fixture git repositories', () => {
 
       expect(summary.pushed).toBe(true);
       expect(shell.pushes).toEqual([['pushed@1.0.0']]);
-      await $`git clone --branch main ${join(author, 'remote.git')} auditor`.cwd(author).quiet();
+      await git(author, ['clone', '--branch', 'main', join(author, 'remote.git'), 'auditor']);
       const auditor = join(author, 'auditor');
       await git(auditor, ['fetch', '--tags', 'origin', 'main']);
       await expect(gitOutput(auditor, ['rev-parse', 'refs/tags/pushed@1.0.0^{}'])).resolves.toBe(
@@ -237,7 +238,7 @@ describe('release planning with fixture git repositories', () => {
       await git(author, ['init', '--bare', 'remote.git']);
       await git(author, ['remote', 'add', 'origin', join(author, 'remote.git')]);
       await git(author, ['push', 'origin', 'main', '--tags']);
-      await $`git clone --branch main ${join(author, 'remote.git')} runner`.cwd(author).quiet();
+      await git(author, ['clone', '--branch', 'main', join(author, 'remote.git'), 'runner']);
       const runner = join(author, 'runner');
       await git(runner, ['config', 'user.name', 'Test User']);
       await git(runner, ['config', 'user.email', 'test@example.com']);
@@ -356,9 +357,4 @@ class LocalGitRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
     }
     await git(this.root, ['tag', '-a', tagName, '-m', tagName, 'HEAD']);
   }
-}
-
-async function gitSucceeds(root: string, args: string[]): Promise<boolean> {
-  const result = await $`git ${args}`.cwd(root).quiet().nothrow();
-  return result.exitCode === 0;
 }
