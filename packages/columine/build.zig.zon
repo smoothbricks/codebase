@@ -10,8 +10,8 @@
     // WASM targets use std.json.Scanner fallback (simdjzon requires 64-bit SIMD).
     .dependencies = .{
         .zig_msgpack = .{
-            .url = "https://github.com/zigcc/zig-msgpack/archive/main.tar.gz",
-            .hash = "zig_msgpack-0.0.14-evvueEc7BQATytDqy8wFvDb883Jv3yLk_8cF5EoYaKFB",
+            .url = "https://github.com/zigcc/zig-msgpack/archive/962cc094508f391a56f3bcfb059331feb2f7a233.tar.gz",
+            .hash = "zig_msgpack-0.0.14-evvueL5SBQACmim6j6klQ9wWIIG_UxGlPvVYdiNy0KT8",
         },
         .simdjzon = .{
             .url = "git+https://github.com/smoothbricks/simdjzon#353b71a46cbb12746515066fe807cab6f67ef4a3",
