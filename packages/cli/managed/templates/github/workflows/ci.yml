@@ -2,8 +2,7 @@ name: CI
 
 on:
   push:
-    branches:
-      - '**'
+    branches: __SMOO_CI_PUSH_BRANCHES__
   pull_request:
 
 permissions:

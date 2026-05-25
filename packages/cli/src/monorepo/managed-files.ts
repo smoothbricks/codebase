@@ -21,6 +21,7 @@ export interface FileResult {
 
 interface ManagedFileContext {
   hasReleasePackages: boolean;
+  ciPushBranches: string[];
   nodeModulesCacheKey: string;
   repoName: string;
 }
@@ -155,16 +156,46 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
 function getManagedFileContext(root: string): ManagedFileContext {
   const packageJson = readPackageJson(join(root, 'package.json'));
   const repoName = packageJson?.name ?? 'monorepo';
+  const ciPushBranches = getCiPushBranches(packageJson);
   const nodeModulesCacheKey = existsSync(join(root, 'bun.lock'))
     ? `$${"{{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json') }}"}`
     : `$${"{{ hashFiles('bun.lockb', 'package.json', 'packages/*/package.json') }}"}`;
-  return { hasReleasePackages: listReleasePackages(root, packageJson).length > 0, nodeModulesCacheKey, repoName };
+  return {
+    hasReleasePackages: listReleasePackages(root, packageJson).length > 0,
+    ciPushBranches,
+    nodeModulesCacheKey,
+    repoName,
+  };
 }
 
 function renderTemplate(context: ManagedFileContext, template: string): string {
   return template
     .replaceAll('{{REPO_NAME}}', context.repoName)
+    .replaceAll('__SMOO_CI_PUSH_BRANCHES__', renderYamlFlowList(context.ciPushBranches))
     .replaceAll('{{NODE_MODULES_CACHE_KEY}}', context.nodeModulesCacheKey);
+}
+
+function getCiPushBranches(packageJson: unknown): string[] {
+  const configured = readCiPushBranches(packageJson);
+  return configured.length > 0 ? configured : ['main'];
+}
+
+function readCiPushBranches(packageJson: unknown): string[] {
+  const rootPackage = recordValue(packageJson);
+  const smoo = recordValue(rootPackage?.smoo);
+  const github = recordValue(smoo?.github);
+  const branches = Array.isArray(github?.pushBranches) ? github.pushBranches : [];
+  return branches.filter((branch): branch is string => typeof branch === 'string' && branch.length > 0);
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function renderYamlFlowList(values: string[]): string {
+  return JSON.stringify(values);
 }
 
 function writeManagedFile(path: string, content: string, executable: boolean): void {
