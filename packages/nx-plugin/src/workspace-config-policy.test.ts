@@ -36,10 +36,15 @@ function validNxJson(): Record<string, unknown> {
       },
       '@smoothbricks/nx-plugin',
     ],
-    targetDefaults: {
-      build: { cache: true, outputs: ['{projectRoot}/dist'] },
-    },
+    targetDefaults: validTargetDefaults(),
     namedInputs: validNamedInputs(),
+  };
+}
+
+function validTargetDefaults(): Record<string, unknown> {
+  return {
+    build: { cache: true, outputs: ['{projectRoot}/dist'] },
+    clean: { executor: '@smoothbricks/nx-plugin:clean-outputs', cache: false },
   };
 }
 
@@ -95,7 +100,7 @@ describe('pure core: checkWorkspaceConfig', () => {
   it('detects missing plugins', () => {
     const issues = checkWorkspaceConfig({
       plugins: [],
-      targetDefaults: { build: { cache: true, outputs: ['{projectRoot}/dist'] } },
+      targetDefaults: validTargetDefaults(),
       namedInputs: validNamedInputs(),
     });
     expect(issues.length).toBe(2);
@@ -107,7 +112,7 @@ describe('pure core: checkWorkspaceConfig', () => {
     const issues = checkWorkspaceConfig({
       ...validNxJson(),
       targetDefaults: {
-        build: { cache: true, outputs: ['{projectRoot}/dist'] },
+        ...validTargetDefaults(),
         'build:wasm': { cache: true },
       },
     });
@@ -121,7 +126,7 @@ describe('pure core: checkWorkspaceConfig', () => {
         { plugin: '@nx/js/typescript', options: { build: { targetName: 'build' } } },
         '@smoothbricks/nx-plugin',
       ],
-      targetDefaults: { build: { cache: true, outputs: ['{projectRoot}/dist'] } },
+      targetDefaults: validTargetDefaults(),
       namedInputs: validNamedInputs(),
     });
     expect(issues.some((i) => i.message.includes('build.targetName must be tsc-js'))).toBe(true);
@@ -130,7 +135,7 @@ describe('pure core: checkWorkspaceConfig', () => {
   it('detects imprecise production inputs', () => {
     const issues = checkWorkspaceConfig({
       plugins: validPlugins(),
-      targetDefaults: { build: { cache: true, outputs: ['{projectRoot}/dist'] } },
+      targetDefaults: validTargetDefaults(),
       namedInputs: {
         ...validNamedInputs(),
         production: ['default'],
@@ -142,7 +147,10 @@ describe('pure core: checkWorkspaceConfig', () => {
   it('detects missing build cache', () => {
     const issues = checkWorkspaceConfig({
       plugins: validPlugins(),
-      targetDefaults: { build: { cache: false } },
+      targetDefaults: {
+        build: { cache: false },
+        clean: { executor: '@smoothbricks/nx-plugin:clean-outputs', cache: false },
+      },
       namedInputs: validNamedInputs(),
     });
     expect(issues.some((i) => i.message.includes('build.cache must be true'))).toBe(true);
@@ -152,7 +160,7 @@ describe('pure core: checkWorkspaceConfig', () => {
   it('detects missing sharedGlobals', () => {
     const issues = checkWorkspaceConfig({
       plugins: validPlugins(),
-      targetDefaults: { build: { cache: true, outputs: ['{projectRoot}/dist'] } },
+      targetDefaults: validTargetDefaults(),
       namedInputs: {
         ...validNamedInputs(),
         sharedGlobals: [],
@@ -171,7 +179,7 @@ describe('pure core: applyWorkspaceConfig', () => {
   it('fixes missing plugins', () => {
     const nxJson: Record<string, unknown> = {
       plugins: [],
-      targetDefaults: { build: { cache: true, outputs: ['{projectRoot}/dist'] } },
+      targetDefaults: validTargetDefaults(),
       namedInputs: validNamedInputs(),
     };
     expect(applyWorkspaceConfig(nxJson)).toBe(true);
@@ -186,7 +194,7 @@ describe('pure core: applyWorkspaceConfig', () => {
     const nxJson = {
       ...validNxJson(),
       targetDefaults: {
-        build: { cache: true, outputs: ['{projectRoot}/dist'] },
+        ...validTargetDefaults(),
         'build:wasm': { cache: true },
       },
     };
@@ -197,7 +205,7 @@ describe('pure core: applyWorkspaceConfig', () => {
   it('fixes imprecise production inputs', () => {
     const nxJson: Record<string, unknown> = {
       plugins: validPlugins(),
-      targetDefaults: { build: { cache: true, outputs: ['{projectRoot}/dist'] } },
+      targetDefaults: validTargetDefaults(),
       namedInputs: {
         ...validNamedInputs(),
         production: ['default', '{projectRoot}/**/*'],
@@ -217,7 +225,7 @@ describe('pure core: applyWorkspaceConfig', () => {
   it('accepts custom precise production inputs unchanged', () => {
     const nxJson: Record<string, unknown> = {
       plugins: validPlugins(),
-      targetDefaults: { build: { cache: true, outputs: ['{projectRoot}/dist'] } },
+      targetDefaults: validTargetDefaults(),
       namedInputs: {
         ...validNamedInputs(),
         production: ['{projectRoot}/src/**/*.rs', '{projectRoot}/Cargo.toml', '!{projectRoot}/**/*.test.*'],
@@ -245,7 +253,7 @@ describe('Tree: checkWorkspaceConfigTree', () => {
     const tree = createTreeWithEmptyWorkspace();
     writeJson(tree, 'nx.json', {
       plugins: [],
-      targetDefaults: { build: { cache: true, outputs: ['{projectRoot}/dist'] } },
+      targetDefaults: validTargetDefaults(),
       namedInputs: validNamedInputs(),
     });
 
@@ -274,7 +282,7 @@ describe('Tree: applyWorkspaceConfigTree', () => {
     const tree = createTreeWithEmptyWorkspace();
     writeJson(tree, 'nx.json', {
       plugins: [],
-      targetDefaults: { build: { cache: true, outputs: ['{projectRoot}/dist'] } },
+      targetDefaults: validTargetDefaults(),
       namedInputs: validNamedInputs(),
     });
 
@@ -312,6 +320,10 @@ describe('Tree: applyWorkspaceConfigTree', () => {
     expect((nxJson.targetDefaults as Record<string, unknown>).build).toEqual({
       cache: true,
       outputs: ['{projectRoot}/dist'],
+    });
+    expect((nxJson.targetDefaults as Record<string, unknown>).clean).toEqual({
+      executor: '@smoothbricks/nx-plugin:clean-outputs',
+      cache: false,
     });
   });
 });

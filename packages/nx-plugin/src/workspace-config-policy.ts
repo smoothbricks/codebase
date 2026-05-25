@@ -23,6 +23,7 @@ export const BUILD_OUTPUT_DEPENDENCIES = [
 
 const nxJsTypescriptPlugin = '@nx/js/typescript';
 const smoothBricksNxPlugin = '@smoothbricks/nx-plugin';
+const cleanOutputsExecutor = '@smoothbricks/nx-plugin:clean-outputs';
 const expectedSharedGlobalsNamedInput = ['{workspaceRoot}/.github/workflows/ci.yml'];
 const defaultProductionNamedInput = [
   '{projectRoot}/src/**/*',
@@ -56,6 +57,9 @@ export function checkWorkspaceConfig(nxJson: Record<string, unknown>): NxPolicyI
 
   // Build target default
   validateBuildTargetDefault(nxJson, 'nx.json', issues);
+
+  // Clean target default
+  validateCleanTargetDefault(nxJson, 'nx.json', issues);
 
   // Named input defaults
   validateNamedInputDefaults(nxJson, 'nx.json', issues);
@@ -97,6 +101,7 @@ export function checkWorkspaceConfig(nxJson: Record<string, unknown>): NxPolicyI
 export function applyWorkspaceConfig(nxJson: Record<string, unknown>): boolean {
   let changed = removeColonTargetDefaults(nxJson);
   changed = applyBuildTargetDefault(nxJson) || changed;
+  changed = applyCleanTargetDefault(nxJson) || changed;
   changed = applyNamedInputDefaults(nxJson) || changed;
   const currentPlugins = Array.isArray(nxJson.plugins) ? nxJson.plugins : [];
   const nextPlugins = upsertNxPlugin(
@@ -185,6 +190,21 @@ function validateBuildTargetDefault(
   }
 }
 
+function validateCleanTargetDefault(
+  nxJson: Record<string, unknown>,
+  nxJsonPath: string,
+  issues: NxPolicyIssue[],
+): void {
+  const targetDefaults = recordProperty(nxJson, 'targetDefaults');
+  const clean = targetDefaults ? recordProperty(targetDefaults, 'clean') : null;
+  if (!clean || clean.executor !== cleanOutputsExecutor) {
+    issues.push({ path: nxJsonPath, message: `targetDefaults.clean.executor must be ${cleanOutputsExecutor}` });
+  }
+  if (!clean || clean.cache !== false) {
+    issues.push({ path: nxJsonPath, message: 'targetDefaults.clean.cache must be false' });
+  }
+}
+
 function validateNamedInputDefaults(
   nxJson: Record<string, unknown>,
   nxJsonPath: string,
@@ -232,6 +252,14 @@ function applyBuildTargetDefault(nxJson: Record<string, unknown>): boolean {
   const build = getOrCreateRecord(targetDefaults, 'build');
   let changed = setBooleanProperty(build, 'cache', true);
   changed = setStringArrayProperty(build, 'outputs', ['{projectRoot}/dist']) || changed;
+  return changed;
+}
+
+function applyCleanTargetDefault(nxJson: Record<string, unknown>): boolean {
+  const targetDefaults = getOrCreateRecord(nxJson, 'targetDefaults');
+  const clean = getOrCreateRecord(targetDefaults, 'clean');
+  let changed = setStringProperty(clean, 'executor', cleanOutputsExecutor);
+  changed = setBooleanProperty(clean, 'cache', false) || changed;
   return changed;
 }
 
@@ -367,6 +395,14 @@ function getOrCreateRecord(record: Record<string, unknown>, key: string): Record
 }
 
 function setBooleanProperty(record: Record<string, unknown>, key: string, value: boolean): boolean {
+  if (record[key] === value) {
+    return false;
+  }
+  record[key] = value;
+  return true;
+}
+
+function setStringProperty(record: Record<string, unknown>, key: string, value: string): boolean {
   if (record[key] === value) {
     return false;
   }

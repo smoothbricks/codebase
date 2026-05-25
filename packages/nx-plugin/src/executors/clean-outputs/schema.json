@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/schema",
+  "version": 2,
+  "title": "Clean Outputs Executor",
+  "description": "Remove declared build output directories unless they contain tracked files.",
+  "type": "object",
+  "properties": {
+    "outputs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Optional output patterns. Defaults to the project's build outputs, then {projectRoot}/dist."
+    }
+  },
+  "additionalProperties": false
+}
