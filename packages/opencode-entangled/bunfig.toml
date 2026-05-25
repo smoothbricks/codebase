@@ -1,3 +1,2 @@
 [test]
-timeout = 30000
 preload = ["@smoothbricks/validation/bun/preload"]

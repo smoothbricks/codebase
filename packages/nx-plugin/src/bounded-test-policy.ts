@@ -4,6 +4,11 @@ import { dirname, join } from 'node:path';
 export const BOUNDED_TEST_EXECUTOR = '@smoothbricks/nx-plugin:bounded-exec';
 export const BOUNDED_TEST_TIMEOUT_MS = 120_000;
 export const BOUNDED_TEST_KILL_AFTER_MS = 10_000;
+// Per-test timeout passed to `bun test --timeout=<ms>`. Bun's default is
+// 5000ms which is too tight for git-fixture tests on slower CI runners
+// (Actions). The bunfig.toml `[test] timeout` key is silently ignored by
+// Bun — the only working surfaces are this CLI flag and `setDefaultTimeout()`.
+export const BOUNDED_TEST_PER_TEST_TIMEOUT_MS = 30_000;
 
 export interface BoundedTestPolicyPackageJson {
   name?: string;
@@ -124,6 +129,7 @@ export function checkBoundedTestTargetPolicy(
     typeof targetOptions.command !== 'string' ||
     targetOptions.command.length === 0 ||
     isPackageTestScriptRunnerCommand(targetOptions.command) ||
+    targetOptions.command !== ensureBunTestTimeoutFlag(targetOptions.command) ||
     targetOptions.cwd !== '{projectRoot}' ||
     targetOptions.timeoutMs !== BOUNDED_TEST_TIMEOUT_MS ||
     targetOptions.killAfterMs !== BOUNDED_TEST_KILL_AFTER_MS
@@ -141,6 +147,14 @@ export function resolveTestCommand(
   packageJson: BoundedTestPolicyPackageJson,
   defaultCommand = 'bun test',
   projectJson?: BoundedTestPolicyProjectJson,
+): string {
+  return ensureBunTestTimeoutFlag(resolveRawTestCommand(packageJson, defaultCommand, projectJson));
+}
+
+function resolveRawTestCommand(
+  packageJson: BoundedTestPolicyPackageJson,
+  defaultCommand: string,
+  projectJson: BoundedTestPolicyProjectJson | undefined,
 ): string {
   const commandFromProjectTarget = resolveTargetCommand(projectJson?.targets?.test);
   if (commandFromProjectTarget) {
@@ -173,6 +187,28 @@ function resolveTargetCommand(existingTarget: unknown): string | null {
     }
   }
   return null;
+}
+
+const BUN_TEST_PREFIX = /^bun\s+test(?=\s|$)/;
+const EXISTING_BUN_TIMEOUT = /(^|\s)--timeout(?:=|\s+)(\S+)/;
+
+// Bun's `[test] timeout` bunfig key is silently ignored — only the CLI flag
+// and `setDefaultTimeout()` actually take effect. Normalize every `bun test`
+// command so the policy enforces the workspace per-test timeout in the one
+// place where Bun will honor it.
+export function ensureBunTestTimeoutFlag(command: string, timeoutMs = BOUNDED_TEST_PER_TEST_TIMEOUT_MS): string {
+  if (!BUN_TEST_PREFIX.test(command)) {
+    return command;
+  }
+  const flag = `--timeout=${timeoutMs}`;
+  const existing = EXISTING_BUN_TIMEOUT.exec(command);
+  if (!existing) {
+    return command.replace(BUN_TEST_PREFIX, `bun test ${flag}`);
+  }
+  if (existing[2] === String(timeoutMs)) {
+    return command;
+  }
+  return command.replace(EXISTING_BUN_TIMEOUT, `${existing[1]}${flag}`);
 }
 
 function isPackageTestScriptRunnerCommand(command: string): boolean {

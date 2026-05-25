@@ -5,8 +5,12 @@ import { dirname, join } from 'node:path';
 import {
   BOUNDED_TEST_EXECUTOR,
   BOUNDED_TEST_KILL_AFTER_MS,
+  BOUNDED_TEST_PER_TEST_TIMEOUT_MS,
   BOUNDED_TEST_TIMEOUT_MS,
 } from '@smoothbricks/nx-plugin/bounded-test-policy';
+
+const TIMEOUT_FLAG = `--timeout=${BOUNDED_TEST_PER_TEST_TIMEOUT_MS}`;
+
 import {
   applyFixableMonorepoDefaults,
   applyNxPluginDefaults,
@@ -595,7 +599,7 @@ describe('workspace package script policy', () => {
               test: {
                 executor: BOUNDED_TEST_EXECUTOR,
                 options: {
-                  command: 'bun test',
+                  command: `bun test ${TIMEOUT_FLAG}`,
                   cwd: '{projectRoot}',
                   timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
                   killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
@@ -825,7 +829,7 @@ describe('workspace package script policy', () => {
           test: {
             executor: BOUNDED_TEST_EXECUTOR,
             options: {
-              command: 'bun test --pass-with-no-tests',
+              command: `bun test ${TIMEOUT_FLAG} --pass-with-no-tests`,
               cwd: '{projectRoot}',
               timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
               killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
@@ -970,7 +974,7 @@ describe('workspace package script policy', () => {
           test: {
             executor: BOUNDED_TEST_EXECUTOR,
             options: {
-              command: 'bun test --pass-with-no-tests',
+              command: `bun test ${TIMEOUT_FLAG} --pass-with-no-tests`,
               cwd: '{projectRoot}',
               timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
               killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,

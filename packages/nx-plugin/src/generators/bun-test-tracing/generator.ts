@@ -47,7 +47,6 @@ const DEFAULT_TEST_INCLUDES = [
 ];
 
 const COPIED_COMPILER_OPTIONS = ['baseUrl', 'module', 'moduleResolution', 'jsx', 'lib'];
-const DEFAULT_BUN_TEST_TIMEOUT_MS = 30_000;
 
 export default async function generator(tree: Tree, schema: BunTestTracingGeneratorSchema): Promise<void> {
   const options = normalizeOptions(schema);
@@ -135,50 +134,42 @@ function writeBunfig(tree: Tree, projectRoot: string): void {
   const preloadEntries = '"@smoothbricks/lmao/bun/preload", "@smoothbricks/lmao/bun/trace-preload"';
 
   if (!tree.exists(bunfigPath)) {
-    tree.write(bunfigPath, `[test]\ntimeout = ${DEFAULT_BUN_TEST_TIMEOUT_MS}\npreload = [${preloadEntries}]\n`);
+    tree.write(bunfigPath, `[test]\npreload = [${preloadEntries}]\n`);
     return;
   }
 
-  const current = tree.read(bunfigPath, 'utf-8') ?? '';
-  const next = ensureBunTestTimeout(current);
+  // Bun silently ignores `[test] timeout` in bunfig.toml — only the `--timeout`
+  // CLI flag and `setDefaultTimeout()` actually take effect. Strip any stale
+  // `timeout = N` lines so the file isn't lying about what's enforced; the real
+  // per-test timeout is wired into `bun test --timeout=N` by the bounded-test
+  // policy (see BOUNDED_TEST_PER_TEST_TIMEOUT_MS).
+  const current = stripBunTestTimeoutLine(tree.read(bunfigPath, 'utf-8') ?? '');
 
   // Already has the package specifier preloads
-  if (next.includes('@smoothbricks/lmao/bun/preload')) {
-    if (next !== current) {
-      tree.write(bunfigPath, next);
+  if (current.includes('@smoothbricks/lmao/bun/preload')) {
+    if (current !== (tree.read(bunfigPath, 'utf-8') ?? '')) {
+      tree.write(bunfigPath, current);
     }
     return;
   }
 
   // Replace old patterns with the package specifier preloads
-  if (next.includes('preload = [')) {
-    tree.write(bunfigPath, next.replace(/preload\s*=\s*\[.*?\]/s, `preload = [${preloadEntries}]`));
+  if (current.includes('preload = [')) {
+    tree.write(bunfigPath, current.replace(/preload\s*=\s*\[.*?\]/s, `preload = [${preloadEntries}]`));
     return;
-  }
-
-  if (next.includes('[test]')) {
-    tree.write(bunfigPath, next.replace('[test]', `[test]\npreload = [${preloadEntries}]`));
-    return;
-  }
-
-  const suffix = next.endsWith('\n') ? '' : '\n';
-  tree.write(
-    bunfigPath,
-    `${next}${suffix}[test]\ntimeout = ${DEFAULT_BUN_TEST_TIMEOUT_MS}\npreload = [${preloadEntries}]\n`,
-  );
-}
-
-function ensureBunTestTimeout(current: string): string {
-  if (/(^|\n)\s*timeout\s*=/.test(current)) {
-    return current;
   }
 
   if (current.includes('[test]')) {
-    return current.replace('[test]', `[test]\ntimeout = ${DEFAULT_BUN_TEST_TIMEOUT_MS}`);
+    tree.write(bunfigPath, current.replace('[test]', `[test]\npreload = [${preloadEntries}]`));
+    return;
   }
 
   const suffix = current.endsWith('\n') ? '' : '\n';
-  return `${current}${suffix}[test]\ntimeout = ${DEFAULT_BUN_TEST_TIMEOUT_MS}\n`;
+  tree.write(bunfigPath, `${current}${suffix}[test]\npreload = [${preloadEntries}]\n`);
+}
+
+function stripBunTestTimeoutLine(current: string): string {
+  return current.replace(/^\s*timeout\s*=.*\n?/gm, '');
 }
 
 function renderSuiteTracer(options: Required<BunTestTracingGeneratorSchema>): string {
