@@ -48,10 +48,12 @@ export { SMOO_NX_RELEASE_TAG_PATTERN, SMOO_NX_VERSION_ACTIONS };
 
 const extraCommitScopes = ['release'];
 const rootScriptPolicy: Record<string, string> = {
+  clean: 'nx run-many -t clean; nx reset',
+  'clean:node_modules': 'rm -rf node_modules && find e* t* p* -type d -name node_modules -print0 | xargs -0 rm -rvf',
+  'format:changed': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --also-unstaged',
+  'format:staged': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml',
   lint: 'nx run-many -t lint',
   'lint:fix': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --unstaged',
-  'format:staged': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml',
-  'format:changed': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --also-unstaged',
 };
 
 export function applyFixableMonorepoDefaults(root: string): void {

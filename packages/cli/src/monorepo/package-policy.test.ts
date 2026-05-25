@@ -51,14 +51,17 @@ describe('root smoo monorepo policy', () => {
       );
       await writeJson(join(root, 'nx.json'), validNxJson());
 
-      expect(validateRootPackagePolicy(root)).toBe(5);
-      expect(validateNxReleaseConfig(root)).toBe(6);
+      expect(validateRootPackagePolicy(root)).toBe(7);
+      expect(validateNxReleaseConfig(root)).toBe(8);
 
       applyFixableMonorepoDefaults(root);
 
       const rootPackage = await readJson(join(root, 'package.json'));
       const nxJson = await readJson(join(root, 'nx.json'));
       expect(rootPackage.scripts).toEqual({
+        clean: 'nx run-many -t clean; nx reset',
+        'clean:node_modules':
+          'rm -rf node_modules && find e* t* p* -type d -name node_modules -print0 | xargs -0 rm -rvf',
         'format:changed': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --also-unstaged',
         'format:staged': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml',
         lint: 'nx run-many -t lint',
@@ -66,7 +69,7 @@ describe('root smoo monorepo policy', () => {
       });
       expect(rootPackage).toMatchObject({ nx: { includedScripts: [] } });
       expect(nxJson.namedInputs).toEqual(validNamedInputs());
-      expect(nxJson.targetDefaults).toEqual({ build: { cache: true, outputs: ['{projectRoot}/dist'] } });
+      expect(nxJson.targetDefaults).toEqual(validTargetDefaults());
       expect(nxJson.plugins).toEqual([
         {
           plugin: '@nx/js/typescript',
@@ -152,12 +155,12 @@ describe('root smoo monorepo policy', () => {
         },
       });
 
-      expect(validateNxReleaseConfig(root)).toBe(4);
+      expect(validateNxReleaseConfig(root)).toBe(6);
 
       applyFixableMonorepoDefaults(root);
 
       const nxJson = await readJson(join(root, 'nx.json'));
-      expect(nxJson.targetDefaults).toEqual({ build: { cache: true, outputs: ['{projectRoot}/dist'] } });
+      expect(nxJson.targetDefaults).toEqual(validTargetDefaults());
       expect(validateNxReleaseConfig(root)).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -1096,7 +1099,7 @@ function validConfiguredNxJson(): Record<string, unknown> {
   return {
     ...validNxJson(),
     namedInputs: validNamedInputs(),
-    targetDefaults: { build: { cache: true, outputs: ['{projectRoot}/dist'] } },
+    targetDefaults: validTargetDefaults(),
     plugins: [
       {
         plugin: '@nx/js/typescript',
@@ -1112,6 +1115,13 @@ function validConfiguredNxJson(): Record<string, unknown> {
       },
       '@smoothbricks/nx-plugin',
     ],
+  };
+}
+
+function validTargetDefaults(): Record<string, unknown> {
+  return {
+    build: { cache: true, outputs: ['{projectRoot}/dist'] },
+    clean: { executor: '@smoothbricks/nx-plugin:clean-outputs', cache: false },
   };
 }
 

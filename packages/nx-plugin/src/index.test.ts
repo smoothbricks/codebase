@@ -38,6 +38,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets.build?.executor).toBe('nx:noop');
       expect(targets.build?.cache).toBe(true);
       expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
+      expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
+      expect(targets.clean?.cache).toBe(false);
 
       expect(targets['typecheck-tests']?.executor).toBe('nx:run-commands');
       expect(targets['typecheck-tests']?.cache).toBe(true);
@@ -112,7 +114,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       const targets = await inferProjectTargets(workspace, 'packages/ziggy/package.json');
 
-      expect(Object.keys(targets).sort()).toEqual(['build', 'zig-native', 'zig-wasm']);
+      expect(Object.keys(targets).sort()).toEqual(['build', 'clean', 'zig-native', 'zig-wasm']);
       expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
       expect(targets.build?.cache).toBe(true);
       expect(targets['zig-wasm']?.cache).toBe(true);
@@ -144,6 +146,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['tsdown-js']).toBeUndefined();
       expect(targets.build?.executor).toBe('nx:noop');
       expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
+      expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
     } finally {
       await workspace.cleanup();
     }

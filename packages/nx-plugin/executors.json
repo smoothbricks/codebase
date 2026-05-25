@@ -4,6 +4,11 @@
       "implementation": "./dist/executors/bounded-exec/executor.js",
       "schema": "./src/executors/bounded-exec/schema.json",
       "description": "Run a command with bounded timeout and force-kill behavior"
+    },
+    "clean-outputs": {
+      "implementation": "./dist/executors/clean-outputs/executor.js",
+      "schema": "./src/executors/clean-outputs/schema.json",
+      "description": "Remove declared build output directories unless they contain tracked files"
     }
   }
 }

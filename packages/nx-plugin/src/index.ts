@@ -118,6 +118,10 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       cache: true,
       dependsOn: ['^build', ...BUILD_OUTPUT_DEPENDENCIES],
     };
+    targets.clean = {
+      executor: '@smoothbricks/nx-plugin:clean-outputs',
+      cache: false,
+    };
   }
 
   if (targets['typecheck-tests']) {
