@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { $ } from 'bun';
 import type { GitReleaseTagInfo } from '../../core.js';
 
 const GIT_TIMEOUT_MS = 10_000;
@@ -108,6 +109,23 @@ async function gitResult(root: string, args: string[], env?: Record<string, stri
 
 async function streamBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+export async function runFixtureNx(root: string, args: string[]): Promise<void> {
+  await $`nx ${args}`
+    .cwd(root)
+    .env({ ...definedProcessEnv(), NX_DAEMON: 'false' })
+    .quiet();
+}
+
+function definedProcessEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) {
+      env[key] = value;
+    }
+  }
+  return env;
 }
 
 interface GitResult {

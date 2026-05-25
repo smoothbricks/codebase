@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { $ } from 'bun';
 import { collectOwnedReleaseTagRecords, pendingReleaseTargets, type ReleasePackageInfo, releaseTag } from '../core.js';
 import { completeReleaseAtHead, type ReleaseRepairShell, repairPendingTargets } from '../orchestration.js';
 import {
@@ -11,6 +10,7 @@ import {
   gitReleaseTagsByCreatorDate,
   gitSucceeds,
   packageVersionAtRef,
+  runFixtureNx,
   tag,
   withFixtureRepo,
   writeBuildablePackage,
@@ -106,7 +106,7 @@ describe('release planning with fixture git repositories', () => {
       await writeBuildablePackage(root, '@scope/a', 'packages/a');
       await writeBuildablePackage(root, '@scope/b', 'packages/b');
 
-      await $`nx run-many -t build --projects=${'a,b'}`.cwd(root).quiet();
+      await runFixtureNx(root, ['run-many', '-t', 'build', '--projects=a,b']);
 
       await expect(readFile(join(root, 'packages/a/dist/index.js'), 'utf8')).resolves.toBe('{}\n');
       await expect(readFile(join(root, 'packages/b/dist/index.js'), 'utf8')).resolves.toBe('{}\n');
@@ -324,7 +324,12 @@ class LocalGitRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
 
   async buildReleaseCandidate(packages: ReleasePackageInfo[]): Promise<void> {
     this.builds.push(packages.map((pkg) => pkg.name));
-    await $`nx run-many -t build --projects=${packages.map((pkg) => pkg.projectName).join(',')}`.cwd(this.root).quiet();
+    await runFixtureNx(this.root, [
+      'run-many',
+      '-t',
+      'build',
+      `--projects=${packages.map((pkg) => pkg.projectName).join(',')}`,
+    ]);
   }
 
   async publishPackage(pkg: ReleasePackageInfo, distTag: string, dryRun: boolean): Promise<void> {
