@@ -2,7 +2,11 @@ import { beforeEach, describe, expect, it } from 'bun:test';
 import { addProjectConfiguration, readJson, type Tree } from 'nx/src/devkit-exports.js';
 import { createTreeWithEmptyWorkspace } from 'nx/src/devkit-testing-exports.js';
 
-import { BOUNDED_TEST_KILL_AFTER_MS, BOUNDED_TEST_TIMEOUT_MS } from '../../bounded-test-policy.js';
+import {
+  BOUNDED_TEST_KILL_AFTER_MS,
+  BOUNDED_TEST_PER_TEST_TIMEOUT_MS,
+  BOUNDED_TEST_TIMEOUT_MS,
+} from '../../bounded-test-policy.js';
 import generator from './generator.js';
 
 function referencePaths(references: Array<{ path: string }> | undefined): string[] {
@@ -57,7 +61,8 @@ describe('bun-test-tracing generator', () => {
     expect(tree.read('packages/example/bunfig.toml', 'utf-8')).toContain(
       'preload = ["@smoothbricks/lmao/bun/preload", "@smoothbricks/lmao/bun/trace-preload"]',
     );
-    expect(tree.read('packages/example/bunfig.toml', 'utf-8')).toContain('timeout = 30000');
+    // Bun ignores `[test] timeout` in bunfig — per-test timeout lives on the bun CLI flag.
+    expect(tree.read('packages/example/bunfig.toml', 'utf-8')).not.toContain('timeout =');
 
     const tracerFile = tree.read('packages/example/src/test-suite-tracer.ts', 'utf-8');
     expect(tracerFile).toContain("import { opContext } from '@smoothbricks/lmao';");
@@ -72,7 +77,7 @@ describe('bun-test-tracing generator', () => {
       executor: '@smoothbricks/nx-plugin:bounded-exec',
       dependsOn: ['typecheck-tests', '^build'],
       options: {
-        command: 'bun test',
+        command: `bun test --timeout=${BOUNDED_TEST_PER_TEST_TIMEOUT_MS}`,
         cwd: '{projectRoot}',
         timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
@@ -142,7 +147,7 @@ describe('bun-test-tracing generator', () => {
 
     const bunfig = tree.read('packages/example/bunfig.toml', 'utf-8') ?? '';
     expect(bunfig).toContain('[test]');
-    expect(bunfig).toContain('timeout = 30000');
+    expect(bunfig).not.toContain('timeout =');
     expect(bunfig).toContain('preload');
   });
 
@@ -193,7 +198,9 @@ describe('bun-test-tracing generator', () => {
     });
 
     const bunfig = tree.read('packages/example/bunfig.toml', 'utf-8') ?? '';
-    expect(bunfig).toContain('timeout = 10');
+    // Stale `[test] timeout` lines are stripped — Bun ignores them and they
+    // mislead readers about what's actually enforced.
+    expect(bunfig).not.toContain('timeout =');
     expect(bunfig).toContain('@smoothbricks/lmao/bun/preload');
     expect(bunfig).toContain('@smoothbricks/lmao/bun/trace-preload');
 

@@ -15,9 +15,11 @@ describe('Bun bootstrap imports', () => {
     expect(typeof policy.checkBoundedTestTargetPolicy).toBe('function');
     expect(typeof policy.boundedTestScriptAlias).toBe('function');
     expect(typeof policy.resolveTestCommand).toBe('function');
+    expect(typeof policy.ensureBunTestTimeoutFlag).toBe('function');
     expect(typeof policy.BOUNDED_TEST_EXECUTOR).toBe('string');
     expect(typeof policy.BOUNDED_TEST_TIMEOUT_MS).toBe('number');
     expect(typeof policy.BOUNDED_TEST_KILL_AFTER_MS).toBe('number');
+    expect(typeof policy.BOUNDED_TEST_PER_TEST_TIMEOUT_MS).toBe('number');
   });
 
   it('imports workspace-config-policy', async () => {

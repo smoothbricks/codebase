@@ -1,3 +1,2 @@
 [test]
-timeout = 30000
 preload = ["./src/bun/preload.ts", "./src/bun/trace-preload.ts"]

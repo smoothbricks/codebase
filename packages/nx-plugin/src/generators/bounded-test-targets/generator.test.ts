@@ -5,8 +5,12 @@ import { createTreeWithEmptyWorkspace } from 'nx/src/devkit-testing-exports.js';
 import {
   BOUNDED_TEST_EXECUTOR,
   BOUNDED_TEST_KILL_AFTER_MS,
+  BOUNDED_TEST_PER_TEST_TIMEOUT_MS,
   BOUNDED_TEST_TIMEOUT_MS,
 } from '../../bounded-test-policy.js';
+
+const TIMEOUT_FLAG = `--timeout=${BOUNDED_TEST_PER_TEST_TIMEOUT_MS}`;
+
 import generator from './generator.js';
 
 describe('bounded-test-targets generator', () => {
@@ -41,7 +45,7 @@ describe('bounded-test-targets generator', () => {
       executor: BOUNDED_TEST_EXECUTOR,
       dependsOn: ['typecheck-tests', '^build'],
       options: {
-        command: 'bun test --target',
+        command: `bun test ${TIMEOUT_FLAG} --target`,
         cwd: '{projectRoot}',
         timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
@@ -64,7 +68,7 @@ describe('bounded-test-targets generator', () => {
     expect(packageJson.nx?.targets?.test).toEqual({
       executor: BOUNDED_TEST_EXECUTOR,
       options: {
-        command: 'bun test --script',
+        command: `bun test ${TIMEOUT_FLAG} --script`,
         cwd: '{projectRoot}',
         timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
@@ -110,7 +114,7 @@ describe('bounded-test-targets generator', () => {
       executor: BOUNDED_TEST_EXECUTOR,
       dependsOn: ['typecheck-tests'],
       options: {
-        command: 'bun test --project-target',
+        command: `bun test ${TIMEOUT_FLAG} --project-target`,
         cwd: '{projectRoot}',
         timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,

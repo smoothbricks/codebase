@@ -8,14 +8,18 @@ import {
   applyWorkspaceBoundedTestTargetPolicy,
   BOUNDED_TEST_EXECUTOR,
   BOUNDED_TEST_KILL_AFTER_MS,
+  BOUNDED_TEST_PER_TEST_TIMEOUT_MS,
   BOUNDED_TEST_TIMEOUT_MS,
   type BoundedTestPolicyPackageJson,
   type BoundedTestPolicyProjectJson,
   boundedTestScriptAlias,
   checkBoundedTestTargetPolicy,
   checkWorkspaceBoundedTestTargetPolicy,
+  ensureBunTestTimeoutFlag,
   resolveTestCommand,
 } from './bounded-test-policy.js';
+
+const TIMEOUT_FLAG = `--timeout=${BOUNDED_TEST_PER_TEST_TIMEOUT_MS}`;
 
 describe('bounded test target policy', () => {
   it('preserves an existing nx:run-commands test command', () => {
@@ -38,7 +42,7 @@ describe('bounded test target policy', () => {
       executor: BOUNDED_TEST_EXECUTOR,
       dependsOn: ['typecheck-tests'],
       options: {
-        command: 'bun test --coverage',
+        command: `bun test ${TIMEOUT_FLAG} --coverage`,
         cwd: '{projectRoot}',
         timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
@@ -57,7 +61,7 @@ describe('bounded test target policy', () => {
     expect(packageJson.nx?.targets?.test).toEqual({
       executor: BOUNDED_TEST_EXECUTOR,
       options: {
-        command: 'bun test --pass-with-no-tests',
+        command: `bun test ${TIMEOUT_FLAG} --pass-with-no-tests`,
         cwd: '{projectRoot}',
         timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
@@ -94,7 +98,7 @@ describe('bounded test target policy', () => {
       executor: BOUNDED_TEST_EXECUTOR,
       dependsOn: ['typecheck-tests'],
       options: {
-        command: 'bun test --project-target',
+        command: `bun test ${TIMEOUT_FLAG} --project-target`,
         cwd: '{projectRoot}',
         timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
@@ -120,7 +124,7 @@ describe('bounded test target policy', () => {
     expect(projectJson.targets?.test).toEqual({
       executor: BOUNDED_TEST_EXECUTOR,
       options: {
-        command: 'bun test --script',
+        command: `bun test ${TIMEOUT_FLAG} --script`,
         cwd: '{projectRoot}',
         timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
@@ -157,7 +161,20 @@ describe('bounded test target policy', () => {
       scripts: { test: boundedTestScriptAlias('example') },
     };
 
-    expect(resolveTestCommand(packageJson)).toBe('bun test');
+    expect(resolveTestCommand(packageJson)).toBe(`bun test ${TIMEOUT_FLAG}`);
+  });
+
+  it('idempotently appends --timeout to bare bun test commands', () => {
+    expect(ensureBunTestTimeoutFlag('bun test')).toBe(`bun test ${TIMEOUT_FLAG}`);
+    expect(ensureBunTestTimeoutFlag('bun test --pass-with-no-tests')).toBe(
+      `bun test ${TIMEOUT_FLAG} --pass-with-no-tests`,
+    );
+    expect(ensureBunTestTimeoutFlag(`bun test ${TIMEOUT_FLAG}`)).toBe(`bun test ${TIMEOUT_FLAG}`);
+    expect(ensureBunTestTimeoutFlag('bun test --timeout=10')).toBe(`bun test ${TIMEOUT_FLAG}`);
+    expect(ensureBunTestTimeoutFlag('bun test --timeout 10 --bail')).toBe(`bun test ${TIMEOUT_FLAG} --bail`);
+    // Non-bun-test commands are left alone (vitest, custom runners, etc.).
+    expect(ensureBunTestTimeoutFlag('vitest run')).toBe('vitest run');
+    expect(ensureBunTestTimeoutFlag('bun run test')).toBe('bun run test');
   });
 
   it('checks and fixes workspace package test targets', async () => {
@@ -188,7 +205,7 @@ describe('bounded test target policy', () => {
       expect(app.nx.targets.test).toEqual({
         executor: BOUNDED_TEST_EXECUTOR,
         options: {
-          command: 'bun test --pass-with-no-tests',
+          command: `bun test ${TIMEOUT_FLAG} --pass-with-no-tests`,
           cwd: '{projectRoot}',
           timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
           killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
@@ -238,7 +255,7 @@ describe('bounded test target policy', () => {
       expect(appProject.targets.test).toEqual({
         executor: BOUNDED_TEST_EXECUTOR,
         options: {
-          command: 'bun test --project',
+          command: `bun test ${TIMEOUT_FLAG} --project`,
           cwd: '{projectRoot}',
           timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
           killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
