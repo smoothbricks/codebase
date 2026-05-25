@@ -1,8 +1,9 @@
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { $ } from 'bun';
 import type { GitReleaseTagInfo } from '../../core.js';
+
+const GIT_TIMEOUT_MS = 10_000;
 
 export async function withFixtureRepo(fn: (root: string) => Promise<void>): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'smoo-release-test-'));
@@ -63,15 +64,65 @@ export async function writeBuildablePackage(
 }
 
 export async function git(root: string, args: string[], env?: Record<string, string>): Promise<void> {
-  await $`git ${args}`
-    .cwd(root)
-    .env(env ?? {})
-    .quiet();
+  const result = await gitResult(root, args, env);
+  if (result.exitCode !== 0) {
+    throw new Error(gitErrorMessage(root, args, result));
+  }
 }
 
 export async function gitOutput(root: string, args: string[]): Promise<string> {
-  const result = await $`git ${args}`.cwd(root).quiet();
+  const result = await gitResult(root, args);
+  if (result.exitCode !== 0) {
+    throw new Error(gitErrorMessage(root, args, result));
+  }
   return new TextDecoder().decode(result.stdout).trim();
+}
+
+export async function gitSucceeds(root: string, args: string[]): Promise<boolean> {
+  return (await gitResult(root, args)).exitCode === 0;
+}
+
+async function gitResult(root: string, args: string[], env?: Record<string, string>): Promise<GitResult> {
+  const proc = Bun.spawn(['git', ...args], {
+    cwd: root,
+    env: { ...process.env, ...env },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    proc.kill();
+  }, GIT_TIMEOUT_MS);
+  try {
+    const [exitCode, stdout, stderr] = await Promise.all([
+      proc.exited,
+      streamBytes(proc.stdout),
+      streamBytes(proc.stderr),
+    ]);
+    return { exitCode, stdout, stderr, timedOut };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function streamBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+interface GitResult {
+  exitCode: number;
+  stdout: Uint8Array;
+  stderr: Uint8Array;
+  timedOut: boolean;
+}
+
+function gitErrorMessage(root: string, args: string[], result: GitResult): string {
+  const stderr = new TextDecoder().decode(result.stderr).trim();
+  const timeoutText = result.timedOut
+    ? ` timed out after ${GIT_TIMEOUT_MS}ms`
+    : ` failed with exit code ${result.exitCode}`;
+  return [`git ${args.join(' ')}${timeoutText}`, `cwd: ${root}`, stderr].filter(Boolean).join('\n');
 }
 
 export async function tag(root: string, tagName: string, date: string): Promise<void> {
@@ -79,10 +130,15 @@ export async function tag(root: string, tagName: string, date: string): Promise<
 }
 
 export async function gitReleaseTagsByCreatorDate(root: string): Promise<GitReleaseTagInfo[]> {
-  const result =
-    await $`git for-each-ref --sort=-creatordate --format=${'%(refname:short)%09%(creatordate:unix)%09%(*objectname)%09%(objectname)'} refs/tags`
-      .cwd(root)
-      .quiet();
+  const result = await gitResult(root, [
+    'for-each-ref',
+    '--sort=-creatordate',
+    '--format=%(refname:short)%09%(creatordate:unix)%09%(*objectname)%09%(objectname)',
+    'refs/tags',
+  ]);
+  if (result.exitCode !== 0) {
+    throw new Error(gitErrorMessage(root, ['for-each-ref', 'refs/tags'], result));
+  }
   return new TextDecoder()
     .decode(result.stdout)
     .split('\n')
@@ -100,12 +156,11 @@ export async function gitReleaseTagsByCreatorDate(root: string): Promise<GitRele
 }
 
 export async function gitIsAncestor(root: string, ancestor: string, descendant: string): Promise<boolean> {
-  const result = await $`git merge-base --is-ancestor ${ancestor} ${descendant}`.cwd(root).quiet().nothrow();
-  return result.exitCode === 0;
+  return gitSucceeds(root, ['merge-base', '--is-ancestor', ancestor, descendant]);
 }
 
 export async function packageVersionAtRef(root: string, packagePath: string, ref: string): Promise<string | null> {
-  const result = await $`git show ${`${ref}:${packagePath}/package.json`}`.cwd(root).quiet().nothrow();
+  const result = await gitResult(root, ['show', `${ref}:${packagePath}/package.json`]);
   if (result.exitCode !== 0) {
     return null;
   }
