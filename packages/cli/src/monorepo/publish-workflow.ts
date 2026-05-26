@@ -38,6 +38,7 @@ export interface PublishWorkflowDefinition {
 
 export interface PublishWorkflowDefinitionOptions {
   deploy?: boolean;
+  deployProvider?: 'cloudflare';
   repoName?: string;
 }
 
@@ -254,7 +255,7 @@ function shouldRunStep(
 
 export function renderPublishWorkflowYaml(options: PublishWorkflowDefinitionOptions = {}): string {
   const steps = definePublishWorkflow(options).steps;
-  return `${renderPublishWorkflowHeader(options)}${renderPublishWorkflowSteps(steps)}`;
+  return `${renderPublishWorkflowHeader(options)}${renderPublishWorkflowSteps(steps, options)}`;
 }
 
 function renderPublishWorkflowHeader(options: PublishWorkflowDefinitionOptions): string {
@@ -306,12 +307,12 @@ jobs:
 `;
 }
 
-function renderPublishWorkflowSteps(steps: PublishWorkflowStep[]): string {
+function renderPublishWorkflowSteps(steps: PublishWorkflowStep[], options: PublishWorkflowDefinitionOptions): string {
   const lines: string[] = [];
   for (const step of steps) {
     lines.push(...sectionLinesBefore(step));
     lines.push(...commentLinesForStep(step));
-    lines.push(...yamlLinesForStep(step));
+    lines.push(...yamlLinesForStep(step, options));
     lines.push('');
   }
   return `${lines.join('\n').trimEnd()}\n`;
@@ -354,7 +355,7 @@ function commentLinesForStep(step: PublishWorkflowStep): string[] {
   return [`      # Step ${step.number}`];
 }
 
-function yamlLinesForStep(step: PublishWorkflowStep): string[] {
+function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDefinitionOptions): string[] {
   switch (step.kind) {
     case PublishWorkflowStepKind.Checkout:
       return [
@@ -432,10 +433,7 @@ function yamlLinesForStep(step: PublishWorkflowStep): string[] {
         `        run: smoo release publish --bump "${githubExpression('inputs.bump')}" --dry-run "${githubExpression('inputs.dry_run')}"`,
       ];
     case PublishWorkflowStepKind.DeployProduction:
-      return conditionalRunStep(
-        step,
-        'smoo github-ci nx-deploy --configuration production --mode run-many --verify --name "Deploy Production"',
-      );
+      return deployProductionStep(step, options);
     case PublishWorkflowStepKind.SaveNixDevenv:
       return [
         `      - name: ${step.name}`,
@@ -448,16 +446,29 @@ function yamlLinesForStep(step: PublishWorkflowStep): string[] {
   }
 }
 
-function conditionalRunStep(step: PublishWorkflowStep, run: string): string[] {
-  if (step.condition === 'deploy-production') {
-    return [
-      `      - name: ${step.name}`,
-      '        if:',
-      "          ${{ steps.version.outputs.mode != 'none' && inputs.deploy_environment == 'production' && inputs.dry_run !=",
-      "          'true' }}",
-      `        run: ${run}`,
-    ];
+function deployProductionStep(step: PublishWorkflowStep, options: PublishWorkflowDefinitionOptions): string[] {
+  return [
+    `      - name: ${step.name}`,
+    '        if:',
+    "          ${{ steps.version.outputs.mode != 'none' && inputs.deploy_environment == 'production' && inputs.dry_run !=",
+    "          'true' }}",
+    ...deployEnvLines(options),
+    '        run: smoo github-ci nx-deploy --configuration production --mode run-many --verify --name "Deploy Production"',
+  ];
+}
+
+function deployEnvLines(options: PublishWorkflowDefinitionOptions): string[] {
+  if (options.deployProvider !== 'cloudflare') {
+    return [];
   }
+  return [
+    '        env:',
+    '          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}',
+    '          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}',
+  ];
+}
+
+function conditionalRunStep(step: PublishWorkflowStep, run: string): string[] {
   const condition = "steps.version.outputs.mode != 'none'";
   return [`      - name: ${step.name}`, `        if: ${githubExpression(condition)}`, `        run: ${run}`];
 }
