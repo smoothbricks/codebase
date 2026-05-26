@@ -41,9 +41,22 @@ describe('publish workflow definition', () => {
 
     expect(rendered).toContain('deploy_environment:');
     expect(rendered).toContain('- name: 🚀 Deploy production');
+    expect(rendered).not.toContain('CLOUDFLARE_API_TOKEN');
+    expect(rendered).not.toContain('CLOUDFLARE_ACCOUNT_ID');
     expect(rendered).toContain(
       'smoo github-ci nx-deploy --configuration production --mode run-many --verify --name "Deploy Production"',
     );
+  });
+
+  it('adds Cloudflare credentials for Wrangler-backed production deploys', () => {
+    const rendered = renderPublishWorkflowYaml({
+      deploy: true,
+      deployProvider: 'cloudflare',
+      repoName: '@smoothbricks/codebase',
+    });
+
+    expect(rendered).toContain('CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}');
+    expect(rendered).toContain('CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}');
   });
 
   it('deploys production only after a real publish when requested', async () => {

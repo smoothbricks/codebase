@@ -20,6 +20,7 @@ export interface CiWorkflowStep {
 
 export interface CiWorkflowDefinitionOptions {
   deploy: boolean;
+  deployProvider?: 'cloudflare';
   pushBranches: string[];
 }
 
@@ -48,7 +49,7 @@ export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkfl
 
 export function renderCiWorkflowYaml(options: CiWorkflowDefinitionOptions): string {
   const steps = defineCiWorkflow(options);
-  return `${renderCiWorkflowHeader(options)}${renderCiWorkflowSteps(steps)}`;
+  return `${renderCiWorkflowHeader(options)}${renderCiWorkflowSteps(steps, options)}`;
 }
 
 function renderCiWorkflowHeader(options: CiWorkflowDefinitionOptions): string {
@@ -85,12 +86,12 @@ function githubExpression(expression: string): string {
   return `$${`{{ ${expression} }}`}`;
 }
 
-function renderCiWorkflowSteps(steps: CiWorkflowStep[]): string {
+function renderCiWorkflowSteps(steps: CiWorkflowStep[], options: CiWorkflowDefinitionOptions): string {
   const lines: string[] = [];
   for (const step of steps) {
     lines.push(...sectionLinesBefore(step));
     lines.push(...commentLinesForStep(step));
-    lines.push(...yamlLinesForStep(step));
+    lines.push(...yamlLinesForStep(step, options));
     lines.push('');
   }
   return `${lines.join('\n').trimEnd()}\n`;
@@ -131,7 +132,7 @@ function commentLinesForStep(step: CiWorkflowStep): string[] {
   return [`      # Step ${step.number}`];
 }
 
-function yamlLinesForStep(step: CiWorkflowStep): string[] {
+function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOptions): string[] {
   switch (step.kind) {
     case CiWorkflowStepKind.Checkout:
       return [
@@ -164,6 +165,7 @@ function yamlLinesForStep(step: CiWorkflowStep): string[] {
         '        if:',
         "          ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}',",
         '          github.event.repository.default_branch) }}',
+        ...deployEnvLines(options),
         `        run: smoo github-ci nx-deploy --configuration staging --mode affected --name "Deploy Staging" --step ${step.number}`,
       ];
     case CiWorkflowStepKind.SaveNxCache:
@@ -201,6 +203,17 @@ function yamlLinesForStep(step: CiWorkflowStep): string[] {
         '          devenv-cache-hit: ${{ steps.setup.outputs.devenv-cache-hit }}',
       ];
   }
+}
+
+function deployEnvLines(options: CiWorkflowDefinitionOptions): string[] {
+  if (options.deployProvider !== 'cloudflare') {
+    return [];
+  }
+  return [
+    '        env:',
+    '          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}',
+    '          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}',
+  ];
 }
 
 function nxSmartStep(step: CiWorkflowStep, target: string, name: string): string[] {

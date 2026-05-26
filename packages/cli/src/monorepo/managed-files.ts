@@ -25,9 +25,16 @@ interface ManagedFileContext {
   hasReleasePackages: boolean;
   hasStagingDeployTargets: boolean;
   hasProductionDeployTargets: boolean;
+  stagingDeployProvider?: 'cloudflare';
+  productionDeployProvider?: 'cloudflare';
   ciPushBranches: string[];
   nodeModulesCacheKey: string;
   repoName: string;
+}
+
+interface DeployTargetInfo {
+  exists: boolean;
+  provider?: 'cloudflare';
 }
 
 const managedFiles: ManagedFile[] = [
@@ -111,7 +118,7 @@ function applyManagedFile(
   mode: 'update' | 'check' | 'diff',
   context: ManagedFileContext,
 ): FileResult {
-  if (file.releasePackagesOnly === true && !context.hasReleasePackages) {
+  if (file.releasePackagesOnly === true && !context.hasReleasePackages && !context.hasProductionDeployTargets) {
     return { target: file.target, action: 'skipped' };
   }
   const target = resolve(root, file.target);
@@ -144,10 +151,18 @@ function applyManagedFile(
 function getManagedContent(file: ManagedFile, context: ManagedFileContext): string {
   if (file.kind === 'generated') {
     if (file.source === 'ci-workflow') {
-      return renderCiWorkflowYaml({ deploy: context.hasStagingDeployTargets, pushBranches: context.ciPushBranches });
+      return renderCiWorkflowYaml({
+        deploy: context.hasStagingDeployTargets,
+        deployProvider: context.stagingDeployProvider,
+        pushBranches: context.ciPushBranches,
+      });
     }
     if (file.source === 'publish-workflow') {
-      return renderPublishWorkflowYaml({ deploy: context.hasProductionDeployTargets, repoName: context.repoName });
+      return renderPublishWorkflowYaml({
+        deploy: context.hasProductionDeployTargets,
+        deployProvider: context.productionDeployProvider,
+        repoName: context.repoName,
+      });
     }
     throw new Error(`Unknown generated managed file source ${file.source}`);
   }
@@ -164,13 +179,17 @@ function getManagedFileContext(root: string): ManagedFileContext {
   const packageJson = readPackageJson(join(root, 'package.json'));
   const repoName = packageJson?.name ?? 'monorepo';
   const ciPushBranches = getCiPushBranches(packageJson?.json);
+  const stagingDeploy = getDeployTargetInfo(root, 'staging');
+  const productionDeploy = getDeployTargetInfo(root, 'production');
   const nodeModulesCacheKey = existsSync(join(root, 'bun.lock'))
     ? `$${"{{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json') }}"}`
     : `$${"{{ hashFiles('bun.lockb', 'package.json', 'packages/*/package.json') }}"}`;
   return {
     hasReleasePackages: listReleasePackages(root, packageJson).length > 0,
-    hasStagingDeployTargets: hasDeployTarget(root, 'staging'),
-    hasProductionDeployTargets: hasDeployTarget(root, 'production'),
+    hasStagingDeployTargets: stagingDeploy.exists,
+    hasProductionDeployTargets: productionDeploy.exists,
+    stagingDeployProvider: stagingDeploy.provider,
+    productionDeployProvider: productionDeploy.provider,
     ciPushBranches,
     nodeModulesCacheKey,
     repoName,
@@ -184,7 +203,7 @@ function renderTemplate(context: ManagedFileContext, template: string): string {
     .replaceAll('{{NODE_MODULES_CACHE_KEY}}', context.nodeModulesCacheKey);
 }
 
-function hasDeployTarget(root: string, configuration: string): boolean {
+function getDeployTargetInfo(root: string, configuration: string): DeployTargetInfo {
   const output = execFileSync('nx', ['show', 'projects', '--withTarget', 'deploy', '--json'], {
     cwd: root,
     encoding: 'utf8',
@@ -192,12 +211,22 @@ function hasDeployTarget(root: string, configuration: string): boolean {
   });
   const projects: unknown = JSON.parse(output);
   if (!Array.isArray(projects) || !projects.every((project) => typeof project === 'string')) {
-    return false;
+    return { exists: false };
   }
-  return projects.some((project) => nxDeployTargetHasConfiguration(root, project, configuration));
+  let exists = false;
+  let provider: DeployTargetInfo['provider'];
+  for (const project of projects) {
+    const target = nxDeployTarget(root, project, configuration);
+    if (!target.exists) {
+      continue;
+    }
+    exists = true;
+    provider ??= target.provider;
+  }
+  return { exists, provider };
 }
 
-function nxDeployTargetHasConfiguration(root: string, project: string, configuration: string): boolean {
+function nxDeployTarget(root: string, project: string, configuration: string): DeployTargetInfo {
   const output = execFileSync('nx', ['show', 'project', project, '--json'], {
     cwd: root,
     encoding: 'utf8',
@@ -208,7 +237,21 @@ function nxDeployTargetHasConfiguration(root: string, project: string, configura
   const targets = recordValue(projectJson?.targets);
   const deploy = recordValue(targets?.deploy);
   const configurations = recordValue(deploy?.configurations);
-  return recordValue(configurations?.[configuration]) !== undefined;
+  const config = recordValue(configurations?.[configuration]);
+  if (!config) {
+    return { exists: false };
+  }
+  const command = deployCommand(deploy, config);
+  return { exists: true, provider: command.includes('wrangler ') ? 'cloudflare' : undefined };
+}
+
+function deployCommand(deploy: Record<string, unknown> | undefined, config: Record<string, unknown>): string {
+  const command = stringValue(config.command) ?? stringValue(recordValue(config.options)?.command);
+  return command ?? stringValue(recordValue(deploy?.options)?.command) ?? '';
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
 }
 
 function getCiPushBranches(packageJson: unknown): string[] {

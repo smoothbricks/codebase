@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { defineCiWorkflow, renderCiWorkflowYaml } from '../ci-workflow.js';
+import { CiWorkflowStepKind, defineCiWorkflow, renderCiWorkflowYaml } from '../ci-workflow.js';
 
 describe('CI workflow definition', () => {
   it('renders the checked-in local CI workflow copy', async () => {
@@ -15,11 +15,20 @@ describe('CI workflow definition', () => {
     const steps = defineCiWorkflow({ deploy: true, pushBranches: ['main'] });
     const rendered = renderCiWorkflowYaml({ deploy: true, pushBranches: ['main'] });
 
-    expect(steps.map((step) => [step.kind, step.number])).toContainEqual(['deploy', 9]);
+    expect(steps.map((step) => [step.kind, step.number])).toContainEqual([CiWorkflowStepKind.Deploy, 9]);
     expect(rendered).toContain('- name: 🚀 Deploy Staging');
+    expect(rendered).not.toContain('CLOUDFLARE_API_TOKEN');
+    expect(rendered).not.toContain('CLOUDFLARE_ACCOUNT_ID');
     expect(rendered).toContain(
       'smoo github-ci nx-deploy --configuration staging --mode affected --name "Deploy Staging" --step 9',
     );
     expect(rendered).toContain("# Step 10\n      # Nx's database cache needs artifact files");
+  });
+
+  it('adds Cloudflare credentials for Wrangler-backed deploys', () => {
+    const rendered = renderCiWorkflowYaml({ deploy: true, deployProvider: 'cloudflare', pushBranches: ['main'] });
+
+    expect(rendered).toContain('CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}');
+    expect(rendered).toContain('CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}');
   });
 });
