@@ -47,6 +47,10 @@
         "cwd": "{workspaceRoot}",
         "parallel": false
       }
+    },
+    "clean": {
+      "executor": "@smoothbricks/nx-plugin:clean-outputs",
+      "cache": false
     }
   },
   "plugins": [
