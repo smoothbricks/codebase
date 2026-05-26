@@ -298,18 +298,48 @@ function buildProgram(): Command {
     .requiredOption('--target <target>')
     .option('--name <name>')
     .option('--step <step>')
-    .action(async (options: { target: string; name?: string; step?: string }) => {
-      const { githubCiNxSmart } = await import('./github-ci/index.js');
-      await githubCiNxSmart(await findRepoRoot(), options);
-    });
+    .option('--mode <mode>', 'auto, affected, or run-many', 'auto')
+    .option('--configuration <configuration>')
+    .action(
+      async (options: {
+        target: string;
+        name?: string;
+        step?: string;
+        mode?: 'auto' | 'affected' | 'run-many';
+        configuration?: string;
+      }) => {
+        const { githubCiNxSmart } = await import('./github-ci/index.js');
+        await githubCiNxSmart(await findRepoRoot(), options);
+      },
+    );
   githubCi
     .command('nx-run-many')
     .requiredOption('--targets <targets>')
     .option('--projects <projects>')
-    .action(async (options: { targets: string; projects?: string }) => {
+    .option('--configuration <configuration>')
+    .action(async (options: { targets: string; projects?: string; configuration?: string }) => {
       const { githubCiNxRunMany } = await import('./github-ci/index.js');
       await githubCiNxRunMany(await findRepoRoot(), options);
     });
+  githubCi
+    .command('nx-deploy')
+    .requiredOption('--configuration <configuration>')
+    .option('--mode <mode>', 'auto, affected, or run-many', 'run-many')
+    .option('--name <name>')
+    .option('--step <step>')
+    .option('--verify', 'run build, lint, and test before deploy')
+    .action(
+      async (options: {
+        configuration: string;
+        mode?: 'auto' | 'affected' | 'run-many';
+        name?: string;
+        step?: string;
+        verify?: boolean;
+      }) => {
+        const { githubCiNxDeploy } = await import('./github-ci/index.js');
+        await githubCiNxDeploy(await findRepoRoot(), options);
+      },
+    );
 
   return program;
 }

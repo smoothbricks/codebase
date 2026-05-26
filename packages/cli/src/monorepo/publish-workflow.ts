@@ -1,8 +1,9 @@
 import { isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
 
 export type PublishWorkflowBump = 'auto' | 'patch' | 'minor' | 'major' | 'prerelease';
-export type PublishWorkflowCondition = 'version-mode-not-none' | 'failure' | 'always';
+export type PublishWorkflowCondition = 'version-mode-not-none' | 'deploy-production' | 'failure' | 'always';
 export type PublishWorkflowNxTarget = 'build' | 'lint' | 'test';
+export type PublishWorkflowDeployEnvironment = 'none' | 'production';
 
 export enum PublishWorkflowStepKind {
   Checkout = 'checkout',
@@ -18,6 +19,7 @@ export enum PublishWorkflowStepKind {
   UploadTraceDbs = 'upload-trace-dbs',
   ValidateMonorepoConfig = 'validate-monorepo-config',
   PublishRelease = 'publish-release',
+  DeployProduction = 'deploy-production',
   SaveNixDevenv = 'save-nix-devenv',
 }
 
@@ -35,11 +37,13 @@ export interface PublishWorkflowDefinition {
 }
 
 export interface PublishWorkflowDefinitionOptions {
+  deploy?: boolean;
   repoName?: string;
 }
 
 export interface PublishWorkflowInputs {
   bump: PublishWorkflowBump;
+  deployEnvironment: PublishWorkflowDeployEnvironment;
   dryRun: boolean;
 }
 
@@ -65,6 +69,7 @@ export interface PublishWorkflowCallbacks {
   uploadTraceDbs(): Promise<void>;
   validateMonorepoConfig(): Promise<void>;
   publishRelease(input: { bump: PublishWorkflowBump; dryRun: boolean }): Promise<void>;
+  deployProduction(): Promise<void>;
   saveNixDevenv(input: PublishWorkflowSetupOutputs): Promise<void>;
 }
 
@@ -89,6 +94,19 @@ export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions 
   ];
   if (isSmoothBricksCodebasePackageName(options.repoName)) {
     setupSteps.push({ kind: PublishWorkflowStepKind.BuildSelfHostedCli, name: '🏗️ Build self-hosted smoo' });
+  }
+  const releaseSteps: PublishWorkflowStepInput[] = [
+    {
+      kind: PublishWorkflowStepKind.PublishRelease,
+      name: `📦 Publish release (${versionMode})`,
+    },
+  ];
+  if (options.deploy === true) {
+    releaseSteps.push({
+      kind: PublishWorkflowStepKind.DeployProduction,
+      name: '🚀 Deploy production',
+      condition: 'deploy-production',
+    });
   }
   return {
     steps: numberWorkflowSteps([
@@ -127,10 +145,7 @@ export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions 
         name: `✅ Validate monorepo config (${versionMode})`,
         condition: 'version-mode-not-none',
       },
-      {
-        kind: PublishWorkflowStepKind.PublishRelease,
-        name: `📦 Publish release (${versionMode})`,
-      },
+      ...releaseSteps,
       {
         kind: PublishWorkflowStepKind.SaveNixDevenv,
         name: '🧹 Cleanup and cache Nix/devenv',
@@ -153,7 +168,7 @@ export async function runPublishWorkflow(
   let failed = false;
   let failure: unknown;
   for (const step of workflow.steps) {
-    if (!shouldRunStep(step, version, failed)) {
+    if (!shouldRunStep(step, version, failed, context.inputs)) {
       continue;
     }
     try {
@@ -201,6 +216,9 @@ export async function runPublishWorkflow(
             dryRun: context.inputs.dryRun,
           });
           break;
+        case PublishWorkflowStepKind.DeployProduction:
+          await context.callbacks.deployProduction();
+          break;
         case PublishWorkflowStepKind.SaveNixDevenv:
           await context.callbacks.saveNixDevenv(setupOutputs);
           break;
@@ -216,9 +234,17 @@ export async function runPublishWorkflow(
   return { version, failed };
 }
 
-function shouldRunStep(step: PublishWorkflowStep, version: PublishWorkflowVersionOutputs, failed: boolean): boolean {
+function shouldRunStep(
+  step: PublishWorkflowStep,
+  version: PublishWorkflowVersionOutputs,
+  failed: boolean,
+  inputs: PublishWorkflowInputs,
+): boolean {
   if (step.condition === 'version-mode-not-none') {
     return version.mode !== 'none';
+  }
+  if (step.condition === 'deploy-production') {
+    return version.mode !== 'none' && inputs.deployEnvironment === 'production' && !inputs.dryRun;
   }
   if (step.condition === 'failure') {
     return failed;
@@ -228,10 +254,19 @@ function shouldRunStep(step: PublishWorkflowStep, version: PublishWorkflowVersio
 
 export function renderPublishWorkflowYaml(options: PublishWorkflowDefinitionOptions = {}): string {
   const steps = definePublishWorkflow(options).steps;
-  return `${renderPublishWorkflowHeader()}${renderPublishWorkflowSteps(steps)}`;
+  return `${renderPublishWorkflowHeader(options)}${renderPublishWorkflowSteps(steps)}`;
 }
 
-function renderPublishWorkflowHeader(): string {
+function renderPublishWorkflowHeader(options: PublishWorkflowDefinitionOptions): string {
+  const deployInput =
+    options.deploy === true
+      ? `
+      deploy_environment:
+        type: choice
+        description: Deploy live systems after a successful publish.
+        options: [none, production]
+        default: none`
+      : '';
   return `name: Publish
 
 on:
@@ -247,7 +282,7 @@ on:
       dry_run:
         type: boolean
         description: Run release commands without writing versions, tags, publishes, or GitHub Releases.
-        default: false
+        default: false${deployInput}
 
 permissions:
   contents: write
@@ -396,6 +431,11 @@ function yamlLinesForStep(step: PublishWorkflowStep): string[] {
         '        # Missing package names are bootstrapped locally before trust setup.',
         `        run: smoo release publish --bump "${githubExpression('inputs.bump')}" --dry-run "${githubExpression('inputs.dry_run')}"`,
       ];
+    case PublishWorkflowStepKind.DeployProduction:
+      return conditionalRunStep(
+        step,
+        'smoo github-ci nx-deploy --configuration production --mode run-many --verify --name "Deploy Production"',
+      );
     case PublishWorkflowStepKind.SaveNixDevenv:
       return [
         `      - name: ${step.name}`,
@@ -409,11 +449,17 @@ function yamlLinesForStep(step: PublishWorkflowStep): string[] {
 }
 
 function conditionalRunStep(step: PublishWorkflowStep, run: string): string[] {
-  return [
-    `      - name: ${step.name}`,
-    `        if: ${githubExpression("steps.version.outputs.mode != 'none'")}`,
-    `        run: ${run}`,
-  ];
+  if (step.condition === 'deploy-production') {
+    return [
+      `      - name: ${step.name}`,
+      '        if:',
+      "          ${{ steps.version.outputs.mode != 'none' && inputs.deploy_environment == 'production' && inputs.dry_run !=",
+      "          'true' }}",
+      `        run: ${run}`,
+    ];
+  }
+  const condition = "steps.version.outputs.mode != 'none'";
+  return [`      - name: ${step.name}`, `        if: ${githubExpression(condition)}`, `        run: ${run}`];
 }
 
 function githubExpression(expression: string): string {

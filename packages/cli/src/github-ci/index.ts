@@ -4,6 +4,8 @@ import { dirname, join } from 'node:path';
 import { $ } from 'bun';
 import { decode, run, runStatus } from '../lib/run.js';
 
+type NxSmartMode = 'auto' | 'affected' | 'run-many';
+
 export async function cleanupGithubCiCache(root: string): Promise<void> {
   const githubOutput = process.env.GITHUB_OUTPUT;
   const markCacheReady = async (ready: boolean): Promise<void> => {
@@ -113,17 +115,17 @@ async function addReferencesFrom(roots: Set<string>, path: string, cwd: string):
 
 export async function githubCiNxSmart(
   root: string,
-  options: { target: string; name?: string; step?: string },
+  options: { target: string; name?: string; step?: string; mode?: NxSmartMode; configuration?: string },
 ): Promise<void> {
   const name = options.name ?? options.target;
   const step = options.step ?? '';
   await createGithubStatus(name, step);
-  const mode =
-    process.env.GITHUB_EVENT_NAME === 'push' && process.env.GITHUB_REF_NAME === 'main' ? 'run-many' : 'affected';
-  const nxArgs =
-    mode === 'run-many'
-      ? ['run-many', '-t', options.target, '--parallel=5']
-      : ['affected', '-t', options.target, '--parallel=5'];
+  const mode = resolveNxSmartMode(options.mode ?? 'auto');
+  const nxArgs = mode === 'run-many' ? ['run-many', '-t', options.target] : ['affected', '-t', options.target];
+  if (options.configuration) {
+    nxArgs.push(`--configuration=${options.configuration}`);
+  }
+  nxArgs.push('--parallel=5');
   const status = await runStatus('nx', nxArgs, root);
   await updateGithubStatus(name, status === 0 ? 'success' : 'failure', step);
   if (status !== 0) {
@@ -131,12 +133,96 @@ export async function githubCiNxSmart(
   }
 }
 
-export async function githubCiNxRunMany(root: string, options: { targets: string; projects?: string }): Promise<void> {
+export async function githubCiNxRunMany(
+  root: string,
+  options: { targets: string; projects?: string; configuration?: string },
+): Promise<void> {
   const nxArgs = ['run-many', '-t', options.targets, '--parallel=5'];
   if (options.projects) {
     nxArgs.push(`--projects=${options.projects}`);
   }
+  if (options.configuration) {
+    nxArgs.push(`--configuration=${options.configuration}`);
+  }
   await run('nx', nxArgs, root);
+}
+
+export async function githubCiNxDeploy(
+  root: string,
+  options: { configuration: string; mode?: NxSmartMode; name?: string; step?: string; verify?: boolean },
+): Promise<void> {
+  const name = options.name ?? `Deploy ${options.configuration}`;
+  const step = options.step ?? '';
+  await createGithubStatus(name, step);
+  const mode = resolveNxSmartMode(options.mode ?? 'run-many');
+  const projects = await deployProjectsWithConfiguration(root, options.configuration, mode);
+  if (projects.length === 0) {
+    console.log(`No ${mode} deploy projects with configuration ${options.configuration}; skipping.`);
+    await updateGithubStatus(name, 'success', step);
+    return;
+  }
+
+  const projectList = projects.join(',');
+  const targets = options.verify === true ? ['build', 'lint', 'test', 'deploy'] : ['deploy'];
+  for (const target of targets) {
+    const nxArgs = ['run-many', '-t', target, `--projects=${projectList}`, '--parallel=5'];
+    if (target === 'deploy') {
+      nxArgs.push(`--configuration=${options.configuration}`);
+    }
+    const status = await runStatus('nx', nxArgs, root);
+    if (status !== 0) {
+      await updateGithubStatus(name, 'failure', step);
+      throw new Error(`nx ${nxArgs.join(' ')} failed with exit code ${status}`);
+    }
+  }
+  await updateGithubStatus(name, 'success', step);
+}
+
+function resolveNxSmartMode(mode: NxSmartMode): 'affected' | 'run-many' {
+  if (mode === 'affected' || mode === 'run-many') {
+    return mode;
+  }
+  return process.env.GITHUB_EVENT_NAME === 'push' && process.env.GITHUB_REF_NAME === 'main' ? 'run-many' : 'affected';
+}
+
+async function deployProjectsWithConfiguration(
+  root: string,
+  configuration: string,
+  mode: 'affected' | 'run-many',
+): Promise<string[]> {
+  const listArgs =
+    mode === 'affected'
+      ? ['show', 'projects', '--affected', '--withTarget', 'deploy', '--json']
+      : ['show', 'projects', '--withTarget', 'deploy', '--json'];
+  const result = await $`nx ${listArgs}`.cwd(root).quiet();
+  const candidates = nxProjectList(decode(result.stdout));
+  const projects: string[] = [];
+  for (const project of candidates) {
+    if (await deployTargetHasConfiguration(root, project, configuration)) {
+      projects.push(project);
+    }
+  }
+  return projects.sort((a, b) => a.localeCompare(b));
+}
+
+async function deployTargetHasConfiguration(root: string, project: string, configuration: string): Promise<boolean> {
+  const result = await $`nx show project ${project} --json`.cwd(root).quiet();
+  const parsed: unknown = JSON.parse(decode(result.stdout));
+  const targets = recordValue(parsed)?.targets;
+  const deploy = recordValue(targets)?.deploy;
+  const configurations = recordValue(deploy)?.configurations;
+  return recordValue(configurations)?.[configuration] !== undefined;
+}
+
+function nxProjectList(output: string): string[] {
+  const parsed: unknown = JSON.parse(output);
+  return Array.isArray(parsed) ? parsed.filter((project): project is string => typeof project === 'string') : [];
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }
 
 async function createGithubStatus(name: string, step: string): Promise<void> {
