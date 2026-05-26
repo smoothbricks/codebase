@@ -28,6 +28,48 @@ describe('publish workflow definition', () => {
     expect(rendered).toContain('packages must already exist on npm and use trusted publishing/OIDC');
   });
 
+  it('omits production deploy controls when no production deploy target exists', () => {
+    const rendered = renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase' });
+
+    expect(rendered).not.toContain('deploy_environment');
+    expect(rendered).not.toContain('Deploy production');
+    expect(rendered).not.toContain('nx-deploy');
+  });
+
+  it('renders production deploy controls for repos with production deploy targets', () => {
+    const rendered = renderPublishWorkflowYaml({ deploy: true, repoName: '@smoothbricks/codebase' });
+
+    expect(rendered).toContain('deploy_environment:');
+    expect(rendered).toContain('- name: 🚀 Deploy production');
+    expect(rendered).toContain(
+      'smoo github-ci nx-deploy --configuration production --mode run-many --verify --name "Deploy Production"',
+    );
+  });
+
+  it('deploys production only after a real publish when requested', async () => {
+    const deployed = await publishWorkflowScenario({
+      deploy: true,
+      repairs: [],
+      current: [],
+      bump: 'auto',
+      deployEnvironment: 'production',
+      dryRun: false,
+      version: { mode: 'new', projects: ['app'] },
+    }).run();
+    const dryRun = await publishWorkflowScenario({
+      deploy: true,
+      repairs: [],
+      current: [],
+      bump: 'auto',
+      deployEnvironment: 'production',
+      dryRun: true,
+      version: { mode: 'new', projects: ['app'] },
+    }).run();
+
+    expect(deployed.productionDeployed).toBe(true);
+    expect(dryRun.productionDeployed).toBe(false);
+  });
+
   it('bootstraps the self-hosted CLI before release commands only for the SmoothBricks repo', async () => {
     const smoothbricks = await publishWorkflowScenario({
       repoName: '@smoothbricks/codebase',
@@ -143,10 +185,12 @@ interface ReleaseGap {
 }
 
 interface WorkflowScenarioConfig {
+  deploy?: boolean;
   repoName?: string;
   repairs: ReleaseGap[];
   current: ReleaseGap[];
   bump: PublishWorkflowBump;
+  deployEnvironment?: 'none' | 'production';
   dryRun: boolean;
   version: PublishWorkflowVersionOutputs;
 }
@@ -161,6 +205,7 @@ interface WorkflowOutcome {
   repairBuildArtifacts: string[];
   validation: { checks: number; builds: string[]; lints: string[]; tests: string[]; validates: number };
   publishRan: boolean;
+  productionDeployed: boolean;
   publishSawValidatedRelease: boolean;
   publishCompletedTags: string[];
   remainingDurableGaps: string[];
@@ -170,8 +215,8 @@ function publishWorkflowScenario(config: WorkflowScenarioConfig): { run(): Promi
   return {
     async run() {
       const state = new WorkflowScenarioState(config);
-      await runPublishWorkflow(definePublishWorkflow({ repoName: config.repoName }), {
-        inputs: { bump: config.bump, dryRun: config.dryRun },
+      await runPublishWorkflow(definePublishWorkflow({ deploy: config.deploy, repoName: config.repoName }), {
+        inputs: { bump: config.bump, deployEnvironment: config.deployEnvironment ?? 'none', dryRun: config.dryRun },
         callbacks: state.callbacks(),
       });
       return state.outcome();
@@ -186,6 +231,7 @@ class WorkflowScenarioState {
   private repairObservedSelfHostedCli = false;
   private versionObservedSelfHostedCli = false;
   private publishReleaseRan = false;
+  private productionDeployRan = false;
   private publishSawValidation = false;
   private readonly repaired = new Set<string>();
   private readonly repairBuilds = new Set<string>();
@@ -275,6 +321,9 @@ class WorkflowScenarioState {
           }
         }
       },
+      deployProduction: async () => {
+        this.productionDeployRan = true;
+      },
       saveNixDevenv: async () => {},
     };
   }
@@ -296,6 +345,7 @@ class WorkflowScenarioState {
         validates: this.validationState.validates,
       },
       publishRan: this.publishReleaseRan,
+      productionDeployed: this.productionDeployRan,
       publishSawValidatedRelease: this.publishSawValidation,
       publishCompletedTags: [...this.publishedCurrent].sort(),
       remainingDurableGaps: [...this.durableGaps].sort(),

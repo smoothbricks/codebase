@@ -1,7 +1,9 @@
+import { execFileSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { listReleasePackages, readPackageJson } from '../lib/workspace.js';
+import { renderCiWorkflowYaml } from './ci-workflow.js';
 import { renderPublishWorkflowYaml } from './publish-workflow.js';
 
 type ManagedKind = 'raw' | 'template' | 'generated';
@@ -21,6 +23,8 @@ export interface FileResult {
 
 interface ManagedFileContext {
   hasReleasePackages: boolean;
+  hasStagingDeployTargets: boolean;
+  hasProductionDeployTargets: boolean;
   ciPushBranches: string[];
   nodeModulesCacheKey: string;
   repoName: string;
@@ -57,8 +61,8 @@ const managedFiles: ManagedFile[] = [
     target: '.git-format-staged.yml',
   },
   {
-    kind: 'template',
-    source: 'github/workflows/ci.yml',
+    kind: 'generated',
+    source: 'ci-workflow',
     target: '.github/workflows/ci.yml',
   },
   {
@@ -139,8 +143,11 @@ function applyManagedFile(
 
 function getManagedContent(file: ManagedFile, context: ManagedFileContext): string {
   if (file.kind === 'generated') {
+    if (file.source === 'ci-workflow') {
+      return renderCiWorkflowYaml({ deploy: context.hasStagingDeployTargets, pushBranches: context.ciPushBranches });
+    }
     if (file.source === 'publish-workflow') {
-      return renderPublishWorkflowYaml({ repoName: context.repoName });
+      return renderPublishWorkflowYaml({ deploy: context.hasProductionDeployTargets, repoName: context.repoName });
     }
     throw new Error(`Unknown generated managed file source ${file.source}`);
   }
@@ -156,12 +163,14 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
 function getManagedFileContext(root: string): ManagedFileContext {
   const packageJson = readPackageJson(join(root, 'package.json'));
   const repoName = packageJson?.name ?? 'monorepo';
-  const ciPushBranches = getCiPushBranches(packageJson);
+  const ciPushBranches = getCiPushBranches(packageJson?.json);
   const nodeModulesCacheKey = existsSync(join(root, 'bun.lock'))
     ? `$${"{{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json') }}"}`
     : `$${"{{ hashFiles('bun.lockb', 'package.json', 'packages/*/package.json') }}"}`;
   return {
     hasReleasePackages: listReleasePackages(root, packageJson).length > 0,
+    hasStagingDeployTargets: hasDeployTarget(root, 'staging'),
+    hasProductionDeployTargets: hasDeployTarget(root, 'production'),
     ciPushBranches,
     nodeModulesCacheKey,
     repoName,
@@ -173,6 +182,33 @@ function renderTemplate(context: ManagedFileContext, template: string): string {
     .replaceAll('{{REPO_NAME}}', context.repoName)
     .replaceAll('__SMOO_CI_PUSH_BRANCHES__', renderYamlFlowList(context.ciPushBranches))
     .replaceAll('{{NODE_MODULES_CACHE_KEY}}', context.nodeModulesCacheKey);
+}
+
+function hasDeployTarget(root: string, configuration: string): boolean {
+  const output = execFileSync('nx', ['show', 'projects', '--withTarget', 'deploy', '--json'], {
+    cwd: root,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  const projects: unknown = JSON.parse(output);
+  if (!Array.isArray(projects) || !projects.every((project) => typeof project === 'string')) {
+    return false;
+  }
+  return projects.some((project) => nxDeployTargetHasConfiguration(root, project, configuration));
+}
+
+function nxDeployTargetHasConfiguration(root: string, project: string, configuration: string): boolean {
+  const output = execFileSync('nx', ['show', 'project', project, '--json'], {
+    cwd: root,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  const parsed: unknown = JSON.parse(output);
+  const projectJson = recordValue(parsed);
+  const targets = recordValue(projectJson?.targets);
+  const deploy = recordValue(targets?.deploy);
+  const configurations = recordValue(deploy?.configurations);
+  return recordValue(configurations?.[configuration]) !== undefined;
 }
 
 function getCiPushBranches(packageJson: unknown): string[] {
