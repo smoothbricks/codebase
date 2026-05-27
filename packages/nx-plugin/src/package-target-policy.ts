@@ -11,6 +11,8 @@ export type { NxPolicyIssue };
 export interface ResolvedProjectTargets {
   targets: ReadonlySet<string>;
   buildDependsOn?: readonly string[];
+  targetExecutors?: ReadonlyMap<string, string>;
+  targetScripts?: ReadonlyMap<string, string>;
 }
 
 export interface PackageTargetPolicyOptions {
@@ -200,14 +202,31 @@ function resolvedProjectBuildDependsOn(
   return resolvedProject.buildDependsOn;
 }
 
+function resolvedProjectTargetExecutor(
+  resolvedProject: ReadonlySet<string> | ResolvedProjectTargets | undefined,
+  targetName: string,
+): string | undefined {
+  return isResolvedProjectTargets(resolvedProject) ? resolvedProject.targetExecutors?.get(targetName) : undefined;
+}
+
+function resolvedProjectTargetScript(
+  resolvedProject: ReadonlySet<string> | ResolvedProjectTargets | undefined,
+  targetName: string,
+): string | undefined {
+  return isResolvedProjectTargets(resolvedProject) ? resolvedProject.targetScripts?.get(targetName) : undefined;
+}
+
 function isResolvedProjectTargets(
   value: ReadonlySet<string> | ResolvedProjectTargets | undefined,
 ): value is ResolvedProjectTargets {
   return isRecord(value) && value.targets instanceof Set;
 }
 
-function targetExistsInResolvedProject(targetName: string, resolvedTargets?: ReadonlySet<string>): boolean {
-  return resolvedTargets?.has(targetName) === true;
+function targetExistsInResolvedProject(
+  targetName: string,
+  resolvedTargets?: ReadonlySet<string> | ResolvedProjectTargets,
+): boolean {
+  return resolvedProjectTargetNames(resolvedTargets)?.has(targetName) === true;
 }
 
 function isBuildOutputDependencyPattern(dependency: string): boolean {
@@ -652,7 +671,7 @@ function validatePackageScriptPolicy(
   pkg: Record<string, unknown>,
   packagePath: string,
   workspaceNames: ReadonlySet<string>,
-  options: { resolvedTargets?: ReadonlySet<string> } = {},
+  options: { resolvedTargets?: ReadonlySet<string> | ResolvedProjectTargets } = {},
 ): NxPolicyIssue[] {
   if (!hasWorkspaceDependency(pkg, workspaceNames)) {
     return [];
@@ -670,6 +689,13 @@ function validatePackageScriptPolicy(
       continue;
     }
     const alias = parseNxRunAlias(rawCommand);
+    if (isResolvedSelfRecursiveScript(scriptName, alias, projectName, options.resolvedTargets)) {
+      issues.push({
+        path: packagePath,
+        message: `${packagePath}: scripts.${scriptName} recursively delegates to its own inferred Nx target; remove the script so the resolved Nx target can run`,
+      });
+      continue;
+    }
     const rewrite = alias
       ? { targetName: alias.targetName, continuous: isContinuousTarget(alias.targetName, '') }
       : classifyScriptRewrite(scriptName, rawCommand);
@@ -989,7 +1015,7 @@ function applyPackageScriptPolicyForPkg(
   pkg: Record<string, unknown>,
   _packagePath: string,
   workspaceNames: ReadonlySet<string>,
-  options: { resolvedTargets?: ReadonlySet<string> } = {},
+  options: { resolvedTargets?: ReadonlySet<string> | ResolvedProjectTargets } = {},
 ): boolean {
   if (!hasWorkspaceDependency(pkg, workspaceNames)) {
     return false;
@@ -1010,6 +1036,11 @@ function applyPackageScriptPolicyForPkg(
       continue;
     }
     const parsedAlias = parseNxRunAlias(rawCommand);
+    if (isResolvedSelfRecursiveScript(scriptName, parsedAlias, projectName, options.resolvedTargets)) {
+      delete scripts[scriptName];
+      changed = true;
+      continue;
+    }
     if (parsedAlias?.projectName === projectName && parsedAlias.targetName === 'test') {
       continue;
     }
@@ -1065,6 +1096,20 @@ function applyPackageScriptPolicyForPkg(
   return changed;
 }
 
+function isResolvedSelfRecursiveScript(
+  scriptName: string,
+  alias: { projectName: string; targetName: string } | null,
+  projectName: string | null,
+  resolvedTargets?: ReadonlySet<string> | ResolvedProjectTargets,
+): boolean {
+  return (
+    alias?.projectName === projectName &&
+    alias.targetName === scriptName &&
+    resolvedProjectTargetExecutor(resolvedTargets, scriptName) === 'nx:run-script' &&
+    resolvedProjectTargetScript(resolvedTargets, scriptName) === scriptName
+  );
+}
+
 export function checkPackageTargets(
   pkg: Record<string, unknown>,
   packagePath: string,
@@ -1103,7 +1148,7 @@ export function checkPackageTargetPolicy(root: string, options: PackageTargetPol
     issues.push(...validateExplicitNxTargets(pkg, packagePath, resolvedTargets));
     issues.push(...validateTestEntrypointPresence(root, packagePath, pkg));
     issues.push(...validateBuildZigPolicy(root, packagePath));
-    issues.push(...validatePackageScriptPolicy(pkg, packagePath, workspaceNames, { resolvedTargets }));
+    issues.push(...validatePackageScriptPolicy(pkg, packagePath, workspaceNames, { resolvedTargets: resolvedProject }));
   }
 
   return issues;
@@ -1128,7 +1173,8 @@ export function applyPackageTargetPolicy(root: string, options: PackageTargetPol
     packageChanged = removePackageColonTargets(pkg) || packageChanged;
     packageChanged = removeRedundantNoopBuildTarget(pkg, resolvedProject) || packageChanged;
     packageChanged =
-      applyPackageScriptPolicyForPkg(pkg, packagePath, workspaceNames, { resolvedTargets }) || packageChanged;
+      applyPackageScriptPolicyForPkg(pkg, packagePath, workspaceNames, { resolvedTargets: resolvedProject }) ||
+      packageChanged;
 
     if (packageChanged) {
       writeJsonObject(packageJsonPath, pkg);
