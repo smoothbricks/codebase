@@ -9,6 +9,8 @@ export interface ProjectTargets {
   project: string;
   targets: string[];
   buildDependsOn?: string[];
+  targetExecutors?: Map<string, string>;
+  targetScripts?: Map<string, string>;
 }
 
 export interface CommandInvocation {
@@ -40,6 +42,38 @@ export function buildDependsOnFromNxProjectJson(value: unknown): string[] | unde
     return undefined;
   }
   return build.dependsOn;
+}
+
+export function targetExecutorsFromNxProjectJson(value: unknown): Map<string, string> {
+  const targets = isRecord(value) ? recordProperty(value, 'targets') : null;
+  const executors = new Map<string, string>();
+  if (!targets) {
+    return executors;
+  }
+  for (const [targetName, target] of Object.entries(targets)) {
+    if (isRecord(target) && typeof target.executor === 'string') {
+      executors.set(targetName, target.executor);
+    }
+  }
+  return executors;
+}
+
+export function targetScriptsFromNxProjectJson(value: unknown): Map<string, string> {
+  const targets = isRecord(value) ? recordProperty(value, 'targets') : null;
+  const scripts = new Map<string, string>();
+  if (!targets) {
+    return scripts;
+  }
+  for (const [targetName, target] of Object.entries(targets)) {
+    if (!isRecord(target)) {
+      continue;
+    }
+    const options = recordProperty(target, 'options');
+    if (typeof options?.script === 'string') {
+      scripts.set(targetName, options.script);
+    }
+  }
+  return scripts;
 }
 
 export function formatProjectTargetLines(projects: ProjectTargets[]): string {
@@ -135,5 +169,7 @@ async function readProjectTarget(root: string, project: string): Promise<Project
     project,
     targets: targetNamesFromNxProjectJson(parsed),
     buildDependsOn: buildDependsOnFromNxProjectJson(parsed),
+    targetExecutors: targetExecutorsFromNxProjectJson(parsed),
+    targetScripts: targetScriptsFromNxProjectJson(parsed),
   };
 }

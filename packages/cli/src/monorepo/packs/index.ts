@@ -395,6 +395,8 @@ async function readResolvedTargetsByProject(ctx: MonorepoContext): Promise<Map<s
       {
         targets: new Set(project.targets),
         ...(project.buildDependsOn ? { buildDependsOn: project.buildDependsOn } : {}),
+        ...(project.targetExecutors ? { targetExecutors: project.targetExecutors } : {}),
+        ...(project.targetScripts ? { targetScripts: project.targetScripts } : {}),
       },
     ]),
   );

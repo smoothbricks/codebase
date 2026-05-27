@@ -262,6 +262,102 @@ describe('package target policy', () => {
     }
   });
 
+  it('removes self-recursive scripts using resolved Nx target metadata', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoothbricks-pkg-target-'));
+    try {
+      await writeJson(join(root, 'package.json'), {
+        name: '@scope/root',
+        private: true,
+        workspaces: ['packages/*'],
+      });
+      await writeJson(join(root, 'packages/app/package.json'), {
+        name: '@scope/app',
+        dependencies: { '@scope/lib': 'workspace:*' },
+        scripts: {
+          build: 'nx run app:build',
+          test: 'bun test',
+        },
+        nx: {
+          name: 'app',
+          targets: {
+            'tsdown-js': {
+              executor: 'nx:run-commands',
+              options: { command: 'tsdown', cwd: '{projectRoot}' },
+            },
+          },
+        },
+      });
+      await writeJson(join(root, 'packages/lib/package.json'), {
+        name: '@scope/lib',
+      });
+      const resolvedTargetsByProject = new Map<string, ResolvedProjectTargets>([
+        [
+          'app',
+          {
+            targets: new Set(['build', 'test', 'tsdown-js']),
+            targetExecutors: new Map([
+              ['build', 'nx:run-script'],
+              ['test', 'nx:run-script'],
+              ['tsdown-js', 'nx:run-commands'],
+            ]),
+            targetScripts: new Map([
+              ['build', 'build'],
+              ['test', 'test'],
+            ]),
+          },
+        ],
+      ]);
+
+      const issues = checkPackageTargetPolicy(root, { resolvedTargetsByProject });
+      expect(issues.some((i) => i.message.includes('scripts.build recursively delegates'))).toBe(true);
+      expect(applyPackageTargetPolicy(root, { resolvedTargetsByProject })).toBe(true);
+
+      const app = JSON.parse(await readFile(join(root, 'packages/app/package.json'), 'utf8'));
+      expect(app.scripts.build).toBeUndefined();
+      expect(app.scripts.test).toBe('bun test');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps self-alias scripts when resolved target comes from project configuration', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoothbricks-pkg-target-'));
+    try {
+      await writeJson(join(root, 'package.json'), {
+        name: '@scope/root',
+        private: true,
+        workspaces: ['packages/*'],
+      });
+      await writeJson(join(root, 'packages/app/package.json'), {
+        name: '@scope/app',
+        dependencies: { '@scope/lib': 'workspace:*' },
+        scripts: {
+          build: 'nx run app:build',
+        },
+        nx: { name: 'app' },
+      });
+      await writeJson(join(root, 'packages/lib/package.json'), {
+        name: '@scope/lib',
+      });
+      const resolvedTargetsByProject = new Map<string, ResolvedProjectTargets>([
+        [
+          'app',
+          {
+            targets: new Set(['build']),
+            targetExecutors: new Map([['build', 'nx:run-commands']]),
+          },
+        ],
+      ]);
+
+      expect(applyPackageTargetPolicy(root, { resolvedTargetsByProject })).toBe(false);
+
+      const app = JSON.parse(await readFile(join(root, 'packages/app/package.json'), 'utf8'));
+      expect(app.scripts.build).toBe('nx run app:build');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('moves env assignments into target options', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoothbricks-pkg-target-'));
     try {
