@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { $ } from 'bun';
 
@@ -105,10 +105,6 @@ function resolveBundledCommand(command: string): string | null {
   try {
     if (command === 'sherif') {
       return fileURLToPath(import.meta.resolve('sherif'));
-    }
-    if (command === 'attw') {
-      const packageJson = fileURLToPath(import.meta.resolve('@arethetypeswrong/cli/package.json'));
-      return join(dirname(packageJson), 'dist', 'index.js');
     }
   } catch {
     return null;

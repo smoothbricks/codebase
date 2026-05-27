@@ -1,5 +1,7 @@
-import { readFileSync, rmSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, relative } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { publint } from 'publint';
 import { formatMessage } from 'publint/utils';
 import { isRecord } from '../lib/json.js';
@@ -86,39 +88,158 @@ async function validatePackedManifest(
 }
 
 async function validateAttw(root: string, pkg: PackageInfo, packed: { path: string }): Promise<number> {
-  const attwArgs = [
-    packed.path,
-    '--format',
-    'ascii',
-    '--no-color',
-    '--profile',
-    'node16',
-    '--ignore-rules',
-    'cjs-resolves-to-esm',
-    ...attwExcludedEntrypointArgs(pkg),
-  ];
-  const attw = await runResult('attw', attwArgs, root);
-  if (attw.exitCode === 0) {
+  const attw = await loadAttwCore();
+  const analysis = await attw.checkPackage(await createAttwPackageFromTarball(attw, root, packed.path), {
+    excludeEntrypoints: wasmExportEntrypoints(pkg.json.exports),
+  });
+  if (!isRecord(analysis) || analysis.types === false) {
     return 0;
   }
-  printAttwOutput(attw.stdout);
-  printAttwOutput(attw.stderr);
+  const rawProblems = Array.isArray(analysis.problems) ? analysis.problems : [];
+  const problems = rawProblems.filter(isReportedAttwProblem);
+  if (problems.length === 0) {
+    return 0;
+  }
+  for (const problem of problems) {
+    console.error(`${pkg.path}: are-the-types-wrong ${problem.kind}${formatProblemLocation(problem)}`);
+  }
   console.error(`${pkg.path}: are-the-types-wrong validation failed`);
   return 1;
 }
 
-function printAttwOutput(output: string): void {
-  for (const line of output.split('\n')) {
-    if (!line || line.includes('(ignored)')) {
-      continue;
+interface AttwCore {
+  createPackage: (files: Record<string, Uint8Array>, packageName: string, packageVersion: string) => unknown;
+  checkPackage: (pkg: unknown, options: { excludeEntrypoints: string[] }) => Promise<unknown>;
+}
+
+async function loadAttwCore(): Promise<AttwCore> {
+  const packageJson = fileURLToPath(import.meta.resolve('@arethetypeswrong/core/package.json'));
+  const core = await import(pathToFileURL(join(dirname(packageJson), 'dist', 'index.js')).href);
+  if (!isRecord(core)) {
+    throw new Error('@arethetypeswrong/core does not expose the expected API');
+  }
+  const PackageConstructor = core.Package;
+  const checkPackage = core.checkPackage;
+  if (typeof PackageConstructor !== 'function' || typeof checkPackage !== 'function') {
+    throw new Error('@arethetypeswrong/core does not expose the expected API');
+  }
+  return {
+    createPackage: (files, packageName, packageVersion) =>
+      Reflect.construct(PackageConstructor, [files, packageName, packageVersion]),
+    checkPackage: (pkg, options) => Promise.resolve(checkPackage(pkg, options)),
+  };
+}
+
+async function createAttwPackageFromTarball(attw: AttwCore, root: string, tarballPath: string): Promise<unknown> {
+  const temp = mkdtempSync(join(tmpdir(), 'smoo-attw-'));
+  try {
+    const extract = await runResult('tar', ['-xzf', tarballPath, '-C', temp], root);
+    if (extract.exitCode !== 0) {
+      printCommandOutput(extract.stdout, extract.stderr);
+      throw new Error('unable to extract packed package for are-the-types-wrong');
     }
-    console.error(line);
+    return createAttwPackageFromDirectory(attw, join(temp, 'package'));
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
   }
 }
 
-function attwExcludedEntrypointArgs(pkg: PackageInfo): string[] {
-  const excluded = wasmExportEntrypoints(pkg.json.exports);
-  return excluded.length === 0 ? [] : ['--exclude-entrypoints', ...excluded];
+function createAttwPackageFromDirectory(attw: AttwCore, packageDir: string): unknown {
+  const packageJson = readJsonFile(join(packageDir, 'package.json'));
+  const packageName = typeof packageJson.name === 'string' ? packageJson.name : null;
+  const packageVersion = typeof packageJson.version === 'string' ? packageJson.version : null;
+  if (!packageName || !packageVersion) {
+    throw new Error('packed package.json must contain name and version');
+  }
+  const files: Record<string, Uint8Array> = {};
+  collectAttwFiles(packageDir, packageDir, packageName, files);
+  return attw.createPackage(files, packageName, packageVersion);
+}
+
+function collectAttwFiles(root: string, current: string, packageName: string, files: Record<string, Uint8Array>): void {
+  for (const entry of readdirSync(current)) {
+    const path = join(current, entry);
+    const stat = statSync(path);
+    if (stat.isDirectory()) {
+      collectAttwFiles(root, path, packageName, files);
+      continue;
+    }
+    if (!stat.isFile()) {
+      continue;
+    }
+    const packageRelativePath = relative(root, path).split('\\').join('/');
+    files[`/node_modules/${packageName}/${packageRelativePath}`] = new Uint8Array(readFileSync(path));
+  }
+}
+
+function readJsonFile(path: string): Record<string, unknown> {
+  const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+  if (!isRecord(parsed)) {
+    throw new Error(`${path} is not a JSON object`);
+  }
+  return parsed;
+}
+
+function isReportedAttwProblem(problem: unknown): boolean {
+  if (!isRecord(problem) || typeof problem.kind !== 'string') {
+    return false;
+  }
+  const flag = attwProblemFlag(problem.kind);
+  if (flag === 'cjs-resolves-to-esm') {
+    return false;
+  }
+  return problem.resolutionKind !== 'node10';
+}
+
+function attwProblemFlag(kind: string): string | null {
+  switch (kind) {
+    case 'NoResolution':
+      return 'no-resolution';
+    case 'UntypedResolution':
+      return 'untyped-resolution';
+    case 'FalseCJS':
+      return 'false-cjs';
+    case 'FalseESM':
+      return 'false-esm';
+    case 'CJSResolvesToESM':
+      return 'cjs-resolves-to-esm';
+    case 'FallbackCondition':
+      return 'fallback-condition';
+    case 'CJSOnlyExportsDefault':
+      return 'cjs-only-exports-default';
+    case 'NamedExports':
+      return 'named-exports';
+    case 'FalseExportDefault':
+      return 'false-export-default';
+    case 'MissingExportEquals':
+      return 'missing-export-equals';
+    case 'UnexpectedModuleSyntax':
+      return 'unexpected-module-syntax';
+    case 'InternalResolutionError':
+      return 'internal-resolution-error';
+    default:
+      return null;
+  }
+}
+
+function formatProblemLocation(problem: unknown): string {
+  if (!isRecord(problem)) {
+    return '';
+  }
+  const entrypoint = typeof problem.entrypoint === 'string' ? ` ${problem.entrypoint}` : '';
+  const resolution =
+    typeof problem.resolutionKind === 'string' ? ` ${formatResolutionKind(problem.resolutionKind)}` : '';
+  return `${entrypoint}${resolution}`;
+}
+
+function formatResolutionKind(kind: string): string {
+  if (kind === 'node16-cjs') {
+    return 'node16 (from CJS)';
+  }
+  if (kind === 'node16-esm') {
+    return 'node16 (from ESM)';
+  }
+  return kind;
 }
 
 function wasmExportEntrypoints(exports: unknown): string[] {
