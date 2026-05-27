@@ -44,7 +44,7 @@
     "!**/*.tsbuildinfo"
   ],
   "dependencies": {
-    "@arethetypeswrong/cli": "^0.18.2",
+    "@arethetypeswrong/core": "^0.18.2",
     "@smoothbricks/nx-plugin": "workspace:*",
     "@smoothbricks/validation": "workspace:*",
     "commander": "^14.0.3",
