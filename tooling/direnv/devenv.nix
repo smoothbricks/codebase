@@ -78,8 +78,8 @@ in {
 
   # PATH order: most-specific → least-specific.
   enterShell = ''
-     cd "$DEVENV_ROOT/../.."
-     export PATH="$("$PWD/tooling/direnv/repo-path")"
+    cd "$DEVENV_ROOT/../.."
+    export PATH="$("$PWD/tooling/direnv/repo-path")"
     bun "$DEVENV_ROOT/enter-shell.ts"
 
     # Unset nix CC/CXX so xcodebuild finds Xcode's clang (supports -index-store-path)
