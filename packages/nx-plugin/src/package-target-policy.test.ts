@@ -358,6 +358,45 @@ describe('package target policy', () => {
     }
   });
 
+  it('accepts stream output style on non-continuous nx aliases', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoothbricks-pkg-target-'));
+    try {
+      await writeJson(join(root, 'package.json'), {
+        name: '@scope/root',
+        private: true,
+        workspaces: ['packages/*'],
+      });
+      await writeJson(join(root, 'packages/app/package.json'), {
+        name: '@scope/app',
+        dependencies: { '@scope/lib': 'workspace:*' },
+        scripts: {
+          deploy: 'nx run app:deploy:production --outputStyle=stream',
+        },
+        nx: {
+          name: 'app',
+          targets: {
+            deploy: {
+              executor: 'nx:run-commands',
+              options: { command: 'wrangler deploy --env production', cwd: '{projectRoot}' },
+              configurations: {
+                production: { command: 'wrangler deploy --env production' },
+              },
+            },
+          },
+        },
+      });
+      await writeJson(join(root, 'packages/lib/package.json'), {
+        name: '@scope/lib',
+      });
+
+      const issues = checkPackageTargetPolicy(root);
+      expect(issues.some((i) => i.message.includes('scripts.deploy must delegate'))).toBe(false);
+      expect(applyPackageTargetPolicy(root)).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('moves env assignments into target options', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoothbricks-pkg-target-'));
     try {

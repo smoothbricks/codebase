@@ -323,6 +323,19 @@ export function nxRunAlias(
   return `nx run ${projectName}:${targetName}${flags}`;
 }
 
+function nxRunAliasMatches(
+  rawAlias: { projectName: string; targetName: string } | null,
+  expectedAlias: string,
+): boolean {
+  const expected = parseNxRunAlias(expectedAlias);
+  return (
+    !!rawAlias &&
+    !!expected &&
+    rawAlias.projectName === expected.projectName &&
+    rawAlias.targetName === expected.targetName
+  );
+}
+
 function nxRunOutputStyle(command?: string | null): 'stream' | 'dynamic-legacy' {
   if (command && /(?:^|\s)(?:astro|vite)\s+dev(?:\s|$)/.test(command)) {
     return 'dynamic-legacy';
@@ -720,7 +733,7 @@ function validatePackageScriptPolicy(
     const command = targetOptions ? stringProperty(targetOptions, 'command') : null;
     const rewriteCommand = 'command' in rewrite ? rewrite.command : null;
     const expectedAlias = nxRunAlias(projectName, rewrite.targetName, rewrite.continuous, command ?? rewriteCommand);
-    if (rawCommand !== expectedAlias) {
+    if (alias ? !nxRunAliasMatches(alias, expectedAlias) : rawCommand !== expectedAlias) {
       issues.push({
         path: packagePath,
         message: `${packagePath}: scripts.${scriptName} must delegate to ${expectedAlias}`,
