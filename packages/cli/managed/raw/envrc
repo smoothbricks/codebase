@@ -1,0 +1,18 @@
+# Worktrees inherit the real project .envrc once, then stop. The same file is
+# checked out inside .jcode-worktrees, so continuing after source_up_if_exists
+# would run the devenv setup twice while sandbox blocks access to tooling/.
+case "$PWD" in
+  */.jcode-worktrees/*)
+    ;;
+  *)
+    source_up_if_exists
+    ;;
+esac
+
+watch_file tooling/direnv/envrc.sh
+
+cd tooling/direnv
+. envrc.sh
+
+# Load local extensions and overrides
+source_env_if_exists .envrc-local

@@ -40,6 +40,11 @@ interface DeployTargetInfo {
 const managedFiles: ManagedFile[] = [
   {
     kind: 'raw',
+    source: 'envrc',
+    target: '.envrc',
+  },
+  {
+    kind: 'raw',
     source: 'tooling/direnv/repo-path',
     target: 'tooling/direnv/repo-path',
     executable: true,
@@ -48,6 +53,12 @@ const managedFiles: ManagedFile[] = [
     kind: 'raw',
     source: 'tooling/direnv/github-actions-bootstrap.sh',
     target: 'tooling/direnv/github-actions-bootstrap.sh',
+    executable: true,
+  },
+  {
+    kind: 'raw',
+    source: 'tooling/direnv/setup-environment.ts',
+    target: 'tooling/direnv/setup-environment.ts',
     executable: true,
   },
   {
