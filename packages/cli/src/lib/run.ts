@@ -70,6 +70,15 @@ export async function runResult(
   };
 }
 
+export function printCommandOutput(stdout: string, stderr: string): void {
+  if (stdout.length > 0) {
+    console.log(trimTrailingNewline(stdout));
+  }
+  if (stderr.length > 0) {
+    console.error(trimTrailingNewline(stderr));
+  }
+}
+
 function mergeEnv(env: Record<string, string>): Record<string, string> {
   const merged: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
@@ -117,4 +126,8 @@ export async function findRepoRoot(): Promise<string> {
 
 export function decode(bytes: Uint8Array): string {
   return new TextDecoder().decode(bytes);
+}
+
+function trimTrailingNewline(value: string): string {
+  return value.endsWith('\n') ? value.slice(0, -1) : value;
 }
