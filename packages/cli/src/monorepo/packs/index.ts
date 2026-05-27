@@ -1,6 +1,6 @@
 import { chmodSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { runStatus } from '../../lib/run.js';
+import { printCommandOutput, runResult, runStatus } from '../../lib/run.js';
 import { readProjectTargets } from '../../nx/index.js';
 import { syncBunLockfileVersions, validateBunLockfileVersions } from '../lockfile.js';
 import { validateManagedFiles } from '../managed-files.js';
@@ -315,10 +315,14 @@ async function runBuild(ctx: MonorepoContext, options: ValidatePackOptions = {})
   if (options.verbose) {
     printCheckHeading('build', true);
   }
-  const status = await runStatus('nx', ['run-many', '-t', 'build'], ctx.root, options.verbose !== true);
+  const result = options.verbose
+    ? { exitCode: await runStatus('nx', ['run-many', '-t', 'build'], ctx.root, false), stdout: '', stderr: '' }
+    : await runResult('nx', ['run-many', '-t', 'build'], ctx.root);
+  const status = result.exitCode;
   if (status !== 0) {
     if (!options.verbose) {
       printCheckHeading('build', true);
+      printCommandOutput(result.stdout, result.stderr);
     }
     console.error('nx run-many -t build failed');
     printCheckStatus('build', 1);
