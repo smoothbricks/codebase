@@ -1,0 +1,39 @@
+---
+title: Entry types & system columns
+description: The entry-type names that classify rows, and the reserved system columns.
+sidebar:
+  order: 7
+---
+
+Each row in a span buffer carries an **entry type** that says what the row represents. You usually don't touch these
+directly — `tag`, `log`, `ok`/`err`, and feature-flag access write the right rows for you — but they're useful when
+reading raw trace output.
+
+## Entry-type names
+
+| Group | Names |
+|---|---|
+| Span lifecycle | `span-start`, `span-ok`, `span-err`, `span-exception`, `span-retry` |
+| Log levels | `trace`, `debug`, `info`, `warn`, `error` |
+| Feature flags | `ff-access`, `ff-usage` |
+| Period marker | `period-start` |
+| Op metrics | `op-invocations`, `op-errors`, `op-exceptions`, `op-duration-total`, `op-duration-ok`, `op-duration-err`, `op-duration-min`, `op-duration-max` |
+| Buffer metrics | `buffer-writes`, `buffer-spans`, `buffer-capacity` |
+
+The matching numeric constants are exported as `ENTRY_TYPE_*` (e.g. `ENTRY_TYPE_SPAN_OK`, `ENTRY_TYPE_INFO`).
+
+## Reserved system columns
+
+These columns are managed by LMAO and present in the output; your schema field names must not collide with them:
+
+`trace_id`, `thread_id`, `span_id`, `parent_thread_id`, `parent_span_id`, `timestamp`, `entry_type`.
+
+## Multi-purpose columns
+
+A few columns carry different meanings depending on the entry type:
+
+- **`message`** — a span name (lifecycle rows), a log message template (log rows), or a flag name (feature-flag rows).
+- **`ff_value`** — a feature flag's resolved value.
+- **`uint64_value`** — large integers, used for metrics and big counts.
+
+See [Span identity](/concepts/span-identity/) for how the identity columns reconstruct the trace tree.

@@ -1,0 +1,69 @@
+---
+title: Tracers
+description: Tracer options, the concrete tracers, and the trace() overloads.
+sidebar:
+  order: 4
+---
+
+A tracer executes ops and emits spans. Construct one with `new SomeTracer(opContext, options)`, then destructure
+`trace` from it. Import tracers and `JsBufferStrategy` from `@smoothbricks/lmao`.
+
+## `TracerOptions`
+
+| Option | Required | Purpose |
+|---|---|---|
+| `bufferStrategy` | yes | How buffers are allocated. Use `new JsBufferStrategy()`. |
+| `createTraceRoot` | yes | Platform timestamp factory, from `@smoothbricks/lmao/node` or `/es`. |
+| `flagEvaluator` | no | Provides feature-flag values (e.g. `InMemoryFlagEvaluator`). |
+
+```ts
+import { JsBufferStrategy, StdioTracer } from '@smoothbricks/lmao';
+import { createTraceRoot } from '@smoothbricks/lmao/node';
+
+const { trace } = new StdioTracer(opContext, {
+  bufferStrategy: new JsBufferStrategy(),
+  createTraceRoot,
+});
+```
+
+## Concrete tracers
+
+| Tracer | Extra options | Use |
+|---|---|---|
+| `StdioTracer` | `out?`, `err?`, `colorEnabled?` | Print spans to the console (dev/debug). |
+| `TestTracer` | — | Keep traces in memory (`tracer.rootBuffers`) for inspection/tests. |
+| `ArrayQueueTracer` | — | Queue completed traces in memory for batch processing. |
+| `SQLiteTracer` | `db` | Write traces to a synchronous SQLite database. |
+| `SQLiteAsyncTracer` | `db` | Write traces to an async database (e.g. D1). |
+| `CompositeTracer` | `delegates` | Fan out to multiple tracers. |
+| `NoOpTracer` | — | Execute ops without emitting. |
+
+`StdioTracer` defaults: `out` → `process.stdout`, `err` → `process.stderr`, `colorEnabled` → `true`.
+
+```ts
+// SQLite
+new SQLiteTracer(opContext, { bufferStrategy, createTraceRoot, db });
+// Composite
+new CompositeTracer(opContext, { bufferStrategy, createTraceRoot, delegates: [t1, t2] });
+```
+
+## `trace(...)` overloads
+
+`trace` runs an op (or an inline function) as the root span. `overrides` carries user-context values (and an optional
+`trace_id`).
+
+```ts
+trace(name, op, ...args);
+trace(name, overrides, op, ...args);
+trace(name, fn);
+trace(name, overrides, fn);
+```
+
+```ts
+// Op with no extra args:
+await trace('greet', greet);
+// Inline function with user-context overrides:
+await trace('greet', { requestId: 'req-1' }, async (ctx) => ctx.ok(null));
+```
+
+Op invocations resolve to `Promise<Result<S, E>>`; check `result.success`. See [Errors & retry](/reference/errors-and-retry/).

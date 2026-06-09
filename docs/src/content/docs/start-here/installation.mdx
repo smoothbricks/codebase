@@ -1,0 +1,70 @@
+---
+title: Installation
+description: Install @smoothbricks/lmao and choose the platform entry point for your runtime.
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+## Install
+
+<Tabs syncKey="pkg">
+  <TabItem label="bun">
+    ```sh
+    bun add @smoothbricks/lmao
+    ```
+  </TabItem>
+  <TabItem label="npm">
+    ```sh
+    npm install @smoothbricks/lmao
+    ```
+  </TabItem>
+  <TabItem label="pnpm">
+    ```sh
+    pnpm add @smoothbricks/lmao
+    ```
+  </TabItem>
+  <TabItem label="yarn">
+    ```sh
+    yarn add @smoothbricks/lmao
+    ```
+  </TabItem>
+</Tabs>
+
+## Requirements
+
+- **TypeScript**, with the package consumed as an **ES module** (`"type": "module"` or a bundler that emits ESM).
+- A modern runtime: **Node 18+** or **Bun** for server code; modern browsers, Deno, or Cloudflare Workers for the
+  browser/edge entry point.
+
+## Platform entry point
+
+LMAO needs a platform-specific timestamp source, exposed as a `createTraceRoot` factory. Import it from the entry
+point that matches your runtime; import everything else from the package root.
+
+<Tabs syncKey="platform">
+  <TabItem label="Node">
+    ```ts
+    // High-precision timestamps via process.hrtime.bigint()
+    import { createTraceRoot } from '@smoothbricks/lmao/node';
+    import { defineOpContext, JsBufferStrategy, StdioTracer } from '@smoothbricks/lmao';
+    ```
+  </TabItem>
+  <TabItem label="Browser / Workers / Deno">
+    ```ts
+    // High-precision timestamps via performance.now()
+    import { createTraceRoot } from '@smoothbricks/lmao/es';
+    import { defineOpContext, JsBufferStrategy, StdioTracer } from '@smoothbricks/lmao';
+    ```
+  </TabItem>
+</Tabs>
+
+:::note
+Every tracer is constructed with two things: a **buffer strategy** (use `new JsBufferStrategy()`) and a
+**`createTraceRoot`** from your platform entry point. You'll see both in the [Quickstart](/start-here/quickstart/).
+:::
+
+## Next
+
+Continue to the [Quickstart](/start-here/quickstart/) to define an operation and run your first trace.

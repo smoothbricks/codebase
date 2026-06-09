@@ -1,0 +1,70 @@
+---
+title: Compose library traces
+description: Nest a library's spans into your application trace without column collisions.
+sidebar:
+  order: 8
+---
+
+A library can define its own ops against its own schema, and an application can wire that library in as a
+**dependency**. The library's spans then nest into the app's trace. Prefixing keeps the library's column names from
+colliding with the app's.
+
+## Define a library
+
+A library defines an op context and a group of ops. It writes to its own **unprefixed** column names.
+
+```ts
+import { S, defineLogSchema, defineOpContext } from '@smoothbricks/lmao';
+
+const authSchema = defineLogSchema({
+  userId: S.category(),
+  role: S.category(),
+});
+
+const authContext = defineOpContext({ logSchema: authSchema });
+
+export const authOps = authContext.defineOps({
+  checkAuth: async (ctx) => {
+    ctx.tag.userId('user-456').role('admin');
+    return ctx.ok({ authorized: true });
+  },
+});
+```
+
+## Wire it in as a dependency
+
+The consumer declares the library under `deps`, applying `prefix(...)` to namespace its columns. Inside an op, invoke a
+dependency op as a child span via `ctx.deps`.
+
+```ts
+const appContext = defineOpContext({
+  logSchema: defineLogSchema({ requestId: S.category() }),
+  deps: {
+    auth: authOps.prefix('auth'), // auth's `userId` → column `auth_userId`
+  },
+});
+
+const { defineOp } = appContext;
+
+const handle = defineOp('handle', async (ctx) => {
+  ctx.tag.requestId('req-1');
+
+  // Runs authOps.checkAuth as a child span named "auth-check".
+  await ctx.span('auth-check', ctx.deps.auth.checkAuth);
+
+  return ctx.ok(null);
+});
+```
+
+In the combined trace, the library's `userId`/`role` appear as `auth_userId`/`auth_role`, so they never clash with the
+app's own columns. To remap individual columns (instead of prefixing all of them), use `mapColumns({...})`.
+
+:::caution
+Composition is an advanced area. Keep dependency wiring close to the patterns shown here and in the tests, and prefer
+prefixing to avoid column-name collisions.
+:::
+
+:::note
+For the reasoning behind prefixing and how library spans merge into one Arrow table, see
+[Library composition](/concepts/library-composition/).
+:::

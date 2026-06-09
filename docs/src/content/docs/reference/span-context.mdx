@@ -1,0 +1,86 @@
+---
+title: SpanContext
+description: The ctx surface available inside an op — tag, log, span, ff, deps, scope, ok, err.
+sidebar:
+  order: 2
+---
+
+Every op receives a span context (`ctx`). It is the API for the currently executing span.
+
+## `ctx.tag`
+
+Set attributes on this span. Each setter returns the tag object, so calls chain. `with({...})` sets several at once.
+
+```ts
+ctx.tag.userId('ada').itemCount(3);
+ctx.tag.with({ route: '/cart', status: 200 }).itemCount(5);
+```
+
+Field names and value types come from your `logSchema`.
+
+## `ctx.log`
+
+Append a timestamped event. Levels: `info`, `debug`, `warn`, `error`. The message is a template; attach values via the
+same fluent chain.
+
+```ts
+ctx.log.info('processing {{itemCount}} items').itemCount(3);
+ctx.log.warn('slow path');
+```
+
+## `ctx.span(name, opOrFn)`
+
+Open a child span. Pass an op, or an inline function that receives the child context.
+
+```ts
+await ctx.span('validate', validateOp);
+await ctx.span('save', async (child) => child.ok({ id: 1 }));
+```
+
+## `ctx.setScope(values)`
+
+Set default values for this span that are **inherited by child spans**. Call once for correlating context.
+
+```ts
+ctx.setScope({ requestId: 'req-1', userId: 'ada' });
+```
+
+## `ctx.ff`
+
+Access feature flags (present only when the op context declares `flags`). Sync flags are properties; async flags use
+`get()`. See [Feature flags](/guides/feature-flags/).
+
+```ts
+if (ctx.ff.advancedValidation) {
+  /* ... */
+}
+const experiment = await ctx.ff.get('experiment');
+```
+
+## `ctx.deps`
+
+Access dependency op groups declared in `deps`. Invoke a dependency op as a child span.
+
+```ts
+await ctx.span('auth-check', ctx.deps.auth.checkAuth);
+```
+
+## `ctx.ok(value)` / `ctx.err(error)`
+
+Complete the span. `ctx.ok` returns success; `ctx.err` returns a failure with a typed error. Both support fluent
+`.with({...})` and `.message('...')`.
+
+```ts
+return ctx.ok({ id: 'user-1' });
+return ctx.err(NOT_FOUND({ id })).with({ userId: id });
+```
+
+## `ctx.buffer`
+
+The span's underlying buffer. Useful in tests for querying the span tree (`querySpan(ctx.buffer)`) and for reading
+`ctx.buffer.trace_id`.
+
+## User context properties
+
+Any properties declared in `defineOpContext({ ctx: { ... } })` are available directly on `ctx` (for example
+`ctx.requestId`, `ctx.env`). They are inherited by child spans.

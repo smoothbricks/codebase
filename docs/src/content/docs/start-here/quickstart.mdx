@@ -1,0 +1,127 @@
+---
+title: 'Quickstart: your first trace'
+description: Define an operation, run it through a tracer, and watch the span print to your console.
+sidebar:
+  order: 3
+---
+
+import { Steps } from '@astrojs/starlight/components';
+
+This walkthrough defines one operation, runs it through a tracer, and prints the resulting span to your console. It
+follows a single happy path — no errors, no branching.
+
+<Steps>
+
+1. **Define a schema.**
+
+   A schema declares the typed columns your spans can write. Pick a string strategy per field (here, `userId` repeats
+   across spans, so `S.category()` fits).
+
+   ```ts
+   import { S, defineLogSchema } from '@smoothbricks/lmao';
+
+   const appSchema = defineLogSchema({
+     userId: S.category(),
+     itemCount: S.number(),
+   });
+   ```
+
+2. **Create an op context and an op.**
+
+   `defineOpContext` returns a factory. Destructure `defineOp` to define operations; keep the `opContext` value to pass
+   to a tracer. An op receives a span context (`ctx`) and returns `ctx.ok(...)` on success.
+
+   ```ts
+   import { defineOpContext } from '@smoothbricks/lmao';
+
+   const opContext = defineOpContext({ logSchema: appSchema });
+   const { defineOp } = opContext;
+
+   const greet = defineOp('greet', async (ctx) => {
+     ctx.tag.userId('ada').itemCount(3); // typed span attributes
+     ctx.log.info('greeting {{userId}}').userId('ada'); // a log event
+     return ctx.ok({ message: 'Hello, Ada!' });
+   });
+   ```
+
+3. **Create a tracer.**
+
+   A tracer executes ops and emits the spans. `StdioTracer` prints them to your console. It needs a buffer strategy and
+   the `createTraceRoot` for your platform.
+
+   ```ts
+   import { JsBufferStrategy, StdioTracer } from '@smoothbricks/lmao';
+   import { createTraceRoot } from '@smoothbricks/lmao/node';
+
+   const { trace } = new StdioTracer(opContext, {
+     bufferStrategy: new JsBufferStrategy(),
+     createTraceRoot,
+   });
+   ```
+
+4. **Run it.**
+
+   Call `trace(name, op)`. The result is a discriminated union: check `result.success`, then read `result.value`.
+
+   ```ts
+   const result = await trace('greet', greet);
+
+   if (result.success) {
+     console.log(result.value.message); // "Hello, Ada!"
+   }
+   ```
+
+5. **Observe the output.**
+
+   `StdioTracer` prints a tree-style line when the span starts and when it ends, including the trace id, an `[OK]`
+   status, and the span's duration. Conceptually:
+
+   ```text
+   [2025-12-25T10:30:45.123Z] [a1b2c3…] greet
+   [2025-12-25T10:30:45.126Z] [a1b2c3…] greet [OK] (3.00ms) ========
+   ```
+
+   The `userId`, `itemCount`, and the log event are recorded into the span's columns in memory.
+
+</Steps>
+
+## The complete file
+
+```ts
+import {
+  S,
+  defineLogSchema,
+  defineOpContext,
+  JsBufferStrategy,
+  StdioTracer,
+} from '@smoothbricks/lmao';
+import { createTraceRoot } from '@smoothbricks/lmao/node';
+
+const appSchema = defineLogSchema({
+  userId: S.category(),
+  itemCount: S.number(),
+});
+
+const opContext = defineOpContext({ logSchema: appSchema });
+const { defineOp } = opContext;
+
+const greet = defineOp('greet', async (ctx) => {
+  ctx.tag.userId('ada').itemCount(3);
+  ctx.log.info('greeting {{userId}}').userId('ada');
+  return ctx.ok({ message: 'Hello, Ada!' });
+});
+
+const { trace } = new StdioTracer(opContext, {
+  bufferStrategy: new JsBufferStrategy(),
+  createTraceRoot,
+});
+
+const result = await trace('greet', greet);
+if (result.success) {
+  console.log(result.value.message);
+}
+```
+
+:::note
+Wondering about `tag` vs `log`, or what a "span" really is? See [Core concepts in 5 minutes](/start-here/core-concepts/).
+:::

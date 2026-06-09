@@ -1,0 +1,52 @@
+---
+title: tag, scope, and log
+description: Three ways to record information on a span and how they differ.
+sidebar:
+  order: 4
+---
+
+A span context gives you three recorders. They write to the same typed columns but differ in *which rows* they affect
+and *whether children inherit them*.
+
+## tag — attributes of this span
+
+`ctx.tag.field(v)` sets an attribute on the current span's start row. Calls are chainable, and `with({...})` sets
+several at once. Tags describe the span itself.
+
+```ts
+ctx.tag.userId('ada').itemCount(3);
+ctx.tag.with({ route: '/cart', status: 200 });
+```
+
+## scope — inherited defaults
+
+`ctx.setScope({...})` sets values that apply across the whole span **and are inherited by child spans**. It's how you
+attach correlating context (like a `requestId`) once, without repeating it on every tag and log below.
+
+```ts
+ctx.setScope({ requestId: 'req-1', userId: 'ada' });
+// Every child span sees requestId and userId too.
+```
+
+Scope is applied as default values when the trace is converted, filling cells that weren't written directly. Child
+spans inherit the parent's scope; a child can add more with its own `setScope`.
+
+## log — timestamped events
+
+`ctx.log.info/debug/warn/error(message)` appends an event row with a timestamp. The message is a **template**:
+`{{field}}` placeholders name columns, and you attach the values through the same fluent chain.
+
+```ts
+ctx.log.info('processing {{itemCount}} items').itemCount(3);
+```
+
+The template string is stored as-is; the value goes in its own column. A viewer renders the final text from the
+column values — which also means identical templates share storage.
+
+## Picking one
+
+- Describes the span? → **tag**
+- Should appear on children too? → **scope**
+- Marks a moment in time? → **log**
+
+For the task-focused version, see [tag vs scope vs log](/guides/tag-vs-scope-vs-log/).

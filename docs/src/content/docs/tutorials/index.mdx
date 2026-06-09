@@ -1,0 +1,16 @@
+---
+title: Tutorials
+description: Step-by-step, end-to-end walkthroughs for learning LMAO.
+sidebar:
+  order: 0
+---
+
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+Learning-oriented walkthroughs. If you're brand new, start with the
+[Quickstart](/start-here/quickstart/), then come back here.
+
+<CardGrid>
+  <LinkCard title="Test by tracing" href="/tutorials/test-by-tracing/" description="Run code that emits spans and assert on the span tree." />
+  <LinkCard title="Trace an HTTP request end-to-end" href="/tutorials/trace-http-request/" description="Scope, child spans, and converting a trace to an Arrow table." />
+</CardGrid>

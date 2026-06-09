@@ -1,0 +1,32 @@
+---
+title: Library composition
+description: How a library's spans merge into an application trace without column collisions.
+sidebar:
+  order: 7
+---
+
+LMAO is designed so libraries can be instrumented independently and still compose cleanly into an application's trace.
+
+## The problem
+
+A library defines its own schema and writes to column names that make sense to it — an HTTP library might use `status`,
+a database library might also use a `duration` column. If two such libraries were merged into one trace naively, their
+columns would collide.
+
+## Prefixing and column mapping
+
+When an application wires a library in as a dependency, it applies a **prefix** (or a per-column **mapping**). The
+library keeps writing to its own unprefixed names; the prefix is applied to its columns as they're composed into the
+combined trace.
+
+So an HTTP library's `status` becomes `http_status` in the app trace, and a database library's `duration` becomes
+`db_duration`. Each library stays oblivious to the others, yet their columns never clash. Where it's intentional,
+mapping can also point two libraries at a *shared* column.
+
+## How it nests
+
+A dependency's op is invoked as a **child span** of the calling op (via `ctx.deps`). The library's spans therefore
+appear nested under the app's spans in the trace tree, and their (prefixed) columns join the same Arrow table. The
+result is one coherent trace spanning app and library code.
+
+For the step-by-step wiring, see [Compose library traces](/guides/compose-library-traces/).

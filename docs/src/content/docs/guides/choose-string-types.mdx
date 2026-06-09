@@ -1,0 +1,37 @@
+---
+title: Choose a string type
+description: When to use S.enum, S.category, or S.text for a string field.
+sidebar:
+  order: 1
+---
+
+LMAO has three string field types. They behave the same at the call site (you pass a string) but store differently,
+which affects size and query ergonomics. Pick by the field's **cardinality** — how many distinct values it has.
+
+| Type | Use when | Example field |
+|---|---|---|
+| `S.enum([...])` | The full set of values is known at author time and small. | `method: S.enum(['GET', 'POST'])` |
+| `S.category()` | Values repeat across spans but aren't known ahead of time. | `userId`, `region`, `requestId` |
+| `S.text()` | Values are mostly unique. | a SQL `query`, a free-form `message` |
+
+```ts
+import { S, defineLogSchema } from '@smoothbricks/lmao';
+
+const schema = defineLogSchema({
+  method: S.enum(['GET', 'POST', 'PUT', 'DELETE']), // known, small set
+  userId: S.category(), // repeats, unknown ahead of time
+  query: S.text(), // mostly unique
+});
+```
+
+## How to decide
+
+- **Is the set fixed and known now?** Use `S.enum`. It stores the smallest representation.
+- **Otherwise, do values repeat?** Use `S.category`. Repeated values are dictionary-encoded when the trace is
+  converted to Arrow, so storage stays compact.
+- **Are values essentially unique?** Use `S.text`. A dictionary wouldn't help, so it avoids that overhead.
+
+:::note
+This is purely a storage/encoding choice — the value you pass and read back is always a string. For the reasoning
+behind dictionary encoding, see [Schema & string encoding](/concepts/schema-and-encoding/).
+:::

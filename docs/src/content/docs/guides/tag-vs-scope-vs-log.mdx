@@ -1,0 +1,41 @@
+---
+title: tag vs scope vs log
+description: Pick the right way to record information on a span.
+sidebar:
+  order: 2
+---
+
+A span context offers three recorders. Use this guide to pick; for the underlying model, see
+[tag, scope, and log](/concepts/the-three-writers/).
+
+## Choose by intent
+
+| You want to… | Use | Notes |
+|---|---|---|
+| Set an attribute of **this span** | `ctx.tag.field(v)` | Chainable; set once per span. |
+| Set a value that should appear on **this span and its children** | `ctx.setScope({...})` | Inherited by child spans; set it once. |
+| Record a **timestamped event** during the span | `ctx.log.info/debug/warn/error` | Message is a template; values attach via the same fluent chain. |
+
+## Recipe
+
+```ts
+const handle = defineOp('handle', async (ctx) => {
+  // Inherited by every child span — set request-wide context once.
+  ctx.setScope({ requestId: 'req-1', userId: 'ada' });
+
+  // Attributes of this span.
+  ctx.tag.itemCount(3);
+
+  // An event, with values filled into the {{...}} template.
+  ctx.log.info('processing {{itemCount}} items').itemCount(3);
+
+  return ctx.ok(null);
+});
+```
+
+## Common questions
+
+- **Should `requestId` be a tag or scope?** Scope — you want it on the child spans too, without repeating it.
+- **Tag or log for a one-off attribute?** Tag, if it describes the span. Log, if it marks a moment in time.
+- **Do log templates interpolate?** The message stays a template (`processing {{itemCount}} items`); the value is
+  recorded in its own column. Tools render the final string from the column values.
