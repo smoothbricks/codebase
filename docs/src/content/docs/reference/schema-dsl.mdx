@@ -1,0 +1,55 @@
+---
+title: Schema DSL (S)
+description: Field types and feature-flag builders for defining schemas.
+sidebar:
+  order: 3
+---
+
+Import `S`, `defineLogSchema`, and `defineFeatureFlags` from `@smoothbricks/lmao`.
+
+## `defineLogSchema({ ... })`
+
+Declares the typed columns a span can write.
+
+```ts
+import { S, defineLogSchema } from '@smoothbricks/lmao';
+
+const appSchema = defineLogSchema({
+  userId: S.category(),
+  itemCount: S.number(),
+  method: S.enum(['GET', 'POST']),
+});
+```
+
+## Field types (`S`)
+
+| Builder | Type | Notes |
+|---|---|---|
+| `S.number()` | number | Numeric column. |
+| `S.boolean()` | boolean | True/false column. |
+| `S.enum([...])` | string (union) | Small, known set of values. |
+| `S.category()` | string | Repeating values; dictionary-encoded on conversion. |
+| `S.text()` | string | Mostly-unique values; stored as plain strings. |
+| `S.unknown()` | unknown | Arbitrary value stored as msgpack binary. |
+| `S.object<T>()` | T (object) | Typed object stored as msgpack binary. |
+
+For choosing between the string types, see [Choose a string type](/guides/choose-string-types/).
+
+## `defineFeatureFlags({ ... })`
+
+Declares typed feature flags. Each flag uses an `S` builder with `.default(value)` and an evaluation mode `.sync()` or
+`.async()`.
+
+```ts
+import { S, defineFeatureFlags } from '@smoothbricks/lmao';
+
+const flags = defineFeatureFlags({
+  advancedValidation: S.boolean().default(false).sync(),
+  maxRetries: S.number().default(3).sync(),
+  experiment: S.boolean().default(false).async(),
+});
+```
+
+The result exposes `.schema` (pass this to `defineOpContext({ flags })`), plus `.syncFlags` and `.asyncFlags` lists.
+The `.default(v).sync()` / `.async()` modifiers apply to **flags only**, not to log-schema fields. See
+[Feature flags](/guides/feature-flags/).

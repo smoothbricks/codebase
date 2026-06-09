@@ -1,0 +1,101 @@
+---
+title: Trace an HTTP request end-to-end
+description: Use scope, child spans, and Arrow conversion to trace a request through validation and data loading.
+sidebar:
+  order: 2
+---
+
+import { Steps } from '@astrojs/starlight/components';
+
+This tutorial traces a request handler that validates input and loads data, then converts the trace to an Apache Arrow
+table to inspect it. It uses scope to attach request-wide attributes once, and child spans for each step.
+
+<Steps>
+
+1. **Define a request schema.**
+
+   ```ts
+   import { S, defineLogSchema, defineOpContext } from '@smoothbricks/lmao';
+
+   const httpSchema = defineLogSchema({
+     requestId: S.category(),
+     userId: S.category(),
+     route: S.category(),
+     status: S.number(),
+   });
+
+   const opContext = defineOpContext({ logSchema: httpSchema });
+   const { defineOp } = opContext;
+   ```
+
+2. **Set request-wide attributes once with scope.**
+
+   `setScope` values apply to the whole span and are inherited by child spans, so you don't repeat `requestId` on every
+   log or tag.
+
+   ```ts
+   const handleRequest = defineOp('handle-request', async (ctx) => {
+     ctx.setScope({ requestId: 'req-1', userId: 'ada' });
+     ctx.tag.route('/cart').status(200);
+
+     const valid = await ctx.span('validate', async (v) => {
+       v.log.info('validating request');
+       return v.ok(true);
+     });
+
+     const data = await ctx.span('load-cart', async (d) => {
+       d.tag.status(200);
+       return d.ok({ items: 3 });
+     });
+
+     return ctx.ok({ valid: valid.value, items: data.value.items });
+   });
+   ```
+
+3. **Run it with a tracer.**
+
+   `TestTracer` keeps completed traces in memory so you can convert them. Like every tracer, it needs a buffer strategy
+   and `createTraceRoot`.
+
+   ```ts
+   import { JsBufferStrategy, TestTracer } from '@smoothbricks/lmao';
+   import { createTraceRoot } from '@smoothbricks/lmao/node';
+
+   const tracer = new TestTracer(opContext, {
+     bufferStrategy: new JsBufferStrategy(),
+     createTraceRoot,
+   });
+
+   await tracer.trace('handle-request', handleRequest);
+   ```
+
+4. **Convert the trace to an Arrow table.**
+
+   `convertSpanTreeToArrowTable` turns the root span (and its children) into a single Arrow table with shared
+   dictionaries. You can read its columns by name.
+
+   ```ts
+   import { convertSpanTreeToArrowTable } from '@smoothbricks/lmao';
+
+   const table = convertSpanTreeToArrowTable(tracer.rootBuffers[0]);
+   console.log(table.numRows); // rows across all spans in the trace
+   console.log(table.names); // column names, including your schema fields
+   ```
+
+</Steps>
+
+The tree you produced:
+
+```text
+handle-request
+├─ validate
+└─ load-cart
+```
+
+Each span contributes rows to the same Arrow table; `requestId` and `userId` (set via scope on the root) carry across
+the child spans.
+
+:::note
+For the conversion API on its own, see [Convert a trace to Arrow](/guides/convert-to-arrow/). To understand why scope is
+inherited and immutable, read [tag, scope, and log](/concepts/the-three-writers/).
+:::

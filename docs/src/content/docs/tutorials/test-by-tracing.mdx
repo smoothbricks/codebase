@@ -1,0 +1,101 @@
+---
+title: Test by tracing
+description: Run code that emits spans and assert on the resulting span tree with bun:test.
+sidebar:
+  order: 1
+---
+
+import { Steps } from '@astrojs/starlight/components';
+
+LMAO can intercept your test runner so each test runs inside a trace. You then assert on the **span tree** the code
+produced — what ran, in what order, and whether it succeeded — instead of only checking return values.
+
+This tutorial uses `bun:test`. A `vitest` setup is nearly identical; see the note at the end.
+
+<Steps>
+
+1. **Have an op context to trace.**
+
+   Export the `opContext` your code already uses (the value returned by `defineOpContext`).
+
+   ```ts
+   // src/op-context.ts
+   import { S, defineLogSchema, defineOpContext } from '@smoothbricks/lmao';
+
+   export const appSchema = defineLogSchema({
+     userId: S.category(),
+     itemCount: S.number(),
+   });
+
+   export const opContext = defineOpContext({ logSchema: appSchema });
+   ```
+
+2. **Write a preload that wires the harness.**
+
+   `initTraceTestRun` registers the trace test run; `mock.module` transparently intercepts `bun:test` so your tests
+   keep importing from `bun:test` as normal.
+
+   ```ts
+   // test-trace-setup.ts
+   import * as bunTest from 'bun:test';
+   import { mock } from 'bun:test';
+   import { createBunTestMock, initTraceTestRun } from '@smoothbricks/lmao/testing/bun';
+   import { opContext } from './src/op-context.js';
+
+   initTraceTestRun(opContext, { sqlite: { dbPath: '.trace-results.db' } });
+   mock.module('bun:test', () => createBunTestMock(bunTest));
+   ```
+
+   :::caution
+   `mock.module` must be called from the preload file itself — bun only intercepts imports when the mock is registered
+   from the preload's module context.
+   :::
+
+3. **Register the preload in `bunfig.toml`.**
+
+   ```toml
+   [test]
+   preload = ["./test-trace-setup.ts"]
+   ```
+
+4. **Write a test and assert on the span tree.**
+
+   Import `describe`/`it`/`expect` from `bun:test` as usual. `useTestSpan()` returns the current test's span context;
+   `querySpan` and `findSpan` let you inspect the tree.
+
+   ```ts
+   import { describe, expect, it } from 'bun:test';
+   import { useTestSpan } from '@smoothbricks/lmao/testing/bun';
+   import { findSpan, querySpan } from '@smoothbricks/lmao/testing';
+
+   describe('cart', () => {
+     it('validates then saves', async () => {
+       const ctx = useTestSpan();
+
+       await ctx.span('process-cart', async (cart) => {
+         await cart.span('validate', async (v) => v.ok(true));
+         await cart.span('save', async (s) => s.ok({ id: 'cart-1' }));
+         return cart.ok({ status: 'saved' });
+       });
+
+       const q = querySpan(ctx.buffer);
+       expect(q.names()).toContain('validate');
+       expect(findSpan(ctx.buffer, 'save')).toBeDefined();
+     });
+   });
+   ```
+
+5. **Inspect the persisted results (optional).**
+
+   With `sqlite` configured, the trace database is written after the run to the configured path. You can open it with
+   any SQLite tool, or query it programmatically with `TraceQuery` — see the
+   [Trace-testing reference](/reference/trace-testing/).
+
+</Steps>
+
+:::note
+**Using vitest?** Replace `mock.module(...)` with a `vi.mock('vitest', ...)` bridge using `createVitestMock`, import
+`useTestSpan` and `initTraceTestRun` from `@smoothbricks/lmao/testing/vitest`, and pass
+`createDatabase: createNodeSQLiteDatabase` (from `@smoothbricks/lmao/sqlite/node`) in the `sqlite` options. The query
+APIs from `@smoothbricks/lmao/testing` are the same.
+:::

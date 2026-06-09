@@ -1,0 +1,58 @@
+---
+title: Handle errors with Result
+description: Define typed error codes, return them from ops, and read failures.
+sidebar:
+  order: 3
+---
+
+Ops return a `Result` — a discriminated union of success and failure. You signal failure with `ctx.err(...)` and a
+typed error code, then read it back via the `success` flag.
+
+## Define a typed error code
+
+`defineCodeError` creates a code with a typed payload. Call it to construct an error value.
+
+```ts
+import { defineCodeError } from '@smoothbricks/lmao';
+
+const NOT_FOUND = defineCodeError('NOT_FOUND')<{ id: string }>();
+```
+
+## Return it from an op
+
+```ts
+const getUser = defineOp('get-user', async (ctx, id: string) => {
+  const user = await lookup(id);
+  if (!user) {
+    return ctx.err(NOT_FOUND({ id }));
+  }
+  return ctx.ok(user);
+});
+```
+
+You can attach span attributes or override the span name fluently on the result:
+
+```ts
+return ctx.err(NOT_FOUND({ id })).with({ userId: id }).message('user lookup failed');
+```
+
+## Read the result
+
+The result narrows on `success`: read `value` on success, `error` on failure. The error carries its `code` and your
+payload fields.
+
+```ts
+const result = await trace('get-user', getUser, 'ada');
+
+if (result.success) {
+  console.log(result.value); // the value passed to ctx.ok(...)
+} else {
+  console.log(result.error.code); // "NOT_FOUND"
+  console.log(result.error.id); // payload field
+}
+```
+
+:::note
+For failures that should be **retried** (a temporarily unavailable dependency), use a transient error instead — see
+[Retry transient failures](/guides/retry-transient-failures/).
+:::

@@ -1,0 +1,47 @@
+---
+title: Architecture overview
+description: The layers between your operation and a queryable Arrow table.
+sidebar:
+  order: 1
+---
+
+LMAO is built in layers. Your code touches the top; each layer below it handles a more primitive concern, ending in an
+Apache Arrow table.
+
+```text
+your op  ──►  @smoothbricks/lmao        (spans, schema, tracers, results)
+                   │
+                   ▼
+              arrow-builder             (columnar buffers, typed arrays, codegen)
+                   │
+                   ▼
+              flechette  ──►  Apache Arrow Table  ──►  SQLite / Arrow / queue
+```
+
+## The library layer
+
+This is the API you use: `defineOpContext`/`defineOp`, the span context (`tag`, `log`, `span`, `ff`, `deps`, `scope`,
+`ok`, `err`), schemas, results, and tracers. It turns your typed operations into spans recorded in columnar buffers.
+
+## The columnar buffer layer
+
+Underneath, a lower-level layer manages the actual memory: cache-aligned typed arrays, null bitmaps, and the code
+generation that makes writes fast. It has no notion of tracing — it just stores columns efficiently.
+
+## Buffer strategies
+
+How buffers are allocated is pluggable, behind a buffer-strategy abstraction. The shipped, public strategy is
+`JsBufferStrategy`, which you pass to every tracer. (An experimental WebAssembly-backed strategy exists in the codebase
+but is not part of the public API surface, so it is not documented here.)
+
+## Conversion and sinks
+
+When a trace completes (or a flush is triggered), the buffers are converted to a single Arrow table with shared
+dictionaries via `convertSpanTreeToArrowTable`. From there a tracer can print it, keep it in memory, or write it to a
+sink such as SQLite. Tracers decide what happens to a completed trace; see [Tracers](/reference/tracers/).
+
+## Where the cost goes
+
+Recording happens on the **hot path** (direct column writes). Encoding strings, building dictionaries, and producing
+the Arrow table happen on the **cold path**, at conversion time. That split is the heart of the design — see
+[Why columnar tracing](/concepts/columnar-tracing/).

@@ -1,0 +1,50 @@
+---
+title: Persist traces to SQLite
+description: Write traces to a SQLite database with SQLiteTracer.
+sidebar:
+  order: 6
+---
+
+`SQLiteTracer` writes completed traces to a SQLite database instead of (or alongside) printing them. On Node, create
+the database with `createNodeSQLiteDatabase`.
+
+## Write traces to a file
+
+```ts
+import { JsBufferStrategy, SQLiteTracer } from '@smoothbricks/lmao';
+import { createTraceRoot } from '@smoothbricks/lmao/node';
+import { createNodeSQLiteDatabase } from '@smoothbricks/lmao/sqlite/node';
+
+const db = createNodeSQLiteDatabase('traces.db');
+
+const { trace } = new SQLiteTracer(opContext, {
+  bufferStrategy: new JsBufferStrategy(),
+  createTraceRoot,
+  db,
+});
+
+await trace('greet', greet); // span rows are written to traces.db
+```
+
+The tracer options are the same as any tracer (`bufferStrategy`, `createTraceRoot`) plus a `db`.
+
+## Query the results
+
+You can open `traces.db` with any SQLite tool, or read it programmatically with `TraceQuery` from
+`@smoothbricks/lmao/testing`:
+
+```ts
+import { TraceQuery } from '@smoothbricks/lmao/testing';
+
+const query = new TraceQuery(db);
+query.failures(); // failed spans in the latest trace
+query.slowest(undefined, 10); // 10 slowest spans
+query.close();
+```
+
+See the [Trace-testing reference](/reference/trace-testing/) for the full `TraceQuery` API.
+
+:::note
+On Cloudflare D1 (async), use `SQLiteAsyncTracer` with `createD1SQLiteDatabase` instead — see
+[Cloudflare Workers + D1](/guides/cloudflare-workers-d1/).
+:::

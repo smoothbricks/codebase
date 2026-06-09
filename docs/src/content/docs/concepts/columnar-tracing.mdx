@@ -1,0 +1,35 @@
+---
+title: Why columnar tracing
+description: The hot-path / cold-path split that lets tracing be both cheap and queryable.
+sidebar:
+  order: 2
+---
+
+LMAO's central idea is to separate the cost of **recording** a span from the cost of **producing queryable output**.
+
+## Two paths
+
+- **Hot path — recording.** When your op calls `ctx.tag.itemCount(3)`, the value is written directly into a typed
+  column (here, a numeric array slot). There's no string formatting and minimal allocation. This is the path that runs
+  on every operation, so it's kept cheap.
+- **Cold path — conversion.** Turning those columns into an Apache Arrow table is where the heavier work happens:
+  encoding strings to UTF-8, building dictionaries for repeated values, assembling the final typed arrays. This runs
+  when you flush or convert — not on every operation.
+
+## Why columns instead of strings
+
+A formatted log line throws away structure: `user ada bought 3 items` is just text. To analyze it you must parse it
+back apart.
+
+In a columnar model, `userId` and `itemCount` are separate typed columns from the start. Recording is a typed write,
+and the output is directly analyzable — you can read a whole column at once without re-parsing. Repeated string values
+(like a `userId` that appears on many spans) are stored compactly via dictionary encoding when the table is built.
+
+## What this buys you
+
+- Cheap instrumentation you can leave on in hot code paths.
+- Output that's structured by construction — an Arrow table, not a pile of strings.
+- A natural place (the cold path) to do the expensive-but-occasional work of encoding and dictionary building.
+
+For where this sits in the stack, see [Architecture overview](/concepts/architecture/). For how the three string
+types affect encoding, see [Schema & string encoding](/concepts/schema-and-encoding/).

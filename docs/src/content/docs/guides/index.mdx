@@ -1,0 +1,40 @@
+---
+title: How-to guides
+description: Task-oriented recipes for common LMAO jobs.
+sidebar:
+  order: 0
+---
+
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+Short, goal-directed recipes. Each assumes you've done the [Quickstart](/start-here/quickstart/).
+
+## Schema & tagging
+
+<CardGrid>
+  <LinkCard title="Choose a string type" href="/guides/choose-string-types/" description="enum vs category vs text." />
+  <LinkCard title="tag vs scope vs log" href="/guides/tag-vs-scope-vs-log/" description="Pick the right recorder for the job." />
+</CardGrid>
+
+## Errors & resilience
+
+<CardGrid>
+  <LinkCard title="Handle errors with Result" href="/guides/handle-errors/" description="Typed error codes and reading failures." />
+  <LinkCard title="Retry transient failures" href="/guides/retry-transient-failures/" description="Transient errors and backoff policies." />
+</CardGrid>
+
+## Flags, persistence & export
+
+<CardGrid>
+  <LinkCard title="Feature flags" href="/guides/feature-flags/" description="Define, evaluate, and track flags." />
+  <LinkCard title="Persist traces to SQLite" href="/guides/persist-to-sqlite/" description="Write traces to a SQLite database." />
+  <LinkCard title="Convert a trace to Arrow" href="/guides/convert-to-arrow/" description="Turn a span tree into an Arrow table." />
+</CardGrid>
+
+## Composition, deployment & testing
+
+<CardGrid>
+  <LinkCard title="Compose library traces" href="/guides/compose-library-traces/" description="Nest a library's spans into your app trace." />
+  <LinkCard title="Cloudflare Workers + D1" href="/guides/cloudflare-workers-d1/" description="Trace on the edge and flush to D1." />
+  <LinkCard title="Set up trace-testing" href="/guides/set-up-trace-testing/" description="Add trace-testing to a new package." />
+</CardGrid>
