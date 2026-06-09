@@ -1,0 +1,79 @@
+---
+title: defineOpContext / defineOp
+description: Define an op context from a schema, then define operations against it.
+sidebar:
+  order: 1
+---
+
+Import from `@smoothbricks/lmao`.
+
+## `defineOpContext(config)`
+
+Creates an op-context factory from a schema (plus optional flags, dependencies, and user context).
+
+```ts
+const opContext = defineOpContext({
+  logSchema: appSchema, // required: a defineLogSchema(...) result
+  flags: myFlags.schema, // optional: a defineFeatureFlags(...).schema
+  deps: { auth: authOps.prefix('auth') }, // optional: prefixed/mapped op groups
+  ctx: {
+    // optional: user context properties, declared up front
+    requestId: undefined as string | undefined,
+    env: undefined as Env | undefined,
+  },
+});
+```
+
+### Config fields
+
+| Field | Required | Purpose |
+|---|---|---|
+| `logSchema` | yes | The span column schema, from `defineLogSchema`. |
+| `flags` | no | Feature-flag schema, from `defineFeatureFlags(...).schema`. |
+| `deps` | no | Dependency op groups, each `prefix(...)`-ed or `mapColumns(...)`-ed. |
+| `ctx` | no | User context properties available on every span as `ctx.<name>`. |
+
+:::caution
+User-context property names may not collide with built-in span-context members, and may not start with `_` (reserved
+for internal use). Declare each property's type with the `undefined as T | undefined` (or `null as T`) pattern.
+:::
+
+### Returns
+
+```ts
+const { defineOp, defineOps, opGroup, opContext } = defineOpContext({ logSchema: appSchema });
+```
+
+- `defineOp(name, fn)` — define a single op.
+- `defineOps({ ... })` — define several ops at once; returns an op group.
+- `opGroup` / `opContext` — the op group and bundled type information (used for composition and typing).
+
+The factory value itself is what you pass to a tracer constructor.
+
+## `defineOp(name, fn)`
+
+Defines a single operation. `fn` receives a [`SpanContext`](/reference/span-context/) plus any extra arguments, and
+returns `ctx.ok(...)` or `ctx.err(...)`.
+
+```ts
+const getUser = defineOp('get-user', async (ctx, id: string) => {
+  ctx.tag.userId(id);
+  return ctx.ok({ id });
+});
+```
+
+The returned op is an object with:
+
+- `fn` — the underlying function.
+- `metadata` — op metadata (such as `package_name`).
+
+## `defineOps({ ... })`
+
+Defines multiple ops in one call and returns an **op group**. Op groups expose `prefix(p)` and `mapColumns(mapping)`
+for [composition](/guides/compose-library-traces/).
+
+```ts
+const authOps = opContext.defineOps({
+  checkAuth: async (ctx) => ctx.ok({ ok: true }),
+});
+```
