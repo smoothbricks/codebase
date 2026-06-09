@@ -1,0 +1,32 @@
+---
+title: Package exports
+description: What each @smoothbricks/lmao import subpath provides.
+sidebar:
+  order: 8
+---
+
+`@smoothbricks/lmao` exposes several entry points. Import the core API from the root and platform/optional pieces from
+their subpaths.
+
+| Import | Provides |
+|---|---|
+| `@smoothbricks/lmao` | Core API: `defineOpContext`, `defineLogSchema`, `defineFeatureFlags`, `S`, `JsBufferStrategy`, all tracers (`StdioTracer`, `TestTracer`, `ArrayQueueTracer`, `CompositeTracer`, `SQLiteTracer`, `SQLiteAsyncTracer`, `NoOpTracer`), `convertSpanTreeToArrowTable` / `convertToArrowTable`, `FlushScheduler`, results (`Ok`/`Err`/`defineCodeError`), `Transient`, `Blocked`, backoff helpers, `InMemoryFlagEvaluator`, entry-type constants. |
+| `@smoothbricks/lmao/node` | `createTraceRoot` using `process.hrtime.bigint()` (Node). |
+| `@smoothbricks/lmao/es` | `createTraceRoot` using `performance.now()` (browser, Deno, Workers). |
+| `@smoothbricks/lmao/sqlite` | `SQLiteTracer`, `SQLiteAsyncTracer`, and `createD1SQLiteDatabase`. |
+| `@smoothbricks/lmao/sqlite/node` | `createNodeSQLiteDatabase` (and an async variant) for Node SQLite. |
+| `@smoothbricks/lmao/errors` | Error utilities; also as focused subpaths below. |
+| `@smoothbricks/lmao/errors/Transient` | `Transient`. |
+| `@smoothbricks/lmao/errors/Blocked` | `Blocked`. |
+| `@smoothbricks/lmao/errors/CodeError` | Code-error construction. |
+| `@smoothbricks/lmao/errors/retry-policy` | `linearBackoff`, `exponentialBackoff`, `fixedDelay`. |
+| `@smoothbricks/lmao/errors/RetriesExhausted` | `RetriesExhausted`. |
+| `@smoothbricks/lmao/testing` | Span query API: `querySpan`, `findSpan`, `findAllSpans`, `extractFacts`, `spanNames`, `TraceQuery`. |
+| `@smoothbricks/lmao/testing/bun` | Bun harness: `initTraceTestRun`, `createBunTestMock`, `useTestSpan`. |
+| `@smoothbricks/lmao/testing/vitest` | Vitest harness: `initTraceTestRun`, `createVitestMock`, `useTestSpan`. |
+| `@smoothbricks/lmao/bun/preload` | Bun preload hook (registers validation codegen). |
+
+:::note
+The common, everyday symbols all live at the root. You typically import only one platform subpath (`/node` **or**
+`/es`) plus the root, and add `/sqlite*` or `/testing*` when you use those features.
+:::
