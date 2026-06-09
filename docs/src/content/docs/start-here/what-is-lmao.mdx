@@ -1,0 +1,69 @@
+---
+title: What is LMAO?
+description: A structured tracing library for TypeScript that records spans into columnar Apache Arrow buffers.
+sidebar:
+  order: 1
+---
+
+LMAO is a structured tracing and observability library for TypeScript. Your code records **spans** — units of work
+with typed attributes, timing, and a parent/child tree — and LMAO stores them in columnar
+[Apache Arrow](https://arrow.apache.org/) buffers that you can convert to a table and query.
+
+## The problem
+
+Plain logging forces a trade-off:
+
+- **String logs are cheap to write but hard to query.** A formatted line like `user ada did checkout` flattens
+  structure into text. Analyzing it later means parsing strings back apart.
+- **Rich structured telemetry is queryable but often expensive.** Building objects and serializing them on every
+  operation adds allocation and CPU cost to the path you most want to keep fast.
+
+LMAO splits the work in two so you don't have to choose:
+
+- A **hot path** that records attributes as direct writes into typed columns — no string formatting, minimal
+  allocation.
+- A **cold path** that turns those columns into an Arrow table (encoding strings, building dictionaries) only when
+  you flush.
+
+## Columnar tracing
+
+A traditional log row is a string. In LMAO, each attribute you record is a **typed column**: `userId` is one column,
+`itemCount` is another, the span's status is another. A span writes values into those columns; later, the columns
+become an Arrow table where each field is a contiguous typed array.
+
+This is what makes the hot path cheap (writing a number into a `Float64Array` slot is fast) and the output rich (an
+Arrow table is directly analyzable, column by column).
+
+Here is the smallest possible piece of LMAO — a schema and an operation:
+
+```ts
+import { S, defineLogSchema, defineOpContext } from '@smoothbricks/lmao';
+
+// Each field is a typed column.
+const appSchema = defineLogSchema({
+  userId: S.category(), // string that repeats across spans
+  itemCount: S.number(), // numeric column
+});
+
+const { defineOp } = defineOpContext({ logSchema: appSchema });
+
+// An "op" is a reusable, traceable operation.
+const getCart = defineOp('get-cart', async (ctx) => {
+  ctx.tag.userId('ada').itemCount(3); // write typed attributes
+  return ctx.ok({ items: 3 }); // complete successfully
+});
+```
+
+That op doesn't run on its own — you execute it with a **tracer**, which is covered in the
+[Quickstart](/start-here/quickstart/).
+
+:::note
+Beyond instrumenting production code, LMAO supports **test-by-tracing**: run code that emits spans and assert on the
+span tree itself. See [Test by tracing](/tutorials/test-by-tracing/).
+:::
+
+## Next
+
+- [Installation](/start-here/installation/)
+- [Quickstart: your first trace](/start-here/quickstart/)
+- [Core concepts in 5 minutes](/start-here/core-concepts/)

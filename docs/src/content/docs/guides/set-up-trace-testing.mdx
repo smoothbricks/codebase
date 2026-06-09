@@ -1,0 +1,52 @@
+---
+title: Set up trace-testing in a new package
+description: A checklist for adding LMAO trace-testing to a package.
+sidebar:
+  order: 10
+---
+
+import { Steps } from '@astrojs/starlight/components';
+
+This is the procedural checklist for wiring trace-testing into a package. For the full walkthrough with assertions, see
+[Test by tracing](/tutorials/test-by-tracing/).
+
+<Steps>
+
+1. **Export your op context.** Make the value returned by `defineOpContext` importable from your source (e.g.
+   `src/op-context.ts`).
+
+2. **Create a preload file** (e.g. `test-trace-setup.ts`) that calls `initTraceTestRun` and registers the test-runner
+   mock from the preload's own module context.
+
+   ```ts
+   import * as bunTest from 'bun:test';
+   import { mock } from 'bun:test';
+   import { createBunTestMock, initTraceTestRun } from '@smoothbricks/lmao/testing/bun';
+   import { opContext } from './src/op-context.js';
+
+   initTraceTestRun(opContext, { sqlite: { dbPath: '.trace-results.db' } });
+   mock.module('bun:test', () => createBunTestMock(bunTest));
+   ```
+
+3. **Register the preload** in `bunfig.toml`:
+
+   ```toml
+   [test]
+   preload = ["./test-trace-setup.ts"]
+   ```
+
+4. **Ignore the results database.** Add the configured path to `.gitignore`:
+
+   ```text
+   .trace-results.db
+   ```
+
+5. **Write tests as usual.** Import `describe`/`it`/`expect` from `bun:test`; use `useTestSpan()` and the query helpers
+   to assert on the span tree.
+
+</Steps>
+
+:::note
+On **vitest**, swap the preload for a `vi.mock('vitest', ...)` bridge using `createVitestMock`, import from
+`@smoothbricks/lmao/testing/vitest`, and pass `createDatabase: createNodeSQLiteDatabase` in the `sqlite` options.
+:::

@@ -1,0 +1,73 @@
+---
+title: Retry transient failures
+description: Use transient errors and backoff policies to retry child spans automatically.
+sidebar:
+  order: 4
+---
+
+Some failures are worth retrying — a dependency that's briefly unavailable, a rate-limited call. LMAO models these as
+**transient errors** with an attached **retry policy**. When a child span (`ctx.span(...)`) returns a transient error,
+it is retried automatically per the policy, and the attempts are recorded as `span-retry` entries.
+
+## Define a transient error with a policy
+
+`Transient` takes a code and a default retry policy. The backoff helpers build policies:
+
+```ts
+import { Transient, exponentialBackoff } from '@smoothbricks/lmao';
+
+const SERVICE_UNAVAILABLE = Transient<{ status: number }>(
+  'SERVICE_UNAVAILABLE',
+  exponentialBackoff(3), // up to 3 attempts
+);
+```
+
+Backoff helpers:
+
+| Helper | Signature |
+|---|---|
+| `linearBackoff` | `linearBackoff(maxAttempts, baseDelayMs = 100)` |
+| `exponentialBackoff` | `exponentialBackoff(maxAttempts, baseDelayMs = 100)` |
+| `fixedDelay` | `fixedDelay(maxAttempts, delayMs = 1000)` |
+
+## Return it from a child span
+
+Return the transient error (don't throw it). When invoked as a child span, LMAO applies the policy.
+
+```ts
+const callService = defineOp('call-service', async (ctx) => {
+  const res = await fetch('https://api.example.com/cart');
+  if (res.status === 503) {
+    return ctx.err(SERVICE_UNAVAILABLE({ status: 503 }));
+  }
+  return ctx.ok(await res.json());
+});
+
+const handle = defineOp('handle', async (ctx) => {
+  // Retried automatically on a transient error, per the policy.
+  const result = await ctx.span('call-service', callService);
+  return result;
+});
+```
+
+You can override the policy for a single error value:
+
+```ts
+return ctx.err(SERVICE_UNAVAILABLE({ status: 503 }, { maxAttempts: 5 }));
+```
+
+## Failures that should not retry
+
+Use `Blocked` for a temporary condition you don't want retried (a circuit open, a target that has shut down). It is
+returned the same way but stops immediately.
+
+```ts
+import { Blocked } from '@smoothbricks/lmao';
+
+return ctx.err(Blocked.service('payment-api'));
+```
+
+:::note
+Retry applies to **child spans** (`ctx.span(...)`), not to the root `trace(...)` call. For non-retryable, typed
+failures, see [Handle errors with Result](/guides/handle-errors/).
+:::

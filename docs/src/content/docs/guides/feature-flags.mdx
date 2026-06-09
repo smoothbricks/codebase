@@ -1,0 +1,96 @@
+---
+title: Feature flags
+description: Define typed feature flags, evaluate them in ops, and track usage.
+sidebar:
+  order: 5
+---
+
+LMAO has typed feature flags that integrate with tracing: flag access and usage are recorded on the span.
+
+## Define flags
+
+Use `defineFeatureFlags` with `S` builders. Each flag has a default and an evaluation mode — `.sync()` or `.async()`.
+
+```ts
+import { S, defineFeatureFlags } from '@smoothbricks/lmao';
+
+const flags = defineFeatureFlags({
+  advancedValidation: S.boolean().default(false).sync(),
+  maxRetries: S.number().default(3).sync(),
+  experiment: S.boolean().default(false).async(),
+});
+```
+
+## Wire flags into the op context and tracer
+
+Pass the flag schema via `flags.schema`. Provide values through an evaluator — `InMemoryFlagEvaluator` is built in (in
+production, back it with your own source). The evaluator is passed to the tracer.
+
+```ts
+import {
+  S,
+  defineLogSchema,
+  defineOpContext,
+  InMemoryFlagEvaluator,
+  JsBufferStrategy,
+  StdioTracer,
+} from '@smoothbricks/lmao';
+import { createTraceRoot } from '@smoothbricks/lmao/node';
+
+const opContext = defineOpContext({
+  logSchema: defineLogSchema({ userId: S.category() }),
+  flags: flags.schema,
+});
+
+const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, {
+  advancedValidation: true,
+  maxRetries: 5,
+});
+
+const { trace } = new StdioTracer(opContext, {
+  bufferStrategy: new JsBufferStrategy(),
+  createTraceRoot,
+  flagEvaluator,
+});
+```
+
+## Evaluate flags in an op
+
+Sync flags are accessed as properties; async flags use `get()`. A flag is a wrapper when enabled and `undefined` when
+not, so a plain truthy check works.
+
+```ts
+const { defineOp } = opContext;
+
+const handle = defineOp('handle', async (ctx) => {
+  // Sync flag: property access, truthy when enabled.
+  if (ctx.ff.advancedValidation) {
+    ctx.log.info('advanced validation on');
+  }
+
+  const retries = ctx.ff.maxRetries;
+  if (retries) {
+    console.log(retries.value); // 5
+  }
+
+  // Async flag.
+  const experiment = await ctx.ff.get('experiment');
+  if (experiment) {
+    // ...
+  }
+
+  return ctx.ok(null);
+});
+```
+
+## Track usage
+
+Calling `.track()` records that the flag influenced a code path (an `ff-usage` entry) and returns a fluent entry you can
+tag.
+
+```ts
+const flag = ctx.ff.advancedValidation;
+if (flag) {
+  flag.track().userId('ada');
+}
+```

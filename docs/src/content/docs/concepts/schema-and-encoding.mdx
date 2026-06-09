@@ -1,0 +1,35 @@
+---
+title: Schema & string encoding
+description: Why LMAO has three string field types and how they encode.
+sidebar:
+  order: 6
+---
+
+A schema declares your span columns and their types. Numbers and booleans are straightforward. Strings have three
+types because string storage benefits from knowing a field's **cardinality**.
+
+## The three string types
+
+- **`S.enum([...])`** — a small, fixed set of values you know at author time (HTTP methods, statuses). The value can be
+  stored as a compact index into the known set.
+- **`S.category()`** — values that repeat but aren't known ahead of time (`userId`, `region`). These are
+  **dictionary-encoded** when the trace is converted to Arrow: each distinct string is stored once, and rows reference
+  it. Repetition becomes cheap.
+- **`S.text()`** — values that are essentially unique (a SQL query, a free-form message). A dictionary wouldn't pay
+  off, so these are stored as plain strings.
+
+At the call site all three look the same — you pass and read a string. The type only changes how the column is stored.
+
+## Why this matters
+
+Recording is on the hot path; the expensive string work (encoding, dictionary building) is deferred to conversion. The
+field type tells the converter how to encode efficiently: index for enums, dictionary for repeating categories, plain
+strings for unique text. Choosing well keeps the output compact without changing your code.
+
+## Templated log messages
+
+Log messages are templates, not interpolated strings. `ctx.log.info('processing {{itemCount}} items')` stores the
+template as-is and records the value in its own column. Because the template repeats across many events, it
+dictionary-encodes well — and a viewer renders the final text from the columns.
+
+For the practical decision, see [Choose a string type](/guides/choose-string-types/).

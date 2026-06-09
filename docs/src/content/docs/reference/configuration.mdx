@@ -1,0 +1,60 @@
+---
+title: Configuration
+description: Tracer options, the flush scheduler, and test-harness configuration.
+sidebar:
+  order: 9
+---
+
+## Tracer options
+
+Every tracer takes the same base options (see [Tracers](/reference/tracers/)):
+
+| Option | Required | Default |
+|---|---|---|
+| `bufferStrategy` | yes | — (use `new JsBufferStrategy()`) |
+| `createTraceRoot` | yes | — (from `/node` or `/es`) |
+| `flagEvaluator` | no | none |
+
+`StdioTracer` adds:
+
+| Option | Default |
+|---|---|
+| `out` | `process.stdout` |
+| `err` | `process.stderr` |
+| `colorEnabled` | `true` |
+
+`SQLiteTracer` / `SQLiteAsyncTracer` add a required `db`; `CompositeTracer` adds `delegates`.
+
+## FlushScheduler
+
+`FlushScheduler` decides when accumulated buffers are flushed to a handler.
+
+```ts
+import { FlushScheduler } from '@smoothbricks/lmao';
+
+const scheduler = new FlushScheduler(
+  (table, meta) => {
+    /* handle the Arrow table; meta.flushReason explains why */
+  },
+  { maxFlushInterval: 5000, capacityThreshold: 0.9 },
+);
+
+scheduler.register(buffer);
+scheduler.start();
+await scheduler.flush(); // manual flush
+scheduler.stop();
+```
+
+Common config fields: `maxFlushInterval`, `minFlushInterval`, `capacityThreshold` (0–1), `idleDetection`,
+`idleTimeout`, `memoryPressureDetection`, `memoryPressureThreshold`. The handler receives the Arrow table and metadata
+whose `flushReason` is one of `capacity`, `time`, `memory`, `idle`, or `manual`.
+
+## Test-harness options
+
+`initTraceTestRun(opContext, options)` accepts:
+
+- `sqlite` — write results to a database. On Node/bun, `{ dbPath: '.trace-results.db' }`; on vitest, also pass
+  `createDatabase: createNodeSQLiteDatabase`.
+- `verbose` — extra logging.
+
+See [Set up trace-testing](/guides/set-up-trace-testing/).

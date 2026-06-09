@@ -1,0 +1,47 @@
+---
+title: Cloudflare Workers + D1
+description: Trace on the edge and flush traces to a D1 database without blocking the response.
+sidebar:
+  order: 9
+---
+
+On Cloudflare Workers, use the browser/edge entry point (`@smoothbricks/lmao/es`) for timestamps and the async SQLite
+sink backed by **D1**. Because D1 writes are async, flush in the background with the Worker's `ctx.waitUntil` so tracing
+doesn't delay the response.
+
+## Set up the tracer per request
+
+```ts
+import { JsBufferStrategy, SQLiteAsyncTracer } from '@smoothbricks/lmao';
+import { createTraceRoot } from '@smoothbricks/lmao/es';
+import { createD1SQLiteDatabase } from '@smoothbricks/lmao/sqlite';
+
+export default {
+  async fetch(request: Request, env: { DB: D1Database }, ctx: ExecutionContext) {
+    const db = createD1SQLiteDatabase(env.DB);
+
+    const tracer = new SQLiteAsyncTracer(opContext, {
+      bufferStrategy: new JsBufferStrategy(),
+      createTraceRoot,
+      db,
+    });
+    const { trace } = tracer;
+
+    const result = await trace('handle-request', handleRequest);
+
+    // Flush in the background — D1 writes complete after the response is sent.
+    ctx.waitUntil(tracer.flush());
+
+    return Response.json({ ok: result.success });
+  },
+};
+```
+
+- `env.DB` is your D1 binding (configured in `wrangler.toml`).
+- `createTraceRoot` comes from `@smoothbricks/lmao/es`, which uses `performance.now()`.
+- `ctx.waitUntil` is the standard Workers API for background work; `tracer.flush()` awaits the pending D1 writes.
+
+:::note
+For local Node persistence instead, use `SQLiteTracer` with `createNodeSQLiteDatabase` — see
+[Persist traces to SQLite](/guides/persist-to-sqlite/).
+:::

@@ -1,0 +1,41 @@
+---
+title: The span model
+description: Op vs span, and how a span is laid out internally.
+sidebar:
+  order: 3
+---
+
+## Op vs span
+
+- An **op** is a *definition*. You create it once with `defineOp(name, fn)`. It describes work and binds to a schema,
+  but it doesn't run by itself.
+- A **span** is an *execution*. Running an op (via `trace(...)` at the root, or `ctx.span(...)` for a child) produces a
+  span: a unit of work with its own timing, its own attributes, and a position in the trace tree.
+
+One op can produce many spans — every time it runs, it makes another span.
+
+## The trace tree
+
+The root `trace(...)` call opens the root span. Each `ctx.span(...)` inside it opens a child. The result is a tree:
+
+```text
+handle-request          ← root span
+├─ validate             ← child span
+└─ load-cart            ← child span
+   └─ db-query          ← grandchild span
+```
+
+## How a span is laid out
+
+Each span records into a small set of rows in its buffer, in a fixed shape:
+
+- **Start.** When the span begins, a start row holds the span's name and the attributes you set with `ctx.tag`.
+- **Completion.** When the span ends, a completion row records the outcome — success (`ctx.ok`), a returned error
+  (`ctx.err`), or an exception if something threw.
+- **Events.** In between, each `ctx.log.*` call appends an event row.
+
+Because start and completion are recorded with timestamps, a span's duration falls out naturally as the difference
+between them. You don't manage this layout directly — `tag`, `log`, and `ok`/`err` write the right rows for you. The
+detail matters mainly when reading raw output; see [entry types](/reference/entry-types/).
+
+For the three recorders, see [tag, scope, and log](/concepts/the-three-writers/).
