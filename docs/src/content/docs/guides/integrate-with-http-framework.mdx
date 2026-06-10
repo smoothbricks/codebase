@@ -1,0 +1,52 @@
+---
+title: Integrate with an HTTP framework
+description: Trace a request once at the boundary and attach request-wide context with scope.
+sidebar:
+  order: 18
+---
+
+The idiomatic pattern for a web framework (Express, Fastify, Hono, …) is to open **one trace per request** at the
+handler boundary, set request-wide attributes once with `setScope`, and use child spans for the steps inside.
+
+## One trace per request
+
+Pass request-scoped values through `trace`'s overrides, then `setScope` them so every child span inherits them without
+repetition.
+
+```ts
+const handleRequest = defineOp('handle-request', async (ctx) => {
+  // Inherited by every child span below.
+  ctx.setScope({ requestId: ctx.requestId });
+  ctx.tag.route('/cart').status(200);
+
+  const data = await ctx.span('load-cart', loadCart);
+  return ctx.ok(data.value);
+});
+```
+
+```ts
+// Express-style handler
+app.get('/cart', async (req, res) => {
+  const result = await trace(
+    'GET /cart',
+    { requestId: req.headers['x-request-id'] }, // userCtx overrides
+    handleRequest,
+  );
+
+  res.status(result.success ? 200 : 500).json(result.success ? result.value : { error: true });
+});
+```
+
+Here `requestId` is a user-context property declared in `defineOpContext({ ctx: { requestId: undefined as string | undefined } })`,
+so it's available as `ctx.requestId` and can be promoted into scope.
+
+## Why scope, not repeated tags
+
+Setting `requestId` once via `setScope` means each child span (`load-cart`, and anything it opens) carries it
+automatically. You avoid threading the value through every function. See
+[tag vs scope vs log](/guides/tag-vs-scope-vs-log/).
+
+:::note
+To emit the resulting traces to a database or queue, swap `StdioTracer` for `SQLiteTracer` or `ArrayQueueTracer` — see
+[Persist traces to SQLite](/guides/persist-to-sqlite/) and [Batch and send traces](/guides/batch-and-send-traces/).
+:::

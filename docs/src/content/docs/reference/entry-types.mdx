@@ -20,7 +20,19 @@ reading raw trace output.
 | Op metrics | `op-invocations`, `op-errors`, `op-exceptions`, `op-duration-total`, `op-duration-ok`, `op-duration-err`, `op-duration-min`, `op-duration-max` |
 | Buffer metrics | `buffer-writes`, `buffer-spans`, `buffer-capacity` |
 
-The matching numeric constants are exported as `ENTRY_TYPE_*` (e.g. `ENTRY_TYPE_SPAN_OK`, `ENTRY_TYPE_INFO`).
+The matching numeric constants are exported as `ENTRY_TYPE_*` (e.g. `ENTRY_TYPE_SPAN_OK`, `ENTRY_TYPE_INFO`). The
+lifecycle and log values are:
+
+| Constant | Value | Constant | Value |
+|---|---|---|---|
+| `ENTRY_TYPE_SPAN_START` | 1 | `ENTRY_TYPE_TRACE` | 6 |
+| `ENTRY_TYPE_SPAN_OK` | 2 | `ENTRY_TYPE_DEBUG` | 7 |
+| `ENTRY_TYPE_SPAN_ERR` | 3 | `ENTRY_TYPE_INFO` | 8 |
+| `ENTRY_TYPE_SPAN_EXCEPTION` | 4 | `ENTRY_TYPE_WARN` | 9 |
+| `ENTRY_TYPE_SPAN_RETRY` | 5 | `ENTRY_TYPE_ERROR` | 10 |
+
+Feature-flag, period, op-metric, and buffer-metric constants continue from 11 upward. Compare against these constants
+when filtering rows (see [Measure op performance](/guides/measure-op-performance/)).
 
 ## Reserved system columns
 

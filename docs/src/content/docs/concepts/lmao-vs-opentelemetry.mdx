@@ -1,0 +1,37 @@
+---
+title: LMAO vs OpenTelemetry
+description: How LMAO's design choices differ from a conventional tracing stack.
+sidebar:
+  order: 9
+---
+
+LMAO and OpenTelemetry (OTel) both produce traces of spans, but they make different design choices. This page is for
+deciding when LMAO's approach fits — it is not a migration guide, and LMAO is not a drop-in OTel replacement.
+
+## Where they differ
+
+| Aspect | LMAO | Typical OTel |
+|---|---|---|
+| Span identity | Thread-local counter + one random `thread_id` per worker | Random id per span |
+| Output format | Columnar Apache Arrow | OTLP (protobuf) |
+| Buffer control | Explicit (`bufferStrategy`), self-tuning capacity | Managed by the SDK |
+| Correlation id | W3C-format `trace_id` | W3C trace context |
+| Ecosystem | TypeScript, focused | Many languages, large |
+
+## What the choices buy
+
+- **Cheap identity.** Generating a fresh random id per span has a cost on the hot path. LMAO pays it once per worker
+  (the random `thread_id`) and uses a counter per span; the `(thread_id, span_id)` pair stays collision-resistant. See
+  [Span identity](/concepts/span-identity/).
+- **Analytics-native output.** Arrow tables are columnar and directly queryable, which suits exporting to columnar
+  stores and analytical engines without a translation step.
+- **Predictable buffers.** You choose the buffer strategy and the sink, and capacity tunes itself to the workload.
+
+## What you give up
+
+- The breadth of OTel's ecosystem — instrumentation libraries, collectors, and multi-language support.
+- Drop-in interoperability with OTel-based backends (though the W3C `trace_id` keeps cross-system correlation possible).
+
+LMAO is a good fit for performance-sensitive TypeScript services that want structured, Arrow-native traces and are
+comfortable owning their export path. If you need a broad, standardized, multi-language observability ecosystem, OTel
+remains the better choice.
