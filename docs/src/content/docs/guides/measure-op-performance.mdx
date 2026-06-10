@@ -1,0 +1,49 @@
+---
+title: Measure op performance
+description: Read op and buffer metrics from the trace output.
+sidebar:
+  order: 17
+---
+
+LMAO records performance metrics as ordinary rows in the same trace table, classified by their **entry type**. There's
+no separate metrics pipeline — when metrics are emitted, they sit alongside your spans, so you analyze them with the
+same Arrow tooling.
+
+## Which metrics exist
+
+| Entry type | Meaning |
+|---|---|
+| `op-invocations` | Number of times an op ran. |
+| `op-errors` | Invocations that returned `ctx.err(...)`. |
+| `op-exceptions` | Invocations that threw. |
+| `op-duration-total` / `-ok` / `-err` | Summed durations by outcome. |
+| `op-duration-min` / `-max` | Extremes. |
+| `buffer-writes` / `buffer-spans` / `buffer-capacity` | Buffer efficiency. |
+
+The numeric constants for these are exported as `ENTRY_TYPE_*` (e.g. `ENTRY_TYPE_OP_DURATION_OK`).
+
+## Reading them from the Arrow table
+
+Metric rows carry the op name in the `message` column and the numeric value in `uint64_value`; filter by
+`entry_type`. After converting a trace (see [Convert a trace to Arrow](/guides/convert-to-arrow/)):
+
+```ts
+import { ENTRY_TYPE_OP_INVOCATIONS } from '@smoothbricks/lmao';
+
+const entryType = table.getChild('entry_type');
+const message = table.getChild('message');
+const value = table.getChild('uint64_value');
+
+for (let i = 0; i < table.numRows; i++) {
+  if (entryType.at(i) === ENTRY_TYPE_OP_INVOCATIONS) {
+    console.log(message.at(i), value.at(i)); // op name, invocation count
+  }
+}
+```
+
+Because metrics are rows in the same table, you can also aggregate them with whatever queries you run over your
+exported trace data.
+
+:::note
+For the full list of entry types and reserved columns, see the [Entry types reference](/reference/entry-types/).
+:::

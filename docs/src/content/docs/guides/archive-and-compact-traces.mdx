@@ -1,0 +1,66 @@
+---
+title: Archive and compact traces
+description: Build chunk envelopes and compact them into time windows with the archive primitives.
+sidebar:
+  order: 16
+---
+
+After you flush traces to storage (Arrow files, object storage), the **archive primitives** help you track and compact
+those chunks. They are deterministic, pure functions — they describe and combine chunks; they don't do I/O themselves.
+
+:::caution
+This is an advanced, lower-level area. Most applications only need the tracers and SQLite sinks. Reach for these when
+you're building a trace archive/compaction pipeline.
+:::
+
+## Describe a chunk
+
+`buildTraceChunkEnvelope` produces an envelope with a deterministic `chunk_id` derived from its contents — useful for
+idempotent, at-least-once delivery (consumers dedupe by `chunk_id`).
+
+```ts
+import { buildTraceChunkEnvelope } from '@smoothbricks/lmao';
+
+const envelope = buildTraceChunkEnvelope({
+  file_ref: 's3://bucket/traces/2025-01-01/part-0.arrow',
+  chunk_ref: 'part-0',
+  row_count: 1280,
+  started_at_ms: 1_700_000_000_000,
+  ended_at_ms: 1_700_000_060_000,
+  partition_keys: ['route', 'status'],
+});
+
+envelope.chunk_id; // deterministic id, e.g. "chunk_…"
+```
+
+## Compact chunks into a window
+
+`compactTraceChunks` merges a set of envelopes into a single record describing the compacted set over a time window.
+
+```ts
+import { compactTraceChunks } from '@smoothbricks/lmao';
+
+const compacted = compactTraceChunks([envelopeA, envelopeB], {
+  started_at_ms: 1_700_000_000_000,
+  ended_at_ms: 1_700_000_120_000,
+});
+
+compacted.total_rows; // sum of source row counts
+compacted.source_chunk_ids; // sorted, de-duplicated source ids
+```
+
+## Stats and partitioning
+
+```ts
+import { extractChunkStats, splitChunkByPartition, inspectPartitionCardinality } from '@smoothbricks/lmao';
+
+const stats = extractChunkStats(envelope); // row_count, duration_ms, …
+
+// Group rows by a partition key for routing/splitting.
+const cardinality = inspectPartitionCardinality(rows, (r) => r.route); // 'single' | 'mixed' | 'unknown'
+const splits = splitChunkByPartition(rows, (r) => r.route);
+```
+
+These are the same primitives you'd use behind an edge flush (for example, building an envelope per response and
+enqueuing it). See [Cloudflare Workers + D1](/guides/cloudflare-workers-d1/) for the flush side, and the
+[Archive reference](/reference/archive/) for full type signatures.

@@ -1,0 +1,71 @@
+---
+title: Write a custom feature-flag evaluator
+description: Implement the FlagEvaluator interface to source flag values from your own backend.
+sidebar:
+  order: 14
+---
+
+`InMemoryFlagEvaluator` is convenient for tests and static config. To source flag values from your own system, implement
+the `FlagEvaluator` interface. The built-in `InMemoryFlagEvaluator` is itself just a small implementation of it.
+
+## The interface
+
+```ts
+interface FlagEvaluator<Ctx> {
+  getSync(ctx, flag): FlagValue; // cached/static flags
+  getAsync(ctx, flag): Promise<FlagValue>; // dynamic flags (network, etc.)
+  forContext(ctx): /* per-span wrapper */;
+}
+```
+
+- `getSync` / `getAsync` receive the span context (without `ff`) and a flag name, and return the value. The `ctx`
+  argument lets an advanced evaluator log, open child spans, or read scope while evaluating.
+- `forContext(ctx)` builds the per-span wrapper that exposes typed getters (`ctx.ff.myFlag`). Delegate it to the
+  built-in `createFeatureFlagEvaluator`.
+
+## Implementation
+
+```ts
+import { createFeatureFlagEvaluator } from '@smoothbricks/lmao';
+
+class RemoteFlagEvaluator {
+  constructor(ffSchema, source) {
+    this.ffSchema = ffSchema;
+    this.source = source; // your flag backend
+  }
+
+  // Return a cached value synchronously, or null if unknown.
+  getSync(_ctx, flag) {
+    return this.source.cached(flag) ?? null;
+  }
+
+  // Fetch a value, optionally tracing the call via ctx.
+  async getAsync(_ctx, flag) {
+    return (await this.source.fetch(flag)) ?? null;
+  }
+
+  // Build the per-span wrapper with typed getters.
+  forContext(ctx) {
+    return createFeatureFlagEvaluator(this.ffSchema, ctx, this);
+  }
+}
+```
+
+Pass an instance as the tracer's `flagEvaluator`, exactly like `InMemoryFlagEvaluator`:
+
+```ts
+const flagEvaluator = new RemoteFlagEvaluator(flags.schema, mySource);
+
+const { trace } = new StdioTracer(opContext, {
+  bufferStrategy: new JsBufferStrategy(),
+  createTraceRoot,
+  flagEvaluator,
+});
+```
+
+Ops then read flags the usual way — `ctx.ff.myFlag` (sync) or `await ctx.ff.get('myFlag')` (async). See
+[Feature flags](/guides/feature-flags/).
+
+:::note
+Returning `null` from `getSync`/`getAsync` means "no value", which reads as a disabled/absent flag in the op.
+:::
