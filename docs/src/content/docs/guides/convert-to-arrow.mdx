@@ -33,6 +33,12 @@ const userIds = table.getChild('userId'); // a single column
 
 For a single buffer without its child tree, use `convertToArrowTable(buffer)`.
 
+:::tip
+Inside an op you can also reach the current span's root buffer directly through the public `ctx.buffer` handle, then
+convert it once the trace completes — handy when you aren't using a retaining tracer. See
+[`examples/arrow-export.ts`](https://github.com/smoothbricks/codebase/tree/main/packages/lmao/examples/arrow-export.ts).
+:::
+
 :::note
 Conversion runs on the cold path — it does not affect the cost of recording spans. For why this split exists, see
 [Why columnar tracing](/concepts/columnar-tracing/).
