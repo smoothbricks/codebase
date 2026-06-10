@@ -1,0 +1,18 @@
+---
+title: Page not found
+template: splash
+editUrl: false
+hero:
+  title: '404'
+  tagline: That page doesn't exist. Try the search (Ctrl/Cmd + K) or jump back in below.
+---
+
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+<CardGrid>
+  <LinkCard title="Start Here" href="/start-here/what-is-lmao/" description="What LMAO is, installation, and the quickstart." />
+  <LinkCard title="Tutorials" href="/tutorials/" description="Step-by-step walkthroughs." />
+  <LinkCard title="How-to guides" href="/guides/" description="Task-oriented recipes." />
+  <LinkCard title="Concepts" href="/concepts/" description="How LMAO works and why." />
+  <LinkCard title="Reference" href="/reference/" description="Complete API lookup." />
+</CardGrid>

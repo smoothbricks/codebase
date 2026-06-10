@@ -64,7 +64,8 @@
   },
   "workspaces": [
     "packages/*",
-    "tooling"
+    "tooling",
+    "docs"
   ],
   "nx": {
     "includedScripts": [],
