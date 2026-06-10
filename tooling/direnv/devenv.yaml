@@ -1,4 +1,9 @@
 allowUnfree: true
+# MinIO (services.minio) is only used for BunS3Archive integration tests, but its
+# nixpkgs package is flagged insecure. Permit it here so contributors don't have to
+# touch their personal ~/.config/nixpkgs/config.nix. Bump the date tag when nixpkgs does.
+permittedInsecurePackages:
+  - minio-2025-10-15T17-29-55Z
 inputs:
   nixpkgs:
     url: github:cachix/devenv-nixpkgs/rolling
