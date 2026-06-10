@@ -1,170 +1,130 @@
+#!/usr/bin/env bun
 /**
- * Example: Fluent Result API with Span Lifecycle
+ * Example: Fluent result API and span lifecycle
  *
- * Demonstrates the new fluent API for ctx.ok() and ctx.err()
- * with automatic span lifecycle tracking (span-start, span-ok, span-err, span-exception)
+ * Demonstrates:
+ * - `ctx.ok(value).with({...}).message('...')` — writes the span-ok entry
+ * - `ctx.err(CODE({...})).with({...}).message('...')` — writes the span-err entry
+ * - Typed error codes via `defineCodeError`
+ * - Reading results: `result.success ? result.value : result.error.code`
+ * - Exceptions thrown inside an op become span-exception entries
+ * - Child spans with their own ok/err lifecycle
+ *
+ * Run it:
+ *   bun run examples/fluent-result-api.ts
  */
 
-import { defineFeatureFlags, defineLogSchema, defineModule, InMemoryFlagEvaluator, S } from '../src/index.js';
+import {
+  createTraceRoot,
+  defineCodeError,
+  defineLogSchema,
+  defineOpContext,
+  JsBufferStrategy,
+  S,
+  StdioTracer,
+} from '../src/node.js';
 
-// Define schema for user management operations
-// Note: resultMessage/exceptionMessage are not needed - use the unified .message() API
-// which writes to the system 'message' column
 const userSchema = defineLogSchema({
   userId: S.category(),
   email: S.category(),
   operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
   duration: S.number(),
-  errorCode: S.category(),
 });
 
-const featureFlags = defineFeatureFlags({
-  enableUserValidation: S.boolean().default(true).sync(),
-  enableEmailNotifications: S.boolean().default(false).sync(),
-});
+const { defineOp } = defineOpContext({ logSchema: userSchema });
 
-// Mock evaluator
-const mockEvaluator = new InMemoryFlagEvaluator({
-  enableUserValidation: true,
-  enableEmailNotifications: false,
-});
+// Typed error codes — the payload shape is checked at the call site.
+const INVALID_EMAIL = defineCodeError('INVALID_EMAIL')<{ email: string; reason: string }>();
+const VALIDATION_FAILED = defineCodeError('VALIDATION_FAILED')<{ email: string }>();
 
-// Create module with defineModule
-const userModule = defineModule({
-  moduleMetadata: {
-    gitSha: 'abc123',
-    packageName: '@example/user-module',
-    packagePath: 'src/modules/user.ts',
-  },
-  logSchema: userSchema,
-});
+// 1. Success with fluent attributes + message.
+const createUser = defineOp('createUser', async (ctx, email: string, name: string) => {
+  const start = performance.now();
+  const userId = `user_${Math.random().toString(36).slice(2, 11)}`;
 
-// Example 1: Success with fluent API
-const createUser = userModule.task('createUser', async (ctx, email: string, name: string) => {
-  // Span-start entry is automatically written at op start
-
-  const startTime = Date.now();
-
-  // Simulate user creation
-  const userId = `user_${Math.random().toString(36).substr(2, 9)}`;
-
-  // Log during operation
   ctx.tag.userId(userId).email(email).operation('CREATE');
+  ctx.log.info('Creating user {{email}}').email(email);
 
-  ctx.log.info(`Creating user with email: ${email}`);
-
-  const duration = Date.now() - startTime;
-
-  // Fluent result with attributes and message
-  // Writes span-ok entry with all attributes
   return ctx
     .ok({ userId, email, name })
-    .with({ userId, email, operation: 'CREATE', duration })
+    .with({ duration: performance.now() - start })
     .message('User created successfully');
 });
 
-// Example 2: Error with fluent API
-const validateEmail = userModule.task('validateEmail', async (ctx, email: string) => {
-  // Span-start entry is automatically written
+// 2. Error with a typed code.
+const validateEmail = defineOp('validateEmail', async (ctx, email: string) => {
+  ctx.tag.email(email).operation('READ');
 
   if (!email.includes('@')) {
-    // Fluent error result
-    // Writes span-err entry with error code and attributes
     return ctx
-      .err('INVALID_EMAIL', { field: 'email', reason: 'Missing @ symbol' })
-      .with({ email, operation: 'READ' })
+      .err(INVALID_EMAIL({ email, reason: 'missing @ symbol' }))
       .message('Email validation failed');
   }
-
-  return ctx.ok({ valid: true }).with({ email, operation: 'READ' }).message('Email is valid');
+  return ctx.ok({ valid: true }).message('Email is valid');
 });
 
-// Example 3: Exception handling
-const updateUser = userModule.task('updateUser', async (ctx, userId: string, _updates: Record<string, unknown>) => {
-  // Span-start entry is automatically written
-
-  // Simulate exception
+// 3. Exception handling — a thrown error is recorded as a span-exception and re-thrown.
+const updateUser = defineOp('updateUser', async (ctx, userId: string) => {
+  ctx.tag.userId(userId).operation('UPDATE');
   if (userId === 'invalid') {
     throw new Error('User not found in database');
-    // Span-exception entry is automatically written with stack trace
   }
-
-  return ctx.ok({ updated: true }).with({ userId, operation: 'UPDATE' }).message('User updated successfully');
+  return ctx.ok({ updated: true }).message('User updated');
 });
 
-// Example 4: Child spans with lifecycle tracking
-const processUserRegistration = userModule.task('processUserRegistration', async (ctx, email: string, name: string) => {
-  // Parent span-start
-
-  // Child span 1: Validate email
-  const validationResult = await ctx.span('validateEmail', async (childCtx) => {
-    // Child span-start
-    const isValid = email.includes('@') && email.includes('.');
-
-    if (!isValid) {
-      // Child span-err
-      return childCtx
-        .err('INVALID_EMAIL', { email })
-        .with({ email, operation: 'READ' })
-        .message('Email format is invalid');
+// 4. Parent op composing child spans, each with its own lifecycle.
+const registerUser = defineOp('registerUser', async (ctx, email: string, name: string) => {
+  const validation = await ctx.span('validate-email', async (childCtx) => {
+    childCtx.tag.email(email).operation('READ');
+    if (!email.includes('@') || !email.includes('.')) {
+      return childCtx.err(INVALID_EMAIL({ email, reason: 'invalid format' })).message('Email format invalid');
     }
-
-    // Child span-ok
-    return childCtx.ok({ valid: true }).with({ email, operation: 'READ' }).message('Email validation passed');
+    return childCtx.ok({ valid: true }).message('Email valid');
   });
 
-  if (!validationResult.success) {
-    // Parent span-err
-    return ctx
-      .err('VALIDATION_FAILED', validationResult.error)
-      .with({ email, operation: 'CREATE' })
-      .message('User registration failed validation');
+  if (!validation.success) {
+    return ctx.err(VALIDATION_FAILED({ email })).message('Registration failed validation');
   }
 
-  // Child span 2: Create user
-  const createResult = await ctx.span('createUser', async (childCtx) => {
-    // Child span-start
-    const userId = `user_${Math.random().toString(36).substr(2, 9)}`;
-
-    // Child span-ok
-    return childCtx
-      .ok({ userId, email, name })
-      .with({ userId, email, operation: 'CREATE' })
-      .message('User created in database');
+  const created = await ctx.span('create-user', async (childCtx) => {
+    const userId = `user_${Math.random().toString(36).slice(2, 11)}`;
+    childCtx.tag.userId(userId).email(email).operation('CREATE');
+    return childCtx.ok({ userId, email, name }).message('User created in database');
   });
 
-  // Parent span-ok
-  return ctx.ok(createResult).with({ email, operation: 'CREATE' }).message('User registration completed successfully');
+  return ctx.ok(created.success ? created.value : { email }).message('Registration completed');
 });
 
-// Run examples
-async function main() {
-  // Create trace context via module
-  const traceCtx = userModule.traceContext({ requestId: 'req_001', userId: 'admin' }, featureFlags, mockEvaluator, {
-    environment: 'development',
-  });
+const { trace } = new StdioTracer(defineOpContext({ logSchema: userSchema }), {
+  bufferStrategy: new JsBufferStrategy(),
+  createTraceRoot,
+});
 
-  console.log('=== Example 1: Success with Fluent API ===');
-  const user = await createUser(traceCtx, 'john@example.com', 'John Doe');
-  console.log('Result:', user);
-  console.log();
+async function main(): Promise<void> {
+  console.log('=== 1. Success ===');
+  const created = await trace('createUser', createUser, 'john@example.com', 'John Doe');
+  console.log(created.success ? created.value : created.error);
 
-  console.log('=== Example 2: Validation Error ===');
-  const validResult = await validateEmail(traceCtx, 'invalid-email');
-  console.log('Result:', validResult);
-  console.log();
-
-  console.log('=== Example 3: Exception Handling ===');
-  try {
-    await updateUser(traceCtx, 'invalid', { name: 'New Name' });
-  } catch (error) {
-    console.log('Caught exception:', (error as Error).message);
+  console.log('\n=== 2. Validation error ===');
+  const invalid = await trace('validateEmail', validateEmail, 'not-an-email');
+  if (!invalid.success) {
+    console.log('error code:', invalid.error.code, '| email:', invalid.error.email);
   }
-  console.log();
 
-  console.log('=== Example 4: Nested Spans with Lifecycle ===');
-  const registration = await processUserRegistration(traceCtx, 'jane@example.com', 'Jane Smith');
-  console.log('Result:', registration);
+  console.log('\n=== 3. Exception ===');
+  // A thrown error is recorded as a span-exception entry and then re-thrown.
+  try {
+    await trace('updateUser', updateUser, 'invalid');
+  } catch (error) {
+    console.log('caught exception:', error instanceof Error ? error.message : String(error));
+  }
+
+  console.log('\n=== 4. Nested spans ===');
+  const registration = await trace('registerUser', registerUser, 'jane@example.com', 'Jane Smith');
+  console.log(registration.success ? registration.value : registration.error);
 }
 
-main().catch(console.error);
+main().catch((error: unknown) => {
+  console.error(error);
+  process.exitCode = 1;
+});
