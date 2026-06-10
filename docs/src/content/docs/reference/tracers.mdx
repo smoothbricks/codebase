@@ -47,6 +47,22 @@ new SQLiteTracer(opContext, { bufferStrategy, createTraceRoot, db });
 new CompositeTracer(opContext, { bufferStrategy, createTraceRoot, delegates: [t1, t2] });
 ```
 
+## Buffer access & extension
+
+Tracers that retain traces expose them for processing:
+
+- `ArrayQueueTracer.drain()` → all queued root buffers (clears the queue). See [Batch and send traces](/guides/batch-and-send-traces/).
+- `TestTracer.rootBuffers` → completed root buffers (for tests/conversion).
+
+The buffer strategy converts and frees buffers:
+
+- `tracer.bufferStrategy.toArrowTable(buffer)` → an Arrow table.
+- `tracer.bufferStrategy.releaseBuffer(buffer)` → frees the buffer.
+
+To define your own emission behavior, subclass the abstract `Tracer` and implement its hooks (`onTraceStart`,
+`onTraceEnd`, `onSpanStart`, `onSpanEnd`, `onStatsWillResetFor`) — see [Write a custom tracer](/guides/write-a-custom-tracer/)
+and [The tracer lifecycle](/concepts/tracer-lifecycle/).
+
 ## `trace(...)` overloads
 
 `trace` runs an op (or an inline function) as the root span. `overrides` carries user-context values (and an optional

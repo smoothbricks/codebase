@@ -1,0 +1,49 @@
+---
+title: Batch and send traces
+description: Accumulate completed traces with ArrayQueueTracer and ship them to a backend in batches.
+sidebar:
+  order: 12
+---
+
+`ArrayQueueTracer` queues completed root traces in memory. You periodically `drain()` the queue, convert each trace to
+an Arrow table, send it, and release the buffer. This is the building block for shipping traces to a backend in batches.
+
+## Queue and drain
+
+```ts
+import { ArrayQueueTracer, JsBufferStrategy } from '@smoothbricks/lmao';
+import { createTraceRoot } from '@smoothbricks/lmao/node';
+
+const tracer = new ArrayQueueTracer(opContext, {
+  bufferStrategy: new JsBufferStrategy(),
+  createTraceRoot,
+});
+const { trace } = tracer;
+
+// Handle work; completed traces accumulate in the queue.
+await trace('request-1', handleRequest);
+await trace('request-2', handleRequest);
+
+// Later, drain and process the batch.
+for (const buffer of tracer.drain()) {
+  const table = await tracer.bufferStrategy.toArrowTable(buffer);
+  await sendToBackend(table); // your code
+  tracer.bufferStrategy.releaseBuffer(buffer);
+}
+```
+
+- `tracer.drain()` returns all queued root buffers and clears the queue.
+- `tracer.bufferStrategy.toArrowTable(buffer)` converts a buffer (and its child spans) to an Arrow table.
+- `tracer.bufferStrategy.releaseBuffer(buffer)` frees the buffer once you've converted it.
+
+## Where to drain
+
+Call `drain()` on whatever cadence suits you — on a timer, after every N requests, or at the end of a request when the
+runtime allows background work (for example a Worker's `ctx.waitUntil`). The queue holds buffers until you drain, so
+drain often enough to bound memory.
+
+:::note
+If you want the queue logic plus custom delivery in one class, subclass `Tracer` directly — see
+[Write a custom tracer](/guides/write-a-custom-tracer/). To write to SQLite/D1 instead, see
+[Persist traces to SQLite](/guides/persist-to-sqlite/).
+:::

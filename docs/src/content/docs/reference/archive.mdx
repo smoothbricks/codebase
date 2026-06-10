@@ -1,0 +1,58 @@
+---
+title: Archive
+description: Chunk envelope, compaction, stats, and partitioning primitives.
+sidebar:
+  order: 12
+---
+
+Deterministic, pure functions for tracking and compacting flushed trace chunks. Imported from `@smoothbricks/lmao`. For
+task guidance, see [Archive and compact traces](/guides/archive-and-compact-traces/).
+
+## Envelopes
+
+```ts
+buildTraceChunkEnvelope(input: TraceChunkEnvelopeInput): TraceChunkEnvelope
+```
+
+`TraceChunkEnvelopeInput`:
+
+| Field | Type |
+|---|---|
+| `file_ref` | `string` |
+| `chunk_ref` | `string` |
+| `row_count` | `number` |
+| `started_at_ms` | `number` |
+| `ended_at_ms` | `number` |
+| `partition_keys?` | `readonly string[]` |
+| `metadata?` | `Record<string, unknown>` |
+
+`TraceChunkEnvelope` adds a deterministic `chunk_id` (derived from the contents) and normalizes `partition_keys`
+(sorted). Identical inputs produce the same `chunk_id`, which consumers can use to dedupe.
+
+## Compaction
+
+```ts
+compactTraceChunks(chunks: readonly TraceChunkEnvelope[], window: CompactionWindow): CompactedChunkSet
+```
+
+- `CompactionWindow` — `{ started_at_ms: number; ended_at_ms: number }`.
+- `CompactedChunkSet` — `{ compaction_id, source_set_hash, source_chunk_ids, source_chunk_count, total_rows, window }`.
+
+## Stats
+
+```ts
+extractChunkStats(envelope: TraceChunkEnvelope, partitions?): TraceChunkStats
+```
+
+`TraceChunkStats` — `{ chunk_id, row_count, partition_count, started_at_ms, ended_at_ms, duration_ms }`.
+
+## Partitioning
+
+```ts
+inspectPartitionCardinality(rows, partitionOf): 'single' | 'mixed' | 'unknown'
+splitChunkByPartition(rows, partitionOf, partitionField?): readonly PartitionSplit<T>[]
+```
+
+- `partitionOf(row)` returns the partition key for a row (or `null`/`undefined` to skip it).
+- `PartitionSplit<T>` — `{ partition, selector, row_indexes, rows }`.
+- `PartitionCardinality` — `'single' | 'mixed' | 'unknown'`.

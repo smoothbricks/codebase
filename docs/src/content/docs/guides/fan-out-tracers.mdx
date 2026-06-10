@@ -1,0 +1,39 @@
+---
+title: Fan out to multiple tracers
+description: Send one trace run to several tracers at once with CompositeTracer.
+sidebar:
+  order: 13
+---
+
+`CompositeTracer` forwards every lifecycle hook to a list of delegate tracers, so a single trace run can produce
+multiple outputs — for example printing to the console *and* writing to SQLite.
+
+```ts
+import {
+  JsBufferStrategy,
+  StdioTracer,
+  SQLiteTracer,
+  CompositeTracer,
+} from '@smoothbricks/lmao';
+import { createTraceRoot } from '@smoothbricks/lmao/node';
+import { createNodeSQLiteDatabase } from '@smoothbricks/lmao/sqlite/node';
+
+const base = { bufferStrategy: new JsBufferStrategy(), createTraceRoot };
+
+const stdio = new StdioTracer(opContext, base);
+const sqlite = new SQLiteTracer(opContext, { ...base, db: createNodeSQLiteDatabase('traces.db') });
+
+const { trace } = new CompositeTracer(opContext, {
+  ...base,
+  delegates: [stdio, sqlite],
+});
+
+await trace('greet', greet); // printed AND written to traces.db
+```
+
+The delegates are ordinary tracer instances built with the same `opContext`. `CompositeTracer` also forwards `flush()`
+to each delegate (and `close()` where a delegate supports it), so flushing the composite flushes them all.
+
+:::note
+To build a delegate that does something custom, see [Write a custom tracer](/guides/write-a-custom-tracer/).
+:::

@@ -94,3 +94,13 @@ if (flag) {
   flag.track().userId('ada');
 }
 ```
+
+## Beyond booleans
+
+Flags aren't limited to booleans and numbers. A flag whose value is a string resolves to a **variant** wrapper, and one
+whose value is an object resolves to a **config** wrapper (the config's fields spread onto the wrapper, alongside
+`track()`). The access pattern is the same — truthy when enabled, `undefined` when not. See the
+[Feature-flag types reference](/reference/feature-flag-types/) for the exact shapes.
+
+To source flag values from your own backend instead of `InMemoryFlagEvaluator`, see
+[Write a custom feature-flag evaluator](/guides/custom-feature-flag-evaluator/).
