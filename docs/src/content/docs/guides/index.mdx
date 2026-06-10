@@ -51,3 +51,23 @@ Short, goal-directed recipes. Each assumes you've done the [Quickstart](/start-h
   <LinkCard title="Cloudflare Workers + D1" href="/guides/cloudflare-workers-d1/" description="Trace on the edge and flush to D1." />
   <LinkCard title="Set up trace-testing" href="/guides/set-up-trace-testing/" description="Add trace-testing to a new package." />
 </CardGrid>
+
+## Runnable examples
+
+The patterns above are demonstrated end-to-end in the package's
+[`examples/`](https://github.com/smoothbricks/codebase/tree/main/packages/lmao/examples) directory. Each file is a
+self-contained script you can run with Bun:
+
+```sh
+bun run examples/basic-usage.ts
+```
+
+| Example | Shows |
+|---|---|
+| `basic-usage.ts` | Schema, feature flags, fluent tag chaining, a child span |
+| `fluent-result-api.ts` | `ok`/`err` lifecycle, typed error codes, exceptions |
+| `chaining-showcase.ts` | Heavy tag chaining, `with()`, flag-guarded child spans |
+| `complete-example.ts` | Scoped attributes, async flags, nested spans, `FlushScheduler` |
+| `middleware-pattern.ts` | Request scope set once, inherited by every operation |
+| `library-integration.ts` | Composing libraries via `deps` + `prefix` |
+| `arrow-export.ts` | Converting a span tree to an Apache Arrow table |
