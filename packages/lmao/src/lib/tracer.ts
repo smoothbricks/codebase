@@ -710,9 +710,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     ctx.ff = this.flagEvaluator.forContext(ctx);
 
     // Copy resolved user context onto SpanContext.
-    for (const key in resolvedUserCtx) {
-      (ctx as Record<string, unknown>)[key] = resolvedUserCtx[key];
-    }
+    Object.assign(ctx, resolvedUserCtx);
 
     return ctx;
   }
