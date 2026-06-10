@@ -1,0 +1,71 @@
+---
+title: Write a custom tracer
+description: Subclass the abstract Tracer to control how completed spans are collected and processed.
+sidebar:
+  order: 11
+---
+
+`Tracer` is an abstract base class. The built-in tracers (`StdioTracer`, `SQLiteTracer`, …) are subclasses that
+implement a few lifecycle hooks. You can write your own to send traces anywhere.
+
+## The lifecycle hooks
+
+A subclass implements five hooks:
+
+| Hook | Called when |
+|---|---|
+| `onTraceStart(rootBuffer)` | A root trace begins. |
+| `onTraceEnd(rootBuffer)` | A root trace completes (the usual place to collect/ship). |
+| `onSpanStart(childBuffer)` | A child span begins. |
+| `onSpanEnd(childBuffer)` | A child span ends. |
+| `onStatsWillResetFor(buffer)` | Before buffer stats reset (override to capture stats). |
+
+Inside a subclass you also have `this.bufferStrategy`, which converts and frees buffers:
+
+- `this.bufferStrategy.toArrowTable(buffer)` → an Arrow table.
+- `this.bufferStrategy.releaseBuffer(buffer)` → frees the buffer.
+
+## A minimal collector
+
+This tracer converts each completed trace to an Arrow table and keeps it. Most hooks are no-ops.
+
+```ts
+import { JsBufferStrategy, Tracer } from '@smoothbricks/lmao';
+import { createTraceRoot } from '@smoothbricks/lmao/node';
+
+class CollectingTracer extends Tracer {
+  readonly tables: unknown[] = [];
+
+  onTraceStart() {}
+  onSpanStart() {}
+  onSpanEnd() {}
+  onStatsWillResetFor() {}
+
+  async onTraceEnd(rootBuffer) {
+    const table = await this.bufferStrategy.toArrowTable(rootBuffer);
+    this.tables.push(table);
+    this.bufferStrategy.releaseBuffer(rootBuffer);
+  }
+}
+
+const tracer = new CollectingTracer(opContext, {
+  bufferStrategy: new JsBufferStrategy(),
+  createTraceRoot,
+});
+
+await tracer.trace('greet', greet);
+console.log(tracer.tables.length); // 1
+```
+
+The constructor signature is inherited — `new MyTracer(opContext, options)` with the usual `bufferStrategy` and
+`createTraceRoot`.
+
+:::caution
+If you collect buffers instead of releasing them immediately, release them once you're done (after converting). Holding
+buffers indefinitely keeps their memory alive.
+:::
+
+:::note
+For a ready-made batching tracer, see [Batch and send traces](/guides/batch-and-send-traces/). For how a trace flows
+through these hooks, see [The tracer lifecycle](/concepts/tracer-lifecycle/).
+:::

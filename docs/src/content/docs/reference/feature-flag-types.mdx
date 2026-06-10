@@ -1,0 +1,46 @@
+---
+title: Feature-flag types
+description: The FlagEvaluator interface, flag context types, and built-in evaluators.
+sidebar:
+  order: 11
+---
+
+Reference for the feature-flag type surface. For task guidance, see [Feature flags](/guides/feature-flags/) and
+[Write a custom feature-flag evaluator](/guides/custom-feature-flag-evaluator/).
+
+## `FlagEvaluator<Ctx>`
+
+The interface an evaluator implements. Imported from `@smoothbricks/lmao`.
+
+| Member | Description |
+|---|---|
+| `getSync(ctx, flag)` | Return a flag value synchronously (cached/static). Returns the value or `null`. |
+| `getAsync(ctx, flag)` | Return a flag value asynchronously (dynamic/network). |
+| `forContext(ctx)` | Build the per-span wrapper exposing typed getters. Delegate to `createFeatureFlagEvaluator`. |
+
+`getSync`/`getAsync` receive the span context without `ff` (to prevent recursion), so an evaluator can log or open child
+spans while evaluating.
+
+## Flag context types
+
+A flag, when enabled, resolves to one of these wrappers (the shape depends on the flag's value type):
+
+| Type | Returned for | Shape |
+|---|---|---|
+| `BooleanFlagContext` | boolean flags | `{ value: true; track(ctx?) }` |
+| `VariantFlagContext<V>` | string/variant flags | `{ value: V; track(ctx?) }` |
+| `ConfigFlagContext<T>` | object/config flags | `T & { track(ctx?) }` |
+
+When a flag is disabled, accessing it yields `undefined` — so a plain truthy check works. `track(context?)` records an
+`ff-usage` entry and returns a fluent log entry; `FlagTrackContext` is `{ action?: string; outcome?: string }`.
+
+## Built-in evaluators
+
+```ts
+import { InMemoryFlagEvaluator, createFeatureFlagEvaluator } from '@smoothbricks/lmao';
+```
+
+- `new InMemoryFlagEvaluator(ffSchema, initialFlags?)` — stores values in memory; `setFlag(flag, value)` updates them.
+  Good for tests and static config.
+- `createFeatureFlagEvaluator(ffSchema, ctx, evaluator)` — builds the per-span typed wrapper; use it inside a custom
+  evaluator's `forContext`.

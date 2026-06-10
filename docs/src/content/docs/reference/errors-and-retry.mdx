@@ -74,6 +74,17 @@ return ctx.err(Blocked.index('search-index'));
 
 Each factory takes an optional `BlockedConfig` (`{ maxAttempts?, nextRetry?(attempt) }`).
 
+## `RetriesExhausted`
+
+`RetriesExhausted` is the error type representing a transient failure whose retry policy ran out of attempts. It's
+exported both from the root and as the focused subpath `@smoothbricks/lmao/errors/RetriesExhausted`.
+
+## Helpers
+
+- `hasErrorCode(error)` — a type guard narrowing an unknown value to `{ code: string }`, useful when inspecting an
+  error of unknown origin.
+- Result builders also expose `.line(n)` (alongside `.with({...})` and `.message('...')`) to record a source line.
+
 :::note
 Retry applies to **child spans** (`ctx.span(...)`), not to the root `trace(...)`. See
 [Retry transient failures](/guides/retry-transient-failures/).
