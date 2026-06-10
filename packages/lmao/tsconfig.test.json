@@ -4,7 +4,7 @@
     "paths": {
       "@smoothbricks/validation": ["../validation/src/index.ts"]
     },
-    "rootDir": "src",
+    "rootDir": ".",
     "types": ["bun"],
     "composite": false,
     "declaration": false,
@@ -19,7 +19,8 @@
     "src/**/*.spec.ts",
     "src/**/__tests__/**/*.ts",
     "src/**/__tests__/**/*.tsx",
-    "src/test-suite-tracer.ts"
+    "src/test-suite-tracer.ts",
+    "examples/**/*.ts"
   ],
   "references": [
     {
