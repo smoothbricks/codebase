@@ -14,6 +14,7 @@ Short, goal-directed recipes. Each assumes you've done the [Quickstart](/start-h
 <CardGrid>
   <LinkCard title="Choose a string type" href="/guides/choose-string-types/" description="enum vs category vs text." />
   <LinkCard title="tag vs scope vs log" href="/guides/tag-vs-scope-vs-log/" description="Pick the right recorder for the job." />
+  <LinkCard title="Store structured payloads" href="/guides/store-structured-payloads/" description="Objects, optional, and union fields." />
 </CardGrid>
 
 ## Errors & resilience
@@ -23,18 +24,30 @@ Short, goal-directed recipes. Each assumes you've done the [Quickstart](/start-h
   <LinkCard title="Retry transient failures" href="/guides/retry-transient-failures/" description="Transient errors and backoff policies." />
 </CardGrid>
 
-## Flags, persistence & export
+## Flags
 
 <CardGrid>
   <LinkCard title="Feature flags" href="/guides/feature-flags/" description="Define, evaluate, and track flags." />
+  <LinkCard title="Custom flag evaluator" href="/guides/custom-feature-flag-evaluator/" description="Source flag values from your own backend." />
+</CardGrid>
+
+## Tracers & output
+
+<CardGrid>
+  <LinkCard title="Write a custom tracer" href="/guides/write-a-custom-tracer/" description="Subclass Tracer and collect spans your way." />
+  <LinkCard title="Batch and send traces" href="/guides/batch-and-send-traces/" description="Queue, drain, and ship traces in batches." />
+  <LinkCard title="Fan out to multiple tracers" href="/guides/fan-out-tracers/" description="One run, several outputs, via CompositeTracer." />
   <LinkCard title="Persist traces to SQLite" href="/guides/persist-to-sqlite/" description="Write traces to a SQLite database." />
   <LinkCard title="Convert a trace to Arrow" href="/guides/convert-to-arrow/" description="Turn a span tree into an Arrow table." />
+  <LinkCard title="Measure op performance" href="/guides/measure-op-performance/" description="Read op and buffer metrics." />
+  <LinkCard title="Archive & compact traces" href="/guides/archive-and-compact-traces/" description="Chunk envelopes and compaction." />
 </CardGrid>
 
 ## Composition, deployment & testing
 
 <CardGrid>
   <LinkCard title="Compose library traces" href="/guides/compose-library-traces/" description="Nest a library's spans into your app trace." />
+  <LinkCard title="Integrate with an HTTP framework" href="/guides/integrate-with-http-framework/" description="One trace per request, scoped context." />
   <LinkCard title="Cloudflare Workers + D1" href="/guides/cloudflare-workers-d1/" description="Trace on the edge and flush to D1." />
   <LinkCard title="Set up trace-testing" href="/guides/set-up-trace-testing/" description="Add trace-testing to a new package." />
 </CardGrid>

@@ -32,6 +32,11 @@ const appSchema = defineLogSchema({
 | `S.text()` | string | Mostly-unique values; stored as plain strings. |
 | `S.unknown()` | unknown | Arbitrary value stored as msgpack binary. |
 | `S.object<T>()` | T (object) | Typed object stored as msgpack binary. |
+| `S.binary({ encoder })` | bytes | Raw bytes via a custom encoder. |
+| `S.optional(schema)` | `T \| undefined` | Wrap a schema to allow an absent value. |
+| `S.union([a, b, …])` | `A \| B \| …` | Allow one of several schemas. |
+
+For objects, optional, and union fields in practice, see [Store structured payloads](/guides/store-structured-payloads/).
 
 For choosing between the string types, see [Choose a string type](/guides/choose-string-types/).
 

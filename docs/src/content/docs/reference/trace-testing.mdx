@@ -70,6 +70,12 @@ spanNames(rootBuffer);
 extractFacts(rootBuffer);
 ```
 
+### Facts
+
+`querySpan(buffer).facts()` and `extractFacts(rootBuffer)` return an array of typed **facts** — strings like
+`span:validate: started` or `tag:userId: ada` — that you can assert against. The full vocabulary (and its builders and
+type guards) is documented in the [Facts reference](/reference/facts/).
+
 ### `TraceQuery` (SQLite-backed)
 
 Query a persisted results database.
