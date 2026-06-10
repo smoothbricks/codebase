@@ -1,0 +1,53 @@
+---
+title: Store structured payloads
+description: Record objects and optional/union values using the binary and composite schema types.
+sidebar:
+  order: 15
+---
+
+Most span columns are scalars (numbers, booleans, strings). When you need to record a whole object or an arbitrary
+value, use the binary schema types; for nullable or multi-shape fields, use the composite helpers.
+
+## Binary columns for objects
+
+- `S.unknown()` — store an arbitrary value (encoded as msgpack binary).
+- `S.object<T>()` — same, but typed as `T`.
+- `S.binary({ encoder })` — store bytes with a custom encoder.
+
+```ts
+import { S, defineLogSchema } from '@smoothbricks/lmao';
+
+const schema = defineLogSchema({
+  userId: S.category(),
+  payload: S.object<{ items: number[]; coupon?: string }>(),
+  raw: S.unknown(),
+});
+```
+
+```ts
+const op = defineOp('checkout', async (ctx) => {
+  ctx.tag.userId('ada').payload({ items: [1, 2, 3], coupon: 'SAVE10' });
+  return ctx.ok(null);
+});
+```
+
+Binary columns let you keep structured context without flattening it into many scalar columns. They're stored compactly
+and decoded when you read the trace.
+
+## Optional and union fields
+
+- `S.optional(schema)` — allow the value to be absent (`T | undefined`).
+- `S.union([a, b, ...])` — allow one of several schemas.
+
+```ts
+const schema = defineLogSchema({
+  note: S.optional(S.text()),
+  id: S.union([S.number(), S.category()]),
+});
+```
+
+:::note
+For the simpler scalar string choices (`enum` / `category` / `text`), see
+[Choose a string type](/guides/choose-string-types/). For the full builder list, see the
+[Schema DSL reference](/reference/schema-dsl/).
+:::
