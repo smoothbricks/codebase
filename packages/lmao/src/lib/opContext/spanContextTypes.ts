@@ -28,21 +28,38 @@ import type { Op } from './opTypes.js';
 import type { OpContext } from './types.js';
 
 // =============================================================================
-// DEPENDENCY TYPES (structural to avoid circular imports)
+// DEPENDENCY TYPES (deliberate `any` placeholders — see rationale below)
 // =============================================================================
 
+// WHY these are `any` and not the real `DepsConfig`/`ResolvedDeps` from opGroupTypes:
+//
+// `ResolvedDeps<D>` maps each dep to `OpGroup<Ctx, Ops>`, and an OpGroup's ops carry
+// `SpanContext<DepCtx>` in their signatures. If `SpanContext` referenced the *real*
+// `ResolvedDeps<Ctx['deps']>` for its `deps` member, `SpanContext` would become
+// structurally recursive: deps -> OpGroup -> op -> SpanContext -> deps -> ...
+//
+// That recursion breaks the structural assignability TypeScript performs when a
+// dependency's op is passed to `ctx.span(name, ctx.deps.x.op)` across libraries
+// (verified: it regresses the nested-library-tasks composition tests) and makes
+// type comparison cost explode. The `any` keeps `ctx.deps.x.op` ergonomic for op
+// authors while keeping `SpanContext` comparisons tractable and non-recursive.
+//
+// A real fix (fully-typed `ctx.deps`) requires reworking deps resolution so the
+// resolved-deps view does not pull `SpanContext` back into its own definition.
+// Until then these placeholders are load-bearing, not laziness.
+
 /**
- * DepsConfig - structural type to avoid importing from opGroupTypes.
- * Represents a record of dependency groups.
+ * DepsConfig - structural placeholder for a record of dependency groups.
+ * The authoritative type is `DepsConfig` in opGroupTypes; see the WHY above.
  */
-// biome-ignore lint/suspicious/noExplicitAny: Structural placeholder - actual type in opGroupTypes
+// biome-ignore lint/suspicious/noExplicitAny: load-bearing placeholder — real type makes SpanContext recursive (see WHY above)
 export type DepsConfig = Record<string, any>;
 
 /**
- * ResolvedDeps - structural type to avoid importing from opGroupTypes.
- * At runtime, deps are resolved OpGroups with their ops accessible.
+ * ResolvedDeps - structural placeholder for resolved dependency OpGroups.
+ * The authoritative type is `ResolvedDeps` in opGroupTypes; see the WHY above.
  */
-// biome-ignore lint/suspicious/noExplicitAny: Structural placeholder - actual type in opGroupTypes
+// biome-ignore lint/suspicious/noExplicitAny: load-bearing placeholder — real type makes SpanContext recursive (see WHY above)
 export type ResolvedDeps<_D extends DepsConfig> = Record<string, any>;
 
 // =============================================================================
