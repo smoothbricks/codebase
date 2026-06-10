@@ -1,25 +1,40 @@
+#!/usr/bin/env bun
 /**
- * Method Chaining Showcase
+ * Example: Fluent tag-chaining showcase
  *
- * This example demonstrates the fluent method chaining API for tag attributes.
- * Each tag method returns the tag object, allowing natural, readable chaining.
+ * Demonstrates:
+ * - Heavy fluent chaining: `ctx.tag.orderId(id).amount(n).currency('USD').status('processing')`
+ * - Bulk attributes with `ctx.tag.with({...})` then continued chaining
+ * - Feature-flag-guarded child spans (`ctx.ff.fraudDetection?.value`)
+ * - User context (`requestId` / `userId`) supplied per-trace via overrides
+ *
+ * Run it:
+ *   bun run examples/chaining-showcase.ts
  */
 
-import { defineFeatureFlags, defineLogSchema, defineModule, InMemoryFlagEvaluator, S } from '../src/index.js';
+import {
+  createTraceRoot,
+  defineCodeError,
+  defineFeatureFlags,
+  defineLogSchema,
+  defineOpContext,
+  InMemoryFlagEvaluator,
+  JsBufferStrategy,
+  S,
+  StdioTracer,
+} from '../src/node.js';
 
-// Define comprehensive tag attributes
-// Using the three string types per specs/lmao/01a_trace_schema_system.md
-const orderAttributes = defineLogSchema({
-  requestId: S.category(), // Category: request IDs repeat
-  userId: S.category(), // Category: user IDs repeat
-  orderId: S.category(), // Category: order IDs may repeat in tracking
+const orderSchema = defineLogSchema({
+  requestId: S.category(),
+  userId: S.category(),
+  orderId: S.category(),
   amount: S.number(),
-  currency: S.enum(['USD', 'EUR', 'GBP', 'JPY']), // Enum: known currencies
-  paymentMethod: S.enum(['card', 'paypal', 'bank_transfer']), // Enum: known methods
-  status: S.enum(['pending', 'processing', 'completed', 'failed']), // Enum: known statuses
+  currency: S.enum(['USD', 'EUR', 'GBP', 'JPY']),
+  paymentMethod: S.enum(['card', 'paypal', 'bank_transfer']),
+  status: S.enum(['pending', 'processing', 'completed', 'failed']),
   duration: S.number(),
   httpStatus: S.number(),
-  operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']), // Enum: known operations
+  operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),
 });
 
 const featureFlags = defineFeatureFlags({
@@ -27,45 +42,21 @@ const featureFlags = defineFeatureFlags({
   fastCheckout: S.boolean().default(false).sync(),
 });
 
-const environmentConfig = {
-  awsRegion: 'us-east-1',
-  paymentGateway: 'stripe',
-  environment: 'production',
-};
-
-const flagEvaluator = new InMemoryFlagEvaluator({
-  fraudDetection: true,
-  fastCheckout: true,
-});
-
-// Create module with defineModule
-const orderModule = defineModule({
-  moduleMetadata: {
-    gitSha: 'abc123def456',
-    packageName: '@example/order-service',
-    packagePath: 'src/services/order.ts',
+const opContext = defineOpContext({
+  logSchema: orderSchema,
+  flags: featureFlags.schema,
+  ctx: {
+    requestId: undefined as string | undefined,
+    userId: undefined as string | undefined,
   },
-  logSchema: orderAttributes,
 });
+const { defineOp } = opContext;
 
-// Example 1: Simple chaining
-const validateOrder = orderModule.task('validate-order', async (ctx, orderId: string) => {
-  // Clean, readable chaining
-  ctx.tag
-    .requestId(ctx.requestId)
-    .userId(ctx.userId || 'guest')
-    .orderId(orderId)
-    .operation('SELECT')
-    .status('pending');
+const INSUFFICIENT_FUNDS = defineCodeError('INSUFFICIENT_FUNDS')<{ amount: number; limit: number }>();
+const PAYMENT_FAILED = defineCodeError('PAYMENT_FAILED')<{ reason: string }>();
 
-  return ctx.ok({ valid: true });
-});
-
-// Example 2: Real-world pattern from requirements
 type Currency = 'USD' | 'EUR' | 'GBP' | 'JPY';
-
 type PaymentMethod = 'card' | 'paypal' | 'bank_transfer';
-
 interface Order {
   id: string;
   total: number;
@@ -73,144 +64,101 @@ interface Order {
   paymentMethod: PaymentMethod;
 }
 
-const processPayment = orderModule.task('process-payment', async (ctx, order: Order) => {
-  // Example: ctx.tag.orderId(order.id).amount(order.total)
+// 1. Simple chaining.
+const validateOrder = defineOp('validate-order', async (ctx, orderId: string) => {
   ctx.tag
-    .orderId(order.id)
-    .amount(order.total)
-    .currency(order.currency)
-    .paymentMethod(order.paymentMethod)
-    .status('processing');
+    .requestId(ctx.requestId ?? 'req-unknown')
+    .userId(ctx.userId ?? 'guest')
+    .orderId(orderId)
+    .operation('SELECT')
+    .status('pending');
+  return ctx.ok({ valid: true });
+});
 
-  // Simulate payment processing with child span
+// 2. Chaining across a child span, with a typed error path.
+const processPayment = defineOp('process-payment', async (ctx, order: Order) => {
+  ctx.tag.orderId(order.id).amount(order.total).currency(order.currency).paymentMethod(order.paymentMethod).status('processing');
+
   const payment = await ctx.span('call-payment-gateway', async (childCtx) => {
-    const startTime = Date.now();
-
-    // Chaining in child spans - use childCtx.tag (not .log.tag)
+    const start = performance.now();
     childCtx.tag.operation('INSERT').orderId(order.id).amount(order.total).status('processing');
 
-    // Simulate API call
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    const succeeded = order.total < 10_000; // simulate a limit
+    const duration = performance.now() - start;
 
-    // Simulate potential payment failure (e.g., insufficient funds)
-    const paymentSucceeded = order.total < 10000; // Fail for large amounts
-
-    const duration = Date.now() - startTime;
-
-    if (!paymentSucceeded) {
+    if (!succeeded) {
       childCtx.tag.duration(duration).httpStatus(402).status('failed');
-
-      return childCtx.err('INSUFFICIENT_FUNDS', { amount: order.total, limit: 10000 });
+      return childCtx.err(INSUFFICIENT_FUNDS({ amount: order.total, limit: 10_000 }));
     }
 
-    // Chain more after processing
     childCtx.tag.duration(duration).httpStatus(200).status('completed');
-
     return childCtx.ok({ transactionId: 'txn-123', duration });
   });
 
   if (!payment.success) {
     ctx.tag.status('failed').httpStatus(500);
-    return ctx.err('PAYMENT_FAILED', payment.error);
+    return ctx.err(PAYMENT_FAILED({ reason: payment.error.code }));
   }
 
-  // Final status update with chaining
   ctx.tag.status('completed').httpStatus(201).duration(payment.value.duration);
-
-  return ctx.ok({
-    orderId: order.id,
-    transactionId: payment.value.transactionId,
-    status: 'completed',
-  });
+  return ctx.ok({ orderId: order.id, transactionId: payment.value.transactionId });
 });
 
-// Example 3: Mixing with() and chaining
-const createOrder = orderModule.task('create-order', async (ctx, orderData: Partial<Order>) => {
-  // Validate required fields or apply safe defaults
-  const id = orderData.id ?? `order-${Date.now()}`;
-  const total = orderData.total ?? 0;
-  const currency: Currency = orderData.currency ?? 'USD';
-  const paymentMethod: PaymentMethod = orderData.paymentMethod ?? 'card';
-
-  if (!orderData.id || orderData.total === undefined || !orderData.currency || !orderData.paymentMethod) {
-    ctx.log.warn('createOrder called with missing required fields, using defaults');
-  }
-
-  // Start with bulk setting
+// 3. Mixing with() and chaining + a flag-guarded child span.
+const createOrder = defineOp('create-order', async (ctx, order: Order) => {
   ctx.tag
-    .with({
-      requestId: ctx.requestId,
-      userId: ctx.userId || 'guest',
-      operation: 'INSERT',
-    })
-    // Then chain specific values with validated/normalized values
-    .orderId(id)
-    .amount(total)
-    .currency(currency)
-    .paymentMethod(paymentMethod)
+    .with({ requestId: ctx.requestId ?? 'req-unknown', userId: ctx.userId ?? 'guest', operation: 'INSERT' })
+    .orderId(order.id)
+    .amount(order.total)
+    .currency(order.currency)
+    .paymentMethod(order.paymentMethod)
     .status('pending');
 
-  // Feature flags work alongside chaining
-  if (ctx.ff.fraudDetection) {
+  if (ctx.ff.fraudDetection?.value) {
     await ctx.span('fraud-check', async (childCtx) => {
-      childCtx.tag.orderId(id).operation('SELECT').status('pending');
-
-      // Fraud check logic...
+      childCtx.tag.orderId(order.id).operation('SELECT').status('pending');
       return childCtx.ok({ safe: true });
     });
   }
 
-  // More chaining after async operations
   ctx.tag.status('completed').httpStatus(201).duration(25.5);
-
-  return ctx.ok({ created: true, orderId: id });
+  return ctx.ok({ created: true, orderId: order.id });
 });
 
-// Run examples
-async function runExamples() {
-  // Create trace context via module
-  const traceCtx = orderModule.traceContext(
-    {
-      requestId: `req-${Date.now()}`,
-      userId: 'user-456',
-    },
-    featureFlags,
-    flagEvaluator,
-    environmentConfig,
+const { trace } = new StdioTracer(opContext, {
+  bufferStrategy: new JsBufferStrategy(),
+  createTraceRoot,
+  flagEvaluator: new InMemoryFlagEvaluator(featureFlags.schema, { fraudDetection: true, fastCheckout: true }),
+});
+
+async function main(): Promise<void> {
+  const overrides = { requestId: `req-${Date.now()}`, userId: 'user-456' };
+
+  console.log('=== 1. Simple chaining ===');
+  console.log(await trace('validate-order', overrides, validateOrder, 'order-789'));
+
+  console.log('\n=== 2. Payment with child span ===');
+  console.log(
+    await trace('process-payment', overrides, processPayment, {
+      id: 'order-789',
+      total: 149.99,
+      currency: 'USD',
+      paymentMethod: 'card',
+    }),
   );
 
-  console.log('\n=== Example 1: Simple Chaining ===');
-  console.log('Writing to columnar buffers...');
-  const validation = await validateOrder(traceCtx, 'order-789');
-  console.log('✅ Result:', validation);
-
-  console.log('\n=== Example 2: Real-world Pattern (orderId/amount) ===');
-  console.log('Each chained call writes to a separate row in Arrow columns...');
-  const payment = await processPayment(traceCtx, {
-    id: 'order-789',
-    total: 149.99,
-    currency: 'USD',
-    paymentMethod: 'card',
-  });
-  console.log('✅ Result:', payment);
-
-  console.log('\n=== Example 3: Mixing with() and Chaining ===');
-  console.log('Bulk attributes written, then individual columns appended...');
-  const creation = await createOrder(traceCtx, {
-    id: 'order-999',
-    total: 299.99,
-    currency: 'EUR',
-    paymentMethod: 'paypal',
-  });
-  console.log('✅ Result:', creation);
-
-  console.log('\n💾 All data stored in Arrow columnar format:');
-  console.log('   - Each attribute has its own typed column (array)');
-  console.log('   - Operations tracked with entry type codes');
-  console.log('   - Timestamps stored as Float64 arrays');
-  console.log('   - Child spans create tree structure with parent references');
-  console.log('   - Zero-copy serialization ready for Parquet export\n');
+  console.log('\n=== 3. with() + chaining + flag-guarded child span ===');
+  console.log(
+    await trace('create-order', overrides, createOrder, {
+      id: 'order-999',
+      total: 299.99,
+      currency: 'EUR',
+      paymentMethod: 'paypal',
+    }),
+  );
 }
 
-console.log('🔗 Method Chaining Showcase - Columnar Buffer Storage\n');
-runExamples().catch(console.error);
+main().catch((error: unknown) => {
+  console.error(error);
+  process.exitCode = 1;
+});
