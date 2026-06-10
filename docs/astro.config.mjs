@@ -1,4 +1,7 @@
-// @ts-check
+// Note: no `// @ts-check` here. Starlight 0.34 ships raw `.ts` source for its
+// `.` export, and under this repo's TypeScript 6 that source trips an internal
+// type error (utils/i18n.ts) that would otherwise surface against this file.
+// The config object is still validated by `defineConfig`/`starlight()` types.
 import starlight from '@astrojs/starlight';
 import { defineConfig } from 'astro/config';
 import starlightLinksValidator from 'starlight-links-validator';
