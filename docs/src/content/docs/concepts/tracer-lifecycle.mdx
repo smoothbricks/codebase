@@ -1,0 +1,47 @@
+---
+title: The tracer lifecycle
+description: How a trace flows through the abstract Tracer's hooks to a sink.
+sidebar:
+  order: 8
+---
+
+A tracer turns op executions into emitted spans. Understanding the order of its lifecycle hooks explains where each
+built-in tracer does its work — and where a custom one plugs in.
+
+## The flow of one trace
+
+```text
+trace(name, op)
+   │  createTraceRoot()  → timestamps + trace_id
+   ▼
+allocate root buffer
+   │  onTraceStart(rootBuffer)
+   ▼
+run the op  ───────────────►  ctx.span(child)
+   │                              │ allocate child buffer
+   │                              │ onSpanStart(childBuffer)
+   │                              │ run child …
+   │                              │ onSpanEnd(childBuffer)
+   ▼
+op returns ok/err
+   │  onTraceEnd(rootBuffer)   ← convert / collect / ship here
+   ▼
+buffer strategy: toArrowTable / releaseBuffer
+```
+
+## The hooks
+
+- **`onTraceStart` / `onTraceEnd`** fire at the boundaries of a root trace. `onTraceEnd` is where most tracers act —
+  `StdioTracer` prints, `SQLiteTracer` writes, `ArrayQueueTracer` enqueues.
+- **`onSpanStart` / `onSpanEnd`** fire for each child span. Streaming tracers (like `StdioTracer`) use them to print as
+  execution happens; collecting tracers leave them as no-ops.
+- **`onStatsWillResetFor`** fires before a buffer's stats reset, so a tracer can capture them first.
+
+## The buffer strategy
+
+The hooks receive **buffers**, not Arrow tables. Converting and freeing them is the buffer strategy's job
+(`toArrowTable`, `releaseBuffer`), which the tracer owns as `this.bufferStrategy`. This separation is why the same
+tracer logic works regardless of how buffers are allocated.
+
+To implement your own, you fill in these hooks — see [Write a custom tracer](/guides/write-a-custom-tracer/). For the
+big picture, see [Architecture overview](/concepts/architecture/).

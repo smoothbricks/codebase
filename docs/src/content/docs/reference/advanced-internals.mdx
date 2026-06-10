@@ -1,0 +1,54 @@
+---
+title: Advanced / internals
+description: Lower-level exports for advanced use — code generation, identifiers, and buffer strategy.
+sidebar:
+  order: 13
+---
+
+:::caution
+These symbols are exported for advanced use. Most applications never need them — the everyday API
+([defineOpContext](/reference/define-op-context/), [SpanContext](/reference/span-context/),
+[Tracers](/reference/tracers/)) is sufficient. They're documented here for completeness.
+:::
+
+All are imported from `@smoothbricks/lmao` unless noted.
+
+## Buffer strategy
+
+`BufferStrategy` is the interface tracers use to allocate buffers and convert them to Arrow. `JsBufferStrategy` is the
+shipped implementation you pass to every tracer.
+
+| Member | Purpose |
+|---|---|
+| `createSpanBuffer(...)` / `createChildSpanBuffer(...)` | Allocate buffers. |
+| `createOverflowBuffer(buffer)` | Chain a buffer when capacity is exceeded. |
+| `toArrowTable(buffer)` | Convert a buffer (and children) to an Arrow table. |
+| `releaseBuffer(buffer)` | Free a buffer. |
+
+## Arrow conversion
+
+- `convertSpanTreeToArrowTable(rootBuffer)` — convert a root span and its children with shared dictionaries.
+- `convertToArrowTable(buffer)` — convert a single buffer.
+
+See [Convert a trace to Arrow](/guides/convert-to-arrow/).
+
+## Identifiers
+
+| Export | Purpose |
+|---|---|
+| `createTraceId(value)` | Build a branded `TraceId` from a string. |
+| `generateTraceId()` | Generate a new W3C-format trace id. |
+| `isValidTraceId(value)` | Validate a trace id. |
+| `extractSpanIdentity(...)` | Read a span's identity. |
+| `getThreadId()` | The current thread's id. |
+
+## Code generation
+
+Used internally to generate fast per-schema writers; exposed for advanced tooling:
+
+`createSpanLogger`, `createSpanLoggerClass`, `createResultWriter`, `createTagWriter`.
+
+## System schema
+
+`systemSchema` and `mergeWithSystemSchema(fields)` expose the system columns that are merged into every log schema, plus
+the `ENTRY_TYPE_*` constants (see [Entry types](/reference/entry-types/)).

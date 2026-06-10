@@ -28,5 +28,19 @@ This is a deliberate trade: per-span identity is cheaper to produce, at the cost
 identity rather than one opaque id. The `trace_id` remains a standard W3C value, so traces can still be correlated
 across systems.
 
+## Continuing a trace across services
+
+Because the `trace_id` is a standard W3C value shared by reference, you can continue an existing trace rather than start
+a fresh one. The root `trace(...)` call accepts overrides that include a `trace_id`:
+
+```ts
+import { createTraceId } from '@smoothbricks/lmao';
+
+await trace('handle', { trace_id: createTraceId(incomingTraceId) }, handleRequest);
+```
+
+Use `createTraceId` to turn an incoming id (e.g. from a request header) into the branded `TraceId` the override
+expects. This is how spans produced on different services line up under one trace.
+
 These identity columns are part of the system columns in the output; see [entry types](/reference/entry-types/) for the
 full list.
