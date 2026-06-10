@@ -173,10 +173,5 @@ export const TraceContextProto: TraceContextBase = {
  * Type guard to check if a value is a TraceContext
  */
 export function isTraceContext(value: unknown): value is TraceContext<FeatureFlagSchema, Record<string, unknown>> {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    TRACE_CONTEXT_MARKER in value &&
-    (value as Record<symbol, unknown>)[TRACE_CONTEXT_MARKER] === true
-  );
+  return typeof value === 'object' && value !== null && Reflect.get(value, TRACE_CONTEXT_MARKER) === true;
 }
