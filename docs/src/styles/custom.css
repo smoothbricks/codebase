@@ -1,0 +1,24 @@
+/**
+ * LMAO docs theme — Phase 1: accent tokens only.
+ *
+ * Terminal-amber accent, dark-first. Status colors elsewhere in the site map to
+ * span semantics (ok=green, err=amber, exception=red); the accent ramp below is
+ * the same amber family so the whole site tells one visual story.
+ *
+ * Dark mode is the default scheme; the light ramp is tuned for >= 4.5:1 contrast
+ * on white (accent text uses the `high` value).
+ */
+
+/* Dark (default) */
+:root {
+  --sl-color-accent-low: #42300a;
+  --sl-color-accent: #d97706;
+  --sl-color-accent-high: #f5c065;
+}
+
+/* Light */
+:root[data-theme='light'] {
+  --sl-color-accent-low: #fdf0d5;
+  --sl-color-accent: #b45309;
+  --sl-color-accent-high: #6b3a06;
+}
