@@ -284,7 +284,11 @@ export function getInsertStatementCacheKey(activeUserFields: readonly string[]):
 }
 
 export function buildInsertSql(activeUserFields: readonly string[]): string {
-  const userColsSql = activeUserFields.length > 0 ? `, ${activeUserFields.join(', ')}` : '';
+  // WHY quote: user column names come from arbitrary LogSchema fields and may
+  // collide with SQLite reserved words (e.g. a `check` or `order` trace column).
+  // buildAddColumnSql already quotes via quoteSqlIdentifier; the INSERT column
+  // list must too, or `near "check": syntax error` at flush time.
+  const userColsSql = activeUserFields.length > 0 ? `, ${activeUserFields.map(quoteSqlIdentifier).join(', ')}` : '';
   const userPlaceholders = activeUserFields.length > 0 ? `, ${activeUserFields.map(() => '?').join(', ')}` : '';
   return `INSERT INTO spans (trace_id, span_id, parent_span_id, row_index, entry_type, timestamp_ns, message${userColsSql})
    VALUES (?, ?, ?, ?, ?, ?, ?${userPlaceholders})`;
