@@ -8,6 +8,7 @@
  */
 
 export { SQLiteAsyncTraceWriter } from './sqlite-async-writer.js';
+export type { SQLiteTableInfoRow } from './sqlite-common.js';
 export {
   buildAddColumnSql,
   extractSqliteColumnsFromTableInfo,
