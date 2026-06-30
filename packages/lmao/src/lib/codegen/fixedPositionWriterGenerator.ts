@@ -183,6 +183,7 @@ function generateWithMethod(schemaFields: readonly ColumnEntry[], enumFieldNames
     }`;
 }
 
+//#region smoo/lmao!n/codegen-architecture
 /**
  * Generate the complete fixed-position writer class code.
  *
@@ -442,3 +443,4 @@ export function createResultWriter<T extends LogSchema, R = unknown, E = unknown
   const WriterClass = getResultWriterClass(schema);
   return new WriterClass(buffer, resultOrError, isError);
 }
+//#endregion smoo/lmao!n/codegen-architecture

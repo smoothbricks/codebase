@@ -26,6 +26,7 @@
 
 import type { SpanBufferStats } from './spanBufferStats.js';
 
+//#region smoo/lmao!n/buffer-tuning-capacity
 /** Minimum spans needed before tuning decisions */
 const MIN_SPANS_FOR_TUNING = 10;
 
@@ -100,3 +101,4 @@ export function shouldTuneCapacity(stats: SpanBufferStats): void {
     resetStats(stats);
   }
 }
+//#endregion smoo/lmao!n/buffer-tuning-capacity

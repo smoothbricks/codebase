@@ -71,9 +71,15 @@ function isRemappedSpanLoggerClass<T extends LogSchema>(value: unknown): value i
   );
 }
 
+//#region smoo/lmao!n/codegen-prefixed-remap
 /**
  * Prefix a tag attribute schema
  * Renames all fields with a prefix to avoid conflicts
+ *
+ * 01j "Library Compilation (Prefixed)": a library defines clean field names
+ * (status, method); the consumer applies a prefix (http) at wire time. This block
+ * generates the prefixed schema, the clean->prefixed mapping, and the RemappedSpanLogger /
+ * RemappedBufferView classes whose clean methods write to prefixed columns.
  *
  * Example:
  * - Input: { status: S.number(), method: S.enum(['GET', 'POST']) }
@@ -680,3 +686,4 @@ export function createRemappedSpanLoggerClass<T extends LogSchema>(
 
   return GeneratedClass;
 }
+//#endregion smoo/lmao!n/codegen-prefixed-remap

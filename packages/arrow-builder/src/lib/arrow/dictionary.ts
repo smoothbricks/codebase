@@ -128,6 +128,7 @@ interface TrackedEntry {
 // Static encoder instance (stateless)
 const encoder = new TextEncoder();
 
+//#region smoo/lmao!n/buffer-perf-dictionary
 export class DictionaryBuilder {
   private entries = new Map<string, TrackedEntry>();
   private totalBytes = 0;
@@ -229,3 +230,4 @@ export class DictionaryBuilder {
     this.totalBytes = 0;
   }
 }
+//#endregion smoo/lmao!n/buffer-perf-dictionary

@@ -13,8 +13,17 @@ import type { RoundingMode } from './rounding.js';
 import { roundBasisToAmount } from './rounding.js';
 import { type Amount, Basis, type Basis as BasisValue } from './types.js';
 
+//#region corpos/billing!n/audit-multi-currency.money-conversion #basis-to-amount-remainder
 /**
  * Audit trail for an FX conversion. Captures all inputs for traceability.
+ *
+ * Spec 14 §Conversion-Boundary: keep intermediate math in high-precision Basis,
+ * convert Basis -> settled Amount at the boundary with an explicit rounding mode,
+ * and never silently absorb the residual. `convertFx` returns the settled Amount,
+ * the explicit `remainder`, and the rate/mode audit. The richer settlement tuple
+ * the spec lists (`source_amount`/`settled_amount`/`rate_source`/`rate_as_of_date`/
+ * `fx_delta_classification`) is assembled by billing's FX Op around this primitive
+ * (`audit-multi-currency.fx-rate-ops`); this is the pure math foundation.
  */
 export interface FxAudit<From extends string, To extends string> {
   readonly fromAmount: Amount<From>;
@@ -83,3 +92,4 @@ export function convertFx<From extends string, To extends string>(
     },
   };
 }
+//#endregion corpos/billing!n/audit-multi-currency.money-conversion

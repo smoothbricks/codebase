@@ -120,6 +120,7 @@ export interface FlushSchedulerConfig {
  * Background flush scheduler
  * Manages automatic flushing of span buffers to Arrow tables
  */
+//#region smoo/lmao!n/buffer-tuning-flush
 export class FlushScheduler {
   private config: Required<FlushSchedulerConfig>;
   private handler: FlushHandler;
@@ -464,6 +465,7 @@ export class FlushScheduler {
     this.lastActivityTime = Date.now();
   }
 }
+//#endregion smoo/lmao!n/buffer-tuning-flush
 
 /**
  * Global flush scheduler instance (optional)

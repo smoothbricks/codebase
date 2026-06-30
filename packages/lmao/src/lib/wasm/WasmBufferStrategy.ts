@@ -30,6 +30,9 @@ import {
   type WasmSpanBufferInstance,
 } from './wasmSpanBuffer.js';
 
+// Spec link (88): realizes specs/lmao/01q_wasm_memory_architecture.md#smoo/lmao!n/wasm-mem (OpContext integration + trace completion).
+//#region smoo/lmao!n/wasm-mem.strategy
+
 function requireWasmSpanBuffer(buffer: AnySpanBuffer): WasmSpanBufferInstance {
   if (!isWasmSpanBufferInstance(buffer)) {
     throw new Error('Expected WASM-backed span buffer');
@@ -217,3 +220,4 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
     };
   }
 }
+//#endregion smoo/lmao!n/wasm-mem.strategy

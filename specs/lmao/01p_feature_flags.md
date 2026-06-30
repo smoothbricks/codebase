@@ -1,6 +1,6 @@
-# Feature Flag System
+# Feature Flag System <a id="smoo/lmao!n/schema-feature-flags.feature-flag-system"></a>
 
-## Overview
+## Overview <a id="smoo/lmao!n/schema-feature-flags.overview"></a>
 
 The feature flag system provides type-safe, high-performance configuration and attribute management for dynamic
 behavior. It integrates deeply with the trace logging system to provide:
@@ -10,11 +10,11 @@ behavior. It integrates deeply with the trace logging system to provide:
 3.  **Analytics**: Automatic tracking of flag access and usage
 4.  **Context Awareness**: Evaluation based on span context (user, region, etc.)
 
-## Schema Definition
+## Schema Definition <a id="smoo/lmao!n/schema-feature-flags.schema-definition"></a>
 
 **Purpose**: Define feature flags with type-safe access and explicit analytics tracking.
 
-### Defining Flags
+### Defining Flags <a id="smoo/lmao!n/schema-feature-flags.defining-flags"></a>
 
 ```typescript
 const featureFlags = defineFeatureFlags({
@@ -34,7 +34,7 @@ const featureFlags = defineFeatureFlags({
 });
 ```
 
-### Flag Access: Wrapper Semantics (`FlagContext | undefined`)
+### Flag Access: Wrapper Semantics (`FlagContext | undefined`) <a id="smoo/lmao!n/schema-feature-flags.flag-access-wrapper-semantics-flagcontext-undefined"></a>
 
 `ctx.ff` uses undefined/truthy semantics:
 
@@ -60,7 +60,7 @@ if (experiment) {
 }
 ```
 
-### Tracking: `flag.track()` Creates a New `ff-usage` Row
+### Tracking: `flag.track()` Creates a New `ff-usage` Row <a id="smoo/lmao!n/schema-feature-flags.tracking-flagtrack-creates-a-new-ff-usage-row"></a>
 
 `ctx.ff.flagName` is access-only and deduplicated (`ff-access`). It does not expose tagging methods because repeated
 accesses are deduped to a single access event per span.
@@ -76,7 +76,7 @@ if (darkMode) {
 }
 ```
 
-### Usage Context Storage
+### Usage Context Storage <a id="smoo/lmao!n/schema-feature-flags.usage-context-storage"></a>
 
 `ff-usage` rows store the flag name in `message`. If `track(context)` is provided, it is applied as
 `track().with(context)` to write known schema fields on the same row.
@@ -88,9 +88,9 @@ if (darkMode) {
 // - optional schema attributes from track(context?) and fluent setters
 ```
 
-## Context Flow & Integration
+## Context Flow & Integration <a id="smoo/lmao!n/schema-feature-flags.context-flow-integration"></a>
 
-### Scope Values for Flag Evaluation
+### Scope Values for Flag Evaluation <a id="smoo/lmao!n/schema-feature-flags.scope-values-for-flag-evaluation"></a>
 
 Feature flag evaluation reads context from two sources:
 
@@ -112,7 +112,7 @@ flagEvaluator: async (ctx, flag, defaultValue) => {
 };
 ```
 
-### Context Flow Diagram
+### Context Flow Diagram <a id="smoo/lmao!n/schema-feature-flags.context-flow-diagram"></a>
 
 ```
 Request Boundary                    Middleware                         Flag Evaluation
@@ -139,11 +139,11 @@ trace('request', {                  ctx.setScope({ region })          ctx.ff.pre
 - **Can log and span**: Create child spans for external calls, log debug info
 - **Type-safe**: TypeScript ensures you can't accidentally access `ctx.ff` in evaluator
 
-## Evaluator Implementation
+## Evaluator Implementation <a id="smoo/lmao!n/op-context-flag-evaluator.evaluator-implementation"></a>
 
 **Purpose**: Handle feature flag evaluation with full span context for logging, tracing, and analytics.
 
-### Ctx-First Evaluator Pattern
+### Ctx-First Evaluator Pattern <a id="smoo/lmao!n/op-context-flag-evaluator.ctx-first-evaluator-pattern"></a>
 
 The evaluator receives `Omit<SpanContext, 'ff'>` - full context access except `ff` itself. This enables:
 
@@ -153,7 +153,7 @@ The evaluator receives `Omit<SpanContext, 'ff'>` - full context access except `f
 4. **Scope values** via `ctx.scope.region`, etc.
 5. **Environment** via `ctx.env` for environment-specific evaluation
 
-### Evaluator Interface
+### Evaluator Interface <a id="smoo/lmao!n/op-context-flag-evaluator.evaluator-interface"></a>
 
 ```typescript
 /**
@@ -206,7 +206,7 @@ ctx-first pattern used throughout the codebase and enables:
 - **Environment**: `ctx.env.LD_SDK_KEY`
 - **Dependencies**: `ctx.deps.http.request(...)`
 
-### Example: LaunchDarkly Integration
+### Example: LaunchDarkly Integration <a id="smoo/lmao!n/op-context-flag-evaluator.example-launchdarkly-integration"></a>
 
 ```typescript
 import { FlagEvaluator, FeatureFlagEvaluator, SpanContextWithoutFf } from '@smoothbricks/lmao';
@@ -301,7 +301,7 @@ const { trace } = new TestTracer(opContext, {
 });
 ```
 
-### Why Each Span Gets Its Own Evaluator Instance
+### Why Each Span Gets Its Own Evaluator Instance <a id="smoo/lmao!n/op-context-flag-evaluator.why-each-span-gets-its-own-evaluator-instance"></a>
 
 The `forContext()` method creates a **new evaluator instance per span**. This is required because:
 
@@ -345,7 +345,7 @@ class GeneratedEvaluator {
 LaunchDarkly) can use `ctx.log`, `ctx.scope`, `ctx.span()` during evaluation. The ctx passed to these methods comes from
 the stored `#spanContext`.
 
-### Why `ff` is Omitted from Evaluator Context
+### Why `ff` is Omitted from Evaluator Context <a id="smoo/lmao!n/op-context-flag-evaluator.why-ff-is-omitted-from-evaluator-context"></a>
 
 The evaluator receives `Omit<SpanContext, 'ff'>` to **prevent infinite recursion**:
 
@@ -365,7 +365,7 @@ flagEvaluator: async (ctx, flag, defaultValue) => {
 };
 ```
 
-### Evaluator Capabilities Summary
+### Evaluator Capabilities Summary <a id="smoo/lmao!n/op-context-flag-evaluator.evaluator-capabilities-summary"></a>
 
 | Capability         | Available | Example                                    |
 | ------------------ | --------- | ------------------------------------------ |
@@ -377,7 +377,7 @@ flagEvaluator: async (ctx, flag, defaultValue) => {
 | Dependencies       | ✅        | `ctx.deps.http.request(...)`               |
 | Other flags        | ❌        | `ctx.ff` is omitted (prevents recursion)   |
 
-### Access Deduplication
+### Access Deduplication <a id="smoo/lmao!n/op-context-flag-evaluator.access-deduplication"></a>
 
 **One `ff-access` per span**: The first access to a flag logs an `ff-access` entry. Subsequent accesses in the same span
 do not log duplicate entries.
@@ -405,9 +405,9 @@ buffer.scopeValues = {
 };
 ```
 
-## Schema Integration Patterns
+## Schema Integration Patterns <a id="smoo/lmao!n/op-context-flag-evaluator.schema-integration-patterns"></a>
 
-### InMemoryFlagEvaluator for Testing/Bootstrap
+### InMemoryFlagEvaluator for Testing/Bootstrap <a id="smoo/lmao!n/op-context-flag-evaluator.inmemoryflagevaluator-for-testingbootstrap"></a>
 
 For tests or bootstrap scenarios, use the built-in `InMemoryFlagEvaluator`:
 
@@ -473,7 +473,7 @@ class InMemoryFlagEvaluator<T, FF, Env> implements FlagEvaluator<T, FF, Env> {
 }
 ```
 
-### Op Integration with Feature Flags
+### Op Integration with Feature Flags <a id="smoo/lmao!n/op-context-flag-evaluator.op-integration-with-feature-flags"></a>
 
 ```typescript
 const fetchUser = defineOp('fetchUser', async (ctx, id: string) => {
@@ -497,7 +497,7 @@ const fetchUser = defineOp('fetchUser', async (ctx, id: string) => {
 });
 ```
 
-### Request Handler Example
+### Request Handler Example <a id="smoo/lmao!n/op-context-flag-evaluator.request-handler-example"></a>
 
 ```typescript
 // With Tracer from defineOpContext
@@ -529,7 +529,7 @@ export default {
 };
 ```
 
-## Performance Characteristics
+## Performance Characteristics <a id="smoo/lmao!n/codegen-spanlogger.performance-characteristics"></a>
 
 - **Every access**: Evaluator call + access dedupe scan (sync via getter, async via `get()`)
 - **First access per flag/span**: Writes one `ff-access` row
@@ -537,7 +537,7 @@ export default {
 - **Tracking**: `flag.track()` writes `ff-usage` rows and returns fluent tagging entry
 - **V8 optimized**: Generated class with real getters (no Proxy traps)
 
-## Complete Example
+## Complete Example <a id="smoo/lmao!n/op-context-flag-evaluator.complete-example"></a>
 
 ```typescript
 import {

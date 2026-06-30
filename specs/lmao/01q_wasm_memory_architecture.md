@@ -1,14 +1,14 @@
-# 01q: WASM Memory Architecture for SpanBuffer Storage
+# 01q: WASM Memory Architecture for SpanBuffer Storage <a id="smoo/lmao!n/wasm-mem"></a>
 
-## Overview
+## Overview <a id="smoo/lmao!n/wasm-mem.overview"></a>
 
 This spec describes a WASM-based memory architecture for SpanBuffer columnar storage. The goal is to consolidate numeric
 column data into WebAssembly memory for improved cache locality and explicit memory management, while keeping string
 data in JavaScript.
 
-## Motivation
+## Motivation <a id="smoo/lmao!n/wasm-mem.motivation"></a>
 
-### Current Architecture
+### Current Architecture <a id="smoo/lmao!n/wasm-mem.current-architecture"></a>
 
 Each SpanBuffer owns separate JavaScript TypedArrays:
 
@@ -23,7 +23,7 @@ Each SpanBuffer owns separate JavaScript TypedArrays:
 - Memory fragmentation across heap
 - 64KB minimum for WASM Memory means per-SpanBuffer WASM is wasteful
 
-### Proposed Architecture
+### Proposed Architecture <a id="smoo/lmao!n/wasm-mem.proposed-architecture"></a>
 
 One `WebAssembly.Memory` per `OpContext`:
 
@@ -32,7 +32,7 @@ One `WebAssembly.Memory` per `OpContext`:
 - Freelists enable memory reuse across traces
 - String columns remain in JS (cold-path dictionary building)
 
-## Design Principles
+## Design Principles <a id="smoo/lmao!n/wasm-mem.design-principles"></a>
 
 1. **WASM per OpContext, not per SpanBuffer** - Amortizes 64KB minimum across many spans
 2. **Freelist per size class** - Enables O(1) allocation/deallocation without fragmentation
@@ -41,9 +41,9 @@ One `WebAssembly.Memory` per `OpContext`:
    `RemappedBufferView`
 5. **Capacity-sized blocks** - All blocks in a freelist are identical size (capacity × element_size)
 
-## Memory Layout
+## Memory Layout <a id="smoo/lmao!n/wasm-mem.memory-layout"></a>
 
-### OpContext WASM Memory
+### OpContext WASM Memory <a id="smoo/lmao!n/wasm-mem.opcontext-wasm-memory"></a>
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -63,7 +63,7 @@ One `WebAssembly.Memory` per `OpContext`:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Header Structure (192 bytes, 3 cache lines)
+### Header Structure (192 bytes, 3 cache lines) <a id="smoo/lmao!n/wasm-mem.header-structure-192-bytes-3-cache-lines"></a>
 
 The header uses tiered freelists for buddy allocation. Each size class has 7 tiers corresponding to capacities 8, 16,
 32, 64, 128, 256, 512.
@@ -89,7 +89,7 @@ Offset  Size  Field
 **Capacity per-call API**: Capacity is NOT stored in the header. Each `alloc_*` and `free_*` call takes capacity as a
 parameter, allowing different OpContexts to share the same WASM memory with different capacities.
 
-### Size Classes
+### Size Classes <a id="smoo/lmao!n/wasm-mem.size-classes"></a>
 
 Each column block contains **both null bitmap and values** - they're always allocated together:
 
@@ -122,7 +122,7 @@ Block layout (column blocks):
 └─────────────────────────────────────────────────────────┘
 ```
 
-### Identity Block Layout
+### Identity Block Layout <a id="smoo/lmao!n/wasm-mem.identity-block-layout"></a>
 
 Each span has an identity block (128 bytes, fixed size) that stores per-span metadata:
 
@@ -142,9 +142,9 @@ trace_id from their parent via the `_parent` buffer reference.
 **Thread ID** is stored globally in the header (not per-span) since all spans in a process/worker share the same thread
 ID.
 
-## Buddy Allocation
+## Buddy Allocation <a id="smoo/lmao!n/wasm-mem.buddy-allocation"></a>
 
-### Why Buddy Allocation?
+### Why Buddy Allocation? <a id="smoo/lmao!n/wasm-mem.why-buddy-allocation"></a>
 
 When capacity changes (e.g., self-tuning adjusts from 64 to 32 rows), blocks in the freelist become the wrong size.
 Buddy allocation allows:
@@ -154,7 +154,7 @@ Buddy allocation allows:
 
 This eliminates memory waste when capacity changes and enables memory compaction.
 
-### Tiered Freelists
+### Tiered Freelists <a id="smoo/lmao!n/wasm-mem.tiered-freelists"></a>
 
 The allocator maintains 28 freelists organized by size class and capacity tier:
 
@@ -164,7 +164,7 @@ The allocator maintains 28 freelists organized by size class and capacity tier:
 
 Freelist index: `size_class * NUM_TIERS + tier`
 
-### Buddy Relationship
+### Buddy Relationship <a id="smoo/lmao!n/wasm-mem.buddy-relationship"></a>
 
 For capacity `C`, blocks can split/merge with capacity `C/2`:
 
@@ -175,7 +175,7 @@ For capacity `C`, blocks can split/merge with capacity `C/2`:
 | col_4b      | 264  | 132  | 66   | `size(C) = 2 × size(C/2)` ✓ |
 | col_8b      | 520  | 260  | 130  | `size(C) = 2 × size(C/2)` ✓ |
 
-### Split Operation (allocAtTier)
+### Split Operation (allocAtTier) <a id="smoo/lmao!n/wasm-mem.split-operation-allocattier"></a>
 
 When allocating a block for capacity tier `T` but freelist is empty:
 
@@ -185,7 +185,7 @@ When allocating a block for capacity tier `T` but freelist is empty:
    - Second half pushed to tier `T` freelist
 3. If all tiers exhausted, bump allocate at current tier
 
-### Merge Operation (freeAtTier) - Address-Based
+### Merge Operation (freeAtTier) - Address-Based <a id="smoo/lmao!n/wasm-mem.merge-operation-freeattier-address-based"></a>
 
 When freeing a block at offset `O` with block size `B`:
 
@@ -201,7 +201,7 @@ When freeing a block at offset `O` with block size `B`:
 
 3. If no merge possible, push to freelist at tier `T`
 
-### Address-Based Buddy Identification (Implemented)
+### Address-Based Buddy Identification (Implemented) <a id="smoo/lmao!n/wasm-mem.address-based-buddy-identification"></a>
 
 Buddies are identified by address arithmetic, not stored pointers:
 
@@ -214,7 +214,7 @@ at `O ± block_size`. If found, we merge.
 **O(n) freelist scan**: `findAndRemoveByOffset` scans the freelist to find a neighbor. Freelists are expected to be
 short in practice (typically 0-10 blocks), so O(n) is acceptable.
 
-### Cascading Merge Behavior
+### Cascading Merge Behavior <a id="smoo/lmao!n/wasm-mem.cascading-merge-behavior"></a>
 
 When blocks are allocated by splitting from the max tier (512), sibling blocks are left at every intermediate tier. When
 freeing, merges cascade all the way back up:
@@ -234,9 +234,9 @@ Free(32) → merge with tier-2 sibling → tier 3
 
 The final merged block ends up at max tier (512).
 
-## Freelist Implementation
+## Freelist Implementation <a id="smoo/lmao!n/wasm-mem.freelist-implementation"></a>
 
-### Zero-Overhead Freelists
+### Zero-Overhead Freelists <a id="smoo/lmao!n/wasm-mem.zero-overhead-freelists"></a>
 
 The freelist uses the **block's own memory** to store the next pointer. When a block is free, its first 4 bytes hold the
 next pointer. When a block is in use, those same bytes hold valid data (null bitmap). There is **no per-block
@@ -248,7 +248,7 @@ This works because:
 - When free, the null bitmap / values are garbage anyway
 - All blocks are ≥ 4 bytes (minimum: 1B column with capacity=4 → 1 + 4 = 5 bytes)
 
-### Block Lifecycle Diagram
+### Block Lifecycle Diagram <a id="smoo/lmao!n/wasm-mem.block-lifecycle-diagram"></a>
 
 ```
 ═══════════════════════════════════════════════════════════════════════════════
@@ -334,7 +334,7 @@ STEP 5: ALLOCATE (new trace starts, pops from freelist)
     SpanBuffer._columnOffsets[colId] = 200   ← New caller holds reference
 ```
 
-### Key Insight
+### Key Insight <a id="smoo/lmao!n/wasm-mem.key-insight"></a>
 
 **A block is never on the freelist AND in use simultaneously.**
 
@@ -346,7 +346,7 @@ The first 4 bytes serve dual purpose:
 - When **free**: `next` pointer to chain free blocks, followed by cascading stats
 - When **in use**: Start of null bitmap (overwritten with valid data)
 
-### Minimum Capacity Requirement
+### Minimum Capacity Requirement <a id="smoo/lmao!n/wasm-mem.minimum-capacity-requirement"></a>
 
 For zero-overhead freelists to work, all blocks must be ≥ 4 bytes to hold the next pointer.
 
@@ -358,7 +358,7 @@ Smallest block is a 1B column: `ceil(capacity/8) + capacity × 1`
 
 **Constraint: capacity ≥ 4** (which is reasonable - a span with fewer than 4 rows is unusual).
 
-### Allocation Algorithm
+### Allocation Algorithm <a id="smoo/lmao!n/wasm-mem.allocation-algorithm"></a>
 
 ```
 fn alloc(size_class: SizeClass) -> u32:
@@ -382,7 +382,7 @@ fn alloc(size_class: SizeClass) -> u32:
     return ptr
 ```
 
-### Deallocation Algorithm
+### Deallocation Algorithm <a id="smoo/lmao!n/wasm-mem.deallocation-algorithm"></a>
 
 ```
 fn free(offset: u32, size_class: SizeClass):
@@ -392,7 +392,7 @@ fn free(offset: u32, size_class: SizeClass):
     freelist_heads[size_class] = offset
 ```
 
-### Freelist Statistics (Zero-Overhead)
+### Freelist Statistics (Zero-Overhead) <a id="smoo/lmao!n/wasm-mem.freelist-statistics-zero-overhead"></a>
 
 Since freed blocks have unused space after the `next` pointer, we store cascading statistics that aggregate as blocks
 are pushed/popped. This is the `FreeBlock` struct (20 bytes):
@@ -459,7 +459,7 @@ If freelist is empty (`HEAD == 0`), all stats return 0.
 - `reuse_ratio = total_reuse_count / header.alloc_count`
 - `fragmentation_indicator`: high `freelist_len` with low `reuse_ratio` suggests fragmentation
 
-### Freelist Growth
+### Freelist Growth <a id="smoo/lmao!n/wasm-mem.freelist-growth"></a>
 
 Freelists start empty and grow dynamically:
 
@@ -471,7 +471,7 @@ Freelists start empty and grow dynamically:
 
 This naturally adapts to the OpContext's usage pattern without pre-reservation.
 
-## What WASM Manages
+## What WASM Manages <a id="smoo/lmao!n/wasm-mem.what-wasm-manages"></a>
 
 | Data                   | Storage     | Notes                                                   |
 | ---------------------- | ----------- | ------------------------------------------------------- |
@@ -481,7 +481,7 @@ This naturally adapts to the OpContext's usage pattern without pre-reservation.
 | Thread ID              | WASM header | Global for all spans (set once per worker/process)      |
 | Span ID counter        | WASM header | Monotonically increasing, used to assign span_id        |
 
-## What JS Manages
+## What JS Manages <a id="smoo/lmao!n/wasm-mem.what-js-manages"></a>
 
 | Data                            | Storage      | Notes                                             |
 | ------------------------------- | ------------ | ------------------------------------------------- |
@@ -489,16 +489,16 @@ This naturally adapts to the OpContext's usage pattern without pre-reservation.
 | SpanBuffer object               | JS heap      | Holds offsets, children, metadata                 |
 | `_columnOffsets`                | `Int32Array` | Maps column ID → WASM offset (-1 = not allocated) |
 
-### Why Strings Stay in JS
+### Why Strings Stay in JS <a id="smoo/lmao!n/wasm-mem.why-strings-stay-in-js"></a>
 
 1. **Dictionary building is cold-path** - Happens at Arrow conversion, not hot-path writes
 2. **UTF-8 encoding is cold-path** - Only needed for Arrow output
 3. **No null bitmap needed** - `undefined` in `string[]` naturally represents null
 4. **Avoids WASM string complexity** - No need for string table management
 
-## SpanBuffer Changes
+## SpanBuffer Changes <a id="smoo/lmao!n/wasm-mem.spanbuffer-changes"></a>
 
-### Current SpanBuffer Properties
+### Current SpanBuffer Properties <a id="smoo/lmao!n/wasm-mem.current-spanbuffer-properties"></a>
 
 ```typescript
 // Per-column TypedArrays (current)
@@ -506,7 +506,7 @@ this._userId_values: Float64Array;
 this._userId_nulls: Uint8Array;
 ```
 
-### Proposed SpanBuffer Properties
+### Proposed SpanBuffer Properties <a id="smoo/lmao!n/wasm-mem.proposed-spanbuffer-properties"></a>
 
 ```typescript
 // Offset into OpContext's WASM memory
@@ -517,7 +517,7 @@ this._columnOffsets: Int32Array;      // Per-column: WASM offset or -1
 this._userId_values: string[];        // For category/text columns
 ```
 
-### Write Path (Numeric Column)
+### Write Path (Numeric Column) <a id="smoo/lmao!n/wasm-mem.write-path-numeric-column"></a>
 
 ```typescript
 // Generated SpanLogger method for numeric column
@@ -547,7 +547,7 @@ latency(value: number) {
 }
 ```
 
-### Write Path (String Column)
+### Write Path (String Column) <a id="smoo/lmao!n/wasm-mem.write-path-string-column"></a>
 
 ```typescript
 // Generated SpanLogger method for category/text column
@@ -566,16 +566,16 @@ userId(value: string) {
 }
 ```
 
-## Library Integration (No Write-Time Remapping)
+## Library Integration (No Write-Time Remapping) <a id="smoo/lmao!n/wasm-mem.library-integration-no-write-time-remapping"></a>
 
-### Current Flow
+### Current Flow <a id="smoo/lmao!n/wasm-mem.current-flow"></a>
 
 Library defines ops with its own schema. When composed into app with `prefix()`:
 
 - `RemappedSpanLogger` generated with prefixed column names baked in
 - `RemappedBufferView` generated for Arrow conversion
 
-### Proposed Flow
+### Proposed Flow <a id="smoo/lmao!n/wasm-mem.proposed-flow"></a>
 
 Same as current - **no change to remapping**:
 
@@ -587,9 +587,9 @@ Same as current - **no change to remapping**:
 This works because each OpContext (library vs app) has its own WASM memory. Library code writes to library memory with
 library column IDs. No cross-OpContext coordination needed at write time.
 
-## Lifecycle
+## Lifecycle <a id="smoo/lmao!n/wasm-mem.lifecycle"></a>
 
-### Span Start
+### Span Start <a id="smoo/lmao!n/wasm-mem.span-start"></a>
 
 ```
 1. Alloc Span System block from freelist_span (or bump)
@@ -598,7 +598,7 @@ library column IDs. No cross-OpContext coordination needed at write time.
 4. String columns: leave as undefined (lazy)
 ```
 
-### Lazy Column Allocation
+### Lazy Column Allocation <a id="smoo/lmao!n/wasm-mem.lazy-column-allocation"></a>
 
 ```
 On first write to numeric column:
@@ -608,7 +608,7 @@ On first write to numeric column:
 3. Write value and null bit
 ```
 
-### Trace Completion
+### Trace Completion <a id="smoo/lmao!n/wasm-mem.trace-completion"></a>
 
 ```
 Walk span tree depth-first:
@@ -619,7 +619,7 @@ For each span:
   3. String arrays: left for GC (or pooled)
 ```
 
-## Capacity Tuning Considerations
+## Capacity Tuning Considerations <a id="smoo/lmao!n/wasm-mem.capacity-tuning-considerations"></a>
 
 If OpContext capacity changes (e.g., 32 → 64):
 
@@ -628,7 +628,7 @@ If OpContext capacity changes (e.g., 32 → 64):
 - Memory waste during tuning phase, but capacity stabilizes quickly
 - Alternative: Maintain separate freelists per capacity (more complex)
 
-## Concurrent Traces
+## Concurrent Traces <a id="smoo/lmao!n/wasm-mem.concurrent-traces"></a>
 
 Multiple traces can be in-flight within same OpContext (async/await):
 
@@ -641,22 +641,22 @@ Trace B resumes: writes to its pre-allocated offsets
 
 Single-threaded JS ensures no race conditions. Each span has its own allocated blocks, writes are isolated.
 
-## Memory Growth and Reclamation
+## Memory Growth and Reclamation <a id="smoo/lmao!n/wasm-mem.memory-growth-and-reclamation"></a>
 
-### Growth
+### Growth <a id="smoo/lmao!n/wasm-mem.growth"></a>
 
 - WASM memory grows in 64KB pages via `memory.grow()`
 - Bump allocator carves small blocks from pages
 - Growth happens when freelists empty AND bump area exhausted
 
-### Reclamation
+### Reclamation <a id="smoo/lmao!n/wasm-mem.reclamation"></a>
 
 - Blocks returned to freelists on trace completion
 - Freelists enable reuse without compaction
 - WASM memory never shrinks (spec limitation)
 - Memory naturally stabilizes at peak usage level
 
-### Long-Running Processes
+### Long-Running Processes <a id="smoo/lmao!n/wasm-mem.long-running-processes"></a>
 
 For servers handling many requests:
 
@@ -664,28 +664,28 @@ For servers handling many requests:
 - Peak memory = max concurrent traces × blocks per trace
 - No unbounded growth if traces complete and return blocks
 
-## Performance Characteristics
+## Performance Characteristics <a id="smoo/lmao!n/wasm-mem.performance-characteristics"></a>
 
-### Cache Locality
+### Cache Locality <a id="smoo/lmao!n/wasm-mem.cache-locality"></a>
 
 - All numeric data for an OpContext in contiguous WASM memory
 - Span System blocks (timestamp + entry_type) accessed together
 - Better L1/L2 cache utilization than scattered TypedArrays
 
-### Allocation Cost
+### Allocation Cost <a id="smoo/lmao!n/wasm-mem.allocation-cost"></a>
 
 - Freelist pop: O(1) - read next pointer, update head
 - Freelist push: O(1) - write next pointer, update head
 - Bump allocate: O(1) - increment pointer, maybe grow memory
 - No GC pressure for numeric data
 
-### Write Cost
+### Write Cost <a id="smoo/lmao!n/wasm-mem.write-cost"></a>
 
 - Same as current: array index write
 - One extra indirection: `_columnOffsets[colId]` lookup
 - Offset cached after first write per column
 
-## Implementation Status
+## Implementation Status <a id="smoo/lmao!n/wasm-mem.implementation-map"></a>
 
 **All phases complete and tested** - WASM memory architecture is fully integrated:
 
@@ -705,7 +705,7 @@ The WASM architecture is production-ready and works seamlessly with:
 - Arrow conversion via existing `convertSpanTreeToArrowTable()`
 - Schema generation (S.enum, S.category, S.text, S.number, S.boolean)
 
-### Phase 1: WASM Allocator Module ✅ COMPLETE
+### Phase 1: WASM Allocator Module ✅ COMPLETE <a id="smoo/lmao!n/wasm-mem.allocator"></a>
 
 Implemented in Zig (`packages/lmao/src/lib/wasm/allocator.zig`):
 
@@ -728,7 +728,7 @@ TypeScript wrapper (`packages/lmao/src/lib/wasm/wasmAllocator.ts`):
 - All WASM functions exposed with TypeScript types
 - Capacity defaults to allocator's configured capacity but can be overridden per-call
 
-### Phase 2: OpContext Integration ✅ COMPLETE
+### Phase 2: OpContext Integration ✅ COMPLETE <a id="smoo/lmao!n/wasm-mem.strategy"></a>
 
 Implemented as `WasmBufferStrategy` (`packages/lmao/src/lib/wasm/WasmBufferStrategy.ts`):
 
@@ -738,7 +738,7 @@ Implemented as `WasmBufferStrategy` (`packages/lmao/src/lib/wasm/WasmBufferStrat
 - Implements `BufferStrategy` interface for full Tracer compatibility
 - Handles memory growth via allocator's bump pointer mechanism
 
-### Phase 3: SpanBuffer Migration ✅ COMPLETE
+### Phase 3: SpanBuffer Migration ✅ COMPLETE <a id="smoo/lmao!n/wasm-mem.spanbuffer"></a>
 
 Implemented in `WasmSpanBuffer` (`packages/lmao/src/lib/wasm/wasmSpanBuffer.ts`, 942 lines):
 
@@ -751,7 +751,7 @@ Implemented in `WasmSpanBuffer` (`packages/lmao/src/lib/wasm/wasmSpanBuffer.ts`,
 - System columns stored in WASM via `_systemPtr`
 - Full test coverage in `wasmSpanBuffer.test.ts` (52 tests)
 
-### Phase 4: SpanLogger Codegen ✅ COMPLETE
+### Phase 4: SpanLogger Codegen ✅ COMPLETE <a id="smoo/lmao!n/wasm-mem.spanlogger-codegen"></a>
 
 Code generation in `wasmSpanBuffer.ts`:
 
@@ -765,7 +765,7 @@ Code generation in `wasmSpanBuffer.ts`:
 - Fluent API preserved (all methods return `this`)
 - Supports both numeric (float64, uint32, uint8) and string (category, text) column types
 
-### Phase 5: Trace Completion ✅ COMPLETE
+### Phase 5: Trace Completion ✅ COMPLETE <a id="smoo/lmao!n/wasm-mem.trace-completion-2"></a>
 
 Implemented in `WasmBufferStrategy` (`packages/lmao/src/lib/wasm/WasmBufferStrategy.ts`):
 
@@ -778,7 +778,7 @@ Implemented in `WasmBufferStrategy` (`packages/lmao/src/lib/wasm/WasmBufferStrat
 - Freelist merges enabled by address-based buddy allocation
 - Supports capacity tuning by discarding orphaned blocks (simple, effective)
 
-### Phase 6: Benchmarking ✅ COMPLETE
+### Phase 6: Benchmarking ✅ COMPLETE <a id="smoo/lmao!n/wasm-mem.bench"></a>
 
 Implemented in `benchmarks/js-vs-wasm.bench.ts`:
 
@@ -790,7 +790,7 @@ Implemented in `benchmarks/js-vs-wasm.bench.ts`:
 - Integration tests in `wasm-integration.test.ts` (full end-to-end test suite)
 - `WasmTracer` disabled tests available (wasmTracer.test.ts.disabled) for future work
 
-## Open Questions (Resolved/Deferred)
+## Open Questions (Resolved/Deferred) <a id="smoo/lmao!n/wasm-mem.resolved-decisions"></a>
 
 1. ~~**Capacity tuning**: Accept orphaned blocks, or track blocks by capacity?~~ ✅ **RESOLVED**: Accept orphaned blocks
    during capacity tuning - simple, effective, capacity stabilizes quickly in practice.
@@ -805,13 +805,13 @@ Implemented in `benchmarks/js-vs-wasm.bench.ts`:
 4. ~~**Overflow buffers**: Do overflow buffers allocate from same WASM memory?~~ ✅ **RESOLVED**: Yes -
    `createWasmOverflowBuffer()` allocates from the same allocator, enabling memory reuse across overflow buffers.
 
-## Future Optimizations (Not Currently Implemented)
+## Future Optimizations (Not Currently Implemented) <a id="smoo/lmao!n/wasm-mem-deferred"></a>
 
 - **String array pooling**: Pool `string[]` arrays to reduce GC pressure in long-running processes
 - **Per-capacity freelists**: Track blocks by capacity to avoid orphaning during self-tuning (more complex)
 - **Hot path optimizations**: Further inline WASM exports, elide bounds checking via capacity constraints
 
-## References
+## References <a id="smoo/lmao!n/wasm-mem.references"></a>
 
 - [01b_columnar_buffer_architecture.md](./01b_columnar_buffer_architecture.md) - Current buffer architecture
 - [01b6_buffer_codegen_extension.md](./01b6_buffer_codegen_extension.md) - Buffer code generation

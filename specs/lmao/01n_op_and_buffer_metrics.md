@@ -1,15 +1,15 @@
-# Op and Buffer Metrics
+# Op and Buffer Metrics <a id="smoo/lmao!n/op-metrics"></a>
 
-## Overview
+## Overview <a id="smoo/lmao!n/op-metrics.overview"></a>
 
 Op metrics track runtime performance of operations. Buffer metrics track memory efficiency of columnar buffers. Both are
 stored as structured log entries in the same Arrow table as trace data.
 
 **Key insight:** Metrics reuse span timestamps, achieving zero extra timing overhead in the hot path.
 
-## Design Evolution: Why This Design
+## Design Evolution: Why This Design <a id="smoo/lmao!n/op-metrics.design-evolution-why-this-design"></a>
 
-### Problem: No Runtime Visibility
+### Problem: No Runtime Visibility <a id="smoo/lmao!n/op-metrics.problem-no-runtime-visibility"></a>
 
 Without metrics, users must query all trace data to calculate invocation counts, error rates, and durations. This is:
 
@@ -17,7 +17,7 @@ Without metrics, users must query all trace data to calculate invocation counts,
 - **Slow**: Real-time dashboards impossible without pre-aggregation
 - **Wasteful**: Same calculations repeated on every query
 
-### Key Design Decisions
+### Key Design Decisions <a id="smoo/lmao!n/op-metrics.key-design-decisions"></a>
 
 #### 1. Metrics as Structured Logs (Not Separate Table)
 
@@ -151,11 +151,11 @@ GROUP BY timestamp, package_name
 - Compare performance between different modules within a service
 - Roll up file-level metrics to package-level dashboards
 
-## Entry Types for Metrics
+## Entry Types for Metrics <a id="smoo/lmao!n/lmao-entry-metrics-entry-types.entry-types-for-metrics"></a>
 
 **Total: 13 new entry types**
 
-### Period Marker (1)
+### Period Marker (1) <a id="smoo/lmao!n/lmao-entry-metrics-entry-types.period-marker-1"></a>
 
 | Entry Type   | message | uint64_value                           |
 | ------------ | ------- | -------------------------------------- |
@@ -163,7 +163,7 @@ GROUP BY timestamp, package_name
 
 The period ends at `timestamp` (the flush time). Duration = `timestamp - uint64_value`.
 
-### Op Metrics (8)
+### Op Metrics (8) <a id="smoo/lmao!n/lmao-entry-metrics-entry-types.op-metrics-8"></a>
 
 | Entry Type        | package_file | message | uint64_value                       |
 | ----------------- | ------------ | ------- | ---------------------------------- |
@@ -184,7 +184,7 @@ The period ends at `timestamp` (the flush time). Duration = `timestamp - uint64_
 - Both `package_file` and `message` enable hierarchical aggregation (see
   [Hierarchical Aggregation Support](#8-hierarchical-aggregation-support))
 
-### Buffer Metrics (4)
+### Buffer Metrics (4) <a id="smoo/lmao!n/lmao-entry-metrics-entry-types.buffer-metrics-3"></a>
 
 | Entry Type             | message | uint64_value                        |
 | ---------------------- | ------- | ----------------------------------- |
@@ -198,7 +198,7 @@ The period ends at `timestamp` (the flush time). Duration = `timestamp - uint64_
 - Buffer metrics are per-module (identified by `package_name`)
 - High `buffer-overflows` suggests initial capacity tuning needed
 
-## Op Class Metrics Tracking
+## Op Class Metrics Tracking <a id="smoo/lmao!n/op-metrics-collection"></a>
 
 The `Op` class maintains metrics counters that reset on each flush. Type parameters are ordered to match the function
 signature `(ctx, ...args) => Promise<Result>`:
@@ -232,7 +232,7 @@ class Op<Ctx, Args extends unknown[], Result> {
 - 9,007,199,254,740,991 ns = ~104 days
 - Summing many durations compounds quickly
 
-## Collecting Metrics (Inside Op's Invoke)
+## Collecting Metrics (Inside Op's Invoke) <a id="smoo/lmao!n/op-metrics-collection.collecting-metrics-inside-ops-invoke"></a>
 
 ```typescript
 async invoke(parentCtx, spanName, line, ...args) {
@@ -274,9 +274,9 @@ async invoke(parentCtx, spanName, line, ...args) {
 **Key insight:** No extra timing calls. We reuse `buffer.timestamp[0]` (written by `span-start`) and
 `buffer.timestamp[1]` (written by `span-ok/err`).
 
-## Metrics Flush
+## Metrics Flush <a id="smoo/lmao!n/op-metrics-collection.metrics-flush"></a>
 
-### When
+### When <a id="smoo/lmao!n/op-metrics-collection.when"></a>
 
 Metrics flush alongside trace data using the same `FlushScheduler` triggers:
 
@@ -285,7 +285,7 @@ Metrics flush alongside trace data using the same `FlushScheduler` triggers:
 - Idle timeout (5s of inactivity)
 - Manual `flush()` call
 
-### Process
+### Process <a id="smoo/lmao!n/op-metrics-collection.process"></a>
 
 1. Capture current timestamp as `period_end` (this becomes `timestamp` for all metric rows)
 2. For each module: a. Write `period-start` row with `periodStartNs` as `uint64_value` b. For each Op in module:
@@ -301,7 +301,7 @@ Metrics flush alongside trace data using the same `FlushScheduler` triggers:
 3. Reset all counters to zero
 4. Update `periodStartNs` to current timestamp (start of next period)
 
-### Example Flush Output
+### Example Flush Output <a id="smoo/lmao!n/op-metrics-collection.example-flush-output"></a>
 
 ```
 timestamp | thread_id | package_name | package_file       | entry_type             | message | uint64_value
@@ -336,7 +336,7 @@ timestamp | thread_id | package_name | package_file       | entry_type          
 **Note:** Buffer metrics don't have `package_file` since they're aggregated at the package level. Op metrics include
 `package_file` to enable file-level aggregation.
 
-## User-Facing API
+## User-Facing API <a id="smoo/lmao!n/op-metrics-uint64-api"></a>
 
 Users can write `uint64_value` for their own purposes using the `.uint64()` method:
 
@@ -359,9 +359,9 @@ const processRecords = op(async ({ log, tag, ok }, records) => {
 - Same column, same storage efficiency
 - Consistent API: `.uint64(value)` works on `tag`, `log`, and result methods
 
-## Query Examples (ClickHouse)
+## Query Examples (ClickHouse) <a id="smoo/lmao!n/op-metrics.query-examples-clickhouse"></a>
 
-### Op Performance Summary (Per-Op Granularity)
+### Op Performance Summary (Per-Op Granularity) <a id="smoo/lmao!n/op-metrics.op-performance-summary-per-op-granularity"></a>
 
 Get a complete picture of each operation's performance:
 
@@ -388,7 +388,7 @@ GROUP BY timestamp, package_name, package_file, message
 ORDER BY invocations DESC
 ```
 
-### File-Level Aggregation
+### File-Level Aggregation <a id="smoo/lmao!n/op-metrics.file-level-aggregation"></a>
 
 Aggregate all ops within each file to identify problematic modules:
 
@@ -411,7 +411,7 @@ GROUP BY timestamp, package_name, package_file
 ORDER BY file_error_rate DESC
 ```
 
-### Package-Level Aggregation
+### Package-Level Aggregation <a id="smoo/lmao!n/op-metrics.package-level-aggregation"></a>
 
 Roll up all ops to package-level metrics for service health dashboards:
 
@@ -435,7 +435,7 @@ GROUP BY timestamp, package_name
 ORDER BY total_invocations DESC
 ```
 
-### Error Duration Analysis
+### Error Duration Analysis <a id="smoo/lmao!n/op-metrics.error-duration-analysis"></a>
 
 Determine if errors are fast-fails (validation) or slow timeouts:
 
@@ -469,7 +469,7 @@ GROUP BY timestamp, package_name, package_file, message
 -- If avg_err_duration << avg_ok_duration: fast validation failures
 ```
 
-### Buffer Health
+### Buffer Health <a id="smoo/lmao!n/op-metrics.buffer-health"></a>
 
 Monitor buffer efficiency and detect capacity issues:
 
@@ -489,7 +489,7 @@ GROUP BY timestamp, package_name
 ORDER BY overflow_rate DESC
 ```
 
-### Invocation Rate (Throughput)
+### Invocation Rate (Throughput) <a id="smoo/lmao!n/op-metrics.invocation-rate-throughput"></a>
 
 Calculate operations per second:
 
@@ -511,7 +511,7 @@ GROUP BY timestamp, package_name, package_file, message
 ORDER BY invocations_per_sec DESC
 ```
 
-### Latency Distribution Over Time
+### Latency Distribution Over Time <a id="smoo/lmao!n/op-metrics.latency-distribution-over-time"></a>
 
 Track p50/p90/p99 approximations across periods:
 
@@ -531,7 +531,7 @@ GROUP BY minute, package_name, package_file, message
 ORDER BY minute, package_name, package_file, op_name
 ```
 
-### Package Throughput Over Time
+### Package Throughput Over Time <a id="smoo/lmao!n/op-metrics.package-throughput-over-time"></a>
 
 Track package-level throughput trends:
 
@@ -551,7 +551,7 @@ GROUP BY minute, package_name
 ORDER BY minute, package_name
 ```
 
-## Integration with Other Specs
+## Integration with Other Specs <a id="smoo/lmao!n/op-metrics.integration-with-other-specs"></a>
 
 | Spec                                                                                   | Integration                                        |
 | -------------------------------------------------------------------------------------- | -------------------------------------------------- |
@@ -562,7 +562,7 @@ ORDER BY minute, package_name
 | [01g_trace_context_api_codegen.md](01g_trace_context_api_codegen.md)                   | Generates `.uint64()` method on SpanLogger         |
 | [01a_trace_schema_system.md](01a_trace_schema_system.md)                               | Entry type enum extended with metric types         |
 
-## Summary
+## Summary <a id="smoo/lmao!n/op-metrics.summary"></a>
 
 Op and Buffer metrics provide runtime visibility with zero timing overhead by reusing span timestamps. The design stores
 metrics as structured log entries (not a separate table), uses a single `uint64_value` column for all numeric needs, and

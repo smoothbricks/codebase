@@ -1,9 +1,9 @@
-# TypeScript Transformer
+# TypeScript Transformer <a id="smoo/lmao!n/transformer"></a>
 
 The LMAO TypeScript transformer performs compile-time optimizations that enable zero-overhead logging at runtime. It
 transforms ergonomic user code into V8-optimized output.
 
-## Design Philosophy
+## Design Philosophy <a id="smoo/lmao!n/transformer-philosophy"></a>
 
 **User writes ergonomic code, transformer produces optimized code.**
 
@@ -15,9 +15,9 @@ The transformer enables two modes:
 This means the library is usable without the transformer (for quick prototyping, REPL usage, etc.) but production builds
 should always use the transformer for optimal performance.
 
-## Transformations
+## Transformations <a id="smoo/lmao!n/transformer-transformations"></a>
 
-### 1. Line Number Injection
+### 1. Line Number Injection <a id="smoo/lmao!n/transformer-line-injection"></a>
 
 Injects source line numbers as the first argument to `span()` calls for source mapping without runtime stack parsing.
 
@@ -31,7 +31,7 @@ await ctx.span(42, 'fetch-user', fetchUserOp, userId);
 
 The line number flows directly to TypedArray writes - it is NEVER stored as a property on any object.
 
-### 2. Monomorphic span() Rewriting
+### 2. Monomorphic span() Rewriting <a id="smoo/lmao!n/transformer-span-rewrite"></a>
 
 **Problem**: `span()` has multiple overloads (Op invocation, inline closure). A single method with runtime argument
 inspection is polymorphic - V8 can't optimize the call site.
@@ -105,7 +105,7 @@ await ctx.span_op(42, 'external-call', Object.assign(Object.create(ctx), { env: 
 - Second argument is `Op` instance → `span_op` with `ctx` as context
 - Second argument is arrow function or function expression → `span_fn` with `ctx` as context
 
-### 3. Destructured Context Rewriting
+### 3. Destructured Context Rewriting <a id="smoo/lmao!n/transformer-destructured-context"></a>
 
 **Problem**: When users destructure the context parameter, there's no `ctx` variable to call methods on:
 
@@ -159,7 +159,7 @@ const myOp = op(async (__ctx) => {
 });
 ```
 
-### 4. `with()` Bulk Setter Unrolling
+### 4. `with()` Bulk Setter Unrolling <a id="smoo/lmao!n/transformer-tag-chain-inline"></a>
 
 Transforms object-based bulk setters into individual setter calls for V8 inline caching:
 
@@ -177,7 +177,7 @@ ctx.tag.userId('user-123').requestId('req-456');
 - Eliminates `Object.keys()` iteration at runtime
 - Each setter call is monomorphic with inline caching
 
-### 5. Metadata Injection
+### 5. Metadata Injection <a id="smoo/lmao!n/transformer-metadata-inject"></a>
 
 Injects module metadata from build context:
 
@@ -208,7 +208,7 @@ const myModule = defineModule({
 - `packagePath`: Relative path from package root
 - `gitSha`: From git HEAD (optional, CI environments)
 
-### 6. Log Line Number Injection
+### 6. Log Line Number Injection <a id="smoo/lmao!n/transformer-log-line"></a>
 
 Appends `.line(N)` to log calls for source mapping:
 
@@ -222,7 +222,7 @@ log.info('Processing user').line(42);
 log.warn('Rate limit approaching').line(43);
 ```
 
-## V8 Optimization Impact
+## V8 Optimization Impact <a id="smoo/lmao!n/transformer-v8-impact"></a>
 
 | Transformation       | Without Transformer      | With Transformer         |
 | -------------------- | ------------------------ | ------------------------ |
@@ -232,9 +232,9 @@ log.warn('Rate limit approaching').line(43);
 | Line numbers         | Not available            | Zero-cost injection      |
 | Metadata             | Manual or missing        | Auto-injected            |
 
-## Implementation Notes
+## Implementation Notes <a id="smoo/lmao!n/transformer-impl-notes"></a>
 
-### Detecting Op vs Function
+### Detecting Op vs Function <a id="smoo/lmao!n/transformer-detect-op"></a>
 
 The transformer uses TypeScript's type system to distinguish:
 
@@ -247,7 +247,7 @@ await span('name', async () => { ... });   // → span_fn
 await span('name', async function() { });  // → span_fn
 ```
 
-### Synthetic Variable Naming
+### Synthetic Variable Naming <a id="smoo/lmao!n/transformer-synthetic-naming"></a>
 
 The `__ctx` variable name is chosen to:
 
@@ -257,11 +257,11 @@ The `__ctx` variable name is chosen to:
 
 If `__ctx` is already in scope (unlikely), transformer falls back to `__ctx$1`, `__ctx$2`, etc.
 
-### Source Maps
+### Source Maps <a id="smoo/lmao!n/transformer-source-maps"></a>
 
 All transformations preserve source map mappings so debuggers show original source locations.
 
-## Fallback Behavior
+## Fallback Behavior <a id="smoo/lmao!n/transformer-fallback"></a>
 
 Without the transformer, everything still works:
 
@@ -276,7 +276,7 @@ This enables:
 - Quick prototyping
 - Gradual adoption
 
-## Related Specs
+## Related Specs <a id="smoo/lmao!n/transformer-related"></a>
 
 - [Entry Types and Logging Primitives](./01h_entry_types_and_logging_primitives.md) - `with()` bulk setter
 - [Op Context Pattern](./01l_op_context_pattern.md) - Metadata injection, `span()` overloads

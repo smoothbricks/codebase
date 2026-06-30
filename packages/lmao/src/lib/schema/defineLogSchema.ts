@@ -229,6 +229,7 @@ function assertValidatedObject<T extends SchemaFields>(
   }
 }
 
+//#region smoo/lmao!n/schema-log-schema
 export function defineLogSchema<T extends SchemaFields>(
   schema: T,
   options?: DefineLogSchemaOptions,
@@ -289,3 +290,4 @@ export function defineLogSchema<T extends SchemaFields>(
   // Return logSchema (still a LogSchema instance with added methods)
   return result;
 }
+//#endregion smoo/lmao!n/schema-log-schema

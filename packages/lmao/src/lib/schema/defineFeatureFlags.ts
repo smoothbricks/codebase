@@ -1,3 +1,4 @@
+//#region corpos/billing!n/audit-flag-evaluator.lmao-flag-schema
 import type { Output } from '@smoothbricks/arrow-builder';
 import type { FeatureFlagDefinition } from './types.js';
 
@@ -89,3 +90,4 @@ export interface UsageContext {
   value?: number;
   metadata?: Record<string, string | number | boolean>;
 }
+//#endregion corpos/billing!n/audit-flag-evaluator.lmao-flag-schema

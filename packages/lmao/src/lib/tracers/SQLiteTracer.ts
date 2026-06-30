@@ -21,6 +21,7 @@ export interface SQLiteAsyncTracerOptions<
 /**
  * Tracer that persists completed root traces to SQLite synchronously.
  */
+//#region smoo/lmao!n/tracer-implementations.sqlite
 export class SQLiteTracer<B extends OpContextBinding = OpContextBinding> extends Tracer<B> {
   private readonly writer: SQLiteTraceWriter;
 
@@ -57,6 +58,7 @@ export class SQLiteTracer<B extends OpContextBinding = OpContextBinding> extends
     cleanupDebug('sqliteTracer.close:end');
   }
 }
+//#endregion smoo/lmao!n/tracer-implementations.sqlite
 
 /**
  * Tracer that persists completed root traces to SQLite asynchronously.

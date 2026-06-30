@@ -1,4 +1,4 @@
-# Buffer Performance Optimizations
+# Buffer Performance Optimizations <a id="smoo/lmao!n/buffer-perf"></a>
 
 > **📚 PART OF COLUMNAR BUFFER ARCHITECTURE**
 >
@@ -37,7 +37,7 @@ buffer.timestamp[idx] = Date.now(); // 8 bytes written directly
 buffer.userIds[idx] = 123; // 4 bytes written directly
 ```
 
-## V8 Optimization Patterns
+## V8 Optimization Patterns <a id="smoo/lmao!n/buffer-perf-v8-patterns"></a>
 
 ### 1. Monomorphic Array Access
 
@@ -204,7 +204,7 @@ class BufferWriter {
 }
 ```
 
-### 4. Cache Line Alignment
+### 4. Cache Line Alignment <a id="smoo/lmao!n/buffer-perf-cache-alignment"></a>
 
 **WHY**: CPUs load memory in 64-byte cache lines. Aligned access = fewer cache misses.
 
@@ -266,7 +266,7 @@ class SequentialBuffer {
 }
 ```
 
-## String Column Optimization
+## String Column Optimization <a id="smoo/lmao!n/buffer-perf-string-columns"></a>
 
 ### The String Problem
 
@@ -665,7 +665,7 @@ dictionary, TEXT only if it saves >128 bytes.
 5. **Bounded growth**: Strings cleared after each flush, SIEVE cache bounds UTF-8 memory
 6. **Simpler implementation**: No global interner state to manage
 
-## Memory Layout Optimization
+## Memory Layout Optimization <a id="smoo/lmao!n/buffer-perf-memory-layout"></a>
 
 ### Array of Structs vs Struct of Arrays
 
@@ -1145,14 +1145,14 @@ class MemoryMonitor {
 }
 ```
 
-## String Interning and UTF-8 Caching Architecture
+## String Interning and UTF-8 Caching Architecture <a id="smoo/lmao!n/buffer-perf-interning-arch"></a>
 
 The system uses a two-tier architecture for efficient string handling:
 
 1. **Global Interner (arrow-builder)**: Pre-encodes UTF-8 for compile-time known strings
 2. **SIEVE Cache (lmao)**: Bounded cache for runtime strings during Arrow conversion
 
-### StringInterner (arrow-builder owns)
+### StringInterner (arrow-builder owns) <a id="smoo/lmao!n/buffer-perf-interner"></a>
 
 Located in `packages/arrow-builder/src/lib/arrow/interner.ts`.
 
@@ -1212,7 +1212,7 @@ const buffer = createSpanBuffer(
 buffer.lineNumber_values[0] = lineNumber; // Direct TypedArray write, NOT stored as property
 ```
 
-### Utf8Cache (lmao owns)
+### Utf8Cache (lmao owns) <a id="smoo/lmao!n/buffer-perf-utf8-cache"></a>
 
 Located in `packages/lmao/src/lib/utf8Cache.ts`.
 
@@ -1250,7 +1250,7 @@ export const globalUtf8Cache = new Utf8Cache(); // Singleton
 **Why separate from interner**: Runtime strings have high cardinality (userIds, error messages) and need bounded memory.
 The interner is for finite, known strings; the cache is for unbounded, runtime strings.
 
-### DictionaryBuilder (arrow-builder owns)
+### DictionaryBuilder (arrow-builder owns) <a id="smoo/lmao!n/buffer-perf-dictionary"></a>
 
 Located in `packages/arrow-builder/src/lib/arrow/dictionary.ts`.
 

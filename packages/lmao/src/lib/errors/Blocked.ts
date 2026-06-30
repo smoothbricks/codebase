@@ -53,6 +53,7 @@
 
 import type { TaggedError } from '../result.js';
 
+//#region smoo/lmao!n/op-context-tagged-errors.blocked
 /**
  * Reason why an Op is blocked.
  */
@@ -163,3 +164,4 @@ export class Blocked extends Error implements TaggedError<'Blocked'> {
     };
   }
 }
+//#endregion smoo/lmao!n/op-context-tagged-errors.blocked

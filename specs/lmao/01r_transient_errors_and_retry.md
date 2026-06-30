@@ -1,6 +1,6 @@
-# Transient Errors and Retry System
+# Transient Errors and Retry System <a id="smoo/lmao!n/op-retry.transient-errors-and-retry-system"></a>
 
-## Overview
+## Overview <a id="smoo/lmao!n/op-retry.overview"></a>
 
 The transient error and retry system provides automatic retry logic for operations that may temporarily fail due to
 external dependencies. This pattern is common in distributed systems where network issues, rate limiting, or service
@@ -14,7 +14,7 @@ Key components:
 4. **executeWithRetry**: Retry loop in span execution
 5. **span-retry entries**: Observability entries for retry tracking
 
-## Error Type Hierarchy
+## Error Type Hierarchy <a id="smoo/lmao!n/op-context-tagged-errors.error-type-hierarchy"></a>
 
 ```
 Error (JavaScript built-in)
@@ -34,11 +34,11 @@ Error (JavaScript built-in)
 
 **Key Distinction**: TransientError triggers retry, Blocked and CodeError do not.
 
-## TransientError Class
+## TransientError Class <a id="smoo/lmao!n/op-retry.transienterror-class"></a>
 
 TransientError represents a temporary failure that should be retried according to a configurable policy.
 
-### Factory Pattern
+### Factory Pattern <a id="smoo/lmao!n/op-retry.factory-pattern"></a>
 
 ```typescript
 // Define a transient error code with default policy
@@ -68,7 +68,7 @@ const fetchData = defineOp('fetchData', async (ctx, url: string) => {
 });
 ```
 
-### Transient Factory Signature
+### Transient Factory Signature <a id="smoo/lmao!n/op-retry.transient-factory-signature"></a>
 
 ```typescript
 function Transient<T>(code: string, defaultPolicy: RetryPolicy): TransientErrorFactory<T>;
@@ -86,7 +86,7 @@ type TransientErrorFactory<T> = {
 };
 ```
 
-### TransientError Instance
+### TransientError Instance <a id="smoo/lmao!n/op-retry.transienterror-instance"></a>
 
 ```typescript
 class TransientError<C extends string = string, T = unknown> extends Error {
@@ -99,7 +99,7 @@ class TransientError<C extends string = string, T = unknown> extends Error {
 }
 ```
 
-## RetryPolicy
+## RetryPolicy <a id="smoo/lmao!n/op-retry.retrypolicy"></a>
 
 RetryPolicy configures how retries are performed:
 
@@ -122,7 +122,7 @@ interface RetryPolicy {
 }
 ```
 
-### Backoff Strategy Helpers
+### Backoff Strategy Helpers <a id="smoo/lmao!n/op-retry.backoff-strategy-helpers"></a>
 
 ```typescript
 // Exponential backoff: delay = baseDelayMs * 2^(attempt-1)
@@ -159,7 +159,7 @@ function fixedDelay(maxAttempts: number, baseDelayMs: number): RetryPolicy {
 }
 ```
 
-### Delay Calculation
+### Delay Calculation <a id="smoo/lmao!n/op-retry.delay-calculation"></a>
 
 ```typescript
 function calculateDelay(policy: RetryPolicy, attempt: number): number {
@@ -193,12 +193,12 @@ function calculateDelay(policy: RetryPolicy, attempt: number): number {
 }
 ```
 
-## Blocked Class
+## Blocked Class <a id="smoo/lmao!n/op-context-tagged-errors.blocked-class"></a>
 
 Blocked represents a non-transient blocking condition - the operation cannot proceed and should NOT be retried. This is
 distinct from TransientError which indicates temporary failure.
 
-### Factory Methods
+### Factory Methods <a id="smoo/lmao!n/op-context-tagged-errors.factory-methods"></a>
 
 ```typescript
 class Blocked extends Error {
@@ -220,7 +220,7 @@ type BlockedReason =
   | { type: 'resource'; resourceType: string; resourceId: string };
 ```
 
-### Usage
+### Usage <a id="smoo/lmao!n/op-context-tagged-errors.usage"></a>
 
 ```typescript
 const processOrder = defineOp('processOrder', async (ctx, orderId: string) => {
@@ -242,7 +242,7 @@ const processOrder = defineOp('processOrder', async (ctx, orderId: string) => {
 });
 ```
 
-## Retry Loop Implementation
+## Retry Loop Implementation <a id="smoo/lmao!n/op-retry.retry-loop-implementation"></a>
 
 The retry loop is implemented in span execution (`spanContext.ts`), not at the tracer level. This means:
 
@@ -250,7 +250,7 @@ The retry loop is implemented in span execution (`spanContext.ts`), not at the t
 - Child spans via `ctx.span()` DO have retry
 - The span buffer captures all retry attempts via `span-retry` entries
 
-### executeWithRetry Flow
+### executeWithRetry Flow <a id="smoo/lmao!n/op-retry.executewithretry-flow"></a>
 
 ```typescript
 async function executeWithRetry<T, E>(buffer: SpanBuffer, fn: () => Promise<Result<T, E>>): Promise<Result<T, E>> {
@@ -300,7 +300,7 @@ async function executeWithRetry<T, E>(buffer: SpanBuffer, fn: () => Promise<Resu
 }
 ```
 
-### writeRetryEntry
+### writeRetryEntry <a id="smoo/lmao!n/op-retry.writeretryentry"></a>
 
 Each retry attempt writes a `span-retry` entry to the buffer for observability:
 
@@ -323,7 +323,7 @@ function writeRetryEntry(buffer: SpanBuffer, attempt: number, error: TransientEr
 }
 ```
 
-### Entry Type
+### Entry Type <a id="smoo/lmao!n/op-retry.entry-type"></a>
 
 ```typescript
 // In systemSchema.ts
@@ -338,7 +338,7 @@ export const ENTRY_TYPE_SPAN_RETRY = 5;
 // 6+ = log levels (info, debug, warn, error)
 ```
 
-## Op Class Integration
+## Op Class Integration <a id="smoo/lmao!n/op-retry.op-class-integration"></a>
 
 The Op class wraps span execution with retry logic. The flow is:
 
@@ -372,9 +372,9 @@ SpanContext.span0-span8()
     └─► writeSpanEnd(buffer, result)
 ```
 
-## Observability
+## Observability <a id="smoo/lmao!n/lmao-entry-retry-entry-type.observability"></a>
 
-### span-retry Entry Format
+### span-retry Entry Format <a id="smoo/lmao!n/lmao-entry-retry-entry-type.span-retry-entry-format"></a>
 
 Each retry attempt produces a `span-retry` entry in the span buffer:
 
@@ -385,7 +385,7 @@ Each retry attempt produces a `span-retry` entry in the span buffer:
 | message    | `retry:op:{opName}`         | Queryable pattern        |
 | error_code | e.g., `SERVICE_UNAVAILABLE` | Error that caused retry  |
 
-### Querying Retries
+### Querying Retries <a id="smoo/lmao!n/lmao-entry-retry-entry-type.querying-retries"></a>
 
 ```sql
 -- Find all retries
@@ -405,7 +405,7 @@ GROUP BY trace_id
 HAVING COUNT(*) > 5
 ```
 
-### Metrics Derivation
+### Metrics Derivation <a id="smoo/lmao!n/lmao-entry-retry-entry-type.metrics-derivation"></a>
 
 From span-retry entries, you can derive:
 
@@ -414,9 +414,9 @@ From span-retry entries, you can derive:
 - **Error breakdown**: Which error codes cause most retries
 - **Retry success rate**: Spans that succeeded after retry vs exhausted retries
 
-## Best Practices
+## Best Practices <a id="smoo/lmao!n/op-retry.best-practices"></a>
 
-### When to Use TransientError
+### When to Use TransientError <a id="smoo/lmao!n/op-retry.when-to-use-transienterror"></a>
 
 Use TransientError for:
 
@@ -427,14 +427,14 @@ Use TransientError for:
 - Temporary resource unavailability
 - Optimistic locking failures
 
-### When to Return vs Throw
+### When to Return vs Throw <a id="smoo/lmao!n/op-retry.when-to-return-vs-throw"></a>
 
 - Retry-eligible failures must be returned as `ctx.err(Transient(...))`, not thrown.
 - `ctx.err(...)`/`Err` covers all known operational outcomes (transient, blocked, code/business errors).
 - Throw only for unexpected invariant failures (bugs, impossible states, broken runtime contracts).
 - `span-retry` and `span-err` entries are driven by returned errors; `span-exception` indicates unexpected throw paths.
 
-### When to Use Blocked
+### When to Use Blocked <a id="smoo/lmao!n/op-retry.when-to-use-blocked"></a>
 
 Use Blocked for:
 
@@ -443,7 +443,7 @@ Use Blocked for:
 - Execution already completed
 - Resource permanently gone (404)
 
-### When to Use CodeError
+### When to Use CodeError <a id="smoo/lmao!n/op-retry.when-to-use-codeerror"></a>
 
 Use CodeError for:
 
@@ -452,7 +452,7 @@ Use CodeError for:
 - Authentication/authorization errors
 - Client errors (4xx except 429)
 
-### Policy Tuning
+### Policy Tuning <a id="smoo/lmao!n/op-retry.policy-tuning"></a>
 
 ```typescript
 // API calls - exponential backoff with cap
@@ -479,7 +479,7 @@ const NETWORK_BLIP = Transient('NETWORK_BLIP', {
 });
 ```
 
-## Integration Points
+## Integration Points <a id="smoo/lmao!n/op-retry.integration-points"></a>
 
 This system integrates with:
 
@@ -488,7 +488,7 @@ This system integrates with:
 - **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: span-retry entries written to buffer
 - **[Arrow Table Structure](./01f_arrow_table_structure.md)**: span-retry entries included in Arrow output
 
-## Files
+## Files <a id="smoo/lmao!n/op-retry.files"></a>
 
 | File                                           | Purpose                           |
 | ---------------------------------------------- | --------------------------------- |

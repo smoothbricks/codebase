@@ -1,3 +1,4 @@
+//#region smoo/lmao!n/op-retry.policy
 /**
  * RetryPolicy - configures retry behavior for transient failures.
  *
@@ -85,3 +86,4 @@ export function mergePolicy(base: RetryPolicy, override?: Partial<RetryPolicy>):
   if (!override) return base;
   return { ...base, ...override };
 }
+//#endregion smoo/lmao!n/op-retry.policy

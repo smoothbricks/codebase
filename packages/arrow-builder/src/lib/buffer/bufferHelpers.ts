@@ -22,9 +22,11 @@
  * @param elementCount - Requested number of elements
  * @returns Capacity rounded up to nearest multiple of 8
  */
+//#region smoo/lmao!n/buffer-perf-cache-alignment
 export function getAlignedCapacity(elementCount: number): number {
   return Math.ceil(elementCount / 8) * 8;
 }
+//#endregion smoo/lmao!n/buffer-perf-cache-alignment
 
 /**
  * Set a single bit in a null bitmap (mark index as non-null).

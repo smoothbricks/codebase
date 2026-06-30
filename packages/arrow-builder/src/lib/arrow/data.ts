@@ -42,6 +42,10 @@ const DICT8_BATCH = batchType(dictionary(UTF8_TYPE, UINT8_TYPE));
 const DICT16_BATCH = batchType(dictionary(UTF8_TYPE, UINT16_TYPE));
 const DICT32_BATCH = batchType(dictionary(UTF8_TYPE, UINT32_TYPE));
 
+//#region smoo/lmao!n/arrow-table-zero-copy
+// Zero-copy column construction: every Batch wraps `values.subarray(0, length)`
+// directly (a view, not a copy). The builder pattern (per-value append) is never
+// used. See specs/lmao/01f_arrow_table_structure.md#smoo/lmao!n/arrow-table-zero-copy.
 function createValidity(length: number, nullBitmap?: Uint8Array): Uint8Array {
   return nullBitmap?.subarray(0, Math.ceil(length / 8)) ?? EMPTY_VALIDITY;
 }
@@ -234,3 +238,4 @@ export function createTableFromBatches(batches: Record<string, ArrowBatch>) {
   }
   return tableFromColumns(columns);
 }
+//#endregion smoo/lmao!n/arrow-table-zero-copy

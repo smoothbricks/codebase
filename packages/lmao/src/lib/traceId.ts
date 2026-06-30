@@ -12,6 +12,7 @@
  * @module traceId
  */
 
+//#region smoo/lmao!n/span-identity.trace-id
 /** Maximum length for a trace ID */
 export const MAX_TRACE_ID_LENGTH = 128;
 
@@ -85,10 +86,12 @@ export function generateTraceId(): TraceId {
 
   return brandTraceId(hex);
 }
+//#endregion smoo/lmao!n/span-identity.trace-id
 
 // ============================================================================
 // SpanIdentity - Span identification for external systems
 // ============================================================================
+//#region smoo/lmao!n/span-identity.external-correlation
 
 /**
  * SpanIdentity - Identifies a specific span for external correlation.
@@ -140,3 +143,4 @@ export function extractSpanIdentity(buffer: { trace_id: TraceId; span_id: number
     thread_id: buffer.thread_id,
   };
 }
+//#endregion smoo/lmao!n/span-identity.external-correlation
