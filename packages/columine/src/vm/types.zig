@@ -462,9 +462,17 @@ pub fn getSlotMeta(state_base: [*]u8, slot: u8) SlotMeta {
     // Read byte-sized fields
     const type_flags = SlotTypeFlags.fromByte(meta_bytes[SlotMetaOffset.TYPE_FLAGS]);
     // Byte 13 is dual-purpose: AggType for AGGREGATE/SCALAR, num_fields for STRUCT_MAP, 0 for others.
-    // Only interpret as AggType if the raw value is in range [1..13].
+    // Only AGGREGATE/SCALAR slots store a real AggType here; for a STRUCT_MAP the byte
+    // is num_fields, which can legitimately be 6 or 7 — values the AggType enum
+    // RESERVES (no member), so a blind `@enumFromInt` would panic ("invalid enum
+    // value") when a 6-or-7-field struct map is scanned (e.g. via
+    // findSlotMetaByOffset). Gate on the slot type, and additionally reject the
+    // reserved 6/7 gap, so only a genuine AggType byte is decoded.
+    const slot_type = type_flags.slot_type;
     const agg_byte = meta_bytes[SlotMetaOffset.AGG_TYPE];
-    const agg_type: AggType = if (agg_byte >= 1 and agg_byte <= 13) @enumFromInt(agg_byte) else .SUM;
+    const agg_is_typed = (slot_type == .AGGREGATE or slot_type == .SCALAR) and
+        agg_byte >= 1 and agg_byte <= 13 and agg_byte != 6 and agg_byte != 7;
+    const agg_type: AggType = if (agg_is_typed) @enumFromInt(agg_byte) else .SUM;
     const change_flags_ptr: *u8 = @ptrCast(meta_bytes + SlotMetaOffset.CHANGE_FLAGS);
     const timestamp_field_idx = meta_bytes[SlotMetaOffset.TIMESTAMP_FIELD_IDX];
     const start_of: DurationUnit = @enumFromInt(meta_bytes[SlotMetaOffset.START_OF]);
