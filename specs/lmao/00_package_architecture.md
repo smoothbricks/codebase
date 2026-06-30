@@ -1,6 +1,6 @@
-# Package Architecture: arrow-builder and lmao
+# Package Architecture: arrow-builder and lmao <a id="smoo/lmao!n/lmao-arch"></a>
 
-## Overview
+## Overview <a id="smoo/lmao!n/lmao-arch-overview"></a>
 
 This monorepo contains two distinct packages with clear separation of concerns:
 
@@ -55,9 +55,9 @@ This monorepo contains two distinct packages with clear separation of concerns:
 
 ---
 
-## Design Philosophy: Why Two Packages?
+## Design Philosophy: Why Two Packages? <a id="smoo/lmao!n/lmao-arch-design-philosophy-why-two-packages"></a>
 
-### Problem: Apache Arrow's Hidden Allocations
+### Problem: Apache Arrow's Hidden Allocations <a id="smoo/lmao!n/lmao-arch-problem-apache-arrows-hidden-allocations"></a>
 
 Apache Arrow's JavaScript builder pattern has hidden resizing and allocations:
 
@@ -75,7 +75,7 @@ This is problematic for high-performance logging because:
 2. **No control over capacity**: Can't pre-allocate based on workload patterns
 3. **No lazy initialization**: All columns allocated eagerly, even if unused
 
-### Solution: Explicit Allocation Control
+### Solution: Explicit Allocation Control <a id="smoo/lmao!n/lmao-arch-solution-explicit-allocation-control"></a>
 
 **arrow-builder** provides explicit, visible allocations:
 
@@ -102,9 +102,9 @@ const GET = op(async ({ span, log, tag }) => {
 
 ---
 
-## Key Architectural Principles
+## Key Architectural Principles <a id="smoo/lmao!n/lmao-arch-key-architectural-principles"></a>
 
-### 1. Explicit Allocation Visibility (arrow-builder)
+### 1. Explicit Allocation Visibility (arrow-builder) <a id="smoo/lmao!n/lmao-arch-1-explicit-allocation-visibility-arrow-builder"></a>
 
 **WHY**: Traditional Arrow builders hide allocations and resizes. This makes it impossible to:
 
@@ -120,7 +120,7 @@ const GET = op(async ({ span, log, tag }) => {
 - No automatic resizing - buffer chaining is explicit
 - Capacity is always specified at creation time
 
-### 2. Zero Overhead Hot Path (lmao)
+### 2. Zero Overhead Hot Path (lmao) <a id="smoo/lmao!n/lmao-arch-2-zero-overhead-hot-path-lmao"></a>
 
 **WHY**: System columns (timestamp, entry_type) are written on EVERY log entry. Even a single `if (values === null)`
 check adds overhead per entry, compounding to milliseconds on high-throughput spans.
@@ -131,7 +131,7 @@ check adds overhead per entry, compounding to milliseconds on high-throughput sp
 - **User attributes**: Lazy by default - allocated only when first written or scope set
 - Clear separation enforced by codegen: system columns are direct TypedArray properties
 
-### 3. V8-Friendly Extensibility via Composition
+### 3. V8-Friendly Extensibility via Composition <a id="smoo/lmao!n/lmao-arch-3-v8-friendly-extensibility-via-composition"></a>
 
 **WHY**: V8 optimizes objects with stable property layouts (hidden classes). Dynamic property access and inheritance
 break these optimizations.
@@ -144,7 +144,7 @@ break these optimizations.
 - **No dynamic property access**: All property names known at codegen time
 - **Op is a plain class**: Stable hidden class, no Proxy, no Function subclassing
 
-### 4. Application-Agnostic Primitives (arrow-builder)
+### 4. Application-Agnostic Primitives (arrow-builder) <a id="smoo/lmao!n/lmao-arch-4-application-agnostic-primitives-arrow-builder"></a>
 
 **WHY**: arrow-builder should be usable for ANY columnar data use case, not just logging. This ensures clean separation
 and prevents feature creep.
@@ -157,7 +157,7 @@ and prevents feature creep.
 - ✅ Database query result caching
 - ❌ Structured logging (needs lmao's ops, spans, scopes, entry types)
 
-### 5. Scope is SEPARATE from Buffer Columns (lmao)
+### 5. Scope is SEPARATE from Buffer Columns (lmao) <a id="smoo/lmao!n/lmao-arch-5-scope-is-separate-from-buffer-columns-lmao"></a>
 
 **WHY**: Scope values are per-span inheritable attributes. Buffer columns are per-entry storage. Mixing them creates
 complexity:
@@ -174,9 +174,9 @@ complexity:
 
 ---
 
-## @smoothbricks/arrow-builder
+## @smoothbricks/arrow-builder <a id="smoo/lmao!n/lmao-arch-smoothbricksarrow-builder"></a>
 
-### Purpose
+### Purpose <a id="smoo/lmao!n/lmao-arch-purpose"></a>
 
 A low-level alternative to building Arrow tables directly with flechette constructors. The library focuses on:
 
@@ -186,7 +186,7 @@ A low-level alternative to building Arrow tables directly with flechette constru
 - **V8-friendly codegen**: Uses `new Function()` for direct property access
 - **Zero knowledge of logging**: Generic columnar storage only
 
-### What arrow-builder OWNS
+### What arrow-builder OWNS <a id="smoo/lmao!n/lmao-arch-what-arrow-builder-owns"></a>
 
 1. **Cache-aligned TypedArray creation** - 64-byte aligned buffers for CPU cache efficiency
 2. **Lazy column storage pattern** - Nulls and values share ONE ArrayBuffer per column
@@ -200,7 +200,7 @@ A low-level alternative to building Arrow tables directly with flechette constru
 10. **Utf8Encoder interface** - Contract for UTF-8 encoding with `encode()`, `byteLength()`, `encodeInto()`
 11. **DictionaryBuilder** - Builds Arrow dictionaries with 2nd-occurrence caching pattern
 
-### What arrow-builder MUST NOT know about
+### What arrow-builder MUST NOT know about <a id="smoo/lmao!n/lmao-arch-what-arrow-builder-must-not-know-about"></a>
 
 - ❌ Logging or tracing concepts (ops, spans, traces, contexts)
 - ❌ Entry types (info, warn, error, span-start, span-end)
@@ -212,7 +212,7 @@ A low-level alternative to building Arrow tables directly with flechette constru
 - ❌ Tree structures (parent/child spans, buffer.\_children, buffer.\_next)
 - ❌ Any `@smoothbricks/lmao` dependency
 
-### Column Naming Convention
+### Column Naming Convention <a id="smoo/lmao!n/lmao-arch-column-naming-convention"></a>
 
 **User columns** use the field name directly from the schema (no prefix):
 
@@ -235,7 +235,7 @@ buffer._next; // Buffer chaining
 This keeps the user API clean while preventing collisions between user-defined field names and internal buffer
 properties.
 
-### Lazy Column Storage Pattern
+### Lazy Column Storage Pattern <a id="smoo/lmao!n/lmao-arch-lazy-column-storage-pattern"></a>
 
 **WHY**: Most spans only use a subset of schema attributes. Eager allocation wastes memory.
 
@@ -291,7 +291,7 @@ class GeneratedColumnBuffer {
 - Lazy: zero memory cost for unused columns
 - Cache-aligned: no false sharing, optimal CPU access
 
-### Schema Extensibility (for lmao's codegen)
+### Schema Extensibility (for lmao's codegen) <a id="smoo/lmao!n/lmao-arch-schema-extensibility-for-lmaos-codegen"></a>
 
 arrow-builder's schema system supports a "lazy" option that consumers can use:
 
@@ -309,9 +309,9 @@ concepts.
 
 ---
 
-## @smoothbricks/lmao
+## @smoothbricks/lmao <a id="smoo/lmao!n/lmao-arch-smoothbrickslmao"></a>
 
-### Purpose
+### Purpose <a id="smoo/lmao!n/lmao-arch-smoothbrickslmao-purpose"></a>
 
 A high-level structured logging library providing excellent developer experience with minimal runtime overhead:
 
@@ -320,7 +320,7 @@ A high-level structured logging library providing excellent developer experience
 - **Context propagation**: Automatic trace correlation through traceContext→op→span hierarchy
 - **System column optimization**: timestamp/entry_type are NEVER lazy
 
-### What lmao OWNS
+### What lmao OWNS <a id="smoo/lmao!n/lmao-arch-what-lmao-owns"></a>
 
 1. **Schema DSL** - `S.enum()`, `S.category()`, `S.text()`, `S.number()`, `S.boolean()`
 2. **Tag attribute definitions** - Schema definitions with masking transforms
@@ -344,7 +344,7 @@ A high-level structured logging library providing excellent developer experience
 20. **Pre-encoded contexts** - ModuleContext with `utf8PackageName`, `utf8PackagePath`, `utf8GitSha`
 21. **Line number injection** - Transformer inserts line as first arg to span()
 
-### System Columns vs User Attributes
+### System Columns vs User Attributes <a id="smoo/lmao!n/lmao-arch-system-columns-vs-user-attributes"></a>
 
 **System columns** (timestamp, entry_type) are written on EVERY entry - ALWAYS eager, pre-allocated in constructor.
 
@@ -352,7 +352,7 @@ A high-level structured logging library providing excellent developer experience
 
 See `01b_columnar_buffer_architecture.md` for implementation details.
 
-### SpanBuffer Property Naming Convention
+### SpanBuffer Property Naming Convention <a id="smoo/lmao!n/lmao-arch-spanbuffer-property-naming-convention"></a>
 
 SpanBuffer public properties correspond exactly to Arrow table column names for obvious data flow:
 
@@ -373,7 +373,7 @@ naming.
 
 ---
 
-## Package Dependencies
+## Package Dependencies <a id="smoo/lmao!n/lmao-arch-package-dependencies"></a>
 
 ```json
 // packages/arrow-builder/package.json
@@ -397,7 +397,7 @@ naming.
 
 ---
 
-## Summary
+## Summary <a id="smoo/lmao!n/lmao-arch-summary"></a>
 
 | Aspect               | arrow-builder                                | lmao                                         |
 | -------------------- | -------------------------------------------- | -------------------------------------------- |
@@ -420,9 +420,9 @@ naming.
 
 ---
 
-## Quick Reference: Who Owns What?
+## Quick Reference: Who Owns What? <a id="smoo/lmao!n/lmao-arch-quick-reference-who-owns-what"></a>
 
-### Decision Flowchart
+### Decision Flowchart <a id="smoo/lmao!n/lmao-arch-decision-flowchart"></a>
 
 ```
 Is it logging/tracing specific?
@@ -434,7 +434,7 @@ Is it logging/tracing specific?
     └── NO → Probably lmao
 ```
 
-### Concrete Examples
+### Concrete Examples <a id="smoo/lmao!n/lmao-arch-concrete-examples"></a>
 
 | Feature                              | Package       | Why                                   |
 | ------------------------------------ | ------------- | ------------------------------------- |
@@ -464,9 +464,9 @@ Is it logging/tracing specific?
 
 ---
 
-## Design Decision Checklist
+## Design Decision Checklist <a id="smoo/lmao!n/lmao-arch-design-decision-checklist"></a>
 
-### Adding to arrow-builder
+### Adding to arrow-builder <a id="smoo/lmao!n/lmao-arch-adding-to-arrow-builder"></a>
 
 - [ ] Feature is generic (could be used by metrics, CSV parsing, etc.)
 - [ ] No dependency on lmao types or concepts
@@ -474,7 +474,7 @@ Is it logging/tracing specific?
 - [ ] Provides explicit allocation control (no hidden allocations)
 - [ ] Documentation doesn't mention logging/tracing
 
-### Adding to lmao
+### Adding to lmao <a id="smoo/lmao!n/lmao-arch-adding-to-lmao"></a>
 
 - [ ] Feature is logging/tracing specific
 - [ ] Uses arrow-builder primitives, doesn't duplicate them

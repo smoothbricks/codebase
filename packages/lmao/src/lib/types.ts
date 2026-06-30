@@ -74,6 +74,7 @@ export type { AnyColumnBuffer, ColumnBuffer, ColumnValueType, TypedArray };
  *
  * @see SpanBuffer<T> for schema-typed version with index signatures
  */
+//#region smoo/lmao!n/spanbuffer-layout.interface
 export interface AnySpanBuffer extends AnyColumnBuffer {
   // ===========================================================================
   // System Memory (cache-aligned, per specs/lmao/01b1)
@@ -414,6 +415,7 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
    */
   copyParentThreadIdTo(dest: Uint8Array, offset: number): void;
 }
+//#endregion smoo/lmao!n/spanbuffer-layout.interface
 
 // ============================================================================
 // Schema Type Helpers

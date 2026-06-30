@@ -20,7 +20,7 @@ property-based APIs.
 - **Type safety**: Full TypeScript support with schema-driven types
 - **Destructured context**: Context properties available via destructuring in op signatures
 
-## Destructured Context Pattern
+## Destructured Context Pattern <a id="smoo/lmao!n/codegen-destructured-context"></a>
 
 The context is destructured directly in op signatures, eliminating `ctx.xxx` drilling:
 
@@ -63,7 +63,7 @@ const GET = op(async ({ span, log, tag, deps, ff, env, scope }, url: string) => 
 | `ok`     | Success result helper                         |
 | `err`    | Error result helper                           |
 
-## API Patterns
+## API Patterns <a id="smoo/lmao!n/codegen-architecture.api-patterns"></a>
 
 ### Object-Based API (Primary)
 
@@ -95,7 +95,7 @@ const processUser = op(async ({ tag }, userData) => {
 });
 ```
 
-## Codegen Architecture
+## Codegen Architecture <a id="smoo/lmao!n/codegen-architecture"></a>
 
 ### 1. Schema-Driven Column Writers
 
@@ -208,7 +208,7 @@ const processUser = op(async ({ log, tag, scope, span, ok, err }, userData) => {
 });
 ```
 
-## Scope API Code Generation
+## Scope API Code Generation <a id="smoo/lmao!n/codegen-spanlogger.scope"></a>
 
 ### scope() as Function (NOT stored in buffer columns)
 
@@ -456,7 +456,7 @@ function generateObjectAPI(schema: Schema): Function {
 - **IDE support**: Full autocomplete and error detection
 - **Runtime safety**: Type mismatches caught during development
 
-## Feature Flag Entry Types
+## Feature Flag Entry Types <a id="smoo/lmao!n/codegen-spanlogger.ff"></a>
 
 Feature flag entry types (`ff-access` and `ff-usage`) are handled automatically by the `FeatureFlagEvaluator` using
 internal methods on `SpanLogger`:
@@ -595,7 +595,7 @@ This codegen system integrates with:
 - **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Column writers populate buffer arrays
 - **[Context Flow and Op Wrappers](./01c_context_flow_and_op_wrappers.md)**: Op lifecycle integrates with generated APIs
 
-## uint64 Method Generation
+## uint64 Method Generation <a id="smoo/lmao!n/codegen-spanlogger.uint64"></a>
 
 ### Overview
 

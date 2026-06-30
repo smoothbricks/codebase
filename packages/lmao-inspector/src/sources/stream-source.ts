@@ -22,6 +22,7 @@ export interface StreamSource {
  * Create a live stream source that receives Arrow IPC frames via WebSocket or SSE.
  * Auto-reconnects on disconnect with exponential backoff (max 30s).
  */
+//#region smoo/lmao!n/inspector-stream-source.create
 export function createStreamSource(config: StreamSourceConfig): StreamSource {
   const batchCallbacks: Array<(ipcBytes: Uint8Array, parsed: ReturnType<typeof tableFromIPC>) => void> = [];
   let ws: WebSocket | null = null;
@@ -136,3 +137,4 @@ export function createStreamSource(config: StreamSourceConfig): StreamSource {
     },
   };
 }
+//#endregion smoo/lmao!n/inspector-stream-source.create

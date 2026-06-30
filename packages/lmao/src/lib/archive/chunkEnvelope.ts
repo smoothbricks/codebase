@@ -1,3 +1,4 @@
+//#region smoo/lmao!n/trace-archive-envelope.build
 export interface TraceChunkEnvelopeInput {
   readonly file_ref: string;
   readonly chunk_ref: string;
@@ -77,3 +78,4 @@ function fnv1a64(input: string): string {
 
   return hash.toString(16).padStart(16, '0');
 }
+//#endregion smoo/lmao!n/trace-archive-envelope.build

@@ -10,7 +10,11 @@
  * - Blocks are organized by tier (capacity 8, 16, 32, 64, 128, 256, 512)
  * - When freelist is empty, splits from larger tier
  * - When freeing, merges with adjacent blocks if both are free (address-based buddy merge)
+ *
+ * Spec link (88): realizes specs/lmao/01q_wasm_memory_architecture.md#smoo/lmao!n/wasm-mem (TS allocator wrapper).
  */
+
+//#region smoo/lmao!n/wasm-mem.ts-allocator
 
 // =============================================================================
 // Types
@@ -467,3 +471,4 @@ export function createWasmAllocatorSync(wasmModule: WebAssembly.Module, options?
 
   return wrapWasmInstance(instance, memory, capacity);
 }
+//#endregion smoo/lmao!n/wasm-mem.ts-allocator

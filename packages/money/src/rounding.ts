@@ -9,9 +9,15 @@
 import type { CurrencyDef } from './currency-registry.js';
 import { Amount, type Basis } from './types.js';
 
+//#region corpos/billing!n/audit-multi-currency.money-rounding #explicit-rounding-mode
 /**
  * Explicit rounding modes for Basis -> Amount conversion.
  * Matches IEEE 754 / financial standard terminology.
+ *
+ * Spec 14 §Conversion-Boundary requires the Basis -> settled-Amount boundary to
+ * use an EXPLICIT rounding mode (no implicit truncation), so the rounding choice
+ * is part of the conversion audit. `convertFx` (money-conversion) rounds through
+ * `roundBasisToAmount`.
  */
 export const RoundingMode = {
   Floor: 'floor',
@@ -121,3 +127,4 @@ export function roundBasisToAmount<C extends string>(
     }
   }
 }
+//#endregion corpos/billing!n/audit-multi-currency.money-rounding

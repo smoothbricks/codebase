@@ -14,6 +14,8 @@
 
 import ts from 'typescript';
 
+//#region smoo/lmao!n/transformer-tag-chain-inline
+
 // ============================================================================
 // Schema Types & Extraction
 // ============================================================================
@@ -814,3 +816,4 @@ export function tryTransformTagChain(
 
   return block;
 }
+//#endregion smoo/lmao!n/transformer-tag-chain-inline

@@ -14,6 +14,7 @@ export interface CompactedChunkSet {
   readonly window: CompactionWindow;
 }
 
+//#region smoo/lmao!n/trace-archive-compaction.manifest
 export function compactTraceChunks(chunks: readonly TraceChunkEnvelope[], window: CompactionWindow): CompactedChunkSet {
   const sourceChunkIds = [...new Set(chunks.map((chunk) => chunk.chunk_id))].sort();
   const totalRows = chunks.reduce((sum, chunk) => sum + chunk.row_count, 0);
@@ -29,6 +30,7 @@ export function compactTraceChunks(chunks: readonly TraceChunkEnvelope[], window
     window,
   };
 }
+//#endregion smoo/lmao!n/trace-archive-compaction.manifest
 
 function hashDeterministic(input: string): string {
   let hash = 0xcbf29ce484222325n;

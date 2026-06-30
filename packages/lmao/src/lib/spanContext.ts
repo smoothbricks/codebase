@@ -69,9 +69,14 @@ export const SPAN_CONTEXT_MARKER = Symbol.for('lmao.SpanContext');
 // Type Exports
 // =============================================================================
 
+//#region smoo/lmao!n/codegen-spanlogger.ff
 /**
  * Internal SpanLogger type with FF methods and internal methods exposed.
  * Used by FeatureFlagEvaluator and internal span management code.
+ *
+ * The 01g "SpanLoggerInternal Type Pattern": the public SpanLogger<T> hides
+ * ffAccess/ffUsage; the evaluator casts to this internal type to reach them.
+ * The methods themselves are generated in codegen/spanLoggerGenerator.ts.
  */
 export type SpanLoggerInternal<T extends LogSchema> = SpanLoggerImpl<T> & {
   /**
@@ -85,6 +90,7 @@ export type SpanLoggerInternal<T extends LogSchema> = SpanLoggerImpl<T> & {
    */
   ffUsage(flagName: string, context?: Record<string, unknown>): FluentLogEntry<T>;
 };
+//#endregion smoo/lmao!n/codegen-spanlogger.ff
 
 type SpanDispatchFn<Ctx extends OpContext, Args extends unknown[] = unknown[], S = unknown, E = unknown> = (
   ctx: SpanContext<Ctx>,
@@ -202,6 +208,7 @@ function resolveSpanTarget<Ctx extends OpContext>(
 // Helper Functions
 // =============================================================================
 
+//#region smoo/lmao!n/lmao-entry-span-lifecycle-entry-types.start
 /**
  * Write span-start entry to buffer at row 0 (fixed layout)
  * Pre-initialize row 1 as span-exception (will be overwritten by ok/err)
@@ -219,6 +226,7 @@ export function writeSpanStart<T extends LogSchema>(buffer: SpanBuffer<T>, spanN
   // Delegate to TraceRoot - platform-specific implementation handles timestamps
   buffer._traceRoot.writeSpanStart(buffer, spanName);
 }
+//#endregion smoo/lmao!n/lmao-entry-span-lifecycle-entry-types.start
 
 /**
  * Create a SpanLogger for the given buffer.
@@ -234,6 +242,7 @@ export function createSpanLogger<T extends LogSchema>(schema: T, buffer: SpanBuf
   return createSpanLoggerFromGenerator(schema, buffer);
 }
 
+//#region smoo/lmao!n/op-retry.delay
 /**
  * Calculate delay for retry based on policy and attempt number.
  *
@@ -268,7 +277,9 @@ function calculateDelay(policy: RetryPolicy, attempt: number): number {
 
   return delay;
 }
+//#endregion smoo/lmao!n/op-retry.delay
 
+//#region smoo/lmao!n/lmao-entry-span-lifecycle-entry-types.retry
 /**
  * Write span-retry entry to buffer.
  *
@@ -308,7 +319,9 @@ function writeRetryEntry<T extends LogSchema>(
   buffer.retry_attempt(index, attempt);
   buffer.retry_delay_ms(index, delayMs);
 }
+//#endregion smoo/lmao!n/lmao-entry-span-lifecycle-entry-types.retry
 
+//#region smoo/lmao!n/op-retry.loop
 /**
  * Sleep for the specified duration.
  *
@@ -383,7 +396,9 @@ async function executeWithRetry<T extends LogSchema, S, E>(
     return result;
   }
 }
+//#endregion smoo/lmao!n/op-retry.loop
 
+//#region smoo/lmao!n/lmao-entry-span-lifecycle-entry-types.end
 /**
  * Write span-end entry to buffer at row 1.
  *
@@ -408,14 +423,20 @@ export function writeSpanEnd<T extends LogSchema, S, E>(buffer: SpanBuffer<T>, r
     }
   }
 }
+//#endregion smoo/lmao!n/lmao-entry-span-lifecycle-entry-types.end
 
 // =============================================================================
 // SpanContext Class Types
 // =============================================================================
 
+//#region smoo/lmao!n/spancontext-type
 /**
  * Constructor type for SpanContext classes created by createSpanContextClass.
  * Takes buffer, schema, spanLogger, tag directly (no temp object allocation).
+ *
+ * 01j "SpanContext Type Definition": the runtime SpanContext shape, parameterised by a single
+ * bundled OpContext (logSchema/flags/deps/...) rather than separate Schema/Deps/FF/Extra params,
+ * and SpanFn realized as the monomorphic span0-span8 overloads + variadic span() dispatcher.
  */
 export type SpanContextClass<Ctx extends OpContext> = new (
   buffer: SpanBuffer<Ctx['logSchema']>,
@@ -596,6 +617,7 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
     a8: A8,
   ): Promise<Result<S, E, Ctx['logSchema']>>;
 };
+//#endregion smoo/lmao!n/spancontext-type
 
 // =============================================================================
 // SpanContext Class Factory
@@ -654,6 +676,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
       spanLogger: SpanLoggerImpl<Ctx['logSchema']>,
       tag: TagWriter<Ctx['logSchema']>,
     ) {
+      //#region smoo/lmao!n/codegen-destructured-context
+      // Destructured-context assembly (01g): every property an op destructures —
+      // tag, log, scope (setScope), ok, err, span — is wired here as a closed-over
+      // field/closure so `op(({ tag, log, span, ok, err }) => ...)` needs no ctx drilling.
       this._buffer = buffer;
       this._schema = schema;
       this._spanLogger = spanLogger;
@@ -669,7 +695,14 @@ export function createSpanContextClass<Ctx extends OpContext>(
       this.ok = <V>(value: V): Ok<V, Ctx['logSchema']> => new Ok<V, Ctx['logSchema']>(value, schema, buffer);
 
       this.err = <E>(error: E): Err<E, Ctx['logSchema']> => new Err<E, Ctx['logSchema']>(error, schema, buffer);
+      //#endregion smoo/lmao!n/codegen-destructured-context
 
+      //#region smoo/lmao!n/context-flow-span-promise
+      // 01c "Why span() Is Promise-Based" + "Child Span Creation via span()" + "spanSync()".
+      // span() is the variadic, line-number-aware Promise-based dispatcher: it detects the
+      // (line?, name, overrides?, op|fn, ...args) pattern via arguments.length (no rest-spread
+      // allocation) and routes to the monomorphic span0-span8. spanSync() is the sync-only
+      // sibling (returns Result, no Promise, no async retry loop) for guaranteed-sync callbacks.
       // span uses regular function to access `arguments` (no ...rest spread allocation)
       // Closes over `self` for calling prototype methods
       // Named function for better stack traces
@@ -866,6 +899,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
           fn,
         );
       };
+      //#endregion smoo/lmao!n/context-flow-span-promise
     }
 
     // =========================================================================
@@ -902,9 +936,13 @@ export function createSpanContextClass<Ctx extends OpContext>(
       return this._buffer;
     }
 
+    //#region smoo/lmao!n/scope-attributes.read
+    // 01i read-only scope view: the immutable _scopeValues snapshot (setScope is wired in the
+    // destructured-context region; the immutable merge is _setScope in spanLoggerGenerator).
     get scope(): Readonly<Partial<InferSchema<Ctx['logSchema']>>> {
       return this._buffer._scopeValues;
     }
+    //#endregion smoo/lmao!n/scope-attributes.read
 
     // =========================================================================
     // Internal methods (on prototype)
@@ -944,6 +982,12 @@ export function createSpanContextClass<Ctx extends OpContext>(
      * @param remappedViewClass - Optional view class for prefixed ops (wraps buffer for Arrow conversion)
      * @param opMetadata - Metadata for the executing op (Op's metadata or parent's for plain functions)
      */
+    //#region smoo/lmao!n/context-flow-child-span
+    // 01c "Child Span Creation via span()" / "How span() Works" and 01e "Op's Responsibility:
+    // Buffer Creation and Registration": _spanPre is where the child SpanBuffer is created
+    // (via the buffer strategy, using the Op's SpanBufferClass for cross-library schema),
+    // wrapped in a RemappedBufferView when the dep is prefixed/mapped, registered in the
+    // parent's _children, and span-start (row 0) is written with the caller's line number.
     _spanPre(
       childCtx: SpanContextInstance<Ctx>,
       line: number,
@@ -1203,7 +1247,9 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
       return ctx;
     }
+    //#endregion smoo/lmao!n/context-flow-child-span
 
+    //#region smoo/lmao!n/lmao-entry-span-lifecycle-entry-types.exception
     /**
      * Handle span exception - writes exception details to row 1.
      * Called in catch blocks of span methods.
@@ -1218,6 +1264,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
         childBuffer.exception_stack(1, errorStack);
       }
     }
+    //#endregion smoo/lmao!n/lmao-entry-span-lifecycle-entry-types.exception
 
     // =========================================================================
     // Monomorphic span methods (for transformer output)

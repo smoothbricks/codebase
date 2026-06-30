@@ -28,6 +28,7 @@
  * Created once per `defineOpContext`, stored as static property on generated
  * SpanBuffer class. All buffers from same context share these stats.
  */
+//#region smoo/lmao!n/spanbuffer-layout.stats
 export interface SpanBufferStats {
   /** Current buffer capacity for new buffers (grows/shrinks based on utilization) */
   capacity: number;
@@ -38,3 +39,4 @@ export interface SpanBufferStats {
   /** Number of non-chained spans created (root + child spans, NOT overflow buffers) */
   spansCreated: number;
 }
+//#endregion smoo/lmao!n/spanbuffer-layout.stats

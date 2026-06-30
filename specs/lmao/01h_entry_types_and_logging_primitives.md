@@ -1,6 +1,6 @@
-# Entry Types and Logging Primitives
+# Entry Types and Logging Primitives <a id="smoo/lmao!n/lmao-entry"></a>
 
-## Design Philosophy
+## Design Philosophy <a id="smoo/lmao!n/lmao-entry-design-philosophy"></a>
 
 **Key Insight**: All trace events in the system are unified under a single entry type enum. Whether it's a span
 lifecycle event, console.log call, structured data tag, or feature flag evaluation - everything becomes a row in the
@@ -14,11 +14,11 @@ trace with a specific entry type.
 - **Extensible**: New entry types can be added without breaking existing code
 - **Destructured context**: Context properties available via destructuring in op signatures
 
-## Entry Type Definitions
+## Entry Type Definitions <a id="smoo/lmao!n/lmao-entry-entry-type-definitions"></a>
 
 The entry type system defines exactly what each row in a trace represents:
 
-### Span Lifecycle Entry Types
+### Span Lifecycle Entry Types <a id="smoo/lmao!n/lmao-entry-span-lifecycle-entry-types"></a>
 
 Spans represent units of work with a clear beginning and end. These entry types use **fixed row positions** in the
 SpanBuffer (see [Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md) for details):
@@ -113,7 +113,7 @@ function completeSpanErr(buffer: SpanBuffer, error: string): void {
 
 This design ensures every span has valid duration data, even when exceptions bypass normal completion.
 
-### Fluent Result Integration
+### Fluent Result Integration <a id="smoo/lmao!n/lmao-entry-fluent-result-integration"></a>
 
 `ctx.ok()` and `ctx.err()` return **buffer-agnostic** fluent builders. Tags are captured as closures and applied by
 `span()`/`trace()` when the function returns:
@@ -227,7 +227,7 @@ return ctx.ok(user).message('User created successfully');
 - Operational retry signaling must stay in `Err` values; do not rely on thrown exceptions for known retry paths.
 - A thrown exception represents a bug or violated invariant, not normal control flow.
 
-### Retry Entry Type
+### Retry Entry Type <a id="smoo/lmao!n/lmao-entry-retry-entry-type"></a>
 
 The `span-retry` entry type provides observability for transient failure handling in Op execution:
 
@@ -266,7 +266,7 @@ span-retry: retry:op:fetchPayment (attempt=2, error="503 Service Unavailable", d
 span-ok: op:fetchPayment (success on attempt 3)
 ```
 
-### Log Level Entry Types
+### Log Level Entry Types <a id="smoo/lmao!n/lmao-entry-log-level-entry-types"></a>
 
 Structured logging with message templates and typed attributes - **APPENDS new rows starting at row 2**:
 
@@ -349,7 +349,7 @@ const processUser = op(async ({ log }) => {
 });
 ```
 
-### Span Attributes (tag)
+### Span Attributes (tag) <a id="smoo/lmao!n/lmao-entry-span-attributes-tag"></a>
 
 **Note**: The `tag` API does NOT create a separate entry type. It updates attributes on the span-start row (row 0).
 
@@ -372,7 +372,7 @@ const processUser = op(async ({ tag, log }) => {
 });
 ```
 
-### Feature Flag Entry Types
+### Feature Flag Entry Types <a id="smoo/lmao!n/lmao-entry-feature-flag-entry-types"></a>
 
 - **`ff-access`** - When feature flags are evaluated
   - Logged automatically by `FeatureFlagEvaluator`
@@ -388,7 +388,7 @@ const processUser = op(async ({ tag, log }) => {
 
 See **[Feature Flags](./01p_feature_flags.md)** for details on the evaluator implementation and tracking API.
 
-### Metrics Entry Types
+### Metrics Entry Types <a id="smoo/lmao!n/lmao-entry-metrics-entry-types"></a>
 
 Metrics are structured logs that capture operational statistics during flush cycles. All metrics rows from the same
 flush share identical `timestamp` (the period end time).
@@ -454,7 +454,7 @@ flush share identical `timestamp` (the period end time).
   - `uint64_value`: Number of overflow events
   - `message`: unused (null)
 
-## Fluent API Design
+## Fluent API Design <a id="smoo/lmao!n/lmao-entry-fluent-api-design"></a>
 
 With unified tag attributes across all entry types, we use a fluent/chainable API pattern that can be mixed into
 different operations:
@@ -484,7 +484,7 @@ const processOrder = op(async ({ ok, err, span, log }, order) => {
 
 This fluent pattern provides a consistent, composable API across all trace operations.
 
-### The `.uint64()` Fluent Method
+### The `.uint64()` Fluent Method <a id="smoo/lmao!n/lmao-entry-the-uint64-fluent-method"></a>
 
 The `.uint64()` method attaches a large integer value to any entry type. It writes to the `uint64_value` lazy system
 column (see [Arrow Table Structure](./01f_arrow_table_structure.md)).
@@ -520,7 +520,7 @@ const processRecords = op(async ({ log, tag, ok }, records) => {
 3. **Type safety**: Stored as `BigUint64Array`, converted to Arrow `uint64`
 4. **Query efficiency**: Direct column access without JSON parsing
 
-### SpanLogger Zero-Allocation Design
+### SpanLogger Zero-Allocation Design <a id="smoo/lmao!n/lmao-entry-spanlogger-zero-allocation-design"></a>
 
 After exploring several approaches, we arrived at a zero-allocation design where the `SpanLogger` instance serves
 multiple roles:
@@ -707,7 +707,7 @@ object keys.
 
 This design achieves the fluent API ergonomics while maintaining the zero-overhead performance goals.
 
-### Type Safety with Generics
+### Type Safety with Generics <a id="smoo/lmao!n/lmao-entry-type-safety-with-generics"></a>
 
 The API uses TypeScript generics to provide full type safety for attribute operations:
 
@@ -786,7 +786,7 @@ const createUser = op(
 
 This provides complete compile-time safety while maintaining zero runtime overhead through prototype compilation.
 
-### Reserved Method Names
+### Reserved Method Names <a id="smoo/lmao!n/lmao-entry-reserved-method-names"></a>
 
 The APIs reserve certain method names that cannot be used as attribute column names:
 
@@ -801,7 +801,7 @@ The APIs reserve certain method names that cannot be used as attribute column na
 
 When defining attribute schemas, these names must be avoided to prevent conflicts with the API methods.
 
-### Public vs Low-Level API Separation
+### Public vs Low-Level API Separation <a id="smoo/lmao!n/lmao-entry-public-vs-low-level-api-separation"></a>
 
 **Span Attributes** (`tag`):
 
@@ -842,12 +842,12 @@ The `log` API is for explicit logging during execution, while `ok()`/`err()` are
 underlying entry type system. Each span's log instance references its own buffer, avoiding traceid+spanid appends and
 keeping logs neatly sorted in Arrow output.
 
-## Fluent Result API
+## Fluent Result API <a id="smoo/lmao!n/lmao-entry-fluent-result-api"></a>
 
 The `ok()` and `err()` functions return **buffer-agnostic** fluent result objects that support method chaining while
 maintaining TypeScript type narrowing for Result pattern consumption.
 
-### Deferred Tag Application Design
+### Deferred Tag Application Design <a id="smoo/lmao!n/lmao-entry-deferred-tag-application-design"></a>
 
 **Key Insight**: FluentOk and FluentErr do NOT hold buffer references. This ensures:
 
@@ -868,7 +868,7 @@ return ctx.ok(user).with({ cached: true }).message('Created');
 // 5. writeSpanEnd writes entry_type, timestamp, then calls result.applyTags(buffer)
 ```
 
-### FluentOk
+### FluentOk <a id="smoo/lmao!n/lmao-entry-fluentok"></a>
 
 Returned by `ctx.ok(value)`. Implements the `Ok<V>` interface with deferred chaining methods:
 
@@ -897,7 +897,7 @@ class FluentOk<V, T extends LogSchema> implements Ok<V> {
 }
 ```
 
-### FluentErr
+### FluentErr <a id="smoo/lmao!n/lmao-entry-fluenterr"></a>
 
 Returned by `ctx.err(code, details)`. Implements the `Err<E>` interface with deferred chaining methods:
 
@@ -922,7 +922,7 @@ class FluentErr<E, T extends LogSchema> implements Err<E> {
 }
 ```
 
-### Buffer Write Timing
+### Buffer Write Timing <a id="smoo/lmao!n/lmao-entry-buffer-write-timing"></a>
 
 All writes to row 1 happen when `span()`/`trace()` completes:
 
@@ -933,7 +933,7 @@ All writes to row 1 happen when `span()`/`trace()` completes:
 
 This ensures row 1 is never partially written - it's atomic at span completion.
 
-### Usage Examples
+### Usage Examples <a id="smoo/lmao!n/lmao-entry-usage-examples"></a>
 
 ```typescript
 const createUser = op(async ({ ok, err }, userData) => {
@@ -968,7 +968,7 @@ const createUser = op(async ({ ok, err }, userData) => {
 });
 ```
 
-### Result Pattern Compatibility
+### Result Pattern Compatibility <a id="smoo/lmao!n/lmao-entry-result-pattern-compatibility"></a>
 
 The fluent result objects are fully compatible with TypeScript's discriminated union narrowing:
 
@@ -986,7 +986,7 @@ if (result.success) {
 }
 ```
 
-### Error Code Storage
+### Error Code Storage <a id="smoo/lmao!n/lmao-entry-error-code-storage"></a>
 
 When `err(code, details)` is called, the error code is automatically written to the `errorCode` column. This enables
 efficient querying of errors by code:
@@ -997,7 +997,7 @@ WHERE entry_type = 'span-err'
   AND errorCode = 'VALIDATION_FAILED';
 ```
 
-### Message Storage
+### Message Storage <a id="smoo/lmao!n/lmao-entry-message-storage"></a>
 
 Both `.message()` methods write to the unified `message` column, enabling message-based queries:
 
@@ -1008,11 +1008,11 @@ WHERE entry_type IN ('span-ok', 'span-err')
   AND message IS NOT NULL;
 ```
 
-## Low-Level Logging API
+## Low-Level Logging API <a id="smoo/lmao!n/lmao-entry-low-level-logging-api"></a>
 
 The entry type system is implemented through low-level column writers that directly populate trace buffers:
 
-### Column Writer Interface (Design TBD)
+### Column Writer Interface (Design TBD) <a id="smoo/lmao!n/lmao-entry-column-writer-interface"></a>
 
 The exact API for writing to columns is still being designed. The examples below use a placeholder `writeColumnName()`
 pattern to illustrate the concepts, but the actual implementation will likely be much cleaner:
@@ -1037,7 +1037,7 @@ interface ColumnWriters {
 }
 ```
 
-### Entry Type Creation Patterns (Conceptual)
+### Entry Type Creation Patterns (Conceptual) <a id="smoo/lmao!n/lmao-entry-entry-type-creation-patterns"></a>
 
 Each entry type follows specific patterns for populating columns. The examples below use placeholder `writeColumnName()`
 calls to illustrate the concepts - the actual column writing API is still being designed:
@@ -1172,7 +1172,7 @@ function createFeatureFlagEntry(
 }
 ```
 
-## Span Duration Calculation
+## Span Duration Calculation <a id="smoo/lmao!n/lmao-entry-span-duration-calculation"></a>
 
 The fixed row layout guarantees that duration is always computable:
 
@@ -1206,11 +1206,11 @@ WHERE entry_type IN ('span-start', 'span-ok', 'span-err', 'span-exception')
 GROUP BY thread_id, span_id, span_name, entry_type;
 ```
 
-## Entry Type Validation
+## Entry Type Validation <a id="smoo/lmao!n/lmao-entry-entry-type-validation"></a>
 
 The system enforces entry type constraints at the API level:
 
-### Required Columns by Entry Type
+### Required Columns by Entry Type <a id="smoo/lmao!n/lmao-entry-required-columns-by-entry-type"></a>
 
 - **All entry types**: `timestamp`, `trace_id`, `thread_id`, `span_id`, `entry_type`, `module`, `message`
 - **Span lifecycle** (`span-start`, `span-ok`, `span-err`, `span-exception`): `message` contains span name
@@ -1224,7 +1224,7 @@ The system enforces entry type constraints at the API level:
   contains the metric value
 - **Period marker** (`period-start`): `uint64_value` contains the period start timestamp (nanoseconds)
 
-### The `message` Column by Entry Type
+### The `message` Column by Entry Type <a id="smoo/lmao!n/lmao-entry-the-message-column-by-entry-type"></a>
 
 | Entry Type                                            | `message` Contains                                       |
 | ----------------------------------------------------- | -------------------------------------------------------- |
@@ -1234,7 +1234,7 @@ The system enforces entry type constraints at the API level:
 | `op-*` (all 8 op metric types)                        | Op name (e.g., `'GET'`, `'createUser'`)                  |
 | `period-start`, `buffer-*` (5 types)                  | unused (null)                                            |
 
-### Fixed Row Constraints
+### Fixed Row Constraints <a id="smoo/lmao!n/lmao-entry-fixed-row-constraints"></a>
 
 - **Row 0**: Always `span-start` - created at span initialization
 - **Row 1**: Always completion type (`span-ok`, `span-err`, or `span-exception`) - pre-initialized as `span-exception`
@@ -1243,15 +1243,15 @@ The system enforces entry type constraints at the API level:
 **Metrics rows** (`period-start`, `op-*`, `buffer-*`) are written during flush cycles, not during span execution. They
 are appended to the global trace buffer, not to individual SpanBuffers.
 
-### Forbidden Combinations
+### Forbidden Combinations <a id="smoo/lmao!n/lmao-entry-forbidden-combinations"></a>
 
 - **Span completion without start**: `span-ok`/`span-err`/`span-exception` must have matching `span-start`
 - **Orphaned spans**: All spans except root must have valid `parent_thread_id` and `parent_span_id`
 - **Mixed concerns**: Feature flag columns only valid with `ff-access`/`ff-usage` entry types
 
-## Performance Characteristics
+## Performance Characteristics <a id="smoo/lmao!n/lmao-entry-performance-characteristics"></a>
 
-### Dictionary Encoding Benefits
+### Dictionary Encoding Benefits <a id="smoo/lmao!n/lmao-entry-dictionary-encoding-benefits"></a>
 
 Entry types use Arrow's dictionary encoding:
 
@@ -1259,7 +1259,7 @@ Entry types use Arrow's dictionary encoding:
 - **Query performance**: Numeric comparisons instead of string matching
 - **Memory efficiency**: References are small integers
 
-### Hot Path Optimization
+### Hot Path Optimization <a id="smoo/lmao!n/lmao-entry-hot-path-optimization"></a>
 
 The entry type system is designed for minimal hot path overhead:
 
@@ -1267,7 +1267,7 @@ The entry type system is designed for minimal hot path overhead:
 - **No conditionals**: Entry type determines exact code path
 - **Direct memory writes**: No intermediate objects or transformations
 
-## Integration Points
+## Integration Points <a id="smoo/lmao!n/lmao-entry-integration-points"></a>
 
 This entry type system integrates with:
 

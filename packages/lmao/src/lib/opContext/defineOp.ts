@@ -14,6 +14,11 @@ import type { OpGroup, OpGroupOps } from './opGroupTypes.js';
 import type { Op, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
 import type { OpContext } from './types.js';
 
+//#region smoo/lmao!n/metadata-injection
+// 01l "Metadata Injection (Transformer)": package_name/package_file/git_sha/line are the
+// per-Op OpMetadata the transformer injects at the defineOpContext call site. createOpMetadata
+// pre-encodes the dictionary entries (interned UTF-8); DEFAULT_METADATA is the un-injected
+// placeholder; extractMetadataFromStack is the no-transformer dev fallback (parses the stack).
 // =============================================================================
 // METADATA HELPERS
 // =============================================================================
@@ -130,6 +135,7 @@ export function extractMetadataFromStack(skipFrames = 2): OpMetadata {
 
   return createOpMetadata('unknown', packageName, filePath, 'runtime', lineNumber);
 }
+//#endregion smoo/lmao!n/metadata-injection
 
 // =============================================================================
 // FACTORY CONFIG

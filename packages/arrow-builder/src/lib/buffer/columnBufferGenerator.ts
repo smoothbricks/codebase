@@ -45,6 +45,7 @@ export type { AnyColumnBuffer, ColumnBuffer };
  * breaks V8 hidden class optimization. This extension mechanism allows injecting
  * code directly into the generated class for optimal performance.
  */
+//#region smoo/lmao!n/buffer-codegen.extension-options
 export interface ColumnBufferExtension {
   /**
    * Additional code to add to the constructor (after system columns are initialized).
@@ -118,6 +119,9 @@ export interface ColumnBufferExtension {
   dependencies?: Record<string, unknown>;
 }
 
+//#endregion smoo/lmao!n/buffer-codegen.extension-options
+
+//#region smoo/lmao!n/buffer-arch-eager-vs-lazy
 /**
  * Storage info for a schema field - determines how values are stored
  */
@@ -190,7 +194,9 @@ function getTypedArrayInfo(schema: ColumnSchema, fieldName: string): ColumnStora
   // Default to Uint32Array for unknown types
   return { constructorName: 'Uint32Array', bytesPerElement: 4, isBitPacked: false, schemaType, isEager };
 }
+//#endregion smoo/lmao!n/buffer-arch-eager-vs-lazy
 
+//#region smoo/lmao!n/buffer-arch-lazy-column-init
 /**
  * Generate inline allocation code for a lazy column's _nulls getter.
  * This allocates BOTH nulls and values arrays in a shared ArrayBuffer.
@@ -224,7 +230,9 @@ function generateInlineAllocation(columnName: string, info: ColumnStorageInfo): 
         v = this._${columnName}_nulls = new Uint8Array(buf, 0, nullSize);
         this._${columnName}_values = new ${constructorName}(buf, alignedOffset, cap);`;
 }
+//#endregion smoo/lmao!n/buffer-arch-lazy-column-init
 
+//#region smoo/lmao!n/buffer-arch-allocation-timing
 /** Generate value assignment code for a setter method. */
 function generateSetterValueAssignment(info: ColumnStorageInfo, accessPrefix: string): string {
   const { schemaType, isBitPacked, enumValues } = info;
@@ -263,7 +271,9 @@ function getDefaultValueLiteral(info: ColumnStorageInfo): string {
   if (schemaType === 'binary') return 'null';
   return '0';
 }
+//#endregion smoo/lmao!n/buffer-arch-allocation-timing
 
+//#region smoo/lmao!n/buffer-codegen.generate-class
 /**
  * Generate ColumnBuffer class code as a string.
  *
@@ -424,10 +434,12 @@ ${extensionMethods}
 return ${className};
 `;
 }
+//#endregion smoo/lmao!n/buffer-codegen.generate-class
 
 /**
  * Cache for generated ColumnBuffer classes.
  */
+//#region smoo/lmao!n/buffer-codegen.get-class
 const classCache = new Map<string, new (capacity: number, ...args: unknown[]) => AnyColumnBuffer>();
 
 type ColumnBufferConstructor = new (capacity: number, ...ctorArgs: unknown[]) => AnyColumnBuffer;
@@ -521,3 +533,4 @@ export function createGeneratedColumnBuffer(
   const BufferClass = getColumnBufferClass(schema, extension);
   return new BufferClass(requestedCapacity, ...constructorArgs);
 }
+//#endregion smoo/lmao!n/buffer-codegen.get-class

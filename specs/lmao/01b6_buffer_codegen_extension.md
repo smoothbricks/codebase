@@ -1,4 +1,4 @@
-# Buffer Code Generation and Extension
+# Buffer Code Generation and Extension <a id="smoo/lmao!n/buffer-codegen"></a>
 
 > **Part of [Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**
 
@@ -13,7 +13,7 @@ The system uses runtime code generation (`new Function()`) to create specialized
 2. **lmao** provides span-specific code via callbacks
 3. Generated classes have fixed hidden class shapes for V8 optimization
 
-## ColumnBuffer Extension Mechanism
+## ColumnBuffer Extension Mechanism <a id="smoo/lmao!n/buffer-codegen-extension-mechanism"></a>
 
 **Purpose**: Enable arrow-builder to provide extensible buffer generation while allowing lmao to inject span-specific
 functionality without tight coupling.
@@ -24,7 +24,7 @@ functionality without tight coupling.
 - **lmao** provides the extension with span-specific code (identity, tree structure, context)
 - arrow-builder has NO knowledge of what the extension code does
 
-### Extension Options Interface
+### Extension Options Interface <a id="smoo/lmao!n/buffer-codegen.extension-options"></a>
 
 ```typescript
 interface ColumnBufferExtensionOptions {
@@ -138,7 +138,7 @@ class GeneratedSpanBuffer {
 }
 ```
 
-### Lazy Column Getter Implementation
+### Lazy Column Getter Implementation <a id="smoo/lmao!n/buffer-codegen.generate-class"></a>
 
 Attribute columns use lazy getters that allocate shared ArrayBuffers on first access:
 
@@ -224,7 +224,7 @@ This enables V8 to:
 | **Code Generation**  | Duplicate logic              | Single codegen with injection |
 | **Maintenance**      | Two codebases to update      | Single source of truth        |
 
-## Schema-Generated Buffer Extensions
+## Schema-Generated Buffer Extensions <a id="smoo/lmao!n/buffer-codegen-schema-generated"></a>
 
 **Purpose**: Extend the base buffer with typed columns based on tag attribute schemas.
 
@@ -254,7 +254,7 @@ interface ComposedSpanBuffer extends SpanBuffer {
 }
 ```
 
-### createSpanBuffer Factory
+### createSpanBuffer Factory <a id="smoo/lmao!n/buffer-codegen-create-factory"></a>
 
 ```typescript
 /**
@@ -287,7 +287,7 @@ function createSpanBuffer<T extends LogSchema>(
 }
 ```
 
-### getSpanBufferClass Generator
+### getSpanBufferClass Generator <a id="smoo/lmao!n/buffer-codegen-get-class"></a>
 
 Key optimizations in the generated class:
 
@@ -347,14 +347,14 @@ function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
 }
 ```
 
-### createNextBuffer (Overflow Chaining)
+### createOverflowBuffer (Overflow Chaining) <a id="smoo/lmao!n/buffer-codegen-overflow"></a>
 
 ```typescript
 /**
  * Creates a continuation buffer when current buffer overflows.
  * Chained buffers SHARE identity reference (same logical span).
  */
-function createNextBuffer<T extends LogSchema>(buffer: SpanBuffer<T>): SpanBuffer<T> {
+function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>): SpanBuffer<T> {
   const schema = buffer.module.logSchema as T;
   const capacity = (buffer.module.sb_capacity + 7) & ~7;
 

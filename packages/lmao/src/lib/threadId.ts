@@ -22,6 +22,7 @@
  * @module threadId
  */
 
+//#region smoo/lmao!n/spanbuffer-layout.thread-id
 /** Thread ID size in bytes */
 export const THREAD_ID_BYTES = 8;
 
@@ -120,6 +121,7 @@ export function writeThreadIdToUint64Array(dest: BigUint64Array, index: number):
   const byteView = new Uint8Array(dest.buffer, dest.byteOffset + index * 8, 8);
   byteView.set(threadIdBytes);
 }
+//#endregion smoo/lmao!n/spanbuffer-layout.thread-id
 
 /**
  * Reset thread ID for testing purposes only.

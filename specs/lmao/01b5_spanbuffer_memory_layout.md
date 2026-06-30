@@ -1,4 +1,4 @@
-# SpanBuffer Memory Layout
+# SpanBuffer Memory Layout <a id="smoo/lmao!n/spanbuffer-layout"></a>
 
 > **Part of [Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**
 >
@@ -6,7 +6,7 @@
 > ArrayBuffer for maximum cache efficiency. For span identification concepts, see
 > [Span Identity](./01b4_span_identity.md).
 
-## Unified SpanBuffer Memory Layout
+## Unified SpanBuffer Memory Layout <a id="smoo/lmao!n/spanbuffer-layout-unified"></a>
 
 **Purpose**: Combine identity and system columns into a single ArrayBuffer allocation for maximum cache efficiency,
 minimal allocations, and zero conditional logic for system column access.
@@ -196,7 +196,7 @@ get span_id(): number {
 }
 ```
 
-### Thread ID Generation
+### Thread ID Generation <a id="smoo/lmao!n/spanbuffer-layout.thread-id"></a>
 
 Thread ID is cached as raw bytes at module level (thread_id.ts) for zero-copy writes:
 
@@ -217,7 +217,7 @@ function copyThreadIdTo(dest: Uint8Array, offset: number): void {
   dest.set(thread_idBytes!, offset); // Direct copy of cached bytes
 }
 
-### Constructor Implementation
+### Constructor Implementation <a id="smoo/lmao!n/spanbuffer-layout.constructor"></a>
 
 ```typescript
 class SpanBuffer {
@@ -459,7 +459,7 @@ Object.assign(SpanBuffer.prototype, spanBufferMethods);
 - Root: O(1) decode from \_identity
 - Child depth N: O(N) pointer walks (typically N=3-5)
 
-## Complete SpanBuffer Interface
+## Complete SpanBuffer Interface <a id="smoo/lmao!n/spanbuffer-layout.interface"></a>
 
 **Purpose**: Provide the authoritative interface definition that can be extended with schema-generated columns.
 
@@ -556,13 +556,13 @@ buffer.userId_nulls[byteIdx] |= bitmask; // ✅ Direct bitmap access
 const values = buffer.getColumnIfAllocated('userId');
 ```
 
-## Buffer Creation Functions
+## Buffer Creation Functions <a id="smoo/lmao!n/spanbuffer-layout-creation"></a>
 
 **Purpose**: Factory functions for creating SpanBuffer instances with correct identity and hierarchy.
 
 **PACKAGE**: All buffer creation functions are in **lmao** (`packages/lmao/src/lib/spanBuffer.ts`).
 
-### createSpanBuffer - Root Buffer Creation
+### createSpanBuffer - Root Buffer Creation <a id="smoo/lmao!n/spanbuffer-layout.create-root"></a>
 
 Creates a root SpanBuffer for a new trace with full identity including trace_id.
 
@@ -590,7 +590,7 @@ function createSpanBuffer<T extends LogSchema>(
 
 **Memory:** Single ArrayBuffer containing timestamps, entry_type, and identity (13 + traceId.length bytes)
 
-### createChildSpanBuffer - Child Buffer Creation
+### createChildSpanBuffer - Child Buffer Creation <a id="smoo/lmao!n/spanbuffer-layout.create-child"></a>
 
 Creates a child span buffer with parent linkage and simplified identity (no trace_id bytes).
 
@@ -622,7 +622,7 @@ function createChildSpanBuffer<T extends LogSchema>(
 
 **Note:** Child buffers access trace_id by walking parent chain to root (typically 3-5 levels).
 
-### createOverflowBuffer - Buffer Chaining
+### createOverflowBuffer - Buffer Chaining <a id="smoo/lmao!n/spanbuffer-layout.create-overflow"></a>
 
 Creates a continuation buffer when the current buffer overflows. Chained buffers SHARE the identity reference from the
 first buffer (they represent the SAME logical span, just additional storage).
@@ -643,7 +643,7 @@ function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>): SpanB
 
 **Note:** Capacity is rounded up to multiple of 8 for byte-aligned null bitmaps.
 
-### TraceRoot Interface
+### TraceRoot Interface <a id="smoo/lmao!n/spanbuffer-layout-traceroot"></a>
 
 TraceRoot is created once per trace and shared by reference across all spans. It provides timestamp anchoring and tracer
 lifecycle hooks.
@@ -690,7 +690,7 @@ interface TraceRoot {
 
 See [High-Precision Timestamps](./01b3_high_precision_timestamps.md) for timestamp design details.
 
-## Capacity Statistics
+## Capacity Statistics <a id="smoo/lmao!n/spanbuffer-layout.stats"></a>
 
 Each `SpanBufferClass` (generated per schema) has a static `stats` property for capacity tuning:
 

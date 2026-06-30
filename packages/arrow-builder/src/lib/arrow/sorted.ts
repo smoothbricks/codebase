@@ -5,6 +5,7 @@
  * Used for Arrow dictionary columns that require sorted values (enum, category).
  */
 
+//#region smoo/lmao!n/arrow-tree-walker-sort
 declare const sortedArrayBrand: unique symbol;
 
 /** Branded type for arrays that have been sorted */
@@ -31,3 +32,4 @@ export function sortInPlace<T>(arr: T[], compare: (a: T, b: T) => number): Sorte
 export function compareStrings(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
+//#endregion smoo/lmao!n/arrow-tree-walker-sort

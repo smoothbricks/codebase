@@ -7,4 +7,6 @@
 export * from './index.js';
 
 // Export Node.js-specific TraceRoot factory for Tracer construction
+//#region smoo/lmao!n/trace-root-timestamps.entry-points #node
 export { createTraceRoot } from './lib/traceRoot.node.js';
+//#endregion smoo/lmao!n/trace-root-timestamps.entry-points

@@ -1,22 +1,21 @@
-# Trace Archive Primitives
+# Trace Archive Primitives <a id="smoo/lmao!n/trace-archive"></a>
 
-## Overview
+## Overview <a id="smoo/lmao!n/trace-archive-overview"></a>
 
 This spec defines LMAO library primitives for trace archival data-plane operations.
 
 LMAO owns chunk construction, Arrow/Parquet conversion utilities, generic partition helpers, and deterministic
 per-consumer cursor state.
 
-## Ownership Boundary
+## Ownership Boundary <a id="smoo/lmao!n/trace-archive-ownership"></a>
 
-### LMAO Owns (This Spec)
+### LMAO Owns (This Spec) <a id="smoo/lmao!n/trace-archive-ownership.lmao-owns"></a>
 
 - Trace chunk envelope construction from Arrow tables
 - Deterministic chunk identity helpers (`chunk_id`, schema hash, lineage hash)
 - Generic partition-cardinality inspection and split helpers for tabular batches
 - Compaction primitives for time-windowed Arrow/Parquet outputs
 - Chunk statistics extraction helpers for downstream predicate pre-filtering
-
 
 - Archive catalog/state model and listener registration
 - Expression evaluation policy and wake strategy
@@ -25,8 +24,7 @@ per-consumer cursor state.
 
 LMAO primitives in this spec do not parse, compile, or evaluate `ax` expressions.
 
-
-## Primitive 1: Chunk Envelope Construction
+## Primitive 1: Chunk Envelope Construction <a id="smoo/lmao!n/trace-archive-envelope"></a>
 
 ```typescript
 type TraceChunkEnvelope = {
@@ -56,7 +54,7 @@ interface TraceChunkBuilder {
 
 `chunk_id` must be deterministic from envelope content identity (not random per retry).
 
-## Primitive 2: Partition Shape Inspection
+## Primitive 2: Partition Shape Inspection <a id="smoo/lmao!n/trace-archive-partition-inspect"></a>
 
 ```typescript
 type PartitionCardinality =
@@ -75,7 +73,7 @@ interface ChunkPartitionInspector {
 This primitive does not derive AxDomainGroup or destination AxId. It only reports whether rows are single-partition,
 mixed-partition, or unresolvable from provided columns.
 
-## Primitive 3: Partition Split Helper
+## Primitive 3: Partition Split Helper <a id="smoo/lmao!n/trace-archive-partition-split"></a>
 
 ```typescript
 type PartitionSlice = {
@@ -97,7 +95,7 @@ interface ChunkPartitioner {
 
 Split output must be deterministic for the same input chunk and partition-column configuration.
 
-## Primitive 4: Compaction
+## Primitive 4: Compaction <a id="smoo/lmao!n/trace-archive-compaction"></a>
 
 ```typescript
 type CompactionTargetFormat = 'arrow' | 'parquet';
@@ -130,7 +128,7 @@ interface TraceChunkCompactor {
 
 Compaction must be append-only: source chunks remain immutable, output emits new chunk identity + lineage.
 
-## Primitive 5: Chunk Stats Extraction
+## Primitive 5: Chunk Stats Extraction <a id="smoo/lmao!n/trace-archive-stats"></a>
 
 ```typescript
 type ChunkColumnStat = {
@@ -147,25 +145,23 @@ interface TraceChunkStats {
 
 These stats are optional optimization primitives for downstream expression pre-filtering.
 
-## Determinism and Retry Invariants
+## Determinism and Retry Invariants <a id="smoo/lmao!n/trace-archive-determinism"></a>
 
 - Same logical input produces same `chunk_id` and partition split output.
 - Retrying ingest/compaction must not require random IDs.
 - Compaction identity is stable by `(window, source_set_hash, targetFormat)`.
 - Split helper never mutates input payload bytes.
 
-## Op Integration Pattern
-
+## Op Integration Pattern <a id="smoo/lmao!n/trace-archive-op-integration"></a>
 
 Example call chain:
 
 1. Op receives queue envelope
 2. Op builds chunk via `TraceChunkBuilder`
 3. Op inspects/splits via `ChunkPartitionInspector` + `ChunkPartitioner`
-4. Op compacts via `TraceChunkCompactor` on schedule
-   fan-out and cursor behavior
+4. Op compacts via `TraceChunkCompactor` on schedule fan-out and cursor behavior
 
-## Related
+## Related <a id="smoo/lmao!n/trace-archive.related"></a>
 
 - [Cloudflare Fetch Trace Wrapper](./01s_cloudflare_fetch_trace_wrapper.md)
 - [Arrow Table Structure](./01f_arrow_table_structure.md)

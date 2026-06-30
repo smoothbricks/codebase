@@ -20,6 +20,9 @@ import type { ITraceRoot } from '../traceRoot.js';
 import type { AnySpanBuffer } from '../types.js';
 import type { WasmAllocator } from './wasmAllocator.js';
 
+// Spec link (88): realizes specs/lmao/01q_wasm_memory_architecture.md#smoo/lmao!n/wasm-mem (SpanBuffer + SpanLogger codegen).
+//#region smoo/lmao!n/wasm-mem.spanbuffer
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -1012,3 +1015,4 @@ export function createWasmOverflowBuffer(
 
   return overflow;
 }
+//#endregion smoo/lmao!n/wasm-mem.spanbuffer

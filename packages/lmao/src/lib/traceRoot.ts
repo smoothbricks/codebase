@@ -24,6 +24,7 @@ export { createTraceId, extractSpanIdentity, generateTraceId, isValidTraceId, MA
  * Tracer lifecycle hooks interface.
  * Extracted to avoid circular dependency - Tracer implements this.
  */
+//#region smoo/lmao!n/buffer-tuning-observability
 export interface TracerLifecycleHooks {
   onTraceStart(buffer: unknown): void;
   onTraceEnd(buffer: unknown): void;
@@ -47,6 +48,7 @@ export interface TracerLifecycleHooks {
     createOverflowBuffer(buffer: AnySpanBuffer): AnySpanBuffer;
   };
 }
+//#endregion smoo/lmao!n/buffer-tuning-observability
 
 /**
  * TraceRoot._system memory layout (little-endian):
@@ -61,6 +63,7 @@ export interface TracerLifecycleHooks {
  *
  * This layout enables NAPI/WASM to read anchors directly without BigInt extraction.
  */
+//#region smoo/lmao!n/trace-root-timestamps #contract
 export const TRACE_ROOT_ANCHOR_EPOCH_OFFSET = 0;
 export const TRACE_ROOT_ANCHOR_PERF_OFFSET = 8;
 export const TRACE_ROOT_TRACE_ID_LEN_OFFSET = 16;
@@ -152,3 +155,4 @@ export interface ITraceRoot {
    */
   writeLogEntry(buffer: AnySpanBuffer, entryType: number): number;
 }
+//#endregion smoo/lmao!n/trace-root-timestamps

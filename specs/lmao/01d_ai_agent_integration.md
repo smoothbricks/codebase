@@ -1,6 +1,6 @@
-# AI Agent Integration
+# AI Agent Integration <a id="smoo/lmao!n/ai-agent-integration"></a>
 
-## Overview
+## Overview <a id="smoo/lmao!n/ai-agent-integration-overview"></a>
 
 The AI agent integration provides structured access to trace data for automated analysis and debugging. It includes:
 
@@ -9,7 +9,7 @@ The AI agent integration provides structured access to trace data for automated 
 3. **AI agent workflow** for trace-driven development and debugging
 4. **Production deployment** with authentication and privacy controls
 
-## Design Philosophy
+## Design Philosophy <a id="smoo/lmao!n/ai-agent-integration-philosophy"></a>
 
 **Key Insight**: AI agents need structured access to trace data without consuming limited context windows. The MCP
 protocol provides tool-based access where detailed trace data is only loaded when specifically requested.
@@ -21,7 +21,7 @@ protocol provides tool-based access where detailed trace data is only loaded whe
 - **Background processing**: Server watches trace files, AI queries on-demand
 - **Tool-based interface**: AI agents can call trace query functions as tools
 
-## MCP Server Architecture
+## MCP Server Architecture <a id="smoo/lmao!n/ai-agent-mcp-server"></a>
 
 **Purpose**: Provide AI agents with structured access to trace data through standardized tools.
 
@@ -155,7 +155,7 @@ traceServer.addTool({
 - **Performance focus**: Dedicated tools for performance analysis
 - **Feature flag analytics**: Specialized tools for A/B testing insights
 
-## Test Framework Integration
+## Test Framework Integration <a id="smoo/lmao!n/ai-agent-test-integration"></a>
 
 **Purpose**: Automatically correlate traces with test runs for AI-driven analysis.
 
@@ -171,7 +171,7 @@ any test framework can integrate similarly by:
 The integration pattern works with Vitest, Mocha, Jest, Bun, and any other test framework that supports plugins or
 hooks.
 
-### Jest Plugin
+### Jest Plugin <a id="smoo/lmao!n/ai-agent-test-integration.jest-plugin"></a>
 
 ```typescript
 // jest-trace-plugin
@@ -208,7 +208,7 @@ beforeEach(() => {
 });
 ```
 
-### Bun Test Plugin
+### Bun Test Plugin <a id="smoo/lmao!n/ai-agent-test-integration.bun-plugin"></a>
 
 ```typescript
 // bun-trace-plugin
@@ -243,11 +243,11 @@ plugin({
 - **Automatic tagging**: Test metadata automatically added to traces
 - **Framework agnostic**: Works with Jest, Bun, Vitest, etc.
 
-## AI Agent Workflow
+## AI Agent Workflow <a id="smoo/lmao!n/ai-agent-workflow"></a>
 
 **Purpose**: Enable AI agents to analyze actual execution behavior rather than just static code.
 
-### Example AI Agent Interaction
+### Example AI Agent Interaction <a id="smoo/lmao!n/ai-agent-workflow.example"></a>
 
 ```
 AI: Running tests...
@@ -302,7 +302,7 @@ MCP Tool Call: get_traces_by_span({ spanName: "email-send", testRunId: "test-run
 AI: All 15 failures are SMTP timeouts. Let me fix the retry logic and timeout configuration...
 ```
 
-### Workflow Steps
+### Workflow Steps <a id="smoo/lmao!n/ai-agent-workflow.steps"></a>
 
 1. **Test Execution**: AI runs tests, sees test run ID in console output
 2. **Trace Collection**: Test framework plugin writes traces with test metadata
@@ -310,11 +310,11 @@ AI: All 15 failures are SMTP timeouts. Let me fix the retry logic and timeout co
 4. **Analysis**: AI analyzes actual execution patterns, performance, errors
 5. **Code Improvement**: AI makes informed changes based on trace data
 
-## Production Deployment
+## Production Deployment <a id="smoo/lmao!n/ai-agent-prod-deployment"></a>
 
 **Purpose**: Deploy authenticated MCP server for production trace access with privacy controls.
 
-### Production MCP Server
+### Production MCP Server <a id="smoo/lmao!n/ai-agent-prod-deployment.production-mcp"></a>
 
 **Why OAuth2**:
 
@@ -364,7 +364,7 @@ traceServer.addTool({
 });
 ```
 
-### Dual Storage Architecture
+### Dual Storage Architecture <a id="smoo/lmao!n/ai-agent-prod-deployment.dual-storage"></a>
 
 **Purpose**: Store both masked data (for analytics) and encrypted unmasked data (for debugging).
 
@@ -413,11 +413,11 @@ traceServer.addTool({
 - **Compliance**: Meets privacy requirements while maintaining debugging capability
 - **Audit trail**: All decryption access logged for security
 
-## Distributed Tracing Integration
+## Distributed Tracing Integration <a id="smoo/lmao!n/ai-agent-distributed-tracing"></a>
 
 **Purpose**: Query traces across multiple services and deployments.
 
-### Cross-Service Query Architecture
+### Cross-Service Query Architecture <a id="smoo/lmao!n/ai-agent-distributed-tracing.cross-service"></a>
 
 ```typescript
 // Query distributed traces across S3 files
@@ -462,11 +462,11 @@ const lambdaTraceQuery = async (trace_id: string) => {
 - **Serverless querying**: chDB on Lambda provides cost-effective trace analysis
 - **Standard tooling**: Leverage existing analytics infrastructure
 
-## MCP Configuration
+## MCP Configuration <a id="smoo/lmao!n/ai-agent-mcp-config"></a>
 
 **Purpose**: Configure AI agents to use the trace analysis MCP server.
 
-### Claude Desktop Configuration
+### Claude Desktop Configuration <a id="smoo/lmao!n/ai-agent-mcp-config.claude-desktop"></a>
 
 ```json
 // claude_desktop_config.json
@@ -493,7 +493,7 @@ const lambdaTraceQuery = async (trace_id: string) => {
 }
 ```
 
-### Cursor/VS Code Configuration
+### Cursor/VS Code Configuration <a id="smoo/lmao!n/ai-agent-mcp-config.cursor-vscode"></a>
 
 ```json
 // .vscode/settings.json
@@ -509,11 +509,11 @@ const lambdaTraceQuery = async (trace_id: string) => {
 }
 ```
 
-## AI Agent Documentation Requirements
+## AI Agent Documentation Requirements <a id="smoo/lmao!n/ai-agent-doc-requirements"></a>
 
 **Purpose**: Provide AI agents with concise prompts that enforce trace logging patterns.
 
-### Agent Prompt Structure
+### Agent Prompt Structure <a id="smoo/lmao!n/ai-agent-doc-requirements.prompt-structure"></a>
 
 ```typescript
 // AI agent-specific prompts (< 500 tokens each)
@@ -618,7 +618,7 @@ const AI_AGENT_PROMPTS = {
 };
 ```
 
-## Benefits
+## Benefits <a id="smoo/lmao!n/ai-agent-integration-benefits"></a>
 
 1. **Actual Behavior Analysis**: AI sees real execution traces, not just static code
 2. **Performance Insights**: AI can identify slow operations and memory issues
@@ -631,11 +631,11 @@ const AI_AGENT_PROMPTS = {
 This integration enables AI agents to make informed decisions based on actual application behavior rather than just code
 analysis.
 
-## Arrow Table Conversion
+## Arrow Table Conversion <a id="smoo/lmao!n/ai-agent-arrow-conversion"></a>
 
 **Purpose**: MCP tools convert SpanBuffer data to Arrow tables for efficient querying and analysis.
 
-### Zero-Copy Conversion
+### Zero-Copy Conversion <a id="smoo/lmao!n/ai-agent-arrow-conversion.zero-copy"></a>
 
 MCP tools use **zero-copy Arrow conversion** to transform SpanBuffer data into Arrow tables. This process:
 
@@ -649,7 +649,7 @@ MCP tools use **zero-copy Arrow conversion** to transform SpanBuffer data into A
 The conversion happens in the cold path (when MCP tools are called), ensuring zero overhead on the hot path (runtime
 logging).
 
-## Arrow Table Column Reference
+## Arrow Table Column Reference <a id="smoo/lmao!n/ai-agent-arrow-columns"></a>
 
 When querying trace data via MCP tools, the following columns are available:
 
@@ -666,7 +666,7 @@ When querying trace data via MCP tools, the following columns are available:
 | `parent_span_id`   | Parent span's ID (uint32, nullable - null for root spans)                                                                                                      |
 | `ff_value`         | Feature flag value (dictionary-encoded string, S.category). Flag name is in `message` column for `ff-access`/`ff-usage` entries                                |
 
-### Message Column
+### Message Column <a id="smoo/lmao!n/ai-agent-arrow-columns.message"></a>
 
 The `message` column serves different purposes based on entry type:
 
@@ -678,7 +678,7 @@ The `message` column serves different purposes based on entry type:
 
 See [Arrow Table Structure](./01f_arrow_table_structure.md#the-message-system-column) for complete details.
 
-### Module Identification
+### Module Identification <a id="smoo/lmao!n/ai-agent-arrow-columns.module-id"></a>
 
 The `package_name` and `package_path` columns work together to identify the source location:
 
@@ -694,7 +694,7 @@ show `httpModule` (execution).
 
 See [Arrow Table Structure](./01f_arrow_table_structure.md#module-identification) for complete details.
 
-### Span Identification
+### Span Identification <a id="smoo/lmao!n/ai-agent-arrow-columns.span-id"></a>
 
 Spans are uniquely identified by the composite `(thread_id, span_id)`:
 

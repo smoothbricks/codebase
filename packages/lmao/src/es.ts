@@ -8,4 +8,6 @@
 export * from './index.js';
 
 // Export browser-specific TraceRoot factory for Tracer construction
+//#region smoo/lmao!n/trace-root-timestamps.entry-points #es
 export { createTraceRoot } from './lib/traceRoot.es.js';
+//#endregion smoo/lmao!n/trace-root-timestamps.entry-points

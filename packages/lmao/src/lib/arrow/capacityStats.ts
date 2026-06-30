@@ -57,6 +57,7 @@ function append(entries: [string, Column<unknown>][], name: string, column: Colu
   entries.push([name, column]);
 }
 
+//#region smoo/lmao!n/buffer-tuning-stats-logging
 export function createCapacityStatsTable(
   entriesToLog: CapacityStatsEntry[],
   periodStartNs: bigint,
@@ -338,3 +339,4 @@ export function createCapacityStatsTable(
 
   return tableFromColumns(cols);
 }
+//#endregion smoo/lmao!n/buffer-tuning-stats-logging

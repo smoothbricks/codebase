@@ -12,6 +12,7 @@ export interface ArchiveSource {
  * Create an archive source that fetches historical Arrow chunks via HTTP GET.
  * The server returns Arrow IPC files for the requested time range.
  */
+//#region smoo/lmao!n/inspector-archive-source.create
 export function createArchiveSource(baseUrl: string): ArchiveSource {
   return {
     async *fetchRange(startTime: number, endTime: number): AsyncIterable<Uint8Array> {
@@ -87,3 +88,4 @@ export function createArchiveSource(baseUrl: string): ArchiveSource {
     },
   };
 }
+//#endregion smoo/lmao!n/inspector-archive-source.create

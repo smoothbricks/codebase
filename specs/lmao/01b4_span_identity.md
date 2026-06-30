@@ -1,4 +1,4 @@
-# Span Identity
+# Span Identity <a id="smoo/lmao!n/span-identity"></a>
 
 > **Part of [Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**
 >
@@ -104,7 +104,7 @@ To find a parent span, you need:
 - No struct unpacking needed for common queries
 - Direct column filtering in WHERE clauses
 
-### Thread-Local Counter Design (CRITICAL)
+### Thread-Local Counter Design (CRITICAL) <a id="smoo/lmao!n/span-identity.span-id-counter"></a>
 
 **The `span_id` is a THREAD-LOCAL counter**, not a per-trace counter:
 
@@ -250,7 +250,7 @@ WHERE parent_thread_id IS NULL AND parent_span_id IS NULL;
 | **Arrow output** | Separate columns (not Struct)        | Direct column filtering, no unpacking    |
 | **JS compat**    | 64-bit BigInt + 32-bit number        | No BigInt in hot path                    |
 
-## TraceId: Branded String Type
+## TraceId: Branded String Type <a id="smoo/lmao!n/span-identity.trace-id"></a>
 
 **Purpose**: Provide a type-safe, validated trace identifier that is shared by reference across all spans in a trace,
 avoiding string copies.

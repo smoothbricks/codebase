@@ -6,7 +6,7 @@
 //
 // Memory Layout:
 // ┌─────────────────────────────────────────────────────────────────────────────┐
-// │ Header (64 bytes, cache-aligned)                                            │
+// │ Header (192 bytes, 3 cache lines)                                           │
 // ├─────────────────────────────────────────────────────────────────────────────┤
 // │ Allocated Blocks (spans + columns)                                          │
 // ├─────────────────────────────────────────────────────────────────────────────┤
@@ -22,7 +22,9 @@
 //
 // Freelist: Zero-overhead, uses block's memory for next pointer + cascading stats when free.
 //
+// Spec link (88): realizes specs/lmao/01q_wasm_memory_architecture.md#smoo/lmao!n/wasm-mem (the Zig allocator region).
 
+//#region smoo/lmao!n/wasm-mem.allocator
 const std = @import("std");
 
 // =============================================================================
@@ -943,3 +945,4 @@ export fn read_col_is_valid(col_offset: u32, row_idx: u32) u8 {
     const bit: u8 = @as(u8, 1) << @intCast(row_idx & 7);
     return if ((byte & bit) != 0) 1 else 0;
 }
+//#endregion smoo/lmao!n/wasm-mem.allocator

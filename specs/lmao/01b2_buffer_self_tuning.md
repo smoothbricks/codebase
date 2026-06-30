@@ -1,4 +1,4 @@
-# Buffer Self-Tuning
+# Buffer Self-Tuning <a id="smoo/lmao!n/buffer-tuning"></a>
 
 > **📚 PART OF COLUMNAR BUFFER ARCHITECTURE**
 >
@@ -34,7 +34,7 @@ SpanBuffers, enabling per-op tuning.
 9. **Lazy-to-Eager Column Promotion** - Frequently-used columns automatically pre-allocate (see
    [Column Promotion](#lazy-to-eager-column-promotion))
 
-## Self-Tuning Architecture
+## Self-Tuning Architecture <a id="smoo/lmao!n/buffer-tuning-capacity"></a>
 
 ### Core Principle: Observe and Adapt
 
@@ -287,7 +287,7 @@ class MemoryAwareBuffer {
 }
 ```
 
-## Flush Strategy
+## Flush Strategy <a id="smoo/lmao!n/buffer-tuning-flush"></a>
 
 ### FlushScheduler Design
 
@@ -428,9 +428,9 @@ class FlushScheduler {
 **Note**: These thresholds are sensible defaults that work for most workloads. Configuration is available for advanced
 use cases (e.g., low-latency requirements, memory-constrained environments) but is not required for normal operation.
 
-## Capacity Constraints
+## Capacity Constraints <a id="smoo/lmao!n/buffer-tuning-constraints"></a>
 
-### Multiple of 8 Requirement
+### Multiple of 8 Requirement <a id="smoo/lmao!n/buffer-tuning-multiple-of-8"></a>
 
 **All buffer capacities MUST be multiples of 8.** This constraint enables efficient null bitmap operations:
 
@@ -828,7 +828,7 @@ describe('Self-tuning buffer', () => {
 });
 ```
 
-## Lazy-to-Eager Column Promotion
+## Lazy-to-Eager Column Promotion <a id="smoo/lmao!n/buffer-tuning-promotion"></a>
 
 ### Overview
 
@@ -1148,7 +1148,7 @@ describe('Lazy-to-eager column promotion', () => {
 });
 ```
 
-## Buffer Statistics Logging
+## Buffer Statistics Logging <a id="smoo/lmao!n/buffer-tuning-stats-logging"></a>
 
 Buffer statistics are logged periodically (every 100 flushes by default) to provide visibility into buffer tuning
 performance. Statistics use structured entry types with the `uint64_value` system column for efficient columnar storage.
@@ -1226,7 +1226,7 @@ ORDER BY overflow_rate DESC
 - **Consistent pattern**: Same structure as op metrics (`op-invocations`, `op-errors`, etc.)
 - **Dictionary compression**: Entry type strings compress well (only 4 unique values)
 
-## Observability Hook
+## Observability Hook <a id="smoo/lmao!n/buffer-tuning-observability"></a>
 
 Before stats are reset during capacity adjustment, the Tracer's `onStatsWillResetFor` hook is called:
 

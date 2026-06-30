@@ -20,6 +20,7 @@ export interface CompositeTracerOptions<B extends OpContextBinding = OpContextBi
  * Useful when you want multiple outputs from a single trace run,
  * for example Stdio + SQLite.
  */
+//#region smoo/lmao!n/tracer-implementations.composite
 export class CompositeTracer<B extends OpContextBinding = OpContextBinding> extends Tracer<B> {
   private readonly delegates: Tracer<B>[];
 
@@ -79,3 +80,4 @@ export class CompositeTracer<B extends OpContextBinding = OpContextBinding> exte
     }
   }
 }
+//#endregion smoo/lmao!n/tracer-implementations.composite

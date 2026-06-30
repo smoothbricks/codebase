@@ -5,6 +5,7 @@
  * The interner is a simple Map - no wrapper class needed.
  */
 
+//#region smoo/lmao!n/buffer-perf-interner
 const encoder = new TextEncoder();
 
 /** Global interner instance for pre-encoded UTF-8 */
@@ -51,3 +52,4 @@ export function internedCount(): number {
 export function clearInterned(): void {
   strings.clear();
 }
+//#endregion smoo/lmao!n/buffer-perf-interner

@@ -6,8 +6,14 @@
  * and crypto (BTC, USDC).
  */
 
+//#region corpos/billing!n/audit-multi-currency.money-currency-registry #fiat-crypto-type
 /**
  * Currency definition with both Amount and Basis precision.
+ *
+ * `type` ('fiat' | 'crypto') is the discriminator spec 14 §Currency-Registry
+ * names as the driver of FX-rate source, settlement-rail routing, and
+ * reconciliation strategy. This is the runtime registry `@axe.sc/billing`
+ * imports (`getCurrency`); the `S.enum` authoring registry lives in 00a.
  */
 export interface CurrencyDef {
   readonly code: string;
@@ -64,6 +70,7 @@ export function hasCurrency(code: string): boolean {
 export function registerCurrency(def: CurrencyDef): void {
   registry.set(def.code, def);
 }
+//#endregion corpos/billing!n/audit-multi-currency.money-currency-registry
 
 // Precomputed powers of 10 for O(1) scale lookups (covers decimals 0-18)
 const POW10: bigint[] = [];

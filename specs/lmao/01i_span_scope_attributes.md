@@ -1,4 +1,4 @@
-# Span Scope Attributes
+# Span Scope Attributes <a id="smoo/lmao!n/scope-attributes"></a>
 
 ## Overview
 
@@ -328,7 +328,7 @@ that have no direct write (null in the column).
 - **log fluent attributes**: "Specific state at this log entry"
 - **scope**: "Default context for rows without direct writes"
 
-## Arrow Conversion: Fill Optimization
+## Arrow Conversion: Fill Optimization <a id="smoo/lmao!n/scope-attributes.arrow-fill"></a>
 
 At Arrow conversion time (cold path), scope values fill any NULL cells in columns. Direct writes (tag, ok/err, log
 fluent attributes) are preserved - scope only fills cells that weren't written to.

@@ -81,6 +81,7 @@ export interface StatsSnapshot<T extends LogSchema = LogSchema> {
  * expect(tracer.statsSnapshots.length).toBeGreaterThan(0);
  * ```
  */
+//#region smoo/lmao!n/tracer-implementations.test
 export class TestTracer<B extends OpContextBinding = OpContextBinding> extends Tracer<B> {
   /**
    * All completed root trace buffers.
@@ -144,3 +145,4 @@ export class TestTracer<B extends OpContextBinding = OpContextBinding> extends T
     }
   }
 }
+//#endregion smoo/lmao!n/tracer-implementations.test

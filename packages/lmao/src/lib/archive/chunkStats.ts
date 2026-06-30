@@ -10,6 +10,7 @@ export interface TraceChunkStats {
   readonly duration_ms: number;
 }
 
+//#region smoo/lmao!n/trace-archive-stats.chunk-level
 export function extractChunkStats<T>(
   envelope: TraceChunkEnvelope,
   partitions: readonly PartitionSplit<T>[] = [],
@@ -23,3 +24,4 @@ export function extractChunkStats<T>(
     duration_ms: Math.max(0, envelope.ended_at_ms - envelope.started_at_ms),
   };
 }
+//#endregion smoo/lmao!n/trace-archive-stats.chunk-level

@@ -16,6 +16,9 @@ import type { ITraceRoot, TracerLifecycleHooks } from '../traceRoot.js';
 import type { AnySpanBuffer } from '../types.js';
 import type { WasmAllocator } from './wasmAllocator.js';
 
+// Spec link (88): realizes specs/lmao/01q_wasm_memory_architecture.md#smoo/lmao!n/wasm-mem (span lifecycle writer).
+//#region smoo/lmao!n/wasm-mem.trace-root
+
 // =============================================================================
 // WASM Buffer Detection
 // =============================================================================
@@ -313,3 +316,4 @@ export function createWasmTraceRootFactory(allocator: WasmAllocator) {
     return new WasmTraceRoot(allocator, createTraceId(trace_id), tracer);
   };
 }
+//#endregion smoo/lmao!n/wasm-mem.trace-root

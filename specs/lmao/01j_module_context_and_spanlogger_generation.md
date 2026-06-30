@@ -15,7 +15,7 @@ handles:
 
 This system operates at build/startup time to generate efficient runtime code with zero overhead.
 
-## Context Hierarchy
+## Context Hierarchy <a id="smoo/lmao!n/opcontext-hierarchy"></a>
 
 ```
 ModuleContext (class) - ONE per module definition
@@ -119,7 +119,7 @@ const createUser = op(async ({ span, log, tag }, userData: UserData) => {
 - **Deps destructuring**: `const { retry, auth } = deps`
 - **User-extensible**: Add `env` or other properties via `.ctx<Extra>()`
 
-## Module Definition with defineModule()
+## Module Definition with defineModule() <a id="smoo/lmao!n/opcontext-definition"></a>
 
 **Purpose**: Set up module-level configuration shared across all ops in the module.
 
@@ -233,7 +233,7 @@ function defineModule<Schema, Deps, FF>(config: { metadata: ModuleMetadata; logS
 }
 ```
 
-## Op Class Generation
+## Op Class Generation <a id="smoo/lmao!n/op-class"></a>
 
 The `op()` factory creates Op instances that wrap user functions. Type parameters are ordered to match the function
 signature `(ctx, ...args) => Promise<Result>`:
@@ -328,7 +328,7 @@ class Op<Ctx, Args extends unknown[], Result> {
 }
 ```
 
-## TagAPI Class Generation
+## TagAPI Class Generation <a id="smoo/lmao!n/codegen-architecture"></a>
 
 The TagAPI class provides typed attribute methods for `tag`:
 
@@ -344,7 +344,7 @@ function compileTagOperations(logSchema: LogSchema) {
 }
 ```
 
-### Library Compilation (Prefixed)
+### Library Compilation (Prefixed) <a id="smoo/lmao!n/codegen-prefixed-remap"></a>
 
 ```typescript
 function compilePrefixedTagOperations(cleanSchema: LogSchema, prefix: string) {
@@ -467,7 +467,7 @@ class LibraryTagAPI extends BaseTagAPI {
 }
 ```
 
-## SpanLogger Class Generation
+## SpanLogger Class Generation <a id="smoo/lmao!n/codegen-spanlogger"></a>
 
 The SpanLogger handles log methods (info/debug/warn/error):
 
@@ -523,7 +523,7 @@ function generateSpanLoggerClass(attributeNames: string[], schema: LogSchema) {
 }
 ```
 
-## SpanContext Type Definition
+## SpanContext Type Definition <a id="smoo/lmao!n/spancontext-type"></a>
 
 The context destructured by op functions. The `Extra` type parameter allows user-defined fields (like `env` with CF
 Worker bindings):
@@ -728,7 +728,7 @@ const httpRoot = httpLib.prefix('http').use({
 const result = await httpRoot.span('fetch-users', GET, 'https://api.example.com/users');
 ```
 
-## ESLint Rule: No Capturing Fluent Interface
+## ESLint Rule: No Capturing Fluent Interface <a id="smoo/lmao!n/eslint-no-capture-fluent"></a>
 
 Because `tag` writes entries, users must not capture the fluent interface:
 

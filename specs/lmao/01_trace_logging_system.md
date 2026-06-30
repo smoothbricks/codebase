@@ -1,15 +1,15 @@
-# Project: Trace Logging System
+# Project: Trace Logging System <a id="smoo/lmao!n/lmao-trace"></a>
 
-## Core Insight
+## Core Insight <a id="smoo/lmao!n/lmao-trace-core-insight"></a>
 
 **Observation**: Most logging systems are either too slow (string concatenation at runtime) or too hard to query
 (unstructured). We need something that's blazing fast at runtime but produces rich, queryable data.
 
-## Design Rationale: Why op() + span()?
+## Design Rationale: Why op() + span()? <a id="smoo/lmao!n/lmao-trace-design-rationale-why-op-span"></a>
 
 Understanding the design rationale helps explain WHY the current `op()` + `span()` pattern was chosen over alternatives.
 
-### Alternative Considered: task('name', fn)
+### Alternative Considered: task('name', fn) <a id="smoo/lmao!n/lmao-trace-alternative-considered-taskname-fn"></a>
 
 ```typescript
 // ALTERNATIVE (rejected): Name at definition time, ctx passed everywhere
@@ -33,7 +33,7 @@ await GET(httpRoot, 'https://example.com');
 3. **Fixed span names**: Caller couldn't provide contextual names like `'fetch-user-123'`
 4. **Unclear responsibility**: `task()` would do definition AND implied invocation semantics
 
-### Chosen Approach: op() + span()
+### Chosen Approach: op() + span() <a id="smoo/lmao!n/lmao-trace-chosen-approach-op-span"></a>
 
 ```typescript
 // op() captures module binding, span() provides name at call site
@@ -61,7 +61,7 @@ await httpRoot.span('GET', GET, 'https://example.com');
 | Module binding  | Implicit               | Explicit via Op class            |
 | V8 optimization | Closure-heavy          | Plain class, stable hidden class |
 
-### Line Number Injection
+### Line Number Injection <a id="smoo/lmao!n/lmao-trace-line-number-injection"></a>
 
 The TypeScript transformer injects line numbers as the first argument to `span()`:
 
@@ -75,12 +75,12 @@ await span(42, 'retry', deps.retry, 1);
 
 This enables source code linking without runtime stack trace parsing.
 
-## System Overview
+## System Overview <a id="smoo/lmao!n/lmao-trace-system-overview"></a>
 
 The trace logging system provides a complete solution for high-performance, structured observability with AI agent
 integration. It consists of these main components:
 
-### 1. [Trace Schema System](./01a_trace_schema_system.md)
+### 1. [Trace Schema System](./01a_trace_schema_system.md) <a id="smoo/lmao!n/lmao-trace-1-trace-schema-system01atraceschemasystemmd"></a>
 
 **Purpose**: Type-safe configuration and attribute management
 
@@ -89,7 +89,7 @@ integration. It consists of these main components:
 - **WHY**: Provides a single source of truth for data shapes, validation, and privacy rules, enabling type-safe
   operations and automatic masking.
 
-### 2. [Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)
+### 2. [Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md) <a id="smoo/lmao!n/lmao-trace-2-columnar-buffer-architecture01bcolumnarbufferarchitecturemd"></a>
 
 **Purpose**: High-performance runtime log buffers with fixed row layout.
 
@@ -105,14 +105,14 @@ integration. It consists of these main components:
 - **WHY**: Achieves <0.1ms runtime overhead and >90% storage compression by separating the hot path (writes) from the
   cold path (serialization).
 
-### 3. [Arrow Table Structure](./01f_arrow_table_structure.md)
+### 3. [Arrow Table Structure](./01f_arrow_table_structure.md) <a id="smoo/lmao!n/lmao-trace-3-arrow-table-structure01farrowtablestructuremd"></a>
 
 **Purpose**: Queryable data format for analysis and storage.
 
 - Zero-copy conversion from runtime buffers to Apache Arrow format.
 - **WHY**: Enables efficient querying, compression, and integration with data analysis tools.
 
-### 4. [Context Flow and Op/Span Pattern](./01c_context_flow_and_op_wrappers.md)
+### 4. [Context Flow and Op/Span Pattern](./01c_context_flow_and_op_wrappers.md) <a id="smoo/lmao!n/lmao-trace-4-context-flow-and-opspan-pattern01ccontextflowandopwrappersmd"></a>
 
 **Purpose**: Hierarchical context management with span correlation.
 
@@ -123,7 +123,7 @@ integration. It consists of these main components:
 - **Context destructuring**: `{ span, log, tag, deps }` for ergonomic access
 - **WHY**: Zero per-span allocation for deps, flexible naming, clean business logic
 
-### 5. [AI Agent Integration](./01d_ai_agent_integration.md)
+### 5. [AI Agent Integration](./01d_ai_agent_integration.md) <a id="smoo/lmao!n/lmao-trace-5-ai-agent-integration01daiagentintegrationmd"></a>
 
 **Purpose**: Structured trace access for automated analysis and debugging.
 
@@ -131,7 +131,7 @@ integration. It consists of these main components:
 - **WHY**: Allows AI agents to query and understand real system behavior, moving from static code analysis to dynamic
   trace analysis.
 
-### 6. [Library Integration Pattern](./01e_library_integration_pattern.md)
+### 6. [Library Integration Pattern](./01e_library_integration_pattern.md) <a id="smoo/lmao!n/lmao-trace-6-library-integration-pattern01elibraryintegrationpatternmd"></a>
 
 **Purpose**: Enable third-party libraries to provide traced operations with clean APIs.
 
@@ -139,22 +139,22 @@ integration. It consists of these main components:
 - **WHY**: Enables a rich ecosystem of traced libraries while maintaining performance and avoiding attribute name
   collisions through prefixing.
 
-### 7. [Cloudflare Fetch Trace Wrapper](./01s_cloudflare_fetch_trace_wrapper.md)
+### 7. [Cloudflare Fetch Trace Wrapper](./01s_cloudflare_fetch_trace_wrapper.md) <a id="smoo/lmao!n/lmao-trace-7-cloudflare-fetch-trace-wrapper01scloudflarefetchtracewrappermd"></a>
 
 **Purpose**: Define efficient request-path tracing and asynchronous flush behavior for Cloudflare Worker fetch handlers.
 
 - Uses `ctx.waitUntil(...)` for non-blocking trace chunk delivery.
 - Produces durable Arrow chunks for queue/object-storage aggregation.
 
-### 8. [Trace Archive Primitives](./01t_trace_archive_pipeline.md)
+### 8. [Trace Archive Primitives](./01t_trace_archive_pipeline.md) <a id="smoo/lmao!n/lmao-trace-8-trace-archive-primitives01ttracearchivepipelinemd"></a>
 
 **Purpose**: Define library-level archive primitives for chunk identity, split helpers, and compaction.
 
 - Provides deterministic data-plane building blocks callable from archival Ops.
-- Keeps LMAO focused on trace/Arrow mechanics, not agent control-plane policy.
-  registration, mixed-group routing policy, and fan-out/cursor control-plane behavior.
+- Keeps LMAO focused on trace/Arrow mechanics, not agent control-plane policy. registration, mixed-group routing policy,
+  and fan-out/cursor control-plane behavior.
 
-## Core Architecture Principles
+## Core Architecture Principles <a id="smoo/lmao!n/lmao-trace-core-architecture-principles"></a>
 
 - **Two-Phase Logging**: Separate runtime writes from background processing.
 - **Data-Oriented Design**: Use columnar storage and null bitmaps for performance, and near instant conversion to
@@ -165,9 +165,9 @@ integration. It consists of these main components:
 - **Zero-Allocation Deps**: Dependencies are Op references, not per-span closures.
 - **Call-Site Naming**: Span names provided at invocation for contextual flexibility.
 
-## The Op + Span Pattern
+## The Op + Span Pattern <a id="smoo/lmao!n/lmao-trace-the-op-span-pattern"></a>
 
-### op() - Definition Time
+### op() - Definition Time <a id="smoo/lmao!n/lmao-trace-op---definition-time"></a>
 
 `op()` wraps a function and captures module binding:
 
@@ -199,7 +199,7 @@ const GET = op(async ({ span, log, tag, deps }, url: string) => {
 - Allocate per-span
 - Bind context
 
-### span() - Invocation Time
+### span() - Invocation Time <a id="smoo/lmao!n/lmao-trace-span---invocation-time"></a>
 
 `span()` is the unified API for invoking ops:
 
@@ -221,7 +221,7 @@ await span('validate', validateOp, data);
 5. Handles try/catch for span-exception entries
 6. Records completion (span-ok or span-err)
 
-### Context Destructuring
+### Context Destructuring <a id="smoo/lmao!n/lmao-trace-context-destructuring"></a>
 
 Inside an op, context is destructured for ergonomics:
 
@@ -247,7 +247,7 @@ const processUser = op(async ({ span, log, tag, deps, ff, env }, user: User) => 
 });
 ```
 
-### Dependencies
+### Dependencies <a id="smoo/lmao!n/lmao-trace-dependencies"></a>
 
 `deps` are just references to Op instances - no per-span allocation:
 
@@ -272,7 +272,7 @@ const GET = op(async ({ span, deps }, url: string) => {
 - Old design: `ctx.deps.retry.attempt(1)` created a closure for EVERY span
 - New design: `deps.retry` is just an Op reference, shared across all spans
 
-## Key Innovations
+## Key Innovations <a id="smoo/lmao!n/lmao-trace-key-innovations"></a>
 
 1. **Zero-Allocation Deps**: Op references instead of per-span closures
 2. **Call-Site Naming**: `span('name', op, args)` for contextual flexibility
@@ -283,12 +283,12 @@ const GET = op(async ({ span, deps }, url: string) => {
 7. **AI Agent Integration**: Structured access to trace data for automated analysis
 8. **Line Number Injection**: Transformer adds line as first arg to span()
 
-## V8 Optimization Patterns
+## V8 Optimization Patterns <a id="smoo/lmao!n/lmao-trace-v8-optimization-patterns"></a>
 
 The library is designed around V8's optimization characteristics. Understanding these patterns explains many design
 decisions.
 
-### 1. Hidden Classes and Inline Caching
+### 1. Hidden Classes and Inline Caching <a id="smoo/lmao!n/lmao-trace-1-hidden-classes-and-inline-caching"></a>
 
 V8 creates "hidden classes" (also called "shapes" or "maps") for objects with the same property layout. Objects sharing
 a hidden class enable **inline caching** - V8 can remember the exact memory offset for each property, making access O(1)
@@ -319,7 +319,7 @@ ctx.span = spanFn; // Hidden class transition #2
 - `.ctx<Extra>(defaults)` requires all keys to be enumerable for codegen
 - `Object.create(proto)` used instead of object spreads `{...ctx}`
 
-### 2. Monomorphic Call Sites
+### 2. Monomorphic Call Sites <a id="smoo/lmao!n/lmao-trace-2-monomorphic-call-sites"></a>
 
 V8 optimizes function calls that always receive the same types. A call site that sees multiple types becomes
 "polymorphic" (slower) or "megamorphic" (much slower, dictionary lookup).
@@ -344,7 +344,7 @@ function writeTimestamp(buffer: any, idx: number, value: bigint) {
 - SpanContext prototype chain is consistent across all spans
 - Enum setters use switch-case (JIT-inlined) not Map.get()
 
-### 3. Runtime Codegen with `new Function()`
+### 3. Runtime Codegen with `new Function()` <a id="smoo/lmao!n/lmao-trace-3-runtime-codegen-with-new-function"></a>
 
 V8 optimizes generated code the same as handwritten code. By generating specialized code at startup, we get:
 
@@ -374,7 +374,7 @@ logger.userId('123').requestId('req-456');
 - Enum mapping functions use generated switch-case
 - Scope `_setScope()` has unrolled per-field code
 
-### 4. Prototype-Based Context Inheritance
+### 4. Prototype-Based Context Inheritance <a id="smoo/lmao!n/lmao-trace-4-prototype-based-context-inheritance"></a>
 
 `Object.create(proto)` is faster than object spreads `{...parent}` because:
 
@@ -432,7 +432,7 @@ const childScope = { ...parentScope }; // New hidden class!
 - User `Extra` properties inherit through prototype chain
 - Scope classes are generated with fixed property order for stable hidden classes
 
-### 5. TypedArray Performance
+### 5. TypedArray Performance <a id="smoo/lmao!n/lmao-trace-5-typedarray-performance"></a>
 
 TypedArrays (Uint8Array, Float64Array, BigInt64Array) are faster than regular arrays for numeric data:
 
@@ -458,7 +458,7 @@ timestamps[idx] = value; // Boxing overhead
 - Capacity aligned to 64-byte cache lines (8 elements × 8 bytes)
 - Null bitmaps use Uint8Array with bit operations
 
-### 6. Lazy Allocation Pattern
+### 6. Lazy Allocation Pattern <a id="smoo/lmao!n/lmao-trace-6-lazy-allocation-pattern"></a>
 
 For sparse data (user attributes), defer allocation until first write:
 
@@ -482,7 +482,7 @@ get userId_values() {
 - User attribute columns lazy by default
 - `S.number().eager()` forces eager allocation for hot columns
 
-### Summary: Why These Patterns Matter
+### Summary: Why These Patterns Matter <a id="smoo/lmao!n/lmao-trace-summary-why-these-patterns-matter"></a>
 
 | Pattern                | Without Optimization | With Optimization  | Speedup   |
 | ---------------------- | -------------------- | ------------------ | --------- |
@@ -496,14 +496,14 @@ get userId_values() {
 These patterns compound - a logging call that would take 10μs with naive implementation takes <0.1μs with all
 optimizations applied.
 
-## Future Experiments
+## Future Experiments <a id="smoo/lmao!n/lmao-trace-future-experiments"></a>
 
 - **Buffer Performance**: Benchmark different columnar storage strategies (e.g., single TypedArray vs. multiple) for
   memory and CPU efficiency
 - **Schema Evolution**: Design and test schema versioning and migration strategies
 - **Prototype schema-driven masking** with runtime codegen
 
-## Integration with Development Platform
+## Integration with Development Platform <a id="smoo/lmao!n/lmao-trace-integration-with-development-platform"></a>
 
 The trace logging system integrates with these platform components:
 
@@ -512,7 +512,7 @@ The trace logging system integrates with these platform components:
 - **[Context API Framework](./03_context_api_framework.md)**: Promise-local context propagation
 - **[AI Agent Development System](./08_ai_agent_development_system.md)**: MCP integration
 
-## Related Documents
+## Related Documents <a id="smoo/lmao!n/lmao-trace-related-documents"></a>
 
 1. **[Package Architecture](./00_package_architecture.md)** - arrow-builder vs lmao separation, op() + span() evolution
 2. **[Schema System](./01a_trace_schema_system.md)** - Attribute definitions and type safety
@@ -524,7 +524,7 @@ The trace logging system integrates with these platform components:
 8. **[Trace Context API Codegen](./01g_trace_context_api_codegen.md)** - Runtime API generation
 9. **[TypeScript Transformer](./01o_typescript_transformer.md)** - Compile-time optimizations for V8
 
-## Quick Reference: op() + span() Design
+## Quick Reference: op() + span() Design <a id="smoo/lmao!n/lmao-trace-quick-reference-op-span-design"></a>
 
 | Aspect             | Alternative (rejected)      | Chosen Approach                |
 | ------------------ | --------------------------- | ------------------------------ |

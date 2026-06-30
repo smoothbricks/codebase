@@ -24,7 +24,7 @@ requirements. The system optimizes each type appropriately rather than forcing t
 | **Feature Flags**         | Schema + evaluator  | Always   | Cached + analytics | A/B testing, rollouts |
 | **Environment Variables** | Plain object        | Never    | Property access    | Infrastructure config |
 
-### String Type Performance Characteristics
+### String Type Performance Characteristics <a id="smoo/lmao!n/schema-string-types"></a>
 
 LMAO provides three distinct string types with different storage strategies optimized for different access patterns.
 
@@ -47,7 +47,7 @@ for implementation details, including:
 - Dictionary building strategies per type
 - Memory growth prevention mechanisms
 
-### String Type Decision Matrix
+### String Type Decision Matrix <a id="smoo/lmao!n/schema-string-types.matrix"></a>
 
 ```typescript
 // ENUM: Known values at compile time (≤256 common, ≤65536 max)
@@ -70,7 +70,7 @@ requestId: S.text(); // Request IDs are unique by design
 uuid: S.text(); // UUIDs are unique by definition
 ```
 
-## Log Schema Definition
+## Log Schema Definition <a id="smoo/lmao!n/schema-log-schema"></a>
 
 **Purpose**: Define structured data that can be logged to spans with type safety and automatic masking.
 
@@ -104,7 +104,7 @@ const httpModule = defineModule({
 - **Masking rules**: Sensitive data automatically masked during serialization
 - **Columnar storage**: Schema drives efficient TypedArray column generation
 
-## Feature Flag Schema Definition
+## Feature Flag Schema Definition <a id="smoo/lmao!n/schema-feature-flags"></a>
 
 **Purpose**: Define feature flags with type-safe access and explicit analytics tracking.
 
@@ -135,7 +135,7 @@ const featureFlags = defineFeatureFlags({
 - **Unified event model**: Feature-flag analytics are encoded as system entry types (`ff-access`, `ff-usage`)
 - **Access dedupe**: `ff-access` is deduped per span/flag, with explicit `ff-usage` rows for tracking
 
-## Environment Variable Configuration
+## Environment Variable Configuration <a id="smoo/lmao!n/schema-env-config"></a>
 
 **Purpose**: Provide simple, fast access to deployment configuration without overhead.
 

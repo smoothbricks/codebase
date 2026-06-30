@@ -34,6 +34,11 @@ import type {
 import { validateOpName } from './opGroupTypes.js';
 import type { OpContext } from './types.js';
 
+//#region smoo/lmao!n/column-mapping-api
+// 01l "Dependencies with Column Mapping" + 01e "Column Mapping API": .prefix(name) and
+// .mapColumns({ col: 'new' | 'shared' | null }) are realized here. Each call clones the
+// OpGroup's ops with a fresh RemappedBufferView (cold-path codegen via library.ts), so the
+// hot path still writes the clean unprefixed columns; the view remaps clean->target for Arrow.
 // =============================================================================
 // INTERNAL HELPERS
 // =============================================================================
@@ -454,3 +459,4 @@ export function createOpGroup<Ctx extends OpContext, Ops extends OpGroupOps<Ctx>
   assertGroupCarriesOps<Ctx, Ops>(group, ops);
   return group;
 }
+//#endregion smoo/lmao!n/column-mapping-api

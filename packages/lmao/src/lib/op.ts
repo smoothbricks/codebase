@@ -31,6 +31,11 @@ import type { SpanBufferConstructor } from './spanBuffer.js';
  * Includes pre-encoded UTF-8 entries for Arrow dictionary building -
  * encode once at Op definition time, reuse for every span conversion.
  */
+//#region smoo/lmao!n/opcontext-hierarchy
+// 01j "ModuleContext", renamed: per-Op source-attribution metadata
+// (package_name/package_file/git_sha) + pre-encoded UTF-8 entries for Arrow
+// dictionary building. One per defineOp; SpanBuffer/SpanContext are the other
+// two levels of the 01j Context Hierarchy.
 export interface OpMetadata {
   /** Op name for metrics tracking (distinct from span names which are provided at call sites) */
   readonly name: string;
@@ -50,11 +55,13 @@ export interface OpMetadata {
   /** Pre-encoded git_sha for Arrow dictionary building */
   readonly git_sha_entry: PreEncodedEntry;
 }
+//#endregion smoo/lmao!n/opcontext-hierarchy
 
 // =============================================================================
 // Op Class
 // =============================================================================
 
+//#region smoo/lmao!n/op-class
 /**
  * Op - Traced operation (Phase 2 architecture)
  *
@@ -101,3 +108,4 @@ export class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
     readonly _opContextBinding?: OpContextBinding,
   ) {}
 }
+//#endregion smoo/lmao!n/op-class

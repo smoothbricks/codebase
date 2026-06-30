@@ -1,3 +1,4 @@
+//#region corpos/billing!n/audit-flag-evaluator.lmao-evaluator-generator
 /**
  * Worker-safe feature-flag evaluator generation.
  *
@@ -307,3 +308,4 @@ export function createEvaluatorClass<Ctx extends OpContext>(
 
   return generatedEvaluatorClass;
 }
+//#endregion corpos/billing!n/audit-flag-evaluator.lmao-evaluator-generator

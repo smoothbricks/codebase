@@ -1,4 +1,4 @@
-# Context Flow and Op Wrappers
+# Context Flow and Op Wrappers <a id="smoo/lmao!n/context-flow"></a>
 
 ## Overview
 
@@ -11,7 +11,7 @@ application. It provides:
 4. **Type-safe context destructuring** with automatic span correlation
 5. **User-extensible context** via `ctx` property in `defineOpContext()` for custom properties like env bindings
 
-## What A Span Is (Conceptual Model)
+## What A Span Is (Conceptual Model) <a id="smoo/lmao!n/context-flow-what-is-span"></a>
 
 A span is the smallest traced unit of execution in LMAO.
 
@@ -23,7 +23,7 @@ A span is the smallest traced unit of execution in LMAO.
 
 Operationally, `trace(...)` creates the root span and `ctx.span(...)` creates child spans.
 
-## Why `span()` Is Promise-Based
+## Why `span()` Is Promise-Based <a id="smoo/lmao!n/context-flow-span-promise"></a>
 
 `span()` is Promise-based by design to provide one uniform execution contract for:
 
@@ -47,7 +47,7 @@ When a child span callback is guaranteed synchronous, use `spanSync(name, fn)`.
 - Lifecycle semantics: same span-start/span-end/span-exception envelope as `span()`
 - Retry behavior: no async retry/backoff loop
 
-## Context Hierarchy
+## Context Hierarchy <a id="smoo/lmao!n/context-flow-hierarchy"></a>
 
 ```
 OpMetadata (object) - ONE per Op, injected by transformer
@@ -131,7 +131,7 @@ buffer.line_values[0]; // Line number for row 0 (lazy column)
 buffer.trace_id; // Walks parent chain to root if child span
 ```
 
-## Design Rationale: From ctx Parameter to Destructured Context
+## Design Rationale: From ctx Parameter to Destructured Context <a id="smoo/lmao!n/context-flow-destructuring"></a>
 
 ### Problem with Traditional ctx Parameter
 
@@ -230,7 +230,7 @@ trace('create-user', { env, requestId }, createUserOp, userData) creates:
 - `ff`: Feature flag evaluator bound to current span's buffer
 - User context properties (e.g., `env`, `requestId`, `userId` - defined via `ctx` in `defineOpContext()`)
 
-## Trace-Level Context Creation
+## Trace-Level Context Creation <a id="smoo/lmao!n/context-flow-trace-creation"></a>
 
 **Purpose**: Create the initial context at request boundaries with user-specific feature flag evaluation and
 high-precision time anchor.
@@ -314,7 +314,7 @@ await trace('handle-request', { trace_id: incomingTraceId, env, requestId }, han
 await trace('handle-request', { env, requestId }, handleOp);
 ```
 
-## Op Definition and the defineOp() Factory
+## Op Definition and the defineOp() Factory <a id="smoo/lmao!n/context-flow-op-definition"></a>
 
 ### What is an Op?
 
@@ -487,7 +487,7 @@ class Op<Ctx, Args extends unknown[], Result> {
    - Memory efficient - no copying of user properties at each span creation
    - No `_extraKeys` tracking needed - prototype chain handles inheritance automatically
 
-## SpanContext Interface
+## SpanContext Interface <a id="smoo/lmao!n/context-flow-spancontext-iface"></a>
 
 The context passed to op functions combines built-in properties with user-extensible `Ctx`:
 
@@ -557,7 +557,7 @@ const fetchWithRetry = defineOp('fetchWithRetry', async (ctx, url: string) => {
 });
 ```
 
-## Child Span Creation via span()
+## Child Span Creation via span() <a id="smoo/lmao!n/context-flow-child-span"></a>
 
 The `span()` method is how ops call other ops:
 
@@ -609,7 +609,7 @@ const processOrder = defineOp('processOrder', async (ctx, order: Order) => {
 });
 ```
 
-## Root Invocation
+## Root Invocation <a id="smoo/lmao!n/context-flow-root-invocation"></a>
 
 At the application entry point, create a Tracer and use its `trace()` method:
 
@@ -653,7 +653,7 @@ app.post('/users', async (req, res) => {
 });
 ```
 
-## Thread ID and Distributed Span Identification
+## Thread ID and Distributed Span Identification <a id="smoo/lmao!n/context-flow-thread-id"></a>
 
 The `thread_id` stored in SpanBuffer enables collision-resistant span identification:
 
@@ -674,7 +674,7 @@ Worker B: childBuffer = { thread_id: 0xBBB..., span_id: 1, parent: parentBuffer 
           Arrow output: parent_thread_id=0xAAA..., parent_span_id=1
 ```
 
-## High-Precision Timestamp Design
+## High-Precision Timestamp Design <a id="smoo/lmao!n/context-flow-timestamps"></a>
 
 The trace root captures time anchors at creation, stored in `TraceRoot`:
 
@@ -704,7 +704,7 @@ function getTimestamp(buffer: SpanBuffer): bigint {
 - All spans in trace share same anchor via `_traceRoot` reference (comparable timestamps)
 - Root buffer stores `TraceRoot`, children access via parent chain
 
-## Feature Flag Integration
+## Feature Flag Integration <a id="smoo/lmao!n/context-flow-feature-flags"></a>
 
 Feature flags are accessed via `ff` in the op context:
 
@@ -882,7 +882,7 @@ This context flow system integrates with:
 - **[Library Integration Pattern](./01e_library_integration_pattern.md)**: Shows how libraries define ops
 - **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Defines the SpanBuffer structure
 
-## Line Number System
+## Line Number System <a id="smoo/lmao!n/context-flow-line-numbers"></a>
 
 **CRITICAL: lineNumber is NEVER a property on any object.** It flows directly from transformer injection to TypedArray
 writes:

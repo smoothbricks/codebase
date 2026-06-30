@@ -23,6 +23,7 @@ let _enginePromise: Promise<ArrowQueryEngine> | null = null;
  * Lazy initialization: the WASM bundle is only fetched on first call,
  * keeping import-time bundle cost zero.
  */
+//#region smoo/lmao!n/inspector-query-engine.duckdb-wasm
 export function createQueryEngine(): Promise<ArrowQueryEngine> {
   if (_enginePromise) return _enginePromise;
   // Reset the singleton on init failure so callers can retry after a broken
@@ -87,6 +88,7 @@ async function initEngine(): Promise<ArrowQueryEngine> {
     },
   };
 }
+//#endregion smoo/lmao!n/inspector-query-engine.duckdb-wasm
 
 /**
  * Reset the singleton engine reference. Useful for testing.

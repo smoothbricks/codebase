@@ -28,6 +28,7 @@ const textEncoder = new TextEncoder();
 /** Shared TextDecoder for trace_id decoding (stateless, reusable) */
 const textDecoder = new TextDecoder();
 
+//#region smoo/lmao!n/trace-root-timestamps #node
 /**
  * TraceRoot - Node.js implementation.
  *
@@ -168,3 +169,4 @@ export function createTraceRoot(trace_id: string, tracer: TracerLifecycleHooks):
   const anchorPerfNow = Number(anchorHrtimeBigInt);
   return new TraceRoot(createTraceId(trace_id), anchorEpochNanos, anchorPerfNow, anchorHrtimeBigInt, tracer);
 }
+//#endregion smoo/lmao!n/trace-root-timestamps

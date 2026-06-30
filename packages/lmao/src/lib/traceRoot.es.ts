@@ -1,3 +1,4 @@
+//#region corpos/billing!n/audit-pricing-metering.lmao-es-trace-root
 /**
  * TraceRoot - Browser/ES implementation.
  *
@@ -94,6 +95,7 @@ export class TraceRoot implements ITraceRoot {
     return createTraceId(textDecoder.decode(new Uint8Array(this._system, TRACE_ROOT_TRACE_ID_OFFSET, len)));
   }
 
+  //#region smoo/lmao!n/trace-root-timestamps #es
   /**
    * Get current timestamp in nanoseconds since Unix epoch.
    * Uses performance.now() - microsecond precision (last 3 digits = 000).
@@ -104,6 +106,7 @@ export class TraceRoot implements ITraceRoot {
     const elapsedNanos = BigInt(Math.floor(elapsedMs * 1000)) * 1000n;
     return Nanoseconds.unsafe(this._epochView[0] + elapsedNanos);
   }
+  //#endregion smoo/lmao!n/trace-root-timestamps
 
   /**
    * Write span-start entry to buffer at row 0.
@@ -155,3 +158,4 @@ export function createTraceRoot(trace_id: string, tracer: TracerLifecycleHooks):
   const anchorPerfNow = performance.now();
   return new TraceRoot(createTraceId(trace_id), anchorEpochNanos, anchorPerfNow, tracer);
 }
+//#endregion corpos/billing!n/audit-pricing-metering.lmao-es-trace-root

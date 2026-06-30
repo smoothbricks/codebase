@@ -1,6 +1,6 @@
-# Query Engine
+# Query Engine <a id="smoo/lmao!n/query-engine"></a>
 
-## Overview
+## Overview <a id="smoo/lmao!n/query-engine.overview"></a>
 
 DuckDB is the most viable query engine for lmao traces. It natively reads Arrow IPC, runs on AWS Lambda reading S3, and
 has a straightforward extension system that makes a custom `msgpack_extract()` function feasible.
@@ -13,9 +13,9 @@ This document covers:
 4. **msgpack_extract() extension** — custom function for querying `S.unknown()` Binary columns
 5. **Query patterns** — common trace analysis queries leveraging the extension
 
-## Why DuckDB
+## Why DuckDB <a id="smoo/lmao!n/query-engine.why-duckdb"></a>
 
-### SQL Engine Comparison for Binary Column Queryability
+### SQL Engine Comparison for Binary Column Queryability <a id="smoo/lmao!n/query-engine.sql-engine-comparison"></a>
 
 lmao's `S.unknown()` columns store values as msgpack-encoded Arrow Binary columns. No major SQL engine has native
 msgpack extraction:
@@ -28,7 +28,7 @@ msgpack extraction:
 | Snowflake  | Yes              | No                  | No               | No custom extensions   |
 | Databricks | Yes              | No                  | Via Spark        | JVM-based, heavyweight |
 
-### Why NOT JSON for S.unknown()
+### Why NOT JSON for S.unknown() <a id="smoo/lmao!n/query-engine.why-not-json"></a>
 
 Using JSON (Utf8 column) instead of msgpack (Binary column) was considered for universal `json_extract()` compatibility.
 Rejected because:
@@ -39,7 +39,7 @@ Rejected because:
 - **Encoding cost**: JSON.stringify is slower than msgpack encoding on the Zig hot path
 - **DuckDB extension is small**: The custom function is a bounded, well-scoped piece of work
 
-### Why DuckDB Specifically
+### Why DuckDB Specifically <a id="smoo/lmao!n/query-engine.why-duckdb-specifically"></a>
 
 - **Arrow IPC native**: Reads Arrow IPC files directly with zero-copy, no format conversion needed — lmao already
   produces Arrow IPC
@@ -50,9 +50,9 @@ Rejected because:
   `read_ipc('s3://...')`) — no intermediate download step
 - **Lambda compatible**: Multiple proven deployment options (see below)
 
-## Deployment: Lambda + S3
+## Deployment: Lambda + S3 <a id="smoo/lmao!n/query-engine-lambda"></a>
 
-### Architecture
+### Architecture <a id="smoo/lmao!n/query-engine-lambda.architecture"></a>
 
 ```
 [lmao flush] → Arrow IPC → S3 bucket
@@ -64,7 +64,7 @@ Rejected because:
 
 Traces are flushed as Arrow IPC files to S3. DuckDB on Lambda reads them directly via `httpfs` for on-demand analysis.
 
-### Proven Lambda Deployments
+### Proven Lambda Deployments <a id="smoo/lmao!n/query-engine-lambda.proven-deployments"></a>
 
 Multiple open-source projects demonstrate DuckDB running on AWS Lambda:
 
@@ -73,7 +73,7 @@ Multiple open-source projects demonstrate DuckDB running on AWS Lambda:
 - **quack-reduce** — MapReduce-style queries using DuckDB across Lambda invocations
 - **Pre-built Lambda layers** — DuckDB compiled for Amazon Linux 2, ready to attach as Lambda layer
 
-### S3 Reading
+### S3 Reading <a id="smoo/lmao!n/query-engine-lambda.s3-reading"></a>
 
 DuckDB's `httpfs` extension handles S3 reads natively:
 
@@ -89,7 +89,7 @@ WHERE timestamp > '2026-02-15T00:00:00'::timestamp;
 SELECT * FROM read_parquet('s3://my-traces/2026/02/15/*.parquet');
 ```
 
-## Arrow IPC Integration
+## Arrow IPC Integration <a id="smoo/lmao!n/query-engine-lambda.arrow-ipc-integration"></a>
 
 lmao already produces Arrow IPC via its flush path. DuckDB reads Arrow IPC natively — no conversion step needed.
 
@@ -107,14 +107,14 @@ SELECT * FROM read_ipc('s3://traces/2026-02-15/*.arrow');
 DuckDB's Arrow reader uses zero-copy for primitive columns (Float64, Int32, timestamps, etc.) and dictionary columns.
 Binary columns (where msgpack data lives) are read as `BLOB` type.
 
-## msgpack_extract() Extension
+## msgpack_extract() Extension <a id="smoo/lmao!n/query-engine-msgpack-extract"></a>
 
-### Purpose
+### Purpose <a id="smoo/lmao!n/query-engine-msgpack-extract.purpose"></a>
 
 Query msgpack-encoded values inside Arrow Binary columns without deserializing the entire payload. This is what makes
 `S.unknown()` queryable despite using msgpack instead of JSON.
 
-### Target API
+### Target API <a id="smoo/lmao!n/query-engine-msgpack-extract.target-api"></a>
 
 ```sql
 -- Extract a scalar value by path
@@ -137,7 +137,7 @@ FROM traces
 WHERE msgpack_extract_int(payload, '$.statusCode') >= 400;
 ```
 
-### Implementation Approach
+### Implementation Approach <a id="smoo/lmao!n/query-engine-msgpack-extract.implementation-approach"></a>
 
 DuckDB extensions use the C API (`duckdb.h`):
 
@@ -153,7 +153,7 @@ The extension needs:
 2. JSONPath-like path navigation over msgpack bytes
 3. Type coercion functions (extract as VARCHAR, INTEGER, DOUBLE, BOOLEAN, BLOB)
 
-### Scope
+### Scope <a id="smoo/lmao!n/query-engine-msgpack-extract.scope"></a>
 
 The extension only needs to handle the msgpack subset that lmao's Zig encoder produces:
 
@@ -164,9 +164,9 @@ The extension only needs to handle the msgpack subset that lmao's Zig encoder pr
 
 This is a well-bounded subset — no need for a general-purpose msgpack library.
 
-## Query Patterns
+## Query Patterns <a id="smoo/lmao!n/query-engine-msgpack-extract.query-patterns"></a>
 
-### Querying S.unknown() Columns
+### Querying S.unknown() Columns <a id="smoo/lmao!n/query-engine-msgpack-extract.querying-sunknown"></a>
 
 ```sql
 -- Traces with unknown payload columns
@@ -190,7 +190,7 @@ GROUP BY event_type
 ORDER BY occurrences DESC;
 ```
 
-### Combining with Standard Columns
+### Combining with Standard Columns <a id="smoo/lmao!n/query-engine-msgpack-extract.combining-standard-columns"></a>
 
 The `S.unknown()` binary columns coexist with standard typed columns. Queries can mix both:
 
@@ -207,7 +207,7 @@ WHERE package_name = '@mycompany/api-gateway'
   AND msgpack_extract_string(custom_payload, '$.correlationId') IS NOT NULL;
 ```
 
-## Future Considerations
+## Future Considerations <a id="smoo/lmao!n/query-engine.future-considerations"></a>
 
 - **Parquet export**: Arrow IPC files on S3 could be periodically compacted into Parquet for long-term storage with
   better compression. DuckDB reads both formats natively.

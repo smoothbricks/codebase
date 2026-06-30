@@ -35,6 +35,7 @@ import type { SpanBuffer } from '../types.js';
  *
  * @typeParam B - OpContextBinding type
  */
+//#region smoo/lmao!n/tracer-implementations.noop
 export class NoOpTracer<B extends OpContextBinding = OpContextBinding> extends Tracer<B> {
   /**
    * No-op hook for trace start.
@@ -71,3 +72,4 @@ export class NoOpTracer<B extends OpContextBinding = OpContextBinding> extends T
     // No-op
   }
 }
+//#endregion smoo/lmao!n/tracer-implementations.noop

@@ -1,6 +1,6 @@
-# Columnar Buffer Architecture
+# Columnar Buffer Architecture <a id="smoo/lmao!n/buffer-arch"></a>
 
-## Overview
+## Overview <a id="smoo/lmao!n/buffer-arch-overview"></a>
 
 The columnar buffer architecture is the core performance engine of the trace logging system. It provides:
 
@@ -16,7 +16,7 @@ The columnar buffer architecture is the core performance engine of the trace log
 **Key Design Insight**: Every span gets its own buffer. This eliminates the need for trace_id/span_id TypedArrays
 (they're constant per buffer), keeps logs sorted in Arrow output, and enables efficient Arrow conversion.
 
-## Design Philosophy
+## Design Philosophy <a id="smoo/lmao!n/buffer-arch-design-philosophy"></a>
 
 **Key Insight**: Traditional logging creates objects at runtime and serializes them later. This approach separates the
 hot path (TypedArray writes) from the cold path (background processing), achieving <0.1ms runtime overhead.
@@ -29,7 +29,7 @@ hot path (TypedArray writes) from the cold path (background processing), achievi
 - Flat deferred structure, not nested objects
 - Cache line alignment for optimal CPU performance
 
-## Fixed Row Layout
+## Fixed Row Layout <a id="smoo/lmao!n/buffer-arch-fixed-row-layout"></a>
 
 Each SpanBuffer uses a fixed row layout that reserves specific positions for span lifecycle events:
 
@@ -61,7 +61,7 @@ Span completion entry types (all written to row 1):
 6. **Events append from row 2**: `ctx.log.*` creates new rows starting at index 2
 7. **writeIndex starts at 2**: After span initialization, ready for event appends
 
-### ctx.tag Semantics (Datadog/Jaeger Pattern)
+### ctx.tag Semantics (Datadog/Jaeger Pattern) <a id="smoo/lmao!n/buffer-arch-ctx-tag-semantics"></a>
 
 The `ctx.tag.*` API follows Datadog's `span.set_tag()` and OpenTelemetry's `Span.setAttribute()` semantics:
 
@@ -105,7 +105,7 @@ See **[Buffer Performance Optimizations](./01b1_buffer_performance_optimizations
 - Equal length constraint for all TypedArrays
 - Performance impact (10-30% improvement)
 
-## Lazy Column Initialization
+## Lazy Column Initialization <a id="smoo/lmao!n/buffer-arch-lazy-column-init"></a>
 
 **Memory Optimization**: Attribute columns use **lazy getters** that allocate shared ArrayBuffers on first access. This
 provides significant memory savings for sparse columns.
@@ -232,7 +232,7 @@ for:
 **Quick Summary**: Schema drives typed column generation. Each attribute becomes direct properties via lazy getters.
 Optional prefixes (e.g., `http_`, `db_`) prevent conflicts with SpanBuffer internals.
 
-## Eager vs Lazy Column Allocation
+## Eager vs Lazy Column Allocation <a id="smoo/lmao!n/buffer-arch-eager-vs-lazy"></a>
 
 See **[Buffer Self-Tuning](./01b2_buffer_self_tuning.md#lazy-to-eager-column-promotion)** for the full allocation
 strategy.
@@ -287,7 +287,7 @@ See **[Buffer Self-Tuning](./01b2_buffer_self_tuning.md)** for:
 - Capacity learning algorithm
 - Lazy-to-eager column promotion
 
-### Allocation Timing Summary
+### Allocation Timing Summary <a id="smoo/lmao!n/buffer-arch-allocation-timing"></a>
 
 Understanding when allocations happen is critical for performance:
 

@@ -1,29 +1,29 @@
-# Cloudflare Fetch Trace Wrapper
+# Cloudflare Fetch Trace Wrapper <a id="smoo/lmao!n/cf-fetch-wrapper"></a>
 
-## Overview
+## Overview <a id="smoo/lmao!n/cf-fetch-wrapper-overview"></a>
 
 This spec defines a Cloudflare Worker fetch-wrapper pattern for LMAO tracing that keeps response latency low while
 shipping trace data durably for downstream aggregation.
 
 The wrapper records traces on request path and flushes asynchronously via `ctx.waitUntil(...)`.
 
-## Goals
+## Goals <a id="smoo/lmao!n/cf-fetch-wrapper-goals"></a>
 
 1. Preserve request-path performance (no synchronous log shipping on response path)
 2. Produce durable trace chunks suitable for Arrow/Parquet aggregation
 3. Keep implementation deterministic and runtime-safe in Cloudflare Workers
 
-## Non-Goals
+## Non-Goals <a id="smoo/lmao!n/cf-fetch-wrapper-non-goals"></a>
 
 - This wrapper is not prepaid/budget enforcement logic.
 
-## Runtime Constraints
+## Runtime Constraints <a id="smoo/lmao!n/cf-fetch-wrapper-runtime-constraints"></a>
 
 - Worker isolates are ephemeral and may not survive beyond any single request.
 - In-memory buffers are best-effort optimizations only.
 - Durable delivery must rely on external systems (Queue/object storage), not isolate memory.
 
-## Wrapper API
+## Wrapper API <a id="smoo/lmao!n/cf-fetch-wrapper-api"></a>
 
 ```typescript
 import type { OpContextBinding } from '@smoothbricks/lmao';
@@ -45,7 +45,7 @@ function withLmaoTracing<B extends OpContextBinding>(
 ): WrappedFetch;
 ```
 
-### Required Tracer Construction (Cloudflare Runtime)
+### Required Tracer Construction (Cloudflare Runtime) <a id="smoo/lmao!n/cf-fetch-wrapper-tracer-construction"></a>
 
 Create the tracer with Cloudflare-compatible timestamping and a queueable sink:
 
@@ -59,7 +59,7 @@ const tracer = new ArrayQueueTracer(opContext, {
 });
 ```
 
-## Canonical Request Flow
+## Canonical Request Flow <a id="smoo/lmao!n/cf-fetch-wrapper-request-flow"></a>
 
 1. Wrapper opens a root trace for the fetch request via `await tracer.trace('fetch', ...)`.
 2. Handler executes and returns response.
@@ -69,7 +69,7 @@ const tracer = new ArrayQueueTracer(opContext, {
 6. Wrapper schedules enqueue via `ctx.waitUntil(config.enqueue(chunk))`.
 7. Response is returned immediately without waiting for enqueue completion.
 
-## Trace Chunk Envelope
+## Trace Chunk Envelope <a id="smoo/lmao!n/cf-fetch-wrapper-chunk-envelope"></a>
 
 ```typescript
 type TraceChunkEnvelope = {
@@ -89,7 +89,7 @@ type TraceChunkEnvelope = {
 };
 ```
 
-## Flush Triggers
+## Flush Triggers <a id="smoo/lmao!n/cf-fetch-wrapper-flush-triggers"></a>
 
 Flush when any trigger is met:
 
@@ -99,20 +99,19 @@ Flush when any trigger is met:
 
 If none are met during a request, implementation MAY keep best-effort in-memory accumulation for warm isolates.
 
-
-## Delivery Semantics
+## Delivery Semantics <a id="smoo/lmao!n/cf-fetch-wrapper-delivery-semantics"></a>
 
 - Queue delivery is at-least-once.
 - `chunk_id` must be stable and dedupe-safe.
 - Consumers must deduplicate by `chunk_id`.
 
-## Failure Handling
+## Failure Handling <a id="smoo/lmao!n/cf-fetch-wrapper-failure-handling"></a>
 
 - Enqueue failures occur in background via `waitUntil`; they must not block response return.
 - Failed enqueue attempts should emit runtime metrics and retry via queue policy/backoff.
 - If queue is unavailable for extended periods, runtime should degrade gracefully and surface health alerts.
 
-## Downstream Archival Contract
+## Downstream Archival Contract <a id="smoo/lmao!n/cf-fetch-wrapper-archival-contract"></a>
 
 agent:
 
@@ -122,8 +121,7 @@ agent:
 2. Periodically compacts small chunks into time-windowed Arrow/Parquet files.
 3. Uses mixed-group split helpers before group-targeted routing.
 
-
-## Example
+## Example <a id="smoo/lmao!n/cf-fetch-wrapper-example"></a>
 
 ```typescript
 export default {
@@ -135,7 +133,7 @@ export default {
 };
 ```
 
-## Reference Flush Routine
+## Reference Flush Routine <a id="smoo/lmao!n/cf-fetch-wrapper-flush-routine"></a>
 
 ```typescript
 async function flushTraceBatch<B extends OpContextBinding>(
@@ -155,7 +153,7 @@ async function flushTraceBatch<B extends OpContextBinding>(
 }
 ```
 
-## Related
+## Related <a id="smoo/lmao!n/cf-fetch-wrapper-related"></a>
 
 - [Trace Logging System](./01_trace_logging_system.md)
 - [Context Flow and Op/Span Pattern](./01c_context_flow_and_op_wrappers.md)

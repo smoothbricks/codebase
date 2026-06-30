@@ -167,6 +167,7 @@ function isDefineModuleObjectCall(node: ts.CallExpression): boolean {
   return isDefineModuleCall(node) && node.arguments.length > 0 && ts.isObjectLiteralExpression(node.arguments[0]);
 }
 
+//#region smoo/lmao!n/transformer-metadata-inject
 /**
  * Try to transform defineModule() to inject metadata.
  *
@@ -246,6 +247,7 @@ function tryTransformDefineModuleCall(
     ...node.arguments.slice(1),
   ]);
 }
+//#endregion smoo/lmao!n/transformer-metadata-inject
 
 /**
  * Creates a LMAO transformer that injects line numbers into logging, span, and result calls.
@@ -258,6 +260,7 @@ function tryTransformDefineModuleCall(
  *
  * @param options - Optional configuration including TypeChecker for type-aware transformation
  */
+//#region smoo/lmao!n/transformer #entry
 export function createLmaoTransformer(options: LmaoTransformerOptions = {}): ts.TransformerFactory<ts.SourceFile> {
   const { typeChecker, projectRoot = getCachedGitRoot() ?? process.cwd() } = options;
 
@@ -352,6 +355,7 @@ export function createLmaoTransformer(options: LmaoTransformerOptions = {}): ts.
     };
   };
 }
+//#endregion smoo/lmao!n/transformer
 
 /**
  * Check if a type is a LMAO context type (TaskContext, SpanContext, etc.)
@@ -416,6 +420,7 @@ function isLmaoSpanLoggerType(type: ts.Type, typeChecker: ts.TypeChecker): boole
   return false;
 }
 
+//#region smoo/lmao!n/transformer-span-rewrite
 /**
  * Try to transform a ctx.span('name', fn) call.
  *
@@ -539,7 +544,9 @@ function tryTransformSpanCall(
     newArgs,
   );
 }
+//#endregion smoo/lmao!n/transformer-span-rewrite
 
+//#region smoo/lmao!n/transformer-task-line
 /**
  * Try to transform a task('name', fn) call to task('name', fn, lineNumber).
  *
@@ -589,7 +596,9 @@ function tryTransformTaskCall(
     factory.createNumericLiteral(lineNumber),
   ]);
 }
+//#endregion smoo/lmao!n/transformer-task-line
 
+//#region smoo/lmao!n/transformer-log-line
 /**
  * Try to transform a log call chain.
  *
@@ -682,6 +691,7 @@ function tryTransformResultChain(
 
   return rebuildChain(lineCall, chainAfterResultCall, factory);
 }
+//#endregion smoo/lmao!n/transformer-log-line
 
 interface ChainLink {
   methodName: string;
@@ -862,6 +872,7 @@ function rebuildChain(base: ts.Expression, chain: ChainLink[], factory: ts.NodeF
   return lastCall;
 }
 
+//#region smoo/lmao!n/transformer-line-injection
 /**
  * Get the 1-based line number for a node
  */
@@ -869,3 +880,4 @@ function getLineNumber(node: ts.Node, sourceFile: ts.SourceFile): number {
   const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
   return line + 1;
 }
+//#endregion smoo/lmao!n/transformer-line-injection

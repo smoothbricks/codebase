@@ -1,6 +1,6 @@
-# Lambda Routing Example: Library Composition with `op()` + `span()`
+# Lambda Routing Example: Library Composition with `op()` + `span()` <a id="smoo/lmao!n/lambda-routing-example"></a>
 
-## Overview
+## Overview <a id="smoo/lmao!n/lambda-routing-example-overview"></a>
 
 This spec demonstrates how the `defineModule()` API enables elegant library composition through a practical Lambda
 routing example. It showcases:
@@ -11,7 +11,7 @@ routing example. It showcases:
 4. **The `span()` pattern** as the universal invocation mechanism
 5. **Op-based routing** for Lambda handlers
 
-## The Pattern: `op()` + `span()`
+## The Pattern: `op()` + `span()` <a id="smoo/lmao!n/lambda-routing-example-pattern"></a>
 
 The key insight is that **every cross-cutting operation should be wrapped in a span**. This gives you:
 
@@ -25,9 +25,9 @@ The key insight is that **every cross-cutting operation should be wrapped in a s
 const result = await span('operation-name', someOp, ...args);
 ```
 
-## Complete Example: Lambda Op Router
+## Complete Example: Lambda Op Router <a id="smoo/lmao!n/lambda-routing-example-router"></a>
 
-### Auth Library (`@mycompany/auth-tracing`)
+### Auth Library (`@mycompany/auth-tracing`) <a id="smoo/lmao!n/lambda-routing-example-router.auth-library"></a>
 
 A simple authentication library that validates tokens and extracts user information.
 
@@ -93,7 +93,7 @@ export const refreshToken = op(async ({ tag, log }, refreshToken: string) => {
 - Context provides `{ tag, log, span, deps }` - destructure what you need
 - No prefix concerns in library code - clean, domain-focused
 
-### HTTP Library (`@mycompany/http-tracing`)
+### HTTP Library (`@mycompany/http-tracing`) <a id="smoo/lmao!n/lambda-routing-example-router.http-library"></a>
 
 An HTTP client library that can optionally authenticate requests using the auth library.
 
@@ -194,7 +194,7 @@ export const DELETE = op(async ({ span }, url: string, opts?: { token?: string }
 - Convenience methods (`GET`, `POST`, etc.) use `span('request', request, ...)` for composition
 - All attributes unprefixed - prefix applied at composition time
 
-### Lambda Router Library (`@mycompany/lambda-router`)
+### Lambda Router Library (`@mycompany/lambda-router`) <a id="smoo/lmao!n/lambda-routing-example-router.lambda-library"></a>
 
 A Lambda handler that routes operations by name, composing HTTP and auth libraries.
 
@@ -324,7 +324,7 @@ export const routeOp = op(async ({ span, tag, log, deps }, event: LambdaEvent): 
 });
 ```
 
-### Direct Invoke Argument Shape
+### Direct Invoke Argument Shape <a id="smoo/lmao!n/lambda-routing-example-invoke-shape"></a>
 
 For JSON invoke routers (`{ op: 'name', ...fields }`), use Ops with one of these signatures:
 
@@ -343,7 +343,7 @@ remaining payload fields should map to a single object arg.
 - Error handling with proper attribute tagging
 - Single entry point (`routeOp`) handles all operations
 
-### Application Entry Point
+### Application Entry Point <a id="smoo/lmao!n/lambda-routing-example-router.entry-point"></a>
 
 Wire everything together with prefixes and create the Lambda handler.
 
@@ -410,9 +410,9 @@ export const handlerWithContext = async (event: LambdaEvent, context: LambdaCont
 - `lambdaRoot.span('route', routeOp, event)` creates root span and invokes
 - `forContext()` adds request-scoped attributes (requestId, etc.)
 
-## Why This Pattern is Elegant
+## Why This Pattern is Elegant <a id="smoo/lmao!n/lambda-routing-example-why"></a>
 
-### 1. Deps Can Be Destructured
+### 1. Deps Can Be Destructured <a id="smoo/lmao!n/lambda-routing-example-why.deps-destructure"></a>
 
 ```typescript
 // Clean, JavaScript-native pattern
@@ -424,7 +424,7 @@ await span('GET', http.GET, url);
 
 Destructuring makes library code readable and IDE-friendly with full autocomplete.
 
-### 2. Shared Dependency Instances
+### 2. Shared Dependency Instances <a id="smoo/lmao!n/lambda-routing-example-why.shared-instances"></a>
 
 ```typescript
 // Single auth instance shared across the entire trace
@@ -442,7 +442,7 @@ const lambdaRoot = lambdaModule.prefix('lambda').use({
 
 Both HTTP and Lambda write to the SAME `auth_*` columns. No duplicate `http_auth_tokenType` or `lambda_auth_tokenType`.
 
-### 3. `span()` is the Universal Invocation
+### 3. `span()` is the Universal Invocation <a id="smoo/lmao!n/lambda-routing-example-why.universal-span"></a>
 
 ```typescript
 // Every cross-cutting call uses span()
@@ -459,7 +459,7 @@ await span('route', routeOp, event);
 
 No need for different invocation patterns - `span()` handles everything.
 
-### 4. Clean Library Code
+### 4. Clean Library Code <a id="smoo/lmao!n/lambda-routing-example-why.clean-library"></a>
 
 Libraries use unprefixed schemas:
 
@@ -475,7 +475,7 @@ tag.status(200);
 
 Prefix is applied at composition time, not authoring time.
 
-### 5. Op Routing Pattern
+### 5. Op Routing Pattern <a id="smoo/lmao!n/lambda-routing-example-why.op-routing"></a>
 
 The switch-based routing is explicit and traceable:
 
@@ -493,7 +493,7 @@ switch (event.op) {
 
 Each route creates a properly named span with full trace context.
 
-## Resulting Trace Structure
+## Resulting Trace Structure <a id="smoo/lmao!n/lambda-routing-example-trace-structure"></a>
 
 For a `POST` request with authentication:
 
@@ -517,7 +517,7 @@ lambda/route (routeOp)
             └── auth_valid = true
 ```
 
-## Arrow Table Output
+## Arrow Table Output <a id="smoo/lmao!n/lambda-routing-example-arrow-output"></a>
 
 The final Arrow table has clean, prefixed columns from all libraries:
 
@@ -551,7 +551,7 @@ The final Arrow table has clean, prefixed columns from all libraries:
 - Boolean columns use `uint8` (0 or 1)
 - `uint64_value` is a lazy system column (only allocated when used)
 
-## ClickHouse Query Examples
+## ClickHouse Query Examples <a id="smoo/lmao!n/lambda-routing-example-clickhouse"></a>
 
 ```sql
 -- Analyze Lambda operations by type
@@ -618,7 +618,7 @@ GROUP BY timestamp, package_name, message
 ORDER BY invocations DESC;
 ```
 
-## Client Invocation Examples
+## Client Invocation Examples <a id="smoo/lmao!n/lambda-routing-example-client-invocation"></a>
 
 ```typescript
 // Simple GET
@@ -639,7 +639,7 @@ await invoke({ op: 'validateToken', token: 'eyJhbGciOiJIUzI1NiIs...' });
 await invoke({ op: 'refreshToken', token: 'refresh-token-xxx' });
 ```
 
-## Summary
+## Summary <a id="smoo/lmao!n/lambda-routing-example-summary"></a>
 
 The `op()` + `span()` pattern enables:
 
@@ -653,7 +653,7 @@ The `op()` + `span()` pattern enables:
 This pattern scales from simple single-library usage to complex multi-library compositions like Lambda routers, GraphQL
 resolvers, or microservice gateways.
 
-## Integration with Other Specs
+## Integration with Other Specs <a id="smoo/lmao!n/lambda-routing-example-integration"></a>
 
 - **[Op Context Pattern](./01l_op_context_pattern.md)**: Defines `defineOpContext()`, `defineOp()`, and Tracer API
   contract

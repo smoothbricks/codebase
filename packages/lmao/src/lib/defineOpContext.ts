@@ -250,8 +250,14 @@ function buildOpContextFactory<
   };
 }
 
+//#region smoo/lmao!n/opcontext-definition
 /**
  * Define an Op context factory
+ *
+ * 01j "Module Definition", renamed: this is the shipped entry point (defineOpContext,
+ * not defineModule().ctx().make()). Returns { defineOp, defineOps }; user context is the
+ * `ctx` config field (runtime defaults, reserved-key-guarded — see the nested
+ * n/schema-env-config region), deps carry their own prefix, and per-Op attribution is OpMetadata.
  *
  * Creates a factory for defining Ops that share the same schema, deps, and context.
  * This is the main entry point for the Op-centric API.
@@ -334,7 +340,14 @@ export function defineOpContext<
   Deps extends DepsConfig = Record<string, never>,
   UserCtx extends Record<string, unknown> = Record<string, never>,
 >(config: OpContextConfig<T, FF, Deps, UserCtx>) {
-  // Runtime validation: check for reserved property names in user context
+  //#region smoo/lmao!n/schema-env-config
+  // Runtime validation: check for reserved property names in user context.
+  // The `ctx` config object is the env/deployment-config surface from
+  // 01a "Environment Variable Configuration" — a plain user object (env, services,
+  // requestId, ...) spread into SpanContext, guarded only against reserved/internal keys.
+  //#region smoo/lmao!n/schema-env-config.reserved
+  // 01l "Reserved Names": ctx keys cannot collide with built-in SpanContext members
+  // (buffer/tag/log/scope/setScope/ok/err/span/ff/deps) or start with `_` (internal).
   if (config.ctx) {
     const userKeys = Object.keys(config.ctx);
     for (const key of userKeys) {
@@ -350,6 +363,8 @@ export function defineOpContext<
       }
     }
   }
+  //#endregion smoo/lmao!n/schema-env-config.reserved
+  //#endregion smoo/lmao!n/schema-env-config
 
   // Compute effective schema by combining app schema with dep contributions.
   // This merges app fields + all dep contributed fields (after prefix/mapping).
@@ -387,6 +402,7 @@ export function defineOpContext<
 
   return buildOpContextFactory(effectiveFields, config.flags, config.deps, config.ctx);
 }
+//#endregion smoo/lmao!n/opcontext-definition
 
 // Re-export everything from opContext for convenience
 export * from './opContext/index.js';

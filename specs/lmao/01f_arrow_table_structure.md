@@ -1,6 +1,6 @@
-# Arrow Table Structure
+# Arrow Table Structure <a id="smoo/lmao!n/arrow-table"></a>
 
-## Overview
+## Overview <a id="smoo/lmao!n/arrow-table.overview"></a>
 
 The Arrow Table Structure defines the final queryable format produced by the trace logging system. It provides:
 
@@ -11,12 +11,12 @@ The Arrow Table Structure defines the final queryable format produced by the tra
 5. **Zero-copy conversion patterns** for efficient cold-path processing
 6. **Arrow conversion interface** defining how lmao and arrow-builder coordinate during conversion
 
-## Zero-Copy Mandate
+## Zero-Copy Mandate <a id="smoo/lmao!n/arrow-table-zero-copy"></a>
 
 **CRITICAL**: All Arrow conversions MUST use `arrow.makeData()` with direct TypedArray references. The builder pattern
 (`arrow.makeBuilder()`) is **PROHIBITED** because it copies every value during append operations.
 
-### Reference Pattern
+### Reference Pattern <a id="smoo/lmao!n/arrow-table-zero-copy.reference"></a>
 
 The correct zero-copy approach uses flechette's `DirectBatch` constructor with `subarray()` views over TypedArrays (see
 `@uwdata/flechette` `batch.js`):
@@ -46,7 +46,7 @@ for (let i = 0; i < length; i++) {
 - **GC Pressure**: Generates temporary objects that need collection
 - **Hot Path Optimization**: SpanBuffer already stores data in correct TypedArray format
 
-### Conversion Strategies by Column Type
+### Conversion Strategies by Column Type <a id="smoo/lmao!n/arrow-table-zero-copy.strategies"></a>
 
 Different column types require different zero-copy strategies:
 
@@ -128,7 +128,7 @@ if (useDictionary) {
 }
 ```
 
-### Buffer Concatenation for Chained Buffers
+### Buffer Concatenation for Chained Buffers <a id="smoo/lmao!n/arrow-table-zero-copy.concat"></a>
 
 When SpanBuffer chains need concatenation (buffer.\_next), use this helper:
 
@@ -167,7 +167,7 @@ return arrow.makeData({
 **Note**: While concatenation requires one copy, it's still more efficient than the builder pattern which copies during
 every append() call.
 
-### Null Bitmap Construction
+### Null Bitmap Construction <a id="smoo/lmao!n/arrow-table-zero-copy.null-bitmap"></a>
 
 Null bitmaps must be constructed from SpanBuffer null tracking:
 
@@ -197,7 +197,7 @@ function buildNullBitmap(buffer: SpanBuffer, columnName: string): { nullBitmap: 
 }
 ```
 
-## Design Philosophy
+## Design Philosophy <a id="smoo/lmao!n/arrow-table.philosophy"></a>
 
 **Key Insight**: The Arrow table structure must balance query performance with data completeness. Every entry in the
 system becomes a row in the final table, enabling rich analytical queries while maintaining efficient storage.
@@ -210,9 +210,9 @@ system becomes a row in the final table, enabling rich analytical queries while 
 - **Type optimization**: Appropriate data types for storage and performance
 - **Zero-copy conversion**: Direct TypedArray references without intermediate copies
 
-## Column Schema
+## Column Schema <a id="smoo/lmao!n/arrow-table-schema"></a>
 
-### Core System Columns (Always Present)
+### Core System Columns (Always Present) <a id="smoo/lmao!n/arrow-table-schema.core"></a>
 
 | Column Name        | Type                 | Description                                                                                                   | Example Values                                                                                                   |
 | ------------------ | -------------------- | ------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
@@ -227,7 +227,7 @@ system becomes a row in the final table, enabling rich analytical queries while 
 | `package_file`     | `dictionary<string>` | Path within package, relative to package.json (see [Module Identification](#module-identification) section)   | `'src/services/user.ts'`, `'lib/handlers/auth.ts'`                                                               |
 | `message`          | `dictionary<string>` | Span name, log message template, exception message, result message, OR flag name (see Message Column section) | `'create-user'`, `'User {{userId}} created'`, `'Processing {{count}} items'`, `'TypeError: x is not a function'` |
 
-### Lazy System Columns (Sparse/Nullable)
+### Lazy System Columns (Sparse/Nullable) <a id="smoo/lmao!n/arrow-table-schema.lazy"></a>
 
 These system columns are allocated lazily (only when first written to) because they are used by specific entry types
 rather than every row.
@@ -253,12 +253,12 @@ rather than every row.
 - `thread_id` + `span_id`: Extracted from `SpanIdentity` 25-byte ArrayBuffer during Arrow conversion.
 - `parent_thread_id` + `parent_span_id`: Also from `SpanIdentity`, null for root spans (hasParent flag = 0).
 
-## Module Identification
+## Module Identification <a id="smoo/lmao!n/arrow-table-module-id"></a>
 
 The `package_name` and `package_file` columns work together to identify the source location of each trace entry. This
 two-column design provides significant benefits over a single combined path:
 
-### Why `packageName` + `packagePath` (Not a Combined Path)
+### Why `packageName` + `packagePath` (Not a Combined Path) <a id="smoo/lmao!n/arrow-table-module-id.two-column"></a>
 
 1. **Cross-repo log aggregation**: When logs from multiple repositories or services are combined (e.g., in a data
    warehouse), the package name provides a globally unique namespace. npm enforces package name uniqueness, so
@@ -287,7 +287,7 @@ two-column design provides significant benefits over a single combined path:
 5. **TypeScript transformer compatibility**: The TypeScript transformer computes both pieces via `findNearestPackage()`,
    which returns both `packageName` and `packageDir`. Storing them separately avoids redundant string concatenation.
 
-### Relation to Operations (Ops)
+### Relation to Operations (Ops) <a id="smoo/lmao!n/arrow-table-module-id.ops"></a>
 
 Module metadata comes from the op's bound module at runtime:
 
@@ -304,7 +304,7 @@ const GET = op(async ({ span, log, tag }, url: string) => {
 - **`package_file`**: From where the module was defined (TypeScript transformer)
 - **Span names**: Come from `span('name', op, ...args)` call sites, stored in `message` column
 
-### Why NOT Git-Based Identity
+### Why NOT Git-Based Identity <a id="smoo/lmao!n/arrow-table-module-id.not-git"></a>
 
 We considered using git repository info (git root path, git SHA for identity) but rejected it:
 
@@ -314,7 +314,7 @@ We considered using git repository info (git root path, git SHA for identity) bu
 - **Git SHA is for version tracking**: Answers "which version of the code?" not "which module?"
   - We keep `gitSha` as a separate field for version tracking, not as part of module identity
 
-### ModuleMetadata Interface
+### ModuleMetadata Interface <a id="smoo/lmao!n/arrow-table-module-id.metadata"></a>
 
 The `moduleMetadata` object passed to `createModuleContext()` contains:
 
@@ -336,7 +336,7 @@ moduleMetadata: {
 }
 ```
 
-### ModuleContext Properties
+### ModuleContext Properties <a id="smoo/lmao!n/arrow-table-module-id.context-props"></a>
 
 The `ModuleContext` (created at module initialization) stores:
 
@@ -346,7 +346,7 @@ The `ModuleContext` (created at module initialization) stores:
 
 Both `packageName` and `packagePath` values are interned at module creation time for efficient dictionary encoding.
 
-## Span Definition
+## Span Definition <a id="smoo/lmao!n/arrow-table-span-id"></a>
 
 > **A span represents a unit of work within a single thread of execution.**
 
@@ -357,7 +357,7 @@ simply a "unit of work" with random 64-bit IDs, LMAO explicitly ties spans to th
 - **Thread timeline visibility**: See how async concurrency interleaves requests
 - **Cross-thread tracing**: Parent spans can be on different threads
 
-### Comparison to OpenTelemetry
+### Comparison to OpenTelemetry <a id="smoo/lmao!n/arrow-table-span-id.otel"></a>
 
 | Aspect              | OpenTelemetry                | LMAO                                               |
 | ------------------- | ---------------------------- | -------------------------------------------------- |
@@ -368,9 +368,9 @@ simply a "unit of work" with random 64-bit IDs, LMAO explicitly ties spans to th
 | **Thread Concept**  | None (spans are independent) | Explicit (spans belong to threads)                 |
 | **Timeline View**   | Requires timestamp sorting   | `span_id` gives within-thread ordering             |
 
-## Distributed Span ID Design
+## Distributed Span ID Design <a id="smoo/lmao!n/arrow-table-span-id.distributed"></a>
 
-### Problem: Span ID Collisions in Distributed Tracing
+### Problem: Span ID Collisions in Distributed Tracing <a id="smoo/lmao!n/arrow-table-span-id.collisions"></a>
 
 In distributed tracing, the same `trace_id` can exist across multiple machines/workers. If each uses a simple
 incrementing counter (`span_id++`), collisions occur:
@@ -386,7 +386,7 @@ This happens in several scenarios:
 - **Distributed services**: Same trace spanning multiple machines
 - **Serverless**: Multiple Lambda invocations for the same request
 
-### Chosen Approach: SpanIdentity + TraceId
+### Chosen Approach: SpanIdentity + TraceId <a id="smoo/lmao!n/arrow-table-span-id.chosen"></a>
 
 LMAO uses a combination of `SpanIdentity` (25-byte ArrayBuffer) and `TraceId` (branded string) for span identification.
 In the Arrow output, these are expanded to separate columns for query flexibility:
@@ -399,7 +399,7 @@ In the Arrow output, these are expanded to separate columns for query flexibilit
 | `parent_thread_id` | `uint64` (nullable)  | Parent span's thread                                  |
 | `parent_span_id`   | `uint32` (nullable)  | Parent span's ID                                      |
 
-### SpanIdentity Memory Layout
+### SpanIdentity Memory Layout <a id="smoo/lmao!n/arrow-table-span-id.layout"></a>
 
 In memory, span identification is packed into a 25-byte `SpanIdentity` ArrayBuffer:
 
@@ -414,7 +414,7 @@ SpanIdentity (25 bytes):
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-### TraceId: Branded String
+### TraceId: Branded String <a id="smoo/lmao!n/arrow-table-span-id.traceid"></a>
 
 `TraceId` is a branded string type that is:
 
@@ -429,7 +429,7 @@ type TraceId = string & { readonly __brand: 'TraceId' };
 rootSpan.trace_id === childSpan.trace_id; // true (same string reference)
 ```
 
-### Global Uniqueness
+### Global Uniqueness <a id="smoo/lmao!n/arrow-table-span-id.uniqueness"></a>
 
 **Within a trace**: `(thread_id, span_id)` is unique **Globally**: `(trace_id, thread_id, span_id)` is globally unique
 
@@ -437,7 +437,7 @@ rootSpan.trace_id === childSpan.trace_id; // true (same string reference)
 - `thread_id` provides cross-process uniqueness (crypto-secure 64-bit random)
 - `span_id` provides within-thread ordering (32-bit counter)
 
-### Parent Reference
+### Parent Reference <a id="smoo/lmao!n/arrow-table-span-id.parent"></a>
 
 To find a parent span, you need:
 
@@ -452,7 +452,7 @@ spanA.isParentOf(spanB); // true if spanA is spanB's parent
 spanB.isChildOf(spanA); // true if spanB is spanA's child
 ```
 
-### Why This Design
+### Why This Design <a id="smoo/lmao!n/arrow-table-span-id.why"></a>
 
 **Performance (Hot Path)**:
 
@@ -485,7 +485,7 @@ spanB.isChildOf(spanA); // true if spanB is spanA's child
 - `span_id` (32-bit): Fits in `number`, used per span (no BigInt in hot path)
 - `trace_id`: Plain string reference (branded for type safety)
 
-### Thread-Local Counter Design (CRITICAL)
+### Thread-Local Counter Design (CRITICAL) <a id="smoo/lmao!n/arrow-table-span-id.thread-local"></a>
 
 **The `span_id` is a THREAD-LOCAL counter**, not a per-trace counter:
 
@@ -523,7 +523,7 @@ Worker B (thread_id: 0xCCC): span_id 1, 2...              (all traces combined)
 - **Still globally unique**: `(thread_id, span_id)` never collides
 - **Thread timeline visibility**: See exactly how async concurrency interleaves different traces on a thread
 
-### Collision Math
+### Collision Math <a id="smoo/lmao!n/arrow-table-span-id.collision-math"></a>
 
 For the 64-bit thread ID (birthday paradox):
 
@@ -531,7 +531,7 @@ For the 64-bit thread ID (birthday paradox):
 - 2^20 (~1 million) threads → 0.00003% collision probability
 - In practice, collision is negligible for any realistic deployment
 
-### Query Examples
+### Query Examples <a id="smoo/lmao!n/arrow-table-span-id.queries"></a>
 
 ```sql
 -- Find all ancestors (recursive)
@@ -584,7 +584,7 @@ ORDER BY span_id;
 -- trace_id: req-2, span_id: 5    (req-2 continues)
 ```
 
-### SpanIdentity to Arrow Conversion
+### SpanIdentity to Arrow Conversion <a id="smoo/lmao!n/arrow-table-span-id.to-arrow"></a>
 
 During Arrow conversion, the `SpanIdentity` 25-byte ArrayBuffer is expanded to separate columns:
 
@@ -626,7 +626,7 @@ function convertSpanIdentityToArrowColumns(spanIdentity: SpanIdentity, rowCount:
 }
 ```
 
-### Library-Specific Attribute Columns (Sparse/Nullable)
+### Library-Specific Attribute Columns (Sparse/Nullable) <a id="smoo/lmao!n/arrow-table-schema.library-attrs"></a>
 
 | Column Name       | Type                 | Description                               | Example Values                                   |
 | ----------------- | -------------------- | ----------------------------------------- | ------------------------------------------------ |
@@ -646,7 +646,7 @@ function convertSpanIdentityToArrowColumns(spanIdentity: SpanIdentity, rowCount:
 `ff_value` column uses `S.category()` (dictionary encoding) because flag values repeat frequently (e.g., `true`/`false`,
 `'blue'`/`'green'`/`'red'`, etc.).
 
-## Complete Trace Example: User Registration Flow
+## Complete Trace Example: User Registration Flow <a id="smoo/lmao!n/arrow-table.example"></a>
 
 This example shows a complete user registration request with multiple spans, HTTP calls, database operations, and
 console.log compatibility traces.
@@ -687,9 +687,9 @@ thread_id: 0x1a2b3c4d5e6f7890, span_id: 2, parent_thread_id: 0x1a2b3c4d5e6f7890,
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.251Z` | `info`       | `@mycompany/user-service` | `src/controllers/user.ts`      | `Registration completed for {{userId}}`         | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.252Z` | `span-ok`    | `@mycompany/user-service` | `src/controllers/user.ts`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 
-## The `message` System Column
+## The `message` System Column <a id="smoo/lmao!n/arrow-table-message"></a>
 
-### Unified Purpose
+### Unified Purpose <a id="smoo/lmao!n/arrow-table-message.unified"></a>
 
 The `message` column serves different purposes based on entry type:
 
@@ -708,7 +708,7 @@ The `message` column serves different purposes based on entry type:
 | `op-*` (all 8 op metric types)      | Op name (e.g., `'GET'`, `'createUser'`)                      | Metric value (count or ns)  |
 | `buffer-*` (all 4 buffer types)     | -                                                            | Metric value (count)        |
 
-### Format String Pattern (CRITICAL)
+### Format String Pattern (CRITICAL) <a id="smoo/lmao!n/arrow-table-message.format-string"></a>
 
 **Log messages use FORMAT STRINGS, not interpolated strings.**
 
@@ -732,7 +732,7 @@ The system stores:
 **The message is NOT interpolated.** The template string `'User {{userId}} created...'` is stored verbatim in the
 `message` column, while the actual values (`123`, `5`) are stored in their respective typed attribute columns.
 
-### Why This Design?
+### Why This Design? <a id="smoo/lmao!n/arrow-table-message.why"></a>
 
 **1. Efficient Storage via String Interning (S.category)**
 
@@ -778,7 +778,7 @@ Instead of separate `span_name`, `message`, and `ffName` columns (most always nu
 - Better column utilization (less sparsity)
 - Consistent pattern across all entry types
 
-### Example Data
+### Example Data <a id="smoo/lmao!n/arrow-table-message.example"></a>
 
 | entry_type   | message                                              | userId | itemCount |
 | ------------ | ---------------------------------------------------- | ------ | --------- |
@@ -787,7 +787,7 @@ Instead of separate `span_name`, `message`, and `ffName` columns (most always nu
 | `debug`      | `'Processing batch for {{userId}}'`                  | `123`  | `null`    |
 | `span-ok`    | `'create-user'`                                      | `123`  | `null`    |
 
-### Contrast with Traditional Logging
+### Contrast with Traditional Logging <a id="smoo/lmao!n/arrow-table-message.contrast"></a>
 
 **Traditional (interpolated strings):**
 
@@ -804,16 +804,16 @@ log.info('User {{userId}} created with {{itemCount}} items').userId(123).itemCou
 // Stores: template in message, values in typed columns - structured, queryable
 ```
 
-## Key Patterns in the Data
+## Key Patterns in the Data <a id="smoo/lmao!n/arrow-table.patterns"></a>
 
-### 1. Span Hierarchy & Lifecycle
+### 1. Span Hierarchy & Lifecycle <a id="smoo/lmao!n/arrow-table.patterns-hierarchy"></a>
 
 - **Root span** (span_id=1): `register-user` with no parent
 - **Child spans** (span_id=2,3,4,5): All have parent_span_id=1
 - **Span lifecycle**: `span-start` → entries → `span-ok`/`span-err`/`span-exception`
 - **Success/failure tracking**: `span-ok` vs `span-err` vs `span-exception` captures span outcome without extra columns
 
-### 2. Structured Logging via Entry Type Enum
+### 2. Structured Logging via Entry Type Enum <a id="smoo/lmao!n/arrow-table.patterns-structured"></a>
 
 - **Log levels with structure**: `log.info('Template {{var}}').var(value)` → `entry_type='info'` with typed attributes
 - **Template storage**: Log message TEMPLATES stored in unified `message` column (NOT interpolated strings)
@@ -821,7 +821,7 @@ log.info('User {{userId}} created with {{itemCount}} items').userId(123).itemCou
 - **Optional attributes**: Structured data can accompany log messages
 - **Gradual migration**: Familiar log levels but with structured data instead of string concatenation
 
-### 3. Entry Type System
+### 3. Entry Type System <a id="smoo/lmao!n/arrow-table.patterns-entry-types"></a>
 
 The `entry_type` column uses a dictionary-encoded enum that covers all possible trace events. For complete definitions
 and low-level API details, see **[Entry Types and Logging Primitives](./01h_entry_types_and_logging_primitives.md)**.
@@ -842,7 +842,7 @@ and low-level API details, see **[Entry Types and Logging Primitives](./01h_entr
 - **Self-documenting**: `op-invocations` is clearer than generic `metric` + `name` columns
 - **Unified system**: All trace events (including metrics) use the same table and flush path
 
-### 4. Metrics as Structured Logs
+### 4. Metrics as Structured Logs <a id="smoo/lmao!n/arrow-table.patterns-metrics"></a>
 
 Metrics are emitted during flush cycles as structured log rows. This design avoids a separate metrics infrastructure -
 same Arrow table, same query tools, same export path.
@@ -887,13 +887,13 @@ GROUP BY message
 ORDER BY invocations DESC;
 ```
 
-### 5. Library Integration
+### 5. Library Integration <a id="smoo/lmao!n/arrow-table.patterns-library"></a>
 
 - **HTTP entries**: Multiple rows for single request (start tag, end tag with duration)
 - **Database entries**: Query logged, then duration and row count added
 - **Attribute isolation**: Each library's attributes are cleanly separated in dedicated columns
 
-### 6. Feature Flag Integration via Entry Type Enum
+### 6. Feature Flag Integration via Entry Type Enum <a id="smoo/lmao!n/arrow-table.patterns-feature-flags"></a>
 
 - **Flag evaluation**: `ff-access` entry types capture when flags are checked
 - **Usage tracking**: `ff-usage` entry types capture when flag-gated features are used
@@ -901,16 +901,16 @@ ORDER BY invocations DESC;
 - **Type safety**: Feature flag context uses same typed attribute system as other entry types
 - **Query efficiency**: No JSON parsing needed - direct column access for flag context
 
-### 7. Sparse Data Efficiency
+### 7. Sparse Data Efficiency <a id="smoo/lmao!n/arrow-table.patterns-sparse"></a>
 
 - **Core columns always present**: 9 system columns in every row (8 eager + 1 lazy `uint64_value` when used)
 - **Attribute columns sparse**: Library-specific columns mostly null
 - **Efficient storage**: Arrow's null bitmap handles sparsity with minimal overhead
 - **Targeted information**: Each row contains only relevant attributes
 
-## ClickHouse Query Examples
+## ClickHouse Query Examples <a id="smoo/lmao!n/arrow-table.queries"></a>
 
-### Request Performance Analysis
+### Request Performance Analysis <a id="smoo/lmao!n/arrow-table.queries-request-perf"></a>
 
 ```sql
 -- Average request duration by endpoint
@@ -928,7 +928,7 @@ ORDER BY total_duration_ms DESC
 LIMIT 10;
 ```
 
-### Database Performance Monitoring
+### Database Performance Monitoring <a id="smoo/lmao!n/arrow-table.queries-db-perf"></a>
 
 ```sql
 -- Slow database queries
@@ -945,7 +945,7 @@ GROUP BY db_table, db_query
 ORDER BY avg_duration DESC;
 ```
 
-### HTTP Error Analysis
+### HTTP Error Analysis <a id="smoo/lmao!n/arrow-table.queries-http-error"></a>
 
 ```sql
 -- HTTP error rates by service
@@ -963,7 +963,7 @@ HAVING total_requests > 100  -- Only services with significant traffic
 ORDER BY error_rate_percent DESC;
 ```
 
-### User Journey Analysis
+### User Journey Analysis <a id="smoo/lmao!n/arrow-table.queries-user-journey"></a>
 
 ```sql
 -- Trace user journey through registration flow
@@ -986,7 +986,7 @@ WHERE trace_id = 'req-abc123'
 ORDER BY timestamp;
 ```
 
-### Structured Logging Analysis
+### Structured Logging Analysis <a id="smoo/lmao!n/arrow-table.queries-structured-logging"></a>
 
 ```sql
 -- Analyze structured logging usage patterns
@@ -1016,7 +1016,7 @@ ORDER BY occurrences DESC
 LIMIT 20;
 ```
 
-### Feature Flag Analysis
+### Feature Flag Analysis <a id="smoo/lmao!n/arrow-table.queries-feature-flag"></a>
 
 ```sql
 -- Feature flag usage and performance impact
@@ -1061,7 +1061,7 @@ JOIN trace_performance tp ON ft.trace_id = tp.trace_id
 GROUP BY ft.ff_value, up.user_plan;
 ```
 
-### Op and Buffer Metrics Analysis
+### Op and Buffer Metrics Analysis <a id="smoo/lmao!n/arrow-table.queries-op-buffer-metrics"></a>
 
 ```sql
 -- Op performance dashboard by package
@@ -1129,9 +1129,9 @@ GROUP BY package_name
 ORDER BY overflow_pct DESC;
 ```
 
-## Performance Characteristics
+## Performance Characteristics <a id="smoo/lmao!n/arrow-table.perf"></a>
 
-### Timestamp Precision (High-Resolution Anchored Design)
+### Timestamp Precision (High-Resolution Anchored Design) <a id="smoo/lmao!n/arrow-table.perf-timestamp"></a>
 
 The timestamp system uses a high-precision anchored design that captures a single time reference at trace root creation,
 then uses high-resolution timers for all subsequent timestamps. See
@@ -1187,7 +1187,7 @@ allocations, no `Date.now()` calls per entry.
 - DST/NTP safe - anchor per trace, traces are short-lived
 - Safe numeric conversion until year 2255
 
-### Storage Efficiency
+### Storage Efficiency <a id="smoo/lmao!n/arrow-table.perf-storage"></a>
 
 - **Dictionary encoding**: Module names, span names, HTTP methods stored once
 - **Null bitmap compression**: Sparse columns compressed efficiently
@@ -1195,7 +1195,7 @@ allocations, no `Date.now()` calls per entry.
 - **Parquet compression**: Additional compression when written to storage
 - **Timestamp precision**: Platform-optimized precision minimizes storage while maximizing accuracy
 
-### Query Performance
+### Query Performance <a id="smoo/lmao!n/arrow-table.perf-query"></a>
 
 - **Columnar scanning**: Only relevant columns read for queries
 - **Predicate pushdown**: Filters applied at storage level
@@ -1203,14 +1203,14 @@ allocations, no `Date.now()` calls per entry.
 - **Index support**: Dictionary columns enable efficient filtering
 - **Timestamp indexing**: Nanosecond/microsecond precision enables precise time-based queries
 
-### Data Characteristics
+### Data Characteristics <a id="smoo/lmao!n/arrow-table.perf-data"></a>
 
 - **High sparsity**: Most columns null for most rows (efficient with Arrow nulls)
 - **Temporal ordering**: Timestamp allows efficient time-range queries
 - **Hierarchical structure**: Span relationships enable trace reconstruction
 - **Multi-dimensional**: Can slice by module, user, time, or entry type
 
-## Arrow Conversion Interface
+## Arrow Conversion Interface <a id="smoo/lmao!n/arrow-table.interface"></a>
 
 The conversion from LMAO's trace buffers to Arrow tables uses a **two-pass tree conversion** approach for optimal memory
 efficiency and shared dictionaries.
@@ -1218,7 +1218,7 @@ efficiency and shared dictionaries.
 **For complete details on the two-pass approach, dictionary building, and UTF-8 caching, see:**
 **[Tree Walker and Arrow Conversion](./01k_tree_walker_and_arrow_conversion.md)**
 
-### Key Concepts
+### Key Concepts <a id="smoo/lmao!n/arrow-table.interface-key-concepts"></a>
 
 - **Two-pass conversion**: Pass 1 builds dictionaries, Pass 2 creates RecordBatches
 - **No intermediate buffer collection**: Walk tree twice instead of collecting into an array
@@ -1227,7 +1227,7 @@ efficiency and shared dictionaries.
 - **Depth-first pre-order traversal**: Parents before children (optimal for queries and compression)
 - **Buffer overflow handling**: Multiple buffers with same span_id yielded contiguously
 
-## Current Implementation Status
+## Current Implementation Status <a id="smoo/lmao!n/arrow-table-impl"></a>
 
 **✅ ZERO-COPY IMPLEMENTATION COMPLETE**: The implementation in `packages/lmao/src/lib/convertToArrow.ts` uses
 `arrow.makeData()` exclusively.
@@ -1244,7 +1244,7 @@ efficiency and shared dictionaries.
 
 **Key Implementation Patterns**:
 
-### Primitive Columns (Float64, Uint8, etc.)
+### Primitive Columns (Float64, Uint8, etc.) <a id="smoo/lmao!n/arrow-table-impl.primitive"></a>
 
 ```typescript
 // Collect value arrays from each buffer
@@ -1257,7 +1257,7 @@ const data = arrow.makeData({ type, length, nullCount, data: allValues, nullBitm
 vectors.push(arrow.makeVector(data));
 ```
 
-### Dictionary Columns (enum, category, text)
+### Dictionary Columns (enum, category, text) <a id="smoo/lmao!n/arrow-table-impl.dictionary"></a>
 
 ```typescript
 // Collect index arrays
@@ -1285,7 +1285,7 @@ vectors.push(arrow.makeVector(data));
 - **Direct memory references**: TypedArrays passed directly to Arrow without copying
 - **Dictionary efficiency**: Indices already in correct format, just wrap with dictionary
 
-## Integration Points
+## Integration Points <a id="smoo/lmao!n/arrow-table.integration"></a>
 
 This Arrow table structure integrates with:
 
