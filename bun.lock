@@ -33,7 +33,7 @@
         "verdaccio": "6.8.0",
       },
     },
-    "docs": {
+    "lmao-docs": {
       "name": "@smoothbricks/lmao-docs",
       "version": "0.0.0",
       "dependencies": {
@@ -1350,7 +1350,7 @@
 
     "@smoothbricks/lmao": ["@smoothbricks/lmao@workspace:packages/lmao"],
 
-    "@smoothbricks/lmao-docs": ["@smoothbricks/lmao-docs@workspace:docs"],
+    "@smoothbricks/lmao-docs": ["@smoothbricks/lmao-docs@workspace:lmao-docs"],
 
     "@smoothbricks/lmao-expo-benchmark": ["@smoothbricks/lmao-expo-benchmark@workspace:packages/lmao-expo-benchmark"],
 
