@@ -1,0 +1,23 @@
+---
+title: Concepts
+description: Understanding-oriented explanations of how LMAO works.
+sidebar:
+  order: 0
+---
+
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+Background and rationale. These pages explain *why* LMAO works the way it does — read them when you want the mental
+model behind the API.
+
+<CardGrid>
+  <LinkCard title="Architecture overview" href="/concepts/architecture/" description="The layers, from your op down to an Arrow table." />
+  <LinkCard title="Why columnar tracing" href="/concepts/columnar-tracing/" description="Hot path vs cold path, and the performance idea." />
+  <LinkCard title="The span model" href="/concepts/span-model/" description="Op vs span and how a span is laid out." />
+  <LinkCard title="tag, scope, and log" href="/concepts/the-three-writers/" description="Three ways to record, and how they differ." />
+  <LinkCard title="Span identity" href="/concepts/span-identity/" description="How spans are identified within a trace." />
+  <LinkCard title="Schema & string encoding" href="/concepts/schema-and-encoding/" description="Why there are three string types." />
+  <LinkCard title="Library composition" href="/concepts/library-composition/" description="How library spans merge into an app trace." />
+  <LinkCard title="The tracer lifecycle" href="/concepts/tracer-lifecycle/" description="How a trace flows through the tracer hooks." />
+  <LinkCard title="LMAO vs OpenTelemetry" href="/concepts/lmao-vs-opentelemetry/" description="How the design choices differ." />
+</CardGrid>

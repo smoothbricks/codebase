@@ -1,0 +1,45 @@
+---
+title: Convert a trace to Arrow
+description: Turn a completed span tree into an Apache Arrow table.
+sidebar:
+  order: 7
+---
+
+`convertSpanTreeToArrowTable` turns a root span buffer (and its children) into a single Apache Arrow table with shared
+dictionaries. You get the buffer from a tracer that retains completed traces, such as `TestTracer` or
+`ArrayQueueTracer`, via `tracer.rootBuffers`.
+
+```ts
+import {
+  JsBufferStrategy,
+  TestTracer,
+  convertSpanTreeToArrowTable,
+} from '@smoothbricks/lmao';
+import { createTraceRoot } from '@smoothbricks/lmao/node';
+
+const tracer = new TestTracer(opContext, {
+  bufferStrategy: new JsBufferStrategy(),
+  createTraceRoot,
+});
+
+await tracer.trace('greet', greet);
+
+const table = convertSpanTreeToArrowTable(tracer.rootBuffers[0]);
+
+console.log(table.numRows); // total rows across all spans in the trace
+console.log(table.names); // column names (your schema fields + system columns)
+const userIds = table.getChild('userId'); // a single column
+```
+
+For a single buffer without its child tree, use `convertToArrowTable(buffer)`.
+
+:::tip
+Inside an op you can also reach the current span's root buffer directly through the public `ctx.buffer` handle, then
+convert it once the trace completes — handy when you aren't using a retaining tracer. See
+[`examples/arrow-export.ts`](https://github.com/smoothbricks/codebase/tree/main/packages/lmao/examples/arrow-export.ts).
+:::
+
+:::note
+Conversion runs on the cold path — it does not affect the cost of recording spans. For why this split exists, see
+[Why columnar tracing](/concepts/columnar-tracing/).
+:::

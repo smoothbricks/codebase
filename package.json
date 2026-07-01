@@ -59,7 +59,8 @@
   },
   "workspaces": [
     "packages/*",
-    "tooling"
+    "tooling",
+    "lmao-docs"
   ],
   "nx": {
     "includedScripts": [],

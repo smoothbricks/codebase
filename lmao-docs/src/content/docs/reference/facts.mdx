@@ -1,0 +1,64 @@
+---
+title: Facts
+description: The typed fact vocabulary for asserting on span trees in tests.
+sidebar:
+  order: 10
+---
+
+A **fact** is a typed string describing something that happened in a span — a span starting, a log, a tag, a scoped
+value, a flag, or a metric. The query API returns facts so tests can assert on *what happened* rather than on raw
+buffer rows. Import these from `@smoothbricks/lmao/testing`.
+
+## Fact shapes
+
+| Namespace | Type | String form |
+|---|---|---|
+| span | `SpanFact` | `span:<name>: started` · `ok` · `err(<code>)` · `exception(<msg>)` |
+| log | `LogFact` | `log:<level>: <message>` |
+| tag | `TagFact` | `tag:<key>: <value>` |
+| scope | `ScopeFact` | `scope:<key>: <value>` |
+| ff | `FFFact` | `ff:<flag>: <value>` |
+| metric | `MetricFact` | `metric:<name>: <value>` |
+
+`TraceFact` is the union of all of them; `FactNamespace` is the union of the namespace labels.
+
+## Builders
+
+Construct facts (handy for assertions):
+
+```ts
+import { spanStarted, logFact, tagFact, scopeFact, ffFact, metricFact } from '@smoothbricks/lmao/testing';
+
+spanStarted('validate'); // "span:validate: started"
+logFact('info', 'processing'); // "log:info: processing"
+tagFact('userId', 'ada'); // "tag:userId: ada"
+```
+
+## Guards
+
+Narrow a `TraceFact` to a specific namespace:
+
+```ts
+import { isSpanFact, isLogFact, isTagFact, isScopeFact, isFFFact, isMetricFact } from '@smoothbricks/lmao/testing';
+
+if (isSpanFact(fact)) {
+  /* fact is a SpanFact */
+}
+```
+
+## Using facts in assertions
+
+`querySpan(buffer).facts()` (and the standalone `extractFacts`) return an array of facts for a span tree:
+
+```ts
+import { querySpan } from '@smoothbricks/lmao/testing';
+
+const facts = querySpan(ctx.buffer).facts();
+expect(facts).toContain(spanStarted('validate'));
+expect(facts.some(isFFFact)).toBe(true);
+```
+
+:::note
+For the harness setup and the rest of the query API, see [Trace-testing](/reference/trace-testing/) and the
+[Test by tracing](/tutorials/test-by-tracing/) tutorial.
+:::

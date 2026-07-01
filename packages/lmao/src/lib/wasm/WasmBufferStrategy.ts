@@ -118,8 +118,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
       opMetadata, // _callsiteMetadata (same as opMetadata for root)
     );
 
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- generated WASM buffers implement the SpanBuffer contract for the same schema.
-    return wasmBuffer as unknown as SpanBuffer<T>;
+    return this.toTypedBuffer(wasmBuffer);
   }
 
   createChildSpanBuffer(
@@ -150,8 +149,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
       callsiteMetadata, // _callsiteMetadata
     );
 
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- child buffers preserve the requested schema contract.
-    return child as unknown as SpanBuffer<T>;
+    return this.toTypedBuffer(child);
   }
 
   createOverflowBuffer(buffer: SpanBuffer<T>): SpanBuffer<T> {
@@ -164,8 +162,23 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
       buffer._callsiteMetadata ?? buffer._opMetadata, // _callsiteMetadata (same as original, fallback to opMetadata)
     );
 
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- overflow buffers are schema-compatible continuations of the same span.
-    return overflow as unknown as SpanBuffer<T>;
+    return this.toTypedBuffer(overflow);
+  }
+
+  /**
+   * Bridge a generated WASM buffer to its typed `SpanBuffer<T>` view.
+   *
+   * WHY a single assertion: WASM span buffers are produced by runtime class generation and
+   * structurally implement the `SpanBuffer<T>` contract for their schema, but two facts prevent a
+   * static proof: (1) the codegen output cannot be checked against the mapped `SpanBuffer<T>` type,
+   * and (2) the WASM buffer's span-tree links are schema-erased (`WasmSpanBufferInstance`, mirroring
+   * `AnySpanBuffer`) so the instance type cannot `extends SpanBuffer<T>` without breaking cross-schema
+   * child spans. This method is the single documented boundary for that conversion; the three
+   * create* methods route through it instead of asserting at each call site.
+   */
+  private toTypedBuffer(buffer: WasmSpanBufferInstance): SpanBuffer<T> {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- single documented WASM codegen/tree-link boundary (see JSDoc)
+    return buffer as unknown as SpanBuffer<T>;
   }
 
   toArrowTable(buffer: AnySpanBuffer): Table {

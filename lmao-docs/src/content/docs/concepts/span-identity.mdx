@@ -1,0 +1,46 @@
+---
+title: Span identity
+description: How spans are identified within a trace, and how that differs from random per-span IDs.
+sidebar:
+  order: 5
+---
+
+Every span needs an identity so the tree can be reconstructed: which span is which, and who its parent is. LMAO's
+approach is designed to make that identity cheap to generate.
+
+## The pieces
+
+- **`trace_id`** — identifies the whole trace. It's a W3C-format trace id (32 hex characters), shared by every span in
+  the trace.
+- **`thread_id`** — a random 64-bit value generated once per worker/thread, shared by the spans it produces.
+- **`span_id`** — a counter that increments per thread.
+
+A span is uniquely identified by the combination of `thread_id` and `span_id`. Parent/child links are recorded as
+references to the parent's identity, which is what lets the tree be rebuilt.
+
+## Why a counter instead of random per-span IDs
+
+Generating a fresh random id for every span has a cost on the hot path. LMAO instead pays that cost once per thread
+(the random `thread_id`) and then uses a cheap incrementing counter (`span_id`) for each span. The
+`(thread_id, span_id)` pair stays collision-resistant across threads while keeping per-span work minimal.
+
+This is a deliberate trade: per-span identity is cheaper to produce, at the cost of thinking in terms of a composite
+identity rather than one opaque id. The `trace_id` remains a standard W3C value, so traces can still be correlated
+across systems.
+
+## Continuing a trace across services
+
+Because the `trace_id` is a standard W3C value shared by reference, you can continue an existing trace rather than start
+a fresh one. The root `trace(...)` call accepts overrides that include a `trace_id`:
+
+```ts
+import { createTraceId } from '@smoothbricks/lmao';
+
+await trace('handle', { trace_id: createTraceId(incomingTraceId) }, handleRequest);
+```
+
+Use `createTraceId` to turn an incoming id (e.g. from a request header) into the branded `TraceId` the override
+expects. This is how spans produced on different services line up under one trace.
+
+These identity columns are part of the system columns in the output; see [entry types](/reference/entry-types/) for the
+full list.

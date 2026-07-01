@@ -1,0 +1,65 @@
+---
+title: Home
+description: A high-performance structured tracing library for TypeScript that records spans into columnar Apache Arrow buffers.
+template: splash
+hero:
+  title: LMAO
+  tagline: Structured tracing for TypeScript that writes spans into columnar Apache Arrow buffers — fast on the hot path, queryable on the cold path.
+  actions:
+    - text: Quickstart
+      link: /start-here/quickstart/
+      icon: right-arrow
+      variant: primary
+    - text: Test by tracing
+      link: /tutorials/test-by-tracing/
+      icon: open-book
+    - text: Core concepts
+      link: /start-here/core-concepts/
+      icon: information
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+LMAO is a structured tracing and observability library for TypeScript. Instead of formatting log strings, your code
+records **spans** into typed, columnar [Apache Arrow](https://arrow.apache.org/) buffers. Writing a span attribute is a
+direct typed-array write on the hot path; string encoding and Arrow conversion happen later, off that path.
+
+<CardGrid stagger>
+  <Card title="Typed, structured" icon="setting">
+    Define a schema with `defineLogSchema`, then tag spans with typed columns instead of stringly-typed log lines.
+  </Card>
+  <Card title="Fast hot path" icon="rocket">
+    Span writes are direct column writes. Dictionary building and Arrow conversion run on the cold path.
+  </Card>
+  <Card title="Test by tracing" icon="approve-check">
+    Run code that emits spans and assert on the resulting span tree — not just return values.
+  </Card>
+  <Card title="Runs where you run" icon="laptop">
+    Node (`process.hrtime`) and browser/Workers (`performance.now`) entry points, with SQLite and D1 sinks.
+  </Card>
+</CardGrid>
+
+## Start here
+
+<CardGrid>
+  <LinkCard title="What is LMAO?" href="/start-here/what-is-lmao/" description="The problem it solves and how columnar tracing works." />
+  <LinkCard title="Installation" href="/start-here/installation/" description="Install the package and pick a platform entry point." />
+  <LinkCard title="Quickstart: your first trace" href="/start-here/quickstart/" description="Define an op, run it through a tracer, see the span." />
+  <LinkCard title="Core concepts in 5 minutes" href="/start-here/core-concepts/" description="Op vs span, tag vs scope vs log, and why columnar." />
+</CardGrid>
+
+## For LLMs and AI tools
+
+These docs are published in the [llms.txt](https://llmstxt.org/) format so you can feed them straight to an AI
+assistant. Download the index or the full corpus:
+
+<CardGrid>
+  <LinkCard title="llms.txt" href="/llms.txt" description="Curated index of the documentation, with links to every section." />
+  <LinkCard title="llms-full.txt" href="/llms-full.txt" description="The complete documentation concatenated into a single file." />
+  <LinkCard title="llms-small.txt" href="/llms-small.txt" description="A compact build with non-essential content stripped, for smaller context windows." />
+</CardGrid>
+
+:::note
+"LMAO" is the library's name. The pages here document only what ships in `@smoothbricks/lmao` today; planned
+directions are collected under [Roadmap & ecosystem](/roadmap/).
+:::

@@ -1,0 +1,92 @@
+---
+title: Trace-testing
+description: Harness setup and the span query API for testing by tracing.
+sidebar:
+  order: 6
+---
+
+Trace-testing runs each test inside a trace and lets you assert on the resulting span tree. For the walkthrough, see
+[Test by tracing](/tutorials/test-by-tracing/); for the checklist, see
+[Set up trace-testing](/guides/set-up-trace-testing/).
+
+## Harness setup
+
+### `initTraceTestRun(opContext, options?)`
+
+Registers a trace test run. Options include `sqlite` (write results to a database) and `verbose`.
+
+```ts
+// bun
+import { createBunTestMock, initTraceTestRun } from '@smoothbricks/lmao/testing/bun';
+initTraceTestRun(opContext, { sqlite: { dbPath: '.trace-results.db' } });
+```
+
+On vitest, import from `@smoothbricks/lmao/testing/vitest` and provide
+`sqlite: { dbPath, createDatabase: createNodeSQLiteDatabase }` (from `@smoothbricks/lmao/sqlite/node`).
+
+### `createBunTestMock(bunTest)` / `createVitestMock(module)`
+
+Wraps the test-runner module so tests can keep importing from `bun:test` / `vitest` while LMAO intercepts transparently.
+Register from the preload (bun) or in `vi.mock('vitest', ...)` (vitest).
+
+### `useTestSpan()`
+
+Returns the current test's `SpanContext`. Import from `@smoothbricks/lmao/testing/bun` or `/testing/vitest`.
+
+```ts
+const ctx = useTestSpan();
+await ctx.span('work', async (c) => c.ok(null));
+```
+
+## Span query API
+
+Import from `@smoothbricks/lmao/testing`.
+
+### `querySpan(buffer)` → `QueryableSpan`
+
+| Member | Description |
+|---|---|
+| `.name` | The span's name. |
+| `.facts(options?)` | Facts recorded in this span tree. |
+| `.find(name)` | First descendant span with that name. |
+| `.findAll(name)` | All descendant spans with that name. |
+| `.children` | Direct child spans (as `QueryableSpan`s). |
+| `.names()` | All descendant span names. |
+| `.buffer` | The underlying buffer. |
+
+```ts
+const q = querySpan(ctx.buffer);
+q.names(); // e.g. ['process-cart', 'validate', 'save']
+q.find('validate');
+```
+
+### Standalone helpers
+
+```ts
+import { findSpan, findAllSpans, extractFacts, extractFactsFor, spanNames } from '@smoothbricks/lmao/testing';
+
+findSpan(rootBuffer, 'save');
+spanNames(rootBuffer);
+extractFacts(rootBuffer);
+```
+
+### Facts
+
+`querySpan(buffer).facts()` and `extractFacts(rootBuffer)` return an array of typed **facts** — strings like
+`span:validate: started` or `tag:userId: ada` — that you can assert against. The full vocabulary (and its builders and
+type guards) is documented in the [Facts reference](/reference/facts/).
+
+### `TraceQuery` (SQLite-backed)
+
+Query a persisted results database.
+
+```ts
+import { TraceQuery } from '@smoothbricks/lmao/testing';
+
+const query = new TraceQuery(db);
+query.failures(); // failed spans (latest trace)
+query.slowest(undefined, 10); // 10 slowest
+query.findSpans('%validate%'); // by name pattern
+query.testTree('my-test'); // full subtree for a test
+query.close();
+```

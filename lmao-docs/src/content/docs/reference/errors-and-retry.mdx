@@ -1,0 +1,91 @@
+---
+title: Errors & retry
+description: Result types, typed error codes, transient errors, blocked errors, and backoff policies.
+sidebar:
+  order: 5
+---
+
+Import these from `@smoothbricks/lmao` (or the `@smoothbricks/lmao/errors/*` subpaths).
+
+## `Result<V, E>`
+
+The return type of an op, a discriminated union:
+
+- On success: `{ success: true, value: V }`.
+- On failure: `{ success: false, error: E }`.
+
+```ts
+const result = await trace('get-user', getUser, 'ada');
+if (result.success) {
+  result.value; // V
+} else {
+  result.error; // E
+}
+```
+
+## `ctx.ok(value)` / `ctx.err(error)`
+
+Create the result inside an op. Both support fluent `.with({...})` (attach span attributes) and `.message('...')`
+(override the span name).
+
+## `defineCodeError(code)<Payload>()`
+
+Defines a typed, non-retryable error code.
+
+```ts
+const NOT_FOUND = defineCodeError('NOT_FOUND')<{ id: string }>();
+// usage
+return ctx.err(NOT_FOUND({ id: 'ada' }));
+// reading
+if (!result.success) {
+  result.error.code; // "NOT_FOUND"
+  result.error.id; // payload field
+}
+```
+
+## `Transient(code, policy)`
+
+Defines a **retryable** error with a default retry policy. Returned from a child span, it is retried automatically.
+
+```ts
+const SERVICE_UNAVAILABLE = Transient<{ status: number }>('SERVICE_UNAVAILABLE', exponentialBackoff(3));
+return ctx.err(SERVICE_UNAVAILABLE({ status: 503 }));
+// override the policy for one value:
+return ctx.err(SERVICE_UNAVAILABLE({ status: 503 }, { maxAttempts: 5 }));
+```
+
+## Backoff policies
+
+| Helper | Signature |
+|---|---|
+| `linearBackoff` | `linearBackoff(maxAttempts, baseDelayMs = 100)` |
+| `exponentialBackoff` | `exponentialBackoff(maxAttempts, baseDelayMs = 100)` |
+| `fixedDelay` | `fixedDelay(maxAttempts, delayMs = 1000)` |
+
+## `Blocked`
+
+A non-retryable temporary block. Construct with a factory and return it like any error.
+
+```ts
+return ctx.err(Blocked.service('payment-api'));
+return ctx.err(Blocked.ended('worker'));
+return ctx.err(Blocked.index('search-index'));
+```
+
+Each factory takes an optional `BlockedConfig` (`{ maxAttempts?, nextRetry?(attempt) }`).
+
+## `RetriesExhausted`
+
+`RetriesExhausted` is the error type representing a transient failure whose retry policy ran out of attempts. It's
+exported both from the root and as the focused subpath `@smoothbricks/lmao/errors/RetriesExhausted`.
+
+## Helpers
+
+- `hasErrorCode(error)` — a type guard narrowing an unknown value to `{ code: string }`, useful when inspecting an
+  error of unknown origin.
+- Result builders also expose `.line(n)` (alongside `.with({...})` and `.message('...')`) to record a source line.
+
+:::note
+Retry applies to **child spans** (`ctx.span(...)`), not to the root `trace(...)`. See
+[Retry transient failures](/guides/retry-transient-failures/).
+:::

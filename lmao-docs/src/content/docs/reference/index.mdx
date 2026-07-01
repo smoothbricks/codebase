@@ -1,0 +1,26 @@
+---
+title: Reference
+description: Complete, information-oriented reference for the LMAO API.
+sidebar:
+  order: 0
+---
+
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+Look-up reference for the public API. Every symbol here is exported from `@smoothbricks/lmao` or one of its subpaths.
+
+<CardGrid>
+  <LinkCard title="defineOpContext / defineOp" href="/reference/define-op-context/" description="Define an op context and operations." />
+  <LinkCard title="SpanContext" href="/reference/span-context/" description="The ctx surface: tag, log, span, ff, deps, scope, ok, err." />
+  <LinkCard title="Schema DSL (S)" href="/reference/schema-dsl/" description="Field types and feature-flag builders." />
+  <LinkCard title="Tracers" href="/reference/tracers/" description="Tracer options, concrete tracers, and trace() overloads." />
+  <LinkCard title="Errors & retry" href="/reference/errors-and-retry/" description="Result, defineCodeError, Transient, Blocked, backoff." />
+  <LinkCard title="Trace-testing" href="/reference/trace-testing/" description="Harness setup and the span query API." />
+  <LinkCard title="Facts" href="/reference/facts/" description="The typed fact vocabulary for test assertions." />
+  <LinkCard title="Feature-flag types" href="/reference/feature-flag-types/" description="FlagEvaluator, flag contexts, evaluators." />
+  <LinkCard title="Entry types" href="/reference/entry-types/" description="Entry-type names and reserved system columns." />
+  <LinkCard title="Archive" href="/reference/archive/" description="Chunk envelope, compaction, stats, partitioning." />
+  <LinkCard title="Package exports" href="/reference/package-exports/" description="What each import subpath provides." />
+  <LinkCard title="Configuration" href="/reference/configuration/" description="Tracer, flush, and test-harness options." />
+  <LinkCard title="Advanced / internals" href="/reference/advanced-internals/" description="Code generation, identifiers, buffer strategy." />
+</CardGrid>

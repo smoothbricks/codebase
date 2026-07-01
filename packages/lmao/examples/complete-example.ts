@@ -1,325 +1,172 @@
+#!/usr/bin/env bun
 /**
- * Complete LMAO Example - Demonstrates All Features
+ * Example: End-to-end workflow
  *
- * This example shows:
- * - Request context with feature flags and environment
- * - Module context with tag attributes
- * - Op wrappers with typed logging
- * - Scoped attributes inheritance (spec 01i)
- * - Child spans
- * - FlushScheduler with Arrow conversion
- * - String type system (enum/category/text)
+ * Brings several features together:
+ * - Scoped attributes (`ctx.setScope`) inherited by child spans
+ * - Synchronous and asynchronous feature flags (`ctx.ff.x?.value` / `await ctx.ff.get('x')`)
+ * - Multi-level child spans via `ctx.span(name, op, ...args)`
+ * - `FlushScheduler` converting registered buffers to Arrow tables
+ *
+ * Run it:
+ *   bun run examples/complete-example.ts
  */
 
 import {
+  type AnySpanBuffer,
+  createTraceRoot,
+  defineCodeError,
   defineFeatureFlags,
   defineLogSchema,
-  defineModule,
+  defineOpContext,
   FlushScheduler,
   InMemoryFlagEvaluator,
+  JsBufferStrategy,
   S,
-} from '../src/index.js';
-
-// ====================
-// 1. Define Tag Attributes
-// ====================
-
-// Using the three string types per specs/lmao/01a_trace_schema_system.md:
-// - S.enum(): Known values at compile time -> Uint8Array (1 byte)
-// - S.category(): Values that repeat -> Uint32Array with string interning
-// - S.text(): Unique values -> Uint32Array without interning
+  StdioTracer,
+} from '../src/node.js';
 
 const orderSchema = defineLogSchema({
-  // Enum: Known operations at compile time
   operation: S.enum(['CREATE_ORDER', 'UPDATE_ORDER', 'CANCEL_ORDER', 'PROCESS_PAYMENT']),
-
-  // Enum: HTTP methods
   httpMethod: S.enum(['GET', 'POST', 'PUT', 'DELETE']),
-
-  // Category: IDs that repeat across operations
   orderId: S.category(),
   userId: S.category(),
   requestId: S.category(),
-
-  // Text: Unique values that rarely repeat
-  errorMessage: S.text(),
   sqlQuery: S.text(),
-
-  // Numbers and booleans
   orderAmount: S.number(),
   itemCount: S.number(),
   isValid: S.boolean(),
   httpStatus: S.number(),
 });
 
-// ====================
-// 2. Define Feature Flags
-// ====================
-
 const featureFlags = defineFeatureFlags({
-  // Sync flags (synchronous access)
   advancedValidation: S.boolean().default(false).sync(),
-  maxRetries: S.number().default(3).sync(),
-
-  // Async flags (requires await)
   experimentalPaymentFlow: S.boolean().default(false).async(),
 });
 
-// ====================
-// 3. Setup Environment
-// ====================
-
-const environmentConfig = {
-  awsRegion: 'us-east-1',
-  paymentProvider: 'stripe',
-  databaseUrl: 'postgresql://localhost:5432/orders',
-};
-
-// ====================
-// 4. Create Module with defineModule
-// ====================
-
-const orderModule = defineModule({
-  moduleMetadata: {
-    gitSha: 'abc123def456',
-    packageName: '@example/order-service',
-    packagePath: 'src/services/order-service.ts',
-  },
+const opContext = defineOpContext({
   logSchema: orderSchema,
+  flags: featureFlags.schema,
+  ctx: {
+    requestId: undefined as string | undefined,
+    userId: undefined as string | undefined,
+  },
+});
+const { defineOp } = opContext;
+
+// A single error code per op keeps the op's inferred error type homogeneous.
+const ORDER_FAILED = defineCodeError('ORDER_FAILED')<{ stage: 'validation' | 'payment'; reason: string }>();
+const EMPTY_ORDER = defineCodeError('EMPTY_ORDER')<{ reason: string }>();
+const AMOUNT_TOO_LARGE = defineCodeError('AMOUNT_TOO_LARGE')<{ amount: number; maxAmount: number }>();
+
+interface OrderData {
+  userId: string;
+  items: Array<{ productId: string; quantity: number; price: number }>;
+}
+
+// Validation op — demonstrates a flag-guarded nested span and scope override.
+const validateOrder = defineOp('validate-order', async (ctx, orderData: OrderData) => {
+  if (ctx.ff.advancedValidation?.value) {
+    return ctx.span('advanced-validation', async (childCtx) => {
+      // Child inherits parent scope (userId, requestId, ...) and can add/override its own.
+      childCtx.setScope({ operation: 'UPDATE_ORDER', sqlQuery: 'SELECT * FROM products WHERE id IN (...)' });
+      childCtx.log.info('Running advanced validation');
+      if (orderData.items.length === 0) {
+        return childCtx.err(EMPTY_ORDER({ reason: 'no items' }));
+      }
+      return childCtx.ok({ validated: true });
+    });
+  }
+
+  ctx.log.info('Running basic validation');
+  if (orderData.items.length === 0) {
+    return ctx.err(EMPTY_ORDER({ reason: 'no items' }));
+  }
+  return ctx.ok({ validated: true });
 });
 
-// ====================
-// 5. Setup FlushScheduler
-// ====================
-
-// FlushScheduler now uses direct string access - no interners needed
-const scheduler = new FlushScheduler(
-  // Flush handler - receives Arrow table
-  (table, metadata) => {
-    console.log('\n📊 Flushing trace data:');
-    console.log(`   Rows: ${metadata.totalRows}`);
-    console.log(`   Buffers: ${metadata.totalBuffers}`);
-    console.log(`   Reason: ${metadata.flushReason}`);
-    console.log(`   Arrow table columns: ${table.schema.fields.map((f) => f.name).join(', ')}`);
-
-    // In production, you would:
-    // - Write to ClickHouse
-    // - Write to Parquet file
-    // - Send to analytics service
-    // - etc.
-  },
-  {
-    maxFlushInterval: 5000, // Flush every 5 seconds
-    capacityThreshold: 0.8, // Flush when 80% full
-    idleDetection: true, // Flush when idle
-    idleTimeout: 2000, // 2 seconds of idle
-  },
-);
-
-// Start scheduler
-scheduler.start();
-
-// ====================
-// 6. Define Business Logic Ops
-// ====================
-
-// Main order creation op
-const createOrder = orderModule.task(
-  'create-order',
-  async (
-    ctx,
-    orderData: {
-      userId: string;
-      items: Array<{ productId: string; quantity: number; price: number }>;
-    },
-  ) => {
-    // Set request-level scoped attributes
-    // Per specs/lmao/01i - these propagate to all child operations
-    ctx.setScope({
-      userId: orderData.userId,
-      requestId: ctx.requestId,
-      httpMethod: 'POST',
-      operation: 'CREATE_ORDER',
-    });
-
-    ctx.log.info('Order creation started');
-
-    // Calculate totals
-    const orderAmount = orderData.items.reduce((sum, item) => sum + item.price * item.quantity, 0);
-    const itemCount = orderData.items.reduce((sum, item) => sum + item.quantity, 0);
-
-    // Add order-specific scope
-    ctx.setScope({
-      orderAmount,
-      itemCount,
-    });
-
-    // Validate order
-    const validationResult = await validateOrder(ctx, orderData);
-
-    if (!validationResult.success) {
-      ctx.log.error('Order validation failed');
-      return ctx.err('VALIDATION_FAILED', validationResult.error);
-    }
-
-    ctx.log.info('Order validated successfully');
-
-    // Create order in database
-    const orderId = `ORD-${Date.now()}`;
-
-    ctx.setScope({
-      orderId,
-      isValid: true,
-    });
-
-    // Process payment
-    const paymentResult = await processPayment(ctx, orderId, orderAmount);
-
-    if (!paymentResult.success) {
-      ctx.log.error('Payment processing failed');
-      return ctx.err('PAYMENT_FAILED', paymentResult.error);
-    }
-
-    ctx.log.info('Order created successfully');
-
-    return ctx.ok({
-      orderId,
-      userId: orderData.userId,
-      amount: orderAmount,
-      status: 'created',
-    });
-  },
-);
-
-// Validation op - demonstrates child span
-const validateOrder = orderModule.task(
-  'validate-order',
-  async (
-    ctx,
-    orderData: {
-      userId: string;
-      items: Array<{ productId: string; quantity: number; price: number }>;
-    },
-  ) => {
-    // Check advanced validation feature flag
-    if (ctx.ff.advancedValidation) {
-      ctx.log.info('Using advanced validation');
-
-      return await ctx.span('advanced-validation', async (childCtx) => {
-        // Child span inherits parent's scoped attributes (userId, requestId, etc.)
-        childCtx.log.info('Running advanced validation checks');
-
-        // Add validation-specific scope
-        childCtx.setScope({
-          operation: 'UPDATE_ORDER', // Can override parent scope
-          sqlQuery: 'SELECT * FROM products WHERE id IN (...)',
-        });
-
-        // Simulate validation
-        if (orderData.items.length === 0) {
-          return childCtx.err('EMPTY_ORDER', 'Order has no items');
-        }
-
-        return childCtx.ok({ validated: true });
-      });
-    }
-
-    // Basic validation
-    ctx.log.info('Using basic validation');
-
-    if (orderData.items.length === 0) {
-      return ctx.err('EMPTY_ORDER', 'Order has no items');
-    }
-
-    return ctx.ok({ validated: true });
-  },
-);
-
-// Payment processing op - demonstrates async feature flags
-const processPayment = orderModule.task('process-payment', async (ctx, orderId: string, amount: number) => {
-  ctx.setScope({
-    orderId,
-    orderAmount: amount,
-    operation: 'PROCESS_PAYMENT',
-  });
-
+// Payment op — demonstrates an async feature flag.
+const processPayment = defineOp('process-payment', async (ctx, orderId: string, amount: number) => {
+  ctx.setScope({ orderId, orderAmount: amount, operation: 'PROCESS_PAYMENT' });
   ctx.log.info('Payment processing started');
 
-  // Simulate payment validation - amounts over 10000 are rejected
-  if (amount > 10000) {
+  if (amount > 10_000) {
     ctx.setScope({ httpStatus: 400 });
-    return ctx.err('AMOUNT_TOO_LARGE', { amount, maxAmount: 10000 });
+    return ctx.err(AMOUNT_TOO_LARGE({ amount, maxAmount: 10_000 }));
   }
 
-  // Check experimental payment flow (async)
-  const useExperimentalFlow = await ctx.ff.get('experimentalPaymentFlow');
-
-  if (useExperimentalFlow) {
-    ctx.log.info('Using experimental payment flow');
-
-    return await ctx.span('experimental-payment', async (childCtx) => {
-      childCtx.log.info('Processing payment with new flow');
-
-      // Simulate payment
-      const paymentId = `PAY-${Date.now()}`;
-
-      childCtx.setScope({
-        httpStatus: 200,
-        httpMethod: 'POST',
-      });
-
-      return childCtx.ok({ paymentId, status: 'success' });
+  const experimental = await ctx.ff.get('experimentalPaymentFlow');
+  if (experimental?.value) {
+    // Run the experimental flow as a child span for its tracing; the op's own result is below.
+    await ctx.span('experimental-payment', async (childCtx) => {
+      childCtx.setScope({ httpStatus: 200, httpMethod: 'POST' });
+      childCtx.log.info('Processing payment with experimental flow');
+      return childCtx.ok({ ok: true });
     });
   }
 
-  // Standard payment flow
-  ctx.log.info('Using standard payment flow');
-
-  // Simulate payment
-  const paymentId = `PAY-${Date.now()}`;
-
-  ctx.setScope({
-    httpStatus: 200,
-  });
-
-  return ctx.ok({ paymentId, status: 'success' });
+  ctx.setScope({ httpStatus: 200 });
+  return ctx.ok({ paymentId: `PAY-${Date.now()}`, status: 'success' });
 });
 
-// ====================
-// 7. Run Example
-// ====================
+// Root op — sets request-level scope, then composes the sub-ops as child spans.
+let rootBuffer: AnySpanBuffer | undefined;
+const createOrder = defineOp('create-order', async (ctx, orderData: OrderData) => {
+  rootBuffer = ctx.buffer;
 
-async function main() {
-  console.log('🚀 LMAO Complete Example\n');
-  console.log('This example demonstrates:');
-  console.log('- Request context with feature flags');
-  console.log('- Scoped attributes inheritance');
-  console.log('- Child spans');
-  console.log('- FlushScheduler with Arrow conversion');
-  console.log('- String type system (enum/category/text)\n');
-
-  // Create flag evaluator
-  const flagEvaluator = new InMemoryFlagEvaluator({
-    advancedValidation: true,
-    maxRetries: 5,
-    experimentalPaymentFlow: false,
+  ctx.setScope({
+    userId: orderData.userId,
+    requestId: ctx.requestId,
+    httpMethod: 'POST',
+    operation: 'CREATE_ORDER',
   });
+  ctx.log.info('Order creation started');
 
-  // Create request context via module
-  const traceCtx = orderModule.traceContext(
-    {
-      requestId: 'req-12345',
-      userId: 'user-789',
-    },
-    featureFlags,
-    flagEvaluator,
-    environmentConfig,
-  );
+  const orderAmount = orderData.items.reduce((sum, item) => sum + item.price * item.quantity, 0);
+  const itemCount = orderData.items.reduce((sum, item) => sum + item.quantity, 0);
+  ctx.setScope({ orderAmount, itemCount });
 
-  console.log('📦 Processing order...\n');
+  const validation = await ctx.span('validate-order', validateOrder, orderData);
+  if (!validation.success) {
+    ctx.log.error('Order validation failed');
+    return ctx.err(ORDER_FAILED({ stage: 'validation', reason: validation.error.code }));
+  }
 
-  // Execute op
-  const result = await createOrder(traceCtx, {
+  const orderId = `ORD-${Date.now()}`;
+  ctx.setScope({ orderId, isValid: true });
+
+  const payment = await ctx.span('process-payment', processPayment, orderId, orderAmount);
+  if (!payment.success) {
+    ctx.log.error('Payment processing failed');
+    return ctx.err(ORDER_FAILED({ stage: 'payment', reason: payment.error.code }));
+  }
+
+  ctx.log.info('Order created successfully');
+  return ctx.ok({ orderId, userId: orderData.userId, amount: orderAmount, status: 'created' });
+});
+
+const { trace } = new StdioTracer(opContext, {
+  bufferStrategy: new JsBufferStrategy(),
+  createTraceRoot,
+  flagEvaluator: new InMemoryFlagEvaluator(featureFlags.schema, {
+    advancedValidation: true,
+    experimentalPaymentFlow: false,
+  }),
+});
+
+const scheduler = new FlushScheduler(
+  (table, metadata) => {
+    console.log('\n📊 Flushing trace data:');
+    console.log(`   Rows: ${metadata.totalRows}, Buffers: ${metadata.totalBuffers}, Reason: ${metadata.flushReason}`);
+    console.log(`   Arrow columns: ${table.names.join(', ')}`);
+  },
+  { maxFlushInterval: 5000, capacityThreshold: 0.8, idleDetection: true, idleTimeout: 2000 },
+);
+
+async function main(): Promise<void> {
+  scheduler.start();
+
+  const result = await trace('create-order', { requestId: 'req-12345', userId: 'user-789' }, createOrder, {
     userId: 'user-789',
     items: [
       { productId: 'prod-1', quantity: 2, price: 29.99 },
@@ -328,25 +175,20 @@ async function main() {
   });
 
   if (result.success) {
-    console.log('\n✅ Order created successfully!');
-    console.log('   Order ID:', result.value.orderId);
-    console.log(`   Amount: $${result.value.amount.toFixed(2)}`);
+    console.log(`\n✅ Order ${result.value.orderId} created — $${result.value.amount.toFixed(2)}`);
   } else {
-    console.log('\n❌ Order creation failed:');
-    console.log('   Error:', result.error);
+    console.log(`\n❌ Order failed: ${result.error.code}`);
   }
 
-  // Manually flush to see the data
-  console.log('\n🔄 Manually flushing trace data...');
+  // Register the captured root buffer and flush it through the scheduler.
+  if (rootBuffer) {
+    scheduler.register(rootBuffer);
+  }
   await scheduler.flush();
-
-  // Stop scheduler
   scheduler.stop();
-
-  console.log('\n✨ Example complete!\n');
 }
 
-// Run if this file is executed directly
-if (import.meta.url === `file://${process.argv[1]}`.replace(/\\/g, '/')) {
-  main().catch(console.error);
-}
+main().catch((error: unknown) => {
+  console.error(error);
+  process.exitCode = 1;
+});

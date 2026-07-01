@@ -1,0 +1,69 @@
+---
+title: Core concepts in 5 minutes
+description: Op vs span, tag vs scope vs log, and why LMAO tracing is columnar.
+sidebar:
+  order: 4
+---
+
+Three ideas cover most of what you need to read and write LMAO traces.
+
+## Op vs span
+
+An **op** is a reusable definition — you create it once with `defineOp`. A **span** is one *execution* of work inside a
+trace: it has its own buffer, its own timing, and a place in the trace tree.
+
+Running an op produces a span. Inside an op you can open **child spans** with `ctx.span(...)`, which nest under the
+current span.
+
+```ts
+const fetchItem = defineOp('fetch-item', async (ctx) => ctx.ok({ id: 1 }));
+
+const getCart = defineOp('get-cart', async (ctx) => {
+  // This call creates a child span under "get-cart".
+  const item = await ctx.span('fetch-item', fetchItem);
+  return ctx.ok({ items: [item] });
+});
+```
+
+The tree for one run of `get-cart` looks like:
+
+```text
+get-cart
+└─ fetch-item
+```
+
+## Tag vs scope vs log
+
+A span context gives you three ways to record information, each with a different shape:
+
+- **`ctx.tag`** — attributes of *this* span. Set once; chainable.
+- **`ctx.setScope({...})`** — default values that apply to this span *and are inherited by child spans*. Set it once
+  (e.g. a `requestId`) and stop repeating it.
+- **`ctx.log.info/debug/warn/error`** — timestamped events recorded during the span. Messages are templates:
+  `{{field}}` placeholders are filled from the values you attach.
+
+```ts
+const handle = defineOp('handle', async (ctx) => {
+  ctx.setScope({ userId: 'ada' }); // inherited by children
+  ctx.tag.itemCount(3); // attribute of this span
+  ctx.log.info('processing {{itemCount}} items').itemCount(3); // event
+  return ctx.ok(null);
+});
+```
+
+## Why columnar
+
+Each attribute is stored in its own **typed column**, not concatenated into a string. Writing `itemCount(3)` puts a
+number into a numeric column slot — a cheap operation on the hot path. Turning those columns into an Apache Arrow table
+(encoding strings, building dictionaries) happens later, on the cold path, when you flush.
+
+The schema's string types tune how strings are stored:
+
+- `S.enum([...])` — a small, known set of values.
+- `S.category()` — values that repeat (dictionary-encoded at conversion time).
+- `S.text()` — mostly-unique values.
+
+:::note
+All of this runs inside an op executed by a tracer — see the [Quickstart](/start-here/quickstart/). For deeper dives,
+read the [Concepts](/concepts/) section.
+:::

@@ -1,0 +1,38 @@
+---
+title: Roadmap & ecosystem
+description: Directions and adjacent components that are not part of the shipped @smoothbricks/lmao API.
+sidebar:
+  order: 99
+---
+
+Everything in the rest of these docs is part of the shipped `@smoothbricks/lmao` API. This page collects directions and
+adjacent ideas that are **not shipped** in the package today — listed for context, not for use.
+
+:::caution
+The items below are not available in the current public API. Don't write code against them.
+:::
+
+## Query engine
+
+A trace analytics path (for example, querying exported Arrow data with an engine such as DuckDB) is a direction, not a
+shipped feature of this package. Today you can convert traces to Arrow tables and persist them to SQLite using the
+shipped APIs — see [Convert a trace to Arrow](/guides/convert-to-arrow/) and
+[Persist traces to SQLite](/guides/persist-to-sqlite/).
+
+## Inspector
+
+A visual trace viewer is an envisioned ecosystem component. It is not part of `@smoothbricks/lmao`.
+
+## AI-agent / MCP integration
+
+Exposing traces to AI agents over a protocol such as MCP is an idea under consideration, not a shipped capability.
+
+## TypeScript transformer
+
+A build-time transformer (for source-line injection and call-site optimizations) is described in the project's design
+notes. There is no transformer to configure in the current package, and none of the documented APIs require one.
+
+---
+
+If you need one of these capabilities today, build on the shipped primitives: Arrow conversion, SQLite/D1 sinks, and the
+trace-testing query API.
