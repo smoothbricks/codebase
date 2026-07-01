@@ -1,18 +1,14 @@
-# Starlight Starter Kit: Basics
+# LMAO docs site (Astro Starlight)
 
-[![Built with Starlight](https://astro.badg.es/v2/built-with-starlight/tiny.svg)](https://starlight.astro.build)
+This folder contains the Astro/Starlight documentation site for `@smoothbricks/lmao`.
 
-```
-npm create astro@latest -- --template starlight
-```
+## Local development
 
-> 🧑‍🚀 **Seasoned astronaut?** Delete this file. Have fun!
+From the repo root:
 
-## 🚀 Project Structure
-
-Inside of your Astro + Starlight project, you'll see the following folders and files:
-
-```
+    bun install
+    cd lmao-docs
+    bun run dev
 .
 ├── public/
 ├── src/
