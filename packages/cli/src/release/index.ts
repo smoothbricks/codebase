@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
 import { $ } from 'bun';
+import { assertNoConflictMarkers } from '../lib/conflict-markers.js';
 import { withDevenvEnv } from '../lib/devenv.js';
 import { isRecord, readJsonObject, stringProperty } from '../lib/json.js';
 import { decode, run, runInteractiveStatus, runResult, runStatus } from '../lib/run.js';
@@ -110,6 +111,10 @@ export async function releaseVersion(root: string, options: ReleaseVersionOption
 }
 
 export async function releasePublish(root: string, options: ReleasePublishOptions): Promise<void> {
+  // Never publish a tree carrying unresolved conflict markers (e.g. a merged
+  // review branch that still had markers). Enforced here so every smoo-managed
+  // repo's template publish step inherits it. See `smoo pr resolve`.
+  await assertNoConflictMarkers({ runResult }, root, 'publish');
   const bump = releaseBumpArg(options.bump);
   const packages = await releasePackagesAtHead(root, releasePackages(root));
   if (packages.length === 0) {
