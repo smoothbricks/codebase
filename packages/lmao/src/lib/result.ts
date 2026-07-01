@@ -104,6 +104,7 @@ function createCodeErrorValue<Code extends string, Fields extends object>(
 // OK CLASS
 // =============================================================================
 
+//#region smoo/lmao!n/lmao-entry-fluentok
 /**
  * Success result with fluent tag application.
  *
@@ -240,11 +241,13 @@ export class Ok<V, T extends LogSchema = LogSchema> {
     return { ok: true, value: this.value };
   }
 }
+//#endregion smoo/lmao!n/lmao-entry-fluentok
 
 // =============================================================================
 // ERR CLASS
 // =============================================================================
 
+//#region smoo/lmao!n/lmao-entry-fluenterr
 /**
  * Error result with fluent tag application.
  *
@@ -410,6 +413,7 @@ export class Err<E, T extends LogSchema = LogSchema> {
     return { ok: false, error: this.error };
   }
 }
+//#endregion smoo/lmao!n/lmao-entry-fluenterr
 
 // =============================================================================
 // RESULT TYPE

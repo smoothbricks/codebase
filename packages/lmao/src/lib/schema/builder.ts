@@ -66,6 +66,7 @@ function createSchemaWithFlagBuilder<Value, TSchema extends Schema<Value>>(
   return schemaWithBuilder;
 }
 
+//#region smoo/lmao!n/schema-string-types
 /**
  * Schema builder that wraps arrow-builder's S with feature flag support
  *
@@ -199,3 +200,4 @@ const schemaBuilderImpl: SchemaBuilder = {
 // Export as S for convenience
 // Note: The SchemaBuilder type is exported from types.ts
 export const S = schemaBuilderImpl;
+//#endregion smoo/lmao!n/schema-string-types

@@ -1,3 +1,4 @@
+//#region corpos/billing!n/audit-pricing-metering.lmao-array-queue-tracer
 import type { OpContextBinding } from '../opContext/types.js';
 import { Tracer } from '../tracer.js';
 import type { SpanBuffer } from '../types.js';
@@ -74,3 +75,4 @@ export class ArrayQueueTracer<B extends OpContextBinding = OpContextBinding> ext
     return buffers;
   }
 }
+//#endregion corpos/billing!n/audit-pricing-metering.lmao-array-queue-tracer

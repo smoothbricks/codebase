@@ -53,7 +53,7 @@ in {
   # - languages.python sets up shell hooks that ensure argv[0] contains the full path
   languages.python = {
     enable = true;
-    package = pkgs.python312.withPackages (ps: [ps.pyarrow ps.pandas]);
+    package = pkgs.python314.withPackages (ps: [ps.pyarrow ps.pandas]);
   };
 
   # We're not using Devenv's pre-commit-hooks, because this repo's pre-commit hook

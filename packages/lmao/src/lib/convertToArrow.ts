@@ -186,6 +186,11 @@ function getAllocatedBinaryColumn(buffer: AnySpanBuffer, columnName: string): un
   return Array.isArray(column) ? column : undefined;
 }
 
+//#region smoo/lmao!n/scope-attributes.arrow-fill
+// Cold-path scope materialization (01i): scope values fill NULL cells (no direct write) at
+// Arrow conversion. These typed readers pull from the buffer's immutable _scopeValues; the
+// per-column fill loops below call them so a row with a direct write keeps its value and scope
+// only fills the gaps.
 function getStringScopeValue(buffer: AnySpanBuffer, fieldName: string): string | undefined {
   const value = buffer._scopeValues?.[fieldName];
   return typeof value === 'string' ? value : undefined;
@@ -200,6 +205,7 @@ function getBooleanScopeValue(buffer: AnySpanBuffer, fieldName: string): boolean
   const value = buffer._scopeValues?.[fieldName];
   return typeof value === 'boolean' ? value : undefined;
 }
+//#endregion smoo/lmao!n/scope-attributes.arrow-fill
 
 function requireUint8Array(value: unknown, message: string): Uint8Array {
   if (!(value instanceof Uint8Array)) {

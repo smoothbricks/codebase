@@ -203,6 +203,7 @@ export function mergeWithSystemSchema<T extends Record<string, unknown>>(userSch
   return merged;
 }
 
+//#region smoo/lmao!n/lmao-entry-entry-type-definitions
 // =============================================================================
 // Entry Type Constants
 // =============================================================================
@@ -337,3 +338,4 @@ export const ENTRY_TYPE_NAMES = [
   'buffer-spans', // 23
   'buffer-capacity', // 24
 ] as const;
+//#endregion smoo/lmao!n/lmao-entry-entry-type-definitions

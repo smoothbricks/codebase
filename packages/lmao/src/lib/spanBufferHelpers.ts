@@ -10,6 +10,7 @@
 
 import { copyThreadIdTo } from './threadId.js';
 
+//#region smoo/lmao!n/spanbuffer-layout.helpers
 /**
  * Shared TextEncoder instance for traceId encoding.
  * TextEncoder is stateless and thread-safe, so one instance suffices.
@@ -71,3 +72,4 @@ export const spanBufferHelpers = {
 } as const;
 
 export type SpanBufferHelpers = typeof spanBufferHelpers;
+//#endregion smoo/lmao!n/spanbuffer-layout.helpers

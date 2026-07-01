@@ -2,6 +2,7 @@ import { Command, CommanderError } from 'commander';
 import { variants } from './generate/index.js';
 import { cliPackageVersion } from './lib/cli-package.js';
 import { findRepoRoot } from './lib/run.js';
+import { resolvePrConflicts } from './pr/index.js';
 
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   const program = buildProgram();
@@ -340,6 +341,18 @@ function buildProgram(): Command {
         await githubCiNxDeploy(await findRepoRoot(), options);
       },
     );
+
+  const pr = program.command('pr').description('Work with GitHub pull requests');
+  pr.command('resolve [pr]')
+    .description('Resolve conflict markers in a PR (agent-first, two-phase)')
+    .option('--remote <name>', 'git remote hosting the PR branch (auto-inferred when omitted)')
+    .option('--abort', 'discard an in-progress resolution and return to the original branch')
+    .action(async (prArg: string | undefined, options: { remote?: string; abort?: boolean }) => {
+      const exitCode = await resolvePrConflicts(await findRepoRoot(), prArg, options);
+      if (exitCode !== 0) {
+        process.exitCode = exitCode;
+      }
+    });
 
   return program;
 }

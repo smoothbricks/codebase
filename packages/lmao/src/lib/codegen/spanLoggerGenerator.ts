@@ -261,6 +261,7 @@ function generateEnumFluentSetters(enumFieldNames: Set<string>): string {
   return setters.join('\n');
 }
 
+//#region smoo/lmao!n/codegen-spanlogger.scope
 /**
  * Generate _setScope() method code - IMMUTABLE scope semantics
  *
@@ -365,7 +366,9 @@ function generatePrefillScopedAttributesMethod(
       ${columnFills.join('\n')}
     }`;
 }
+//#endregion smoo/lmao!n/codegen-spanlogger.scope
 
+//#region smoo/lmao!n/codegen-spanlogger
 /**
  * Build the extension for SpanLogger that extends ColumnWriter
  */
@@ -713,3 +716,4 @@ export function createSpanLogger<T extends LogSchema>(schema: T, buffer: SpanBuf
   const SpanLoggerClass = createSpanLoggerClass(schema);
   return new SpanLoggerClass(buffer);
 }
+//#endregion smoo/lmao!n/codegen-spanlogger

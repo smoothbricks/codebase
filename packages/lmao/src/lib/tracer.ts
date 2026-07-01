@@ -239,6 +239,7 @@ export type TraceFn<Ctx extends OpContext> = {
 // Tracer Class
 // =============================================================================
 
+//#region smoo/lmao!n/tracer-architecture #contract
 /**
  * Tracer - Abstract base class for trace collection
  *
@@ -357,6 +358,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
   // trace() - Polymorphic dispatcher (like span())
   // ===========================================================================
 
+  //#region smoo/lmao!n/tracer-architecture.trace-overloads
   /**
    * Polymorphic trace dispatcher.
    *
@@ -547,6 +549,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     }
     return this._trace_unknown_fn(line, name, overrides, fnOrOp);
   }
+  //#endregion smoo/lmao!n/tracer-architecture.trace-overloads
 
   // ===========================================================================
   // Monomorphic trace methods (for transformer optimization)
@@ -892,3 +895,4 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     }
   }
 }
+//#endregion smoo/lmao!n/tracer-architecture

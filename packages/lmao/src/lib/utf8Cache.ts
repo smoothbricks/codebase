@@ -39,6 +39,7 @@ type Utf8CacheStats = { hits: number; misses: number; hitRate: number; size: num
  * The cache is safe to use in async contexts since JS awaits don't
  * allow concurrent access to the same cache instance.
  */
+//#region smoo/lmao!n/buffer-perf-utf8-cache
 export class Utf8Cache implements Utf8Encoder {
   private readonly cache: SieveCache<string, Uint8Array>;
   private readonly encoder = new TextEncoder();
@@ -199,3 +200,4 @@ export const globalUtf8Cache = new Utf8Cache();
 export function createUtf8Cache(maxSize?: number): Utf8Cache {
   return new Utf8Cache(maxSize);
 }
+//#endregion smoo/lmao!n/buffer-perf-utf8-cache

@@ -1,4 +1,4 @@
-# Library Integration Pattern
+# Library Integration Pattern <a id="smoo/lmao!n/library-integration"></a>
 
 ## Overview
 
@@ -31,7 +31,7 @@ the parent that maps target names to unprefixed columns. This enables:
 - **Hot path**: Direct TypedArray writes to unprefixed columns (zero overhead)
 - **Cold path**: Arrow conversion uses RemappedBufferView to access columns via mapped names
 
-## Column Mapping API
+## Column Mapping API <a id="smoo/lmao!n/library-integration-column-mapping"></a>
 
 Applications control how library columns appear in the final Arrow output using two methods:
 
@@ -72,7 +72,7 @@ postgresOps.mapColumns({
 | `{ col: null }`            | Drop column              | Ignore debug/internal writes      |
 | `.prefix('x')` (shorthand) | All cols get `x_` prefix | Simple namespacing                |
 
-## Core Architecture: RemappedBufferView
+## Core Architecture: RemappedBufferView <a id="smoo/lmao!n/library-integration-remapped-view"></a>
 
 ### The Problem
 
@@ -208,7 +208,7 @@ function generateRemappedBufferViewClass(
 - `view.getColumnIfAllocated('_debug')` → mapping returns `null` → returns `undefined`
 - Library can write `tag._debug(...)` but it never appears in Arrow output
 
-## Op's Responsibility: Buffer Creation and Registration
+## Op's Responsibility: Buffer Creation and Registration <a id="smoo/lmao!n/library-integration-op-buffer"></a>
 
 **Critical Design Point**: The **Op's internal wrapper** (not `span()`) is responsible for buffer creation and
 registration. `span()` just invokes the op and passes metadata (name, line number).
@@ -277,7 +277,7 @@ It does **NOT**:
 - Register \_children
 - Handle exceptions
 
-## Library Definition with defineOpContext
+## Library Definition with defineOpContext <a id="smoo/lmao!n/library-integration-define"></a>
 
 Libraries use `defineOpContext()` to define their schema and ops:
 
@@ -294,7 +294,7 @@ const httpSchema = defineLogSchema({
 });
 
 // Create op context for this library
-const { defineOp, defineOps, createTrace, logSchema, flags } = defineOpContext({
+const { defineOp, defineOps, logSchema, flags } = defineOpContext({
   logSchema: httpSchema,
   deps: {
     retry: retryOps, // Declare dependency (wiring happens at app level)
@@ -334,7 +334,7 @@ const post = defineOp('post', async (ctx, url: string, body: unknown) => {
 export const httpOps = defineOps({ get, post, put, delete: del });
 ```
 
-## Application Composition
+## Application Composition <a id="smoo/lmao!n/library-integration-app-composition"></a>
 
 Applications wire libraries with column mapping using the fluent API:
 
@@ -353,7 +353,7 @@ const appSchema = defineLogSchema({
 });
 
 // Wire dependencies with column mapping
-const { defineOp, defineOps, createTrace, logSchema, flags } = defineOpContext({
+const { defineOp, defineOps, logSchema, flags } = defineOpContext({
   logSchema: appSchema,
   deps: {
     // Simple prefixing
@@ -396,7 +396,7 @@ export default {
 };
 ```
 
-## Shared Columns Across Libraries
+## Shared Columns Across Libraries <a id="smoo/lmao!n/library-integration-shared-columns"></a>
 
 Multiple libraries can write to the same column when they have semantically similar data:
 
@@ -433,7 +433,7 @@ WHERE entry_type = 'span-ok'
   AND query IS NOT NULL;
 ```
 
-## Type Safety: Collision Detection
+## Type Safety: Collision Detection <a id="smoo/lmao!n/library-integration-collision"></a>
 
 The pattern provides compile-time collision detection:
 
@@ -463,7 +463,7 @@ deps: {
 }
 ```
 
-## Performance Benefits
+## Performance Benefits <a id="smoo/lmao!n/library-integration-performance"></a>
 
 ### Cold Path vs Hot Path Optimization
 
@@ -544,7 +544,7 @@ walkSpanTree(rootBuffer, (buffer) => {
 });
 ```
 
-## Arrow Table Output
+## Arrow Table Output <a id="smoo/lmao!n/library-integration-arrow-output"></a>
 
 The final Arrow table has clean, collision-free columns:
 

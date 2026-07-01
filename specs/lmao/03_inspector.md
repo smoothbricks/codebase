@@ -1,6 +1,6 @@
-# LMAO Inspector
+# LMAO Inspector <a id="smoo/lmao!n/inspector"></a>
 
-## Overview
+## Overview <a id="smoo/lmao!n/inspector.overview"></a>
 
 `packages/lmao-inspector` is a standalone trace viewer package built with Tamagui. It provides components for searching,
 streaming, and visualizing LMAO traces with client-side Arrow processing. Designed for embedding in any Expo app (web or
@@ -10,7 +10,7 @@ The inspector complements the server-side DuckDB query engine (`02_query_engine.
 instead of Lambda + S3 queries, the inspector streams or downloads Arrow RecordBatches directly to the browser and
 processes them client-side.
 
-## Architecture
+## Architecture <a id="smoo/lmao!n/inspector.architecture"></a>
 
 ```
                     ┌─────────────────────────────┐
@@ -27,9 +27,9 @@ processes them client-side.
   Server streams raw Arrow/Parquet — no server-side query API needed.
 ```
 
-## Sources
+## Sources <a id="smoo/lmao!n/inspector.sources"></a>
 
-### Live Stream Source
+### Live Stream Source <a id="smoo/lmao!n/inspector-stream-source"></a>
 
 Connects to a MessageRelay Durable Object (see `extern/graphql/src/message-relay.ts`) via WebSocket. The relay pattern:
 
@@ -43,7 +43,7 @@ publishes. This is the existing MessageRelay pattern, not a new infrastructure p
 
 For Bun backends: direct SSE endpoint that pushes RecordBatches as they arrive (no DO relay needed).
 
-### Archive Source
+### Archive Source <a id="smoo/lmao!n/inspector-archive-source"></a>
 
 Fetches historical Arrow IPC or Parquet files from object storage (R2, S3) by time range. Used for:
 
@@ -52,7 +52,7 @@ Fetches historical Arrow IPC or Parquet files from object storage (R2, S3) by ti
 
 Archive files follow the existing LMAO flush path: `{prefix}/{date}/{batch-id}.arrow`
 
-## Arrow Query Engine
+## Arrow Query Engine <a id="smoo/lmao!n/inspector-query-engine"></a>
 
 Client-side engine that processes Arrow RecordBatches in the browser. Candidates (research spike needed):
 
@@ -70,12 +70,12 @@ The engine must handle the LMAO column schema including `S.unknown()` Binary col
 the `msgpack_extract()` extension from `02_query_engine.md` applies here too — either as a WASM extension or with
 client-side msgpack deserialization before query.
 
-## Components
+## Components <a id="smoo/lmao!n/inspector-components"></a>
 
 All components are Tamagui-based (cross-platform). The Arrow query engine is web-only — on native, components show a
 simplified list view without client-side SQL.
 
-### TraceViewer
+### TraceViewer <a id="smoo/lmao!n/inspector-components.trace-viewer"></a>
 
 Top-level composed component. Accepts a `TraceSource` (live stream or archive) and renders the trace UI.
 
@@ -86,12 +86,12 @@ Top-level composed component. Accepts a `TraceSource` (live stream or archive) a
 />
 ```
 
-### TraceTimeline
+### TraceTimeline <a id="smoo/lmao!n/inspector-components.trace-timeline"></a>
 
 Span timeline visualization. Shows parent/child span relationships, timing, and duration. Clicking a span opens
 SpanDetail.
 
-### SpanDetail
+### SpanDetail <a id="smoo/lmao!n/inspector-components.span-detail"></a>
 
 Individual span attributes, timing breakdown, log entries, and links. Displays:
 
@@ -99,7 +99,7 @@ Individual span attributes, timing breakdown, log entries, and links. Displays:
 - All tagged attributes (from `ctx.tag.*`)
 - Log entries (from `ctx.log.*`)
 
-### LogSearch
+### LogSearch <a id="smoo/lmao!n/inspector-components.log-search"></a>
 
 Full-text search + attribute filtering over the Arrow data. Queries run client-side via the Arrow query engine.
 Supports:
@@ -109,23 +109,22 @@ Supports:
 - Severity/entry type filtering
 - msgpack payload field queries (via `msgpack_extract` or client-side deserialization)
 
-## Data Model
+## Data Model <a id="smoo/lmao!n/inspector.data-model"></a>
 
 The inspector queries LMAO's Arrow column schema (`01f_arrow_table_structure.md`):
 
-| Column         | Type      | Usage in Inspector                                   |
-| -------------- | --------- | ---------------------------------------------------- |
-| span_id        | category  | Individual span identity                             |
-| parent_span_id | category  | Build span tree for timeline view                    |
-| message        | text      | Primary display text, full-text search target        |
-| entry_type     | enum      | Filter by span/info/warn/error                       |
-| timestamp      | number    | Timeline positioning, time range filtering           |
-| duration       | number    | Span duration display, performance analysis          |
-| package_name   | category  | Filter by source package                             |
-| \*             | S.unknown | Queryable via msgpack extraction                     |
+| Column         | Type      | Usage in Inspector                            |
+| -------------- | --------- | --------------------------------------------- |
+| span_id        | category  | Individual span identity                      |
+| parent_span_id | category  | Build span tree for timeline view             |
+| message        | text      | Primary display text, full-text search target |
+| entry_type     | enum      | Filter by span/info/warn/error                |
+| timestamp      | number    | Timeline positioning, time range filtering    |
+| duration       | number    | Span duration display, performance analysis   |
+| package_name   | category  | Filter by source package                      |
+| \*             | S.unknown | Queryable via msgpack extraction              |
 
-
-## Public API
+## Public API <a id="smoo/lmao!n/inspector-public-api"></a>
 
 ```typescript
 // Sources
@@ -143,7 +142,7 @@ export function LogSearch(props: LogSearchProps): JSX.Element;
 export function createQueryEngine(): Promise<ArrowQueryEngine>;
 ```
 
-## Related
+## Related <a id="smoo/lmao!n/inspector.related"></a>
 
 - `02_query_engine.md` — Server-side DuckDB query engine (Lambda + S3)
 - `01f_arrow_table_structure.md` — Arrow column schema

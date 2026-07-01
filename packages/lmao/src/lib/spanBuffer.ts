@@ -122,6 +122,7 @@ export const SpanBufferTestUtils = {
  *
  * traceRoot is ALWAYS provided - factories extract it from parent when needed.
  */
+//#region smoo/lmao!n/spanbuffer-layout.class-signature
 export interface SpanBufferConstructor<T extends LogSchema = LogSchema> {
   new (
     capacity: number,
@@ -137,6 +138,7 @@ export interface SpanBufferConstructor<T extends LogSchema = LogSchema> {
   readonly schema: T;
   readonly stats: SpanBufferStats;
 }
+//#endregion smoo/lmao!n/spanbuffer-layout.class-signature
 
 type GeneratedSpanBufferClass<T extends LogSchema> = new (
   capacity: number,
@@ -214,6 +216,7 @@ const spanBufferClassCache = new WeakMap<LogSchema, SpanBufferConstructor>();
  * @param schema - LogSchema defining the buffer structure
  * @returns SpanBufferConstructor with static schema and stats properties
  */
+//#region smoo/lmao!n/spanbuffer-layout.constructor
 export function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferConstructor<T> {
   const cached = spanBufferClassCache.get(schema);
   if (isSpanBufferConstructorForSchema(cached, schema)) {
@@ -439,6 +442,7 @@ export function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferCo
 
   return SpanBufferClass;
 }
+//#endregion smoo/lmao!n/spanbuffer-layout.constructor
 
 // ============================================================================
 // SpanBuffer factory functions
@@ -458,6 +462,7 @@ export function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferCo
  */
 const MIN_CAPACITY = 8;
 
+//#region smoo/lmao!n/spanbuffer-layout.create-root
 export function createSpanBuffer<T extends LogSchema>(
   schema: T,
   traceRoot: ITraceRoot,
@@ -485,6 +490,7 @@ export function createSpanBuffer<T extends LogSchema>(
     traceRoot, // pre-built TraceRoot with trace_id, anchors, tracer
   );
 }
+//#endregion smoo/lmao!n/spanbuffer-layout.create-root
 
 /**
  * Creates a continuation buffer when the current buffer overflows.
@@ -496,6 +502,7 @@ export function createSpanBuffer<T extends LogSchema>(
  *
  * @returns New SpanBuffer linked via `buffer._overflow`, with same schema type
  */
+//#region smoo/lmao!n/spanbuffer-layout.create-overflow
 export function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>): SpanBuffer<T> {
   const SpanBufferClass = getSpanBufferConstructorForBuffer(buffer);
   const stats = SpanBufferClass.stats;
@@ -520,6 +527,7 @@ export function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>)
 
   return nextBuffer;
 }
+//#endregion smoo/lmao!n/spanbuffer-layout.create-overflow
 
 /**
  * Creates a child span buffer with parent linkage.
@@ -537,6 +545,7 @@ export function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>)
  *
  * @returns New SpanBuffer linked to parent
  */
+//#region smoo/lmao!n/spanbuffer-layout.create-child
 export function createChildSpanBuffer<T extends LogSchema>(
   parentBuffer: AnySpanBuffer,
   SpanBufferClass: SpanBufferConstructor<T>,
@@ -563,6 +572,7 @@ export function createChildSpanBuffer<T extends LogSchema>(
 
   return childBuffer;
 }
+//#endregion smoo/lmao!n/spanbuffer-layout.create-child
 
 // ============================================================================
 // Constants for Arrow conversion

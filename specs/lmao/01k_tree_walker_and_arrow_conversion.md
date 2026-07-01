@@ -1,6 +1,6 @@
-# Tree Walker and Arrow Conversion
+# Tree Walker and Arrow Conversion <a id="smoo/lmao!n/arrow-tree-walker"></a>
 
-## Overview
+## Overview <a id="smoo/lmao!n/arrow-tree-walker.overview"></a>
 
 This specification defines the **two-pass tree conversion** approach for converting SpanBuffer trees to Apache Arrow
 tables. The approach is designed for:
@@ -10,9 +10,9 @@ tables. The approach is designed for:
 - **UTF-8 caching**: Encode once, copy on reuse for repeated strings
 - **Shared dictionaries**: All RecordBatches reference the same dictionary vectors
 
-## Problem Statement
+## Problem Statement <a id="smoo/lmao!n/arrow-tree-walker.problem"></a>
 
-### The Challenge
+### The Challenge <a id="smoo/lmao!n/arrow-tree-walker.problem-challenge"></a>
 
 **SpanBuffers form a tree structure** (spans have children), and arrow-builder shouldn't know about span trees (that's
 lmao's concept). When converting to Arrow:
@@ -21,16 +21,16 @@ lmao's concept). When converting to Arrow:
 2. **RecordBatch creation needs dictionaries**: Can't create batches until dictionaries are finalized
 3. **Memory efficiency is critical**: Avoid collecting buffers into intermediate arrays
 
-### Design Goals
+### Design Goals <a id="smoo/lmao!n/arrow-tree-walker.problem-goals"></a>
 
 1. **No intermediate buffer collection**: Walk the tree twice instead of collecting into an array
 2. **Exact-size allocations**: Know total bytes/rows before allocating
 3. **UTF-8 optimization**: Cache encodings for repeated strings, use `encodeInto()` for unique ones
 4. **Single dictionary per column**: All RecordBatches share the same dictionary vectors
 
-## Solution: Two-Pass Tree Conversion
+## Solution: Two-Pass Tree Conversion <a id="smoo/lmao!n/arrow-tree-walker-two-pass"></a>
 
-### Architecture Overview
+### Architecture Overview <a id="smoo/lmao!n/arrow-tree-walker-two-pass.architecture"></a>
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -99,7 +99,7 @@ lmao's concept). When converting to Arrow:
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Pass 1: Build Dictionaries
+### Pass 1: Build Dictionaries <a id="smoo/lmao!n/arrow-tree-walker-two-pass.pass1"></a>
 
 Walk the tree with a simple recursive function. For each buffer encountered:
 
@@ -229,7 +229,7 @@ class ColumnDictionary {
 }
 ```
 
-### Finalize Dictionaries
+### Finalize Dictionaries <a id="smoo/lmao!n/arrow-tree-walker-two-pass.finalize"></a>
 
 After Pass 1, finalize each dictionary with exact-size allocations:
 
@@ -307,7 +307,7 @@ function finalizeDictionary(dict: ColumnDictionary, utf8Cache: Utf8Cache): Final
 }
 ```
 
-### Pass 2: Convert Buffers to RecordBatches
+### Pass 2: Convert Buffers to RecordBatches <a id="smoo/lmao!n/arrow-tree-walker-single-batch"></a>
 
 Walk the tree again, converting each buffer to a RecordBatch using the shared dictionaries:
 
@@ -376,7 +376,7 @@ function convertBufferToRecordBatch(
 }
 ```
 
-### Tree Walking: Simple Recursive Function
+### Tree Walking: Simple Recursive Function <a id="smoo/lmao!n/arrow-tree-walker-walk"></a>
 
 The tree walking is a simple recursive function - no intermediate buffer collection:
 
@@ -498,9 +498,9 @@ function convertSpanTreeToArrowTable(
 }
 ```
 
-## Why This Approach?
+## Why This Approach? <a id="smoo/lmao!n/arrow-tree-walker.rationale"></a>
 
-### 1. No Intermediate Buffer Collection
+### 1. No Intermediate Buffer Collection <a id="smoo/lmao!n/arrow-tree-walker.rationale-no-collect"></a>
 
 **Problem**: Collecting all buffers into an array before processing wastes memory and adds allocation overhead.
 
@@ -510,7 +510,7 @@ visitor callback changes.
 **Benefit**: Zero intermediate array allocation. Only the data structures we actually need (dictionaries,
 RecordBatches).
 
-### 2. Exact-Size Allocations
+### 2. Exact-Size Allocations <a id="smoo/lmao!n/arrow-tree-walker.rationale-exact-size"></a>
 
 **Problem**: Growing arrays/buffers during construction causes repeated reallocations and copies.
 
@@ -522,7 +522,7 @@ RecordBatches).
 
 **Benefit**: Optimal memory usage, no GC pressure from intermediate allocations.
 
-### 3. UTF-8 Caching Strategy
+### 3. UTF-8 Caching Strategy <a id="smoo/lmao!n/arrow-tree-walker.utf8-cache"></a>
 
 **Problem**: `TextEncoder.encode()` allocates a new Uint8Array for every call. For repeated strings, this is wasteful.
 
@@ -540,7 +540,7 @@ RecordBatches).
 - Most strings in logging are repeated (module names, span names, etc.)
 - Cache persists across conversions: module/span names encoded once across entire application lifetime
 
-### 4. V8's Native Sort Beats Manual Insertion
+### 4. V8's Native Sort Beats Manual Insertion <a id="smoo/lmao!n/arrow-tree-walker-sort"></a>
 
 **Problem**: Sorted dictionary values enable binary search and better compression.
 
@@ -552,7 +552,7 @@ RecordBatches).
 - V8's Timsort is O(n log n) for the whole array
 - For 1000 unique strings: sorted insertion = 500,000 operations, Timsort ≈ 10,000 operations
 
-### 5. Chunk Copies for TypedArrays
+### 5. Chunk Copies for TypedArrays <a id="smoo/lmao!n/arrow-tree-walker.rationale-chunk-copy"></a>
 
 **Problem**: Row-by-row copying is slow due to function call overhead and poor cache utilization.
 
@@ -564,7 +564,7 @@ output.set(buffer.col.subarray(0, writeIndex), offset);
 
 **Benefit**: V8/Bun optimize this to `memcpy` - orders of magnitude faster than row iteration.
 
-### 6. Shared Dictionary Vectors
+### 6. Shared Dictionary Vectors <a id="smoo/lmao!n/arrow-tree-walker-single-batch.shared-dicts"></a>
 
 **Problem**: Each RecordBatch having its own dictionary wastes memory and breaks DuckDB/ClickHouse optimizations.
 
@@ -576,9 +576,9 @@ output.set(buffer.col.subarray(0, writeIndex), offset);
 - Query engines can optimize dictionary comparisons
 - Arrow IPC format supports shared dictionaries
 
-## Tree Traversal Order
+## Tree Traversal Order <a id="smoo/lmao!n/arrow-tree-walker-walk.traversal"></a>
 
-### Depth-First Pre-Order
+### Depth-First Pre-Order <a id="smoo/lmao!n/arrow-tree-walker-walk.depth-first"></a>
 
 **Definition**: Visit parent before its children, then recursively visit children left-to-right.
 
@@ -593,7 +593,7 @@ Example trace tree:
 Traversal order: span1 → span2 → span4 → span5 → span3
 ```
 
-### Why Depth-First Pre-Order?
+### Why Depth-First Pre-Order? <a id="smoo/lmao!n/arrow-tree-walker-walk.depth-first-why"></a>
 
 1. **Trace reconstruction**: Parent spans appear before children → enables streaming reconstruction
 2. **Query efficiency**: Related spans (parent + children) co-located in Arrow table
@@ -601,7 +601,7 @@ Traversal order: span1 → span2 → span4 → span5 → span3
 4. **Natural ordering**: Matches execution order for most synchronous code paths
 5. **Memory locality**: Children immediately follow parents → cache-friendly queries
 
-### Buffer Overflow Chain Handling
+### Buffer Overflow Chain Handling <a id="smoo/lmao!n/arrow-tree-walker-walk.overflow"></a>
 
 Multiple buffers can share the same `span_id` due to buffer overflow:
 
@@ -625,7 +625,7 @@ Traversal with overflow:
 
 This ensures all entries for a span are contiguous in the Arrow table.
 
-### Library Integration: RemappedBufferView
+### Library Integration: RemappedBufferView <a id="smoo/lmao!n/arrow-tree-walker.remapped-view"></a>
 
 When libraries use prefixed schemas (see [Library Integration Pattern](./01e_library_integration_pattern.md)), the tree
 may contain **RemappedBufferView** objects instead of raw SpanBuffers:
@@ -694,7 +694,7 @@ App Root → RemappedBufferView(HTTP) → RemappedBufferView(Auth) → Auth Buff
            http_status → status       auth_token → token
 ```
 
-### Op's Responsibility: Buffer Registration
+### Op's Responsibility: Buffer Registration <a id="smoo/lmao!n/arrow-tree-walker.op-registration"></a>
 
 SpanBuffer constructors do **not** auto-register with parent's `_children[]` array. The **Op's wrapper** handles
 registration explicitly:
@@ -732,13 +732,13 @@ async invoke(parentCtx, spanName, line, ...args) {
 | `span()` inline child | Delegates to op wrapper            |
 | Library `.use()` impl | Op wrapper with RemappedBufferView |
 
-## Multiple Root Buffers → Single RecordBatch
+## Multiple Root Buffers → Single RecordBatch <a id="smoo/lmao!n/arrow-tree-walker-single-batch.multi-root"></a>
 
 **Key Design Decision**: Multiple root buffers (e.g., multiple HTTP requests) are converted into a **single
 RecordBatch** rather than multiple RecordBatches. This maximizes dictionary reuse - all buffers share the same
 dictionary vectors.
 
-### Schema Requirement
+### Schema Requirement <a id="smoo/lmao!n/arrow-tree-walker-single-batch.schema-req"></a>
 
 **All buffers in a flush must share the same schema.** This is enforced because:
 
@@ -765,14 +765,14 @@ dictionary vectors.
 3. **Runtime Enforcement**: The conversion function validates that all root buffers share the same schema, throwing an
    error if they differ.
 
-### Benefits of Single RecordBatch
+### Benefits of Single RecordBatch <a id="smoo/lmao!n/arrow-tree-walker-single-batch.benefits"></a>
 
 - **Maximum Dictionary Reuse**: All buffers share the same dictionary vectors, reducing memory
 - **Better Query Performance**: Query engines can optimize dictionary lookups across all data
 - **Simpler Implementation**: No need to union schemas or handle missing columns
 - **Efficient Flushing**: One RecordBatch per flush cycle, matching the flush scheduler's design
 
-### Single Buffer Conversion
+### Single Buffer Conversion <a id="smoo/lmao!n/arrow-tree-walker-single-batch.single-buffer"></a>
 
 For simple cases (single buffer, no tree), use `convertToRecordBatch`:
 
@@ -802,9 +802,9 @@ function convertToRecordBatch(
 
 This is the building block used by `convertBuffersToRecordBatch` in Pass 2.
 
-## Package Separation
+## Package Separation <a id="smoo/lmao!n/arrow-tree-walker-package-separation"></a>
 
-### What Lives Where
+### What Lives Where <a id="smoo/lmao!n/arrow-tree-walker-package-separation.what-lives-where"></a>
 
 | Responsibility              | Package       | Why                                                    |
 | --------------------------- | ------------- | ------------------------------------------------------ |
@@ -816,7 +816,7 @@ This is the building block used by `convertBuffersToRecordBatch` in Pass 2.
 | ColumnBuffer interface      | arrow-builder | Generic buffer type with writeIndex                    |
 | arrow.makeData() usage      | lmao          | Arrow library import, uses arrow-builder's TypedArrays |
 
-### Key Principle
+### Key Principle <a id="smoo/lmao!n/arrow-tree-walker-package-separation.key-principle"></a>
 
 **arrow-builder doesn't know about trees**. It provides:
 
@@ -830,9 +830,9 @@ This is the building block used by `convertBuffersToRecordBatch` in Pass 2.
 - `ColumnDictionary` class
 - `convertSpanTreeToArrowTable()` orchestration
 
-## Performance Characteristics
+## Performance Characteristics <a id="smoo/lmao!n/arrow-tree-walker.perf"></a>
 
-### Memory Allocation Profile
+### Memory Allocation Profile <a id="smoo/lmao!n/arrow-tree-walker.perf-memory"></a>
 
 | Phase               | Allocations                                  | Size                            |
 | ------------------- | -------------------------------------------- | ------------------------------- |
@@ -841,14 +841,14 @@ This is the building block used by `convertBuffersToRecordBatch` in Pass 2.
 | Pass 2 tree walk    | RecordBatch per buffer                       | O(buffers)                      |
 | Final Table         | One Table wrapping batches                   | Minimal overhead                |
 
-### UTF-8 Encoding Cost
+### UTF-8 Encoding Cost <a id="smoo/lmao!n/arrow-tree-walker.perf-utf8-cost"></a>
 
 | String Frequency | First Occurrence                                  | Subsequent Occurrences       |
 | ---------------- | ------------------------------------------------- | ---------------------------- |
 | Once             | utf8ByteLength (no alloc) → encodeInto (no alloc) | N/A                          |
 | Twice+           | utf8ByteLength (no alloc)                         | encode() cached → set() copy |
 
-### Comparison to Naive Approach
+### Comparison to Naive Approach <a id="smoo/lmao!n/arrow-tree-walker.perf-naive"></a>
 
 | Aspect                | Naive (collect buffers)     | Two-Pass                                    |
 | --------------------- | --------------------------- | ------------------------------------------- |
@@ -857,9 +857,9 @@ This is the building block used by `convertBuffersToRecordBatch` in Pass 2.
 | UTF-8 encoding        | encode() for every string   | encodeInto() for unique, cache for repeated |
 | Sorted dictionary     | Sort after collection       | Sort once after counting                    |
 
-## Integration Points
+## Integration Points <a id="smoo/lmao!n/arrow-tree-walker.integration"></a>
 
-### Buffer Access Patterns for Conversion
+### Buffer Access Patterns for Conversion <a id="smoo/lmao!n/arrow-tree-walker.integration-access"></a>
 
 When converting SpanBuffers to Arrow, use these patterns for efficient access:
 
@@ -891,7 +891,7 @@ if (values) {
 - Null bitmap transformation
 - String dictionary building from `string[]` arrays
 
-### Related Specifications
+### Related Specifications <a id="smoo/lmao!n/arrow-tree-walker.integration-related"></a>
 
 This specification integrates with:
 
@@ -901,7 +901,7 @@ This specification integrates with:
 - **[Entry Types and Logging Primitives](./01h_entry_types_and_logging_primitives.md)**: Entry type enum and operations
 - **[Trace Schema System](./01a_trace_schema_system.md)**: Schema definition and type system
 
-## References
+## References <a id="smoo/lmao!n/arrow-tree-walker.references"></a>
 
 - **Implementation**: `/packages/lmao/src/lib/convertToArrow.ts`
 - **Buffer types**: `/packages/arrow-builder/src/lib/buffer/types.ts`

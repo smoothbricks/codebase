@@ -1,4 +1,4 @@
-# Op Context Pattern
+# Op Context Pattern <a id="smoo/lmao!n/op-context-pattern"></a>
 
 > **Status**: This spec REPLACES `01l_module_builder_pattern.md` which should be DELETED.
 
@@ -77,7 +77,7 @@ export default {
 
 ## Core Concepts
 
-### What defineOpContext Returns
+### What defineOpContext Returns <a id="smoo/lmao!n/op-context-define-returns"></a>
 
 `defineOpContext()` returns an `OpContextFactory` which extends `OpContextBinding`:
 
@@ -116,7 +116,7 @@ const { trace } = new TestTracer(opContext);
 The phantom type `[opContextType]` enables TypeScript to infer the full context type from the factory, so
 `new TestTracer(opContext)` has fully typed `trace()` methods.
 
-### Context Properties (`ctx`) - Runtime Context
+### Context Properties (`ctx`) - Runtime Context <a id="smoo/lmao!n/op-context-ctx-props"></a>
 
 **IMPORTANT**: `ctx` properties are **runtime context** (environment, config, services). They are NOT stored in Arrow
 columns. For column data, use `setScope()` or `tag`.
@@ -151,7 +151,7 @@ ctx: {
 - **Optional**: User ID after auth (may not be known yet), optional features
 - **Default**: Configuration with sensible defaults
 
-### Scope vs Context Properties
+### Scope vs Context Properties <a id="smoo/lmao!n/op-context-scope-vs-ctx"></a>
 
 **Two DIFFERENT concepts that serve DIFFERENT purposes:**
 
@@ -186,7 +186,7 @@ await ctx.span('child', async (child) => {
 - **setScope**: For column data that should appear on EVERY row in the span (request_id, correlation_id, tenant_id)
 - **tag**: For column data on a SPECIFIC row (row 0 typically)
 
-### Dependencies with Column Mapping
+### Dependencies with Column Mapping <a id="smoo/lmao!n/column-mapping-api"></a>
 
 Libraries don't know how they'll be wired. App controls column naming:
 
@@ -209,7 +209,7 @@ deps: {
 
 The **effective schema** = `appSchema & http_* & pg_* & mysql_* & query`.
 
-### Feature Flag Evaluator
+### Feature Flag Evaluator <a id="smoo/lmao!n/op-context-flag-evaluator"></a>
 
 Ctx-first pattern. Receives SpanContext without `ff` (prevents recursion):
 
@@ -226,7 +226,7 @@ flagEvaluator: async (ctx, flag, defaultValue) => {
 };
 ```
 
-### SpanContext API
+### SpanContext API <a id="smoo/lmao!n/op-context-spancontext-api"></a>
 
 Inside an Op, `ctx` provides:
 
@@ -277,7 +277,7 @@ async (ctx, ...args) => {
 };
 ```
 
-## Result Types
+## Result Types <a id="smoo/lmao!n/op-context-result-types"></a>
 
 LMAO provides two result patterns:
 
@@ -325,7 +325,7 @@ const matched = result.match({
 });
 ```
 
-### Tagged Errors
+### Tagged Errors <a id="smoo/lmao!n/op-context-tagged-errors"></a>
 
 Tagged errors implement `TaggedError<Tag>` for use with `Result.isErr(Tag)`:
 
@@ -353,7 +353,6 @@ if (result.isErr(NotFound)) {
 
 **Built-in Tagged Errors (tree-shakable):**
 
-
 ```typescript
 import { Blocked, RetriesExhausted } from '@smoothbricks/lmao';
 
@@ -369,7 +368,7 @@ if (result.isErr(RetriesExhausted)) {
 }
 ```
 
-### Fluent Builders (ctx.ok / ctx.err)
+### Fluent Builders (ctx.ok / ctx.err) <a id="smoo/lmao!n/op-context-fluent-builders"></a>
 
 `ctx.ok()` and `ctx.err()` return fluent builders that write to buffer row 1:
 
@@ -392,7 +391,7 @@ return ctx
 | `.message(text)` | Set message column                    |
 | `.line(n)`       | Set source line number                |
 
-### Entry Type Detection
+### Entry Type Detection <a id="smoo/lmao!n/op-context-entry-detection"></a>
 
 The Tracer detects if a function returns `FluentOk` or `FluentErr`:
 
@@ -408,7 +407,7 @@ The Tracer detects if a function returns `FluentOk` or `FluentErr`:
 - `span-err` means expected failure represented as a value; `span-exception` means an unexpected thrown exception.
 - Do not use `throw` to signal known retry behavior; retry decisions should flow through typed error values.
 
-### Defining Ops
+### Defining Ops <a id="smoo/lmao!n/op-context-defining-ops"></a>
 
 **Single op:**
 
@@ -438,7 +437,7 @@ export const myOps = defineOps({ ... });
 // Consumer: myOps.prefix('my') or myOps.mapColumns({ ... })
 ```
 
-## Tracer Architecture
+## Tracer Architecture <a id="smoo/lmao!n/tracer-architecture"></a>
 
 The Tracer is an abstract base class that manages trace execution and lifecycle. Concrete implementations define how
 trace data is collected, batched, and processed.
@@ -482,7 +481,7 @@ All hooks receive the `SpanBuffer` as their argument, providing access to:
 - `trace_fn()` - Monomorphic function execution (transformer optimization)
 - `flush()` - Optional flush method (default no-op, override for batching)
 
-### Concrete Implementations
+### Concrete Implementations <a id="smoo/lmao!n/tracer-implementations"></a>
 
 | Tracer             | Purpose                                           | Key Features                                           |
 | ------------------ | ------------------------------------------------- | ------------------------------------------------------ |
@@ -540,7 +539,7 @@ for (const buf of batch) {
 }
 ```
 
-### trace() Method Signatures
+### trace() Method Signatures <a id="smoo/lmao!n/tracer-architecture.trace-overloads"></a>
 
 The `trace()` method has 8 overloads supporting various combinations:
 
@@ -685,7 +684,6 @@ object arg:
 - preferred Op signatures: `(ctx)` or `(ctx, argObject)`
 - avoid multi-positional args for JSON invoke transports
 
-
 ### Library Package
 
 ```typescript
@@ -748,7 +746,7 @@ const { defineOp } = defineOpContext({
 });
 ```
 
-## Reserved Names
+## Reserved Names <a id="smoo/lmao!n/op-context-reserved-names"></a>
 
 Cannot use in `ctx`:
 
@@ -781,7 +779,7 @@ The `null as T` / `undefined as T | undefined` patterns ensure:
 - TypeScript correctly infers required vs optional at `trace()`
 - Generated SpanContext class has stable hidden class
 
-## Metadata Injection (Transformer)
+## Metadata Injection (Transformer) <a id="smoo/lmao!n/metadata-injection"></a>
 
 The TypeScript transformer injects metadata at the `defineOpContext` call site:
 
@@ -806,7 +804,7 @@ This metadata flows to all Ops created from this context, enabling:
 - Source file tracking
 - Git SHA for deployment correlation
 
-## Retry Handling
+## Retry Handling <a id="smoo/lmao!n/op-retry"></a>
 
 Ops support automatic retry for transient failures. Retry policy is embedded in the error itself via
 `TransientError.policy`.

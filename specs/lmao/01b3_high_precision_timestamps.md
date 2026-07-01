@@ -1,4 +1,4 @@
-# High-Precision Timestamp System
+# High-Precision Timestamp System <a id="smoo/lmao!n/trace-root-timestamps"></a>
 
 > **Part of [Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**
 >
@@ -216,7 +216,7 @@ interface TraceRoot {
 - Simpler serialization if context needs to cross boundaries
 - Matches the "flat deferred structure" design principle
 
-## Platform-Specific Entry Points
+## Platform-Specific Entry Points <a id="smoo/lmao!n/trace-root-timestamps.entry-points"></a>
 
 The package provides separate entry points for optimal tree-shaking and platform-specific timestamp implementations:
 

@@ -7,6 +7,7 @@ export interface PartitionSplit<T> {
   readonly rows: readonly T[];
 }
 
+//#region smoo/lmao!n/trace-archive-partition-inspect.inspect
 export function inspectPartitionCardinality<T>(
   rows: readonly T[],
   partitionOf: (row: T) => string | null | undefined,
@@ -29,7 +30,9 @@ export function inspectPartitionCardinality<T>(
 
   return partitions.size === 1 ? 'single' : 'unknown';
 }
+//#endregion smoo/lmao!n/trace-archive-partition-inspect.inspect
 
+//#region smoo/lmao!n/trace-archive-partition-split.split
 export function splitChunkByPartition<T>(
   rows: readonly T[],
   partitionOf: (row: T) => string | null | undefined,
@@ -68,3 +71,4 @@ export function splitChunkByPartition<T>(
     };
   });
 }
+//#endregion smoo/lmao!n/trace-archive-partition-split.split

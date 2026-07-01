@@ -1,3 +1,4 @@
+//#region smoo/lmao!n/op-retry.transient
 /**
  * TransientError - typed transient error codes with embedded retry policy.
  *
@@ -166,3 +167,4 @@ function isRetryPolicyLike(value: unknown): value is Partial<RetryPolicy> {
 
 // Re-export policy helpers for convenience
 export { exponentialBackoff, fixedDelay, linearBackoff, mergePolicy, type RetryPolicy } from './retry-policy.js';
+//#endregion smoo/lmao!n/op-retry.transient

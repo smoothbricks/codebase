@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/cli",
-  "version": "0.4.4-next.0",
+  "version": "0.5.1-next.0",
   "type": "module",
   "description": "SmoothBricks monorepo automation CLI",
   "bin": {

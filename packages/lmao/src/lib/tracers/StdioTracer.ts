@@ -204,6 +204,7 @@ export interface StdioTracerOptions<
  * - Human-readable timestamps and durations
  * - Exceptions go to stderr
  */
+//#region smoo/lmao!n/tracer-implementations.stdio
 export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends Tracer<B> {
   /**
    * Per-trace indent levels for concurrent-safe nesting.
@@ -378,3 +379,4 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
     );
   }
 }
+//#endregion smoo/lmao!n/tracer-implementations.stdio
