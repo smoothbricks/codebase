@@ -60,7 +60,7 @@
   "workspaces": [
     "packages/*",
     "tooling",
-    "docs"
+    "lmao-docs"
   ],
   "nx": {
     "includedScripts": [],
