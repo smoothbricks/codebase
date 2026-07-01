@@ -79,6 +79,17 @@ const managedFiles: ManagedFile[] = [
     target: '.git-format-staged.yml',
   },
   {
+    kind: 'raw',
+    source: 'gitattributes',
+    target: '.gitattributes',
+  },
+  {
+    kind: 'raw',
+    source: 'tooling/direnv/merge-newer-pins.sh',
+    target: 'tooling/direnv/merge-newer-pins.sh',
+    executable: true,
+  },
+  {
     kind: 'generated',
     source: 'ci-workflow',
     target: '.github/workflows/ci.yml',

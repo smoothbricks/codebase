@@ -13,6 +13,16 @@ export async function applyWorkspaceGitConfig(root: string): Promise<void> {
   const tooling = join(root, 'tooling');
 
   await $`git config --local include.path ${join(tooling, 'workspace.gitconfig')}`.cwd(root);
+
+  // Keep the newer runtime version pins on any merge (nvfetcher overlay +
+  // devenv.lock) so a mirror sync's `git am --3way` never stalls on a version
+  // conflict. Mapped by the managed .gitattributes (merge=smoo-newer-pins);
+  // implemented in tooling/direnv/merge-newer-pins.sh. The next `devenv shell`
+  // regenerates package.json fields from the resulting runtime.
+  await $`git config --local merge.smoo-newer-pins.name ${'keep the newer devenv/nvfetcher runtime pins'}`.cwd(root);
+  await $`git config --local merge.smoo-newer-pins.driver ${'bash tooling/direnv/merge-newer-pins.sh %O %A %B %P'}`.cwd(
+    root,
+  );
   linkHook(gitDir, tooling, 'pre-commit');
   linkHook(gitDir, tooling, 'commit-msg');
 }
