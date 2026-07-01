@@ -17,7 +17,7 @@ export default defineConfig({
 			title: 'LMAO',
 			logo: { src: './src/assets/logo.svg', alt: 'LMAO' },
 			social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/smoothbricks/codebase' }],
-			editLink: { baseUrl: 'https://github.com/smoothbricks/codebase/edit/main/docs/' },
+			editLink: { baseUrl: 'https://github.com/smoothbricks/codebase/edit/main/lmao-docs/' },
 			lastUpdated: true,
 			customCss: ['./src/styles/custom.css'],
 			sidebar: [
