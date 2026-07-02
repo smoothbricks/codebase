@@ -22,3 +22,123 @@
   --sl-color-accent: #b45309;
   --sl-color-accent-high: #6b3a06;
 }
+
+/* =============================================================================
+ * Landing motion + depth
+ *
+ * Borrowed from Conloca (conloca.com): the same lightweight CSS keyframes and a
+ * soft accent glow for depth — but on LMAO's amber accent, not Conloca's cyan.
+ * Everything here is scoped to the splash home via `:has(.hero)` (the `.hero`
+ * element only renders on splash pages) and gated behind prefers-reduced-motion,
+ * so docs pages and reduced-motion users are unaffected.
+ * ========================================================================== */
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+
+@keyframes bounce {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-25%);
+  }
+}
+
+/* Depth: a soft amber glow behind the hero, plus a slate-deep backdrop in dark mode. */
+.hero {
+  position: relative;
+}
+
+.hero::before {
+  content: '';
+  position: absolute;
+  inset: -20% -15% 10%;
+  z-index: -1;
+  pointer-events: none;
+  background: radial-gradient(
+    55% 55% at 50% 0%,
+    color-mix(in oklch, var(--sl-color-accent) 14%, transparent),
+    transparent 70%
+  );
+}
+
+:root[data-theme='dark']:has(.hero) {
+  /* Deepen the splash backdrop toward a slate near-black (Conloca-style depth). */
+  --sl-color-bg: #0a0b10;
+}
+
+/* A blinking terminal cursor after the hero title — ties the landing to the
+ * StdioTracer/terminal aesthetic the amber accent already tells. */
+.hero h1::after {
+  content: '▋';
+  margin-inline-start: 0.08em;
+  color: var(--sl-color-accent);
+  font-weight: 400;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  /* Hero entrance — staggered slide-up. */
+  .hero .copy {
+    animation: slideUp 0.6s ease-out both;
+  }
+
+  .hero .actions {
+    animation: slideUp 0.6s ease-out 0.15s both;
+  }
+
+  .hero h1::after {
+    animation: blink 1s step-end infinite;
+  }
+
+  /* Card reveals — only on pages that have a hero (i.e. the splash home). */
+  :root:has(.hero) .card,
+  :root:has(.hero) .sl-link-card {
+    animation: slideUp 0.55s ease-out both;
+  }
+
+  :root:has(.hero) .card-grid > :nth-child(2) {
+    animation-delay: 0.08s;
+  }
+
+  :root:has(.hero) .card-grid > :nth-child(3) {
+    animation-delay: 0.16s;
+  }
+
+  :root:has(.hero) .card-grid > :nth-child(4) {
+    animation-delay: 0.24s;
+  }
+
+  /* Available for a scroll cue in a future TerminalHero. */
+  .animate-bounce {
+    animation: bounce 1.2s ease-in-out infinite;
+  }
+}
