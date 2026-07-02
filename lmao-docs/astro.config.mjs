@@ -1,7 +1,4 @@
-// Note: no `// @ts-check` here. Starlight 0.34 ships raw `.ts` source for its
-// `.` export, and under this repo's TypeScript 6 that source trips an internal
-// type error (utils/i18n.ts) that would otherwise surface against this file.
-// The config object is still validated by `defineConfig`/`starlight()` types.
+// @ts-check
 import starlight from '@astrojs/starlight';
 import { defineConfig } from 'astro/config';
 import starlightLinksValidator from 'starlight-links-validator';
@@ -21,11 +18,11 @@ export default defineConfig({
 			lastUpdated: true,
 			customCss: ['./src/styles/custom.css'],
 			sidebar: [
-				{ label: 'Start Here', autogenerate: { directory: 'start-here' } },
-				{ label: 'Tutorials', collapsed: true, autogenerate: { directory: 'tutorials' } },
-				{ label: 'How-to guides', collapsed: true, autogenerate: { directory: 'guides' } },
-				{ label: 'Concepts', collapsed: true, autogenerate: { directory: 'concepts' } },
-				{ label: 'Reference', collapsed: true, autogenerate: { directory: 'reference' } },
+				{ label: 'Start Here', items: [{ autogenerate: { directory: 'start-here' } }] },
+				{ label: 'Tutorials', collapsed: true, items: [{ autogenerate: { directory: 'tutorials' } }] },
+				{ label: 'How-to guides', collapsed: true, items: [{ autogenerate: { directory: 'guides' } }] },
+				{ label: 'Concepts', collapsed: true, items: [{ autogenerate: { directory: 'concepts' } }] },
+				{ label: 'Reference', collapsed: true, items: [{ autogenerate: { directory: 'reference' } }] },
 				{ label: 'Roadmap', link: '/roadmap/', badge: { text: 'Future', variant: 'caution' } },
 			],
 			plugins: [
