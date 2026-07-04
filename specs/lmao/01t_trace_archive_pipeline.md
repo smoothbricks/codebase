@@ -5,7 +5,8 @@
 This spec defines LMAO library primitives for trace archival data-plane operations.
 
 LMAO owns chunk construction, Arrow/Parquet conversion utilities, generic partition helpers, and deterministic
-per-consumer cursor state.
+per-consumer cursor state. The consuming system owns processor lifecycle, listener registration, fan-out decisions,
+routing-destination derivation, and control-plane policy.
 
 ## Ownership Boundary <a id="smoo/lmao!n/trace-archive-ownership"></a>
 
@@ -17,12 +18,14 @@ per-consumer cursor state.
 - Compaction primitives for time-windowed Arrow/Parquet outputs
 - Chunk statistics extraction helpers for downstream predicate pre-filtering
 
+### The Consuming System Owns (Out of Scope Here) <a id="smoo/lmao!n/trace-archive-ownership.consumer-owns"></a>
+
 - Archive catalog/state model and listener registration
-- Expression evaluation policy and wake strategy
-- Multi-destination signal fan-out decisions
+- Predicate evaluation policy and scheduling strategy
+- Multi-destination delivery fan-out decisions
 - Per-consumer cursor progression and replay policy
 
-LMAO primitives in this spec do not parse, compile, or evaluate `ax` expressions.
+LMAO primitives in this spec do not parse, compile, or evaluate consumer predicate expressions.
 
 ## Primitive 1: Chunk Envelope Construction <a id="smoo/lmao!n/trace-archive-envelope"></a>
 
@@ -54,6 +57,14 @@ interface TraceChunkBuilder {
 
 `chunk_id` must be deterministic from envelope content identity (not random per retry).
 
+> **Implementation status (shipped, leaner contract).** `packages/lmao/src/lib/archive/chunkEnvelope.ts` ships
+> `buildTraceChunkEnvelope(input)` — the deterministic `chunk_id` (FNV-1a over a stable-serialized canonical body) is
+> implemented as specified. The shipped envelope addresses an already-flushed chunk **by reference** (`file_ref` +
+> `chunk_ref`) rather than carrying inline `payload_bytes` / `codec` / `format`, and its time bounds are numeric
+> `started_at_ms` / `ended_at_ms` (not ISO `emitted_at` / `first_ts`). The inline-Arrow-payload envelope
+> (`payload_bytes` Arrow IPC, `codec`, `schema_hash`, `group_hints`) below is the future shape — staged as a `smoo/lmao`
+> node, not yet built.
+
 ## Primitive 2: Partition Shape Inspection <a id="smoo/lmao!n/trace-archive-partition-inspect"></a>
 
 ```typescript
@@ -70,8 +81,12 @@ interface ChunkPartitionInspector {
 }
 ```
 
-This primitive does not derive AxDomainGroup or destination AxId. It only reports whether rows are single-partition,
-mixed-partition, or unresolvable from provided columns.
+This primitive does not derive routing groups or delivery destinations for the consuming system. It only reports whether
+rows are single-partition, mixed-partition, or unresolvable from provided columns.
+
+> **Implementation status (shipped).** `packages/lmao/src/lib/archive/chunkRouting.ts:inspectPartitionCardinality`
+> reports `'single' | 'mixed' | 'unknown'` over rows + a `partitionOf` accessor, exactly as specified (an empty/missing
+> partition value yields `'unknown'`). It derives no routing destinations.
 
 ## Primitive 3: Partition Split Helper <a id="smoo/lmao!n/trace-archive-partition-split"></a>
 
@@ -94,6 +109,12 @@ interface ChunkPartitioner {
 ```
 
 Split output must be deterministic for the same input chunk and partition-column configuration.
+
+> **Implementation status (shipped, leaner contract).**
+> `packages/lmao/src/lib/archive/chunkRouting.ts:splitChunkByPartition` splits rows deterministically (sorted partition
+> keys) and emits, per partition, the row indexes, the materialized rows, and a stable string `selector`
+> (`group == "value"`). It returns the rows directly rather than a `row_bitmap` + `chunk_ref` indirection; the
+> compact-bitmap selector below is a future optimization, not yet built.
 
 ## Primitive 4: Compaction <a id="smoo/lmao!n/trace-archive-compaction"></a>
 
@@ -128,6 +149,13 @@ interface TraceChunkCompactor {
 
 Compaction must be append-only: source chunks remain immutable, output emits new chunk identity + lineage.
 
+> **Implementation status (shipped, identity-only).**
+> `packages/lmao/src/lib/archive/chunkCompaction.ts:compactTraceChunks` ships the append-only **identity + lineage**
+> half: a deterministic `compaction_id` and `source_set_hash` stable by `(window, sorted source_chunk_ids)`, plus
+> `total_rows`. It does **not** yet read source payloads, re-encode to Arrow/Parquet, or emit `payload_bytes` — i.e. it
+> computes the compaction manifest, not the compacted bytes. The payload-producing compaction (`targetFormat` →
+> `payload_bytes`) below is staged as a `smoo/lmao` node, not yet built.
+
 ## Primitive 5: Chunk Stats Extraction <a id="smoo/lmao!n/trace-archive-stats"></a>
 
 ```typescript
@@ -143,7 +171,12 @@ interface TraceChunkStats {
 }
 ```
 
-These stats are optional optimization primitives for downstream expression pre-filtering.
+These stats are optional optimization primitives for downstream predicate pre-filtering.
+
+> **Implementation status (shipped, chunk-level).** `packages/lmao/src/lib/archive/chunkStats.ts:extractChunkStats`
+> ships **chunk-level** rollups — `chunk_id`, `row_count`, `partition_count`, time bounds, and `duration_ms`. The
+> **per-column** min/max/null_count stats below (for predicate pre-filtering) are not yet built; they are staged as a
+> `smoo/lmao` node. Both are optional optimization primitives.
 
 ## Determinism and Retry Invariants <a id="smoo/lmao!n/trace-archive-determinism"></a>
 
@@ -154,12 +187,14 @@ These stats are optional optimization primitives for downstream expression pre-f
 
 ## Op Integration Pattern <a id="smoo/lmao!n/trace-archive-op-integration"></a>
 
-Example call chain:
+These primitives are designed to be called from the consuming system's archival jobs. Example call chain:
 
-1. Op receives queue envelope
-2. Op builds chunk via `TraceChunkBuilder`
-3. Op inspects/splits via `ChunkPartitionInspector` + `ChunkPartitioner`
-4. Op compacts via `TraceChunkCompactor` on schedule fan-out and cursor behavior
+1. Job receives queue envelope
+2. Job builds chunk via `TraceChunkBuilder`
+3. Job inspects/splits via `ChunkPartitionInspector` + `ChunkPartitioner`
+4. Job compacts via `TraceChunkCompactor` on schedule
+5. The consuming system's archive processor maps partition values to routing destinations using its route configuration
+   or predicate expressions, then decides fan-out and cursor behavior
 
 ## Related <a id="smoo/lmao!n/trace-archive.related"></a>
 

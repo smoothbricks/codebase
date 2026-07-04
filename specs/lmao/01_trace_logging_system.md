@@ -145,14 +145,17 @@ integration. It consists of these main components:
 
 - Uses `ctx.waitUntil(...)` for non-blocking trace chunk delivery.
 - Produces durable Arrow chunks for queue/object-storage aggregation.
+- **WHY**: Preserves Worker response latency while enabling high-volume trace aggregation downstream.
 
 ### 8. [Trace Archive Primitives](./01t_trace_archive_pipeline.md) <a id="smoo/lmao!n/lmao-trace-8-trace-archive-primitives01ttracearchivepipelinemd"></a>
 
 **Purpose**: Define library-level archive primitives for chunk identity, split helpers, and compaction.
 
 - Provides deterministic data-plane building blocks callable from archival Ops.
-- Keeps LMAO focused on trace/Arrow mechanics, not agent control-plane policy. registration, mixed-group routing policy,
-  and fan-out/cursor control-plane behavior.
+- Keeps LMAO focused on trace/Arrow mechanics, not agent control-plane policy.
+- Ownership split is explicit: LMAO owns chunk identity/split/compaction primitives; the consuming system's archive
+  agents own listener registration, mixed-group routing policy, and fan-out/cursor control-plane behavior.
+- **WHY**: Lets the consuming system's archival agents implement replay/fan-out semantics using stable LMAO primitives.
 
 ## Core Architecture Principles <a id="smoo/lmao!n/lmao-trace-core-architecture-principles"></a>
 

@@ -75,7 +75,10 @@ uuid: S.text(); // UUIDs are unique by definition
 **Purpose**: Define structured data that can be logged to spans with type safety and automatic masking.
 
 ```typescript
-// Define module with logSchema
+// Define a log schema, then wire it into an op context.
+// (Implemented API — see "Implementation status" below. The illustrative
+// `defineModule(...).ctx<Extra>().make()` form below predates the shipped
+// `defineLogSchema` + `defineOpContext` surface.)
 const httpModule = defineModule({
   metadata: { packageName: '@mycompany/http', packagePath: 'src/index.ts', gitSha: 'abc123' },
   logSchema: {
@@ -104,9 +107,22 @@ const httpModule = defineModule({
 - **Masking rules**: Sensitive data automatically masked during serialization
 - **Columnar storage**: Schema drives efficient TypedArray column generation
 
+**Implementation status**: The schema DSL (`S.enum/category/text/number/boolean`, plus `S.binary/unknown/object` for
+msgpack columns and `.mask(preset)` on category/text) is `packages/lmao/src/lib/schema/builder.ts`; `defineLogSchema()`
+(validation + inference + reserved-name guard) is `packages/lmao/src/lib/schema/defineLogSchema.ts`. The shipped
+authoring surface is **`defineLogSchema(...)` + `defineOpContext({ logSchema, deps, flags, ctx })` →
+`{ defineOp, defineOps }`** (`packages/lmao/src/lib/defineOpContext.ts`), NOT `defineModule(...).ctx<Extra>().make()` as
+drawn above — user context is the `ctx` config field (runtime defaults), not a type-only `.ctx<Extra>()` method. The
+wholesale `defineModule` → `defineOpContext` rename across 01a/01g/01j is staged as the reconciliation node below.
+
 ## Feature Flag Schema Definition <a id="smoo/lmao!n/schema-feature-flags"></a>
 
 **Purpose**: Define feature flags with type-safe access and explicit analytics tracking.
+
+> **Implementation status**: `defineFeatureFlags()` is `packages/lmao/src/lib/schema/defineFeatureFlags.ts`; the
+> sync/async flag builder (`.default(v).sync()/.async()`) is on the schema DSL in `schema/builder.ts`. The full
+> evaluator + `ff-access`/`ff-usage` analytics are specified in [01p](./01p_feature_flags.md) and realized in
+> `codegen/evaluatorGenerator.ts` / `schema/evaluator.ts`.
 
 See **[Feature Flags](./01p_feature_flags.md)** for the complete feature flag system specification, including:
 
@@ -138,6 +154,12 @@ const featureFlags = defineFeatureFlags({
 ## Environment Variable Configuration <a id="smoo/lmao!n/schema-env-config"></a>
 
 **Purpose**: Provide simple, fast access to deployment configuration without overhead.
+
+> **Implementation status**: There is no dedicated env-config module — by design (a plain object is "just property
+> access, no evaluator or tracking"). In the shipped API the user-supplied object reaches ops through the `ctx` config
+> field of `defineOpContext` (`packages/lmao/src/lib/defineOpContext.ts`), spread into `SpanContext` as user-extensible
+> properties. Masking on logged values is the schema's `.mask(preset)` (`schema/builder.ts`), applied at
+> Arrow-conversion time, not by an env layer.
 
 ```typescript
 // Simple configuration object loaded at startup

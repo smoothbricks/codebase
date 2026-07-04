@@ -1,9 +1,18 @@
 # Query Engine <a id="smoo/lmao!n/query-engine"></a>
 
+> **Implementation status (unbuilt — server-side).** This spec describes the **server-side** DuckDB-on-Lambda + S3 query
+> path and the custom `msgpack_extract()` DuckDB C extension. As of this audit **neither exists** in the repo: there is
+> no Lambda deployment, no `read_ipc`/`httpfs` S3 wiring, and no DuckDB C extension. The repo's only DuckDB usage is the
+> **browser** DuckDB-WASM engine in `packages/lmao-inspector` (spec 03), which has no `msgpack_extract` either (it
+> queries Arrow primitive/standard columns only). The server-side path here is staged as `smoo/lmao` action nodes — it
+> is intended infrastructure, not shipped. The Zig `msgpack_extractor.zig` in `packages/columine` is a columnar-runtime
+> msgpack scanner (payload extraction in a VM), a different artifact from the DuckDB scalar function this spec
+> specifies.
+
 ## Overview <a id="smoo/lmao!n/query-engine.overview"></a>
 
-DuckDB is the most viable query engine for lmao traces. It natively reads Arrow IPC, runs on AWS Lambda reading S3, and
-has a straightforward extension system that makes a custom `msgpack_extract()` function feasible.
+DuckDB is the query engine for lmao traces. It natively reads Arrow IPC, runs on AWS Lambda reading S3, and has an
+extension system that carries a custom `msgpack_extract()` function.
 
 This document covers:
 

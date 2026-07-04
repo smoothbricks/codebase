@@ -1,4 +1,4 @@
-//#region corpos/billing!n/audit-pricing-metering.lmao-es-trace-root
+//#region smoo/lmao!n/es-trace-root
 /**
  * TraceRoot - Browser/ES implementation.
  *
@@ -158,4 +158,4 @@ export function createTraceRoot(trace_id: string, tracer: TracerLifecycleHooks):
   const anchorPerfNow = performance.now();
   return new TraceRoot(createTraceId(trace_id), anchorEpochNanos, anchorPerfNow, tracer);
 }
-//#endregion corpos/billing!n/audit-pricing-metering.lmao-es-trace-root
+//#endregion smoo/lmao!n/es-trace-root

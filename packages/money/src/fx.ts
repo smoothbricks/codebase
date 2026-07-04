@@ -13,7 +13,7 @@ import type { RoundingMode } from './rounding.js';
 import { roundBasisToAmount } from './rounding.js';
 import { type Amount, Basis, type Basis as BasisValue } from './types.js';
 
-//#region corpos/billing!n/audit-multi-currency.money-conversion #basis-to-amount-remainder
+//#region smoo/money!n/conversion #basis-to-amount-remainder
 /**
  * Audit trail for an FX conversion. Captures all inputs for traceability.
  *
@@ -92,4 +92,4 @@ export function convertFx<From extends string, To extends string>(
     },
   };
 }
-//#endregion corpos/billing!n/audit-multi-currency.money-conversion
+//#endregion smoo/money!n/conversion

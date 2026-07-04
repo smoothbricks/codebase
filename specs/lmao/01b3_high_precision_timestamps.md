@@ -9,6 +9,16 @@ The trace logging system uses a high-precision timestamp design that provides su
 overhead. The design captures a single time anchor at trace root creation, then uses high-resolution timers for all
 subsequent timestamps.
 
+> **Implementation status** (system state, not aspiration). The anchored-timestamp design is implemented as the
+> `TraceRoot` **class** (`ITraceRoot` interface in `packages/lmao/src/lib/traceRoot.ts`), with two platform classes:
+> `packages/lmao/src/lib/traceRoot.node.ts` (`process.hrtime.bigint()`, NAPI-accelerated writes) and
+> `packages/lmao/src/lib/traceRoot.es.ts` (`performance.now()`). Each exposes `getTimestampNanos(): Nanoseconds`, the
+> per-trace anchor (`anchorEpochNanos`, `anchorPerfNow`), and the span-start/span-end/log write methods. Anchors and
+> `trace_id` live in a single `_system` `ArrayBuffer` (see the layout below `TRACE_ROOT_*_OFFSET`) so NAPI/WASM can read
+> them without BigInt extraction. The function-style `getTimestamp(buffer)` sketches below are illustrative; the
+> realized API is the class method `getTimestampNanos()`. Behaviour is pinned by
+> `packages/lmao/src/lib/__tests__/timestamp.test.ts`.
+
 ### Core Design Principles
 
 1. **Zero allocations** - No object creation per timestamp
@@ -50,7 +60,8 @@ subsequent timestamps.
 **For Trace Timestamps** (Performance-Critical Path):
 
 - ❌ **NEVER use `Date.now()` for span/log timestamps**
-- ✅ **ALWAYS use anchored approach**: `getTimestampMicros(anchorEpochMicros, anchorPerfNow)`
+- ✅ **ALWAYS use anchored approach**: `traceRoot.getTimestampNanos()` (anchored on `anchorEpochNanos` /
+  `anchorPerfNow`)
 - Why: Anchored timestamps provide sub-millisecond precision and avoid repeated system calls
 
 **For Scheduling/Background Tasks** (Non-Performance-Critical):
@@ -64,10 +75,10 @@ subsequent timestamps.
 
 ```typescript
 // ✅ CORRECT: Trace timestamps use anchored approach
-buffer.timestamp[idx] = getTimestampMicros(ctx.anchorEpochMicros, ctx.anchorPerfNow);
+buffer.timestamp[idx] = buffer._traceRoot.getTimestampNanos();
 
 // ❌ WRONG: Don't use Date.now() for trace timestamps
-buffer.timestamp[idx] = Date.now() * 1000; // No sub-ms precision, repeated syscalls
+buffer.timestamp[idx] = BigInt(Date.now()) * 1_000_000n; // No sub-ms precision, repeated syscalls
 
 // ✅ CORRECT: Scheduling uses Date.now()
 const nextFlushTime = Date.now() + flushIntervalMs;
@@ -107,10 +118,12 @@ function createTraceRoot(tracer: Tracer, traceId?: TraceId): TraceRoot {
 
 // All subsequent timestamps derived from anchor (accessed via buffer._traceRoot)
 function getTimestamp(buffer: SpanBuffer): bigint {
-  // Returns nanoseconds since epoch
-  // performance.now() - anchorPerfNow gives elapsed ms with sub-ms precision
+  // Returns nanoseconds since epoch.
+  // performance.now() resolution is ~microseconds, so the elapsed ms is floored to
+  // microseconds → the last 3 nanosecond digits are always 000 (see traceRoot.es.ts).
   const { anchorEpochNanos, anchorPerfNow } = buffer._traceRoot;
-  return anchorEpochNanos + BigInt(Math.round((performance.now() - anchorPerfNow) * 1_000_000));
+  const elapsedMs = performance.now() - anchorPerfNow;
+  return anchorEpochNanos + BigInt(Math.floor(elapsedMs * 1000)) * 1000n;
 }
 ```
 
@@ -152,11 +165,12 @@ function createTraceRoot(tracer: Tracer, traceId?: TraceId): TraceRoot {
 
 // All subsequent timestamps derived from anchor (accessed via buffer._traceRoot)
 function getTimestamp(buffer: SpanBuffer): bigint {
-  // Returns nanoseconds since epoch
-  // hrtime.bigint() gives nanoseconds directly
-  const { anchorEpochNanos, anchorPerfNow } = buffer._traceRoot;
-  const anchorHrtime = BigInt(Math.round(anchorPerfNow));
-  const elapsedNanos = process.hrtime.bigint() - anchorHrtime;
+  // Returns nanoseconds since epoch; hrtime.bigint() gives nanoseconds directly.
+  // The realized class keeps the EXACT hrtime anchor as a BigInt (_anchorHrtimeBigInt),
+  // not BigInt(Math.round(anchorPerfNow)) — the f64 anchorPerfNow loses integer
+  // precision after ~104 days of uptime, which would corrupt the delta (traceRoot.node.ts).
+  const { anchorEpochNanos } = buffer._traceRoot;
+  const elapsedNanos = process.hrtime.bigint() - buffer._traceRoot._anchorHrtimeBigInt;
   return anchorEpochNanos + elapsedNanos;
 }
 ```
@@ -248,43 +262,54 @@ Uses `performance.now()` with microsecond precision (~5-20μs resolution), conve
 
 ### Implementation
 
-Both entry points provide the same API but with different underlying implementations:
+Both entry points provide the same `ITraceRoot` API (`getTimestampNanos()`, anchors, span/log writes) with different
+underlying implementations. The realized form is a **class per platform** plus a `createTraceRoot` factory; the factory
+is what each entry point re-exports, so the unused platform class is tree-shaken (there is **no**
+`setTimestampNanosImpl` module-load mutation — the factory is passed to the `Tracer` instead):
 
 ```typescript
-// timestamp.node.ts (Node.js - TRUE nanosecond precision)
-export function getTimestampNanos(anchorEpochNanos: bigint, anchorPerfNow: number): Nanoseconds {
-  const anchorHrtime = BigInt(Math.round(anchorPerfNow));
-  const currentHrtime = process.hrtime.bigint();
-  const elapsedNanos = currentHrtime - anchorHrtime;
-  return Nanoseconds.unsafe(anchorEpochNanos + elapsedNanos);
+// traceRoot.node.ts (Node.js - TRUE nanosecond precision)
+class TraceRoot implements ITraceRoot {
+  // anchors + trace_id live in _system ArrayBuffer; _anchorHrtimeBigInt kept as exact BigInt
+  getTimestampNanos(): Nanoseconds {
+    const currentHrtime = process.hrtime.bigint();
+    const elapsedNanos = currentHrtime - this._anchorHrtimeBigInt; // exact BigInt delta
+    return Nanoseconds.unsafe(this.anchorEpochNanos + elapsedNanos);
+  }
+}
+export function createTraceRoot(trace_id: string, tracer: TracerLifecycleHooks): TraceRoot {
+  const anchorEpochNanos = BigInt(Date.now()) * 1_000_000n;
+  const anchorHrtimeBigInt = process.hrtime.bigint();
+  return new TraceRoot(
+    createTraceId(trace_id),
+    anchorEpochNanos,
+    Number(anchorHrtimeBigInt),
+    anchorHrtimeBigInt,
+    tracer
+  );
 }
 
-export function createTimestampAnchor(): { anchorEpochNanos: bigint; anchorPerfNow: number } {
-  return {
-    anchorEpochNanos: BigInt(Date.now()) * 1_000_000n,
-    anchorPerfNow: Number(process.hrtime.bigint()),
-  };
+// traceRoot.es.ts (Browser - microsecond precision, last 3 digits always 000)
+class TraceRoot implements ITraceRoot {
+  getTimestampNanos(): Nanoseconds {
+    const elapsedMs = performance.now() - this.anchorPerfNow;
+    const elapsedNanos = BigInt(Math.floor(elapsedMs * 1000)) * 1000n;
+    return Nanoseconds.unsafe(this.anchorEpochNanos + elapsedNanos);
+  }
 }
-
-// timestamp.ts (Browser - microsecond precision, last 3 digits always 000)
-export function getTimestampNanos(anchorEpochNanos: bigint, anchorPerfNow: number): Nanoseconds {
-  const elapsedMs = performance.now() - anchorPerfNow;
-  const elapsedNanos = BigInt(Math.floor(elapsedMs * 1000)) * 1000n;
-  return (anchorEpochNanos + elapsedNanos) as Nanoseconds;
-}
-
-export function createTimestampAnchor(): { anchorEpochNanos: bigint; anchorPerfNow: number } {
-  return {
-    anchorEpochNanos: BigInt(Date.now()) * 1_000_000n,
-    anchorPerfNow: performance.now(),
-  };
+export function createTraceRoot(trace_id: string, tracer: TracerLifecycleHooks): TraceRoot {
+  const anchorEpochNanos = BigInt(Date.now()) * 1_000_000n;
+  return new TraceRoot(createTraceId(trace_id), anchorEpochNanos, performance.now(), tracer);
 }
 ```
 
 **Key Details**:
 
-- **Anchor captured once** at trace creation via `createTimestampAnchor()`
+- **Anchor captured once** at trace creation inside `createTraceRoot()` (the factory)
 - All subsequent timestamps use delta from anchor for consistency
-- Both implementations use the same anchor structure (`anchorEpochNanos`, `anchorPerfNow`)
-- Entry points (`node.ts`, `es.ts`) call `setTimestampNanosImpl()` before re-exporting main functionality
-- No runtime platform detection - implementation chosen at import time for zero overhead
+- Both implementations expose the same anchors (`anchorEpochNanos`, `anchorPerfNow`)
+- The Node class additionally retains the **exact** `process.hrtime.bigint()` anchor as a BigInt (`_anchorHrtimeBigInt`)
+  so deltas stay correct even after the f64 `anchorPerfNow` loses integer precision (~104 days of uptime); a regression
+  test pins this. This supersedes a `BigInt(Math.round(anchorPerfNow))` approach, which would drift.
+- Entry points (`node.ts`, `es.ts`) re-export the matching `createTraceRoot` factory; `Tracer` calls it
+- No runtime platform detection — the platform is chosen at import time (which factory) for zero overhead

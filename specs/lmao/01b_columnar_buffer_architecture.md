@@ -61,6 +61,13 @@ Span completion entry types (all written to row 1):
 6. **Events append from row 2**: `ctx.log.*` creates new rows starting at index 2
 7. **writeIndex starts at 2**: After span initialization, ready for event appends
 
+**Implementation status**: The row-0/row-1/writeIndex=2 contract is realized by `ITraceRoot.writeSpanStart` /
+`writeSpanEnd` (declared in `packages/lmao/src/lib/traceRoot.ts`; implemented in `traceRoot.node.ts` and
+`traceRoot.es.ts`). Those spans are fenced under the high-precision-timestamp node `smoo/lmao!n/trace-root-timestamps`
+([01b3](./01b3_high_precision_timestamps.md)); this heading shares that realization rather than re-fencing it. The
+pre-init of row 1 to `span-exception` and its overwrite to `span-ok`/`span-err` live in `spanContext.ts` (fenced
+`smoo/lmao!n/lmao-entry-span-lifecycle-entry-types`).
+
 ### ctx.tag Semantics (Datadog/Jaeger Pattern) <a id="smoo/lmao!n/buffer-arch-ctx-tag-semantics"></a>
 
 The `ctx.tag.*` API follows Datadog's `span.set_tag()` and OpenTelemetry's `Span.setAttribute()` semantics:

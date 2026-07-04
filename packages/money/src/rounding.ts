@@ -9,7 +9,7 @@
 import type { CurrencyDef } from './currency-registry.js';
 import { Amount, type Basis } from './types.js';
 
-//#region corpos/billing!n/audit-multi-currency.money-rounding #explicit-rounding-mode
+//#region smoo/money!n/rounding #explicit-rounding-mode
 /**
  * Explicit rounding modes for Basis -> Amount conversion.
  * Matches IEEE 754 / financial standard terminology.
@@ -127,4 +127,4 @@ export function roundBasisToAmount<C extends string>(
     }
   }
 }
-//#endregion corpos/billing!n/audit-multi-currency.money-rounding
+//#endregion smoo/money!n/rounding

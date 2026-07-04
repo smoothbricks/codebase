@@ -26,6 +26,12 @@ functionality without tight coupling.
 
 ### Extension Options Interface <a id="smoo/lmao!n/buffer-codegen.extension-options"></a>
 
+**Implementation status**: Realized as the `ColumnBufferExtension` interface
+(`packages/arrow-builder/src/lib/buffer/columnBufferGenerator.ts`). The shipped fields are `constructorCode`, `methods`,
+`classPreamble`, `constructorPreamble`, `constructorParams`, and `dependencies` (the closure-injection map). The
+`preamble` / `properties` names sketched below were superseded by `classPreamble`/`constructorPreamble` and by declaring
+properties inside `constructorCode` (so they land in the fixed hidden-class shape directly).
+
 ```typescript
 interface ColumnBufferExtensionOptions {
   /**
@@ -256,6 +262,13 @@ interface ComposedSpanBuffer extends SpanBuffer {
 
 ### createSpanBuffer Factory <a id="smoo/lmao!n/buffer-codegen-create-factory"></a>
 
+**Implementation status**: The shipped `createSpanBuffer` (`packages/lmao/src/lib/spanBuffer.ts`) takes
+`(schema, traceRoot, opMetadata, capacity?)` — not `(schema, module, spanName, trace_id?, capacity?)`. The 8-aligned
+capacity rounding lives in arrow-builder's `getAlignedCapacity` (invoked inside the generated constructor), not in this
+factory; `createSpanBuffer` only enforces `MIN_CAPACITY = 8`. See
+[SpanBuffer Memory Layout §createSpanBuffer](./01b5_spanbuffer_memory_layout.md#smoo/lmao!n/spanbuffer-layout-create-root)
+for the authoritative signature. The sketch below is the original design.
+
 ```typescript
 /**
  * Creates a root SpanBuffer for a new trace.
@@ -288,6 +301,13 @@ function createSpanBuffer<T extends LogSchema>(
 ```
 
 ### getSpanBufferClass Generator <a id="smoo/lmao!n/buffer-codegen-get-class"></a>
+
+**Implementation status**: Realized as `getSpanBufferClass` (`packages/lmao/src/lib/spanBuffer.ts`), cached per schema
+via a `WeakMap`. The shipped `constructorParams` is `stats, parent, isChained, callsiteMetadata, opMetadata, traceRoot`
+and the injected `dependencies` are `writeThreadIdToUint64Array`, `textDecoder`, `textEncoder`, `EMPTY_SCOPE`, and
+`checkCapacityTuning`. The span counter is `globalThis.globalSpanCounter` (module/worker-local), not a closure
+`nextSpanId`. The full constructor body lives in
+[01b5 §Constructor Implementation](./01b5_spanbuffer_memory_layout.md#smoo/lmao!n/spanbuffer-layout-constructor).
 
 Key optimizations in the generated class:
 
@@ -348,6 +368,13 @@ function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
 ```
 
 ### createOverflowBuffer (Overflow Chaining) <a id="smoo/lmao!n/buffer-codegen-overflow"></a>
+
+**Implementation status**: The shipped function is named `createOverflowBuffer`, not `createNextBuffer`
+(`packages/lmao/src/lib/spanBuffer.ts`; see
+[01b5 §createOverflowBuffer](./01b5_spanbuffer_memory_layout.md#smoo/lmao!n/spanbuffer-layout-create-overflow)). It
+reads capacity from the class's static `stats.capacity` (8-aligned), passes the original buffer as `parent` for identity
+sharing, copies `_callsiteMetadata`/`_opMetadata`/`_traceRoot`, and links via `buffer._overflow`. The pre-rename sketch
+below uses `buffer.module.logSchema`/`sb_capacity`/`buffer._next`, which the constructor-alignment work superseded.
 
 ```typescript
 /**

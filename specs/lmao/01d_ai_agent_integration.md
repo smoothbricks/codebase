@@ -1,5 +1,20 @@
 # AI Agent Integration <a id="smoo/lmao!n/ai-agent-integration"></a>
 
+> **Implementation status — aspirational integration layer; most of it is unbuilt.** This spec describes an AI-agent
+> trace-access layer that is **not implemented** in `packages/lmao/src`: there is **no** `MCPServer` / trace-analyzer
+> tool surface, **no** Jest/Bun trace plugin, **no** OAuth2 production server or dual-storage record, and **no** chDB /
+> Athena distributed-query path (verified by source search — none of `MCPServer`, `get_traces_by_test_run`,
+> `generateTestRunId`, `productionTraceServer`, or `queryDistributedTrace` exist in `packages/lmao/src`). The unbuilt
+> surface is tracked as the implementation nodes `smoo/lmao!n/ai-agent-mcp-server-impl`,
+> `smoo/lmao!n/ai-agent-test-plugins-impl`, `smoo/lmao!n/ai-agent-prod-deployment-impl`, and
+> `smoo/lmao!n/ai-agent-distributed-query-impl`. What **does** ship are the underlying trace primitives the layer would
+> sit on: the columnar `SpanBuffer` → Arrow conversion (`lib/convertToArrow.ts`), the Arrow column/schema model (see
+> [`01f_arrow_table_structure.md`](./01f_arrow_table_structure.md)), the `SQLiteTracer` (`lib/tracers/SQLiteTracer.ts`
+> `smoo/lmao!n/tracer-implementations.sqlite`) that writes the queryable `.trace-results.db`, and the
+> op/span/tag/log/ff/env/setScope authoring API the prompt section documents (`lib/op.ts`, `lib/spanContext.ts`,
+> `lib/defineOpContext.ts`). The query/analysis surface that an MCP server would expose lives separately in the
+> `lmao-inspector` package (specs 02/03), not here.
+
 ## Overview <a id="smoo/lmao!n/ai-agent-integration-overview"></a>
 
 The AI agent integration provides structured access to trace data for automated analysis and debugging. It includes:
@@ -22,6 +37,12 @@ protocol provides tool-based access where detailed trace data is only loaded whe
 - **Tool-based interface**: AI agents can call trace query functions as tools
 
 ## MCP Server Architecture <a id="smoo/lmao!n/ai-agent-mcp-server"></a>
+
+> **Implementation status:** unbuilt. No `MCPServer`, `addTool`, or any of the `get_traces_by_test_run` /
+> `get_traces_by_span` / `get_span_by_identity` / `get_parent_span` / `get_performance_metrics` /
+> `analyze_feature_flag_usage` tools exist in `packages/lmao/src`. Tracked as `smoo/lmao!n/ai-agent-mcp-server-impl`.
+> The query primitives such a server would call are in `lmao-inspector` (spec 02 query engine); the trace store it would
+> read is the `SQLiteTracer` output.
 
 **Purpose**: Provide AI agents with structured access to trace data through standardized tools.
 
@@ -157,6 +178,12 @@ traceServer.addTool({
 
 ## Test Framework Integration <a id="smoo/lmao!n/ai-agent-test-integration"></a>
 
+> **Implementation status:** the trace-plugin surface shown here (Jest reporter, Bun plugin, `generateTestRunId`,
+> `globalThis.__TEST_RUN_ID__`, `trace.setContext`) is **not** implemented in `packages/lmao/src`. Tracked as
+> `smoo/lmao!n/ai-agent-test-plugins-impl`. Note the repo's OWN test suites already flush LMAO traces to per-package
+> `.trace-results.db` via the shared test harness + `SQLiteTracer` (CLAUDE.md), which is a different, working mechanism
+> than the framework-agnostic `testRunId === trace_id` plugin described below.
+
 **Purpose**: Automatically correlate traces with test runs for AI-driven analysis.
 
 **Why Jest/Bun Examples**:
@@ -245,6 +272,9 @@ plugin({
 
 ## AI Agent Workflow <a id="smoo/lmao!n/ai-agent-workflow"></a>
 
+> **Implementation status:** illustrative narrative of how an agent would drive the (unbuilt) MCP tools; its realization
+> is `smoo/lmao!n/ai-agent-mcp-server-impl`. No standalone code obligation beyond that server.
+
 **Purpose**: Enable AI agents to analyze actual execution behavior rather than just static code.
 
 ### Example AI Agent Interaction <a id="smoo/lmao!n/ai-agent-workflow.example"></a>
@@ -311,6 +341,11 @@ AI: All 15 failures are SMTP timeouts. Let me fix the retry logic and timeout co
 5. **Code Improvement**: AI makes informed changes based on trace data
 
 ## Production Deployment <a id="smoo/lmao!n/ai-agent-prod-deployment"></a>
+
+> **Implementation status:** unbuilt. No OAuth2-authenticated `productionTraceServer`, no `ProductionTraceRecord`
+> dual-storage (masked + encrypted) shape, and no `get_production_traces` / `analyze_production_performance` /
+> `get_production_trace_details` tools exist in `packages/lmao/src`. Tracked as
+> `smoo/lmao!n/ai-agent-prod-deployment-impl`.
 
 **Purpose**: Deploy authenticated MCP server for production trace access with privacy controls.
 
@@ -415,6 +450,11 @@ traceServer.addTool({
 
 ## Distributed Tracing Integration <a id="smoo/lmao!n/ai-agent-distributed-tracing"></a>
 
+> **Implementation status:** unbuilt. No cross-service `queryDistributedTrace` / `get_distributed_trace` tool, no
+> S3/Parquet glob query, and no chDB-on-Lambda path exist in `packages/lmao/src`. Tracked as
+> `smoo/lmao!n/ai-agent-distributed-query-impl`. The W3C `trace_id` correlation key the queries pivot on IS produced by
+> the shipped tracer (`lib/traceId.ts` `smoo/lmao!n/span-identity.trace-id`).
+
 **Purpose**: Query traces across multiple services and deployments.
 
 ### Cross-Service Query Architecture <a id="smoo/lmao!n/ai-agent-distributed-tracing.cross-service"></a>
@@ -464,6 +504,10 @@ const lambdaTraceQuery = async (trace_id: string) => {
 
 ## MCP Configuration <a id="smoo/lmao!n/ai-agent-mcp-config"></a>
 
+> **Implementation status:** these are example client configs for the unbuilt servers; they land with
+> `smoo/lmao!n/ai-agent-mcp-server-impl` / `smoo/lmao!n/ai-agent-prod-deployment-impl` (the `dist/*-mcp-server.js`
+> entrypoints they reference do not exist yet).
+
 **Purpose**: Configure AI agents to use the trace analysis MCP server.
 
 ### Claude Desktop Configuration <a id="smoo/lmao!n/ai-agent-mcp-config.claude-desktop"></a>
@@ -510,6 +554,14 @@ const lambdaTraceQuery = async (trace_id: string) => {
 ```
 
 ## AI Agent Documentation Requirements <a id="smoo/lmao!n/ai-agent-doc-requirements"></a>
+
+> **Implementation status:** these are authored prompt strings (documentation artifacts), not code. The op/span/tag/
+> ff/env/setScope API they instruct agents to emit DOES ship — `op`/`span`/`tag`/`log`/`ok`/`err` (`lib/op.ts`
+> `smoo/lmao!n/op-class`, `lib/spanContext.ts`), `setScope` (`smoo/lmao!n/scope-attributes.read`), feature flags and env
+> (`lib/defineOpContext.ts` `smoo/lmao!n/schema-env-config`), and the transformer's line-number injection into `span()`
+> (01g). One drift to note: the prompt snippet destructures `op` from a module (`const { op } = myModule`); the shipped
+> surface is `defineOp`/`defineOps` from `defineOpContext` — same true-up as
+> `smoo/lmao!n/lambda-routing-example-api-trueup` (01m), kept consistent here.
 
 **Purpose**: Provide AI agents with concise prompts that enforce trace logging patterns.
 
@@ -633,6 +685,12 @@ analysis.
 
 ## Arrow Table Conversion <a id="smoo/lmao!n/ai-agent-arrow-conversion"></a>
 
+> **Implementation status:** realized. The SpanBuffer → Arrow conversion (zero-copy TypedArray refs, cold-path
+> dictionary building, two-pass tree walk, shared dictionaries) ships in `lib/convertToArrow.ts` and the codegen/buffer
+> layer; this section describes that shipped behaviour. Canonical spec is
+> [`01f_arrow_table_structure.md`](./01f_arrow_table_structure.md) and the tree-walker spec 01k. A future MCP server
+> would call this conversion, but the conversion itself is not gated on the (unbuilt) server.
+
 **Purpose**: MCP tools convert SpanBuffer data to Arrow tables for efficient querying and analysis.
 
 ### Zero-Copy Conversion <a id="smoo/lmao!n/ai-agent-arrow-conversion.zero-copy"></a>
@@ -650,6 +708,12 @@ The conversion happens in the cold path (when MCP tools are called), ensuring ze
 logging).
 
 ## Arrow Table Column Reference <a id="smoo/lmao!n/ai-agent-arrow-columns"></a>
+
+> **Implementation status:** realized — this column set (`message`, `package_name`/`package_path`, `entry_type`,
+> `trace_id`, `thread_id`/`span_id`, `parent_thread_id`/`parent_span_id`, `ff_value`) is the shipped Arrow schema
+> (`lib/schema/systemSchema.ts` `smoo/lmao!n/lmao-entry-entry-type-definitions`, `lib/convertToArrow.ts`, span identity
+> in `lib/threadId.ts`/`lib/traceId.ts` `smoo/lmao!n/span-identity.*`). Canonical spec is
+> [`01f_arrow_table_structure.md`](./01f_arrow_table_structure.md); this is a consumer-facing restatement.
 
 When querying trace data via MCP tools, the following columns are available:
 

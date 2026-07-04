@@ -275,6 +275,10 @@ Structured logging with message templates and typed attributes - **APPENDS new r
 - **`warn`** - Warning messages with optional structured data
 - **`error`** - Error messages with optional structured data
 
+> **Implementation status.** The shipped enum (`ENTRY_TYPE_NAMES` in `packages/lmao/src/lib/schema/systemSchema.ts`)
+> also defines a **`trace`** level (most verbose: `trace < debug < info < warn < error`), which this list omits. The
+> source is authoritative; aligning this section is tracked by `smoo/lmao!n/lmao-entry-spec-source-reconcile`.
+
 These entry types enable gradual migration from console.log by providing structured logging with the familiar log
 levels, but with typed attributes instead of just string concatenation.
 
@@ -437,6 +441,13 @@ flush share identical `timestamp` (the period end time).
   - `uint64_value`: Longest duration in nanoseconds
 
 **Buffer Metrics** (4 entry types for buffer statistics):
+
+> **Implementation status.** The shipped enum (`ENTRY_TYPE_NAMES` in `packages/lmao/src/lib/schema/systemSchema.ts`)
+> defines **three** buffer metrics, not four, and names them differently: `buffer-writes` (22), `buffer-spans` (23),
+> `buffer-capacity` (24). The four names below (`buffer-overflow-writes`, `buffer-created`, `buffer-overflows`) are NOT
+> in the source. The source is authoritative; aligning this list and the
+> [Entry Type Validation](#smoo/lmao!n/lmao-entry-entry-type-validation) table is tracked by
+> `smoo/lmao!n/lmao-entry-spec-source-reconcile`.
 
 - **`buffer-writes`** - Total entries written to buffers
   - `uint64_value`: Count of all entries written during the period
@@ -792,7 +803,7 @@ The APIs reserve certain method names that cannot be used as attribute column na
 
 **On `tag` (TagAPI)**:
 
-- **`with`**: Reserved for future bulk attribute setting (currently callable via `tag({ ... })`)
+- **`with`**: Reserved on `tag` for bulk attribute setting; the object-callable form `tag({ ... })` is the bulk setter.
 
 **On `log` (LogAPI)**:
 
@@ -1012,13 +1023,15 @@ WHERE entry_type IN ('span-ok', 'span-err')
 
 The entry type system is implemented through low-level column writers that directly populate trace buffers:
 
-### Column Writer Interface (Design TBD) <a id="smoo/lmao!n/lmao-entry-column-writer-interface"></a>
+### Column Writer Interface <a id="smoo/lmao!n/lmao-entry-column-writer-interface"></a>
 
-The exact API for writing to columns is still being designed. The examples below use a placeholder `writeColumnName()`
-pattern to illustrate the concepts, but the actual implementation will likely be much cleaner:
+The concrete column-writing API is the **schema-driven, codegen'd** writer set defined in
+[Trace Context API Codegen](./01g_trace_context_api_codegen.md#1-schema-driven-column-writers); that spec is the source
+of truth for the generated writers. The `writeColumnName()` interface below is **illustrative** — it names the columns
+each entry type populates, not the generated method surface:
 
 ```typescript
-// PLACEHOLDER - actual API design TBD
+// ILLUSTRATIVE shape — the generated writers are specified in 01g §Schema-Driven Column Writers
 interface ColumnWriters {
   // Core system columns
   writeTimestamp(value: bigint): void;
@@ -1029,7 +1042,7 @@ interface ColumnWriters {
   writeModule(value: string): void;
   writeMessage(value: string): void; // Span name, log message template, OR flag name (S.category)
 
-  // Generated attribute columns (example - actual API TBD)
+  // Generated attribute columns (per-schema; see 01g §Schema-Driven Column Writers)
   writeHttpStatus(value: number): void;
   writeHttpMethod(value: string): void;
   writeUserId(value: string): void;
@@ -1037,10 +1050,12 @@ interface ColumnWriters {
 }
 ```
 
-### Entry Type Creation Patterns (Conceptual) <a id="smoo/lmao!n/lmao-entry-entry-type-creation-patterns"></a>
+### Entry Type Creation Patterns <a id="smoo/lmao!n/lmao-entry-entry-type-creation-patterns"></a>
 
-Each entry type follows specific patterns for populating columns. The examples below use placeholder `writeColumnName()`
-calls to illustrate the concepts - the actual column writing API is still being designed:
+Each entry type populates a fixed set of columns; the per-type column contract below is normative (it matches
+[Entry Type Validation](#entry-type-validation)). The `writeColumnName()` calls are illustrative stand-ins for the
+codegen'd writers
+([01g §Schema-Driven Column Writers](./01g_trace_context_api_codegen.md#1-schema-driven-column-writers)):
 
 #### Span Start Pattern
 
@@ -1055,7 +1070,7 @@ function createSpanStart(module: string, spanName: string, parentSpanId?: bigint
   writers.writeMessage(spanName); // message = span name for span entries
 
   // Optional structured attributes for span start
-  // TODO: Actual column writing API design TBD
+  // (attribute columns are written by the codegen'd writers — 01g §Schema-Driven Column Writers)
   if (attributes) {
     for (const [key, value] of Object.entries(attributes)) {
       const writerMethod = `write${capitalize(key)}`;
@@ -1080,7 +1095,7 @@ function createSpanCompletion(entryType: 'span-ok' | 'span-err', result?: any, a
   writers.writeMessage(getCurrentSpanName()); // message = span name for span entries
 
   // Structured attributes from completion
-  // TODO: Actual column writing API design TBD
+  // (attribute columns are written by the codegen'd writers — 01g §Schema-Driven Column Writers)
   if (attributes) {
     for (const [key, value] of Object.entries(attributes)) {
       const writerMethod = `write${capitalize(key)}`;
@@ -1116,7 +1131,7 @@ function createLogEntry(
 
   // Attribute VALUES go in their own columns
   // Template references like {{userId}} are NOT replaced - stored verbatim
-  // TODO: Actual column writing API design TBD
+  // (attribute columns are written by the codegen'd writers — 01g §Schema-Driven Column Writers)
   if (attributes) {
     for (const [key, value] of Object.entries(attributes)) {
       const writerMethod = `write${capitalize(key)}`;

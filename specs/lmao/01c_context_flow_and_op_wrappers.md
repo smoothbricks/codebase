@@ -491,6 +491,12 @@ class Op<Ctx, Args extends unknown[], Result> {
 
 The context passed to op functions combines built-in properties with user-extensible `Ctx`:
 
+> **Implementation status**: the shipped type is `SpanContext<Ctx>` (a single bundled `OpContext` type parameter
+> carrying `logSchema`/`flags`/`deps`/`userCtx`), not the separate `<Schema, Deps, FF, Ctx>` list shown below — see
+> `SpanContextInstance` in `packages/lmao/src/lib/spanContext.ts` (node `smoo/lmao!n/spancontext-type`).
+> `ctx.ok()`/`ctx.err()` return the `Ok<V>`/`Err<E>` classes from `result.ts` (the spec's `FluentOk`/`FluentErr` are
+> illustrative names); they are both the type-safe result and the fluent row-1 writer.
+
 ```typescript
 type SpanContext<Schema, Deps, FF, Ctx> = {
   // Invoke another op as a child span - supports multiple overloads

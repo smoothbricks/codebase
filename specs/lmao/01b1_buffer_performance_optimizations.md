@@ -39,6 +39,15 @@ buffer.userIds[idx] = 123; // 4 bytes written directly
 
 ## V8 Optimization Patterns <a id="smoo/lmao!n/buffer-perf-v8-patterns"></a>
 
+**Implementation status**: These six patterns (monomorphic access, hidden-class stability + in-object property ordering,
+inline caching, cache-line alignment, sequential access) are realized structurally by the **generated** SpanBuffer class
+— `getSpanBufferClass` orders the hottest properties first in its `constructorPreamble`
+([01b5](./01b5_spanbuffer_memory_layout.md#smoo/lmao!n/spanbuffer-layout.constructor)), and arrow-builder's
+`generateColumnBufferClass` emits monomorphic per-column getters/setters with a fixed hidden-class shape
+([01b6](./01b6_buffer_codegen_extension.md#smoo/lmao!n/buffer-codegen.generate-class)). Cache-line alignment is
+`getAlignedCapacity` in arrow-builder. The code blocks below are illustrative `BAD`/`GOOD` teaching examples, not
+literal source.
+
 ### 1. Monomorphic Array Access
 
 **WHY**: V8 creates optimized machine code for consistent access patterns.
@@ -207,6 +216,11 @@ class BufferWriter {
 ### 4. Cache Line Alignment <a id="smoo/lmao!n/buffer-perf-cache-alignment"></a>
 
 **WHY**: CPUs load memory in 64-byte cache lines. Aligned access = fewer cache misses.
+
+**Implementation status**: Realized as `getAlignedCapacity` (`packages/arrow-builder/src/lib/buffer/bufferHelpers.ts`) —
+rounds capacity up to a multiple of 8, which is both the null-bitmap byte-boundary requirement
+([01b2 §Multiple of 8](./01b2_buffer_self_tuning.md#smoo/lmao!n/buffer-tuning-multiple-of-8)) and 64-byte cache-line
+alignment for `BigInt64Array`. The `alignedCapacity` / `byteOffset % 64` sketch below is illustrative.
 
 ```typescript
 // Cache line aware sizing

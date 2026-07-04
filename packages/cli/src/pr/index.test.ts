@@ -18,7 +18,7 @@ afterEach(() => {
 
 const PR_JSON = JSON.stringify({
   number: 40,
-  url: 'https://github.com/conloca/private/pull/40',
+  url: 'https://github.com/acme/private/pull/40',
   headRefName: 'gar-sync/private-to-public',
   baseRefName: 'public-mirror',
   isCrossRepository: false,
@@ -145,7 +145,7 @@ function writeState(overrides: Record<string, unknown>): void {
   mkdirSync(join(gitDir, 'smoo'), { recursive: true });
   const state = {
     pr: 40,
-    url: 'https://github.com/conloca/private/pull/40',
+    url: 'https://github.com/acme/private/pull/40',
     headBranch: 'gar-sync/private-to-public',
     baseBranch: 'public-mirror',
     remote: 'origin',
