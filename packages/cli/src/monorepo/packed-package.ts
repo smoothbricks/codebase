@@ -90,7 +90,7 @@ async function validatePackedManifest(
 async function validateAttw(root: string, pkg: PackageInfo, packed: { path: string }): Promise<number> {
   const attw = await loadAttwCore();
   const analysis = await attw.checkPackage(await createAttwPackageFromTarball(attw, root, packed.path), {
-    excludeEntrypoints: wasmExportEntrypoints(pkg.json.exports),
+    excludeEntrypoints: nonJsExportEntrypoints(pkg.json.exports),
   });
   if (!isRecord(analysis) || analysis.types === false) {
     return 0;
@@ -242,20 +242,22 @@ function formatResolutionKind(kind: string): string {
   return kind;
 }
 
-function wasmExportEntrypoints(exports: unknown): string[] {
+function nonJsExportEntrypoints(exports: unknown): string[] {
   if (!isRecord(exports)) {
     return [];
   }
   return Object.entries(exports)
-    .filter(([key, value]) => key.startsWith('.') && exportPointsToWasm(value))
+    .filter(([key, value]) => key.startsWith('.') && exportPointsToNonJs(value))
     .map(([key]) => key);
 }
 
-function exportPointsToWasm(value: unknown): boolean {
+function exportPointsToNonJs(value: unknown): boolean {
   if (typeof value === 'string') {
-    return value.endsWith('.wasm');
+    // attw resolves every entrypoint as a module; assets can never have types.
+    // Existence of the target files is still validated by publint.
+    return value.endsWith('.wasm') || value.endsWith('.css');
   }
-  return isRecord(value) && Object.values(value).some(exportPointsToWasm);
+  return isRecord(value) && Object.values(value).some(exportPointsToNonJs);
 }
 
 async function packPackage(root: string, pkg: PackageInfo): Promise<{ path: string; arrayBuffer: ArrayBuffer }> {
