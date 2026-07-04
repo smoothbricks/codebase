@@ -1,4 +1,4 @@
-//#region corpos/billing!n/audit-flag-evaluator.lmao-evaluator
+//#region smoo/lmao!n/flag-evaluator
 import type { Schema, SchemaWithMetadata } from '@smoothbricks/arrow-builder';
 import { createEvaluatorClass, type GeneratedEvaluatorInstance } from '../codegen/evaluatorGenerator.js';
 import type { FluentLogEntry } from '../codegen/spanLoggerGenerator.js';
@@ -403,4 +403,4 @@ export class InMemoryFlagEvaluator<Ctx extends OpContext = OpContext> implements
     return createFeatureFlagEvaluator(this.ffSchema, ctx, this);
   }
 }
-//#endregion corpos/billing!n/audit-flag-evaluator.lmao-evaluator
+//#endregion smoo/lmao!n/flag-evaluator

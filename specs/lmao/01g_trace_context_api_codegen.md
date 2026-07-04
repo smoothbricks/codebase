@@ -22,7 +22,7 @@ property-based APIs.
 
 ## Destructured Context Pattern <a id="smoo/lmao!n/codegen-destructured-context"></a>
 
-The context is destructured directly in op signatures, eliminating `ctx.xxx` drilling:
+The context is destructured directly in op signatures, eliminating `ctx.<field>` drilling:
 
 ```typescript
 const GET = op(async ({ span, log, tag, deps, ff, env, scope }, url: string) => {
@@ -65,6 +65,11 @@ const GET = op(async ({ span, log, tag, deps, ff, env, scope }, url: string) => 
 
 ## API Patterns <a id="smoo/lmao!n/codegen-architecture.api-patterns"></a>
 
+> **Implementation status**: Both the object `tag({...})` / `log.info().with({...})` form and the per-field
+> `tag.userId()` form are emitted by the same TagWriter/SpanLogger generators
+> (`codegen/fixedPositionWriterGenerator.ts`, `codegen/spanLoggerGenerator.ts`) — the dual API is the generated `with()`
+> method plus the per-field setters, not two separate backends.
+
 ### Object-Based API (Primary)
 
 ```typescript
@@ -96,6 +101,15 @@ const processUser = op(async ({ tag }, userData) => {
 ```
 
 ## Codegen Architecture <a id="smoo/lmao!n/codegen-architecture"></a>
+
+> **Implementation status**: The runtime codegen lives in `packages/lmao/src/lib/codegen/`.
+> `fixedPositionWriterGenerator.ts` generates the **TagWriter** (row 0) and **ResultWriter** (row 1) fluent setters —
+> both the object-based `with({...})` and the per-field `tag.userId()` setters, with compile-time enum→index mapping,
+> all via `new Function()` at schema-definition time and cached per schema (`WeakMap`). `spanLoggerGenerator.ts`
+> generates the **SpanLogger** (rows 2+: info/debug/warn/error/trace + `with`) by extending arrow-builder's
+> `ColumnWriter`. The "entry-type-bound" split in the prose below maps to: TagWriter (fixed row 0) vs SpanLogger
+> (advancing rows) — not a per-entry-type class. The illustrative class names below (`TagAPI`/`LogAPI`) are the shipped
+> `TagWriter`/`SpanLogger`.
 
 ### 1. Schema-Driven Column Writers
 
@@ -209,6 +223,14 @@ const processUser = op(async ({ log, tag, scope, span, ok, err }, userData) => {
 ```
 
 ## Scope API Code Generation <a id="smoo/lmao!n/codegen-spanlogger.scope"></a>
+
+> **Implementation status**: Scope generation is in `spanLoggerGenerator.ts` (`generateSetScopeMethod` +
+> `generatePrefillScopedAttributesMethod`). Scope values live in `buffer._scopeValues` (a plain frozen object), separate
+> from TypedArray columns, matching the "NOT stored in buffer columns" pin. Two refinements over the prose below, per
+> [01i](./01i_span_scope_attributes.md): scope is **immutable** (`_setScope` builds a NEW frozen object; `null` clears a
+> key, `undefined` is ignored) and scope values are **filled at Arrow conversion / overflow-prefill time**
+> (`_prefillScopedAttributesOn`), not eagerly on set. The generated method is named `_setScope`, not a bare `scope()`
+> closure.
 
 ### scope() as Function (NOT stored in buffer columns)
 
@@ -391,14 +413,14 @@ export const apiCall = op(async ({ tag, log, ok }) => {
 // Result: writes to http_status, http_method, http_url, http_duration columns
 ```
 
-## Implementation Details (Design TBD)
+## Implementation Details
 
 ### Function Generation Strategy
 
-The codegen approach using `new Function()` is conceptual - the actual column writing API is still being designed:
+The codegen builds each column writer with `new Function()` at op-definition time (the cold path above), so the hot path
+is a direct typed-array store:
 
 ```typescript
-// PLACEHOLDER - actual implementation TBD
 function generateColumnWriter(columnName: string, columnType: string): Function {
   // Generate optimized function code
   const functionCode = `
@@ -416,10 +438,10 @@ function generateColumnWriter(columnName: string, columnType: string): Function 
 
 ### Object API Implementation
 
-The object-based API approach is conceptual - actual implementation TBD:
+The object-based API (`tag({ … })`) is generated the same way — one `new Function()` body that fans the attribute keys
+out to the per-column writers:
 
 ```typescript
-// PLACEHOLDER - actual implementation TBD
 function generateObjectAPI(schema: Schema): Function {
   const writerCalls = Object.keys(schema)
     .map((key) => `if ('${key}' in attributes) this.writers.write${capitalize(key)}(entryType, attributes.${key});`)
@@ -597,6 +619,12 @@ This codegen system integrates with:
 
 ## uint64 Method Generation <a id="smoo/lmao!n/codegen-spanlogger.uint64"></a>
 
+> **Implementation status**: The `uint64_value(value: bigint)` fluent method is generated on SpanLogger in
+> `spanLoggerGenerator.ts` (lazy `BigUint64Array` column, null-bitmap tracked, writes at the current `_writeIndex`). The
+> shipped method name is **`uint64_value`** (matching the column), not bare `.uint64`. It is present on the log fluent
+> entry and the result writers; the spec's "TagAPI" row-0 case is the `uint64_value` column reachable via the same
+> generated setter surface.
+
 ### Overview
 
 The `.uint64(value: bigint)` method is generated on:
@@ -681,7 +709,9 @@ const createArrowVectors = (spanBuffer: SpanBuffer) => {
 };
 ```
 
-## Future Extensions
+## Deferred
+
+Out of scope for this codegen; each is a flagged follow-up, not a silent stub.
 
 ### Dynamic Schema Updates
 

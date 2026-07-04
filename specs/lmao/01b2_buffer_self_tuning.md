@@ -30,11 +30,21 @@ SpanBuffers, enabling per-op tuning.
 5. **Environment Agnostic** - Same code everywhere
 6. **Per-Span Buffers** - Each span gets its own buffer (created by op wrapper), avoiding trace_id/span_id TypedArrays
 7. **Buffer Chaining** - Graceful overflow handling while learning optimal capacity
-8. **Freelist Pooling** - Pooling buffers for V8 GC optimization (future experiment, not yet implemented)
+8. **Freelist Pooling** - Pooling buffers for GC optimization. Implemented for the WASM strategy (`bufferStrategy.ts`,
+   `wasmSpanBuffer.ts` — blocks return to a freelist); the JS strategy relies on V8 GC instead.
 9. **Lazy-to-Eager Column Promotion** - Frequently-used columns automatically pre-allocate (see
    [Column Promotion](#lazy-to-eager-column-promotion))
 
 ## Self-Tuning Architecture <a id="smoo/lmao!n/buffer-tuning-capacity"></a>
+
+**Implementation status**: Realized as `capacityTuning.ts` — `checkCapacityTuning` → `shouldTuneCapacity`
+(`packages/lmao/src/lib/capacityTuning.ts`). The shipped mechanism is a single **utilization ratchet**:
+`utilization = totalWrites / (spansCreated × (capacity − 2))`; grow ×2 when `> 1.5`, shrink ÷2 when `< 0.5`, bounded by
+`MIN_CAPACITY = 8` / `MAX_CAPACITY = 1024`, with stats reset after each adjustment. The richer designs sketched below
+(predictive pre-allocation, workload-pattern detection, multi-buffer coordination, the `SelfTuningBuffer` interface with
+growth-history/compaction-history) are **aspirational illustrations, not shipped** — the production tuner is
+intentionally minimal. Memory-pressure / idle response is handled by `FlushScheduler`
+([§FlushScheduler Design](#smoo/lmao!n/buffer-tuning-flush)), not the capacity tuner.
 
 ### Core Principle: Observe and Adapt
 
@@ -432,7 +442,15 @@ use cases (e.g., low-latency requirements, memory-constrained environments) but 
 
 ### Multiple of 8 Requirement <a id="smoo/lmao!n/buffer-tuning-multiple-of-8"></a>
 
-**All buffer capacities MUST be multiples of 8.** This constraint enables efficient null bitmap operations:
+**All buffer capacities MUST be multiples of 8.**
+
+**Implementation status**: The `(requestedCapacity + 7) & ~7` alignment is realized by `getAlignedCapacity`
+(`packages/arrow-builder/src/lib/buffer/bufferHelpers.ts`, fenced
+[`smoo/lmao!n/buffer-perf-cache-alignment`](./01b1_buffer_performance_optimizations.md#smoo/lmao!n/buffer-perf-cache-alignment))
+— called inside the generated constructor — and is re-applied by `createOverflowBuffer`
+([01b5](./01b5_spanbuffer_memory_layout.md#smoo/lmao!n/spanbuffer-layout.create-overflow)). Self-tuning capacities are
+powers of two (8…1024), so the constraint is naturally satisfied. This constraint enables efficient null bitmap
+operations:
 
 1. **Byte-aligned concatenation**: When converting multiple buffers to Arrow, null bitmaps can be bulk-copied with
    `TypedArray.set()` instead of bit-by-bit loops
@@ -835,6 +853,16 @@ describe('Self-tuning buffer', () => {
 Beyond capacity self-tuning, the system also adapts column access patterns. Columns start as lazy (memory-efficient) and
 automatically promote to eager (performance-optimized) when heavily used.
 
+**Implementation status — PARTIAL / runtime promotion NOT implemented.** The _static_ half exists: arrow-builder's
+codegen honours a per-column `__eager` flag (`columnBufferGenerator.ts` `getTypedArrayInfo` /
+`generateColumnBufferClass`, fenced
+[`smoo/lmao!n/buffer-arch-eager-vs-lazy`](./01b_columnar_buffer_architecture.md#smoo/lmao!n/buffer-arch-eager-vs-lazy)),
+and the schema builder marks `number`/`boolean`/`bigUint64` columns eager by type. The **runtime usage-driven promotion
+ratchet described below is NOT shipped**: there is no `LazyColumnStats` / per-column `instantiationCount`, no
+`promoteColumnsToEager`, and the shipped `SpanBufferStats` tracks only `{capacity, totalWrites, spansCreated}` (no
+per-column counters). The 100-sample / 80%-ratio recompilation, the in-flight-buffer convergence, and the promotion
+tests below are unbuilt. Tracked as implementation node `smoo/lmao!n/buffer-tuning-promotion`.
+
 **Key Insight**: Promotion happens during background flush (cold path), ensuring zero hot-path impact while optimizing
 for actual usage patterns.
 
@@ -1153,6 +1181,14 @@ describe('Lazy-to-eager column promotion', () => {
 Buffer statistics are logged periodically (every 100 flushes by default) to provide visibility into buffer tuning
 performance. Statistics use structured entry types with the `uint64_value` system column for efficient columnar storage.
 
+**Implementation status**: Realized as `createCapacityStatsTable` (`packages/lmao/src/lib/arrow/capacityStats.ts`),
+driven from `FlushScheduler.doFlush` via `CAPACITY_STATS_FLUSH_INTERVAL = 100`. The shipped entry-type set tracks the
+three fields the tuner reads plus a period marker — `period-start`, `buffer-writes` (`stats.totalWrites`),
+`buffer-spans` (`stats.spansCreated`), `buffer-capacity` (`stats.capacity`) — NOT the
+`buffer-overflow-writes`/`buffer-created`/`buffer-overflows` set the original table below lists (the runtime
+`SpanBufferStats` has no overflow/created counters; see
+[01b5 §Capacity Statistics](./01b5_spanbuffer_memory_layout.md#smoo/lmao!n/spanbuffer-layout.stats)).
+
 ### Entry Types
 
 | Entry Type               | Description                                    | uint64_value         |
@@ -1228,7 +1264,14 @@ ORDER BY overflow_rate DESC
 
 ## Observability Hook <a id="smoo/lmao!n/buffer-tuning-observability"></a>
 
-Before stats are reset during capacity adjustment, the Tracer's `onStatsWillResetFor` hook is called:
+Before stats are reset during capacity adjustment, the Tracer's `onStatsWillResetFor` hook is called.
+
+**Implementation status**: The hook is declared on `TracerLifecycleHooks` (`packages/lmao/src/lib/traceRoot.ts`) and
+implemented by every tracer (`TestTracer`, `StdioTracer`, `ArrayQueueTracer`, `SQLiteTracer`, `NoOpTracer`,
+`CompositeTracer`). It is invoked from the generated `getOrCreateOverflow` method
+([01b5 §Constructor](./01b5_spanbuffer_memory_layout.md#smoo/lmao!n/spanbuffer-layout.constructor)) — which calls
+`tracer.onStatsWillResetFor(this)` then `checkCapacityTuning(stats)` — NOT a free `_getNextBuffer` function as the older
+sketch below shows.
 
 ```typescript
 // In Tracer (abstract)
@@ -1293,7 +1336,7 @@ Self-tuning buffers provide:
 - **Global coordination** - Multiple buffers share resources
 - **Per-span isolation** - Each span gets its own buffer for sorted output
 - **Buffer chaining** - Overflow handled gracefully while tuning learns optimal size
-- **Freelist optimization** - Buffer pooling for V8 GC optimization (future experiment)
+- **Freelist optimization** - Buffer pooling for GC optimization (WASM strategy; JS uses V8 GC)
 - **Column promotion** - Lazy columns automatically promote to eager when heavily used
 - **Buffer statistics** - Periodic logging of tuning metrics via structured entry types
 

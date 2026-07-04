@@ -143,6 +143,13 @@ trace('request', {                  ctx.setScope({ region })          ctx.ff.pre
 
 **Purpose**: Handle feature flag evaluation with full span context for logging, tracing, and analytics.
 
+**Implementation status:** Realized in `schema/evaluator.ts` (the `FlagEvaluator` interface, the abstract
+`FeatureFlagEvaluator` per-span wrapper, `createFeatureFlagEvaluator`, the `FlagValue` / `SpanContextWithoutFf` /
+`BooleanFlagContext` / `VariantFlagContext` / `ConfigFlagContext` types, and the built-in `InMemoryFlagEvaluator`),
+`tracer.ts:_createFlagEvaluator` (wires the evaluator from `TracerOptions`), and the generated per-span getter class in
+`codegen/evaluatorGenerator.ts`. These source spans are fenced under `smoo/lmao!n/flag-evaluator*`; the spec
+relationship is `n/op-context-flag-evaluator` (evaluator) and `n/schema-feature-flags` (schema entry point).
+
 ### Ctx-First Evaluator Pattern <a id="smoo/lmao!n/op-context-flag-evaluator.ctx-first-evaluator-pattern"></a>
 
 The evaluator receives `Omit<SpanContext, 'ff'>` - full context access except `ff` itself. This enables:
@@ -382,7 +389,12 @@ flagEvaluator: async (ctx, flag, defaultValue) => {
 **One `ff-access` per span**: The first access to a flag logs an `ff-access` entry. Subsequent accesses in the same span
 do not log duplicate entries.
 
-**Implementation**: The evaluator scans the buffer chain backward to check if a flag was already logged.
+**Implementation**: The generated evaluator scans the buffer chain backward (from `buf._writeIndex`) to check if a flag
+was already logged before calling the generated `ffAccess(flagName, value)` writer. The `ffAccess` / `ffUsage` row
+writers (and the `ff-access` / `ff-usage` entry types) are emitted by `codegen/spanLoggerGenerator.ts`
+(`n/codegen-spanlogger`); the backward-scan dedup lives in the generated evaluator class
+(`codegen/evaluatorGenerator.ts`, fenced `smoo/lmao!n/flag-evaluator-generator`). The `ff-access` / `ff-usage`
+entry-type constants are `n/lmao-entry-feature-flag-entry-types`.
 
 **Why buffer scan instead of Set?**
 

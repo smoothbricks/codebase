@@ -18,21 +18,28 @@ Key components:
 
 ```
 Error (JavaScript built-in)
-├── CodeError (base class for typed errors)
-│   ├── code: string
-│   └── data: T
+├── CodeError<C, D> (base class for typed errors)        errors/CodeError.ts
+│   ├── code: C
+│   └── data: D
 │
-├── TransientError extends Error
-│   ├── code: string
-│   ├── data: T
+├── TransientError<C, D> extends CodeError<C, D>          errors/Transient.ts
 │   └── policy: RetryPolicy
 │
-└── Blocked extends Error
-    ├── reason: BlockedReason
-    └── resource: string
+├── Blocked extends Error (TaggedError<'Blocked'>)        errors/Blocked.ts
+│   ├── reason: BlockedReason
+│   └── blockedConfig?: BlockedConfig   (closure-based nextRetry)
+│
+└── RetriesExhausted extends Error                        errors/RetriesExhausted.ts
 ```
 
-**Key Distinction**: TransientError triggers retry, Blocked and CodeError do not.
+**Key Distinction**: `TransientError` triggers retry; `Blocked`, `CodeError`, and `RetriesExhausted` do not.
+
+**Implementation status:** `TransientError` extends `CodeError<C, D>` (not bare `Error`), inheriting the
+`code`/`data`/`_tag` pattern and adding the embedded `policy`. `Blocked` is a `TaggedError<'Blocked'>` carrying a
+`reason` union (`service` / `ended` / `index`) and an optional closure-based `BlockedConfig` (`maxAttempts` +
+`nextRetry(attempt)`), not a flat `resource` string. `RetriesExhausted` (`errors/RetriesExhausted.ts`) is the terminal
+error when a `Blocked` retry budget is consumed; both `Blocked` and `RetriesExhausted` are tree-shakable built-ins for
+workflow-engine integration. Realized in `errors/` (`n/op-context-tagged-errors` — `Blocked.ts` fenced `.blocked`).
 
 ## TransientError Class <a id="smoo/lmao!n/op-retry.transienterror-class"></a>
 
@@ -195,51 +202,67 @@ function calculateDelay(policy: RetryPolicy, attempt: number): number {
 
 ## Blocked Class <a id="smoo/lmao!n/op-context-tagged-errors.blocked-class"></a>
 
-Blocked represents a non-transient blocking condition - the operation cannot proceed and should NOT be retried. This is
-distinct from TransientError which indicates temporary failure.
+Blocked represents a non-transient blocking condition - the operation cannot proceed and should NOT be retried by the
+LMAO span retry loop (it signals structural unavailability that needs coordination at the engine level). This is
+distinct from TransientError which indicates temporary failure. Realized in `errors/Blocked.ts` (fenced
+`n/op-context-tagged-errors.blocked`).
 
 ### Factory Methods <a id="smoo/lmao!n/op-context-tagged-errors.factory-methods"></a>
 
 ```typescript
-class Blocked extends Error {
+class Blocked extends Error implements TaggedError<'Blocked'> {
+  static readonly _tag = 'Blocked' as const;
   readonly reason: BlockedReason;
-  readonly resource: string;
+  readonly blockedConfig: BlockedConfig | undefined;
 
   // Factory methods for common blocking scenarios
-  static service(name: string): Blocked;
-  static index(name: string): Blocked;
-  static ended(executionId: string): Blocked;
-  static resource(type: string, id: string): Blocked;
+  static service(name: string, config?: BlockedConfig): Blocked;
+  static index(indexName: string, config?: BlockedConfig): Blocked;
+  static ended(target: string, config?: BlockedConfig): Blocked;
 }
 
-// BlockedReason types
+// BlockedReason union (no `resource` variant — service/ended/index only)
 type BlockedReason =
-  | { type: 'service'; name: string }
-  | { type: 'index'; name: string }
-  | { type: 'ended'; executionId: string }
-  | { type: 'resource'; resourceType: string; resourceId: string };
+  | { readonly type: 'service'; readonly name: string }
+  | { readonly type: 'ended'; readonly target: string }
+  | { readonly type: 'index'; readonly indexName: string };
+
+// Closure-based retry config — the closure captures Op execution context, so each
+// re-execution can produce a fresh delay (e.g. updated Retry-After headers).
+interface BlockedConfig {
+  readonly maxAttempts?: number; // default 5, then RetriesExhausted
+  readonly nextRetry?: (attempt: number) => number; // delay ms before next retry
+}
 ```
 
 ### Usage <a id="smoo/lmao!n/op-context-tagged-errors.usage"></a>
 
 ```typescript
+import { Blocked } from '@smoothbricks/lmao/errors/Blocked';
+
 const processOrder = defineOp('processOrder', async (ctx, orderId: string) => {
   // Check if payment service is available
   if (!(await isServiceHealthy('payment-api'))) {
-    // Do NOT retry - service is down, wait for recovery
-    return ctx.err(Blocked.service('payment-api'));
+    // Do NOT retry in the span loop - service is down, wait for recovery
+    return new Err(Blocked.service('payment-api'));
   }
 
   // Check if order execution already completed
   const execution = await getExecution(orderId);
   if (execution.ended) {
     // Do NOT retry - execution already finished
-    return ctx.err(Blocked.ended(execution.id));
+    return new Err(Blocked.ended(execution.id));
   }
 
   // This CAN be retried if it fails transiently
   return ctx.span('charge-payment', chargePayment, orderId);
 });
+
+// Discriminate blocked from other errors at the call site
+const result = await trace('order', processOrder, orderId);
+if (result.isErr(Blocked)) {
+  // Handle temporary unavailability - retry, queue, etc.
+}
 ```
 
 ## Retry Loop Implementation <a id="smoo/lmao!n/op-retry.retry-loop-implementation"></a>
@@ -252,45 +275,46 @@ The retry loop is implemented in span execution (`spanContext.ts`), not at the t
 
 ### executeWithRetry Flow <a id="smoo/lmao!n/op-retry.executewithretry-flow"></a>
 
+The loop, `calculateDelay`, and `sleep` live in `spanContext.ts`, fenced `n/op-retry.loop` and `n/op-retry.delay`;
+success/error is discriminated by `instanceof Ok` / `Err` (not a `.success` field). One delay is computed and reused for
+both the `span-retry` entry and the `sleep`.
+
 ```typescript
-async function executeWithRetry<T, E>(buffer: SpanBuffer, fn: () => Promise<Result<T, E>>): Promise<Result<T, E>> {
+async function executeWithRetry<T extends LogSchema, S, E>(
+  buffer: SpanBuffer<T>,
+  fn: () => Result<S, E> | Promise<Result<S, E>>
+): Promise<Result<S, E>> {
   let attempt = 0;
-  let lastError: TransientError | null = null;
 
   while (true) {
     attempt++;
     const result = await fn();
 
     // Success - return immediately
-    if (result.success) {
+    if (result instanceof Ok) {
       return result;
     }
 
-    // Check error type
-    const error = result.error;
+    const error = (result as Err<E>).error;
 
-    // Blocked - return immediately, no retry
+    // Blocked - return immediately, no retry (structural unavailability)
     if (error instanceof Blocked) {
       return result;
     }
 
     // TransientError - check if we should retry
     if (error instanceof TransientError) {
-      const policy = error.policy;
+      const { policy } = error;
 
-      // Exhausted attempts - return final error
+      // Exhausted attempts (maxAttempts includes the initial) - return final error
       if (attempt >= policy.maxAttempts) {
         return result;
       }
 
-      // Write span-retry entry for observability
-      writeRetryEntry(buffer, attempt, error, calculateDelay(policy, attempt));
-
-      // Wait before retry
-      await sleep(calculateDelay(policy, attempt));
-
-      // Continue loop for next attempt
-      lastError = error;
+      // Compute the delay once, reuse for the entry and the wait
+      const delay = calculateDelay(policy, attempt);
+      writeRetryEntry(buffer, attempt, error, delay);
+      await sleep(delay);
       continue;
     }
 
@@ -302,11 +326,18 @@ async function executeWithRetry<T, E>(buffer: SpanBuffer, fn: () => Promise<Resu
 
 ### writeRetryEntry <a id="smoo/lmao!n/op-retry.writeretryentry"></a>
 
-Each retry attempt writes a `span-retry` entry to the buffer for observability:
+Each retry attempt writes a `span-retry` entry to the buffer for observability. Realized in `spanContext.ts`, fenced
+`n/lmao-entry-span-lifecycle-entry-types.retry` (the entry-type's spec side is `n/lmao-entry-retry-entry-type`). Beyond
+the message + error code, it writes `retry_attempt` and `retry_delay_ms` so attempt/delay are directly queryable columns
+in the Arrow output:
 
 ```typescript
-function writeRetryEntry(buffer: SpanBuffer, attempt: number, error: TransientError, delayMs: number): void {
-  // Get current write index
+function writeRetryEntry<T extends LogSchema>(
+  buffer: SpanBuffer<T>,
+  attempt: number,
+  error: TransientError<string, unknown>,
+  delayMs: number
+): void {
   const index = buffer._writeIndex;
 
   // Write entry via TraceRoot for timestamp handling
@@ -320,6 +351,10 @@ function writeRetryEntry(buffer: SpanBuffer, attempt: number, error: TransientEr
   if (error.code) {
     buffer.error_code(index, error.code);
   }
+
+  // Retry metadata for direct queryability
+  buffer.retry_attempt(index, attempt);
+  buffer.retry_delay_ms(index, delayMs);
 }
 ```
 
@@ -378,12 +413,14 @@ SpanContext.span0-span8()
 
 Each retry attempt produces a `span-retry` entry in the span buffer:
 
-| Column     | Value                       | Description              |
-| ---------- | --------------------------- | ------------------------ |
-| entry_type | 5 (ENTRY_TYPE_SPAN_RETRY)   | Identifies retry entry   |
-| timestamp  | nanoseconds since epoch     | When retry was triggered |
-| message    | `retry:op:{opName}`         | Queryable pattern        |
-| error_code | e.g., `SERVICE_UNAVAILABLE` | Error that caused retry  |
+| Column         | Value                       | Description                  |
+| -------------- | --------------------------- | ---------------------------- |
+| entry_type     | 5 (ENTRY_TYPE_SPAN_RETRY)   | Identifies retry entry       |
+| timestamp      | nanoseconds since epoch     | When retry was triggered     |
+| message        | `retry:op:{opName}`         | Queryable pattern            |
+| error_code     | e.g., `SERVICE_UNAVAILABLE` | Error that caused retry      |
+| retry_attempt  | attempt number (1-indexed)  | Which attempt triggered this |
+| retry_delay_ms | delay before next attempt   | Backoff delay applied (ms)   |
 
 ### Querying Retries <a id="smoo/lmao!n/lmao-entry-retry-entry-type.querying-retries"></a>
 
@@ -490,9 +527,11 @@ This system integrates with:
 
 ## Files <a id="smoo/lmao!n/op-retry.files"></a>
 
-| File                                           | Purpose                           |
-| ---------------------------------------------- | --------------------------------- |
-| `packages/lmao/src/lib/errors/Transient.ts`    | TransientError class and factory  |
-| `packages/lmao/src/lib/errors/Blocked.ts`      | Blocked class                     |
-| `packages/lmao/src/lib/spanContext.ts`         | executeWithRetry, writeRetryEntry |
-| `packages/lmao/src/lib/schema/systemSchema.ts` | ENTRY_TYPE_SPAN_RETRY constant    |
+| File                                               | Purpose                                                             |
+| -------------------------------------------------- | ------------------------------------------------------------------- |
+| `packages/lmao/src/lib/errors/Transient.ts`        | `TransientError` class + `Transient()` factory (`.transient` fence) |
+| `packages/lmao/src/lib/errors/retry-policy.ts`     | `RetryPolicy` + backoff helpers + `mergePolicy` (`.policy` fence)   |
+| `packages/lmao/src/lib/errors/Blocked.ts`          | `Blocked` class (`.blocked` fence)                                  |
+| `packages/lmao/src/lib/errors/RetriesExhausted.ts` | Terminal error when a `Blocked` retry budget is exhausted           |
+| `packages/lmao/src/lib/spanContext.ts`             | `executeWithRetry` / `calculateDelay` / `sleep` / `writeRetryEntry` |
+| `packages/lmao/src/lib/schema/systemSchema.ts`     | `ENTRY_TYPE_SPAN_RETRY` constant                                    |

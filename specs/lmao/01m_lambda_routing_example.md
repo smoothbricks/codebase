@@ -1,8 +1,22 @@
 # Lambda Routing Example: Library Composition with `op()` + `span()` <a id="smoo/lmao!n/lambda-routing-example"></a>
 
+> **Implementation status — illustrative example; construction surface renamed in source.** This is a worked
+> **example**, not a new contract: every behaviour it shows (op-wrapped operations, `span(name, op, …args)` invocation,
+> `tag`/`log`, dependency injection via `deps`, prefix-namespaced columns, shared dependency instances, the resulting
+> prefixed Arrow table) is realized today in `packages/lmao/src` — `defineOpContext`/`defineOp`/`defineOps`
+> (`lib/defineOpContext.ts`, fenced `smoo/lmao!n/opcontext-definition`), the op/span/tag/log context (`lib/op.ts`
+> `smoo/lmao!n/op-class`, `lib/spanContext.ts`), prefix remap (`lib/library.ts` `smoo/lmao!n/codegen-prefixed-remap`,
+> `lib/opContext/createOpGroup.ts` `smoo/lmao!n/column-mapping-api`), and the tracer (`lib/tracer.ts`
+> `smoo/lmao!n/tracer-architecture`). **But the module-construction surface in the code samples below is stale:** the
+> shipped API is `defineOpContext({ logSchema, deps, flags, ctx })` returning `{ defineOp, defineOps }` with
+> `deps: { auth: authOps.prefix('auth') }`, **not** `defineModule({ schema, deps })` + `op()` +
+> `.prefix('x').use({…})` + `.forContext({…})`. The current authored surface is
+> [`01l_op_context_pattern.md`](./01l_op_context_pattern.md). Truing the samples up to the shipped names is tracked as
+> `smoo/lmao!n/lambda-routing-example-api-trueup`.
+
 ## Overview <a id="smoo/lmao!n/lambda-routing-example-overview"></a>
 
-This spec demonstrates how the `defineModule()` API enables elegant library composition through a practical Lambda
+This spec demonstrates how the LMAO op-context API enables elegant library composition through a practical Lambda
 routing example. It showcases:
 
 1. **Clean library authoring** with unprefixed schemas
@@ -656,7 +670,6 @@ resolvers, or microservice gateways.
 ## Integration with Other Specs <a id="smoo/lmao!n/lambda-routing-example-integration"></a>
 
 - **[Op Context Pattern](./01l_op_context_pattern.md)**: Defines `defineOpContext()`, `defineOp()`, and Tracer API
-  contract
 - **[Library Integration Pattern](./01e_library_integration_pattern.md)**: RemappedBufferView for Arrow conversion
 - **[Context Flow](./01c_context_flow_and_op_wrappers.md)**: How context propagates through span() calls
 - **[Trace Schema System](./01a_trace_schema_system.md)**: `S.enum()`, `S.category()`, `S.text()` definitions

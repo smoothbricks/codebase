@@ -1,4 +1,4 @@
-//#region corpos/billing!n/audit-pricing-metering.lmao-buffer-strategy
+//#region smoo/lmao!n/buffer-strategy
 /**
  * BufferStrategy - Abstraction for SpanBuffer memory management and Arrow conversion.
  *
@@ -105,4 +105,4 @@ export interface BufferStrategy<T extends LogSchema = LogSchema> {
    */
   releaseBuffer(buffer: AnySpanBuffer): void;
 }
-//#endregion corpos/billing!n/audit-pricing-metering.lmao-buffer-strategy
+//#endregion smoo/lmao!n/buffer-strategy

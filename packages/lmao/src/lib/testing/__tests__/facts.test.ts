@@ -286,10 +286,10 @@ describe('trace-testing example', () => {
     // Simulate facts collected from a trace
     const facts = createFactArray([
       spanStarted('execute-loop'),
-      spanStarted('reduce'),
+      spanStarted('prepare'),
       tagFact('event_count', 5),
-      spanOk('reduce'),
-      spanStarted('decide'),
+      spanOk('prepare'),
+      spanStarted('plan'),
       spanStarted('op:reserveInventory'),
       tagFact('sku', 'SKU-A'),
       tagFact('quantity', 2),
@@ -297,7 +297,7 @@ describe('trace-testing example', () => {
       spanStarted('op:chargePayment'),
       logInfo('Charging $49.99'),
       spanOk('op:chargePayment'),
-      spanOk('decide'),
+      spanOk('plan'),
       spanOk('execute-loop'),
     ]);
 
@@ -307,8 +307,8 @@ describe('trace-testing example', () => {
     // The execution completed successfully
     expect(facts.has(spanOk('execute-loop'))).toBe(true);
 
-    // Reduce happened before decide
-    expect(facts.hasInOrder([spanOk('reduce'), spanStarted('decide')])).toBe(true);
+    // Preparation happened before planning
+    expect(facts.hasInOrder([spanOk('prepare'), spanStarted('plan')])).toBe(true);
 
     // Inventory was reserved before payment was charged
     expect(facts.hasInOrder([spanOk('op:reserveInventory'), spanStarted('op:chargePayment')])).toBe(true);

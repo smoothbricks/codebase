@@ -16,6 +16,7 @@ The wrapper records traces on request path and flushes asynchronously via `ctx.w
 ## Non-Goals <a id="smoo/lmao!n/cf-fetch-wrapper-non-goals"></a>
 
 - This wrapper is not prepaid/budget enforcement logic.
+- This wrapper does not aggregate usage itself; it emits trace chunks for later aggregation.
 
 ## Runtime Constraints <a id="smoo/lmao!n/cf-fetch-wrapper-runtime-constraints"></a>
 
@@ -24,6 +25,12 @@ The wrapper records traces on request path and flushes asynchronously via `ctx.w
 - Durable delivery must rely on external systems (Queue/object storage), not isolate memory.
 
 ## Wrapper API <a id="smoo/lmao!n/cf-fetch-wrapper-api"></a>
+
+> **Implementation status:** the `withLmaoTracing` fetch-wrapper, its `TraceWrapperConfig`, and the `WrappedFetch` type
+> are **not yet implemented** in `packages/lmao/src`. The tracer/buffer primitives the wrapper composes
+> (`ArrayQueueTracer`, `JsBufferStrategy`, `createTraceRoot`, `Tracer.trace`, `drain`, `bufferStrategy.toArrowTable` /
+> `releaseBuffer`) all ship today — the wrapper is the unwritten orchestration over them. Tracked as
+> `n/cf-fetch-wrapper-impl`.
 
 ```typescript
 import type { OpContextBinding } from '@smoothbricks/lmao';
@@ -71,6 +78,24 @@ const tracer = new ArrayQueueTracer(opContext, {
 
 ## Trace Chunk Envelope <a id="smoo/lmao!n/cf-fetch-wrapper-chunk-envelope"></a>
 
+**Lane note** (per
+[01u §Collection Lanes and Fallbacks](./01u_cloudflare_trace_segments.md#smoo/lmao!n/cf-trace-segments-hop)): on the
+primary diagnostic lane — the Cloudflare Pipelines stream binding — the `enqueue` seam sends **rows** (JSON-serializable
+records), because Pipelines owns batching and Parquet encoding for the raw tier. The `TraceChunkEnvelope` below remains
+the payload format for the Queues fallback lane and for the compactor's archive primitives
+([01t](./01t_trace_archive_pipeline.md)); the flush triggers, delivery semantics, and failure handling in this spec
+apply to both payload shapes.
+
+> **Implementation status — spec/source drift, source is the shipped contract.** The envelope below is the request-path
+> producer's view. The **shipped** `TraceChunkEnvelope` lives in `packages/lmao/src/lib/archive/chunkEnvelope.ts`
+> (`buildTraceChunkEnvelope`) and carries a different, archival-oriented shape: `chunk_id` (deterministic FNV-1a hash —
+> the dedupe key), `file_ref`, `chunk_ref`, `row_count`, `started_at_ms` / `ended_at_ms`, `partition_keys`, and
+> `metadata`. The producer-side fields the wrapper spec names here (`emitted_at`, `domain`, `runtime`, `trace_format`,
+> `compression`, `payload_bytes`, `metadata.{batch_count,first_ts,last_ts}`) are **not** on the shipped type.
+> Reconciling the producer envelope with the shipped archival envelope (one type, or an explicit producer→archival
+> mapping) is tracked as `n/cf-fetch-wrapper-envelope-reconcile`; the `chunk_id` idempotency guarantee (below) already
+> holds in source.
+
 ```typescript
 type TraceChunkEnvelope = {
   chunk_id: string; // idempotency key
@@ -105,6 +130,11 @@ If none are met during a request, implementation MAY keep best-effort in-memory 
 - `chunk_id` must be stable and dedupe-safe.
 - Consumers must deduplicate by `chunk_id`.
 
+> **Implementation status:** the stable, dedupe-safe `chunk_id` is realized — `buildTraceChunkEnvelope`
+> (`packages/lmao/src/lib/archive/chunkEnvelope.ts`) derives it from a canonical, sorted serialization via FNV-1a, so
+> identical chunk content yields an identical id (covered by `trace-archive-primitives.test.ts`). At-least-once delivery
+> and consumer dedup are queue-transport contracts, satisfied by the consumer keying on this `chunk_id`.
+
 ## Failure Handling <a id="smoo/lmao!n/cf-fetch-wrapper-failure-handling"></a>
 
 - Enqueue failures occur in background via `waitUntil`; they must not block response return.
@@ -113,7 +143,13 @@ If none are met during a request, implementation MAY keep best-effort in-memory 
 
 ## Downstream Archival Contract <a id="smoo/lmao!n/cf-fetch-wrapper-archival-contract"></a>
 
-agent:
+> **Implementation status:** the LMAO data-plane primitives this contract names ship in `packages/lmao/src/lib/archive/`
+> — `buildTraceChunkEnvelope` (chunk identity), `compactTraceChunks` (time-windowed compaction), and
+> `inspectPartitionCardinality` / `splitChunkByPartition` (mixed-group split before group-targeted routing) — the
+> realization of items 2–3 below. The archive control plane (listener registration, wake/fan-out, per-consumer cursor)
+> is owned by the consuming system, not this package.
+
+Queue consumers should route drained chunk envelopes into an archival flow built on LMAO's data-plane primitives:
 
 - LMAO owns data-plane chunk primitives (`chunk_id`, partition inspection/split helpers, compaction helpers).
 
@@ -134,6 +170,12 @@ export default {
 ```
 
 ## Reference Flush Routine <a id="smoo/lmao!n/cf-fetch-wrapper-flush-routine"></a>
+
+> **Implementation status:** the drain→convert→release primitives this routine chains ship today
+> (`ArrayQueueTracer.drain`, `tracer.bufferStrategy.toArrowTable`, `releaseBuffer` —
+> `packages/lmao/src/lib/tracers/ArrayQueueTracer.ts` + `packages/lmao/src/lib/tracer.ts`). The
+> `encodeArrowTableAsChunkEnvelope` step is unimplemented and lands with the wrapper + envelope-reconcile work
+> (`n/cf-fetch-wrapper-impl`, `n/cf-fetch-wrapper-envelope-reconcile`).
 
 ```typescript
 async function flushTraceBatch<B extends OpContextBinding>(

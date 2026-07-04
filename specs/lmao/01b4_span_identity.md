@@ -143,26 +143,26 @@ Worker B (thread_id: 0xCCC): span_id 1, 2...              (all traces combined)
 
 ### Runtime Representation
 
+The thread-local counter is a **per-realm singleton in the generated buffer-class constructor** (not a hand-written
+module variable): each SpanBuffer construction does `const spanId = ++globalThis.globalSpanCounter` (lazily initialised
+to `0`, so the first span on a realm gets `1`), in `packages/lmao/src/lib/spanBuffer.ts`'s `constructorPreamble`. ES
+modules are one-per-realm, so each worker/Worker gets its own counter and its own `thread_id` (from `threadId.ts`) with
+zero coordination.
+
 ```typescript
-// Module-level thread-local counter (per-worker, initialized once at startup)
-// NOT per-class, NOT per-trace - one counter per worker that increments across all traces
-let nextSpanId = 1;
-
-// thread_id comes from thread_id.ts module-level singleton (not a parameter)
-// Module and spanName are passed directly (flattened from TaskContext)
-
-function createSpanBuffer(schema, module, spanName, trace_id, capacity): SpanBuffer {
-  const SpanBufferClass = getSpanBufferClass(schema); // Cached per schema
-  return new SpanBufferClass(
-    capacity,
-    module, // Op's module context
-    spanName, // Span name
-    undefined, // parent
-    false, // isChained
-    trace_id,
-    undefined // callsiteModule
-  );
+// In the generated SpanBuffer constructor (spanBuffer.ts constructorPreamble):
+// thread-local span counter, per realm (worker/Worker), increments across ALL traces
+if (typeof globalThis.globalSpanCounter === 'undefined') {
+  globalThis.globalSpanCounter = 0;
 }
+const spanId = ++globalThis.globalSpanCounter;
+// thread_id bytes come from threadId.ts (writeThreadIdToUint64Array); both are written
+// into the packed identity section of the buffer's _system ArrayBuffer.
+
+// Root buffers are created by createSpanBuffer(schema, traceRoot, opMetadata, capacity?)
+// — the TraceRoot (trace_id + anchors) and op metadata are passed in; span_id/thread_id
+//   are assigned inside the constructor, not by the caller.
+const rootBuffer = createSpanBuffer(schema, traceRoot, opMetadata);
 ```
 
 ### Arrow Conversion
@@ -360,27 +360,39 @@ console.log(rootSpan.trace_id === childSpan.trace_id); // true (same reference)
 
 ### SpanBuffer Integration
 
+> **Implementation status** (system state). The realized layout differs from an earlier "`span_id: SpanIdentity` 25-byte
+> ArrayBuffer" sketch. In `packages/lmao/src/lib/spanBuffer.ts` (the generated buffer class) the identity is a **packed
+> byte section** inside the buffer's `_system` ArrayBuffer: `[threadId(8)][spanId(4)]` for a CHILD (12 bytes),
+> `[threadId(8)][spanId(4)][traceIdLen(1)][traceId(N)]` for a ROOT (13 + N bytes); a CHAINED overflow buffer **shares**
+> the parent's `_identity` reference. `span_id` is a `uint32` getter reading bytes `[8:12]`; `thread_id` a `uint64`
+> getter over `[0:8]`; `trace_id` walks the parent chain to the root and decodes. `parent_span_id` / `parent_thread_id`
+> delegate to the parent **pointer** (no copied bytes). `isParentOf` / `isChildOf` are O(1) **pointer** comparisons
+> (`this === other._parent`), exactly the "parent ancestry via pointer" decision below — not a `SpanIdentity` method.
+
 ```typescript
+// Realized shape (packages/lmao/src/lib/spanBuffer.ts, generated getters):
 interface SpanBuffer {
-  // TraceId is a shared string reference (zero-copy across spans)
-  trace_id: TraceId;
+  // TraceId is a shared string reference (zero-copy across spans), walked up to the root
+  get trace_id(): TraceId;
 
-  // SpanIdentity is per-span (25-byte ArrayBuffer)
-  span_id: SpanIdentity;
+  // span_id / thread_id read from the packed identity bytes (uint32 / uint64)
+  get span_id(): number; // bytes [8:12] of _identity
+  get thread_id(): bigint; // bytes [0:8] of _identity
 
-  // Comparison methods check BOTH trace_id AND span_id
-  isParentOf(other: SpanBuffer): boolean;
-  isChildOf(other: SpanBuffer): boolean;
-}
+  // parent ids delegate to the parent pointer (no separate storage)
+  get parent_span_id(): number; // this._parent?.span_id ?? 0
+  get parent_thread_id(): bigint; // this._parent?.thread_id ?? 0n
 
-// Implementation
-function isParentOf(this: SpanBuffer, other: SpanBuffer): boolean {
-  // Fast string reference comparison first
-  if (this.trace_id !== other.trace_id) return false;
-  // Then SpanIdentity comparison
-  return this.span_id.isParentOf(other.span_id);
+  // O(1) pointer comparison (NOT a trace_id + SpanIdentity check)
+  isParentOf(other: SpanBuffer): boolean; // this === other._parent
+  isChildOf(other: SpanBuffer): boolean; // this._parent === other
 }
 ```
+
+> The `SpanIdentity` **interface** (`packages/lmao/src/lib/traceId.ts`:
+> `{ trace_id, span_id: number, thread_id: bigint }`, with `extractSpanIdentity(buffer)`) is a **separate, flat
+> external-correlation shape** — the value handed to external systems (distributed trace headers, error reporting). It
+> is **not** the in-buffer identity and carries no comparison methods.
 
 ### Benefits
 

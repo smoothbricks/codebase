@@ -13,8 +13,15 @@ The Arrow Table Structure defines the final queryable format produced by the tra
 
 ## Zero-Copy Mandate <a id="smoo/lmao!n/arrow-table-zero-copy"></a>
 
-**CRITICAL**: All Arrow conversions MUST use `arrow.makeData()` with direct TypedArray references. The builder pattern
-(`arrow.makeBuilder()`) is **PROHIBITED** because it copies every value during append operations.
+**CRITICAL**: All Arrow conversions MUST wrap **direct TypedArray references** (`subarray()` views). The builder pattern
+is **PROHIBITED** because it copies every value during append operations.
+
+> **Implementation status.** The realization uses `@uwdata/flechette`, not `apache-arrow`: the zero-copy wrap is a
+> flechette `Batch` constructor taking `values: x.subarray(0, length)`, surfaced through the
+> `create{Uint8,Uint16,Uint32,Int32,Float64,Bool,Utf8,Dictionary*}Data` helpers in
+> `packages/arrow-builder/src/lib/arrow/data.ts`. The `arrow.makeData()` / `arrow.makeBuilder()` names below are the
+> original apache-arrow framing; the commitment (direct TypedArray references, no builder) is unchanged — only the
+> library API differs. See [Implementation](#implementation).
 
 ### Reference Pattern <a id="smoo/lmao!n/arrow-table-zero-copy.reference"></a>
 
@@ -1227,55 +1234,49 @@ efficiency and shared dictionaries.
 - **Depth-first pre-order traversal**: Parents before children (optimal for queries and compression)
 - **Buffer overflow handling**: Multiple buffers with same span_id yielded contiguously
 
-## Current Implementation Status <a id="smoo/lmao!n/arrow-table-impl"></a>
+## Implementation <a id="smoo/lmao!n/arrow-table-impl"></a>
 
-**✅ ZERO-COPY IMPLEMENTATION COMPLETE**: The implementation in `packages/lmao/src/lib/convertToArrow.ts` uses
-`arrow.makeData()` exclusively.
+The conversion lives in `packages/lmao/src/lib/convertToArrow.ts` (`convertSpanTreeToArrowTable`, the two-pass tree walk
+of [01k](./01k_tree_walker_and_arrow_conversion.md)). The columnar back-end is **`@uwdata/flechette`** (not
+`apache-arrow`): the [Zero-Copy Mandate](#zero-copy-mandate) is honored by constructing flechette `Batch` objects
+directly from `subarray()` views — the builder pattern is never used. The generic zero-copy `Batch` constructors live in
+`packages/arrow-builder/src/lib/arrow/data.ts`:
 
-**Implementation Details**:
+- `createUint8Data` / `createUint16Data` / `createUint32Data` / `createInt32Data` / `createFloat64Data` /
+  `createBoolData` — primitive columns: `values: values.subarray(0, length)` wrapped in a flechette `Batch` (no copy).
+- `createUtf8Data` — plain UTF-8 columns from a packed `data` buffer + `Int32Array` offsets.
+- `createDictionary8Data` / `createDictionary16Data` / `createDictionary32Data` — dictionary columns: an index array +
+  the shared UTF-8 dictionary `Column`, the index width chosen by unique count.
+- `concatenateUint8Arrays` / `concatenateFloat64Arrays` / `concatenateNullBitmaps`
+  (`packages/lmao/src/lib/arrow/utils.ts`) — buffer-chain concatenation across overflow buffers (one copy, still cheaper
+  than per-value `append()`).
 
-1. ✅ `createZeroCopyData()` helper function - direct TypedArray wrapping with arrow.makeData()
-2. ✅ `concatenateTypedArrays()` helper - efficient buffer chain concatenation
-3. ✅ `concatenateNullBitmaps()` helper - null bitmap merging across buffers
-4. ✅ Primitive columns (number, boolean, timestamp) - direct subarray() + concatenation
-5. ✅ Dictionary columns (enum, category, text, trace_id, package_name, package_file, span_name, entry_type) - index
-   arrays + dictionary vectors
-6. ✅ System columns - all use zero-copy with direct TypedArray construction
+`convertToArrow.ts` itself drives `buildColumn` / `buildData` / `buildTable` over these primitives, plus
+`buildTimestampColumn`, `buildEntryTypeColumn`, `buildPerBufferDictColumn`, and `buildBinaryColumnFromBuffers` for the
+system columns. Dictionary building (`DictionaryBuilder`, `createSortedDictionary`) is the arrow-builder side of
+[01k](./01k_tree_walker_and_arrow_conversion.md).
 
-**Key Implementation Patterns**:
+**Key Patterns**:
 
 ### Primitive Columns (Float64, Uint8, etc.) <a id="smoo/lmao!n/arrow-table-impl.primitive"></a>
 
 ```typescript
-// Collect value arrays from each buffer
+// Collect value arrays from each buffer (subarray = zero-copy view)
 const valueArrays = buffers.map((buf) => buf.column.subarray(0, buf._writeIndex));
-// Concatenate (one copy, but still better than builder's per-value copy)
-const allValues = concatenateTypedArrays(valueArrays);
+// Concatenate across the overflow chain (one copy, still cheaper than builder per-value append)
+const allValues = concatenateFloat64Arrays(valueArrays);
 const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
-// Zero-copy wrap
-const data = arrow.makeData({ type, length, nullCount, data: allValues, nullBitmap });
-vectors.push(arrow.makeVector(data));
+// Wrap as a flechette Batch — values.subarray() is referenced, not copied
+const batch = createFloat64Data(allValues, allValues.length, nullBitmap);
+vectors.push(new Column([batch]));
 ```
 
 ### Dictionary Columns (enum, category, text) <a id="smoo/lmao!n/arrow-table-impl.dictionary"></a>
 
 ```typescript
-// Collect index arrays
-const indexArrays = buffers.map((buf) => buf.column_values.subarray(0, buf._writeIndex));
-const allIndices = concatenateTypedArrays(indexArrays);
-const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
-// Create dictionary vector from interner
-const dictVector = arrow.makeVector(interner.getStrings());
-// Zero-copy wrap indices with dictionary
-const data = arrow.makeData({
-  type: new arrow.Dictionary(new arrow.Utf8(), indexType),
-  length,
-  nullCount,
-  data: allIndices,
-  nullBitmap,
-  dictionary: dictVector,
-});
-vectors.push(arrow.makeVector(data));
+// indices already in the correct width; the dictionary is the shared FinalizedDictionary
+const batch = createDictionary8Data(indices, dict.data, dict.offsets, length, nullBitmap);
+vectors.push(new Column([batch]));
 ```
 
 **Performance Benefits**:
@@ -1302,7 +1303,7 @@ This Arrow table structure integrates with:
   Arrow columns
 - **[Tree Walker and Arrow Conversion](./01k_tree_walker_and_arrow_conversion.md)**: Two-pass tree conversion with
   dictionary building, UTF-8 caching, and shared dictionaries across RecordBatches
-- **Background Processing Pipeline** (future document): Batch conversion process from buffers to Arrow/Parquet
+- **Background Processing Pipeline**: Batch conversion from buffers to Arrow/Parquet
 - **@uwdata/flechette batch.js**: Reference implementation for zero-copy Arrow data construction
 
 The flat table structure enables rich analytical queries while maintaining the performance benefits of columnar storage

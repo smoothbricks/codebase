@@ -6,6 +6,26 @@ Span scope attributes allow setting attributes at the span level that automatica
 and are inherited by child spans. This eliminates repetitive attribute setting, ensures consistency, and provides
 zero-hot-path allocation.
 
+> **Implementation status** (system state). Realized across four sites, with these names:
+>
+> - **Storage** — the buffer field is **`_scopeValues`** (underscore-prefixed per the SpanBuffer property convention),
+>   defaulting to the shared frozen singleton **`EMPTY_SCOPE`** (`packages/lmao/src/lib/spanBuffer.ts`), not a
+>   fresh-per-buffer `Object.freeze({})`. Child inheritance is by reference in the generated constructor
+>   (`this._scopeValues = parent ? parent._scopeValues : EMPTY_SCOPE`).
+> - **Merge** — the immutable merge (`null` deletes, `undefined` ignored, new frozen object) is the generated
+>   **`_setScope`** method (`packages/lmao/src/lib/codegen/spanLoggerGenerator.ts: generateSetScopeMethod`, region
+>   `smoo/lmao!n/codegen-spanlogger.scope`).
+> - **Public API** — `ctx.setScope(attributes: ScopeUpdate<T> | null)` and the read-only `ctx.scope` getter are wired in
+>   `packages/lmao/src/lib/spanContext.ts` (the destructured-context region `smoo/lmao!n/codegen-destructured-context`
+>   for `setScope`, plus the `scope` getter). The parameter type is `ScopeUpdate<T>` (a per-field-nullable map), not
+>   `Partial<SchemaValues<Schema> | null>`.
+> - **Arrow fill** — the cold-path NULL-cell fill is in `packages/lmao/src/lib/convertToArrow.ts` (`getStringScopeValue`
+>   / `getNumberScopeValue` / `getBooleanScopeValue` + the per-column fill).
+>
+> Behaviour is pinned by `packages/lmao/src/lib/__tests__/scope-attributes.test.ts`. The `scopeValues` /
+> `createSpanBuffer(capacity)` sketches below are illustrative of the contract; the realized names are `_scopeValues` +
+> `EMPTY_SCOPE`.
+
 **Key differences from direct writes**:
 
 - `tag.userId('123')` → writes to row 0 only (span-start)
@@ -66,17 +86,16 @@ doesn't apply. A plain object is simpler and works just as well.
 interface SpanBuffer {
   // ... existing fields (timestamps, entryTypes, etc.)
 
-  // Scope values - immutable object, replaced on each setScope call
-  scopeValues: Readonly<Record<string, unknown>>;
+  // Scope values - immutable object, replaced on each _setScope call
+  _scopeValues: Readonly<Record<string, unknown>>;
 }
 
-// Created with empty frozen scope
-function createSpanBuffer(capacity: number): SpanBuffer {
-  return {
-    // ... other fields
-    scopeValues: Object.freeze({}),
-  };
-}
+// Shared frozen singleton - the default _scopeValues for every buffer until setScope() is called
+// (avoids a fresh Object.freeze({}) allocation per buffer)
+const EMPTY_SCOPE: Readonly<Record<string, unknown>> = Object.freeze({});
+
+// In the generated constructor: child inherits the parent reference, root gets EMPTY_SCOPE
+this._scopeValues = parent ? parent._scopeValues : EMPTY_SCOPE;
 ```
 
 ### setScope API - Immutable Merge Semantics
@@ -189,12 +208,8 @@ const handleRequest = op(async (ctx, req) => {
 Child spans inherit parent's scope by **reference** (safe because scope objects are immutable):
 
 ```typescript
-function createChildSpanBuffer(parent: SpanBuffer): SpanBuffer {
-  return {
-    // ... other fields
-    scopeValues: parent.scopeValues, // Same reference - safe because immutable!
-  };
-}
+// In the generated SpanBuffer constructor (child case): share the parent reference
+this._scopeValues = parent._scopeValues; // Same reference - safe because immutable!
 ```
 
 **No copy needed!** Since scope objects are never mutated, sharing the reference is safe. When either parent or child

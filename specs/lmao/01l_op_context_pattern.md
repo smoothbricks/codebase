@@ -285,6 +285,11 @@ LMAO provides two result patterns:
 2. **`FluentOk`/`FluentErr`** - For fluent result builders with deferred tag application (returned by
    `ctx.ok()`/`ctx.err()`)
 
+> **Implementation status**: the shipped classes are `Ok<V>` and `Err<E>` in `packages/lmao/src/lib/result.ts` (the
+> `FluentOk`/`FluentErr` names above are illustrative). `Result<V, E>` is the union `Ok<V> | Err<E>`. The same
+> `Ok`/`Err` instances are both the type-safe result (`isOk`/`isErr(Tag)`/`map`/`match`/`unwrapOr`) and the fluent
+> buffer-row-1 writer (`.with()`/`.message()`/`.line()`) — there is no separate fluent-builder class.
+
 ### Result Class
 
 The `Result` class wraps success/error values and provides methods for type-safe error handling:
@@ -304,6 +309,7 @@ if (result.isErr()) {
   console.log(result.error);
 }
 
+// Tagged error discrimination (for use with a workflow engine or custom error types)
 if (result.isErr(Blocked)) {
   return result; // Pass through - engine handles retry
 }
@@ -353,12 +359,15 @@ if (result.isErr(NotFound)) {
 
 **Built-in Tagged Errors (tree-shakable):**
 
+LMAO provides `Blocked` and `RetriesExhausted` for engine integration. Import only if needed:
+
 ```typescript
 import { Blocked, RetriesExhausted } from '@smoothbricks/lmao';
 
 // In an Op that calls external services
 const result = await ctx.deps.indexStore.query(args);
 if (result.isErr(Blocked)) {
+  return result; // Pass through - the engine handles retry
 }
 
 // After max retries exhausted
@@ -441,6 +450,12 @@ export const myOps = defineOps({ ... });
 
 The Tracer is an abstract base class that manages trace execution and lifecycle. Concrete implementations define how
 trace data is collected, batched, and processed.
+
+> **Implementation status**: `Tracer` is `abstract class Tracer<B extends OpContextBinding>` in
+> `packages/lmao/src/lib/tracer.ts`. The constructor signature is `(binding, options)` where `TracerOptions` carries
+> `bufferStrategy` (required) and `createTraceRoot` (the platform time-anchor factory, 01b3) in addition to the optional
+> `flagEvaluator` — the spec's `options.flagEvaluator`-only sketch is incomplete. `trace`/`trace_op`/`trace_fn`/`flush`
+> are bound in the constructor for destructuring.
 
 ### Abstract Tracer Class
 
@@ -683,6 +698,8 @@ object arg:
 
 - preferred Op signatures: `(ctx)` or `(ctx, argObject)`
 - avoid multi-positional args for JSON invoke transports
+
+This keeps invoke handling deterministic and compatible with JSON shape-based dispatch contracts.
 
 ### Library Package
 

@@ -200,7 +200,7 @@ get span_id(): number {
 
 Thread ID is cached as raw bytes at module level (thread_id.ts) for zero-copy writes:
 
-````typescript
+```typescript
 // Module-level singleton (thread_id.ts)
 // Generated once per process/worker, cached as Uint8Array for zero-copy writes
 let thread_idBytes: Uint8Array | null = null;
@@ -216,8 +216,18 @@ function copyThreadIdTo(dest: Uint8Array, offset: number): void {
   ensureInitialized();
   dest.set(thread_idBytes!, offset); // Direct copy of cached bytes
 }
+```
 
 ### Constructor Implementation <a id="smoo/lmao!n/spanbuffer-layout.constructor"></a>
+
+**Implementation status**: Realized as a **generated** constructor — `getSpanBufferClass`
+(`packages/lmao/src/lib/spanBuffer.ts`) builds the `constructorPreamble` string passed to arrow-builder's
+`getColumnBufferClass`. The authoritative parameter list is `SpanBufferConstructor` (same file):
+`(capacity, stats, parent, isChained, callsiteMetadata, opMetadata, traceRoot)`. The illustrative class below predates
+that signature: the real constructor takes `stats`/`traceRoot`/`callsiteMetadata`/`opMetadata` (NOT `module`,
+`spanName`, or a `trace_id` string — `spanName` is written to `message_values[0]` by `writeSpanStart`, and `trace_id`
+comes from `traceRoot`). The unified `_system` layout, identity layout
+(`[threadId 8][spanId 4][traceIdLen 1][traceId N]`), and V8 hot-property ordering shown here are accurate.
 
 ```typescript
 class SpanBuffer {
@@ -307,7 +317,7 @@ class SpanBuffer {
     module.sb_totalCreated++;
   }
 }
-````
+```
 
 ### V8 In-Object Property Optimization
 
@@ -648,6 +658,13 @@ function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>): SpanB
 TraceRoot is created once per trace and shared by reference across all spans. It provides timestamp anchoring and tracer
 lifecycle hooks.
 
+**Implementation status**: Realized as `ITraceRoot` (`packages/lmao/src/lib/traceRoot.ts`), fenced under the
+high-precision-timestamp node `smoo/lmao!n/trace-root-timestamps` ([01b3](./01b3_high_precision_timestamps.md)), so this
+heading shares that realization rather than re-fencing it. The shipped interface adds `_system` (backing anchor buffer)
+and the `writeSpanStart`/`writeSpanEnd`/`writeLogEntry`/`getTimestampNanos` write API beyond the four read-only fields
+sketched below; `tracer` is `TracerLifecycleHooks` (carrying `onStatsWillResetFor`, the
+[Buffer Self-Tuning](./01b2_buffer_self_tuning.md) observability hook).
+
 ```typescript
 interface TraceRoot {
   /**
@@ -692,7 +709,14 @@ See [High-Precision Timestamps](./01b3_high_precision_timestamps.md) for timesta
 
 ## Capacity Statistics <a id="smoo/lmao!n/spanbuffer-layout.stats"></a>
 
-Each `SpanBufferClass` (generated per schema) has a static `stats` property for capacity tuning:
+Each `SpanBufferClass` (generated per schema) has a static `stats` property for capacity tuning.
+
+**Implementation status**: The shipped `SpanBufferStats` (`packages/lmao/src/lib/spanBufferStats.ts`) carries the three
+fields the utilization tuner actually reads — `capacity`, `totalWrites`, `spansCreated` (non-chained spans only). The
+`overflowWrites` / `totalCreated` / `overflows` fields below are NOT on the runtime interface; overflow accounting is
+derived during flush (see [Buffer Self-Tuning §Buffer Statistics Logging](./01b2_buffer_self_tuning.md)), and the
+`buffer.constructor.stats` accessor (`_stats` getter) replaces the per-instance variants. The example below is the
+original design sketch.
 
 ```typescript
 interface SpanBufferStats {

@@ -1,5 +1,12 @@
 # 01q: WASM Memory Architecture for SpanBuffer Storage <a id="smoo/lmao!n/wasm-mem"></a>
 
+> **Implementation status (realized).** This architecture is built and tested under `packages/lmao/src/lib/wasm/`. The
+> realized base node is `smoo/lmao!n/wasm-mem` (covers this whole spec by heading-subtree inheritance, 88 §1d); its
+> source spans are the dotted `#region` fences `.allocator` (`allocator.zig`), `.ts-allocator` (`wasmAllocator.ts`),
+> `.strategy` (`WasmBufferStrategy.ts`), `.spanbuffer` (`wasmSpanBuffer.ts`), `.trace-root` (`wasmTraceRoot.ts`), and
+> `.bench` (`benchmarks/js-vs-wasm.bench.ts` + `__tests__/wasm-integration.test.ts`). The four items under
+> [Deferred Work](#smoo/lmao!n/wasm-mem-deferred) are the only open follow-ups.
+
 ## Overview <a id="smoo/lmao!n/wasm-mem.overview"></a>
 
 This spec describes a WASM-based memory architecture for SpanBuffer columnar storage. The goal is to consolidate numeric
@@ -201,7 +208,7 @@ When freeing a block at offset `O` with block size `B`:
 
 3. If no merge possible, push to freelist at tier `T`
 
-### Address-Based Buddy Identification (Implemented) <a id="smoo/lmao!n/wasm-mem.address-based-buddy-identification"></a>
+### Address-Based Buddy Identification <a id="smoo/lmao!n/wasm-mem.address-based-buddy-identification"></a>
 
 Buddies are identified by address arithmetic, not stored pointers:
 
@@ -476,7 +483,7 @@ This naturally adapts to the OpContext's usage pattern without pre-reservation.
 | Data                   | Storage     | Notes                                                   |
 | ---------------------- | ----------- | ------------------------------------------------------- |
 | Span System            | WASM block  | timestamp (8B × capacity) + entry_type (1B × capacity)  |
-| Identity               | WASM block  | writeIndex, span_id, trace_id (144 bytes fixed)         |
+| Identity               | WASM block  | writeIndex, span_id, trace_id (128 bytes fixed)         |
 | Numeric columns (lazy) | WASM block  | Null bitmap + values together, allocated on first write |
 | Thread ID              | WASM header | Global for all spans (set once per worker/process)      |
 | Span ID counter        | WASM header | Monotonically increasing, used to assign span_id        |
@@ -685,52 +692,45 @@ For servers handling many requests:
 - One extra indirection: `_columnOffsets[colId]` lookup
 - Offset cached after first write per column
 
-## Implementation Status <a id="smoo/lmao!n/wasm-mem.implementation-map"></a>
+## Implementation Map <a id="smoo/lmao!n/wasm-mem.implementation-map"></a>
 
-**All phases complete and tested** - WASM memory architecture is fully integrated:
+The architecture spans Zig (the allocator + per-span lifecycle) and a TypeScript surface (buffer strategy, span buffer,
+codegen). It integrates with `TestTracer` / `StdioTracer` / `ArrayQueueTracer` via `WasmBufferStrategy`, with
+`defineOpContext()` and the logging API (tag, log, ok, err, span), with Arrow conversion via
+`convertSpanTreeToArrowTable()`, and with schema generation (`S.enum`, `S.category`, `S.text`, `S.number`, `S.boolean`).
+The pieces below are the commitments — what lives where, the file:symbol map.
 
-- ✅ Phase 1: WASM Allocator Module (Zig + TypeScript wrapper)
-- ✅ Phase 2: OpContext Integration (WasmBufferStrategy)
-- ✅ Phase 3: SpanBuffer Migration (WasmSpanBuffer with lazy allocation)
-- ✅ Phase 4: SpanLogger Codegen (numeric/string setters)
-- ✅ Phase 5: Trace Completion (block return to freelists)
-- ✅ Phase 6: Benchmarking (comprehensive JS vs WASM benchmarks)
+### WASM Allocator Module <a id="smoo/lmao!n/wasm-mem.allocator"></a>
 
-**Total implementation**: ~2,910 lines (Zig: 971 lines, TypeScript: 1,939 lines)
-
-The WASM architecture is production-ready and works seamlessly with:
-
-- `TestTracer`, `StdioTracer`, `ArrayQueueTracer` via `WasmBufferStrategy`
-- `defineOpContext()` and the entire logging API (tag, log, ok, err, span)
-- Arrow conversion via existing `convertSpanTreeToArrowTable()`
-- Schema generation (S.enum, S.category, S.text, S.number, S.boolean)
-
-### Phase 1: WASM Allocator Module ✅ COMPLETE <a id="smoo/lmao!n/wasm-mem.allocator"></a>
-
-Implemented in Zig (`packages/lmao/src/lib/wasm/allocator.zig`):
+Lives in Zig (`packages/lmao/src/lib/wasm/allocator.zig`):
 
 - Header initialization: `init()`, `reset()`
 - Tiered allocation: `alloc_span_system(capacity)`, `alloc_col_1b(capacity)`, `alloc_col_4b(capacity)`,
   `alloc_col_8b(capacity)`
 - Tiered deallocation with buddy merge: `free_span_system(offset, capacity)`, `free_col_1b(offset, capacity)`, etc.
-- Identity block allocation: `alloc_identity_root(trace_id_ptr, trace_id_len)`, `alloc_identity_child()`,
-  `free_identity(offset)`
+- Identity block allocation: `alloc_identity_root_for_js_write(trace_id_len)` (returns a packed u64
+  `(identity_offset << 32) | trace_id_field_offset` so JS writes the trace_id bytes directly — one copy, no scratch
+  buffer), `alloc_identity_child()`, `free_identity(offset)`
 - Span lifecycle: `span_start()`, `span_end_ok()`, `span_end_err()`, `write_log_entry()`
 - Column writes: `write_col_f64()`, `write_col_u32()`, `write_col_u8()`
 - Thread ID management: `set_thread_id()`, `get_thread_id_high()`, `get_thread_id_low()`
 - Freelist statistics: `get_freelist_len()`, `get_freelist_reuse_count()`, `get_freelist_split_count()`,
   `get_freelist_merge_count()`
 
+#### TypeScript wrapper <a id="smoo/lmao!n/wasm-mem.ts-allocator"></a>
+
 TypeScript wrapper (`packages/lmao/src/lib/wasm/wasmAllocator.ts`):
 
 - `createWasmAllocator(options)` - async factory
 - `createWasmAllocatorSync(wasmModule, options)` - sync factory
 - All WASM functions exposed with TypeScript types
+- Typed views (`u8`/`u32`/`i64`/`f64`) are refreshed automatically when `memory.buffer` identity changes after a grow;
+  the compiled module is cached (`cachedWasmModule`) so only instantiation, not recompilation, recurs per allocator
 - Capacity defaults to allocator's configured capacity but can be overridden per-call
 
-### Phase 2: OpContext Integration ✅ COMPLETE <a id="smoo/lmao!n/wasm-mem.strategy"></a>
+### OpContext Integration <a id="smoo/lmao!n/wasm-mem.strategy"></a>
 
-Implemented as `WasmBufferStrategy` (`packages/lmao/src/lib/wasm/WasmBufferStrategy.ts`):
+`WasmBufferStrategy` (`packages/lmao/src/lib/wasm/WasmBufferStrategy.ts`):
 
 - `WasmBufferStrategy` owns `WebAssembly.Memory` + allocator instance
 - Exposes typed views: `u8`, `u32`, `f64`, `i64` (cached, recreated after grow)
@@ -738,9 +738,10 @@ Implemented as `WasmBufferStrategy` (`packages/lmao/src/lib/wasm/WasmBufferStrat
 - Implements `BufferStrategy` interface for full Tracer compatibility
 - Handles memory growth via allocator's bump pointer mechanism
 
-### Phase 3: SpanBuffer Migration ✅ COMPLETE <a id="smoo/lmao!n/wasm-mem.spanbuffer"></a>
+### SpanBuffer <a id="smoo/lmao!n/wasm-mem.spanbuffer"></a>
 
-Implemented in `WasmSpanBuffer` (`packages/lmao/src/lib/wasm/wasmSpanBuffer.ts`, 942 lines):
+`WasmSpanBuffer` (`packages/lmao/src/lib/wasm/wasmSpanBuffer.ts`) — this region also covers
+[SpanLogger Codegen](#spanlogger-codegen), which is generated in the same file:
 
 - `WasmSpanBufferInstance` extends `AnySpanBuffer` for full API compatibility
 - Per-column storage replaced with `_columnPtrs: Int32Array` (WASM offsets, -1 = not allocated)
@@ -749,9 +750,9 @@ Implemented in `WasmSpanBuffer` (`packages/lmao/src/lib/wasm/wasmSpanBuffer.ts`,
 - Runtime class generation with schema-specific column methods
 - Identity block allocation (root stores trace_id, child inherits from parent)
 - System columns stored in WASM via `_systemPtr`
-- Full test coverage in `wasmSpanBuffer.test.ts` (52 tests)
+- Tests in `wasmSpanBuffer.test.ts`
 
-### Phase 4: SpanLogger Codegen ✅ COMPLETE <a id="smoo/lmao!n/wasm-mem.spanlogger-codegen"></a>
+### SpanLogger Codegen <a id="smoo/lmao!n/wasm-mem.spanlogger-codegen"></a>
 
 Code generation in `wasmSpanBuffer.ts`:
 
@@ -765,51 +766,58 @@ Code generation in `wasmSpanBuffer.ts`:
 - Fluent API preserved (all methods return `this`)
 - Supports both numeric (float64, uint32, uint8) and string (category, text) column types
 
-### Phase 5: Trace Completion ✅ COMPLETE <a id="smoo/lmao!n/wasm-mem.trace-completion-2"></a>
+### Span Lifecycle Writer <a id="smoo/lmao!n/wasm-mem.trace-root"></a>
 
-Implemented in `WasmBufferStrategy` (`packages/lmao/src/lib/wasm/WasmBufferStrategy.ts`):
+`WasmTraceRoot` (`packages/lmao/src/lib/wasm/wasmTraceRoot.ts`) writes span lifecycle events directly into WASM memory
+via the allocator's exports (`span_start`, `span_end_ok`, `span_end_err`, `write_log_entry`) instead of JS
+`ArrayBuffer`s, and implements `ITraceRoot` for `SpanContext`/`Tracer` compatibility. Factories `createWasmTraceRoot()`
+/ `createWasmTraceRootFactory()`.
+
+### Trace Completion <a id="smoo/lmao!n/wasm-mem.trace-completion-2"></a>
+
+In `WasmBufferStrategy` (`packages/lmao/src/lib/wasm/WasmBufferStrategy.ts`):
 
 - `releaseBuffer(buf)` - called when trace completes
-- `releaseSpanTree(buf)` - recursively walks span tree depth-first
+- `freeSpanTree(buf)` (private) - recursively walks the span tree depth-first
 - Returns Span System blocks to freelist via `freeSpanSystem()`
 - Returns each allocated numeric block to its size-class freelist (1B, 4B, 8B)
 - Returns identity blocks to identity freelist
 - String arrays left for JavaScript GC
 - Freelist merges enabled by address-based buddy allocation
-- Supports capacity tuning by discarding orphaned blocks (simple, effective)
+- Supports capacity tuning by discarding orphaned blocks
 
-### Phase 6: Benchmarking ✅ COMPLETE <a id="smoo/lmao!n/wasm-mem.bench"></a>
+### Benchmarking <a id="smoo/lmao!n/wasm-mem.bench"></a>
 
-Implemented in `benchmarks/js-vs-wasm.bench.ts`:
+`benchmarks/js-vs-wasm.bench.ts` compares JS (`JsBufferStrategy`) vs WASM (`WasmBufferStrategy`) on throughput
+(ops/second) across cold-start (simple trace, trace with tags, multiple log entries) and warm/steady-state (simple
+trace, tags, nested spans, multiple entries, memory reuse) scenarios, using `mitata`. End-to-end coverage lives in
+`wasm-integration.test.ts`.
 
-- Comprehensive benchmarks comparing JS (`JsBufferStrategy`) vs WASM (`WasmBufferStrategy`)
-- Cold start scenarios: simple trace, trace with tags, multiple log entries
-- Warm/steady-state scenarios: simple trace, tags, nested spans, multiple entries, memory reuse
-- Uses `mitata` benchmarking framework
-- Measures throughput (ops/second) for realistic workloads
-- Integration tests in `wasm-integration.test.ts` (full end-to-end test suite)
-- `WasmTracer` disabled tests available (wasmTracer.test.ts.disabled) for future work
+## Resolved Decisions <a id="smoo/lmao!n/wasm-mem.resolved-decisions"></a>
 
-## Open Questions (Resolved/Deferred) <a id="smoo/lmao!n/wasm-mem.resolved-decisions"></a>
+Three earlier questions are settled, and their resolutions are commitments:
 
-1. ~~**Capacity tuning**: Accept orphaned blocks, or track blocks by capacity?~~ ✅ **RESOLVED**: Accept orphaned blocks
-   during capacity tuning - simple, effective, capacity stabilizes quickly in practice.
+- **Capacity tuning** — on a capacity change, orphaned freelist blocks are discarded rather than tracked per capacity;
+  capacity stabilizes quickly, so the waste is transient (see
+  [Capacity Tuning Considerations](#capacity-tuning-considerations)).
+- **View invalidation** — TypedArray views are cached in `WasmAllocator` and recreated after `memory.grow()`; memory
+  grows only when freelists are empty and the bump area is exhausted (see [Growth](#growth)).
+- **Overflow buffers** — `createWasmOverflowBuffer()` allocates from the same allocator, so overflow buffers reuse the
+  OpContext's memory.
 
-2. **String column pooling**: Should we pool `string[]` arrays too? 🚧 **DEFERRED**: Not implemented. String arrays left
-   for GC. Could be future optimization but not critical since strings are cold-path.
+## Deferred Work <a id="smoo/lmao!n/wasm-mem-deferred"></a>
 
-3. ~~**View invalidation**: How to handle `memory.grow()` invalidating TypedArray views?~~ ✅ **RESOLVED**: Views cached
-   in `WasmAllocator` but allocator grows memory conservatively for benchmarks. Memory grows only when freelists empty
-   and bump area exhausted.
+Each item below is genuinely open and is tracked as a node under `smoo/lmao!n/wasm-mem` (not a silent gap):
+`n/wasm-mem-string-pooling`, `n/wasm-mem-per-capacity-freelists`, `n/wasm-mem-hotpath-inline`, `n/wasm-mem-wasm-tracer`.
 
-4. ~~**Overflow buffers**: Do overflow buffers allocate from same WASM memory?~~ ✅ **RESOLVED**: Yes -
-   `createWasmOverflowBuffer()` allocates from the same allocator, enabling memory reuse across overflow buffers.
-
-## Future Optimizations (Not Currently Implemented) <a id="smoo/lmao!n/wasm-mem-deferred"></a>
-
-- **String array pooling**: Pool `string[]` arrays to reduce GC pressure in long-running processes
-- **Per-capacity freelists**: Track blocks by capacity to avoid orphaning during self-tuning (more complex)
-- **Hot path optimizations**: Further inline WASM exports, elide bounds checking via capacity constraints
+- **String array pooling** (`n/wasm-mem-string-pooling`) — pool `string[]` arrays to cut GC pressure in long-running
+  processes. Strings are cold-path, so this is an optimization, not a correctness requirement.
+- **Per-capacity freelists** (`n/wasm-mem-per-capacity-freelists`) — track blocks by capacity to avoid orphaning during
+  self-tuning, replacing the discard-on-tune decision above.
+- **Hot-path inlining** (`n/wasm-mem-hotpath-inline`) — further inline the WASM exports and elide bounds checking via
+  capacity constraints.
+- **`WasmTracer`** (`n/wasm-mem-wasm-tracer`) — a tracer reading directly from WASM memory; the disabled
+  `wasmTracer.test.ts.disabled` is the seam.
 
 ## References <a id="smoo/lmao!n/wasm-mem.references"></a>
 
