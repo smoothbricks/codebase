@@ -8,6 +8,14 @@ import { renderPublishWorkflowYaml } from './publish-workflow.js';
 
 type ManagedKind = 'raw' | 'template' | 'generated';
 
+/**
+ * Repos may append their own content to a managed file below this marker —
+ * e.g. extra merge drivers in .gitattributes. Everything from the marker
+ * line onward is preserved verbatim across updates and ignored by the
+ * drift check; the managed section above it stays byte-exact.
+ */
+export const LOCAL_SECTION_MARKER = '# smoo-local: everything below this line is repo-owned and preserved';
+
 interface ManagedFile {
   kind: ManagedKind;
   source: string;
@@ -15,6 +23,16 @@ interface ManagedFile {
   executable?: boolean;
   releasePackagesOnly?: boolean;
 }
+
+/** Split a managed target's content into the managed part and the repo-owned tail. */
+function splitLocalSection(current: string): { managed: string; localTail: string } {
+  const index = current.indexOf(LOCAL_SECTION_MARKER);
+  if (index === -1) return { managed: current, localTail: '' };
+  return { managed: current.slice(0, index), localTail: current.slice(index) };
+}
+
+/** Test seam for the pure splitter. */
+export const splitLocalSectionForTest = splitLocalSection;
 
 export interface FileResult {
   target: string;
@@ -154,13 +172,15 @@ function applyManagedFile(
       throw new Error(`${file.target} exists but is not a regular file or symlink`);
     }
     const current = readFileSync(target, 'utf8');
-    if (current === content) {
+    const { managed, localTail } = splitLocalSection(current);
+    if (managed === content || (localTail !== '' && managed === `${content}\n`)) {
       return { target: file.target, action: 'unchanged' };
     }
     if (mode === 'check' || mode === 'diff') {
       return { target: file.target, action: 'drifted' };
     }
-    writeManagedFile(target, content, file.executable === true);
+    const next = localTail === '' ? content : `${content}\n${localTail}`;
+    writeManagedFile(target, next, file.executable === true);
     return { target: file.target, action: 'updated' };
   }
   if (mode === 'check' || mode === 'diff') {
