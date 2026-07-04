@@ -294,6 +294,11 @@ export function buildInsertSql(activeUserFields: readonly string[]): string {
    VALUES (?, ?, ?, ?, ?, ?, ?${userPlaceholders})`;
 }
 
+/** Read a user schema field for one buffer row, falling back to the buffer's scope values. */
+export function readSpanFieldValue(buffer: AnySpanBuffer, fieldName: string, row: number): unknown {
+  return readUserValue(buffer, fieldName, row) ?? readScopeValue(buffer, fieldName);
+}
+
 export function buildInsertParams(segment: SpanSegment, row: number, activeUserFields: readonly string[]): unknown[] {
   const { buffer, traceId, spanId, parentSpanId, rowOffset } = segment;
   const entryType = buffer.entry_type[row];

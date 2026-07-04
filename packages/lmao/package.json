@@ -26,6 +26,12 @@
       "import": "./dist/es.js",
       "default": "./dist/es.js"
     },
+    "./cloudflare": {
+      "types": "./dist/cloudflare.d.ts",
+      "development": "./src/cloudflare.ts",
+      "import": "./dist/cloudflare.js",
+      "default": "./dist/cloudflare.js"
+    },
     "./tracers": {
       "types": "./dist/lib/tracers/index.d.ts",
       "development": "./src/lib/tracers/index.ts",
