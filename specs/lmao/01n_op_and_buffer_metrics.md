@@ -375,22 +375,24 @@ timestamp | thread_id | package_name | package_file       | entry_type          
 
 ## User-Facing API <a id="smoo/lmao!n/op-metrics-uint64-api"></a>
 
-**Status: NOT YET IMPLEMENTED** — `n/op-metrics-uint64-api`. The `uint64_value` column exists in the system schema, but
-no fluent `.uint64(value)` method is generated on `tag` / `log` / the result builders, and there is no public
-`uint64_value` row-writer for user values. The block below is the target API.
+**Status: SHIPPED** — `n/op-metrics-uint64-api`. The `uint64_value` column exists in the system schema, and the fluent
+`uint64_value(value: bigint)` writer is generated on all three surfaces: `log` (`FluentLogEntry`, by
+`codegen/spanLoggerGenerator.ts`) and `tag` (`TagWriter`) / result (`ok`/`err`, `ResultWriter`, by
+`codegen/fixedPositionWriterGenerator.ts`). The method matches the Arrow column name 1:1 per the system-field naming
+convention; there is no short-form `.uint64()` alias (a second name for one column would violate that convention).
 
-Users can write `uint64_value` for their own purposes using the `.uint64()` method:
+Users can write `uint64_value` for their own purposes using the `uint64_value()` method:
 
 ```typescript
 const processRecords = op(async ({ log, tag, ok }, records) => {
   // Tag the span with a large count
-  tag.batchId(batchId).uint64(BigInt(recordCount));
+  tag.batchId(batchId).uint64_value(BigInt(recordCount));
 
   // Log with a large byte count
-  log.info('Processing complete').uint64(BigInt(bytesProcessed));
+  log.info('Processing complete').uint64_value(BigInt(bytesProcessed));
 
   // Return with a large total
-  return ok({ success: true }).uint64(BigInt(totalRecords));
+  return ok({ success: true }).uint64_value(BigInt(totalRecords));
 });
 ```
 
@@ -398,7 +400,7 @@ const processRecords = op(async ({ log, tag, ok }, records) => {
 
 - Users have large numbers too (byte counts, record counts, IDs)
 - Same column, same storage efficiency
-- Consistent API: `.uint64(value)` works on `tag`, `log`, and result methods
+- Consistent API: `uint64_value(value)` works on `tag`, `log`, and result methods
 
 ## Query Examples (ClickHouse) <a id="smoo/lmao!n/op-metrics.query-examples-clickhouse"></a>
 

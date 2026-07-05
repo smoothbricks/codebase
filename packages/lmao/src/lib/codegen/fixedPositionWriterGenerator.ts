@@ -55,6 +55,10 @@ export type TagWriter<T extends LogSchema> = {
    * Bulk set multiple attributes at once.
    */
   with(attributes: Partial<InferSchema<T>>): TagWriter<T>;
+  /**
+   * Set the reserved `uint64_value` column for this span-start row.
+   */
+  uint64_value(value: bigint): TagWriter<T>;
 } & {
   /**
    * Individual attribute setters - each returns `this` for chaining.
@@ -97,6 +101,10 @@ export type ResultWriter<T extends LogSchema, R = unknown, E = unknown> = {
    * Set the result-row source line (row 1).
    */
   line(lineNumber: number): ResultWriter<T, R, E>;
+  /**
+   * Set the reserved `uint64_value` column for this result row.
+   */
+  uint64_value(value: bigint): ResultWriter<T, R, E>;
 } & {
   /**
    * Individual attribute setters - each returns `this` for chaining.
@@ -297,11 +305,23 @@ const resultWriterClassCache = new WeakMap<LogSchema, unknown>();
 // ============================================================================
 
 /**
+ * TagWriter extension - adds the reserved system `uint64_value` writer (row 0).
+ */
+const tagWriterExtension: FixedPositionWriterExtension = {
+  methods: `
+uint64_value(value) {
+  this._buffer.uint64_value(this._pos, value);
+  return this;
+}
+`,
+};
+
+/**
  * Generate TagWriter class code for a schema.
  * TagWriter writes to position 0 (span-start row).
  */
 export function generateTagWriterClass(schema: LogSchema): string {
-  return generateFixedPositionWriterClass(schema, 0, 'GeneratedTagWriter');
+  return generateFixedPositionWriterClass(schema, 0, 'GeneratedTagWriter', tagWriterExtension);
 }
 
 /**
@@ -376,6 +396,11 @@ message(text) {
 
 line(lineNumber) {
   this._buffer.line(this._pos, lineNumber);
+  return this;
+}
+
+uint64_value(value) {
+  this._buffer.uint64_value(this._pos, value);
   return this;
 }
 `,
