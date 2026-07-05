@@ -34,6 +34,82 @@ function splitLocalSection(current: string): { managed: string; localTail: strin
 /** Test seam for the pure splitter. */
 export const splitLocalSectionForTest = splitLocalSection;
 
+/**
+ * A repo-owned block INSIDE the managed section — e.g. one extra pattern
+ * spliced into a formatter's list, where a trailing marker (LOCAL_SECTION_MARKER)
+ * can't express it because it isn't at the end of the file. Wrap it in
+ * `# smoo-local-begin` / `# smoo-local-end`; the block is anchored to the line
+ * immediately before `# smoo-local-begin`. On update, the block is re-spliced
+ * right after that same anchor line in the freshly rendered template — if the
+ * anchor no longer appears there (the template reworked that section), the
+ * update refuses rather than silently dropping the repo's customization.
+ */
+export const INLINE_LOCAL_BEGIN = '# smoo-local-begin';
+export const INLINE_LOCAL_END = '# smoo-local-end';
+
+interface InlineLocalBlock {
+  anchor: string;
+  lines: string;
+}
+
+/** Pull inline local blocks out of a managed section, returning the section
+ * with each block (and its markers) removed, plus the extracted blocks in
+ * the order they appeared. */
+function extractInlineLocalBlocks(managed: string): { withoutInline: string; blocks: InlineLocalBlock[] } {
+  const lines = managed.split('\n');
+  const kept: string[] = [];
+  const blocks: InlineLocalBlock[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line !== undefined && line.trim() === INLINE_LOCAL_BEGIN) {
+      const anchor = kept.at(-1);
+      if (anchor === undefined) {
+        throw new Error(`${INLINE_LOCAL_BEGIN} on line ${i + 1} has no preceding anchor line`);
+      }
+      const blockLines: string[] = [];
+      i += 1;
+      while (i < lines.length && lines[i]?.trim() !== INLINE_LOCAL_END) {
+        blockLines.push(lines[i] as string);
+        i += 1;
+      }
+      if (i >= lines.length) {
+        throw new Error(`${INLINE_LOCAL_BEGIN} anchored on "${anchor}" has no matching ${INLINE_LOCAL_END}`);
+      }
+      blocks.push({ anchor, lines: blockLines.join('\n') });
+      i += 1; // skip the END marker line itself
+      continue;
+    }
+    kept.push(line);
+    i += 1;
+  }
+  return { withoutInline: kept.join('\n'), blocks };
+}
+
+/** Test seam for the pure extractor. */
+export const extractInlineLocalBlocksForTest = extractInlineLocalBlocks;
+
+/** Re-splice extracted inline blocks into freshly rendered managed content,
+ * each immediately after its anchor line. A no-op when there are no blocks. */
+function reinsertInlineLocalBlocks(content: string, blocks: InlineLocalBlock[]): string {
+  if (blocks.length === 0) return content;
+  const lines = content.split('\n');
+  for (const block of blocks) {
+    const index = lines.indexOf(block.anchor);
+    if (index === -1) {
+      throw new Error(
+        `${INLINE_LOCAL_BEGIN} block anchored on "${block.anchor}" no longer matches any line in the updated ` +
+          'template — reconcile the repo-owned block manually',
+      );
+    }
+    lines.splice(index + 1, 0, INLINE_LOCAL_BEGIN, ...block.lines.split('\n'), INLINE_LOCAL_END);
+  }
+  return lines.join('\n');
+}
+
+/** Test seam for the pure re-splicer. */
+export const reinsertInlineLocalBlocksForTest = reinsertInlineLocalBlocks;
+
 export interface FileResult {
   target: string;
   action: 'created' | 'updated' | 'unchanged' | 'skipped' | 'skipped-symlink' | 'drifted' | 'ok-symlink';
@@ -173,13 +249,15 @@ function applyManagedFile(
     }
     const current = readFileSync(target, 'utf8');
     const { managed, localTail } = splitLocalSection(current);
-    if (managed === content || (localTail !== '' && managed === `${content}\n`)) {
+    const { withoutInline, blocks } = extractInlineLocalBlocks(managed);
+    if (withoutInline === content || (localTail !== '' && withoutInline === `${content}\n`)) {
       return { target: file.target, action: 'unchanged' };
     }
     if (mode === 'check' || mode === 'diff') {
       return { target: file.target, action: 'drifted' };
     }
-    const next = localTail === '' ? content : `${content}\n${localTail}`;
+    const rendered = reinsertInlineLocalBlocks(content, blocks);
+    const next = localTail === '' ? rendered : `${rendered}\n${localTail}`;
     writeManagedFile(target, next, file.executable === true);
     return { target: file.target, action: 'updated' };
   }
