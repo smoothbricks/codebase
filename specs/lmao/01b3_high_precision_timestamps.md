@@ -11,13 +11,18 @@ subsequent timestamps.
 
 > **Implementation status** (system state, not aspiration). The anchored-timestamp design is implemented as the
 > `TraceRoot` **class** (`ITraceRoot` interface in `packages/lmao/src/lib/traceRoot.ts`), with two platform classes:
-> `packages/lmao/src/lib/traceRoot.node.ts` (`process.hrtime.bigint()`, NAPI-accelerated writes) and
+> `packages/lmao/src/lib/traceRoot.node.ts` (`process.hrtime.bigint()`, pure-JS writes) and
 > `packages/lmao/src/lib/traceRoot.es.ts` (`performance.now()`). Each exposes `getTimestampNanos(): Nanoseconds`, the
 > per-trace anchor (`anchorEpochNanos`, `anchorPerfNow`), and the span-start/span-end/log write methods. Anchors and
-> `trace_id` live in a single `_system` `ArrayBuffer` (see the layout below `TRACE_ROOT_*_OFFSET`) so NAPI/WASM can read
-> them without BigInt extraction. The function-style `getTimestamp(buffer)` sketches below are illustrative; the
+> `trace_id` live in a single `_system` `ArrayBuffer` (see the layout below `TRACE_ROOT_*_OFFSET`) so the WASM path can
+> read them without BigInt extraction. The function-style `getTimestamp(buffer)` sketches below are illustrative; the
 > realized API is the class method `getTimestampNanos()`. Behaviour is pinned by
 > `packages/lmao/src/lib/__tests__/timestamp.test.ts`.
+>
+> **Native acceleration is WASM, not NAPI.** A Zig NAPI span-write backend was built and benchmarked against JS and WASM
+> (span timestamp writes, M1 Max: WASM ~48 ns, NAPI ~70–86 ns, JS ~85–98 ns); NAPI beat JS but lost to WASM, so the
+> node-gyp/NAPI path was removed in favor of the pure-Zig WASM memory architecture (01q). Node's `TraceRoot` writes are
+> plain JS today; the WASM allocator is the native fast path. There is no NAPI addon in the package.
 
 ### Core Design Principles
 

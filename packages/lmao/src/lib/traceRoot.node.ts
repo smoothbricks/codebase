@@ -52,8 +52,8 @@ export class TraceRoot implements ITraceRoot {
   private readonly _perfView: Float64Array;
 
   /**
-   * Cached anchor hrtime as BigInt for JS timestamp fallback.
-   * Only used if NAPI addon is not available.
+   * Cached anchor hrtime as the exact BigInt, so the JS timestamp delta stays
+   * correct after the f64 `anchorPerfNow` loses integer precision (~104 days uptime).
    */
   private readonly _anchorHrtimeBigInt: bigint;
 
@@ -165,7 +165,7 @@ export class TraceRoot implements ITraceRoot {
 export function createTraceRoot(trace_id: string, tracer: TracerLifecycleHooks): TraceRoot {
   const anchorEpochNanos = BigInt(Date.now()) * 1_000_000n;
   const anchorHrtimeBigInt = process.hrtime.bigint();
-  // Store as number for NAPI to read as f64
+  // Also store as f64 in the shared _system layout (WASM reads it without BigInt extraction)
   const anchorPerfNow = Number(anchorHrtimeBigInt);
   return new TraceRoot(createTraceId(trace_id), anchorEpochNanos, anchorPerfNow, anchorHrtimeBigInt, tracer);
 }

@@ -255,8 +255,8 @@ function defineModule<Schema, Deps, FF>(config: { metadata: ModuleMetadata; logS
 > `SpanBufferClass`, the user `fn`, and an optional `remappedViewClass` for prefixed ops). The `_invoke` flow sketched
 > below is split across `Tracer` (root spans) and `SpanContextImpl._spanPre` + the monomorphic `span0`–`span8` dispatch
 > (`packages/lmao/src/lib/spanContext.ts`): buffer creation, parent/child registration, `writeSpanStart` (row 0),
-> execute under try/catch, `writeSpanOk`/`writeSpanException` (row 1). The op factory is `defineOp`
-> (`packages/lmao/src/lib/opContext/defineOp.ts`), not `op()`.
+> execute under try/catch, `writeSpanEnd(buffer, ENTRY_TYPE_SPAN_OK/ERR)` (ok) and `SpanContextImpl._spanException`
+> (throw) (row 1). The op factory is `defineOp` (`packages/lmao/src/lib/opContext/defineOp.ts`), not `op()`.
 
 The `op()` factory creates Op instances that wrap user functions. Type parameters are ordered to match the function
 signature `(ctx, ...args) => Promise<Result>`:

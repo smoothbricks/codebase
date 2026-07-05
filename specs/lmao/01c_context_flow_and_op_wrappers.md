@@ -255,7 +255,7 @@ abstract class Tracer<T extends LogSchema> {
 }
 ```
 
-**Concrete implementations** (from `packages/lmao/src/lib/tracer/`):
+**Concrete implementations** (from `packages/lmao/src/lib/tracers/`):
 
 - `TestTracer` - Accumulates root buffers in `rootBuffers` array for inspection
 - `NoOpTracer` - Supported no-op implementation; useful for API/overhead comparison, but repo policy prefers observable
@@ -479,7 +479,7 @@ class Op<Ctx, Args extends unknown[], Result> {
 3. **Zero allocation deps**: `deps` is a plain object, not closures created per call
 4. **V8 hidden class friendly**: Op is a simple class with fixed structure
 5. **Single Ctx type param**: Op carries full Ctx requirement, contravariance at span() ensures compatibility
-6. **Direct lineNumber writes**: lineNumber passed as argument to span(), written directly to `lineNumber_values[0]` (NO
+6. **Direct lineNumber writes**: lineNumber passed as argument to span(), written directly to `line_values[0]` (NO
    lineNumber property on any context object)
 7. **Prototype-based user property inheritance**: `Object.create(parentSpanContext)` instead of copying properties
    - V8 inline caches make prototype access fast after warmup
@@ -591,7 +591,7 @@ const createUser = defineOp('createUser', async (ctx, userData: UserData) => {
 2. **Name provided by caller**: The span name - caller decides contextually
 3. **Op provided by caller**: The Op instance to invoke
 4. **Args passed through**: Remaining arguments go to the op function
-5. **lineNumber written directly**: Written to `lineNumber_values[0]` inside \_invoke() (NO intermediate object storage)
+5. **lineNumber written directly**: Written to `line_values[0]` inside \_invoke() (NO intermediate object storage)
 6. **SpanBuffer created with \_callsiteMetadata**: `_callsiteMetadata` for row 0's metadata, `metadata` for rows 1+
 7. **Buffer linking**: Child buffer registered with parent's children array
 8. **RemappedBufferView**: If op has prefix, view maps prefixed columns for Arrow
@@ -866,8 +866,8 @@ await trace('process-order', { env: myEnv }, processOrder, order);
 ### Op Invocation
 
 - **Buffer creation**: One SpanBuffer per span with `_callsiteMetadata` reference
-- **lineNumber**: Passed as argument to span(), written directly to `lineNumber_values[0]` (NO lineNumber property on
-  any object)
+- **lineNumber**: Passed as argument to span(), written directly to `line_values[0]` (NO lineNumber property on any
+  object)
 - **SpanContext creation**: One SpanContext object per invocation
 - **No closure allocation**: deps is shared object reference
 
@@ -894,7 +894,7 @@ This context flow system integrates with:
 writes:
 
 - **Injection**: TypeScript transformer injects line numbers at compile time
-- **Storage**: Written directly to `lineNumber_values` TypedArray at the appropriate row index
+- **Storage**: Written directly to `line_values` TypedArray at the appropriate row index
 - **No intermediate object**: lineNumber is NOT stored on any context object - just passed as argument and written to
   TypedArray
 - **Overhead**: Zero runtime overhead - literal passed to span(), written directly to TypedArray
@@ -911,12 +911,12 @@ await ctx.span(43, 'validate', validateUser, userData); // line number FIRST for
 
 **Row-based lineNumber storage:**
 
-- **Row 0 (span-start)**: lineNumber argument written directly to `lineNumber_values[0]` inside `_invoke()`
-- **Rows 1+ (logs, span-ok/err)**: lineNumber written to `lineNumber_values[writeIndex]` via `.line(N)` calls
+- **Row 0 (span-start)**: lineNumber argument written directly to `line_values[0]` inside `_invoke()`
+- **Rows 1+ (logs, span-ok/err)**: lineNumber written to `line_values[writeIndex]` via `.line(N)` calls
 
 **SpanBuffer stores:**
 
 - `_callsiteMetadata`: The caller's OpMetadata (for row 0's git_sha/package_name/package_file)
 - `metadata`: The Op's OpMetadata (for rows 1+ git_sha/package_name/package_file)
 - `spanName`: The contextual name provided by caller
-- `lineNumber_values`: Int32Array for line numbers per row (NOT a lineNumber property)
+- `line_values`: Float64Array for line numbers per row (NOT a lineNumber property)

@@ -457,7 +457,7 @@ operations:
 2. **Efficient clearing**: Clearing null bits for a buffer's rows uses `TypedArray.fill(0)` for full bytes
 3. **Simple offset math**: `rowOffset / 8` gives exact byte offset, no bit shifting needed at boundaries
 
-The constraint is enforced in `createSpanBuffer()` and `createNextBuffer()`:
+The constraint is enforced in `createSpanBuffer()` and `createOverflowBuffer()`:
 
 ```typescript
 // Align capacity to multiple of 8
