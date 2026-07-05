@@ -26,6 +26,7 @@ import {
 } from '../packed-package.js';
 import { syncRootRuntimeVersions } from '../runtime.js';
 import { applyToolConfigDefaults, validateToolConfig } from '../tool-validation.js';
+import { applyWranglerDefaults, validateWrangler } from '../wrangler.js';
 
 export interface MonorepoContext {
   root: string;
@@ -148,6 +149,18 @@ const packs: MonorepoPack[] = [
     name: 'packed-package-types',
     validatePostBuild(ctx) {
       return validatePackedPublicPackageTypes(ctx.root);
+    },
+  },
+  {
+    name: 'wrangler',
+    init(ctx) {
+      applyWranglerDefaults(ctx.root);
+    },
+    fixPreBuild(ctx) {
+      applyWranglerDefaults(ctx.root);
+    },
+    validatePreBuild(ctx) {
+      return validateWrangler(ctx.root);
     },
   },
 ];
