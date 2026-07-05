@@ -300,7 +300,7 @@ arrow-builder's schema system supports a "lazy" option that consumers can use:
 export interface SchemaWithMetadata {
   __schema_type?: 'enum' | 'category' | 'text' | 'number' | 'boolean';
   __enum_values?: readonly string[]; // For enum types
-  __lazy?: boolean; // Hint for consumers (default: true for most)
+  __eager?: boolean; // opt-in eager; absent = lazy (the default)
 }
 ```
 
@@ -341,7 +341,8 @@ A high-level structured logging library providing excellent developer experience
 17. **Arrow Table creation** - Orchestrates conversion using shared dictionaries and `arrow.makeData()`
 18. **Utf8Cache** - SIEVE-based cache implementing arrow-builder's `Utf8Encoder` interface
 19. **globalUtf8Cache singleton** - Shared cache for cross-flush UTF-8 encoding benefits
-20. **Pre-encoded contexts** - ModuleContext with `utf8PackageName`, `utf8PackagePath`, `utf8GitSha`
+20. **Pre-encoded contexts** - `OpMetadata` (formerly ModuleContext) with pre-encoded `package_name_entry`,
+    `package_file_entry`, `git_sha_entry`
 21. **Line number injection** - Transformer inserts line as first arg to span()
 
 ### System Columns vs User Attributes <a id="smoo/lmao!n/lmao-arch-system-columns-vs-user-attributes"></a>
@@ -457,7 +458,7 @@ Is it logging/tracing specific?
 | Context flow                         | **lmao**      | Logging-specific hierarchy            |
 | `Utf8Cache` (SIEVE)                  | **lmao**      | Logging-specific bounded caching      |
 | `globalUtf8Cache` singleton          | **lmao**      | Logging-specific cross-flush cache    |
-| Pre-encoded contexts (utf8\*)        | **lmao**      | Logging-specific context optimization |
+| Pre-encoded contexts (`*_entry`)     | **lmao**      | Logging-specific context optimization |
 | Tree walking (span trees)            | **lmao**      | Logging-specific tree structure       |
 | Dictionary building across tree      | **lmao**      | Logging-specific Arrow conversion     |
 | RecordBatch creation with dicts      | **lmao**      | Logging-specific Arrow output         |

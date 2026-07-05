@@ -430,7 +430,7 @@ const childScope = { ...parentScope }; // New hidden class!
 
 **Application in LMAO**:
 
-- `createTraceContext()` uses `Object.create(TraceContextProto)`
+- Root context is created via `module.traceContext()` (the exported `TraceContextProto` is its base shape)
 - Child spans use `Object.create(parentCtx)`
 - User `Extra` properties inherit through prototype chain
 - Scope classes are generated with fixed property order for stable hidden classes

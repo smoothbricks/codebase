@@ -8,7 +8,7 @@
  *
  * Platform-specific implementations:
  * - TraceRoot.es.ts: Browser - uses performance.now() for timing
- * - TraceRoot.node.ts: Node.js - delegates to NAPI addon for optimized writes
+ * - TraceRoot.node.ts: Node.js - process.hrtime.bigint(), pure-JS writes to SpanBuffer state
  *
  * @module traceRoot
  */
@@ -61,7 +61,7 @@ export interface TracerLifecycleHooks {
  *
  * Total: 17 + trace_id.length bytes
  *
- * This layout enables NAPI/WASM to read anchors directly without BigInt extraction.
+ * This layout enables the WASM path to read anchors directly without BigInt extraction.
  */
 //#region smoo/lmao!n/trace-root-timestamps #contract
 export const TRACE_ROOT_ANCHOR_EPOCH_OFFSET = 0;
@@ -74,7 +74,7 @@ export const TRACE_ROOT_TRACE_ID_OFFSET = 17;
  *
  * Each implementation handles timestamp calculation and span writes differently:
  * - Browser: Pure JS with performance.now()
- * - Node.js: NAPI addon with mach_absolute_time() / clock_gettime()
+ * - Node.js: process.hrtime.bigint() (pure JS; a NAPI addon was benchmarked slower than WASM and removed)
  */
 /**
  * Factory function type for creating platform-specific TraceRoot instances.
@@ -87,7 +87,7 @@ export type TraceRootFactory = (trace_id: string, tracer: TracerLifecycleHooks) 
 export interface ITraceRoot {
   /**
    * Raw backing buffer containing anchor timestamps and trace_id.
-   * NAPI/WASM can read this directly without BigInt extraction.
+   * The WASM path can read this directly without BigInt extraction.
    */
   readonly _system: ArrayBuffer;
 
@@ -110,7 +110,7 @@ export interface ITraceRoot {
   /**
    * High-resolution timer anchor when trace was created.
    * Browser: performance.now() value (number)
-   * Node.js: stored as number for NAPI compatibility, but represents hrtime
+   * Node.js: stored as number in the shared layout (WASM-readable), but represents hrtime
    */
   readonly anchorPerfNow: number;
 

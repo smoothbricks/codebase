@@ -474,13 +474,13 @@ Object.assign(SpanBuffer.prototype, spanBufferMethods);
 **Purpose**: Provide the authoritative interface definition that can be extended with schema-generated columns.
 
 **PACKAGE**: This interface is defined in **lmao** (`packages/lmao/src/lib/types.ts`). It extends arrow-builder's
-`TypedColumnBuffer` with span-specific properties (tree structure, identity, context).
+`AnyColumnBuffer` with span-specific properties (tree structure, identity, context).
 
 **CRITICAL**: Column properties are **direct properties** on the SpanBuffer via lazy getters (no nested
 `columns: Record<...>`). This design provides zero indirection for hot path access.
 
 ```typescript
-// PACKAGE: lmao - SpanBuffer extends arrow-builder's TypedColumnBuffer
+// PACKAGE: lmao - SpanBuffer extends arrow-builder's AnyColumnBuffer
 interface SpanBuffer {
   // Core columns - always present (allocated immediately in constructor)
   timestamp: BigInt64Array; // Every operation appends timestamp (nanoseconds)
