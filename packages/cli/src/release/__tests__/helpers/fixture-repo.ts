@@ -6,6 +6,24 @@ import type { GitReleaseTagInfo } from '../../core.js';
 
 const GIT_TIMEOUT_MS = 10_000;
 
+// Isolate fixture git from the runner environment and skip fsync. These are
+// throwaway temp repos (deleted in withFixtureRepo's finally) so durability is
+// irrelevant — fsync is pure cost. On GitHub Actions the ~20 sequential git
+// spawns in a push test otherwise sum past the 30s cap: fsync on the runner's
+// disk is the dominant cost, and inheriting the runner's global/system config
+// (credential helpers, url.*.insteadOf rewrites, fsmonitor) slows every spawn
+// and risks a credential-prompt hang. Unknown core.* keys are ignored by older
+// git, so this is a harmless speedup locally and the real fix on CI.
+const GIT_FIXTURE_ENV: Record<string, string> = {
+  GIT_CONFIG_GLOBAL: '/dev/null',
+  GIT_CONFIG_SYSTEM: '/dev/null',
+  GIT_TERMINAL_PROMPT: '0',
+  GIT_OPTIONAL_LOCKS: '0',
+  GIT_CONFIG_COUNT: '1',
+  GIT_CONFIG_KEY_0: 'core.fsync',
+  GIT_CONFIG_VALUE_0: 'none',
+};
+
 export async function withFixtureRepo(fn: (root: string) => Promise<void>): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'smoo-release-test-'));
   try {
@@ -86,7 +104,7 @@ export async function gitSucceeds(root: string, args: string[]): Promise<boolean
 async function gitResult(root: string, args: string[], env?: Record<string, string>): Promise<GitResult> {
   const proc = Bun.spawn(['git', ...args], {
     cwd: root,
-    env: { ...process.env, ...env },
+    env: { ...process.env, ...GIT_FIXTURE_ENV, ...env },
     stdout: 'pipe',
     stderr: 'pipe',
   });
