@@ -33,6 +33,13 @@
       "development": "./src/monorepo/git-config.ts",
       "import": "./dist/monorepo/git-config.js",
       "default": "./dist/monorepo/git-config.js"
+    },
+    "./wrangler/prepare-env": {
+      "types": "./dist/wrangler/prepare-env.d.ts",
+      "bun": "./src/wrangler/prepare-env.ts",
+      "development": "./src/wrangler/prepare-env.ts",
+      "import": "./dist/wrangler/prepare-env.js",
+      "default": "./dist/wrangler/prepare-env.js"
     }
   },
   "files": [
@@ -51,6 +58,7 @@
     "publint": "^0.3.18",
     "semver": "^7.7.4",
     "sherif": "^1.11.1",
+    "smol-toml": "^1.6.1",
     "tslib": "^2.8.1"
   },
   "devDependencies": {
