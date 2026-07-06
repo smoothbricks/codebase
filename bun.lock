@@ -34,7 +34,7 @@
     },
     "packages/arrow-builder": {
       "name": "@smoothbricks/arrow-builder",
-      "version": "0.1.2",
+      "version": "0.1.3-next.0",
       "dependencies": {
         "@uwdata/flechette": "^2.3.0",
         "tslib": "^2.8.1",
@@ -45,7 +45,7 @@
     },
     "packages/cli": {
       "name": "@smoothbricks/cli",
-      "version": "0.9.0",
+      "version": "0.9.1-next.0",
       "bin": {
         "smoo": "./bin/smoo",
       },
@@ -57,7 +57,7 @@
         "publint": "^0.3.18",
         "semver": "^7.7.4",
         "sherif": "^1.11.1",
-        "smol-toml": "^1.6.1",
+        "toml-eslint-parser": "^1.0.3",
         "tslib": "^2.8.1",
       },
       "devDependencies": {
@@ -66,7 +66,7 @@
     },
     "packages/columine": {
       "name": "@smoothbricks/columine",
-      "version": "0.1.2",
+      "version": "0.1.3-next.0",
       "devDependencies": {
         "@smoothbricks/validation": "workspace:*",
         "typescript": "^6.0.3",
@@ -97,7 +97,7 @@
     },
     "packages/lmao": {
       "name": "@smoothbricks/lmao",
-      "version": "0.2.0",
+      "version": "0.2.1-next.0",
       "dependencies": {
         "@msgpack/msgpack": "^3.1.3",
         "@neophi/sieve-cache": "^1.5.0",
@@ -119,7 +119,7 @@
     },
     "packages/lmao-inspector": {
       "name": "@smoothbricks/lmao-inspector",
-      "version": "0.1.5",
+      "version": "0.1.6-next.0",
       "dependencies": {
         "@duckdb/duckdb-wasm": "1.33.1-dev20.0",
         "@uwdata/flechette": "^2.3.0",
@@ -136,7 +136,7 @@
     },
     "packages/lmao-transformer": {
       "name": "@smoothbricks/lmao-transformer",
-      "version": "0.1.5",
+      "version": "0.1.6-next.0",
       "devDependencies": {
         "@smoothbricks/lmao": "workspace:*",
         "@smoothbricks/validation": "workspace:*",
@@ -149,7 +149,7 @@
     },
     "packages/money": {
       "name": "@smoothbricks/money",
-      "version": "0.1.3",
+      "version": "0.1.4-next.0",
       "dependencies": {
         "tslib": "^2.8.1",
       },
@@ -159,7 +159,7 @@
     },
     "packages/nx-plugin": {
       "name": "@smoothbricks/nx-plugin",
-      "version": "0.2.5",
+      "version": "0.2.6-next.0",
       "dependencies": {
         "@nx/js": "22.7.1",
         "nx": "22.7.1",
@@ -2941,6 +2941,8 @@
 
     "toml": ["toml@4.1.2", "", {}, "sha512-m0vXfHODcw3gk+KONAOlVQ5yNHc3yS3B1ybM3HS1vqDoS0RWTDDVBVVTYi8hH0k+2OM1vmo9fb1WX9EVqjqfHA=="],
 
+    "toml-eslint-parser": ["toml-eslint-parser@1.0.3", "", { "dependencies": { "eslint-visitor-keys": "^5.0.0" } }, "sha512-A5F0cM6+mDleacLIEUkmfpkBbnHJFV1d2rprHU2MXNk7mlxHq2zGojA+SRvQD1RoMo9gqjZPWEaKG4v1BQ48lw=="],
+
     "tough-cookie": ["tough-cookie@5.1.2", "", { "dependencies": { "tldts": "^6.1.32" } }, "sha512-FVDYdxtnj0G6Qm/DhNPSb8Ju59ULcup3tuJxkFb5K8Bv2pUXILbf0xZWU8PX8Ov19OXljbUyveOFwRMwkXzO+A=="],
 
     "tr46": ["tr46@0.0.3", "", {}, "sha512-N3WMsuqV66lT30CrXNbEjx4GEwlow3v6rr4mCcv6prnfwhS01rkgyFdjPNBYd9br7LpXV1+Emh01fHnq2Gdgrw=="],
@@ -3480,6 +3482,8 @@
     "test-exclude/minimatch": ["minimatch@3.1.5", "", { "dependencies": { "brace-expansion": "^1.1.7" } }, "sha512-VgjWUsnnT6n+NUk6eZq77zeFdpW2LWDzP6zFGrCbHXiYNul5Dzqk2HHQ5uFH2DNW5Xbp8+jVzaeNt94ssEEl4w=="],
 
     "through2/readable-stream": ["readable-stream@2.3.8", "", { "dependencies": { "core-util-is": "~1.0.0", "inherits": "~2.0.3", "isarray": "~1.0.0", "process-nextick-args": "~2.0.0", "safe-buffer": "~5.1.1", "string_decoder": "~1.1.1", "util-deprecate": "~1.0.1" } }, "sha512-8p0AUk4XODgIewSi0l8Epjs+EVnWiK7NoDIEGU0HhE7+ZyY8D1IMY7odu5lRrFXGg71L15KG8QrPmum45RTtdA=="],
+
+    "toml-eslint-parser/eslint-visitor-keys": ["eslint-visitor-keys@5.0.1", "", {}, "sha512-tD40eHxA35h0PEIZNeIjkHoDR4YjjJp34biM0mDvplBe//mB+IHCqHDGV7pxF+7MklTvighcCPPZC7ynWyjdTA=="],
 
     "typia/commander": ["commander@10.0.1", "", {}, "sha512-y4Mg2tXshplEbSGzx7amzPwKKOCGuoSRP/CjEdwwk0FOGlUbq6lKuoyDZTNZkmxHdJtp54hdfY/JUrdL7Xfdug=="],
 
