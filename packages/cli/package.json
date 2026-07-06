@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/cli",
-  "version": "0.9.1-next.0",
+  "version": "0.10.0",
   "type": "module",
   "description": "SmoothBricks monorepo automation CLI",
   "bin": {
@@ -83,7 +83,7 @@
           "command": "bun test --timeout=30000",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
-          "killAfterMs": 1e4
+          "killAfterMs": 10000
         }
       }
     },
