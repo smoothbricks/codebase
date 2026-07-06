@@ -19,29 +19,78 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { $ } from 'bun';
-import { parse } from 'smol-toml';
+import { type AST, getStaticTOMLValue, parseTOML } from 'toml-eslint-parser';
 
-// ── runtime narrowing (wrangler JSON + parsed toml are external data — no casts) ─
+// ── runtime narrowing (wrangler JSON is external data — no casts) ─────────────
 
 export function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-function escapeRe(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// ── wrangler.toml editors (CST: read via getStaticTOMLValue, write via
+// node-range splice — comment/format-preserving by construction, no regex) ─────
+
+/** All top-level tables (`[env.x]`, `[env.x.vars]`, `[[env.x.d1_databases]]`, …) — each carries `resolvedKey` (incl. array index). */
+function tables(toml: string): AST.TOMLTable[] {
+  return parseTOML(toml).body[0].body.filter((n): n is AST.TOMLTable => n.type === 'TOMLTable');
 }
 
-// ── pure wrangler.toml editors (no I/O — unit-testable) ──────────────────────
+/** Whole doc as a JS object (comments/format dropped — reads only). */
+function tomlValue(toml: string): Record<string, unknown> {
+  const value = getStaticTOMLValue(parseTOML(toml));
+  return isRecord(value) ? value : {};
+}
 
-/** First `[env.<name>]` header, or `null` when the config declares no envs (top-level bindings only). */
+function envRecord(toml: string, env: string): Record<string, unknown> | null {
+  const envs = tomlValue(toml).env;
+  const block = isRecord(envs) ? envs[env] : undefined;
+  return isRecord(block) ? block : null;
+}
+
+function sameKey(a: (string | number)[], b: (string | number)[]): boolean {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
+/** The `key = value` node named `key` in a table (single-segment keys; matched by source text). */
+function kvIn(toml: string, table: AST.TOMLTable, key: string): AST.TOMLKeyValue | null {
+  for (const kv of table.body) {
+    if (toml.slice(kv.key.range[0], kv.key.range[1]).trim() === key) return kv;
+  }
+  return null;
+}
+
+/** The `<field>` KV of the `[[env.<env>.<arrayKey>]]` table whose `binding` matches, or null. */
+function arrayTableKv(toml: string, env: string, arrayKey: string, binding: string, field: string): AST.TOMLKeyValue | null {
+  const block = envRecord(toml, env);
+  const rows = isRecord(block) && Array.isArray(block[arrayKey]) ? block[arrayKey] : [];
+  const index = rows.findIndex((r) => isRecord(r) && r.binding === binding);
+  if (index < 0) return null;
+  const table = tables(toml).find((t) => t.kind === 'array' && sameKey(t.resolvedKey, ['env', env, arrayKey, index]));
+  return table ? kvIn(toml, table, field) : null;
+}
+
+function splice(toml: string, start: number, end: number, text: string): string {
+  return toml.slice(0, start) + text + toml.slice(end);
+}
+
+/** End of the physical line containing `offset` (exclusive of the newline). */
+function endOfLine(toml: string, offset: number): number {
+  const nl = toml.indexOf('\n', offset);
+  return nl === -1 ? toml.length : nl;
+}
+
+/** First `[env.<name>]` (source order; also derived from a nested `[env.<name>.*]`), or null when no env declared. */
 export function firstWranglerEnv(toml: string): string | null {
-  const match = toml.match(/^\s*\[env\.([A-Za-z0-9_-]+)/m);
-  return match ? match[1] : null;
+  const envs = tomlValue(toml).env;
+  if (!isRecord(envs)) return null;
+  const [first] = Object.keys(envs);
+  return first ?? null;
 }
 
-/** True if the toml declares `[env.<env>]`. */
+/** True if the toml declares `[env.<env>]` (or any `[env.<env>.*]` sub-table). */
 export function hasEnvBlock(toml: string, env: string): boolean {
-  return new RegExp(`^\\[env\\.${escapeRe(env)}\\]`, 'm').test(toml);
+  const envs = tomlValue(toml).env;
+  return isRecord(envs) && env in envs;
 }
 
 /** A `[env.<env>.vars]` value, or null if unset/empty. Reads committed public config. */
@@ -52,13 +101,12 @@ export function getVar(toml: string, env: string, name: string): string | null {
   return typeof value === 'string' && value ? value : null;
 }
 
-/** Set a `[env.<env>.vars]` value, preserving any trailing comment. Throws if the key isn't present (scaffold first). */
+/** Set a `[env.<env>.vars]` value (JSON-encoded), preserving any trailing comment. Throws if the key is absent (scaffold first). */
 export function setVar(toml: string, env: string, name: string, value: string): string {
-  const re = new RegExp(`(\\[env\\.${escapeRe(env)}\\.vars\\][\\s\\S]*?\\n${escapeRe(name)} = )"[^"]*"`);
-  if (!re.test(toml)) {
-    throw new Error(`vars key "${name}" not found under [env.${env}.vars]`);
-  }
-  return toml.replace(re, (_m: string, prefix: string) => `${prefix}${JSON.stringify(value)}`);
+  const table = tables(toml).find((t) => sameKey(t.resolvedKey, ['env', env, 'vars']));
+  const kv = table ? kvIn(toml, table, name) : null;
+  if (!kv) throw new Error(`vars key "${name}" not found under [env.${env}.vars]`);
+  return splice(toml, kv.value.range[0], kv.value.range[1], JSON.stringify(value));
 }
 
 /** The id written for `[[env.<env>.kv_namespaces]]` binding, or null if absent/empty. */
@@ -66,70 +114,48 @@ export function getKvId(toml: string, env: string, binding: string): string | nu
   const block = envRecord(toml, env);
   const rows = isRecord(block) && Array.isArray(block.kv_namespaces) ? block.kv_namespaces : [];
   for (const row of rows) {
-    if (isRecord(row) && row.binding === binding && typeof row.id === 'string') {
-      return row.id || null;
-    }
+    if (isRecord(row) && row.binding === binding && typeof row.id === 'string') return row.id || null;
   }
   return null;
 }
 
-/** Rewrite the `id = ...` line of the `[[env.<env>.kv_namespaces]]` table whose binding matches. Throws if absent. */
+/** Rewrite the `id = ...` line (value + trailing comment) of the kv_namespaces table whose binding matches. Throws if absent. */
 export function setKvId(toml: string, env: string, binding: string, id: string, title: string): string {
-  const re = new RegExp(
-    `(\\[\\[env\\.${escapeRe(env)}\\.kv_namespaces\\]\\]\\s*\\n\\s*binding = "${escapeRe(binding)}"\\s*\\n\\s*id = )[^\\n]*`,
-  );
-  if (!re.test(toml)) {
-    throw new Error(`kv_namespaces binding "${binding}" not found under [env.${env}]`);
-  }
-  return toml.replace(re, `$1"${id}" # ${title}`);
+  const kv = arrayTableKv(toml, env, 'kv_namespaces', binding, 'id');
+  if (!kv) throw new Error(`kv_namespaces binding "${binding}" not found under [env.${env}]`);
+  return splice(toml, kv.value.range[0], endOfLine(toml, kv.value.range[1]), `${JSON.stringify(id)} # ${title}`);
 }
 
 /**
- * Append a copy of the whole `[env.<from>]` … block-group (every `[env.<from>...]`
- * table up to the next non-`from` env or EOF) rewritten for `<to>`. Returns the new
- * toml. Throws if `<from>` is absent or `<to>` already exists (blank/fill instead).
+ * Append a copy of every `[env.<from>...]` table rewritten for `<to>` (headers
+ * only — values copied verbatim). Throws if `<from>` is absent or `<to>` exists.
  */
 export function cloneEnvBlock(toml: string, from: string, to: string): string {
   if (!hasEnvBlock(toml, from)) throw new Error(`source [env.${from}] not found`);
   if (hasEnvBlock(toml, to)) throw new Error(`target [env.${to}] already exists — blank/fill it instead`);
-  const lines = toml.split('\n');
-  const isFromHeader = (l: string) => new RegExp(`^\\[+env\\.${escapeRe(from)}(\\.|\\])`).test(l);
-  const isAnyEnvHeader = (l: string) => /^\[+env\.[A-Za-z0-9_-]+(\.|\])/.test(l);
-  const out: string[] = [];
-  let capturing = false;
-  for (const line of lines) {
-    if (isFromHeader(line)) {
-      capturing = true;
-      out.push(line);
-    } else if (capturing && isAnyEnvHeader(line) && !isFromHeader(line)) {
-      capturing = false; // a different env began — stop
-    } else if (capturing) {
-      out.push(line);
-    }
-  }
-  const cloned = out
-    .map((l) => l.replace(new RegExp(`(\\[+env\\.)${escapeRe(from)}(\\.|\\])`, 'g'), `$1${to}$2`))
-    .join('\n');
-  return `${toml.replace(/\s*$/, '')}\n\n${cloned}\n`;
+  const cloned = tables(toml)
+    .filter((t) => t.resolvedKey[0] === 'env' && t.resolvedKey[1] === from)
+    .map((t) => {
+      const seg = t.key.keys[1].range; // the `<from>` segment of this table's header
+      const text = toml.slice(t.range[0], t.range[1]);
+      return text.slice(0, seg[0] - t.range[0]) + to + text.slice(seg[1] - t.range[0]);
+    });
+  return `${toml.replace(/\s*$/, '')}\n\n${cloned.join('\n\n')}\n`;
 }
 
-/** Blank every `NAME = "..."` under `[env.<env>.vars]` whose key is in `keys` (env-specific values to re-fill). */
+/** Blank the named `[env.<env>.vars]` values to `""` (preserving comments), skipping absent keys. */
 export function blankEnvVars(toml: string, env: string, keys: string[]): string {
-  let out = toml;
-  for (const key of keys) {
-    const re = new RegExp(`(\\[env\\.${escapeRe(env)}\\.vars\\][\\s\\S]*?\\n${escapeRe(key)} = )"[^"]*"`);
-    if (re.test(out)) out = out.replace(re, '$1""');
-  }
-  return out;
+  const table = tables(toml).find((t) => sameKey(t.resolvedKey, ['env', env, 'vars']));
+  if (!table) return toml;
+  const edits = keys
+    .map((key) => kvIn(toml, table, key))
+    .flatMap((kv) => (kv ? [{ start: kv.value.range[0], end: kv.value.range[1] }] : []));
+  return applyBlanks(toml, edits);
 }
 
-/** Blank every `id = ...` line under the env's `[[env.<env>.kv_namespaces]]` tables (per-env resource ids). */
+/** Blank every kv_namespaces `id` under the env to `""` (drops trailing comment; binding/name survive). */
 export function blankKvIds(toml: string, env: string): string {
-  const re = new RegExp(
-    `(\\[\\[env\\.${escapeRe(env)}\\.kv_namespaces\\]\\]\\s*\\n\\s*binding = "[^"]*"\\s*\\n\\s*id = )[^\\n]*`,
-    'g',
-  );
-  return toml.replace(re, '$1""');
+  return blankArrayField(toml, env, 'kv_namespaces', 'id');
 }
 
 /** The database_id written for `[[env.<env>.d1_databases]]` binding, or null if absent/empty. */
@@ -137,61 +163,58 @@ export function getD1Id(toml: string, env: string, binding: string): string | nu
   const block = envRecord(toml, env);
   const rows = isRecord(block) && Array.isArray(block.d1_databases) ? block.d1_databases : [];
   for (const row of rows) {
-    if (isRecord(row) && row.binding === binding && typeof row.database_id === 'string') {
-      return row.database_id || null;
-    }
+    if (isRecord(row) && row.binding === binding && typeof row.database_id === 'string') return row.database_id || null;
   }
   return null;
 }
 
-/** The `database_name` declared for `[[env.<env>.d1_databases]]` binding, or null if absent. The source of truth for which DB to create/reuse. */
+/** The `database_name` for `[[env.<env>.d1_databases]]` binding, or null. Source of truth for which DB to create/reuse. */
 export function getD1Name(toml: string, env: string, binding: string): string | null {
   const block = envRecord(toml, env);
   const rows = isRecord(block) && Array.isArray(block.d1_databases) ? block.d1_databases : [];
   for (const row of rows) {
-    if (isRecord(row) && row.binding === binding && typeof row.database_name === 'string') {
-      return row.database_name || null;
-    }
+    if (isRecord(row) && row.binding === binding && typeof row.database_name === 'string') return row.database_name || null;
   }
   return null;
 }
 
-/** Rewrite the `database_id = ...` line of the `[[env.<env>.d1_databases]]` table whose binding matches (tolerates fields between binding and database_id). Throws if absent. */
+/** Rewrite the `database_id = ...` line (value + trailing comment) of the d1 table whose binding matches; the name line is untouched. Throws if absent. */
 export function setD1Id(toml: string, env: string, binding: string, id: string, name: string): string {
-  const re = new RegExp(
-    `(\\[\\[env\\.${escapeRe(env)}\\.d1_databases\\]\\]\\s*\\n\\s*binding = "${escapeRe(binding)}"[\\s\\S]*?\\n\\s*database_id = )[^\\n]*`,
-  );
-  if (!re.test(toml)) {
-    throw new Error(`d1_databases binding "${binding}" not found under [env.${env}]`);
-  }
-  return toml.replace(re, `$1"${id}" # ${name}`);
+  const kv = arrayTableKv(toml, env, 'd1_databases', binding, 'database_id');
+  if (!kv) throw new Error(`d1_databases binding "${binding}" not found under [env.${env}]`);
+  return splice(toml, kv.value.range[0], endOfLine(toml, kv.value.range[1]), `${JSON.stringify(id)} # ${name}`);
 }
 
-/** Blank every `database_id = ...` under the env's `[[env.<env>.d1_databases]]` tables (per-env resource ids). */
+/** Blank every d1 `database_id` under the env to `""` (drops trailing comment; binding/name survive). */
 export function blankD1Ids(toml: string, env: string): string {
-  const re = new RegExp(
-    `(\\[\\[env\\.${escapeRe(env)}\\.d1_databases\\]\\]\\s*\\n\\s*binding = "[^"]*"[\\s\\S]*?\\n\\s*database_id = )[^\\n]*`,
-    'g',
-  );
-  return toml.replace(re, '$1""');
+  return blankArrayField(toml, env, 'd1_databases', 'database_id');
+}
+
+/** Blank one field across every `[[env.<env>.<arrayKey>]]` table (value..EOL -> `""`). */
+function blankArrayField(toml: string, env: string, arrayKey: string, field: string): string {
+  const edits = tables(toml)
+    .filter((t) => t.kind === 'array' && t.resolvedKey[0] === 'env' && t.resolvedKey[1] === env && t.resolvedKey[2] === arrayKey)
+    .map((t) => kvIn(toml, t, field))
+    .flatMap((kv) => (kv ? [{ start: kv.value.range[0], end: endOfLine(toml, kv.value.range[1]) }] : []));
+  return applyBlanks(toml, edits);
+}
+
+/** Apply `""` at each range, descending so earlier offsets stay valid. */
+function applyBlanks(toml: string, edits: { start: number; end: number }[]): string {
+  let out = toml;
+  for (const e of [...edits].sort((a, b) => b.start - a.start)) out = splice(out, e.start, e.end, '""');
+  return out;
 }
 
 /** Parse-guard: throws if `toml` no longer parses, so a bad edit can't be written to disk. */
 export function assertToml(toml: string): void {
-  parse(toml);
+  parseTOML(toml);
 }
 
 /** Persist a toml string after confirming it still parses. */
 export function saveToml(path: string, toml: string): void {
   assertToml(toml);
   writeFileSync(path, toml);
-}
-
-function envRecord(toml: string, env: string): Record<string, unknown> | null {
-  const parsed = parse(toml);
-  const envs = isRecord(parsed) && isRecord(parsed.env) ? parsed.env : {};
-  const block = envs[env];
-  return isRecord(block) ? block : null;
 }
 
 // ── manifest: what the worker needs, split into vars vs secrets ──────────────
