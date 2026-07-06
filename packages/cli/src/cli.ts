@@ -3,6 +3,7 @@ import { variants } from './generate/index.js';
 import { cliPackageVersion } from './lib/cli-package.js';
 import { findRepoRoot } from './lib/run.js';
 import { resolvePrConflicts } from './pr/index.js';
+import { scaffold } from './wrangler/scaffold.js';
 
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   const program = buildProgram();
@@ -352,6 +353,15 @@ function buildProgram(): Command {
       if (exitCode !== 0) {
         process.exitCode = exitCode;
       }
+    });
+
+  const wrangler = program.command('wrangler').description('Cloudflare wrangler project helpers');
+  wrangler
+    .command('scaffold <project>')
+    .description('Write a starter scripts/prepare-env.ts (manifest-driven) and wire its nx target')
+    .option('--force', 'overwrite an existing scripts/prepare-env.ts')
+    .action(async (project: string, options: { force?: boolean }) => {
+      scaffold(await findRepoRoot(), project, { force: options.force });
     });
 
   return program;
