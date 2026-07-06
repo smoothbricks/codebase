@@ -132,6 +132,50 @@ export function blankKvIds(toml: string, env: string): string {
   return toml.replace(re, '$1""');
 }
 
+/** The database_id written for `[[env.<env>.d1_databases]]` binding, or null if absent/empty. */
+export function getD1Id(toml: string, env: string, binding: string): string | null {
+  const block = envRecord(toml, env);
+  const rows = isRecord(block) && Array.isArray(block.d1_databases) ? block.d1_databases : [];
+  for (const row of rows) {
+    if (isRecord(row) && row.binding === binding && typeof row.database_id === 'string') {
+      return row.database_id || null;
+    }
+  }
+  return null;
+}
+
+/** The `database_name` declared for `[[env.<env>.d1_databases]]` binding, or null if absent. The source of truth for which DB to create/reuse. */
+export function getD1Name(toml: string, env: string, binding: string): string | null {
+  const block = envRecord(toml, env);
+  const rows = isRecord(block) && Array.isArray(block.d1_databases) ? block.d1_databases : [];
+  for (const row of rows) {
+    if (isRecord(row) && row.binding === binding && typeof row.database_name === 'string') {
+      return row.database_name || null;
+    }
+  }
+  return null;
+}
+
+/** Rewrite the `database_id = ...` line of the `[[env.<env>.d1_databases]]` table whose binding matches (tolerates fields between binding and database_id). Throws if absent. */
+export function setD1Id(toml: string, env: string, binding: string, id: string, name: string): string {
+  const re = new RegExp(
+    `(\\[\\[env\\.${escapeRe(env)}\\.d1_databases\\]\\]\\s*\\n\\s*binding = "${escapeRe(binding)}"[\\s\\S]*?\\n\\s*database_id = )[^\\n]*`,
+  );
+  if (!re.test(toml)) {
+    throw new Error(`d1_databases binding "${binding}" not found under [env.${env}]`);
+  }
+  return toml.replace(re, `$1"${id}" # ${name}`);
+}
+
+/** Blank every `database_id = ...` under the env's `[[env.<env>.d1_databases]]` tables (per-env resource ids). */
+export function blankD1Ids(toml: string, env: string): string {
+  const re = new RegExp(
+    `(\\[\\[env\\.${escapeRe(env)}\\.d1_databases\\]\\]\\s*\\n\\s*binding = "[^"]*"[\\s\\S]*?\\n\\s*database_id = )[^\\n]*`,
+    'g',
+  );
+  return toml.replace(re, '$1""');
+}
+
 /** Parse-guard: throws if `toml` no longer parses, so a bad edit can't be written to disk. */
 export function assertToml(toml: string): void {
   parse(toml);
@@ -155,6 +199,8 @@ function envRecord(toml: string, env: string): Record<string, unknown> | null {
 export interface Manifest {
   /** KV binding names declared under `[[env.<env>.kv_namespaces]]` (resources to provision). */
   kvBindings: string[];
+  /** D1 binding names declared under `[[env.<env>.d1_databases]]` (resources to provision). */
+  d1Bindings: string[];
   /** Public var names declared in `[env.<env>.vars]` (committed config). */
   vars: string[];
   /** Secret names declared in `.dev.vars.example` (values live on the worker, never in the repo). */
@@ -185,9 +231,11 @@ export function readManifest(root: string, env: string): Manifest {
   const vars = Object.keys(varsRec);
   const kvRows = isRecord(block) && Array.isArray(block.kv_namespaces) ? block.kv_namespaces : [];
   const kvBindings = kvRows.flatMap((row) => (isRecord(row) && typeof row.binding === 'string' ? [row.binding] : []));
+  const d1Rows = isRecord(block) && Array.isArray(block.d1_databases) ? block.d1_databases : [];
+  const d1Bindings = d1Rows.flatMap((row) => (isRecord(row) && typeof row.binding === 'string' ? [row.binding] : []));
   const examplePath = join(root, '.dev.vars.example');
   const secrets = existsSync(examplePath) ? parseDevVarsExample(readFileSync(examplePath, 'utf8')) : [];
-  return { kvBindings, vars, secrets };
+  return { kvBindings, d1Bindings, vars, secrets };
 }
 
 // ── PEM (a standard, reusable) ───────────────────────────────────────────────
@@ -268,6 +316,51 @@ export async function ensureNamespace(logical: string, existing: KvNamespace[], 
 
 async function reList(logical: string, cwd: string): Promise<string | null> {
   return (await listNamespaces(cwd)).find((n) => n.title === logical)?.id ?? null;
+}
+
+export interface D1Database {
+  uuid: string;
+  name: string;
+}
+
+function asD1Databases(json: unknown): D1Database[] {
+  if (!Array.isArray(json)) return [];
+  const out: D1Database[] = [];
+  for (const row of json) {
+    if (isRecord(row) && typeof row.uuid === 'string' && typeof row.name === 'string') {
+      out.push({ uuid: row.uuid, name: row.name });
+    }
+  }
+  return out;
+}
+
+/** Live D1 databases on the account (`d1 list --json`); `[]` when offline/unauthenticated. */
+export async function listD1Databases(cwd: string): Promise<D1Database[]> {
+  try {
+    return asD1Databases(await $`bunx wrangler d1 list --json`.cwd(cwd).quiet().json());
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Reuse the D1 database whose name matches, else create it. The uuid comes from
+ * the structured `list` JSON (create prints freeform text), so we re-list rather
+ * than scrape. Returns the uuid, or null on failure.
+ */
+export async function ensureD1Database(name: string, existing: D1Database[], cwd: string): Promise<string | null> {
+  const match = existing.find((d) => d.name === name);
+  if (match) return match.uuid;
+  try {
+    await $`bunx wrangler d1 create ${name}`.cwd(cwd).quiet();
+  } catch (err) {
+    return errText(err).includes('already') ? reListD1(name, cwd) : null;
+  }
+  return reListD1(name, cwd);
+}
+
+async function reListD1(name: string, cwd: string): Promise<string | null> {
+  return (await listD1Databases(cwd)).find((d) => d.name === name)?.uuid ?? null;
 }
 
 /** Current secret names on the worker for `env`; `[]` when none/unreachable (Cloudflare allows setting pre-deploy). */

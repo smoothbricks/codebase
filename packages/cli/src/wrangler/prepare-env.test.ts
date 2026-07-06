@@ -4,10 +4,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   assertToml,
+  blankD1Ids,
   blankEnvVars,
   blankKvIds,
   cloneEnvBlock,
   firstWranglerEnv,
+  getD1Id,
+  getD1Name,
   getKvId,
   getVar,
   hasEnvBlock,
@@ -16,6 +19,7 @@ import {
   parseDevVarsExample,
   readManifest,
   readPemFile,
+  setD1Id,
   setKvId,
   setVar,
 } from './prepare-env.js';
@@ -161,6 +165,81 @@ describe('blankEnvVars / blankKvIds', () => {
   });
 });
 
+// D1 shell-outs (listD1Databases / ensureD1Database) invoke `bunx wrangler d1`
+// against a live account and are integration-only — deliberately not exercised.
+
+describe('getD1Id / getD1Name', () => {
+  const toml =
+    '[env.staging]\n\n' +
+    '[[env.staging.d1_databases]]\nbinding = "DB"\ndatabase_id = "abc123"\ndatabase_name = "app-staging-db"\n\n' +
+    '[env.production]\n\n' +
+    '[[env.production.d1_databases]]\nbinding = "DB"\ndatabase_id = ""\ndatabase_name = "app-db"\n';
+
+  it('reads the id for a matching binding and null for empty id, absent binding, and absent env', () => {
+    expect(getD1Id(toml, 'staging', 'DB')).toBe('abc123');
+    expect(getD1Id(toml, 'production', 'DB')).toBeNull(); // production id is ""
+    expect(getD1Id(toml, 'staging', 'MISSING')).toBeNull(); // absent binding
+    expect(getD1Id(toml, 'qa', 'DB')).toBeNull(); // absent env
+  });
+
+  it('reads the database_name for a matching binding and null when the binding or env is absent', () => {
+    expect(getD1Name(toml, 'staging', 'DB')).toBe('app-staging-db');
+    expect(getD1Name(toml, 'production', 'DB')).toBe('app-db'); // present even though its id is blank
+    expect(getD1Name(toml, 'staging', 'MISSING')).toBeNull();
+    expect(getD1Name(toml, 'qa', 'DB')).toBeNull();
+  });
+});
+
+describe('setD1Id', () => {
+  const toml =
+    '[[env.staging.d1_databases]]\nbinding = "DB"\ndatabase_id = ""\ndatabase_name = "app-staging-db"\n\n' +
+    '[[env.staging.d1_databases]]\nbinding = "ANALYTICS"\ndatabase_id = ""\ndatabase_name = "app-staging-analytics"\n\n' +
+    '[[env.production.d1_databases]]\nbinding = "DB"\ndatabase_id = "prod-existing"\ndatabase_name = "app-db"\n';
+
+  it('writes "<id>" # <name> against the matching env+binding, leaving siblings and other envs intact', () => {
+    const out = setD1Id(toml, 'staging', 'DB', 'new-staging-id', 'app-staging-db');
+    expect(out).toContain('"new-staging-id" # app-staging-db');
+    expect(getD1Id(out, 'staging', 'DB')).toBe('new-staging-id'); // round-trip
+    expect(getD1Id(out, 'staging', 'ANALYTICS')).toBeNull(); // sibling binding untouched
+    expect(getD1Id(out, 'production', 'DB')).toBe('prod-existing'); // other env untouched
+  });
+
+  it('tolerates database_name preceding database_id and preserves the name', () => {
+    const nameFirst =
+      '[[env.staging.d1_databases]]\nbinding = "DB"\ndatabase_name = "app-staging-db"\ndatabase_id = "old"\n';
+    const out = setD1Id(nameFirst, 'staging', 'DB', 'fresh', 'app-staging-db');
+    expect(getD1Id(out, 'staging', 'DB')).toBe('fresh');
+    expect(getD1Name(out, 'staging', 'DB')).toBe('app-staging-db'); // name line not clobbered
+    expect(() => assertToml(out)).not.toThrow();
+  });
+
+  it('throws when the binding or the env is absent', () => {
+    expect(() => setD1Id(toml, 'staging', 'MISSING', 'x', 'n')).toThrow();
+    expect(() => setD1Id(toml, 'qa', 'DB', 'x', 'n')).toThrow();
+  });
+});
+
+describe('blankD1Ids', () => {
+  const toml =
+    '[[env.staging.d1_databases]]\nbinding = "DB"\ndatabase_id = "staging-db-id"\ndatabase_name = "app-staging-db"\n\n' +
+    '[[env.staging.d1_databases]]\nbinding = "ANALYTICS"\ndatabase_id = "staging-an-id"\ndatabase_name = "app-staging-analytics"\n\n' +
+    '[[env.production.d1_databases]]\nbinding = "DB"\ndatabase_id = "prod-db-id"\ndatabase_name = "app-db"\n';
+
+  it('blanks every d1 id under the env while names, bindings, and the other env survive', () => {
+    const out = blankD1Ids(toml, 'staging');
+    expect(getD1Id(out, 'staging', 'DB')).toBeNull();
+    expect(getD1Id(out, 'staging', 'ANALYTICS')).toBeNull();
+    // names survive the blanking
+    expect(getD1Name(out, 'staging', 'DB')).toBe('app-staging-db');
+    expect(getD1Name(out, 'staging', 'ANALYTICS')).toBe('app-staging-analytics');
+    // other env's id is untouched
+    expect(getD1Id(out, 'production', 'DB')).toBe('prod-db-id');
+    // bindings survived: setD1Id still resolves them and re-fills an id
+    const refilled = setD1Id(out, 'staging', 'DB', 're-provisioned', 'app-staging-db');
+    expect(getD1Id(refilled, 'staging', 'DB')).toBe('re-provisioned');
+  });
+});
+
 describe('assertToml', () => {
   it('returns for valid toml', () => {
     expect(() => assertToml('name = "svc"\n[env.production]\n')).not.toThrow();
@@ -192,6 +271,7 @@ describe('readManifest', () => {
       await writeFile(join(root, '.dev.vars.example'), '# secrets\nAPI_KEY=\nJWT_SECRET=""\n');
       expect(readManifest(root, 'staging')).toEqual({
         kvBindings: ['CACHE', 'SESSIONS'],
+        d1Bindings: [],
         vars: ['PUBLIC_URL', 'FEATURE_FLAG'],
         secrets: ['API_KEY', 'JWT_SECRET'],
       });
@@ -208,6 +288,27 @@ describe('readManifest', () => {
       expect(manifest.secrets).toEqual([]);
       expect(manifest.vars).toEqual(['PUBLIC_URL', 'FEATURE_FLAG']);
       expect(manifest.kvBindings).toEqual(['CACHE', 'SESSIONS']);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('reports d1 bindings alongside kv bindings and vars without dropping the existing fields', async () => {
+    const withD1 =
+      'name = "svc"\n\n' +
+      '[env.staging.vars]\nPUBLIC_URL = "https://staging"\n\n' +
+      '[[env.staging.kv_namespaces]]\nbinding = "CACHE"\nid = "abc"\n\n' +
+      '[[env.staging.d1_databases]]\nbinding = "DB"\ndatabase_id = "id-1"\ndatabase_name = "app-staging-db"\n\n' +
+      '[[env.staging.d1_databases]]\nbinding = "ANALYTICS"\ndatabase_id = ""\ndatabase_name = "app-analytics-db"\n';
+    const root = await mkdtemp(join(tmpdir(), 'smoo-prepare-env-'));
+    try {
+      await writeFile(join(root, 'wrangler.toml'), withD1);
+      expect(readManifest(root, 'staging')).toEqual({
+        kvBindings: ['CACHE'],
+        d1Bindings: ['DB', 'ANALYTICS'],
+        vars: ['PUBLIC_URL'],
+        secrets: [],
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
