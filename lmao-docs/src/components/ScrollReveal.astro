@@ -1,0 +1,37 @@
+---
+/**
+ * Reveals the home page's card grids as they scroll into view.
+ *
+ * Progressive enhancement: the `.reveal` (hidden) class is only ever applied by
+ * this script, so content stays fully visible if JS fails to load, is disabled,
+ * or the visitor prefers reduced motion. Each card animates in once, then is
+ * unobserved.
+ */
+---
+
+<script>
+  const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const targets = document.querySelectorAll<HTMLElement>('.card-grid .card, .card-grid .sl-link-card');
+
+  if (!prefersReducedMotion && targets.length > 0 && 'IntersectionObserver' in window) {
+    for (const el of targets) {
+      el.classList.add('reveal');
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            entry.target.classList.add('in-view');
+            observer.unobserve(entry.target);
+          }
+        }
+      },
+      { threshold: 0.15, rootMargin: '0px 0px -10% 0px' },
+    );
+
+    for (const el of targets) {
+      observer.observe(el);
+    }
+  }
+</script>
