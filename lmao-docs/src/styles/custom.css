@@ -119,26 +119,44 @@
     animation: blink 1s step-end infinite;
   }
 
-  /* Card reveals — only on pages that have a hero (i.e. the splash home). */
-  :root:has(.hero) .card,
-  :root:has(.hero) .sl-link-card {
-    animation: slideUp 0.55s ease-out both;
-  }
-
-  :root:has(.hero) .card-grid > :nth-child(2) {
-    animation-delay: 0.08s;
-  }
-
-  :root:has(.hero) .card-grid > :nth-child(3) {
-    animation-delay: 0.16s;
-  }
-
-  :root:has(.hero) .card-grid > :nth-child(4) {
-    animation-delay: 0.24s;
-  }
-
   /* Available for a scroll cue in a future TerminalHero. */
   .animate-bounce {
     animation: bounce 1.2s ease-in-out infinite;
   }
+}
+
+/* =============================================================================
+ * Scroll-triggered card reveals (below-the-fold content on the splash home).
+ *
+ * The `.reveal` class is only ever applied by ScrollReveal.astro's
+ * IntersectionObserver script, so cards stay fully visible if JS fails to load,
+ * is disabled, or the visitor prefers reduced motion (the script bails out
+ * early in that case) — this is pure progressive enhancement, not a CSS-only
+ * hide/show gate.
+ * ========================================================================== */
+
+.reveal {
+  opacity: 0;
+  transform: translateY(24px);
+  transition:
+    opacity 0.55s ease-out,
+    transform 0.55s ease-out;
+}
+
+.reveal.in-view {
+  opacity: 1;
+  transform: none;
+}
+
+/* Stagger reveals of cards within the same grid. */
+.card-grid > :nth-child(2).reveal {
+  transition-delay: 0.08s;
+}
+
+.card-grid > :nth-child(3).reveal {
+  transition-delay: 0.16s;
+}
+
+.card-grid > :nth-child(4).reveal {
+  transition-delay: 0.24s;
 }
