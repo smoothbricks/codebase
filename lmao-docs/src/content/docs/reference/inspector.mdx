@@ -1,0 +1,121 @@
+---
+title: Inspector (query engine)
+description: Client-side trace analysis over Arrow — the @smoothbricks/lmao-inspector companion package.
+sidebar:
+  order: 20
+---
+
+`@smoothbricks/lmao-inspector` is a **separate companion package** (not a subpath of `@smoothbricks/lmao`) that reads
+exported Arrow trace data for analysis and live viewing. It provides an in-browser SQL query engine plus two data
+sources — historical (HTTP) and live (WebSocket/SSE).
+
+:::note
+This package is browser/DOM-oriented: it uses `Worker`, `WebSocket`/`EventSource`, `fetch`, and a DuckDB-WASM bundle
+fetched on demand. It runs where those APIs exist (browsers, and Workers-like runtimes that provide them), not in plain
+Node. It is published as a pre-1.0 companion package and its surface may still change.
+:::
+
+```bash
+bun add @smoothbricks/lmao-inspector
+```
+
+## Query engine
+
+`createQueryEngine()` returns a lazily-initialized, DuckDB-WASM-backed engine. The WASM bundle is fetched on first use,
+so importing the package costs nothing until you query.
+
+```ts
+createQueryEngine(): Promise<ArrowQueryEngine>
+```
+
+`ArrowQueryEngine`:
+
+| Method | Purpose |
+|---|---|
+| `registerArrowBatch(name, ipcBytes)` | Register an Arrow IPC buffer (`Uint8Array`) as a table named `name`. |
+| `query(sql)` | Run SQL and resolve the result (an Apache Arrow `Table`). |
+| `close()` | Drop registered tables and tear down the engine. |
+
+```ts
+import { createQueryEngine } from '@smoothbricks/lmao-inspector';
+
+const engine = await createQueryEngine();
+
+// `ipcBytes` is Arrow IPC produced by convertToArrowTable(...) on the writer side.
+await engine.registerArrowBatch('spans', ipcBytes);
+
+// entry_type 8 = info; see the entry-types reference.
+const result = await engine.query(`
+  SELECT message, uint64_value
+  FROM spans
+  WHERE entry_type = 8
+`);
+
+await engine.close();
+```
+
+Each `registerArrowBatch(name, …)` creates (or replaces) a table called `name`, so you can register several batches
+under different names and `UNION ALL` across them in SQL.
+
+## Historical source (archive)
+
+`createArchiveSource(baseUrl)` fetches historical Arrow IPC over HTTP `GET`, yielding buffers you feed straight into the
+query engine.
+
+```ts
+createArchiveSource(baseUrl: string): ArchiveSource
+// ArchiveSource.fetchRange(startTime, endTime): AsyncIterable<Uint8Array>
+```
+
+```ts
+import { createArchiveSource, createQueryEngine } from '@smoothbricks/lmao-inspector';
+
+const engine = await createQueryEngine();
+const source = createArchiveSource('https://traces.example.com/chunks');
+
+let i = 0;
+for await (const ipcBytes of source.fetchRange(startMs, endMs)) {
+  await engine.registerArrowBatch(`chunk_${i++}`, ipcBytes);
+}
+```
+
+The source requests `${baseUrl}?start=<startTime>&end=<endTime>` and streams the response body as Arrow IPC frames.
+
+## Live source (stream)
+
+`createStreamSource(config)` receives live Arrow IPC frames over WebSocket or SSE and auto-reconnects with exponential
+backoff (capped at 30s).
+
+```ts
+createStreamSource(config: StreamSourceConfig): StreamSource
+```
+
+`StreamSourceConfig` — `{ url: string; transport: 'websocket' | 'sse'; topic: string }`.
+
+`StreamSource` — `connect()`, `disconnect()`, and `onBatch(callback)` where `callback` receives the raw IPC bytes and a
+decoded table.
+
+```ts
+import { createStreamSource } from '@smoothbricks/lmao-inspector';
+
+const stream = createStreamSource({
+  url: 'wss://traces.example.com/live',
+  transport: 'websocket',
+  topic: 'traces:my-group',
+});
+
+stream.onBatch((ipcBytes, parsed) => {
+  // `parsed` is decoded from the Arrow IPC frame; `ipcBytes` is the raw buffer,
+  // ready to hand to engine.registerArrowBatch(...) if you also want to query it.
+});
+
+stream.connect();
+// later, on teardown:
+stream.disconnect();
+```
+
+## See also
+
+- [Convert a trace to Arrow](/guides/convert-to-arrow/) — produce the Arrow IPC these sources consume.
+- [Entry types & system columns](/reference/entry-types/) — what the `entry_type`, `message`, and `uint64_value`
+  columns mean when you write SQL.
