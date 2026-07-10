@@ -31,7 +31,8 @@ const userSchema = defineLogSchema({
   duration: S.number(),
 });
 
-const { defineOp } = defineOpContext({ logSchema: userSchema });
+const opContext = defineOpContext({ logSchema: userSchema });
+const { defineOp } = opContext;
 
 // Typed error codes — the payload shape is checked at the call site.
 const INVALID_EMAIL = defineCodeError('INVALID_EMAIL')<{ email: string; reason: string }>();
@@ -95,7 +96,7 @@ const registerUser = defineOp('registerUser', async (ctx, email: string, name: s
   return ctx.ok(created.success ? created.value : { email }).message('Registration completed');
 });
 
-const { trace } = new StdioTracer(defineOpContext({ logSchema: userSchema }), {
+const { trace } = new StdioTracer(opContext, {
   bufferStrategy: new JsBufferStrategy(),
   createTraceRoot,
 });
