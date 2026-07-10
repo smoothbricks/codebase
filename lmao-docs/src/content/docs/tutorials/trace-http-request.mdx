@@ -48,7 +48,10 @@ table to inspect it. It uses scope to attach request-wide attributes once, and c
        return d.ok({ items: 3 });
      });
 
-     return ctx.ok({ valid: valid.value, items: data.value.items });
+     return ctx.ok({
+       valid: valid.success ? valid.value : false,
+       items: data.success ? data.value.items : 0,
+     });
    });
    ```
 
