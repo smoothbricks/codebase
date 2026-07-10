@@ -25,6 +25,9 @@ handle-request          ← root span
    └─ db-query          ← grandchild span
 ```
 
+Child spans are usually opened with `await ctx.span(...)`. For synchronous work that returns a `Result` immediately,
+`ctx.spanSync(...)` opens a child span without awaiting — see the [SpanContext reference](/reference/span-context/).
+
 ## How a span is laid out
 
 Each span records into a small set of rows in its buffer, in a fixed shape:

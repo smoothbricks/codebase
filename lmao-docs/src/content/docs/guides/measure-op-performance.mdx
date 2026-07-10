@@ -44,6 +44,17 @@ for (let i = 0; i < table.numRows; i++) {
 Because metrics are rows in the same table, you can also aggregate them with whatever queries you run over your
 exported trace data.
 
+## Emit your own 64-bit value
+
+The `uint64_value` column isn't reserved for built-in metrics. Write your own large integer on any log entry with the
+`.uint64_value(value)` setter (it takes a `bigint`):
+
+```ts
+ctx.log.info('scanned index').uint64_value(BigInt(rowsScanned));
+```
+
+It lands in the same `uint64_value` column, so the same filter-by-`entry_type` reading above applies.
+
 :::note
 For the full list of entry types and reserved columns, see the [Entry types reference](/reference/entry-types/).
 :::
