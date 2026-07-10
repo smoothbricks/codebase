@@ -63,6 +63,19 @@ To define your own emission behavior, subclass the abstract `Tracer` and impleme
 `onTraceEnd`, `onSpanStart`, `onSpanEnd`, `onStatsWillResetFor`) — see [Write a custom tracer](/guides/write-a-custom-tracer/)
 and [The tracer lifecycle](/concepts/tracer-lifecycle/).
 
+## Cloudflare sink tracers
+
+The `@smoothbricks/lmao/cloudflare` subpath adds two `ArrayQueueTracer`-based tracers that drain completed traces to
+flat rows and hand them to injected transports:
+
+| Tracer | Extra options | Use |
+|---|---|---|
+| `DiagnosticDrainTracer` | `transport`, `onSendError?` | Fire-and-forget diagnostic lane. `flush()` drains rows to the transport and never rejects. |
+| `ClassSplitTracer` | `collector`, `diagnostics`, `classify`, `onDiagnosticSendError?`, `onLateBillableSendFailure?` | Route each row to a billing-grade collector (awaited via `settleBillable()`) or the diagnostic transport (`flush()`). |
+
+Both are **partially implemented** — the tracers and transports ship; the billing-grade collector service is still a
+design. See [Cloudflare Workers + D1](/guides/cloudflare-workers-d1/#diagnostic-trace-sink-experimental) for setup.
+
 ## `trace(...)` overloads
 
 `trace` runs an op (or an inline function) as the root span. `overrides` carries user-context values (and an optional
