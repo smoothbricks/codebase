@@ -15,6 +15,7 @@ their subpaths.
 | `@smoothbricks/lmao/es` | `createTraceRoot` using `performance.now()` (browser, Deno, Workers). |
 | `@smoothbricks/lmao/sqlite` | `SQLiteTracer`, `SQLiteAsyncTracer`, and `createD1SQLiteDatabase`. |
 | `@smoothbricks/lmao/sqlite/node` | `createNodeSQLiteDatabase` (and an async variant) for Node SQLite. |
+| `@smoothbricks/lmao/cloudflare` | Cloudflare trace-sink adapters: `DiagnosticDrainTracer` with `PipelinesStreamTransport` / `QueuesFallbackTransport`, `ClassSplitTracer`, `CollectorClient` / `FakeCollectorClient`, and `spanBufferToTraceRows`. **Partially implemented** — see [Cloudflare Workers + D1](/guides/cloudflare-workers-d1/#diagnostic-trace-sink-experimental). |
 | `@smoothbricks/lmao/errors` | Error utilities; also as focused subpaths below. |
 | `@smoothbricks/lmao/errors/Transient` | `Transient`. |
 | `@smoothbricks/lmao/errors/Blocked` | `Blocked`. |
@@ -30,3 +31,12 @@ their subpaths.
 The common, everyday symbols all live at the root. You typically import only one platform subpath (`/node` **or**
 `/es`) plus the root, and add `/sqlite*` or `/testing*` when you use those features.
 :::
+
+## Companion packages
+
+Two capabilities ship as **separate packages** rather than subpaths of `@smoothbricks/lmao`:
+
+| Package | Provides |
+|---|---|
+| `@smoothbricks/lmao-inspector` | Client-side Arrow query engine and trace sources. See the [Inspector reference](/reference/inspector/). |
+| `@smoothbricks/lmao-transformer` | Optional build-time TypeScript transformer. See the [Transformer reference](/reference/transformer/). |
