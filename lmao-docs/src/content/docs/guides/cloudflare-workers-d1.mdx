@@ -45,3 +45,82 @@ export default {
 For local Node persistence instead, use `SQLiteTracer` with `createNodeSQLiteDatabase` — see
 [Persist traces to SQLite](/guides/persist-to-sqlite/).
 :::
+
+## Diagnostic trace sink (experimental)
+
+Instead of writing to D1, you can stream trace **rows** off the isolate to Cloudflare Pipelines or Queues. The
+`@smoothbricks/lmao/cloudflare` subpath provides sink tracers that drain completed traces to flat, JSON-serializable
+rows and hand them to a transport you inject.
+
+:::caution[Partially implemented]
+The sink tracers and transports ship, but the billing-grade **collector service** they target is still a design — a
+`FakeCollectorClient` is provided so you can compose and test the lanes today. Treat this whole section as experimental.
+:::
+
+`DiagnosticDrainTracer` is fire-and-forget: `flush()` drains rows to the transport, never throws, and always releases
+buffers. Schedule it with `ctx.waitUntil` so it runs after the response.
+
+```ts
+import { JsBufferStrategy } from '@smoothbricks/lmao';
+import { createTraceRoot } from '@smoothbricks/lmao/es';
+import { DiagnosticDrainTracer, PipelinesStreamTransport } from '@smoothbricks/lmao/cloudflare';
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    const tracer = new DiagnosticDrainTracer(opContext, {
+      bufferStrategy: new JsBufferStrategy(),
+      createTraceRoot,
+      // env.TRACE_STREAM is a Pipelines stream binding (configured in wrangler).
+      transport: new PipelinesStreamTransport((rows) => env.TRACE_STREAM.send(rows)),
+      onSendError: (error, rows) => console.error('trace drain failed', error, rows.length),
+    });
+    const { trace } = tracer;
+
+    const result = await trace('handle-request', handleRequest);
+
+    ctx.waitUntil(tracer.flush()); // drain diagnostics after the response
+    return Response.json({ ok: result.success });
+  },
+};
+```
+
+To fall back to **Queues**, swap the transport. `QueuesFallbackTransport` batches rows into chunk-envelope messages with
+a deterministic `chunk_id` (so a redelivered batch dedupes) and keeps each message under the 128 KB Queues limit:
+
+```ts
+import { QueuesFallbackTransport } from '@smoothbricks/lmao/cloudflare';
+
+const transport = new QueuesFallbackTransport({
+  fileRef: 'queue://my-worker',
+  maxRowsPerMessage: 500,
+  sendMessage: (message) => env.TRACE_QUEUE.send(message),
+});
+```
+
+### Two delivery classes
+
+When some rows are revenue-critical and others are best-effort, `ClassSplitTracer` routes each row by an injected
+`classify` function. Billing-grade rows are delivered **within** the request via `settleBillable()` (an unacked send
+fails the request); diagnostic rows drain in the background on `flush()`.
+
+```ts
+import { ClassSplitTracer, FakeCollectorClient, PipelinesStreamTransport } from '@smoothbricks/lmao/cloudflare';
+
+const tracer = new ClassSplitTracer(opContext, {
+  bufferStrategy: new JsBufferStrategy(),
+  createTraceRoot,
+  collector: new FakeCollectorClient(), // the real collector service is not deployed yet
+  diagnostics: new PipelinesStreamTransport((rows) => env.TRACE_STREAM.send(rows)),
+  // `row` is a flat record; here an op tags a `billable` column when it matters.
+  classify: (row) => (row.billable === true ? 'billing-grade' : 'diagnostic'),
+});
+const { trace } = tracer;
+
+await trace('handle-request', handleRequest);
+
+const settled = await tracer.settleBillable();
+if (!settled.success) {
+  return new Response('trace collector unavailable', { status: 503 });
+}
+ctx.waitUntil(tracer.flush()); // diagnostics, fire-and-forget
+```
