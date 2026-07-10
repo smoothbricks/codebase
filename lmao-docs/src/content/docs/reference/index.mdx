@@ -7,7 +7,8 @@ sidebar:
 
 import { CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-Look-up reference for the public API. Every symbol here is exported from `@smoothbricks/lmao` or one of its subpaths.
+Look-up reference for the public API. Most symbols here are exported from `@smoothbricks/lmao` or one of its subpaths;
+the last two cards cover companion packages published separately.
 
 <CardGrid>
   <LinkCard title="defineOpContext / defineOp" href="/reference/define-op-context/" description="Define an op context and operations." />
@@ -23,4 +24,6 @@ Look-up reference for the public API. Every symbol here is exported from `@smoot
   <LinkCard title="Package exports" href="/reference/package-exports/" description="What each import subpath provides." />
   <LinkCard title="Configuration" href="/reference/configuration/" description="Tracer, flush, and test-harness options." />
   <LinkCard title="Advanced / internals" href="/reference/advanced-internals/" description="Code generation, identifiers, buffer strategy." />
+  <LinkCard title="Inspector (query engine)" href="/reference/inspector/" description="Client-side Arrow analysis — the @smoothbricks/lmao-inspector package." />
+  <LinkCard title="TypeScript transformer" href="/reference/transformer/" description="Optional build-time line injection and tag inlining." />
 </CardGrid>
