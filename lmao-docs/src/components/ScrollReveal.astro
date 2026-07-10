@@ -11,7 +11,7 @@
 
 <script>
   const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  const targets = document.querySelectorAll<HTMLElement>('.card-grid .card, .card-grid .sl-link-card');
+  const targets = document.querySelectorAll('.card-grid .card, .card-grid .sl-link-card');
 
   if (!prefersReducedMotion && targets.length > 0 && 'IntersectionObserver' in window) {
     for (const el of targets) {
