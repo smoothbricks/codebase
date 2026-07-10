@@ -46,6 +46,7 @@ A few columns carry different meanings depending on the entry type:
 
 - **`message`** — a span name (lifecycle rows), a log message template (log rows), or a flag name (feature-flag rows).
 - **`ff_value`** — a feature flag's resolved value.
-- **`uint64_value`** — large integers, used for metrics and big counts.
+- **`uint64_value`** — large 64-bit integers, used for metrics and big counts. Write your own from a log entry with
+  `.uint64_value(value)` (the argument is a `bigint`) — see [SpanContext](/reference/span-context/#ctxlog).
 
 See [Span identity](/concepts/span-identity/) for how the identity columns reconstruct the trace tree.
