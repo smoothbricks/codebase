@@ -1,38 +1,61 @@
 ---
 title: Roadmap & ecosystem
-description: Directions and adjacent components that are not part of the shipped @smoothbricks/lmao API.
+description: Companion packages that extend @smoothbricks/lmao, and the directions still on the roadmap.
 sidebar:
   order: 99
 ---
 
-Everything in the rest of these docs is part of the shipped `@smoothbricks/lmao` API. This page collects directions and
-adjacent ideas that are **not shipped** in the package today — listed for context, not for use.
+The rest of these docs cover the shipped `@smoothbricks/lmao` core. This page collects two things: **companion packages**
+that ship separately and extend the core, and the directions that are **still on the roadmap** — listed for context, not
+yet for use.
+
+## Companion packages (shipped separately)
+
+These are real, installable packages published alongside the core. They are pre-1.0, so treat their surfaces as still
+settling, but they exist today.
+
+### Query engine & inspector
+
+Trace analysis — an in-browser SQL query engine over exported Arrow data, plus historical (HTTP) and live
+(WebSocket/SSE) data sources — ships as **`@smoothbricks/lmao-inspector`**. See the
+[Inspector reference](/reference/inspector/). On the writer side you produce the Arrow it consumes with the shipped
+[Convert a trace to Arrow](/guides/convert-to-arrow/) and [Persist traces to SQLite](/guides/persist-to-sqlite/) APIs.
+
+### TypeScript transformer
+
+The build-time transformer (source-line injection and `ctx.tag` inlining) ships as
+**`@smoothbricks/lmao-transformer`**. It is entirely optional — no documented API requires it — and is an opt-in
+performance/DX optimization. See the [Transformer reference](/reference/transformer/). One piece of its design, the
+destructured-context (`__ctx`) rewrite, is not yet implemented.
+
+### Cloudflare trace sink
+
+Sink adapters for streaming trace rows on Cloudflare (a diagnostic lane over Pipelines/Queues and a billing-grade lane)
+ship at the **`@smoothbricks/lmao/cloudflare`** subpath. This one is **partially implemented** — the sink tracers and
+transports ship, but the collector service they target is still a design. See
+[Cloudflare Workers + D1](/guides/cloudflare-workers-d1/#diagnostic-trace-sink-experimental).
+
+## Still on the roadmap
 
 :::caution
-The items below are not available in the current public API. Don't write code against them.
+The items below are not available as a shipped API. Don't write code against them.
 :::
 
-## Query engine
-
-A trace analytics path (for example, querying exported Arrow data with an engine such as DuckDB) is a direction, not a
-shipped feature of this package. Today you can convert traces to Arrow tables and persist them to SQLite using the
-shipped APIs — see [Convert a trace to Arrow](/guides/convert-to-arrow/) and
-[Persist traces to SQLite](/guides/persist-to-sqlite/).
-
-## Inspector
-
-A visual trace viewer is an envisioned ecosystem component. It is not part of `@smoothbricks/lmao`.
-
-## AI-agent / MCP integration
+### AI-agent / MCP integration
 
 Exposing traces to AI agents over a protocol such as MCP is an idea under consideration, not a shipped capability.
 
-## TypeScript transformer
+### Partially built
 
-A build-time transformer (for source-line injection and call-site optimizations) is described in the project's design
-notes. There is no transformer to configure in the current package, and none of the documented APIs require one.
+A few capabilities are underway but incomplete — present in the design and partly in the code, not yet a stable API:
+
+- **Op-metrics collection** — the reserved metric entry types and the `uint64_value` writer exist, but automatic
+  per-op accumulation is not wired up.
+- **Runtime column promotion** — lazy→eager column promotion is only half-built.
+- **The Cloudflare collector service** — the billing-grade collector the sink adapters target is not deployed; a
+  `FakeCollectorClient` ships so the lane composition is testable.
 
 ---
 
-If you need one of these capabilities today, build on the shipped primitives: Arrow conversion, SQLite/D1 sinks, and the
-trace-testing query API.
+If you need one of the roadmap capabilities today, build on the shipped primitives: Arrow conversion, SQLite/D1 sinks,
+the companion inspector package, and the trace-testing query API.
