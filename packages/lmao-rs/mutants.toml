@@ -15,8 +15,6 @@ exclude_globs = [
 # Stubbed fns (todo!) produce only unviable/timeout noise; skip calls that can't
 # currently be exercised. Remove entries as implementations land.
 exclude_re = [
-    "Arena::alloc",
-    "Arena::free",
     "SpanBuffer::append",
 ]
 
