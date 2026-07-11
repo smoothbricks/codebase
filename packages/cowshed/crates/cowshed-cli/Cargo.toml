@@ -1,0 +1,11 @@
+[package]
+name = "cowshed-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "cowshed"
+path = "src/main.rs"
+
+[dependencies]
