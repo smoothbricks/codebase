@@ -16,6 +16,7 @@ in {
   # https://devenv.sh/overlays/
   overlays = [
     inputs.nixpkgs-overlay.overlays.default
+    inputs.rust-overlay.overlays.default
   ];
 
   # https://devenv.sh/packages/
@@ -30,6 +31,13 @@ in {
     bun
     # WASM and NAPI extensions
     zig
+    # Rust toolchain for packages/cowshed: cargo, rustc, clippy, rustfmt via
+    # rust-overlay stable, plus rust-src/rust-analyzer for IDE and LSP use.
+    (rust-bin.stable.latest.default.override {
+      extensions = ["rust-src" "rust-analyzer"];
+    })
+    cargo-nextest # Rust test runner
+    sccache # Shared Rust compile cache (cowshed cache layer 3)
     # Git hooks and formatters
     git-format-staged
     jq # Used in pre-commit hook and generally useful
