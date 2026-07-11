@@ -9,7 +9,10 @@
 //! `wall_ms`) instead of imported, keeping this module deterministic — the
 //! wasm exports fetch host clocks, native callers use `Clock` from lmao-core.
 
-use crate::{FREE_BLOCK_SIZE, HEADER_SIZE, IDENTITY_SIZE, NUM_TIERS, SizeClass, block_size, capacity_to_tier, tier_to_capacity};
+use crate::{
+    FREE_BLOCK_SIZE, HEADER_SIZE, IDENTITY_SIZE, NUM_TIERS, SizeClass, block_size,
+    capacity_to_tier, tier_to_capacity,
+};
 
 /// Linear memory backend. Offsets are absolute byte offsets; offset 0 holds the
 /// header, so 0 doubles as the null sentinel exactly as in the Zig.
@@ -293,7 +296,10 @@ fn effective_tier(sc: SizeClass, tier: usize) -> usize {
 /// The byte extent a request actually occupies (post tier-clamping); use this
 /// for adjacency/overlap reasoning instead of [`block_size`].
 pub fn effective_block_size(sc: SizeClass, capacity: u32) -> u32 {
-    block_size(sc, tier_to_capacity(effective_tier(sc, capacity_to_tier(capacity))))
+    block_size(
+        sc,
+        tier_to_capacity(effective_tier(sc, capacity_to_tier(capacity))),
+    )
 }
 
 /// `allocWithCapacity`.
@@ -303,7 +309,12 @@ pub fn alloc_with_capacity<M: Mem>(m: &mut M, sc: SizeClass, capacity: u32) -> u
 
 /// `freeWithCapacity`.
 pub fn free_with_capacity<M: Mem>(m: &mut M, offset: u32, sc: SizeClass, capacity: u32) {
-    free_at_tier(m, offset, sc, effective_tier(sc, capacity_to_tier(capacity)));
+    free_at_tier(
+        m,
+        offset,
+        sc,
+        effective_tier(sc, capacity_to_tier(capacity)),
+    );
 }
 
 // --- Identity blocks (fixed 128B, separate freelist, no buddy) ---
@@ -444,12 +455,20 @@ pub fn debug_freelist_head<M: Mem>(m: &M, sc: SizeClass, capacity: u32) -> u32 {
 }
 
 pub fn debug_next_ptr<M: Mem>(m: &M, offset: u32) -> u32 {
-    if offset == 0 { 0 } else { m.read_u32(offset + FB_NEXT_PTR) }
+    if offset == 0 {
+        0
+    } else {
+        m.read_u32(offset + FB_NEXT_PTR)
+    }
 }
 
 fn freelist_head_stat<M: Mem>(m: &M, sc: SizeClass, capacity: u32, field: u32) -> u32 {
     let head = freelist_head(m, sc, effective_tier(sc, capacity_to_tier(capacity)));
-    if head == 0 { 0 } else { m.read_u32(head + field) }
+    if head == 0 {
+        0
+    } else {
+        m.read_u32(head + field)
+    }
 }
 
 pub fn freelist_len<M: Mem>(m: &M, sc: SizeClass, capacity: u32) -> u32 {
@@ -489,7 +508,14 @@ pub fn timestamp_nanos<M: Mem>(m: &M, trace_root_ptr: u32, current_ms: f64) -> i
 // Span system layout: [timestamp: i64 × capacity][entry_type: u8 × capacity]
 
 /// `span_start` — row 0 = span-start, row 1 pre-armed span-exception, write_index = 2.
-pub fn span_start<M: Mem>(m: &mut M, system_ptr: u32, identity_ptr: u32, trace_root_ptr: u32, capacity: u32, current_ms: f64) {
+pub fn span_start<M: Mem>(
+    m: &mut M,
+    system_ptr: u32,
+    identity_ptr: u32,
+    trace_root_ptr: u32,
+    capacity: u32,
+    current_ms: f64,
+) {
     let ts = timestamp_nanos(m, trace_root_ptr, current_ms);
     m.write_i64(system_ptr, ts);
     m.write_u8(system_ptr + capacity * 8, ENTRY_TYPE_SPAN_START);
@@ -499,14 +525,29 @@ pub fn span_start<M: Mem>(m: &mut M, system_ptr: u32, identity_ptr: u32, trace_r
 }
 
 /// `span_end_ok` / `span_end_err` share the row-1 completion write.
-pub fn span_end<M: Mem>(m: &mut M, system_ptr: u32, trace_root_ptr: u32, capacity: u32, entry_type: u8, current_ms: f64) {
+pub fn span_end<M: Mem>(
+    m: &mut M,
+    system_ptr: u32,
+    trace_root_ptr: u32,
+    capacity: u32,
+    entry_type: u8,
+    current_ms: f64,
+) {
     m.write_u8(system_ptr + capacity * 8 + 1, entry_type);
     let ts = timestamp_nanos(m, trace_root_ptr, current_ms);
     m.write_i64(system_ptr + 8, ts);
 }
 
 /// `write_log_entry` — bump write_index, stamp row, return the row index written.
-pub fn write_log_entry<M: Mem>(m: &mut M, system_ptr: u32, identity_ptr: u32, trace_root_ptr: u32, entry_type: u8, capacity: u32, current_ms: f64) -> u32 {
+pub fn write_log_entry<M: Mem>(
+    m: &mut M,
+    system_ptr: u32,
+    identity_ptr: u32,
+    trace_root_ptr: u32,
+    entry_type: u8,
+    capacity: u32,
+    current_ms: f64,
+) -> u32 {
     let idx = m.read_u32(identity_ptr + ID_WRITE_INDEX);
     let ts = timestamp_nanos(m, trace_root_ptr, current_ms);
     m.write_i64(system_ptr + idx * 8, ts);
@@ -518,8 +559,18 @@ pub fn write_log_entry<M: Mem>(m: &mut M, system_ptr: u32, identity_ptr: u32, tr
 // --- Column IO (null bitmap precedes values, sharing one block) ---
 
 /// `write_col_f64` — lazily allocates the column block on first write.
-pub fn write_col_f64<M: Mem>(m: &mut M, col_offset: u32, row_idx: u32, value: f64, capacity: u32) -> u32 {
-    let offset = if col_offset == 0 { alloc_with_capacity(m, SizeClass::Col8B, capacity) } else { col_offset };
+pub fn write_col_f64<M: Mem>(
+    m: &mut M,
+    col_offset: u32,
+    row_idx: u32,
+    value: f64,
+    capacity: u32,
+) -> u32 {
+    let offset = if col_offset == 0 {
+        alloc_with_capacity(m, SizeClass::Col8B, capacity)
+    } else {
+        col_offset
+    };
     if offset == 0 {
         return 0;
     }
@@ -530,8 +581,18 @@ pub fn write_col_f64<M: Mem>(m: &mut M, col_offset: u32, row_idx: u32, value: f6
 }
 
 /// `write_col_u32`.
-pub fn write_col_u32<M: Mem>(m: &mut M, col_offset: u32, row_idx: u32, value: u32, capacity: u32) -> u32 {
-    let offset = if col_offset == 0 { alloc_with_capacity(m, SizeClass::Col4B, capacity) } else { col_offset };
+pub fn write_col_u32<M: Mem>(
+    m: &mut M,
+    col_offset: u32,
+    row_idx: u32,
+    value: u32,
+    capacity: u32,
+) -> u32 {
+    let offset = if col_offset == 0 {
+        alloc_with_capacity(m, SizeClass::Col4B, capacity)
+    } else {
+        col_offset
+    };
     if offset == 0 {
         return 0;
     }
@@ -542,8 +603,18 @@ pub fn write_col_u32<M: Mem>(m: &mut M, col_offset: u32, row_idx: u32, value: u3
 }
 
 /// `write_col_u8`.
-pub fn write_col_u8<M: Mem>(m: &mut M, col_offset: u32, row_idx: u32, value: u8, capacity: u32) -> u32 {
-    let offset = if col_offset == 0 { alloc_with_capacity(m, SizeClass::Col1B, capacity) } else { col_offset };
+pub fn write_col_u8<M: Mem>(
+    m: &mut M,
+    col_offset: u32,
+    row_idx: u32,
+    value: u8,
+    capacity: u32,
+) -> u32 {
+    let offset = if col_offset == 0 {
+        alloc_with_capacity(m, SizeClass::Col1B, capacity)
+    } else {
+        col_offset
+    };
     if offset == 0 {
         return 0;
     }

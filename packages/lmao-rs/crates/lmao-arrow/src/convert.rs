@@ -129,7 +129,11 @@ pub fn convert_span_trees<S: SpanSource>(roots: &[S]) -> Result<RecordBatch, Arr
             line_numbers.push(b.line_number(row));
         }
     });
-    debug_assert_eq!(timestamps.len(), total_rows, "pass-1/pass-2 row-count drift");
+    debug_assert_eq!(
+        timestamps.len(),
+        total_rows,
+        "pass-1/pass-2 row-count drift"
+    );
 
     let parent_nulls = NullBuffer::new(parent_valid.finish());
     let message_nulls = NullBuffer::new(message_valid.finish());

@@ -121,7 +121,7 @@ fn bench_append_only(c: &mut Criterion) {
 /// generated — null-bitmap bit set + f64 store into a preallocated column pair.
 /// This is the exact work the JS TypedArray hot path does (two typed stores).
 fn bench_tag_write_proxy(c: &mut Criterion) {
-    let mut bitmap = vec![0u8; 8]; // 64 rows
+    let mut bitmap = [0u8; 8]; // 64 rows
     let mut values = vec![0f64; 64];
     let mut row = 0usize;
     c.bench_function("tag_write_f64_proxy", |b| {

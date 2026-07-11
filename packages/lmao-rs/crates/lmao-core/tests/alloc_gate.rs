@@ -75,7 +75,6 @@ fn append_within_capacity_is_alloc_free() {
     );
 }
 
-
 /// The FULL traced hot path is alloc-free after warmup: static log templates
 /// (SharedStr::Static), numeric tag writes into pre-touched lazy columns, and
 /// Arc<str> category values (refcount bump only).

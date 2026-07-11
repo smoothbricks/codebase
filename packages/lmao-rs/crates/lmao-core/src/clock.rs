@@ -28,7 +28,9 @@ pub struct SystemClock {
 
 impl SystemClock {
     pub fn new() -> Self {
-        Self { origin: Instant::now() }
+        Self {
+            origin: Instant::now(),
+        }
     }
 }
 
@@ -177,7 +179,9 @@ mod tests {
 
     #[test]
     fn anchored_timestamps_are_deterministic_and_monotonic() {
-        let clock = TickClock { ticks: AtomicU64::new(0) };
+        let clock = TickClock {
+            ticks: AtomicU64::new(0),
+        };
         let anchor = TraceAnchor::capture(&clock);
         let t1 = anchor.timestamp(&clock);
         let t2 = anchor.timestamp(&clock);

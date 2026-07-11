@@ -40,7 +40,7 @@ async fn main() {
     let (tx, mut rx) = mpsc::channel::<SpanBuffer>(256);
 
     // In jcode, thread_id comes from the process-level entropy seam once.
-    let thread_id = 0x1C0D_Eu64;
+    let thread_id = 0x0001_C0DE_u64;
 
     // ---- Worker tasks: each turn/tool-call runs inside a span ----
     let mut workers = Vec::new();
@@ -79,7 +79,9 @@ async fn main() {
                         }
                     },
                 );
-                attrs.tag_duration_ms(1.5 * (call as f64 + 1.0)).tag_tokens(128 * call);
+                attrs
+                    .tag_duration_ms(1.5 * (call as f64 + 1.0))
+                    .tag_tokens(128 * call);
                 let attrs = attrs.finish_ok(&trace.anchor, trace.clock());
                 let _ = out; // jcode: surface Err to the turn loop
                 drop(attrs); // jcode: attrs buffer flushes alongside `buf`

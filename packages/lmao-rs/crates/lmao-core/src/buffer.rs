@@ -200,7 +200,12 @@ impl SpanBuffer {
     }
 
     #[inline]
-    fn write_row(&mut self, entry_type: EntryType, anchor: &TraceAnchor, clock: &dyn Clock) -> usize {
+    fn write_row(
+        &mut self,
+        entry_type: EntryType,
+        anchor: &TraceAnchor,
+        clock: &dyn Clock,
+    ) -> usize {
         let row = self.write_index;
         self.timestamps[row] = anchor.timestamp(clock);
         self.entry_types[row] = entry_type.as_u8();
