@@ -1,0 +1,5 @@
+error: enum field needs at least one value: `enum["A", ...]`
+ --> tests/compile_fail/empty_enum.rs:4:14
+  |
+4 |     outcome: enum[],
+  |              ^^^^
