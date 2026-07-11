@@ -1,0 +1,29 @@
+# lmao-rs task runner. Install: cargo install just cargo-mutants
+# (cd packages/lmao-rs first, or `just -f packages/lmao-rs/justfile <task>`)
+
+# Fast tier: unit + property tests at default case counts (runs the green suite).
+test:
+    cargo test --workspace
+
+# Heavy property tier: includes the TDD-red #[ignore]d tests and elevated proptest
+# cases. Expect failures until the corresponding implementation lands (that's TDD).
+proptest-heavy cases="10000":
+    PROPTEST_CASES={{cases}} cargo test --workspace --release -- --include-ignored
+
+# Mutation tier (see mutants.toml for arid/exclusion policy).
+mutants:
+    cargo mutants --workspace
+
+# wasm32 ABI build (allocator.zig replacement). Needs: rustup target add wasm32-unknown-unknown
+wasm:
+    cargo build -p lmao-wasm --target wasm32-unknown-unknown --release
+    @ls -la target/wasm32-unknown-unknown/release/lmao_wasm.wasm
+
+# AxE overhead gates placeholder (criterion). Real gate: traced-vs-untraced ≤20%
+# throughput delta + zero-alloc test (tests/alloc_gate.rs, currently TDD-red).
+bench:
+    cargo bench -p lmao-core
+
+check:
+    cargo check --workspace --all-targets
+    cargo clippy --workspace --all-targets -- -D warnings

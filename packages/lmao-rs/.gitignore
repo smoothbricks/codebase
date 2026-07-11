@@ -1,0 +1,4 @@
+target/
+mutants.out*/
+# NOTE: Cargo.lock is committed (deterministic builds are an AxE requirement).
+# NOTE: proptest-regressions/ directories are committed (they are the regression seed corpus).

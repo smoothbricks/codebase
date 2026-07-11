@@ -1,0 +1,11 @@
+# wasm32 build parity with build.zig: JS owns the memory (import_memory),
+# all exports visible (rdynamic ≈ export-dynamic here via no wasm-bindgen and
+# cdylib exports).
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--import-memory"]
+
+[alias]
+# Test tiers (see README.md):
+t = "test --workspace"
+proptest-heavy = "test --workspace --release -- --include-ignored --nocapture"
+wasm = "build -p lmao-wasm --target wasm32-unknown-unknown --release"
