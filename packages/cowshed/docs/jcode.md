@@ -49,7 +49,9 @@ let worker: WorkspaceHandle = coord.worker("session_raven")?;
 // generated from the workspace's *current* grant snapshot.
 let run = worker.exec(ExecRequest::new(["cargo", "test", "-p", "jcode-core"])
     .cwd_rel("crates/jcode-core")
-    .env("RUST_BACKTRACE", "1")).await?;
+    .env("RUST_BACKTRACE", "1")
+    .trace(task_ctx)).await?;   // Option<TraceContext>; None mints a root. Injected as
+                                 // TRACEPARENT into the job env; the exec record carries the ids.
 match run.outcome {
     cowshed_core::Outcome::Exit(code) => { /* child's code, passed through untouched */ }
     cowshed_core::Outcome::SandboxDenied(denial) => {
@@ -80,6 +82,10 @@ updating the session-owned `ToolContext`. In cowshed the grant set is a first-cl
 coord.grant("session_raven", GrantDelta {
     write:  vec!["/Users/danny/Dev/shared-assets".into()],
     read:   vec!["/Users/danny/Dev/reference-corpus".into()],
+    // Intercepted by default: gateway injects the Keychain credential + trace context,
+    // the worker never holds a token. `.opaque()` for a pinned host, `.impersonate("chrome")`
+    // for a browser fingerprint (both suppress injection). EgressRule carries { host, ports,
+    // mode, impersonate }.
     egress: vec![EgressRule::host("api.github.com")],
 }).await?;
 ```

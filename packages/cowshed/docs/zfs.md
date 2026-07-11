@@ -9,15 +9,15 @@ substrate. Override in `.cowshed.toml` (`[substrate] kind = "zfs"`) only if you 
 
 ## What lives where
 
-| What                                                   | Where                                                                                                       |
-| ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
-| Main workspace                                         | dataset `<pool>/cowshed/<project_id>/main`, mounted at the original path                                    |
-| Session workspaces                                     | `<pool>/cowshed/<project_id>/ws/<name>`, mounted under `~/.cowshed/mnt/<project_id>/`                       |
-| Checkpoints                                            | `zfs snapshot`s on the workspace dataset                                                                    |
-| Shared caches (sccache, zig, gradle, gateway mirror)   | `<pool>/cowshed/caches`, mounted at `~/.cowshed/caches`                                                     |
-| Grants, waivers, quarantine, gateway state + audit log | `<pool>/cowshed/store` dataset at `~/.cowshed/store` (audit at `gateway/audit.ndjson`) — same path as macOS |
-| Secrets                                                | secret-service (GNOME Keyring/KWallet), service `dev.cowshed.gateway`                                       |
-| Operational logs                                       | `~/.cowshed/store/logs/`                                                                                    |
+| What                                                               | Where                                                                                 |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------- |
+| Main workspace                                                     | dataset `<pool>/cowshed/<project_id>/main`, mounted at the original path              |
+| Session workspaces                                                 | `<pool>/cowshed/<project_id>/ws/<name>`, mounted under `~/.cowshed/mnt/<project_id>/` |
+| Checkpoints                                                        | `zfs snapshot`s on the workspace dataset                                              |
+| Shared caches (sccache, zig, gradle, Go mod/build, gateway mirror) | `<pool>/cowshed/caches`, mounted at `~/.cowshed/caches`                               |
+| Grants, waivers, quarantine, gateway state                         | `<pool>/cowshed/store` dataset at `~/.cowshed` — same path as macOS                   |
+| Telemetry + gateway audit (Arrow segments)                         | `~/.cowshed/telemetry/` (`cowshed logs`/`audit`/`trace`) — same as macOS              |
+| Secrets                                                            | secret-service (GNOME Keyring/KWallet), service `dev.cowshed.gateway`                 |
 
 Mountpoints are ZFS properties, so they survive reboots without a LaunchAgent, a stub `.envrc`, or any healing:
 `zfs-mount.service` mounts everything at boot exactly where cowshed put it. `cowshed ensure` still runs in your `.envrc`

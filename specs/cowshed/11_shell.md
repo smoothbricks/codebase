@@ -80,35 +80,35 @@ Every command runs as a _job_ with an id, whether foreground or backgrounded:
 
 ### Exec records — the single capture
 
-Every job, on completion, appends one line to `.cowshed/jobs/records.ndjson`:
+Every job, on completion, appends one Arrow batch to `.cowshed/jobs/records.arrow` (Arrow IPC stream; same schema family
+as the store-side telemetry — 13_telemetry.md). One record carries:
 
-```json
-{
-  "id": "j-7f3a",
-  "argv": ["bun", "test"],
-  "cwd": ".",
-  "envHash": "…",
-  "grantRevision": 7,
-  "started": "2026-07-11T12:34:56Z",
-  "durationMs": 8421,
-  "exit": 1,
-  "signal": null,
-  "stdout": ".cowshed/jobs/j-7f3a/stdout",
-  "stderr": ".cowshed/jobs/j-7f3a/stderr",
-  "truncated": false
-}
-```
+| Field                                 | Example                           | Notes                                     |
+| ------------------------------------- | --------------------------------- | ----------------------------------------- |
+| `id`                                  | `j-7f3a`                          | job id; spool dir name                    |
+| `argv`, `cwd`                         | `["bun","test"]`, `.`             |                                           |
+| `envHash`, `grantRevision`            | `…`, `7`                          | reproduce a run: same env, same authority |
+| `traceId` / `spanId` / `parentSpanId` | `4bf92f…` / `00f067…` / `a3ce92…` | locate the job in its trace               |
+| `started`, `durationMs`               | `2026-07-11T12:34:56Z`, `8421`    |                                           |
+| `exit`, `signal`                      | `1`, `null`                       |                                           |
+| `stdout`, `stderr`                    | `.cowshed/jobs/j-7f3a/stdout`, …  | spool paths — spools stay raw byte files  |
+| `truncated`                           | `false`                           | a spool hit its size cap                  |
+
+Inspect with `cowshed jobs <ws> --json` or generically with `lmao-inspect` (13_telemetry.md) — there is no line-oriented
+log to `tail`; export encodings (`--ndjson`) exist on the pipe, not on disk.
 
 This is the _only_ capture implementation in cowshed. The CLI's `jobs`, the MCP `job_status`/`job_logs` tools, and CI's
 failure-diagnosis artifact (10_ci.md) all read these records and spools — no client re-implements capture, and every
-consumer sees the same `grantRevision` and `envHash` needed to reproduce a run. Spools are size-capped
-(`[shell] max_spool`, default 32 MiB per stream) with a `truncated` flag rather than unbounded growth.
+consumer sees the same `grantRevision` and `envHash` needed to reproduce a run. The `traceId`/`spanId`/`parentSpanId`
+columns locate the job in its trace: `spanId` is the job's span, `parentSpanId` the exec that launched it (from the
+supervisor-injected `TRACEPARENT`), so an lmao-instrumented child continues the same trace (13_telemetry.md). Spools are
+size-capped (`[shell] max_spool`, default 32 MiB per stream) with a `truncated` flag rather than unbounded growth.
 
 **Not audit-grade.** These records live _inside_ the workspace volume, which is workspace-writable by construction — a
-job can rewrite its own `records.ndjson` and spools. They are a reproduction/observability aid, not a tamper-evident
+job can rewrite its own `records.arrow` and spools. They are a reproduction/observability aid, not a tamper-evident
 audit trail. The authoritative record of what authority a workspace held and what egress it made lives **outside** the
-volume: the grant files and their revisions (controller-owned, 01/04) and the gateway's append-only audit log (05). When
-those disagree with an in-volume record, the outside-the-volume source wins.
+volume: the grant files and their revisions (controller-owned, 01/04) and the gateway's audit events in the telemetry
+store (05/13). When those disagree with an in-volume record, the outside-the-volume source wins.
 
 ## Grant-change propagation
 
@@ -166,4 +166,6 @@ workspace keeps the boundary and the teardown clean.
 
 **Text-log capture rejected.** Scraping merged terminal text is what forces agents into brittle `grep` parsing.
 Structured exec records with separated, spooled streams and the grant/env context make a failed run reproducible instead
-of merely readable (10_ci.md).
+of merely readable (10_ci.md). Records are Arrow, not a line log, for the same reason all cowshed telemetry is
+(13_telemetry.md): one substrate, queryable and joinable against the store-side spans — "diff the job histories of these
+two forks" is a query, not a diff of text files.

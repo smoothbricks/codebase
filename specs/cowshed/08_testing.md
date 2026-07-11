@@ -13,9 +13,12 @@ No mounts, no root, no network — pure functions with table-driven cases:
   Seatbelt by **ordering** — see next bullet), ReadOnly drops mount writes, grant-intersects-deny refusal, path
   canonicalization/escaping (including unix-socket rule paths: the kernel matches canonical targets, so a `/tmp`-spelled
   rule silently denies — measured).
-- **Profile ordering invariant (denies last)**: SBPL is last-match-wins (measured — the same rules in the opposite order
-  leave a secret readable), so every generated profile MUST place all deny rules after all allows. This test asserts it
-  structurally over generated grant sets; the entire secret-protection model depends on it (04_sandbox.md).
+- **Profile ordering invariant (layered)**: SBPL is last-match-wins (measured — the same rules in the opposite order
+  leave a secret readable), so every generated profile MUST emit its four layers in order: broad allows → the
+  `~/.cowshed` volume-wide deny → scoped carve-backs (caches read, designated cache-subtree writes, own mount) → secret
+  denies (04_sandbox.md). This test asserts the layer order structurally over generated grant sets AND by probe paths:
+  grant file, CA key, sibling image, sibling mount must resolve to deny; own mount and designated cache subtrees to
+  allow; secret paths to deny regardless of grants. The entire secret-protection model depends on it.
 - **Path policy**: cwd validation, `..`/symlink-shape normalization, workspace-name validation.
 - **Grant files**: schema round-trip, revision monotonicity, delta application, wildcard egress matching
   (`*.github.com`), port defaults.
@@ -75,6 +78,12 @@ Covered flows:
 - gc: trash drain, checkpoint pruning, orphan mountpoint removal, compaction (SPARSE fallback);
 - gateway: mirror hit/miss against a local fixture registry, token→policy mapping, 403 hint body, audit records, CONNECT
   allow/deny, `repo mirror` fetch into a read-only bare mirror;
+- gateway interception (05_gateway.md): an intercepted host serves a workspace-CA leaf the in-image anchor trusts,
+  injects the Keychain credential, and records a **request-granular** audit line; an `--opaque` host tunnels without
+  injection; an `--impersonate` connection suppresses header injection; the **upstream-health gate** fails a dead
+  upstream fast with a classifiable error (not a per-request timeout) — asserting the gateway-absent / upstream-offline
+  / denied trichotomy; **socket teardown**: no leaked listeners or half-closed sockets after a churn of many distinct
+  intercepted hosts (the JS original's fd-leak bug class), and oversized request headers are tolerated;
 - ASIF/SPARSE fallback selection.
 
 ## Escape tests (cowshed-escape-tests, one corpus, both OSes, release gate)
@@ -85,8 +94,9 @@ jcode's `jcode-sandbox-escape-bash-*` crates: each case is a shell payload plus 
 denied and the artifact untouched.
 
 Shared categories: path escapes (traversal, symlink, hardlink), secret reads, cowshed-state tampering, cross-workspace
-access, egress bypass (direct, helper-process, DNS), revocation binding, ReadOnly enforcement — plus two the port-block
-model adds:
+access, egress bypass (direct, helper-process, DNS), revocation binding, ReadOnly enforcement, **workspace-CA
+isolation** (a workspace cannot read its own or a sibling's CA private key, nor obtain a leaf for an ungranted host —
+the CA cert it holds is a public anchor only, 04_sandbox.md/05_gateway.md) — plus two the port-block model adds:
 
 - **sibling-supervisor-socket**: workspace A attempts to `connect(2)` workspace B's supervisor unix socket and drive B's
   shells — must be denied (the baseline scopes unix-socket connect to the workspace's own supervisor socket, the nix
@@ -101,6 +111,25 @@ Linux-specific cases (Landlock/netns): bind-mount a denied path into a granted r
 reaching a non-gateway listener, `connect(2)` to a non-gateway TCP port. Policy-string goldens (unit tier) do not
 substitute for this — they prove generation, not kernel enforcement. Every production-discovered escape becomes a
 permanent case.
+
+## Trace assertions (lmao-query)
+
+The escape and integration tiers assert over **emitted traces** (13_telemetry.md), not scraped text. Because lmao is
+deterministic under an injected `Clock`/`Entropy` (bit-identical trace bytes per `(build, seed, config)`), a run
+produces a stable trace the tier queries with `lmao-query` selectors:
+
+- **Escape tier** asserts denials as trace facts: `never(gateway.allow ∧ host ∉ grants)`,
+  `count(egress ∧ ¬granted) == 0`, and the ordering invariant `never(secret-read ∧ granted-ancestor)` (the denies-last
+  property, cross-checked against the unit-tier generation golden — one proves kernel enforcement, the other profile
+  text).
+- **Integration tier** asserts lifecycle causality: `every(rm ⇒ supervisor-stop precedes detach)`,
+  `every(new ⇒ fsck precedes mount)`, and the escalation loop `denial → grant(rev+1) → retry` as a single connected
+  trace.
+- **Golden trace fixtures**: the deterministic trace of `cowshed new` (and other lifecycle ops) is checked in; a diff is
+  a behavior change that must touch the spec, the same contract as the CLI goldens.
+
+This is the assertion surface `lmao-query` was built for (its `selector → count/never` shape); the tiers consume it
+rather than each re-implementing trace inspection.
 
 ## Performance budgets (regression thresholds)
 

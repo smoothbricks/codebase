@@ -64,15 +64,27 @@ it — the jcode supervisor pattern). Shape:
 ;; pointed at block ports (PORT/COWSHED_PORT_BASE). Untested edge, tracked in
 ;; the kickoff experiments: which real tools this bites in practice.
 
-;; Writable roots — the closed baseline.
+;; Writable roots outside the cowshed tree — the closed baseline.
 (allow file-write*
-  (subpath "<workspace mount>")
-  (subpath "~/.cowshed/caches/sccache")
-  (subpath "~/.cowshed/caches/zig")
-  (subpath "~/.cowshed/caches/gradle")
   (subpath "<exec temp dir>")
   (literal "/dev/null") (literal "/dev/stdout") (literal "/dev/stderr")
   … granted write paths …)
+
+;; The cowshed tree: deny the volume, carve back the workspace's share.
+;; `~/.cowshed` IS the store volume (01_storage.md) and everything cowshed mounts
+;; nests beneath it, so ONE subtree deny covers images, grant files, CA keys,
+;; telemetry, gateway state, AND every sibling workspace's mount — including
+;; projects adopted after this profile was generated. SBPL is last-match-wins,
+;; so the carve-backs are emitted AFTER the deny:
+(deny file-read* file-write* (subpath "~/.cowshed"))
+(allow file-read* (subpath "~/.cowshed/caches"))       ;; layer-1/3 caches: readable
+(allow file-write*
+  (subpath "~/.cowshed/caches/sccache")
+  (subpath "~/.cowshed/caches/zig")
+  (subpath "~/.cowshed/caches/gradle")
+  (subpath "~/.cowshed/caches/go/mod")
+  (subpath "~/.cowshed/caches/go/build"))
+(allow file-read* file-write* (subpath "<workspace mount>"))  ;; own mount ONLY
 
 ;; Secrets: denied. SBPL is LAST-MATCH-WINS (measured, both directions, network
 ;; and filesystem) — these rules protect anything only because generation emits
@@ -84,24 +96,31 @@ it — the jcode supervisor pattern). Shape:
   (literal "~/.cargo/config.toml") (literal "~/.cargo/credentials.toml")
   (subpath "~/.cargo/bin")                             ;; on PATH — write = persistence escape
   (literal "~/.gradle/gradle.properties")
+  (subpath "~/go")                                     ;; misconfig tripwire, not a secret (see notes)
   (subpath "~/Library/Keychains")
-  (subpath "~/.cowshed/store")                         ;; images, grant files, gateway state, logs
   … denied paths from policy …)
 ```
 
 Notes:
 
-- The broad `file-read-data` allow is required for dyld; confidentiality of specific paths is achieved by the explicit
-  deny list — which works **only because profile generation emits denies last**. SBPL has no deny-beats-allow
-  precedence: evaluation is last-match-wins (measured: the same rules in the opposite order leave the token readable).
-  The entire secret-protection model depends on this ordering; it is asserted by a unit test (08_testing.md) that
-  generated profiles place every deny after every allow. The deny list always includes cowshed's store volume
-  (`~/.cowshed/store`, 01_storage.md), so no sandboxed process can touch images, grant files, or gateway credentials.
+- The broad `file-read-data` allow is required for dyld; confidentiality is achieved by explicit denies — which work
+  **only because of emission order**. SBPL has no deny-beats-allow precedence: evaluation is last-match-wins (measured:
+  the same rules in the opposite order leave the token readable). Profiles are generated in four ordered **layers** —
+  broad allows → the `~/.cowshed` volume-wide deny → scoped carve-backs (caches read, designated cache-subtree writes,
+  own mount) → secret denies — and a unit test (08_testing.md) asserts the layer order plus probe paths (grant file, CA
+  key, sibling image, sibling mount unreadable; own mount and designated caches writable). The single subtree deny on
+  `~/.cowshed` is _structurally_ stronger than the old enumerated list: sibling workspace mounts and projects adopted
+  after profile generation are covered without being named.
 - The caches volume's **mirror** and **git** (bare-mirror) subtrees are readable but never writable from a sandbox (only
   the gateway writes layer-1 artifacts — 03_caches.md, 05_gateway.md).
 - `~/.cargo` and `~/.gradle` are deliberately _not_ relocated wholesale to the cache volume — only their cache subtrees
   are (03_caches.md). The deny list above pins their config, credential, and PATH-resolved binary paths to the host
   precisely because the cache volume is sandbox-writable.
+- The `~/go` deny is a **misconfiguration tripwire, not secret protection**: once the in-image `GOENV` wiring
+  (03_caches.md) is in place nothing should ever touch `~/go` — `GOMODCACHE`/`GOCACHE` live on the caches volume,
+  `GOPATH`/`GOBIN` in-image. A go invocation that missed the wiring (unwrapped spawn, editor without direnv) would
+  otherwise silently regrow a gigabyte-scale `~/go` on the Data volume; the deny turns that into a loud EPERM, and
+  `cowshed doctor` translates it into the `GOENV` fix hint.
 - Each workspace serves on its own block ports (`base+1 … base+15`), so dev servers that honor the port convention never
   collide — the port block _is_ the collision fix. Because bind stays permissive (macOS has no per-process network
   namespace), a sibling may still _bind_ any loopback port, including a hardcoded default; isolation holds anyway
@@ -134,7 +153,14 @@ sandbox). Never readable or writable from inside a sandbox.
   "updatedAt": "2026-07-11T12:34:56Z",
   "read": ["/Users/danny/Dev/shared-fixtures"],
   "write": ["/Users/danny/Dev/conloca-artifacts/raven"],
-  "egress": [{ "host": "registry.npmjs.org" }, { "host": "*.github.com", "ports": [443] }, { "host": "crates.io" }]
+  "egress": [
+    { "host": "registry.npmjs.org" },
+    { "host": "api.example.com", "mode": "intercept" },
+    { "host": "pinned.example.com", "mode": "opaque" },
+    { "host": "scrape.example.com", "mode": "intercept", "impersonate": "chrome" },
+    { "host": "*.github.com", "ports": [443] }
+  ],
+  "sim": ["openurl"]
 }
 ```
 
@@ -142,7 +168,16 @@ sandbox). Never readable or writable from inside a sandbox.
   `CowshedError::SandboxDenied`).
 - `revision` increments on every change; execs and the gateway log the revision they enforced, making audit trails
   reconstructible.
-- Egress hosts are exact names or single-level `*.` wildcards, optional port list (default 443/80).
+- Egress hosts are exact names or single-level `*.` wildcards, optional port list (default 443/80), optional
+  `mode: "intercept" | "opaque"` (default `intercept` — the gateway terminates TLS under the workspace CA and injects
+  credentials + trace; `opaque` is a pass-through CONNECT tunnel for pinned clients — 05_gateway.md), and optional
+  `impersonate: "<profile>"` (outbound TLS-fingerprint impersonation, which suppresses header injection —
+  05_gateway.md). There are no SSH or Docker grant axes.
+- `sim` is the **personal-session simulator** axis (posture B — 14_nix.md): a set of broker verbs the workspace may
+  invoke through the gateway's `/sim/` endpoint (05_gateway.md). `openurl` drives an already-installed app (deep links,
+  reload); `install` pushes a drop-dir artifact and is additionally subject to the human-gating rule (14_nix.md).
+  Dev-side headless simulators need no `sim` grant at all — they are reached directly via the "simulator" profile preset
+  below; this axis exists only for the human's simulator.
 - `portBlock` is the workspace's contiguous 16-port block from the reserved range (default 40960–49151; 05_gateway.md):
   `base` is the gateway's data-plane listener, `base+1 … base+15` are the workspace's own bindable service ports.
   Allocated at new/fork (adopt, for main), preserved across restore, never inherited by a fork. `gatewayPort` is a
@@ -153,9 +188,12 @@ sandbox). Never readable or writable from inside a sandbox.
 Grant files are small, but they are the authority record — mutations are specified exactly:
 
 - **Canonical set semantics.** Paths are canonicalized before comparison (symlinks resolved; the `/var` → `/private/var`
-  handling generalizes); read/write/egress vectors are sorted and deduplicated; egress hosts are lowercased, wildcards
-  normalized to one leading `*.` label, omitted ports normalized to the 443/80 default. Applying a delta computes a
-  complete new snapshot — there is no in-place patching.
+  handling generalizes); read/write/egress/sim vectors are sorted and deduplicated (`sim` verbs are a closed enum —
+  unknown verbs are usage errors, exit 2); egress hosts are lowercased, wildcards normalized to one leading `*.` label,
+  omitted ports normalized to the 443/80 default. An egress entry's `mode` and `impersonate` are attributes **of the
+  host**, not separate rows: a second grant on an existing host updates them in place (last write wins on the
+  attribute), and an omitted `mode` normalizes to `intercept`. Applying a delta computes a complete new snapshot — there
+  is no in-place patching.
 - **Locking and CAS.** Every mutation holds an exclusive `flock` on the workspace's `.lock` file (01_storage.md).
   Callers may pass an `expected_revision`; a mismatch is a conflict (exit 4 / `CowshedError::Conflict`) and the
   coordinator retries against the fresh snapshot — concurrent coordinators serialize instead of clobbering.
@@ -169,8 +207,8 @@ Grant files are small, but they are the authority record — mutations are speci
 ### Widening and narrowing
 
 ```
-cowshed grant  <ws> [--read <path>]… [--write <path>]… [--egress <host[:port]>]…
-cowshed revoke <ws> [--read <path>]… [--write <path>]… [--egress <host>]… [--all]
+cowshed grant  <ws> [--read <path>]… [--write <path>]… [--egress <host[:port]>]… [--sim <verb>]…
+cowshed revoke <ws> [--read <path>]… [--write <path>]… [--egress <host>]… [--sim <verb>]… [--all]
 ```
 
 Rust API: `Workspace::grant(delta)` / `Workspace::revoke(delta)` — this is the generalization of jcode's
@@ -179,12 +217,56 @@ proves the need.
 
 Propagation:
 
-- **Egress**: immediate. The gateway resolves the workspace by its token and consults the current grant file per
-  request.
+- **Egress and `sim`**: immediate. The gateway resolves the workspace by its token and consults the current grant file
+  per request (`/sim/` verbs included).
 - **Filesystem**: at the next exec. Every `ExecRequest` snapshots the grant file and the profile is regenerated with the
   snapshot; long-lived supervisor trees launched before a grant continue under their launch profile until relaunched
   (cowshed surfaces the enforced revision so controllers know). Revocation likewise binds at the next exec — controllers
   that need hard cuts kill the affected process tree (`cowshed exec` reports PIDs for this purpose).
+
+### The "simulator" profile preset
+
+Dev-side headless simulator work — `xcodebuild test -destination 'platform=iOS Simulator…'`, `simctl` against the dev
+uid's own device sets — cannot run under the closed baseline: CoreSimulator is reached through mach services and
+XPC/unix sockets the baseline's scoped IPC rules deny. The **"simulator" preset** is a named grant class
+(`cowshed grant <ws> --preset simulator`) that relaxes exactly that surface — the CoreSimulator service lookups and
+sockets, nothing else. It is a documented preset, not an escape hatch: the secret denies still terminate the profile,
+the `~/.cowshed` deny still stands, and egress is untouched. The precise mach-lookup/socket inventory is an
+implementation-time verification item (kickoff); the escape suite pins that the preset does not widen filesystem or
+network authority. Note the preset concerns the **dev uid's own** simulators only — the personal-session simulator is
+never reached through Seatbelt at all, only through the gateway `/sim/` broker and its grant axis above.
+
+## Egress-interception trust anchors
+
+Granted egress is intercepted by default: the gateway terminates TLS under the **workspace's own CA** (05_gateway.md).
+The CA **private key** lives with the gateway on the store volume, next to the grant file, and is denied to every
+sandbox exactly like the grant file — a workspace can never sign its own leaves or read another workspace's key. The CA
+**certificate** is public and ships in-image as a trust anchor: **the workspace holds only public trust anchors**, never
+a secret. cowshed wires the anchor into the tools that honor an environment/config anchor (written at new/fork, with the
+CA cert placed in-image, and re-asserted by `ensure`):
+
+| Tool family                     | Anchor                                                                                                     |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| OpenSSL CLI, curl, most C tools | `SSL_CERT_FILE`                                                                                            |
+| Node / Bun                      | `NODE_EXTRA_CA_CERTS` (Bun support is a **verification item**, not assumed)                                |
+| git                             | `GIT_SSL_CAINFO`                                                                                           |
+| Python requests                 | `REQUESTS_CA_BUNDLE`                                                                                       |
+| Deno                            | `DENO_CERT`                                                                                                |
+| cargo                           | `http.cainfo` in the in-image cargo config                                                                 |
+| JVM (gradle)                    | a per-workspace PKCS12 truststore cowshed generates in-image                                               |
+| Go-built tools                  | `SSL_CERT_FILE` on Linux; **on macOS Go uses the platform verifier** (Security.framework) — see gaps below |
+
+**Known gaps** (documented, not silently broken):
+
+- **macOS-native TLS** (Security.framework — Swift/Xcode tooling, some system utilities, **and Go-built binaries**: Go's
+  `crypto/x509` honors `SSL_CERT_FILE` only on Unix roots, while its darwin path defers to the platform verifier —
+  verification item) ignores the env anchors above. Such a client either fails against an intercepted host or must be
+  granted `--opaque` for it (05_gateway.md). This is moot for Go **module** traffic, which rides the plain-HTTP loopback
+  `/go` mirror (05_gateway.md) and never sees TLS. The exact inventory of affected tools is a kickoff verification item.
+- **Cert-pinning clients** reject the leaf regardless of trust store; `--opaque` is their path.
+
+These anchors are trust configuration, not secrets, so they are exported/written like any other cache wiring
+(03_caches.md) and travel with the image.
 
 ## Exec pipeline
 
@@ -192,9 +274,9 @@ Propagation:
 
 1. Resolve workspace (marker), verify mounted (heal via ensure logic if not).
 2. Snapshot grants; validate cwd against policy; refuse commands whose cwd escapes the mount in rw mode.
-3. Compose env: identity + cache wiring (03_caches.md) + the workspace's own `.envrc` via fail-closed `direnv export`
-   (see "devenv / Nix inside the sandbox") + caller env filtered through an allowlist (build-configuration variables
-   only — never `*_TOKEN`, `*_SECRET`, `AWS_*`, etc.).
+3. Compose env: identity + cache wiring (03_caches.md) + `TRACEPARENT` for the job's span (13_telemetry.md) + the
+   workspace's own `.envrc` via fail-closed `direnv export` (see "devenv / Nix inside the sandbox") + caller env
+   filtered through an allowlist (build-configuration variables only — never `*_TOKEN`, `*_SECRET`, `AWS_*`, etc.).
 4. Generate the profile, write it to a private temp file, spawn `sandbox-exec -f <profile> /usr/bin/env <env…> <cmd…>`
    with cwd inside the mount.
 5. Stream stdout/stderr through unmodified; report exit code, PIDs, and enforced grant revision.
@@ -269,8 +351,8 @@ ride block ports. On Linux the netns makes both moot: each workspace's loopback 
 
 On Linux the model is identical — start closed, widen by grant, narrow by revoke, one grant file feeding both planes —
 only the enforcers change. Nothing above the enforcement layer differs: same `<image>.grants.json` schema
-(09_substrates.md: `~/.cowshed/store/…` on Linux too), same revision semantics, same propagation (filesystem at next
-exec, egress immediate via the gateway), same exit code 6 on a grant that intersects the deny set.
+(09_substrates.md: the same `~/.cowshed/…` paths on Linux too), same revision semantics, same propagation (filesystem at
+next exec, egress immediate via the gateway), same exit code 6 on a grant that intersects the deny set.
 
 | Capability              | macOS                           | Linux                              |
 | ----------------------- | ------------------------------- | ---------------------------------- |
@@ -303,7 +385,8 @@ the real exec pipeline and asserts denial. The macOS suite runs under Seatbelt; 
 Landlock, plus Linux-specific escapes:
 
 - write outside granted roots (absolute, relative, `..`-traversal, symlink pivot, hardlink);
-- read `~/.ssh`, `~/.aws`, Keychains, the `cowshed.store` volume, another workspace's mount;
+- read `~/.ssh`, `~/.aws`, Keychains, any `~/.cowshed` path outside the carve-backs (grant files, CA keys, sibling
+  images, sibling mounts);
 - tamper with own grant file or marker via crafted paths;
 - connect to a sibling workspace's supervisor socket (must be refused by the scoped unix-socket allow — including via a
   non-canonical `/tmp`-alias path);
@@ -313,7 +396,19 @@ Landlock, plus Linux-specific escapes:
   emitted last — the last-match-wins invariant);
 - write to `~/.cargo/bin`, cargo config/credentials, or `~/.gradle/gradle.properties` — directly and via the
   sandbox-writable cache volume;
+- write to `~/go` (the misconfig tripwire — must EPERM); write to another workspace's in-image `GOBIN` (unreachable
+  across the mount boundary); chmod a 0444 `~/.cowshed/caches/go/mod` entry writable and modify it (allowed by scope —
+  the accepted layer-3 poisoning risk — but asserted to appear in telemetry as a mutation of a shared cache);
+- read the workspace's own CA **private key** or any sibling workspace's CA key (both on the store volume — denied): a
+  workspace can read only its own in-image CA **cert** (a public anchor), never a signing key, and cannot obtain a leaf
+  signed for a host it was not granted; a sibling's in-image trust anchor is not reachable across the mount boundary;
 - egress to a non-granted host directly and via helper processes (`curl`, `nc`, `python`);
+- invoke a `/sim/` broker verb without the matching `sim` grant (403 + audit); `install` naming a path outside the drop
+  dir (refused broker-side regardless of grants); `openurl` with a scheme the project has not registered; probe the
+  broker by bypassing the in-image `xcrun` wrapper (must reach only dev-local CoreSimulator — the safe default,
+  14_nix.md);
+- under the "simulator" preset: assert filesystem and network authority are unwidened (the preset opens CoreSimulator
+  IPC only);
 - write through `/tmp` symlinks into denied paths; abuse `file-map-executable` scratch dirs;
 - verify revocation binds at next exec and ReadOnly mode rejects mount writes.
 

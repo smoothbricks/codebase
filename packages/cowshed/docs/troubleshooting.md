@@ -57,13 +57,16 @@ but there was no exit 6, check the raw Seatbelt log around the failure:
 log show --last 2m --predicate 'sender == "Sandbox"' | grep deny
 ```
 
-and the gateway audit log for egress
-(`jq -rc 'select(.status=="denied")' ~/.cowshed/store/gateway/audit.ndjson | tail`). Common cases:
+and the gateway audit events for egress (`cowshed audit --denied | tail`). Common cases:
 
 - **Tool writes to `$HOME` dotfiles** (some CLIs insist on `~/.toolrc`): grant narrowly (`--write ~/.toolrc`, not
   `--write ~`), or set the tool's env override to a path inside the workspace — `cowshed shell` and fix its config once;
   it's in the image and every fork inherits it.
 - **Egress to an unmirrored host**: `cowshed grant <ws> --egress <host>` — applies immediately, no re-exec.
+- **`go` denied writing `~/go`**: that deny is a deliberate tripwire, not a bug — it means a go invocation ran without
+  the workspace's `GOENV` wiring (an unwrapped spawn, or an editor without direnv integration). Run it through
+  `cowshed exec`/a direnv shell, or fix the editor's direnv plugin; never grant `~/go`. `cowshed doctor` prints the same
+  hint, and checks the host for a stray `~/go` that predates adoption (safe to delete — it is only cache).
 - **Denial persists after a grant**: filesystem grants apply from the _next_ exec; a long-running process (watcher, dev
   server) keeps its launch-time profile. Restart that process.
 
@@ -113,11 +116,34 @@ treat them as one.
 ## When cowshed itself misbehaves
 
 `cowshed doctor --json` is the bug-report payload: it includes versions, invariant results, and the last few operations
-from the log at `~/.cowshed/store/logs/cowshed.log`. State is fully derivable, so the nuclear option is safe and small:
-detach everything (`cowshed detach` per workspace), and every subsequent command re-derives reality. There is no cache
-to clear and no database to reset.
+from the telemetry store (`cowshed logs --since 1h` shows the same thing). State is fully derivable, so the nuclear
+option is safe and small: detach everything (`cowshed detach` per workspace), and every subsequent command re-derives
+reality. There is no cache to clear and no database to reset.
 
 For cache-volume corruption specifically there is a bigger, equally safe hammer: nothing unique lives on
 `cowshed.caches`, so `diskutil apfs deleteVolume` and letting cowshed lazily recreate it is always an option — the
 mirror refetches, sccache and registries rebuild. `cowshed doctor` suggests it when the caches volume fails its checks.
 (Never do this to `cowshed.store` — that volume holds your images.)
+
+## "cowshed volumes owned by another user"
+
+The cowshed volumes belong to exactly one uid. If `doctor` reports a foreign-uid volume, you are running cowshed as the
+wrong account — most commonly you set up the dedicated-`dev`-uid posture (specs' 14_nix.md) and then ran cowshed from
+your personal account. Run it as dev instead: `ssh dev@localhost` or `sudo -u dev -i` (a dev shell via ssh/sudo is the
+expected, healthy shape — doctor recognizes it). Cross-uid file access to another account's cowshed tree is deliberately
+unsupported; there is no `--force` for this one. On nix hosts, `programs.cowshed` (home-manager) and `services.cowshed`
+(nix-darwin, for the dev-uid posture) own the host setup declaratively — `doctor` hints name the option to enable rather
+than a command to run.
+
+## Simulator brokering (posture B — see ios.md)
+
+- **A tool only lists dev-local simulators, never the personal-session device.** It spawned `/usr/bin/xcrun` by absolute
+  path, bypassing the in-image wrapper (`.cowshed/bin/xcrun`). That degradation is the safe default — the personal
+  session is unreachable except through the wrapper → gateway → broker path. Fix the tool's PATH resolution, or hand the
+  artifact over manually (`cowshed sim export` + your side's `simctl install`).
+- **`cowshed: sim broker unreachable` (exit 5).** The session broker is a launchd agent in the _personal_ GUI session —
+  it isn't running if nobody is logged in or the agent isn't loaded; the `next:` hint names the `launchctl` kickstart.
+  Exit 5 (environment) is deliberately distinct from exit 6 (a denial: missing `--sim` grant, non-drop-dir install,
+  unregistered URL scheme).
+- **`install` refused despite a `--sim install` grant.** The broker only installs drop-dir artifacts and only under the
+  human-gating rule — that refusal is the design, not a bug (ios.md explains why: simulator apps run as _you_).

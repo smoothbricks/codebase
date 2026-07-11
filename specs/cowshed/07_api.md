@@ -76,8 +76,10 @@ pub struct ExecRequest {
     pub cwd: Option<PathBuf>,            // relative to mount; default mount root
     pub mode: RunSandboxMode,            // default ReadWrite
     pub env: HashMap<String, String>,    // filtered through the build-config allowlist
+    pub trace: Option<TraceContext>,     // W3C context; propagated into the job env as TRACEPARENT (13_telemetry.md)
     pub stdin: Stdio, pub stdout: Stdio, pub stderr: Stdio,
 }
+pub struct TraceContext { pub trace_id: [u8; 16], pub span_id: [u8; 8] }  // adopted or minted per request
 
 pub struct ExecHandle {
     pub pid: u32,
@@ -93,13 +95,21 @@ pub struct GrantSet {
                                          //   base+1..size-1 = the workspace's own service ports (04_sandbox.md)
     pub read: Vec<PathBuf>,
     pub write: Vec<PathBuf>,
-    pub egress: Vec<EgressRule>,         // { host: String, ports: Vec<u16> }
+    pub egress: Vec<EgressRule>,         // { host, ports, mode, impersonate }
     pub repos: Vec<RepoRule>,            // repo-scoped mirror grants (05_gateway.md)
+    pub sim: Vec<SimVerb>,               // personal-session simulator broker verbs (04/05/14_nix.md)
 }
+pub enum SimVerb { OpenUrl, Install }    // closed enum; unknown verbs are usage errors
 pub struct PortBlock { pub base: u16, pub size: u16 }   // default size 16, from the reserved range
+pub struct EgressRule {                 // 04_sandbox.md / 05_gateway.md
+    pub host: String, pub ports: Vec<u16>,
+    pub mode: EgressMode,                // default Intercept (per-workspace CA); Opaque = pass-through CONNECT
+    pub impersonate: Option<String>,     // outbound TLS fingerprint; suppresses header injection
+}
+pub enum EgressMode { Intercept, Opaque }
 pub struct GrantDelta {
     pub read: Vec<PathBuf>, pub write: Vec<PathBuf>,
-    pub egress: Vec<EgressRule>, pub repos: Vec<RepoRule>,
+    pub egress: Vec<EgressRule>, pub repos: Vec<RepoRule>, pub sim: Vec<SimVerb>,
     pub expected_revision: Option<u64>,  // CAS: reject with Conflict if the on-disk revision differs
 }
 
@@ -173,10 +183,11 @@ subagent holding one cannot grant itself anything.
 These types are defined **once** in `cowshed-core` and reused verbatim by the CLI (`--json` bodies), NAPI, and MCP — no
 adapter redefines a field, and the contract goldens (08_testing.md) pin their shapes: `WorkspaceInfo`, `EnsureReport`,
 `GcReport`, `Finding`, `ExecOutcome`, `ExecRecord`, `PushReport`, `JobInfo`,
-`GrantSet`/`GrantDelta`/`PortBlock`/`EgressRule`/`RepoRule`, `GatewayStatus`, `AuditEvent`, and every `*Options` type
-(`AdoptOptions`, `CreateOptions`, `AttachOptions`, `RemoveOptions`, `RebaseOptions`, `LandOptions`, `PushOptions`).
-Field sketches elsewhere in this spec are illustrative; the freeze rule — one definition, reused, versioned together —
-is the contract. Adding a field is a coordinated change across core + goldens, not a per-adapter patch.
+`GrantSet`/`GrantDelta`/`PortBlock`/`EgressRule`/`RepoRule`/`SimVerb`, `GatewayStatus`, `AuditEvent`, and every
+`*Options` type (`AdoptOptions`, `CreateOptions`, `AttachOptions`, `RemoveOptions`, `RebaseOptions`, `LandOptions`,
+`PushOptions`). Field sketches elsewhere in this spec are illustrative; the freeze rule — one definition, reused,
+versioned together — is the contract. Adding a field is a coordinated change across core + goldens, not a per-adapter
+patch.
 
 ## Shell client (`cowshed-shell`)
 
@@ -203,7 +214,8 @@ impl Job {
 /// The single capture record CLI, MCP, and CI all consume (11_shell.md).
 pub struct ExecRecord {
     pub argv: Vec<String>, pub cwd: PathBuf, pub env_hash: u64,
-    pub grant_revision: u64, pub started: SystemTime, pub duration: Duration,
+    pub grant_revision: u64, pub trace: TraceContext,   // traceId/spanId/parentSpanId (13_telemetry.md)
+    pub started: SystemTime, pub duration: Duration,
     pub exit: ExitStatus, pub stdout_spool: PathBuf, pub stderr_spool: PathBuf,
     pub truncated: bool,
 }
