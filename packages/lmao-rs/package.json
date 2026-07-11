@@ -1,0 +1,9 @@
+{
+  "name": "@smoothbricks/lmao-rs",
+  "version": "0.1.0",
+  "private": true,
+  "nx": {
+    "name": "lmao-rs"
+  },
+  "description": "Rust implementation of lmao (Cargo workspace; see crates/)"
+}
