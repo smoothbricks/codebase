@@ -91,7 +91,11 @@ impl<'a> ColumnDictionary<'a> {
     pub fn finalize_indexed(self) -> FinalizedDictionary<'a> {
         let mut values: Vec<&'a str> = self.distinct.into_iter().collect();
         values.sort_unstable();
-        let index = values.iter().enumerate().map(|(i, v)| (*v, i as u32)).collect();
+        let index = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (*v, i as u32))
+            .collect();
         FinalizedDictionary { values, index }
     }
 }
@@ -151,8 +155,21 @@ mod tests {
         let f = e.finalize_indexed();
         assert_eq!(f.len(), 1);
         assert!(!f.is_empty());
-        assert!(FinalizedDictionary { values: vec![], index: Default::default() }.is_empty());
-        assert_eq!(FinalizedDictionary::<'_> { values: vec![], index: Default::default() }.len(), 0);
+        assert!(
+            FinalizedDictionary {
+                values: vec![],
+                index: Default::default()
+            }
+            .is_empty()
+        );
+        assert_eq!(
+            FinalizedDictionary::<'_> {
+                values: vec![],
+                index: Default::default()
+            }
+            .len(),
+            0
+        );
     }
 
     #[test]

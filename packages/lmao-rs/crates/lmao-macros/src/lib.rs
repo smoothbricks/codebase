@@ -44,7 +44,7 @@ use proc_macro2::Span;
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
-use syn::{braced, bracketed, Ident, LitStr, Token, Visibility};
+use syn::{Ident, LitStr, Token, Visibility, braced, bracketed};
 
 enum FieldKind {
     Number,
@@ -87,8 +87,10 @@ impl Parse for Field {
             "enum" => {
                 let content;
                 bracketed!(content in input);
-                let values: Punctuated<LitStr, Token![,]> =
-                    content.parse_terminated(<LitStr as syn::parse::Parse>::parse as fn(ParseStream) -> syn::Result<LitStr>, Token![,])?;
+                let values: Punctuated<LitStr, Token![,]> = content.parse_terminated(
+                    <LitStr as syn::parse::Parse>::parse as fn(ParseStream) -> syn::Result<LitStr>,
+                    Token![,],
+                )?;
                 if values.is_empty() {
                     return Err(syn::Error::new(
                         kind_span,
@@ -124,7 +126,10 @@ impl Parse for SchemaDef {
         let fields: Punctuated<Field, Token![,]> =
             content.parse_terminated(Field::parse, Token![,])?;
         if fields.is_empty() {
-            return Err(syn::Error::new(name.span(), "schema needs at least one field"));
+            return Err(syn::Error::new(
+                name.span(),
+                "schema needs at least one field",
+            ));
         }
         Ok(SchemaDef {
             vis,
