@@ -21,9 +21,9 @@ pub trait SpanSource {
     fn entry_type(&self, row: usize) -> u8;
     /// Format-string template / span name / flag name for the row (`01f`: the
     /// `message` column is dictionary-encoded and NEVER interpolated).
-    fn message(&self, _row: usize) -> Option<&str> {
-        None
-    }
+    fn message(&self, row: usize) -> Option<&str>;
+    /// Callsite line for the row (`01f` lineNumber system column; 0 = unset).
+    fn line_number(&self, row: usize) -> u32;
     /// Overflow continuation (same identity), yielded immediately after this buffer
     /// so one logical span's rows stay contiguous (`01k`).
     fn overflow(&self) -> Option<&Self>;
@@ -48,6 +48,14 @@ impl SpanSource for SpanBuffer {
 
     fn entry_type(&self, row: usize) -> u8 {
         self.entry_type_at(row).map(|e| e.as_u8()).unwrap_or(0)
+    }
+
+    fn message(&self, row: usize) -> Option<&str> {
+        self.message_at(row)
+    }
+
+    fn line_number(&self, row: usize) -> u32 {
+        self.line_at(row)
     }
 
     fn overflow(&self) -> Option<&Self> {
@@ -112,6 +120,10 @@ impl SpanSource for MockSpan {
 
     fn message(&self, row: usize) -> Option<&str> {
         self.messages.get(row).and_then(|m| m.as_deref())
+    }
+
+    fn line_number(&self, _row: usize) -> u32 {
+        0
     }
 
     fn overflow(&self) -> Option<&Self> {

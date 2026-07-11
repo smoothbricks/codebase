@@ -59,6 +59,7 @@ pub fn trace_schema() -> Arc<Schema> {
         Field::new("parent_span_id", DataType::UInt32, true),
         Field::new("entry_type", dict_type(DataType::UInt8), false),
         Field::new("message", dict_type(DataType::UInt32), true),
+        Field::new("line_number", DataType::UInt32, false),
     ]))
 }
 
@@ -93,6 +94,7 @@ pub fn convert_span_trees<S: SpanSource>(roots: &[S]) -> Result<RecordBatch, Arr
     let mut entry_keys = Vec::with_capacity(total_rows);
     let mut message_keys = Vec::with_capacity(total_rows);
     let mut message_valid = BooleanBufferBuilder::new(total_rows);
+    let mut line_numbers = Vec::with_capacity(total_rows);
 
     walk_pre_order(roots, &mut |b: &S| {
         let id = b.identity();
@@ -124,8 +126,10 @@ pub fn convert_span_trees<S: SpanSource>(roots: &[S]) -> Result<RecordBatch, Arr
                     message_valid.append(false);
                 }
             }
+            line_numbers.push(b.line_number(row));
         }
     });
+    debug_assert_eq!(timestamps.len(), total_rows, "pass-1/pass-2 row-count drift");
 
     let parent_nulls = NullBuffer::new(parent_valid.finish());
     let message_nulls = NullBuffer::new(message_valid.finish());
@@ -164,6 +168,7 @@ pub fn convert_span_trees<S: SpanSource>(roots: &[S]) -> Result<RecordBatch, Arr
             Arc::new(UInt32Array::new(parent_span_ids.into(), Some(parent_nulls))),
             Arc::new(entry_col),
             Arc::new(message_col),
+            Arc::new(UInt32Array::from(line_numbers)),
         ],
     )
 }
