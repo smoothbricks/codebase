@@ -1,0 +1,29 @@
+# cargo-mutants configuration (https://mutants.rs)
+#
+# AxE convention (AxE/specs/sim/07-mutation-testing.md): lmao INSTRUMENTATION CALL
+# SITES in application code are "arid" (excluded from mutation) — but the tracer's
+# OWN logic (this workspace) is fully mutated. Kernel-rule residue policy applies:
+# survivors must be classified equivalent / invalid / budget-timeout / unreached /
+# oracle-gap; only demonstrated equivalence is acceptable.
+
+# Proc-macro expansion code is excluded until it emits real code (compile_error stubs
+# would make every mutant "unviable" noise). Re-include when define_log_schema! lands.
+exclude_globs = [
+    "crates/lmao-macros/**",
+]
+
+# Stubbed fns (todo!) produce only unviable/timeout noise; skip calls that can't
+# currently be exercised. Remove entries as implementations land.
+exclude_re = [
+    "convert_span_trees",
+    "Arena::alloc",
+    "Arena::free",
+    "SpanBuffer::append",
+]
+
+# Determinism makes kills non-flaky, so a tight timeout is safe.
+timeout_multiplier = 2.0
+minimum_test_timeout = 30.0
+
+# Only mutate the workspace crates, not deps.
+# (cargo-mutants does this by default; kept explicit for readers.)
