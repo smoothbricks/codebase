@@ -41,12 +41,20 @@ formatters:
       - '!*.graphql'
       # Exclude files handled by Alejandra
       - '!*.nix'
+      # Exclude files handled by rustfmt
+      - '!*.rs'
       # Bun lockfiles are generated and should not be rewritten by Prettier
       - '!bun.lock'
       # Binary artifacts: Prettier reads them as UTF-8 and can corrupt them
       # by replacing invalid byte sequences.
       - '!*.wasm'
       - '!*.wasm.sha256'
+
+  # rustfmt for Rust files (packages/lmao-rs and future Rust workspaces)
+  rustfmt:
+    command: 'rustfmt --edition 2024'
+    patterns:
+      - '*.rs'
 
   # Alejandra for Nix files
   alejandra:
