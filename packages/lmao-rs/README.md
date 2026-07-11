@@ -75,3 +75,14 @@ Without `just`: the same commands are spelled out in `justfile`, and `.cargo/con
 5. `lmao-wasm` real bodies over linear memory; validate against the TS host's 52 allocator tests in
    `packages/lmao/src/lib/wasm/__tests__/`.
 6. `lmao-query` Arrow scan backend; SQLite parity backend.
+
+## Backlog (downstream consumers depend on these)
+
+- **`lmao-inspect`** — a thin generic CLI over `lmao-query`: tail/follow Arrow segment dirs, run selectors and SQL,
+  render tables, export `--json`/`--ndjson`. Reusable by cowshed, AxE, and jcode; spec at
+  `specs/lmao/04_inspect_cli.md`.
+- **W3C `traceparent` interop** — the runtime adopts an inbound `TRACEPARENT` (env / carrier) at tracer init as the root
+  span context, and stamps outbound `fetch`/HTTP requests with the current span's `traceparent`. This is what lets a
+  first-party tool's traffic join the caller's trace end-to-end (cowshed's tier-1 gateway attribution depends on it —
+  `specs/cowshed/13_telemetry.md`). Applies to both the TS/`packages/lmao` and Rust tracers; keep the wire format
+  identical across them.
