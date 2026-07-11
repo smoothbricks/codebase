@@ -1,0 +1,361 @@
+# cowshed CLI guide
+
+## The contract
+
+Every cowshed command follows the same I/O discipline:
+
+- **stdout** carries machine-readable output only: a bare value (a path, a name, TSV rows) or a JSON envelope with
+  `--json`. If you pipe cowshed, you get data — never prose.
+- **stderr** carries _everything else_: progress, explanations, warnings, and self-driving guidance. Guidance lines are
+  prefixed `cowshed:`; suggested follow-up commands are prefixed `next:`. Agents and humans read the same hints.
+- **Exit codes** are stable:
+
+| Code | Meaning                          | Typical cause                                                                                                                       |
+| ---- | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| 0    | ok                               | —                                                                                                                                   |
+| 1    | internal error (bug — report it) | panic, unexpected hdiutil/diskutil failure                                                                                          |
+| 2    | usage                            | unknown flag, missing argument                                                                                                      |
+| 3    | not-found                        | no such workspace/project/checkpoint                                                                                                |
+| 4    | conflict                         | name in use, workspace busy, restore over unsaved state without `--force`                                                           |
+| 5    | env-missing                      | gateway not running, caches volume absent, direnv missing                                                                           |
+| 6    | sandbox-denied                   | command blocked by the sandbox, confirmed by authoritative evidence; stderr names the path/domain and the grant that would allow it |
+
+`cowshed exec` passes the child's exit code through **unchanged**; failures of cowshed's own exec wrapper (mount gone
+mid-run, profile generation failed, …) use 100–105 so they can never collide with a child that legitimately exits 1–6.
+Exit 6 is reported only when cowshed has authoritative evidence of a denial — the gateway logged the egress decision, or
+the kernel sandbox telemetry names the blocked operation; otherwise the child's ordinary exit passes through untouched.
+
+The JSON envelope is uniform:
+
+```
+$ cowshed new raven --json
+{"ok":true,"result":{"name":"raven","project":"conloca-3f2a9c1b",
+ "path":"/Users/danny/.cowshed/mnt/conloca-3f2a9c1b/raven","branch":"cowshed/raven",
+ "base":"6f3a2c1","createdAt":"2026-07-11T14:03:22Z"}}
+
+$ cowshed path nonesuch --json
+{"ok":false,"error":{"code":"not-found",
+ "message":"no workspace 'nonesuch' in project 'conloca-3f2a9c1b'",
+ "hint":"cowshed ls"}}
+```
+
+Errors with `--json` still exit with their code; stderr stays human-readable either way.
+
+## Global flags
+
+- `--json` — JSON envelope on stdout instead of bare values/TSV. Available on every command.
+- `--project <path|name>` — operate on a project you're not standing in. Default: the project owning the current
+  directory (walking up to a `.cowshed/workspace.json` marker or an adopted git root). Exit 3 if neither resolves.
+- `-q` / `--quiet` — suppress `cowshed:` progress lines on stderr; errors and `next:` hints still print.
+
+Workspace names are `[a-z0-9][a-z0-9-]*`, unique per project. Commands taking `<name>` accept `main` wherever it makes
+sense (`cowshed path main`, `cowshed exec main -- ...` runs _unsandboxed_ in your adopted checkout and warns on stderr).
+
+## Lifecycle
+
+### `cowshed adopt`
+
+Run once, inside an existing checkout. Converts it into an image-backed **main workspace** at the same path. This is the
+only cowshed operation that copies data (one-time; clonefile cannot cross volumes into a new image).
+
+```
+$ cd ~/Dev/conloca && cowshed adopt
+cowshed: created dedicated volumes cowshed.store, cowshed.caches (space-sharing, excluded from backup)
+cowshed: creating image ~/.cowshed/store/conloca-3f2a9c1b/main.asif (capacity 100g, sparse)
+cowshed: copying 8,357,293 objects into the image (this is the one-time cost)
+cowshed: verifying tree against source ... ok
+cowshed: swapping ~/Dev/conloca -> mountpoint (stub .envrc written beneath)
+next: eval "$(cowshed ensure --envrc)"   # add to .envrc
+next: cowshed new <name>
+/Users/danny/Dev/conloca
+```
+
+### `cowshed new <name> [--ref <rev>] [--browse]`
+
+Clones **main's live image** (there are no templates) and mounts it.
+
+```
+$ cowshed new raven
+cowshed: cloned conloca main image (copy-on-write)
+cowshed: verified clone (fsck, pre-mount) and attached at ~/.cowshed/mnt/conloca-3f2a9c1b/raven
+cowshed: branch cowshed/raven created from main @ 6f3a2c1
+cowshed: port block 40960–40975 (gateway at 40960; your dev servers at 40961+)
+cowshed: sandbox: closed (write: own volume, designated cache subtrees, temp; egress: gateway only)
+next: cowshed exec raven -- bun test
+/Users/danny/.cowshed/mnt/conloca-3f2a9c1b/raven
+```
+
+The clone is crash-consistent (like a power cut) and fsck-verified on its device _before_ mounting (attach `-nomount` →
+verify → mount). `--ref` starts the branch elsewhere than main's HEAD; source catches up via git, caches stay warm
+regardless. `--browse` makes the volume visible in Finder (default is nobrowse).
+
+### `cowshed ls`
+
+TSV on stdout: name, state, branch, mountpoint (empty when detached).
+
+```
+$ cowshed ls
+main	mounted	main	/Users/danny/Dev/conloca
+raven	mounted	cowshed/raven	/Users/danny/.cowshed/mnt/conloca-3f2a9c1b/raven
+fox	detached	cowshed/fox
+```
+
+### `cowshed path <name>`
+
+Bare mountpoint on stdout. Exit 3 if the workspace doesn't exist. A detached workspace is attached first, so the printed
+path is always live; pass `--no-attach` to skip the healing and get the would-be path with a `cowshed:` note instead.
+
+### `cowshed rm <name> [--force]`
+
+Marks the workspace deleted and returns immediately; detach and image deletion happen in the background. Refuses
+(exit 4) when the branch has commits not pushed anywhere unless `--force`.
+
+```
+$ cowshed rm raven
+cowshed: cowshed/raven is pushed (host has 6f3a2c1..9b2e77d)
+cowshed: detaching and deleting in background
+next: cowshed gc   # reclaim space from old checkpoints too
+```
+
+Nothing on stdout — `rm` has no answer to give.
+
+## Daily work
+
+### `cowshed exec <name> -- <cmd...>`
+
+Runs a command inside the workspace's sandbox, cwd at the workspace root. Child stdout/stderr pass through untouched
+(cowshed writes nothing to stdout itself); child exit code passes through.
+
+```
+$ cowshed exec raven -- cargo build -p cowshed-core
+   Compiling cowshed-core v0.1.0
+...
+$ echo $?
+0
+```
+
+When a command fails _because of_ the sandbox and cowshed has authoritative evidence — the gateway logged the egress
+denial, or the kernel sandbox telemetry (unified log, correlated by pid) names the blocked operation — cowshed reports
+exit 6 with the diagnosis:
+
+```
+$ cowshed exec raven -- ./scripts/render-video.sh
+cowshed: sandbox denied file-write /Users/danny/Movies/renders
+cowshed: workspace 'raven' starts closed; this path is outside its writable set
+next: cowshed grant raven --write /Users/danny/Movies/renders
+$ echo $?
+6
+```
+
+Without such evidence, the child's ordinary exit code passes through untouched — cowshed never guesses a denial from
+output text. Failures of the exec wrapper itself use exit codes 100–105.
+
+### `cowshed shell <name>`
+
+Interactive shell inside the sandbox, same wiring as `exec`. Your prompt, direnv, and toolchains work normally; writes
+outside the granted set fail with EPERM.
+
+### Dev servers inside workspaces
+
+Each workspace owns a **16-port block** (allocated at creation; the gateway's data plane sits on the base port). Ports
+base+1 through base+15 are the workspace's own to bind: `astro dev`, vite, metro, `devenv up` all run sandboxed and are
+reachable from your host browser — the way a container would publish ports — and two workspaces never collide. The one
+honest requirement: tools must take their port from configuration rather than a hardcoded default.
+`cowshed ensure --envrc` exports `PORT` (base+1), which most dev servers respect, and `COWSHED_PORT_BASE` for tools that
+need several; devenv port offsets can derive from the block.
+
+```
+$ cowshed shell raven
+raven$ echo $PORT
+40961
+raven$ bun run dev          # vite reads $PORT; open http://localhost:40961 in your browser
+```
+
+### `cowshed jobs <name>` — background work
+
+Long commands auto-background at the soft timeout (default 120 s; `--timeout <dur>` tunes it, `--background` forces it
+immediately) and keep running under the workspace supervisor, spooling output inside the volume.
+`cowshed exec`/`cowshed shell` accept `--session <name>` for a persistent named shell whose cwd, variables, and jobs
+survive across calls.
+
+```
+$ cowshed exec raven --background -- bun run build:everything
+j-7f3a
+$ cowshed jobs raven
+j-7f3a	running	bun run build:everything	2m14s
+$ cowshed jobs logs raven j-7f3a --follow      # streamed spool; --stderr for the other stream
+$ cowshed jobs attach raven j-7f3a             # re-attach live stdio
+```
+
+### `cowshed ensure [--envrc]`
+
+The fast auto-fix. Healthy fast-path is a marker read plus a statfs (~15–25 ms, silent, exit 0). Otherwise it reattaches
+images after reboot or Finder ejects, repairs mount flags, re-arms the autosave agent, and reconciles anything drifted —
+synchronously, so when it returns you are standing in a valid workspace. `--envrc` additionally prints exports for the
+current workspace on stdout, for `eval` in `.envrc`:
+
+```
+$ cowshed ensure --envrc
+export COWSHED_GATEWAY_TOKEN=cw1_r4v3n…
+export COWSHED_PORT_BASE=40960 PORT=40961
+export COWSHED_PROJECT=conloca-3f2a9c1b COWSHED_WORKSPACE=raven
+```
+
+Deliberately short: wiring is carried by **files, not environment**. The registry URL (the workspace's own gateway base
+port) and the bun cache dir live in the committed `bunfig.toml` — bun honors a _relative_ `[install.cache] dir`,
+verified, so there is no cache export at all; cargo's source replacement and `SCCACHE_NO_DAEMON` live in the in-image
+`.cargo/config.toml` (cargo's `[env]` verifiably reaches rustc-wrapper invocations); the read-at-build caches (cargo
+registry, sccache, zig, gradle) are reached through their tools' _default_ host paths, relocated once onto the caches
+volume at first adopt. The one load-bearing export above exists only until its verification passes (token-via-config
+kills it); `PORT`/`COWSHED_PORT_BASE` wire dev servers into the workspace's port block (see "Dev servers" above); the
+`COWSHED_*` identity lines are prompt conveniences, never load-bearing.
+
+`ensure` never does slow or surprising work — no fetches, no compaction, no installs. Main gets the same wiring (that's
+the "main shares caches like sandboxes do" rule; the only difference is main isn't sandboxed).
+
+### `cowshed attach <name>` / `cowshed detach <name>`
+
+Suspend and resume a workspace without destroying it. Detached workspaces cost one closed file.
+
+## Sandbox grants
+
+Workspaces start **closed**: write access to their own volume, `~/.cowshed/caches`, and temp; read access to the
+toolchains and system; egress to the localhost gateway only. Widen per workspace:
+
+```
+$ cowshed grant raven --read ~/Dev/reference-corpus
+$ cowshed grant raven --write ~/Dev/shared-assets --egress api.github.com
+cowshed: grants for raven now: +read ~/Dev/reference-corpus, +write ~/Dev/shared-assets, +egress api.github.com
+cowshed: filesystem grants apply from the next exec; egress applies immediately (gateway allowlist)
+next: cowshed exec raven -- <retry your command>
+```
+
+- Grants are recorded in `<image>.grants.json`, **outside the volume** — a sandboxed process cannot edit its own grants.
+- Filesystem grants take effect at the next `exec`/`shell` (Seatbelt profiles are fixed at process launch; every exec
+  carries the current grant snapshot). Egress grants are enforced by the gateway and apply to running processes
+  immediately.
+- `cowshed grant <name>` with no flags prints the current grant set (TSV; `--json` for the envelope):
+
+```
+$ cowshed grant raven
+read	/Users/danny/Dev/reference-corpus
+write	/Users/danny/Dev/shared-assets
+egress	api.github.com
+```
+
+- `cowshed revoke raven --write ~/Dev/shared-assets` narrows again; `cowshed revoke raven --all` resets to closed.
+  Revocation of egress is immediate; filesystem revocation applies from the next exec.
+- The closed baseline is a floor, not a grant: you cannot revoke a workspace's access to its own volume, the caches
+  volume, or the gateway.
+
+## Git
+
+Workspace git is **local-paths-only**: every workspace has the `host` remote (main's repository, a mounted path) and can
+clone from read-only mirrors under `~/.cowshed/caches/git` — nothing else. No remote URLs, no credentials, no credential
+helpers exist inside a workspace; pushing to real remotes (origin, GitHub) is coordinator work, done host-side with your
+normal git setup.
+
+### `cowshed push <name> [--branch <b>]`
+
+Delivers the workspace branch to main's repository. Under the hood this is a _host-side fetch from the workspace mount_
+— the trusted side runs git, so nothing inside the workspace (hooks, `.git/config`) ever executes outside the sandbox.
+Never touches main's checked-out branch.
+
+```
+$ cowshed push raven
+cowshed: pushed cowshed/raven -> host (9 commits, 6f3a2c1..9b2e77d)
+next: merge in main when ready; new workspaces are warm from whatever main has built
+cowshed/raven
+```
+
+A background autosave (a per-project launchd agent, host-side like `push`) fetches every workspace into
+`refs/cowshed/<name>/wip` every 10 minutes — uncommitted work is the only thing at risk between autosaves, because the
+store volume that holds the images is excluded from backup (durability = git).
+
+### `cowshed repo mirror <url>` / `cowshed repo clone <url> [dir]`
+
+How third-party code gets into a workspace — the `gh repo clone` of the sandbox. `mirror` asks the gateway to fetch the
+repository (with its Keychain credentials, subject to the workspace's repo grants, one audit line) into a shared bare
+mirror on the caches volume, and prints the mirror path. `clone` is the sugar: mirror, then a local `git clone` from
+that path into the workspace. Mirrors are fetch-only, deduplicated fleet-wide, and read-only for sandboxes; re-run
+`mirror` to refresh.
+
+```
+$ cowshed exec raven -- cowshed repo clone https://github.com/tinylibs/tinybench
+cowshed: mirror ~/.cowshed/caches/git/github.com/tinylibs/tinybench.git (fetched via gateway)
+tinybench
+```
+
+### `cowshed rebase <name> [--fresh]`
+
+Brings the workspace branch up to current main (`git fetch host && git rebase host/main`, run inside the sandbox).
+Conflicts abort cleanly and exit 4 naming the conflicted paths. `--fresh` sheds accumulated image divergence: replay the
+branch onto a brand-new clone of current main and transplant the workspace's identity onto it — refused (exit 4) if the
+tree is dirty.
+
+### `cowshed land <name> [--check <cmd>]`
+
+The full close-out in one primitive: rebase onto main, validate (`--check`, or `.cowshed.toml` `[land] check`) inside
+the sandbox, fast-forward main's repo from the workspace, retire the workspace. Any failing step exits 4 with the
+workspace intact. `--no-retire` keeps the workspace; `--push-only` stops after validation for review-gated flows.
+
+## Time travel
+
+### `cowshed fork <src> <dst>`
+
+Clones a _running_ workspace — two divergent futures from the same mid-flight state, in milliseconds. Grants are **not**
+inherited; forks start closed.
+
+### `cowshed checkpoint <name> [label]` / `cowshed restore <name> <label>`
+
+Checkpoint clonefiles the workspace image (crash-consistent, fsck-verified) under a label — generated from the UTC
+timestamp when you don't give one; restore swaps the current image for the checkpoint (detach → clone → reattach, ~500
+ms). Restore refuses over unsaved work without `--force` (exit 4), and the displaced image is kept as a
+`pre-restore-<ts>` checkpoint, so a restore is itself undoable. List checkpoints with `cowshed ls --json` or
+`cowshed du`.
+
+```
+$ cowshed checkpoint raven pre-refactor
+pre-refactor
+$ cowshed restore raven pre-refactor
+cowshed: raven restored to pre-refactor (previous image kept as pre-restore-2026-07-11T14-22-09Z)
+next: cowshed exec raven -- git status
+```
+
+## Infrastructure
+
+### `cowshed gateway run` / `cowshed gateway status`
+
+`run` starts the gateway in the foreground (use launchd for login-time start; see [gateway.md](gateway.md)). `status`
+prints `running <pid>` plus the control port and per-workspace listener count, or exits 5 with setup hints.
+
+### `cowshed du`
+
+Copy-on-write-aware usage: written vs referenced bytes per workspace and per checkpoint — "written" is the true cost,
+"referenced" is shared with main. `--json` for dashboards; this is also how a coordinator spots long-lived workspaces
+worth `cowshed rebase --fresh`.
+
+### `cowshed mcp serve`
+
+Runs the MCP server (stdio, or a shared unix socket) exposing workspaces as tools for agent harnesses — the coordinator
+token prints once to stderr at start. See specs 12_mcp.md for the capability model; the short version: coordinator token
+creates/destroys/grants, workspace tokens can only run and observe work in their own workspace.
+
+### `cowshed gc`
+
+Deletes orphaned images and stale mountpoint dirs, prunes expired checkpoints, compacts detached images, and reports
+what it reclaimed. Safe to run anytime; also runs opportunistically from other commands.
+
+### `cowshed doctor`
+
+Invariant checks: every image has a marker, every mount matches an image, grants files parse, caches volume and gateway
+reachable, autosave fresh. Exit 0 when healthy; otherwise the code of the most severe finding (3/4/5) with one
+`cowshed:` line per issue and a `next:` fix for each.
+
+```
+$ cowshed doctor
+cowshed: gateway not running (last audit entry 2d ago)
+next: cowshed gateway run   # or: launchctl kickstart -k gui/501/dev.cowshed.gateway
+$ echo $?
+5
+```
