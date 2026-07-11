@@ -22,8 +22,10 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-use lmao_arena::raw::{self, Mem};
 use lmao_arena::SizeClass;
+#[cfg(target_arch = "wasm32")]
+use lmao_arena::raw::Mem;
+use lmao_arena::raw::{self};
 
 // --- host imports (env module) ---
 #[cfg(target_arch = "wasm32")]

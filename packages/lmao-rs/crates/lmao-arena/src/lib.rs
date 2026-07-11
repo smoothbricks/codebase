@@ -132,6 +132,17 @@ pub use raw::Mem;
 #[derive(Debug)]
 pub struct VecMem(Vec<u8>);
 
+impl VecMem {
+    /// A zeroed backing of `initial_bytes` with an initialized header
+    /// (used by [`Arena`] and the lmao-wasm native-fallback arena).
+    pub fn with_zeroed(initial_bytes: usize) -> Self {
+        assert!(initial_bytes >= HEADER_SIZE);
+        let mut mem = VecMem(vec![0u8; initial_bytes]);
+        raw::init(&mut mem);
+        mem
+    }
+}
+
 impl raw::Mem for VecMem {
     #[inline]
     fn size(&self) -> u32 {
