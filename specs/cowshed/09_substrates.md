@@ -115,16 +115,16 @@ unprivileged.
 
 ### Linux host paths
 
-State paths are identical across platforms — `~/.cowshed/{store,caches}` — only the volume technology behind each
-mountpoint differs (a pool necessarily exists on the ZFS substrate, so dedicating datasets costs nothing, exactly like
-APFS container volumes):
+State paths are identical across platforms — the store volume/dataset at `~/.cowshed`, caches nested at
+`~/.cowshed/caches` — only the volume technology behind each mountpoint differs (a pool necessarily exists on the ZFS
+substrate, so dedicating datasets costs nothing, exactly like APFS container volumes):
 
-| macOS                                                                                               | Linux                                                         |
-| --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
-| `cowshed.store` APFS volume at `~/.cowshed/store` (images, grants, quarantine, gateway state, logs) | `<pool>/cowshed/store` dataset at `~/.cowshed/store`          |
-| `cowshed.caches` APFS volume at `~/.cowshed/caches`                                                 | `<pool>/cowshed/caches` dataset at `~/.cowshed/caches`        |
-| Keychain (gateway secrets)                                                                          | secret-service (keyring) or `systemd-creds` on headless hosts |
-| launchd (gateway, login attach)                                                                     | systemd user units                                            |
+| macOS                                                                                              | Linux                                                         |
+| -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| `cowshed.store` APFS volume at `~/.cowshed` (images, grants, quarantine, gateway state, telemetry) | `<pool>/cowshed/store` dataset at `~/.cowshed`                |
+| `cowshed.caches` APFS volume at `~/.cowshed/caches`                                                | `<pool>/cowshed/caches` dataset at `~/.cowshed/caches`        |
+| Keychain (gateway secrets)                                                                         | secret-service (keyring) or `systemd-creds` on headless hosts |
+| launchd (gateway, login attach)                                                                    | systemd user units                                            |
 
 ### What ZFS adds
 

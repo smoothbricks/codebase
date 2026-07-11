@@ -123,8 +123,8 @@ cowshed makes it defensible, and the standard guardrails still apply:
   cannot read the host's secrets (they're in the gateway, denied to the sandbox), cannot reach the network except
   through the gateway's allowlist, and cannot write outside its throwaway clone.
 - **Secrets aren't on GitHub to leak**: registry and git credentials live only on the runner host. A compromised job
-  reaches them only through the gateway, which scopes every request to the job workspace's egress grants and logs it
-  (`~/.cowshed/store/gateway/audit.ndjson`).
+  reaches them only through the gateway, which scopes every request to the job workspace's egress grants and audits it
+  (Arrow telemetry store, `cowshed audit`).
 
 The clone-is-a-blast-radius property does the heavy lifting: the worst a job can do to the host is fill its throwaway
 dataset, which `cowshed rm` reclaims.

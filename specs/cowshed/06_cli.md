@@ -31,7 +31,8 @@ next: cowshed grant raven --egress registry.npmjs.org            ← stderr (if 
 `hint`. No other top-level keys — `cmd`, `detail`, and a numeric `code` are **not** part of the envelope. This is the
 single frozen shape; contract goldens (08_testing.md) enforce it, and any package doc showing a different arrangement is
 stale, not authoritative. Long operations additionally emit NDJSON progress events on stderr with `--json`
-(`{"event":"attach","ms":233}`).
+(`{"event":"attach","ms":233}`) — NDJSON here is a **wire encoding on a pipe to a live consumer**, the same role it
+plays for `--ndjson` export flags; cowshed never writes NDJSON to disk (telemetry storage is Arrow, 13_telemetry.md).
 
 ## Exit codes (stable API)
 
@@ -67,36 +68,40 @@ they can never be confused with a child that legitimately exits 1–6.
 Global flags: `--json`, `--project <git-root>` (default: cwd's repo), `-q`/`--quiet` (aliases; suppress stderr guidance,
 never errors).
 
-| Command                                       | stdout                                           | Notes                                                                                                                |
-| --------------------------------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
-| `cowshed adopt [path]`                        | mount path                                       | Convert checkout → main workspace (02). `--capacity <size>`.                                                         |
-| `cowshed new <name>`                          | mount path                                       | Clone main → session. `--ref <rev>`, `--from <ws>`, `--browse`, `--slot <n>`.                                        |
-| `cowshed ls`                                  | one name per line (`--json`: full records)       | Includes `main`, mount state, branch, base commit, age. Detached rows degrade — see below.                           |
-| `cowshed path <ws>`                           | mount path                                       | Exit 3 if unknown; attaches if detached (unless `--no-attach`).                                                      |
-| `cowshed exec <ws> -- <cmd…>`                 | child's stdout                                   | Sandboxed exec (04). `--ro`, `--cwd <rel>`. Child exit passes through unchanged; wrapper errors use 100–105.         |
-| `cowshed shell <ws>`                          | — (interactive)                                  | Sandboxed login shell inside the mount.                                                                              |
-| `cowshed repo mirror <url>`                   | mirror path                                      | Gateway fetches `<url>` into a read-only bare mirror on the cache volume (02/05). Repo-scoped egress grant required. |
-| `cowshed repo clone <url> [dir]`              | clone path                                       | `repo mirror` then a local `git clone --dissociate` into the workspace (default dir: repo basename).                 |
-| `cowshed ensure`                              | `--envrc`: export lines (≤2 load-bearing; 03)    | ≤25 ms fast path; heals mounts (02). `--attach` for stubs.                                                           |
-| `cowshed grant <ws> …`                        | new grant revision                               | `--read/--write <path>`, `--egress <host[:port]>`, `--repo <host/org[/repo]>` (04).                                  |
-| `cowshed revoke <ws> …`                       | new grant revision                               | Same selectors + `--all`.                                                                                            |
-| `cowshed push <ws>`                           | pushed ref                                       | `--branch <name>`. Host-side fetch from the mount (02); refuses checked-out branch (exit 4).                         |
-| `cowshed rebase <ws>`                         | new head sha                                     | Rebase branch onto host/main (02). `--fresh` sheds divergence.                                                       |
-| `cowshed land <ws>`                           | landed sha                                       | Rebase + validate + host ff-merge + retire (02). `--check <cmd>`, `--no-retire`, `--push-only`.                      |
-| `cowshed fork <src> <dst>`                    | mount path                                       | Mid-flight CoW copy; closed grants.                                                                                  |
-| `cowshed checkpoint <ws> [label]`             | label                                            | Crash-consistent snapshot; omitted label → generated UTC-timestamp label. `--keep` exempts from gc.                  |
-| `cowshed restore <ws> <label>`                | mount path                                       | Label required. Previous image kept as `pre-restore-…` (02).                                                         |
-| `cowshed jobs <ws>`                           | one job id per line (`--json`: records)          | List backgrounded jobs (11).                                                                                         |
-| `cowshed jobs logs <ws> <id>`                 | spooled stdout                                   | `--stderr`, `--follow`. Reads the in-volume spool.                                                                   |
-| `cowshed jobs attach <ws> <id>`               | streamed io                                      | Re-attach to a running job's stdio (11).                                                                             |
-| `cowshed rm <ws>`                             | — (no stdout)                                    | Perceived-instant (02). Refuses unpushed branch without `--force`; `--force` also required for main / dirty.         |
-| `cowshed attach <ws>` / `cowshed detach <ws>` | mount path / —                                   | Explicit mount lifecycle. `--browse`.                                                                                |
-| `cowshed du [ws]`                             | `--json`: written/referenced per ws + checkpoint | CoW-aware usage; lists checkpoints per workspace (01).                                                               |
-| `cowshed mcp serve`                           | — (stdio/socket server)                          | Prints the coordinator token to stderr exactly once (12).                                                            |
-| `cowshed gateway run`                         | — (foreground daemon)                            | launchd runs this.                                                                                                   |
-| `cowshed gateway status`                      | `--json` status                                  | Cache stats, per-workspace counters, audit path.                                                                     |
-| `cowshed gc`                                  | freed bytes                                      | Trash drain, checkpoint/retention pruning, orphan mountpoints, compaction (01). `--dry-run`.                         |
-| `cowshed doctor`                              | `--json` findings                                | Invariant checks; each finding carries a `fix:` hint.                                                                |
+| Command                                       | stdout                                           | Notes                                                                                                                                                       |
+| --------------------------------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cowshed adopt [path]`                        | mount path                                       | Convert checkout → main workspace (02). `--capacity <size>`.                                                                                                |
+| `cowshed new <name>`                          | mount path                                       | Clone main → session. `--ref <rev>`, `--from <ws>`, `--browse`, `--slot <n>`.                                                                               |
+| `cowshed ls`                                  | one name per line (`--json`: full records)       | Includes `main`, mount state, branch, base commit, age. Detached rows degrade — see below.                                                                  |
+| `cowshed path <ws>`                           | mount path                                       | Exit 3 if unknown; attaches if detached (unless `--no-attach`).                                                                                             |
+| `cowshed exec <ws> -- <cmd…>`                 | child's stdout                                   | Sandboxed exec (04). `--ro`, `--cwd <rel>`. Child exit passes through unchanged; wrapper errors use 100–105.                                                |
+| `cowshed shell <ws>`                          | — (interactive)                                  | Sandboxed login shell inside the mount.                                                                                                                     |
+| `cowshed repo mirror <url>`                   | mirror path                                      | Gateway fetches `<url>` into a read-only bare mirror on the cache volume (02/05). Repo-scoped egress grant required.                                        |
+| `cowshed repo clone <url> [dir]`              | clone path                                       | `repo mirror` then a local `git clone --dissociate` into the workspace (default dir: repo basename).                                                        |
+| `cowshed sim export <ws> [artifact]`          | drop path                                        | Copy a built `.app` to the one-way drop dir for the personal-session simulator (02/14). Default: newest built app.                                          |
+| `cowshed ensure`                              | `--envrc`: export lines (≤2 load-bearing; 03)    | ≤25 ms fast path; heals mounts (02). `--attach` for stubs.                                                                                                  |
+| `cowshed grant <ws> …`                        | new grant revision                               | `--read/--write <path>`, `--egress <host[:port]> [--opaque] [--impersonate <p>]`, `--repo <host/org[/repo]>`, `--sim <verb>`, `--preset simulator` (04/05). |
+| `cowshed revoke <ws> …`                       | new grant revision                               | Same selectors + `--all`.                                                                                                                                   |
+| `cowshed push <ws>`                           | pushed ref                                       | `--branch <name>`. Host-side fetch from the mount (02); refuses checked-out branch (exit 4).                                                                |
+| `cowshed rebase <ws>`                         | new head sha                                     | Rebase branch onto host/main (02). `--fresh` sheds divergence.                                                                                              |
+| `cowshed land <ws>`                           | landed sha                                       | Rebase + validate + host ff-merge + retire (02). `--check <cmd>`, `--no-retire`, `--push-only`.                                                             |
+| `cowshed fork <src> <dst>`                    | mount path                                       | Mid-flight CoW copy; closed grants.                                                                                                                         |
+| `cowshed checkpoint <ws> [label]`             | label                                            | Crash-consistent snapshot; omitted label → generated UTC-timestamp label. `--keep` exempts from gc.                                                         |
+| `cowshed restore <ws> <label>`                | mount path                                       | Label required. Previous image kept as `pre-restore-…` (02).                                                                                                |
+| `cowshed jobs <ws>`                           | one job id per line (`--json`: records)          | List backgrounded jobs (11).                                                                                                                                |
+| `cowshed jobs logs <ws> <id>`                 | spooled stdout                                   | `--stderr`, `--follow`. Reads the in-volume spool.                                                                                                          |
+| `cowshed jobs attach <ws> <id>`               | streamed io                                      | Re-attach to a running job's stdio (11).                                                                                                                    |
+| `cowshed rm <ws>`                             | — (no stdout)                                    | Perceived-instant (02). Refuses unpushed branch without `--force`; `--force` also required for main / dirty.                                                |
+| `cowshed attach <ws>` / `cowshed detach <ws>` | mount path / —                                   | Explicit mount lifecycle. `--browse`.                                                                                                                       |
+| `cowshed du [ws]`                             | `--json`: written/referenced per ws + checkpoint | CoW-aware usage; lists checkpoints per workspace (01).                                                                                                      |
+| `cowshed logs`                                | human table (`--json`/`--ndjson`: events)        | Controller telemetry (13). `--ws`, `--kind`, `--since`, `--follow`. Wraps `lmao-inspect` over the store segments.                                           |
+| `cowshed audit`                               | human table (`--json`/`--ndjson`: events)        | Gateway audit events (05/13). `--denied`, `--host`, `--ws`, `--follow` (live tail via the control plane).                                                   |
+| `cowshed trace <trace-id>`                    | human waterfall (`--json`: span tree)            | Terminal waterfall of a lifecycle op, exec, or land (13).                                                                                                   |
+| `cowshed mcp serve`                           | — (stdio/socket server)                          | Prints the coordinator token to stderr exactly once (12).                                                                                                   |
+| `cowshed gateway run`                         | — (foreground daemon)                            | launchd runs this.                                                                                                                                          |
+| `cowshed gateway status`                      | `--json` status                                  | Cache stats, per-workspace counters, telemetry segment stats.                                                                                               |
+| `cowshed gc`                                  | freed bytes                                      | Trash drain, checkpoint/retention pruning, orphan mountpoints, compaction (01). `--dry-run`.                                                                |
+| `cowshed doctor`                              | `--json` findings                                | Invariant checks; each finding carries a `fix:` hint.                                                                                                       |
 
 ### `cowshed ls` detached-row degradation
 
@@ -112,6 +117,18 @@ getmntinfo alone.
 Checkpoints are **not** listed by a bare `cowshed checkpoint <ws>` (that form generates a timestamped snapshot). List
 them with `cowshed ls --json` (per-workspace `checkpoints` array) or `cowshed du <ws>` (which reports each checkpoint's
 written/referenced bytes).
+
+### Egress grant modes
+
+`--egress <host>` grants an intercepted host by default: the gateway terminates TLS under the workspace CA and injects
+the Keychain credential + trace context (05_gateway.md). `--opaque` reverts a host to an opaque CONNECT tunnel (pinned
+clients, no injection); `--impersonate <profile>` presents a browser-shaped outbound fingerprint and suppresses header
+injection. A bare `cowshed grant <ws>` (no flags) prints the current set with `mode` and `impersonate` columns on the
+egress rows.
+
+`--sim <verb>` grants personal-session simulator broker verbs (`openurl`, `install` — 04/05/14); dev-side headless
+simulators need the `--preset simulator` profile class instead (CoreSimulator IPC), not a `--sim` grant. `install` is
+additionally bound to drop-dir artifacts and the human-gating rule (14_nix.md).
 
 `cowshed exec` and `cowshed shell` accept `--session <name>` to bind to a named persistent shell in the workspace
 supervisor (state — cwd, env, jobs — persists across calls); without it, exec uses an anonymous pooled shell
@@ -154,7 +171,8 @@ extra_workspace_dirs = ["build-out"]
 
 `cowshed ensure --envrc` additionally exports `PORT` and `COWSHED_PORT_BASE` (= the block base) as dev-server
 conventions, so `vite`/`astro`/`metro`/`devenv up` bind inside the workspace's own block instead of colliding with
-siblings (04_sandbox.md).
+siblings (04_sandbox.md), and `GOENV` pointing at the in-image go env file — Go's one load-bearing export, since Go has
+no directory-scoped config to carry the per-workspace `GOPROXY` (03_caches.md).
 
 ## Tradeoffs
 

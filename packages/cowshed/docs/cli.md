@@ -61,7 +61,7 @@ only cowshed operation that copies data (one-time; clonefile cannot cross volume
 ```
 $ cd ~/Dev/conloca && cowshed adopt
 cowshed: created dedicated volumes cowshed.store, cowshed.caches (space-sharing, excluded from backup)
-cowshed: creating image ~/.cowshed/store/conloca-3f2a9c1b/main.asif (capacity 100g, sparse)
+cowshed: creating image ~/.cowshed/conloca-3f2a9c1b/main.asif (capacity 100g, sparse)
 cowshed: copying 8,357,293 objects into the image (this is the one-time cost)
 cowshed: verifying tree against source ... ok
 cowshed: swapping ~/Dev/conloca -> mountpoint (stub .envrc written beneath)
@@ -197,6 +197,7 @@ current workspace on stdout, for `eval` in `.envrc`:
 ```
 $ cowshed ensure --envrc
 export COWSHED_GATEWAY_TOKEN=cw1_r4v3n…
+export GOENV=/Users/danny/.cowshed/mnt/conloca-3f2a9c1b/raven/.cowshed/cache/go/env
 export COWSHED_PORT_BASE=40960 PORT=40961
 export COWSHED_PROJECT=conloca-3f2a9c1b COWSHED_WORKSPACE=raven
 ```
@@ -205,9 +206,12 @@ Deliberately short: wiring is carried by **files, not environment**. The registr
 port) and the bun cache dir live in the committed `bunfig.toml` — bun honors a _relative_ `[install.cache] dir`,
 verified, so there is no cache export at all; cargo's source replacement and `SCCACHE_NO_DAEMON` live in the in-image
 `.cargo/config.toml` (cargo's `[env]` verifiably reaches rustc-wrapper invocations); the read-at-build caches (cargo
-registry, sccache, zig, gradle) are reached through their tools' _default_ host paths, relocated once onto the caches
-volume at first adopt. The one load-bearing export above exists only until its verification passes (token-via-config
-kills it); `PORT`/`COWSHED_PORT_BASE` wire dev servers into the workspace's port block (see "Dev servers" above); the
+registry, Go module/build caches, sccache, zig, gradle) are reached through their tools' _default_ host paths, relocated
+once onto the caches volume at first adopt — except Go, which has no directory-scoped config: its in-image env file
+(carrying the per-workspace `GOPROXY`, the shared caches, in-image `GOPATH`/`GOBIN`, and `GOTOOLCHAIN=local`) is reached
+via the `GOENV` export, so `~/go` is never created. The two load-bearing exports above each exist only until their
+verification passes (token-via-config kills the first; a file-based `GOENV` alternative — none known — would kill the
+second); `PORT`/`COWSHED_PORT_BASE` wire dev servers into the workspace's port block (see "Dev servers" above); the
 `COWSHED_*` identity lines are prompt conveniences, never load-bearing.
 
 `ensure` never does slow or surprising work — no fetches, no compaction, no installs. Main gets the same wiring (that's
@@ -216,6 +220,13 @@ the "main shares caches like sandboxes do" rule; the only difference is main isn
 ### `cowshed attach <name>` / `cowshed detach <name>`
 
 Suspend and resume a workspace without destroying it. Detached workspaces cost one closed file.
+
+### Simulators (iOS) — `cowshed sim export <name> [artifact]`
+
+Copies a built `.app` to the one-way drop dir (`/Users/Shared/cowshed-drop/<project_id>/`; stdout = the drop path) so
+the personal session can install it into the human's native Simulator.app — the artifact handoff for posture B. The
+in-image `xcrun` wrapper handles the rest of the simulator story (dev-local headless simulators by default;
+personal-session devices via `--sim` grants). The full walkthrough, Expo included, is [ios.md](ios.md).
 
 ## Sandbox grants
 
@@ -230,6 +241,9 @@ cowshed: filesystem grants apply from the next exec; egress applies immediately 
 next: cowshed exec raven -- <retry your command>
 ```
 
+- Besides `--read`/`--write`/`--egress` there are `--repo <host/org[/repo]>` (gateway repo mirrors), `--sim <verb>`
+  (personal-session simulator broker: `openurl` freely, `install` drop-dir-bound and human-gated — [ios.md](ios.md)),
+  and `--preset simulator` (dev-side headless CoreSimulator IPC).
 - Grants are recorded in `<image>.grants.json`, **outside the volume** — a sandboxed process cannot edit its own grants.
 - Filesystem grants take effect at the next `exec`/`shell` (Seatbelt profiles are fixed at process launch; every exec
   carries the current grant snapshot). Egress grants are enforced by the gateway and apply to running processes
@@ -247,6 +261,11 @@ egress	api.github.com
   Revocation of egress is immediate; filesystem revocation applies from the next exec.
 - The closed baseline is a floor, not a grant: you cannot revoke a workspace's access to its own volume, the caches
   volume, or the gateway.
+- **Egress is intercepted by default.** `--egress api.github.com` lets the gateway terminate TLS under the workspace's
+  CA and inject the Keychain credential + trace context — the workspace reaches the API authenticated while holding no
+  secret. Add `--opaque` for a cert-pinning host (plain tunnel, no injection) or `--impersonate <profile>` for a
+  browser-shaped fingerprint (also no injection). A bare `cowshed grant raven` prints the set with `mode`/`impersonate`
+  columns; `--repo github.com/org/*` grants which repos the gateway will mirror (see Git).
 
 ## Git
 
@@ -335,6 +354,20 @@ Copy-on-write-aware usage: written vs referenced bytes per workspace and per che
 "referenced" is shared with main. `--json` for dashboards; this is also how a coordinator spots long-lived workspaces
 worth `cowshed rebase --fresh`.
 
+### `cowshed logs` / `cowshed audit` / `cowshed trace`
+
+cowshed's telemetry is distributed tracing into Arrow columns, not a text logfile (see [telemetry.md](telemetry.md)) —
+these three verbs read it, human tables by default, `--json`/`--ndjson` to pipe:
+
+```
+$ cowshed logs --ws raven --kind lifecycle --since 1h   # lifecycle/op spans for one workspace
+$ cowshed audit --denied --follow                       # live egress denials across the fleet
+$ cowshed trace 4bf92f35a3…                             # terminal waterfall of one op/exec/land
+```
+
+There is no `.ndjson` or `.log` file to `tail`; `--ndjson` is an export encoding on the pipe. Under the hood these wrap
+the generic `lmao-inspect` reader over the Arrow segments in `~/.cowshed/telemetry/`.
+
 ### `cowshed mcp serve`
 
 Runs the MCP server (stdio, or a shared unix socket) exposing workspaces as tools for agent harnesses — the coordinator
@@ -354,7 +387,7 @@ reachable, autosave fresh. Exit 0 when healthy; otherwise the code of the most s
 
 ```
 $ cowshed doctor
-cowshed: gateway not running (last audit entry 2d ago)
+cowshed: gateway not running (last audit event 2d ago)
 next: cowshed gateway run   # or: launchctl kickstart -k gui/501/dev.cowshed.gateway
 $ echo $?
 5

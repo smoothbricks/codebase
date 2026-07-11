@@ -64,9 +64,9 @@ Agent-driven development multiplies workspaces. Three failure modes follow:
                                          │          │
                     ┌────────────────────┘          └──────────────────┐
                     ▼                                                  ▼
-        ~/.cowshed/store/  (cowshed.store volume)                  cowshed-gateway (localhost)
-        <project>/main.asif          ── clonefile ──►          npm/cargo mirror · CONNECT
-        <project>/sessions/<ws>.asif                           repo-mirror verb · audit log
+        ~/.cowshed/  (= the cowshed.store volume)                  cowshed-gateway (localhost)
+        <project>/main.asif          ── clonefile ──►          npm/cargo mirror · per-workspace CA interception
+        <project>/sessions/<ws>.asif                           repo-mirror verb · Arrow audit (13)
         <project>/sessions/<ws>.asif.grants.json                     │
                     │                                                ▼
                     ▼ hdiutil attach (nobrowse)               cowshed.caches APFS volume
@@ -82,13 +82,20 @@ Both volumes are dedicated: the Data volume carries no cowshed bytes (01_storage
 remote (main's mount, fetch-only for rebase) and read-only bare mirrors on the cache volume. Pulling a new upstream repo
 is a gateway _control-plane_ verb (`cowshed repo mirror`, 06_cli.md/05_gateway.md), never in-sandbox git-over-HTTPS;
 publishing to a real origin is coordinator work, host-side, outside any sandbox (02_workspaces.md). The gateway box
-therefore carries npm/cargo mirrors, an allowlisted CONNECT tunnel, and the repo-mirror verb — no git credential broker.
+therefore carries npm/cargo mirrors, **per-workspace-CA TLS interception** as the default for granted egress hosts (with
+an `--opaque` CONNECT fallback for pinned clients — 05_gateway.md), and the repo-mirror verb — no git credential broker.
+The workspace holds only public trust anchors; the CA private key stays with the gateway.
 
 State is derived, never stored: the workspace clones are the registry (readdir / `zfs list`), the kernel mount table is
 the attachment state (getmntinfo), and an in-workspace marker (`.cowshed/workspace.json`) is the identity. There is **no
 state database**. The only daemons are the gateway (one per host) and the per-workspace shell supervisors (11_shell.md)
 with the optional MCP socket server (12_mcp.md); none of them _store_ authoritative state — kill any of them and the
 next command rederives everything from disk and the mount table.
+
+Observability is **distributed tracing into Arrow columns** (13_telemetry.md): lifecycle ops, jobs, and gateway requests
+are spans propagating W3C trace context, flushed as queryable Arrow segments on the store volume via **lmao**
+(`packages/lmao-rs`). There is no telemetry daemon and no on-disk text log — the audit trail, the perf SLOs, and the
+sandbox trace-assertions are all queries over one substrate.
 
 ## Crate map
 
@@ -117,7 +124,9 @@ next command rederives everything from disk and the mount table.
 **VMs / Apple containers rejected as substrate.** Apple's Containerization framework runs Linux guests (excludes
 Swift/Xcode/iOS work), and Virtualization.framework enforces a two-concurrent-VM cap for macOS guests — unusable for a
 fleet. Seatbelt-on-host covers all toolchains at zero boot cost; the reduced isolation ceiling is documented and
-accepted.
+accepted. The remaining unsandboxed surfaces — main and the controller tooling — can additionally be placed behind a
+kernel uid boundary by running the whole stack as a dedicated `dev` account (deployment posture B, 14_nix.md); that is
+the recommended hardening, not a substrate change.
 
 **Warm pools rejected.** Pre-attached image pools would hide attach latency (~235 ms) but add a claim/refill state
 machine and staleness handling. The cold path already meets the ≤ 1 s budget; the acceptable-latency envelope (10 s for

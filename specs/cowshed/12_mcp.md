@@ -73,24 +73,32 @@ even if compromised — escalation is strictly a decision made one level up.
 
 ### Coordinator tools (require the coordinator token)
 
-| Tool                | Args (sketch)                                                                      | Returns                                                           |
-| ------------------- | ---------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| `workspace_create`  | `name`, `ref?`, `from?`, `slot?`                                                   | mount path, base commit                                           |
-| `workspace_list`    | —                                                                                  | records (name, state, base, age, written/referenced)              |
-| `workspace_destroy` | `name`, `force?`                                                                   | ok                                                                |
-| `fork`              | `src`, `dst`                                                                       | mount path                                                        |
-| `checkpoint`        | `name`, `label?`                                                                   | label (generated UTC timestamp if omitted)                        |
-| `restore`           | `name`, `label` (**required**)                                                     | mount path                                                        |
-| `rebase`            | `name`, `fresh?`                                                                   | new head sha                                                      |
-| `land`              | `name`, `check?`, `retire?`                                                        | landed sha                                                        |
-| `grant` / `revoke`  | `name`, `read[]?`, `write[]?`, `egress[]?`, `repo[]?`, `all?`, `expectedRevision?` | new grant revision                                                |
-| `slot_assign`       | `name`, `slot`                                                                     | ok (recycled mount path for the slot)                             |
-| `mint_worker`       | `name`                                                                             | a short-lived one-use worker connection descriptor for a subagent |
+| Tool                | Args (sketch)                                                                                | Returns                                                           |
+| ------------------- | -------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| `workspace_create`  | `name`, `ref?`, `from?`, `slot?`                                                             | mount path, base commit                                           |
+| `workspace_list`    | —                                                                                            | records (name, state, base, age, written/referenced)              |
+| `workspace_destroy` | `name`, `force?`                                                                             | ok                                                                |
+| `fork`              | `src`, `dst`                                                                                 | mount path                                                        |
+| `checkpoint`        | `name`, `label?`                                                                             | label (generated UTC timestamp if omitted)                        |
+| `restore`           | `name`, `label` (**required**)                                                               | mount path                                                        |
+| `rebase`            | `name`, `fresh?`                                                                             | new head sha                                                      |
+| `land`              | `name`, `check?`, `retire?`                                                                  | landed sha                                                        |
+| `grant` / `revoke`  | `name`, `read[]?`, `write[]?`, `egress[]?`, `repo[]?`, `sim[]?`, `all?`, `expectedRevision?` | new grant revision                                                |
+| `slot_assign`       | `name`, `slot`                                                                               | ok (recycled mount path for the slot)                             |
+| `mint_worker`       | `name`                                                                                       | a short-lived one-use worker connection descriptor for a subagent |
+
+A coordinator-scoped **telemetry query tool** (selector/SQL over the store segments, 13_telemetry.md) is roadmap, not v1
+— the CLI's `cowshed logs`/`audit`/`trace` cover the need until then; workers never get it (they may read only their own
+in-volume exec records, which `job_status`/`job_logs` already expose).
 
 `checkpoint` and `restore` are split into two tools (not one `label?` row) because `restore`'s label is **required** —
 there is no "restore the latest" default — while `checkpoint`'s is optional. `grant`/`revoke` carry `expectedRevision`
-for compare-and-swap (07_api.md/04_sandbox.md) and a `repo[]` selector for repo-scoped mirror grants (05_gateway.md);
-there are no SSH/Docker grant axes.
+for compare-and-swap (07_api.md/04_sandbox.md) and a `repo[]` selector for repo-scoped mirror grants (05_gateway.md).
+Each `egress[]` entry is `{ host, ports?, mode?: "intercept" | "opaque", impersonate?: "<profile>" }`, mirroring the
+grant-file schema (04_sandbox.md): a coordinator sets a host's interception mode and fingerprint at grant time, `mode`
+defaulting to `intercept`. `sim[]` carries personal-session simulator broker verbs (`"openurl"` / `"install"` —
+04_sandbox.md/05_gateway.md); `install` remains bound to drop-dir artifacts and the human-gating rule regardless of the
+grant (14_nix.md). There are no SSH/Docker grant axes.
 
 ### Worker tools (workspace token; scoped to that workspace)
 

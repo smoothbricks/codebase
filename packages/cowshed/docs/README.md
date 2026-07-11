@@ -17,8 +17,8 @@ sandbox, gateway, and cache model are identical across them.
 
 On ZFS everything is faster — `cowshed new` is tens of milliseconds and checkpoints are literal snapshots — see
 [zfs.md](zfs.md). A third consumer, **self-hosted CI runners** ([ci.md](ci.md)), uses cowshed on Linux/ZFS to give every
-GitHub Actions job a warm, sandboxed, ephemeral workspace. The examples below are macOS; on Linux the same
-`~/.cowshed/{store,caches}` paths are backed by ZFS datasets, with secret-service in place of Keychain.
+GitHub Actions job a warm, sandboxed, ephemeral workspace. The examples below are macOS; on Linux the same `~/.cowshed`
+and `~/.cowshed/caches` paths are backed by ZFS datasets, with secret-service in place of Keychain.
 
 ```
 $ cowshed new raven
@@ -79,29 +79,31 @@ eval "$(cowshed ensure --envrc)"
 
 ## Where things live
 
-| What                                                                    | Where                                                                       |
-| ----------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| Images (main + workspaces + checkpoints)                                | `~/.cowshed/store/<project_id>/` (dedicated `cowshed.store` volume)         |
-| Workspace mounts                                                        | `~/.cowshed/mnt/<project_id>/<workspace>`                                   |
-| Adopted main mount                                                      | its original path (e.g. `~/Dev/conloca`)                                    |
-| Shared cache volume (sccache, zig, gradle, gateway mirror, git mirrors) | `~/.cowshed/caches` (dedicated `cowshed.caches` volume — fully rebuildable) |
-| Workspace identity marker                                               | `<mount>/.cowshed/workspace.json`                                           |
-| Sandbox grants (outside the volume, tamper-proof)                       | `<image>.grants.json`                                                       |
-| Gateway audit log                                                       | `~/.cowshed/store/gateway/audit.ndjson`                                     |
+| What                                                                                            | Where                                                                             |
+| ----------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| Images (main + workspaces + checkpoints)                                                        | `~/.cowshed/<project_id>/` (`~/.cowshed` IS the dedicated `cowshed.store` volume) |
+| Workspace mounts                                                                                | `~/.cowshed/mnt/<project_id>/<workspace>`                                         |
+| Adopted main mount                                                                              | its original path (e.g. `~/Dev/conloca`)                                          |
+| Shared cache volume (sccache, zig, gradle, Go module/build caches, gateway mirror, git mirrors) | `~/.cowshed/caches` (dedicated `cowshed.caches` volume — fully rebuildable)       |
+| Workspace identity marker                                                                       | `<mount>/.cowshed/workspace.json`                                                 |
+| Sandbox grants (outside the volume, tamper-proof)                                               | `<image>.grants.json`                                                             |
+| Telemetry + gateway audit (Arrow, `cowshed logs`/`audit`)                                       | `~/.cowshed/telemetry/`                                                           |
 
 There is no database. The images, the kernel mount table, and the in-image markers _are_ the state; every command
 derives the world by looking at them.
 
 ## The cache model in one paragraph
 
-Downloads happen once, ever: the gateway mirrors npm and cargo registries (and, via `cowshed repo`, git repositories) on
-each workspace's own localhost port and caches artifacts on `~/.cowshed/caches`. Bun's install cache lives _inside_ each
-workspace image — inherited from main via copy-on-write — because bun clones out of it, and clonefile can't cross
-volumes; that keeps `bun install` on its fast path. Read-at-build caches (cargo's registry, sccache, zig global, gradle)
-are shared on `~/.cowshed/caches`, reached through the tools' default paths — `~/.cargo/{registry,git}` and friends are
-relocated there once at first adopt (config, credentials, and `~/.cargo/bin` stay home, untouched). Workspace-keyed
-state (`target/`, `node_modules`, DerivedData, `.nx`) stays per-workspace, warm from main. This wiring is identical for
-main and for sandboxes — main shares caches exactly the way agent workspaces do.
+Downloads happen once, ever: the gateway mirrors npm, cargo, and Go module registries (and, via `cowshed repo`, git
+repositories) on each workspace's own localhost port and caches artifacts on `~/.cowshed/caches`. Bun's install cache
+lives _inside_ each workspace image — inherited from main via copy-on-write — because bun clones out of it, and
+clonefile can't cross volumes; that keeps `bun install` on its fast path. Read-at-build caches (cargo's registry, Go's
+module and build caches, sccache, zig global, gradle) are shared on `~/.cowshed/caches`, reached through the tools'
+default paths — `~/.cargo/{registry,git}` and friends are relocated there once at first adopt (config, credentials, and
+`~/.cargo/bin` stay home, untouched), while Go is pointed there directly by its in-image env file — **`~/go` never
+exists on a cowshed host**. Workspace-keyed state (`target/`, `node_modules`, DerivedData, `.nx`, `vendor/`) stays
+per-workspace, warm from main. This wiring is identical for main and for sandboxes — main shares caches exactly the way
+agent workspaces do.
 
 ## Documentation
 
@@ -109,6 +111,7 @@ main and for sandboxes — main shares caches exactly the way agent workspaces d
 - [agents.md](agents.md) — driving cowshed from coding agents (Claude Code warm worktrees)
 - [jcode.md](jcode.md) — jcode integration via the cowshed-core Rust API
 - [gateway.md](gateway.md) — gateway setup, credentials, mirrors, egress allowlists
+- [ios.md](ios.md) — iOS/Expo development across the dev-uid boundary: simulators, the drop dir, the `xcrun` wrapper
 - [zfs.md](zfs.md) — Linux/ZFS substrate: pool setup, send/receive, pinned-space lifecycle
 - [ci.md](ci.md) — cowshed as a self-hosted GitHub Actions runner
 - [troubleshooting.md](troubleshooting.md) — mounts, sandbox denials, disk usage, backup story

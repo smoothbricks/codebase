@@ -21,32 +21,52 @@ wrong project on the strength of a short hash. Every path below uses `project_id
 
 ## Directory layout
 
-```
-~/.cowshed/
-  store/                             # cowshed.store volume mountpoint (state; see "Dedicated volumes")
-    <project_id>/
-      main.asif                      # the adopted main workspace image
-      main.asif.grants.json          # controller-owned grants (main is normally unsandboxed)
-      sessions/
-        <workspace>.asif             # one image per workspace
-        <workspace>.asif.grants.json # controller-owned grant file (see 04_sandbox.md)
-        <workspace>.asif.lock        # flock target for lifecycle operations
-      checkpoints/
-        <workspace>/<label>.asif     # clonefile snapshots (see 02_workspaces.md)
-      quarantine/                    # secrets relocated by `cowshed adopt --quarantine` (02_workspaces.md)
-      waivers.json                   # reasoned secret-scan waivers (02_workspaces.md)
-    gateway/
-      config.json                    # allowlist, upstream registries (optional; defaults apply)
-      audit.ndjson                   # append-only egress audit log — protected state, never mixed with logs
-    logs/                            # operational logs (per-command debug, daemon stderr), rotated
-  caches/                            # cowshed.caches volume mountpoint (mirror, git mirrors, layer-3 caches)
-  mnt/<project_id>/<workspace>/      # session mountpoints (empty dirs when detached)
-  gateway.sock                       # gateway unix socket (control plane)
+`~/.cowshed` **is** the `cowshed.store` volume — the dotdir is a mountpoint, not a directory tree on Data. There is no
+intermediate `store/` level; the volume root is the layout root:
 
-~/Library/LaunchAgents/dev.cowshed.*.plist   # the ONLY ~/Library residue — launchd requires this location
+```
+~/.cowshed/                          # ← the cowshed.store volume, mounted here (see "Dedicated volumes")
+  .cowshed-volume.json               # volume marker: its ABSENCE means "not mounted" (see mount ordering below)
+  <project_id>/
+    main.asif                        # the adopted main workspace image
+    main.asif.grants.json            # controller-owned grants (main is normally unsandboxed)
+    sessions/
+      <workspace>.asif               # one image per workspace
+      <workspace>.asif.grants.json   # controller-owned grant file (see 04_sandbox.md)
+      <workspace>.asif.lock          # flock target for lifecycle operations
+    checkpoints/
+      <workspace>/<label>.asif       # clonefile snapshots (see 02_workspaces.md)
+    quarantine/                      # secrets relocated by `cowshed adopt --quarantine` (02_workspaces.md)
+    waivers.json                     # reasoned secret-scan waivers (02_workspaces.md)
+  gateway/
+    config.json                      # allowlist, upstream registries (optional; defaults apply)
+  gateway.sock                       # gateway unix socket (control plane; root-level keeps sun_path short)
+  telemetry/                         # ALL telemetry: Arrow IPC segments, day-partitioned (13_telemetry.md)
+    <yyyy-mm-dd>/*.arrow             #   lifecycle spans, gateway audit, grant mutations, command debug
+    daemon-stderr.log                #   the one text file: launchd stderr for pre-tracer-init crashes only
+  caches/                            # ← cowshed.caches volume, NESTED mount (mirror, git mirrors, layer-3 caches)
+  mnt/<project_id>/<workspace>/      # ← session workspace mounts, nested (empty dirs when detached)
+
+~/Library/LaunchAgents/dev.cowshed.*.plist   # the ONLY ~/Library residue — launchd requires this location;
+                                             # home-manager-owned on nix hosts (14_nix.md)
 ```
 
-Workspace names match `[a-z0-9][a-z0-9-]{0,63}`; `main` is reserved.
+Workspace names match `[a-z0-9][a-z0-9-]{0,63}`; `main` is reserved. Top-level project directories cannot collide with
+the reserved names (`gateway`, `telemetry`, `caches`, `mnt`) because `project_id` always carries the `-<hex8>` suffix —
+a repository literally named `telemetry` becomes `telemetry-3f2a9c1b`.
+
+After this layout, cowshed's entire Data-volume home footprint is **one empty mountpoint directory** (plus the
+home-manager-managed items above): everything real lives on the two cowshed volumes, outside Data's snapshots, backups,
+and fsck domain.
+
+### Two `.cowshed` namespaces
+
+The name appears in two namespaces that must not be confused. **Host-absolute `~/.cowshed`** exists once — it is the
+herd's: images, grants, caches, telemetry, mounts. **In-image relative `.cowshed/`** exists once _per workspace_, at
+each volume root — the marker, token, CA certificate, in-image cache roots, job spools — and travels with every clone.
+The wiring rule follows the split: shared/rebuildable state resolves to host-absolute `~/.cowshed/...` paths (the same
+string in every context), workspace-keyed state resolves to in-image relative `.cowshed/...` paths (correct in every
+clone automatically). Main and sessions use identical wiring; only the sandbox's permission mask differs.
 
 ## Images
 
@@ -94,21 +114,28 @@ All cowshed bytes live on two dedicated APFS volumes, split by **rebuildability 
 cowshed churn at all:
 
 - **`cowshed.caches`**, mounted at `~/.cowshed/caches` — everything rebuildable. Layout:
-  `~/.cowshed/caches/{mirror,git,sccache,zig,gradle}` (see 03_caches.md). `git/` holds bare git mirrors
+  `~/.cowshed/caches/{mirror,git,sccache,zig,gradle,go/{mod,build}}` (see 03_caches.md). `git/` holds bare git mirrors
   (`<host>/<org>/<repo>.git`) — written only by the gateway via `cowshed repo mirror`, sandbox-read-only, the sole
   source of remote code inside workspaces (02_workspaces.md). Because nothing unique lives here, the nuclear recovery
   path is always safe: `diskutil apfs deleteVolume` + lazy recreate — the mirror refetches, sccache and registries
   rebuild. `cowshed doctor` offers it as the fix for cache-volume corruption; `cowshed gc` never needs more than it.
-- **`cowshed.store`**, mounted at `~/.cowshed/store` — images, grant sidecars, waivers, quarantine, gateway config and
-  audit, operational logs. Mostly rebuildable, with a small unique window: uncommitted work between autosaves
-  (02_workspaces.md); durability is still git. Same-volume clonefile is preserved by construction — main → sessions →
-  checkpoints and trash renames all stay within `cowshed.store`.
+- **`cowshed.store`**, mounted at `~/.cowshed` — images, grant sidecars, waivers, quarantine, gateway config and audit,
+  telemetry. Mostly rebuildable, with a small unique window: uncommitted work between autosaves (02_workspaces.md);
+  durability is still git. Same-volume clonefile is preserved by construction — main → sessions → checkpoints and trash
+  renames all stay within `cowshed.store`.
 
 Both volumes are created lazily on first use
 (`diskutil apfs addVolume <container> APFS <cowshed.caches|cowshed.store> -nomount`, then mounted `-nobrowse`) and share
 the container's free-space pool — no sizing, no space cost for the split. macOS auto-mounts container volumes at boot,
 but `-nobrowse` is not sticky: `cowshed ensure` re-mounts with canonical flags after reboot, and `cowshed doctor`
 verifies presence and flags of both.
+
+**Mount ordering and the unmounted-masking guard.** The layout nests: the caches volume and every workspace mount at
+directories that live _on_ the store volume, so `cowshed.store` mounts first — the login agent and `cowshed ensure`
+sequence store → caches → workspaces. When the store volume is not mounted, `~/.cowshed` is a bare, empty directory on
+Data; the volume-root marker `.cowshed-volume.json` is how every cowshed command tells the difference — marker absent ⇒
+treat as unmounted and heal before doing anything (the same shape as the workspace stub `.envrc`). The underlying Data
+directory is kept empty by construction so nothing ever silently lands on Data behind an unmounted volume.
 
 Why volumes and not paths on Data: Data takes hourly APFS local snapshots, and a snapshot pins every since-rewritten
 block of a multi-GB churning image — ghosts that path-level `tmutil addexclusion` does **not** prevent (exclusion stops
@@ -146,14 +173,19 @@ Written at adopt/new/fork/restore, at the volume root; travels with every clone:
   "imageFormat": "asif", // "asif" | "sparse"
   "baseCommit": "8f31c2d…", // main's HEAD at creation
   "createdAt": "2026-07-11T12:00:00Z",
-  "forkedFrom": null // workspace name when created by `cowshed fork`
+  "forkedFrom": null, // workspace name when created by `cowshed fork`
+  "createdTrace": "4bf92f…" // trace id of the new/fork/restore that created this image (13_telemetry.md)
 }
 ```
 
-The in-image `.cowshed/` directory also holds `token` (the gateway identity, 0600, rewritten on new/fork/restore so
-identities never duplicate), the in-image cache roots (03_caches.md), and `jobs/<id>/` — the per-exec output spool and
-NDJSON exec records written by the shell supervisor (11_shell.md). Because job output lives inside the volume, a
-checkpoint captures the execution history alongside the filesystem state it produced: snapshot-as-evidence.
+`createdTrace` is the CoW-lineage anchor: `fork`/`restore`/`checkpoint` link the new trace to it, so the clone graph is
+a queryable provenance graph (13_telemetry.md). The in-image `.cowshed/` directory also holds `token` (the gateway
+identity, 0600, rewritten on new/fork/restore so identities never duplicate), the workspace CA **certificate** (the
+public trust anchor for egress interception — the private key stays controller-side, 04_sandbox.md/05_gateway.md), the
+in-image cache roots (03_caches.md), and `jobs/` — the per-exec output spools (`jobs/<id>/`, raw bytes) and the Arrow
+exec records (`jobs/records.arrow`, 11_shell.md/13_telemetry.md) written by the shell supervisor. Because job output
+lives inside the volume, a checkpoint captures the execution history alongside the filesystem state it produced:
+snapshot-as-evidence.
 
 ### Grant files live outside the volume
 
@@ -161,7 +193,10 @@ checkpoint captures the execution history alongside the filesystem state it prod
 **never** granted into any sandbox — a sandboxed process that could edit its own grant file could escalate itself. Only
 cowshed-core (running unsandboxed as the controller) reads and writes it. Besides grants it carries the workspace's
 `portBlock` binding (`{base, size}`; base = the gateway's per-workspace data-plane listener, base+1..15 = the
-workspace's own bindable dev-server ports) and the detach-time info snapshot described above. Schema in 04_sandbox.md.
+workspace's own bindable dev-server ports) and the detach-time info snapshot described above. The workspace's CA
+**private key** sits alongside it (`<image>.ca.key`, 0600, same controller-only, sandbox-denied treatment) — the gateway
+signs per-host interception leaves with it; only the public CA cert ever enters the image (04_sandbox.md/05_gateway.md).
+Schema in 04_sandbox.md.
 
 ## Retention
 
@@ -205,6 +240,12 @@ short, stable, hidden paths cowshed fully owns.
 volume, where local snapshots pin their rewritten blocks and backup policy needs per-path exclusion machinery. Two
 dedicated volumes cost nothing (container space-sharing) and reduce cowshed's `~/Library` footprint to the launchd
 plists that must live there.
+
+**A `store/` sub-mountpoint rejected.** Mounting the store volume at `~/.cowshed/store` left `~/.cowshed` as a real
+Data-volume directory holding one wrapper level that meant nothing to users ("store with nested telemetry"). Mounting
+the volume at `~/.cowshed` itself makes the dotdir a door, not a room: one empty mountpoint inode on Data, every other
+path one level shorter, and "cowshed stuff lives in the cowshed" is literally true. The costs — mount ordering and the
+bare-directory guard above — are machinery `ensure` already had for the workspaces.
 
 **Images on the caches volume rejected.** Co-locating images with caches unlocks no additional sharing: container
 volumes already pool free space, and the reflink boundary that matters is the image's _inner_ filesystem — clonefile

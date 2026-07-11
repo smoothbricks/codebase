@@ -159,4 +159,8 @@ authority; workers run closed and ask.
   `.env` files.
 - No remote git. Your repo has exactly the local `host` remote (main) and whatever mirrors `cowshed repo clone` brought
   in; pushing to origin/GitHub is the coordinator's job, host-side.
+- No reaching the human's simulator. iOS test loops run on **dev-side headless simulators** (`--preset simulator`;
+  `simctl`, XCUITest, `simctl io` screenshots). The personal-session simulator is reachable only through `--sim` grants
+  the coordinator gives you — `install` is human-gated per artifact by design ([ios.md](ios.md)); ship builds with
+  `cowshed sim export` and let the human pull them in.
 - No mutating cowshed's own state files: markers are informational, grants live outside your volume.
