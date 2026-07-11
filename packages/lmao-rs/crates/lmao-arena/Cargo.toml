@@ -1,0 +1,12 @@
+[package]
+name = "lmao-arena"
+description = "Tiered freelist/buddy arena for SpanBuffer storage, ported from packages/lmao/src/lib/wasm/allocator.zig"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+proptest = { workspace = true }
