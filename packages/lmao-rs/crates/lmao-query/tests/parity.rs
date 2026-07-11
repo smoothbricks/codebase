@@ -47,7 +47,11 @@ fn fixture_batch() -> RecordBatch {
         children: vec![],
     };
 
-    let mut root = span(root_a, "handle-request", &["user {id} loaded", "cache {key} hit"]);
+    let mut root = span(
+        root_a,
+        "handle-request",
+        &["user {id} loaded", "cache {key} hit"],
+    );
     root.children.push(span(
         child_a,
         "db-query",
@@ -57,19 +61,27 @@ fn fixture_batch() -> RecordBatch {
     convert_span_trees(&[root, other]).unwrap()
 }
 
+#[cfg_attr(not(any(feature = "sqlite", feature = "datafusion")), allow(dead_code))]
 fn selectors() -> Vec<(&'static str, Selector)> {
     vec![
         ("by-template", Selector::template("cache {key} hit")),
-        ("template+span", Selector::template("cache {key} hit").with("span_id", 2u64)),
+        (
+            "template+span",
+            Selector::template("cache {key} hit").with("span_id", 2u64),
+        ),
         ("by-trace", Selector::default().with("trace_id", "trace-a")),
         ("absent", Selector::template("never-logged {x}")),
-        ("by-entry-type-span-start", Selector::template("handle-request")),
+        (
+            "by-entry-type-span-start",
+            Selector::template("handle-request"),
+        ),
         ("timestamp", Selector::default().with("timestamp_ns", 0i64)),
     ]
 }
 
 /// The Arrow backend uses lmao-arrow column names; SQLite/DataFusion-over-sqlite-shape
 /// use the SQLiteTracer names. Translate the two columns that differ.
+#[cfg_attr(not(any(feature = "sqlite", feature = "datafusion")), allow(dead_code))]
 fn arrow_flavored(s: &Selector) -> Selector {
     let mut out = s.clone();
     for (name, _) in out.constraints.iter_mut() {

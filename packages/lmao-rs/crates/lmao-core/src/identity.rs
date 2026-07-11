@@ -82,9 +82,7 @@ pub struct SpanIdentity {
 impl SpanIdentity {
     /// O(1) pointer-equality parentage check (`01b4`: `isParentOf` is `this === other.parent`).
     pub fn is_child_of(&self, other: &Arc<SpanIdentity>) -> bool {
-        self.parent
-            .as_ref()
-            .is_some_and(|p| Arc::ptr_eq(p, other))
+        self.parent.as_ref().is_some_and(|p| Arc::ptr_eq(p, other))
     }
 }
 

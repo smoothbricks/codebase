@@ -9,7 +9,7 @@
 //! is stated over split families, matching the Zig behavior, not over arbitrary
 //! bump-allocated neighbors.
 
-use lmao_arena::raw::{self, Mem};
+use lmao_arena::raw::{self};
 use lmao_arena::{Arena, SizeClass, block_size};
 use proptest::prelude::*;
 

@@ -144,12 +144,12 @@ fn size_class(sc: u8) -> SizeClass {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn init() {
-    with_mem(|m| raw::init(m));
+    with_mem(raw::init);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn reset() {
-    with_mem(|m| raw::reset(m));
+    with_mem(raw::reset);
 }
 
 // =============================================================================
@@ -262,7 +262,7 @@ pub extern "C" fn alloc_identity_root_for_js_write(trace_id_len: u32) -> u64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn alloc_identity_child() -> u32 {
-    with_mem(|m| raw::alloc_identity_child(m))
+    with_mem(raw::alloc_identity_child)
 }
 
 #[unsafe(no_mangle)]
@@ -345,7 +345,12 @@ pub extern "C" fn init_trace_root(trace_root_ptr: u32) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn span_start(system_ptr: u32, identity_ptr: u32, trace_root_ptr: u32, capacity: u32) {
+pub extern "C" fn span_start(
+    system_ptr: u32,
+    identity_ptr: u32,
+    trace_root_ptr: u32,
+    capacity: u32,
+) {
     let now = performance_now();
     with_mem(|m| raw::span_start(m, system_ptr, identity_ptr, trace_root_ptr, capacity, now));
 }
@@ -353,19 +358,53 @@ pub extern "C" fn span_start(system_ptr: u32, identity_ptr: u32, trace_root_ptr:
 #[unsafe(no_mangle)]
 pub extern "C" fn span_end_ok(system_ptr: u32, trace_root_ptr: u32, capacity: u32) {
     let now = performance_now();
-    with_mem(|m| raw::span_end(m, system_ptr, trace_root_ptr, capacity, raw::ENTRY_TYPE_SPAN_OK, now));
+    with_mem(|m| {
+        raw::span_end(
+            m,
+            system_ptr,
+            trace_root_ptr,
+            capacity,
+            raw::ENTRY_TYPE_SPAN_OK,
+            now,
+        )
+    });
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn span_end_err(system_ptr: u32, trace_root_ptr: u32, capacity: u32) {
     let now = performance_now();
-    with_mem(|m| raw::span_end(m, system_ptr, trace_root_ptr, capacity, raw::ENTRY_TYPE_SPAN_ERR, now));
+    with_mem(|m| {
+        raw::span_end(
+            m,
+            system_ptr,
+            trace_root_ptr,
+            capacity,
+            raw::ENTRY_TYPE_SPAN_ERR,
+            now,
+        )
+    });
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn write_log_entry(system_ptr: u32, identity_ptr: u32, trace_root_ptr: u32, entry_type: u8, capacity: u32) -> u32 {
+pub extern "C" fn write_log_entry(
+    system_ptr: u32,
+    identity_ptr: u32,
+    trace_root_ptr: u32,
+    entry_type: u8,
+    capacity: u32,
+) -> u32 {
     let now = performance_now();
-    with_mem(|m| raw::write_log_entry(m, system_ptr, identity_ptr, trace_root_ptr, entry_type, capacity, now))
+    with_mem(|m| {
+        raw::write_log_entry(
+            m,
+            system_ptr,
+            identity_ptr,
+            trace_root_ptr,
+            entry_type,
+            capacity,
+            now,
+        )
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -446,7 +485,10 @@ mod tests {
 
         span_start(system, identity, root, cap);
         assert_eq!(read_entry_type(system, 0, cap), raw::ENTRY_TYPE_SPAN_START);
-        assert_eq!(read_entry_type(system, 1, cap), raw::ENTRY_TYPE_SPAN_EXCEPTION);
+        assert_eq!(
+            read_entry_type(system, 1, cap),
+            raw::ENTRY_TYPE_SPAN_EXCEPTION
+        );
         assert_eq!(read_write_index(identity), 2);
 
         let idx = write_log_entry(system, identity, root, 5, cap);

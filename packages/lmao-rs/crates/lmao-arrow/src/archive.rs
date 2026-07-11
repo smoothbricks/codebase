@@ -4,16 +4,18 @@
 //! retries): envelope identity, partition inspection/split, chunk stats. Control-plane
 //! fan-out belongs to the consuming system and is out of scope.
 
+use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int64Type, UInt32Type};
-use arrow_array::RecordBatch;
 
 /// FNV-1a 64-bit over canonicalized content — deterministic chunk identity (`01t`:
 /// chunk ids are content hashes, never random).
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
     const OFFSET: u64 = 0xcbf29ce484222325;
     const PRIME: u64 = 0x100000001b3;
-    bytes.iter().fold(OFFSET, |h, b| (h ^ (*b as u64)).wrapping_mul(PRIME))
+    bytes
+        .iter()
+        .fold(OFFSET, |h, b| (h ^ (*b as u64)).wrapping_mul(PRIME))
 }
 
 /// Envelope referencing already-flushed Arrow payload by ref, not inline bytes.
@@ -49,7 +51,8 @@ pub fn extract_chunk_stats(batch: &RecordBatch) -> (usize, i64, i64) {
 pub fn build_trace_chunk_envelope(file_ref: &str, batch: &RecordBatch) -> TraceChunkEnvelope {
     let (row_count, min_timestamp, max_timestamp) = extract_chunk_stats(batch);
     // Canonical descriptor: stable field order, unambiguous separators.
-    let canonical = format!("v1\x1f{file_ref}\x1f{row_count}\x1f{min_timestamp}\x1f{max_timestamp}");
+    let canonical =
+        format!("v1\x1f{file_ref}\x1f{row_count}\x1f{min_timestamp}\x1f{max_timestamp}");
     TraceChunkEnvelope {
         chunk_id: fnv1a64(canonical.as_bytes()),
         file_ref: file_ref.to_string(),
@@ -95,7 +98,10 @@ pub fn inspect_partition_cardinality(batch: &RecordBatch) -> PartitionCardinalit
 pub fn split_chunk_by_partition(batch: &RecordBatch) -> Vec<(u32, Vec<usize>)> {
     let mut groups: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
     for row in 0..batch.num_rows() {
-        groups.entry(trace_key_at(batch, row)).or_default().push(row);
+        groups
+            .entry(trace_key_at(batch, row))
+            .or_default()
+            .push(row);
     }
     groups.into_iter().collect()
 }

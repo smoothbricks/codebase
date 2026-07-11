@@ -21,9 +21,9 @@
 
 use crate::buffer::SpanBuffer;
 use crate::clock::{Clock, TraceAnchor};
-use crate::entry_type::EntryType;
-use crate::identity::{next_span_id, SpanIdentity, TraceId};
 use crate::columns::SharedStr;
+use crate::entry_type::EntryType;
+use crate::identity::{SpanIdentity, TraceId, next_span_id};
 use crate::result::{SpanOutcome, Transient};
 use std::sync::Arc;
 
@@ -153,14 +153,20 @@ impl<'t> SpanContext<'t> {
             level,
             EntryType::Info | EntryType::Debug | EntryType::Warn | EntryType::Error
         ));
-        self.buf
-            .append_msg(level, template, line, &self.trace.anchor, self.trace.clock())
+        self.buf.append_msg(
+            level,
+            template,
+            line,
+            &self.trace.anchor,
+            self.trace.clock(),
+        )
     }
 
     /// Append a metric/flag entry (no template).
     #[inline]
     pub fn append(&mut self, entry: EntryType) -> usize {
-        self.buf.append(entry, &self.trace.anchor, self.trace.clock())
+        self.buf
+            .append(entry, &self.trace.anchor, self.trace.clock())
     }
 
     /// The buffer being written — schema wrappers use this plus the row indices
