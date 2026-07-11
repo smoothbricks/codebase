@@ -385,6 +385,19 @@ function createImports(memory: WebAssembly.Memory) {
 let cachedWasmModule: WebAssembly.Module | null = null;
 
 /**
+ * Allocator artifact filename. Both implementations expose the identical ABI:
+ * - `allocator.wasm` — Zig (`src/lib/wasm/allocator.zig`), the default.
+ * - `allocator-rs.wasm` — Rust (`packages/lmao-rs/crates/lmao-wasm`), opt-in
+ *   via LMAO_WASM_ALLOCATOR=rs (Node/Bun only; browsers get the default).
+ */
+function wasmArtifactName(): string {
+  if (typeof process !== 'undefined' && process.env?.LMAO_WASM_ALLOCATOR === 'rs') {
+    return 'allocator-rs.wasm';
+  }
+  return 'allocator.wasm';
+}
+
+/**
  * Load WASM bytes - handles both Node.js and browser environments.
  */
 async function loadWasmBytes(): Promise<ArrayBuffer> {
@@ -397,7 +410,7 @@ async function loadWasmBytes(): Promise<ArrayBuffer> {
     // __dirname equivalent for ESM
     const currentFile = fileURLToPath(import.meta.url);
     const currentDir = dirname(currentFile);
-    const wasmPath = join(currentDir, '../../../dist/allocator.wasm');
+    const wasmPath = join(currentDir, '../../../dist', wasmArtifactName());
 
     const buffer = await readFile(wasmPath);
     // Create a proper ArrayBuffer from the Node.js Buffer
@@ -407,7 +420,7 @@ async function loadWasmBytes(): Promise<ArrayBuffer> {
   }
 
   // Browser: fetch from relative path
-  const response = await fetch(new URL('../../../dist/allocator.wasm', import.meta.url));
+  const response = await fetch(new URL(`../../../dist/${wasmArtifactName()}`, import.meta.url));
   return response.arrayBuffer();
 }
 
