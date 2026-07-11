@@ -8,7 +8,7 @@
 //! (Rust's default SipHash was separately measured losing to JS Map — 5.8 µs vs
 //! 3.3 µs — which is why the hasher is FxHash; see `benches/flush.rs`.)
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Dictionary accumulated in pass 1 for one string column
 /// (`ColumnDictionary` in convertToArrow.ts). Borrows its keys from the buffers.
@@ -18,7 +18,9 @@ use rustc_hash::FxHashMap;
 /// column if it saves more than 128 bytes vs plain UTF-8).
 #[derive(Debug, Default)]
 pub struct ColumnDictionary<'a> {
-    counts: FxHashMap<&'a str, u64>,
+    /// Distinct values (occurrence counts proved dead weight: nothing downstream
+    /// reads them — the savings heuristic needs only totals + distinct bytes).
+    distinct: FxHashSet<&'a str>,
     /// Total UTF-8 bytes if stored plain (every occurrence).
     plain_bytes: u64,
     /// Total values observed (occurrences, not distinct).
@@ -58,14 +60,14 @@ impl<'a> ColumnDictionary<'a> {
         // zero allocations.
         self.plain_bytes += value.len() as u64;
         self.total += 1;
-        *self.counts.entry(value).or_insert(0) += 1;
+        self.distinct.insert(value);
     }
 
     /// Bytes saved by dictionary-encoding instead of plain UTF-8:
     /// plain = every occurrence's bytes; dict = each distinct value once + one
     /// u32 index per occurrence (offset overhead treated as equal either way).
     pub fn dictionary_savings(&self) -> i64 {
-        let distinct_bytes: u64 = self.counts.keys().map(|k| k.len() as u64).sum();
+        let distinct_bytes: u64 = self.distinct.iter().map(|k| k.len() as u64).sum();
         self.plain_bytes as i64 - (distinct_bytes + 4 * self.total) as i64
     }
 
@@ -87,7 +89,7 @@ impl<'a> ColumnDictionary<'a> {
 
     /// Sort distinct values and build the value → index map for pass 2.
     pub fn finalize_indexed(self) -> FinalizedDictionary<'a> {
-        let mut values: Vec<&'a str> = self.counts.keys().copied().collect();
+        let mut values: Vec<&'a str> = self.distinct.into_iter().collect();
         values.sort_unstable();
         let index = values.iter().enumerate().map(|(i, v)| (*v, i as u32)).collect();
         FinalizedDictionary { values, index }
@@ -115,6 +117,42 @@ mod tests {
             u.observe(s);
         }
         assert!(!u.should_dictionary_encode());
+    }
+
+    #[test]
+    fn savings_arithmetic_is_exact() {
+        // 5 occurrences of a 37-byte string: plain 185, dict 37 + 4·5 = 57 → 128.
+        // Exactly at the threshold: the heuristic is STRICTLY greater-than (`01a`),
+        // so 128 must NOT encode (kills the > vs >= boundary mutant).
+        let s = "x".repeat(37);
+        let mut d = ColumnDictionary::default();
+        for _ in 0..5 {
+            d.observe(&s);
+        }
+        assert_eq!(d.dictionary_savings(), 128);
+        assert!(!d.should_dictionary_encode());
+
+        // One more occurrence: 222 − (37 + 24) = 161 > 128 → encode.
+        d.observe(&s);
+        assert_eq!(d.dictionary_savings(), 161);
+        assert!(d.should_dictionary_encode());
+    }
+
+    #[test]
+    fn finalize_returns_sorted_owned_values() {
+        let mut d = ColumnDictionary::default();
+        for v in ["b", "a", "b"] {
+            d.observe(v);
+        }
+        assert_eq!(d.finalize(), vec!["a".to_string(), "b".to_string()]);
+
+        let mut e = ColumnDictionary::default();
+        e.observe("only");
+        let f = e.finalize_indexed();
+        assert_eq!(f.len(), 1);
+        assert!(!f.is_empty());
+        assert!(FinalizedDictionary { values: vec![], index: Default::default() }.is_empty());
+        assert_eq!(FinalizedDictionary::<'_> { values: vec![], index: Default::default() }.len(), 0);
     }
 
     #[test]
