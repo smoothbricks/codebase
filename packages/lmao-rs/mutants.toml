@@ -16,6 +16,10 @@ exclude_globs = [
 # currently be exercised. Remove entries as implementations land.
 exclude_re = [
     "SpanBuffer::append",
+    # Test scaffolding, arid: MockSpan is the differential fixture — tests compute
+    # expectations through the same accessors, so mutating it is self-consistent
+    # noise, not an oracle gap (classification: equivalent-by-construction).
+    "MockSpan",
 ]
 
 # Determinism makes kills non-flaky, so a tight timeout is safe.
