@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/lmao-core",
+    "crates/lmao-arena",
+    "crates/lmao-arrow",
+    "crates/lmao-macros",
+    "crates/lmao-wasm",
+    "crates/lmao-query",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "UNLICENSED"
+publish = false
+repository = "https://github.com/smoothbricks/smoothbricks"
+
+[workspace.dependencies]
+lmao-core = { path = "crates/lmao-core" }
+lmao-arena = { path = "crates/lmao-arena" }
+# Arrow subcrates only (not the `arrow` umbrella) to keep compile times down.
+arrow-array = "55"
+arrow-buffer = "55"
+arrow-schema = "55"
+arrow-ipc = "55"
+rustc-hash = "2"
+proptest = "1"
+criterion = { version = "0.5", default-features = false }
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# wasm32 export size matters (parity with Zig ReleaseSmall build of allocator.wasm)
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+panic = "abort"
