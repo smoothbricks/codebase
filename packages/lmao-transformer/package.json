@@ -10,10 +10,18 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./ttsc-plugin": "./plugin.cjs"
+  },
+  "ttsc": {
+    "plugin": {
+      "transform": "@smoothbricks/lmao-transformer/ttsc-plugin"
     }
   },
   "files": [
     "dist",
+    "plugin.cjs",
+    "plugin",
     "!**/*.tsbuildinfo"
   ],
   "peerDependencies": {
