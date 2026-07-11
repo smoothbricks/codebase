@@ -1,22 +1,24 @@
 //! Pass-1 string dictionary accumulation, per `01k_tree_walker_and_arrow_conversion.md`
 //! and the string-strategy table in `01a_trace_schema_system.md`.
 //!
-//! Counting uses `FxHashMap` (rustc-hash): the benchmark investigation measured Rust's
-//! default SipHash `HashMap` LOSING to JS `Map` on dictionary building (5.8 µs vs
-//! 3.3 µs for 256 strings); FxHashMap is the remedy and is re-measured in
-//! `benches/flush.rs`.
+//! Keys BORROW from the span buffers being flushed (`&'a str`) — the flush bench
+//! showed owned-key allocation dominating hash choice: FxHashMap with `Box<str>`
+//! keys ran 5.9 µs for the 256-string shape vs 4.9 µs for a borrowing std map.
+//! Borrowed FxHashMap keys remove the per-distinct-value allocation entirely.
+//! (Rust's default SipHash was separately measured losing to JS Map — 5.8 µs vs
+//! 3.3 µs — which is why the hasher is FxHash; see `benches/flush.rs`.)
 
 use rustc_hash::FxHashMap;
 
 /// Dictionary accumulated in pass 1 for one string column
-/// (`ColumnDictionary` in convertToArrow.ts).
+/// (`ColumnDictionary` in convertToArrow.ts). Borrows its keys from the buffers.
 ///
 /// Tracks per-value occurrence counts and running byte totals so `text` columns can
 /// apply the `>128 bytes saved` heuristic (`01a`: only dictionary-encode a text
 /// column if it saves more than 128 bytes vs plain UTF-8).
 #[derive(Debug, Default)]
-pub struct ColumnDictionary {
-    counts: FxHashMap<Box<str>, u64>,
+pub struct ColumnDictionary<'a> {
+    counts: FxHashMap<&'a str, u64>,
     /// Total UTF-8 bytes if stored plain (every occurrence).
     plain_bytes: u64,
     /// Total values observed (occurrences, not distinct).
@@ -25,15 +27,15 @@ pub struct ColumnDictionary {
 
 /// Finalized, sorted dictionary plus the value → index map used by pass 2.
 #[derive(Debug)]
-pub struct FinalizedDictionary {
+pub struct FinalizedDictionary<'a> {
     /// Sorted, deduplicated values. Sorted order is deterministic for a given
     /// multiset regardless of observation order — load-bearing for AxE's
     /// bit-identical trace bytes.
-    pub values: Vec<String>,
-    index: FxHashMap<Box<str>, u32>,
+    pub values: Vec<&'a str>,
+    index: FxHashMap<&'a str, u32>,
 }
 
-impl FinalizedDictionary {
+impl<'a> FinalizedDictionary<'a> {
     #[inline]
     pub fn index_of(&self, value: &str) -> Option<u32> {
         self.index.get(value).copied()
@@ -50,16 +52,13 @@ impl FinalizedDictionary {
     }
 }
 
-impl ColumnDictionary {
-    pub fn observe(&mut self, value: &str) {
-        // Flush-only path (no hot-path interning, `01a`). One hash lookup per value.
+impl<'a> ColumnDictionary<'a> {
+    pub fn observe(&mut self, value: &'a str) {
+        // Flush-only path (no hot-path interning, `01a`). One hash lookup per value,
+        // zero allocations.
         self.plain_bytes += value.len() as u64;
         self.total += 1;
-        if let Some(count) = self.counts.get_mut(value) {
-            *count += 1;
-        } else {
-            self.counts.insert(value.into(), 1);
-        }
+        *self.counts.entry(value).or_insert(0) += 1;
     }
 
     /// Bytes saved by dictionary-encoding instead of plain UTF-8:
@@ -79,18 +78,18 @@ impl ColumnDictionary {
     /// Sort + dedupe into the final dictionary (compatibility surface; prefer
     /// [`Self::finalize_indexed`] in conversion code).
     pub fn finalize(self) -> Vec<String> {
-        self.finalize_indexed().values
+        self.finalize_indexed()
+            .values
+            .into_iter()
+            .map(str::to_string)
+            .collect()
     }
 
     /// Sort distinct values and build the value → index map for pass 2.
-    pub fn finalize_indexed(self) -> FinalizedDictionary {
-        let mut values: Vec<String> = self.counts.keys().map(|k| k.to_string()).collect();
+    pub fn finalize_indexed(self) -> FinalizedDictionary<'a> {
+        let mut values: Vec<&'a str> = self.counts.keys().copied().collect();
         values.sort_unstable();
-        let index = values
-            .iter()
-            .enumerate()
-            .map(|(i, v)| (v.as_str().into(), i as u32))
-            .collect();
+        let index = values.iter().enumerate().map(|(i, v)| (*v, i as u32)).collect();
         FinalizedDictionary { values, index }
     }
 }
@@ -110,9 +109,10 @@ mod tests {
         assert!(d.should_dictionary_encode());
 
         // All-unique strings: dict always loses (adds 4 bytes/occurrence).
+        let unique: Vec<String> = (0..100).map(|i| format!("unique-{i}")).collect();
         let mut u = ColumnDictionary::default();
-        for i in 0..100 {
-            u.observe(&format!("unique-{i}"));
+        for s in &unique {
+            u.observe(s);
         }
         assert!(!u.should_dictionary_encode());
     }
