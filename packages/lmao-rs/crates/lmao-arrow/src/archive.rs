@@ -105,6 +105,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chunk_stats_values_are_exact() {
+        use crate::convert::convert_span_trees;
+        use crate::source::MockSpan;
+        use lmao_core::{SpanIdentity, TraceId};
+        use std::sync::Arc;
+
+        let span = MockSpan {
+            identity: Arc::new(SpanIdentity {
+                thread_id: 1,
+                span_id: 1,
+                trace_id: TraceId::new("stats-trace").unwrap(),
+                parent: None,
+            }),
+            timestamps: vec![50, 900, 200],
+            entry_types: vec![1, 2, 5],
+            messages: vec![None, None, None],
+            overflow: None,
+            children: vec![],
+        };
+        let batch = convert_span_trees(&[span]).unwrap();
+        assert_eq!(extract_chunk_stats(&batch), (3, 50, 900));
+
+        let empty = convert_span_trees::<MockSpan>(&[]).unwrap();
+        assert_eq!(extract_chunk_stats(&empty), (0, 0, 0));
+
+        let env = build_trace_chunk_envelope("ref", &batch);
+        assert_eq!(
+            (env.row_count, env.min_timestamp, env.max_timestamp),
+            (3, 50, 900)
+        );
+    }
+
+    #[test]
     fn fnv_matches_reference_vectors() {
         // Standard FNV-1a 64 test vectors.
         assert_eq!(fnv1a64(b""), 0xcbf29ce484222325);
