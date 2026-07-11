@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a476ac6ff2de4f4972e15f1c922f65ebb786e0312b7f666a66e1f335033f7960 # shrinks to sc = SpanSystem, tier = 0
+cc 335334753cc12007094d6e14f0ede9a5a7cc2372cd218357ae07a8ad338fc226 # shrinks to cap = 8, n = 2
+cc 6b593715542710d9a2333ab9d6c7d55a4d879c6cffc7bd487c0f59808cf0272d # shrinks to sc = Col1B, tier = 0
+cc 773dc71e364eb6788d6e0054cfa91f093813287982fa8e636e397387ac50d699 # shrinks to sc = Col1B, cap = 8, rounds = 1
+cc 62520f6dab10f7b49ba2b04317d9e430f81694e139cf63ea98df2ff7d700a4af # shrinks to allocs = [(Col1B, 8), (Col1B, 16)]
