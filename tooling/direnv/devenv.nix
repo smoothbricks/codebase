@@ -31,10 +31,12 @@ in {
     bun
     # WASM and NAPI extensions
     zig
-    # Rust toolchain for packages/cowshed: cargo, rustc, clippy, rustfmt via
-    # rust-overlay stable, plus rust-src/rust-analyzer for IDE and LSP use.
+    # Rust toolchain for packages/cowshed and packages/lmao-rs: cargo, rustc,
+    # clippy, rustfmt via rust-overlay stable, plus rust-src/rust-analyzer for
+    # IDE and LSP use. wasm32 target for lmao-wasm (allocator.wasm replacement).
     (rust-bin.stable.latest.default.override {
       extensions = ["rust-src" "rust-analyzer"];
+      targets = ["wasm32-unknown-unknown"];
     })
     cargo-nextest # Rust test runner
     sccache # Shared Rust compile cache (cowshed cache layer 3)
