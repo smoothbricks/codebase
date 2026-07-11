@@ -1,0 +1,25 @@
+[package]
+name = "lmao-query"
+description = "Tracer-agnostic trace query layer: one selector surface over SQLite or in-process Arrow backends (AxE 08-trace-testing.md)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+rusqlite = { version = "0.37", features = ["bundled"], optional = true }
+datafusion = { version = "47", default-features = false, features = ["nested_expressions"], optional = true }
+tokio = { version = "1", features = ["rt"], optional = true }
+
+# Backends are opt-in to keep the default workspace build light; the hand-rolled
+# Arrow scan backend is always available.
+[features]
+default = []
+sqlite = ["dep:rusqlite"]
+datafusion = ["dep:datafusion", "dep:tokio"]
+
+[dev-dependencies]
+lmao-arrow = { path = "../lmao-arrow" }
+lmao-core = { workspace = true }
