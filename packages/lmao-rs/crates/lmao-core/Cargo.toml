@@ -1,0 +1,26 @@
+[package]
+name = "lmao-core"
+description = "Core span/log data model: entry types, span identity, fixed row layout, SoA column buffers, capacity self-tuning"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+lmao-macros = { path = "../lmao-macros" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[[example]]
+name = "jcode_tracer"
+
+[[bench]]
+name = "overhead"
+harness = false
+
+[[bench]]
+name = "hot_path"
+harness = false
