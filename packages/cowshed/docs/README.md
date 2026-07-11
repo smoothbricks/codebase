@@ -112,6 +112,8 @@ agent workspaces do.
 - [jcode.md](jcode.md) — jcode integration via the cowshed-core Rust API
 - [gateway.md](gateway.md) — gateway setup, credentials, mirrors, egress allowlists
 - [ios.md](ios.md) — iOS/Expo development across the dev-uid boundary: simulators, the drop dir, the `xcrun` wrapper
+- [desktop.md](desktop.md) — macOS desktop apps across the dev-uid boundary: the three lanes (test/debug as dev, use as
+  you) and `app promote`
 - [zfs.md](zfs.md) — Linux/ZFS substrate: pool setup, send/receive, pinned-space lifecycle
 - [ci.md](ci.md) — cowshed as a self-hosted GitHub Actions runner
 - [troubleshooting.md](troubleshooting.md) — mounts, sandbox denials, disk usage, backup story

@@ -2,7 +2,8 @@
 
 This guide assumes posture B (a dedicated `dev` uid — see the deployment postures in `specs/cowshed/14_nix.md`): your
 GUI session is your personal account, and every build, agent, and bundler runs as `dev`. Under posture A (single
-account) none of the brokering below is needed — everything is already one uid.
+account) none of the brokering below is needed — everything is already one uid. For **macOS desktop** apps (not
+simulators) the same dev-uid boundary applies with a simpler shape — see [desktop.md](desktop.md).
 
 The one topology fact everything follows from: **Xcode has no remote mode, and Simulator.app only shows the invoking
 user's simulators.** So cowshed splits the simulator estate:

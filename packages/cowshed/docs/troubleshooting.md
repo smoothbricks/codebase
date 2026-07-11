@@ -147,3 +147,13 @@ than a command to run.
   unregistered URL scheme).
 - **`install` refused despite a `--sim install` grant.** The broker only installs drop-dir artifacts and only under the
   human-gating rule — that refusal is the design, not a bug (ios.md explains why: simulator apps run as _you_).
+
+## Desktop apps (posture B — see desktop.md)
+
+- **"I want the app running as dev but visible in my session."** macOS can't show one uid's window in another's session
+  (Screen Sharing streams a whole session, it doesn't relocate a window). Pick a lane: test/debug as dev (view via
+  Screen Sharing into dev's session), or `cowshed app promote` and run it as yourself.
+- **Gatekeeper blocks a promoted app.** It's ad-hoc-signed and `promote` needed `--force`. Sign with Developer-ID on the
+  dev side (dev holds the signing identity) so it installs and launches cleanly; or right-click-open once.
+- **An agent can't launch a desktop app in my session.** Correct — there is no agent verb for it (unlike `--sim`, there
+  is deliberately no `--app open`). Agents test desktop apps as dev in dev's session; only the human `promote`s.

@@ -163,4 +163,7 @@ authority; workers run closed and ask.
   `simctl`, XCUITest, `simctl io` screenshots). The personal-session simulator is reachable only through `--sim` grants
   the coordinator gives you — `install` is human-gated per artifact by design ([ios.md](ios.md)); ship builds with
   `cowshed sim export` and let the human pull them in.
+- Desktop apps: test them **in dev's own session** — run the built `.app` and drive it via accessibility APIs /
+  AppleScript (no grant, same uid). You cannot launch an app in the human's session; there is no verb for it. Ship a
+  build with `cowshed app export` — the human runs `cowshed app promote` to use it ([desktop.md](desktop.md)).
 - No mutating cowshed's own state files: markers are informational, grants live outside your volume.

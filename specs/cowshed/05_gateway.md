@@ -99,7 +99,10 @@ fallback (a miss fails at the gateway with the offline/denied distinction rather
 ### `/sim/` — personal-session simulator broker (posture B)
 
 The bridge that lets a workspace drive the **human's** simulator (14_nix.md: the personal-session simulator is an
-artifact host; dev-side headless simulators are reached directly and need no gateway). Requests arrive on the
+artifact host; dev-side headless simulators are reached directly and need no gateway). This endpoint exists only for the
+**cross-session** direction — reaching a launcher in the personal user's session. macOS **desktop** apps need none of
+it: lanes 1–2 (agent testing, debugging) run the app as dev in dev's own session (same uid), and lane 3 (daily use) is
+`cowshed app promote`, a human-run personal-session verb, not a gateway call (14_nix.md). Requests arrive on the
 workspace's own data-plane port from the in-image `xcrun` wrapper (03_caches.md) — first-party code, so every call
 carries `traceparent` (tier-1 attribution, 13_telemetry.md). The gateway checks the workspace's `sim` grants
 (04_sandbox.md), forwards allowed verbs to the **session broker**, and appends one `kind: "sim"` audit event per

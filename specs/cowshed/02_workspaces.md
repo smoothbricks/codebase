@@ -168,12 +168,15 @@ The project's own origin is just another mirror — mirroring it covers "the age
 operations (creating PRs, issues) are coordinator work in v1: they require credentials and therefore live outside the
 sandbox by construction.
 
-## Artifact egress: `cowshed sim export`
+## Artifact egress: `cowshed sim export` / `cowshed app export`
 
-The outbound sibling of `repo` ingress, for posture B (14_nix.md): `cowshed sim export <ws> [artifact]` copies a built
-`.app` bundle to the one-way drop dir (`/Users/Shared/cowshed-drop/<project_id>/`), where the personal session installs
-it into the human's simulator — an immutable artifact crossing the uid boundary, never a live tree. Semantics, gating,
-and the `--sim` grant class live in 14_nix.md / 04_sandbox.md / 05_gateway.md.
+The outbound sibling of `repo` ingress, for posture B (14_nix.md). `cowshed sim export <ws> [artifact]` copies a built
+iOS `.app` to the one-way drop dir (`/Users/Shared/cowshed-drop/<project_id>/`), where the personal session installs it
+into the human's simulator; `cowshed app export <ws> [artifact]` is the Mac-target sibling. Either way an immutable
+artifact crosses the uid boundary, never a live tree; semantics, gating, and the `--sim` grant class live in 14_nix.md /
+04_sandbox.md / 05_gateway.md. The lane-3 counterpart `cowshed app promote` is a **personal-session human verb** (it
+installs a promoted build into `~/Applications`), documented in 14_nix.md — not a workspace or sandbox operation and not
+agent-invokable.
 
 ## Return to main: `cowshed rebase` and `cowshed land`
 
