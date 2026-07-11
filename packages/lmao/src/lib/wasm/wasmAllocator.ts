@@ -386,13 +386,17 @@ let cachedWasmModule: WebAssembly.Module | null = null;
 
 /**
  * Allocator artifact filename. Both implementations expose the identical ABI:
- * - `allocator.wasm` — Zig (`src/lib/wasm/allocator.zig`), the default.
- * - `allocator-rs.wasm` — Rust (`packages/lmao-rs/crates/lmao-wasm`), opt-in
- *   via LMAO_WASM_ALLOCATOR=rs (Node/Bun only; browsers get the default).
+ * - `allocator.wasm` — Rust (`packages/lmao-rs/crates/lmao-wasm`), the default
+ *   and the artifact shipped in the npm package. It also fixes a latent Zig
+ *   freelist bug (FreeBlock bookkeeping overrunning sub-20-byte col_1b blocks).
+ * - `allocator-zig.wasm` — Zig (`src/lib/wasm/allocator.zig`), reference build,
+ *   opt-in via LMAO_WASM_ALLOCATOR=zig (Node/Bun only; browsers get the
+ *   default). Built locally with `bun run build:zig-wasm`; not shipped.
+ * `LMAO_WASM_ALLOCATOR=rs` is accepted as an alias of the default.
  */
 function wasmArtifactName(): string {
-  if (typeof process !== 'undefined' && process.env?.LMAO_WASM_ALLOCATOR === 'rs') {
-    return 'allocator-rs.wasm';
+  if (typeof process !== 'undefined' && process.env?.LMAO_WASM_ALLOCATOR === 'zig') {
+    return 'allocator-zig.wasm';
   }
   return 'allocator.wasm';
 }

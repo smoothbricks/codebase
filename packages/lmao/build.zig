@@ -27,14 +27,19 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(wasm);
 
-    // Copy to dist/allocator.wasm
+    // Copy to dist/allocator-zig.wasm. The shipped default (dist/allocator.wasm)
+    // is built from Rust (packages/lmao-rs, `nx run lmao-rs:cargo-wasm`); this
+    // Zig artifact is an opt-in reference build loaded via LMAO_WASM_ALLOCATOR=zig.
+    // The step is deliberately NOT named "wasm": the nx plugin turns build.zig
+    // steps into `zig-<step>` targets, and a `*-wasm` name would put Zig back
+    // into the default `build` dependency chain.
     const copy_wasm = b.addInstallFileWithDir(
         wasm.getEmittedBin(),
         .{ .custom = "../dist" },
-        "allocator.wasm",
+        "allocator-zig.wasm",
     );
     b.getInstallStep().dependOn(&copy_wasm.step);
 
-    const wasm_step = b.step("wasm", "Build allocator WASM");
+    const wasm_step = b.step("zig-allocator", "Build reference Zig allocator WASM (opt-in)");
     wasm_step.dependOn(&copy_wasm.step);
 }
