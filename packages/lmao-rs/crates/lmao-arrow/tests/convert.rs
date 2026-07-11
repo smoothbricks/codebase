@@ -68,7 +68,10 @@ fn converts_core_span_buffers_with_overflow() {
     // TickClock timestamps: anchor consumes tick 0, row 0 = wall + 1.
     let ts = batch.column(0).as_primitive::<Int64Type>();
     assert_eq!(ts.value(0), 1_700_000_000_000_000_001);
-    assert!(ts.value(2) > ts.value(0), "log rows stamped after span-start");
+    assert!(
+        ts.value(2) > ts.value(0),
+        "log rows stamped after span-start"
+    );
     // Row 0 message is the span name; log rows carry templates + line numbers.
     let msg = batch
         .column(7)
@@ -81,10 +84,14 @@ fn converts_core_span_buffers_with_overflow() {
     assert_eq!(lines.value(0), 41, "callsite line on row 0");
     assert_eq!(lines.value(2), 100, "append_msg line on first log row");
     // Children were walked: the child span's name appears after the root's rows.
-    let child_name_key = (0..batch.num_rows())
-        .find(|r| !msg.keys().is_null(*r) && msg_values.value(msg.keys().value(*r) as usize) == "child-op");
+    let child_name_key = (0..batch.num_rows()).find(|r| {
+        !msg.keys().is_null(*r) && msg_values.value(msg.keys().value(*r) as usize) == "child-op"
+    });
     assert!(child_name_key.is_some(), "child span rows present in batch");
-    assert_eq!(inspect_partition_cardinality(&batch), PartitionCardinality::Mixed);
+    assert_eq!(
+        inspect_partition_cardinality(&batch),
+        PartitionCardinality::Mixed
+    );
 
     let parts = split_chunk_by_partition(&batch);
     assert_eq!(parts.len(), 2);

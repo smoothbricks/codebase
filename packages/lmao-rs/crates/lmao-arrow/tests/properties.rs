@@ -89,7 +89,11 @@ fn build_tree(n: usize, trace: &str) -> MockSpan {
     };
     for i in 0..n {
         let (ts, et, msg) = row(i);
-        let target = if i % 2 == 0 { &mut child } else { &mut overflow };
+        let target = if i % 2 == 0 {
+            &mut child
+        } else {
+            &mut overflow
+        };
         target.timestamps.push(ts);
         target.entry_types.push(et);
         target.messages.push(msg);

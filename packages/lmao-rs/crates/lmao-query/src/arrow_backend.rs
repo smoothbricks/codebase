@@ -25,9 +25,8 @@ impl ArrowTraceQuery {
         selector: &'a Selector,
     ) -> impl Iterator<Item = (&'a RecordBatch, usize)> + 'a {
         self.batches.iter().flat_map(move |batch| {
-            (0..batch.num_rows()).filter_map(move |row| {
-                row_matches(batch, row, selector).then_some((batch, row))
-            })
+            (0..batch.num_rows())
+                .filter_map(move |row| row_matches(batch, row, selector).then_some((batch, row)))
         })
     }
 }
@@ -89,7 +88,9 @@ fn column_equals(batch: &RecordBatch, name: &str, row: usize, want: &ColumnValue
         },
         ColumnValue::F64(v) => match col.data_type() {
             arrow_schema::DataType::Float64 => {
-                col.as_primitive::<arrow_array::types::Float64Type>().value(row) == *v
+                col.as_primitive::<arrow_array::types::Float64Type>()
+                    .value(row)
+                    == *v
             }
             _ => false,
         },
