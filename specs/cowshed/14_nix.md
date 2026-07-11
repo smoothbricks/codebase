@@ -100,6 +100,10 @@ unauthenticated upstreams work before unlock; credentialed flows queue a clear e
 
 ### iOS, Xcode, and simulators (posture B)
 
+The GUI-toolchain postures below (simulators, then desktop apps) all rest on one boundary fact and one physics limit,
+stated once here and reused: **a process runs under exactly one uid, and macOS shows a window only in that uid's own GUI
+session.** Everything else is choosing which uid runs a given artifact.
+
 The facts that shape everything here: **Xcode has no client/server split** — no remote-development mode exists — and
 **Simulator.app displays only the invoking user's CoreSimulatorService devices**; there is no cross-uid or remote
 attach. Commercial "remote simulators" (Appetize, BrowserStack App Live) are the same trick underneath: run the real
@@ -140,6 +144,58 @@ target the personal simulator except through the `--sim` grant class (04_sandbox
 already-consented install) is grantable freely and `install` is additionally bound to drop-dir artifacts and the
 human-gating rule. Agent test loops stay on dev-side headless simulators, always.
 
+### macOS desktop apps: three lanes
+
+The uid boundary confines **agents and build-time code execution** — unattended, semi-trusted. A finished app the
+**human chooses to run as themselves** is a deliberate boundary exit at a human decision point, like installing from the
+App Store — not a violation. Desktop apps you develop therefore have three legitimate lanes, and cowshed serves all
+three rather than treating daily use as an escape hatch:
+
+| Lane                          | Runs as               | Appears in                                           | Trigger           | Consent                                                     |
+| ----------------------------- | --------------------- | ---------------------------------------------------- | ----------------- | ----------------------------------------------------------- |
+| **1 — E2E / agent testing**   | dev                   | dev's background GUI session                         | agent, unattended | none — it's confined (dev running dev's build)              |
+| **2 — interactive debugging** | dev                   | fast-user-switch / Screen Sharing into dev's session | human, occasional | none — same uid                                             |
+| **3 — daily use of your app** | **the personal user** | your own session, natively                           | human, deliberate | **`app promote`** is the consent — the point, not a warning |
+
+**Lanes 1–2 run the drop-dir build in place, as dev — no broker, no grant, no promotion.** Driving a dev-session app as
+dev is just dev running dev's app (like dev-side headless simulators need no `/sim/` grant): agents automate it through
+accessibility APIs / AppleScript — the same mechanism cowshed's agent-browser tooling already uses for Electron apps (VS
+Code, Slack) — and screenshots come out. Lane 1 uses the **dev-side background GUI session** (the persistent Aqua
+session recommended for simulator reliability above, now doing double duty). This makes desktop testing **simpler** than
+the simulator case: same uid, so no `/sim/`-style cross-session broker is involved at all.
+
+**Lane 3 is `cowshed app export` → `cowshed app promote`:**
+
+- `cowshed app export <ws>` copies the built `.app` to the same one-way drop dir (the Mac-target sibling of
+  `cowshed sim export` — 02_workspaces.md/06_cli.md).
+- `cowshed app promote [artifact]` is **run by the human, in the personal session** — it writes `~/Applications`, which
+  dev cannot, so it is structurally a personal-session verb, **not a sandbox or gateway call and not grantable to any
+  agent**. It verifies the code signature (**Developer-ID required by default**; ad-hoc into `~/Applications` needs
+  `--force` because ad-hoc trips Gatekeeper), optionally checks the artifact came from a landed/clean commit, copies
+  into `~/Applications` (or `/Applications` with escalation), and clears any quarantine xattr. The promoted copy is
+  yours — launch it, Dock it, make it a login item, use it for months.
+
+The consent asymmetry, stated plainly: lanes 1–2 need no consent because the app is **confined** (it runs as dev under
+posture B); lane 3's consent **is** the point — the app runs as you, with your full authority (Photos, Keychain,
+Documents), which is exactly what posture B fences off for agents and what a human deliberately, per-build, chooses to
+exit. `promote` is that choice, and no agent can make it.
+
+**Gatekeeper / quarantine** (verified: `cp`/`cp -R` applies no `com.apple.quarantine` xattr — that xattr comes from
+downloader apps, not the filesystem copy): a Developer-ID-signed app dropped by dev's copy opens cleanly in the personal
+session; an **ad-hoc**-signed app still trips Gatekeeper on first launch (right-click-open or an `spctl` allowance).
+This is one more reason lanes 1–2 are smoother (dev's own session can permit its own builds) and lane 3 wants real
+Developer-ID signing — which is precisely why dev holds the signing identity.
+
+**Live iteration in lane 3.** An Electron / React-Native-desktop promoted app can still point at dev's dev-server over
+**loopback** (shared across uids — the same trick as Expo/Metro in the iOS story): you use yesterday's promoted shell
+while today's JS and hot-reload come from dev. Native SwiftUI cannot do this — there, daily-driving a new build is a
+re-`promote`.
+
+**The one hard limit** (physics, not policy): an app cannot simultaneously run **as dev** and show its window in the
+**personal** session — macOS has no cross-session window display (Screen Sharing streams a whole session, it does not
+relocate one window). The three lanes each pick a side cleanly, so this costs nothing: testing and debugging want
+run-as-dev; using wants run-as-you, and `promote` is the bridge between them.
+
 ### Explicitly unsupported (v1)
 
 **Cross-uid FILE access**: personal-account processes reading or writing `/Users/dev` directly — an editor opening dev
@@ -164,6 +220,13 @@ filesystem.
 **Split-session cross-uid file sharing rejected (v1)**: the one configuration that looks convenient — personal GUI
 editing dev-owned files in place — reintroduces every cross-uid ACL problem the fixed-path rejection avoided, at the
 exact boundary posture B exists to harden. Remote-backend editors make it unnecessary.
+
+**A personal-session `--app open` grant rejected.** It is tempting to mirror `--sim` with an `--app open` axis that
+launches a desktop app in the personal session on an agent's behalf. Rejected: the only personal-session path for a
+desktop app is `app promote`, and promote is **human-run by construction** (it writes `~/Applications`, unreachable from
+dev or any sandbox). Giving an agent a verb that runs arbitrary code as the personal user would reintroduce exactly the
+authority posture B removes — with none of the simulator's loose containment. Dev-session app runs (lanes 1–2) need no
+grant at all; personal-session use is promote-only, and the human makes the call.
 
 **Simulator screen-streaming as the default rejected.** Streaming a dev-session Simulator to the personal desktop (idb
 video + HID, or Screen Sharing) was the first design; the artifact handoff beats it — the human gets the native,

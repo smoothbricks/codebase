@@ -118,6 +118,16 @@ plumbing) and Claude Code / other agents (CLI "warm worktrees").
   under the `sim` grant axis (`openurl` freely grantable; `install` drop-dir-bound and human-gated: simulator apps
   execute AS the invoking user). Expo/RN daily loops ride shared loopback unchanged (docs/ios.md). Specs: 14_nix.md,
   02/03/04/05/06/07/12/13.
+- **macOS desktop apps (posture B) — three lanes**: (1) agent E2E testing and (2) interactive debugging both run the app
+  **as dev in dev's own session** (accessibility APIs/AppleScript; same uid → **no broker, no grant** — simpler than
+  simulators); (3) daily use runs it **as the personal user** via `cowshed app export` (drop dir) →
+  `cowshed app promote` — a **human-run personal-session verb** (writes `~/Applications`, so unreachable from any
+  sandbox/agent; Developer-ID signature required by default, clears quarantine). The consent asymmetry: lanes 1–2 need
+  none (confined as dev), lane 3's `promote` IS the consent (the app runs with the human's full authority — a deliberate
+  boundary exit). No `--app open` agent grant exists (rejected — promote is the only personal-session path, human by
+  construction). `cp` applies no quarantine xattr (verified), so a Developer-ID drop opens cleanly; ad-hoc trips
+  Gatekeeper. Electron/RN-desktop promoted apps point at dev's dev-server over loopback for live iteration. Specs:
+  14_nix.md, 02/04/05/06; docs/desktop.md.
 - **Sandbox**: layered, start closed (write: own mount + designated cache subtrees + temp; egress: localhost only),
   widened at runtime via grants (fs read/write paths + egress domains) applied at next exec (Seatbelt regen) and
   immediately at the gateway. Parity with jcode swarm coordinator grants is a hard requirement. No VMs/containers (user
@@ -253,6 +263,13 @@ Open experiments (fold into Phase 1 as tests, don't block on them):
   setup); (v) the headless-signing recipe (`security set-key-partition-list`, once-per-boot unlock) under the dev uid;
   (vi) idb as the dev-side streaming/HID path for agents observing headless simulators; (vii) the "simulator" Seatbelt
   preset's exact mach-lookup/XPC-socket inventory for CoreSimulator (04_sandbox.md).
+- **macOS desktop verification** (14_nix.md): (i) Developer-ID vs ad-hoc Gatekeeper behavior when `cowshed app promote`
+  installs into `~/Applications` (confirm ad-hoc needs the override, Developer-ID does not); (ii) quarantine-xattr
+  absence on `cp`/`cp -R` into the drop dir — **verified this session** (`cp` adds no `com.apple.quarantine`),
+  re-confirm on a real signed `.app` bundle; (iii) an Electron/RN-desktop promoted app pointing at dev's dev-server over
+  loopback across uids (live iteration); (iv) driving a dev-session desktop app from a dev-side agent via accessibility
+  APIs/AppleScript (the lane-1 mechanism; reuse cowshed's agent-browser Electron path); (v) `app promote` refuses to run
+  as anything but the personal user and is unreachable from the sandbox/gateway (structural, but assert it).
 
 Interception + telemetry verification (05_gateway.md, 13_telemetry.md — fold into Phase 2 gateway work):
 

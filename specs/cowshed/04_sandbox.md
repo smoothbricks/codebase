@@ -177,7 +177,10 @@ sandbox). Never readable or writable from inside a sandbox.
   invoke through the gateway's `/sim/` endpoint (05_gateway.md). `openurl` drives an already-installed app (deep links,
   reload); `install` pushes a drop-dir artifact and is additionally subject to the human-gating rule (14_nix.md).
   Dev-side headless simulators need no `sim` grant at all — they are reached directly via the "simulator" profile preset
-  below; this axis exists only for the human's simulator.
+  below; this axis exists only for the human's simulator. **macOS desktop apps add no grant axis**: an agent testing a
+  desktop app runs it as dev in dev's own session (same uid — no broker, no grant, just accessibility APIs/AppleScript),
+  and the only personal-session path is `cowshed app promote`, a human-run verb outside the sandbox model entirely
+  (14_nix.md). There is deliberately no agent verb that launches a desktop app as the personal user.
 - `portBlock` is the workspace's contiguous 16-port block from the reserved range (default 40960–49151; 05_gateway.md):
   `base` is the gateway's data-plane listener, `base+1 … base+15` are the workspace's own bindable service ports.
   Allocated at new/fork (adopt, for main), preserved across restore, never inherited by a fork. `gatewayPort` is a
