@@ -19,6 +19,8 @@ proptest! {
         for v in &values {
             d1.observe(v);
         }
+        // Finalize to owned strings before shuffling (keys borrow from `values`).
+        let f1 = d1.finalize();
         // Deterministic pseudo-shuffle from the seed (no rand dep).
         let len = values.len();
         if len > 1 {
@@ -32,7 +34,7 @@ proptest! {
         for v in &values {
             d2.observe(v);
         }
-        prop_assert_eq!(d1.finalize(), d2.finalize());
+        prop_assert_eq!(f1, d2.finalize());
     }
 }
 
