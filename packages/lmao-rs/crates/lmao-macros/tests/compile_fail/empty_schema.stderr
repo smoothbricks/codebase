@@ -1,0 +1,5 @@
+error: schema needs at least one field
+ --> tests/compile_fail/empty_schema.rs:3:24
+  |
+3 | define_log_schema!(pub EmptySchema {});
+  |                        ^^^^^^^^^^^

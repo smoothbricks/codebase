@@ -1,0 +1,5 @@
+error: unknown field kind `floatish`; expected one of: number, uint64, boolean, category, text, enum[..] (binary/unknown are not supported yet — see lmao-macros docs)
+ --> tests/compile_fail/unknown_kind.rs:4:13
+  |
+4 |     status: floatish,
+  |             ^^^^^^^^
