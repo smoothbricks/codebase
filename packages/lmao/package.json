@@ -133,8 +133,9 @@
   "scripts": {
     "bench": "bun run benchmarks/*.bench.ts",
     "bench:wasm": "bun run benchmarks/js-vs-wasm.bench.ts",
-    "build:wasm": "zig build -Doptimize=ReleaseSmall",
-    "test": "nx run lmao:test --outputStyle=stream"
+    "build:wasm": "nx run lmao:rust-wasm",
+    "test": "nx run lmao:test --outputStyle=stream",
+    "build:zig-wasm": "zig build zig-allocator -Doptimize=ReleaseSmall"
   },
   "nx": {
     "sourceRoot": "packages/lmao/src",
@@ -154,6 +155,30 @@
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
           "killAfterMs": 10000
+        }
+      },
+      "rust-wasm": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "dependsOn": [
+          {
+            "projects": [
+              "lmao-rs"
+            ],
+            "target": "cargo-wasm"
+          }
+        ],
+        "inputs": [
+          {
+            "dependentTasksOutputFiles": "**/*.wasm"
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/dist/allocator.wasm"
+        ],
+        "options": {
+          "command": "mkdir -p dist && cp ../lmao-rs/dist/allocator.wasm dist/allocator.wasm",
+          "cwd": "{projectRoot}"
         }
       }
     },
