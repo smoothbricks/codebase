@@ -1,0 +1,13 @@
+[package]
+name = "lmao-wasm"
+description = "wasm32 cdylib exposing the allocator.zig-compatible ABI so the TS host (wasmAllocator.ts) loads it unchanged"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lmao-arena = { workspace = true }
