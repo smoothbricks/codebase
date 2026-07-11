@@ -2,31 +2,26 @@
 //
 // Implements the structural (TypeChecker-free) transformations:
 //
-//   §1/§2  span() line injection + monomorphic spanN rewrite (heuristic Op detection)
-//   §5     defineModule() metadata injection (git_sha, package_name, package_file)
-//   §6     .line(N) injection on log/ok/err chains
-//   §7     task('name', fn) line injection
+//	§1/§2  span() line injection + monomorphic spanN rewrite (heuristic Op detection)
+//	§5     defineModule() metadata injection (git_sha, package_name, package_file)
+//	§6     .line(N) injection on log/ok/err chains
+//	§7     task('name', fn) line injection
 //
 // NOT yet ported (staged, requires the tsgo Checker via driver shims):
-//   §3     destructured-context rewriting (shipped in the TS transformer;
-//          needs identifier-binding analysis parity before porting)
-//   §4     tag-chain inlining with schema specialization (enum indices,
-//          eager/lazy null-bitmap elision). The checker-free fallback of §4
-//          is deliberately NOT ported either: emitting direct buffer writes
-//          without the schema risks divergence from the TS inliner's output;
-//          run the classic transformer for tag inlining until the Checker
-//          port lands.
+//
+//	§3     destructured-context rewriting (shipped in the TS transformer;
+//	       needs identifier-binding analysis parity before porting)
+//	§4     tag-chain inlining with schema specialization (enum indices,
+//	       eager/lazy null-bitmap elision). The checker-free fallback of §4
+//	       is deliberately NOT ported either: emitting direct buffer writes
+//	       without the schema risks divergence from the TS inliner's output;
+//	       run the classic transformer for tag inlining until the Checker
+//	       port lands.
 //
 // Column-name contract (spec 01e): any future §4 port must write
 // library-local (unprefixed) column names; prefix/mapColumns remapping is
 // cold-path-only via RemappedBufferView and must never appear in emitted
 // hot-path writes.
-//
-// VERIFICATION STATUS: authored without a local Go toolchain (none in this
-// repo's devenv). Compiles-by-inspection against the ttsc shim API as
-// documented in ttsc's authoring/getting-started and end-to-end walkthroughs;
-// run `go vet ./...` + the fixture e2e in a Go-enabled environment before
-// publishing (see plugin/main_test.go).
 package main
 
 import (
@@ -35,10 +30,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	shimast "github.com/microsoft/typescript-go/shim/ast"
 	shimprinter "github.com/microsoft/typescript-go/shim/printer"
+	shimscanner "github.com/microsoft/typescript-go/shim/scanner"
 	"github.com/samchon/ttsc/packages/ttsc/driver"
 )
 
@@ -152,6 +149,32 @@ func runBuild(args []string) int {
 }
 
 // ---------------------------------------------------------------------------
+// Node synthesis helpers (shared factory; synthesized nodes carry pos -1)
+// ---------------------------------------------------------------------------
+
+var factory = shimast.NewNodeFactory(shimast.NodeFactoryHooks{})
+
+func ident(text string) *shimast.Node {
+	return factory.NewIdentifier(text)
+}
+
+func str(text string) *shimast.Node {
+	return factory.NewStringLiteral(text, shimast.TokenFlagsNone)
+}
+
+func num(n int) *shimast.Node {
+	return factory.NewNumericLiteral(strconv.Itoa(n), shimast.TokenFlagsNone)
+}
+
+func propAccess(expr *shimast.Node, name string) *shimast.Node {
+	return factory.NewPropertyAccessExpression(expr, nil, ident(name), shimast.NodeFlagsNone)
+}
+
+func callExpr(expr *shimast.Node, args []*shimast.Node) *shimast.Node {
+	return factory.NewCallExpression(expr, nil, nil, factory.NewNodeList(args), shimast.NodeFlagsNone)
+}
+
+// ---------------------------------------------------------------------------
 // Transformations
 // ---------------------------------------------------------------------------
 
@@ -163,8 +186,12 @@ func transformProgram(prog *driver.Program, cwd string) {
 		if file == nil || file.IsDeclarationFile {
 			continue
 		}
-		t := &fileTransformer{file: file, cwd: cwd}
+		t := &fileTransformer{file: file, cwd: cwd, processed: map[*shimast.CallExpression]bool{}}
 		t.walk(file.AsNode())
+		// Wire Parent on freshly synthesized nodes (only where nil — must not
+		// overwrite reused parse-tree nodes' parents); the emit resolver walks
+		// Parent and would nil-panic otherwise. See shim/ast/parent.go.
+		shimast.SetParentInChildrenUnset(file.AsNode())
 	}
 }
 
@@ -173,6 +200,11 @@ type fileTransformer struct {
 	cwd  string
 	// seenDefineModule guards the one-module-per-file invariant (spec 01o §5).
 	seenDefineModule bool
+	// processed marks call nodes produced by a chain rewrite so the walker
+	// does not re-match them (the Go analog of the TS transformer's
+	// processedCalls WeakSet). Without it, the cloned inner call re-matches
+	// on descent and the rewrite regresses infinitely.
+	processed map[*shimast.CallExpression]bool
 }
 
 func (t *fileTransformer) walk(node *shimast.Node) {
@@ -195,27 +227,28 @@ func (t *fileTransformer) walk(node *shimast.Node) {
 	})
 }
 
-// lineOf returns the 1-based line of a node's start position.
+// lineOf returns the 1-based line of a node's trivia-skipped start position
+// (parity with the TS transformer's getStart()-based getLineNumber).
 func (t *fileTransformer) lineOf(node *shimast.Node) int {
-	line, _ := shimast.GetLineAndCharacterOfPosition(t.file, node.Pos())
-	return line + 1
+	pos := shimscanner.SkipTrivia(t.file.Text(), node.Pos())
+	return shimscanner.GetECMALineOfPosition(t.file, pos) + 1
 }
 
-// calleePropertyName returns the property name if the call target is
-// `recv.name(...)`, or the identifier text for a bare `name(...)`.
+// calleeNames returns the receiver and method name for `recv.name(...)`,
+// or (nil, text) for a bare `name(...)`.
 func calleeNames(call *shimast.CallExpression) (recv *shimast.Node, name string) {
 	expr := call.Expression
 	if expr.Kind == shimast.KindPropertyAccessExpression {
 		pa := expr.AsPropertyAccessExpression()
-		return pa.Expression, pa.Name().Text()
+		return pa.Expression, shimast.NodeText(pa.Name())
 	}
 	if expr.Kind == shimast.KindIdentifier {
-		return nil, expr.Text()
+		return nil, shimast.NodeText(expr)
 	}
 	return nil, ""
 }
 
-// --- §5 defineModule metadata -------------------------------------------------
+// --- §5 defineModule metadata ------------------------------------------------
 
 func (t *fileTransformer) tryDefineModuleMetadata(call *shimast.CallExpression) bool {
 	_, name := calleeNames(call)
@@ -234,7 +267,8 @@ func (t *fileTransformer) tryDefineModuleMetadata(call *shimast.CallExpression) 
 	}
 	t.seenDefineModule = true
 	for _, prop := range obj.Properties.Nodes {
-		if prop.Kind == shimast.KindPropertyAssignment && prop.Name() != nil && prop.Name().Text() == "metadata" {
+		if prop.Kind == shimast.KindPropertyAssignment && prop.Name() != nil &&
+			shimast.NodeText(prop.Name()) == "metadata" {
 			return false // already has metadata — leave alone
 		}
 	}
@@ -242,18 +276,15 @@ func (t *fileTransformer) tryDefineModuleMetadata(call *shimast.CallExpression) 
 	gitSha := gitLastCommit(t.file.FileName(), t.cwd)
 	pkgName, pkgFile := nearestPackage(t.file.FileName())
 
-	// Prepend `metadata: { git_sha, package_name, package_file }` via a
-	// synthesized property. Leaf-text mutations must set the synthesize flag
-	// (ttsc synthesize-flag invariant for leaf-text mutations).
-	meta := shimast.NewSynthesizedObjectLiteral(map[string]string{
-		"git_sha":      gitSha,
-		"package_name": pkgName,
-		"package_file": pkgFile,
-	})
-	obj.Properties.Nodes = append(
-		[]*shimast.Node{shimast.NewSynthesizedPropertyAssignment("metadata", meta)},
-		obj.Properties.Nodes...,
-	)
+	metaProps := []*shimast.Node{
+		factory.NewPropertyAssignment(nil, ident("git_sha"), nil, nil, str(gitSha)),
+		factory.NewPropertyAssignment(nil, ident("package_name"), nil, nil, str(pkgName)),
+		factory.NewPropertyAssignment(nil, ident("package_file"), nil, nil, str(pkgFile)),
+	}
+	metaObj := factory.NewObjectLiteralExpression(factory.NewNodeList(metaProps), true)
+	metadata := factory.NewPropertyAssignment(nil, ident("metadata"), nil, nil, metaObj)
+
+	obj.Properties = factory.NewNodeList(append([]*shimast.Node{metadata}, obj.Properties.Nodes...))
 	return true
 }
 
@@ -295,7 +326,7 @@ func nearestPackage(filePath string) (name, relFile string) {
 	return "unknown", filepath.Base(filePath)
 }
 
-// --- §1/§2 span rewrite -------------------------------------------------------
+// --- §1/§2 span rewrite --------------------------------------------------------
 
 func (t *fileTransformer) trySpanRewrite(call *shimast.CallExpression) bool {
 	recv, name := calleeNames(call)
@@ -314,35 +345,28 @@ func (t *fileTransformer) trySpanRewrite(call *shimast.CallExpression) bool {
 
 	var bufferClass, remappedView, opMetadata, fn *shimast.Node
 	if isOp {
-		bufferClass = shimast.NewSynthesizedPropertyAccess(opOrFn, "SpanBufferClass")
-		remappedView = shimast.NewSynthesizedPropertyAccess(opOrFn, "remappedViewClass")
-		opMetadata = shimast.NewSynthesizedPropertyAccess(opOrFn, "metadata")
-		fn = shimast.NewSynthesizedPropertyAccess(opOrFn, "fn")
+		bufferClass = propAccess(opOrFn, "SpanBufferClass")
+		remappedView = propAccess(opOrFn, "remappedViewClass")
+		opMetadata = propAccess(opOrFn, "metadata")
+		fn = propAccess(opOrFn, "fn")
 	} else {
-		buffer := shimast.NewSynthesizedPropertyAccess(recv, "_buffer")
-		bufferClass = shimast.NewSynthesizedPropertyAccess(buffer, "constructor")
-		remappedView = shimast.NewSynthesizedIdentifier("undefined")
-		opMetadata = shimast.NewSynthesizedPropertyAccess(shimast.NewSynthesizedPropertyAccess(recv, "_buffer"), "_opMetadata")
+		bufferClass = propAccess(propAccess(recv, "_buffer"), "constructor")
+		remappedView = ident("undefined")
+		opMetadata = propAccess(propAccess(recv, "_buffer"), "_opMetadata")
 		fn = opOrFn
 	}
 
-	newCtx := shimast.NewSynthesizedCall(shimast.NewSynthesizedPropertyAccess(recv, "_newCtx0"), nil)
+	newCtx := callExpr(propAccess(recv, "_newCtx0"), nil)
 	newArgs := append([]*shimast.Node{
-		shimast.NewSynthesizedNumericLiteral(line),
-		nameArg,
-		newCtx,
-		bufferClass,
-		remappedView,
-		opMetadata,
-		fn,
+		num(line), nameArg, newCtx, bufferClass, remappedView, opMetadata, fn,
 	}, rest...)
 
-	call.Expression = shimast.NewSynthesizedPropertyAccess(recv, methodName)
-	call.Arguments.Nodes = newArgs
+	call.Expression = propAccess(recv, methodName)
+	call.Arguments = factory.NewNodeList(newArgs)
 	return true
 }
 
-// --- §7 task line -------------------------------------------------------------
+// --- §7 task line ---------------------------------------------------------------
 
 func (t *fileTransformer) tryTaskLine(call *shimast.CallExpression) bool {
 	_, name := calleeNames(call)
@@ -352,26 +376,28 @@ func (t *fileTransformer) tryTaskLine(call *shimast.CallExpression) bool {
 	if call.Arguments.Nodes[0].Kind != shimast.KindStringLiteral {
 		return false
 	}
-	call.Arguments.Nodes = append(call.Arguments.Nodes,
-		shimast.NewSynthesizedNumericLiteral(t.lineOf(call.AsNode())))
+	call.Arguments = factory.NewNodeList(append(
+		append([]*shimast.Node{}, call.Arguments.Nodes...),
+		num(t.lineOf(call.AsNode())),
+	))
 	return true
 }
 
-// --- §6 log / result .line(N) ---------------------------------------------------
+// --- §6 log / result .line(N) -----------------------------------------------------
 
 // isLogReceiver checks the receiver of a log method is a `.log` property access.
 func isLogReceiver(recv *shimast.Node) bool {
 	return recv != nil &&
 		recv.Kind == shimast.KindPropertyAccessExpression &&
-		recv.AsPropertyAccessExpression().Name().Text() == "log"
+		shimast.NodeText(recv.AsPropertyAccessExpression().Name()) == "log"
 }
 
 // tryChainLine inserts `.line(N)` right after the matched method at the root
-// of a fluent chain, preserving trailing calls, no-op when `.line` is present.
+// of a fluent chain, preserving trailing calls; no-op when `.line` is present.
 func (t *fileTransformer) tryChainLine(call *shimast.CallExpression, methods map[string]bool, receiverOK func(*shimast.Node) bool) bool {
-	// Only fire at chain tops: parent must not be the expression of an outer
-	// PropertyAccess+Call (walk() visits outermost first, so mark handled
-	// chains by detecting `.line` presence instead of a WeakSet).
+	if t.processed[call] {
+		return false
+	}
 	target, trailing := findChainTarget(call, methods, receiverOK)
 	if target == nil {
 		return false
@@ -381,12 +407,23 @@ func (t *fileTransformer) tryChainLine(call *shimast.CallExpression, methods map
 	}
 	line := t.lineOf(target.AsNode())
 
-	// Build: target.line(N), then re-hang the trailing links on top.
-	lineCall := shimast.NewSynthesizedCall(
-		shimast.NewSynthesizedPropertyAccess(target.AsNode(), "line"),
-		[]*shimast.Node{shimast.NewSynthesizedNumericLiteral(line)},
+	// Build innerClone.line(N), then re-hang the trailing links on top and
+	// graft the rebuilt chain's parts into the outermost call. The inner call
+	// must be a fresh node (not `target` itself): when target IS the
+	// outermost call, reusing it would make the call its own descendant — a
+	// cycle that loops the walker forever.
+	inner := factory.NewCallExpression(
+		target.Expression, nil, target.TypeArguments, target.Arguments, shimast.NodeFlagsNone,
 	)
-	rebuildChainOnto(call, lineCall, trailing)
+	t.processed[inner.AsCallExpression()] = true
+	t.processed[call] = true
+	rebuilt := callExpr(propAccess(inner, "line"), []*shimast.Node{num(line)})
+	for _, link := range trailing {
+		rebuilt = callExpr(propAccess(rebuilt, link.name), factory.NewNodeList(link.args).Nodes)
+	}
+	rc := rebuilt.AsCallExpression()
+	call.Expression = rc.Expression
+	call.Arguments = rc.Arguments
 	return true
 }
 
@@ -407,7 +444,7 @@ func findChainTarget(call *shimast.CallExpression, methods map[string]bool, rece
 			return nil, nil
 		}
 		pa := expr.AsPropertyAccessExpression()
-		name := pa.Name().Text()
+		name := shimast.NodeText(pa.Name())
 		if methods[name] && (receiverOK == nil || receiverOK(pa.Expression)) {
 			return current, trailing
 		}
@@ -427,7 +464,7 @@ func chainHasLine(call *shimast.CallExpression) bool {
 			return false
 		}
 		pa := expr.AsPropertyAccessExpression()
-		if pa.Name().Text() == "line" {
+		if shimast.NodeText(pa.Name()) == "line" {
 			return true
 		}
 		if pa.Expression.Kind != shimast.KindCallExpression {
@@ -435,21 +472,4 @@ func chainHasLine(call *shimast.CallExpression) bool {
 		}
 		current = pa.Expression.AsCallExpression()
 	}
-}
-
-// rebuildChainOnto mutates `root` (the outermost chain call) so its chain
-// becomes: base, then the trailing links in order.
-func rebuildChainOnto(root *shimast.CallExpression, base *shimast.Node, trailing []chainLink) {
-	current := base
-	for _, link := range trailing {
-		current = shimast.NewSynthesizedCall(
-			shimast.NewSynthesizedPropertyAccess(current, link.name),
-			link.args,
-		)
-	}
-	// Replace root's content with the rebuilt chain (structural mutation on
-	// the outermost node keeps the parent pointers intact).
-	rebuilt := current.AsCallExpression()
-	root.Expression = rebuilt.Expression
-	root.Arguments = rebuilt.Arguments
 }
