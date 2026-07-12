@@ -1,15 +1,18 @@
 # TypeScript Transformer <a id="smoo/lmao!n/transformer"></a>
 
-The LMAO TypeScript transformer performs compile-time optimizations that enable zero-overhead logging at runtime. It
-transforms ergonomic user code into V8-optimized output.
+The LMAO TypeScript transformer performs compile-time rewrites that remove runtime dispatch and setup where static proof
+is available. The optimizations below describe emitted code and runtime contracts; they do not imply an unmeasured
+speedup.
 
-> **Implementation status (system state).** The transformer ships in `packages/lmao-transformer/src/`: `transformer.ts`
-> (`createLmaoTransformer` + the `visitor`) is the entry factory wired into the TS compile via
-> `transformers: { before: [createLmaoTransformer()] }`; `tagChainInliner.ts` holds the `ctx.tag` chain inliner. Every
-> transformation below is implemented and tested (`src/__tests__/transformer.test.ts`,
-> `src/__tests__/tagChainInliner.test.ts`) **except** §3 Destructured Context Rewriting, which is not implemented (see
-> that section). Several sections below were stale relative to the shipped output and have been trued up to the code —
-> the running invariant is **the transformed output the tests assert**, not the original sketches.
+> **Implementation status (system state).** The TypeScript transformer ships in `packages/lmao-ttsc/src/`, and
+> the ttsc Go plugin in `packages/lmao-ttsc/plugin/` implements the corresponding span, runtime-hint, and
+> Op-local log-template-ID passes. Destructured-context rewriting (§3), Promise-preserving fixed-arity span lowering,
+> packed runtime hints, private `u16` log-template storage, and the existing line, metadata, tag, log, and result
+> transformations are implemented and tested in both compiler paths. `spanAutoN` exists as an internal, explicit runtime
+> seam, but automatic `ctx.span(...)` → `spanAutoN(...)` lowering is intentionally disabled because a synchronous return
+> would change the public Promise API's observable microtask scheduling. The running invariant is **the transformed
+> output the tests assert**, not earlier design sketches. No performance improvement is claimed for the template-ID path
+> until its dedicated benchmark has been run.
 
 ## Design Philosophy <a id="smoo/lmao!n/transformer-philosophy"></a>
 
@@ -27,98 +30,178 @@ should always use the transformer for optimal performance.
 
 ### 1. Line Number Injection <a id="smoo/lmao!n/transformer-line-injection"></a>
 
-Injects source line numbers as the first argument to `span()` calls for source mapping without runtime stack parsing.
-The 1-based line number comes from `getLineNumber()` (`getLineAndCharacterOfPosition` + 1) and is reused by every
-transformation below that needs a call-site line (span, log, result, task).
+Injects the 1-based source line as the first runtime argument when a span call can be lowered without changing
+evaluation or Promise semantics. The line comes from `getLineNumber()` (`getLineAndCharacterOfPosition` + 1) and is also
+reused by log, result, and task rewrites.
 
 ```typescript
 // User writes:
 await ctx.span('fetch-user', fetchUserOp, userId);
 
-// Transformer outputs:
-await ctx.span(42, 'fetch-user', fetchUserOp, userId);
+// Stable, checker-proved Op:
+await ctx.span1(
+  42,
+  'fetch-user',
+  Object.create(ctx),
+  fetchUserOp.SpanBufferClass,
+  fetchUserOp.remappedViewClass,
+  fetchUserOp.metadata,
+  fetchUserOp.fn,
+  userId,
+  fetchUserOp.runtimeHint
+);
 ```
 
-The line number flows directly to TypedArray writes - it is NEVER stored as a property on any object.
+A dynamic or unstable Op expression that cannot be expanded exactly once remains on `span()` unchanged, so it does not
+receive compile-time span-line injection. The line number in lowered calls flows directly to TypedArray writes; it is
+never stored as a property on the context.
 
 ### 2. Monomorphic span() Rewriting <a id="smoo/lmao!n/transformer-span-rewrite"></a>
 
-**Problem**: `span()` has multiple overloads (Op invocation, inline closure) and a variadic argument list. A single
-method with runtime argument inspection is polymorphic - V8 can't optimize the call site.
+`tryTransformSpanCall` conservatively lowers supported calls to the Promise-based `span0`–`span8` ABI. It requires at
+most eight trailing arguments, a stable receiver (`identifier` or `this`), and either:
 
-**Solution**: Rewrite to **arity-indexed monomorphic methods** `span0`, `span1`, … `span8` — one per count of trailing
-args after the op/fn — so each call site lands on a fixed-shape method. This replaces the earlier `span_op`/`span_fn`
-sketch; the shipped runtime exposes `span0`–`span8` on the SpanContext prototype (plus a `spanSync` sync sibling), and
-the variadic `span()` dispatcher is the no-transformer fallback that routes to the same `spanN` methods
-(`packages/lmao/src/lib/spanContext.ts`, node `smoo/lmao!n/context-flow-span-promise`).
-
-#### Transformer Behavior
-
-`tryTransformSpanCall` statically analyzes each `ctx.span('name', opOrFn, ...rest)` call. The method name is
-`span${rest.length}`, and the transformer emits **6 fixed arguments before the op/fn**, so the runtime method never
-inspects an Op object at the call site:
-
-1. `line: number` — the call-site line (`getLineNumber`)
-2. `name: string` — the span name (unchanged)
-3. `childCtx: SpanContext` — `ctx._newCtx0()` (the child context, allocated explicitly)
-4. `SpanBufferClass` — the span-buffer constructor
-5. `remappedViewClass` — `RemappedViewConstructor | undefined`
-6. `opMetadata` — the per-Op metadata
+1. a checker-proved `Op` represented by a stable identifier, whose buffer class, remapped view, metadata, function, and
+   runtime hint can each be read once; or
+2. an inline arrow/function expression, using the receiver's buffer class and metadata and runtime hint `0`.
 
 ```typescript
 // User writes:
 await ctx.span('fetch-user', fetchUserOp, userId);
 ctx.span('compute', async () => heavyComputation());
 
-// Transformer outputs (Op: pull SpanBufferClass/remappedViewClass/metadata/fn off the op):
+// Transformer outputs:
 await ctx.span1(
   42,
   'fetch-user',
-  ctx._newCtx0(),
+  Object.create(ctx),
   fetchUserOp.SpanBufferClass,
   fetchUserOp.remappedViewClass,
   fetchUserOp.metadata,
   fetchUserOp.fn,
-  userId
+  userId,
+  fetchUserOp.runtimeHint
 );
-
-// Transformer outputs (plain fn: take buffer class + metadata off ctx._buffer, remappedView = undefined):
-ctx.span0(43, 'compute', ctx._newCtx0(), ctx._buffer.constructor, undefined, ctx._buffer._opMetadata, async () =>
-  heavyComputation()
+ctx.span0(
+  43,
+  'compute',
+  Object.create(ctx),
+  ctx._buffer.constructor,
+  undefined,
+  ctx._buffer._opMetadata,
+  async () => heavyComputation(),
+  0
 );
 ```
 
-**Detection logic** (Op vs function, §"Detecting Op vs Function"):
+The child is exactly `Object.create(receiver)`, not `_newCtx0()` and not a copied or merged object. Because `spanN`
+remains Promise-based, the lowered call preserves the public `span()` scheduling contract.
 
-- With a `TypeChecker`: the 2nd argument's type starts with/contains `Op` → Op path; else function path.
-- Without a `TypeChecker`: a non-(arrow|function) literal is assumed to be an Op; arrow/function expressions are the fn
-  path.
-- Op path → `op.SpanBufferClass`, `op.remappedViewClass`, `op.metadata`, `op.fn`. Function path →
-  `ctx._buffer.constructor`, `undefined`, `ctx._buffer._opMetadata`, and the function expression itself.
+#### Evaluation and safety bailouts
 
-> **Implementation note — context override not handled.** The earlier `span('name', { env }, op, …)` override form
-> (merging via `Object.assign(Object.create(ctx), …)`) is **not** implemented in `tryTransformSpanCall`; the function
-> requires the 2nd arg to be the op/fn directly. If the override form is still wanted it is unimplemented work, tracked
-> by node `smoo/lmao!n/transformer-span-override`.
+The transformer never duplicates an unstable receiver or Op expression. Calls such as
+`getCtx().span('name', getOp(), value)` remain byte-shape calls to the public variadic `span()` dispatcher: receiver and
+Op are each evaluated once in source order, and the returned Promise retains its normal microtask boundary. Other
+bailouts include a missing checker for an Op value, unproved receiver/Op types, more than eight trailing arguments,
+override form `span(name, overrides, op, ...)`, and any unsupported function expression. Every bailout preserves the
+public runtime path.
+
+Automatic `spanAutoN` lowering is **not** considered safe merely because a call is directly awaited or returned from an
+`async` function. Although both `Result` and `Promise<Result>` are await-compatible, returning a synchronous `Result`
+changes the number/order of Promise-assimilation microtasks. Exact observable scheduling takes precedence over removing
+Promise allocation.
+
+#### Internal `spanAutoN` seam
+
+The runtime still exposes `spanAuto0`–`spanAuto8` as an internal/explicit ABI returning `Result | Promise<Result>`.
+`_spanAutoPre` performs `Object.create(this)`, passes that exact inherited child to `_spanPre`, and invokes the Op once
+on the initial path. A genuine `Ok`/`Err` terminal result with no retry requirement is finalized and returned
+synchronously. All other values—including custom thenables—transfer to the async helper and are assimilated once; a
+retryable error also transfers to that helper. The helper awaits the first value, applies the normal retry policy
+(re-invoking only for an actual retry), records retry and terminal rows, and ends tracing exactly once. Throws and
+rejections use the normal span-exception path. This ABI is not emitted automatically from public `span()`.
+
+#### Packed runtime hint, structured compile metadata, and specialized setup
+
+For checker-proved LMAO calls, the transformer computes a packed unsigned 32-bit runtime hint and emits it inside the
+structured `OpCompileMetadata` ABI. `defineOp(...)` must have result type `Op<...>`/symbol `Op`, and `defineOps(...)`
+must have result type `OpGroup<...>`/symbol `OpGroup`; the resolved call declaration must come from LMAO. Same-named
+unrelated functions and checkerless classic-transformer calls receive no compile metadata.
+
+| Bits     | Meaning                                                                        |
+| -------- | ------------------------------------------------------------------------------ |
+| `0..15`  | initial row capacity (`0` means adaptive/unspecified)                          |
+| `16..22` | required `tag`, `log`, `ff`, nested-span, result, scope, and deps capabilities |
+| `23`     | analysis-valid marker                                                          |
+| `24..31` | reserved; any set bit invalidates the hint                                     |
+
+Analysis starts capacity at two reserved rows (span start/tags and terminal result), then adds one for each statically
+encountered direct `ctx.log.info/debug/warn/error/trace(...)`. A loop makes capacity unknown and encodes zero while
+still retaining safely proven capability bits. Capacity overflow beyond `0xffff` also becomes unknown. At runtime, a
+nonzero analyzed capacity is clamped to a minimum of two; zero uses the normal adaptive capacity.
+
+Capability analysis is closed-world. It accepts only direct, recognized forms: calls through `tag`/known log methods,
+`ff(...)` or `ff.flag(...)`, direct `span`/`spanSync`/`ok`/`err`/`setScope` calls, and property access through `scope`
+or `deps`. It emits hint `0` if the first parameter is not a simple identifier, the context escapes or is used as a
+value, access is computed/unknown, a nested function is entered, or another use cannot be proven safe. Consequently a
+callback whose first parameter is destructured is conservatively hinted as `0` even when the separate §3 rewrite
+succeeds.
+
+`defineOp` is annotated only when no fourth argument already exists. Its fourth argument is
+`{ runtimeHint, logTemplateIds }`; missing user metadata is represented by an inserted third argument `undefined`.
+`defineOps` is annotated only when called with a single object literal; its second argument is a property-keyed map of
+the same structured metadata. The map includes inline arrow functions, function expressions, and method declarations,
+keyed by literal property name. Shorthand properties and property assignments containing an existing Op
+identifier/expression are omitted rather than assigned empty metadata; an analyzable inline callback that fails
+closed-world hint analysis keeps its own key with `runtimeHint: 0`. This object ABI replaces the earlier bare
+packed-hint argument/map: the runtime normalizes both fields, installs `runtimeHint` on the Op, and copies the frozen
+template table to `OpMetadata.logTemplateIds`.
+
+Hint injection and destructured-context rewriting compose in one visitor step: the original callback is analyzed first,
+then the hint-bearing call is passed to §3 rewriting. A call may therefore receive both changes; if §3 later bails, the
+already-proved hint injection remains.
+
+`_spanPre` trusts specialization only when the value is an in-range integer, bit 23 is set, and reserved bits are clear.
+Otherwise it installs the full context surface. A valid hint constructs only the required own properties. Logger setup
+is shared by `log`, `ff`, and scope; `ff` binds via `forContext(ctx)` to the **exact inherited child**, not a copied
+context. Unused capabilities remain inherited or absent rather than being eagerly allocated, while `_buffer`, `_schema`,
+and `_logBinding` are always rebound to the child span.
 
 ### 3. Destructured Context Rewriting <a id="smoo/lmao!n/transformer-destructured-context"></a>
 
-**Status: NOT IMPLEMENTED in the transformer.** The `__ctx` rewrite described here does not exist in
-`packages/lmao-transformer/src/` — there is no `__ctx` synthesis and `tryTransformSpanCall` only rewrites
-`ctx.span(...)` property-access calls, not a bare destructured `span(...)` call. Tracked as unimplemented work by node
-`smoo/lmao!n/transformer-destructured-context`.
+**Status: implemented in the TypeScript transformer.** For arrow/function literals passed to `op`, `defineOp`,
+`defineOps`, or `task`, a destructured first parameter containing `span` may be replaced with `__ctx`. Other
+destructured properties are rebound as the first body statement, preserving aliases, defaults, and nested bindings.
+Every bare `span(...)` call must support the same Promise-preserving §2 lowering; otherwise the whole function is left
+unchanged.
 
-**The destructured case still works at runtime — without this optimization.** When a user destructures the context
-(`const myOp = op(async ({ span, log, tag }, userId) => …)`), the destructured `span`/`log`/`tag` are real closures
-bound to the context at codegen time (`packages/lmao/src/lib/spanContext.ts`, node
-`smoo/lmao!n/codegen-destructured-context`). So `span('fetch', fetchOp, userId)` dispatches through the variadic
-`span()` fallback (§"Fallback Behavior") and is correct, just not rewritten to a monomorphic `spanN` call. This section
-describes a **future** compile-time optimization, not current behavior.
+```typescript
+// User writes:
+op(async ({ span, log }, userId) => {
+  await span('fetch', fetchUserOp, userId);
+});
 
-The originally-sketched approach was: detect `op()` calls with a destructured first param, replace it with a synthetic
-`__ctx`, move the remaining destructured props to a `const { … } = __ctx` inside the body, and rewrite each `span(...)`
-to `__ctx.spanN(line, name, __ctx._newCtx0(), …)` — keeping `span` in the destructure only when it is passed as a value
-rather than called.
+// Stable, checker-proved Op:
+op(async (__ctx, userId) => {
+  const { log } = __ctx;
+  await __ctx.span1(
+    42,
+    'fetch',
+    Object.create(__ctx),
+    fetchUserOp.SpanBufferClass,
+    fetchUserOp.remappedViewClass,
+    fetchUserOp.metadata,
+    fetchUserOp.fn,
+    userId,
+    fetchUserOp.runtimeHint
+  );
+});
+```
+
+The whole function is left unchanged if `span` is passed or otherwise used as a value, is shadowed, a rest binding is
+present, `__ctx` would collide, any bare span call cannot be lowered safely, or no `span` binding exists. This all-or-
+nothing preflight prevents a mixed rewrite from changing destructuring semantics. Concise arrow bodies are converted to
+a block with an explicit `return`.
 
 ### 4. `with()` Bulk Setter Unrolling <a id="smoo/lmao!n/transformer-tag-chain-inline"></a>
 
@@ -221,6 +304,63 @@ return ctx.ok(user).with({ userId: user.id }).message('Created');
 return ctx.ok(user).line(42).with({ userId: user.id }).message('Created');
 ```
 
+#### Op-local `u16` log-template IDs
+
+The same checker-backed prepass can replace an eligible literal log write with a private numeric write. Eligibility is
+intentionally narrow: the enclosing Op must be an inline arrow, function expression, or method with a simple identifier
+as its first parameter; the call must be direct `ctx.log.info/debug/warn/error/trace(message)` with exactly one
+argument; `ctx` must be that first parameter; the `ctx.log` value must be checker-proved as LMAO `SpanLogger` or
+`GeneratedSpanLogger`; and `message` must be a string literal or no-substitution template literal. Analysis never
+crosses a nested function. Trailing fluent links, including an existing `.line(...)`, are preserved around the rewritten
+inner call.
+
+The compiler uses the literal's **cooked string value** (`node.text`/the tsgo AST equivalent), not source-token
+spelling. It deduplicates equal cooked strings within each Op and assigns IDs in first lexical encounter order. ID `0`
+is reserved for the dynamic/raw-message path; unique templates receive IDs `1..65535`, and
+`OpMetadata.logTemplateIds[id - 1]` is the only lookup table. Once 65,535 unique strings have been assigned, later
+unseen strings remain ordinary dynamic writes; previous duplicates continue to reuse their assigned ID. These IDs are
+private to one Op and are neither stable across builds nor comparable between Ops.
+
+```typescript
+// User writes:
+const load = defineOp('load', async (ctx) => {
+  ctx.log.info('cache\nhit').userId('42');
+  ctx.log.warn(`cache\nhit`);
+  ctx.log.info(getMessage());
+});
+
+// Contractual shape (irrelevant printer details omitted):
+defineOp('load', async (ctx) => {
+  ctx.log._infoTemplate(1).line(42).userId('42');
+  ctx.log._warnTemplate(1).line(43);
+  ctx.log.info(getMessage()).line(44);
+}, undefined, {
+  runtimeHint: /* packed value */,
+  logTemplateIds: ['cache\nhit'],
+});
+```
+
+A dynamic expression, substitution template, multiple/zero arguments, alias or computed access, unrelated/shadowed
+logger type, nested-function call, non-inline Op definition, missing checker proof, or saturated new template bails out
+of ID encoding without changing logging behavior. It still uses the existing raw string column and ordinary line
+transform where eligible.
+
+At runtime, a template-bearing Op conditionally adds a zero-initialized `Uint16Array` lane to each JS `SpanBuffer`
+system allocation; the wasm-backed buffer uses the same conditional `Uint16Array` contract. Ops with an empty table
+allocate no lane. Static compiler output writes only the nonzero ID (both fluent and direct-inlined log paths); dynamic
+logs leave the zero sentinel and write `message_values` exactly as before. Overflow buffers inherit the same Op metadata
+and lane shape.
+
+`resolveMessage(buffer, row)` is the cold/public boundary: `0` returns the raw row value, while nonzero `n` returns
+`buffer._opMetadata.logTemplateIds[n - 1]` and throws on an invalid nonzero ID. Arrow conversion, SQLite insertion,
+testing/fact extraction, Cloudflare rows, feature-flag evaluation, and stdio tracing all use this resolver. Therefore
+public Arrow `message` values and other exported messages remain the exact cooked literal or dynamic runtime string; the
+private ID lane is not an Arrow schema change. Span names and all non-eligible messages remain ordinary strings.
+
+The TypeScript and tsgo implementations share these checker-proof, lexical-order, deduplication, saturation, structured
+metadata, and bailout rules. Their parity tests establish emitted behavior and runtime/Arrow invariants; they are not
+performance evidence. The hot-store change has no claimed speedup until a dedicated benchmark reports results.
+
 ### 7. `task()` Line Number Injection <a id="smoo/lmao!n/transformer-task-line"></a>
 
 `tryTransformTaskCall` appends the call-site line number as a trailing argument to `task('name', fn)` calls — both the
@@ -239,38 +379,37 @@ module.task('processOrder', async (ctx) => {}, 42);
 
 ## V8 Optimization Impact <a id="smoo/lmao!n/transformer-v8-impact"></a>
 
-| Transformation       | Without Transformer      | With Transformer                  |
-| -------------------- | ------------------------ | --------------------------------- |
-| `span()` dispatch    | Polymorphic (arg check)  | Monomorphic (`span0`–`span8`)     |
-| `with()` bulk setter | Object alloc + iteration | Direct columnar buffer writes     |
-| Destructured context | Closure-bound `span`     | Closure-bound `span` (not yet §3) |
-| Line numbers         | Not available            | Zero-cost injection               |
-| Metadata             | Manual or missing        | Auto-injected                     |
+| Transformation                    | Without Transformer                   | With Transformer                                                                           |
+| --------------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Stable proven Op span             | Public variadic Promise dispatcher    | Promise-based fixed `span0`–`span8` ABI                                                    |
+| Dynamic/unstable Op span          | Public variadic Promise dispatcher    | Unchanged public dispatcher; single evaluation preserved                                   |
+| Inline-function span              | Public variadic Promise dispatcher    | Promise-based fixed `span0`–`span8` ABI with direct `Object.create` child                  |
+| Explicit internal `spanAutoN`     | Not applicable                        | Sync `Ok`/`Err` terminal or Promise retry/thenable fallback; never automatic               |
+| `with()` bulk setter              | Object allocation + iteration         | Direct columnar buffer writes                                                              |
+| Destructured `span`               | Closure-bound public dispatcher       | `__ctx` plus safe Promise-based fixed-arity lowering, or whole-function bailout            |
+| Op setup                          | Full context setup, adaptive capacity | Structured compile metadata with packed hint and Op-local templates when analysis is valid |
+| Literal Op log message            | String stored per row                 | Private Op-local `u16` row ID; exact string restored on cold/public reads                  |
+| Dynamic or ineligible log message | Raw string row                        | Unchanged raw string row (`u16` sentinel `0` when a lane exists)                           |
+| Line numbers                      | Runtime fallback/absent               | Compile-time injection on lowered calls                                                    |
+| Metadata                          | Manual or missing                     | Auto-injected                                                                              |
+
+These are structural properties of emitted code. Performance claims require a benchmark for the target runtime and
+workload.
 
 ## Implementation Notes <a id="smoo/lmao!n/transformer-impl-notes"></a>
 
 ### Detecting Op vs Function <a id="smoo/lmao!n/transformer-detect-op"></a>
 
-`tryTransformSpanCall` distinguishes Op from inline function to choose the buffer/metadata/fn arguments (it does **not**
-pick a method name from this — the method is always `span${restCount}`):
-
-```typescript
-// With a TypeChecker: type name starts-with/contains 'Op' → Op path
-await ctx.span('name', fetchUserOp, args);   // → op.SpanBufferClass / op.remappedViewClass / op.metadata / op.fn
-
-// Function — arrow function or function expression → function path
-ctx.span('name', async () => { ... });        // → ctx._buffer.constructor / undefined / ctx._buffer._opMetadata / fn
-ctx.span('name', async function() { });       // → function path
-
-// Without a TypeChecker: any non-(arrow|function) literal is assumed to be an Op.
-```
+The transformer uses a `TypeChecker` to prove the LMAO context receiver and `Op<...>` second argument. A proven Op is
+lowered to Promise-based `spanN` only when the Op is a stable identifier, so extracting its fields cannot repeat a
+dynamic expression. Arrow and function expressions can use the same legacy `spanN` path when their receiver is stable.
+Everything else remains on `span()`; `spanAutoN` is never selected automatically.
 
 ### Synthetic Variable Naming <a id="smoo/lmao!n/transformer-synthetic-naming"></a>
 
-The `__ctx` synthetic-variable scheme belongs to the **not-yet-implemented** §3 Destructured Context Rewriting; no
-`__ctx` is emitted by the shipped transformer. The tag-chain inliner that _is_ shipped uses `$$vN` temporaries
-(`generateVarName`) for non-literal tag values, chosen to avoid collision with user variables. (Recorded under the §3
-work node `smoo/lmao!n/transformer-destructured-context`.)
+Destructured-context rewriting emits `__ctx` only after proving that name does not occur in the function body. The
+transform is skipped on collision. The tag-chain inliner uses `$$vN` temporaries (`generateVarName`) for non-literal tag
+values.
 
 ### Source Maps <a id="smoo/lmao!n/transformer-source-maps"></a>
 
@@ -285,20 +424,18 @@ inliner additionally **strips** inherited comments and source positions from its
 
 ## Fallback Behavior <a id="smoo/lmao!n/transformer-fallback"></a>
 
-Without the transformer, everything still works:
+Without proof—or without the transformer—everything stays correct through the public API:
 
-- `span()` is the variadic dispatcher that detects `(line?, name, op|fn, ...args)` via `arguments.length` and routes to
-  the same monomorphic `span0`–`span8` (`packages/lmao/src/lib/spanContext.ts`,
-  `smoo/lmao!n/context-flow-span-promise`).
-- `with()` / tag setters iterate at runtime through the generated fluent builders instead of the inlined buffer writes.
-- No line numbers in traces (the runtime dev fallback can parse the stack — `extractMetadataFromStack`).
-- Metadata must be provided manually (`DEFAULT_METADATA` is the un-injected sentinel).
-
-This enables:
-
-- REPL/playground usage
-- Quick prototyping
-- Gradual adoption
+- `span()` always returns `Promise<Result<...>>`. It parses the optional line/override forms, resolves Op versus
+  function, creates `_newCtx0()`/`_newCtx1()`, and dispatches to Promise-based `span0`–`span8`.
+- Stable proven Ops and inline functions may lower directly to the same Promise-based `spanN` methods. Dynamic Op
+  expressions remain on `span()` to preserve single evaluation and Promise scheduling.
+- `spanAutoN` is an internal/explicit `Result | Promise<Result>` runtime seam and is not an automatic public-call
+  replacement, even in direct await or async-return positions.
+- `with()` and tag setters iterate through generated fluent builders rather than direct inlined writes.
+- Runtime line/metadata fallbacks continue to apply when compile-time injection is absent.
+- Literal log-template encoding is optional: ineligible/dynamic calls write the raw message, and every public/Arrow read
+  resolves to the same string. A malformed nonzero private ID fails loudly rather than producing a wrong message.
 
 ## Related Specs <a id="smoo/lmao!n/transformer-related"></a>
 
