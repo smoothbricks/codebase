@@ -1,8 +1,11 @@
 # Workspace Lifecycle
 
 The central convention: **main is the base**. There are no templates, no refresh pipelines, and no registration steps.
-The adopted main workspace is always warm because the user works in it and merges land in it; every new workspace is a
-copy-on-write clone of main's live image.
+The **main workspace** is the adopted image-backed workspace and its standalone Git repository/object store. It is not
+the checked-out Git `main` branch, and it is not shorthand for that branch's working tree or index. The main workspace
+is always warm because the user works in its currently checked-out working tree and merges land there; every new
+workspace is a copy-on-write clone of the main workspace's live image. Operations that update only a non-checked-out ref
+in its repository do not change its checked-out branch, index, or working tree.
 
 ## The safe-to-clone-main invariant
 
@@ -146,19 +149,44 @@ source endpoint or CA. Two divergent futures from one warm state, ~250 ms on the
 - `cowshed gc` retains every pinned checkpoint, every checkpoint younger than 14 days, and always the newest five per
   workspace. A supplied label and `--keep` both create explicit pins; only an explicit unpin makes them eligible.
 
+### Checkpoint before writer handoff
+
+Before write responsibility passes from one writer to another, the current writer creates a checkpoint after stopping or
+quiescing its writes. The checkpoint is the recovery boundary for the handoff and includes the complete live workspace
+state, including committed and uncommitted files. The next writer may receive a fresh capability for the same attached,
+writable workspace, or the handoff may create a live copy-on-write fork from that workspace. A fork receives its own
+identity and closed-baseline grants as described above; the source and its checkpoint remain recoverable until the fork
+is accepted or independently preserved. A failed writer can therefore be replaced on the same workspace, or its attempt
+can be abandoned in favor of the checkpoint or an unaffected fork, without conflating handoff with publication or
+retirement.
+
 ## `cowshed push <ws> [--branch <name>]`
 
-Delivers the workspace branch to the host repository — **pull-based**: the controller runs
-`git -C <main mount> fetch <ws mount> +cowshed/<name>:cowshed/<name>` (default: the workspace's `cowshed/<name>`
-branch). Refuses to update any branch currently checked out in main (exit 4). After a successful push the work exists in
-the host repository's object store — the workspace is disposable from that moment.
+Preserves a completed workspace branch in the **main workspace's standalone repository/object store**. This is a local,
+pull-based Git operation; it does not switch or update the checked-out Git `main` branch and does not modify the main
+workspace's index or working tree. The default source is the workspace's `refs/heads/cowshed/<ws>` branch. A validated
+`--branch` selects another local source branch. The destination is the non-checked-out namespaced ref
+`refs/cowshed/<ws>/heads/<branch>` in the main workspace repository.
 
-The direction is a security invariant, not an implementation detail: **cowshed never executes git with its cwd or config
-inside a workspace unsandboxed.** A workspace's `.git/config` and hooks are agent-writable, and git executes them
-(`core.fsmonitor`, `core.sshCommand`, `credential.helper`, `pre-push`) — controller-side git run inside a workspace repo
-would be arbitrary code execution outside the sandbox. Fetching _from_ a workspace parses objects without executing the
-remote's config; that is the safe direction, and every trust-boundary git operation uses it. Workspace-side git — the
-rebase step, branch creation on a fresh clone of trusted main — runs **inside** the sandbox.
+The controller reads from the source workspace using host-side Git with the main workspace repository as the receiving
+repository, `--no-write-fetch-head`, and no checkout or merge. It fetches the selected source into a temporary ref,
+verifies the fetched object ID, then atomically installs that exact object ID at the destination ref and removes the
+temporary ref. The receiving command never uses the source workspace's Git configuration or hooks. Updating an existing
+destination is deliberate preservation of a newer snapshot, not a working-tree operation.
+
+`push` accepts three independent optional compare-and-swap preconditions: the expected source workspace incarnation, the
+expected source branch head object ID, and the expected destination ref head (either a specific object ID or missing).
+Under the destination-ref lock, cowshed validates every supplied expectation against authoritative host metadata and the
+fetched source. Any mismatch returns `Conflict`, reports which expectation moved, leaves the destination ref unchanged,
+and retains the source workspace. Omitting an expectation requests the corresponding unconditional behavior; callers
+that may race or retry should supply all three.
+
+Success returns the source object ID and destination ref and guarantees that the destination resolves to that exact
+object ID. Once every unique commit that must survive is reachable from this durable namespaced ref (or another
+non-temporary ref in the main workspace repository), the source workspace may be retired. Merely transferring objects,
+leaving them dangling, or updating `FETCH_HEAD` is not preservation. Remote forge publication, pull-request mutation,
+workflow policy, and scheduling are outside Cowshed; another trusted host-side component may publish the preserved ref
+without changing these local semantics.
 
 ## Autosave
 

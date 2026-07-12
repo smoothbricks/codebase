@@ -49,6 +49,10 @@ No mounts, no root, no network — pure functions with table-driven cases:
   `ensure`/`attach`; `WorkspaceHandle` exposes exactly one workspace's exec/shell/jobs/quota-bound checkpoint/push/grant
   reads; only `Coordinator` exposes grant/revoke/restore/destroy/rebase/land/gc/repo-mirror and quota policy.
   Compile-fail fixtures prove forbidden methods and cross-workspace construction are unavailable.
+- **Push CAS and preservation model**: pure state-machine tables cover each omitted/satisfied/mismatched combination of
+  expected workspace incarnation, source head, and destination ref head (including expected-missing). A mismatch is a
+  `Conflict` that preserves the old destination exactly and leaves the source live; success reports one source object ID
+  and a destination ref resolving to that exact ID. DTO goldens pin the Rust, JSON, N-API, and MCP spellings.
 - **MCP capability/auth codecs**: coordinator authority can be read only from the designated inherited FD/socketpair and
   never argv/environment/stderr; worker descriptors are 256-bit, 30-second, one-use, memory-only, atomic-consume,
   restart-invalidated, workspace/socket/peer-bound. Missing, expired, replayed, mismatched, or insufficient authority
@@ -97,6 +101,22 @@ both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZF
 Covered flows:
 
 - adopt → new → exec → push → rm (the golden path), including marker/token rewrite on new;
+- **Completed-branch preservation without checkout mutation**: dirty the main workspace working tree and index and
+  record its checked-out branch, HEAD, status, file bytes, and index checksum. Push a completed workspace branch and
+  assert `refs/cowshed/<ws>/heads/<branch>` resolves to the exact source head with every unique commit reachable, while
+  the recorded branch, HEAD, status, bytes, and index remain byte-for-byte unchanged. Assert no preservation claim is
+  made for objects reachable only from a temporary ref or `FETCH_HEAD`, retire the source only after the durable ref is
+  installed, and recover the exact commit graph after retirement.
+- **Writable handoff and fork recovery**: checkpoint a quiesced writable workspace containing committed and uncommitted
+  state, hand the same live workspace to a successive writer, and prove it can edit, execute, commit, and push. Repeat
+  by creating a live CoW fork at handoff; prove the fork is independently writable with fresh identity and
+  closed-baseline grants, then simulate writer failure and recover from both the retained source/checkpoint and the
+  unaffected fork without losing the pre-handoff state.
+- **Push compare-and-swap conflicts**: race workspace restore against expected-incarnation push, a new source commit
+  against expected-source-head push, and another preservation update against expected-destination-head push (including
+  expected-missing versus an existing ref). Every stale attempt must return `Conflict`, identify the moved expectation,
+  leave the destination object ID and main working tree/index unchanged, and retain the source workspace. A retry with
+  freshly read expectations must preserve exactly the newly selected source head.
 - **runner interception from step one**: execute a workflow fixture with a hostile first command, later shell commands,
   and a supported action-generated command. Instrument the runner spawn boundary and assert that every
   repository-controlled command is launched through `cowshed exec` in the job workspace, in workflow order, with zero
