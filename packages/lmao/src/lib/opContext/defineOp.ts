@@ -8,10 +8,10 @@
  */
 
 import { intern, PreEncodedEntry } from '@smoothbricks/arrow-builder';
-import { Op as OpClass } from '../op.js';
+import { EMPTY_LOG_TEMPLATE_IDS, Op as OpClass } from '../op.js';
 import { getSpanBufferClass } from '../spanBuffer.js';
 import type { OpGroup, OpGroupOps } from './opGroupTypes.js';
-import type { Op, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
+import type { Op, OpCompileMetadata, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
 import type { OpContext } from './types.js';
 
 //#region smoo/lmao!n/metadata-injection
@@ -44,6 +44,7 @@ export function createOpMetadata(
     package_name_entry: new PreEncodedEntry(package_name, intern(package_name)),
     package_file_entry: new PreEncodedEntry(package_file, intern(package_file)),
     git_sha_entry: new PreEncodedEntry(git_sha, intern(git_sha)),
+    logTemplateIds: EMPTY_LOG_TEMPLATE_IDS,
   };
 }
 
@@ -56,6 +57,37 @@ export function createOpMetadata(
  * These are placeholder values that will be replaced at compile time.
  */
 export const DEFAULT_METADATA: OpMetadata = createOpMetadata('unknown', 'unknown', 'unknown', 'unknown', 0);
+
+const DEFAULT_COMPILE_METADATA: OpCompileMetadata = Object.freeze({
+  runtimeHint: 0,
+  logTemplateIds: EMPTY_LOG_TEMPLATE_IDS,
+});
+
+function normalizeLogTemplateIds(logTemplateIds: readonly string[]): readonly string[] {
+  const length = logTemplateIds.length;
+  if (length === 0) return EMPTY_LOG_TEMPLATE_IDS;
+  if (length > 65_535) {
+    throw new RangeError(`Op log template table exceeds the u16 ID limit: ${length}`);
+  }
+
+  const normalized = new Array<string>(length);
+  for (let index = 0; index < length; index++) {
+    const template = logTemplateIds[index];
+    if (typeof template !== 'string') {
+      throw new TypeError(`Op log template at index ${index} must be a string`);
+    }
+    normalized[index] = template;
+  }
+  return Object.freeze(normalized);
+}
+
+function normalizeCompileMetadata(compileMetadata?: OpCompileMetadata): OpCompileMetadata {
+  if (compileMetadata === undefined) return DEFAULT_COMPILE_METADATA;
+  return Object.freeze({
+    runtimeHint: compileMetadata.runtimeHint,
+    logTemplateIds: normalizeLogTemplateIds(compileMetadata.logTemplateIds),
+  });
+}
 
 // =============================================================================
 // STACK TRACE METADATA EXTRACTION
@@ -185,6 +217,7 @@ export function createDefineOp<Ctx extends OpContext>(
   name: string,
   fn: OpFn<Ctx, Args, S, E>,
   metadata?: Partial<OpMetadata>,
+  compileMetadata?: OpCompileMetadata,
 ) => Op<Ctx, Args, S, E> {
   // Why get class from schema: Class has static schema + stats shared by all instances
   const SpanBufferClass = getSpanBufferClass(factoryConfig.logSchema);
@@ -193,13 +226,21 @@ export function createDefineOp<Ctx extends OpContext>(
     name: string,
     fn: OpFn<Ctx, Args, S, E>,
     metadata?: Partial<OpMetadata>,
+    compileMetadata?: OpCompileMetadata,
   ): Op<Ctx, Args, S, E> {
+    const normalizedCompileMetadata = normalizeCompileMetadata(compileMetadata);
+
     // When transformer is not installed, extract metadata from stack trace
     // This provides useful file/line info for debugging even without build-time injection
     // skipFrames=3: Error -> extractMetadataFromStack -> defineOpImpl -> caller
     const baseMetadata = metadata?.package_file ? DEFAULT_METADATA : extractMetadataFromStack(3);
     // Use name from: 1) explicit metadata.name (transformer), 2) defineOp('name', fn), 3) baseMetadata
-    const finalMetadata = { ...baseMetadata, ...metadata, name: metadata?.name ?? name };
+    const finalMetadata: OpMetadata = {
+      ...baseMetadata,
+      ...metadata,
+      name: metadata?.name ?? name,
+      logTemplateIds: normalizedCompileMetadata.logTemplateIds,
+    };
 
     // Use the Op class which handles all span/buffer management:
     // - Creates SpanBuffer for the op
@@ -209,7 +250,14 @@ export function createDefineOp<Ctx extends OpContext>(
     // - Handles exceptions with span-exception
     // Why SpanBufferClass: All ops from same defineOpContext share this class for stats coordination
     // Why undefined for remappedViewClass: Only prefixed ops need remapping - set by .prefix() method
-    return new OpClass(finalMetadata, SpanBufferClass, fn, undefined, factoryConfig.opContextBinding);
+    return new OpClass(
+      finalMetadata,
+      SpanBufferClass,
+      fn,
+      undefined,
+      factoryConfig.opContextBinding,
+      normalizedCompileMetadata.runtimeHint,
+    );
   };
 }
 
@@ -258,20 +306,41 @@ export function createDefineOps<Ctx extends OpContext>(
   createOpGroup: CreateOpGroupFn<Ctx>,
 ): <Defs extends Record<string, Op<Ctx, unknown[], unknown, unknown> | OpFn<Ctx, unknown[], unknown, unknown>>>(
   definitions: Defs & ThisType<OpsFromRecord<Ctx, Defs>>,
+  compileMetadataByKey?: Partial<Record<keyof Defs, OpCompileMetadata>>,
 ) => OpGroup<Ctx, OpsFromRecord<Ctx, Defs>> {
   // Get the defineOp function for wrapping raw functions
   const defineOp = createDefineOp<Ctx>(factoryConfig);
 
   return function defineOpsImpl<
     Defs extends Record<string, Op<Ctx, unknown[], unknown, unknown> | OpFn<Ctx, unknown[], unknown, unknown>>,
-  >(definitions: Defs & ThisType<OpsFromRecord<Ctx, Defs>>): OpGroup<Ctx, OpsFromRecord<Ctx, Defs>> {
+  >(
+    definitions: Defs & ThisType<OpsFromRecord<Ctx, Defs>>,
+    compileMetadataByKey?: Partial<Record<keyof Defs, OpCompileMetadata>>,
+  ): OpGroup<Ctx, OpsFromRecord<Ctx, Defs>> {
     // Build the ops record by processing each definition.
     // Keep the runtime container broad, then narrow once we've populated every key.
     const ops: Record<string, Op<Ctx, unknown[], unknown, unknown>> = {};
 
     for (const name in definitions) {
       const def = definitions[name];
-      ops[name] = isOp<Ctx>(def) ? def : defineOp(name, def);
+      const compileMetadata = compileMetadataByKey?.[name];
+      if (isOp<Ctx>(def)) {
+        if (compileMetadata === undefined) {
+          ops[name] = def;
+        } else {
+          const normalizedCompileMetadata = normalizeCompileMetadata(compileMetadata);
+          ops[name] = new OpClass(
+            { ...def.metadata, logTemplateIds: normalizedCompileMetadata.logTemplateIds },
+            def.SpanBufferClass,
+            def.fn,
+            def.remappedViewClass,
+            def._opContextBinding,
+            normalizedCompileMetadata.runtimeHint,
+          );
+        }
+      } else {
+        ops[name] = defineOp(name, def, undefined, compileMetadata);
+      }
     }
 
     if (!hasAllDefinedOps(definitions, ops)) {
