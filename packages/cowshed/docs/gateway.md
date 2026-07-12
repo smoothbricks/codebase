@@ -1,50 +1,56 @@
 # cowshed-gateway
 
-The gateway is a localhost daemon that is the **only network path out of a sandboxed workspace**. For a **granted**
-egress host it terminates TLS with the workspace's own CA — reading and re-originating the request so it injects
-upstream credentials and trace context — caches registry traffic behind protocol-aware mirrors, and mirrors git
-repositories on your behalf. Secrets live only here (macOS Keychain); a workspace holds only public trust anchors, never
-a token.
+The gateway is the **only external-network path out of a sandboxed workspace**. For granted intercepted egress it
+presents a leaf signed by that workspace's CA, reads the HTTP request, then opens and verifies a separate upstream TLS
+connection. This lets it add narrowly scoped credentials and trace context without putting secrets in a workspace. The
+in-image CA certificate trusts the gateway as a server only; it is not a client identity and is never sent upstream.
+Protocol mirrors cache registry artifacts, and certificate-pinning clients can use an allowlisted opaque tunnel.
 
-Ports: `127.0.0.1:7644` is the **host control plane only** (status, audit) alongside `~/.cowshed/gateway.sock` — it
-never appears in workspace configuration. Each workspace (main included) owns a **16-port block** from a reserved range
-(default `40960–49151`), allocated at `new`/`fork`/`adopt` and recorded in the grant sidecar. The block's **base port is
-the workspace's gateway data-plane listener**: the port is the workspace's identity at the gateway, with its token
-(`.cowshed/token`) as the mandatory second factor, and each sandbox may reach only its own block — one workspace can
-never impersonate another. Ports base+1 through base+15 belong to the workspace itself, for its own dev servers (see
-cli.md).
+The host control plane is host-netns `127.0.0.1:7644` plus `~/.cowshed/gateway.sock`; neither host endpoint is reachable
+from a workspace. Linux reuses the numeric loopback address inside each private netns for a distinct data-plane
+connector; it is not the host control listener. Data-plane identity depends on the OS:
+
+- **macOS:** each workspace has a 16-port block from `40960–49151`. The gateway listener is `base`; service ports are
+  `base+1 … base+15`. Seatbelt lets the workspace connect only to its own block, so the destination listener identifies
+  the workspace.
+- **Linux:** there is no port block. A controller-owned socket at `~/.cowshed/run/gateway/<workspaceIncarnation>.sock`
+  is mounted as `/run/cowshed/gateway.sock` inside that workspace's private loopback-only network namespace. The
+  controller launches exactly one trusted minimal connector in the netns, under a controller-owned identity and
+  dedicated cgroup that workspace processes cannot signal, ptrace, inspect, or join. It binds only IPv4
+  `127.0.0.1:7644`, rejects non-loopback traffic, and copies bytes unchanged only to the mounted socket. It owns no
+  policy, token, CA key, registry credential, or upstream-network authority. There is no veth, route, DNAT, host
+  listener, or sibling-reachable loopback; socket inode plus netns, not port 7644, identifies the workspace.
+
+Every request also sends exactly `Proxy-Authorization: Bearer <opaque-token>`. The endpoint selects the workspace; the
+32-byte unpadded-base64url token is defense in depth. It is never accepted in a URL, cookie, alternate header, or query
+parameter, is compared in constant time, and is stripped before upstream forwarding. Restore rotates the token and CA,
+drains and kills the old Linux connector cgroup, closes all old gateway connections, recreates the Linux socket/netns
+connector, and atomically rewrites client wiring; a preserved macOS port therefore does not preserve authority. Detach
+drains and removes the connector/socket before releasing the netns; attach creates exactly one before admitting execs.
 
 Five jobs:
 
-1. **Registry mirrors.** Speaks the npm, cargo (sparse), and Go module proxy protocols at `/npm`, `/cargo/`, and `/go/`
-   on every workspace listener. Immutable artifacts (tarballs, `.crate` files, module zips) are cached once on
-   `~/.cowshed/caches` and served to every workspace and to main — duplicate downloads are eliminated fleet-wide.
-   Upstream credentials (private registries, GitHub Packages, private Go module hosts) are injected by the gateway;
-   workspaces never see a token. `/go` also passes the checksum database through, so `go.sum` verification works
-   unchanged — and it is how private Go modules reach a sandbox at all, since workspace git is local-only and `go`'s VCS
-   fallback has nothing to talk to. Registry access is **baseline policy**: it works in a fully closed workspace with
-   zero grants.
-2. **Repo mirrors.** Workspace git is local-paths-only — the `host` remote plus read-only bare mirrors under
-   `~/.cowshed/caches/git`. `cowshed repo mirror <url>` asks the gateway to fetch a repository upstream (Keychain
-   credentials, repo-scoped grants, one audit event) into the shared mirror; the workspace then clones from the mirror
-   path locally. There is no git protocol endpoint, no credential helper, and no `insteadOf` rewiring inside workspaces
-   — remote pushes are coordinator work, host-side.
-3. **Intercepted egress (the default for a granted host).** `cowshed grant <ws> --egress <host>` terminates TLS under
-   the workspace's CA, injects the Keychain credential for that host (if one exists) and the trace context, forwards
-   over a fresh upstream connection, and audits at request granularity. This is what gives an in-workspace agent
-   authenticated access to an arbitrary HTTPS API **without the workspace ever holding the secret** — the workspace
-   trusts the gateway's per-host leaf because the workspace's CA **certificate** (public) is an in-image trust anchor;
-   the CA **private key** never leaves the gateway.
-4. **Opaque tunnels (`--opaque`).** For a cert-pinning client or a host interception breaks,
-   `cowshed grant <ws> --egress <host> --opaque` reverts that host to a plain allowlisted CONNECT byte tunnel: no
-   injection, host-only audit. This is the fallback, not the default.
-5. **Simulator broker (`/sim/`, posture B — see ios.md).** Routes whitelisted `simctl` verbs from the in-image `xcrun`
-   wrapper to the personal session's simulator, under the `--sim` grant axis (`openurl` freely grantable; `install`
-   drop-dir-bound and human-gated). Dev-side headless simulators never touch the gateway.
+1. **Registry mirrors.** `/npm`, `/cargo/`, and `/go/` serve anonymous public npm, crates.io, the public Go proxy, and
+   checksum database as zero-grant baseline policy. Private/scoped/credentialed registries and module namespaces work
+   only when trusted policy for the current `repo_id` admits their exact origin and package/module prefix. Repository
+   config may request or further restrict a route, but cannot admit itself. Artifacts are digest-checked and cached
+   once.
+2. **Repo mirrors.** Git is local-paths-only inside workspaces. Mirror fetch is a coordinator-only control-plane action,
+   bound to the current project and its trusted repository admission. A sandbox token cannot invoke it; admission or a
+   mirror for one project grants nothing to another. Fetches use gateway-owned config and credentials, and resulting
+   bare mirrors are sandbox-readable but never sandbox-writable. Pushes remain host-side coordinator work.
+3. **Intercepted egress.** `cowshed grant <ws> --egress <host>` defaults to interception. CONNECT authority, port, TLS
+   SNI, and HTTP authority must agree before the gateway opens an upstream connection. The gateway verifies upstream
+   TLS, strips client authorization, injects only a credential whose exact origin, project, method, and normalized path
+   scope match, and audits at request granularity.
+4. **Opaque tunnels (`--opaque`).** After the same endpoint, token, CONNECT-authority/SNI, port, and grant checks, the
+   gateway forwards encrypted bytes without credentials, trace injection, or path visibility. This is for pinned or
+   incompatible clients, not the default.
+5. **Simulator broker (`/sim/`).** The only personal-session grant verbs are `openurl` (project-registered schemes) and
+   `install` (drop-directory artifact, human-gated). Personal-device `list` and `boot` remain dev-side controller
+   actions; dev-side headless simulators never use the gateway.
 
-Every decision is auditable: each request becomes one event (workspace, grant revision, kind, host/name, status, bytes,
-cache hit/miss, trace id) in the telemetry store at `~/.cowshed/telemetry/` — Arrow segments, same substrate as all
-cowshed telemetry. Read them with `cowshed audit`; there is no separate log file to find.
+Every decision is auditable in Arrow telemetry under `~/.cowshed/telemetry/`; read it with `cowshed audit`.
 
 ## Start at login (launchd)
 
@@ -61,11 +67,11 @@ login session needed). The hand-written equivalent:
 <plist version="1.0"><dict>
   <key>Label</key><string>dev.cowshed.gateway</string>
   <key>ProgramArguments</key>
-  <array><string>/Users/danny/.cargo-target/release/cowshed</string>
+  <array><string>&lt;project-root&gt;/target/release/cowshed</string>
          <string>gateway</string><string>run</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardErrorPath</key><string>/Users/danny/.cowshed/telemetry/daemon-stderr.log</string>
+  <key>StandardErrorPath</key><string>~/.cowshed/telemetry/daemon-stderr.log</string>
 </dict></plist>
 ```
 
@@ -77,79 +83,93 @@ cowshed gateway status        # -> running 4821 control 7644, 3 workspace listen
 `cowshed doctor` and `cowshed ensure` both check gateway liveness; a dead gateway is exit 5 with the kickstart command
 in the `next:` hint.
 
-## Credentials (Keychain-held, never in workspaces)
+## Credentials (credential-store-held, never in workspaces)
 
-The gateway reads secrets exclusively from the login Keychain, service-prefixed `dev.cowshed.gateway`:
+On macOS, secrets are Keychain generic passwords under service `dev.cowshed.gateway`; Linux runner storage follows the
+CI platform configuration. A valid credential binding includes protocol, exact HTTPS origin (scheme, normalized host,
+explicit port), allowed methods, normalized path/package/module prefixes, and project `repo_id` where applicable. A bare
+host-only credential is rejected.
 
-```sh
-# npm publish/install token for a private scope
-security add-generic-password -s dev.cowshed.gateway -a npm:registry.npmjs.org -w "$NPM_TOKEN"
+Credential lookup happens only after workspace endpoint and token checks, project admission, CONNECT authority/SNI and
+port agreement, method validation, and path normalization. Client `Authorization`, `Proxy-Authorization`, cookies, and
+protocol token headers are stripped first, so workspace input cannot select or override the credential. Values never
+appear in URLs, logs, telemetry, cache keys, or responses.
 
-# GitHub token, used by the gateway when mirroring private repos (cowshed repo mirror)
-security add-generic-password -s dev.cowshed.gateway -a git:github.com -w "$GITHUB_TOKEN"
-
-# private cargo registry
-security add-generic-password -s dev.cowshed.gateway -a cargo:crates.internal.example -w "$TOKEN"
-```
-
-The account field is `<protocol>:<host>`; the gateway matches on it when forwarding upstream. Rotation is a Keychain
-update — nothing inside any workspace changes, because nothing inside any workspace ever held the credential. This is
-what makes **main's image safe to clone for agents**: there is no `.env` to scrub, no token to leak. Keep it that way —
-if a tool demands a secret in a file, that's a gateway feature request, not a workspace exception.
+Redirects are not trusted continuations. Each location is normalized and re-authorized; all credentials are stripped and
+only an independently matching credential may be injected. Cross-origin redirects, TLS downgrade, method rewriting, or
+leaving the admitted prefix are returned unfollowed (mirror fills fail closed). At most five same-origin redirects are
+followed. Credential rotation is observed on next use; nothing inside a workspace changes.
 
 ## Client wiring (files, not hand-written env)
 
-Wiring is written into the image at adopt/new and re-validated by `ensure` — it travels with every clone and covers
-processes cowshed never spawned:
+Wiring is written at adopt/new/fork and revalidated by `ensure`. `portBlock` is optional and macOS-only. The exact
+registry URLs are:
 
-- bun/npm: `bunfig.toml` points `install.registry` at the workspace's own gateway base port (e.g.
-  `http://127.0.0.1:40960/npm` for a workspace whose block starts at 40960) and sets the in-image cache dir.
-- cargo: a source-replacement stanza in the in-image `.cargo/config.toml` pointing `crates-io` at
-  `sparse+http://127.0.0.1:<block-base>/cargo/`.
-- go: an in-image go env file (`.cowshed/cache/go/env`, reached via the `GOENV` export from `cowshed ensure --envrc`)
-  sets `GOPROXY=http://127.0.0.1:<block-base>/go` (no `,direct` fallback), the shared `GOMODCACHE`/`GOCACHE` on
-  `~/.cowshed/caches/go`, in-image `GOPATH`/`GOBIN`, and `GOTOOLCHAIN=local` — **`~/go` is never created**, and the
-  sandbox denies it as a tripwire so a mis-wired go invocation fails loudly instead of silently regrowing it.
-- generic: `HTTP_PROXY`/`HTTPS_PROXY` at the workspace's base port for proxy-aware tools; egress is still subject to
-  grants.
-- TLS trust anchor: the workspace's public CA cert ships in-image and cowshed points each tool family at it —
-  `SSL_CERT_FILE` (curl/OpenSSL), `NODE_EXTRA_CA_CERTS` (Node/Bun — a verification item), `GIT_SSL_CAINFO`,
-  `REQUESTS_CA_BUNDLE`, `http.cainfo` in cargo config, a generated PKCS12 truststore for the JVM (04_sandbox.md). This
-  is a public trust anchor, not a secret. macOS-native TLS (Security.framework — Swift/Xcode) ignores these and stays a
-  documented gap.
-- identity: the bearer token lives at `<mount>/.cowshed/token`; `cowshed ensure --envrc` exports `COWSHED_GATEWAY_TOKEN`
-  only until token-via-config verification lands.
+| Client                | macOS                                         | Linux                                 |
+| --------------------- | --------------------------------------------- | ------------------------------------- |
+| Bun/npm               | `http://127.0.0.1:<block-base>/npm`           | `http://127.0.0.1:7644/npm`           |
+| Cargo sparse source   | `sparse+http://127.0.0.1:<block-base>/cargo/` | `sparse+http://127.0.0.1:7644/cargo/` |
+| Go `GOPROXY`          | `http://127.0.0.1:<block-base>/go`            | `http://127.0.0.1:7644/go`            |
+| Generic HTTP(S) proxy | `http://127.0.0.1:<block-base>`               | `http://127.0.0.1:7644`               |
 
-Main gets identical wiring on its own port — your interactive `bun install` warms the same mirror cache agents read
-from.
+`HTTP_PROXY`, `HTTPS_PROXY`, and their lowercase forms use the generic base. Linux clients do **not** speak HTTP over
+the Unix socket: only the connector opens `/run/cowshed/gateway.sock`. No direct fallback is configured.
 
-## Egress allowlisting
+All requests load the token from mode-0600 configuration and send it only in `Proxy-Authorization`; no token is exported
+in a URL or proxy variable. The compatibility listener provides reachability, not identity or authority: endpoint/socket
+selection plus the token still authenticate, and gateway policy still authorizes.
 
-Three tiers, checked in order:
+The workspace's public CA certificate is installed as a server trust anchor for supported tool families. Its private key
+never enters a mount. macOS-native TLS clients that ignore configured anchors must fail or use an explicitly granted
+opaque tunnel.
 
-1. **Baseline broker policy**: the configured registry upstreams (npm, crates.io, and any scoped registries in
-   `gateway/config.json`). Available to every workspace, including fully closed ones — installs need zero grants.
-2. **Repo grants** (`cowshed grant <ws> --repo github.com/org/*`): which repositories the gateway will mirror on this
-   workspace's behalf.
-3. **Egress grants** (`cowshed grant <ws> --egress <host>`): everything else. Intercepted by default (credential + trace
-   injection, request-level audit); `--opaque` for a pass-through tunnel, `--impersonate <profile>` for a browser-shaped
-   outbound fingerprint (which suppresses injection). Stored in the workspace's grants file, enforced by the gateway
-   _immediately_ (no re-exec needed), revoked with `cowshed revoke`. Egress never inherits the registry defaults.
+Main gets identical platform wiring and warms the same validated artifact cache.
 
-Denials are visible in three places: exit 6 with a `next:` grant hint at the CLI, a denied event in the audit store, and
-`cowshed doctor`'s recent-denials summary. Sandboxed processes cannot reach the network except through their own gateway
-listener, so the allowlist is the complete egress policy — there is no second path to audit.
+## Egress and filesystem policy
 
-## Why per-workspace CA interception is safe
+Policy is monotonic. `repo_id` is stable lowercase `owner/repo`, normalized from a chosen remote URL; its binding
+records and validates that remote. Multiple identities may be bound with exactly one primary. Local-only repositories
+require an explicit identifier, and discovery may propose but never silently mint one. Effective filesystem denies are
+the canonical-path union of built-ins, trusted operator policy at `~/.cowshed/<owner>/<repo>/policy.json`, and
+repository-added denies; repository config can add protection but cannot remove or carve back earlier entries. The
+trusted path is formed from separately validated `owner` and `repo` segments—never by accepting separators, `.`, `..`,
+encoded separators, or a repository-relative path. Malformed trusted policy fails closed.
 
-Interception normally means "one machine-wide CA whose compromise breaks all TLS everywhere" — which is why a naive MITM
-proxy is a bad idea. cowshed's CA is **per workspace**: minted at `new`/`fork`, its private key kept gateway-side next
-to the grant file (never in any mount), destroyed with the workspace. A leaked key is one ephemeral workspace's traffic,
-and it lives with the gateway, which already holds every upstream credential — so it is no new trust root. That is what
-earns interception as the _default_: a granted host gets credential + trace injection with no bespoke per-service
-endpoint. (Infisical's [agent-vault](https://github.com/Infisical/agent-vault) is the machine-wide-CA version of the
-same idea; the per-workspace scope is the difference.) The interception engine (`hyper` + `rustls` + `rcgen`, dynamic
-SNI, h1+h2, streaming preserved for LLM APIs) is specified normatively in 05_gateway.md.
+A read grant opens read plus metadata/listing access only within a configured **closed-baseline external root**. Such
+roots are intentionally grantable and are distinct from immutable denies. No grant—ancestor or exact—can re-open a
+built-in, trusted-policy, or repository-added deny.
+
+Network decisions are checked in order:
+
+1. Anonymous public registry baseline.
+2. Trusted project admission for private/scoped/credentialed registry routes and coordinator-only repo mirrors.
+3. Workspace egress grants for all other destinations; intercepted by default, with explicit opaque or impersonated
+   mode.
+
+## Gateway safety limits
+
+Defaults are deliberately bounded: 32 active and 64 queued requests per workspace, 256 active and 512 queued globally,
+and 8 upstream connections per workspace+origin. Each stream direction buffers at most 1 MiB and applies backpressure;
+queue overflow returns 429. Header/read, connect, TLS, upstream-header, and idle timeouts are 10 s, 5 s, 10 s, 60 s, and
+120 s; ordinary requests stop at 15 minutes and opaque or detected streaming connections at 60 minutes.
+
+Requests are limited to an 8 KiB target, 100 headers, 16 KiB per field, 64 KiB total headers, and a 64 MiB generic body.
+Mirror artifacts may stream to 2 GiB only with declared length and digest. Ambiguous HTTP framing is rejected: no
+obs-fold, duplicate authority, repeated/conflicting content length, content-length plus transfer-encoding, invalid
+transfer coding, CONNECT body, authority mismatch, or h2 connection-specific fields. Parsed requests are reserialized,
+never relayed with client framing.
+
+The leaf LRU holds 256 entries per workspace and 4096 globally, expires entries after 24 hours, and validates hostname,
+workspace CA, validity, and remaining lifetime on use. The artifact cache evicts inactive LRU objects from a 20 GiB high
+water mark to 16 GiB; active readers/fills are pinned. Metadata is conditionally revalidated after 5 minutes. Immutable
+objects are length- and digest-verified on fill and every read, atomically committed, and deleted on corruption.
+
+## Why per-workspace CA interception is bounded
+
+The CA authenticates only the gateway's client-facing TLS server and is scoped to one workspace. The private key stays
+controller-owned outside mounts and rotates on restore; the public certificate is only a trust anchor. This limits blast
+radius without turning the CA into workspace identity or upstream authentication. The explicit costs are tool-specific
+trust wiring, opaque fallback for pinned clients, and gateway visibility into intercepted plaintext.
 
 ## Reading the audit events
 
