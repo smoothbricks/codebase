@@ -114,14 +114,14 @@ grant (14_nix.md). There are no SSH/Docker grant axes.
 
 ### Worker tools (one-use descriptor; scoped to that workspace)
 
-| Tool         | Args                                                       | Returns                                                                                    |
-| ------------ | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `bash`       | `command`, `stdin?`, `timeout?`, `background?`, `session?` | `jobId`, state, stdin metadata, `stdout`/`stderr` stream info, exit metadata when terminal |
-| `job_list`   | `state?`                                                   | numeric job ids, state, timings, trace identity, per-stream info                           |
-| `job_status` | `jobId` (numeric)                                          | state, timings, exit metadata, `stdout`/`stderr` stream info, trace identity               |
-| `job_logs`   | `jobId` (numeric), `stream?: "out" \| "err"`, `follow?`    | raw bytes from the selected backing file                                                   |
-| `checkpoint` | `label?`                                                   | label                                                                                      |
-| `push`       | `branch?`                                                  | pushed ref                                                                                 |
+| Tool         | Args                                                                                                                        | Returns                                                                                    |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `bash`       | `command`, `stdin?`, `timeout?`, `background?`, `session?`                                                                  | `jobId`, state, stdin metadata, `stdout`/`stderr` stream info, exit metadata when terminal |
+| `job_list`   | `state?`                                                                                                                    | numeric job ids, state, timings, trace identity, per-stream info                           |
+| `job_status` | `jobId` (numeric)                                                                                                           | state, timings, exit metadata, `stdout`/`stderr` stream info, trace identity               |
+| `job_logs`   | `jobId` (numeric), `stream?: "out" \| "err"`, `follow?`                                                                     | raw bytes from the selected backing file                                                   |
+| `checkpoint` | `label?`                                                                                                                    | label                                                                                      |
+| `push`       | `branch?`, `expectedWorkspaceIncarnation?`, `expectedSourceHead?`, `expectedDestinationHead?: { missing: true } \| { oid }` | source head, non-checked-out destination ref, previous destination head?                   |
 
 `bash` is the workhorse: it runs through the workspace supervisor (warm shell, 11_shell.md), honors `session` for
 stateful multi-step work, and returns the workspace-local monotonic numeric `jobId` for **every accepted exec
@@ -142,6 +142,12 @@ plus normal job/trace identity; inline bytes never enter JSON results or telemet
 `checkpoint` atomically enforces the coordinator-configured per-workspace checkpoint count and byte quotas. Quota
 exhaustion is a conflict carrying current usage and limits; it never silently prunes another checkpoint. Restore is
 coordinator-only.
+
+`push` has the same preservation and compare-and-swap semantics as `WorkspaceHandle::push` (07_api.md): it installs the
+exact fetched source head under `refs/cowshed/<ws>/heads/<branch>` in the main workspace repository/object store without
+changing the checked-out Git `main` branch, index, or working tree. Any supplied incarnation, source-head, or
+destination-head expectation mismatch maps to `Conflict` (`-32002`), leaves the destination unchanged, and retains the
+source workspace. Remote publication and workflow policy are not MCP tools.
 
 MCP JSON carries job/control metadata and separate `stdout` and `stderr` `StreamInfo` objects: each is
 `{ path, bytes, summary }`, with the deterministic bounded versioned redacted summary defined in 11_shell.md. The

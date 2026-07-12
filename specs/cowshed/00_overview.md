@@ -95,12 +95,12 @@ therefore carries npm/cargo mirrors, **per-workspace-CA TLS interception** as th
 an `--opaque` CONNECT fallback for pinned clients — 05_gateway.md), and the repo-mirror verb — no git credential broker.
 The workspace holds only public trust anchors; the CA private key stays with the gateway.
 
-The `<owner>/<repo>` pair is the primary Telos `repo_id`: lowercase `owner/repo` normalized from an explicitly selected
-remote URL, stable across machines and checkout moves. The controller records that remote binding, validates it on every
-open, permits multiple bound identities with exactly one primary, and requires an explicit `repo_id` for a local-only
-repository. Discovery may propose candidates but never silently mints or selects one. Each component is validated and
-encoded independently before path joining. Trusted project policy lives only at `~/.cowshed/<owner>/<repo>/policy.json`,
-outside every workspace and denied to sandboxes (01_storage.md).
+The `<owner>/<repo>` pair is the primary project `repo_id`: lowercase `owner/repo` normalized from an explicitly
+selected remote URL, stable across machines and checkout moves. The controller records that repository binding,
+validates it on every open, permits multiple bound identities with exactly one primary, and requires an explicit
+`repo_id` for a local-only repository. Discovery may propose candidates but never silently mints or selects one. Each
+component is validated and encoded independently before path joining. Trusted project policy lives only at
+`~/.cowshed/<owner>/<repo>/policy.json`, outside every workspace and denied to sandboxes (01_storage.md).
 
 State is derived, never stored: the workspace clones are the registry (readdir / `zfs list`), the kernel mount table is
 the attachment state (getmntinfo), the controller-owned remote binding establishes repository identity, and an
