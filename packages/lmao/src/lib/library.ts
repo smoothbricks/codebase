@@ -263,6 +263,7 @@ export function generateRemappedBufferViewClass(
     // System columns (NOT remapped - same in all buffers)
     get timestamp() { return this._buffer.timestamp; }
     get entry_type() { return this._buffer.entry_type; }
+    get _messageTemplateIds() { return this._buffer._messageTemplateIds; }
     get message_values() { return this._buffer.message_values; }
     get message_nulls() { return this._buffer.message_nulls; }
     get line_values() { return this._buffer.line_values; }

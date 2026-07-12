@@ -359,6 +359,85 @@ export type SpanContext<Ctx extends OpContext> = {
    */
   spanSync: SpanSyncFn<Ctx>;
 
+  /** @internal Transformer-only fixed-arity sync-fast span ABI. */
+  spanAuto0<S, E>(line: number, name: string, op: Op<Ctx, [], S, E>): Result<S, E> | Promise<Result<S, E>>;
+  spanAuto1<S, E, A1>(
+    line: number,
+    name: string,
+    op: Op<Ctx, [A1], S, E>,
+    a1: A1,
+  ): Result<S, E> | Promise<Result<S, E>>;
+  spanAuto2<S, E, A1, A2>(
+    line: number,
+    name: string,
+    op: Op<Ctx, [A1, A2], S, E>,
+    a1: A1,
+    a2: A2,
+  ): Result<S, E> | Promise<Result<S, E>>;
+  spanAuto3<S, E, A1, A2, A3>(
+    line: number,
+    name: string,
+    op: Op<Ctx, [A1, A2, A3], S, E>,
+    a1: A1,
+    a2: A2,
+    a3: A3,
+  ): Result<S, E> | Promise<Result<S, E>>;
+  spanAuto4<S, E, A1, A2, A3, A4>(
+    line: number,
+    name: string,
+    op: Op<Ctx, [A1, A2, A3, A4], S, E>,
+    a1: A1,
+    a2: A2,
+    a3: A3,
+    a4: A4,
+  ): Result<S, E> | Promise<Result<S, E>>;
+  spanAuto5<S, E, A1, A2, A3, A4, A5>(
+    line: number,
+    name: string,
+    op: Op<Ctx, [A1, A2, A3, A4, A5], S, E>,
+    a1: A1,
+    a2: A2,
+    a3: A3,
+    a4: A4,
+    a5: A5,
+  ): Result<S, E> | Promise<Result<S, E>>;
+  spanAuto6<S, E, A1, A2, A3, A4, A5, A6>(
+    line: number,
+    name: string,
+    op: Op<Ctx, [A1, A2, A3, A4, A5, A6], S, E>,
+    a1: A1,
+    a2: A2,
+    a3: A3,
+    a4: A4,
+    a5: A5,
+    a6: A6,
+  ): Result<S, E> | Promise<Result<S, E>>;
+  spanAuto7<S, E, A1, A2, A3, A4, A5, A6, A7>(
+    line: number,
+    name: string,
+    op: Op<Ctx, [A1, A2, A3, A4, A5, A6, A7], S, E>,
+    a1: A1,
+    a2: A2,
+    a3: A3,
+    a4: A4,
+    a5: A5,
+    a6: A6,
+    a7: A7,
+  ): Result<S, E> | Promise<Result<S, E>>;
+  spanAuto8<S, E, A1, A2, A3, A4, A5, A6, A7, A8>(
+    line: number,
+    name: string,
+    op: Op<Ctx, [A1, A2, A3, A4, A5, A6, A7, A8], S, E>,
+    a1: A1,
+    a2: A2,
+    a3: A3,
+    a4: A4,
+    a5: A5,
+    a6: A6,
+    a7: A7,
+    a8: A8,
+  ): Result<S, E> | Promise<Result<S, E>>;
+
   /**
    * Set scoped attributes that auto-propagate to all subsequent log entries.
    *

@@ -57,6 +57,7 @@ import {
   getArrowFieldName,
   walkSpanTree,
 } from './arrow/utils.js';
+import { resolveMessage } from './resolveMessage.js';
 import { ENTRY_TYPE_NAMES, SYSTEM_SCHEMA_FIELD_NAMES } from './schema/systemSchema.js';
 import { getBinaryEncoder, getEnumUtf8, getEnumValues, getSchemaType } from './schema/typeGuards.js';
 import type { LogSchema } from './schema/types.js';
@@ -592,47 +593,58 @@ function convertBuffersToTable(buffers: AnySpanBuffer[], systemColumnBuilder?: S
     vectors.push(...metadataResult.vectors);
 
     // System attribute column: message (eager category)
-    const maskTransform = undefined; // message has no masking
-    let {
-      dictionary: dictValues,
-      indices,
-      arrowIndexType,
-      nullBitmap,
-    } = buildSortedCategoryDictionary(buffers, 'message', maskTransform);
-    // Ensure dictionary has at least one entry (empty string) if no messages were written
-    if (dictValues.length === 0) {
-      dictValues = [''];
+    const messageBuilder = new DictBuilder(globalUtf8Cache);
+    for (const buf of buffers) {
+      for (let row = 0; row < buf._writeIndex; row++) {
+        const message = resolveMessage(buf, row);
+        if (message !== undefined) messageBuilder.add(message);
+      }
     }
-    // Ensure nullBitmap is all 1s (all valid) for eager column
-    if (!nullBitmap) {
-      const bitmapBytes = Math.ceil(totalRows / 8);
-      nullBitmap = new Uint8Array(bitmapBytes);
-      nullBitmap.fill(0xff);
+    let messageDict = messageBuilder.finalize(true);
+    if (messageDict.indexMap.size === 0) {
+      messageBuilder.add('');
+      messageDict = messageBuilder.finalize(true);
     }
-
-    // CRITICAL: Create ONE Dictionary type instance for field and batch data
-    // Arrow Schema validates that fields with same dictionary ID have identical type references
-    const messageDictType = dictionary(utf8(), arrowIndexType);
+    const messageIndices = new messageDict.indexArrayCtor(totalRows);
+    const messageNullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
+    let messageNullCount = 0;
+    let messageRowOffset = 0;
+    for (const buf of buffers) {
+      for (let row = 0; row < buf._writeIndex; row++) {
+        const message = resolveMessage(buf, row);
+        if (message === undefined) {
+          messageNullCount++;
+          continue;
+        }
+        const index = messageDict.indexMap.get(message);
+        if (index === undefined) {
+          throw new Error(`Message dictionary index not found for row ${row}`);
+        }
+        const rowIndex = messageRowOffset + row;
+        messageIndices[rowIndex] = index;
+        messageNullBitmap[rowIndex >>> 3] |= 1 << (rowIndex & 7);
+      }
+      messageRowOffset += buf._writeIndex;
+    }
+    const messageDictType = dictionary(utf8(), messageDict.arrowIndexType);
     fields.push('message');
-
-    const { data: messageUtf8Data, offsets: messageUtf8Offsets } = globalUtf8Cache.encodeMany(dictValues);
 
     const messageDictData = buildData({
       type: utf8(),
       offset: 0,
-      length: dictValues.length,
+      length: messageDict.indexMap.size,
       nullCount: 0,
-      valueOffsets: messageUtf8Offsets,
-      data: messageUtf8Data,
+      valueOffsets: messageDict.offsets,
+      data: messageDict.data,
     });
 
     const messageData = buildData({
       type: messageDictType,
       offset: 0,
       length: totalRows,
-      nullCount: 0, // message is eager, never null
-      data: indices,
-      nullBitmap, // Always include nullBitmap for message (even though nullCount is 0)
+      nullCount: messageNullCount,
+      data: messageIndices,
+      nullBitmap: messageNullBitmap,
       dictionary: buildColumn(messageDictData),
     });
 
@@ -1062,12 +1074,22 @@ export function convertSpanTreeToArrowTable(
     }
 
     for (const [fieldName, builder] of categoryBuilders) {
-      const col = getAllocatedStringColumn(buffer, fieldName);
       const maskTransform = categoryMaskTransforms.get(fieldName);
       const originalToMasked = categoryOriginalToMasked.get(fieldName);
       if (!originalToMasked) {
         throw new Error(`Category originalToMasked map not found for field: ${fieldName}`);
       }
+      if (fieldName === 'message') {
+        for (let row = 0; row < buffer._writeIndex; row++) {
+          const message = resolveMessage(buffer, row);
+          if (message !== undefined) {
+            originalToMasked.set(message, message);
+            builder.add(message);
+          }
+        }
+        continue;
+      }
+      const col = getAllocatedStringColumn(buffer, fieldName);
       if (col) {
         for (let i = 0; i < buffer._writeIndex; i++) {
           const originalValue = col[i];
@@ -1333,19 +1355,23 @@ function convertBuffersWithSharedDicts(
   const messageFieldType = dictionary(utf8(), messageDict.arrowIndexType, false, 5);
   const messageIndices = new messageDict.indexArrayCtor(totalRows);
   const messageNullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
+  let messageNullCount = 0;
   let messageRowOffset = 0;
   for (const buf of buffers) {
-    const col = getAllocatedStringColumn(buf, 'message');
-    if (col) {
-      for (let i = 0; i < buf._writeIndex; i++) {
-        const v = col[i];
-        const rowIdx = messageRowOffset + i;
-        if (v != null) {
-          const maskedValue = messageOriginalToMasked.get(v) ?? v;
-          messageIndices[rowIdx] = messageDict.indexMap.get(maskedValue) ?? 0;
-          messageNullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
-        }
+    for (let i = 0; i < buf._writeIndex; i++) {
+      const message = resolveMessage(buf, i);
+      if (message === undefined) {
+        messageNullCount++;
+        continue;
       }
+      const rowIdx = messageRowOffset + i;
+      const maskedValue = messageOriginalToMasked.get(message) ?? message;
+      const index = messageDict.indexMap.get(maskedValue);
+      if (index === undefined) {
+        throw new Error(`Message dictionary index not found for row ${i}`);
+      }
+      messageIndices[rowIdx] = index;
+      messageNullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
     }
     messageRowOffset += buf._writeIndex;
   }
@@ -1355,7 +1381,7 @@ function convertBuffersWithSharedDicts(
         type: messageFieldType,
         offset: 0,
         length: totalRows,
-        nullCount: 0, // message is eager, never null
+        nullCount: messageNullCount,
         data: messageIndices,
         nullBitmap: messageNullBitmap,
         dictionary: buildColumn(

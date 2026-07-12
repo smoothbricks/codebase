@@ -736,6 +736,9 @@ class WasmSpanBuffer {
     this._scopeValues = opts._scopeValues;
     this._opMetadata = opts._opMetadata;
     this._callsiteMetadata = opts._callsiteMetadata;
+    this._messageTemplateIds = opts._opMetadata.logTemplateIds.length !== 0
+      ? new Uint16Array(opts.capacity)
+      : undefined;
 
     // Initialize message array
     this._message = new Array(opts.capacity);

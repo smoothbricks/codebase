@@ -299,8 +299,13 @@ export function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferCo
        const spanId = ++globalThis.globalSpanCounter;
 ` +
       // Calculate system buffer size: timestamps (8 bytes * cap) + entry_type (1 byte * cap)
+      // and, only for template-bearing Ops, message template IDs (2 bytes * cap).
       // Align to 8 bytes so identity's BigUint64Array offset is aligned
-      `const rawSystemSize = requestedCapacity * 9;
+      `const hasMessageTemplates = opMetadata && opMetadata.logTemplateIds.length !== 0;
+       const messageTemplateOffset = (requestedCapacity * 9 + 1) & ~1;
+       const rawSystemSize = hasMessageTemplates
+         ? messageTemplateOffset + requestedCapacity * 2
+         : requestedCapacity * 9;
        const systemSize = (rawSystemSize + 7) & ~7;
        let systemBuffer;
        let identityView;
@@ -334,9 +339,12 @@ export function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferCo
           identityView.set(traceIdUtf8, 13);
         }
 ` +
-      // Create TypedArray views for timestamps and entry_type
+      // Create TypedArray views for timestamps, entry_type, and the conditional template-ID lane
       `const timestampView = new BigInt64Array(systemBuffer, 0, requestedCapacity);
        const entryTypeView = new Uint8Array(systemBuffer, requestedCapacity * 8, requestedCapacity);
+       const messageTemplateIdView = hasMessageTemplates
+         ? new Uint16Array(systemBuffer, messageTemplateOffset, requestedCapacity)
+         : undefined;
        timestampView.fill(0n);
        entryTypeView.fill(0);
 ` +
@@ -346,6 +354,7 @@ export function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferCo
        this._overflow = undefined;
        this.timestamp = timestampView;
        this.entry_type = entryTypeView;
+       this._messageTemplateIds = messageTemplateIdView;
        this._children = [];
        this._parent = isChained ? parent._parent : parent;
        this._traceRoot = traceRoot;

@@ -213,6 +213,11 @@ export type SpanLoggerImpl<T extends LogSchema> = ColumnWriter<T> & {
   warn(message: string): FluentLogEntry<T>;
   error(message: string): FluentLogEntry<T>;
   trace(message: string): FluentLogEntry<T>;
+  _infoTemplate(templateId: number): FluentLogEntry<T>;
+  _debugTemplate(templateId: number): FluentLogEntry<T>;
+  _warnTemplate(templateId: number): FluentLogEntry<T>;
+  _errorTemplate(templateId: number): FluentLogEntry<T>;
+  _traceTemplate(templateId: number): FluentLogEntry<T>;
   readonly scope: Readonly<Record<string, unknown>>;
   _setScope(attributes: ScopeUpdate<T>): void;
 };
@@ -448,6 +453,18 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       return this;
     }
 
+    _infoTemplate(templateId) {
+      this._checkOverflow();
+      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_INFO);
+      this._writeIndex = idx;
+      this._buffer._messageTemplateIds[idx] = templateId;
+      if (this._buffer.message_nulls) {
+        helpers.setNullBit(this._buffer.message_nulls, idx);
+      }
+      this._buffer.constructor.stats.totalWrites++;
+      return this;
+    }
+
     ` +
       // Write a debug log entry.
       `debug(message) {
@@ -459,6 +476,18 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
         if (this._buffer.message_nulls) {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
+      }
+      this._buffer.constructor.stats.totalWrites++;
+      return this;
+    }
+
+    _debugTemplate(templateId) {
+      this._checkOverflow();
+      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_DEBUG);
+      this._writeIndex = idx;
+      this._buffer._messageTemplateIds[idx] = templateId;
+      if (this._buffer.message_nulls) {
+        helpers.setNullBit(this._buffer.message_nulls, idx);
       }
       this._buffer.constructor.stats.totalWrites++;
       return this;
@@ -480,6 +509,18 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       return this;
     }
 
+    _warnTemplate(templateId) {
+      this._checkOverflow();
+      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_WARN);
+      this._writeIndex = idx;
+      this._buffer._messageTemplateIds[idx] = templateId;
+      if (this._buffer.message_nulls) {
+        helpers.setNullBit(this._buffer.message_nulls, idx);
+      }
+      this._buffer.constructor.stats.totalWrites++;
+      return this;
+    }
+
     ` +
       // Write an error log entry.
       `error(message) {
@@ -496,6 +537,18 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       return this;
     }
 
+    _errorTemplate(templateId) {
+      this._checkOverflow();
+      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_ERROR);
+      this._writeIndex = idx;
+      this._buffer._messageTemplateIds[idx] = templateId;
+      if (this._buffer.message_nulls) {
+        helpers.setNullBit(this._buffer.message_nulls, idx);
+      }
+      this._buffer.constructor.stats.totalWrites++;
+      return this;
+    }
+
     ` +
       // Write a trace log entry.
       `trace(message) {
@@ -507,6 +560,18 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
         if (this._buffer.message_nulls) {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
+      }
+      this._buffer.constructor.stats.totalWrites++;
+      return this;
+    }
+
+    _traceTemplate(templateId) {
+      this._checkOverflow();
+      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_TRACE);
+      this._writeIndex = idx;
+      this._buffer._messageTemplateIds[idx] = templateId;
+      if (this._buffer.message_nulls) {
+        helpers.setNullBit(this._buffer.message_nulls, idx);
       }
       this._buffer.constructor.stats.totalWrites++;
       return this;

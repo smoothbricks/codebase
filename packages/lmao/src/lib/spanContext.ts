@@ -33,13 +33,25 @@ import {
   type ScopeUpdate,
   type SpanLoggerImpl,
 } from './codegen/spanLoggerGenerator.js';
-import { Blocked } from './errors/Blocked.js';
 import type { RetryPolicy } from './errors/retry-policy.js';
 import { TransientError } from './errors/Transient.js';
 import type { RemappedViewConstructor } from './logBinding.js';
 import { Op } from './op.js';
 import type { OpContext, OpMetadata, SpanContext, SpanFn, SpanLogger, SpanSyncFn } from './opContext/types.js';
 import { Err, hasErrorCode, Ok, type Result } from './result.js';
+import {
+  isRuntimeHintAnalyzed,
+  RUNTIME_HINT_CAPABILITIES_MASK,
+  RUNTIME_HINT_DEPS,
+  RUNTIME_HINT_FF,
+  RUNTIME_HINT_FULL_CAPABILITIES,
+  RUNTIME_HINT_LOG,
+  RUNTIME_HINT_RESULT,
+  RUNTIME_HINT_SCOPE,
+  RUNTIME_HINT_SPAN,
+  RUNTIME_HINT_TAG,
+  runtimeHintInitialCapacity,
+} from './runtimeHint.js';
 import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from './schema/evaluator.js';
 import {
   ENTRY_TYPE_SPAN_ERR,
@@ -102,6 +114,7 @@ type SpanDispatchTarget<Ctx extends OpContext> = {
   readonly remappedViewClass: RemappedViewConstructor | undefined;
   readonly opMetadata: OpMetadata;
   readonly fn: SpanDispatchFn<Ctx>;
+  readonly runtimeHint: number;
 };
 
 function isOpInstance<Ctx extends OpContext>(value: unknown): value is Op<Ctx, unknown[], unknown, unknown> {
@@ -189,6 +202,7 @@ function resolveSpanTarget<Ctx extends OpContext>(
       remappedViewClass: value.remappedViewClass,
       opMetadata: value.metadata,
       fn: value.fn,
+      runtimeHint: value.runtimeHint,
     };
   }
 
@@ -201,7 +215,17 @@ function resolveSpanTarget<Ctx extends OpContext>(
     remappedViewClass: undefined,
     opMetadata: fallbackBuffer._opMetadata,
     fn: value,
+    runtimeHint: 0,
   };
+}
+
+function isSynchronousResult<S, E>(value: Result<S, E> | PromiseLike<Result<S, E>>): value is Result<S, E> {
+  return value instanceof Ok || value instanceof Err;
+}
+
+function getRetryableError<S, E>(result: Result<S, E>, attempt: number): TransientError<string, unknown> | undefined {
+  if (!(result instanceof Err) || !(result.error instanceof TransientError)) return undefined;
+  return attempt < result.error.policy.maxAttempts ? result.error : undefined;
 }
 
 // =============================================================================
@@ -332,68 +356,211 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * Execute function with retry loop for TransientError handling.
- *
- * Per plan 19-03: Op class handles retry loop internally.
- * - TransientError from op body triggers retry based on error.policy
- * - Retry respects maxAttempts from TransientError.policy
- * - span-retry entry written for each transient failure
- * - Only final result written as span-ok or span-err
- * - BlockedError returns immediately without retry
- *
- * @param buffer - SpanBuffer to write retry entries to
- * @param fn - Function to execute (may be retried)
- * @returns Final result (success, non-transient error, or exhausted transient error)
- */
-async function executeWithRetry<T extends LogSchema, S, E>(
-  buffer: SpanBuffer<T>,
-  fn: () => Result<S, E> | Promise<Result<S, E>>,
+async function executeWithRetry0<Ctx extends OpContext, S, E>(
+  buffer: SpanBuffer<Ctx['logSchema']>,
+  fn: (ctx: SpanContext<Ctx>) => Result<S, E> | Promise<Result<S, E>>,
+  ctx: SpanContext<Ctx>,
 ): Promise<Result<S, E>> {
   let attempt = 0;
-
   while (true) {
     attempt++;
+    const result = await fn(ctx);
+    if (!(result instanceof Err) || !(result.error instanceof TransientError)) return result;
+    if (attempt >= result.error.policy.maxAttempts) return result;
+    const delay = calculateDelay(result.error.policy, attempt);
+    writeRetryEntry(buffer, attempt, result.error, delay);
+    await sleep(delay);
+  }
+}
 
-    // Execute the function
-    const result = await fn();
+async function executeWithRetry1<Ctx extends OpContext, S, E, A1>(
+  buffer: SpanBuffer<Ctx['logSchema']>,
+  fn: (ctx: SpanContext<Ctx>, a1: A1) => Result<S, E> | Promise<Result<S, E>>,
+  ctx: SpanContext<Ctx>,
+  a1: A1,
+): Promise<Result<S, E>> {
+  let attempt = 0;
+  while (true) {
+    attempt++;
+    const result = await fn(ctx, a1);
+    if (!(result instanceof Err) || !(result.error instanceof TransientError)) return result;
+    if (attempt >= result.error.policy.maxAttempts) return result;
+    const delay = calculateDelay(result.error.policy, attempt);
+    writeRetryEntry(buffer, attempt, result.error, delay);
+    await sleep(delay);
+  }
+}
 
-    // Success - return immediately
-    if (result instanceof Ok) {
-      return result;
-    }
+async function executeWithRetry2<Ctx extends OpContext, S, E, A1, A2>(
+  buffer: SpanBuffer<Ctx['logSchema']>,
+  fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2) => Result<S, E> | Promise<Result<S, E>>,
+  ctx: SpanContext<Ctx>,
+  a1: A1,
+  a2: A2,
+): Promise<Result<S, E>> {
+  let attempt = 0;
+  while (true) {
+    attempt++;
+    const result = await fn(ctx, a1, a2);
+    if (!(result instanceof Err) || !(result.error instanceof TransientError)) return result;
+    if (attempt >= result.error.policy.maxAttempts) return result;
+    const delay = calculateDelay(result.error.policy, attempt);
+    writeRetryEntry(buffer, attempt, result.error, delay);
+    await sleep(delay);
+  }
+}
 
-    // Error result - check error type for retry behavior
-    const error = (result as Err<E>).error;
+async function executeWithRetry3<Ctx extends OpContext, S, E, A1, A2, A3>(
+  buffer: SpanBuffer<Ctx['logSchema']>,
+  fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3) => Result<S, E> | Promise<Result<S, E>>,
+  ctx: SpanContext<Ctx>,
+  a1: A1,
+  a2: A2,
+  a3: A3,
+): Promise<Result<S, E>> {
+  let attempt = 0;
+  while (true) {
+    attempt++;
+    const result = await fn(ctx, a1, a2, a3);
+    if (!(result instanceof Err) || !(result.error instanceof TransientError)) return result;
+    if (attempt >= result.error.policy.maxAttempts) return result;
+    const delay = calculateDelay(result.error.policy, attempt);
+    writeRetryEntry(buffer, attempt, result.error, delay);
+    await sleep(delay);
+  }
+}
 
-    // BlockedError - return immediately, no retry
-    if (error instanceof Blocked) {
-      return result;
-    }
+async function executeWithRetry4<Ctx extends OpContext, S, E, A1, A2, A3, A4>(
+  buffer: SpanBuffer<Ctx['logSchema']>,
+  fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4) => Result<S, E> | Promise<Result<S, E>>,
+  ctx: SpanContext<Ctx>,
+  a1: A1,
+  a2: A2,
+  a3: A3,
+  a4: A4,
+): Promise<Result<S, E>> {
+  let attempt = 0;
+  while (true) {
+    attempt++;
+    const result = await fn(ctx, a1, a2, a3, a4);
+    if (!(result instanceof Err) || !(result.error instanceof TransientError)) return result;
+    if (attempt >= result.error.policy.maxAttempts) return result;
+    const delay = calculateDelay(result.error.policy, attempt);
+    writeRetryEntry(buffer, attempt, result.error, delay);
+    await sleep(delay);
+  }
+}
 
-    // TransientError - check if we should retry
-    if (error instanceof TransientError) {
-      const { policy } = error;
+async function executeWithRetry5<Ctx extends OpContext, S, E, A1, A2, A3, A4, A5>(
+  buffer: SpanBuffer<Ctx['logSchema']>,
+  fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4, a5: A5) => Result<S, E> | Promise<Result<S, E>>,
+  ctx: SpanContext<Ctx>,
+  a1: A1,
+  a2: A2,
+  a3: A3,
+  a4: A4,
+  a5: A5,
+): Promise<Result<S, E>> {
+  let attempt = 0;
+  while (true) {
+    attempt++;
+    const result = await fn(ctx, a1, a2, a3, a4, a5);
+    if (!(result instanceof Err) || !(result.error instanceof TransientError)) return result;
+    if (attempt >= result.error.policy.maxAttempts) return result;
+    const delay = calculateDelay(result.error.policy, attempt);
+    writeRetryEntry(buffer, attempt, result.error, delay);
+    await sleep(delay);
+  }
+}
 
-      // Check attempt limit (maxAttempts includes initial attempt)
-      if (attempt >= policy.maxAttempts) {
-        // Exhausted - return final error
-        return result;
-      }
+async function executeWithRetry6<Ctx extends OpContext, S, E, A1, A2, A3, A4, A5, A6>(
+  buffer: SpanBuffer<Ctx['logSchema']>,
+  fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4, a5: A5, a6: A6) => Result<S, E> | Promise<Result<S, E>>,
+  ctx: SpanContext<Ctx>,
+  a1: A1,
+  a2: A2,
+  a3: A3,
+  a4: A4,
+  a5: A5,
+  a6: A6,
+): Promise<Result<S, E>> {
+  let attempt = 0;
+  while (true) {
+    attempt++;
+    const result = await fn(ctx, a1, a2, a3, a4, a5, a6);
+    if (!(result instanceof Err) || !(result.error instanceof TransientError)) return result;
+    if (attempt >= result.error.policy.maxAttempts) return result;
+    const delay = calculateDelay(result.error.policy, attempt);
+    writeRetryEntry(buffer, attempt, result.error, delay);
+    await sleep(delay);
+  }
+}
 
-      // Calculate delay based on policy and attempt number
-      const delay = calculateDelay(policy, attempt);
+async function executeWithRetry7<Ctx extends OpContext, S, E, A1, A2, A3, A4, A5, A6, A7>(
+  buffer: SpanBuffer<Ctx['logSchema']>,
+  fn: (
+    ctx: SpanContext<Ctx>,
+    a1: A1,
+    a2: A2,
+    a3: A3,
+    a4: A4,
+    a5: A5,
+    a6: A6,
+    a7: A7,
+  ) => Result<S, E> | Promise<Result<S, E>>,
+  ctx: SpanContext<Ctx>,
+  a1: A1,
+  a2: A2,
+  a3: A3,
+  a4: A4,
+  a5: A5,
+  a6: A6,
+  a7: A7,
+): Promise<Result<S, E>> {
+  let attempt = 0;
+  while (true) {
+    attempt++;
+    const result = await fn(ctx, a1, a2, a3, a4, a5, a6, a7);
+    if (!(result instanceof Err) || !(result.error instanceof TransientError)) return result;
+    if (attempt >= result.error.policy.maxAttempts) return result;
+    const delay = calculateDelay(result.error.policy, attempt);
+    writeRetryEntry(buffer, attempt, result.error, delay);
+    await sleep(delay);
+  }
+}
 
-      // Write span-retry entry to buffer for observability
-      writeRetryEntry(buffer, attempt, error, delay);
-
-      // Wait before retry
-      await sleep(delay);
-      continue;
-    }
-
-    // Non-transient error - return immediately
-    return result;
+async function executeWithRetry8<Ctx extends OpContext, S, E, A1, A2, A3, A4, A5, A6, A7, A8>(
+  buffer: SpanBuffer<Ctx['logSchema']>,
+  fn: (
+    ctx: SpanContext<Ctx>,
+    a1: A1,
+    a2: A2,
+    a3: A3,
+    a4: A4,
+    a5: A5,
+    a6: A6,
+    a7: A7,
+    a8: A8,
+  ) => Result<S, E> | Promise<Result<S, E>>,
+  ctx: SpanContext<Ctx>,
+  a1: A1,
+  a2: A2,
+  a3: A3,
+  a4: A4,
+  a5: A5,
+  a6: A6,
+  a7: A7,
+  a8: A8,
+): Promise<Result<S, E>> {
+  let attempt = 0;
+  while (true) {
+    attempt++;
+    const result = await fn(ctx, a1, a2, a3, a4, a5, a6, a7, a8);
+    if (!(result instanceof Err) || !(result.error instanceof TransientError)) return result;
+    if (attempt >= result.error.policy.maxAttempts) return result;
+    const delay = calculateDelay(result.error.policy, attempt);
+    writeRetryEntry(buffer, attempt, result.error, delay);
+    await sleep(delay);
   }
 }
 //#endregion smoo/lmao!n/op-retry.loop
@@ -466,6 +633,7 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
     SpanBufferClass: SpanBufferConstructor,
     remappedViewClass: import('./logBinding.js').RemappedViewConstructor | undefined,
     opMetadata: import('./opContext/opTypes.js').OpMetadata,
+    runtimeHint?: number,
   ): SpanContextInstance<Ctx>;
   _spanException(buffer: SpanBuffer<Ctx['logSchema']>, error: unknown): void;
 
@@ -479,6 +647,7 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
     remappedViewClass: RemappedViewConstructor | undefined,
     opMetadata: OpMetadata,
     fn: (ctx: SpanContext<Ctx>) => Result<S, E>,
+    runtimeHint?: number,
   ): Result<S, E>;
   span0<S, E>(
     line: number,
@@ -488,6 +657,7 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
     remappedViewClass: import('./logBinding.js').RemappedViewConstructor | undefined,
     opMetadata: import('./opContext/opTypes.js').OpMetadata,
     fn: (ctx: SpanContext<Ctx>) => Result<S, E> | Promise<Result<S, E>>,
+    runtimeHint?: number,
   ): Promise<Result<S, E>>;
   span1<S, E, A1>(
     line: number,
@@ -498,6 +668,7 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
     opMetadata: OpMetadata,
     fn: (ctx: SpanContext<Ctx>, a1: A1) => Result<S, E> | Promise<Result<S, E>>,
     a1: A1,
+    runtimeHint?: number,
   ): Promise<Result<S, E>>;
   span2<S, E, A1, A2>(
     line: number,
@@ -509,6 +680,7 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
     fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2) => Result<S, E> | Promise<Result<S, E>>,
     a1: A1,
     a2: A2,
+    runtimeHint?: number,
   ): Promise<Result<S, E>>;
   span3<S, E, A1, A2, A3>(
     line: number,
@@ -521,6 +693,7 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
     a1: A1,
     a2: A2,
     a3: A3,
+    runtimeHint?: number,
   ): Promise<Result<S, E>>;
   span4<S, E, A1, A2, A3, A4>(
     line: number,
@@ -534,6 +707,7 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
     a2: A2,
     a3: A3,
     a4: A4,
+    runtimeHint?: number,
   ): Promise<Result<S, E>>;
   span5<S, E, A1, A2, A3, A4, A5>(
     line: number,
@@ -548,6 +722,7 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
     a3: A3,
     a4: A4,
     a5: A5,
+    runtimeHint?: number,
   ): Promise<Result<S, E>>;
   span6<S, E, A1, A2, A3, A4, A5, A6>(
     line: number,
@@ -563,6 +738,7 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
     a4: A4,
     a5: A5,
     a6: A6,
+    runtimeHint?: number,
   ): Promise<Result<S, E>>;
   span7<S, E, A1, A2, A3, A4, A5, A6, A7>(
     line: number,
@@ -588,6 +764,7 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
     a5: A5,
     a6: A6,
     a7: A7,
+    runtimeHint?: number,
   ): Promise<Result<S, E>>;
   span8<S, E, A1, A2, A3, A4, A5, A6, A7, A8>(
     line: number,
@@ -615,6 +792,7 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
     a6: A6,
     a7: A7,
     a8: A8,
+    runtimeHint?: number,
   ): Promise<Result<S, E, Ctx['logSchema']>>;
 };
 //#endregion smoo/lmao!n/spancontext-type
@@ -764,6 +942,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
               target.remappedViewClass,
               target.opMetadata,
               target.fn,
+              target.runtimeHint,
             );
           case 1:
             return self.span1(
@@ -775,6 +954,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
               target.opMetadata,
               target.fn,
               arguments[fnIdx + 1],
+              target.runtimeHint,
             );
           case 2:
             return self.span2(
@@ -787,6 +967,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
               target.fn,
               arguments[fnIdx + 1],
               arguments[fnIdx + 2],
+              target.runtimeHint,
             );
           case 3:
             return self.span3(
@@ -800,6 +981,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
               arguments[fnIdx + 1],
               arguments[fnIdx + 2],
               arguments[fnIdx + 3],
+              target.runtimeHint,
             );
           case 4:
             return self.span4(
@@ -814,6 +996,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
               arguments[fnIdx + 2],
               arguments[fnIdx + 3],
               arguments[fnIdx + 4],
+              target.runtimeHint,
             );
           case 5:
             return self.span5(
@@ -829,6 +1012,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
               arguments[fnIdx + 3],
               arguments[fnIdx + 4],
               arguments[fnIdx + 5],
+              target.runtimeHint,
             );
           case 6:
             return self.span6(
@@ -845,6 +1029,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
               arguments[fnIdx + 4],
               arguments[fnIdx + 5],
               arguments[fnIdx + 6],
+              target.runtimeHint,
             );
           case 7:
             return self.span7(
@@ -862,6 +1047,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
               arguments[fnIdx + 5],
               arguments[fnIdx + 6],
               arguments[fnIdx + 7],
+              target.runtimeHint,
             );
           case 8:
             return self.span8(
@@ -880,6 +1066,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
               arguments[fnIdx + 6],
               arguments[fnIdx + 7],
               arguments[fnIdx + 8],
+              target.runtimeHint,
             );
           default:
             throw new Error(`span() supports up to 8 arguments, got ${argCount}`);
@@ -995,6 +1182,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
       remappedViewClass: RemappedViewConstructor | undefined,
       opMetadata: OpMetadata,
+      runtimeHint = 0,
     ): SpanContextInstance<Ctx> {
       // Get Op's schema for cross-library calls (child may have different schema than parent)
       const childSchema = SpanBufferClass.schema;
@@ -1005,7 +1193,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
         this._buffer, // parentBuffer
         this._buffer._opMetadata, // callsiteMetadata - WHO called span() (for row 0)
         opMetadata, // opMetadata - WHICH op is executing (for rows 1+)
-        undefined, // capacity - use default
+        runtimeHintInitialCapacity(runtimeHint),
         childSchema, // schema - Op's schema for correct tag methods
       );
       if (!isSpanBufferForSchema(createdBuffer, childSchema)) {
@@ -1025,225 +1213,241 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
       // Write line number to row 0 (line() takes pos and value)
       childBuffer.line(0, line);
-      const childLogger = createSpanLogger(childSchema, childBuffer);
-      const childTagAPI = createTagWriter(childSchema, childBuffer);
 
-      // Cast to impl for property assignment
       const ctx = childCtx;
-
-      // ═══════════════════════════════════════════════════════════════════
-      // PROPERTY ASSIGNMENT ORDER: HOT → COLD (V8 in-object slots optimization)
-      // First ~10-12 properties get fast in-object slots per spec
-      // ═══════════════════════════════════════════════════════════════════
-
-      // SLOT 1-4: HOTTEST - accessed on every span operation
       ctx._buffer = childBuffer;
-      ctx._spanLogger = childLogger;
-      ctx.tag = childTagAPI;
-      ctx.log = childLogger;
-
-      // SLOT 5-7: HOT - reserved keys copied from parent for O(1) access
-      ctx.deps = this.deps;
-      // Create child-bound FF evaluator so flag access logs to child buffer
-      // If no evaluator (ff is EMPTY_SCOPE), just copy the reference
-      ctx.ff = this.ff.forContext ? this.ff.forContext(ctx) : this.ff;
-      // Note: user-defined extras (env, requestId, etc.) inherited via prototype chain
-
-      // SLOT 8-11: WARM - function properties (created per-context for destructuring)
-      // Regular functions close over local variables directly - no property lookups
-      const childSpan: SpanFn<Ctx> = function span(
-        nameOrLine: string | number,
-        _arg1?: unknown,
-        _arg2?: unknown,
-        _arg3?: unknown,
-        _arg4?: unknown,
-        _arg5?: unknown,
-        _arg6?: unknown,
-        _arg7?: unknown,
-        _arg8?: unknown,
-        _arg9?: unknown,
-        _arg10?: unknown,
-        _arg11?: unknown,
-      ): Promise<Result<unknown, unknown>> {
-        const len = arguments.length;
-        const hasLine = typeof nameOrLine === 'number';
-        const spanLine = hasLine ? nameOrLine : 0;
-        const spanName = hasLine ? readStringArgument(arguments, 1, 'span name') : nameOrLine;
-        const checkIdx = hasLine ? 2 : 1;
-        const maybeOverrides = arguments[checkIdx];
-        const hasOverrides =
-          maybeOverrides !== null &&
-          typeof maybeOverrides === 'object' &&
-          !(maybeOverrides instanceof Op) &&
-          typeof maybeOverrides !== 'function';
-        const fnIdx = checkIdx + (hasOverrides ? 1 : 0);
-        const target = resolveSpanTarget<Ctx>(arguments[fnIdx], childBuffer);
-
-        // Create child context - use _newCtx0 or _newCtx1 based on overrides
-        const newChildCtx = hasOverrides ? ctx._newCtx1(maybeOverrides) : ctx._newCtx0();
-        const argCount = len - fnIdx - 1;
-        switch (argCount) {
-          case 0:
-            return ctx.span0(
-              spanLine,
-              spanName,
-              newChildCtx,
-              target.SpanBufferClass,
-              target.remappedViewClass,
-              target.opMetadata,
-              target.fn,
-            );
-          case 1:
-            return ctx.span1(
-              spanLine,
-              spanName,
-              newChildCtx,
-              target.SpanBufferClass,
-              target.remappedViewClass,
-              target.opMetadata,
-              target.fn,
-              arguments[fnIdx + 1],
-            );
-          case 2:
-            return ctx.span2(
-              spanLine,
-              spanName,
-              newChildCtx,
-              target.SpanBufferClass,
-              target.remappedViewClass,
-              target.opMetadata,
-              target.fn,
-              arguments[fnIdx + 1],
-              arguments[fnIdx + 2],
-            );
-          case 3:
-            return ctx.span3(
-              spanLine,
-              spanName,
-              newChildCtx,
-              target.SpanBufferClass,
-              target.remappedViewClass,
-              target.opMetadata,
-              target.fn,
-              arguments[fnIdx + 1],
-              arguments[fnIdx + 2],
-              arguments[fnIdx + 3],
-            );
-          case 4:
-            return ctx.span4(
-              spanLine,
-              spanName,
-              newChildCtx,
-              target.SpanBufferClass,
-              target.remappedViewClass,
-              target.opMetadata,
-              target.fn,
-              arguments[fnIdx + 1],
-              arguments[fnIdx + 2],
-              arguments[fnIdx + 3],
-              arguments[fnIdx + 4],
-            );
-          case 5:
-            return ctx.span5(
-              spanLine,
-              spanName,
-              newChildCtx,
-              target.SpanBufferClass,
-              target.remappedViewClass,
-              target.opMetadata,
-              target.fn,
-              arguments[fnIdx + 1],
-              arguments[fnIdx + 2],
-              arguments[fnIdx + 3],
-              arguments[fnIdx + 4],
-              arguments[fnIdx + 5],
-            );
-          case 6:
-            return ctx.span6(
-              spanLine,
-              spanName,
-              newChildCtx,
-              target.SpanBufferClass,
-              target.remappedViewClass,
-              target.opMetadata,
-              target.fn,
-              arguments[fnIdx + 1],
-              arguments[fnIdx + 2],
-              arguments[fnIdx + 3],
-              arguments[fnIdx + 4],
-              arguments[fnIdx + 5],
-              arguments[fnIdx + 6],
-            );
-          case 7:
-            return ctx.span7(
-              spanLine,
-              spanName,
-              newChildCtx,
-              target.SpanBufferClass,
-              target.remappedViewClass,
-              target.opMetadata,
-              target.fn,
-              arguments[fnIdx + 1],
-              arguments[fnIdx + 2],
-              arguments[fnIdx + 3],
-              arguments[fnIdx + 4],
-              arguments[fnIdx + 5],
-              arguments[fnIdx + 6],
-              arguments[fnIdx + 7],
-            );
-          case 8:
-            return ctx.span8(
-              spanLine,
-              spanName,
-              newChildCtx,
-              target.SpanBufferClass,
-              target.remappedViewClass,
-              target.opMetadata,
-              target.fn,
-              arguments[fnIdx + 1],
-              arguments[fnIdx + 2],
-              arguments[fnIdx + 3],
-              arguments[fnIdx + 4],
-              arguments[fnIdx + 5],
-              arguments[fnIdx + 6],
-              arguments[fnIdx + 7],
-              arguments[fnIdx + 8],
-            );
-          default:
-            throw new Error(`span() supports up to 8 arguments, got ${argCount}`);
-        }
-      };
-      ctx.span = childSpan;
-
-      ctx.spanSync = function spanSync<S, E>(
-        name: string,
-        fn: (syncCtx: SpanContext<Ctx>) => Result<S, E>,
-      ): Result<S, E> {
-        const newChildCtx = ctx._newCtx0();
-        return ctx.spanSync0(
-          0,
-          name,
-          newChildCtx,
-          getBufferConstructor(childBuffer),
-          undefined,
-          childBuffer._opMetadata,
-          fn,
-        );
-      };
-
-      ctx.ok = function ok<V>(value: V): Ok<V, Ctx['logSchema']> {
-        return new Ok<V, Ctx['logSchema']>(value, childSchema, childBuffer);
-      };
-      ctx.err = function err<E>(error: E): Err<E, Ctx['logSchema']> {
-        return new Err<E, Ctx['logSchema']>(error, childSchema, childBuffer);
-      };
-      ctx.setScope = function setScope(attributes: ScopeUpdate<Ctx['logSchema']> | null): void {
-        childLogger._setScope(attributes ?? {});
-      };
-
-      // SLOT 12+: COLD - internal/rarely accessed
       ctx._schema = childSchema;
       ctx._logBinding = logBinding;
+
+      const capabilities = isRuntimeHintAnalyzed(runtimeHint)
+        ? runtimeHint & RUNTIME_HINT_CAPABILITIES_MASK
+        : RUNTIME_HINT_FULL_CAPABILITIES;
+      const needsLogger =
+        (capabilities & RUNTIME_HINT_LOG) !== 0 ||
+        (capabilities & RUNTIME_HINT_FF) !== 0 ||
+        (capabilities & RUNTIME_HINT_SCOPE) !== 0;
+      const childLogger = needsLogger ? createSpanLogger(childSchema, childBuffer) : undefined;
+      if (childLogger) {
+        ctx._spanLogger = childLogger;
+      }
+      if ((capabilities & RUNTIME_HINT_LOG) !== 0 && childLogger) {
+        ctx.log = childLogger;
+      }
+      if ((capabilities & RUNTIME_HINT_TAG) !== 0) {
+        ctx.tag = createTagWriter(childSchema, childBuffer);
+      }
+      if ((capabilities & RUNTIME_HINT_DEPS) !== 0) {
+        ctx.deps = this.deps;
+      }
+      if ((capabilities & RUNTIME_HINT_FF) !== 0 && childLogger) {
+        ctx.log = childLogger;
+        ctx.ff = this.ff.forContext ? this.ff.forContext(ctx) : this.ff;
+      }
+
+      if ((capabilities & RUNTIME_HINT_SPAN) !== 0) {
+        const childSpan: SpanFn<Ctx> = function span(
+          nameOrLine: string | number,
+          _arg1?: unknown,
+          _arg2?: unknown,
+          _arg3?: unknown,
+          _arg4?: unknown,
+          _arg5?: unknown,
+          _arg6?: unknown,
+          _arg7?: unknown,
+          _arg8?: unknown,
+          _arg9?: unknown,
+          _arg10?: unknown,
+          _arg11?: unknown,
+        ): Promise<Result<unknown, unknown>> {
+          const len = arguments.length;
+          const hasLine = typeof nameOrLine === 'number';
+          const spanLine = hasLine ? nameOrLine : 0;
+          const spanName = hasLine ? readStringArgument(arguments, 1, 'span name') : nameOrLine;
+          const checkIdx = hasLine ? 2 : 1;
+          const maybeOverrides = arguments[checkIdx];
+          const hasOverrides =
+            maybeOverrides !== null &&
+            typeof maybeOverrides === 'object' &&
+            !(maybeOverrides instanceof Op) &&
+            typeof maybeOverrides !== 'function';
+          const fnIdx = checkIdx + (hasOverrides ? 1 : 0);
+          const target = resolveSpanTarget<Ctx>(arguments[fnIdx], childBuffer);
+
+          // Create child context - use _newCtx0 or _newCtx1 based on overrides
+          const newChildCtx = hasOverrides ? ctx._newCtx1(maybeOverrides) : ctx._newCtx0();
+          const argCount = len - fnIdx - 1;
+          switch (argCount) {
+            case 0:
+              return ctx.span0(
+                spanLine,
+                spanName,
+                newChildCtx,
+                target.SpanBufferClass,
+                target.remappedViewClass,
+                target.opMetadata,
+                target.fn,
+                target.runtimeHint,
+              );
+            case 1:
+              return ctx.span1(
+                spanLine,
+                spanName,
+                newChildCtx,
+                target.SpanBufferClass,
+                target.remappedViewClass,
+                target.opMetadata,
+                target.fn,
+                arguments[fnIdx + 1],
+                target.runtimeHint,
+              );
+            case 2:
+              return ctx.span2(
+                spanLine,
+                spanName,
+                newChildCtx,
+                target.SpanBufferClass,
+                target.remappedViewClass,
+                target.opMetadata,
+                target.fn,
+                arguments[fnIdx + 1],
+                arguments[fnIdx + 2],
+                target.runtimeHint,
+              );
+            case 3:
+              return ctx.span3(
+                spanLine,
+                spanName,
+                newChildCtx,
+                target.SpanBufferClass,
+                target.remappedViewClass,
+                target.opMetadata,
+                target.fn,
+                arguments[fnIdx + 1],
+                arguments[fnIdx + 2],
+                arguments[fnIdx + 3],
+                target.runtimeHint,
+              );
+            case 4:
+              return ctx.span4(
+                spanLine,
+                spanName,
+                newChildCtx,
+                target.SpanBufferClass,
+                target.remappedViewClass,
+                target.opMetadata,
+                target.fn,
+                arguments[fnIdx + 1],
+                arguments[fnIdx + 2],
+                arguments[fnIdx + 3],
+                arguments[fnIdx + 4],
+                target.runtimeHint,
+              );
+            case 5:
+              return ctx.span5(
+                spanLine,
+                spanName,
+                newChildCtx,
+                target.SpanBufferClass,
+                target.remappedViewClass,
+                target.opMetadata,
+                target.fn,
+                arguments[fnIdx + 1],
+                arguments[fnIdx + 2],
+                arguments[fnIdx + 3],
+                arguments[fnIdx + 4],
+                arguments[fnIdx + 5],
+                target.runtimeHint,
+              );
+            case 6:
+              return ctx.span6(
+                spanLine,
+                spanName,
+                newChildCtx,
+                target.SpanBufferClass,
+                target.remappedViewClass,
+                target.opMetadata,
+                target.fn,
+                arguments[fnIdx + 1],
+                arguments[fnIdx + 2],
+                arguments[fnIdx + 3],
+                arguments[fnIdx + 4],
+                arguments[fnIdx + 5],
+                arguments[fnIdx + 6],
+                target.runtimeHint,
+              );
+            case 7:
+              return ctx.span7(
+                spanLine,
+                spanName,
+                newChildCtx,
+                target.SpanBufferClass,
+                target.remappedViewClass,
+                target.opMetadata,
+                target.fn,
+                arguments[fnIdx + 1],
+                arguments[fnIdx + 2],
+                arguments[fnIdx + 3],
+                arguments[fnIdx + 4],
+                arguments[fnIdx + 5],
+                arguments[fnIdx + 6],
+                arguments[fnIdx + 7],
+                target.runtimeHint,
+              );
+            case 8:
+              return ctx.span8(
+                spanLine,
+                spanName,
+                newChildCtx,
+                target.SpanBufferClass,
+                target.remappedViewClass,
+                target.opMetadata,
+                target.fn,
+                arguments[fnIdx + 1],
+                arguments[fnIdx + 2],
+                arguments[fnIdx + 3],
+                arguments[fnIdx + 4],
+                arguments[fnIdx + 5],
+                arguments[fnIdx + 6],
+                arguments[fnIdx + 7],
+                arguments[fnIdx + 8],
+                target.runtimeHint,
+              );
+            default:
+              throw new Error(`span() supports up to 8 arguments, got ${argCount}`);
+          }
+        };
+        ctx.span = childSpan;
+
+        ctx.spanSync = function spanSync<S, E>(
+          name: string,
+          fn: (syncCtx: SpanContext<Ctx>) => Result<S, E>,
+        ): Result<S, E> {
+          const newChildCtx = ctx._newCtx0();
+          return ctx.spanSync0(
+            0,
+            name,
+            newChildCtx,
+            getBufferConstructor(childBuffer),
+            undefined,
+            childBuffer._opMetadata,
+            fn,
+          );
+        };
+      }
+
+      if ((capabilities & RUNTIME_HINT_RESULT) !== 0) {
+        ctx.ok = function ok<V>(value: V): Ok<V, Ctx['logSchema']> {
+          return new Ok<V, Ctx['logSchema']>(value, childSchema, childBuffer);
+        };
+        ctx.err = function err<E>(error: E): Err<E, Ctx['logSchema']> {
+          return new Err<E, Ctx['logSchema']>(error, childSchema, childBuffer);
+        };
+      }
+      if ((capabilities & RUNTIME_HINT_SCOPE) !== 0 && childLogger) {
+        ctx.setScope = function setScope(attributes: ScopeUpdate<Ctx['logSchema']> | null): void {
+          childLogger._setScope(attributes ?? {});
+        };
+      }
 
       return ctx;
     }
@@ -1266,6 +1470,581 @@ export function createSpanContextClass<Ctx extends OpContext>(
     }
     //#endregion smoo/lmao!n/lmao-entry-span-lifecycle-entry-types.exception
 
+    private _spanAutoPre<Args extends unknown[], S, E>(
+      line: number,
+      name: string,
+      op: Op<Ctx, Args, S, E>,
+    ): SpanContextInstance<Ctx> {
+      const child: unknown = Object.create(this);
+      if (!isSpanContextInstance<Ctx>(child)) {
+        throw new TypeError('Failed to create child span context');
+      }
+      return this._spanPre(child, line, name, op.SpanBufferClass, op.remappedViewClass, op.metadata, op.runtimeHint);
+    }
+
+    spanAuto0<S, E>(line: number, name: string, op: Op<Ctx, [], S, E>): Result<S, E> | Promise<Result<S, E>> {
+      const ctx = this._spanAutoPre(line, name, op);
+      const buffer = ctx._buffer;
+      buffer._traceRoot.tracer.onSpanStart(buffer);
+      let isAsync = false;
+      try {
+        const result = op.fn(ctx);
+        if (!isSynchronousResult(result) || getRetryableError(result, 1) !== undefined) {
+          isAsync = true;
+          return this._spanAutoAsync0(ctx, buffer, op, result);
+        }
+        writeSpanEnd(buffer, result);
+        return result;
+      } catch (error) {
+        this._spanException(buffer, error);
+        throw error;
+      } finally {
+        if (!isAsync) {
+          buffer._traceRoot.tracer.onSpanEnd(buffer);
+        }
+      }
+    }
+
+    private async _spanAutoAsync0<S, E>(
+      ctx: SpanContextInstance<Ctx>,
+      buffer: SpanBuffer<Ctx['logSchema']>,
+      op: Op<Ctx, [], S, E>,
+      first: Result<S, E> | PromiseLike<Result<S, E>>,
+    ): Promise<Result<S, E>> {
+      try {
+        let attempt = 1;
+        let result = await first;
+        while (true) {
+          const retryError = getRetryableError(result, attempt);
+          if (!retryError) break;
+          const delay = calculateDelay(retryError.policy, attempt);
+          writeRetryEntry(buffer, attempt, retryError, delay);
+          await sleep(delay);
+          attempt++;
+          result = await op.fn(ctx);
+        }
+        writeSpanEnd(buffer, result);
+        return result;
+      } catch (error) {
+        this._spanException(buffer, error);
+        throw error;
+      } finally {
+        buffer._traceRoot.tracer.onSpanEnd(buffer);
+      }
+    }
+
+    spanAuto1<S, E, A1>(
+      line: number,
+      name: string,
+      op: Op<Ctx, [A1], S, E>,
+      a1: A1,
+    ): Result<S, E> | Promise<Result<S, E>> {
+      const ctx = this._spanAutoPre(line, name, op);
+      const buffer = ctx._buffer;
+      buffer._traceRoot.tracer.onSpanStart(buffer);
+      let isAsync = false;
+      try {
+        const result = op.fn(ctx, a1);
+        if (!isSynchronousResult(result) || getRetryableError(result, 1) !== undefined) {
+          isAsync = true;
+          return this._spanAutoAsync1(ctx, buffer, op, result, a1);
+        }
+        writeSpanEnd(buffer, result);
+        return result;
+      } catch (error) {
+        this._spanException(buffer, error);
+        throw error;
+      } finally {
+        if (!isAsync) {
+          buffer._traceRoot.tracer.onSpanEnd(buffer);
+        }
+      }
+    }
+
+    private async _spanAutoAsync1<S, E, A1>(
+      ctx: SpanContextInstance<Ctx>,
+      buffer: SpanBuffer<Ctx['logSchema']>,
+      op: Op<Ctx, [A1], S, E>,
+      first: Result<S, E> | PromiseLike<Result<S, E>>,
+      a1: A1,
+    ): Promise<Result<S, E>> {
+      try {
+        let attempt = 1;
+        let result = await first;
+        while (true) {
+          const retryError = getRetryableError(result, attempt);
+          if (!retryError) break;
+          const delay = calculateDelay(retryError.policy, attempt);
+          writeRetryEntry(buffer, attempt, retryError, delay);
+          await sleep(delay);
+          attempt++;
+          result = await op.fn(ctx, a1);
+        }
+        writeSpanEnd(buffer, result);
+        return result;
+      } catch (error) {
+        this._spanException(buffer, error);
+        throw error;
+      } finally {
+        buffer._traceRoot.tracer.onSpanEnd(buffer);
+      }
+    }
+
+    spanAuto2<S, E, A1, A2>(
+      line: number,
+      name: string,
+      op: Op<Ctx, [A1, A2], S, E>,
+      a1: A1,
+      a2: A2,
+    ): Result<S, E> | Promise<Result<S, E>> {
+      const ctx = this._spanAutoPre(line, name, op);
+      const buffer = ctx._buffer;
+      buffer._traceRoot.tracer.onSpanStart(buffer);
+      let isAsync = false;
+      try {
+        const result = op.fn(ctx, a1, a2);
+        if (!isSynchronousResult(result) || getRetryableError(result, 1) !== undefined) {
+          isAsync = true;
+          return this._spanAutoAsync2(ctx, buffer, op, result, a1, a2);
+        }
+        writeSpanEnd(buffer, result);
+        return result;
+      } catch (error) {
+        this._spanException(buffer, error);
+        throw error;
+      } finally {
+        if (!isAsync) {
+          buffer._traceRoot.tracer.onSpanEnd(buffer);
+        }
+      }
+    }
+
+    private async _spanAutoAsync2<S, E, A1, A2>(
+      ctx: SpanContextInstance<Ctx>,
+      buffer: SpanBuffer<Ctx['logSchema']>,
+      op: Op<Ctx, [A1, A2], S, E>,
+      first: Result<S, E> | PromiseLike<Result<S, E>>,
+      a1: A1,
+      a2: A2,
+    ): Promise<Result<S, E>> {
+      try {
+        let attempt = 1;
+        let result = await first;
+        while (true) {
+          const retryError = getRetryableError(result, attempt);
+          if (!retryError) break;
+          const delay = calculateDelay(retryError.policy, attempt);
+          writeRetryEntry(buffer, attempt, retryError, delay);
+          await sleep(delay);
+          attempt++;
+          result = await op.fn(ctx, a1, a2);
+        }
+        writeSpanEnd(buffer, result);
+        return result;
+      } catch (error) {
+        this._spanException(buffer, error);
+        throw error;
+      } finally {
+        buffer._traceRoot.tracer.onSpanEnd(buffer);
+      }
+    }
+
+    spanAuto3<S, E, A1, A2, A3>(
+      line: number,
+      name: string,
+      op: Op<Ctx, [A1, A2, A3], S, E>,
+      a1: A1,
+      a2: A2,
+      a3: A3,
+    ): Result<S, E> | Promise<Result<S, E>> {
+      const ctx = this._spanAutoPre(line, name, op);
+      const buffer = ctx._buffer;
+      buffer._traceRoot.tracer.onSpanStart(buffer);
+      let isAsync = false;
+      try {
+        const result = op.fn(ctx, a1, a2, a3);
+        if (!isSynchronousResult(result) || getRetryableError(result, 1) !== undefined) {
+          isAsync = true;
+          return this._spanAutoAsync3(ctx, buffer, op, result, a1, a2, a3);
+        }
+        writeSpanEnd(buffer, result);
+        return result;
+      } catch (error) {
+        this._spanException(buffer, error);
+        throw error;
+      } finally {
+        if (!isAsync) {
+          buffer._traceRoot.tracer.onSpanEnd(buffer);
+        }
+      }
+    }
+
+    private async _spanAutoAsync3<S, E, A1, A2, A3>(
+      ctx: SpanContextInstance<Ctx>,
+      buffer: SpanBuffer<Ctx['logSchema']>,
+      op: Op<Ctx, [A1, A2, A3], S, E>,
+      first: Result<S, E> | PromiseLike<Result<S, E>>,
+      a1: A1,
+      a2: A2,
+      a3: A3,
+    ): Promise<Result<S, E>> {
+      try {
+        let attempt = 1;
+        let result = await first;
+        while (true) {
+          const retryError = getRetryableError(result, attempt);
+          if (!retryError) break;
+          const delay = calculateDelay(retryError.policy, attempt);
+          writeRetryEntry(buffer, attempt, retryError, delay);
+          await sleep(delay);
+          attempt++;
+          result = await op.fn(ctx, a1, a2, a3);
+        }
+        writeSpanEnd(buffer, result);
+        return result;
+      } catch (error) {
+        this._spanException(buffer, error);
+        throw error;
+      } finally {
+        buffer._traceRoot.tracer.onSpanEnd(buffer);
+      }
+    }
+
+    spanAuto4<S, E, A1, A2, A3, A4>(
+      line: number,
+      name: string,
+      op: Op<Ctx, [A1, A2, A3, A4], S, E>,
+      a1: A1,
+      a2: A2,
+      a3: A3,
+      a4: A4,
+    ): Result<S, E> | Promise<Result<S, E>> {
+      const ctx = this._spanAutoPre(line, name, op);
+      const buffer = ctx._buffer;
+      buffer._traceRoot.tracer.onSpanStart(buffer);
+      let isAsync = false;
+      try {
+        const result = op.fn(ctx, a1, a2, a3, a4);
+        if (!isSynchronousResult(result) || getRetryableError(result, 1) !== undefined) {
+          isAsync = true;
+          return this._spanAutoAsync4(ctx, buffer, op, result, a1, a2, a3, a4);
+        }
+        writeSpanEnd(buffer, result);
+        return result;
+      } catch (error) {
+        this._spanException(buffer, error);
+        throw error;
+      } finally {
+        if (!isAsync) {
+          buffer._traceRoot.tracer.onSpanEnd(buffer);
+        }
+      }
+    }
+
+    private async _spanAutoAsync4<S, E, A1, A2, A3, A4>(
+      ctx: SpanContextInstance<Ctx>,
+      buffer: SpanBuffer<Ctx['logSchema']>,
+      op: Op<Ctx, [A1, A2, A3, A4], S, E>,
+      first: Result<S, E> | PromiseLike<Result<S, E>>,
+      a1: A1,
+      a2: A2,
+      a3: A3,
+      a4: A4,
+    ): Promise<Result<S, E>> {
+      try {
+        let attempt = 1;
+        let result = await first;
+        while (true) {
+          const retryError = getRetryableError(result, attempt);
+          if (!retryError) break;
+          const delay = calculateDelay(retryError.policy, attempt);
+          writeRetryEntry(buffer, attempt, retryError, delay);
+          await sleep(delay);
+          attempt++;
+          result = await op.fn(ctx, a1, a2, a3, a4);
+        }
+        writeSpanEnd(buffer, result);
+        return result;
+      } catch (error) {
+        this._spanException(buffer, error);
+        throw error;
+      } finally {
+        buffer._traceRoot.tracer.onSpanEnd(buffer);
+      }
+    }
+
+    spanAuto5<S, E, A1, A2, A3, A4, A5>(
+      line: number,
+      name: string,
+      op: Op<Ctx, [A1, A2, A3, A4, A5], S, E>,
+      a1: A1,
+      a2: A2,
+      a3: A3,
+      a4: A4,
+      a5: A5,
+    ): Result<S, E> | Promise<Result<S, E>> {
+      const ctx = this._spanAutoPre(line, name, op);
+      const buffer = ctx._buffer;
+      buffer._traceRoot.tracer.onSpanStart(buffer);
+      let isAsync = false;
+      try {
+        const result = op.fn(ctx, a1, a2, a3, a4, a5);
+        if (!isSynchronousResult(result) || getRetryableError(result, 1) !== undefined) {
+          isAsync = true;
+          return this._spanAutoAsync5(ctx, buffer, op, result, a1, a2, a3, a4, a5);
+        }
+        writeSpanEnd(buffer, result);
+        return result;
+      } catch (error) {
+        this._spanException(buffer, error);
+        throw error;
+      } finally {
+        if (!isAsync) {
+          buffer._traceRoot.tracer.onSpanEnd(buffer);
+        }
+      }
+    }
+
+    private async _spanAutoAsync5<S, E, A1, A2, A3, A4, A5>(
+      ctx: SpanContextInstance<Ctx>,
+      buffer: SpanBuffer<Ctx['logSchema']>,
+      op: Op<Ctx, [A1, A2, A3, A4, A5], S, E>,
+      first: Result<S, E> | PromiseLike<Result<S, E>>,
+      a1: A1,
+      a2: A2,
+      a3: A3,
+      a4: A4,
+      a5: A5,
+    ): Promise<Result<S, E>> {
+      try {
+        let attempt = 1;
+        let result = await first;
+        while (true) {
+          const retryError = getRetryableError(result, attempt);
+          if (!retryError) break;
+          const delay = calculateDelay(retryError.policy, attempt);
+          writeRetryEntry(buffer, attempt, retryError, delay);
+          await sleep(delay);
+          attempt++;
+          result = await op.fn(ctx, a1, a2, a3, a4, a5);
+        }
+        writeSpanEnd(buffer, result);
+        return result;
+      } catch (error) {
+        this._spanException(buffer, error);
+        throw error;
+      } finally {
+        buffer._traceRoot.tracer.onSpanEnd(buffer);
+      }
+    }
+
+    spanAuto6<S, E, A1, A2, A3, A4, A5, A6>(
+      line: number,
+      name: string,
+      op: Op<Ctx, [A1, A2, A3, A4, A5, A6], S, E>,
+      a1: A1,
+      a2: A2,
+      a3: A3,
+      a4: A4,
+      a5: A5,
+      a6: A6,
+    ): Result<S, E> | Promise<Result<S, E>> {
+      const ctx = this._spanAutoPre(line, name, op);
+      const buffer = ctx._buffer;
+      buffer._traceRoot.tracer.onSpanStart(buffer);
+      let isAsync = false;
+      try {
+        const result = op.fn(ctx, a1, a2, a3, a4, a5, a6);
+        if (!isSynchronousResult(result) || getRetryableError(result, 1) !== undefined) {
+          isAsync = true;
+          return this._spanAutoAsync6(ctx, buffer, op, result, a1, a2, a3, a4, a5, a6);
+        }
+        writeSpanEnd(buffer, result);
+        return result;
+      } catch (error) {
+        this._spanException(buffer, error);
+        throw error;
+      } finally {
+        if (!isAsync) {
+          buffer._traceRoot.tracer.onSpanEnd(buffer);
+        }
+      }
+    }
+
+    private async _spanAutoAsync6<S, E, A1, A2, A3, A4, A5, A6>(
+      ctx: SpanContextInstance<Ctx>,
+      buffer: SpanBuffer<Ctx['logSchema']>,
+      op: Op<Ctx, [A1, A2, A3, A4, A5, A6], S, E>,
+      first: Result<S, E> | PromiseLike<Result<S, E>>,
+      a1: A1,
+      a2: A2,
+      a3: A3,
+      a4: A4,
+      a5: A5,
+      a6: A6,
+    ): Promise<Result<S, E>> {
+      try {
+        let attempt = 1;
+        let result = await first;
+        while (true) {
+          const retryError = getRetryableError(result, attempt);
+          if (!retryError) break;
+          const delay = calculateDelay(retryError.policy, attempt);
+          writeRetryEntry(buffer, attempt, retryError, delay);
+          await sleep(delay);
+          attempt++;
+          result = await op.fn(ctx, a1, a2, a3, a4, a5, a6);
+        }
+        writeSpanEnd(buffer, result);
+        return result;
+      } catch (error) {
+        this._spanException(buffer, error);
+        throw error;
+      } finally {
+        buffer._traceRoot.tracer.onSpanEnd(buffer);
+      }
+    }
+
+    spanAuto7<S, E, A1, A2, A3, A4, A5, A6, A7>(
+      line: number,
+      name: string,
+      op: Op<Ctx, [A1, A2, A3, A4, A5, A6, A7], S, E>,
+      a1: A1,
+      a2: A2,
+      a3: A3,
+      a4: A4,
+      a5: A5,
+      a6: A6,
+      a7: A7,
+    ): Result<S, E> | Promise<Result<S, E>> {
+      const ctx = this._spanAutoPre(line, name, op);
+      const buffer = ctx._buffer;
+      buffer._traceRoot.tracer.onSpanStart(buffer);
+      let isAsync = false;
+      try {
+        const result = op.fn(ctx, a1, a2, a3, a4, a5, a6, a7);
+        if (!isSynchronousResult(result) || getRetryableError(result, 1) !== undefined) {
+          isAsync = true;
+          return this._spanAutoAsync7(ctx, buffer, op, result, a1, a2, a3, a4, a5, a6, a7);
+        }
+        writeSpanEnd(buffer, result);
+        return result;
+      } catch (error) {
+        this._spanException(buffer, error);
+        throw error;
+      } finally {
+        if (!isAsync) {
+          buffer._traceRoot.tracer.onSpanEnd(buffer);
+        }
+      }
+    }
+
+    private async _spanAutoAsync7<S, E, A1, A2, A3, A4, A5, A6, A7>(
+      ctx: SpanContextInstance<Ctx>,
+      buffer: SpanBuffer<Ctx['logSchema']>,
+      op: Op<Ctx, [A1, A2, A3, A4, A5, A6, A7], S, E>,
+      first: Result<S, E> | PromiseLike<Result<S, E>>,
+      a1: A1,
+      a2: A2,
+      a3: A3,
+      a4: A4,
+      a5: A5,
+      a6: A6,
+      a7: A7,
+    ): Promise<Result<S, E>> {
+      try {
+        let attempt = 1;
+        let result = await first;
+        while (true) {
+          const retryError = getRetryableError(result, attempt);
+          if (!retryError) break;
+          const delay = calculateDelay(retryError.policy, attempt);
+          writeRetryEntry(buffer, attempt, retryError, delay);
+          await sleep(delay);
+          attempt++;
+          result = await op.fn(ctx, a1, a2, a3, a4, a5, a6, a7);
+        }
+        writeSpanEnd(buffer, result);
+        return result;
+      } catch (error) {
+        this._spanException(buffer, error);
+        throw error;
+      } finally {
+        buffer._traceRoot.tracer.onSpanEnd(buffer);
+      }
+    }
+
+    spanAuto8<S, E, A1, A2, A3, A4, A5, A6, A7, A8>(
+      line: number,
+      name: string,
+      op: Op<Ctx, [A1, A2, A3, A4, A5, A6, A7, A8], S, E>,
+      a1: A1,
+      a2: A2,
+      a3: A3,
+      a4: A4,
+      a5: A5,
+      a6: A6,
+      a7: A7,
+      a8: A8,
+    ): Result<S, E> | Promise<Result<S, E>> {
+      const ctx = this._spanAutoPre(line, name, op);
+      const buffer = ctx._buffer;
+      buffer._traceRoot.tracer.onSpanStart(buffer);
+      let isAsync = false;
+      try {
+        const result = op.fn(ctx, a1, a2, a3, a4, a5, a6, a7, a8);
+        if (!isSynchronousResult(result) || getRetryableError(result, 1) !== undefined) {
+          isAsync = true;
+          return this._spanAutoAsync8(ctx, buffer, op, result, a1, a2, a3, a4, a5, a6, a7, a8);
+        }
+        writeSpanEnd(buffer, result);
+        return result;
+      } catch (error) {
+        this._spanException(buffer, error);
+        throw error;
+      } finally {
+        if (!isAsync) {
+          buffer._traceRoot.tracer.onSpanEnd(buffer);
+        }
+      }
+    }
+
+    private async _spanAutoAsync8<S, E, A1, A2, A3, A4, A5, A6, A7, A8>(
+      ctx: SpanContextInstance<Ctx>,
+      buffer: SpanBuffer<Ctx['logSchema']>,
+      op: Op<Ctx, [A1, A2, A3, A4, A5, A6, A7, A8], S, E>,
+      first: Result<S, E> | PromiseLike<Result<S, E>>,
+      a1: A1,
+      a2: A2,
+      a3: A3,
+      a4: A4,
+      a5: A5,
+      a6: A6,
+      a7: A7,
+      a8: A8,
+    ): Promise<Result<S, E>> {
+      try {
+        let attempt = 1;
+        let result = await first;
+        while (true) {
+          const retryError = getRetryableError(result, attempt);
+          if (!retryError) break;
+          const delay = calculateDelay(retryError.policy, attempt);
+          writeRetryEntry(buffer, attempt, retryError, delay);
+          await sleep(delay);
+          attempt++;
+          result = await op.fn(ctx, a1, a2, a3, a4, a5, a6, a7, a8);
+        }
+        writeSpanEnd(buffer, result);
+        return result;
+      } catch (error) {
+        this._spanException(buffer, error);
+        throw error;
+      } finally {
+        buffer._traceRoot.tracer.onSpanEnd(buffer);
+      }
+    }
+
     // =========================================================================
     // Monomorphic span methods (for transformer output)
     // Transformer emits: ctx.span0(line, name, ctx, fn) or
@@ -1281,8 +2060,9 @@ export function createSpanContextClass<Ctx extends OpContext>(
       remappedViewClass: RemappedViewConstructor | undefined,
       opMetadata: OpMetadata,
       fn: (ctx: SpanContext<Ctx>) => Result<S, E>,
+      runtimeHint = 0,
     ): Result<S, E> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata, runtimeHint);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
@@ -1305,13 +2085,14 @@ export function createSpanContextClass<Ctx extends OpContext>(
       remappedViewClass: RemappedViewConstructor | undefined,
       opMetadata: OpMetadata,
       fn: (ctx: SpanContext<Ctx>) => Result<S, E> | Promise<Result<S, E>>,
+      runtimeHint = 0,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata, runtimeHint);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
-        const result = await executeWithRetry(buffer, () => fn(ctx));
+        const result = await executeWithRetry0(buffer, fn, ctx);
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1331,13 +2112,14 @@ export function createSpanContextClass<Ctx extends OpContext>(
       opMetadata: OpMetadata,
       fn: (ctx: SpanContext<Ctx>, a1: A1) => Result<S, E> | Promise<Result<S, E>>,
       a1: A1,
+      runtimeHint = 0,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata, runtimeHint);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
-        const result = await executeWithRetry(buffer, () => fn(ctx, a1));
+        const result = await executeWithRetry1(buffer, fn, ctx, a1);
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1358,13 +2140,14 @@ export function createSpanContextClass<Ctx extends OpContext>(
       fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2) => Result<S, E> | Promise<Result<S, E>>,
       a1: A1,
       a2: A2,
+      runtimeHint = 0,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata, runtimeHint);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
-        const result = await executeWithRetry(buffer, () => fn(ctx, a1, a2));
+        const result = await executeWithRetry2(buffer, fn, ctx, a1, a2);
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1386,13 +2169,14 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a1: A1,
       a2: A2,
       a3: A3,
+      runtimeHint = 0,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata, runtimeHint);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
-        const result = await executeWithRetry(buffer, () => fn(ctx, a1, a2, a3));
+        const result = await executeWithRetry3(buffer, fn, ctx, a1, a2, a3);
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1415,13 +2199,14 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a2: A2,
       a3: A3,
       a4: A4,
+      runtimeHint = 0,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata, runtimeHint);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
-        const result = await executeWithRetry(buffer, () => fn(ctx, a1, a2, a3, a4));
+        const result = await executeWithRetry4(buffer, fn, ctx, a1, a2, a3, a4);
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1445,13 +2230,14 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a3: A3,
       a4: A4,
       a5: A5,
+      runtimeHint = 0,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata, runtimeHint);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
-        const result = await executeWithRetry(buffer, () => fn(ctx, a1, a2, a3, a4, a5));
+        const result = await executeWithRetry5(buffer, fn, ctx, a1, a2, a3, a4, a5);
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1484,13 +2270,14 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a4: A4,
       a5: A5,
       a6: A6,
+      runtimeHint = 0,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata, runtimeHint);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
-        const result = await executeWithRetry(buffer, () => fn(ctx, a1, a2, a3, a4, a5, a6));
+        const result = await executeWithRetry6(buffer, fn, ctx, a1, a2, a3, a4, a5, a6);
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1525,13 +2312,14 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a5: A5,
       a6: A6,
       a7: A7,
+      runtimeHint = 0,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata, runtimeHint);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
-        const result = await executeWithRetry(buffer, () => fn(ctx, a1, a2, a3, a4, a5, a6, a7));
+        const result = await executeWithRetry7(buffer, fn, ctx, a1, a2, a3, a4, a5, a6, a7);
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1568,13 +2356,14 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a6: A6,
       a7: A7,
       a8: A8,
+      runtimeHint = 0,
     ): Promise<Result<S, E, Ctx['logSchema']>> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata, runtimeHint);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
-        const result = await executeWithRetry(buffer, () => fn(ctx, a1, a2, a3, a4, a5, a6, a7, a8));
+        const result = await executeWithRetry8(buffer, fn, ctx, a1, a2, a3, a4, a5, a6, a7, a8);
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
