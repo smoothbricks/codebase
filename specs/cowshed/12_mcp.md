@@ -1,9 +1,8 @@
 # MCP Server
 
 `cowshed-mcp` is a separate binary built on `cowshed-core` + `cowshed-shell` — **never** a wrapper around the CLI. It
-exposes cowshed's warm workspaces to MCP clients (Claude Code's "warm worktrees", other agent runtimes) as tools, with a
-capability model that lets an autonomous coordinator run a fleet of subagents without a human in the loop and without
-any subagent being able to widen its own sandbox.
+exposes warm workspaces to MCP clients as tools, with a capability model that lets an autonomous coordinator run a fleet
+of subagents without any subagent being able to widen its own sandbox.
 
 Built on the core crates directly, the server keeps typed grants, streamed exec (the framed protocol of 11_shell.md),
 and the `Coordinator`/`WorkspaceHandle` split (07_api.md); shelling out to the CLI would reserialize everything through
@@ -18,40 +17,51 @@ contract small and the capability model — not a resource ACL — the only thin
 
 ## Transports
 
-- **stdio** — one server per client, spawned by the MCP client (the Claude Code pattern). The process **inherits
-  coordinator authority**: the coordinator token is delivered to the spawning process (below) and the single stdio
-  connection is inherently the coordinator's.
-- **unix socket** — a shared server at `<runtime dir>/<project_id>/mcp.sock` for a long-lived coordinator that hands
-  scoped connections to many subagents. A socket connection authenticates with a **short-lived, one-use connection
-  descriptor** minted by `mint_worker` (coordinator-only); it binds the connection to exactly one workspace's
-  `WorkspaceHandle` and cannot be replayed. A bare workspace token on the socket authenticates only as that workspace's
-  worker — it is physically incapable of reaching any coordinator tool.
+- **stdio** — one server per client, spawned by the MCP client. Coordinator authority is transferred only through a
+  controller-created inherited FD or socketpair endpoint. The FD is absent from argv and environment, is never printed
+  on stdout/stderr, is marked close-on-exec/non-inheritable immediately after receipt, and is closed after the server
+  binds authority. Stdio alone conveys no authority.
+- **unix socket** — a shared server at `<runtime dir>/<owner>/<repo>/mcp.sock` for a long-lived coordinator that hands
+  scoped connections to many subagents. The controller derives `owner` and `repo` from the primary `repo_id`, validates
+  and encodes each as one component, and only then joins the path; an unsplit identifier is never accepted as path text.
+  Its parent directory is mode `0700`, socket mode is `0600`, and the server verifies peer uid/platform credentials
+  before authentication. A socket connection authenticates with a short-lived, one-use connection descriptor minted by
+  `mint_worker`; it binds the connection to exactly one workspace's `WorkspaceHandle` and cannot be replayed. The shared
+  MCP socket never accepts the in-volume gateway token.
 
 ## Capability model
 
-This is the center of the design. Two token types, two authority levels, and one hard invariant: **nothing readable from
-inside a sandbox may authorize escalation.**
+This is the center of the design. Two capability classes, two authority levels, and one hard invariant: **nothing
+readable from inside a sandbox may authorize escalation.** The in-volume `.cowshed/token` is reserved for gateway
+request authentication (05_gateway.md); it is not an MCP credential.
 
 ### Coordinator token
 
-- Minted fresh at server start, delivered **only to the spawning process** — printed once to stderr
-  (`cowshed: mcp coordinator token: …`) and/or set in its environment. Never written into any workspace, never into the
-  state dir a sandbox can reach, never logged.
-- Authorizes the full lifecycle: `workspace_create`, `workspace_destroy`, `fork`, `checkpoint`, `restore`, `rebase`,
-  `land`, `grant`, `revoke`, `slot_assign`, and minting workspace-scoped connections for subagents.
-- Held by the trusted orchestrator — jcode's swarm coordinator, or a top-level Claude Code session that spawns
-  subagents. It is the only authority that can change what a workspace may touch.
+- A 256-bit capability minted fresh at server start and transferred to the trusted spawning controller only over the
+  inherited FD/socketpair above. It is never emitted on stderr, stdout, argv, environment, telemetry, or any filesystem
+  path; it is never written into a workspace. The receiving endpoint is non-inheritable and closed after binding.
+- Authorizes the full coordinator surface: `workspace_create`, `workspace_destroy`, `fork`, `restore`, `rebase`, `land`,
+  `grant`, `revoke`, `slot_assign`, `gc`, `repo_mirror`, checkpoint-quota policy, and minting workspace-scoped
+  connections. Checkpoint creation is exercised through the quota-bound one-workspace worker capability.
+- Held by the trusted orchestrator. It is the only authority that can change what a workspace may touch or perform
+  cross-workspace/project maintenance.
 
-### Workspace token
+### Worker connection descriptor
 
-- The in-volume `.cowshed/token` (01_storage.md) — the same identity the gateway already uses for egress policy. A
-  subagent working inside a workspace has it by construction.
-- Scopes an MCP session to **exactly that one workspace**: `bash`, `job_status`, `job_logs`, `checkpoint`, `push`.
-  Nothing else, and critically **no `grant`/`revoke`, no `destroy`, no access to any other workspace.
-- Because a sandboxed subagent can read its own workspace token, the token must not authorize anything that could
-  escalate the sandbox — hence grants are coordinator-only. This is the same reasoning that puts grant files _outside_
-  the volume (01_storage.md, 04_sandbox.md), expressed at the RPC layer: the type a subagent can obtain
-  (`WorkspaceHandle`, 07_api.md) simply has no escalation methods.
+- `mint_worker` returns a cryptographically random **256-bit** descriptor for exactly one workspace. The authenticated
+  coordinator/orchestrator delivers it to the intended worker; it never passes through a workspace file, argv,
+  environment, telemetry, or the reusable in-volume gateway token.
+- Descriptors are memory-only, have a fixed **30-second TTL**, are single-use, and are invalidated by server restart.
+  Redemption is one atomic consume operation: validation and removal happen under the same lock, so concurrent redeemers
+  yield exactly one success. A descriptor is bound to the target workspace, server socket identity, and expected peer
+  identity (uid plus available platform peer credentials); a mismatch authorizes nothing and does not consume a
+  descriptor intended for the correct peer. Successful consume binds the connection to one `WorkspaceHandle` and
+  permanently removes the descriptor.
+- The resulting session exposes `bash`, `job_list`, `job_status`, `job_logs`, quota-bound `checkpoint`, and `push` for
+  exactly that workspace. It exposes no grant/revoke, restore/destroy/rebase/land/gc/repo-mirror, descriptor minting, or
+  access to another workspace.
+
+Descriptors never appear in telemetry or workspace records. The in-volume `.cowshed/token` remains gateway-only.
 
 ### The escalation loop (no human, by design)
 
@@ -71,54 +81,85 @@ even if compromised — escalation is strictly a decision made one level up.
 
 ## Tools
 
-### Coordinator tools (require the coordinator token)
+### Coordinator tools (require coordinator authority)
 
-| Tool                | Args (sketch)                                                                                | Returns                                                           |
-| ------------------- | -------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| `workspace_create`  | `name`, `ref?`, `from?`, `slot?`                                                             | mount path, base commit                                           |
-| `workspace_list`    | —                                                                                            | records (name, state, base, age, written/referenced)              |
-| `workspace_destroy` | `name`, `force?`                                                                             | ok                                                                |
-| `fork`              | `src`, `dst`                                                                                 | mount path                                                        |
-| `checkpoint`        | `name`, `label?`                                                                             | label (generated UTC timestamp if omitted)                        |
-| `restore`           | `name`, `label` (**required**)                                                               | mount path                                                        |
-| `rebase`            | `name`, `fresh?`                                                                             | new head sha                                                      |
-| `land`              | `name`, `check?`, `retire?`                                                                  | landed sha                                                        |
-| `grant` / `revoke`  | `name`, `read[]?`, `write[]?`, `egress[]?`, `repo[]?`, `sim[]?`, `all?`, `expectedRevision?` | new grant revision                                                |
-| `slot_assign`       | `name`, `slot`                                                                               | ok (recycled mount path for the slot)                             |
-| `mint_worker`       | `name`                                                                                       | a short-lived one-use worker connection descriptor for a subagent |
+| Tool                | Args (sketch)                                                                                | Returns                                                  |
+| ------------------- | -------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| `workspace_create`  | `name`, `ref?`, `from?`, `slot?`                                                             | mount path, base commit                                  |
+| `workspace_list`    | —                                                                                            | records (name, state, base, age, written/referenced)     |
+| `workspace_destroy` | `name`, `force?`                                                                             | ok                                                       |
+| `fork`              | `src`, `dst`                                                                                 | mount path                                               |
+| `checkpoint`        | `name`, `label?`                                                                             | label (generated UTC timestamp if omitted)               |
+| `restore`           | `name`, `label` (**required**)                                                               | mount path                                               |
+| `rebase`            | `name`, `fresh?`                                                                             | new head sha                                             |
+| `land`              | `name`, `check?`, `retire?`                                                                  | landed sha                                               |
+| `grant` / `revoke`  | `name`, `read[]?`, `write[]?`, `egress[]?`, `repo[]?`, `sim[]?`, `all?`, `expectedRevision?` | new grant revision                                       |
+| `slot_assign`       | `name`, `slot`                                                                               | ok (recycled mount path for the slot)                    |
+| `mint_worker`       | `name`                                                                                       | 256-bit, 30-second, one-use worker connection descriptor |
+| `gc`                | `dryRun?`                                                                                    | reclaimed bytes/report                                   |
+| `repo_mirror`       | `name`, `url`                                                                                | controller-owned read-only mirror path                   |
 
 A coordinator-scoped **telemetry query tool** (selector/SQL over the store segments, 13_telemetry.md) is roadmap, not v1
-— the CLI's `cowshed logs`/`audit`/`trace` cover the need until then; workers never get it (they may read only their own
-in-volume exec records, which `job_status`/`job_logs` already expose).
+— the CLI's `cowshed logs`/`audit`/`trace` cover the need until then. Workers get only one-workspace job status/log
+tools; status is reconciled from controller-owned authority, while workspace records remain optional reproduction data.
 
-`checkpoint` and `restore` are split into two tools (not one `label?` row) because `restore`'s label is **required** —
-there is no "restore the latest" default — while `checkpoint`'s is optional. `grant`/`revoke` carry `expectedRevision`
-for compare-and-swap (07_api.md/04_sandbox.md) and a `repo[]` selector for repo-scoped mirror grants (05_gateway.md).
-Each `egress[]` entry is `{ host, ports?, mode?: "intercept" | "opaque", impersonate?: "<profile>" }`, mirroring the
-grant-file schema (04_sandbox.md): a coordinator sets a host's interception mode and fingerprint at grant time, `mode`
-defaulting to `intercept`. `sim[]` carries personal-session simulator broker verbs (`"openurl"` / `"install"` —
+`restore` requires a label — there is no "restore the latest" default. Worker `checkpoint` accepts an optional label.
+`grant`/`revoke` carry `expectedRevision` for compare-and-swap (07_api.md/04_sandbox.md) and a `repo[]` selector for
+repo-scoped mirror grants (05_gateway.md). Each `egress[]` entry is
+`{ host, ports?, mode?: "intercept" | "opaque", impersonate?: "<profile>" }`, mirroring the grant-file schema
+(04_sandbox.md): a coordinator sets a host's interception mode and fingerprint at grant time, `mode` defaulting to
+`intercept`. `sim[]` carries personal-session simulator broker verbs (`"openurl"` / `"install"` —
 04_sandbox.md/05_gateway.md); `install` remains bound to drop-dir artifacts and the human-gating rule regardless of the
 grant (14_nix.md). There are no SSH/Docker grant axes.
 
-### Worker tools (workspace token; scoped to that workspace)
+### Worker tools (one-use descriptor; scoped to that workspace)
 
-| Tool         | Args                                             | Returns                                      |
-| ------------ | ------------------------------------------------ | -------------------------------------------- |
-| `bash`       | `command`, `timeout?`, `background?`, `session?` | stdout, stderr, exit, `jobId?` (11_shell.md) |
-| `job_status` | `jobId`                                          | state, timings                               |
-| `job_logs`   | `jobId`, `stderr?`, `follow?`                    | streamed spool                               |
-| `checkpoint` | `label?`                                         | label                                        |
-| `push`       | `branch?`                                        | pushed ref                                   |
+| Tool         | Args                                                       | Returns                                                                                    |
+| ------------ | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `bash`       | `command`, `stdin?`, `timeout?`, `background?`, `session?` | `jobId`, state, stdin metadata, `stdout`/`stderr` stream info, exit metadata when terminal |
+| `job_list`   | `state?`                                                   | numeric job ids, state, timings, trace identity, per-stream info                           |
+| `job_status` | `jobId` (numeric)                                          | state, timings, exit metadata, `stdout`/`stderr` stream info, trace identity               |
+| `job_logs`   | `jobId` (numeric), `stream?: "out" \| "err"`, `follow?`    | raw bytes from the selected backing file                                                   |
+| `checkpoint` | `label?`                                                   | label                                                                                      |
+| `push`       | `branch?`                                                  | pushed ref                                                                                 |
 
 `bash` is the workhorse: it runs through the workspace supervisor (warm shell, 11_shell.md), honors `session` for
-stateful multi-step work, auto-backgrounds on the soft timeout returning a `jobId`, and surfaces `exitCode 6` with the
-resolving `grant` **only on authoritative denial evidence** (06_cli.md — never synthesized from output text). Its result
-is derived from the same exec record every other client sees.
+stateful multi-step work, and returns the workspace-local monotonic numeric `jobId` for **every accepted exec
+submission**, including foreground jobs. Auto-backgrounding changes only state, not identity. The result surfaces
+`exitCode 6` with the resolving `grant` **only on authoritative denial evidence** (06_cli.md — never synthesized from
+stdout, stderr, or their summaries). A spawn failure is a terminal job with the already-allocated id.
+
+`bash.stdin` is a discriminated union with exactly one source: `{ "inlineBase64": "…" }` for opaque inline bytes,
+`{ "stream": true }` for subsequent framed channel-1 bytes on socket transport, or `{ "workspaceFile": "rel/path" }` for
+a workspace-relative regular file. Omission means empty input for non-interactive tool calls. The server decodes base64
+strictly and never embeds bytes or a file expression in `command`. Workspace files are opened by the supervisor
+read-only, beneath the workspace, with no-follow component traversal; absolute/escaping paths, symlinks, devices,
+sockets, directories, and replacement races fail closed. Stream backpressure propagates to the MCP transport; EOF closes
+child stdin once, cancellation closes stdin and records incomplete delivery without implicitly killing the job.
+Results/events carry stdin kind, delivered byte count, completion, and normalized relative file path when applicable,
+plus normal job/trace identity; inline bytes never enter JSON results or telemetry.
+
+`checkpoint` atomically enforces the coordinator-configured per-workspace checkpoint count and byte quotas. Quota
+exhaustion is a conflict carrying current usage and limits; it never silently prunes another checkpoint. Restore is
+coordinator-only.
+
+MCP JSON carries job/control metadata and separate `stdout` and `stderr` `StreamInfo` objects: each is
+`{ path, bytes, summary }`, with the deterministic bounded versioned redacted summary defined in 11_shell.md. The
+configurable combined stdout+stderr quota defaults to 1 GiB. Crossing it terminates the process group with
+TERM/grace/KILL, drains both pipes, and returns the explicit `outputLimit` terminal state and limit metadata; the server
+never silently truncates a running job. Summaries have independent projection truncation semantics.
+
+Every job result and event includes the durable `(repoId, workspaceIncarnation, jobId)` key and standard trace identity.
+Authoritative lifecycle, exit/signal, output-limit, and denial fields come from controller-owned immutable per-writer
+telemetry segments delivered through the controller-provided non-inheritable writer FD/capability or IPC channel. The
+in-volume `.cowshed/job/records.arrow` projection may be returned for convenience only after reconciling it with
+controller state; it is never trusted for status, authorization, denial, quota, or audit decisions.
 
 `bash` takes **shell text** (`command`) for agent ergonomics; the server converts it **explicitly** to the typed core
-exec form `["/bin/sh", "-c", command]` before calling `WorkspaceHandle::exec`. The core API is argv-typed throughout
-(07_api.md) — the string→argv wrap happens once, at the MCP boundary, visibly, rather than any layer guessing at shell
-semantics.
+exec form `["/bin/sh", "-c", command]` before calling `WorkspaceHandle::exec`. A real shell AST parser may recognize
+only the narrowly eligible single-simple-command literal redirection fast path defined in 11_shell.md; any ambiguity or
+failed eligibility check falls back to ordinary shell execution/capture. Parsing is optimization only, never authority
+or correctness. Structured stdin remains separate from shell text in all cases.
 
 ## Error mapping (CowshedError → JSON-RPC)
 
@@ -134,9 +175,15 @@ code passed through; 6 only on authoritative denial).
 | `Environment`   | -32003                  | `{ code: "envMissing", hint }`                                 |
 | `SandboxDenied` | -32004                  | `{ code: "sandboxDenied", hint, grant }` (the resolving grant) |
 | `Internal`      | -32603 (internal error) | `{ code: "internal" }`                                         |
+| `Authorization` | -32005                  | `{ code: "unauthorized", hint }`                               |
 
-A worker token presented to a coordinator tool is **not** a domain error — it is an authorization failure at the
-transport (-32004-class), returned before the tool runs, so a subagent never sees a coordinator tool "attempt and fail."
+A missing, expired, replayed, peer-mismatched, socket-mismatched, or insufficient capability is the distinct
+`Authorization` error **-32005**, returned before tool dispatch. It is never reported as `SandboxDenied` (`-32004`) or
+as a process exit code. Authorization failures do not disclose whether the targeted workspace or coordinator operation
+exists.
+
+A worker descriptor presented to a coordinator tool is an authorization failure at the transport (`-32005`), returned
+before the tool runs, so a subagent never sees a coordinator tool attempt. It is never mapped to `SandboxDenied`.
 
 ## Tradeoffs
 
@@ -147,9 +194,10 @@ one legitimate escalation — widening a sandbox — is authority, not a dialog:
 resolved agent-to-agent. (A human orchestrator remains free to _be_ the coordinator and approve grants manually; that is
 a policy choice at the top level, not a protocol requirement pushed onto every workspace.)
 
-**One token type rejected.** A single token that both scopes a workspace and can grant would mean any sandboxed subagent
-that reads `.cowshed/token` could escalate itself — defeating the entire grants model. Splitting coordinator authority
-from workspace scope is what makes the sandbox's closed baseline trustworthy under multi-agent orchestration.
+**One capability type rejected.** A single reusable credential that both scopes a workspace and can grant would let any
+sandboxed subagent holding it escalate itself. Coordinator authority and one-use workspace descriptors are distinct; the
+gateway's in-volume token has no MCP meaning. This split keeps the sandbox's closed baseline trustworthy under
+multi-agent orchestration.
 
 **CLI-wrapping MCP server rejected.** Building the server on the CLI would lose typed grants, streamed stdio, and the
 capability split, and would fork a subprocess per tool call. `cowshed-mcp` on the core crates is the same decision as

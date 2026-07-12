@@ -31,6 +31,40 @@ No mounts, no root, no network — pure functions with table-driven cases:
   allows** (measured: SBPL rejects port ranges — `invalid port in network address` — and hosts other than
   `localhost`/`*`), leaves `network-bind`/`network-inbound` permissive on localhost, and contains no range syntax
   anywhere (a generation-text golden; kernel enforcement is proved by the escape tier).
+- **Runner launch planning**: a workflow fixture whose first step is repository-controlled, followed by shell and
+  supported action-generated commands, produces only `cowshed exec` launch plans in original order. The direct process
+  launcher is a fail-on-call spy. An action type for which every process cannot be intercepted is rejected with the
+  documented configuration error before its payload or any child process starts; cwd relocation and completion of the
+  composite action never count as wrapping.
+- **Image-format dispatch**: detached host metadata carries `imageFormat`; the complete table is `ASIF` → `.asif` and
+  `SPARSE` → `.sparseimage`. Matching metadata/extension selects the corresponding attach path, while either crossed
+  pair, an unknown format, or a wrong extension is rejected before an attach command is constructed. There is no
+  extension alias or inference fallback.
+- **Job-control encoding and summaries**: numeric job IDs round-trip without string coercion; stdout and stderr summary
+  codecs are separate, versioned, deterministic for identical bytes, bounded at the specified byte limit, and redact the
+  specified secret fixtures. Control-message JSON and Arrow records carry control/result metadata plus those summaries,
+  never the full stream bytes. Arrow's `job_id` joins to the standard trace identity and is not copied into or
+  substituted for `span_id`.
+- **API capability goldens**: `Project` exposes discovery only; `WorkspaceRef` exposes inspection plus safe
+  `ensure`/`attach`; `WorkspaceHandle` exposes exactly one workspace's exec/shell/jobs/quota-bound checkpoint/push/grant
+  reads; only `Coordinator` exposes grant/revoke/restore/destroy/rebase/land/gc/repo-mirror and quota policy.
+  Compile-fail fixtures prove forbidden methods and cross-workspace construction are unavailable.
+- **MCP capability/auth codecs**: coordinator authority can be read only from the designated inherited FD/socketpair and
+  never argv/environment/stderr; worker descriptors are 256-bit, 30-second, one-use, memory-only, atomic-consume,
+  restart-invalidated, workspace/socket/peer-bound. Missing, expired, replayed, mismatched, or insufficient authority
+  maps to dedicated JSON-RPC `-32005`, never sandbox-denied.
+- **Structured stdin codecs and policy**: API/CLI/N-API/MCP discriminated inputs round-trip arbitrary binary inline
+  bytes, streams, and normalized workspace-relative file paths without shell interpolation. Pure path cases reject
+  absolute paths, traversal, symlinks, non-regular files, and ambiguous source combinations; job/trace DTO goldens carry
+  kind, delivered bytes, completion, and optional relative path but never inline contents.
+- **Shell AST redirection eligibility**: use the production shell AST parser against a matrix proving that only one
+  top-level simple command with literal, in-workspace, same-filesystem, nonexistent `>` and/or `2>` targets under
+  default clobber semantics is eligible. Append, fd duplication, pipelines, lists, subshells, expansions, symlinks,
+  `noclobber`, existing/cross-filesystem targets, malformed input, and unknown AST forms must fall back. A spy makes
+  regex/string sniffing impossible and proves parsing never feeds authorization or denial decisions.
+- **Job-output quota state machine**: combined accounting includes persisted plus in-flight bytes, counts a shared
+  redirection inode once, and transitions only to explicit `output-limit`; tests pin TERM→grace→KILL→drain→fsync→publish
+  ordering and distinguish timeout/signal/exit.
 
 ## Property tests (proptest, pure, all platforms)
 
@@ -43,8 +77,9 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   vectors come out sorted + deduplicated regardless of input order.
 - **Marker/schema**: round-trip (`parse(write(m)) == m`) for all roles; any unknown `version` is rejected, never
   silently coerced.
-- **Egress/port normalization**: host wildcard matching (`*.github.com`) and default-port fill are order- and
-  duplicate-independent; a port block round-trips through the grant file.
+- **Egress/endpoint normalization**: host wildcard matching (`*.github.com`) and default-port fill are order- and
+  duplicate-independent; macOS `portBlock` round-trips when present and is rejected on Linux. Linux endpoint generation
+  always yields `http://127.0.0.1:7644` and never manufactures a block base.
 - **Staged-object non-enumeration**: for any generated set of in-flight staged names (adopt/new temporaries, 01/02),
   enumeration never returns one — the "derived state" promise holds under partial writes.
 - **Idempotent recovery/gc**: replaying a crash-recovery or `gc` pass over any generated interrupted-state fixture
@@ -62,6 +97,31 @@ both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZF
 Covered flows:
 
 - adopt → new → exec → push → rm (the golden path), including marker/token rewrite on new;
+- **runner interception from step one**: execute a workflow fixture with a hostile first command, later shell commands,
+  and a supported action-generated command. Instrument the runner spawn boundary and assert that every
+  repository-controlled command is launched through `cowshed exec` in the job workspace, in workflow order, with zero
+  direct runner spawns. A fixture containing an uninterceptable action type must fail before that action starts and must
+  not fall back to direct execution. Run the fixture after the composite action has returned and with cwd already inside
+  the mount, proving neither mechanism supplies interception.
+- **workspace-local job allocation across restart**: submit multiple execs, assert each submission receives a unique
+  numeric ID in strictly increasing allocation order, restart the job-control/supervisor process, submit again, and
+  assert the new ID is greater than every ID allocated before restart. Exercise two workspaces to prove ordering state
+  is workspace-local rather than a shared or lexicographic identifier.
+- **job backing files and summary surfaces**: run a below-quota command that emits distinct text, secret fixtures,
+  truncation-boundary bytes, and invalid UTF-8 independently to both streams, then exits nonzero. Assert every admitted
+  byte is present in `.cowshed/job/<id>/out` and `.cowshed/job/<id>/err`; stdout/stderr are never merged. Assert control
+  messages and Arrow rows contain the same deterministic, bounded, versioned, redacted per-stream summaries and
+  control/result metadata, while backing files remain unredacted. Redaction and summary truncation must not change
+  denial, exit status, policy evaluation, or build-success classification.
+- **JSON is control-only**: request JSON for the same job and parse the complete output as the documented control/result
+  envelope. It contains the numeric job ID, result metadata, backing-file references, and redacted stdout/stderr
+  summaries, but neither raw stream bytes nor a text/base64 embedding of them; reading the referenced files is the only
+  way to recover full binary output.
+- **supervisor grant-revision cutover**: start a long-running job at revision N, apply an effective filesystem grant or
+  revoke, and assert the enclosing supervisor drains and is relaunched at N+1 before the next exec. The running job
+  completes under N, an inner per-command profile can only narrow N and cannot broaden it, the next exec observes N+1,
+  and reconnecting a named session bound to N returns the documented stale-session conflict rather than silently
+  rebinding. Repeat for both grant and revoke.
 - **attach `-nomount` → fsck device → mount** ordering on APFS (the clone is verified as a block device _before_ it is
   mounted, per 02) — asserts the sequence and that a structurally-bad clone is caught before mount, not after;
 - **fork mid-write clone validity**: clone an image while a writer churns the volume, then verify the clone mounts and
@@ -78,20 +138,60 @@ Covered flows:
 - gc: trash drain, checkpoint pruning, orphan mountpoint removal, compaction (SPARSE fallback);
 - gateway: mirror hit/miss against a local fixture registry, token→policy mapping, 403 hint body, audit records, CONNECT
   allow/deny, `repo mirror` fetch into a read-only bare mirror;
+- **Linux connector end to end**: for an attached workspace, assert exactly one connector exists in its private netns,
+  under the dedicated controller-owned identity/cgroup, bound only to IPv4 `127.0.0.1:7644`. Run real Bun/npm install,
+  Cargo sparse-registry fetch, Go module download, and a generic HTTP/HTTPS proxy client against
+  `http://127.0.0.1:7644/{npm,cargo,go}` and the proxy variables; assert byte identity through the connector, gateway
+  endpoint+token authentication, mirror behavior, and no direct fallback. None of these clients may use a Unix-socket
+  transport. Run two workspaces with the same address/port and prove neither can reach the other's connector or socket.
+  Detach must stop admission, drain connections, kill the connector cgroup, unlink the socket, and leave 7644 unbound;
+  attach must create exactly one fresh connector before exec admission. Restore must drain old connections and make the
+  old connector/socket/token unusable before publishing the new incarnation.
 - gateway interception (05_gateway.md): an intercepted host serves a workspace-CA leaf the in-image anchor trusts,
   injects the Keychain credential, and records a **request-granular** audit line; an `--opaque` host tunnels without
   injection; an `--impersonate` connection suppresses header injection; the **upstream-health gate** fails a dead
   upstream fast with a classifiable error (not a per-request timeout) — asserting the gateway-absent / upstream-offline
   / denied trichotomy; **socket teardown**: no leaked listeners or half-closed sockets after a churn of many distinct
   intercepted hosts (the JS original's fd-leak bug class), and oversized request headers are tolerated;
-- ASIF/SPARSE fallback selection.
+- ASIF/SPARSE format/extension enforcement: attach detached fixtures whose host metadata says `ASIF` with `.asif` and
+  `SPARSE` with `.sparseimage`, and assert dispatch reaches the corresponding real substrate path. Swap the extensions
+  and assert a format/extension mismatch is reported before attach; fallback from unavailable ASIF creates and records
+  SPARSE with `.sparseimage`, never ASIF metadata on a SPARSE file.
+- **persistent multi-client supervisor socket**: runtime directory is `0700`, socket is `0600`, wrong-peer credentials
+  fail before framing, and many simultaneous clients submit/query independent jobs. Disconnect one client while jobs and
+  another attachment remain active, then reconnect and resume by job id/backing-file offset; assert no job stops and the
+  socket remains linked. Only orderly supervisor exit unlinks it; stale-start cleanup first proves no live owner.
+- **authoritative job telemetry channel**: launch the supervisor with a controller-provided writer IPC/capability FD and
+  assert it is close-on-exec and absent from every job descendant. Concurrent producers write distinct exclusively
+  allocated segments; seal/publish makes each immutable, recovery writes a new segment, and no shared append occurs.
+  Forge, delete, and contradict workspace-local `records.arrow`; status, output-limit, denial correlation, and audit
+  queries must still return controller-owned truth.
+- **combined job-output quota**: configure small limits and race stdout/stderr writers so persisted and
+  read-but-in-flight bytes cross from both pipes. Assert exactly one trip, no accounting overshoot/double-count for
+  eligible shared-inode redirection, complete-process-group TERM then grace/KILL, both pipes drained without deadlock,
+  fsync before the authoritative `output-limit` event, and no silent continuation/truncation. Repeat at exactly-limit,
+  one-byte-over, client-disconnected, soft-timeout, and hard-timeout boundaries.
+- **shell redirection fast path equivalence**: for every eligible AST form, assert requested destination and job stream
+  are links to the supervisor-created inode, byte-identical to ordinary shell behavior, tailed once, and retained
+  without unlinking the caller destination. For every ineligible/ambiguous/racy case, assert pre-exec fallback to the
+  ordinary shell/capture path and identical exit/output/filesystem results. Exercise quota crossing in both optimized
+  and fallback paths and require identical terminal metadata.
+- **structured stdin end to end**: feed binary data containing NUL and invalid UTF-8 through inline, backpressured
+  stream, and workspace-file sources over CLI/N-API/MCP into a slow reader; assert byte identity, bounded buffering, EOF
+  exactly once, and consistent stdin/job/trace metadata. Cancel mid-stream (stdin closes and metadata is incomplete
+  without implicit job kill), exit the job before producer EOF (producer cancels and waiters release), and race path
+  replacement. Workspace-file opens must reject absolute/escaping paths, symlink ancestors/targets, devices, sockets,
+  directories, and cross-workspace sources with no bytes delivered.
+- **MCP authority lifecycle**: prove coordinator startup emits no authority to stdout/stderr/argv/environment, inherited
+  endpoint closure and non-inheritance, descriptor TTL/replay/concurrent atomic consume/restart invalidation, peer and
+  socket binding, and non-disclosure through telemetry. A worker invoking every coordinator-only tool receives `-32005`
+  before dispatch; `SandboxDenied` remains reserved for authoritative sandbox evidence.
 
 ## Escape tests (cowshed-escape-tests, one corpus, both OSes, release gate)
 
 One shared adversarial corpus (04_sandbox.md), run through the real exec pipeline: **Seatbelt on macOS, Landlock +
-loopback netns on Linux**, green on **both** as a release gate (a red escape test cannot be waived). Structure mirrors
-jcode's `jcode-sandbox-escape-bash-*` crates: each case is a shell payload plus an assertion that the operation was
-denied and the artifact untouched.
+loopback netns on Linux**, green on **both** as a release gate (a red escape test cannot be waived). Structure uses one
+shared corpus: each case is a shell payload plus an assertion that the operation was denied and the artifact untouched.
 
 Shared categories: path escapes (traversal, symlink, hardlink), secret reads, cowshed-state tampering, cross-workspace
 access, egress bypass (direct, helper-process, DNS), revocation binding, ReadOnly enforcement, **workspace-CA
@@ -108,9 +208,12 @@ the CA cert it holds is a public anchor only, 04_sandbox.md/05_gateway.md) — p
 
 Linux-specific cases (Landlock/netns): bind-mount a denied path into a granted root, `/proc/<pid>/root` and
 `/proc/<pid>/cwd` reach-arounds, `unshare`/`setns` to leave the netns, abstract-namespace and filesystem unix sockets
-reaching a non-gateway listener, `connect(2)` to a non-gateway TCP port. Policy-string goldens (unit tier) do not
-substitute for this — they prove generation, not kernel enforcement. Every production-discovered escape becomes a
-permanent case.
+reaching a non-gateway listener, and `connect(2)` to a non-gateway TCP port. Connector-specific cases race a malicious
+workspace listener for `127.0.0.1:7644`, attempt to impersonate/replace the connector, signal or ptrace it, join its
+identity/cgroup, inject traffic through a non-loopback local or peer address, redirect it to another Unix socket, and
+reach a sibling workspace's connector/socket. Every attempt must fail and produce no gateway request. Policy-string
+goldens (unit tier) do not substitute for this — they prove generation, not kernel enforcement. Every
+production-discovered escape becomes a permanent case.
 
 ## Trace assertions (lmao-query)
 
@@ -123,8 +226,9 @@ produces a stable trace the tier queries with `lmao-query` selectors:
   property, cross-checked against the unit-tier generation golden — one proves kernel enforcement, the other profile
   text).
 - **Integration tier** asserts lifecycle causality: `every(rm ⇒ supervisor-stop precedes detach)`,
-  `every(new ⇒ fsck precedes mount)`, and the escalation loop `denial → grant(rev+1) → retry` as a single connected
-  trace.
+  `every(linux-detach ⇒ connector-drain precedes connector-cgroup-kill precedes socket-unlink precedes netns-release)`,
+  `every(linux-restore ⇒ old-connector-drain precedes new-endpoint-publish)`, `every(new ⇒ fsck precedes mount)`, and
+  the escalation loop `denial → grant(rev+1) → retry` as a single connected trace.
 - **Golden trace fixtures**: the deterministic trace of `cowshed new` (and other lifecycle ops) is checked in; a diff is
   a behavior change that must touch the spec, the same contract as the CLI goldens.
 
