@@ -491,7 +491,7 @@ Previous approaches considered using JavaScript Proxy for remapping. This was re
 
 ### Transformed Code Example
 
-The lmao-transformer converts fluent tag calls to direct array writes:
+The lmao-ttsc plugin converts fluent tag calls to direct array writes:
 
 ```typescript
 // Library source code (unprefixed):

@@ -69,16 +69,13 @@ per-library-schema, not per-application-schema.
 
 ### 5. Native lmao-rs hosts don't need the transformer
 
-In-process Rust (jcode, AxE sim) gets the same effect from
-`define_log_schema!` proc-macro expansion at Rust compile time (1.9 ns
-append, 2.5 ns tag write, per the main investigation). The transformer is
-the *TypeScript-host* analog of that macro — same role, same schema-static
-philosophy, two compilers.
-
+In-process Rust (jcode, AxE sim) gets the same effect from `define_log_schema!` proc-macro expansion at Rust compile
+time (1.9 ns append, 2.5 ns tag write, per the main investigation). The native ttsc transformer is the _TypeScript-host_
+analog of that macro — same role and schema-static philosophy, in one compiler implementation.
 ## Current shipped span optimization
 
-The TypeScript transformer and ttsc Go plugin now implement bounded, Promise-preserving span setup plus packed runtime
-hints. Automatic public `span()` → `spanAutoN()` lowering is intentionally disabled.
+The ttsc Go plugin implements bounded, Promise-preserving span setup plus packed runtime hints. Automatic public
+`span()` → `spanAutoN()` lowering is intentionally disabled.
 
 ### Promise-preserving fixed-arity lowering and ABI boundary
 
@@ -115,8 +112,8 @@ not required for correctness.
 
 The transformer appends one packed unsigned 32-bit hint to eligible `defineOp` calls and emits per-key hints for a
 single-object-literal `defineOps` call. Eligibility is checker-proved from the result type: `Op<...>`/symbol `Op` for
-`defineOp`, and `OpGroup<...>`/symbol `OpGroup` for `defineOps`. Same-named unrelated functions and checkerless classic
-transforms are not annotated.
+`defineOp`, and `OpGroup<...>`/symbol `OpGroup` for `defineOps`. Same-named unrelated functions and calls without
+checker-backed LMAO declaration provenance are not annotated.
 
 | Bits     | Payload                                               |
 | -------- | ----------------------------------------------------- |
@@ -156,12 +153,12 @@ Promise API's microtask scheduling. No performance magnitude is asserted here.
 ## Current shipped Op-local log-template optimization
 
 Roadmap F now has one deliberately local subset in production. For each checker-proved inline `defineOp` callback—or
-each eligible inline member of a single-object-literal `defineOps`—the TypeScript transformer and ttsc/tsgo Go plugin
-collect direct one-argument `ctx.log.info/debug/warn/error/trace(...)` calls whose `ctx.log` type is proven as LMAO's
-logger and whose message is a string literal or no-substitution template literal. A simple identifier first context
-parameter is required, nested functions are not traversed, and all uncertain shapes remain on the ordinary logging path.
+each eligible inline member of a single-object-literal `defineOps`—the native ttsc/tsgo plugin collects direct
+one-argument `ctx.log.info/debug/warn/error/trace(...)` calls whose `ctx.log` type is proven as LMAO's logger and whose
+message is a string literal or no-substitution template literal. A simple identifier first context parameter is
+required, nested functions are not traversed, and all uncertain shapes remain on the ordinary logging path.
 
-Both compilers use the cooked string value, deduplicate equal strings per Op, and assign private IDs in first lexical
+The compiler uses the cooked string value, deduplicates equal strings per Op, and assigns private IDs in first lexical
 encounter order. `0` means dynamic/raw; unique strings receive `1..65535`; after 65,535 unique values, later unseen
 strings remain dynamic while prior duplicates keep their IDs. The IDs have no program-wide stability and cannot be
 compared across Ops or builds.
@@ -180,13 +177,13 @@ returns the raw value for zero or looks up a nonzero ID and throws if it is inva
 
 The lane is private storage, not a public Arrow format. Arrow dictionary construction and row emission resolve messages
 back to exact strings; SQLite, test facts, Cloudflare rows, feature-flag lookup, and stdio output use the same resolver.
-Dynamic messages and span names remain strings. TypeScript and tsgo parity tests plus runtime/Arrow tests establish
-these correctness invariants. Five independent order-reversed benchmark processes did **not** meet the promotion gate:
-the repeated-literal case was neutral (about -2% to +1% per reversed pair), four literal callsites improved only about
-2–6% (below the 10% gate), attribute-bearing and 90/10 mixed cases changed sign with registration position/run, and
-dynamic controls exposed a large first-registration bias. No performance win is claimed. The local typed store remains
-an implemented representation change; a global prebuilt dictionary and header packing remain proposed prerequisites to
-seek a measured Roadmap F win.
+Dynamic messages and span names remain strings. Native plugin tests plus runtime/Arrow tests establish these correctness
+invariants. Five independent order-reversed benchmark processes did **not** meet the promotion gate: the
+repeated-literal case was neutral (about -2% to +1% per reversed pair), four literal callsites improved only about 2–6%
+(below the 10% gate), attribute-bearing and 90/10 mixed cases changed sign with registration position/run, and dynamic
+controls exposed a large first-registration bias. No performance win is claimed. The local typed store remains an
+implemented representation change; a global prebuilt dictionary and header packing remain proposed prerequisites to seek
+a measured Roadmap F win.
 
 ## The bigger design space: typed macros over the schema, not just call sites
 
@@ -311,7 +308,7 @@ analyses (usage-driven pre-allocation, dead columns, vocabulary contracts) that 
    explicit internal `spanAutoN` retry/thenable fallback; and checker-proved Op-local literal log-template IDs with
    conditional `u16` storage and cold exact-string decode.
 2. **Done**: checker-dependent tag/log/result inlining and the line, metadata, span, runtime-hint, and structured
-   template-metadata transforms in both the TypeScript transformer and ttsc Go plugin.
+   template-metadata transforms in the native ttsc Go plugin.
 3. **Correctness boundary**: keep automatic public `span()` → `spanAutoN()` disabled. Await-compatible type shape does
    not preserve the public Promise path's observable microtask schedule.
 4. **Next, measure first**: benchmark the shipped fixed-arity/hint path and the separate Op-local template-ID path on
