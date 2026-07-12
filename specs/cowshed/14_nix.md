@@ -15,6 +15,7 @@ programs.cowshed = {
                                #   ~/.gradle/caches (+ other gradle cache dirs), sccache default → ~/.cowshed/caches/…
   gateway.launchd = true;      # dev.cowshed.gateway LaunchAgent (HM manages ~/Library/LaunchAgents on darwin)
   loginAttach = true;          # dev.cowshed.attach LaunchAgent: mount volumes + personal workspaces at login
+  linuxConnector = true;       # Linux only: trusted per-attached-workspace netns connector runtime/identity
   goEnvDefaults = true;        # host-side go hygiene that is NOT per-workspace (GOTOOLCHAIN=local guidance; the
                                #   per-workspace GOENV file stays cowshed-written, in-image — 03_caches.md)
   tmutilExclusions = true;     # volume-level TM exclusions for cowshed.store/cowshed.caches (activation script;
@@ -26,31 +27,55 @@ With the module enabled, cowshed's last `~/Library` residue (the launchd plists)
 declared, rollbackable, never drifting. Combined with the store volume mounted at `~/.cowshed` (01_storage.md), the
 Data-volume home footprint is: one empty mountpoint directory, plus HM-managed artifacts.
 
+On Linux, `programs.cowshed.linuxConnector` (and `services.cowshed-runner` in CI) installs the controller-side launcher
+and declares the dedicated connector uid/process restrictions and cgroup subtree. The launcher may enter the already
+created workspace netns, bind only `127.0.0.1:7644`, and open only the bind-mounted per-workspace gateway socket; it has
+no credential-store, policy-file, CA-key, or upstream-network access. Workspace processes cannot signal, ptrace,
+inspect, or join that identity/cgroup. The module owns this host security setup, while attach/detach/restore create,
+drain, and remove each ephemeral connector instance. This is not a system-wide listener and allocates no Linux
+`portBlock`.
+
 ## Ownership detection: validate, never mutate
 
 When home-manager owns the host setup, `adopt` and `ensure` **validate and refuse to mutate**. Detection is structural,
 not configured: HM-created symlinks resolve into `/nix/store` (verification item: confirm across HM's symlink strategies
 — `home.file` vs `mkOutOfStoreSymlink`). Per artifact:
 
-| Artifact               | HM-owned (declarative)                                                   | Unowned (imperative fallback)      |
-| ---------------------- | ------------------------------------------------------------------------ | ---------------------------------- |
-| Cache-subtree symlinks | validate targets; `doctor` → `next: enable programs.cowshed.relocations` | `adopt` writes them (03_caches.md) |
-| launchd agents         | validate loaded; `doctor` → `next:` the HM option                        | `adopt` installs plists            |
-| TM exclusions          | validate; hint the HM option                                             | `adopt` runs `tmutil`              |
+| Artifact                | HM-owned (declarative)                                                   | Unowned (imperative fallback)      |
+| ----------------------- | ------------------------------------------------------------------------ | ---------------------------------- |
+| Cache-subtree symlinks  | validate targets; `doctor` → `next: enable programs.cowshed.relocations` | `adopt` writes them (03_caches.md) |
+| launchd agents          | validate loaded; `doctor` → `next:` the HM option                        | `adopt` installs plists            |
+| Linux connector runtime | validate launcher identity/cgroup; `doctor` → `next:` the module option  | `adopt` refuses until installed    |
+| TM exclusions           | validate; hint the HM option                                             | `adopt` runs `tmutil`              |
 
 `doctor` findings in declarative mode always name the nix option, never a mutating command — the self-driving contract
 (06_cli.md) pointed at configuration instead of side effects.
 
+**Trusted project policy is always declarative/controller-owned.** Repository identity is a stable, machine-independent
+`repo_id`, normalized from a chosen remote URL to lowercase `owner/repo`. The binding records that chosen remote and
+validation requires its URL to produce the recorded `repo_id`; discovery may propose a binding but never silently mint
+one. Multiple bindings may exist with exactly one primary, while a local-only repository requires an explicit `repo_id`.
+Trusted policy lives at `~/.cowshed/<owner>/<repo>/policy.json`, with `owner` and `repo` encoded as separate, path-safe
+components. Home-manager or the trusted host bootstrap owns that file; `adopt`, `ensure`, workspaces, agents, and
+repository content may validate it but never create or rewrite it. Missing policy or an inconsistent binding is a
+bootstrap error with a declarative remediation hint, never an imperative fallback derived from a checkout path.
+
 **What stays imperative always**, on every host: volume creation (`diskutil apfs addVolume` — stateful, hardware-
 adjacent) and every per-project/per-workspace artifact (images, grants, tokens, CA keys). Those live inside cowshed's
-volumes, not `$HOME`; there is nothing for a dotfile generation to own.
+volumes, not `$HOME`; there is nothing for a dotfile generation to own. Trusted repository bindings and policy are the
+exception: despite living under the cowshed volume, they remain host-bootstrap-owned and outside workspace authority.
 
 ## Deployment postures
 
-Paths are uid-relative — `~/.cowshed` — under every posture; a posture decides _which uid_, never _which path_. A fixed
-non-user path (`/opt/cowshed`, `/Users/Shared`) was considered and rejected: cross-uid sharing would force a group-ACL
-model through grant files (0600, controller-owned), supervisor and gateway sockets, volume ownership, and Keychain
-access. Same-uid-or-nothing.
+Paths are uid-relative under every posture: cowshed state is rooted at `~/.cowshed`, and trusted policy is
+`~/.cowshed/<owner>/<repo>/policy.json`. A posture decides _which uid owns that root and its policy_, never derives a
+second identity from a machine-local checkout path. Host activation and repository bootstrap MUST run as that owning uid
+(or a trusted system service writing on its behalf); a workspace, remote editor, or personal-session broker cannot
+bootstrap policy. Changing postures is an explicit reprovision into the new owner's root, not a recursive `chown`,
+shared-policy mount, or rediscovery. Multiple repository identities remain separate path-safe owner/repo trees, with the
+binding's single primary identity selecting the default policy. Fixed cross-user state was considered and rejected:
+sharing would force a group-ACL model through controller-owned policy and grant files (0600), supervisor and gateway
+sockets, volume ownership, and Keychain access. Same-uid-or-nothing.
 
 ### Posture A — single account (default)
 
@@ -77,7 +102,8 @@ Two ways to live in it:
 - **B1 — full login as dev** (fast-user-switching): simplest semantics; GUI, editors, everything as dev.
 - **B2 — remote-backend session (recommended)**: ONE GUI session (the personal account); ALL workloads as dev. Treat the
   dev uid as a remote dev machine that happens to be localhost — the devcontainer pattern without containers:
-  - shells: `ssh dev@localhost` (Remote Login enabled, scoped to dev, key auth) or `sudo -u dev -i` for quick ones;
+  - shells: connect to the dedicated account over localhost SSH (Remote Login enabled, scoped to that account, key auth)
+    or use an equivalent explicit uid switch for quick shells;
   - editors: remote backends — VS Code/Cursor Remote-SSH to `dev@localhost`, JetBrains Gateway, Zed remote. The GUI
     client runs as the personal user; the server, LSPs, watchers, terminals, agents, and builds all run as dev.
 
@@ -130,19 +156,22 @@ session); Xcode-heavy days may simply prefer B1.
 
 ### Artifact handoff: the drop dir
 
-The one sanctioned path for build products to cross the uid boundary is a **one-way drop directory**:
-`/Users/Shared/cowshed-drop/<project_id>/` — dev-owned, world-readable, sticky-bit semantics. Dev writes **immutable
-artifacts** (a built `.app`, via `cowshed sim export` — 06_cli.md); the personal side reads. This is the CI-artifact
-pattern — an immutable product crosses, never a live tree — and it is explicitly **not** cross-uid file sharing, which
-stays rejected below. The personal side may run an optional launchd path-watcher that auto-installs and relaunches new
-artifacts into the booted simulator (`simctl install` + `launch`).
+The one sanctioned path for build products to cross the uid boundary is a deployment-configured **one-way drop
+directory**, written here as `<drop-dir>/<owner>/<repo>/`. The dedicated development account owns it; the personal side
+can read it, and sticky-bit semantics prevent consumers from rewriting another producer's artifacts. Dev writes
+**immutable artifacts** (a built `.app`, via `cowshed sim export` — 06_cli.md); the personal side reads. This is the
+CI-artifact pattern — an immutable product crosses, never a live tree — and it is explicitly **not** cross-uid file
+sharing, which stays rejected below. An optional personal-session path watcher may notify the human or stage an artifact
+for review, but it MUST NOT install, launch, or relaunch anything.
 
 The consent rule, and why it exists: **simulator apps execute as the invoking user, with only loosely-emulated iOS
 containment** — installing a build into the personal-session simulator is running that code as yourself, which is
-precisely the hole posture B closes. So personal-session installs are **human-initiated, per-artifact**; agents cannot
-target the personal simulator except through the `--sim` grant class (04_sandbox.md), where `openurl` (driving an
-already-consented install) is grantable freely and `install` is additionally bound to drop-dir artifacts and the
-human-gating rule. Agent test loops stay on dev-side headless simulators, always.
+precisely the hole posture B closes. Personal-session installs are therefore **human-initiated, per-artifact**. The
+personal-session broker exposes only `openurl` and `install`: `openurl` may drive an already-consented install under a
+workspace grant, while `install` accepts only an immutable drop-dir artifact and completes only after explicit human
+approval for that artifact. A watcher can notify or stage but cannot invoke this approval or installation path. Device
+`list` and `boot` remain dev-side operations against dev-owned headless simulators and are never brokered into the
+personal session. Agent test loops stay on dev-side headless simulators, always.
 
 ### macOS desktop apps: three lanes
 
@@ -159,10 +188,9 @@ three rather than treating daily use as an escape hatch:
 
 **Lanes 1–2 run the drop-dir build in place, as dev — no broker, no grant, no promotion.** Driving a dev-session app as
 dev is just dev running dev's app (like dev-side headless simulators need no `/sim/` grant): agents automate it through
-accessibility APIs / AppleScript — the same mechanism cowshed's agent-browser tooling already uses for Electron apps (VS
-Code, Slack) — and screenshots come out. Lane 1 uses the **dev-side background GUI session** (the persistent Aqua
-session recommended for simulator reliability above, now doing double duty). This makes desktop testing **simpler** than
-the simulator case: same uid, so no `/sim/`-style cross-session broker is involved at all.
+accessibility APIs / AppleScript, and screenshots come out. Lane 1 uses the **dev-side background GUI session** (the
+persistent Aqua session recommended for simulator reliability above, now doing double duty). This makes desktop testing
+**simpler** than the simulator case: same uid, so no `/sim/`-style cross-session broker is involved at all.
 
 **Lane 3 is `cowshed app export` → `cowshed app promote`:**
 
@@ -198,13 +226,13 @@ run-as-dev; using wants run-as-you, and `promote` is the bridge between them.
 
 ### Explicitly unsupported (v1)
 
-**Cross-uid FILE access**: personal-account processes reading or writing `/Users/dev` directly — an editor opening dev
-files as the personal user, shared group-ACL trees. B2 does not need it (the personal side hosts only GUI frontends
-speaking to dev-side backends over SSH/sockets), and half-supporting it would mean permissions, launchd, and socket
-semantics that limp. Group-ACL sharing is a roadmap note, nothing more. `cowshed doctor` refuses cowshed volumes owned
-by a different uid with a clear error (per-user volume naming, e.g. `cowshed.store.<uid>`, is noted as a future
-extension for multi-posture machines) — and recognizes posture B2 as healthy: running via an ssh or `sudo -u dev` shell
-is fine and expected.
+**Cross-uid FILE access**: personal-account processes reading or writing the dedicated development account's home
+directly — for example, a personal-session editor opening dev-owned files in place or a shared group-ACL tree. B2 does
+not need it (the personal side hosts only GUI frontends speaking to dev-side backends over SSH/sockets), and
+half-supporting it would mean permissions, launchd, and socket semantics that limp. Group-ACL sharing is a roadmap note,
+nothing more. `cowshed doctor` refuses cowshed volumes owned by a different uid with a clear error (per-user volume
+naming is noted as a future extension for multi-posture machines) — and recognizes posture B2 as healthy: running via a
+remote-backend shell or explicit uid switch is fine and expected.
 
 ## Tradeoffs
 
@@ -213,9 +241,10 @@ exactly the out-of-band drift HM users adopted HM to eliminate; the next `home-m
 costs one detection check and keeps both audiences: nix hosts get generation-owned state, everyone else keeps
 zero-config adopt.
 
-**Fixed shared path rejected** (see Deployment postures): a group-writable `/opt/cowshed` breaks the 0600
-controller-owned grant model and Keychain scoping for no gain — the uid boundary is the point of posture B, not a shared
-filesystem.
+**Fixed shared path rejected** (see Deployment postures): a group-writable shared state root breaks the 0600
+controller-owned policy and grant model and Keychain scoping for no gain — the uid boundary is the point of posture B,
+not a shared filesystem. The separately configured one-way artifact drop is not a state root and grants no access back
+into cowshed.
 
 **Split-session cross-uid file sharing rejected (v1)**: the one configuration that looks convenient — personal GUI
 editing dev-owned files in place — reintroduces every cross-uid ACL problem the fixed-path rejection avoided, at the

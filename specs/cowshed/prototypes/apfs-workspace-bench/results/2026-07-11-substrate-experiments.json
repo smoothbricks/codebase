@@ -63,7 +63,7 @@
     "verdict": "Crash-consistent live cloning is reliably fsck-clean and mountable under heavy churn, on both SPARSE and ASIF. `cowshed new` should: sync the mounted volume before clonefile (freshness, not correctness), attach the clone -nomount, fsck (fsck_apfs for SPARSE; diskutil image attach --noMount + fsck_apfs for ASIF) as a cheap safety net, then mount. The delete-and-retry-once fallback is unlikely to ever trigger from write churn alone."
   },
   "q4_tmutil": {
-    "observation": "Every probe path returned '[Excluded]' — but the test dir is under /private/tmp, which macOS excludes from Time Machine by default. Inconclusive for the real ~/.cowshed state location.",
+    "observation": "Every probe path returned '[Excluded]' — but the test dir is under /private/tmp, which macOS excludes from Time Machine by default. Inconclusive for the real <state-root> location.",
     "verdict": "Cannot confirm image-volume TM-default from /private/tmp. The spec's volume-level exclusion should stay as belt-and-suspenders; whether internal image-backed volumes are TM-included by default remains a verification item to run against the real state dir."
   },
   "critical_finding_asif_attach": {

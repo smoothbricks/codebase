@@ -7,48 +7,62 @@ it) and **ZFS datasets** (Linux; macOS only where OpenZFS is already installed).
 
 ## The `Substrate` trait
 
+Lifecycle is asynchronous because image tools, `zfs`, sync, fsck, mount, and helper RPCs can block. Pure synchronous
+planning is deliberately separate from execution: planning validates identities, names, policy, topology, and intended
+state transitions without touching the platform; execution performs the blocking plan on an async executor. No trait
+method hides a blocking subprocess or filesystem operation in a synchronous call.
+
 ```rust
 pub trait Substrate: Send + Sync {
-    fn adopt(&self, checkout: &Path, project: &ProjectId) -> Result<Main>;
-    fn list(&self, project: &ProjectId) -> Result<Vec<WorkspaceRef>>;   // enumeration is substrate-owned: readdir vs `zfs list`
-    fn snapshot_main(&self, main: &Main) -> Result<SnapshotRef>;        // crash-consistent point; owned — see below
-    fn create_workspace(&self, from: SnapshotRef, name: &WsName) -> Result<Workspace>; // mounted; consumes the snapshot
-    fn checkpoint(&self, ws: &Workspace, label: &Label) -> Result<CheckpointRef>;
-    fn restore(&self, ws: &Workspace, cp: CheckpointRef, mode: RestoreMode) -> Result<()>;
-    fn fork(&self, src: &Workspace, dst: &WsName) -> Result<Workspace>;
-    fn retire(&self, ws: &Workspace) -> Result<RetiredRef>;             // logical: fast, drops out of enumeration
-    fn reclaim(&self, retired: RetiredRef) -> Result<()>;               // physical: idempotent, background, gc-resumable
-    fn mount_state(&self, ws: &WorkspaceRef) -> Result<MountState>;     // derived, never cached
-    fn ensure_mounted(&self, ws: &WorkspaceRef) -> Result<PathBuf>;
-    fn unmount(&self, ws: &WorkspaceRef) -> Result<()>;
-    fn caches_root(&self) -> Result<PathBuf>;                           // shared layer-3 area
-    fn stats(&self, ws: &WorkspaceRef) -> Result<SubstrateStats>;       // space, pinned, quota, dependents
-    fn gc(&self) -> Result<GcReport>;
+    fn plan_adopt(&self, checkout: &Path, repo: &RepoId) -> Result<AdoptPlan>;
+    fn plan_create(&self, from: &WorkspaceRef, name: &WsName) -> Result<CreatePlan>;
+    fn plan_checkpoint(&self, ws: &WorkspaceRef, label: &Label, pin: Pin) -> Result<CheckpointPlan>;
+    fn plan_restore(&self, ws: &WorkspaceRef, cp: &CheckpointRef, mode: RestoreMode) -> Result<RestorePlan>;
+    fn plan_fork(&self, src: &WorkspaceRef, dst: &WsName) -> Result<ForkPlan>;
+    fn plan_retire(&self, ws: &WorkspaceRef) -> Result<RetirePlan>;
+
+    async fn execute_adopt(&self, plan: AdoptPlan) -> Result<Main>;
+    async fn execute_create(&self, plan: CreatePlan) -> Result<Workspace>;
+    async fn execute_checkpoint(&self, plan: CheckpointPlan) -> Result<CheckpointRef>;
+    async fn execute_restore(&self, plan: RestorePlan) -> Result<RestoreReceipt>;
+    async fn execute_fork(&self, plan: ForkPlan) -> Result<Workspace>;
+    async fn execute_retire(&self, plan: RetirePlan) -> Result<RetiredRef>;
+    async fn reclaim(&self, retired: RetiredRef) -> Result<()>;
+    async fn list(&self, repo: &RepoId) -> Result<Vec<WorkspaceRef>>;
+    async fn mount_state(&self, ws: &WorkspaceRef) -> Result<MountState>;
+    async fn ensure_mounted(&self, ws: &WorkspaceRef) -> Result<PathBuf>;
+    async fn unmount(&self, ws: &WorkspaceRef) -> Result<()>;
+    async fn caches_root(&self) -> Result<PathBuf>;
+    async fn stats(&self, ws: &WorkspaceRef) -> Result<SubstrateStats>;
+    async fn gc(&self) -> Result<GcReport>;
 }
 ```
 
 Contract notes:
 
-- **`SnapshotRef` is owned.** It is released by `create_workspace` (which consumes it) or by explicit cleanup/`gc` —
-  never leaked. On APFS the "snapshot" _is_ the clonefile: `snapshot_main` may return a token meaning "clone the live
-  image now" and the two calls collapse into one operation; the trait permits that. On ZFS it is a real
-  `main@cowshed:<name>` snapshot with a lifetime the substrate must account for.
-- **`retire`/`reclaim` replace one APFS-shaped `destroy`.** Retire is the perceived-instant half — APFS renames the
-  image into `sessions/.trash/`, ZFS renames the dataset into a `…/.trash` namespace — after which the workspace no
-  longer enumerates. Reclaim is the physical half — unlink; `zfs destroy` clone then origin snapshot — idempotent,
-  allowed to fail transiently (busy mounts, dependent forks), resumed by `gc`.
-- **References are opaque.** `WorkspaceRef`/`SnapshotRef`/`RetiredRef`/`CheckpointRef` never leak image paths or dataset
-  names above the trait; everything above it addresses workspaces by name.
+- **Plans are pure, immutable, and capability-free.** They contain validated logical names, expected
+  incarnation/revision, and intended operations, but no open descriptors, mounted paths supplied by callers, or executed
+  side effects. Execute revalidates all preconditions under the workspace lock before the first mutation; a stale plan
+  conflicts.
+- **Async execution owns blocking work.** Implementations use the platform executor's blocking lane for subprocesses and
+  blocking syscalls, remain cancellation-safe at documented transaction boundaries, and never block an async runtime
+  worker. CLI commands may synchronously wait at the outermost process boundary; library consumers await futures.
 
-Selection is convention, not configuration: `statfs` of the project root decides — APFS → image substrate, ZFS → zfs
-substrate. `.cowshed.toml` `substrate = "apfs-image" | "zfs"` overrides (the only expected use: forcing images on a mac
-that also runs OpenZFS). `cowshed doctor` prints which substrate is active and why.
+Selection is convention, not guesswork. `statfs` of the project root selects APFS images when it reports APFS. When it
+reports ZFS, cowshed uses the containing dataset only if its pool has a suitable delegated cowshed root. If `statfs`
+cannot identify such a dataset (including a non-ZFS checkout whose workspace data should live on ZFS), selection
+requires an explicit `.cowshed.toml` `[substrate] kind = "zfs"` and `pool = "<pool>"`; cowshed never scans pools or
+silently picks one. A configured pool must contain or permit creation of the exact hierarchy below. `cowshed doctor`
+prints the selected substrate, pool, and evidence.
 
 ## APFS image substrate (reference)
 
-As specified in 01_storage.md and 02_workspaces.md: one `.asif` per workspace, clonefile ≈ 2 ms, `hdiutil attach` ≈ 235
-ms, verification before first mount (attach `-nomount`, `fsck_apfs -q`, then mount), deletion unlinks one file. Clones
-are fully independent of their source — no GC coupling.
+As specified in 01_storage.md and 02_workspaces.md: one format-specific image per workspace — `.asif` for ASIF or
+`.sparseimage` for SPARSE — with clonefile ≈ 2 ms and attach ≈ 235–400 ms. The host-readable sibling metadata carries
+`imageFormat`; enumeration recognizes both extensions, and cowshed refuses an extension/metadata mismatch before attach.
+Dispatch is `diskutil image attach` for ASIF and `hdiutil attach` for SPARSE, followed by verification before the first
+mount (attach without mounting, `fsck_apfs -q`, then mount). Deletion unlinks one file. Clones preserve their source
+format and extension and are fully independent of their source — no GC coupling.
 
 ## ZFS substrate
 
@@ -56,10 +70,10 @@ are fully independent of their source — no GC coupling.
 
 | cowshed concept                   | ZFS object                                                                                                                                                                                                   |
 | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| project                           | `<pool>/cowshed/<project_id>` (container dataset)                                                                                                                                                            |
-| main workspace                    | `<pool>/cowshed/<project_id>/main`, `mountpoint=` original checkout path                                                                                                                                     |
-| session workspace                 | `<pool>/cowshed/<project_id>/ws/<name>`                                                                                                                                                                      |
-| workspace mounts                  | `mountpoint` inheritance on `…/ws` → `~/.cowshed/mnt/<project_id>/<name>`                                                                                                                                    |
+| project                           | `<pool>/cowshed/projects/<owner>/<repo>` (primary `repo_id`; component-safe container dataset)                                                                                                               |
+| main workspace                    | `<pool>/cowshed/projects/<owner>/<repo>/main`, `mountpoint=` original checkout path                                                                                                                          |
+| session workspace                 | `<pool>/cowshed/projects/<owner>/<repo>/ws/<name>`                                                                                                                                                           |
+| workspace mounts                  | `mountpoint` inheritance on `…/ws` → `~/.cowshed/mnt/<owner>/<repo>/<name>`                                                                                                                                  |
 | crash-consistent snapshot of main | `zfs snapshot main@cowshed:<name>` (transactionally atomic)                                                                                                                                                  |
 | `cowshed new`                     | snapshot + `zfs clone` — tens of ms, mounts itself, **no attach step, no fsck step**                                                                                                                         |
 | `cowshed checkpoint <ws> <label>` | `zfs snapshot ws@<label>` — instant, zero-copy                                                                                                                                                               |
@@ -67,19 +81,25 @@ are fully independent of their source — no GC coupling.
 | `cowshed fork <src> <dst>`        | `zfs snapshot src@cowshed:fork-<dst>` + clone                                                                                                                                                                |
 | `cowshed rm`                      | retire: `zfs rename` into `…/.trash`; reclaim: `zfs destroy` the clone **then** its origin snapshot — an idempotent logical transaction (physically two commands; `cowshed gc` completes interrupted halves) |
 | capacity cap                      | `refquota` per workspace dataset (replaces sparse-image capacity)                                                                                                                                            |
-| shared caches (layer 3)           | `<pool>/cowshed/caches` dataset mounted at `~/.cowshed/caches`                                                                                                                                               |
+| shared caches (layers 1 and 3)    | `<pool>/cowshed/caches` dataset mounted at `~/.cowshed/caches`                                                                                                                                               |
+| Linux gateway attachment          | no persistent port block; per-incarnation Unix socket + private netns + trusted `127.0.0.1:7644` connector, created and destroyed with attachment                                                            |
 | compaction                        | not needed — freed blocks return to the pool                                                                                                                                                                 |
 
-Adopt on ZFS: create `…/main`, copy the tree once (rsync-fidelity, preserving metadata), set `mountpoint=` the original
-path. The original tree moves aside as `<root>.pre-cowshed` exactly as on macOS. The self-healing stub `.envrc` is still
-written beneath the mountpoint — ZFS mounts also disappear when a pool isn't imported, and healing parity keeps
-`cowshed ensure` identical across substrates.
+Adopt on ZFS: create `…/projects/<owner>/<repo>/main`, copy the tree once (rsync-fidelity, preserving metadata), set
+`mountpoint=` the original path. The original tree moves aside as `<root>.pre-cowshed` exactly as on macOS. The
+self-healing stub `.envrc` is still written beneath the mountpoint — ZFS mounts also disappear when a pool isn't
+imported, and healing parity keeps `cowshed ensure` identical across substrates.
 
-Markers, tokens, grant semantics, secrets gates, and the cache taxonomy are unchanged. Layer-2 extracted caches stay
-**in-dataset** and arrive via the clone, same as in-image: hardlinks cannot cross datasets, so a shared extracted cache
-would demote installs to copies. OpenZFS ≥ 2.2 block cloning (`copy_file_range` → BRT) makes reflink-grade copies work
-_across_ datasets in one pool; cowshed treats that as an opportunistic bonus, never load-bearing (it is version- and
-tunable-dependent).
+Markers, tokens, grant semantics, secrets gates, and the cache taxonomy are unchanged. Detached metadata uses the same
+schema but `portBlock` is optional and omitted for ZFS/Linux. When a dataset is attached, the controller creates its
+private loopback-only netns, bind-mounts that incarnation's Unix gateway socket, and launches the trusted connector on
+namespace-local `127.0.0.1:7644`; package tools use that HTTP address, not a Unix-socket API. Detach drains and kills
+the connector cgroup and unlinks the socket before releasing the netns. Restore fences and drains the old connector
+before publishing the replacement incarnation, then creates a fresh socket and connector before admitting jobs. Layer-2
+extracted caches stay **in-dataset** and arrive via the clone, same as in-image: hardlinks cannot cross datasets, so a
+shared extracted cache would demote installs to copies. OpenZFS ≥ 2.2 block cloning (`copy_file_range` → BRT) makes
+reflink-grade copies work _across_ datasets in one pool; cowshed treats that as an opportunistic bonus, never
+load-bearing (it is version- and tunable-dependent).
 
 ### The clone-origin dependency
 
@@ -116,23 +136,58 @@ unprivileged.
 ### Linux host paths
 
 State paths are identical across platforms — the store volume/dataset at `~/.cowshed`, caches nested at
-`~/.cowshed/caches` — only the volume technology behind each mountpoint differs (a pool necessarily exists on the ZFS
-substrate, so dedicating datasets costs nothing, exactly like APFS container volumes):
+`~/.cowshed/caches` — only the volume technology behind each mountpoint differs. ZFS additionally keeps workspace data
+in the sibling `projects` dataset tree:
 
-| macOS                                                                                              | Linux                                                         |
-| -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
-| `cowshed.store` APFS volume at `~/.cowshed` (images, grants, quarantine, gateway state, telemetry) | `<pool>/cowshed/store` dataset at `~/.cowshed`                |
-| `cowshed.caches` APFS volume at `~/.cowshed/caches`                                                | `<pool>/cowshed/caches` dataset at `~/.cowshed/caches`        |
-| Keychain (gateway secrets)                                                                         | secret-service (keyring) or `systemd-creds` on headless hosts |
-| launchd (gateway, login attach)                                                                    | systemd user units                                            |
+| macOS                                                                                              | Linux                                                                 |
+| -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `cowshed.store` APFS volume at `~/.cowshed` (images, grants, quarantine, gateway state, telemetry) | `<pool>/cowshed/store` dataset at `~/.cowshed`                        |
+| `cowshed.caches` APFS volume at `~/.cowshed/caches`                                                | `<pool>/cowshed/caches` dataset at `~/.cowshed/caches`                |
+| project images are files on `cowshed.store`                                                        | `<pool>/cowshed/projects/<owner>/<repo>` workspace dataset containers |
 
-### What ZFS adds
+### Fixed dataset hierarchy
 
-- **`zfs send -i`**: ship a warm workspace or checkpoint to another host (fleet runners cloning a shared main,
-  10_ci.md), and real incremental backup of main — a durability upgrade over the APFS posture where images are excluded
-  from backup and git is the only exit.
-- **`refquota`/`refreservation`** per workspace; **native encryption** per project dataset.
-- **No fsck, ever**: snapshots are consistent by construction; `cowshed new` drops the verify step.
+The ZFS root has exactly three sibling children; project datasets never sit beside or beneath the store dataset:
+
+```
+<pool>/cowshed
+├── store       mountpoint=~/.cowshed
+├── caches      mountpoint=~/.cowshed/caches
+└── projects    mountpoint=none
+    └── <owner>/<repo>/{main,ws/...}
+```
+
+`store` contains repository bindings, trusted `policy.json`, grants, quarantine, gateway state, and telemetry. `caches`
+is wholly rebuildable. `projects` contains only workspace datasets and their snapshots. Creation, helper containment
+checks, discovery, send/receive, and GC all use these exact roots; the three siblings are not configurable
+independently.
+
+### Restore transaction
+
+Restore is one fenced transaction on both substrates:
+
+1. Acquire the workspace lifecycle lock and revalidate the plan's current `workspaceIncarnation`, grant revision,
+   checkpoint identity, format/dataset, and absence of a concurrent retire. Stop admitting jobs, drain the
+   revision-bound supervisor, and detach/unmount the current workspace.
+2. Prepare the replacement at a non-enumerated staging name. Clone the checkpoint, validate it (including fsck on APFS),
+   and preserve the logical workspace name, grant binding, CA, primary `repo_id`, and the macOS `portBlock` only when
+   present. Linux preserves no port block; its connector endpoint is recreated as attachment topology.
+3. Mint the fresh `workspaceIncarnation` first. Then mint a fresh gateway token bound to that incarnation and write both
+   into the staged marker/token files, flush them, and verify them while the replacement is still not discoverable.
+   Copied job records retain their producer incarnation; the new incarnation's numeric job sequence starts
+   independently.
+4. Atomically swap the staged replacement into the canonical image/dataset name while moving the displaced workspace to
+   the undo checkpoint. Mount at the canonical path, then validate marker, incarnation, token, policy binding, and
+   grants.
+5. Publish detached metadata carrying the new incarnation with an atomic replace and parent-directory fsync. Only after
+   that publication may the gateway accept the new token, a supervisor launch, or an exec. The old token is revoked at
+   the same publication boundary; no interval admits both incarnations.
+6. On any failure before publication, unmount and remove the staged replacement, restore the displaced workspace under
+   its original name, remount it, and resume its original supervisor/token. After publication, recovery completes the
+   new state and never rolls back across the incarnation fence. `gc` resumes only idempotent cleanup.
+
+Default ZFS restore uses clone-swap so later checkpoints survive; `--discard-newer` may use rollback but follows the
+same fencing, token/incarnation, publication, and supervisor ordering.
 
 ### macOS ZFS, btrfs
 

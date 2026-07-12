@@ -12,11 +12,11 @@ naturally:
 
 ```
 $ cowshed ensure          # in an .envrc: this already ran when you cd'd in
-cowshed: reattached conloca/raven (image was healthy, mount was gone)
+cowshed: reattached acme/widget/raven (image was healthy, mount was gone)
 ```
 
 Adopted main workspaces self-heal through the stub `.envrc` cowshed wrote _underneath_ the mountpoint during `adopt`:
-when unmounted, `cd ~/Dev/conloca` hits the stub, which runs `cowshed ensure --attach`; the real `.envrc` shadows the
+when unmounted, `cd <project-root>` hits the stub, which runs `cowshed ensure --attach`; the real `.envrc` shadows the
 stub once mounted, and direnv reloads. You `direnv allow` each file once. The login LaunchAgent attaches permanent
 workspaces proactively; `ensure` is the belt-and-braces.
 
@@ -35,17 +35,24 @@ dependent tooling fails loudly. For push: the offending hunks are named — remo
 meanwhile skips (never propagates findings) and warns. False positive? Add a reasoned waiver (shown by `cowshed doctor`
 forever after) rather than working around the gate.
 
-**Attach fails.** `cowshed doctor` distinguishes: image file missing (exit 3 — was it `cowshed rm`'d from another
-session?), image fails verification (restore a checkpoint or re-clone from main), or mountpoint dir occupied by real
-files (exit 4 — something wrote to the unmounted path; cowshed never deletes those files for you; move them and re-run).
+**Attach fails.** `cowshed doctor` distinguishes: image/dataset missing, image verification failure on macOS, occupied
+mountpoint, or Linux attachment wiring failure. On Linux an attachment is healthy only when its private netns contains
+exactly one trusted connector bound to `127.0.0.1:7644` and that connector can open the mounted per-incarnation
+`/run/cowshed/gateway.sock`. `ensure` recreates missing runtime wiring; it never invents a Linux `portBlock`.
+
+**Repository identity conflict.** cowshed records the selected remote URL and its normalized lowercase `owner/repo`
+`repo_id`. If the URL no longer normalizes to that identity, open fails instead of mounting another repository's data.
+Fix the remote or explicitly select/rebind the intended identity; discovery only proposes candidates. Local-only
+repositories must be adopted with `--repo-id owner/repo`. Moving a checkout is not a conflict. Trusted policy is read
+only from `~/.cowshed/<owner>/<repo>/policy.json`, never from the checkout.
 
 ## Sandbox denials (exit 6)
 
 When cowshed reports exit 6, it comes with the diagnosis and the fix on stderr:
 
 ```
-cowshed: sandbox denied file-write /Users/danny/Dev/other-repo/gen.lock
-next: cowshed grant raven --write /Users/danny/Dev/other-repo
+cowshed: sandbox denied file-write <external-path>/gen.lock
+next: cowshed grant raven --write <external-path>
 ```
 
 Exit 6 is only ever reported on authoritative evidence: egress denials always (the gateway logged the decision),
@@ -63,12 +70,24 @@ and the gateway audit events for egress (`cowshed audit --denied | tail`). Commo
   `--write ~`), or set the tool's env override to a path inside the workspace — `cowshed shell` and fix its config once;
   it's in the image and every fork inherits it.
 - **Egress to an unmirrored host**: `cowshed grant <ws> --egress <host>` — applies immediately, no re-exec.
+- **Linux package/proxy client gets connection refused at `127.0.0.1:7644`**: do not point it at the Unix socket or a
+  macOS block base. Run `cowshed ensure`; `doctor` distinguishes a detached workspace, absent/dead connector, missing or
+  wrong per-incarnation socket mount, and a dead host gateway. A healthy workspace uses
+  `http://127.0.0.1:7644/{npm,cargo,go}` and the same base in `HTTP_PROXY`/`HTTPS_PROXY` (plus lowercase forms). Detach
+  and restore intentionally drain old connections; retry only after the new attachment is admitted.
+- **Linux 401 versus 403**: 401 means the endpoint/token pair did not authenticate—often stale pre-restore wiring. 403
+  means endpoint and token authenticated but policy denied the destination; use the gateway's grant hint. Port 7644 by
+  itself is not workspace identity: the private netns plus mounted socket inode selects the workspace.
 - **`go` denied writing `~/go`**: that deny is a deliberate tripwire, not a bug — it means a go invocation ran without
   the workspace's `GOENV` wiring (an unwrapped spawn, or an editor without direnv integration). Run it through
   `cowshed exec`/a direnv shell, or fix the editor's direnv plugin; never grant `~/go`. `cowshed doctor` prints the same
   hint, and checks the host for a stray `~/go` that predates adoption (safe to delete — it is only cache).
 - **Denial persists after a grant**: filesystem grants apply from the _next_ exec; a long-running process (watcher, dev
   server) keeps its launch-time profile. Restart that process.
+
+**Checkpoint was not pruned.** GC keeps the union of three sets: explicit pins, every checkpoint younger than 14 days,
+and the newest five checkpoints per workspace. A user label and `cowshed checkpoint --keep` both pin; age or count does
+not override a pin. Unpin explicitly before expecting GC to remove it.
 
 ## Disk usage
 
@@ -86,6 +105,15 @@ Attribution: `du` on the images directory tells you per-workspace cost; _inside_
 — it's just APFS. Remember clones share extents: ten fresh workspaces cost ~zero until they diverge, so "sum of image
 sizes" overstates real usage. `df -h ~/.cowshed/caches` covers the shared cache volume; it shares the container's free
 space with everything else.
+
+Cargo's shared writable caches are `~/.cowshed/caches/cargo/{registry,git}`; gateway-owned bare repository mirrors are
+separate at `~/.cowshed/caches/repo-mirrors` and must remain sandbox-read-only.
+
+**Nix cache/state points at the host filesystem.** On declarative hosts the module must own
+`~/.cache/nix → ~/.cowshed/caches/nix/cache` and `~/.local/state/nix → ~/.cowshed/caches/nix/state`; `adopt` and
+`ensure` only validate. Fix the declarative configuration rather than allowing cowshed to mutate it. The explicit
+`cowshed adopt --imperative-host-setup` fallback is only for a host with no supported declarative owner; it is never an
+automatic recovery from mixed or broken ownership.
 
 ## Path-sensitive caches (why a fresh workspace rebuilds more than expected)
 
@@ -112,6 +140,20 @@ better protected by git. The durability contract:
 Restoring a machine: clone main's repo from its origin remote, `cowshed adopt` again; workspaces are recreated from
 their saved branches (`cowshed new x --ref refs/cowshed/x/wip`). Checkpoints and images are not backup artifacts — never
 treat them as one.
+
+## ZFS pool and hierarchy
+
+A ZFS host uses exactly three sibling datasets under the configured root: `<pool>/cowshed/store` at `~/.cowshed`,
+`<pool>/cowshed/caches` at `~/.cowshed/caches`, and `<pool>/cowshed/projects` for `<owner>/<repo>/{main,ws/...}`. If
+`statfs` does not locate a suitable delegated ZFS dataset, configure `[substrate] kind = "zfs"` and `pool = "<pool>"`;
+cowshed deliberately refuses to scan pools or guess. `cowshed doctor` reports the selected pool and any missing sibling,
+mountpoint, or delegation.
+
+**Restore interrupted.** Before detached metadata publication, recovery restores the displaced workspace, old
+incarnation, and old token. After publication, recovery completes the replacement forward; it never rolls back across
+the incarnation fence. A healthy restore always drains the old supervisor, stages and verifies the replacement, mints
+the new incarnation then token, swaps and mounts, publishes metadata atomically, revokes the old token, and only then
+admits a supervisor or job. No state should accept both tokens; `cowshed doctor` reports a publication mismatch.
 
 ## When cowshed itself misbehaves
 

@@ -1,7 +1,7 @@
 Project created
 
 ```text
-  /Users/danny/Dev/apfs-workspace-bench/
+  <benchmark-root>/
   ├── package.json
   ├── bun.lock
   ├── bench.ts
@@ -24,11 +24,11 @@ It uses:
 Run it with:
 
 ```bash
-  cd ~/Dev/apfs-workspace-bench
+  cd <benchmark-root>
 
   bun run bench
-  bun run scan ~/Dev/Conloca --depth 2 --limit 40 --threshold 10000
-  bun run classify ~/Dev/Conloca/.jcode-worktrees/session_raven_1779838230248_e95b74ac46e7dd0a
+  bun run scan <project-root> --depth 2 --limit 40 --threshold 10000
+  bun run classify <project-root>/.agent-session-trees/session-example
 ```
 
 The benchmark cleans its /private/tmp workspace by default. Add --keep to retain the generated images.
@@ -56,7 +56,7 @@ The base contained a real Git repository with:
 - 1,000 files differing between branches;
 - ignored node_modules and Rust cache trees.
 
-This was intentionally close to one of the observed Conloca session workspaces, where node_modules contains roughly
+This was intentionally close to one of the observed agent session workspaces, where node_modules contains roughly
 88,000–96,000 objects.
 
 The “fresh session” measurements are fresh shadow/clone session creation while macOS is already running, not a machine
@@ -164,21 +164,21 @@ For Node, Rust, package installation, branch checkout, and build output workload
 
 ────────────────────────────────────────────────────────────────────────────────
 
-Real Conloca inode profile
+Real project inode profile
 
-The new Bun scripts scanned the actual Conloca trees.
+The new Bun scripts scanned the actual project and agent session trees.
 
 Whole repository
 
 ```text
-  8,357,293  ~/Dev/Conloca
-  6,152,355  ~/Dev/Conloca/.jcode-worktrees
-  1,891,789  ~/Dev/Conloca/.claude/worktrees
-    254,599  ~/Dev/Conloca/node_modules
-     42,461  ~/Dev/Conloca/.nx/cache
+  8,357,293  <project-root>
+  6,152,355  <project-root>/.agent-session-tree-a
+  1,891,789  <project-root>/.agent-session-tree-b
+    254,599  <project-root>/node_modules
+     42,461  <project-root>/.nx/cache
 ```
 
-jCode session tree
+Agent session tree A
 
 ```text
   Root objects:          6,152,354
@@ -187,20 +187,7 @@ jCode session tree
   node_modules share:       97.20%
 ```
 
-Largest remaining source categories across all 69 sessions:
-
-```text
-  privpkgs       86,482
-  packages       43,096
-  targets        13,746
-  specs           9,384
-  example         6,141
-  tooling         4,811
-  project         2,484
-  .nx             1,656
-```
-
-Claude worktree tree
+Agent session tree B
 
 ```text
   Root objects:          1,891,789
@@ -223,7 +210,7 @@ That is:
   7,810,798 / 8,357,293 = 93.46%
 ```
 
-So moving only session node_modules trees into image-backed files would remove approximately 93.5% of all Conloca
+So moving only session node_modules trees into image-backed files would remove approximately 93.5% of all project
 filesystem objects from the host Data volume, while leaving:
 
 - the main checkout;
@@ -242,28 +229,25 @@ Recommended initial architecture: Git outside, caches in B clones
 Use ordinary linked Git worktrees for source and one cloned cache image per session.
 
 ```text
-  ~/Dev/
-  └── Conloca/                       ordinary hot main checkout
-      └── .git/                      authoritative shared Git repository
+  <project-root>/                     ordinary hot main checkout
+  └── .git/                           authoritative shared Git repository
 
-  ~/WorkspaceImages/
-  └── Conloca/
-      ├── cache-base.sparseimage     hot node_modules/build-cache template
-      └── sessions/
-          ├── raven.sparseimage      /bin/cp -c clone
-          ├── fox.sparseimage
-          └── bug-123.sparseimage
-
-  ~/DevSessions/
-  └── Conloca/
-      ├── raven/
-      │   ├── src/                   ordinary linked Git worktree
-      │   └── cache/                 mounted image
+  <benchmark-root>/
+  ├── workspace-images/
+  │   ├── cache-base.sparseimage      hot node_modules/build-cache template
+  │   └── sessions/
+  │       ├── session-a.sparseimage   /bin/cp -c clone
+  │       ├── session-b.sparseimage
+  │       └── bug-123.sparseimage
+  └── sessions/
+      ├── session-a/
+      │   ├── src/                    ordinary linked Git worktree
+      │   └── cache/                  mounted image
       │       ├── node_modules/
       │       ├── target/
       │       ├── .nx/
       │       └── other generated data
-      └── fox/
+      └── session-b/
           ├── src/
           └── cache/
 ```
@@ -271,13 +255,14 @@ Use ordinary linked Git worktrees for source and one cloned cache image per sess
 Session creation becomes:
 
 ```bash
-  SESSION=raven
-  REPO="$HOME/Dev/Conloca"
-  SESSION_ROOT="$HOME/DevSessions/Conloca/$SESSION"
+  SESSION=session-a
+  BENCHMARK_ROOT="<benchmark-root>"
+  REPO="<project-root>"
+  SESSION_ROOT="$BENCHMARK_ROOT/sessions/$SESSION"
   SOURCE="$SESSION_ROOT/src"
   CACHE="$SESSION_ROOT/cache"
-  BASE="$HOME/WorkspaceImages/Conloca/cache-base.sparseimage"
-  IMAGE="$HOME/WorkspaceImages/Conloca/sessions/$SESSION.sparseimage"
+  BASE="$BENCHMARK_ROOT/workspace-images/cache-base.sparseimage"
+  IMAGE="$BENCHMARK_ROOT/workspace-images/sessions/$SESSION.sparseimage"
 
   mkdir -p "$SESSION_ROOT" "$CACHE"
 
@@ -312,7 +297,7 @@ Do not automatically move repository state, credentials, or non-reproducible dat
 
 Why this is the best first step
 
-1.  It removes approximately 7.81 million host filesystem objects for Conloca.
+1.  It removes approximately 7.81 million host filesystem objects for the project.
 2.  It retains native git worktree behavior.
 3.  The branch is already visible to the main repository; there is no local push step.
 4.  Git’s object database remains shared.
@@ -332,7 +317,7 @@ Full-workspace architecture
 If maximum isolation is desired later, put the complete independent repository inside the image:
 
 ```text
-  ~/WorkspaceImages/Conloca/base.sparseimage
+  <benchmark-root>/workspace-images/base.sparseimage
   └── repo/
       ├── .git/
       ├── source
@@ -340,31 +325,35 @@ If maximum isolation is desired later, put the complete independent repository i
       ├── target/
       └── .nx/
 
-  ~/WorkspaceImages/Conloca/sessions/raven.sparseimage
+  <benchmark-root>/workspace-images/sessions/session-a.sparseimage
   └── APFS clone of the complete base image
 ```
 
 Session creation:
 
 ```bash
+  BENCHMARK_ROOT="<benchmark-root>"
+  SESSION=session-a
+  SESSION_MOUNT="$BENCHMARK_ROOT/sessions/$SESSION"
+
   /bin/cp -c \
-    "$HOME/WorkspaceImages/Conloca/base.sparseimage" \
-    "$HOME/WorkspaceImages/Conloca/sessions/raven.sparseimage"
+    "$BENCHMARK_ROOT/workspace-images/base.sparseimage" \
+    "$BENCHMARK_ROOT/workspace-images/sessions/$SESSION.sparseimage"
 
   hdiutil attach \
     -nobrowse \
     -owners on \
-    -mountpoint "$HOME/DevSessions/Conloca/raven" \
-    "$HOME/WorkspaceImages/Conloca/sessions/raven.sparseimage"
+    -mountpoint "$SESSION_MOUNT" \
+    "$BENCHMARK_ROOT/workspace-images/sessions/$SESSION.sparseimage"
 
-  git -C "$HOME/DevSessions/Conloca/raven/repo" \
-    switch -c agent/raven host/main
+  git -C "$SESSION_MOUNT/repo" \
+    switch -c "agent/$SESSION" host/main
 ```
 
 The image repository should have the ordinary checkout as a local remote:
 
 ```bash
-  git -C "$MOUNT/repo" remote add host "$HOME/Dev/Conloca"
+  git -C "$MOUNT/repo" remote add host <project-root>
 ```
 
 Return the branch with:
@@ -372,10 +361,10 @@ Return the branch with:
 ```bash
   git -C "$MOUNT/repo" push \
     host \
-    HEAD:refs/heads/agent/raven
+    HEAD:refs/heads/agent/$SESSION
 ```
 
-Do not push onto the branch currently checked out by ~/Dev/Conloca; push a separate session branch.
+Do not push onto the branch currently checked out by <project-root>; push a separate session branch.
 
 ────────────────────────────────────────────────────────────────────────────────
 
@@ -400,7 +389,7 @@ Git officially supports:
 
 ```bash
   git init \
-    --separate-git-dir "$HOME/GitSessions/Conloca/raven.git" \
+    --separate-git-dir "<benchmark-root>/git-sessions/session-a.git" \
     "$MOUNT/repo"
 ```
 
@@ -436,7 +425,7 @@ Do not clone an already-linked Git worktree
 A normal linked worktree contains a .git file pointing to something like:
 
 ```text
-  ~/Dev/Conloca/.git/worktrees/<registration>
+  <project-root>/.git/worktrees/<registration>
 ```
 
 Cloning an image containing that linked worktree would duplicate the pointer. Multiple mounted sessions would claim the
@@ -480,13 +469,13 @@ For this machine:
 1.  Use Option B, not shadows, for writable session images.
 2.  First move only session caches—especially node_modules—into cloned images.
 
-- Measured host-inode reduction opportunity: 7,810,798 objects, or 93.46% of the complete Conloca tree.
+- Measured host-inode reduction opportunity: 7,810,798 objects, or 93.46% of the complete project tree.
 
 3.  Keep source as ordinary linked worktrees during the pilot.
 4.  If cache-root symlinks behave reliably, this likely solves the APFS object-count problem without changing
     source-worktree semantics.
 5.  If complete session isolation is later required, clone the entire hot workspace image and keep its standalone .git
-    inside the image, with ~/Dev/Conloca configured as a local remote.
+    inside the image, with <project-root> configured as a local remote.
 6.  Do not use a cloned linked-worktree .git pointer, and do not externalize .git merely to save host inodes—it does not
     provide a meaningful inode advantage once the repository is inside the image.
 
