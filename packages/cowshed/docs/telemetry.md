@@ -28,8 +28,23 @@ cowshed trace <trace-id>                                                        
 
 Human tables by default; `--json` (one envelope) or `--ndjson` (one event per line) to pipe into `jq`. **NDJSON only
 ever exists on the pipe** — nothing writes it to disk. Under the hood these wrap the generic `lmao-inspect` reader over
-the Arrow segments in `~/.cowshed/telemetry/`; in-workspace exec records live in-volume (`.cowshed/jobs/`) and travel
-with a `cowshed checkpoint`.
+the controller-owned Arrow segments in `~/.cowshed/telemetry/`. Workspace-local `.cowshed/job/records.arrow` travels
+with checkpoints as reproduction data, but is editable and never authoritative.
+
+## Job authority and writers
+
+Authoritative job lifecycle, exit/signal, output-limit, and denial-correlation events live outside workspaces in
+controller-owned telemetry. Every job event carries the durable `(repoId, workspaceIncarnation, jobId)` key; the numeric
+`jobId` remains a workspace-local handle, while the full tuple distinguishes copied and restored timelines. At
+supervisor launch the controller provides each producer a dedicated IPC channel or a write-only inherited capability/FD;
+it is made non-inheritable before any job starts. Each writer owns a separately allocated segment, publishes it
+atomically, and never reopens a sealed segment or shares append ownership. Recovery starts a new segment. If controller
+telemetry and an in-workspace record disagree, controller telemetry wins.
+
+stdout and stderr remain separate job payload files. They share a configurable capture quota, default 1 GiB, whose
+accounting includes persisted and in-flight bytes. A crossing yields TERM/grace/KILL of the process group, pipe drain,
+and the explicit authoritative `output-limit` terminal state. cowshed never silently truncates a stream while the job
+continues. Bounded diagnostic-summary truncation is independent and cannot establish status or policy.
 
 ## Trace propagation (what "distributed" buys you)
 
@@ -39,9 +54,10 @@ cowshed uses W3C `traceparent`. Every entry point **mints or adopts** a trace:
   harness is already traced, cowshed's spans nest under it.
 - **CI** derives the trace id deterministically from `(run_id, attempt)`, so a job's trace is findable straight from the
   GitHub run — no lookup table.
-- The **shell supervisor injects `TRACEPARENT` into each job's environment**, so a tool that emits its own traces (or
-  any lmao-instrumented process) continues the same trace with zero plumbing — your build's spans and cowshed's spans
-  are one waterfall.
+- The **shell supervisor injects `TRACEPARENT` into each job's environment** and records structured stdin metadata:
+  source kind, bytes delivered, EOF completion, and an optional normalized workspace-relative file path. Inline binary
+  input is never stored in telemetry. The framed stdin channel preserves backpressure and cancellation semantics while
+  keeping input separate from shell text.
 - **CoW lineage is linked**: a workspace's marker records the trace that created it, and `fork`/`restore`/`checkpoint`
   link back — from a gateway denial you can walk to which task cloned this workspace from which state of main.
 
@@ -62,6 +78,6 @@ Because most granted egress is intercepted (see [gateway.md](gateway.md)), the g
 
 ## For agents
 
-An in-workspace agent doesn't configure any of this — `TRACEPARENT` is already in its environment, and its own outbound
-HTTP (if it uses an lmao-aware client) joins the trace automatically. Query surface is capability-scoped: a coordinator
-queries the fleet store; a worker sees only its own in-volume records via `job_status`/`job_logs` (12_mcp.md).
+An in-workspace agent doesn't configure any of this — `TRACEPARENT` is already in its environment. Query surface is
+capability-scoped: a coordinator queries the controller-owned store; a worker sees one-workspace job views through the
+supervisor/controller capability. Local records remain non-authoritative even when exposed for reproduction.

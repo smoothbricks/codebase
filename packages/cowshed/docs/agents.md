@@ -26,7 +26,7 @@ Prefer `--json` when you want structure:
 cowshed new task-4821 --json | jq -r .result.path
 ```
 
-## Warm worktrees for Claude Code
+## Warm workspaces for coding agents
 
 Pattern: one cowshed workspace per agent task, instead of `git worktree add`. You get full isolation (the agent can
 trash anything inside; the host is safe), warm caches (builds and installs are incremental from main's state), and O(1)
@@ -64,45 +64,28 @@ Notes for harness integration:
 - Parallel exploration: `cowshed fork <ws> <ws>-alt` mid-task gives you two divergent futures from the same state. Forks
   start with a closed sandbox regardless of the source's grants.
 
-## A complete task loop (script-grade)
+This is cowshed's layered capability model: the trusted coordinator holds policy authority; workers run closed and ask.
+A worker handle controls exactly one workspace's exec, shells, jobs, quota-limited checkpoints, push, and read-only
+grants. It cannot grant/revoke, restore/destroy/rebase/land, run gc, mirror repositories, or select another workspace.
 
-Everything an autonomous harness needs, with exit-code handling:
+## Binary stdin without shell interpolation
+
+Agent harnesses should use cowshed's structured stdin paths rather than quoting binary or untrusted data into a command:
 
 ```sh
-#!/bin/sh
-set -eu
-TASK="$1"; WS="task-$TASK"
-
-if ! WS_PATH=$(cowshed new "$WS" --json | jq -re .result.path); then
-  case $? in
-    4) echo "name collision: $WS already exists (stale task?)" >&2; exit 1 ;;
-    5) cowshed doctor >&2; exit 1 ;;      # environment problem; doctor says what
-    *) exit 1 ;;
-  esac
-fi
-
-run() {
-  cowshed exec "$WS" -- "$@"
-  rc=$?
-  if [ $rc -eq 6 ]; then
-    # cowshed already printed the exact `next: cowshed grant ...` line on stderr.
-    # Surface it upward; do NOT self-grant here.
-    echo "NEEDS-GRANT: see stderr above" >&2
-  fi
-  return $rc
-}
-
-run bun install
-run bun test
-run git commit -am "task $TASK"
-
-cowshed push "$WS" >/dev/null           # branch cowshed/task-$TASK now in main's repo
-cowshed rm "$WS" >/dev/null
+producer | cowshed exec "$WS" --stdin -- ./consume
+cowshed exec "$WS" --stdin-file fixtures/request.bin -- ./consume
 ```
 
-Points worth copying even if you don't copy the script: capture stdout only via `--json`+`jq`; branch on exit codes, not
-output text; let exit 6 flow upward as a permission request; push before rm (rm exits 4 otherwise, which is your
-unsaved-work safety net).
+Inline bytes, backpressured streams, and workspace-relative file sources remain separate from argv/shell text. File
+sources are regular files opened beneath the workspace with no-follow traversal. Job metadata reports source kind,
+delivered bytes, EOF completion, and an optional relative path, never inline contents. Canceling an input stream closes
+stdin without implicitly killing the job.
+
+A trivial `>`/`2>` shell form may take an optimized path only when a real shell AST parser proves the narrow eligible
+shape; every ambiguity falls back to ordinary shell execution and capture. Harnesses must not depend on whether the
+optimization fires. The combined stdout+stderr job quota defaults to 1 GiB; crossing it yields an explicit
+`output-limit` terminal state after process-group termination and pipe drain, never silent truncation.
 
 ## Sandbox etiquette: start closed, earn grants
 
@@ -137,15 +120,15 @@ passed through unchanged. If a command fails writing outside your volume or reac
 6, suspect the sandbox anyway — `cowshed doctor` shows recent gateway denials, and the troubleshooting guide has the
 Seatbelt log incantation.
 
-This is the same layered model jcode's swarm coordinator uses (see [jcode.md](jcode.md)): the supervisor holds grant
-authority; workers run closed and ask.
+This is cowshed's layered capability model: the trusted coordinator holds policy authority; workers run closed and ask.
 
 ## Concurrency and hygiene
 
 - Workspaces are cheap; don't pool or reuse them across tasks. Fresh clone per task means reproducible starting state
   (whatever main was at that moment).
-- Everything about a workspace is derived from disk — there is no daemon to desync from. If your harness crashes
-  mid-task, `cowshed ls` still tells the truth, and `cowshed rm` cleans up completely.
+- Workspace enumeration and attachment state derive from disk; the persistent supervisor owns only live process/job
+  control and recovers from durable job ids plus controller telemetry. If a harness crashes, `cowshed ls` still tells
+  the truth, clients reconnect to running jobs, and `cowshed rm` cleans up completely.
 - Run `cowshed ensure` at task start if your harness may outlive reboots; it is a no-op (~20 ms) when healthy and
   repairs mounts when not.
 - `cowshed gc` is safe to run between tasks; it never touches live workspaces.
@@ -167,3 +150,18 @@ authority; workers run closed and ask.
   AppleScript (no grant, same uid). You cannot launch an app in the human's session; there is no verb for it. Ship a
   build with `cowshed app export` — the human runs `cowshed app promote` to use it ([desktop.md](desktop.md)).
 - No mutating cowshed's own state files: markers are informational, grants live outside your volume.
+
+## Coordinator and worker connections
+
+MCP coordinator authority is transferred only on a dedicated inherited FD/socketpair — never stderr, argv, environment,
+or a workspace file. A coordinator mints a worker a 256-bit descriptor bound to one workspace and the expected peer and
+socket; it is memory-only, one-use, atomically consumed, expires in 30 seconds, and dies on server restart. Presenting a
+worker capability to a coordinator-only tool returns the dedicated authorization RPC error before dispatch, not a
+sandbox-denied outcome. Escalation remains an agent-to-agent policy decision; there is no interactive consent protocol.
+
+Workspace enumeration and attachment state derive from disk, while a persistent per-workspace supervisor provides job
+control. Its permission-checked socket accepts concurrent clients and survives individual disconnects; reconnect by the
+workspace-local numeric job id to resume status, logs, or attachment. The durable key is
+`(repoId, workspaceIncarnation, jobId)`. A client disconnect never unlinks the socket or stops the job. Authoritative
+job state comes from controller-owned immutable per-writer telemetry segments. Workspace-local records travel with
+checkpoints but are editable reproduction data and must never drive authorization, denial, quota, or success decisions.

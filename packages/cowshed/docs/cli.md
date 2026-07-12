@@ -29,13 +29,13 @@ The JSON envelope is uniform:
 
 ```
 $ cowshed new raven --json
-{"ok":true,"result":{"name":"raven","project":"conloca-3f2a9c1b",
- "path":"/Users/danny/.cowshed/mnt/conloca-3f2a9c1b/raven","branch":"cowshed/raven",
+{"ok":true,"result":{"name":"raven","repoId":"acme/widget",
+ "path":"~/.cowshed/mnt/acme/widget/raven","branch":"cowshed/raven",
  "base":"6f3a2c1","createdAt":"2026-07-11T14:03:22Z"}}
 
 $ cowshed path nonesuch --json
 {"ok":false,"error":{"code":"not-found",
- "message":"no workspace 'nonesuch' in project 'conloca-3f2a9c1b'",
+ "message":"no workspace 'nonesuch' in project 'example-project'",
  "hint":"cowshed ls"}}
 ```
 
@@ -59,15 +59,15 @@ Run once, inside an existing checkout. Converts it into an image-backed **main w
 only cowshed operation that copies data (one-time; clonefile cannot cross volumes into a new image).
 
 ```
-$ cd ~/Dev/conloca && cowshed adopt
+$ cd <project-root> && cowshed adopt
 cowshed: created dedicated volumes cowshed.store, cowshed.caches (space-sharing, excluded from backup)
-cowshed: creating image ~/.cowshed/conloca-3f2a9c1b/main.asif (capacity 100g, sparse)
+cowshed: creating image ~/.cowshed/acme/widget/main.asif (capacity 100g, sparse)
 cowshed: copying 8,357,293 objects into the image (this is the one-time cost)
 cowshed: verifying tree against source ... ok
-cowshed: swapping ~/Dev/conloca -> mountpoint (stub .envrc written beneath)
+cowshed: swapping <project-root> -> mountpoint (stub .envrc written beneath)
 next: eval "$(cowshed ensure --envrc)"   # add to .envrc
 next: cowshed new <name>
-/Users/danny/Dev/conloca
+<project-root>
 ```
 
 ### `cowshed new <name> [--ref <rev>] [--browse]`
@@ -76,13 +76,13 @@ Clones **main's live image** (there are no templates) and mounts it.
 
 ```
 $ cowshed new raven
-cowshed: cloned conloca main image (copy-on-write)
-cowshed: verified clone (fsck, pre-mount) and attached at ~/.cowshed/mnt/conloca-3f2a9c1b/raven
+cowshed: cloned acme/widget main image (copy-on-write)
+cowshed: verified clone (fsck, pre-mount) and attached at ~/.cowshed/mnt/acme/widget/raven
 cowshed: branch cowshed/raven created from main @ 6f3a2c1
-cowshed: port block 40960–40975 (gateway at 40960; your dev servers at 40961+)
+cowshed: port block 40960–40975 (macOS: gateway at 40960; your dev servers at 40961+)
 cowshed: sandbox: closed (write: own volume, designated cache subtrees, temp; egress: gateway only)
 next: cowshed exec raven -- bun test
-/Users/danny/.cowshed/mnt/conloca-3f2a9c1b/raven
+~/.cowshed/mnt/acme/widget/raven
 ```
 
 The clone is crash-consistent (like a power cut) and fsck-verified on its device _before_ mounting (attach `-nomount` →
@@ -95,8 +95,8 @@ TSV on stdout: name, state, branch, mountpoint (empty when detached).
 
 ```
 $ cowshed ls
-main	mounted	main	/Users/danny/Dev/conloca
-raven	mounted	cowshed/raven	/Users/danny/.cowshed/mnt/conloca-3f2a9c1b/raven
+main	mounted	main	<project-root>
+raven	mounted	cowshed/raven	~/.cowshed/mnt/acme/widget/raven
 fox	detached	cowshed/fox
 ```
 
@@ -140,9 +140,9 @@ exit 6 with the diagnosis:
 
 ```
 $ cowshed exec raven -- ./scripts/render-video.sh
-cowshed: sandbox denied file-write /Users/danny/Movies/renders
+cowshed: sandbox denied file-write <project-root>/renders
 cowshed: workspace 'raven' starts closed; this path is outside its writable set
-next: cowshed grant raven --write /Users/danny/Movies/renders
+next: cowshed grant raven --write <project-root>/renders
 $ echo $?
 6
 ```
@@ -157,12 +157,17 @@ outside the granted set fail with EPERM.
 
 ### Dev servers inside workspaces
 
-Each workspace owns a **16-port block** (allocated at creation; the gateway's data plane sits on the base port). Ports
-base+1 through base+15 are the workspace's own to bind: `astro dev`, vite, metro, `devenv up` all run sandboxed and are
-reachable from your host browser — the way a container would publish ports — and two workspaces never collide. The one
-honest requirement: tools must take their port from configuration rather than a hardcoded default.
-`cowshed ensure --envrc` exports `PORT` (base+1), which most dev servers respect, and `COWSHED_PORT_BASE` for tools that
-need several; devenv port offsets can derive from the block.
+On macOS, each workspace owns a **16-port block** allocated at creation; the gateway data plane sits on the base port,
+and base+1 through base+15 are workspace service ports. Linux allocates no port block: every workspace instead gets
+private loopback in its own network namespace, so fixed service ports do not collide with siblings. Ordinary package
+tools still use `http://127.0.0.1:7644/…`: exactly one controller-owned, non-signalable connector in that namespace
+binds that address and forwards bytes only to the workspace's mounted `/run/cowshed/gateway.sock`. It holds no policy or
+credentials and is not a general TCP/Unix-socket forwarder; the socket inode, namespace, and opaque token retain the
+authority boundary. Detach or restore drains and kills it. Tools must use cowshed's platform-specific configuration
+rather than assuming host-wide loopback.
+
+On macOS, `cowshed ensure --envrc` exports `PORT` (base+1) and `COWSHED_PORT_BASE` for tools that need several ports;
+devenv offsets can derive from the block. Linux configuration contains no block or sentinel values.
 
 ```
 $ cowshed shell raven
@@ -197,22 +202,23 @@ current workspace on stdout, for `eval` in `.envrc`:
 ```
 $ cowshed ensure --envrc
 export COWSHED_GATEWAY_TOKEN=cw1_r4v3n…
-export GOENV=/Users/danny/.cowshed/mnt/conloca-3f2a9c1b/raven/.cowshed/cache/go/env
+export GOENV=~/.cowshed/mnt/acme/widget/raven/.cowshed/cache/go/env
 export COWSHED_PORT_BASE=40960 PORT=40961
-export COWSHED_PROJECT=conloca-3f2a9c1b COWSHED_WORKSPACE=raven
+export COWSHED_REPO_ID=acme/widget COWSHED_WORKSPACE=raven
 ```
 
-Deliberately short: wiring is carried by **files, not environment**. The registry URL (the workspace's own gateway base
-port) and the bun cache dir live in the committed `bunfig.toml` — bun honors a _relative_ `[install.cache] dir`,
-verified, so there is no cache export at all; cargo's source replacement and `SCCACHE_NO_DAEMON` live in the in-image
-`.cargo/config.toml` (cargo's `[env]` verifiably reaches rustc-wrapper invocations); the read-at-build caches (cargo
-registry, Go module/build caches, sccache, zig, gradle) are reached through their tools' _default_ host paths, relocated
-once onto the caches volume at first adopt — except Go, which has no directory-scoped config: its in-image env file
-(carrying the per-workspace `GOPROXY`, the shared caches, in-image `GOPATH`/`GOBIN`, and `GOTOOLCHAIN=local`) is reached
-via the `GOENV` export, so `~/go` is never created. The two load-bearing exports above each exist only until their
-verification passes (token-via-config kills the first; a file-based `GOENV` alternative — none known — would kill the
-second); `PORT`/`COWSHED_PORT_BASE` wire dev servers into the workspace's port block (see "Dev servers" above); the
-`COWSHED_*` identity lines are prompt conveniences, never load-bearing.
+Deliberately short: wiring is carried by **files, not environment**. The registry URL (the macOS workspace gateway base
+port, or Linux's fixed private-loopback connector at `127.0.0.1:7644`) and the bun cache dir live in the committed
+`bunfig.toml` — bun honors a _relative_ `[install.cache] dir`, verified, so there is no cache export at all; cargo's
+source replacement and `SCCACHE_NO_DAEMON` live in the in-image `.cargo/config.toml` (cargo's `[env]` verifiably reaches
+rustc-wrapper invocations); the read-at-build caches (cargo registry, Go module/build caches, sccache, zig, gradle) are
+reached through their tools' _default_ host paths, relocated once onto the caches volume at first adopt — except Go,
+which has no directory-scoped config: its in-image env file (carrying the per-workspace `GOPROXY`, the shared caches,
+in-image `GOPATH`/`GOBIN`, and `GOTOOLCHAIN=local`) is reached via the `GOENV` export, so `~/go` is never created. The
+two load-bearing exports above each exist only until their verification passes (token-via-config kills the first; a
+file-based `GOENV` alternative — none known — would kill the second); on macOS, `PORT`/`COWSHED_PORT_BASE` wire dev
+servers into the workspace's port block (see "Dev servers" above); Linux has no block. The `COWSHED_*` identity lines
+are prompt conveniences, never load-bearing.
 
 `ensure` never does slow or surprising work — no fetches, no compaction, no installs. Main gets the same wiring (that's
 the "main shares caches like sandboxes do" rule; the only difference is main isn't sandboxed).
@@ -223,10 +229,11 @@ Suspend and resume a workspace without destroying it. Detached workspaces cost o
 
 ### Simulators (iOS) — `cowshed sim export <name> [artifact]`
 
-Copies a built `.app` to the one-way drop dir (`/Users/Shared/cowshed-drop/<project_id>/`; stdout = the drop path) so
-the personal session can install it into the human's native Simulator.app — the artifact handoff for posture B. The
-in-image `xcrun` wrapper handles the rest of the simulator story (dev-local headless simulators by default;
-personal-session devices via `--sim` grants). The full walkthrough, Expo included, is [ios.md](ios.md).
+Copies a built `.app` to the one-way drop dir (`<shared-drop-root>/<owner>/<repo>/`, using the separately validated
+components of the primary `repo_id`; stdout = the drop path) so the personal session can install it into the human's
+native Simulator.app — the artifact handoff for posture B. The in-image `xcrun` wrapper handles the rest of the
+simulator story (dev-local headless simulators by default; personal-session devices via `--sim` grants). The full
+walkthrough, Expo included, is [ios.md](ios.md).
 
 ## Sandbox grants
 
@@ -234,9 +241,9 @@ Workspaces start **closed**: write access to their own volume, `~/.cowshed/cache
 toolchains and system; egress to the localhost gateway only. Widen per workspace:
 
 ```
-$ cowshed grant raven --read ~/Dev/reference-corpus
-$ cowshed grant raven --write ~/Dev/shared-assets --egress api.github.com
-cowshed: grants for raven now: +read ~/Dev/reference-corpus, +write ~/Dev/shared-assets, +egress api.github.com
+$ cowshed grant raven --read <project-root>/reference-corpus
+$ cowshed grant raven --write <project-root>/shared-assets --egress api.github.com
+cowshed: grants for raven now: +read <project-root>/reference-corpus, +write <project-root>/shared-assets, +egress api.github.com
 cowshed: filesystem grants apply from the next exec; egress applies immediately (gateway allowlist)
 next: cowshed exec raven -- <retry your command>
 ```
@@ -252,13 +259,13 @@ next: cowshed exec raven -- <retry your command>
 
 ```
 $ cowshed grant raven
-read	/Users/danny/Dev/reference-corpus
-write	/Users/danny/Dev/shared-assets
+read	<project-root>/reference-corpus
+write	<project-root>/shared-assets
 egress	api.github.com
 ```
 
-- `cowshed revoke raven --write ~/Dev/shared-assets` narrows again; `cowshed revoke raven --all` resets to closed.
-  Revocation of egress is immediate; filesystem revocation applies from the next exec.
+- `cowshed revoke raven --write <project-root>/shared-assets` narrows again; `cowshed revoke raven --all` resets to
+  closed. Revocation of egress is immediate; filesystem revocation applies from the next exec.
 - The closed baseline is a floor, not a grant: you cannot revoke a workspace's access to its own volume, the caches
   volume, or the gateway.
 - **Egress is intercepted by default.** `--egress api.github.com` lets the gateway terminate TLS under the workspace's
@@ -266,6 +273,20 @@ egress	api.github.com
   secret. Add `--opaque` for a cert-pinning host (plain tunnel, no injection) or `--impersonate <profile>` for a
   browser-shaped fingerprint (also no injection). A bare `cowshed grant raven` prints the set with `mode`/`impersonate`
   columns; `--repo github.com/org/*` grants which repos the gateway will mirror (see Git).
+
+## Authority boundaries
+
+Project lookup is discovery-only. Workspace inspection may safely ensure or attach. A worker capability controls one
+workspace's exec, shell, jobs, quota-limited checkpoints, push, and grant reads. Only a trusted coordinator may
+grant/revoke, restore/destroy/rebase/land, run gc, or mirror repositories. The persistent per-workspace supervisor
+socket is permission- and peer-checked, supports concurrent clients and reconnect, and is never unlinked merely because
+one client disconnects. Job status authority comes from controller-owned immutable telemetry segments, not editable
+workspace records.
+
+MCP coordinator authority is delivered only through an inherited FD/socketpair, never stderr, argv, environment, or a
+workspace file. Worker descriptors are 256-bit, one-use, expire after 30 seconds, are atomically consumed, restart-
+invalidated, and bound to the intended peer/socket/workspace. Authorization uses its own RPC error and is not a sandbox
+denial.
 
 ## Git
 
@@ -370,9 +391,10 @@ the generic `lmao-inspect` reader over the Arrow segments in `~/.cowshed/telemet
 
 ### `cowshed mcp serve`
 
-Runs the MCP server (stdio, or a shared unix socket) exposing workspaces as tools for agent harnesses — the coordinator
-token prints once to stderr at start. See specs 12_mcp.md for the capability model; the short version: coordinator token
-creates/destroys/grants, workspace tokens can only run and observe work in their own workspace.
+Runs the MCP server (stdio, or a shared Unix socket) exposing workspaces as tools for agent harnesses. Coordinator
+authority arrives only through a dedicated inherited FD/socketpair and is never printed on stderr or placed in argv or
+environment. Worker connections redeem short-lived one-use descriptors and can run or observe only their bound
+workspace.
 
 ### `cowshed gc`
 
@@ -392,3 +414,31 @@ next: cowshed gateway run   # or: launchctl kickstart -k gui/501/dev.cowshed.gat
 $ echo $?
 5
 ```
+
+### Binary stdin
+
+Use structured stdin instead of interpolating input into shell text:
+
+```sh
+producer | cowshed exec raven --stdin -- ./binary-consumer
+cowshed exec raven --stdin-file fixtures/input.bin -- ./binary-consumer
+cowshed exec raven --stdin-base64 AAEC/w== -- ./binary-consumer
+```
+
+`--stdin` streams opaque caller bytes with backpressure; `--stdin-file` accepts only a workspace-relative regular file
+opened read-only with no-follow traversal; `--stdin-base64` strictly decodes inline bytes. Absolute/escaping paths,
+symlinks, devices, sockets, and directories fail closed. EOF closes child stdin once. Canceling input closes stdin and
+records incomplete delivery; it does not implicitly kill the job. Job JSON reports stdin kind, delivered byte count,
+completion, and the normalized relative file path when applicable, never inline contents.
+
+For trivial shell `>`/`2>` commands cowshed may use its optimized capture path, but only after a real shell AST parser
+proves the exact narrow form safe. Anything ambiguous or involving append, fd duplication, pipelines, subshells,
+expansion, symlinks, existing/cross-filesystem targets, or `noclobber` runs through the ordinary shell unchanged.
+Parsing is optimization only, not authorization or correctness.
+
+### Job output limit
+
+stdout and stderr share a configurable per-job capture quota (default 1 GiB). The quota includes persisted and in-flight
+bytes. Crossing it terminates the whole process group with TERM, grace, then KILL, drains both pipes, and records the
+explicit `output-limit` terminal state. cowshed never silently truncates output while the command continues. Diagnostic
+summary truncation is separate.
