@@ -1,19 +1,46 @@
-# TypeScript Transformer <a id="smoo/lmao!n/transformer"></a>
+# ttsc TypeScript Transformer <a id="smoo/lmao!n/transformer"></a>
 
 The LMAO TypeScript transformer performs compile-time rewrites that remove runtime dispatch and setup where static proof
 is available. The optimizations below describe emitted code and runtime contracts; they do not imply an unmeasured
 speedup.
 
-> **Implementation status (system state).** The TypeScript transformer ships in `packages/lmao-ttsc/src/`, and
-> the ttsc Go plugin in `packages/lmao-ttsc/plugin/` implements the corresponding span, runtime-hint, and
-> Op-local log-template-ID passes. Destructured-context rewriting (§3), Promise-preserving fixed-arity span lowering,
-> packed runtime hints, private `u16` log-template storage, and the existing line, metadata, tag, log, and result
-> transformations are implemented and tested in both compiler paths. `spanAutoN` exists as an internal, explicit runtime
-> seam, but automatic `ctx.span(...)` → `spanAutoN(...)` lowering is intentionally disabled because a synchronous return
-> would change the public Promise API's observable microtask scheduling. The running invariant is **the transformed
-> output the tests assert**, not earlier design sketches. No performance improvement is claimed for the template-ID path
-> until its dedicated benchmark has been run.
+> **Implementation status (system state).** The sole compiler implementation is the native ttsc/tsgo plugin in
+> `packages/lmao-ttsc/plugin/`. Bun build and runtime hosts load that plugin through the package's `@ttsc/unplugin`
+> adapters; there is no parallel TypeScript compiler-API transformer. Destructured-context rewriting (§3),
+> Promise-preserving fixed-arity span lowering, packed runtime hints, private `u16` log-template storage, and the
+> existing line, metadata, tag, log, and result transformations are implemented in the native plugin and covered by its
+> Go suite plus Bun integration. `spanAutoN` exists as an internal, explicit runtime seam, but automatic `ctx.span(...)`
+> → `spanAutoN(...)` lowering is intentionally disabled because a synchronous return would change the public Promise
+> API's observable microtask scheduling. The running invariant is **the transformed output the tests assert**, not
+> earlier design sketches. No performance improvement is claimed for the template-ID path until its dedicated benchmark
+> has been run.
 
+## Bun integration
+
+Install `@smoothbricks/lmao-ttsc` as a direct dependency. ttsc discovers its native descriptor from the package's
+`ttsc.plugin` field; consumers do not register a second transformer implementation.
+
+For `Bun.build`, use the package's adapter export:
+
+```typescript
+import ttsc from '@smoothbricks/lmao-ttsc/bun';
+
+await Bun.build({
+  entrypoints: ['src/index.ts'],
+  outdir: 'dist',
+  plugins: [ttsc()],
+});
+```
+
+For Bun's runtime loader (`bun run` and `bun test`), register the same adapter once in `bunfig.toml`:
+
+```toml
+[test]
+preload = ["@smoothbricks/lmao-ttsc/bun-register"]
+```
+
+Both entrypoints read the nearest TypeScript project and apply its configured and direct-dependency ttsc plugins. The
+`./bun-register` export is intentionally marked as a package side effect; the build adapter itself is side-effect free.
 ## Design Philosophy <a id="smoo/lmao!n/transformer-philosophy"></a>
 
 **User writes ergonomic code, transformer produces optimized code.**
@@ -126,7 +153,7 @@ rejections use the normal span-exception path. This ABI is not emitted automatic
 For checker-proved LMAO calls, the transformer computes a packed unsigned 32-bit runtime hint and emits it inside the
 structured `OpCompileMetadata` ABI. `defineOp(...)` must have result type `Op<...>`/symbol `Op`, and `defineOps(...)`
 must have result type `OpGroup<...>`/symbol `OpGroup`; the resolved call declaration must come from LMAO. Same-named
-unrelated functions and checkerless classic-transformer calls receive no compile metadata.
+unrelated functions and calls without checker-backed LMAO declaration provenance receive no compile metadata.
 
 | Bits     | Meaning                                                                        |
 | -------- | ------------------------------------------------------------------------------ |
@@ -413,13 +440,12 @@ values.
 
 ### Source Maps <a id="smoo/lmao!n/transformer-source-maps"></a>
 
-The transformations are AST rewrites via the TS `NodeFactory`, so positions map through TypeScript's own emit. The tag
-inliner additionally **strips** inherited comments and source positions from its synthesized statements
-(`clearComments`: `setSyntheticLeadingComments`/`setSyntheticTrailingComments`/`setSourceMapRange` cleared,
-`setTextRange` reset) to prevent the generated buffer-write block from inheriting nearby source comments.
+The native plugin constructs replacement AST nodes through tsgo's shim factory inside ttsc's emit transform. That keeps
+all rewriting in the compiler's normal emit pipeline instead of text-splicing JavaScript. Synthesized direct-write
+blocks do not inherit unrelated source comments.
 
 > **Implementation status.** A dedicated source-map preservation/verification pass is not separately implemented or
-> tested; correctness relies on factory-based emit plus the tag-inliner comment scrub. Tracked by node
+> tested; correctness currently relies on ttsc's factory-based emit. Tracked by node
 > `smoo/lmao!n/transformer-source-maps`.
 
 ## Fallback Behavior <a id="smoo/lmao!n/transformer-fallback"></a>
