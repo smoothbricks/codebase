@@ -227,48 +227,64 @@ sibling. Either way an immutable artifact crosses the uid boundary, never a live
 **personal-session human verb** (it installs a promoted build into `~/Applications`), documented in 14_nix.md — not a
 workspace or sandbox operation and not agent-invokable.
 
-## Return to main: `cowshed rebase` and `cowshed land`
+## Return to an integration branch: `cowshed rebase` and `cowshed land`
 
-Workspaces are born from main and return to main. `new`/`fork` are the first half of the lifecycle; `rebase` and `land`
-are the second. Between them, autosave refs (fetched host-side to `refs/cowshed/<ws>/wip` — see "Autosave") remain the
-crash-safety net. cowshed provides the _primitives_; the retry/scheduling policy around them is coordinator work
-(12_mcp.md), deliberately not baked in.
+Workspaces are born from the main workspace's Git state and return to a controller-selected integration branch.
+`new`/`fork` are the first half of the lifecycle; `rebase` and `land` are the second. Between them, autosave refs
+(fetched host-side to `refs/cowshed/<ws>/wip` — see "Autosave") remain the crash-safety net. Cowshed provides the
+primitives; retry, scheduling, review, remote publication, and branch-selection policy are coordinator work (12_mcp.md),
+deliberately not baked in.
 
-### `cowshed rebase <ws>`
+### `cowshed rebase <ws> [--onto <branch-or-ref>]`
 
-Brings a workspace's branch up to current main.
+Brings a workspace's branch up to the selected host revision. The default is `main`; `--onto` accepts a validated local
+branch or fully qualified ref in the main workspace repository. An object ID may be used as an immutable replay base,
+but `land` still requires a named branch as its fast-forward target.
 
-- Default: `git fetch host` inside the workspace, then `git rebase host/main` onto the `cowshed/<name>` branch. The
-  whole step runs **inside the workspace sandbox** — the fetch from main's mount is a read (covered by the baseline),
-  and every write lands in the workspace's own repo. Conflicts abort the rebase (`git rebase --abort`), leave the
-  workspace exactly as it was, and exit 4 with `next:` hints naming the conflicted paths.
-- `--fresh`: divergence-shedding rebase. Create a new clone from **current** main, replay the branch onto it
-  (`git format-patch`/`am`, or cherry-pick range), then **transplant identity** — the new clone inherits the workspace's
-  name, canonical mount path, token, and grant-file binding; the old clone is destroyed (11_shell.md teardown ordering).
-  This drops the accumulated substrate divergence (ZFS origin-snapshot pin, APFS image growth — 01_storage.md,
-  09_substrates.md) and re-warms in-image caches to current main. A replay conflict leaves the **original** workspace
-  untouched and discards the half-built fresh clone (exit 4). Refuses (exit 4) when the workspace has uncommitted
-  changes — replay carries commits only; commit or discard first. `--fresh` is what a coordinator runs against a
-  long-lived workspace that `cowshed du` shows has drifted far from main.
+- Default mode: fetch the selected host revision inside the workspace, then rebase the `cowshed/<name>` branch onto that
+  exact object ID. The whole step runs **inside the workspace sandbox** — the fetch from the main workspace mount is a
+  read (covered by the baseline), and every write lands in the workspace's own repository. Conflicts abort the rebase
+  (`git rebase --abort`), leave the workspace exactly as it was, and exit 4 with `next:` hints naming the conflicted
+  paths.
+- `--fresh`: divergence-shedding rebase. Create a new clone from the selected current host revision, replay the branch
+  onto it (`git format-patch`/`am`, or cherry-pick range), then **transplant identity** — the new clone inherits the
+  workspace's name, canonical mount path, token, and grant-file binding; the old clone is destroyed (11_shell.md
+  teardown ordering). This drops accumulated substrate divergence (ZFS origin-snapshot pin, APFS image growth —
+  01_storage.md, 09_substrates.md) and re-warms in-image caches to the selected base. A replay conflict leaves the
+  **original** workspace untouched and discards the half-built fresh clone (exit 4). Refuses (exit 4) when the workspace
+  has uncommitted changes — replay carries commits only; commit or discard first. `--fresh` is what a coordinator runs
+  against a long-lived workspace that `cowshed du` shows has drifted far from its integration base.
 
-### `cowshed land <ws> [--check <cmd>]`
+### `cowshed land <ws> [--target <branch>] [--check <cmd>]`
 
-The full born-from-main-return-to-main close-out, as one primitive:
+The full born-from-host-return-to-host close-out, as one primitive. The target defaults to `main`:
 
-1. **Rebase** onto `host/main` (the `cowshed rebase` step above; conflict → exit 4, workspace intact).
+1. **Rebase** onto the current target branch object ID (the `cowshed rebase --onto <target>` step above; conflict → exit
+   4, workspace intact).
 2. **Validate**: run the check _inside the sandbox_ — `--check <cmd>` if given, else `.cowshed.toml` `[land] check`,
    else no validation with one honest `cowshed:` stderr line saying so. Non-zero check → exit 4, workspace intact,
    output captured as a job (11_shell.md) for diagnosis.
-3. **Fast-forward host**: the host repository fetches the branch from the workspace mount and
-   `git merge --ff-only cowshed/<name>`. Requires a clean-enough host worktree (refuse exit 4 otherwise, `next:` hint to
-   commit/stash). If main advanced during validation the merge is non-fast-forward → exit 4 with a
-   `next: cowshed land <ws>` hint; the caller (coordinator) re-runs, which re-rebases against the new main. cowshed does
-   not loop internally.
-4. **Retire**: destroy the workspace (supervisor tree first — 11_shell.md), prune its `refs/cowshed/<ws>/*` on the host.
+3. **Fast-forward the target branch under its repository lock**: fetch the exact validated source head from the
+   workspace mount, revalidate the source workspace incarnation, source head, and expected target head, then require a
+   fast-forward. How the update is materialized depends only on checkout state:
+   - If the target branch is checked out in the main workspace, run the fast-forward **through that checked-out
+     workspace**. Its branch ref, `HEAD`, index, and working tree all advance to the validated source tree. This is the
+     normal `main` case; Cowshed must not update only a hidden or non-checked-out ref while leaving the visible main
+     workspace stale. The main workspace must be clean enough for the update or `land` refuses with exit 4 and a `next:`
+     hint to commit or stash.
+   - If the target branch is not checked out, atomically compare-and-swap `refs/heads/<target>` to the validated source
+     head without changing the main workspace's currently checked-out branch, `HEAD`, index, or working tree.
+   - If the target is checked out by any other linked worktree unknown to Cowshed, refuse rather than leave that
+     worktree's index and files stale. If the target advanced during validation, any expected head changed, or the
+     update is not a fast-forward, return `Conflict`, leave both source and target intact, and report the moved value.
+     Cowshed never retries against a new base internally; the coordinator decides whether to rebase and re-run checks.
+4. **Retire**: only after the target branch and, when checked out, its visible working state resolve to the validated
+   source head, destroy the workspace (supervisor tree first — 11_shell.md) and prune its `refs/cowshed/<ws>/*`
+   preservation refs on the host.
 
 `--no-retire` keeps the workspace after a successful land (for a coordinator that wants to reuse it via
-`rebase --fresh`). `--push-only` performs steps 1–2 and pushes the validated branch without the host ff-merge, for
-review-gated flows.
+`rebase --fresh`). `--push-only` performs steps 1–2 and installs the validated head in the workspace's durable
+`refs/cowshed/<ws>/heads/<branch>` preservation ref without advancing the target branch, for review-gated flows.
 
 ## `cowshed rm <ws>` — perceived-instant deletion
 
