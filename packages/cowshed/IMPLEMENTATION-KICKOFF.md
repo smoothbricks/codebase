@@ -1,29 +1,23 @@
 # cowshed — implementation kickoff
 
-Prompt for a fresh session: launch a multi-agent implementation workflow for `packages/cowshed` ("ultracode"-style:
-Sonnet 5 implementors, fork reviewers, fixers). Everything below is the context that session needs; the authoritative
-design is in the specs, not this file.
+Prompt for a fresh session: launch a multi-agent implementation workflow for `packages/cowshed`. Everything below is the
+context that session needs; the authoritative design is in the specs, not this file. Nothing in this summary implies
+that the specified behavior is already implemented.
 
 ## What cowshed is
 
-Warm git workspaces for macOS/APFS: every workspace is one copy-on-write cloned disk image (clonefile ≈ 2 ms, attach ≈
-235–400 ms), mounted nobrowse, sandboxed by default, with shared toolchain/package caches and an egress gateway holding
-all secrets. Consumers: jcode (Rust API, replacing its `.jcode-worktrees` linked worktrees and per-command sandbox
-plumbing) and Claude Code / other agents (CLI "warm worktrees").
+Warm git workspaces for macOS/APFS and Linux/ZFS: every workspace is a copy-on-write clone, sandboxed by default, with
+shared toolchain/package caches and an egress gateway holding all secrets. Rust applications consume `cowshed-core`
+directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use the CLI.
 
 ## Read first (in order)
 
 1. `specs/cowshed/*.md` (repo root) — the committed design: 00 overview, 01 storage, 02 workspaces, 03 caches, 04
    sandbox, 05 gateway, 06 CLI, 07 API, 08 testing, 09 substrates (ZFS/Linux), 10 CI runner, 11 shell layer, 12 MCP, 13
-   telemetry, 14 nix/declarative host setup + deployment postures. Specs are commitments (see AGENTS.md); implement from
-   them, critique them if they conflict with reality.
-2. `packages/cowshed/docs/` — user-facing docs written as if cowshed exists; treat as UX acceptance.
-3. `/Users/danny/Dev/_fork/jcode/crates/jcode-base/src/sandbox.rs` (+ `shell_supervisor.rs`,
-   `jcode-app-core/src/tool/bash.rs`) — the proven Seatbelt generator cowshed-core generalizes: launch-time
-   `sandbox-exec` wrapping, deny-default profiles, secret deny rules, dynamic writable-root grants
-   (`grant_write_paths`), `SCCACHE_NO_DAEMON=1`, direnv env filtering.
-4. `specs/cowshed/prototypes/apfs-workspace-bench/` — benchmark harness + REPORT.md + results backing the design numbers
-   (folded into the repo; formerly `~/Dev/apfs-workspace-bench`).
+   telemetry, 14 nix/declarative host setup + deployment postures. Implement from them and resolve any conflict in favor
+   of the specs.
+2. `packages/cowshed/docs/` — user-facing UX acceptance documents, not evidence of an implementation.
+3. `specs/cowshed/prototypes/apfs-workspace-bench/` — benchmark harness, report, and results backing the design numbers.
 
 ## Decisions already made (do not relitigate)
 
@@ -38,48 +32,46 @@ plumbing) and Claude Code / other agents (CLI "warm worktrees").
   `cowshed adopt` (blocking, full-tree, `--quarantine` escape), gates `cowshed push`/autosave on the content delta, and
   audits in `cowshed doctor` (filename + known-token-shape rules, no entropy heuristics; explicit reasoned waivers
   outside the image; `--secrets-deep` via gitleaks when installed). Spec: 02_workspaces.md.
-- **No SQLite / no state store**: registry = readdir over images; mount truth = kernel mount table; identity = in-image
-  `.cowshed/workspace.json`; grants = `<image>.grants.json` OUTSIDE the volume (never writable from inside the sandbox).
-  No _image_ pooling — cold ~270 ms is fine (budget: ≤10 s human, minutes for agents). (The per-workspace warm _shell_
-  pool in 11_shell.md is a different mechanism and stays.) The only daemons are the host gateway and per-workspace shell
-  supervisors (+ optional MCP socket server); none store authoritative state.
-- **Local-only git**: a workspace's git touches only local paths — the `host` remote (main's mount, fetch-only for
-  rebase) and read-only bare mirrors on the cache volume. Pulling a new upstream repo is a gateway control-plane verb
-  `cowshed repo mirror <url>` / `cowshed repo clone` (gateway fetches with Keychain creds into a bare mirror it owns;
-  repo-scoped egress grant). The git credential broker is **deleted** — no in-sandbox git-over-HTTPS, no `insteadOf`
-  rewrite, no `ssh_config ProxyCommand`. Publishing to a real origin is coordinator work, host-side, outside any
-  sandbox.
+- **Stable repository identity and trusted policy**: `repo_id` comes from one explicitly chosen Git remote URL,
+  normalized to lowercase `owner/repo` after discarding transport, credentials, host, leading slash, optional `.git`,
+  query, and fragment. Controller-owned binding metadata records both the chosen URL and `repo_id`; every open
+  re-normalizes the recorded URL and conflicts if it no longer matches. A checkout may have multiple candidate
+  identities but exactly one primary binding. Discovery may propose candidates, never silently mint or select one;
+  local-only repositories require an explicit `repo_id`. Treat the two components as validated path components,
+  rejecting empty, `.`, `..`, separators, NUL, and noncanonical forms. The trusted project policy for `acme/widget` is
+  `~/.cowshed/acme/widget/policy.json`, outside every workspace and denied to sandboxes.
+- **No SQLite / no state store**: registry = readdir over images/datasets; mount truth = the kernel mount table;
+  workspace identity = in-image `.cowshed/workspace.json`; grants and repository binding metadata are controller-owned
+  and outside the workspace. No image pooling. Per-workspace supervisors and the optional MCP server hold no
+  authoritative lifecycle state.
+- **Local-only git and coordinator-owned mirrors**: workspace git touches only local paths: the `host` remote and
+  gateway-owned, sandbox-read-only bare mirrors on the cache volume. Mirror creation and refresh are
+  coordinator/control- plane operations using host-held credentials; workspaces may read mirrors but can never
+  configure, update, or write them. Publishing to a real origin is also coordinator work outside every sandbox. There is
+  no in-sandbox Git-over-HTTPS, credential helper, `insteadOf` rewrite, SSH proxy, or data-plane Git protocol.
 - **Push/autosave direction is host-side**: `cowshed push` and the autosave net are the _host_ fetching from the
   workspace mount (`git fetch <mount> +cowshed/<ws>:…`), never the sandbox running `git push` against agent-controlled
   `.git` config/hooks. Autosave ref namespace: `refs/cowshed/<ws>/wip`.
-- **Per-workspace gateway port BLOCK**: each workspace gets a contiguous 16-port block from a reserved range (default
-  40960–49151), recorded in the grant file as `portBlock: {base, size}`. `base` = the gateway's per-workspace data-plane
-  listener (host-bound; workspace identity is transport-enforced by which port it reaches, token is the second factor).
-  `base+1..size-1` = the workspace's own bindable service ports, so dev servers (vite/astro/metro/`devenv up`) run
-  container-style without sibling collisions. **Enforcement shape is measured, not the naive one**: SBPL rejects port
-  ranges and can't enumerate the ephemeral range, and restricting `network-bind` breaks `bind(0)` — so isolation rides
-  **entirely on outbound** (16 literal single-port allow rules per workspace) with bind/inbound left permissive;
-  siblings may bind freely but cannot be _reached_ (EPERM). A second measured invariant: SBPL is **last-match-wins** —
-  the secret deny list protects anything only because generation emits denies last (unit-tested ordering, 04/08). macOS
-  cooperative mechanism; Linux netns gives private loopback, so blocks are macOS-only. **7644 is the host/control plane
-  only and never appears in workspace config.**
-- **Denial evidence, never string-sniffing**: exit/typed 6 (sandbox-denied) is emitted only on authoritative evidence —
-  pre-spawn validation, profile-application failure, gateway policy denial, or the measured in-band errno signal (denial
-  = EPERM(1) vs allowed-but-unserved = ECONNREFUSED(61)). Unified-log correlation by pid is an _enhancement pending
-  verification_ from an unsandboxed context (the log store is permission-gated from sandboxed sessions). cowshed never
-  parses child stdout/stderr to infer a denial or synthesize a suggested grant (jcode's output-string heuristic is
-  explicitly not carried over).
+- **Platform network isolation**: macOS uses one 16-port block per workspace; Seatbelt emits 16 literal outbound allows,
+  leaves bind/inbound permissive, and relies on outbound confinement. The host control plane at 7644 never appears in
+  workspace configuration. Linux instead has a per-workspace gateway Unix data socket and no TCP egress. A fresh network
+  namespace remains solely for private loopback/dev-server isolation; there is no veth, DNAT, or routing plumbing, and
+  macOS port blocks do not apply on Linux.
+- **Denial evidence, never string-sniffing**: exit/typed 6 is emitted only on authoritative evidence: pre-spawn
+  validation, profile-application failure, gateway policy denial, or a verified kernel signal. Child output and bounded
+  summaries never establish a denial or synthesize a grant.
 - **Layout — two dedicated volumes, zero `~/Library`** (except the launchd plists, which must live there;
   home-manager-owned on nix hosts): `cowshed.store` mounted AT `~/.cowshed` (the dotdir IS the volume — no `store/`
   level; images, grants, quarantine, gateway state, telemetry at the volume root) and `cowshed.caches` NESTED at
   `~/.cowshed/caches` (mirror, git mirrors, layer-3 caches — fully rebuildable, nukeable). Both lazily created,
   space-sharing the container; store mounts first (the other mountpoints live on it) and the volume-root marker
   `.cowshed-volume.json` distinguishes mounted from bare — absent means unmounted, heal before acting. Workspace mounts
-  at `~/.cowshed/mnt/<project>/<ws>` (nobrowse, owners on, NOT /Volumes). Data-volume home footprint: one empty
-  mountpoint dir. Rationale: Data's local snapshots would pin churned image blocks (path-level tmutil exclusion doesn't
-  stop snapshotting); dedicated volumes also collapse backup policy to per-volume decisions and separate fsck/corruption
-  domains by rebuildability class. Sandbox consequence: ONE `~/.cowshed` subtree deny + carve-backs replaces the
-  enumerated store/sibling-mount denies (04_sandbox.md). Spec: 01_storage.md.
+  at `~/.cowshed/mnt/<owner>/<repo>/<ws>` (primary `repo_id`, with each component separately validated and encoded;
+  nobrowse, owners on, NOT /Volumes). Data-volume home footprint: one empty mountpoint dir. Rationale: Data's local
+  snapshots would pin churned image blocks (path-level tmutil exclusion doesn't stop snapshotting); dedicated volumes
+  also collapse backup policy to per-volume decisions and separate fsck/corruption domains by rebuildability class.
+  Sandbox consequence: ONE `~/.cowshed` subtree deny + carve-backs replaces the enumerated store/sibling-mount denies
+  (04_sandbox.md). Spec: 01_storage.md.
 - **Declarative host setup + deployment postures (14_nix.md)**: on nix hosts, `programs.cowshed` (home-manager) owns the
   cache-subtree symlinks, launchd agents, go env defaults, and TM exclusions declaratively — `adopt`/`ensure` VALIDATE
   and never mutate when HM owns the host (detection: HM symlinks resolve into /nix/store); imperative mode stays the
@@ -111,32 +103,53 @@ plumbing) and Claude Code / other agents (CLI "warm worktrees").
   03_caches.md, 04_sandbox.md, 05_gateway.md.
 - **iOS/Xcode topology (posture B)**: Xcode has no remote mode and Simulator.app cannot attach cross-uid, so the
   **personal-session simulator is an artifact host** (human inspection, fed by the one-way drop dir
-  `/Users/Shared/cowshed-drop/<project_id>/` via `cowshed sim export`) and **dev-side headless simulators are the
-  agent/CI runtime** (simctl/XCUITest/idb; the "simulator" Seatbelt preset opens CoreSimulator IPC only). The in-image
-  `.cowshed/bin/xcrun` wrapper (passthrough except simctl/devicectl; dev-local default) routes personal-session verbs
-  through the gateway's `/sim/` endpoint to a session broker — the one cowshed component running as the personal user —
-  under the `sim` grant axis (`openurl` freely grantable; `install` drop-dir-bound and human-gated: simulator apps
-  execute AS the invoking user). Expo/RN daily loops ride shared loopback unchanged (docs/ios.md). Specs: 14_nix.md,
-  02/03/04/05/06/07/12/13.
+  `<shared-drop-root>/<owner>/<repo>/`, using the separately validated components of the primary `repo_id`, via
+  `cowshed sim export`) and **dev-side headless simulators are the agent/CI runtime** (simctl/XCUITest/idb; the
+  "simulator" Seatbelt preset opens CoreSimulator IPC only). The in-image `.cowshed/bin/xcrun` wrapper (passthrough
+  except simctl/devicectl; dev-local default) routes personal-session verbs through the gateway's `/sim/` endpoint to a
+  session broker — the one cowshed component running as the personal user — under the `sim` grant axis (`openurl` freely
+  grantable; `install` drop-dir-bound and human-gated: simulator apps execute AS the invoking user). Expo/RN daily loops
+  ride shared loopback unchanged (docs/ios.md). Specs: 14_nix.md, 02/03/04/05/06/07/12/13.
 - **macOS desktop apps (posture B) — three lanes**: (1) agent E2E testing and (2) interactive debugging both run the app
   **as dev in dev's own session** (accessibility APIs/AppleScript; same uid → **no broker, no grant** — simpler than
   simulators); (3) daily use runs it **as the personal user** via `cowshed app export` (drop dir) →
   `cowshed app promote` — a **human-run personal-session verb** (writes `~/Applications`, so unreachable from any
   sandbox/agent; Developer-ID signature required by default, clears quarantine). The consent asymmetry: lanes 1–2 need
   none (confined as dev), lane 3's `promote` IS the consent (the app runs with the human's full authority — a deliberate
-  boundary exit). No `--app open` agent grant exists (rejected — promote is the only personal-session path, human by
-  construction). `cp` applies no quarantine xattr (verified), so a Developer-ID drop opens cleanly; ad-hoc trips
+  boundary exit). The contract defines no `--app open` agent grant: promotion is the only personal-session path and is
+  human by construction. `cp` applies no quarantine xattr (verified), so a Developer-ID drop opens cleanly; ad-hoc trips
   Gatekeeper. Electron/RN-desktop promoted apps point at dev's dev-server over loopback for live iteration. Specs:
   14_nix.md, 02/04/05/06; docs/desktop.md.
+- **Layered sandbox and grant propagation**: start closed. Egress and simulator policy update immediately at the
+  gateway. Filesystem authority belongs to an immutable supervisor launch revision: after an effective filesystem grant
+  or revoke, the old supervisor stops admitting work and drains; existing jobs retain the old revision, then the
+  controller relaunches under the new revision. Inner per-command profiles may narrow but never widen. Named sessions
+  pinned to a stale revision conflict rather than migrate. No-op, egress-only, and simulator-only changes do not
+  relaunch.
+- **Supervisor, clients, and jobs**: one persistent Unix socket per workspace supports concurrent clients. Its runtime
+  directory is mode 0700, socket mode 0600, and connections require peer-credential/uid validation. A disconnect
+  detaches only that client's view; jobs continue and clients resume by durable numeric job ID and backing-file offsets.
+  Every accepted exec gets a positive workspace-local monotonic `u64` job ID with no reuse. Complete separate streams
+  live at `.cowshed/job/<id>/out` and `err`; metadata and deterministic bounded redacted summaries live in control
+  messages and Arrow records. A configurable combined output quota defaults to 1 GiB. At the first crossing, stop
+  accepting bytes past the boundary, terminate the whole process group, drain both pipes, fsync, and record an
+  authoritative `output-limit` terminal state; never silently truncate while a job continues.
+- **MCP authority delivery and consent**: coordinator authority is delivered only over an inherited dedicated file
+  descriptor or socketpair from the spawner, then validated, closed, and made non-inheritable before any workspace
+  process is spawned. It never appears in environment, argv, stderr, workspace files, or ordinary token text. Worker
+  connection descriptors are separate 256-bit random, one-use, 30-second-TTL, memory-only capabilities, atomically
+  consumed and bound to the intended workspace plus peer/socket identity; restart invalidates them. MCP has no
+  interactive consent or elicitation. The coordinator applies policy agent-to-agent. A worker calling a coordinator-only
+  tool fails authorization before execution with an error distinct from sandbox denial and domain errors. Simulator
+  install remains per-artifact human-gated, and desktop promotion remains a human-run personal-session action; no grant
+  bypasses either boundary.
 - **Sandbox**: layered, start closed (write: own mount + designated cache subtrees + temp; egress: localhost only),
-  widened at runtime via grants (fs read/write paths + egress domains) applied at next exec (Seatbelt regen) and
-  immediately at the gateway. Parity with jcode swarm coordinator grants is a hard requirement. No VMs/containers (user
-  rejected; VZ caps macOS guests at 2 anyway); Seatbelt on host is the isolation ceiling, documented as confinement.
-- **devenv/Nix in sandboxes** (jcode requirement): multi-user (daemon) Nix required; store reads via the broad read
-  allow; builds/substitution via the daemon unix socket — an accepted off-gateway trusted channel; `~/.cache/nix` +
-  `~/.local/state/nix` in the writable baseline; cowshed auto-trusts each clone's `.envrc` (direnv trust is path-keyed)
-  at new/fork/restore and in `ensure` healing; `cowshed exec` wraps commands fail-closed in `direnv export` (jcode's
-  `command_with_nearest_envrc`, without secret filtering — no-secrets invariant). See 04_sandbox.md.
+  widened at runtime through coordinator-owned grants. No VMs/containers; Seatbelt on host is the documented confinement
+  ceiling.
+- **devenv/Nix in sandboxes**: multi-user daemon Nix is required; store reads use the broad read allow and
+  builds/substitution use the daemon Unix socket as an accepted trusted channel. Writable Nix cache/state roots are
+  explicit, clone `.envrc` trust is healed at lifecycle boundaries, and exec loads direnv fail-closed without exporting
+  secrets.
 - **Gateway**: localhost daemon. npm + cargo mirrors (caching/dedupe, Keychain upstream creds) + the `repo mirror`
   control-plane verb (bare read-only git mirrors; no in-sandbox git broker). Granted egress is **intercepted by
   default** — per-workspace CA (private key gateway-side next to the grant file, public cert an in-image trust anchor;
@@ -159,11 +172,9 @@ plumbing) and Claude Code / other agents (CLI "warm worktrees").
   telemetry daemon; the one text file is `telemetry/daemon-stderr.log` for pre-tracer-init crashes. lmao-query selectors
   are the 08 trace-assertion surface (golden trace fixtures via injected Clock); `cowshed logs`/`audit`/`trace` read
   them; OTLP is a projection if ever needed. Spec: 13_telemetry.md.
-- **Substrates**: `cowshed_core::Substrate` trait with two v1 implementations — APFS images (macOS) and ZFS datasets
-  (Linux; snapshot `main@cowshed:<name>` + clone, destroy clone+origin together, minimal root helper for mount ops since
-  Linux ignores zfs mount delegation). Auto-detected from the filesystem the project root sits on. Linux sandbox
-  enforcement = Landlock + loopback-only netns, same grant files, same exit codes. Spec: 09_substrates.md +
-  04_sandbox.md.
+- **Substrates**: `cowshed_core::Substrate` has APFS image and ZFS dataset contracts. Linux enforcement combines
+  Landlock, a private-loopback network namespace, and a per-workspace gateway Unix socket, with the same grants,
+  revision semantics, and exit taxonomy as macOS.
 - **CI runner**: cowshed is a GitHub Actions runner substrate — NixOS module `services.cowshed-runner`, ephemeral
   runners labeled `[self-hosted, cowshed, zfs]`, one workspace per job (`ci-<run_id>`), headless main refreshed by the
   green main-branch job; composite action at `.github/actions/smoothbricks-ci/action.yml` (mode auto|github|cowshed).
@@ -175,30 +186,31 @@ plumbing) and Claude Code / other agents (CLI "warm worktrees").
   ok/usage/not-found/conflict/env-missing/ sandbox-denied. `cowshed exec` passes the **child's** code through unchanged;
   cowshed-wrapper failures during exec use **100–105** so they never collide with a child that exits 1–6. `-q`/
   `--quiet` are aliases. Convention over configuration: zero required config, `.cowshed.toml` overrides only.
+- **Structured stdin and safe shell optimization**: `ExecRequest` supports no stdin, inline binary/streamed stdin, or a
+  workspace-relative file source. File input is opened no-follow beneath the workspace and streamed with backpressure;
+  EOF and cancellation are explicit, and job metadata records only source kind and byte count, never content. No shell
+  interpolation is involved. Ordinary shell execution remains the correctness path. An optional fast path may use a real
+  shell AST parser—never regex or output sniffing—for one top-level simple command with literal, in-workspace,
+  same-filesystem, nonexistent clobber targets for `>` and/or `2>`. Append, descriptor duplication, pipelines,
+  subshells, expansion, symlinks, noclobber, ambiguity, and every ineligible form fall back unchanged. The supervisor
+  may create the target inode and hardlink the matching job stream to it, with inode-aware tailing and quota accounting.
+  This is never a security, denial-evidence, authority, quota-correctness, or general correctness dependency.
 
 ## State of the tree
 
-- `packages/cowshed/`: Cargo workspace scaffolded (resolver 3, edition 2024), stub crates compile: `cowshed-core`,
-  `cowshed-cli` (bin `cowshed`), `cowshed-gateway`, `cowshed-napi` (cdylib), `cowshed-escape-tests`.
-- Toolchain: latest stable Rust via rust-overlay in `tooling/direnv/devenv.{yaml,nix}` — verified 1.97.0. **Caution
-  (measured): `cargo` is currently NOT on the devenv profile PATH** — the profile ships
-  rust-analyzer/cargo-nextest/sccache but not cargo itself; builds today reach the toolchain via the rust-overlay store
-  path directly. Fix the devenv profile (or use the store path) before assuming
-  `direnv exec /Users/danny/Dev/smoothbricks cargo …` works.
-- Repo rules (AGENTS.md): bun only (no npm/npx), fix everything you see, greenfield — no compat layers, search before
-  implementing.
+- `packages/cowshed/` contains Cargo workspace scaffolding and stub crates only. Treat every behavior in the specs and
+  docs as an implementation obligation, not as shipped functionality.
+- Toolchain configuration lives in `tooling/direnv/devenv.{yaml,nix}`. Invoke repository commands from `<repo-root>`;
+  never embed a workstation-specific absolute path.
+- Keep the implementation greenfield: migrate all callers cleanly and leave no compatibility paths.
 
 ## Suggested workflow shape
 
-Phase 1 — `cowshed-core` (one strong implementor; it's the foundation): image/volume lifecycle (hdiutil/diskutil
-wrappers, clonefile via libc), marker/grants files, env wiring, Seatbelt profile generation ported+generalized from
-jcode, exec supervision. Unit tests for pure parts (profile text, path policy, grant merge); integration tests behind a
-flag on real APFS under `/private/tmp` (hdiutil works unsandboxed; CI-skip otherwise). Phase 2 — parallel implementors:
-`cowshed-cli` (self-driving contract), `cowshed-gateway` (mirror + broker + CONNECT), `cowshed-napi` (napi-rs async
-bindings), `cowshed-escape-tests` (port jcode's escape-test pattern). Phase 3 — fork reviewers per crate (adversarial:
-spec conformance, sandbox soundness, exit-code contract), then fixers apply confirmed findings, then a final verify
-agent: `cargo check && cargo clippy -- -D warnings && cargo test` (via direnv) + a CLI transcript smoke-run against the
-docs' examples.
+Phase 1 — `cowshed-core` and `cowshed-shell`: substrate lifecycle, repository binding and policy lookup, markers/grants,
+env wiring, sandbox profile generation, multi-client supervision, jobs, output quotas, and revision-bound relaunch. Unit
+tests cover pure contracts; integration tests use isolated temporary paths. Phase 2 — parallel work on the CLI, gateway,
+N-API bindings, MCP server, and escape suite. Phase 3 — adversarial conformance and sandbox review, confirmed fixes,
+then targeted verification plus the repository's full Rust checks and a CLI transcript against the docs.
 
 **Resolved experiments** (2026-07-11, harnesses + results in `specs/cowshed/prototypes/apfs-workspace-bench/`; verdicts
 folded into the specs):
@@ -287,14 +299,15 @@ Interception + telemetry verification (05_gateway.md, 13_telemetry.md — fold i
   (13_telemetry.md).
 - **Audit flush-durability window** — measure the one-batch crash window under the decision-boundary/short-timer flush
   policy; confirm no audit-relevant event class needs a per-event flush (13_telemetry.md).
-- **lmao TRACEPARENT adoption** — the TS/Rust tracer adopts `TRACEPARENT` at init and stamps outbound `fetch`/HTTP; this
-  is what promotes first-party traffic to tier-1 attribution (13_telemetry.md). Ships in lmao, verified in cowshed.
+- **lmao TRACEPARENT adoption** — verify that the TS/Rust tracer adopts `TRACEPARENT` at init and stamps outbound
+  `fetch`/HTTP, which promotes first-party traffic to tier-1 attribution (13_telemetry.md).
 
 ## Acceptance
 
 - `cowshed adopt && cowshed new x && cowshed exec x -- <build> && cowshed push x && cowshed rm x` works end-to-end on
-  this machine, sandboxed, with caches warm from main.
-- Exit code 6 + stderr grant hint on sandbox denial; `cowshed grant` unblocks without restart.
+  each supported host, sandboxed, with caches warm from main.
+- Exit code 6 and a grant hint appear only on authoritative sandbox-denial evidence. After a filesystem grant, the prior
+  supervisor drains and relaunches at the new revision before retry; egress and simulator grants apply immediately.
 - `cowshed ensure` fast path ≤ 25 ms; `cowshed new` ≤ 1 s cold; `cowshed rm` returns instantly.
 - Zero host-visible inode growth per workspace beyond the image file + grants file.
 - Substrate parity: the acceptance flow above passes on Linux/ZFS with Landlock enforcement (integration leg; can run in
