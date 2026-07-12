@@ -16,13 +16,20 @@ Nix and ZFS already available" necessarily means **self-hosted**. That's the poi
 ## Runner host setup
 
 The runner host is a Linux box with ZFS and multi-user Nix. The NixOS module registers ephemeral GitHub runners and
-keeps a headless `main` workspace warm:
+keeps a headless `main` workspace warm. Its repository binding records the chosen remote and the corresponding stable
+`repo_id` (the remote's lowercase `owner/repo`); startup refuses a mismatch. Discovery may suggest a binding but never
+silently creates one. Multiple identities are allowed with one primary, and a local-only repository requires an explicit
+`repo_id`.
 
 ```nix
 {
   services.cowshed-runner = {
     enable = true;
-    repo = "smoothbricks/smoothbricks";
+    repository = {
+      remote = "https://github.com/smoothbricks/smoothbricks.git";
+      repoId = "smoothbricks/smoothbricks";
+      primary = true;
+    };
     # Ephemeral runners: each registers, runs one job, deregisters.
     ephemeral = true;
     count = 4;
@@ -39,6 +46,12 @@ keeps a headless `main` workspace warm:
 }
 ```
 
+Trusted project policy is `~/.cowshed/<owner>/<repo>/policy.json`, with `owner` and `repo` encoded as separate path-safe
+components. Here `~` belongs to the trusted cowshed controller identity, not the ephemeral runner account. Policy is
+created by trusted host bootstrap, owned by the controller, and unavailable to runner and job processes. A checkout,
+workflow, discovery result, or job hook can neither mint repository identity nor rewrite policy; a missing or
+inconsistent binding is a host-bootstrap error.
+
 `services.cowshed-runner` also installs the ZFS mount helper and the gateway service, and points runner registration at
 a `GITHUB_TOKEN`/app credential read from the host secret-service — the only place a token is needed.
 
@@ -52,14 +65,14 @@ main-as-base convention cowshed uses everywhere, applied to the runner host. No 
 ## How a job flows
 
 1. **Register** — an ephemeral runner picks up the job (labels `[self-hosted, cowshed, zfs]`).
-2. **Clone** — the composite action runs `cowshed new ci-<run_id>`: snapshot + clone of the headless main, tens of
-   milliseconds. The workspace already has Nix/devenv built, `node_modules` installed, caches warm.
-3. **Steps run sandboxed** — build/lint/test execute via cowshed's exec pipeline inside the workspace: Landlock-confined
-   filesystem, loopback-only egress through the gateway, the same grants and exit-code-6 contract as everywhere else.
-4. **Destroy** — the ephemeral runner reaps every dataset under the job when it deregisters, so nothing persists between
-   jobs. To reclaim immediately, add a trailing `if: ${{ always() }}` step running `cowshed rm ci-${{ github.run_id }}`
-   (the composite action can't self-clean — composite actions have no post-job hook — and it prints this reminder on
-   stderr). `cowshed gc` on the host sweeps any orphaned `ci-*` workspace and its origin snapshot as a backstop.
+2. **Clone** — the runner's trusted job-start hook creates `ci-<run_id>-<attempt>` as a snapshot + clone of the headless
+   main before any repository-controlled payload starts. The composite action does not create the confinement boundary.
+3. **Intercept every command** — before the runner launches any repository-controlled command, including the first, the
+   runner integration dispatches it through `cowshed exec` in that workspace. There is no direct-runner fallback. An
+   action type is supported only when all repository-controlled processes it can launch are interceptable; otherwise the
+   step is rejected before its payload starts.
+4. **Destroy** — the trusted job-completed hook destroys the clone and origin snapshot regardless of job outcome. The
+   ephemeral runner then deregisters. Host `cowshed gc` sweeps orphaned `ci-*` workspaces after crashes.
 
 ## What you delete from the workflow
 
@@ -90,41 +103,46 @@ jobs:
       - uses: actions/checkout@v6.0.2
         with: { filter: blob:none, fetch-depth: 0 }
 
-      - name: 🧱 Setup (cowshed clone or GitHub Nix)
+      - name: 🧱 Setup environment
         id: cowshed
         uses: ./.github/actions/smoothbricks-ci
         with:
           mode: auto # auto | github | cowshed
 
       # Unchanged: the same targets, warm on cowshed, cold-with-cache on GitHub.
+      # On a cowshed runner, the runner integration intercepts each command and invokes cowshed exec.
       - run: smoo github-ci nx-smart --target build --name "Build" --step 6
       - run: smoo github-ci nx-smart --target lint  --name "Lint"  --step 7
       - run: smoo github-ci nx-smart --target test  --name "Unit Tests" --step 8
-
-      # cowshed mode: reclaim the workspace now (no-op on GitHub — COWSHED_CI_WORKSPACE is unset).
-      - name: 🧹 Destroy cowshed workspace
-        if: ${{ always() && env.COWSHED_CI_WORKSPACE != '' }}
-        run: cowshed rm "$COWSHED_CI_WORKSPACE"
 ```
 
-On a cowshed runner, `steps.cowshed.outputs.workspace-path` is the mounted clone; on GitHub it is the plain checkout, so
-downstream steps don't branch. Pin `mode: github` to force the hosted path (e.g. to reproduce a hosted-only failure), or
-`mode: cowshed` to fail loudly if a job was mis-routed to a runner without cowshed.
+On a cowshed runner, `steps.cowshed.outputs.workspace-path` is the job-hook-created clone; on GitHub it is the plain
+checkout, so downstream job bodies do not branch. Pin `mode: github` to force the hosted path (for example, to reproduce
+a hosted-only failure), or `mode: cowshed` to fail loudly if a job was mis-routed to a runner without cowshed. The
+action only provisions the environment and publishes a cwd; it cannot wrap later steps and is never credited as a
+sandbox boundary.
 
 ## Public-repo security posture
 
 Self-hosted runners on public repos are normally dangerous — a fork PR can run arbitrary code on your infrastructure.
-cowshed makes it defensible, and the standard guardrails still apply:
+cowshed makes it defensible, not risk-free, and the standard guardrails still apply:
 
 - **Require approval for fork-PR workflows** (repo setting: _Require approval for all outside collaborators_). This is
   mandatory, not optional.
 - **Ephemeral runners**: one job per runner, then deregister — no state carries from a malicious job to the next.
-- **Sandboxed steps**: even within a job, build/test run Landlock-confined with loopback-only egress. A hostile PR
-  cannot read the host's secrets (they're in the gateway, denied to the sandbox), cannot reach the network except
-  through the gateway's allowlist, and cannot write outside its throwaway clone.
+- **Universal interception for supported actions**: every repository-controlled command, including the first, runs via
+  `cowshed exec`; an action type that cannot be intercepted completely is rejected before any payload starts.
+- **Sandboxed commands**: Landlock confinement limits each command to its throwaway workspace and designated caches;
+  egress is loopback-only through the gateway. Host secrets, cowshed state, trusted policy, and other jobs stay denied.
+- **Runner-unit defense in depth**: the dedicated unprivileged runner unit is independently filesystem-confined away
+  from cowshed state, bindings, `~/.cowshed/<owner>/<repo>/policy.json`, gateway credentials, and sockets, and its
+  network is forced through the gateway. A narrow controller interface permits lifecycle and `cowshed exec` dispatch
+  without exposing backing files. This remains mandatory even though `cowshed exec` is the repository-command boundary.
 - **Secrets aren't on GitHub to leak**: registry and git credentials live only on the runner host. A compromised job
   reaches them only through the gateway, which scopes every request to the job workspace's egress grants and audits it
   (Arrow telemetry store, `cowshed audit`).
+- **Dedicated runner group**: scope ephemeral runners to this repository, and never use `pull_request_target` to check
+  out untrusted code.
 
-The clone-is-a-blast-radius property does the heavy lifting: the worst a job can do to the host is fill its throwaway
-dataset, which `cowshed rm` reclaims.
+Neither cwd relocation nor the composite action confines a process. The security claim depends on both universal runner
+interception and the independent unit sandbox; the throwaway clone limits persistence but is not itself a host sandbox.
