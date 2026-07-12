@@ -24,26 +24,27 @@ Why placement decides it (measured, so it is not re-litigated — bun 1.3.14, wa
 volume space consumed** (99.2% of blocks shared with the cache — clonefile confirmed); **cross-volume cache: 0.18 s (6×)
 and a full 59 MB copy, zero sharing**. For delta installs the two placements are nearly a wash — the gateway mirror
 already dedupes the download. The deciding case is **full materialization**: a wiped `node_modules`, a big lockfile
-churn, a fresh adopt — at Conloca scale (~90k objects, GBs) the measured 6× ratio lands in the
-seconds-vs-tens-of-seconds band (the project benchmark's 100k-file copy took ~7.5 s for 256-byte files; real file sizes
-are worse). The measured 0.8% marginal disk also proves the "cache and `node_modules` share blocks in-image" claim:
-carrying the cache in the image is nearly free. The cost is sibling workspaces duplicating entries fetched post-clone —
-bounded, ephemeral, reclaimed at rm/land.
+churn, a fresh adopt — at large-repository scale (~90k objects, GBs) the measured 6× ratio lands in the
+seconds-vs-tens-of-seconds band (for a repository with roughly 100k objects); the measured relationship is the project
+benchmark's 100k-file copy took ~7.5 s for 256-byte files; real file sizes are worse). The measured 0.8% marginal disk
+also proves the "cache and `node_modules` share blocks in-image" claim: carrying the cache in the image is nearly free.
+The cost is sibling workspaces duplicating entries fetched post-clone — bounded, ephemeral, reclaimed at rm/land.
 
 ## The three layers
 
-| Layer                         | Contents                                                                                 | Location                                                                                                                       | Sharing                                   |
-| ----------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------- |
-| 1. Mirror artifacts           | npm tarballs, crate files, registry metadata, bare git mirrors                           | `~/.cowshed/caches/{mirror,git}` (the `cowshed.caches` volume, 01_storage.md), content-addressed                               | Global, written only by cowshed-gateway   |
-| 2. Clone-materializing caches | bun install cache — **today: bun, on APFS; possibly nothing at all on ZFS**              | Inside each workspace image under `.cowshed/cache/bun`                                                                         | Inherited from main via CoW at clone time |
-| 3. Read-at-build caches       | cargo registry (`~/.cargo`), Go module + build caches, sccache, zig global cache, gradle | Shared cache volume, reached through the tools' **default paths** (relocated once) or **direct path config** (Go — see Wiring) | Shared writable by all workspaces         |
+| Layer                         | Contents                                                                                                                  | Location                                                                                           | Sharing                                   |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| 1. Gateway mirrors            | npm tarballs, crate files, registry metadata, bare repository mirrors                                                     | `~/.cowshed/caches/mirror` and `~/.cowshed/caches/repo-mirrors` (gateway-owned, sandbox-read-only) | Global, written only by cowshed-gateway   |
+| 2. Clone-materializing caches | bun install cache — **today: bun, on APFS; possibly nothing at all on ZFS**                                               | Inside each workspace image under `.cowshed/cache/bun`                                             | Inherited from main via CoW at clone time |
+| 3. Read-at-build caches       | Cargo registry/git extraction caches, Go module + build caches, sccache, zig global cache, gradle, Nix eval/fetcher state | Dedicated writable roots under `~/.cowshed/caches/` reached through tool defaults or direct config | Shared writable by all workspaces         |
 
-Layer 1 removes duplicate _downloads_ (and stores compressed bytes once, ever); its git form is the bare-mirror tree
-(`~/.cowshed/caches/git/<host>/<path>.git`), written only by the gateway's `repo mirror` verb (05_gateway.md) and
-locally cloned/fetched from by workspaces and main — workspace git never speaks to a network remote. Layer 2 is one
-special case, not a category: it exists exactly where a tool reflinks out of its cache and the substrate cannot reflink
-across volume boundaries. Layer 3 caches are read at build time and write nowhere near the workspace, so sharing them is
-free.
+Layer 1 removes duplicate _downloads_ (and stores compressed bytes once, ever). Bare repository mirrors live only at
+`~/.cowshed/caches/repo-mirrors/<host>/<path>.git`; they are written by the gateway's `repo mirror` control-plane verb
+and are read-only to workspaces and main. Cargo's `~/.cargo/git` is **not** that mirror tree: it is a shared writable
+Cargo extraction/index cache at `~/.cowshed/caches/cargo/git`. The two have distinct ownership, permissions, and paths,
+so a Cargo process can never mutate gateway repository mirrors. Layer 2 is one special case, not a category: it exists
+exactly where a tool reflinks out of its cache and the substrate cannot reflink across volume boundaries. Layer 3 caches
+are read at build time and write nowhere near the workspace, so sharing them is free.
 
 **ZFS may empty layer 2** (verify item, not a promise): OpenZFS 2.2 block cloning (BRT) works across datasets within a
 pool — something APFS clonefile cannot do across volumes. If bun's Linux copy path goes through `copy_file_range` (which
@@ -65,44 +66,50 @@ rule: read-at-build caches may live off-image freely, because nothing ever refli
 
 ## Wiring
 
-Wiring is carried by **files and host paths, not environment variables**. Files travel with the image through
-clone/fork/checkpoint and cover processes cowshed never spawned (IDE terminals, launchd jobs, CI runner steps);
-environment dies at the first unwrapped spawn.
+Wiring is carried primarily by **files and host paths**. Files travel with the image through clone/fork/checkpoint and
+cover processes cowshed never spawned (IDE terminals, launchd jobs, CI runner steps). The exception is standard generic
+HTTP proxy variables, which are emitted by the workspace environment wiring because ordinary proxy-aware tools consume
+them there; they always contain an endpoint URL, never credentials.
 
-- **In-image config files**, written at adopt/new/fork (per-workspace values: the gateway data port) and re-validated by
+- **In-image config files**, written at adopt/new/fork with platform-specific endpoint values and re-validated by
   `ensure`. cowshed lists the paths it owns in the workspace repo's `.git/info/exclude` — repo-local ignore that travels
-  with every clone — so per-workspace rewrites never dirty `git status`:
-  - `bunfig.toml` at the workspace root: `install.registry` pointing at the workspace's own gateway data-plane port
-    (`http://127.0.0.1:<base>/npm` — the workspace's `portBlock.base`, 05_gateway.md; a file, still no variable) and
+  with every clone — so per-workspace rewrites never dirty `git status`. Define `GATEWAY_HTTP` as
+  `http://127.0.0.1:<portBlock.base>` on macOS and exactly `http://127.0.0.1:7644` on Linux. The Linux address is served
+  by the trusted connector inside that workspace's private netns; package clients do not speak Unix sockets. No Linux
+  `portBlock` or synthetic base exists.
+  - `bunfig.toml` at the workspace root: `install.registry = "<GATEWAY_HTTP>/npm"` and
     `[install.cache] dir = ".cowshed/cache/bun"` — **verified (bun 1.3.14): the relative path is honored and resolves
     against the project root, not the invocation cwd** — one committed line, identical for main, workspaces, and CI.
     Caution, same verification: the `[install] cacheDir` spelling is _silently ignored_ (falls back to the global cache
     with no error); `cowshed doctor` checks for that misspelling.
-  - cargo config: source replacement of crates.io with `sparse+http://127.0.0.1:<base>/cargo/`,
+  - cargo config: source replacement of crates.io with `sparse+<GATEWAY_HTTP>/cargo/`,
     `[build] rustc-wrapper = "sccache"` when sccache is present, and `[env]` setting `SCCACHE_NO_DAEMON = "1"` —
     **verified (cargo 1.97): `[env]` values reach every rustc-wrapper invocation; no environment fallback is needed.**
     Host-global settings live in the host-owned `~/.cargo/config.toml` (never on the cache volume — see relocation
-    below); per-workspace ones live in the in-image `.cargo/config.toml`. The port is the primary workspace identity, so
-    the URL no longer needs to carry the token; the token second factor rides the registry auth mechanism
-    (05_gateway.md).
+    below); per-workspace ones live in the in-image `.cargo/config.toml`. Endpoint plus the registry authentication
+    mechanism carry the token; the URL never contains it (05_gateway.md).
   - No git remote/proxy config is written: workspace git speaks only local filesystem remotes (the `host` remote and
     gateway-owned bare mirrors — 05_gateway.md), so there is nothing to route through the gateway and no credential
     helper inside the image.
   - **Go env file** at `.cowshed/cache/go/env` (the `go env -w` format), reached via a `GOENV` export (below). Go is the
     one toolchain with **no project-level config file** — settings live in a single user-global env file
     (`os.UserConfigDir()/go/env`, measured default `~/Library/Application Support/go/env`) overridable only by `GOENV` —
-    and `GOPROXY` must carry the workspace's own data-plane port, so a host-global file cannot express it. The in-image
-    file pins: `GOPROXY=http://127.0.0.1:<base>/go` (no `,direct` fallback — misses fail at the gateway with the
-    offline/denied distinction, 05_gateway.md), `GOSUMDB=sum.golang.org` (verification rides the proxy's sumdb
-    passthrough), `GOMODCACHE=~/.cowshed/caches/go/mod` and `GOCACHE=~/.cowshed/caches/go/build` (shared, layer 3),
-    `GOPATH=<mount>/.cowshed/cache/go/path` and `GOBIN=<mount>/.cowshed/cache/go/bin` (in-image, workspace-keyed —
-    `go install` binaries are the `~/.cargo/bin` persistence-escape hazard and must never land on the shared volume).
-    Net effect: **`~/go` is never created** (measured on this host: the devenv-provided go 1.26.3 had already grown a
-    1.1 GB `~/go/pkg/mod` under the defaults); 04_sandbox.md turns any regression into a loud tripwire. cowshed also
-    writes **`GOTOOLCHAIN=local`**: the toolchain is nix/devenv-provided and pinned, and `auto` silently downloading Go
-    toolchains contradicts the declarative environment — a project that deliberately overrides to `auto` gets its
-    downloads in `GOMODCACHE`, i.e. on the caches volume, never in `$HOME`. A host-global `go env -w` file instead of
-    `GOENV` is rejected: `GOPROXY` is per-workspace identity, and a global file would leak one workspace's port to all.
+    and `GOPROXY` is per-workspace. The in-image file pins: `GOPROXY=<GATEWAY_HTTP>/go` (no `,direct` fallback — misses
+    fail at the gateway with the offline/denied distinction, 05_gateway.md), `GOSUMDB=sum.golang.org` (verification
+    rides the proxy's sumdb passthrough), `GOMODCACHE=~/.cowshed/caches/go/mod` and `GOCACHE=~/.cowshed/caches/go/build`
+    (shared, layer 3), `GOPATH=<mount>/.cowshed/cache/go/path` and `GOBIN=<mount>/.cowshed/cache/go/bin` (in-image,
+    workspace-keyed — `go install` binaries are the `~/.cargo/bin` persistence-escape hazard and must never land on the
+    shared volume). Net effect: **`~/go` is never created** (measured on this host: the devenv-provided go 1.26.3 had
+    already grown a 1.1 GB `~/go/pkg/mod` under the defaults); 04_sandbox.md turns any regression into a loud tripwire.
+    cowshed also writes **`GOTOOLCHAIN=local`**: the toolchain is nix/devenv-provided and pinned, and `auto` silently
+    downloading Go toolchains contradicts the declarative environment — a project that deliberately overrides to `auto`
+    gets its downloads in `GOMODCACHE`, i.e. on the caches volume, never in `$HOME`. A host-global `go env -w` file
+    instead of `GOENV` is rejected: `GOPROXY` is per-workspace identity, and a global file could select another
+    workspace's endpoint.
+- **Generic proxy variables.** Workspace env wiring sets `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, and `https_proxy` to
+  `<GATEWAY_HTTP>` and configures `NO_PROXY`/`no_proxy` only for the workspace's own local services. On Linux these
+  variables therefore resolve to `http://127.0.0.1:7644`; on macOS they resolve to the workspace block base. The token
+  is still carried only as `Proxy-Authorization`, never in any variable or URL.
 - **In-image tool shims** at `.cowshed/bin/`, PATH-prepended by the same `.envrc` wiring (so they travel with every
   clone and cover every process spawned in the workspace, IDE terminals included). Today that is one shim: the **`xcrun`
   wrapper** — pure `exec /usr/bin/xcrun "$@"` passthrough for everything except the simulator-control verbs (`simctl`,
@@ -112,20 +119,36 @@ environment dies at the first unwrapped spawn.
   gateway's `/sim/` endpoint (05_gateway.md) under the `sim` grant axis (04_sandbox.md). Tools that hardcode
   `/usr/bin/xcrun` bypass the shim and degrade to dev-local simulators — the safe default.
 - **Host-level relocation, once — cache subtrees only**: at first adopt on a host (idempotent, re-checked by `doctor`),
-  the read-at-build tools' _cache_ directories become symlinks onto the cache volume: `~/.cargo/registry`,
-  `~/.cargo/git`, `~/.cache/zig`, `~/.gradle/caches` (and the other gradle cache subdirs), sccache's platform default.
+  the read-at-build tools' _cache_ directories resolve to these exact dedicated roots:
+
+  | Tool default           | cowshed.caches target              |
+  | ---------------------- | ---------------------------------- |
+  | `~/.cargo/registry`    | `~/.cowshed/caches/cargo/registry` |
+  | `~/.cargo/git`         | `~/.cowshed/caches/cargo/git`      |
+  | `~/.cache/zig`         | `~/.cowshed/caches/zig`            |
+  | `~/.gradle/caches`     | `~/.cowshed/caches/gradle/caches`  |
+  | sccache platform cache | `~/.cowshed/caches/sccache`        |
+  | `~/.cache/nix`         | `~/.cowshed/caches/nix/cache`      |
+  | `~/.local/state/nix`   | `~/.cowshed/caches/nix/state`      |
+
+  Go remains direct-configured as `~/.cowshed/caches/go/{mod,build}`. Gateway artifacts remain outside every writable
+  tool root at `mirror/` and `repo-mirrors/`.
+
   **The parent config directories stay on the host.** `~/.cargo/config.toml`, `~/.cargo/credentials.toml`,
   `~/.cargo/bin` (on PATH), and `~/.gradle/gradle.properties` are _not_ relocated and are on the secret deny list
   (04_sandbox.md) — relocating them wholesale would put user config, credentials, and PATH-resolved binaries on a
   sandbox-writable volume, a persistence-escape surface. No `CARGO_HOME`, `ZIG_GLOBAL_CACHE_DIR`, `GRADLE_USER_HOME`, or
   `SCCACHE_DIR` exports exist. Go needs no symlink at all — `GOMODCACHE`/`GOCACHE` are directly configurable in its env
   file (above), which is strictly cleaner than relocating a default path. Profile generation canonicalizes symlinked
-  paths when emitting write grants (the `/var` → `/private/var` handling generalizes). The relocation runs in one of two
-  modes (14_nix.md): **declarative** — `programs.cowshed` (home-manager) owns the symlinks as generation-managed
-  artifacts, and `adopt`/`ensure` VALIDATE without mutating (detection: the symlinks resolve into `/nix/store`; `doctor`
-  findings point at the declarative fix, e.g. `next: enable programs.cowshed.relocations`); **imperative** — the non-nix
-  fallback, where `adopt` writes the symlinks itself, exactly as above. Same end state either way; the difference is who
-  owns it.
+  paths when emitting write grants (the `/var` → `/private/var` handling generalizes).
+
+  On home-manager/NixOS/nix-darwin hosts this relocation is **declarative and mandatory**: the module creates the exact
+  links/bindings above as generation-managed artifacts, including the two Nix subdirectories, and `adopt`/`ensure` only
+  validate. They never mutate module-owned paths. The sole exception is an explicitly imperative, non-declarative host:
+  when no supported declarative manager owns the paths, `cowshed adopt --imperative-host-setup` may create the same
+  links after an explicit confirmation. There is no automatic fallback from failed declarative validation; mixed
+  ownership is a conflict and `doctor` points to the declarative option that must be fixed.
+
 - **Environment variables: at most two load-bearing.**
   - `BUN_INSTALL_CACHE_DIR` is **retired** — its verification passed (relative `[install.cache] dir` works, above); the
     committed bunfig line is the wiring and no export exists.
@@ -137,11 +160,12 @@ environment dies at the first unwrapped spawn.
     `cowshed exec`'s fail-closed `direnv export` (04_sandbox.md) carries it, and IDE-spawned tools (gopls) get it via
     the editor's direnv integration. Verification item (kickoff): coverage across go invocations including gopls, and
     whether any file-based mechanism exists that kills the export.
-  - `cowshed ensure --envrc` additionally emits **port conventions for dev servers** —
+  - On macOS, `cowshed ensure --envrc` additionally emits **port conventions for dev servers** —
     `COWSHED_PORT_BASE=<portBlock.base>` and `PORT=<base+1>` — so devenv/dev servers bind inside the workspace's own
-    block (04_sandbox.md, cooperative-sandboxing caveat); and **optional prompt conveniences — explicitly
-    non-load-bearing** — `COWSHED_WORKSPACE` / `COWSHED_PROJECT` / `COWSHED_LAYER` / `COWSHED_MOUNT`. Anything that
-    needs identity derives it from cwd via `.cowshed/workspace.json` or asks the CLI.
+    block (04_sandbox.md, cooperative-sandboxing caveat). Linux emits neither value: services use private loopback and
+    package/proxy wiring uses fixed `GATEWAY_HTTP=http://127.0.0.1:7644`. Both platforms may emit **optional prompt
+    conveniences — explicitly non-load-bearing** — `COWSHED_WORKSPACE` / `COWSHED_REPO_ID` / `COWSHED_LAYER` /
+    `COWSHED_MOUNT`. Anything that needs identity derives it from cwd via `.cowshed/workspace.json` or asks the CLI.
 
 `SCCACHE_NO_DAEMON=1` remains mandatory wiring wherever it is carried: a shared sccache server process would inherit the
 sandbox of whichever workspace spawned it and enforce the wrong boundary for every other client. In-process mode trades
@@ -190,9 +214,9 @@ table is advisory metadata, not a gate.
   sandbox holds includes cargo's `registry/src`, the Go caches, and the sccache store — caches that _main itself
   compiles from_, so a poisoned entry can influence main's next build. That is an accepted risk under the confinement
   threat model (semi-trusted agents running the user's own code), bounded by write scope — a sandboxed workspace can
-  write only the designated layer-3 subtrees, never the mirror (layer 1, gateway-only) and never the relocated
-  cargo/gradle _config_ (host-side, deny-listed — see relocation above). Go's posture within that scope is notably
-  stronger than cargo's: module downloads verify against `go.sum` plus the checksum database, extraction is
+  write only the designated layer-3 subtrees, never the gateway mirror or `repo-mirrors` (layer 1, gateway-only) and
+  never relocated Cargo/Gradle _config_ (host-side, deny-listed — see relocation above). Go's posture within that scope
+  is notably stronger than cargo's: module downloads verify against `go.sum` plus the checksum database, extraction is
   ziphash-verified, and `GOMODCACHE` entries land read-only (0444) — tampering requires an explicit chmod, which the
   escape suite exercises (04_sandbox.md); `GOCACHE` is the sccache-analog and shares its trust level.
 - **Proxy-unaware tools.** Tools that hardcode registries need per-tool shims in the wiring step; the shim list grows by

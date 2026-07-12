@@ -8,10 +8,10 @@ closed and widen only through explicit, controller-owned grants.
 
 ## Platforms
 
-| Platform | Substrate                       | Sandbox                      | Secrets                        |
-| -------- | ------------------------------- | ---------------------------- | ------------------------------ |
-| macOS    | APFS images (`.asif`, hdiutil)  | Seatbelt (`sandbox-exec`)    | Keychain                       |
-| Linux    | ZFS datasets (snapshot + clone) | Landlock + network namespace | secret-service / systemd-creds |
+| Platform | Substrate                              | Sandbox                      | Secrets                        |
+| -------- | -------------------------------------- | ---------------------------- | ------------------------------ |
+| macOS    | APFS images (`.asif` / `.sparseimage`) | Seatbelt (`sandbox-exec`)    | Keychain                       |
+| Linux    | ZFS datasets (snapshot + clone)        | Landlock + network namespace | secret-service / systemd-creds |
 
 The substrate and enforcement layers sit behind traits (09_substrates.md, 04_sandbox.md); every concept above them —
 grants, gateway, cache taxonomy, CLI contract, marker files — is identical across platforms.
@@ -40,7 +40,8 @@ Agent-driven development multiplies workspaces. Three failure modes follow:
   runtime via grants, narrow via revocation.
 - Secrets never inside a workspace: credentials live only in the gateway (Keychain-backed).
 - Shared caches without duplicate downloads or duplicate storage, using clonefile wherever physically possible.
-- Convention over configuration: zero required config; an empty `.cowshed.toml` is the expected state.
+- Convention over configuration: remote discovery proposes candidates; one explicit, stable `repo_id` binding is the
+  only required identity decision, and an otherwise empty `.cowshed.toml` is expected.
 - Self-driving CLI: machine-readable stdout, agent guidance on stderr.
 
 ## Non-goals
@@ -49,15 +50,15 @@ Agent-driven development multiplies workspaces. Three failure modes follow:
   against hostile kernel exploits. VM-class isolation is out of scope.
 - Backup of workspace images. Durability is git: work leaves a workspace via `cowshed push`. (On ZFS, `zfs send -i`
   additionally enables real incremental backup of main — 09_substrates.md.)
-- Package-manager replacement. cowshed redirects existing tools (bun, cargo, git) via standard configuration; it does
-  not reimplement them.
+- Package-manager replacement. cowshed redirects existing tools (bun, cargo, Go) via standard configuration; it does not
+  reimplement them.
 
 ## Architecture
 
 ```
                                   ┌────────────────────────────┐
-   jcode (Rust) ──── cowshed-core ────┤                            │
-   Claude Code ───── cowshed-cli ─────┤         cowshed-core           │
+   Rust consumers ─── cowshed-core ────┤                            │
+   Agent harnesses ─── cowshed-cli ─────┤         cowshed-core           │
    Bun/Node ──────── cowshed-napi ────┤  images · mounts · marker  │
                                   │  grants · seatbelt · env   │
                                   └──────┬──────────┬──────────┘
@@ -65,18 +66,26 @@ Agent-driven development multiplies workspaces. Three failure modes follow:
                     ┌────────────────────┘          └──────────────────┐
                     ▼                                                  ▼
         ~/.cowshed/  (= the cowshed.store volume)                  cowshed-gateway (localhost)
-        <project>/main.asif          ── clonefile ──►          npm/cargo mirror · per-workspace CA interception
-        <project>/sessions/<ws>.asif                           repo-mirror verb · Arrow audit (13)
-        <project>/sessions/<ws>.asif.grants.json                     │
+        <owner>/<repo>/main{.asif|.sparseimage} ─ clonefile ─►    npm/cargo mirror · per-workspace CA interception
+        <owner>/<repo>/sessions/<ws>{.asif|.sparseimage}          repo-mirror verb · Arrow audit (13)
+        <owner>/<repo>/sessions/<ws>{.asif|.sparseimage}.grants.json    │
                     │                                                ▼
-                    ▼ hdiutil attach (nobrowse)               cowshed.caches APFS volume
-        ~/.cowshed/mnt/<project>/<ws>/          ◄─ sccache/zig/gradle ─  ~/.cowshed/caches/
+                    ▼ format-selected attach                 cowshed.caches APFS volume
+        ~/.cowshed/mnt/<owner>/<repo>/<ws>/          ◄─ sccache/zig/gradle ─  ~/.cowshed/caches/
         (workspace: src + .git + node_modules + target)
 ```
 
-The diagram shows the macOS/APFS substrate; on Linux the same shape holds with ZFS datasets in place of `.asif` files
-and `<pool>/cowshed/{store,caches}` datasets behind the same `~/.cowshed/{store,caches}` mountpoints (09_substrates.md).
-Both volumes are dedicated: the Data volume carries no cowshed bytes (01_storage.md).
+The diagram shows the macOS/APFS substrate: ASIF images use `.asif` and `diskutil image attach`, while SPARSE fallback
+images use `.sparseimage` and `hdiutil attach`; detached metadata selects the tool and must agree with the extension
+(01_storage.md). On Linux the same logical shape holds with ZFS datasets in place of image files and the store mounted
+directly at `~/.cowshed` with the caches dataset nested at `~/.cowshed/caches` (09_substrates.md). Both volumes are
+dedicated: the Data volume carries no cowshed bytes (01_storage.md).
+
+Gateway reachability is deliberately platform-specific. macOS package clients use the workspace's `portBlock.base`.
+Linux allocates no `portBlock`: each attached workspace has a private loopback/netns and a controller-launched trusted
+connector at `127.0.0.1:7644`; that connector relays only to the workspace's bind-mounted per-workspace Unix gateway
+socket. Thus ordinary Bun, Cargo, Go, and proxy-aware clients keep standard localhost HTTP URLs while the socket inode
+plus network namespace remains the primary Linux workspace identity (04_sandbox.md/05_gateway.md).
 
 **Git never crosses the network from inside a workspace.** A workspace's git speaks only to local paths: the `host`
 remote (main's mount, fetch-only for rebase) and read-only bare mirrors on the cache volume. Pulling a new upstream repo
@@ -86,11 +95,20 @@ therefore carries npm/cargo mirrors, **per-workspace-CA TLS interception** as th
 an `--opaque` CONNECT fallback for pinned clients — 05_gateway.md), and the repo-mirror verb — no git credential broker.
 The workspace holds only public trust anchors; the CA private key stays with the gateway.
 
+The `<owner>/<repo>` pair is the primary Telos `repo_id`: lowercase `owner/repo` normalized from an explicitly selected
+remote URL, stable across machines and checkout moves. The controller records that remote binding, validates it on every
+open, permits multiple bound identities with exactly one primary, and requires an explicit `repo_id` for a local-only
+repository. Discovery may propose candidates but never silently mints or selects one. Each component is validated and
+encoded independently before path joining. Trusted project policy lives only at `~/.cowshed/<owner>/<repo>/policy.json`,
+outside every workspace and denied to sandboxes (01_storage.md).
+
 State is derived, never stored: the workspace clones are the registry (readdir / `zfs list`), the kernel mount table is
-the attachment state (getmntinfo), and an in-workspace marker (`.cowshed/workspace.json`) is the identity. There is **no
-state database**. The only daemons are the gateway (one per host) and the per-workspace shell supervisors (11_shell.md)
-with the optional MCP socket server (12_mcp.md); none of them _store_ authoritative state — kill any of them and the
-next command rederives everything from disk and the mount table.
+the attachment state (getmntinfo), the controller-owned remote binding establishes repository identity, and an
+in-workspace marker (`.cowshed/workspace.json`) identifies a workspace incarnation. There is **no mutable state
+database**. The persistent daemons are the gateway (one per host) and the per-workspace shell supervisors (11_shell.md),
+with the optional MCP socket server (12_mcp.md). Linux additionally has one ephemeral minimal connector per attached
+workspace; it is attachment plumbing and stores no authority. None of these processes _store_ authoritative state — kill
+any of them and the next command rederives everything from disk and the mount table.
 
 Observability is **distributed tracing into Arrow columns** (13_telemetry.md): lifecycle ops, jobs, and gateway requests
 are spans propagating W3C trace context, flushed as queryable Arrow segments on the store volume via **lmao**
@@ -109,11 +127,11 @@ sandbox trace-assertions are all queries over one substrate.
 
 ## Consumers
 
-- **jcode** links `cowshed-core` directly. Its swarm coordinator holds a `Coordinator` (07_api.md), creates workspaces
-  for workers, hands each worker a non-escalating `WorkspaceHandle`, and widens grants mid-session exactly as it does
-  today with `grant_write_paths` — but through `Coordinator::grant` instead of bespoke Seatbelt plumbing.
-- **Claude Code** (and any agent harness) uses the CLI: `cowshed new <name>` prints a mount path on stdout and next-step
-  guidance on stderr — a "warm worktree" with no further setup.
+- **Rust consumers** link `cowshed-core` directly. A coordinator holds a `Coordinator` (07_api.md), creates workspaces
+  for workers, hands each worker a non-escalating `WorkspaceHandle`, and widens grants mid-session through
+  `Coordinator::grant`.
+- **Agent harnesses** use the CLI: `cowshed new <name>` prints a mount path on stdout and next-step guidance on stderr —
+  a "warm worktree" with no further setup.
 - **Bun/Node tooling** uses `@smoothbricks/cowshed` (cowshed-napi) for programmatic control.
 - **CI runners.** A Linux+ZFS host runs each GitHub Actions job in an ephemeral, sandbox-confined clone of a warm
   headless main — warm caches, no on-runner Nix install, and registry/git secrets held host-side in the gateway rather

@@ -25,16 +25,15 @@ grant, no broker. Lane 3 is the one that crosses to you, and it crosses through 
 Build as usual, then run the built `.app` in dev's session:
 
 ```sh
-# dev side (ssh dev@localhost / your remote-editor terminal)
+# dev side (remote editor terminal connected to the dedicated development account)
 $ cowshed exec myapp -- npm run build           # or xcodebuild, tauri build, …
 $ open dist/MyApp.app                            # launches as dev, in dev's session
 ```
 
-Agents automate it in place — the same accessibility/AppleScript path cowshed's agent-browser tooling already uses to
-drive Electron apps (VS Code, Slack, Figma). Lane 1 wants a **persistent background GUI session for dev** (the one you
-already keep alive for simulator reliability — see ios.md); the app has a real Aqua session to draw into, agents send
-events and read the accessibility tree, screenshots come back as artifacts. Boundary intact: untrusted code never leaves
-the dev uid.
+Agents automate it in place through the standard accessibility/AppleScript path used for desktop applications. Lane 1
+wants a **persistent background GUI session for dev** (the one already kept alive for simulator reliability — see
+ios.md); the app has a real Aqua session to draw into, agents send events and read the accessibility tree, and
+screenshots come back as artifacts. Boundary intact: untrusted code never leaves the dev uid.
 
 For lane 2, fast-user-switch into dev (or Screen Sharing to dev's session as a window on your desktop) and debug with
 the app right there.
@@ -46,11 +45,11 @@ it's the consent point:
 
 ```sh
 # dev side: drop the built app
-$ cowshed app export myapp                       # copies MyApp.app to /Users/Shared/cowshed-drop/<project>/
+$ cowshed app export myapp                       # stages MyApp.app under <drop-dir>/<owner>/<repo>/
 
 # your side (personal session, YOU run this):
 $ cowshed app promote                            # verify signature, install to ~/Applications, clear quarantine
-/Users/danny/Applications/MyApp.app
+~/Applications/MyApp.app
 ```
 
 `cowshed app promote` runs **as you, in your session** — it writes `~/Applications`, which dev cannot touch, so it is

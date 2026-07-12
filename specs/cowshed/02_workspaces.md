@@ -17,15 +17,14 @@ clone useful.
 
 ### Secrets enforcement
 
-The invariant is checked, not assumed — cowshed's dropped protections (jcode's direnv secret-var filtering, its
-sensitive-path command scanning) are only sound if the invariant actually holds. One built-in scanner
-(`cowshed-core::secrets`), three call sites:
+The invariant is checked, not assumed. One built-in scanner (`cowshed-core::secrets`), three call sites:
 
 - **`cowshed adopt` — blocking gate.** Full-tree scan before the image is created (skipping cache roots and `.git`
   objects). Findings refuse the adopt (exit 4) with per-file stderr guidance: migrate the value to the gateway Keychain,
-  delete the file, or `cowshed adopt --quarantine`, which moves findings to `~/.cowshed/<project_id>/quarantine/` (0600,
-  original paths preserved) so dependent tooling fails loudly instead of leaking silently. There is no "adopt anyway"
-  flag — main's image is cloned to every future workspace; adopt is the one moment the invariant is cheap to establish.
+  delete the file, or `cowshed adopt --quarantine`, which moves findings to `~/.cowshed/<owner>/<repo>/quarantine/` (the
+  primary component-safe `repo_id` path; mode 0600, original paths preserved) so dependent tooling fails loudly instead
+  of leaking silently. There is no "adopt anyway" flag — main's image is cloned to every future workspace; adopt is the
+  one moment the invariant is cheap to establish.
 - **`cowshed push` and autosave — delta gate.** Scans only content new relative to the base commit (cheap). Push refuses
   with exit 4 and names the offending hunks; autosave skips the snapshot and emits one `cowshed:` warning — it never
   blocks work, but it never propagates a finding to the host repo either. This closes the write side: an agent that
@@ -47,24 +46,33 @@ Converts an existing checkout into an image-backed workspace mounted at its orig
 (clonefile cannot cross volumes). The source is a _live_ tree — editors, watchers, and build daemons mutate it during
 the copy — so adopt is an explicit transaction with defined crash points, not a best-effort script:
 
-1. Verify: git root, clean-enough state (adopt refuses mid-merge/rebase), free space, the secrets gate (see "Secrets
-   enforcement" — blocking; `--quarantine` to relocate findings), and that `<root>.pre-cowshed` does **not** already
+1. Verify: git root, clean-enough state (adopt refuses mid-merge/rebase), free space, the secrets gate, and repository
+   identity. Remote discovery may propose normalized lowercase `owner/repo` candidates but never silently chooses or
+   mints one. Adoption selects a remote, records its normalized URL and `repo_id`, validates they agree, designates one
+   primary identity if several are bound, and requires `--repo-id owner/repo` for a local-only repository. Load trusted
+   policy only from `~/.cowshed/<owner>/<repo>/policy.json`. Also require that `<root>.pre-cowshed` does **not** already
    exist (exit 4 — a previous adopt left state behind; resolve it first). Ensure host setup is present — declaratively
    validated when home-manager/nix-darwin owns it (`programs.cowshed`/`services.cowshed`, 14_nix.md), imperatively
    applied otherwise — and both dedicated volumes exist: lazily create and mount `cowshed.store` (at `~/.cowshed`) then
    `cowshed.caches` (nested; ordering and the volume marker in 01_storage.md) before any image is created.
-2. Create the image under a staged, non-enumerated name (`<project_id>/.staging/main.asif` — the readdir registry never
-   sees staged objects), attach at a staging mountpoint.
+2. Select the supported format, then create the image under a staged, non-enumerated, format-specific name:
+   `<owner>/<repo>/.staging/main.asif` for ASIF or `<owner>/<repo>/.staging/main.sparseimage` for SPARSE. Both
+   components come from the validated primary `repo_id` and are encoded independently as specified in 01_storage.md.
+   Create its complete sibling host sidecar with the matching `imageFormat` before the first attach; the readdir
+   registry never sees staged objects. Attach at a staging mountpoint, refusing any extension/metadata mismatch as
+   specified in 01_storage.md.
 3. Copy the full tree (including `.git`), preserving metadata, in delta passes until quiescent: re-run rsync-style delta
    copies while the source keeps changing; refuse (exit 4) if the tree fails to quiesce within the pass budget, naming
    the churning paths.
 4. Write `.cowshed/workspace.json` (`role: "main"`), mint `.cowshed/token`, mint main's per-workspace CA (private key
    controller-side next to the grant file; CA cert placed in-image as a trust anchor with the tool anchors wired —
-   04_sandbox.md/05_gateway.md), create in-image cache roots, write the shared-cache env wiring into tool config files
-   (03_caches.md). Verify the copied tree against the source before publication.
+   04_sandbox.md/05_gateway.md), create in-image cache roots, and write platform endpoint plus shared-cache wiring into
+   tool config files (03_caches.md). The main sidecar contains `portBlock` only on macOS; Linux omits it and creates its
+   per-incarnation socket/netns connector when the published workspace is attached. Verify the copied tree against the
+   source before publication.
 5. Publish: move the original tree aside (`<root>.pre-cowshed`), recreate the emptied directory as the mountpoint with
-   the self-healing stub `.envrc` inside it, rename the staged image into place, `fsync` the parent directories around
-   each rename, attach.
+   the self-healing stub `.envrc` inside it, rename the staged image and each sibling sidecar into place without
+   changing the format extension, `fsync` the parent directories around each rename, attach.
 6. Print the mount path on stdout.
 
 Every step is idempotent to re-run. `cowshed doctor`/`cowshed gc` recognize each crash point — staged image present,
@@ -80,26 +88,27 @@ Budget: ≤ 1 s cold. No pool, no pre-warming.
 1. `flock` main's image lock; `fsync`/`sync` the main volume. Measured: the sync is for **freshness, not consistency** —
    a live clone is always crash-consistent, but without a sync it can miss the last writes (a just-written file was
    absent from a non-synced clone).
-2. `clonefile(main.asif, sessions/<name>.asif)` — ~2 ms regardless of content size.
+2. Preserve the source format and extension: `clonefile(main.<ext>, sessions/<name>.<ext>)`, where `<ext>` is `asif` or
+   `sparseimage` according to main's validated detached `imageFormat` — ~2 ms regardless of content size. Create the
+   complete closed-baseline sibling sidecar before attach; allocate `portBlock` only on macOS and omit it on Linux.
 3. Attach without mounting, run `fsck_apfs -q` against the clone's APFS volume device, then mount at
-   `~/.cowshed/mnt/<project_id>/<name>` — the attach tool dispatches on `imageFormat` (`diskutil image attach --noMount`
-   for ASIF, `hdiutil attach -nomount` for SPARSE; flags per 01_storage.md) — ~235–400 ms typical. Verification precedes
-   the first mount; a clone never mounts unchecked.
+   `~/.cowshed/mnt/<owner>/<repo>/<name>` — extension and detached `imageFormat` must agree, then attach dispatches to
+   `diskutil image attach --noMount` for ASIF or `hdiutil attach -nomount` for SPARSE (flags per 01_storage.md) —
+   ~235–400 ms typical. Verification precedes the first mount; a clone never mounts unchecked.
 4. On fsck failure, delete the clone and retry once from a fresh sync. (Measured: 10/10 clonefiles taken under a
    continuous writer plus a streaming 128 MiB dd passed both `fsck_apfs -q` and a full `-n` check, mountable and
    readable, on both formats — this path is a safety net that is expected to essentially never fire; the fork-mid-write
    integration test pins it, 08_testing.md.)
 5. Rewrite `.cowshed/workspace.json` (`role: "workspace"`, `baseCommit` = main's HEAD), mint a fresh `.cowshed/token`,
    mint a fresh per-workspace CA (private key controller-side next to the grant file; CA cert placed in-image as a trust
-   anchor with the tool anchors wired — 04_sandbox.md/05_gateway.md), allocate a contiguous 16-port block from the
-   reserved range (default `40960–49151`) and record it as `portBlock` in the grant file (04_sandbox.md/05_gateway.md) —
-   the gateway binds the block base as this workspace's data-plane listener; the remaining ports are the workspace's
-   bindable service ports (dev servers, `devenv up`) — create the sibling grant file with the closed baseline
-   (04_sandbox.md), and mark `<mount>/.envrc` direnv-trusted (trust is keyed by absolute path; every clone needs its own
-   allow entry — 04_sandbox.md, devenv section). In-image config (bunfig registry, cargo source replacement) is written
-   pointing at the block base, and the in-image tool shims are placed at `.cowshed/bin/` (the `xcrun` wrapper —
-   03_caches.md); there is no git network wiring to write — workspace git is local-only (see "Remote code ingress").
-6. Inside the mount, under the workspace's closed sandbox: `git remote add host <projectRoot>` (idempotent),
+   anchor with the tool anchors wired — 04_sandbox.md/05_gateway.md), and complete platform wiring. On macOS, use the
+   sidecar's allocated contiguous 16-port `portBlock` from the reserved range (default `40960–49151`): the gateway binds
+   `base`, and `base+1 … base+15` are workspace service ports. On Linux, omit `portBlock`; after the dataset is mounted,
+   create and bind-mount the per-incarnation Unix gateway socket and launch the trusted connector inside the workspace's
+   private netns on `127.0.0.1:7644` (04_sandbox.md/05_gateway.md). Mark `<mount>/.envrc` direnv-trusted. In-image Bun,
+   Cargo, Go, and proxy wiring uses the platform endpoint, and tool shims are placed at `.cowshed/bin/`; there is no git
+   network wiring — workspace git is local-only (see "Remote code ingress").
+6. Inside the mount, under the workspace's closed sandbox: `git remote add host <project-root>` (idempotent),
    `git switch -c cowshed/<name>` from the checked-out state. The `.git` directory arrived complete via CoW — the
    workspace is a standalone repository with **no linked-worktree registration and no back-references** into the host
    checkout.
@@ -110,21 +119,32 @@ Flags: `--ref <rev>` (after branching, `git switch -c cowshed/<name> <rev>` inst
 
 ## `cowshed fork <src> <dst>`
 
-Clones a _session_ mid-flight: same steps as `cowshed new` but the source image is `sessions/<src>.asif` and the marker
-records `forkedFrom`. Grants do **not** carry over — the fork starts from the closed baseline, including a freshly
-allocated port block and a freshly minted CA (the fork never inherits `<src>`'s `portBlock` or CA; the fork's in-image
-trust anchor is rewritten to its own CA cert). Two divergent futures from one warm state, ~250 ms.
+Clones a _session_ mid-flight: same steps as `cowshed new`, preserving the source image's validated format and extension
+(`sessions/<src>.asif` → `sessions/<dst>.asif`, or `sessions/<src>.sparseimage` → `sessions/<dst>.sparseimage`), and the
+marker records `forkedFrom`. Grants do **not** carry over — the fork starts from the closed baseline, with a freshly
+minted CA and fresh platform endpoint identity. On macOS it receives a newly allocated `portBlock`; on Linux `portBlock`
+remains absent and attach creates a new per-incarnation socket, netns, and connector. Neither platform inherits the
+source endpoint or CA. Two divergent futures from one warm state, ~250 ms on the APFS path.
 
 ## `cowshed checkpoint <ws> [label]` / `cowshed restore <ws> <label>`
 
 - Checkpoint: `sync` the workspace volume (freshness — a non-synced clone can miss the last writes; consistency is
-  unconditional, see `cowshed new` step 1), `clonefile` its image to `checkpoints/<ws>/<label>.asif` (label defaults to
-  a UTC timestamp). The workspace keeps running; the checkpoint is crash-consistent and fsck-verified in the background.
-- Restore: detach the workspace, rename its image aside, `clonefile` the checkpoint back into place, re-attach, rewrite
-  marker + token, and re-assert the workspace's port block and CA (identity is preserved across a restore, so the
-  `portBlock`, CA, and grant binding carry through; only the token is reminted). The displaced image becomes
-  `checkpoints/<ws>/pre-restore-<ts>.asif` so a restore is itself undoable.
-- `cowshed gc` prunes checkpoints beyond the newest 5 per workspace (`.cowshed.toml` `checkpoints.keep`).
+  unconditional, see `cowshed new` step 1), then `clonefile` its image to `checkpoints/<ws>/<label>.<ext>`, preserving
+  `.asif` for ASIF or `.sparseimage` for SPARSE (label defaults to a UTC timestamp). The workspace keeps running; the
+  checkpoint is crash-consistent and fsck-verified in the background.
+- Restore follows the substrate transaction in 09_substrates.md: lock and revalidate the old incarnation/revision; stop
+  admissions and drain the supervisor and, on Linux, the connector; detach; prepare and verify a non-enumerated
+  same-format clone; mint and write the fresh `workspaceIncarnation` **before** minting its fresh token; atomically swap
+  the clone into the canonical name; attach and validate; on Linux create the fresh per-incarnation socket and
+  connector; atomically publish detached metadata and switch gateway acceptance from the old endpoint/token to the new
+  endpoint/token at that same boundary; only then admit the new supervisor. The logical workspace identity, primary
+  `repo_id`, CA, and grant binding carry through; a macOS `portBlock` carries through only when present, while Linux has
+  none. The displaced image becomes `checkpoints/<ws>/pre-restore-<ts>.<ext>` with its original extension, so restore is
+  undoable. Before publication, failure restores the displaced workspace and old token; after the incarnation fence is
+  published, recovery completes forward and never exposes both tokens. Copied job records retain the incarnation that
+  produced them, while the new incarnation has its own workspace-local monotonic numeric job sequence.
+- `cowshed gc` retains every pinned checkpoint, every checkpoint younger than 14 days, and always the newest five per
+  workspace. A supplied label and `--keep` both create explicit pins; only an explicit unpin makes them eligible.
 
 ## `cowshed push <ws> [--branch <name>]`
 
@@ -158,9 +178,10 @@ helper, and no `insteadOf` rewriting inside any workspace.
 
 - **`cowshed repo mirror <url>`** — a control-plane RPC, not workspace git. The gateway checks the workspace's repo
   grants (`cowshed grant <ws> --repo github.com/org/*` — repo-scoped, finer than host egress), executes the fetch itself
-  with Keychain-held credentials into a bare mirror it owns at `~/.cowshed/caches/git/<host>/<org>/<repo>.git`, writes
-  one audit line, and returns the mirror path on stdout. Mirrors are created by the gateway with its own config — no
-  agent-writable git config is ever in the loop — and are fetch-only, sandbox-read-only (01_storage.md, 05_gateway.md).
+  with Keychain-held credentials into a bare mirror it owns at `~/.cowshed/caches/repo-mirrors/<host>/<org>/<repo>.git`,
+  writes one audit line, and returns the mirror path on stdout. Mirrors are created by the gateway with its own config —
+  no agent-writable git config is ever in the loop — and are fetch-only, sandbox-read-only (01_storage.md,
+  05_gateway.md).
 - **`cowshed repo clone <url> [dir]`** — sugar: mirror, then a local `git clone --dissociate <mirror>` run inside the
   sandbox.
 
@@ -171,12 +192,12 @@ sandbox by construction.
 ## Artifact egress: `cowshed sim export` / `cowshed app export`
 
 The outbound sibling of `repo` ingress, for posture B (14_nix.md). `cowshed sim export <ws> [artifact]` copies a built
-iOS `.app` to the one-way drop dir (`/Users/Shared/cowshed-drop/<project_id>/`), where the personal session installs it
-into the human's simulator; `cowshed app export <ws> [artifact]` is the Mac-target sibling. Either way an immutable
-artifact crosses the uid boundary, never a live tree; semantics, gating, and the `--sim` grant class live in 14_nix.md /
-04_sandbox.md / 05_gateway.md. The lane-3 counterpart `cowshed app promote` is a **personal-session human verb** (it
-installs a promoted build into `~/Applications`), documented in 14_nix.md — not a workspace or sandbox operation and not
-agent-invokable.
+iOS `.app` to the one-way drop dir (`<shared-drop-root>/<owner>/<repo>/`, using the primary path-safe `repo_id`), where
+the personal session installs it into the human's simulator; `cowshed app export <ws> [artifact]` is the Mac-target
+sibling. Either way an immutable artifact crosses the uid boundary, never a live tree; semantics, gating, and the
+`--sim` grant class live in 14_nix.md / 04_sandbox.md / 05_gateway.md. The lane-3 counterpart `cowshed app promote` is a
+**personal-session human verb** (it installs a promoted build into `~/Applications`), documented in 14_nix.md — not a
+workspace or sandbox operation and not agent-invokable.
 
 ## Return to main: `cowshed rebase` and `cowshed land`
 
@@ -228,9 +249,10 @@ review-gated flows.
 2. Stop the supervisor: TERM → grace → KILL across the whole descendant tree (11_shell.md). Teardown precedes retirement
    — live children would otherwise hold the mount busy and keep enforcing stale launch-time authority after the grants
    disappear.
-3. Logically retire: rename the image to `sessions/.trash/<ws>.<ts>.asif` and remove the grant file and the
-   controller-side CA private key — the workspace disappears from `cowshed ls`; the command returns here (typically well
-   under a second; a stubborn process tree delays it by at most the kill grace).
+3. Logically retire: preserve the image extension while renaming it to `sessions/.trash/<ws>.<ts>.asif` for ASIF or
+   `sessions/.trash/<ws>.<ts>.sparseimage` for SPARSE, and remove the grant file and the controller-side CA private key
+   — the workspace disappears from enumeration; the command returns here (typically well under a second; a stubborn
+   process tree delays it by at most the kill grace).
 4. Background (spawned detached): detach the mount (escalating to `-force` after a 10 s grace), unlink the trashed image
    and any checkpoints, remove the mountpoint dir. Interrupted cleanup is resumed by `cowshed gc` (idempotent).
 
@@ -239,9 +261,11 @@ clean `git status` (exit 4 otherwise).
 
 ## `cowshed attach` / `cowshed detach`
 
-Explicit mount lifecycle for long-lived workspaces: `detach` frees the attachment (image and grants persist); `attach`
-re-mounts at the canonical path with canonical flags. Personal workspaces are typically attached at login by a launchd
-agent installed by `cowshed adopt`.
+Explicit attachment lifecycle for long-lived workspaces: `detach` first stops admissions and drains the supervisor and
+Linux connector, unlinks the Linux per-incarnation socket, then frees the attachment; the image/dataset and grants
+persist. `attach` mounts at the canonical path with canonical flags and, on Linux, creates the per-workspace
+socket/netns and starts exactly one connector before admitting execs. Personal macOS workspaces are typically attached
+at login by a launchd agent; Linux uses its platform service/controller lifecycle.
 
 ## `cowshed ensure` — the .envrc fast path
 
@@ -262,10 +286,11 @@ It never does slow or surprising work — no fetch, no compaction, no refresh.
 
 `cowshed ensure --envrc` additionally prints `export` lines on stdout — but wiring is carried by in-image config files
 and host-level paths, not environment (03_caches.md pins the exact set: at most `COWSHED_GATEWAY_TOKEN`, only until its
-verification passes — the bun cache export is already retired, bunfig's relative cache dir is verified — plus the
-`PORT`/`COWSHED_PORT_BASE` dev-server conventions and optional non-load-bearing identity conveniences like
-`COWSHED_WORKSPACE`). Anything that needs identity derives it from cwd via `.cowshed/workspace.json` or asks the CLI.
-Usage in a repo's `.envrc`:
+verification passes — the bun cache export is already retired, bunfig's relative cache dir is verified — plus, on macOS
+only, the `PORT`/`COWSHED_PORT_BASE` dev-server conventions, and optional non-load-bearing identity conveniences like
+`COWSHED_WORKSPACE`. Linux exports neither port convention; its package/proxy base is the fixed private-netns connector
+URL and its dev servers use private loopback directly. Anything that needs identity derives it from cwd via
+`.cowshed/workspace.json` or asks the CLI. Usage in a repo's `.envrc`:
 
 ```bash
 eval "$(cowshed ensure --envrc)"
