@@ -117,6 +117,16 @@ Covered flows:
   expected-missing versus an existing ref). Every stale attempt must return `Conflict`, identify the moved expectation,
   leave the destination object ID and main working tree/index unchanged, and retain the source workspace. A retry with
   freshly read expectations must preserve exactly the newly selected source head.
+- **Checked-out target fast-forward**: create a clean main workspace with the selected target branch checked out, land a
+  reviewed workspace onto that branch, and assert the target ref, `HEAD`, index, tracked files, and worktree tree all
+  advance to the exact validated source object ID. Assert no hidden or namespaced ref is accepted as a substitute for
+  updating the visible checkout. Repeat with dirty tracked and staged state and prove `land` returns `Conflict` without
+  changing the target, source workspace, index, or file bytes.
+- **Non-checked-out target fast-forward**: check out a different branch in the main workspace, land onto another local
+  target branch, and assert only `refs/heads/<target>` advances while the current branch, `HEAD`, index, status, and
+  file bytes remain unchanged. Race target advancement and source/incarnation changes against the final update; every
+  stale expectation must fail before retirement. A target checked out by an unmanaged linked worktree must be refused
+  rather than updated behind that worktree's index.
 - **runner interception from step one**: execute a workflow fixture with a hostile first command, later shell commands,
   and a supported action-generated command. Instrument the runner spawn boundary and assert that every
   repository-controlled command is launched through `cowshed exec` in the job workspace, in workflow order, with zero

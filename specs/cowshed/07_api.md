@@ -203,6 +203,40 @@ Mutation authority lives only on `Coordinator`; `WorkspaceHandle` is the non-esc
 mirror the MCP token model (12_mcp.md) in the type system:
 
 ```rust
+pub enum RevisionTarget {
+    Branch(String),       // refs/heads/<name> in the main workspace repository
+    Ref(String),          // validated fully qualified ref
+    Oid(Oid),             // immutable replay base; never a land destination
+}
+
+pub struct RebaseOptions {
+    pub onto: Option<RevisionTarget>,    // default Branch("main")
+    pub fresh: bool,
+    pub expected_workspace_incarnation: Option<[u8; 16]>,
+    pub expected_source_head: Option<Oid>,
+    pub expected_onto_head: Option<Oid>,
+}
+
+pub struct LandOptions {
+    pub target_branch: Option<String>,   // default "main"
+    pub check: Option<Vec<String>>,
+    pub retire: bool,
+    pub push_only: bool,
+    pub expected_workspace_incarnation: Option<[u8; 16]>,
+    pub expected_source_head: Option<Oid>,
+    pub expected_target_head: Option<ExpectedRefHead>,
+}
+
+pub struct LandReport {
+    pub landed_head: Oid,
+    pub target_branch: String,
+    pub previous_target_head: Option<Oid>,
+    pub target_was_checked_out: bool,
+    pub retired: bool,
+}
+```
+
+```rust
 /// The sole mutation and cross-workspace authority over a project. It is the only capability that can adopt, create,
 /// destroy, fork, grant, revoke, restore, rebase, land, collect garbage, mirror repositories, set checkpoint quotas,
 /// or assign slots.
@@ -214,7 +248,7 @@ impl Coordinator {
     pub async fn grant(&self, ws: &str, delta: GrantDelta) -> Result<GrantSet, CowshedError>;
     pub async fn revoke(&self, ws: &str, delta: GrantDelta) -> Result<GrantSet, CowshedError>;
     pub async fn rebase(&self, ws: &str, opts: RebaseOptions) -> Result<Oid, CowshedError>;
-    pub async fn land(&self, ws: &str, opts: LandOptions) -> Result<Oid, CowshedError>;
+    pub async fn land(&self, ws: &str, opts: LandOptions) -> Result<LandReport, CowshedError>;
     pub async fn restore(&self, ws: &str, label: &str) -> Result<(), CowshedError>;
     pub async fn assign_slot(&self, ws: &str, slot: u32) -> Result<(), CowshedError>;
     pub async fn destroy(&self, ws: &str, opts: RemoveOptions) -> Result<(), CowshedError>;
@@ -224,6 +258,14 @@ impl Coordinator {
     /// Hand a worker a capability scoped to exactly one workspace.
     pub fn worker(&self, ws: &str) -> Result<WorkspaceHandle, CowshedError>;
 }
+
+`Coordinator::land` fast-forwards a real `refs/heads/<target_branch>`, not a hidden integration ref. When that target
+branch is checked out in the main workspace, the operation updates the checked-out branch through the main workspace so
+its `HEAD`, index, and working tree all resolve to `landed_head`; dirty state causes `Conflict`. When the target is not
+checked out, Cowshed compare-and-swaps the branch ref without disturbing the main workspace's current checkout. A target
+checked out by an unmanaged linked worktree is refused rather than leaving that worktree stale. All expected values are
+revalidated under the target lock immediately before the fast-forward. A mismatch or non-fast-forward retains the source
+workspace and leaves the target branch and visible working state unchanged.
 
 /// A worker's capability: it can run and observe work in *its* workspace and hand results
 /// back, but it can never widen its own sandbox or touch another workspace. Escalation is
@@ -295,13 +337,13 @@ subagent holding one cannot grant itself anything.
 These types are defined **once** in `cowshed-core` and reused verbatim by the CLI (`--json` bodies), NAPI, and MCP — no
 adapter redefines a field, and the contract goldens (08_testing.md) pin their shapes: `WorkspaceInfo`, `EnsureReport`,
 `GcReport`, `Finding`, `JobId`, `JobState`, `JobInfo`, `StreamInfo`, `OutputSummary`, `ExecRecord`, `PushReport`,
-`GrantSet`/`GrantDelta`/`PortBlock`/`EgressRule`/`RepoRule`/`SimVerb`, `GatewayStatus`, `AuditEvent`, and every
-`*Options` type (`AdoptOptions`, `CreateOptions`, `AttachOptions`, `RemoveOptions`, `RebaseOptions`, `LandOptions`,
-`PushOptions`). Field sketches elsewhere in this spec are illustrative; the freeze rule — one definition, reused,
-versioned together — is the contract. `GrantSet.port_block` is the platform union: macOS always carries a real
-`PortBlock`, while Linux carries `None` and its JSON/N-API projection omits `portBlock`. Adapters and consumers must use
-that optional shape directly; casts, `null`, zero-sized blocks, and sentinel base values are forbidden. Adding a field
-is a coordinated change across core + goldens, not a per-adapter patch. JSON and N-API use the same camel-case
+`LandReport`, `RevisionTarget`, `GrantSet`/`GrantDelta`/`PortBlock`/`EgressRule`/`RepoRule`/`SimVerb`, `GatewayStatus`,
+`AuditEvent`, and every `*Options` type (`AdoptOptions`, `CreateOptions`, `AttachOptions`, `RemoveOptions`,
+`RebaseOptions`, `LandOptions`, `PushOptions`). Field sketches elsewhere in this spec are illustrative; the freeze rule
+— one definition, reused, versioned together — is the contract. `GrantSet.port_block` is the platform union: macOS
+always `PortBlock`, while Linux carries `None` and its JSON/N-API projection omits `portBlock`. Adapters and consumers
+must use that optional shape directly; casts, `null`, zero-sized blocks, and sentinel base values are forbidden. Adding
+a field is a coordinated change across core + goldens, not a per-adapter patch. JSON and N-API use the same camel-case
 projection: `JobInfo.stdout` and `JobInfo.stderr` are `StreamInfo` objects, each with `path`, `bytes`, and `summary`;
 each `summary` has `version`, `text`, and `truncated`. The paths name the in-workspace raw byte files containing every
 byte admitted before any output-limit trip. There are no flattened aliases or adapter-specific spellings.
