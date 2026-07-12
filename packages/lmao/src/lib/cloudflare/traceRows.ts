@@ -10,6 +10,7 @@
  * buffer's user schema columns, flattened so downstream SQL transforms need no unnesting.
  */
 
+import { resolveMessage } from '../resolveMessage.js';
 import { readSpanFieldValue, walkSpanSegments } from '../sqlite/sqlite-common.js';
 import type { AnySpanBuffer } from '../types.js';
 
@@ -48,7 +49,7 @@ export function spanBufferToTraceRows(rootBuffer: AnySpanBuffer): TraceRow[] {
         row_index: rowOffset + row,
         entry_type: buffer.entry_type[row],
         timestamp_ns: Number(buffer.timestamp[row]),
-        message: buffer.message_values[row] ?? null,
+        message: toTraceRowValue(resolveMessage(buffer, row)),
       };
       for (const fieldName of fieldNames) {
         record[fieldName] = toTraceRowValue(readSpanFieldValue(buffer, fieldName, row));

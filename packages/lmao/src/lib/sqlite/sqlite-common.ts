@@ -1,5 +1,6 @@
 import type { SchemaType } from '@smoothbricks/arrow-builder';
 import { hasOwn, hasOwnString, isRecord } from '@smoothbricks/validation';
+import { resolveMessage } from '../resolveMessage.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import { getSchemaType } from '../schema/typeGuards.js';
 import type { AnySpanBuffer } from '../types.js';
@@ -303,7 +304,7 @@ export function buildInsertParams(segment: SpanSegment, row: number, activeUserF
   const { buffer, traceId, spanId, parentSpanId, rowOffset } = segment;
   const entryType = buffer.entry_type[row];
   const timestampNs = Number(buffer.timestamp[row]);
-  const message = buffer.message_values[row] ?? null;
+  const message = resolveMessage(buffer, row);
 
   const userValues = activeUserFields.map((fieldName) => {
     const directValue = readUserValue(buffer, fieldName, row);
