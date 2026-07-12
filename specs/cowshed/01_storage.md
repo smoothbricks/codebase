@@ -122,12 +122,16 @@ avoids depending on the inaccessible in-image marker to choose an attach tool. A
 in-image marker's `imageFormat` to match. The two formats have disjoint attach tools (measured: `hdiutil attach` refuses
 ASIF outright with _"use 'diskutil image attach'"_):
 
-- **ASIF (`.asif`)**: `diskutil image attach --nobrowse --mountPoint <path> <image>`. diskutil's defaults differ from
-  hdiutil's (browsable, noowners), so cowshed passes the nobrowse/owners equivalents explicitly; ownership is
-  additionally guaranteed by the chown-at-create step above.
-- **SPARSE (`.sparseimage`, fallback)**: `hdiutil attach -nobrowse -owners on -mountpoint <path> <image>`.
+- **ASIF (`.asif`)**: `diskutil image attach --nobrowse --noMount --plist <image>`.
+- **SPARSE (`.sparseimage`, fallback)**: `hdiutil attach -nobrowse -owners on -nomount -plist <image>`.
 
-For every attach:
+Both commands return machine-readable attachment data from which cowshed selects the APFS volume device. Before the
+first mount, cowshed runs `fsck_apfs -q <device>`; any non-zero result detaches the image and fails without exposing a
+workspace mount. It then mounts explicitly with `diskutil mount nobrowse -mountPoint <path> <device>` (`--browse` omits
+`nobrowse`). ASIF and SPARSE therefore share the same verify-before-mount safety boundary even though their image
+attachment tools remain disjoint. Ownership is also guaranteed by the ASIF chown-at-create step above.
+
+For every mounted attachment:
 
 - Session workspaces mount at `~/.cowshed/mnt/<owner>/<repo>/<workspace>`. `-nobrowse` keeps every cowshed volume out of
   Finder, the Desktop, and the sidebar regardless of Finder preferences.
