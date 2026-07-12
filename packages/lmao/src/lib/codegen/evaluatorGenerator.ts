@@ -8,6 +8,7 @@
 
 import { isRecord } from '@smoothbricks/validation';
 import type { OpContext } from '../opContext/types.js';
+import { resolveMessage } from '../resolveMessage.js';
 import type { FeatureFlagSchema } from '../schema/defineFeatureFlags.js';
 import type {
   FlagEvaluator,
@@ -73,22 +74,26 @@ function isInternalSpanLogger<T extends OpContext['logSchema']>(value: unknown):
   return isRecord(value) && 'ffAccess' in value && 'ffUsage' in value;
 }
 
+function isEvaluatorRuntimeContext<Ctx extends OpContext>(
+  value: SpanContextWithoutFf<Ctx>,
+): value is EvaluatorRuntimeContext<Ctx> {
+  return (
+    isRecord(value) &&
+    '_buffer' in value &&
+    'log' in value &&
+    isAnySpanBuffer(value._buffer) &&
+    isInternalSpanLogger<Ctx['logSchema']>(value.log)
+  );
+}
+
 function getEvaluatorRuntimeContext<Ctx extends OpContext>(
   ctx: SpanContextWithoutFf<Ctx>,
 ): EvaluatorRuntimeContext<Ctx> {
-  if (!isRecord(ctx) || !('_buffer' in ctx) || !('log' in ctx)) {
-    throw new Error('Feature-flag evaluator requires an internal span context');
-  }
-
-  if (!isAnySpanBuffer(ctx._buffer) || !isInternalSpanLogger<Ctx['logSchema']>(ctx.log)) {
+  if (!isEvaluatorRuntimeContext(ctx)) {
     throw new Error('Feature-flag evaluator requires runtime span buffer and logger internals');
   }
 
-  return {
-    ...ctx,
-    _buffer: ctx._buffer,
-    log: ctx.log,
-  };
+  return ctx;
 }
 
 function createFlagGetter(flagName: string) {
@@ -183,7 +188,7 @@ class WorkerSafeGeneratedEvaluator<Ctx extends OpContext> implements GeneratedEv
     while (buf) {
       const limit = buf._writeIndex;
       for (let i = limit - 1; i >= 0; i--) {
-        if (buf.entry_type[i] === this.#entryTypeFfAccess && buf.message_values && buf.message_values[i] === flagName) {
+        if (buf.entry_type[i] === this.#entryTypeFfAccess && resolveMessage(buf, i) === flagName) {
           return true;
         }
       }

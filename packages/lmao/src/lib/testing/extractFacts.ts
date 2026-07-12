@@ -7,6 +7,7 @@
  * @module testing/extractFacts
  */
 
+import { resolveMessage } from '../resolveMessage.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import {
   ENTRY_TYPE_DEBUG,
@@ -152,7 +153,7 @@ function walkBuffer<T extends LogSchema>(
   opts: Required<ExtractFactsOptions>,
 ): void {
   // Span name is in message_values[0] (written by writeSpanStart)
-  const spanName = buffer.message_values[0];
+  const spanName = resolveMessage(buffer, 0) ?? '';
   const writeIndex = buffer._writeIndex;
 
   if (writeIndex === 0) {
@@ -186,7 +187,6 @@ function walkBuffer<T extends LogSchema>(
   // - Row 1: span-ok/err/exception (completion status)
   // - Row 2+: log entries (info/debug/warn/error), ff entries
   const entryTypes = buffer.entry_type;
-  const messages = buffer.message_values;
 
   // Process log/ff entries from row 2 onwards
   for (let row = 2; row < writeIndex; row++) {
@@ -199,9 +199,7 @@ function walkBuffer<T extends LogSchema>(
       case ENTRY_TYPE_ERROR: {
         if (opts.includeLogs) {
           const level = entryTypeToLogLevel(entryType);
-          const rowMessage = messages[row];
-          const message = typeof rowMessage === 'string' ? rowMessage : '';
-          facts.push(logFact(level, message));
+          facts.push(logFact(level, resolveMessage(buffer, row) ?? ''));
         }
         break;
       }
@@ -294,10 +292,10 @@ function extractTagFacts<T extends LogSchema>(
  */
 function extractFFfacts<T extends LogSchema>(buffer: SpanBuffer<T>, row: number, facts: TraceFact[]): void {
   // Feature flag entries store the flag name in message_values and the resolved value in ff_value_values.
-  const name = buffer.message_values[row];
+  const name = resolveMessage(buffer, row);
   const value = buffer.ff_value_values[row];
 
-  if (typeof name === 'string' && typeof value === 'string') {
+  if (name !== undefined && typeof value === 'string') {
     facts.push(ffFact(name, value));
   }
 }
@@ -341,8 +339,7 @@ function getErrorCode<T extends LogSchema>(buffer: SpanBuffer<T>, row: number): 
  * Get exception message from a span-exception row.
  */
 function getExceptionMessage<T extends LogSchema>(buffer: SpanBuffer<T>, row: number): string {
-  const message = buffer.message_values[row];
-  return typeof message === 'string' ? message : 'Unknown exception';
+  return resolveMessage(buffer, row) ?? 'Unknown exception';
 }
 
 /**

@@ -116,6 +116,12 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   readonly entry_type: Uint8Array;
 
   /**
+   * Private Op-local compile-time message template IDs. Zero means message_values owns the row.
+   * Allocated only when this buffer's Op has compile-time templates.
+   */
+  readonly _messageTemplateIds?: Uint16Array;
+
+  /**
    * Timestamp of span start (row 0).
    *
    * Internal helper getter (underscore-prefixed) to avoid conflicts with schema columns.

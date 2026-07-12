@@ -179,6 +179,38 @@ function extendBindingLogSchema<
   return extendedBinding;
 }
 
+type RuntimeHarnessBinding<
+  TFields extends SchemaFields,
+  FF extends FeatureFlagSchema,
+  Deps extends DepsConfig,
+  UserCtx extends Record<string, unknown>,
+  TExt extends SchemaFields,
+> = OpContextBinding<LogSchema<TFields & (BunTestHarnessBuiltins | HarnessSchema<TExt>)>, FF, Deps, UserCtx>;
+
+function createRuntimeHarnessBinding<
+  TFields extends SchemaFields,
+  FF extends FeatureFlagSchema,
+  Deps extends DepsConfig,
+  UserCtx extends Record<string, unknown>,
+  TExt extends SchemaFields,
+>(
+  binding: OpContextBinding<LogSchema<TFields>, FF, Deps, UserCtx>,
+  options: BunTestSetupOptions<TExt> | undefined,
+): RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt> {
+  const harnessSchema: BunTestHarnessBuiltins | HarnessSchema<TExt> =
+    options?.extraTestColumns === undefined
+      ? buildHarnessSchemaExtensions(binding, undefined)
+      : buildHarnessSchemaExtensions(binding, options.extraTestColumns);
+  return extendBindingLogSchema<
+    OpContextBinding<LogSchema<TFields>, FF, Deps, UserCtx>,
+    TFields,
+    FF,
+    Deps,
+    UserCtx,
+    BunTestHarnessBuiltins | HarnessSchema<TExt>
+  >(binding, harnessSchema);
+}
+
 function isTruthyEnvFlag(value: unknown): boolean {
   return value === true || value === '1' || value === 'true';
 }
@@ -204,6 +236,15 @@ function isTracerForBinding<B extends OpContextBinding>(value: unknown, binding:
     typeof logBinding === 'object' &&
     logBinding !== null &&
     Reflect.get(logBinding, 'logSchema') === binding.logBinding.logSchema
+  );
+}
+
+function isTracerInstance(value: unknown): value is Tracer<OpContextBinding> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof Reflect.get(value, 'trace') === 'function' &&
+    typeof Reflect.get(value, 'flush') === 'function'
   );
 }
 
@@ -293,14 +334,19 @@ export interface BunTestSuiteTracer<B extends OpContextBinding> {
 export type BunTestSuiteUseTestTracer<
   B extends OpContextBinding,
   TExt extends SchemaFields = Record<never, never>,
-> = ReturnType<typeof makeBunTestSuiteTracer<B, TExt>>['useTestTracer'];
+> = BunTestTracerInstance<ExtendBindingLogSchema<B, HarnessSchema<TExt>>>;
 
 export type TestTracer<
   B extends OpContextBinding,
   TExt extends SchemaFields = Record<never, never>,
 > = BunTestSuiteUseTestTracer<B, TExt>;
 
-type ActiveBunTestTracer = BunTestTracerInstance<OpContextBinding>;
+export interface ActiveBunTestTracer {
+  setup(): void;
+  useTestSpan(): unknown;
+  getTracer(): unknown;
+  createBunTestMock<TModule extends BunTestModuleShape>(bunTestModule: TModule): TModule;
+}
 
 let _activeSuiteTracer: ActiveBunTestTracer | null = null;
 
@@ -326,7 +372,7 @@ export function makeBunTestSuiteTracer<B extends OpContextBinding, TExt extends 
 export function makeBunTestSuiteTracer<B extends OpContextBinding, TExt extends SchemaFields = Record<never, never>>(
   binding: B,
   options?: BunTestSetupOptions<TExt>,
-): BunTestSuiteTracer<OpContextBinding> {
+) {
   const useTestTracer = createTestTracerInstance(binding, options);
   return {
     useTestTracer,
@@ -382,31 +428,37 @@ export function makeTestTracer<B extends OpContextBinding, TExt extends SchemaFi
 export function makeTestTracer<B extends OpContextBinding, TExt extends SchemaFields = Record<never, never>>(
   binding: B,
   options?: BunTestSetupOptions<TExt>,
-): BunTestTracerInstance<OpContextBinding> {
+) {
   return createTestTracerInstance(binding, options);
 }
-function createTestTracerInstance<B extends OpContextBinding, TExt extends SchemaFields = Record<never, never>>(
-  binding: B,
+function createTestTracerInstance<
+  TFields extends SchemaFields,
+  FF extends FeatureFlagSchema,
+  Deps extends DepsConfig,
+  UserCtx extends Record<string, unknown>,
+  TExt extends SchemaFields = Record<never, never>,
+>(
+  binding: OpContextBinding<LogSchema<TFields>, FF, Deps, UserCtx>,
   options?: BunTestSetupOptions<TExt>,
-): BunTestTracerInstance<OpContextBinding> {
-  let activeBinding: OpContextBinding | null = null;
-  let tracer: Tracer<OpContextBinding> | null = null;
+): BunTestTracerInstance<RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt>> {
+  let activeBinding: RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt> | null = null;
+  let tracer: Tracer<RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt>> | null = null;
   let verboseTrace = false;
-  let rootCtx: SpanContext<OpContext> | null = null;
+  let rootCtx: HarnessSpanContext<RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt>> | null = null;
   let resolveTestRun: (() => void) | null = null;
   let rootTracePromise: Promise<unknown> | null = null;
   let isSetup = false;
 
-  const als = new AsyncLocalStorage<SpanContext<OpContext>>();
+  const als = new AsyncLocalStorage<HarnessSpanContext<RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt>>>();
 
-  function assertRootCtx(): SpanContext<OpContext> {
+  function assertRootCtx(): HarnessSpanContext<RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt>> {
     if (!rootCtx || !activeBinding || !isSpanContextForBinding(rootCtx, activeBinding)) {
       throw new Error('Call setup() before wiring bun:test wrappers');
     }
     return rootCtx;
   }
 
-  function assertTracer(): Tracer<OpContextBinding> {
+  function assertTracer(): Tracer<RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt>> {
     if (!tracer || !activeBinding || !isTracerForBinding(tracer, activeBinding)) {
       throw new Error('Call setup() in preload before tests');
     }
@@ -510,11 +562,7 @@ function createTestTracerInstance<B extends OpContextBinding, TExt extends Schem
       }
       isSetup = true;
 
-      const harnessSchema =
-        options?.extraTestColumns === undefined
-          ? buildHarnessSchemaExtensions(binding, undefined)
-          : buildHarnessSchemaExtensions(binding, options.extraTestColumns);
-      const extendedBinding = extendBindingLogSchema(binding, harnessSchema);
+      const extendedBinding = createRuntimeHarnessBinding(binding, options);
       activeBinding = extendedBinding;
 
       verboseTrace = isVerboseTraceEnabled(options?.verbose);
@@ -526,7 +574,7 @@ function createTestTracerInstance<B extends OpContextBinding, TExt extends Schem
       });
 
       tracer = activeTracer;
-      rootTracePromise = activeTracer.trace('test-run', (ctx: SpanContext<OpContext>) => {
+      rootTracePromise = activeTracer.trace('test-run', (ctx) => {
         rootCtx = ctx;
         return new Promise<void>((resolve) => {
           resolveTestRun = resolve;
@@ -570,7 +618,7 @@ function createTestTracerInstance<B extends OpContextBinding, TExt extends Schem
       });
     },
 
-    useTestSpan(): SpanContext<OpContext> {
+    useTestSpan(): HarnessSpanContext<RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt>> {
       const ctx = als.getStore();
       if (!ctx || !activeBinding || !isSpanContextForBinding(ctx, activeBinding)) {
         throw new Error('useTestSpan() called outside of a traced it()');
@@ -578,7 +626,7 @@ function createTestTracerInstance<B extends OpContextBinding, TExt extends Schem
       return ctx;
     },
 
-    getTracer(): Tracer<OpContextBinding> {
+    getTracer(): Tracer<RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt>> {
       return assertTracer();
     },
 
@@ -638,12 +686,12 @@ export function initTraceTestRun<B extends OpContextBinding>(opContext: B, optio
 
   // Create the single root trace — a long-lived promise keeps it alive
   const tracer = _tracer;
-  _rootTracePromise = tracer.trace('test-run', (ctx: SpanContext<OpContext>) => {
+  _rootTracePromise = tracer.trace('test-run', (ctx) => {
     _rootCtx = ctx;
     return new Promise<void>((resolve) => {
       _resolveTestRun = resolve;
     });
-  }) as Promise<unknown>;
+  });
 
   // Register global teardown — resolve root, wait for span-end, then flush tracer outputs
   _afterAll(async () => {
@@ -734,7 +782,7 @@ export function createBunTestMock<TModule extends BunTestModuleShape>(bunTestMod
     // Capture describe path at registration time (synchronous)
     const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
     return origIt(name, () =>
-      rootCtx.span(name, async (ctx: SpanContext<OpContext>) => {
+      rootCtx.span(name, async (ctx) => {
         writeDescribeTag(ctx.tag, describePath);
         try {
           await als.run(ctx, fn);
@@ -778,7 +826,11 @@ export function createBunTestMock<TModule extends BunTestModuleShape>(bunTestMod
 export function useTestSpan<TCtx extends SpanContext<OpContextOf<OpContextBinding>>>(): TCtx;
 export function useTestSpan(): SpanContext<OpContextOf<OpContextBinding>> {
   if (_activeSuiteTracer) {
-    return _activeSuiteTracer.useTestSpan();
+    const ctx = _activeSuiteTracer.useTestSpan();
+    if (!isSpanContext<OpContextOf<OpContextBinding>>(ctx)) {
+      throw new TypeError('Active test tracer returned an invalid span context');
+    }
+    return ctx;
   }
 
   const ctx = _als.getStore();
@@ -795,7 +847,11 @@ export function useTestSpan(): SpanContext<OpContextOf<OpContextBinding>> {
  */
 export function getTracer(): Tracer<OpContextBinding> {
   if (_activeSuiteTracer) {
-    return _activeSuiteTracer.getTracer();
+    const tracer = _activeSuiteTracer.getTracer();
+    if (!isTracerInstance(tracer)) {
+      throw new TypeError('Active test tracer returned an invalid tracer');
+    }
+    return tracer;
   }
 
   if (!_tracer) throw new Error('Call initTraceTestRun() in preload before tests');

@@ -32,6 +32,7 @@
  */
 
 import type { OpContextBinding } from '../opContext/types.js';
+import { resolveMessage } from '../resolveMessage.js';
 import {
   ENTRY_TYPE_DEBUG,
   ENTRY_TYPE_ERROR,
@@ -271,7 +272,7 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
         const level = getLogLevel(current.entry_type[i]);
         if (!level) continue;
 
-        const template = current.message_values[i] ?? '';
+        const template = resolveMessage(current, i) ?? '';
         const message = formatTemplateMessage(current, i, template);
         const ts = formatTimestamp(current.timestamp[i]);
         const traceId = current.trace_id;
@@ -297,7 +298,7 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
 
   onTraceStart(rootBuffer: SpanBuffer<B['logBinding']['logSchema']> | AnySpanBuffer): void {
     const traceId = rootBuffer.trace_id;
-    const name = rootBuffer.message_values[0];
+    const name = resolveMessage(rootBuffer, 0);
     const ts = formatTimestamp(rootBuffer.timestamp[0]);
 
     this.out.write(`[${ts}] ${this.color(traceId)}[${traceId}]${this.reset()} ${name}\n`);
@@ -309,7 +310,7 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
     this.printLogRows(rootBuffer, 1);
     this.decrementIndent(traceId);
 
-    const name = rootBuffer.message_values[0];
+    const name = resolveMessage(rootBuffer, 0);
     const startTs = rootBuffer.timestamp[0];
     const endTs = rootBuffer.timestamp[1];
     const duration = formatDuration(endTs - startTs);
@@ -330,7 +331,7 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
   onSpanStart(childBuffer: SpanBuffer<B['logBinding']['logSchema']> | AnySpanBuffer): void {
     const traceId = childBuffer.trace_id;
     const indent = this.getIndent(traceId);
-    const name = childBuffer.message_values[0];
+    const name = resolveMessage(childBuffer, 0);
     const ts = formatTimestamp(childBuffer.timestamp[0]);
 
     this.out.write(`[${ts}] ${this.color(traceId)}[${traceId}]${this.reset()} ${'  '.repeat(indent)}├─ ${name}\n`);
@@ -343,7 +344,7 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
     const indent = this.getIndent(traceId);
     this.printLogRows(childBuffer, indent + 1);
 
-    const name = childBuffer.message_values[0];
+    const name = resolveMessage(childBuffer, 0);
     const startTs = childBuffer.timestamp[0];
     const endTs = childBuffer.timestamp[1];
     const duration = formatDuration(endTs - startTs);

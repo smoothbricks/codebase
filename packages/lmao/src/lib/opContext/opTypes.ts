@@ -24,7 +24,7 @@ import type { OpContext } from './types.js';
 // Re-export the Op class and OpMetadata from op.ts - single source of truth
 // The class is defined in op.ts to be the canonical type used by both
 // defineOp (creates instances) and Tracer (checks instanceof)
-export { Op, type OpMetadata } from '../op.js';
+export { Op, type OpCompileMetadata, type OpMetadata } from '../op.js';
 
 // =============================================================================
 // OP FUNCTION TYPE

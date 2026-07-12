@@ -36,6 +36,13 @@ import type { SpanBufferConstructor } from './spanBuffer.js';
 // (package_name/package_file/git_sha) + pre-encoded UTF-8 entries for Arrow
 // dictionary building. One per defineOp; SpanBuffer/SpanContext are the other
 // two levels of the 01j Context Hierarchy.
+export interface OpCompileMetadata {
+  readonly runtimeHint: number;
+  readonly logTemplateIds: readonly string[];
+}
+
+export const EMPTY_LOG_TEMPLATE_IDS: readonly string[] = Object.freeze([]);
+
 export interface OpMetadata {
   /** Op name for metrics tracking (distinct from span names which are provided at call sites) */
   readonly name: string;
@@ -54,6 +61,8 @@ export interface OpMetadata {
   readonly package_file_entry: PreEncodedEntry;
   /** Pre-encoded git_sha for Arrow dictionary building */
   readonly git_sha_entry: PreEncodedEntry;
+  /** Op-local compile-time log templates; ID n resolves at index n - 1. */
+  readonly logTemplateIds: readonly string[];
 }
 //#endregion smoo/lmao!n/opcontext-hierarchy
 
@@ -95,7 +104,7 @@ export class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
     /** Op name for metrics, telemetry, and debugging */
     readonly metadata: OpMetadata,
     /** Op owns buffer creation - class has static schema + stats shared by all instances */
-    readonly SpanBufferClass: SpanBufferConstructor,
+    readonly SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
     /** The user function to execute - called by span_op after context creation (can be sync or async) */
     readonly fn: (ctx: SpanContext<Ctx>, ...args: Args) => Result<S, E> | Promise<Result<S, E>>,
     /** Only set for prefixed ops - wraps child buffers during registration */
@@ -106,6 +115,8 @@ export class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
      * LMAO schema for context merging and conflict detection.
      */
     readonly _opContextBinding?: OpContextBinding,
+    /** Packed transformer analysis used to specialize child-span setup. */
+    readonly runtimeHint = 0,
   ) {}
 }
 //#endregion smoo/lmao!n/op-class

@@ -76,7 +76,14 @@ function copyOpsWithView<Ctx extends OpContext>(
 ) {
   for (const [key, value] of Object.entries(source)) {
     if (isOpInstance<Ctx>(value)) {
-      target[key] = new Op(value.metadata, value.SpanBufferClass, value.fn, remappedViewClass, value._opContextBinding);
+      target[key] = new Op(
+        value.metadata,
+        value.SpanBufferClass,
+        value.fn,
+        remappedViewClass,
+        value._opContextBinding,
+        value.runtimeHint,
+      );
     }
   }
 }
