@@ -57,8 +57,12 @@ async fn main() {
                 // Typed schema buffer for attribute columns; core span context
                 // for system columns. (The full ergonomic fusion — SpanContext
                 // parameterized by schema — is the next macro iteration.)
-                let mut attrs =
-                    ToolCallSchema::start(trace.identity(None), &trace.anchor, trace.clock());
+                let mut attrs = ToolCallSchema::start(
+                    trace.identity(None),
+                    "tool-call-attributes",
+                    &trace.anchor,
+                    trace.clock(),
+                );
                 attrs
                     .tag_tool_name(format!("tool-{}", call % 5))
                     .tag_cache_hit(call % 3 == 0)

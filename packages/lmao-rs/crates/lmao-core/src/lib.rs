@@ -16,6 +16,7 @@ pub mod columns;
 pub mod context;
 pub mod entry_type;
 pub mod identity;
+pub mod packed_header;
 pub mod result;
 pub mod tuning;
 
@@ -25,5 +26,10 @@ pub use columns::{BoolColumn, EnumColumn, F64Column, NumColumn, SharedStr, StrCo
 pub use context::{SpanContext, TraceContext};
 pub use entry_type::EntryType;
 pub use identity::{Entropy, SpanIdentity, TraceId};
+pub use packed_header::{
+    InvalidVocabularyId, MAX_VOCABULARY_ID, StaticVocabularyNotAllowed, VocabularyId,
+    entry_type_from_header, pack_dynamic, pack_static, supports_static_vocabulary,
+    vocabulary_id_from_header,
+};
 pub use result::{RetryPolicy, SpanOutcome, Transient};
 pub use tuning::CapacityRatchet;

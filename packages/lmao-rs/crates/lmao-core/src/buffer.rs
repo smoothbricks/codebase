@@ -21,6 +21,10 @@ use crate::clock::{Clock, TraceAnchor};
 use crate::columns::{SharedStr, StrColumn};
 use crate::entry_type::EntryType;
 use crate::identity::SpanIdentity;
+use crate::packed_header::{
+    StaticVocabularyNotAllowed, VocabularyId, entry_type_from_header, pack_dynamic, pack_static,
+    vocabulary_id_from_header,
+};
 use std::sync::Arc;
 
 /// Row index reserved for span completion.
@@ -28,7 +32,7 @@ pub const COMPLETION_ROW: usize = 1;
 /// First appendable log row.
 pub const FIRST_LOG_ROW: usize = 2;
 
-/// One span's columnar buffer. SoA: parallel `timestamps`/`entry_types` arrays plus
+/// One span's columnar buffer. SoA: parallel timestamp/packed-header arrays plus
 /// lazily-created attribute columns (todo: generated per-schema by `lmao-macros`).
 #[derive(Debug)]
 pub struct SpanBuffer {
@@ -36,11 +40,11 @@ pub struct SpanBuffer {
     capacity: usize,
     write_index: usize,
     timestamps: Vec<i64>,
-    entry_types: Vec<u8>,
+    headers: Vec<u32>,
     /// Eager system column (`01b1`): callsite line per row (0 = unknown).
     line_numbers: Vec<u32>,
-    /// `message` column (`01f`): OVERLOADED per entry type — row 0 span name,
-    /// rows 2+ log format-string TEMPLATES (never interpolated text). Lazy.
+    /// Dynamic span names and log messages only. Static vocabulary paths leave
+    /// this column untouched so it remains lazy and unallocated.
     messages: StrColumn,
     /// Callsite of the `span!` invocation (file is 'static via `file!()`).
     callsite: Option<(&'static str, u32)>,
@@ -51,30 +55,61 @@ pub struct SpanBuffer {
 }
 
 impl SpanBuffer {
-    /// Create a buffer with row 0 = span-start (stamped now) and row 1 pre-armed as
-    /// span-exception. `capacity` must be a power of two in `[8, 1024]` (`01b2`).
-    pub fn start(
+    /// Start a span whose name is carried dynamically in the message column.
+    pub fn start_dynamic(
         identity: Arc<SpanIdentity>,
         capacity: usize,
+        name: SharedStr,
+        anchor: &TraceAnchor,
+        clock: &dyn Clock,
+    ) -> Self {
+        let mut buffer = Self::start_with_header(
+            identity,
+            capacity,
+            pack_dynamic(EntryType::SpanStart),
+            anchor,
+            clock,
+        );
+        buffer.messages.set(0, capacity, name);
+        buffer
+    }
+
+    /// Start a span whose name is represented by a manifest-global vocabulary ID.
+    pub fn start_static(
+        identity: Arc<SpanIdentity>,
+        capacity: usize,
+        span_name_id: VocabularyId,
+        anchor: &TraceAnchor,
+        clock: &dyn Clock,
+    ) -> Self {
+        let header = pack_static(EntryType::SpanStart, span_name_id)
+            .expect("SpanStart must support a static vocabulary ID");
+        Self::start_with_header(identity, capacity, header, anchor, clock)
+    }
+
+    fn start_with_header(
+        identity: Arc<SpanIdentity>,
+        capacity: usize,
+        span_start_header: u32,
         anchor: &TraceAnchor,
         clock: &dyn Clock,
     ) -> Self {
         debug_assert!(capacity.is_power_of_two() && (8..=1024).contains(&capacity));
         let mut timestamps = vec![0i64; capacity];
-        let mut entry_types = vec![0u8; capacity];
+        let mut headers = vec![0u32; capacity];
         let line_numbers = vec![0u32; capacity];
         let now = anchor.timestamp(clock);
         timestamps[0] = now;
-        entry_types[0] = EntryType::SpanStart.as_u8();
+        headers[0] = span_start_header;
         // Exception safety: if the span is never completed, row 1 is already valid.
         timestamps[COMPLETION_ROW] = now;
-        entry_types[COMPLETION_ROW] = EntryType::SpanException.as_u8();
+        headers[COMPLETION_ROW] = pack_dynamic(EntryType::SpanException);
         Self {
             identity,
             capacity,
             write_index: FIRST_LOG_ROW,
             timestamps,
-            entry_types,
+            headers,
             line_numbers,
             messages: StrColumn::new(),
             callsite: None,
@@ -83,13 +118,8 @@ impl SpanBuffer {
         }
     }
 
-    /// Span name — the row-0 `message` slot (`01f`: message is overloaded).
-    pub fn set_name(&mut self, name: impl Into<SharedStr>) {
-        let cap = self.capacity;
-        self.messages.set(0, cap, name);
-    }
-
-    pub fn name(&self) -> Option<&str> {
+    /// Dynamic span name stored at row 0, or `None` for a static span start.
+    pub fn dynamic_name(&self) -> Option<&str> {
         self.messages.get(0)
     }
 
@@ -120,22 +150,51 @@ impl SpanBuffer {
         self.complete(EntryType::SpanErr, anchor, clock);
     }
 
-    fn complete(&mut self, et: EntryType, anchor: &TraceAnchor, clock: &dyn Clock) {
-        debug_assert!(et.is_completion());
+    fn complete(&mut self, entry_type: EntryType, anchor: &TraceAnchor, clock: &dyn Clock) {
+        debug_assert!(entry_type.is_completion());
         self.timestamps[COMPLETION_ROW] = anchor.timestamp(clock);
-        self.entry_types[COMPLETION_ROW] = et.as_u8();
+        self.headers[COMPLETION_ROW] = pack_dynamic(entry_type);
     }
 
-    /// Append a log/metric entry; returns the row index written (relative to the
-    /// buffer it landed in). When full, chains an overflow buffer sharing this
-    /// buffer's identity (`01b2`) — the overflow's rows are all appendable (no
-    /// span-start/completion rows), so its `write_index` starts at 0.
-    pub fn append(
+    /// Append a dynamic row, optionally storing its message. `None` leaves the
+    /// lazy message column untouched.
+    pub fn append_dynamic(
         &mut self,
         entry_type: EntryType,
+        message: Option<SharedStr>,
+        line: u32,
         anchor: &TraceAnchor,
         clock: &dyn Clock,
     ) -> usize {
+        let row = self.append_header(pack_dynamic(entry_type), anchor, clock);
+        let target = self.append_target();
+        if let Some(message) = message {
+            target.messages.set(row, target.capacity, message);
+        }
+        target.line_numbers[row] = line;
+        row
+    }
+
+    /// Append a static log-template row. Validation is completed before any
+    /// timestamp, index, overflow, line, or message state is mutated.
+    pub fn append_static(
+        &mut self,
+        entry_type: EntryType,
+        template_id: VocabularyId,
+        line: u32,
+        anchor: &TraceAnchor,
+        clock: &dyn Clock,
+    ) -> Result<usize, StaticVocabularyNotAllowed> {
+        let header = pack_static(entry_type, template_id)?;
+        if entry_type == EntryType::SpanStart {
+            return Err(StaticVocabularyNotAllowed(entry_type));
+        }
+        let row = self.append_header(header, anchor, clock);
+        self.append_target().line_numbers[row] = line;
+        Ok(row)
+    }
+
+    fn append_header(&mut self, header: u32, anchor: &TraceAnchor, clock: &dyn Clock) -> usize {
         let target = self.append_target();
         if target.write_index == target.capacity {
             let mut next = Box::new(SpanBuffer {
@@ -143,46 +202,22 @@ impl SpanBuffer {
                 capacity: target.capacity,
                 write_index: 0,
                 timestamps: vec![0i64; target.capacity],
-                entry_types: vec![0u8; target.capacity],
+                headers: vec![0u32; target.capacity],
                 line_numbers: vec![0u32; target.capacity],
                 messages: StrColumn::new(),
                 callsite: None,
                 overflow: None,
                 children: Vec::new(),
             });
-            let row = next.write_row(entry_type, anchor, clock);
+            let row = next.write_row(header, anchor, clock);
             target.overflow = Some(next);
             return row;
         }
-        target.write_row(entry_type, anchor, clock)
+        target.write_row(header, anchor, clock)
     }
 
-    /// Append a log entry with its format-string TEMPLATE (`01f`: store the
-    /// template, never interpolated text — values go in typed attribute columns)
-    /// and callsite line. Returns the row index in the buffer it landed in.
-    pub fn append_msg(
-        &mut self,
-        entry_type: EntryType,
-        template: impl Into<SharedStr>,
-        line: u32,
-        anchor: &TraceAnchor,
-        clock: &dyn Clock,
-    ) -> usize {
-        let row = self.append(entry_type, anchor, clock);
-        let target = self.append_target_ref();
-        let cap = target.capacity;
-        target.messages.set(row, cap, template);
-        target.line_numbers[row] = line;
-        row
-    }
-
-    /// Last buffer in the overflow chain, immutable positioning helper for
-    /// writers that already appended.
-    fn append_target_ref(&mut self) -> &mut SpanBuffer {
-        self.append_target()
-    }
-
-    pub fn message_at(&self, row: usize) -> Option<&str> {
+    /// Dynamic message for this physical buffer row. Static rows return `None`.
+    pub fn dynamic_message_at(&self, row: usize) -> Option<&str> {
         self.messages.get(row)
     }
 
@@ -200,15 +235,10 @@ impl SpanBuffer {
     }
 
     #[inline]
-    fn write_row(
-        &mut self,
-        entry_type: EntryType,
-        anchor: &TraceAnchor,
-        clock: &dyn Clock,
-    ) -> usize {
+    fn write_row(&mut self, header: u32, anchor: &TraceAnchor, clock: &dyn Clock) -> usize {
         let row = self.write_index;
         self.timestamps[row] = anchor.timestamp(clock);
-        self.entry_types[row] = entry_type.as_u8();
+        self.headers[row] = header;
         self.write_index = row + 1;
         row
     }
@@ -224,8 +254,18 @@ impl SpanBuffer {
     }
 
     #[inline]
+    pub fn packed_header_at(&self, row: usize) -> Option<u32> {
+        self.headers.get(row).copied()
+    }
+
+    #[inline]
+    pub fn vocabulary_id_at(&self, row: usize) -> Option<VocabularyId> {
+        vocabulary_id_from_header(self.packed_header_at(row)?)
+    }
+
+    #[inline]
     pub fn entry_type_at(&self, row: usize) -> Option<EntryType> {
-        EntryType::from_u8(*self.entry_types.get(row)?)
+        entry_type_from_header(self.packed_header_at(row)?)
     }
 
     #[inline]

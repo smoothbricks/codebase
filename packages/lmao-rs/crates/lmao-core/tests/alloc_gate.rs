@@ -61,11 +61,11 @@ fn append_within_capacity_is_alloc_free() {
         parent: None,
     });
     // Warmup: buffer creation allocates (pre-allocation IS the design).
-    let mut buf = SpanBuffer::start(identity, 1024, &anchor, &clock);
+    let mut buf = SpanBuffer::start_dynamic(identity, 1024, "span".into(), &anchor, &clock);
 
     let before = allocations();
     for _ in 0..1000 {
-        buf.append(EntryType::Info, &anchor, &clock);
+        buf.append_dynamic(EntryType::Info, None, 0, &anchor, &clock);
     }
     let after = allocations();
     assert_eq!(
@@ -81,7 +81,9 @@ fn append_within_capacity_is_alloc_free() {
 #[test]
 fn traced_hot_path_is_alloc_free_after_warmup() {
     use lmao_core::clock::{Clock, TraceAnchor};
-    use lmao_core::{EntryType, F64Column, SpanBuffer, SpanIdentity, StrColumn, TraceId};
+    use lmao_core::{
+        EntryType, F64Column, SharedStr, SpanBuffer, SpanIdentity, StrColumn, TraceId,
+    };
     use std::sync::Arc;
 
     struct FixedClock;
@@ -104,27 +106,32 @@ fn traced_hot_path_is_alloc_free_after_warmup() {
     });
 
     // Warmup: buffer + first-touch of every column + the shared category value.
-    let mut buf = SpanBuffer::start(identity, 1024, &anchor, &clock);
+    let mut buf = SpanBuffer::start_dynamic(identity, 1024, "span".into(), &anchor, &clock);
     let mut latency = F64Column::new();
     let mut route = StrColumn::new();
     let route_value: Arc<str> = "GET /api/v1/sessions".into();
     latency.set(0, 1024, 0.0);
     route.set(0, 1024, route_value.clone());
     // First log warms the lazy messages column (first-touch alloc is warmup).
-    buf.append_msg(EntryType::Info, "warmup", 0, &anchor, &clock);
+    buf.append_dynamic(
+        EntryType::Info,
+        Some(SharedStr::Static("warmup")),
+        0,
+        &anchor,
+        &clock,
+    );
 
     let before = allocations();
     for i in 0..500usize {
-        let row = buf.append_msg(
+        let row = buf.append_dynamic(
             EntryType::Info,
-            "handled {route} in {latency} ms", // 'static: SharedStr::Static, no alloc
+            Some(SharedStr::Static("handled {route} in {latency} ms")),
             42,
             &anchor,
             &clock,
         );
         latency.set(row, 1024, i as f64);
         route.set(row, 1024, route_value.clone()); // Arc clone: refcount bump
-        buf.set_name("hot-span"); // 'static overwrite, row-0 semantics
     }
     let after = allocations();
     assert_eq!(
