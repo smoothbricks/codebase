@@ -1,0 +1,20 @@
+{
+  "expo": {
+    "name": "LMAO Expo Benchmark",
+    "slug": "lmao-expo-benchmark",
+    "version": "1.0.0",
+    "platforms": ["ios", "android", "web"],
+    "jsEngine": "hermes",
+    "newArchEnabled": true,
+    "ios": {
+      "bundleIdentifier": "dev.smoothbricks.lmaobenchmark"
+    },
+    "android": {
+      "package": "dev.smoothbricks.lmaobenchmark"
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    }
+  }
+}
