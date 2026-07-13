@@ -340,12 +340,11 @@ export function getSpanBufferClass<T extends LogSchema>(
     // V8 IN-OBJECT PROPERTY OPTIMIZATION:
     // Property assignment order determines which properties get fast in-object slots.
     // First ~10-12 properties are stored directly on the object (fastest access).
-    // Slots 1-3: HOTTEST (every log entry) - _writeIndex, _capacity, _overflow
-    // Slots 4-5: HOT (TypedArray refs) - timestamp, entry_type
-    // Slots 6-7: WARM (tree structure) - _nodeIndex, _parent
-    // Slots 8-10: WARM (context) - _traceRoot, _scopeValues, _identity
-    // Slots 11: WARM (system) - _system
-    // Slots 12+: COLD (Arrow conversion only) - _callsiteMetadata, _opMetadata
+    // Slots 0-2: HOTTEST (every log entry) - _writeIndex, _capacity, _overflow
+    // Slots 3-6: HOT (storage refs) - timestamp, entry_type/header, message identity, vocabulary
+    // Slots 7-10: WARM (tree structure) - _nodeIndex, _topologyGeneration, _parent, _traceRoot
+    // Slots 11-14: WARM (context/identity) - _scopeValues, _threadId, _identity, _system
+    // Slots 15+: COLD (Arrow/stats/raw message) - metadata, stats, message_values
     // ==========================================================================
     constructorPreamble:
       // Thread-local span counter (per-process/worker, see threadId.ts docs)
@@ -354,7 +353,6 @@ export function getSpanBufferClass<T extends LogSchema>(
        }
        const spanId = ++globalThis.globalSpanCounter;
        const threadId = isChained ? parent.thread_id : getThreadId();
-       void '${messagePhysicalLayout}';
 ` +
       // Calculate exact physical system storage once for the generated class.
       (messagePhysicalLayout === 'packed'
@@ -447,10 +445,6 @@ export function getSpanBufferClass<T extends LogSchema>(
 `
               : `       this._logHeaders = logHeaderView;
 `)) +
-      (messageLayoutFamily === 'static-only'
-        ? ''
-        : `       this.message_values = new Array(requestedCapacity);
-`) +
       `       this._vocabularyGeneration = vocabularyGeneration;
 ` +
       (messageLayoutFamily === 'static-only'
@@ -473,7 +467,12 @@ export function getSpanBufferClass<T extends LogSchema>(
         this._opMetadata = opMetadata;
         this._statsSealed = false;
         this._statsReservedRows = isChained ? 0 : 2;
-    `,
+` +
+      (messageLayoutFamily === 'static-only'
+        ? ''
+        : `       this.message_values = new Array(requestedCapacity);
+`) +
+      '    ',
     // Generated identity methods use canonical primitives/direct offsets without temporary views.
     methods: `get span_id() {
       const b = this._identity;
@@ -634,11 +633,23 @@ export function createSpanBuffer<T extends LogSchema>(
   capacity?: number,
   plannedClass?: SpanBufferConstructor<T>,
 ): SpanBuffer<T> {
-  const SpanBufferClass = plannedClass ?? getSpanBufferClass(schema);
+  const metadataPlan = opMetadata._physicalLayoutPlan;
+  const metadataSpanBufferClass = metadataPlan?.SpanBufferClass;
+  if (
+    metadataSpanBufferClass !== undefined &&
+    !isSpanBufferConstructorForSchema(metadataSpanBufferClass, schema)
+  ) {
+    throw new TypeError('Planned SpanBuffer class does not match schema');
+  }
+  const plannedSpanBufferClass = plannedClass ?? metadataSpanBufferClass;
+  const SpanBufferClass = plannedSpanBufferClass ?? getSpanBufferClass(schema);
   const stats = SpanBufferClass.stats;
 
-  // An analyzed nonzero hint is an exact physical capacity. Only adaptive/default capacity is floored.
-  const actualCapacity = resolveSpanBufferCapacity(capacity, stats.capacity);
+  // Compiler-planned capacities are validated when the runtime hint is decoded. Keep direct external calls strict.
+  const actualCapacity =
+    plannedSpanBufferClass === undefined
+      ? resolveSpanBufferCapacity(capacity, stats.capacity)
+      : (capacity ?? Math.max(MIN_ADAPTIVE_BUFFER_CAPACITY, stats.capacity));
 
   // Track non-chained buffer creation for capacity tuning
   stats.spansCreated++;
@@ -652,7 +663,7 @@ export function createSpanBuffer<T extends LogSchema>(
     opMetadata,
     opMetadata,
     traceRoot,
-    opMetadata._physicalLayoutPlan?.vocabularyGeneration ?? getVocabularyGeneration(),
+    metadataPlan?.vocabularyGeneration ?? getVocabularyGeneration(),
   );
   traceRoot._topology.registerRoot(buffer);
   return buffer;
@@ -723,7 +734,8 @@ export function createChildSpanBuffer<T extends LogSchema>(
   capacity?: number,
 ): SpanBuffer<T> {
   const stats = SpanBufferClass.stats;
-  const actualCapacity = resolveSpanBufferCapacity(capacity, stats.capacity);
+  // Child capacities arrive through a validated callsite plan; preserve exact values including 2..7.
+  const actualCapacity = capacity ?? Math.max(MIN_ADAPTIVE_BUFFER_CAPACITY, stats.capacity);
 
   // Track non-chained buffer creation for capacity tuning
   stats.spansCreated++;
