@@ -32,6 +32,10 @@ pub enum DtoError {
     InvalidSpanId(String),
     #[error("invalid job projection: {0}")]
     InvalidJobProjection(&'static str),
+    #[error("invalid branch name {0:?}")]
+    InvalidBranchName(String),
+    #[error("invalid fully-qualified git ref {0:?}")]
+    InvalidGitRef(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -127,12 +131,11 @@ fn is_rfc3339_utc(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() < 20
         || !value.is_ascii()
-        || bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || bytes[10] != b'T'
-        || bytes[13] != b':'
-        || bytes[16] != b':'
-        || *bytes.last().unwrap_or(&0) != b'Z'
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
     {
         return false;
     }
@@ -155,20 +158,37 @@ fn is_rfc3339_utc(value: &str) -> bool {
     ) else {
         return false;
     };
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     let max_day = match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
+        2 if leap_year => 29,
         2 => 28,
         _ => return false,
     };
-    let fraction_valid = match bytes.get(19..bytes.len() - 1) {
+    let time_end = if bytes.last() == Some(&b'Z') {
+        bytes.len() - 1
+    } else if bytes.len() >= 25 {
+        let sign = bytes.len() - 6;
+        let valid_offset = matches!(bytes[sign], b'+' | b'-')
+            && bytes[sign + 3] == b':'
+            && digits(sign + 1, sign + 3).is_some_and(|hour| hour <= 23)
+            && digits(sign + 4, sign + 6).is_some_and(|minute| minute <= 59);
+        if !valid_offset {
+            return false;
+        }
+        sign
+    } else {
+        return false;
+    };
+    let fraction_valid = match bytes.get(19..time_end) {
         Some([]) => true,
-        Some([b'.', digits @ ..]) => !digits.is_empty() && digits.iter().all(u8::is_ascii_digit),
+        Some([b'.', fraction @ ..]) => {
+            !fraction.is_empty() && fraction.iter().all(u8::is_ascii_digit)
+        }
         _ => false,
     };
-    (1..=max_day).contains(&day) && hour <= 23 && minute <= 59 && second <= 59 && fraction_valid
+    (1..=max_day).contains(&day) && hour <= 23 && minute <= 59 && second <= 60 && fraction_valid
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -271,6 +291,7 @@ macro_rules! hex_identifier {
             pub fn new(value: impl Into<String>) -> Result<Self, DtoError> {
                 let value = value.into();
                 if value.len() == $bytes * 2
+                    && value.bytes().any(|byte| byte != b'0')
                     && value
                         .bytes()
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -491,27 +512,22 @@ pub struct StdinInfo {
     pub complete: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JobInfo {
     pub repo_id: RepoId,
     pub workspace_incarnation: WorkspaceIncarnation,
     pub job_id: JobId,
     pub state: JobState,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     pub grant_revision: u64,
     pub argv: Vec<String>,
     pub cwd: WorkspacePath,
     pub started: UtcTimestamp,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub exit: Option<ExitStatus>,
     pub stdout: StreamInfo,
     pub stderr: StreamInfo,
     pub trace: TraceContext,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_limit: Option<OutputLimitInfo>,
     pub stdin: StdinInfo,
 }
@@ -538,6 +554,109 @@ impl JobInfo {
                 "exit kind does not agree with job state",
             )),
         }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JobInfoRef<'a> {
+    repo_id: &'a RepoId,
+    workspace_incarnation: &'a WorkspaceIncarnation,
+    job_id: JobId,
+    state: JobState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    grant_revision: u64,
+    argv: &'a [String],
+    cwd: &'a WorkspacePath,
+    started: &'a UtcTimestamp,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit: Option<&'a ExitStatus>,
+    stdout: &'a StreamInfo,
+    stderr: &'a StreamInfo,
+    trace: &'a TraceContext,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_limit: Option<&'a OutputLimitInfo>,
+    stdin: &'a StdinInfo,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct JobInfoWire {
+    repo_id: RepoId,
+    workspace_incarnation: WorkspaceIncarnation,
+    job_id: JobId,
+    state: JobState,
+    pid: Option<u32>,
+    grant_revision: u64,
+    argv: Vec<String>,
+    cwd: WorkspacePath,
+    started: UtcTimestamp,
+    duration_ms: Option<u64>,
+    exit: Option<ExitStatus>,
+    stdout: StreamInfo,
+    stderr: StreamInfo,
+    trace: TraceContext,
+    output_limit: Option<OutputLimitInfo>,
+    stdin: StdinInfo,
+}
+
+impl Serialize for JobInfo {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        JobInfoRef {
+            repo_id: &self.repo_id,
+            workspace_incarnation: &self.workspace_incarnation,
+            job_id: self.job_id,
+            state: self.state,
+            pid: self.pid,
+            grant_revision: self.grant_revision,
+            argv: &self.argv,
+            cwd: &self.cwd,
+            started: &self.started,
+            duration_ms: self.duration_ms,
+            exit: self.exit.as_ref(),
+            stdout: &self.stdout,
+            stderr: &self.stderr,
+            trace: &self.trace,
+            output_limit: self.output_limit.as_ref(),
+            stdin: &self.stdin,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for JobInfo {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = JobInfoWire::deserialize(deserializer)?;
+        let value = Self {
+            repo_id: wire.repo_id,
+            workspace_incarnation: wire.workspace_incarnation,
+            job_id: wire.job_id,
+            state: wire.state,
+            pid: wire.pid,
+            grant_revision: wire.grant_revision,
+            argv: wire.argv,
+            cwd: wire.cwd,
+            started: wire.started,
+            duration_ms: wire.duration_ms,
+            exit: wire.exit,
+            stdout: wire.stdout,
+            stderr: wire.stderr,
+            trace: wire.trace,
+            output_limit: wire.output_limit,
+            stdin: wire.stdin,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
     }
 }
 
@@ -601,19 +720,143 @@ pub struct ExecRequest {
     pub stdin: StdinSource,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
+fn valid_ref_name(value: &str) -> bool {
+    !value.is_empty()
+        && value != "@"
+        && !value.starts_with('-')
+        && !value.starts_with('.')
+        && !value.ends_with('/')
+        && !value.ends_with('.')
+        && !value.ends_with(".lock")
+        && !value.contains("..")
+        && !value.contains("@{")
+        && !value.contains("//")
+        && value.split('/').all(|component| {
+            !component.is_empty() && !component.starts_with('.') && !component.ends_with(".lock")
+        })
+        && !value.bytes().any(|byte| {
+            byte <= b' '
+                || byte == 0x7f
+                || matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+        })
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BranchName(String);
+
+impl BranchName {
+    pub fn new(value: impl Into<String>) -> Result<Self, DtoError> {
+        let value = value.into();
+        if !value.starts_with("refs/") && valid_ref_name(&value) {
+            Ok(Self(value))
+        } else {
+            Err(DtoError::InvalidBranchName(value))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GitRef(String);
+
+impl GitRef {
+    pub fn new(value: impl Into<String>) -> Result<Self, DtoError> {
+        let value = value.into();
+        if value.starts_with("refs/") && valid_ref_name(&value) {
+            Ok(Self(value))
+        } else {
+            Err(DtoError::InvalidGitRef(value))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+macro_rules! string_domain_serde {
+    ($name:ident) => {
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(&self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+string_domain_serde!(BranchName);
+string_domain_serde!(GitRef);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RevisionTarget {
-    Branch {
-        branch: String,
-    },
-    Ref {
-        #[serde(rename = "ref")]
-        git_ref: String,
-    },
-    Oid {
-        oid: GitOid,
-    },
+    Branch(BranchName),
+    Ref(GitRef),
+    Oid(GitOid),
+}
+
+impl Serialize for RevisionTarget {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        match self {
+            Self::Branch(branch) => map.serialize_entry("branch", branch)?,
+            Self::Ref(git_ref) => map.serialize_entry("ref", git_ref)?,
+            Self::Oid(oid) => map.serialize_entry("oid", oid)?,
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for RevisionTarget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("revision target must be an object"))?;
+        if object.len() != 1 {
+            return Err(serde::de::Error::custom(
+                "revision target requires exactly one discriminator",
+            ));
+        }
+        if let Some(value) = object.get("branch") {
+            return serde_json::from_value(value.clone())
+                .map(Self::Branch)
+                .map_err(serde::de::Error::custom);
+        }
+        if let Some(value) = object.get("ref") {
+            return serde_json::from_value(value.clone())
+                .map(Self::Ref)
+                .map_err(serde::de::Error::custom);
+        }
+        if let Some(value) = object.get("oid") {
+            return serde_json::from_value(value.clone())
+                .map(Self::Oid)
+                .map_err(serde::de::Error::custom);
+        }
+        Err(serde::de::Error::custom(
+            "revision target requires branch, ref, or oid",
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -849,24 +1092,101 @@ pub struct AuditEvent {
     pub trace: TraceContext,
 }
 
+mod result_body_seal {
+    pub trait Sealed {}
+}
+
+pub trait ResultBody:
+    result_body_seal::Sealed + Serialize + DeserializeOwned + Send + Sync + 'static
+{
+}
+
+impl<T> ResultBody for T where
+    T: result_body_seal::Sealed + Serialize + DeserializeOwned + Send + Sync + 'static
+{
+}
+
+macro_rules! result_bodies {
+    ($($type:ty),+ $(,)?) => {
+        $(impl result_body_seal::Sealed for $type {})+
+    };
+}
+
+result_bodies!(
+    EmptyResult,
+    MountResult,
+    EnsureReport,
+    DoctorReport,
+    GcReport,
+    CheckpointResult,
+    RevisionResult,
+    SlotResult,
+    WorkspaceInfo,
+    JobInfo,
+    ExecRecord,
+    PushReport,
+    LandReport,
+    GrantSet,
+    GatewayStatus,
+    MirrorInfo,
+    AuditEvent,
+    Vec<WorkspaceInfo>,
+    Vec<JobInfo>,
+    Vec<ExecRecord>,
+    Vec<AuditEvent>,
+);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum JsonEnvelope<T> {
+enum EnvelopeBody<T> {
     Success(T),
     Failure(CowshedError),
 }
 
-impl<T: Serialize> Serialize for JsonEnvelope<T> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsonEnvelope<T: ResultBody> {
+    body: EnvelopeBody<T>,
+}
+
+impl<T: ResultBody> JsonEnvelope<T> {
+    pub fn success(result: T) -> Self {
+        Self {
+            body: EnvelopeBody::Success(result),
+        }
+    }
+
+    pub fn failure(error: CowshedError) -> Self {
+        Self {
+            body: EnvelopeBody::Failure(error),
+        }
+    }
+
+    pub fn result(&self) -> Option<&T> {
+        match &self.body {
+            EnvelopeBody::Success(result) => Some(result),
+            EnvelopeBody::Failure(_) => None,
+        }
+    }
+
+    pub fn error(&self) -> Option<&CowshedError> {
+        match &self.body {
+            EnvelopeBody::Success(_) => None,
+            EnvelopeBody::Failure(error) => Some(error),
+        }
+    }
+}
+
+impl<T: ResultBody> Serialize for JsonEnvelope<T> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         let mut map = serializer.serialize_map(Some(2))?;
-        match self {
-            Self::Success(result) => {
+        match &self.body {
+            EnvelopeBody::Success(result) => {
                 map.serialize_entry("ok", &true)?;
                 map.serialize_entry("result", result)?;
             }
-            Self::Failure(error) => {
+            EnvelopeBody::Failure(error) => {
                 map.serialize_entry("ok", &false)?;
                 map.serialize_entry("error", error)?;
             }
@@ -875,7 +1195,7 @@ impl<T: Serialize> Serialize for JsonEnvelope<T> {
     }
 }
 
-impl<'de, T: DeserializeOwned> Deserialize<'de> for JsonEnvelope<T> {
+impl<'de, T: ResultBody> Deserialize<'de> for JsonEnvelope<T> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -898,14 +1218,14 @@ impl<'de, T: DeserializeOwned> Deserialize<'de> for JsonEnvelope<T> {
                 .get("result")
                 .ok_or_else(|| serde::de::Error::custom("successful envelope requires result"))?;
             serde_json::from_value(result.clone())
-                .map(Self::Success)
+                .map(Self::success)
                 .map_err(serde::de::Error::custom)
         } else {
             let error = object
                 .get("error")
                 .ok_or_else(|| serde::de::Error::custom("failed envelope requires error"))?;
             serde_json::from_value(error.clone())
-                .map(Self::Failure)
+                .map(Self::failure)
                 .map_err(serde::de::Error::custom)
         }
     }
