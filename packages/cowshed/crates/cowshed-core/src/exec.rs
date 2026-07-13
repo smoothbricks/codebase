@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
-use crate::sandbox::{seatbelt_profile, SandboxConfig, SandboxError};
+use crate::sandbox::{SandboxConfig, SandboxError, seatbelt_profile};
 
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -37,8 +37,12 @@ pub enum WrapperStage {
 
 #[derive(Debug)]
 pub enum ExecError {
-    InvalidRequest { message: String },
-    SandboxDenied { message: String },
+    InvalidRequest {
+        message: String,
+    },
+    SandboxDenied {
+        message: String,
+    },
     WrapperFailure {
         stage: WrapperStage,
         message: String,
@@ -70,10 +74,7 @@ impl std::error::Error for ExecError {
 
 /// Converts authoritative controller inputs into an argv-only sandbox-exec launch.
 /// No child-provided text or environment participates in this plan.
-pub fn plan_exec(
-    request: &ExecRequest,
-    sandbox: &SandboxConfig,
-) -> Result<SpawnPlan, ExecError> {
+pub fn plan_exec(request: &ExecRequest, sandbox: &SandboxConfig) -> Result<SpawnPlan, ExecError> {
     validate_argv(&request.argv)?;
     let cwd = contained_cwd(&sandbox.workspace_mount, &request.cwd)?;
     let profile = seatbelt_profile(sandbox).map_err(map_sandbox_error)?;
@@ -131,21 +132,20 @@ pub fn execute_with<R: SpawnRunner>(
     runner: &R,
 ) -> Result<ExecOutcome, ExecError> {
     let plan = plan_exec(request, sandbox)?;
-    let status = runner.run(&plan).map_err(|failure| ExecError::WrapperFailure {
-        stage: failure.stage,
-        message: format!(
-            "sandbox wrapper failed during {:?}: {}",
-            failure.stage, failure.source
-        ),
-        source: Some(failure.source),
-    })?;
+    let status = runner
+        .run(&plan)
+        .map_err(|failure| ExecError::WrapperFailure {
+            stage: failure.stage,
+            message: format!(
+                "sandbox wrapper failed during {:?}: {}",
+                failure.stage, failure.source
+            ),
+            source: Some(failure.source),
+        })?;
     Ok(ExecOutcome { status })
 }
 
-pub fn execute(
-    request: &ExecRequest,
-    sandbox: &SandboxConfig,
-) -> Result<ExecOutcome, ExecError> {
+pub fn execute(request: &ExecRequest, sandbox: &SandboxConfig) -> Result<ExecOutcome, ExecError> {
     execute_with(request, sandbox, &SystemSpawnRunner)
 }
 
@@ -199,16 +199,15 @@ fn contained_cwd(workspace_mount: &Path, requested: &Path) -> Result<PathBuf, Ex
         });
     }
 
-    let workspace = std::fs::canonicalize(workspace_mount).map_err(|source| {
-        ExecError::WrapperFailure {
+    let workspace =
+        std::fs::canonicalize(workspace_mount).map_err(|source| ExecError::WrapperFailure {
             stage: WrapperStage::ValidateProfile,
             message: format!(
                 "could not resolve workspace mount {}: {source}",
                 workspace_mount.display()
             ),
             source: Some(source),
-        }
-    })?;
+        })?;
     if workspace != workspace_mount {
         return Err(ExecError::WrapperFailure {
             stage: WrapperStage::ValidateProfile,
@@ -400,7 +399,10 @@ mod tests {
             plans: RefCell::new(vec![]),
         };
         let mut sandbox = tree.sandbox();
-        sandbox.grants.read.push(PathBuf::from("/Users/tester/.ssh"));
+        sandbox
+            .grants
+            .read
+            .push(PathBuf::from("/Users/tester/.ssh"));
         let request = ExecRequest {
             argv: vec![OsString::from("true")],
             cwd: tree.cwd.clone(),

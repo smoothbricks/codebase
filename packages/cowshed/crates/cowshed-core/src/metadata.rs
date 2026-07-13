@@ -15,13 +15,25 @@ pub const PORT_BLOCK_SIZE: u16 = 16;
 
 #[derive(Debug)]
 pub enum MetadataError {
-    Io { path: PathBuf, source: io::Error },
-    Json { path: PathBuf, source: serde_json::Error },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Json {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
     InvalidWorkspaceName(String),
     ReservedSessionName,
     InvalidWorkspaceIncarnation(String),
-    UnsupportedVersion { kind: &'static str, version: u32 },
-    WorkspaceRoleMismatch { workspace: String, role: WorkspaceRole },
+    UnsupportedVersion {
+        kind: &'static str,
+        version: u32,
+    },
+    WorkspaceRoleMismatch {
+        workspace: String,
+        role: WorkspaceRole,
+    },
     ImageFormatMismatch {
         path: PathBuf,
         format: ImageFormat,
@@ -31,7 +43,10 @@ pub enum MetadataError {
         path: PathBuf,
         actual_extension: Option<String>,
     },
-    InvalidPortBlock { base: u16, size: u16 },
+    InvalidPortBlock {
+        base: u16,
+        size: u16,
+    },
     InvalidPath(PathBuf),
     TemporaryFileExhausted(PathBuf),
 }
@@ -39,27 +54,46 @@ pub enum MetadataError {
 impl fmt::Display for MetadataError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io { path, source } => write!(f, "metadata I/O failed for {}: {source}", path.display()),
-            Self::Json { path, source } => write!(f, "invalid metadata JSON in {}: {source}", path.display()),
+            Self::Io { path, source } => {
+                write!(f, "metadata I/O failed for {}: {source}", path.display())
+            }
+            Self::Json { path, source } => {
+                write!(f, "invalid metadata JSON in {}: {source}", path.display())
+            }
             Self::InvalidWorkspaceName(name) => write!(f, "invalid workspace name {name:?}"),
-            Self::ReservedSessionName => f.write_str("workspace name \"main\" is reserved and cannot name a session"),
+            Self::ReservedSessionName => {
+                f.write_str("workspace name \"main\" is reserved and cannot name a session")
+            }
             Self::InvalidWorkspaceIncarnation(value) => {
-                write!(f, "invalid workspace incarnation {value:?}: expected 32 lowercase hexadecimal characters")
+                write!(
+                    f,
+                    "invalid workspace incarnation {value:?}: expected 32 lowercase hexadecimal characters"
+                )
             }
             Self::UnsupportedVersion { kind, version } => {
                 write!(f, "unsupported {kind} metadata version {version}")
             }
             Self::WorkspaceRoleMismatch { workspace, role } => {
-                write!(f, "workspace {workspace:?} does not agree with role {role:?}")
+                write!(
+                    f,
+                    "workspace {workspace:?} does not agree with role {role:?}"
+                )
             }
-            Self::ImageFormatMismatch { path, format, actual_extension } => write!(
+            Self::ImageFormatMismatch {
+                path,
+                format,
+                actual_extension,
+            } => write!(
                 f,
                 "image {} has extension {:?}, which does not agree with imageFormat {:?}",
                 path.display(),
                 actual_extension,
                 format
             ),
-            Self::UnsupportedImageExtension { path, actual_extension } => write!(
+            Self::UnsupportedImageExtension {
+                path,
+                actual_extension,
+            } => write!(
                 f,
                 "image {} has unsupported extension {:?}; expected .asif or .sparseimage",
                 path.display(),
@@ -68,9 +102,15 @@ impl fmt::Display for MetadataError {
             Self::InvalidPortBlock { base, size } => {
                 write!(f, "invalid port block {{ base: {base}, size: {size} }}")
             }
-            Self::InvalidPath(path) => write!(f, "metadata path has no file name: {}", path.display()),
+            Self::InvalidPath(path) => {
+                write!(f, "metadata path has no file name: {}", path.display())
+            }
             Self::TemporaryFileExhausted(path) => {
-                write!(f, "could not allocate a temporary file beside {}", path.display())
+                write!(
+                    f,
+                    "could not allocate a temporary file beside {}",
+                    path.display()
+                )
             }
         }
     }
@@ -87,7 +127,10 @@ impl Error for MetadataError {
 }
 
 fn io_error(path: &Path, source: io::Error) -> MetadataError {
-    MetadataError::Io { path: path.to_owned(), source }
+    MetadataError::Io {
+        path: path.to_owned(),
+        source,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -218,7 +261,11 @@ pub struct WorkspaceIncarnation(String);
 impl WorkspaceIncarnation {
     pub fn new(value: impl Into<String>) -> Result<Self, MetadataError> {
         let value = value.into();
-        if value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+        if value.len() == 32
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
             Ok(Self(value))
         } else {
             Err(MetadataError::InvalidWorkspaceIncarnation(value))
@@ -263,10 +310,16 @@ pub enum WorkspaceRole {
 }
 
 fn validate_role_name(role: WorkspaceRole, name: &WorkspaceName) -> Result<(), MetadataError> {
-    if matches!((role, name.is_main()), (WorkspaceRole::Main, true) | (WorkspaceRole::Workspace, false)) {
+    if matches!(
+        (role, name.is_main()),
+        (WorkspaceRole::Main, true) | (WorkspaceRole::Workspace, false)
+    ) {
         Ok(())
     } else {
-        Err(MetadataError::WorkspaceRoleMismatch { workspace: name.to_string(), role })
+        Err(MetadataError::WorkspaceRoleMismatch {
+            workspace: name.to_string(),
+            role,
+        })
     }
 }
 
@@ -289,13 +342,16 @@ pub struct WorkspaceMarker {
 impl WorkspaceMarker {
     pub fn validate(&self) -> Result<(), MetadataError> {
         if self.version != METADATA_VERSION {
-            return Err(MetadataError::UnsupportedVersion { kind: "workspace marker", version: self.version });
+            return Err(MetadataError::UnsupportedVersion {
+                kind: "workspace marker",
+                version: self.version,
+            });
         }
         validate_role_name(self.role, &self.workspace)?;
-        if let Some(source) = &self.forked_from {
-            if source.is_main() {
-                return Err(MetadataError::ReservedSessionName);
-            }
+        if let Some(source) = &self.forked_from
+            && source.is_main()
+        {
+            return Err(MetadataError::ReservedSessionName);
         }
         Ok(())
     }
@@ -399,14 +455,20 @@ impl GrantSet {
         if let Some(block) = port_block {
             block.validate()?;
         }
-        Ok(Self { port_block, ..Self::default() })
+        Ok(Self {
+            port_block,
+            ..Self::default()
+        })
     }
 
     pub fn validate(&self, platform: Platform) -> Result<(), MetadataError> {
         match (platform, self.port_block) {
             (Platform::Macos, Some(block)) => block.validate(),
             (Platform::Linux, None) => Ok(()),
-            (_, Some(block)) => Err(MetadataError::InvalidPortBlock { base: block.base, size: block.size }),
+            (_, Some(block)) => Err(MetadataError::InvalidPortBlock {
+                base: block.base,
+                size: block.size,
+            }),
             (Platform::Macos, None) => Err(MetadataError::InvalidPortBlock { base: 0, size: 0 }),
         }
     }
@@ -446,7 +508,10 @@ pub struct DetachedWorkspaceMetadata {
 impl DetachedWorkspaceMetadata {
     pub fn validate(&self, image_path: &Path) -> Result<(), MetadataError> {
         if self.version != METADATA_VERSION {
-            return Err(MetadataError::UnsupportedVersion { kind: "detached workspace", version: self.version });
+            return Err(MetadataError::UnsupportedVersion {
+                kind: "detached workspace",
+                version: self.version,
+            });
         }
         self.image_format.validate_path(image_path)?;
         self.grants.validate(self.platform)?;
@@ -473,14 +538,21 @@ pub fn sidecar_path(image_path: &Path) -> PathBuf {
 
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, MetadataError> {
     let file = File::open(path).map_err(|source| io_error(path, source))?;
-    serde_json::from_reader(BufReader::new(file))
-        .map_err(|source| MetadataError::Json { path: path.to_owned(), source })
+    serde_json::from_reader(BufReader::new(file)).map_err(|source| MetadataError::Json {
+        path: path.to_owned(),
+        source,
+    })
 }
 
 pub fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), MetadataError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path.file_name().ok_or_else(|| MetadataError::InvalidPath(path.to_owned()))?;
-    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| MetadataError::InvalidPath(path.to_owned()))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
 
     let mut opened = None;
     for attempt in 0..128_u8 {
@@ -504,15 +576,28 @@ pub fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), M
         }
     }
 
-    let (temp_path, file) = opened.ok_or_else(|| MetadataError::TemporaryFileExhausted(path.to_owned()))?;
-    let mut cleanup = TempCleanup { path: temp_path.clone(), armed: true };
+    let (temp_path, file) =
+        opened.ok_or_else(|| MetadataError::TemporaryFileExhausted(path.to_owned()))?;
+    let mut cleanup = TempCleanup {
+        path: temp_path.clone(),
+        armed: true,
+    };
     {
         let mut writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(&mut writer, value)
-            .map_err(|source| MetadataError::Json { path: path.to_owned(), source })?;
-        writer.write_all(b"\n").map_err(|source| io_error(&temp_path, source))?;
-        writer.flush().map_err(|source| io_error(&temp_path, source))?;
-        writer.get_ref().sync_all().map_err(|source| io_error(&temp_path, source))?;
+        serde_json::to_writer_pretty(&mut writer, value).map_err(|source| MetadataError::Json {
+            path: path.to_owned(),
+            source,
+        })?;
+        writer
+            .write_all(b"\n")
+            .map_err(|source| io_error(&temp_path, source))?;
+        writer
+            .flush()
+            .map_err(|source| io_error(&temp_path, source))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|source| io_error(&temp_path, source))?;
     }
 
     #[cfg(unix)]
@@ -524,7 +609,9 @@ pub fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), M
 
     fs::rename(&temp_path, path).map_err(|source| io_error(path, source))?;
     cleanup.armed = false;
-    File::open(parent).and_then(|directory| directory.sync_all()).map_err(|source| io_error(parent, source))?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| io_error(parent, source))?;
     Ok(())
 }
 
@@ -547,8 +634,14 @@ mod tests {
     use serde_json::json;
 
     fn temp_directory(test: &str) -> PathBuf {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!("cowshed-metadata-{test}-{}-{nonce}", std::process::id()));
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cowshed-metadata-{test}-{}-{nonce}",
+            std::process::id()
+        ));
         fs::create_dir(&path).unwrap();
         path
     }
@@ -614,8 +707,12 @@ mod tests {
     fn formats_and_extensions_must_agree() {
         assert_eq!(ImageFormat::Asif.attach_tool(), AttachTool::DiskutilImage);
         assert_eq!(ImageFormat::Sparse.attach_tool(), AttachTool::Hdiutil);
-        ImageFormat::Asif.validate_path(Path::new("raven.asif")).unwrap();
-        ImageFormat::Sparse.validate_path(Path::new("raven.sparseimage")).unwrap();
+        ImageFormat::Asif
+            .validate_path(Path::new("raven.asif"))
+            .unwrap();
+        ImageFormat::Sparse
+            .validate_path(Path::new("raven.sparseimage"))
+            .unwrap();
         assert!(matches!(
             ImageFormat::Asif.validate_path(Path::new("raven.sparseimage")),
             Err(MetadataError::ImageFormatMismatch { .. })
@@ -624,7 +721,11 @@ mod tests {
             ImageFormat::Sparse.validate_path(Path::new("raven.asif")),
             Err(MetadataError::ImageFormatMismatch { .. })
         ));
-        assert!(ImageFormat::Asif.validate_path(Path::new("raven.img")).is_err());
+        assert!(
+            ImageFormat::Asif
+                .validate_path(Path::new("raven.img"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -650,7 +751,10 @@ mod tests {
             assert!(WorkspaceName::new(invalid).is_err(), "accepted {invalid:?}");
         }
         assert!(WorkspaceName::new(format!("a{}", "b".repeat(64))).is_err());
-        assert!(matches!(WorkspaceName::session("main"), Err(MetadataError::ReservedSessionName)));
+        assert!(matches!(
+            WorkspaceName::session("main"),
+            Err(MetadataError::ReservedSessionName)
+        ));
         assert!(WorkspaceName::session("raven").is_ok());
     }
 
@@ -662,12 +766,18 @@ mod tests {
         write_json(&path, &value).unwrap();
         let actual: serde_json::Value = read_json(&path).unwrap();
         assert_eq!(actual, value);
-        let entries: Vec<_> = fs::read_dir(&directory).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        let entries: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
         assert_eq!(entries, vec![OsString::from("metadata.json")]);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         fs::remove_dir_all(directory).unwrap();
     }

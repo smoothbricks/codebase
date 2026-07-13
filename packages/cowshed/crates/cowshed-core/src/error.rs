@@ -87,11 +87,7 @@ impl CowshedError {
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
-        Self::new(
-            ErrorCode::Internal,
-            message,
-            "cowshed doctor --json",
-        )
+        Self::new(ErrorCode::Internal, message, "cowshed doctor --json")
     }
 
     pub const fn exit_code(&self) -> u8 {

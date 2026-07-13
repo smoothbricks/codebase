@@ -46,11 +46,25 @@ pub struct SecretScan {
 /// Operational failures are returned rather than converted into an incomplete scan.
 #[derive(Debug)]
 pub enum SecretScanError {
-    InvalidRoot { path: PathBuf, reason: &'static str },
-    InvalidWaiver { path: PathBuf, reason: &'static str },
-    DuplicateWaiver { path: PathBuf },
-    Walk { path: PathBuf, source: walkdir::Error },
-    Read { path: PathBuf, source: io::Error },
+    InvalidRoot {
+        path: PathBuf,
+        reason: &'static str,
+    },
+    InvalidWaiver {
+        path: PathBuf,
+        reason: &'static str,
+    },
+    DuplicateWaiver {
+        path: PathBuf,
+    },
+    Walk {
+        path: PathBuf,
+        source: walkdir::Error,
+    },
+    Read {
+        path: PathBuf,
+        source: io::Error,
+    },
 }
 
 impl fmt::Display for SecretScanError {
@@ -89,10 +103,7 @@ impl std::error::Error for SecretScanError {
 ///
 /// `.git` and workspace-local build/cache roots are pruned before traversal. Waivers
 /// match normalized, repository-relative paths exactly and must include a reason.
-pub fn scan_tree(
-    root: &Path,
-    waivers: &[SecretWaiver],
-) -> Result<SecretScan, SecretScanError> {
+pub fn scan_tree(root: &Path, waivers: &[SecretWaiver]) -> Result<SecretScan, SecretScanError> {
     let root_metadata = fs::symlink_metadata(root).map_err(|source| SecretScanError::Read {
         path: root.to_path_buf(),
         source,
@@ -129,13 +140,14 @@ pub fn scan_tree(
         if !entry.file_type().is_file() {
             continue;
         }
-        let relative = entry
-            .path()
-            .strip_prefix(root)
-            .map_err(|_| SecretScanError::InvalidRoot {
-                path: entry.path().to_path_buf(),
-                reason: "walker produced a path outside the scan root",
-            })?;
+        let relative =
+            entry
+                .path()
+                .strip_prefix(root)
+                .map_err(|_| SecretScanError::InvalidRoot {
+                    path: entry.path().to_path_buf(),
+                    reason: "walker produced a path outside the scan root",
+                })?;
         scan_file(entry.path(), relative, &mut findings)?;
     }
 
@@ -156,9 +168,9 @@ pub fn scan_tree(
     Ok(result)
 }
 
-fn validate_waivers<'a>(
-    waivers: &'a [SecretWaiver],
-) -> Result<BTreeMap<&'a Path, &'a str>, SecretScanError> {
+fn validate_waivers(
+    waivers: &[SecretWaiver],
+) -> Result<BTreeMap<&Path, &str>, SecretScanError> {
     let mut validated = BTreeMap::new();
     for waiver in waivers {
         if waiver.reason.trim().is_empty() {
@@ -223,7 +235,12 @@ fn should_visit(root: &Path, entry: &DirEntry) -> bool {
     ) {
         return false;
     }
-    if name == "target" && entry.path().parent().is_some_and(|parent| parent.join("Cargo.toml").is_file()) {
+    if name == "target"
+        && entry
+            .path()
+            .parent()
+            .is_some_and(|parent| parent.join("Cargo.toml").is_file())
+    {
         return false;
     }
     !is_cowshed_cache(relative)
@@ -259,14 +276,38 @@ fn scan_file(
         path: absolute.to_path_buf(),
         source,
     })?;
-    let file_name = relative.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let file_name = relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
     let shell_file = is_shell_file(file_name, relative);
 
     for (index, line) in contents.split(|byte| *byte == b'\n').enumerate() {
         let mut matches = Vec::new();
-        find_prefixed_token(line, b"ghp_", 20, github_token_byte, "token.github-pat", &mut matches);
-        find_prefixed_token(line, b"xoxb-", 10, slack_token_byte, "token.slack-bot", &mut matches);
-        find_prefixed_token(line, b"sk-", 20, secret_key_byte, "token.secret-key", &mut matches);
+        find_prefixed_token(
+            line,
+            b"ghp_",
+            20,
+            github_token_byte,
+            "token.github-pat",
+            &mut matches,
+        );
+        find_prefixed_token(
+            line,
+            b"xoxb-",
+            10,
+            slack_token_byte,
+            "token.slack-bot",
+            &mut matches,
+        );
+        find_prefixed_token(
+            line,
+            b"sk-",
+            20,
+            secret_key_byte,
+            "token.secret-key",
+            &mut matches,
+        );
         find_aws_access_keys(line, &mut matches);
         find_pem_marker(line, &mut matches);
         find_auth_config(file_name, line, &mut matches);
@@ -367,7 +408,11 @@ fn find_prefixed_token(
         }
         let boundary_ok = start == 0 || !secret_key_byte(line[start - 1]);
         if boundary_ok && end - suffix_start >= minimum_suffix {
-            matches.push(LineMatch { start, end, rule_id });
+            matches.push(LineMatch {
+                start,
+                end,
+                rule_id,
+            });
         }
         offset = suffix_start;
     }
@@ -426,7 +471,12 @@ fn find_auth_config(file_name: &str, line: &[u8], matches: &mut Vec<LineMatch>) 
     } else {
         matches!(key.trim(), "password" | "token")
     };
-    let value_start = separator + 1 + line[separator + 1..].iter().take_while(|byte| byte.is_ascii_whitespace()).count();
+    let value_start = separator
+        + 1
+        + line[separator + 1..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_whitespace())
+            .count();
     if sensitive && value_start < line.len() {
         matches.push(LineMatch {
             start: value_start,
@@ -440,16 +490,14 @@ fn find_auth_config(file_name: &str, line: &[u8], matches: &mut Vec<LineMatch>) 
     }
 }
 
-fn find_shell_secret(
-    shell_file: bool,
-    envrc: bool,
-    line: &[u8],
-    matches: &mut Vec<LineMatch>,
-) {
+fn find_shell_secret(shell_file: bool, envrc: bool, line: &[u8], matches: &mut Vec<LineMatch>) {
     if !shell_file {
         return;
     }
-    let leading = line.iter().take_while(|byte| byte.is_ascii_whitespace()).count();
+    let leading = line
+        .iter()
+        .take_while(|byte| byte.is_ascii_whitespace())
+        .count();
     let mut declaration = &line[leading..];
     let exported = declaration.starts_with(b"export ");
     if exported {
@@ -465,9 +513,13 @@ fn find_shell_secret(
         || !variable
             .iter()
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_')
-        || ![b"_TOKEN".as_slice(), b"_SECRET".as_slice(), b"_KEY".as_slice()]
-            .iter()
-            .any(|suffix| variable.ends_with(suffix))
+        || ![
+            b"_TOKEN".as_slice(),
+            b"_SECRET".as_slice(),
+            b"_KEY".as_slice(),
+        ]
+        .iter()
+        .any(|suffix| variable.ends_with(suffix))
     {
         return;
     }
@@ -482,7 +534,10 @@ fn find_shell_secret(
 }
 
 fn redact_line(line: &[u8], matches: &[LineMatch]) -> String {
-    let mut ranges: Vec<(usize, usize)> = matches.iter().map(|matched| (matched.start, matched.end)).collect();
+    let mut ranges: Vec<(usize, usize)> = matches
+        .iter()
+        .map(|matched| (matched.start, matched.end))
+        .collect();
     ranges.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (start, end) in ranges {
@@ -505,7 +560,9 @@ fn redact_line(line: &[u8], matches: &[LineMatch]) -> String {
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn github_token_byte(byte: u8) -> bool {
@@ -530,7 +587,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{scan_tree, SecretScanError, SecretWaiver};
+    use super::{SecretScanError, SecretWaiver, scan_tree};
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -576,7 +633,11 @@ mod tests {
         tree.write(".aws/credentials", "aws_secret_access_key=secret");
 
         let scan = scan_tree(tree.path(), &[]).expect("scan succeeds");
-        let rules: Vec<&str> = scan.findings.iter().map(|finding| finding.rule_id.as_str()).collect();
+        let rules: Vec<&str> = scan
+            .findings
+            .iter()
+            .map(|finding| finding.rule_id.as_str())
+            .collect();
         assert!(rules.contains(&"filename.env"));
         assert!(rules.contains(&"filename.pem"));
         assert!(rules.contains(&"filename.ssh-private-key"));
@@ -607,22 +668,44 @@ mod tests {
         for secret in [github, slack, generic, aws, "-----BEGIN PRIVATE KEY-----"] {
             assert!(!serialized.contains(secret));
         }
-        assert!(scan.findings.iter().all(|finding| finding.context.contains("[REDACTED]")));
-        assert!(scan.findings.iter().all(|finding| finding.path != Path::new("random.txt")));
+        assert!(
+            scan.findings
+                .iter()
+                .all(|finding| finding.context.contains("[REDACTED]"))
+        );
+        assert!(
+            scan.findings
+                .iter()
+                .all(|finding| finding.path != Path::new("random.txt"))
+        );
     }
 
     #[test]
     fn auth_files_and_shell_exports_only_flag_secret_values() {
         let tree = TestDir::new();
-        tree.write(".npmrc", "registry=https://registry.npmjs.org\n//registry.npmjs.org/:_authToken=npm-secret");
+        tree.write(
+            ".npmrc",
+            "registry=https://registry.npmjs.org\n//registry.npmjs.org/:_authToken=npm-secret",
+        );
         tree.write(".pypirc", "username=builder\npassword=pypi-secret");
-        tree.write("setup.sh", "export BUILD_MODE=debug\nexport SERVICE_TOKEN=super-sensitive-value");
-        tree.write(".envrc", "GOENV=.cowshed/cache/go/env\nAPI_KEY=envrc-secret");
+        tree.write(
+            "setup.sh",
+            "export BUILD_MODE=debug\nexport SERVICE_TOKEN=super-sensitive-value",
+        );
+        tree.write(
+            ".envrc",
+            "GOENV=.cowshed/cache/go/env\nAPI_KEY=envrc-secret",
+        );
 
         let scan = scan_tree(tree.path(), &[]).expect("scan succeeds");
         assert_eq!(scan.findings.len(), 4);
         let serialized = serde_json::to_string(&scan).expect("scan serializes");
-        for secret in ["npm-secret", "pypi-secret", "super-sensitive-value", "envrc-secret"] {
+        for secret in [
+            "npm-secret",
+            "pypi-secret",
+            "super-sensitive-value",
+            "envrc-secret",
+        ] {
             assert!(!serialized.contains(secret));
         }
         assert!(!serialized.contains("BUILD_MODE"));
@@ -660,7 +743,8 @@ mod tests {
 
         let scan = scan_tree(tree.path(), &[]).expect("interior symlink is safely skipped");
         assert!(scan.findings.is_empty());
-        let error = scan_tree(&tree.path().join("linked"), &[]).expect_err("symlink root is refused");
+        let error =
+            scan_tree(&tree.path().join("linked"), &[]).expect_err("symlink root is refused");
         assert!(matches!(error, SecretScanError::InvalidRoot { .. }));
     }
 
@@ -692,7 +776,10 @@ mod tests {
     fn result_order_is_path_then_rule_then_line() {
         let tree = TestDir::new();
         tree.write("z.txt", "sk-abcdefghijklmnopqrstuvwxyz012345");
-        tree.write("a.txt", "AKIAABCDEFGHIJKLMNOP\nghp_abcdefghijklmnopqrstuvwxyz0123456789");
+        tree.write(
+            "a.txt",
+            "AKIAABCDEFGHIJKLMNOP\nghp_abcdefghijklmnopqrstuvwxyz0123456789",
+        );
 
         let first = scan_tree(tree.path(), &[]).expect("scan succeeds");
         let second = scan_tree(tree.path(), &[]).expect("scan succeeds");
