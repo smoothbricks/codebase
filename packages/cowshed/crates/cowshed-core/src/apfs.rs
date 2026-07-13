@@ -824,6 +824,8 @@ impl<R: CommandRunner> ApfsBackend for MacOsApfsBackend<R> {
             args.push(OsString::from("nobrowse"));
         }
         args.extend([
+            OsString::from("-mountOptions"),
+            OsString::from("owners"),
             OsString::from("-mountPoint"),
             mount_point.as_os_str().to_owned(),
             OsString::from(&attachment.volume_device),
@@ -1471,11 +1473,57 @@ mod tests {
         assert_eq!(argv(&requests[1]), ["apfs", "list", "-plist"]);
         assert_eq!(argv(&requests[2]), ["-q", "/dev/rdisk10s1"]);
         assert_eq!(
-            argv(&requests[3])[..3],
-            ["mount", "nobrowse", "-mountPoint"]
+            argv(&requests[3])[..5],
+            [
+                "mount",
+                "nobrowse",
+                "-mountOptions",
+                "owners",
+                "-mountPoint"
+            ]
         );
         assert_eq!(argv(&requests[3]).last().unwrap(), "/dev/disk10s1");
         let _ = fs::remove_dir(mount);
+    }
+
+    #[test]
+    fn mount_always_enables_owners_and_preserves_browse_selection() {
+        let attachment = AttachedImage {
+            image: PathBuf::from("session.sparseimage"),
+            format: ImageFormat::Sparse,
+            whole_device: "/dev/disk4".into(),
+            volume_device: "/dev/disk5s2".into(),
+        };
+        for browse in [false, true] {
+            let backend =
+                MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success([])]));
+            let mount = temp_path(
+                if browse {
+                    "mount-browse"
+                } else {
+                    "mount-nobrowse"
+                },
+                "mount",
+            );
+            backend.mount(&attachment, &mount, browse).unwrap();
+
+            let mut expected = vec!["mount".to_owned()];
+            if !browse {
+                expected.push("nobrowse".to_owned());
+            }
+            expected.extend([
+                "-mountOptions".to_owned(),
+                "owners".to_owned(),
+                "-mountPoint".to_owned(),
+                mount.to_string_lossy().into_owned(),
+                "/dev/disk5s2".to_owned(),
+            ]);
+            let requests = backend.runner().requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].program, Path::new(DISKUTIL));
+            assert_eq!(argv(&requests[0]), expected);
+            fs::remove_dir(mount).unwrap();
+        }
     }
 
     #[test]
