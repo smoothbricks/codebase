@@ -1,11 +1,33 @@
 # 01q: WASM Memory Architecture for SpanBuffer Storage <a id="smoo/lmao!n/wasm-mem"></a>
 
-> **Implementation status (realized).** This architecture is built and tested under `packages/lmao/src/lib/wasm/`. The
-> realized base node is `smoo/lmao!n/wasm-mem` (covers this whole spec by heading-subtree inheritance, 88 §1d); its
-> source spans are the dotted `#region` fences `.allocator` (`allocator.zig`), `.ts-allocator` (`wasmAllocator.ts`),
-> `.strategy` (`WasmBufferStrategy.ts`), `.spanbuffer` (`wasmSpanBuffer.ts`), `.trace-root` (`wasmTraceRoot.ts`), and
-> `.bench` (`benchmarks/js-vs-wasm.bench.ts` + `__tests__/wasm-integration.test.ts`). The four items under
-> [Deferred Work](#smoo/lmao!n/wasm-mem-deferred) are the only open follow-ups.
+> **Implementation status (partial realization).** The allocator, TypeScript wrapper, WASM buffer strategy, span buffer,
+> trace-root writer, synchronous conversion/release flow, and current Mitata benchmarks are shipped under
+> `packages/lmao/src/lib/wasm/`. The implementation map identifies their source regions. `PhysicalLayoutPlan`,
+> `VocabularyBinding`, `ArrowLease`, memory-epoch ownership, and lease-pinned asynchronous Arrow borrowing below are
+> target contracts, not assertions about the shipped implementation. Deferred Work lists the original allocator/runtime
+> follow-ups; the phase/ownership gates in this document are additional acceptance requirements.
+
+## Status and Phase Contract <a id="smoo/lmao!n/wasm-mem.status-contract"></a>
+
+The implementation-map WASM allocator and synchronous lifecycle are shipped; current JS-buffer and WASM behavior are
+benchmarked separately.
+
+**Shipped phases:** startup instantiates the memory/allocator and generated accessors; span setup allocates or reuses
+identity/system blocks and creates JS buffer/offset views; warmed writes use fixed stores; first-column allocation,
+freelist miss, overflow, and `memory.grow()` are slow paths. Conversion reads WASM views synchronously, constructs or
+copies Arrow-owned output as required, and `releaseBuffer()` immediately returns the span tree's blocks after
+conversion. Cached TypedArray views are recreated after growth. Shipped code does not expose asynchronous borrowed WASM
+Arrow data and does not implement `ArrowLease`, memory-epoch ownership, `PhysicalLayoutPlan`, or `VocabularyBinding`.
+
+**Target phases:** startup creates an immutable versioned `PhysicalLayoutPlan` and performs `VocabularyBinding`; warmed
+fixed-capacity writes introduce zero new JS heap allocations with monomorphic stores and one predictable branch; and
+per-request flush may borrow compatible WASM regions only under `ArrowLease`, otherwise retaining the shipped
+Arrow-owned copy boundary.
+
+For shipped measurement and target gates, effective memory includes JS heap/view objects, every committed WASM page
+(live, free, fragmented, or orphaned), Arrow output, temporary conversion buffers, caches, and allocator/GC metadata.
+Target measurements additionally include lease-pinned blocks/pages. Logical block bytes or freelist counters alone are
+not memory usage.
 
 ## Overview <a id="smoo/lmao!n/wasm-mem.overview"></a>
 
@@ -30,7 +52,7 @@ Each SpanBuffer owns separate JavaScript TypedArrays:
 - Memory fragmentation across heap
 - 64KB minimum for WASM Memory means per-SpanBuffer WASM is wasteful
 
-### Proposed Architecture <a id="smoo/lmao!n/wasm-mem.proposed-architecture"></a>
+### Target/Realized WASM Architecture <a id="smoo/lmao!n/wasm-mem.proposed-architecture"></a>
 
 One `WebAssembly.Memory` per `OpContext`:
 
@@ -243,11 +265,11 @@ The final merged block ends up at max tier (512).
 
 ## Freelist Implementation <a id="smoo/lmao!n/wasm-mem.freelist-implementation"></a>
 
-### Zero-Overhead Freelists <a id="smoo/lmao!n/wasm-mem.zero-overhead-freelists"></a>
+### In-Block Freelist Metadata <a id="smoo/lmao!n/wasm-mem.zero-overhead-freelists"></a>
 
-The freelist uses the **block's own memory** to store the next pointer. When a block is free, its first 4 bytes hold the
-next pointer. When a block is in use, those same bytes hold valid data (null bitmap). There is **no per-block
-overhead**.
+The freelist reuses a free block's payload for its next pointer, so it adds no **separate per-block side allocation**.
+Header bytes, committed pages, fragmentation, orphaned blocks, and allocator work remain in effective-memory and
+slow-path accounting.
 
 This works because:
 
@@ -355,7 +377,7 @@ The first 4 bytes serve dual purpose:
 
 ### Minimum Capacity Requirement <a id="smoo/lmao!n/wasm-mem.minimum-capacity-requirement"></a>
 
-For zero-overhead freelists to work, all blocks must be ≥ 4 bytes to hold the next pointer.
+For in-block freelist metadata to work, all blocks must be ≥ 4 bytes to hold the next pointer.
 
 Smallest block is a 1B column: `ceil(capacity/8) + capacity × 1`
 
@@ -399,7 +421,7 @@ fn free(offset: u32, size_class: SizeClass):
     freelist_heads[size_class] = offset
 ```
 
-### Freelist Statistics (Zero-Overhead) <a id="smoo/lmao!n/wasm-mem.freelist-statistics-zero-overhead"></a>
+### Freelist Statistics (In-Block Metadata) <a id="smoo/lmao!n/wasm-mem.freelist-statistics-zero-overhead"></a>
 
 Since freed blocks have unused space after the `next` pointer, we store cascading statistics that aggregate as blocks
 are pushed/popped. This is the `FreeBlock` struct (20 bytes):
@@ -594,7 +616,20 @@ Same as current - **no change to remapping**:
 This works because each OpContext (library vs app) has its own WASM memory. Library code writes to library memory with
 library column IDs. No cross-OpContext coordination needed at write time.
 
-## Lifecycle <a id="smoo/lmao!n/wasm-mem.lifecycle"></a>
+## Target Lifecycle and Asynchronous Ownership <a id="smoo/lmao!n/wasm-mem.lifecycle"></a>
+
+The following state machine is a **target**, not shipped behavior. Shipped conversion is synchronous and releases/copies
+before `releaseBuffer()` recycles blocks; therefore shipped Arrow output MUST NOT retain views into recycled WASM
+blocks.
+
+The target gives each block an ownership state and each `WebAssembly.Memory.buffer` an epoch:
+
+`FREE → BUFFER_OWNED → FLUSH_PINNED → FREE`
+
+`BUFFER_OWNED` permits mutable writes. `FLUSH_PINNED` means an `ArrowLease` owns the borrow: the block cannot be
+overwritten, recycled, split/merged, or orphaned, and `memory.grow()` cannot invalidate its epoch. Release returns all
+pinned blocks atomically. If allocation would require growth while a lease pins the epoch, delay growth or copy leased
+output to Arrow-owned buffers and release first; never detach a borrowed Arrow view.
 
 ### Span Start <a id="smoo/lmao!n/wasm-mem.span-start"></a>
 
@@ -617,14 +652,12 @@ On first write to numeric column:
 
 ### Trace Completion <a id="smoo/lmao!n/wasm-mem.trace-completion"></a>
 
-```
-Walk span tree depth-first:
-For each span:
-  1. Return Span System block to freelist_span
-  2. For each allocated numeric column:
-     - Return column block to size-class freelist
-  3. String arrays: left for GC (or pooled)
-```
+**Shipped:** conversion consumes the frozen tree synchronously, produces Arrow-owned output where lifetime isolation is
+required, then `releaseBuffer()` returns system, identity, and numeric blocks to freelists. No returned Arrow value may
+retain a view of those recycled blocks.
+
+**Target:** blocks borrowed by Arrow transition to `FLUSH_PINNED` and return only when their `ArrowLease` is released.
+Blocks not exposed to Arrow may return immediately. JS string arrays remain GC-owned unless an explicit pool owns them.
 
 ## Capacity Tuning Considerations <a id="smoo/lmao!n/wasm-mem.capacity-tuning-considerations"></a>
 
@@ -652,24 +685,21 @@ Single-threaded JS ensures no race conditions. Each span has its own allocated b
 
 ### Growth <a id="smoo/lmao!n/wasm-mem.growth"></a>
 
-- WASM memory grows in 64KB pages via `memory.grow()`
-- Bump allocator carves small blocks from pages
-- Growth happens when freelists empty AND bump area exhausted
+- Grow in 64KB pages only on the freelist-miss/bump-exhausted slow path.
+- Before `memory.grow()`, no lease may pin the current epoch. After growth, increment the epoch and recreate every
+  cached TypedArray/DataView before access.
+- Record requested/committed pages, recreated views, latency, and cause.
 
 ### Reclamation <a id="smoo/lmao!n/wasm-mem.reclamation"></a>
 
-- Blocks returned to freelists on trace completion
-- Freelists enable reuse without compaction
-- WASM memory never shrinks (spec limitation)
-- Memory naturally stabilizes at peak usage level
+- Released blocks return to size/capacity-correct freelists; pinned blocks are not free.
+- WASM memory never shrinks, so retained effective memory includes the committed high-water mark.
+- Orphaned capacity-tuning blocks count as retained fragmentation until reusable.
 
 ### Long-Running Processes <a id="smoo/lmao!n/wasm-mem.long-running-processes"></a>
 
-For servers handling many requests:
-
-- Freelists accumulate blocks matching usage patterns
-- Peak memory = max concurrent traces × blocks per trace
-- No unbounded growth if traces complete and return blocks
+Memory is bounded only if trace/lease completion is bounded and workload high-water stabilizes. Report active leases,
+oldest lease age, pinned/reusable/orphaned bytes, committed pages, fragmentation, growth count, and peak concurrency.
 
 ## Performance Characteristics <a id="smoo/lmao!n/wasm-mem.performance-characteristics"></a>
 
@@ -681,10 +711,9 @@ For servers handling many requests:
 
 ### Allocation Cost <a id="smoo/lmao!n/wasm-mem.allocation-cost"></a>
 
-- Freelist pop: O(1) - read next pointer, update head
-- Freelist push: O(1) - write next pointer, update head
-- Bump allocate: O(1) - increment pointer, maybe grow memory
-- No GC pressure for numeric data
+- Freelist pop/push and bump-pointer updates are O(1) operations, not zero work.
+- A freelist hit needs no new WASM page; a miss may grow memory and recreate views.
+- Numeric payload avoids per-column JS backing stores, but wrappers/views and committed pages remain in memory/GC data.
 
 ### Write Cost <a id="smoo/lmao!n/wasm-mem.write-cost"></a>
 
@@ -788,10 +817,16 @@ In `WasmBufferStrategy` (`packages/lmao/src/lib/wasm/WasmBufferStrategy.ts`):
 
 ### Benchmarking <a id="smoo/lmao!n/wasm-mem.bench"></a>
 
-`benchmarks/js-vs-wasm.bench.ts` compares JS (`JsBufferStrategy`) vs WASM (`WasmBufferStrategy`) on throughput
-(ops/second) across cold-start (simple trace, trace with tags, multiple log entries) and warm/steady-state (simple
-trace, tags, nested spans, multiple entries, memory reuse) scenarios, using `mitata`. End-to-end coverage lives in
-`wasm-integration.test.ts`.
+The existing `js-vs-wasm.bench.ts` Mitata comparison is shipped evidence, not the complete protocol. WASM scenarios MUST
+follow
+[01b1 §Required Mitata Protocol](./01b1_buffer_performance_optimizations.md#smoo/lmao!n/buffer-perf-benchmark-protocol):
+compare plugin-off, plugin-on/current JS, current WASM, and candidates with semantic checksums, position-balanced order,
+machine-readable raw samples, and p50/p95/p99/p99.9 for startup, span setup/freelist hit, warmed writes, lazy
+allocation/overflow/growth, recycle, and request Arrow flush. Effective-memory, allocation/GC, epoch/view recreation,
+lease duration/pinned bytes, copied bytes, IC/shape, branch, and chunk observations are auxiliary instrumentation beside
+Mitata and may be unavailable. Reject semantic differences, warmed-write allocations, unstable hot shapes/branches,
+growth during a target borrowed lease, shipped output retaining recycled WASM views, or regressions beyond the declared
+noise threshold.
 
 ## Resolved Decisions <a id="smoo/lmao!n/wasm-mem.resolved-decisions"></a>
 
@@ -800,8 +835,8 @@ Three earlier questions are settled, and their resolutions are commitments:
 - **Capacity tuning** — on a capacity change, orphaned freelist blocks are discarded rather than tracked per capacity;
   capacity stabilizes quickly, so the waste is transient (see
   [Capacity Tuning Considerations](#capacity-tuning-considerations)).
-- **View invalidation** — TypedArray views are cached in `WasmAllocator` and recreated after `memory.grow()`; memory
-  grows only when freelists are empty and the bump area is exhausted (see [Growth](#growth)).
+- **View invalidation** — shipped cached views are recreated after `memory.grow()`. The target `ArrowLease` adds the
+  cross-consumer guarantee: delay growth or copy leased data before invalidating the old epoch.
 - **Overflow buffers** — `createWasmOverflowBuffer()` allocates from the same allocator, so overflow buffers reuse the
   OpContext's memory.
 

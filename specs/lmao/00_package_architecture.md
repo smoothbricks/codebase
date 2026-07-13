@@ -37,7 +37,7 @@ This monorepo contains two distinct packages with clear separation of concerns:
 │  • Null bitmap management                                        │
 │  • Schema extensibility via composition (NOT inheritance)       │
 │  • Runtime class generation (new Function()) for V8 optimization│
-│  • Zero-copy Arrow conversion                                    │
+│  • Ownership-aware Arrow wrapping and conversion                 │
 │  • NO knowledge of logging/tracing                              │
 └─────────────────────────────────────────────────────────────────┘
                               │
@@ -192,7 +192,8 @@ A low-level alternative to building Arrow tables directly with flechette constru
 2. **Lazy column storage pattern** - Nulls and values share ONE ArrayBuffer per column
 3. **Null bitmap management** - Arrow-format null bitmaps with bit manipulation
 4. **Buffer capacity management** - Explicit capacity, no hidden resizing
-5. **Zero-copy Arrow conversion utilities** - TypedArray concatenation, null bitmap merging helpers
+5. **Arrow wrapping and conversion utilities** - Ownership-aware views plus explicit bulk TypedArray concatenation/copy
+   and null-bitmap merge helpers
 6. **Generic schema types** - Type definitions (enum, category, text, number, boolean)
 7. **Runtime class generation** - `generateColumnBufferClass()` using `new Function()`
 8. **Column buffer codegen utilities** - Create optimized buffer classes with direct properties
@@ -315,10 +316,64 @@ concepts.
 
 A high-level structured logging library providing excellent developer experience with minimal runtime overhead:
 
-- **Zero-allocation hot path**: Avoid string interpolation and object allocation during logging
+- **Target warmed-entry allocation**: Avoid string interpolation and object allocation for in-capacity writes
 - **Schema-driven type safety**: Compile-time and runtime validation of logged data
 - **Context propagation**: Automatic trace correlation through traceContext→op→span hierarchy
 - **System column optimization**: timestamp/entry_type are NEVER lazy
+
+### Optimization Architecture Contract (Target, Not Yet Shipped)
+
+The structures in this subsection are the clean-cutover optimization target. The shipped implementation still builds
+Op-local buffer/writer classes and performs more string and dictionary work during Arrow conversion. A performance claim
+MUST name its phase: **startup**, **span setup**, **warmed entry write**, **overflow/slow path**, or **per-request
+flush**. “Zero allocation” without a phase is not a valid architecture claim.
+
+Startup owns expensive work. `@smoothbricks/lmao` compiles each canonical schema into an immutable `PhysicalLayoutPlan`:
+concrete column offsets and widths, eager/lazy policy, null-bitmap placement, message lanes, and backend-specific
+writer/flush factories. A process cache keyed by **schema identity + physical layout version + backend kind** shares
+that plan and its generated classes across ops. It does not collapse distinct prefix/remap semantics into one cache
+entry. Each warmed callsite then targets one fixed writer shape and fixed column stores; schema lookup, computed
+property selection, dictionary lookup, and backend dispatch are forbidden on the warmed entry path.
+
+Callsites are classified as **static**, **structured**, or **dynamic**. `mixed` describes only a physical layout that
+contains both static-index and dynamic-reference lanes; it is never a fourth callsite class.
+
+The target string representation separates vocabulary from dynamic data:
+
+- Checker-proven literal log templates use `kindTag = 1` (`LOG_TEMPLATE`); checker-proven literal span names use
+  `kindTag = 2` (`SPAN_NAME`). Both use process-dense `Uint32` indices that are already Arrow dictionary indices. Span
+  names that the checker cannot prove literal remain dynamic references.
+- Runtime `CATEGORY` and `TEXT` values remain dynamic and use explicit dynamic reference lanes. `CATEGORY` may be
+  deduplicated during flush; `TEXT` preserves high-cardinality/raw semantics. Neither silently becomes static merely
+  because a value repeats.
+- Compiled application modules and precompiled JS libraries own and ship vocabulary fragment inputs. Their registration
+  callback is invoked only after the LMAO runtime installer has been imported and evaluated. The registry validates the
+  typed arrays, then copies/merges them into a runtime-owned immutable dictionary generation. Its returned
+  `VocabularyBinding` is indexed directly as `binding[ordinal]`; applications do not copy, renumber, or claim ownership
+  of library fragments.
+
+Dense Arrow indices are process-local and append-only in fragment registration order. Each new immutable dictionary
+generation retains the previous generation as an unchanged prefix and appends only unseen decoded values, so old
+bindings remain prefix-valid. Stable IDs and decoded values are deterministic; dense indices and dictionary order are
+not deterministic across processes. Dense index `0` is valid; nullability is represented only by the Arrow bitmap.
+
+Per-request flush walks the already physicalized buffers and reuses schema/layout/backend classes, vocabulary bindings,
+dictionary generations, scratch storage, and Arrow-compatible views. Its target is few or no allocations and maximal
+Arrow-native reuse. Returned storage is pinned by an `ArrowLease`; the exporter MUST release the lease before the exact
+runtime-owned storage or dictionary generation can be recycled. A lease never pins or borrows a module's mutable
+fragment arrays: those arrays are registration inputs already copied by the registry. Overflow remains an explicit,
+predictable slow path and may allocate; it MUST NOT make the warmed in-capacity path polymorphic.
+
+**Shipped gap**: the current scheduler may coalesce multiple roots into a flush, rather than producing one measured
+lease per request. Async Arrow/WASM lease pinning is target behavior, not shipped behavior, and the current WASM path
+recreates JavaScript views after memory growth. Measure these costs with the repository-standard Mitata protocol and the
+acceptance gate in [Buffer Performance Optimizations](./01b1_buffer_performance_optimizations.md), rather than
+attributing them to the target `ArrowLease` design.
+
+Package ownership remains strict: `arrow-builder` owns generic physical column layout, buffers, bitmaps, Arrow views,
+and backend-neutral allocation primitives. `lmao` owns logging schemas, static/structured/dynamic callsite classes,
+static-index and dynamic-reference lanes, vocabulary registration and binding, span trees, flush orchestration, and
+lease lifecycle. The global registration callback is a LMAO runtime ABI, not an `arrow-builder` logging dependency.
 
 ### What lmao OWNS <a id="smoo/lmao!n/lmao-arch-what-lmao-owns"></a>
 
@@ -400,24 +455,24 @@ naming.
 
 ## Summary <a id="smoo/lmao!n/lmao-arch-summary"></a>
 
-| Aspect               | arrow-builder                                | lmao                                         |
-| -------------------- | -------------------------------------------- | -------------------------------------------- |
-| **Purpose**          | Generic columnar buffer engine               | Structured logging library                   |
-| **Level**            | Low-level primitives                         | High-level API                               |
-| **Focus**            | Explicit allocations, memory efficiency      | Developer experience, zero overhead hot path |
-| **Knowledge**        | Generic columnar data                        | Logging/tracing semantics                    |
-| **Allocations**      | Visible, controllable                        | Delegates to arrow-builder                   |
-| **Schema**           | Generic types, extensible metadata           | Extends with masking                         |
-| **Naming**           | User-defined column names                    | `_` prefix for system, direct for user       |
-| **Lazy Columns**     | Provides pattern (shared ArrayBuffer)        | Uses for user attributes                     |
-| **System Columns**   | No concept                                   | ALWAYS eager (\_timestamps, \_operations)    |
-| **Scope**            | No concept                                   | SEPARATE class from buffer columns           |
-| **Op/Span**          | No concept                                   | Op wraps fn, span() invokes                  |
-| **Codegen**          | `generateColumnBufferClass()`                | Extends with SpanLogger, TagAPI, Scope       |
-| **String Interning** | `intern()` for known strings (unbounded)     | `Utf8Cache` for runtime strings (SIEVE)      |
-| **UTF-8 Encoding**   | `Utf8Encoder` interface, `DictionaryBuilder` | `globalUtf8Cache`, pre-encoded contexts      |
-| **Tree Walking**     | No concept                                   | Owns tree traversal and dictionary building  |
-| **Dependencies**     | @uwdata/flechette only                       | arrow-builder + @uwdata/flechette            |
+| Aspect               | arrow-builder                                | lmao                                                       |
+| -------------------- | -------------------------------------------- | ---------------------------------------------------------- |
+| **Purpose**          | Generic columnar buffer engine               | Structured logging library                                 |
+| **Level**            | Low-level primitives                         | High-level API                                             |
+| **Focus**            | Explicit allocations, memory efficiency      | Developer experience, target zero-allocation warmed writes |
+| **Knowledge**        | Generic columnar data                        | Logging/tracing semantics                                  |
+| **Allocations**      | Visible, controllable                        | Delegates to arrow-builder                                 |
+| **Schema**           | Generic types, extensible metadata           | Extends with masking                                       |
+| **Naming**           | User-defined column names                    | `_` prefix for system, direct for user                     |
+| **Lazy Columns**     | Provides pattern (shared ArrayBuffer)        | Uses for user attributes                                   |
+| **System Columns**   | No concept                                   | ALWAYS eager (\_timestamps, \_operations)                  |
+| **Scope**            | No concept                                   | SEPARATE class from buffer columns                         |
+| **Op/Span**          | No concept                                   | Op wraps fn, span() invokes                                |
+| **Codegen**          | `generateColumnBufferClass()`                | Extends with SpanLogger, TagAPI, Scope                     |
+| **String Interning** | `intern()` for known strings (unbounded)     | `Utf8Cache` for runtime strings (SIEVE)                    |
+| **UTF-8 Encoding**   | `Utf8Encoder` interface, `DictionaryBuilder` | `globalUtf8Cache`, pre-encoded contexts                    |
+| **Tree Walking**     | No concept                                   | Owns tree traversal and dictionary building                |
+| **Dependencies**     | @uwdata/flechette only                       | arrow-builder + @uwdata/flechette                          |
 
 ---
 
