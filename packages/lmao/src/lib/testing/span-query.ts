@@ -7,6 +7,7 @@
  * @module span-query
  */
 
+import { resolveMessage } from '../resolveMessage.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { SpanBuffer } from '../types.js';
 import { type ExtractFactsOptions, extractFacts } from './extractFacts.js';
@@ -15,9 +16,8 @@ import type { FactArray } from './facts.js';
 /** Find first descendant span by name (depth-first) */
 export function findSpan<T extends LogSchema>(root: SpanBuffer<T>, name: string): SpanBuffer<T> | undefined {
   for (const child of root._children) {
-    const typed = child as SpanBuffer<T>;
-    if (typed.message_values[0] === name) return typed;
-    const found = findSpan(typed, name);
+    if (resolveMessage(child, 0) === name) return child;
+    const found = findSpan(child, name);
     if (found) return found;
   }
   return undefined;
@@ -44,22 +44,20 @@ export function extractFactsFor<T extends LogSchema>(
 /** Collect all descendant span names (flat list, depth-first) */
 export function spanNames<T extends LogSchema>(root: SpanBuffer<T>): string[] {
   const result: string[] = [];
-  collectNames(root._children as SpanBuffer<T>[], result);
+  collectNames(root._children, result);
   return result;
 }
 
 function collectSpans<T extends LogSchema>(root: SpanBuffer<T>, name: string, results: SpanBuffer<T>[]): void {
   for (const child of root._children) {
-    const typed = child as SpanBuffer<T>;
-    if (typed.message_values[0] === name) results.push(typed);
-    collectSpans(typed, name, results);
+    if (resolveMessage(child, 0) === name) results.push(child);
+    collectSpans(child, name, results);
   }
 }
 
 function collectNames<T extends LogSchema>(children: SpanBuffer<T>[], result: string[]): void {
   for (const child of children) {
-    const typed = child as SpanBuffer<T>;
-    result.push(typed.message_values[0]);
-    collectNames(typed._children as SpanBuffer<T>[], result);
+    result.push(resolveMessage(child, 0) ?? '');
+    collectNames(child._children, result);
   }
 }

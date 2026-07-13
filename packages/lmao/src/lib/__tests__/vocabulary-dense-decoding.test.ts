@@ -133,14 +133,17 @@ describe('global vocabulary dense decoding', () => {
     const tracer = new TestTracer(opContext, createTestTracerOptions());
     await tracer.trace('dense-levels', op);
     const buffer = tracer.rootBuffers[0];
+    const headers = buffer._logHeaders;
+    const rawMessages = buffer.message_values;
+    if (!headers || !rawMessages) throw new Error('Expected mixed buffer message lanes');
 
     const entryTypes = [ENTRY_TYPE_INFO, ENTRY_TYPE_DEBUG, ENTRY_TYPE_WARN, ENTRY_TYPE_ERROR, ENTRY_TYPE_TRACE];
-    expect(Array.from(buffer._logHeaders.subarray(2, 7))).toEqual(
+    expect(Array.from(headers.subarray(2, 7))).toEqual(
       entryTypes.map((entryType, ordinal) => (binding[ordinal] << 8) | entryType),
     );
-    expect(buffer._logHeaders[7]).toBe(0);
-    for (let row = 2; row < 7; row++) expect(buffer.message_values[row]).toBeUndefined();
-    expect(buffer.message_values[7]).toBe('dynamic message');
+    expect(headers[7]).toBe(0);
+    for (let row = 2; row < 7; row++) expect(rawMessages[row]).toBeUndefined();
+    expect(rawMessages[7]).toBe('dynamic message');
     expect(Array.from({ length: 6 }, (_, index) => resolveMessage(buffer, index + 2))).toEqual([
       ...messages,
       'dynamic message',

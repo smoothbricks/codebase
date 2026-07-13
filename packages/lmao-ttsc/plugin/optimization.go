@@ -17,6 +17,9 @@ const (
 	runtimeHintScope    uint32 = 1 << 21
 	runtimeHintDeps     uint32 = 1 << 22
 	runtimeHintAnalyzed uint32 = 1 << 23
+	runtimeHintMessageStatic  uint32 = 1 << 24
+	runtimeHintMessageDynamic uint32 = 1 << 25
+	runtimeHintMessageMixed   uint32 = runtimeHintMessageStatic | runtimeHintMessageDynamic
 )
 
 var contextCapability = map[string]uint32{
@@ -76,7 +79,7 @@ func isLoop(node *shimast.Node) bool {
 
 // analyzeOpFunction is intentionally closed-world. A hint is emitted only when
 // every use of the context parameter is a direct access to a known capability.
-func analyzeOpFunction(fn *shimast.Node) uint32 {
+func analyzeOpFunction(fn *shimast.Node, staticLogIDs map[*shimast.CallExpression]globalVocabularyID) uint32 {
 	params, body, _, ok := functionParts(fn)
 	if !ok || params == nil || len(params.Nodes) == 0 || body == nil {
 		return 0
@@ -94,6 +97,8 @@ func analyzeOpFunction(fn *shimast.Node) uint32 {
 	capacityKnown := true
 	capacity := uint32(2) // rows 0 (tags) and 1 (terminal result)
 	caps := uint32(0)
+	hasStaticMessage := false
+	hasDynamicMessage := false
 	var visit func(*shimast.Node, bool)
 	visit = func(node *shimast.Node, root bool) {
 		if node == nil || !valid {
@@ -124,6 +129,9 @@ func analyzeOpFunction(fn *shimast.Node) uint32 {
 				return
 			}
 			caps |= capability
+			if name == "ff" {
+				hasDynamicMessage = true
+			}
 		}
 		if node.Kind == shimast.KindCallExpression {
 			call := node.AsCallExpression()
@@ -132,6 +140,11 @@ func analyzeOpFunction(fn *shimast.Node) uint32 {
 				if logMethods[shimast.NodeText(method.Name())] && method.Expression.Kind == shimast.KindPropertyAccessExpression {
 					logAccess := method.Expression.AsPropertyAccessExpression()
 					if shimast.NodeText(logAccess.Name()) == "log" && logAccess.Expression.Kind == shimast.KindIdentifier && shimast.NodeText(logAccess.Expression) == ctxName {
+						if staticLogIDs[call] != 0 {
+							hasStaticMessage = true
+						} else {
+							hasDynamicMessage = true
+						}
 						if capacityKnown && capacity < 0xffff {
 							capacity++
 						} else {
@@ -153,7 +166,14 @@ func analyzeOpFunction(fn *shimast.Node) uint32 {
 	if !capacityKnown {
 		capacity = 0
 	}
-	return runtimeHintAnalyzed | caps | capacity
+	messageHint := runtimeHintMessageStatic
+	if hasDynamicMessage {
+		messageHint = runtimeHintMessageDynamic
+		if hasStaticMessage {
+			messageHint = runtimeHintMessageMixed
+		}
+	}
+	return runtimeHintAnalyzed | messageHint | caps | capacity
 }
 
 func literalLogMessage(node *shimast.Node) (string, bool) {
@@ -171,7 +191,7 @@ func literalLogMessage(node *shimast.Node) (string, bool) {
 // analyzeOpCompileMetadata derives only runtime execution hints. Static log
 // vocabulary is whole-program metadata collected independently of Op nesting.
 func (t *fileTransformer) analyzeOpCompileMetadata(fn *shimast.Node) opCompileAnalysis {
-	return opCompileAnalysis{runtimeHint: analyzeOpFunction(fn)}
+	return opCompileAnalysis{runtimeHint: analyzeOpFunction(fn, t.staticLogIDs)}
 }
 
 func isClosedWorldCapabilityUse(access *shimast.Node, name string) bool {
@@ -290,7 +310,7 @@ func hasLmaoCallProvenance(chk *shimchecker.Checker, call *shimast.CallExpressio
 	return signature != nil && isLmaoDeclarationNode(signature.Declaration())
 }
 
-func (t *fileTransformer) collectOptimizations(root *shimast.Node) []hintRewrite {
+func (t *fileTransformer) collectOptimizations(root *shimast.Node, emitHints bool) []hintRewrite {
 	if t.checker == nil {
 		return nil
 	}
@@ -302,22 +322,27 @@ func (t *fileTransformer) collectOptimizations(root *shimast.Node) []hintRewrite
 		}
 		if node.Kind == shimast.KindCallExpression {
 			call := node.AsCallExpression()
-			t.collectLogVocabulary(call)
+			if !emitHints {
+				t.collectLogVocabulary(call)
+			}
 			_, name := calleeNames(call)
 			provenLmaoCall := hasLmaoCallProvenance(t.checker, call)
 			switch name {
 			case "defineOp":
-				if provenLmaoCall && len(call.Arguments.Nodes) >= 2 && len(call.Arguments.Nodes) < 4 && isNamedType(t.checker, call.AsNode(), "Op") {
+				if emitHints && provenLmaoCall && len(call.Arguments.Nodes) >= 2 && len(call.Arguments.Nodes) < 4 && isNamedType(t.checker, call.AsNode(), "Op") {
 					hints = append(hints, hintRewrite{call: call, single: t.analyzeOpCompileMetadata(call.Arguments.Nodes[1])})
 				}
 			case "defineOps":
-				if provenLmaoCall && len(call.Arguments.Nodes) == 1 && call.Arguments.Nodes[0].Kind == shimast.KindObjectLiteralExpression && isNamedType(t.checker, call.AsNode(), "OpGroup") {
+				if emitHints && provenLmaoCall && len(call.Arguments.Nodes) == 1 && call.Arguments.Nodes[0].Kind == shimast.KindObjectLiteralExpression && isNamedType(t.checker, call.AsNode(), "OpGroup") {
 					group := collectDefineOpsHints(t, call.Arguments.Nodes[0].AsObjectLiteralExpression())
 					if len(group) > 0 {
 						hints = append(hints, hintRewrite{call: call, hints: group, isGroup: true})
 					}
 				}
 			case "span":
+				if emitHints {
+					break
+				}
 				recv, _ := calleeNames(call)
 				if recv != nil && len(call.Arguments.Nodes) >= 2 && len(call.Arguments.Nodes) <= 10 &&
 					(recv.Kind == shimast.KindIdentifier || recv.Kind == shimast.KindThisKeyword) {

@@ -58,6 +58,13 @@ async function main(): Promise<void> {
   const result = await tracer.trace('structured-log-parity-root', structuredLogOp);
   const root = tracer.rootBuffers[0];
   if (!root) throw new Error('Structured logging fixture produced no trace');
+  if (
+    root._messageLayoutFamily !== 'mixed' ||
+    root._logHeaders === undefined ||
+    root.message_values === undefined
+  ) {
+    throw new Error(`Structured logging fixture requires mixed message storage, received ${root._messageLayoutFamily}`);
+  }
 
   const facts = extractFacts(root, { tagFields: ['userId', 'elapsedMs', 'region'] });
   const logHeaders = Array.from(root._logHeaders.subarray(0, root._writeIndex));

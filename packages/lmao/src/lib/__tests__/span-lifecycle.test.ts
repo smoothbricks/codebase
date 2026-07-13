@@ -8,6 +8,7 @@ import { Nanoseconds } from '@smoothbricks/arrow-builder';
 import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { defineCodeError } from '../result.js';
+import { resolveMessage } from '../resolveMessage.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import {
@@ -530,7 +531,7 @@ describe('Fixed Row Layout', () => {
       throw new Error('capturedBuffer is undefined');
     }
 
-    expect(capturedBuffer.message_values[1]).toBe('completed');
+    expect(resolveMessage(capturedBuffer, 1)).toBe('completed');
     expect(capturedBuffer.userId_values[1]).toBe('user-1');
     expect(capturedBuffer.operation_values[1]).toBe(0);
     expect(capturedBuffer.line_values[1]).toBe(42);
@@ -554,7 +555,7 @@ describe('Fixed Row Layout', () => {
       throw new Error('capturedBuffer is undefined');
     }
 
-    expect(capturedBuffer.message_values[1]).toBe('failed');
+    expect(resolveMessage(capturedBuffer, 1)).toBe('failed');
     expect(capturedBuffer.userId_values[1]).toBe('user-2');
     expect(capturedBuffer.error_code_values[1]).toBe('VALIDATION_ERROR');
     expect(capturedBuffer.line_values[1]).toBe(99);

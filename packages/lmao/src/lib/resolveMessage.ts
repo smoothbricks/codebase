@@ -27,11 +27,20 @@ function decodeVocabularyMessage(generation: VocabularyGeneration, denseIndex: n
 
 /** Resolve one dynamic or process-dense vocabulary message row. */
 export function resolveMessage(buffer: AnySpanBuffer, row: number): string | undefined {
-  const header = buffer._logHeaders[row];
-  if (header === 0) return buffer.message_values[row];
-  const headerEntryType = header & 0xff;
-  if (headerEntryType !== buffer.entry_type[row]) {
-    throw new Error(`Log header entry type ${headerEntryType} does not match row ${row}`);
+  if (row === 0 && buffer._spanName !== undefined) {
+    return typeof buffer._spanName === 'number'
+      ? decodeVocabularyMessage(buffer._vocabularyGeneration, buffer._spanName)
+      : buffer._spanName;
   }
-  return decodeVocabularyMessage(buffer._vocabularyGeneration, header >>> 8);
+  if (row === 1 && buffer._terminalMessage !== undefined) return buffer._terminalMessage;
+
+  const header = buffer._logHeaders?.[row] ?? 0;
+  if (header !== 0) {
+    const headerEntryType = header & 0xff;
+    if (headerEntryType !== buffer.entry_type[row]) {
+      throw new Error(`Log header entry type ${headerEntryType} does not match row ${row}`);
+    }
+    return decodeVocabularyMessage(buffer._vocabularyGeneration, header >>> 8);
+  }
+  return buffer.message_values?.[row];
 }

@@ -25,10 +25,16 @@
  * @module spanBuffer
  */
 
-import { type ColumnBufferExtension, DEFAULT_BUFFER_CAPACITY, getColumnBufferClass } from '@smoothbricks/arrow-builder';
+import {
+  type ColumnBufferExtension,
+  DEFAULT_BUFFER_CAPACITY,
+  getColumnBufferClass,
+  type SchemaWithMetadata,
+} from '@smoothbricks/arrow-builder';
 import { checkCapacityTuning } from './capacityTuning.js';
 import type { OpMetadata } from './opContext/opTypes.js';
-import type { LogSchema } from './schema/LogSchema.js';
+import { LogSchema } from './schema/LogSchema.js';
+import type { MessageLayoutFamily } from './runtimeHint.js';
 import { textEncoder } from './spanBufferHelpers.js';
 import type { SpanBufferStats } from './spanBufferStats.js';
 import { writeThreadIdToUint64Array } from './threadId.js';
@@ -139,6 +145,7 @@ export interface SpanBufferConstructor<T extends LogSchema = LogSchema> {
   // Static properties added after class generation
   readonly schema: T;
   readonly stats: SpanBufferStats;
+  readonly messageLayoutFamily: MessageLayoutFamily;
 }
 //#endregion smoo/lmao!n/spanbuffer-layout.class-signature
 
@@ -191,10 +198,12 @@ function getSpanBufferConstructorForBuffer<T extends LogSchema>(buffer: SpanBuff
 
 function createSpanBufferConstructor<T extends LogSchema>(
   schema: T,
+  messageLayoutFamily: MessageLayoutFamily,
   generatedClass: GeneratedSpanBufferClass<T>,
 ): SpanBufferConstructor<T> {
   return Object.assign(generatedClass, {
     schema,
+    messageLayoutFamily,
     stats: {
       capacity: DEFAULT_BUFFER_CAPACITY,
       totalWrites: 0,
@@ -207,7 +216,22 @@ function createSpanBufferConstructor<T extends LogSchema>(
  * Cache for generated SpanBuffer classes per schema.
  * Key is the schema object reference (WeakMap for GC).
  */
-const spanBufferClassCache = new WeakMap<LogSchema, SpanBufferConstructor>();
+const spanBufferClassCache = new WeakMap<LogSchema, Map<MessageLayoutFamily, SpanBufferConstructor>>();
+const staticStorageSchemas = new WeakMap<LogSchema, LogSchema>();
+
+function getStorageSchema(schema: LogSchema, messageLayoutFamily: MessageLayoutFamily): LogSchema {
+  if (messageLayoutFamily !== 'static-only') return schema;
+  let storageSchema = staticStorageSchemas.get(schema);
+  if (storageSchema === undefined) {
+    const fields: Record<string, SchemaWithMetadata> = {};
+    for (const [name, field] of schema._columns) {
+      if (name !== 'message') fields[name] = field;
+    }
+    storageSchema = new LogSchema(fields);
+    staticStorageSchemas.set(schema, storageSchema);
+  }
+  return storageSchema;
+}
 
 /**
  * Get or create a SpanBuffer class for the given schema.
@@ -222,9 +246,13 @@ const spanBufferClassCache = new WeakMap<LogSchema, SpanBufferConstructor>();
  * @returns SpanBufferConstructor with static schema and stats properties
  */
 //#region smoo/lmao!n/spanbuffer-layout.constructor
-export function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferConstructor<T> {
-  const cached = spanBufferClassCache.get(schema);
-  if (isSpanBufferConstructorForSchema(cached, schema)) {
+export function getSpanBufferClass<T extends LogSchema>(
+  schema: T,
+  messageLayoutFamily: MessageLayoutFamily = 'mixed',
+): SpanBufferConstructor<T> {
+  let familyClasses = spanBufferClassCache.get(schema);
+  const cached = familyClasses?.get(messageLayoutFamily);
+  if (isSpanBufferConstructorForSchema(cached, schema) && cached.messageLayoutFamily === messageLayoutFamily) {
     return cached;
   }
 
@@ -303,15 +331,18 @@ export function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferCo
        }
        const spanId = ++globalThis.globalSpanCounter;
 ` +
-      // Calculate system buffer size: timestamps (8 bytes * cap), entry type (1 byte * cap),
-      // and packed dense vocabulary log headers (4 bytes * cap).
-      // Align header and identity offsets for their TypedArray views.
-      `const logHeaderOffset = (requestedCapacity * 9 + 3) & ~3;
+      // Calculate exact system storage. Dynamic-only has no capacity-sized packed-header lane.
+      (messageLayoutFamily === 'dynamic-only'
+        ? `const systemSize = (requestedCapacity * 9 + 7) & ~7;
+       let systemBuffer;
+       let identityView;
+`
+        : `const logHeaderOffset = (requestedCapacity * 9 + 3) & ~3;
        const rawSystemSize = logHeaderOffset + requestedCapacity * 4;
        const systemSize = (rawSystemSize + 7) & ~7;
        let systemBuffer;
        let identityView;
-` +
+`) +
       // CHAINED BUFFER: overflow storage for same logical span - shares parent identity
       `if (isChained) {
           systemBuffer = new ArrayBuffer(systemSize);
@@ -341,23 +372,37 @@ export function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferCo
           identityView.set(traceIdUtf8, 13);
         }
 ` +
-      // Create TypedArray views for timestamps, entry types, and packed vocabulary log headers
+      // Create exact family views. Headerless buffers never create a header view.
       `const timestampView = new BigInt64Array(systemBuffer, 0, requestedCapacity);
        const entryTypeView = new Uint8Array(systemBuffer, requestedCapacity * 8, requestedCapacity);
-       const logHeaderView = new Uint32Array(systemBuffer, logHeaderOffset, requestedCapacity);
        timestampView.fill(0n);
        entryTypeView.fill(0);
-       logHeaderView.fill(0);
 ` +
+      (messageLayoutFamily === 'dynamic-only'
+        ? ''
+        : `       const logHeaderView = new Uint32Array(systemBuffer, logHeaderOffset, requestedCapacity);
+       logHeaderView.fill(0);
+`) +
       // Assign properties in optimal order for V8 in-object slots (see comment above)
       `this._writeIndex = 0;
        this._capacity = requestedCapacity;
        this._overflow = undefined;
        this.timestamp = timestampView;
        this.entry_type = entryTypeView;
-       this._logHeaders = logHeaderView;
-       this._vocabularyGeneration = vocabularyGeneration;
-       this._children = [];
+` +
+      (messageLayoutFamily === 'dynamic-only' ? '' : `       this._logHeaders = logHeaderView;
+`) +
+      `       this._vocabularyGeneration = vocabularyGeneration;
+` +
+      (messageLayoutFamily === 'static-only'
+        ? `       this._spanName = undefined;
+       this._terminalMessage = undefined;
+`
+        : messageLayoutFamily === 'dynamic-only'
+          ? `       this._spanName = undefined;
+`
+          : '') +
+      `       this._children = [];
        this._parent = isChained ? parent._parent : parent;
        this._traceRoot = traceRoot;
        this._scopeValues = parent ? parent._scopeValues : EMPTY_SCOPE;
@@ -428,6 +473,7 @@ export function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferCo
       this._parent?.copyThreadIdTo(dest, offset) ?? new DataView(dest.buffer, dest.byteOffset + offset).setBigUint64(0, 0n, true);
     }
     get _logSchema() { return this.constructor.schema; }
+    get _messageLayoutFamily() { return this.constructor.messageLayoutFamily; }
     get _columns() { return this.constructor.schema._columns; }
     get _stats() { return this.constructor.stats; }
     _sealStats() {
@@ -451,21 +497,29 @@ export function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferCo
       checkCapacityTuning(this.constructor.stats);
       return tracer.bufferStrategy.createOverflowBuffer(this);
     }
+    ${messageLayoutFamily === 'static-only' ? `message(pos, val) {
+      if (pos === 0) this._spanName = val;
+      else if (pos === 1) this._terminalMessage = val;
+      else throw new RangeError('Static-only buffers only accept raw system messages at rows 0 and 1');
+      return this;
+    }` : ''}
     `,
   };
 
   // Generate class with arrow-builder
-  const generatedClass = getColumnBufferClass(schema, extension);
+  const generatedClass = getColumnBufferClass(getStorageSchema(schema, messageLayoutFamily), extension);
   if (!isGeneratedSpanBufferClass<T>(generatedClass)) {
     throw new TypeError('Generated column buffer is missing SpanBuffer methods');
   }
 
   // Add static properties to the generated class
   // These are shared across all instances from the same defineOpContext
-  const SpanBufferClass = createSpanBufferConstructor(schema, generatedClass);
+  const SpanBufferClass = createSpanBufferConstructor(schema, messageLayoutFamily, generatedClass);
 
   // Cache for future use
-  spanBufferClassCache.set(schema, SpanBufferClass);
+  familyClasses ??= new Map();
+  familyClasses.set(messageLayoutFamily, SpanBufferClass);
+  spanBufferClassCache.set(schema, familyClasses);
 
   return SpanBufferClass;
 }

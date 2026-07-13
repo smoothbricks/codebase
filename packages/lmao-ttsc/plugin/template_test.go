@@ -33,6 +33,7 @@ export class SpanContext {
   readonly _buffer: { constructor: unknown; _opMetadata: unknown };
   readonly log: SpanLogger;
   ok(value: unknown): unknown;
+  ff(name: string): boolean;
   span(name: string, op: Op): Promise<unknown>;
 }
 export class Op {

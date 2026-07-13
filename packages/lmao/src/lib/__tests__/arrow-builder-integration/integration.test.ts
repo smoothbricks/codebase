@@ -7,6 +7,7 @@ import {
 } from '@smoothbricks/arrow-builder';
 import { convertToArrowTable, createSpanBuffer, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
 import { defineOpContext } from '../../defineOpContext.js';
+import { resolveMessage } from '../../resolveMessage.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { ENTRY_TYPE_INFO } from '../../schema/systemSchema.js';
 import { TestTracer } from '../../tracers/TestTracer.js';
@@ -332,7 +333,7 @@ describe('Buffer Integration', () => {
 
       // Verify buffer properly references schema via constructor
       expect(buffer._logSchema).toBe(schema);
-      expect(buffer.message_values[0]).toBe('context-integration');
+      expect(resolveMessage(buffer, 0)).toBe('context-integration');
 
       // Verify system metadata columns are accessible
       expect(buffer.span_id).toBeGreaterThan(0);
