@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -289,8 +290,6 @@ plan_type!(ForkPlan);
 plan_type!(CheckpointPlan);
 plan_type!(RestorePlan);
 plan_type!(RetirePlan);
-plan_type!(ReclaimPlan);
-plan_type!(StatsPlan);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Operation {
@@ -321,12 +320,6 @@ pub enum Operation {
         format: ImageFormat,
     },
     Retire {
-        workspace: WorkspaceName,
-    },
-    Reclaim {
-        workspace: WorkspaceName,
-    },
-    Stats {
         workspace: WorkspaceName,
     },
 }
@@ -390,8 +383,6 @@ pub trait LifecyclePlanner: Send + Sync {
         mode: RestoreMode,
     ) -> Result<RestorePlan, PlanError>;
     fn plan_retire(&self, workspace: &WorkspaceRef) -> Result<RetirePlan, PlanError>;
-    fn plan_reclaim(&self, workspace: &WorkspaceRef) -> Result<ReclaimPlan, PlanError>;
-    fn plan_stats(&self, workspace: &WorkspaceRef) -> Result<StatsPlan, PlanError>;
 }
 
 fn destination_expected(
@@ -513,29 +504,6 @@ impl LifecyclePlanner for PurePlanner {
             },
         })
     }
-    fn plan_reclaim(&self, workspace: &WorkspaceRef) -> Result<ReclaimPlan, PlanError> {
-        if workspace.name.is_main() {
-            return Err(PlanError::MainIsPermanent);
-        }
-        let mut retired = ExpectedState::active(workspace);
-        if let ExpectedState::Exists { retired, .. } = &mut retired {
-            *retired = true;
-        }
-        Ok(ReclaimPlan {
-            expected: vec![retired],
-            operation: Operation::Reclaim {
-                workspace: workspace.name.clone(),
-            },
-        })
-    }
-    fn plan_stats(&self, workspace: &WorkspaceRef) -> Result<StatsPlan, PlanError> {
-        Ok(StatsPlan {
-            expected: vec![ExpectedState::active(workspace)],
-            operation: Operation::Stats {
-                workspace: workspace.name.clone(),
-            },
-        })
-    }
 }
 
 pub trait ImmutablePlan: Send + Sync {
@@ -550,14 +518,36 @@ immutable_plan!(
     CheckpointPlan,
     RestorePlan,
     RetirePlan,
-    ReclaimPlan,
-    StatsPlan
 );
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LifecycleReceipt {
     pub workspace: WorkspaceRef,
     pub resulting_revision: Revision,
+}
+
+/// Stable identity returned by retirement and consumed by reclamation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetiredRef {
+    workspace: WorkspaceRef,
+    resulting_revision: Revision,
+}
+
+impl RetiredRef {
+    pub fn new(workspace: WorkspaceRef, resulting_revision: Revision) -> Self {
+        Self {
+            workspace,
+            resulting_revision,
+        }
+    }
+
+    pub fn workspace(&self) -> &WorkspaceRef {
+        &self.workspace
+    }
+
+    pub const fn resulting_revision(&self) -> Revision {
+        self.resulting_revision
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RestoreReceipt {
@@ -607,17 +597,29 @@ pub fn derive_workspaces(
     storage: impl IntoIterator<Item = StorageFact>,
     mounts: impl IntoIterator<Item = KernelMountFact>,
 ) -> Result<Vec<DerivedWorkspace>, DerivationError> {
+    let storage: Vec<_> = storage.into_iter().collect();
+    let mut seen_workspaces = BTreeSet::new();
+    let mut seen_volume_names = BTreeSet::new();
+    for fact in &storage {
+        let workspace_key = (&fact.workspace.repo, &fact.workspace.name);
+        if !seen_workspaces.insert(workspace_key) {
+            return Err(DerivationError::DuplicateWorkspace(
+                fact.workspace.name.clone(),
+            ));
+        }
+        if !seen_volume_names.insert(fact.volume_name.as_str()) {
+            return Err(DerivationError::DuplicateVolumeName(
+                fact.volume_name.clone(),
+            ));
+        }
+    }
+
     let mounts: BTreeMap<_, _> = mounts
         .into_iter()
         .map(|mount| (mount.volume_name, mount.mount_id))
         .collect();
-    let mut seen = BTreeSet::new();
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(storage.len());
     for fact in storage {
-        let key = (fact.workspace.repo.clone(), fact.workspace.name.clone());
-        if !seen.insert(key) {
-            return Err(DerivationError::DuplicateWorkspace(fact.workspace.name));
-        }
         let mount_state = mounts
             .get(&fact.volume_name)
             .copied()
@@ -637,6 +639,8 @@ pub fn derive_workspaces(
 pub enum DerivationError {
     #[error("duplicate canonical workspace {0}")]
     DuplicateWorkspace(WorkspaceName),
+    #[error("duplicate canonical volume name {0}")]
+    DuplicateVolumeName(String),
 }
 
 /// Dispatch a blocking command or filesystem operation away from async runtime workers.
@@ -703,15 +707,16 @@ pub trait Substrate: LifecyclePlanner {
     type Error: Send;
     async fn execute_adopt(&self, plan: AdoptPlan) -> Result<LifecycleReceipt, Self::Error>;
     async fn execute_create(&self, plan: CreatePlan) -> Result<LifecycleReceipt, Self::Error>;
-    async fn execute_fork(&self, plan: ForkPlan) -> Result<LifecycleReceipt, Self::Error>;
     async fn execute_checkpoint(&self, plan: CheckpointPlan) -> Result<CheckpointRef, Self::Error>;
     async fn execute_restore(&self, plan: RestorePlan) -> Result<RestoreReceipt, Self::Error>;
-    async fn execute_retire(&self, plan: RetirePlan) -> Result<LifecycleReceipt, Self::Error>;
-    async fn execute_reclaim(&self, plan: ReclaimPlan) -> Result<(), Self::Error>;
-    async fn execute_stats(&self, plan: StatsPlan) -> Result<SubstrateStats, Self::Error>;
-    async fn list(&self, repo: &RepoId) -> Result<Vec<DerivedWorkspace>, Self::Error>;
+    async fn execute_fork(&self, plan: ForkPlan) -> Result<LifecycleReceipt, Self::Error>;
+    async fn execute_retire(&self, plan: RetirePlan) -> Result<RetiredRef, Self::Error>;
+    async fn reclaim(&self, retired: RetiredRef) -> Result<(), Self::Error>;
+    async fn list(&self, repo: &RepoId) -> Result<Vec<WorkspaceRef>, Self::Error>;
     async fn mount_state(&self, workspace: &WorkspaceRef) -> Result<MountState, Self::Error>;
-    async fn ensure_mounted(&self, workspace: &WorkspaceRef) -> Result<(), Self::Error>;
+    async fn ensure_mounted(&self, workspace: &WorkspaceRef) -> Result<PathBuf, Self::Error>;
     async fn unmount(&self, workspace: &WorkspaceRef) -> Result<(), Self::Error>;
+    async fn caches_root(&self) -> Result<PathBuf, Self::Error>;
+    async fn stats(&self, workspace: &WorkspaceRef) -> Result<SubstrateStats, Self::Error>;
     async fn gc(&self) -> Result<GcReport, Self::Error>;
 }

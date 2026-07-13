@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::ThreadId;
 
@@ -144,6 +145,191 @@ fn backend(actual: Vec<ObservedState>) -> SpyBackend {
     }
 }
 
+struct ContractSubstrate {
+    workspace: WorkspaceRef,
+}
+
+impl LifecyclePlanner for ContractSubstrate {
+    fn plan_adopt(&self, request: AdoptRequest) -> Result<AdoptPlan, PlanError> {
+        PurePlanner.plan_adopt(request)
+    }
+
+    fn plan_create(
+        &self,
+        from: &WorkspaceRef,
+        destination: Destination,
+    ) -> Result<CreatePlan, PlanError> {
+        PurePlanner.plan_create(from, destination)
+    }
+
+    fn plan_fork(
+        &self,
+        from: &WorkspaceRef,
+        destination: Destination,
+    ) -> Result<ForkPlan, PlanError> {
+        PurePlanner.plan_fork(from, destination)
+    }
+
+    fn plan_checkpoint(
+        &self,
+        workspace: &WorkspaceRef,
+        label: CheckpointLabel,
+        pin: Pin,
+    ) -> Result<CheckpointPlan, PlanError> {
+        PurePlanner.plan_checkpoint(workspace, label, pin)
+    }
+
+    fn plan_restore(
+        &self,
+        workspace: &WorkspaceRef,
+        checkpoint: &CheckpointRef,
+        mode: RestoreMode,
+    ) -> Result<RestorePlan, PlanError> {
+        PurePlanner.plan_restore(workspace, checkpoint, mode)
+    }
+
+    fn plan_retire(&self, workspace: &WorkspaceRef) -> Result<RetirePlan, PlanError> {
+        PurePlanner.plan_retire(workspace)
+    }
+}
+
+#[async_trait]
+impl Substrate for ContractSubstrate {
+    type Error = &'static str;
+
+    async fn execute_adopt(&self, _: AdoptPlan) -> Result<LifecycleReceipt, Self::Error> {
+        Err("not exercised")
+    }
+
+    async fn execute_create(&self, _: CreatePlan) -> Result<LifecycleReceipt, Self::Error> {
+        Err("not exercised")
+    }
+
+    async fn execute_checkpoint(&self, _: CheckpointPlan) -> Result<CheckpointRef, Self::Error> {
+        Err("not exercised")
+    }
+
+    async fn execute_restore(&self, _: RestorePlan) -> Result<RestoreReceipt, Self::Error> {
+        Err("not exercised")
+    }
+
+    async fn execute_fork(&self, _: ForkPlan) -> Result<LifecycleReceipt, Self::Error> {
+        Err("not exercised")
+    }
+
+    async fn execute_retire(&self, plan: RetirePlan) -> Result<RetiredRef, Self::Error> {
+        match plan.operation() {
+            Operation::Retire { workspace } if workspace == self.workspace.name() => {
+                Ok(RetiredRef::new(
+                    self.workspace.clone(),
+                    Revision::new(self.workspace.revision().get() + 1),
+                ))
+            }
+            _ => Err("wrong retirement plan"),
+        }
+    }
+
+    async fn reclaim(&self, retired: RetiredRef) -> Result<(), Self::Error> {
+        if retired.workspace() == &self.workspace
+            && retired.resulting_revision().get() == self.workspace.revision().get() + 1
+        {
+            Ok(())
+        } else {
+            Err("wrong retired identity")
+        }
+    }
+
+    async fn list(&self, repo: &RepoId) -> Result<Vec<WorkspaceRef>, Self::Error> {
+        if repo == self.workspace.repo() {
+            Ok(vec![self.workspace.clone()])
+        } else {
+            Err("wrong repository")
+        }
+    }
+
+    async fn mount_state(&self, workspace: &WorkspaceRef) -> Result<MountState, Self::Error> {
+        if workspace == &self.workspace {
+            Ok(MountState::Mounted { mount_id: 77 })
+        } else {
+            Err("wrong workspace")
+        }
+    }
+
+    async fn ensure_mounted(&self, workspace: &WorkspaceRef) -> Result<PathBuf, Self::Error> {
+        if workspace == &self.workspace {
+            Ok(PathBuf::from("/canonical").join(workspace.name().as_str()))
+        } else {
+            Err("wrong workspace")
+        }
+    }
+
+    async fn unmount(&self, workspace: &WorkspaceRef) -> Result<(), Self::Error> {
+        if workspace == &self.workspace {
+            Ok(())
+        } else {
+            Err("wrong workspace")
+        }
+    }
+
+    async fn caches_root(&self) -> Result<PathBuf, Self::Error> {
+        Ok(PathBuf::from("/canonical/caches"))
+    }
+
+    async fn stats(&self, workspace: &WorkspaceRef) -> Result<SubstrateStats, Self::Error> {
+        if workspace == &self.workspace {
+            Ok(SubstrateStats {
+                logical_bytes: workspace.revision().get(),
+                allocated_bytes: workspace.topology_revision().get(),
+                checkpoint_count: 2,
+            })
+        } else {
+            Err("wrong workspace")
+        }
+    }
+
+    async fn gc(&self) -> Result<GcReport, Self::Error> {
+        Ok(GcReport::default())
+    }
+}
+
+#[tokio::test]
+async fn finalized_substrate_surface_returns_direct_values_and_canonical_paths() {
+    let ws = workspace("topic", 3, 5);
+    let substrate = ContractSubstrate {
+        workspace: ws.clone(),
+    };
+
+    assert_eq!(substrate.list(&repo()).await.unwrap(), vec![ws.clone()]);
+    assert_eq!(
+        substrate.mount_state(&ws).await.unwrap(),
+        MountState::Mounted { mount_id: 77 }
+    );
+    assert_eq!(
+        substrate.ensure_mounted(&ws).await.unwrap(),
+        PathBuf::from("/canonical/topic")
+    );
+    assert_eq!(
+        substrate.caches_root().await.unwrap(),
+        PathBuf::from("/canonical/caches")
+    );
+    assert_eq!(
+        substrate.stats(&ws).await.unwrap(),
+        SubstrateStats {
+            logical_bytes: 3,
+            allocated_bytes: 5,
+            checkpoint_count: 2,
+        }
+    );
+
+    let retired = substrate
+        .execute_retire(substrate.plan_retire(&ws).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(retired.workspace(), &ws);
+    assert_eq!(retired.resulting_revision(), Revision::new(4));
+    assert_eq!(substrate.reclaim(retired).await, Ok(()));
+}
+
 #[test]
 fn value_accessors_and_every_fact_field_are_observable() {
     assert_eq!(Revision::new(42).get(), 42);
@@ -267,7 +453,7 @@ fn restore_rejects_each_checkpoint_identity_mismatch() {
 
 #[tokio::test]
 async fn execute_acquires_rereads_revalidates_then_mutates() {
-    let plan = PurePlanner.plan_stats(&workspace("topic", 3, 5)).unwrap();
+    let plan = PurePlanner.plan_retire(&workspace("topic", 3, 5)).unwrap();
     let spy = backend(plan.expected().iter().map(observed).collect());
     execute_checked(&spy, &plan).await.unwrap();
     assert_eq!(spy.acquired.load(Ordering::SeqCst), 1);
@@ -340,6 +526,42 @@ async fn blocking_work_is_dispatched_off_the_async_worker() {
     assert_ne!(runtime_worker, blocking_worker);
 }
 
+#[test]
+fn duplicate_canonical_volume_names_are_rejected_before_mount_joining() {
+    let storage = || {
+        vec![
+            StorageFact {
+                workspace: workspace("alpha", 0, 0),
+                volume_name: "shared-volume".to_owned(),
+            },
+            StorageFact {
+                workspace: workspace("beta", 0, 0),
+                volume_name: "shared-volume".to_owned(),
+            },
+        ]
+    };
+    let mount_tables = [
+        vec![],
+        vec![KernelMountFact {
+            mount_id: 41,
+            volume_name: "shared-volume".to_owned(),
+        }],
+        vec![KernelMountFact {
+            mount_id: 42,
+            volume_name: "unrelated-volume".to_owned(),
+        }],
+    ];
+
+    for mounts in mount_tables {
+        assert_eq!(
+            derive_workspaces(storage(), mounts),
+            Err(DerivationError::DuplicateVolumeName(
+                "shared-volume".to_owned()
+            ))
+        );
+    }
+}
+
 proptest! {
     #[test]
     fn generated_plans_are_deterministic(revision in any::<u64>(), topology in any::<u64>(), suffix in 0u16..1000) {
@@ -359,5 +581,35 @@ proptest! {
             let expected = if mounted.contains(&index) { MountState::Mounted { mount_id: u64::from(index) + 100 } } else { MountState::Detached };
             prop_assert_eq!(item.mount_state, expected);
         }
+    }
+
+    #[test]
+    fn generated_ambiguous_volume_names_are_rejected(
+        left in 0u16..1000,
+        right in 0u16..1000,
+        volume in any::<u64>(),
+        mount_id in any::<u64>(),
+    ) {
+        prop_assume!(left != right);
+        let volume_name = format!("volume-{volume}");
+        let storage = vec![
+            StorageFact {
+                workspace: workspace(&format!("left-{left}"), 0, 0),
+                volume_name: volume_name.clone(),
+            },
+            StorageFact {
+                workspace: workspace(&format!("right-{right}"), 0, 0),
+                volume_name: volume_name.clone(),
+            },
+        ];
+        let mounts = vec![KernelMountFact {
+            mount_id,
+            volume_name: volume_name.clone(),
+        }];
+
+        prop_assert_eq!(
+            derive_workspaces(storage, mounts),
+            Err(DerivationError::DuplicateVolumeName(volume_name))
+        );
     }
 }
