@@ -526,7 +526,7 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
         ),
     )
     .expect("compile-fail manifest");
-    let cases: [(&str, &str, &[&str]); 5] = [
+    let cases: [(&str, &str, &[&str]); 6] = [
         (
             "project_authority",
             "use cowshed_core::Project;\nfn deny(value: &Project) { value.attach(); value.exec(); value.grant(); value.gc(); }\nfn main() {}\n",
@@ -556,7 +556,18 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
         (
             "private_construction",
             "use cowshed_core::{CoordinatorToken,Cowshed,Project,WorkspaceHandle};\nfn main() { let _ = Cowshed {}; let _ = Project {}; let _ = WorkspaceHandle {}; let _ = CoordinatorToken {}; }\n",
-            &["Cowshed", "Project", "WorkspaceHandle", "CoordinatorToken"],
+            &[
+                "Cowshed",
+                "Project",
+                "WorkspaceHandle",
+                "CoordinatorToken",
+                "private",
+            ],
+        ),
+        (
+            "port_block_construction",
+            "use cowshed_core::api::PortBlock;\nfn main() { let _ = PortBlock { base: 40960, size: 16 }; }\n",
+            &["PortBlock", "private"],
         ),
         (
             "null_success",
