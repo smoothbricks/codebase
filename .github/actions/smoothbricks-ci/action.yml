@@ -26,9 +26,11 @@ runs:
     - name: 🔎 Resolve mode
       id: resolve
       shell: bash
+      env:
+        SMOOTHBRICKS_CI_MODE: ${{ inputs.mode }}
       run: |
         set -euo pipefail
-        requested='${{ inputs.mode }}'
+        requested="$SMOOTHBRICKS_CI_MODE"
         case "$requested" in
           github|cowshed|auto) ;;
           *) echo "smoothbricks-ci: invalid mode '$requested' (expected auto|github|cowshed)" >&2; exit 2 ;;
