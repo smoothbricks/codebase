@@ -1,16 +1,7 @@
 //! Warm, copy-on-write workspaces with explicit controller authority.
 
-pub mod api {
-    pub mod capability;
-    pub mod dto;
-
-    pub use capability::{
-        Coordinator, CoordinatorToken, Cowshed, JobAttachment, JobHandle, JobStdin, JobStream,
-        Project, RawByteStream, Session, WorkspaceHandle, WorkspaceRef,
-    };
-    pub use dto::*;
-}
 pub mod apfs;
+pub mod api;
 pub mod copy;
 pub mod error;
 pub mod exec;
