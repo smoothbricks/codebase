@@ -14,7 +14,7 @@
  */
 
 import type { PreEncodedEntry } from '@smoothbricks/arrow-builder';
-import type { RemappedViewConstructor } from './logBinding.js';
+import type { RemapDescriptor } from './logBinding.js';
 import type { SpanContext } from './opContext/spanContextTypes.js';
 import type { OpContext, OpContextBinding } from './opContext/types.js';
 import { getPhysicalLayoutPlan, type PhysicalLayoutPlan } from './physicalLayoutPlan.js';
@@ -94,7 +94,7 @@ export interface OpMetadata {
  *
  * Phase 2 architecture:
  * - SpanBufferClass carries static schema + stats (shared by all ops from same defineOpContext)
- * - remappedViewClass only set for prefixed ops (wraps child buffers before adding to _children)
+ * - remapDescriptor is immutable cold-path metadata for prefixed/mapped ops
  * - No LogBinding - stats accessed via SpanBufferClass.stats
  *
  * @typeParam Ctx - OpContext with deps, ff, env (contravariant position)
@@ -107,7 +107,7 @@ export class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
   readonly physicalLayoutPlan: PhysicalLayoutPlan<Ctx['logSchema']>;
   readonly SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>;
   readonly fn: (ctx: SpanContext<Ctx>, ...args: Args) => Result<S, E> | Promise<Result<S, E>>;
-  readonly remappedViewClass?: RemappedViewConstructor;
+  readonly remapDescriptor?: RemapDescriptor;
   readonly _opContextBinding?: OpContextBinding;
   readonly runtimeHint: number;
 
@@ -115,16 +115,16 @@ export class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
     metadata: OpMetadata,
     SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
     fn: (ctx: SpanContext<Ctx>, ...args: Args) => Result<S, E> | Promise<Result<S, E>>,
-    remappedViewClass?: RemappedViewConstructor,
+    remapDescriptor?: RemapDescriptor,
     opContextBinding?: OpContextBinding,
     runtimeHint = 0,
   ) {
-    const physicalLayoutPlan = getPhysicalLayoutPlan(SpanBufferClass, runtimeHint);
+    const physicalLayoutPlan = getPhysicalLayoutPlan(SpanBufferClass, runtimeHint, remapDescriptor);
     this.physicalLayoutPlan = physicalLayoutPlan;
     this.metadata = Object.freeze({ ...metadata, _physicalLayoutPlan: physicalLayoutPlan });
     this.SpanBufferClass = physicalLayoutPlan.SpanBufferClass;
     this.fn = fn;
-    this.remappedViewClass = remappedViewClass;
+    this.remapDescriptor = remapDescriptor;
     this._opContextBinding = opContextBinding;
     this.runtimeHint = physicalLayoutPlan.runtimeHint;
   }

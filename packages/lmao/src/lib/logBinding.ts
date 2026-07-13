@@ -14,31 +14,23 @@
 
 import type { LogSchema } from './schema/LogSchema.js';
 
-// Type-only import keeps this file runtime-safe while preserving buffer shape information.
-type SpanBuffer = import('./types.js').AnySpanBuffer;
+/** Dense cold-path remap entry with schema and canonical storage property metadata. */
+export type RemappedColumn = readonly [
+  outputName: string,
+  sourceName: string,
+  schema: unknown,
+  valuesProperty: `${string}_values`,
+  nullsProperty: `${string}_nulls`,
+];
 
 /**
- * RemappedViewConstructor - Constructor type for RemappedBufferView classes.
- *
- * Generated at module composition time (cold path) by `generateRemappedBufferViewClass()`.
- * Used by prefixed modules to wrap SpanBuffer instances for Arrow conversion when
- * the module's schema columns have been renamed with a prefix.
- *
- * The constructor takes a raw SpanBuffer and returns a view that remaps column access
- * from prefixed names to unprefixed names for tree traversal during Arrow conversion.
- *
- * Per specs/lmao/01e_library_integration_pattern.md:
- * - Hot path: Library writes directly to unprefixed columns (zero overhead)
- * - Cold path: Arrow conversion uses RemappedBufferView to access via prefixed names
+ * Immutable metadata interpreted only by cold Arrow conversion.
+ * Child SpanBuffers retain their canonical schema and storage layout.
  */
-export type RemappedViewConstructor = new (buffer: SpanBuffer) => SpanBuffer;
-
-/** A remapped output column and its schema. */
-export type RemappedColumn = readonly [outputName: string, schema: unknown];
-
-/** Immutable output-to-source metadata reserved by a PhysicalLayoutPlan. */
 export interface RemapDescriptor {
+  /** Fully composed output-name to canonical source-name lookup. */
   readonly sourceNames: Readonly<Record<string, string>>;
+  /** Dense output/source/schema entries in deterministic composition order. */
   readonly columns: readonly RemappedColumn[];
 }
 
@@ -56,24 +48,14 @@ export interface RemapDescriptor {
  * - 01b2_buffer_self_tuning.md - Self-tuning via SpanBufferClass.stats
  * - 01e_library_integration_pattern.md - Library prefix/remapping support
  *
- * @property logSchema - The unprefixed schema defining what columns can be written.
- *   This is the canonical schema. Column names in remappedViewClass will be prefixed versions
- *   of these field names when a prefix or column mapping has been applied.
- *
- * @property remappedViewClass - Optional RemappedBufferView class for prefixed/remapped buffers.
- *   - When present: the module's ops write to unprefixed columns, but buffers must be wrapped
- *     in this view for Arrow conversion to access them by prefixed names
- *   - When absent: buffers can be used directly without remapping
- *   - Set during module composition when prefix() or mapColumns() is applied (cold path)
- *   - Used when registering child spans to parent's tree (see op.ts)
+ * @property remapDescriptor - Optional immutable output-to-source metadata for
+ *   prefixed/remapped buffers. Ops attach the descriptor pointer to raw child
+ *   buffers; cold Arrow traversal interprets it without wrapping the buffer.
  */
 export interface LogBinding<T extends LogSchema = LogSchema> {
   /** The unprefixed schema defining what columns exist */
   readonly logSchema: T;
 
-  /** Optional RemappedBufferView class for prefixed/remapped buffers */
-  readonly remappedViewClass?: RemappedViewConstructor;
-
-  /** Immutable cold-path remap binding owned by a physical layout plan. */
+  /** Optional immutable remapping metadata for cold Arrow conversion. */
   readonly remapDescriptor?: RemapDescriptor;
 }

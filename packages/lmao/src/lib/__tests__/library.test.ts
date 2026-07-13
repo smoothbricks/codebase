@@ -6,7 +6,7 @@
  * - Prefix application for library composition
  * - Dependency wiring with .use()
  * - Clean API with prefixed column storage
- * - RemappedBufferView for Arrow conversion
+ * - Immutable remap descriptors for Arrow conversion
  * - Collision detection and type safety
  * - Library composition scenarios
  * - End-to-end integration verification
@@ -16,15 +16,15 @@ import { describe, expect, it } from 'bun:test';
 import { defineOpContext } from '../defineOpContext.js';
 import {
   createPrefixMapping,
+  createRemapDescriptor,
   createRemappedSpanLoggerClass,
-  generateRemappedBufferViewClass,
   generateRemappedSpanLoggerClass,
   type PrefixMapping,
   prefixSchema,
 } from '../library.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import { createBuffer, getMappedOpGroupInternals, getOpGroupInternals } from './test-helpers.js';
+import { getMappedOpGroupInternals, getOpGroupInternals } from './test-helpers.js';
 
 describe('Library Integration Pattern', () => {
   describe('Schema Prefixing', () => {
@@ -132,68 +132,30 @@ describe('Library Integration Pattern', () => {
     });
   });
 
-  describe('RemappedBufferView Generation', () => {
-    it('should generate valid RemappedBufferView class', () => {
-      const mapping: Record<string, string> = {
-        http_status: 'status',
-        http_method: 'method',
-      };
+  describe('Remap descriptor metadata', () => {
+    it('preserves composed output order and schema identity in immutable cold-path metadata', () => {
+      const schema = defineLogSchema({
+        status: S.number(),
+        method: S.enum(['GET', 'POST']),
+      });
 
-      const ViewClass = generateRemappedBufferViewClass(mapping);
+      const descriptor = createRemapDescriptor(schema, {
+        v1_api_method: 'method',
+        v1_api_status: 'status',
+      });
 
-      // Should create a callable constructor
-      expect(typeof ViewClass).toBe('function');
-
-      // Should cache same mapping
-      const ViewClass2 = generateRemappedBufferViewClass(mapping);
-      expect(ViewClass).toBe(ViewClass2); // Same cached instance
-    });
-
-    it('should handle empty prefix mapping', () => {
-      const mapping: Record<string, string> = {};
-      const ViewClass = generateRemappedBufferViewClass(mapping);
-
-      expect(typeof ViewClass).toBe('function');
-    });
-
-    it('should handle single field mapping', () => {
-      const mapping: Record<string, string> = {
-        http_status: 'status',
-      };
-      const ViewClass = generateRemappedBufferViewClass(mapping);
-
-      expect(typeof ViewClass).toBe('function');
-    });
-
-    it('should correctly map column access from prefixed to unprefixed', () => {
-      const mapping: Record<string, string> = {
-        http_status: 'status',
-        http_method: 'method',
-      };
-
-      const ViewClass = generateRemappedBufferViewClass(mapping);
-
-      const mockBuffer = createBuffer(
-        defineLogSchema({
-          status: S.number(),
-          method: S.category(),
-        }),
-      );
-      mockBuffer.status(0, 200);
-      mockBuffer._writeIndex = 1;
-
-      const mockValues = mockBuffer.getColumnIfAllocated('status');
-      const mockNulls = mockBuffer.getNullsIfAllocated('status');
-
-      const view = new ViewClass(mockBuffer);
-
-      // Should map prefixed to unprefixed
-      expect(view.getColumnIfAllocated('http_status')).toBe(mockValues);
-      expect(view.getNullsIfAllocated('http_status')).toBe(mockNulls);
-
-      // Should pass through unknown names
-      expect(view.getColumnIfAllocated('unknown')).toBeUndefined();
-      expect(view.getNullsIfAllocated('unknown')).toBeUndefined();
+      expect(descriptor.sourceNames).toEqual({
+        v1_api_method: 'method',
+        v1_api_status: 'status',
+      });
+      expect(descriptor.columns).toEqual([
+        ['v1_api_method', 'method', schema.fields.method, 'method_values', 'method_nulls'],
+        ['v1_api_status', 'status', schema.fields.status, 'status_values', 'status_nulls'],
+      ]);
+      expect(Object.isFrozen(descriptor)).toBe(true);
+      expect(Object.isFrozen(descriptor.sourceNames)).toBe(true);
+      expect(Object.isFrozen(descriptor.columns)).toBe(true);
+      expect(descriptor.columns.every(Object.isFrozen)).toBe(true);
     });
   });
 

@@ -57,6 +57,7 @@ import {
   getArrowFieldName,
   walkSpanTree,
 } from './arrow/utils.js';
+import type { RemapDescriptor } from './logBinding.js';
 import { resolveMessage } from './resolveMessage.js';
 import { ENTRY_TYPE_NAMES, SYSTEM_SCHEMA_FIELD_NAMES } from './schema/systemSchema.js';
 import { getBinaryEncoder, getEnumUtf8, getEnumValues, getSchemaType } from './schema/typeGuards.js';
@@ -69,6 +70,7 @@ const F64Array = Float64Array;
 
 type BuiltArrowColumn = { column: Column<unknown>; nullCount: number };
 type BuiltMetadataColumns = { fields: string[]; vectors: Column<unknown>[] };
+type RemapsByBuffer = WeakMap<AnySpanBuffer, RemapDescriptor>;
 
 export type SystemColumnBuilder = (
   buffer: AnySpanBuffer,
@@ -174,16 +176,30 @@ function appendTables(base: Table, extra: Table): Table {
   return tableFromColumns(columns);
 }
 
-function getAllocatedStringColumn(buffer: AnySpanBuffer, columnName: string): string[] | undefined {
-  const column = buffer.getColumnIfAllocated(columnName);
+function resolveColumnName(buffer: AnySpanBuffer, outputName: string, remaps: RemapsByBuffer): string {
+  return remaps.get(buffer)?.sourceNames[outputName] ?? outputName;
+}
+
+function getAllocatedStringColumn(
+  buffer: AnySpanBuffer,
+  columnName: string,
+  remaps?: RemapsByBuffer,
+): string[] | undefined {
+  const sourceName = remaps ? resolveColumnName(buffer, columnName, remaps) : columnName;
+  const column = buffer.getColumnIfAllocated(sourceName);
   if (!Array.isArray(column)) {
     return undefined;
   }
   return isStringArray(column) ? column : undefined;
 }
 
-function getAllocatedBinaryColumn(buffer: AnySpanBuffer, columnName: string): unknown[] | undefined {
-  const column = buffer.getColumnIfAllocated(columnName);
+function getAllocatedBinaryColumn(
+  buffer: AnySpanBuffer,
+  columnName: string,
+  remaps?: RemapsByBuffer,
+): unknown[] | undefined {
+  const sourceName = remaps ? resolveColumnName(buffer, columnName, remaps) : columnName;
+  const column = buffer.getColumnIfAllocated(sourceName);
   return Array.isArray(column) ? column : undefined;
 }
 
@@ -192,18 +208,21 @@ function getAllocatedBinaryColumn(buffer: AnySpanBuffer, columnName: string): un
 // Arrow conversion. These typed readers pull from the buffer's immutable _scopeValues; the
 // per-column fill loops below call them so a row with a direct write keeps its value and scope
 // only fills the gaps.
-function getStringScopeValue(buffer: AnySpanBuffer, fieldName: string): string | undefined {
-  const value = buffer._scopeValues?.[fieldName];
+function getStringScopeValue(buffer: AnySpanBuffer, fieldName: string, remaps?: RemapsByBuffer): string | undefined {
+  const sourceName = remaps ? resolveColumnName(buffer, fieldName, remaps) : fieldName;
+  const value = buffer._scopeValues?.[sourceName];
   return typeof value === 'string' ? value : undefined;
 }
 
-function getNumberScopeValue(buffer: AnySpanBuffer, fieldName: string): number | undefined {
-  const value = buffer._scopeValues?.[fieldName];
+function getNumberScopeValue(buffer: AnySpanBuffer, fieldName: string, remaps?: RemapsByBuffer): number | undefined {
+  const sourceName = remaps ? resolveColumnName(buffer, fieldName, remaps) : fieldName;
+  const value = buffer._scopeValues?.[sourceName];
   return typeof value === 'number' ? value : undefined;
 }
 
-function getBooleanScopeValue(buffer: AnySpanBuffer, fieldName: string): boolean | undefined {
-  const value = buffer._scopeValues?.[fieldName];
+function getBooleanScopeValue(buffer: AnySpanBuffer, fieldName: string, remaps?: RemapsByBuffer): boolean | undefined {
+  const sourceName = remaps ? resolveColumnName(buffer, fieldName, remaps) : fieldName;
+  const value = buffer._scopeValues?.[sourceName];
   return typeof value === 'boolean' ? value : undefined;
 }
 //#endregion smoo/lmao!n/scope-attributes.arrow-fill
@@ -463,14 +482,16 @@ function buildBinaryColumnFromBuffers(
   columnName: string,
   totalRows: number,
   fieldSchema: unknown,
+  remaps?: RemapsByBuffer,
 ): BuiltArrowColumn {
   const encoder = getBinaryEncoder(fieldSchema);
 
   // Collect all values from buffers, encode each if encoder is present
   const allValues: (Uint8Array | null)[] = [];
   for (const buf of buffers) {
-    const col = getAllocatedBinaryColumn(buf, columnName);
-    const srcNulls = buf.getNullsIfAllocated(columnName);
+    const col = getAllocatedBinaryColumn(buf, columnName, remaps);
+    const sourceName = remaps ? resolveColumnName(buf, columnName, remaps) : columnName;
+    const srcNulls = buf.getNullsIfAllocated(sourceName);
     for (let i = 0; i < buf._writeIndex; i++) {
       if (srcNulls) {
         const isValid = (srcNulls[i >>> 3] & (1 << (i & 7))) !== 0;
@@ -998,18 +1019,20 @@ export function convertSpanTreeToArrowTable(
   // (e.g., library prefixed schemas like db_query, http_status, etc.)
   // ═══════════════════════════════════════════════════════════════════════════
   const mergedSchemaFields = new Map<string, unknown>();
+  const remaps: RemapsByBuffer = new WeakMap();
 
-  walkSpanTree(rootBuffer, (buffer) => {
-    // Use buffer._columns directly - works for both SpanBuffer and RemappedBufferView
-    const fields = buffer._columns;
-    for (const [fieldName, fieldSchema] of fields) {
-      // Skip system schema fields - they are handled separately as system columns
-      // (message, line, error_code, exception_stack, ff_value, uint64_value)
-      if (SYSTEM_SCHEMA_FIELD_NAMES.has(fieldName)) {
-        continue;
+  walkSpanTree(rootBuffer, (buffer, remapDescriptor) => {
+    if (remapDescriptor) {
+      remaps.set(buffer, remapDescriptor);
+      for (const [fieldName, , fieldSchema] of remapDescriptor.columns) {
+        if (!SYSTEM_SCHEMA_FIELD_NAMES.has(fieldName) && !mergedSchemaFields.has(fieldName)) {
+          mergedSchemaFields.set(fieldName, fieldSchema);
+        }
       }
-      // Only add if not already present (first buffer with this field wins)
-      if (!mergedSchemaFields.has(fieldName)) {
+      return;
+    }
+    for (const [fieldName, fieldSchema] of buffer._columns) {
+      if (!SYSTEM_SCHEMA_FIELD_NAMES.has(fieldName) && !mergedSchemaFields.has(fieldName)) {
         mergedSchemaFields.set(fieldName, fieldSchema);
       }
     }
@@ -1089,7 +1112,7 @@ export function convertSpanTreeToArrowTable(
         }
         continue;
       }
-      const col = getAllocatedStringColumn(buffer, fieldName);
+      const col = getAllocatedStringColumn(buffer, fieldName, remaps);
       if (col) {
         for (let i = 0; i < buffer._writeIndex; i++) {
           const originalValue = col[i];
@@ -1105,7 +1128,7 @@ export function convertSpanTreeToArrowTable(
       }
       // Also add scope values to dictionary (they may not be in columns)
       // Per specs/lmao/01i_span_scope_attributes.md: scope values fill NULL cells at Arrow conversion
-      const scopeValue = getStringScopeValue(buffer, fieldName);
+      const scopeValue = getStringScopeValue(buffer, fieldName, remaps);
       if (scopeValue !== undefined) {
         let maskedScopeValue = originalToMasked.get(scopeValue);
         if (maskedScopeValue === undefined) {
@@ -1117,7 +1140,7 @@ export function convertSpanTreeToArrowTable(
     }
 
     for (const [fieldName, builder] of textBuilders) {
-      const col = getAllocatedStringColumn(buffer, fieldName);
+      const col = getAllocatedStringColumn(buffer, fieldName, remaps);
       const maskTransform = textMaskTransforms.get(fieldName);
       const originalToMasked = textOriginalToMasked.get(fieldName);
       if (!originalToMasked) {
@@ -1138,7 +1161,7 @@ export function convertSpanTreeToArrowTable(
       }
       // Also add scope values to dictionary (they may not be in columns)
       // Per specs/lmao/01i_span_scope_attributes.md: scope values fill NULL cells at Arrow conversion
-      const scopeValue = getStringScopeValue(buffer, fieldName);
+      const scopeValue = getStringScopeValue(buffer, fieldName, remaps);
       if (scopeValue !== undefined) {
         let maskedScopeValue = originalToMasked.get(scopeValue);
         if (maskedScopeValue === undefined) {
@@ -1222,6 +1245,7 @@ export function convertSpanTreeToArrowTable(
           schemaFields,
           categoryOriginalToMasked,
           textOriginalToMasked,
+          remaps,
         )
       : undefined;
 
@@ -1262,6 +1286,7 @@ function convertBuffersWithSharedDicts(
   schemaFields: Array<[string, unknown]>,
   categoryOriginalToMasked: Map<string, Map<string, string>>,
   textOriginalToMasked: Map<string, Map<string, string>>,
+  remaps: RemapsByBuffer,
 ): Table {
   const totalRows = buffers.reduce((sum, buf) => sum + buf._writeIndex, 0);
   const fields: string[] = [];
@@ -1435,9 +1460,9 @@ function convertBuffersWithSharedDicts(
 
       // Per specs/lmao/01i_span_scope_attributes.md: scope values fill NULL cells at Arrow conversion
       for (const buf of buffers) {
-        const col = getAllocatedStringColumn(buf, columnName);
+        const col = getAllocatedStringColumn(buf, columnName, remaps);
         // Check if this buffer has a scope value for this field
-        const scopeValue = getStringScopeValue(buf, fieldName);
+        const scopeValue = getStringScopeValue(buf, fieldName, remaps);
         let scopeEncodedValue: number | undefined;
         if (scopeValue !== undefined) {
           const maskedScopeValue = originalToMasked.get(scopeValue) ?? scopeValue;
@@ -1510,9 +1535,9 @@ function convertBuffersWithSharedDicts(
       let rowOffset = 0;
 
       for (const buf of buffers) {
-        const col = getAllocatedStringColumn(buf, columnName);
+        const col = getAllocatedStringColumn(buf, columnName, remaps);
         // Check if this buffer has a scope value for this field
-        const scopeValue = getStringScopeValue(buf, fieldName);
+        const scopeValue = getStringScopeValue(buf, fieldName, remaps);
         let scopeEncodedValue: number | undefined;
         if (scopeValue !== undefined) {
           const maskedScopeValue = originalToMasked.get(scopeValue) ?? scopeValue;
@@ -1581,10 +1606,11 @@ function convertBuffersWithSharedDicts(
       let rowOffset = 0;
 
       for (const buf of buffers) {
-        const col = buf.getColumnIfAllocated(columnName);
-        const srcNulls = buf.getNullsIfAllocated(columnName);
+        const sourceName = resolveColumnName(buf, columnName, remaps);
+        const col = buf.getColumnIfAllocated(sourceName);
+        const srcNulls = buf.getNullsIfAllocated(sourceName);
         // Check if this buffer has a scope value for this field
-        const scopeValue = getNumberScopeValue(buf, fieldName);
+        const scopeValue = getNumberScopeValue(buf, fieldName, remaps);
 
         if (col instanceof Float64Array) {
           allValues.set(col.subarray(0, buf._writeIndex), rowOffset);
@@ -1655,10 +1681,11 @@ function convertBuffersWithSharedDicts(
       let rowOffset = 0;
 
       for (const buf of buffers) {
-        const col = buf.getColumnIfAllocated(columnName);
-        const srcNulls = buf.getNullsIfAllocated(columnName);
+        const sourceName = resolveColumnName(buf, columnName, remaps);
+        const col = buf.getColumnIfAllocated(sourceName);
+        const srcNulls = buf.getNullsIfAllocated(sourceName);
         // Check if this buffer has a scope value for this field
-        const scopeValue = getBooleanScopeValue(buf, fieldName);
+        const scopeValue = getBooleanScopeValue(buf, fieldName, remaps);
 
         if (col instanceof Uint8Array) {
           // Copy boolean values bit by bit - can't avoid loop for bit-level operations
@@ -1746,10 +1773,11 @@ function convertBuffersWithSharedDicts(
       }
 
       for (const buf of buffers) {
-        const col = buf.getColumnIfAllocated(columnName);
-        const srcNulls = buf.getNullsIfAllocated(columnName);
+        const sourceName = resolveColumnName(buf, columnName, remaps);
+        const col = buf.getColumnIfAllocated(sourceName);
+        const srcNulls = buf.getNullsIfAllocated(sourceName);
         // Check if this buffer has a scope value for this field
-        const scopeValue = getStringScopeValue(buf, fieldName);
+        const scopeValue = getStringScopeValue(buf, fieldName, remaps);
         let scopeEncodedValue: number | undefined;
         if (scopeValue !== undefined) {
           scopeEncodedValue = enumValueToIndex.get(scopeValue);
@@ -1827,7 +1855,7 @@ function convertBuffersWithSharedDicts(
     } else if (lmaoType === 'binary') {
       // Binary columns: raw Uint8Array or encoder-wrapped values (e.g. msgpack)
       // Binary columns don't use dictionaries and are not scope-fillable
-      const { column } = buildBinaryColumnFromBuffers(buffers, columnName, totalRows, fieldSchema);
+      const { column } = buildBinaryColumnFromBuffers(buffers, columnName, totalRows, fieldSchema, remaps);
       fields.push(arrowFieldName);
       vectors.push(column);
     }
