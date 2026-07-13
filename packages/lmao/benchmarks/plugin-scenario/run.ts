@@ -1,15 +1,17 @@
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { createLmaoTransformer } from '@smoothbricks/lmao-transformer';
 import mitataPackage from 'mitata/package.json' with { type: 'json' };
-import ts from 'typescript';
 
 const MANIFEST_SCHEMA_VERSION = 1;
 const scenarioDirectory = dirname(fileURLToPath(import.meta.url));
 const workloadPath = join(scenarioDirectory, 'workload.ts');
 const projectRoot = resolve(scenarioDirectory, '../../../..');
 const lmaoNodeUrl = pathToFileURL(resolve(projectRoot, 'packages/lmao/src/node.ts')).href;
+const nativePluginPath = resolve(projectRoot, 'packages/lmao-ttsc/plugin.cjs');
+const nativeAdapterUrl = pathToFileURL(resolve(projectRoot, 'packages/lmao-ttsc/src/index.ts')).href;
+const lmaoTtscPackage = await Bun.file(resolve(projectRoot, 'packages/lmao-ttsc/package.json')).json();
+const { createBunTtscPlugin } = await import(nativeAdapterUrl);
 const textDecoder = new TextDecoder();
 
 type Variant = 'off' | 'on';
@@ -24,17 +26,15 @@ interface RunnerOptions {
   manifestOutput?: string;
 }
 
+interface TransformSignatureCounts {
+  runtimeHintSignatures: number;
+  directBufferWriteSignatures: number;
+  vocabularyRegistrationSignatures: number;
+}
+
 interface TransformProof {
-  off: {
-    injectedLineSignature: boolean;
-    monomorphicSpanSignature: boolean;
-    injectedLineOrMetadataSignature: boolean;
-  };
-  on: {
-    injectedLineSignature: boolean;
-    monomorphicSpanSignature: boolean;
-    injectedLineOrMetadataSignature: boolean;
-  };
+  off: TransformSignatureCounts;
+  on: TransformSignatureCounts;
 }
 
 interface Launch {
@@ -186,76 +186,82 @@ function assertDistinctOutputPaths(paths: string[]): void {
   }
 }
 
-function formatDiagnostics(diagnostics: readonly ts.Diagnostic[]): string {
-  return ts.formatDiagnosticsWithColorAndContext(diagnostics, {
-    getCanonicalFileName: (fileName) => fileName,
-    getCurrentDirectory: () => projectRoot,
-    getNewLine: () => '\n',
+async function compileWorkload(variant: Variant, projectPath: string, outputDirectory: string): Promise<string> {
+  const result = await Bun.build({
+    entrypoints: [workloadPath],
+    outdir: outputDirectory,
+    target: 'bun',
+    external: ['@smoothbricks/lmao', '@smoothbricks/lmao/node', 'mitata'],
+    minify: false,
+    sourcemap: 'none',
+    ...(variant === 'on'
+      ? {
+          plugins: [
+            createBunTtscPlugin({
+              project: projectPath,
+              plugins: [
+                {
+                  transform: nativePluginPath,
+                },
+              ],
+            }),
+          ],
+        }
+      : {}),
   });
-}
 
-function compileWorkload(source: string, transformed: boolean): string {
-  const compilerOptions: ts.CompilerOptions = {
-    module: ts.ModuleKind.ESNext,
-    target: ts.ScriptTarget.ESNext,
-  };
-  const transpileOptions: ts.TranspileOptions = {
-    compilerOptions,
-    fileName: workloadPath,
-    reportDiagnostics: true,
-  };
-  const result = transformed
-    ? ts.transpileModule(source, {
-        ...transpileOptions,
-        transformers: { before: [createLmaoTransformer({ projectRoot })] },
-      })
-    : ts.transpileModule(source, transpileOptions);
-
-  if (result.diagnostics !== undefined && result.diagnostics.length > 0) {
-    throw new Error(`Legacy TypeScript compilation failed:\n${formatDiagnostics(result.diagnostics)}`);
+  if (!result.success) {
+    throw new Error(
+      `${variant.toUpperCase()} native build failed:\n${result.logs.map((log) => log.message).join('\n')}`,
+    );
   }
-  const runtimeJavaScript = result.outputText
+  const emittedJavaScript = result.outputs.find((candidate) => candidate.path.endsWith('.js'));
+  if (emittedJavaScript === undefined) {
+    throw new Error(`${variant.toUpperCase()} native build emitted no JavaScript`);
+  }
+
+  const outputText = await emittedJavaScript.text();
+  const runtimeJavaScript = outputText
     .replaceAll('"@smoothbricks/lmao/node"', JSON.stringify(lmaoNodeUrl))
     .replaceAll("'@smoothbricks/lmao/node'", JSON.stringify(lmaoNodeUrl));
-  if (runtimeJavaScript === result.outputText) {
-    throw new Error('Compiled workload did not retain the expected LMAO Node import');
+  if (runtimeJavaScript === outputText) {
+    throw new Error(`${variant.toUpperCase()} compiled workload did not retain the expected LMAO Node import`);
   }
   return runtimeJavaScript;
 }
 
 function proveTransformation(offJavaScript: string, onJavaScript: string): TransformProof {
-  const injectedLinePattern = /\.line\(\d+\)/;
-  const monomorphicSpanPattern = /\.span[0-8]\(\d+,\s*["']scenario child/;
-  const injectedMetadataPattern = /\b(?:git_sha|package_name|package_file)\s*:/;
+  const runtimeHintPattern = /\bruntimeHint:\s*\d+\b/g;
+  const directBufferWritePattern = /\b(?:_logHeaders|[A-Za-z_$][\w$]*_values)\[\$\$i\]\s*=/g;
+  const vocabularyRegistrationPattern = /\bregisterLmaoVocabulary\w*\(\{/g;
 
+  const countSignatures = (source: string): TransformSignatureCounts => ({
+    runtimeHintSignatures: source.match(runtimeHintPattern)?.length ?? 0,
+    directBufferWriteSignatures: source.match(directBufferWritePattern)?.length ?? 0,
+    vocabularyRegistrationSignatures: source.match(vocabularyRegistrationPattern)?.length ?? 0,
+  });
   const proof: TransformProof = {
-    off: {
-      injectedLineSignature: injectedLinePattern.test(offJavaScript),
-      monomorphicSpanSignature: monomorphicSpanPattern.test(offJavaScript),
-      injectedLineOrMetadataSignature:
-        injectedLinePattern.test(offJavaScript) || injectedMetadataPattern.test(offJavaScript),
-    },
-    on: {
-      injectedLineSignature: injectedLinePattern.test(onJavaScript),
-      monomorphicSpanSignature: monomorphicSpanPattern.test(onJavaScript),
-      injectedLineOrMetadataSignature:
-        injectedLinePattern.test(onJavaScript) || injectedMetadataPattern.test(onJavaScript),
-    },
+    off: countSignatures(offJavaScript),
+    on: countSignatures(onJavaScript),
   };
 
   if (
-    proof.off.injectedLineSignature ||
-    proof.off.monomorphicSpanSignature ||
-    proof.off.injectedLineOrMetadataSignature
+    proof.off.runtimeHintSignatures !== 0 ||
+    proof.off.directBufferWriteSignatures !== 0 ||
+    proof.off.vocabularyRegistrationSignatures !== 0
   ) {
-    throw new Error('OFF compilation unexpectedly contains a legacy transformer signature');
+    throw new Error(
+      `OFF compilation unexpectedly contains native transform signatures: runtime hints=${proof.off.runtimeHintSignatures}, direct buffer writes=${proof.off.directBufferWriteSignatures}, vocabulary registrations=${proof.off.vocabularyRegistrationSignatures}`,
+    );
   }
   if (
-    !proof.on.injectedLineSignature ||
-    !proof.on.monomorphicSpanSignature ||
-    !proof.on.injectedLineOrMetadataSignature
+    proof.on.runtimeHintSignatures !== 2 ||
+    proof.on.directBufferWriteSignatures < 1 ||
+    proof.on.vocabularyRegistrationSignatures !== 1
   ) {
-    throw new Error('ON compilation is missing the expected legacy transformer signatures');
+    throw new Error(
+      `ON compilation is missing native transform signatures: expected runtime hints=2, direct buffer writes>=1, vocabulary registrations=1; received ${proof.on.runtimeHintSignatures}/${proof.on.directBufferWriteSignatures}/${proof.on.vocabularyRegistrationSignatures}`,
+    );
   }
 
   return proof;
@@ -347,12 +353,38 @@ async function main(): Promise<void> {
   assertDistinctOutputPaths([semanticOutput, manifestOutput, ...launches.map((launch) => launch.outputPath)]);
 
   const sourceBuffer = new Uint8Array(await Bun.file(workloadPath).arrayBuffer());
-  const source = textDecoder.decode(sourceBuffer);
   const temporaryDirectory = await mkdtemp(join(scenarioDirectory, '.plugin-scenario-'));
 
   try {
-    const offJavaScript = compileWorkload(source, false);
-    const onJavaScript = compileWorkload(source, true);
+    const projectPath = join(temporaryDirectory, 'tsconfig.json');
+    await Bun.write(
+      projectPath,
+      `${JSON.stringify(
+        {
+          extends: resolve(projectRoot, 'tsconfig.base.json'),
+          compilerOptions: {
+            composite: false,
+            declaration: false,
+            declarationMap: false,
+            emitDeclarationOnly: false,
+            noEmit: true,
+            rootDir: scenarioDirectory,
+            types: ['bun', 'node'],
+          },
+          files: [workloadPath],
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    const offBuildDirectory = join(temporaryDirectory, 'build.off');
+    const onBuildDirectory = join(temporaryDirectory, 'build.on');
+    await Promise.all([mkdir(offBuildDirectory), mkdir(onBuildDirectory)]);
+    const [offJavaScript, onJavaScript] = await Promise.all([
+      compileWorkload('off', projectPath, offBuildDirectory),
+      compileWorkload('on', projectPath, onBuildDirectory),
+    ]);
     const transformProof = proveTransformation(offJavaScript, onJavaScript);
     const offWorkload = join(temporaryDirectory, 'workload.off.mjs');
     const onWorkload = join(temporaryDirectory, 'workload.on.mjs');
@@ -379,10 +411,11 @@ async function main(): Promise<void> {
       workloadSha256: workloadSha256(sourceBuffer),
       versions: {
         bun: Bun.version,
-        typescript: ts.version,
+        typescript: lmaoTtscPackage.dependencies.typescript,
         mitata: mitataPackage.version,
+        lmaoTtsc: lmaoTtscPackage.version,
       },
-      compilerKind: 'legacy-ts',
+      compilerKind: 'native-ttsc',
       transformProof,
       quick: options.quick,
       quickBehavior: options.quick ? 'label-only' : 'standard',
