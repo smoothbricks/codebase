@@ -179,10 +179,36 @@ pub enum RestoreFailpoint {
     AfterCanonicalImageRename = 6,
 }
 
+fn store_directory_exists(store_root: &Path) -> Result<bool, ApfsStorageError> {
+    match fs::symlink_metadata(store_root) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
+        Ok(_) => Err(ApfsStorageError::Host(format!(
+            "APFS store root is not a directory: {}",
+            store_root.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error("inspect APFS store root", store_root, error)),
+    }
+}
+
+fn directory_exists_no_follow(directory: &Path) -> Result<bool, ApfsStorageError> {
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) => Ok(metadata.file_type().is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error("inspect recovery directory", directory, error)),
+    }
+}
+
 fn directory_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
     match fs::symlink_metadata(directory) {
         Ok(metadata) if metadata.file_type().is_dir() => {}
-        Ok(_) => return Ok(Vec::new()),
+        Ok(metadata) if metadata.file_type().is_symlink() => return Ok(Vec::new()),
+        Ok(_) => {
+            return Err(ApfsStorageError::Host(format!(
+                "recovery path is not a directory: {}",
+                directory.display()
+            )));
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(io_error("inspect recovery directory", directory, error)),
     }
@@ -214,7 +240,13 @@ fn directory_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageError
 fn regular_file_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
     match fs::symlink_metadata(directory) {
         Ok(metadata) if metadata.file_type().is_dir() => {}
-        Ok(_) => return Ok(Vec::new()),
+        Ok(metadata) if metadata.file_type().is_symlink() => return Ok(Vec::new()),
+        Ok(_) => {
+            return Err(ApfsStorageError::Host(format!(
+                "recovery path is not a directory: {}",
+                directory.display()
+            )));
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(io_error("inspect recovery directory", directory, error)),
     }
@@ -254,6 +286,9 @@ fn staged_image_format(path: &Path) -> Option<ImageFormat> {
 
 fn collect_project_directories(store_root: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
     let mut projects = Vec::new();
+    if !store_directory_exists(store_root)? {
+        return Ok(projects);
+    }
     for owner in directory_children(store_root)? {
         let Some(owner_name) = owner.file_name().and_then(|name| name.to_str()) else {
             continue;
@@ -265,8 +300,8 @@ fn collect_project_directories(store_root: &Path) -> Result<Vec<PathBuf>, ApfsSt
             continue;
         }
         for project in directory_children(&owner)? {
-            if project.join("checkpoints").is_dir()
-                || project.join(super::STAGING_NAMESPACE).is_dir()
+            if directory_exists_no_follow(&project.join("checkpoints"))?
+                || directory_exists_no_follow(&project.join(super::STAGING_NAMESPACE))?
             {
                 projects.push(project);
             }
@@ -2077,6 +2112,9 @@ where
             ));
         }
         let mut report = StorageGcReport::default();
+        if !store_directory_exists(&config.store_root)? {
+            return Ok(report);
+        }
         for owner in directory_children(&config.store_root)? {
             if owner == config.caches_root
                 || owner.file_name().is_some_and(|name| {
