@@ -17,21 +17,50 @@ use crate::apfs::{
     ApfsBackend, AttachedImage, CommandRunner, CreateImageRequest, CreatedImage, DetachTarget,
     ImageFormatSelection, MacOsApfsBackend,
 };
+use crate::copy::TreeCopier;
 use crate::metadata::{
-    DetachedWorkspaceMetadata, GrantSet, ImageFormat, METADATA_VERSION, Platform, WorkspaceMarker,
+    DetachedWorkspaceMetadata, ImageFormat, METADATA_VERSION, Platform, WorkspaceMarker,
     WorkspaceName, WorkspaceRole, sidecar_path,
 };
 use crate::repository::RepoId;
+use serde::{Deserialize, Serialize};
 
 use super::super::lifecycle::{
-    ExpectedState, KernelMountFact, LifecycleWorkspace, ObservedState, Revision, StorageFact,
-    StorageGcReport, SubstrateStats,
+    CheckpointFact, ExpectedState, KernelMountFact, LifecycleWorkspace, ObservedState,
+    OperationIdentity, Pin, Revision, StorageFact, StorageGcReport, SubstrateStats,
 };
 use super::super::{CheckpointLabel, WORKSPACE_MARKER_PATH, discover_session_images};
 use super::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, MarkerExpectation, MetadataPolicy,
     layout, volume_name,
 };
+
+const CHECKPOINT_FACT_VERSION: u32 = 1;
+const CHECKPOINT_FACT_SUFFIX: &str = ".checkpoint.json";
+const SELF_HEALING_STUB: &[u8] = b"cowshed ensure --attach\n";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CheckpointFactWire {
+    version: u32,
+    repo_id: RepoId,
+    workspace: WorkspaceName,
+    label: CheckpointLabel,
+    revision: u64,
+    pin: String,
+}
+
+fn checkpoint_fact_path(image: &Path) -> PathBuf {
+    let mut path = image.as_os_str().to_owned();
+    path.push(CHECKPOINT_FACT_SUFFIX);
+    PathBuf::from(path)
+}
+
+fn pre_cowshed_path(project_root: &Path) -> PathBuf {
+    let mut path = project_root.as_os_str().to_owned();
+    path.push(".pre-cowshed");
+    PathBuf::from(path)
+}
 
 macro_rules! sync_parent {
     ($path:expr) => {{
@@ -97,7 +126,7 @@ impl KernelMountSource for SystemKernelMountSource {
 }
 
 fn canonical_mount_flags(flags: u64) -> bool {
-    flags & MNT_DONTBROWSE != 0 && flags & MNT_IGNORE_OWNERS == 0
+    flags & MNT_IGNORE_OWNERS == 0
 }
 
 fn system_kernel_mounts() -> Result<Vec<KernelMountSnapshot>, ApfsStorageError> {
@@ -233,15 +262,6 @@ fn image_from_sidecar(sidecar: &Path) -> Result<PathBuf, ApfsStorageError> {
             ))
         })?;
     Ok(PathBuf::from(value))
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorkspaceMetadataTemplate {
-    pub project_root: PathBuf,
-    pub base_commit: String,
-    pub created_at: String,
-    pub created_trace: String,
-    pub grants: GrantSet,
 }
 
 struct MountedAttachment {
@@ -380,7 +400,6 @@ impl MountedRegistry {
 pub struct MacOsApfsExecutionHost<R> {
     backend: MacOsApfsBackend<R>,
     config: ApfsSubstrateConfig,
-    metadata: WorkspaceMetadataTemplate,
     mounted: MountedRegistry,
     restore_failpoint: AtomicU8,
     mount_source: Arc<dyn KernelMountSource>,
@@ -388,24 +407,18 @@ pub struct MacOsApfsExecutionHost<R> {
 }
 
 impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
-    pub fn new(
-        runner: R,
-        config: ApfsSubstrateConfig,
-        metadata: WorkspaceMetadataTemplate,
-    ) -> Result<Self, ApfsStorageError> {
-        Self::with_mount_source(runner, config, metadata, SystemKernelMountSource)
+    pub fn new(runner: R, config: ApfsSubstrateConfig) -> Result<Self, ApfsStorageError> {
+        Self::with_mount_source(runner, config, SystemKernelMountSource)
     }
 
     pub fn with_mount_source(
         runner: R,
         config: ApfsSubstrateConfig,
-        metadata: WorkspaceMetadataTemplate,
         mount_source: impl KernelMountSource,
     ) -> Result<Self, ApfsStorageError> {
         Ok(Self {
             backend: MacOsApfsBackend::new(runner),
             config,
-            metadata,
             mounted: MountedRegistry::start()?,
             mount_source: Arc::new(mount_source),
             recovery_marker_source: None,
@@ -416,14 +429,12 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     pub fn with_recovery_sources(
         runner: R,
         config: ApfsSubstrateConfig,
-        metadata: WorkspaceMetadataTemplate,
         mount_source: impl KernelMountSource,
         recovery_marker_source: impl RecoveryMarkerSource,
     ) -> Result<Self, ApfsStorageError> {
         Ok(Self {
             backend: MacOsApfsBackend::new(runner),
             config,
-            metadata,
             mounted: MountedRegistry::start()?,
             mount_source: Arc::new(mount_source),
             recovery_marker_source: Some(Arc::new(recovery_marker_source)),
@@ -580,6 +591,52 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         fs::rename(&source, &destination)
             .map_err(|error| io_error("rename detached metadata", &source, error))?;
         sync_parent!(&destination)
+    }
+
+    fn ensure_adopt_mountpoint(&self, mount_point: &Path) -> Result<(), ApfsStorageError> {
+        if self
+            .mount_source
+            .mounts()?
+            .iter()
+            .any(|mount| mount.mount_point == mount_point)
+        {
+            return Ok(());
+        }
+        match fs::metadata(mount_point) {
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(ApfsStorageError::Host(format!(
+                    "adopt mountpoint is not a directory: {}",
+                    mount_point.display()
+                )));
+            }
+            Ok(_) => {
+                for entry in fs::read_dir(mount_point)
+                    .map_err(|error| io_error("read adopt mountpoint", mount_point, error))?
+                {
+                    let entry = entry.map_err(|error| {
+                        io_error("read adopt mountpoint entry", mount_point, error)
+                    })?;
+                    if entry.file_name() != ".envrc" {
+                        return Err(ApfsStorageError::Host(format!(
+                            "adopt mountpoint contains unexpected data: {}",
+                            entry.path().display()
+                        )));
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(mount_point)
+                    .map_err(|error| io_error("create adopt mountpoint", mount_point, error))?;
+            }
+            Err(error) => return Err(io_error("inspect adopt mountpoint", mount_point, error)),
+        }
+        let stub = mount_point.join(".envrc");
+        fs::write(&stub, SELF_HEALING_STUB)
+            .map_err(|error| io_error("write self-healing mount stub", &stub, error))?;
+        fs::File::open(mount_point)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| io_error("sync adopt mountpoint", mount_point, error))?;
+        sync_parent!(mount_point)
     }
 
     fn published_facts(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError> {
@@ -744,7 +801,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         report: &mut StorageGcReport,
     ) -> Result<(), ApfsStorageError>
     where
-        R: CommandRunner,
+        R: CommandRunner + Send + Sync + 'static,
     {
         let sessions = project.join("sessions");
         let session_images = match fs::read_dir(&sessions) {
@@ -755,7 +812,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                         .map_err(|error| io_error("read session entry", &sessions, error))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(io_error("enumerate sessions", &sessions, error)),
         };
 
@@ -770,13 +827,51 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                         continue;
                     };
                     report.examined += 1;
-                    self.backend.delete_image(&path, format)?;
-                    Self::remove_sidecar(&path)?;
+                    self.reclaim_image(&path, format)?;
                     report.reclaimed += 1;
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(io_error("enumerate trash", &trash, error)),
+        }
+
+        let checkpoint_root = project.join("checkpoints");
+        for workspace_directory in directory_children(&checkpoint_root)? {
+            let mut checkpoints = Vec::new();
+            for image in directory_children(&workspace_directory)? {
+                let Ok(format) = ImageFormat::from_image_path(&image) else {
+                    continue;
+                };
+                let fact_path = checkpoint_fact_path(&image);
+                if !fact_path.exists() {
+                    continue;
+                }
+                let fact: CheckpointFactWire = crate::metadata::read_json(&fact_path)
+                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+                let modified = fs::metadata(&image)
+                    .and_then(|metadata| metadata.modified())
+                    .map_err(|error| io_error("read checkpoint age", &image, error))?;
+                checkpoints.push((modified, image, format, fact));
+            }
+            checkpoints.sort_by(|left, right| right.0.cmp(&left.0));
+            for (index, (modified, image, format, fact)) in checkpoints.into_iter().enumerate() {
+                report.examined += 1;
+                if fact.pin == "pinned" {
+                    report.retained_pinned += 1;
+                    continue;
+                }
+                let younger_than_fourteen_days = std::time::SystemTime::now()
+                    .duration_since(modified)
+                    .map_or(true, |age| {
+                        age < std::time::Duration::from_secs(14 * 24 * 60 * 60)
+                    });
+                if index < 5 || younger_than_fourteen_days {
+                    report.retained_recent += 1;
+                    continue;
+                }
+                self.reclaim_image(&image, format)?;
+                report.reclaimed += 1;
+            }
         }
 
         for path in session_images {
@@ -930,6 +1025,13 @@ where
             .map_err(Into::into)
     }
 
+    fn copy_tree(&self, source: &Path, destination: &Path) -> Result<(), ApfsStorageError> {
+        TreeCopier::new(self.backend.runner())
+            .copy_until_quiescent(source, destination)
+            .map(|_| ())
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))
+    }
+
     fn attach_verified(
         &self,
         image: &Path,
@@ -995,19 +1097,20 @@ where
         mount_point: &Path,
         workspace: &LifecycleWorkspace,
         forked_from: Option<&WorkspaceName>,
+        identity: &OperationIdentity,
     ) -> Result<(), ApfsStorageError> {
         let marker = WorkspaceMarker {
             version: METADATA_VERSION,
             repo_id: workspace.repo().clone(),
-            project_root: self.metadata.project_root.clone(),
+            project_root: identity.project_root.clone(),
             workspace: workspace.name().clone(),
             workspace_incarnation: workspace.incarnation().clone(),
             role: workspace.role(),
             image_format: workspace.format(),
-            base_commit: self.metadata.base_commit.clone(),
-            created_at: self.metadata.created_at.clone(),
+            base_commit: identity.base_commit.clone(),
+            created_at: identity.created_at.clone(),
             forked_from: forked_from.cloned(),
-            created_trace: self.metadata.created_trace.clone(),
+            created_trace: identity.created_trace.clone(),
         };
         marker
             .validate()
@@ -1219,12 +1322,76 @@ where
         Ok(())
     }
 
+    fn publish_adopt(
+        &self,
+        source_checkout: &Path,
+        pre_cowshed_checkout: &Path,
+        staged: &Path,
+        canonical: &Path,
+    ) -> Result<(), ApfsStorageError> {
+        if !source_checkout.is_absolute()
+            || pre_cowshed_checkout != pre_cowshed_path(source_checkout)
+            || !source_checkout.is_dir()
+            || pre_cowshed_checkout.exists()
+        {
+            return Err(ApfsStorageError::InvalidPlan(
+                "invalid adopt source or pre-cowshed handoff",
+            ));
+        }
+        fs::rename(source_checkout, pre_cowshed_checkout).map_err(|error| {
+            io_error("move original checkout aside", pre_cowshed_checkout, error)
+        })?;
+        sync_parent!(pre_cowshed_checkout)?;
+
+        let publication = (|| {
+            fs::create_dir(source_checkout)
+                .map_err(|error| io_error("create canonical mountpoint", source_checkout, error))?;
+            let stub = source_checkout.join(".envrc");
+            fs::write(&stub, SELF_HEALING_STUB)
+                .map_err(|error| io_error("write self-healing mount stub", &stub, error))?;
+            fs::File::open(source_checkout)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| io_error("sync canonical mountpoint", source_checkout, error))?;
+            sync_parent!(source_checkout)?;
+            self.publish_image(staged, canonical)
+        })();
+
+        if let Err(primary) = publication {
+            let cleanup = (|| {
+                let stub = source_checkout.join(".envrc");
+                match fs::remove_file(&stub) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(io_error("remove mount stub", &stub, error)),
+                }
+                match fs::remove_dir(source_checkout) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(io_error(
+                            "remove failed canonical mountpoint",
+                            source_checkout,
+                            error,
+                        ));
+                    }
+                }
+                fs::rename(pre_cowshed_checkout, source_checkout).map_err(|error| {
+                    io_error("restore original checkout", source_checkout, error)
+                })?;
+                sync_parent!(source_checkout)
+            })();
+            return super::combine_cleanup("adopt publication", primary, cleanup);
+        }
+        Ok(())
+    }
+
     fn publish_metadata(
         &self,
         image: &Path,
         workspace: &LifecycleWorkspace,
         revision: Revision,
         policy: MetadataPolicy,
+        identity: Option<&OperationIdentity>,
         source_image: Option<&Path>,
     ) -> Result<(), ApfsStorageError> {
         workspace
@@ -1243,11 +1410,25 @@ where
             }
             (MetadataPolicy::Fresh, _) => None,
         };
-        let mut grants = preserved.as_ref().map_or_else(
-            || self.metadata.grants.clone(),
-            |metadata| metadata.grants.clone(),
-        );
+        let mut grants = match &preserved {
+            Some(metadata) => metadata.grants.clone(),
+            None => identity
+                .ok_or(ApfsStorageError::InvalidPlan(
+                    "fresh metadata requires operation identity",
+                ))?
+                .grants
+                .clone(),
+        };
         grants.revision = revision.get();
+        let updated_at = identity.map_or_else(
+            || {
+                preserved
+                    .as_ref()
+                    .map(|metadata| metadata.updated_at.clone())
+                    .unwrap_or_default()
+            },
+            |identity| identity.created_at.clone(),
+        );
         let metadata = DetachedWorkspaceMetadata {
             version: METADATA_VERSION,
             repo_id: workspace.repo().clone(),
@@ -1255,13 +1436,40 @@ where
             workspace_incarnation: workspace.incarnation().clone(),
             image_format: workspace.format(),
             platform: Platform::Macos,
-            updated_at: self.metadata.created_at.clone(),
+            updated_at,
             grants,
             info_snapshot: preserved.and_then(|metadata| metadata.info_snapshot),
         };
         metadata
             .write_for_image(image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))
+    }
+
+    fn publish_checkpoint_fact(
+        &self,
+        image: &Path,
+        label: &CheckpointLabel,
+        revision: Revision,
+        pin: Pin,
+    ) -> Result<(), ApfsStorageError> {
+        let metadata = DetachedWorkspaceMetadata::read_for_image(image)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        let fact = CheckpointFactWire {
+            version: CHECKPOINT_FACT_VERSION,
+            repo_id: metadata.repo_id,
+            workspace: metadata.workspace,
+            label: label.clone(),
+            revision: revision.get(),
+            pin: match pin {
+                Pin::Pinned => "pinned",
+                Pin::Automatic => "automatic",
+            }
+            .to_owned(),
+        };
+        let path = checkpoint_fact_path(image);
+        crate::metadata::write_json(&path, &fact)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        sync_parent!(&path)
     }
 
     fn restore_swap(
@@ -1322,6 +1530,7 @@ where
             workspace,
             revision,
             MetadataPolicy::Preserve,
+            None,
             Some(source_image),
         )?;
         self.trip_restore_failpoint(RestoreFailpoint::AfterMetadataPublish)?;
@@ -1381,7 +1590,13 @@ where
 
     fn reclaim_image(&self, image: &Path, format: ImageFormat) -> Result<(), ApfsStorageError> {
         self.backend.delete_image(image, format)?;
-        Self::remove_sidecar(image)
+        Self::remove_sidecar(image)?;
+        let fact = checkpoint_fact_path(image);
+        match fs::remove_file(&fact) {
+            Ok(()) => sync_parent!(image),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_error("remove checkpoint fact", &fact, error)),
+        }
     }
 
     fn list(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError> {
@@ -1419,6 +1634,73 @@ where
             .collect()
     }
 
+    fn checkpoints(&self, repo: &RepoId) -> Result<Vec<CheckpointFact>, ApfsStorageError> {
+        let root = layout(&self.config, repo)?.project().checkpoints.clone();
+        let mut facts = Vec::new();
+        for workspace_directory in directory_children(&root)? {
+            let Some(workspace_name) = workspace_directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(WorkspaceName::new)
+                .transpose()
+                .map_err(|error| ApfsStorageError::Host(error.to_string()))?
+            else {
+                continue;
+            };
+            for image in directory_children(&workspace_directory)? {
+                if ImageFormat::from_image_path(&image).is_err() {
+                    continue;
+                }
+                let fact_path = checkpoint_fact_path(&image);
+                if !fact_path.exists() {
+                    continue;
+                }
+                let wire: CheckpointFactWire = crate::metadata::read_json(&fact_path)
+                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+                let pin = match wire.pin.as_str() {
+                    "pinned" => Pin::Pinned,
+                    "automatic" => Pin::Automatic,
+                    _ => {
+                        return Err(ApfsStorageError::Host(format!(
+                            "invalid checkpoint pin in {}",
+                            fact_path.display()
+                        )));
+                    }
+                };
+                let expected_label = image
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .ok_or_else(|| {
+                        ApfsStorageError::Host(format!(
+                            "invalid checkpoint image name: {}",
+                            image.display()
+                        ))
+                    })?;
+                if wire.version != CHECKPOINT_FACT_VERSION
+                    || wire.repo_id != *repo
+                    || wire.workspace != workspace_name
+                    || wire.label.as_str() != expected_label
+                {
+                    return Err(ApfsStorageError::Host(format!(
+                        "checkpoint fact does not match image path: {}",
+                        fact_path.display()
+                    )));
+                }
+                facts.push(CheckpointFact {
+                    repo: wire.repo_id,
+                    workspace: wire.workspace,
+                    label: wire.label,
+                    revision: Revision::new(wire.revision),
+                    pin,
+                });
+            }
+        }
+        facts.sort_by(|left, right| {
+            (&left.workspace, &left.label).cmp(&(&right.workspace, &right.label))
+        });
+        Ok(facts)
+    }
+
     fn recover_pending(&self, config: &ApfsSubstrateConfig) -> Result<(), ApfsStorageError> {
         for project in collect_project_directories(&config.store_root)? {
             let staging = project.join(super::STAGING_NAMESPACE);
@@ -1435,9 +1717,6 @@ where
                         continue;
                     }
                     let staged = image_from_sidecar(&path)?;
-                    if staged.exists() {
-                        continue;
-                    }
                     let metadata = DetachedWorkspaceMetadata::read_for_image(&staged)
                         .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
                     let storage = layout(config, &metadata.repo_id)?;
@@ -1465,6 +1744,21 @@ where
                             metadata.image_format.extension()
                         ));
                     if sidecar_path(&restore_undo).exists() {
+                        continue;
+                    }
+                    if metadata.workspace.is_main() {
+                        let pre_cowshed = pre_cowshed_path(&config.main_mount);
+                        if staged.exists() {
+                            if !canonical.exists() && pre_cowshed.exists() {
+                                self.ensure_adopt_mountpoint(&config.main_mount)?;
+                                self.publish_image(&staged, &canonical)?;
+                            }
+                            continue;
+                        }
+                        if pre_cowshed.exists() {
+                            self.ensure_adopt_mountpoint(&config.main_mount)?;
+                        }
+                    } else if staged.exists() {
                         continue;
                     }
                     if canonical.exists() && !sidecar_path(&canonical).exists() {

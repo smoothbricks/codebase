@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::metadata::{ImageFormat, WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
+use crate::metadata::{GrantSet, ImageFormat, WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use crate::repository::RepoId;
 
 use super::CheckpointLabel;
@@ -292,20 +292,34 @@ plan_type!(RestorePlan);
 plan_type!(RetirePlan);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationIdentity {
+    pub project_root: PathBuf,
+    pub base_commit: String,
+    pub created_at: String,
+    pub created_trace: String,
+    pub grants: GrantSet,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Operation {
     Adopt {
         repo: RepoId,
         format: ImageFormat,
+        source_checkout: PathBuf,
+        pre_cowshed_checkout: PathBuf,
+        identity: OperationIdentity,
     },
     Create {
         source: WorkspaceName,
         destination: WorkspaceName,
         format: ImageFormat,
+        identity: OperationIdentity,
     },
     Fork {
         source: WorkspaceName,
         destination: WorkspaceName,
         format: ImageFormat,
+        identity: OperationIdentity,
     },
     Checkpoint {
         workspace: WorkspaceName,
@@ -318,6 +332,7 @@ pub enum Operation {
         label: CheckpointLabel,
         mode: RestoreMode,
         format: ImageFormat,
+        identity: OperationIdentity,
     },
     Retire {
         workspace: WorkspaceName,
@@ -329,6 +344,9 @@ pub struct AdoptRequest {
     pub repo: RepoId,
     pub format: ImageFormat,
     pub topology_revision: Revision,
+    pub source_checkout: PathBuf,
+    pub pre_cowshed_checkout: PathBuf,
+    pub identity: OperationIdentity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -336,6 +354,7 @@ pub struct Destination {
     pub repo: RepoId,
     pub name: WorkspaceName,
     pub topology_revision: Revision,
+    pub identity: OperationIdentity,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -353,6 +372,8 @@ pub enum PlanError {
     CheckpointMismatch,
     #[error("main cannot be retired or reclaimed")]
     MainIsPermanent,
+    #[error("adopt source and pre-cowshed checkout paths are not distinct absolute paths")]
+    InvalidAdoptHandoff,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -381,6 +402,7 @@ pub trait LifecyclePlanner: Send + Sync {
         workspace: &LifecycleWorkspace,
         checkpoint: &CheckpointRef,
         mode: RestoreMode,
+        identity: OperationIdentity,
     ) -> Result<RestorePlan, PlanError>;
     fn plan_retire(&self, workspace: &LifecycleWorkspace) -> Result<RetirePlan, PlanError>;
 }
@@ -405,6 +427,12 @@ fn destination_expected(
 impl LifecyclePlanner for PurePlanner {
     fn plan_adopt(&self, request: AdoptRequest) -> Result<AdoptPlan, PlanError> {
         let main = WorkspaceName::new("main").expect("fixed main name is valid");
+        if !request.source_checkout.is_absolute()
+            || !request.pre_cowshed_checkout.is_absolute()
+            || request.source_checkout == request.pre_cowshed_checkout
+        {
+            return Err(PlanError::InvalidAdoptHandoff);
+        }
         Ok(AdoptPlan {
             expected: vec![ExpectedState::Absent {
                 repo: request.repo.clone(),
@@ -414,6 +442,9 @@ impl LifecyclePlanner for PurePlanner {
             operation: Operation::Adopt {
                 repo: request.repo,
                 format: request.format,
+                source_checkout: request.source_checkout,
+                pre_cowshed_checkout: request.pre_cowshed_checkout,
+                identity: request.identity,
             },
         })
     }
@@ -429,6 +460,7 @@ impl LifecyclePlanner for PurePlanner {
                 source: from.name.clone(),
                 destination: destination.name,
                 format: from.format,
+                identity: destination.identity,
             },
         })
     }
@@ -444,6 +476,7 @@ impl LifecyclePlanner for PurePlanner {
                 source: from.name.clone(),
                 destination: destination.name,
                 format: from.format,
+                identity: destination.identity,
             },
         })
     }
@@ -468,6 +501,7 @@ impl LifecyclePlanner for PurePlanner {
         workspace: &LifecycleWorkspace,
         checkpoint: &CheckpointRef,
         mode: RestoreMode,
+        identity: OperationIdentity,
     ) -> Result<RestorePlan, PlanError> {
         if checkpoint.workspace.repo != workspace.repo
             || checkpoint.workspace.name != workspace.name
@@ -490,6 +524,7 @@ impl LifecyclePlanner for PurePlanner {
                 label: checkpoint.label.clone(),
                 mode,
                 format: workspace.format,
+                identity,
             },
         })
     }
@@ -549,11 +584,22 @@ impl RetiredRef {
         self.resulting_revision
     }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointFact {
+    pub repo: RepoId,
+    pub workspace: WorkspaceName,
+    pub label: CheckpointLabel,
+    pub revision: Revision,
+    pub pin: Pin,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RestoreReceipt {
     pub previous_incarnation: WorkspaceIncarnation,
     pub workspace: LifecycleWorkspace,
 }
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StorageGcReport {
     pub examined: usize,
@@ -561,6 +607,7 @@ pub struct StorageGcReport {
     pub retained_pinned: usize,
     pub retained_recent: usize,
 }
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SubstrateStats {
     pub logical_bytes: u64,
@@ -574,28 +621,37 @@ pub enum MountState {
     Mounted { mount_id: u64 },
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MountIntent {
+    pub browse: bool,
+}
+
 /// Canonical persistent fact read from an image/dataset and its sidecar.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StorageFact {
     pub workspace: LifecycleWorkspace,
     pub volume_name: String,
 }
+
 /// A kernel mount-table fact supplied by the platform adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelMountFact {
     pub mount_id: u64,
     pub volume_name: String,
 }
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DerivedWorkspace {
     pub workspace: LifecycleWorkspace,
     pub mount_state: MountState,
+    pub checkpoints: Vec<CheckpointFact>,
 }
 
-/// Derive enumeration from canonical storage and kernel facts. Duplicate canonical identities are conflicts.
+/// Derive enumeration from canonical storage, kernel mounts, and versioned checkpoint facts.
 pub fn derive_workspaces(
     storage: impl IntoIterator<Item = StorageFact>,
     mounts: impl IntoIterator<Item = KernelMountFact>,
+    checkpoints: impl IntoIterator<Item = CheckpointFact>,
 ) -> Result<Vec<DerivedWorkspace>, DerivationError> {
     let storage: Vec<_> = storage.into_iter().collect();
     let mut seen_workspaces = BTreeSet::new();
@@ -618,6 +674,15 @@ pub fn derive_workspaces(
         .into_iter()
         .map(|mount| (mount.volume_name, mount.mount_id))
         .collect();
+    let mut checkpoints_by_workspace: BTreeMap<(RepoId, WorkspaceName), Vec<CheckpointFact>> =
+        BTreeMap::new();
+    for checkpoint in checkpoints {
+        checkpoints_by_workspace
+            .entry((checkpoint.repo.clone(), checkpoint.workspace.clone()))
+            .or_default()
+            .push(checkpoint);
+    }
+
     let mut result = Vec::with_capacity(storage.len());
     for fact in storage {
         let mount_state = mounts
@@ -626,10 +691,18 @@ pub fn derive_workspaces(
             .map_or(MountState::Detached, |mount_id| MountState::Mounted {
                 mount_id,
             });
+        let mut checkpoints = checkpoints_by_workspace
+            .remove(&(fact.workspace.repo.clone(), fact.workspace.name.clone()))
+            .unwrap_or_default();
+        checkpoints.sort_by(|left, right| left.label.cmp(&right.label));
         result.push(DerivedWorkspace {
             workspace: fact.workspace,
             mount_state,
+            checkpoints,
         });
+    }
+    if let Some(((_, workspace), _)) = checkpoints_by_workspace.into_iter().next() {
+        return Err(DerivationError::OrphanCheckpoint(workspace));
     }
     result.sort_by(|a, b| a.workspace.name.cmp(&b.workspace.name));
     Ok(result)
@@ -641,6 +714,8 @@ pub enum DerivationError {
     DuplicateWorkspace(WorkspaceName),
     #[error("duplicate canonical volume name {0}")]
     DuplicateVolumeName(String),
+    #[error("checkpoint belongs to unpublished workspace {0}")]
+    OrphanCheckpoint(WorkspaceName),
 }
 
 /// Dispatch a blocking command or filesystem operation away from async runtime workers.
@@ -712,9 +787,13 @@ pub trait Substrate: LifecyclePlanner {
     async fn execute_fork(&self, plan: ForkPlan) -> Result<LifecycleReceipt, Self::Error>;
     async fn execute_retire(&self, plan: RetirePlan) -> Result<RetiredRef, Self::Error>;
     async fn reclaim(&self, retired: RetiredRef) -> Result<(), Self::Error>;
-    async fn list(&self, repo: &RepoId) -> Result<Vec<LifecycleWorkspace>, Self::Error>;
+    async fn list(&self, repo: &RepoId) -> Result<Vec<DerivedWorkspace>, Self::Error>;
     async fn mount_state(&self, workspace: &LifecycleWorkspace) -> Result<MountState, Self::Error>;
-    async fn ensure_mounted(&self, workspace: &LifecycleWorkspace) -> Result<PathBuf, Self::Error>;
+    async fn ensure_mounted(
+        &self,
+        workspace: &LifecycleWorkspace,
+        intent: MountIntent,
+    ) -> Result<PathBuf, Self::Error>;
     async fn unmount(&self, workspace: &LifecycleWorkspace) -> Result<(), Self::Error>;
     async fn caches_root(&self) -> Result<PathBuf, Self::Error>;
     async fn stats(&self, workspace: &LifecycleWorkspace) -> Result<SubstrateStats, Self::Error>;

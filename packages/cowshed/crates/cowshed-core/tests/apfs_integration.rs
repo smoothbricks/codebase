@@ -12,12 +12,13 @@ use cowshed_core::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
 use cowshed_core::metadata::{GrantSet, ImageFormat, PortBlock, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
-use cowshed_core::storage::apfs::native::{MacOsApfsExecutionHost, WorkspaceMetadataTemplate};
+use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::{
     ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig, IncarnationSource, TokioApfsBlockingLane,
 };
 use cowshed_core::storage::lifecycle::{
-    AdoptRequest, Destination, LifecyclePlanner, Pin, RestoreMode, Revision, Substrate,
+    AdoptRequest, Destination, LifecyclePlanner, MountIntent, OperationIdentity, Pin, RestoreMode,
+    Revision, Substrate,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,14 +198,16 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
         ApfsCaseSensitivity::Insensitive,
     )
     .with_capacity("1g")?;
-    let template = WorkspaceMetadataTemplate {
-        project_root: root.path.join("original-project"),
-        base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
-        created_at: "2026-07-13T00:00:00Z".to_owned(),
-        created_trace: format!("apfs-integration-{}", format.extension()),
-        grants: GrantSet::closed_baseline(Some(PortBlock::new(30000, 16)?))?,
+    let identity = || -> Result<OperationIdentity, Box<dyn Error>> {
+        Ok(OperationIdentity {
+            project_root: main_mount.clone(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            created_at: "2026-07-13T00:00:00Z".to_owned(),
+            created_trace: format!("apfs-integration-{}", format.extension()),
+            grants: GrantSet::closed_baseline(Some(PortBlock::new(30000, 16)?))?,
+        })
     };
-    let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone(), template)?;
+    let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())?;
     let substrate = ApfsSubstrate::with_lane_and_incarnations(
         config,
         host,
@@ -226,6 +229,9 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             repo: repo.clone(),
             format,
             topology_revision: Revision::new(0),
+            source_checkout: main_mount.clone(),
+            pre_cowshed_checkout: PathBuf::from(format!("{}.pre-cowshed", main_mount.display())),
+            identity: identity()?,
         })?;
         let main = substrate
             .execute_adopt(adopt)
@@ -241,7 +247,7 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
         }
         assert_eq!(
             substrate
-                .ensure_mounted(&main)
+                .ensure_mounted(&main, MountIntent { browse: false })
                 .await
                 .map_err(|error| std::io::Error::other(format!("ensure main: {error}")))?,
             main_mount
@@ -269,6 +275,7 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
                 repo: repo.clone(),
                 name: destination,
                 topology_revision: Revision::new(1),
+                identity: identity()?,
             },
         )?;
         let fork_started = Instant::now();
@@ -284,7 +291,7 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             "fork lifecycle exceeded 5 seconds: {fork_elapsed:?}"
         );
         let fork_mount = substrate
-            .ensure_mounted(&fork)
+            .ensure_mounted(&fork, MountIntent { browse: false })
             .await
             .map_err(|error| std::io::Error::other(format!("ensure fork: {error}")))?;
         assert_eq!(
@@ -306,7 +313,8 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             .await
             .map_err(|error| std::io::Error::other(format!("checkpoint: {error}")))?;
         fs::write(&payload, b"mutated after checkpoint\n")?;
-        let restore_plan = substrate.plan_restore(&main, &checkpoint, RestoreMode::Replace)?;
+        let restore_plan =
+            substrate.plan_restore(&main, &checkpoint, RestoreMode::Replace, identity()?)?;
         let restored = substrate
             .execute_restore(restore_plan)
             .await

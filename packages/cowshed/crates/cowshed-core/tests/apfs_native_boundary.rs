@@ -14,12 +14,14 @@ use cowshed_core::repository::RepoId;
 use cowshed_core::storage::StorageLayout;
 use cowshed_core::storage::apfs::native::{
     KernelMountSnapshot, KernelMountSource, MacOsApfsExecutionHost, RecoveryMarkerSource,
-    RestoreFailpoint, SystemKernelMountSource, WorkspaceMetadataTemplate,
+    RestoreFailpoint, SystemKernelMountSource,
 };
 use cowshed_core::storage::apfs::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, MarkerExpectation, MetadataPolicy,
 };
-use cowshed_core::storage::lifecycle::{ExpectedState, LifecycleWorkspace, Revision};
+use cowshed_core::storage::lifecycle::{
+    ExpectedState, LifecycleWorkspace, OperationIdentity, Revision,
+};
 const ATTACH_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
 <dict><key>content-hint</key><string>GUID_partition_scheme</string><key>dev-entry</key><string>/dev/disk9</string></dict>
 <dict><key>content-hint</key><string>Apple_APFS</string><key>dev-entry</key><string>/dev/disk9s2</string></dict>
@@ -267,18 +269,21 @@ fn native_host(
     MacOsApfsExecutionHost::with_recovery_sources(
         runner,
         fixture.config(),
-        WorkspaceMetadataTemplate {
-            project_root: fixture.root.join("project"),
-            base_commit: "0123456789abcdef".to_owned(),
-            created_at: "2026-07-13T00:00:00Z".to_owned(),
-            created_trace: "trace-apfs-boundary".to_owned(),
-            grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
-                .expect("grants"),
-        },
         SystemKernelMountSource,
         ByteRecoveryMarkers,
     )
     .expect("native APFS host")
+}
+
+fn identity(fixture: &Fixture) -> OperationIdentity {
+    OperationIdentity {
+        project_root: fixture.root.join("project"),
+        base_commit: "0123456789abcdef".to_owned(),
+        created_at: "2026-07-13T00:00:00Z".to_owned(),
+        created_trace: "trace-apfs-boundary".to_owned(),
+        grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
+            .expect("grants"),
+    }
 }
 
 fn create_image(path: &Path, format: ImageFormat) {
@@ -546,7 +551,7 @@ fn marker_validation_checks_every_detached_identity_dimension() {
     let host = native_host(&fixture, RecordingRunner::default());
     let workspace = workspace(ImageFormat::Sparse);
     let mount = fixture.root.join("mounted");
-    host.write_marker(&mount, &workspace, None)
+    host.write_marker(&mount, &workspace, None, &identity(&fixture))
         .expect("write marker");
     let expected = MarkerExpectation {
         repo: workspace.repo().clone(),
@@ -706,6 +711,7 @@ fn metadata_publication_writes_the_requested_identity_and_revision() {
         &workspace,
         Revision::new(17),
         MetadataPolicy::Fresh,
+        Some(&identity(&fixture)),
         None,
     )
     .expect("publish metadata");
@@ -892,19 +898,7 @@ fn failed_detach_restores_actor_state_and_force_retries_exactly_once() {
     let image = layout.main_image(ImageFormat::Sparse).expect("image");
     create_image(image.image(), ImageFormat::Sparse);
     let runner = FailingDetachRunner::new(1);
-    let host = MacOsApfsExecutionHost::new(
-        runner.clone(),
-        fixture.config(),
-        WorkspaceMetadataTemplate {
-            project_root: fixture.root.join("project"),
-            base_commit: "0123456789abcdef".to_owned(),
-            created_at: "2026-07-13T00:00:00Z".to_owned(),
-            created_trace: "detach-retry".to_owned(),
-            grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
-                .expect("grants"),
-        },
-    )
-    .expect("host");
+    let host = MacOsApfsExecutionHost::new(runner.clone(), fixture.config()).expect("host");
     let workspace = workspace(ImageFormat::Sparse);
     let attachment = host
         .attach_verified(image.image(), ImageFormat::Sparse)
@@ -973,19 +967,8 @@ fn gc_distinguishes_a_missing_store_from_a_non_directory_store() {
         fixture.root.join("mount"),
         ApfsCaseSensitivity::Insensitive,
     );
-    let host = MacOsApfsExecutionHost::new(
-        RecordingRunner::default(),
-        config.clone(),
-        WorkspaceMetadataTemplate {
-            project_root: fixture.root.join("project"),
-            base_commit: "0123456789abcdef".to_owned(),
-            created_at: "2026-07-13T00:00:00Z".to_owned(),
-            created_trace: "gc-store".to_owned(),
-            grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
-                .expect("grants"),
-        },
-    )
-    .expect("host");
+    let host =
+        MacOsApfsExecutionHost::new(RecordingRunner::default(), config.clone()).expect("host");
     assert_eq!(host.gc(&config).expect("missing store"), Default::default());
 
     std::fs::write(&missing_root, b"not a directory").expect("store file");
@@ -1050,18 +1033,9 @@ fn kernel_mount_facts_survive_host_restart_and_prevent_detached_compaction() {
         true,
         true,
     )]);
-    let template = || WorkspaceMetadataTemplate {
-        project_root: fixture.root.join("project"),
-        base_commit: "0123456789abcdef".to_owned(),
-        created_at: "2026-07-13T00:00:00Z".to_owned(),
-        created_trace: "kernel-restart".to_owned(),
-        grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
-            .expect("grants"),
-    };
     let first = MacOsApfsExecutionHost::with_mount_source(
         RecordingRunner::default(),
         fixture.config(),
-        template(),
         source.clone(),
     )
     .expect("first host");
@@ -1070,13 +1044,9 @@ fn kernel_mount_facts_survive_host_restart_and_prevent_detached_compaction() {
 
     let runner = RecordingRunner::default();
     runner.set_volume_name("cowshed.acme--widget.main");
-    let restarted = MacOsApfsExecutionHost::with_mount_source(
-        runner.clone(),
-        fixture.config(),
-        template(),
-        source,
-    )
-    .expect("restarted host");
+    let restarted =
+        MacOsApfsExecutionHost::with_mount_source(runner.clone(), fixture.config(), source)
+            .expect("restarted host");
     assert_eq!(
         restarted.mounts(&repo()).expect("restart facts")[0].mount_id,
         42
@@ -1127,20 +1097,8 @@ fn restart_safe_detach_honors_force_only_after_normal_detach_fails() {
         true,
     )]);
     let runner = FailingDetachRunner::new(2);
-    let host = MacOsApfsExecutionHost::with_mount_source(
-        runner.clone(),
-        fixture.config(),
-        WorkspaceMetadataTemplate {
-            project_root: fixture.root.join("project"),
-            base_commit: "0123456789abcdef".to_owned(),
-            created_at: "2026-07-13T00:00:00Z".to_owned(),
-            created_trace: "kernel-restart-force".to_owned(),
-            grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
-                .expect("grants"),
-        },
-        source,
-    )
-    .expect("host");
+    let host = MacOsApfsExecutionHost::with_mount_source(runner.clone(), fixture.config(), source)
+        .expect("host");
 
     host.detach_mounted(&workspace(ImageFormat::Sparse), false)
         .expect_err("non-forced restart detach must not escalate");
@@ -1168,20 +1126,8 @@ fn canonical_path_with_unrelated_volume_fails_closed_without_detaching() {
     )]);
     let runner = RecordingRunner::default();
     runner.set_volume_name("unrelated.volume");
-    let host = MacOsApfsExecutionHost::with_mount_source(
-        runner.clone(),
-        fixture.config(),
-        WorkspaceMetadataTemplate {
-            project_root: fixture.root.join("project"),
-            base_commit: "0123456789abcdef".to_owned(),
-            created_at: "2026-07-13T00:00:00Z".to_owned(),
-            created_trace: "wrong-source".to_owned(),
-            grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
-                .expect("grants"),
-        },
-        source,
-    )
-    .expect("host");
+    let host = MacOsApfsExecutionHost::with_mount_source(runner.clone(), fixture.config(), source)
+        .expect("host");
     let error = host.mounts(&repo()).expect_err("impostor mount");
     assert!(error.to_string().contains("mount source mismatch"));
     let error = host
@@ -1227,20 +1173,9 @@ fn wrong_kernel_mount_flags_are_detected_and_healed_by_mountpoint() {
         false,
     )]);
     let runner = RecordingRunner::default();
-    let host = MacOsApfsExecutionHost::with_mount_source(
-        runner.clone(),
-        fixture.config(),
-        WorkspaceMetadataTemplate {
-            project_root: fixture.root.join("project"),
-            base_commit: "0123456789abcdef".to_owned(),
-            created_at: "2026-07-13T00:00:00Z".to_owned(),
-            created_trace: "wrong-flags".to_owned(),
-            grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
-                .expect("grants"),
-        },
-        source.clone(),
-    )
-    .expect("host");
+    let host =
+        MacOsApfsExecutionHost::with_mount_source(runner.clone(), fixture.config(), source.clone())
+            .expect("host");
     let workspace = workspace(ImageFormat::Sparse);
     assert!(
         host.mounts(&repo())
@@ -1730,11 +1665,11 @@ fn system_mount_source_observes_the_live_root_mount() {
 }
 
 #[test]
-fn kernel_mount_flag_truth_table_requires_nobrowse_and_owners() {
+fn kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
     for (nobrowse, owners, expected_valid) in [
         (true, true, true),
         (true, false, false),
-        (false, true, false),
+        (false, true, true),
         (false, false, false),
     ] {
         let fixture = Fixture::new(&format!("flag-table-{nobrowse}-{owners}"));
@@ -1752,16 +1687,6 @@ fn kernel_mount_flag_truth_table_requires_nobrowse_and_owners() {
         let host = MacOsApfsExecutionHost::with_mount_source(
             RecordingRunner::default(),
             fixture.config(),
-            WorkspaceMetadataTemplate {
-                project_root: fixture.root.join("project"),
-                base_commit: "0123456789abcdef".to_owned(),
-                created_at: "2026-07-13T00:00:00Z".to_owned(),
-                created_trace: "flag-table".to_owned(),
-                grants: GrantSet::closed_baseline(Some(
-                    PortBlock::new(20000, 16).expect("port block"),
-                ))
-                .expect("grants"),
-            },
             source,
         )
         .expect("host");

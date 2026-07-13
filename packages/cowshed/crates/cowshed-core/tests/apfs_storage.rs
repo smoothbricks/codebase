@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use cowshed_core::apfs::{
     ApfsCaseSensitivity, CreateImageRequest, CreatedImage, ImageFormatSelection,
 };
-use cowshed_core::metadata::{ImageFormat, WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
+use cowshed_core::metadata::{
+    GrantSet, ImageFormat, PortBlock, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+};
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
@@ -15,9 +17,9 @@ use cowshed_core::storage::apfs::{
     IncarnationSource, MarkerExpectation, MetadataPolicy, volume_name,
 };
 use cowshed_core::storage::lifecycle::{
-    AdoptRequest, Destination, ExpectedState, KernelMountFact, LifecyclePlanner,
-    LifecycleWorkspace, MountState, ObservedState, Pin, RestoreMode, Revision, StorageFact,
-    StorageGcReport, Substrate, SubstrateStats,
+    AdoptRequest, CheckpointFact, Destination, ExpectedState, KernelMountFact, LifecyclePlanner,
+    LifecycleWorkspace, MountIntent, MountState, ObservedState, OperationIdentity, Pin,
+    RestoreMode, Revision, StorageFact, StorageGcReport, Substrate, SubstrateStats,
 };
 use proptest::prelude::*;
 
@@ -32,6 +34,7 @@ struct FakeState {
     published: BTreeMap<(RepoId, WorkspaceName), StorageFact>,
     mounted: BTreeMap<(RepoId, WorkspaceName), KernelMountFact>,
     formats: BTreeMap<(RepoId, WorkspaceName), ImageFormat>,
+    checkpoints: Vec<CheckpointFact>,
     next_mount_id: u64,
     paths: Vec<PathBuf>,
     mount_paths: Vec<PathBuf>,
@@ -236,6 +239,11 @@ impl ApfsExecutionHost for FakeHost {
         Ok(FakeAttachment { format })
     }
 
+    fn copy_tree(&self, _: &Path, _: &Path) -> Result<(), ApfsStorageError> {
+        self.record("copy-until-quiescent");
+        Ok(())
+    }
+
     fn mount(
         &self,
         attachment: &Self::Attachment,
@@ -267,7 +275,9 @@ impl ApfsExecutionHost for FakeHost {
         _: &Path,
         _: &LifecycleWorkspace,
         forked_from: Option<&WorkspaceName>,
+        identity: &OperationIdentity,
     ) -> Result<(), ApfsStorageError> {
+        self.record(format!("marker-identity:{}", identity.created_trace));
         self.record(if forked_from.is_some() {
             "write-marker:fork"
         } else {
@@ -348,12 +358,24 @@ impl ApfsExecutionHost for FakeHost {
         Ok(())
     }
 
+    fn publish_adopt(
+        &self,
+        _: &Path,
+        _: &Path,
+        _: &Path,
+        _: &Path,
+    ) -> Result<(), ApfsStorageError> {
+        self.record("atomic-adopt-handoff+publish");
+        Ok(())
+    }
+
     fn publish_metadata(
         &self,
         _: &Path,
         workspace: &LifecycleWorkspace,
         revision: Revision,
         policy: MetadataPolicy,
+        _: Option<&OperationIdentity>,
         _: Option<&Path>,
     ) -> Result<(), ApfsStorageError> {
         self.record(format!("atomic-metadata+parent-fsync:{policy:?}"));
@@ -366,6 +388,38 @@ impl ApfsExecutionHost for FakeHost {
             return Err(ApfsStorageError::Host("fresh revision mismatch".to_owned()));
         }
         self.seed(workspace);
+        Ok(())
+    }
+
+    fn publish_checkpoint_fact(
+        &self,
+        _: &Path,
+        label: &CheckpointLabel,
+        revision: Revision,
+        pin: Pin,
+    ) -> Result<(), ApfsStorageError> {
+        let workspace = self
+            .state
+            .lock()
+            .expect("fake state")
+            .published
+            .values()
+            .find(|fact| fact.workspace.name().is_main())
+            .expect("published workspace")
+            .workspace
+            .clone();
+        self.state
+            .lock()
+            .expect("fake state")
+            .checkpoints
+            .push(CheckpointFact {
+                repo: workspace.repo().clone(),
+                workspace: workspace.name().clone(),
+                label: label.clone(),
+                revision,
+                pin,
+            });
+        self.record(format!("checkpoint-fact:{pin:?}"));
         Ok(())
     }
 
@@ -404,6 +458,7 @@ impl ApfsExecutionHost for FakeHost {
             workspace,
             revision,
             MetadataPolicy::Preserve,
+            None,
             Some(source_image),
         )
     }
@@ -446,6 +501,18 @@ impl ApfsExecutionHost for FakeHost {
             .iter()
             .filter(|((mounted_repo, _), _)| mounted_repo == repo)
             .map(|(_, fact)| fact.clone())
+            .collect())
+    }
+
+    fn checkpoints(&self, repo: &RepoId) -> Result<Vec<CheckpointFact>, ApfsStorageError> {
+        Ok(self
+            .state
+            .lock()
+            .expect("fake state")
+            .checkpoints
+            .iter()
+            .filter(|checkpoint| &checkpoint.repo == repo)
+            .cloned()
             .collect())
     }
 
@@ -517,6 +584,28 @@ fn incarnation(value: u8) -> WorkspaceIncarnation {
     WorkspaceIncarnation::new(format!("{value:032x}")).expect("incarnation")
 }
 
+fn identity() -> OperationIdentity {
+    OperationIdentity {
+        project_root: PathBuf::from("/project"),
+        base_commit: "0123456789abcdef".to_owned(),
+        created_at: "2026-07-13T00:00:00Z".to_owned(),
+        created_trace: "apfs-storage".to_owned(),
+        grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
+            .expect("grants"),
+    }
+}
+
+fn adopt_request(format: ImageFormat) -> AdoptRequest {
+    AdoptRequest {
+        repo: repo(),
+        format,
+        topology_revision: Revision::new(0),
+        source_checkout: PathBuf::from("/project"),
+        pre_cowshed_checkout: PathBuf::from("/project.pre-cowshed"),
+        identity: identity(),
+    }
+}
+
 fn workspace(name: &str, format: ImageFormat, revision: u64) -> LifecycleWorkspace {
     let name = WorkspaceName::new(name).expect("workspace name");
     LifecycleWorkspace::new(
@@ -555,11 +644,7 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
     let lane = CountingLane::default();
     let substrate = substrate(host.clone(), lane.clone());
     let plan = substrate
-        .plan_adopt(AdoptRequest {
-            repo: repo(),
-            format: ImageFormat::Sparse,
-            topology_revision: Revision::new(0),
-        })
+        .plan_adopt(adopt_request(ImageFormat::Sparse))
         .expect("adopt plan");
 
     let receipt = substrate.execute_adopt(plan).await.expect("adopt");
@@ -581,10 +666,12 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
             "atomic-metadata+parent-fsync:Fresh",
             "attach-no-mount+fsck:Sparse",
             "mount:Sparse",
+            "copy-until-quiescent",
+            "marker-identity:apfs-storage",
             "write-marker",
             "validate-marker",
             "detach:false",
-            "atomic-publish-image",
+            "atomic-adopt-handoff+publish",
             "attach-no-mount+fsck:Sparse",
             "mount:Sparse",
             "validate-marker",
@@ -609,11 +696,7 @@ async fn ensure_mounted_is_idempotent_for_an_already_mounted_workspace() {
     let host = FakeHost::default();
     let substrate = substrate(host.clone(), CountingLane::default());
     let plan = substrate
-        .plan_adopt(AdoptRequest {
-            repo: repo(),
-            format: ImageFormat::Sparse,
-            topology_revision: Revision::new(0),
-        })
+        .plan_adopt(adopt_request(ImageFormat::Sparse))
         .expect("adopt plan");
     let workspace = substrate
         .execute_adopt(plan)
@@ -623,7 +706,7 @@ async fn ensure_mounted_is_idempotent_for_an_already_mounted_workspace() {
     host.clear_events();
 
     let path = substrate
-        .ensure_mounted(&workspace)
+        .ensure_mounted(&workspace, MountIntent { browse: false })
         .await
         .expect("already mounted");
 
@@ -642,11 +725,7 @@ async fn marker_mismatch_detaches_and_reclaims_staging_before_publication() {
     host.fail_next_marker();
     let substrate = substrate(host.clone(), CountingLane::default());
     let plan = substrate
-        .plan_adopt(AdoptRequest {
-            repo: repo(),
-            format: ImageFormat::Asif,
-            topology_revision: Revision::new(0),
-        })
+        .plan_adopt(adopt_request(ImageFormat::Asif))
         .expect("adopt plan");
 
     let error = substrate
@@ -678,6 +757,7 @@ async fn restore_staging_failure_remounts_the_old_image_without_swapping() {
             &current,
             &checkpoint,
             cowshed_core::storage::lifecycle::RestoreMode::Replace,
+            identity(),
         )
         .expect("restore plan");
     host.fail_next_metadata();
@@ -716,6 +796,7 @@ async fn restore_post_swap_marker_failure_rolls_back_and_remounts_old_image() {
             &current,
             &checkpoint,
             cowshed_core::storage::lifecycle::RestoreMode::Replace,
+            identity(),
         )
         .expect("restore plan");
     host.fail_marker_after(1);
@@ -757,7 +838,7 @@ async fn restore_metadata_publication_failure_rolls_back_after_verified_mount() 
         true,
     );
     let plan = substrate
-        .plan_restore(&current, &checkpoint, RestoreMode::Replace)
+        .plan_restore(&current, &checkpoint, RestoreMode::Replace, identity())
         .expect("restore plan");
     host.fail_next_restored_metadata();
     host.clear_events();
@@ -800,6 +881,7 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
                         repo: repo(),
                         name: WorkspaceName::session("created").expect("created"),
                         topology_revision: Revision::new(8),
+                        identity: identity(),
                     },
                 )
                 .expect("create plan"),
@@ -818,6 +900,7 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
                         repo: repo(),
                         name: WorkspaceName::session("forked").expect("forked"),
                         topology_revision: Revision::new(10),
+                        identity: identity(),
                     },
                 )
                 .expect("fork plan"),
@@ -844,7 +927,7 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
     let restored = substrate
         .execute_restore(
             substrate
-                .plan_restore(&source, &checkpoint, RestoreMode::Replace)
+                .plan_restore(&source, &checkpoint, RestoreMode::Replace, identity())
                 .expect("restore plan"),
         )
         .await
@@ -911,9 +994,26 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
         "restore must retain a pre-restore undo image"
     );
     let listed = substrate.list(&repo()).await.expect("list");
-    assert!(listed.contains(&created.workspace));
-    assert!(listed.contains(&forked.workspace));
-    assert!(listed.contains(&restored.workspace));
+    assert!(
+        listed
+            .iter()
+            .any(|observed| observed.workspace == created.workspace)
+    );
+    assert!(
+        listed
+            .iter()
+            .any(|observed| observed.workspace == forked.workspace)
+    );
+    let restored_observation = listed
+        .iter()
+        .find(|observed| observed.workspace == restored.workspace)
+        .expect("restored observation");
+    assert_eq!(
+        restored_observation.mount_state,
+        MountState::Mounted { mount_id: 3 }
+    );
+    assert_eq!(restored_observation.checkpoints.len(), 1);
+    assert_eq!(restored_observation.checkpoints[0].pin, Pin::Pinned);
 
     host.clear_events();
     substrate
@@ -984,6 +1084,7 @@ proptest! {
                                 repo: repo(),
                                 name: destination,
                                 topology_revision: Revision::new(index as u64 + 2),
+                                identity: identity(),
                             },
                         ).expect("create plan");
                         let receipt = substrate.execute_create(plan).await.expect("create");
@@ -998,6 +1099,7 @@ proptest! {
                                 repo: repo(),
                                 name: destination,
                                 topology_revision: Revision::new(index as u64 + 2),
+                                identity: identity(),
                             },
                         ).expect("fork plan");
                         let receipt = substrate.execute_fork(plan).await.expect("fork");
