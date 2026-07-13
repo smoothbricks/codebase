@@ -128,9 +128,7 @@ where
 
 #[cfg(any(not(target_os = "macos"), test))]
 fn descriptor_limit() -> io::Result<libc::rlim_t> {
-    descriptor_limit_with(|limit| unsafe {
-        libc::getrlimit(libc::RLIMIT_NOFILE, limit)
-    })
+    descriptor_limit_with(|limit| unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit) })
 }
 
 #[cfg(target_os = "macos")]
@@ -211,9 +209,7 @@ where
 fn mark_descriptor_close_on_exec(descriptor: libc::c_int) -> io::Result<()> {
     mark_descriptor_close_on_exec_with(
         descriptor,
-        |descriptor, command, argument| unsafe {
-            libc::fcntl(descriptor, command, argument)
-        },
+        |descriptor, command, argument| unsafe { libc::fcntl(descriptor, command, argument) },
         io::Error::last_os_error,
     )
 }
@@ -254,8 +250,7 @@ fn mark_non_stdio_close_on_exec_with<CloseRange, MarkDescriptor>(
     mark_descriptor: MarkDescriptor,
 ) -> io::Result<()>
 where
-    CloseRange:
-        FnOnce(libc::c_uint, libc::c_uint, libc::c_uint) -> io::Result<()>,
+    CloseRange: FnOnce(libc::c_uint, libc::c_uint, libc::c_uint) -> io::Result<()>,
     MarkDescriptor: FnMut(libc::c_int) -> io::Result<()>,
 {
     match close_range(3, libc::c_uint::MAX, CLOSE_RANGE_CLOEXEC) {
@@ -279,9 +274,7 @@ fn mark_non_stdio_close_on_exec(limit: libc::rlim_t) -> io::Result<()> {
         return mark_non_stdio_close_on_exec_with(
             limit,
             |first, last, flags| {
-                let result = unsafe {
-                    libc::syscall(libc::SYS_close_range, first, last, flags)
-                };
+                let result = unsafe { libc::syscall(libc::SYS_close_range, first, last, flags) };
                 if result == 0 {
                     Ok(())
                 } else {
@@ -683,8 +676,7 @@ mod tests {
 
         assert!(validate_fd_listing_size(-1, capacity).is_err());
         for invalid in [entry_size - 1, capacity + entry_size] {
-            let error =
-                validate_fd_listing_size(invalid as libc::c_int, capacity).unwrap_err();
+            let error = validate_fd_listing_size(invalid as libc::c_int, capacity).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
             assert_eq!(
                 error.to_string(),
@@ -785,11 +777,7 @@ mod tests {
             invocations.into_inner(),
             vec![
                 (descriptor, libc::F_GETFD, 0),
-                (
-                    descriptor,
-                    libc::F_SETFD,
-                    original_flags | libc::FD_CLOEXEC
-                )
+                (descriptor, libc::F_SETFD, original_flags | libc::FD_CLOEXEC)
             ]
         );
     }
