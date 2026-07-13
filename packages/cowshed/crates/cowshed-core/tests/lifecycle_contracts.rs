@@ -211,22 +211,6 @@ impl LifecyclePlanner for ContractSubstrate {
 impl Substrate for ContractSubstrate {
     type Error = &'static str;
 
-    async fn execute_create(&self, _: CreatePlan) -> Result<LifecycleReceipt, Self::Error> {
-        Err("not exercised")
-    }
-
-    async fn execute_checkpoint(&self, _: CheckpointPlan) -> Result<CheckpointRef, Self::Error> {
-        Err("not exercised")
-    }
-
-    async fn execute_restore(&self, _: RestorePlan) -> Result<RestoreReceipt, Self::Error> {
-        Err("not exercised")
-    }
-
-    async fn execute_fork(&self, _: ForkPlan) -> Result<LifecycleReceipt, Self::Error> {
-        Err("not exercised")
-    }
-
     async fn execute_retire(&self, plan: RetirePlan) -> Result<RetiredRef, Self::Error> {
         match plan.operation() {
             Operation::Retire { workspace, .. } if workspace == self.workspace.name() => {

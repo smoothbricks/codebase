@@ -554,6 +554,13 @@ pub struct WorkspaceInfoSnapshot {
     pub stale: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PublicationState {
+    Active,
+    PendingFence,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DetachedWorkspaceMetadata {
@@ -563,6 +570,7 @@ pub struct DetachedWorkspaceMetadata {
     pub workspace_incarnation: WorkspaceIncarnation,
     pub image_format: ImageFormat,
     pub platform: Platform,
+    pub publication_state: PublicationState,
     pub updated_at: String,
     #[serde(flatten)]
     pub grants: GrantSet,
@@ -579,6 +587,7 @@ struct DetachedWorkspaceMetadataWire {
     workspace_incarnation: WorkspaceIncarnation,
     image_format: ImageFormat,
     platform: Platform,
+    publication_state: PublicationState,
     updated_at: String,
     revision: u64,
     #[serde(default)]
@@ -610,6 +619,7 @@ impl<'de> Deserialize<'de> for DetachedWorkspaceMetadata {
             workspace_incarnation: wire.workspace_incarnation,
             image_format: wire.image_format,
             platform: wire.platform,
+            publication_state: wire.publication_state,
             updated_at: wire.updated_at,
             grants: GrantSet {
                 revision: wire.revision,
@@ -788,6 +798,7 @@ mod tests {
             "repoId": "acme/widget",
             "workspace": "raven",
             "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+            "publicationState": "active",
             "imageFormat": "asif",
             "platform": "macos",
             "updatedAt": "2026-07-11T12:34:56Z",

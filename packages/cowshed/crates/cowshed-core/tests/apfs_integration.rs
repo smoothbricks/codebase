@@ -280,7 +280,7 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
         )?;
         let fork_started = Instant::now();
         let fork = substrate
-            .execute_create(fork_plan)
+            .execute_create_staged(fork_plan, |_| async { Ok::<(), &'static str>(()) })
             .await
             .map_err(|error| std::io::Error::other(format!("live clone: {error}")))?
             .workspace;
@@ -309,14 +309,18 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             Pin::Pinned,
         )?;
         let checkpoint = substrate
-            .execute_checkpoint(checkpoint_plan)
+            .execute_checkpoint_staged(checkpoint_plan, |_| async { Ok::<(), &'static str>(()) })
             .await
             .map_err(|error| std::io::Error::other(format!("checkpoint: {error}")))?;
         fs::write(&payload, b"mutated after checkpoint\n")?;
         let restore_plan =
             substrate.plan_restore(&main, &checkpoint, RestoreMode::Replace, identity()?)?;
         let restored = substrate
-            .execute_restore(restore_plan)
+            .execute_restore_staged(
+                restore_plan,
+                |_| async { Ok::<(), &'static str>(()) },
+                |_| async { Ok::<(), &'static str>(()) },
+            )
             .await
             .map_err(|error| std::io::Error::other(format!("restore: {error}")))?
             .workspace;

@@ -77,6 +77,40 @@ fn store(root: &Path, config: ArtifactConfig) -> ArtifactStore {
 }
 
 #[test]
+fn invalid_configs_are_rejected_before_creating_protected_layout() {
+    let cases = [
+        ArtifactConfig {
+            inline_cap_bytes: MAX_INLINE_OUTPUT_BYTES + 1,
+            ..ArtifactConfig::default()
+        },
+        ArtifactConfig {
+            combined_output_quota_bytes: 0,
+            ..ArtifactConfig::default()
+        },
+        ArtifactConfig {
+            retained_recovery_budget_bytes: 0,
+            ..ArtifactConfig::default()
+        },
+    ];
+    for (index, config) in cases.into_iter().enumerate() {
+        let root = TempRoot::new(&format!("invalid-config-{index}"));
+        assert!(matches!(
+            ArtifactStore::open(
+                root.path(),
+                RepoId::parse("acme/widget").unwrap(),
+                WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
+                config,
+            ),
+            Err(ArtifactError::InvalidConfig(_))
+        ));
+        assert!(
+            !root.path().join(".cowshed").exists(),
+            "configuration validation must precede layout creation"
+        );
+    }
+}
+
+#[test]
 fn threshold_crossing_spills_only_the_crossing_stream_and_round_trips_arrow() {
     let root = TempRoot::new("threshold");
     let store = store(
@@ -339,6 +373,15 @@ fn redirect_sealing_uses_owned_descriptor_and_reads_only_independent_artifact() 
         .unwrap();
     use std::os::fd::AsRawFd;
     let redirect_fd = descriptor.as_raw_fd();
+    assert_eq!(
+        unsafe { libc::fcntl(redirect_fd, libc::F_SETFD, 0) },
+        0,
+        "clear the standard library's default close-on-exec flag"
+    );
+    assert_eq!(
+        unsafe { libc::fcntl(redirect_fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+        0
+    );
     let store = store(
         root.path(),
         ArtifactConfig {
@@ -930,6 +973,157 @@ fn open_rejects_missing_corrupt_and_swapped_file_backed_streams() {
 }
 
 #[test]
+fn verified_file_rejects_each_metadata_length_and_hash_violation() {
+    #[derive(Clone, Copy, Debug)]
+    enum Mutation {
+        WritableMode,
+        Hardlink,
+        Truncated,
+        Extended,
+        SameLengthHash,
+        Symlink,
+        Directory,
+    }
+
+    for mutation in [
+        Mutation::WritableMode,
+        Mutation::Hardlink,
+        Mutation::Truncated,
+        Mutation::Extended,
+        Mutation::SameLengthHash,
+        Mutation::Symlink,
+        Mutation::Directory,
+    ] {
+        let root = TempRoot::new(&format!("verified-file-{mutation:?}"));
+        let store = store(
+            root.path(),
+            ArtifactConfig {
+                inline_cap_bytes: 1,
+                ..ArtifactConfig::default()
+            },
+        );
+        let expected = b"sealed-authority";
+        let mut writer = store.start_job(1, OutputTargets::default()).unwrap();
+        writer.write_stdout(expected).unwrap();
+        let sealed = writer.seal(JobState::Exited).unwrap();
+        let path = root.path().join(".cowshed/job/1/out");
+
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::metadata(&path).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o400);
+            assert_eq!(metadata.nlink(), 1);
+            assert_eq!(metadata.len(), expected.len() as u64);
+        }
+        assert_eq!(
+            read_stream(root.path(), &sealed.record.stdout).unwrap(),
+            expected
+        );
+
+        match mutation {
+            Mutation::WritableMode => {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            Mutation::Hardlink => {
+                fs::hard_link(&path, root.path().join("protected-alias")).unwrap();
+            }
+            Mutation::Truncated => {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len((expected.len() - 1) as u64)
+                    .unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+            }
+            Mutation::Extended => {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(b"+")
+                    .unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+            }
+            Mutation::SameLengthHash => {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+                file.write_all(b"X").unwrap();
+                file.sync_all().unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+            }
+            Mutation::Symlink => {
+                use std::os::unix::fs::symlink;
+
+                let backing = root.path().join(".cowshed/job/1/backing");
+                fs::rename(&path, &backing).unwrap();
+                symlink("backing", &path).unwrap();
+            }
+            Mutation::Directory => {
+                fs::remove_file(&path).unwrap();
+                fs::create_dir(&path).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+            }
+        }
+
+        let error = read_stream(root.path(), &sealed.record.stdout).unwrap_err();
+        match mutation {
+            Mutation::WritableMode | Mutation::Directory => assert!(
+                matches!(
+                    &error,
+                    ArtifactError::Integrity { message, .. } if message.contains("sealed regular file")
+                ),
+                "{mutation:?}: {error:?}"
+            ),
+            Mutation::Hardlink => assert!(matches!(
+                error,
+                ArtifactError::Integrity { message, .. } if message.contains("hardlink aliases")
+            )),
+            Mutation::Truncated | Mutation::Extended => assert!(matches!(
+                error,
+                ArtifactError::Integrity { message, .. } if message.contains("length differs")
+            )),
+            Mutation::SameLengthHash => assert!(matches!(
+                error,
+                ArtifactError::Integrity { message, .. } if message.contains("does not match")
+            )),
+            Mutation::Symlink => assert!(matches!(error, ArtifactError::Io { .. })),
+        }
+        if matches!(mutation, Mutation::Directory) {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+}
+
+#[test]
+fn verified_open_rejects_a_symlinked_workspace_root() {
+    use std::os::unix::fs::symlink;
+
+    let container = TempRoot::new("symlinked-workspace-root");
+    let actual = container.path().join("actual");
+    fs::create_dir(&actual).unwrap();
+    let store = store(
+        &actual,
+        ArtifactConfig {
+            inline_cap_bytes: 1,
+            ..ArtifactConfig::default()
+        },
+    );
+    let mut writer = store.start_job(1, OutputTargets::default()).unwrap();
+    writer.write_stdout(b"protected").unwrap();
+    let sealed = writer.seal(JobState::Exited).unwrap();
+    let alias = container.path().join("alias");
+    symlink(&actual, &alias).unwrap();
+
+    assert!(matches!(
+        read_stream(&alias, &sealed.record.stdout),
+        Err(ArtifactError::Io { .. }) | Err(ArtifactError::Integrity { .. })
+    ));
+}
+
+#[test]
 fn streaming_recovery_enforces_retained_budget_before_payload_allocation() {
     let root = TempRoot::new("recovery-budget");
     let store = store(root.path(), ArtifactConfig::default());
@@ -1052,6 +1246,56 @@ fn incremental_reader_verifies_large_files_while_vec_convenience_is_bounded() {
             .finish(),
         Err(ArtifactError::Integrity { .. })
     ));
+}
+
+#[test]
+fn verified_reader_bounds_chunks_and_finish_consumes_the_exact_remainder() {
+    for inline_cap_bytes in [64, 1] {
+        let root = TempRoot::new(&format!("reader-bound-{inline_cap_bytes}"));
+        let store = store(
+            root.path(),
+            ArtifactConfig {
+                inline_cap_bytes,
+                ..ArtifactConfig::default()
+            },
+        );
+        let expected = b"abcdef";
+        let mut writer = store.start_job(1, OutputTargets::default()).unwrap();
+        writer.write_stdout(expected).unwrap();
+        let sealed = writer.seal(JobState::Exited).unwrap();
+
+        let mut partial = open_stream_reader(root.path(), &sealed.record.stdout).unwrap();
+        assert_eq!(partial.read_chunk(&mut []).unwrap(), 0);
+        assert!(!partial.is_verified());
+        let mut bounded = [0xa5; 3];
+        assert_eq!(partial.read_chunk(&mut bounded[..2]).unwrap(), 2);
+        assert_eq!(&bounded[..2], b"ab");
+        assert_eq!(bounded[2], 0xa5);
+        partial.finish().unwrap();
+
+        let mut exact = open_stream_reader(root.path(), &sealed.record.stdout).unwrap();
+        let mut observed = Vec::new();
+        let mut chunk = [0_u8; 2];
+        for expected_read in [2, 2, 2, 0] {
+            let read = exact.read_chunk(&mut chunk).unwrap();
+            assert_eq!(read, expected_read);
+            observed.extend_from_slice(&chunk[..read]);
+        }
+        assert_eq!(observed, expected);
+        assert!(exact.is_verified());
+    }
+
+    let empty_root = TempRoot::new("reader-empty");
+    let empty_store = store(empty_root.path(), ArtifactConfig::default());
+    let sealed = empty_store
+        .start_job(1, OutputTargets::default())
+        .unwrap()
+        .seal(JobState::Exited)
+        .unwrap();
+    let mut empty = open_stream_reader(empty_root.path(), &sealed.record.stdout).unwrap();
+    let mut byte = [0_u8; 1];
+    assert_eq!(empty.read_chunk(&mut byte).unwrap(), 0);
+    assert!(empty.is_verified());
 }
 
 proptest! {

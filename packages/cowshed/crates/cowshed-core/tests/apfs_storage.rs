@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use cowshed_core::apfs::{
-    ApfsCaseSensitivity, CreateImageRequest, CreatedImage, ImageFormatSelection,
+    ApfsCaseSensitivity, CreateImageRequest, CreatedImage, ImageFormatSelection, MountAccess,
 };
 use cowshed_core::metadata::{
     GrantSet, ImageFormat, PortBlock, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
@@ -36,6 +36,7 @@ struct FakeState {
     mounted: BTreeMap<(RepoId, WorkspaceName), KernelMountFact>,
     formats: BTreeMap<(RepoId, WorkspaceName), ImageFormat>,
     staged: BTreeMap<PathBuf, StorageFact>,
+    pending: BTreeMap<PathBuf, StorageFact>,
     checkpoints: Vec<CheckpointFact>,
     next_mount_id: u64,
     paths: Vec<PathBuf>,
@@ -271,6 +272,7 @@ impl ApfsExecutionHost for FakeHost {
         &self,
         attachment: &Self::Attachment,
         mount_point: &Path,
+        _: MountAccess,
         _: bool,
     ) -> Result<(), ApfsStorageError> {
         self.record_path(mount_point);
@@ -336,6 +338,12 @@ impl ApfsExecutionHost for FakeHost {
         } else {
             Ok(())
         }
+    }
+
+    fn validate_staged_companion(&self, path: &Path) -> Result<(), ApfsStorageError> {
+        self.record_path(path);
+        self.record("validate-staged-companion");
+        Ok(())
     }
     fn detach(&self, _: Self::Attachment, force: bool) -> Result<(), ApfsStorageError> {
         self.record(format!("detach:{force}"));
@@ -427,7 +435,12 @@ impl ApfsExecutionHost for FakeHost {
             workspace: workspace.clone(),
             volume_name: volume_name(workspace.repo(), workspace.name()),
         };
-        if image
+        if policy == MetadataPolicy::PendingFence {
+            let key = (workspace.repo().clone(), workspace.name().clone());
+            let mut state = self.state.lock().expect("fake state");
+            state.published.remove(&key);
+            state.pending.insert(image.to_owned(), fact);
+        } else if image
             .components()
             .any(|component| component.as_os_str() == ".staging")
         {
@@ -508,10 +521,23 @@ impl ApfsExecutionHost for FakeHost {
             canonical,
             workspace,
             revision,
-            MetadataPolicy::Preserve,
+            MetadataPolicy::PendingFence,
             None,
             Some(source_image),
         )
+    }
+
+    fn activate_restored_metadata(&self, canonical: &Path) -> Result<(), ApfsStorageError> {
+        self.record("activate-restored-metadata");
+        let mut state = self.state.lock().expect("fake state");
+        let fact = state
+            .pending
+            .remove(canonical)
+            .ok_or_else(|| ApfsStorageError::PendingPublication(canonical.to_owned()))?;
+        let key = (fact.workspace.repo().clone(), fact.workspace.name().clone());
+        state.formats.insert(key.clone(), fact.workspace.format());
+        state.published.insert(key, fact);
+        Ok(())
     }
 
     fn rollback_restore(&self, _: &Path, _: &Path, _: &Path) -> Result<(), ApfsStorageError> {
@@ -546,6 +572,31 @@ impl ApfsExecutionHost for FakeHost {
             .iter()
             .filter(|((published_repo, _), _)| published_repo == repo)
             .map(|(_, fact)| fact.clone())
+            .collect())
+    }
+
+    fn pending_publications(
+        &self,
+        repo: &RepoId,
+    ) -> Result<Vec<cowshed_core::storage::apfs::PendingPublicationFact>, ApfsStorageError> {
+        Ok(self
+            .state
+            .lock()
+            .expect("fake state")
+            .pending
+            .iter()
+            .filter(|(_, fact)| fact.workspace.repo() == repo)
+            .map(
+                |(image, fact)| cowshed_core::storage::apfs::PendingPublicationFact {
+                    workspace: fact.workspace.clone(),
+                    image: image.clone(),
+                    mount_point: if fact.workspace.name().is_main() {
+                        PathBuf::from("/project")
+                    } else {
+                        PathBuf::from(format!("/store/mnt/{}", fact.workspace.name()))
+                    },
+                },
+            )
             .collect())
     }
 
@@ -763,6 +814,7 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
             "write-marker",
             "validate-marker",
             "controller-initialize",
+            "validate-staged-companion",
             "validate-marker",
             "detach:false",
             "atomic-adopt-handoff+publish",
@@ -956,7 +1008,7 @@ async fn marker_mismatch_detaches_and_reclaims_staging_before_publication() {
 }
 
 #[tokio::test]
-async fn restore_staging_failure_remounts_the_old_image_without_swapping() {
+async fn restore_staging_failure_leaves_the_old_workspace_untouched() {
     let host = FakeHost::default();
     let current = workspace("raven", ImageFormat::Sparse, 7);
     host.seed(&current);
@@ -979,19 +1031,26 @@ async fn restore_staging_failure_remounts_the_old_image_without_swapping() {
     host.clear_events();
 
     substrate
-        .execute_restore(plan)
+        .execute_restore_staged(
+            plan,
+            |_| async { Ok::<(), &'static str>(()) },
+            |_| async { Ok::<(), &'static str>(()) },
+        )
         .await
         .expect_err("staging metadata failure");
 
     let events = host.events();
     assert!(!events.contains(&"atomic-restore-swap+undo".to_owned()));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
-    assert!(
-        events
-            .iter()
-            .any(|event| event == "attach-no-mount+fsck:Sparse")
+    assert!(!events.contains(&"detach-mounted:false".to_owned()));
+    assert!(!events.contains(&"attach-no-mount+fsck:Sparse".to_owned()));
+    assert_eq!(
+        host.list(&repo()).expect("active workspace"),
+        vec![StorageFact {
+            workspace: current,
+            volume_name: volume_name(&repo(), &WorkspaceName::new("raven").expect("workspace")),
+        }]
     );
-    assert_eq!(events.last().map(String::as_str), Some("retain-mounted"));
 }
 
 #[tokio::test]
@@ -1014,11 +1073,15 @@ async fn restore_post_swap_marker_failure_rolls_back_and_remounts_old_image() {
             identity(),
         )
         .expect("restore plan");
-    host.fail_marker_after(1);
+    host.fail_marker_after(2);
     host.clear_events();
 
     substrate
-        .execute_restore(plan)
+        .execute_restore_staged(
+            plan,
+            |_| async { Ok::<(), &'static str>(()) },
+            |_| async { Ok::<(), &'static str>(()) },
+        )
         .await
         .expect_err("canonical marker failure");
 
@@ -1059,7 +1122,11 @@ async fn restore_metadata_publication_failure_rolls_back_after_verified_mount() 
     host.clear_events();
 
     substrate
-        .execute_restore(plan)
+        .execute_restore_staged(
+            plan,
+            |_| async { Ok::<(), &'static str>(()) },
+            |_| async { Ok::<(), &'static str>(()) },
+        )
         .await
         .expect_err("restored metadata publication failure");
 
@@ -1088,7 +1155,7 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
     let substrate = substrate(host.clone(), CountingLane::default());
 
     let created = substrate
-        .execute_create(
+        .execute_create_staged(
             substrate
                 .plan_create(
                     &source,
@@ -1100,6 +1167,7 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
                     },
                 )
                 .expect("create plan"),
+            |_| async { Ok::<(), &'static str>(()) },
         )
         .await
         .expect("create");
@@ -1107,7 +1175,7 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
     assert_eq!(created.workspace.topology_revision(), Revision::new(9));
 
     let forked = substrate
-        .execute_fork(
+        .execute_fork_staged(
             substrate
                 .plan_fork(
                     &source,
@@ -1119,6 +1187,7 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
                     },
                 )
                 .expect("fork plan"),
+            |_| async { Ok::<(), &'static str>(()) },
         )
         .await
         .expect("fork");
@@ -1129,10 +1198,11 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
     assert_eq!(exact_label.as_str(), "exact");
     assert_eq!(format!("{exact_label}"), "exact");
     let checkpoint = substrate
-        .execute_checkpoint(
+        .execute_checkpoint_staged(
             substrate
                 .plan_checkpoint(&source, exact_label, Pin::Pinned)
                 .expect("checkpoint plan"),
+            |_| async { Ok::<(), &'static str>(()) },
         )
         .await
         .expect("checkpoint");
@@ -1140,10 +1210,12 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
     assert!(checkpoint.pinned());
 
     let restored = substrate
-        .execute_restore(
+        .execute_restore_staged(
             substrate
                 .plan_restore(&source, &checkpoint, RestoreMode::Replace, identity())
                 .expect("restore plan"),
+            |_| async { Ok::<(), &'static str>(()) },
+            |_| async { Ok::<(), &'static str>(()) },
         )
         .await
         .expect("restore");
@@ -1302,7 +1374,12 @@ proptest! {
                                 identity: identity(),
                             },
                         ).expect("create plan");
-                        let receipt = substrate.execute_create(plan).await.expect("create");
+                        let receipt = substrate
+                            .execute_create_staged(plan, |_| async {
+                                Ok::<(), &'static str>(())
+                            })
+                            .await
+                            .expect("create");
                         prop_assert_eq!(receipt.workspace.format(), format);
                     }
                     1 => {
@@ -1317,7 +1394,12 @@ proptest! {
                                 identity: identity(),
                             },
                         ).expect("fork plan");
-                        let receipt = substrate.execute_fork(plan).await.expect("fork");
+                        let receipt = substrate
+                            .execute_fork_staged(plan, |_| async {
+                                Ok::<(), &'static str>(())
+                            })
+                            .await
+                            .expect("fork");
                         prop_assert_eq!(receipt.workspace.format(), format);
                     }
                     _ => {
@@ -1327,7 +1409,12 @@ proptest! {
                                 .expect("label"),
                             Pin::Automatic,
                         ).expect("checkpoint plan");
-                        let checkpoint = substrate.execute_checkpoint(plan).await.expect("checkpoint");
+                        let checkpoint = substrate
+                            .execute_checkpoint_staged(plan, |_| async {
+                                Ok::<(), &'static str>(())
+                            })
+                            .await
+                            .expect("checkpoint");
                         prop_assert_eq!(checkpoint.workspace().format(), format);
                     }
                 }
