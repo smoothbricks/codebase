@@ -437,6 +437,11 @@ describe('specialized SpanContext runtime semantics', () => {
         rootContext = ctx;
         ctx.log.info('root-first');
         ctx.log.info('root-second');
+        ctx.log.info('root-third');
+        ctx.log.info('root-fourth');
+        ctx.log.info('root-fifth');
+        ctx.log.info('root-sixth');
+        ctx.log.info('root-seventh');
         await ctx.span('overflow-child', child);
         return ctx.ok('root');
       },
@@ -465,7 +470,7 @@ describe('specialized SpanContext runtime semantics', () => {
     expectThinWriter(capturedChild.log, capturedChild);
     expect(capturedRoot).not.toBe(capturedChild);
     expect(Reflect.get(capturedRoot, '_spanBuffer')).toBe(overflowRoot);
-    expect(Reflect.get(capturedRoot, '_buffer')).toBe(overflowRoot);
+    expect(Reflect.get(capturedRoot, '_buffer')).toBe(overflowRoot._overflow);
     expect(Reflect.get(capturedChild, '_spanBuffer')).toBe(overflowChild);
     expect(Reflect.get(capturedChild, '_buffer')).toBe(overflowChild._overflow);
   });

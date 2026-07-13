@@ -57,7 +57,9 @@ type RootSpanContext = SpanContext<RootContext>;
 const ROOT_HINT =
   RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_FF | RUNTIME_HINT_DEPS | RUNTIME_HINT_SPAN | RUNTIME_HINT_RESULT | 4;
 const ROOT_KEYS = [
+  '_spanBuffer',
   '_buffer',
+  '_appendLogEntry',
   '_schema',
   '_logBinding',
   '_physicalLayoutPlan',
@@ -75,7 +77,9 @@ const ROOT_KEYS = [
   'spanSync',
 ];
 const RESULT_ONLY_KEYS = [
+  '_spanBuffer',
   '_buffer',
+  '_appendLogEntry',
   '_schema',
   '_logBinding',
   '_physicalLayoutPlan',
@@ -378,7 +382,9 @@ describe('root SpanContext direct construction', () => {
     expect(Object.keys(capturedFull)).toEqual(ROOT_KEYS);
     expect(Object.keys(capturedResultOnly)).toEqual(RESULT_ONLY_KEYS);
     expect(Object.keys(alternateRoot)).toEqual([
+      '_spanBuffer',
       '_buffer',
+      '_appendLogEntry',
       '_schema',
       '_logBinding',
       '_physicalLayoutPlan',
