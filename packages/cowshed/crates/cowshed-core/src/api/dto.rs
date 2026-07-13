@@ -1136,7 +1136,7 @@ pub struct JobInfo {
     pub pid: Option<u32>,
     pub grant_revision: u64,
     pub argv: Vec<String>,
-    pub cwd: WorkspacePath,
+    pub cwd: Option<WorkspacePath>,
     pub started: UtcTimestamp,
     pub duration_ms: Option<u64>,
     pub exit: Option<ExitStatus>,
@@ -1187,7 +1187,7 @@ struct JobInfoRef<'a> {
     pid: Option<u32>,
     grant_revision: u64,
     argv: &'a [String],
-    cwd: &'a WorkspacePath,
+    cwd: &'a Option<WorkspacePath>,
     started: &'a UtcTimestamp,
     #[serde(skip_serializing_if = "Option::is_none")]
     duration_ms: Option<u64>,
@@ -1202,6 +1202,13 @@ struct JobInfoRef<'a> {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum RequiredJobCwd {
+    Nested(WorkspacePath),
+    Root(()),
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct JobInfoWire {
     repo_id: RepoId,
@@ -1211,7 +1218,7 @@ struct JobInfoWire {
     pid: Option<u32>,
     grant_revision: u64,
     argv: Vec<String>,
-    cwd: WorkspacePath,
+    cwd: RequiredJobCwd,
     started: UtcTimestamp,
     duration_ms: Option<u64>,
     exit: Option<ExitStatus>,
@@ -1264,7 +1271,10 @@ impl<'de> Deserialize<'de> for JobInfo {
             pid: wire.pid,
             grant_revision: wire.grant_revision,
             argv: wire.argv,
-            cwd: wire.cwd,
+            cwd: match wire.cwd {
+                RequiredJobCwd::Nested(path) => Some(path),
+                RequiredJobCwd::Root(()) => None,
+            },
             started: wire.started,
             duration_ms: wire.duration_ms,
             exit: wire.exit,
