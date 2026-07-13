@@ -36,7 +36,7 @@ use super::super::{
 };
 use super::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, LockMode, MarkerExpectation,
-    MetadataPolicy, layout, volume_name,
+    MetadataPolicy, PublicationDisposition, PublicationError, layout, volume_name,
 };
 
 const CHECKPOINT_FACT_VERSION: u32 = 1;
@@ -219,6 +219,15 @@ macro_rules! sync_parent {
     }};
 }
 
+fn sync_parent_path(path: &Path) -> Result<(), ApfsStorageError> {
+    let parent = path
+        .parent()
+        .ok_or(ApfsStorageError::InvalidPlan("image path has no parent"))?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| io_error("sync image directory", parent, error))
+}
+
 const MNT_DONTBROWSE: u64 = 0x0010_0000;
 const MNT_IGNORE_OWNERS: u64 = 0x0020_0000;
 
@@ -316,6 +325,7 @@ fn system_kernel_mounts() -> Result<Vec<KernelMountSnapshot>, ApfsStorageError> 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RestoreFailpoint {
     Disabled = 0,
+    CanonicalSidecarRollbackFailure = 10,
     AfterUndoSidecar = 1,
     AfterImageSwap = 2,
     AfterUndoRename = 3,
@@ -697,6 +707,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     RestoreFailpoint::AfterMetadataPublish => "metadata publish",
                     RestoreFailpoint::AfterMetadataFsync => "metadata fsync",
                     RestoreFailpoint::AfterCanonicalImageRename => "canonical image rename",
+                    RestoreFailpoint::CanonicalSidecarRollbackFailure => {
+                        "canonical sidecar rollback"
+                    }
                     RestoreFailpoint::AfterCanonicalSidecarRename => {
                         "canonical sidecar rename"
                     }
@@ -1704,29 +1717,41 @@ where
         }
     }
 
-    fn publish_image(&self, staged: &Path, canonical: &Path) -> Result<(), ApfsStorageError> {
-        self.verify_controller_path(staged)?;
-        self.verify_controller_path(canonical)?;
-        Self::ensure_parent(canonical)?;
-        let staged_format = ImageFormat::from_image_path(staged)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        let canonical_format = ImageFormat::from_image_path(canonical)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+    fn publish_image(&self, staged: &Path, canonical: &Path) -> Result<(), PublicationError> {
+        self.verify_controller_path(staged)
+            .map_err(PublicationError::rolled_back)?;
+        self.verify_controller_path(canonical)
+            .map_err(PublicationError::rolled_back)?;
+        Self::ensure_parent(canonical).map_err(PublicationError::rolled_back)?;
+        let staged_format = ImageFormat::from_image_path(staged).map_err(|error| {
+            PublicationError::rolled_back(ApfsStorageError::Host(error.to_string()))
+        })?;
+        let canonical_format = ImageFormat::from_image_path(canonical).map_err(|error| {
+            PublicationError::rolled_back(ApfsStorageError::Host(error.to_string()))
+        })?;
         if staged_format != canonical_format {
-            return Err(ApfsStorageError::InvalidPlan(
-                "canonical publication must preserve image format",
+            return Err(PublicationError::rolled_back(
+                ApfsStorageError::InvalidPlan("canonical publication must preserve image format"),
             ));
         }
         if canonical.exists() {
-            return Err(ApfsStorageError::Host(format!(
-                "canonical image already exists: {}",
-                canonical.display()
+            return Err(PublicationError::forward_only(ApfsStorageError::Host(
+                format!("canonical image already exists: {}", canonical.display()),
             )));
         }
-        let expected_metadata = DetachedWorkspaceMetadata::read_for_image(staged)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        let expected_metadata =
+            DetachedWorkspaceMetadata::read_for_image(staged).map_err(|error| {
+                PublicationError::rolled_back(ApfsStorageError::Host(error.to_string()))
+            })?;
         let publication = (|| {
             Self::rename_sidecar(staged, canonical)?;
+            if self.restore_failpoint.load(AtomicOrdering::SeqCst)
+                == RestoreFailpoint::CanonicalSidecarRollbackFailure as u8
+            {
+                return Err(ApfsStorageError::Host(
+                    "injected failure after canonical sidecar rename".to_owned(),
+                ));
+            }
             self.trip_restore_failpoint(RestoreFailpoint::AfterCanonicalSidecarRename)?;
             sync_parent!(&sidecar_path(canonical))?;
             self.trip_restore_failpoint(RestoreFailpoint::AfterMetadataFsync)?;
@@ -1755,29 +1780,52 @@ where
             })();
             return match verified {
                 Ok(()) => Ok(()),
-                Err(cleanup) => Err(ApfsStorageError::Cleanup {
+                Err(cleanup) => Err(PublicationError::forward_only(ApfsStorageError::Cleanup {
                     operation: "verify durable canonical publication",
                     primary: Box::new(primary),
                     cleanup: Box::new(cleanup),
-                }),
+                })),
             };
         }
 
-        let rollback = if !canonical.exists() && canonical_sidecar.exists() && staged.exists() {
+        if !canonical.exists() && canonical_sidecar.exists() && staged.exists() {
             let staged_sidecar = sidecar_path(staged);
-            fs::rename(&canonical_sidecar, &staged_sidecar)
-                .map_err(|error| {
-                    io_error(
-                        "roll back prepublication canonical metadata",
-                        &staged_sidecar,
-                        error,
-                    )
-                })
-                .and_then(|()| sync_parent!(&staged_sidecar))
+            let inject_rollback_failure = self.restore_failpoint.load(AtomicOrdering::SeqCst)
+                == RestoreFailpoint::CanonicalSidecarRollbackFailure as u8;
+            if inject_rollback_failure {
+                self.restore_failpoint
+                    .store(RestoreFailpoint::Disabled as u8, AtomicOrdering::SeqCst);
+            }
+            let rollback = if inject_rollback_failure {
+                Err(ApfsStorageError::Host(
+                    "injected canonical sidecar rollback rename failure".to_owned(),
+                ))
+            } else {
+                fs::rename(&canonical_sidecar, &staged_sidecar)
+                    .map_err(|error| {
+                        io_error(
+                            "roll back prepublication canonical metadata",
+                            &staged_sidecar,
+                            error,
+                        )
+                    })
+                    .and_then(|()| sync_parent!(&staged_sidecar))
+            };
+            return match rollback {
+                Ok(()) => Err(PublicationError::rolled_back(primary)),
+                Err(cleanup) => Err(PublicationError::forward_only(ApfsStorageError::Cleanup {
+                    operation: "roll back partial canonical publication",
+                    primary: Box::new(primary),
+                    cleanup: Box::new(cleanup),
+                })),
+            };
+        }
+
+        if canonical.exists() || canonical_sidecar.exists() {
+            Err(PublicationError::forward_only(primary))
         } else {
-            Ok(())
-        };
-        super::combine_cleanup("roll back partial canonical publication", primary, rollback)
+            Err(PublicationError::rolled_back(primary))
+        }
     }
 
     fn publish_adopt(
@@ -1786,64 +1834,91 @@ where
         pre_cowshed_checkout: &Path,
         staged: &Path,
         canonical: &Path,
-    ) -> Result<(), ApfsStorageError> {
+    ) -> Result<(), PublicationError> {
         if !source_checkout.is_absolute()
             || pre_cowshed_checkout != pre_cowshed_path(source_checkout)
             || !source_checkout.is_dir()
             || pre_cowshed_checkout.exists()
         {
-            return Err(ApfsStorageError::InvalidPlan(
-                "invalid adopt source or pre-cowshed handoff",
+            return Err(PublicationError::rolled_back(
+                ApfsStorageError::InvalidPlan("invalid adopt source or pre-cowshed handoff"),
             ));
         }
         fs::rename(source_checkout, pre_cowshed_checkout).map_err(|error| {
-            io_error("move original checkout aside", pre_cowshed_checkout, error)
+            PublicationError::rolled_back(io_error(
+                "move original checkout aside",
+                pre_cowshed_checkout,
+                error,
+            ))
         })?;
-        sync_parent!(pre_cowshed_checkout)?;
 
         let publication = (|| {
-            fs::create_dir(source_checkout)
-                .map_err(|error| io_error("create canonical mountpoint", source_checkout, error))?;
+            sync_parent_path(pre_cowshed_checkout).map_err(PublicationError::rolled_back)?;
+            fs::create_dir(source_checkout).map_err(|error| {
+                PublicationError::rolled_back(io_error(
+                    "create canonical mountpoint",
+                    source_checkout,
+                    error,
+                ))
+            })?;
             let stub = source_checkout.join(".envrc");
-            fs::write(&stub, SELF_HEALING_STUB)
-                .map_err(|error| io_error("write self-healing mount stub", &stub, error))?;
+            fs::write(&stub, SELF_HEALING_STUB).map_err(|error| {
+                PublicationError::rolled_back(io_error(
+                    "write self-healing mount stub",
+                    &stub,
+                    error,
+                ))
+            })?;
             fs::File::open(source_checkout)
                 .and_then(|directory| directory.sync_all())
-                .map_err(|error| io_error("sync canonical mountpoint", source_checkout, error))?;
-            sync_parent!(source_checkout)?;
+                .map_err(|error| {
+                    PublicationError::rolled_back(io_error(
+                        "sync canonical mountpoint",
+                        source_checkout,
+                        error,
+                    ))
+                })?;
+            sync_parent_path(source_checkout).map_err(PublicationError::rolled_back)?;
             self.publish_image(staged, canonical)
         })();
 
-        if let Err(primary) = publication {
-            if canonical.exists() || sidecar_path(canonical).exists() {
-                return Err(primary);
-            }
-            let cleanup = (|| {
-                let stub = source_checkout.join(".envrc");
-                match fs::remove_file(&stub) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(io_error("remove mount stub", &stub, error)),
-                }
-                match fs::remove_dir(source_checkout) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(io_error(
-                            "remove failed canonical mountpoint",
-                            source_checkout,
-                            error,
-                        ));
-                    }
-                }
-                fs::rename(pre_cowshed_checkout, source_checkout).map_err(|error| {
-                    io_error("restore original checkout", source_checkout, error)
-                })?;
-                sync_parent!(source_checkout)
-            })();
-            return super::combine_cleanup("adopt publication", primary, cleanup);
+        let Err(primary) = publication else {
+            return Ok(());
+        };
+        if primary.disposition() == PublicationDisposition::ForwardOnly {
+            return Err(primary);
         }
-        Ok(())
+        let source = primary.into_source();
+        let cleanup = (|| {
+            let stub = source_checkout.join(".envrc");
+            match fs::remove_file(&stub) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error("remove mount stub", &stub, error)),
+            }
+            match fs::remove_dir(source_checkout) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(io_error(
+                        "remove failed canonical mountpoint",
+                        source_checkout,
+                        error,
+                    ));
+                }
+            }
+            fs::rename(pre_cowshed_checkout, source_checkout)
+                .map_err(|error| io_error("restore original checkout", source_checkout, error))?;
+            sync_parent!(source_checkout)
+        })();
+        match cleanup {
+            Ok(()) => Err(PublicationError::rolled_back(source)),
+            Err(cleanup) => Err(PublicationError::forward_only(ApfsStorageError::Cleanup {
+                operation: "adopt publication rollback",
+                primary: Box::new(source),
+                cleanup: Box::new(cleanup),
+            })),
+        }
     }
 
     fn publish_metadata(

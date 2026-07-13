@@ -14,7 +14,7 @@ use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
     ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig,
-    IncarnationSource, LockMode, MarkerExpectation, MetadataPolicy, volume_name,
+    IncarnationSource, LockMode, MarkerExpectation, MetadataPolicy, PublicationError, volume_name,
 };
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, CheckpointFact, Destination, ExpectedState, KernelMountFact, LifecyclePlanner,
@@ -363,7 +363,7 @@ impl ApfsExecutionHost for FakeHost {
         Ok(())
     }
 
-    fn publish_image(&self, _: &Path, _: &Path) -> Result<(), ApfsStorageError> {
+    fn publish_image(&self, _: &Path, _: &Path) -> Result<(), PublicationError> {
         self.record("atomic-publish-image");
         Ok(())
     }
@@ -374,7 +374,7 @@ impl ApfsExecutionHost for FakeHost {
         _: &Path,
         _: &Path,
         _: &Path,
-    ) -> Result<(), ApfsStorageError> {
+    ) -> Result<(), PublicationError> {
         self.record("atomic-adopt-handoff+publish");
         Ok(())
     }

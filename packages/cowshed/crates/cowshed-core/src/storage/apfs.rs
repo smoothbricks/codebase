@@ -119,6 +119,50 @@ pub enum LockMode {
     Try,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationDisposition {
+    RolledBack,
+    ForwardOnly,
+}
+
+#[derive(Debug, Error)]
+#[error("{source}")]
+pub struct PublicationError {
+    disposition: PublicationDisposition,
+    #[source]
+    source: Box<ApfsStorageError>,
+}
+
+impl PublicationError {
+    pub fn rolled_back(source: ApfsStorageError) -> Self {
+        Self {
+            disposition: PublicationDisposition::RolledBack,
+            source: Box::new(source),
+        }
+    }
+
+    pub fn forward_only(source: ApfsStorageError) -> Self {
+        Self {
+            disposition: PublicationDisposition::ForwardOnly,
+            source: Box::new(source),
+        }
+    }
+
+    pub fn disposition(&self) -> PublicationDisposition {
+        self.disposition
+    }
+
+    pub fn into_source(self) -> ApfsStorageError {
+        *self.source
+    }
+}
+
+impl From<PublicationError> for ApfsStorageError {
+    fn from(error: PublicationError) -> Self {
+        error.into_source()
+    }
+}
+
 /// Synchronous macOS/filesystem boundary. Implementations must use the primitives in
 /// `crate::apfs`; the storage executor calls this trait only through [`ApfsBlockingLane`].
 pub trait ApfsExecutionHost: Send + Sync + 'static {
@@ -189,14 +233,14 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         workspace: &LifecycleWorkspace,
         force: bool,
     ) -> Result<(), ApfsStorageError>;
-    fn publish_image(&self, staged: &Path, canonical: &Path) -> Result<(), ApfsStorageError>;
+    fn publish_image(&self, staged: &Path, canonical: &Path) -> Result<(), PublicationError>;
     fn publish_adopt(
         &self,
         source_checkout: &Path,
         pre_cowshed_checkout: &Path,
         staged: &Path,
         canonical: &Path,
-    ) -> Result<(), ApfsStorageError>;
+    ) -> Result<(), PublicationError>;
     fn publish_metadata(
         &self,
         image: &Path,
@@ -1014,8 +1058,11 @@ fn apply_adopt<H: ApfsExecutionHost>(
         &created.path,
         &canonical,
     ) {
-        let cleanup = host.reclaim_image(&created.path, created.format);
-        return combine_cleanup("adopt publication", primary, cleanup);
+        let cleanup = match primary.disposition() {
+            PublicationDisposition::RolledBack => host.reclaim_image(&created.path, created.format),
+            PublicationDisposition::ForwardOnly => Ok(()),
+        };
+        return combine_cleanup("adopt publication", primary.into_source(), cleanup);
     }
     mount_canonical(host, &canonical, source_checkout, &workspace)?;
     Ok(Applied::Lifecycle(LifecycleReceipt {
@@ -1086,8 +1133,11 @@ fn apply_clone<H: ApfsExecutionHost>(
         return combine_cleanup("clone preparation", primary, cleanup);
     }
     if let Err(primary) = host.publish_image(&staged, &destination) {
-        let cleanup = host.reclaim_image(&staged, format);
-        return combine_cleanup("clone publication", primary, cleanup);
+        let cleanup = match primary.disposition() {
+            PublicationDisposition::RolledBack => host.reclaim_image(&staged, format),
+            PublicationDisposition::ForwardOnly => Ok(()),
+        };
+        return combine_cleanup("clone publication", primary.into_source(), cleanup);
     }
     let mount = mount_point(config, &workspace)?;
     mount_canonical(host, &destination, &mount, &workspace)?;
