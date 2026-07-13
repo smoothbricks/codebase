@@ -19,7 +19,7 @@ use cowshed_core::storage::apfs::native::{
 use cowshed_core::storage::apfs::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, MarkerExpectation, MetadataPolicy,
 };
-use cowshed_core::storage::lifecycle::{ExpectedState, Revision, WorkspaceRef};
+use cowshed_core::storage::lifecycle::{ExpectedState, LifecycleWorkspace, Revision};
 const ATTACH_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
 <dict><key>content-hint</key><string>GUID_partition_scheme</string><key>dev-entry</key><string>/dev/disk9</string></dict>
 <dict><key>content-hint</key><string>Apple_APFS</string><key>dev-entry</key><string>/dev/disk9s2</string></dict>
@@ -287,8 +287,8 @@ fn create_image(path: &Path, format: ImageFormat) {
     metadata(format).write_for_image(path).expect("sidecar");
 }
 
-fn workspace(format: ImageFormat) -> WorkspaceRef {
-    WorkspaceRef::new(
+fn workspace(format: ImageFormat) -> LifecycleWorkspace {
+    LifecycleWorkspace::new(
         repo(),
         WorkspaceName::new("main").expect("main"),
         WorkspaceIncarnation::new("00000000000000000000000000000001").expect("incarnation"),
@@ -1520,7 +1520,7 @@ fn recovery_rolls_back_when_published_metadata_is_missing() {
     next_metadata
         .write_for_image(&staged)
         .expect("next metadata");
-    let replacement = WorkspaceRef::new(
+    let replacement = LifecycleWorkspace::new(
         repo(),
         WorkspaceName::new("main").expect("main"),
         next_incarnation,
@@ -1638,7 +1638,7 @@ fn stateless_restore_recovery_converges_each_publication_boundary() {
         next_metadata
             .write_for_image(&staged)
             .expect("next metadata");
-        let replacement = WorkspaceRef::new(
+        let replacement = LifecycleWorkspace::new(
             repo(),
             WorkspaceName::new("main").expect("main"),
             next_incarnation.clone(),

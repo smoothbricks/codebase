@@ -15,10 +15,10 @@ use crate::repository::RepoId;
 
 use super::lifecycle::{
     AdoptPlan, AdoptRequest, CheckpointPlan, CheckpointRef, CreatePlan, Destination, ExecuteError,
-    ExpectedState, ForkPlan, GcReport, ImmutablePlan, KernelMountFact, LifecycleBackend,
-    LifecyclePlanner, LifecycleReceipt, MountState, ObservedState, Operation, Pin, PlanError,
+    ExpectedState, ForkPlan, ImmutablePlan, KernelMountFact, LifecycleBackend, LifecyclePlanner,
+    LifecycleReceipt, LifecycleWorkspace, MountState, ObservedState, Operation, Pin, PlanError,
     PurePlanner, RestoreMode, RestorePlan, RestoreReceipt, RetirePlan, RetiredRef, Revision,
-    StorageFact, Substrate, SubstrateStats, WorkspaceRef, execute_checked,
+    StorageFact, StorageGcReport, Substrate, SubstrateStats, execute_checked,
 };
 use super::{CheckpointLabel, StorageLayout, StorageLayoutError};
 
@@ -90,7 +90,7 @@ pub struct MarkerExpectation {
 }
 
 impl MarkerExpectation {
-    fn from_workspace(workspace: &WorkspaceRef) -> Self {
+    fn from_workspace(workspace: &LifecycleWorkspace) -> Self {
         Self {
             repo: workspace.repo().clone(),
             workspace: workspace.name().clone(),
@@ -102,7 +102,7 @@ impl MarkerExpectation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublishedImage {
-    pub workspace: WorkspaceRef,
+    pub workspace: LifecycleWorkspace,
     pub image: PathBuf,
     pub mount_point: PathBuf,
 }
@@ -151,7 +151,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     fn write_marker(
         &self,
         mount_point: &Path,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         forked_from: Option<&WorkspaceName>,
     ) -> Result<(), ApfsStorageError>;
     fn validate_marker(
@@ -162,21 +162,24 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     fn detach(&self, attachment: Self::Attachment, force: bool) -> Result<(), ApfsStorageError>;
     fn heal_mount(
         &self,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         mount_point: &Path,
     ) -> Result<(), ApfsStorageError>;
     fn retain_mounted(
         &self,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         attachment: Self::Attachment,
     ) -> Result<u64, ApfsStorageError>;
-    fn detach_mounted(&self, workspace: &WorkspaceRef, force: bool)
-    -> Result<(), ApfsStorageError>;
+    fn detach_mounted(
+        &self,
+        workspace: &LifecycleWorkspace,
+        force: bool,
+    ) -> Result<(), ApfsStorageError>;
     fn publish_image(&self, staged: &Path, canonical: &Path) -> Result<(), ApfsStorageError>;
     fn publish_metadata(
         &self,
         image: &Path,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         revision: Revision,
         policy: MetadataPolicy,
         source_image: Option<&Path>,
@@ -191,7 +194,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         &self,
         staged: &Path,
         canonical: &Path,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         revision: Revision,
         source_image: &Path,
     ) -> Result<(), ApfsStorageError>;
@@ -208,11 +211,11 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     fn recover_pending(&self, config: &ApfsSubstrateConfig) -> Result<(), ApfsStorageError>;
     fn stats(
         &self,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         image: &Path,
     ) -> Result<SubstrateStats, ApfsStorageError>;
     fn compact(&self, image: &Path, format: ImageFormat) -> Result<bool, ApfsStorageError>;
-    fn gc(&self, config: &ApfsSubstrateConfig) -> Result<GcReport, ApfsStorageError>;
+    fn gc(&self, config: &ApfsSubstrateConfig) -> Result<StorageGcReport, ApfsStorageError>;
 }
 
 #[async_trait]
@@ -389,7 +392,7 @@ where
 
     fn plan_create(
         &self,
-        from: &WorkspaceRef,
+        from: &LifecycleWorkspace,
         destination: Destination,
     ) -> Result<CreatePlan, PlanError> {
         self.planner.plan_create(from, destination)
@@ -397,7 +400,7 @@ where
 
     fn plan_fork(
         &self,
-        from: &WorkspaceRef,
+        from: &LifecycleWorkspace,
         destination: Destination,
     ) -> Result<ForkPlan, PlanError> {
         self.planner.plan_fork(from, destination)
@@ -405,7 +408,7 @@ where
 
     fn plan_checkpoint(
         &self,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         label: CheckpointLabel,
         pin: Pin,
     ) -> Result<CheckpointPlan, PlanError> {
@@ -414,14 +417,14 @@ where
 
     fn plan_restore(
         &self,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         checkpoint: &CheckpointRef,
         mode: RestoreMode,
     ) -> Result<RestorePlan, PlanError> {
         self.planner.plan_restore(workspace, checkpoint, mode)
     }
 
-    fn plan_retire(&self, workspace: &WorkspaceRef) -> Result<RetirePlan, PlanError> {
+    fn plan_retire(&self, workspace: &LifecycleWorkspace) -> Result<RetirePlan, PlanError> {
         self.planner.plan_retire(workspace)
     }
 }
@@ -484,7 +487,7 @@ where
         .await
     }
 
-    async fn list(&self, repo: &RepoId) -> Result<Vec<WorkspaceRef>, Self::Error> {
+    async fn list(&self, repo: &RepoId) -> Result<Vec<LifecycleWorkspace>, Self::Error> {
         let repo = repo.clone();
         self.dispatch_locked(move |host, _| {
             let storage = host.list(&repo)?;
@@ -497,7 +500,7 @@ where
         .await
     }
 
-    async fn mount_state(&self, workspace: &WorkspaceRef) -> Result<MountState, Self::Error> {
+    async fn mount_state(&self, workspace: &LifecycleWorkspace) -> Result<MountState, Self::Error> {
         let workspace = workspace.clone();
         self.dispatch_locked(move |host, _| {
             let storage = host.list(workspace.repo())?;
@@ -512,7 +515,7 @@ where
         .await
     }
 
-    async fn ensure_mounted(&self, workspace: &WorkspaceRef) -> Result<PathBuf, Self::Error> {
+    async fn ensure_mounted(&self, workspace: &LifecycleWorkspace) -> Result<PathBuf, Self::Error> {
         let workspace = workspace.clone();
         self.dispatch_locked(move |host, config| {
             let mount_point = mount_point(&config, &workspace)?;
@@ -542,7 +545,7 @@ where
         .await
     }
 
-    async fn unmount(&self, workspace: &WorkspaceRef) -> Result<(), Self::Error> {
+    async fn unmount(&self, workspace: &LifecycleWorkspace) -> Result<(), Self::Error> {
         let workspace = workspace.clone();
         self.dispatch_locked(move |host, _| host.detach_mounted(&workspace, false))
             .await
@@ -552,7 +555,7 @@ where
         Ok(self.config.caches_root.clone())
     }
 
-    async fn stats(&self, workspace: &WorkspaceRef) -> Result<SubstrateStats, Self::Error> {
+    async fn stats(&self, workspace: &LifecycleWorkspace) -> Result<SubstrateStats, Self::Error> {
         let workspace = workspace.clone();
         self.dispatch_locked(move |host, config| {
             let image = canonical_image_path(&config, &workspace)?;
@@ -561,7 +564,7 @@ where
         .await
     }
 
-    async fn gc(&self) -> Result<GcReport, Self::Error> {
+    async fn gc(&self) -> Result<StorageGcReport, Self::Error> {
         self.dispatch_locked(move |host, config| host.gc(&config))
             .await
     }
@@ -734,7 +737,7 @@ fn apply_adopt<H: ApfsExecutionHost>(
         },
     };
     let created = host.create_staged(&request, requested_format)?;
-    let workspace = WorkspaceRef::new(
+    let workspace = LifecycleWorkspace::new(
         repo.clone(),
         main_name(),
         incarnation,
@@ -790,7 +793,7 @@ fn apply_clone<H: ApfsExecutionHost>(
     let source = active_expected(expected, source_name, format)?;
     let destination_topology = absent_expected(expected)?;
     let incarnation = incarnations.mint()?;
-    let workspace = WorkspaceRef::new(
+    let workspace = LifecycleWorkspace::new(
         source.repo().clone(),
         destination_name.clone(),
         incarnation,
@@ -903,7 +906,7 @@ fn apply_restore<H: ApfsExecutionHost>(
     }
 
     let previous_incarnation = current.incarnation().clone();
-    let replacement = WorkspaceRef::new(
+    let replacement = LifecycleWorkspace::new(
         current.repo().clone(),
         current.name().clone(),
         incarnations.mint()?,
@@ -1005,7 +1008,7 @@ fn prepare_image<H: ApfsExecutionHost>(
     host: &H,
     image: &Path,
     mount_point: &Path,
-    workspace: &WorkspaceRef,
+    workspace: &LifecycleWorkspace,
     forked_from: Option<&WorkspaceName>,
     chown: bool,
     relabel: bool,
@@ -1034,7 +1037,7 @@ fn mount_canonical<H: ApfsExecutionHost>(
     host: &H,
     image: &Path,
     mount_point: &Path,
-    workspace: &WorkspaceRef,
+    workspace: &LifecycleWorkspace,
 ) -> Result<(), ApfsStorageError> {
     let attachment = host.attach_verified(image, workspace.format())?;
     if let Err(primary) = host.mount(&attachment, mount_point, false).and_then(|()| {
@@ -1097,7 +1100,7 @@ fn active_expected(
     expected: &[ExpectedState],
     name: &WorkspaceName,
     format: ImageFormat,
-) -> Result<WorkspaceRef, ApfsStorageError> {
+) -> Result<LifecycleWorkspace, ApfsStorageError> {
     let workspace = active_expected_with_format(expected, name, format)?;
     Ok(workspace)
 }
@@ -1106,7 +1109,7 @@ fn active_expected_with_format(
     expected: &[ExpectedState],
     name: &WorkspaceName,
     format: ImageFormat,
-) -> Result<WorkspaceRef, ApfsStorageError> {
+) -> Result<LifecycleWorkspace, ApfsStorageError> {
     let Some(ExpectedState::Exists {
         repo,
         name: expected_name,
@@ -1127,7 +1130,7 @@ fn active_expected_with_format(
     } else {
         WorkspaceRole::Workspace
     };
-    WorkspaceRef::new(
+    LifecycleWorkspace::new(
         repo.clone(),
         expected_name.clone(),
         incarnation.clone(),
@@ -1175,7 +1178,7 @@ fn layout(config: &ApfsSubstrateConfig, repo: &RepoId) -> Result<StorageLayout, 
 
 fn canonical_image_path(
     config: &ApfsSubstrateConfig,
-    workspace: &WorkspaceRef,
+    workspace: &LifecycleWorkspace,
 ) -> Result<PathBuf, ApfsStorageError> {
     let layout = layout(config, workspace.repo())?;
     if workspace.name().is_main() {
@@ -1204,7 +1207,7 @@ fn staging_stem(
 
 fn staging_image(
     config: &ApfsSubstrateConfig,
-    workspace: &WorkspaceRef,
+    workspace: &LifecycleWorkspace,
 ) -> Result<PathBuf, ApfsStorageError> {
     let stem = staging_stem(
         config,
@@ -1217,7 +1220,7 @@ fn staging_image(
 
 fn staging_mount(
     config: &ApfsSubstrateConfig,
-    workspace: &WorkspaceRef,
+    workspace: &LifecycleWorkspace,
 ) -> Result<PathBuf, ApfsStorageError> {
     Ok(layout(config, workspace.repo())?
         .project()
@@ -1232,7 +1235,7 @@ fn staging_mount(
 
 fn checkpoint_image(
     config: &ApfsSubstrateConfig,
-    workspace: &WorkspaceRef,
+    workspace: &LifecycleWorkspace,
     label: &CheckpointLabel,
 ) -> Result<PathBuf, ApfsStorageError> {
     Ok(layout(config, workspace.repo())?
@@ -1243,8 +1246,8 @@ fn checkpoint_image(
 
 fn undo_image(
     config: &ApfsSubstrateConfig,
-    current: &WorkspaceRef,
-    replacement: &WorkspaceRef,
+    current: &LifecycleWorkspace,
+    replacement: &LifecycleWorkspace,
 ) -> Result<PathBuf, ApfsStorageError> {
     Ok(layout(config, current.repo())?
         .project()
@@ -1259,7 +1262,7 @@ fn undo_image(
 
 fn retired_image_path(
     config: &ApfsSubstrateConfig,
-    workspace: &WorkspaceRef,
+    workspace: &LifecycleWorkspace,
 ) -> Result<PathBuf, ApfsStorageError> {
     let project = layout(config, workspace.repo())?
         .project()
@@ -1275,7 +1278,7 @@ fn retired_image_path(
 
 fn mount_point(
     config: &ApfsSubstrateConfig,
-    workspace: &WorkspaceRef,
+    workspace: &LifecycleWorkspace,
 ) -> Result<PathBuf, ApfsStorageError> {
     if workspace.name().is_main() {
         Ok(config.main_mount.clone())

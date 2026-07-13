@@ -15,9 +15,9 @@ use cowshed_core::storage::apfs::{
     IncarnationSource, MarkerExpectation, MetadataPolicy, volume_name,
 };
 use cowshed_core::storage::lifecycle::{
-    AdoptRequest, Destination, ExpectedState, GcReport, KernelMountFact, LifecyclePlanner,
-    MountState, ObservedState, Pin, RestoreMode, Revision, StorageFact, Substrate, SubstrateStats,
-    WorkspaceRef,
+    AdoptRequest, Destination, ExpectedState, KernelMountFact, LifecyclePlanner,
+    LifecycleWorkspace, MountState, ObservedState, Pin, RestoreMode, Revision, StorageFact,
+    StorageGcReport, Substrate, SubstrateStats,
 };
 use proptest::prelude::*;
 
@@ -89,7 +89,7 @@ impl FakeHost {
             .push(path.to_owned());
     }
 
-    fn seed(&self, workspace: &WorkspaceRef) {
+    fn seed(&self, workspace: &LifecycleWorkspace) {
         let key = (workspace.repo().clone(), workspace.name().clone());
         let mut state = self.state.lock().expect("fake state");
         state.formats.insert(key.clone(), workspace.format());
@@ -265,7 +265,7 @@ impl ApfsExecutionHost for FakeHost {
     fn write_marker(
         &self,
         _: &Path,
-        _: &WorkspaceRef,
+        _: &LifecycleWorkspace,
         forked_from: Option<&WorkspaceName>,
     ) -> Result<(), ApfsStorageError> {
         self.record(if forked_from.is_some() {
@@ -306,13 +306,13 @@ impl ApfsExecutionHost for FakeHost {
         Ok(())
     }
 
-    fn heal_mount(&self, _: &WorkspaceRef, _: &Path) -> Result<(), ApfsStorageError> {
+    fn heal_mount(&self, _: &LifecycleWorkspace, _: &Path) -> Result<(), ApfsStorageError> {
         Ok(())
     }
 
     fn retain_mounted(
         &self,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         _: Self::Attachment,
     ) -> Result<u64, ApfsStorageError> {
         self.record("retain-mounted");
@@ -331,7 +331,7 @@ impl ApfsExecutionHost for FakeHost {
 
     fn detach_mounted(
         &self,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         force: bool,
     ) -> Result<(), ApfsStorageError> {
         self.record(format!("detach-mounted:{force}"));
@@ -351,7 +351,7 @@ impl ApfsExecutionHost for FakeHost {
     fn publish_metadata(
         &self,
         _: &Path,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         revision: Revision,
         policy: MetadataPolicy,
         _: Option<&Path>,
@@ -386,7 +386,7 @@ impl ApfsExecutionHost for FakeHost {
         &self,
         _: &Path,
         canonical: &Path,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         revision: Revision,
         source_image: &Path,
     ) -> Result<(), ApfsStorageError> {
@@ -453,7 +453,7 @@ impl ApfsExecutionHost for FakeHost {
         Ok(())
     }
 
-    fn stats(&self, _: &WorkspaceRef, _: &Path) -> Result<SubstrateStats, ApfsStorageError> {
+    fn stats(&self, _: &LifecycleWorkspace, _: &Path) -> Result<SubstrateStats, ApfsStorageError> {
         Ok(SubstrateStats {
             logical_bytes: 4096,
             allocated_bytes: 1024,
@@ -466,9 +466,9 @@ impl ApfsExecutionHost for FakeHost {
         Ok(format == ImageFormat::Sparse)
     }
 
-    fn gc(&self, _: &ApfsSubstrateConfig) -> Result<GcReport, ApfsStorageError> {
+    fn gc(&self, _: &ApfsSubstrateConfig) -> Result<StorageGcReport, ApfsStorageError> {
         self.record("gc-trash+compact-detached");
-        Ok(GcReport {
+        Ok(StorageGcReport {
             examined: 2,
             reclaimed: 1,
             retained_pinned: 1,
@@ -517,9 +517,9 @@ fn incarnation(value: u8) -> WorkspaceIncarnation {
     WorkspaceIncarnation::new(format!("{value:032x}")).expect("incarnation")
 }
 
-fn workspace(name: &str, format: ImageFormat, revision: u64) -> WorkspaceRef {
+fn workspace(name: &str, format: ImageFormat, revision: u64) -> LifecycleWorkspace {
     let name = WorkspaceName::new(name).expect("workspace name");
-    WorkspaceRef::new(
+    LifecycleWorkspace::new(
         repo(),
         name.clone(),
         incarnation(revision as u8),

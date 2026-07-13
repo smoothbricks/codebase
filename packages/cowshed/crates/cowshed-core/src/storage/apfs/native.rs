@@ -24,8 +24,8 @@ use crate::metadata::{
 use crate::repository::RepoId;
 
 use super::super::lifecycle::{
-    ExpectedState, GcReport, KernelMountFact, ObservedState, Revision, StorageFact, SubstrateStats,
-    WorkspaceRef,
+    ExpectedState, KernelMountFact, LifecycleWorkspace, ObservedState, Revision, StorageFact,
+    StorageGcReport, SubstrateStats,
 };
 use super::super::{CheckpointLabel, WORKSPACE_MARKER_PATH, discover_session_images};
 use super::{
@@ -738,7 +738,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
     }
 
-    fn gc_project(&self, project: &Path, report: &mut GcReport) -> Result<(), ApfsStorageError>
+    fn gc_project(
+        &self,
+        project: &Path,
+        report: &mut StorageGcReport,
+    ) -> Result<(), ApfsStorageError>
     where
         R: CommandRunner,
     {
@@ -989,7 +993,7 @@ where
     fn write_marker(
         &self,
         mount_point: &Path,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         forked_from: Option<&WorkspaceName>,
     ) -> Result<(), ApfsStorageError> {
         let marker = WorkspaceMarker {
@@ -1045,7 +1049,7 @@ where
 
     fn heal_mount(
         &self,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         mount_point: &Path,
     ) -> Result<(), ApfsStorageError> {
         let Some(mount) = self
@@ -1078,7 +1082,7 @@ where
 
     fn retain_mounted(
         &self,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         attachment: Self::Attachment,
     ) -> Result<u64, ApfsStorageError> {
         let key = (workspace.repo().clone(), workspace.name().clone());
@@ -1108,7 +1112,7 @@ where
 
     fn detach_mounted(
         &self,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         force: bool,
     ) -> Result<(), ApfsStorageError> {
         let key = (workspace.repo().clone(), workspace.name().clone());
@@ -1218,7 +1222,7 @@ where
     fn publish_metadata(
         &self,
         image: &Path,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         revision: Revision,
         policy: MetadataPolicy,
         source_image: Option<&Path>,
@@ -1309,7 +1313,7 @@ where
         &self,
         staged: &Path,
         canonical: &Path,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         revision: Revision,
         source_image: &Path,
     ) -> Result<(), ApfsStorageError> {
@@ -1628,7 +1632,7 @@ where
 
     fn stats(
         &self,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         image: &Path,
     ) -> Result<SubstrateStats, ApfsStorageError> {
         workspace
@@ -1682,13 +1686,13 @@ where
         Ok(true)
     }
 
-    fn gc(&self, config: &ApfsSubstrateConfig) -> Result<GcReport, ApfsStorageError> {
+    fn gc(&self, config: &ApfsSubstrateConfig) -> Result<StorageGcReport, ApfsStorageError> {
         if config.store_root != self.config.store_root {
             return Err(ApfsStorageError::InvalidPlan(
                 "GC config differs from host storage root",
             ));
         }
-        let mut report = GcReport::default();
+        let mut report = StorageGcReport::default();
         let owners = match fs::read_dir(&config.store_root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(report),
@@ -1721,14 +1725,14 @@ where
 
 fn metadata_workspace_ref(
     metadata: &DetachedWorkspaceMetadata,
-) -> Result<WorkspaceRef, ApfsStorageError> {
+) -> Result<LifecycleWorkspace, ApfsStorageError> {
     let role = if metadata.workspace.is_main() {
         WorkspaceRole::Main
     } else {
         WorkspaceRole::Workspace
     };
     let revision = Revision::new(metadata.grants.revision);
-    WorkspaceRef::new(
+    LifecycleWorkspace::new(
         metadata.repo_id.clone(),
         metadata.workspace.clone(),
         metadata.workspace_incarnation.clone(),
