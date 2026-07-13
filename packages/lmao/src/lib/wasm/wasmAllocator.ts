@@ -20,6 +20,13 @@
 // Types
 // =============================================================================
 
+export interface WasmMemoryEpochPin {
+  readonly buffer: ArrayBuffer;
+  readonly version: number;
+  readonly released: boolean;
+  release(): void;
+}
+
 export interface WasmAllocator {
   /** The underlying WASM memory */
   readonly memory: WebAssembly.Memory;
@@ -27,6 +34,8 @@ export interface WasmAllocator {
   readonly memoryVersion: number;
   /** Refresh canonical allocator views after growth and return memoryVersion. */
   refreshViews(): number;
+  /** Pin the current linear-memory backing epoch for borrowed Arrow views. */
+  pinMemoryEpoch(): WasmMemoryEpochPin;
 
 
 
@@ -222,9 +231,13 @@ function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Me
   let views = createViews(memory);
   let currentBuffer = memory.buffer;
   let memoryVersion = 1;
+  let memoryEpochPins = 0;
 
   const refreshViews = (): number => {
     if (memory.buffer !== currentBuffer) {
+      if (memoryEpochPins !== 0) {
+        throw new Error('WASM memory grew while an Arrow lease pinned the previous epoch');
+      }
       currentBuffer = memory.buffer;
       views = createViews(memory);
       memoryVersion++;
@@ -243,6 +256,24 @@ function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Me
       return refreshViews();
     },
     refreshViews,
+    pinMemoryEpoch() {
+      const version = refreshViews();
+      const buffer = currentBuffer;
+      memoryEpochPins++;
+      let released = false;
+      return {
+        buffer,
+        version,
+        get released() {
+          return released;
+        },
+        release() {
+          if (released) return;
+          released = true;
+          memoryEpochPins--;
+        },
+      };
+    },
 
     get u8() {
       refreshViews();

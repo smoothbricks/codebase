@@ -47,6 +47,23 @@ export interface EagerColumnDescriptor {
   readonly key: string;
 }
 
+export interface ArrowExposurePlan {
+  readonly version: 1;
+  readonly primitiveStorage: 'borrowed-chunks' | 'owned-copy';
+  readonly dictionaryStorage: 'pinned-generation-prefix';
+}
+
+const JS_ARROW_EXPOSURE: ArrowExposurePlan = Object.freeze({
+  version: 1,
+  primitiveStorage: 'borrowed-chunks',
+  dictionaryStorage: 'pinned-generation-prefix',
+});
+const WASM_ARROW_EXPOSURE: ArrowExposurePlan = Object.freeze({
+  version: 1,
+  primitiveStorage: 'owned-copy',
+  dictionaryStorage: 'pinned-generation-prefix',
+});
+
 const EMPTY_EAGER_COLUMNS: EagerColumnDescriptor = Object.freeze({
   names: Object.freeze([]),
   words: Object.freeze([]),
@@ -117,6 +134,8 @@ export interface PhysicalLayoutPlan<
   readonly appenders: PhysicalAppenders;
   /** Immutable global vocabulary generation used by dense row identities in this plan. */
   readonly vocabularyGeneration: VocabularyGeneration;
+  /** Startup-fixed ownership policy used by leased Arrow conversion. */
+  readonly arrowExposure: ArrowExposurePlan;
   /** Reserved immutable ownership slot; buffer pooling is a later task. */
   readonly poolRef: null;
   readonly remapDescriptor: RemapDescriptor | null;
@@ -269,6 +288,7 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
     clock: TRACE_ROOT_CLOCK,
     appenders: APPENDERS_BY_MESSAGE_LAYOUT[messageLayoutFamily],
     vocabularyGeneration,
+    arrowExposure: backendKind === 'wasm' ? WASM_ARROW_EXPOSURE : JS_ARROW_EXPOSURE,
     poolRef: null,
     remapDescriptor: null,
     newCtx0,

@@ -14,9 +14,10 @@
 
 import type { Table } from '@uwdata/flechette';
 import { bench, group, run, summary } from 'mitata';
-import { walkSpanTree } from '../src/lib/arrow/utils.js';
-import { createSpanLogger } from '../src/lib/codegen/spanLoggerGenerator.js';
+import { walkSpanTree } from '../src/lib/traceTopology.js';
+import type { SpanLoggerImpl } from '../src/lib/codegen/spanLoggerGenerator.js';
 import { convertSpanTreeToArrowTable, convertToArrowTable } from '../src/lib/convertToArrow.js';
+import { getVocabularyDictionaryPrefix } from '../src/lib/arrow/vocabularyDictionary.js';
 import { defineOpContext } from '../src/lib/defineOpContext.js';
 import { JsBufferStrategy } from '../src/lib/JsBufferStrategy.js';
 import { createOpMetadata } from '../src/lib/opContext/defineOp.js';
@@ -49,7 +50,6 @@ const TEMPLATE_BINDING = registerBenchmarkVocabulary(TEMPLATES);
 const USER_SCHEMA = defineLogSchema({ marker: S.category() });
 const OP_CONTEXT = defineOpContext({ logSchema: USER_SCHEMA });
 const FULL_SCHEMA = OP_CONTEXT.logBinding.logSchema;
-const TRACER = new TestTracer(OP_CONTEXT, { bufferStrategy: new JsBufferStrategy(), createTraceRoot });
 const textEncoder = new TextEncoder();
 
 interface Counters {
@@ -94,17 +94,8 @@ function metadataForScenario(name: string) {
   return createOpMetadata(name, '@smoothbricks/arrow-flush-bench', 'arrow-flush-path.bench.ts', 'bench', 1);
 }
 
-function initializeSpan(buffer: AnySpanBuffer, name: string, timestampBase: bigint): void {
-  buffer.timestamp[0] = timestampBase;
-  buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
-  buffer.message(0, name);
-  buffer.timestamp[1] = timestampBase + 1n;
-  buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
-  buffer.message(1, name);
-}
 
-function writeLogs(buffer: SpanBuffer, kind: MessageKind, count: number): void {
-  const logger = createSpanLogger(FULL_SCHEMA, buffer);
+function writeLogs(logger: SpanLoggerImpl<typeof FULL_SCHEMA>, kind: MessageKind, count: number): void {
   for (let index = 0; index < count; index++) {
     if (kind === 'static' || (kind === 'mixed' && (index & 1) === 0)) {
       logger._infoTemplate(TEMPLATE_BINDING[index % TEMPLATES.length]!);
@@ -122,26 +113,35 @@ function collectBuffers(root: AnySpanBuffer): AnySpanBuffer[] {
   return buffers;
 }
 
-function makeScenario(kind: MessageKind, logCount: number, topology: Topology): Scenario {
-  const capacity = topology === 'overflow-capacity' ? 8 : 64;
+async function makeScenario(kind: MessageKind, logCount: number, topology: Topology): Promise<Scenario> {
+  const requestedCapacity = topology === 'overflow-capacity' ? 8 : 64;
   const depth = topology === 'depth-3-tree' ? 3 : 1;
-  const metadata = metadataForScenario(`${kind}-${logCount}-${topology}`);
-  const traceRoot = createTraceRoot(createTraceId(`arrow-flush-${kind}-${logCount}-${topology}`), TRACER);
-  const root = createSpanBuffer(FULL_SCHEMA, traceRoot, metadata, capacity);
-  initializeSpan(root, 'root-span', 1_000n);
-  writeLogs(root, kind, logCount);
-
-  if (depth === 3) {
-    const BufferClass = getSpanBufferClass(FULL_SCHEMA);
-    let parent = root;
-    for (let level = 1; level < depth; level++) {
-      const child = createChildSpanBuffer(parent, BufferClass, metadata, metadata, capacity) as SpanBuffer;
-      parent._children.push(child);
-      initializeSpan(child, `child-span-${level}`, BigInt((level + 1) * 1_000));
-      writeLogs(child, kind, logCount);
-      parent = child;
+  const scenarioName = `${kind}-${logCount}-${topology}`;
+  const metadata = metadataForScenario(scenarioName);
+  const tracer = new TestTracer(OP_CONTEXT, { bufferStrategy: new JsBufferStrategy(), createTraceRoot });
+  const op = OP_CONTEXT.defineOp(`arrow-flush-${scenarioName}`, async (ctx) => {
+    writeLogs(ctx.log as SpanLoggerImpl<typeof FULL_SCHEMA>, kind, logCount);
+    if (depth === 3) {
+      await ctx.span('child-span-1', async (child1) => {
+        writeLogs(child1.log as SpanLoggerImpl<typeof FULL_SCHEMA>, kind, logCount);
+        await child1.span('child-span-2', (child2) => {
+          writeLogs(child2.log as SpanLoggerImpl<typeof FULL_SCHEMA>, kind, logCount);
+          return child2.ok(null);
+        });
+        return child1.ok(null);
+      });
     }
+    return ctx.ok(null);
+  }, metadata);
+  const previousCapacity = op.callsitePlan.SpanBufferClass.stats.capacity;
+  op.callsitePlan.SpanBufferClass.stats.capacity = requestedCapacity;
+  try {
+    await tracer.trace('root-span', op);
+  } finally {
+    op.callsitePlan.SpanBufferClass.stats.capacity = previousCapacity;
   }
+  const root = tracer.rootBuffers[0];
+  if (!root) throw new Error(`${scenarioName}: production trace did not retain a root buffer`);
 
   const buffers = collectBuffers(root);
   const staticValues = new Set<string>(TEMPLATES);
@@ -158,7 +158,7 @@ function makeScenario(kind: MessageKind, logCount: number, topology: Topology): 
     kind,
     logCount,
     topology,
-    capacity,
+    capacity: root._capacity,
     depth,
     root,
     buffers,
@@ -311,8 +311,9 @@ function directNumericStaticSuffixModel(scenario: Scenario): DirectNumericResult
   for (const buffer of scenario.buffers) {
     for (let row = 0; row < buffer._writeIndex; row++, outputRow++) {
       const header = buffer._logHeaders[row]!;
-      if (header !== 0) {
-        indices[outputRow] = scenario.staticDenseIndices[header >>> 8]!;
+      const denseIndex = header >>> 8;
+      if (denseIndex !== 0) {
+        indices[outputRow] = denseIndex;
         continue;
       }
 
@@ -321,7 +322,7 @@ function directNumericStaticSuffixModel(scenario: Scenario): DirectNumericResult
       dynamicLookupCount++;
       let index = suffix.get(value);
       if (index === undefined) {
-        index = TEMPLATES.length + suffix.size;
+        index = getVocabularyDictionaryPrefix(buffer._vocabularyGeneration).length + suffix.size;
         suffix.set(value, index);
       }
       indices[outputRow] = index;
@@ -335,10 +336,18 @@ function validateDirectNumericResult(
   result: DirectNumericResult,
   expectedMessages: readonly (string | null)[],
 ): Counters {
-  const dictionary = [...TEMPLATES, ...result.suffix.keys()];
-  const decoded = Array.from(result.indices, (index) => dictionary[index] ?? null);
+  const prefix = getVocabularyDictionaryPrefix(scenario.root._vocabularyGeneration);
+  const prefixValues = Array.from(prefix.valueToDenseIndex.entries())
+    .sort((left, right) => left[1] - right[1])
+    .map(([value]) => value);
+  const dictionary = [...prefixValues, ...result.suffix.keys()];
+  const decoded = Array.from(result.indices, (index, row) =>
+    expectedMessages[row] === null ? null : (dictionary[index] ?? null),
+  );
   if (JSON.stringify(decoded) !== JSON.stringify(expectedMessages)) {
-    throw new Error(`${scenario.name}: direct numeric static/suffix kernel mismatch`);
+    throw new Error(
+      `${scenario.name}: direct numeric static/suffix kernel mismatch ${JSON.stringify({ decoded, expectedMessages, indices: Array.from(result.indices), dictionary })}`,
+    );
   }
   const suffixBytes = Array.from(result.suffix.keys()).reduce((sum, value) => sum + byteLength(value), 0);
   return {
@@ -433,22 +442,36 @@ function assertMessageArrow(scenario: Scenario, table: Table, expectedMessages: 
       `${scenario.name}: cross-topology schema/type mismatch actual=${schemaSignature} canonical=${canonicalSchema}`,
     );
   }
-  if (JSON.stringify(flattenMessages(logical)) !== JSON.stringify(expectedMessages)) {
-    throw new Error(`${scenario.name}: decoded message/row-order mismatch`);
+  if (
+    logical.rows !== expectedMessages.length ||
+    JSON.stringify(flattenMessages(logical)) !== JSON.stringify(expectedMessages)
+  ) {
+    throw new Error(`${scenario.name}: production Arrow decoded rows mismatch`);
   }
 
   const snapshot = dictionarySnapshot(table, 'message');
-  const dictionary = expectedDictionary(expectedMessages, true);
+  const prefix = getVocabularyDictionaryPrefix(scenario.root._vocabularyGeneration);
+  const prefixValues = Array.from(prefix.valueToDenseIndex.entries())
+    .sort((left, right) => left[1] - right[1])
+    .map(([value]) => value);
+  const dynamicSuffix = Array.from(
+    new Set(
+      expectedMessages.filter(
+        (value): value is string => value !== null && !prefix.valueToDenseIndex.has(value),
+      ),
+    ),
+  );
+  const dictionary = [...prefixValues, ...dynamicSuffix];
   const expectedIndices = expectedMessages.map((value) => (value === null ? 0 : dictionary.indexOf(value)));
   const expectedBitmapBytes = new Uint8Array(Math.ceil(expectedMessages.length / 8));
   for (let index = 0; index < expectedMessages.length; index++) {
     if (expectedMessages[index] !== null) expectedBitmapBytes[index >> 3]! |= 1 << (index & 7);
   }
   const expectedBitmap = Array.from(expectedBitmapBytes);
-  const expectedIndexArray =
-    dictionary.length <= 255 ? 'Uint8Array' : dictionary.length <= 65_535 ? 'Uint16Array' : 'Uint32Array';
   if (JSON.stringify(snapshot.values) !== JSON.stringify(dictionary)) {
-    throw new Error(`${scenario.name}: message dictionary-values mismatch`);
+    throw new Error(
+      `${scenario.name}: message dictionary-values mismatch ${JSON.stringify({ actual: snapshot.values, expected: dictionary })}`,
+    );
   }
   if (JSON.stringify(snapshot.indices) !== JSON.stringify(expectedIndices)) {
     throw new Error(`${scenario.name}: message dictionary-indices mismatch`);
@@ -459,7 +482,7 @@ function assertMessageArrow(scenario: Scenario, table: Table, expectedMessages: 
   if (snapshot.nullCount !== expectedMessages.filter((value) => value === null).length) {
     throw new Error(`${scenario.name}: message null-count mismatch`);
   }
-  if (snapshot.indexArrayName !== expectedIndexArray) {
+  if (snapshot.indexArrayName !== 'Uint32Array') {
     throw new Error(`${scenario.name}: message index-width/type mismatch`);
   }
 }
@@ -692,7 +715,6 @@ function makeStringScenario(profile: StringProfile, topology: Topology): StringS
     let parent = root;
     for (let depth = 1; depth < 3; depth++) {
       const child = createChildSpanBuffer(parent, BufferClass, metadata, metadata, capacity) as SpanBuffer;
-      parent._children.push(child);
       writeStringRows(child, rows.slice(depth * 4, depth * 4 + 4), depth * 4);
       buffers.push(child);
       parent = child;
@@ -737,8 +759,18 @@ function dictionarySnapshot(
     throw new Error(`Expected dictionary Arrow type for ${columnName}`);
   }
   if (!ArrayBuffer.isView(batch.values)) throw new Error(`Missing dictionary indices for ${columnName}`);
-  const dictionaryBatch = dictionary.data?.[0];
-  if (!(dictionaryBatch?.values instanceof Uint8Array) || !(dictionaryBatch.offsets instanceof Int32Array)) {
+  const dictionaryBatches = dictionary.data as readonly {
+    readonly length: number;
+    readonly values: Uint8Array;
+    readonly offsets: Int32Array;
+  }[];
+  if (
+    dictionaryBatches.length === 0 ||
+    dictionaryBatches.some(
+      (dictionaryBatch) =>
+        !(dictionaryBatch.values instanceof Uint8Array) || !(dictionaryBatch.offsets instanceof Int32Array),
+    )
+  ) {
     throw new Error(`Missing raw UTF-8 dictionary buffers for ${columnName}`);
   }
   const values = Array.from({ length: dictionary.length }, (_, index) => String(dictionary.get(index)));
@@ -750,15 +782,29 @@ function dictionarySnapshot(
     expectedOffsets[index + 1] = totalBytes;
   }
   const expectedBytes = new Uint8Array(totalBytes);
+  const physicalBytes = new Uint8Array(totalBytes);
+  const physicalOffsets = new Int32Array(values.length + 1);
   let byteOffset = 0;
+  let valueOffset = 0;
+  for (const dictionaryBatch of dictionaryBatches) {
+    const batchByteLength = dictionaryBatch.offsets[dictionaryBatch.length];
+    if (batchByteLength === undefined) throw new Error(`${columnName}: missing dictionary byte boundary`);
+    physicalBytes.set(dictionaryBatch.values.subarray(0, batchByteLength), byteOffset);
+    for (let index = 1; index <= dictionaryBatch.length; index++) {
+      physicalOffsets[valueOffset + index] = byteOffset + dictionaryBatch.offsets[index]!;
+    }
+    byteOffset += batchByteLength;
+    valueOffset += dictionaryBatch.length;
+  }
+  byteOffset = 0;
   for (const bytes of encoded) {
     expectedBytes.set(bytes, byteOffset);
     byteOffset += bytes.byteLength;
   }
-  if (JSON.stringify(Array.from(dictionaryBatch.values)) !== JSON.stringify(Array.from(expectedBytes))) {
+  if (JSON.stringify(Array.from(physicalBytes)) !== JSON.stringify(Array.from(expectedBytes))) {
     throw new Error(`${columnName}: raw UTF-8 dictionary bytes mismatch`);
   }
-  if (JSON.stringify(Array.from(dictionaryBatch.offsets)) !== JSON.stringify(Array.from(expectedOffsets))) {
+  if (JSON.stringify(Array.from(physicalOffsets)) !== JSON.stringify(Array.from(expectedOffsets))) {
     throw new Error(`${columnName}: raw UTF-8 dictionary offsets mismatch`);
   }
   const validity = batch.validity instanceof Uint8Array ? Array.from(batch.validity) : [];
@@ -775,8 +821,8 @@ function dictionarySnapshot(
       const value = column.get(index);
       return value == null ? null : String(value);
     }),
-    utf8Bytes: Array.from(dictionaryBatch.values),
-    utf8Offsets: Array.from(dictionaryBatch.offsets),
+    utf8Bytes: Array.from(physicalBytes),
+    utf8Offsets: Array.from(physicalOffsets),
   };
 }
 
@@ -922,7 +968,7 @@ const selectedTopologies = TOPOLOGIES; // Quick still exercises schema parity ac
 for (const topology of selectedTopologies) {
   for (const kind of MESSAGE_KINDS) {
     for (const logCount of selectedLogCounts) {
-      const scenario = makeScenario(kind, logCount, topology);
+      const scenario = await makeScenario(kind, logCount, topology);
       const preflight = preflightScenario(scenario);
       summary(() => registerScenario(scenario, preflight));
     }
