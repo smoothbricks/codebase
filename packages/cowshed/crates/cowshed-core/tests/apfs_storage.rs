@@ -827,14 +827,13 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
     assert_eq!(forked.workspace.revision(), Revision::new(6));
     assert_eq!(forked.workspace.topology_revision(), Revision::new(11));
 
+    let exact_label = CheckpointLabel::new("exact").expect("label");
+    assert_eq!(exact_label.as_str(), "exact");
+    assert_eq!(format!("{exact_label}"), "exact");
     let checkpoint = substrate
         .execute_checkpoint(
             substrate
-                .plan_checkpoint(
-                    &source,
-                    CheckpointLabel::new("exact").expect("label"),
-                    Pin::Pinned,
-                )
+                .plan_checkpoint(&source, exact_label, Pin::Pinned)
                 .expect("checkpoint plan"),
         )
         .await
