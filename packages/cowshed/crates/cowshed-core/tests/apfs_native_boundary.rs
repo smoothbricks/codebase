@@ -10,8 +10,8 @@ use cowshed_core::apfs::{
     CreateImageRequest, ImageFormatSelection,
 };
 use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, GrantSet, ImageFormat, METADATA_VERSION, Platform, PortBlock,
-    WorkspaceIncarnation, WorkspaceName, WorkspaceRole, sidecar_path,
+    sidecar_path, DetachedWorkspaceMetadata, GrantSet, ImageFormat, Platform, PortBlock,
+    WorkspaceIncarnation, WorkspaceName, WorkspaceRole, METADATA_VERSION,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::{CheckpointLabel, StorageLayout};
@@ -37,13 +37,18 @@ const APFS_LIST_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>Containe
 <key>Volumes</key><array><dict><key>DeviceIdentifier</key><string>disk10s1</string></dict></array>
 </dict></array></dict></plist>"#;
 
+const EMPTY_ATTACHMENT_INVENTORY: &str =
+    r#"<?xml version="1.0"?><plist><dict><key>images</key><array/></dict></plist>"#;
+
 fn successful_output(request: &CommandRequest) -> CommandOutput {
     let args: Vec<_> = request
         .args
         .iter()
         .map(|argument| argument.to_string_lossy())
         .collect();
-    let stdout = if args.first().is_some_and(|argument| argument == "attach") {
+    let stdout = if request.program == Path::new("/usr/bin/hdiutil") && args == ["info", "-plist"] {
+        EMPTY_ATTACHMENT_INVENTORY.as_bytes().to_vec()
+    } else if args.first().is_some_and(|argument| argument == "attach") {
         ATTACH_PLIST.as_bytes().to_vec()
     } else if args.starts_with(&["apfs".into(), "list".into()]) {
         APFS_LIST_PLIST.as_bytes().to_vec()
@@ -91,10 +96,11 @@ impl CommandRunner for RecordingRunner {
             .lock()
             .expect("requests")
             .push(request.clone());
-        let is_info = request
-            .args
-            .first()
-            .is_some_and(|argument| argument == "info");
+        let is_info = request.program == Path::new("/usr/sbin/diskutil")
+            && request
+                .args
+                .first()
+                .is_some_and(|argument| argument == "info");
         if is_info {
             let device = request
                 .args
@@ -136,10 +142,11 @@ impl FailingDetachRunner {
 impl CommandRunner for FailingDetachRunner {
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        if request
-            .args
-            .first()
-            .is_some_and(|argument| argument == "info")
+        if request.program == Path::new("/usr/sbin/diskutil")
+            && request
+                .args
+                .first()
+                .is_some_and(|argument| argument == "info")
         {
             let device = request
                 .args
@@ -598,8 +605,8 @@ fn mount_registry_actor_owns_attachment_state_and_blocks_mounted_compaction() {
         .expect("detach retained image");
     assert_eq!(
         runner.calls(),
-        5,
-        "attach, volume resolution, fsck, mount, and detach cross the command boundary"
+        6,
+        "inventory, attach, volume resolution, fsck, mount, and detach cross the command boundary"
     );
 }
 
@@ -801,12 +808,11 @@ fn canonical_identity_mismatches_are_rejected_one_dimension_at_a_time() {
             .expect("mismatched metadata");
         let host = native_host(&fixture, RecordingRunner::default());
 
-        assert!(
-            host.list(&repo())
-                .expect_err("identity mismatch")
-                .to_string()
-                .contains("detached metadata identity mismatch")
-        );
+        assert!(host
+            .list(&repo())
+            .expect_err("identity mismatch")
+            .to_string()
+            .contains("detached metadata identity mismatch"));
     }
 }
 
@@ -1003,10 +1009,9 @@ fn stats_distinguish_a_missing_checkpoint_directory_from_an_invalid_one() {
     let checkpoint_path = layout.project().checkpoints.join("main");
     std::fs::create_dir_all(checkpoint_path.parent().expect("parent")).expect("parent");
     std::fs::write(&checkpoint_path, b"not a directory").expect("checkpoint file");
-    assert!(
-        host.stats(&workspace(ImageFormat::Sparse), canonical.image())
-            .is_err()
-    );
+    assert!(host
+        .stats(&workspace(ImageFormat::Sparse), canonical.image())
+        .is_err());
 }
 
 #[cfg(unix)]
@@ -1019,12 +1024,11 @@ fn chown_rejects_a_nul_path_before_the_native_call() {
     host.chown_volume_root(&fixture.root)
         .expect("chown owned directory to current user");
     let invalid = PathBuf::from(std::ffi::OsString::from_vec(b"invalid\0path".to_vec()));
-    assert!(
-        host.chown_volume_root(&invalid)
-            .expect_err("NUL path")
-            .to_string()
-            .contains("contains NUL")
-    );
+    assert!(host
+        .chown_volume_root(&invalid)
+        .expect_err("NUL path")
+        .to_string()
+        .contains("contains NUL"));
 }
 
 #[test]
@@ -1043,7 +1047,11 @@ fn reverse_teardown_drains_actor_state_and_detaches_every_attachment() {
 
     host.detach_all_reverse().expect("reverse detach");
 
-    assert_eq!(runner.calls(), 4, "attach, resolve, fsck, detach");
+    assert_eq!(
+        runner.calls(),
+        5,
+        "inventory, attach, resolve, fsck, detach"
+    );
 }
 
 #[test]
@@ -1056,10 +1064,9 @@ fn sidecar_removal_does_not_hide_non_file_errors() {
     std::fs::create_dir_all(sidecar_path(image.image())).expect("sidecar directory");
     let host = native_host(&fixture, RecordingRunner::default());
 
-    assert!(
-        host.reclaim_image(image.image(), ImageFormat::Sparse)
-            .is_err()
-    );
+    assert!(host
+        .reclaim_image(image.image(), ImageFormat::Sparse)
+        .is_err());
 }
 
 #[test]
@@ -1081,6 +1088,7 @@ fn failed_detach_restores_actor_state_and_force_retries_exactly_once() {
 
     runner.failures_remaining.store(1, Ordering::SeqCst);
     host.detach_mounted(&workspace, true).expect("forced retry");
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 7);
     assert_eq!(
         *runner.detach_attempts.lock().expect("detach attempts"),
         [false, false, true],
@@ -1102,7 +1110,11 @@ fn direct_detach_crosses_the_backend_boundary() {
 
     host.detach(attachment, false).expect("detach");
 
-    assert_eq!(runner.calls(), 4, "attach, resolve, fsck, detach");
+    assert_eq!(
+        runner.calls(),
+        5,
+        "inventory, attach, resolve, fsck, detach"
+    );
 }
 
 #[test]
@@ -1168,12 +1180,11 @@ fn session_identity_mismatches_are_rejected_one_dimension_at_a_time() {
             .expect("mismatched sidecar");
         let host = native_host(&fixture, RecordingRunner::default());
 
-        assert!(
-            host.list(&repo())
-                .expect_err("session identity mismatch")
-                .to_string()
-                .contains("detached metadata identity mismatch")
-        );
+        assert!(host
+            .list(&repo())
+            .expect_err("session identity mismatch")
+            .to_string()
+            .contains("detached metadata identity mismatch"));
     }
 }
 
@@ -1222,13 +1233,11 @@ fn kernel_mount_facts_survive_host_restart_and_prevent_detached_compaction() {
         restarted.mounts(&repo()).expect("restart facts")[0].mount_id,
         42
     );
-    assert!(
-        restarted
-            .compact(canonical.image(), ImageFormat::Sparse)
-            .expect_err("kernel-mounted image must not compact")
-            .to_string()
-            .contains("cannot compact mounted image")
-    );
+    assert!(restarted
+        .compact(canonical.image(), ImageFormat::Sparse)
+        .expect_err("kernel-mounted image must not compact")
+        .to_string()
+        .contains("cannot compact mounted image"));
     let requests = runner.requests();
     assert_eq!(requests.len(), 2);
     assert!(requests.iter().all(|request| {
@@ -1307,19 +1316,15 @@ fn canonical_path_with_unrelated_volume_fails_closed_without_detaching() {
             &fixture.config().main_mount,
         )
         .expect_err("impostor must not be healed destructively");
-    assert!(
-        error
-            .to_string()
-            .contains("refusing to heal unrelated mount")
-    );
+    assert!(error
+        .to_string()
+        .contains("refusing to heal unrelated mount"));
     let error = host
         .detach_mounted(&workspace(ImageFormat::Sparse), true)
         .expect_err("restart-safe detach must reject an impostor source");
-    assert!(
-        error
-            .to_string()
-            .contains("refusing to detach unrelated mount")
-    );
+    assert!(error
+        .to_string()
+        .contains("refusing to detach unrelated mount"));
     assert!(
         runner.requests().iter().all(|request| request
             .args
@@ -1348,12 +1353,11 @@ fn wrong_kernel_mount_flags_are_detected_and_healed_by_mountpoint() {
         MacOsApfsExecutionHost::with_mount_source(runner.clone(), fixture.config(), source.clone())
             .expect("host");
     let workspace = workspace(ImageFormat::Sparse);
-    assert!(
-        host.mounts(&repo())
-            .expect_err("wrong flags")
-            .to_string()
-            .contains("non-canonical flags")
-    );
+    assert!(host
+        .mounts(&repo())
+        .expect_err("wrong flags")
+        .to_string()
+        .contains("non-canonical flags"));
 
     host.heal_mount(&workspace, &fixture.config().main_mount)
         .expect("heal by mountpoint");
@@ -1825,11 +1829,9 @@ fn recovery_ignores_unscoped_and_non_internal_restore_lookalikes() {
         std::fs::read(canonical.image()).expect("canonical"),
         b"live generation"
     );
-    assert!(
-        invalid_checkpoints
-            .iter()
-            .all(|checkpoint| checkpoint.exists())
-    );
+    assert!(invalid_checkpoints
+        .iter()
+        .all(|checkpoint| checkpoint.exists()));
     assert_eq!(
         std::fs::read(session_canonical.image()).expect("session"),
         b"live session"

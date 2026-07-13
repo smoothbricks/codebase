@@ -4,6 +4,7 @@
 //! as an executable plus an argument vector; this module never invokes a shell.
 
 use crate::metadata::ImageFormat;
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
@@ -290,6 +291,19 @@ impl fmt::Display for VolumeNameResolutionFailure {
 }
 
 #[derive(Debug)]
+pub struct AttachmentDetachFailure {
+    pub device: String,
+    pub error: Box<ApfsError>,
+}
+
+#[derive(Debug)]
+pub struct AttachmentCleanupFailure {
+    pub inventory: Option<Box<ApfsError>>,
+    pub detach: Vec<AttachmentDetachFailure>,
+    pub remaining_devices: Vec<String>,
+}
+
+#[derive(Debug)]
 pub enum ApfsError {
     InvalidImagePath {
         path: PathBuf,
@@ -313,6 +327,12 @@ pub enum ApfsError {
     },
     UnsupportedMacOsVersion(String),
     InvalidAttachmentPlist(String),
+    InvalidAttachmentInventory(String),
+    AttachmentCleanupFailed {
+        image: PathBuf,
+        primary: Box<ApfsError>,
+        cleanup: AttachmentCleanupFailure,
+    },
     VolumeResolutionFailed {
         candidate: String,
         reason: VolumeResolutionFailure,
@@ -394,6 +414,14 @@ impl fmt::Display for ApfsError {
             Self::InvalidAttachmentPlist(message) => {
                 write!(f, "invalid attachment plist: {message}")
             }
+            Self::InvalidAttachmentInventory(message) => {
+                write!(f, "invalid attachment inventory: {message}")
+            }
+            Self::AttachmentCleanupFailed { image, .. } => write!(
+                f,
+                "attachment failed for {}, and cleaning up newly attached devices also failed",
+                image.display()
+            ),
             Self::VolumeResolutionFailed { candidate, reason } => {
                 write!(f, "could not resolve APFS volume for {candidate}: {reason}")
             }
@@ -438,6 +466,7 @@ impl std::error::Error for ApfsError {
             Self::VerificationAndDetachFailed { detach, .. } => Some(detach),
             Self::VolumeResolutionAndDetachFailed { detach, .. } => Some(detach),
             Self::AsifCreationAndCleanupFailed { primary, .. } => Some(primary),
+            Self::AttachmentCleanupFailed { primary, .. } => Some(primary),
             _ => None,
         }
     }
@@ -508,6 +537,100 @@ impl<R> MacOsApfsBackend<R> {
 }
 
 impl<R: CommandRunner> MacOsApfsBackend<R> {
+    fn attached_whole_devices(&self, image: &Path) -> Result<BTreeSet<String>, ApfsError> {
+        let image = attachment_inventory_path(image)?;
+        // Tahoe's `diskutil image info --plist` does not expose attachment
+        // devices. The read-only hdiutil inventory is the observed authoritative
+        // image-path -> system-entities map for both ASIF and SPARSE images; ASIF
+        // creation, attachment, and detachment remain diskutil-only.
+        let output = self.run_checked(
+            "inventory attached disk images",
+            CommandRequest::new(HDIUTIL, ["info", "-plist"]),
+        )?;
+        parse_attachment_inventory(&image, &output.stdout)
+    }
+
+    fn cleanup_new_attachments(
+        &self,
+        image: &Path,
+        format: ImageFormat,
+        before: &BTreeSet<String>,
+    ) -> Result<(), AttachmentCleanupFailure> {
+        let after =
+            self.attached_whole_devices(image)
+                .map_err(|error| AttachmentCleanupFailure {
+                    inventory: Some(Box::new(error)),
+                    detach: Vec::new(),
+                    remaining_devices: Vec::new(),
+                })?;
+        let new_devices: BTreeSet<_> = after.difference(before).cloned().collect();
+        let mut detach = Vec::new();
+        for device in &new_devices {
+            if let Err(error) = self.detach_device(format, device, false) {
+                detach.push(AttachmentDetachFailure {
+                    device: device.clone(),
+                    error: Box::new(error),
+                });
+            }
+        }
+
+        let verified = match self.attached_whole_devices(image) {
+            Ok(verified) => verified,
+            Err(error) => {
+                return Err(AttachmentCleanupFailure {
+                    inventory: Some(Box::new(error)),
+                    detach,
+                    remaining_devices: Vec::new(),
+                });
+            }
+        };
+        let remaining_devices: Vec<String> = new_devices.intersection(&verified).cloned().collect();
+        if detach.is_empty() && remaining_devices.is_empty() {
+            Ok(())
+        } else {
+            Err(AttachmentCleanupFailure {
+                inventory: None,
+                detach,
+                remaining_devices,
+            })
+        }
+    }
+
+    fn failed_attachment(
+        &self,
+        image: &Path,
+        format: ImageFormat,
+        before: &BTreeSet<String>,
+        primary: ApfsError,
+    ) -> ApfsError {
+        match self.cleanup_new_attachments(image, format, before) {
+            Ok(()) => primary,
+            Err(cleanup) => ApfsError::AttachmentCleanupFailed {
+                image: image.to_owned(),
+                primary: Box::new(primary),
+                cleanup,
+            },
+        }
+    }
+
+    fn failed_asif_attachment(
+        &self,
+        path: &Path,
+        before: &BTreeSet<String>,
+        primary: ApfsError,
+    ) -> ApfsError {
+        match self.cleanup_new_attachments(path, ImageFormat::Asif, before) {
+            Ok(()) => self.cleanup_failed_asif(path, primary),
+            Err(cleanup) => ApfsError::AttachmentCleanupFailed {
+                image: path.to_owned(),
+                primary: Box::new(primary),
+                cleanup,
+            },
+        }
+    }
+}
+
+impl<R: CommandRunner> MacOsApfsBackend<R> {
     fn run_checked(
         &self,
         operation: &'static str,
@@ -556,6 +679,7 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
             ],
         );
         self.run_checked("create ASIF image", create)?;
+        let attached_before = self.attached_whole_devices(path)?;
 
         let attach = CommandRequest::new(
             DISKUTIL,
@@ -570,12 +694,26 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
         );
         let output = match self.run_checked("attach blank ASIF image", attach) {
             Ok(output) => output,
-            Err(primary) => return Err(self.cleanup_failed_asif(path, primary, None)),
+            Err(primary) => {
+                return Err(self.failed_asif_attachment(path, &attached_before, primary));
+            }
         };
         let whole_device = match parse_blank_asif_whole_device(&output.stdout) {
             Ok(device) => device,
-            Err(primary) => return Err(self.cleanup_failed_asif(path, primary, None)),
+            Err(primary) => {
+                return Err(self.failed_asif_attachment(path, &attached_before, primary));
+            }
         };
+        if attached_before.contains(&whole_device) {
+            return Err(self.failed_attachment(
+                path,
+                ImageFormat::Asif,
+                &attached_before,
+                ApfsError::InvalidAttachmentPlist(
+                    "attach reported a pre-existing whole image device".into(),
+                ),
+            ));
+        }
         let case_flag = match request.case_sensitivity {
             ApfsCaseSensitivity::Sensitive => "-e",
             ApfsCaseSensitivity::Insensitive => "-i",
@@ -594,23 +732,20 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
             ],
         );
         if let Err(primary) = self.run_checked("format ASIF APFS volume", format) {
-            let detach = self
-                .detach_device(ImageFormat::Asif, &whole_device, true)
-                .err();
-            return Err(self.cleanup_failed_asif(path, primary, detach));
+            return match self.detach_device(ImageFormat::Asif, &whole_device, true) {
+                Ok(()) => Err(self.cleanup_failed_asif(path, primary)),
+                Err(detach) => Err(ApfsError::AsifCreationAndCleanupFailed {
+                    primary: Box::new(primary),
+                    detach: Some(Box::new(detach)),
+                    remove: None,
+                }),
+            };
         }
-        if let Err(primary) = self.detach_device(ImageFormat::Asif, &whole_device, true) {
-            return Err(self.cleanup_failed_asif(path, primary, None));
-        }
+        self.detach_device(ImageFormat::Asif, &whole_device, true)?;
         Ok(())
     }
 
-    fn cleanup_failed_asif(
-        &self,
-        path: &Path,
-        primary: ApfsError,
-        detach: Option<ApfsError>,
-    ) -> ApfsError {
+    fn cleanup_failed_asif(&self, path: &Path, primary: ApfsError) -> ApfsError {
         let remove = match fs::remove_file(path) {
             Ok(()) => None,
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -620,12 +755,12 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
                 source,
             }),
         };
-        if detach.is_none() && remove.is_none() {
+        if remove.is_none() {
             primary
         } else {
             ApfsError::AsifCreationAndCleanupFailed {
                 primary: Box::new(primary),
-                detach: detach.map(Box::new),
+                detach: None,
                 remove: remove.map(Box::new),
             }
         }
@@ -678,6 +813,7 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
         format: ImageFormat,
     ) -> Result<AttachedImage, ApfsError> {
         validate_image_path(image, format)?;
+        let attached_before = self.attached_whole_devices(image)?;
         let request = match format {
             ImageFormat::Asif => CommandRequest::new(
                 DISKUTIL,
@@ -703,8 +839,28 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
                 ],
             ),
         };
-        let output = self.run_checked("attach image without mounting", request)?;
-        let (whole_device, candidate) = parse_attachment_plist(&output.stdout)?;
+        let output = match self.run_checked("attach image without mounting", request) {
+            Ok(output) => output,
+            Err(primary) => {
+                return Err(self.failed_attachment(image, format, &attached_before, primary));
+            }
+        };
+        let (whole_device, candidate) = match parse_attachment_plist(&output.stdout) {
+            Ok(attachment) => attachment,
+            Err(primary) => {
+                return Err(self.failed_attachment(image, format, &attached_before, primary));
+            }
+        };
+        if attached_before.contains(&whole_device) {
+            return Err(self.failed_attachment(
+                image,
+                format,
+                &attached_before,
+                ApfsError::InvalidAttachmentPlist(
+                    "attach reported a pre-existing whole image device".into(),
+                ),
+            ));
+        }
         let volume_device = match self.resolve_apfs_volume(&candidate) {
             Ok(volume_device) => volume_device,
             Err(resolution) => {
@@ -1038,6 +1194,75 @@ fn validate_detach_target(target: DetachTarget<'_>) -> Result<OsString, ApfsErro
         DetachTarget::Device(device) => OsString::from(device),
         DetachTarget::MountPoint(path) => path.as_os_str().to_owned(),
     })
+}
+
+fn attachment_inventory_path(image: &Path) -> Result<PathBuf, ApfsError> {
+    std::path::absolute(image).map_err(|source| ApfsError::FileOperation {
+        operation: "resolve attachment inventory path",
+        path: image.to_owned(),
+        source,
+    })
+}
+
+fn parse_attachment_inventory(image: &Path, bytes: &[u8]) -> Result<BTreeSet<String>, ApfsError> {
+    let expected = image.to_str().ok_or_else(|| {
+        ApfsError::InvalidAttachmentInventory("image path is not valid UTF-8".into())
+    })?;
+    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|error| ApfsError::InvalidAttachmentInventory(error.to_string()))?;
+    let images = value
+        .as_dictionary()
+        .and_then(|root| root.get("images"))
+        .and_then(plist::Value::as_array)
+        .ok_or_else(|| ApfsError::InvalidAttachmentInventory("missing images array".into()))?;
+    let mut devices = BTreeSet::new();
+    for image_entry in images {
+        let dictionary = image_entry.as_dictionary().ok_or_else(|| {
+            ApfsError::InvalidAttachmentInventory("images entry is not a dictionary".into())
+        })?;
+        let reported_path = dictionary
+            .get("image-path")
+            .and_then(plist::Value::as_string)
+            .ok_or_else(|| {
+                ApfsError::InvalidAttachmentInventory(
+                    "images entry has no string image-path".into(),
+                )
+            })?;
+        if reported_path != expected {
+            continue;
+        }
+        let entities = dictionary
+            .get("system-entities")
+            .and_then(plist::Value::as_array)
+            .ok_or_else(|| {
+                ApfsError::InvalidAttachmentInventory(
+                    "matching image has no system-entities array".into(),
+                )
+            })?;
+        let mut roots = 0usize;
+        for entity in entities {
+            let device = entity
+                .as_dictionary()
+                .and_then(|entity| entity.get("dev-entry"))
+                .and_then(plist::Value::as_string)
+                .and_then(device_path)
+                .ok_or_else(|| {
+                    ApfsError::InvalidAttachmentInventory(
+                        "matching image has an invalid dev-entry".into(),
+                    )
+                })?;
+            if device_depth(&device) == 0 && is_kernel_device_path(&device) {
+                roots += 1;
+                devices.insert(device);
+            }
+        }
+        if roots == 0 {
+            return Err(ApfsError::InvalidAttachmentInventory(
+                "matching image has no canonical whole device".into(),
+            ));
+        }
+    }
+    Ok(devices)
 }
 
 fn is_canonical_mount_point(path: &Path) -> bool {
@@ -1477,7 +1702,7 @@ fn classify_clone_error(source: &Path, destination: &Path, error: io::Error) -> 
 mod tests {
     use super::*;
     use std::cell::{Ref, RefCell};
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
 
     const PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
       <dict><key>dev-entry</key><string>disk10</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
@@ -1485,6 +1710,8 @@ mod tests {
       <dict><key>dev-entry</key><string>disk10s1</string><key>content-hint</key><string>Apple_APFS_Volume</string><key>volume-kind</key><string>apfs</string></dict>
     </array></dict></plist>"#;
 
+    const EMPTY_ATTACHMENT_INVENTORY: &str =
+        r#"<?xml version="1.0"?><plist><dict><key>images</key><array/></dict></plist>"#;
     const BLANK_ASIF_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
       <dict><key>dev-entry</key><string>disk8</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
     </array></dict></plist>"#;
@@ -1597,6 +1824,154 @@ mod tests {
             .collect()
     }
 
+    struct StatefulMalformedAttachRunner {
+        requests: RefCell<Vec<CommandRequest>>,
+        attached: RefCell<BTreeMap<String, BTreeSet<String>>>,
+        image: String,
+        format: ImageFormat,
+        new_device: String,
+        fail_detach: bool,
+    }
+
+    impl StatefulMalformedAttachRunner {
+        fn new(image: &Path, format: ImageFormat, preexisting: &[&str], fail_detach: bool) -> Self {
+            let image = attachment_inventory_path(image)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let mut attached = BTreeMap::new();
+            attached.insert(
+                image.clone(),
+                preexisting
+                    .iter()
+                    .map(|device| (*device).to_owned())
+                    .collect(),
+            );
+            attached.insert(
+                "/tmp/cowshed-unrelated.asif".into(),
+                BTreeSet::from(["/dev/disk20".into()]),
+            );
+            Self {
+                requests: RefCell::new(Vec::new()),
+                attached: RefCell::new(attached),
+                image,
+                format,
+                new_device: match format {
+                    ImageFormat::Asif => "/dev/disk8",
+                    ImageFormat::Sparse => "/dev/disk9",
+                }
+                .into(),
+                fail_detach,
+            }
+        }
+
+        fn inventory(&self) -> String {
+            let attached = self.attached.borrow();
+            let mut plist =
+                String::from(r#"<?xml version="1.0"?><plist><dict><key>images</key><array>"#);
+            for (path, devices) in attached.iter().filter(|(_, devices)| !devices.is_empty()) {
+                plist.push_str("<dict><key>image-path</key><string>");
+                plist.push_str(path);
+                plist.push_str("</string><key>system-entities</key><array>");
+                for device in devices {
+                    plist.push_str("<dict><key>dev-entry</key><string>");
+                    plist.push_str(device);
+                    plist.push_str("</string></dict>");
+                }
+                plist.push_str("</array></dict>");
+            }
+            plist.push_str("</array></dict></plist>");
+            plist
+        }
+
+        fn requests(&self) -> Ref<'_, Vec<CommandRequest>> {
+            self.requests.borrow()
+        }
+
+        fn devices_for(&self, image: &Path) -> BTreeSet<String> {
+            let image = attachment_inventory_path(image)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            self.attached
+                .borrow()
+                .get(&image)
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    impl CommandRunner for StatefulMalformedAttachRunner {
+        fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+            self.requests.borrow_mut().push(request.clone());
+            let args = argv(request);
+            if request.program == Path::new(HDIUTIL) && args == ["info", "-plist"] {
+                return Ok(CommandOutput::success(self.inventory()));
+            }
+            if request.program == Path::new(DISKUTIL)
+                && args.starts_with(&["image".into(), "create".into(), "blank".into()])
+            {
+                return Ok(CommandOutput::success([]));
+            }
+            let is_attach = match self.format {
+                ImageFormat::Asif => {
+                    request.program == Path::new(DISKUTIL)
+                        && args.starts_with(&["image".into(), "attach".into()])
+                }
+                ImageFormat::Sparse => {
+                    request.program == Path::new(HDIUTIL)
+                        && args.first().is_some_and(|arg| arg == "attach")
+                }
+            };
+            if is_attach {
+                self.attached
+                    .borrow_mut()
+                    .entry(self.image.clone())
+                    .or_default()
+                    .insert(self.new_device.clone());
+                return Ok(CommandOutput::success("<plist><dict><key>malformed"));
+            }
+            let is_detach = match self.format {
+                ImageFormat::Asif => {
+                    request.program == Path::new(DISKUTIL)
+                        && args == ["eject", self.new_device.as_str()]
+                }
+                ImageFormat::Sparse => {
+                    request.program == Path::new(HDIUTIL)
+                        && args == ["detach", "-quiet", self.new_device.as_str()]
+                }
+            };
+            assert!(is_detach, "unexpected command: {request:?}");
+            if self.fail_detach {
+                return Ok(CommandOutput::failure(16, "busy"));
+            }
+            self.attached
+                .borrow_mut()
+                .get_mut(&self.image)
+                .expect("target image is inventoried")
+                .remove(&self.new_device);
+            Ok(CommandOutput::success([]))
+        }
+    }
+
+    fn attachment_inventory(entries: &[(&str, &[&str])]) -> String {
+        let mut plist =
+            String::from(r#"<?xml version="1.0"?><plist><dict><key>images</key><array>"#);
+        for (path, devices) in entries {
+            plist.push_str("<dict><key>image-path</key><string>");
+            plist.push_str(path);
+            plist.push_str("</string><key>system-entities</key><array>");
+            for device in *devices {
+                plist.push_str("<dict><key>dev-entry</key><string>");
+                plist.push_str(device);
+                plist.push_str("</string></dict>");
+            }
+            plist.push_str("</array></dict>");
+        }
+        plist.push_str("</array></dict></plist>");
+        plist
+    }
+
     fn temp_path(label: &str, extension: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "cowshed-apfs-{label}-{}-{:?}.{extension}",
@@ -1680,6 +2055,10 @@ mod tests {
         };
         assert!(combined.to_string().contains("detaching"));
         assert!(std::error::Error::source(&combined).is_some());
+        assert_eq!(
+            ApfsError::InvalidAttachmentInventory("bad shape".into()).to_string(),
+            "invalid attachment inventory: bad shape"
+        );
     }
 
     #[test]
@@ -1693,8 +2072,9 @@ mod tests {
     }
 
     #[test]
-    fn asif_attach_never_reaches_hdiutil_and_mount_follows_fsck() {
+    fn asif_attach_uses_read_only_inventory_then_diskutil_attach_and_fsck() {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(PLIST),
             CommandOutput::success(VOLUME_LIST_PLIST),
             CommandOutput::success([]),
@@ -1716,20 +2096,22 @@ mod tests {
                 .map(|request| request.program.as_path())
                 .collect::<Vec<_>>(),
             [
+                Path::new(HDIUTIL),
                 Path::new(DISKUTIL),
                 Path::new(DISKUTIL),
                 Path::new(FSCK_APFS),
                 Path::new(DISKUTIL),
             ]
         );
+        assert_eq!(argv(&requests[0]), ["info", "-plist"]);
         assert_eq!(
-            argv(&requests[0])[..5],
+            argv(&requests[1])[..5],
             ["image", "attach", "--nobrowse", "--noMount", "--plist"]
         );
-        assert_eq!(argv(&requests[1]), ["apfs", "list", "-plist"]);
-        assert_eq!(argv(&requests[2]), ["-q", "/dev/rdisk10s1"]);
+        assert_eq!(argv(&requests[2]), ["apfs", "list", "-plist"]);
+        assert_eq!(argv(&requests[3]), ["-q", "/dev/rdisk10s1"]);
         assert_eq!(
-            argv(&requests[3])[..5],
+            argv(&requests[4])[..5],
             [
                 "mount",
                 "nobrowse",
@@ -1738,7 +2120,7 @@ mod tests {
                 "-mountPoint"
             ]
         );
-        assert_eq!(argv(&requests[3]).last().unwrap(), "/dev/disk10s1");
+        assert_eq!(argv(&requests[4]).last().unwrap(), "/dev/disk10s1");
         let _ = fs::remove_dir(mount);
     }
 
@@ -1785,6 +2167,7 @@ mod tests {
     #[test]
     fn sparse_attach_resolves_volume_via_diskutil_before_raw_fsck() {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(SPARSE_ATTACH_PLIST),
             CommandOutput::success(SPARSE_VOLUME_LIST_PLIST),
             CommandOutput::success([]),
@@ -1802,12 +2185,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 Path::new(HDIUTIL),
+                Path::new(HDIUTIL),
                 Path::new(DISKUTIL),
                 Path::new(FSCK_APFS)
             ]
         );
+        assert_eq!(argv(&requests[0]), ["info", "-plist"]);
         assert_eq!(
-            argv(&requests[0]),
+            argv(&requests[1]),
             [
                 "attach",
                 "-nobrowse",
@@ -1818,13 +2203,14 @@ mod tests {
                 "session.sparseimage",
             ]
         );
-        assert_eq!(argv(&requests[1]), ["apfs", "list", "-plist"]);
-        assert_eq!(argv(&requests[2]), ["-q", "/dev/rdisk5s2"]);
+        assert_eq!(argv(&requests[2]), ["apfs", "list", "-plist"]);
+        assert_eq!(argv(&requests[3]), ["-q", "/dev/rdisk5s2"]);
     }
 
     #[test]
     fn failed_verification_detaches_the_whole_sparse_image_device() {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(SPARSE_ATTACH_PLIST),
             CommandOutput::success(SPARSE_VOLUME_LIST_PLIST),
             CommandOutput::failure(8, "not clean"),
@@ -1841,21 +2227,20 @@ mod tests {
             } if device == "/dev/disk5s2"
         ));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 4);
-        assert_eq!(requests[2].program, Path::new(FSCK_APFS));
-        assert_eq!(argv(&requests[2]), ["-q", "/dev/rdisk5s2"]);
-        assert_eq!(requests[3].program, Path::new(HDIUTIL));
-        assert_eq!(argv(&requests[3]), ["detach", "-quiet", "/dev/disk4"]);
-        assert!(
-            !requests
-                .iter()
-                .any(|request| argv(request).first().is_some_and(|arg| arg == "mount"))
-        );
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[3].program, Path::new(FSCK_APFS));
+        assert_eq!(argv(&requests[3]), ["-q", "/dev/rdisk5s2"]);
+        assert_eq!(requests[4].program, Path::new(HDIUTIL));
+        assert_eq!(argv(&requests[4]), ["detach", "-quiet", "/dev/disk4"]);
+        assert!(!requests
+            .iter()
+            .any(|request| argv(request).first().is_some_and(|arg| arg == "mount")));
     }
 
     #[test]
     fn missing_volume_resolution_detaches_the_whole_image_before_failing() {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(SPARSE_ATTACH_PLIST),
             CommandOutput::success(EMPTY_VOLUME_LIST_PLIST),
             CommandOutput::success([]),
@@ -1872,15 +2257,16 @@ mod tests {
             } if candidate == "/dev/disk4s1"
         ));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 3);
-        assert_eq!(argv(&requests[1]), ["apfs", "list", "-plist"]);
-        assert_eq!(requests[2].program, Path::new(HDIUTIL));
-        assert_eq!(argv(&requests[2]), ["detach", "-quiet", "/dev/disk4"]);
+        assert_eq!(requests.len(), 4);
+        assert_eq!(argv(&requests[2]), ["apfs", "list", "-plist"]);
+        assert_eq!(requests[3].program, Path::new(HDIUTIL));
+        assert_eq!(argv(&requests[3]), ["detach", "-quiet", "/dev/disk4"]);
     }
 
     #[test]
     fn ambiguous_volume_and_detach_failures_preserve_both_typed_errors() {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(SPARSE_ATTACH_PLIST),
             CommandOutput::success(AMBIGUOUS_VOLUME_LIST_PLIST),
             CommandOutput::failure(16, "busy"),
@@ -1917,13 +2303,14 @@ mod tests {
             other => panic!("unexpected error: {other}"),
         }
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 3);
-        assert_eq!(argv(&requests[2]), ["detach", "-quiet", "/dev/disk4"]);
+        assert_eq!(requests.len(), 4);
+        assert_eq!(argv(&requests[3]), ["detach", "-quiet", "/dev/disk4"]);
     }
 
     #[test]
     fn failed_volume_resolution_command_detaches_and_preserves_command_error() {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(SPARSE_ATTACH_PLIST),
             CommandOutput::failure(3, "list failed"),
             CommandOutput::success([]),
@@ -1941,8 +2328,293 @@ mod tests {
             }
         ));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 3);
-        assert_eq!(argv(&requests[2]), ["detach", "-quiet", "/dev/disk4"]);
+        assert_eq!(requests.len(), 4);
+        assert_eq!(argv(&requests[3]), ["detach", "-quiet", "/dev/disk4"]);
+    }
+
+    #[test]
+    fn parsed_attach_never_detaches_a_preexisting_same_image_device() {
+        let image = Path::new("/tmp/cowshed-preexisting.asif");
+        let inventory =
+            attachment_inventory(&[("/tmp/cowshed-preexisting.asif", &["/dev/disk10"][..])]);
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success(inventory.as_bytes()),
+            CommandOutput::success(PLIST),
+            CommandOutput::success(inventory.as_bytes()),
+            CommandOutput::success(inventory.as_bytes()),
+        ]));
+
+        let error = backend
+            .attach_verified(image, ImageFormat::Asif)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApfsError::InvalidAttachmentPlist(message)
+                if message == "attach reported a pre-existing whole image device"
+        ));
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(argv(&requests[0]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[2]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[3]), ["info", "-plist"]);
+        assert!(!requests
+            .iter()
+            .any(|request| argv(request).first().is_some_and(|arg| arg == "eject")));
+    }
+
+    #[test]
+    fn malformed_asif_attach_detaches_only_the_new_device_and_verifies_absence() {
+        let image = Path::new("/tmp/cowshed-malformed-attach.asif");
+        let backend = MacOsApfsBackend::new(StatefulMalformedAttachRunner::new(
+            image,
+            ImageFormat::Asif,
+            &["/dev/disk4"],
+            false,
+        ));
+
+        let error = backend
+            .attach_verified(image, ImageFormat::Asif)
+            .unwrap_err();
+
+        assert!(matches!(error, ApfsError::InvalidAttachmentPlist(_)));
+        assert_eq!(
+            backend.runner().devices_for(image),
+            BTreeSet::from(["/dev/disk4".into()])
+        );
+        assert_eq!(
+            backend
+                .runner()
+                .devices_for(Path::new("/tmp/cowshed-unrelated.asif")),
+            BTreeSet::from(["/dev/disk20".into()])
+        );
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(argv(&requests[0]), ["info", "-plist"]);
+        assert_eq!(
+            argv(&requests[1]),
+            [
+                "image",
+                "attach",
+                "--nobrowse",
+                "--noMount",
+                "--plist",
+                "/tmp/cowshed-malformed-attach.asif",
+            ]
+        );
+        assert_eq!(argv(&requests[2]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[3]), ["eject", "/dev/disk8"]);
+        assert_eq!(argv(&requests[4]), ["info", "-plist"]);
+        assert!(!requests.iter().any(|request| {
+            let args = argv(request);
+            args.iter()
+                .any(|arg| arg == "/dev/disk4" || arg == "/dev/disk20")
+        }));
+    }
+
+    #[test]
+    fn malformed_sparse_attach_detaches_the_new_device_and_verifies_absence() {
+        let image = Path::new("/tmp/cowshed-malformed-attach.sparseimage");
+        let backend = MacOsApfsBackend::new(StatefulMalformedAttachRunner::new(
+            image,
+            ImageFormat::Sparse,
+            &[],
+            false,
+        ));
+
+        let error = backend
+            .attach_verified(image, ImageFormat::Sparse)
+            .unwrap_err();
+
+        assert!(matches!(error, ApfsError::InvalidAttachmentPlist(_)));
+        assert!(backend.runner().devices_for(image).is_empty());
+        assert_eq!(
+            backend
+                .runner()
+                .devices_for(Path::new("/tmp/cowshed-unrelated.asif")),
+            BTreeSet::from(["/dev/disk20".into()])
+        );
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(argv(&requests[0]), ["info", "-plist"]);
+        assert_eq!(
+            argv(&requests[1]),
+            [
+                "attach",
+                "-nobrowse",
+                "-owners",
+                "on",
+                "-nomount",
+                "-plist",
+                "/tmp/cowshed-malformed-attach.sparseimage",
+            ]
+        );
+        assert_eq!(argv(&requests[2]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[3]), ["detach", "-quiet", "/dev/disk9"]);
+        assert_eq!(argv(&requests[4]), ["info", "-plist"]);
+    }
+
+    #[test]
+    fn malformed_blank_asif_cleanup_failure_preserves_image_and_typed_context() {
+        let stem = temp_path("malformed-blank-cleanup", "stem").with_extension("");
+        let image = stem.with_extension(ImageFormat::Asif.extension());
+        fs::write(&image, b"created").unwrap();
+        let backend = MacOsApfsBackend::new(StatefulMalformedAttachRunner::new(
+            &image,
+            ImageFormat::Asif,
+            &[],
+            true,
+        ));
+
+        let error = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: stem,
+                capacity: "5g".into(),
+                volume_name: "main".into(),
+                case_sensitivity: ApfsCaseSensitivity::Insensitive,
+                image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
+                owner_uid: 502,
+                owner_gid: 20,
+            })
+            .unwrap_err();
+
+        assert!(image.exists());
+        assert_eq!(
+            backend.runner().devices_for(&image),
+            BTreeSet::from(["/dev/disk8".into()])
+        );
+        assert!(error
+            .to_string()
+            .contains("cleaning up newly attached devices also failed"));
+        assert!(std::error::Error::source(&error).is_some());
+        match error {
+            ApfsError::AttachmentCleanupFailed {
+                image: failed_image,
+                primary,
+                cleanup,
+            } => {
+                assert_eq!(failed_image, image);
+                assert!(matches!(*primary, ApfsError::InvalidAttachmentPlist(_)));
+                assert!(cleanup.inventory.is_none());
+                assert_eq!(cleanup.detach.len(), 1);
+                assert_eq!(cleanup.detach[0].device, "/dev/disk8");
+                assert!(matches!(
+                    cleanup.detach[0].error.as_ref(),
+                    ApfsError::CommandFailed {
+                        operation: "detach image",
+                        output: CommandOutput { status: 16, .. },
+                        ..
+                    }
+                ));
+                assert_eq!(cleanup.remaining_devices, ["/dev/disk8"]);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 6);
+        assert_eq!(argv(&requests[0])[..3], ["image", "create", "blank"]);
+        assert_eq!(argv(&requests[1]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[3]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[4]), ["eject", "/dev/disk8"]);
+        assert_eq!(argv(&requests[5]), ["info", "-plist"]);
+        fs::remove_file(image).unwrap();
+    }
+
+    #[test]
+    fn failed_detach_remains_a_cleanup_error_when_inventory_reports_absence() {
+        let image = Path::new("/tmp/cowshed-failed-detach.asif");
+        let attached =
+            attachment_inventory(&[("/tmp/cowshed-failed-detach.asif", &["/dev/disk8"][..])]);
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            CommandOutput::success("<plist><dict><key>malformed"),
+            CommandOutput::success(attached.as_bytes()),
+            CommandOutput::failure(16, "busy after eject"),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+        ]));
+
+        let error = backend
+            .attach_verified(image, ImageFormat::Asif)
+            .unwrap_err();
+
+        match error {
+            ApfsError::AttachmentCleanupFailed {
+                primary, cleanup, ..
+            } => {
+                assert!(matches!(*primary, ApfsError::InvalidAttachmentPlist(_)));
+                assert!(cleanup.inventory.is_none());
+                assert_eq!(cleanup.detach.len(), 1);
+                assert_eq!(cleanup.detach[0].device, "/dev/disk8");
+                assert!(cleanup.remaining_devices.is_empty());
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(argv(&requests[3]), ["eject", "/dev/disk8"]);
+        assert_eq!(argv(&requests[4]), ["info", "-plist"]);
+    }
+
+    #[test]
+    fn malformed_blank_asif_inventory_failures_preserve_the_image() {
+        let cleanup_outputs = [
+            CommandOutput::failure(5, "inventory unavailable"),
+            CommandOutput::success("not a plist"),
+        ];
+        for (index, cleanup_output) in cleanup_outputs.into_iter().enumerate() {
+            let stem =
+                temp_path(&format!("malformed-inventory-{index}"), "stem").with_extension("");
+            let image = stem.with_extension(ImageFormat::Asif.extension());
+            fs::write(&image, b"created").unwrap();
+            let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+                CommandOutput::success([]),
+                CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+                CommandOutput::success("<plist><dict><key>malformed"),
+                cleanup_output,
+            ]));
+
+            let error = backend
+                .create_staged_image(&CreateImageRequest {
+                    staged_stem: stem,
+                    capacity: "5g".into(),
+                    volume_name: "main".into(),
+                    case_sensitivity: ApfsCaseSensitivity::Insensitive,
+                    image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
+                    owner_uid: 502,
+                    owner_gid: 20,
+                })
+                .unwrap_err();
+
+            assert!(image.exists());
+            match error {
+                ApfsError::AttachmentCleanupFailed {
+                    primary, cleanup, ..
+                } => {
+                    assert!(matches!(*primary, ApfsError::InvalidAttachmentPlist(_)));
+                    let inventory = cleanup.inventory.expect("inventory failure is retained");
+                    if index == 0 {
+                        assert!(matches!(
+                            *inventory,
+                            ApfsError::CommandFailed {
+                                operation: "inventory attached disk images",
+                                output: CommandOutput { status: 5, .. },
+                                ..
+                            }
+                        ));
+                    } else {
+                        assert!(matches!(
+                            *inventory,
+                            ApfsError::InvalidAttachmentInventory(_)
+                        ));
+                    }
+                    assert!(cleanup.detach.is_empty());
+                    assert!(cleanup.remaining_devices.is_empty());
+                }
+                other => panic!("unexpected error: {other}"),
+            }
+            assert_eq!(backend.runner().requests().len(), 4);
+            fs::remove_file(image).unwrap();
+        }
     }
 
     #[test]
@@ -1987,6 +2659,7 @@ mod tests {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success("26.0\n"),
             CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(BLANK_ASIF_PLIST),
             CommandOutput::success([]),
             CommandOutput::success([]),
@@ -2019,6 +2692,7 @@ mod tests {
             [
                 Path::new(SW_VERS),
                 Path::new(DISKUTIL),
+                Path::new(HDIUTIL),
                 Path::new(DISKUTIL),
                 Path::new(NEWFS_APFS),
                 Path::new(DISKUTIL),
@@ -2041,8 +2715,9 @@ mod tests {
                 ".staging/auto.asif",
             ]
         );
+        assert_eq!(argv(&requests[2]), ["info", "-plist"]);
         assert_eq!(
-            argv(&requests[2]),
+            argv(&requests[3]),
             [
                 "image",
                 "attach",
@@ -2053,10 +2728,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            argv(&requests[3]),
+            argv(&requests[4]),
             ["-U", "502", "-G", "20", "-i", "-v", "main", "/dev/disk8"]
         );
-        assert_eq!(argv(&requests[4]), ["eject", "force", "/dev/disk8"]);
+        assert_eq!(argv(&requests[5]), ["eject", "force", "/dev/disk8"]);
     }
 
     #[test]
@@ -2108,6 +2783,7 @@ mod tests {
     fn exact_asif_records_unprivileged_formatting_and_extension() {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(BLANK_ASIF_PLIST),
             CommandOutput::success([]),
             CommandOutput::success([]),
@@ -2132,7 +2808,7 @@ mod tests {
             }
         );
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 5);
         assert_eq!(
             requests
                 .iter()
@@ -2140,16 +2816,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 Path::new(DISKUTIL),
+                Path::new(HDIUTIL),
                 Path::new(DISKUTIL),
                 Path::new(NEWFS_APFS),
                 Path::new(DISKUTIL),
             ]
         );
         assert_eq!(
-            argv(&requests[2]),
+            argv(&requests[3]),
             ["-U", "501", "-G", "80", "-i", "-v", "main", "/dev/disk8"]
         );
-        assert_eq!(argv(&requests[3]), ["eject", "force", "/dev/disk8"]);
+        assert_eq!(argv(&requests[4]), ["eject", "force", "/dev/disk8"]);
     }
 
     #[test]
@@ -2265,6 +2942,7 @@ mod tests {
     fn exact_asif_case_sensitive_creation_uses_newfs_e_flag() {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(BLANK_ASIF_PLIST),
             CommandOutput::success([]),
             CommandOutput::success([]),
@@ -2284,9 +2962,9 @@ mod tests {
         assert_eq!(created.format, ImageFormat::Asif);
         assert_eq!(created.path, Path::new(".staging/sensitive-asif.asif"));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 5);
         assert_eq!(
-            argv(&requests[2]),
+            argv(&requests[3]),
             [
                 "-U",
                 "777",
@@ -2308,7 +2986,10 @@ mod tests {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success("26.0\n"),
             CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::failure(1, "unsupported after create"),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]));
         let error = backend
             .create_staged_image(&CreateImageRequest {
@@ -2331,11 +3012,14 @@ mod tests {
         ));
         assert!(!image.exists());
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 3);
-        assert!(
-            !requests
+        assert_eq!(requests.len(), 6);
+        assert_eq!(argv(&requests[2]), ["info", "-plist"]);
+        assert_eq!(
+            requests
                 .iter()
-                .any(|request| request.program == Path::new(HDIUTIL))
+                .filter(|request| argv(request) == ["info", "-plist"])
+                .count(),
+            3
         );
     }
 
@@ -2346,7 +3030,10 @@ mod tests {
         assert!(!image.exists());
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::failure(9, "attach failed"),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]));
         let error = backend
             .create_staged_image(&CreateImageRequest {
@@ -2368,7 +3055,7 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(backend.runner().requests().len(), 2);
+        assert_eq!(backend.runner().requests().len(), 5);
     }
 
     #[test]
@@ -2378,6 +3065,7 @@ mod tests {
         fs::write(&image, b"partial").unwrap();
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(BLANK_ASIF_PLIST),
             CommandOutput::failure(70, "format failed"),
             CommandOutput::success([]),
@@ -2404,18 +3092,19 @@ mod tests {
         ));
         assert!(!image.exists());
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 4);
-        assert_eq!(requests[2].program, Path::new(NEWFS_APFS));
-        assert_eq!(argv(&requests[3]), ["eject", "force", "/dev/disk8"]);
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[3].program, Path::new(NEWFS_APFS));
+        assert_eq!(argv(&requests[4]), ["eject", "force", "/dev/disk8"]);
     }
 
     #[test]
-    fn failed_newfs_preserves_detach_cleanup_failure_and_removes_image() {
+    fn failed_newfs_preserves_image_when_detach_cleanup_fails() {
         let stem = temp_path("asif-detach-cleanup-failure", "stem").with_extension("");
         let image = stem.with_extension(ImageFormat::Asif.extension());
         fs::write(&image, b"partial").unwrap();
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(BLANK_ASIF_PLIST),
             CommandOutput::failure(70, "format failed"),
             CommandOutput::failure(16, "busy"),
@@ -2454,7 +3143,8 @@ mod tests {
                 }
             )
         ));
-        assert!(!image.exists());
+        assert!(image.exists());
+        fs::remove_file(image).unwrap();
     }
 
     #[test]
@@ -2464,6 +3154,7 @@ mod tests {
         fs::create_dir(&image).unwrap();
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(BLANK_ASIF_PLIST),
             CommandOutput::failure(70, "format failed"),
             CommandOutput::success([]),
@@ -2504,12 +3195,13 @@ mod tests {
     }
 
     #[test]
-    fn failed_final_asif_eject_removes_image_without_publishing() {
+    fn failed_final_asif_eject_preserves_attached_image() {
         let stem = temp_path("asif-final-eject-failure", "stem").with_extension("");
         let image = stem.with_extension(ImageFormat::Asif.extension());
         fs::write(&image, b"formatted").unwrap();
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(BLANK_ASIF_PLIST),
             CommandOutput::success([]),
             CommandOutput::failure(16, "busy"),
@@ -2534,7 +3226,8 @@ mod tests {
                 ..
             }
         ));
-        assert!(!image.exists());
+        assert!(image.exists());
+        fs::remove_file(image).unwrap();
     }
 
     #[test]
@@ -3294,6 +3987,46 @@ mod tests {
             Err(ApfsError::InvalidAttachmentPlist(message))
                 if message == "multiple whole image devices"
         ));
+    }
+
+    #[test]
+    fn attachment_inventory_selects_only_exact_image_path_whole_devices() {
+        let plist = attachment_inventory(&[
+            (
+                "/tmp/cowshed-target.asif",
+                &["disk4", "/dev/disk4s1", "/dev/disk5"][..],
+            ),
+            ("/tmp/cowshed-unrelated.asif", &["/dev/disk20"][..]),
+        ]);
+
+        assert_eq!(
+            parse_attachment_inventory(Path::new("/tmp/cowshed-target.asif"), plist.as_bytes())
+                .unwrap(),
+            BTreeSet::from(["/dev/disk4".into(), "/dev/disk5".into()])
+        );
+        assert!(parse_attachment_inventory(
+            Path::new("/tmp/cowshed-absent.asif"),
+            plist.as_bytes()
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
+    fn attachment_inventory_rejects_malformed_matching_records() {
+        let malformed = [
+            b"not a plist".as_slice(),
+            br#"<?xml version="1.0"?><plist><dict/></plist>"#,
+            br#"<?xml version="1.0"?><plist><dict><key>images</key><array><string>bad</string></array></dict></plist>"#,
+            br#"<?xml version="1.0"?><plist><dict><key>images</key><array><dict><key>image-path</key><string>/tmp/cowshed-target.asif</string></dict></array></dict></plist>"#,
+            br#"<?xml version="1.0"?><plist><dict><key>images</key><array><dict><key>image-path</key><string>/tmp/cowshed-target.asif</string><key>system-entities</key><array><dict><key>dev-entry</key><string>not-a-device</string></dict></array></dict></array></dict></plist>"#,
+        ];
+        for plist in malformed {
+            assert!(matches!(
+                parse_attachment_inventory(Path::new("/tmp/cowshed-target.asif"), plist),
+                Err(ApfsError::InvalidAttachmentInventory(_))
+            ));
+        }
     }
 
     #[test]
