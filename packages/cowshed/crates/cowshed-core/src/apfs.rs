@@ -162,10 +162,6 @@ pub enum CloneFileError {
         path: PathBuf,
         format: ImageFormat,
     },
-    FormatMismatch {
-        source: PathBuf,
-        destination: PathBuf,
-    },
     CrossVolume {
         source: PathBuf,
         destination: PathBuf,
@@ -189,15 +185,6 @@ impl fmt::Display for CloneFileError {
                 "{} does not have the required {} image extension",
                 path.display(),
                 format.extension()
-            ),
-            Self::FormatMismatch {
-                source,
-                destination,
-            } => write!(
-                f,
-                "image clone must preserve format: {} -> {}",
-                source.display(),
-                destination.display()
             ),
             Self::CrossVolume {
                 source,
@@ -614,12 +601,6 @@ impl<R: CommandRunner> ApfsBackend for MacOsApfsBackend<R> {
     ) -> Result<(), CloneFileError> {
         validate_clone_path(source, format)?;
         validate_clone_path(destination, format)?;
-        if source.extension() != destination.extension() {
-            return Err(CloneFileError::FormatMismatch {
-                source: source.to_owned(),
-                destination: destination.to_owned(),
-            });
-        }
         clonefile_native(source, destination)
     }
 
@@ -792,13 +773,8 @@ fn parse_attachment_plist(bytes: &[u8]) -> Result<(String, String), ApfsError> {
         .map(|(device, _, _)| device.clone())
         .ok_or_else(|| ApfsError::InvalidAttachmentPlist("no APFS volume device".into()))?;
 
-    let whole = entities
-        .iter()
-        .map(|(device, _, _)| device)
-        .find(|device| device_depth(device) == 0)
-        .cloned()
-        .or_else(|| whole_device_from(&volume))
-        .ok_or_else(|| ApfsError::InvalidAttachmentPlist("no whole image device".into()))?;
+    let whole = whole_device_from(&volume)
+        .ok_or_else(|| ApfsError::InvalidAttachmentPlist("invalid APFS volume device".into()))?;
     Ok((whole, volume))
 }
 
@@ -832,42 +808,49 @@ fn whole_device_from(device: &str) -> Option<String> {
     (digits > 0).then(|| format!("/dev/disk{}", &tail[..digits]))
 }
 
-#[cfg(target_os = "macos")]
 fn clonefile_native(source: &Path, destination: &Path) -> Result<(), CloneFileError> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
 
-    unsafe extern "C" {
-        fn clonefile(
-            src: *const std::ffi::c_char,
-            dst: *const std::ffi::c_char,
-            flags: u32,
-        ) -> std::ffi::c_int;
+        unsafe extern "C" {
+            fn clonefile(
+                src: *const std::ffi::c_char,
+                dst: *const std::ffi::c_char,
+                flags: u32,
+            ) -> std::ffi::c_int;
+        }
+        let src = CString::new(source.as_os_str().as_bytes()).map_err(|_| CloneFileError::Io {
+            source_path: source.to_owned(),
+            destination_path: destination.to_owned(),
+            source: io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"),
+        })?;
+        let dst =
+            CString::new(destination.as_os_str().as_bytes()).map_err(|_| CloneFileError::Io {
+                source_path: source.to_owned(),
+                destination_path: destination.to_owned(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "destination path contains NUL",
+                ),
+            })?;
+        let result = unsafe { clonefile(src.as_ptr(), dst.as_ptr(), 0) };
+        if result == 0 {
+            return Ok(());
+        }
+        Err(classify_clone_error(
+            source,
+            destination,
+            io::Error::last_os_error(),
+        ))
     }
-    let src = CString::new(source.as_os_str().as_bytes()).map_err(|_| CloneFileError::Io {
-        source_path: source.to_owned(),
-        destination_path: destination.to_owned(),
-        source: io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"),
-    })?;
-    let dst = CString::new(destination.as_os_str().as_bytes()).map_err(|_| CloneFileError::Io {
-        source_path: source.to_owned(),
-        destination_path: destination.to_owned(),
-        source: io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL"),
-    })?;
-    let result = unsafe { clonefile(src.as_ptr(), dst.as_ptr(), 0) };
-    if result == 0 {
-        return Ok(());
-    }
-    Err(classify_clone_error(
-        source,
-        destination,
-        io::Error::last_os_error(),
-    ))
-}
 
-#[cfg(not(target_os = "macos"))]
-fn clonefile_native(_source: &Path, _destination: &Path) -> Result<(), CloneFileError> {
-    Err(CloneFileError::UnsupportedPlatform)
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (source, destination);
+        Err(CloneFileError::UnsupportedPlatform)
+    }
 }
 
 fn classify_clone_error(source: &Path, destination: &Path, error: io::Error) -> CloneFileError {
@@ -896,7 +879,7 @@ mod tests {
     use std::collections::VecDeque;
 
     const PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
-      <dict><key>dev-entry</key><string>/dev/disk9</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
+      <dict><key>dev-entry</key><string>/dev/disk10</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
       <dict><key>dev-entry</key><string>/dev/disk9s2</string><key>content-hint</key><string>Apple_APFS</string></dict>
       <dict><key>dev-entry</key><string>/dev/disk10s1</string><key>content-hint</key><string>Apple_APFS_Volume</string><key>volume-kind</key><string>apfs</string></dict>
     </array></dict></plist>"#;
@@ -938,6 +921,91 @@ mod tests {
             .collect()
     }
 
+    fn temp_path(label: &str, extension: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "cowshed-apfs-{label}-{}-{:?}.{extension}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
+    #[test]
+    fn system_runner_reports_output_spawn_errors_and_signal_status() {
+        let output = SystemCommandRunner
+            .run(&CommandRequest::new(
+                "/bin/sh",
+                ["-c", "printf stdout; printf stderr >&2; exit 7"],
+            ))
+            .unwrap();
+        assert_eq!(output.status, 7);
+        assert_eq!(output.stdout, b"stdout");
+        assert_eq!(output.stderr, b"stderr");
+
+        let signaled = SystemCommandRunner
+            .run(&CommandRequest::new("/bin/sh", ["-c", "kill -TERM $$"]))
+            .unwrap();
+        assert_eq!(signaled.status, -1);
+
+        let missing = temp_path("missing-command", "bin");
+        let error = SystemCommandRunner
+            .run(&CommandRequest::new(
+                &missing,
+                std::iter::empty::<OsString>(),
+            ))
+            .unwrap_err();
+        assert_eq!(error.program, missing);
+        assert!(error.to_string().contains("could not run"));
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn typed_errors_preserve_messages_and_sources() {
+        let clone = CloneFileError::Io {
+            source_path: PathBuf::from("source.asif"),
+            destination_path: PathBuf::from("destination.asif"),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "clone denied"),
+        };
+        assert!(clone.to_string().contains("clone denied"));
+        assert_eq!(
+            std::error::Error::source(&clone).unwrap().to_string(),
+            "clone denied"
+        );
+
+        let spawn = ApfsError::CommandSpawn(CommandRunError {
+            program: PathBuf::from("/missing"),
+            source: io::Error::new(io::ErrorKind::NotFound, "missing"),
+        });
+        assert!(spawn.to_string().contains("/missing"));
+        assert!(std::error::Error::source(&spawn).is_some());
+
+        let file = ApfsError::FileOperation {
+            operation: "delete image",
+            path: PathBuf::from("main.asif"),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
+        };
+        assert!(file.to_string().contains("delete image main.asif failed"));
+        assert!(std::error::Error::source(&file).is_some());
+
+        let clone = ApfsError::Clone(CloneFileError::DestinationExists {
+            destination: PathBuf::from("session.asif"),
+        });
+        assert!(clone.to_string().contains("session.asif"));
+        assert!(std::error::Error::source(&clone).is_some());
+
+        let detach = ApfsError::CommandFailed {
+            operation: "detach image",
+            request: CommandRequest::new(DISKUTIL, ["eject", "/dev/disk4"]),
+            output: CommandOutput::failure(1, "busy"),
+        };
+        let combined = ApfsError::VerificationAndDetachFailed {
+            device: "/dev/disk4s1".into(),
+            verification: CommandOutput::failure(8, "not clean"),
+            detach: Box::new(detach),
+        };
+        assert!(combined.to_string().contains("detaching"));
+        assert!(std::error::Error::source(&combined).is_some());
+    }
+
     #[test]
     fn rejects_format_extension_mismatch_before_spawning() {
         let backend = MacOsApfsBackend::new(RecordingRunner::default());
@@ -958,6 +1026,10 @@ mod tests {
         let attachment = backend
             .attach_verified(Path::new("session.asif"), ImageFormat::Asif)
             .unwrap();
+        assert_eq!(attachment.image(), Path::new("session.asif"));
+        assert_eq!(attachment.format(), ImageFormat::Asif);
+        assert_eq!(attachment.whole_device(), "/dev/disk10");
+        assert_eq!(attachment.volume_device(), "/dev/disk10s1");
         let mount = std::env::temp_dir().join(format!("cowshed-apfs-test-{}", std::process::id()));
         backend.mount(&attachment, &mount, false).unwrap();
         let requests = backend.runner().requests();
@@ -1024,7 +1096,7 @@ mod tests {
         assert_eq!(requests.len(), 3);
         assert_eq!(requests[1].program, Path::new(FSCK_APFS));
         assert_eq!(requests[2].program, Path::new(DISKUTIL));
-        assert_eq!(argv(&requests[2]), ["eject", "/dev/disk9"]);
+        assert_eq!(argv(&requests[2]), ["eject", "/dev/disk10"]);
         assert!(
             !requests
                 .iter()
@@ -1114,11 +1186,247 @@ mod tests {
     }
 
     #[test]
+    fn non_capability_asif_failure_is_not_silently_downgraded() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success("26.0\n"),
+            CommandOutput::failure(77, "permission denied"),
+        ]));
+        let error = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: PathBuf::from(".staging/main"),
+                capacity: "100g".into(),
+                volume_name: "main".into(),
+                case_sensitivity: ApfsCaseSensitivity::Insensitive,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ApfsError::CommandFailed {
+                operation: "create ASIF image",
+                output: CommandOutput { status: 77, .. },
+                ..
+            }
+        ));
+        assert_eq!(backend.runner().requests().len(), 2);
+        assert!(!asif_is_unsupported(&CommandOutput::failure(
+            77,
+            "permission denied"
+        )));
+        assert!(asif_is_unsupported(&CommandOutput::failure(
+            1,
+            "unknown format ASIF"
+        )));
+    }
+
+    #[test]
+    fn unsupported_asif_cleanup_removes_partial_artifact() {
+        let stem = temp_path("partial", "stem").with_extension("");
+        let asif = stem.with_extension(ImageFormat::Asif.extension());
+        fs::write(&asif, b"partial").unwrap();
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success("26.0\n"),
+            CommandOutput::failure(1, "unsupported"),
+            CommandOutput::success([]),
+        ]));
+        let created = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: stem,
+                capacity: "1g".into(),
+                volume_name: "main".into(),
+                case_sensitivity: ApfsCaseSensitivity::Insensitive,
+            })
+            .unwrap();
+        assert_eq!(created.format, ImageFormat::Sparse);
+        assert!(!asif.exists());
+    }
+
+    #[test]
+    fn clone_validation_requires_both_paths_to_preserve_requested_format() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::default());
+        for (source, destination, invalid) in [
+            ("main.sparseimage", "session.asif", "main.sparseimage"),
+            ("main.asif", "session.sparseimage", "session.sparseimage"),
+        ] {
+            let error = backend
+                .clone_image(Path::new(source), Path::new(destination), ImageFormat::Asif)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                CloneFileError::InvalidImagePath { path, format }
+                    if path == Path::new(invalid) && format == ImageFormat::Asif
+            ));
+        }
+
+        let source = temp_path("validated-missing-source", ImageFormat::Asif.extension());
+        let destination = temp_path(
+            "validated-missing-destination",
+            ImageFormat::Asif.extension(),
+        );
+        let error = backend
+            .clone_image(&source, &destination, ImageFormat::Asif)
+            .unwrap_err();
+        #[cfg(target_os = "macos")]
+        assert!(matches!(error, CloneFileError::Io { .. }));
+        #[cfg(not(target_os = "macos"))]
+        assert!(matches!(error, CloneFileError::UnsupportedPlatform));
+    }
+
+    #[test]
+    fn public_detach_delegates_format_force_and_device() {
+        let backend =
+            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::failure(
+                16, "busy",
+            )]));
+        let attachment = AttachedImage {
+            image: PathBuf::from("session.sparseimage"),
+            format: ImageFormat::Sparse,
+            whole_device: "/dev/disk12".into(),
+            volume_device: "/dev/disk12s1".into(),
+        };
+        let error = backend.detach(&attachment, true).unwrap_err();
+        assert!(matches!(
+            error,
+            ApfsError::CommandFailed {
+                operation: "detach image",
+                output: CommandOutput { status: 16, .. },
+                ..
+            }
+        ));
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].program, Path::new(HDIUTIL));
+        assert_eq!(
+            argv(&requests[0]),
+            ["detach", "-quiet", "-force", "/dev/disk12"]
+        );
+    }
+
+    #[test]
+    fn delete_image_removes_files_ignores_absence_and_reports_other_io() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::default());
+        let image = temp_path("delete", ImageFormat::Asif.extension());
+        fs::write(&image, b"image").unwrap();
+        backend.delete_image(&image, ImageFormat::Asif).unwrap();
+        assert!(!image.exists());
+        backend.delete_image(&image, ImageFormat::Asif).unwrap();
+
+        let directory = temp_path("delete-directory", ImageFormat::Asif.extension());
+        fs::create_dir(&directory).unwrap();
+        let error = backend
+            .delete_image(&directory, ImageFormat::Asif)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ApfsError::FileOperation {
+                operation: "delete image",
+                ..
+            }
+        ));
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
     fn plist_selects_apfs_volume_and_whole_image_device() {
         assert_eq!(
             parse_attachment_plist(PLIST.as_bytes()).unwrap(),
-            ("/dev/disk9".into(), "/dev/disk10s1".into())
+            ("/dev/disk10".into(), "/dev/disk10s1".into())
         );
+    }
+
+    #[test]
+    fn plist_accepts_each_apfs_volume_marker_and_prefers_deepest_volume() {
+        let hint_only = br#"<plist><dict><key>dev-entry</key><string>/dev/disk4</string></dict>
+            <dict><key>dev-entry</key><string>/dev/disk4s1</string>
+            <key>content-hint</key><string>Apple_APFS_Volume</string></dict></plist>"#;
+        assert_eq!(
+            parse_attachment_plist(hint_only).unwrap(),
+            ("/dev/disk4".into(), "/dev/disk4s1".into())
+        );
+
+        let kind_only = br#"<plist><dict><key>dev-entry</key><string>/dev/disk5</string></dict>
+            <dict><key>dev-entry</key><string>/dev/disk5s2</string>
+            <key>volume-kind</key><string>APFS</string></dict></plist>"#;
+        assert_eq!(
+            parse_attachment_plist(kind_only).unwrap(),
+            ("/dev/disk5".into(), "/dev/disk5s2".into())
+        );
+
+        let nested = br#"<plist>
+            <dict><key>dev-entry</key><string>/dev/disk7s1</string>
+            <key>content-hint</key><string>Apple_APFS</string></dict>
+            <dict><key>dev-entry</key><string>/dev/disk7s1s2</string>
+            <key>content-hint</key><string>Apple_APFS</string></dict></plist>"#;
+        assert_eq!(
+            parse_attachment_plist(nested).unwrap(),
+            ("/dev/disk7".into(), "/dev/disk7s1s2".into())
+        );
+    }
+
+    #[test]
+    fn device_helpers_distinguish_whole_disks_slices_and_invalid_names() {
+        assert_eq!(device_depth("/dev/disk12"), 0);
+        assert_eq!(device_depth("/dev/disk12s3"), 1);
+        assert_eq!(device_depth("/dev/disk12s3s1"), 2);
+        assert_eq!(
+            whole_device_from("/dev/disk12s3"),
+            Some("/dev/disk12".into())
+        );
+        assert_eq!(whole_device_from("/dev/disk"), None);
+        assert_eq!(whole_device_from("/dev/not-a-disk"), None);
+
+        let invalid = br#"<dict><key>dev-entry</key><string>/dev/not-a-disk</string>
+            <key>volume-kind</key><string>apfs</string></dict>"#;
+        assert!(matches!(
+            parse_attachment_plist(invalid),
+            Err(ApfsError::InvalidAttachmentPlist(message))
+                if message == "invalid APFS volume device"
+        ));
+    }
+
+    #[test]
+    fn clonefile_errors_classify_existing_destination_and_other_io() {
+        let destination = classify_clone_error(
+            Path::new("main.asif"),
+            Path::new("session.asif"),
+            io::Error::from_raw_os_error(17),
+        );
+        assert!(matches!(
+            destination,
+            CloneFileError::DestinationExists { destination }
+                if destination == Path::new("session.asif")
+        ));
+
+        let other = classify_clone_error(
+            Path::new("main.asif"),
+            Path::new("session.asif"),
+            io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
+        );
+        assert!(matches!(
+            &other,
+            CloneFileError::Io {
+                source_path,
+                destination_path,
+                source,
+            } if source_path == Path::new("main.asif")
+                && destination_path == Path::new("session.asif")
+                && source.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(
+            std::error::Error::source(&other).unwrap().to_string(),
+            "denied"
+        );
+    }
+
+    #[test]
+    fn clonefile_reports_a_missing_source_without_creating_destination() {
+        let source = temp_path("missing-clone-source", ImageFormat::Asif.extension());
+        let destination = temp_path("missing-clone-destination", ImageFormat::Asif.extension());
+        let error = clonefile_native(&source, &destination).unwrap_err();
+        #[cfg(target_os = "macos")]
+        assert!(matches!(error, CloneFileError::Io { .. }));
+        #[cfg(not(target_os = "macos"))]
+        assert!(matches!(error, CloneFileError::UnsupportedPlatform));
+        assert!(!destination.exists());
     }
 
     #[test]
