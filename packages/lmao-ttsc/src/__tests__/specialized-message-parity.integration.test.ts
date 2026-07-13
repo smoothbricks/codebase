@@ -6,7 +6,6 @@ import { createBunTtscPlugin } from '../index.js';
 
 const fixturePath = fileURLToPath(new URL('./fixtures/specialized-message-parity.ts', import.meta.url));
 const projectPath = fileURLToPath(new URL('../../tsconfig.test.json', import.meta.url));
-const vocabularySyncPath = fileURLToPath(new URL('../../scripts/sync-vocabulary.mjs', import.meta.url));
 
 interface FixtureResult {
   result: { ok: boolean; value: string };
@@ -25,12 +24,7 @@ interface FixtureResult {
   rawMessageSentinels: [string | null, string | null];
 }
 
-async function buildFixture(
-  pluginEnabled: boolean,
-  outputDir: string,
-  vocabularyManifest: string,
-  project: string,
-): Promise<string> {
+async function buildFixture(pluginEnabled: boolean, outputDir: string): Promise<string> {
   const result = await Bun.build({
     entrypoints: [fixturePath],
     outdir: outputDir,
@@ -39,11 +33,10 @@ async function buildFixture(
     plugins: pluginEnabled
       ? [
           createBunTtscPlugin({
-            project,
+            project: projectPath,
             plugins: [
               {
                 transform: '@smoothbricks/lmao-ttsc/ttsc-plugin',
-                vocabularyManifest,
               },
             ],
           }),
@@ -54,26 +47,6 @@ async function buildFixture(
   const output = result.outputs.find((candidate) => candidate.path.endsWith('.js'));
   if (!output) throw new Error('Specialized message parity fixture emitted no JavaScript');
   return output.path;
-}
-
-async function syncVocabulary(project: string, vocabularyManifest: string): Promise<void> {
-  const child = Bun.spawn(
-    [
-      process.execPath,
-      vocabularySyncPath,
-      '--write',
-      `--cwd=${dirname(projectPath)}`,
-      `--tsconfig=${project}`,
-      `--lmao-vocabulary-manifest=${vocabularyManifest}`,
-    ],
-    { cwd: dirname(projectPath), stdout: 'pipe', stderr: 'pipe', env: process.env },
-  );
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-    child.exited,
-  ]);
-  if (exitCode !== 0) throw new Error(`Specialized message vocabulary sync exited ${exitCode}:\n${stderr || stdout}`);
 }
 
 async function executeFixture(entrypoint: string): Promise<FixtureResult> {
@@ -101,21 +74,11 @@ async function executeFixture(entrypoint: string): Promise<FixtureResult> {
 test('plugin ON selects specialized capacity-64 static-50 while OFF stays current with identical semantics', async () => {
   const temporaryRoot = await mkdtemp(join(dirname(fixturePath), '.specialized-message-parity-'));
   try {
-    const vocabularyManifest = join(temporaryRoot, 'lmao.vocabulary.json');
-    const isolatedProject = join(temporaryRoot, 'tsconfig.json');
-    await Bun.write(
-      isolatedProject,
-      JSON.stringify({ extends: projectPath, include: [], files: [fixturePath] }),
-    );
-    await syncVocabulary(isolatedProject, vocabularyManifest);
     const [offEntrypoint, onEntrypoint] = await Promise.all([
-      buildFixture(false, join(temporaryRoot, 'off'), vocabularyManifest, isolatedProject),
-      buildFixture(true, join(temporaryRoot, 'on'), vocabularyManifest, isolatedProject),
+      buildFixture(false, join(temporaryRoot, 'off')),
+      buildFixture(true, join(temporaryRoot, 'on')),
     ]);
-    const [pluginOff, pluginOn] = await Promise.all([
-      executeFixture(offEntrypoint),
-      executeFixture(onEntrypoint),
-    ]);
+    const [pluginOff, pluginOn] = await Promise.all([executeFixture(offEntrypoint), executeFixture(onEntrypoint)]);
 
     const expectedEffects = Array.from({ length: 31 }, (_, index) => index);
     expect(pluginOff.effects).toEqual(expectedEffects);
