@@ -1,8 +1,7 @@
 import { expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as adapterExports from '@smoothbricks/lmao-ttsc';
 
 const fixturePath = fileURLToPath(new URL('./fixtures/typed-op.ts', import.meta.url));
@@ -13,7 +12,7 @@ test('the exported Bun adapter applies the explicitly selected native plugin', a
   if (typeof adapterFactory !== 'function') {
     throw new TypeError('@smoothbricks/lmao-ttsc did not export a Bun adapter factory');
   }
-  const outputDir = await mkdtemp(join(tmpdir(), 'lmao-ttsc-bun-'));
+  const outputDir = await mkdtemp(join(dirname(fixturePath), '.bun-adapter-'));
 
   try {
     const result = await Bun.build({
@@ -24,7 +23,12 @@ test('the exported Bun adapter applies the explicitly selected native plugin', a
       plugins: [
         adapterFactory({
           project: projectPath,
-          plugins: [{ transform: '@smoothbricks/lmao-ttsc/ttsc-plugin' }],
+          plugins: [
+            {
+              transform: '@smoothbricks/lmao-ttsc/ttsc-plugin',
+              vocabularyManifest: '../../lmao.vocabulary.json',
+            },
+          ],
         }),
       ],
     });
@@ -38,8 +42,13 @@ test('the exported Bun adapter applies the explicitly selected native plugin', a
       throw new Error('Bun.build did not emit JavaScript for the typed Op fixture');
     }
 
-    const emitted = await output.text();
-    expect(emitted).toMatch(/runtimeHint:\s*9568259,\s*logTemplateIds:\s*\[\s*"native fixture log"\s*\]/);
+    // The build output path is created per test, so a static import cannot address this module boundary.
+    const builtModule = await import(pathToFileURL(output.path).href);
+    const typedOp: unknown = builtModule.typedOp;
+    if ((typeof typedOp !== 'object' && typeof typedOp !== 'function') || typedOp === null) {
+      throw new TypeError('Bun adapter output did not export the transformed typed Op');
+    }
+    expect(Reflect.get(typedOp, 'runtimeHint')).toBe(9568260);
     expect('createLmaoTransformer' in adapterExports).toBe(false);
   } finally {
     await rm(outputDir, { recursive: true, force: true });

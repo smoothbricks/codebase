@@ -18,6 +18,7 @@ import type { LogSchema } from '../schema/LogSchema.js';
 import type { SpanBufferStats } from '../spanBufferStats.js';
 import type { ITraceRoot } from '../traceRoot.js';
 import type { AnySpanBuffer } from '../types.js';
+import { getVocabularyGeneration, type VocabularyGeneration } from '../vocabularyRegistry.js';
 import type { WasmAllocator } from './wasmAllocator.js';
 
 // Spec link (88): realizes specs/lmao/01q_wasm_memory_architecture.md#smoo/lmao!n/wasm-mem (SpanBuffer + SpanLogger codegen).
@@ -62,6 +63,7 @@ export interface WasmSpanBufferOptions {
   _scopeValues: Readonly<Record<string, unknown>>;
   _opMetadata: OpMetadata;
   _callsiteMetadata: OpMetadata;
+  _vocabularyGeneration: VocabularyGeneration;
   _identityMode?: WasmIdentityMode;
   _identityPtr?: number;
   _parent?: WasmSpanBufferInstance;
@@ -818,9 +820,8 @@ class WasmSpanBuffer {
     this._scopeValues = opts._scopeValues;
     this._opMetadata = opts._opMetadata;
     this._callsiteMetadata = opts._callsiteMetadata;
-    this._messageTemplateIds = opts._opMetadata.logTemplateIds.length !== 0
-      ? new Uint16Array(opts.capacity)
-      : undefined;
+    this._logHeaders = new Uint32Array(opts.capacity);
+    this._vocabularyGeneration = opts._vocabularyGeneration;
     this._statsSealed = false;
     this._statsReservedRows = 2;
 
@@ -995,7 +996,10 @@ return WasmSpanBuffer;
  */
 export function createWasmSpanBuffer(
   schema: LogSchema,
-  opts: Omit<WasmSpanBufferOptions, 'logSchema' | '_traceRoot' | '_scopeValues' | '_opMetadata' | '_callsiteMetadata'>,
+  opts: Omit<
+    WasmSpanBufferOptions,
+    'logSchema' | '_traceRoot' | '_scopeValues' | '_opMetadata' | '_callsiteMetadata' | '_vocabularyGeneration'
+  >,
   _traceRoot: ITraceRoot,
   _scopeValues: Readonly<Record<string, unknown>>,
   _opMetadata: OpMetadata,
@@ -1011,6 +1015,7 @@ export function createWasmSpanBuffer(
     _scopeValues,
     _opMetadata,
     _callsiteMetadata,
+    _vocabularyGeneration: _opMetadata._physicalLayoutPlan?.vocabularyGeneration ?? getVocabularyGeneration(),
   });
 }
 
@@ -1040,6 +1045,7 @@ export function createWasmChildSpanBuffer(
     | '_scopeValues'
     | '_opMetadata'
     | '_callsiteMetadata'
+    | '_vocabularyGeneration'
   > & {
     schema?: LogSchema;
   },
@@ -1065,6 +1071,7 @@ export function createWasmChildSpanBuffer(
     _scopeValues,
     _opMetadata,
     _callsiteMetadata,
+    _vocabularyGeneration: _opMetadata._physicalLayoutPlan?.vocabularyGeneration ?? getVocabularyGeneration(),
   });
 
   return child;
@@ -1102,6 +1109,7 @@ export function createWasmOverflowBuffer(
     _scopeValues,
     _opMetadata,
     _callsiteMetadata,
+    _vocabularyGeneration: buffer._vocabularyGeneration,
     _identityMode: 'overflow',
     _identityPtr: buffer._identityPtr,
     _parent: buffer._parent,

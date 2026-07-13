@@ -48,10 +48,15 @@ import type { AnySpanBuffer, SpanBuffer } from '../types.js';
  * Singleton - same object shared by all generated SpanLogger classes.
  */
 export const SPAN_LOGGER_HELPERS: {
+  normalizeOperationalTemplate: (template: string) => string;
   setNullBit: (bitmap: Uint8Array, idx: number) => void;
   fillNullBitmapRange: (bitmap: Uint8Array, startIdx: number, endIdx: number) => void;
   fillBooleanBitmapRange: (bitmap: Uint8Array, startIdx: number, endIdx: number, value: boolean) => void;
 } = {
+  normalizeOperationalTemplate: (template: string) => {
+    if (template.indexOf('{{') === -1 && template.indexOf('}}') === -1) return template;
+    return template.replaceAll('{{', '{').replaceAll('}}', '}');
+  },
   setNullBit: (bitmap: Uint8Array, idx: number) => {
     bitmap[idx >>> 3] |= 1 << (idx & 7);
   },
@@ -157,12 +162,17 @@ export const SPAN_LOGGER_HELPERS: {
 export interface BaseSpanLogger<T extends LogSchema> {
   /** Log info-level message */
   info(message: string): FluentLogEntry<T>;
+  info(template: string, fields: Partial<InferSchema<T>>): FluentLogEntry<T>;
   /** Log debug-level message */
   debug(message: string): FluentLogEntry<T>;
   /** Log warning message */
   warn(message: string): FluentLogEntry<T>;
+  warn(template: string, fields: Partial<InferSchema<T>>): FluentLogEntry<T>;
   /** Log error message */
   error(message: string): FluentLogEntry<T>;
+  error(template: string, fields: Partial<InferSchema<T>>): FluentLogEntry<T>;
+  /** Log trace-level message */
+  trace(message: string): FluentLogEntry<T>;
 }
 
 /**
@@ -189,9 +199,12 @@ export type FluentLogEntry<T extends LogSchema> = {
 
   // Logging methods for continued chaining
   info(message: string): FluentLogEntry<T>;
+  info(template: string, fields: Partial<InferSchema<T>>): FluentLogEntry<T>;
   debug(message: string): FluentLogEntry<T>;
   warn(message: string): FluentLogEntry<T>;
+  warn(template: string, fields: Partial<InferSchema<T>>): FluentLogEntry<T>;
   error(message: string): FluentLogEntry<T>;
+  error(template: string, fields: Partial<InferSchema<T>>): FluentLogEntry<T>;
   trace(message: string): FluentLogEntry<T>;
 } & {
   [K in keyof InferSchema<T>]: (value: InferSchema<T>[K]) => FluentLogEntry<T>;
@@ -210,15 +223,18 @@ export type FluentLogEntry<T extends LogSchema> = {
  */
 export type SpanLoggerImpl<T extends LogSchema> = ColumnWriter<T> & {
   info(message: string): FluentLogEntry<T>;
+  info(template: string, fields: Partial<InferSchema<T>>): FluentLogEntry<T>;
   debug(message: string): FluentLogEntry<T>;
   warn(message: string): FluentLogEntry<T>;
+  warn(template: string, fields: Partial<InferSchema<T>>): FluentLogEntry<T>;
   error(message: string): FluentLogEntry<T>;
+  error(template: string, fields: Partial<InferSchema<T>>): FluentLogEntry<T>;
   trace(message: string): FluentLogEntry<T>;
-  _infoTemplate(templateId: number): FluentLogEntry<T>;
-  _debugTemplate(templateId: number): FluentLogEntry<T>;
-  _warnTemplate(templateId: number): FluentLogEntry<T>;
-  _errorTemplate(templateId: number): FluentLogEntry<T>;
-  _traceTemplate(templateId: number): FluentLogEntry<T>;
+  _infoTemplate(vocabularyIndex: number): FluentLogEntry<T>;
+  _debugTemplate(vocabularyIndex: number): FluentLogEntry<T>;
+  _warnTemplate(vocabularyIndex: number): FluentLogEntry<T>;
+  _errorTemplate(vocabularyIndex: number): FluentLogEntry<T>;
+  _traceTemplate(vocabularyIndex: number): FluentLogEntry<T>;
   readonly scope: Readonly<Record<string, unknown>>;
   _setScope(attributes: ScopeUpdate<T>): void;
 };
@@ -440,26 +456,32 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
 
     ` +
       // Write an info log entry.
+      // The optional fields argument is the untransformed fallback. JavaScript evaluates
+      // the receiver, template, and object initializers before this method runs. Lowered
+      // calls use _infoTemplate/_warnTemplate/_errorTemplate plus direct setters instead.
       // writeLogEntry bumps buffer._writeIndex, writes timestamp+entry_type, returns idx.
       // We sync this._writeIndex so fluent setters write at correct row.
-      `info(message) {
+      `info(message, fields) {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_INFO);
       this._writeIndex = idx;
       if (this._buffer.message_values) {
-        this._buffer.message_values[idx] = message;
+        this._buffer.message_values[idx] = helpers.normalizeOperationalTemplate(message);
         if (this._buffer.message_nulls) {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
+      if (fields !== undefined) {
+        this.with(fields);
+      }
       return this;
     }
 
-    _infoTemplate(templateId) {
+    _infoTemplate(vocabularyIndex) {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_INFO);
       this._writeIndex = idx;
-      this._buffer._messageTemplateIds[idx] = templateId;
+      this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_INFO) >>> 0;
       if (this._buffer.message_nulls) {
         helpers.setNullBit(this._buffer.message_nulls, idx);
       }
@@ -481,11 +503,11 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       return this;
     }
 
-    _debugTemplate(templateId) {
+    _debugTemplate(vocabularyIndex) {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_DEBUG);
       this._writeIndex = idx;
-      this._buffer._messageTemplateIds[idx] = templateId;
+      this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_DEBUG) >>> 0;
       if (this._buffer.message_nulls) {
         helpers.setNullBit(this._buffer.message_nulls, idx);
       }
@@ -494,24 +516,27 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
 
     ` +
       // Write a warn log entry.
-      `warn(message) {
+      `warn(message, fields) {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_WARN);
       this._writeIndex = idx;
       if (this._buffer.message_values) {
-        this._buffer.message_values[idx] = message;
+        this._buffer.message_values[idx] = helpers.normalizeOperationalTemplate(message);
         if (this._buffer.message_nulls) {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
+      if (fields !== undefined) {
+        this.with(fields);
+      }
       return this;
     }
 
-    _warnTemplate(templateId) {
+    _warnTemplate(vocabularyIndex) {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_WARN);
       this._writeIndex = idx;
-      this._buffer._messageTemplateIds[idx] = templateId;
+      this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_WARN) >>> 0;
       if (this._buffer.message_nulls) {
         helpers.setNullBit(this._buffer.message_nulls, idx);
       }
@@ -520,24 +545,27 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
 
     ` +
       // Write an error log entry.
-      `error(message) {
+      `error(message, fields) {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_ERROR);
       this._writeIndex = idx;
       if (this._buffer.message_values) {
-        this._buffer.message_values[idx] = message;
+        this._buffer.message_values[idx] = helpers.normalizeOperationalTemplate(message);
         if (this._buffer.message_nulls) {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
+      if (fields !== undefined) {
+        this.with(fields);
+      }
       return this;
     }
 
-    _errorTemplate(templateId) {
+    _errorTemplate(vocabularyIndex) {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_ERROR);
       this._writeIndex = idx;
-      this._buffer._messageTemplateIds[idx] = templateId;
+      this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_ERROR) >>> 0;
       if (this._buffer.message_nulls) {
         helpers.setNullBit(this._buffer.message_nulls, idx);
       }
@@ -559,11 +587,11 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       return this;
     }
 
-    _traceTemplate(templateId) {
+    _traceTemplate(vocabularyIndex) {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_TRACE);
       this._writeIndex = idx;
-      this._buffer._messageTemplateIds[idx] = templateId;
+      this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_TRACE) >>> 0;
       if (this._buffer.message_nulls) {
         helpers.setNullBit(this._buffer.message_nulls, idx);
       }

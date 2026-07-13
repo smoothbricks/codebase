@@ -112,7 +112,7 @@ async function captureRoot(runtimeHint: number, name: string): Promise<CapturedC
       return new Ok(name);
     },
     undefined,
-    { runtimeHint, logTemplateIds: [] },
+    { runtimeHint },
   );
   const tracer = new TestTracer(context, createTestTracerOptions());
   await tracer.trace(name, { requestId: `${name}-request` }, op);
@@ -230,7 +230,7 @@ describe('capability-specialized SpanContext shapes', () => {
         return ctx.ok(null);
       },
       undefined,
-      { runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_RESULT | 2, logTemplateIds: [] },
+      { runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_RESULT | 2 },
     );
     const tracer = new TestTracer(context, createTestTracerOptions());
     await tracer.trace('typed-user-context', { requestId: 'request-7', tenant: { region: 'ord' } }, op);
@@ -266,7 +266,6 @@ describe('specialized SpanContext runtime semantics', () => {
       undefined,
       {
         runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_FF | RUNTIME_HINT_RESULT | 2,
-        logTemplateIds: [],
       },
     );
     const parent = context.defineOp(
@@ -278,7 +277,6 @@ describe('specialized SpanContext runtime semantics', () => {
       undefined,
       {
         runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_SPAN | RUNTIME_HINT_RESULT | 2,
-        logTemplateIds: [],
       },
     );
     const tracer = new TestTracer(context, { ...createTestTracerOptions(), flagEvaluator: evaluator });
@@ -300,7 +298,7 @@ describe('specialized SpanContext runtime semantics', () => {
         return ctx.ok('child');
       },
       undefined,
-      { runtimeHint: hint, logTemplateIds: [] },
+      { runtimeHint: hint },
     );
     let rootContext: CapturedContext | undefined;
     const root = context.defineOp(
@@ -313,7 +311,7 @@ describe('specialized SpanContext runtime semantics', () => {
         return ctx.ok('root');
       },
       undefined,
-      { runtimeHint: hint, logTemplateIds: [] },
+      { runtimeHint: hint },
     );
     const tracer = new TestTracer(context, createTestTracerOptions());
     await tracer.trace('overflow-root', root);
@@ -345,7 +343,7 @@ describe('specialized SpanContext runtime semantics', () => {
           return ctx.err(TEST_FAILURE({ reason: 'expected' }));
         },
         undefined,
-        { runtimeHint, logTemplateIds: [] },
+        { runtimeHint },
       );
       const tracer = new TestTracer(context, createTestTracerOptions());
       const result = await tracer.trace(name, op);

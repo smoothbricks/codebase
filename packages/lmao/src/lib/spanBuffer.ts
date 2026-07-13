@@ -34,6 +34,7 @@ import type { SpanBufferStats } from './spanBufferStats.js';
 import { writeThreadIdToUint64Array } from './threadId.js';
 import type { ITraceRoot } from './traceRoot.js';
 import type { AnySpanBuffer, SpanBuffer } from './types.js';
+import { getVocabularyGeneration, type VocabularyGeneration } from './vocabularyRegistry.js';
 
 // Re-export ITraceRoot for external consumers (and to satisfy linter - it's used in generated code)
 export type { ITraceRoot };
@@ -132,6 +133,7 @@ export interface SpanBufferConstructor<T extends LogSchema = LogSchema> {
     callsiteMetadata: OpMetadata | undefined,
     opMetadata: OpMetadata | undefined,
     traceRoot: ITraceRoot,
+    vocabularyGeneration: VocabularyGeneration,
   ): SpanBuffer<T>;
 
   // Static properties added after class generation
@@ -148,6 +150,7 @@ type GeneratedSpanBufferClass<T extends LogSchema> = new (
   callsiteMetadata: OpMetadata | undefined,
   opMetadata: OpMetadata | undefined,
   traceRoot: ITraceRoot,
+  vocabularyGeneration: VocabularyGeneration,
 ) => SpanBuffer<T>;
 
 function isGeneratedSpanBufferClass<T extends LogSchema>(
@@ -253,7 +256,7 @@ export function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferCo
 
   // Define extension for arrow-builder's class generator
   const extension: ColumnBufferExtension = {
-    constructorParams: 'stats, parent, isChained, callsiteMetadata, opMetadata, traceRoot',
+    constructorParams: 'stats, parent, isChained, callsiteMetadata, opMetadata, traceRoot, vocabularyGeneration',
     dependencies: {
       writeThreadIdToUint64Array,
       textDecoder: traceIdDecoder,
@@ -300,14 +303,11 @@ export function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferCo
        }
        const spanId = ++globalThis.globalSpanCounter;
 ` +
-      // Calculate system buffer size: timestamps (8 bytes * cap) + entry_type (1 byte * cap)
-      // and, only for template-bearing Ops, message template IDs (2 bytes * cap).
-      // Align to 8 bytes so identity's BigUint64Array offset is aligned
-      `const hasMessageTemplates = opMetadata && opMetadata.logTemplateIds.length !== 0;
-       const messageTemplateOffset = (requestedCapacity * 9 + 1) & ~1;
-       const rawSystemSize = hasMessageTemplates
-         ? messageTemplateOffset + requestedCapacity * 2
-         : requestedCapacity * 9;
+      // Calculate system buffer size: timestamps (8 bytes * cap), entry type (1 byte * cap),
+      // and packed dense vocabulary log headers (4 bytes * cap).
+      // Align header and identity offsets for their TypedArray views.
+      `const logHeaderOffset = (requestedCapacity * 9 + 3) & ~3;
+       const rawSystemSize = logHeaderOffset + requestedCapacity * 4;
        const systemSize = (rawSystemSize + 7) & ~7;
        let systemBuffer;
        let identityView;
@@ -341,14 +341,13 @@ export function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferCo
           identityView.set(traceIdUtf8, 13);
         }
 ` +
-      // Create TypedArray views for timestamps, entry_type, and the conditional template-ID lane
+      // Create TypedArray views for timestamps, entry types, and packed vocabulary log headers
       `const timestampView = new BigInt64Array(systemBuffer, 0, requestedCapacity);
        const entryTypeView = new Uint8Array(systemBuffer, requestedCapacity * 8, requestedCapacity);
-       const messageTemplateIdView = hasMessageTemplates
-         ? new Uint16Array(systemBuffer, messageTemplateOffset, requestedCapacity)
-         : undefined;
+       const logHeaderView = new Uint32Array(systemBuffer, logHeaderOffset, requestedCapacity);
        timestampView.fill(0n);
        entryTypeView.fill(0);
+       logHeaderView.fill(0);
 ` +
       // Assign properties in optimal order for V8 in-object slots (see comment above)
       `this._writeIndex = 0;
@@ -356,7 +355,8 @@ export function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferCo
        this._overflow = undefined;
        this.timestamp = timestampView;
        this.entry_type = entryTypeView;
-       this._messageTemplateIds = messageTemplateIdView;
+       this._logHeaders = logHeaderView;
+       this._vocabularyGeneration = vocabularyGeneration;
        this._children = [];
        this._parent = isChained ? parent._parent : parent;
        this._traceRoot = traceRoot;
@@ -515,6 +515,7 @@ export function createSpanBuffer<T extends LogSchema>(
     opMetadata, // callsiteMetadata for row 0
     opMetadata, // opMetadata for rows 1+ (same as callsite for root)
     traceRoot, // pre-built TraceRoot with trace_id, anchors, tracer
+    opMetadata._physicalLayoutPlan?.vocabularyGeneration ?? getVocabularyGeneration(),
   );
 }
 //#endregion smoo/lmao!n/spanbuffer-layout.create-root
@@ -547,6 +548,7 @@ export function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>)
     buffer._callsiteMetadata,
     buffer._opMetadata,
     buffer._traceRoot, // traceRoot from parent
+    buffer._vocabularyGeneration,
   );
 
   // Link current buffer to next
@@ -595,6 +597,7 @@ export function createChildSpanBuffer<T extends LogSchema>(
     callsiteMetadata, // callsiteMetadata - CALLER's op metadata (for row 0)
     opMetadata, // opMetadata - EXECUTING op metadata (for rows 1+)
     parentBuffer._traceRoot, // traceRoot from parent
+    opMetadata._physicalLayoutPlan?.vocabularyGeneration ?? getVocabularyGeneration(),
   );
 
   return childBuffer;

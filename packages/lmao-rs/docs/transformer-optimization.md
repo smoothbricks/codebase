@@ -150,46 +150,12 @@ retry/terminal rows, and ends the span exactly once. Throws and rejected thenabl
 Because automatic lowering is disabled, this internal `Result | Promise<Result>` behavior cannot alter the public
 Promise API's microtask scheduling. No performance magnitude is asserted here.
 
-## Current shipped Op-local log-template optimization
 
-Roadmap F now has one deliberately local subset in production. For each checker-proved inline `defineOp` callback—or
-each eligible inline member of a single-object-literal `defineOps`—the native ttsc/tsgo plugin collects direct
-one-argument `ctx.log.info/debug/warn/error/trace(...)` calls whose `ctx.log` type is proven as LMAO's logger and whose
-message is a string literal or no-substitution template literal. A simple identifier first context parameter is
-required, nested functions are not traversed, and all uncertain shapes remain on the ordinary logging path.
+## Shipped clean cutover: registered structured vocabulary
 
-The compiler uses the cooked string value, deduplicates equal strings per Op, and assigns private IDs in first lexical
-encounter order. `0` means dynamic/raw; unique strings receive `1..65535`; after 65,535 unique values, later unseen
-strings remain dynamic while prior duplicates keep their IDs. The IDs have no program-wide stability and cannot be
-compared across Ops or builds.
-
-The emitted ABI is structured rather than a second positional scalar: the fourth `defineOp` argument is
-`{ runtimeHint, logTemplateIds }`, and the second `defineOps` argument is a property-keyed map of those objects. Runtime
-normalization validates a maximum of 65,535 string entries, freezes the table, installs the packed hint on the Op, and
-publishes the table as `OpMetadata.logTemplateIds` (`id n` resolves at index `n - 1`). Missing or ineligible metadata
-uses empty templates and hint zero.
-
-A template-bearing JS `SpanBuffer` conditionally reserves an aligned `Uint16Array` lane inside its system allocation;
-the wasm-backed buffer conditionally allocates the same typed lane. Ops with no templates allocate no lane. Static
-transformed writes store only a nonzero ID; dynamic and bailed-out writes store their raw `message_values` string and
-retain ID zero. Overflow buffers inherit the same Op metadata and representation. On cold reads, `resolveMessage`
-returns the raw value for zero or looks up a nonzero ID and throws if it is invalid.
-
-The lane is private storage, not a public Arrow format. Arrow dictionary construction and row emission resolve messages
-back to exact strings; SQLite, test facts, Cloudflare rows, feature-flag lookup, and stdio output use the same resolver.
-Dynamic messages and span names remain strings. Native plugin tests plus runtime/Arrow tests establish these correctness
-invariants. Five independent order-reversed benchmark processes did **not** meet the promotion gate: the
-repeated-literal case was neutral (about -2% to +1% per reversed pair), four literal callsites improved only about 2–6%
-(below the 10% gate), attribute-bearing and 90/10 mixed cases changed sign with registration position/run, and dynamic
-controls exposed a large first-registration bias. No performance win is claimed. The local typed store remains an
-implemented representation change; a global prebuilt dictionary and header packing remain proposed prerequisites to seek
-a measured Roadmap F win.
-
-## Clean-cutover target: registered structured vocabulary
-
-This section is the authoritative compiler/runtime ABI target; it is **not shipped**. It replaces the Op-local `u16`
-representation above rather than layering another ID space over it. The clean cutover removes `logTemplateIds` and its
-private lane after every caller uses the registration ABI. No compatibility alias or dual write survives the cutover.
+This section is the authoritative compiler/runtime ABI. It replaces the former Op-local `u16` representation rather
+than layering another ID space over it. The clean cutover removes the per-Op template table and its private lane after
+every caller uses the registration ABI. No compatibility alias or dual write survives the cutover.
 
 ### Checker recognition and source policy
 
