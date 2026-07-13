@@ -21,7 +21,7 @@ use cowshed_core::storage::apfs::native::{
 };
 use cowshed_core::storage::apfs::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, LockMode, MarkerExpectation,
-    MetadataPolicy,
+    MetadataPolicy, PublicationDisposition,
 };
 use cowshed_core::storage::lifecycle::{
     ExpectedState, LifecycleWorkspace, OperationIdentity, Pin, Revision,
@@ -2498,7 +2498,11 @@ fn persistent_parent_fsync_failure_never_restores_adopt_source_beside_canonical_
     let error = host
         .publish_adopt(&config.main_mount, &pre_cowshed, &staged, canonical.image())
         .expect_err("persistent fsync remains uncertain");
-    assert!(matches!(error, ApfsStorageError::Cleanup { .. }));
+    assert_eq!(error.disposition(), PublicationDisposition::ForwardOnly);
+    assert!(matches!(
+        error.into_source(),
+        ApfsStorageError::Cleanup { .. }
+    ));
     assert!(canonical.image().exists());
     assert!(sidecar_path(canonical.image()).exists());
     assert_eq!(
@@ -2531,4 +2535,67 @@ fn persistent_parent_fsync_failure_never_restores_adopt_source_beside_canonical_
             .recover_pending(&config, &[])
             .expect("repeated recovery");
     }
+}
+
+#[test]
+fn sidecar_primary_and_rollback_double_failure_retains_every_forward_artifact() {
+    let fixture = Fixture::new("sidecar-double-failure");
+    let config = fixture.config();
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    let staged = layout
+        .project()
+        .project_root
+        .join(".staging/main-00000000000000000000000000000001.sparseimage");
+    create_image(&staged, ImageFormat::Sparse);
+    std::fs::write(&staged, b"complete forward image").expect("staged bytes");
+    std::fs::create_dir_all(&config.main_mount).expect("source");
+    std::fs::write(config.main_mount.join("tracked"), b"irreplaceable source")
+        .expect("source bytes");
+    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.main_mount.display()));
+    let host = native_host(&fixture, RecordingRunner::default());
+    host.set_restore_failpoint(RestoreFailpoint::CanonicalSidecarRollbackFailure);
+    let error = host
+        .publish_adopt(&config.main_mount, &pre_cowshed, &staged, canonical.image())
+        .expect_err("compound publication failure");
+    assert_eq!(error.disposition(), PublicationDisposition::ForwardOnly);
+    assert!(matches!(
+        error.into_source(),
+        ApfsStorageError::Cleanup { .. }
+    ));
+    assert!(staged.exists(), "full staged image must be retained");
+    assert!(!sidecar_path(&staged).exists());
+    assert!(!canonical.image().exists());
+    assert!(
+        sidecar_path(canonical.image()).exists(),
+        "canonical sidecar remains the forward reference"
+    );
+    assert_eq!(
+        std::fs::read(pre_cowshed.join("tracked")).expect("preserved source"),
+        b"irreplaceable source"
+    );
+    assert!(!config.main_mount.join("tracked").exists());
+    assert!(config.main_mount.join(".envrc").exists());
+
+    drop(host);
+    let restarted = native_host(&fixture, RecordingRunner::default());
+    restarted
+        .recover_pending(&config, &[])
+        .expect("fresh recovery completes image-last publication");
+    assert_eq!(
+        std::fs::read(canonical.image()).expect("canonical bytes"),
+        b"complete forward image"
+    );
+    DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("canonical metadata");
+    assert!(!staged.exists());
+    assert_eq!(restarted.list(&repo()).expect("list").len(), 1);
+    restarted.gc(&config).expect("GC convergence");
+    restarted
+        .recover_pending(&config, &[])
+        .expect("idempotent recovery");
+    assert_eq!(
+        std::fs::read(pre_cowshed.join("tracked")).expect("preserved source"),
+        b"irreplaceable source"
+    );
+    assert!(!config.main_mount.join("tracked").exists());
 }
