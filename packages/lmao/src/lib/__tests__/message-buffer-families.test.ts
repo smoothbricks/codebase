@@ -592,6 +592,75 @@ describe('specialized message buffer families', () => {
     }
   });
 
+  it('zero-initializes every fresh physical lane across exact capacities, layouts, and allocation kinds', () => {
+    for (const capacity of [3, 8]) {
+      for (const { mode, op } of [
+        { mode: 'current' as const, op: mixedOp },
+        { mode: 'specialized' as const, op: specializedMixedOp },
+        { mode: 'packed' as const, op: packedMixedOp },
+      ]) {
+        const SpanBufferClass = op.callsitePlan.SpanBufferClass;
+        const root = createSpanBuffer(
+          runtimeSchema,
+          createTestTraceRoot(`zero-${mode}-${capacity}`),
+          op.metadata,
+          capacity,
+          SpanBufferClass,
+        );
+        const child = createChildSpanBuffer(root, SpanBufferClass, op.metadata, op.metadata, capacity);
+        const overflow = new SpanBufferClass(
+          capacity,
+          SpanBufferClass.stats,
+          child,
+          true,
+          child._callsiteMetadata,
+          child._opMetadata,
+          child._traceRoot,
+          child._vocabularyGeneration,
+        );
+
+        expect(child._identity).not.toBe(root._identity);
+        expect(overflow._identity).toBe(child._identity);
+        for (const [kind, buffer] of [
+          ['root', root],
+          ['child', child],
+          ['overflow', overflow],
+        ] as const) {
+          expect(buffer._capacity).toBe(capacity);
+          expect(buffer._writeIndex).toBe(0);
+          expect(buffer.constructor).toBe(SpanBufferClass);
+          expect(buffer._opMetadata).toBe(op.metadata);
+          expect(buffer.timestamp.every((value) => value === 0n)).toBe(true);
+
+          if (mode === 'packed') {
+            const rowHeaders = buffer._rowHeaders;
+            if (rowHeaders === undefined) throw new Error(`Expected ${kind} packed row headers`);
+            expect(rowHeaders.every((value) => value === 0)).toBe(true);
+            expect('entry_type' in buffer).toBe(false);
+            expect('_messageIds' in buffer).toBe(false);
+            expect('_logHeaders' in buffer).toBe(false);
+          } else {
+            const entryTypes = buffer.entry_type;
+            if (entryTypes === undefined) throw new Error(`Expected ${kind} ${mode} entry types`);
+            expect(entryTypes.every((value) => value === 0)).toBe(true);
+            expect('_rowHeaders' in buffer).toBe(false);
+            if (mode === 'current') {
+              const messageIds = buffer._messageIds;
+              if (messageIds === undefined) throw new Error(`Expected ${kind} current message IDs`);
+              expect(messageIds.every((value) => value === 0)).toBe(true);
+              expect('_logHeaders' in buffer).toBe(false);
+            } else {
+              const logHeaders = buffer._logHeaders;
+              if (logHeaders === undefined) throw new Error(`Expected ${kind} specialized log headers`);
+              expect(logHeaders.every((value) => value === 0)).toBe(true);
+              expect('_messageIds' in buffer).toBe(false);
+            }
+          }
+        }
+      }
+    }
+  });
+
   it('derives Arrow null, raw, and static messages across current and specialized root, child, and overflow', () => {
     const denseZeroText = textAtDenseZero();
     for (const { mode, op } of [
