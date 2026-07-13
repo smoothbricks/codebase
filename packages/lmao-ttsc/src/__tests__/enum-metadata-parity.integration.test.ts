@@ -30,7 +30,6 @@ async function buildFixture(pluginEnabled: boolean, outputDir: string): Promise<
             plugins: [
               {
                 transform: '@smoothbricks/lmao-ttsc/ttsc-plugin',
-                vocabularyManifest: '../../lmao.vocabulary.json',
               },
             ],
           }),
@@ -66,10 +65,7 @@ test('plugin OFF and ON preserve exact enum value/null bytes while ON reuses pla
       buildFixture(false, join(temporaryRoot, 'off')),
       buildFixture(true, join(temporaryRoot, 'on')),
     ]);
-    const [pluginOff, pluginOn] = await Promise.all([
-      executeFixture(offBuild.path),
-      executeFixture(onBuild.path),
-    ]);
+    const [pluginOff, pluginOn] = await Promise.all([executeFixture(offBuild.path), executeFixture(onBuild.path)]);
 
     expect(pluginOn.storage).toEqual(pluginOff.storage);
     expect(pluginOn.decoded).toEqual(pluginOff.decoded);
