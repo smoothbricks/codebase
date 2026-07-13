@@ -109,18 +109,16 @@ function expectWasmPhysicalShape(
     if (physicalLayout === 'current' && hasStaticMessages) {
       expect(buffer._messageIds).toBeInstanceOf(Uint16Array);
       expect('_logHeaders' in buffer).toBe(false);
-      expect(buffer.message_nulls).toBeInstanceOf(Uint8Array);
     } else if (physicalLayout === 'specialized' && hasStaticMessages) {
       expect('_messageIds' in buffer).toBe(false);
       expect(buffer._logHeaders).toBeInstanceOf(Uint32Array);
-      expect(buffer.message_nulls).toBeInstanceOf(Uint8Array);
     } else {
       expect('_messageIds' in buffer).toBe(false);
       expect('_logHeaders' in buffer).toBe(false);
-      expect(buffer.message_nulls).toBeInstanceOf(Uint8Array);
+    }
+    expect('message_nulls' in buffer).toBe(false);
     }
   }
-}
 
 function writeEntryType(buffer: AnySpanBuffer, row: number, entryType: number): void {
   if (buffer._rowHeaders !== undefined) {
@@ -140,17 +138,14 @@ function writeStaticDense(buffer: AnySpanBuffer, row: number, entryType: number,
     buffer._rowHeaders[row] = (((denseIndex + 1) << 8) | entryType) >>> 0;
     return;
   }
-  if (buffer.entry_type === undefined || buffer.message_nulls === undefined) {
-    throw new Error('Expected nonpacked entry-type and validity lanes');
-  }
+  if (buffer.entry_type === undefined) throw new Error('Expected nonpacked entry-type lane');
   buffer.entry_type[row] = entryType;
-  buffer.message_nulls[row >>> 3] |= 1 << (row & 7);
   if (buffer._messagePhysicalLayout === 'current') {
     if (buffer._messageIds === undefined) throw new Error('Expected current local-ID lane');
     buffer._messageIds[row] = denseIndex + 1;
   } else {
     if (buffer._logHeaders === undefined) throw new Error('Expected specialized global dense lane');
-    buffer._logHeaders[row] = denseIndex;
+    buffer._logHeaders[row] = denseIndex + 1;
   }
 }
 
@@ -216,7 +211,6 @@ describe('WASM specialized message buffer families', () => {
       fc.property(fc.integer({ min: 1, max: 512 }), (capacity) => {
         const timestampBytes = capacity * BigUint64Array.BYTES_PER_ELEMENT;
         const entryTypeBytes = capacity * Uint8Array.BYTES_PER_ELEMENT;
-        const validityBytes = Math.ceil(capacity / 8);
         for (const family of families) {
           for (const mode of modes) {
             const template = createWasmLayoutTemplate(schema, family, mode);
@@ -227,14 +221,14 @@ describe('WASM specialized message buffer families', () => {
             expect(layout.messagePhysicalLayout).toBe(mode);
             expect(layout.system.timestampOffset).toBe(0);
             expect(layout.system.messageValueOffset).toBe(family === 'static-only' ? null : 0);
+            expect('messageIdValidityOffset' in layout.system).toBe(false);
+            expect('messageValidityOffset' in layout.system).toBe(false);
 
             if (mode === 'packed') {
               const rowHeaderOffset = align(timestampBytes, Uint32Array.BYTES_PER_ELEMENT);
               expect(layout.system.entryTypeOffset).toBeNull();
               expect(layout.system.messageIdOffset).toBeNull();
-              expect(layout.system.messageIdValidityOffset).toBeNull();
               expect(layout.system.messageDenseIndexOffset).toBeNull();
-              expect(layout.system.messageValidityOffset).toBeNull();
               expect(layout.system.rowHeaderOffset).toBe(rowHeaderOffset);
               expect(layout.system.byteLength).toBe(
                 align(rowHeaderOffset + capacity * Uint32Array.BYTES_PER_ELEMENT, BigUint64Array.BYTES_PER_ELEMENT),
@@ -244,36 +238,27 @@ describe('WASM specialized message buffer families', () => {
               expect(layout.system.entryTypeOffset).toBe(entryTypeOffset);
               expect(layout.system.rowHeaderOffset).toBeNull();
               if (!hasStaticMessages) {
-                const messageValidityOffset = entryTypeOffset + entryTypeBytes;
                 expect(layout.system.messageIdOffset).toBeNull();
-                expect(layout.system.messageIdValidityOffset).toBeNull();
                 expect(layout.system.messageDenseIndexOffset).toBeNull();
-                expect(layout.system.messageValidityOffset).toBe(messageValidityOffset);
                 expect(layout.system.byteLength).toBe(
-                  align(messageValidityOffset + validityBytes, BigUint64Array.BYTES_PER_ELEMENT),
+                  align(entryTypeOffset + entryTypeBytes, BigUint64Array.BYTES_PER_ELEMENT),
                 );
               } else if (mode === 'current') {
                 const messageIdOffset = align(entryTypeOffset + entryTypeBytes, Uint16Array.BYTES_PER_ELEMENT);
-                const messageIdValidityOffset = messageIdOffset + capacity * Uint16Array.BYTES_PER_ELEMENT;
                 expect(layout.system.messageIdOffset).toBe(messageIdOffset);
-                expect(layout.system.messageIdValidityOffset).toBe(messageIdValidityOffset);
                 expect(layout.system.messageDenseIndexOffset).toBeNull();
-                expect(layout.system.messageValidityOffset).toBeNull();
                 expect(layout.system.byteLength).toBe(
-                  align(messageIdValidityOffset + validityBytes, BigUint64Array.BYTES_PER_ELEMENT),
+                  align(messageIdOffset + capacity * Uint16Array.BYTES_PER_ELEMENT, BigUint64Array.BYTES_PER_ELEMENT),
                 );
               } else {
                 const messageDenseIndexOffset = align(
                   entryTypeOffset + entryTypeBytes,
                   Uint32Array.BYTES_PER_ELEMENT,
                 );
-                const messageValidityOffset = messageDenseIndexOffset + capacity * Uint32Array.BYTES_PER_ELEMENT;
                 expect(layout.system.messageIdOffset).toBeNull();
-                expect(layout.system.messageIdValidityOffset).toBeNull();
                 expect(layout.system.messageDenseIndexOffset).toBe(messageDenseIndexOffset);
-                expect(layout.system.messageValidityOffset).toBe(messageValidityOffset);
                 expect(layout.system.byteLength).toBe(
-                  align(messageValidityOffset + validityBytes, BigUint64Array.BYTES_PER_ELEMENT),
+                  align(messageDenseIndexOffset + capacity * Uint32Array.BYTES_PER_ELEMENT, BigUint64Array.BYTES_PER_ELEMENT),
                 );
               }
             }
@@ -298,18 +283,72 @@ describe('WASM specialized message buffer families', () => {
       expect(resolveEntryType(buffer, 0)).toBe(ENTRY_TYPE_INFO);
       expect(resolveMessage(buffer, 0)).toBeDefined();
       if (mode === 'current') expect(buffer._messageIds?.[0]).toBe(1);
-      else expect(buffer._logHeaders?.[0]).toBe(0);
-      const validity = buffer.message_nulls;
-      if (validity === undefined) throw new Error(`Expected ${mode} validity lane`);
-      expect(validity[0] & 1).toBe(1);
+      else expect(buffer._logHeaders?.[0]).toBe(1);
+      expect('message_nulls' in buffer).toBe(false);
 
       writeEntryType(buffer, 1, ENTRY_TYPE_DEBUG);
       expect(resolveMessage(buffer, 1)).toBeUndefined();
-      buffer.message(1, `${mode} raw`);
-      validity[0] |= 1 << 1;
-      expect(resolveMessage(buffer, 1)).toBe(`${mode} raw`);
+      buffer.message(1, '');
+      expect(resolveMessage(buffer, 1)).toBe('');
       writeEntryType(buffer, 2, ENTRY_TYPE_DEBUG);
       expect(resolveMessage(buffer, 2)).toBeUndefined();
+      if (mode === 'specialized') {
+        if (buffer._logHeaders === undefined) throw new Error('Expected specialized dense lane');
+        buffer._logHeaders[2] = MAX_PACKED_MESSAGE_DENSE_INDEX + 1;
+        expect(buffer._logHeaders[2]).toBe(0x00ffffff);
+      }
+    }
+  });
+
+  it('clears stale raw rows across allocator reuse before current and specialized static/null/raw transitions', () => {
+    for (const { mode, metadata } of [
+      { mode: 'current' as const, metadata: currentMixedOp.metadata },
+      { mode: 'specialized' as const, metadata: specializedMixedOp.metadata },
+    ]) {
+      allocator.reset();
+      allocator.setThreadId(0, 42);
+      traceRoot = new WasmTraceRoot<typeof schema>(allocator, createTraceId(`${mode}-raw-cycle`), lifecycleTracer);
+      const staleRaw = createBuffer('mixed', mode, metadata);
+      writeEntryType(staleRaw, 0, ENTRY_TYPE_DEBUG);
+      staleRaw.message(0, 'stale raw');
+      expect(resolveMessage(staleRaw, 0)).toBe('stale raw');
+      const reusedSystemPtr = staleRaw._descriptor.systemPtr;
+      const reducedSystemBytes = staleRaw._layout.system.byteLength;
+
+      allocator.reset();
+      allocator.setThreadId(0, 42);
+      traceRoot = new WasmTraceRoot<typeof schema>(allocator, createTraceId(`${mode}-static-cycle`), lifecycleTracer);
+      const staticRow = createBuffer('mixed', mode, metadata);
+      expect(staticRow._descriptor.systemPtr).toBe(reusedSystemPtr);
+      expect(staticRow._layout.system.byteLength).toBe(reducedSystemBytes);
+      expect(staticRow.message_values?.[0]).toBeUndefined();
+      expect('message_nulls' in staticRow).toBe(false);
+      writeStaticDense(staticRow, 0, ENTRY_TYPE_INFO, 0);
+      expect(resolveMessage(staticRow, 0)).toBeDefined();
+      if (mode === 'current') expect(staticRow._messageIds?.[0]).toBe(1);
+      else expect(staticRow._logHeaders?.[0]).toBe(1);
+
+      allocator.reset();
+      allocator.setThreadId(0, 42);
+      traceRoot = new WasmTraceRoot<typeof schema>(allocator, createTraceId(`${mode}-null-cycle`), lifecycleTracer);
+      const nullRow = createBuffer('mixed', mode, metadata);
+      expect(nullRow._descriptor.systemPtr).toBe(reusedSystemPtr);
+      writeEntryType(nullRow, 0, ENTRY_TYPE_DEBUG);
+      expect(nullRow.message_values?.[0]).toBeUndefined();
+      expect(resolveMessage(nullRow, 0)).toBeUndefined();
+      if (mode === 'current') expect(nullRow._messageIds?.[0]).toBe(0);
+      else expect(nullRow._logHeaders?.[0]).toBe(0);
+
+      allocator.reset();
+      allocator.setThreadId(0, 42);
+      traceRoot = new WasmTraceRoot<typeof schema>(allocator, createTraceId(`${mode}-fresh-raw-cycle`), lifecycleTracer);
+      const freshRaw = createBuffer('mixed', mode, metadata);
+      expect(freshRaw._descriptor.systemPtr).toBe(reusedSystemPtr);
+      writeEntryType(freshRaw, 0, ENTRY_TYPE_DEBUG);
+      freshRaw.message(0, '');
+      expect(resolveMessage(freshRaw, 0)).toBe('');
+      if (mode === 'current') expect(freshRaw._messageIds?.[0]).toBe(0);
+      else expect(freshRaw._logHeaders?.[0]).toBe(0);
     }
   });
 
@@ -444,15 +483,6 @@ describe('WASM specialized message buffer families', () => {
             } else if (operation.kind === 'dynamic') {
               jsSegment.message(jsRow, operation.text);
               wasmSegment.message(wasmRow, operation.text);
-              if (physicalLayout !== 'packed') {
-                const jsValidity = jsSegment.message_nulls;
-                const wasmValidity = wasmSegment.message_nulls;
-                if (jsValidity === undefined || wasmValidity === undefined) {
-                  throw new Error(`Expected ${physicalLayout} parity validity lanes`);
-                }
-                jsValidity[jsRow >>> 3] |= 1 << (jsRow & 7);
-                wasmValidity[wasmRow >>> 3] |= 1 << (wasmRow & 7);
-              }
             }
             expected.push(resolveMessage(jsSegment, jsRow));
             jsSegment._writeIndex = ++jsRow;

@@ -153,14 +153,13 @@ describe('WasmSpanBuffer', () => {
           expect(layout.system.timestampOffset).toBe(0);
           expect(layout.system.entryTypeOffset).toBe(capacity * 8);
           const messageIdOffset = (capacity * 9 + 1) & ~1;
-          const messageIdValidityOffset = messageIdOffset + capacity * Uint16Array.BYTES_PER_ELEMENT;
-          const expectedByteLength = (messageIdValidityOffset + Math.ceil(capacity / 8) + 7) & ~7;
+          const expectedByteLength = (messageIdOffset + capacity * Uint16Array.BYTES_PER_ELEMENT + 7) & ~7;
           expect(layout.messageLayoutFamily).toBe('mixed');
           expect(layout.messagePhysicalLayout).toBe('current');
           expect(layout.system.messageIdOffset).toBe(messageIdOffset);
-          expect(layout.system.messageIdValidityOffset).toBe(messageIdValidityOffset);
+          expect('messageIdValidityOffset' in layout.system).toBe(false);
           expect(layout.system.messageDenseIndexOffset).toBeNull();
-          expect(layout.system.messageValidityOffset).toBeNull();
+          expect('messageValidityOffset' in layout.system).toBe(false);
           expect(layout.system.rowHeaderOffset).toBeNull();
           expect(layout.system.byteLength).toBe(expectedByteLength);
 
@@ -393,8 +392,7 @@ describe('WasmSpanBuffer', () => {
       buffer.message(0, 'span-start message');
       buffer.message(1, 'span-end message');
       buffer.message(2, 'log entry');
-      if (buffer.message_nulls === undefined) throw new Error('Expected message validity lane');
-      buffer.message_nulls[0] |= 0b111;
+      expect('message_nulls' in buffer).toBe(false);
       expect(resolveMessage(buffer, 0)).toBe('span-start message');
       expect(resolveMessage(buffer, 1)).toBe('span-end message');
       expect(resolveMessage(buffer, 2)).toBe('log entry');

@@ -18,8 +18,8 @@ import type {
   Nanoseconds,
   TypedArray,
 } from '@smoothbricks/arrow-builder';
-import type { MessageLayoutFamily, MessagePhysicalLayout } from './runtimeHint.js';
 import type { OpMetadata } from './opContext/opTypes.js';
+import type { MessageLayoutFamily, MessagePhysicalLayout } from './runtimeHint.js';
 import type { LogSchema } from './schema/LogSchema.js';
 import type { InferSchema } from './schema/types.js';
 import type { SpanBufferStats } from './spanBufferStats.js';
@@ -115,8 +115,7 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   /** Current-mode buffer-local template IDs. Zero selects the raw reference lane. */
   readonly _messageIds?: Uint16Array;
 
-
-  /** Specialized global dense message identities. Zero selects the raw reference lane. */
+  /** Specialized 1-based global dense message identities. Zero selects the raw/null sidecar sentinel. */
   readonly _logHeaders?: Uint32Array;
 
   /** Packed row headers: low 8 bits entry type, high 24 bits dense message index plus one. */
@@ -298,9 +297,8 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   // These are explicitly typed here since they're always present from systemSchema.
   // ===========================================================================
 
-  /** Raw per-row message lane. Omitted by the static-only physical family. */
-  readonly message_values?: string[];
-  readonly message_nulls?: Uint8Array;
+  /** Raw per-row message lane. Omitted by static-only; `undefined` is the null sentinel. */
+  readonly message_values?: (string | undefined)[];
 
   /**
    * Line number column values - Float64Array (lazy but always present).
