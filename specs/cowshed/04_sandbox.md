@@ -107,6 +107,33 @@ Shape:
   … denied paths from policy …)
 ```
 
+### Trusted supervisor and child profiles
+
+The revision-bound profile above is the **supervisor profile**. It grants the trusted supervisor write access to
+`<workspace mount>/.cowshed/job/**` so the supervisor can allocate job IDs, capture streams, and write job records.
+That authority must never reach an executed shell. Every anonymous shell, named session, one-shot command, and descendant
+therefore runs under a second profile which intersects with the supervisor profile and only removes authority:
+
+```scheme
+;; Final filesystem rule in every macOS child profile. Because SBPL is
+;; last-match-wins, nothing may be emitted after this rule that can match it.
+(deny file-write*
+  (subpath "<workspace mount>/.cowshed/job"))
+```
+
+The corresponding Linux child Landlock ruleset omits every write right for that subtree. Both platforms deny creating
+children, opening for write, truncating, replacing, renaming, unlinking, linking, changing metadata, and reaching a
+protected inode through a symlink, hardlink, bind mount, alternate spelling, `/proc`, or inherited descriptor. The
+supervisor opens job backing files itself and marks every writable artifact descriptor and controller-writer channel
+close-on-exec/non-inheritable before spawning any shell. Read access may remain available for `cowshed job logs` and
+workspace-local inspection; write authority does not.
+
+This split also applies to a one-shot `cowshed exec` that does not use the persistent pool: the trusted cowshed parent
+retains artifact-write authority and only its command child receives the narrower profile. An inner profile can never
+add a grant absent from the enclosing supervisor profile. An effective filesystem grant mutation still requires the
+outer supervisor drain/relaunch protocol; per-command profiles apply the invariant control-path deny plus mode-specific
+narrowing such as ReadOnly.
+
 Notes:
 
 - The broad `file-read-data` allow is required for dyld; confidentiality is achieved by explicit denies — which work
@@ -321,12 +348,14 @@ These anchors are trust configuration, not secrets, so they are exported/written
 3. Compose env: identity + cache wiring (03_caches.md) + `TRACEPARENT` for the job's span (13_telemetry.md) + the
    workspace's own `.envrc` via fail-closed `direnv export` (see "devenv / Nix inside the sandbox") + caller env
    filtered through an allowlist (build-configuration variables only — never `*_TOKEN`, `*_SECRET`, `AWS_*`, etc.).
-4. Allocate the next workspace-local monotonic numeric job ID. Generate an inner command profile that only narrows the
-   revision-bound supervisor envelope, then submit the command with cwd inside the mount; `--ro` removes workspace write
-   access and no inner rule may add authority absent from the enclosing profile.
-5. Tee the full unmodified streams separately to `.cowshed/job/<numeric-id>/out` and `.cowshed/job/<numeric-id>/err`
-   while streaming them to the caller; append the Arrow exec record at `.cowshed/job/records.arrow`, and report exit
-   code, PIDs, and the enforced supervisor grant revision.
+4. Allocate the next workspace-local monotonic numeric job ID. The trusted supervisor exclusively creates and opens the
+   job directory and backing files, then launches the shell under an inner command profile whose final rule denies every
+   write mutation beneath `.cowshed/job/**`. The inner profile also applies request-specific narrowing such as `--ro`;
+   it may never add authority absent from the revision-bound supervisor envelope.
+5. Tee the complete bytes received on the child stdout and stderr pipes separately to protected
+   `.cowshed/job/<numeric-id>/out` and `.cowshed/job/<numeric-id>/err` while streaming them to the caller. Publish
+   complete Arrow record batches at `.cowshed/job/records.arrow`, seal terminal artifacts, and report exit code, PIDs,
+   and the enforced supervisor grant revision.
 
 ## Sandbox-denial evidence
 
@@ -477,11 +506,12 @@ both OSes.
 
 ## Tradeoffs
 
-**Revision-bound supervisor plus per-command narrowing.** The enclosing supervisor's immutable launch profile is the
-filesystem-authority ceiling for its whole process tree. Inner per-command wrapping cheaply removes authority for modes
-such as ReadOnly, but cannot make a new grant effective. Effective filesystem grant/revoke changes therefore pay an
-explicit drain and relaunch before the next submission; the enforced old revision remains visible on jobs already
-running, and stale named sessions conflict rather than crossing the revision boundary silently.
+**Revision-bound supervisor plus mandatory child narrowing.** The enclosing supervisor's immutable launch profile is the
+filesystem-authority ceiling for its whole process tree. Every shell receives a deterministic inner profile that removes
+write authority to `.cowshed/job/**`; request modes such as ReadOnly may narrow it further. Inner wrapping cannot make a
+new grant effective. Effective filesystem grant/revoke changes therefore pay an explicit drain and relaunch before the
+next submission; the enforced old revision remains visible on jobs already running, and stale named sessions conflict
+rather than crossing the revision boundary silently.
 
 **VM isolation rejected (v1).** Seatbelt confines file writes and egress but shares the kernel; a kernel exploit escapes
 it. The alternatives fail the fleet: Apple containers run only Linux guests, and macOS guests are capped at two

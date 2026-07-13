@@ -30,8 +30,9 @@ The pool is what keeps the _per-command_ cost from eating those wins.
 
 One supervisor process per attached workspace, spawned on first exec (or by `cowshed ensure` for warmed workspaces).
 Each instance is launched **once per effective filesystem grant revision** under that revision's workspace sandbox
-profile, so its whole process tree — every shell it forks, every child those shells spawn — inherits the
-Seatbelt/Landlock boundary transparently, with no per-command wrapping (04_sandbox.md).
+profile. That outer profile is the authority ceiling for the process tree. Every anonymous shell, named session, and
+one-shot command also receives a deterministic inner profile which denies writes beneath `.cowshed/job/**` and applies
+request-specific narrowing such as ReadOnly (04_sandbox.md). The inner profile can remove authority but never add it.
 
 - Holds K warm shells (default 2, `.cowshed.toml` `[shell] pool`), each an interactive shell that has already sourced
   the workspace environment via `direnv export`. Anonymous shells are reset (`cd` to mount root, environment re-applied
@@ -87,7 +88,7 @@ metadata and summaries only; arbitrary stdout/stderr bytes never enter JSON.
 
 Every exec submission is a _job_, foreground or backgrounded. At admission the supervisor allocates a positive `u64`
 `jobId`, monotonically increasing within that workspace. Decimal rendering is canonical, with no prefix or zero padding.
-The raw streams and in-volume record stream are:
+The protected raw streams and in-volume record stream are:
 
 ```
 .cowshed/job/<jobId>/out
@@ -96,16 +97,19 @@ The raw streams and in-volume record stream are:
 ```
 
 `out` and `err` are separate opaque byte streams admitted under the combined quota: no UTF-8 assumption, line rewriting,
-redaction, merging, or summary substitution. The supervisor creates each job directory exclusively before spawning the
-process and opens both files without following symlinks.
+redaction, merging, or summary substitution. The trusted supervisor creates each job directory exclusively and opens
+both files without following symlinks before spawning the command. Executed shells receive a child profile that denies
+every write mutation beneath `.cowshed/job/**`; no writable artifact descriptor is inheritable. The supervisor is the
+only live writer, and completion drains, fsyncs, closes, and seals the backing files before publishing terminal state.
 
 Allocation is exclusive and crash-safe without a counter file or state database. One supervisor is the sole allocator
 for an attached workspace. At startup it scans canonical decimal job directories, chooses `max(existing) + 1` (or `1`
 when none exist), and reserves that number by creating `.cowshed/job/<jobId>/` exclusively before spawn. An unexpected
 `AlreadyExists` advances and retries; malformed names are ignored for allocation and reported by `doctor`. The created
 directory is the durable allocation record, so a crash may leave a terminal pre-spawn attempt but cannot cause reuse.
-Supervisor replacement and attach repeat the scan before admitting an exec. Fork/checkpoint/restore copies reconcile
-above the inherited maximum; no separate high-water file exists.
+Supervisor replacement and attach repeat the scan before admitting an exec. They validate `records.arrow`, discard only
+an incomplete trailing Arrow batch left by an unclean supervisor exit, and never rewrite a complete batch or sealed
+backing file. Fork/checkpoint/restore copies reconcile above the inherited maximum; no separate high-water file exists.
 
 A controller-minted immutable `workspaceIncarnation` disambiguates histories copied by fork/checkpoint/restore. Each
 create, fork destination, and restore result receives a fresh incarnation; inherited records retain the incarnation that
@@ -134,19 +138,27 @@ full tuple remains unique across checkpoint copies and recycled workspace names.
 
 ### Exec records and output summaries
 
-Every job emits lifecycle records to two projections. The workspace-local `.cowshed/job/records.arrow` remains a
-checkpoint-travelling convenience copy. **Authoritative job telemetry is written outside the workspace** by the
-controller telemetry writer. At supervisor launch the controller supplies either a dedicated IPC channel or an
-inherited, write-only capability/FD for that writer; it is marked close-on-exec/non-inheritable before any workspace
-process is spawned and is never represented by a path or token readable inside the workspace. The supervisor cannot
-reopen or delegate it, and children never inherit it.
+Every job emits protected lifecycle records to `.cowshed/job/records.arrow`. The file travels with checkpoints and is
+authoritative for the complete batches written by the trusted supervisor within the recorded
+`workspaceIncarnation`. Executed jobs may read it but cannot write, truncate, rename, unlink, hardlink, or replace it.
+Completion is a record-batch boundary. After an unclean supervisor exit, recovery validates the stream and may truncate
+only an incomplete trailing batch before appending a new recovery batch; malformed complete data is an integrity error,
+not child-authored input to reinterpret.
 
-Each writer appends only to its own immutable segment: segment names are exclusively allocated, a segment has one
-writer, completed segments are sealed and never reopened or shared for append, and publication is atomic. Recovery may
-publish a new segment containing a terminal `supervisor-lost` event; it never edits a sealed segment. Controller
-queries, status authority, quota terminal state, denial correlation, and audit joins use these controller-owned
-segments, **never** workspace-local records. If the two projections disagree, the controller-owned segment wins.
-Completion is a record-batch boundary in both projections.
+Cross-incarnation completeness still requires a controller-owned commitment. At supervisor launch the controller
+supplies either a dedicated IPC channel or an inherited, write-only capability/FD for its telemetry writer; it is
+close-on-exec/non-inheritable before any workspace process is spawned and is never represented by a path or token
+readable inside the workspace. The supervisor cannot reopen or delegate it, and children never inherit it. Admission
+publishes the durable job key; after terminal artifacts are drained, fsynced, and sealed, the supervisor publishes a
+compact commitment containing the terminal state, grant revision, byte counts, incremental SHA-256 stream digests, and
+the digest of the terminal record batch. Controller writers use exclusively allocated immutable segments: one writer
+per segment, atomic publication, no shared append, and no reopening after seal.
+
+Protected in-volume records and streams are authoritative job evidence for their originating incarnation. Controller
+commitments are authoritative for job existence, cross-incarnation ordering, fork/restore lineage, and detection of
+later omission, mutation, or rollback. A mismatch is an explicit integrity failure; neither side silently overwrites
+the other. Grant authority remains in controller-owned grant files and gateway decisions remain in controller-owned
+gateway audit segments.
 
 | Field                                                                        | Example                                                           | Notes                                                                                                                         |
 | ---------------------------------------------------------------------------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
@@ -170,9 +182,9 @@ algorithm and limits.
 
 Summaries are convenience evidence only. They **never** establish a sandbox denial, exit status, signal, output-limit,
 policy/audit decision, or build/test success; those come from authoritative structured process, quota, sandbox, CI, and
-gateway fields. They may omit decisive text by design. Full bytes retained up to the combined job-output quota remain
-exclusively in `out` and `err`; crossing the quota terminates and drains the job into the explicit `output-limit` state.
-No stream is silently truncated while the process continues.
+gateway fields. They may omit decisive text by design. Complete bytes observed on the child pipes and admitted up to the
+combined job-output quota remain exclusively in the protected `out` and `err` files; crossing the quota terminates and
+drains the job into the explicit `output-limit` state. No stream is silently truncated while the process continues.
 
 The workspace-file source is opened after job-id allocation with an `openat`-style, read-only, no-follow component walk
 rooted at the workspace mount. It must canonicalize beneath that mount and resolve to a regular file; absolute paths,
@@ -185,16 +197,18 @@ file source when applicable, plus the existing job and trace identity; inline co
 
 Inspect with `cowshed ps <ws> --json`, `cowshed job list <ws> --json`, or generically with `lmao-inspect`
 (13_telemetry.md). This is the _only_ capture implementation in cowshed. CLI, MCP job tools, and CI diagnostics read the
-same records and raw files; no client re-captures or derives authority from summary text. The standard lmao trace
-identity locates the job span, while `job_id` links that trace to the workspace-local raw files and job-control handle.
-Raw streams are the byte record admitted under the combined quota; only diagnostic summaries use lossy text projection.
-A quota crossing is separately explicit in authoritative terminal state.
+same protected records and raw files; no client re-captures or derives authority from summary text. The standard lmao
+trace identity locates the job span, while `job_id` links that trace to the workspace-local raw files and job-control
+handle. Raw streams are the byte record admitted under the combined quota; only diagnostic summaries use lossy text
+projection. A quota crossing is separately explicit in authoritative terminal state.
 
-**Not authoritative.** Workspace-local records live _inside_ the workspace volume, which is workspace-writable by
-construction — a job can rewrite its own `records.arrow`, `out`, and `err`. They are a reproduction/observability aid,
-not status or audit authority. Authoritative job lifecycle and quota state live in controller-owned immutable writer
-segments; grant authority lives in controller-owned grant files; gateway decisions live in controller-owned audit
-segments. Outside-the-workspace sources always win.
+**Tiered authority.** Physical placement inside a workspace image does not imply executed-job write authority. The
+mandatory child profile excludes `.cowshed/job/**`, the supervisor is its sole live writer, and completed files are
+sealed. Those artifacts are authoritative within their originating incarnation. They cannot alone prove that a newer
+job or incarnation was not omitted by restoring or deleting the whole image, so compact controller commitments preserve
+cross-incarnation continuity and detect rollback. Grant files and gateway audit remain controller-owned. A commitment
+mismatch or missing committed artifact is reported as an integrity failure rather than resolved by trusting whichever
+copy is newer.
 
 ## Grant-change propagation
 
@@ -242,10 +256,11 @@ layer is not optional glue but core to correct lifecycle.
 
 ## Tradeoffs
 
-**Per-command sandbox wrapping rejected as the default.** Wrapping every command in its own `sandbox-exec` (the fallback
-path, still available for one-shot `cowshed exec` with no supervisor) pays the full startup cost per command and cannot
-hold persistent shell state. Launch-time supervisor sandboxing pays it once; the cost — grants bind only at shell
-relaunch — is surfaced, not hidden.
+**Full per-command authority regeneration rejected.** Rebuilding the complete workspace profile and environment for
+every command would pay the expensive setup cost and cannot hold persistent shell state. Launch-time supervisor
+sandboxing pays that cost once per grant revision. A small deterministic inner profile is nevertheless mandatory for
+every shell: it removes `.cowshed/job/**` write authority and applies request-specific narrowing without regenerating or
+widening the outer profile. A one-shot exec uses the same trusted-parent/narrow-child split.
 
 **A cross-workspace shared supervisor rejected.** One supervisor serving many workspaces would straddle sandbox
 boundaries and couple unrelated workspaces' lifecycles. One supervisor per workspace keeps the boundary and teardown
@@ -257,22 +272,23 @@ merely readable (10_ci.md). Records are Arrow, not a line log, for the same reas
 (13_telemetry.md): one substrate, queryable and joinable against the store-side spans — "diff the job histories of these
 two forks" is a query, not a diff of text files.
 
-## Shell text and output redirection
+## Shell text, redirection, and sealed output export
 
-`cowshed exec` is the token-efficient, safe shell path for agent harnesses. Shell semantics are normally delegated to
-the shell, but cowshed may optimize trivial, very common redirections **only after parsing with a real shell AST
-parser**. Regexes, substring checks, token sniffing, and ad-hoc quote handling are forbidden.
+Shell text is always interpreted by the selected shell. Cowshed does not parse `>`, `2>`, append, pipelines, expansions,
+or any other shell syntax to redirect, authorize, or optimize output. Bytes the shell redirects away from the
+supervisor's stdout/stderr pipes have ordinary shell semantics and are not part of the captured pipe stream. In
+particular, cowshed never aliases a protected job artifact into the writable workspace with a hardlink.
 
-The fast path is eligible only for one top-level simple command with a literal, in-workspace, same-filesystem,
-nonexistent destination for `>path` and/or `2>path`, using ordinary clobber semantics. It is ineligible for append, fd
-duplication, pipelines, lists, subshells, command/parameter/glob expansion, symlink destinations or ancestors,
-`noclobber`, existing destinations, cross-filesystem paths, or any syntax/condition not affirmatively proven safe. The
-supervisor exclusively creates each eligible destination inode, then may make the corresponding `.cowshed/job/<id>/out`
-or `err` path a hardlink to that same inode and tail/account that inode once for streaming, summaries, and the combined
-output quota. Retention never unlinks the caller's destination, and quota accounting never double-counts the two names.
+Callers that want a durable workspace-visible copy of a captured stream request `stdout_copy` and/or `stderr_copy`
+explicitly in `ExecRequest` (07_api.md). After the command is terminal and the selected backing file has been drained,
+fsynced, closed, and sealed, the supervisor materializes a temporary destination from that protected source, fsyncs it,
+and atomically renames it according to the requested create/replace policy. The destination is an independent CoW clone
+on APFS (`clonefile`) or on ZFS with block cloning enabled; the substrate falls back to an ordinary extent copy when
+reflinking is unavailable. It is never a hardlink. Later writes, replacement, or deletion of the exported destination
+cannot change the protected source.
 
-Parsing is an optimization only — never an authorization, denial, or correctness dependency. Any parse ambiguity,
-ineligible AST, failed canonical containment/same-filesystem/nonexistence check, or inode/link operation failure falls
-back before execution to ordinary shell execution plus normal supervisor capture. The fallback must preserve exact shell
-behavior. A future structured copy/export API may clone or copy a sealed backing file (using `clonefile` where
-supported); it is separate from shell parsing.
+Export paths are normalized workspace-relative regular-file paths opened by a no-follow component walk. Absolute paths,
+traversal, symlink ancestors, directories, devices, sockets, and replacement races fail closed. Export status and the
+`reflink`/`copy` disposition are structured job metadata. Export failure never changes the already-established process
+exit or terminal quota state. This operation is deliberately not shell redirection: it publishes after completion and
+does not promise that the destination exists or is observable while the command runs.
