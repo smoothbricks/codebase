@@ -164,8 +164,8 @@ export type OpGroup<Ctx extends OpContext, Ops extends object = NoOpMembers> = O
 /**
  * An OpGroup with column mapping applied.
  *
- * The mapping is used during wiring to create RemappedBufferView
- * that translates the library's column writes to the app's column names.
+ * Wiring composes the mapping into immutable metadata interpreted only by cold
+ * Arrow conversion; library child buffers keep their canonical storage layout.
  *
  * Note: Ops are accessed directly as properties (`.opName` not `.ops.opName`)
  * for V8 hidden class optimization and cleaner API ergonomics.

@@ -4,20 +4,16 @@
  * WHY: Libraries need to write clean, domain-focused code (ctx.tag.status(200))
  * while avoiding naming conflicts when composed with other libraries.
  *
- * HOW: At composition time (cold path), we generate a remapped SpanLogger class
- * that exposes clean method names but writes to prefixed buffer columns.
+ * HOW: At composition time (cold path), we generate remapped SpanLogger classes and
+ * immutable Arrow remap descriptors. Child buffers retain canonical schema/layout.
  *
  * Per specs/lmao/01e_library_integration_pattern.md:
  * - Libraries define clean schemas without prefixes (status, method, url)
  * - Prefixing happens at composition time (http_status, http_method, http_url)
- * - Zero hot path overhead - all remapping done via code generation at module creation
+ * - Zero hot path overhead - remapping is composed at module creation
  *
- * WHAT: This module provides:
- * - prefixSchema() - Rename schema fields with prefix
- * - createPrefixMapping() - Build clean→prefixed name mapping
- * - generateRemappedBufferViewClass() - Generate view for Arrow conversion
- * - generateRemappedSpanLoggerClass() - Generate class with clean methods, prefixed writes
- * - createRemappedSpanLoggerClass() - Compile and cache SpanLogger classes
+ * WHAT: This module provides schema/prefix mapping utilities, immutable remap
+ * descriptors for cold Arrow conversion, and generated remapped SpanLogger classes.
  */
 
 import { isRecord } from '@smoothbricks/validation';
@@ -34,7 +30,6 @@ import { getEnumValues, getSchemaType } from './schema/typeGuards.js';
 import { LogSchema, type SchemaFields } from './schema/types.js';
 import type { AnySpanBuffer } from './types.js';
 
-type RemappedBufferViewConstructor = new (buffer: AnySpanBuffer) => AnySpanBuffer;
 type RemappedSpanLoggerConstructor<T extends LogSchema = LogSchema> = new (
   buffer: AnySpanBuffer,
   createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
@@ -43,19 +38,6 @@ type RemappedSpanLoggerConstructor<T extends LogSchema = LogSchema> = new (
 
 function isSchemaField(value: unknown): value is SchemaFields[string] {
   return isRecord(value);
-}
-
-function isRemappedBufferViewClass(value: unknown): value is RemappedBufferViewConstructor {
-  if (typeof value !== 'function') {
-    return false;
-  }
-  const prototype = Reflect.get(value, 'prototype');
-  return (
-    typeof prototype === 'object' &&
-    prototype !== null &&
-    typeof Reflect.get(prototype, 'getColumnIfAllocated') === 'function' &&
-    typeof Reflect.get(prototype, 'getNullsIfAllocated') === 'function'
-  );
 }
 
 function isRemappedSpanLoggerClass<T extends LogSchema>(value: unknown): value is RemappedSpanLoggerConstructor<T> {
@@ -79,8 +61,8 @@ function isRemappedSpanLoggerClass<T extends LogSchema>(value: unknown): value i
  *
  * 01j "Library Compilation (Prefixed)": a library defines clean field names
  * (status, method); the consumer applies a prefix (http) at wire time. This block
- * generates the prefixed schema, the clean->prefixed mapping, and the RemappedSpanLogger /
- * RemappedBufferView classes whose clean methods write to prefixed columns.
+ * creates the prefixed schema, clean-to-prefixed mapping, immutable Arrow remap
+ * descriptor, and RemappedSpanLogger whose clean methods write to prefixed columns.
  *
  * Example:
  * - Input: { status: S.number(), method: S.enum(['GET', 'POST']) }
@@ -162,7 +144,13 @@ export function createRemapDescriptor(
     sourceNames[outputName] = sourceName;
     const fieldSchema = sourceSchema.fields[sourceName];
     if (fieldSchema !== undefined) {
-      const column: RemappedColumn = Object.freeze([outputName, fieldSchema]);
+      const column: RemappedColumn = Object.freeze([
+        outputName,
+        sourceName,
+        fieldSchema,
+        `${sourceName}_values`,
+        `${sourceName}_nulls`,
+      ]);
       columns.push(column);
     }
   }
@@ -173,175 +161,20 @@ export function createRemapDescriptor(
   });
 }
 
-// ============================================================================
-// RemappedBufferView - Maps prefixed column names to unprefixed for tree traversal
-// ============================================================================
-
-/**
- * Cache for generated RemappedBufferView classes.
- * Key is a stable string representation of the mapping.
- * This avoids regenerating classes for the same mapping.
- */
-const remappedBufferViewClassCache = new Map<string, RemappedBufferViewConstructor>();
-
-/**
- * Cache for generated RemappedSpanLogger classes.
- * Key is a stable string representation of schema fields + prefix mapping.
- */
+/** Cache for generated RemappedSpanLogger classes. */
 const remappedSpanLoggerClassCache = new Map<string, RemappedSpanLoggerConstructor>();
 
-/**
- * Create a stable cache key from a prefix mapping.
- * Sorts keys to ensure consistent ordering.
- */
+/** Create a stable, order-independent mapping cache key. */
 function createMappingCacheKey(mapping: Record<string, string>): string {
   const sortedEntries = Object.entries(mapping).sort(([a], [b]) => a.localeCompare(b));
   return JSON.stringify(sortedEntries);
 }
 
-/**
- * Create a stable cache key from schema and prefix mapping.
- * Combines schema fields with sorted prefix mapping for consistent keys.
- */
+/** Create a stable cache key from schema and prefix mapping. */
 function createSchemaAndMappingCacheKey(schema: LogSchema, mapping: Record<string, string>): string {
   const schemaKey = JSON.stringify(schema.fields);
   const mappingKey = createMappingCacheKey(mapping);
   return `${schemaKey}:${mappingKey}`;
-}
-
-/**
- * Generate a RemappedBufferView class for library prefix support.
- *
- * WHY: Libraries write to unprefixed columns (status, method) but Arrow conversion
- * iterates using prefixed names from the root schema (http_status, http_method).
- * RemappedBufferView bridges this gap for tree traversal during cold-path Arrow conversion.
- *
- * HOW: Uses new Function() to generate a class at library composition time (cold path).
- * The generated class wraps a SpanBuffer and remaps getColumnIfAllocated/getNullsIfAllocated
- * calls from prefixed names to unprefixed names.
- *
- * WHAT: Returns a class constructor that:
- * - Passes through tree traversal properties (children, next)
- * - Passes through system columns (timestamps, operations, message, etc.)
- * - Passes through identity properties (traceId, spanId, etc.)
- * - Remaps getColumnIfAllocated() and getNullsIfAllocated() from prefixed→unprefixed
- *
- * Per specs/lmao/01e_library_integration_pattern.md:
- * - Hot path: Library writes directly to unprefixed columns (zero overhead)
- * - Cold path: Arrow conversion uses RemappedBufferView to access via prefixed names
- *
- * @param prefixToUnprefixedMapping - Maps prefixed names to unprefixed names
- *   e.g., { 'http_status': 'status', 'http_method': 'method' }
- *   NOTE: The mapping is prefixed→unprefixed (reverse of createPrefixMapping output)
- *
- * @returns Constructor for RemappedBufferView class
- *
- * @example
- * ```typescript
- * // Create mapping (prefixed → unprefixed)
- * const mapping = { 'http_status': 'status', 'http_method': 'method' };
- * const ViewClass = generateRemappedBufferViewClass(mapping);
- *
- * // Wrap library buffer
- * const view = new ViewClass(libraryBuffer);
- *
- * // Access via prefixed name returns unprefixed column
- * view.getColumnIfAllocated('http_status'); // Returns buffer.getColumnIfAllocated('status')
- * ```
- */
-export function generateRemappedBufferViewClass(
-  prefixToUnprefixedMapping: Record<string, string>,
-): RemappedBufferViewConstructor {
-  // Check cache first
-  const cacheKey = createMappingCacheKey(prefixToUnprefixedMapping);
-  const cached = remappedBufferViewClassCache.get(cacheKey);
-  if (cached) {
-    return cached;
-  }
-
-  const mappingCode = JSON.stringify(prefixToUnprefixedMapping);
-
-  // Generate the class code
-  // Uses IIFE wrapper for clean scope, similar to generateRemappedSpanLoggerClass
-  const code = `(function() {
-  'use strict';
-  const mapping = ${mappingCode};
-  
-  class RemappedBufferView {
-    constructor(buffer) {
-      this._buffer = buffer;
-      // Build _columns with prefixed names from mapping
-      // mapping is { prefixedName: unprefixedName }
-      // _logSchema may be undefined in tests using mock buffers
-      const baseFields = buffer._logSchema?.fields ?? {};
-      this._columns = [];
-      for (const prefixedName in mapping) {
-        const unprefixedName = mapping[prefixedName];
-        const schema = baseFields[unprefixedName];
-        if (schema) this._columns.push([prefixedName, schema]);
-      }
-    }
-    
-    // Tree traversal (pass-through)
-    get _children() { return this._buffer._children; }
-    get _parent() { return this._buffer._parent; }
-    get _overflow() { return this._buffer._overflow; }
-
-    // Row count
-    get _writeIndex() { return this._buffer._writeIndex; }
-
-    // System columns (NOT remapped - same in all buffers)
-    get timestamp() { return this._buffer.timestamp; }
-    get entry_type() { return this._buffer.entry_type; }
-    get _messageTemplateIds() { return this._buffer._messageTemplateIds; }
-    get message_values() { return this._buffer.message_values; }
-    get message_nulls() { return this._buffer.message_nulls; }
-    get line_values() { return this._buffer.line_values; }
-    get line_nulls() { return this._buffer.line_nulls; }
-    get error_code_values() { return this._buffer.error_code_values; }
-    get error_code_nulls() { return this._buffer.error_code_nulls; }
-    get exception_stack_values() { return this._buffer.exception_stack_values; }
-    get exception_stack_nulls() { return this._buffer.exception_stack_nulls; }
-    get ff_value_values() { return this._buffer.ff_value_values; }
-    get ff_value_nulls() { return this._buffer.ff_value_nulls; }
-    
-    // Identity (pass-through)
-    get trace_id() { return this._buffer.trace_id; }
-    get thread_id() { return this._buffer.thread_id; }
-    get span_id() { return this._buffer.span_id; }
-    get parent_span_id() { return this._buffer.parent_span_id; }
-    get parent_thread_id() { return this._buffer.parent_thread_id; }
-    get _identity() { return this._buffer._identity; }
-    
-    // Metadata (pass-through)
-    get module() { return this._buffer._module; }
-    get _opMetadata() { return this._buffer._opMetadata; }
-    get _callsiteMetadata() { return this._buffer._callsiteMetadata; }
-    // Remapped column access (for Arrow conversion iteration)
-    // Maps prefixed name → unprefixed name before calling underlying buffer
-    getColumnIfAllocated(name) {
-      const unprefixedName = mapping[name] ?? name;
-      return this._buffer.getColumnIfAllocated(unprefixedName);
-    }
-    
-    getNullsIfAllocated(name) {
-      const unprefixedName = mapping[name] ?? name;
-      return this._buffer.getNullsIfAllocated(unprefixedName);
-    }
-  }
-  
-  return RemappedBufferView;
-})()`;
-
-  const GeneratedClass = new Function(`return ${code}`)();
-  if (!isRemappedBufferViewClass(GeneratedClass)) {
-    throw new TypeError('Generated remapped buffer view is missing column remapping methods');
-  }
-
-  // Cache for future use
-  remappedBufferViewClassCache.set(cacheKey, GeneratedClass);
-
-  return GeneratedClass;
 }
 
 /**

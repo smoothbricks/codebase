@@ -3,6 +3,7 @@
  */
 
 import { copyBits, countNulls } from '@smoothbricks/arrow-builder';
+import type { RemapDescriptor } from '../logBinding.js';
 import type { AnySpanBuffer } from '../types.js';
 
 const UTF8_ENCODER = new TextEncoder();
@@ -112,12 +113,17 @@ export function getArrowFieldName(fieldName: string): string {
 }
 
 /**
- * Walk a SpanBuffer tree (including overflow chains and children)
+ * Walk a canonical SpanBuffer tree, carrying immutable remap metadata across each
+ * child's overflow chain without allocating buffer wrappers.
  */
-export function walkSpanTree(root: AnySpanBuffer, visitor: (buffer: AnySpanBuffer) => void): void {
+export function walkSpanTree(
+  root: AnySpanBuffer,
+  visitor: (buffer: AnySpanBuffer, remapDescriptor: RemapDescriptor | undefined) => void,
+): void {
+  const remapDescriptor = root._remapDescriptor;
   let current: AnySpanBuffer | undefined = root;
   while (current) {
-    visitor(current);
+    visitor(current, remapDescriptor);
     current = current._overflow;
   }
   for (const child of root._children) {
