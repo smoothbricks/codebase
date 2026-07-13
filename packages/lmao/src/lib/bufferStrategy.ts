@@ -23,6 +23,7 @@ import type { Table } from '@uwdata/flechette';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { LogSchema } from './schema/LogSchema.js';
 import type { ITraceRoot } from './traceRoot.js';
+import type { SpanBufferConstructor } from './spanBuffer.js';
 import type { AnySpanBuffer, SpanBuffer } from './types.js';
 
 /**
@@ -45,7 +46,13 @@ export interface BufferStrategy<T extends LogSchema = LogSchema> {
    * @param capacity - Optional capacity override
    * @returns New SpanBuffer for the root span
    */
-  createSpanBuffer(schema: T, traceRoot: ITraceRoot, opMetadata: OpMetadata, capacity?: number): SpanBuffer<T>;
+  createSpanBuffer(
+    schema: T,
+    traceRoot: ITraceRoot,
+    opMetadata: OpMetadata,
+    capacity?: number,
+    SpanBufferClass?: SpanBufferConstructor<T>,
+  ): SpanBuffer<T>;
 
   /**
    * Create a child span buffer linked to a parent.
@@ -65,6 +72,7 @@ export interface BufferStrategy<T extends LogSchema = LogSchema> {
     opMetadata: OpMetadata,
     capacity?: number,
     schema?: T,
+    SpanBufferClass?: SpanBufferConstructor<T>,
   ): SpanBuffer<T>;
 
   /**

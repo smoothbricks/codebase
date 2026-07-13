@@ -495,8 +495,9 @@ export function createSpanBuffer<T extends LogSchema>(
   traceRoot: ITraceRoot,
   opMetadata: OpMetadata,
   capacity?: number,
+  plannedClass?: SpanBufferConstructor<T>,
 ): SpanBuffer<T> {
-  const SpanBufferClass = getSpanBufferClass(schema);
+  const SpanBufferClass = plannedClass ?? getSpanBufferClass(schema);
   const stats = SpanBufferClass.stats;
 
   // Use provided capacity or default from class stats, enforce minimum

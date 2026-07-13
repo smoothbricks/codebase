@@ -273,17 +273,49 @@ function createFactoryOps() {
 		t.Fatalf("factory-local static logs did not lower through the packed registered-header seam\n%s", output)
 	}
 	if strings.Count(output, binding+"[") != 7 {
-		t.Fatalf("registered binding uses = %d, want two per static log and one static span\n%s", strings.Count(output, binding+"["), output)
+		t.Fatalf("registered binding uses = %d, want two per static log and one unified static-span operand\n%s", strings.Count(output, binding+"["), output)
 	}
 	if strings.Contains(output, "TemplateIds") {
 		t.Fatalf("a separate template-ID lane survived global vocabulary lowering\n%s", output)
 	}
-	if strings.Count(output, "ctx.spanStatic0(") != 1 {
-		t.Fatalf("stable child span rewrites = %d, want exactly one registered static span\n%s", strings.Count(output, "ctx.spanStatic0("), output)
+	callsite := regexp.MustCompile(`ctx\.span0\(\d+,\s*` + regexp.QuoteMeta(binding) + `\[\d+\],\s*child\.callsitePlan\.newCtx0\(ctx\),\s*child\.callsitePlan,\s*child\.fn\)`)
+	if !callsite.MatchString(output) {
+		t.Fatalf("stable child span did not lower to the monomorphic CallsitePlan ABI\n%s", output)
 	}
-	for _, field := range []string{"child.SpanBufferClass", "child.metadata", "child.fn", "child.runtimeHint"} {
-		if !strings.Contains(output, field) {
-			t.Fatalf("stable child span output missing %s\n%s", field, output)
+	for _, stale := range []string{"spanStatic0(", "Object.create(ctx)", "child.SpanBufferClass", "child.remappedViewClass", "child.metadata", "child.runtimeHint"} {
+		if strings.Contains(output, stale) {
+			t.Fatalf("stable child span retained per-call operand %s\n%s", stale, output)
+		}
+	}
+}
+
+func TestRepeatedOpCallsReuseDirectPlanOperandsAndDynamicOpBailsOut(t *testing.T) {
+	output := transformTemplateFixture(t, `
+declare function choose(left: Op, right: Op): Op;
+const child = defineOp('child', (ctx) => ctx.ok('child'));
+const alternate = defineOp('alternate', (ctx) => ctx.ok('alternate'));
+defineOp('parent', async (ctx) => {
+  await ctx.span('first', child);
+  await ctx.span('second', child);
+  await ctx.span('dynamic-op', choose(child, alternate));
+  return ctx.ok(null);
+});
+`)
+
+	if strings.Count(output, "child.callsitePlan.newCtx0(ctx)") != 2 {
+		t.Fatalf("repeated child calls did not each consume the pre-resolved context factory\n%s", output)
+	}
+	directPlanOperand := regexp.MustCompile(`child\.callsitePlan\.newCtx0\(ctx\),\s*child\.callsitePlan,\s*child\.fn`)
+	if len(directPlanOperand.FindAllString(output, -1)) != 2 {
+		t.Fatalf("repeated child calls did not reuse the same direct plan operand shape\n%s", output)
+	}
+	dynamicCall := regexp.MustCompile(`ctx\.span\(["']dynamic-op["'],\s*choose\(child,\s*alternate\)\)`)
+	if !dynamicCall.MatchString(output) {
+		t.Fatalf("unanalyzed dynamic Op call did not bail out unchanged\n%s", output)
+	}
+	for _, stale := range []string{"spanStatic0(", "Object.create(ctx)", "child.SpanBufferClass", "child.remappedViewClass", "child.metadata", "child.runtimeHint"} {
+		if strings.Contains(output, stale) {
+			t.Fatalf("repeated monomorphic calls retained per-call operand %s\n%s", stale, output)
 		}
 	}
 }

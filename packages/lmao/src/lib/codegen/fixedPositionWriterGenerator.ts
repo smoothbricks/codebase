@@ -114,7 +114,7 @@ export type ResultWriter<T extends LogSchema, R = unknown, E = unknown> = {
 
 type TagWriterConstructor<T extends LogSchema> = new (buffer: AnySpanBuffer) => TagWriter<T>;
 
-type ResultWriterConstructor<T extends LogSchema> = new <R = unknown, E = unknown>(
+export type ResultWriterConstructor<T extends LogSchema> = new <R = unknown, E = unknown>(
   buffer: AnySpanBuffer,
   resultOrError: unknown,
   isError: boolean,

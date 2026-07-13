@@ -75,11 +75,11 @@ function copyOpsWithDescriptor<Ctx extends OpContext>(
     if (isOpInstance<Ctx>(value)) {
       target[key] = new Op(
         value.metadata,
-        value.SpanBufferClass,
+        value.callsitePlan.SpanBufferClass,
         value.fn,
         remapDescriptor,
         value._opContextBinding,
-        value.runtimeHint,
+        value.callsitePlan.runtimeHint,
       );
     }
   }

@@ -60,29 +60,30 @@
  */
 
 import type { BufferStrategy } from './bufferStrategy.js';
-import { createTagWriter } from './codegen/fixedPositionWriterGenerator.js';
-import { createSpanLogger as createSpanLoggerFromGenerator } from './codegen/spanLoggerGenerator.js';
 import type { LogBinding } from './logBinding.js';
 import { Op } from './op.js';
 import { createOpMetadata } from './opContext/defineOp.js';
 import type { OpContext, OpContextBinding, OpContextOf, SpanContext } from './opContext/types.js';
+import {
+  getPhysicalLayoutPlan,
+  sealCallsitePlan,
+  type CallsitePlan,
+  type PhysicalLayoutPlan,
+} from './physicalLayoutPlan.js';
 import { Err, Ok, type Result } from './result.js';
 import { createFeatureFlagEvaluator, type FlagEvaluator, InMemoryFlagEvaluator } from './schema/evaluator.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_OK } from './schema/systemSchema.js';
-
-import { EMPTY_SCOPE } from './spanBuffer.js';
+import { EMPTY_SCOPE, getSpanBufferClass } from './spanBuffer.js';
 import {
   createSpanContextClass,
-  type SpanContextClass,
   isPhysicalLayoutPlanForContext,
+  type SpanContextClass,
   type SpanContextInstance,
   writeSpanEnd,
   writeSpanStart,
 } from './spanContext.js';
-import type { PhysicalLayoutPlan } from './physicalLayoutPlan.js';
-import { RUNTIME_HINT_FF, RUNTIME_HINT_LOG, RUNTIME_HINT_SCOPE, RUNTIME_HINT_TAG } from './runtimeHint.js';
 import { generateTraceId, isValidTraceId, type TraceId } from './traceId.js';
-import type { TraceRootFactory } from './traceRoot.js';
+import type { TraceRootFactory, TracerLifecycleHooks } from './traceRoot.js';
 import type { SpanBuffer } from './types.js';
 
 // =============================================================================
@@ -112,7 +113,7 @@ export interface TracerOptions<
    * Factory for creating platform-specific TraceRoot instances.
    * Import from '@smoothbricks/lmao/node' or '@smoothbricks/lmao/es'.
    */
-  createTraceRoot: TraceRootFactory;
+  createTraceRoot: TraceRootFactory<T>;
 
   /** Feature flag evaluator - provides flag values at runtime */
   flagEvaluator?: FlagEvaluator<OpContext>;
@@ -253,13 +254,15 @@ export type TraceFn<Ctx extends OpContext> = {
  *
  * @typeParam B - OpContextBinding type (inferred from constructor argument)
  */
-export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
+export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
+  implements TracerLifecycleHooks<B['logBinding']['logSchema']> {
   private readonly logBinding: LogBinding<B['logBinding']['logSchema']>;
   private readonly SpanContextClass: SpanContextClass<OpContextOf<B>>;
+  private readonly physicalLayoutPlan: PhysicalLayoutPlan<B['logBinding']['logSchema'], OpContextOf<B>>;
   private readonly flagEvaluator: FlagEvaluator<OpContextOf<B>>;
   private readonly ctxDefaults: Record<string, unknown>;
   private readonly deps: Record<string, unknown>;
-  private readonly createTraceRoot: TraceRootFactory;
+  private readonly createTraceRoot: TraceRootFactory<B['logBinding']['logSchema']>;
 
   /**
    * Buffer strategy for memory management and Arrow conversion.
@@ -284,7 +287,14 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
       undefined,
       Object.keys(this.ctxDefaults),
     );
-
+    this.physicalLayoutPlan = getPhysicalLayoutPlan(
+      getSpanBufferClass(binding.logBinding.logSchema),
+      0,
+      this.SpanContextClass,
+      undefined,
+      'strategy-selected',
+      Object.keys(this.ctxDefaults).sort().join('\u0000'),
+    );
 
     // Bind methods for destructuring (per AGENTS.md - "Always destructure")
     this.trace = this.trace.bind(this);
@@ -453,15 +463,15 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     if (fnOrOp instanceof Op) {
       switch (argCount) {
         case 0:
-          return this._trace_unknown_op(line, name, overrides, fnOrOp.metadata, fnOrOp.fn);
+          return this._trace_unknown_op(line, name, overrides, fnOrOp.callsitePlan, fnOrOp.fn);
         case 1:
-          return this._trace_unknown_op(line, name, overrides, fnOrOp.metadata, fnOrOp.fn, args[fnIdx + 1]);
+          return this._trace_unknown_op(line, name, overrides, fnOrOp.callsitePlan, fnOrOp.fn, args[fnIdx + 1]);
         case 2:
           return this._trace_unknown_op(
             line,
             name,
             overrides,
-            fnOrOp.metadata,
+            fnOrOp.callsitePlan,
             fnOrOp.fn,
             args[fnIdx + 1],
             args[fnIdx + 2],
@@ -471,7 +481,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
             line,
             name,
             overrides,
-            fnOrOp.metadata,
+            fnOrOp.callsitePlan,
             fnOrOp.fn,
             args[fnIdx + 1],
             args[fnIdx + 2],
@@ -482,7 +492,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
             line,
             name,
             overrides,
-            fnOrOp.metadata,
+            fnOrOp.callsitePlan,
             fnOrOp.fn,
             args[fnIdx + 1],
             args[fnIdx + 2],
@@ -494,7 +504,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
             line,
             name,
             overrides,
-            fnOrOp.metadata,
+            fnOrOp.callsitePlan,
             fnOrOp.fn,
             args[fnIdx + 1],
             args[fnIdx + 2],
@@ -507,7 +517,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
             line,
             name,
             overrides,
-            fnOrOp.metadata,
+            fnOrOp.callsitePlan,
             fnOrOp.fn,
             args[fnIdx + 1],
             args[fnIdx + 2],
@@ -521,7 +531,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
             line,
             name,
             overrides,
-            fnOrOp.metadata,
+            fnOrOp.callsitePlan,
             fnOrOp.fn,
             args[fnIdx + 1],
             args[fnIdx + 2],
@@ -536,7 +546,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
             line,
             name,
             overrides,
-            fnOrOp.metadata,
+            fnOrOp.callsitePlan,
             fnOrOp.fn,
             args[fnIdx + 1],
             args[fnIdx + 2],
@@ -578,10 +588,10 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     op: Op<OpContextOf<B>, Args, S, E>,
     ...opArgs: Args
   ): Result<S, E> | Promise<Result<S, E>> {
-    if (!isPhysicalLayoutPlanForContext<OpContextOf<B>>(op.physicalLayoutPlan, this.logBinding.logSchema)) {
+    if (!isPhysicalLayoutPlanForContext<OpContextOf<B>>(op.callsitePlan, this.logBinding.logSchema)) {
       throw new TypeError('Op physical layout plan does not match this tracer context');
     }
-    const ctx = this._createRootContext(line, name, overrides, op.metadata, op.physicalLayoutPlan);
+    const ctx = this._createRootContext(line, name, overrides, op.callsitePlan);
     return this._executeResultWithContext(ctx, (c) => op.fn(c, ...opArgs));
   }
 
@@ -589,17 +599,14 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     line: number,
     name: string,
     overrides: Record<string, unknown>,
-    metadata: ReturnType<typeof createOpMetadata>,
+    callsitePlan: CallsitePlan<B['logBinding']['logSchema'], OpContextOf<B>>,
     fn: (
       ctx: SpanContext<OpContextOf<B>>,
       ...opArgs: unknown[]
     ) => Result<unknown, unknown> | Promise<Result<unknown, unknown>>,
     ...opArgs: unknown[]
   ): Result<unknown, unknown> | Promise<Result<unknown, unknown>> {
-    if (!isPhysicalLayoutPlanForContext<OpContextOf<B>>(metadata._physicalLayoutPlan, this.logBinding.logSchema)) {
-      throw new TypeError('Op metadata is missing its physical layout plan');
-    }
-    const ctx = this._createRootContext(line, name, overrides, metadata, metadata._physicalLayoutPlan);
+    const ctx = this._createRootContext(line, name, overrides, callsitePlan);
     return this._executeResultWithContext(ctx, (childCtx) => fn(childCtx, ...opArgs));
   }
 
@@ -625,11 +632,15 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     overrides: Record<string, unknown>,
     fn: (ctx: SpanContext<OpContextOf<B>>) => unknown,
   ): unknown {
+    const metadata = Object.freeze({
+      ...createOpMetadata('root', 'tracer', 'runtime', 'unknown', 0),
+      _physicalLayoutPlan: this.physicalLayoutPlan,
+    });
     const ctx = this._createRootContext(
       line,
       name,
       overrides,
-      createOpMetadata('root', 'tracer', 'runtime', 'unknown', 0),
+      sealCallsitePlan(this.physicalLayoutPlan, metadata),
     );
     return this._executeUnknownWithContext(ctx, fn);
   }
@@ -694,8 +705,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     _line: number,
     name: string,
     overrides: Record<string, unknown>,
-    metadata: ReturnType<typeof createOpMetadata>,
-    physicalLayoutPlan?: PhysicalLayoutPlan<B['logBinding']['logSchema'], OpContextOf<B>>,
+    callsitePlan: CallsitePlan<B['logBinding']['logSchema'], OpContextOf<B>>,
   ): SpanContextInstance<OpContextOf<B>> {
     // Extract trace_id from overrides if present
     const traceId: TraceId = isValidTraceId(overrides.trace_id) ? overrides.trace_id : generateTraceId();
@@ -712,38 +722,27 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     // Create root SpanBuffer with pre-built TraceRoot via strategy
     const buffer = this.bufferStrategy.createSpanBuffer(
       schema,
-      traceRoot, // pre-built TraceRoot with trace_id, anchors, tracer
-      metadata, // opMetadata (for both callsite and op at root level)
+      traceRoot,
+      callsitePlan.metadata,
+      callsitePlan.capacityTier,
+      callsitePlan.SpanBufferClass,
     );
 
     // Write span-start entry (row 0)
     writeSpanStart(buffer, name);
 
-    const capabilities = physicalLayoutPlan?.capabilities;
-    const needsLogger =
-      capabilities === undefined ||
-      (capabilities & (RUNTIME_HINT_LOG | RUNTIME_HINT_FF | RUNTIME_HINT_SCOPE)) !== 0;
-    const needsTag = capabilities === undefined || (capabilities & RUNTIME_HINT_TAG) !== 0;
-    const spanLogger = needsLogger
-      ? physicalLayoutPlan?.createSpanLogger(buffer) ?? createSpanLoggerFromGenerator(schema, buffer)
-      : undefined;
-    const tagWriter = needsTag
-      ? physicalLayoutPlan?.createTagWriter(buffer) ?? createTagWriter(schema, buffer)
-      : undefined;
-    const SpanContextCtor = physicalLayoutPlan?.SpanContextClass ?? this.SpanContextClass;
-    return new SpanContextCtor(
+    return new callsitePlan.SpanContextClass(
       buffer,
       schema,
-      spanLogger,
-      tagWriter,
-      physicalLayoutPlan,
+      callsitePlan.newSpanLogger?.(buffer),
+      callsitePlan.newTagWriter?.(buffer),
+      callsitePlan,
       resolvedUserCtx,
       undefined,
       this.deps,
       this.flagEvaluator,
     );
   }
-
 
   /**
    * Validate null-sentinel required fields and merge with provided overrides.
@@ -798,7 +797,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
   ): Result<S, E> | Promise<Result<S, E>> {
     const buffer = ctx._buffer;
 
-    this.onTraceStart(buffer as SpanBuffer<B['logBinding']['logSchema']>);
+    this.onTraceStart(buffer);
 
     let isAsync = false;
     try {
@@ -826,7 +825,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
               throw error;
             },
           )
-          .finally(() => this.onTraceEnd(buffer as SpanBuffer<B['logBinding']['logSchema']>));
+          .finally(() => this.onTraceEnd(buffer));
       }
 
       writeSpanEnd(buffer, result);
@@ -845,7 +844,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
       throw error;
     } finally {
       if (!isAsync) {
-        this.onTraceEnd(buffer as SpanBuffer<B['logBinding']['logSchema']>);
+        this.onTraceEnd(buffer);
       }
     }
   }
@@ -857,7 +856,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     const buffer = ctx._buffer;
 
     // Call trace start hook
-    this.onTraceStart(buffer as SpanBuffer<B['logBinding']['logSchema']>);
+    this.onTraceStart(buffer);
 
     let isAsync = false;
     try {
@@ -889,7 +888,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
               throw error;
             },
           )
-          .finally(() => this.onTraceEnd(buffer as SpanBuffer<B['logBinding']['logSchema']>));
+          .finally(() => this.onTraceEnd(buffer));
       }
 
       // Sync path - write span-end
@@ -917,7 +916,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     } finally {
       // Only call for sync path - async uses .finally() on promise
       if (!isAsync) {
-        this.onTraceEnd(buffer as SpanBuffer<B['logBinding']['logSchema']>);
+        this.onTraceEnd(buffer);
       }
     }
   }

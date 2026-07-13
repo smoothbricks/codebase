@@ -217,27 +217,34 @@ describe('capability-specialized SpanContext shapes', () => {
     }
   });
 
-  it('preserves inferred user-context properties in the canonical own-key layout', async () => {
-    let capturedRequest = '';
-    let capturedRegion = '';
-    let capturedContext: CapturedContext | undefined;
+  it('preserves inferred overrides while reusing the Op CallsitePlan', async () => {
+    const capturedRequests: string[] = [];
+    const capturedRegions: string[] = [];
+    const capturedContexts: CapturedContext[] = [];
     const op = context.defineOp(
       'typed-user-context',
       (ctx) => {
-        capturedContext = ctx;
-        capturedRequest = ctx.requestId.toUpperCase();
-        capturedRegion = ctx.tenant.region.toUpperCase();
+        capturedContexts.push(ctx);
+        capturedRequests.push(ctx.requestId.toUpperCase());
+        capturedRegions.push(ctx.tenant.region.toUpperCase());
         return ctx.ok(null);
       },
       undefined,
       { runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_RESULT | 2 },
     );
+    const plan = op.callsitePlan;
     const tracer = new TestTracer(context, createTestTracerOptions());
-    await tracer.trace('typed-user-context', { requestId: 'request-7', tenant: { region: 'ord' } }, op);
+    await tracer.trace('typed-user-context-1', { requestId: 'request-7', tenant: { region: 'ord' } }, op);
+    await tracer.trace('typed-user-context-2', { requestId: 'request-8', tenant: { region: 'dfw' } }, op);
 
-    expect(capturedRequest).toBe('REQUEST-7');
-    expect(capturedRegion).toBe('ORD');
-    expect(Reflect.ownKeys(requireCaptured(capturedContext, 'typed user'))).toEqual(RESULT_ONLY_KEYS);
+    expect(capturedRequests).toEqual(['REQUEST-7', 'REQUEST-8']);
+    expect(capturedRegions).toEqual(['ORD', 'DFW']);
+    expect(op.callsitePlan).toBe(plan);
+    expect(capturedContexts).toHaveLength(2);
+    for (const captured of capturedContexts) {
+      expect(captured).toBeInstanceOf(plan.SpanContextClass);
+      expect(Reflect.ownKeys(captured)).toEqual(RESULT_ONLY_KEYS);
+    }
   });
 });
 
@@ -251,13 +258,13 @@ describe('specialized SpanContext runtime semantics', () => {
     }
   }
 
-  it('binds feature flags to the exact specialized child instance', async () => {
+  it('binds repeated feature evaluations to contexts created by one CallsitePlan', async () => {
     const evaluator = new CapturingEvaluator(flags.schema, { enabled: true });
-    let childContext: CapturedContext | undefined;
+    const childContexts: CapturedContext[] = [];
     const child = context.defineOp(
       'flag-child',
       (ctx) => {
-        childContext = ctx;
+        childContexts.push(ctx);
         const enabled = ctx.ff.enabled;
         if (!enabled) throw new Error('enabled feature flag was not bound');
         expect(enabled.value).toBe(true);
@@ -268,10 +275,12 @@ describe('specialized SpanContext runtime semantics', () => {
         runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_FF | RUNTIME_HINT_RESULT | 2,
       },
     );
+    const plan = child.callsitePlan;
     const parent = context.defineOp(
       'flag-parent',
       async (ctx) => {
-        await ctx.span('flag-child', child);
+        await ctx.span('flag-child-1', child);
+        await ctx.span('flag-child-2', child);
         return ctx.ok('parent');
       },
       undefined,
@@ -282,8 +291,10 @@ describe('specialized SpanContext runtime semantics', () => {
     const tracer = new TestTracer(context, { ...createTestTracerOptions(), flagEvaluator: evaluator });
     await tracer.trace('flag-parent', parent);
 
-    const captured = requireCaptured(childContext, 'flag child');
-    expect(evaluator.contexts).toEqual([captured]);
+    expect(child.callsitePlan).toBe(plan);
+    expect(childContexts).toHaveLength(2);
+    expect(childContexts.every((captured) => captured instanceof plan.SpanContextClass)).toBe(true);
+    expect(evaluator.contexts).toEqual(childContexts);
   });
 
   it('keeps exact own-key order stable across root, child, and overflowing contexts', async () => {

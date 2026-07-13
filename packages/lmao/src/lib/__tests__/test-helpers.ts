@@ -107,7 +107,11 @@ export function createTestTracerOptions<T extends LogSchema>(): TracerOptions<T>
  * Shared TestTracer instance for tests that create buffers directly.
  * Typed as TracerLifecycleHooks because that's what TraceRoot expects.
  */
-export const TEST_TRACER: TracerLifecycleHooks = new TestTracer(minimalOpContext, createTestTracerOptions());
+type MinimalLogSchema = (typeof minimalOpContext)['logBinding']['logSchema'];
+export const TEST_TRACER: TracerLifecycleHooks<MinimalLogSchema> = new TestTracer(
+  minimalOpContext,
+  createTestTracerOptions(),
+);
 
 type TestSpanBufferBundle<T extends SchemaFields> = {
   logBinding: LogBinding;

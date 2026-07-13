@@ -22,22 +22,16 @@ import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import type { LogSchema } from '../../schema/types.js';
 import { createSpanBuffer, SpanBufferTestUtils } from '../../spanBuffer.js';
 
-import type { AnySpanBuffer } from '../../types.js';
-import { createSpanLoggerClass } from '../spanLoggerGenerator.js';
+import type { SpanBuffer } from '../../types.js';
+import { createSpanLogger } from '../spanLoggerGenerator.js';
 
 /**
  * Create a test buffer from a schema
  */
-function createTestBuffer(schema: LogSchema): AnySpanBuffer {
+function createTestBuffer<T extends LogSchema>(schema: T): SpanBuffer<T> {
   return createBuffer(schema);
 }
 
-/**
- * Create a test buffer with a specific capacity
- */
-function createTestBufferWithCapacity(schema: LogSchema, capacity: number): AnySpanBuffer {
-  return createSpanBuffer(schema, createTestTraceRoot('test-trace'), DEFAULT_METADATA, capacity);
-}
 
 describe('null bitmap correctness', () => {
   describe('immutable scope semantics', () => {
@@ -47,8 +41,7 @@ describe('null bitmap correctness', () => {
       });
       const buffer = createTestBuffer(schema);
 
-      const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer);
+      const logger = createSpanLogger(schema, buffer);
 
       // _setScope should store values in buffer._scopeValues (not fill buffer columns)
       logger._setScope({ requestId: 'req-123' });
@@ -68,8 +61,7 @@ describe('null bitmap correctness', () => {
       });
       const buffer = createTestBuffer(schema);
 
-      const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer);
+      const logger = createSpanLogger(schema, buffer);
 
       // First setScope call
       logger._setScope({ requestId: 'req-123' });
@@ -100,8 +92,7 @@ describe('null bitmap correctness', () => {
       });
       const buffer = createTestBuffer(schema);
 
-      const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer);
+      const logger = createSpanLogger(schema, buffer);
 
       // Set initial values
       logger._setScope({ requestId: 'req-123', userId: 'user-456' });
@@ -122,8 +113,7 @@ describe('null bitmap correctness', () => {
       });
       const buffer = createTestBuffer(schema);
 
-      const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer);
+      const logger = createSpanLogger(schema, buffer);
 
       // _setScope should NOT fill buffer columns
       logger._setScope({ requestId: 'req-123' });
@@ -151,8 +141,7 @@ describe('null bitmap correctness', () => {
       // Set scope value via buffer._scopeValues directly for test setup
       buffer._scopeValues = Object.freeze({ requestId: 'req-123' });
 
-      const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer);
+      const logger = createSpanLogger(schema, buffer);
 
       // Set _writeIndex to 4 so nextRow() makes it 5
       logger._writeIndex = 4;
@@ -177,13 +166,12 @@ describe('null bitmap correctness', () => {
         requestId: S.category(),
       });
       // Need capacity > 9 to test writing at index 9
-      const buffer = createTestBufferWithCapacity(schema, 16);
+      const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), DEFAULT_METADATA, 16);
 
       // Set scope value via buffer._scopeValues directly for test setup
       buffer._scopeValues = Object.freeze({ requestId: 'req-456' });
 
-      const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer);
+      const logger = createSpanLogger(schema, buffer);
 
       // Set _writeIndex to 8 so nextRow() makes it 9
       logger._writeIndex = 8;
