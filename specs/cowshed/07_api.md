@@ -260,7 +260,7 @@ pub struct JobInfo {
     pub pid: Option<u32>,
     pub grant_revision: u64,
     pub argv: Vec<String>,
-    pub cwd: WorkspacePath,
+    pub cwd: Option<WorkspacePath>,        // None is the workspace mount root
     pub started: UtcTimestamp,
     pub duration_ms: Option<u64>,
     pub exit: Option<ExitStatus>,
@@ -560,14 +560,17 @@ reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission 
   ranges are validated. `exit` is the discriminated union `{kind:"exited",code}` or
   `{kind:"signaled",signal,coreDumped}`; it is absent before a process result exists. `outputLimit` is present iff
   `state == "outputLimit"`. Both serialization and deserialization enforce these state / duration / exit / output-limit
-  invariants.
+  invariants. `cwd` is required but nullable on the wire: `null` means the workspace mount root and a string means
+  exactly one validated, normalized workspace-relative `WorkspacePath`. Decoders reject an omitted `cwd`; neither `""`
+  nor `"."` is a root sentinel, and the same `Option<WorkspacePath>` is preserved by Rust, JSON, CLI, N-API, MCP, and
+  Arrow.
 - `StreamInfo = { storage, bytes, sha256, summary }` with the exact discriminated unions above. JSON decoders reject
   unknown/multiple discriminants, invalid digest hex, inline data over `MAX_INLINE_OUTPUT_BYTES`, a protected file path
   outside `.cowshed/job/**`, or a redirect source outside the writable workspace. Complete output bytes never appear in
   controller commitments; bounded inline output may appear only in protected Arrow Binary and tagged API JSON.
 - `StdinInfo = { kind, bytes, workspacePath?, complete }`; kind is `"empty" | "inline" | "stream" | "workspaceFile"`.
-  Every cwd, protected artifact path, redirect source, publication path, and workspace stdin path uses the validated
-  relative `WorkspacePath` domain type: no root, empty component, `.`/`..`, prefix, NUL, or symlink-following open.
+- Every non-root cwd, protected artifact path, redirect source, publication path, and workspace stdin path uses the
+  validated relative `WorkspacePath` domain type: no empty component, `.`/`..`, prefix, NUL, or symlink-following open.
   Public capability methods convert non-UTF8 host paths into typed `CowshedError::Usage`; they never pass a `Path` to
   `json!` or panic while constructing a controller request.
 - `ProtectedRecord` is exactly `Job(JobArtifactRecord) | CheckpointManifest(CheckpointManifestRecord)`. The Job fields

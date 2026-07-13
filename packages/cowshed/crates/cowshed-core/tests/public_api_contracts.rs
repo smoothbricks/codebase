@@ -50,6 +50,35 @@ fn stream(path: &str, bytes: u64, text: &str) -> StreamInfo {
     }
 }
 
+fn finished_job(cwd: Option<WorkspacePath>) -> JobInfo {
+    JobInfo {
+        repo_id: repo(),
+        workspace_incarnation: incarnation(),
+        job_id: JobId::new(7).unwrap(),
+        state: JobState::Signaled,
+        pid: Some(4242),
+        grant_revision: 9,
+        argv: vec!["bun".into(), "test".into()],
+        cwd,
+        started: timestamp(),
+        duration_ms: Some(1250),
+        exit: Some(ExitStatus::Signaled {
+            signal: 15,
+            core_dumped: false,
+        }),
+        stdout: stream(".cowshed/job/7/out", 3, "ok\n"),
+        stderr: stream(".cowshed/job/7/err", 0, ""),
+        trace: trace(),
+        output_limit: None,
+        stdin: StdinInfo {
+            kind: StdinKind::WorkspaceFile,
+            bytes: 12,
+            workspace_path: Some(WorkspacePath::new("fixtures/input.bin").unwrap()),
+            complete: true,
+        },
+    }
+}
+
 #[test]
 fn workspace_snapshot_accessors_are_public_and_consuming_projections_are_owned() {
     let _: for<'a> fn(&'a WorkspaceRef) -> &'a WorkspaceInfo = WorkspaceRef::info;
@@ -66,7 +95,15 @@ fn job_id_and_path_domain_types_reject_unsafe_values() {
     assert_eq!(JobId::new(MAX_JOB_ID).expect("max id").get(), MAX_JOB_ID);
     assert!(JobId::new(MAX_JOB_ID + 1).is_err());
 
-    for path in ["", "/absolute", "../escape", "a/../escape", "a//b", "a\\b"] {
+    for path in [
+        "",
+        ".",
+        "/absolute",
+        "../escape",
+        "a/../escape",
+        "a//b",
+        "a\\b",
+    ] {
         assert!(WorkspacePath::new(path).is_err(), "accepted {path:?}");
     }
     assert_eq!(
@@ -217,32 +254,7 @@ fn ensure_doctor_gc_and_empty_results_have_exact_shapes() {
 
 #[test]
 fn nested_job_info_shape_is_byte_safe_and_frozen() {
-    let info = JobInfo {
-        repo_id: repo(),
-        workspace_incarnation: incarnation(),
-        job_id: JobId::new(7).unwrap(),
-        state: JobState::Signaled,
-        pid: Some(4242),
-        grant_revision: 9,
-        argv: vec!["bun".into(), "test".into()],
-        cwd: WorkspacePath::new("packages/app").unwrap(),
-        started: timestamp(),
-        duration_ms: Some(1250),
-        exit: Some(ExitStatus::Signaled {
-            signal: 15,
-            core_dumped: false,
-        }),
-        stdout: stream(".cowshed/job/7/out", 3, "ok\n"),
-        stderr: stream(".cowshed/job/7/err", 0, ""),
-        trace: trace(),
-        output_limit: None,
-        stdin: StdinInfo {
-            kind: StdinKind::WorkspaceFile,
-            bytes: 12,
-            workspace_path: Some(WorkspacePath::new("fixtures/input.bin").unwrap()),
-            complete: true,
-        },
-    };
+    let info = finished_job(Some(WorkspacePath::new("packages/app").unwrap()));
     let value = serde_json::to_value(&info).expect("job JSON");
     assert_eq!(
         value,
@@ -269,6 +281,47 @@ fn nested_job_info_shape_is_byte_safe_and_frozen() {
     assert!(!encoded.contains("rawBytes"));
     assert!(!encoded.contains("stdoutBytes"));
     assert_eq!(serde_json::from_value::<JobInfo>(value).unwrap(), info);
+}
+
+#[test]
+fn root_job_info_requires_explicit_null_cwd() {
+    let info = finished_job(None);
+    let value = json!({
+        "repoId": "acme/widget",
+        "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+        "jobId": 7,
+        "state": "signaled",
+        "pid": 4242,
+        "grantRevision": 9,
+        "argv": ["bun", "test"],
+        "cwd": null,
+        "started": "2026-07-11T12:34:56Z",
+        "durationMs": 1250,
+        "exit": {"kind":"signaled","signal":15,"coreDumped":false},
+        "stdout": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/out"}},"bytes":3,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"ok\n","truncated":false}},
+        "stderr": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/err"}},"bytes":0,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"","truncated":false}},
+        "trace": {"traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"00f067aa0ba902b7"},
+        "stdin": {"kind":"workspaceFile","bytes":12,"workspacePath":"fixtures/input.bin","complete":true}
+    });
+
+    assert_eq!(serde_json::to_value(&info).expect("root job JSON"), value);
+    assert_eq!(
+        serde_json::from_value::<JobInfo>(value.clone()).expect("root job"),
+        info
+    );
+
+    let mut omitted = value.clone();
+    omitted.as_object_mut().unwrap().remove("cwd");
+    assert!(serde_json::from_value::<JobInfo>(omitted).is_err());
+
+    for invalid in [".", "/absolute", "../escape", "a/../escape"] {
+        let mut invalid_value = value.clone();
+        invalid_value["cwd"] = json!(invalid);
+        assert!(
+            serde_json::from_value::<JobInfo>(invalid_value).is_err(),
+            "accepted invalid cwd {invalid:?}"
+        );
+    }
 }
 
 #[test]

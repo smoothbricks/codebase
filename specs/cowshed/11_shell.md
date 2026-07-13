@@ -42,6 +42,12 @@ named session, one-shot, and descendant beneath that restriction. The child prof
 - **Named sessions** (`--session <name>`, `WorkspaceHandle::shell(Some(name))`) are persistent shells outside the pool:
   state survives across calls until explicitly closed or the supervisor stops. This is how a coordinator gives one
   subagent a stable shell for a multi-step task.
+
+Execution cwd has one representation across `ExecRequest`, supervisor/session state, `JobInfo`, JSON, and Arrow:
+`Option<WorkspacePath>`. `None` denotes the workspace mount root; `Some(path)` denotes exactly one validated, normalized
+workspace-relative path. Wire `cwd` is required and encodes `None` as JSON `null`; omission rejects, and neither an
+empty path nor `.` is admitted as a root sentinel.
+
 - Idle timeout: the supervisor exits after `[shell] idle` (default 30 min) with no sessions and no running jobs, freeing
   memory; the next exec respawns it. `cowshed detach`/`cowshed rm` stop it immediately (teardown below).
 
