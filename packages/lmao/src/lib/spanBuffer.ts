@@ -160,6 +160,8 @@ function isGeneratedSpanBufferClass<T extends LogSchema>(
 
   return (
     typeof Reflect.get(prototype, 'getOrCreateOverflow') === 'function' &&
+    typeof Reflect.get(prototype, '_sealStats') === 'function' &&
+    typeof Reflect.get(prototype, '_sealStatsChain') === 'function' &&
     typeof Reflect.get(prototype, 'isParentOf') === 'function' &&
     typeof Reflect.get(prototype, 'isChildOf') === 'function'
   );
@@ -363,6 +365,8 @@ export function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferCo
         this._system = systemBuffer;
         this._callsiteMetadata = callsiteMetadata;
         this._opMetadata = opMetadata;
+        this._statsSealed = false;
+        this._statsReservedRows = isChained ? 0 : 2;
     `,
     // Generated methods for SpanBuffer - no comments in output
     // span_id: extract from identity bytes [8:12]
@@ -426,8 +430,22 @@ export function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferCo
     get _logSchema() { return this.constructor.schema; }
     get _columns() { return this.constructor.schema._columns; }
     get _stats() { return this.constructor.stats; }
+    _sealStats() {
+      if (this._statsSealed) return;
+      const completedRows = this._writeIndex - this._statsReservedRows;
+      if (completedRows > 0) this.constructor.stats.totalWrites += completedRows;
+      this._statsSealed = true;
+    }
+    _sealStatsChain() {
+      let current = this;
+      while (current) {
+        current._sealStats();
+        current = current._overflow;
+      }
+    }
     getOrCreateOverflow() {
       if (this._overflow) return this._overflow;
+      this._sealStats();
       const tracer = this._traceRoot.tracer;
       tracer.onStatsWillResetFor(this);
       checkCapacityTuning(this.constructor.stats);

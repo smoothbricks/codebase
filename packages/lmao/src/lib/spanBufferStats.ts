@@ -33,7 +33,7 @@ export interface SpanBufferStats {
   /** Current buffer capacity for new buffers (grows/shrinks based on utilization) */
   capacity: number;
 
-  /** Total entries written across all buffers */
+  /** Completed user/event rows sealed across physical segments; lifecycle rows 0/1 are excluded once per span. */
   totalWrites: number;
 
   /** Number of non-chained spans created (root + child spans, NOT overflow buffers) */

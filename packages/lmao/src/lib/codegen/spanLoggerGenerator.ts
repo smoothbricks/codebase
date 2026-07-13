@@ -449,7 +449,6 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer.constructor.stats.totalWrites++;
       return this;
     }
 
@@ -461,7 +460,6 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       if (this._buffer.message_nulls) {
         helpers.setNullBit(this._buffer.message_nulls, idx);
       }
-      this._buffer.constructor.stats.totalWrites++;
       return this;
     }
 
@@ -477,7 +475,6 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer.constructor.stats.totalWrites++;
       return this;
     }
 
@@ -489,7 +486,6 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       if (this._buffer.message_nulls) {
         helpers.setNullBit(this._buffer.message_nulls, idx);
       }
-      this._buffer.constructor.stats.totalWrites++;
       return this;
     }
 
@@ -505,7 +501,6 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer.constructor.stats.totalWrites++;
       return this;
     }
 
@@ -517,7 +512,6 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       if (this._buffer.message_nulls) {
         helpers.setNullBit(this._buffer.message_nulls, idx);
       }
-      this._buffer.constructor.stats.totalWrites++;
       return this;
     }
 
@@ -533,7 +527,6 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer.constructor.stats.totalWrites++;
       return this;
     }
 
@@ -545,7 +538,6 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       if (this._buffer.message_nulls) {
         helpers.setNullBit(this._buffer.message_nulls, idx);
       }
-      this._buffer.constructor.stats.totalWrites++;
       return this;
     }
 
@@ -561,7 +553,6 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer.constructor.stats.totalWrites++;
       return this;
     }
 
@@ -573,7 +564,6 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       if (this._buffer.message_nulls) {
         helpers.setNullBit(this._buffer.message_nulls, idx);
       }
-      this._buffer.constructor.stats.totalWrites++;
       return this;
     }
 
@@ -613,7 +603,6 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.ff_value_nulls, idx);
         }
       }
-      this._buffer.constructor.stats.totalWrites++;
     }
 
     ` +
@@ -629,7 +618,6 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer.constructor.stats.totalWrites++;
       if (context) {
         this.with(context);
       }
