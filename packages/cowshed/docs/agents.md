@@ -6,14 +6,17 @@ the implicit contract explicit.
 
 ## The two-stream rule
 
-- **Parse stdout.** It contains exactly one thing: the answer (a path, a name, TSV rows, or a `--json` envelope). Piping
-  cowshed into `grep`, `jq`, `xargs`, or a variable never captures prose.
+- **Parse ordinary control stdout.** It contains one answer: a path, a name, TSV rows, or a bounded `--json` envelope.
+  Job/status JSON is bounded control transport: it carries lifecycle fields, `StreamInfo`, hashes, summaries, and may
+  carry a small `Inline.data` value tagged as `utf8` or `base64`. Unbounded output is available only through explicit
+  foreground streaming, `cowshed job logs`, `cowshed job attach`, or artifact reads.
 - **Read stderr.** All guidance lives there, in greppable, prefixed lines:
   - `cowshed: ...` — what just happened, or why something failed
   - `next: <command>` — concrete follow-up commands, valid to run as-is
 
-An agent's loop is: capture stdout for data, scan stderr for `next:` lines when deciding what to do, and switch on the
-exit code when something fails. Never parse prose out of stdout — there is none — and never expect data on stderr.
+An agent's loop is: parse the control answer, scan stderr for `next:` lines when deciding what to do, and switch on the
+exit code when something fails. Treat explicit raw streams as opaque bytes; do not decode them merely to move or retain
+them.
 
 ```sh
 WS_PATH=$(cowshed new task-4821)          # stdout only: the mountpoint
@@ -61,12 +64,45 @@ Notes for harness integration:
   `--force` deliberately.
 - If a task needs a _snapshot to retry from_, `cowshed checkpoint <ws> <label>` before the risky step and
   `cowshed restore <ws> <label>` on failure — both are milliseconds, and far cheaper than re-creating the workspace.
+  Checkpoint publication first crosses a supervisor barrier: complete Arrow batches and spill files are sealed, and a
+  manifest commits every checkpoint-resident job byte. A restored checkpoint starts a new workspace incarnation; the
+  captured content remains authoritative only for the snapshot that created it, while controller commitments preserve
+  existence, ordering, terminal state, hashes, and fork/restore lineage across that boundary.
 - Parallel exploration: `cowshed fork <ws> <ws>-alt` mid-task gives you two divergent futures from the same state. Forks
   start with a closed sandbox regardless of the source's grants.
 
 This is cowshed's layered capability model: the trusted coordinator holds policy authority; workers run closed and ask.
 A worker handle controls exactly one workspace's exec, shells, jobs, quota-limited checkpoints, push, and read-only
 grants. It cannot grant/revoke, restore/destroy/rebase/land, run gc, mirror repositories, or select another workspace.
+
+## Bounded job results and raw artifacts
+
+Every job has separate `StreamInfo { storage, bytes, sha256, summary }` handles for stdout and stderr. `storage` is
+`Captured { artifact }` or `Redirect { source, artifact }`; the protected `artifact` is either
+`Inline { data: BinaryData }` or `File { path: WorkspacePath }`. Small terminal streams may remain inline as Arrow
+Binary, so a short job need not create `out` or `err` files. Protected files spill lazily. Raw reads always resolve
+`artifact`, making logs and attachment representation-transparent.
+
+`Redirect` exists only when a real shell AST proves a narrow literal `>`/`2>` workspace destination. Its
+workspace-relative `source` is the live caller-visible path written by the shell and is never authoritative. After
+terminal state cowshed snapshots the admitted bytes into an independent sealed `artifact`: inline when small, otherwise
+a protected clone/reflink/copy file. It never hardlinks writable and protected paths. Ambiguous or unrecognized shell
+text retains ordinary shell behavior; bytes redirected away from cowshed's pipes then do not appear in the job handle.
+
+Separate `stdout_copy`/`stderr_copy` request fields publish a workspace-visible copy post-terminal from the canonical
+artifact. That export does not alter `StreamInfo.storage` and is never used for reads or authority. Its destination is
+also an independent clone/reflink/copy, never a hardlink.
+
+Ordinary agent responses remain bounded and control-only. They carry lifecycle metadata, `StreamInfo`, and redacted
+summaries. A small `Inline.data` artifact may appear in the response's tagged `utf8`/`base64` representation; the bound
+prevents an unbounded byte array, base64 blob, or decoded stdout/stderr copy. To consume full-fidelity output of any
+size, use `cowshed job logs <ws> <id>`, `cowshed job attach <ws> <id>`, or the frontend's raw artifact stream. These
+paths preserve arbitrary binary bytes and keep stdout and stderr separate.
+
+The supervisor is the sole writer under protected `.cowshed/job/**`. Every executed shell, named session, and descendant
+receives a child restriction that denies writes there before repository-controlled startup; completed batches and files
+are immutable. Recovery may discard only an incomplete trailing batch or file. A missing or hash-mismatched committed
+artifact is an integrity failure, not an invitation to trust a newer-looking copy.
 
 ## Binary stdin without shell interpolation
 
@@ -82,10 +118,10 @@ sources are regular files opened beneath the workspace with no-follow traversal.
 delivered bytes, EOF completion, and an optional relative path, never inline contents. Canceling an input stream closes
 stdin without implicitly killing the job.
 
-A trivial `>`/`2>` shell form may take an optimized path only when a real shell AST parser proves the narrow eligible
-shape; every ambiguity falls back to ordinary shell execution and capture. Harnesses must not depend on whether the
-optimization fires. The combined stdout+stderr job quota defaults to 1 GiB; crossing it yields an explicit
-`output-limit` terminal state after process-group termination and pipe drain, never silent truncation.
+Shell `>`, `2>`, pipelines, expansions, and descriptor operations keep ordinary shell semantics. Bytes redirected away
+from the supervisor's pipes are not captured output, and cowshed never aliases a protected artifact into a writable
+destination. The combined stdout+stderr job quota defaults to 1 GiB; crossing it yields an explicit `output-limit`
+terminal state after process-group termination and pipe drain, never silent truncation.
 
 ## Sandbox etiquette: start closed, earn grants
 
@@ -161,7 +197,12 @@ sandbox-denied outcome. Escalation remains an agent-to-agent policy decision; th
 
 Workspace enumeration and attachment state derive from disk, while a persistent per-workspace supervisor provides job
 control. Its permission-checked socket accepts concurrent clients and survives individual disconnects; reconnect by the
-workspace-local numeric job id to resume status, logs, or attachment. The durable key is
-`(repoId, workspaceIncarnation, jobId)`. A client disconnect never unlinks the socket or stops the job. Authoritative
-job state comes from controller-owned immutable per-writer telemetry segments. Workspace-local records travel with
-checkpoints but are editable reproduction data and must never drive authorization, denial, quota, or success decisions.
+workspace-local numeric job id to resume status, raw logs, or attachment. The durable key is
+`(repo_id, workspace_incarnation, job_id)`. A client disconnect never unlinks the socket or stops the job.
+
+Protected in-volume Arrow records and canonical `Inline`/`File` artifacts are the captured-content authority within
+their originating incarnation and checkpoint snapshot; a `Redirect.source` never is. Controller-owned immutable Arrow
+segments carry compact continuity commitments for job existence, lifecycle, ordering, lineage, terminal state, byte
+counts, stream hashes, and terminal-batch digest. They carry no artifact payload or path authority and never duplicate
+raw stdout/stderr. Neither tier silently wins a mismatch: missing committed content or a digest disagreement is an
+integrity failure.

@@ -120,20 +120,34 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
   human by construction. `cp` applies no quarantine xattr (verified), so a Developer-ID drop opens cleanly; ad-hoc trips
   Gatekeeper. Electron/RN-desktop promoted apps point at dev's dev-server over loopback for live iteration. Specs:
   14_nix.md, 02/04/05/06; docs/desktop.md.
-- **Layered sandbox and grant propagation**: start closed. Egress and simulator policy update immediately at the
-  gateway. Filesystem authority belongs to an immutable supervisor launch revision: after an effective filesystem grant
-  or revoke, the old supervisor stops admitting work and drains; existing jobs retain the old revision, then the
-  controller relaunches under the new revision. Inner per-command profiles may narrow but never widen. Named sessions
-  pinned to a stale revision conflict rather than migrate. No-op, egress-only, and simulator-only changes do not
-  relaunch.
-- **Supervisor, clients, and jobs**: one persistent Unix socket per workspace supports concurrent clients. Its runtime
-  directory is mode 0700, socket mode 0600, and connections require peer-credential/uid validation. A disconnect
-  detaches only that client's view; jobs continue and clients resume by durable numeric job ID and backing-file offsets.
-  Every accepted exec gets a positive workspace-local monotonic `u64` job ID with no reuse. Complete separate streams
-  live at `.cowshed/job/<id>/out` and `err`; metadata and deterministic bounded redacted summaries live in control
-  messages and Arrow records. A configurable combined output quota defaults to 1 GiB. At the first crossing, stop
-  accepting bytes past the boundary, terminate the whole process group, drain both pipes, fsync, and record an
-  authoritative `output-limit` terminal state; never silently truncate while a job continues.
+- **Layered sandbox and child invariant**: start closed. Filesystem authority belongs to an immutable supervisor launch
+  revision. Every anonymous shell, named session, one-shot, startup hook, and descendant receives a narrower child
+  profile before repository-controlled code runs; it denies every mutation beneath `.cowshed/job/**`, and no writable
+  protected-artifact/controller-writer FD is inherited. Effective filesystem grant changes drain/relaunch the
+  supervisor; named sessions pinned to stale revisions conflict. Egress/simulator changes apply at the gateway. No-op
+  and non-filesystem changes do not relaunch.
+- **Supervisor, clients, jobs, and stream storage**: one permission-checked persistent Unix socket per workspace
+  supports concurrent/reconnecting clients. Every accepted exec gets an unreused positive workspace-local monotonic job
+  ID, committed before spawn. Stdout/stderr are separate opaque byte streams under one exact combined quota (default 1
+  GiB) with byte count, SHA-256, and bounded redacted summary. Capture starts in bounded memory; small terminal bytes
+  live as protected Arrow Binary, while `.cowshed/job/<id>/out|err` appears lazily only after threshold,
+  background/replay, or checkpoint promotion. No per-job stream path is promised.
+- **Frozen storage and publication DTOs**: `ProtectedOutput::{Inline{data:BinaryData},File{path}}`;
+  `OutputStorage::{Captured{artifact},Redirect{source,artifact}}`; `StreamInfo{storage,bytes,sha256,summary}`;
+  `ProtectedRecord::{Job(JobArtifactRecord),CheckpointManifest(CheckpointManifestRecord)}`. `BinaryData` is a bounded
+  byte newtype whose JSON wire union is exact tagged `utf8|base64`; ordinary `JobInfo` may carry it, while controller
+  commitments never carry payload/path/summary fields. `Redirect.source` is mutable shell state; reads resolve its
+  independent protected artifact. Classify only an AST-proven redirect with a trusted actual descriptor and exact quota
+  accounting; never poll/tail/reopen. `ExecRequest.stdout_copy` / `stderr_copy` are
+  `Option<OutputPublication { path, policy: CreateNew|Replace }>` (camelCase in JSON/NAPI). CLI
+  `--stdout-copy`/`--stderr-copy` default CreateNew; one `--replace-output` switches all requested copies and is Usage
+  without a copy. Redirect snapshots and post-terminal publication use independent clone/reflink/copy, never hardlinks.
+- **Checkpoint artifact barrier**: admissions/artifact writes pause; running prefixes promote and files fsync. Append a
+  complete `CheckpointManifestRecord { version,repo_id,origin_incarnation,barrier_id,visible_jobs,records_sha256 }`;
+  each visible stream is `{storage_kind,bytes,sha256,protected_path}` with exact captured/redirect × inline/file kind
+  and path iff file. Clone while held; publish
+  `CheckpointCommitment { version,order,repo_id,origin_incarnation,checkpoint_id,barrier_id, manifest_batch_sha256 }`.
+  Terminal inline bytes resolve through prefix Job rows; running bytes are named fsynced files.
 - **MCP authority delivery and consent**: coordinator authority is delivered only over an inherited dedicated file
   descriptor or socketpair from the spawner, then validated, closed, and made non-inheritable before any workspace
   process is spawned. It never appears in environment, argv, stderr, workspace files, or ordinary token text. Worker
@@ -163,15 +177,17 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
   Outbound is an `OutboundConnector` trait: default hyper/rustls, optional `impersonate` cargo feature linking
   libcurl-impersonate (runtime-detected, truly optional; wreq/rquest possible behind the same trait). Per-workspace port
   block + token → egress/repo policy; 7644 = control plane only.
-- **Telemetry = lmao Arrow, one substrate**: observability is distributed tracing into Arrow columns via lmao
-  (`packages/lmao-rs`), not text logs. W3C trace context minted-or-adopted at every entry (CLI env, Rust `TraceContext`
-  on request structs, MCP `_meta`, CI deterministic from `(run_id, attempt)`); the supervisor injects `TRACEPARENT` into
-  each job's env; exec records and gateway audit carry trace/span ids. Store telemetry + gateway audit flush as
-  day-partitioned Arrow IPC segments under `~/.cowshed/telemetry/` (retention = gc drops segments); exec records are
-  in-volume Arrow (travel with checkpoints, not audit-grade). **No on-disk NDJSON** (wire/export encoding only) and no
-  telemetry daemon; the one text file is `telemetry/daemon-stderr.log` for pre-tracer-init crashes. lmao-query selectors
-  are the 08 trace-assertion surface (golden trace fixtures via injected Clock); `cowshed logs`/`audit`/`trace` read
-  them; OTLP is a projection if ever needed. Spec: 13_telemetry.md.
+- **Telemetry and tiered authority = lmao Arrow**: protected Arrow is exact
+  `ProtectedRecord::{Job(JobArtifactRecord),CheckpointManifest(CheckpointManifestRecord)}`. Complete batches/sealed
+  files are content authority within the origin boundary. Controller continuity is exact
+  `ControllerCommitment::{Admission(AdmissionCommitment),Terminal(TerminalCommitment), Checkpoint(CheckpointCommitment),Fork(ForkCommitment),Restore(RestoreCommitment)}`
+  with exact fields frozen in 07_api.md/13_telemetry.md. It owns existence/status/order/lineage/count/hash/digests but
+  carries no raw payload, inline bytes, protected/redirect path, or summary. `order` is positive, globally unique,
+  contiguous, and strictly increasing; admission precedes the sole terminal, checkpoint/fork/restore sources exist, and
+  lineage is acyclic. Constructors, Arrow, and JSON run one row/collection validator with `CommitmentPriorContext`. Any
+  gap, contradiction, missing/altered content, invalid complete frame, or digest mismatch is `Integrity`; only an
+  incomplete trailing frame may be discarded and reported with its `batch_sha256`. W3C context still spans
+  CLI/Rust/MCP/CI/job/gateway boundaries. No on-disk NDJSON or telemetry daemon; `daemon-stderr.log` is pre-init only.
 - **Substrates**: `cowshed_core::Substrate` has APFS image and ZFS dataset contracts. Linux enforcement combines
   Landlock, a private-loopback network namespace, and a per-workspace gateway Unix socket, with the same grants,
   revision semantics, and exit taxonomy as macOS.
@@ -180,26 +196,27 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
   green main-branch job; composite action at `.github/actions/smoothbricks-ci/action.yml` (mode auto|github|cowshed).
   Deletes Nix-restore / bun-install / Nx-cache steps and moves registry/git secrets off GitHub into the host gateway.
   Spec: 10_ci.md.
-- **CLI contract ("self-driving")**: stdout = machine-readable only (bare value or `--json` envelope
-  `{"ok":…,"result"|"error":…}` — the frozen shape; the docs' `cmd`/`detail` variant is stale); ALL guidance on stderr
-  ending with `next:` hints (so `| grep` on stdout never eats agent guidance); cowshed's own exit codes 0/2/3/4/5/6 =
-  ok/usage/not-found/conflict/env-missing/ sandbox-denied. `cowshed exec` passes the **child's** code through unchanged;
-  cowshed-wrapper failures during exec use **100–105** so they never collide with a child that exits 1–6. `-q`/
-  `--quiet` are aliases. Convention over configuration: zero required config, `.cowshed.toml` overrides only.
-- **Structured stdin and safe shell optimization**: `ExecRequest` supports no stdin, inline binary/streamed stdin, or a
-  workspace-relative file source. File input is opened no-follow beneath the workspace and streamed with backpressure;
-  EOF and cancellation are explicit, and job metadata records only source kind and byte count, never content. No shell
-  interpolation is involved. Ordinary shell execution remains the correctness path. An optional fast path may use a real
-  shell AST parser—never regex or output sniffing—for one top-level simple command with literal, in-workspace,
-  same-filesystem, nonexistent clobber targets for `>` and/or `2>`. Append, descriptor duplication, pipelines,
-  subshells, expansion, symlinks, noclobber, ambiguity, and every ineligible form fall back unchanged. The supervisor
-  may create the target inode and hardlink the matching job stream to it, with inode-aware tailing and quota accounting.
-  This is never a security, denial-evidence, authority, quota-correctness, or general correctness dependency.
+- **CLI/error contract ("self-driving")**: stdout is machine-readable only (bare value or the frozen JSON envelope); all
+  guidance is stderr with `next:` hints. Own exits are 0 success, 1 internal, 2 usage, 3 not-found, 4 conflict, 5
+  environment-missing, 6 sandbox-denied, and 7 integrity. Child exits pass through unchanged. Exec-wrapper errors are
+  100–106 in the same taxonomy order, with integrity at 106. JSON/NAPI/MCP use the shared `integrity` code; MCP maps it
+  to -32006. `-q`/`--quiet` are aliases. Configuration remains optional.
+- **Structured stdin, redirect evidence, and publication**: `ExecRequest` supports empty, inline binary/streamed, or
+  safe workspace-file stdin. It also has separate `stdout_copy`/`stderr_copy` post-terminal publications with explicit
+  create/replace policy. Shell text remains opaque by default. A real AST may recognize a narrowly proven simple literal
+  `>`/`2>` only when supervisor descriptor interposition preserves exact capture/quota semantics; terminal bytes are
+  independently snapshotted into the protected artifact. Ineligible forms use ordinary shell semantics and cowshed
+  claims only bytes reaching captured pipes. The old shell-AST hardlink optimization is deleted: no protected inode may
+  have a writable hardlink alias.
 
 ## State of the tree
 
-- `packages/cowshed/` contains Cargo workspace scaffolding and stub crates only. Treat every behavior in the specs and
-  docs as an implementation obligation, not as shipped functionality.
+- Current tree (2026-07-13): `cowshed-core` now contains the frozen DTO/error contracts, repository and path validation,
+  APFS lifecycle primitives, sandbox profile/child spawning, protected job-artifact storage/recovery/publication, and
+  the capability/controller actor boundary including the bounded raw-byte lane. These are tested foundations, not a
+  usable product: controller operation implementations remain incomplete, the CLI parses and renders typed failures but
+  does not dispatch successful commands, and gateway/N-API/escape-suite adapters remain scaffolds. Treat every remaining
+  behavior in the specs and docs as an implementation obligation, not as shipped functionality.
 - Toolchain configuration lives in `tooling/direnv/devenv.{yaml,nix}`. Invoke repository commands from `<repo-root>`;
   never embed a workstation-specific absolute path.
 - Keep the implementation greenfield: migrate all callers cleanly and leave no compatibility paths.
@@ -220,8 +237,9 @@ folded into the specs):
 - Attach latency floor → **not flag-reducible** (`-noverify` ~15 ms noise); only a DiskImages2/diskarbitrationd-level
   path could improve it — research item, budgets don't assume it.
 - Fork-mid-write clone validity → **10/10 clean** under continuous writer + streaming dd, both formats, `fsck_apfs -q`
-  and full `-n`; sync-before-clone is freshness only. Gate removed from `new`/`fork`/`checkpoint`; regression-pinned in
-  08_testing.md.
+  and full `-n`; sync-before-clone is filesystem freshness, not crash-consistency. Checkpoint still requires the
+  separate supervisor artifact barrier so process-resident captured bytes and its manifest are durable;
+  regression-pinned in 08_testing.md.
 - (a) bunfig relative `install.cache.dir` → **works, resolves to project root** (bun 1.3.14); `BUN_INSTALL_CACHE_DIR`
   retired. `[install] cacheDir` is silently ignored — doctor checks for it.
 - Cross-volume bun install cost → **measured 6× slower + full-copy** (0.03 s/480 KiB in-volume vs 0.18 s/59 MB
