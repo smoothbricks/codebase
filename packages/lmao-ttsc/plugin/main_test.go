@@ -32,12 +32,22 @@ func TestGitLastCommitUnknownOutsideRepo(t *testing.T) {
 	}
 }
 
-func TestReadFlags(t *testing.T) {
-	cwd, tsconfig := readFlags([]string{"--cwd=/x", "--tsconfig=custom.json"})
-	if cwd != "/x" {
-		t.Fatalf("cwd = %q", cwd)
+func TestReadOptionsResolvesExplicitRelativePaths(t *testing.T) {
+	options, err := readOptions([]string{
+		"--cwd=/x",
+		"--tsconfig=config/custom.json",
+		"--lmao-vocabulary-manifest=manifests/vocabulary.json",
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if tsconfig != filepath.Join("/x", "custom.json") {
-		t.Fatalf("tsconfig = %q", tsconfig)
+	if options.cwd != "/x" {
+		t.Fatalf("cwd = %q, want /x", options.cwd)
+	}
+	if options.tsconfig != filepath.Join("/x", "config", "custom.json") {
+		t.Fatalf("tsconfig = %q, want explicit path resolved from cwd", options.tsconfig)
+	}
+	if options.manifestPath != filepath.Join("/x", "config", "manifests", "vocabulary.json") {
+		t.Fatalf("manifestPath = %q, want explicit path resolved from tsconfig directory", options.manifestPath)
 	}
 }

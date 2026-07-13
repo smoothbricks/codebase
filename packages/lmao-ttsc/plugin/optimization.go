@@ -27,8 +27,7 @@ var contextCapability = map[string]uint32{
 }
 
 type opCompileAnalysis struct {
-	runtimeHint    uint32
-	logTemplateIds []string
+	runtimeHint uint32
 }
 
 type hintRewrite struct {
@@ -38,7 +37,6 @@ type hintRewrite struct {
 	isGroup bool
 }
 
-const maxLogTemplateID = 0xffff
 
 func functionParts(node *shimast.Node) (params *shimast.ParameterList, body *shimast.Node, async bool, ok bool) {
 	switch node.Kind {
@@ -170,63 +168,10 @@ func literalLogMessage(node *shimast.Node) (string, bool) {
 	}
 }
 
-// analyzeOpCompileMetadata runs against the untouched tree. It assigns IDs in
-// lexical order and records the exact call nodes consumed later by the emitter.
+// analyzeOpCompileMetadata derives only runtime execution hints. Static log
+// vocabulary is whole-program metadata collected independently of Op nesting.
 func (t *fileTransformer) analyzeOpCompileMetadata(fn *shimast.Node) opCompileAnalysis {
-	analysis := opCompileAnalysis{runtimeHint: analyzeOpFunction(fn)}
-	params, body, _, ok := functionParts(fn)
-	if !ok || params == nil || len(params.Nodes) == 0 || body == nil {
-		return analysis
-	}
-	first := params.Nodes[0]
-	if first.Kind != shimast.KindParameter || first.Name() == nil || first.Name().Kind != shimast.KindIdentifier {
-		return analysis
-	}
-	contextName := shimast.NodeText(first.Name())
-	idsByMessage := map[string]uint16{}
-	var visit func(*shimast.Node)
-	visit = func(node *shimast.Node) {
-		if node == nil {
-			return
-		}
-		if isNestedFunction(node) {
-			return
-		}
-		if node.Kind == shimast.KindCallExpression {
-			call := node.AsCallExpression()
-			if len(call.Arguments.Nodes) == 1 && call.Expression.Kind == shimast.KindPropertyAccessExpression {
-				method := call.Expression.AsPropertyAccessExpression()
-				logNode := method.Expression
-				if logMethods[shimast.NodeText(method.Name())] && logNode.Kind == shimast.KindPropertyAccessExpression {
-					logAccess := logNode.AsPropertyAccessExpression()
-					if shimast.NodeText(logAccess.Name()) == "log" && logAccess.Expression.Kind == shimast.KindIdentifier &&
-						shimast.NodeText(logAccess.Expression) == contextName {
-						logType := t.checker.GetTypeAtLocation(logNode)
-						if logType != nil && isSpanLoggerType(t.checker, logType) {
-							if message, literal := literalLogMessage(call.Arguments.Nodes[0]); literal {
-								id, exists := idsByMessage[message]
-								if !exists && len(analysis.logTemplateIds) < maxLogTemplateID {
-									analysis.logTemplateIds = append(analysis.logTemplateIds, message)
-									id = uint16(len(analysis.logTemplateIds))
-									idsByMessage[message] = id
-									exists = true
-								}
-								if exists {
-									t.logTemplateIDs[call] = id
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-		node.ForEachChild(func(child *shimast.Node) bool {
-			visit(child)
-			return false
-		})
-	}
-	visit(body)
-	return analysis
+	return opCompileAnalysis{runtimeHint: analyzeOpFunction(fn)}
 }
 
 func isClosedWorldCapabilityUse(access *shimast.Node, name string) bool {
@@ -345,6 +290,23 @@ func hasLmaoCallProvenance(chk *shimchecker.Checker, call *shimast.CallExpressio
 	return signature != nil && isLmaoDeclarationNode(signature.Declaration())
 }
 
+func (t *fileTransformer) collectStaticLogVocabulary(call *shimast.CallExpression) {
+	if t.vocabulary == nil || len(call.Arguments.Nodes) != 1 || call.Expression.Kind != shimast.KindPropertyAccessExpression {
+		return
+	}
+	method := call.Expression.AsPropertyAccessExpression()
+	if !logMethods[shimast.NodeText(method.Name())] || !hasLmaoCallProvenance(t.checker, call) {
+		return
+	}
+	receiverType := t.checker.GetTypeAtLocation(method.Expression)
+	if receiverType == nil || !isSpanLoggerType(t.checker, receiverType) {
+		return
+	}
+	if text, literal := literalVocabularyValue(call.Arguments.Nodes[0]); literal {
+		t.vocabulary.add(vocabularyLogTemplate, text, call, t.file.FileName())
+	}
+}
+
 func (t *fileTransformer) collectOptimizations(root *shimast.Node) []hintRewrite {
 	if t.checker == nil {
 		return nil
@@ -357,6 +319,7 @@ func (t *fileTransformer) collectOptimizations(root *shimast.Node) []hintRewrite
 		}
 		if node.Kind == shimast.KindCallExpression {
 			call := node.AsCallExpression()
+			t.collectStaticLogVocabulary(call)
 			_, name := calleeNames(call)
 			provenLmaoCall := hasLmaoCallProvenance(t.checker, call)
 			switch name {
@@ -374,12 +337,17 @@ func (t *fileTransformer) collectOptimizations(root *shimast.Node) []hintRewrite
 			case "span":
 				recv, _ := calleeNames(call)
 				if recv != nil && len(call.Arguments.Nodes) >= 2 && len(call.Arguments.Nodes) <= 10 &&
-					(recv.Kind == shimast.KindIdentifier || recv.Kind == shimast.KindThisKeyword) &&
-					call.Arguments.Nodes[1].Kind == shimast.KindIdentifier &&
-					isNamedLmaoType(t.checker, call.Arguments.Nodes[1], "Op") {
+					(recv.Kind == shimast.KindIdentifier || recv.Kind == shimast.KindThisKeyword) {
+					opOrFn := call.Arguments.Nodes[1]
+					plainFunction := opOrFn.Kind == shimast.KindArrowFunction || opOrFn.Kind == shimast.KindFunctionExpression
+					provenOp := opOrFn.Kind == shimast.KindIdentifier && isNamedLmaoType(t.checker, opOrFn, "Op")
 					recvType := t.checker.GetTypeAtLocation(recv)
-					if recvType != nil && isLmaoContextType(t.checker, recvType) {
-						t.opSpans[call] = true
+					provenContext := recvType != nil && isLmaoContextType(t.checker, recvType)
+					if provenOp && provenContext { t.opSpans[call] = true }
+					if provenContext && (plainFunction || provenOp) && t.vocabulary != nil {
+						if text, literal := literalVocabularyValue(call.Arguments.Nodes[0]); literal {
+							t.vocabulary.add(vocabularySpanName, text, call, t.file.FileName())
+						}
 					}
 				}
 			}
@@ -426,14 +394,8 @@ func (t *fileTransformer) spanContextApproved(node *shimast.Node) bool {
 }
 
 func compileMetadataNode(analysis opCompileAnalysis) *shimast.Node {
-	templates := make([]*shimast.Node, len(analysis.logTemplateIds))
-	for i, message := range analysis.logTemplateIds {
-		templates[i] = str(message)
-	}
 	return factory.NewObjectLiteralExpression(factory.NewNodeList([]*shimast.Node{
 		factory.NewPropertyAssignment(nil, ident("runtimeHint"), nil, nil, num(int(analysis.runtimeHint))),
-		factory.NewPropertyAssignment(nil, ident("logTemplateIds"), nil, nil,
-			factory.NewArrayLiteralExpression(factory.NewNodeList(templates), false)),
 	}), true)
 }
 

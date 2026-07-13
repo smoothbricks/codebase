@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -14,7 +15,6 @@ import (
 const templateFixtureDeclarations = `
 export interface OpCompileMetadata {
   readonly runtimeHint: number;
-  readonly logTemplateIds: readonly string[];
 }
 export class FluentLogEntry { line(value: number): this; }
 export class SpanLogger {
@@ -23,6 +23,10 @@ export class SpanLogger {
   warn(message: string): FluentLogEntry;
   error(message: string): FluentLogEntry;
   trace(message: string): FluentLogEntry;
+  jobId(value: string): FluentLogEntry;
+  elapsedMs(value: number): FluentLogEntry;
+  attempt(value: number): FluentLogEntry;
+  success(value: boolean): FluentLogEntry;
 }
 export class SpanContext {
   readonly _buffer: { constructor: unknown; _opMetadata: unknown };
@@ -42,7 +46,15 @@ export function defineOp(name: string, fn: (ctx: SpanContext) => unknown, metada
 export function defineOps(definitions: Record<string, Op | ((ctx: SpanContext) => unknown)>, compileMetadataByKey?: Readonly<Record<string, OpCompileMetadata>>): OpGroup;
 `
 
-func transformTemplateFixture(t *testing.T, body string) string {
+type templateFixtureResult struct {
+	output string
+	err    error
+	manifest vocabularyManifest
+	inputPath string
+	source    string
+}
+
+func runTemplateFixture(t *testing.T, body string) templateFixtureResult {
 	t.Helper()
 	root := t.TempDir()
 	inputPath := filepath.Join(root, "input.ts")
@@ -68,7 +80,26 @@ func transformTemplateFixture(t *testing.T, body string) string {
 		t.Fatal(err)
 	}
 	defer program.Close()
-	transform := lmaoPluginTransform(program, root)
+	options := compilerOptions{
+		cwd:          root,
+		tsconfig:     filepath.Join(root, "tsconfig.json"),
+		manifestPath: filepath.Join(root, "lmao.vocabulary.json"),
+	}
+	_, manifest, err := collectProgramCompilation(program, options, false)
+	if err != nil {
+		return templateFixtureResult{err: err, inputPath: inputPath, source: source}
+	}
+	manifestBytes, err := canonicalManifestBytes(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(options.manifestPath, manifestBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	transform, err := lmaoPluginTransform(program, options)
+	if err != nil {
+		return templateFixtureResult{err: err, inputPath: inputPath, source: source}
+	}
 	for _, sourceFile := range program.SourceFiles() {
 		if sourceFile == nil || filepath.Clean(sourceFile.FileName()) != filepath.Clean(inputPath) {
 			continue
@@ -79,10 +110,19 @@ func transformTemplateFixture(t *testing.T, body string) string {
 			t.Fatal("template fixture transform returned nil")
 		}
 		printer := shimprinter.NewPrinter(shimprinter.PrinterOptions{}, shimprinter.PrintHandlers{}, emitContext)
-		return shimprinter.EmitSourceFile(printer, result)
+		return templateFixtureResult{output: shimprinter.EmitSourceFile(printer, result), manifest: manifest, inputPath: inputPath, source: source}
 	}
 	t.Fatal("template fixture input source was not loaded")
-	return ""
+	return templateFixtureResult{}
+}
+
+func transformTemplateFixture(t *testing.T, body string) string {
+	t.Helper()
+	result := runTemplateFixture(t, body)
+	if result.err != nil {
+		t.Fatalf("template fixture transform failed: %v", result.err)
+	}
+	return result.output
 }
 
 func collectNodeText(root *shimast.Node, kind shimast.Kind) []string {
@@ -113,9 +153,22 @@ func containsText(values []string, target string) bool {
 	return false
 }
 
-func emittedLogBlock(level string, templateID uint16) *shimast.Node {
+func containsTemplateIDLane(values []string) bool {
+	for _, value := range values {
+		if strings.HasSuffix(value, "TemplateIds") {
+			return true
+		}
+	}
+	return false
+}
+
+func emittedLogBlock(level string, templateID globalVocabularyID) *shimast.Node {
 	list := factory.NewNodeList([]*shimast.Node{factory.NewExpressionStatement(ident("placeholder"))})
 	transformer := &fileTransformer{}
+	if templateID != 0 {
+		transformer.vocabularyBinding = ident("vocabularyBinding")
+		transformer.vocabularyOrdinals = map[globalVocabularyID]int{templateID: 4}
+	}
 	transformer.applyLogInlines([]logInline{{
 		list:       list,
 		index:      0,
@@ -127,18 +180,14 @@ func emittedLogBlock(level string, templateID uint16) *shimast.Node {
 	return list.Nodes[0]
 }
 
-func TestCompileMetadataKeepsTemplateTableOrder(t *testing.T) {
-	node := compileMetadataNode(opCompileAnalysis{
-		runtimeHint:    123,
-		logTemplateIds: []string{"first", "shared", "last"},
-	})
-	strings := collectNodeText(node, shimast.KindStringLiteral)
-	if len(strings) != 3 || strings[0] != "first" || strings[1] != "shared" || strings[2] != "last" {
-		t.Fatalf("compile metadata template order = %q, want [first shared last]", strings)
+func TestCompileMetadataExcludesRemovedPerOpTemplateTable(t *testing.T) {
+	node := compileMetadataNode(opCompileAnalysis{runtimeHint: 123})
+	if strings := collectNodeText(node, shimast.KindStringLiteral); len(strings) != 0 {
+		t.Fatalf("compile metadata retained obsolete per-Op template strings: %q", strings)
 	}
 	identifiers := collectNodeText(node, shimast.KindIdentifier)
-	if !containsText(identifiers, "runtimeHint") || !containsText(identifiers, "logTemplateIds") {
-		t.Fatalf("compile metadata fields = %q, want runtimeHint and logTemplateIds", identifiers)
+	if len(identifiers) != 1 || identifiers[0] != "runtimeHint" {
+		t.Fatalf("compile metadata fields = %q, want runtimeHint only", identifiers)
 	}
 	numbers := collectNodeText(node, shimast.KindNumericLiteral)
 	if !containsText(numbers, "123") {
@@ -146,7 +195,7 @@ func TestCompileMetadataKeepsTemplateTableOrder(t *testing.T) {
 	}
 }
 
-func TestLiteralLogInlineUsesOnlyTemplateLaneForEveryLevel(t *testing.T) {
+func TestLiteralLogInlineUsesRegisteredHeaderOperandForEveryLevel(t *testing.T) {
 	entryTypes := map[string]string{
 		"info":  "8",
 		"debug": "7",
@@ -158,15 +207,15 @@ func TestLiteralLogInlineUsesOnlyTemplateLaneForEveryLevel(t *testing.T) {
 		t.Run(level, func(t *testing.T) {
 			block := emittedLogBlock(level, 37)
 			identifiers := collectNodeText(block, shimast.KindIdentifier)
-			if !containsText(identifiers, "_messageTemplateIds") {
-				t.Fatalf("%s literal inline does not write _messageTemplateIds: %q", level, identifiers)
+			if !containsText(identifiers, "_logHeaders") || !containsText(identifiers, "vocabularyBinding") {
+				t.Fatalf("%s literal inline does not pack the registered binding operand into _logHeaders: %q", level, identifiers)
 			}
-			if containsText(identifiers, "message_values") || containsText(identifiers, "message_nulls") {
-				t.Fatalf("%s literal inline writes dynamic message storage: %q", level, identifiers)
+			if containsTemplateIDLane(identifiers) || containsText(identifiers, "message_values") || containsText(identifiers, "message_nulls") {
+				t.Fatalf("%s literal inline writes a separate template-ID lane or dynamic message storage: %q", level, identifiers)
 			}
 			numbers := collectNodeText(block, shimast.KindNumericLiteral)
-			if !containsText(numbers, "37") {
-				t.Fatalf("%s literal inline numeric values = %q, want template ID 37", level, numbers)
+			if !containsText(numbers, "4") || containsText(numbers, "37") {
+				t.Fatalf("%s literal inline numeric values = %q, want fragment ordinal 4 and no global ID 37", level, numbers)
 			}
 			if !containsText(numbers, entryType) {
 				t.Fatalf("%s literal inline numeric values = %q, want entry type %s", level, numbers, entryType)
@@ -178,8 +227,8 @@ func TestLiteralLogInlineUsesOnlyTemplateLaneForEveryLevel(t *testing.T) {
 func TestDynamicLogInlineKeepsSingleMessageEvaluationAndSentinelLaneClear(t *testing.T) {
 	block := emittedLogBlock("info", 0)
 	identifiers := collectNodeText(block, shimast.KindIdentifier)
-	if containsText(identifiers, "_messageTemplateIds") {
-		t.Fatalf("dynamic inline unexpectedly writes the template lane: %q", identifiers)
+	if containsTemplateIDLane(identifiers) {
+		t.Fatalf("dynamic inline unexpectedly writes a separate template-ID lane: %q", identifiers)
 	}
 	if !containsText(identifiers, "message_values") || !containsText(identifiers, "message_nulls") {
 		t.Fatalf("dynamic inline does not use ordinary message storage: %q", identifiers)
@@ -195,7 +244,7 @@ func TestDynamicLogInlineKeepsSingleMessageEvaluationAndSentinelLaneClear(t *tes
 	}
 }
 
-func TestFactoryLocalOpsReceiveMetadataTemplatesAndStableChildRewrite(t *testing.T) {
+func TestFactoryLocalOpsUseGlobalVocabularyAndStableChildRewrite(t *testing.T) {
 	output := transformTemplateFixture(t, `
 function createFactoryOps() {
   const child = defineOp('factory-child', (ctx) => {
@@ -214,19 +263,22 @@ function createFactoryOps() {
 }
 `)
 
-	for _, literal := range []string{"child literal", "group literal", "parent literal"} {
-		if strings.Count(output, literal) != 1 {
-			t.Fatalf("%q occurrences = %d, want exactly one metadata entry\n%s", literal, strings.Count(output, literal), output)
-		}
+	registration := regexp.MustCompile(`const (\$\$lmaoVocabulary\w*) = \$\$registerLmaoVocabulary\w*\(\{`).FindStringSubmatch(output)
+	if len(registration) != 2 {
+		t.Fatalf("factory-local vocabulary registration missing\n%s", output)
 	}
-	if strings.Count(output, "logTemplateIds") != 3 {
-		t.Fatalf("logTemplateIds occurrences = %d, want child, grouped, and parent metadata\n%s", strings.Count(output, "logTemplateIds"), output)
+	binding := registration[1]
+	if strings.Count(output, "writeLogEntry($$b") != 3 || strings.Count(output, "_logHeaders[$$i]") != 3 {
+		t.Fatalf("factory-local static logs did not lower through the packed registered-header seam\n%s", output)
 	}
-	if !strings.Contains(output, "_messageTemplateIds[$$i] = 1") {
-		t.Fatalf("factory-local literal logs did not use template IDs\n%s", output)
+	if strings.Count(output, binding+"[") != 7 {
+		t.Fatalf("registered binding uses = %d, want two per static log and one static span\n%s", strings.Count(output, binding+"["), output)
 	}
-	if strings.Count(output, "ctx.span0(") != 1 {
-		t.Fatalf("stable child span rewrites = %d, want exactly one\n%s", strings.Count(output, "ctx.span0("), output)
+	if strings.Contains(output, "TemplateIds") {
+		t.Fatalf("a separate template-ID lane survived global vocabulary lowering\n%s", output)
+	}
+	if strings.Count(output, "ctx.spanStatic0(") != 1 {
+		t.Fatalf("stable child span rewrites = %d, want exactly one registered static span\n%s", strings.Count(output, "ctx.spanStatic0("), output)
 	}
 	for _, field := range []string{"child.SpanBufferClass", "child.metadata", "child.fn", "child.runtimeHint"} {
 		if !strings.Contains(output, field) {
@@ -235,28 +287,34 @@ function createFactoryOps() {
 	}
 }
 
-func TestLiteralLogsInValueContextsUseRecordedIDsWithoutDoubleRewrite(t *testing.T) {
+func TestLiteralLogsInValueContextsUseRegisteredBindingsWithoutDoubleRewrite(t *testing.T) {
 	output := transformTemplateFixture(t, `
 declare function dynamicMessage(): string;
 declare function consume(value: unknown): void;
 defineOp('value-contexts', (ctx) => {
   const initialized = ctx.log.info('initializer literal');
-  const conditional = true ? ctx.log.warn('conditional literal') : ctx.log.warn(dynamicMessage());
+  const conditional = true ? ctx.log.warn('conditional literal') : ctx.log.debug(dynamicMessage());
   consume(ctx.log.error('argument literal'));
   return ctx.ok([initialized, conditional]);
 });
 `)
 
-	if !strings.Contains(output, `logTemplateIds: ["initializer literal", "conditional literal", "argument literal"]`) {
-		t.Fatalf("value-context metadata table missing or out of order\n%s", output)
+	registration := regexp.MustCompile(`const (\$\$lmaoVocabulary\w*) = \$\$registerLmaoVocabulary\w*\(\{`).FindStringSubmatch(output)
+	if len(registration) != 2 {
+		t.Fatalf("value-context vocabulary registration missing\n%s", output)
 	}
-	for _, call := range []string{"ctx.log._infoTemplate(1)", "ctx.log._warnTemplate(2)", "ctx.log._errorTemplate(3)"} {
+	binding := registration[1]
+	for _, method := range []string{"_infoTemplate", "_warnTemplate", "_errorTemplate"} {
+		call := "ctx.log." + method + "(" + binding + "["
 		if strings.Count(output, call) != 1 {
-			t.Fatalf("%s occurrences = %d, want exactly one\n%s", call, strings.Count(output, call), output)
+			t.Fatalf("%s registered call occurrences = %d, want exactly one\n%s", method, strings.Count(output, call), output)
 		}
 	}
-	if strings.Count(output, "ctx.log.warn(dynamicMessage())") != 1 {
-		t.Fatalf("dynamic log evaluations = %d, want one\n%s", strings.Count(output, "ctx.log.warn(dynamicMessage())"), output)
+	if strings.Contains(output, "TemplateIds") {
+		t.Fatalf("a separate template-ID lane survived value-context lowering\n%s", output)
+	}
+	if strings.Count(output, "ctx.log.debug(dynamicMessage())") != 1 {
+		t.Fatalf("raw dynamic debug evaluations = %d, want one\n%s", strings.Count(output, "ctx.log.debug(dynamicMessage())"), output)
 	}
 	if strings.Contains(output, "ctx.log.info('initializer literal')") || strings.Contains(output, "ctx.log.warn('conditional literal')") || strings.Contains(output, "ctx.log.error('argument literal')") {
 		t.Fatalf("literal value-context call survived alongside its template rewrite\n%s", output)

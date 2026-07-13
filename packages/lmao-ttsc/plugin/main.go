@@ -26,7 +26,9 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -44,146 +46,142 @@ const pluginName = "@smoothbricks/lmao-ttsc"
 const pluginVersion = "0.1.6"
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "%s: command required\n", pluginName)
-		os.Exit(2)
-	}
+	if len(os.Args) < 2 { fmt.Fprintf(os.Stderr, "%s: command required\n", pluginName); os.Exit(2) }
 	switch os.Args[1] {
-	case "version", "-v", "--version":
-		fmt.Printf("%s %s\n", pluginName, pluginVersion)
-	case "check":
-		// Transform-stage plugin: check is a no-op.
-	case "transform":
-		os.Exit(runTransform(os.Args[2:]))
-	case "build":
-		os.Exit(runBuild(os.Args[2:]))
-	default:
-		fmt.Fprintf(os.Stderr, "%s: unknown command %q\n", pluginName, os.Args[1])
-		os.Exit(2)
+	case "version", "-v", "--version": fmt.Printf("%s %s\n", pluginName, pluginVersion)
+	case "check": os.Exit(runCheck(os.Args[2:]))
+	case "sync-vocabulary": os.Exit(runVocabularySync(os.Args[2:]))
+	case "transform": os.Exit(runTransform(os.Args[2:]))
+	case "build": os.Exit(runBuild(os.Args[2:]))
+	default: fmt.Fprintf(os.Stderr, "%s: unknown command %q\n", pluginName, os.Args[1]); os.Exit(2)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Host plumbing (per ttsc authoring walkthrough)
-// ---------------------------------------------------------------------------
+type compilerOptions struct { cwd, tsconfig, manifestPath string }
+type nativePluginConfigEntry struct { Config map[string]any `json:"config"`; Name string `json:"name"`; Stage string `json:"stage"` }
 
-func readFlags(args []string) (cwd, tsconfig string) {
-	tsconfig = "tsconfig.json"
-	for _, a := range args {
+func readOptions(args []string) (compilerOptions, error) {
+	options := compilerOptions{tsconfig: "tsconfig.json"}
+	var explicitManifest, pluginsJSON string
+	for _, argument := range args {
 		switch {
-		case strings.HasPrefix(a, "--cwd="):
-			cwd = strings.TrimPrefix(a, "--cwd=")
-		case strings.HasPrefix(a, "--tsconfig="):
-			tsconfig = strings.TrimPrefix(a, "--tsconfig=")
+		case strings.HasPrefix(argument, "--cwd="): options.cwd = strings.TrimPrefix(argument, "--cwd=")
+		case strings.HasPrefix(argument, "--tsconfig="): options.tsconfig = strings.TrimPrefix(argument, "--tsconfig=")
+		case strings.HasPrefix(argument, "--lmao-vocabulary-manifest="): explicitManifest = strings.TrimPrefix(argument, "--lmao-vocabulary-manifest=")
+		case strings.HasPrefix(argument, "--plugins-json="): pluginsJSON = strings.TrimPrefix(argument, "--plugins-json=")
 		}
 	}
-	if cwd == "" {
-		cwd, _ = os.Getwd()
-	}
-	if !filepath.IsAbs(tsconfig) {
-		tsconfig = filepath.Join(cwd, tsconfig)
-	}
-	return cwd, tsconfig
-}
-
-type transformResult struct {
-	TypeScript map[string]string `json:"typescript"`
-}
-
-func outputKey(cwd, fileName string) string {
-	rel, err := filepath.Rel(cwd, fileName)
-	if err != nil {
-		return fileName
-	}
-	return filepath.ToSlash(rel)
-}
-
-// lmaoPluginTransform builds the emit-phase transformer. Running inside
-// tsgo's per-file emit chain (the AST-integration model, same as typia) is
-// what makes synthesized pos:-1 nodes safe: the checker's per-file emit-time
-// passes (grammar checks, MarkLinkedReferences) run BEFORE the script
-// transformers, so nothing type-checks the mutated tree. Checker queries the
-// transform itself makes (tag-chain detection) happen in a collect phase over
-// the still-untouched file before any node is spliced.
-func lmaoPluginTransform(prog *driver.Program, cwd string) driver.PluginTransform {
-	return func(_ *shimprinter.EmitContext, sf *shimast.SourceFile) *shimast.SourceFile {
-		if sf == nil || sf.IsDeclarationFile {
-			return sf
+	if options.cwd == "" { options.cwd, _ = os.Getwd() }
+	options.cwd, _ = filepath.Abs(options.cwd)
+	if !filepath.IsAbs(options.tsconfig) { options.tsconfig = filepath.Join(options.cwd, options.tsconfig) }
+	options.tsconfig = filepath.Clean(options.tsconfig)
+	configuredManifest := ""
+	if strings.TrimSpace(pluginsJSON) != "" {
+		decoder := json.NewDecoder(strings.NewReader(pluginsJSON)); decoder.DisallowUnknownFields()
+		var entries []nativePluginConfigEntry
+		if err := decoder.Decode(&entries); err != nil { return compilerOptions{}, fmt.Errorf("LMAO1010 malformed --plugins-json: %w", err) }
+		var trailing any
+		if err := decoder.Decode(&trailing); err == nil { return compilerOptions{}, fmt.Errorf("LMAO1010 malformed --plugins-json: trailing JSON value")
+		} else if !errors.Is(err, io.EOF) { return compilerOptions{}, fmt.Errorf("LMAO1010 malformed --plugins-json: %w", err) }
+		matched := false
+		for _, entry := range entries {
+			if entry.Name != pluginName { continue }
+			if matched { return compilerOptions{}, fmt.Errorf("LMAO1010 --plugins-json contains multiple %s entries", pluginName) }
+			matched = true
+			value, exists := entry.Config["vocabularyManifest"]
+			if !exists { continue }
+			manifest, ok := value.(string)
+			if !ok || manifest == "" { return compilerOptions{}, fmt.Errorf("LMAO1010 %s config.vocabularyManifest must be a non-empty string", pluginName) }
+			configuredManifest = manifest
 		}
-		t := &fileTransformer{
-			file: sf, cwd: cwd, checker: prog.Checker,
-			processed:      map[*shimast.CallExpression]bool{},
-			opSpans:        map[*shimast.CallExpression]bool{},
-			logTemplateIDs: map[*shimast.CallExpression]uint16{},
-		}
-		hintRewrites := t.collectOptimizations(sf.AsNode())
-		tagInlines, logInlines, resultInlines := t.collectTagInlines(sf.AsNode())
-		applyHintRewrites(hintRewrites)
-		t.applyTagInlines(tagInlines)
-		t.applyLogInlines(logInlines)
-		t.applyResultInlines(resultInlines)
-		t.walk(sf.AsNode())
-		// Wire Parent on synthesized nodes (only where nil); printer passes
-		// walk parents. See shim/ast/parent.go.
+	}
+	manifestPath := configuredManifest
+	if explicitManifest != "" { manifestPath = explicitManifest }
+	if manifestPath == "" { manifestPath = "lmao.vocabulary.json" }
+	if !filepath.IsAbs(manifestPath) { manifestPath = filepath.Join(filepath.Dir(options.tsconfig), manifestPath) }
+	options.manifestPath = filepath.Clean(manifestPath)
+	return options, nil
+}
+
+type transformResult struct { TypeScript map[string]string `json:"typescript"` }
+func outputKey(cwd, fileName string) string { rel, err := filepath.Rel(cwd, fileName); if err != nil { return fileName }; return filepath.ToSlash(rel) }
+
+type collectedFile struct {
+	transformer *fileTransformer
+	hintRewrites []hintRewrite
+	tagInlines []tagInline
+	logInlines []logInline
+	resultInlines []resultInline
+	registrationEntries []vocabularyManifestEntry
+}
+type programCompilation struct { files map[*shimast.SourceFile]*collectedFile }
+
+func collectProgramCompilation(prog *driver.Program, options compilerOptions, validateManifest bool) (*programCompilation, vocabularyManifest, error) {
+	collector := newProgramVocabularyCollector()
+	compilation := &programCompilation{files: map[*shimast.SourceFile]*collectedFile{}}
+	for _, sf := range prog.SourceFiles() {
+		if sf == nil || sf.IsDeclarationFile { continue }
+		t := &fileTransformer{file: sf, cwd: options.cwd, checker: prog.Checker, processed: map[*shimast.CallExpression]bool{}, opSpans: map[*shimast.CallExpression]bool{}, vocabulary: collector}
+		compilation.files[sf] = &collectedFile{transformer: t, hintRewrites: t.collectOptimizations(sf.AsNode())}
+	}
+	if err := collector.diagnosticError(); err != nil { return nil, vocabularyManifest{}, err }
+	expected, err := buildVocabularyManifest(collector); if err != nil { return nil, vocabularyManifest{}, err }
+	manifest := expected
+	if validateManifest {
+		manifest, err = loadVocabularyManifest(options.manifestPath); if err != nil { return nil, vocabularyManifest{}, err }
+		if err = validateVocabularyManifestForProgram(manifest, expected); err != nil { return nil, vocabularyManifest{}, err }
+	}
+	staticLogs, staticSpans := resolveVocabularyIDs(manifest, collector)
+	for sf, collected := range compilation.files {
+		collected.transformer.staticLogIDs = staticLogs; collected.transformer.staticSpanNameIDs = staticSpans
+		collected.registrationEntries = manifestEntriesForFile(manifest, collector.fileKeys[sf.FileName()])
+		collected.transformer.vocabularyOrdinals = vocabularyOrdinals(collected.registrationEntries)
+		collected.tagInlines, collected.logInlines, collected.resultInlines = collected.transformer.collectTagInlines(sf.AsNode())
+	}
+	return compilation, manifest, nil
+}
+
+func lmaoPluginTransform(prog *driver.Program, options compilerOptions) (driver.PluginTransform, error) {
+	compilation, _, err := collectProgramCompilation(prog, options, true); if err != nil { return nil, err }
+	return func(ec *shimprinter.EmitContext, sf *shimast.SourceFile) *shimast.SourceFile {
+		if sf == nil || sf.IsDeclarationFile { return sf }
+		collected := compilation.files[sf]; if collected == nil { panic("source file missing from finalized LMAO compilation") }
+		t := collected.transformer
+		binding, registration := vocabularyRegistrationStatements(ec, collected.registrationEntries); t.vocabularyBinding = binding
+		applyHintRewrites(collected.hintRewrites); t.applyTagInlines(collected.tagInlines); t.applyLogInlines(collected.logInlines); t.applyResultInlines(collected.resultInlines); t.walk(sf.AsNode())
+		prependVocabularyRegistration(sf, registration)
 		shimast.SetParentInChildrenUnset(sf.AsNode())
 		return sf
-	}
+	}, nil
 }
 
+func loadCompilerProgram(options compilerOptions) (*driver.Program, error) { prog, _, err := driver.LoadProgram(options.cwd, options.tsconfig, driver.LoadProgramOptions{}); return prog, err }
+func runCheck(args []string) int {
+	options, err := readOptions(args); if err != nil { fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err); return 2 }
+	prog, err := loadCompilerProgram(options); if err != nil { fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err); return 2 }; defer prog.Close()
+	if _, _, err = collectProgramCompilation(prog, options, true); err != nil { fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err); return 2 }; return 0
+}
+func runVocabularySync(args []string) int {
+	options, err := readOptions(args); if err != nil { fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err); return 2 }
+	prog, err := loadCompilerProgram(options); if err != nil { fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err); return 2 }; defer prog.Close()
+	_, manifest, err := collectProgramCompilation(prog, options, false); if err != nil { fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err); return 2 }
+	data, err := canonicalManifestBytes(manifest); if err == nil { err = writeManifestAtomic(options.manifestPath, data) }
+	if err != nil { fmt.Fprintf(os.Stderr, "%s: vocabulary sync failed: %v\n", pluginName, err); return 2 }; return 0
+}
 func runTransform(args []string) int {
-	cwd, tsconfig := readFlags(args)
-	prog, _, err := driver.LoadProgram(cwd, tsconfig, driver.LoadProgramOptions{})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err)
-		return 2
-	}
-	defer prog.Close()
-
-	transform := lmaoPluginTransform(prog, cwd)
+	options, err := readOptions(args); if err != nil { fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err); return 2 }
+	prog, err := loadCompilerProgram(options); if err != nil { fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err); return 2 }; defer prog.Close()
+	transform, err := lmaoPluginTransform(prog, options); if err != nil { fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err); return 2 }
 	out := transformResult{TypeScript: map[string]string{}}
-	for _, file := range prog.SourceFiles() {
-		if file == nil || file.IsDeclarationFile {
-			continue
-		}
-		ec := shimprinter.NewEmitContext()
-		result := file
-		if next := transform(ec, result); next != nil {
-			result = next
-		}
-		printer := shimprinter.NewPrinter(shimprinter.PrinterOptions{}, shimprinter.PrintHandlers{}, ec)
-		out.TypeScript[outputKey(cwd, file.FileName())] = shimprinter.EmitSourceFile(printer, result)
-	}
-	data, err := json.Marshal(out)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: marshal failed: %v\n", pluginName, err)
-		return 3
-	}
-	fmt.Println(string(data))
-	return 0
+	for _, file := range prog.SourceFiles() { if file == nil || file.IsDeclarationFile { continue }; ec := shimprinter.NewEmitContext(); result := file; if next := transform(ec, result); next != nil { result = next }; printer := shimprinter.NewPrinter(shimprinter.PrinterOptions{}, shimprinter.PrintHandlers{}, ec); out.TypeScript[outputKey(options.cwd, file.FileName())] = shimprinter.EmitSourceFile(printer, result) }
+	data, err := json.Marshal(out); if err != nil { fmt.Fprintf(os.Stderr, "%s: marshal failed: %v\n", pluginName, err); return 3 }; fmt.Println(string(data)); return 0
 }
-
 func runBuild(args []string) int {
-	cwd, tsconfig := readFlags(args)
-	prog, _, err := driver.LoadProgram(cwd, tsconfig, driver.LoadProgramOptions{})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err)
-		return 2
-	}
-	defer prog.Close()
-
-	emitDiags, err := prog.EmitWithPluginTransformers(
-		[]driver.PluginTransform{lmaoPluginTransform(prog, cwd)}, nil)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: emit failed: %v\n", pluginName, err)
-		return 3
-	}
-	if len(emitDiags) > 0 {
-		for _, d := range emitDiags {
-			fmt.Fprintln(os.Stderr, d.String())
-		}
-		return 2
-	}
-	return 0
+	options, err := readOptions(args); if err != nil { fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err); return 2 }
+	prog, err := loadCompilerProgram(options); if err != nil { fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err); return 2 }; defer prog.Close()
+	transform, err := lmaoPluginTransform(prog, options); if err != nil { fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err); return 2 }
+	emitDiags, err := prog.EmitWithPluginTransformers([]driver.PluginTransform{transform}, nil); if err != nil { fmt.Fprintf(os.Stderr, "%s: emit failed: %v\n", pluginName, err); return 3 }
+	if len(emitDiags) > 0 { for _, d := range emitDiags { fmt.Fprintln(os.Stderr, d.String()) }; return 2 }; return 0
 }
 
 // ---------------------------------------------------------------------------
@@ -240,12 +238,23 @@ type fileTransformer struct {
 	// opSpans is populated with Checker-proved, stable-expression Op calls in
 	// the untouched-tree collect phase. The mutation walk never queries types.
 	opSpans map[*shimast.CallExpression]bool
-	// logTemplateIDs is populated by checker/provenance-gated per-Op analysis
-	// and consumed only after all checker-backed collection has completed.
-	logTemplateIDs map[*shimast.CallExpression]uint16
-	// checker is the program's pinned type checker (nil-safe: tag-chain
-	// inlining is skipped entirely without it).
-	checker *shimchecker.Checker
+	staticLogIDs        map[*shimast.CallExpression]globalVocabularyID
+	staticSpanNameIDs   map[*shimast.CallExpression]globalVocabularyID
+	vocabulary          *programVocabularyCollector
+	vocabularyOrdinals  map[globalVocabularyID]int
+	vocabularyBinding   *shimast.Node
+	checker             *shimchecker.Checker
+}
+
+func (t *fileTransformer) staticVocabularyOperand(id globalVocabularyID) *shimast.Node {
+	if id == 0 || t.vocabularyBinding == nil {
+		panic("static vocabulary operand requested before registration")
+	}
+	ordinal, exists := t.vocabularyOrdinals[id]
+	if !exists {
+		panic("static vocabulary id missing from source-file fragment")
+	}
+	return factory.NewElementAccessExpression(t.vocabularyBinding, nil, num(ordinal), shimast.NodeFlagsNone)
 }
 
 func (t *fileTransformer) walk(node *shimast.Node) {
@@ -389,6 +398,8 @@ func (t *fileTransformer) trySpanRewrite(call *shimast.CallExpression) bool {
 
 	line := t.lineOf(call.AsNode())
 	methodName := fmt.Sprintf("span%d", len(rest))
+	staticID := t.staticSpanNameIDs[call]
+	if staticID != 0 { methodName = fmt.Sprintf("spanStatic%d", len(rest)) }
 	childCtx := callExpr(propAccess(ident("Object"), "create"), []*shimast.Node{recv})
 	var bufferClass, remappedView, opMetadata, fn, runtimeHint *shimast.Node
 	if isPlainFunction {
@@ -404,9 +415,13 @@ func (t *fileTransformer) trySpanRewrite(call *shimast.CallExpression) bool {
 		fn = propAccess(opOrFn, "fn")
 		runtimeHint = propAccess(opOrFn, "runtimeHint")
 	}
-	newArgs := append([]*shimast.Node{
-		num(line), nameArg, childCtx, bufferClass, remappedView, opMetadata, fn,
-	}, rest...)
+	var newArgs []*shimast.Node
+	if staticID != 0 {
+		newArgs = []*shimast.Node{num(line), t.staticVocabularyOperand(staticID), childCtx, bufferClass, remappedView, opMetadata, fn}
+	} else {
+		newArgs = []*shimast.Node{num(line), nameArg, childCtx, bufferClass, remappedView, opMetadata, fn}
+	}
+	newArgs = append(newArgs, rest...)
 	newArgs = append(newArgs, runtimeHint)
 
 	call.Expression = propAccess(recv, methodName)
@@ -458,9 +473,9 @@ func (t *fileTransformer) tryChainLine(call *shimast.CallExpression, methods map
 		}
 	}
 	target, trailing := findChainTarget(call, methods, receiverOK)
-	templateID := uint16(0)
+	templateID := globalVocabularyID(0)
 	if receiverOK != nil {
-		if templateTarget, templateTrailing, id := findTemplateLogInChain(call, t.logTemplateIDs); templateTarget != nil {
+		if templateTarget, templateTrailing, id := findTemplateLogInChain(call, t.staticLogIDs); templateTarget != nil {
 			target, trailing, templateID = templateTarget, templateTrailing, id
 		}
 	}
@@ -473,14 +488,13 @@ func (t *fileTransformer) tryChainLine(call *shimast.CallExpression, methods map
 	}
 	line := t.lineOf(target.AsNode())
 
-	// Build a fresh inner call, substituting the private template entry point
-	// when this exact call was assigned an Op-local ID during collection.
+	// Build a fresh inner call, substituting the private registered entry point.
 	innerExpression := target.Expression
 	innerArguments := target.Arguments
 	if templateID != 0 {
 		pa := target.Expression.AsPropertyAccessExpression()
 		innerExpression = propAccess(pa.Expression, "_"+shimast.NodeText(pa.Name())+"Template")
-		innerArguments = factory.NewNodeList([]*shimast.Node{num(int(templateID))})
+		innerArguments = factory.NewNodeList([]*shimast.Node{t.staticVocabularyOperand(templateID)})
 	}
 	inner := factory.NewCallExpression(
 		innerExpression, nil, target.TypeArguments, innerArguments, shimast.NodeFlagsNone,
@@ -504,7 +518,7 @@ func (t *fileTransformer) tryChainLine(call *shimast.CallExpression, methods map
 
 // findTemplateLogInChain locates a previously analyzed literal call while
 // preserving the same receiver-to-outer fluent link order as findChainTarget.
-func findTemplateLogInChain(call *shimast.CallExpression, ids map[*shimast.CallExpression]uint16) (*shimast.CallExpression, []chainLink, uint16) {
+func findTemplateLogInChain(call *shimast.CallExpression, ids map[*shimast.CallExpression]globalVocabularyID) (*shimast.CallExpression, []chainLink, globalVocabularyID) {
 	var trailing []chainLink
 	current := call
 	for {
