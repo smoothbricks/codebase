@@ -11,6 +11,7 @@ interface CliOptions {
   quick: boolean;
   offOutput?: string;
   onOutput?: string;
+  abbaOutputDir?: string;
 }
 
 interface SemanticOutput {
@@ -28,10 +29,16 @@ function parseCli(argv: readonly string[]): CliOptions {
     else if (argument.startsWith('--off-output=')) options.offOutput = argument.slice('--off-output='.length);
     else if (argument === '--on-output') options.onOutput = argv[++index];
     else if (argument.startsWith('--on-output=')) options.onOutput = argument.slice('--on-output='.length);
-    else throw new Error(`Unknown argument: ${argument}`);
+    else if (argument === '--abba-output-dir') options.abbaOutputDir = argv[++index];
+    else if (argument.startsWith('--abba-output-dir=')) {
+      options.abbaOutputDir = argument.slice('--abba-output-dir='.length);
+    } else throw new Error(`Unknown argument: ${argument}`);
   }
-  if (argv.at(-1) === '--off-output' || argv.at(-1) === '--on-output') {
+  if (argv.at(-1) === '--off-output' || argv.at(-1) === '--on-output' || argv.at(-1) === '--abba-output-dir') {
     throw new Error('Output path option requires a path');
+  }
+  if (options.abbaOutputDir && (options.offOutput || options.onOutput)) {
+    throw new Error('--abba-output-dir cannot be combined with --off-output or --on-output');
   }
   return options;
 }
@@ -80,23 +87,34 @@ async function assertTransformProof(offEntrypoint: string, onEntrypoint: string)
   const registrationSignature = /registerLmaoVocabulary\w*\(\{/g;
   const offRuntimeHints = offSource.match(runtimeHintSignature)?.length ?? 0;
   const onRuntimeHints = onSource.match(runtimeHintSignature)?.length ?? 0;
+  const onRuntimeHintValues = Array.from(onSource.matchAll(/runtimeHint:\s*(\d+)/g), (match) => Number(match[1]));
   const offDenseHeaders = offSource.match(denseHeaderSignature)?.length ?? 0;
   const onDenseHeaders = onSource.match(denseHeaderSignature)?.length ?? 0;
   const offRegistrations = offSource.match(registrationSignature)?.length ?? 0;
   const onRegistrations = onSource.match(registrationSignature)?.length ?? 0;
   if (
     offRuntimeHints !== 0 ||
-    onRuntimeHints !== 1 ||
+    onRuntimeHints !== 2 ||
+    onRuntimeHintValues[0] !== 194183232 ||
+    onRuntimeHintValues[1] !== 0 ||
     offDenseHeaders !== 0 ||
     onDenseHeaders === 0 ||
     offRegistrations !== 0 ||
     onRegistrations !== 1
   ) {
     throw new Error(
-      `Plugin transform proof failed: expected OFF runtime/dense/registration=0/0/0 and ON=1/>0/1; received OFF=${offRuntimeHints}/${offDenseHeaders}/${offRegistrations}, ON=${onRuntimeHints}/${onDenseHeaders}/${onRegistrations}`,
+      `Plugin transform proof failed: expected OFF runtime/dense/registration=0/0/0 and ON hints=194183232,0/dense>0/registration=1; received OFF=${offRuntimeHints}/${offDenseHeaders}/${offRegistrations}, ON hints=${onRuntimeHintValues.join(',')}/dense=${onDenseHeaders}/registration=${onRegistrations}`,
     );
   }
-  return { offRuntimeHints, onRuntimeHints, offDenseHeaders, onDenseHeaders, offRegistrations, onRegistrations };
+  return {
+    offRuntimeHints,
+    onRuntimeHints,
+    onRuntimeHint: onRuntimeHintValues.join(','),
+    offDenseHeaders,
+    onDenseHeaders,
+    offRegistrations,
+    onRegistrations,
+  };
 }
 
 async function runProcess(entrypoint: string, args: readonly string[]): Promise<string> {
@@ -197,17 +215,34 @@ try {
   }
 
   const benchmarkArgs = cli.quick ? ['--benchmark', '--quick'] : ['--benchmark'];
-  const [offJson, onJson] = await Promise.all([
-    runProcess(offEntrypoint, benchmarkArgs),
-    runProcess(onEntrypoint, benchmarkArgs),
-  ]);
-  parseJson<unknown>('OFF', 'Mitata benchmark', offJson);
-  parseJson<unknown>('ON', 'Mitata benchmark', onJson);
-  await Promise.all([persist(cli.offOutput, offJson), persist(cli.onOutput, onJson)]);
+  if (cli.abbaOutputDir) {
+    const outputDir = resolve(cli.abbaOutputDir);
+    await mkdir(outputDir, { recursive: true });
+    const positions = [
+      ['OFF', offEntrypoint, 'off-pos1.json'],
+      ['ON', onEntrypoint, 'on-pos2.json'],
+      ['ON', onEntrypoint, 'on-pos1.json'],
+      ['OFF', offEntrypoint, 'off-pos2.json'],
+    ] as const;
+    for (const [variant, entrypoint, filename] of positions) {
+      const json = await runProcess(entrypoint, benchmarkArgs);
+      parseJson<unknown>(variant, `Mitata benchmark ${filename}`, json);
+      await persist(join(outputDir, filename), json);
+    }
+  } else {
+    const [offJson, onJson] = await Promise.all([
+      runProcess(offEntrypoint, benchmarkArgs),
+      runProcess(onEntrypoint, benchmarkArgs),
+    ]);
+    parseJson<unknown>('OFF', 'Mitata benchmark', offJson);
+    parseJson<unknown>('ON', 'Mitata benchmark', onJson);
+    await Promise.all([persist(cli.offOutput, offJson), persist(cli.onOutput, onJson)]);
+  }
 
   process.stderr.write(
-    `transform proof: OFF runtime/dense/registration=${transformProof.offRuntimeHints}/${transformProof.offDenseHeaders}/${transformProof.offRegistrations}, ON=${transformProof.onRuntimeHints}/${transformProof.onDenseHeaders}/${transformProof.onRegistrations}\n` +
+    `transform proof: OFF runtime/dense/registration=${transformProof.offRuntimeHints}/${transformProof.offDenseHeaders}/${transformProof.offRegistrations}, ON hint=${transformProof.onRuntimeHint}/dense=${transformProof.onDenseHeaders}/registration=${transformProof.onRegistrations}\n` +
       `semantic parity: ${offSemantic.checksum} (${offSemantic.rowCount} decoded Arrow rows)\n` +
+      `${cli.abbaOutputDir ? `ABBA Mitata JSON directory: ${resolve(cli.abbaOutputDir)}\n` : ''}` +
       `${cli.offOutput ? `OFF Mitata JSON: ${resolve(cli.offOutput)}\n` : ''}` +
       `${cli.onOutput ? `ON Mitata JSON: ${resolve(cli.onOutput)}\n` : ''}`,
   );
