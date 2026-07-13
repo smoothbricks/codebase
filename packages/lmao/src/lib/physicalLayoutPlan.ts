@@ -7,6 +7,7 @@ import {
 } from './codegen/fixedPositionWriterGenerator.js';
 import { createSpanLoggerClass, type SpanLoggerImpl } from './codegen/spanLoggerGenerator.js';
 import type { RemapDescriptor } from './logBinding.js';
+import type { OpContext } from './opContext/types.js';
 import {
   isRuntimeHintAnalyzed,
   RUNTIME_HINT_CAPABILITIES_MASK,
@@ -16,11 +17,13 @@ import {
 import type { LogSchema } from './schema/LogSchema.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
 import type { AnySpanBuffer, SpanBuffer } from './types.js';
+import type { SpanContextClass } from './spanContext.js';
 
 export const PHYSICAL_LAYOUT_VERSION = 1;
 
 /** Concrete backends may bind the same physical schema to distinct immutable plans. */
 export type PhysicalBackendKind = 'strategy-selected' | 'js-heap' | 'wasm';
+
 
 export interface PhysicalClock {
   readonly kind: 'trace-root';
@@ -33,7 +36,10 @@ export interface PhysicalAppenders {
   writeLogEntry(buffer: AnySpanBuffer, entryType: number): number;
 }
 
-export interface PhysicalLayoutPlan<T extends LogSchema = LogSchema> {
+export interface PhysicalLayoutPlan<
+  T extends LogSchema = LogSchema,
+  Ctx extends OpContext<T> = OpContext<T>,
+> {
   readonly version: typeof PHYSICAL_LAYOUT_VERSION;
   readonly backendKind: PhysicalBackendKind;
   readonly schema: T;
@@ -41,6 +47,10 @@ export interface PhysicalLayoutPlan<T extends LogSchema = LogSchema> {
   readonly capabilities: number;
   /** Fixed transformer tier, or undefined to retain adaptive strategy capacity. */
   readonly capacityTier: number | undefined;
+  /** Canonical user-context key layout used by the generated context constructor. */
+  readonly contextLayoutKey: string;
+  /** Exact constructor selected at startup for this plan's capability/layout signature. */
+  readonly SpanContextClass: SpanContextClass<Ctx>;
   readonly SpanBufferClass: SpanBufferConstructor<T>;
   readonly SpanLoggerClass: new (buffer: AnySpanBuffer) => SpanLoggerImpl<T>;
   readonly TagWriterClass: new (buffer: AnySpanBuffer) => TagWriter<T>;
@@ -82,11 +92,14 @@ const TRACE_ROOT_APPENDERS: PhysicalAppenders = Object.freeze({
 const basePlans = new WeakMap<LogSchema, Map<string, object>>();
 const remappedPlans = new WeakMap<object, WeakMap<RemapDescriptor, object>>();
 
-function createBasePlan<T extends LogSchema>(
+
+function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
   SpanBufferClass: SpanBufferConstructor<T>,
   runtimeHint: number,
   backendKind: PhysicalBackendKind,
-): PhysicalLayoutPlan<T> {
+  SpanContextClass: SpanContextClass<Ctx>,
+  contextLayoutKey: string,
+): PhysicalLayoutPlan<T, Ctx> {
   const schema = SpanBufferClass.schema;
   const SpanLoggerClass = createSpanLoggerClass(schema);
   const TagWriterClass = getTagWriterClass(schema);
@@ -100,6 +113,8 @@ function createBasePlan<T extends LogSchema>(
     capabilities: isRuntimeHintAnalyzed(runtimeHint)
       ? runtimeHint & RUNTIME_HINT_CAPABILITIES_MASK
       : RUNTIME_HINT_FULL_CAPABILITIES,
+    contextLayoutKey,
+    SpanContextClass,
     capacityTier: runtimeHintInitialCapacity(runtimeHint),
     SpanBufferClass,
     SpanLoggerClass,
@@ -119,12 +134,14 @@ function createBasePlan<T extends LogSchema>(
   });
 }
 
-export function getPhysicalLayoutPlan<T extends LogSchema>(
+export function getPhysicalLayoutPlan<T extends LogSchema, Ctx extends OpContext<T>>(
   SpanBufferClass: SpanBufferConstructor<T>,
-  runtimeHint = 0,
+  runtimeHint: number,
+  SpanContextClass: SpanContextClass<Ctx>,
   remapDescriptor?: RemapDescriptor,
   backendKind: PhysicalBackendKind = 'strategy-selected',
-): PhysicalLayoutPlan<T> {
+  contextLayoutKey = '',
+): PhysicalLayoutPlan<T, Ctx> {
   const schema = SpanBufferClass.schema;
   let byKey = basePlans.get(schema);
   if (!byKey) {
@@ -132,15 +149,16 @@ export function getPhysicalLayoutPlan<T extends LogSchema>(
     basePlans.set(schema, byKey);
   }
 
-  const key = `${PHYSICAL_LAYOUT_VERSION}:${backendKind}:${runtimeHint}`;
-  let base = byKey.get(key) as PhysicalLayoutPlan<T> | undefined;
+  const key = `${PHYSICAL_LAYOUT_VERSION}:${backendKind}:${runtimeHint}:${contextLayoutKey}`;
+  let base = byKey.get(key) as PhysicalLayoutPlan<T, Ctx> | undefined;
   if (!base) {
-    base = createBasePlan(SpanBufferClass, runtimeHint, backendKind);
+    base = createBasePlan(SpanBufferClass, runtimeHint, backendKind, SpanContextClass, contextLayoutKey);
     byKey.set(key, base);
   } else if (base.SpanBufferClass !== SpanBufferClass) {
     throw new TypeError('Physical layout cache key resolved to a different SpanBuffer constructor');
+  } else if (base.SpanContextClass !== SpanContextClass) {
+    throw new TypeError('Physical layout cache key resolved to a different SpanContext constructor');
   }
-
   if (!remapDescriptor) return base;
 
   let bindings = remappedPlans.get(base);
@@ -148,10 +166,10 @@ export function getPhysicalLayoutPlan<T extends LogSchema>(
     bindings = new WeakMap();
     remappedPlans.set(base, bindings);
   }
-  const cached = bindings.get(remapDescriptor) as PhysicalLayoutPlan<T> | undefined;
+  const cached = bindings.get(remapDescriptor) as PhysicalLayoutPlan<T, Ctx> | undefined;
   if (cached) return cached;
 
-  const bound: PhysicalLayoutPlan<T> = Object.freeze({
+  const bound: PhysicalLayoutPlan<T, Ctx> = Object.freeze({
     ...base,
     remapDescriptor,
   });
