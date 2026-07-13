@@ -117,6 +117,12 @@ pub enum ApfsCaseSensitivity {
     Insensitive,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImageFormatSelection {
+    Auto,
+    Exact(ImageFormat),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateImageRequest {
     /// Staged path without an image extension, e.g. `.staging/main`.
@@ -125,6 +131,7 @@ pub struct CreateImageRequest {
     pub capacity: String,
     pub volume_name: String,
     pub case_sensitivity: ApfsCaseSensitivity,
+    pub image_format: ImageFormatSelection,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -233,6 +240,10 @@ pub enum ApfsError {
     },
     InvalidStagedStem(PathBuf),
     InvalidCreateRequest(&'static str),
+    UnsupportedOperation {
+        operation: &'static str,
+        format: ImageFormat,
+    },
     CommandSpawn(CommandRunError),
     CommandFailed {
         operation: &'static str,
@@ -273,6 +284,9 @@ impl fmt::Display for ApfsError {
                 path.display()
             ),
             Self::InvalidCreateRequest(message) => f.write_str(message),
+            Self::UnsupportedOperation { operation, format } => {
+                write!(f, "{operation} is not supported for {format:?} images")
+            }
             Self::CommandSpawn(error) => error.fmt(f),
             Self::CommandFailed {
                 operation, output, ..
@@ -334,6 +348,7 @@ impl From<CloneFileError> for ApfsError {
 
 pub trait ApfsBackend {
     fn create_staged_image(&self, request: &CreateImageRequest) -> Result<CreatedImage, ApfsError>;
+    fn compact_image(&self, image: &Path, format: ImageFormat) -> Result<(), ApfsError>;
     fn sync_for_freshness(&self) -> Result<(), ApfsError>;
     fn clone_image(
         &self,
@@ -539,50 +554,103 @@ impl<R: CommandRunner> ApfsBackend for MacOsApfsBackend<R> {
                 "volume name must not be empty",
             ));
         }
+        if request.image_format == ImageFormatSelection::Exact(ImageFormat::Asif)
+            && request.case_sensitivity == ApfsCaseSensitivity::Sensitive
+        {
+            return Err(ApfsError::InvalidCreateRequest(
+                "ASIF creation cannot request case-sensitive APFS",
+            ));
+        }
 
-        let asif_path = request
-            .staged_stem
-            .with_extension(ImageFormat::Asif.extension());
-        let sparse_path = request
-            .staged_stem
-            .with_extension(ImageFormat::Sparse.extension());
-        validate_image_path(&asif_path, ImageFormat::Asif)?;
-        validate_image_path(&sparse_path, ImageFormat::Sparse)?;
-
-        // diskutil's blank-image API cannot request case-sensitive APFS. Preserve
-        // repository case behavior by selecting SPARSE for that case.
-        let try_asif = request.case_sensitivity == ApfsCaseSensitivity::Insensitive
-            && self.macos_major_version()? >= 26;
-        if try_asif {
-            match self.create_asif(&asif_path, request) {
-                Ok(()) => {
-                    return Ok(CreatedImage {
-                        path: asif_path,
-                        format: ImageFormat::Asif,
-                    });
-                }
-                Err(ApfsError::CommandFailed {
-                    operation,
-                    request: command,
-                    output,
-                }) if asif_is_unsupported(&output) => {
-                    if asif_path.exists() {
-                        fs::remove_file(&asif_path).map_err(|source| ApfsError::FileOperation {
-                            operation: "remove unsupported ASIF artifact",
-                            path: asif_path.clone(),
-                            source,
-                        })?;
+        match request.image_format {
+            ImageFormatSelection::Auto => {
+                // diskutil's blank-image API cannot request case-sensitive APFS. Preserve
+                // repository case behavior by selecting SPARSE for that case.
+                let try_asif = request.case_sensitivity == ApfsCaseSensitivity::Insensitive
+                    && self.macos_major_version()? >= 26;
+                if try_asif {
+                    let asif_path = request
+                        .staged_stem
+                        .with_extension(ImageFormat::Asif.extension());
+                    match self.create_asif(&asif_path, request) {
+                        Ok(()) => {
+                            return Ok(CreatedImage {
+                                path: asif_path,
+                                format: ImageFormat::Asif,
+                            });
+                        }
+                        Err(ApfsError::CommandFailed {
+                            operation,
+                            request: command,
+                            output,
+                        }) if asif_is_unsupported(&output) => {
+                            if asif_path.exists() {
+                                fs::remove_file(&asif_path).map_err(|source| {
+                                    ApfsError::FileOperation {
+                                        operation: "remove unsupported ASIF artifact",
+                                        path: asif_path,
+                                        source,
+                                    }
+                                })?;
+                            }
+                            let _ = (operation, command);
+                        }
+                        Err(error) => return Err(error),
                     }
-                    let _ = (operation, command);
                 }
-                Err(error) => return Err(error),
+
+                let path = request
+                    .staged_stem
+                    .with_extension(ImageFormat::Sparse.extension());
+                self.create_sparse(&path, request)?;
+                Ok(CreatedImage {
+                    path,
+                    format: ImageFormat::Sparse,
+                })
+            }
+            ImageFormatSelection::Exact(ImageFormat::Asif) => {
+                let path = request
+                    .staged_stem
+                    .with_extension(ImageFormat::Asif.extension());
+                self.create_asif(&path, request)?;
+                Ok(CreatedImage {
+                    path,
+                    format: ImageFormat::Asif,
+                })
+            }
+            ImageFormatSelection::Exact(ImageFormat::Sparse) => {
+                let path = request
+                    .staged_stem
+                    .with_extension(ImageFormat::Sparse.extension());
+                self.create_sparse(&path, request)?;
+                Ok(CreatedImage {
+                    path,
+                    format: ImageFormat::Sparse,
+                })
             }
         }
-        self.create_sparse(&sparse_path, request)?;
-        Ok(CreatedImage {
-            path: sparse_path,
-            format: ImageFormat::Sparse,
-        })
+    }
+
+    fn compact_image(&self, image: &Path, format: ImageFormat) -> Result<(), ApfsError> {
+        if format == ImageFormat::Asif {
+            return Err(ApfsError::UnsupportedOperation {
+                operation: "compact image",
+                format,
+            });
+        }
+        validate_image_path(image, format)?;
+        self.run_checked(
+            "compact SPARSE image",
+            CommandRequest::new(
+                HDIUTIL,
+                [
+                    OsString::from("compact"),
+                    OsString::from("-quiet"),
+                    image.as_os_str().to_owned(),
+                ],
+            ),
+        )
+        .map(|_| ())
     }
 
     fn sync_for_freshness(&self) -> Result<(), ApfsError> {
@@ -1097,11 +1165,9 @@ mod tests {
         assert_eq!(requests[1].program, Path::new(FSCK_APFS));
         assert_eq!(requests[2].program, Path::new(DISKUTIL));
         assert_eq!(argv(&requests[2]), ["eject", "/dev/disk10"]);
-        assert!(
-            !requests
-                .iter()
-                .any(|request| argv(request).first().is_some_and(|arg| arg == "mount"))
-        );
+        assert!(!requests
+            .iter()
+            .any(|request| argv(request).first().is_some_and(|arg| arg == "mount")));
     }
 
     #[test]
@@ -1117,6 +1183,7 @@ mod tests {
                 capacity: "100g".into(),
                 volume_name: "cowshed.owner--repo.main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
+                image_format: ImageFormatSelection::Auto,
             })
             .unwrap();
         assert_eq!(
@@ -1139,6 +1206,341 @@ mod tests {
     }
 
     #[test]
+    fn auto_tahoe_create_records_asif_command_and_extension() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success("26.0\n"),
+            CommandOutput::success([]),
+        ]));
+        let created = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: PathBuf::from(".staging/auto"),
+                capacity: "5g".into(),
+                volume_name: "main".into(),
+                case_sensitivity: ApfsCaseSensitivity::Insensitive,
+                image_format: ImageFormatSelection::Auto,
+            })
+            .unwrap();
+
+        assert_eq!(
+            created,
+            CreatedImage {
+                path: PathBuf::from(".staging/auto.asif"),
+                format: ImageFormat::Asif,
+            }
+        );
+        let requests = backend.runner().requests();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.program.as_path())
+                .collect::<Vec<_>>(),
+            [Path::new(SW_VERS), Path::new(DISKUTIL)]
+        );
+        assert_eq!(
+            argv(&requests[1]),
+            [
+                "image",
+                "create",
+                "blank",
+                "--format",
+                "ASIF",
+                "--size",
+                "5g",
+                "--volumeName",
+                "main",
+                "--fs",
+                "APFS",
+                ".staging/auto.asif",
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_case_sensitive_create_records_only_sparse_command() {
+        let backend =
+            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success([])]));
+        let created = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: PathBuf::from(".staging/sensitive"),
+                capacity: "8g".into(),
+                volume_name: "main".into(),
+                case_sensitivity: ApfsCaseSensitivity::Sensitive,
+                image_format: ImageFormatSelection::Auto,
+            })
+            .unwrap();
+
+        assert_eq!(
+            created,
+            CreatedImage {
+                path: PathBuf::from(".staging/sensitive.sparseimage"),
+                format: ImageFormat::Sparse,
+            }
+        );
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].program, Path::new(HDIUTIL));
+        assert_eq!(
+            argv(&requests[0]),
+            [
+                "create",
+                "-quiet",
+                "-size",
+                "8g",
+                "-type",
+                "SPARSE",
+                "-fs",
+                "Case-sensitive APFS",
+                "-volname",
+                "main",
+                "-nospotlight",
+                ".staging/sensitive.sparseimage",
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_asif_records_only_diskutil_command_and_extension() {
+        let backend =
+            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success([])]));
+        let created = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: PathBuf::from(".staging/exact"),
+                capacity: "5g".into(),
+                volume_name: "main".into(),
+                case_sensitivity: ApfsCaseSensitivity::Insensitive,
+                image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
+            })
+            .unwrap();
+
+        assert_eq!(
+            created,
+            CreatedImage {
+                path: PathBuf::from(".staging/exact.asif"),
+                format: ImageFormat::Asif,
+            }
+        );
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].program, Path::new(DISKUTIL));
+        assert_eq!(
+            argv(&requests[0]),
+            [
+                "image",
+                "create",
+                "blank",
+                "--format",
+                "ASIF",
+                "--size",
+                "5g",
+                "--volumeName",
+                "main",
+                "--fs",
+                "APFS",
+                ".staging/exact.asif",
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_sparse_records_only_hdiutil_command_and_extension() {
+        let backend =
+            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success([])]));
+        let created = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: PathBuf::from(".staging/exact"),
+                capacity: "8g".into(),
+                volume_name: "main".into(),
+                case_sensitivity: ApfsCaseSensitivity::Sensitive,
+                image_format: ImageFormatSelection::Exact(ImageFormat::Sparse),
+            })
+            .unwrap();
+
+        assert_eq!(
+            created,
+            CreatedImage {
+                path: PathBuf::from(".staging/exact.sparseimage"),
+                format: ImageFormat::Sparse,
+            }
+        );
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].program, Path::new(HDIUTIL));
+        assert_eq!(
+            argv(&requests[0]),
+            [
+                "create",
+                "-quiet",
+                "-size",
+                "8g",
+                "-type",
+                "SPARSE",
+                "-fs",
+                "Case-sensitive APFS",
+                "-volname",
+                "main",
+                "-nospotlight",
+                ".staging/exact.sparseimage",
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_asif_unsupported_failure_never_falls_back() {
+        let backend =
+            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::failure(
+                1,
+                "ASIF format is not supported",
+            )]));
+        let error = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: PathBuf::from(".staging/exact"),
+                capacity: "5g".into(),
+                volume_name: "main".into(),
+                case_sensitivity: ApfsCaseSensitivity::Insensitive,
+                image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApfsError::CommandFailed {
+                operation: "create ASIF image",
+                output: CommandOutput { status: 1, .. },
+                ..
+            }
+        ));
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].program, Path::new(DISKUTIL));
+    }
+
+    #[test]
+    fn exact_sparse_failure_never_probes_or_falls_back() {
+        let backend =
+            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::failure(
+                9,
+                "create failed",
+            )]));
+        let error = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: PathBuf::from(".staging/exact"),
+                capacity: "5g".into(),
+                volume_name: "main".into(),
+                case_sensitivity: ApfsCaseSensitivity::Insensitive,
+                image_format: ImageFormatSelection::Exact(ImageFormat::Sparse),
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApfsError::CommandFailed {
+                operation: "create SPARSE image",
+                output: CommandOutput { status: 9, .. },
+                ..
+            }
+        ));
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].program, Path::new(HDIUTIL));
+    }
+
+    #[test]
+    fn exact_asif_rejects_case_sensitive_creation_without_spawning() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::default());
+        let error = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: PathBuf::from(".staging/exact"),
+                capacity: "5g".into(),
+                volume_name: "main".into(),
+                case_sensitivity: ApfsCaseSensitivity::Sensitive,
+                image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApfsError::InvalidCreateRequest("ASIF creation cannot request case-sensitive APFS")
+        ));
+        assert!(backend.runner().requests().is_empty());
+    }
+
+    #[test]
+    fn sparse_compaction_records_checked_hdiutil_command() {
+        let backend =
+            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success([])]));
+        backend
+            .compact_image(Path::new("main.sparseimage"), ImageFormat::Sparse)
+            .unwrap();
+
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].program, Path::new(HDIUTIL));
+        assert_eq!(
+            argv(&requests[0]),
+            ["compact", "-quiet", "main.sparseimage"]
+        );
+    }
+
+    #[test]
+    fn sparse_compaction_validates_extension_before_spawning() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::default());
+        let error = backend
+            .compact_image(Path::new("main.asif"), ImageFormat::Sparse)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApfsError::InvalidImagePath { path, format }
+                if path == Path::new("main.asif") && format == ImageFormat::Sparse
+        ));
+        assert!(backend.runner().requests().is_empty());
+    }
+
+    #[test]
+    fn asif_compaction_is_typed_unsupported_before_validation_or_spawn() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::default());
+        let error = backend
+            .compact_image(Path::new("wrong.sparseimage"), ImageFormat::Asif)
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "compact image is not supported for Asif images"
+        );
+        assert!(matches!(
+            error,
+            ApfsError::UnsupportedOperation {
+                operation: "compact image",
+                format: ImageFormat::Asif,
+            }
+        ));
+        assert!(backend.runner().requests().is_empty());
+    }
+
+    #[test]
+    fn sparse_compaction_propagates_checked_command_failure() {
+        let backend =
+            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::failure(
+                9,
+                "compact failed",
+            )]));
+        let error = backend
+            .compact_image(Path::new("main.sparseimage"), ImageFormat::Sparse)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApfsError::CommandFailed {
+                operation: "compact SPARSE image",
+                request,
+                output: CommandOutput { status: 9, .. },
+            } if request.program == Path::new(HDIUTIL)
+                && argv(&request) == ["compact", "-quiet", "main.sparseimage"]
+        ));
+        assert_eq!(backend.runner().requests().len(), 1);
+    }
+
+    #[test]
     fn pre_tahoe_create_selects_sparse_without_asif_request() {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success("15.6\n"),
@@ -1150,6 +1552,7 @@ mod tests {
                 capacity: "100g".into(),
                 volume_name: "cowshed.owner--repo.main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
+                image_format: ImageFormatSelection::Auto,
             })
             .unwrap();
         assert_eq!(created.format, ImageFormat::Sparse);
@@ -1197,6 +1600,7 @@ mod tests {
                 capacity: "100g".into(),
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
+                image_format: ImageFormatSelection::Auto,
             })
             .unwrap_err();
         assert!(matches!(
@@ -1234,6 +1638,7 @@ mod tests {
                 capacity: "1g".into(),
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
+                image_format: ImageFormatSelection::Auto,
             })
             .unwrap();
         assert_eq!(created.format, ImageFormat::Sparse);
