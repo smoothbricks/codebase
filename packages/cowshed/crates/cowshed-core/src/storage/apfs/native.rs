@@ -82,7 +82,7 @@ fn should_retry_lock(kind: io::ErrorKind) -> bool {
 }
 
 pub struct ImageLockGuard {
-    files: Vec<File>,
+    _files: Vec<File>,
 }
 
 fn path_component(value: &std::ffi::OsStr, path: &Path) -> Result<CString, ApfsStorageError> {
@@ -200,7 +200,7 @@ fn acquire_image_locks(
             return Err(io_error("acquire lifecycle lock", &path, error));
         }
     }
-    Ok(Some(ImageLockGuard { files }))
+    Ok(Some(ImageLockGuard { _files: files }))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1263,12 +1263,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     .map_err(|error| io_error("read checkpoint age", &image, error))?;
                 checkpoints.push((modified, image, format, fact));
             }
-            checkpoints.sort_by(|left, right| {
-                right
-                    .0
-                    .cmp(&left.0)
-                    .then_with(|| right.1.cmp(&left.1))
-            });
+            checkpoints
+                .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
             for (index, (modified, image, format, fact)) in checkpoints.into_iter().enumerate() {
                 report.examined += 1;
                 if fact.pin == "pinned" {
@@ -2669,7 +2665,10 @@ where
         for owner in directory_children(&config.store_root)? {
             if owner == config.caches_root
                 || owner.file_name().is_some_and(|name| {
-                    matches!(name.to_str(), Some("mnt" | "caches" | "gateway" | "telemetry" | "run"))
+                    matches!(
+                        name.to_str(),
+                        Some("mnt" | "caches" | "gateway" | "telemetry" | "run")
+                    )
                 })
             {
                 continue;

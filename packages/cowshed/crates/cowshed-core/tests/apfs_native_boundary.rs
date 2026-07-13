@@ -10,11 +10,10 @@ use cowshed_core::apfs::{
     CreateImageRequest, ImageFormatSelection,
 };
 use cowshed_core::metadata::{
-    sidecar_path, DetachedWorkspaceMetadata, GrantSet, ImageFormat, Platform, PortBlock,
-    WorkspaceIncarnation, WorkspaceName, WorkspaceRole, METADATA_VERSION,
+    DetachedWorkspaceMetadata, GrantSet, ImageFormat, METADATA_VERSION, Platform, PortBlock,
+    WorkspaceIncarnation, WorkspaceName, WorkspaceRole, sidecar_path,
 };
 use cowshed_core::repository::RepoId;
-use cowshed_core::storage::{CheckpointLabel, StorageLayout};
 use cowshed_core::storage::apfs::native::{
     KernelMountSnapshot, KernelMountSource, MacOsApfsExecutionHost, RecoveryMarkerSource,
     RestoreFailpoint, SystemKernelMountSource,
@@ -26,6 +25,7 @@ use cowshed_core::storage::apfs::{
 use cowshed_core::storage::lifecycle::{
     ExpectedState, LifecycleWorkspace, OperationIdentity, Pin, Revision,
 };
+use cowshed_core::storage::{CheckpointLabel, StorageLayout};
 const ATTACH_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
 <dict><key>content-hint</key><string>GUID_partition_scheme</string><key>dev-entry</key><string>/dev/disk9</string></dict>
 <dict><key>content-hint</key><string>Apple_APFS</string><key>dev-entry</key><string>/dev/disk9s2</string></dict>
@@ -330,9 +330,8 @@ fn set_modified(path: &Path, seconds_since_epoch: u64) {
         .open(path)
         .expect("open image for timestamp");
     file.set_times(
-        FileTimes::new().set_modified(
-            SystemTime::UNIX_EPOCH + Duration::from_secs(seconds_since_epoch),
-        ),
+        FileTimes::new()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds_since_epoch)),
     )
     .expect("set image timestamp");
 }
@@ -808,11 +807,12 @@ fn canonical_identity_mismatches_are_rejected_one_dimension_at_a_time() {
             .expect("mismatched metadata");
         let host = native_host(&fixture, RecordingRunner::default());
 
-        assert!(host
-            .list(&repo())
-            .expect_err("identity mismatch")
-            .to_string()
-            .contains("detached metadata identity mismatch"));
+        assert!(
+            host.list(&repo())
+                .expect_err("identity mismatch")
+                .to_string()
+                .contains("detached metadata identity mismatch")
+        );
     }
 }
 
@@ -952,8 +952,14 @@ fn checkpoint_gc_reclaims_only_expired_automatic_regular_files_and_sidecars() {
     assert!(newest_five.iter().all(|image| image.exists()));
     assert!(young.exists(), "young automatic checkpoint must survive");
     assert!(pinned.exists(), "old pinned checkpoint must survive");
-    assert!(!expired.exists(), "expired automatic checkpoint is reclaimed");
-    assert!(!sidecar_path(&expired).exists(), "grants sidecar is reclaimed");
+    assert!(
+        !expired.exists(),
+        "expired automatic checkpoint is reclaimed"
+    );
+    assert!(
+        !sidecar_path(&expired).exists(),
+        "grants sidecar is reclaimed"
+    );
     assert!(
         !checkpoint_fact_path(&expired).exists(),
         "checkpoint fact sidecar is reclaimed"
@@ -1009,9 +1015,10 @@ fn stats_distinguish_a_missing_checkpoint_directory_from_an_invalid_one() {
     let checkpoint_path = layout.project().checkpoints.join("main");
     std::fs::create_dir_all(checkpoint_path.parent().expect("parent")).expect("parent");
     std::fs::write(&checkpoint_path, b"not a directory").expect("checkpoint file");
-    assert!(host
-        .stats(&workspace(ImageFormat::Sparse), canonical.image())
-        .is_err());
+    assert!(
+        host.stats(&workspace(ImageFormat::Sparse), canonical.image())
+            .is_err()
+    );
 }
 
 #[cfg(unix)]
@@ -1024,11 +1031,12 @@ fn chown_rejects_a_nul_path_before_the_native_call() {
     host.chown_volume_root(&fixture.root)
         .expect("chown owned directory to current user");
     let invalid = PathBuf::from(std::ffi::OsString::from_vec(b"invalid\0path".to_vec()));
-    assert!(host
-        .chown_volume_root(&invalid)
-        .expect_err("NUL path")
-        .to_string()
-        .contains("contains NUL"));
+    assert!(
+        host.chown_volume_root(&invalid)
+            .expect_err("NUL path")
+            .to_string()
+            .contains("contains NUL")
+    );
 }
 
 #[test]
@@ -1064,9 +1072,10 @@ fn sidecar_removal_does_not_hide_non_file_errors() {
     std::fs::create_dir_all(sidecar_path(image.image())).expect("sidecar directory");
     let host = native_host(&fixture, RecordingRunner::default());
 
-    assert!(host
-        .reclaim_image(image.image(), ImageFormat::Sparse)
-        .is_err());
+    assert!(
+        host.reclaim_image(image.image(), ImageFormat::Sparse)
+            .is_err()
+    );
 }
 
 #[test]
@@ -1180,11 +1189,12 @@ fn session_identity_mismatches_are_rejected_one_dimension_at_a_time() {
             .expect("mismatched sidecar");
         let host = native_host(&fixture, RecordingRunner::default());
 
-        assert!(host
-            .list(&repo())
-            .expect_err("session identity mismatch")
-            .to_string()
-            .contains("detached metadata identity mismatch"));
+        assert!(
+            host.list(&repo())
+                .expect_err("session identity mismatch")
+                .to_string()
+                .contains("detached metadata identity mismatch")
+        );
     }
 }
 
@@ -1233,11 +1243,13 @@ fn kernel_mount_facts_survive_host_restart_and_prevent_detached_compaction() {
         restarted.mounts(&repo()).expect("restart facts")[0].mount_id,
         42
     );
-    assert!(restarted
-        .compact(canonical.image(), ImageFormat::Sparse)
-        .expect_err("kernel-mounted image must not compact")
-        .to_string()
-        .contains("cannot compact mounted image"));
+    assert!(
+        restarted
+            .compact(canonical.image(), ImageFormat::Sparse)
+            .expect_err("kernel-mounted image must not compact")
+            .to_string()
+            .contains("cannot compact mounted image")
+    );
     let requests = runner.requests();
     assert_eq!(requests.len(), 2);
     assert!(requests.iter().all(|request| {
@@ -1316,15 +1328,19 @@ fn canonical_path_with_unrelated_volume_fails_closed_without_detaching() {
             &fixture.config().main_mount,
         )
         .expect_err("impostor must not be healed destructively");
-    assert!(error
-        .to_string()
-        .contains("refusing to heal unrelated mount"));
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to heal unrelated mount")
+    );
     let error = host
         .detach_mounted(&workspace(ImageFormat::Sparse), true)
         .expect_err("restart-safe detach must reject an impostor source");
-    assert!(error
-        .to_string()
-        .contains("refusing to detach unrelated mount"));
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to detach unrelated mount")
+    );
     assert!(
         runner.requests().iter().all(|request| request
             .args
@@ -1353,11 +1369,12 @@ fn wrong_kernel_mount_flags_are_detected_and_healed_by_mountpoint() {
         MacOsApfsExecutionHost::with_mount_source(runner.clone(), fixture.config(), source.clone())
             .expect("host");
     let workspace = workspace(ImageFormat::Sparse);
-    assert!(host
-        .mounts(&repo())
-        .expect_err("wrong flags")
-        .to_string()
-        .contains("non-canonical flags"));
+    assert!(
+        host.mounts(&repo())
+            .expect_err("wrong flags")
+            .to_string()
+            .contains("non-canonical flags")
+    );
 
     host.heal_mount(&workspace, &fixture.config().main_mount)
         .expect("heal by mountpoint");
@@ -1472,8 +1489,7 @@ fn gc_reclaims_sidecarless_staging_crash_images_but_preserves_recoverable_pairs(
     let orphan = staging.join("session-a-00000000000000000000000000000002.asif");
     std::fs::create_dir_all(&staging).expect("staging directory");
     std::fs::write(&orphan, b"crashed before metadata").expect("orphan staged image");
-    let recoverable =
-        staging.join("main-00000000000000000000000000000001.sparseimage");
+    let recoverable = staging.join("main-00000000000000000000000000000001.sparseimage");
     create_image(&recoverable, ImageFormat::Sparse);
 
     let report = native_host(&fixture, RecordingRunner::default())
@@ -1497,8 +1513,7 @@ fn gc_does_not_follow_symlinked_owner_repository_staging_or_image_paths() {
     let external = Fixture::new("gc-external-targets");
     let orphan_name = "main-00000000000000000000000000000002.sparseimage";
     let write_orphan = |path: &Path, contents: &[u8]| {
-        std::fs::create_dir_all(path.parent().expect("external parent"))
-            .expect("external parent");
+        std::fs::create_dir_all(path.parent().expect("external parent")).expect("external parent");
         std::fs::write(path, contents).expect("external staged image");
     };
 
@@ -1555,8 +1570,7 @@ fn gc_does_not_follow_symlinked_owner_repository_staging_or_image_paths() {
         .to_owned();
     std::fs::create_dir_all(escaped_checkpoint.parent().expect("checkpoint directory"))
         .expect("checkpoint directory");
-    std::os::unix::fs::symlink(&image_target, &escaped_checkpoint)
-        .expect("checkpoint symlink");
+    std::os::unix::fs::symlink(&image_target, &escaped_checkpoint).expect("checkpoint symlink");
     metadata(ImageFormat::Sparse)
         .write_for_image(&escaped_checkpoint)
         .expect("escaped checkpoint metadata");
@@ -1829,9 +1843,11 @@ fn recovery_ignores_unscoped_and_non_internal_restore_lookalikes() {
         std::fs::read(canonical.image()).expect("canonical"),
         b"live generation"
     );
-    assert!(invalid_checkpoints
-        .iter()
-        .all(|checkpoint| checkpoint.exists()));
+    assert!(
+        invalid_checkpoints
+            .iter()
+            .all(|checkpoint| checkpoint.exists())
+    );
     assert_eq!(
         std::fs::read(session_canonical.image()).expect("session"),
         b"live session"

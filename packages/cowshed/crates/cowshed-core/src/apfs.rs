@@ -2232,9 +2232,11 @@ mod tests {
         assert_eq!(argv(&requests[3]), ["-q", "/dev/rdisk5s2"]);
         assert_eq!(requests[4].program, Path::new(HDIUTIL));
         assert_eq!(argv(&requests[4]), ["detach", "-quiet", "/dev/disk4"]);
-        assert!(!requests
-            .iter()
-            .any(|request| argv(request).first().is_some_and(|arg| arg == "mount")));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| argv(request).first().is_some_and(|arg| arg == "mount"))
+        );
     }
 
     #[test]
@@ -2358,9 +2360,11 @@ mod tests {
         assert_eq!(argv(&requests[0]), ["info", "-plist"]);
         assert_eq!(argv(&requests[2]), ["info", "-plist"]);
         assert_eq!(argv(&requests[3]), ["info", "-plist"]);
-        assert!(!requests
-            .iter()
-            .any(|request| argv(request).first().is_some_and(|arg| arg == "eject")));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| argv(request).first().is_some_and(|arg| arg == "eject"))
+        );
     }
 
     #[test]
@@ -2483,9 +2487,11 @@ mod tests {
             backend.runner().devices_for(&image),
             BTreeSet::from(["/dev/disk8".into()])
         );
-        assert!(error
-            .to_string()
-            .contains("cleaning up newly attached devices also failed"));
+        assert!(
+            error
+                .to_string()
+                .contains("cleaning up newly attached devices also failed")
+        );
         assert!(std::error::Error::source(&error).is_some());
         match error {
             ApfsError::AttachmentCleanupFailed {
@@ -4004,12 +4010,11 @@ mod tests {
                 .unwrap(),
             BTreeSet::from(["/dev/disk4".into(), "/dev/disk5".into()])
         );
-        assert!(parse_attachment_inventory(
-            Path::new("/tmp/cowshed-absent.asif"),
-            plist.as_bytes()
-        )
-        .unwrap()
-        .is_empty());
+        assert!(
+            parse_attachment_inventory(Path::new("/tmp/cowshed-absent.asif"), plist.as_bytes())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
