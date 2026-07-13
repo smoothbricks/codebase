@@ -334,6 +334,82 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_errors_report_the_rejected_values() {
+        let invalid_port = SandboxError::InvalidPortBlock { base: 65_520, size: 8 };
+        assert_eq!(
+            invalid_port.to_string(),
+            "invalid macOS port block at 65520 with size 8; exactly 16 ports are required"
+        );
+
+        let invalid_path = SandboxError::InvalidPath {
+            path: PathBuf::from("relative/path"),
+            reason: "path is not absolute",
+        };
+        assert_eq!(
+            invalid_path.to_string(),
+            "invalid sandbox path relative/path: path is not absolute"
+        );
+
+        let intersecting_grant = SandboxError::GrantIntersectsDeny {
+            grant: PathBuf::from("/Users/tester/.ssh/id_ed25519"),
+            deny: PathBuf::from("/Users/tester/.ssh"),
+        };
+        assert_eq!(
+            intersecting_grant.to_string(),
+            "grant /Users/tester/.ssh/id_ed25519 intersects protected path /Users/tester/.ssh"
+        );
+    }
+
+    #[test]
+    fn every_profile_path_must_be_absolute_and_canonical() {
+        let mut relative = config(RunSandboxMode::ReadOnly);
+        relative.home = PathBuf::from("Users/tester");
+        assert_eq!(
+            seatbelt_profile(&relative),
+            Err(SandboxError::InvalidPath {
+                path: PathBuf::from("Users/tester"),
+                reason: "path is not absolute",
+            })
+        );
+
+        let mut traversing = config(RunSandboxMode::ReadOnly);
+        traversing
+            .grants
+            .write
+            .push(PathBuf::from("/opt/output/../private"));
+        assert_eq!(
+            seatbelt_profile(&traversing),
+            Err(SandboxError::InvalidPath {
+                path: PathBuf::from("/opt/output/../private"),
+                reason: "path is not canonical",
+            })
+        );
+
+        let mut nul = config(RunSandboxMode::ReadOnly);
+        nul.allowed_unix_sockets = vec![PathBuf::from("/var/run/socket\0suffix")];
+        assert_eq!(
+            seatbelt_profile(&nul),
+            Err(SandboxError::InvalidPath {
+                path: PathBuf::from("/var/run/socket\0suffix"),
+                reason: "path contains NUL",
+            })
+        );
+    }
+
+    #[test]
+    fn additional_denies_are_validated_before_becoming_authoritative() {
+        let mut invalid = config(RunSandboxMode::ReadOnly);
+        invalid.additional_denies = vec![PathBuf::from("relative/deny")];
+        assert_eq!(
+            seatbelt_profile(&invalid),
+            Err(SandboxError::InvalidPath {
+                path: PathBuf::from("relative/deny"),
+                reason: "path is not absolute",
+            })
+        );
+    }
+
+    #[test]
     fn profile_is_deterministic_and_has_exactly_sixteen_literal_ports() {
         let config = config(RunSandboxMode::ReadWrite);
         let first = seatbelt_profile(&config).unwrap();

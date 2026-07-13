@@ -331,6 +331,83 @@ mod tests {
     }
 
     #[test]
+    fn exec_errors_preserve_messages_and_io_sources() {
+        let invalid = ExecError::InvalidRequest {
+            message: "bad argv".into(),
+        };
+        assert_eq!(invalid.to_string(), "bad argv");
+        assert!(std::error::Error::source(&invalid).is_none());
+
+        let denied = ExecError::SandboxDenied {
+            message: "outside workspace".into(),
+        };
+        assert_eq!(denied.to_string(), "outside workspace");
+        assert!(std::error::Error::source(&denied).is_none());
+
+        let wrapper = ExecError::WrapperFailure {
+            stage: WrapperStage::Spawn,
+            message: "wrapper could not start".into(),
+            source: Some(io::Error::new(
+                io::ErrorKind::NotFound,
+                "missing executable",
+            )),
+        };
+        assert_eq!(wrapper.to_string(), "wrapper could not start");
+        let source = std::error::Error::source(&wrapper).unwrap();
+        assert_eq!(source.to_string(), "missing executable");
+    }
+
+    #[test]
+    fn argv_rejects_empty_programs_and_nul_bytes() {
+        let tree = TestTree::new();
+        for (argv, expected_message) in [
+            (vec![], "exec requires a non-empty argv"),
+            (vec![OsString::new()], "exec argv[0] must not be empty"),
+            (
+                vec![OsString::from("printf"), OsString::from("bad\0argument")],
+                "exec argv must not contain NUL",
+            ),
+        ] {
+            let error = plan_exec(
+                ExecRequest {
+                    argv,
+                    cwd: tree.cwd.clone(),
+                },
+                &tree.sandbox(),
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), expected_message);
+        }
+    }
+
+    #[test]
+    fn system_runner_returns_the_real_child_status() {
+        let tree = TestTree::new();
+        let status = SystemSpawnRunner
+            .run(&SpawnPlan {
+                program: PathBuf::from("/usr/bin/false"),
+                args: vec![],
+                cwd: tree.cwd.clone(),
+            })
+            .unwrap();
+        assert_eq!(status.code(), Some(1));
+    }
+
+    #[test]
+    fn system_runner_reports_spawn_failures() {
+        let tree = TestTree::new();
+        let failure = SystemSpawnRunner
+            .run(&SpawnPlan {
+                program: tree.root.join("missing-executable"),
+                args: vec![],
+                cwd: tree.cwd.clone(),
+            })
+            .unwrap_err();
+        assert_eq!(failure.stage, WrapperStage::Spawn);
+        assert_eq!(failure.source.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
     fn argv_is_passed_as_distinct_values_without_a_shell() {
         let tree = TestTree::new();
         let request = ExecRequest {
