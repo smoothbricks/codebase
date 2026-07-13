@@ -2,19 +2,25 @@ import type { Nanoseconds } from '@smoothbricks/arrow-builder';
 import {
   getResultWriterClass,
   getTagWriterClass,
-  type ResultWriter,
+  type ResultWriterConstructor,
   type TagWriter,
 } from './codegen/fixedPositionWriterGenerator.js';
 import { createSpanLoggerClass, type SpanLoggerImpl } from './codegen/spanLoggerGenerator.js';
 import type { RemapDescriptor } from './logBinding.js';
+import type { OpMetadata } from './opContext/opTypes.js';
 import type { OpContext } from './opContext/types.js';
 import {
   isRuntimeHintAnalyzed,
   RUNTIME_HINT_CAPABILITIES_MASK,
+  RUNTIME_HINT_FF,
   RUNTIME_HINT_FULL_CAPABILITIES,
+  RUNTIME_HINT_LOG,
+  RUNTIME_HINT_SCOPE,
+  RUNTIME_HINT_TAG,
   runtimeHintInitialCapacity,
 } from './runtimeHint.js';
 import type { LogSchema } from './schema/LogSchema.js';
+import { ENTRY_TYPE_SPAN_START } from './schema/systemSchema.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
 import type { AnySpanBuffer, SpanBuffer } from './types.js';
 import type { SpanContextClass } from './spanContext.js';
@@ -34,7 +40,7 @@ export interface PhysicalClock {
 }
 
 export interface PhysicalAppenders {
-  writeSpanStart(buffer: AnySpanBuffer, name: string): void;
+  writeSpanStart(buffer: AnySpanBuffer, name: string | number): void;
   writeSpanEnd(buffer: AnySpanBuffer, entryType: number): void;
   writeLogEntry(buffer: AnySpanBuffer, entryType: number): number;
 }
@@ -61,22 +67,47 @@ export interface PhysicalLayoutPlan<
     appendLogEntry: TimestampAppendPrimitive,
   ) => SpanLoggerImpl<T>;
   readonly TagWriterClass: new (buffer: AnySpanBuffer) => TagWriter<T>;
-  readonly ResultWriterClass: new <R = unknown, E = unknown>(
-    buffer: AnySpanBuffer,
-    resultOrError: R | E,
-    isError: boolean,
-  ) => ResultWriter<T, R, E>;
+  readonly ResultWriterClass: ResultWriterConstructor<T>;
   readonly clock: PhysicalClock;
   readonly appenders: PhysicalAppenders;
   /** Immutable global vocabulary generation used by dense row identities in this plan. */
   readonly vocabularyGeneration: VocabularyGeneration;
-  /** Cached immutable WASM layout template for exact per-capacity descriptors. */
-  readonly wasmLayout: WasmLayoutTemplate;
   /** Reserved immutable ownership slot; buffer pooling is a later task. */
   readonly poolRef: null;
   readonly remapDescriptor: RemapDescriptor | null;
-  createSpanLogger(buffer: SpanBuffer<T>): SpanLoggerImpl<T>;
-  createTagWriter(buffer: AnySpanBuffer): TagWriter<T>;
+  readonly newCtx0: (parent: object) => object;
+  readonly newCtx1: (parent: object, overrides: object) => object;
+  readonly newSpanLogger: ((buffer: SpanBuffer<T>) => SpanLoggerImpl<T>) | undefined;
+  readonly newTagWriter: ((buffer: AnySpanBuffer) => TagWriter<T>) | undefined;
+  readonly wasmLayout: WasmLayoutTemplate;
+}
+
+/** Fully resolved immutable operands for one operation callsite. */
+export interface CallsitePlan<
+  T extends LogSchema = LogSchema,
+  Ctx extends OpContext<T> = OpContext<T>,
+> extends PhysicalLayoutPlan<T, Ctx> {
+  readonly metadata: OpMetadata;
+}
+
+export function sealCallsitePlan<T extends LogSchema, Ctx extends OpContext<T>>(
+  physicalLayoutPlan: PhysicalLayoutPlan<T, Ctx>,
+  metadata: OpMetadata,
+): CallsitePlan<T, Ctx> {
+  return Object.freeze({ ...physicalLayoutPlan, metadata });
+}
+
+const newCtx0 = (parent: object): object => parent;
+
+function createNewCtx1(contextLayoutKey: string): (parent: object, overrides: object) => object {
+  const keys = contextLayoutKey === '' ? [] : contextLayoutKey.split('\u0000');
+  return (parent: object, overrides: object): object => {
+    const context: Record<string, unknown> = {};
+    for (const key of keys) {
+      context[key] = Object.hasOwn(overrides, key) ? Reflect.get(overrides, key) : Reflect.get(parent, key);
+    }
+    return context;
+  };
 }
 
 const TRACE_ROOT_CLOCK: PhysicalClock = Object.freeze({
@@ -88,7 +119,15 @@ const TRACE_ROOT_CLOCK: PhysicalClock = Object.freeze({
 });
 
 const TRACE_ROOT_APPENDERS: PhysicalAppenders = Object.freeze({
-  writeSpanStart(buffer: AnySpanBuffer, name: string): void {
+  writeSpanStart(buffer: AnySpanBuffer, name: string | number): void {
+    if (typeof name === 'number') {
+      const traceRoot = buffer._traceRoot;
+      buffer.timestamp[0] = traceRoot._timestampNow(traceRoot);
+      buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer._logHeaders[0] = ((name << 8) | ENTRY_TYPE_SPAN_START) >>> 0;
+      if (buffer.message_nulls) buffer.message_nulls[0] |= 1;
+      return;
+    }
     const traceRoot = buffer._traceRoot;
     traceRoot._writeSpanStart(traceRoot, buffer, name);
   },
@@ -118,6 +157,18 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
   const SpanLoggerClass = createSpanLoggerClass(schema);
   const TagWriterClass = getTagWriterClass(schema);
   const ResultWriterClass = getResultWriterClass(schema);
+  const capabilities = isRuntimeHintAnalyzed(runtimeHint)
+    ? runtimeHint & RUNTIME_HINT_CAPABILITIES_MASK
+    : RUNTIME_HINT_FULL_CAPABILITIES;
+  const needsLogger = (capabilities & (RUNTIME_HINT_LOG | RUNTIME_HINT_FF | RUNTIME_HINT_SCOPE)) !== 0;
+  const needsTag = (capabilities & RUNTIME_HINT_TAG) !== 0;
+  const newSpanLogger = needsLogger
+    ? (buffer: SpanBuffer<T>): SpanLoggerImpl<T> => {
+        const traceRoot = buffer._traceRoot;
+        return new SpanLoggerClass(buffer, traceRoot, traceRoot._appendLogEntry);
+      }
+    : undefined;
+  const newTagWriter = needsTag ? (buffer: AnySpanBuffer): TagWriter<T> => new TagWriterClass(buffer) : undefined;
   const wasmLayout = createWasmLayoutTemplate(schema);
 
   return Object.freeze({
@@ -125,9 +176,7 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
     backendKind,
     schema,
     runtimeHint,
-    capabilities: isRuntimeHintAnalyzed(runtimeHint)
-      ? runtimeHint & RUNTIME_HINT_CAPABILITIES_MASK
-      : RUNTIME_HINT_FULL_CAPABILITIES,
+    capabilities,
     contextLayoutKey,
     SpanContextClass,
     capacityTier: runtimeHintInitialCapacity(runtimeHint),
@@ -138,16 +187,13 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
     clock: TRACE_ROOT_CLOCK,
     appenders: TRACE_ROOT_APPENDERS,
     vocabularyGeneration,
-    wasmLayout,
     poolRef: null,
     remapDescriptor: null,
-    createSpanLogger(buffer: SpanBuffer<T>): SpanLoggerImpl<T> {
-      const traceRoot = buffer._traceRoot;
-      return new SpanLoggerClass(buffer, traceRoot, traceRoot._appendLogEntry);
-    },
-    createTagWriter(buffer: AnySpanBuffer): TagWriter<T> {
-      return new TagWriterClass(buffer);
-    },
+    newCtx0,
+    newCtx1: createNewCtx1(contextLayoutKey),
+    newSpanLogger,
+    newTagWriter,
+    wasmLayout,
   });
 }
 

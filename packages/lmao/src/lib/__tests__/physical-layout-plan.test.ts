@@ -167,8 +167,8 @@ describe('PhysicalLayoutPlan', () => {
       undefined,
       { runtimeHint: HOT_CHILD_HINT },
     );
-    const childSchema = childOp.SpanBufferClass.schema;
-    const plan = childOp.physicalLayoutPlan;
+    const plan = childOp.callsitePlan;
+    const childSchema = plan.SpanBufferClass.schema;
     if (!isPhysicalLayoutPlanForContext<OpContext<typeof childSchema>>(plan, childSchema)) {
       throw new TypeError('Expected child Op to own a schema-specific physical layout plan');
     }
@@ -196,10 +196,99 @@ describe('PhysicalLayoutPlan', () => {
     expect(planTimestamp >= beforePlanClock && planTimestamp <= afterPlanClock).toBe(true);
     expect(writtenUsers).toEqual(['planned-user', 'planned-user']);
     expect(writtenMessages).toEqual(['planned-log', 'planned-log']);
-    expect(childOp.metadata._physicalLayoutPlan).toBe(plan);
-    expect(childOp.physicalLayoutPlan).toBe(plan);
     expect(plan.SpanLoggerClass).toBe(ownedLogger);
     expect(plan.TagWriterClass).toBe(ownedTagWriter);
     expect(plan.appenders).toBe(ownedAppenders);
+  });
+  it('reuses one monomorphic CallsitePlan across sync and async calls while separating capability and schema plans', async () => {
+    const schema = defineLogSchema({ userId: S.category() });
+    const opContext = defineOpContext({ logSchema: schema, ctx: { requestId: 'default-request' } });
+    const resultContexts: object[] = [];
+    const resultOnly = opContext.defineOp(
+      'result-only-callsite',
+      (ctx) => {
+        resultContexts.push(ctx);
+        return ctx.ok(resultContexts.length);
+      },
+      undefined,
+      { runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_RESULT | 4 },
+    );
+    const logResult = opContext.defineOp(
+      'log-result-callsite',
+      (ctx) => {
+        ctx.log.info('planned-log');
+        return ctx.ok('logged');
+      },
+      undefined,
+      { runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_LOG | RUNTIME_HINT_RESULT | 4 },
+    );
+    const tagResult = opContext.defineOp(
+      'tag-result-callsite',
+      (ctx) => {
+        ctx.tag.userId('planned-user');
+        return ctx.ok('tagged');
+      },
+      undefined,
+      { runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_TAG | RUNTIME_HINT_RESULT | 4 },
+    );
+    const otherSchema = defineLogSchema({ duration: S.number() });
+    const otherContext = defineOpContext({ logSchema: otherSchema });
+    const otherSchemaOp = otherContext.defineOp(
+      'other-schema-callsite',
+      (ctx) => ctx.ok('other'),
+      undefined,
+      { runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_RESULT | 4 },
+    );
+
+    const plan = resultOnly.callsitePlan;
+    expect(Object.isFrozen(plan)).toBe(true);
+    expect(plan.schema).toBe(opContext.logBinding.logSchema);
+    expect(plan.metadata.name).toBe('result-only-callsite');
+    expect(plan.metadata).toBe(resultOnly.metadata);
+    expect(plan.runtimeHint).toBe(RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_RESULT | 4);
+    expect(plan.newSpanLogger).toBeUndefined();
+    expect(plan.newTagWriter).toBeUndefined();
+    expect(typeof plan.newCtx0).toBe('function');
+    expect(typeof plan.newCtx1).toBe('function');
+    const inherited = { requestId: 'default-request' };
+    const noOverrides = plan.newCtx0(inherited);
+    const withOverrides = plan.newCtx1(inherited, { requestId: 'override-request' });
+    expect(noOverrides).toBe(inherited);
+    expect(withOverrides).not.toBe(inherited);
+    expect(Object.getPrototypeOf(withOverrides)).toBe(Object.prototype);
+    expect(Reflect.ownKeys(withOverrides)).toEqual(['requestId']);
+    expect(Reflect.get(withOverrides, 'requestId')).toBe('override-request');
+
+    expect(logResult.callsitePlan).not.toBe(plan);
+    expect(logResult.callsitePlan.SpanContextClass).not.toBe(plan.SpanContextClass);
+    expect(logResult.callsitePlan.SpanBufferClass).toBe(plan.SpanBufferClass);
+    expect(typeof logResult.callsitePlan.newSpanLogger).toBe('function');
+    expect(logResult.callsitePlan.newTagWriter).toBeUndefined();
+    expect(tagResult.callsitePlan).not.toBe(plan);
+    expect(tagResult.callsitePlan.SpanBufferClass).toBe(plan.SpanBufferClass);
+    expect(tagResult.callsitePlan.newSpanLogger).toBeUndefined();
+    expect(typeof tagResult.callsitePlan.newTagWriter).toBe('function');
+    expect(otherSchemaOp.callsitePlan).not.toBe(plan);
+    expect(otherSchemaOp.callsitePlan.SpanBufferClass).not.toBe(plan.SpanBufferClass);
+
+    const parent = opContext.defineOp('callsite-parent', async (ctx) => {
+      const syncResult = ctx.spanSync('sync-result', resultOnly);
+      const asyncResult = await ctx.span('async-result', resultOnly);
+      if (!syncResult.success || !asyncResult.success) throw new Error('expected repeated child calls to succeed');
+      return ctx.ok([syncResult.value, asyncResult.value]);
+    });
+    const tracer = new TestTracer(opContext, createTestTracerOptions());
+    const result = await tracer.trace('callsite-root', parent);
+
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error('expected parent result to succeed');
+    expect(result.value).toEqual([1, 2]);
+    expect(resultOnly.callsitePlan).toBe(plan);
+    expect(resultContexts).toHaveLength(2);
+    expect(resultContexts.every((ctx) => ctx instanceof plan.SpanContextClass)).toBe(true);
+    const children = tracer.rootBuffers[0]?._children;
+    if (!children) throw new Error('expected repeated child buffers');
+    expect(children).toHaveLength(2);
+    expect(children.every((buffer) => buffer instanceof plan.SpanBufferClass)).toBe(true);
   });
 });

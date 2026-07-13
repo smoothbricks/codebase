@@ -12,16 +12,17 @@
 import { Nanoseconds } from '@smoothbricks/arrow-builder';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from './schema/systemSchema.js';
 import { createTraceId, type TraceId } from './traceId.js';
+import type { LogSchema } from './schema/LogSchema.js';
 import {
   type ITraceRoot,
-  TRACE_ROOT_ANCHOR_EPOCH_OFFSET,
-  TRACE_ROOT_ANCHOR_PERF_OFFSET,
-  TRACE_ROOT_TRACE_ID_LEN_OFFSET,
-  TRACE_ROOT_TRACE_ID_OFFSET,
   type SpanEndPrimitive,
   type SpanStartPrimitive,
   type TimestampAppendPrimitive,
   type TimestampNowPrimitive,
+  TRACE_ROOT_ANCHOR_EPOCH_OFFSET,
+  TRACE_ROOT_ANCHOR_PERF_OFFSET,
+  TRACE_ROOT_TRACE_ID_LEN_OFFSET,
+  TRACE_ROOT_TRACE_ID_OFFSET,
   type TracerLifecycleHooks,
 } from './traceRoot.js';
 import type { AnySpanBuffer } from './types.js';
@@ -70,7 +71,7 @@ const writeSpanEndPrimitive: SpanEndPrimitive = (traceRoot, buffer, entryType) =
   buffer._sealStatsChain();
 };
 
-export class TraceRoot implements ITraceRoot {
+export class TraceRoot<T extends LogSchema = LogSchema> implements ITraceRoot<T> {
   /**
    * Raw backing buffer containing anchor timestamps and trace_id.
    */
@@ -79,7 +80,7 @@ export class TraceRoot implements ITraceRoot {
   /**
    * Tracer reference for lifecycle hooks and event callbacks.
    */
-  readonly tracer: TracerLifecycleHooks;
+  readonly tracer: TracerLifecycleHooks<T>;
   readonly _timestampNow = timestampNow;
   readonly _appendLogEntry = appendLogEntry;
   readonly _writeSpanStart = writeSpanStartPrimitive;
@@ -100,7 +101,7 @@ export class TraceRoot implements ITraceRoot {
     anchorEpochNanos: bigint,
     anchorPerfNow: number,
     anchorHrtimeBigInt: bigint,
-    tracer: TracerLifecycleHooks,
+    tracer: TracerLifecycleHooks<T>,
   ) {
     // Allocate buffer: 17 bytes header + trace_id length
     // trace_id is validated to be ASCII (1 byte per char) so length === byte length
@@ -184,7 +185,7 @@ export class TraceRoot implements ITraceRoot {
  * Factory function for creating Node.js TraceRoot instances.
  * Pass this to Tracer constructor for Node.js environments.
  */
-export function createTraceRoot(trace_id: string, tracer: TracerLifecycleHooks): TraceRoot {
+export function createTraceRoot<T extends LogSchema>(trace_id: string, tracer: TracerLifecycleHooks<T>): TraceRoot<T> {
   const anchorEpochNanos = BigInt(Date.now()) * 1_000_000n;
   const anchorHrtimeBigInt = process.hrtime.bigint();
   // Also store as f64 in the shared _system layout (WASM reads it without BigInt extraction)

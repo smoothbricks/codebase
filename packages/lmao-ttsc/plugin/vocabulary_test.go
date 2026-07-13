@@ -221,9 +221,12 @@ function createOrdinalOps() {
 	if !packedHeaderPattern.MatchString(output) {
 		t.Fatalf("static log packed header did not reuse the log record's fragment ordinal through %s\n%s", binding, output)
 	}
-	spanPattern := regexp.MustCompile(`ctx\.spanStatic0\([^,]+,\s*` + regexp.QuoteMeta(binding) + `\[` + strconv.Itoa(ordinals[vocabularySpanName]) + `\]`)
+	spanPattern := regexp.MustCompile(`ctx\.span0\([^,]+,\s*` + regexp.QuoteMeta(binding) + `\[` + strconv.Itoa(ordinals[vocabularySpanName]) + `\],\s*child\.callsitePlan\.newCtx0\(ctx\),\s*child\.callsitePlan,\s*child\.fn\)`)
 	if !spanPattern.MatchString(output) {
-		t.Fatalf("static span did not read its dense ID from the span record's fragment ordinal using %s\n%s", binding, output)
+		t.Fatalf("static span did not read its fragment ordinal through unified span0 CallsitePlan dispatch using %s\n%s", binding, output)
+	}
+	if strings.Contains(output, "spanStatic0(") || strings.Count(output, binding+"[") != 3 {
+		t.Fatalf("static span did not use exactly one vocabulary operand on unified dispatch\n%s", output)
 	}
 }
 

@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import { createBuffer, createTestLogBinding, createTestSchema } from '../../__tests__/test-helpers.js';
+import { DEFAULT_METADATA } from '../../opContext/defineOp.js';
 import type { OpContext } from '../../opContext/types.js';
+import { getPhysicalLayoutPlan, sealCallsitePlan } from '../../physicalLayoutPlan.js';
 import { S } from '../../schema/builder.js';
 import type { FeatureFlagSchema } from '../../schema/defineFeatureFlags.js';
 import { defineFeatureFlags } from '../../schema/defineFeatureFlags.js';
@@ -8,6 +10,7 @@ import { InMemoryFlagEvaluator } from '../../schema/evaluator.js';
 import { ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE } from '../../schema/systemSchema.js';
 import type { LogSchema } from '../../schema/types.js';
 import { createSpanContextClass, type SpanContextInstance } from '../../spanContext.js';
+import { getSpanBufferClass } from '../../spanBuffer.js';
 import type { AnySpanBuffer, SpanBuffer } from '../../types.js';
 import { createEvaluatorClass, generateEvaluatorClass } from '../evaluatorGenerator.js';
 import { createTagWriter } from '../fixedPositionWriterGenerator.js';
@@ -29,6 +32,8 @@ type EvaluatorTestContext<TLogSchema extends LogSchema, TFlags extends FeatureFl
   Record<string, never>
 >;
 
+let mockContextOrdinal = 0;
+
 function createMockSpanContext<TLogSchema extends LogSchema, TFlags extends FeatureFlagSchema>(
   schema: TLogSchema,
   spanBuffer: SpanBuffer<TLogSchema>,
@@ -39,7 +44,16 @@ function createMockSpanContext<TLogSchema extends LogSchema, TFlags extends Feat
     schema,
     createTestLogBinding(schema),
   );
-  const ctx = new SpanContextClass(spanBuffer, schema, logger, tagWriter);
+  const physicalPlan = getPhysicalLayoutPlan(
+    getSpanBufferClass(schema),
+    0,
+    SpanContextClass,
+    undefined,
+    'js-heap',
+    `evaluator-test-${mockContextOrdinal++}`,
+  );
+  const plan = sealCallsitePlan(physicalPlan, DEFAULT_METADATA);
+  const ctx = new SpanContextClass(spanBuffer, schema, logger, tagWriter, plan);
   ctx.deps = {};
   return ctx;
 }
