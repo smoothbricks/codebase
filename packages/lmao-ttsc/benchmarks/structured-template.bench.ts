@@ -1,35 +1,87 @@
-import { bench, group, run, summary } from 'mitata';
-import { DEFAULT_METADATA } from '../../lmao/src/lib/opContext/defineOp.ts';
+/**
+ * Structured-log lowering benchmark.
+ *
+ * Static compiler paths use the registered vocabulary binding and a static-only
+ * CallsitePlan. Dynamic paths use a dynamic-only plan. Every runner owns a real
+ * production SpanContext/WriterState and verifies evaluation order plus stored
+ * semantics before Mitata starts timing.
+ *
+ * Run: bun packages/lmao-ttsc/benchmarks/structured-template.bench.ts --quick
+ */
+
+import { bench, do_not_optimize, group, run, summary } from 'mitata';
+import type { WriterState } from '../../lmao/src/lib/codegen/fixedPositionWriterGenerator.ts';
+import { resolveMessage } from '../../lmao/src/lib/resolveMessage.ts';
+import {
+  RUNTIME_HINT_ANALYZED_VALID,
+  RUNTIME_HINT_LOG,
+  RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY,
+  RUNTIME_HINT_MESSAGE_LAYOUT_STATIC_ONLY,
+} from '../../lmao/src/lib/runtimeHint.ts';
 import {
   createSpanBuffer,
-  createSpanLogger,
   createTraceRoot,
   defineLogSchema,
+  defineOpContext,
+  ENTRY_TYPE_DEBUG,
   ENTRY_TYPE_INFO,
-  mergeWithSystemSchema,
+  JsBufferStrategy,
+  Ok,
   S,
+  type SpanBuffer,
+  type SpanLoggerImpl,
+  TestTracer,
 } from '../../lmao/src/node.ts';
+import { registerBenchmarkVocabulary } from '../../lmao/benchmarks/vocabularyFixture.ts';
 
 const QUICK = process.argv.includes('--quick');
 const FORMAT = process.argv.includes('--json') ? 'json' : process.argv.includes('--markdown') ? 'markdown' : 'mitata';
-const ITERATIONS = QUICK ? 250 : 10_000;
+const ITERATIONS = QUICK ? 128 : 10_000;
 const CAPACITY = ITERATIONS + 2;
 const STATIC_MESSAGE = 'request completed';
-const ATTRIBUTE_NAMES = ['userId', 'retries', 'region', 'latencyMs', 'cached'] as const;
 const MASK_64 = (1n << 64n) - 1n;
+const EAGER_COLUMNS: readonly string[] = ['userId', 'retries', 'region', 'latencyMs', 'cached'];
+const STATIC_BINDING = registerBenchmarkVocabulary([STATIC_MESSAGE]);
+const STATIC_MESSAGE_INDEX = STATIC_BINDING[0];
+if (STATIC_MESSAGE_INDEX === undefined) throw new Error('Static benchmark vocabulary did not bind its message');
 
-const schema = defineLogSchema(
-  mergeWithSystemSchema({
-    userId: S.category(),
-    retries: S.number(),
-    region: S.category(),
-    latencyMs: S.number(),
-    cached: S.boolean(),
-  }),
-  { _skipReservedNameValidation: true },
-);
+const schema = defineLogSchema({
+  userId: S.category(),
+  retries: S.number(),
+  region: S.category(),
+  latencyMs: S.number(),
+  cached: S.boolean(),
+});
+const opContext = defineOpContext({ logSchema: schema });
+const tracer = new TestTracer(opContext, {
+  bufferStrategy: new JsBufferStrategy(),
+  createTraceRoot,
+});
 
-type AttributeName = (typeof ATTRIBUTE_NAMES)[number];
+type RuntimeSchema = typeof opContext.logBinding.logSchema;
+type RuntimeLogger = SpanLoggerImpl<RuntimeSchema>;
+
+interface AttributeViews {
+  userIdValues: string[];
+  userIdNulls: Uint8Array;
+  retriesValues: Float64Array;
+  retriesNulls: Uint8Array;
+  regionValues: string[];
+  regionNulls: Uint8Array;
+  latencyMsValues: Float64Array;
+  latencyMsNulls: Uint8Array;
+  cachedValues: Uint8Array;
+  cachedNulls: Uint8Array;
+}
+
+interface RuntimeBundle {
+  buffer: SpanBuffer<RuntimeSchema>;
+  context: WriterState & { readonly _spanLogger: RuntimeLogger };
+  staticLowered: boolean;
+  staticMessageId: number;
+  views: AttributeViews;
+}
+
 type AttributeValues = {
   userId: string;
   retries: number;
@@ -37,135 +89,117 @@ type AttributeValues = {
   latencyMs: number;
   cached: boolean;
 };
-type FluentEntry = {
-  userId(value: string): FluentEntry;
-  retries(value: number): FluentEntry;
-  region(value: string): FluentEntry;
-  latencyMs(value: number): FluentEntry;
-  cached(value: boolean): FluentEntry;
-  with(attributes: Partial<AttributeValues>): void;
-};
-type BenchmarkBuffer = {
-  _writeIndex: number;
-  _traceRoot: { writeLogEntry(buffer: BenchmarkBuffer, entryType: number): number };
-  constructor: { stats: { totalWrites: number } };
-  message_values: (string | undefined)[];
-  message_nulls: Uint8Array | undefined;
-  userId_values: (string | undefined)[];
-  userId_nulls: Uint8Array;
-  retries_values: Float64Array;
-  retries_nulls: Uint8Array;
-  region_values: (string | undefined)[];
-  region_nulls: Uint8Array;
-  latencyMs_values: Float64Array;
-  latencyMs_nulls: Uint8Array;
-  cached_values: Uint8Array;
-  cached_nulls: Uint8Array;
-};
-type BenchmarkLogger = {
-  _buffer: BenchmarkBuffer;
-  _writeIndex: number;
-  _checkOverflow(): void;
-  info(message: string): FluentEntry;
-  debug(message: string): FluentEntry;
-};
-type RuntimeBundle = {
-  buffer: BenchmarkBuffer;
-  logger: BenchmarkLogger;
-};
-type RunResult = {
+
+type Implementation = 'current' | 'conceptual' | 'unrolled' | 'staged' | 'raw-debug' | 'interpolation';
+
+interface RunResult {
   checksum: bigint;
-};
-type Tracker = {
+}
+
+interface Tracker {
   count: number;
   hash: bigint;
   trace: string[] | undefined;
-};
-type Runner = {
+}
+
+interface Runner {
   label: string;
-  run: () => number;
-  preflight: () => RunResult;
+  run(): number;
+  preflight(): RunResult;
   tracker: Tracker;
-};
+}
 
-const tracerHooks = {
-  onTraceStart() {},
-  onTraceEnd() {},
-  onSpanStart() {},
-  onSpanEnd() {},
-} satisfies Parameters<typeof createTraceRoot>[1];
+function stringValues(value: unknown, name: string): string[] {
+  if (!Array.isArray(value) || !value.every((item) => typeof item === 'string')) {
+    throw new TypeError(`${name} did not expose string-array storage`);
+  }
+  return value;
+}
 
-function makeRuntimeBundle(label: string): RuntimeBundle {
-  const traceRoot = createTraceRoot(`structured-template-${label}`, tracerHooks);
-  // The generated buffer/logger expose schema-specific columns and fluent methods
-  // that the public factory return types cannot express together.
-  const buffer = createSpanBuffer(schema, traceRoot, DEFAULT_METADATA, CAPACITY) as unknown as BenchmarkBuffer;
-  const logger = createSpanLogger(schema, buffer) as unknown as BenchmarkLogger;
+function uint8Values(value: unknown, name: string): Uint8Array {
+  if (!(value instanceof Uint8Array)) throw new TypeError(`${name} did not expose Uint8Array storage`);
+  return value;
+}
 
-  // Force lazy user columns to allocate outside all timed bodies.
-  void buffer.userId_values;
-  void buffer.userId_nulls;
-  void buffer.retries_values;
-  void buffer.retries_nulls;
-  void buffer.region_values;
-  void buffer.region_nulls;
-  void buffer.latencyMs_values;
-  void buffer.latencyMs_nulls;
-  void buffer.cached_values;
-  void buffer.cached_nulls;
-  return { buffer, logger };
+function float64Values(value: unknown, name: string): Float64Array {
+  if (!(value instanceof Float64Array)) throw new TypeError(`${name} did not expose Float64Array storage`);
+  return value;
+}
+
+function attributeViews(buffer: SpanBuffer<RuntimeSchema>): AttributeViews {
+  return {
+    userIdValues: stringValues(buffer.userId_values, 'userId_values'),
+    userIdNulls: uint8Values(buffer.userId_nulls, 'userId_nulls'),
+    retriesValues: float64Values(buffer.retries_values, 'retries_values'),
+    retriesNulls: uint8Values(buffer.retries_nulls, 'retries_nulls'),
+    regionValues: stringValues(buffer.region_values, 'region_values'),
+    regionNulls: uint8Values(buffer.region_nulls, 'region_nulls'),
+    latencyMsValues: float64Values(buffer.latencyMs_values, 'latencyMs_values'),
+    latencyMsNulls: uint8Values(buffer.latencyMs_nulls, 'latencyMs_nulls'),
+    cachedValues: uint8Values(buffer.cached_values, 'cached_values'),
+    cachedNulls: uint8Values(buffer.cached_nulls, 'cached_nulls'),
+  };
+}
+
+function makeRuntimeBundle(label: string, dynamic: boolean, implementation: Implementation): RuntimeBundle {
+  const staticLowered = !dynamic && (implementation === 'unrolled' || implementation === 'staged');
+  const messageLayout = staticLowered
+    ? RUNTIME_HINT_MESSAGE_LAYOUT_STATIC_ONLY
+    : RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY;
+  const benchmarkOp = opContext.defineOp(
+    `structured-template-${label}`,
+    () => new Ok(undefined),
+    undefined,
+    {
+      runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_LOG | messageLayout | CAPACITY,
+      eagerColumns: EAGER_COLUMNS,
+      localMessageDictionary: staticLowered ? [STATIC_MESSAGE_INDEX] : [],
+    },
+  );
+  const plan = benchmarkOp.callsitePlan;
+  const staticMessageId = staticLowered ? plan.encodeLocalMessage(STATIC_MESSAGE_INDEX) : 0;
+  if (staticLowered && staticMessageId === 0) {
+    throw new Error('Static CallsitePlan did not bind the benchmark vocabulary message');
+  }
+  const traceRoot = createTraceRoot(`structured-template-${label}`, tracer);
+  const buffer = createSpanBuffer(plan.schema, traceRoot, plan.metadata, CAPACITY, plan.SpanBufferClass);
+  plan.appenders.writeSpanStart(buffer, benchmarkOp.metadata.name);
+  const context = new plan.SpanContextClass(buffer, plan.schema, plan);
+  return { buffer, context, staticLowered, staticMessageId, views: attributeViews(buffer) };
 }
 
 function resetBundle(bundle: RuntimeBundle): void {
-  bundle.logger._buffer = bundle.buffer;
   bundle.buffer._writeIndex = 2;
-  bundle.logger._writeIndex = 1;
+  bundle.context._buffer = bundle.buffer;
 }
 
 function sourceMessage(dynamic: boolean, iteration: number): string {
   return dynamic ? `request-${iteration & 31}` : STATIC_MESSAGE;
 }
 
-function sourceAttribute(name: AttributeName, iteration: number): AttributeValues[AttributeName] {
-  switch (name) {
-    case 'userId':
-      return `user-${iteration & 15}`;
-    case 'retries':
-      return iteration & 3;
-    case 'region':
-      return (iteration & 1) === 0 ? 'us-east' : 'eu-west';
-    case 'latencyMs':
-      return iteration + 0.25;
-    case 'cached':
-      return (iteration & 1) === 0;
-  }
-}
-
-function sourceAttributes(count: number, iteration: number): AttributeValues {
-  const values = {} as AttributeValues;
-  for (let index = 0; index < count; index++) {
-    const name = ATTRIBUTE_NAMES[index]!;
-    values[name] = sourceAttribute(name, iteration) as never;
-  }
-  return values;
+function sourceValues(count: number, iteration: number): AttributeValues {
+  return {
+    userId: count >= 1 ? `user-${iteration & 15}` : '',
+    retries: count >= 2 ? iteration & 3 : 0,
+    region: count >= 3 ? ((iteration & 1) === 0 ? 'us-east' : 'eu-west') : '',
+    latencyMs: count >= 4 ? iteration + 0.25 : 0,
+    cached: count >= 5 && (iteration & 1) === 0,
+  };
 }
 
 function sourceObject(count: number, iteration: number): Partial<AttributeValues> {
   switch (count) {
     case 1:
-      return { userId: sourceAttribute('userId', iteration) as string };
+      return { userId: `user-${iteration & 15}` };
     case 2:
-      return {
-        userId: sourceAttribute('userId', iteration) as string,
-        retries: sourceAttribute('retries', iteration) as number,
-      };
+      return { userId: `user-${iteration & 15}`, retries: iteration & 3 };
     case 5:
       return {
-        userId: sourceAttribute('userId', iteration) as string,
-        retries: sourceAttribute('retries', iteration) as number,
-        region: sourceAttribute('region', iteration) as string,
-        latencyMs: sourceAttribute('latencyMs', iteration) as number,
-        cached: sourceAttribute('cached', iteration) as boolean,
+        userId: `user-${iteration & 15}`,
+        retries: iteration & 3,
+        region: (iteration & 1) === 0 ? 'us-east' : 'eu-west',
+        latencyMs: iteration + 0.25,
+        cached: (iteration & 1) === 0,
       };
     default:
       throw new Error(`Unsupported attribute count: ${count}`);
@@ -184,116 +218,78 @@ function evaluateMessage(tracker: Tracker, dynamic: boolean, iteration: number):
   return `request-${iteration & 31}`;
 }
 
-function evaluateAttribute(tracker: Tracker, name: AttributeName, iteration: number): AttributeValues[AttributeName] {
-  switch (name) {
-    case 'userId':
-      note(tracker, 'u');
-      return `user-${iteration & 15}`;
-    case 'retries':
-      note(tracker, 'r');
-      return iteration & 3;
-    case 'region':
-      note(tracker, 'g');
-      return (iteration & 1) === 0 ? 'us-east' : 'eu-west';
-    case 'latencyMs':
-      note(tracker, 'l');
-      return iteration + 0.25;
-    case 'cached':
-      note(tracker, 'c');
-      return (iteration & 1) === 0;
+function evaluateValues(tracker: Tracker, count: number, iteration: number): AttributeValues {
+  let userId = '';
+  let retries = 0;
+  let region = '';
+  let latencyMs = 0;
+  let cached = false;
+  if (count >= 1) {
+    note(tracker, 'u');
+    userId = `user-${iteration & 15}`;
   }
-}
-
-function evaluateAttributes(tracker: Tracker, count: number, iteration: number): AttributeValues {
-  const values = {} as AttributeValues;
-  for (let index = 0; index < count; index++) {
-    const name = ATTRIBUTE_NAMES[index]!;
-    values[name] = evaluateAttribute(tracker, name, iteration) as never;
+  if (count >= 2) {
+    note(tracker, 'r');
+    retries = iteration & 3;
   }
-  return values;
-}
-
-function checksumIteration(checksum: bigint, message: string, attributes: AttributeValues, count: number): bigint {
-  let next = (checksum * 1_000_003n + BigInt(message.length)) & MASK_64;
-  for (let index = 0; index < count; index++) {
-    const value = attributes[ATTRIBUTE_NAMES[index]!];
-    if (typeof value === 'string') next = (next * 131n + BigInt(value.length)) & MASK_64;
-    else if (typeof value === 'number') next = (next * 131n + BigInt(Math.trunc(value * 4))) & MASK_64;
-    else next = (next * 131n + BigInt(value ? 1 : 0)) & MASK_64;
+  if (count >= 3) {
+    note(tracker, 'g');
+    region = (iteration & 1) === 0 ? 'us-east' : 'eu-west';
   }
-  return next;
-}
-
-function storedAttribute(
-  buffer: BenchmarkBuffer,
-  name: AttributeName,
-  row: number,
-): string | number | boolean | undefined {
-  switch (name) {
-    case 'userId':
-      return buffer.userId_values[row];
-    case 'retries':
-      return buffer.retries_values[row];
-    case 'region':
-      return buffer.region_values[row];
-    case 'latencyMs':
-      return buffer.latencyMs_values[row];
-    case 'cached':
-      return (buffer.cached_values[row >>> 3]! & (1 << (row & 7))) !== 0;
+  if (count >= 4) {
+    note(tracker, 'l');
+    latencyMs = iteration + 0.25;
   }
-}
-
-function finishChecksum(checksum: bigint, tracker: Tracker, bundle: RuntimeBundle, count: number): RunResult {
-  const activeBuffer = bundle.logger._buffer;
-  const row = activeBuffer._writeIndex - 1;
-  let result = checksum ^ tracker.hash ^ BigInt(tracker.count);
-  const storedMessage = activeBuffer.message_values[row] as string | undefined;
-  result ^= BigInt(storedMessage?.length ?? 0) << 8n;
-  for (let index = 0; index < count; index++) {
-    const stored = storedAttribute(activeBuffer, ATTRIBUTE_NAMES[index]!, row);
-    if (typeof stored === 'string') result ^= BigInt(stored.length) << BigInt(16 + index * 5);
-    else if (typeof stored === 'number') result ^= BigInt(Math.trunc(stored * 4)) << BigInt(16 + index * 5);
+  if (count >= 5) {
+    note(tracker, 'c');
+    cached = (iteration & 1) === 0;
   }
-  return { checksum: result & MASK_64 };
+  return { userId, retries, region, latencyMs, cached };
 }
 
-function expectedTrace(dynamic: boolean, attributeCount: number, iterations: number): string[] {
-  const tokens = [...(dynamic ? ['m'] : []), ...['u', 'r', 'g', 'l', 'c'].slice(0, attributeCount)];
-  return Array.from({ length: iterations }, () => tokens).flat();
-}
-
-function makeObject(tracker: Tracker, count: number, iteration: number): Partial<AttributeValues> {
-  // This explicit object-literal matrix preserves property evaluation order while
-  // ensuring each source expression is evaluated exactly once.
+function evaluateObject(tracker: Tracker, count: number, iteration: number): Partial<AttributeValues> {
   switch (count) {
     case 1:
-      return { userId: evaluateAttribute(tracker, 'userId', iteration) as string };
+      note(tracker, 'u');
+      return { userId: `user-${iteration & 15}` };
     case 2:
-      return {
-        userId: evaluateAttribute(tracker, 'userId', iteration) as string,
-        retries: evaluateAttribute(tracker, 'retries', iteration) as number,
-      };
+      note(tracker, 'u');
+      const userId = `user-${iteration & 15}`;
+      note(tracker, 'r');
+      return { userId, retries: iteration & 3 };
     case 5:
-      return {
-        userId: evaluateAttribute(tracker, 'userId', iteration) as string,
-        retries: evaluateAttribute(tracker, 'retries', iteration) as number,
-        region: evaluateAttribute(tracker, 'region', iteration) as string,
-        latencyMs: evaluateAttribute(tracker, 'latencyMs', iteration) as number,
-        cached: evaluateAttribute(tracker, 'cached', iteration) as boolean,
-      };
+      note(tracker, 'u');
+      const fullUserId = `user-${iteration & 15}`;
+      note(tracker, 'r');
+      const retries = iteration & 3;
+      note(tracker, 'g');
+      const region = (iteration & 1) === 0 ? 'us-east' : 'eu-west';
+      note(tracker, 'l');
+      const latencyMs = iteration + 0.25;
+      note(tracker, 'c');
+      return { retries, region, latencyMs, cached: (iteration & 1) === 0, userId: fullUserId };
     default:
       throw new Error(`Unsupported attribute count: ${count}`);
   }
 }
 
-function applyUnrolled(
-  logger: BenchmarkLogger,
-  message: string,
-  values: AttributeValues,
-  count: number,
-  level: 'info' | 'debug',
-): void {
-  const entry = logger[level](message);
+function checksumIteration(checksum: bigint, message: string, values: AttributeValues, count: number): bigint {
+  let next = (checksum * 1_000_003n + BigInt(message.length)) & MASK_64;
+  if (count >= 1) next = (next * 131n + BigInt(values.userId.length)) & MASK_64;
+  if (count >= 2) next = (next * 131n + BigInt(Math.trunc(values.retries * 4))) & MASK_64;
+  if (count >= 3) next = (next * 131n + BigInt(values.region.length)) & MASK_64;
+  if (count >= 4) next = (next * 131n + BigInt(Math.trunc(values.latencyMs * 4))) & MASK_64;
+  if (count >= 5) next = (next * 131n + BigInt(values.cached ? 1 : 0)) & MASK_64;
+  return next;
+}
+
+function applyUnrolled(bundle: RuntimeBundle, message: string, values: AttributeValues, count: number, debug: boolean): void {
+  const logger = bundle.context._spanLogger;
+  const entry = bundle.staticLowered
+    ? logger._infoTemplate(STATIC_MESSAGE_INDEX)
+    : debug
+      ? logger.debug(message)
+      : logger.info(message);
   switch (count) {
     case 1:
       entry.userId(values.userId);
@@ -309,179 +305,185 @@ function applyUnrolled(
         .latencyMs(values.latencyMs)
         .cached(values.cached);
       return;
+    default:
+      throw new Error(`Unsupported attribute count: ${count}`);
   }
 }
 
 function directWrite(bundle: RuntimeBundle, message: string, values: AttributeValues, count: number): void {
-  const logger = bundle.logger;
-  logger._checkOverflow();
-  const buffer = logger._buffer;
-  const row = buffer._traceRoot.writeLogEntry(buffer, ENTRY_TYPE_INFO);
-  logger._writeIndex = row;
-  buffer.message_values[row] = message;
-  if (buffer.message_nulls) buffer.message_nulls[row >>> 3] |= 1 << (row & 7);
-  buffer.constructor.stats.totalWrites++;
-
-  const write = (name: AttributeName, value: AttributeValues[AttributeName]): void => {
-    const byte = row >>> 3;
-    const mask = 1 << (row & 7);
-    switch (name) {
-      case 'userId':
-        buffer.userId_values[row] = value as string;
-        buffer.userId_nulls[byte] |= mask;
-        return;
-      case 'retries':
-        buffer.retries_values[row] = value as number;
-        buffer.retries_nulls[byte] |= mask;
-        return;
-      case 'region':
-        buffer.region_values[row] = value as string;
-        buffer.region_nulls[byte] |= mask;
-        return;
-      case 'latencyMs':
-        buffer.latencyMs_values[row] = value as number;
-        buffer.latencyMs_nulls[byte] |= mask;
-        return;
-      case 'cached':
-        if (value) buffer.cached_values[byte] |= mask;
-        else buffer.cached_values[byte] &= ~mask;
-        buffer.cached_nulls[byte] |= mask;
+  const buffer = bundle.buffer;
+  const views = bundle.views;
+  const row = bundle.context._appendWriterEntry(ENTRY_TYPE_INFO);
+  if (bundle.staticLowered) {
+    const messageIds = buffer._messageIds;
+    if (!messageIds || bundle.staticMessageId === 0) {
+      throw new Error('Static CallsitePlan did not provide its bound local message storage');
     }
-  };
-  for (let index = 0; index < count; index++) {
-    const name = ATTRIBUTE_NAMES[index]!;
-    write(name, values[name]);
+    messageIds[row] = bundle.staticMessageId;
+  } else {
+    const messageValues = buffer.message_values;
+    if (!messageValues) throw new Error('Dynamic CallsitePlan did not provide message storage');
+    messageValues[row] = message;
+  }
+  const byte = row >>> 3;
+  const mask = 1 << (row & 7);
+  if (count >= 1) {
+    views.userIdValues[row] = values.userId;
+    views.userIdNulls[byte] |= mask;
+  }
+  if (count >= 2) {
+    views.retriesValues[row] = values.retries;
+    views.retriesNulls[byte] |= mask;
+  }
+  if (count >= 3) {
+    views.regionValues[row] = values.region;
+    views.regionNulls[byte] |= mask;
+  }
+  if (count >= 4) {
+    views.latencyMsValues[row] = values.latencyMs;
+    views.latencyMsNulls[byte] |= mask;
+  }
+  if (count >= 5) {
+    if (values.cached) views.cachedValues[byte] |= mask;
+    else views.cachedValues[byte] &= ~mask;
+    views.cachedNulls[byte] |= mask;
   }
 }
 
-function conceptualInfoObject(logger: BenchmarkLogger, message: string, attributes: Partial<AttributeValues>): void {
-  // Isolated model of the proposed two-argument surface using today's runtime
-  // operations. It measures call/evaluation shape, not an implemented fused writer.
-  logger.info(message).with(attributes);
+function storedChecksum(bundle: RuntimeBundle, row: number, count: number): bigint {
+  const message = resolveMessage(bundle.buffer, row);
+  const views = bundle.views;
+  let checksum = BigInt(message?.length ?? 0) << 8n;
+  if (count >= 1) checksum ^= BigInt(views.userIdValues[row]?.length ?? 0) << 16n;
+  if (count >= 2) checksum ^= BigInt(Math.trunc(views.retriesValues[row] * 4)) << 21n;
+  if (count >= 3) checksum ^= BigInt(views.regionValues[row]?.length ?? 0) << 26n;
+  if (count >= 4) checksum ^= BigInt(Math.trunc(views.latencyMsValues[row] * 4)) << 31n;
+  if (count >= 5) {
+    const cached = (views.cachedValues[row >>> 3] & (1 << (row & 7))) !== 0;
+    checksum ^= BigInt(cached ? 1 : 0) << 36n;
+  }
+  return checksum;
+}
+
+function finishChecksum(
+  semantic: bigint,
+  tracker: Tracker,
+  bundle: RuntimeBundle,
+  attributeCount: number,
+): RunResult {
+  const row = bundle.buffer._writeIndex - 1;
+  return {
+    checksum: (semantic ^ tracker.hash ^ BigInt(tracker.count) ^ storedChecksum(bundle, row, attributeCount)) & MASK_64,
+  };
+}
+
+function expectedTrace(dynamic: boolean, attributeCount: number): string[] {
+  const perIteration: string[] = [];
+  if (dynamic) perIteration.push('m');
+  if (attributeCount >= 1) perIteration.push('u');
+  if (attributeCount >= 2) perIteration.push('r');
+  if (attributeCount >= 3) perIteration.push('g');
+  if (attributeCount >= 4) perIteration.push('l');
+  if (attributeCount >= 5) perIteration.push('c');
+  const trace: string[] = [];
+  for (let iteration = 0; iteration < ITERATIONS; iteration++) trace.push(...perIteration);
+  return trace;
 }
 
 function makeRunner(
   label: string,
-  attributeCount: number,
+  attributeCount: 1 | 2 | 5,
   dynamic: boolean,
-  implementation: 'current' | 'conceptual' | 'unrolled' | 'staged' | 'raw-debug' | 'interpolation',
+  implementation: Implementation,
 ): Runner {
-  const bundle = makeRuntimeBundle(`${label}-${attributeCount}-${dynamic ? 'dynamic' : 'static'}`);
+  const bundle = makeRuntimeBundle(`${label}-${attributeCount}-${dynamic ? 'dynamic' : 'static'}`, dynamic, implementation);
   const tracker: Tracker = { count: 0, hash: 0n, trace: undefined };
 
-  const run = (): number => {
+  function execute(tracked: boolean): RunResult {
     resetBundle(bundle);
-    for (let iteration = 0; iteration < ITERATIONS; iteration++) {
-      if (implementation === 'current') {
-        const message = sourceMessage(dynamic, iteration);
-        const attributes = sourceObject(attributeCount, iteration);
-        bundle.logger.info(message).with(attributes);
-      } else if (implementation === 'conceptual') {
-        const message = sourceMessage(dynamic, iteration);
-        const attributes = sourceObject(attributeCount, iteration);
-        conceptualInfoObject(bundle.logger, message, attributes);
-      } else {
-        const message = sourceMessage(implementation === 'interpolation' || dynamic, iteration);
-        const attributes = sourceAttributes(attributeCount, iteration);
-        if (implementation === 'staged') directWrite(bundle, message, attributes, attributeCount);
-        else
-          applyUnrolled(
-            bundle.logger,
-            message,
-            attributes,
-            attributeCount,
-            implementation === 'raw-debug' ? 'debug' : 'info',
-          );
-      }
+    if (tracked) {
+      tracker.count = 0;
+      tracker.hash = 0n;
     }
-    const activeBuffer = bundle.logger._buffer;
-    const row = activeBuffer._writeIndex - 1;
-    return activeBuffer._writeIndex ^ ((activeBuffer.message_values[row] as string | undefined)?.length ?? 0);
-  };
-
-  const preflight = (): RunResult => {
-    resetBundle(bundle);
-    tracker.count = 0;
-    tracker.hash = 0n;
     let semantic = 0n;
-
     for (let iteration = 0; iteration < ITERATIONS; iteration++) {
-      if (implementation === 'current') {
-        const message = evaluateMessage(tracker, dynamic, iteration);
-        const attributes = makeObject(tracker, attributeCount, iteration);
-        bundle.logger.info(message).with(attributes);
-        semantic = checksumIteration(semantic, message, attributes as AttributeValues, attributeCount);
-      } else if (implementation === 'conceptual') {
-        const message = evaluateMessage(tracker, dynamic, iteration);
-        const attributes = makeObject(tracker, attributeCount, iteration);
-        conceptualInfoObject(bundle.logger, message, attributes);
-        semantic = checksumIteration(semantic, message, attributes as AttributeValues, attributeCount);
+      const message = tracked
+        ? evaluateMessage(tracker, implementation === 'interpolation' || dynamic, iteration)
+        : sourceMessage(implementation === 'interpolation' || dynamic, iteration);
+      if (implementation === 'current' || implementation === 'conceptual') {
+        const attributes = tracked
+          ? evaluateObject(tracker, attributeCount, iteration)
+          : sourceObject(attributeCount, iteration);
+        if (implementation === 'current') bundle.context._spanLogger.info(message).with(attributes);
+        else bundle.context._spanLogger.info(message, attributes);
+        if (tracked) semantic = checksumIteration(semantic, message, sourceValues(attributeCount, iteration), attributeCount);
       } else {
-        const message =
-          implementation === 'interpolation'
-            ? evaluateMessage(tracker, true, iteration)
-            : evaluateMessage(tracker, dynamic, iteration);
-        const attributes = evaluateAttributes(tracker, attributeCount, iteration);
-        if (implementation === 'staged') directWrite(bundle, message, attributes, attributeCount);
-        else
-          applyUnrolled(
-            bundle.logger,
-            message,
-            attributes,
-            attributeCount,
-            implementation === 'raw-debug' ? 'debug' : 'info',
-          );
-        semantic = checksumIteration(semantic, message, attributes, attributeCount);
+        const values = tracked
+          ? evaluateValues(tracker, attributeCount, iteration)
+          : sourceValues(attributeCount, iteration);
+        if (implementation === 'staged') directWrite(bundle, message, values, attributeCount);
+        else applyUnrolled(bundle, message, values, attributeCount, implementation === 'raw-debug');
+        if (tracked) semantic = checksumIteration(semantic, message, values, attributeCount);
       }
     }
     return finishChecksum(semantic, tracker, bundle, attributeCount);
-  };
+  }
 
-  return { label, run, preflight, tracker };
+  return {
+    label,
+    tracker,
+    run() {
+      execute(false);
+      const row = bundle.buffer._writeIndex - 1;
+      return bundle.buffer._writeIndex ^ (resolveMessage(bundle.buffer, row)?.length ?? 0);
+    },
+    preflight() {
+      return execute(true);
+    },
+  };
 }
 
 function assertSemantics(runners: readonly Runner[], dynamic: boolean, attributeCount: number): void {
-  const expected = expectedTrace(dynamic, attributeCount, ITERATIONS);
+  const expected = expectedTrace(dynamic, attributeCount);
   let checksum: bigint | undefined;
   for (const runner of runners) {
     runner.tracker.trace = [];
     const result = runner.preflight();
     const actual = runner.tracker.trace;
     runner.tracker.trace = undefined;
-    if (actual.length !== expected.length || actual.some((token, index) => token !== expected[index])) {
+    if (!actual || actual.length !== expected.length || actual.some((token, index) => token !== expected[index])) {
       throw new Error(`${runner.label} violated exactly-once source evaluation order`);
     }
     if (checksum === undefined) checksum = result.checksum;
-    else if (result.checksum !== checksum) {
-      throw new Error(`${runner.label} semantic checksum differed before timing`);
-    }
+    else if (result.checksum !== checksum) throw new Error(`${runner.label} semantic checksum differed before timing`);
   }
 }
 
 function registerScenario(attributeCount: 1 | 2 | 5, dynamic: boolean): void {
   const runners: Runner[] = [
     makeRunner('current-info-with-object', attributeCount, dynamic, 'current'),
-    makeRunner('conceptual-info-object-api', attributeCount, dynamic, 'conceptual'),
-    makeRunner('fluent-unrolled-chain', attributeCount, dynamic, 'unrolled'),
+    makeRunner('current-info-two-argument', attributeCount, dynamic, 'conceptual'),
+    makeRunner('compiler-unrolled-chain', attributeCount, dynamic, 'unrolled'),
     makeRunner('compiler-staged-direct-writes', attributeCount, dynamic, 'staged'),
   ];
   if (dynamic) {
     runners.push(
       makeRunner('raw-dynamic-debug-control', attributeCount, true, 'raw-debug'),
-      makeRunner('rejected-interpolation-control', attributeCount, true, 'interpolation'),
+      makeRunner('interpolation-control', attributeCount, true, 'interpolation'),
     );
   }
 
   assertSemantics(runners, dynamic, attributeCount);
   group(`structured-template | attrs=${attributeCount} | message=${dynamic ? 'dynamic' : 'static'}`, () => {
     for (const runner of runners) {
-      const benchmark = bench(runner.label, runner.run);
+      const benchmark = bench(runner.label, () => do_not_optimize(runner.run()));
       if (runner.label === 'current-info-with-object') benchmark.baseline(true);
     }
   });
 }
 
-for (const attributeCount of [1, 2, 5] as const) {
+const ATTRIBUTE_COUNTS: readonly (1 | 2 | 5)[] = QUICK ? [2] : [1, 2, 5];
+for (const attributeCount of ATTRIBUTE_COUNTS) {
   summary(() => registerScenario(attributeCount, false));
   summary(() => registerScenario(attributeCount, true));
 }

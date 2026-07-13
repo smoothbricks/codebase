@@ -1,54 +1,79 @@
-/**
- * Native Mitata diagnostics for WASM-owned memory before ownership/layout
- * optimizations. Labels containing "production" execute the shipped allocator
- * wrapper/exports. Labels containing "model" are isolated candidate models and
- * must not be interpreted as production measurements.
- *
- * Run: bun packages/lmao/benchmarks/wasm-owned-memory.bench.ts --quick
- */
-
-import { bench, do_not_optimize, group, run } from 'mitata';
+import { bench, do_not_optimize, group, run, summary } from 'mitata';
+import { defineOpContext } from '../src/lib/defineOpContext.js';
+import { createOpMetadata } from '../src/lib/opContext/defineOp.js';
+import {
+  RUNTIME_HINT_ANALYZED_VALID,
+  RUNTIME_HINT_MESSAGE_LAYOUT_MIXED,
+  RUNTIME_HINT_RESULT,
+} from '../src/lib/runtimeHint.js';
+import { S } from '../src/lib/schema/builder.js';
+import { defineLogSchema } from '../src/lib/schema/defineLogSchema.js';
+import { ENTRY_TYPE_INFO } from '../src/lib/schema/systemSchema.js';
+import type { TracerLifecycleHooks } from '../src/lib/traceRoot.js';
+import { iterateSpanTree } from '../src/lib/traceTopology.js';
+import { WasmBufferStrategy } from '../src/lib/wasm/WasmBufferStrategy.js';
 import { createWasmAllocator, type WasmAllocator } from '../src/lib/wasm/wasmAllocator.js';
+import { createWasmTraceRoot } from '../src/lib/wasm/wasmTraceRoot.js';
+import { registerBenchmarkVocabulary } from './vocabularyFixture.js';
 
-const quick = process.argv.includes('--quick');
-const capacities = quick ? [64] : [8, 64, 256];
-const writeIterations = quick ? 256 : 4_096;
-const ownershipIterations = quick ? 16 : 256;
-const stringRows = quick ? 64 : 256;
+const QUICK = process.argv.includes('--quick');
+const CAPACITIES: readonly number[] = QUICK ? Object.freeze([64]) : Object.freeze([8, 64, 256]);
+const WRITE_ITERATIONS = QUICK ? 256 : 4_096;
+const OWNERSHIP_ITERATIONS = QUICK ? 16 : 256;
+const STRING_ROWS = QUICK ? 64 : 256;
 const PAGE_BYTES = 65_536;
-const IDENTITY_BYTES = 48;
 const TRACE_ID = '0123456789abcdef0123456789abcdef';
-const TRACE_BYTES = new TextEncoder().encode(TRACE_ID);
+const STATIC_STRINGS: readonly string[] = Object.freeze(['GET', 'POST', 'PUT', 'DELETE']);
+const STATIC_BINDING = registerBenchmarkVocabulary(STATIC_STRINGS);
+const SCHEMA = defineLogSchema({ value: S.number() });
+const CONTEXT = defineOpContext({ logSchema: SCHEMA });
+const RUNTIME_SCHEMA = CONTEXT.logBinding.logSchema;
+const METADATA = createOpMetadata(
+  'wasm-owned-memory',
+  '@smoothbricks/lmao',
+  'wasm-owned-memory.bench.ts',
+  'bench',
+  1,
+);
+const LAYOUT_OP = CONTEXT.defineOp('wasm-owned-memory-layout', (ctx) => ctx.ok(null), undefined, {
+  runtimeHint:
+    RUNTIME_HINT_ANALYZED_VALID |
+    RUNTIME_HINT_MESSAGE_LAYOUT_MIXED |
+    RUNTIME_HINT_RESULT |
+    64,
+});
+
+type NativeFormat = 'json' | 'markdown' | 'mitata' | 'quiet';
 
 function invariant(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(`wasm-owned-memory semantic check failed: ${message}`);
 }
 
-type NativeFormat = 'json' | 'markdown' | 'mitata' | 'quiet';
-
 function requestedFormat(): NativeFormat {
-  if (process.argv.includes('--json')) return 'json';
-  if (process.argv.includes('--markdown')) return 'markdown';
-  if (process.argv.includes('--quiet')) return 'quiet';
-  const value = process.argv.find((argument) => argument.startsWith('--format='))?.slice('--format='.length);
-  if (value === undefined) return 'mitata';
-  invariant(
-    value === 'json' || value === 'markdown' || value === 'mitata' || value === 'quiet',
-    `unsupported Mitata format ${value}`,
-  );
-  return value;
-}
-
-function align(value: number, alignment: number): number {
-  return (value + alignment - 1) & ~(alignment - 1);
-}
-
-function col8ValueOffset(pointer: number, capacity: number): number {
-  return align(pointer + Math.ceil(capacity / 8), 8);
+  const prefix = '--format=';
+  for (let index = 0; index < process.argv.length; index++) {
+    const argument = process.argv[index];
+    if (argument === undefined) continue;
+    const value = argument.startsWith(prefix)
+      ? argument.slice(prefix.length)
+      : argument === '--format'
+        ? process.argv[index + 1]
+        : undefined;
+    if (value === undefined) continue;
+    if (value === 'json' || value === 'markdown' || value === 'mitata' || value === 'quiet') return value;
+    throw new Error(`Unknown Mitata format: ${value}`);
+  }
+  return 'mitata';
 }
 
 function mix(hash: number, value: number): number {
   return Math.imul(hash ^ value, 16_777_619) >>> 0;
+}
+
+function requireNumber(values: Uint32Array, index: number, label: string): number {
+  const value = values[index];
+  if (value === undefined) throw new RangeError(`${label} index ${index} is out of range`);
+  return value;
 }
 
 function expectedNumericChecksum(iterations: number, capacity: number): number {
@@ -62,435 +87,233 @@ function expectedNumericChecksum(iterations: number, capacity: number): number {
   return checksum;
 }
 
-interface ColumnDescriptor {
-  readonly offset: number;
-  readonly valueOffset: number;
-  readonly capacity: number;
-  generation: number;
-}
+function makeNumericRunners(allocator: WasmAllocator, capacity: number) {
+  const layout = LAYOUT_OP.callsitePlan.wasmLayout.forCapacity(capacity);
+  const column = layout.columns.find((candidate) => candidate.name === 'value');
+  const slab = layout.slabs.f64;
+  if (column === undefined || slab === null) throw new Error('PhysicalLayoutPlan omitted the eager numeric WASM slab');
+  const pointer = allocator.allocExact(slab.byteLength, slab.alignment);
+  invariant(pointer !== 0, 'production exact numeric slab allocation failed');
+  const nullOffset = pointer + column.nullOffset;
+  const valueOffset = pointer + column.valueOffset;
 
-function makeNumericRunners(allocator: WasmAllocator, capacity: number, pointer: number) {
-  const valueOffset = col8ValueOffset(pointer, capacity);
-  const descriptor: ColumnDescriptor = { offset: pointer, valueOffset, capacity, generation: 1 };
-  const modelSlab = new ArrayBuffer(valueOffset + capacity * 8 + 64);
-  const modelBytes = new Uint8Array(modelSlab);
-  const modelF64 = new Float64Array(modelSlab);
-  let canonicalBuffer = allocator.memory.buffer;
-  let canonicalBytes = new Uint8Array(canonicalBuffer);
-  let canonicalF64 = new Float64Array(canonicalBuffer);
-  let canonicalGeneration = 1;
-
-  const writeChecksum = (write: (row: number, value: number) => void): number => {
+  const writeChecksum = (bytes: Uint8Array, values: Float64Array): number => {
     let checksum = 2_166_136_261;
-    for (let index = 0; index < writeIterations; index++) {
+    const valueBase = valueOffset >>> 3;
+    for (let index = 0; index < WRITE_ITERATIONS; index++) {
       const row = index & (capacity - 1);
       const value = row * 3.25 + 0.5;
-      write(row, value);
+      bytes[nullOffset + (row >>> 3)] |= 1 << (row & 7);
+      values[valueBase + row] = value;
       checksum = mix(checksum, row);
       checksum = mix(checksum, Math.trunc(value * 4));
     }
     return checksum;
   };
 
-  const productionWrapper = (): number =>
-    writeChecksum((row, value) => allocator.writeColF64(pointer, row, value, capacity));
-  const productionExport = (): number =>
-    writeChecksum((row, value) => allocator.exports.write_col_f64(pointer, row, value, capacity));
-  const productionGetter = (): number => {
-    const bytes = allocator.u8;
-    const values = allocator.f64;
-    const base = valueOffset >>> 3;
-    return writeChecksum((row, value) => {
-      bytes[pointer + (row >>> 3)] |= 1 << (row & 7);
-      values[base + row] = value;
-    });
-  };
-  const productionCanonical = (): number => {
-    // Refresh is intentionally once per operation, outside the row hot loop.
-    if (canonicalBuffer !== allocator.memory.buffer) {
-      canonicalBuffer = allocator.memory.buffer;
-      canonicalBytes = new Uint8Array(canonicalBuffer);
-      canonicalF64 = new Float64Array(canonicalBuffer);
-      canonicalGeneration++;
-    }
-    const base = descriptor.valueOffset >>> 3;
-    return writeChecksum((row, value) => {
-      canonicalBytes[descriptor.offset + (row >>> 3)] |= 1 << (row & 7);
-      canonicalF64[base + row] = value;
-    });
-  };
-  const exactLayoutModel = (): number => {
-    const base = descriptor.valueOffset >>> 3;
-    return writeChecksum((row, value) => {
-      modelBytes[descriptor.offset + (row >>> 3)] |= 1 << (row & 7);
-      modelF64[base + row] = value;
-    });
-  };
-
   return {
-    descriptor,
-    get canonicalGeneration() {
-      return canonicalGeneration;
+    layout,
+    getterViews(): number {
+      return writeChecksum(allocator.u8, allocator.f64);
     },
-    productionWrapper,
-    productionExport,
-    productionGetter,
-    productionCanonical,
-    exactLayoutModel,
+    canonicalViews(): number {
+      return writeChecksum(new Uint8Array(allocator.memory.buffer), new Float64Array(allocator.memory.buffer));
+    },
+    pinnedEpoch(): number {
+      const pin = allocator.pinMemoryEpoch();
+      try {
+        return writeChecksum(new Uint8Array(pin.buffer), new Float64Array(pin.buffer));
+      } finally {
+        pin.release();
+      }
+    },
   };
 }
 
-async function validateGrowthInvalidation(): Promise<void> {
+async function validateGrowthAndPinning(): Promise<void> {
   const allocator = await createWasmAllocator({ capacity: 64, initialPages: 17, maxPages: 20 });
-  const staleGetterView = allocator.f64;
-  const staleDirectView = new Float64Array(allocator.memory.buffer);
+  const staleView = allocator.f64;
   const oldBuffer = allocator.memory.buffer;
+  const pin = allocator.pinMemoryEpoch();
   allocator.memory.grow(1);
-  invariant(oldBuffer !== allocator.memory.buffer, 'memory.grow must replace the ArrayBuffer');
-  invariant(staleGetterView.byteLength === 0, 'cached allocator view must be detached by growth');
-  invariant(staleDirectView.byteLength === 0, 'canonical direct view must be detached by growth');
-  const refreshed = allocator.f64;
-  invariant(refreshed.buffer === allocator.memory.buffer, 'allocator getter must refresh after growth');
-  invariant(refreshed.byteLength === 18 * PAGE_BYTES, 'refreshed getter must cover the full grown memory');
-
-  let generation = 1;
-  let generationBuffer = oldBuffer;
-  let generationView = staleDirectView;
-  if (generationBuffer !== allocator.memory.buffer) {
-    generationBuffer = allocator.memory.buffer;
-    generationView = new Float64Array(generationBuffer);
-    generation++;
-  }
-  invariant(generation === 2, 'growth-aware direct view must increment generation exactly once');
-  invariant(generationView.buffer === allocator.memory.buffer, 'growth-aware direct view must own current buffer');
-}
-
-interface OwnedDescriptor {
-  index: number;
-  generation: number;
-  active: boolean;
-  kind: 1 | 2 | 3;
-  identityOffset: number;
-  systemOffset: number;
-  columnOffset: number;
-  parent: number;
-  overflow: number;
-}
-
-class ExactLayoutDescriptorSlab {
-  readonly memory: ArrayBuffer;
-  readonly bytes: Uint8Array;
-  readonly descriptors: OwnedDescriptor[];
-  private readonly freeDescriptors: number[];
-  private readonly freeIdentities: number[] = [];
-  private readonly freeSystems: number[] = [];
-  private readonly freeColumns: number[] = [];
-  private bump: number;
-
-  constructor(
-    readonly capacity: number,
-    descriptorCapacity: number,
-  ) {
-    this.memory = new ArrayBuffer(2 * 1024 * 1024);
-    this.bytes = new Uint8Array(this.memory);
-    this.bump = 64;
-    this.descriptors = Array.from({ length: descriptorCapacity }, (_, index) => ({
-      index,
-      generation: 0,
-      active: false,
-      kind: 1 as const,
-      identityOffset: 0,
-      systemOffset: 0,
-      columnOffset: 0,
-      parent: -1,
-      overflow: -1,
-    }));
-    this.freeDescriptors = Array.from({ length: descriptorCapacity }, (_, index) => descriptorCapacity - index - 1);
-  }
-
-  private block(free: number[], bytes: number, alignment: number): number {
-    const reused = free.pop();
-    if (reused !== undefined) return reused;
-    const offset = align(this.bump, alignment);
-    this.bump = offset + bytes;
-    invariant(this.bump <= this.memory.byteLength, 'modeled slab exhausted');
-    return offset;
-  }
-
-  acquire(kind: 1 | 2 | 3, parent = -1): OwnedDescriptor {
-    const index = this.freeDescriptors.pop();
-    invariant(index !== undefined, 'modeled descriptor slab exhausted');
-    const descriptor = this.descriptors[index]!;
-    invariant(!descriptor.active, 'descriptor acquired while still owned');
-    descriptor.generation++;
-    descriptor.active = true;
-    descriptor.kind = kind;
-    descriptor.identityOffset = this.block(this.freeIdentities, IDENTITY_BYTES, 8);
-    descriptor.systemOffset = this.block(this.freeSystems, this.capacity * 9, 8);
-    descriptor.columnOffset = this.block(
-      this.freeColumns,
-      align(Math.ceil(this.capacity / 8), 8) + this.capacity * 8,
-      8,
-    );
-    descriptor.parent = parent;
-    descriptor.overflow = -1;
-    return descriptor;
-  }
-
-  release(descriptor: OwnedDescriptor, generation: number): void {
-    invariant(descriptor.active, 'double release detected');
-    invariant(descriptor.generation === generation, 'stale generation release detected');
-    descriptor.active = false;
-    this.freeIdentities.push(descriptor.identityOffset);
-    this.freeSystems.push(descriptor.systemOffset);
-    this.freeColumns.push(descriptor.columnOffset);
-    this.freeDescriptors.push(descriptor.index);
-  }
-}
-
-function productionOwnershipCycle(allocator: WasmAllocator, capacity: number): number {
-  let semantic = 0;
-  for (let iteration = 0; iteration < ownershipIterations; iteration++) {
-    const rootPacked = allocator.allocIdentityRootForJsWrite(TRACE_BYTES.length);
-    const rootIdentity = Number(rootPacked >> 32n);
-    allocator.u8.set(TRACE_BYTES, Number(rootPacked & 0xffff_ffffn));
-    const rootSystem = allocator.allocSpanSystem(capacity);
-    const rootColumn = allocator.alloc8B(capacity);
-
-    const childIdentity = allocator.allocIdentityChild();
-    const childSystem = allocator.allocSpanSystem(capacity);
-    const childColumn = allocator.alloc8B(capacity);
-
-    const overflowPacked = allocator.allocIdentityRootForJsWrite(TRACE_BYTES.length);
-    const overflowIdentity = Number(overflowPacked >> 32n);
-    allocator.u8.set(TRACE_BYTES, Number(overflowPacked & 0xffff_ffffn));
-    const overflowSystem = allocator.allocSpanSystem(capacity);
-    const overflowColumn = allocator.alloc8B(capacity);
-
-    semantic = mix(semantic, 1);
-    semantic = mix(semantic, 2);
-    semantic = mix(semantic, 3);
-
-    allocator.free8B(overflowColumn, capacity);
-    allocator.freeSpanSystem(overflowSystem, capacity);
-    allocator.freeIdentity(overflowIdentity);
-    allocator.free8B(childColumn, capacity);
-    allocator.freeSpanSystem(childSystem, capacity);
-    allocator.freeIdentity(childIdentity);
-    allocator.free8B(rootColumn, capacity);
-    allocator.freeSpanSystem(rootSystem, capacity);
-    allocator.freeIdentity(rootIdentity);
-  }
-  return semantic;
-}
-
-function modelOwnershipCycle(slab: ExactLayoutDescriptorSlab): number {
-  let semantic = 0;
-  for (let iteration = 0; iteration < ownershipIterations; iteration++) {
-    const root = slab.acquire(1);
-    const child = slab.acquire(2, root.index);
-    const overflow = slab.acquire(3, root.index);
-    root.overflow = overflow.index;
-    semantic = mix(semantic, root.kind);
-    semantic = mix(semantic, child.kind);
-    semantic = mix(semantic, overflow.kind);
-    slab.release(overflow, overflow.generation);
-    slab.release(child, child.generation);
-    slab.release(root, root.generation);
-  }
-  return semantic;
-}
-
-function validateProductionOwnership(allocator: WasmAllocator, capacity: number): void {
-  const beforeAlloc = allocator.getAllocCount();
-  const beforeFree = allocator.getFreeCount();
-  productionOwnershipCycle(allocator, capacity);
-  const allocationDelta = allocator.getAllocCount() - beforeAlloc;
-  const freeDelta = allocator.getFreeCount() - beforeFree;
-  const logicalBlockCount = ownershipIterations * 9;
-  invariant(
-    allocationDelta === logicalBlockCount,
-    `production allocation count mismatch: expected ${logicalBlockCount}, observed ${allocationDelta}`,
-  );
-  invariant(
-    freeDelta >= logicalBlockCount,
-    `production free counter must include all ${logicalBlockCount} releases; observed ${freeDelta}`,
-  );
-}
-
-function validateModeledOwnership(slab: ExactLayoutDescriptorSlab): void {
-  const root = slab.acquire(1);
-  const generation = root.generation;
-  slab.release(root, generation);
-  const reused = slab.acquire(1);
-  invariant(reused.index === root.index, 'released descriptor must be reused');
-  invariant(reused.generation === generation + 1, 'descriptor reuse must advance generation');
-  let staleReleaseRejected = false;
+  let pinRejectedRefresh = false;
   try {
-    slab.release(reused, generation);
-  } catch {
-    staleReleaseRejected = true;
+    allocator.refreshViews();
+  } catch (error) {
+    pinRejectedRefresh = error instanceof Error && error.message.includes('Arrow lease pinned');
   }
-  invariant(staleReleaseRejected, 'stale generation release must be rejected');
-  slab.release(reused, reused.generation);
+  invariant(pinRejectedRefresh, 'memory refresh must reject growth while an epoch lease is active');
+  pin.release();
+  invariant(allocator.refreshViews() === 2, 'released epoch must refresh exactly once');
+  invariant(oldBuffer !== allocator.memory.buffer, 'memory.grow must replace the ArrayBuffer');
+  invariant(staleView.byteLength === 0, 'pre-growth canonical view must detach');
+  invariant(allocator.f64.byteLength === 18 * PAGE_BYTES, 'refreshed getter must cover grown memory');
 }
 
-const dynamicStrings = Array.from({ length: stringRows }, (_, index) => `request-${index % 23}/user-${index % 11}`);
-const staticStrings = ['GET', 'POST', 'PUT', 'DELETE'] as const;
+function lifecycleFor(strategy: WasmBufferStrategy<typeof RUNTIME_SCHEMA>): TracerLifecycleHooks<typeof RUNTIME_SCHEMA> {
+  return {
+    onTraceStart: () => undefined,
+    onTraceEnd: () => undefined,
+    onSpanStart: () => undefined,
+    onSpanEnd: () => undefined,
+    onStatsWillResetFor: () => undefined,
+    getFlagEvaluatorForContext: () => undefined,
+    bufferStrategy: strategy,
+  };
+}
+
+function ownershipCycle(
+  strategy: WasmBufferStrategy<typeof RUNTIME_SCHEMA>,
+  capacity: number,
+  iterations: number,
+): number {
+  let checksum = 2_166_136_261;
+  const lifecycle = lifecycleFor(strategy);
+  for (let iteration = 0; iteration < iterations; iteration++) {
+    const traceRoot = createWasmTraceRoot(strategy.allocator, TRACE_ID, lifecycle);
+    const root = strategy.createSpanBuffer(
+      RUNTIME_SCHEMA,
+      traceRoot,
+      METADATA,
+      capacity,
+      LAYOUT_OP.callsitePlan.SpanBufferClass,
+    );
+    const child = strategy.createChildSpanBuffer(
+      root,
+      METADATA,
+      METADATA,
+      capacity,
+      RUNTIME_SCHEMA,
+      LAYOUT_OP.callsitePlan.SpanBufferClass,
+    );
+    const overflow = strategy.createOverflowBuffer(child);
+    root.timestamp[0] = BigInt(iteration * 3 + 1);
+    child.timestamp[0] = BigInt(iteration * 3 + 2);
+    overflow.timestamp[0] = BigInt(iteration * 3 + 3);
+    const rootEntryTypes = root.entry_type;
+    const childEntryTypes = child.entry_type;
+    const overflowEntryTypes = overflow.entry_type;
+    invariant(rootEntryTypes !== undefined, 'root entry_type lane must be allocated');
+    invariant(childEntryTypes !== undefined, 'child entry_type lane must be allocated');
+    invariant(overflowEntryTypes !== undefined, 'overflow entry_type lane must be allocated');
+    rootEntryTypes[0] = ENTRY_TYPE_INFO;
+    childEntryTypes[0] = ENTRY_TYPE_INFO;
+    overflowEntryTypes[0] = ENTRY_TYPE_INFO;
+    root.message(0, `root-${iteration}`);
+    child.message(0, `child-${iteration}`);
+    overflow.message(0, `overflow-${iteration}`);
+    root.value(0, iteration + 0.25);
+    child.value(0, iteration + 0.5);
+    overflow.value(0, iteration + 0.75);
+    root._writeIndex = 1;
+    child._writeIndex = 1;
+    overflow._writeIndex = 1;
+    const nodes = Array.from(iterateSpanTree(root));
+    invariant(nodes.length === 3, 'root/child/overflow topology must expose three physical segments');
+    checksum = mix(checksum, nodes.length);
+    checksum = mix(checksum, root._nodeIndex);
+    checksum = mix(checksum, child._nodeIndex);
+    checksum = mix(checksum, overflow._nodeIndex);
+    const generation = traceRoot._topology.generation;
+    strategy.releaseBuffer(root);
+    invariant(traceRoot._topology.generation === generation + 1, 'released topology must advance generation');
+  }
+  return checksum;
+}
 
 function stringChecksum(): number {
   let checksum = 2_166_136_261;
-  for (let index = 0; index < stringRows; index++) {
-    const dynamic = dynamicStrings[index]!;
-    const fixed = staticStrings[index & 3]!;
+  for (let index = 0; index < STRING_ROWS; index++) {
+    const dynamic = `request-${index % 23}/user-${index % 11}`;
+    const fixed = STATIC_STRINGS[index & 3];
+    if (fixed === undefined) throw new RangeError(`Missing static string ${index & 3}`);
     for (let char = 0; char < dynamic.length; char++) checksum = mix(checksum, dynamic.charCodeAt(char));
     for (let char = 0; char < fixed.length; char++) checksum = mix(checksum, fixed.charCodeAt(char));
   }
   return checksum;
 }
 
-function makeDynamicJsSidecar() {
-  const dynamic = new Array<string>(stringRows);
-  const fixed = new Array<string>(stringRows);
-  const validity = new Uint8Array(Math.ceil(stringRows / 8));
-  return (): number => {
-    let semantic = 2_166_136_261;
-    for (let index = 0; index < stringRows; index++) {
-      dynamic[index] = dynamicStrings[index]!;
-      fixed[index] = staticStrings[index & 3]!;
-      validity[index >>> 3] |= 1 << (index & 7);
-      for (let char = 0; char < dynamic[index]!.length; char++)
-        semantic = mix(semantic, dynamic[index]!.charCodeAt(char));
-      for (let char = 0; char < fixed[index]!.length; char++) semantic = mix(semantic, fixed[index]!.charCodeAt(char));
-    }
-    return semantic;
-  };
+function dynamicStringSidecars(): number {
+  const dynamic = new Array<string>(STRING_ROWS);
+  const fixed = new Array<string>(STRING_ROWS);
+  let checksum = 2_166_136_261;
+  for (let index = 0; index < STRING_ROWS; index++) {
+    const dynamicValue = `request-${index % 23}/user-${index % 11}`;
+    const fixedValue = STATIC_STRINGS[index & 3];
+    if (fixedValue === undefined) throw new RangeError(`Missing static string ${index & 3}`);
+    dynamic[index] = dynamicValue;
+    fixed[index] = fixedValue;
+    for (let char = 0; char < dynamicValue.length; char++) checksum = mix(checksum, dynamicValue.charCodeAt(char));
+    for (let char = 0; char < fixedValue.length; char++) checksum = mix(checksum, fixedValue.charCodeAt(char));
+  }
+  return checksum;
 }
 
-function makeStaticIdSidecar() {
-  const dynamic = new Array<string>(stringRows);
-  const fixedIds = new Uint8Array(stringRows);
-  const validity = new Uint8Array(Math.ceil(stringRows / 8));
-  return (): number => {
-    let semantic = 2_166_136_261;
-    for (let index = 0; index < stringRows; index++) {
-      dynamic[index] = dynamicStrings[index]!;
-      fixedIds[index] = index & 3;
-      validity[index >>> 3] |= 1 << (index & 7);
-      const fixed = staticStrings[fixedIds[index]!]!;
-      for (let char = 0; char < dynamic[index]!.length; char++)
-        semantic = mix(semantic, dynamic[index]!.charCodeAt(char));
-      for (let char = 0; char < fixed.length; char++) semantic = mix(semantic, fixed.charCodeAt(char));
-    }
-    return semantic;
-  };
+function vocabularyStringSidecar(): number {
+  const dynamic = new Array<string>(STRING_ROWS);
+  const denseIds = new Uint32Array(STRING_ROWS);
+  let checksum = 2_166_136_261;
+  for (let index = 0; index < STRING_ROWS; index++) {
+    const dynamicValue = `request-${index % 23}/user-${index % 11}`;
+    const ordinal = index & 3;
+    const fixedValue = STATIC_STRINGS[ordinal];
+    if (fixedValue === undefined) throw new RangeError(`Missing static string ${ordinal}`);
+    dynamic[index] = dynamicValue;
+    denseIds[index] = requireNumber(STATIC_BINDING, ordinal, 'static vocabulary binding');
+    for (let char = 0; char < dynamicValue.length; char++) checksum = mix(checksum, dynamicValue.charCodeAt(char));
+    for (let char = 0; char < fixedValue.length; char++) checksum = mix(checksum, fixedValue.charCodeAt(char));
+  }
+  return checksum;
 }
 
-function makeUtf8SlabSidecar() {
-  const encoder = new TextEncoder();
-  const bytes = new Uint8Array(stringRows * 40);
-  const offsets = new Uint32Array(stringRows + 1);
-  const fixedIds = new Uint8Array(stringRows);
-  return (): number => {
-    let offset = 0;
-    let semantic = 2_166_136_261;
-    offsets[0] = 0;
-    for (let index = 0; index < stringRows; index++) {
-      const dynamic = dynamicStrings[index]!;
-      const fixed = staticStrings[index & 3]!;
-      const encoded = encoder.encodeInto(dynamic, bytes.subarray(offset));
-      offset += encoded.written;
-      offsets[index + 1] = offset;
-      fixedIds[index] = index & 3;
-      for (let char = 0; char < dynamic.length; char++) semantic = mix(semantic, dynamic.charCodeAt(char));
-      for (let char = 0; char < fixed.length; char++) semantic = mix(semantic, fixed.charCodeAt(char));
-    }
-    return semantic;
-  };
-}
+await validateGrowthAndPinning();
 
-await validateGrowthInvalidation();
-
-for (const capacity of capacities) {
+for (const capacity of CAPACITIES) {
   invariant((capacity & (capacity - 1)) === 0, 'capacity must be a power of two');
   const allocator = await createWasmAllocator({ capacity, initialPages: 17, maxPages: 256 });
-  const column = allocator.alloc8B(capacity);
-  invariant(column !== 0, 'production column allocation failed');
-  const numeric = makeNumericRunners(allocator, capacity, column);
-  const expected = expectedNumericChecksum(writeIterations, capacity);
-  for (const numericRun of [
-    numeric.productionWrapper,
-    numeric.productionExport,
-    numeric.productionGetter,
-    numeric.productionCanonical,
-    numeric.exactLayoutModel,
-  ]) {
-    invariant(numericRun() === expected, 'numeric variant checksum mismatch before timing');
-  }
-  invariant(numeric.descriptor.valueOffset % 8 === 0, 'exact column value offset must be aligned');
-  invariant(numeric.canonicalGeneration === 1, 'non-growing hot path must retain view generation');
+  const numeric = makeNumericRunners(allocator, capacity);
+  const expected = expectedNumericChecksum(WRITE_ITERATIONS, capacity);
+  invariant(numeric.getterViews() === expected, 'getter-view numeric checksum mismatch');
+  invariant(numeric.canonicalViews() === expected, 'canonical-view numeric checksum mismatch');
+  invariant(numeric.pinnedEpoch() === expected, 'pinned-epoch numeric checksum mismatch');
+  invariant(numeric.layout.messageLayoutFamily === 'mixed', 'CallsitePlan chose the wrong message family');
+  invariant(numeric.layout.capacity === capacity, 'PhysicalLayoutPlan chose the wrong capacity');
 
-  group(`WASM numeric layout | capacity=${capacity} rows=${writeIterations}`, () => {
-    bench('current/production-wrapper-writeColF64', () => do_not_optimize(numeric.productionWrapper())).baseline();
-    bench('production-raw-export/write_col_f64', () => do_not_optimize(numeric.productionExport()));
-    bench('production-wrapper/full-memory-getters', () => do_not_optimize(numeric.productionGetter()));
-    bench('production-canonical/full-memory-direct-view-refresh-outside-loop', () =>
-      do_not_optimize(numeric.productionCanonical()),
-    );
-    bench('isolated-model/exact-layout-descriptor-slab', () => do_not_optimize(numeric.exactLayoutModel()));
+  group(`WASM numeric exact layout | capacity=${capacity} rows=${WRITE_ITERATIONS}`, () => {
+    summary(() => {
+      bench('production/allocator-getter-views', () => do_not_optimize(numeric.getterViews())).baseline(true);
+      bench('production/canonical-memory-views', () => do_not_optimize(numeric.canonicalViews()));
+      bench('production/pinned-memory-epoch', () => do_not_optimize(numeric.pinnedEpoch()));
+    });
   });
 
-  const ownershipAllocator = await createWasmAllocator({ capacity, initialPages: 17, maxPages: 256 });
-  const modelSlab = new ExactLayoutDescriptorSlab(capacity, 3);
-  // Allocator counters and ownership/generation assertions stay outside Mitata's timed bodies.
-  validateProductionOwnership(ownershipAllocator, capacity);
-  validateModeledOwnership(modelSlab);
-  const productionOwnership = () => productionOwnershipCycle(ownershipAllocator, capacity);
-  const modeledOwnership = () => modelOwnershipCycle(modelSlab);
-  invariant(
-    productionOwnership() === modeledOwnership(),
-    'production/model ownership semantic checksum mismatch before timing',
-  );
-
-  group(`WASM root/child/overflow ownership | capacity=${capacity} cycles=${ownershipIterations}`, () => {
-    bench('current/production-allocator-acquire-release', () => do_not_optimize(productionOwnership())).baseline();
-    bench('isolated-model/exact-layout-descriptor-slab-acquire-release', () => do_not_optimize(modeledOwnership()));
+  const strategy = await WasmBufferStrategy.create<typeof RUNTIME_SCHEMA>({
+    capacity,
+    initialPages: 17,
+    maxPages: 256,
+  });
+  const expectedOwnership = ownershipCycle(strategy, capacity, 1);
+  invariant(expectedOwnership !== 0, 'production ownership checksum must be observable');
+  group(`WASM root/child/overflow ownership | capacity=${capacity} cycles=${OWNERSHIP_ITERATIONS}`, () => {
+    bench('production/topology-acquire-release', () =>
+      do_not_optimize(ownershipCycle(strategy, capacity, OWNERSHIP_ITERATIONS)),
+    ).baseline(true);
   });
 }
 
-const dynamicSidecar = makeDynamicJsSidecar();
-const staticIdSidecar = makeStaticIdSidecar();
-const utf8SlabSidecar = makeUtf8SlabSidecar();
 const expectedStrings = stringChecksum();
-invariant(dynamicSidecar() === expectedStrings, 'dynamic string sidecar checksum mismatch');
-invariant(staticIdSidecar() === expectedStrings, 'static ID sidecar checksum mismatch');
-invariant(utf8SlabSidecar() === expectedStrings, 'UTF-8 slab sidecar checksum mismatch');
-
-group(`WASM string sidecar lifecycle | rows=${stringRows} static-vocabulary=${staticStrings.length}`, () => {
-  bench('current/allocation-inclusive-dynamic-js-array-sidecars', () =>
-    do_not_optimize(makeDynamicJsSidecar()()),
-  ).baseline();
-  bench('isolated-model/allocation-inclusive-static-id-plus-dynamic-js-sidecar', () =>
-    do_not_optimize(makeStaticIdSidecar()()),
-  );
-  bench('isolated-model/allocation-inclusive-static-id-plus-dynamic-utf8-slab-sidecar', () =>
-    do_not_optimize(makeUtf8SlabSidecar()()),
-  );
-});
-
-group(`WASM string sidecar reused data path | rows=${stringRows} static-vocabulary=${staticStrings.length}`, () => {
-  bench('current/reused-dynamic-js-array-sidecars', () => do_not_optimize(dynamicSidecar())).baseline();
-  bench('isolated-model/reused-static-id-plus-dynamic-js-sidecar', () => do_not_optimize(staticIdSidecar()));
-  bench('isolated-model/reused-static-id-plus-dynamic-utf8-slab-sidecar', () => do_not_optimize(utf8SlabSidecar()));
+invariant(dynamicStringSidecars() === expectedStrings, 'dynamic string sidecar checksum mismatch');
+invariant(vocabularyStringSidecar() === expectedStrings, 'vocabulary string sidecar checksum mismatch');
+group(`WASM string sidecar lifecycle | rows=${STRING_ROWS} vocabulary=${STATIC_STRINGS.length}`, () => {
+  summary(() => {
+    bench('production/dynamic-js-sidecars', () => do_not_optimize(dynamicStringSidecars())).baseline(true);
+    bench('production/dense-vocabulary-plus-dynamic-sidecar', () => do_not_optimize(vocabularyStringSidecar()));
+  });
 });
 
 const format = requestedFormat();
 console.error(
-  'WASM owned-memory preflight passed: growth/view generation, exact-layout ownership, and semantic checksums. ' +
-    `Quick=${quick}; capacities=${capacities.join(',')}; writes=${writeIterations}; ownership cycles=${ownershipIterations}; string rows=${stringRows}.`,
+  'WASM owned-memory preflight passed: PhysicalLayoutPlan exact slabs, memory-epoch pinning, topology release, and vocabulary checksums. ' +
+    `quick=${QUICK}; capacities=${CAPACITIES.join(',')}; writes=${WRITE_ITERATIONS}; ownership cycles=${OWNERSHIP_ITERATIONS}; string rows=${STRING_ROWS}.`,
 );
-
-await run({
-  colors: format === 'mitata' && !process.argv.includes('--no-colors'),
-  format,
-});
+await run({ colors: format === 'mitata' && !process.argv.includes('--no-colors'), format, throw: true });

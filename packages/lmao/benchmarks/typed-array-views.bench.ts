@@ -1,12 +1,13 @@
 /**
  * Benchmark: Lazy vs Cached TypedArray/DataView allocation strategies
  *
- * Compares three patterns for SpanBuffer identity access:
+ * Compares four patterns for SpanBuffer identity access:
  * - Lazy: Create Uint8Array/DataView on each access
  * - Cached: Store views as instance properties, reuse
  * - Hybrid: Cache Uint8Array only, lazy DataView (cold path)
+ * - Direct: Cache Uint8Array and read span IDs byte-by-byte
  *
- * Run: bun run packages/lmao/src/lib/__benchmarks__/typed-array-views.bench.ts
+ * Run: bun packages/lmao/benchmarks/typed-array-views.bench.ts [--quick]
  */
 
 import { bench, boxplot, group, run, summary } from 'mitata';
@@ -196,7 +197,14 @@ class DirectIdentity {
 // =============================================================================
 // Pre-create instances for read benchmarks
 // =============================================================================
-const INSTANCE_COUNT = 10_000;
+const QUICK = process.argv.includes('--quick');
+const INSTANCE_COUNT = QUICK ? 1_000 : 10_000;
+
+function benchmarkGroup(name: string, register: () => void): void {
+  if (!QUICK || name.startsWith('Construction') || name.startsWith('Mixed workload')) {
+    group(name, register);
+  }
+}
 
 const lazyInstances: LazyIdentity[] = [];
 const cachedInstances: CachedIdentity[] = [];
@@ -231,7 +239,7 @@ console.log('');
 // -----------------------------------------------------------------------------
 // 1. Construction Cost
 // -----------------------------------------------------------------------------
-group('Construction (create 10,000 instances)', () => {
+benchmarkGroup(`Construction (create ${INSTANCE_COUNT.toLocaleString()} instances)`, () => {
   summary(() => {
     bench('Lazy', () => {
       const arr: LazyIdentity[] = [];
@@ -270,7 +278,7 @@ group('Construction (create 10,000 instances)', () => {
 // -----------------------------------------------------------------------------
 // 2. spanId reads (cold path - 1 read per instance)
 // -----------------------------------------------------------------------------
-group('spanId read (1x per instance, cold path)', () => {
+benchmarkGroup('spanId read (1x per instance, cold path)', () => {
   summary(() => {
     bench('Lazy', () => {
       let sum = 0;
@@ -309,7 +317,7 @@ group('spanId read (1x per instance, cold path)', () => {
 // -----------------------------------------------------------------------------
 // 3. hasParent reads (single byte read)
 // -----------------------------------------------------------------------------
-group('hasParent read (single byte)', () => {
+benchmarkGroup('hasParent read (single byte)', () => {
   summary(() => {
     bench('Lazy', () => {
       let count = 0;
@@ -348,7 +356,7 @@ group('hasParent read (single byte)', () => {
 // -----------------------------------------------------------------------------
 // 4. 12-byte comparison (hot path - isParentOf/isChildOf)
 // -----------------------------------------------------------------------------
-group('12-byte comparison (hot path)', () => {
+benchmarkGroup('12-byte comparison (hot path)', () => {
   summary(() => {
     bench('Lazy', () => {
       let matches = 0;
@@ -387,7 +395,7 @@ group('12-byte comparison (hot path)', () => {
 // -----------------------------------------------------------------------------
 // 5. Bulk copy with set() (createChild scenario)
 // -----------------------------------------------------------------------------
-group('copyTo with set() (createChild)', () => {
+benchmarkGroup('copyTo with set() (createChild)', () => {
   summary(() => {
     bench('Lazy', () => {
       for (let i = 0; i < INSTANCE_COUNT; i++) {
@@ -419,7 +427,7 @@ group('copyTo with set() (createChild)', () => {
 // 6. Mixed workload (realistic span lifecycle)
 // Each span: construct + 1 spanId read + 2 hasParent + 1 copy
 // -----------------------------------------------------------------------------
-group('Mixed workload (realistic span lifecycle)', () => {
+benchmarkGroup('Mixed workload (realistic span lifecycle)', () => {
   summary(() => {
     bench('Lazy', () => {
       const instances: LazyIdentity[] = [];
@@ -481,7 +489,7 @@ group('Mixed workload (realistic span lifecycle)', () => {
 // -----------------------------------------------------------------------------
 // 7. getBytes() access pattern
 // -----------------------------------------------------------------------------
-group('getBytes() access', () => {
+benchmarkGroup('getBytes() access', () => {
   summary(() => {
     bench('Lazy', () => {
       let sum = 0;
@@ -518,6 +526,7 @@ group('getBytes() access', () => {
 });
 
 // Enable boxplot visualization
+if (!QUICK) {
 boxplot(() => {
   group('All patterns - spanId read', () => {
     bench('Lazy', () => {
@@ -550,6 +559,7 @@ boxplot(() => {
     });
   });
 });
+}
 
 // Run all benchmarks
 await run({
