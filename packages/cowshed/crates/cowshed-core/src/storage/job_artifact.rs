@@ -3863,6 +3863,379 @@ mod tests {
         ArtifactStore::open(root, repo(), incarnation(), config).unwrap()
     }
 
+    fn inline_stream(bytes: &[u8]) -> StreamInfo {
+        StreamInfo {
+            storage: OutputStorage::Captured {
+                artifact: ProtectedOutput::Inline {
+                    data: BinaryData::new(bytes.to_vec()).unwrap(),
+                },
+            },
+            bytes: bytes.len() as u64,
+            sha256: Sha256Digest::compute(bytes),
+            summary: safe_output_summary(),
+        }
+    }
+
+    fn valid_job_record(job_id: u64) -> JobArtifactRecord {
+        JobArtifactRecord {
+            repo_id: repo(),
+            workspace_incarnation: incarnation(),
+            job_id: JobId::new(job_id).unwrap(),
+            sequence: 1,
+            state: JobState::Exited,
+            grant_revision: 1,
+            output_limit: None,
+            stdout: inline_stream(b""),
+            stderr: inline_stream(b""),
+        }
+    }
+
+    fn append_protected_record(root: &Path, record: ProtectedRecord) {
+        let batch = protected_record_to_batch(&record).unwrap();
+        let payload = encode_batch(&batch).unwrap();
+        append_framed_batch(
+            &records_path(root),
+            &payload,
+            Sha256Digest::compute(&payload),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn record_and_manifest_validation_reject_every_invalid_boundary() {
+        let valid = valid_job_record(1);
+        let mut invalid_records = Vec::new();
+
+        let mut zero_sequence = valid.clone();
+        zero_sequence.sequence = 0;
+        invalid_records.push(("zero sequence", zero_sequence));
+
+        let mut missing_limit = valid.clone();
+        missing_limit.state = JobState::OutputLimit;
+        invalid_records.push(("missing output-limit evidence", missing_limit));
+
+        let mut unexpected_limit = valid.clone();
+        unexpected_limit.output_limit = Some(OutputLimitInfo {
+            limit_bytes: 4,
+            crossing_bytes: 5,
+        });
+        invalid_records.push(("unexpected output-limit evidence", unexpected_limit));
+
+        for crossing_bytes in [3, 4] {
+            let mut non_crossing_limit = valid.clone();
+            non_crossing_limit.state = JobState::OutputLimit;
+            non_crossing_limit.output_limit = Some(OutputLimitInfo {
+                limit_bytes: 4,
+                crossing_bytes,
+            });
+            invalid_records.push(("non-crossing output limit", non_crossing_limit));
+        }
+
+        let mut wrong_protected_path = valid.clone();
+        wrong_protected_path.stdout = StreamInfo {
+            storage: OutputStorage::Captured {
+                artifact: ProtectedOutput::File {
+                    path: WorkspacePath::new(".cowshed/job/2/out").unwrap(),
+                },
+            },
+            bytes: 0,
+            sha256: Sha256Digest::compute(b""),
+            summary: safe_output_summary(),
+        };
+        invalid_records.push(("wrong protected path", wrong_protected_path));
+
+        for (case, record) in invalid_records {
+            assert!(
+                matches!(record.validate(), Err(ArtifactError::Integrity { .. })),
+                "{case} must be rejected"
+            );
+            assert!(
+                matches!(
+                    ProtectedRecord::Job(record).validate(),
+                    Err(ArtifactError::Integrity { .. })
+                ),
+                "{case} must also be rejected through protected-record validation"
+            );
+        }
+
+        let visible = VisibleJobCommitment {
+            workspace_incarnation: incarnation(),
+            job_id: JobId::new(1).unwrap(),
+            state: JobState::Exited,
+            stdout: VisibleStreamCommitment::from_stream(&inline_stream(b"")),
+            stderr: VisibleStreamCommitment::from_stream(&inline_stream(b"")),
+        };
+        let valid_manifest = CheckpointManifestRecord {
+            version: RECORD_SCHEMA_VERSION as u16,
+            repo_id: repo(),
+            origin_incarnation: incarnation(),
+            barrier_id: 1,
+            visible_jobs: vec![visible.clone()],
+            records_sha256: Sha256Digest::compute(RECORD_MAGIC),
+        };
+        valid_manifest.validate().unwrap();
+
+        let mut manifests = Vec::new();
+        for (version, barrier_id) in [(0, 1), (1, 0), (0, 0)] {
+            let mut manifest = valid_manifest.clone();
+            manifest.version = version;
+            manifest.barrier_id = barrier_id;
+            manifests.push(("version/barrier boundary", manifest));
+        }
+
+        let mut duplicate = valid_manifest.clone();
+        duplicate.visible_jobs.push(visible.clone());
+        manifests.push(("duplicate visible job", duplicate));
+
+        let mut wrong_path = valid_manifest.clone();
+        wrong_path.visible_jobs[0].stdout = VisibleStreamCommitment {
+            storage_kind: VisibleStorageKind::CapturedFile,
+            bytes: 0,
+            sha256: Sha256Digest::compute(b""),
+            protected_path: Some(WorkspacePath::new(".cowshed/job/2/out").unwrap()),
+        };
+        manifests.push(("wrong visible protected path", wrong_path));
+
+        let mut missing_path = valid_manifest.clone();
+        missing_path.visible_jobs[0].stdout.storage_kind = VisibleStorageKind::CapturedFile;
+        manifests.push(("file commitment without path", missing_path));
+
+        let mut running_inline = valid_manifest.clone();
+        running_inline.visible_jobs[0].state = JobState::Running;
+        manifests.push(("running inline prefix", running_inline));
+
+        for (case, manifest) in manifests {
+            assert!(
+                matches!(manifest.validate(), Err(ArtifactError::Integrity { .. })),
+                "{case} must be rejected"
+            );
+            assert!(
+                matches!(
+                    ProtectedRecord::CheckpointManifest(manifest).validate(),
+                    Err(ArtifactError::Integrity { .. })
+                ),
+                "{case} must also be rejected through protected-record validation"
+            );
+        }
+    }
+
+    #[test]
+    fn append_record_refuses_poison_and_duplicate_terminal_after_seal() {
+        let root = temp_root("append-guards");
+        let store = store_at(&root, ArtifactConfig::default());
+        let sealed = store
+            .start_job(1, OutputTargets::default())
+            .unwrap()
+            .seal(JobState::Exited)
+            .unwrap();
+        let records = records_path(&root);
+        let sealed_len = fs::metadata(&records).unwrap().len();
+
+        assert!(matches!(
+            store.append_record(sealed.record.clone()),
+            Err(ArtifactError::Integrity { message, .. })
+                if message.contains("duplicate terminal")
+        ));
+        assert_eq!(fs::metadata(&records).unwrap().len(), sealed_len);
+
+        let poison = ArtifactError::WriterPoisoned("injected poison".into());
+        *store
+            .inner
+            .records_poison
+            .lock()
+            .expect("records poison lock") = Some(poison.clone());
+        let mut running = valid_job_record(2);
+        running.state = JobState::Running;
+        assert_eq!(store.append_record(running), Err(poison));
+        assert_eq!(fs::metadata(&records).unwrap().len(), sealed_len);
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_hashes_missing_and_exactly_empty_records_as_magic_prefix() {
+        for (case, precreate_empty) in [("missing", false), ("empty", true)] {
+            let root = temp_root(case);
+            let store = store_at(&root, ArtifactConfig::default());
+            if precreate_empty {
+                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+                let path = records_path(&root);
+                ensure_private_job_root(&root).unwrap();
+                OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+            }
+
+            let checkpoint = store.checkpoint(1).unwrap();
+            assert_eq!(
+                checkpoint.record.records_sha256,
+                Sha256Digest::compute(RECORD_MAGIC),
+                "{case} records must commit the initialized magic prefix"
+            );
+            drop(store);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn reopened_checkpoint_barriers_are_scoped_to_their_manifest_origin() {
+        let historical = WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let historical_root = temp_root("historical-manifest");
+        append_protected_record(
+            &historical_root,
+            ProtectedRecord::CheckpointManifest(CheckpointManifestRecord {
+                version: RECORD_SCHEMA_VERSION as u16,
+                repo_id: repo(),
+                origin_incarnation: historical.clone(),
+                barrier_id: 50,
+                visible_jobs: Vec::new(),
+                records_sha256: Sha256Digest::compute(RECORD_MAGIC),
+            }),
+        );
+        assert!(matches!(
+            ArtifactStore::open(
+                &historical_root,
+                repo(),
+                incarnation(),
+                ArtifactConfig::default()
+            ),
+            Err(ArtifactError::Integrity { .. })
+        ));
+        let historical_store = ArtifactStore::open(
+            &historical_root,
+            repo(),
+            incarnation(),
+            ArtifactConfig {
+                admitted_historical_incarnations: BTreeSet::from([historical]),
+                ..ArtifactConfig::default()
+            },
+        )
+        .unwrap();
+        historical_store.checkpoint(1).unwrap();
+        drop(historical_store);
+        fs::remove_dir_all(historical_root).unwrap();
+
+        let current_root = temp_root("current-manifest");
+        let current_store = store_at(&current_root, ArtifactConfig::default());
+        current_store.checkpoint(7).unwrap();
+        drop(current_store);
+        let reopened = store_at(&current_root, ArtifactConfig::default());
+        assert!(matches!(
+            reopened.checkpoint(7),
+            Err(ArtifactError::Integrity { .. })
+        ));
+        reopened.checkpoint(8).unwrap();
+        drop(reopened);
+        fs::remove_dir_all(current_root).unwrap();
+    }
+
+    #[test]
+    fn buffer_budget_reservation_boundaries_never_wrap_or_overcommit() {
+        let cases = [
+            (0, 0, 0, true, 0),
+            (0, 0, 1, false, 0),
+            (0, 1, 1, true, 1),
+            (1, 1, 0, true, 1),
+            (1, 1, 1, false, 1),
+            (3, 4, 1, true, 4),
+            (3, 4, 2, false, 3),
+            (usize::MAX, usize::MAX, 1, false, usize::MAX),
+        ];
+        for (used, limit, requested, accepted, expected_used) in cases {
+            let mut budget = BufferBudget { used, limit };
+            assert_eq!(
+                budget.try_reserve(requested),
+                accepted,
+                "used={used}, limit={limit}, requested={requested}"
+            );
+            assert_eq!(budget.used, expected_used);
+        }
+
+        let mut budget = BufferBudget { used: 4, limit: 4 };
+        for release in [0, 1, 3] {
+            budget.release(release);
+        }
+        assert_eq!(budget.used, 0);
+    }
+
+    #[test]
+    fn framed_batch_limit_accepts_exact_boundary_and_rejects_first_byte_over() {
+        let cases = [
+            (2 * 1024 + 9, true),
+            (MAX_RECORD_BATCH_BYTES as usize, true),
+            (MAX_RECORD_BATCH_BYTES as usize + 1, false),
+        ];
+        for (length, accepted) in cases {
+            let root = temp_root(&format!("frame-size-{length}"));
+            let path = records_path(&root);
+            let payload = vec![0x5a; length];
+            let result = append_framed_batch(&path, &payload, Sha256Digest::compute(&payload));
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "payload length {length} has the wrong admission result"
+            );
+            if accepted {
+                assert_eq!(
+                    fs::metadata(&path).unwrap().len(),
+                    (RECORD_MAGIC.len() + FRAME_OVERHEAD_BYTES + length) as u64
+                );
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_create_and_open_descriptors_enforce_metadata_and_cloexec() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = temp_root("protected-descriptors");
+        let store = store_at(&root, ArtifactConfig::default());
+        let job_id = JobId::new(1).unwrap();
+        let mut file = create_protected_file(&store, job_id, StreamKind::Stdout).unwrap();
+        let path = protected_absolute(&store, job_id, StreamKind::Stdout);
+        let metadata = file.metadata().unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.len(), 0);
+        assert_ne!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        file.write_all(b"protected").unwrap();
+        seal_file(file, &path).unwrap();
+
+        let relative = protected_relative(job_id, StreamKind::Stdout).unwrap();
+        let opened = open_artifact_no_follow(&root, &relative).unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(opened.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        let metadata = opened.metadata().unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o400);
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.len(), b"protected".len() as u64);
+        drop(opened);
+        use std::os::unix::fs::symlink;
+        let hash_alias = root.join("hash-alias");
+        symlink(&path, &hash_alias).unwrap();
+        assert!(matches!(
+            hash_file_incrementally(&hash_alias),
+            Err(ArtifactError::Io { .. })
+        ));
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn admission(order: u64) -> ControllerCommitment {
         ControllerCommitment::Admission(AdmissionCommitment {
             version: CONTROLLER_COMMITMENT_VERSION,

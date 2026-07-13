@@ -170,18 +170,22 @@ Restore is one fenced transaction on both substrates:
    checkpoint identity, format/dataset, and absence of a concurrent retire. Stop admitting jobs, drain the
    revision-bound supervisor, and detach/unmount the current workspace.
 2. Prepare the replacement at a non-enumerated staging name. Clone the checkpoint, validate it (including fsck on APFS),
-   and preserve the logical workspace name, grant binding, CA, primary `repo_id`, and the macOS `portBlock` only when
-   present. Linux preserves no port block; its connector endpoint is recreated as attachment topology.
+   and validate the complete protected `CheckpointManifestRecord` against the controller `CheckpointCommitment`:
+   `repo_id`, `origin_incarnation`, `barrier_id`, visible stream counts/hashes/paths, `records_sha256`, and
+   `manifest_batch_sha256` must agree. Missing/altered content, invalid complete frames, or digest mismatch is typed
+   `Integrity` before publication; only an incomplete trailing frame may be discarded as reported recovery with its
+   `batch_sha256` retained. Preserve the logical workspace name, grant binding, CA, primary `repo_id`, and macOS
+   `portBlock` only when present. Linux preserves no port block.
 3. Mint the fresh `workspaceIncarnation` first. Then mint a fresh gateway token bound to that incarnation and write both
-   into the staged marker/token files, flush them, and verify them while the replacement is still not discoverable.
-   Copied job records retain their producer incarnation; the new incarnation's numeric job sequence starts
-   independently.
+   into staged marker/token files, flush, and verify while undiscoverable. Copied job records retain their producer
+   incarnation; allocation in the new incarnation starts above every inherited numeric job ID.
 4. Atomically swap the staged replacement into the canonical image/dataset name while moving the displaced workspace to
    the undo checkpoint. Mount at the canonical path, then validate marker, incarnation, token, policy binding, and
    grants.
-5. Publish detached metadata carrying the new incarnation with an atomic replace and parent-directory fsync. Only after
-   that publication may the gateway accept the new token, a supervisor launch, or an exec. The old token is revoked at
-   the same publication boundary; no interval admits both incarnations.
+5. In one publication transaction, append
+   `RestoreCommitment { version,order,repo_id,source_checkpoint,source_incarnation,destination_incarnation }`, publish
+   detached metadata for the new incarnation with atomic replace + parent fsync, and switch gateway acceptance from the
+   old token to the new. Only then may the gateway, supervisor, or exec admit the incarnation; no interval admits both.
 6. On any failure before publication, unmount and remove the staged replacement, restore the displaced workspace under
    its original name, remount it, and resume its original supervisor/token. After publication, recovery completes the
    new state and never rolls back across the incarnation fence. `gc` resumes only idempotent cleanup.

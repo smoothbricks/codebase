@@ -225,10 +225,19 @@ actually produced it.
 a queryable provenance graph (13_telemetry.md). The in-image `.cowshed/` directory also holds `token` (the gateway
 identity, 0600, rewritten on new/fork/restore so identities never duplicate), the workspace CA **certificate** (the
 public trust anchor for egress interception — the private key stays controller-side, 04_sandbox.md/05_gateway.md), the
-in-image cache roots (03_caches.md), and `.cowshed/job/` — each exec receives a workspace-local monotonic numeric ID and
-stores its full raw streams at `.cowshed/job/<numeric-id>/out` and `.cowshed/job/<numeric-id>/err`; Arrow exec records
-live at `.cowshed/job/records.arrow` (11_shell.md/13_telemetry.md). Because job output lives inside the volume, a
-checkpoint captures the execution history alongside the filesystem state it produced: snapshot-as-evidence.
+in-image cache roots (03_caches.md), and the protected `.cowshed/job/` authority domain.
+
+The trusted supervisor is the only live writer beneath `.cowshed/job/**`; every executed shell, named session, startup
+hook, and descendant receives the mandatory child restriction before repository-controlled code runs (04_sandbox.md).
+`.cowshed/job/records.arrow` is the framed protected `ProtectedRecord` stream: `Job(JobArtifactRecord)` or
+`CheckpointManifest(CheckpointManifestRecord)`. Small terminal stdout/stderr may live as Arrow Binary in a Job row. A
+stream promotes lazily to `.cowshed/job/<numeric-id>/out` or `err` only when it exceeds the bounded inline limit or a
+checkpoint/background/replay requirement forces residency; no per-job path is promised. Each stream records byte count,
+SHA-256, bounded summary, and exact captured/redirect plus inline/file discriminants. Checkpoint manifests carry
+`version, repo_id, origin_incarnation, barrier_id, visible_jobs, records_sha256`; the visible stream commitment is
+`storage_kind, bytes, sha256, protected_path` with path present iff file. Complete Arrow batches and sealed spills are
+immutable. Compact controller Admission/Terminal/Checkpoint/Fork/Restore commitments own existence/status/order/lineage
+and expected hashes/digests, never raw payload or artifact paths (02_workspaces.md/07_api.md/13_telemetry.md).
 
 ### Grant files live outside the volume
 

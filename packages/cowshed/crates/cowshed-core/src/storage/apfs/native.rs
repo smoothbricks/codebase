@@ -11,18 +11,18 @@ use std::thread;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 
 use crate::apfs::{
     ApfsBackend, AttachedImage, CommandRunner, CreateImageRequest, CreatedImage, DetachTarget,
-    ImageFormatSelection, MacOsApfsBackend,
+    ImageFormatSelection, MacOsApfsBackend, MountAccess,
 };
 use crate::copy::TreeCopier;
 use crate::metadata::{
-    DetachedWorkspaceMetadata, ImageFormat, METADATA_VERSION, Platform, WorkspaceIncarnation,
-    WorkspaceMarker, WorkspaceName, WorkspaceRole, sidecar_path,
+    DetachedWorkspaceMetadata, ImageFormat, METADATA_VERSION, Platform, PublicationState,
+    WorkspaceIncarnation, WorkspaceMarker, WorkspaceName, WorkspaceRole, sidecar_path,
 };
 use crate::repository::RepoId;
 use serde::{Deserialize, Serialize};
@@ -36,7 +36,8 @@ use super::super::{
 };
 use super::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, LockMode, MarkerExpectation,
-    MetadataPolicy, PublicationDisposition, PublicationError, layout, volume_name,
+    MetadataPolicy, PendingPublicationFact, PublicationDisposition, PublicationError,
+    companion_path, layout, volume_name,
 };
 
 const CHECKPOINT_FACT_VERSION: u32 = 1;
@@ -904,7 +905,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let layout = layout(&self.config, repo)?;
         let mut facts = Vec::new();
         let main = WorkspaceName::new("main").expect("fixed main name is valid");
-        if let Some((_, metadata)) = self.find_canonical_image(repo, &main)? {
+        if let Some((_, metadata)) = self.find_canonical_image(repo, &main)?
+            && metadata.publication_state == PublicationState::Active
+        {
             facts.push(StorageFact {
                 workspace: metadata_workspace_ref(&metadata)?,
                 volume_name: volume_name(repo, &main),
@@ -931,6 +934,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     "detached metadata identity mismatch for {}",
                     discovered.path().display()
                 )));
+            }
+            if metadata.publication_state == PublicationState::PendingFence {
+                continue;
             }
             facts.push(StorageFact {
                 workspace: metadata_workspace_ref(&metadata)?,
@@ -1021,7 +1027,10 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         fs::create_dir_all(mount_point)
             .map_err(|error| io_error("create recovery mount", mount_point, error))?;
         let attachment = self.backend.attach_verified(image, format)?;
-        if let Err(primary) = self.backend.mount(&attachment, mount_point, false) {
+        if let Err(primary) =
+            self.backend
+                .mount(&attachment, mount_point, MountAccess::ReadOnly, false)
+        {
             let cleanup = self.backend.detach(&attachment, true).map_err(Into::into);
             return super::combine_cleanup("recovery marker mount", primary.into(), cleanup);
         }
@@ -1380,11 +1389,15 @@ where
         repo: &RepoId,
         workspace: &WorkspaceName,
     ) -> Result<ImageFormat, ApfsStorageError> {
-        self.find_canonical_image(repo, workspace)?
-            .map(|(_, metadata)| metadata.image_format)
-            .ok_or(ApfsStorageError::Host(format!(
-                "published workspace is missing: {repo}/{workspace}"
-            )))
+        let (image, metadata) =
+            self.find_canonical_image(repo, workspace)?
+                .ok_or(ApfsStorageError::Host(format!(
+                    "published workspace is missing: {repo}/{workspace}"
+                )))?;
+        if metadata.publication_state == PublicationState::PendingFence {
+            return Err(ApfsStorageError::PendingPublication(image));
+        }
+        Ok(metadata.image_format)
     }
 
     fn create_staged(
@@ -1454,6 +1467,13 @@ where
                 image.display()
             )));
         }
+        if metadata.publication_state == PublicationState::PendingFence
+            && !image
+                .components()
+                .any(|component| component.as_os_str() == super::STAGING_NAMESPACE)
+        {
+            return Err(ApfsStorageError::PendingPublication(image.to_owned()));
+        }
         self.backend
             .attach_verified(image, format)
             .map_err(Into::into)
@@ -1463,11 +1483,12 @@ where
         &self,
         attachment: &Self::Attachment,
         mount_point: &Path,
+        access: MountAccess,
         browse: bool,
     ) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(mount_point)?;
         self.backend
-            .mount(attachment, mount_point, browse)
+            .mount(attachment, mount_point, access, browse)
             .map_err(Into::into)
     }
 
@@ -1561,6 +1582,26 @@ where
                 expected.format
             )))
         }
+    }
+
+    fn validate_staged_companion(&self, path: &Path) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(path)?;
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| io_error("inspect staged CA key", path, error))?;
+        if !metadata.file_type().is_file() {
+            return Err(ApfsStorageError::Host(format!(
+                "staged CA key is not a regular file: {}",
+                path.display()
+            )));
+        }
+        #[cfg(unix)]
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err(ApfsStorageError::Host(format!(
+                "staged CA key must have mode 0600: {}",
+                path.display()
+            )));
+        }
+        Ok(())
     }
 
     fn heal_mount(
@@ -1723,6 +1764,18 @@ where
             DetachedWorkspaceMetadata::read_for_image(staged).map_err(|error| {
                 PublicationError::rolled_back(ApfsStorageError::Host(error.to_string()))
             })?;
+        let staged_companion = companion_path(staged);
+        let canonical_companion = companion_path(canonical);
+        self.validate_staged_companion(&staged_companion)
+            .map_err(PublicationError::rolled_back)?;
+        if canonical_companion.exists() {
+            return Err(PublicationError::forward_only(ApfsStorageError::Host(
+                format!(
+                    "canonical CA key already exists: {}",
+                    canonical_companion.display()
+                ),
+            )));
+        }
         let publication = (|| {
             Self::rename_sidecar(staged, canonical)?;
             if self.restore_failpoint.load(AtomicOrdering::SeqCst)
@@ -1735,6 +1788,9 @@ where
             self.trip_restore_failpoint(RestoreFailpoint::AfterCanonicalSidecarRename)?;
             sync_parent!(&sidecar_path(canonical))?;
             self.trip_restore_failpoint(RestoreFailpoint::AfterMetadataFsync)?;
+            fs::rename(&staged_companion, &canonical_companion).map_err(|error| {
+                io_error("publish canonical CA key", &canonical_companion, error)
+            })?;
             fs::rename(staged, canonical)
                 .map_err(|error| io_error("publish canonical image", canonical, error))?;
             self.trip_restore_failpoint(RestoreFailpoint::AfterCanonicalImageRename)?;
@@ -1746,7 +1802,7 @@ where
         };
 
         let canonical_sidecar = sidecar_path(canonical);
-        if canonical.exists() && canonical_sidecar.exists() {
+        if canonical.exists() && canonical_sidecar.exists() && canonical_companion.exists() {
             let verified = (|| {
                 let actual = DetachedWorkspaceMetadata::read_for_image(canonical)
                     .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
@@ -1781,15 +1837,26 @@ where
                     "injected canonical sidecar rollback rename failure".to_owned(),
                 ))
             } else {
-                fs::rename(&canonical_sidecar, &staged_sidecar)
-                    .map_err(|error| {
-                        io_error(
-                            "roll back prepublication canonical metadata",
-                            &staged_sidecar,
-                            error,
-                        )
-                    })
-                    .and_then(|()| sync_parent!(&staged_sidecar))
+                (|| {
+                    if canonical_companion.exists() {
+                        fs::rename(&canonical_companion, &staged_companion).map_err(|error| {
+                            io_error(
+                                "roll back prepublication canonical CA key",
+                                &staged_companion,
+                                error,
+                            )
+                        })?;
+                    }
+                    fs::rename(&canonical_sidecar, &staged_sidecar)
+                        .map_err(|error| {
+                            io_error(
+                                "roll back prepublication canonical metadata",
+                                &staged_sidecar,
+                                error,
+                            )
+                        })
+                        .and_then(|()| sync_parent!(&staged_sidecar))
+                })()
             };
             return match rollback {
                 Ok(()) => Err(PublicationError::rolled_back(primary)),
@@ -1801,7 +1868,7 @@ where
             };
         }
 
-        if canonical.exists() || canonical_sidecar.exists() {
+        if canonical.exists() || canonical_sidecar.exists() || canonical_companion.exists() {
             Err(PublicationError::forward_only(primary))
         } else {
             Err(PublicationError::rolled_back(primary))
@@ -1916,11 +1983,11 @@ where
             .validate_path(image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         let preserved = match (policy, source_image) {
-            (MetadataPolicy::Preserve, Some(source)) => Some(
+            (MetadataPolicy::Preserve | MetadataPolicy::PendingFence, Some(source)) => Some(
                 DetachedWorkspaceMetadata::read_for_image(source)
                     .map_err(|error| ApfsStorageError::Host(error.to_string()))?,
             ),
-            (MetadataPolicy::Preserve, None) => {
+            (MetadataPolicy::Preserve | MetadataPolicy::PendingFence, None) => {
                 return Err(ApfsStorageError::InvalidPlan(
                     "preserved metadata requires a source image",
                 ));
@@ -1953,6 +2020,10 @@ where
             workspace_incarnation: workspace.incarnation().clone(),
             image_format: workspace.format(),
             platform: Platform::Macos,
+            publication_state: match policy {
+                MetadataPolicy::PendingFence => PublicationState::PendingFence,
+                MetadataPolicy::Fresh | MetadataPolicy::Preserve => PublicationState::Active,
+            },
             updated_at,
             grants,
             info_snapshot: preserved.and_then(|metadata| metadata.info_snapshot),
@@ -2008,36 +2079,64 @@ where
         }
         let canonical_sidecar = sidecar_path(canonical);
         let undo_sidecar = sidecar_path(undo);
+        let staged_companion = companion_path(staged);
+        let canonical_companion = companion_path(canonical);
+        let undo_companion = companion_path(undo);
         DetachedWorkspaceMetadata::read_for_image(staged)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         DetachedWorkspaceMetadata::read_for_image(canonical)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        self.validate_staged_companion(&staged_companion)?;
+        self.validate_staged_companion(&canonical_companion)?;
         fs::hard_link(&canonical_sidecar, &undo_sidecar)
             .map_err(|error| io_error("retain restore metadata", &undo_sidecar, error))?;
+        if let Err(error) = fs::hard_link(&canonical_companion, &undo_companion) {
+            let _ = fs::remove_file(&undo_sidecar);
+            return Err(io_error("retain restore CA key", &undo_companion, error));
+        }
         self.trip_restore_failpoint(RestoreFailpoint::AfterUndoSidecar)?;
         if let Err(error) = swap_paths(canonical, staged) {
             let _ = fs::remove_file(&undo_sidecar);
+            let _ = fs::remove_file(&undo_companion);
             return Err(error);
+        }
+        if let Err(primary) = swap_paths(&canonical_companion, &staged_companion) {
+            let rollback = swap_paths(canonical, staged);
+            let _ = fs::remove_file(&undo_sidecar);
+            let _ = fs::remove_file(&undo_companion);
+            return super::combine_cleanup("restore CA key swap", primary, rollback);
         }
         self.trip_restore_failpoint(RestoreFailpoint::AfterImageSwap)?;
         if let Err(error) = fs::rename(staged, undo) {
             let primary = io_error("retain restore undo image", undo, error);
-            let rollback = swap_paths(canonical, staged);
+            let rollback = swap_paths(&canonical_companion, &staged_companion)
+                .and_then(|()| swap_paths(canonical, staged));
             let _ = fs::remove_file(&undo_sidecar);
-            return match rollback {
-                Ok(()) => Err(primary),
-                Err(cleanup) => Err(ApfsStorageError::Cleanup {
-                    operation: "restore swap",
-                    primary: Box::new(primary),
-                    cleanup: Box::new(cleanup),
-                }),
-            };
+            let _ = fs::remove_file(&undo_companion);
+            return super::combine_cleanup("restore swap", primary, rollback);
         }
+        fs::remove_file(&staged_companion)
+            .map_err(|error| io_error("remove displaced CA key", &staged_companion, error))?;
         self.trip_restore_failpoint(RestoreFailpoint::AfterUndoRename)?;
         sync_parent!(canonical)?;
         sync_parent!(undo)
     }
 
+    fn activate_restored_metadata(&self, canonical: &Path) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(canonical)?;
+        let mut metadata = DetachedWorkspaceMetadata::read_for_image(canonical)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        if metadata.publication_state != PublicationState::PendingFence {
+            return Err(ApfsStorageError::InvalidPlan(
+                "only a pending restore publication can be activated",
+            ));
+        }
+        metadata.publication_state = PublicationState::Active;
+        metadata
+            .write_for_image(canonical)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        sync_parent!(canonical)
+    }
     fn publish_restored_metadata(
         &self,
         staged: &Path,
@@ -2053,7 +2152,7 @@ where
             canonical,
             workspace,
             revision,
-            MetadataPolicy::Preserve,
+            MetadataPolicy::PendingFence,
             None,
             Some(source_image),
         )?;
@@ -2097,22 +2196,31 @@ where
         self.verify_controller_path(canonical)?;
         self.verify_controller_path(trash)?;
         Self::ensure_parent(trash)?;
-        if trash.exists() {
+        let canonical_companion = companion_path(canonical);
+        let trash_companion = companion_path(trash);
+        if trash.exists() || trash_companion.exists() {
             return Err(ApfsStorageError::Host(format!(
-                "retired image already exists: {}",
+                "retired image artifacts already exist: {}",
                 trash.display()
             )));
         }
+        self.validate_staged_companion(&canonical_companion)?;
         fs::rename(canonical, trash).map_err(|error| io_error("retire image", trash, error))?;
-        if let Err(error) = Self::rename_sidecar(canonical, trash) {
-            return match fs::rename(trash, canonical) {
-                Ok(()) => Err(error),
-                Err(rollback) => Err(ApfsStorageError::Cleanup {
-                    operation: "retire image",
-                    primary: Box::new(error),
-                    cleanup: Box::new(io_error("roll back retirement", canonical, rollback)),
-                }),
-            };
+        if let Err(primary) = Self::rename_sidecar(canonical, trash) {
+            return super::combine_cleanup(
+                "retire image",
+                primary,
+                fs::rename(trash, canonical)
+                    .map_err(|error| io_error("roll back retirement", canonical, error)),
+            );
+        }
+        if let Err(error) = fs::rename(&canonical_companion, &trash_companion) {
+            let primary = io_error("retire CA key", &trash_companion, error);
+            let cleanup = Self::rename_sidecar(trash, canonical).and_then(|()| {
+                fs::rename(trash, canonical)
+                    .map_err(|error| io_error("roll back retirement", canonical, error))
+            });
+            return super::combine_cleanup("retire image", primary, cleanup);
         }
         sync_parent!(trash)
     }
@@ -2120,6 +2228,12 @@ where
     fn reclaim_image(&self, image: &Path, format: ImageFormat) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(image)?;
         self.backend.delete_image(image, format)?;
+        let companion = companion_path(image);
+        match fs::remove_file(&companion) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("remove CA key", &companion, error)),
+        }
         Self::remove_sidecar(image)?;
         let fact = checkpoint_fact_path(image);
         match fs::remove_file(&fact) {
@@ -2131,6 +2245,56 @@ where
 
     fn list(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError> {
         self.published_facts(repo)
+    }
+
+    fn pending_publications(
+        &self,
+        repo: &RepoId,
+    ) -> Result<Vec<PendingPublicationFact>, ApfsStorageError> {
+        let storage = layout(&self.config, repo)?;
+        let mut pending = Vec::new();
+        let main = WorkspaceName::new("main").expect("fixed main name is valid");
+        if let Some((image, metadata)) = self.find_canonical_image(repo, &main)?
+            && metadata.publication_state == PublicationState::PendingFence
+        {
+            pending.push(PendingPublicationFact {
+                workspace: metadata_workspace_ref(&metadata)?,
+                mount_point: self.expected_mount_point(&metadata)?,
+                image,
+            });
+        }
+        let entries = match fs::read_dir(&storage.project().sessions) {
+            Ok(entries) => entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .collect::<Vec<_>>(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(io_error(
+                    "enumerate pending session images",
+                    &storage.project().sessions,
+                    error,
+                ));
+            }
+        };
+        for discovered in discover_session_images(entries)? {
+            let metadata = DetachedWorkspaceMetadata::read_for_image(discovered.path())
+                .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+            if metadata.publication_state != PublicationState::PendingFence {
+                continue;
+            }
+            if metadata.repo_id != *repo || metadata.workspace != *discovered.workspace() {
+                return Err(ApfsStorageError::Host(format!(
+                    "pending detached metadata identity mismatch for {}",
+                    discovered.path().display()
+                )));
+            }
+            pending.push(PendingPublicationFact {
+                workspace: metadata_workspace_ref(&metadata)?,
+                mount_point: self.expected_mount_point(&metadata)?,
+                image: discovered.path().to_owned(),
+            });
+        }
+        Ok(pending)
     }
 
     fn mounts(&self, repo: &RepoId) -> Result<Vec<KernelMountFact>, ApfsStorageError> {
@@ -2568,6 +2732,11 @@ where
             .format()
             .validate_path(image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        let detached = DetachedWorkspaceMetadata::read_for_image(image)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        if detached.publication_state == PublicationState::PendingFence {
+            return Err(ApfsStorageError::PendingPublication(image.to_owned()));
+        }
         let metadata =
             fs::metadata(image).map_err(|error| io_error("read image statistics", image, error))?;
         #[cfg(unix)]

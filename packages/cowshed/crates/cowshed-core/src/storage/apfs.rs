@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use crate::apfs::{
     ApfsCaseSensitivity, ApfsError, CreateImageRequest, CreatedImage, ImageFormatSelection,
+    MountAccess,
 };
 use crate::metadata::{ImageFormat, WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use crate::repository::RepoId;
@@ -80,6 +81,7 @@ impl IncarnationSource for UuidIncarnationSource {
 pub enum MetadataPolicy {
     Fresh,
     Preserve,
+    PendingFence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,21 +110,55 @@ pub struct PublishedImage {
     pub mount_point: PathBuf,
 }
 
-/// Mounted, controller-private adoption stage. It is not published into workspace enumeration.
+/// Mounted, controller-private workspace stage. It is not published into workspace enumeration.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdoptStage {
+pub struct WorkspaceStage {
     pub workspace: LifecycleWorkspace,
+    pub mount_point: PathBuf,
+    pub companion: PathBuf,
+}
+
+pub type AdoptStage = WorkspaceStage;
+pub type CreateStage = WorkspaceStage;
+pub type ForkStage = WorkspaceStage;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RestoreStage {
+    Verify {
+        workspace: LifecycleWorkspace,
+        label: CheckpointLabel,
+        revision: Revision,
+        image: PathBuf,
+        mount_point: PathBuf,
+    },
+    Replace(WorkspaceStage),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointStage {
+    pub checkpoint: CheckpointRef,
+    pub image: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingPublicationFact {
+    pub workspace: LifecycleWorkspace,
+    pub image: PathBuf,
     pub mount_point: PathBuf,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestoreFence {
+    pub pending: PendingPublicationFact,
+}
+
 #[derive(Debug, Error)]
-pub enum AdoptExecutionError<E> {
-    #[error("APFS adopt staging failed: {0}")]
+pub enum StagedExecutionError<E> {
+    #[error("staged lifecycle execution failed: {0}")]
     Storage(#[source] ApfsStorageError),
-    #[error("adopt initializer failed: {0}")]
+    #[error("staged lifecycle initializer failed: {0}")]
     Initializer(E),
     #[error(
-        "adopt initializer failed and staging cleanup also failed: initializer={initializer}; cleanup={cleanup}"
+        "staged lifecycle initializer failed and cleanup also failed: initializer={initializer}; cleanup={cleanup}"
     )]
     InitializerCleanup {
         initializer: E,
@@ -131,7 +167,44 @@ pub enum AdoptExecutionError<E> {
     },
 }
 
-impl<E> From<ApfsStorageError> for AdoptExecutionError<E> {
+#[derive(Debug, Error)]
+pub enum RestoreExecutionError<P, F> {
+    #[error("restore staging failed: {0}")]
+    Storage(#[source] ApfsStorageError),
+    #[error("restore prepare callback failed: {0}")]
+    Prepare(P),
+    #[error(
+        "restore prepare callback failed and cleanup also failed: prepare={prepare}; cleanup={cleanup}"
+    )]
+    PrepareCleanup {
+        prepare: P,
+        #[source]
+        cleanup: ApfsStorageError,
+    },
+    #[error("restore fence failed with a pending forward-only publication: {source}")]
+    Fence {
+        source: F,
+        pending: PendingPublicationFact,
+    },
+    #[error("restore fence succeeded but pending publication activation failed: {source}")]
+    Activation {
+        #[source]
+        source: ApfsStorageError,
+        pending: PendingPublicationFact,
+    },
+}
+
+impl<P, F> From<ApfsStorageError> for RestoreExecutionError<P, F> {
+    fn from(error: ApfsStorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+pub type AdoptExecutionError<E> = StagedExecutionError<E>;
+pub type CreateExecutionError<E> = StagedExecutionError<E>;
+pub type ForkExecutionError<E> = StagedExecutionError<E>;
+pub type CheckpointExecutionError<E> = StagedExecutionError<E>;
+
+impl<E> From<ApfsStorageError> for StagedExecutionError<E> {
     fn from(error: ApfsStorageError) -> Self {
         Self::Storage(error)
     }
@@ -230,6 +303,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         &self,
         attachment: &Self::Attachment,
         mount_point: &Path,
+        access: MountAccess,
         browse: bool,
     ) -> Result<(), ApfsStorageError>;
     fn chown_volume_root(&self, mount_point: &Path) -> Result<(), ApfsStorageError>;
@@ -246,6 +320,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         mount_point: &Path,
         expected: &MarkerExpectation,
     ) -> Result<(), ApfsStorageError>;
+    fn validate_staged_companion(&self, path: &Path) -> Result<(), ApfsStorageError>;
     fn detach(&self, attachment: Self::Attachment, force: bool) -> Result<(), ApfsStorageError>;
     fn heal_mount(
         &self,
@@ -300,6 +375,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         revision: Revision,
         source_image: &Path,
     ) -> Result<(), ApfsStorageError>;
+    fn activate_restored_metadata(&self, canonical: &Path) -> Result<(), ApfsStorageError>;
     fn rollback_restore(
         &self,
         canonical: &Path,
@@ -309,6 +385,10 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     fn retire_image(&self, canonical: &Path, trash: &Path) -> Result<(), ApfsStorageError>;
     fn reclaim_image(&self, image: &Path, format: ImageFormat) -> Result<(), ApfsStorageError>;
     fn list(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError>;
+    fn pending_publications(
+        &self,
+        repo: &RepoId,
+    ) -> Result<Vec<PendingPublicationFact>, ApfsStorageError>;
     fn mounts(&self, repo: &RepoId) -> Result<Vec<KernelMountFact>, ApfsStorageError>;
     fn checkpoints(&self, repo: &RepoId) -> Result<Vec<CheckpointFact>, ApfsStorageError>;
     fn recover_pending(
@@ -366,6 +446,8 @@ pub enum ApfsStorageError {
     Conflict(#[from] super::lifecycle::Conflict),
     #[error("derived APFS state is inconsistent: {0}")]
     Derivation(#[from] super::lifecycle::DerivationError),
+    #[error("workspace publication is pending its controller fence: {0}")]
+    PendingPublication(PathBuf),
     #[error("blocking APFS task failed: {0}")]
     BlockingTask(String),
     #[error("image capacity must not be empty")]
@@ -398,8 +480,6 @@ impl From<ExecuteError<ApfsStorageError>> for ApfsStorageError {
 #[derive(Debug)]
 enum Applied {
     Lifecycle(LifecycleReceipt),
-    Checkpoint(CheckpointRef),
-    Restore(RestoreReceipt),
     Retired(RetiredRef),
 }
 
@@ -533,8 +613,8 @@ where
                 .dispatch(move || abort_prepared_adopt(host.as_ref(), prepared))
                 .await;
             return Err(match cleanup {
-                Ok(()) => AdoptExecutionError::Initializer(initializer),
-                Err(cleanup) => AdoptExecutionError::InitializerCleanup {
+                Ok(()) => StagedExecutionError::Initializer(initializer),
+                Err(cleanup) => StagedExecutionError::InitializerCleanup {
                     initializer,
                     cleanup,
                 },
@@ -550,6 +630,332 @@ where
             Applied::Lifecycle(receipt) => Ok(receipt),
             _ => Err(ApfsStorageError::UnexpectedResult.into()),
         }
+    }
+
+    pub async fn execute_create_staged<F, Fut, E>(
+        &self,
+        plan: CreatePlan,
+        initialize: F,
+    ) -> Result<LifecycleReceipt, CreateExecutionError<E>>
+    where
+        F: FnOnce(CreateStage) -> Fut + Send,
+        Fut: Future<Output = Result<(), E>> + Send,
+        E: Send,
+    {
+        self.execute_clone_staged(plan, CloneKind::Create, initialize)
+            .await
+    }
+
+    pub async fn execute_fork_staged<F, Fut, E>(
+        &self,
+        plan: ForkPlan,
+        initialize: F,
+    ) -> Result<LifecycleReceipt, ForkExecutionError<E>>
+    where
+        F: FnOnce(ForkStage) -> Fut + Send,
+        Fut: Future<Output = Result<(), E>> + Send,
+        E: Send,
+    {
+        self.execute_clone_staged(plan, CloneKind::Fork, initialize)
+            .await
+    }
+
+    async fn execute_clone_staged<P, F, Fut, E>(
+        &self,
+        plan: P,
+        kind: CloneKind,
+        initialize: F,
+    ) -> Result<LifecycleReceipt, StagedExecutionError<E>>
+    where
+        P: ImmutablePlan,
+        F: FnOnce(WorkspaceStage) -> Fut + Send,
+        Fut: Future<Output = Result<(), E>> + Send,
+        E: Send,
+    {
+        let backend = CheckedApfsBackend {
+            host: Arc::clone(&self.host),
+            lane: Arc::clone(&self.lane),
+            config: Arc::clone(&self.config),
+            incarnations: Arc::clone(&self.incarnations),
+            expected: plan.expected().to_vec(),
+        };
+        let mut guard = backend.acquire(plan.operation()).await?;
+        let actual = backend
+            .read_authoritative(&mut guard, plan.expected())
+            .await?;
+        revalidate(plan.expected(), &actual).map_err(ApfsStorageError::from)?;
+
+        let host = Arc::clone(&self.host);
+        let config = Arc::clone(&self.config);
+        let incarnations = Arc::clone(&self.incarnations);
+        let expected = plan.expected().to_vec();
+        let operation = plan.operation().clone();
+        let prepared = self
+            .lane
+            .dispatch(move || {
+                let (source, destination, format, identity, operation_kind) = match &operation {
+                    Operation::Create {
+                        source,
+                        destination,
+                        format,
+                        identity,
+                    } => (source, destination, *format, identity, CloneKind::Create),
+                    Operation::Fork {
+                        source,
+                        destination,
+                        format,
+                        identity,
+                    } => (source, destination, *format, identity, CloneKind::Fork),
+                    _ => {
+                        return Err(ApfsStorageError::InvalidPlan(
+                            "staged clone executor requires a create or fork operation",
+                        ));
+                    }
+                };
+                if operation_kind != kind {
+                    return Err(ApfsStorageError::InvalidPlan(
+                        "staged clone executor operation kind mismatch",
+                    ));
+                }
+                prepare_clone_stage(
+                    host.as_ref(),
+                    &config,
+                    &expected,
+                    CloneExecution {
+                        source,
+                        destination,
+                        format,
+                        fork: kind == CloneKind::Fork,
+                        identity,
+                    },
+                    incarnations.as_ref(),
+                )
+            })
+            .await?;
+
+        if let Err(initializer) = initialize(prepared.stage.clone()).await {
+            let host = Arc::clone(&self.host);
+            let cleanup = self
+                .lane
+                .dispatch(move || abort_prepared_clone(host.as_ref(), prepared))
+                .await;
+            return Err(match cleanup {
+                Ok(()) => StagedExecutionError::Initializer(initializer),
+                Err(cleanup) => StagedExecutionError::InitializerCleanup {
+                    initializer,
+                    cleanup,
+                },
+            });
+        }
+        let host = Arc::clone(&self.host);
+        let applied = self
+            .lane
+            .dispatch(move || commit_prepared_clone(host.as_ref(), prepared))
+            .await?;
+        match applied {
+            Applied::Lifecycle(receipt) => Ok(receipt),
+            _ => Err(ApfsStorageError::UnexpectedResult.into()),
+        }
+    }
+
+    pub async fn execute_checkpoint_staged<F, Fut, E>(
+        &self,
+        plan: CheckpointPlan,
+        initialize: F,
+    ) -> Result<CheckpointRef, CheckpointExecutionError<E>>
+    where
+        F: FnOnce(CheckpointStage) -> Fut + Send,
+        Fut: Future<Output = Result<(), E>> + Send,
+        E: Send,
+    {
+        let backend = CheckedApfsBackend {
+            host: Arc::clone(&self.host),
+            lane: Arc::clone(&self.lane),
+            config: Arc::clone(&self.config),
+            incarnations: Arc::clone(&self.incarnations),
+            expected: plan.expected().to_vec(),
+        };
+        let mut guard = backend.acquire(plan.operation()).await?;
+        let actual = backend
+            .read_authoritative(&mut guard, plan.expected())
+            .await?;
+        revalidate(plan.expected(), &actual).map_err(ApfsStorageError::from)?;
+
+        let host = Arc::clone(&self.host);
+        let config = Arc::clone(&self.config);
+        let expected = plan.expected().to_vec();
+        let operation = plan.operation().clone();
+        let prepared = self
+            .lane
+            .dispatch(move || {
+                let Operation::Checkpoint {
+                    workspace,
+                    label,
+                    pin,
+                    format,
+                } = &operation
+                else {
+                    return Err(ApfsStorageError::InvalidPlan(
+                        "staged checkpoint executor requires a checkpoint operation",
+                    ));
+                };
+                prepare_checkpoint_stage(
+                    host.as_ref(),
+                    &config,
+                    &expected,
+                    workspace,
+                    label,
+                    *pin,
+                    *format,
+                )
+            })
+            .await?;
+
+        if let Err(initializer) = initialize(prepared.stage.clone()).await {
+            let host = Arc::clone(&self.host);
+            let cleanup = self
+                .lane
+                .dispatch(move || abort_prepared_checkpoint(host.as_ref(), prepared))
+                .await;
+            return Err(match cleanup {
+                Ok(()) => StagedExecutionError::Initializer(initializer),
+                Err(cleanup) => StagedExecutionError::InitializerCleanup {
+                    initializer,
+                    cleanup,
+                },
+            });
+        }
+        let host = Arc::clone(&self.host);
+        self.lane
+            .dispatch(move || commit_prepared_checkpoint(host.as_ref(), prepared))
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn execute_restore_staged<
+        Prepare,
+        PrepareFut,
+        PrepareError,
+        Fence,
+        FenceFut,
+        FenceError,
+    >(
+        &self,
+        plan: RestorePlan,
+        prepare: Prepare,
+        fence: Fence,
+    ) -> Result<RestoreReceipt, RestoreExecutionError<PrepareError, FenceError>>
+    where
+        Prepare: FnOnce(RestoreStage) -> PrepareFut + Send,
+        PrepareFut: Future<Output = Result<(), PrepareError>> + Send,
+        PrepareError: Send,
+        Fence: FnOnce(RestoreFence) -> FenceFut + Send,
+        FenceFut: Future<Output = Result<(), FenceError>> + Send,
+        FenceError: Send,
+    {
+        let backend = CheckedApfsBackend {
+            host: Arc::clone(&self.host),
+            lane: Arc::clone(&self.lane),
+            config: Arc::clone(&self.config),
+            incarnations: Arc::clone(&self.incarnations),
+            expected: plan.expected().to_vec(),
+        };
+        let mut guard = backend.acquire(plan.operation()).await?;
+        let actual = backend
+            .read_authoritative(&mut guard, plan.expected())
+            .await?;
+        revalidate(plan.expected(), &actual).map_err(ApfsStorageError::from)?;
+
+        let host = Arc::clone(&self.host);
+        let config = Arc::clone(&self.config);
+        let incarnations = Arc::clone(&self.incarnations);
+        let expected = plan.expected().to_vec();
+        let operation = plan.operation().clone();
+        let prepared = self
+            .lane
+            .dispatch(move || {
+                let Operation::Restore {
+                    workspace,
+                    label,
+                    mode,
+                    format,
+                    identity,
+                } = &operation
+                else {
+                    return Err(ApfsStorageError::InvalidPlan(
+                        "staged restore executor requires a restore operation",
+                    ));
+                };
+                prepare_restore_stage(
+                    host.as_ref(),
+                    &config,
+                    &expected,
+                    RestoreExecution {
+                        workspace,
+                        label,
+                        mode: *mode,
+                        format: *format,
+                        identity,
+                    },
+                    incarnations.as_ref(),
+                )
+            })
+            .await?;
+
+        let stage = match &prepared {
+            PreparedRestore::Verify(prepared) => prepared.stage.clone(),
+            PreparedRestore::Replace(prepared) => RestoreStage::Replace(prepared.stage.clone()),
+        };
+        if let Err(prepare_error) = prepare(stage).await {
+            let host = Arc::clone(&self.host);
+            let cleanup = self
+                .lane
+                .dispatch(move || abort_prepared_restore(host.as_ref(), prepared))
+                .await;
+            return Err(match cleanup {
+                Ok(()) => RestoreExecutionError::Prepare(prepare_error),
+                Err(cleanup) => RestoreExecutionError::PrepareCleanup {
+                    prepare: prepare_error,
+                    cleanup,
+                },
+            });
+        }
+        let host = Arc::clone(&self.host);
+        let committed = self
+            .lane
+            .dispatch(move || commit_prepared_restore(host.as_ref(), prepared))
+            .await?;
+        let CommittedRestore::Pending(pending) = committed else {
+            let CommittedRestore::Verified(receipt) = committed else {
+                unreachable!()
+            };
+            return Ok(receipt);
+        };
+
+        let fence_input = RestoreFence {
+            pending: pending.fact.clone(),
+        };
+        if let Err(source) = fence(fence_input).await {
+            return Err(RestoreExecutionError::Fence {
+                source,
+                pending: pending.fact,
+            });
+        }
+        let host = Arc::clone(&self.host);
+        if let Err(source) = self
+            .lane
+            .dispatch({
+                let image = pending.fact.image.clone();
+                move || host.activate_restored_metadata(&image)
+            })
+            .await
+        {
+            return Err(RestoreExecutionError::Activation {
+                source,
+                pending: pending.fact,
+            });
+        }
+        Ok(pending.receipt)
     }
     async fn execute<P: ImmutablePlan>(&self, plan: &P) -> Result<Applied, ApfsStorageError> {
         let backend = CheckedApfsBackend {
@@ -655,34 +1061,6 @@ where
 {
     type Error = ApfsStorageError;
 
-    async fn execute_create(&self, plan: CreatePlan) -> Result<LifecycleReceipt, Self::Error> {
-        match self.execute(&plan).await? {
-            Applied::Lifecycle(receipt) => Ok(receipt),
-            _ => Err(ApfsStorageError::UnexpectedResult),
-        }
-    }
-
-    async fn execute_checkpoint(&self, plan: CheckpointPlan) -> Result<CheckpointRef, Self::Error> {
-        match self.execute(&plan).await? {
-            Applied::Checkpoint(checkpoint) => Ok(checkpoint),
-            _ => Err(ApfsStorageError::UnexpectedResult),
-        }
-    }
-
-    async fn execute_restore(&self, plan: RestorePlan) -> Result<RestoreReceipt, Self::Error> {
-        match self.execute(&plan).await? {
-            Applied::Restore(receipt) => Ok(receipt),
-            _ => Err(ApfsStorageError::UnexpectedResult),
-        }
-    }
-
-    async fn execute_fork(&self, plan: ForkPlan) -> Result<LifecycleReceipt, Self::Error> {
-        match self.execute(&plan).await? {
-            Applied::Lifecycle(receipt) => Ok(receipt),
-            _ => Err(ApfsStorageError::UnexpectedResult),
-        }
-    }
-
     async fn execute_retire(&self, plan: RetirePlan) -> Result<RetiredRef, Self::Error> {
         match self.execute(&plan).await? {
             Applied::Retired(retired) => Ok(retired),
@@ -766,7 +1144,12 @@ where
             let canonical = canonical_image_path(&config, &workspace)?;
             let attachment = host.attach_verified(&canonical, workspace.format())?;
             if let Err(primary) = host
-                .mount(&attachment, &mount_point, intent.browse)
+                .mount(
+                    &attachment,
+                    &mount_point,
+                    MountAccess::ReadWrite,
+                    intent.browse,
+                )
                 .and_then(|()| {
                     host.validate_marker(
                         &mount_point,
@@ -908,6 +1291,61 @@ struct PreparedAdopt<A> {
     source_checkout: PathBuf,
     pre_cowshed_checkout: PathBuf,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloneKind {
+    Create,
+    Fork,
+}
+
+struct PreparedClone<A> {
+    stage: WorkspaceStage,
+    attachment: A,
+    staged_image: PathBuf,
+    canonical_image: PathBuf,
+    canonical_mount: PathBuf,
+}
+
+struct PendingRestore {
+    receipt: RestoreReceipt,
+    fact: PendingPublicationFact,
+}
+
+enum CommittedRestore {
+    Verified(RestoreReceipt),
+    Pending(PendingRestore),
+}
+
+struct PreparedCheckpoint {
+    stage: CheckpointStage,
+    label: CheckpointLabel,
+    revision: Revision,
+    pin: Pin,
+    format: ImageFormat,
+}
+
+struct PreparedVerifyRestore<A> {
+    stage: RestoreStage,
+    attachment: A,
+    receipt: RestoreReceipt,
+}
+
+struct PreparedReplaceRestore<A> {
+    stage: WorkspaceStage,
+    attachment: A,
+    staged_image: PathBuf,
+    canonical_image: PathBuf,
+    canonical_mount: PathBuf,
+    checkpoint_image: PathBuf,
+    undo_image: PathBuf,
+    current: LifecycleWorkspace,
+    previous_incarnation: WorkspaceIncarnation,
+}
+
+enum PreparedRestore<A> {
+    Verify(PreparedVerifyRestore<A>),
+    Replace(PreparedReplaceRestore<A>),
+}
 fn workspace_lock_path(
     config: &ApfsSubstrateConfig,
     repo: &RepoId,
@@ -991,89 +1429,26 @@ struct RestoreExecution<'a> {
     identity: &'a OperationIdentity,
 }
 
-struct Preparation<'a> {
-    image: &'a Path,
-    mount_point: &'a Path,
-    workspace: &'a LifecycleWorkspace,
-    forked_from: Option<&'a WorkspaceName>,
-    identity: &'a OperationIdentity,
-    copy_source: Option<&'a Path>,
-    chown: bool,
-    relabel: bool,
-}
-
 fn apply_operation<H: ApfsExecutionHost>(
     host: &H,
     config: &ApfsSubstrateConfig,
     expected: &[ExpectedState],
     operation: &Operation,
-    incarnations: &dyn IncarnationSource,
+    _incarnations: &dyn IncarnationSource,
 ) -> Result<Applied, ApfsStorageError> {
     match operation {
         Operation::Adopt { .. } => Err(ApfsStorageError::InvalidPlan(
             "adopt operations require the staged controller executor",
         )),
-        Operation::Create {
-            source,
-            destination,
-            format,
-            identity,
-        } => apply_clone(
-            host,
-            config,
-            expected,
-            CloneExecution {
-                source,
-                destination,
-                format: *format,
-                fork: false,
-                identity,
-            },
-            incarnations,
-        ),
-        Operation::Fork {
-            source,
-            destination,
-            format,
-            identity,
-        } => apply_clone(
-            host,
-            config,
-            expected,
-            CloneExecution {
-                source,
-                destination,
-                format: *format,
-                fork: true,
-                identity,
-            },
-            incarnations,
-        ),
-        Operation::Checkpoint {
-            workspace,
-            label,
-            pin,
-            format,
-        } => apply_checkpoint(host, config, expected, workspace, label, *pin, *format),
-        Operation::Restore {
-            workspace,
-            label,
-            mode,
-            format,
-            identity,
-        } => apply_restore(
-            host,
-            config,
-            expected,
-            RestoreExecution {
-                workspace,
-                label,
-                mode: *mode,
-                format: *format,
-                identity,
-            },
-            incarnations,
-        ),
+        Operation::Create { .. } | Operation::Fork { .. } => Err(ApfsStorageError::InvalidPlan(
+            "create and fork operations require the staged controller executor",
+        )),
+        Operation::Checkpoint { .. } => Err(ApfsStorageError::InvalidPlan(
+            "checkpoint operations require the staged controller executor",
+        )),
+        Operation::Restore { .. } => Err(ApfsStorageError::InvalidPlan(
+            "restore operations require the staged controller executor",
+        )),
         Operation::Retire { workspace, .. } => apply_retire(host, config, expected, workspace),
     }
 }
@@ -1155,23 +1530,26 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
             );
         }
     };
-    let prepared = host.mount(&attachment, &mount_point, false).and_then(|()| {
-        if created.format == ImageFormat::Asif {
-            host.chown_volume_root(&mount_point)?;
-        }
-        host.copy_tree(source_checkout, &mount_point)?;
-        host.write_marker(&mount_point, &workspace, None, identity)?;
-        host.validate_marker(&mount_point, &MarkerExpectation::from_workspace(&workspace))
-    });
+    let prepared = host
+        .mount(&attachment, &mount_point, MountAccess::ReadWrite, false)
+        .and_then(|()| {
+            if created.format == ImageFormat::Asif {
+                host.chown_volume_root(&mount_point)?;
+            }
+            host.copy_tree(source_checkout, &mount_point)?;
+            host.write_marker(&mount_point, &workspace, None, identity)?;
+            host.validate_marker(&mount_point, &MarkerExpectation::from_workspace(&workspace))
+        });
     if let Err(primary) = prepared {
         let cleanup = detach_and_reclaim_adopt(host, attachment, &created.path, created.format);
         return combine_cleanup("adopt preparation", primary, cleanup);
     }
 
     Ok(PreparedAdopt {
-        stage: AdoptStage {
+        stage: WorkspaceStage {
             workspace,
             mount_point,
+            companion: companion_path(&created.path),
         },
         attachment,
         staged_image: created.path,
@@ -1219,10 +1597,15 @@ fn commit_prepared_adopt<H: ApfsExecutionHost>(
         source_checkout,
         pre_cowshed_checkout,
     } = prepared;
-    if let Err(primary) = host.validate_marker(
-        &stage.mount_point,
-        &MarkerExpectation::from_workspace(&stage.workspace),
-    ) {
+    if let Err(primary) = host
+        .validate_staged_companion(&stage.companion)
+        .and_then(|()| {
+            host.validate_marker(
+                &stage.mount_point,
+                &MarkerExpectation::from_workspace(&stage.workspace),
+            )
+        })
+    {
         let cleanup =
             detach_and_reclaim_adopt(host, attachment, &staged_image, stage.workspace.format());
         return combine_cleanup("adopt post-initialization validation", primary, cleanup);
@@ -1255,13 +1638,13 @@ fn commit_prepared_adopt<H: ApfsExecutionHost>(
     }))
 }
 
-fn apply_clone<H: ApfsExecutionHost>(
+fn prepare_clone_stage<H: ApfsExecutionHost>(
     host: &H,
     config: &ApfsSubstrateConfig,
     expected: &[ExpectedState],
     execution: CloneExecution<'_>,
     incarnations: &dyn IncarnationSource,
-) -> Result<Applied, ApfsStorageError> {
+) -> Result<PreparedClone<H::Attachment>, ApfsStorageError> {
     let CloneExecution {
         source: source_name,
         destination: destination_name,
@@ -1271,11 +1654,10 @@ fn apply_clone<H: ApfsExecutionHost>(
     } = execution;
     let source = active_expected(expected, source_name, format)?;
     let destination_topology = absent_expected(expected)?;
-    let incarnation = incarnations.mint()?;
     let workspace = LifecycleWorkspace::new(
         source.repo().clone(),
         destination_name.clone(),
-        incarnation,
+        incarnations.mint()?,
         Revision::new(source.revision().get() + 1),
         Revision::new(destination_topology.get() + 1),
         WorkspaceRole::Workspace,
@@ -1283,55 +1665,150 @@ fn apply_clone<H: ApfsExecutionHost>(
     )
     .map_err(|_| ApfsStorageError::InvalidPlan("invalid cloned workspace identity"))?;
     let source_image = canonical_image_path(config, &source)?;
-    let destination = canonical_image_path(config, &workspace)?;
-    let staged = staging_image(config, &workspace)?;
+    let canonical_image = canonical_image_path(config, &workspace)?;
+    let canonical_mount = mount_point(config, &workspace)?;
+    let staged_image = staging_image(config, &workspace)?;
     let staging_mount = staging_mount(config, &workspace)?;
 
-    host.clone_image(&source_image, &staged, format)?;
-    let forked_from = fork.then_some(source.name());
+    host.clone_image(&source_image, &staged_image, format)?;
     if let Err(primary) = host.publish_metadata(
-        &staged,
+        &staged_image,
         &workspace,
         workspace.revision(),
         MetadataPolicy::Fresh,
         Some(identity),
         Some(&source_image),
     ) {
-        let cleanup = host.reclaim_image(&staged, format);
-        return combine_cleanup("clone staging metadata", primary, cleanup);
+        return combine_cleanup(
+            "clone staging metadata",
+            primary,
+            host.reclaim_image(&staged_image, format),
+        );
     }
-    if let Err(primary) = prepare_image(
-        host,
-        Preparation {
-            image: &staged,
-            mount_point: &staging_mount,
-            workspace: &workspace,
-            forked_from,
-            identity,
-            copy_source: None,
-            chown: false,
-            relabel: true,
+    let attachment = match host.attach_verified(&staged_image, format) {
+        Ok(attachment) => attachment,
+        Err(primary) => {
+            return combine_cleanup(
+                "clone staging attachment",
+                primary,
+                host.reclaim_image(&staged_image, format),
+            );
+        }
+    };
+    let prepared = host
+        .mount(&attachment, &staging_mount, MountAccess::ReadWrite, false)
+        .and_then(|()| {
+            host.rename_volume(
+                &staging_mount,
+                &volume_name(workspace.repo(), workspace.name()),
+            )?;
+            host.write_marker(
+                &staging_mount,
+                &workspace,
+                fork.then_some(source.name()),
+                identity,
+            )?;
+            host.validate_marker(
+                &staging_mount,
+                &MarkerExpectation::from_workspace(&workspace),
+            )
+        });
+    if let Err(primary) = prepared {
+        return combine_cleanup(
+            "clone preparation",
+            primary,
+            detach_and_reclaim_clone(host, attachment, &staged_image, format),
+        );
+    }
+    Ok(PreparedClone {
+        stage: WorkspaceStage {
+            workspace,
+            mount_point: staging_mount,
+            companion: companion_path(&staged_image),
         },
-    ) {
-        let cleanup = host.reclaim_image(&staged, format);
-        return combine_cleanup("clone preparation", primary, cleanup);
+        attachment,
+        staged_image,
+        canonical_image,
+        canonical_mount,
+    })
+}
+
+fn abort_prepared_clone<H: ApfsExecutionHost>(
+    host: &H,
+    prepared: PreparedClone<H::Attachment>,
+) -> Result<(), ApfsStorageError> {
+    detach_and_reclaim_clone(
+        host,
+        prepared.attachment,
+        &prepared.staged_image,
+        prepared.stage.workspace.format(),
+    )
+}
+
+fn detach_and_reclaim_clone<H: ApfsExecutionHost>(
+    host: &H,
+    attachment: H::Attachment,
+    staged_image: &Path,
+    format: ImageFormat,
+) -> Result<(), ApfsStorageError> {
+    let detached = host.detach(attachment, false);
+    let reclaimed = host.reclaim_image(staged_image, format);
+    match detached {
+        Ok(()) => reclaimed,
+        Err(primary) => combine_cleanup("clone staging detach", primary, reclaimed),
     }
-    if let Err(primary) = host.publish_image(&staged, &destination) {
+}
+
+fn commit_prepared_clone<H: ApfsExecutionHost>(
+    host: &H,
+    prepared: PreparedClone<H::Attachment>,
+) -> Result<Applied, ApfsStorageError> {
+    let PreparedClone {
+        stage,
+        attachment,
+        staged_image,
+        canonical_image,
+        canonical_mount,
+    } = prepared;
+    if let Err(primary) = host
+        .validate_staged_companion(&stage.companion)
+        .and_then(|()| {
+            host.validate_marker(
+                &stage.mount_point,
+                &MarkerExpectation::from_workspace(&stage.workspace),
+            )
+        })
+    {
+        return combine_cleanup(
+            "clone post-callback validation",
+            primary,
+            detach_and_reclaim_clone(host, attachment, &staged_image, stage.workspace.format()),
+        );
+    }
+    if let Err(primary) = host.detach(attachment, false) {
+        return combine_cleanup(
+            "clone staging detach",
+            primary,
+            host.reclaim_image(&staged_image, stage.workspace.format()),
+        );
+    }
+    if let Err(primary) = host.publish_image(&staged_image, &canonical_image) {
         let cleanup = match primary.disposition() {
-            PublicationDisposition::RolledBack => host.reclaim_image(&staged, format),
+            PublicationDisposition::RolledBack => {
+                host.reclaim_image(&staged_image, stage.workspace.format())
+            }
             PublicationDisposition::ForwardOnly => Ok(()),
         };
         return combine_cleanup("clone publication", primary.into_source(), cleanup);
     }
-    let mount = mount_point(config, &workspace)?;
-    mount_canonical(host, &destination, &mount, &workspace)?;
+    mount_canonical(host, &canonical_image, &canonical_mount, &stage.workspace)?;
     Ok(Applied::Lifecycle(LifecycleReceipt {
-        resulting_revision: workspace.revision(),
-        workspace,
+        resulting_revision: stage.workspace.revision(),
+        workspace: stage.workspace,
     }))
 }
 
-fn apply_checkpoint<H: ApfsExecutionHost>(
+fn prepare_checkpoint_stage<H: ApfsExecutionHost>(
     host: &H,
     config: &ApfsSubstrateConfig,
     expected: &[ExpectedState],
@@ -1339,51 +1816,86 @@ fn apply_checkpoint<H: ApfsExecutionHost>(
     label: &CheckpointLabel,
     pin: Pin,
     format: ImageFormat,
-) -> Result<Applied, ApfsStorageError> {
+) -> Result<PreparedCheckpoint, ApfsStorageError> {
     let workspace = active_expected(expected, workspace_name, format)?;
     let source = canonical_image_path(config, &workspace)?;
-    let checkpoint = checkpoint_image(config, &workspace, label)?;
-    host.clone_image(&source, &checkpoint, format)?;
-    let checkpoint_revision = Revision::new(expected_revision(expected)? + 1);
+    let image = checkpoint_image(config, &workspace, label)?;
+    host.clone_image(&source, &image, format)?;
+    let revision = Revision::new(expected_revision(expected)? + 1);
     if let Err(primary) = host.publish_metadata(
-        &checkpoint,
+        &image,
         &workspace,
-        checkpoint_revision,
+        revision,
         MetadataPolicy::Preserve,
         None,
         Some(&source),
     ) {
-        let cleanup = host.reclaim_image(&checkpoint, format);
-        return combine_cleanup("checkpoint metadata", primary, cleanup);
+        return combine_cleanup(
+            "checkpoint metadata",
+            primary,
+            host.reclaim_image(&image, format),
+        );
     }
-    if let Err(primary) = host.publish_checkpoint_fact(&checkpoint, label, checkpoint_revision, pin)
-    {
-        let cleanup = host.reclaim_image(&checkpoint, format);
-        return combine_cleanup("checkpoint fact", primary, cleanup);
-    }
-    let attachment = match host.attach_verified(&checkpoint, format) {
+    let attachment = match host.attach_verified(&image, format) {
         Ok(attachment) => attachment,
         Err(primary) => {
-            let cleanup = host.reclaim_image(&checkpoint, format);
-            return combine_cleanup("checkpoint verification", primary, cleanup);
+            return combine_cleanup(
+                "checkpoint verification",
+                primary,
+                host.reclaim_image(&image, format),
+            );
         }
     };
-    host.detach(attachment, false)?;
-    Ok(Applied::Checkpoint(CheckpointRef::new(
-        workspace,
-        label.clone(),
-        checkpoint_revision,
-        pin == Pin::Pinned,
-    )))
+    if let Err(primary) = host.detach(attachment, false) {
+        return combine_cleanup(
+            "checkpoint verification detach",
+            primary,
+            host.reclaim_image(&image, format),
+        );
+    }
+    let checkpoint = CheckpointRef::new(workspace, label.clone(), revision, pin == Pin::Pinned);
+    Ok(PreparedCheckpoint {
+        stage: CheckpointStage { checkpoint, image },
+        label: label.clone(),
+        revision,
+        pin,
+        format,
+    })
 }
 
-fn apply_restore<H: ApfsExecutionHost>(
+fn abort_prepared_checkpoint<H: ApfsExecutionHost>(
+    host: &H,
+    prepared: PreparedCheckpoint,
+) -> Result<(), ApfsStorageError> {
+    host.reclaim_image(&prepared.stage.image, prepared.format)
+}
+
+fn commit_prepared_checkpoint<H: ApfsExecutionHost>(
+    host: &H,
+    prepared: PreparedCheckpoint,
+) -> Result<CheckpointRef, ApfsStorageError> {
+    if let Err(primary) = host.publish_checkpoint_fact(
+        &prepared.stage.image,
+        &prepared.label,
+        prepared.revision,
+        prepared.pin,
+    ) {
+        return combine_cleanup(
+            "checkpoint fact",
+            primary,
+            host.reclaim_image(&prepared.stage.image, prepared.format),
+        );
+    }
+    Ok(prepared.stage.checkpoint)
+}
+
+fn prepare_restore_stage<H: ApfsExecutionHost>(
     host: &H,
     config: &ApfsSubstrateConfig,
     expected: &[ExpectedState],
     execution: RestoreExecution<'_>,
     incarnations: &dyn IncarnationSource,
-) -> Result<Applied, ApfsStorageError> {
+) -> Result<PreparedRestore<H::Attachment>, ApfsStorageError> {
     let RestoreExecution {
         workspace: workspace_name,
         label,
@@ -1392,13 +1904,32 @@ fn apply_restore<H: ApfsExecutionHost>(
         identity,
     } = execution;
     let current = active_expected(expected, workspace_name, format)?;
-    let checkpoint = checkpoint_image(config, &current, label)?;
+    let checkpoint_image = checkpoint_image(config, &current, label)?;
     if mode == RestoreMode::VerifyOnly {
-        let attachment = host.attach_verified(&checkpoint, format)?;
-        host.detach(attachment, false)?;
-        return Ok(Applied::Restore(RestoreReceipt {
-            previous_incarnation: current.incarnation().clone(),
-            workspace: current,
+        let mount_point = staging_mount(config, &current)?;
+        let attachment = host.attach_verified(&checkpoint_image, format)?;
+        let mounted = host
+            .mount(&attachment, &mount_point, MountAccess::ReadOnly, false)
+            .and_then(|()| {
+                host.validate_marker(&mount_point, &MarkerExpectation::from_workspace(&current))
+            });
+        if let Err(primary) = mounted {
+            return detach_after_failure(host, attachment, primary, "restore verification mount");
+        }
+        let previous_incarnation = current.incarnation().clone();
+        return Ok(PreparedRestore::Verify(PreparedVerifyRestore {
+            stage: RestoreStage::Verify {
+                workspace: current.clone(),
+                label: label.clone(),
+                revision: checkpoint_expected_revision(expected, workspace_name, label)?,
+                image: checkpoint_image,
+                mount_point,
+            },
+            attachment,
+            receipt: RestoreReceipt {
+                previous_incarnation,
+                workspace: current,
+            },
         }));
     }
 
@@ -1413,77 +1944,193 @@ fn apply_restore<H: ApfsExecutionHost>(
         format,
     )
     .map_err(|_| ApfsStorageError::InvalidPlan("invalid restore replacement identity"))?;
-    let canonical = canonical_image_path(config, &current)?;
-    let staged = staging_image(config, &replacement)?;
+    let canonical_image = canonical_image_path(config, &current)?;
+    let canonical_mount = mount_point(config, &replacement)?;
+    let staged_image = staging_image(config, &replacement)?;
     let staging_mount = staging_mount(config, &replacement)?;
-    let undo = undo_image(config, &current, &replacement)?;
+    let undo_image = undo_image(config, &current, &replacement)?;
 
-    host.detach_mounted(&current, false)?;
-    if let Err(primary) = host.clone_image(&checkpoint, &staged, format) {
-        let cleanup = mount_canonical(host, &canonical, &mount_point(config, &current)?, &current);
-        return combine_cleanup("restore clone", primary, cleanup);
-    }
+    host.clone_image(&checkpoint_image, &staged_image, format)?;
     if let Err(primary) = host.publish_metadata(
-        &staged,
+        &staged_image,
         &replacement,
         replacement.revision(),
         MetadataPolicy::Preserve,
         Some(identity),
-        Some(&checkpoint),
+        Some(&checkpoint_image),
     ) {
-        let cleanup = host.reclaim_image(&staged, format).and_then(|()| {
-            mount_canonical(host, &canonical, &mount_point(config, &current)?, &current)
-        });
-        return combine_cleanup("restore staging metadata", primary, cleanup);
+        return combine_cleanup(
+            "restore staging metadata",
+            primary,
+            host.reclaim_image(&staged_image, format),
+        );
     }
-    if let Err(primary) = prepare_image(
-        host,
-        Preparation {
-            image: &staged,
-            mount_point: &staging_mount,
-            workspace: &replacement,
-            forked_from: None,
-            identity,
-            copy_source: None,
-            chown: false,
-            relabel: true,
+    let attachment = match host.attach_verified(&staged_image, format) {
+        Ok(attachment) => attachment,
+        Err(primary) => {
+            return combine_cleanup(
+                "restore staging attachment",
+                primary,
+                host.reclaim_image(&staged_image, format),
+            );
+        }
+    };
+    let prepared = host
+        .mount(&attachment, &staging_mount, MountAccess::ReadWrite, false)
+        .and_then(|()| {
+            host.rename_volume(
+                &staging_mount,
+                &volume_name(replacement.repo(), replacement.name()),
+            )?;
+            host.write_marker(&staging_mount, &replacement, None, identity)?;
+            host.validate_marker(
+                &staging_mount,
+                &MarkerExpectation::from_workspace(&replacement),
+            )
+        });
+    if let Err(primary) = prepared {
+        return combine_cleanup(
+            "restore preparation",
+            primary,
+            detach_and_reclaim_restore(host, attachment, &staged_image, format),
+        );
+    }
+    Ok(PreparedRestore::Replace(PreparedReplaceRestore {
+        stage: WorkspaceStage {
+            workspace: replacement,
+            mount_point: staging_mount,
+            companion: companion_path(&staged_image),
         },
-    ) {
-        let cleanup = host.reclaim_image(&staged, format).and_then(|()| {
-            mount_canonical(host, &canonical, &mount_point(config, &current)?, &current)
-        });
-        return combine_cleanup("restore preparation", primary, cleanup);
+        attachment,
+        staged_image,
+        canonical_image,
+        canonical_mount,
+        checkpoint_image,
+        undo_image,
+        current,
+        previous_incarnation,
+    }))
+}
+
+fn abort_prepared_restore<H: ApfsExecutionHost>(
+    host: &H,
+    prepared: PreparedRestore<H::Attachment>,
+) -> Result<(), ApfsStorageError> {
+    match prepared {
+        PreparedRestore::Verify(prepared) => host.detach(prepared.attachment, false),
+        PreparedRestore::Replace(prepared) => detach_and_reclaim_restore(
+            host,
+            prepared.attachment,
+            &prepared.staged_image,
+            prepared.stage.workspace.format(),
+        ),
     }
-    if let Err(primary) = host.restore_swap(&staged, &canonical, &undo) {
-        let cleanup = host.reclaim_image(&staged, format).and_then(|()| {
-            mount_canonical(host, &canonical, &mount_point(config, &current)?, &current)
-        });
+}
+
+fn detach_and_reclaim_restore<H: ApfsExecutionHost>(
+    host: &H,
+    attachment: H::Attachment,
+    staged_image: &Path,
+    format: ImageFormat,
+) -> Result<(), ApfsStorageError> {
+    let detached = host.detach(attachment, false);
+    let reclaimed = host.reclaim_image(staged_image, format);
+    match detached {
+        Ok(()) => reclaimed,
+        Err(primary) => combine_cleanup("restore staging detach", primary, reclaimed),
+    }
+}
+
+fn commit_prepared_restore<H: ApfsExecutionHost>(
+    host: &H,
+    prepared: PreparedRestore<H::Attachment>,
+) -> Result<CommittedRestore, ApfsStorageError> {
+    let PreparedRestore::Replace(prepared) = prepared else {
+        let PreparedRestore::Verify(prepared) = prepared else {
+            unreachable!()
+        };
+        host.detach(prepared.attachment, false)?;
+        return Ok(CommittedRestore::Verified(prepared.receipt));
+    };
+    let PreparedReplaceRestore {
+        stage,
+        attachment,
+        staged_image,
+        canonical_image,
+        canonical_mount,
+        checkpoint_image,
+        undo_image,
+        current,
+        previous_incarnation,
+    } = prepared;
+    if let Err(primary) = host
+        .validate_staged_companion(&stage.companion)
+        .and_then(|()| {
+            host.validate_marker(
+                &stage.mount_point,
+                &MarkerExpectation::from_workspace(&stage.workspace),
+            )
+        })
+    {
+        return combine_cleanup(
+            "restore post-callback validation",
+            primary,
+            detach_and_reclaim_restore(host, attachment, &staged_image, stage.workspace.format()),
+        );
+    }
+    if let Err(primary) = host.detach(attachment, false) {
+        return combine_cleanup(
+            "restore staging detach",
+            primary,
+            host.reclaim_image(&staged_image, stage.workspace.format()),
+        );
+    }
+    if let Err(primary) = host.detach_mounted(&current, false) {
+        return combine_cleanup(
+            "restore canonical detach",
+            primary,
+            host.reclaim_image(&staged_image, stage.workspace.format()),
+        );
+    }
+    if let Err(primary) = host.restore_swap(&staged_image, &canonical_image, &undo_image) {
+        let cleanup = host
+            .reclaim_image(&staged_image, stage.workspace.format())
+            .and_then(|()| mount_canonical(host, &canonical_image, &canonical_mount, &current));
         return combine_cleanup("restore swap", primary, cleanup);
     }
-    let canonical_mount = mount_point(config, &replacement)?;
-    if let Err(primary) = mount_canonical(host, &canonical, &canonical_mount, &replacement) {
+    if let Err(primary) =
+        mount_canonical(host, &canonical_image, &canonical_mount, &stage.workspace)
+    {
         let cleanup = host
-            .detach_mounted(&replacement, false)
-            .and_then(|()| host.rollback_restore(&canonical, &undo, &staged))
-            .and_then(|()| mount_canonical(host, &canonical, &canonical_mount, &current));
+            .detach_mounted(&stage.workspace, false)
+            .and_then(|()| host.rollback_restore(&canonical_image, &undo_image, &staged_image))
+            .and_then(|()| mount_canonical(host, &canonical_image, &canonical_mount, &current));
         return combine_cleanup("restore rollback", primary, cleanup);
     }
     if let Err(primary) = host.publish_restored_metadata(
-        &staged,
-        &canonical,
-        &replacement,
-        replacement.revision(),
-        &checkpoint,
+        &staged_image,
+        &canonical_image,
+        &stage.workspace,
+        stage.workspace.revision(),
+        &checkpoint_image,
     ) {
         let cleanup = host
-            .detach_mounted(&replacement, false)
-            .and_then(|()| host.rollback_restore(&canonical, &undo, &staged))
-            .and_then(|()| mount_canonical(host, &canonical, &canonical_mount, &current));
+            .detach_mounted(&stage.workspace, false)
+            .and_then(|()| host.rollback_restore(&canonical_image, &undo_image, &staged_image))
+            .and_then(|()| mount_canonical(host, &canonical_image, &canonical_mount, &current));
         return combine_cleanup("restore metadata publication", primary, cleanup);
     }
-    Ok(Applied::Restore(RestoreReceipt {
-        previous_incarnation,
-        workspace: replacement,
+    let fact = PendingPublicationFact {
+        workspace: stage.workspace.clone(),
+        image: canonical_image,
+        mount_point: canonical_mount,
+    };
+    Ok(CommittedRestore::Pending(PendingRestore {
+        receipt: RestoreReceipt {
+            previous_incarnation,
+            workspace: stage.workspace,
+        },
+        fact,
     }))
 }
 
@@ -1506,43 +2153,6 @@ fn apply_retire<H: ApfsExecutionHost>(
     )))
 }
 
-fn prepare_image<H: ApfsExecutionHost>(
-    host: &H,
-    preparation: Preparation<'_>,
-) -> Result<(), ApfsStorageError> {
-    let Preparation {
-        image,
-        mount_point,
-        workspace,
-        forked_from,
-        identity,
-        copy_source,
-        chown,
-        relabel,
-    } = preparation;
-    let attachment = host.attach_verified(image, workspace.format())?;
-    let prepared = host.mount(&attachment, mount_point, false).and_then(|()| {
-        if chown {
-            host.chown_volume_root(mount_point)?;
-        }
-        if relabel {
-            host.rename_volume(
-                mount_point,
-                &volume_name(workspace.repo(), workspace.name()),
-            )?;
-        }
-        if let Some(source) = copy_source {
-            host.copy_tree(source, mount_point)?;
-        }
-        host.write_marker(mount_point, workspace, forked_from, identity)?;
-        host.validate_marker(mount_point, &MarkerExpectation::from_workspace(workspace))
-    });
-    match prepared {
-        Ok(()) => host.detach(attachment, false),
-        Err(primary) => detach_after_failure(host, attachment, primary, "staged validation"),
-    }
-}
-
 fn mount_canonical<H: ApfsExecutionHost>(
     host: &H,
     image: &Path,
@@ -1550,9 +2160,12 @@ fn mount_canonical<H: ApfsExecutionHost>(
     workspace: &LifecycleWorkspace,
 ) -> Result<(), ApfsStorageError> {
     let attachment = host.attach_verified(image, workspace.format())?;
-    if let Err(primary) = host.mount(&attachment, mount_point, false).and_then(|()| {
-        host.validate_marker(mount_point, &MarkerExpectation::from_workspace(workspace))
-    }) {
+    if let Err(primary) = host
+        .mount(&attachment, mount_point, MountAccess::ReadWrite, false)
+        .and_then(|()| {
+            host.validate_marker(mount_point, &MarkerExpectation::from_workspace(workspace))
+        })
+    {
         return detach_after_failure(host, attachment, primary, "canonical validation");
     }
     host.retain_mounted(workspace, attachment)?;
@@ -1652,6 +2265,12 @@ fn active_expected_with_format(
     .map_err(|_| ApfsStorageError::InvalidPlan("invalid active workspace identity"))
 }
 
+fn companion_path(image: &Path) -> PathBuf {
+    let mut path = image.as_os_str().to_owned();
+    path.push(".ca.key");
+    PathBuf::from(path)
+}
+
 fn absent_expected(expected: &[ExpectedState]) -> Result<Revision, ApfsStorageError> {
     expected
         .iter()
@@ -1675,6 +2294,27 @@ fn expected_revision(expected: &[ExpectedState]) -> Result<u64, ApfsStorageError
         })
         .ok_or(ApfsStorageError::InvalidPlan(
             "workspace revision expectation is missing",
+        ))
+}
+
+fn checkpoint_expected_revision(
+    expected: &[ExpectedState],
+    workspace: &WorkspaceName,
+    label: &CheckpointLabel,
+) -> Result<Revision, ApfsStorageError> {
+    expected
+        .iter()
+        .find_map(|fact| match fact {
+            ExpectedState::Checkpoint {
+                workspace: expected_workspace,
+                label: expected_label,
+                revision,
+                ..
+            } if expected_workspace == workspace && expected_label == label => Some(*revision),
+            _ => None,
+        })
+        .ok_or(ApfsStorageError::InvalidPlan(
+            "checkpoint revision expectation is missing",
         ))
 }
 

@@ -1,4 +1,5 @@
 use std::fs::{FileTimes, OpenOptions};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7,11 +8,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use cowshed_core::apfs::{
     ApfsCaseSensitivity, CommandOutput, CommandRequest, CommandRunError, CommandRunner,
-    CreateImageRequest, ImageFormatSelection,
+    CreateImageRequest, ImageFormatSelection, MountAccess,
 };
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, GrantSet, ImageFormat, METADATA_VERSION, Platform, PortBlock,
-    WorkspaceIncarnation, WorkspaceName, WorkspaceRole, sidecar_path,
+    PublicationState, WorkspaceIncarnation, WorkspaceName, WorkspaceRole, sidecar_path,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::apfs::native::{
@@ -266,6 +267,7 @@ fn metadata(format: ImageFormat) -> DetachedWorkspaceMetadata {
             .expect("incarnation"),
         image_format: format,
         platform: Platform::Macos,
+        publication_state: PublicationState::Active,
         updated_at: "2026-07-13T00:00:00Z".to_owned(),
         grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
             .expect("grants"),
@@ -354,6 +356,11 @@ fn create_image(path: &Path, format: ImageFormat) {
     std::fs::create_dir_all(path.parent().expect("parent")).expect("image parent");
     std::fs::write(path, b"fixture").expect("image");
     metadata(format).write_for_image(path).expect("sidecar");
+    let mut ca_key = path.as_os_str().to_owned();
+    ca_key.push(".ca.key");
+    let ca_key = PathBuf::from(ca_key);
+    std::fs::write(&ca_key, b"fixture-ca-private-key").expect("CA key");
+    std::fs::set_permissions(&ca_key, std::fs::Permissions::from_mode(0o600)).expect("CA key mode");
 }
 
 fn workspace(format: ImageFormat) -> LifecycleWorkspace {
@@ -592,8 +599,13 @@ fn mount_registry_actor_owns_attachment_state_and_blocks_mounted_compaction() {
     let attachment = host
         .attach_verified(image.image(), ImageFormat::Sparse)
         .expect("verified attachment");
-    host.mount(&attachment, &fixture.root.join("mounted"), false)
-        .expect("mount attachment");
+    host.mount(
+        &attachment,
+        &fixture.root.join("mounted"),
+        MountAccess::ReadWrite,
+        false,
+    )
+    .expect("mount attachment");
     let mount_id = host
         .retain_mounted(&workspace, attachment)
         .expect("retain attachment");

@@ -782,10 +782,6 @@ pub async fn execute_checked<B: LifecycleBackend, P: ImmutablePlan>(
 #[async_trait]
 pub trait Substrate: LifecyclePlanner {
     type Error: Send;
-    async fn execute_create(&self, plan: CreatePlan) -> Result<LifecycleReceipt, Self::Error>;
-    async fn execute_checkpoint(&self, plan: CheckpointPlan) -> Result<CheckpointRef, Self::Error>;
-    async fn execute_restore(&self, plan: RestorePlan) -> Result<RestoreReceipt, Self::Error>;
-    async fn execute_fork(&self, plan: ForkPlan) -> Result<LifecycleReceipt, Self::Error>;
     async fn execute_retire(&self, plan: RetirePlan) -> Result<RetiredRef, Self::Error>;
     async fn reclaim(&self, retired: RetiredRef) -> Result<(), Self::Error>;
     async fn list(&self, repo: &RepoId) -> Result<Vec<DerivedWorkspace>, Self::Error>;
