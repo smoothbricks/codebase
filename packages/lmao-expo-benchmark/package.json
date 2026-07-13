@@ -1,0 +1,87 @@
+{
+  "name": "@smoothbricks/lmao-expo-benchmark",
+  "version": "0.0.0",
+  "private": true,
+  "main": "index.ts",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios",
+    "web": "expo start --web"
+  },
+  "dependencies": {
+    "@expo/metro-runtime": "57.0.3",
+    "@smoothbricks/lmao": "workspace:*",
+    "expo": "57.0.4",
+    "fast-text-encoding": "1.0.6",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "react-native": "0.86.0",
+    "react-native-get-random-values": "2.0.0",
+    "react-native-web": "0.21.2"
+  },
+  "devDependencies": {
+    "@smoothbricks/lmao-ttsc": "workspace:*",
+    "@ttsc/metro": "^0.18.4",
+    "@types/react": "^19.2.14",
+    "ttsc": "^0.18.4",
+    "typescript": "^7.0.2"
+  },
+  "nx": {
+    "name": "lmao-expo-benchmark",
+    "sourceRoot": "packages/lmao-expo-benchmark/src",
+    "projectType": "application",
+    "targets": {
+      "typecheck": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "dependsOn": [
+          "^build"
+        ],
+        "options": {
+          "command": "ttsc --noEmit -p tsconfig.json",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 600000,
+          "killAfterMs": 10000
+        }
+      },
+      "lint": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "dependsOn": [
+          "typecheck"
+        ],
+        "options": {
+          "command": "biome check .",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 600000,
+          "killAfterMs": 10000
+        }
+      },
+      "export-browser": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": false,
+        "outputs": [
+          "{projectRoot}/dist/web"
+        ],
+        "options": {
+          "command": "bun expo export --platform web --output-dir dist/web --clear",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 600000,
+          "killAfterMs": 10000
+        }
+      },
+      "export-hermes": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": false,
+        "outputs": [
+          "{projectRoot}/dist/headless"
+        ],
+        "options": {
+          "command": "bun expo export:embed --entry-file headless-bootstrap.js --platform android --dev false --minify true --bytecode --reset-cache --max-workers 1 --bundle-output dist/headless/lmao-benchmark.hbc --sourcemap-output dist/headless/lmao-benchmark.hbc.map --assets-dest dist/headless",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 600000,
+          "killAfterMs": 10000
+        }
+      }
+    }
+  }
+}
