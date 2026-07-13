@@ -102,7 +102,7 @@ fn strip_comment(line: &str) -> &str {
     let mut escaped = false;
     for (index, byte) in line.bytes().enumerate() {
         match byte {
-            b'\\' if quoted => escaped = !escaped,
+            b'\\' => escaped = !escaped,
             b'"' if !escaped => quoted = !quoted,
             b'#' if !quoted => return &line[..index],
             _ => escaped = false,
@@ -112,9 +112,6 @@ fn strip_comment(line: &str) -> &str {
 }
 
 fn parse_toml_string(value: &str, line: usize) -> Result<String, ConfigError> {
-    if !value.starts_with('"') || !value.ends_with('"') {
-        return Err(ConfigError::ExpectedQuotedString { line });
-    }
     serde_json::from_str(value).map_err(|_| ConfigError::ExpectedQuotedString { line })
 }
 
@@ -249,22 +246,21 @@ pub fn select_substrate(
         if let StatFsEvidence::Zfs {
             containing_dataset: Some(dataset),
         } = &statfs
+            && dataset.cowshed_root_available()
         {
-            if dataset.cowshed_root_available() {
-                if dataset.pool() != pool {
-                    return Err(SelectionError::AmbiguousPools {
-                        configured: pool,
-                        containing: dataset.pool().to_owned(),
-                    });
-                }
-                evidence.insert(
-                    0,
-                    SelectionEvidence::DelegatedContainingDataset {
-                        dataset: dataset.dataset().to_owned(),
-                        pool: dataset.pool().to_owned(),
-                    },
-                );
+            if dataset.pool() != pool {
+                return Err(SelectionError::AmbiguousPools {
+                    configured: pool,
+                    containing: dataset.pool().to_owned(),
+                });
             }
+            evidence.insert(
+                0,
+                SelectionEvidence::DelegatedContainingDataset {
+                    dataset: dataset.dataset().to_owned(),
+                    pool: dataset.pool().to_owned(),
+                },
+            );
         }
         return Ok(SelectedSubstrate::Zfs { pool, evidence });
     }
@@ -364,10 +360,6 @@ impl VolumeMarker {
             role,
             substrate,
         }
-    }
-
-    pub fn version(&self) -> u32 {
-        self.version
     }
 
     pub fn role(&self) -> VolumeRole {
@@ -497,6 +489,67 @@ impl HostCommand {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExistingMarkerEvidence {
+    Missing,
+    Invalid,
+    UnsupportedVersion(u32),
+    Valid(VolumeMarker),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExistingStorage {
+    Absent,
+    MountedValid {
+        exact_identifier: String,
+    },
+    ExistingUnmounted {
+        exact_identifier: String,
+        marker: ExistingMarkerEvidence,
+    },
+}
+
+impl ExistingStorage {
+    pub fn mounted_valid(exact_identifier: impl Into<String>) -> Self {
+        Self::MountedValid {
+            exact_identifier: exact_identifier.into(),
+        }
+    }
+
+    pub fn existing_unmounted(exact_identifier: impl Into<String>, marker: VolumeMarker) -> Self {
+        Self::ExistingUnmounted {
+            exact_identifier: exact_identifier.into(),
+            marker: ExistingMarkerEvidence::Valid(marker),
+        }
+    }
+
+    fn exact_identifier(&self) -> Option<&str> {
+        match self {
+            Self::Absent => None,
+            Self::MountedValid { exact_identifier }
+            | Self::ExistingUnmounted {
+                exact_identifier, ..
+            } => Some(exact_identifier),
+        }
+    }
+}
+
+/// Evidence for only cowshed's fixed storage objects. Callers obtain this by exact APFS volume or
+/// ZFS dataset identity; the type intentionally cannot represent a pool scan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BootstrapEvidence {
+    Apfs {
+        store: ExistingStorage,
+        caches: ExistingStorage,
+    },
+    Zfs {
+        root: ExistingStorage,
+        store: ExistingStorage,
+        caches: ExistingStorage,
+        projects: ExistingStorage,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostOperation {
     VerifyZfsDelegation {
         pool: String,
@@ -540,11 +593,34 @@ impl BootstrapPlan {
 pub fn plan_bootstrap(
     substrate: SelectedSubstrate,
     home: &Path,
+    evidence: BootstrapEvidence,
 ) -> Result<BootstrapPlan, PlanError> {
     let roots = CanonicalRoots::for_home(home)?;
-    let operations = match &substrate {
-        SelectedSubstrate::Apfs { container, .. } => plan_apfs(container, &roots),
-        SelectedSubstrate::Zfs { pool, .. } => plan_zfs(pool, &roots),
+    let operations = match (&substrate, evidence) {
+        (SelectedSubstrate::Apfs { container, .. }, BootstrapEvidence::Apfs { store, caches }) => {
+            plan_apfs(container, &roots, &store, &caches)?
+        }
+        (
+            SelectedSubstrate::Zfs { pool, .. },
+            BootstrapEvidence::Zfs {
+                root,
+                store,
+                caches,
+                projects,
+            },
+        ) => plan_zfs(pool, &roots, &root, &store, &caches, &projects)?,
+        (SelectedSubstrate::Apfs { .. }, BootstrapEvidence::Zfs { .. }) => {
+            return Err(PlanError::EvidenceSubstrateMismatch {
+                selected: SubstrateKind::Apfs,
+                evidence: SubstrateKind::Zfs,
+            });
+        }
+        (SelectedSubstrate::Zfs { .. }, BootstrapEvidence::Apfs { .. }) => {
+            return Err(PlanError::EvidenceSubstrateMismatch {
+                selected: SubstrateKind::Zfs,
+                evidence: SubstrateKind::Apfs,
+            });
+        }
     };
     Ok(BootstrapPlan {
         substrate,
@@ -553,107 +629,265 @@ pub fn plan_bootstrap(
     })
 }
 
-fn plan_apfs(container: &str, roots: &CanonicalRoots) -> Vec<HostOperation> {
-    let store_marker = VolumeMarker::new(VolumeRole::Store, SubstrateKind::Apfs);
-    let caches_marker = VolumeMarker::new(VolumeRole::Caches, SubstrateKind::Apfs);
-    vec![
-        guard(roots.store(), VolumeRole::Store, SubstrateKind::Apfs),
-        HostOperation::EnsureDirectory(roots.store().to_owned()),
-        command(
-            DISKUTIL,
-            [
-                "apfs",
-                "addVolume",
-                container,
-                "APFS",
-                APFS_STORE_VOLUME,
-                "-nomount",
-            ],
-        ),
-        command(
-            DISKUTIL,
-            [
-                "mount",
-                "-nobrowse",
-                "-mountPoint",
-                &roots.store().to_string_lossy(),
-                APFS_STORE_VOLUME,
-            ],
-        ),
-        marker(roots.store(), store_marker),
-        guard(roots.caches(), VolumeRole::Caches, SubstrateKind::Apfs),
-        HostOperation::EnsureDirectory(roots.caches().to_owned()),
-        command(
-            DISKUTIL,
-            [
-                "apfs",
-                "addVolume",
-                container,
-                "APFS",
-                APFS_CACHES_VOLUME,
-                "-nomount",
-            ],
-        ),
-        command(
-            DISKUTIL,
-            [
-                "mount",
-                "-nobrowse",
-                "-mountPoint",
-                &roots.caches().to_string_lossy(),
-                APFS_CACHES_VOLUME,
-            ],
-        ),
-        marker(roots.caches(), caches_marker),
-    ]
+fn plan_apfs(
+    container: &str,
+    roots: &CanonicalRoots,
+    store: &ExistingStorage,
+    caches: &ExistingStorage,
+) -> Result<Vec<HostOperation>, PlanError> {
+    validate_nested_topology(store, caches)?;
+    validate_existing_marker(store, VolumeRole::Store, SubstrateKind::Apfs)?;
+    validate_existing_marker(caches, VolumeRole::Caches, SubstrateKind::Apfs)?;
+
+    let mut operations = vec![guard(roots.store(), VolumeRole::Store, SubstrateKind::Apfs)];
+    plan_apfs_volume(
+        &mut operations,
+        container,
+        roots.store(),
+        APFS_STORE_VOLUME,
+        VolumeRole::Store,
+        store,
+    );
+    operations.push(guard(
+        roots.caches(),
+        VolumeRole::Caches,
+        SubstrateKind::Apfs,
+    ));
+    plan_apfs_volume(
+        &mut operations,
+        container,
+        roots.caches(),
+        APFS_CACHES_VOLUME,
+        VolumeRole::Caches,
+        caches,
+    );
+    Ok(operations)
 }
 
-fn plan_zfs(pool: &str, roots: &CanonicalRoots) -> Vec<HostOperation> {
+fn plan_apfs_volume(
+    operations: &mut Vec<HostOperation>,
+    container: &str,
+    mountpoint: &Path,
+    volume_name: &str,
+    role: VolumeRole,
+    state: &ExistingStorage,
+) {
+    match state {
+        ExistingStorage::MountedValid { .. } => {}
+        ExistingStorage::Absent => {
+            operations.push(HostOperation::EnsureDirectory(mountpoint.to_owned()));
+            operations.push(command(
+                DISKUTIL,
+                [
+                    "apfs",
+                    "addVolume",
+                    container,
+                    "APFS",
+                    volume_name,
+                    "-nomount",
+                ],
+            ));
+            operations.push(apfs_mount(mountpoint, volume_name));
+            operations.push(marker(
+                mountpoint,
+                VolumeMarker::new(role, SubstrateKind::Apfs),
+            ));
+        }
+        ExistingStorage::ExistingUnmounted {
+            exact_identifier, ..
+        } => {
+            operations.push(HostOperation::EnsureDirectory(mountpoint.to_owned()));
+            operations.push(apfs_mount(mountpoint, exact_identifier));
+            operations.push(guard(mountpoint, role, SubstrateKind::Apfs));
+        }
+    }
+}
+
+fn apfs_mount(mountpoint: &Path, exact_identifier: &str) -> HostOperation {
+    command(
+        DISKUTIL,
+        [
+            "mount",
+            "-nobrowse",
+            "-mountPoint",
+            &mountpoint.to_string_lossy(),
+            exact_identifier,
+        ],
+    )
+}
+
+fn plan_zfs(
+    pool: &str,
+    roots: &CanonicalRoots,
+    root_state: &ExistingStorage,
+    store_state: &ExistingStorage,
+    caches_state: &ExistingStorage,
+    projects_state: &ExistingStorage,
+) -> Result<Vec<HostOperation>, PlanError> {
     let root = zfs_name(pool, ZFS_COWSHED_ROOT);
     let store = zfs_name(&root, ZFS_STORE_CHILD);
     let caches = zfs_name(&root, ZFS_CACHES_CHILD);
     let projects = zfs_name(&root, ZFS_PROJECTS_CHILD);
-    vec![
+    validate_zfs_evidence(root_state, &root)?;
+    validate_zfs_evidence(store_state, &store)?;
+    validate_zfs_evidence(caches_state, &caches)?;
+    validate_zfs_evidence(projects_state, &projects)?;
+    validate_zfs_topology(root_state, store_state, caches_state, projects_state)?;
+    validate_existing_marker(store_state, VolumeRole::Store, SubstrateKind::Zfs)?;
+    validate_existing_marker(caches_state, VolumeRole::Caches, SubstrateKind::Zfs)?;
+    validate_existing_marker(projects_state, VolumeRole::Projects, SubstrateKind::Zfs)?;
+
+    let mut operations = vec![
         HostOperation::VerifyZfsDelegation {
             pool: pool.to_owned(),
             required_root: root.clone(),
         },
-        command(ZFS, ["create", "-o", "mountpoint=none", &root]),
         guard(roots.store(), VolumeRole::Store, SubstrateKind::Zfs),
-        HostOperation::EnsureDirectory(roots.store().to_owned()),
-        command(
-            ZFS,
-            [
-                "create",
-                "-o",
-                &format!("mountpoint={}", roots.store().display()),
-                &store,
-            ],
-        ),
-        zfs_marker(&store, VolumeRole::Store),
-        marker(
-            roots.store(),
-            VolumeMarker::new(VolumeRole::Store, SubstrateKind::Zfs),
-        ),
-        guard(roots.caches(), VolumeRole::Caches, SubstrateKind::Zfs),
-        HostOperation::EnsureDirectory(roots.caches().to_owned()),
-        command(
-            ZFS,
-            [
-                "create",
-                "-o",
-                &format!("mountpoint={}", roots.caches().display()),
-                &caches,
-            ],
-        ),
-        zfs_marker(&caches, VolumeRole::Caches),
-        marker(
-            roots.caches(),
-            VolumeMarker::new(VolumeRole::Caches, SubstrateKind::Zfs),
-        ),
-        command(ZFS, ["create", "-o", "mountpoint=none", &projects]),
-        zfs_marker(&projects, VolumeRole::Projects),
-    ]
+    ];
+    if matches!(root_state, ExistingStorage::Absent) {
+        operations.push(command(ZFS, ["create", "-o", "mountpoint=none", &root]));
+    }
+    plan_zfs_mounted_dataset(
+        &mut operations,
+        &store,
+        roots.store(),
+        VolumeRole::Store,
+        store_state,
+    );
+    operations.push(guard(
+        roots.caches(),
+        VolumeRole::Caches,
+        SubstrateKind::Zfs,
+    ));
+    plan_zfs_mounted_dataset(
+        &mut operations,
+        &caches,
+        roots.caches(),
+        VolumeRole::Caches,
+        caches_state,
+    );
+    if matches!(projects_state, ExistingStorage::Absent) {
+        operations.push(command(ZFS, ["create", "-o", "mountpoint=none", &projects]));
+        operations.push(zfs_marker(&projects, VolumeRole::Projects));
+    }
+    Ok(operations)
+}
+
+fn validate_nested_topology(
+    store: &ExistingStorage,
+    caches: &ExistingStorage,
+) -> Result<(), PlanError> {
+    if matches!(store, ExistingStorage::Absent) && !matches!(caches, ExistingStorage::Absent) {
+        return Err(PlanError::ImpossibleStorageTopology(
+            "caches cannot exist when store is absent",
+        ));
+    }
+    if !matches!(store, ExistingStorage::MountedValid { .. })
+        && matches!(caches, ExistingStorage::MountedValid { .. })
+    {
+        return Err(PlanError::ImpossibleStorageTopology(
+            "caches cannot be mounted while store is unmounted",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_zfs_topology(
+    root: &ExistingStorage,
+    store: &ExistingStorage,
+    caches: &ExistingStorage,
+    projects: &ExistingStorage,
+) -> Result<(), PlanError> {
+    if matches!(root, ExistingStorage::Absent)
+        && [store, caches, projects]
+            .into_iter()
+            .any(|state| !matches!(state, ExistingStorage::Absent))
+    {
+        return Err(PlanError::ImpossibleStorageTopology(
+            "ZFS root cannot be absent when a child dataset exists",
+        ));
+    }
+    validate_nested_topology(store, caches)
+}
+
+fn validate_existing_marker(
+    state: &ExistingStorage,
+    expected_role: VolumeRole,
+    expected_substrate: SubstrateKind,
+) -> Result<(), PlanError> {
+    let ExistingStorage::ExistingUnmounted {
+        exact_identifier,
+        marker,
+    } = state
+    else {
+        return Ok(());
+    };
+    if !matches!(
+        marker,
+        ExistingMarkerEvidence::Valid(actual)
+            if actual.role() == expected_role && actual.substrate() == expected_substrate
+    ) {
+        return Err(PlanError::InvalidExistingStorageMarker {
+            exact_identifier: exact_identifier.clone(),
+            expected_role,
+            expected_substrate,
+        });
+    }
+    Ok(())
+}
+
+fn validate_zfs_evidence(state: &ExistingStorage, expected: &str) -> Result<(), PlanError> {
+    if let Some(actual) = state.exact_identifier()
+        && actual != expected
+    {
+        return Err(PlanError::UnexpectedStorageIdentifier {
+            expected: expected.to_owned(),
+            actual: actual.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn plan_zfs_mounted_dataset(
+    operations: &mut Vec<HostOperation>,
+    dataset: &str,
+    mountpoint: &Path,
+    role: VolumeRole,
+    state: &ExistingStorage,
+) {
+    match state {
+        ExistingStorage::MountedValid { .. } => {}
+        ExistingStorage::Absent => {
+            operations.push(HostOperation::EnsureDirectory(mountpoint.to_owned()));
+            operations.push(command(
+                ZFS,
+                [
+                    "create",
+                    "-o",
+                    &format!("mountpoint={}", mountpoint.display()),
+                    dataset,
+                ],
+            ));
+            operations.push(zfs_marker(dataset, role));
+            operations.push(marker(
+                mountpoint,
+                VolumeMarker::new(role, SubstrateKind::Zfs),
+            ));
+        }
+        ExistingStorage::ExistingUnmounted { .. } => {
+            operations.push(HostOperation::EnsureDirectory(mountpoint.to_owned()));
+            operations.push(command(
+                ZFS,
+                [
+                    "set".to_owned(),
+                    format!("mountpoint={}", mountpoint.display()),
+                    dataset.to_owned(),
+                ],
+            ));
+            operations.push(command(ZFS, ["mount", dataset]));
+            operations.push(guard(mountpoint, role, SubstrateKind::Zfs));
+        }
+    }
 }
 
 fn guard(path: &Path, role: VolumeRole, substrate: SubstrateKind) -> HostOperation {
@@ -708,6 +942,23 @@ impl fmt::Display for VolumeRole {
 pub enum PlanError {
     #[error("home path must be absolute and normalized: {0:?}")]
     NonCanonicalHome(PathBuf),
+    #[error("selected {selected:?} substrate cannot use {evidence:?} bootstrap evidence")]
+    EvidenceSubstrateMismatch {
+        selected: SubstrateKind,
+        evidence: SubstrateKind,
+    },
+    #[error("storage evidence names {actual:?}, expected exact object {expected:?}")]
+    UnexpectedStorageIdentifier { expected: String, actual: String },
+    #[error(
+        "existing storage {exact_identifier:?} has no valid {expected_substrate:?} {expected_role:?} marker"
+    )]
+    InvalidExistingStorageMarker {
+        exact_identifier: String,
+        expected_role: VolumeRole,
+        expected_substrate: SubstrateKind,
+    },
+    #[error("impossible existing-storage topology: {0}")]
+    ImpossibleStorageTopology(&'static str),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -747,10 +998,6 @@ impl HostError {
             message: message.into(),
         }
     }
-
-    pub fn message(&self) -> &str {
-        &self.message
-    }
 }
 
 pub type BlockingJob = Box<dyn FnOnce() -> Result<(), BootstrapExecutionError> + Send + 'static>;
@@ -782,8 +1029,9 @@ where
     H: BootstrapHost + 'static,
     L: BlockingLane,
 {
-    for operation in plan.operations().iter().cloned() {
+    for operation in plan.operations() {
         let host = Arc::clone(&host);
+        let operation = operation.clone();
         lane.dispatch(Box::new(move || apply_operation(host.as_ref(), &operation)))
             .await?;
     }
