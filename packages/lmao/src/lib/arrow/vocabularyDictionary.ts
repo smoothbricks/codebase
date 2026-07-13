@@ -1,5 +1,4 @@
 import { Column, utf8 } from '@uwdata/flechette';
-import '../../generated/vocabulary.js';
 import { ENTRY_TYPE_NAMES } from '../schema/systemSchema.js';
 import type { VocabularyGeneration } from '../vocabularyRegistry.js';
 import { makeArrowColumn } from './flechette.js';
@@ -89,7 +88,6 @@ export function getVocabularyDictionaryPrefix(generation: VocabularyGeneration):
   vocabularyDictionaries.set(generation, prefix);
   return prefix;
 }
-
 
 /**
  * Append one UTF-8 dictionary batch without copying the prefix buffers or
