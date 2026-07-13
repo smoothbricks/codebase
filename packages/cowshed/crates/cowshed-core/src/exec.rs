@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
-use crate::sandbox::{seatbelt_profile, SandboxConfig, SandboxError};
+use crate::sandbox::{SandboxConfig, SandboxError, seatbelt_profile};
 
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
