@@ -60,7 +60,6 @@
  */
 
 import type { BufferStrategy } from './bufferStrategy.js';
-import type { TagWriter } from './codegen/fixedPositionWriterGenerator.js';
 import { createTagWriter } from './codegen/fixedPositionWriterGenerator.js';
 import { createSpanLogger as createSpanLoggerFromGenerator } from './codegen/spanLoggerGenerator.js';
 import type { LogBinding } from './logBinding.js';
@@ -75,10 +74,13 @@ import { EMPTY_SCOPE } from './spanBuffer.js';
 import {
   createSpanContextClass,
   type SpanContextClass,
+  isPhysicalLayoutPlanForContext,
   type SpanContextInstance,
   writeSpanEnd,
   writeSpanStart,
 } from './spanContext.js';
+import type { PhysicalLayoutPlan } from './physicalLayoutPlan.js';
+import { RUNTIME_HINT_FF, RUNTIME_HINT_LOG, RUNTIME_HINT_SCOPE, RUNTIME_HINT_TAG } from './runtimeHint.js';
 import { generateTraceId, isValidTraceId, type TraceId } from './traceId.js';
 import type { TraceRootFactory } from './traceRoot.js';
 import type { SpanBuffer } from './types.js';
@@ -276,13 +278,23 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
 
     // Create SpanContext class for all contexts created by this tracer
     // The class closes over schema/logBinding and provides typed methods
-    this.SpanContextClass = createSpanContextClass<OpContextOf<B>>(binding.logBinding.logSchema, binding.logBinding);
+    this.SpanContextClass = createSpanContextClass<OpContextOf<B>>(
+      binding.logBinding.logSchema,
+      binding.logBinding,
+      undefined,
+      Object.keys(this.ctxDefaults),
+    );
+
 
     // Bind methods for destructuring (per AGENTS.md - "Always destructure")
     this.trace = this.trace.bind(this);
     this.trace_op = this.trace_op.bind(this);
     this.trace_fn = this.trace_fn.bind(this);
     this.flush = this.flush.bind(this);
+  }
+
+  getFlagEvaluatorForContext(): FlagEvaluator<OpContextOf<B>> {
+    return this.flagEvaluator;
   }
 
   private _createFlagEvaluator(
@@ -566,7 +578,10 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     op: Op<OpContextOf<B>, Args, S, E>,
     ...opArgs: Args
   ): Result<S, E> | Promise<Result<S, E>> {
-    const ctx = this._createRootContext(line, name, overrides, op.metadata);
+    if (!isPhysicalLayoutPlanForContext<OpContextOf<B>>(op.physicalLayoutPlan, this.logBinding.logSchema)) {
+      throw new TypeError('Op physical layout plan does not match this tracer context');
+    }
+    const ctx = this._createRootContext(line, name, overrides, op.metadata, op.physicalLayoutPlan);
     return this._executeResultWithContext(ctx, (c) => op.fn(c, ...opArgs));
   }
 
@@ -581,7 +596,10 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     ) => Result<unknown, unknown> | Promise<Result<unknown, unknown>>,
     ...opArgs: unknown[]
   ): Result<unknown, unknown> | Promise<Result<unknown, unknown>> {
-    const ctx = this._createRootContext(line, name, overrides, metadata);
+    if (!isPhysicalLayoutPlanForContext<OpContextOf<B>>(metadata._physicalLayoutPlan, this.logBinding.logSchema)) {
+      throw new TypeError('Op metadata is missing its physical layout plan');
+    }
+    const ctx = this._createRootContext(line, name, overrides, metadata, metadata._physicalLayoutPlan);
     return this._executeResultWithContext(ctx, (childCtx) => fn(childCtx, ...opArgs));
   }
 
@@ -677,6 +695,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     name: string,
     overrides: Record<string, unknown>,
     metadata: ReturnType<typeof createOpMetadata>,
+    physicalLayoutPlan?: PhysicalLayoutPlan<B['logBinding']['logSchema'], OpContextOf<B>>,
   ): SpanContextInstance<OpContextOf<B>> {
     // Extract trace_id from overrides if present
     const traceId: TraceId = isValidTraceId(overrides.trace_id) ? overrides.trace_id : generateTraceId();
@@ -700,25 +719,31 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     // Write span-start entry (row 0)
     writeSpanStart(buffer, name);
 
-    // Create tag writer and span logger (needed for constructor)
-    const tagWriter: TagWriter<B['logBinding']['logSchema']> = createTagWriter(schema, buffer);
-    const spanLogger = createSpanLoggerFromGenerator(schema, buffer);
-
-    // Instantiate SpanContext class with direct arguments (no temp object allocation)
-    const ctx = new this.SpanContextClass(buffer, schema, spanLogger, tagWriter);
-
-    // Set up deps from config (may be EMPTY_SCOPE if none provided)
-    ctx.deps = this.deps;
-
-    ctx.ff = this.flagEvaluator.forContext(ctx);
-
-    // Copy resolved user context onto SpanContext.
-    for (const key in resolvedUserCtx) {
-      (ctx as Record<string, unknown>)[key] = resolvedUserCtx[key];
-    }
-
-    return ctx;
+    const capabilities = physicalLayoutPlan?.capabilities;
+    const needsLogger =
+      capabilities === undefined ||
+      (capabilities & (RUNTIME_HINT_LOG | RUNTIME_HINT_FF | RUNTIME_HINT_SCOPE)) !== 0;
+    const needsTag = capabilities === undefined || (capabilities & RUNTIME_HINT_TAG) !== 0;
+    const spanLogger = needsLogger
+      ? physicalLayoutPlan?.createSpanLogger(buffer) ?? createSpanLoggerFromGenerator(schema, buffer)
+      : undefined;
+    const tagWriter = needsTag
+      ? physicalLayoutPlan?.createTagWriter(buffer) ?? createTagWriter(schema, buffer)
+      : undefined;
+    const SpanContextCtor = physicalLayoutPlan?.SpanContextClass ?? this.SpanContextClass;
+    return new SpanContextCtor(
+      buffer,
+      schema,
+      spanLogger,
+      tagWriter,
+      physicalLayoutPlan,
+      resolvedUserCtx,
+      undefined,
+      this.deps,
+      this.flagEvaluator,
+    );
   }
+
 
   /**
    * Validate null-sentinel required fields and merge with provided overrides.

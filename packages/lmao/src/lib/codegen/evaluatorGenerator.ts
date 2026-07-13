@@ -48,7 +48,7 @@ type WorkerSafeEvaluatorInstance = WorkerSafeGeneratedEvaluator<OpContext>;
 
 type EvaluatorRuntimeContext<Ctx extends OpContext> = SpanContextWithoutFf<Ctx> & {
   _buffer: AnySpanBuffer;
-  log: SpanLoggerInternal<Ctx['logSchema']>;
+  _spanLogger: SpanLoggerInternal<Ctx['logSchema']>;
 };
 
 /**
@@ -80,9 +80,9 @@ function isEvaluatorRuntimeContext<Ctx extends OpContext>(
   return (
     isRecord(value) &&
     '_buffer' in value &&
-    'log' in value &&
+    '_spanLogger' in value &&
     isAnySpanBuffer(value._buffer) &&
-    isInternalSpanLogger<Ctx['logSchema']>(value.log)
+    isInternalSpanLogger<Ctx['logSchema']>(value._spanLogger)
   );
 }
 
@@ -267,7 +267,7 @@ class WorkerSafeGeneratedEvaluator<Ctx extends OpContext> implements GeneratedEv
   }
 
   private getLogger(): SpanLoggerInternal<Ctx['logSchema']> {
-    return this.#spanContext.log;
+    return this.#spanContext._spanLogger;
   }
 
   private logUsage(flagName: string, context?: FlagTrackContext) {
