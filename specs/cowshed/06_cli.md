@@ -37,12 +37,13 @@ plays for `--ndjson` export flags; cowshed never writes NDJSON to disk (telemetr
 ### JSON result bodies (frozen)
 
 Every command uses a named `cowshed-core` DTO as its `result`; adapters never assemble anonymous maps. `adopt`, `new`,
-`fork`, `restore`, `attach`, and `path` return `MountResult { workspace, mount }`. `detach`, `rm`, job detach/kill, and
-successful policy mutations with no additional observation return the literal empty object `{}` through `EmptyResult`
-(never `null`, `true`, or a message string). `doctor` returns `DoctorReport { healthy, findings }`; each `Finding` has
-`code`, `severity`, `message`, `hint`, and optional `path`. `ls` returns `WorkspaceInfo[]`; `ensure` returns
-`EnsureReport`; `gc` returns `GcReport`. Exec and job commands return the frozen job DTOs in 07_api.md. Commands whose
-normal stdout is a scalar use a named one-field body (`CheckpointResult { label }`, `RevisionResult { oid }`,
+`fork`, `restore`, `attach`, and `path` return `MountResult { workspace, mount, baseCommit? }`; lifecycle commands fill
+`baseCommit`, while query/attachment paths may omit it when no marker snapshot was requested. `detach`, `rm`, job
+detach/kill, and successful policy mutations with no additional observation return the literal empty object `{}` through
+`EmptyResult` (never `null`, `true`, or a message string). `doctor` returns `DoctorReport { healthy, findings }`; each
+`Finding` has `code`, `severity`, `message`, `hint`, and optional `path`. `ls` returns `WorkspaceInfo[]`; `ensure`
+returns `EnsureReport`; `gc` returns `GcReport`. Exec and job commands return the frozen job DTOs in 07_api.md. Commands
+whose normal stdout is a scalar use a named one-field body (`CheckpointResult { label }`, `RevisionResult { oid }`,
 `SlotResult { slot }`) so JSON never changes shape when another field is added.
 
 The controller transport never places raw stdout/stderr bytes in a JSON body. `StreamInfo.path` names the raw spool and

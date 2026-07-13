@@ -363,6 +363,8 @@ pub struct EnsureReport {
 pub struct MountResult {
     pub workspace: WorkspaceName,
     pub mount: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<GitOid>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
