@@ -84,7 +84,6 @@ pub struct ExecRequest {
     pub env: HashMap<String, String>,    // filtered through the build-config allowlist
     pub trace: Option<TraceContext>,     // W3C context; propagated into the job env as TRACEPARENT (13_telemetry.md)
     pub stdin: StdinSource,
-    pub stdout: Stdio, pub stderr: Stdio,
 }
 
 /// Binary stdin without shell interpolation. N-API projects Inline as Uint8Array/Buffer,
@@ -93,25 +92,30 @@ pub enum StdinSource {
     Empty,
     Inline(Bytes),
     Stream(Pin<Box<dyn AsyncRead + Send>>),
-    WorkspaceFile(PathBuf),
+    WorkspaceFile(WorkspacePath),
 }
 
 pub struct StdinInfo {
     pub kind: StdinKind,                 // empty | inline | stream | workspace-file
     pub bytes: u64,                      // bytes successfully delivered before EOF/cancellation
-    pub workspace_path: Option<PathBuf>, // normalized relative path; never host-absolute
+    pub workspace_path: Option<WorkspacePath>, // normalized relative path; never host-absolute
     pub complete: bool,                  // true only after clean source EOF reached child stdin
 }
 
-pub struct TraceContext { pub trace_id: [u8; 16], pub span_id: [u8; 8] }  // adopted or minted per request
+pub struct TraceContext { pub trace_id: TraceId, pub span_id: SpanId } // validated lowercase hex
 
 /// Positive, workspace-local monotonic identity allocated for every exec submission.
 /// The allocator never reuses a value. Values are capped at 2^53-1 so the same integer is exact
 /// in Rust, JSON, and N-API/JavaScript `number`.
-#[serde(transparent)]
-pub struct JobId(pub u64);
+pub struct JobId(u64); // constructed with JobId::new; 1..=2^53-1
 
 pub enum JobState { Queued, Running, Exited, Signaled, Killed, OutputLimit, Failed }
+
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ExitStatus {
+    Exited { code: i32 },
+    Signaled { signal: i32, core_dumped: bool },
+}
 
 /// Deterministic, bounded, redacted text projection of a raw stream.
 pub struct OutputSummary {
@@ -121,28 +125,28 @@ pub struct OutputSummary {
 }
 
 pub struct StreamInfo {
-    pub path: PathBuf,                   // `.cowshed/job/<id>/out` or `err`, relative to mount
+    pub path: WorkspacePath,             // `.cowshed/job/<id>/out` or `err`, relative to mount
     pub bytes: u64,
     pub summary: OutputSummary,
 }
 
 /// The single lifecycle/result DTO reused by core, CLI JSON, N-API, MCP, and Arrow projections.
 pub struct JobInfo {
-    pub repo_id: String,
-    pub workspace_incarnation: [u8; 16],
-    pub id: JobId,
+    pub repo_id: RepoId,
+    pub workspace_incarnation: WorkspaceIncarnation,
+    pub job_id: JobId,
     pub state: JobState,
     pub pid: Option<u32>,
     pub grant_revision: u64,
     pub argv: Vec<String>,
-    pub cwd: PathBuf,
-    pub started: SystemTime,
-    pub duration: Option<Duration>,
+    pub cwd: WorkspacePath,
+    pub started: UtcTimestamp,
+    pub duration_ms: Option<u64>,
     pub exit: Option<ExitStatus>,
     pub stdout: StreamInfo,
     pub stderr: StreamInfo,
     pub trace: TraceContext,
-    pub output_limit: Option<OutputLimitInfo>, // present for the explicit OutputLimit terminal state
+    pub output_limit: Option<OutputLimitInfo>, // present exactly for OutputLimit
     pub stdin: StdinInfo,
 }
 
@@ -419,16 +423,18 @@ impl Session {
 
 /// The single capture record CLI, MCP, and CI all consume (11_shell.md).
 pub struct ExecRecord {
-    pub repo_id: String,
-    pub workspace_incarnation: [u8; 16],
+    pub repo_id: RepoId,
+    pub workspace_incarnation: WorkspaceIncarnation,
     pub job_id: JobId,
-    pub argv: Vec<String>, pub cwd: PathBuf, pub env_hash: u64,
+    pub state: JobState,
+    pub argv: Vec<String>, pub cwd: WorkspacePath, pub env_hash: u64,
     pub grant_revision: u64,
-    pub trace: TraceContext,              // standard trace_id/span_id; job_id is a separate join key
-    pub started: SystemTime, pub duration: Duration,
-    pub exit: ExitStatus,
+    pub trace: TraceContext,
+    pub started: UtcTimestamp, pub duration_ms: u64,
+    pub exit: Option<ExitStatus>,
     pub stdout: StreamInfo, pub stderr: StreamInfo,
     pub stdin: StdinInfo,
+    pub output_limit: Option<OutputLimitInfo>,
 }
 ```
 
