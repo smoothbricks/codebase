@@ -207,8 +207,10 @@ export function generateFixedPositionWriterClass(
   position: number,
   className: string,
   extension?: FixedPositionWriterExtension,
+  eagerColumns: readonly string[] = [],
 ): string {
   const schemaFields = schema._columns;
+  void eagerColumns;
 
   // Generate enum mapping functions
   const enumMappings: string[] = [];
@@ -294,12 +296,12 @@ ${extensionMethods}
  * Cache for TagWriter classes (position 0).
  * WeakMap allows garbage collection when schema is no longer referenced.
  */
-const tagWriterClassCache = new WeakMap<LogSchema, unknown>();
+const tagWriterClassCache = new WeakMap<LogSchema, Map<string, unknown>>();
 
 /**
  * Cache for ResultWriter classes (position 1).
  */
-const resultWriterClassCache = new WeakMap<LogSchema, Map<MessageLayoutFamily, unknown>>();
+const resultWriterClassCache = new WeakMap<LogSchema, Map<string, unknown>>();
 
 // ============================================================================
 // TagWriter API
@@ -321,8 +323,8 @@ uint64_value(value) {
  * Generate TagWriter class code for a schema.
  * TagWriter writes to position 0 (span-start row).
  */
-export function generateTagWriterClass(schema: LogSchema): string {
-  return generateFixedPositionWriterClass(schema, 0, 'GeneratedTagWriter', tagWriterExtension);
+export function generateTagWriterClass(schema: LogSchema, eagerColumns: readonly string[] = []): string {
+  return generateFixedPositionWriterClass(schema, 0, 'GeneratedTagWriter', tagWriterExtension, eagerColumns);
 }
 
 /**
@@ -331,13 +333,17 @@ export function generateTagWriterClass(schema: LogSchema): string {
  * @param schema - Tag attribute schema
  * @returns TagWriter class constructor
  */
-export function getTagWriterClass<T extends LogSchema>(schema: T): new (buffer: AnySpanBuffer) => TagWriter<T> {
-  let WriterClass = tagWriterClassCache.get(schema);
+export function getTagWriterClass<T extends LogSchema>(
+  schema: T,
+  eagerColumns: readonly string[] = [],
+): new (buffer: AnySpanBuffer) => TagWriter<T> {
+  const cacheKey = eagerColumns.join('\u0000');
+  let classes = tagWriterClassCache.get(schema);
+  let WriterClass = classes?.get(cacheKey);
 
   if (!WriterClass) {
-    const classCode = generateTagWriterClass(schema).trim();
+    const classCode = generateTagWriterClass(schema, eagerColumns).trim();
 
-    // Compile with new Function()
     const factory = new Function('helpers', classCode);
     WriterClass = factory(bufferHelpers);
 
@@ -345,7 +351,9 @@ export function getTagWriterClass<T extends LogSchema>(schema: T): new (buffer: 
       throw new Error('Failed to generate TagWriter constructor');
     }
 
-    tagWriterClassCache.set(schema, WriterClass);
+    classes ??= new Map();
+    classes.set(cacheKey, WriterClass);
+    tagWriterClassCache.set(schema, classes);
   }
 
   if (!isTagWriterConstructor<T>(WriterClass)) {
@@ -420,12 +428,14 @@ uint64_value(value) {
 export function generateResultWriterClass(
   schema: LogSchema,
   messageLayoutFamily: MessageLayoutFamily = 'mixed',
+  eagerColumns: readonly string[] = [],
 ): string {
   return generateFixedPositionWriterClass(
     schema,
     1,
     'GeneratedResultWriter',
     createResultWriterExtension(messageLayoutFamily),
+    eagerColumns,
   );
 }
 
@@ -438,16 +448,18 @@ export function generateResultWriterClass(
 export function getResultWriterClass<T extends LogSchema>(
   schema: T,
   messageLayoutFamily: MessageLayoutFamily = 'mixed',
+  eagerColumns: readonly string[] = [],
 ): new <R = unknown, E = unknown>(
   buffer: AnySpanBuffer,
   resultOrError: unknown,
   isError: boolean,
 ) => ResultWriter<T, R, E> {
   let familyClasses = resultWriterClassCache.get(schema);
-  let WriterClass = familyClasses?.get(messageLayoutFamily);
+  const cacheKey = `${messageLayoutFamily}:${eagerColumns.join('\u0000')}`;
+  let WriterClass = familyClasses?.get(cacheKey);
 
   if (!WriterClass) {
-    const classCode = generateResultWriterClass(schema, messageLayoutFamily).trim();
+    const classCode = generateResultWriterClass(schema, messageLayoutFamily, eagerColumns).trim();
 
     // Compile with new Function()
     const factory = new Function('helpers', classCode);
@@ -458,7 +470,7 @@ export function getResultWriterClass<T extends LogSchema>(
     }
 
     familyClasses ??= new Map();
-    familyClasses.set(messageLayoutFamily, WriterClass);
+    familyClasses.set(cacheKey, WriterClass);
     resultWriterClassCache.set(schema, familyClasses);
   }
 

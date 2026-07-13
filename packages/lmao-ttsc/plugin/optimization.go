@@ -9,14 +9,14 @@ import (
 )
 
 const (
-	runtimeHintTag      uint32 = 1 << 16
-	runtimeHintLog      uint32 = 1 << 17
-	runtimeHintFF       uint32 = 1 << 18
-	runtimeHintSpan     uint32 = 1 << 19
-	runtimeHintResult   uint32 = 1 << 20
-	runtimeHintScope    uint32 = 1 << 21
-	runtimeHintDeps     uint32 = 1 << 22
-	runtimeHintAnalyzed uint32 = 1 << 23
+	runtimeHintTag            uint32 = 1 << 16
+	runtimeHintLog            uint32 = 1 << 17
+	runtimeHintFF             uint32 = 1 << 18
+	runtimeHintSpan           uint32 = 1 << 19
+	runtimeHintResult         uint32 = 1 << 20
+	runtimeHintScope          uint32 = 1 << 21
+	runtimeHintDeps           uint32 = 1 << 22
+	runtimeHintAnalyzed       uint32 = 1 << 23
 	runtimeHintMessageStatic  uint32 = 1 << 24
 	runtimeHintMessageDynamic uint32 = 1 << 25
 	runtimeHintMessageMixed   uint32 = runtimeHintMessageStatic | runtimeHintMessageDynamic
@@ -30,7 +30,8 @@ var contextCapability = map[string]uint32{
 }
 
 type opCompileAnalysis struct {
-	runtimeHint uint32
+	runtimeHint  uint32
+	eagerColumns []string
 }
 
 type hintRewrite struct {
@@ -39,7 +40,6 @@ type hintRewrite struct {
 	single  opCompileAnalysis
 	isGroup bool
 }
-
 
 func functionParts(node *shimast.Node) (params *shimast.ParameterList, body *shimast.Node, async bool, ok bool) {
 	switch node.Kind {
@@ -176,6 +176,315 @@ func analyzeOpFunction(fn *shimast.Node, staticLogIDs map[*shimast.CallExpressio
 	return runtimeHintAnalyzed | messageHint | caps | capacity
 }
 
+type eagerColumnSet map[string]struct{}
+
+type eagerColumnFlow struct {
+	fields         eagerColumnSet
+	terminalFields eagerColumnSet
+	fallsThrough   bool
+	hasTerminal    bool
+}
+
+type eagerColumnAnalyzer struct {
+	transformer *fileTransformer
+	ctxName     string
+	valid       bool
+}
+
+func cloneEagerColumns(columns eagerColumnSet) eagerColumnSet {
+	cloned := make(eagerColumnSet, len(columns))
+	for name := range columns {
+		cloned[name] = struct{}{}
+	}
+	return cloned
+}
+
+func addEagerColumns(dst, src eagerColumnSet) {
+	for name := range src {
+		dst[name] = struct{}{}
+	}
+}
+
+func intersectEagerColumns(left, right eagerColumnSet) eagerColumnSet {
+	if len(left) > len(right) {
+		left, right = right, left
+	}
+	intersection := make(eagerColumnSet, len(left))
+	for name := range left {
+		if _, present := right[name]; present {
+			intersection[name] = struct{}{}
+		}
+	}
+	return intersection
+}
+
+func mergeEagerTerminals(dst *eagerColumnFlow, src eagerColumnFlow) {
+	if !src.hasTerminal {
+		return
+	}
+	if !dst.hasTerminal {
+		dst.terminalFields = cloneEagerColumns(src.terminalFields)
+		dst.hasTerminal = true
+		return
+	}
+	dst.terminalFields = intersectEagerColumns(dst.terminalFields, src.terminalFields)
+}
+
+func (a *eagerColumnAnalyzer) validateSyntax(node *shimast.Node, root bool) {
+	if node == nil || !a.valid {
+		return
+	}
+	if !root && isNestedFunction(node) {
+		a.valid = false
+		return
+	}
+	switch node.Kind {
+	case shimast.KindForStatement, shimast.KindForInStatement, shimast.KindForOfStatement,
+		shimast.KindWhileStatement, shimast.KindDoStatement, shimast.KindSwitchStatement,
+		shimast.KindTryStatement, shimast.KindLabeledStatement, shimast.KindWithStatement:
+		a.valid = false
+		return
+	}
+	node.ForEachChild(func(child *shimast.Node) bool {
+		a.validateSyntax(child, false)
+		return !a.valid
+	})
+}
+
+func isNamedContextAccess(node *shimast.Node, ctxName, name string) bool {
+	if node == nil || node.Kind != shimast.KindPropertyAccessExpression {
+		return false
+	}
+	access := node.AsPropertyAccessExpression()
+	return shimast.NodeText(access.Name()) == name && access.Expression.Kind == shimast.KindIdentifier && shimast.NodeText(access.Expression) == ctxName
+}
+
+func contextWriterRoot(call *shimast.CallExpression, ctxName string) string {
+	current := call
+	for {
+		if current.Expression.Kind != shimast.KindPropertyAccessExpression {
+			return ""
+		}
+		access := current.Expression.AsPropertyAccessExpression()
+		next := access.Expression
+		if next.Kind == shimast.KindCallExpression {
+			current = next.AsCallExpression()
+			continue
+		}
+		if next.Kind == shimast.KindIdentifier && shimast.NodeText(next) == ctxName {
+			switch shimast.NodeText(access.Name()) {
+			case "ok", "err":
+				return "result"
+			}
+			return ""
+		}
+		if isNamedContextAccess(next, ctxName, "tag") {
+			return "tag"
+		}
+		if isNamedContextAccess(next, ctxName, "log") {
+			return "log"
+		}
+		return ""
+	}
+}
+
+func (a *eagerColumnAnalyzer) provenCallWrites(call *shimast.CallExpression) (eagerColumnSet, bool) {
+	root := contextWriterRoot(call, a.ctxName)
+	if root == "" {
+		return nil, false
+	}
+	var writes []tagWrite
+	var schema map[string]schemaField
+	proved := false
+	switch root {
+	case "tag":
+		ctxExpr, recovered, recoveredSchema, ok := a.transformer.findTagChain(call)
+		if ok && ctxExpr.Kind == shimast.KindIdentifier && shimast.NodeText(ctxExpr) == a.ctxName {
+			writes, schema, proved = recovered, recoveredSchema, true
+		}
+	case "log":
+		if recovered, ok := a.transformer.findLogInline(call); ok && isNamedContextAccess(recovered.logExpr, a.ctxName, "log") {
+			writes, schema, proved = recovered.writes, recovered.schema, true
+		}
+	case "result":
+		if recovered, ok := a.transformer.findResultInline(call); ok && recovered.okCall != nil && recovered.okCall.Kind == shimast.KindCallExpression {
+			rootCall := recovered.okCall.AsCallExpression()
+			if rootCall.Expression.Kind == shimast.KindPropertyAccessExpression {
+				rootAccess := rootCall.Expression.AsPropertyAccessExpression()
+				if rootAccess.Expression.Kind == shimast.KindIdentifier && shimast.NodeText(rootAccess.Expression) == a.ctxName {
+					writes, schema, proved = recovered.writes, recovered.schema, true
+				}
+			}
+		}
+		if !proved && call.Expression.Kind == shimast.KindPropertyAccessExpression {
+			access := call.Expression.AsPropertyAccessExpression()
+			if access.Expression.Kind == shimast.KindIdentifier && shimast.NodeText(access.Expression) == a.ctxName && resultMethods[shimast.NodeText(access.Name())] {
+				return eagerColumnSet{}, true
+			}
+		}
+	}
+	if !proved {
+		a.valid = false
+		return nil, true
+	}
+	columns := make(eagerColumnSet, len(writes))
+	for _, write := range writes {
+		if root == "result" && (write.field == "line" || write.field == "message") {
+			continue
+		}
+		if _, known := schema[write.field]; !known {
+			a.valid = false
+			return nil, true
+		}
+		columns[write.field] = struct{}{}
+	}
+	return columns, true
+}
+
+func (a *eagerColumnAnalyzer) expressionWrites(node *shimast.Node) eagerColumnSet {
+	columns := eagerColumnSet{}
+	if node == nil || !a.valid {
+		return columns
+	}
+	switch node.Kind {
+	case shimast.KindParenthesizedExpression:
+		return a.expressionWrites(node.AsParenthesizedExpression().Expression)
+	case shimast.KindConditionalExpression:
+		expression := node.AsConditionalExpression()
+		base := a.expressionWrites(expression.Condition)
+		whenTrue := cloneEagerColumns(base)
+		addEagerColumns(whenTrue, a.expressionWrites(expression.WhenTrue))
+		whenFalse := cloneEagerColumns(base)
+		addEagerColumns(whenFalse, a.expressionWrites(expression.WhenFalse))
+		return intersectEagerColumns(whenTrue, whenFalse)
+	case shimast.KindBinaryExpression:
+		expression := node.AsBinaryExpression()
+		left := a.expressionWrites(expression.Left)
+		operator := expression.OperatorToken.Kind
+		if operator == shimast.KindAmpersandAmpersandToken || operator == shimast.KindBarBarToken || operator == shimast.KindQuestionQuestionToken {
+			a.expressionWrites(expression.Right)
+			return left
+		}
+		addEagerColumns(left, a.expressionWrites(expression.Right))
+		return left
+	case shimast.KindCallExpression:
+		call := node.AsCallExpression()
+		if recovered, handled := a.provenCallWrites(call); handled {
+			addEagerColumns(columns, recovered)
+			for _, argument := range call.Arguments.Nodes {
+				addEagerColumns(columns, a.expressionWrites(argument))
+			}
+			return columns
+		}
+	}
+	node.ForEachChild(func(child *shimast.Node) bool {
+		addEagerColumns(columns, a.expressionWrites(child))
+		return !a.valid
+	})
+	return columns
+}
+
+func (a *eagerColumnAnalyzer) statements(nodes []*shimast.Node, incoming eagerColumnSet) eagerColumnFlow {
+	flow := eagerColumnFlow{fields: cloneEagerColumns(incoming), fallsThrough: true}
+	for _, statement := range nodes {
+		if !flow.fallsThrough || !a.valid {
+			break
+		}
+		next := a.statement(statement, flow.fields)
+		mergeEagerTerminals(&flow, next)
+		flow.fields = next.fields
+		flow.fallsThrough = next.fallsThrough
+	}
+	return flow
+}
+
+func (a *eagerColumnAnalyzer) statement(node *shimast.Node, incoming eagerColumnSet) eagerColumnFlow {
+	flow := eagerColumnFlow{fields: cloneEagerColumns(incoming), fallsThrough: true}
+	if node == nil || !a.valid {
+		return flow
+	}
+	switch node.Kind {
+	case shimast.KindBlock:
+		return a.statements(node.AsBlock().Statements.Nodes, incoming)
+	case shimast.KindExpressionStatement:
+		addEagerColumns(flow.fields, a.expressionWrites(node.AsExpressionStatement().Expression))
+	case shimast.KindReturnStatement:
+		addEagerColumns(flow.fields, a.expressionWrites(node.AsReturnStatement().Expression))
+		flow.terminalFields, flow.hasTerminal, flow.fallsThrough = cloneEagerColumns(flow.fields), true, false
+	case shimast.KindThrowStatement:
+		addEagerColumns(flow.fields, a.expressionWrites(node.AsThrowStatement().Expression))
+		flow.terminalFields, flow.hasTerminal, flow.fallsThrough = cloneEagerColumns(flow.fields), true, false
+	case shimast.KindIfStatement:
+		statement := node.AsIfStatement()
+		base := cloneEagerColumns(incoming)
+		addEagerColumns(base, a.expressionWrites(statement.Expression))
+		whenTrue := a.statement(statement.ThenStatement, base)
+		whenFalse := eagerColumnFlow{fields: cloneEagerColumns(base), fallsThrough: true}
+		if statement.ElseStatement != nil {
+			whenFalse = a.statement(statement.ElseStatement, base)
+		}
+		flow = eagerColumnFlow{}
+		mergeEagerTerminals(&flow, whenTrue)
+		mergeEagerTerminals(&flow, whenFalse)
+		switch {
+		case whenTrue.fallsThrough && whenFalse.fallsThrough:
+			flow.fields = intersectEagerColumns(whenTrue.fields, whenFalse.fields)
+			flow.fallsThrough = true
+		case whenTrue.fallsThrough:
+			flow.fields, flow.fallsThrough = cloneEagerColumns(whenTrue.fields), true
+		case whenFalse.fallsThrough:
+			flow.fields, flow.fallsThrough = cloneEagerColumns(whenFalse.fields), true
+		}
+	default:
+		addEagerColumns(flow.fields, a.expressionWrites(node))
+	}
+	return flow
+}
+
+func (t *fileTransformer) analyzeEagerColumns(fn *shimast.Node) []string {
+	params, body, _, ok := functionParts(fn)
+	if !ok || params == nil || len(params.Nodes) == 0 || body == nil {
+		return nil
+	}
+	parameter := params.Nodes[0]
+	if parameter.Kind != shimast.KindParameter || parameter.Name() == nil || parameter.Name().Kind != shimast.KindIdentifier {
+		return nil
+	}
+	analyzer := eagerColumnAnalyzer{transformer: t, ctxName: shimast.NodeText(parameter.Name()), valid: true}
+	analyzer.validateSyntax(body, true)
+	if !analyzer.valid {
+		return nil
+	}
+	var outcomes eagerColumnSet
+	if body.Kind == shimast.KindBlock {
+		flow := analyzer.statements(body.AsBlock().Statements.Nodes, eagerColumnSet{})
+		if !analyzer.valid {
+			return nil
+		}
+		if flow.hasTerminal {
+			outcomes = cloneEagerColumns(flow.terminalFields)
+		}
+		if flow.fallsThrough {
+			if outcomes == nil {
+				outcomes = cloneEagerColumns(flow.fields)
+			} else {
+				outcomes = intersectEagerColumns(outcomes, flow.fields)
+			}
+		}
+	} else {
+		outcomes = analyzer.expressionWrites(body)
+	}
+	if !analyzer.valid || len(outcomes) == 0 {
+		return nil
+	}
+	columns := make([]string, 0, len(outcomes))
+	for name := range outcomes {
+		columns = append(columns, name)
+	}
+	sort.Strings(columns)
+	return columns
+}
+
 func literalLogMessage(node *shimast.Node) (string, bool) {
 	if node == nil {
 		return "", false
@@ -188,10 +497,16 @@ func literalLogMessage(node *shimast.Node) (string, bool) {
 	}
 }
 
-// analyzeOpCompileMetadata derives only runtime execution hints. Static log
-// vocabulary is whole-program metadata collected independently of Op nesting.
+// analyzeOpCompileMetadata derives runtime execution hints and conservative
+// definitely-written user columns. Static log vocabulary remains whole-program
+// metadata collected independently of Op nesting.
 func (t *fileTransformer) analyzeOpCompileMetadata(fn *shimast.Node) opCompileAnalysis {
-	return opCompileAnalysis{runtimeHint: analyzeOpFunction(fn, t.staticLogIDs)}
+	runtimeHint := analyzeOpFunction(fn, t.staticLogIDs)
+	analysis := opCompileAnalysis{runtimeHint: runtimeHint}
+	if runtimeHint&runtimeHintAnalyzed != 0 {
+		analysis.eagerColumns = t.analyzeEagerColumns(fn)
+	}
+	return analysis
 }
 
 func isClosedWorldCapabilityUse(access *shimast.Node, name string) bool {
@@ -351,7 +666,9 @@ func (t *fileTransformer) collectOptimizations(root *shimast.Node, emitHints boo
 					provenOp := opOrFn.Kind == shimast.KindIdentifier && isNamedLmaoType(t.checker, opOrFn, "Op")
 					recvType := t.checker.GetTypeAtLocation(recv)
 					provenContext := recvType != nil && isLmaoContextType(t.checker, recvType)
-					if provenOp && provenContext { t.opSpans[call] = true }
+					if provenOp && provenContext {
+						t.opSpans[call] = true
+					}
 					if provenContext && (plainFunction || provenOp) && t.vocabulary != nil {
 						if text, literal := literalVocabularyValue(call.Arguments.Nodes[0]); literal {
 							t.vocabulary.add(vocabularySpanName, text, call, t.file.FileName())
@@ -402,9 +719,18 @@ func (t *fileTransformer) spanContextApproved(node *shimast.Node) bool {
 }
 
 func compileMetadataNode(analysis opCompileAnalysis) *shimast.Node {
-	return factory.NewObjectLiteralExpression(factory.NewNodeList([]*shimast.Node{
+	properties := []*shimast.Node{
 		factory.NewPropertyAssignment(nil, ident("runtimeHint"), nil, nil, num(int(analysis.runtimeHint))),
-	}), true)
+	}
+	if len(analysis.eagerColumns) > 0 {
+		elements := make([]*shimast.Node, len(analysis.eagerColumns))
+		for index, name := range analysis.eagerColumns {
+			elements[index] = str(name)
+		}
+		properties = append(properties, factory.NewPropertyAssignment(nil, ident("eagerColumns"), nil, nil,
+			factory.NewArrayLiteralExpression(factory.NewNodeList(elements), false)))
+	}
+	return factory.NewObjectLiteralExpression(factory.NewNodeList(properties), true)
 }
 
 func applyHintRewrites(rewrites []hintRewrite) {

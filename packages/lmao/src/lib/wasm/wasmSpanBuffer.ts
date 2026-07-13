@@ -14,6 +14,7 @@ import type { ColumnValueType } from '@smoothbricks/arrow-builder';
 import { getSchemaType } from '@smoothbricks/arrow-builder';
 import { checkCapacityTuning } from '../capacityTuning.js';
 import type { OpMetadata } from '../op.js';
+import type { EagerColumnDescriptor } from '../physicalLayoutPlan.js';
 import type { MessageLayoutFamily } from '../runtimeHint.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { SpanBufferStats } from '../spanBufferStats.js';
@@ -57,6 +58,12 @@ export interface WasmBufferDescriptor {
   overflow?: WasmBufferDescriptor;
 }
 
+
+const EMPTY_EAGER_COLUMNS: EagerColumnDescriptor = Object.freeze({
+  names: Object.freeze([]),
+  words: Object.freeze([]),
+  key: '',
+});
 let nextWasmBufferGeneration = 0;
 
 export interface WasmSpanBufferOptions<T extends LogSchema = LogSchema> {
@@ -168,8 +175,10 @@ interface ColumnMeta {
   schemaType: string;
   /** Index in the _columnPtrs array */
   columnIndex: number;
-  /** Whether this column is eager (always allocated) */
-  isEager: boolean;
+  /** Schema-level eager storage suppresses null bitmaps by declaration. */
+  isSchemaEager: boolean;
+  /** Compile-proven eager storage is preallocated but remains nullable. */
+  isPreallocated: boolean;
   /** Enum values if schemaType === 'enum' */
   enumValues?: readonly string[];
 }
@@ -226,15 +235,16 @@ function isWasmSpanBufferFactory(value: unknown): value is () => WasmSpanBufferC
  * Build column metadata array from schema.
  * Maps each schema field to its storage characteristics.
  */
-function buildColumnMeta(schema: LogSchema): ColumnMeta[] {
+function buildColumnMeta(schema: LogSchema, eagerColumns: EagerColumnDescriptor): ColumnMeta[] {
   const result: ColumnMeta[] = [];
   const fields = schema.fields;
+  const preallocatedColumns = new Set(eagerColumns.names);
   let columnIndex = 0;
 
   for (const name of schema._columnNames) {
     const field = fields[name];
     const schemaType = getSchemaType(field);
-    const isEager = getFieldEager(field);
+    const isSchemaEager = getFieldEager(field);
     const enumValues = getFieldEnumValues(field);
 
     let sizeClass: SizeClass;
@@ -260,7 +270,8 @@ function buildColumnMeta(schema: LogSchema): ColumnMeta[] {
       sizeClass,
       schemaType: schemaType ?? 'unknown',
       columnIndex,
-      isEager,
+      isSchemaEager,
+      isPreallocated: !isSchemaEager && preallocatedColumns.has(name),
       enumValues,
     });
     columnIndex++;
@@ -530,8 +541,11 @@ function generateColumnInit(columnMeta: ColumnMeta[]): string {
   const lines: string[] = [];
   for (const col of columnMeta) {
     if (col.name === 'message' || col.sizeClass !== 'string') continue;
-    if (col.isEager) {
+    if (col.isSchemaEager) {
       lines.push(`this._${col.name}_values = new Array(this._capacity);`);
+    } else if (col.isPreallocated) {
+      lines.push(`this._${col.name}_values = new Array(this._capacity);`);
+      lines.push(`this._${col.name}_nulls = new Uint8Array((this._capacity + 7) >>> 3);`);
     } else {
       lines.push(`this._${col.name}_values = undefined;`);
       lines.push(`this._${col.name}_nulls = undefined;`);
@@ -540,30 +554,65 @@ function generateColumnInit(columnMeta: ColumnMeta[]): string {
   return lines.join('\n    ');
 }
 
-function generateNumericSetter(col: ColumnMeta): string {
+function generateNumericViewBinding(col: ColumnMeta, layoutIndex: number): string {
+  const arrayType =
+    col.schemaType === 'number'
+      ? 'Float64Array'
+      : col.schemaType === 'bigUint64'
+        ? 'BigUint64Array'
+        : col.sizeClass === '1b'
+          ? 'Uint8Array'
+          : col.sizeClass === '4b'
+            ? 'Uint32Array'
+            : 'Float64Array';
+  return `const column = this._layout.columns[${layoutIndex}];
+      const familyPtr = this._familyPtrs[column.family];
+      this._${col.name}_nulls = new Uint8Array(memory, familyPtr + column.nullOffset, column.nullByteLength);
+      this._${col.name}_values = new ${arrayType}(memory, familyPtr + column.valueOffset, this._capacity);
+      this._columnPtrs[${col.columnIndex}] = familyPtr + column.nullOffset;`;
+}
+
+function generateEnsureNumericView(col: ColumnMeta, layoutIndex: number): string {
+  if (col.isSchemaEager || col.isPreallocated) return '';
+  return `if (this._columnPtrs[${col.columnIndex}] === -1) {
+      const memory = this._allocator.memory.buffer;
+      ${generateNumericViewBinding(col, layoutIndex)}
+    }`;
+}
+
+function generateNumericSetter(col: ColumnMeta, layoutIndex: number): string {
+  const ensureView = generateEnsureNumericView(col, layoutIndex);
+  const validity = col.isSchemaEager
+    ? `this._${col.name}_values[idx] = value;`
+    : `if (value == null) {
+      this._${col.name}_nulls[idx >>> 3] &= ~(1 << (idx & 7));
+    } else {
+      this._${col.name}_nulls[idx >>> 3] |= 1 << (idx & 7);
+      this._${col.name}_values[idx] = value;
+    }`;
   return `${col.name}(idx, value) {
     this._ensureWasmViews();
-    this._${col.name}_nulls[idx >>> 3] |= 1 << (idx & 7);
-    this._${col.name}_values[idx] = value;
+    ${ensureView}
+    ${validity}
     return this;
   }`;
 }
 
-function generateNumericValuesGetter(col: ColumnMeta): string {
+function generateNumericValuesGetter(col: ColumnMeta, layoutIndex: number): string {
   return `get ${col.name}_values() {
     this._ensureWasmViews();
+    ${generateEnsureNumericView(col, layoutIndex)}
     return this._${col.name}_values;
   }`;
 }
 
-function generateNumericNullsGetter(col: ColumnMeta): string {
-  if (col.isEager) {
-    return `get ${col.name}_nulls() {
-    return undefined;
-  }`;
+function generateNumericNullsGetter(col: ColumnMeta, layoutIndex: number): string {
+  if (col.isSchemaEager) {
+    return `get ${col.name}_nulls() { return undefined; }`;
   }
   return `get ${col.name}_nulls() {
     this._ensureWasmViews();
+    ${generateEnsureNumericView(col, layoutIndex)}
     return this._${col.name}_nulls;
   }`;
 }
@@ -584,23 +633,12 @@ function generateViewRefresh(columnMeta: ColumnMeta[], messageLayoutFamily: Mess
   let layoutIndex = 0;
   for (const col of columnMeta) {
     if (col.sizeClass === 'string' || col.name === 'message') continue;
-    lines.push(`{
-      const column = this._layout.columns[${layoutIndex}];
-      const familyPtr = this._familyPtrs[column.family];
-      this._${col.name}_nulls = new Uint8Array(memory, familyPtr + column.nullOffset, column.nullByteLength);
-      this._${col.name}_values = new ${
-        col.schemaType === 'number'
-          ? 'Float64Array'
-          : col.schemaType === 'bigUint64'
-            ? 'BigUint64Array'
-            : col.sizeClass === '1b'
-              ? 'Uint8Array'
-              : col.sizeClass === '4b'
-                ? 'Uint32Array'
-                : 'Float64Array'
-      }(memory, familyPtr + column.valueOffset, this._capacity);
-      this._columnPtrs[${col.columnIndex}] = familyPtr + column.nullOffset;
-    }`);
+    const binding = generateNumericViewBinding(col, layoutIndex);
+    if (col.isSchemaEager || col.isPreallocated) {
+      lines.push(`{ ${binding} }`);
+    } else {
+      lines.push(`if (this._columnPtrs[${col.columnIndex}] !== -1) { ${binding} }`);
+    }
     layoutIndex++;
   }
   lines.push('this._viewVersion = version;', 'this._descriptor.memoryVersion = version;');
@@ -611,8 +649,11 @@ function generateColumnLookup(columnMeta: ColumnMeta[], nulls: boolean): string 
   const cases: string[] = [];
   for (const col of columnMeta) {
     if (col.name === 'message') continue;
-    const property = nulls ? `${col.name}_nulls` : `${col.name}_values`;
-    cases.push(`case ${col.columnIndex}: return this.${property};`);
+    if (nulls && col.isSchemaEager) cases.push(`case ${col.columnIndex}: return undefined;`);
+    else {
+      const property = nulls ? `_${col.name}_nulls` : `_${col.name}_values`;
+      cases.push(`case ${col.columnIndex}: return this.${property};`);
+    }
   }
   return `switch (columnIndex) { ${cases.join(' ')} default: return undefined; }`;
 }
@@ -621,10 +662,22 @@ function generateColumnLookup(columnMeta: ColumnMeta[], nulls: boolean): string 
  * Generate setter method for a string column (stored in JS).
  */
 function generateStringSetter(col: ColumnMeta): string {
-  if (col.isEager) {
+  if (col.isSchemaEager) {
     return `${col.name}(idx, value) {
     if (this._descriptor.state !== 'live') throw new Error('Cannot write a released WASM buffer');
     this._${col.name}_values[idx] = value;
+    return this;
+  }`;
+  }
+
+  if (col.isPreallocated) {
+    return `${col.name}(idx, value) {
+    if (this._descriptor.state !== 'live') throw new Error('Cannot write a released WASM buffer');
+    if (value == null) this._${col.name}_nulls[idx >>> 3] &= ~(1 << (idx & 7));
+    else {
+      this._${col.name}_values[idx] = value;
+      this._${col.name}_nulls[idx >>> 3] |= 1 << (idx & 7);
+    }
     return this;
   }`;
   }
@@ -653,12 +706,6 @@ function generateStringSetter(col: ColumnMeta): string {
  * Generate getter for string column values.
  */
 function generateStringValuesGetter(col: ColumnMeta): string {
-  if (col.isEager) {
-    return `get ${col.name}_values() {
-    return this._${col.name}_values;
-  }`;
-  }
-
   return `get ${col.name}_values() {
     return this._${col.name}_values;
   }`;
@@ -668,7 +715,7 @@ function generateStringValuesGetter(col: ColumnMeta): string {
  * Generate getter for string column nulls.
  */
 function generateStringNullsGetter(col: ColumnMeta): string {
-  if (col.isEager) {
+  if (col.isSchemaEager) {
     return `get ${col.name}_nulls() {
     return undefined;
   }`;
@@ -685,21 +732,19 @@ function generateStringNullsGetter(col: ColumnMeta): string {
  */
 function generateColumnMethods(columnMeta: ColumnMeta[]): string {
   const methods: string[] = [];
+  let layoutIndex = 0;
 
   for (const col of columnMeta) {
-    // Skip 'message' - handled specially by generateMessageMethods()
-    if (col.name === 'message') {
-      continue;
-    }
-
+    if (col.name === 'message') continue;
     if (col.sizeClass === 'string') {
       methods.push(generateStringSetter(col));
       methods.push(generateStringValuesGetter(col));
       methods.push(generateStringNullsGetter(col));
     } else {
-      methods.push(generateNumericSetter(col));
-      methods.push(generateNumericValuesGetter(col));
-      methods.push(generateNumericNullsGetter(col));
+      methods.push(generateNumericSetter(col, layoutIndex));
+      methods.push(generateNumericValuesGetter(col, layoutIndex));
+      methods.push(generateNumericNullsGetter(col, layoutIndex));
+      layoutIndex++;
     }
   }
 
@@ -711,7 +756,7 @@ function generateColumnMethods(columnMeta: ColumnMeta[]): string {
 // =============================================================================
 
 /** Cache for generated WASM SpanBuffer classes, partitioned by schema and message family. */
-const wasmSpanBufferClassCache = new WeakMap<LogSchema, Map<MessageLayoutFamily, object>>();
+const wasmSpanBufferClassCache = new WeakMap<LogSchema, Map<string, object>>();
 
 /**
  * Generate a WASM SpanBuffer class for the given schema.
@@ -724,13 +769,14 @@ const wasmSpanBufferClassCache = new WeakMap<LogSchema, Map<MessageLayoutFamily,
 export function getWasmSpanBufferClass<T extends LogSchema>(
   schema: T,
   messageLayoutFamily: MessageLayoutFamily = 'mixed',
+  eagerColumns: EagerColumnDescriptor = EMPTY_EAGER_COLUMNS,
 ): WasmSpanBufferConstructor<T> {
+  const cacheKey = `${messageLayoutFamily}:${eagerColumns.key}`;
   let familyClasses = wasmSpanBufferClassCache.get(schema);
-  const cached = familyClasses?.get(messageLayoutFamily);
+  const cached = familyClasses?.get(cacheKey);
   if (cached !== undefined && isWasmSpanBufferConstructor(cached, schema, messageLayoutFamily)) return cached;
 
-  // Pre-compute column metadata
-  const columnMeta = buildColumnMeta(schema);
+  const columnMeta = buildColumnMeta(schema, eagerColumns);
 
   // Generate ONLY schema-specific code (constructor + column methods)
   const classCode = `
@@ -994,7 +1040,7 @@ return WasmSpanBuffer;
   }
 
   familyClasses ??= new Map();
-  familyClasses.set(messageLayoutFamily, WasmSpanBufferClass);
+  familyClasses.set(cacheKey, WasmSpanBufferClass);
   wasmSpanBufferClassCache.set(schema, familyClasses);
 
   return WasmSpanBufferClass;
@@ -1027,12 +1073,13 @@ export function createWasmSpanBuffer<T extends LogSchema>(
   _callsiteMetadata: OpMetadata,
 ): WasmSpanBufferInstance<T> {
   const messageLayoutFamily = opts.messageLayoutFamily ?? 'mixed';
-  const WasmSpanBufferClass = getWasmSpanBufferClass(schema, messageLayoutFamily);
+  const eagerColumns = _opMetadata._physicalLayoutPlan?.eagerColumns ?? EMPTY_EAGER_COLUMNS;
+  const WasmSpanBufferClass = getWasmSpanBufferClass(schema, messageLayoutFamily, eagerColumns);
   return new WasmSpanBufferClass({
     ...opts,
     _identityMode: 'root',
     _generation: ++nextWasmBufferGeneration,
-    _layout: getWasmPhysicalLayout(schema, opts.capacity, messageLayoutFamily),
+    _layout: getWasmPhysicalLayout(schema, opts.capacity, messageLayoutFamily, eagerColumns),
     logSchema: schema,
     _traceRoot,
     _scopeValues,
@@ -1081,7 +1128,8 @@ export function createWasmChildSpanBuffer<T extends LogSchema>(
   // Use provided schema (for cross-library calls) or parent's schema
   const childSchema = opts.schema ?? parent._logSchema;
   const messageLayoutFamily = opts.messageLayoutFamily ?? parent._messageLayoutFamily;
-  const WasmSpanBufferClass = getWasmSpanBufferClass(childSchema, messageLayoutFamily);
+  const eagerColumns = _opMetadata._physicalLayoutPlan?.eagerColumns ?? EMPTY_EAGER_COLUMNS;
+  const WasmSpanBufferClass = getWasmSpanBufferClass(childSchema, messageLayoutFamily, eagerColumns);
   const child = new WasmSpanBufferClass({
     ...opts,
     logSchema: childSchema,
@@ -1091,7 +1139,7 @@ export function createWasmChildSpanBuffer<T extends LogSchema>(
     _identityMode: 'child',
     _parent: parent,
     _generation: ++nextWasmBufferGeneration,
-    _layout: getWasmPhysicalLayout(childSchema, opts.capacity, messageLayoutFamily),
+    _layout: getWasmPhysicalLayout(childSchema, opts.capacity, messageLayoutFamily, eagerColumns),
     _traceRoot,
     _scopeValues,
     _opMetadata,

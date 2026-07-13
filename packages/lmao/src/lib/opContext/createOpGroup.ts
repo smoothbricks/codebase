@@ -80,6 +80,7 @@ function copyOpsWithDescriptor<Ctx extends OpContext>(
         remapDescriptor,
         value._opContextBinding,
         value.callsitePlan.runtimeHint,
+        value.callsitePlan.eagerColumns.names,
       );
     }
   }
