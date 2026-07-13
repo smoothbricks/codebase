@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use lmao_arrow::{ColumnDictionary, MockSpan, convert_span_trees};
+use lmao_arrow::{ColumnDictionary, MockSpan, StableVocabularyCatalog, convert_span_trees};
 use lmao_core::{SpanIdentity, TraceId};
 
 /// 256 observations over 64 distinct templates — same shape as the TS
@@ -102,12 +102,15 @@ fn build_flush_input(spans: usize, logs: usize) -> Vec<MockSpan> {
 
 fn bench_full_flush(c: &mut Criterion) {
     let mut g = c.benchmark_group("flush_to_record_batch");
+    let vocabulary = StableVocabularyCatalog::EMPTY;
     for (spans, logs) in [(8, 30), (64, 30), (256, 62)] {
         let input = build_flush_input(spans, logs);
         let rows = spans * (logs + 2);
         g.throughput(criterion::Throughput::Elements(rows as u64));
         g.bench_function(format!("{spans}spans_x_{logs}logs"), |b| {
-            b.iter(|| black_box(convert_span_trees(black_box(&input)).unwrap()))
+            b.iter(|| {
+                black_box(convert_span_trees(black_box(&input), black_box(&vocabulary)).unwrap())
+            })
         });
     }
     g.finish();

@@ -6,16 +6,15 @@ use std::sync::Arc;
 
 use arrow_array::builder::BooleanBufferBuilder;
 use arrow_array::{
-    Array, ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt8Array,
-    UInt32Array, UInt64Array,
+    ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt8Array, UInt32Array,
+    UInt64Array,
 };
 use arrow_buffer::NullBuffer;
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 
 use crate::dict::{
-    ColumnDictionary, FirstSeenDictionary, LOG_TEMPLATE_KIND, SPAN_NAME_KIND, StaticLookupError,
-    mixed_vocabulary_dictionary, static_vocabulary_dictionary, static_vocabulary_key,
-    static_vocabulary_value_key,
+    ColumnDictionary, FirstSeenDictionary, StableVocabularyCatalog, StableVocabularyKind,
+    StableVocabularyLookupError, vocabulary_dictionary,
 };
 use crate::source::{SpanSource, walk_pre_order};
 
@@ -79,8 +78,8 @@ pub enum ConvertError {
     VocabularyKindMismatch {
         row: usize,
         id: u32,
-        expected: u8,
-        actual: u8,
+        expected: StableVocabularyKind,
+        actual: StableVocabularyKind,
     },
     MissingDynamicMessage {
         row: usize,
@@ -106,7 +105,8 @@ impl fmt::Display for ConvertError {
                 actual,
             } => write!(
                 f,
-                "static vocabulary id {id} has kind tag {actual}, expected {expected} at row {row}",
+                "static vocabulary id {id} has kind tag {}, expected {} at row {row}",
+                *actual as u8, *expected as u8,
             ),
             Self::MissingDynamicMessage { row, entry_type } => write!(
                 f,
@@ -132,10 +132,10 @@ impl From<ArrowError> for ConvertError {
 }
 
 #[inline]
-fn required_vocabulary_kind(entry_type: u8) -> Option<u8> {
+fn required_vocabulary_kind(entry_type: u8) -> Option<StableVocabularyKind> {
     match entry_type {
-        1 => Some(SPAN_NAME_KIND),
-        6..=10 => Some(LOG_TEMPLATE_KIND),
+        1 => Some(StableVocabularyKind::SpanName),
+        6..=10 => Some(StableVocabularyKind::LogTemplate),
         _ => None,
     }
 }
@@ -145,7 +145,10 @@ fn split_packed_header(header: u32) -> (u8, u32) {
     (header as u8, header >> 8)
 }
 
-pub fn convert_span_trees<S: SpanSource>(roots: &[S]) -> Result<RecordBatch, ConvertError> {
+pub fn convert_span_trees<S: SpanSource>(
+    roots: &[S],
+    vocabulary: &StableVocabularyCatalog<'_>,
+) -> Result<RecordBatch, ConvertError> {
     let mut total_rows = 0usize;
     let mut trace_dict = ColumnDictionary::default();
     let mut dynamic_messages = FirstSeenDictionary::default();
@@ -176,15 +179,15 @@ pub fn convert_span_trees<S: SpanSource>(roots: &[S]) -> Result<RecordBatch, Con
                             id: vocabulary_id,
                         });
                     }
-                    Some(kind) => match static_vocabulary_key(vocabulary_id, kind) {
+                    Some(kind) => match vocabulary.key_for_id(vocabulary_id, kind) {
                         Ok(_) => {}
-                        Err(StaticLookupError::UnknownId(id)) => {
+                        Err(StableVocabularyLookupError::UnknownId(id)) => {
                             failure.get_or_insert(ConvertError::InvalidVocabularyId {
                                 row: absolute_row,
                                 id,
                             });
                         }
-                        Err(StaticLookupError::KindMismatch {
+                        Err(StableVocabularyLookupError::KindMismatch {
                             id,
                             expected,
                             actual,
@@ -199,7 +202,7 @@ pub fn convert_span_trees<S: SpanSource>(roots: &[S]) -> Result<RecordBatch, Con
                     },
                 }
             } else if let Some(message) = buffer.dynamic_message(row) {
-                if static_vocabulary_value_key(message).is_none() {
+                if vocabulary.key_for_value(message).is_none() {
                     dynamic_messages.observe(message);
                 }
             } else if required_vocabulary_kind(entry_type).is_some() {
@@ -216,8 +219,6 @@ pub fn convert_span_trees<S: SpanSource>(roots: &[S]) -> Result<RecordBatch, Con
     }
 
     let trace_dict = trace_dict.finalize_indexed();
-    let static_values = static_vocabulary_dictionary();
-    let static_message_count = static_values.len() as u32;
 
     let mut timestamps = Vec::with_capacity(total_rows);
     let mut trace_keys = Vec::with_capacity(total_rows);
@@ -252,19 +253,20 @@ pub fn convert_span_trees<S: SpanSource>(roots: &[S]) -> Result<RecordBatch, Con
             entry_keys.push(entry_type - 1);
             if vocabulary_id != 0 {
                 message_keys.push(
-                    static_vocabulary_key(
-                        vocabulary_id,
-                        required_vocabulary_kind(entry_type)
-                            .expect("validated static row kind in pass 1"),
-                    )
-                    .expect("validated static vocabulary ID in pass 1"),
+                    vocabulary
+                        .key_for_id(
+                            vocabulary_id,
+                            required_vocabulary_kind(entry_type)
+                                .expect("validated static row kind in pass 1"),
+                        )
+                        .expect("validated static vocabulary ID in pass 1"),
                 );
                 message_valid.append(true);
             } else if let Some(message) = buffer.dynamic_message(row) {
-                message_keys.push(match static_vocabulary_value_key(message) {
+                message_keys.push(match vocabulary.key_for_value(message) {
                     Some(key) => key,
                     None => {
-                        static_message_count
+                        vocabulary.len() as u32
                             + dynamic_messages
                                 .index_of(message)
                                 .expect("dynamic message observed in pass 1")
@@ -289,11 +291,7 @@ pub fn convert_span_trees<S: SpanSource>(roots: &[S]) -> Result<RecordBatch, Con
         UInt32Array::from(trace_keys),
         Arc::new(StringArray::from_iter_values(trace_dict.values.iter())) as ArrayRef,
     )?;
-    let message_values: ArrayRef = if dynamic_messages.is_empty() {
-        static_values
-    } else {
-        mixed_vocabulary_dictionary(&dynamic_messages.values)?
-    };
+    let message_values: ArrayRef = vocabulary_dictionary(vocabulary, &dynamic_messages.values)?;
     let message_col = DictionaryArray::try_new(
         UInt32Array::new(message_keys.into(), Some(message_nulls)),
         message_values,
