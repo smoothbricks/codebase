@@ -1,0 +1,99 @@
+{
+  "schemaVersion": 1,
+  "idAlgorithm": "sha256-24-v1",
+  "contentHash": "1f92e229d16bd3470e7dc1f15673f689f9350886788f2475a18236e228f6c6ae",
+  "entries": [
+    {
+      "id": 273228,
+      "kind": "log_template",
+      "text": "Processing complete",
+      "fields": []
+    },
+    {
+      "id": 377410,
+      "kind": "log_template",
+      "text": "json-sensitive \u003c\u003e\u0026 \u2028\u2029",
+      "fields": []
+    },
+    {
+      "id": 2878065,
+      "kind": "log_template",
+      "text": "Validation passed",
+      "fields": []
+    },
+    {
+      "id": 7140773,
+      "kind": "log_template",
+      "text": "loaded {userId} in {elapsedMs}ms",
+      "fields": [
+        {
+          "name": "userId",
+          "column": "userId"
+        },
+        {
+          "name": "elapsedMs",
+          "column": "elapsedMs"
+        }
+      ]
+    },
+    {
+      "id": 8012750,
+      "kind": "log_template",
+      "text": "Processing items",
+      "fields": []
+    },
+    {
+      "id": 9474871,
+      "kind": "log_template",
+      "text": "literal braces: {ok} for {region}",
+      "fields": [
+        {
+          "name": "region",
+          "column": "region"
+        }
+      ]
+    },
+    {
+      "id": 12761596,
+      "kind": "log_template",
+      "text": "native fixture log",
+      "fields": []
+    },
+    {
+      "id": 13676444,
+      "kind": "log_template",
+      "text": "Starting data processing",
+      "fields": []
+    },
+    {
+      "id": 13700822,
+      "kind": "log_template",
+      "text": "Received items to process",
+      "fields": []
+    },
+    {
+      "id": 15317875,
+      "kind": "log_template",
+      "text": "No items to validate",
+      "fields": []
+    },
+    {
+      "id": 15419721,
+      "kind": "span_name",
+      "text": "validate-items",
+      "fields": []
+    },
+    {
+      "id": 16094209,
+      "kind": "log_template",
+      "text": "Running validation",
+      "fields": []
+    },
+    {
+      "id": 16369894,
+      "kind": "log_template",
+      "text": "Validation failed",
+      "fields": []
+    }
+  ]
+}

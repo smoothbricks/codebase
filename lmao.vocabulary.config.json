@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "projects": [
+    {
+      "cwd": "packages/lmao-ttsc",
+      "tsconfig": "examples/tsconfig.json"
+    },
+    {
+      "cwd": "packages/lmao-ttsc",
+      "tsconfig": "tsconfig.test.json"
+    }
+  ],
+  "outputs": {
+    "manifest": "lmao.vocabulary.json",
+    "typescript": "packages/lmao/src/generated/vocabulary.ts",
+    "rust": "packages/lmao-rs/crates/lmao-arrow/src/generated/vocabulary.rs"
+  }
+}
