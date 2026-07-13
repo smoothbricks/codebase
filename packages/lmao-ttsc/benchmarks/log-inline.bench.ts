@@ -10,9 +10,11 @@
  */
 
 import { bench, do_not_optimize, group, run } from 'mitata';
+import { registerBenchmarkVocabulary } from '../../lmao/benchmarks/vocabularyFixture.ts';
 import type { WriterState } from '../../lmao/src/lib/codegen/fixedPositionWriterGenerator.ts';
 import { resolveMessage } from '../../lmao/src/lib/resolveMessage.ts';
 import {
+  type MessageLayoutFamily,
   RUNTIME_HINT_ANALYZED_VALID,
   RUNTIME_HINT_LOG,
   RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY,
@@ -20,7 +22,6 @@ import {
   RUNTIME_HINT_MESSAGE_LAYOUT_STATIC_ONLY,
   RUNTIME_HINT_MESSAGE_PHYSICAL_PACKED,
   RUNTIME_HINT_RESULT,
-  type MessageLayoutFamily,
 } from '../../lmao/src/lib/runtimeHint.ts';
 import {
   createSpanBuffer,
@@ -36,7 +37,6 @@ import {
   type SpanLoggerImpl,
   TestTracer,
 } from '../../lmao/src/node.ts';
-import { registerBenchmarkVocabulary } from '../../lmao/benchmarks/vocabularyFixture.ts';
 
 const QUICK = process.argv.includes('--quick');
 const FORMAT = process.argv.includes('--json') ? 'json' : process.argv.includes('--markdown') ? 'markdown' : 'mitata';
@@ -139,20 +139,15 @@ function numericViews(buffer: SpanBuffer<RuntimeSchema>): NumericViews {
 
 function makeLogBundle(family: MessageLayoutFamily): LogBundle {
   const id = bundleId++;
-  const benchmarkOp = opContext.defineOp(
-    `log-inline-${family}-${id}`,
-    () => new Ok(undefined),
-    undefined,
-    {
-      runtimeHint:
-        RUNTIME_HINT_ANALYZED_VALID |
-        RUNTIME_HINT_LOG |
-        messageLayoutHint(family) |
-        RUNTIME_HINT_MESSAGE_PHYSICAL_PACKED |
-        CAPACITY,
-      eagerColumns: EAGER_COLUMNS,
-    },
-  );
+  const benchmarkOp = opContext.defineOp(`log-inline-${family}-${id}`, () => new Ok(undefined), undefined, {
+    runtimeHint:
+      RUNTIME_HINT_ANALYZED_VALID |
+      RUNTIME_HINT_LOG |
+      messageLayoutHint(family) |
+      RUNTIME_HINT_MESSAGE_PHYSICAL_PACKED |
+      CAPACITY,
+    eagerColumns: EAGER_COLUMNS,
+  });
   const plan = benchmarkOp.callsitePlan;
   if (plan.messageLayoutFamily !== family) {
     throw new Error(`Log CallsitePlan selected ${plan.messageLayoutFamily}; expected ${family}`);
@@ -169,19 +164,11 @@ function makeLogBundle(family: MessageLayoutFamily): LogBundle {
 
 function makeResultBundle(): ResultBundle {
   const id = bundleId++;
-  const benchmarkOp = opContext.defineOp(
-    `result-inline-${id}`,
-    () => new Ok(undefined),
-    undefined,
-    {
-      runtimeHint:
-        RUNTIME_HINT_ANALYZED_VALID |
-        RUNTIME_HINT_RESULT |
-        RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY |
-        CAPACITY,
-      eagerColumns: EAGER_COLUMNS,
-    },
-  );
+  const benchmarkOp = opContext.defineOp(`result-inline-${id}`, () => new Ok(undefined), undefined, {
+    runtimeHint:
+      RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_RESULT | RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY | CAPACITY,
+    eagerColumns: EAGER_COLUMNS,
+  });
   const plan = benchmarkOp.callsitePlan;
   const traceRoot = createTraceRoot(`result-inline-${id}`, tracer);
   const buffer = createSpanBuffer(plan.schema, traceRoot, plan.metadata, CAPACITY, plan.SpanBufferClass);
@@ -305,16 +292,26 @@ const fluentBareBundle = makeLogBundle('dynamic-only');
 const inlineBareBundle = makeLogBundle('static-only');
 const inlineBareHeaders = packedHeaders(inlineBareBundle);
 
-assertEqual('inlined info', writeInlinedInfo(inlineInfoBundle, inlineInfoHeaders, 17), writeFluentInfo(fluentInfoBundle, 17));
+assertEqual(
+  'inlined info',
+  writeInlinedInfo(inlineInfoBundle, inlineInfoHeaders, 17),
+  writeFluentInfo(fluentInfoBundle, 17),
+);
 assertEqual('inlined warn', writeInlinedWarn(inlineWarnBundle, inlineWarnHeaders), writeFluentWarn(fluentWarnBundle));
-assertEqual('inlined bare log', writeInlinedBare(inlineBareBundle, inlineBareHeaders), writeFluentBare(fluentBareBundle));
+assertEqual(
+  'inlined bare log',
+  writeInlinedBare(inlineBareBundle, inlineBareHeaders),
+  writeFluentBare(fluentBareBundle),
+);
 
 let infoIteration = 0;
 let warnIteration = 0;
 let bareIteration = 0;
 
 group('log.info + line + 2 attrs', () => {
-  bench('A fluent (runtime path)', () => do_not_optimize(writeFluentInfo(fluentInfoBundle, infoIteration++))).baseline();
+  bench('A fluent (runtime path)', () =>
+    do_not_optimize(writeFluentInfo(fluentInfoBundle, infoIteration++)),
+  ).baseline();
   bench('B inlined (WriterState + vocabulary header)', () =>
     do_not_optimize(writeInlinedInfo(inlineInfoBundle, inlineInfoHeaders, infoIteration++)),
   );
@@ -561,7 +558,10 @@ function resultChecksum(bundle: ResultBundle): number {
 }
 
 function writeFluentResult(bundle: ResultBundle, iteration: number): number {
-  bundle.context.ok(iteration).line(19).with({ userId: `u${iteration}`, retries: 2 });
+  bundle.context
+    .ok(iteration)
+    .line(19)
+    .with({ userId: `u${iteration}`, retries: 2 });
   return resultChecksum(bundle);
 }
 

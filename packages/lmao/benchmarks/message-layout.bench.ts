@@ -1,17 +1,17 @@
 import { bench, do_not_optimize, group, run, summary } from 'mitata';
 import { defineOpContext } from '../src/lib/defineOpContext.js';
 import { JsBufferStrategy } from '../src/lib/JsBufferStrategy.js';
-import type { CallsitePlan } from '../src/lib/physicalLayoutPlan.js';
 import type { OpContextOf } from '../src/lib/opContext/types.js';
+import type { CallsitePlan } from '../src/lib/physicalLayoutPlan.js';
 import { resolveMessage } from '../src/lib/resolveMessage.js';
 import {
+  type MessageLayoutFamily,
   RUNTIME_HINT_ANALYZED_VALID,
   RUNTIME_HINT_LOG,
   RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY,
   RUNTIME_HINT_MESSAGE_LAYOUT_MIXED,
   RUNTIME_HINT_MESSAGE_LAYOUT_STATIC_ONLY,
   RUNTIME_HINT_RESULT,
-  type MessageLayoutFamily,
 } from '../src/lib/runtimeHint.js';
 import { S } from '../src/lib/schema/builder.js';
 import { defineLogSchema } from '../src/lib/schema/defineLogSchema.js';
@@ -90,12 +90,9 @@ function defineFamilyPlan(
   familyBits: number,
   capacity: number,
 ): CallsitePlan<typeof RUNTIME_SCHEMA, RuntimeContext> {
-  return CONTEXT.defineOp(
-    `message-layout-${family}-${capacity}`,
-    (ctx) => ctx.ok(null),
-    undefined,
-    { runtimeHint: familyHint(familyBits, capacity) },
-  ).callsitePlan;
+  return CONTEXT.defineOp(`message-layout-${family}-${capacity}`, (ctx) => ctx.ok(null), undefined, {
+    runtimeHint: familyHint(familyBits, capacity),
+  }).callsitePlan;
 }
 
 function createWorkload(capacity: number, staticRatio: number): Workload {
@@ -136,7 +133,8 @@ function requireHeaderLane(buffer: AnySpanBuffer): Uint32Array {
 
 function requireMessageLane(buffer: AnySpanBuffer): (unknown | undefined)[] {
   const messages = buffer.message_values;
-  if (messages === undefined) throw new Error(`${buffer._messageLayoutFamily} buffer omitted its required message lane`);
+  if (messages === undefined)
+    throw new Error(`${buffer._messageLayoutFamily} buffer omitted its required message lane`);
   return messages;
 }
 
@@ -266,9 +264,7 @@ for (const capacity of CAPACITIES) {
           do_not_optimize(writeWorkload(mixedPlan, mixedBuffer, workload, repetitions)),
         ).baseline(true);
         if (family !== 'mixed') {
-          bench(selectedLabel, () =>
-            do_not_optimize(writeWorkload(plan, selectedBuffer, workload, repetitions)),
-          );
+          bench(selectedLabel, () => do_not_optimize(writeWorkload(plan, selectedBuffer, workload, repetitions)));
         }
       });
     });

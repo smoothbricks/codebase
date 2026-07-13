@@ -9,6 +9,13 @@
  */
 
 import { bench, do_not_optimize, group, run } from 'mitata';
+import type { WriterState } from '../../lmao/src/lib/codegen/fixedPositionWriterGenerator.ts';
+import type { TagWriter as ContextTagWriter } from '../../lmao/src/lib/opContext/spanContextTypes.ts';
+import {
+  RUNTIME_HINT_ANALYZED_VALID,
+  RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY,
+  RUNTIME_HINT_TAG,
+} from '../../lmao/src/lib/runtimeHint.ts';
 import {
   createSpanBuffer,
   createTraceRoot,
@@ -17,16 +24,9 @@ import {
   JsBufferStrategy,
   Ok,
   S,
-  TestTracer,
   type SpanBuffer,
+  TestTracer,
 } from '../../lmao/src/node.ts';
-import type { WriterState } from '../../lmao/src/lib/codegen/fixedPositionWriterGenerator.ts';
-import type { TagWriter as ContextTagWriter } from '../../lmao/src/lib/opContext/spanContextTypes.ts';
-import {
-  RUNTIME_HINT_ANALYZED_VALID,
-  RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY,
-  RUNTIME_HINT_TAG,
-} from '../../lmao/src/lib/runtimeHint.ts';
 
 const CAPACITY = 64;
 const FORMAT = process.argv.includes('--json') ? 'json' : process.argv.includes('--markdown') ? 'markdown' : 'mitata';
@@ -46,19 +46,10 @@ const tracer = new TestTracer(opContext, {
   bufferStrategy: new JsBufferStrategy(),
   createTraceRoot,
 });
-const benchmarkOp = opContext.defineOp(
-  'inline-vs-codegen',
-  () => new Ok(undefined),
-  undefined,
-  {
-    runtimeHint:
-      RUNTIME_HINT_ANALYZED_VALID |
-      RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY |
-      RUNTIME_HINT_TAG |
-      CAPACITY,
-    eagerColumns: EAGER_COLUMNS,
-  },
-);
+const benchmarkOp = opContext.defineOp('inline-vs-codegen', () => new Ok(undefined), undefined, {
+  runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY | RUNTIME_HINT_TAG | CAPACITY,
+  eagerColumns: EAGER_COLUMNS,
+});
 const plan = benchmarkOp.callsitePlan;
 
 interface TagViews {

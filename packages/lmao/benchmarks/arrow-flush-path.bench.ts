@@ -1,16 +1,14 @@
 import type { Table } from '@uwdata/flechette';
 import { bench, do_not_optimize, group, run, summary } from 'mitata';
 import type { ArrowLease } from '../src/lib/arrow/lease.js';
-import {
-  convertSpanTreeToLeasedArrowTable,
-  convertToLeasedArrowTable,
-} from '../src/lib/convertToArrow.js';
+import { convertSpanTreeToLeasedArrowTable, convertToLeasedArrowTable } from '../src/lib/convertToArrow.js';
 import { defineOpContext } from '../src/lib/defineOpContext.js';
 import { JsBufferStrategy } from '../src/lib/JsBufferStrategy.js';
-import type { CallsitePlan } from '../src/lib/physicalLayoutPlan.js';
 import type { OpContextOf } from '../src/lib/opContext/types.js';
+import type { CallsitePlan } from '../src/lib/physicalLayoutPlan.js';
 import { resolveMessage } from '../src/lib/resolveMessage.js';
 import {
+  type MessageLayoutFamily,
   RUNTIME_HINT_ANALYZED_VALID,
   RUNTIME_HINT_LOG,
   RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY,
@@ -18,15 +16,14 @@ import {
   RUNTIME_HINT_MESSAGE_LAYOUT_STATIC_ONLY,
   RUNTIME_HINT_RESULT,
   RUNTIME_HINT_SPAN,
-  type MessageLayoutFamily,
 } from '../src/lib/runtimeHint.js';
 import { S } from '../src/lib/schema/builder.js';
 import { defineLogSchema } from '../src/lib/schema/defineLogSchema.js';
 import { ENTRY_TYPE_SPAN_START } from '../src/lib/schema/systemSchema.js';
 import { createTraceId } from '../src/lib/traceId.js';
 import { createTraceRoot } from '../src/lib/traceRoot.node.js';
-import { iterateSpanTree } from '../src/lib/traceTopology.js';
 import { TestTracer } from '../src/lib/tracers/TestTracer.js';
+import { iterateSpanTree } from '../src/lib/traceTopology.js';
 import type { AnySpanBuffer, SpanBuffer } from '../src/lib/types.js';
 import { registerBenchmarkVocabulary } from './vocabularyFixture.js';
 
@@ -198,9 +195,7 @@ async function makeScenario(kind: MessageKind, logCount: number, topology: Topol
 }
 
 function leaseFor(root: AnySpanBuffer, topology: Topology): ArrowLease {
-  return topology === 'depth-3-tree'
-    ? convertSpanTreeToLeasedArrowTable(root)
-    : convertToLeasedArrowTable(root);
+  return topology === 'depth-3-tree' ? convertSpanTreeToLeasedArrowTable(root) : convertToLeasedArrowTable(root);
 }
 
 function logicalFromTable(table: Table): LogicalOutput {
@@ -363,14 +358,66 @@ function closedValue(index: number): string {
 }
 
 const STRING_PROFILES: readonly StringProfile[] = Object.freeze([
-  { name: 'enum-closed-values', row: (index) => ({ closedValue: closedValue(index), categoryValue: `region-${index % 2}`, textValue: `enum-${index}` }) },
-  { name: 'category-low-cardinality-repeated', row: (index) => ({ closedValue: closedValue(index), categoryValue: `region-${index % 3}`, textValue: `low-${index}` }) },
-  { name: 'category-high-cardinality', row: (index) => ({ closedValue: closedValue(index), categoryValue: `session-${index}`, textValue: `high-${index}` }) },
-  { name: 'text-unique', row: (index) => ({ closedValue: closedValue(index), categoryValue: `bucket-${index % 2}`, textValue: `unique-${index}` }) },
-  { name: 'null-sparse-strings', row: (index) => ({ closedValue: index % 4 === 0 ? null : closedValue(index), categoryValue: index % 3 === 0 ? null : `sparse-${index % 2}`, textValue: index % 2 === 0 ? null : `text-${index}` }) },
-  { name: 'short-ascii', row: (index) => ({ closedValue: closedValue(index), categoryValue: `c${index % 4}`, textValue: `t${index}` }) },
-  { name: 'multibyte-utf8', row: (index) => ({ closedValue: closedValue(index), categoryValue: `東京-${index % 3}`, textValue: `résumé-🙂-東京-${index}` }) },
-  { name: 'long-utf8', row: (index) => ({ closedValue: closedValue(index), categoryValue: `long-${index % 2}`, textValue: `payload-${index}-${'λ🙂'.repeat(512)}` }) },
+  {
+    name: 'enum-closed-values',
+    row: (index) => ({
+      closedValue: closedValue(index),
+      categoryValue: `region-${index % 2}`,
+      textValue: `enum-${index}`,
+    }),
+  },
+  {
+    name: 'category-low-cardinality-repeated',
+    row: (index) => ({
+      closedValue: closedValue(index),
+      categoryValue: `region-${index % 3}`,
+      textValue: `low-${index}`,
+    }),
+  },
+  {
+    name: 'category-high-cardinality',
+    row: (index) => ({
+      closedValue: closedValue(index),
+      categoryValue: `session-${index}`,
+      textValue: `high-${index}`,
+    }),
+  },
+  {
+    name: 'text-unique',
+    row: (index) => ({
+      closedValue: closedValue(index),
+      categoryValue: `bucket-${index % 2}`,
+      textValue: `unique-${index}`,
+    }),
+  },
+  {
+    name: 'null-sparse-strings',
+    row: (index) => ({
+      closedValue: index % 4 === 0 ? null : closedValue(index),
+      categoryValue: index % 3 === 0 ? null : `sparse-${index % 2}`,
+      textValue: index % 2 === 0 ? null : `text-${index}`,
+    }),
+  },
+  {
+    name: 'short-ascii',
+    row: (index) => ({ closedValue: closedValue(index), categoryValue: `c${index % 4}`, textValue: `t${index}` }),
+  },
+  {
+    name: 'multibyte-utf8',
+    row: (index) => ({
+      closedValue: closedValue(index),
+      categoryValue: `東京-${index % 3}`,
+      textValue: `résumé-🙂-東京-${index}`,
+    }),
+  },
+  {
+    name: 'long-utf8',
+    row: (index) => ({
+      closedValue: closedValue(index),
+      categoryValue: `long-${index % 2}`,
+      textValue: `payload-${index}-${'λ🙂'.repeat(512)}`,
+    }),
+  },
 ]);
 
 const CARDINALITY_PROFILES: readonly StringProfile[] = Object.freeze(
@@ -381,22 +428,12 @@ const CARDINALITY_PROFILES: readonly StringProfile[] = Object.freeze(
   })),
 );
 
-function stringPlan(
-  capacity: number,
-): CallsitePlan<typeof STRING_RUNTIME_SCHEMA, OpContextOf<typeof STRING_CONTEXT>> {
+function stringPlan(capacity: number): CallsitePlan<typeof STRING_RUNTIME_SCHEMA, OpContextOf<typeof STRING_CONTEXT>> {
   const encodedCapacity = capacity <= 0xffff ? capacity : 0;
-  return STRING_CONTEXT.defineOp(
-    `arrow-string-layout-${capacity}`,
-    (ctx) => ctx.ok(null),
-    undefined,
-    {
-      runtimeHint:
-        RUNTIME_HINT_ANALYZED_VALID |
-        RUNTIME_HINT_RESULT |
-        RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY |
-        encodedCapacity,
-    },
-  ).callsitePlan;
+  return STRING_CONTEXT.defineOp(`arrow-string-layout-${capacity}`, (ctx) => ctx.ok(null), undefined, {
+    runtimeHint:
+      RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_RESULT | RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY | encodedCapacity,
+  }).callsitePlan;
 }
 
 function writeStringRows(
@@ -470,7 +507,8 @@ function requireDictionaryValues(table: Table, columnName: string): readonly str
   if (typeof dictionary !== 'object' || dictionary === null) throw new Error(`${columnName} is not dictionary encoded`);
   const length = Reflect.get(dictionary, 'length');
   const getter = Reflect.get(dictionary, 'get');
-  if (typeof length !== 'number' || typeof getter !== 'function') throw new Error(`${columnName} dictionary is invalid`);
+  if (typeof length !== 'number' || typeof getter !== 'function')
+    throw new Error(`${columnName} dictionary is invalid`);
   return Array.from({ length }, (_, index) => String(Reflect.apply(getter, dictionary, [index])));
 }
 
@@ -507,7 +545,8 @@ function assertStringScenario(scenario: StringScenario): readonly (readonly Stri
     const messages = table.getChild('message');
     if (messages === null) throw new Error(`${scenario.name}: missing message column`);
     for (let row = 0; row < scenario.rows.length; row++) {
-      if (messages.get(row) !== `string-row-${row}`) throw new Error(`${scenario.name}: message order mismatch at ${row}`);
+      if (messages.get(row) !== `string-row-${row}`)
+        throw new Error(`${scenario.name}: message order mismatch at ${row}`);
     }
   } finally {
     lease.release();
@@ -559,7 +598,8 @@ const quickStringSelections: readonly (readonly [StringProfile, Topology])[] = O
   [valueAt(CARDINALITY_PROFILES, 3, 'cardinality profiles'), 'single'],
 ]);
 const fullStringSelections: Array<readonly [StringProfile, Topology]> = [];
-for (const profile of STRING_PROFILES) for (const topology of TOPOLOGIES) fullStringSelections.push([profile, topology]);
+for (const profile of STRING_PROFILES)
+  for (const topology of TOPOLOGIES) fullStringSelections.push([profile, topology]);
 for (const profile of CARDINALITY_PROFILES) fullStringSelections.push([profile, 'single']);
 const stringSelections = QUICK ? quickStringSelections : fullStringSelections;
 
