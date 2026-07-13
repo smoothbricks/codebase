@@ -17,11 +17,6 @@
     "skipLibCheck": true,
     "strict": true,
     "target": "es2022",
-    "plugins": [
-      {
-        "transform": "typia/lib/transform"
-      }
-    ],
     "customConditions": ["development"],
     "paths": {
       "@smoothbricks/arrow-builder": ["./packages/arrow-builder/src/index.ts"],

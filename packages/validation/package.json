@@ -2,7 +2,10 @@
   "name": "@smoothbricks/validation",
   "version": "0.1.1",
   "type": "module",
-  "sideEffects": false,
+  "sideEffects": [
+    "./dist/bun/preload.js",
+    "./src/bun/preload.ts"
+  ],
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -54,10 +57,12 @@
   ],
   "dependencies": {
     "tslib": "^2.8.1",
-    "typia": "^12.0.1"
+    "typia": "13.1.0"
   },
   "devDependencies": {
-    "@typia/unplugin": "^12.0.1"
+    "@ttsc/unplugin": "0.18.4",
+    "ttsc": "0.18.4",
+    "typescript": "7.0.2"
   },
   "license": "MIT",
   "publishConfig": {
