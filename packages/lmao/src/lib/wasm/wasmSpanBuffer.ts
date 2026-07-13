@@ -398,6 +398,7 @@ function wasmGetMessageNulls(this: WasmSpanBufferInstance): undefined {
 /** Free each owned WASM block exactly once. */
 function wasmFree(this: WasmSpanBufferInstance): void {
   if (this._descriptor.state === 'freed') return;
+  this._sealStats();
 
   for (const col of buildColumnMeta(this._logSchema)) {
     if (col.sizeClass !== 'string' && this._columnPtrs[col.columnIndex] >= 0) {
@@ -464,12 +465,28 @@ function wasmGetIdentity(this: WasmSpanBufferInstance): Uint8Array {
   return new Uint8Array(this._allocator.memory.buffer, this._identityPtr, 48);
 }
 
+function wasmSealStats(this: WasmSpanBufferInstance): void {
+  if (this._statsSealed) return;
+  const completedRows = this._writeIndex - this._statsReservedRows;
+  if (completedRows > 0) getWasmSpanBufferConstructor(this).stats.totalWrites += completedRows;
+  this._statsSealed = true;
+}
+
+function wasmSealStatsChain(this: WasmSpanBufferInstance): void {
+  let current: WasmSpanBufferInstance | undefined = this;
+  while (current) {
+    current._sealStats();
+    current = current._overflow;
+  }
+}
+
 /**
  * Get or create overflow buffer.
  */
 function wasmGetOrCreateOverflow(this: WasmSpanBufferInstance): WasmSpanBufferInstance {
   assertWasmBufferLive(this);
   if (this._overflow) return this._overflow;
+  this._sealStats();
   const tracer = this._traceRoot.tracer;
   tracer.onStatsWillResetFor(this);
   checkCapacityTuning(getWasmSpanBufferConstructor(this).stats);
@@ -804,6 +821,8 @@ class WasmSpanBuffer {
     this._messageTemplateIds = opts._opMetadata.logTemplateIds.length !== 0
       ? new Uint16Array(opts.capacity)
       : undefined;
+    this._statsSealed = false;
+    this._statsReservedRows = 2;
 
     // Initialize message array
     this._message = new Array(opts.capacity);
@@ -926,6 +945,8 @@ return WasmSpanBuffer;
   WasmSpanBufferClass.prototype.getColumnIfAllocated = wasmGetColumnIfAllocated;
   WasmSpanBufferClass.prototype.getNullsIfAllocated = wasmGetNullsIfAllocated;
   WasmSpanBufferClass.prototype.getOrCreateOverflow = wasmGetOrCreateOverflow;
+  WasmSpanBufferClass.prototype._sealStats = wasmSealStats;
+  WasmSpanBufferClass.prototype._sealStatsChain = wasmSealStatsChain;
   WasmSpanBufferClass.prototype[Symbol.for('nodejs.util.inspect.custom')] = wasmInspect;
 
   // Add static schema property
@@ -1086,6 +1107,7 @@ export function createWasmOverflowBuffer(
     _parent: buffer._parent,
     _generation: ++nextWasmBufferGeneration,
   });
+  overflow._statsReservedRows = 0;
   buffer._overflow = overflow;
   buffer._descriptor.overflow = overflow._descriptor;
 

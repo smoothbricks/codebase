@@ -134,6 +134,7 @@ export class TraceRoot implements ITraceRoot {
   writeSpanEnd(buffer: AnySpanBuffer, entryType: number): void {
     buffer.timestamp[1] = this.getTimestampNanos();
     buffer.entry_type[1] = entryType;
+    buffer._sealStatsChain();
   }
 
   /**
