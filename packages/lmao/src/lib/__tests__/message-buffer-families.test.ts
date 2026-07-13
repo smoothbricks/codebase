@@ -553,6 +553,45 @@ describe('specialized message buffer families', () => {
     }
   });
 
+  it('starts every new JS root, child, and overflow identity lane at the zero null/raw sentinel', () => {
+    for (const { mode, op } of [
+      { mode: 'current' as const, op: mixedOp },
+      { mode: 'specialized' as const, op: specializedMixedOp },
+    ]) {
+      const root = createPlannedBuffer('mixed', op.callsitePlan.SpanBufferClass, op.metadata);
+      const child = createChildSpanBuffer(
+        root,
+        op.callsitePlan.SpanBufferClass,
+        op.metadata,
+        op.metadata,
+        CAPACITY,
+      );
+      const overflow = createOverflowBuffer(child);
+
+      for (const [kind, buffer] of [
+        ['root', root],
+        ['child', child],
+        ['overflow', overflow],
+      ] as const) {
+        if (buffer.entry_type === undefined || buffer.message_values === undefined) {
+          throw new Error(`Expected ${mode} ${kind} entry-type and raw message lanes`);
+        }
+        const identityLane = mode === 'current' ? buffer._messageIds : buffer._logHeaders;
+        if (identityLane === undefined) throw new Error(`Expected ${mode} ${kind} identity lane`);
+
+        expect(identityLane.every((identity) => identity === 0)).toBe(true);
+        expect(buffer.message_values[0]).toBeUndefined();
+        buffer.entry_type[0] = ENTRY_TYPE_DEBUG;
+        expect(resolveMessage(buffer, 0)).toBeUndefined();
+
+        buffer.entry_type[1] = ENTRY_TYPE_DEBUG;
+        buffer.message(1, '');
+        expect(identityLane[1]).toBe(0);
+        expect(resolveMessage(buffer, 1)).toBe('');
+      }
+    }
+  });
+
   it('derives Arrow message validity from sentinel IDs and raw value definedness', () => {
     const root = createPlannedBuffer(
       'mixed',

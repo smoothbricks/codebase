@@ -426,10 +426,8 @@ export function getSpanBufferClass<T extends LogSchema>(
             ? ''
             : messagePhysicalLayout === 'current'
               ? `       const messageIdView = new Uint16Array(systemBuffer, messageIdOffset, requestedCapacity);
-       messageIdView.fill(0);
 `
               : `       const logHeaderView = new Uint32Array(systemBuffer, logHeaderOffset, requestedCapacity);
-       logHeaderView.fill(0);
 `)) +
       // Assign properties in optimal order for V8 in-object slots.
       `this._writeIndex = 0;
