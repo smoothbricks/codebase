@@ -3,7 +3,25 @@
   "version": "0.1.0",
   "private": true,
   "nx": {
-    "name": "cowshed"
+    "name": "cowshed",
+    "targets": {
+      "integration-apfs": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "cwd": "packages/cowshed",
+          "command": "COWSHED_INTEGRATION=1 cargo test -p cowshed-core --test apfs_integration -- --ignored --nocapture"
+        }
+      },
+      "benchmark-apfs": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "cwd": "packages/cowshed",
+          "command": "COWSHED_BENCH=1 cargo test --release -p cowshed-core --test apfs_benchmark -- --ignored --nocapture"
+        }
+      }
+    }
   },
   "type": "module",
   "description": "Warm git workspaces: instant isolated copy-on-write workspaces with layered sandboxing (CLI, Rust API, NAPI bindings)"

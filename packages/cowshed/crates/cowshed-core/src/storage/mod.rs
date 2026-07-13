@@ -11,6 +11,7 @@ use thiserror::Error;
 use crate::metadata::{ImageFormat, MetadataError, WorkspaceName};
 use crate::repository::{PathLayoutError, ProjectPaths, RepoId};
 
+pub mod apfs;
 pub mod bootstrap;
 pub mod lifecycle;
 pub mod recovery;
