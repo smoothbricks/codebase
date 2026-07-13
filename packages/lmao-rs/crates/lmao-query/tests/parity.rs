@@ -35,7 +35,7 @@ fn fixture_batch() -> RecordBatch {
     let span = |id: Arc<SpanIdentity>, name: &str, logs: &[&str]| MockSpan {
         identity: id,
         timestamps: (0..(2 + logs.len()) as i64).collect(),
-        entry_types: [1u8, 2]
+        packed_headers: [1u32, 2]
             .into_iter()
             .chain(std::iter::repeat_n(5, logs.len()))
             .collect(),
