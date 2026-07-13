@@ -107,13 +107,15 @@ the attachment state (getmntinfo), the controller-owned remote binding establish
 in-workspace marker (`.cowshed/workspace.json`) identifies a workspace incarnation. There is **no mutable state
 database**. The persistent daemons are the gateway (one per host) and the per-workspace shell supervisors (11_shell.md),
 with the optional MCP socket server (12_mcp.md). Linux additionally has one ephemeral minimal connector per attached
-workspace; it is attachment plumbing and stores no authority. None of these processes _store_ authoritative state — kill
-any of them and the next command rederives everything from disk and the mount table.
+workspace; it is attachment plumbing and stores no authority. Runtime processes hold no sole authority: kill them and
+the next command rederives lifecycle from protected/controller durable tiers and the mount table. The trusted supervisor
+is nevertheless the sole live writer of protected in-volume job evidence; controller telemetry writers publish compact
+immutable continuity commitments.
 
-Observability is **distributed tracing into Arrow columns** (13_telemetry.md): lifecycle ops, jobs, and gateway requests
-are spans propagating W3C trace context, flushed as queryable Arrow segments on the store volume via **lmao**
-(`packages/lmao-rs`). There is no telemetry daemon and no on-disk text log — the audit trail, the perf SLOs, and the
-sandbox trace-assertions are all queries over one substrate.
+Observability is distributed tracing into Arrow columns (13_telemetry.md). Protected in-volume complete job batches and
+sealed artifacts own captured content within an origin incarnation/checkpoint boundary. Controller Arrow commitments own
+existence/status/order/lineage and hashes but never duplicate raw output. Lifecycle, gateway, and audit spans share lmao
+Arrow transport; there is no telemetry daemon or ordinary on-disk text log.
 
 ## Crate map
 

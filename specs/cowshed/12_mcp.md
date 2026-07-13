@@ -99,9 +99,9 @@ even if compromised — escalation is strictly a decision made one level up.
 | `gc`                | `dryRun?`                                                                                              | reclaimed bytes/report                                   |
 | `repo_mirror`       | `name`, `url`                                                                                          | controller-owned read-only mirror path                   |
 
-A coordinator-scoped **telemetry query tool** (selector/SQL over the store segments, 13_telemetry.md) is roadmap, not v1
-— the CLI's `cowshed logs`/`audit`/`trace` cover the need until then. Workers get only one-workspace job status/log
-tools; status is reconciled from controller-owned authority, while workspace records remain optional reproduction data.
+A coordinator-scoped telemetry query tool (selector/SQL over controller commitments and telemetry, 13_telemetry.md) is
+roadmap, not v1. Workers get only one-workspace job status/log tools: lifecycle is reconciled against controller
+continuity commitments, while captured bytes resolve from protected in-volume artifacts within their origin boundary.
 
 `restore` requires a label — there is no "restore the latest" default. Worker `checkpoint` accepts an optional label.
 `grant`/`revoke` carry `expectedRevision` for compare-and-swap (07_api.md/04_sandbox.md) and a `repo[]` selector for
@@ -121,14 +121,14 @@ base. `push` remains the separate worker-scoped preservation primitive and inten
 
 ### Worker tools (one-use descriptor; scoped to that workspace)
 
-| Tool         | Args                                                                                                                        | Returns                                                                                    |
-| ------------ | --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `bash`       | `command`, `stdin?`, `timeout?`, `background?`, `session?`                                                                  | `jobId`, state, stdin metadata, `stdout`/`stderr` stream info, exit metadata when terminal |
-| `job_list`   | `state?`                                                                                                                    | numeric job ids, state, timings, trace identity, per-stream info                           |
-| `job_status` | `jobId` (numeric)                                                                                                           | state, timings, exit metadata, `stdout`/`stderr` stream info, trace identity               |
-| `job_logs`   | `jobId` (numeric), `stream?: "out" \| "err"`, `follow?`                                                                     | raw bytes from the selected backing file                                                   |
-| `checkpoint` | `label?`                                                                                                                    | label                                                                                      |
-| `push`       | `branch?`, `expectedWorkspaceIncarnation?`, `expectedSourceHead?`, `expectedDestinationHead?: { missing: true } \| { oid }` | source head, non-checked-out destination ref, previous destination head?                   |
+| Tool         | Args                                                                                                                           | Returns                                                                                    |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
+| `bash`       | `command`, `stdin?`, `timeout?`, `background?`, `session?`, `stdoutCopy?: OutputPublication`, `stderrCopy?: OutputPublication` | `jobId`, state, stdin metadata, `stdout`/`stderr` stream info, exit metadata when terminal |
+| `job_list`   | `state?`                                                                                                                       | numeric job ids, state, timings, trace identity, per-stream info                           |
+| `job_status` | `jobId` (numeric)                                                                                                              | state, timings, exit metadata, `stdout`/`stderr` stream info, trace identity               |
+| `job_logs`   | `jobId` (numeric), `stream?: "out" \| "err"`, `follow?`                                                                        | raw bytes resolved representation-transparently from the protected artifact                |
+| `checkpoint` | `label?`                                                                                                                       | label                                                                                      |
+| `push`       | `branch?`, `expectedWorkspaceIncarnation?`, `expectedSourceHead?`, `expectedDestinationHead?: { missing: true } \| { oid }`    | source head, non-checked-out destination ref, previous destination head?                   |
 
 `bash` is the workhorse: it runs through the workspace supervisor (warm shell, 11_shell.md), honors `session` for
 stateful multi-step work, and returns the workspace-local monotonic numeric `jobId` for **every accepted exec
@@ -146,9 +146,11 @@ child stdin once, cancellation closes stdin and records incomplete delivery with
 Results/events carry stdin kind, delivered byte count, completion, and normalized relative file path when applicable,
 plus normal job/trace identity; inline bytes never enter JSON results or telemetry.
 
-`checkpoint` atomically enforces the coordinator-configured per-workspace checkpoint count and byte quotas. Quota
+`checkpoint` atomically enforces the coordinator-configured per-workspace checkpoint count and byte quotas. It reaches
+the supervisor barrier before cloning: running memory-only stream prefixes promote, protected files and a complete
+checkpoint-manifest Arrow batch fsync, and the controller publishes the manifest digest/lineage commitment. Quota
 exhaustion is a conflict carrying current usage and limits; it never silently prunes another checkpoint. Restore is
-coordinator-only.
+coordinator-only and rejects any manifest/commitment mismatch as `Integrity`.
 
 `push` has the same preservation and compare-and-swap semantics as `WorkspaceHandle::push` (07_api.md): it installs the
 exact fetched source head under `refs/cowshed/<ws>/heads/<branch>` in the main workspace repository/object store without
@@ -156,39 +158,45 @@ changing the checked-out Git `main` branch, index, or working tree. Any supplied
 destination-head expectation mismatch maps to `Conflict` (`-32002`), leaves the destination unchanged, and retains the
 source workspace. Remote publication and workflow policy are not MCP tools.
 
-MCP JSON carries job/control metadata and separate `stdout` and `stderr` `StreamInfo` objects: each is
-`{ path, bytes, summary }`, with the deterministic bounded versioned redacted summary defined in 11_shell.md. The
-configurable combined stdout+stderr quota defaults to 1 GiB. Crossing it terminates the process group with
-TERM/grace/KILL, drains both pipes, and returns the explicit `outputLimit` terminal state and limit metadata; the server
-never silently truncates a running job. Summaries have independent projection truncation semantics.
+MCP JSON carries separate `stdout` and `stderr` with frozen `StreamInfo { storage, bytes, sha256, summary }`. A bounded
+inline artifact uses `BinaryData` `{encoding:"utf8",data} | {encoding:"base64",data}` exactly as ordinary `JobInfo`;
+both branches are decoded-byte bounded. A file path exists only after promotion. Controller commitments carry neither
+inline form nor any payload/path. `Redirect.source` is mutable and never used by `job_logs`; the exact combined quota
+still applies. `stdoutCopy`/`stderrCopy` are the exact per-stream `{path,policy}` `OutputPublication` objects with
+`policy: "createNew"|"replace"`. Publication is independent, post-terminal, never hardlinks, never alters storage, and
+never becomes authority.
 
-Every job result and event includes the durable `(repoId, workspaceIncarnation, jobId)` key and standard trace identity.
-Authoritative lifecycle, exit/signal, output-limit, and denial fields come from controller-owned immutable per-writer
-telemetry segments delivered through the controller-provided non-inheritable writer FD/capability or IPC channel. The
-in-volume `.cowshed/job/records.arrow` projection may be returned for convenience only after reconciling it with
-controller state; it is never trusted for status, authorization, denial, quota, or audit decisions.
+Every job result/event includes `(repoId, workspaceIncarnation, jobId)` and standard trace identity. Protected in-volume
+complete Arrow batches and sealed artifacts own captured content within the origin incarnation/checkpoint boundary.
+Compact controller commitments own existence/status/order/lineage and expected counts/hashes, but never output payload
+or artifact paths. The server reconciles both: missing/altered committed content, invalid complete batches, and
+count/hash/batch/lineage mismatch return `Integrity` (`-32006`), preserving both sides rather than trusting whichever
+appears newer. Discarding only an incomplete trailing batch is successful recovery.
 
-`bash` takes **shell text** (`command`) for agent ergonomics; the server converts it **explicitly** to the typed core
-exec form `["/bin/sh", "-c", command]` before calling `WorkspaceHandle::exec`. A real shell AST parser may recognize
-only the narrowly eligible single-simple-command literal redirection fast path defined in 11_shell.md; any ambiguity or
-failed eligibility check falls back to ordinary shell execution/capture. Parsing is optimization only, never authority
-or correctness. Structured stdin remains separate from shell text in all cases.
+`bash` takes shell text for agent ergonomics and converts it explicitly to `["/bin/sh","-c",command]`. A real shell AST
+may classify only a proven simple literal `>`/`2>` as `Redirect`, and only when the supervisor controls the actual
+writable descriptor and applies identical exact quota accounting. After terminal state it snapshots that source into an
+independent protected inline or clone/reflink/copied file artifact. Polling/tailing or reopening the source path is
+forbidden. If eligibility/interposition fails, ordinary shell semantics run and the result claims only bytes that
+reached captured pipes. This is evidence classification, not the removed hardlink optimization. Structured stdin remains
+separate from shell text.
 
 ## Error mapping (CowshedError → JSON-RPC)
 
 One table; the server maps the core taxonomy (07_api.md) onto JSON-RPC error codes. `data.hint` carries the same
-actionable next step the CLI prints on stderr, and `data.exitCode` carries the process exit for `bash` results (child
-code passed through; 6 only on authoritative denial).
+actionable next step as CLI stderr, and `data.exitCode` carries a child process exit for `bash` results; a child 6 or 7
+is not reclassified as a cowshed error.
 
-| CowshedError    | JSON-RPC code           | `data`                                                         |
-| --------------- | ----------------------- | -------------------------------------------------------------- |
-| `Usage`         | -32602 (invalid params) | `{ code: "usage", hint }`                                      |
-| `NotFound`      | -32001                  | `{ code: "notFound", hint }`                                   |
-| `Conflict`      | -32002                  | `{ code: "conflict", hint }` (grant CAS staleness lands here)  |
-| `Environment`   | -32003                  | `{ code: "envMissing", hint }`                                 |
-| `SandboxDenied` | -32004                  | `{ code: "sandboxDenied", hint, grant }` (the resolving grant) |
-| `Internal`      | -32603 (internal error) | `{ code: "internal" }`                                         |
-| `Authorization` | -32005                  | `{ code: "unauthorized", hint }`                               |
+| CowshedError         | JSON-RPC code           | `data`                                    |
+| -------------------- | ----------------------- | ----------------------------------------- |
+| `Usage`              | -32602 (invalid params) | `{ code: "usage", hint }`                 |
+| `NotFound`           | -32001                  | `{ code: "not-found", hint }`             |
+| `Conflict`           | -32002                  | `{ code: "conflict", hint }`              |
+| `EnvironmentMissing` | -32003                  | `{ code: "environment-missing", hint }`   |
+| `SandboxDenied`      | -32004                  | `{ code: "sandbox-denied", hint, grant }` |
+| `Authorization`      | -32005                  | `{ code: "unauthorized", hint }`          |
+| `Integrity`          | -32006                  | `{ code: "integrity", hint }`             |
+| `Internal`           | -32603 (internal error) | `{ code: "internal" }`                    |
 
 A missing, expired, replayed, peer-mismatched, socket-mismatched, or insufficient capability is the distinct
 `Authorization` error **-32005**, returned before tool dispatch. It is never reported as `SandboxDenied` (`-32004`) or
