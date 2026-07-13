@@ -238,7 +238,11 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     fn list(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError>;
     fn mounts(&self, repo: &RepoId) -> Result<Vec<KernelMountFact>, ApfsStorageError>;
     fn checkpoints(&self, repo: &RepoId) -> Result<Vec<CheckpointFact>, ApfsStorageError>;
-    fn recover_pending(&self, config: &ApfsSubstrateConfig) -> Result<(), ApfsStorageError>;
+    fn recover_pending(
+        &self,
+        config: &ApfsSubstrateConfig,
+        held_locks: &[PathBuf],
+    ) -> Result<(), ApfsStorageError>;
     fn stats(
         &self,
         workspace: &LifecycleWorkspace,
@@ -425,7 +429,7 @@ where
                     ApfsStorageError::InvalidPlan("blocking image lock unexpectedly unavailable"),
                 )?;
                 if recover {
-                    host.recover_pending(&config)?;
+                    host.recover_pending(&config, &lock_paths)?;
                 }
                 job(host, config)
             })
@@ -657,6 +661,11 @@ where
     }
 }
 
+struct CheckedGuard<G> {
+    _lock: G,
+    paths: Vec<PathBuf>,
+}
+
 struct CheckedApfsBackend<H, L> {
     host: Arc<H>,
     lane: Arc<L>,
@@ -671,34 +680,35 @@ where
     H: ApfsExecutionHost,
     L: ApfsBlockingLane,
 {
-    type Guard = H::LockGuard;
+    type Guard = CheckedGuard<H::LockGuard>;
     type Output = Applied;
     type Error = ApfsStorageError;
 
     async fn acquire(&self, operation: &Operation) -> Result<Self::Guard, Self::Error> {
-        let lock_paths = operation_lock_paths(&self.config, &self.expected, operation)?;
+        let paths = operation_lock_paths(&self.config, &self.expected, operation)?;
         let host = Arc::clone(&self.host);
         self.lane
             .dispatch(move || {
-                host.lock_images(&lock_paths, LockMode::Wait)?
-                    .ok_or(ApfsStorageError::InvalidPlan(
-                        "blocking image lock unexpectedly unavailable",
-                    ))
+                let lock = host.lock_images(&paths, LockMode::Wait)?.ok_or(
+                    ApfsStorageError::InvalidPlan("blocking image lock unexpectedly unavailable"),
+                )?;
+                Ok(CheckedGuard { _lock: lock, paths })
             })
             .await
     }
 
     async fn read_authoritative(
         &self,
-        _: &mut Self::Guard,
+        guard: &mut Self::Guard,
         expected: &[ExpectedState],
     ) -> Result<Vec<ObservedState>, Self::Error> {
         let host = Arc::clone(&self.host);
         let config = Arc::clone(&self.config);
+        let held_locks = guard.paths.clone();
         let expected = expected.to_vec();
         self.lane
             .dispatch(move || {
-                host.recover_pending(&config)?;
+                host.recover_pending(&config, &held_locks)?;
                 host.observe(&expected)
             })
             .await

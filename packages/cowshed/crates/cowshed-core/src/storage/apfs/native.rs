@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, OsString};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Sender, SyncSender};
@@ -11,9 +11,9 @@ use std::thread;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 
 use crate::apfs::{
     ApfsBackend, AttachedImage, CommandRunner, CreateImageRequest, CreatedImage, DetachTarget,
@@ -31,7 +31,9 @@ use super::super::lifecycle::{
     CheckpointFact, ExpectedState, KernelMountFact, LifecycleWorkspace, ObservedState,
     OperationIdentity, Pin, Revision, StorageFact, StorageGcReport, SubstrateStats,
 };
-use super::super::{CheckpointLabel, WORKSPACE_MARKER_PATH, discover_session_images};
+use super::super::{
+    CheckpointLabel, WORKSPACE_MARKER_PATH, discover_session_images, verify_no_symlinks,
+};
 use super::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, LockMode, MarkerExpectation,
     MetadataPolicy, layout, volume_name,
@@ -55,7 +57,101 @@ impl Drop for ImageLockGuard {
     }
 }
 
+fn path_component(value: &std::ffi::OsStr, path: &Path) -> Result<CString, ApfsStorageError> {
+    CString::new(value.as_bytes()).map_err(|_| {
+        ApfsStorageError::Host(format!("controller path contains NUL: {}", path.display()))
+    })
+}
+
+fn open_lock_file(root: &Path, path: &Path) -> Result<File, ApfsStorageError> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        ApfsStorageError::Layout(super::super::StorageLayoutError::EscapesStoreRoot)
+    })?;
+    let mut components = relative.components().peekable();
+    if components.peek().is_none() {
+        return Err(ApfsStorageError::InvalidPlan("lock path is the store root"));
+    }
+    let root_name = CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| ApfsStorageError::Host("store root contains NUL".to_owned()))?;
+    let root_fd = unsafe {
+        libc::open(
+            root_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(io_error(
+            "open controller store without following symlinks",
+            root,
+            io::Error::last_os_error(),
+        ));
+    }
+    let mut directory = unsafe { File::from_raw_fd(root_fd) };
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(ApfsStorageError::Layout(
+                super::super::StorageLayoutError::EscapesStoreRoot,
+            ));
+        };
+        let name = path_component(name, path)?;
+        if components.peek().is_none() {
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                return Err(io_error(
+                    "open lifecycle lock without following symlinks",
+                    path,
+                    io::Error::last_os_error(),
+                ));
+            }
+            return Ok(unsafe { File::from_raw_fd(fd) });
+        }
+        let mut fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 && io::Error::last_os_error().kind() == io::ErrorKind::NotFound {
+            let created = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
+            if created != 0 && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists {
+                return Err(io_error(
+                    "create controller directory without following symlinks",
+                    path,
+                    io::Error::last_os_error(),
+                ));
+            }
+            fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+        }
+        if fd < 0 {
+            return Err(io_error(
+                "open controller directory without following symlinks",
+                path,
+                io::Error::last_os_error(),
+            ));
+        }
+        directory = unsafe { File::from_raw_fd(fd) };
+    }
+    Err(ApfsStorageError::InvalidPlan(
+        "lock path has no final component",
+    ))
+}
+
 fn acquire_image_locks(
+    root: &Path,
     paths: &[PathBuf],
     mode: LockMode,
 ) -> Result<Option<ImageLockGuard>, ApfsStorageError> {
@@ -64,29 +160,7 @@ fn acquire_image_locks(
     paths.dedup();
     let mut files = Vec::with_capacity(paths.len());
     for path in paths {
-        let parent = path
-            .parent()
-            .ok_or(ApfsStorageError::InvalidPlan("lock path has no parent"))?;
-        fs::create_dir_all(parent)
-            .map_err(|error| io_error("create lifecycle lock directory", parent, error))?;
-        if fs::symlink_metadata(parent)
-            .map_err(|error| io_error("inspect lifecycle lock directory", parent, error))?
-            .file_type()
-            .is_symlink()
-        {
-            return Err(ApfsStorageError::Host(format!(
-                "lifecycle lock parent must not be a symlink: {}",
-                parent.display()
-            )));
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|error| io_error("open lifecycle lock", &path, error))?;
+        let file = open_lock_file(root, &path)?;
         let operation = match mode {
             LockMode::Wait => libc::LOCK_EX,
             LockMode::Try => libc::LOCK_EX | libc::LOCK_NB,
@@ -706,6 +780,20 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             retired,
         }
     }
+    fn verify_controller_path(&self, path: &Path) -> Result<(), ApfsStorageError> {
+        if path == self.config.store_root {
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|error| io_error("inspect controller store root", path, error))?;
+            if metadata.file_type().is_symlink() {
+                return Err(ApfsStorageError::Layout(
+                    super::super::StorageLayoutError::SymlinkComponent(path.to_owned()),
+                ));
+            }
+        } else if path.starts_with(&self.config.store_root) {
+            verify_no_symlinks(&self.config.store_root, path)?;
+        }
+        Ok(())
+    }
 
     fn ensure_parent(path: &Path) -> Result<(), ApfsStorageError> {
         let parent = path
@@ -982,6 +1070,20 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         Ok(PathBuf::from(lock))
     }
 
+    fn recovery_lock(
+        &self,
+        canonical: &Path,
+        held_locks: &[PathBuf],
+    ) -> Result<Option<Option<ImageLockGuard>>, ApfsStorageError> {
+        let lock = Self::lock_path_for_image(canonical);
+        if held_locks.contains(&lock) {
+            Ok(Some(None))
+        } else {
+            acquire_image_locks(&self.config.store_root, &[lock], LockMode::Try)
+                .map(|guard| guard.map(Some))
+        }
+    }
+
     fn lock_path_for_image(image: &Path) -> PathBuf {
         let mut lock: OsString = image.as_os_str().to_owned();
         lock.push(".lock");
@@ -1021,7 +1123,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     };
                     report.examined += 1;
                     let lock = Self::transient_lock_path(project, &path, format)?;
-                    let Some(_guard) = acquire_image_locks(&[lock], LockMode::Try)? else {
+                    let Some(_guard) =
+                        acquire_image_locks(&self.config.store_root, &[lock], LockMode::Try)?
+                    else {
                         continue;
                     };
                     self.reclaim_image(&path, format)?;
@@ -1057,7 +1161,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 continue;
             }
             let lock = Self::transient_lock_path(project, image, *format)?;
-            let Some(_guard) = acquire_image_locks(&[lock], LockMode::Try)? else {
+            let Some(_guard) =
+                acquire_image_locks(&self.config.store_root, &[lock], LockMode::Try)?
+            else {
                 continue;
             };
             self.reclaim_image(image, *format)?;
@@ -1072,7 +1178,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 continue;
             };
             let lock = Self::transient_lock_path(project, image, format)?;
-            let Some(_guard) = acquire_image_locks(&[lock], LockMode::Try)? else {
+            let Some(_guard) =
+                acquire_image_locks(&self.config.store_root, &[lock], LockMode::Try)?
+            else {
                 continue;
             };
             fs::remove_file(sidecar)
@@ -1126,7 +1234,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     &fact.workspace,
                     format,
                 )?;
-                let Some(_guard) = acquire_image_locks(&[lock], LockMode::Try)? else {
+                let Some(_guard) =
+                    acquire_image_locks(&self.config.store_root, &[lock], LockMode::Try)?
+                else {
                     continue;
                 };
                 self.reclaim_image(&image, format)?;
@@ -1137,7 +1247,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         for path in session_images {
             if matches!(ImageFormat::from_image_path(&path), Ok(ImageFormat::Sparse)) {
                 let lock = Self::lock_path_for_image(&path);
-                let Some(_guard) = acquire_image_locks(&[lock], LockMode::Try)? else {
+                let Some(_guard) =
+                    acquire_image_locks(&self.config.store_root, &[lock], LockMode::Try)?
+                else {
                     continue;
                 };
                 if self.image_is_kernel_mounted(&path)? {
@@ -1187,7 +1299,7 @@ where
         paths: &[PathBuf],
         mode: LockMode,
     ) -> Result<Option<Self::LockGuard>, ApfsStorageError> {
-        acquire_image_locks(paths, mode)
+        acquire_image_locks(&self.config.store_root, paths, mode)
     }
 
     type Attachment = AttachedImage;
@@ -1274,6 +1386,7 @@ where
                 "lifecycle image format selection disagrees with the plan",
             ));
         }
+        self.verify_controller_path(&request.staged_stem)?;
         Self::ensure_parent(&request.staged_stem)?;
         self.backend
             .create_staged_image(request)
@@ -1286,6 +1399,8 @@ where
         destination: &Path,
         format: ImageFormat,
     ) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(source)?;
+        self.verify_controller_path(destination)?;
         DetachedWorkspaceMetadata::read_for_image(source)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         format
@@ -1301,6 +1416,7 @@ where
     }
 
     fn copy_tree(&self, source: &Path, destination: &Path) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(destination)?;
         TreeCopier::new(self.backend.runner())
             .copy_until_quiescent(source, destination)
             .map(|_| ())
@@ -1312,6 +1428,7 @@ where
         image: &Path,
         format: ImageFormat,
     ) -> Result<Self::Attachment, ApfsStorageError> {
+        self.verify_controller_path(image)?;
         let metadata = DetachedWorkspaceMetadata::read_for_image(image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         if metadata.image_format != format {
@@ -1331,12 +1448,14 @@ where
         mount_point: &Path,
         browse: bool,
     ) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(mount_point)?;
         self.backend
             .mount(attachment, mount_point, browse)
             .map_err(Into::into)
     }
 
     fn chown_volume_root(&self, mount_point: &Path) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(mount_point)?;
         #[cfg(unix)]
         {
             let path = CString::new(mount_point.as_os_str().as_bytes())
@@ -1362,6 +1481,7 @@ where
     }
 
     fn rename_volume(&self, mount_point: &Path, volume_name: &str) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(mount_point)?;
         self.backend
             .rename_volume(mount_point, volume_name)
             .map_err(Into::into)
@@ -1374,6 +1494,7 @@ where
         forked_from: Option<&WorkspaceName>,
         identity: &OperationIdentity,
     ) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(mount_point)?;
         let marker = WorkspaceMarker {
             version: METADATA_VERSION,
             repo_id: workspace.repo().clone(),
@@ -1560,6 +1681,8 @@ where
     }
 
     fn publish_image(&self, staged: &Path, canonical: &Path) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(staged)?;
+        self.verify_controller_path(canonical)?;
         Self::ensure_parent(canonical)?;
         let staged_format = ImageFormat::from_image_path(staged)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
@@ -1578,22 +1701,14 @@ where
         }
         DetachedWorkspaceMetadata::read_for_image(staged)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        Self::rename_sidecar(staged, canonical)?;
+        self.trip_restore_failpoint(RestoreFailpoint::AfterMetadataPublish)?;
+        sync_parent!(&sidecar_path(canonical))?;
+        self.trip_restore_failpoint(RestoreFailpoint::AfterMetadataFsync)?;
         fs::rename(staged, canonical)
             .map_err(|error| io_error("publish canonical image", canonical, error))?;
         self.trip_restore_failpoint(RestoreFailpoint::AfterCanonicalImageRename)?;
-        if let Err(primary) = Self::rename_sidecar(staged, canonical) {
-            let cleanup = fs::rename(canonical, staged)
-                .map_err(|error| io_error("roll back image publication", staged, error));
-            return super::combine_cleanup("publish canonical sidecar", primary, cleanup);
-        }
-        if let Err(primary) = sync_parent!(canonical) {
-            let cleanup = Self::rename_sidecar(canonical, staged).and_then(|()| {
-                fs::rename(canonical, staged).map_err(|error| {
-                    io_error("roll back unsynced image publication", staged, error)
-                })
-            });
-            return super::combine_cleanup("sync canonical image publication", primary, cleanup);
-        }
+        sync_parent!(canonical)?;
         Ok(())
     }
 
@@ -1669,6 +1784,7 @@ where
         identity: Option<&OperationIdentity>,
         source_image: Option<&Path>,
     ) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(image)?;
         workspace
             .format()
             .validate_path(image)
@@ -1727,6 +1843,7 @@ where
         revision: Revision,
         pin: Pin,
     ) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(image)?;
         let metadata = DetachedWorkspaceMetadata::read_for_image(image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         let fact = CheckpointFactWire {
@@ -1753,6 +1870,9 @@ where
         canonical: &Path,
         undo: &Path,
     ) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(staged)?;
+        self.verify_controller_path(canonical)?;
+        self.verify_controller_path(undo)?;
         Self::ensure_parent(undo)?;
         if undo.exists() {
             return Err(ApfsStorageError::Host(format!(
@@ -1800,6 +1920,9 @@ where
         revision: Revision,
         source_image: &Path,
     ) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(staged)?;
+        self.verify_controller_path(canonical)?;
+        self.verify_controller_path(source_image)?;
         self.publish_metadata(
             canonical,
             workspace,
@@ -1821,6 +1944,9 @@ where
         undo: &Path,
         staged: &Path,
     ) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(canonical)?;
+        self.verify_controller_path(undo)?;
+        self.verify_controller_path(staged)?;
         let canonical_sidecar = sidecar_path(canonical);
         let undo_sidecar = sidecar_path(undo);
         let staged_sidecar = sidecar_path(staged);
@@ -1842,6 +1968,8 @@ where
     }
 
     fn retire_image(&self, canonical: &Path, trash: &Path) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(canonical)?;
+        self.verify_controller_path(trash)?;
         Self::ensure_parent(trash)?;
         if trash.exists() {
             return Err(ApfsStorageError::Host(format!(
@@ -1864,6 +1992,7 @@ where
     }
 
     fn reclaim_image(&self, image: &Path, format: ImageFormat) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(image)?;
         self.backend.delete_image(image, format)?;
         Self::remove_sidecar(image)?;
         let fact = checkpoint_fact_path(image);
@@ -1976,8 +2105,97 @@ where
         Ok(facts)
     }
 
-    fn recover_pending(&self, config: &ApfsSubstrateConfig) -> Result<(), ApfsStorageError> {
+    fn recover_pending(
+        &self,
+        config: &ApfsSubstrateConfig,
+        held_locks: &[PathBuf],
+    ) -> Result<(), ApfsStorageError> {
         for project in collect_project_directories(&config.store_root)? {
+            for directory in [project.as_path(), project.join("sessions").as_path()] {
+                for canonical_sidecar in regular_file_children(directory)? {
+                    if !canonical_sidecar
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.ends_with(".grants.json"))
+                    {
+                        continue;
+                    }
+                    let canonical = image_from_sidecar(&canonical_sidecar)?;
+                    if canonical.exists() {
+                        continue;
+                    }
+                    let Ok(format) = ImageFormat::from_image_path(&canonical) else {
+                        continue;
+                    };
+                    let metadata = DetachedWorkspaceMetadata::read_for_image(&canonical)
+                        .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+                    if metadata.image_format != format {
+                        return Err(ApfsStorageError::Host(format!(
+                            "canonical sidecar format disagrees with image path: {}",
+                            canonical_sidecar.display()
+                        )));
+                    }
+                    let storage = layout(config, &metadata.repo_id)?;
+                    let expected = if metadata.workspace.is_main() {
+                        storage.main_image(format)?.image().to_owned()
+                    } else {
+                        storage
+                            .session_image(&metadata.workspace, format)?
+                            .image()
+                            .to_owned()
+                    };
+                    if storage.project().project_root != project || expected != canonical {
+                        continue;
+                    }
+                    let Some(_guard) = self.recovery_lock(&canonical, held_locks)? else {
+                        continue;
+                    };
+                    if canonical.exists() {
+                        continue;
+                    }
+                    let staged = project.join(super::STAGING_NAMESPACE).join(format!(
+                        "{}-{}.{}",
+                        metadata.workspace,
+                        metadata.workspace_incarnation,
+                        format.extension()
+                    ));
+                    if staged.exists() {
+                        let staged_sidecar = sidecar_path(&staged);
+                        if staged_sidecar.exists() {
+                            let staged_metadata =
+                                DetachedWorkspaceMetadata::read_for_image(&staged)
+                                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+                            if staged_metadata != metadata {
+                                return Err(ApfsStorageError::Host(format!(
+                                    "staged and canonical metadata disagree during recovery: {}",
+                                    staged.display()
+                                )));
+                            }
+                            fs::remove_file(&staged_sidecar).map_err(|error| {
+                                io_error("remove duplicate staged metadata", &staged_sidecar, error)
+                            })?;
+                        }
+                        fs::rename(&staged, &canonical).map_err(|error| {
+                            io_error(
+                                "complete sidecar-first image publication",
+                                &canonical,
+                                error,
+                            )
+                        })?;
+                        sync_parent!(&canonical)?;
+                    } else {
+                        fs::remove_file(&canonical_sidecar).map_err(|error| {
+                            io_error(
+                                "remove orphan canonical metadata",
+                                &canonical_sidecar,
+                                error,
+                            )
+                        })?;
+                        sync_parent!(&canonical_sidecar)?;
+                    }
+                }
+            }
+
             let staging = project.join(super::STAGING_NAMESPACE);
             if let Ok(entries) = fs::read_dir(&staging) {
                 for entry in entries {
@@ -2009,6 +2227,14 @@ where
                             .image()
                             .to_owned()
                     };
+                    let Some(_guard) = self.recovery_lock(&canonical, held_locks)? else {
+                        continue;
+                    };
+                    let refreshed = DetachedWorkspaceMetadata::read_for_image(&staged)
+                        .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+                    if refreshed != metadata {
+                        continue;
+                    }
                     let restore_undo = storage
                         .project()
                         .checkpoints
@@ -2090,6 +2316,14 @@ where
                         .image()
                         .to_owned()
                 };
+                let Some(_guard) = self.recovery_lock(&canonical, held_locks)? else {
+                    continue;
+                };
+                let refreshed = DetachedWorkspaceMetadata::read_for_image(&undo)
+                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+                if refreshed != old_metadata {
+                    continue;
+                }
                 if !canonical.exists() {
                     continue;
                 }
@@ -2240,6 +2474,7 @@ where
     }
 
     fn compact(&self, image: &Path, format: ImageFormat) -> Result<bool, ApfsStorageError> {
+        self.verify_controller_path(image)?;
         if format != ImageFormat::Sparse {
             return Err(ApfsStorageError::InvalidPlan(
                 "detached compaction is supported only for SPARSE images",
@@ -2261,6 +2496,7 @@ where
                 "GC config differs from host storage root",
             ));
         }
+        self.recover_pending(config, &[])?;
         let mut report = StorageGcReport::default();
         if !store_directory_exists(&config.store_root)? {
             return Ok(report);

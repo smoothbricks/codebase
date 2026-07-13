@@ -526,7 +526,11 @@ impl ApfsExecutionHost for FakeHost {
             .collect())
     }
 
-    fn recover_pending(&self, _: &ApfsSubstrateConfig) -> Result<(), ApfsStorageError> {
+    fn recover_pending(
+        &self,
+        _: &ApfsSubstrateConfig,
+        _: &[PathBuf],
+    ) -> Result<(), ApfsStorageError> {
         Ok(())
     }
 
