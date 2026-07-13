@@ -33,6 +33,7 @@ import {
 } from '@smoothbricks/arrow-builder';
 import { checkCapacityTuning } from './capacityTuning.js';
 import type { OpMetadata } from './opContext/opTypes.js';
+import type { EagerColumnDescriptor } from './physicalLayoutPlan.js';
 import { LogSchema } from './schema/LogSchema.js';
 import type { MessageLayoutFamily } from './runtimeHint.js';
 import { textEncoder } from './spanBufferHelpers.js';
@@ -146,6 +147,7 @@ export interface SpanBufferConstructor<T extends LogSchema = LogSchema> {
   readonly schema: T;
   readonly stats: SpanBufferStats;
   readonly messageLayoutFamily: MessageLayoutFamily;
+  readonly eagerColumns: EagerColumnDescriptor;
 }
 //#endregion smoo/lmao!n/spanbuffer-layout.class-signature
 
@@ -200,10 +202,12 @@ function createSpanBufferConstructor<T extends LogSchema>(
   schema: T,
   messageLayoutFamily: MessageLayoutFamily,
   generatedClass: GeneratedSpanBufferClass<T>,
+  eagerColumns: EagerColumnDescriptor,
 ): SpanBufferConstructor<T> {
   return Object.assign(generatedClass, {
     schema,
     messageLayoutFamily,
+    eagerColumns,
     stats: {
       capacity: DEFAULT_BUFFER_CAPACITY,
       totalWrites: 0,
@@ -216,8 +220,13 @@ function createSpanBufferConstructor<T extends LogSchema>(
  * Cache for generated SpanBuffer classes per schema.
  * Key is the schema object reference (WeakMap for GC).
  */
-const spanBufferClassCache = new WeakMap<LogSchema, Map<MessageLayoutFamily, SpanBufferConstructor>>();
+const spanBufferClassCache = new WeakMap<LogSchema, Map<string, SpanBufferConstructor>>();
 const staticStorageSchemas = new WeakMap<LogSchema, LogSchema>();
+const EMPTY_EAGER_COLUMNS: EagerColumnDescriptor = Object.freeze({
+  names: Object.freeze([]),
+  words: Object.freeze([]),
+  key: '',
+});
 
 function getStorageSchema(schema: LogSchema, messageLayoutFamily: MessageLayoutFamily): LogSchema {
   if (messageLayoutFamily !== 'static-only') return schema;
@@ -249,9 +258,11 @@ function getStorageSchema(schema: LogSchema, messageLayoutFamily: MessageLayoutF
 export function getSpanBufferClass<T extends LogSchema>(
   schema: T,
   messageLayoutFamily: MessageLayoutFamily = 'mixed',
+  eagerColumns: EagerColumnDescriptor = EMPTY_EAGER_COLUMNS,
 ): SpanBufferConstructor<T> {
+  const cacheKey = `${messageLayoutFamily}:${eagerColumns.key}`;
   let familyClasses = spanBufferClassCache.get(schema);
-  const cached = familyClasses?.get(messageLayoutFamily);
+  const cached = familyClasses?.get(cacheKey);
   if (isSpanBufferConstructorForSchema(cached, schema) && cached.messageLayoutFamily === messageLayoutFamily) {
     return cached;
   }
@@ -284,6 +295,7 @@ export function getSpanBufferClass<T extends LogSchema>(
 
   // Define extension for arrow-builder's class generator
   const extension: ColumnBufferExtension = {
+    preallocatedColumns: eagerColumns.names,
     constructorParams: 'stats, parent, isChained, callsiteMetadata, opMetadata, traceRoot, vocabularyGeneration',
     dependencies: {
       writeThreadIdToUint64Array,
@@ -514,11 +526,11 @@ export function getSpanBufferClass<T extends LogSchema>(
 
   // Add static properties to the generated class
   // These are shared across all instances from the same defineOpContext
-  const SpanBufferClass = createSpanBufferConstructor(schema, messageLayoutFamily, generatedClass);
+  const SpanBufferClass = createSpanBufferConstructor(schema, messageLayoutFamily, generatedClass, eagerColumns);
 
   // Cache for future use
   familyClasses ??= new Map();
-  familyClasses.set(messageLayoutFamily, SpanBufferClass);
+  familyClasses.set(cacheKey, SpanBufferClass);
   spanBufferClassCache.set(schema, familyClasses);
 
   return SpanBufferClass;

@@ -43,6 +43,7 @@ import type { WasmLayoutTemplate } from './wasm/wasmPhysicalLayout.js';
 // two levels of the 01j Context Hierarchy.
 export interface OpCompileMetadata {
   readonly runtimeHint: number;
+  readonly eagerColumns?: readonly string[];
 }
 
 
@@ -66,6 +67,7 @@ export interface OpMetadata {
   readonly git_sha_entry: PreEncodedEntry;
   /** Startup-resolved physical layout used by span setup; absent only on raw fallback metadata. */
   readonly _physicalLayoutPlan?: {
+    readonly eagerColumns: import('./physicalLayoutPlan.js').EagerColumnDescriptor;
     readonly vocabularyGeneration: VocabularyGeneration;
     readonly wasmLayout: WasmLayoutTemplate;
   };
@@ -118,6 +120,7 @@ export class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
     remapDescriptor?: RemapDescriptor,
     opContextBinding?: OpContextBinding<Ctx['logSchema'], Ctx['flags'], Ctx['deps'], Ctx['userCtx']>,
     runtimeHint = 0,
+    eagerColumns: readonly string[] = [],
   ) {
     const userContextKeys = Object.keys(opContextBinding?.ctxDefaults ?? {}).sort();
     const layoutKey = userContextKeys.join('\u0000');
@@ -135,6 +138,7 @@ export class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
       remapDescriptor,
       'strategy-selected',
       layoutKey,
+      eagerColumns,
     );
     const resolvedMetadata = Object.freeze({ ...metadata, _physicalLayoutPlan: physicalLayoutPlan });
     this.callsitePlan = sealCallsitePlan(physicalLayoutPlan, resolvedMetadata);

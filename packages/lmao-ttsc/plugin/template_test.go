@@ -16,8 +16,37 @@ import (
 const templateFixtureDeclarations = `
 export interface OpCompileMetadata {
   readonly runtimeHint: number;
+  readonly eagerColumns?: readonly string[];
 }
-export type FluentLogEntry<T extends Record<string, unknown> = { jobId: string; elapsedMs: number; attempt: number; success: boolean; operation: 'READ' | 'WRITE' }> = { line(value: number): FluentLogEntry<T> } & { [K in keyof T]: (value: T[K]) => FluentLogEntry<T> };
+export interface UserAttributeFields {
+  alpha: string;
+  beta: number;
+  conditional: string;
+  duplicate: string;
+  ffBoth: string;
+  ffConditional: string;
+  resultField: string;
+  tagField: string;
+  withField: string;
+  f00: number; f01: number; f02: number; f03: number; f04: number; f05: number; f06: number; f07: number;
+  f08: number; f09: number; f10: number; f11: number; f12: number; f13: number; f14: number; f15: number;
+  f16: number; f17: number; f18: number; f19: number; f20: number; f21: number; f22: number; f23: number;
+  f24: number; f25: number; f26: number; f27: number; f28: number; f29: number; f30: number; f31: number;
+  f32: number; f33: number; f34: number; f35: number; f36: number; f37: number; f38: number; f39: number;
+  jobId: string;
+  elapsedMs: number;
+  attempt: number;
+  success: boolean;
+  operation: 'READ' | 'WRITE';
+}
+export type FluentLogEntry<T extends Record<string, unknown> = UserAttributeFields> = { line(value: number): FluentLogEntry<T> } & { [K in keyof T]: (value: T[K]) => FluentLogEntry<T> };
+export type GeneratedTagWriter<T extends Record<string, unknown> = UserAttributeFields> = { with(values: Partial<T>): GeneratedTagWriter<T> } & { [K in keyof T]: (value: T[K]) => GeneratedTagWriter<T> };
+export type FluentResult<T extends Record<string, unknown> = UserAttributeFields> = {
+  readonly _buffer?: unknown;
+  line(value: number): FluentResult<T>;
+  message(value: string): FluentResult<T>;
+  with(values: Partial<T>): FluentResult<T>;
+} & { [K in keyof T]: (value: T[K]) => FluentResult<T> };
 export class SpanLogger {
   info(message: string, fields?: Record<string, unknown>): FluentLogEntry;
   debug(message: string, fields?: Record<string, unknown>): FluentLogEntry;
@@ -32,7 +61,9 @@ export class SpanLogger {
 export class SpanContext {
   readonly _buffer: { constructor: unknown; _opMetadata: unknown };
   readonly log: SpanLogger;
-  ok(value: unknown): unknown;
+  readonly tag: GeneratedTagWriter;
+  ok(value: unknown): FluentResult;
+  err(value: unknown): FluentResult;
   ff(name: string): boolean;
   span(name: string, op: Op): Promise<unknown>;
 }

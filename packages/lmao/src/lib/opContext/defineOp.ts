@@ -61,10 +61,19 @@ const DEFAULT_COMPILE_METADATA: OpCompileMetadata = Object.freeze({
   runtimeHint: 0,
 });
 
+const EMPTY_EAGER_COLUMNS: readonly string[] = Object.freeze([]);
+
 
 function normalizeCompileMetadata(compileMetadata?: OpCompileMetadata): OpCompileMetadata {
   if (compileMetadata === undefined) return DEFAULT_COMPILE_METADATA;
-  return Object.freeze({ runtimeHint: compileMetadata.runtimeHint });
+  const eagerColumns = compileMetadata.eagerColumns;
+  return Object.freeze({
+    runtimeHint: compileMetadata.runtimeHint,
+    eagerColumns:
+      eagerColumns === undefined || eagerColumns.length === 0
+        ? EMPTY_EAGER_COLUMNS
+        : Object.freeze([...new Set(eagerColumns)]),
+  });
 }
 
 // =============================================================================
@@ -234,6 +243,7 @@ export function createDefineOp<Ctx extends OpContext>(
       undefined,
       factoryConfig.opContextBinding,
       normalizedCompileMetadata.runtimeHint,
+      normalizedCompileMetadata.eagerColumns ?? EMPTY_EAGER_COLUMNS,
     );
   };
 }
@@ -313,6 +323,7 @@ export function createDefineOps<Ctx extends OpContext>(
             def.callsitePlan.remapDescriptor ?? undefined,
             def._opContextBinding,
             normalizedCompileMetadata.runtimeHint,
+            normalizedCompileMetadata.eagerColumns ?? EMPTY_EAGER_COLUMNS,
           );
         }
       } else {

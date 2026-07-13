@@ -102,9 +102,6 @@ func (t *fileTransformer) findResultInline(call *shimast.CallExpression) (*resul
 					delete(schema, sys)
 				}
 			}
-			// Mark the kept ok/err call processed so the §6 chain-line pass
-			// does not ALSO append .line() to it inside our block.
-			t.processed[current] = true
 			in := &resultInline{okCall: current.AsNode(), schema: schema}
 			hasLine := false
 			for _, l := range links {

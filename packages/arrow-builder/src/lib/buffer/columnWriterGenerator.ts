@@ -28,6 +28,9 @@ import type { AnyColumnBuffer } from './types.js';
  * code directly into the generated class for optimal performance.
  */
 export interface ColumnWriterExtension {
+  /** Runtime-selected nullable columns whose backing lanes already exist on the buffer. */
+  preallocatedColumns?: readonly string[];
+
   /**
    * Additional code to add to the constructor (after _buffer and _writeIndex are set).
    * Has access to `this`, `buffer`, and any constructorParams.
@@ -125,13 +128,48 @@ export type ColumnWriter<T extends ColumnSchema = ColumnSchema, TBuffer extends 
 /**
  * Get the setter method body for a schema field type
  */
-function getSetterBody(schema: ColumnSchema, fieldName: string): string {
+function getSetterBody(schema: ColumnSchema, fieldName: string, isPreallocated: boolean): string {
   const fieldSchema = schema.fields[fieldName];
   const schemaWithMetadata = fieldSchema as SchemaWithMetadata;
   const schemaType = schemaWithMetadata?.__schema_type;
   const isEager = schemaWithMetadata?.__eager === true;
 
   const columnName = fieldName;
+  if (isPreallocated) {
+    if (schemaType === 'boolean') {
+      return `
+    const idx = this._writeIndex;
+    const byteIdx = idx >>> 3;
+    const bitMask = 1 << (idx & 7);
+    this._buffer._${columnName}_nulls[byteIdx] |= bitMask;
+    if (value) this._buffer._${columnName}_values[byteIdx] |= bitMask;
+    else this._buffer._${columnName}_values[byteIdx] &= ~bitMask;
+    return this;`;
+    }
+    if (schemaType === 'enum') {
+      return `
+    const idx = this._writeIndex;
+    const enumIndex = this._${columnName}_enumLookup.get(value);
+    if (enumIndex === undefined) throw new Error(\`Invalid enum value "\${value}" for field "${columnName}". Valid values: \${this._buffer.${columnName}_enumValues.join(', ')}\`);
+    this._buffer._${columnName}_nulls[idx >>> 3] |= (1 << (idx & 7));
+    this._buffer._${columnName}_values[idx] = enumIndex;
+    return this;`;
+    }
+    if (schemaType === 'binary') {
+      return `
+    const idx = this._writeIndex;
+    if (typeof value === 'object' && value !== null && !(value instanceof Uint8Array)) Object.freeze(value);
+    this._buffer._${columnName}_nulls[idx >>> 3] |= (1 << (idx & 7));
+    this._buffer._${columnName}_values[idx] = value;
+    return this;`;
+    }
+    return `
+    const idx = this._writeIndex;
+    this._buffer._${columnName}_nulls[idx >>> 3] |= (1 << (idx & 7));
+    this._buffer._${columnName}_values[idx] = value;
+    return this;`;
+  }
+
 
   if (schemaType === 'boolean') {
     // Bit-packed boolean: set bit in values bitmap
@@ -242,12 +280,15 @@ export function generateColumnWriterClass(
 ): string {
   // Get field names from ColumnSchema.fieldNames
   const schemaFields = schema._columnNames;
+  const preallocatedColumns = new Set(extension?.preallocatedColumns ?? []);
 
   // Generate setter methods for each schema field
   const setterMethods: string[] = [];
 
   for (const fieldName of schemaFields) {
-    const setterBody = getSetterBody(schema, fieldName);
+    const field = schema.fields[fieldName];
+    const isSchemaEager = typeof field === 'object' && field !== null && Reflect.get(field, '__eager') === true;
+    const setterBody = getSetterBody(schema, fieldName, !isSchemaEager && preallocatedColumns.has(fieldName));
     setterMethods.push(`    ${fieldName}(value) {${setterBody}
     }`);
   }
