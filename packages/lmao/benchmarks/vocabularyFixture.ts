@@ -1,8 +1,5 @@
 import { createHash } from 'node:crypto';
-import {
-  registerVocabularyFragment,
-  type VocabularyFragment,
-} from '../src/lib/vocabularyRegistry.js';
+import { registerVocabularyFragment, type VocabularyFragment } from '../src/lib/vocabularyRegistry.js';
 
 const encoder = new TextEncoder();
 
@@ -25,9 +22,7 @@ export function benchmarkVocabularyStableId(text: string, kindTag = 1): number {
   const record = encodeLogRecord(text);
   const digest = createHash('sha256').update(Uint8Array.of(kindTag)).update(record).digest();
   const stableId =
-    (valueAt(digest, 0, 'digest') << 16) |
-    (valueAt(digest, 1, 'digest') << 8) |
-    valueAt(digest, 2, 'digest');
+    (valueAt(digest, 0, 'digest') << 16) | (valueAt(digest, 1, 'digest') << 8) | valueAt(digest, 2, 'digest');
   if (stableId === 0) throw new Error('Vocabulary record produced reserved stable ID zero');
   return stableId;
 }
@@ -77,10 +72,7 @@ function vocabularyContentHash(fragment: Omit<VocabularyFragment, 'contentHash'>
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-export function createBenchmarkVocabularyFragment(
-  texts: readonly string[],
-  kindTag = 1,
-): VocabularyFragment {
+export function createBenchmarkVocabularyFragment(texts: readonly string[], kindTag = 1): VocabularyFragment {
   if (kindTag !== 1 && kindTag !== 2) throw new RangeError(`Unsupported vocabulary kind tag ${kindTag}`);
   const records = texts.map(encodeLogRecord);
   const offsets = new Int32Array(records.length + 1);

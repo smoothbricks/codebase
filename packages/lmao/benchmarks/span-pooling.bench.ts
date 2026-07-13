@@ -1,8 +1,8 @@
 import { bench, do_not_optimize, group, run, summary } from 'mitata';
 import { defineOpContext } from '../src/lib/defineOpContext.js';
 import { JsBufferStrategy } from '../src/lib/JsBufferStrategy.js';
-import type { CallsitePlan } from '../src/lib/physicalLayoutPlan.js';
 import type { OpContextOf } from '../src/lib/opContext/types.js';
+import type { CallsitePlan } from '../src/lib/physicalLayoutPlan.js';
 import {
   RUNTIME_HINT_ANALYZED_VALID,
   RUNTIME_HINT_LOG,
@@ -14,9 +14,9 @@ import { defineLogSchema } from '../src/lib/schema/defineLogSchema.js';
 import { ENTRY_TYPE_INFO } from '../src/lib/schema/systemSchema.js';
 import { createTraceId } from '../src/lib/traceId.js';
 import { createTraceRoot } from '../src/lib/traceRoot.node.js';
-import { iterateSpanTree } from '../src/lib/traceTopology.js';
 import { TestTracer } from '../src/lib/tracers/TestTracer.js';
-import type { AnySpanBuffer, SpanBuffer } from '../src/lib/types.js';
+import { iterateSpanTree } from '../src/lib/traceTopology.js';
+import type { SpanBuffer } from '../src/lib/types.js';
 
 type WorkloadName = 'steady' | 'burst' | 'overflow' | 'idle-after-burst';
 
@@ -121,19 +121,14 @@ function mix(checksum: number, value: number): number {
 }
 
 function planForCapacity(capacity: number): CallsitePlan<typeof RUNTIME_SCHEMA, RuntimeContext> {
-  return CONTEXT.defineOp(
-    `span-pooling-capacity-${capacity}`,
-    (ctx) => ctx.ok(null),
-    undefined,
-    {
-      runtimeHint:
-        RUNTIME_HINT_ANALYZED_VALID |
-        RUNTIME_HINT_LOG |
-        RUNTIME_HINT_RESULT |
-        RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY |
-        capacity,
-    },
-  ).callsitePlan;
+  return CONTEXT.defineOp(`span-pooling-capacity-${capacity}`, (ctx) => ctx.ok(null), undefined, {
+    runtimeHint:
+      RUNTIME_HINT_ANALYZED_VALID |
+      RUNTIME_HINT_LOG |
+      RUNTIME_HINT_RESULT |
+      RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY |
+      capacity,
+  }).callsitePlan;
 }
 
 function writeRows(
@@ -185,10 +180,7 @@ function buildRoot(
   return { root, checksum, segments };
 }
 
-function runWorkload(
-  plan: CallsitePlan<typeof RUNTIME_SCHEMA, RuntimeContext>,
-  workload: WorkloadSpec,
-): RunOutcome {
+function runWorkload(plan: CallsitePlan<typeof RUNTIME_SCHEMA, RuntimeContext>, workload: WorkloadSpec): RunOutcome {
   let checksum = 2_166_136_261;
   let roots = 0;
   let physicalSegments = 0;
@@ -236,7 +228,8 @@ function assertPreflight(
   workload: WorkloadSpec,
 ): RunOutcome {
   if (plan.messageLayoutFamily !== 'dynamic-only') throw new Error('Span pooling plan chose the wrong message family');
-  if (plan.poolRef !== null) throw new Error('Current PhysicalLayoutPlan unexpectedly retained a production buffer pool');
+  if (plan.poolRef !== null)
+    throw new Error('Current PhysicalLayoutPlan unexpectedly retained a production buffer pool');
   const first = runWorkload(plan, workload);
   const second = runWorkload(plan, workload);
   if (
