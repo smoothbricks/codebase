@@ -16,7 +16,12 @@ import type { Table } from '@uwdata/flechette';
 import { bench, group, run, summary } from 'mitata';
 import { walkSpanTree } from '../src/lib/traceTopology.js';
 import type { SpanLoggerImpl } from '../src/lib/codegen/spanLoggerGenerator.js';
-import { convertSpanTreeToArrowTable, convertToArrowTable } from '../src/lib/convertToArrow.js';
+import {
+  convertSpanTreeToArrowTable,
+  convertSpanTreeToLeasedArrowTable,
+  convertToArrowTable,
+  convertToLeasedArrowTable,
+} from '../src/lib/convertToArrow.js';
 import { getVocabularyDictionaryPrefix } from '../src/lib/arrow/vocabularyDictionary.js';
 import { defineOpContext } from '../src/lib/defineOpContext.js';
 import { JsBufferStrategy } from '../src/lib/JsBufferStrategy.js';
@@ -203,6 +208,18 @@ function currentConversion(scenario: Scenario): VariantOutput {
       ? convertSpanTreeToArrowTable(scenario.root)
       : convertToArrowTable(scenario.root);
   return { logical: logicalFromTable(table), counters: {} };
+}
+
+function leasedConversion(scenario: Scenario): VariantOutput {
+  const lease =
+    scenario.topology === 'depth-3-tree'
+      ? convertSpanTreeToLeasedArrowTable(scenario.root)
+      : convertToLeasedArrowTable(scenario.root);
+  try {
+    return { logical: logicalFromTable(lease.table), counters: {} };
+  } finally {
+    lease.release();
+  }
 }
 
 function modelLogical(
@@ -495,6 +512,11 @@ function preflightScenario(scenario: Scenario): Preflight {
       ? convertSpanTreeToArrowTable(scenario.root)
       : convertToArrowTable(scenario.root);
   assertMessageArrow(scenario, table, expectedMessages);
+  const leased = leasedConversion(scenario).logical;
+  const owned = logicalFromTable(table);
+  if (JSON.stringify(leased) !== JSON.stringify(owned)) {
+    throw new Error(`${scenario.name}: leased Arrow schema/null/topology semantics differ from owned conversion`);
+  }
   const currentTwoPass = currentTwoPassModel(scenario, true);
   const prebuiltStatic = prebuiltStaticDictionaryModel(scenario, true);
   const directNumeric = directNumericStaticSuffixModel(scenario);
@@ -534,6 +556,9 @@ function registerScenario(scenario: Scenario, preflight: Preflight): void {
     bench(counterLabel('current/production-arrow-conversion', preflight.counters[0]!), () =>
       currentConversion(scenario),
     ).baseline(true);
+    bench('current/production-leased-arrow [copies=non-borrowable-columns, release=per-iteration]', () =>
+      leasedConversion(scenario),
+    );
     bench(counterLabel('model/current-two-pass-resolution', preflight.counters[1]!), () =>
       currentTwoPassModel(scenario),
     );
