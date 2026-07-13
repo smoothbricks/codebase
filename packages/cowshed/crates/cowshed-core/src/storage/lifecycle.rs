@@ -195,8 +195,8 @@ pub enum Conflict {
     #[error("authoritative fact {index} changed")]
     Stale {
         index: usize,
-        expected: ExpectedState,
-        actual: ObservedState,
+        expected: Box<ExpectedState>,
+        actual: Box<ObservedState>,
     },
 }
 
@@ -258,8 +258,8 @@ pub fn revalidate(expected: &[ExpectedState], actual: &[ObservedState]) -> Resul
         if !matches {
             return Err(Conflict::Stale {
                 index,
-                expected: expected.clone(),
-                actual: actual.clone(),
+                expected: Box::new(expected.clone()),
+                actual: Box::new(actual.clone()),
             });
         }
     }
