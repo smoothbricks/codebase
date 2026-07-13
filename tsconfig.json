@@ -10,9 +10,6 @@
       "path": "./packages/lmao"
     },
     {
-      "path": "./packages/lmao-transformer"
-    },
-    {
       "path": "./packages/duration"
     },
     {
@@ -47,6 +44,9 @@
     },
     {
       "path": "./packages/cowshed"
+    },
+    {
+      "path": "./packages/lmao-ttsc"
     }
   ]
 }
