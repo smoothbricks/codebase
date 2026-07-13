@@ -15,15 +15,6 @@
       "!{projectRoot}/**/*.test.*",
       "!{projectRoot}/**/*.spec.*"
     ],
-    "vocabularyArtifacts": [
-      "{workspaceRoot}/lmao.vocabulary.config.json",
-      "{workspaceRoot}/lmao.vocabulary.json",
-      "{workspaceRoot}/tooling/lmao-vocabulary.mjs",
-      "{workspaceRoot}/packages/lmao/src/generated/vocabulary.ts",
-      "{workspaceRoot}/packages/lmao-rs/crates/lmao-arrow/src/generated/vocabulary.rs",
-      "{workspaceRoot}/packages/lmao-ttsc/plugin/**/*.go",
-      "{workspaceRoot}/packages/lmao-ttsc/scripts/sync-vocabulary.mjs"
-    ],
     "sharedGlobals": ["{workspaceRoot}/.github/workflows/ci.yml"]
   },
   "targetDefaults": {
