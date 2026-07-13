@@ -33,6 +33,15 @@ type SpanBuffer = import('./types.js').AnySpanBuffer;
  */
 export type RemappedViewConstructor = new (buffer: SpanBuffer) => SpanBuffer;
 
+/** A remapped output column and its schema. */
+export type RemappedColumn = readonly [outputName: string, schema: unknown];
+
+/** Immutable output-to-source metadata reserved by a PhysicalLayoutPlan. */
+export interface RemapDescriptor {
+  readonly sourceNames: Readonly<Record<string, string>>;
+  readonly columns: readonly RemappedColumn[];
+}
+
 /**
  * LogBinding - Everything needed for a group of ops to write logs.
  *
@@ -64,4 +73,7 @@ export interface LogBinding<T extends LogSchema = LogSchema> {
 
   /** Optional RemappedBufferView class for prefixed/remapped buffers */
   readonly remappedViewClass?: RemappedViewConstructor;
+
+  /** Immutable cold-path remap binding owned by a physical layout plan. */
+  readonly remapDescriptor?: RemapDescriptor;
 }
