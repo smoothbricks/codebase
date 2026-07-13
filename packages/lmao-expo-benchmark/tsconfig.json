@@ -1,0 +1,21 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "plugins": [
+      {
+        "transform": "@smoothbricks/lmao-ttsc/ttsc-plugin"
+      }
+    ]
+  },
+  "include": ["App.tsx", "index.ts", "src/**/*.ts", "../lmao/benchmarks/plugin-scenario/platform.ts"],
+  "references": [
+    {
+      "path": "../lmao-ttsc"
+    },
+    {
+      "path": "../lmao"
+    }
+  ]
+}
