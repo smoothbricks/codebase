@@ -161,8 +161,8 @@ pub struct JobHandle { /* workspace capability + JobId */ }
 impl JobHandle {
     pub fn id(&self) -> JobId;
     pub async fn status(&self) -> Result<JobInfo, CowshedError>;
-    pub async fn logs(&self, stream: Stream, follow: bool)
-        -> Result<impl futures::Stream<Item = Bytes>, CowshedError>; // raw bytes from backing file
+    pub async fn logs(&self, stream: JobStream, follow: bool)
+        -> Result<JobByteStream, CowshedError>; // `next()` yields raw `Bytes` from the backing file
     pub async fn attach(&self) -> Result<JobAttachment, CowshedError>;
     pub async fn detach(&self) -> Result<(), CowshedError>;          // job continues
     pub async fn wait(&self) -> Result<JobInfo, CowshedError>;
@@ -170,9 +170,12 @@ impl JobHandle {
 }
 
 /// A live attachment is only a view over one durable job's raw backing streams.
-pub struct JobAttachment { /* stdin sink + independent stdout/stderr byte streams */ }
+pub struct JobAttachment { /* acknowledged stdin sink + independent JobByteStream stdout/stderr */ }
 impl JobAttachment {
-    pub async fn detach(self) -> Result<(), CowshedError>; // closes the client view; job continues
+    pub fn stdout(&mut self) -> &mut JobByteStream;
+    pub fn stderr(&mut self) -> &mut JobByteStream;
+    pub async fn write(&self, bytes: Bytes) -> Result<(), CowshedError>;
+    pub async fn detach(self) -> Result<(), CowshedError>; // closes this view; the job continues
 }
 
 pub struct GrantSet {
@@ -385,15 +388,17 @@ documented lower/camel-case strings, and every optional field is omitted rather 
   `"info" | "warning" | "error"`. `GcReport = { examined, reclaimed, retainedPinned, freedBytes, dryRun }`.
 - `JobId` is a positive integer no greater than `2^53-1`.
   `JobInfo = { repoId, workspaceIncarnation, jobId, state, pid?, grantRevision, argv, cwd, started, durationMs?, exit?, stdout, stderr, trace, outputLimit?, stdin }`.
-  `started` is a full RFC3339 string: `Z` and numeric offsets are accepted, including the RFC3339 leap-second value
-  `:60`; calendar, clock, fraction, and offset ranges are validated. `exit` is the discriminated union
-  `{kind:"exited",code}` or `{kind:"signaled",signal,coreDumped}`; it is absent before a process result exists.
-  `outputLimit` is present iff `state == "outputLimit"`. Both serialization and deserialization enforce these state /
-  duration / exit / output-limit invariants. `StreamInfo` contains only `{path,bytes,summary}` and never raw output
-  bytes.
+  `started` is a full RFC3339 string: `Z` and numeric offsets are accepted. The leap-second value `:60` is accepted only
+  at `23:59:60` on June 30 or December 31; arbitrary dates/minutes reject it. Calendar, clock, fraction, and offset
+  ranges are validated. `exit` is the discriminated union `{kind:"exited",code}` or
+  `{kind:"signaled",signal,coreDumped}`; it is absent before a process result exists. `outputLimit` is present iff
+  `state == "outputLimit"`. Both serialization and deserialization enforce these state / duration / exit / output-limit
+  invariants. `StreamInfo` contains only `{path,bytes,summary}` and never raw output bytes.
 - `StdinInfo = { kind, bytes, workspacePath?, complete }`; kind is `"empty" | "inline" | "stream" | "workspaceFile"`.
   Every `cwd`, stream path, and workspace stdin path uses the validated relative `WorkspacePath` domain type: no root,
-  empty component, `.`/`..`, prefix, NUL, or symlink-following open.
+  empty component, `.`/`..`, prefix, NUL, or symlink-following open. Public capability methods convert non-UTF8 host
+  paths into typed `CowshedError::Usage`; they never pass a `Path` to `json!` or panic while constructing a controller
+  request.
 - `ExecRecord` repeats the durable `(repoId,workspaceIncarnation,jobId)` key and the terminal job fields
   `{state,argv,cwd,envHash,grantRevision,trace,started,durationMs,exit?,stdout,stderr,stdin,outputLimit?}`.
 - `RevisionTarget` projects as an exact one-key object `{branch}`, `{ref}`, or `{oid}` and rejects ambiguous/multi-key
@@ -450,7 +455,11 @@ pub struct ExecRecord {
     pub stdin: StdinInfo,
     pub output_limit: Option<OutputLimitInfo>,
 }
+
 ```
+
+`ExecRecord` is terminal-only. Its custom serializer and deserializer both reject queued/running states, mismatched exit
+kinds, and any `outputLimit` presence that disagrees with the state; adapters cannot persist an invalid record.
 
 Every foreground and background submission is the same durable job: attachment is a client state, not a second exec
 kind. The allocator commits `JobId` before spawn, so even a pre-spawn failure has a queryable terminal `JobInfo`. Raw
@@ -493,7 +502,9 @@ never panic or hide an unstructured `anyhow::Error` inside the public value.
 ## cowshed-napi (`@smoothbricks/cowshed`)
 
 napi-rs, async (tokio runtime owned by the addon), Promise-returning. Names follow JS conventions; semantics are 1:1
-with cowshed-core.
+with cowshed-core. The exception is `ErrorCode`: its serialized `code` value is the global kebab-case taxonomy token in
+every adapter (`not-found`, `environment-missing`, `sandbox-denied`). JS class/method/property names may be camelCase;
+error code values never are.
 
 The authority split holds across the NAPI boundary too — `Project` is read-only discovery, `Coordinator` is the only
 mutation surface, `WorkspaceHandle` is the non-escalating worker capability:
