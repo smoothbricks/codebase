@@ -355,6 +355,14 @@ pub enum RestoreFailpoint {
     AfterCanonicalSidecarRename = 7,
     CanonicalParentFsyncFailure = 8,
     PersistentCanonicalParentFsyncFailure = 9,
+    AfterCanonicalCompanionRename = 11,
+    AfterCanonicalParentFsync = 12,
+    AfterRestoreImageSwap = 13,
+    AfterRestoreUndoImageRename = 14,
+    AfterRestoreCanonicalParentFsync = 15,
+    AfterRestoreUndoParentFsync = 16,
+    AfterStagedMetadataRemoval = 17,
+    AfterRestoreMetadataParentFsync = 18,
 }
 
 fn directory_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
@@ -687,7 +695,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 match failpoint {
                     RestoreFailpoint::Disabled => "disabled",
                     RestoreFailpoint::AfterUndoSidecar => "undo sidecar",
-                    RestoreFailpoint::AfterImageSwap => "image swap",
+                    RestoreFailpoint::AfterImageSwap => "image and CA companion swap",
                     RestoreFailpoint::AfterUndoRename => "undo rename",
                     RestoreFailpoint::AfterMetadataPublish => "metadata publish",
                     RestoreFailpoint::AfterMetadataFsync => "metadata fsync",
@@ -703,6 +711,26 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     }
                     RestoreFailpoint::PersistentCanonicalParentFsyncFailure => {
                         "persistent canonical parent fsync"
+                    }
+                    RestoreFailpoint::AfterCanonicalCompanionRename => {
+                        "canonical CA companion rename"
+                    }
+                    RestoreFailpoint::AfterCanonicalParentFsync => "canonical parent fsync",
+                    RestoreFailpoint::AfterRestoreImageSwap => "restore image swap",
+                    RestoreFailpoint::AfterRestoreUndoImageRename => {
+                        "restore undo image rename"
+                    }
+                    RestoreFailpoint::AfterRestoreCanonicalParentFsync => {
+                        "restore canonical parent fsync"
+                    }
+                    RestoreFailpoint::AfterRestoreUndoParentFsync => {
+                        "restore undo parent fsync"
+                    }
+                    RestoreFailpoint::AfterStagedMetadataRemoval => {
+                        "staged restore metadata removal"
+                    }
+                    RestoreFailpoint::AfterRestoreMetadataParentFsync => {
+                        "restore metadata parent fsync"
                     }
                 }
             )))
@@ -853,6 +881,54 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         fs::rename(&source, &destination)
             .map_err(|error| io_error("rename detached metadata", &source, error))?;
         sync_parent!(&destination)
+    }
+
+    fn recovery_companion(
+        &self,
+        image: &Path,
+        layout: &'static str,
+    ) -> Result<PathBuf, ApfsStorageError> {
+        let companion = companion_path(image);
+        self.verify_controller_path(&companion)?;
+        let metadata = match fs::symlink_metadata(&companion) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ApfsStorageError::MarkerMismatch(format!(
+                    "{layout} is missing its CA companion: image={}, companion={}",
+                    image.display(),
+                    companion.display()
+                )));
+            }
+            Err(error) => {
+                return Err(io_error("inspect recovery CA companion", &companion, error));
+            }
+        };
+        if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err(ApfsStorageError::MarkerMismatch(format!(
+                "{layout} has an invalid CA companion: image={}, companion={}",
+                image.display(),
+                companion.display()
+            )));
+        }
+        Ok(companion)
+    }
+
+    fn companions_match(left: &Path, right: &Path) -> Result<bool, ApfsStorageError> {
+        let left_metadata = fs::symlink_metadata(left)
+            .map_err(|error| io_error("inspect recovery CA identity", left, error))?;
+        let right_metadata = fs::symlink_metadata(right)
+            .map_err(|error| io_error("inspect recovery CA identity", right, error))?;
+        Ok(left_metadata.dev() == right_metadata.dev()
+            && left_metadata.ino() == right_metadata.ino())
+    }
+
+    fn remove_companion(image: &Path) -> Result<(), ApfsStorageError> {
+        let companion = companion_path(image);
+        match fs::remove_file(&companion) {
+            Ok(()) => sync_parent!(&companion),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_error("remove CA companion", &companion, error)),
+        }
     }
 
     fn ensure_adopt_mountpoint(&self, mount_point: &Path) -> Result<(), ApfsStorageError> {
@@ -1776,8 +1852,21 @@ where
                 ),
             )));
         }
+        let canonical_sidecar = sidecar_path(canonical);
+        if canonical_sidecar.exists() {
+            return Err(PublicationError::forward_only(ApfsStorageError::Host(
+                format!(
+                    "canonical metadata already exists: {}",
+                    canonical_sidecar.display()
+                ),
+            )));
+        }
         let publication = (|| {
-            Self::rename_sidecar(staged, canonical)?;
+            let staged_sidecar = sidecar_path(staged);
+            let canonical_sidecar = sidecar_path(canonical);
+            fs::rename(&staged_sidecar, &canonical_sidecar).map_err(|error| {
+                io_error("publish canonical metadata", &canonical_sidecar, error)
+            })?;
             if self.restore_failpoint.load(AtomicOrdering::SeqCst)
                 == RestoreFailpoint::CanonicalSidecarRollbackFailure as u8
             {
@@ -1786,16 +1875,18 @@ where
                 ));
             }
             self.trip_restore_failpoint(RestoreFailpoint::AfterCanonicalSidecarRename)?;
-            sync_parent!(&sidecar_path(canonical))?;
+            sync_parent!(&canonical_sidecar)?;
             self.trip_restore_failpoint(RestoreFailpoint::AfterMetadataFsync)?;
             fs::rename(&staged_companion, &canonical_companion).map_err(|error| {
                 io_error("publish canonical CA key", &canonical_companion, error)
             })?;
+            self.trip_restore_failpoint(RestoreFailpoint::AfterCanonicalCompanionRename)?;
             fs::rename(staged, canonical)
                 .map_err(|error| io_error("publish canonical image", canonical, error))?;
             self.trip_restore_failpoint(RestoreFailpoint::AfterCanonicalImageRename)?;
             self.trip_restore_failpoint(RestoreFailpoint::CanonicalParentFsyncFailure)?;
-            self.sync_canonical_parent(canonical)
+            self.sync_canonical_parent(canonical)?;
+            self.trip_restore_failpoint(RestoreFailpoint::AfterCanonicalParentFsync)
         })();
         let Err(primary) = publication else {
             return Ok(());
@@ -2100,6 +2191,7 @@ where
             let _ = fs::remove_file(&undo_companion);
             return Err(error);
         }
+        self.trip_restore_failpoint(RestoreFailpoint::AfterRestoreImageSwap)?;
         if let Err(primary) = swap_paths(&canonical_companion, &staged_companion) {
             let rollback = swap_paths(canonical, staged);
             let _ = fs::remove_file(&undo_sidecar);
@@ -2115,11 +2207,14 @@ where
             let _ = fs::remove_file(&undo_companion);
             return super::combine_cleanup("restore swap", primary, rollback);
         }
+        self.trip_restore_failpoint(RestoreFailpoint::AfterRestoreUndoImageRename)?;
         fs::remove_file(&staged_companion)
             .map_err(|error| io_error("remove displaced CA key", &staged_companion, error))?;
         self.trip_restore_failpoint(RestoreFailpoint::AfterUndoRename)?;
         sync_parent!(canonical)?;
-        sync_parent!(undo)
+        self.trip_restore_failpoint(RestoreFailpoint::AfterRestoreCanonicalParentFsync)?;
+        sync_parent!(undo)?;
+        self.trip_restore_failpoint(RestoreFailpoint::AfterRestoreUndoParentFsync)
     }
 
     fn activate_restored_metadata(&self, canonical: &Path) -> Result<(), ApfsStorageError> {
@@ -2160,7 +2255,9 @@ where
         sync_parent!(canonical)?;
         self.trip_restore_failpoint(RestoreFailpoint::AfterMetadataFsync)?;
         Self::remove_sidecar(staged)?;
-        sync_parent!(canonical)
+        self.trip_restore_failpoint(RestoreFailpoint::AfterStagedMetadataRemoval)?;
+        sync_parent!(canonical)?;
+        self.trip_restore_failpoint(RestoreFailpoint::AfterRestoreMetadataParentFsync)
     }
 
     fn rollback_restore(
@@ -2175,9 +2272,26 @@ where
         let canonical_sidecar = sidecar_path(canonical);
         let undo_sidecar = sidecar_path(undo);
         let staged_sidecar = sidecar_path(staged);
+        let canonical_companion =
+            self.recovery_companion(canonical, "restore rollback canonical image")?;
+        let undo_companion = self.recovery_companion(undo, "restore rollback undo image")?;
+        let staged_companion = companion_path(staged);
+        if staged_companion.exists() {
+            return Err(ApfsStorageError::MarkerMismatch(format!(
+                "restore rollback staging CA destination is occupied: canonical={}, undo={}, staged={}, companion={}",
+                canonical.display(),
+                undo.display(),
+                staged.display(),
+                staged_companion.display()
+            )));
+        }
         fs::rename(undo, staged)
             .map_err(|error| io_error("stage failed restore image", staged, error))?;
+        fs::hard_link(&undo_companion, &staged_companion).map_err(|error| {
+            io_error("stage displaced restore CA key", &staged_companion, error)
+        })?;
         swap_paths(canonical, staged)?;
+        swap_paths(&canonical_companion, &staged_companion)?;
         fs::rename(&canonical_sidecar, &staged_sidecar).map_err(|error| {
             io_error("stage failed replacement metadata", &staged_sidecar, error)
         })?;
@@ -2189,6 +2303,9 @@ where
                 .map_err(|error| ApfsStorageError::Host(error.to_string()))?,
         )?;
         Self::remove_sidecar(staged)?;
+        Self::remove_companion(staged)?;
+        fs::remove_file(&undo_companion)
+            .map_err(|error| io_error("remove restore undo CA link", &undo_companion, error))?;
         sync_parent!(canonical)
     }
 
@@ -2412,6 +2529,7 @@ where
                     }
                     let canonical = image_from_sidecar(&canonical_sidecar)?;
                     if canonical.exists() {
+                        self.recovery_companion(&canonical, "published canonical image")?;
                         continue;
                     }
                     let Ok(format) = ImageFormat::from_image_path(&canonical) else {
@@ -2441,6 +2559,7 @@ where
                         continue;
                     };
                     if canonical.exists() {
+                        self.recovery_companion(&canonical, "published canonical image")?;
                         continue;
                     }
                     let staged = project.join(super::STAGING_NAMESPACE).join(format!(
@@ -2449,16 +2568,49 @@ where
                         metadata.workspace_incarnation,
                         format.extension()
                     ));
+                    let staged_companion = companion_path(&staged);
+                    let canonical_companion = companion_path(&canonical);
                     if staged.exists() {
+                        match (staged_companion.exists(), canonical_companion.exists()) {
+                            (true, false) => {
+                                self.recovery_companion(&staged, "staged publication image")?;
+                                fs::rename(&staged_companion, &canonical_companion).map_err(
+                                    |error| {
+                                        io_error(
+                                            "complete canonical CA companion publication",
+                                            &canonical_companion,
+                                            error,
+                                        )
+                                    },
+                                )?;
+                                sync_parent!(&canonical_companion)?;
+                            }
+                            (false, true) => {
+                                self.recovery_companion(
+                                    &canonical,
+                                    "canonical companion before image publication",
+                                )?;
+                            }
+                            (staged_exists, canonical_exists) => {
+                                return Err(ApfsStorageError::MarkerMismatch(format!(
+                                    "canonical publication has contradictory CA companions: staged_image={}, staged_companion={} (exists={staged_exists}), canonical_image={}, canonical_companion={} (exists={canonical_exists})",
+                                    staged.display(),
+                                    staged_companion.display(),
+                                    canonical.display(),
+                                    canonical_companion.display()
+                                )));
+                            }
+                        }
                         let staged_sidecar = sidecar_path(&staged);
                         if staged_sidecar.exists() {
                             let staged_metadata =
                                 DetachedWorkspaceMetadata::read_for_image(&staged)
                                     .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
                             if staged_metadata != metadata {
-                                return Err(ApfsStorageError::Host(format!(
-                                    "staged and canonical metadata disagree during recovery: {}",
-                                    staged.display()
+                                return Err(ApfsStorageError::MarkerMismatch(format!(
+                                    "staged and canonical metadata disagree during recovery: staged={}, canonical={}",
+                                    staged.display(),
+                                    canonical.display()
                                 )));
                             }
                             fs::remove_file(&staged_sidecar).map_err(|error| {
@@ -2473,6 +2625,14 @@ where
                             )
                         })?;
                         sync_parent!(&canonical)?;
+                    } else if canonical_companion.exists() {
+                        return Err(ApfsStorageError::MarkerMismatch(format!(
+                            "canonical metadata and CA companion have no publication image: canonical_image={}, canonical_sidecar={}, canonical_companion={}, staged_image={}",
+                            canonical.display(),
+                            canonical_sidecar.display(),
+                            canonical_companion.display(),
+                            staged.display()
+                        )));
                     } else {
                         fs::remove_file(&canonical_sidecar).map_err(|error| {
                             io_error(
@@ -2540,6 +2700,9 @@ where
                     if metadata.workspace.is_main() {
                         let pre_cowshed = pre_cowshed_path(&config.main_mount);
                         if staged.exists() {
+                            self.recovery_companion(&staged, "staged main publication image")?;
+                        }
+                        if staged.exists() {
                             if !canonical.exists() && pre_cowshed.exists() {
                                 self.ensure_adopt_mountpoint(&config.main_mount)?;
                                 self.publish_image(&staged, &canonical)?;
@@ -2550,9 +2713,14 @@ where
                             self.ensure_adopt_mountpoint(&config.main_mount)?;
                         }
                     } else if staged.exists() {
+                        self.recovery_companion(&staged, "staged session publication image")?;
                         continue;
                     }
                     if canonical.exists() && !sidecar_path(&canonical).exists() {
+                        self.recovery_companion(
+                            &canonical,
+                            "canonical image awaiting metadata recovery",
+                        )?;
                         fs::rename(&path, sidecar_path(&canonical)).map_err(|error| {
                             io_error(
                                 "complete canonical sidecar publication",
@@ -2615,7 +2783,11 @@ where
                     continue;
                 }
                 if !canonical.exists() {
-                    continue;
+                    return Err(ApfsStorageError::MarkerMismatch(format!(
+                        "restore recovery has no canonical image: canonical={}, undo_sidecar={}",
+                        canonical.display(),
+                        undo_sidecar.display()
+                    )));
                 }
                 let staged = storage
                     .project()
@@ -2628,6 +2800,11 @@ where
                         old_metadata.image_format.extension()
                     ));
                 let canonical_sidecar = sidecar_path(&canonical);
+                let canonical_companion =
+                    self.recovery_companion(&canonical, "restore recovery canonical image")?;
+                let undo_companion =
+                    self.recovery_companion(&undo, "restore recovery undo metadata")?;
+                let staged_companion = companion_path(&staged);
                 let canonical_metadata = if canonical_sidecar.exists() {
                     Some(
                         DetachedWorkspaceMetadata::read_for_image(&canonical)
@@ -2640,70 +2817,184 @@ where
                     metadata.workspace_incarnation.as_str() == replacement_incarnation
                 });
                 if published {
+                    if Self::companions_match(&canonical_companion, &undo_companion)? {
+                        return Err(ApfsStorageError::MarkerMismatch(format!(
+                            "published restore pairs replacement image with old CA key: canonical={}, canonical_companion={}, undo_companion={}",
+                            canonical.display(),
+                            canonical_companion.display(),
+                            undo_companion.display()
+                        )));
+                    }
                     if undo.exists() {
                         if staged.exists() {
                             self.backend
                                 .delete_image(&staged, old_metadata.image_format)?;
                         }
                     } else if staged.exists() {
+                        let displaced_companion =
+                            self.recovery_companion(&staged, "restore displaced staged image")?;
+                        if !Self::companions_match(&displaced_companion, &undo_companion)? {
+                            return Err(ApfsStorageError::MarkerMismatch(format!(
+                                "displaced restore image has the wrong CA key: staged={}, staged_companion={}, undo_companion={}",
+                                staged.display(),
+                                displaced_companion.display(),
+                                undo_companion.display()
+                            )));
+                        }
                         fs::rename(&staged, &undo).map_err(|error| {
                             io_error("complete restore undo rename", &undo, error)
                         })?;
+                    } else {
+                        return Err(ApfsStorageError::MarkerMismatch(format!(
+                            "published restore is missing its old image: canonical={}, undo={}, staged={}",
+                            canonical.display(),
+                            undo.display(),
+                            staged.display()
+                        )));
                     }
                     Self::remove_sidecar(&staged)?;
+                    Self::remove_companion(&staged)?;
                     sync_parent!(&canonical)?;
                     continue;
                 }
                 if canonical_metadata.as_ref().is_some_and(|metadata| {
                     metadata.workspace_incarnation != old_metadata.workspace_incarnation
                 }) {
-                    continue;
+                    return Err(ApfsStorageError::MarkerMismatch(format!(
+                        "restore metadata matches neither generation: canonical={}, undo_sidecar={}, staged={}",
+                        canonical.display(),
+                        undo_sidecar.display(),
+                        staged.display()
+                    )));
                 }
 
-                let image_was_published = if undo.exists() {
+                let recovery_mount = storage
+                    .project()
+                    .mount_root
+                    .join(super::STAGING_NAMESPACE)
+                    .join(format!(
+                        "recover-{}-{}",
+                        old_metadata.workspace.as_str(),
+                        replacement_incarnation
+                    ));
+                let incarnation = self.detached_image_incarnation(
+                    &canonical,
+                    old_metadata.image_format,
+                    &recovery_mount,
+                )?;
+                let canonical_is_replacement = if incarnation == replacement_incarnation {
                     true
-                } else if staged.exists() {
-                    let recovery_mount = storage
-                        .project()
-                        .mount_root
-                        .join(super::STAGING_NAMESPACE)
-                        .join(format!(
-                            "recover-{}-{}",
-                            old_metadata.workspace.as_str(),
-                            replacement_incarnation
-                        ));
-                    let incarnation = self.detached_image_incarnation(
-                        &canonical,
-                        old_metadata.image_format,
-                        &recovery_mount,
-                    )?;
-                    if incarnation == replacement_incarnation {
-                        true
-                    } else if incarnation == old_metadata.workspace_incarnation.as_str() {
-                        false
-                    } else {
-                        return Err(ApfsStorageError::Host(format!(
-                            "restore candidate marker does not match canonical or replacement: {}",
-                            canonical.display()
+                } else if incarnation == old_metadata.workspace_incarnation.as_str() {
+                    false
+                } else {
+                    return Err(ApfsStorageError::MarkerMismatch(format!(
+                        "restore marker matches neither generation: canonical={}, marker={}, old={}, replacement={}",
+                        canonical.display(),
+                        incarnation,
+                        old_metadata.workspace_incarnation,
+                        replacement_incarnation
+                    )));
+                };
+                let canonical_has_old_key =
+                    Self::companions_match(&canonical_companion, &undo_companion)?;
+
+                if canonical_is_replacement {
+                    if undo.exists() {
+                        if staged.exists() {
+                            return Err(ApfsStorageError::MarkerMismatch(format!(
+                                "restore has both staged and undo old images: staged={}, undo={}",
+                                staged.display(),
+                                undo.display()
+                            )));
+                        }
+                        fs::rename(&undo, &staged).map_err(|error| {
+                            io_error("stage interrupted restore undo", &staged, error)
+                        })?;
+                    } else if !staged.exists() {
+                        return Err(ApfsStorageError::MarkerMismatch(format!(
+                            "restore cannot roll back without old image: canonical={}, staged={}, undo={}",
+                            canonical.display(),
+                            staged.display(),
+                            undo.display()
                         )));
                     }
+                    if canonical_has_old_key {
+                        let staged_key =
+                            self.recovery_companion(&staged, "restore replacement staged image")?;
+                        if Self::companions_match(&staged_key, &undo_companion)? {
+                            return Err(ApfsStorageError::MarkerMismatch(format!(
+                                "restore lost replacement CA key: canonical_companion={}, staged_companion={}, undo_companion={}",
+                                canonical_companion.display(),
+                                staged_key.display(),
+                                undo_companion.display()
+                            )));
+                        }
+                        swap_paths(&canonical, &staged)?;
+                    } else {
+                        if !staged_companion.exists() {
+                            fs::hard_link(&undo_companion, &staged_companion).map_err(|error| {
+                                io_error("stage retained old CA key", &staged_companion, error)
+                            })?;
+                        }
+                        let staged_key =
+                            self.recovery_companion(&staged, "restore displaced staged image")?;
+                        if !Self::companions_match(&staged_key, &undo_companion)? {
+                            return Err(ApfsStorageError::MarkerMismatch(format!(
+                                "restore cannot identify old CA key: canonical_companion={}, staged_companion={}, undo_companion={}",
+                                canonical_companion.display(),
+                                staged_key.display(),
+                                undo_companion.display()
+                            )));
+                        }
+                        swap_paths(&canonical, &staged)?;
+                        swap_paths(&canonical_companion, &staged_companion)?;
+                    }
                 } else {
-                    continue;
-                };
+                    if undo.exists() {
+                        return Err(ApfsStorageError::MarkerMismatch(format!(
+                            "old canonical restore layout still has undo image: canonical={}, undo={}",
+                            canonical.display(),
+                            undo.display()
+                        )));
+                    }
+                    if !canonical_has_old_key {
+                        if !staged_companion.exists() {
+                            fs::hard_link(&undo_companion, &staged_companion).map_err(|error| {
+                                io_error("stage retained old CA key", &staged_companion, error)
+                            })?;
+                        }
+                        let staged_key =
+                            self.recovery_companion(&staged, "restore old staged CA key")?;
+                        if !Self::companions_match(&staged_key, &undo_companion)? {
+                            return Err(ApfsStorageError::MarkerMismatch(format!(
+                                "old image has no recoverable old CA key: canonical={}, canonical_companion={}, staged_companion={}, undo_companion={}",
+                                canonical.display(),
+                                canonical_companion.display(),
+                                staged_key.display(),
+                                undo_companion.display()
+                            )));
+                        }
+                        swap_paths(&canonical_companion, &staged_companion)?;
+                    } else if staged.exists() {
+                        let staged_key =
+                            self.recovery_companion(&staged, "restore replacement staged image")?;
+                        if Self::companions_match(&staged_key, &undo_companion)? {
+                            return Err(ApfsStorageError::MarkerMismatch(format!(
+                                "old and replacement images share old CA key: canonical={}, staged={}, undo_companion={}",
+                                canonical.display(),
+                                staged.display(),
+                                undo_companion.display()
+                            )));
+                        }
+                    }
+                }
 
-                if undo.exists() {
-                    fs::rename(&undo, &staged).map_err(|error| {
-                        io_error("stage interrupted restore undo", &staged, error)
-                    })?;
-                }
-                if image_was_published {
-                    swap_paths(&canonical, &staged)?;
-                }
                 if staged.exists() {
                     self.backend
                         .delete_image(&staged, old_metadata.image_format)?;
                 }
                 Self::remove_sidecar(&staged)?;
+                Self::remove_companion(&staged)?;
                 if canonical_sidecar.exists() {
                     fs::remove_file(&undo_sidecar).map_err(|error| {
                         io_error("remove redundant restore metadata", &undo_sidecar, error)
@@ -2717,6 +3008,9 @@ where
                         )
                     })?;
                 }
+                fs::remove_file(&undo_companion).map_err(|error| {
+                    io_error("remove redundant restore CA key", &undo_companion, error)
+                })?;
                 sync_parent!(&canonical)?;
             }
         }

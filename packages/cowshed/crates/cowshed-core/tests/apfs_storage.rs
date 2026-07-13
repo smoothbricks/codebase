@@ -15,7 +15,7 @@ use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
     AdoptExecutionError, ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate,
     ApfsSubstrateConfig, IncarnationSource, LockMode, MarkerExpectation, MetadataPolicy,
-    PublicationError, volume_name,
+    PublicationError, RestoreStage, volume_name,
 };
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, CheckpointFact, Destination, ExpectedState, KernelMountFact, LifecyclePlanner,
@@ -137,6 +137,16 @@ impl FakeHost {
 
     fn mounted_paths_now(&self) -> BTreeSet<PathBuf> {
         self.mounted_paths.lock().expect("mounted paths").clone()
+    }
+
+    fn staged_paths_now(&self) -> BTreeSet<PathBuf> {
+        self.state
+            .lock()
+            .expect("fake state")
+            .staged
+            .keys()
+            .cloned()
+            .collect()
     }
 }
 
@@ -629,6 +639,16 @@ impl ApfsExecutionHost for FakeHost {
         _: &ApfsSubstrateConfig,
         _: &[PathBuf],
     ) -> Result<(), ApfsStorageError> {
+        let mut state = self.state.lock().expect("fake state");
+        let pending = std::mem::take(&mut state.pending);
+        if !pending.is_empty() {
+            state.events.push("recover-pending-publication".to_owned());
+        }
+        for (_, fact) in pending {
+            let key = (fact.workspace.repo().clone(), fact.workspace.name().clone());
+            state.formats.insert(key.clone(), fact.workspace.format());
+            state.published.insert(key, fact);
+        }
         Ok(())
     }
 
@@ -748,6 +768,32 @@ fn substrate(host: FakeHost, lane: CountingLane) -> ApfsSubstrate<FakeHost, Coun
         lane,
         FixedIncarnations::default(),
     )
+}
+
+async fn abort_at_callback<T>(task: tokio::task::JoinHandle<T>, entered: Arc<AtomicBool>) {
+    for _ in 0..1_000 {
+        if entered.load(Ordering::SeqCst) {
+            task.abort();
+            match task.await {
+                Err(error) => assert!(error.is_cancelled()),
+                Ok(_) => panic!("aborted staged execution completed"),
+            }
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("staged callback was not entered");
+}
+
+fn assert_no_orphan_stage(host: &FakeHost) {
+    assert!(
+        host.mounted_paths_now().is_empty(),
+        "cancellation left a staging mount attached"
+    );
+    assert!(
+        host.staged_paths_now().is_empty(),
+        "cancellation left staged metadata or an orphan image"
+    );
 }
 
 #[tokio::test]
@@ -1342,6 +1388,320 @@ async fn retire_reclaim_stats_and_gc_cross_only_the_blocking_lane() {
     assert!(events.contains(&"atomic-retire-to-trash".to_owned()));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
     assert!(events.contains(&"gc-trash+compact-detached".to_owned()));
+}
+
+#[tokio::test]
+async fn aborting_adopt_callback_detaches_and_reclaims_the_stage() {
+    let host = FakeHost::default();
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let plan = substrate
+        .plan_adopt(adopt_request(ImageFormat::Sparse))
+        .expect("adopt plan");
+    let entered = Arc::new(AtomicBool::new(false));
+    let callback_entered = Arc::clone(&entered);
+    let task = tokio::spawn(async move {
+        substrate
+            .execute_adopt_staged(plan, move |_| async move {
+                callback_entered.store(true, Ordering::SeqCst);
+                std::future::pending::<Result<(), &'static str>>().await
+            })
+            .await
+    });
+
+    abort_at_callback(task, entered).await;
+
+    assert_no_orphan_stage(&host);
+    assert!(host.list(&repo()).expect("post-cancel listing").is_empty());
+    let events = host.events();
+    assert!(events.contains(&"detach:false".to_owned()));
+    assert!(events.contains(&"idempotent-reclaim".to_owned()));
+    assert!(!events.contains(&"atomic-adopt-handoff+publish".to_owned()));
+}
+
+#[tokio::test]
+async fn aborting_create_and_fork_callbacks_detaches_and_reclaims_each_stage() {
+    for fork in [false, true] {
+        let host = FakeHost::default();
+        let source = workspace("main", ImageFormat::Sparse, 5);
+        host.seed(&source);
+        let substrate = substrate(host.clone(), CountingLane::default());
+        let destination = Destination {
+            repo: repo(),
+            name: WorkspaceName::session(if fork {
+                "cancelled-fork"
+            } else {
+                "cancelled-create"
+            })
+            .expect("destination"),
+            topology_revision: Revision::new(8),
+            identity: identity(),
+        };
+        let entered = Arc::new(AtomicBool::new(false));
+        let callback_entered = Arc::clone(&entered);
+        let task = if fork {
+            let plan = substrate
+                .plan_fork(&source, destination)
+                .expect("fork plan");
+            tokio::spawn(async move {
+                substrate
+                    .execute_fork_staged(plan, move |_| async move {
+                        callback_entered.store(true, Ordering::SeqCst);
+                        std::future::pending::<Result<(), &'static str>>().await
+                    })
+                    .await
+            })
+        } else {
+            let plan = substrate
+                .plan_create(&source, destination)
+                .expect("create plan");
+            tokio::spawn(async move {
+                substrate
+                    .execute_create_staged(plan, move |_| async move {
+                        callback_entered.store(true, Ordering::SeqCst);
+                        std::future::pending::<Result<(), &'static str>>().await
+                    })
+                    .await
+            })
+        };
+
+        abort_at_callback(task, entered).await;
+
+        assert_no_orphan_stage(&host);
+        assert_eq!(
+            host.list(&repo()).expect("post-cancel listing"),
+            vec![StorageFact {
+                workspace: source,
+                volume_name: volume_name(&repo(), &WorkspaceName::new("main").expect("main")),
+            }]
+        );
+        let events = host.events();
+        assert!(events.contains(&"detach:false".to_owned()));
+        assert!(events.contains(&"idempotent-reclaim".to_owned()));
+        assert!(!events.contains(&"atomic-publish-image".to_owned()));
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_barrier_runs_under_lock_before_snapshot_clone() {
+    let host = FakeHost::default();
+    let source = workspace("main", ImageFormat::Sparse, 5);
+    host.seed(&source);
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let callback_host = host.clone();
+
+    substrate
+        .execute_checkpoint_staged(
+            substrate
+                .plan_checkpoint(
+                    &source,
+                    CheckpointLabel::new("durable-prefix").expect("label"),
+                    Pin::Pinned,
+                )
+                .expect("checkpoint plan"),
+            move |stage| async move {
+                assert!(
+                    stage
+                        .image
+                        .components()
+                        .any(|component| component.as_os_str() == "checkpoints")
+                );
+                assert!(
+                    !callback_host
+                        .events()
+                        .iter()
+                        .any(|event| event.starts_with("clone:")),
+                    "snapshot clone started before the artifact barrier completed"
+                );
+                callback_host.record("artifact-barrier+manifest-fsync");
+                Ok::<(), &'static str>(())
+            },
+        )
+        .await
+        .expect("checkpoint");
+
+    let events = host.events();
+    let barrier = events
+        .iter()
+        .position(|event| event == "artifact-barrier+manifest-fsync")
+        .expect("barrier event");
+    let clone = events
+        .iter()
+        .position(|event| event == "clone:Sparse")
+        .expect("snapshot clone");
+    let publication = events
+        .iter()
+        .position(|event| event == "checkpoint-fact:Pinned")
+        .expect("checkpoint publication");
+    assert!(barrier < clone && clone < publication);
+    assert_eq!(events[0], "lock:1");
+}
+
+#[tokio::test]
+async fn aborting_checkpoint_barrier_creates_no_snapshot_or_fact() {
+    let host = FakeHost::default();
+    let source = workspace("main", ImageFormat::Sparse, 5);
+    host.seed(&source);
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let plan = substrate
+        .plan_checkpoint(
+            &source,
+            CheckpointLabel::new("cancelled").expect("label"),
+            Pin::Automatic,
+        )
+        .expect("checkpoint plan");
+    let entered = Arc::new(AtomicBool::new(false));
+    let callback_entered = Arc::clone(&entered);
+    let task = tokio::spawn(async move {
+        substrate
+            .execute_checkpoint_staged(plan, move |_| async move {
+                callback_entered.store(true, Ordering::SeqCst);
+                std::future::pending::<Result<(), &'static str>>().await
+            })
+            .await
+    });
+
+    abort_at_callback(task, entered).await;
+
+    assert_no_orphan_stage(&host);
+    assert!(
+        !host
+            .events()
+            .iter()
+            .any(|event| event.starts_with("clone:"))
+    );
+    assert!(host.checkpoints(&repo()).expect("checkpoints").is_empty());
+}
+
+#[tokio::test]
+async fn aborting_restore_prepare_callback_cleans_replace_and_verify_mounts() {
+    for mode in [RestoreMode::Replace, RestoreMode::VerifyOnly] {
+        let host = FakeHost::default();
+        let current = workspace("raven", ImageFormat::Sparse, 7);
+        host.seed(&current);
+        let substrate = substrate(host.clone(), CountingLane::default());
+        let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
+            current.clone(),
+            CheckpointLabel::new("ready").expect("label"),
+            Revision::new(8),
+            true,
+        );
+        let plan = substrate
+            .plan_restore(&current, &checkpoint, mode, identity())
+            .expect("restore plan");
+        let entered = Arc::new(AtomicBool::new(false));
+        let callback_entered = Arc::clone(&entered);
+        let task = tokio::spawn(async move {
+            substrate
+                .execute_restore_staged(
+                    plan,
+                    move |stage| async move {
+                        assert_eq!(
+                            matches!(stage, RestoreStage::Replace(_)),
+                            mode == RestoreMode::Replace
+                        );
+                        callback_entered.store(true, Ordering::SeqCst);
+                        std::future::pending::<Result<(), &'static str>>().await
+                    },
+                    |_| async { Ok::<(), &'static str>(()) },
+                )
+                .await
+        });
+
+        abort_at_callback(task, entered).await;
+
+        assert_no_orphan_stage(&host);
+        assert_eq!(
+            host.list(&repo()).expect("post-cancel listing"),
+            vec![StorageFact {
+                workspace: current,
+                volume_name: volume_name(&repo(), &WorkspaceName::new("raven").expect("workspace"),),
+            }]
+        );
+        let events = host.events();
+        assert!(events.contains(&"detach:false".to_owned()));
+        if mode == RestoreMode::Replace {
+            assert!(events.contains(&"idempotent-reclaim".to_owned()));
+        }
+        assert!(!events.contains(&"atomic-restore-swap+undo".to_owned()));
+    }
+}
+
+#[tokio::test]
+async fn aborting_restore_fence_leaves_recoverable_pending_publication() {
+    let host = FakeHost::default();
+    let current = workspace("raven", ImageFormat::Sparse, 7);
+    host.seed(&current);
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
+        current.clone(),
+        CheckpointLabel::new("ready").expect("label"),
+        Revision::new(8),
+        true,
+    );
+    let plan = substrate
+        .plan_restore(&current, &checkpoint, RestoreMode::Replace, identity())
+        .expect("restore plan");
+    let entered = Arc::new(AtomicBool::new(false));
+    let callback_entered = Arc::clone(&entered);
+    let pending_workspace = Arc::new(Mutex::new(None));
+    let callback_workspace = Arc::clone(&pending_workspace);
+    let task = {
+        let substrate = substrate.clone();
+        tokio::spawn(async move {
+            substrate
+                .execute_restore_staged(
+                    plan,
+                    |_| async { Ok::<(), &'static str>(()) },
+                    move |fence| async move {
+                        *callback_workspace.lock().expect("pending workspace") =
+                            Some(fence.pending.workspace);
+                        callback_entered.store(true, Ordering::SeqCst);
+                        std::future::pending::<Result<(), &'static str>>().await
+                    },
+                )
+                .await
+        })
+    };
+
+    abort_at_callback(task, entered).await;
+
+    assert_eq!(
+        host.pending_publications(&repo())
+            .expect("pending publication")
+            .len(),
+        1
+    );
+    assert!(
+        host.mounted_paths_now().iter().all(|path| !path
+            .components()
+            .any(|component| component.as_os_str() == ".staging")),
+        "the persisted pending publication must not retain a staging mount"
+    );
+    let replacement = pending_workspace
+        .lock()
+        .expect("pending workspace")
+        .clone()
+        .expect("replacement workspace");
+    substrate
+        .ensure_mounted(&replacement, MountIntent { browse: false })
+        .await
+        .expect("ensure recovers pending publication");
+    assert!(
+        host.pending_publications(&repo())
+            .expect("pending publication after recovery")
+            .is_empty()
+    );
+    assert_eq!(
+        host.list(&repo()).expect("recovered publication"),
+        vec![StorageFact {
+            workspace: replacement,
+            volume_name: volume_name(&repo(), &WorkspaceName::new("raven").expect("workspace"),),
+        }]
+    );
+    assert!(
+        host.events()
+            .contains(&"recover-pending-publication".to_owned())
+    );
 }
 
 proptest! {

@@ -561,6 +561,10 @@ pub enum PublicationState {
     PendingFence,
 }
 
+fn active_publication_state() -> PublicationState {
+    PublicationState::Active
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DetachedWorkspaceMetadata {
@@ -587,6 +591,7 @@ struct DetachedWorkspaceMetadataWire {
     workspace_incarnation: WorkspaceIncarnation,
     image_format: ImageFormat,
     platform: Platform,
+    #[serde(default = "active_publication_state")]
     publication_state: PublicationState,
     updated_at: String,
     revision: u64,
@@ -779,6 +784,34 @@ mod tests {
     use proptest::prelude::*;
     use serde_json::json;
 
+    const LEGACY_V1_SIDECAR: &str = r#"{
+  "version": 1,
+  "repoId": "acme/widget",
+  "workspace": "raven",
+  "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+  "imageFormat": "asif",
+  "platform": "macos",
+  "updatedAt": "2026-07-11T12:34:56Z",
+  "revision": 7,
+  "portBlock": { "base": 40976, "size": 16 },
+  "read": ["/project/shared-fixtures"],
+  "write": ["/project/artifacts/raven"],
+  "egress": [
+    { "host": "registry.npmjs.org" },
+    { "host": "pinned.example.com", "mode": "opaque" }
+  ],
+  "sim": ["openurl"],
+  "infoSnapshot": {
+    "projectRoot": "/project",
+    "role": "workspace",
+    "baseCommit": "8f31c2d",
+    "branch": "raven",
+    "createdAt": "2026-07-11T12:00:00Z",
+    "capturedAt": "2026-07-11T12:34:00Z",
+    "stale": true
+  }
+}"#;
+
     fn temp_directory(test: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -845,6 +878,33 @@ mod tests {
         let expected = frozen_sidecar_json();
         let metadata: DetachedWorkspaceMetadata = serde_json::from_value(expected.clone()).unwrap();
         assert_eq!(serde_json::to_value(&metadata).unwrap(), expected);
+    }
+
+    #[test]
+    fn legacy_v1_sidecar_without_publication_state_reopens_as_active() {
+        let directory = temp_directory("legacy-v1-sidecar");
+        let image = directory.join("raven.asif");
+        fs::write(sidecar_path(&image), LEGACY_V1_SIDECAR).unwrap();
+
+        let metadata = DetachedWorkspaceMetadata::read_for_image(&image).unwrap();
+        assert_eq!(metadata.publication_state, PublicationState::Active);
+
+        let mut expected: serde_json::Value = serde_json::from_str(LEGACY_V1_SIDECAR).unwrap();
+        expected["publicationState"] = json!("active");
+        assert_eq!(serde_json::to_value(metadata).unwrap(), expected);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn explicit_malformed_publication_state_is_rejected() {
+        let mut malformed = frozen_sidecar_json();
+        malformed["publicationState"] = json!("published");
+
+        let error = serde_json::from_value::<DetachedWorkspaceMetadata>(malformed).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown variant `published`"),
+            "{error}"
+        );
     }
 
     #[test]
