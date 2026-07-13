@@ -34,20 +34,10 @@ impl<W: Write, E: Write> Output<W, E> {
         }
     }
 
-    /// Copies an already-machine-readable bare value or child stream verbatim.
-    pub fn bare(&mut self, value: &[u8]) -> io::Result<()> {
-        self.stdout.write_all(value)
-    }
-
     /// Emits one machine-readable bare value followed by a newline.
     pub fn bare_line(&mut self, value: &[u8]) -> io::Result<()> {
         self.stdout.write_all(value)?;
         self.stdout.write_all(b"\n")
-    }
-
-    /// Emits one typed JSON record without wrapping it in the CLI envelope.
-    pub fn bare_record<T: Serialize + ?Sized>(&mut self, value: &T) -> io::Result<()> {
-        write_serialized(&mut self.stdout, value)
     }
 
     /// Emits the one frozen success envelope on stdout.
