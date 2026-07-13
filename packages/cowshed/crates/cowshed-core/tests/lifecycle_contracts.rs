@@ -211,10 +211,6 @@ impl LifecyclePlanner for ContractSubstrate {
 impl Substrate for ContractSubstrate {
     type Error = &'static str;
 
-    async fn execute_adopt(&self, _: AdoptPlan) -> Result<LifecycleReceipt, Self::Error> {
-        Err("not exercised")
-    }
-
     async fn execute_create(&self, _: CreatePlan) -> Result<LifecycleReceipt, Self::Error> {
         Err("not exercised")
     }
