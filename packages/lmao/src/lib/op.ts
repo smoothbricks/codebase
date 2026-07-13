@@ -44,6 +44,7 @@ import type { WasmLayoutTemplate } from './wasm/wasmPhysicalLayout.js';
 export interface OpCompileMetadata {
   readonly runtimeHint: number;
   readonly eagerColumns?: readonly string[];
+  readonly localMessageDictionary?: readonly number[];
 }
 
 
@@ -69,7 +70,12 @@ export interface OpMetadata {
   readonly _physicalLayoutPlan?: {
     readonly eagerColumns: import('./physicalLayoutPlan.js').EagerColumnDescriptor;
     readonly vocabularyGeneration: VocabularyGeneration;
+    readonly localMessageDictionary: readonly number[];
+    readonly encodeLocalMessage: (globalDenseIndex: number) => number;
     readonly wasmLayout: WasmLayoutTemplate;
+    readonly appendLogEntry: import('./traceRoot.js').TimestampAppendPrimitive;
+    readonly arrowExposure: import('./physicalLayoutPlan.js').ArrowExposurePlan;
+    readonly appenders: import('./physicalLayoutPlan.js').PhysicalAppenders;
   };
 }
 //#endregion smoo/lmao!n/opcontext-hierarchy
@@ -121,6 +127,7 @@ export class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
     opContextBinding?: OpContextBinding<Ctx['logSchema'], Ctx['flags'], Ctx['deps'], Ctx['userCtx']>,
     runtimeHint = 0,
     eagerColumns: readonly string[] = [],
+    localMessageDictionary: readonly number[] = Object.freeze([]),
   ) {
     const userContextKeys = Object.keys(opContextBinding?.ctxDefaults ?? {}).sort();
     const layoutKey = userContextKeys.join('\u0000');
@@ -139,6 +146,7 @@ export class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
       'strategy-selected',
       layoutKey,
       eagerColumns,
+      localMessageDictionary,
     );
     const resolvedMetadata = Object.freeze({ ...metadata, _physicalLayoutPlan: physicalLayoutPlan });
     this.callsitePlan = sealCallsitePlan(physicalLayoutPlan, resolvedMetadata);

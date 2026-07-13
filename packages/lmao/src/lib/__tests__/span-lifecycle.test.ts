@@ -8,7 +8,7 @@ import { Nanoseconds } from '@smoothbricks/arrow-builder';
 import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { defineCodeError } from '../result.js';
-import { resolveMessage } from '../resolveMessage.js';
+import { resolveEntryType, resolveMessage } from '../resolveMessage.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import {
@@ -498,8 +498,8 @@ describe('Fixed Row Layout', () => {
 
     expect(result.success).toBe(true);
     expect(capturedBuffer).toBeDefined();
-    expect(capturedBuffer?.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
-    expect(capturedBuffer?.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+    expect(capturedBuffer ? resolveEntryType(capturedBuffer, 0) : undefined).toBe(ENTRY_TYPE_SPAN_START);
+    expect(capturedBuffer ? resolveEntryType(capturedBuffer, 1) : undefined).toBe(ENTRY_TYPE_SPAN_OK);
   });
 
   it('should have span-start at row 0 and span-err at row 1 after ctx.err()', async () => {
@@ -513,8 +513,8 @@ describe('Fixed Row Layout', () => {
 
     expect(result.success).toBe(false);
     expect(capturedBuffer).toBeDefined();
-    expect(capturedBuffer?.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
-    expect(capturedBuffer?.entry_type[1]).toBe(ENTRY_TYPE_SPAN_ERR);
+    expect(capturedBuffer ? resolveEntryType(capturedBuffer, 0) : undefined).toBe(ENTRY_TYPE_SPAN_START);
+    expect(capturedBuffer ? resolveEntryType(capturedBuffer, 1) : undefined).toBe(ENTRY_TYPE_SPAN_ERR);
   });
 
   it('should write ok fluent result attributes directly to row 1', async () => {
@@ -573,8 +573,8 @@ describe('Fixed Row Layout', () => {
       }),
     ).rejects.toThrow('Unexpected failure');
     expect(capturedBuffer).toBeDefined();
-    expect(capturedBuffer?.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
-    expect(capturedBuffer?.entry_type[1]).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
+    expect(capturedBuffer ? resolveEntryType(capturedBuffer, 0) : undefined).toBe(ENTRY_TYPE_SPAN_START);
+    expect(capturedBuffer ? resolveEntryType(capturedBuffer, 1) : undefined).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
   });
 
   it('should start writeIndex at 2 after span-start is written', async () => {

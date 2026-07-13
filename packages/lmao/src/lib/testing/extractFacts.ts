@@ -7,7 +7,7 @@
  * @module testing/extractFacts
  */
 
-import { resolveMessage } from '../resolveMessage.js';
+import { resolveEntryType, resolveMessage } from '../resolveMessage.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import {
   ENTRY_TYPE_DEBUG,
@@ -195,9 +195,8 @@ function enterBuffer<T extends LogSchema>(
     for (let row = 0; row < writeIndex; row++) extractTagFacts(buffer, row, facts, opts);
   }
 
-  const entryTypes = buffer.entry_type;
   for (let row = 2; row < writeIndex; row++) {
-    const entryType = entryTypes[row];
+    const entryType = resolveEntryType(buffer, row);
     switch (entryType) {
       case ENTRY_TYPE_INFO:
       case ENTRY_TYPE_DEBUG:
@@ -223,7 +222,7 @@ function leaveBuffer<T extends LogSchema>(
   if (writeIndex === 0) return;
   const spanName = resolveMessage(buffer, 0) ?? '';
   if (writeIndex >= 2) {
-    switch (buffer.entry_type[1]) {
+    switch (resolveEntryType(buffer, 1)) {
       case ENTRY_TYPE_SPAN_OK:
         facts.push(spanOk(spanName));
         break;
@@ -255,7 +254,7 @@ function extractTagFacts<T extends LogSchema>(
 
   for (const fieldName of fields) {
     // Skip system fields
-    if (fieldName.startsWith('_')) continue;
+    if (fieldName === 'message' || fieldName.startsWith('_')) continue;
 
     const nullsKey = `${fieldName}_nulls`;
     const valuesKey = `${fieldName}_values`;

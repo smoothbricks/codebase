@@ -28,6 +28,7 @@ import {
   createTestSpanContext,
   createTestTraceRoot,
 } from '../../__tests__/test-helpers.js';
+import { resolveEntryType } from '../../resolveMessage.js';
 import { createSpanBuffer } from '../../spanBuffer.js';
 import type { AnySpanBuffer } from '../../types.js';
 
@@ -189,8 +190,8 @@ describe('uint64_value cross-row independence (no collision)', () => {
     buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_OK);
 
     // The lifecycle actually ran and wrote its OWN columns (entry_type)...
-    expect(buffer.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
-    expect(buffer.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+    expect(resolveEntryType(buffer, 0)).toBe(ENTRY_TYPE_SPAN_START);
+    expect(resolveEntryType(buffer, 1)).toBe(ENTRY_TYPE_SPAN_OK);
     // ...without clobbering the user uint64 values in either row.
     const values = uint64Column(buffer);
     const nulls = uint64Nulls(buffer);

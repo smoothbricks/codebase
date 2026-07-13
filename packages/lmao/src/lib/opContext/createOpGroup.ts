@@ -81,6 +81,7 @@ function copyOpsWithDescriptor<Ctx extends OpContext>(
         value._opContextBinding,
         value.callsitePlan.runtimeHint,
         value.callsitePlan.eagerColumns.names,
+        value.callsitePlan.localMessageDictionary,
       );
     }
   }

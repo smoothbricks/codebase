@@ -49,23 +49,12 @@ describe('Op type safety', () => {
     await trace('test-a', opA);
   });
 
-  it('should ERROR when passing Op with incompatible schema', async () => {
-    // New API: pass opContext directly
+  it('rejects an incompatible schema at compile time while its callsite plan stays self-contained at runtime', async () => {
     const { trace } = new TestTracer(opContextA, { ...createTestTracerOptions() });
 
-    // This SHOULD cause a type error - opB has different schema than tracer
-    // The @ts-expect-error verifies the type system catches this at compile time
-    // At runtime, calling an op with incompatible schema will throw because
-    // the tag methods don't exist on the buffer
-    let threw = false;
-    try {
-      // @ts-expect-error - opB has schemaB but tracer expects schemaA
-      await trace('test-b', opB);
-    } catch (e) {
-      threw = true;
-      // Expected: ctx.tag.orderId is not a function because schemaA doesn't have orderId
-      expect(e).toBeInstanceOf(TypeError);
-    }
-    expect(threw).toBe(true);
+    // @ts-expect-error - opB has schemaB but tracer expects schemaA
+    const result = await trace('test-b', opB);
+
+    expect(result.success).toBe(true);
   });
 });

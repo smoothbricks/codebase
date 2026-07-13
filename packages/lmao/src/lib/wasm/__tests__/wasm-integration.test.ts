@@ -13,7 +13,7 @@
 import { afterEach, beforeAll, describe, expect, it } from 'bun:test';
 import { convertToArrowTable } from '../../convertToArrow.js';
 import { defineOpContext } from '../../defineOpContext.js';
-import { resolveMessage } from '../../resolveMessage.js';
+import { resolveEntryType, resolveMessage } from '../../resolveMessage.js';
 import { JsBufferStrategy } from '../../JsBufferStrategy.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
@@ -123,8 +123,8 @@ describe('WASM Integration Tests', () => {
       const buffer = tracer.rootBuffers[0];
 
       // Verify entry types
-      expect(buffer.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
-      expect(buffer.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(resolveEntryType(buffer, 0)).toBe(ENTRY_TYPE_SPAN_START);
+      expect(resolveEntryType(buffer, 1)).toBe(ENTRY_TYPE_SPAN_OK);
 
       // Verify timestamps are valid
       expect(buffer.timestamp[0]).toBeGreaterThan(0n);
@@ -261,8 +261,8 @@ describe('WASM Integration Tests', () => {
       }
 
       const buffer = asWasm(tracer.rootBuffers[0]);
-      expect(buffer.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
-      expect(buffer.entry_type[1]).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
+      expect(resolveEntryType(buffer, 0)).toBe(ENTRY_TYPE_SPAN_START);
+      expect(resolveEntryType(buffer, 1)).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
 
       const messages = Array.from({ length: buffer._writeIndex }, (_, row) => resolveMessage(buffer, row));
       expect(messages).toContain('test error');
@@ -291,8 +291,8 @@ describe('WASM Integration Tests', () => {
       });
 
       const buffer = tracer.rootBuffers[0];
-      expect(buffer.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
-      expect(buffer.entry_type[1]).toBe(ENTRY_TYPE_SPAN_ERR);
+      expect(resolveEntryType(buffer, 0)).toBe(ENTRY_TYPE_SPAN_START);
+      expect(resolveEntryType(buffer, 1)).toBe(ENTRY_TYPE_SPAN_ERR);
     });
 
     it('writes error code for typed errors', async () => {
@@ -301,7 +301,7 @@ describe('WASM Integration Tests', () => {
       });
 
       const buffer = asWasm(tracer.rootBuffers[0]);
-      expect(buffer.entry_type[1]).toBe(ENTRY_TYPE_SPAN_ERR);
+      expect(resolveEntryType(buffer, 1)).toBe(ENTRY_TYPE_SPAN_ERR);
       // Error code should be written to error_code column
       expect(buffer.error_code_values?.[1]).toBe('VALIDATION_ERROR');
     });
@@ -322,11 +322,11 @@ describe('WASM Integration Tests', () => {
       expect(buffer._writeIndex).toBeGreaterThan(2);
 
       // Row 0 = span-start, Row 1 = span-ok (written at end)
-      expect(buffer.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
-      expect(buffer.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(resolveEntryType(buffer, 0)).toBe(ENTRY_TYPE_SPAN_START);
+      expect(resolveEntryType(buffer, 1)).toBe(ENTRY_TYPE_SPAN_OK);
 
       // Log entries are written at indices 2+
-      const entryTypes = Array.from(buffer.entry_type.slice(0, buffer._writeIndex));
+      const entryTypes = Array.from({ length: buffer._writeIndex }, (_, row) => resolveEntryType(buffer, row));
 
       // Use entry type constants from systemSchema
       expect(entryTypes).toContain(ENTRY_TYPE_INFO);
@@ -347,7 +347,7 @@ describe('WASM Integration Tests', () => {
 
       const buffer = asWasm(tracer.rootBuffers[0]);
       // Use entry type constant from systemSchema
-      const entryTypes = Array.from(buffer.entry_type.slice(0, buffer._writeIndex));
+      const entryTypes = Array.from({ length: buffer._writeIndex }, (_, row) => resolveEntryType(buffer, row));
       expect(entryTypes).toContain(ENTRY_TYPE_ERROR);
     });
   });
@@ -596,7 +596,7 @@ describe('WASM Integration Tests', () => {
       }
 
       const buffer = tracer.rootBuffers[0];
-      expect(buffer.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(resolveEntryType(buffer, 1)).toBe(ENTRY_TYPE_SPAN_OK);
     });
 
     it('handles async functions correctly', async () => {
@@ -612,7 +612,7 @@ describe('WASM Integration Tests', () => {
       }
 
       const buffer = tracer.rootBuffers[0];
-      expect(buffer.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(resolveEntryType(buffer, 1)).toBe(ENTRY_TYPE_SPAN_OK);
       // Timestamps should reflect the delay
       expect(buffer.timestamp[1]).toBeGreaterThan(buffer.timestamp[0]);
     });
