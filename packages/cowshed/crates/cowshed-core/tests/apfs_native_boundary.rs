@@ -25,7 +25,7 @@ use cowshed_core::storage::apfs::{
 use cowshed_core::storage::lifecycle::{
     ExpectedState, LifecycleWorkspace, OperationIdentity, Pin, Revision,
 };
-use cowshed_core::storage::{CheckpointLabel, StorageLayout};
+use cowshed_core::storage::{CheckpointLabel, StorageLayout, StorageLayoutError};
 const ATTACH_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
 <dict><key>content-hint</key><string>GUID_partition_scheme</string><key>dev-entry</key><string>/dev/disk9</string></dict>
 <dict><key>content-hint</key><string>Apple_APFS</string><key>dev-entry</key><string>/dev/disk9s2</string></dict>
@@ -1575,13 +1575,19 @@ fn gc_does_not_follow_symlinked_owner_repository_staging_or_image_paths() {
         .write_for_image(&escaped_checkpoint)
         .expect("escaped checkpoint metadata");
     let host = native_host(&fixture, RecordingRunner::default());
-    host.publish_checkpoint_fact(
-        &escaped_checkpoint,
-        &escaped_label,
-        Revision::new(99),
-        Pin::Automatic,
-    )
-    .expect("escaped checkpoint fact");
+    let error = host
+        .publish_checkpoint_fact(
+            &escaped_checkpoint,
+            &escaped_label,
+            Revision::new(99),
+            Pin::Automatic,
+        )
+        .expect_err("symlinked checkpoint publication must fail closed");
+    assert!(matches!(
+        error,
+        ApfsStorageError::Layout(StorageLayoutError::SymlinkComponent(path))
+            if path == escaped_checkpoint
+    ));
     assert!(
         host.checkpoints(&repo())
             .expect("checkpoint enumeration")
@@ -1599,6 +1605,12 @@ fn gc_does_not_follow_symlinked_owner_repository_staging_or_image_paths() {
     ] {
         assert_eq!(std::fs::read(path).expect("external target"), contents);
     }
+    assert!(
+        std::fs::symlink_metadata(&escaped_checkpoint)
+            .expect("checkpoint link")
+            .file_type()
+            .is_symlink()
+    );
     assert!(
         std::fs::symlink_metadata(&image_link)
             .expect("image link")
@@ -1666,9 +1678,9 @@ fn adopt_recovery_waits_for_handoff_then_completes_publication_after_restart() {
     assert!(!before_canonical.image().exists());
     let cleanup = before_host.gc(&before_config).expect("staging cleanup");
     assert_eq!(cleanup.examined, 1);
-    assert_eq!(cleanup.reclaimed, 1);
-    assert!(!before_staged.exists());
-    assert!(!sidecar_path(&before_staged).exists());
+    assert_eq!(cleanup.reclaimed, 0);
+    assert!(before_staged.exists());
+    assert!(sidecar_path(&before_staged).exists());
     assert_eq!(
         std::fs::read(before_config.main_mount.join("tracked")).expect("original source"),
         b"source"
@@ -2297,7 +2309,9 @@ fn gc_skips_staging_owned_by_an_active_lifecycle_lock() {
         .project()
         .project_root
         .join(".staging/main-00000000000000000000000000000001.sparseimage");
-    create_image(&staged, ImageFormat::Sparse);
+    std::fs::create_dir_all(staged.parent().expect("staging directory"))
+        .expect("staging directory");
+    std::fs::write(&staged, b"sidecarless staged orphan").expect("staged orphan");
     let owner = native_host_at(&fixture.root);
     let collector = native_host_at(&fixture.root);
     let guard = owner
@@ -2309,11 +2323,12 @@ fn gc_skips_staging_owned_by_an_active_lifecycle_lock() {
     assert_eq!(report.examined, 1);
     assert_eq!(report.reclaimed, 0);
     assert!(staged.exists());
-    assert!(sidecar_path(&staged).exists());
+    assert!(!sidecar_path(&staged).exists());
 
     drop(guard);
     let report = collector.gc(&fixture.config()).expect("released gc");
-    assert!(report.reclaimed >= 1);
+    assert_eq!(report.examined, 1);
+    assert_eq!(report.reclaimed, 1);
     assert!(!staged.exists());
     assert!(!sidecar_path(&staged).exists());
 }
