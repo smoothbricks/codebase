@@ -114,14 +114,23 @@ pub struct SystemSpawnRunner;
 const DESCRIPTOR_PREPARATION_ERRNO: libc::c_int = libc::EOWNERDEAD;
 const SUPERVISOR_FD_CEILING: usize = 4_096;
 
-#[cfg(not(target_os = "macos"))]
-fn descriptor_limit() -> io::Result<libc::rlim_t> {
+#[cfg(any(not(target_os = "macos"), test))]
+fn descriptor_limit_with<GetLimit>(get_limit: GetLimit) -> io::Result<libc::rlim_t>
+where
+    GetLimit: FnOnce(*mut libc::rlimit) -> libc::c_int,
+{
     let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
-    if result == -1 {
+    if get_limit(limit.as_mut_ptr()) == -1 {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { limit.assume_init() }.rlim_cur)
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn descriptor_limit() -> io::Result<libc::rlim_t> {
+    descriptor_limit_with(|limit| unsafe {
+        libc::getrlimit(libc::RLIMIT_NOFILE, limit)
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -173,22 +182,40 @@ fn mark_macos_non_stdio_close_on_exec(
     Ok(())
 }
 
-fn mark_descriptor_close_on_exec(descriptor: libc::c_int) -> io::Result<()> {
-    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+fn mark_descriptor_close_on_exec_with<Fcntl, LastError>(
+    descriptor: libc::c_int,
+    mut fcntl: Fcntl,
+    last_error: LastError,
+) -> io::Result<()>
+where
+    Fcntl: FnMut(libc::c_int, libc::c_int, libc::c_int) -> libc::c_int,
+    LastError: Fn() -> io::Error,
+{
+    let flags = fcntl(descriptor, libc::F_GETFD, 0);
     if flags == -1 {
-        let error = io::Error::last_os_error();
+        let error = last_error();
         if error.raw_os_error() == Some(libc::EBADF) {
             return Ok(());
         }
         return Err(error);
     }
     if flags & libc::FD_CLOEXEC == 0 {
-        let result = unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+        let result = fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC);
         if result == -1 {
-            return Err(io::Error::last_os_error());
+            return Err(last_error());
         }
     }
     Ok(())
+}
+
+fn mark_descriptor_close_on_exec(descriptor: libc::c_int) -> io::Result<()> {
+    mark_descriptor_close_on_exec_with(
+        descriptor,
+        |descriptor, command, argument| unsafe {
+            libc::fcntl(descriptor, command, argument)
+        },
+        io::Error::last_os_error,
+    )
 }
 
 #[cfg(any(not(target_os = "macos"), test))]
@@ -202,36 +229,71 @@ fn fallback_descriptor_limit(limit: libc::rlim_t) -> io::Result<libc::c_int> {
     Ok(limit as libc::c_int)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(not(target_os = "macos"), test))]
+fn mark_descriptor_range_close_on_exec_with<MarkDescriptor>(
+    limit: libc::rlim_t,
+    mut mark_descriptor: MarkDescriptor,
+) -> io::Result<()>
+where
+    MarkDescriptor: FnMut(libc::c_int) -> io::Result<()>,
+{
+    let limit = fallback_descriptor_limit(limit)?;
+    for descriptor in 3..limit {
+        mark_descriptor(descriptor)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+
+#[cfg(any(target_os = "linux", test))]
+fn mark_non_stdio_close_on_exec_with<CloseRange, MarkDescriptor>(
+    limit: libc::rlim_t,
+    close_range: CloseRange,
+    mark_descriptor: MarkDescriptor,
+) -> io::Result<()>
+where
+    CloseRange:
+        FnOnce(libc::c_uint, libc::c_uint, libc::c_uint) -> io::Result<()>,
+    MarkDescriptor: FnMut(libc::c_int) -> io::Result<()>,
+{
+    match close_range(3, libc::c_uint::MAX, CLOSE_RANGE_CLOEXEC) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSYS) | Some(libc::EINVAL)
+            ) =>
+        {
+            mark_descriptor_range_close_on_exec_with(limit, mark_descriptor)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
 fn mark_non_stdio_close_on_exec(limit: libc::rlim_t) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_close_range,
-                3 as libc::c_uint,
-                libc::c_uint::MAX,
-                CLOSE_RANGE_CLOEXEC,
-            )
-        };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if !matches!(
-            error.raw_os_error(),
-            Some(libc::ENOSYS) | Some(libc::EINVAL)
-        ) {
-            return Err(error);
-        }
+        return mark_non_stdio_close_on_exec_with(
+            limit,
+            |first, last, flags| {
+                let result = unsafe {
+                    libc::syscall(libc::SYS_close_range, first, last, flags)
+                };
+                if result == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            },
+            mark_descriptor_close_on_exec,
+        );
     }
 
-    let limit = fallback_descriptor_limit(limit)?;
-    for descriptor in 3..limit {
-        mark_descriptor_close_on_exec(descriptor)?;
-    }
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    mark_descriptor_range_close_on_exec_with(limit, mark_descriptor_close_on_exec)
 }
 
 impl SpawnRunner for SystemSpawnRunner {
@@ -598,33 +660,315 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn descriptor_listing_rejects_ceiling_overflow() {
+    fn descriptor_listing_accepts_low_and_high_bounds() {
         let entry_size = std::mem::size_of::<libc::proc_fdinfo>();
-        let capacity = SUPERVISOR_FD_CEILING * entry_size;
-        let required = capacity + entry_size;
-        let error = validate_fd_listing_size(required as libc::c_int, capacity).unwrap_err();
+        let capacity = 2 * entry_size;
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(validate_fd_listing_size(0, capacity).unwrap(), 0);
         assert_eq!(
-            error.to_string(),
-            "open descriptor listing exceeds the supervisor FD ceiling"
+            validate_fd_listing_size(entry_size as libc::c_int, capacity).unwrap(),
+            1
+        );
+        assert_eq!(
+            validate_fd_listing_size(capacity as libc::c_int, capacity).unwrap(),
+            2
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn descriptor_listing_rejects_negative_misaligned_and_overflow_sizes() {
+        let entry_size = std::mem::size_of::<libc::proc_fdinfo>();
+        let capacity = 2 * entry_size;
+
+        assert!(validate_fd_listing_size(-1, capacity).is_err());
+        for invalid in [entry_size - 1, capacity + entry_size] {
+            let error =
+                validate_fd_listing_size(invalid as libc::c_int, capacity).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                "open descriptor listing exceeds the supervisor FD ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_limit_reports_the_kernel_soft_limit() {
+        let mut expected = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, expected.as_mut_ptr()) },
+            0
+        );
+        let expected = unsafe { expected.assume_init() }.rlim_cur;
+
+        assert!(expected > libc::STDERR_FILENO as libc::rlim_t);
+        assert_eq!(descriptor_limit().unwrap(), expected);
+    }
+
+    #[test]
+    fn descriptor_limit_injection_preserves_boundaries_and_errors() {
+        for expected in [
+            SUPERVISOR_FD_CEILING as libc::rlim_t - 1,
+            SUPERVISOR_FD_CEILING as libc::rlim_t,
+            libc::RLIM_INFINITY,
+        ] {
+            let actual = descriptor_limit_with(|limit| {
+                unsafe {
+                    limit.write(libc::rlimit {
+                        rlim_cur: expected,
+                        rlim_max: libc::RLIM_INFINITY,
+                    });
+                }
+                0
+            })
+            .unwrap();
+            assert_eq!(actual, expected);
+        }
+
+        unsafe {
+            libc::close(-1);
+        }
+        let error = descriptor_limit_with(|_| -1).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[test]
+    fn descriptor_fallback_enforces_infinity_ceiling_and_boundaries() {
+        for accepted in [
+            0,
+            SUPERVISOR_FD_CEILING as libc::rlim_t - 1,
+            SUPERVISOR_FD_CEILING as libc::rlim_t,
+        ] {
+            assert_eq!(
+                fallback_descriptor_limit(accepted).unwrap(),
+                accepted as libc::c_int
+            );
+        }
+
+        for rejected in [
+            SUPERVISOR_FD_CEILING as libc::rlim_t + 1,
+            libc::RLIM_INFINITY,
+        ] {
+            let error = fallback_descriptor_limit(rejected).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                "descriptor fallback limit exceeds the supervisor FD ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_cloexec_preserves_existing_flags() {
+        let descriptor = 17;
+        let original_flags = 0b1010;
+        let invocations = RefCell::new(Vec::new());
+
+        mark_descriptor_close_on_exec_with(
+            descriptor,
+            |actual_descriptor, command, argument| {
+                invocations
+                    .borrow_mut()
+                    .push((actual_descriptor, command, argument));
+                if command == libc::F_GETFD {
+                    original_flags
+                } else {
+                    0
+                }
+            },
+            || panic!("successful fcntl calls must not read errno"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            invocations.into_inner(),
+            vec![
+                (descriptor, libc::F_GETFD, 0),
+                (
+                    descriptor,
+                    libc::F_SETFD,
+                    original_flags | libc::FD_CLOEXEC
+                )
+            ]
         );
     }
 
     #[test]
-    fn descriptor_fallback_rejects_unbounded_scan() {
-        assert_eq!(
-            fallback_descriptor_limit(SUPERVISOR_FD_CEILING as libc::rlim_t).unwrap(),
-            SUPERVISOR_FD_CEILING as libc::c_int
-        );
-        let error =
-            fallback_descriptor_limit(SUPERVISOR_FD_CEILING as libc::rlim_t + 1).unwrap_err();
+    fn descriptor_cloexec_skips_an_already_marked_descriptor() {
+        let invocations = std::cell::Cell::new(0);
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        mark_descriptor_close_on_exec_with(
+            17,
+            |_, command, _| {
+                invocations.set(invocations.get() + 1);
+                assert_eq!(command, libc::F_GETFD);
+                0b1010 | libc::FD_CLOEXEC
+            },
+            || panic!("successful fcntl calls must not read errno"),
+        )
+        .unwrap();
+
+        assert_eq!(invocations.get(), 1);
+    }
+
+    #[test]
+    fn descriptor_cloexec_handles_closed_descriptors_and_propagates_errors() {
+        mark_descriptor_close_on_exec(-1).unwrap();
+        mark_descriptor_close_on_exec_with(
+            17,
+            |_, _, _| -1,
+            || io::Error::from_raw_os_error(libc::EBADF),
+        )
+        .unwrap();
+
+        let get_error = mark_descriptor_close_on_exec_with(
+            17,
+            |_, _, _| -1,
+            || io::Error::from_raw_os_error(libc::EIO),
+        )
+        .unwrap_err();
+        assert_eq!(get_error.raw_os_error(), Some(libc::EIO));
+
+        let invocation = std::cell::Cell::new(0_u8);
+        let set_error = mark_descriptor_close_on_exec_with(
+            17,
+            |_, _, _| {
+                let current = invocation.get();
+                invocation.set(current + 1);
+                if current == 0 { 0 } else { -1 }
+            },
+            || io::Error::from_raw_os_error(libc::EPERM),
+        )
+        .unwrap_err();
+        assert_eq!(set_error.raw_os_error(), Some(libc::EPERM));
+        assert_eq!(invocation.get(), 2);
+    }
+
+    #[test]
+    fn close_range_uses_the_cloexec_flag_and_full_non_stdio_bounds() {
+        let invocation = RefCell::new(None);
+        let fallback_called = std::cell::Cell::new(false);
+
+        mark_non_stdio_close_on_exec_with(
+            SUPERVISOR_FD_CEILING as libc::rlim_t,
+            |first, last, flags| {
+                invocation.replace(Some((first, last, flags)));
+                Ok(())
+            },
+            |_| {
+                fallback_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
         assert_eq!(
-            error.to_string(),
-            "descriptor fallback limit exceeds the supervisor FD ceiling"
+            invocation.into_inner(),
+            Some((3, libc::c_uint::MAX, CLOSE_RANGE_CLOEXEC))
         );
+        assert_eq!(CLOSE_RANGE_CLOEXEC, 4);
+        assert!(!fallback_called.get());
+    }
+
+    #[test]
+    fn close_range_fallback_visits_every_descriptor_below_the_bound() {
+        for unavailable_errno in [libc::ENOSYS, libc::EINVAL] {
+            let visited = RefCell::new(Vec::new());
+            mark_non_stdio_close_on_exec_with(
+                7,
+                |_, _, _| Err(io::Error::from_raw_os_error(unavailable_errno)),
+                |descriptor| {
+                    visited.borrow_mut().push(descriptor);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+            assert_eq!(visited.into_inner(), vec![3, 4, 5, 6]);
+        }
+    }
+
+    #[test]
+    fn close_range_and_fallback_errors_propagate() {
+        let close_range_error = mark_non_stdio_close_on_exec_with(
+            7,
+            |_, _, _| Err(io::Error::from_raw_os_error(libc::EPERM)),
+            |_| panic!("fallback must not run for an unexpected close_range error"),
+        )
+        .unwrap_err();
+        assert_eq!(close_range_error.raw_os_error(), Some(libc::EPERM));
+
+        let visited = RefCell::new(Vec::new());
+        let fallback_error = mark_non_stdio_close_on_exec_with(
+            7,
+            |_, _, _| Err(io::Error::from_raw_os_error(libc::ENOSYS)),
+            |descriptor| {
+                visited.borrow_mut().push(descriptor);
+                if descriptor == 5 {
+                    Err(io::Error::from_raw_os_error(libc::EIO))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(fallback_error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(visited.into_inner(), vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn descriptor_fallback_marks_every_descriptor_below_its_bound() {
+        use std::os::fd::AsRawFd;
+
+        let tree = TestTree::new();
+        let file = fs::File::open(&tree.root).unwrap();
+        let descriptor = file.as_raw_fd();
+        let original = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        assert_ne!(original, -1);
+        assert_ne!(
+            unsafe { libc::fcntl(descriptor, libc::F_SETFD, original & !libc::FD_CLOEXEC) },
+            -1
+        );
+
+        mark_non_stdio_close_on_exec(libc::rlim_t::try_from(descriptor).unwrap() + 1).unwrap();
+        let prepared = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        assert_ne!(
+            unsafe { libc::fcntl(descriptor, libc::F_SETFD, original) },
+            -1
+        );
+
+        assert_ne!(prepared, -1);
+        assert_ne!(prepared & libc::FD_CLOEXEC, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_descriptor_preparation_never_marks_stderr_close_on_exec() {
+        let original = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_GETFD) };
+        assert_ne!(original, -1);
+        assert_ne!(
+            unsafe {
+                libc::fcntl(
+                    libc::STDERR_FILENO,
+                    libc::F_SETFD,
+                    original & !libc::FD_CLOEXEC,
+                )
+            },
+            -1
+        );
+        let mut descriptors = Box::<[libc::proc_fdinfo]>::new_uninit_slice(SUPERVISOR_FD_CEILING);
+
+        mark_macos_non_stdio_close_on_exec(&mut descriptors).unwrap();
+        let prepared = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_GETFD) };
+        assert_ne!(
+            unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_SETFD, original) },
+            -1
+        );
+
+        assert_ne!(prepared, -1);
+        assert_eq!(prepared & libc::FD_CLOEXEC, 0);
     }
 
     #[test]
