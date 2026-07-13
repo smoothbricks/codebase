@@ -5,6 +5,7 @@ use cowshed_core::api::{EmptyResult, MountResult};
 use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::{CowshedError, ErrorCode};
 use output::{Output, write_error_envelope, write_success_envelope};
+use serde_json::json;
 use std::path::PathBuf;
 
 #[test]
@@ -55,4 +56,16 @@ fn empty_success_is_object_and_guidance_is_stderr_only() {
         stderr,
         b"cowshed: attached raven\nnext: cowshed path raven\n"
     );
+}
+
+#[test]
+fn bare_streams_and_records_preserve_machine_bytes() {
+    let mut output = Output::new(Vec::new(), Vec::new(), false);
+    output.bare(b"\0raw\n").unwrap();
+    output
+        .bare_record(&json!({"jobId":7,"state":"running"}))
+        .unwrap();
+    let (stdout, stderr) = output.into_inner();
+    assert_eq!(stdout, b"\0raw\n{\"jobId\":7,\"state\":\"running\"}\n");
+    assert!(stderr.is_empty());
 }
