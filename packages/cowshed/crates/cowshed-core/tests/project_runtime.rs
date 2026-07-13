@@ -672,7 +672,10 @@ impl ProjectRuntimeHost for FakeHost {
 
 fn test_root() -> PathBuf {
     let id = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("cowshed-project-runtime-{id}"));
+    let root = std::env::temp_dir().join(format!(
+        "cowshed-project-runtime-{}-{id}",
+        std::process::id()
+    ));
     match std::fs::remove_dir_all(&root) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
