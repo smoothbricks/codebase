@@ -109,8 +109,17 @@ func readOptions(args []string) (compilerOptions, error) {
 				return compilerOptions{}, fmt.Errorf("LMAO1010 --plugins-json contains multiple %s entries", pluginName)
 			}
 			matched = true
-			if len(entry.Config) != 0 {
-				return compilerOptions{}, fmt.Errorf("LMAO1010 %s does not accept configuration options", pluginName)
+			unsupported := ""
+			for option := range entry.Config {
+				if option == "transform" || option == "enabled" {
+					continue
+				}
+				if unsupported == "" || option < unsupported {
+					unsupported = option
+				}
+			}
+			if unsupported != "" {
+				return compilerOptions{}, fmt.Errorf("LMAO1010 %s unsupported configuration option %q", pluginName, unsupported)
 			}
 		}
 	}
