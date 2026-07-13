@@ -12,6 +12,7 @@ pub enum ErrorCode {
     Conflict,
     EnvironmentMissing,
     SandboxDenied,
+    Integrity,
 }
 
 impl ErrorCode {
@@ -23,6 +24,7 @@ impl ErrorCode {
             Self::Conflict => 4,
             Self::EnvironmentMissing => 5,
             Self::SandboxDenied => 6,
+            Self::Integrity => 7,
         }
     }
 
@@ -34,6 +36,7 @@ impl ErrorCode {
             Self::Conflict => 103,
             Self::EnvironmentMissing => 104,
             Self::SandboxDenied => 105,
+            Self::Integrity => 106,
         }
     }
 
@@ -45,6 +48,7 @@ impl ErrorCode {
             Self::Conflict => "conflict",
             Self::EnvironmentMissing => "environment-missing",
             Self::SandboxDenied => "sandbox-denied",
+            Self::Integrity => "integrity",
         }
     }
 }
@@ -86,6 +90,10 @@ impl CowshedError {
         Self::new(ErrorCode::SandboxDenied, message, hint)
     }
 
+    pub fn integrity(message: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Integrity, message, hint)
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Internal, message, "cowshed doctor --json")
     }
@@ -113,21 +121,22 @@ pub type Result<T> = std::result::Result<T, CowshedError>;
 mod tests {
     use super::{CowshedError, ErrorCode};
 
-    const CODES: [ErrorCode; 6] = [
+    const CODES: [ErrorCode; 7] = [
         ErrorCode::Internal,
         ErrorCode::Usage,
         ErrorCode::NotFound,
         ErrorCode::Conflict,
         ErrorCode::EnvironmentMissing,
         ErrorCode::SandboxDenied,
+        ErrorCode::Integrity,
     ];
 
     #[test]
     fn stable_exit_codes_are_frozen() {
-        assert_eq!(CODES.map(ErrorCode::exit_code), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(CODES.map(ErrorCode::exit_code), [1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(
             CODES.map(ErrorCode::exec_wrapper_exit_code),
-            [100, 101, 102, 103, 104, 105]
+            [100, 101, 102, 103, 104, 105, 106]
         );
     }
 
@@ -150,5 +159,19 @@ mod tests {
         assert_eq!(value["code"], "environment-missing");
         assert_eq!(value["message"], "not adopted");
         assert_eq!(value["hint"], "cowshed adopt");
+    }
+
+    #[test]
+    fn integrity_is_a_typed_operational_failure() {
+        let error = CowshedError::integrity(
+            "sealed stdout digest does not match",
+            "cowshed doctor --json",
+        );
+        let value = serde_json::to_value(&error).expect("error serializes");
+
+        assert_eq!(error.exit_code(), 7);
+        assert_eq!(error.exec_wrapper_exit_code(), 106);
+        assert_eq!(value["code"], "integrity");
+        assert_eq!(value["hint"], "cowshed doctor --json");
     }
 }
