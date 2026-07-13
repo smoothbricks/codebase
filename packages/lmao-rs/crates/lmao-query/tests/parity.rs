@@ -61,7 +61,8 @@ fn fixture_batch() -> RecordBatch {
         &["cache {key} hit", "rows {n} returned"],
     ));
     let other = span(root_b, "handle-request", &["user {id} loaded"]);
-    convert_span_trees(&[root, other], &StableVocabularyCatalog::EMPTY).unwrap()
+    let empty_catalog = StableVocabularyCatalog::EMPTY;
+    convert_span_trees(&[root, other], &empty_catalog).unwrap()
 }
 
 #[cfg_attr(not(any(feature = "sqlite", feature = "datafusion")), allow(dead_code))]
@@ -161,7 +162,8 @@ fn stable_and_dynamic_vocabulary_have_query_and_archive_parity() {
         children: vec![],
     };
     let catalog = StableVocabularyCatalog::try_new(&ENTRIES, &VALUE_ORDER).unwrap();
-    let dynamic_batch = convert_span_trees(&[dynamic], &StableVocabularyCatalog::EMPTY).unwrap();
+    let empty_catalog = StableVocabularyCatalog::EMPTY;
+    let dynamic_batch = convert_span_trees(&[dynamic], &empty_catalog).unwrap();
     let static_batch = convert_span_trees(&[static_rows], &catalog).unwrap();
     let dynamic_query = ArrowTraceQuery::new(vec![dynamic_batch.clone()]);
     let static_query = ArrowTraceQuery::new(vec![static_batch.clone()]);
