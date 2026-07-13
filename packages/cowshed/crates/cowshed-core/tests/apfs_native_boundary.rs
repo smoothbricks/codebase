@@ -1,6 +1,6 @@
 use std::ffi::CString;
-use std::path::{Path, PathBuf};
 use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
