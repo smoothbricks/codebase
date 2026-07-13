@@ -66,6 +66,12 @@ impl CommandOutput {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MountAccess {
+    ReadWrite,
+    ReadOnly,
+}
+
 #[derive(Debug)]
 pub struct CommandRunError {
     pub program: PathBuf,
@@ -511,6 +517,7 @@ pub trait ApfsBackend {
         &self,
         attachment: &AttachedImage,
         mount_point: &Path,
+        access: MountAccess,
         browse: bool,
     ) -> Result<(), ApfsError>;
     fn detach(&self, attachment: &AttachedImage, force: bool) -> Result<(), ApfsError>;
@@ -1127,6 +1134,7 @@ impl<R: CommandRunner> ApfsBackend for MacOsApfsBackend<R> {
         &self,
         attachment: &AttachedImage,
         mount_point: &Path,
+        access: MountAccess,
         browse: bool,
     ) -> Result<(), ApfsError> {
         fs::create_dir_all(mount_point).map_err(|source| ApfsError::FileOperation {
@@ -1135,6 +1143,9 @@ impl<R: CommandRunner> ApfsBackend for MacOsApfsBackend<R> {
             source,
         })?;
         let mut args = vec![OsString::from("mount")];
+        if access == MountAccess::ReadOnly {
+            args.push(OsString::from("readOnly"));
+        }
         if !browse {
             args.push(OsString::from("nobrowse"));
         }
@@ -2088,7 +2099,9 @@ mod tests {
         assert_eq!(attachment.whole_device(), "/dev/disk10");
         assert_eq!(attachment.volume_device(), "/dev/disk10s1");
         let mount = std::env::temp_dir().join(format!("cowshed-apfs-test-{}", std::process::id()));
-        backend.mount(&attachment, &mount, false).unwrap();
+        backend
+            .mount(&attachment, &mount, MountAccess::ReadWrite, false)
+            .unwrap();
         let requests = backend.runner().requests();
         assert_eq!(
             requests
@@ -2125,27 +2138,28 @@ mod tests {
     }
 
     #[test]
-    fn mount_always_enables_owners_and_preserves_browse_selection() {
+    fn mount_access_and_browse_selection_construct_exact_diskutil_arguments() {
         let attachment = AttachedImage {
             image: PathBuf::from("session.sparseimage"),
             format: ImageFormat::Sparse,
             whole_device: "/dev/disk4".into(),
             volume_device: "/dev/disk5s2".into(),
         };
-        for browse in [false, true] {
+        for (access, browse) in [
+            (MountAccess::ReadWrite, false),
+            (MountAccess::ReadWrite, true),
+            (MountAccess::ReadOnly, false),
+            (MountAccess::ReadOnly, true),
+        ] {
             let backend =
                 MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success([])]));
-            let mount = temp_path(
-                if browse {
-                    "mount-browse"
-                } else {
-                    "mount-nobrowse"
-                },
-                "mount",
-            );
-            backend.mount(&attachment, &mount, browse).unwrap();
+            let mount = temp_path(&format!("mount-{access:?}-{browse}"), "mount");
+            backend.mount(&attachment, &mount, access, browse).unwrap();
 
             let mut expected = vec!["mount".to_owned()];
+            if access == MountAccess::ReadOnly {
+                expected.push("readOnly".to_owned());
+            }
             if !browse {
                 expected.push("nobrowse".to_owned());
             }
