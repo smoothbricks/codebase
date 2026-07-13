@@ -26,7 +26,7 @@ import type { TraceId } from './traceId.js';
 import type { ITraceRoot } from './traceRoot.js';
 
 // Re-export infrastructure types
-export type { LogBinding, RemappedViewConstructor } from './logBinding.js';
+export type { LogBinding, RemapDescriptor, RemappedColumn, RemappedViewConstructor } from './logBinding.js';
 export type { OpMetadata } from './opContext/opTypes.js';
 export type { extractSpanIdentity, SpanIdentity } from './traceId.js';
 export type { TracerLifecycleHooks } from './traceRoot.js';
@@ -157,6 +157,9 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
    * Per specs/lmao/01b2: Buffers chain rather than resize for predictable allocation.
    */
   _overflow?: AnySpanBuffer;
+
+  /** Immutable cold-path output remapping attached to this canonical buffer. */
+  _remapDescriptor?: import('./logBinding.js').RemapDescriptor;
 
   // ===========================================================================
   // Identity Getters (read from _identity bytes)

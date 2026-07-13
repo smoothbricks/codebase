@@ -17,6 +17,7 @@ import type { PreEncodedEntry } from '@smoothbricks/arrow-builder';
 import type { RemappedViewConstructor } from './logBinding.js';
 import type { SpanContext } from './opContext/spanContextTypes.js';
 import type { OpContext, OpContextBinding } from './opContext/types.js';
+import { getPhysicalLayoutPlan, type PhysicalLayoutPlan } from './physicalLayoutPlan.js';
 import type { Result } from './result.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
 
@@ -63,6 +64,8 @@ export interface OpMetadata {
   readonly git_sha_entry: PreEncodedEntry;
   /** Op-local compile-time log templates; ID n resolves at index n - 1. */
   readonly logTemplateIds: readonly string[];
+  /** Startup-resolved physical layout used by span setup. */
+  readonly _physicalLayoutPlan?: PhysicalLayoutPlan;
 }
 //#endregion smoo/lmao!n/opcontext-hierarchy
 
@@ -100,23 +103,30 @@ export interface OpMetadata {
  * @typeParam E - Error type of the Result
  */
 export class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
+  readonly metadata: OpMetadata;
+  readonly physicalLayoutPlan: PhysicalLayoutPlan<Ctx['logSchema']>;
+  readonly SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>;
+  readonly fn: (ctx: SpanContext<Ctx>, ...args: Args) => Result<S, E> | Promise<Result<S, E>>;
+  readonly remappedViewClass?: RemappedViewConstructor;
+  readonly _opContextBinding?: OpContextBinding;
+  readonly runtimeHint: number;
+
   constructor(
-    /** Op name for metrics, telemetry, and debugging */
-    readonly metadata: OpMetadata,
-    /** Op owns buffer creation - class has static schema + stats shared by all instances */
-    readonly SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-    /** The user function to execute - called by span_op after context creation (can be sync or async) */
-    readonly fn: (ctx: SpanContext<Ctx>, ...args: Args) => Result<S, E> | Promise<Result<S, E>>,
-    /** Only set for prefixed ops - wraps child buffers during registration */
-    readonly remappedViewClass?: RemappedViewConstructor,
-    /**
-     * WHY: Carries the OpContextBinding from the factory that created this Op.
-     * Enables downstream consumers (defineAgentOps, OpRegistry) to extract the
-     * LMAO schema for context merging and conflict detection.
-     */
-    readonly _opContextBinding?: OpContextBinding,
-    /** Packed transformer analysis used to specialize child-span setup. */
-    readonly runtimeHint = 0,
-  ) {}
+    metadata: OpMetadata,
+    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
+    fn: (ctx: SpanContext<Ctx>, ...args: Args) => Result<S, E> | Promise<Result<S, E>>,
+    remappedViewClass?: RemappedViewConstructor,
+    opContextBinding?: OpContextBinding,
+    runtimeHint = 0,
+  ) {
+    const physicalLayoutPlan = getPhysicalLayoutPlan(SpanBufferClass, runtimeHint);
+    this.physicalLayoutPlan = physicalLayoutPlan;
+    this.metadata = Object.freeze({ ...metadata, _physicalLayoutPlan: physicalLayoutPlan });
+    this.SpanBufferClass = physicalLayoutPlan.SpanBufferClass;
+    this.fn = fn;
+    this.remappedViewClass = remappedViewClass;
+    this._opContextBinding = opContextBinding;
+    this.runtimeHint = physicalLayoutPlan.runtimeHint;
+  }
 }
 //#endregion smoo/lmao!n/op-class
