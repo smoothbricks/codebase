@@ -420,13 +420,9 @@ export function getSpanBufferClass<T extends LogSchema>(
       (messagePhysicalLayout === 'packed'
         ? `const timestampView = new BigInt64Array(systemBuffer, 0, requestedCapacity);
        const rowHeaderView = new Uint32Array(systemBuffer, rowHeaderOffset, requestedCapacity);
-       timestampView.fill(0n);
-       rowHeaderView.fill(0);
 `
         : `const timestampView = new BigInt64Array(systemBuffer, 0, requestedCapacity);
        const entryTypeView = new Uint8Array(systemBuffer, requestedCapacity * 8, requestedCapacity);
-       timestampView.fill(0n);
-       entryTypeView.fill(0);
 ` +
           (messageLayoutFamily === 'dynamic-only'
             ? ''
