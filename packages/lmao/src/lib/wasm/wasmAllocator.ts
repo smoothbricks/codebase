@@ -23,6 +23,10 @@
 export interface WasmAllocator {
   /** The underlying WASM memory */
   readonly memory: WebAssembly.Memory;
+  /** Monotonic version of the current linear-memory ArrayBuffer. */
+  readonly memoryVersion: number;
+  /** Refresh canonical allocator views after growth and return memoryVersion. */
+  refreshViews(): number;
 
 
 
@@ -217,6 +221,17 @@ function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Me
   const exports = instance.exports;
   let views = createViews(memory);
   let currentBuffer = memory.buffer;
+  let memoryVersion = 1;
+
+  const refreshViews = (): number => {
+    if (memory.buffer !== currentBuffer) {
+      currentBuffer = memory.buffer;
+      views = createViews(memory);
+      memoryVersion++;
+    }
+    return memoryVersion;
+  };
+
 
   // Initialize the allocator header
   exports.init();
@@ -224,32 +239,25 @@ function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Me
   return {
     memory,
     capacity,
+    get memoryVersion() {
+      return refreshViews();
+    },
+    refreshViews,
+
     get u8() {
-      if (memory.buffer !== currentBuffer) {
-        currentBuffer = memory.buffer;
-        views = createViews(memory);
-      }
+      refreshViews();
       return views.u8;
     },
     get u32() {
-      if (memory.buffer !== currentBuffer) {
-        currentBuffer = memory.buffer;
-        views = createViews(memory);
-      }
+      refreshViews();
       return views.u32;
     },
     get i64() {
-      if (memory.buffer !== currentBuffer) {
-        currentBuffer = memory.buffer;
-        views = createViews(memory);
-      }
+      refreshViews();
       return views.i64;
     },
     get f64() {
-      if (memory.buffer !== currentBuffer) {
-        currentBuffer = memory.buffer;
-        views = createViews(memory);
-      }
+      refreshViews();
       return views.f64;
     },
 
