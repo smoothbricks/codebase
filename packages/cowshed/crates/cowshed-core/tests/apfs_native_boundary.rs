@@ -1419,7 +1419,7 @@ fn interrupted_restore_image_publication(
 }
 
 #[test]
-fn stateless_recovery_completes_image_before_sidecar_publication_after_restart() {
+fn sidecar_first_publication_is_invisible_until_image_rename_and_recovers() {
     let fixture = Fixture::new("publish-image-boundary");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
     let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
@@ -1430,17 +1430,22 @@ fn stateless_recovery_completes_image_before_sidecar_publication_after_restart()
     create_image(&staged, ImageFormat::Sparse);
     std::fs::write(&staged, b"published generation").expect("staged bytes");
     let host = native_host(&fixture, RecordingRunner::default());
-    host.set_restore_failpoint(RestoreFailpoint::AfterCanonicalImageRename);
+    host.set_restore_failpoint(RestoreFailpoint::AfterMetadataFsync);
     host.publish_image(&staged, canonical.image())
-        .expect_err("crash after image rename");
-    assert!(canonical.image().exists());
-    assert!(!sidecar_path(canonical.image()).exists());
-    assert!(sidecar_path(&staged).exists());
+        .expect_err("crash after durable sidecar publication");
+    assert!(!canonical.image().exists());
+    assert!(sidecar_path(canonical.image()).exists());
+    assert!(staged.exists());
+    assert!(!sidecar_path(&staged).exists());
+    assert!(
+        host.list(&repo()).expect("sidecar-only listing").is_empty(),
+        "readers enumerate images, so sidecar-only publication remains invisible"
+    );
 
     drop(host);
     let restarted = native_host(&fixture, RecordingRunner::default());
     restarted
-        .recover_pending(&fixture.config())
+        .recover_pending(&fixture.config(), &[])
         .expect("complete sidecar publication");
     assert_eq!(
         std::fs::read(canonical.image()).expect("canonical"),
@@ -1449,7 +1454,7 @@ fn stateless_recovery_completes_image_before_sidecar_publication_after_restart()
     DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("canonical metadata");
     assert!(!sidecar_path(&staged).exists());
     restarted
-        .recover_pending(&fixture.config())
+        .recover_pending(&fixture.config(), &[])
         .expect("repeated recovery is idempotent");
 }
 
@@ -1635,7 +1640,7 @@ fn adopt_recovery_waits_for_handoff_then_completes_publication_after_restart() {
     std::fs::write(before_config.main_mount.join("tracked"), b"source").expect("source file");
     let before_host = native_host(&before, RecordingRunner::default());
     before_host
-        .recover_pending(&before_config)
+        .recover_pending(&before_config, &[])
         .expect("pre-handoff recovery");
     assert!(before_staged.exists());
     assert!(!before_canonical.image().exists());
@@ -1666,7 +1671,7 @@ fn adopt_recovery_waits_for_handoff_then_completes_publication_after_restart() {
     std::fs::rename(&after_config.main_mount, &after_pre).expect("simulate handoff crash");
 
     native_host(&after, RecordingRunner::default())
-        .recover_pending(&after_config)
+        .recover_pending(&after_config, &[])
         .expect("post-handoff recovery");
     assert!(after_canonical.image().exists());
     assert!(!after_staged.exists());
@@ -1812,7 +1817,7 @@ fn recovery_ignores_unscoped_and_non_internal_restore_lookalikes() {
         .expect("mismatched undo metadata");
 
     let host = native_host(&fixture, RecordingRunner::default());
-    host.recover_pending(&fixture.config())
+    host.recover_pending(&fixture.config(), &[])
         .expect("ignore lookalikes");
     assert_eq!(
         std::fs::read(canonical.image()).expect("canonical"),
@@ -1838,7 +1843,7 @@ fn recovery_rejects_a_non_directory_store_root_and_ignores_file_children() {
     std::fs::write(&file_config.store_root, b"not a directory").expect("file store root");
     assert!(
         native_host(&file_root, RecordingRunner::default())
-            .recover_pending(&file_config)
+            .recover_pending(&file_config, &[])
             .is_err(),
         "a non-directory store root is corruption, not an empty store"
     );
@@ -1848,7 +1853,7 @@ fn recovery_rejects_a_non_directory_store_root_and_ignores_file_children() {
     std::fs::create_dir_all(&child_config.store_root).expect("store root");
     std::fs::write(child_config.store_root.join("not-a-project"), b"file").expect("child file");
     native_host(&child_file, RecordingRunner::default())
-        .recover_pending(&child_config)
+        .recover_pending(&child_config, &[])
         .expect("non-directory children are not project roots");
 }
 
@@ -1869,7 +1874,7 @@ fn recovery_never_publishes_metadata_without_its_staged_image() {
         .expect("orphan staging metadata");
 
     native_host(&fixture, RecordingRunner::default())
-        .recover_pending(&fixture.config())
+        .recover_pending(&fixture.config(), &[])
         .expect("recovery");
     assert!(sidecar_path(&staged).exists());
     assert!(!sidecar_path(canonical.image()).exists());
@@ -1887,7 +1892,7 @@ fn recovery_rolls_forward_published_metadata_before_undo_rename() {
     drop(host);
     let runner = RecordingRunner::default();
     let host = native_host(&fixture, runner.clone());
-    host.recover_pending(&fixture.config())
+    host.recover_pending(&fixture.config(), &[])
         .expect("roll forward");
 
     assert_eq!(
@@ -1958,7 +1963,7 @@ fn recovery_rolls_back_when_published_metadata_is_missing() {
 
     drop(host);
     let host = native_host(&fixture, RecordingRunner::default());
-    host.recover_pending(&fixture.config())
+    host.recover_pending(&fixture.config(), &[])
         .expect("missing publication evidence rolls back");
     assert_eq!(
         std::fs::read(canonical.image()).expect("canonical"),
@@ -1983,7 +1988,7 @@ fn recovery_accepts_an_already_rolled_back_canonical_layout() {
 
     drop(host);
     let host = native_host(&fixture, RecordingRunner::default());
-    host.recover_pending(&fixture.config())
+    host.recover_pending(&fixture.config(), &[])
         .expect("recognize old canonical");
 
     assert_eq!(
@@ -2002,7 +2007,7 @@ fn recovery_restores_missing_prepublication_canonical_metadata() {
 
     drop(host);
     let host = native_host(&fixture, RecordingRunner::default());
-    host.recover_pending(&fixture.config())
+    host.recover_pending(&fixture.config(), &[])
         .expect("restore metadata from undo");
 
     assert_eq!(
@@ -2090,7 +2095,7 @@ fn stateless_restore_recovery_converges_each_publication_boundary() {
 
         drop(host);
         let host = native_host(&fixture, RecordingRunner::default());
-        host.recover_pending(&fixture.config())
+        host.recover_pending(&fixture.config(), &[])
             .expect("restart recovery");
         let canonical_metadata =
             DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("metadata");
@@ -2291,4 +2296,85 @@ fn gc_skips_staging_owned_by_an_active_lifecycle_lock() {
     assert!(report.reclaimed >= 1);
     assert!(!staged.exists());
     assert!(!sidecar_path(&staged).exists());
+}
+
+#[test]
+fn lock_and_command_targets_reject_intermediate_symlink_ancestors_without_effects() {
+    let fixture = Fixture::new("symlink-ancestor");
+    let runner = RecordingRunner::default();
+    let host = native_host(&fixture, runner.clone());
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    let attacker = fixture.root.join("attacker");
+    std::fs::create_dir(&attacker).expect("attacker directory");
+    std::os::unix::fs::symlink(&attacker, fixture.root.join("acme")).expect("owner symlink");
+
+    assert!(
+        host.lock_images(&[canonical.lock().to_owned()], LockMode::Try)
+            .is_err(),
+        "dirfd traversal must reject a symlinked owner"
+    );
+    let request = CreateImageRequest {
+        staged_stem: layout
+            .project()
+            .project_root
+            .join(".staging/main-00000000000000000000000000000001"),
+        capacity: "1g".to_owned(),
+        volume_name: "cowshed.acme--widget.main".to_owned(),
+        case_sensitivity: ApfsCaseSensitivity::Insensitive,
+        image_format: ImageFormatSelection::Exact(ImageFormat::Sparse),
+        owner_uid: 501,
+        owner_gid: 20,
+    };
+    assert!(
+        host.create_staged(&request, ImageFormat::Sparse).is_err(),
+        "command target validation must reject the same ancestor"
+    );
+    assert!(runner.requests().is_empty(), "no APFS command may spawn");
+    assert!(
+        std::fs::read_dir(&attacker)
+            .expect("attacker directory")
+            .next()
+            .is_none(),
+        "no lock or image may be created through the symlink"
+    );
+}
+
+#[test]
+fn gc_first_recovers_post_handoff_adopt_before_pruning_staging() {
+    let fixture = Fixture::new("gc-first-adopt");
+    let config = fixture.config();
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    let staged = layout
+        .project()
+        .project_root
+        .join(".staging/main-00000000000000000000000000000001.sparseimage");
+    create_image(&staged, ImageFormat::Sparse);
+    std::fs::write(&staged, b"complete adopted image").expect("staged bytes");
+    std::fs::create_dir_all(&config.main_mount).expect("source checkout");
+    std::fs::write(config.main_mount.join("tracked"), b"original source").expect("source bytes");
+    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.main_mount.display()));
+    std::fs::rename(&config.main_mount, &pre_cowshed).expect("simulate completed handoff");
+
+    let host = native_host(&fixture, RecordingRunner::default());
+    host.gc(&config).expect("GC-first recovery");
+    assert_eq!(
+        std::fs::read(canonical.image()).expect("canonical image"),
+        b"complete adopted image"
+    );
+    DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("canonical metadata");
+    assert_eq!(
+        std::fs::read(pre_cowshed.join("tracked")).expect("preserved source"),
+        b"original source"
+    );
+    assert!(config.main_mount.is_dir());
+    assert!(!staged.exists());
+    assert!(!sidecar_path(&staged).exists());
+
+    host.gc(&config).expect("repeated GC converges");
+    host.recover_pending(&config, &[])
+        .expect("repeated recovery converges");
+    assert!(canonical.image().exists());
+    assert!(sidecar_path(canonical.image()).exists());
 }
