@@ -369,11 +369,8 @@ fn directory_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageError
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(io_error("inspect recovery directory", directory, error)),
     }
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(io_error("enumerate recovery directory", directory, error)),
-    };
+    let entries = fs::read_dir(directory)
+        .map_err(|error| io_error("enumerate recovery directory", directory, error))?;
     entries
         .filter_map(|entry| match entry {
             Ok(entry) => match fs::symlink_metadata(entry.path()) {
@@ -407,11 +404,8 @@ fn regular_file_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageEr
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(io_error("inspect recovery directory", directory, error)),
     }
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(io_error("enumerate recovery directory", directory, error)),
-    };
+    let entries = fs::read_dir(directory)
+        .map_err(|error| io_error("enumerate recovery directory", directory, error))?;
     entries
         .filter_map(|entry| match entry {
             Ok(entry) => match fs::symlink_metadata(entry.path()) {
@@ -2781,10 +2775,15 @@ mod tests {
         let regular_file = directory.join("entry.asif");
         let directory_link = root.join("directory-link");
         let file_link = directory.join("entry-link.asif");
+        let loop_a = root.join("loop-a");
+        let loop_b = root.join("loop-b");
+        let loop_child = loop_a.join("child");
         std::fs::create_dir_all(&child_directory).expect("child directory");
         std::fs::write(&regular_file, b"image").expect("regular file");
         std::os::unix::fs::symlink(&directory, &directory_link).expect("directory symlink");
         std::os::unix::fs::symlink(&regular_file, &file_link).expect("file symlink");
+        std::os::unix::fs::symlink("loop-b", &loop_a).expect("first loop symlink");
+        std::os::unix::fs::symlink("loop-a", &loop_b).expect("second loop symlink");
 
         assert!(
             directory_children(&root.join("missing"))
@@ -2797,6 +2796,7 @@ mod tests {
                 .is_empty()
         );
         assert!(directory_children(&regular_file).is_err());
+        assert!(directory_children(&loop_child).is_err());
         assert_eq!(
             directory_children(&directory).expect("directory children"),
             vec![child_directory]
@@ -2813,6 +2813,7 @@ mod tests {
                 .is_empty()
         );
         assert!(regular_file_children(&regular_file).is_err());
+        assert!(regular_file_children(&loop_child).is_err());
         assert_eq!(
             regular_file_children(&directory).expect("regular file children"),
             vec![regular_file]
