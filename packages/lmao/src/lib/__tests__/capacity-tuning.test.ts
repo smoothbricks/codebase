@@ -2,7 +2,6 @@ import { beforeEach, describe, expect, it } from 'bun:test';
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import fc from 'fast-check';
 import { shouldTuneCapacity } from '../capacityTuning.js';
-import { createSpanLogger } from '../codegen/spanLoggerGenerator.js';
 import { DEFAULT_METADATA } from '../opContext/defineOp.js';
 import { S } from '../schema/builder.js';
 import { LogSchema } from '../schema/LogSchema.js';
@@ -10,7 +9,7 @@ import { mergeWithSystemSchema } from '../schema/systemSchema.js';
 import { createSpanBuffer, getSpanBufferClass } from '../spanBuffer.js';
 import type { SpanBufferStats } from '../spanBufferStats.js';
 
-import { createTestTraceRoot, createTestTracerOptions } from './test-helpers.js';
+import { createTestSpanContext, createTestTraceRoot, createTestTracerOptions } from './test-helpers.js';
 
 /**
  * Create mock SpanBufferStats for testing capacity tuning.
@@ -489,12 +488,15 @@ describe('Capacity Tuning Algorithm', () => {
           DEFAULT_METADATA,
           undefined,
         );
-        const logger = createSpanLogger(integrationSchema, buffer);
+        const ctx = createTestSpanContext(integrationSchema, buffer);
+        ctx._buffer._writeIndex = 2;
+        const logger = ctx._spanLogger;
 
         // Write 10 entries per span (160% utilization of 6 usable rows)
         for (let i = 0; i < 10; i++) {
           logger.info(`message ${i}`);
         }
+        buffer._sealStatsChain();
       }
 
       // After 12 spans with 10 writes each = 120 writes

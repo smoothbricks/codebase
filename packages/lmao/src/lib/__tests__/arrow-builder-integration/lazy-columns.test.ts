@@ -3,7 +3,12 @@ import { createColumnBuffer } from '@smoothbricks/arrow-builder';
 import { createTagWriter, S } from '@smoothbricks/lmao';
 import { createSpanBuffer } from '../../spanBuffer.js';
 
-import { createTestOpMetadata, createTestSchema, createTestTraceRoot } from '../test-helpers.js';
+import {
+  createTestOpMetadata,
+  createTestSchema,
+  createTestSpanContext,
+  createTestTraceRoot,
+} from '../test-helpers.js';
 
 /**
  * Tests for lazy column initialization
@@ -331,6 +336,7 @@ describe('SpanBuffer Lazy Column Allocation', () => {
     });
 
     const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata(), 8);
+    const context = createTestSpanContext(schema, buffer);
 
     // Lazy columns should be undefined before TagWriter access
     expect(buffer.getColumnIfAllocated('userId')).toBeUndefined();
@@ -339,7 +345,7 @@ describe('SpanBuffer Lazy Column Allocation', () => {
     expect(buffer.getColumnIfAllocated('operation')).toBeUndefined();
 
     // Create TagWriter and write to one column (createTagWriter expects LogSchema instance)
-    const tagWriter = createTagWriter(schema, buffer);
+    const tagWriter = createTagWriter(schema, context);
     tagWriter.userId('user-123');
 
     // After TagWriter write, the column should be allocated

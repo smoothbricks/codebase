@@ -7,23 +7,21 @@
  * Architecture changes (new design):
  * - SpanLogger handles log entries (rows 2+), NOT tag writes (row 0)
  * - Tag writing is done via ctx.tag which is a separate API (not on SpanLogger)
- * - SpanLogger constructor: (buffer, createNextBuffer)
- * - SpanLogger._writeIndex starts at 1 (rows 0/1 are reserved for span-start/end)
+ * - SpanLogger owns only `_state`, shared with its SpanContext
+ * - SpanContext owns the active buffer and write index state
  * - _setScope() stores scope values in buffer._scopeValues (immutable, frozen)
  * - Scope filling happens at Arrow conversion time, NOT during span execution
  * - Direct writes (tag/log) win over scope values on their respective rows
  */
 
 import { describe, expect, it } from 'bun:test';
-import { createBuffer, createTestTraceRoot } from '../../__tests__/test-helpers.js';
+import { createBuffer, createTestSchema, createTestSpanContext, createTestTraceRoot } from '../../__tests__/test-helpers.js';
 import { DEFAULT_METADATA } from '../../opContext/defineOp.js';
 import { S } from '../../schema/builder.js';
-import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import type { LogSchema } from '../../schema/types.js';
 import { createSpanBuffer, SpanBufferTestUtils } from '../../spanBuffer.js';
 
 import type { SpanBuffer } from '../../types.js';
-import { createSpanLogger } from '../spanLoggerGenerator.js';
 
 /**
  * Create a test buffer from a schema
@@ -36,12 +34,13 @@ function createTestBuffer<T extends LogSchema>(schema: T): SpanBuffer<T> {
 describe('null bitmap correctness', () => {
   describe('immutable scope semantics', () => {
     it('should store scope values in buffer._scopeValues as frozen object', () => {
-      const schema = defineLogSchema({
+      const schema = createTestSchema({
         requestId: S.category(),
       });
       const buffer = createTestBuffer(schema);
 
-      const logger = createSpanLogger(schema, buffer);
+      const ctx = createTestSpanContext(schema, buffer);
+      const logger = ctx._spanLogger;
 
       // _setScope should store values in buffer._scopeValues (not fill buffer columns)
       logger._setScope({ requestId: 'req-123' });
@@ -55,13 +54,14 @@ describe('null bitmap correctness', () => {
     });
 
     it('should create new frozen object on each _setScope call (merge semantics)', () => {
-      const schema = defineLogSchema({
+      const schema = createTestSchema({
         requestId: S.category(),
         userId: S.category(),
       });
       const buffer = createTestBuffer(schema);
 
-      const logger = createSpanLogger(schema, buffer);
+      const ctx = createTestSpanContext(schema, buffer);
+      const logger = ctx._spanLogger;
 
       // First setScope call
       logger._setScope({ requestId: 'req-123' });
@@ -86,13 +86,14 @@ describe('null bitmap correctness', () => {
     });
 
     it('should clear keys when null is passed (null clears, undefined ignores)', () => {
-      const schema = defineLogSchema({
+      const schema = createTestSchema({
         requestId: S.category(),
         userId: S.category(),
       });
       const buffer = createTestBuffer(schema);
 
-      const logger = createSpanLogger(schema, buffer);
+      const ctx = createTestSpanContext(schema, buffer);
+      const logger = ctx._spanLogger;
 
       // Set initial values
       logger._setScope({ requestId: 'req-123', userId: 'user-456' });
@@ -108,12 +109,13 @@ describe('null bitmap correctness', () => {
     });
 
     it('should NOT fill buffer columns during _setScope (deferred to Arrow conversion)', () => {
-      const schema = defineLogSchema({
+      const schema = createTestSchema({
         requestId: S.category(),
       });
       const buffer = createTestBuffer(schema);
 
-      const logger = createSpanLogger(schema, buffer);
+      const ctx = createTestSpanContext(schema, buffer);
+      const logger = ctx._spanLogger;
 
       // _setScope should NOT fill buffer columns
       logger._setScope({ requestId: 'req-123' });
@@ -133,7 +135,7 @@ describe('null bitmap correctness', () => {
       // - Scope values are stored in buffer._scopeValues as a plain object
       // - Scope filling happens at Arrow conversion time, NOT during span execution
       // - This is because scope values are "defaults" that fill null slots
-      const schema = defineLogSchema({
+      const schema = createTestSchema({
         requestId: S.category(),
       });
       const buffer = createTestBuffer(schema);
@@ -141,10 +143,11 @@ describe('null bitmap correctness', () => {
       // Set scope value via buffer._scopeValues directly for test setup
       buffer._scopeValues = Object.freeze({ requestId: 'req-123' });
 
-      const logger = createSpanLogger(schema, buffer);
+      const ctx = createTestSpanContext(schema, buffer);
+      const logger = ctx._spanLogger;
 
-      // Set _writeIndex to 4 so nextRow() makes it 5
-      logger._writeIndex = 4;
+      // Set the shared writer state so the next append writes row 5
+      ctx._buffer._writeIndex = 5;
 
       // Log a message - this does NOT write scoped attributes during execution
       // Scope values are filled at Arrow conversion time
@@ -162,7 +165,7 @@ describe('null bitmap correctness', () => {
     it('should NOT set null bitmap at index 9 during info() - scope is deferred', () => {
       // Same as above - scope values are NOT written during span execution
       // They are stored in buffer._scopeValues and filled at Arrow conversion
-      const schema = defineLogSchema({
+      const schema = createTestSchema({
         requestId: S.category(),
       });
       // Need capacity > 9 to test writing at index 9
@@ -171,10 +174,11 @@ describe('null bitmap correctness', () => {
       // Set scope value via buffer._scopeValues directly for test setup
       buffer._scopeValues = Object.freeze({ requestId: 'req-456' });
 
-      const logger = createSpanLogger(schema, buffer);
+      const ctx = createTestSpanContext(schema, buffer);
+      const logger = ctx._spanLogger;
 
-      // Set _writeIndex to 8 so nextRow() makes it 9
-      logger._writeIndex = 8;
+      // Set the shared writer state so the next append writes row 9
+      ctx._buffer._writeIndex = 9;
 
       // Log a message - does NOT write scoped attributes immediately
       logger.info('test message');

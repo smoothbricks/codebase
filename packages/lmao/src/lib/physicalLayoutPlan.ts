@@ -4,8 +4,14 @@ import {
   getTagWriterClass,
   type ResultWriterConstructor,
   type TagWriter,
+  type TagWriterConstructor,
+  type WriterState,
 } from './codegen/fixedPositionWriterGenerator.js';
-import { createSpanLoggerClass, type SpanLoggerImpl } from './codegen/spanLoggerGenerator.js';
+import {
+  createSpanLoggerClass,
+  type SpanLoggerConstructor,
+  type SpanLoggerImpl,
+} from './codegen/spanLoggerGenerator.js';
 import type { RemapDescriptor } from './logBinding.js';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { OpContext } from './opContext/types.js';
@@ -24,9 +30,8 @@ import {
 import type { LogSchema } from './schema/LogSchema.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from './schema/systemSchema.js';
 import { getSpanBufferClass, type SpanBufferConstructor } from './spanBuffer.js';
-import type { AnySpanBuffer, SpanBuffer } from './types.js';
+import type { AnySpanBuffer } from './types.js';
 import type { SpanContextClass } from './spanContext.js';
-import type { ITraceRoot, TimestampAppendPrimitive } from './traceRoot.js';
 import { getVocabularyGeneration, type VocabularyGeneration } from './vocabularyRegistry.js';
 import { createWasmLayoutTemplate, type WasmLayoutTemplate } from './wasm/wasmPhysicalLayout.js';
 
@@ -105,13 +110,9 @@ export interface PhysicalLayoutPlan<
   /** Exact constructor selected at startup for this plan's capability/layout signature. */
   readonly SpanContextClass: SpanContextClass<Ctx>;
   readonly SpanBufferClass: SpanBufferConstructor<T>;
-  readonly SpanLoggerClass: new (
-    buffer: AnySpanBuffer,
-    traceRoot: ITraceRoot,
-    appendLogEntry: TimestampAppendPrimitive,
-  ) => SpanLoggerImpl<T>;
-  readonly TagWriterClass: new (buffer: AnySpanBuffer) => TagWriter<T>;
-  readonly ResultWriterClass: ResultWriterConstructor<T>;
+  readonly SpanLoggerClass: SpanLoggerConstructor<T>;
+  readonly TagWriterClass: TagWriterConstructor<T>;
+  readonly ResultWriterClass: ResultWriterConstructor;
   readonly clock: PhysicalClock;
   readonly appenders: PhysicalAppenders;
   /** Immutable global vocabulary generation used by dense row identities in this plan. */
@@ -121,8 +122,8 @@ export interface PhysicalLayoutPlan<
   readonly remapDescriptor: RemapDescriptor | null;
   readonly newCtx0: (parent: object) => object;
   readonly newCtx1: (parent: object, overrides: object) => object;
-  readonly newSpanLogger: ((buffer: SpanBuffer<T>) => SpanLoggerImpl<T>) | undefined;
-  readonly newTagWriter: ((buffer: AnySpanBuffer) => TagWriter<T>) | undefined;
+  readonly newSpanLogger: ((state: WriterState) => SpanLoggerImpl<T>) | undefined;
+  readonly newTagWriter: ((state: WriterState) => TagWriter<T>) | undefined;
   readonly wasmLayout: WasmLayoutTemplate;
 }
 
@@ -245,12 +246,9 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
   const needsLogger = (capabilities & (RUNTIME_HINT_LOG | RUNTIME_HINT_FF | RUNTIME_HINT_SCOPE)) !== 0;
   const needsTag = (capabilities & RUNTIME_HINT_TAG) !== 0;
   const newSpanLogger = needsLogger
-    ? (buffer: SpanBuffer<T>): SpanLoggerImpl<T> => {
-        const traceRoot = buffer._traceRoot;
-        return new SpanLoggerClass(buffer, traceRoot, traceRoot._appendLogEntry);
-      }
+    ? (state: WriterState): SpanLoggerImpl<T> => new SpanLoggerClass(state)
     : undefined;
-  const newTagWriter = needsTag ? (buffer: AnySpanBuffer): TagWriter<T> => new TagWriterClass(buffer) : undefined;
+  const newTagWriter = needsTag ? (state: WriterState): TagWriter<T> => new TagWriterClass(state) : undefined;
   const wasmLayout = createWasmLayoutTemplate(schema, messageLayoutFamily, eagerColumns);
 
   return Object.freeze({

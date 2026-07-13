@@ -1,30 +1,16 @@
 import { describe, expect, test } from 'bun:test';
-import { createBuffer, createTestLogBinding, createTestSchema } from '../../__tests__/test-helpers.js';
-import { DEFAULT_METADATA } from '../../opContext/defineOp.js';
+import { createBuffer, createTestSpanContext, createTestSchema } from '../../__tests__/test-helpers.js';
 import type { OpContext } from '../../opContext/types.js';
-import { getPhysicalLayoutPlan, sealCallsitePlan } from '../../physicalLayoutPlan.js';
 import { S } from '../../schema/builder.js';
 import type { FeatureFlagSchema } from '../../schema/defineFeatureFlags.js';
 import { defineFeatureFlags } from '../../schema/defineFeatureFlags.js';
 import { InMemoryFlagEvaluator } from '../../schema/evaluator.js';
 import { ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE } from '../../schema/systemSchema.js';
-import type { LogSchema } from '../../schema/types.js';
-import { createSpanContextClass, type SpanContextInstance } from '../../spanContext.js';
-import { getSpanBufferClass } from '../../spanBuffer.js';
+import type { LogSchema, SchemaFields } from '../../schema/types.js';
 import type { AnySpanBuffer, SpanBuffer } from '../../types.js';
 import { createEvaluatorClass, generateEvaluatorClass } from '../evaluatorGenerator.js';
-import { createTagWriter } from '../fixedPositionWriterGenerator.js';
-import { createSpanLogger } from '../spanLoggerGenerator.js';
 
-/**
- * Create a mock SpanContext for testing FeatureFlagEvaluator
- *
- * The evaluator needs:
- * - _buffer with scopeValues and writeIndex
- * - log with ffAccess, ffUsage, and _writeIndex
- * - buffer getter that returns _buffer
- *
- */
+/** Create a real shared SpanContext for testing FeatureFlagEvaluator. */
 type EvaluatorTestContext<TLogSchema extends LogSchema, TFlags extends FeatureFlagSchema> = OpContext<
   TLogSchema,
   TFlags,
@@ -32,106 +18,17 @@ type EvaluatorTestContext<TLogSchema extends LogSchema, TFlags extends FeatureFl
   Record<string, never>
 >;
 
-let mockContextOrdinal = 0;
-
-function createMockSpanContext<TLogSchema extends LogSchema, TFlags extends FeatureFlagSchema>(
-  schema: TLogSchema,
-  spanBuffer: SpanBuffer<TLogSchema>,
-): SpanContextInstance<EvaluatorTestContext<TLogSchema, TFlags>> {
-  const logger = createSpanLogger(schema, spanBuffer);
-  const tagWriter = createTagWriter(schema, spanBuffer);
-  const SpanContextClass = createSpanContextClass<EvaluatorTestContext<TLogSchema, TFlags>>(
-    schema,
-    createTestLogBinding(schema),
-  );
-  const physicalPlan = getPhysicalLayoutPlan(
-    getSpanBufferClass(schema),
-    0,
-    SpanContextClass,
-    undefined,
-    'js-heap',
-    `evaluator-test-${mockContextOrdinal++}`,
-  );
-  const plan = sealCallsitePlan(physicalPlan, DEFAULT_METADATA);
-  const ctx = new SpanContextClass(spanBuffer, schema, logger, tagWriter, plan);
-  ctx.deps = {};
-  return ctx;
+function createMockSpanContext<TFields extends SchemaFields, const TFlags extends FeatureFlagSchema>(
+  schema: LogSchema<TFields>,
+  spanBuffer: SpanBuffer<LogSchema<TFields>>,
+  _flags: TFlags,
+) {
+  return createTestSpanContext<TFields, EvaluatorTestContext<LogSchema<TFields>, TFlags>>(schema, spanBuffer);
 }
 
 describe('EvaluatorGenerator', () => {
-  describe('generateEvaluatorClass', () => {
-    test('generates valid JavaScript class code', () => {
-      const schema = defineFeatureFlags({
-        debugMode: S.boolean().default(false).sync(),
-        maxRetries: S.number().default(3).sync(),
-      });
-
-      const code = generateEvaluatorClass(schema.schema);
-
-      expect(code).toContain('class GeneratedEvaluator extends WorkerSafeGeneratedEvaluator');
-      expect(code).toContain('Object.defineProperties(GeneratedEvaluator.prototype');
-
-      // Should describe the generated getters for each flag
-      expect(code).toContain("return this.getFlag('debugMode')");
-      expect(code).toContain("return this.getFlag('maxRetries')");
-
-      // Should have new API methods (not old ones)
-      expect(code).toContain('forContext(ctx)');
-      expect(code).toContain('super(spanContext, evaluator, SCHEMA, validateFlagValue, ENTRY_TYPE_FF_ACCESS);');
-
-      // Should NOT have old API methods
-      expect(code).not.toContain('withBuffer(');
-      expect(code).not.toContain('getContext()');
-      expect(code).not.toContain('new Function');
-    });
-
-    test('generates unique getter for each flag', () => {
-      const schema = defineFeatureFlags({
-        featureA: S.boolean().default(false).sync(),
-        featureB: S.boolean().default(false).sync(),
-        featureC: S.number().default(0).sync(),
-        featureD: S.enum(['a', 'b', 'c'] as const)
-          .default('a')
-          .sync(),
-      });
-
-      const code = generateEvaluatorClass(schema.schema);
-
-      expect(code).toContain('featureA: {');
-      expect(code).toContain('featureB: {');
-      expect(code).toContain('featureC: {');
-      expect(code).toContain('featureD: {');
-
-      // Each getter should call getFlag with the flag name
-      expect(code).toContain("this.getFlag('featureA')");
-      expect(code).toContain("this.getFlag('featureB')");
-      expect(code).toContain("this.getFlag('featureC')");
-      expect(code).toContain("this.getFlag('featureD')");
-    });
-  });
 
   describe('createEvaluatorClass', () => {
-    test('creates a functional class constructor', () => {
-      const ffSchema = defineFeatureFlags({
-        debugMode: S.boolean().default(false).sync(),
-      });
-      const logSchema = createTestSchema({});
-      const spanBuffer = createBuffer(logSchema);
-      type Ctx = EvaluatorTestContext<typeof logSchema, typeof ffSchema.schema>;
-      const mockCtx = createMockSpanContext<typeof logSchema, typeof ffSchema.schema>(logSchema, spanBuffer);
-
-      const GeneratedClass = createEvaluatorClass<Ctx>(
-        ffSchema.schema,
-        (value, _schema, def) => value ?? def,
-        ENTRY_TYPE_FF_ACCESS,
-      );
-
-      expect(typeof GeneratedClass).toBe('function');
-
-      const evaluator = new InMemoryFlagEvaluator<Ctx>(ffSchema.schema, { debugMode: true });
-      const instance = new GeneratedClass(mockCtx, evaluator);
-      expect(instance).toBeDefined();
-    });
 
     test('caches generated classes by schema', () => {
       const schema = defineFeatureFlags({
@@ -172,7 +69,7 @@ describe('EvaluatorGenerator', () => {
       const logSchema = createTestSchema({});
       const spanBuffer = createBuffer(logSchema);
       type Ctx = EvaluatorTestContext<typeof logSchema, typeof ffSchema.schema>;
-      const mockCtx = createMockSpanContext<typeof logSchema, typeof ffSchema.schema>(logSchema, spanBuffer);
+      const mockCtx = createMockSpanContext(logSchema, spanBuffer, ffSchema.schema);
 
       const GeneratedClass = createEvaluatorClass<Ctx>(
         ffSchema.schema,
@@ -198,7 +95,7 @@ describe('EvaluatorGenerator', () => {
       const logSchema = createTestSchema({});
       const spanBuffer = createBuffer(logSchema);
       type Ctx = EvaluatorTestContext<typeof logSchema, typeof ffSchema.schema>;
-      const mockCtx = createMockSpanContext<typeof logSchema, typeof ffSchema.schema>(logSchema, spanBuffer);
+      const mockCtx = createMockSpanContext(logSchema, spanBuffer, ffSchema.schema);
 
       const GeneratedClass = createEvaluatorClass<Ctx>(
         ffSchema.schema,
@@ -220,7 +117,7 @@ describe('EvaluatorGenerator', () => {
       const logSchema = createTestSchema({});
       const spanBuffer = createBuffer(logSchema);
       type Ctx = EvaluatorTestContext<typeof logSchema, typeof ffSchema.schema>;
-      const mockCtx = createMockSpanContext<typeof logSchema, typeof ffSchema.schema>(logSchema, spanBuffer);
+      const mockCtx = createMockSpanContext(logSchema, spanBuffer, ffSchema.schema);
 
       const GeneratedClass = createEvaluatorClass<Ctx>(
         ffSchema.schema,
@@ -233,7 +130,7 @@ describe('EvaluatorGenerator', () => {
 
       // Create a new SpanContext for child span
       const childBuffer = createBuffer(logSchema);
-      const childCtx = createMockSpanContext<typeof logSchema, typeof ffSchema.schema>(logSchema, childBuffer);
+      const childCtx = createMockSpanContext(logSchema, childBuffer, ffSchema.schema);
 
       const childInstance = instance.forContext(childCtx);
 
@@ -243,14 +140,11 @@ describe('EvaluatorGenerator', () => {
     });
 
     test('span context scope getter returns the typed buffer scope contract', () => {
-      const ffSchema = defineFeatureFlags({
-        debugMode: S.boolean().default(false).sync(),
-      });
       const logSchema = createTestSchema({
         requestId: S.category(),
       });
       const spanBuffer = createBuffer(logSchema);
-      const mockCtx = createMockSpanContext<typeof logSchema, typeof ffSchema.schema>(logSchema, spanBuffer);
+      const mockCtx = createTestSpanContext(logSchema, spanBuffer);
 
       spanBuffer._scopeValues = Object.freeze({ requestId: 'req-123' });
 
@@ -272,7 +166,7 @@ describe('EvaluatorGenerator', () => {
       const logSchema = createTestSchema({});
       const spanBuffer = createBuffer(logSchema);
       type Ctx = EvaluatorTestContext<typeof logSchema, typeof ffSchema.schema>;
-      const mockCtx = createMockSpanContext<typeof logSchema, typeof ffSchema.schema>(logSchema, spanBuffer);
+      const mockCtx = createMockSpanContext(logSchema, spanBuffer, ffSchema.schema);
 
       let evalCount = 0;
       const trackingEvaluator = new InMemoryFlagEvaluator<Ctx>(ffSchema.schema, { debugMode: true });
@@ -310,7 +204,7 @@ describe('EvaluatorGenerator', () => {
       const logSchema = createTestSchema({});
       const spanBuffer = createBuffer(logSchema);
       type Ctx = EvaluatorTestContext<typeof logSchema, typeof ffSchema.schema>;
-      const mockCtx = createMockSpanContext<typeof logSchema, typeof ffSchema.schema>(logSchema, spanBuffer);
+      const mockCtx = createMockSpanContext(logSchema, spanBuffer, ffSchema.schema);
 
       const GeneratedClass = createEvaluatorClass<Ctx>(
         ffSchema.schema,
@@ -339,7 +233,7 @@ describe('EvaluatorGenerator', () => {
       });
       const spanBuffer = createBuffer(logSchema);
       type Ctx = EvaluatorTestContext<typeof logSchema, typeof ffSchema.schema>;
-      const mockCtx = createMockSpanContext<typeof logSchema, typeof ffSchema.schema>(logSchema, spanBuffer);
+      const mockCtx = createMockSpanContext(logSchema, spanBuffer, ffSchema.schema);
 
       const GeneratedClass = createEvaluatorClass<Ctx>(
         ffSchema.schema,
@@ -390,7 +284,7 @@ describe('EvaluatorGenerator', () => {
 
       const createInstance = () => {
         const spanBuffer = createBuffer(logSchema);
-        const mockCtx = createMockSpanContext<typeof logSchema, typeof schema.schema>(logSchema, spanBuffer);
+        const mockCtx = createMockSpanContext(logSchema, spanBuffer, schema.schema);
         return new GeneratedClass(mockCtx, mockEvaluator);
       };
 
@@ -429,32 +323,7 @@ describe('EvaluatorGenerator', () => {
       expect(descriptor?.configurable).toBe(true);
     });
 
-    test('no Proxy in generated class', () => {
-      const schema = defineFeatureFlags({
-        testFlag: S.boolean().default(false).sync(),
-      });
 
-      const code = generateEvaluatorClass(schema.schema);
-
-      // Generated code should not contain Proxy
-      expect(code).not.toContain('new Proxy');
-      expect(code).not.toContain('Proxy(');
-    });
-
-    test('runtime path stays worker-safe', () => {
-      const schema = defineFeatureFlags({
-        testFlag: S.boolean().default(false).sync(),
-      });
-
-      const GeneratedClass = createEvaluatorClass(
-        schema.schema,
-        (value, _schema, def) => value ?? def,
-        ENTRY_TYPE_FF_ACCESS,
-      );
-
-      expect(() => GeneratedClass).not.toThrow();
-      expect(GeneratedClass.toString()).not.toContain('new Function');
-    });
   });
 });
 

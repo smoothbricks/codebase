@@ -16,12 +16,7 @@
  * SpanLogger starts with _writeIndex = 1, so first _nextRow() makes it 2.
  */
 
-import {
-  type ColumnEntry,
-  type ColumnWriter,
-  type ColumnWriterExtension,
-  getColumnWriterClass,
-} from '@smoothbricks/arrow-builder';
+import { type ColumnEntry, type ColumnWriterExtension, generateColumnWriterClass } from '@smoothbricks/arrow-builder';
 import {
   ENTRY_TYPE_DEBUG,
   ENTRY_TYPE_ERROR,
@@ -31,12 +26,12 @@ import {
   ENTRY_TYPE_TRACE,
   ENTRY_TYPE_WARN,
 } from '../schema/systemSchema.js';
+import type { WriterState } from './fixedPositionWriterGenerator.js';
 import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
 import type { InferSchema, LogSchema } from '../schema/types.js';
 
-import type { ITraceRoot, TimestampAppendPrimitive } from '../traceRoot.js';
 import type { MessageLayoutFamily } from '../runtimeHint.js';
-import type { AnySpanBuffer, SpanBuffer } from '../types.js';
+import type { AnySpanBuffer } from '../types.js';
 
 // =============================================================================
 // SINGLETON HELPERS OBJECT
@@ -222,7 +217,7 @@ export type FluentLogEntry<T extends LogSchema> = {
  * This is the FULL type returned by createSpanLogger().
  * Users see SpanLogger<T> which hides internal methods.
  */
-export type SpanLoggerImpl<T extends LogSchema> = ColumnWriter<T> & {
+export type SpanLoggerImpl<T extends LogSchema> = {
   info(message: string): FluentLogEntry<T>;
   info(template: string, fields: Partial<InferSchema<T>>): FluentLogEntry<T>;
   debug(message: string): FluentLogEntry<T>;
@@ -238,7 +233,12 @@ export type SpanLoggerImpl<T extends LogSchema> = ColumnWriter<T> & {
   _traceTemplate(vocabularyIndex: number): FluentLogEntry<T>;
   readonly scope: Readonly<Record<string, unknown>>;
   _setScope(attributes: ScopeUpdate<T>): void;
+  _prefillScopedAttributesOn(buffer: AnySpanBuffer): void;
+} & {
+  [K in keyof InferSchema<T>]: (value: InferSchema<T>[K]) => FluentLogEntry<T>;
 };
+
+export type SpanLoggerConstructor<T extends LogSchema> = new (state: WriterState) => SpanLoggerImpl<T>;
 
 export type ScopeUpdate<T extends LogSchema> = {
   [K in keyof InferSchema<T>]?: InferSchema<T>[K] | null;
@@ -423,7 +423,6 @@ function buildSpanLoggerExtension(
 
   return {
     preallocatedColumns: eagerColumns,
-    constructorParams: 'traceRoot, appendLogEntry',
 
     // Entry type constants (inlined from lmao.ts)
     classPreamble: `
@@ -438,39 +437,13 @@ function buildSpanLoggerExtension(
   ${enumMappings.join('\n')}
 `,
 
-    // SpanLogger starts at writeIndex 1, so first nextRow() makes it 2
-    // (Rows 0 and 1 are reserved for span-start and span-end)
-    // Sync buffer's writeIndex - needed for Arrow conversion
-    constructorCode: `
-      this._writeIndex = 1;
-      this._buffer._writeIndex = 2;
-      this._traceRoot = traceRoot;
-      this._appendLogEntry = appendLogEntry;
-`,
-
-    // Check for overflow before writing, switch to overflow buffer if needed.
-    // Overflow when _writeIndex >= capacity (buffer is full, no room for this write).
-    // Buffer.getOrCreateOverflow() handles: stats notification, capacity tuning, buffer creation.
-    // We just need to switch this._buffer and prefill scope on the new buffer.
     methods:
-      `_checkOverflow() {
-      if (this._buffer._writeIndex >= this._buffer._capacity) {
-        this._buffer = this._buffer.getOrCreateOverflow();
-        this._prefillScopedAttributesOn(this._buffer);
-      }
-    }
-
-    ` +
-      // Write an info log entry.
       // The optional fields argument is the untransformed fallback. JavaScript evaluates
       // the receiver, template, and object initializers before this method runs. Lowered
       // calls use _infoTemplate/_warnTemplate/_errorTemplate plus direct setters instead.
-      // writeLogEntry bumps buffer._writeIndex, writes timestamp+entry_type, returns idx.
-      // We sync this._writeIndex so fluent setters write at correct row.
+      // Context-owned append advances the shared active buffer and returns the literal row.
       `info(message, fields) {
-      this._checkOverflow();
-      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_INFO);
-      this._writeIndex = idx;
+      const idx = this._state._appendWriterEntry(ENTRY_TYPE_INFO);
       ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = helpers.normalizeOperationalTemplate(message);`}
       if (fields !== undefined) {
         this.with(fields);
@@ -479,9 +452,7 @@ function buildSpanLoggerExtension(
     }
 
     _infoTemplate(vocabularyIndex) {
-      this._checkOverflow();
-      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_INFO);
-      this._writeIndex = idx;
+      const idx = this._state._appendWriterEntry(ENTRY_TYPE_INFO);
       ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : `this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_INFO) >>> 0;`}
       return this;
     }
@@ -489,17 +460,13 @@ function buildSpanLoggerExtension(
     ` +
       // Write a debug log entry.
       `debug(message) {
-      this._checkOverflow();
-      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_DEBUG);
-      this._writeIndex = idx;
+      const idx = this._state._appendWriterEntry(ENTRY_TYPE_DEBUG);
       ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = message;`}
       return this;
     }
 
     _debugTemplate(vocabularyIndex) {
-      this._checkOverflow();
-      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_DEBUG);
-      this._writeIndex = idx;
+      const idx = this._state._appendWriterEntry(ENTRY_TYPE_DEBUG);
       ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : `this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_DEBUG) >>> 0;`}
       return this;
     }
@@ -507,9 +474,7 @@ function buildSpanLoggerExtension(
     ` +
       // Write a warn log entry.
       `warn(message, fields) {
-      this._checkOverflow();
-      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_WARN);
-      this._writeIndex = idx;
+      const idx = this._state._appendWriterEntry(ENTRY_TYPE_WARN);
       ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = helpers.normalizeOperationalTemplate(message);`}
       if (fields !== undefined) {
         this.with(fields);
@@ -518,9 +483,7 @@ function buildSpanLoggerExtension(
     }
 
     _warnTemplate(vocabularyIndex) {
-      this._checkOverflow();
-      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_WARN);
-      this._writeIndex = idx;
+      const idx = this._state._appendWriterEntry(ENTRY_TYPE_WARN);
       ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : `this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_WARN) >>> 0;`}
       return this;
     }
@@ -528,9 +491,7 @@ function buildSpanLoggerExtension(
     ` +
       // Write an error log entry.
       `error(message, fields) {
-      this._checkOverflow();
-      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_ERROR);
-      this._writeIndex = idx;
+      const idx = this._state._appendWriterEntry(ENTRY_TYPE_ERROR);
       ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = helpers.normalizeOperationalTemplate(message);`}
       if (fields !== undefined) {
         this.with(fields);
@@ -539,9 +500,7 @@ function buildSpanLoggerExtension(
     }
 
     _errorTemplate(vocabularyIndex) {
-      this._checkOverflow();
-      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_ERROR);
-      this._writeIndex = idx;
+      const idx = this._state._appendWriterEntry(ENTRY_TYPE_ERROR);
       ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : `this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_ERROR) >>> 0;`}
       return this;
     }
@@ -549,17 +508,13 @@ function buildSpanLoggerExtension(
     ` +
       // Write a trace log entry.
       `trace(message) {
-      this._checkOverflow();
-      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_TRACE);
-      this._writeIndex = idx;
+      const idx = this._state._appendWriterEntry(ENTRY_TYPE_TRACE);
       ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = message;`}
       return this;
     }
 
     _traceTemplate(vocabularyIndex) {
-      this._checkOverflow();
-      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_TRACE);
-      this._writeIndex = idx;
+      const idx = this._state._appendWriterEntry(ENTRY_TYPE_TRACE);
       ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : `this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_TRACE) >>> 0;`}
       return this;
     }
@@ -584,9 +539,7 @@ function buildSpanLoggerExtension(
       // Write a feature flag access entry (internal method, not on public type).
       // Called by FeatureFlagEvaluator to log flag access.
       `ffAccess(flagName, value) {
-      this._checkOverflow();
-      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_FF_ACCESS);
-      this._writeIndex = idx;
+      const idx = this._state._appendWriterEntry(ENTRY_TYPE_FF_ACCESS);
       ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Feature flag write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = flagName;`}
       if (this._buffer.ff_value_values) {
         const strValue = value === null || value === undefined ? 'null' : String(value);
@@ -601,9 +554,7 @@ function buildSpanLoggerExtension(
       // Write a feature flag usage entry (internal method, not on public type).
       // Called by FeatureFlagEvaluator to log flag usage.
       `ffUsage(flagName, context) {
-      this._checkOverflow();
-      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_FF_USAGE);
-      this._writeIndex = idx;
+      const idx = this._state._appendWriterEntry(ENTRY_TYPE_FF_USAGE);
       ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Feature flag write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = flagName;`}
       if (context) {
         this.with(context);
@@ -697,47 +648,46 @@ function buildSpanLoggerExtension(
  */
 const spanLoggerClassCache = new WeakMap<LogSchema, Map<string, unknown>>();
 
-function isSpanLoggerConstructor<T extends LogSchema>(
-  value: unknown,
-): value is new (
-  buffer: AnySpanBuffer,
-  traceRoot: ITraceRoot,
-  appendLogEntry: TimestampAppendPrimitive,
-) => SpanLoggerImpl<T> {
+function isSpanLoggerConstructor<T extends LogSchema>(value: unknown): value is SpanLoggerConstructor<T> {
   return typeof value === 'function';
 }
 
+function generateStateBoundSpanLoggerClass(
+  schema: LogSchema,
+  extension: ColumnWriterExtension,
+): string {
+  const source = generateColumnWriterClass(schema, 'GeneratedSpanLogger', extension);
+  const constructorStart = source.indexOf('    constructor(buffer) {');
+  const firstSetter = schema._columnNames[0];
+  const methodsStart = source.indexOf(
+    firstSetter === undefined ? '\n    info(message, fields) {' : `\n    ${firstSetter}(value) {`,
+    constructorStart,
+  );
+  if (constructorStart < 0 || methodsStart < 0) {
+    throw new Error('Failed to locate generated SpanLogger class boundaries');
+  }
+  const stateConstructor = `    constructor(state) {\n      this._state = state;\n    }\n`;
+  return (source.slice(0, constructorStart) + stateConstructor + source.slice(methodsStart + 1))
+    .replaceAll('this._buffer', 'this._state._buffer')
+    .replaceAll('this._writeIndex', '(this._state._buffer._writeIndex - 1)');
+}
+
 /**
- * Create SpanLogger class constructor from schema.
- * This is the cold-path function called at module creation time.
- *
- * SpanLogger extends ColumnWriter and adds:
- * - info(), debug(), warn(), error() methods for log entries
- * - _setScope() for setting scoped attributes
- * - _getNextBuffer() override for SpanBuffer creation on overflow
- *
- * Note: Fluent attribute setters are inherited from ColumnWriter and write at _writeIndex.
+ * Create the state-only SpanLogger constructor selected for one schema/layout family.
  */
 export function createSpanLoggerClass<T extends LogSchema>(
   schema: T,
   messageLayoutFamily: MessageLayoutFamily = 'mixed',
   eagerColumns: readonly string[] = [],
-): new (
-  buffer: AnySpanBuffer,
-  traceRoot: ITraceRoot,
-  appendLogEntry: TimestampAppendPrimitive,
-) => SpanLoggerImpl<T> {
+): SpanLoggerConstructor<T> {
   const cacheKey = `${messageLayoutFamily}:${eagerColumns.join('\u0000')}`;
   let familyClasses = spanLoggerClassCache.get(schema);
   let SpanLoggerClass = familyClasses?.get(cacheKey);
 
   if (!SpanLoggerClass) {
     const extension = buildSpanLoggerExtension(schema, messageLayoutFamily, eagerColumns);
-
-    // Use arrow-builder's getColumnWriterClass with our extension
-    const WriterClass = getColumnWriterClass(schema, extension);
-
-    SpanLoggerClass = WriterClass;
+    const classCode = generateStateBoundSpanLoggerClass(schema, extension).trim();
+    SpanLoggerClass = new Function('helpers', classCode)(SPAN_LOGGER_HELPERS);
 
     if (!isSpanLoggerConstructor<LogSchema>(SpanLoggerClass)) {
       throw new Error('Failed to generate SpanLogger constructor');
@@ -755,14 +705,8 @@ export function createSpanLoggerClass<T extends LogSchema>(
   return SpanLoggerClass;
 }
 
-/**
- * Create a SpanLogger instance for the given buffer.
- *
- * @param schema - Tag attribute schema
- * @param buffer - SpanBuffer to write to
- */
-export function createSpanLogger<T extends LogSchema>(schema: T, buffer: SpanBuffer<T>): SpanLoggerImpl<T> {
-  const SpanLoggerClass = createSpanLoggerClass(schema);
-  return new SpanLoggerClass(buffer, buffer._traceRoot, buffer._traceRoot._appendLogEntry);
+/** Create a SpanLogger bound to an existing SpanContext writer state. */
+export function createSpanLogger<T extends LogSchema>(schema: T, state: WriterState): SpanLoggerImpl<T> {
+  return new (createSpanLoggerClass(schema))(state);
 }
 //#endregion smoo/lmao!n/codegen-spanlogger

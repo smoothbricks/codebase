@@ -5,47 +5,26 @@
  * - TagWriter: writes to position 0 (span-start row) via ctx.tag.userId("123")
  * - ResultWriter: writes to position 1 (result row) via ctx.ok(data).userId("123")
  *
- * Both share the same codegen since they only differ in:
- * 1. The fixed position (0 vs 1)
- * 2. ResultWriter has additional _result/_error properties
+ * Both share the same codegen and differ only by the literal row embedded in each method.
  *
  * WHY Fixed Positions:
  * - Row 0: span-start entry (written at span creation, attributes set via ctx.tag)
  * - Row 1: span-end entry (written at ctx.ok()/ctx.err(), attributes set via fluent API)
  *
- * Pattern:
- * - Each setter calls this._buffer.columnName(this._pos, value) and returns this
- * - Fluent chaining: ctx.tag.userId("123").requestId("abc")
- * - Zero allocation: returns same object reference
+ * Each wrapper stores only the SpanContext state identity. Setters write through
+ * `state._spanBuffer` to their embedded row and return the same wrapper for fluent chaining.
  */
 
 import { bufferHelpers, type ColumnEntry } from '@smoothbricks/arrow-builder';
+import type { MessageLayoutFamily } from '../runtimeHint.js';
 import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
 import type { InferSchema, LogSchema } from '../schema/types.js';
-import type { MessageLayoutFamily } from '../runtimeHint.js';
 import type { AnySpanBuffer } from '../types.js';
+import type { TimestampAppendPrimitive } from '../traceRoot.js';
 
-/**
- * Extension options for injecting custom code into generated writer classes.
- */
+/** Extension methods injected into a generated fixed-position writer class. */
 export interface FixedPositionWriterExtension {
-  /**
-   * Additional code to add to the constructor (after buffer assignment).
-   * Has access to `this` and constructorParams.
-   */
-  constructorCode?: string;
-
-  /**
-   * Additional methods to add to the class body.
-   */
   methods?: string;
-
-  /**
-   * Constructor parameters beyond buffer.
-   * Added AFTER buffer in the constructor signature.
-   * @example "result, isError"
-   */
-  constructorParams?: string;
 }
 
 /**
@@ -67,65 +46,47 @@ export type TagWriter<T extends LogSchema> = {
   [K in keyof InferSchema<T>]: (value: InferSchema<T>[K]) => TagWriter<T>;
 };
 
-/**
- * ResultWriter interface - fluent setter API for result attributes (row 1)
- *
- * Includes _result and _error properties for accessing the return value or error.
- */
+/** SpanContext-owned hot writer state shared by logger, tag, and result writers. */
+export interface WriterState {
+  /** Immutable span root used by fixed row 0/1 writers. */
+  readonly _spanBuffer: AnySpanBuffer;
+  /** Mutable active buffer used by append writers and updated on overflow. */
+  _buffer: AnySpanBuffer;
+  /** Plan-bound timestamp append operand retained by the SpanContext. */
+  readonly _appendLogEntry: TimestampAppendPrimitive;
+  readonly _physicalLayoutPlan: {
+    readonly ResultWriterClass: ResultWriterConstructor;
+  };
+  /** Append one dynamic row, centralizing overflow and active-buffer updates. */
+  _appendWriterEntry(entryType: number): number;
+}
+
+/** Result-row writer with schema-specific fluent setters. */
 export type ResultWriter<T extends LogSchema, R = unknown, E = unknown> = {
-  /**
-   * The successful result value (set by ctx.ok(data))
-   */
-  readonly _result: R | undefined;
-
-  /**
-   * The error value (set by ctx.err(error))
-   */
-  readonly _error: E | undefined;
-
-  /**
-   * Whether this is an error result
-   */
-  readonly _isError: boolean;
-
-  /**
-   * Bulk set multiple attributes at once.
-   */
+  /** Phantom parameters preserve the public generic contract without duplicating result values. */
+  readonly _resultType?: R;
+  readonly _errorType?: E;
   with(attributes: Partial<InferSchema<T>>): ResultWriter<T, R, E>;
-
-  /**
-   * Set the result-row message (row 1).
-   */
   message(text: string): ResultWriter<T, R, E>;
-
-  /**
-   * Set the result-row source line (row 1).
-   */
   line(lineNumber: number): ResultWriter<T, R, E>;
-  /**
-   * Set the reserved `uint64_value` column for this result row.
-   */
   uint64_value(value: bigint): ResultWriter<T, R, E>;
 } & {
-  /**
-   * Individual attribute setters - each returns `this` for chaining.
-   */
   [K in keyof InferSchema<T>]: (value: InferSchema<T>[K]) => ResultWriter<T, R, E>;
 };
 
-type TagWriterConstructor<T extends LogSchema> = new (buffer: AnySpanBuffer) => TagWriter<T>;
+export type TagWriterConstructor<T extends LogSchema> = new (state: WriterState) => TagWriter<T>;
 
-export type ResultWriterConstructor<T extends LogSchema> = new <R = unknown, E = unknown>(
-  buffer: AnySpanBuffer,
-  resultOrError: unknown,
-  isError: boolean,
-) => ResultWriter<T, R, E>;
+export type ResultWriterConstructor = new <
+  T extends LogSchema = LogSchema,
+  R = unknown,
+  E = unknown,
+>(state: WriterState) => ResultWriter<T, R, E>;
 
 function isTagWriterConstructor<T extends LogSchema>(value: unknown): value is TagWriterConstructor<T> {
   return typeof value === 'function';
 }
 
-function isResultWriterConstructor<T extends LogSchema>(value: unknown): value is ResultWriterConstructor<T> {
+function isResultWriterConstructor(value: unknown): value is ResultWriterConstructor {
   return typeof value === 'function';
 }
 
@@ -145,27 +106,18 @@ ${cases}
   }`;
 }
 
-/**
- * Generate setter method code for a single attribute.
- * Calls this._buffer.columnName(this._pos, value) and returns this.
- */
-function generateSetterMethod(fieldName: string, schema: unknown, hasEnumMapping: boolean): string {
-  const columnName = fieldName;
+/** Generate a state-bound setter for one schema attribute and literal row. */
+function generateSetterMethod(
+  fieldName: string,
+  schema: unknown,
+  hasEnumMapping: boolean,
+  position: number,
+): string {
   const lmaoType = getSchemaType(schema);
-
-  if (lmaoType === 'enum' && hasEnumMapping) {
-    return `
-    ${fieldName}(value) {
-      this._buffer.${columnName}(this._pos, getEnumIndex_${fieldName}(value));
-      return this;
-    }`;
-  }
-
-  // All other types: direct pass-through to buffer setter
-  // The buffer's setter handles null bitmap and storage details
+  const value = lmaoType === 'enum' && hasEnumMapping ? `getEnumIndex_${fieldName}(value)` : 'value';
   return `
     ${fieldName}(value) {
-      this._buffer.${columnName}(this._pos, value);
+      this._state._spanBuffer.${fieldName}(${position}, ${value});
       return this;
     }`;
 }
@@ -174,14 +126,19 @@ function generateSetterMethod(fieldName: string, schema: unknown, hasEnumMapping
  * Generate with() method code - bulk attribute setting.
  * UNROLLED per-column code for zero Object.entries overhead.
  */
-function generateWithMethod(schemaFields: readonly ColumnEntry[], enumFieldNames: Set<string>): string {
+function generateWithMethod(
+  schemaFields: readonly ColumnEntry[],
+  enumFieldNames: Set<string>,
+  position: number,
+): string {
   const columnWrites = schemaFields.map(([fieldName]) => {
-    const hasEnumMapping = enumFieldNames.has(fieldName);
-    const valueExpr = hasEnumMapping ? `getEnumIndex_${fieldName}(attributes.${fieldName})` : `attributes.${fieldName}`;
+    const valueExpr = enumFieldNames.has(fieldName)
+      ? `getEnumIndex_${fieldName}(attributes.${fieldName})`
+      : `attributes.${fieldName}`;
 
     return `
       if ('${fieldName}' in attributes && attributes.${fieldName} !== null && attributes.${fieldName} !== undefined) {
-        this._buffer.${fieldName}(this._pos, ${valueExpr});
+        this._state._spanBuffer.${fieldName}(${position}, ${valueExpr});
       }`;
   });
 
@@ -226,30 +183,14 @@ export function generateFixedPositionWriterClass(
     }
   }
 
-  // Generate setter methods
   const setterMethods = schemaFields.map(([fieldName, fieldSchema]) =>
-    generateSetterMethod(fieldName, fieldSchema, enumFieldNames.has(fieldName)),
+    generateSetterMethod(fieldName, fieldSchema, enumFieldNames.has(fieldName), position),
   );
 
-  // Generate with() method
-  const withMethod = generateWithMethod(schemaFields, enumFieldNames);
+  const withMethod = generateWithMethod(schemaFields, enumFieldNames, position);
 
-  // Build constructor signature
-  const constructorSignature = extension?.constructorParams ? `buffer, ${extension.constructorParams}` : 'buffer';
-
-  // Build constructor body
-  // Generated structure: assigns _buffer and _pos, then runs extension constructor code if provided
-  const constructorBody = ['    this._buffer = buffer;', `    this._pos = ${position};`];
-
-  if (extension?.constructorCode) {
-    constructorBody.push('');
-    // Extension constructor code runs after _buffer/_pos assignment
-    const extensionLines = extension.constructorCode
-      .trim()
-      .split('\n')
-      .map((line) => `    ${line.trim()}`);
-    constructorBody.push(...extensionLines);
-  }
+  const constructorSignature = 'state';
+  const constructorBody = ['    this._state = state;'];
 
   // Build extension methods (additional methods injected by the caller)
   const extensionMethods = extension?.methods
@@ -261,11 +202,7 @@ export function generateFixedPositionWriterClass(
         .join('\n')
     : '';
 
-  // Generated class structure:
-  // - constructor: assigns _buffer, _pos, then extension code
-  // - with(): bulk attribute setting method
-  // - Individual setter methods for each schema field
-  // - Extension methods (if any)
+  // Generated class stores only `_state`; every method embeds its fixed row literal.
   const classCode = `
   'use strict';
 
@@ -313,7 +250,7 @@ const resultWriterClassCache = new WeakMap<LogSchema, Map<string, unknown>>();
 const tagWriterExtension: FixedPositionWriterExtension = {
   methods: `
 uint64_value(value) {
-  this._buffer.uint64_value(this._pos, value);
+  this._state._spanBuffer.uint64_value(0, value);
   return this;
 }
 `,
@@ -336,7 +273,7 @@ export function generateTagWriterClass(schema: LogSchema, eagerColumns: readonly
 export function getTagWriterClass<T extends LogSchema>(
   schema: T,
   eagerColumns: readonly string[] = [],
-): new (buffer: AnySpanBuffer) => TagWriter<T> {
+): TagWriterConstructor<T> {
   const cacheKey = eagerColumns.join('\u0000');
   let classes = tagWriterClassCache.get(schema);
   let WriterClass = classes?.get(cacheKey);
@@ -363,45 +300,22 @@ export function getTagWriterClass<T extends LogSchema>(
   return WriterClass;
 }
 
-/**
- * Create a TagWriter instance for a buffer.
- *
- * @param schema - Tag attribute schema
- * @param buffer - SpanBuffer to write to
- * @returns TagWriter instance bound to position 0
- */
-export function createTagWriter<T extends LogSchema>(schema: T, buffer: AnySpanBuffer): TagWriter<T> {
-  const WriterClass = getTagWriterClass(schema);
-  return new WriterClass(buffer);
+/** Create a TagWriter bound to an existing SpanContext writer state. */
+export function createTagWriter<T extends LogSchema>(schema: T, state: WriterState): TagWriter<T> {
+  return new (getTagWriterClass(schema))(state);
 }
 
 // ============================================================================
 // ResultWriter API
 // ============================================================================
 
-/**
- * ResultWriter extension - adds _result, _error, _isError properties
- *
- * Constructor sets _isError, _result, and _error based on the isError flag.
- * Result/error values are already accessible via the properties set in constructor.
- */
+/** Result-row system setters, specialized once for the plan's message layout family. */
 function createResultWriterExtension(messageLayoutFamily: MessageLayoutFamily): FixedPositionWriterExtension {
   const messageWrite =
     messageLayoutFamily === 'static-only'
-      ? 'this._buffer._terminalMessage = text;'
-      : 'this._buffer.message_values[this._pos] = text;';
+      ? 'this._state._spanBuffer._terminalMessage = text;'
+      : 'this._state._spanBuffer.message_values[1] = text;';
   return {
-    constructorParams: 'resultOrError, isError',
-    constructorCode: `
-      this._isError = isError;
-      if (isError) {
-        this._error = resultOrError;
-        this._result = undefined;
-      } else {
-        this._result = resultOrError;
-        this._error = undefined;
-      }
-    `,
     methods: `
 message(text) {
   ${messageWrite}
@@ -409,12 +323,12 @@ message(text) {
 }
 
 line(lineNumber) {
-  this._buffer.line(this._pos, lineNumber);
+  this._state._spanBuffer.line(1, lineNumber);
   return this;
 }
 
 uint64_value(value) {
-  this._buffer.uint64_value(this._pos, value);
+  this._state._spanBuffer.uint64_value(1, value);
   return this;
 }
 `,
@@ -449,11 +363,7 @@ export function getResultWriterClass<T extends LogSchema>(
   schema: T,
   messageLayoutFamily: MessageLayoutFamily = 'mixed',
   eagerColumns: readonly string[] = [],
-): new <R = unknown, E = unknown>(
-  buffer: AnySpanBuffer,
-  resultOrError: unknown,
-  isError: boolean,
-) => ResultWriter<T, R, E> {
+): ResultWriterConstructor {
   let familyClasses = resultWriterClassCache.get(schema);
   const cacheKey = `${messageLayoutFamily}:${eagerColumns.join('\u0000')}`;
   let WriterClass = familyClasses?.get(cacheKey);
@@ -465,7 +375,7 @@ export function getResultWriterClass<T extends LogSchema>(
     const factory = new Function('helpers', classCode);
     WriterClass = factory(bufferHelpers);
 
-    if (!isResultWriterConstructor<LogSchema>(WriterClass)) {
+    if (!isResultWriterConstructor(WriterClass)) {
       throw new Error('Failed to generate ResultWriter constructor');
     }
 
@@ -474,29 +384,18 @@ export function getResultWriterClass<T extends LogSchema>(
     resultWriterClassCache.set(schema, familyClasses);
   }
 
-  if (!isResultWriterConstructor<T>(WriterClass)) {
+  if (!isResultWriterConstructor(WriterClass)) {
     throw new Error('Invalid cached ResultWriter constructor');
   }
 
   return WriterClass;
 }
 
-/**
- * Create a ResultWriter instance for a buffer.
- *
- * @param schema - Tag attribute schema
- * @param buffer - SpanBuffer to write to
- * @param resultOrError - The result value or error
- * @param isError - Whether this is an error result
- * @returns ResultWriter instance bound to position 1
- */
+/** Create a ResultWriter bound to an existing SpanContext writer state. */
 export function createResultWriter<T extends LogSchema, R = unknown, E = unknown>(
   schema: T,
-  buffer: AnySpanBuffer,
-  resultOrError: R | E,
-  isError: boolean,
+  state: WriterState,
 ): ResultWriter<T, R, E> {
-  const WriterClass = getResultWriterClass(schema, buffer._messageLayoutFamily);
-  return new WriterClass(buffer, resultOrError, isError);
+  return new (getResultWriterClass(schema, state._spanBuffer._messageLayoutFamily))<T, R, E>(state);
 }
 //#endregion smoo/lmao!n/codegen-architecture
