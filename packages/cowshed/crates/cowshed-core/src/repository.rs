@@ -182,10 +182,12 @@ pub fn normalize_remote_url(value: &str) -> Result<RepoId, RemoteUrlError> {
         return Err(RemoteUrlError::AmbiguousRepositoryPath);
     }
 
-    let owner = owner.to_ascii_lowercase();
-    let repo = repo.to_ascii_lowercase();
-    let repo = strip_dot_git(&repo)?;
-    RepoId::parse(&format!("{owner}/{repo}")).map_err(RemoteUrlError::InvalidIdentity)
+    let repo = strip_dot_git(repo)?;
+    let mut canonical = String::with_capacity(owner.len() + 1 + repo.len());
+    canonical.extend(owner.chars().map(|character| character.to_ascii_lowercase()));
+    canonical.push('/');
+    canonical.extend(repo.chars().map(|character| character.to_ascii_lowercase()));
+    RepoId::parse(&canonical).map_err(RemoteUrlError::InvalidIdentity)
 }
 
 fn validate_authority(authority: &str) -> Result<(), RemoteUrlError> {
@@ -243,7 +245,17 @@ fn parse_scp_like(value: &str) -> Result<&str, RemoteUrlError> {
 }
 
 fn strip_dot_git(repo: &str) -> Result<&str, RemoteUrlError> {
-    let stripped = repo.strip_suffix(".git").unwrap_or(repo);
+    let stripped = match repo.len().checked_sub(4) {
+        Some(suffix_index)
+            if repo
+                .get(suffix_index..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".git")) =>
+        {
+            repo.get(..suffix_index)
+                .ok_or(RemoteUrlError::InvalidSyntax)?
+        }
+        _ => repo,
+    };
     if stripped.is_empty() {
         return Err(RemoteUrlError::MissingRepositoryPath);
     }
@@ -355,10 +367,10 @@ impl RepositoryBinding {
             return Err(BindingError::PrimaryCount(primary_count));
         }
 
-        let mut repo_ids = HashSet::with_capacity(self.identities.len());
-        let mut remote_names = HashSet::with_capacity(self.identities.len());
+        let mut repo_ids: HashSet<&RepoId> = HashSet::with_capacity(self.identities.len());
+        let mut remote_names: HashSet<&str> = HashSet::with_capacity(self.identities.len());
         for identity in &self.identities {
-            if !repo_ids.insert(identity.repo_id.clone()) {
+            if !repo_ids.insert(&identity.repo_id) {
                 return Err(BindingError::DuplicateRepoId(identity.repo_id.clone()));
             }
 
@@ -371,7 +383,7 @@ impl RepositoryBinding {
                     {
                         return Err(BindingError::InvalidRemoteName);
                     }
-                    if !remote_names.insert(name.clone()) {
+                    if !remote_names.insert(name.as_str()) {
                         return Err(BindingError::DuplicateRemoteName(name.clone()));
                     }
                     let normalized = normalize_remote_url(url).map_err(|source| {
