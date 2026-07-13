@@ -715,7 +715,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
   ): SpanContextInstance<OpContextOf<B>> {
     // Extract trace_id from overrides if present
     const traceId: TraceId = isValidTraceId(overrides.trace_id) ? overrides.trace_id : generateTraceId();
-    const schema = this.logBinding.logSchema;
+    const schema = callsitePlan.schema;
 
     // Validate required null-sentinel fields before allocating the trace root or buffer.
     this._validateRequiredUserContext(overrides);
