@@ -125,8 +125,8 @@ mod tests {
                 parent: None,
             }),
             timestamps: vec![50, 900, 200],
-            entry_types: vec![1, 2, 5],
-            messages: vec![None, None, None],
+            packed_headers: vec![1, 2, 8],
+            messages: vec![Some("stats-span".into()), None, Some("stats-log".into())],
             overflow: None,
             children: vec![],
         };
