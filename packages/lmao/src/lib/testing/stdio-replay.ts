@@ -3,6 +3,7 @@ import type { OpContextBinding } from '../opContext/types.js';
 import { createTraceRoot } from '../traceRoot.universal.js';
 import { StdioTracer, type StdioWritable } from '../tracers/StdioTracer.js';
 import type { AnySpanBuffer } from '../types.js';
+import { iterateSpanChildren } from '../traceTopology.js';
 
 function isStdioWritable(value: unknown): value is StdioWritable {
   return typeof value === 'object' && value !== null && typeof Reflect.get(value, 'write') === 'function';
@@ -16,13 +17,31 @@ function makeConsoleWriteStream(write: (line: string) => void): StdioWritable {
     },
   };
 }
+type ReplayFrame = {
+  buffer: AnySpanBuffer;
+  children: Generator<AnySpanBuffer>;
+  replayLifecycle: boolean;
+};
 
-function replayChildSpan(tracer: StdioTracer<OpContextBinding>, buffer: AnySpanBuffer): void {
-  tracer.onSpanStart(buffer);
-  for (const child of buffer._children) {
-    replayChildSpan(tracer, child);
+function replayChildSpans(tracer: StdioTracer<OpContextBinding>, rootBuffer: AnySpanBuffer): void {
+  const stack: ReplayFrame[] = [
+    { buffer: rootBuffer, children: iterateSpanChildren(rootBuffer), replayLifecycle: false },
+  ];
+
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    if (!frame) break;
+
+    const next = frame.children.next();
+    if (!next.done) {
+      tracer.onSpanStart(next.value);
+      stack.push({ buffer: next.value, children: iterateSpanChildren(next.value), replayLifecycle: true });
+      continue;
+    }
+
+    stack.pop();
+    if (frame.replayLifecycle) tracer.onSpanEnd(frame.buffer);
   }
-  tracer.onSpanEnd(buffer);
 }
 
 export function replayTraceToStdio(binding: OpContextBinding, rootBuffer: AnySpanBuffer): void {
@@ -43,8 +62,6 @@ export function replayTraceToStdio(binding: OpContextBinding, rootBuffer: AnySpa
   });
 
   tracer.onTraceStart(rootBuffer);
-  for (const child of rootBuffer._children) {
-    replayChildSpan(tracer, child);
-  }
+  replayChildSpans(tracer, rootBuffer);
   tracer.onTraceEnd(rootBuffer);
 }

@@ -26,6 +26,7 @@ import {
   TRACE_ROOT_TRACE_ID_OFFSET,
   type TracerLifecycleHooks,
 } from './traceRoot.js';
+import { TraceTopology } from './traceTopology.js';
 import type { AnySpanBuffer } from './types.js';
 
 /** Shared TextEncoder for trace_id encoding (stateless, reusable) */
@@ -83,6 +84,7 @@ export class TraceRoot<T extends LogSchema = LogSchema> implements ITraceRoot<T>
    * Tracer reference for lifecycle hooks and event callbacks.
    */
   readonly tracer: TracerLifecycleHooks<T>;
+  readonly _topology: TraceTopology;
   readonly _timestampNow = timestampNow;
   readonly _appendLogEntry = appendLogEntry;
   readonly _writeSpanStart = writeSpanStartPrimitive;
@@ -102,6 +104,7 @@ export class TraceRoot<T extends LogSchema = LogSchema> implements ITraceRoot<T>
     // trace_id is validated to be ASCII (1 byte per char) so length === byte length
     this._system = new ArrayBuffer(TRACE_ROOT_TRACE_ID_OFFSET + trace_id.length);
     this.tracer = tracer;
+    this._topology = new TraceTopology();
     this._anchorEpochNanos = anchorEpochNanos;
     this._anchorPerformanceNow = anchorPerfNow;
 

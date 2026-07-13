@@ -115,6 +115,7 @@ export { createSpanLogger, createSpanLoggerClass } from './lib/codegen/spanLogge
 export * from './lib/convertToArrow.js';
 export * from './lib/spanBuffer.js';
 export * from './lib/types.js';
+export * from './lib/traceTopology.js';
 
 // =============================================================================
 // Flush Scheduler

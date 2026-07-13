@@ -22,6 +22,7 @@ import { defineFeatureFlags } from '../schema/defineFeatureFlags.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { InMemoryFlagEvaluator, type SpanContextWithoutFf } from '../schema/evaluator.js';
 import { TestTracer } from '../tracers/TestTracer.js';
+import { iterateSpanChildren } from '../traceTopology.js';
 import { createTestTracerOptions } from './test-helpers.js';
 
 const schema = defineLogSchema({ marker: S.category() });
@@ -139,7 +140,7 @@ function capabilitySnapshot(ctx: CapturedContext): string[] {
 function bufferSnapshot(tracer: TestTracer<typeof context>) {
   const root = tracer.rootBuffers[0];
   if (!root) throw new Error('missing completed root buffer');
-  const child = root._children[0];
+  const [child] = iterateSpanChildren(root);
   if (!child) throw new Error('missing completed child buffer');
   return {
     rootEntryTypes: Array.from(root.entry_type.subarray(0, root._writeIndex)),
@@ -336,7 +337,11 @@ describe('specialized SpanContext runtime semantics', () => {
     expect(Reflect.ownKeys(repeated)).toEqual(LOG_SPAN_RESULT_KEYS);
     expect(constructorOf(capturedRoot)).toBe(constructorOf(capturedChild));
     expect(constructorOf(capturedChild)).toBe(constructorOf(repeated));
-    expect(tracer.rootBuffers[0]?._children[0]?._overflow).toBeDefined();
+    const overflowRoot = tracer.rootBuffers[0];
+    if (!overflowRoot) throw new Error('missing overflow root buffer');
+    const [overflowChild] = iterateSpanChildren(overflowRoot);
+    if (!overflowChild) throw new Error('missing overflow child buffer');
+    expect(overflowChild._overflow).toBeDefined();
   });
 
   it('matches ok, err, log, tag, span, and scope semantics between specialized and fallback contexts', async () => {

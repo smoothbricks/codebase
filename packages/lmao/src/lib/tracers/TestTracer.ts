@@ -1,7 +1,7 @@
 /**
  * TestTracer - A tracer that accumulates completed root trace buffers for test inspection.
  *
- * Child spans are accessible via the buffer's `_children` tree - no need to track them separately.
+ * Child spans are accessible through the trace topology arena; no duplicate tracking is needed.
  * This is the primary tracer for tests that need to inspect trace output, convert to Arrow tables,
  * or verify buffer contents.
  *
@@ -54,9 +54,8 @@ export interface StatsSnapshot<T extends LogSchema = LogSchema> {
 /**
  * Test tracer that accumulates root buffers for inspection.
  *
- * Collects all completed root trace buffers in `rootBuffers` array.
- * Child spans are accessible via the buffer's `_children` tree -
- * no need to track them separately.
+ * Collects all completed root trace buffers in `rootBuffers`; child spans remain reachable
+ * through each root's trace topology arena.
  *
  * Also tracks capacity tuning events via `statsSnapshots` to verify
  * that `onStatsWillResetFor` is called before stats are reset.
@@ -84,8 +83,7 @@ export interface StatsSnapshot<T extends LogSchema = LogSchema> {
 //#region smoo/lmao!n/tracer-implementations.test
 export class TestTracer<B extends OpContextBinding = OpContextBinding> extends Tracer<B> {
   /**
-   * All completed root trace buffers.
-   * Child spans are accessible via each buffer's `_children` tree.
+   * All completed root trace buffers. Child spans remain in each root's topology arena.
    */
   readonly rootBuffers: SpanBuffer<B['logBinding']['logSchema']>[] = [];
 
@@ -109,11 +107,11 @@ export class TestTracer<B extends OpContextBinding = OpContextBinding> extends T
   }
 
   onSpanStart(_childBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
-    // No-op - children are in tree, accessed via rootBuffer._children
+    // No-op - children are registered in the trace topology arena
   }
 
   onSpanEnd(_childBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
-    // No-op - children are in tree, accessed via rootBuffer._children
+    // No-op - children are registered in the trace topology arena
   }
 
   onStatsWillResetFor(buffer: SpanBuffer<B['logBinding']['logSchema']>): void {

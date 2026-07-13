@@ -243,16 +243,13 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   // Tree Structure (for span hierarchy)
   // ===========================================================================
 
-  /**
-   * Child spans created via ctx.span().
-   * Per specs/lmao/01c: Parent-child relationship for trace tree.
-   */
-  _children: AnySpanBuffer[];
+  /** Stable trace-owned logical node index. Overflow segments share the same index. */
+  _nodeIndex: number;
 
-  /**
-   * Parent span buffer (undefined for root).
-   * Set during createChildSpanBuffer().
-   */
+  /** Trace-topology generation used to reject released or reset handles. */
+  _topologyGeneration: number;
+
+  /** Parent span buffer (undefined for root). Preserved for identity access and parent ascent. */
   _parent?: AnySpanBuffer;
 
   // ===========================================================================
@@ -493,8 +490,7 @@ type FilterSchemaFields<T> = {
  * T is REQUIRED - there is no default. Use AnySpanBuffer for generic processing.
  */
 export type SpanBuffer<T extends LogSchema> = AnySpanBuffer & {
-  // Override tree structure with typed versions
-  _children: SpanBuffer<T>[];
+  // Preserve typed parent and overflow links.
   _parent?: SpanBuffer<T>;
   _overflow?: SpanBuffer<T>;
 
