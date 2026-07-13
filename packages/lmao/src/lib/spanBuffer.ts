@@ -203,17 +203,25 @@ function createSpanBufferConstructor<T extends LogSchema>(
   generatedClass: GeneratedSpanBufferClass<T>,
   eagerColumns: EagerColumnDescriptor,
 ): SpanBufferConstructor<T> {
-  return Object.assign(generatedClass, {
-    schema,
-    messageLayoutFamily,
-    messagePhysicalLayout,
-    eagerColumns,
+  Object.defineProperties(generatedClass, {
+    schema: { value: schema, enumerable: true },
+    messageLayoutFamily: { value: messageLayoutFamily, enumerable: true },
+    messagePhysicalLayout: { value: messagePhysicalLayout, enumerable: true },
+    eagerColumns: { value: eagerColumns, enumerable: true },
     stats: {
-      capacity: DEFAULT_BUFFER_CAPACITY,
-      totalWrites: 0,
-      spansCreated: 0,
-    } satisfies SpanBufferStats,
+      value: {
+        capacity: DEFAULT_BUFFER_CAPACITY,
+        totalWrites: 0,
+        spansCreated: 0,
+      } satisfies SpanBufferStats,
+      enumerable: true,
+    },
   });
+
+  if (!isSpanBufferConstructorForSchema(generatedClass, schema)) {
+    throw new TypeError('Generated column buffer constructor initialization failed');
+  }
+  return generatedClass;
 }
 
 /**
@@ -571,17 +579,18 @@ export function getSpanBufferClass<T extends LogSchema>(
     `,
   };
 
+  // Storage schema identity partitions source schema/family/physical classes; the extension cache key
+  // partitions eager-column selections without adding another dedicated cache object.
+  const storageSchema = getStorageSchema(schema, messageLayoutFamily, messagePhysicalLayout);
+
   // Generate class with arrow-builder
-  const generatedClass = getColumnBufferClass(
-    getStorageSchema(schema, messageLayoutFamily, messagePhysicalLayout),
-    extension,
-  );
+  const generatedClass = getColumnBufferClass(storageSchema, extension, storageSchema);
   if (!isGeneratedSpanBufferClass<T>(generatedClass)) {
     throw new TypeError('Generated column buffer is missing SpanBuffer methods');
   }
 
-  // Add static properties to the generated class
-  // These are shared across all instances from the same defineOpContext
+  // Initialize immutable static discriminators before publishing the constructor in the LMAO cache.
+  // The mutable stats object remains shared by every instance of this exact class dimension.
   const SpanBufferClass = createSpanBufferConstructor(
     schema,
     messageLayoutFamily,
@@ -635,10 +644,7 @@ export function createSpanBuffer<T extends LogSchema>(
 ): SpanBuffer<T> {
   const metadataPlan = opMetadata._physicalLayoutPlan;
   const metadataSpanBufferClass = metadataPlan?.SpanBufferClass;
-  if (
-    metadataSpanBufferClass !== undefined &&
-    !isSpanBufferConstructorForSchema(metadataSpanBufferClass, schema)
-  ) {
+  if (metadataSpanBufferClass !== undefined && !isSpanBufferConstructorForSchema(metadataSpanBufferClass, schema)) {
     throw new TypeError('Planned SpanBuffer class does not match schema');
   }
   const plannedSpanBufferClass = plannedClass ?? metadataSpanBufferClass;
