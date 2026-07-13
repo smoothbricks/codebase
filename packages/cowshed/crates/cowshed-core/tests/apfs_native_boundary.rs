@@ -352,15 +352,23 @@ fn checkpoint_fact_path(image: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn ca_key_path(image: &Path) -> PathBuf {
+    let mut path = image.as_os_str().to_owned();
+    path.push(".ca.key");
+    PathBuf::from(path)
+}
+
+fn write_ca_key(image: &Path, contents: &[u8]) {
+    let path = ca_key_path(image);
+    std::fs::write(&path, contents).expect("CA key");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("CA key mode");
+}
+
 fn create_image(path: &Path, format: ImageFormat) {
     std::fs::create_dir_all(path.parent().expect("parent")).expect("image parent");
     std::fs::write(path, b"fixture").expect("image");
     metadata(format).write_for_image(path).expect("sidecar");
-    let mut ca_key = path.as_os_str().to_owned();
-    ca_key.push(".ca.key");
-    let ca_key = PathBuf::from(ca_key);
-    std::fs::write(&ca_key, b"fixture-ca-private-key").expect("CA key");
-    std::fs::set_permissions(&ca_key, std::fs::Permissions::from_mode(0o600)).expect("CA key mode");
+    write_ca_key(path, b"fixture-ca-private-key");
 }
 
 fn workspace(format: ImageFormat) -> LifecycleWorkspace {
@@ -1487,10 +1495,117 @@ fn sidecar_first_publication_is_invisible_until_image_rename_and_recovers() {
         b"published generation"
     );
     DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("canonical metadata");
+    assert_eq!(
+        std::fs::read(ca_key_path(canonical.image())).expect("canonical CA key"),
+        b"fixture-ca-private-key"
+    );
     assert!(!sidecar_path(&staged).exists());
+    assert!(!ca_key_path(&staged).exists());
     restarted
         .recover_pending(&fixture.config(), &[])
         .expect("repeated recovery is idempotent");
+}
+
+#[test]
+fn publication_recovery_converges_every_rename_and_fsync_layout_with_its_ca_key() {
+    for (boundary, move_companion, move_image) in [
+        ("sidecar-rename", false, false),
+        ("sidecar-fsync", false, false),
+        ("companion-rename", true, false),
+        ("image-rename", true, true),
+        ("parent-fsync", true, true),
+    ] {
+        let fixture = Fixture::new(&format!("publication-crash-{boundary}"));
+        let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+        let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+        let staged = layout
+            .project()
+            .project_root
+            .join(".staging/main-00000000000000000000000000000001.sparseimage");
+        create_image(&staged, ImageFormat::Sparse);
+        std::fs::write(&staged, b"new generation").expect("staged image");
+        write_ca_key(&staged, b"new-ca-key");
+        std::fs::rename(sidecar_path(&staged), sidecar_path(canonical.image()))
+            .expect("publish sidecar");
+        if move_companion {
+            std::fs::rename(ca_key_path(&staged), ca_key_path(canonical.image()))
+                .expect("publish CA companion");
+        }
+        if move_image {
+            std::fs::rename(&staged, canonical.image()).expect("publish image");
+        }
+
+        let host = native_host(&fixture, RecordingRunner::default());
+        host.recover_pending(&fixture.config(), &[])
+            .expect("recover publication triple");
+        assert_eq!(
+            std::fs::read(canonical.image()).expect("canonical image"),
+            b"new generation",
+            "{boundary}"
+        );
+        DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("canonical metadata");
+        assert_eq!(
+            std::fs::read(ca_key_path(canonical.image())).expect("canonical CA key"),
+            b"new-ca-key",
+            "{boundary}"
+        );
+        assert!(!staged.exists(), "{boundary}");
+        assert!(!sidecar_path(&staged).exists(), "{boundary}");
+        assert!(!ca_key_path(&staged).exists(), "{boundary}");
+        host.recover_pending(&fixture.config(), &[])
+            .expect("idempotent recovery");
+    }
+}
+
+#[test]
+fn recovery_rejects_missing_or_contradictory_ca_companion_layouts() {
+    let missing = Fixture::new("recovery-missing-ca");
+    let missing_layout = StorageLayout::new(&missing.root, &repo()).expect("layout");
+    let missing_canonical = missing_layout
+        .main_image(ImageFormat::Sparse)
+        .expect("canonical");
+    create_image(missing_canonical.image(), ImageFormat::Sparse);
+    std::fs::remove_file(ca_key_path(missing_canonical.image())).expect("remove CA key");
+    let error = native_host(&missing, RecordingRunner::default())
+        .recover_pending(&missing.config(), &[])
+        .expect_err("missing canonical CA key");
+    match error {
+        ApfsStorageError::MarkerMismatch(message) => {
+            assert!(message.contains(&missing_canonical.image().display().to_string()));
+            assert!(
+                message.contains(&ca_key_path(missing_canonical.image()).display().to_string())
+            );
+        }
+        other => panic!("expected typed integrity error, got {other:?}"),
+    }
+
+    let contradictory = Fixture::new("recovery-contradictory-ca");
+    let layout = StorageLayout::new(&contradictory.root, &repo()).expect("layout");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    let staged = layout
+        .project()
+        .project_root
+        .join(".staging/main-00000000000000000000000000000001.sparseimage");
+    create_image(&staged, ImageFormat::Sparse);
+    std::fs::rename(sidecar_path(&staged), sidecar_path(canonical.image()))
+        .expect("publish sidecar");
+    std::fs::copy(ca_key_path(&staged), ca_key_path(canonical.image()))
+        .expect("create contradictory CA keys");
+    std::fs::set_permissions(
+        ca_key_path(canonical.image()),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .expect("canonical CA mode");
+    let error = native_host(&contradictory, RecordingRunner::default())
+        .recover_pending(&contradictory.config(), &[])
+        .expect_err("contradictory CA keys");
+    match error {
+        ApfsStorageError::MarkerMismatch(message) => {
+            assert!(message.contains(&staged.display().to_string()));
+            assert!(message.contains(&canonical.image().display().to_string()));
+        }
+        other => panic!("expected typed integrity error, got {other:?}"),
+    }
 }
 
 #[test]
@@ -1958,6 +2073,31 @@ fn recovery_rolls_forward_published_metadata_before_undo_rename() {
 }
 
 #[test]
+fn restore_recovery_rejects_published_new_image_with_old_ca_key() {
+    let fixture = Fixture::new("published-new-image-old-ca");
+    let (host, canonical, staged, undo, replacement) =
+        interrupted_restore_image_publication(&fixture, RestoreFailpoint::AfterRestoreImageSwap);
+    replacement
+        .write_for_image(&canonical)
+        .expect("simulate published replacement metadata");
+    drop(host);
+
+    let error = native_host(&fixture, RecordingRunner::default())
+        .recover_pending(&fixture.config(), &[])
+        .expect_err("old CA key must not authenticate replacement image");
+    match error {
+        ApfsStorageError::MarkerMismatch(message) => {
+            assert!(message.contains(&canonical.display().to_string()));
+            assert!(message.contains(&ca_key_path(&canonical).display().to_string()));
+            assert!(message.contains(&ca_key_path(&undo).display().to_string()));
+        }
+        other => panic!("expected typed restore integrity error, got {other:?}"),
+    }
+    assert!(canonical.exists());
+    assert!(staged.exists());
+}
+
+#[test]
 fn recovery_rolls_back_when_published_metadata_is_missing() {
     let fixture = Fixture::new("published-metadata-missing");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
@@ -2072,10 +2212,16 @@ fn recovery_restores_missing_prepublication_canonical_metadata() {
 fn stateless_restore_recovery_converges_each_publication_boundary() {
     for failpoint in [
         RestoreFailpoint::AfterUndoSidecar,
+        RestoreFailpoint::AfterRestoreImageSwap,
         RestoreFailpoint::AfterImageSwap,
+        RestoreFailpoint::AfterRestoreUndoImageRename,
         RestoreFailpoint::AfterUndoRename,
+        RestoreFailpoint::AfterRestoreCanonicalParentFsync,
+        RestoreFailpoint::AfterRestoreUndoParentFsync,
         RestoreFailpoint::AfterMetadataPublish,
         RestoreFailpoint::AfterMetadataFsync,
+        RestoreFailpoint::AfterStagedMetadataRemoval,
+        RestoreFailpoint::AfterRestoreMetadataParentFsync,
     ] {
         let fixture = Fixture::new(&format!("stateless-restore-{failpoint:?}"));
         let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
@@ -2090,8 +2236,10 @@ fn stateless_restore_recovery_converges_each_publication_boundary() {
             .join("main/pre-restore-00000000000000000000000000000002.sparseimage");
         create_image(canonical.image(), ImageFormat::Sparse);
         std::fs::write(canonical.image(), b"old generation").expect("old image");
+        write_ca_key(canonical.image(), b"old-ca-key");
         create_image(&staged, ImageFormat::Sparse);
         std::fs::write(&staged, b"new generation").expect("new image");
+        write_ca_key(&staged, b"new-ca-key");
         let next_incarnation = WorkspaceIncarnation::new("00000000000000000000000000000002")
             .expect("next incarnation");
         let mut next_metadata = metadata(ImageFormat::Sparse);
@@ -2111,13 +2259,17 @@ fn stateless_restore_recovery_converges_each_publication_boundary() {
         .expect("replacement");
         let host = native_host(&fixture, RecordingRunner::default());
         host.set_restore_failpoint(failpoint);
-
-        if matches!(
+        let image_phase = matches!(
             failpoint,
             RestoreFailpoint::AfterUndoSidecar
+                | RestoreFailpoint::AfterRestoreImageSwap
                 | RestoreFailpoint::AfterImageSwap
+                | RestoreFailpoint::AfterRestoreUndoImageRename
                 | RestoreFailpoint::AfterUndoRename
-        ) {
+                | RestoreFailpoint::AfterRestoreCanonicalParentFsync
+                | RestoreFailpoint::AfterRestoreUndoParentFsync
+        );
+        if image_phase {
             host.restore_swap(&staged, canonical.image(), &undo)
                 .expect_err("injected image publication crash");
         } else {
@@ -2131,22 +2283,13 @@ fn stateless_restore_recovery_converges_each_publication_boundary() {
                 &undo,
             )
             .expect_err("injected metadata publication crash");
-            if failpoint == RestoreFailpoint::AfterMetadataPublish {
-                std::fs::copy(canonical.image(), &staged)
-                    .expect("simulate redundant staged image after publication");
-            }
         }
 
         drop(host);
         let host = native_host(&fixture, RecordingRunner::default());
         host.recover_pending(&fixture.config(), &[])
             .expect("restart recovery");
-        let canonical_metadata =
-            DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("metadata");
-        let metadata_was_published = matches!(
-            failpoint,
-            RestoreFailpoint::AfterMetadataPublish | RestoreFailpoint::AfterMetadataFsync
-        );
+        let metadata_was_published = !image_phase;
         assert_eq!(
             std::fs::read(canonical.image()).expect("canonical bytes"),
             if metadata_was_published {
@@ -2156,15 +2299,30 @@ fn stateless_restore_recovery_converges_each_publication_boundary() {
             },
             "{failpoint:?}"
         );
+        assert_eq!(
+            std::fs::read(ca_key_path(canonical.image())).expect("canonical CA key"),
+            if metadata_was_published {
+                b"new-ca-key".as_slice()
+            } else {
+                b"old-ca-key".as_slice()
+            },
+            "{failpoint:?}"
+        );
         if metadata_was_published {
+            assert_eq!(std::fs::read(&undo).expect("undo image"), b"old generation");
             assert_eq!(
-                std::fs::read(&undo).expect("retained undo"),
-                b"old generation",
-                "{failpoint:?}"
+                std::fs::read(ca_key_path(&undo)).expect("undo CA key"),
+                b"old-ca-key"
             );
+        } else {
+            assert!(!undo.exists(), "{failpoint:?}");
+            assert!(!ca_key_path(&undo).exists(), "{failpoint:?}");
         }
-
         assert!(!staged.exists(), "{failpoint:?}");
+        assert!(!sidecar_path(&staged).exists(), "{failpoint:?}");
+        assert!(!ca_key_path(&staged).exists(), "{failpoint:?}");
+        let canonical_metadata =
+            DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("metadata");
         assert_eq!(
             canonical_metadata.workspace_incarnation,
             if metadata_was_published {
@@ -2430,8 +2588,11 @@ fn gc_first_recovers_post_handoff_adopt_before_pruning_staging() {
 fn publication_failpoints_converge_for_clone_and_adopt_callers() {
     for failpoint in [
         RestoreFailpoint::AfterCanonicalSidecarRename,
+        RestoreFailpoint::AfterMetadataFsync,
+        RestoreFailpoint::AfterCanonicalCompanionRename,
         RestoreFailpoint::AfterCanonicalImageRename,
         RestoreFailpoint::CanonicalParentFsyncFailure,
+        RestoreFailpoint::AfterCanonicalParentFsync,
     ] {
         let fixture = Fixture::new(&format!("publish-clone-{failpoint:?}"));
         let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
@@ -2445,7 +2606,12 @@ fn publication_failpoints_converge_for_clone_and_adopt_callers() {
         let host = native_host(&fixture, RecordingRunner::default());
         host.set_restore_failpoint(failpoint);
         let result = host.publish_image(&staged, canonical.image());
-        if failpoint == RestoreFailpoint::AfterCanonicalSidecarRename {
+        if matches!(
+            failpoint,
+            RestoreFailpoint::AfterCanonicalSidecarRename
+                | RestoreFailpoint::AfterMetadataFsync
+                | RestoreFailpoint::AfterCanonicalCompanionRename
+        ) {
             result.expect_err("prepublication failure");
             assert!(staged.exists());
             assert!(sidecar_path(&staged).exists());
@@ -2460,14 +2626,19 @@ fn publication_failpoints_converge_for_clone_and_adopt_callers() {
             b"clone generation"
         );
         DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("canonical metadata");
+        assert!(ca_key_path(canonical.image()).exists(), "{failpoint:?}");
         assert!(!staged.exists());
         assert!(!sidecar_path(&staged).exists());
+        assert!(!ca_key_path(&staged).exists(), "{failpoint:?}");
     }
 
     for failpoint in [
         RestoreFailpoint::AfterCanonicalSidecarRename,
+        RestoreFailpoint::AfterMetadataFsync,
+        RestoreFailpoint::AfterCanonicalCompanionRename,
         RestoreFailpoint::AfterCanonicalImageRename,
         RestoreFailpoint::CanonicalParentFsyncFailure,
+        RestoreFailpoint::AfterCanonicalParentFsync,
     ] {
         let fixture = Fixture::new(&format!("publish-adopt-{failpoint:?}"));
         let config = fixture.config();
@@ -2486,7 +2657,12 @@ fn publication_failpoints_converge_for_clone_and_adopt_callers() {
         host.set_restore_failpoint(failpoint);
         let result =
             host.publish_adopt(&config.main_mount, &pre_cowshed, &staged, canonical.image());
-        if failpoint == RestoreFailpoint::AfterCanonicalSidecarRename {
+        if matches!(
+            failpoint,
+            RestoreFailpoint::AfterCanonicalSidecarRename
+                | RestoreFailpoint::AfterMetadataFsync
+                | RestoreFailpoint::AfterCanonicalCompanionRename
+        ) {
             result.expect_err("prepublication adopt failure");
             assert_eq!(
                 std::fs::read(config.main_mount.join("tracked")).expect("restored source"),

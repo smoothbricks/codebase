@@ -605,8 +605,11 @@ where
                 )
             })
             .await?;
+        let prepared =
+            StagedCallbackGuard::new(Arc::clone(&self.host), prepared, abort_prepared_adopt::<H>);
 
-        if let Err(initializer) = initialize(prepared.stage.clone()).await {
+        if let Err(initializer) = initialize(prepared.get().stage.clone()).await {
+            let prepared = prepared.into_prepared();
             let host = Arc::clone(&self.host);
             let cleanup = self
                 .lane
@@ -621,6 +624,7 @@ where
             });
         }
 
+        let prepared = prepared.into_prepared();
         let host = Arc::clone(&self.host);
         let applied = self
             .lane
@@ -732,8 +736,11 @@ where
                 )
             })
             .await?;
+        let prepared =
+            StagedCallbackGuard::new(Arc::clone(&self.host), prepared, abort_prepared_clone::<H>);
 
-        if let Err(initializer) = initialize(prepared.stage.clone()).await {
+        if let Err(initializer) = initialize(prepared.get().stage.clone()).await {
+            let prepared = prepared.into_prepared();
             let host = Arc::clone(&self.host);
             let cleanup = self
                 .lane
@@ -747,6 +754,7 @@ where
                 },
             });
         }
+        let prepared = prepared.into_prepared();
         let host = Arc::clone(&self.host);
         let applied = self
             .lane
@@ -781,53 +789,35 @@ where
             .await?;
         revalidate(plan.expected(), &actual).map_err(ApfsStorageError::from)?;
 
-        let host = Arc::clone(&self.host);
         let config = Arc::clone(&self.config);
         let expected = plan.expected().to_vec();
         let operation = plan.operation().clone();
-        let prepared = self
-            .lane
-            .dispatch(move || {
-                let Operation::Checkpoint {
-                    workspace,
-                    label,
-                    pin,
-                    format,
-                } = &operation
-                else {
-                    return Err(ApfsStorageError::InvalidPlan(
-                        "staged checkpoint executor requires a checkpoint operation",
-                    ));
-                };
-                prepare_checkpoint_stage(
-                    host.as_ref(),
-                    &config,
-                    &expected,
-                    workspace,
-                    label,
-                    *pin,
-                    *format,
+        let planned = {
+            let Operation::Checkpoint {
+                workspace,
+                label,
+                pin,
+                format,
+            } = &operation
+            else {
+                return Err(ApfsStorageError::InvalidPlan(
+                    "staged checkpoint executor requires a checkpoint operation",
                 )
-            })
-            .await?;
+                .into());
+            };
+            plan_checkpoint_stage(&config, &expected, workspace, label, *pin, *format)?
+        };
 
-        if let Err(initializer) = initialize(prepared.stage.clone()).await {
-            let host = Arc::clone(&self.host);
-            let cleanup = self
-                .lane
-                .dispatch(move || abort_prepared_checkpoint(host.as_ref(), prepared))
-                .await;
-            return Err(match cleanup {
-                Ok(()) => StagedExecutionError::Initializer(initializer),
-                Err(cleanup) => StagedExecutionError::InitializerCleanup {
-                    initializer,
-                    cleanup,
-                },
-            });
+        if let Err(initializer) = initialize(planned.stage.clone()).await {
+            return Err(StagedExecutionError::Initializer(initializer));
         }
+
         let host = Arc::clone(&self.host);
         self.lane
-            .dispatch(move || commit_prepared_checkpoint(host.as_ref(), prepared))
+            .dispatch(move || {
+                let prepared = prepare_checkpoint_stage(host.as_ref(), planned)?;
+                commit_prepared_checkpoint(host.as_ref(), prepared)
+            })
             .await
             .map_err(Into::into)
     }
@@ -901,12 +891,18 @@ where
                 )
             })
             .await?;
+        let prepared = StagedCallbackGuard::new(
+            Arc::clone(&self.host),
+            prepared,
+            abort_prepared_restore::<H>,
+        );
 
-        let stage = match &prepared {
+        let stage = match prepared.get() {
             PreparedRestore::Verify(prepared) => prepared.stage.clone(),
             PreparedRestore::Replace(prepared) => RestoreStage::Replace(prepared.stage.clone()),
         };
         if let Err(prepare_error) = prepare(stage).await {
+            let prepared = prepared.into_prepared();
             let host = Arc::clone(&self.host);
             let cleanup = self
                 .lane
@@ -920,6 +916,7 @@ where
                 },
             });
         }
+        let prepared = prepared.into_prepared();
         let host = Arc::clone(&self.host);
         let committed = self
             .lane
@@ -1198,6 +1195,55 @@ where
     }
 }
 
+struct StagedCallbackGuard<H, P>
+where
+    H: ApfsExecutionHost,
+    P: Send,
+{
+    host: Arc<H>,
+    prepared: Option<P>,
+    abort: fn(&H, P) -> Result<(), ApfsStorageError>,
+}
+
+impl<H, P> StagedCallbackGuard<H, P>
+where
+    H: ApfsExecutionHost,
+    P: Send,
+{
+    fn new(host: Arc<H>, prepared: P, abort: fn(&H, P) -> Result<(), ApfsStorageError>) -> Self {
+        Self {
+            host,
+            prepared: Some(prepared),
+            abort,
+        }
+    }
+
+    fn get(&self) -> &P {
+        self.prepared.as_ref().expect("armed staged callback guard")
+    }
+
+    fn into_prepared(mut self) -> P {
+        self.prepared.take().expect("armed staged callback guard")
+    }
+}
+
+impl<H, P> Drop for StagedCallbackGuard<H, P>
+where
+    H: ApfsExecutionHost,
+    P: Send,
+{
+    fn drop(&mut self) {
+        let Some(prepared) = self.prepared.take() else {
+            return;
+        };
+        let host = Arc::clone(&self.host);
+        let abort = self.abort;
+        std::thread::scope(|scope| {
+            let _ = scope.spawn(move || abort(host.as_ref(), prepared)).join();
+        });
+    }
+}
+
 struct CheckedGuard<G> {
     _lock: G,
     paths: Vec<PathBuf>,
@@ -1318,6 +1364,7 @@ enum CommittedRestore {
 
 struct PreparedCheckpoint {
     stage: CheckpointStage,
+    source: PathBuf,
     label: CheckpointLabel,
     revision: Revision,
     pin: Pin,
@@ -1808,8 +1855,7 @@ fn commit_prepared_clone<H: ApfsExecutionHost>(
     }))
 }
 
-fn prepare_checkpoint_stage<H: ApfsExecutionHost>(
-    host: &H,
+fn plan_checkpoint_stage(
     config: &ApfsSubstrateConfig,
     expected: &[ExpectedState],
     workspace_name: &WorkspaceName,
@@ -1820,42 +1866,11 @@ fn prepare_checkpoint_stage<H: ApfsExecutionHost>(
     let workspace = active_expected(expected, workspace_name, format)?;
     let source = canonical_image_path(config, &workspace)?;
     let image = checkpoint_image(config, &workspace, label)?;
-    host.clone_image(&source, &image, format)?;
     let revision = Revision::new(expected_revision(expected)? + 1);
-    if let Err(primary) = host.publish_metadata(
-        &image,
-        &workspace,
-        revision,
-        MetadataPolicy::Preserve,
-        None,
-        Some(&source),
-    ) {
-        return combine_cleanup(
-            "checkpoint metadata",
-            primary,
-            host.reclaim_image(&image, format),
-        );
-    }
-    let attachment = match host.attach_verified(&image, format) {
-        Ok(attachment) => attachment,
-        Err(primary) => {
-            return combine_cleanup(
-                "checkpoint verification",
-                primary,
-                host.reclaim_image(&image, format),
-            );
-        }
-    };
-    if let Err(primary) = host.detach(attachment, false) {
-        return combine_cleanup(
-            "checkpoint verification detach",
-            primary,
-            host.reclaim_image(&image, format),
-        );
-    }
     let checkpoint = CheckpointRef::new(workspace, label.clone(), revision, pin == Pin::Pinned);
     Ok(PreparedCheckpoint {
         stage: CheckpointStage { checkpoint, image },
+        source,
         label: label.clone(),
         revision,
         pin,
@@ -1863,11 +1878,43 @@ fn prepare_checkpoint_stage<H: ApfsExecutionHost>(
     })
 }
 
-fn abort_prepared_checkpoint<H: ApfsExecutionHost>(
+fn prepare_checkpoint_stage<H: ApfsExecutionHost>(
     host: &H,
     prepared: PreparedCheckpoint,
-) -> Result<(), ApfsStorageError> {
-    host.reclaim_image(&prepared.stage.image, prepared.format)
+) -> Result<PreparedCheckpoint, ApfsStorageError> {
+    host.clone_image(&prepared.source, &prepared.stage.image, prepared.format)?;
+    if let Err(primary) = host.publish_metadata(
+        &prepared.stage.image,
+        prepared.stage.checkpoint.workspace(),
+        prepared.revision,
+        MetadataPolicy::Preserve,
+        None,
+        Some(&prepared.source),
+    ) {
+        return combine_cleanup(
+            "checkpoint metadata",
+            primary,
+            host.reclaim_image(&prepared.stage.image, prepared.format),
+        );
+    }
+    let attachment = match host.attach_verified(&prepared.stage.image, prepared.format) {
+        Ok(attachment) => attachment,
+        Err(primary) => {
+            return combine_cleanup(
+                "checkpoint verification",
+                primary,
+                host.reclaim_image(&prepared.stage.image, prepared.format),
+            );
+        }
+    };
+    if let Err(primary) = host.detach(attachment, false) {
+        return combine_cleanup(
+            "checkpoint verification detach",
+            primary,
+            host.reclaim_image(&prepared.stage.image, prepared.format),
+        );
+    }
+    Ok(prepared)
 }
 
 fn commit_prepared_checkpoint<H: ApfsExecutionHost>(
