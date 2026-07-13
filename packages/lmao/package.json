@@ -177,7 +177,7 @@
           "{projectRoot}/dist/allocator.wasm"
         ],
         "options": {
-          "command": "mkdir -p dist && cp ../lmao-rs/dist/allocator.wasm dist/allocator.wasm",
+          "command": "mkdir -p dist && cp ../lmao-rs/dist/lmao_wasm.wasm dist/allocator.wasm",
           "cwd": "{projectRoot}"
         }
       }
