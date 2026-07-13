@@ -5,48 +5,172 @@ Everything above the substrate (grants, sandbox model, gateway, CLI contract, ma
 substrate-independent. Two substrates ship: **APFS images** (macOS, 01_storage.md/02_workspaces.md are written against
 it) and **ZFS datasets** (Linux; macOS only where OpenZFS is already installed).
 
-## The `Substrate` trait
+## Public lifecycle and substrate API
 
-Lifecycle is asynchronous because image tools, `zfs`, sync, fsck, mount, and helper RPCs can block. Pure synchronous
-planning is deliberately separate from execution: planning validates identities, names, policy, topology, and intended
-state transitions without touching the platform; execution performs the blocking plan on an async executor. No trait
-method hides a blocking subprocess or filesystem operation in a synchronous call.
+Lifecycle is asynchronous because image tools, sync, fsck, mount, and helper RPCs can block. Pure synchronous planning
+is deliberately separate from execution: planning validates identities, names, policy, topology, and intended state
+transitions without touching the platform. The common public contracts are `LifecyclePlanner` and `Substrate`:
 
 ```rust
-pub trait Substrate: Send + Sync {
-    fn plan_adopt(&self, checkout: &Path, repo: &RepoId) -> Result<AdoptPlan>;
-    fn plan_create(&self, from: &WorkspaceRef, name: &WsName) -> Result<CreatePlan>;
-    fn plan_checkpoint(&self, ws: &WorkspaceRef, label: &Label, pin: Pin) -> Result<CheckpointPlan>;
-    fn plan_restore(&self, ws: &WorkspaceRef, cp: &CheckpointRef, mode: RestoreMode) -> Result<RestorePlan>;
-    fn plan_fork(&self, src: &WorkspaceRef, dst: &WsName) -> Result<ForkPlan>;
-    fn plan_retire(&self, ws: &WorkspaceRef) -> Result<RetirePlan>;
+pub trait LifecyclePlanner: Send + Sync {
+    fn plan_adopt(&self, request: AdoptRequest) -> Result<AdoptPlan, PlanError>;
+    fn plan_create(
+        &self,
+        from: &LifecycleWorkspace,
+        destination: Destination,
+    ) -> Result<CreatePlan, PlanError>;
+    fn plan_fork(
+        &self,
+        from: &LifecycleWorkspace,
+        destination: Destination,
+    ) -> Result<ForkPlan, PlanError>;
+    fn plan_checkpoint(
+        &self,
+        workspace: &LifecycleWorkspace,
+        label: CheckpointLabel,
+        pin: Pin,
+    ) -> Result<CheckpointPlan, PlanError>;
+    fn plan_restore(
+        &self,
+        workspace: &LifecycleWorkspace,
+        checkpoint: &CheckpointRef,
+        mode: RestoreMode,
+        identity: OperationIdentity,
+    ) -> Result<RestorePlan, PlanError>;
+    fn plan_retire(&self, workspace: &LifecycleWorkspace) -> Result<RetirePlan, PlanError>;
+}
 
-    async fn execute_adopt(&self, plan: AdoptPlan) -> Result<Main>;
-    async fn execute_create(&self, plan: CreatePlan) -> Result<Workspace>;
-    async fn execute_checkpoint(&self, plan: CheckpointPlan) -> Result<CheckpointRef>;
-    async fn execute_restore(&self, plan: RestorePlan) -> Result<RestoreReceipt>;
-    async fn execute_fork(&self, plan: ForkPlan) -> Result<Workspace>;
-    async fn execute_retire(&self, plan: RetirePlan) -> Result<RetiredRef>;
-    async fn reclaim(&self, retired: RetiredRef) -> Result<()>;
-    async fn list(&self, repo: &RepoId) -> Result<Vec<WorkspaceRef>>;
-    async fn mount_state(&self, ws: &WorkspaceRef) -> Result<MountState>;
-    async fn ensure_mounted(&self, ws: &WorkspaceRef) -> Result<PathBuf>;
-    async fn unmount(&self, ws: &WorkspaceRef) -> Result<()>;
-    async fn caches_root(&self) -> Result<PathBuf>;
-    async fn stats(&self, ws: &WorkspaceRef) -> Result<SubstrateStats>;
-    async fn gc(&self) -> Result<GcReport>;
+#[async_trait]
+pub trait Substrate: LifecyclePlanner {
+    type Error: Send;
+
+    async fn execute_retire(&self, plan: RetirePlan) -> Result<RetiredRef, Self::Error>;
+    async fn reclaim(&self, retired: RetiredRef) -> Result<(), Self::Error>;
+    async fn list(&self, repo: &RepoId) -> Result<Vec<DerivedWorkspace>, Self::Error>;
+    async fn mount_state(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<MountState, Self::Error>;
+    async fn ensure_mounted(
+        &self,
+        workspace: &LifecycleWorkspace,
+        intent: MountIntent,
+    ) -> Result<PathBuf, Self::Error>;
+    async fn unmount(&self, workspace: &LifecycleWorkspace) -> Result<(), Self::Error>;
+    async fn caches_root(&self) -> Result<PathBuf, Self::Error>;
+    async fn stats(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<SubstrateStats, Self::Error>;
+    async fn gc(&self) -> Result<StorageGcReport, Self::Error>;
 }
 ```
 
-Contract notes:
+Adopt, create, fork, checkpoint, and restore are intentionally absent from `Substrate`'s execution methods. The
+implemented APFS controller boundary is staged so that controller-owned state can be initialized or fenced while the
+lifecycle lock remains held. `ApfsSubstrate` exposes these methods:
 
-- **Plans are pure, immutable, and capability-free.** They contain validated logical names, expected
-  incarnation/revision, and intended operations, but no open descriptors, mounted paths supplied by callers, or executed
-  side effects. Execute revalidates all preconditions under the workspace lock before the first mutation; a stale plan
-  conflicts.
-- **Async execution owns blocking work.** Implementations use the platform executor's blocking lane for subprocesses and
-  blocking syscalls, remain cancellation-safe at documented transaction boundaries, and never block an async runtime
-  worker. CLI commands may synchronously wait at the outermost process boundary; library consumers await futures.
+```rust
+impl<H, L> ApfsSubstrate<H, L>
+where
+    H: ApfsExecutionHost,
+    L: ApfsBlockingLane,
+{
+    pub async fn execute_adopt_staged<F, Fut, E>(
+        &self,
+        plan: AdoptPlan,
+        initialize: F,
+    ) -> Result<LifecycleReceipt, AdoptExecutionError<E>>
+    where
+        F: FnOnce(AdoptStage) -> Fut + Send,
+        Fut: Future<Output = Result<(), E>> + Send,
+        E: Send;
+
+    pub async fn execute_create_staged<F, Fut, E>(
+        &self,
+        plan: CreatePlan,
+        initialize: F,
+    ) -> Result<LifecycleReceipt, CreateExecutionError<E>>
+    where
+        F: FnOnce(CreateStage) -> Fut + Send,
+        Fut: Future<Output = Result<(), E>> + Send,
+        E: Send;
+
+    pub async fn execute_fork_staged<F, Fut, E>(
+        &self,
+        plan: ForkPlan,
+        initialize: F,
+    ) -> Result<LifecycleReceipt, ForkExecutionError<E>>
+    where
+        F: FnOnce(ForkStage) -> Fut + Send,
+        Fut: Future<Output = Result<(), E>> + Send,
+        E: Send;
+
+    pub async fn execute_checkpoint_staged<F, Fut, E>(
+        &self,
+        plan: CheckpointPlan,
+        initialize: F,
+    ) -> Result<CheckpointRef, CheckpointExecutionError<E>>
+    where
+        F: FnOnce(CheckpointStage) -> Fut + Send,
+        Fut: Future<Output = Result<(), E>> + Send,
+        E: Send;
+
+    pub async fn execute_restore_staged<
+        Prepare,
+        PrepareFut,
+        PrepareError,
+        Fence,
+        FenceFut,
+        FenceError,
+    >(
+        &self,
+        plan: RestorePlan,
+        prepare: Prepare,
+        fence: Fence,
+    ) -> Result<RestoreReceipt, RestoreExecutionError<PrepareError, FenceError>>
+    where
+        Prepare: FnOnce(RestoreStage) -> PrepareFut + Send,
+        PrepareFut: Future<Output = Result<(), PrepareError>> + Send,
+        PrepareError: Send,
+        Fence: FnOnce(RestoreFence) -> FenceFut + Send,
+        FenceFut: Future<Output = Result<(), FenceError>> + Send,
+        FenceError: Send;
+}
+```
+
+The executor contract is:
+
+- **Lock, recover, reread, revalidate.** Execution acquires every affected lifecycle lock, runs pending-operation
+  recovery, rereads canonical storage and kernel facts, and revalidates the immutable plan before the first new
+  mutation. A stale plan is a typed conflict. Platform subprocesses and blocking filesystem work run only through
+  `ApfsBlockingLane`; callbacks are async and do not block a runtime worker.
+- **Adopt/create/fork initialization precedes publication.** The executor prepares a mounted `WorkspaceStage` in the
+  controller-private staging namespace, then awaits `initialize`, and publishes the canonical image and metadata only
+  after the callback succeeds. A callback error aborts the prepared stage and is returned as `Initializer` or, if abort
+  also fails, `InitializerCleanup`.
+- **The checkpoint callback is the artifact barrier.** With the lifecycle lock held and before cloning the checkpoint
+  image, the executor awaits `initialize`. The controller must flush live job writers, append and fsync the
+  `CheckpointManifestRecord` and its `barrier_id`, and return success only when that barrier is durable. Only then may
+  the executor clone and verify the image and publish its checkpoint fact. Callback failure or cancellation therefore
+  leaves no checkpoint snapshot whose filesystem state outruns its artifact manifest.
+- **Restore has a preparation callback and a publication fence.** `prepare(RestoreStage)` validates and initializes a
+  private replacement (or validates `RestoreStage::Verify`) before it can be published. For a replacement, the executor
+  then swaps images and persists `PendingPublicationFact`, calls `fence(RestoreFence)`, and only after the fence
+  succeeds activates restored metadata and returns `RestoreReceipt`. The fence is where the controller durably commits
+  the incarnation/token/gateway/supervisor handoff; neither the old nor new incarnation may be admitted across that
+  barrier. Verification-only restore returns after `prepare` and performs no publication fence.
+- **Cancellation follows the same transaction boundaries as errors.** Dropping a future while an adopt/create/fork or
+  restore preparation callback is pending synchronously detaches its private attachment and reclaims any cloned staging
+  image before the lifecycle lock is released. Dropping a checkpoint future while its pre-clone barrier is pending
+  creates no image. Once restore has persisted `PendingPublicationFact`, rollback across the incarnation fence is
+  forbidden: a fence error, activation error, cancellation, or crash retains the typed pending fact, and the next
+  recovery pass completes publication forward. Recovery and `gc` also finish any idempotent cleanup left by an
+  interrupted abort.
+
+Plans remain pure, immutable, and capability-free: they contain validated logical names, expected incarnation/revision,
+and intended operations, but no open descriptors, caller-supplied mounted paths, or executed side effects. CLI commands
+may synchronously wait at the outermost process boundary; library consumers await futures.
 
 Selection is convention, not guesswork. `statfs` of the project root selects APFS images when it reports APFS. When it
 reports ZFS, cowshed uses the containing dataset only if its pool has a suitable delegated cowshed root. If `statfs`
