@@ -418,6 +418,9 @@ func (t *fileTransformer) collectTagInlines(root *shimast.Node) ([]tagInline, []
 			}
 			if in, ok := t.findResultInline(call); ok {
 				t.processed[call] = true
+				if in.okCall != nil && in.okCall.Kind == shimast.KindCallExpression {
+					t.processed[in.okCall.AsCallExpression()] = true
+				}
 				in.list, in.index, in.isReturn = list, i, isReturn
 				foundResults = append(foundResults, *in)
 			}
