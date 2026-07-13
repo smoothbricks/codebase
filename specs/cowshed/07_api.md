@@ -20,6 +20,19 @@ workspace.** Authority is attached to explicit capabilities, never inferred from
   restore/destroy/rebase/land, garbage collection, repository mirroring, slot assignment, checkpoint-quota policy, and
   minting one-workspace handles. A trusted unsandboxed controller holds it; workers never do.
 
+`CoordinatorToken` is an affine, opaque, non-serializable proof acquired only by consuming a controller-provided
+inherited Unix stream descriptor. Acquisition validates that the descriptor is a connected socket owned by the current
+uid, performs the controller's one-use nonce handshake, and binds the resulting token to the returned controller actor
+channel and one primary `repoId`. It is neither `Clone` nor `Copy`, has no public constructor or byte/string projection,
+and is consumed by `Cowshed::coordinator`. Environment text may identify the inherited descriptor number but is never
+itself authority. Missing, reused, wrong-peer, malformed, or cross-project descriptors return a typed `CowshedError`;
+there is no fallback token, ambient singleton, filesystem token, or workspace-readable credential.
+
+All capability operations are messages to a single-owner controller/supervisor actor. Handles may clone an immutable
+sender, but they never share mutable authority state behind a mutex. `WorkspaceRef::attach` is deliberately safe,
+idempotent one-workspace attachment; only `Coordinator::detach` may detach because detachment affects running jobs and
+controller fencing.
+
 ## cowshed-core (Rust)
 
 Design rules: async (tokio), no global state, no interior config lookup — everything reachable from an explicit handle;
@@ -31,8 +44,10 @@ pub struct Cowshed;
 impl Cowshed {
     /// Resolve a project from any path inside the repository.
     pub async fn open(path: impl AsRef<Path>) -> Result<Project, CowshedError>;
-    /// Bind coordinator authority (unsandboxed controller only) over a resolved project.
-    pub async fn coordinator(project: &Project, token: &CoordinatorToken)
+    /// Acquire affine authority from an inherited, peer-verified controller socket.
+    pub async fn coordinator_token(fd: OwnedFd) -> Result<CoordinatorToken, CowshedError>;
+    /// Bind and consume coordinator authority (unsandboxed controller only) over a resolved project.
+    pub async fn coordinator(project: &Project, token: CoordinatorToken)
         -> Result<Coordinator, CowshedError>;
 }
 
@@ -250,6 +265,7 @@ impl Coordinator {
     pub async fn rebase(&self, ws: &str, opts: RebaseOptions) -> Result<Oid, CowshedError>;
     pub async fn land(&self, ws: &str, opts: LandOptions) -> Result<LandReport, CowshedError>;
     pub async fn restore(&self, ws: &str, label: &str) -> Result<(), CowshedError>;
+    pub async fn detach(&self, ws: &str) -> Result<EmptyResult, CowshedError>;
     pub async fn assign_slot(&self, ws: &str, slot: u32) -> Result<(), CowshedError>;
     pub async fn destroy(&self, ws: &str, opts: RemoveOptions) -> Result<(), CowshedError>;
     pub async fn gc(&self, opts: GcOptions) -> Result<GcReport, CowshedError>;
@@ -348,6 +364,46 @@ projection: `JobInfo.stdout` and `JobInfo.stderr` are `StreamInfo` objects, each
 each `summary` has `version`, `text`, and `truncated`. The paths name the in-workspace raw byte files containing every
 byte admitted before any output-limit trip. There are no flattened aliases or adapter-specific spellings.
 
+The authoritative Rust definitions live in `cowshed_core::api::dto`; serde uses `camelCase`, enum values use the
+documented lower/camel-case strings, and every optional field is omitted rather than encoded as `null`.
+
+- `WorkspaceInfo = { repoId, workspace, workspaceIncarnation, role, imageFormat, mount, state, branch?, baseCommit?, createdAt?, snapshotStale }`;
+  `state` is `"attached" | "detached"`. Detached rows without a cached marker snapshot omit all three marker-derived
+  optionals.
+- `EnsureReport = { workspace, mount, action }`, where action is `"alreadyMounted" | "attached" | "healed"`.
+  `MountResult = { workspace, mount }`; `EmptyResult` serializes as exactly `{}`.
+- `DoctorReport = { healthy, findings }`; `Finding = { code, severity, message, hint, path? }`, and severity is
+  `"info" | "warning" | "error"`. `GcReport = { examined, reclaimed, retainedPinned, freedBytes, dryRun }`.
+- `JobId` is a positive integer no greater than `2^53-1`.
+  `JobInfo = { repoId, workspaceIncarnation, jobId, state, pid?, grantRevision, argv, cwd, started, durationMs?, exit?, stdout, stderr, trace, outputLimit?, stdin }`.
+  `started` is an RFC3339 UTC string. `exit` is the discriminated union `{kind:"exited",code}` or
+  `{kind:"signaled",signal,coreDumped}`; it is absent before a process result exists. `outputLimit` is present iff
+  `state == "outputLimit"`. `StreamInfo` contains only `{path,bytes,summary}` and never raw output bytes.
+- `StdinInfo = { kind, bytes, workspacePath?, complete }`; kind is `"empty" | "inline" | "stream" | "workspaceFile"`.
+  Every `cwd`, stream path, and workspace stdin path uses the validated relative `WorkspacePath` domain type: no root,
+  empty component, `.`/`..`, prefix, NUL, or symlink-following open.
+- `ExecRecord` repeats the durable `(repoId,workspaceIncarnation,jobId)` key and the terminal job fields
+  `{state,argv,cwd,envHash,grantRevision,trace,started,durationMs,exit?,stdout,stderr,stdin,outputLimit?}`.
+- `RevisionTarget` projects as exactly one of `{branch}`, `{ref}`, or `{oid}`. `ExpectedRefHead` projects as
+  `{missing:true}` or `{oid}`. Oids are validated lowercase 40- or 64-hex strings.
+- `AdoptOptions = { path?, capacity?, quarantine, imageFormat? }`;
+  `CreateOptions = { revision?, fromWorkspace?, browse, slot? }`; `AttachOptions = { browse }`;
+  `RemoveOptions = { force }`; `GcOptions = { dryRun }`; `RebaseOptions`, `LandOptions`, and `PushOptions` use the
+  expectation fields shown above. All booleans are explicit in JSON; absence never silently means authority was granted.
+- `GrantSet`, `GrantDelta`, `PortBlock`, `EgressRule`, `RepoRule`, and `SimVerb` reuse the metadata definitions.
+  `GrantSet.portBlock` is present on macOS and omitted on Linux; `GrantDelta.expectedRevision` is optional.
+- `PushReport = { sourceHead, destinationRef, previousDestinationHead? }`;
+  `LandReport = { landedHead, targetBranch, previousTargetHead?, targetWasCheckedOut, retired }`;
+  `MirrorInfo = { url, mirror }`; `CheckpointQuota = { maxCount, maxBytes }`.
+- `GatewayStatus = { running, socket, cacheEntries, cacheBytes, activeWorkspaces }`.
+  `AuditEvent = { timestamp, repoId, workspaceIncarnation, workspace, action, decision, reason?, trace }`.
+
+`JsonEnvelope<T>` has only `Success(T)` → `{"ok":true,"result":T}` and `Failure(CowshedError)` →
+`{"ok":false,"error":{"code","message","hint"}}`. The discriminant is validated when decoding. There is no public
+constructor that accepts an arbitrary `ok` boolean and no unit/null success. `CowshedError` is the single structured
+value `{code,message,hint}` with the stable codes `internal`, `usage`, `not-found`, `conflict`, `environment-missing`,
+and `sandbox-denied`.
+
 ## Shell client (`cowshed-shell`)
 
 Types for the warm-shell layer (11_shell.md); `WorkspaceHandle::shell`/`list_jobs` return these.
@@ -399,18 +455,20 @@ impl GatewayClient {
 ### Errors
 
 ```rust
-#[non_exhaustive]
-pub enum CowshedError {
-    Usage(String),          // CLI exit 2
-    NotFound(String),       // 3
-    Conflict(String),       // 4
-    Environment(String),    // 5
-    SandboxDenied(String),  // 6
-    Internal(anyhow::Error) // 1
+pub struct CowshedError {
+    pub code: ErrorCode,
+    pub message: String,
+    pub hint: String,
+}
+
+pub enum ErrorCode {
+    Internal, EnvironmentMissing, Usage, NotFound, Conflict, SandboxDenied,
 }
 ```
 
-Every variant carries a `hint()` — the same actionable next step the CLI prints on stderr.
+The code maps to stable CLI exits `1, 5, 2, 3, 4, 6` respectively (and wrapper exits `100..105` in the established
+taxonomy order). `hint` is always the same actionable next step the CLI prints on stderr; known operational failures
+never panic or hide an unstructured `anyhow::Error` inside the public value.
 
 ## cowshed-napi (`@smoothbricks/cowshed`)
 
