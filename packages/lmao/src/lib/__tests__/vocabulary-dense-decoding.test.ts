@@ -2,7 +2,6 @@ import { describe, expect, it } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { Column, type Table } from '@uwdata/flechette';
 import { getVocabularyDictionaryPrefix } from '../arrow/vocabularyDictionary.js';
-import { createSpanLogger } from '../codegen/spanLoggerGenerator.js';
 import { convertToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { resolveMessage } from '../resolveMessage.js';
@@ -128,11 +127,37 @@ function requireMessageDictionary(table: Table): {
 const schema = defineLogSchema({ marker: S.category() });
 const opContext = defineOpContext({ logSchema: schema });
 
+interface DenseTemplateLogger {
+  _infoTemplate(vocabularyIndex: number): unknown;
+  _debugTemplate(vocabularyIndex: number): unknown;
+  _warnTemplate(vocabularyIndex: number): unknown;
+  _errorTemplate(vocabularyIndex: number): unknown;
+  _traceTemplate(vocabularyIndex: number): unknown;
+}
+
+function isDenseTemplateLogger(value: unknown): value is DenseTemplateLogger {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof Reflect.get(value, '_infoTemplate') === 'function' &&
+    typeof Reflect.get(value, '_debugTemplate') === 'function' &&
+    typeof Reflect.get(value, '_warnTemplate') === 'function' &&
+    typeof Reflect.get(value, '_errorTemplate') === 'function' &&
+    typeof Reflect.get(value, '_traceTemplate') === 'function'
+  );
+}
+
+function requireDenseTemplateLogger(context: object): DenseTemplateLogger {
+  const logger = Reflect.get(context, '_spanLogger');
+  if (!isDenseTemplateLogger(logger)) throw new Error('Expected SpanContext to own a dense-template logger');
+  return logger;
+}
+
 
 describe('global vocabulary dense decoding', () => {
   it('keeps the canonical static prefix and uses direct dense zero before the first-seen dynamic suffix', async () => {
     const op = opContext.defineOp('dense-zero-static-prefix', (ctx) => {
-      const logger = createSpanLogger(ctx.buffer._logSchema, ctx.buffer);
+      const logger = requireDenseTemplateLogger(ctx);
       logger._infoTemplate(0);
       logger._infoTemplate(0);
       ctx.log.info('dynamic-b');
@@ -166,12 +191,12 @@ describe('global vocabulary dense decoding', () => {
       'dynamic-b',
     ]);
     expect(dictionary.data).toHaveLength(2);
-    expect(dictionary.data[0]).toBe(prefix.column.data[0]);
+    expect(dictionary.data[0]).toBe(getVocabularyDictionaryPrefix(buffer._vocabularyGeneration).column.data[0]);
   });
 
   it('reuses the pinned cached dictionary object when overflow rows need no dynamic suffix', async () => {
     const op = opContext.defineOp('static-only-overflow', (ctx) => {
-      const logger = createSpanLogger(ctx.buffer._logSchema, ctx.buffer);
+      const logger = requireDenseTemplateLogger(ctx);
       for (let index = 0; index < 40; index++) logger._infoTemplate(0);
       return ctx.ok(null);
     });
@@ -200,7 +225,7 @@ describe('global vocabulary dense decoding', () => {
     ];
     const binding = registerVocabularyFragment(makeFragment(messages));
     const op = opContext.defineOp('dense-levels', (ctx) => {
-      const logger = createSpanLogger(ctx.buffer._logSchema, ctx.buffer);
+      const logger = requireDenseTemplateLogger(ctx);
       logger._infoTemplate(binding[0]);
       logger._debugTemplate(binding[1]);
       logger._warnTemplate(binding[2]);
@@ -240,7 +265,7 @@ describe('global vocabulary dense decoding', () => {
   it('keeps overflow rows pinned to their original vocabulary generation after later registration', async () => {
     const firstBinding = registerVocabularyFragment(makeFragment(['pinned generation literal']));
     const op = opContext.defineOp('dense-overflow-generation', (ctx) => {
-      const logger = createSpanLogger(ctx.buffer._logSchema, ctx.buffer);
+      const logger = requireDenseTemplateLogger(ctx);
       for (let index = 0; index < 20; index++) logger._infoTemplate(firstBinding[0]);
       return ctx.ok(null);
     });
@@ -257,8 +282,7 @@ describe('global vocabulary dense decoding', () => {
       Array.from({ length: 20 }, () => 'pinned generation literal'),
     );
     const { dictionary } = requireMessageDictionary(table);
-    const prefix = getVocabularyDictionaryPrefix(buffer._vocabularyGeneration);
-    expect(dictionary.data[0]).toBe(prefix.column.data[0]);
+    expect(dictionary.data[0]).toBe(getVocabularyDictionaryPrefix(buffer._vocabularyGeneration).column.data[0]);
     expect(Array.from(dictionary)).toContain('pinned generation literal');
     expect(Array.from(dictionary)).not.toContain('registered after buffer creation');
   });
@@ -266,7 +290,7 @@ describe('global vocabulary dense decoding', () => {
   it('rejects a packed dense index outside the buffer generation', async () => {
     let invalidDenseIndex = 0;
     const op = opContext.defineOp('invalid-dense-index', (ctx) => {
-      const logger = createSpanLogger(ctx.buffer._logSchema, ctx.buffer);
+      const logger = requireDenseTemplateLogger(ctx);
       invalidDenseIndex = ctx.buffer._vocabularyGeneration.ids.length;
       logger._infoTemplate(invalidDenseIndex);
       return ctx.ok(null);

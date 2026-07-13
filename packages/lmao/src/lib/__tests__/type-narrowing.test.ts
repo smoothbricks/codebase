@@ -134,4 +134,34 @@ describe('Type Narrowing with FluentResult', () => {
       expect(output.value).toBe('VALIDATION_ERROR');
     }
   });
+  it('preserves schema-specific writer and result inference without casts', async () => {
+    const { trace } = createTestTracer();
+
+    const testOp = defineOp('writerInference', (ctx) => {
+      const tag = ctx.tag.userId('tag-user').customField('tag-custom');
+      tag.userId('tag-user-updated');
+
+      const log = ctx.log.info('inferred log').userId('log-user').customField('log-custom');
+      log.warn('inferred warning');
+
+      const ok = ctx.ok({ id: 789 }).with({ userId: 'result-user' }).message('Result succeeded');
+      if (!ok.success) throw new Error('expected inferred Ok');
+      const id: number = ok.value.id;
+
+      const err = ctx
+        .err(TEST_ERROR({ field: 'writer', reason: 'expected' }))
+        .with({ customField: 'result-error' })
+        .message('Result failed');
+      if (err.success) throw new Error('expected inferred Err');
+      const code: 'TEST_ERROR' = err.error.code;
+      const field: string = err.error.field;
+
+      return ctx.ok({ id, code, field });
+    });
+
+    const output = await trace('writerInference', testOp);
+    expect(output.success).toBe(true);
+    if (!output.success) throw new Error('expected writer inference operation to succeed');
+    expect(output.value).toEqual({ id: 789, code: 'TEST_ERROR', field: 'writer' });
+  });
 });

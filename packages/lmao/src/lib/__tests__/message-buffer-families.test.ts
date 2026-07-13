@@ -296,21 +296,13 @@ describe('specialized message buffer families', () => {
     }
   });
 
-  it('binds hot writers directly to their family without testing absent lanes per write', () => {
-    const staticTemplateSource = String(staticOp.callsitePlan.SpanLoggerClass.prototype._infoTemplate);
-    const dynamicSource = String(dynamicOp.callsitePlan.SpanLoggerClass.prototype.debug);
-    expect(staticTemplateSource).not.toContain('message_values');
-    expect(staticTemplateSource).not.toContain('_messageLayoutFamily');
-    expect(dynamicSource).not.toContain('_logHeaders');
-    expect(dynamicSource).not.toContain('_messageLayoutFamily');
-  });
 
   it('preserves decoded lifecycle and log facts across mixed-family parent/child rows', () => {
     const denseZeroText = textAtDenseZero();
     const root = createPlannedBuffer('mixed', mixedOp.callsitePlan.SpanBufferClass);
+    const rootContext = new mixedOp.callsitePlan.SpanContextClass(root, runtimeSchema, mixedOp.callsitePlan);
     mixedOp.callsitePlan.appenders.writeSpanStart(root, 'mixed root');
-    const rootLogger = mixedOp.callsitePlan.newSpanLogger?.(root);
-    if (!rootLogger) throw new Error('Expected mixed logger');
+    const rootLogger = rootContext._spanLogger;
     rootLogger._infoTemplate(0);
     rootLogger.debug('root raw');
     mixedOp.callsitePlan.appenders.writeSpanEnd(root, ENTRY_TYPE_SPAN_OK);
@@ -322,9 +314,9 @@ describe('specialized message buffer families', () => {
       createTestOpMetadata({ name: 'static child op' }),
       CAPACITY,
     );
+    const childContext = new staticOp.callsitePlan.SpanContextClass(child, runtimeSchema, staticOp.callsitePlan);
     staticOp.callsitePlan.appenders.writeSpanStart(child, 0);
-    const childLogger = staticOp.callsitePlan.newSpanLogger?.(child);
-    if (!childLogger) throw new Error('Expected static logger');
+    const childLogger = childContext._spanLogger;
     childLogger._infoTemplate(0);
     child.message(1, 'child boom');
     staticOp.callsitePlan.appenders.writeSpanEnd(child, ENTRY_TYPE_SPAN_EXCEPTION);
@@ -353,9 +345,9 @@ describe('specialized message buffer families', () => {
         ),
         (operations) => {
           const root = createPlannedBuffer('mixed', mixedOp.callsitePlan.SpanBufferClass);
+          const rootContext = new mixedOp.callsitePlan.SpanContextClass(root, runtimeSchema, mixedOp.callsitePlan);
           mixedOp.callsitePlan.appenders.writeSpanStart(root, 'property root');
-          const logger = mixedOp.callsitePlan.newSpanLogger?.(root);
-          if (!logger) throw new Error('Expected mixed logger');
+          const logger = rootContext._spanLogger;
           for (const operation of operations) {
             if (operation.kind === 'static') logger._infoTemplate(0);
             else logger.debug(operation.text);

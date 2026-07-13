@@ -6,7 +6,7 @@
  */
 
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
-import { createSpanLogger, type SpanLoggerImpl } from '../codegen/spanLoggerGenerator.js';
+import type { SpanLoggerImpl } from '../codegen/spanLoggerGenerator.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import { createOpMetadata, DEFAULT_METADATA } from '../opContext/defineOp.js';
@@ -20,10 +20,19 @@ import type {
 } from '../opContext/opGroupTypes.js';
 import type { OpMetadata } from '../opContext/opTypes.js';
 import type { OpContext } from '../opContext/types.js';
+import { getPhysicalLayoutPlan, sealCallsitePlan, type CallsitePlan } from '../physicalLayoutPlan.js';
 import { LogSchema } from '../schema/LogSchema.js';
 import { mergeWithSystemSchema, type SystemSchemaFieldTypes } from '../schema/systemSchema.js';
 import type { SchemaFields } from '../schema/types.js';
-import { createSpanBuffer } from '../spanBuffer.js';
+import {
+  RUNTIME_HINT_ANALYZED_VALID,
+  RUNTIME_HINT_FULL_CAPABILITIES,
+  RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY,
+  RUNTIME_HINT_MESSAGE_LAYOUT_MIXED,
+  RUNTIME_HINT_MESSAGE_LAYOUT_STATIC_ONLY,
+} from '../runtimeHint.js';
+import { createSpanBuffer, getSpanBufferClass } from '../spanBuffer.js';
+import { createSpanContextClass } from '../spanContext.js';
 import { createTraceId, type TraceId } from '../traceId.js';
 import type { ITraceRoot, TracerLifecycleHooks } from '../traceRoot.js';
 import { createTraceRoot } from '../traceRoot.node.js';
@@ -238,6 +247,52 @@ export function createTestSpanBuffer<T extends SchemaFields>(
   return { logBinding, spanBuffer };
 }
 
+let testWriterContextPlanId = 0;
+
+type TestWriterOpContext<T extends SchemaFields> = OpContext<
+  LogSchema<T>,
+  Record<string, never>,
+  Record<string, never>,
+  Record<string, never>
+>;
+
+/** Create a real capability-complete SpanContext around an existing test buffer. */
+export function createTestSpanContext<
+  T extends SchemaFields,
+  Ctx extends OpContext<LogSchema<T>> = TestWriterOpContext<T>,
+>(
+  schema: LogSchema<T>,
+  buffer: SpanBuffer<LogSchema<T>>,
+  callsitePlan?: CallsitePlan<LogSchema<T>, Ctx>,
+) {
+  const messageLayoutHint =
+    buffer._messageLayoutFamily === 'static-only'
+      ? RUNTIME_HINT_MESSAGE_LAYOUT_STATIC_ONLY
+      : buffer._messageLayoutFamily === 'dynamic-only'
+        ? RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY
+        : RUNTIME_HINT_MESSAGE_LAYOUT_MIXED;
+  const runtimeHint =
+    RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_FULL_CAPABILITIES | messageLayoutHint | buffer._capacity;
+  const resolvedPlan =
+    callsitePlan ??
+    sealCallsitePlan(
+      getPhysicalLayoutPlan(
+        getSpanBufferClass(schema),
+        runtimeHint,
+        createSpanContextClass<Ctx>(
+          schema,
+          { logSchema: schema, remapDescriptor: undefined },
+          RUNTIME_HINT_FULL_CAPABILITIES,
+        ),
+        undefined,
+        'strategy-selected',
+        `test-writer-context:${testWriterContextPlanId++}`,
+      ),
+      DEFAULT_METADATA,
+    );
+  resolvedPlan.appenders.writeSpanStart(buffer, 'test-writer-context');
+  return new resolvedPlan.SpanContextClass(buffer, schema, resolvedPlan);
+}
 /**
  * Create a properly typed SpanLogger for testing.
  *
@@ -247,12 +302,15 @@ export function createTestSpanBuffer<T extends SchemaFields>(
  * @param schema - LogSchema to use
  * @returns Object with buffer and logger, both properly typed
  */
-export function createTestLogger<T extends LogSchema>(schema: T): TestLoggerBundle<T> {
-  const logBinding = createTestLogBinding(schema);
+export function createTestLogger<T extends SchemaFields>(
+  schema: LogSchema<T>,
+): TestLoggerBundle<LogSchema<SystemSchemaFieldTypes & T>> {
+  const runtimeSchema = createTestSchema(schema.fields);
+  const logBinding = createTestLogBinding(runtimeSchema);
   const traceRoot = createTestTraceRoot();
-  const buffer = createSpanBuffer(schema, traceRoot, DEFAULT_METADATA);
-  const logger = createSpanLogger(schema, buffer);
-  return { buffer, logger, logBinding };
+  const buffer = createSpanBuffer(runtimeSchema, traceRoot, DEFAULT_METADATA);
+  const context = createTestSpanContext(runtimeSchema, buffer);
+  return { buffer, logger: context._spanLogger, logBinding };
 }
 
 // =============================================================================

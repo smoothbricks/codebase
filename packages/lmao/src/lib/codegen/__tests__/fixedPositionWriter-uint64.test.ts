@@ -22,7 +22,12 @@
 
 import { describe, expect, it } from 'bun:test';
 import { createResultWriter, createTagWriter, ENTRY_TYPE_SPAN_OK, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
-import { createTestOpMetadata, createTestSchema, createTestTraceRoot } from '../../__tests__/test-helpers.js';
+import {
+  createTestOpMetadata,
+  createTestSchema,
+  createTestSpanContext,
+  createTestTraceRoot,
+} from '../../__tests__/test-helpers.js';
 import { createSpanBuffer } from '../../spanBuffer.js';
 import type { AnySpanBuffer } from '../../types.js';
 
@@ -37,7 +42,8 @@ import type { AnySpanBuffer } from '../../types.js';
 function setup() {
   const schema = createTestSchema({ batchId: S.category(), count: S.number() });
   const buffer = createSpanBuffer(schema, createTestTraceRoot('t'), createTestOpMetadata(), 8);
-  return { schema, buffer };
+  const context = createTestSpanContext(schema, buffer);
+  return { schema, buffer, context };
 }
 
 // Read the allocated `uint64_value` values, narrowed to BigUint64Array.
@@ -77,15 +83,38 @@ function writeUint64Runtime(writer: object, value: bigint | null): void {
   Reflect.apply(method, writer, [value]);
 }
 
+describe('fixed-position WriterState ownership', () => {
+  it('keeps tag and result writers as one-field views over declared state', () => {
+    const { schema, buffer, context } = setup();
+    const writers = [
+      createTagWriter(schema, context),
+      createResultWriter(schema, context),
+    ];
+
+    for (const writer of writers) {
+      expect(Reflect.ownKeys(writer)).toEqual(['_state']);
+      expect(Object.hasOwn(writer, '_buffer')).toBe(false);
+      expect(Object.hasOwn(writer, '_spanBuffer')).toBe(false);
+      expect(Object.hasOwn(writer, '_traceRoot')).toBe(false);
+      expect(Object.hasOwn(writer, '_appendLogEntry')).toBe(false);
+
+      const state = Reflect.get(writer, '_state');
+      expect(Object.is(state, context)).toBe(true);
+      expect(Reflect.get(state, '_spanBuffer')).toBe(buffer);
+      expect(Reflect.get(state, '_buffer')).toBe(buffer);
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Row placement
 // ---------------------------------------------------------------------------
 
 describe('uint64_value row placement', () => {
   it('TagWriter writes to row 0 (span-start)', () => {
-    const { schema, buffer } = setup();
+    const { schema, buffer, context } = setup();
 
-    createTagWriter(schema, buffer).uint64_value(123n);
+    createTagWriter(schema, context).uint64_value(123n);
 
     const values = uint64Column(buffer);
     const nulls = uint64Nulls(buffer);
@@ -96,9 +125,9 @@ describe('uint64_value row placement', () => {
   });
 
   it('ResultWriter writes to row 1 (span-completion)', () => {
-    const { schema, buffer } = setup();
+    const { schema, buffer, context } = setup();
 
-    createResultWriter(schema, buffer, { ok: true }, false).uint64_value(456n);
+    createResultWriter(schema, context).uint64_value(456n);
 
     const values = uint64Column(buffer);
     const nulls = uint64Nulls(buffer);
@@ -115,12 +144,12 @@ describe('uint64_value row placement', () => {
 
 describe('uint64_value cross-row independence (no collision)', () => {
   it('tag row 0 and result row 1 hold distinct values on one buffer', () => {
-    const { schema, buffer } = setup();
+    const { schema, buffer, context } = setup();
     const rowZero = 111n;
     const rowOne = 222n;
 
-    createTagWriter(schema, buffer).uint64_value(rowZero);
-    createResultWriter(schema, buffer, { ok: true }, false).uint64_value(rowOne);
+    createTagWriter(schema, context).uint64_value(rowZero);
+    createResultWriter(schema, context).uint64_value(rowOne);
 
     const values = uint64Column(buffer);
     const nulls = uint64Nulls(buffer);
@@ -132,13 +161,13 @@ describe('uint64_value cross-row independence (no collision)', () => {
   });
 
   it('is order-independent: result-first then tag yields the same layout', () => {
-    const { schema, buffer } = setup();
+    const { schema, buffer, context } = setup();
     const rowZero = 333n;
     const rowOne = 444n;
 
     // Reverse the write order relative to the previous case.
-    createResultWriter(schema, buffer, { ok: true }, false).uint64_value(rowOne);
-    createTagWriter(schema, buffer).uint64_value(rowZero);
+    createResultWriter(schema, context).uint64_value(rowOne);
+    createTagWriter(schema, context).uint64_value(rowZero);
 
     const values = uint64Column(buffer);
     expect(values[0]).toBe(rowZero);
@@ -146,12 +175,12 @@ describe('uint64_value cross-row independence (no collision)', () => {
   });
 
   it('survives the span lifecycle: writeSpanStart/writeSpanEnd never touch uint64_value', () => {
-    const { schema, buffer } = setup();
+    const { schema, buffer, context } = setup();
     const rowZero = 900n;
     const rowOne = 901n;
 
-    const tag = createTagWriter(schema, buffer);
-    const result = createResultWriter(schema, buffer, { ok: true }, false);
+    const tag = createTagWriter(schema, context);
+    const result = createResultWriter(schema, context);
 
     // Reproduce the production sequence: lifecycle start, user tags, user result, lifecycle end.
     buffer._traceRoot.writeSpanStart(buffer, 'lifecycle-span');
@@ -178,12 +207,12 @@ describe('uint64_value cross-row independence (no collision)', () => {
 
 describe('uint64_value lazy allocation', () => {
   it('is unallocated until first write, then allocated', () => {
-    const { schema, buffer } = setup();
+    const { schema, buffer, context } = setup();
 
     expect(buffer.getColumnIfAllocated('uint64_value')).toBeUndefined();
     expect(buffer.getNullsIfAllocated('uint64_value')).toBeUndefined();
 
-    createTagWriter(schema, buffer).uint64_value(7n);
+    createTagWriter(schema, context).uint64_value(7n);
 
     expect(buffer.getColumnIfAllocated('uint64_value')).toBeDefined();
     expect(uint64Column(buffer)[0]).toBe(7n);
@@ -196,15 +225,15 @@ describe('uint64_value lazy allocation', () => {
 
 describe('uint64_value chaining and sibling non-interference', () => {
   it('returns the writer for chaining', () => {
-    const { schema, buffer } = setup();
-    const tag = createTagWriter(schema, buffer);
+    const { schema, context } = setup();
+    const tag = createTagWriter(schema, context);
     expect(tag.uint64_value(1n)).toBe(tag);
   });
 
   it('batchId(...).uint64_value(...) lands both values', () => {
-    const { schema, buffer } = setup();
+    const { schema, buffer, context } = setup();
 
-    createTagWriter(schema, buffer).batchId('batch-A').uint64_value(10n);
+    createTagWriter(schema, context).batchId('batch-A').uint64_value(10n);
 
     expect(uint64Column(buffer)[0]).toBe(10n);
     const batch = buffer.getColumnIfAllocated('batchId');
@@ -215,9 +244,9 @@ describe('uint64_value chaining and sibling non-interference', () => {
   });
 
   it('uint64_value(...).batchId(...) lands both values (reverse order)', () => {
-    const { schema, buffer } = setup();
+    const { schema, buffer, context } = setup();
 
-    createTagWriter(schema, buffer).uint64_value(20n).batchId('batch-B');
+    createTagWriter(schema, context).uint64_value(20n).batchId('batch-B');
 
     expect(uint64Column(buffer)[0]).toBe(20n);
     const batch = buffer.getColumnIfAllocated('batchId');
@@ -234,8 +263,8 @@ describe('uint64_value chaining and sibling non-interference', () => {
 
 describe('uint64_value null handling', () => {
   it('writing null clears the null bit (value marked absent), not sets it', () => {
-    const { schema, buffer } = setup();
-    const tag = createTagWriter(schema, buffer);
+    const { schema, buffer, context } = setup();
+    const tag = createTagWriter(schema, context);
 
     // First set a real value so the null bit is on...
     tag.uint64_value(99n);
@@ -247,9 +276,9 @@ describe('uint64_value null handling', () => {
   });
 
   it('null at row 1 clears row 1 only, leaving a non-null row 0 intact', () => {
-    const { schema, buffer } = setup();
-    const tag = createTagWriter(schema, buffer);
-    const result = createResultWriter(schema, buffer, { ok: true }, false);
+    const { schema, buffer, context } = setup();
+    const tag = createTagWriter(schema, context);
+    const result = createResultWriter(schema, context);
 
     tag.uint64_value(5n);
     result.uint64_value(6n);
@@ -280,8 +309,8 @@ describe('uint64_value boundary values', () => {
 
   for (const { name, value } of cases) {
     it(`round-trips ${name} exactly`, () => {
-      const { schema, buffer } = setup();
-      createTagWriter(schema, buffer).uint64_value(value);
+      const { schema, buffer, context } = setup();
+      createTagWriter(schema, context).uint64_value(value);
 
       const values = uint64Column(buffer);
       expect(values[0]).toBe(value);
@@ -290,8 +319,8 @@ describe('uint64_value boundary values', () => {
   }
 
   it('stores 0n as a non-null zero, distinct from absent', () => {
-    const { schema, buffer } = setup();
-    createTagWriter(schema, buffer).uint64_value(0n);
+    const { schema, buffer, context } = setup();
+    createTagWriter(schema, context).uint64_value(0n);
 
     const values = uint64Column(buffer);
     const nulls = uint64Nulls(buffer);

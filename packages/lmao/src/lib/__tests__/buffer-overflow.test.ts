@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import fc from 'fast-check';
-import { createSpanLogger } from '../codegen/spanLoggerGenerator.js';
 import { DEFAULT_METADATA } from '../opContext/defineOp.js';
 import { resolveMessage } from '../resolveMessage.js';
 import { S } from '../schema/builder.js';
@@ -9,8 +8,8 @@ import { LogSchema } from '../schema/LogSchema.js';
 import { mergeWithSystemSchema } from '../schema/systemSchema.js';
 import { createSpanBuffer, getSpanBufferClass, type SpanBufferConstructor } from '../spanBuffer.js';
 
-import type { AnySpanBuffer } from '../types.js';
-import { createBuffer, createTestTraceRoot } from './test-helpers.js';
+import type { AnySpanBuffer, SpanBuffer } from '../types.js';
+import { createBuffer, createTestSpanContext, createTestTraceRoot } from './test-helpers.js';
 
 /**
  * Property-based tests for buffer overflow handling.
@@ -41,6 +40,12 @@ const testSchema = new LogSchema(
  */
 const RESERVED_ROWS = 2;
 const DB_OPERATIONS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'] as const;
+
+function createLoggerContext(buffer: SpanBuffer<typeof testSchema>) {
+  const ctx = createTestSpanContext(testSchema, buffer);
+  ctx._buffer._writeIndex = RESERVED_ROWS;
+  return ctx;
+}
 
 type BufferChainAnalysis = {
   bufferCount: number;
@@ -199,7 +204,7 @@ describe('Buffer Overflow Property Tests', () => {
             SpanBufferClass.stats.spansCreated = 0;
 
             const buffer = createBuffer(testSchema);
-            const logger = createSpanLogger(testSchema, buffer);
+            const logger = createLoggerContext(buffer)._spanLogger;
 
             // Write entries
             for (let i = 0; i < numEntries; i++) {
@@ -236,7 +241,7 @@ describe('Buffer Overflow Property Tests', () => {
           SpanBufferClass.stats.spansCreated = 0;
 
           const buffer = createSpanBuffer(testSchema, createTestTraceRoot('test-trace'), DEFAULT_METADATA, capacity);
-          const logger = createSpanLogger(testSchema, buffer);
+          const logger = createLoggerContext(buffer)._spanLogger;
 
           // Write entries
           for (let i = 0; i < numEntries; i++) {
@@ -261,7 +266,7 @@ describe('Buffer Overflow Property Tests', () => {
           SpanBufferClass.stats.spansCreated = 0;
 
           const buffer = createBuffer(testSchema);
-          const logger = createSpanLogger(testSchema, buffer);
+          const logger = createLoggerContext(buffer)._spanLogger;
 
           for (let i = 0; i < numEntries; i++) {
             logger.info(`msg-${i}`);
@@ -303,7 +308,7 @@ describe('Buffer Overflow Property Tests', () => {
           SpanBufferClass.stats.spansCreated = 0;
 
           const buffer = createBuffer(testSchema);
-          const logger = createSpanLogger(testSchema, buffer);
+          const logger = createLoggerContext(buffer)._spanLogger;
 
           const operations = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'] as const;
 
@@ -343,7 +348,7 @@ describe('Buffer Overflow Property Tests', () => {
           SpanBufferClass.stats.spansCreated = 0;
 
           const buffer = createBuffer(testSchema);
-          const logger = createSpanLogger(testSchema, buffer);
+          const logger = createLoggerContext(buffer)._spanLogger;
 
           for (let i = 0; i < numEntries; i++) {
             logger.info(`msg-${i}`);
@@ -366,7 +371,7 @@ describe('Buffer Overflow Property Tests', () => {
           SpanBufferClass.stats.spansCreated = 0;
 
           const buffer = createBuffer(testSchema);
-          const logger = createSpanLogger(testSchema, buffer);
+          const logger = createLoggerContext(buffer)._spanLogger;
 
           for (let i = 0; i < numEntries; i++) {
             logger.info(`msg-${i}`);
@@ -393,7 +398,7 @@ describe('Buffer Overflow Property Tests', () => {
       const usableCapacity = capacity - RESERVED_ROWS; // 6 entries fit
 
       const buffer = createSpanBuffer(testSchema, createTestTraceRoot('test-trace'), DEFAULT_METADATA, capacity);
-      const logger = createSpanLogger(testSchema, buffer);
+      const logger = createLoggerContext(buffer)._spanLogger;
 
       // Write exactly usable capacity entries (6 with capacity=8, reserved=2)
       for (let i = 0; i < usableCapacity; i++) {
@@ -412,7 +417,7 @@ describe('Buffer Overflow Property Tests', () => {
       const usableCapacity = capacity - RESERVED_ROWS; // 6
 
       const buffer = createSpanBuffer(testSchema, createTestTraceRoot('test-trace'), DEFAULT_METADATA, capacity);
-      const logger = createSpanLogger(testSchema, buffer);
+      const logger = createLoggerContext(buffer)._spanLogger;
 
       // Write usable capacity + 1 entries (7 entries)
       for (let i = 0; i < usableCapacity + 1; i++) {
@@ -432,7 +437,7 @@ describe('Buffer Overflow Property Tests', () => {
     it('zero entries: single buffer with just reserved space', () => {
       const buffer = createBuffer(testSchema);
       // Create logger but don't write anything
-      createSpanLogger(testSchema, buffer);
+      createLoggerContext(buffer)._spanLogger;
 
       expect(buffer._overflow).toBeUndefined();
       // Logger constructor sets writeIndex to 2 (after reserved rows)
@@ -454,7 +459,7 @@ describe('Buffer Overflow Property Tests', () => {
             SpanBufferClass.stats.spansCreated = 0;
 
             const buffer = createSpanBuffer(testSchema, createTestTraceRoot('test-trace'), DEFAULT_METADATA, capacity);
-            const logger = createSpanLogger(testSchema, buffer);
+            const logger = createLoggerContext(buffer)._spanLogger;
 
             for (let i = 0; i < numEntries; i++) {
               logger.info(`msg-${i}`).requestId(`req-${i}`);
@@ -481,7 +486,7 @@ describe('Buffer Overflow Property Tests', () => {
       const usableCapacity = capacity - RESERVED_ROWS; // 6
 
       const buffer = createSpanBuffer(testSchema, createTestTraceRoot('test-trace'), DEFAULT_METADATA, capacity);
-      const logger = createSpanLogger(testSchema, buffer);
+      const logger = createLoggerContext(buffer)._spanLogger;
 
       // Set scope values that should be prefilled
       buffer._scopeValues = Object.freeze({
@@ -518,7 +523,7 @@ describe('Buffer Overflow Property Tests', () => {
       const usableCapacity = capacity - RESERVED_ROWS; // 6
 
       const buffer = createSpanBuffer(testSchema, createTestTraceRoot('test-trace'), DEFAULT_METADATA, capacity);
-      const logger = createSpanLogger(testSchema, buffer);
+      const logger = createLoggerContext(buffer)._spanLogger;
 
       buffer._scopeValues = Object.freeze({
         requestId: 'req-xyz',
@@ -549,7 +554,7 @@ describe('Buffer Overflow Property Tests', () => {
       const usableCapacity = capacity - RESERVED_ROWS; // 6
 
       const buffer = createSpanBuffer(testSchema, createTestTraceRoot('test-trace'), DEFAULT_METADATA, capacity);
-      const logger = createSpanLogger(testSchema, buffer);
+      const logger = createLoggerContext(buffer)._spanLogger;
 
       // Set scope for ONLY userId and requestId, NOT operation or duration or success
       buffer._scopeValues = Object.freeze({
@@ -580,7 +585,7 @@ describe('Buffer Overflow Property Tests', () => {
       const usableCapacity = capacity - RESERVED_ROWS;
 
       const buffer = createSpanBuffer(testSchema, createTestTraceRoot('test-trace'), DEFAULT_METADATA, capacity);
-      const logger = createSpanLogger(testSchema, buffer);
+      const logger = createLoggerContext(buffer)._spanLogger;
 
       // Set scope for userId but NEVER call .userId() directly
       buffer._scopeValues = Object.freeze({
