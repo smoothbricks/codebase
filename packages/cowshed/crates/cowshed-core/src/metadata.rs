@@ -323,8 +323,8 @@ fn validate_role_name(role: WorkspaceRole, name: &WorkspaceName) -> Result<(), M
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkspaceMarker {
     pub version: u32,
     pub repo_id: RepoId,
@@ -337,6 +337,46 @@ pub struct WorkspaceMarker {
     pub created_at: String,
     pub forked_from: Option<WorkspaceName>,
     pub created_trace: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspaceMarkerWire {
+    version: u32,
+    repo_id: RepoId,
+    project_root: PathBuf,
+    workspace: WorkspaceName,
+    workspace_incarnation: WorkspaceIncarnation,
+    role: WorkspaceRole,
+    image_format: ImageFormat,
+    base_commit: String,
+    created_at: String,
+    forked_from: Option<WorkspaceName>,
+    created_trace: String,
+}
+
+impl<'de> Deserialize<'de> for WorkspaceMarker {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = WorkspaceMarkerWire::deserialize(deserializer)?;
+        let marker = Self {
+            version: wire.version,
+            repo_id: wire.repo_id,
+            project_root: wire.project_root,
+            workspace: wire.workspace,
+            workspace_incarnation: wire.workspace_incarnation,
+            role: wire.role,
+            image_format: wire.image_format,
+            base_commit: wire.base_commit,
+            created_at: wire.created_at,
+            forked_from: wire.forked_from,
+            created_trace: wire.created_trace,
+        };
+        marker.validate().map_err(serde::de::Error::custom)?;
+        Ok(marker)
+    }
 }
 
 impl WorkspaceMarker {
@@ -489,7 +529,7 @@ pub struct WorkspaceInfoSnapshot {
     pub stale: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DetachedWorkspaceMetadata {
     pub version: u32,
@@ -505,16 +545,79 @@ pub struct DetachedWorkspaceMetadata {
     pub info_snapshot: Option<WorkspaceInfoSnapshot>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DetachedWorkspaceMetadataWire {
+    version: u32,
+    repo_id: RepoId,
+    workspace: WorkspaceName,
+    workspace_incarnation: WorkspaceIncarnation,
+    image_format: ImageFormat,
+    platform: Platform,
+    updated_at: String,
+    revision: u64,
+    #[serde(default)]
+    port_block: Option<PortBlock>,
+    #[serde(default)]
+    read: Vec<PathBuf>,
+    #[serde(default)]
+    write: Vec<PathBuf>,
+    #[serde(default)]
+    egress: Vec<EgressRule>,
+    #[serde(default)]
+    repos: Vec<RepoRule>,
+    #[serde(default)]
+    sim: Vec<SimVerb>,
+    #[serde(default)]
+    info_snapshot: Option<WorkspaceInfoSnapshot>,
+}
+
+impl<'de> Deserialize<'de> for DetachedWorkspaceMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = DetachedWorkspaceMetadataWire::deserialize(deserializer)?;
+        let metadata = Self {
+            version: wire.version,
+            repo_id: wire.repo_id,
+            workspace: wire.workspace,
+            workspace_incarnation: wire.workspace_incarnation,
+            image_format: wire.image_format,
+            platform: wire.platform,
+            updated_at: wire.updated_at,
+            grants: GrantSet {
+                revision: wire.revision,
+                port_block: wire.port_block,
+                read: wire.read,
+                write: wire.write,
+                egress: wire.egress,
+                repos: wire.repos,
+                sim: wire.sim,
+            },
+            info_snapshot: wire.info_snapshot,
+        };
+        metadata
+            .validate_deserialized()
+            .map_err(serde::de::Error::custom)?;
+        Ok(metadata)
+    }
+}
+
 impl DetachedWorkspaceMetadata {
-    pub fn validate(&self, image_path: &Path) -> Result<(), MetadataError> {
+    fn validate_deserialized(&self) -> Result<(), MetadataError> {
         if self.version != METADATA_VERSION {
             return Err(MetadataError::UnsupportedVersion {
                 kind: "detached workspace",
                 version: self.version,
             });
         }
+        self.grants.validate(self.platform)
+    }
+
+    pub fn validate(&self, image_path: &Path) -> Result<(), MetadataError> {
+        self.validate_deserialized()?;
         self.image_format.validate_path(image_path)?;
-        self.grants.validate(self.platform)?;
         Ok(())
     }
 
@@ -638,6 +741,7 @@ impl Drop for TempCleanup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use serde_json::json;
 
     fn temp_directory(test: &str) -> PathBuf {
@@ -725,6 +829,118 @@ mod tests {
         let marker: WorkspaceMarker = serde_json::from_value(expected.clone()).unwrap();
         marker.validate().unwrap();
         assert_eq!(serde_json::to_value(marker).unwrap(), expected);
+    }
+
+    #[test]
+    fn marker_deserialization_rejects_inconsistent_invariants_and_unknown_fields() {
+        let valid = serde_json::to_value(marker_from_json()).unwrap();
+        for (field, value) in [
+            ("version", json!(METADATA_VERSION + 1)),
+            ("role", json!("main")),
+            ("forkedFrom", json!("main")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            assert!(serde_json::from_value::<WorkspaceMarker>(invalid).is_err());
+        }
+
+        let mut unknown = valid;
+        unknown["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<WorkspaceMarker>(unknown).is_err());
+    }
+
+    #[test]
+    fn detached_deserialization_rejects_inconsistent_invariants_and_unknown_fields() {
+        let valid = frozen_sidecar_json();
+        for (field, value) in [
+            ("version", json!(METADATA_VERSION + 1)),
+            ("platform", json!("linux")),
+            ("portBlock", json!({ "base": 40976, "size": 15 })),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            assert!(serde_json::from_value::<DetachedWorkspaceMetadata>(invalid).is_err());
+        }
+
+        let mut macos_without_port = valid.clone();
+        macos_without_port
+            .as_object_mut()
+            .unwrap()
+            .remove("portBlock");
+        assert!(serde_json::from_value::<DetachedWorkspaceMetadata>(macos_without_port).is_err());
+
+        let mut unknown = valid;
+        unknown["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<DetachedWorkspaceMetadata>(unknown).is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn valid_marker_schemas_round_trip_across_roles(
+            main in any::<bool>(),
+            sparse in any::<bool>(),
+            session_suffix in 0_u16..=u16::MAX,
+        ) {
+            let (workspace, role) = if main {
+                ("main".to_owned(), "main")
+            } else {
+                (format!("session-{session_suffix}"), "workspace")
+            };
+            let expected = json!({
+                "version": METADATA_VERSION,
+                "repoId": "acme/widget",
+                "projectRoot": "/project",
+                "workspace": workspace,
+                "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                "role": role,
+                "imageFormat": if sparse { "sparse" } else { "asif" },
+                "baseCommit": "8f31c2d",
+                "createdAt": "2026-07-11T12:00:00Z",
+                "forkedFrom": null,
+                "createdTrace": "4bf92f"
+            });
+
+            let marker: WorkspaceMarker = serde_json::from_value(expected.clone()).unwrap();
+            prop_assert_eq!(serde_json::to_value(marker).unwrap(), expected);
+        }
+
+        #[test]
+        fn valid_sidecar_schemas_round_trip_across_platforms(
+            macos in any::<bool>(),
+            sparse in any::<bool>(),
+            base in 0_u16..=(u16::MAX - PORT_BLOCK_SIZE + 1),
+        ) {
+            let mut expected = frozen_sidecar_json();
+            expected["imageFormat"] = json!(if sparse { "sparse" } else { "asif" });
+            if macos {
+                expected["platform"] = json!("macos");
+                expected["portBlock"] = json!({ "base": base, "size": PORT_BLOCK_SIZE });
+            } else {
+                expected["platform"] = json!("linux");
+                expected.as_object_mut().unwrap().remove("portBlock");
+            }
+
+            let metadata: DetachedWorkspaceMetadata =
+                serde_json::from_value(expected.clone()).unwrap();
+            prop_assert_eq!(serde_json::to_value(metadata).unwrap(), expected);
+        }
+
+        #[test]
+        fn public_metadata_deserializers_reject_every_unsupported_version(
+            version in any::<u32>().prop_filter("version 1 is supported", |version| {
+                *version != METADATA_VERSION
+            }),
+        ) {
+            let mut marker = serde_json::to_value(marker_from_json()).unwrap();
+            marker["version"] = json!(version);
+            prop_assert!(serde_json::from_value::<WorkspaceMarker>(marker).is_err());
+
+            let mut sidecar = frozen_sidecar_json();
+            sidecar["version"] = json!(version);
+            prop_assert!(
+                serde_json::from_value::<DetachedWorkspaceMetadata>(sidecar).is_err()
+            );
+        }
     }
 
     #[test]
