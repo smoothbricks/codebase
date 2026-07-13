@@ -6,10 +6,33 @@
 > ArrayBuffer for maximum cache efficiency. For span identification concepts, see
 > [Span Identity](./01b4_span_identity.md).
 
+## Physical Layout and Ownership Contract <a id="smoo/lmao!n/spanbuffer-layout-contract"></a>
+
+`PhysicalLayoutPlan` is the versioned startup artifact that fixes column offsets, widths, alignment, eager/lazy policy,
+and contiguous-versus-chunked Arrow exposure for one generated buffer shape. A compatible `VocabularyBinding` may add
+compiler-emitted vocabulary at startup; it MUST NOT mutate an instantiated plan or live SpanBuffer hidden class.
+
+- **Buffer-owned:** writable `_system`, identity, lazy-column blocks, string-reference arrays, and overflow links from
+  span setup until freeze.
+- **Lease-owned borrowing:** conversion may expose frozen contiguous TypedArray/WASM regions through an `ArrowLease`.
+  The lease pins the backing store, memory epoch, and overflow chunks; reset, recycle, or invalidating growth waits.
+- **Arrow-owned:** dictionary/UTF-8/offset buffers, synthesized null bitmaps, serialized output, and any contiguous
+  concatenation required by a consumer.
+- **Chunked boundary:** overflow buffers remain separate physical chunks. Prefer Arrow-native chunks; concatenate only
+  where contiguity is required, and report the allocation and copied bytes.
+
+Effective memory includes SpanBuffer objects/trees, TypedArray views, JS/external backing stores, committed WASM pages
+and fragmentation, Arrow output, active-lease pinned bytes, temporary conversion buffers, and cache/allocator overhead.
+Report logical payload and peak/retained effective bytes per request.
+
+Startup creates the plan/generated class; span setup allocates the object and base storage; warmed fixed-capacity writes
+target zero new heap allocations with fixed monomorphic stores and one predictable not-overflow branch; first lazy
+column and overflow are slow paths; per-request Arrow flush is separately measured.
+
 ## Unified SpanBuffer Memory Layout <a id="smoo/lmao!n/spanbuffer-layout-unified"></a>
 
-**Purpose**: Combine identity and system columns into a single ArrayBuffer allocation for maximum cache efficiency,
-minimal allocations, and zero conditional logic for system column access.
+**Purpose**: Combine identity and system columns into one base backing allocation for cache efficiency and fixed system
+column offsets. This reduces allocations; it does not make span setup or the complete request allocation-free.
 
 ### Design Principles
 
@@ -119,7 +142,7 @@ minimal allocations, and zero conditional logic for system column access.
 **Key savings from unified approach:**
 
 - Root/Child: 2 fewer ArrayBuffer allocations per span
-- Chained: 12-141 bytes saved (no identity bytes at all) + zero copy
+- Chained: 12-141 identity bytes avoided; the existing identity view is shared by reference
 - All: Better cache locality (identity adjacent to hot system columns)
 
 ### Why System Columns BEFORE Identity
@@ -127,7 +150,7 @@ minimal allocations, and zero conditional logic for system column access.
 Placing timestamp and entry_type at the START of the buffer means:
 
 1. **Fixed offsets for ALL buffer types** - timestamp always at 0, entry_type always at `capacity * 8`
-2. **Zero conditional logic** - same view creation code for root, child, and chained
+2. **No per-write layout conditional** - root, child, and chained buffers use the same fixed system-column offsets
 3. **Chained is just truncated** - same layout prefix, just shorter (no identity suffix)
 
 ```typescript
@@ -198,23 +221,17 @@ get span_id(): number {
 
 ### Thread ID Generation <a id="smoo/lmao!n/spanbuffer-layout.thread-id"></a>
 
-Thread ID is cached as raw bytes at module level (thread_id.ts) for zero-copy writes:
+Thread ID bytes are cached once per worker/process and copied into newly allocated root/child identity storage. The
+cache avoids regeneration and intermediate encoding; `Uint8Array.set()` still copies 8 bytes during span setup.
 
 ```typescript
-// Module-level singleton (thread_id.ts)
-// Generated once per process/worker, cached as Uint8Array for zero-copy writes
+// Module-level singleton generated once per process/worker
 let thread_idBytes: Uint8Array | null = null;
 
-function ensureInitialized(): void {
-  if (thread_idBytes !== null) return;
-  thread_idBytes = new Uint8Array(8);
-  crypto.getRandomValues(thread_idBytes); // Crypto-secure, generated once
-}
-
-// Hot-path API: copy cached bytes directly (zero-copy)
+// Span-setup API: copy cached bytes into owned identity storage
 function copyThreadIdTo(dest: Uint8Array, offset: number): void {
   ensureInitialized();
-  dest.set(thread_idBytes!, offset); // Direct copy of cached bytes
+  dest.set(thread_idBytes!, offset);
 }
 ```
 
@@ -321,11 +338,13 @@ class SpanBuffer {
 
 ### V8 In-Object Property Optimization
 
-**CRITICAL: Property Assignment Order Matters for Performance!**
+**Contract: property assignment order and shape stability are performance requirements.**
 
-V8 distinguishes between **in-object properties** (stored directly on the object, ~8-12 properties) and **out-of-object
-properties** (stored in a backing store with extra indirection). The first properties assigned in the constructor get
-fast in-object slots.
+The generated constructor MUST initialize every hot own-property in the same order for every instance of a generated
+class. Warmed setters observe one receiver shape and value representation per call site; no schema-name lookup, property
+addition/deletion, or JS/WASM receiver mixing is allowed there. Benchmark evidence MUST detect hidden-class transitions
+and polymorphic/megamorphic ICs when diagnostics exist. The common capacity branch is biased to not-overflow; lazy
+allocation and overflow branch into explicit slow helpers.
 
 **SpanBuffer Property Ordering (Hottest → Coldest):**
 
@@ -433,6 +452,9 @@ Object.assign(SpanBuffer.prototype, spanBufferMethods);
 ```
 
 ### Performance Characteristics
+
+Construction counts below are **span-setup** costs. Warmed-write allocation claims exclude them. Effective-memory
+reporting includes object/tree/view overhead, backing stores, lazy columns, and lease-pinned/Arrow-owned output.
 
 **Construction (root span):**
 
@@ -634,8 +656,9 @@ function createChildSpanBuffer<T extends LogSchema>(
 
 ### createOverflowBuffer - Buffer Chaining <a id="smoo/lmao!n/spanbuffer-layout.create-overflow"></a>
 
-Creates a continuation buffer when the current buffer overflows. Chained buffers SHARE the identity reference from the
-first buffer (they represent the SAME logical span, just additional storage).
+Creates a continuation chunk when the current chunk overflows. This slow path allocates system storage/views and links
+the chunk; it shares the immutable identity view with the first buffer. Overflow is excluded from the warmed
+fixed-capacity zero-allocation claim.
 
 ```typescript
 function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>): SpanBuffer<T>;
@@ -647,9 +670,10 @@ function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>): SpanB
 
 **Returns:** New SpanBuffer linked via `buffer._overflow`, with same schema type
 
-**Identity Layout:** Shares `_identity` reference from original buffer (zero bytes allocated)
+**Identity Layout:** Shares `_identity` from the original buffer (zero additional identity payload bytes).
 
-**Memory:** Single ArrayBuffer containing ONLY timestamps and entry_type (smallest allocation!)
+**Memory:** Allocates one system backing store plus views. Arrow keeps it chunked where possible or performs one
+explicitly accounted contiguous copy.
 
 **Note:** Capacity is rounded up to multiple of 8 for byte-aligned null bitmaps.
 
@@ -751,3 +775,14 @@ Stats are per-schema, not per-buffer:
 | Entry written      | `totalWrites++`                   |
 | Overflow triggered | `overflows++`, `overflowWrites++` |
 | Capacity adjusted  | `capacity` updated, stats reset   |
+
+### Benchmark Acceptance
+
+For each `PhysicalLayoutPlan`, Mitata scenarios MUST follow
+[01b1 §Required Mitata Protocol](./01b1_buffer_performance_optimizations.md#smoo/lmao!n/buffer-perf-benchmark-protocol):
+plugin-off, plugin-on/current, and candidates use identical semantic checksums, position-balanced ordering,
+machine-readable raw samples, and p50/p95/p99/p99.9 for startup, span setup, warmed fixed-capacity writes, first lazy
+allocation, overflow, and per-request Arrow flush. Allocation/GC, effective-memory, active-lease, copied-byte, chunk,
+shape/IC, and branch observations are auxiliary instrumentation alongside Mitata and may be unavailable. Reject shape or
+checksum changes, warmed-write allocations, polymorphic hot ICs, unstable common branches, lease-lifetime violations, or
+regressions beyond the predeclared noise threshold.
