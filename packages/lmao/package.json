@@ -144,7 +144,7 @@
     "bench:wasm": "bun run benchmarks/js-vs-wasm.bench.ts",
     "build:wasm": "nx run lmao:rust-wasm",
     "test": "nx run lmao:test --outputStyle=stream",
-    "build:zig-wasm": "zig build zig-allocator -Doptimize=ReleaseSmall"
+    "build:zig-wasm": "nx run lmao:zig-zig-allocator"
   },
   "nx": {
     "sourceRoot": "packages/lmao/src",
@@ -170,6 +170,7 @@
         "executor": "nx:run-commands",
         "cache": true,
         "dependsOn": [
+          "^build",
           {
             "projects": [
               "lmao-rs"
