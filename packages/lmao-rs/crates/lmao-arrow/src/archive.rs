@@ -113,6 +113,7 @@ mod tests {
     #[test]
     fn chunk_stats_values_are_exact() {
         use crate::convert::convert_span_trees;
+        use crate::dict::StableVocabularyCatalog;
         use crate::source::MockSpan;
         use lmao_core::{SpanIdentity, TraceId};
         use std::sync::Arc;
@@ -130,10 +131,10 @@ mod tests {
             overflow: None,
             children: vec![],
         };
-        let batch = convert_span_trees(&[span]).unwrap();
+        let batch = convert_span_trees(&[span], &StableVocabularyCatalog::EMPTY).unwrap();
         assert_eq!(extract_chunk_stats(&batch), (3, 50, 900));
 
-        let empty = convert_span_trees::<MockSpan>(&[]).unwrap();
+        let empty = convert_span_trees::<MockSpan>(&[], &StableVocabularyCatalog::EMPTY).unwrap();
         assert_eq!(extract_chunk_stats(&empty), (0, 0, 0));
 
         let env = build_trace_chunk_envelope("ref", &batch);
