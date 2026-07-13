@@ -3,8 +3,11 @@ import { createHash } from 'node:crypto';
 import fc from 'fast-check';
 import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
+import type { OpMetadata } from '../opContext/opTypes.js';
 import { MAX_PACKED_MESSAGE_DENSE_INDEX, resolveEntryType, resolveMessage } from '../resolveMessage.js';
 import {
+  type MessageLayoutFamily,
+  type MessagePhysicalLayout,
   RUNTIME_HINT_ANALYZED_VALID,
   RUNTIME_HINT_LOG,
   RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY,
@@ -15,10 +18,7 @@ import {
   RUNTIME_HINT_RESULT,
   runtimeHintMessageLayoutFamily,
   runtimeHintMessagePhysicalLayout,
-  type MessageLayoutFamily,
-  type MessagePhysicalLayout,
 } from '../runtimeHint.js';
-import type { OpMetadata } from '../opContext/opTypes.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import {
@@ -37,11 +37,7 @@ import {
 } from '../spanBuffer.js';
 import { extractFacts } from '../testing/extractFacts.js';
 import type { AnySpanBuffer, SpanBuffer } from '../types.js';
-import {
-  getVocabularyGeneration,
-  registerVocabularyFragment,
-  type VocabularyFragment,
-} from '../vocabularyRegistry.js';
+import { getVocabularyGeneration, registerVocabularyFragment, type VocabularyFragment } from '../vocabularyRegistry.js';
 import { createTestTraceRoot } from './test-helpers.js';
 
 const CAPACITY = 8;
@@ -117,15 +113,14 @@ function makeFragment(text: string): VocabularyFragment {
   return { ...fragment, contentHash: fragmentHash(fragment) };
 }
 
-function textAtDenseZero(): string {
-  let generation = getVocabularyGeneration();
-  if (generation.ids.length === 0) {
-    const binding = registerVocabularyFragment(makeFragment('family dense zero'));
-    expect(binding[0]).toBe(0);
-    generation = getVocabularyGeneration();
-  }
-  const start = generation.offsets[0];
-  const end = generation.offsets[1];
+const FAMILY_VOCABULARY_TEXT = 'family local vocabulary literal';
+const FAMILY_VOCABULARY_BINDING = registerVocabularyFragment(makeFragment(FAMILY_VOCABULARY_TEXT));
+const FAMILY_DENSE_INDEX = FAMILY_VOCABULARY_BINDING[0];
+
+function textAtFamilyBinding(): string {
+  const generation = getVocabularyGeneration();
+  const start = generation.offsets[FAMILY_DENSE_INDEX];
+  const end = generation.offsets[FAMILY_DENSE_INDEX + 1];
   const record = generation.records.subarray(start, end);
   const textLength = new DataView(record.buffer, record.byteOffset, record.byteLength).getUint32(0, true);
   return new TextDecoder().decode(record.subarray(4, 4 + textLength));
@@ -137,14 +132,14 @@ function hint(familyBits: number, physicalBits = 0, capacity = CAPACITY): number
 
 const staticOp = context.defineOp('static-family', (ctx) => ctx.ok(null), undefined, {
   runtimeHint: hint(RUNTIME_HINT_MESSAGE_LAYOUT_STATIC_ONLY),
-  localMessageDictionary: [0],
+  localMessageDictionary: [FAMILY_DENSE_INDEX],
 });
 const dynamicOp = context.defineOp('dynamic-family', (ctx) => ctx.ok(null), undefined, {
   runtimeHint: hint(RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY),
 });
 const mixedOp = context.defineOp('mixed-family', (ctx) => ctx.ok(null), undefined, {
   runtimeHint: hint(RUNTIME_HINT_MESSAGE_LAYOUT_MIXED),
-  localMessageDictionary: [0],
+  localMessageDictionary: [FAMILY_DENSE_INDEX],
 });
 const fallbackCurrentOp = context.defineOp('fallback-current-family', (ctx) => ctx.ok(null));
 const specializedStaticOp = context.defineOp('specialized-static-family', (ctx) => ctx.ok(null), undefined, {
@@ -172,13 +167,7 @@ function createPlannedBuffer(
   metadata: OpMetadata,
 ): SpanBuffer<typeof runtimeSchema> {
   SpanBufferClass.stats.capacity = CAPACITY;
-  return createSpanBuffer(
-    runtimeSchema,
-    createTestTraceRoot('family-layout'),
-    metadata,
-    CAPACITY,
-    SpanBufferClass,
-  );
+  return createSpanBuffer(runtimeSchema, createTestTraceRoot('family-layout'), metadata, CAPACITY, SpanBufferClass);
 }
 
 function expectFamilyShape(buffer: AnySpanBuffer, family: MessageLayoutFamily): void {
@@ -258,16 +247,18 @@ describe('specialized message buffer families', () => {
     expect(staticOp.callsitePlan.SpanBufferClass).toBe(getSpanBufferClass(runtimeSchema, 'static-only'));
     expect(dynamicOp.callsitePlan.SpanBufferClass).toBe(getSpanBufferClass(runtimeSchema, 'dynamic-only'));
     expect(mixedOp.callsitePlan.SpanBufferClass).toBe(getSpanBufferClass(runtimeSchema, 'mixed'));
-    expect(new Set([staticOp.callsitePlan.SpanBufferClass, dynamicOp.callsitePlan.SpanBufferClass, mixedOp.callsitePlan.SpanBufferClass]).size).toBe(3);
+    expect(
+      new Set([
+        staticOp.callsitePlan.SpanBufferClass,
+        dynamicOp.callsitePlan.SpanBufferClass,
+        mixedOp.callsitePlan.SpanBufferClass,
+      ]).size,
+    ).toBe(3);
   });
 
   it('decodes physical bits conservatively and caches every family/physical constructor dimension', () => {
     const packedHint = hint(RUNTIME_HINT_MESSAGE_LAYOUT_MIXED, RUNTIME_HINT_MESSAGE_PHYSICAL_PACKED, 64);
-    const specializedHint = hint(
-      RUNTIME_HINT_MESSAGE_LAYOUT_MIXED,
-      RUNTIME_HINT_MESSAGE_PHYSICAL_SPECIALIZED,
-      64,
-    );
+    const specializedHint = hint(RUNTIME_HINT_MESSAGE_LAYOUT_MIXED, RUNTIME_HINT_MESSAGE_PHYSICAL_SPECIALIZED, 64);
     expect(runtimeHintMessagePhysicalLayout(packedHint)).toBe('packed');
     expect(runtimeHintMessagePhysicalLayout(specializedHint)).toBe('specialized');
     expect(runtimeHintMessagePhysicalLayout(hint(RUNTIME_HINT_MESSAGE_LAYOUT_MIXED, 0, 64))).toBe('current');
@@ -299,7 +290,7 @@ describe('specialized message buffer families', () => {
   });
 
   it('packs low-8 entry types and dense-plus-one high-24 messages with exact lane omissions', () => {
-    const denseZeroText = textAtDenseZero();
+    const denseZeroText = textAtFamilyBinding();
     const cases = [
       { family: 'static-only' as const, op: packedStaticOp },
       { family: 'dynamic-only' as const, op: packedDynamicOp },
@@ -314,9 +305,9 @@ describe('specialized message buffer families', () => {
       if (family === 'static-only') expect('message_values' in buffer).toBe(false);
       else expect(buffer.message_values).toBeInstanceOf(Array);
 
-      op.callsitePlan.appenders.writeSpanStart(buffer, 0);
+      op.callsitePlan.appenders.writeSpanStart(buffer, FAMILY_DENSE_INDEX);
       expect(buffer._rowHeaders[0] & 0xff).toBe(ENTRY_TYPE_SPAN_START);
-      expect(buffer._rowHeaders[0] >>> 8).toBe(1);
+      expect(buffer._rowHeaders[0] >>> 8).toBe(FAMILY_DENSE_INDEX + 1);
       expect(buffer._rowHeaders[1] & 0xff).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
       expect(resolveEntryType(buffer, 0)).toBe(ENTRY_TYPE_SPAN_START);
       expect(resolveMessage(buffer, 0)).toBe(denseZeroText);
@@ -360,11 +351,15 @@ describe('specialized message buffer families', () => {
   });
 
   it('keeps packed lifecycle, facts, and semantic message resolution identical', () => {
-    const denseZeroText = textAtDenseZero();
+    const denseZeroText = textAtFamilyBinding();
     const root = createPlannedBuffer('mixed', packedMixedOp.callsitePlan.SpanBufferClass, packedMixedOp.metadata);
-    const rootContext = new packedMixedOp.callsitePlan.SpanContextClass(root, runtimeSchema, packedMixedOp.callsitePlan);
+    const rootContext = new packedMixedOp.callsitePlan.SpanContextClass(
+      root,
+      runtimeSchema,
+      packedMixedOp.callsitePlan,
+    );
     packedMixedOp.callsitePlan.appenders.writeSpanStart(root, 'packed root');
-    rootContext._spanLogger._infoTemplate(0);
+    rootContext._spanLogger._infoTemplate(FAMILY_DENSE_INDEX);
     rootContext._spanLogger.debug('packed raw');
     packedMixedOp.callsitePlan.appenders.writeSpanEnd(root, ENTRY_TYPE_SPAN_OK);
 
@@ -438,15 +433,15 @@ describe('specialized message buffer families', () => {
       fallbackCurrentOp.callsitePlan,
     );
     fallbackCurrentOp.callsitePlan.appenders.writeSpanStart(root, 'fallback root');
-    expect(() => rootContext._spanLogger._infoTemplate(0)).not.toThrow();
+    expect(() => rootContext._spanLogger._infoTemplate(FAMILY_DENSE_INDEX)).not.toThrow();
     const row = root._writeIndex - 1;
     if (root._messageIds === undefined || root.message_values === undefined) {
       throw new Error('Expected fallback current ID and raw lanes');
     }
     expect('message_nulls' in root).toBe(false);
     expect(root._messageIds[row]).toBe(0);
-    expect(root.message_values[row]).toBe(textAtDenseZero());
-    expect(resolveMessage(root, row)).toBe(textAtDenseZero());
+    expect(root.message_values[row]).toBe(textAtFamilyBinding());
+    expect(resolveMessage(root, row)).toBe(textAtFamilyBinding());
   });
 
   it('shares one frozen current-mode local dictionary across root, child, and overflow buffers', () => {
@@ -460,7 +455,7 @@ describe('specialized message buffer families', () => {
     );
     const overflow = createOverflowBuffer(child);
     const dictionary = mixedOp.callsitePlan.localMessageDictionary;
-    expect(dictionary).toEqual([0]);
+    expect(dictionary).toEqual([FAMILY_DENSE_INDEX]);
     expect(Object.isFrozen(dictionary)).toBe(true);
     for (const buffer of [root, child, overflow]) {
       const plan = buffer._opMetadata._physicalLayoutPlan;
@@ -475,7 +470,7 @@ describe('specialized message buffer families', () => {
       buffer.entry_type[0] = ENTRY_TYPE_INFO;
       buffer._messageIds[0] = 1;
       buffer._writeIndex = 1;
-      expect(resolveMessage(buffer, 0)).toBe(textAtDenseZero());
+      expect(resolveMessage(buffer, 0)).toBe(textAtFamilyBinding());
     }
   });
 
@@ -491,7 +486,7 @@ describe('specialized message buffer families', () => {
     }
     expect('message_nulls' in buffer).toBe(false);
     buffer.entry_type[0] = ENTRY_TYPE_INFO;
-    buffer._logHeaders[0] = 1;
+    buffer._logHeaders[0] = FAMILY_DENSE_INDEX + 1;
     buffer.entry_type[1] = ENTRY_TYPE_DEBUG;
     buffer.message(1, '');
     buffer.entry_type[2] = ENTRY_TYPE_DEBUG;
@@ -500,7 +495,7 @@ describe('specialized message buffer families', () => {
     buffer._logHeaders[4] = MAX_PACKED_MESSAGE_DENSE_INDEX + 1;
     buffer._writeIndex = 5;
 
-    expect(resolveMessage(buffer, 0)).toBe(textAtDenseZero());
+    expect(resolveMessage(buffer, 0)).toBe(textAtFamilyBinding());
     expect(resolveMessage(buffer, 1)).toBe('');
     expect(resolveMessage(buffer, 2)).toBe('specialized raw');
     expect(resolveMessage(buffer, 3)).toBeUndefined();
@@ -529,10 +524,10 @@ describe('specialized message buffer families', () => {
         expect(staticRow._messageIds[0]).toBe(1);
       } else {
         if (staticRow._logHeaders === undefined) throw new Error('Expected specialized dense lane');
-        staticRow._logHeaders[0] = 1;
-        expect(staticRow._logHeaders[0]).toBe(1);
+        staticRow._logHeaders[0] = FAMILY_DENSE_INDEX + 1;
+        expect(staticRow._logHeaders[0]).toBe(FAMILY_DENSE_INDEX + 1);
       }
-      expect(resolveMessage(staticRow, 0)).toBe(textAtDenseZero());
+      expect(resolveMessage(staticRow, 0)).toBe(textAtFamilyBinding());
 
       const nullRow = createPlannedBuffer('mixed', op.callsitePlan.SpanBufferClass, op.metadata);
       if (nullRow.entry_type === undefined) throw new Error(`Expected ${mode} entry-type lane`);
@@ -559,13 +554,7 @@ describe('specialized message buffer families', () => {
       { mode: 'specialized' as const, op: specializedMixedOp },
     ]) {
       const root = createPlannedBuffer('mixed', op.callsitePlan.SpanBufferClass, op.metadata);
-      const child = createChildSpanBuffer(
-        root,
-        op.callsitePlan.SpanBufferClass,
-        op.metadata,
-        op.metadata,
-        CAPACITY,
-      );
+      const child = createChildSpanBuffer(root, op.callsitePlan.SpanBufferClass, op.metadata, op.metadata, CAPACITY);
       const overflow = createOverflowBuffer(child);
 
       for (const [kind, buffer] of [
@@ -662,7 +651,7 @@ describe('specialized message buffer families', () => {
   });
 
   it('derives Arrow null, raw, and static messages across current and specialized root, child, and overflow', () => {
-    const denseZeroText = textAtDenseZero();
+    const denseZeroText = textAtFamilyBinding();
     for (const { mode, op } of [
       { mode: 'current' as const, op: mixedOp },
       { mode: 'specialized' as const, op: specializedMixedOp },
@@ -670,28 +659,22 @@ describe('specialized message buffer families', () => {
       const root = createPlannedBuffer('mixed', op.callsitePlan.SpanBufferClass, op.metadata);
       const rootContext = new op.callsitePlan.SpanContextClass(root, runtimeSchema, op.callsitePlan);
       op.callsitePlan.appenders.writeSpanStart(root, `${mode} root`);
-      rootContext._spanLogger._infoTemplate(0);
+      rootContext._spanLogger._infoTemplate(FAMILY_DENSE_INDEX);
       rootContext._spanLogger.debug(`${mode} root raw`);
       op.callsitePlan.appenders.writeLogEntry(root, ENTRY_TYPE_DEBUG);
       op.callsitePlan.appenders.writeSpanEnd(root, ENTRY_TYPE_SPAN_OK);
 
-      const child = createChildSpanBuffer(
-        root,
-        op.callsitePlan.SpanBufferClass,
-        op.metadata,
-        op.metadata,
-        CAPACITY,
-      );
+      const child = createChildSpanBuffer(root, op.callsitePlan.SpanBufferClass, op.metadata, op.metadata, CAPACITY);
       const childContext = new op.callsitePlan.SpanContextClass(child, runtimeSchema, op.callsitePlan);
       op.callsitePlan.appenders.writeSpanStart(child, `${mode} child`);
-      childContext._spanLogger._infoTemplate(0);
+      childContext._spanLogger._infoTemplate(FAMILY_DENSE_INDEX);
       childContext._spanLogger.debug(`${mode} child raw`);
       op.callsitePlan.appenders.writeLogEntry(child, ENTRY_TYPE_DEBUG);
       op.callsitePlan.appenders.writeSpanEnd(child, ENTRY_TYPE_SPAN_OK);
 
       const overflow = createOverflowBuffer(child);
       const overflowContext = new op.callsitePlan.SpanContextClass(overflow, runtimeSchema, op.callsitePlan);
-      overflowContext._spanLogger._infoTemplate(0);
+      overflowContext._spanLogger._infoTemplate(FAMILY_DENSE_INDEX);
       overflowContext._spanLogger.debug(`${mode} overflow raw`);
       op.callsitePlan.appenders.writeLogEntry(overflow, ENTRY_TYPE_DEBUG);
 
@@ -720,8 +703,8 @@ describe('specialized message buffer families', () => {
     }
   });
 
-  it('represents dense index zero, dynamic/static span names, null/raw rows, and terminal scalars', () => {
-    const denseZeroText = textAtDenseZero();
+  it('represents returned dense bindings, dynamic/static span names, null/raw rows, and terminal scalars', () => {
+    const denseZeroText = textAtFamilyBinding();
     const cases = [
       { family: 'static-only' as const, op: staticOp },
       { family: 'dynamic-only' as const, op: dynamicOp },
@@ -730,7 +713,7 @@ describe('specialized message buffer families', () => {
 
     for (const { family, op } of cases) {
       const denseName = createPlannedBuffer(family, op.callsitePlan.SpanBufferClass, op.metadata);
-      op.callsitePlan.appenders.writeSpanStart(denseName, 0);
+      op.callsitePlan.appenders.writeSpanStart(denseName, FAMILY_DENSE_INDEX);
       expect(resolveEntryType(denseName, 0)).toBe(ENTRY_TYPE_SPAN_START);
       expect(resolveMessage(denseName, 0)).toBe(denseZeroText);
       expectPhysicalShape(denseName, 'current');
@@ -774,14 +757,13 @@ describe('specialized message buffer families', () => {
     }
   });
 
-
   it('preserves decoded lifecycle and log facts across mixed-family parent/child rows', () => {
-    const denseZeroText = textAtDenseZero();
+    const denseZeroText = textAtFamilyBinding();
     const root = createPlannedBuffer('mixed', mixedOp.callsitePlan.SpanBufferClass, mixedOp.metadata);
     const rootContext = new mixedOp.callsitePlan.SpanContextClass(root, runtimeSchema, mixedOp.callsitePlan);
     mixedOp.callsitePlan.appenders.writeSpanStart(root, 'mixed root');
     const rootLogger = rootContext._spanLogger;
-    rootLogger._infoTemplate(0);
+    rootLogger._infoTemplate(FAMILY_DENSE_INDEX);
     rootLogger.debug('root raw');
     mixedOp.callsitePlan.appenders.writeSpanEnd(root, ENTRY_TYPE_SPAN_OK);
 
@@ -793,9 +775,9 @@ describe('specialized message buffer families', () => {
       CAPACITY,
     );
     const childContext = new staticOp.callsitePlan.SpanContextClass(child, runtimeSchema, staticOp.callsitePlan);
-    staticOp.callsitePlan.appenders.writeSpanStart(child, 0);
+    staticOp.callsitePlan.appenders.writeSpanStart(child, FAMILY_DENSE_INDEX);
     const childLogger = childContext._spanLogger;
-    childLogger._infoTemplate(0);
+    childLogger._infoTemplate(FAMILY_DENSE_INDEX);
     child.message(1, 'child boom');
     staticOp.callsitePlan.appenders.writeSpanEnd(child, ENTRY_TYPE_SPAN_EXCEPTION);
 
@@ -811,7 +793,7 @@ describe('specialized message buffer families', () => {
   });
 
   it('preserves overflow order, reserved-row formula, identities, and stats across plugin and physical modes', () => {
-    const denseZeroText = textAtDenseZero();
+    const denseZeroText = textAtFamilyBinding();
     const cases: Array<{
       name: string;
       op: typeof mixedOp;
@@ -854,7 +836,7 @@ describe('specialized message buffer families', () => {
             const logger = rootContext._spanLogger;
             for (const operation of operations) {
               if (operation.kind === 'static') {
-                if (testCase.compiledTemplates) logger._infoTemplate(0);
+                if (testCase.compiledTemplates) logger._infoTemplate(FAMILY_DENSE_INDEX);
                 else logger.info(operation.text);
               } else {
                 logger.debug(operation.text);
