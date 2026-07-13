@@ -392,37 +392,26 @@ func (t *fileTransformer) trySpanRewrite(call *shimast.CallExpression) bool {
 		return false
 	}
 	isPlainFunction := opOrFn.Kind == shimast.KindArrowFunction || opOrFn.Kind == shimast.KindFunctionExpression
-	if !isPlainFunction && !t.opSpans[call] {
+	if isPlainFunction || !t.opSpans[call] {
 		return false
 	}
 
 	line := t.lineOf(call.AsNode())
 	methodName := fmt.Sprintf("span%d", len(rest))
-	staticID := t.staticSpanNameIDs[call]
-	if staticID != 0 { methodName = fmt.Sprintf("spanStatic%d", len(rest)) }
-	childCtx := callExpr(propAccess(ident("Object"), "create"), []*shimast.Node{recv})
-	var bufferClass, remappedView, opMetadata, fn, runtimeHint *shimast.Node
-	if isPlainFunction {
-		bufferClass = propAccess(propAccess(recv, "_buffer"), "constructor")
-		remappedView = ident("undefined")
-		opMetadata = propAccess(propAccess(recv, "_buffer"), "_opMetadata")
-		fn = opOrFn
-		runtimeHint = num(0)
-	} else {
-		bufferClass = propAccess(opOrFn, "SpanBufferClass")
-		remappedView = propAccess(opOrFn, "remappedViewClass")
-		opMetadata = propAccess(opOrFn, "metadata")
-		fn = propAccess(opOrFn, "fn")
-		runtimeHint = propAccess(opOrFn, "runtimeHint")
+	nameOperand := nameArg
+	if staticID := t.staticSpanNameIDs[call]; staticID != 0 {
+		nameOperand = t.staticVocabularyOperand(staticID)
 	}
-	var newArgs []*shimast.Node
-	if staticID != 0 {
-		newArgs = []*shimast.Node{num(line), t.staticVocabularyOperand(staticID), childCtx, bufferClass, remappedView, opMetadata, fn}
-	} else {
-		newArgs = []*shimast.Node{num(line), nameArg, childCtx, bufferClass, remappedView, opMetadata, fn}
+	callsitePlan := propAccess(opOrFn, "callsitePlan")
+	childCtx := callExpr(propAccess(callsitePlan, "newCtx0"), []*shimast.Node{recv})
+	newArgs := []*shimast.Node{
+		num(line),
+		nameOperand,
+		childCtx,
+		callsitePlan,
+		propAccess(opOrFn, "fn"),
 	}
 	newArgs = append(newArgs, rest...)
-	newArgs = append(newArgs, runtimeHint)
 
 	call.Expression = propAccess(recv, methodName)
 	call.Arguments = factory.NewNodeList(newArgs)

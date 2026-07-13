@@ -192,7 +192,7 @@ describe('Op Metadata', () => {
 
       expect(myOp.metadata).toBeDefined();
       expect(myOp.fn).toBeInstanceOf(Function);
-      expect(myOp.SpanBufferClass).toBeDefined();
+      expect(myOp.callsitePlan.SpanBufferClass).toBeDefined();
     });
   });
 });

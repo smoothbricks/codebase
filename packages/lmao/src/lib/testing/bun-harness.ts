@@ -403,12 +403,7 @@ export function defineTestTracer<B extends OpContextBinding>(
   return {
     opContext: binding,
     extraTestColumns: options?.extraTestColumns,
-    // WHY no re-validation: the global useTestSpan() already validates against
-    // the active suite tracer's (extended) binding. Re-checking against the
-    // original binding fails when extraTestColumns extend the schema, because
-    // the span's _schema is the extended LogSchema, not the original.
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- WHY: useTestSpan() returns SpanContext typed to the suite binding; narrowing to OpContextOf<B> is safe because initTraceTestRun validates the binding matches
-    useTestSpan: () => useTestSpan() as SpanContext<OpContextOf<B>>,
+    useTestSpan: () => useTestSpan<B>(),
   };
 }
 
@@ -649,11 +644,11 @@ function createTestTracerInstance<
 }
 
 // Global singleton — one root tracer for the entire bun test run
-let _tracer: Tracer<OpContextBinding> | null = null;
+let _tracer: unknown = null;
 let _verboseTrace = false;
 
 // Root span context, its resolver, and the trace promise — one root per test run
-let _rootCtx: SpanContext<OpContext> | null = null;
+let _rootCtx: unknown = null;
 let _resolveTestRun: (() => void) | null = null;
 let _rootTracePromise: Promise<unknown> | null = null;
 
@@ -678,14 +673,14 @@ export function initTraceTestRun<B extends OpContextBinding>(opContext: B, optio
 
   _verboseTrace = isVerboseTraceEnabled(options?.verbose);
 
-  _tracer = createRootTracer({
+  const tracer = createRootTracer({
     binding: extendedBinding,
     sqlite: options?.sqlite,
     verbose: _verboseTrace,
   });
+  _tracer = tracer;
 
   // Create the single root trace — a long-lived promise keeps it alive
-  const tracer = _tracer;
   _rootTracePromise = tracer.trace('test-run', (ctx) => {
     _rootCtx = ctx;
     return new Promise<void>((resolve) => {
@@ -711,12 +706,12 @@ export function initTraceTestRun<B extends OpContextBinding>(opContext: B, optio
       _rootTracePromise = null;
     }
 
-    if (_tracer) {
+    if (isTracerInstance(_tracer)) {
       try {
         cleanupDebug('global.tracer.flush:start', { tracer: _tracer.constructor.name });
         await _tracer.flush();
         cleanupDebug('global.tracer.flush:end', { tracer: _tracer.constructor.name });
-        if (options?.sqlite && _rootCtx) {
+        if (options?.sqlite && isSpanContext(_rootCtx)) {
           const traceId = _rootCtx.buffer.trace_id;
           const dbPath = options.sqlite.dbPath ?? '.trace-results.db';
           console.log(`\n[trace] trace_id: ${traceId} → ${dbPath}`);
@@ -743,7 +738,7 @@ export function initTraceTestRun<B extends OpContextBinding>(opContext: B, optio
  * @param bunTestModule - The original bun:test namespace (`import * as bunTest from 'bun:test'`)
  */
 export function createBunTestMock<TModule extends BunTestModuleShape>(bunTestModule: TModule): TModule {
-  if (!_rootCtx) {
+  if (!isSpanContext(_rootCtx)) {
     if (_activeSuiteTracer) {
       return _activeSuiteTracer.createBunTestMock(bunTestModule);
     }
@@ -823,8 +818,8 @@ export function createBunTestMock<TModule extends BunTestModuleShape>(bunTestMod
  * `useTestSpan()` preserves the suite-local schema extension instead of falling
  * back to the erased global singleton shape.
  */
-export function useTestSpan<TCtx extends SpanContext<OpContextOf<OpContextBinding>>>(): TCtx;
-export function useTestSpan(): SpanContext<OpContextOf<OpContextBinding>> {
+export function useTestSpan<B extends OpContextBinding>(): SpanContext<OpContextOf<B>>;
+export function useTestSpan(): unknown {
   if (_activeSuiteTracer) {
     const ctx = _activeSuiteTracer.useTestSpan();
     if (!isSpanContext<OpContextOf<OpContextBinding>>(ctx)) {
@@ -854,7 +849,7 @@ export function getTracer(): Tracer<OpContextBinding> {
     return tracer;
   }
 
-  if (!_tracer) throw new Error('Call initTraceTestRun() in preload before tests');
+  if (!isTracerInstance(_tracer)) throw new Error('Call initTraceTestRun() in preload before tests');
   return _tracer;
 }
 
@@ -943,7 +938,7 @@ assignOptionalBoundTestFunction(describe, 'if', _describe, _describe);
 export function it(name: string, fn: () => void | Promise<void>): void {
   const describePath = _standaloneDescribeStack.length > 0 ? _standaloneDescribeStack.join(' > ') : null;
   _it(name, () => {
-    if (!_rootCtx) throw new Error('Call initTraceTestRun() in preload before tests');
+    if (!isSpanContext(_rootCtx)) throw new Error('Call initTraceTestRun() in preload before tests');
     return _rootCtx.span(name, async (ctx: SpanContext<OpContext>) => {
       writeDescribeTag(ctx.tag, describePath);
       try {

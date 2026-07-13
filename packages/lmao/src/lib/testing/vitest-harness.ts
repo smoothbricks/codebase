@@ -323,7 +323,7 @@ function createRootTracer<B extends OpContextBinding>({
   });
 }
 
-async function closeTracer(tracer: Tracer<OpContextBinding>): Promise<void> {
+async function closeTracer<B extends OpContextBinding>(tracer: Tracer<B>): Promise<void> {
   const close = Reflect.get(tracer, 'close');
   if (typeof close === 'function') {
     await close.call(tracer);

@@ -69,8 +69,14 @@ export class JsBufferStrategy<T extends LogSchema = LogSchema> implements Buffer
     return cached;
   }
 
-  createSpanBuffer(schema: T, traceRoot: ITraceRoot, opMetadata: OpMetadata, capacity?: number): SpanBuffer<T> {
-    return createSpanBufferImpl(schema, traceRoot, opMetadata, capacity);
+  createSpanBuffer(
+    schema: T,
+    traceRoot: ITraceRoot,
+    opMetadata: OpMetadata,
+    capacity?: number,
+    plannedClass?: SpanBufferConstructor<T>,
+  ): SpanBuffer<T> {
+    return createSpanBufferImpl(schema, traceRoot, opMetadata, capacity, plannedClass);
   }
 
   createChildSpanBuffer(
@@ -79,10 +85,9 @@ export class JsBufferStrategy<T extends LogSchema = LogSchema> implements Buffer
     opMetadata: OpMetadata,
     capacity?: number,
     schema?: T,
+    plannedClass?: SpanBufferConstructor<T>,
   ): SpanBuffer<T> {
-    // Use provided schema (for cross-library calls) or parent's schema
-    const childSchema = schema ?? parentBuffer._logSchema;
-    const SpanBufferClass = this.getSpanBufferClassForSchema(childSchema);
+    const SpanBufferClass = plannedClass ?? this.getSpanBufferClassForSchema(schema ?? parentBuffer._logSchema);
     return createChildSpanBufferImpl(parentBuffer, SpanBufferClass, callsiteMetadata, opMetadata, capacity);
   }
 

@@ -65,6 +65,7 @@ describe('spanAuto synchronous and fallback execution', () => {
     const op = opContext.defineOp('sync', (ctx) => ctx.ok('done'), undefined, {
       runtimeHint: analyzedResult,
     });
+    const plan = op.callsitePlan;
     const tracer = new TestTracer(opContext, createTestTracerOptions());
     const hooks: string[] = [];
     tracer.onSpanStart = (buffer) => hooks.push(`start:${buffer.message_values[0]}`);
@@ -84,6 +85,8 @@ describe('spanAuto synchronous and fallback execution', () => {
     expect(child.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
     expect(child._overflow).toBeUndefined();
     expect(hooks).toEqual(['start:sync-child', 'end:sync-child']);
+    expect(op.callsitePlan).toBe(plan);
+    expect(child).toBeInstanceOf(plan.SpanBufferClass);
   });
 
   it('propagates a synchronous onSpanEnd failure without a second hook or exception rewrite', async () => {
@@ -117,6 +120,7 @@ describe('spanAuto synchronous and fallback execution', () => {
     const op = opContext.defineOp('async', async (ctx) => ctx.ok('later'), undefined, {
       runtimeHint: analyzedResult,
     });
+    const plan = op.callsitePlan;
     const tracer = new TestTracer(opContext, createTestTracerOptions());
 
     await tracer.trace('root', async (ctx) => {
@@ -130,6 +134,8 @@ describe('spanAuto synchronous and fallback execution', () => {
     const child = childOf(tracer);
     expect(child._writeIndex).toBe(2);
     expect(child.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+    expect(op.callsitePlan).toBe(plan);
+    expect(child).toBeInstanceOf(plan.SpanBufferClass);
   });
 
   it('observes a custom Promise then getter exactly once', async () => {
@@ -172,6 +178,7 @@ describe('spanAuto synchronous and fallback execution', () => {
       undefined,
       { runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_RESULT | 3 },
     );
+    const plan = op.callsitePlan;
     const tracer = new TestTracer(opContext, createTestTracerOptions());
 
     await tracer.trace('root', async (ctx) => {
@@ -187,6 +194,8 @@ describe('spanAuto synchronous and fallback execution', () => {
     expect(child.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
     expect(child.entry_type[2]).toBe(ENTRY_TYPE_SPAN_RETRY);
     expect(child._writeIndex).toBe(3);
+    expect(op.callsitePlan).toBe(plan);
+    expect(child).toBeInstanceOf(plan.SpanBufferClass);
   });
 
   it('records a rejected Promise as an exception and ends hooks exactly once', async () => {
@@ -318,17 +327,17 @@ describe('runtime hint specialization', () => {
     );
 
     expect(group.existing).toBe(existing);
-    expect(group.existing.runtimeHint).toBe(analyzedResult | 7);
-    expect(group.raw.runtimeHint).toBe(analyzedResult | 5);
-    expect(group.prefix('lib').existing.runtimeHint).toBe(analyzedResult | 7);
-    expect(group.mapColumns({ marker: 'renamedMarker' }).raw.runtimeHint).toBe(analyzedResult | 5);
+    expect(group.existing.callsitePlan.runtimeHint).toBe(analyzedResult | 7);
+    expect(group.raw.callsitePlan.runtimeHint).toBe(analyzedResult | 5);
+    expect(group.prefix('lib').existing.callsitePlan.runtimeHint).toBe(analyzedResult | 7);
+    expect(group.mapColumns({ marker: 'renamedMarker' }).raw.callsitePlan.runtimeHint).toBe(analyzedResult | 5);
 
     const overridden = opContext.defineOps(
       { existing },
       { existing: { runtimeHint: analyzedResult | 9 } },
     );
     expect(overridden.existing).not.toBe(existing);
-    expect(overridden.existing.runtimeHint).toBe(analyzedResult | 9);
+    expect(overridden.existing.callsitePlan.runtimeHint).toBe(analyzedResult | 9);
   });
 });
 

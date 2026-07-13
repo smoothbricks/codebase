@@ -213,10 +213,9 @@ export type SpanFn<Ctx extends OpContext> = {
  * Use when the callback is guaranteed sync and should return immediately
  * with a Result envelope.
  */
-export type SpanSyncFn<Ctx extends OpContext> = <S, E>(
-  name: string,
-  fn: (ctx: SpanContext<Ctx>) => Result<S, E>,
-) => Result<S, E>;
+export type SpanSyncFn<Ctx extends OpContext> = {
+  <S, E>(name: string, op: Op<Ctx, [], S, E>): Result<S, E>;
+};
 
 // =============================================================================
 // SPAN CONTEXT TYPE

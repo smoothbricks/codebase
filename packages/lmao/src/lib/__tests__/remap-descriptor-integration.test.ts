@@ -99,13 +99,13 @@ describe('Library remap descriptor integration', () => {
     expect(nestedBuffer._logSchema).toBe(libraryContext.logBinding.logSchema);
     expect(siblingBuffer._logSchema).toBe(libraryContext.logBinding.logSchema);
     expect(nestedBuffer.constructor).toBe(siblingBuffer.constructor);
-    expect(nestedBuffer._remapDescriptor).toBe(nested.recordNested.remapDescriptor);
-    expect(siblingBuffer._remapDescriptor).toBe(sibling.recordSibling.remapDescriptor);
-    expect(nested.recordNested.remapDescriptor?.sourceNames).toEqual({
+    expect(nestedBuffer._remapDescriptor).toBe(nested.recordNested.callsitePlan.remapDescriptor ?? undefined);
+    expect(siblingBuffer._remapDescriptor).toBe(sibling.recordSibling.callsitePlan.remapDescriptor ?? undefined);
+    expect(nested.recordNested.callsitePlan.remapDescriptor?.sourceNames).toEqual({
       v1_api_value: 'value',
       v1_api_label: 'label',
     });
-    expect(sibling.recordSibling.remapDescriptor?.sourceNames).toEqual({
+    expect(sibling.recordSibling.callsitePlan.remapDescriptor?.sourceNames).toEqual({
       sibling_value: 'value',
       sibling_label: 'label',
     });
@@ -197,8 +197,8 @@ describe('Library remap descriptor integration', () => {
       },
     });
     const mapped = libraryOps.prefix('overflow');
-    const originalCapacity = mapped.overflow.SpanBufferClass.stats.capacity;
-    mapped.overflow.SpanBufferClass.stats.capacity = 8;
+    const originalCapacity = mapped.overflow.callsitePlan.SpanBufferClass.stats.capacity;
+    mapped.overflow.callsitePlan.SpanBufferClass.stats.capacity = 8;
 
     const appContext = defineOpContext({
       logSchema: defineLogSchema({}),
@@ -215,13 +215,13 @@ describe('Library remap descriptor integration', () => {
       const { trace } = new TestTracer(appContext, createTestTracerOptions());
       await trace('root-span', rootOp);
     } finally {
-      mapped.overflow.SpanBufferClass.stats.capacity = originalCapacity;
+      mapped.overflow.callsitePlan.SpanBufferClass.stats.capacity = originalCapacity;
     }
 
     if (!rootBuffer || !childBuffer) throw new Error('overflow trace did not expose its buffers');
     expect(rootBuffer._children[0]).toBe(childBuffer);
     expect(childBuffer._overflow).toBeDefined();
-    expect(childBuffer._remapDescriptor).toBe(mapped.overflow.remapDescriptor);
+    expect(childBuffer._remapDescriptor).toBe(mapped.overflow.callsitePlan.remapDescriptor ?? undefined);
 
     const table = convertSpanTreeToArrowTable(rootBuffer);
     expectArrowSchema(table, ['overflow_value']);
