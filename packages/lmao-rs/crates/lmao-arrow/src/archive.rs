@@ -131,10 +131,11 @@ mod tests {
             overflow: None,
             children: vec![],
         };
-        let batch = convert_span_trees(&[span], &StableVocabularyCatalog::EMPTY).unwrap();
+        let empty_catalog = StableVocabularyCatalog::EMPTY;
+        let batch = convert_span_trees(&[span], &empty_catalog).unwrap();
         assert_eq!(extract_chunk_stats(&batch), (3, 50, 900));
 
-        let empty = convert_span_trees::<MockSpan>(&[], &StableVocabularyCatalog::EMPTY).unwrap();
+        let empty = convert_span_trees::<MockSpan>(&[], &empty_catalog).unwrap();
         assert_eq!(extract_chunk_stats(&empty), (0, 0, 0));
 
         let env = build_trace_chunk_envelope("ref", &batch);
