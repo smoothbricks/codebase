@@ -95,6 +95,9 @@ export interface ITraceRoot<T extends LogSchema = LogSchema> {
    * The WASM path can read this directly without BigInt extraction.
    */
   readonly _system: ArrayBuffer;
+  /** Canonical immutable UTF-8 trace ID bytes, shared by span identity construction. */
+  readonly _traceIdBytes: Uint8Array;
+
 
   /**
    * Tracer reference for lifecycle hooks and event callbacks.

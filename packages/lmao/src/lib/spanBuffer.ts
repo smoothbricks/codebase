@@ -36,9 +36,8 @@ import type { OpMetadata } from './opContext/opTypes.js';
 import type { EagerColumnDescriptor } from './physicalLayoutPlan.js';
 import { LogSchema } from './schema/LogSchema.js';
 import type { MessageLayoutFamily } from './runtimeHint.js';
-import { textEncoder } from './spanBufferHelpers.js';
 import type { SpanBufferStats } from './spanBufferStats.js';
-import { writeThreadIdToUint64Array } from './threadId.js';
+import { copyThreadIdTo, getThreadId } from './threadId.js';
 import type { ITraceRoot } from './traceRoot.js';
 import type { AnySpanBuffer, SpanBuffer } from './types.js';
 import { getVocabularyGeneration, type VocabularyGeneration } from './vocabularyRegistry.js';
@@ -52,7 +51,6 @@ export type { ITraceRoot };
  */
 export const EMPTY_SCOPE: Readonly<Record<string, unknown>> = Object.freeze({});
 
-const traceIdDecoder = new TextDecoder();
 
 // ============================================================================
 // Thread-local state (generated once per process/worker)
@@ -220,7 +218,7 @@ function createSpanBufferConstructor<T extends LogSchema>(
  * Cache for generated SpanBuffer classes per schema.
  * Key is the schema object reference (WeakMap for GC).
  */
-const spanBufferClassCache = new WeakMap<LogSchema, Map<string, SpanBufferConstructor>>();
+const spanBufferClassCache = new WeakMap<LogSchema, Map<string, object>>();
 const staticStorageSchemas = new WeakMap<LogSchema, LogSchema>();
 const EMPTY_EAGER_COLUMNS: EagerColumnDescriptor = Object.freeze({
   names: Object.freeze([]),
@@ -298,9 +296,8 @@ export function getSpanBufferClass<T extends LogSchema>(
     preallocatedColumns: eagerColumns.names,
     constructorParams: 'stats, parent, isChained, callsiteMetadata, opMetadata, traceRoot, vocabularyGeneration',
     dependencies: {
-      writeThreadIdToUint64Array,
-      textDecoder: traceIdDecoder,
-      textEncoder,
+      copyThreadIdTo,
+      getThreadId,
       EMPTY_SCOPE,
       checkCapacityTuning,
     },
@@ -342,6 +339,7 @@ export function getSpanBufferClass<T extends LogSchema>(
          globalThis.globalSpanCounter = 0;
        }
        const spanId = ++globalThis.globalSpanCounter;
+       const threadId = isChained ? parent.thread_id : getThreadId();
 ` +
       // Calculate exact system storage. Dynamic-only has no capacity-sized packed-header lane.
       (messageLayoutFamily === 'dynamic-only'
@@ -361,27 +359,29 @@ export function getSpanBufferClass<T extends LogSchema>(
           identityView = parent._identity;
         }` +
       // CHILD BUFFER: new span in existing trace - gets identity without traceId
-      // (traceId accessed via parent chain walk in trace_id getter)
       ` else if (parent) {
          const identitySize = 12;
          systemBuffer = new ArrayBuffer(systemSize + identitySize);
          identityView = new Uint8Array(systemBuffer, systemSize, identitySize);
-         const threadIdArray = new BigUint64Array(systemBuffer, systemSize, 1);
-         writeThreadIdToUint64Array(threadIdArray, 0);
-         new DataView(systemBuffer, systemSize).setUint32(8, spanId, true);
+         copyThreadIdTo(identityView, 0);
+         identityView[8] = spanId;
+         identityView[9] = spanId >>> 8;
+         identityView[10] = spanId >>> 16;
+         identityView[11] = spanId >>> 24;
        }` +
-      // ROOT BUFFER: new trace - gets identity with traceId from TraceRoot
+      // ROOT BUFFER: new trace - copies the trace-owned canonical bytes once into its public identity.
       ` else {
-          const traceIdUtf8 = textEncoder.encode(traceRoot.trace_id);
-          const identitySize = 13 + traceIdUtf8.length;
+          const traceIdBytes = traceRoot._traceIdBytes;
+          const identitySize = 13 + traceIdBytes.length;
           systemBuffer = new ArrayBuffer(systemSize + identitySize);
           identityView = new Uint8Array(systemBuffer, systemSize, identitySize);
-          const view = new DataView(systemBuffer, systemSize);
-         const threadIdArray = new BigUint64Array(systemBuffer, systemSize, 1);
-         writeThreadIdToUint64Array(threadIdArray, 0);
-          view.setUint32(8, spanId, true);
-          identityView[12] = traceIdUtf8.length;
-          identityView.set(traceIdUtf8, 13);
+          copyThreadIdTo(identityView, 0);
+          identityView[8] = spanId;
+          identityView[9] = spanId >>> 8;
+          identityView[10] = spanId >>> 16;
+          identityView[11] = spanId >>> 24;
+          identityView[12] = traceIdBytes.length;
+          identityView.set(traceIdBytes, 13);
         }
 ` +
       // Create exact family views. Headerless buffers never create a header view.
@@ -419,6 +419,7 @@ export function getSpanBufferClass<T extends LogSchema>(
        this._parent = isChained ? parent._parent : parent;
        this._traceRoot = traceRoot;
        this._scopeValues = parent ? parent._scopeValues : EMPTY_SCOPE;
+       this._threadId = threadId;
         this._identity = identityView;
         this._system = systemBuffer;
         this._callsiteMetadata = callsiteMetadata;
@@ -426,26 +427,16 @@ export function getSpanBufferClass<T extends LogSchema>(
         this._statsSealed = false;
         this._statsReservedRows = isChained ? 0 : 2;
     `,
-    // Generated methods for SpanBuffer - no comments in output
-    // span_id: extract from identity bytes [8:12]
-    // thread_id: extract from identity bytes [0:8]
-    // trace_id: walk up parent chain to root, decode trace_id from identity
-    // parent_span_id/parent_thread_id: delegate to parent
-    // isParentOf/isChildOf: pointer comparison
-    // copyThreadIdTo/copyParentThreadIdTo: copy thread_id bytes to destination
+    // Generated identity methods use canonical primitives/direct offsets without temporary views.
     methods: `get span_id() {
-      return this._identity ? new DataView(this._identity.buffer, this._identity.byteOffset + 8).getUint32(0, true) : 0;
+      const b = this._identity;
+      return b ? (b[8] | (b[9] << 8) | (b[10] << 16) | (b[11] << 24)) >>> 0 : 0;
     }
     get thread_id() {
-      return this._identity ? new DataView(this._identity.buffer, this._identity.byteOffset).getBigUint64(0, true) : 0n;
+      return this._threadId;
     }
     get trace_id() {
-      let current = this;
-      while (current._parent) { current = current._parent; }
-      if (!current._identity) { return undefined; }
-      const len = current._identity[12];
-      const traceIdBytes = current._identity.subarray(13, 13 + len);
-      return textDecoder.decode(traceIdBytes);
+      return this._traceRoot.trace_id;
     }
     get _spanStartTime() {
       return this.timestamp[0];
@@ -474,16 +465,23 @@ export function getSpanBufferClass<T extends LogSchema>(
     isParentOf(other) { return this === other._parent; }
     isChildOf(other) { return this._parent === other; }
     copyThreadIdTo(dest, offset) {
-      if (this._identity) {
-        const view = new DataView(this._identity.buffer, this._identity.byteOffset);
-        const threadId = view.getBigUint64(0, true);
-        new DataView(dest.buffer, dest.byteOffset + offset).setBigUint64(0, threadId, true);
+      const source = this._identity;
+      if (source) {
+        dest[offset] = source[0];
+        dest[offset + 1] = source[1];
+        dest[offset + 2] = source[2];
+        dest[offset + 3] = source[3];
+        dest[offset + 4] = source[4];
+        dest[offset + 5] = source[5];
+        dest[offset + 6] = source[6];
+        dest[offset + 7] = source[7];
       } else {
-        new DataView(dest.buffer, dest.byteOffset + offset).setBigUint64(0, 0n, true);
+        dest.fill(0, offset, offset + 8);
       }
     }
     copyParentThreadIdTo(dest, offset) {
-      this._parent?.copyThreadIdTo(dest, offset) ?? new DataView(dest.buffer, dest.byteOffset + offset).setBigUint64(0, 0n, true);
+      if (this._parent) this._parent.copyThreadIdTo(dest, offset);
+      else dest.fill(0, offset, offset + 8);
     }
     get _logSchema() { return this.constructor.schema; }
     get _messageLayoutFamily() { return this.constructor.messageLayoutFamily; }
