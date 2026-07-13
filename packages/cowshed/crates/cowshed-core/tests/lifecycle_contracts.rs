@@ -233,7 +233,7 @@ impl Substrate for ContractSubstrate {
 
     async fn execute_retire(&self, plan: RetirePlan) -> Result<RetiredRef, Self::Error> {
         match plan.operation() {
-            Operation::Retire { workspace } if workspace == self.workspace.name() => {
+            Operation::Retire { workspace, .. } if workspace == self.workspace.name() => {
                 Ok(RetiredRef::new(
                     self.workspace.clone(),
                     Revision::new(self.workspace.revision().get() + 1),

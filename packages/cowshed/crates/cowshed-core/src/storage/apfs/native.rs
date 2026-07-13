@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::ffi::{CStr, CString};
-use std::fs;
+use std::ffi::{CStr, CString, OsString};
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,7 +11,9 @@ use std::thread;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 use crate::apfs::{
     ApfsBackend, AttachedImage, CommandRunner, CreateImageRequest, CreatedImage, DetachTarget,
@@ -31,13 +33,82 @@ use super::super::lifecycle::{
 };
 use super::super::{CheckpointLabel, WORKSPACE_MARKER_PATH, discover_session_images};
 use super::{
-    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, MarkerExpectation, MetadataPolicy,
-    layout, volume_name,
+    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, LockMode, MarkerExpectation,
+    MetadataPolicy, layout, volume_name,
 };
 
 const CHECKPOINT_FACT_VERSION: u32 = 1;
 const CHECKPOINT_FACT_SUFFIX: &str = ".checkpoint.json";
 const SELF_HEALING_STUB: &[u8] = b"cowshed ensure --attach\n";
+
+pub struct ImageLockGuard {
+    files: Vec<File>,
+}
+
+impl Drop for ImageLockGuard {
+    fn drop(&mut self) {
+        for file in self.files.iter().rev() {
+            unsafe {
+                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
+fn acquire_image_locks(
+    paths: &[PathBuf],
+    mode: LockMode,
+) -> Result<Option<ImageLockGuard>, ApfsStorageError> {
+    let mut paths = paths.to_vec();
+    paths.sort();
+    paths.dedup();
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let parent = path
+            .parent()
+            .ok_or(ApfsStorageError::InvalidPlan("lock path has no parent"))?;
+        fs::create_dir_all(parent)
+            .map_err(|error| io_error("create lifecycle lock directory", parent, error))?;
+        if fs::symlink_metadata(parent)
+            .map_err(|error| io_error("inspect lifecycle lock directory", parent, error))?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(ApfsStorageError::Host(format!(
+                "lifecycle lock parent must not be a symlink: {}",
+                parent.display()
+            )));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|error| io_error("open lifecycle lock", &path, error))?;
+        let operation = match mode {
+            LockMode::Wait => libc::LOCK_EX,
+            LockMode::Try => libc::LOCK_EX | libc::LOCK_NB,
+        };
+        loop {
+            let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
+            if result == 0 {
+                files.push(file);
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if mode == LockMode::Try && error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(io_error("acquire lifecycle lock", &path, error));
+        }
+    }
+    Ok(Some(ImageLockGuard { files }))
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -876,6 +947,47 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
     }
 
+    fn transient_lock_path(
+        project: &Path,
+        image: &Path,
+        format: ImageFormat,
+    ) -> Result<PathBuf, ApfsStorageError> {
+        let stem = image
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                ApfsStorageError::Host(format!(
+                    "transient image has non-UTF-8 stem: {}",
+                    image.display()
+                ))
+            })?;
+        let workspace = match stem.rsplit_once('-') {
+            Some((workspace, incarnation))
+                if incarnation.len() == 32
+                    && incarnation.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+            {
+                workspace
+            }
+            _ => stem,
+        };
+        let image = if workspace == "main" {
+            project.join(format!("main.{}", format.extension()))
+        } else {
+            project
+                .join("sessions")
+                .join(format!("{workspace}.{}", format.extension()))
+        };
+        let mut lock: OsString = image.as_os_str().to_owned();
+        lock.push(".lock");
+        Ok(PathBuf::from(lock))
+    }
+
+    fn lock_path_for_image(image: &Path) -> PathBuf {
+        let mut lock: OsString = image.as_os_str().to_owned();
+        lock.push(".lock");
+        PathBuf::from(lock)
+    }
+
     fn gc_project(
         &self,
         project: &Path,
@@ -908,6 +1020,10 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                         continue;
                     };
                     report.examined += 1;
+                    let lock = Self::transient_lock_path(project, &path, format)?;
+                    let Some(_guard) = acquire_image_locks(&[lock], LockMode::Try)? else {
+                        continue;
+                    };
                     self.reclaim_image(&path, format)?;
                     report.reclaimed += 1;
                 }
@@ -940,6 +1056,10 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             if staged_sidecars.contains_key(image) {
                 continue;
             }
+            let lock = Self::transient_lock_path(project, image, *format)?;
+            let Some(_guard) = acquire_image_locks(&[lock], LockMode::Try)? else {
+                continue;
+            };
             self.reclaim_image(image, *format)?;
             report.reclaimed += 1;
         }
@@ -948,6 +1068,13 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             if staged_images.contains_key(image) {
                 continue;
             }
+            let Some(format) = staged_image_format(image) else {
+                continue;
+            };
+            let lock = Self::transient_lock_path(project, image, format)?;
+            let Some(_guard) = acquire_image_locks(&[lock], LockMode::Try)? else {
+                continue;
+            };
             fs::remove_file(sidecar)
                 .map_err(|error| io_error("remove orphan staging metadata", sidecar, error))?;
             sync_parent!(sidecar)?;
@@ -993,15 +1120,29 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     report.retained_recent += 1;
                     continue;
                 }
+                let lock = super::workspace_lock_path(
+                    &self.config,
+                    &fact.repo_id,
+                    &fact.workspace,
+                    format,
+                )?;
+                let Some(_guard) = acquire_image_locks(&[lock], LockMode::Try)? else {
+                    continue;
+                };
                 self.reclaim_image(&image, format)?;
                 report.reclaimed += 1;
             }
         }
 
         for path in session_images {
-            if matches!(ImageFormat::from_image_path(&path), Ok(ImageFormat::Sparse))
-                && !self.image_is_kernel_mounted(&path)?
-            {
+            if matches!(ImageFormat::from_image_path(&path), Ok(ImageFormat::Sparse)) {
+                let lock = Self::lock_path_for_image(&path);
+                let Some(_guard) = acquire_image_locks(&[lock], LockMode::Try)? else {
+                    continue;
+                };
+                if self.image_is_kernel_mounted(&path)? {
+                    continue;
+                }
                 report.examined += 1;
                 self.backend.compact_image(&path, ImageFormat::Sparse)?;
             }
@@ -1039,6 +1180,16 @@ impl<R> ApfsExecutionHost for MacOsApfsExecutionHost<R>
 where
     R: CommandRunner + Send + Sync + 'static,
 {
+    type LockGuard = ImageLockGuard;
+
+    fn lock_images(
+        &self,
+        paths: &[PathBuf],
+        mode: LockMode,
+    ) -> Result<Option<Self::LockGuard>, ApfsStorageError> {
+        acquire_image_locks(paths, mode)
+    }
+
     type Attachment = AttachedImage;
 
     fn observe(&self, expected: &[ExpectedState]) -> Result<Vec<ObservedState>, ApfsStorageError> {
@@ -2151,8 +2302,12 @@ fn metadata_workspace_ref(
     .map_err(|_| ApfsStorageError::Host("invalid detached workspace identity".to_owned()))
 }
 
-fn io_error(operation: &'static str, path: &Path, error: io::Error) -> ApfsStorageError {
-    ApfsStorageError::Host(format!("{operation} {} failed: {error}", path.display()))
+fn io_error(operation: &'static str, path: &Path, source: io::Error) -> ApfsStorageError {
+    ApfsStorageError::Io {
+        operation,
+        path: path.to_owned(),
+        source,
+    }
 }
 
 fn swap_paths(left: &Path, right: &Path) -> Result<(), ApfsStorageError> {

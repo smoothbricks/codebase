@@ -14,7 +14,7 @@ use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
     ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig,
-    IncarnationSource, MarkerExpectation, MetadataPolicy, volume_name,
+    IncarnationSource, LockMode, MarkerExpectation, MetadataPolicy, volume_name,
 };
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, CheckpointFact, Destination, ExpectedState, KernelMountFact, LifecyclePlanner,
@@ -126,6 +126,16 @@ impl FakeHost {
 }
 
 impl ApfsExecutionHost for FakeHost {
+    type LockGuard = ();
+    fn lock_images(
+        &self,
+        paths: &[PathBuf],
+        _: LockMode,
+    ) -> Result<Option<Self::LockGuard>, ApfsStorageError> {
+        self.record(format!("lock:{}", paths.len()));
+        Ok(Some(()))
+    }
+
     type Attachment = FakeAttachment;
 
     fn observe(&self, expected: &[ExpectedState]) -> Result<Vec<ObservedState>, ApfsStorageError> {
@@ -655,12 +665,13 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
     assert_eq!(receipt.workspace.topology_revision(), Revision::new(1));
     assert_eq!(
         lane.count(),
-        2,
-        "one authoritative read and one blocking apply"
+        3,
+        "one kernel-lock acquisition, one authoritative read, and one blocking apply"
     );
     assert_eq!(
         host.events(),
         [
+            "lock:1",
             "observe",
             "create:Sparse:100g",
             "atomic-metadata+parent-fsync:Fresh",
@@ -1020,7 +1031,7 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
         .unmount(&restored.workspace)
         .await
         .expect("unmount");
-    assert_eq!(host.events(), ["detach-mounted:false"]);
+    assert_eq!(host.events(), ["lock:1", "detach-mounted:false"]);
 }
 #[tokio::test]
 async fn retire_reclaim_stats_and_gc_cross_only_the_blocking_lane() {
