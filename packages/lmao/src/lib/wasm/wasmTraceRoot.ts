@@ -36,6 +36,9 @@ export interface WasmSpanBufferLike {
   readonly _message: string[];
   /** Current write position (getter/setter reads from WASM identity block) */
   _writeIndex: number;
+  readonly _identityOwner: boolean;
+  readonly timestamp: BigInt64Array;
+  readonly entry_type: Uint8Array;
 }
 
 /**
@@ -65,6 +68,7 @@ export function isWasmSpanBuffer(buffer: unknown): buffer is WasmSpanBufferLike 
 export class WasmTraceRoot implements ITraceRoot {
   /** Byte offset in WASM memory where TraceRoot data lives */
   readonly _traceRootPtr: number;
+  private _state: 'live' | 'freed' = 'live';
 
   /** The WASM allocator instance */
   readonly allocator: WasmAllocator;
@@ -92,10 +96,15 @@ export class WasmTraceRoot implements ITraceRoot {
     // Allocate an 8B column block for TraceRoot data (16 bytes needed, 8B block is large enough)
     // The 8B column block size is: ceil(capacity/8) + capacity*8 = 8 + 512 = 520 bytes for capacity 64
     // We only need 16 bytes, so this works fine
-    this._traceRootPtr = allocator.alloc8B();
-
-    // Initialize wall clock and monotonic start times in WASM memory
+    const traceRootPtr = allocator.alloc8B();
+    if (traceRootPtr === 0) {
+      throw new Error('WASM trace-root allocation failed');
+    }
+    this._traceRootPtr = traceRootPtr;
     allocator.initTraceRoot(this._traceRootPtr);
+  }
+  private assertLive(): void {
+    if (this._state !== 'live') throw new Error('WASM trace root has been released');
   }
 
   /**
@@ -103,6 +112,7 @@ export class WasmTraceRoot implements ITraceRoot {
    * Read from WASM memory at _traceRootPtr offset 0.
    */
   get anchorEpochNanos(): bigint {
+    this.assertLive();
     // i64 view is indexed by 8-byte chunks
     return this.allocator.i64[this._traceRootPtr / 8];
   }
@@ -112,6 +122,7 @@ export class WasmTraceRoot implements ITraceRoot {
    * Read from WASM memory at _traceRootPtr offset 8.
    */
   get anchorPerfNow(): number {
+    this.assertLive();
     // f64 view is indexed by 8-byte chunks
     return this.allocator.f64[(this._traceRootPtr + 8) / 8];
   }
@@ -147,6 +158,7 @@ export class WasmTraceRoot implements ITraceRoot {
    * @param spanName - Name for this span
    */
   writeSpanStart(buffer: AnySpanBuffer, spanName: string): void {
+    this.assertLive();
     if (isWasmSpanBuffer(buffer)) {
       // WASM path: delegate to WASM allocator
       // spanStart writes row 0 (span-start) and row 1 (span-exception placeholder)
@@ -175,6 +187,7 @@ export class WasmTraceRoot implements ITraceRoot {
    * @param entryType - Entry type (SPAN_OK, SPAN_ERR, or SPAN_EXCEPTION)
    */
   writeSpanEnd(buffer: AnySpanBuffer, entryType: number): void {
+    this.assertLive();
     if (isWasmSpanBuffer(buffer)) {
       // WASM path: use appropriate end function based on entry type
       // Note: WASM spanEndOk/spanEndErr write to row 1
@@ -209,11 +222,17 @@ export class WasmTraceRoot implements ITraceRoot {
    * @returns The row index where entry was written
    */
   writeLogEntry(buffer: AnySpanBuffer, entryType: number): number {
+    this.assertLive();
     if (isWasmSpanBuffer(buffer)) {
-      // WASM path: bump writeIndex, write timestamp + entry_type, return idx
-      return this.allocator.writeLogEntry(buffer._systemPtr, buffer._identityPtr, this._traceRootPtr, entryType);
+      if (buffer._identityOwner) {
+        return this.allocator.writeLogEntry(buffer._systemPtr, buffer._identityPtr, this._traceRootPtr, entryType);
+      }
+      const idx = buffer._writeIndex;
+      buffer.timestamp[idx] = this.getTimestampNanos();
+      buffer.entry_type[idx] = entryType;
+      buffer._writeIndex = idx + 1;
+      return idx;
     }
-    // JS path: bump writeIndex, write directly, return idx
     const idx = buffer._writeIndex;
     buffer.timestamp[idx] = this.getTimestampNanos();
     buffer.entry_type[idx] = entryType;
@@ -235,6 +254,7 @@ export class WasmTraceRoot implements ITraceRoot {
    * @param identityPtr - Byte offset of buffer's identity block in WASM memory
    */
   writeSpanStartPtr(systemPtr: number, identityPtr: number): void {
+    this.assertLive();
     this.allocator.spanStart(systemPtr, identityPtr, this._traceRootPtr);
   }
 
@@ -243,6 +263,7 @@ export class WasmTraceRoot implements ITraceRoot {
    * @param systemPtr - Byte offset of buffer's system block in WASM memory
    */
   writeSpanEndOkPtr(systemPtr: number): void {
+    this.assertLive();
     this.allocator.spanEndOk(systemPtr, this._traceRootPtr);
   }
 
@@ -251,6 +272,7 @@ export class WasmTraceRoot implements ITraceRoot {
    * @param systemPtr - Byte offset of buffer's system block in WASM memory
    */
   writeSpanEndErrPtr(systemPtr: number): void {
+    this.assertLive();
     this.allocator.spanEndErr(systemPtr, this._traceRootPtr);
   }
 
@@ -264,6 +286,7 @@ export class WasmTraceRoot implements ITraceRoot {
    * @returns Row index where entry was written
    */
   writeLogEntryPtr(systemPtr: number, identityPtr: number, entryType: number): number {
+    this.assertLive();
     return this.allocator.writeLogEntry(systemPtr, identityPtr, this._traceRootPtr, entryType);
   }
 
@@ -272,14 +295,20 @@ export class WasmTraceRoot implements ITraceRoot {
    * @param identityPtr - Byte offset of buffer's identity block in WASM memory
    */
   readWriteIndex(identityPtr: number): number {
+    this.assertLive();
     return this.allocator.readWriteIndex(identityPtr);
   }
 
-  /**
-   * Free the TraceRoot's memory block when trace completes.
-   */
+  /** Mark the handle stale when its allocator is reset wholesale. */
+  invalidate(): void {
+    this._state = 'freed';
+  }
+
+  /** Free the TraceRoot allocation exactly once. */
   free(): void {
+    if (this._state === 'freed') return;
     this.allocator.free8B(this._traceRootPtr);
+    this._state = 'freed';
   }
 }
 

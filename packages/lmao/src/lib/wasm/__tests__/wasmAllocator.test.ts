@@ -115,6 +115,101 @@ describe('WasmAllocator', () => {
       allocator.freeSpanSystem(offset);
       expect(allocator.getFreeCount()).toBe(before + 1);
     });
+    it('ignores zero-offset frees without changing allocator ownership state', () => {
+      const freeCount = allocator.getFreeCount();
+
+      allocator.freeSpanSystem(0);
+      allocator.free1B(0);
+      allocator.free4B(0);
+      allocator.free8B(0);
+      allocator.freeIdentity(0);
+
+      expect(allocator.getFreeCount()).toBe(freeCount);
+      const first = allocator.allocSpanSystem();
+      const second = allocator.allocSpanSystem();
+      expect(first).not.toBe(second);
+    });
+
+    it('does not enqueue a capacity block twice after it has merged', () => {
+      const cases = [
+        {
+          alloc: () => allocator.allocSpanSystem(8),
+          free: (offset: number) => allocator.freeSpanSystem(offset, 8),
+        },
+        { alloc: () => allocator.alloc1B(8), free: (offset: number) => allocator.free1B(offset, 8) },
+        { alloc: () => allocator.alloc4B(8), free: (offset: number) => allocator.free4B(offset, 8) },
+        { alloc: () => allocator.alloc8B(8), free: (offset: number) => allocator.free8B(offset, 8) },
+      ];
+
+      for (const block of cases) {
+        const offset = block.alloc();
+        block.free(offset);
+        const freeCount = allocator.getFreeCount();
+        block.free(offset);
+        expect(allocator.getFreeCount()).toBe(freeCount);
+
+        const firstOwner = block.alloc();
+        const secondOwner = block.alloc();
+        expect(firstOwner).not.toBe(secondOwner);
+        allocator.reset();
+      }
+    });
+
+    it('does not enqueue an identity block twice', () => {
+      const offset = allocator.allocIdentityChild();
+      allocator.freeIdentity(offset);
+      const freeCount = allocator.getFreeCount();
+
+      allocator.freeIdentity(offset);
+
+      expect(allocator.getFreeCount()).toBe(freeCount);
+      const firstOwner = allocator.allocIdentityChild();
+      const secondOwner = allocator.allocIdentityChild();
+      expect(firstOwner).not.toBe(secondOwner);
+    });
+
+    it('clears recycled column validity before exposing it to a new owner', () => {
+      const col8B = allocator.writeColF64(0, 5, 91.25);
+      allocator.free8B(col8B);
+      const recycled8B = allocator.alloc8B();
+      expect(recycled8B).toBe(col8B);
+      expect(allocator.readColIsValid(recycled8B, 5)).toBe(0);
+      expect(allocator.readColF64(recycled8B, 5)).toBe(0);
+
+      const col4B = allocator.writeColU32(0, 6, 0xdeadbeef);
+      allocator.free4B(col4B);
+      const recycled4B = allocator.alloc4B();
+      expect(recycled4B).toBe(col4B);
+      expect(allocator.readColIsValid(recycled4B, 6)).toBe(0);
+
+      const col1B = allocator.writeColU8(0, 7, 0xff);
+      allocator.free1B(col1B);
+      const recycled1B = allocator.alloc1B();
+      expect(recycled1B).toBe(col1B);
+      expect(allocator.readColIsValid(recycled1B, 7)).toBe(0);
+    });
+
+    it('clears recycled identity write and trace state', () => {
+      const traceId = new TextEncoder().encode('owned-by-released-root');
+      const packed = allocator.allocIdentityRootForJsWrite(traceId.length);
+      const rootIdentity = Number(packed >> 32n);
+      const traceIdOffset = Number(packed & 0xffffffffn);
+      allocator.u8.set(traceId, traceIdOffset);
+
+      const system = allocator.allocSpanSystem();
+      const traceRoot = allocator.alloc8B();
+      allocator.initTraceRoot(traceRoot);
+      allocator.spanStart(system, rootIdentity, traceRoot);
+      expect(allocator.readWriteIndex(rootIdentity)).toBe(2);
+
+      allocator.freeIdentity(rootIdentity);
+      const childIdentity = allocator.allocIdentityChild();
+
+      expect(childIdentity).toBe(rootIdentity);
+      expect(allocator.readWriteIndex(childIdentity)).toBe(0);
+      expect(allocator.readIdentityTraceIdLen(childIdentity)).toBe(0);
+      expect(allocator.u8[allocator.getIdentityTraceIdPtr(childIdentity)]).toBe(0);
+    });
   });
 
   describe('reset', () => {
