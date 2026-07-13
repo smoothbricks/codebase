@@ -11,6 +11,7 @@ use thiserror::Error;
 use crate::metadata::{ImageFormat, MetadataError, WorkspaceName};
 use crate::repository::{PathLayoutError, ProjectPaths, RepoId};
 
+pub mod bootstrap;
 pub mod lifecycle;
 
 pub const WORKSPACE_MARKER_PATH: &str = ".cowshed/workspace.json";
