@@ -1,8 +1,9 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Output;
 
-use tokio::process::Command;
-
+use crate::apfs::{
+    CommandOutput, CommandRequest, CommandRunError, CommandRunner, SystemCommandRunner,
+};
 use crate::error::{CowshedError, Result};
 
 const RSYNC: &str = "/usr/bin/rsync";
@@ -15,6 +16,88 @@ pub struct CopyReport {
     pub changed_entries: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct TreeCopier<R> {
+    runner: R,
+}
+
+impl<R> TreeCopier<R>
+where
+    R: CommandRunner,
+{
+    pub const fn new(runner: R) -> Self {
+        Self { runner }
+    }
+
+    pub fn copy_until_quiescent(&self, source: &Path, destination: &Path) -> Result<CopyReport> {
+        self.copy_with_budget(source, destination, DEFAULT_PASS_BUDGET)
+    }
+
+    pub fn copy_with_budget(
+        &self,
+        source: &Path,
+        destination: &Path,
+        pass_budget: usize,
+    ) -> Result<CopyReport> {
+        if pass_budget == 0 {
+            return Err(CowshedError::usage(
+                "copy pass budget must be positive",
+                "retry cowshed adopt without overriding the pass budget",
+            ));
+        }
+        let (source, destination) = validate_copy_roots(source, destination)?;
+        let source_contents = source.join(".");
+        let destination_contents = destination.join(".");
+        let mut changed_entries = 0usize;
+        let mut last_changes = Vec::new();
+
+        for pass in 1..=pass_budget {
+            let request = CommandRequest::new(
+                RSYNC,
+                [
+                    OsString::from("-aE"),
+                    OsString::from("--delete"),
+                    OsString::from("--itemize-changes"),
+                    OsString::from("--out-format=%i"),
+                    OsString::from("--"),
+                    source_contents.as_os_str().to_owned(),
+                    destination_contents.as_os_str().to_owned(),
+                ],
+            );
+            let output = self.runner.run(&request).map_err(copy_spawn_error)?;
+            if !output.succeeded() {
+                return Err(copy_process_error(&output));
+            }
+            let changes = parse_changes(&output.stdout)?;
+            if changes.is_empty() {
+                return Ok(CopyReport {
+                    passes: pass,
+                    changed_entries,
+                });
+            }
+            changed_entries = changed_entries.saturating_add(changes.len());
+            last_changes = changes;
+        }
+
+        let sample = last_changes
+            .iter()
+            .take(CHURN_SAMPLE_LIMIT)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(CowshedError::conflict(
+            format!(
+                "repository did not quiesce after {pass_budget} copy passes; recent change kinds: {sample}"
+            ),
+            "stop repository writers and retry cowshed adopt",
+        ))
+    }
+}
+
+pub fn copy_until_quiescent_blocking(source: &Path, destination: &Path) -> Result<CopyReport> {
+    TreeCopier::new(SystemCommandRunner).copy_until_quiescent(source, destination)
+}
+
 /// Copy a live repository into an attached image until a complete delta pass observes no changes.
 pub async fn copy_until_quiescent(source: &Path, destination: &Path) -> Result<CopyReport> {
     copy_with_budget(source, destination, DEFAULT_PASS_BUDGET).await
@@ -25,66 +108,13 @@ pub async fn copy_with_budget(
     destination: &Path,
     pass_budget: usize,
 ) -> Result<CopyReport> {
-    if pass_budget == 0 {
-        return Err(CowshedError::usage(
-            "copy pass budget must be positive",
-            "retry cowshed adopt without overriding the pass budget",
-        ));
-    }
-    let (source, destination) = validate_copy_roots(source, destination)?;
-
-    let source_contents = source.join(".");
-    let destination_contents = destination.join(".");
-    let mut changed_entries = 0usize;
-    let mut last_changes = Vec::new();
-
-    for pass in 1..=pass_budget {
-        let output = Command::new(RSYNC)
-            .args([
-                "-aE",
-                "--delete",
-                "--itemize-changes",
-                "--out-format=%i",
-                "--",
-            ])
-            .arg(&source_contents)
-            .arg(&destination_contents)
-            .output()
-            .await
-            .map_err(|error| {
-                CowshedError::environment_missing(
-                    format!("cannot execute {RSYNC}: {error}"),
-                    "install the macOS base system tools, then retry cowshed adopt",
-                )
-            })?;
-
-        if !output.status.success() {
-            return Err(copy_process_error(output));
-        }
-
-        let changes = parse_changes(&output.stdout)?;
-        if changes.is_empty() {
-            return Ok(CopyReport {
-                passes: pass,
-                changed_entries,
-            });
-        }
-        changed_entries = changed_entries.saturating_add(changes.len());
-        last_changes = changes;
-    }
-
-    let sample = last_changes
-        .iter()
-        .take(CHURN_SAMPLE_LIMIT)
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(CowshedError::conflict(
-        format!(
-            "repository did not quiesce after {pass_budget} copy passes; recent change kinds: {sample}"
-        ),
-        "stop repository writers and retry cowshed adopt",
-    ))
+    let source = source.to_owned();
+    let destination = destination.to_owned();
+    tokio::task::spawn_blocking(move || {
+        TreeCopier::new(SystemCommandRunner).copy_with_budget(&source, &destination, pass_budget)
+    })
+    .await
+    .map_err(|error| CowshedError::internal(format!("repository copy worker failed: {error}")))?
 }
 
 fn validate_copy_roots(source: &Path, destination: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -135,10 +165,24 @@ fn sanitize_change_kind(kind: &str) -> String {
         })
         .collect()
 }
+fn copy_spawn_error(error: CommandRunError) -> CowshedError {
+    CowshedError::environment_missing(
+        format!("cannot execute {RSYNC}: {error}"),
+        "install the macOS base system tools, then retry cowshed adopt",
+    )
+}
 
-fn copy_process_error(output: Output) -> CowshedError {
+fn copy_process_error(output: &CommandOutput) -> CowshedError {
+    let reason = String::from_utf8_lossy(&output.stderr);
+    let reason = reason.trim();
+    let status = output.status.to_string();
+    let message = if reason.is_empty() {
+        format!("repository copy failed with status {status}")
+    } else {
+        format!("repository copy failed with status {status}: {reason}")
+    };
     CowshedError::conflict(
-        format!("repository copy failed with status {}", output.status),
+        message,
         "resolve the filesystem error and retry cowshed adopt",
     )
 }

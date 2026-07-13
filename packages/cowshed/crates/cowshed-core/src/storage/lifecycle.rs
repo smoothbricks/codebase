@@ -24,7 +24,7 @@ impl Revision {
 
 /// Logical identity and the exact version a lifecycle plan was made against.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorkspaceRef {
+pub struct LifecycleWorkspace {
     repo: RepoId,
     name: WorkspaceName,
     incarnation: WorkspaceIncarnation,
@@ -34,7 +34,7 @@ pub struct WorkspaceRef {
     format: ImageFormat,
 }
 
-impl WorkspaceRef {
+impl LifecycleWorkspace {
     pub fn new(
         repo: RepoId,
         name: WorkspaceName,
@@ -82,7 +82,7 @@ impl WorkspaceRef {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckpointRef {
-    workspace: WorkspaceRef,
+    workspace: LifecycleWorkspace,
     label: CheckpointLabel,
     revision: Revision,
     pinned: bool,
@@ -90,7 +90,7 @@ pub struct CheckpointRef {
 
 impl CheckpointRef {
     pub fn new(
-        workspace: WorkspaceRef,
+        workspace: LifecycleWorkspace,
         label: CheckpointLabel,
         revision: Revision,
         pinned: bool,
@@ -102,7 +102,7 @@ impl CheckpointRef {
             pinned,
         }
     }
-    pub fn workspace(&self) -> &WorkspaceRef {
+    pub fn workspace(&self) -> &LifecycleWorkspace {
         &self.workspace
     }
     pub fn label(&self) -> &CheckpointLabel {
@@ -152,7 +152,7 @@ pub enum ExpectedState {
 }
 
 impl ExpectedState {
-    fn active(workspace: &WorkspaceRef) -> Self {
+    fn active(workspace: &LifecycleWorkspace) -> Self {
         Self::Exists {
             repo: workspace.repo.clone(),
             name: workspace.name.clone(),
@@ -362,31 +362,31 @@ pub trait LifecyclePlanner: Send + Sync {
     fn plan_adopt(&self, request: AdoptRequest) -> Result<AdoptPlan, PlanError>;
     fn plan_create(
         &self,
-        from: &WorkspaceRef,
+        from: &LifecycleWorkspace,
         destination: Destination,
     ) -> Result<CreatePlan, PlanError>;
     fn plan_fork(
         &self,
-        from: &WorkspaceRef,
+        from: &LifecycleWorkspace,
         destination: Destination,
     ) -> Result<ForkPlan, PlanError>;
     fn plan_checkpoint(
         &self,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         label: CheckpointLabel,
         pin: Pin,
     ) -> Result<CheckpointPlan, PlanError>;
     fn plan_restore(
         &self,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         checkpoint: &CheckpointRef,
         mode: RestoreMode,
     ) -> Result<RestorePlan, PlanError>;
-    fn plan_retire(&self, workspace: &WorkspaceRef) -> Result<RetirePlan, PlanError>;
+    fn plan_retire(&self, workspace: &LifecycleWorkspace) -> Result<RetirePlan, PlanError>;
 }
 
 fn destination_expected(
-    source: &WorkspaceRef,
+    source: &LifecycleWorkspace,
     destination: &Destination,
 ) -> Result<ExpectedState, PlanError> {
     if destination.name.is_main() {
@@ -419,7 +419,7 @@ impl LifecyclePlanner for PurePlanner {
     }
     fn plan_create(
         &self,
-        from: &WorkspaceRef,
+        from: &LifecycleWorkspace,
         destination: Destination,
     ) -> Result<CreatePlan, PlanError> {
         let absent = destination_expected(from, &destination)?;
@@ -434,7 +434,7 @@ impl LifecyclePlanner for PurePlanner {
     }
     fn plan_fork(
         &self,
-        from: &WorkspaceRef,
+        from: &LifecycleWorkspace,
         destination: Destination,
     ) -> Result<ForkPlan, PlanError> {
         let absent = destination_expected(from, &destination)?;
@@ -449,7 +449,7 @@ impl LifecyclePlanner for PurePlanner {
     }
     fn plan_checkpoint(
         &self,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         label: CheckpointLabel,
         pin: Pin,
     ) -> Result<CheckpointPlan, PlanError> {
@@ -465,7 +465,7 @@ impl LifecyclePlanner for PurePlanner {
     }
     fn plan_restore(
         &self,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         checkpoint: &CheckpointRef,
         mode: RestoreMode,
     ) -> Result<RestorePlan, PlanError> {
@@ -493,7 +493,7 @@ impl LifecyclePlanner for PurePlanner {
             },
         })
     }
-    fn plan_retire(&self, workspace: &WorkspaceRef) -> Result<RetirePlan, PlanError> {
+    fn plan_retire(&self, workspace: &LifecycleWorkspace) -> Result<RetirePlan, PlanError> {
         if workspace.name.is_main() {
             return Err(PlanError::MainIsPermanent);
         }
@@ -522,26 +522,26 @@ immutable_plan!(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LifecycleReceipt {
-    pub workspace: WorkspaceRef,
+    pub workspace: LifecycleWorkspace,
     pub resulting_revision: Revision,
 }
 
 /// Stable identity returned by retirement and consumed by reclamation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetiredRef {
-    workspace: WorkspaceRef,
+    workspace: LifecycleWorkspace,
     resulting_revision: Revision,
 }
 
 impl RetiredRef {
-    pub fn new(workspace: WorkspaceRef, resulting_revision: Revision) -> Self {
+    pub fn new(workspace: LifecycleWorkspace, resulting_revision: Revision) -> Self {
         Self {
             workspace,
             resulting_revision,
         }
     }
 
-    pub fn workspace(&self) -> &WorkspaceRef {
+    pub fn workspace(&self) -> &LifecycleWorkspace {
         &self.workspace
     }
 
@@ -552,10 +552,10 @@ impl RetiredRef {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RestoreReceipt {
     pub previous_incarnation: WorkspaceIncarnation,
-    pub workspace: WorkspaceRef,
+    pub workspace: LifecycleWorkspace,
 }
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct GcReport {
+pub struct StorageGcReport {
     pub examined: usize,
     pub reclaimed: usize,
     pub retained_pinned: usize,
@@ -577,7 +577,7 @@ pub enum MountState {
 /// Canonical persistent fact read from an image/dataset and its sidecar.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StorageFact {
-    pub workspace: WorkspaceRef,
+    pub workspace: LifecycleWorkspace,
     pub volume_name: String,
 }
 /// A kernel mount-table fact supplied by the platform adapter.
@@ -588,7 +588,7 @@ pub struct KernelMountFact {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DerivedWorkspace {
-    pub workspace: WorkspaceRef,
+    pub workspace: LifecycleWorkspace,
     pub mount_state: MountState,
 }
 
@@ -712,11 +712,11 @@ pub trait Substrate: LifecyclePlanner {
     async fn execute_fork(&self, plan: ForkPlan) -> Result<LifecycleReceipt, Self::Error>;
     async fn execute_retire(&self, plan: RetirePlan) -> Result<RetiredRef, Self::Error>;
     async fn reclaim(&self, retired: RetiredRef) -> Result<(), Self::Error>;
-    async fn list(&self, repo: &RepoId) -> Result<Vec<WorkspaceRef>, Self::Error>;
-    async fn mount_state(&self, workspace: &WorkspaceRef) -> Result<MountState, Self::Error>;
-    async fn ensure_mounted(&self, workspace: &WorkspaceRef) -> Result<PathBuf, Self::Error>;
-    async fn unmount(&self, workspace: &WorkspaceRef) -> Result<(), Self::Error>;
+    async fn list(&self, repo: &RepoId) -> Result<Vec<LifecycleWorkspace>, Self::Error>;
+    async fn mount_state(&self, workspace: &LifecycleWorkspace) -> Result<MountState, Self::Error>;
+    async fn ensure_mounted(&self, workspace: &LifecycleWorkspace) -> Result<PathBuf, Self::Error>;
+    async fn unmount(&self, workspace: &LifecycleWorkspace) -> Result<(), Self::Error>;
     async fn caches_root(&self) -> Result<PathBuf, Self::Error>;
-    async fn stats(&self, workspace: &WorkspaceRef) -> Result<SubstrateStats, Self::Error>;
-    async fn gc(&self) -> Result<GcReport, Self::Error>;
+    async fn stats(&self, workspace: &LifecycleWorkspace) -> Result<SubstrateStats, Self::Error>;
+    async fn gc(&self) -> Result<StorageGcReport, Self::Error>;
 }

@@ -15,8 +15,8 @@ fn repo() -> RepoId {
 fn make_incarnation(digit: char) -> WorkspaceIncarnation {
     WorkspaceIncarnation::new(digit.to_string().repeat(32)).unwrap()
 }
-fn workspace(name: &str, revision: u64, topology: u64) -> WorkspaceRef {
-    WorkspaceRef::new(
+fn workspace(name: &str, revision: u64, topology: u64) -> LifecycleWorkspace {
+    LifecycleWorkspace::new(
         repo(),
         WorkspaceName::new(name).unwrap(),
         make_incarnation('a'),
@@ -146,7 +146,7 @@ fn backend(actual: Vec<ObservedState>) -> SpyBackend {
 }
 
 struct ContractSubstrate {
-    workspace: WorkspaceRef,
+    workspace: LifecycleWorkspace,
 }
 
 impl LifecyclePlanner for ContractSubstrate {
@@ -156,7 +156,7 @@ impl LifecyclePlanner for ContractSubstrate {
 
     fn plan_create(
         &self,
-        from: &WorkspaceRef,
+        from: &LifecycleWorkspace,
         destination: Destination,
     ) -> Result<CreatePlan, PlanError> {
         PurePlanner.plan_create(from, destination)
@@ -164,7 +164,7 @@ impl LifecyclePlanner for ContractSubstrate {
 
     fn plan_fork(
         &self,
-        from: &WorkspaceRef,
+        from: &LifecycleWorkspace,
         destination: Destination,
     ) -> Result<ForkPlan, PlanError> {
         PurePlanner.plan_fork(from, destination)
@@ -172,7 +172,7 @@ impl LifecyclePlanner for ContractSubstrate {
 
     fn plan_checkpoint(
         &self,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         label: CheckpointLabel,
         pin: Pin,
     ) -> Result<CheckpointPlan, PlanError> {
@@ -181,14 +181,14 @@ impl LifecyclePlanner for ContractSubstrate {
 
     fn plan_restore(
         &self,
-        workspace: &WorkspaceRef,
+        workspace: &LifecycleWorkspace,
         checkpoint: &CheckpointRef,
         mode: RestoreMode,
     ) -> Result<RestorePlan, PlanError> {
         PurePlanner.plan_restore(workspace, checkpoint, mode)
     }
 
-    fn plan_retire(&self, workspace: &WorkspaceRef) -> Result<RetirePlan, PlanError> {
+    fn plan_retire(&self, workspace: &LifecycleWorkspace) -> Result<RetirePlan, PlanError> {
         PurePlanner.plan_retire(workspace)
     }
 }
@@ -239,7 +239,7 @@ impl Substrate for ContractSubstrate {
         }
     }
 
-    async fn list(&self, repo: &RepoId) -> Result<Vec<WorkspaceRef>, Self::Error> {
+    async fn list(&self, repo: &RepoId) -> Result<Vec<LifecycleWorkspace>, Self::Error> {
         if repo == self.workspace.repo() {
             Ok(vec![self.workspace.clone()])
         } else {
@@ -247,7 +247,7 @@ impl Substrate for ContractSubstrate {
         }
     }
 
-    async fn mount_state(&self, workspace: &WorkspaceRef) -> Result<MountState, Self::Error> {
+    async fn mount_state(&self, workspace: &LifecycleWorkspace) -> Result<MountState, Self::Error> {
         if workspace == &self.workspace {
             Ok(MountState::Mounted { mount_id: 77 })
         } else {
@@ -255,7 +255,7 @@ impl Substrate for ContractSubstrate {
         }
     }
 
-    async fn ensure_mounted(&self, workspace: &WorkspaceRef) -> Result<PathBuf, Self::Error> {
+    async fn ensure_mounted(&self, workspace: &LifecycleWorkspace) -> Result<PathBuf, Self::Error> {
         if workspace == &self.workspace {
             Ok(PathBuf::from("/canonical").join(workspace.name().as_str()))
         } else {
@@ -263,7 +263,7 @@ impl Substrate for ContractSubstrate {
         }
     }
 
-    async fn unmount(&self, workspace: &WorkspaceRef) -> Result<(), Self::Error> {
+    async fn unmount(&self, workspace: &LifecycleWorkspace) -> Result<(), Self::Error> {
         if workspace == &self.workspace {
             Ok(())
         } else {
@@ -275,7 +275,7 @@ impl Substrate for ContractSubstrate {
         Ok(PathBuf::from("/canonical/caches"))
     }
 
-    async fn stats(&self, workspace: &WorkspaceRef) -> Result<SubstrateStats, Self::Error> {
+    async fn stats(&self, workspace: &LifecycleWorkspace) -> Result<SubstrateStats, Self::Error> {
         if workspace == &self.workspace {
             Ok(SubstrateStats {
                 logical_bytes: workspace.revision().get(),
@@ -287,8 +287,8 @@ impl Substrate for ContractSubstrate {
         }
     }
 
-    async fn gc(&self) -> Result<GcReport, Self::Error> {
-        Ok(GcReport::default())
+    async fn gc(&self) -> Result<StorageGcReport, Self::Error> {
+        Ok(StorageGcReport::default())
     }
 }
 
@@ -415,7 +415,7 @@ fn value_accessors_and_every_fact_field_are_observable() {
 fn restore_rejects_each_checkpoint_identity_mismatch() {
     let ws = workspace("topic", 3, 5);
     let variants = [
-        WorkspaceRef::new(
+        LifecycleWorkspace::new(
             RepoId::parse("other/project").unwrap(),
             ws.name().clone(),
             ws.incarnation().clone(),
@@ -426,7 +426,7 @@ fn restore_rejects_each_checkpoint_identity_mismatch() {
         )
         .unwrap(),
         workspace("other", 3, 5),
-        WorkspaceRef::new(
+        LifecycleWorkspace::new(
             repo(),
             ws.name().clone(),
             make_incarnation('b'),
