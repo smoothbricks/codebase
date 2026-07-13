@@ -1,10 +1,11 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
-use crate::sandbox::{SandboxConfig, SandboxError, seatbelt_profile};
+use crate::sandbox::{SandboxConfig, SandboxError, SandboxProfileRole, seatbelt_profile};
 
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -31,6 +32,7 @@ pub struct ExecOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WrapperStage {
     ValidateProfile,
+    PrepareChildDescriptors,
     Spawn,
     Wait,
 }
@@ -80,7 +82,8 @@ pub fn plan_exec(
 ) -> Result<SpawnPlan, ExecError> {
     validate_argv(&request.argv)?;
     let cwd = contained_cwd(&sandbox.workspace_mount, &request.cwd)?;
-    let profile = seatbelt_profile(sandbox).map_err(map_sandbox_error)?;
+    let profile =
+        seatbelt_profile(sandbox, SandboxProfileRole::ExecutedChild).map_err(map_sandbox_error)?;
 
     let mut args = Vec::with_capacity(request.argv.len() + 3);
     args.push(OsString::from("-p"));
@@ -108,8 +111,139 @@ pub struct SpawnFailure {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemSpawnRunner;
 
+const DESCRIPTOR_PREPARATION_ERRNO: libc::c_int = libc::EOWNERDEAD;
+const SUPERVISOR_FD_CEILING: usize = 4_096;
+
+#[cfg(not(target_os = "macos"))]
+fn descriptor_limit() -> io::Result<libc::rlim_t> {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { limit.assume_init() }.rlim_cur)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_fd_listing_size(bytes: libc::c_int, capacity: usize) -> io::Result<usize> {
+    if bytes < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let bytes = bytes as usize;
+    if bytes > capacity || !bytes.is_multiple_of(std::mem::size_of::<libc::proc_fdinfo>()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "open descriptor listing exceeds the supervisor FD ceiling",
+        ));
+    }
+    Ok(bytes / std::mem::size_of::<libc::proc_fdinfo>())
+}
+
+#[cfg(target_os = "macos")]
+fn mark_macos_non_stdio_close_on_exec(
+    descriptors: &mut [std::mem::MaybeUninit<libc::proc_fdinfo>],
+) -> io::Result<()> {
+    let capacity = std::mem::size_of_val(descriptors);
+    let required = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDLISTFDS,
+            0,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    validate_fd_listing_size(required, capacity)?;
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDLISTFDS,
+            0,
+            descriptors.as_mut_ptr().cast(),
+            capacity as libc::c_int,
+        )
+    };
+    let count = validate_fd_listing_size(bytes, capacity)?;
+    for descriptor in &descriptors[..count] {
+        let descriptor = unsafe { descriptor.assume_init_ref() }.proc_fd;
+        if descriptor > libc::STDERR_FILENO {
+            mark_descriptor_close_on_exec(descriptor)?;
+        }
+    }
+    Ok(())
+}
+
+fn mark_descriptor_close_on_exec(descriptor: libc::c_int) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if flags == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EBADF) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    if flags & libc::FD_CLOEXEC == 0 {
+        let result = unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn fallback_descriptor_limit(limit: libc::rlim_t) -> io::Result<libc::c_int> {
+    if limit > SUPERVISOR_FD_CEILING as libc::rlim_t {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "descriptor fallback limit exceeds the supervisor FD ceiling",
+        ));
+    }
+    Ok(limit as libc::c_int)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mark_non_stdio_close_on_exec(limit: libc::rlim_t) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                libc::c_uint::MAX,
+                CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSYS) | Some(libc::EINVAL)
+        ) {
+            return Err(error);
+        }
+    }
+
+    let limit = fallback_descriptor_limit(limit)?;
+    for descriptor in 3..limit {
+        mark_descriptor_close_on_exec(descriptor)?;
+    }
+    Ok(())
+}
+
 impl SpawnRunner for SystemSpawnRunner {
     fn run(&self, plan: &SpawnPlan) -> Result<ExitStatus, SpawnFailure> {
+        #[cfg(not(target_os = "macos"))]
+        let descriptor_limit = descriptor_limit().map_err(|source| SpawnFailure {
+            stage: WrapperStage::PrepareChildDescriptors,
+            source,
+        })?;
+        #[cfg(target_os = "macos")]
+        let mut descriptors = Box::<[libc::proc_fdinfo]>::new_uninit_slice(SUPERVISOR_FD_CEILING);
+
         let mut command = Command::new(&plan.program);
         command
             .args(&plan.args)
@@ -117,9 +251,25 @@ impl SpawnRunner for SystemSpawnRunner {
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
+        unsafe {
+            #[cfg(target_os = "macos")]
+            command.pre_exec(move || {
+                mark_macos_non_stdio_close_on_exec(&mut descriptors)
+                    .map_err(|_| io::Error::from_raw_os_error(DESCRIPTOR_PREPARATION_ERRNO))
+            });
+            #[cfg(not(target_os = "macos"))]
+            command.pre_exec(move || {
+                mark_non_stdio_close_on_exec(descriptor_limit)
+                    .map_err(|_| io::Error::from_raw_os_error(DESCRIPTOR_PREPARATION_ERRNO))
+            });
+        }
 
         let mut child = command.spawn().map_err(|source| SpawnFailure {
-            stage: WrapperStage::Spawn,
+            stage: if source.raw_os_error() == Some(DESCRIPTOR_PREPARATION_ERRNO) {
+                WrapperStage::PrepareChildDescriptors
+            } else {
+                WrapperStage::Spawn
+            },
             source,
         })?;
         child.wait().map_err(|source| SpawnFailure {
@@ -414,6 +564,140 @@ mod tests {
     }
 
     #[test]
+    fn system_runner_does_not_inherit_non_stdio_descriptors() {
+        use std::os::fd::AsRawFd;
+
+        let tree = TestTree::new();
+        let descriptor_file = fs::File::create(tree.root.join("inheritable")).unwrap();
+        let descriptor = descriptor_file.as_raw_fd();
+        let original_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        assert_ne!(original_flags, -1);
+        let inheritable_flags = original_flags & !libc::FD_CLOEXEC;
+        assert_ne!(
+            unsafe { libc::fcntl(descriptor, libc::F_SETFD, inheritable_flags) },
+            -1
+        );
+
+        let status = SystemSpawnRunner
+            .run(&SpawnPlan {
+                program: PathBuf::from("/bin/sh"),
+                args: vec![
+                    OsString::from("-c"),
+                    OsString::from(format!("test ! -e /dev/fd/{descriptor}")),
+                ],
+                cwd: tree.cwd.clone(),
+            })
+            .unwrap();
+
+        assert_ne!(
+            unsafe { libc::fcntl(descriptor, libc::F_SETFD, original_flags) },
+            -1
+        );
+        assert!(status.success());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn descriptor_listing_rejects_ceiling_overflow() {
+        let entry_size = std::mem::size_of::<libc::proc_fdinfo>();
+        let capacity = SUPERVISOR_FD_CEILING * entry_size;
+        let required = capacity + entry_size;
+        let error = validate_fd_listing_size(required as libc::c_int, capacity).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "open descriptor listing exceeds the supervisor FD ceiling"
+        );
+    }
+
+    #[test]
+    fn descriptor_fallback_rejects_unbounded_scan() {
+        assert_eq!(
+            fallback_descriptor_limit(SUPERVISOR_FD_CEILING as libc::rlim_t).unwrap(),
+            SUPERVISOR_FD_CEILING as libc::c_int
+        );
+        let error =
+            fallback_descriptor_limit(SUPERVISOR_FD_CEILING as libc::rlim_t + 1).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "descriptor fallback limit exceeds the supervisor FD ceiling"
+        );
+    }
+
+    #[test]
+    fn system_runner_closes_descriptors_opened_during_spawn() {
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let tree = TestTree::new();
+        let marker = tree.root.join("raced-inheritable");
+        fs::write(&marker, b"marker").unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let ready = Arc::new(Barrier::new(2));
+        let opener_running = Arc::clone(&running);
+        let opener_ready = Arc::clone(&ready);
+        let opener_marker = marker.clone();
+        let opener = thread::spawn(move || {
+            let mut held = Vec::with_capacity(64);
+            let first = fs::File::open(&opener_marker).unwrap();
+            let first_descriptor = first.as_raw_fd();
+            let first_flags = unsafe { libc::fcntl(first_descriptor, libc::F_GETFD) };
+            assert_ne!(first_flags, -1);
+            assert_ne!(
+                unsafe {
+                    libc::fcntl(
+                        first_descriptor,
+                        libc::F_SETFD,
+                        first_flags & !libc::FD_CLOEXEC,
+                    )
+                },
+                -1
+            );
+            held.push(first);
+            opener_ready.wait();
+
+            while opener_running.load(Ordering::Acquire) {
+                let file = fs::File::open(&opener_marker).unwrap();
+                let descriptor = file.as_raw_fd();
+                let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+                assert_ne!(flags, -1);
+                assert_ne!(
+                    unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC,) },
+                    -1
+                );
+                if held.len() == held.capacity() {
+                    held.remove(0);
+                }
+                held.push(file);
+            }
+        });
+        ready.wait();
+
+        let script = format!(
+            "for fd in /dev/fd/*; do [ \"$(/usr/bin/readlink \"$fd\" 2>/dev/null)\" = \"{}\" ] && exit 1; done; exit 0",
+            marker.display()
+        );
+        for _ in 0..8 {
+            let status = SystemSpawnRunner
+                .run(&SpawnPlan {
+                    program: PathBuf::from("/bin/sh"),
+                    args: vec![OsString::from("-c"), OsString::from(&script)],
+                    cwd: tree.cwd.clone(),
+                })
+                .unwrap();
+            assert!(status.success());
+        }
+
+        running.store(false, Ordering::Release);
+        opener.join().unwrap();
+    }
+
+    #[test]
     fn argv_is_passed_as_distinct_values_without_a_shell() {
         let tree = TestTree::new();
         let request = SandboxExecRequest {
@@ -433,6 +717,33 @@ mod tests {
             ["printf", "%s", "$(touch /tmp/never); a b"]
         );
         assert_eq!(plan.cwd, tree.cwd);
+    }
+
+    #[test]
+    fn launch_plan_cannot_select_the_trusted_supervisor_profile() {
+        let tree = TestTree::new();
+        let sandbox = tree.sandbox();
+        let plan = plan_exec(
+            SandboxExecRequest {
+                argv: vec![OsString::from("true")],
+                cwd: tree.cwd.clone(),
+            },
+            &sandbox,
+        )
+        .unwrap();
+        let planned_profile = plan.args[1].to_string_lossy();
+        let child = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+        let supervisor = seatbelt_profile(&sandbox, SandboxProfileRole::TrustedSupervisor).unwrap();
+
+        assert_eq!(planned_profile, child);
+        assert_ne!(planned_profile, supervisor);
+        assert!(
+            planned_profile
+                .lines()
+                .last()
+                .unwrap()
+                .starts_with("(deny file-write* (literal ")
+        );
     }
 
     #[test]
