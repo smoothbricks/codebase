@@ -115,10 +115,6 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
         allocator: this.allocator,
         capacity: effectiveCapacity,
         messageLayoutFamily,
-        trace_id: traceRoot.trace_id,
-        // thread_id and span_id come from WASM (global header and allocator respectively)
-        thread_id: 0n, // Will be read from WASM header
-        span_id: 0, // Will be assigned by WASM allocator
       },
       traceRoot, // _traceRoot
       EMPTY_SCOPE, // _scopeValues
@@ -151,8 +147,6 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
       {
         allocator: this.allocator,
         capacity: effectiveCapacity,
-        thread_id: 0n, // Will be read from WASM header
-        span_id: 0, // Will be assigned by WASM allocator
         schema: childSchema, // Pass schema for correct buffer class
         messageLayoutFamily,
       },
