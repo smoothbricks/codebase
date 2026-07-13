@@ -43,6 +43,8 @@ formatters:
       - '!*.nix'
       # Exclude files handled by rustfmt
       - '!*.rs'
+      # Exclude files handled by gofmt
+      - '!*.go'
       # Bun lockfiles are generated and should not be rewritten by Prettier
       - '!bun.lock'
       # Binary artifacts: Prettier reads them as UTF-8 and can corrupt them
@@ -55,6 +57,12 @@ formatters:
     command: 'rustfmt --edition 2024'
     patterns:
       - '*.rs'
+
+  # gofmt for Go compiler and tooling sources
+  gofmt:
+    command: 'gofmt'
+    patterns:
+      - '*.go'
 
   # Alejandra for Nix files
   alejandra:
