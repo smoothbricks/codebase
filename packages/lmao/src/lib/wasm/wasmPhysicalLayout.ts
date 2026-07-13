@@ -1,8 +1,15 @@
 import { getSchemaType } from '@smoothbricks/arrow-builder';
+import type { EagerColumnDescriptor } from '../physicalLayoutPlan.js';
 import type { MessageLayoutFamily } from '../runtimeHint.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 
 export type WasmNumericFamily = 'u8' | 'u32' | 'f64';
+
+const EMPTY_EAGER_COLUMNS: EagerColumnDescriptor = Object.freeze({
+  names: Object.freeze([]),
+  words: Object.freeze([]),
+  key: '',
+});
 export type WasmArrayType = 'Uint8Array' | 'Uint32Array' | 'Float64Array' | 'BigUint64Array';
 
 export interface WasmColumnLayoutTemplate {
@@ -42,6 +49,7 @@ export type WasmSlabLayoutDescriptor = WasmSystemSlabLayoutDescriptor | WasmNume
 export interface WasmPhysicalLayoutDescriptor {
   readonly capacity: number;
   readonly messageLayoutFamily: MessageLayoutFamily;
+  readonly eagerColumns: EagerColumnDescriptor;
   readonly system: WasmSystemSlabLayoutDescriptor;
   readonly slabs: Readonly<Record<WasmNumericFamily, WasmNumericSlabLayoutDescriptor | null>>;
   readonly columns: readonly WasmColumnLayoutDescriptor[];
@@ -49,6 +57,7 @@ export interface WasmPhysicalLayoutDescriptor {
 
 export interface WasmLayoutTemplate {
   readonly messageLayoutFamily: MessageLayoutFamily;
+  readonly eagerColumns: EagerColumnDescriptor;
   readonly columns: readonly WasmColumnLayoutTemplate[];
   forCapacity(capacity: number): WasmPhysicalLayoutDescriptor;
 }
@@ -61,6 +70,7 @@ function freezeExactLayout(
   capacity: number,
   messageLayoutFamily: MessageLayoutFamily,
   templates: readonly WasmColumnLayoutTemplate[],
+  eagerColumns: EagerColumnDescriptor,
 ): WasmPhysicalLayoutDescriptor {
   if (!Number.isSafeInteger(capacity) || capacity <= 0) {
     throw new RangeError(`WASM layout capacity must be a positive safe integer, received ${capacity}`);
@@ -114,6 +124,7 @@ function freezeExactLayout(
   return Object.freeze({
     capacity,
     messageLayoutFamily,
+    eagerColumns,
     system,
     slabs: Object.freeze({
       u8: slab('u8', 1),
@@ -124,14 +135,21 @@ function freezeExactLayout(
   });
 }
 
-function buildWasmLayoutTemplate(schema: LogSchema, messageLayoutFamily: MessageLayoutFamily): WasmLayoutTemplate {
+function buildWasmLayoutTemplate(
+  schema: LogSchema,
+  messageLayoutFamily: MessageLayoutFamily,
+  eagerColumns: EagerColumnDescriptor,
+): WasmLayoutTemplate {
   const columns: WasmColumnLayoutTemplate[] = [];
+  const preallocatedColumns = new Set(eagerColumns.names);
   let columnIndex = 0;
 
   for (const name of schema._columnNames) {
     const field = schema.fields[name];
     const schemaType = getSchemaType(field);
-    const eager = typeof field === 'object' && field !== null && Reflect.get(field, '__eager') === true;
+    const eager =
+      preallocatedColumns.has(name) ||
+      (typeof field === 'object' && field !== null && Reflect.get(field, '__eager') === true);
     let storage: Pick<WasmColumnLayoutTemplate, 'family' | 'arrayType' | 'byteWidth' | 'alignment'> | null = null;
 
     switch (schemaType) {
@@ -157,11 +175,12 @@ function buildWasmLayoutTemplate(schema: LogSchema, messageLayoutFamily: Message
   const descriptors = new Map<number, WasmPhysicalLayoutDescriptor>();
   return Object.freeze({
     messageLayoutFamily,
+    eagerColumns,
     columns: frozenColumns,
     forCapacity(capacity: number): WasmPhysicalLayoutDescriptor {
       let descriptor = descriptors.get(capacity);
       if (descriptor === undefined) {
-        descriptor = freezeExactLayout(capacity, messageLayoutFamily, frozenColumns);
+        descriptor = freezeExactLayout(capacity, messageLayoutFamily, frozenColumns, eagerColumns);
         descriptors.set(capacity, descriptor);
       }
       return descriptor;
@@ -169,18 +188,20 @@ function buildWasmLayoutTemplate(schema: LogSchema, messageLayoutFamily: Message
   });
 }
 
-const templates = new WeakMap<LogSchema, Map<MessageLayoutFamily, WasmLayoutTemplate>>();
+const templates = new WeakMap<LogSchema, Map<string, WasmLayoutTemplate>>();
 
 export function createWasmLayoutTemplate(
   schema: LogSchema,
   messageLayoutFamily: MessageLayoutFamily = 'mixed',
+  eagerColumns: EagerColumnDescriptor = EMPTY_EAGER_COLUMNS,
 ): WasmLayoutTemplate {
+  const cacheKey = `${messageLayoutFamily}:${eagerColumns.key}`;
   let familyTemplates = templates.get(schema);
-  let template = familyTemplates?.get(messageLayoutFamily);
+  let template = familyTemplates?.get(cacheKey);
   if (template === undefined) {
-    template = buildWasmLayoutTemplate(schema, messageLayoutFamily);
+    template = buildWasmLayoutTemplate(schema, messageLayoutFamily, eagerColumns);
     familyTemplates ??= new Map();
-    familyTemplates.set(messageLayoutFamily, template);
+    familyTemplates.set(cacheKey, template);
     templates.set(schema, familyTemplates);
   }
   return template;
@@ -190,6 +211,7 @@ export function getWasmPhysicalLayout(
   schema: LogSchema,
   capacity: number,
   messageLayoutFamily: MessageLayoutFamily = 'mixed',
+  eagerColumns: EagerColumnDescriptor = EMPTY_EAGER_COLUMNS,
 ): WasmPhysicalLayoutDescriptor {
-  return createWasmLayoutTemplate(schema, messageLayoutFamily).forCapacity(capacity);
+  return createWasmLayoutTemplate(schema, messageLayoutFamily, eagerColumns).forCapacity(capacity);
 }

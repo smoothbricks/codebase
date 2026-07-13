@@ -35,6 +35,46 @@ export const PHYSICAL_LAYOUT_VERSION = 1;
 /** Concrete backends may bind the same physical schema to distinct immutable plans. */
 export type PhysicalBackendKind = 'strategy-selected' | 'js-heap' | 'wasm';
 
+/** Canonical schema-ordered eager column selection for generated storage and cache identity. */
+export interface EagerColumnDescriptor {
+  readonly names: readonly string[];
+  readonly words: readonly number[];
+  readonly key: string;
+}
+
+const EMPTY_EAGER_COLUMNS: EagerColumnDescriptor = Object.freeze({
+  names: Object.freeze([]),
+  words: Object.freeze([]),
+  key: '',
+});
+
+export function resolveEagerColumns(
+  schema: LogSchema,
+  requestedNames: readonly string[] = [],
+): EagerColumnDescriptor {
+  if (requestedNames.length === 0) return EMPTY_EAGER_COLUMNS;
+  const requested = new Set(requestedNames);
+  const names: string[] = [];
+  const words = new Array<number>(Math.ceil(schema._columnNames.length / 32)).fill(0);
+  for (let columnIndex = 0; columnIndex < schema._columnNames.length; columnIndex++) {
+    const name = schema._columnNames[columnIndex];
+    if (!requested.delete(name)) continue;
+    names.push(name);
+    const wordIndex = columnIndex >>> 5;
+    words[wordIndex] = (words[wordIndex] | (1 << (columnIndex & 31))) >>> 0;
+  }
+  if (requested.size !== 0) {
+    throw new TypeError(`Unknown eager column${requested.size === 1 ? '' : 's'}: ${[...requested].join(', ')}`);
+  }
+  while (words.length !== 0 && words[words.length - 1] === 0) words.pop();
+  const frozenWords = Object.freeze(words);
+  return Object.freeze({
+    names: Object.freeze(names),
+    words: frozenWords,
+    key: frozenWords.map((word) => word.toString(16).padStart(8, '0')).join(''),
+  });
+}
+
 
 export interface PhysicalClock {
   readonly kind: 'trace-root';
@@ -57,6 +97,7 @@ export interface PhysicalLayoutPlan<
   readonly runtimeHint: number;
   readonly capabilities: number;
   readonly messageLayoutFamily: MessageLayoutFamily;
+  readonly eagerColumns: EagerColumnDescriptor;
   /** Fixed transformer tier, or undefined to retain adaptive strategy capacity. */
   readonly capacityTier: number | undefined;
   /** Canonical user-context key layout used by the generated context constructor. */
@@ -190,13 +231,14 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
   SpanContextClass: SpanContextClass<Ctx>,
   contextLayoutKey: string,
   vocabularyGeneration: VocabularyGeneration,
+  eagerColumns: EagerColumnDescriptor,
 ): PhysicalLayoutPlan<T, Ctx> {
   const schema = SpanBufferClass.schema;
   const messageLayoutFamily = runtimeHintMessageLayoutFamily(runtimeHint);
-  const PlannedSpanBufferClass = getSpanBufferClass(schema, messageLayoutFamily);
-  const SpanLoggerClass = createSpanLoggerClass(schema, messageLayoutFamily);
-  const TagWriterClass = getTagWriterClass(schema);
-  const ResultWriterClass = getResultWriterClass(schema, messageLayoutFamily);
+  const PlannedSpanBufferClass = getSpanBufferClass(schema, messageLayoutFamily, eagerColumns);
+  const SpanLoggerClass = createSpanLoggerClass(schema, messageLayoutFamily, eagerColumns.names);
+  const TagWriterClass = getTagWriterClass(schema, eagerColumns.names);
+  const ResultWriterClass = getResultWriterClass(schema, messageLayoutFamily, eagerColumns.names);
   const capabilities = isRuntimeHintAnalyzed(runtimeHint)
     ? runtimeHint & RUNTIME_HINT_CAPABILITIES_MASK
     : RUNTIME_HINT_FULL_CAPABILITIES;
@@ -209,7 +251,7 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
       }
     : undefined;
   const newTagWriter = needsTag ? (buffer: AnySpanBuffer): TagWriter<T> => new TagWriterClass(buffer) : undefined;
-  const wasmLayout = createWasmLayoutTemplate(schema, messageLayoutFamily);
+  const wasmLayout = createWasmLayoutTemplate(schema, messageLayoutFamily, eagerColumns);
 
   return Object.freeze({
     version: PHYSICAL_LAYOUT_VERSION,
@@ -218,6 +260,7 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
     runtimeHint,
     capabilities,
     messageLayoutFamily,
+    eagerColumns,
     contextLayoutKey,
     SpanContextClass,
     capacityTier: runtimeHintInitialCapacity(runtimeHint),
@@ -245,8 +288,10 @@ export function getPhysicalLayoutPlan<T extends LogSchema, Ctx extends OpContext
   remapDescriptor?: RemapDescriptor,
   backendKind: PhysicalBackendKind = 'strategy-selected',
   contextLayoutKey = '',
+  eagerColumnNames: readonly string[] = [],
 ): PhysicalLayoutPlan<T, Ctx> {
   const schema = SpanBufferClass.schema;
+  const eagerColumns = resolveEagerColumns(schema, eagerColumnNames);
   let byKey = basePlans.get(schema);
   if (!byKey) {
     byKey = new Map();
@@ -255,7 +300,7 @@ export function getPhysicalLayoutPlan<T extends LogSchema, Ctx extends OpContext
 
   const vocabularyGeneration = getVocabularyGeneration();
   const messageLayoutFamily = runtimeHintMessageLayoutFamily(runtimeHint);
-  const key = `${PHYSICAL_LAYOUT_VERSION}:${backendKind}:${runtimeHint}:${messageLayoutFamily}:${contextLayoutKey}:${vocabularyGeneration.generation}`;
+  const key = `${PHYSICAL_LAYOUT_VERSION}:${backendKind}:${runtimeHint}:${messageLayoutFamily}:${contextLayoutKey}:${vocabularyGeneration.generation}:${eagerColumns.key}`;
   let base = byKey.get(key) as PhysicalLayoutPlan<T, Ctx> | undefined;
   if (!base) {
     base = createBasePlan(
@@ -265,6 +310,7 @@ export function getPhysicalLayoutPlan<T extends LogSchema, Ctx extends OpContext
       SpanContextClass,
       contextLayoutKey,
       vocabularyGeneration,
+      eagerColumns,
     );
     byKey.set(key, base);
   } else if (base.SpanBufferClass.messageLayoutFamily !== messageLayoutFamily) {

@@ -395,7 +395,11 @@ function generatePrefillScopedAttributesMethod(
 /**
  * Build the extension for SpanLogger that extends ColumnWriter
  */
-function buildSpanLoggerExtension(schema: LogSchema, messageLayoutFamily: MessageLayoutFamily): ColumnWriterExtension {
+function buildSpanLoggerExtension(
+  schema: LogSchema,
+  messageLayoutFamily: MessageLayoutFamily,
+  eagerColumns: readonly string[],
+): ColumnWriterExtension {
   const schemaFields = schema._columns;
 
   // Collect enum mappings
@@ -418,6 +422,7 @@ function buildSpanLoggerExtension(schema: LogSchema, messageLayoutFamily: Messag
   const enumFluentSetters = generateEnumFluentSetters(enumFieldNames);
 
   return {
+    preallocatedColumns: eagerColumns,
     constructorParams: 'traceRoot, appendLogEntry',
 
     // Entry type constants (inlined from lmao.ts)
@@ -690,7 +695,7 @@ function buildSpanLoggerExtension(schema: LogSchema, messageLayoutFamily: Messag
 /**
  * Cache for generated SpanLogger classes per schema.
  */
-const spanLoggerClassCache = new WeakMap<LogSchema, Map<MessageLayoutFamily, unknown>>();
+const spanLoggerClassCache = new WeakMap<LogSchema, Map<string, unknown>>();
 
 function isSpanLoggerConstructor<T extends LogSchema>(
   value: unknown,
@@ -716,16 +721,18 @@ function isSpanLoggerConstructor<T extends LogSchema>(
 export function createSpanLoggerClass<T extends LogSchema>(
   schema: T,
   messageLayoutFamily: MessageLayoutFamily = 'mixed',
+  eagerColumns: readonly string[] = [],
 ): new (
   buffer: AnySpanBuffer,
   traceRoot: ITraceRoot,
   appendLogEntry: TimestampAppendPrimitive,
 ) => SpanLoggerImpl<T> {
+  const cacheKey = `${messageLayoutFamily}:${eagerColumns.join('\u0000')}`;
   let familyClasses = spanLoggerClassCache.get(schema);
-  let SpanLoggerClass = familyClasses?.get(messageLayoutFamily);
+  let SpanLoggerClass = familyClasses?.get(cacheKey);
 
   if (!SpanLoggerClass) {
-    const extension = buildSpanLoggerExtension(schema, messageLayoutFamily);
+    const extension = buildSpanLoggerExtension(schema, messageLayoutFamily, eagerColumns);
 
     // Use arrow-builder's getColumnWriterClass with our extension
     const WriterClass = getColumnWriterClass(schema, extension);
@@ -737,7 +744,7 @@ export function createSpanLoggerClass<T extends LogSchema>(
     }
 
     familyClasses ??= new Map();
-    familyClasses.set(messageLayoutFamily, SpanLoggerClass);
+    familyClasses.set(cacheKey, SpanLoggerClass);
     spanLoggerClassCache.set(schema, familyClasses);
   }
 

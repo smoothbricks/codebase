@@ -47,6 +47,9 @@ export type { AnyColumnBuffer, ColumnBuffer };
  */
 //#region smoo/lmao!n/buffer-codegen.extension-options
 export interface ColumnBufferExtension {
+  /** Runtime-selected columns allocated eagerly while retaining nullable semantics. */
+  preallocatedColumns?: readonly string[];
+
   /**
    * Additional code to add to the constructor (after system columns are initialized).
    * Has access to `this` and any constructorParams.
@@ -230,6 +233,28 @@ function generateInlineAllocation(columnName: string, info: ColumnStorageInfo): 
         v = this._${columnName}_nulls = new Uint8Array(buf, 0, nullSize);
         this._${columnName}_values = new ${constructorName}(buf, alignedOffset, cap);`;
 }
+
+/** Generate constructor allocation for a nullable preallocated column. */
+function generatePreallocatedAllocation(columnName: string, info: ColumnStorageInfo): string {
+  const { constructorName, bytesPerElement, isBitPacked } = info;
+  if (isBitPacked) {
+    return `const bitmapSize = (alignedCapacity + 7) >>> 3;
+      const buf = new ArrayBuffer(bitmapSize + bitmapSize);
+      this._${columnName}_nulls = new Uint8Array(buf, 0, bitmapSize);
+      this._${columnName}_values = new Uint8Array(buf, bitmapSize, bitmapSize);`;
+  }
+  if (constructorName === 'Array') {
+    return `const nullSize = (alignedCapacity + 7) >>> 3;
+      this._${columnName}_nulls = new Uint8Array(nullSize);
+      this._${columnName}_values = new Array(alignedCapacity);`;
+  }
+  const shift = Math.log2(bytesPerElement);
+  return `const nullSize = (alignedCapacity + 7) >>> 3;
+      const alignedOffset = ((nullSize + ${bytesPerElement - 1}) >>> ${shift}) << ${shift};
+      const buf = new ArrayBuffer(alignedOffset + alignedCapacity * ${bytesPerElement});
+      this._${columnName}_nulls = new Uint8Array(buf, 0, nullSize);
+      this._${columnName}_values = new ${constructorName}(buf, alignedOffset, alignedCapacity);`;
+}
 //#endregion smoo/lmao!n/buffer-arch-lazy-column-init
 
 //#region smoo/lmao!n/buffer-arch-allocation-timing
@@ -296,6 +321,7 @@ export function generateColumnBufferClass(
   }
 
   const schemaFields = schema._columnNames;
+  const preallocatedColumns = new Set(extension?.preallocatedColumns ?? []);
 
   // Buffer management
   const constructorCode: string[] = [
@@ -312,6 +338,7 @@ export function generateColumnBufferClass(
     const columnName = fieldName;
     const storageInfo = getTypedArrayInfo(schema, fieldName);
     const { constructorName, isBitPacked, isEager } = storageInfo;
+    const isPreallocated = !isEager && preallocatedColumns.has(fieldName);
 
     if (isEager) {
       // Eager column: allocate in constructor, no null bitmap
@@ -338,6 +365,29 @@ export function generateColumnBufferClass(
       setterMethods.push(`    ${columnName}(pos, val) {
       if (val == null) val = ${defaultValue};
       ${valueAssignment}
+      return this;
+    }`);
+      continue;
+    }
+
+    if (isPreallocated) {
+      constructorCode.push(`    { ${generatePreallocatedAllocation(columnName, storageInfo)} }`);
+      if (storageInfo.schemaType === 'enum' && storageInfo.enumValues) {
+        constructorCode.push(`    this.${columnName}_enumValues = ${JSON.stringify(storageInfo.enumValues)};`);
+      }
+      getterMethods.push(`    get ${columnName}_nulls() { return this._${columnName}_nulls; }`);
+      getterMethods.push(`    get ${columnName}_values() { return this._${columnName}_values; }`);
+      getterMethods.push(`    get ${columnName}() { return this._${columnName}_values; }`);
+      const valueAssignment = generateSetterValueAssignment(storageInfo, `this._${columnName}`);
+      const nullBitSetting = generateNullBitSetting(`this._${columnName}`);
+      const nullBitClearing = generateNullBitClearing(`this._${columnName}`);
+      setterMethods.push(`    ${columnName}(pos, val) {
+      if (val == null) {
+        ${nullBitClearing}
+      } else {
+        ${valueAssignment}
+        ${nullBitSetting}
+      }
       return this;
     }`);
       continue;
