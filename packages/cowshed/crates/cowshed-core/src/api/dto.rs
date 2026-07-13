@@ -666,7 +666,7 @@ impl<'de> Deserialize<'de> for ExpectedRefHead {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdoptOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
@@ -678,7 +678,7 @@ pub struct AdoptOptions {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<RevisionTarget>,
@@ -690,25 +690,25 @@ pub struct CreateOptions {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct AttachOptions {
     pub browse: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoveOptions {
     pub force: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct GcOptions {
     pub dry_run: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct RebaseOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub onto: Option<RevisionTarget>,
@@ -721,8 +721,8 @@ pub struct RebaseOptions {
     pub expected_onto_head: Option<GitOid>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct LandOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_branch: Option<String>,
@@ -738,8 +738,22 @@ pub struct LandOptions {
     pub expected_target_head: Option<ExpectedRefHead>,
 }
 
+impl Default for LandOptions {
+    fn default() -> Self {
+        Self {
+            target_branch: None,
+            check: None,
+            retire: true,
+            push_only: false,
+            expected_workspace_incarnation: None,
+            expected_source_head: None,
+            expected_target_head: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct PushOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
@@ -752,12 +766,17 @@ pub struct PushOptions {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct GrantDelta {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub write: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress: Vec<EgressRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repos: Vec<RepoRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sim: Vec<SimVerb>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<u64>,

@@ -345,6 +345,25 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
         json!({"dryRun":true})
     );
 
+    assert_eq!(
+        serde_json::from_value::<AttachOptions>(json!({})).unwrap(),
+        AttachOptions::default()
+    );
+    assert_eq!(
+        serde_json::from_value::<CreateOptions>(json!({})).unwrap(),
+        CreateOptions::default()
+    );
+    let land_default = serde_json::from_value::<LandOptions>(json!({})).unwrap();
+    assert!(land_default.retire);
+    assert!(!land_default.push_only);
+    assert_eq!(
+        serde_json::to_value(land_default).unwrap(),
+        json!({"retire":true,"pushOnly":false})
+    );
+    let grant_delta = serde_json::from_value::<GrantDelta>(json!({})).unwrap();
+    assert_eq!(grant_delta, GrantDelta::default());
+    assert_eq!(serde_json::to_value(grant_delta).unwrap(), json!({}));
+
     let rebase = RebaseOptions {
         onto: Some(RevisionTarget::Branch {
             branch: "main".into(),
