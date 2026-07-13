@@ -39,11 +39,13 @@ let threadIdBigInt: bigint | null = null;
 function ensureInitialized(): void {
   if (threadIdBytes !== null) return;
 
-  threadIdBytes = new Uint8Array(THREAD_ID_BYTES);
+  // Keep initialization transactional so a failed entropy provider can be retried.
+  const bytes = new Uint8Array(THREAD_ID_BYTES);
 
   // Use Web Crypto API - available in browsers, Node 19+, Deno, Bun, Workers
   if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
-    crypto.getRandomValues(threadIdBytes);
+    crypto.getRandomValues(bytes);
+    threadIdBytes = bytes;
     return;
   }
 
@@ -51,7 +53,8 @@ function ensureInitialized(): void {
   try {
     const nodeCrypto = require('node:crypto');
     if (nodeCrypto && typeof nodeCrypto.randomFillSync === 'function') {
-      nodeCrypto.randomFillSync(threadIdBytes);
+      nodeCrypto.randomFillSync(bytes);
+      threadIdBytes = bytes;
       return;
     }
   } catch {
