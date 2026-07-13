@@ -1,7 +1,8 @@
 import { bench, do_not_optimize, group, run, summary } from 'mitata';
 import { createTestOpMetadata, createTestSchema, createTestTraceRoot } from '../src/lib/__tests__/test-helpers.js';
 import { convertSpanTreeToArrowTable } from '../src/lib/convertToArrow.js';
-import { generateRemappedBufferViewClass } from '../src/lib/library.js';
+import { createRemapDescriptor } from '../src/lib/library.js';
+import type { RemapDescriptor } from '../src/lib/logBinding.js';
 import { S } from '../src/lib/schema/builder.js';
 import type { LogSchema } from '../src/lib/schema/LogSchema.js';
 import { createChildSpanBuffer, createSpanBuffer, getSpanBufferClass } from '../src/lib/spanBuffer.js';
@@ -25,9 +26,7 @@ const LABELS = {
 } as const;
 
 type MutableBuffer = AnySpanBuffer & Record<string, unknown>;
-type RemappedViewConstructor = new (buffer: AnySpanBuffer) => AnySpanBuffer;
-type MappingEntry = readonly [publicName: string, rawName: string];
-type ColdRemapDescriptor = Readonly<{ entries: readonly MappingEntry[] }>;
+type LegacyRemapWrapper = (buffer: AnySpanBuffer) => AnySpanBuffer;
 type BenchmarkValue = Readonly<{ checksum: number; allocationCount: number; visitedObjects: number }>;
 type TreeMode = 'unprefixed' | 'current' | 'modeled';
 
@@ -38,15 +37,15 @@ interface Workload {
   readonly mappingLabel: 'one-mapping' | 'many-mappings';
   readonly publicNames: readonly string[];
   readonly rawNames: readonly string[];
-  readonly descriptor: ColdRemapDescriptor;
+  readonly descriptor: RemapDescriptor;
   readonly publicSchema: LogSchema;
   readonly rawSchema: LogSchema;
-  readonly remappedViewClass: RemappedViewConstructor;
+  readonly wrapLegacyBuffer: LegacyRemapWrapper;
 }
 
 interface TreeFixture {
   readonly root: AnySpanBuffer;
-  readonly descriptor: ColdRemapDescriptor;
+  readonly descriptor: RemapDescriptor;
   readonly mode: TreeMode;
   readonly depth: number;
   readonly mappingCount: number;
@@ -67,16 +66,39 @@ function numberFields(names: readonly string[]): Record<string, ReturnType<typeo
   return fields;
 }
 
-function createDescriptor(publicNames: readonly string[], rawNames: readonly string[]): ColdRemapDescriptor {
-  const entries = publicNames.map((publicName, index) => Object.freeze([publicName, rawNames[index]!] as const));
-  return Object.freeze({ entries: Object.freeze(entries) });
+function createLegacyRemapWrapper(outputToSourceMapping: Readonly<Record<string, string>>): LegacyRemapWrapper {
+  return (buffer) => {
+    const columns: Array<[string, unknown]> = [];
+    for (const [outputName, sourceName] of Object.entries(outputToSourceMapping)) {
+      const schema = buffer._logSchema.fields[sourceName];
+      if (schema !== undefined) columns.push([outputName, schema]);
+    }
+    const view: AnySpanBuffer = Object.create(buffer);
+    Object.defineProperties(view, {
+      _columns: { value: columns },
+      getColumnIfAllocated: {
+        value(name: string) {
+          return buffer.getColumnIfAllocated(outputToSourceMapping[name] ?? name);
+        },
+      },
+      getNullsIfAllocated: {
+        value(name: string) {
+          return buffer.getNullsIfAllocated(outputToSourceMapping[name] ?? name);
+        },
+      },
+    });
+    return view;
+  };
 }
 
 function createWorkload(depth: number, mappingCount: number): Workload {
   const publicNames = Object.freeze(Array.from({ length: mappingCount }, (_, index) => `lib_value_${index}`));
   const rawNames = Object.freeze(Array.from({ length: mappingCount }, (_, index) => `value_${index}`));
-  const descriptor = createDescriptor(publicNames, rawNames);
-  const reverseMapping = Object.fromEntries(descriptor.entries);
+  const outputToSourceMapping: Record<string, string> = {};
+  for (let index = 0; index < publicNames.length; index++) {
+    outputToSourceMapping[publicNames[index]!] = rawNames[index]!;
+  }
+  const rawSchema = createTestSchema(numberFields(rawNames));
   return {
     depth,
     mappingCount,
@@ -84,10 +106,10 @@ function createWorkload(depth: number, mappingCount: number): Workload {
     mappingLabel: mappingCount === 1 ? 'one-mapping' : 'many-mappings',
     publicNames,
     rawNames,
-    descriptor,
+    descriptor: createRemapDescriptor(rawSchema, outputToSourceMapping),
     publicSchema: createTestSchema(numberFields(publicNames)),
-    rawSchema: createTestSchema(numberFields(rawNames)),
-    remappedViewClass: generateRemappedBufferViewClass(reverseMapping),
+    rawSchema,
+    wrapLegacyBuffer: createLegacyRemapWrapper(outputToSourceMapping),
   };
 }
 
@@ -118,11 +140,10 @@ function appendTree(root: AnySpanBuffer, workload: Workload, mode: TreeMode): Tr
     allocationCount++;
     writeDeterministicRow(child, childNames, level);
     if (mode === 'current') {
-      rawParent._children.push(new workload.remappedViewClass(child));
+      rawParent._children.push(workload.wrapLegacyBuffer(child));
       allocationCount++;
     } else {
-      // Modeled future path: registration keeps the raw child. The immutable descriptor
-      // is created once with the workload and is consulted only by cold traversal.
+      if (mode === 'modeled') child._remapDescriptor = workload.descriptor;
       rawParent._children.push(child);
     }
     rawParent = child;
@@ -150,16 +171,19 @@ function mappedTreeChecksum(tree: TreeFixture): BenchmarkValue {
     visitedObjects++;
     let mappedColumnIndex = 0;
     if (tree.mode === 'modeled') {
-      for (const [publicName, rawName] of tree.descriptor.entries) {
-        const values = visibleChild.getColumnIfAllocated(rawName) as ArrayLike<number> | undefined;
+      const columns = tree.descriptor.columns;
+      const storage = visibleChild as MutableBuffer;
+      for (let columnIndex = 0; columnIndex < columns.length; columnIndex++) {
+        const entry = columns[columnIndex]!;
+        const values = storage[entry[3]] as ArrayLike<number> | undefined;
         const value = values?.[0];
-        if (value === undefined) throw new Error(`Missing modeled value for ${publicName} at depth ${level}`);
-        checksum = (checksum * 1_000_003 + value + mappedColumnIndex) >>> 0;
+        if (value === undefined) throw new Error(`Missing modeled value for ${entry[0]} at depth ${level}`);
+        checksum = (checksum * 1_000_003 + value + columnIndex) >>> 0;
         mappedColumnIndex++;
       }
     } else {
-      // Mirror Arrow pass 0: current buffers expose their schema-backed _columns,
-      // while RemappedBufferView exposes the constructor-built prefixed _columns.
+      // Mirror the legacy Arrow pass 0: the benchmark-local wrapper exposes
+      // constructor-built prefixed columns and remaps access to canonical storage.
       for (const [publicName] of visibleChild._columns) {
         if (!publicName.startsWith('lib_value_')) continue;
         const values = visibleChild.getColumnIfAllocated(publicName) as ArrayLike<number> | undefined;
@@ -229,12 +253,10 @@ function arrowOutputChecksum(tree: TreeFixture, publicNames: readonly string[]):
 function validateArrowSemantics(workload: Workload): void {
   const unprefixed = createTraversalFixture(workload, 'unprefixed');
   const current = createTraversalFixture(workload, 'current');
-  // The modeled representation deliberately avoids wrappers on registration. Materialize
-  // current views only for this untimed compatibility check until Arrow accepts descriptors.
-  const modeledForArrow = createTraversalFixture(workload, 'current');
+  const modeled = createTraversalFixture(workload, 'modeled');
   const expected = arrowOutputChecksum(unprefixed, workload.publicNames);
   const currentChecksum = arrowOutputChecksum(current, workload.publicNames);
-  const modeledChecksum = arrowOutputChecksum(modeledForArrow, workload.publicNames);
+  const modeledChecksum = arrowOutputChecksum(modeled, workload.publicNames);
   if (currentChecksum !== expected || modeledChecksum !== expected) {
     throw new Error(
       `Mapped Arrow checksum mismatch: unprefixed=${expected}, current=${currentChecksum}, modeled=${modeledChecksum}`,

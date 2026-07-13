@@ -180,10 +180,7 @@ export function createTestLogBinding<T extends SchemaFields>(schema: T | LogSche
   // Wrap in LogSchema if plain SchemaFields provided
   const logSchema = schema instanceof LogSchema ? schema : createTestSchema(schema);
 
-  return {
-    logSchema,
-    remappedViewClass: undefined,
-  };
+  return { logSchema };
 }
 
 /**

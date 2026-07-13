@@ -26,7 +26,7 @@ import type { TraceId } from './traceId.js';
 import type { ITraceRoot } from './traceRoot.js';
 
 // Re-export infrastructure types
-export type { LogBinding, RemapDescriptor, RemappedColumn, RemappedViewConstructor } from './logBinding.js';
+export type { LogBinding, RemapDescriptor, RemappedColumn } from './logBinding.js';
 export type { OpMetadata } from './opContext/opTypes.js';
 export type { extractSpanIdentity, SpanIdentity } from './traceId.js';
 export type { TracerLifecycleHooks } from './traceRoot.js';
@@ -158,9 +158,6 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
    */
   _overflow?: AnySpanBuffer;
 
-  /** Immutable cold-path output remapping attached to this canonical buffer. */
-  _remapDescriptor?: import('./logBinding.js').RemapDescriptor;
-
   /** Whether this physical segment has contributed its rows to shared stats. */
   _statsSealed: boolean;
 
@@ -216,14 +213,14 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   readonly _logSchema: LogSchema;
 
   /**
-   * Column entries for Arrow conversion iteration.
-   * For SpanBuffer: delegates to _logSchema._columns (unprefixed names)
-   * For RemappedBufferView: built in constructor with prefixed names from mapping
-   *
-   * This enables Arrow conversion to iterate column names correctly regardless of
-   * whether the buffer is wrapped in a RemappedBufferView.
+   * Canonical schema column entries for this buffer.
+   * Output remapping lives separately in `_remapDescriptor` and is interpreted
+   * only by cold Arrow traversal.
    */
   readonly _columns: ReadonlyArray<[string, unknown]>;
+
+  /** Immutable cold-path output remapping attached to canonical child buffers. */
+  _remapDescriptor?: import('./logBinding.js').RemapDescriptor;
 
   /**
    * Shared stats for all buffers from same defineOpContext (accessed via constructor.stats).

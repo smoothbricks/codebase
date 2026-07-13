@@ -205,7 +205,7 @@ type CreateOpGroupFn<Ctx extends OpContext> = <Ops extends OpGroupOps<Ctx>>(
  * - metadata: includes name + merged with defaults
  * - SpanBufferClass: from getSpanBufferClass(logSchema) - has static schema + stats
  * - fn(ctx, ...args): the user function to execute
- * - remappedViewClass: undefined for original ops (set by .prefix() method)
+ * - remapDescriptor: undefined for original ops (set by .prefix()/.mapColumns())
  *
  * @template Ctx - Bundled OpContext (logSchema, flags, deps, userCtx)
  * @param factoryConfig - Configuration containing logSchema and flags
@@ -249,7 +249,7 @@ export function createDefineOp<Ctx extends OpContext>(
     // - Writes span-start/span-ok/span-err entries
     // - Handles exceptions with span-exception
     // Why SpanBufferClass: All ops from same defineOpContext share this class for stats coordination
-    // Why undefined for remappedViewClass: Only prefixed ops need remapping - set by .prefix() method
+    // Base Ops have no remap descriptor; mapped OpGroups bind one during startup cloning.
     return new OpClass(
       finalMetadata,
       SpanBufferClass,
@@ -333,7 +333,7 @@ export function createDefineOps<Ctx extends OpContext>(
             { ...def.metadata, logTemplateIds: normalizedCompileMetadata.logTemplateIds },
             def.SpanBufferClass,
             def.fn,
-            def.remappedViewClass,
+            def.remapDescriptor,
             def._opContextBinding,
             normalizedCompileMetadata.runtimeHint,
           );
