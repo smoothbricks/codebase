@@ -257,6 +257,11 @@ impl ApfsExecutionHost for FakeHost {
         Ok(())
     }
 
+    fn rename_volume(&self, _: &Path, volume_name: &str) -> Result<(), ApfsStorageError> {
+        self.record(format!("rename-volume:{volume_name}"));
+        Ok(())
+    }
+
     fn write_marker(
         &self,
         _: &Path,
@@ -850,6 +855,20 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
     assert_eq!(
         restored.workspace.topology_revision(),
         source.topology_revision()
+    );
+    let relabels: Vec<_> = host
+        .events()
+        .into_iter()
+        .filter(|event| event.starts_with("rename-volume:"))
+        .collect();
+    assert_eq!(
+        relabels,
+        [
+            "rename-volume:cowshed.acme--widget.created",
+            "rename-volume:cowshed.acme--widget.forked",
+            "rename-volume:cowshed.acme--widget.main",
+        ],
+        "each cloned staging volume is relabeled before publication"
     );
 
     let restore_events = host.events();

@@ -147,6 +147,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         browse: bool,
     ) -> Result<(), ApfsStorageError>;
     fn chown_volume_root(&self, mount_point: &Path) -> Result<(), ApfsStorageError>;
+    fn rename_volume(&self, mount_point: &Path, volume_name: &str) -> Result<(), ApfsStorageError>;
     fn write_marker(
         &self,
         mount_point: &Path,
@@ -525,6 +526,7 @@ where
                 .map(|candidate| candidate.mount_state)
                 .ok_or(ApfsStorageError::InvalidPlan("workspace is not published"))?;
             if matches!(state, MountState::Mounted { .. }) {
+                host.validate_marker(&mount_point, &MarkerExpectation::from_workspace(&workspace))?;
                 return Ok(mount_point);
             }
             let canonical = canonical_image_path(&config, &workspace)?;
@@ -759,6 +761,7 @@ fn apply_adopt<H: ApfsExecutionHost>(
         &workspace,
         None,
         created.format == ImageFormat::Asif,
+        false,
     ) {
         let cleanup = host.reclaim_image(&created.path, created.format);
         return combine_cleanup("adopt preparation", primary, cleanup);
@@ -821,6 +824,7 @@ fn apply_clone<H: ApfsExecutionHost>(
         &workspace,
         forked_from,
         false,
+        true,
     ) {
         let cleanup = host.reclaim_image(&staged, format);
         return combine_cleanup("clone preparation", primary, cleanup);
@@ -931,7 +935,15 @@ fn apply_restore<H: ApfsExecutionHost>(
         });
         return combine_cleanup("restore staging metadata", primary, cleanup);
     }
-    if let Err(primary) = prepare_image(host, &staged, &staging_mount, &replacement, None, false) {
+    if let Err(primary) = prepare_image(
+        host,
+        &staged,
+        &staging_mount,
+        &replacement,
+        None,
+        false,
+        true,
+    ) {
         let cleanup = host.reclaim_image(&staged, format).and_then(|()| {
             mount_canonical(host, &canonical, &mount_point(config, &current)?, &current)
         });
@@ -996,11 +1008,18 @@ fn prepare_image<H: ApfsExecutionHost>(
     workspace: &WorkspaceRef,
     forked_from: Option<&WorkspaceName>,
     chown: bool,
+    relabel: bool,
 ) -> Result<(), ApfsStorageError> {
     let attachment = host.attach_verified(image, workspace.format())?;
     let prepared = host.mount(&attachment, mount_point, false).and_then(|()| {
         if chown {
             host.chown_volume_root(mount_point)?;
+        }
+        if relabel {
+            host.rename_volume(
+                mount_point,
+                &volume_name(workspace.repo(), workspace.name()),
+            )?;
         }
         host.write_marker(mount_point, workspace, forked_from)?;
         host.validate_marker(mount_point, &MarkerExpectation::from_workspace(workspace))

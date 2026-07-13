@@ -19,10 +19,9 @@ use crate::apfs::{
 };
 use crate::metadata::{
     DetachedWorkspaceMetadata, GrantSet, ImageFormat, METADATA_VERSION, Platform, WorkspaceMarker,
-    WorkspaceName, WorkspaceRole, read_json, sidecar_path, write_json,
+    WorkspaceName, WorkspaceRole, sidecar_path,
 };
 use crate::repository::RepoId;
-use serde::{Deserialize, Serialize};
 
 use super::super::lifecycle::{
     ExpectedState, GcReport, KernelMountFact, ObservedState, Revision, StorageFact, SubstrateStats,
@@ -53,6 +52,7 @@ const MNT_IGNORE_OWNERS: u64 = 0x0020_0000;
 pub struct KernelMountSnapshot {
     pub mount_id: u64,
     pub mount_point: PathBuf,
+    pub source_device: String,
     flags: u64,
 }
 
@@ -60,6 +60,7 @@ impl KernelMountSnapshot {
     pub fn new(
         mount_id: u64,
         mount_point: impl Into<PathBuf>,
+        source_device: impl Into<String>,
         nobrowse: bool,
         owners: bool,
     ) -> Self {
@@ -73,6 +74,7 @@ impl KernelMountSnapshot {
         Self {
             mount_id,
             mount_point: mount_point.into(),
+            source_device: source_device.into(),
             flags,
         }
     }
@@ -82,6 +84,9 @@ pub trait KernelMountSource: Send + Sync + 'static {
     fn mounts(&self) -> Result<Vec<KernelMountSnapshot>, ApfsStorageError>;
 }
 
+pub trait RecoveryMarkerSource: Send + Sync + 'static {
+    fn incarnation(&self, image: &Path) -> Result<String, ApfsStorageError>;
+}
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemKernelMountSource;
 
@@ -113,12 +118,16 @@ fn system_kernel_mounts() -> Result<Vec<KernelMountSnapshot>, ApfsStorageError> 
             .iter()
             .map(|entry| {
                 let bytes = unsafe { CStr::from_ptr(entry.f_mntonname.as_ptr()) }.to_bytes();
+                let source_device = unsafe { CStr::from_ptr(entry.f_mntfromname.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned();
                 let mount_point = PathBuf::from(std::ffi::OsStr::from_bytes(bytes));
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 mount_point.hash(&mut hasher);
                 Ok(KernelMountSnapshot {
                     mount_id: hasher.finish(),
                     mount_point,
+                    source_device,
                     flags: entry.f_flags as u64,
                 })
             })
@@ -133,51 +142,16 @@ fn system_kernel_mounts() -> Result<Vec<KernelMountSnapshot>, ApfsStorageError> 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RestoreFailpoint {
     Disabled = 0,
-    AfterImageSwap = 1,
-    AfterUndoRename = 2,
-    AfterMetadataPublish = 3,
-    AfterMetadataFsync = 4,
+    AfterUndoSidecar = 1,
+    AfterImageSwap = 2,
+    AfterUndoRename = 3,
+    AfterMetadataPublish = 4,
+    AfterMetadataFsync = 5,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum RestoreJournalPhase {
-    Prepared,
-    ImagePublished,
-    MetadataPublished,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RestoreJournal {
-    phase: RestoreJournalPhase,
-    staged: PathBuf,
-    canonical: PathBuf,
-    undo: PathBuf,
-    old_inode: u64,
-    new_inode: u64,
-    replacement_incarnation: String,
-}
-
-fn restore_journal_path(staged: &Path) -> PathBuf {
-    let mut path = staged.as_os_str().to_owned();
-    path.push(".restore.json");
-    PathBuf::from(path)
-}
-
-fn image_inode(path: &Path) -> Result<u64, ApfsStorageError> {
-    fs::metadata(path)
-        .map(|metadata| metadata.ino())
-        .map_err(|error| io_error("read restore image identity", path, error))
-}
-
-fn write_restore_journal(path: &Path, journal: &RestoreJournal) -> Result<(), ApfsStorageError> {
-    write_json(path, journal).map_err(|error| ApfsStorageError::Host(error.to_string()))
-}
-
-fn collect_restore_journals(
+fn collect_restore_sidecars(
     directory: &Path,
-    journals: &mut Vec<PathBuf>,
+    sidecars: &mut Vec<PathBuf>,
 ) -> Result<(), ApfsStorageError> {
     if !directory.exists() {
         return Ok(());
@@ -185,23 +159,38 @@ fn collect_restore_journals(
     let mut pending = vec![directory.to_owned()];
     while let Some(directory) = pending.pop() {
         let entries = fs::read_dir(&directory)
-            .map_err(|error| io_error("enumerate restore journals", &directory, error))?;
+            .map_err(|error| io_error("enumerate restore sidecars", &directory, error))?;
         for entry in entries {
             let entry =
-                entry.map_err(|error| io_error("read restore journal entry", &directory, error))?;
+                entry.map_err(|error| io_error("read restore sidecar entry", &directory, error))?;
             let path = entry.path();
             if path.is_dir() {
                 pending.push(path);
-            } else if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".restore.json"))
-            {
-                journals.push(path);
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name.starts_with("pre-restore-") && name.ends_with(".grants.json") {
+                sidecars.push(path);
             }
         }
     }
     Ok(())
+}
+
+fn image_from_sidecar(sidecar: &Path) -> Result<PathBuf, ApfsStorageError> {
+    let value = sidecar
+        .as_os_str()
+        .to_str()
+        .and_then(|value| value.strip_suffix(".grants.json"))
+        .ok_or_else(|| {
+            ApfsStorageError::Host(format!(
+                "invalid detached restore sidecar path: {}",
+                sidecar.display()
+            ))
+        })?;
+    Ok(PathBuf::from(value))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -353,9 +342,10 @@ pub struct MacOsApfsExecutionHost<R> {
     mounted: MountedRegistry,
     restore_failpoint: AtomicU8,
     mount_source: Arc<dyn KernelMountSource>,
+    recovery_marker_source: Option<Arc<dyn RecoveryMarkerSource>>,
 }
 
-impl<R> MacOsApfsExecutionHost<R> {
+impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     pub fn new(
         runner: R,
         config: ApfsSubstrateConfig,
@@ -376,6 +366,25 @@ impl<R> MacOsApfsExecutionHost<R> {
             metadata,
             mounted: MountedRegistry::start()?,
             mount_source: Arc::new(mount_source),
+            recovery_marker_source: None,
+            restore_failpoint: AtomicU8::new(RestoreFailpoint::Disabled as u8),
+        })
+    }
+
+    pub fn with_recovery_sources(
+        runner: R,
+        config: ApfsSubstrateConfig,
+        metadata: WorkspaceMetadataTemplate,
+        mount_source: impl KernelMountSource,
+        recovery_marker_source: impl RecoveryMarkerSource,
+    ) -> Result<Self, ApfsStorageError> {
+        Ok(Self {
+            backend: MacOsApfsBackend::new(runner),
+            config,
+            metadata,
+            mounted: MountedRegistry::start()?,
+            mount_source: Arc::new(mount_source),
+            recovery_marker_source: Some(Arc::new(recovery_marker_source)),
             restore_failpoint: AtomicU8::new(RestoreFailpoint::Disabled as u8),
         })
     }
@@ -400,6 +409,7 @@ impl<R> MacOsApfsExecutionHost<R> {
                 "injected restore failure after {}",
                 match failpoint {
                     RestoreFailpoint::Disabled => "disabled",
+                    RestoreFailpoint::AfterUndoSidecar => "undo sidecar",
                     RestoreFailpoint::AfterImageSwap => "image swap",
                     RestoreFailpoint::AfterUndoRename => "undo rename",
                     RestoreFailpoint::AfterMetadataPublish => "metadata publish",
@@ -581,6 +591,33 @@ impl<R> MacOsApfsExecutionHost<R> {
         }
     }
 
+    fn validate_kernel_mount(
+        &self,
+        mount: &KernelMountSnapshot,
+        expected_path: &Path,
+        expected_volume: &str,
+    ) -> Result<(), ApfsStorageError>
+    where
+        R: CommandRunner,
+    {
+        let actual_volume = self.backend.volume_name(&mount.source_device)?;
+        if actual_volume != expected_volume {
+            return Err(ApfsStorageError::Host(format!(
+                "workspace mount source mismatch at {}: expected volume {expected_volume}, device {} resolves to {actual_volume}",
+                expected_path.display(),
+                mount.source_device
+            )));
+        }
+        if !canonical_mount_flags(mount.flags) {
+            return Err(ApfsStorageError::Host(format!(
+                "workspace mount has non-canonical flags at {}: expected nobrowse with owners, flags={:#x}",
+                expected_path.display(),
+                mount.flags
+            )));
+        }
+        Ok(())
+    }
+
     fn kernel_mount_fact(
         &self,
         metadata: &DetachedWorkspaceMetadata,
@@ -594,16 +631,11 @@ impl<R> MacOsApfsExecutionHost<R> {
         else {
             return Ok(None);
         };
-        if !canonical_mount_flags(mount.flags) {
-            return Err(ApfsStorageError::Host(format!(
-                "workspace mount has non-canonical flags at {}: expected nobrowse with owners, flags={:#x}",
-                expected.display(),
-                mount.flags
-            )));
-        }
+        let expected_volume = volume_name(&metadata.repo_id, &metadata.workspace);
+        self.validate_kernel_mount(&mount, &expected, &expected_volume)?;
         Ok(Some(KernelMountFact {
             mount_id: mount.mount_id,
-            volume_name: volume_name(&metadata.repo_id, &metadata.workspace),
+            volume_name: expected_volume,
         }))
     }
 
@@ -611,6 +643,47 @@ impl<R> MacOsApfsExecutionHost<R> {
         let metadata = DetachedWorkspaceMetadata::read_for_image(image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         Ok(self.kernel_mount_fact(&metadata)?.is_some())
+    }
+
+    fn detached_image_incarnation(
+        &self,
+        image: &Path,
+        format: ImageFormat,
+        mount_point: &Path,
+    ) -> Result<String, ApfsStorageError>
+    where
+        R: CommandRunner,
+    {
+        if let Some(source) = &self.recovery_marker_source {
+            return source.incarnation(image);
+        }
+        fs::create_dir_all(mount_point)
+            .map_err(|error| io_error("create recovery mount", mount_point, error))?;
+        let attachment = self.backend.attach_verified(image, format)?;
+        if let Err(primary) = self.backend.mount(&attachment, mount_point, false) {
+            let cleanup = self.backend.detach(&attachment, true).map_err(Into::into);
+            return super::combine_cleanup("recovery marker mount", primary.into(), cleanup);
+        }
+        let incarnation = WorkspaceMarker::read_from(&mount_point.join(WORKSPACE_MARKER_PATH))
+            .map(|marker| marker.workspace_incarnation.to_string())
+            .map_err(|error| ApfsStorageError::Host(error.to_string()));
+        let detach = self.backend.detach(&attachment, false).map_err(Into::into);
+        let cleanup = match (incarnation, detach) {
+            (Ok(incarnation), Ok(())) => Ok(incarnation),
+            (Err(primary), cleanup) => {
+                super::combine_cleanup("recovery marker read", primary, cleanup)
+            }
+            (Ok(_), Err(error)) => Err(error),
+        };
+        let remove = fs::remove_dir(mount_point)
+            .map_err(|error| io_error("remove recovery mount", mount_point, error));
+        match (cleanup, remove) {
+            (Ok(incarnation), Ok(())) => Ok(incarnation),
+            (Err(primary), cleanup) => {
+                super::combine_cleanup("recovery marker cleanup", primary, cleanup)
+            }
+            (Ok(_), Err(error)) => Err(error),
+        }
     }
 
     fn gc_project(&self, project: &Path, report: &mut GcReport) -> Result<(), ApfsStorageError>
@@ -855,6 +928,12 @@ where
         }
     }
 
+    fn rename_volume(&self, mount_point: &Path, volume_name: &str) -> Result<(), ApfsStorageError> {
+        self.backend
+            .rename_volume(mount_point, volume_name)
+            .map_err(Into::into)
+    }
+
     fn write_marker(
         &self,
         mount_point: &Path,
@@ -925,6 +1004,15 @@ where
         else {
             return Ok(());
         };
+        let expected_volume = volume_name(workspace.repo(), workspace.name());
+        let actual_volume = self.backend.volume_name(&mount.source_device)?;
+        if actual_volume != expected_volume {
+            return Err(ApfsStorageError::Host(format!(
+                "refusing to heal unrelated mount at {}: expected volume {expected_volume}, device {} resolves to {actual_volume}",
+                mount_point.display(),
+                mount.source_device
+            )));
+        }
         if canonical_mount_flags(mount.flags) {
             return Ok(());
         }
@@ -1130,34 +1218,15 @@ where
         }
         let canonical_sidecar = sidecar_path(canonical);
         let undo_sidecar = sidecar_path(undo);
-        let replacement = DetachedWorkspaceMetadata::read_for_image(staged)
+        DetachedWorkspaceMetadata::read_for_image(staged)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         DetachedWorkspaceMetadata::read_for_image(canonical)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        let journal_path = restore_journal_path(staged);
-        if journal_path.exists() {
-            return Err(ApfsStorageError::Host(format!(
-                "restore journal already exists: {}",
-                journal_path.display()
-            )));
-        }
-        let mut journal = RestoreJournal {
-            phase: RestoreJournalPhase::Prepared,
-            staged: staged.to_owned(),
-            canonical: canonical.to_owned(),
-            undo: undo.to_owned(),
-            old_inode: image_inode(canonical)?,
-            new_inode: image_inode(staged)?,
-            replacement_incarnation: replacement.workspace_incarnation.to_string(),
-        };
-        write_restore_journal(&journal_path, &journal)?;
-        if let Err(error) = fs::hard_link(&canonical_sidecar, &undo_sidecar) {
-            let _ = fs::remove_file(&journal_path);
-            return Err(io_error("retain restore metadata", &undo_sidecar, error));
-        }
+        fs::hard_link(&canonical_sidecar, &undo_sidecar)
+            .map_err(|error| io_error("retain restore metadata", &undo_sidecar, error))?;
+        self.trip_restore_failpoint(RestoreFailpoint::AfterUndoSidecar)?;
         if let Err(error) = swap_paths(canonical, staged) {
             let _ = fs::remove_file(&undo_sidecar);
-            let _ = fs::remove_file(&journal_path);
             return Err(error);
         }
         self.trip_restore_failpoint(RestoreFailpoint::AfterImageSwap)?;
@@ -1165,7 +1234,6 @@ where
             let primary = io_error("retain restore undo image", undo, error);
             let rollback = swap_paths(canonical, staged);
             let _ = fs::remove_file(&undo_sidecar);
-            let _ = fs::remove_file(&journal_path);
             return match rollback {
                 Ok(()) => Err(primary),
                 Err(cleanup) => Err(ApfsStorageError::Cleanup {
@@ -1175,8 +1243,6 @@ where
                 }),
             };
         }
-        journal.phase = RestoreJournalPhase::ImagePublished;
-        write_restore_journal(&journal_path, &journal)?;
         self.trip_restore_failpoint(RestoreFailpoint::AfterUndoRename)?;
         sync_parent!(canonical)?;
         sync_parent!(undo)
@@ -1190,9 +1256,6 @@ where
         revision: Revision,
         source_image: &Path,
     ) -> Result<(), ApfsStorageError> {
-        let journal_path = restore_journal_path(staged);
-        let mut journal: RestoreJournal =
-            read_json(&journal_path).map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         self.publish_metadata(
             canonical,
             workspace,
@@ -1200,15 +1263,11 @@ where
             MetadataPolicy::Preserve,
             Some(source_image),
         )?;
-        journal.phase = RestoreJournalPhase::MetadataPublished;
-        write_restore_journal(&journal_path, &journal)?;
         self.trip_restore_failpoint(RestoreFailpoint::AfterMetadataPublish)?;
         sync_parent!(canonical)?;
         self.trip_restore_failpoint(RestoreFailpoint::AfterMetadataFsync)?;
         Self::remove_sidecar(staged)?;
-        fs::remove_file(&journal_path)
-            .map_err(|error| io_error("remove completed restore journal", &journal_path, error))?;
-        sync_parent!(&journal_path)
+        sync_parent!(canonical)
     }
 
     fn rollback_restore(
@@ -1234,15 +1293,6 @@ where
                 .map_err(|error| ApfsStorageError::Host(error.to_string()))?,
         )?;
         Self::remove_sidecar(staged)?;
-        let journal_path = restore_journal_path(staged);
-        if journal_path
-            .try_exists()
-            .map_err(|error| io_error("inspect restore journal", &journal_path, error))?
-        {
-            fs::remove_file(&journal_path).map_err(|error| {
-                io_error("remove rolled-back restore journal", &journal_path, error)
-            })?;
-        }
         sync_parent!(canonical)
     }
 
@@ -1296,12 +1346,9 @@ where
                     Err(error) => return Some(Err(error)),
                 };
                 let mount = kernel.iter().find(|mount| mount.mount_point == expected)?;
-                if !canonical_mount_flags(mount.flags) {
-                    return Some(Err(ApfsStorageError::Host(format!(
-                        "workspace mount has non-canonical flags at {}: expected nobrowse with owners, flags={:#x}",
-                        expected.display(),
-                        mount.flags
-                    ))));
+                if let Err(error) = self.validate_kernel_mount(mount, &expected, &fact.volume_name)
+                {
+                    return Some(Err(error));
                 }
                 Some(Ok(KernelMountFact {
                     mount_id: mount.mount_id,
@@ -1312,89 +1359,134 @@ where
     }
 
     fn recover_pending(&self, config: &ApfsSubstrateConfig) -> Result<(), ApfsStorageError> {
-        let mut journals = Vec::new();
-        collect_restore_journals(&config.store_root, &mut journals)?;
-        journals.sort();
-        for journal_path in journals {
-            let journal: RestoreJournal = read_json(&journal_path)
+        let mut undo_sidecars = Vec::new();
+        collect_restore_sidecars(&config.store_root, &mut undo_sidecars)?;
+        undo_sidecars.sort();
+        for undo_sidecar in undo_sidecars {
+            let undo = image_from_sidecar(&undo_sidecar)?;
+            let Some(replacement_incarnation) = undo
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.strip_prefix("pre-restore-"))
+            else {
+                continue;
+            };
+            let old_metadata = DetachedWorkspaceMetadata::read_for_image(&undo)
                 .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-            let metadata_published =
-                match DetachedWorkspaceMetadata::read_for_image(&journal.canonical) {
-                    Ok(metadata) => {
-                        metadata.workspace_incarnation.to_string()
-                            == journal.replacement_incarnation
-                    }
-                    Err(_) if journal.phase != RestoreJournalPhase::MetadataPublished => false,
-                    Err(error) => return Err(ApfsStorageError::Host(error.to_string())),
-                };
-            let canonical_sidecar = sidecar_path(&journal.canonical);
-            let undo_sidecar = sidecar_path(&journal.undo);
-            if metadata_published {
-                if !journal.undo.exists()
-                    && journal.staged.exists()
-                    && image_inode(&journal.canonical)? == journal.new_inode
-                {
-                    fs::rename(&journal.staged, &journal.undo).map_err(|error| {
-                        io_error("complete restore undo rename", &journal.undo, error)
-                    })?;
-                }
-                Self::remove_sidecar(&journal.staged)?;
+            let storage = layout(config, &old_metadata.repo_id)?;
+            let canonical = if old_metadata.workspace.is_main() {
+                storage
+                    .main_image(old_metadata.image_format)?
+                    .image()
+                    .to_owned()
             } else {
-                let canonical_inode = image_inode(&journal.canonical)?;
-                if canonical_inode == journal.new_inode {
-                    if journal.undo.exists() {
-                        fs::rename(&journal.undo, &journal.staged).map_err(|error| {
-                            io_error("stage interrupted restore undo", &journal.staged, error)
-                        })?;
+                storage
+                    .session_image(&old_metadata.workspace, old_metadata.image_format)?
+                    .image()
+                    .to_owned()
+            };
+            if !canonical.exists() {
+                continue;
+            }
+            let staged = storage
+                .project()
+                .project_root
+                .join(super::STAGING_NAMESPACE)
+                .join(format!(
+                    "{}-{}.{}",
+                    old_metadata.workspace.as_str(),
+                    replacement_incarnation,
+                    old_metadata.image_format.extension()
+                ));
+            let canonical_sidecar = sidecar_path(&canonical);
+            let canonical_metadata = if canonical_sidecar.exists() {
+                Some(
+                    DetachedWorkspaceMetadata::read_for_image(&canonical)
+                        .map_err(|error| ApfsStorageError::Host(error.to_string()))?,
+                )
+            } else {
+                None
+            };
+            let published = canonical_metadata.as_ref().is_some_and(|metadata| {
+                metadata.workspace_incarnation.as_str() == replacement_incarnation
+            });
+            if published {
+                if undo.exists() {
+                    if staged.exists() {
+                        self.backend
+                            .delete_image(&staged, old_metadata.image_format)?;
                     }
-                    if !journal.staged.exists() {
-                        return Err(ApfsStorageError::Host(format!(
-                            "interrupted restore lost old image: {}",
-                            journal.staged.display()
-                        )));
-                    }
-                    swap_paths(&journal.canonical, &journal.staged)?;
-                } else if canonical_inode != journal.old_inode {
+                } else if staged.exists() {
+                    fs::rename(&staged, &undo)
+                        .map_err(|error| io_error("complete restore undo rename", &undo, error))?;
+                }
+                Self::remove_sidecar(&staged)?;
+                sync_parent!(&canonical)?;
+                continue;
+            }
+            if canonical_metadata.as_ref().is_some_and(|metadata| {
+                metadata.workspace_incarnation != old_metadata.workspace_incarnation
+            }) {
+                continue;
+            }
+
+            let image_was_published = if undo.exists() {
+                true
+            } else if staged.exists() {
+                let recovery_mount = storage
+                    .project()
+                    .mount_root
+                    .join(super::STAGING_NAMESPACE)
+                    .join(format!(
+                        "recover-{}-{}",
+                        old_metadata.workspace.as_str(),
+                        replacement_incarnation
+                    ));
+                let incarnation = self.detached_image_incarnation(
+                    &canonical,
+                    old_metadata.image_format,
+                    &recovery_mount,
+                )?;
+                if incarnation == replacement_incarnation {
+                    true
+                } else if incarnation == old_metadata.workspace_incarnation.as_str() {
+                    false
+                } else {
                     return Err(ApfsStorageError::Host(format!(
-                        "restore journal image identity mismatch: {}",
-                        journal.canonical.display()
+                        "restore candidate marker does not match canonical or replacement: {}",
+                        canonical.display()
                     )));
                 }
-                if journal.staged.exists() {
-                    let format = ImageFormat::from_image_path(&journal.staged)
-                        .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-                    self.backend.delete_image(&journal.staged, format)?;
-                }
-                Self::remove_sidecar(&journal.staged)?;
-                if undo_sidecar.exists() {
-                    if canonical_sidecar.try_exists().map_err(|error| {
-                        io_error(
-                            "inspect interrupted restore metadata",
-                            &canonical_sidecar,
-                            error,
-                        )
-                    })? {
-                        fs::remove_file(&canonical_sidecar).map_err(|error| {
-                            io_error(
-                                "remove interrupted restore metadata",
-                                &canonical_sidecar,
-                                error,
-                            )
-                        })?;
-                    }
-                    fs::rename(&undo_sidecar, &canonical_sidecar).map_err(|error| {
-                        io_error(
-                            "restore interrupted canonical metadata",
-                            &canonical_sidecar,
-                            error,
-                        )
-                    })?;
-                }
+            } else {
+                continue;
+            };
+
+            if undo.exists() {
+                fs::rename(&undo, &staged)
+                    .map_err(|error| io_error("stage interrupted restore undo", &staged, error))?;
             }
-            fs::remove_file(&journal_path).map_err(|error| {
-                io_error("remove recovered restore journal", &journal_path, error)
-            })?;
-            sync_parent!(&journal.canonical)?;
+            if image_was_published {
+                swap_paths(&canonical, &staged)?;
+            }
+            if staged.exists() {
+                self.backend
+                    .delete_image(&staged, old_metadata.image_format)?;
+            }
+            Self::remove_sidecar(&staged)?;
+            if canonical_sidecar.exists() {
+                fs::remove_file(&undo_sidecar).map_err(|error| {
+                    io_error("remove redundant restore metadata", &undo_sidecar, error)
+                })?;
+            } else {
+                fs::rename(&undo_sidecar, &canonical_sidecar).map_err(|error| {
+                    io_error(
+                        "restore interrupted canonical metadata",
+                        &canonical_sidecar,
+                        error,
+                    )
+                })?;
+            }
+            sync_parent!(&canonical)?;
         }
         Ok(())
     }
