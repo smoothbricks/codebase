@@ -14,6 +14,7 @@ import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { TestTracer } from '../tracers/TestTracer.js';
+import { iterateSpanChildren } from '../traceTopology.js';
 import type { AnySpanBuffer } from '../types.js';
 import { createTestTracerOptions } from './test-helpers.js';
 
@@ -93,9 +94,7 @@ describe('Library remap descriptor integration', () => {
     const siblingBuffer = childBuffers[1];
     if (!nestedBuffer || !siblingBuffer) throw new Error('library child buffers were not captured');
 
-    expect(rootBuffer._children).toHaveLength(2);
-    expect(rootBuffer._children[0]).toBe(nestedBuffer);
-    expect(rootBuffer._children[1]).toBe(siblingBuffer);
+    expect(Array.from(iterateSpanChildren(rootBuffer))).toEqual([nestedBuffer, siblingBuffer]);
     expect(nestedBuffer._logSchema).toBe(libraryContext.logBinding.logSchema);
     expect(siblingBuffer._logSchema).toBe(libraryContext.logBinding.logSchema);
     expect(nestedBuffer.constructor).toBe(siblingBuffer.constructor);
@@ -219,7 +218,7 @@ describe('Library remap descriptor integration', () => {
     }
 
     if (!rootBuffer || !childBuffer) throw new Error('overflow trace did not expose its buffers');
-    expect(rootBuffer._children[0]).toBe(childBuffer);
+    expect(Array.from(iterateSpanChildren(rootBuffer))).toEqual([childBuffer]);
     expect(childBuffer._overflow).toBeDefined();
     expect(childBuffer._remapDescriptor).toBe(mapped.overflow.callsitePlan.remapDescriptor ?? undefined);
 

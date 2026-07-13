@@ -1137,7 +1137,6 @@ export function createSpanContextClass<Ctx extends OpContext>(
       );
       const childBuffer = createdBuffer;
       childBuffer._remapDescriptor = callsitePlan.remapDescriptor ?? undefined;
-      this._buffer._children.push(childBuffer);
       callsitePlan.appenders.writeSpanStart(childBuffer, name);
       childBuffer.line(0, line);
 

@@ -11,6 +11,7 @@ import { resolveMessage } from '../../resolveMessage.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { ENTRY_TYPE_INFO } from '../../schema/systemSchema.js';
 import { TestTracer } from '../../tracers/TestTracer.js';
+import { NO_NODE } from '../../traceTopology.js';
 import type { AnySpanBuffer } from '../../types.js';
 import { invokeWriterMethod, nextWriterRow, requireAnySpanBuffer } from '../arrow-test-helpers.js';
 import {
@@ -63,7 +64,7 @@ describe('Buffer Integration', () => {
     // Metadata
     expect(buf._capacity).toBe(capacity);
     expect(buf._writeIndex).toBe(0);
-    expect(buf._children).toHaveLength(0);
+    expect(buf._traceRoot._topology.firstChild[buf._nodeIndex]).toBe(NO_NODE);
   });
 
   it('integrates schema definition with buffer creation', () => {
@@ -338,7 +339,7 @@ describe('Buffer Integration', () => {
       // Verify system metadata columns are accessible
       expect(buffer.span_id).toBeGreaterThan(0);
       expect(typeof buffer._hasParent).toBe('boolean');
-      expect(buffer._children).toBeInstanceOf(Array);
+      expect(buffer._traceRoot._topology.buffers[buffer._nodeIndex]).toBe(buffer);
       expect(buffer._writeIndex).toBe(0);
       expect(buffer._capacity).toBe(DEFAULT_BUFFER_CAPACITY);
     });

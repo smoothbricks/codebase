@@ -28,6 +28,7 @@ import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { ENTRY_TYPE_SPAN_RETRY } from '../../schema/systemSchema.js';
 import { TestTracer } from '../../tracers/TestTracer.js';
+import { iterateSpanChildren } from '../../traceTopology.js';
 
 // Test schema
 const testSchema = defineLogSchema({
@@ -476,9 +477,10 @@ describe('LMAO Op Retry', () => {
       const rootBuffer = tracer.rootBuffers[0];
 
       // Get child span buffer (the span execution)
-      const childBuffers = rootBuffer._children;
-      expect(childBuffers.length).toBe(1);
-      const spanBuffer = childBuffers[0];
+      const childBuffers = Array.from(iterateSpanChildren(rootBuffer));
+      expect(childBuffers).toHaveLength(1);
+      const [spanBuffer] = childBuffers;
+      if (!spanBuffer) throw new Error('expected retry span buffer');
 
       // Check entry_type for ENTRY_TYPE_SPAN_RETRY (value 5)
       // Row 0: span-start
@@ -522,9 +524,10 @@ describe('LMAO Op Retry', () => {
 
       expect(tracer.rootBuffers.length).toBe(1);
       const rootBuffer = tracer.rootBuffers[0];
-      const childBuffers = rootBuffer._children;
-      expect(childBuffers.length).toBe(1);
-      const spanBuffer = childBuffers[0];
+      const childBuffers = Array.from(iterateSpanChildren(rootBuffer));
+      expect(childBuffers).toHaveLength(1);
+      const [spanBuffer] = childBuffers;
+      if (!spanBuffer) throw new Error('expected no-retry span buffer');
 
       // Check for any retry entries
       const entryTypes = spanBuffer.entry_type;
@@ -551,7 +554,8 @@ describe('LMAO Op Retry', () => {
       expect(result.success).toBe(false);
 
       const rootBuffer = tracer.rootBuffers[0];
-      const spanBuffer = rootBuffer._children[0];
+      const [spanBuffer] = iterateSpanChildren(rootBuffer);
+      if (!spanBuffer) throw new Error('expected exhausted-retry span buffer');
 
       // Check for retry entries
       const entryTypes = spanBuffer.entry_type;
@@ -583,7 +587,8 @@ describe('LMAO Op Retry', () => {
       });
 
       const rootBuffer = tracer.rootBuffers[0];
-      const spanBuffer = rootBuffer._children[0];
+      const [spanBuffer] = iterateSpanChildren(rootBuffer);
+      if (!spanBuffer) throw new Error('expected retry error-code span buffer');
 
       // Find retry entry
       const entryTypes = spanBuffer.entry_type;
@@ -664,7 +669,8 @@ describe('LMAO Op Retry', () => {
 
       // Verify tags were preserved through retry
       const rootBuffer = tracer.rootBuffers[0];
-      const spanBuffer = rootBuffer._children[0];
+      const [spanBuffer] = iterateSpanChildren(rootBuffer);
+      if (!spanBuffer) throw new Error('expected tag-preservation span buffer');
 
       // Tags are written at row 0 (span-start)
       const operations = requireStringArray(spanBuffer.getColumnIfAllocated('operation'), 'operations');
@@ -728,7 +734,8 @@ describe('LMAO Op Retry', () => {
       expect(attempts).toBe(5);
 
       // Verify 4 retry entries (attempts 1-4 failed)
-      const spanBuffer = tracer.rootBuffers[0]._children[0];
+      const [spanBuffer] = iterateSpanChildren(tracer.rootBuffers[0]);
+      if (!spanBuffer) throw new Error('expected multi-retry span buffer');
       const entryTypes = spanBuffer.entry_type;
       let retryCount = 0;
       for (let i = 0; i < spanBuffer._writeIndex; i++) {

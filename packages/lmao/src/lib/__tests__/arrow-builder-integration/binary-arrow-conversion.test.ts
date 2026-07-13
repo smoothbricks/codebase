@@ -8,7 +8,14 @@
 import { describe, expect, it } from 'bun:test';
 import { decode } from '@msgpack/msgpack';
 import { createColumnWriter } from '@smoothbricks/arrow-builder';
-import { convertSpanTreeToArrowTable, convertToArrowTable, createSpanBuffer, S } from '@smoothbricks/lmao';
+import {
+  convertSpanTreeToArrowTable,
+  convertToArrowTable,
+  createChildSpanBuffer,
+  createSpanBuffer,
+  getSpanBufferClass,
+  S,
+} from '@smoothbricks/lmao';
 import typia from 'typia';
 import { ENTRY_TYPE_INFO, ENTRY_TYPE_SPAN_START } from '../../schema/systemSchema.js';
 import { invokeWriterMethod, nextWriterRow, requireBinaryCell, requireColumn } from '../arrow-test-helpers.js';
@@ -207,8 +214,13 @@ describe('Binary Arrow Conversion', () => {
       rootBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       rootBuffer._writeIndex = 1;
 
-      // Create child buffer
-      const childBuffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
+      // Create and register child buffer in the root trace topology.
+      const childBuffer = createChildSpanBuffer(
+        rootBuffer,
+        getSpanBufferClass(schema),
+        createTestOpMetadata(),
+        createTestOpMetadata(),
+      );
       const childWriter = createColumnWriter(schema, childBuffer);
 
       const childRow = invokeWriterMethod(nextWriterRow(childWriter), 'payload', { level: 'child', nested: { a: 1 } });
@@ -216,10 +228,6 @@ describe('Binary Arrow Conversion', () => {
       childBuffer.timestamp[0] = 2000n;
       childBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       childBuffer._writeIndex = 1;
-
-      // Link parent-child
-      rootBuffer._children.push(childBuffer);
-      childBuffer._parent = rootBuffer;
 
       const table = convertSpanTreeToArrowTable(rootBuffer);
       const payloadCol = requireColumn(table, 'payload');
@@ -298,8 +306,13 @@ describe('Binary Arrow Conversion', () => {
 
       rootBuffer._writeIndex = 3;
 
-      // Child buffer with overlapping category values
-      const childBuffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
+      // Child buffer with overlapping category values, registered in the root topology.
+      const childBuffer = createChildSpanBuffer(
+        rootBuffer,
+        getSpanBufferClass(schema),
+        createTestOpMetadata(),
+        createTestOpMetadata(),
+      );
       const childWriter = createColumnWriter(schema, childBuffer);
 
       const childDataRow = invokeWriterMethod(nextWriterRow(childWriter), 'payload', { req: 4 });
@@ -308,8 +321,6 @@ describe('Binary Arrow Conversion', () => {
       childBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
 
       childBuffer._writeIndex = 1;
-      rootBuffer._children.push(childBuffer);
-      childBuffer._parent = rootBuffer;
 
       // convertSpanTreeToArrowTable uses the shared-dict path (buildSortedCategoryDictionary)
       const table = convertSpanTreeToArrowTable(rootBuffer);
