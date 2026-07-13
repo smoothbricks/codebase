@@ -55,8 +55,6 @@ func main() {
 		fmt.Printf("%s %s\n", pluginName, pluginVersion)
 	case "check":
 		os.Exit(runCheck(os.Args[2:]))
-	case "sync-vocabulary":
-		os.Exit(runVocabularySync(os.Args[2:]))
 	case "transform":
 		os.Exit(runTransform(os.Args[2:]))
 	case "build":
@@ -67,37 +65,28 @@ func main() {
 	}
 }
 
-type compilerOptions struct{ cwd, tsconfig, manifestPath string }
+type compilerOptions struct{ cwd, tsconfig string }
 type nativePluginConfigEntry struct {
-	Config map[string]any `json:"config"`
-	Name   string         `json:"name"`
-	Stage  string         `json:"stage"`
+	Config map[string]json.RawMessage `json:"config"`
+	Name   string                     `json:"name"`
+	Stage  string                     `json:"stage"`
 }
 
 func readOptions(args []string) (compilerOptions, error) {
 	options := compilerOptions{tsconfig: "tsconfig.json"}
-	var explicitManifest, pluginsJSON string
+	var pluginsJSON string
 	for _, argument := range args {
 		switch {
 		case strings.HasPrefix(argument, "--cwd="):
 			options.cwd = strings.TrimPrefix(argument, "--cwd=")
 		case strings.HasPrefix(argument, "--tsconfig="):
 			options.tsconfig = strings.TrimPrefix(argument, "--tsconfig=")
-		case strings.HasPrefix(argument, "--lmao-vocabulary-manifest="):
-			explicitManifest = strings.TrimPrefix(argument, "--lmao-vocabulary-manifest=")
 		case strings.HasPrefix(argument, "--plugins-json="):
 			pluginsJSON = strings.TrimPrefix(argument, "--plugins-json=")
+		default:
+			return compilerOptions{}, fmt.Errorf("unknown argument %q", argument)
 		}
 	}
-	if options.cwd == "" {
-		options.cwd, _ = os.Getwd()
-	}
-	options.cwd, _ = filepath.Abs(options.cwd)
-	if !filepath.IsAbs(options.tsconfig) {
-		options.tsconfig = filepath.Join(options.cwd, options.tsconfig)
-	}
-	options.tsconfig = filepath.Clean(options.tsconfig)
-	configuredManifest := ""
 	if strings.TrimSpace(pluginsJSON) != "" {
 		decoder := json.NewDecoder(strings.NewReader(pluginsJSON))
 		decoder.DisallowUnknownFields()
@@ -120,28 +109,19 @@ func readOptions(args []string) (compilerOptions, error) {
 				return compilerOptions{}, fmt.Errorf("LMAO1010 --plugins-json contains multiple %s entries", pluginName)
 			}
 			matched = true
-			value, exists := entry.Config["vocabularyManifest"]
-			if !exists {
-				continue
+			if len(entry.Config) != 0 {
+				return compilerOptions{}, fmt.Errorf("LMAO1010 %s does not accept configuration options", pluginName)
 			}
-			manifest, ok := value.(string)
-			if !ok || manifest == "" {
-				return compilerOptions{}, fmt.Errorf("LMAO1010 %s config.vocabularyManifest must be a non-empty string", pluginName)
-			}
-			configuredManifest = manifest
 		}
 	}
-	manifestPath := configuredManifest
-	if explicitManifest != "" {
-		manifestPath = explicitManifest
+	if options.cwd == "" {
+		options.cwd, _ = os.Getwd()
 	}
-	if manifestPath == "" {
-		manifestPath = "lmao.vocabulary.json"
+	options.cwd, _ = filepath.Abs(options.cwd)
+	if !filepath.IsAbs(options.tsconfig) {
+		options.tsconfig = filepath.Join(options.cwd, options.tsconfig)
 	}
-	if !filepath.IsAbs(manifestPath) {
-		manifestPath = filepath.Join(filepath.Dir(options.tsconfig), manifestPath)
-	}
-	options.manifestPath = filepath.Clean(manifestPath)
+	options.tsconfig = filepath.Clean(options.tsconfig)
 	return options, nil
 }
 
@@ -163,13 +143,13 @@ type collectedFile struct {
 	tagInlines          []tagInline
 	logInlines          []logInline
 	resultInlines       []resultInline
-	registrationEntries []vocabularyManifestEntry
+	registrationEntries []vocabularyCatalogEntry
 }
 type programCompilation struct {
 	files map[*shimast.SourceFile]*collectedFile
 }
 
-func collectProgramCompilation(prog *driver.Program, options compilerOptions, validateManifest bool) (*programCompilation, vocabularyManifest, error) {
+func collectProgramCompilation(prog *driver.Program, options compilerOptions) (*programCompilation, error) {
 	collector := newProgramVocabularyCollector()
 	compilation := &programCompilation{files: map[*shimast.SourceFile]*collectedFile{}}
 	for _, sf := range prog.SourceFiles() {
@@ -181,37 +161,27 @@ func collectProgramCompilation(prog *driver.Program, options compilerOptions, va
 		compilation.files[sf] = &collectedFile{transformer: t}
 	}
 	if err := collector.diagnosticError(); err != nil {
-		return nil, vocabularyManifest{}, err
+		return nil, err
 	}
-	expected, err := buildVocabularyManifest(collector)
+	catalog, err := buildVocabularyCatalog(collector)
 	if err != nil {
-		return nil, vocabularyManifest{}, err
+		return nil, err
 	}
-	manifest := expected
-	if validateManifest {
-		manifest, err = loadVocabularyManifest(options.manifestPath)
-		if err != nil {
-			return nil, vocabularyManifest{}, err
-		}
-		if err = validateVocabularyManifestForProgram(manifest, expected); err != nil {
-			return nil, vocabularyManifest{}, err
-		}
-	}
-	staticLogs, staticSpans := resolveVocabularyIDs(manifest, collector)
+	staticLogs, staticSpans := resolveVocabularyIDs(catalog, collector)
 	for sf, collected := range compilation.files {
 		collected.transformer.staticLogIDs = staticLogs
 		collected.transformer.staticSpanNameIDs = staticSpans
-		collected.transformer.vocabularySize = len(manifest.Entries)
+		collected.transformer.vocabularySize = len(catalog.Entries)
 		collected.hintRewrites = collected.transformer.collectOptimizations(sf.AsNode(), true)
-		collected.registrationEntries = manifestEntriesForFile(manifest, collector.fileKeys[sf.FileName()])
+		collected.registrationEntries = catalogEntriesForFile(catalog, collector.fileKeys[sf.FileName()])
 		collected.transformer.vocabularyOrdinals = vocabularyOrdinals(collected.registrationEntries)
 		collected.tagInlines, collected.logInlines, collected.resultInlines = collected.transformer.collectTagInlines(sf.AsNode())
 	}
-	return compilation, manifest, nil
+	return compilation, nil
 }
 
 func lmaoPluginTransform(prog *driver.Program, options compilerOptions) (driver.PluginTransform, error) {
-	compilation, _, err := collectProgramCompilation(prog, options, true)
+	compilation, err := collectProgramCompilation(prog, options)
 	if err != nil {
 		return nil, err
 	}
@@ -253,35 +223,8 @@ func runCheck(args []string) int {
 		return 2
 	}
 	defer prog.Close()
-	if _, _, err = collectProgramCompilation(prog, options, true); err != nil {
+	if _, err = collectProgramCompilation(prog, options); err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err)
-		return 2
-	}
-	return 0
-}
-func runVocabularySync(args []string) int {
-	options, err := readOptions(args)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err)
-		return 2
-	}
-	prog, err := loadCompilerProgram(options)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err)
-		return 2
-	}
-	defer prog.Close()
-	_, manifest, err := collectProgramCompilation(prog, options, false)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err)
-		return 2
-	}
-	data, err := canonicalManifestBytes(manifest)
-	if err == nil {
-		err = writeManifestAtomic(options.manifestPath, data)
-	}
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: vocabulary sync failed: %v\n", pluginName, err)
 		return 2
 	}
 	return 0
