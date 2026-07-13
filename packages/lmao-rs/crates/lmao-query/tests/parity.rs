@@ -6,7 +6,10 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use lmao_arrow::{MockSpan, convert_span_trees};
+use lmao_arrow::{
+    MockSpan, StableVocabularyCatalog, StableVocabularyEntry, StableVocabularyKind,
+    build_trace_chunk_envelope, convert_span_trees,
+};
 use lmao_core::{SpanIdentity, TraceId};
 use lmao_query::{ArrowTraceQuery, Selector, TraceQuery};
 
@@ -58,7 +61,7 @@ fn fixture_batch() -> RecordBatch {
         &["cache {key} hit", "rows {n} returned"],
     ));
     let other = span(root_b, "handle-request", &["user {id} loaded"]);
-    convert_span_trees(&[root, other]).unwrap()
+    convert_span_trees(&[root, other], &StableVocabularyCatalog::EMPTY).unwrap()
 }
 
 #[cfg_attr(not(any(feature = "sqlite", feature = "datafusion")), allow(dead_code))]
@@ -108,6 +111,74 @@ fn arrow_scan_answers_the_fixture() {
         &Selector::template("handle-request"),
         &Selector::template("db-query"),
     ));
+}
+
+#[test]
+fn stable_and_dynamic_vocabulary_have_query_and_archive_parity() {
+    const STATIC_LOG_ID: u32 = 0x0055_7011;
+    const STATIC_SPAN_ID: u32 = 0x00A0_3022;
+    static ENTRIES: [StableVocabularyEntry<'static>; 2] = [
+        StableVocabularyEntry {
+            id: STATIC_LOG_ID,
+            kind: StableVocabularyKind::LogTemplate,
+            value: "search {term}",
+        },
+        StableVocabularyEntry {
+            id: STATIC_SPAN_ID,
+            kind: StableVocabularyKind::SpanName,
+            value: "query-span",
+        },
+    ];
+    // Value order is query-span, search {term}, the reverse of stable-ID order.
+    static VALUE_ORDER: [u32; 2] = [1, 0];
+
+    let identity = || {
+        Arc::new(SpanIdentity {
+            thread_id: 31,
+            span_id: 7,
+            trace_id: TraceId::new("vocabulary-parity").unwrap(),
+            parent: None,
+        })
+    };
+    let dynamic = MockSpan {
+        identity: identity(),
+        timestamps: vec![10, 20, 30],
+        packed_headers: vec![1, 2, 8],
+        messages: vec![
+            Some("query-span".into()),
+            None,
+            Some("search {term}".into()),
+        ],
+        overflow: None,
+        children: vec![],
+    };
+    let static_rows = MockSpan {
+        identity: identity(),
+        timestamps: vec![10, 20, 30],
+        packed_headers: vec![(STATIC_SPAN_ID << 8) | 1, 2, (STATIC_LOG_ID << 8) | 8],
+        messages: vec![None, None, None],
+        overflow: None,
+        children: vec![],
+    };
+    let catalog = StableVocabularyCatalog::try_new(&ENTRIES, &VALUE_ORDER).unwrap();
+    let dynamic_batch = convert_span_trees(&[dynamic], &StableVocabularyCatalog::EMPTY).unwrap();
+    let static_batch = convert_span_trees(&[static_rows], &catalog).unwrap();
+    let dynamic_query = ArrowTraceQuery::new(vec![dynamic_batch.clone()]);
+    let static_query = ArrowTraceQuery::new(vec![static_batch.clone()]);
+
+    for (name, selector, expected) in [
+        ("log template", Selector::template("search {term}"), 1),
+        ("span name", Selector::template("query-span"), 1),
+        ("absent", Selector::template("never emitted"), 0),
+    ] {
+        assert_eq!(dynamic_query.count(&selector), expected, "dynamic {name}");
+        assert_eq!(static_query.count(&selector), expected, "static {name}");
+    }
+    assert_eq!(
+        build_trace_chunk_envelope("archive://fixture", &dynamic_batch),
+        build_trace_chunk_envelope("archive://fixture", &static_batch),
+        "archive identity and bounds are independent of vocabulary encoding",
+    );
 }
 
 #[cfg(feature = "sqlite")]
