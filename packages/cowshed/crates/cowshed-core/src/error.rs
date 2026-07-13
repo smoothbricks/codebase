@@ -113,19 +113,34 @@ pub type Result<T> = std::result::Result<T, CowshedError>;
 mod tests {
     use super::{CowshedError, ErrorCode};
 
+    const CODES: [ErrorCode; 6] = [
+        ErrorCode::Internal,
+        ErrorCode::Usage,
+        ErrorCode::NotFound,
+        ErrorCode::Conflict,
+        ErrorCode::EnvironmentMissing,
+        ErrorCode::SandboxDenied,
+    ];
+
     #[test]
-    fn stable_exit_ranges_do_not_overlap() {
-        for code in [
-            ErrorCode::Internal,
-            ErrorCode::Usage,
-            ErrorCode::NotFound,
-            ErrorCode::Conflict,
-            ErrorCode::EnvironmentMissing,
-            ErrorCode::SandboxDenied,
-        ] {
-            assert!((1..=6).contains(&code.exit_code()));
-            assert!((100..=105).contains(&code.exec_wrapper_exit_code()));
-        }
+    fn stable_exit_codes_are_frozen() {
+        assert_eq!(CODES.map(ErrorCode::exit_code), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(
+            CODES.map(ErrorCode::exec_wrapper_exit_code),
+            [100, 101, 102, 103, 104, 105]
+        );
+    }
+
+    #[test]
+    fn cowshed_error_delegates_codes_and_displays_its_message() {
+        let error = CowshedError::conflict("working tree changed", "retry adoption");
+
+        assert_eq!(error.exit_code(), ErrorCode::Conflict.exit_code());
+        assert_eq!(
+            error.exec_wrapper_exit_code(),
+            ErrorCode::Conflict.exec_wrapper_exit_code()
+        );
+        assert_eq!(error.to_string(), "working tree changed");
     }
 
     #[test]
