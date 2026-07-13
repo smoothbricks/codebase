@@ -49,6 +49,10 @@ import {
   type Utf8ColumnData,
 } from './arrow/flechette.js';
 import {
+  appendVocabularyDictionarySuffix,
+  getVocabularyDictionaryPrefix,
+} from './arrow/vocabularyDictionary.js';
+import {
   calculateUtf8Offsets,
   concatenateFloat64Arrays,
   concatenateNullBitmaps,
@@ -242,6 +246,105 @@ function indexTypeForCount(count: number): IntType {
   if (count <= 255) return uint8();
   if (count <= 65535) return uint16();
   return uint32();
+}
+
+function buildMessageColumn(
+  buffers: AnySpanBuffer[],
+  totalRows: number,
+  dictionaryId?: number,
+): Column<unknown> {
+  let generation = buffers[0]._vocabularyGeneration;
+  for (let index = 1; index < buffers.length; index++) {
+    const candidate = buffers[index]._vocabularyGeneration;
+    if (candidate.generation > generation.generation) generation = candidate;
+  }
+  const prefix = getVocabularyDictionaryPrefix(generation);
+  const indices = new Uint32Array(totalRows);
+  const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
+  let nullCount = 0;
+  let rowOffset = 0;
+  let suffixValues: string[] | undefined;
+  let suffixIndices: Map<string, number> | undefined;
+
+  for (const buffer of buffers) {
+    const headers = buffer._logHeaders;
+    for (let row = 0; row < buffer._writeIndex; row++) {
+      const outputRow = rowOffset + row;
+      const header =
+        (row === 0 && buffer._spanName !== undefined) ||
+        (row === 1 && buffer._terminalMessage !== undefined) ||
+        headers === undefined
+          ? 0
+          : headers[row];
+      let dictionaryIndex: number;
+      if (header !== 0) {
+        const headerEntryType = header & 0xff;
+        if (headerEntryType !== buffer.entry_type[row]) {
+          throw new Error(`Log header entry type ${headerEntryType} does not match row ${row}`);
+        }
+        dictionaryIndex = header >>> 8;
+        if (dictionaryIndex >= buffer._vocabularyGeneration.ids.length) {
+          throw new Error(
+            `Invalid vocabulary dense index ${dictionaryIndex} for generation ${buffer._vocabularyGeneration.generation}`,
+          );
+        }
+      } else {
+        const message = resolveMessage(buffer, row);
+        if (message === undefined) {
+          nullCount++;
+          continue;
+        }
+        const staticIndex = prefix.valueToDenseIndex.get(message);
+        if (staticIndex !== undefined) {
+          dictionaryIndex = staticIndex;
+        } else {
+          let dynamicIndex = suffixIndices?.get(message);
+          if (dynamicIndex === undefined) {
+            suffixValues ??= [];
+            suffixIndices ??= new Map<string, number>();
+            dynamicIndex = suffixValues.length;
+            suffixValues.push(message);
+            suffixIndices.set(message, dynamicIndex);
+          }
+          dictionaryIndex = prefix.length + dynamicIndex;
+        }
+      }
+      indices[outputRow] = dictionaryIndex;
+      nullBitmap[outputRow >>> 3] |= 1 << (outputRow & 7);
+    }
+    rowOffset += buffer._writeIndex;
+  }
+
+  let messageDictionary = prefix.column;
+  if (suffixValues !== undefined) {
+    const encoded = globalUtf8Cache.encodeMany(suffixValues);
+    const suffix = buildColumn(
+      buildData({
+        type: utf8(),
+        offset: 0,
+        length: suffixValues.length,
+        nullCount: 0,
+        valueOffsets: encoded.offsets,
+        data: encoded.data,
+      }),
+    );
+    messageDictionary = appendVocabularyDictionarySuffix(prefix, suffix, suffixValues);
+  }
+
+  return buildColumn(
+    buildData({
+      type:
+        dictionaryId === undefined
+          ? dictionary(utf8(), uint32())
+          : dictionary(utf8(), uint32(), false, dictionaryId),
+      offset: 0,
+      length: totalRows,
+      nullCount,
+      data: indices,
+      nullBitmap: nullCount > 0 ? nullBitmap : undefined,
+      dictionary: messageDictionary,
+    }),
+  );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -613,63 +716,10 @@ function convertBuffersToTable(buffers: AnySpanBuffer[], systemColumnBuilder?: S
     fields.push(...metadataResult.fields);
     vectors.push(...metadataResult.vectors);
 
-    // System attribute column: message (eager category)
-    const messageBuilder = new DictBuilder(globalUtf8Cache);
-    for (const buf of buffers) {
-      for (let row = 0; row < buf._writeIndex; row++) {
-        const message = resolveMessage(buf, row);
-        if (message !== undefined) messageBuilder.add(message);
-      }
-    }
-    let messageDict = messageBuilder.finalize(true);
-    if (messageDict.indexMap.size === 0) {
-      messageBuilder.add('');
-      messageDict = messageBuilder.finalize(true);
-    }
-    const messageIndices = new messageDict.indexArrayCtor(totalRows);
-    const messageNullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
-    let messageNullCount = 0;
-    let messageRowOffset = 0;
-    for (const buf of buffers) {
-      for (let row = 0; row < buf._writeIndex; row++) {
-        const message = resolveMessage(buf, row);
-        if (message === undefined) {
-          messageNullCount++;
-          continue;
-        }
-        const index = messageDict.indexMap.get(message);
-        if (index === undefined) {
-          throw new Error(`Message dictionary index not found for row ${row}`);
-        }
-        const rowIndex = messageRowOffset + row;
-        messageIndices[rowIndex] = index;
-        messageNullBitmap[rowIndex >>> 3] |= 1 << (rowIndex & 7);
-      }
-      messageRowOffset += buf._writeIndex;
-    }
-    const messageDictType = dictionary(utf8(), messageDict.arrowIndexType);
+    // Static vocabulary values form an immutable prefix. Only raw messages
+    // missing from that prefix are interned into a first-seen suffix.
     fields.push('message');
-
-    const messageDictData = buildData({
-      type: utf8(),
-      offset: 0,
-      length: messageDict.indexMap.size,
-      nullCount: 0,
-      valueOffsets: messageDict.offsets,
-      data: messageDict.data,
-    });
-
-    const messageData = buildData({
-      type: messageDictType,
-      offset: 0,
-      length: totalRows,
-      nullCount: messageNullCount,
-      data: messageIndices,
-      nullBitmap: messageNullBitmap,
-      dictionary: buildColumn(messageDictData),
-    });
-
-    vectors.push(buildColumn(messageData));
+    vectors.push(buildMessageColumn(buffers, totalRows));
   }
 
   // Build user attribute vectors
@@ -1070,11 +1120,6 @@ export function convertSpanTreeToArrowTable(
     }
   }
 
-  // System attribute column: message (eager category, not in user schema)
-  // message is always present (eager allocation), so we need to handle it explicitly
-  categoryBuilders.set('message', new DictBuilder(globalUtf8Cache));
-  categoryMaskTransforms.set('message', undefined); // message has no masking
-  categoryOriginalToMasked.set('message', new Map());
 
   // Metadata column dictionaries
   // For traceId (metadata), use DictionaryBuilder (values not pre-encoded)
@@ -1101,16 +1146,6 @@ export function convertSpanTreeToArrowTable(
       const originalToMasked = categoryOriginalToMasked.get(fieldName);
       if (!originalToMasked) {
         throw new Error(`Category originalToMasked map not found for field: ${fieldName}`);
-      }
-      if (fieldName === 'message') {
-        for (let row = 0; row < buffer._writeIndex; row++) {
-          const message = resolveMessage(buffer, row);
-          if (message !== undefined) {
-            originalToMasked.set(message, message);
-            builder.add(message);
-          }
-        }
-        continue;
       }
       const col = getAllocatedStringColumn(buffer, fieldName, remaps);
       if (col) {
@@ -1211,14 +1246,6 @@ export function convertSpanTreeToArrowTable(
     textDicts.set(name, builder.finalize(false)); // not sorted
   }
 
-  // Get messageDict from categoryDicts (message is handled as a category column)
-  // If no messages were written, create an empty dictionary
-  let messageDict = categoryDicts.get('message');
-  if (!messageDict) {
-    const messageBuilder = new DictBuilder(globalUtf8Cache);
-    messageBuilder.add(''); // Single empty string entry
-    messageDict = messageBuilder.finalize(true); // sorted
-  }
 
   // ═══════════════════════════════════════════════════════════════════════════
   // PASS 2: Collect all buffers with non-zero rows
@@ -1372,56 +1399,7 @@ function convertBuffersWithSharedDicts(
   // ═══════════════════════════════════════════════════════════════════════════
 
   // System attribute column: message (at fixed position 10, before user attributes)
-  const messageDict = categoryDicts.get('message');
-  const messageOriginalToMasked = categoryOriginalToMasked.get('message');
-  if (!messageDict || !messageOriginalToMasked) {
-    throw new Error('Message dictionary or mapping not found');
-  }
-  const messageFieldType = dictionary(utf8(), messageDict.arrowIndexType, false, 5);
-  const messageIndices = new messageDict.indexArrayCtor(totalRows);
-  const messageNullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
-  let messageNullCount = 0;
-  let messageRowOffset = 0;
-  for (const buf of buffers) {
-    for (let i = 0; i < buf._writeIndex; i++) {
-      const message = resolveMessage(buf, i);
-      if (message === undefined) {
-        messageNullCount++;
-        continue;
-      }
-      const rowIdx = messageRowOffset + i;
-      const maskedValue = messageOriginalToMasked.get(message) ?? message;
-      const index = messageDict.indexMap.get(maskedValue);
-      if (index === undefined) {
-        throw new Error(`Message dictionary index not found for row ${i}`);
-      }
-      messageIndices[rowIdx] = index;
-      messageNullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
-    }
-    messageRowOffset += buf._writeIndex;
-  }
-  vectors.push(
-    buildColumn(
-      buildData({
-        type: messageFieldType,
-        offset: 0,
-        length: totalRows,
-        nullCount: messageNullCount,
-        data: messageIndices,
-        nullBitmap: messageNullBitmap,
-        dictionary: buildColumn(
-          buildData({
-            type: utf8(),
-            offset: 0,
-            length: messageDict.indexMap.size,
-            nullCount: 0,
-            valueOffsets: messageDict.offsets,
-            data: messageDict.data,
-          }),
-        ),
-      }),
-    ),
-  );
+  vectors.push(buildMessageColumn(buffers, totalRows, 5));
   fields.push('message');
 
   // System attribute column: uint64_value (for buffer metrics - op durations, counts, etc.)

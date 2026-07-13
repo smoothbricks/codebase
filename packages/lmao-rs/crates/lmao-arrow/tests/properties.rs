@@ -1,8 +1,16 @@
 //! Determinism properties for the Arrow conversion layer.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use lmao_arrow::{ColumnDictionary, MockSpan, build_trace_chunk_envelope, convert_span_trees};
+use lmao_arrow::{ColumnDictionary, MockSpan, SpanSource, build_trace_chunk_envelope, convert_span_trees};
+use arrow_array::Array;
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt32Type;
+use lmao_arrow::{
+    VOCABULARY_DENSE_INDICES, VOCABULARY_IDS, VOCABULARY_VALUES,
+    static_vocabulary_dictionary,
+};
 use lmao_core::{SpanIdentity, TraceId};
 use proptest::prelude::*;
 
@@ -58,7 +66,7 @@ fn build_tree(n: usize, trace: &str) -> MockSpan {
     let row = |i: usize| {
         (
             1_700_000_000_000_000_000 + i as i64,
-            5u8 + (i % 4) as u8, // info/debug/warn/error
+            [8u32, 7, 9, 10][i % 4], // info/debug/warn/error
             Some(templates[i % templates.len()].to_string()),
         )
     };
@@ -95,7 +103,7 @@ fn build_tree(n: usize, trace: &str) -> MockSpan {
             &mut overflow
         };
         target.timestamps.push(ts);
-        target.entry_types.push(et);
+        target.entry_types.push(et as u8);
         target.messages.push(msg);
     }
     if !overflow.timestamps.is_empty() {
@@ -113,6 +121,272 @@ fn ipc_bytes(batch: &arrow_array::RecordBatch) -> Vec<u8> {
         w.finish().unwrap();
     }
     out
+}
+
+const DENSE_ZERO_LOG_ID: u32 = 15_317_875;
+const OTHER_STATIC_LOG_ID: u32 = 9_474_871;
+
+fn static_ordinal_values() -> Vec<&'static str> {
+    VOCABULARY_DENSE_INDICES
+        .iter()
+        .map(|dense| VOCABULARY_VALUES[*dense as usize])
+        .collect()
+}
+
+fn static_ordinal_for_value(value: &str) -> u32 {
+    VOCABULARY_DENSE_INDICES
+        .iter()
+        .position(|dense| VOCABULARY_VALUES[*dense as usize] == value)
+        .expect("fixture value is registered") as u32
+}
+
+fn packed(entry_type: u8, vocabulary_id: u32) -> u32 {
+    (vocabulary_id << 8) | u32::from(entry_type)
+}
+
+#[derive(Debug)]
+struct DictionarySpan {
+    identity: Arc<SpanIdentity>,
+    timestamps: Vec<i64>,
+    packed_headers: Vec<u32>,
+    messages: Vec<Option<String>>,
+    overflow: Option<Box<DictionarySpan>>,
+    children: Vec<DictionarySpan>,
+}
+
+impl SpanSource for DictionarySpan {
+    fn identity(&self) -> &SpanIdentity {
+        &self.identity
+    }
+
+    fn row_count(&self) -> usize {
+        self.timestamps.len()
+    }
+
+    fn timestamp(&self, row: usize) -> i64 {
+        self.timestamps[row]
+    }
+
+    fn packed_header(&self, row: usize) -> u32 {
+        self.packed_headers[row]
+    }
+
+    fn dynamic_message(&self, row: usize) -> Option<&str> {
+        self.messages.get(row).and_then(|message| message.as_deref())
+    }
+
+    fn line_number(&self, _row: usize) -> u32 {
+        0
+    }
+
+    fn overflow(&self) -> Option<&Self> {
+        self.overflow.as_deref()
+    }
+
+    fn children(&self) -> &[Self] {
+        &self.children
+    }
+}
+
+fn dictionary_span(
+    trace: &str,
+    span_id: u32,
+    rows: &[(i64, u32, Option<String>)],
+) -> DictionarySpan {
+    DictionarySpan {
+        identity: Arc::new(SpanIdentity {
+            thread_id: 0xABCD,
+            span_id,
+            trace_id: TraceId::new(trace).unwrap(),
+            parent: None,
+        }),
+        timestamps: rows.iter().map(|row| row.0).collect(),
+        packed_headers: rows.iter().map(|row| row.1).collect(),
+        messages: rows.iter().map(|row| row.2.clone()).collect(),
+        overflow: None,
+        children: vec![],
+    }
+}
+
+fn message_dictionary(batch: &arrow_array::RecordBatch) -> (&arrow_array::UInt32Array, &arrow_array::StringArray) {
+    let message = batch
+        .column(7)
+        .as_dictionary::<UInt32Type>();
+    (message.keys(), message.values().as_string::<i32>())
+}
+
+#[test]
+fn message_dictionary_reuses_static_prefix_and_appends_first_seen_dynamic_suffix() {
+    let static_only = dictionary_span(
+        "static-only",
+        1,
+        &[
+            (1, packed(8, DENSE_ZERO_LOG_ID), None),
+            (2, packed(8, OTHER_STATIC_LOG_ID), None),
+            (3, 2, None),
+        ],
+    );
+    let static_batch = convert_span_trees(&[static_only]).unwrap();
+    let (static_keys, static_values) = message_dictionary(&static_batch);
+    assert_eq!(static_values.len(), VOCABULARY_VALUES.len(), "static-only rows add no suffix");
+    assert!(
+        std::ptr::eq(static_values, static_vocabulary_dictionary().as_ref()),
+        "static-only conversion reuses the cached dictionary allocation",
+    );
+    assert_eq!(
+        (0..static_values.len()).map(|index| static_values.value(index)).collect::<Vec<_>>(),
+        static_ordinal_values(),
+    );
+    assert_eq!(
+        static_keys.value(0),
+        VOCABULARY_IDS.binary_search(&DENSE_ZERO_LOG_ID).unwrap() as u32,
+    );
+    assert_eq!(
+        static_keys.value(1),
+        VOCABULARY_IDS.binary_search(&OTHER_STATIC_LOG_ID).unwrap() as u32,
+    );
+    assert!(static_keys.is_null(2));
+
+    let mut root = dictionary_span(
+        "mixed-tree",
+        10,
+        &[
+            (10, packed(8, OTHER_STATIC_LOG_ID), None),
+            (11, 8, Some("dynamic-z".into())),
+        ],
+    );
+    root.overflow = Some(Box::new(dictionary_span(
+        "mixed-tree",
+        10,
+        &[
+            (12, 8, Some("dynamic-a".into())),
+            (13, 8, Some("dynamic-z".into())),
+            (14, 2, None),
+        ],
+    )));
+    let mut child = dictionary_span(
+        "mixed-tree",
+        11,
+        &[
+            (15, packed(8, DENSE_ZERO_LOG_ID), None),
+            (16, 8, Some("dynamic-child".into())),
+        ],
+    );
+    child.identity = Arc::new(SpanIdentity {
+        thread_id: 0xABCD,
+        span_id: 11,
+        trace_id: root.identity.trace_id.clone(),
+        parent: Some(root.identity.clone()),
+    });
+    root.children.push(child);
+
+    let mixed_batch = convert_span_trees(&[root]).unwrap();
+    let (keys, values) = message_dictionary(&mixed_batch);
+    assert_eq!(
+        (VOCABULARY_VALUES.len()..values.len()).map(|index| values.value(index)).collect::<Vec<_>>(),
+        ["dynamic-z", "dynamic-a", "dynamic-child"],
+        "dynamic suffix follows first encounter across overflow and child rows",
+    );
+    let suffix = VOCABULARY_VALUES.len() as u32;
+    let other_ordinal = VOCABULARY_IDS.binary_search(&OTHER_STATIC_LOG_ID).unwrap() as u32;
+    let zero_ordinal = VOCABULARY_IDS.binary_search(&DENSE_ZERO_LOG_ID).unwrap() as u32;
+    assert_eq!(
+        (0..keys.len()).map(|row| (!keys.is_null(row)).then(|| keys.value(row))).collect::<Vec<_>>(),
+        [
+            Some(other_ordinal),
+            Some(suffix),
+            Some(suffix + 1),
+            Some(suffix),
+            None,
+            Some(zero_ordinal),
+            Some(suffix + 2),
+        ],
+    );
+    assert_eq!(
+        (0..keys.len()).map(|row| (!keys.is_null(row)).then(|| values.value(keys.value(row) as usize))).collect::<Vec<_>>(),
+        [
+            Some("literal braces: {ok} for {region}"),
+            Some("dynamic-z"),
+            Some("dynamic-a"),
+            Some("dynamic-z"),
+            None,
+            Some("No items to validate"),
+            Some("dynamic-child"),
+        ],
+    );
+}
+
+fn dictionary_row_strategy() -> impl Strategy<Value = (u32, Option<String>, Option<String>)> {
+    prop_oneof![
+        Just((2, None, None)),
+        Just((packed(8, DENSE_ZERO_LOG_ID), None, Some("No items to validate".into()))),
+        Just((packed(8, OTHER_STATIC_LOG_ID), None, Some("literal braces: {ok} for {region}".into()))),
+        "dynamic-[a-z]{0,8}".prop_map(|message| (8, Some(message.clone()), Some(message))),
+    ]
+}
+
+proptest! {
+    #[test]
+    fn randomized_message_rows_preserve_exact_values_and_canonical_indices(
+        rows in prop::collection::vec(dictionary_row_strategy(), 0..100),
+        root_rows in 0usize..100,
+        overflow_rows in 0usize..100,
+    ) {
+        let root_end = root_rows.min(rows.len());
+        let overflow_end = (root_end + overflow_rows).min(rows.len());
+        let to_source_rows = |slice: &[(u32, Option<String>, Option<String>)], base: i64| {
+            slice.iter().enumerate().map(|(index, (header, raw, _))| {
+                (base + index as i64, *header, raw.clone())
+            }).collect::<Vec<_>>()
+        };
+        let mut root = dictionary_span("property-tree", 1, &to_source_rows(&rows[..root_end], 0));
+        if overflow_end > root_end {
+            root.overflow = Some(Box::new(dictionary_span(
+                "property-tree",
+                1,
+                &to_source_rows(&rows[root_end..overflow_end], root_end as i64),
+            )));
+        }
+        if overflow_end < rows.len() {
+            let mut child = dictionary_span(
+                "property-tree",
+                2,
+                &to_source_rows(&rows[overflow_end..], overflow_end as i64),
+            );
+            child.identity = Arc::new(SpanIdentity {
+                thread_id: 0xABCD,
+                span_id: 2,
+                trace_id: root.identity.trace_id.clone(),
+                parent: Some(root.identity.clone()),
+            });
+            root.children.push(child);
+        }
+
+        let batch = convert_span_trees(&[root]).unwrap();
+        let (keys, values) = message_dictionary(&batch);
+        prop_assert_eq!(batch.num_rows(), rows.len());
+        let mut seen = HashSet::new();
+        let expected_suffix = rows.iter().filter_map(|(_, raw, _)| raw.as_deref()).filter(|value| {
+            static_vocabulary_dictionary().iter().flatten().all(|static_value| static_value != *value)
+                && seen.insert(*value)
+        }).collect::<Vec<_>>();
+        prop_assert_eq!(values.len(), VOCABULARY_VALUES.len() + expected_suffix.len());
+        for (offset, expected) in expected_suffix.iter().enumerate() {
+            prop_assert_eq!(values.value(VOCABULARY_VALUES.len() + offset), *expected);
+        }
+        for (row, (_, _, expected)) in rows.iter().enumerate() {
+            match expected {
+                None => prop_assert!(keys.is_null(row)),
+                Some(expected) => {
+                    prop_assert!(!keys.is_null(row));
+                    prop_assert_eq!(values.value(keys.value(row) as usize), expected);
+                    if expected == "No items to validate" {
+                        prop_assert_eq!(keys.value(row), static_ordinal_for_value(expected));
+                    }
+                }
+            }
+        }
+    }
 }
 
 proptest! {
@@ -137,7 +411,7 @@ proptest! {
         let mut expected: Vec<(i64, u8)> = Vec::new();
         walk_pre_order(std::slice::from_ref(&tree), &mut |b: &MockSpan| {
             for row in 0..b.row_count() {
-                expected.push((b.timestamp(row), b.entry_type(row)));
+                expected.push((b.timestamp(row), b.packed_header(row) as u8));
             }
         });
 

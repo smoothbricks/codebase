@@ -36,7 +36,13 @@ fn real_root(trace: &str, span_id: u32, logs: usize) -> SpanBuffer {
     buf.set_name("root-op");
     buf.set_callsite("src/fixture.rs", 41);
     for i in 0..logs {
-        buf.append_msg(EntryType::Info, "log {i}", 100 + i as u32, &anchor, &clock);
+        buf.append_msg(
+            EntryType::Info,
+            "log {i}",
+            100 + i as u32,
+            &anchor,
+            &clock,
+        );
     }
     buf.end_ok(&anchor, &clock);
 
@@ -82,7 +88,7 @@ fn converts_core_span_buffers_with_overflow() {
     assert!(msg.keys().is_null(1), "completion row has no template");
     let lines = batch.column(8).as_primitive::<UInt32Type>();
     assert_eq!(lines.value(0), 41, "callsite line on row 0");
-    assert_eq!(lines.value(2), 100, "append_msg line on first log row");
+    assert_eq!(lines.value(2), 100, "dynamic append line on first log row");
     // Children were walked: the child span's name appears after the root's rows.
     let child_name_key = (0..batch.num_rows()).find(|r| {
         !msg.keys().is_null(*r) && msg_values.value(msg.keys().value(*r) as usize) == "child-op"
