@@ -6,5 +6,6 @@ const { defineOp } = defineOpContext({
 
 export const typedOp = defineOp('native-fixture', async (ctx, value: number) => {
   ctx.log.info('native fixture log');
+  ctx.log.debug('json-sensitive <>& \u2028\u2029');
   return ctx.ok(value + 1);
 });

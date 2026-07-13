@@ -65,7 +65,7 @@ type logInline struct {
 	logExpr    *shimast.Node // the `ctx.log` expression
 	level      string        // info/debug/...
 	message    *shimast.Node
-	templateID uint16        // nonzero only for checker-proved Op-local literals
+	templateID globalVocabularyID // nonzero only for checker-proved registered literals
 	line       int           // source line of the log call (spec 01o §6, folded in)
 	lineArg    *shimast.Node // explicit .line(N) argument if present in source
 	writes     []tagWrite    // chained attribute writes in execution order
@@ -126,12 +126,16 @@ func (t *fileTransformer) findLogInline(call *shimast.CallExpression) (*logInlin
 		if len(links[0].args) != 1 {
 			return nil, false
 		}
+		templateID := t.staticLogIDs[links[0].node]
+		if templateID == 0 {
+			return nil, false // preserve permitted raw debug/trace calls byte-for-byte
+		}
 
 		in := &logInline{
 			logExpr:    next,
 			level:      links[0].name,
 			message:    links[0].args[0],
-			templateID: t.logTemplateIDs[links[0].node],
+			templateID: templateID,
 			line:       t.lineOf(links[0].node.AsNode()),
 			schema:     extractLogSchema(t.checker, recvType),
 		}
@@ -223,6 +227,10 @@ func (t *fileTransformer) applyLogInlines(inlines []logInline) {
 		logger := ident("$$l")
 		buf := ident("$$b")
 		idx := ident("$$i")
+		vocabularyOperand := func() *shimast.Node {
+			if in.templateID == 0 { return num(0) }
+			return t.staticVocabularyOperand(in.templateID)
+		}
 		// Overflow happy-path inline: one compare instead of a method call;
 		// the (rare) overflow path still runs the runtime's _checkOverflow,
 		// which owns buffer switching, capacity tuning, and scope prefill.
@@ -239,15 +247,19 @@ func (t *fileTransformer) applyLogInlines(inlines []logInline) {
 			overflowCheck,
 			constDecl(buf, propAccess(logger, "_buffer")),
 			constDecl(idx, callExpr(propAccess(propAccess(buf, "_traceRoot"), "writeLogEntry"),
-				[]*shimast.Node{buf, num(logEntryTypes[in.level])})),
+				[]*shimast.Node{buf, num(logEntryTypes[in.level]), vocabularyOperand()})),
 			binaryStmt(propAccess(logger, "_writeIndex"), shimast.KindEqualsToken, idx),
 		}
 		if in.templateID != 0 {
+			packed := factory.NewBinaryExpression(nil,
+				factory.NewParenthesizedExpression(factory.NewBinaryExpression(nil,
+					factory.NewParenthesizedExpression(factory.NewBinaryExpression(nil, vocabularyOperand(), nil,
+						factory.NewToken(shimast.KindLessThanLessThanToken), num(8))), nil,
+					factory.NewToken(shimast.KindBarToken), num(logEntryTypes[in.level]))), nil,
+				factory.NewToken(shimast.KindGreaterThanGreaterThanGreaterThanToken), num(0))
 			stmts = append(stmts, binaryStmt(
-				factory.NewElementAccessExpression(propAccess(buf, "_messageTemplateIds"), nil, idx, shimast.NodeFlagsNone),
-				shimast.KindEqualsToken,
-				num(int(in.templateID)),
-			))
+				factory.NewElementAccessExpression(propAccess(buf, "_logHeaders"), nil, idx, shimast.NodeFlagsNone),
+				shimast.KindEqualsToken, packed))
 		} else {
 			stmts = append(stmts, guardedRawWrite(buf, idx, "message", in.message))
 		}
