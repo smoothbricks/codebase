@@ -135,8 +135,13 @@ impl<'t> SpanContext<'t> {
         capacity: usize,
         name: &str,
     ) -> Self {
-        let mut buf = SpanBuffer::start(identity, capacity, &trace.anchor, trace.clock());
-        buf.set_name(SharedStr::Owned(name.into()));
+        let buf = SpanBuffer::start_dynamic(
+            identity,
+            capacity,
+            SharedStr::Owned(name.into()),
+            &trace.anchor,
+            trace.clock(),
+        );
         Self { trace, buf }
     }
 
@@ -151,11 +156,15 @@ impl<'t> SpanContext<'t> {
     pub fn log(&mut self, level: EntryType, template: &'static str, line: u32) -> usize {
         debug_assert!(matches!(
             level,
-            EntryType::Info | EntryType::Debug | EntryType::Warn | EntryType::Error
+            EntryType::Trace
+                | EntryType::Debug
+                | EntryType::Info
+                | EntryType::Warn
+                | EntryType::Error
         ));
-        self.buf.append_msg(
+        self.buf.append_dynamic(
             level,
-            template,
+            Some(SharedStr::Static(template)),
             line,
             &self.trace.anchor,
             self.trace.clock(),
@@ -166,7 +175,7 @@ impl<'t> SpanContext<'t> {
     #[inline]
     pub fn append(&mut self, entry: EntryType) -> usize {
         self.buf
-            .append(entry, &self.trace.anchor, self.trace.clock())
+            .append_dynamic(entry, None, 0, &self.trace.anchor, self.trace.clock())
     }
 
     /// The buffer being written — schema wrappers use this plus the row indices
@@ -237,8 +246,8 @@ mod tests {
         });
         assert_eq!(out, Ok(1));
         assert_eq!(buf.entry_type_at(1), Some(EntryType::SpanOk));
-        assert_eq!(buf.name(), Some("op-a"));
-        assert_eq!(buf.message_at(2), Some("step {n}"));
+        assert_eq!(buf.dynamic_name(), Some("op-a"));
+        assert_eq!(buf.dynamic_message_at(2), Some("step {n}"));
         assert_eq!(buf.line_at(2), 42);
 
         let (out, buf) = t.span("op-b", None, 8, |_| Err::<(), _>("boom"));

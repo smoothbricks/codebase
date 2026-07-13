@@ -33,7 +33,15 @@ fn bench_span_start(c: &mut Criterion) {
         parent: None,
     });
     c.bench_function("span_start_cap64", |b| {
-        b.iter(|| black_box(SpanBuffer::start(identity.clone(), 64, &anchor, &clock)))
+        b.iter(|| {
+            black_box(SpanBuffer::start_dynamic(
+                identity.clone(),
+                64,
+                "span".into(),
+                &anchor,
+                &clock,
+            ))
+        })
     });
 }
 
