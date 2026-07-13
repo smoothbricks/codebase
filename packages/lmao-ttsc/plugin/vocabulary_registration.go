@@ -7,13 +7,13 @@ import (
 
 const vocabularyRegistrationSpecifier = "@smoothbricks/lmao/vocabulary/register/v1"
 
-func manifestEntriesForFile(manifest vocabularyManifest, keys map[vocabularyKey]struct{}) []vocabularyManifestEntry {
+func catalogEntriesForFile(catalog vocabularyCatalog, keys map[vocabularyKey]struct{}) []vocabularyCatalogEntry {
 	if len(keys) == 0 {
 		return nil
 	}
-	entries := make([]vocabularyManifestEntry, 0, len(keys))
-	for _, entry := range manifest.Entries {
-		key, err := keyFromManifestEntry(entry)
+	entries := make([]vocabularyCatalogEntry, 0, len(keys))
+	for _, entry := range catalog.Entries {
+		key, err := keyFromCatalogEntry(entry)
 		if err != nil {
 			panic(err)
 		}
@@ -22,12 +22,12 @@ func manifestEntriesForFile(manifest vocabularyManifest, keys map[vocabularyKey]
 		}
 	}
 	if len(entries) != len(keys) {
-		panic("validated vocabulary manifest omitted a source-file record")
+		panic("canonical vocabulary catalog omitted a source-file record")
 	}
 	return entries
 }
 
-func vocabularyOrdinals(entries []vocabularyManifestEntry) map[globalVocabularyID]int {
+func vocabularyOrdinals(entries []vocabularyCatalogEntry) map[globalVocabularyID]int {
 	ordinals := make(map[globalVocabularyID]int, len(entries))
 	for ordinal, entry := range entries {
 		ordinals[globalVocabularyID(entry.ID)] = ordinal
@@ -63,7 +63,7 @@ func typedArray(constructor string, values *shimast.Node) *shimast.Node {
 	return factory.NewNewExpression(ident(constructor), nil, factory.NewNodeList([]*shimast.Node{values}))
 }
 
-func vocabularyFragmentNode(entries []vocabularyManifestEntry) *shimast.Node {
+func vocabularyFragmentNode(entries []vocabularyCatalogEntry) *shimast.Node {
 	fragment, err := fragmentFromEntries(entries)
 	if err != nil {
 		panic(err)
@@ -80,7 +80,7 @@ func vocabularyFragmentNode(entries []vocabularyManifestEntry) *shimast.Node {
 	return factory.NewObjectLiteralExpression(factory.NewNodeList(properties), true)
 }
 
-func vocabularyRegistrationStatements(ec *shimprinter.EmitContext, entries []vocabularyManifestEntry) (*shimast.Node, []*shimast.Node) {
+func vocabularyRegistrationStatements(ec *shimprinter.EmitContext, entries []vocabularyCatalogEntry) (*shimast.Node, []*shimast.Node) {
 	if len(entries) == 0 {
 		return nil, nil
 	}
