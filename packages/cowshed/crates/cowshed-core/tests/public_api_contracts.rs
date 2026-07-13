@@ -35,8 +35,13 @@ fn trace() -> TraceContext {
 
 fn stream(path: &str, bytes: u64, text: &str) -> StreamInfo {
     StreamInfo {
-        path: WorkspacePath::new(path).expect("workspace path"),
+        storage: OutputStorage::Captured {
+            artifact: ProtectedOutput::File {
+                path: WorkspacePath::new(path).expect("workspace path"),
+            },
+        },
         bytes,
+        sha256: Sha256Digest::from_bytes([0; 32]),
         summary: OutputSummary {
             version: 1,
             text: text.into(),
@@ -233,8 +238,8 @@ fn nested_job_info_shape_is_byte_safe_and_frozen() {
             "started": "2026-07-11T12:34:56Z",
             "durationMs": 1250,
             "exit": {"kind":"signaled","signal":15,"coreDumped":false},
-            "stdout": {"path":".cowshed/job/7/out","bytes":3,"summary":{"version":1,"text":"ok\n","truncated":false}},
-            "stderr": {"path":".cowshed/job/7/err","bytes":0,"summary":{"version":1,"text":"","truncated":false}},
+            "stdout": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/out"}},"bytes":3,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"ok\n","truncated":false}},
+            "stderr": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/err"}},"bytes":0,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"","truncated":false}},
             "trace": {"traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"00f067aa0ba902b7"},
             "stdin": {"kind":"workspaceFile","bytes":12,"workspacePath":"fixtures/input.bin","complete":true}
         })
@@ -258,8 +263,8 @@ fn output_limit_is_an_explicit_terminal_projection() {
         "cwd": "packages/app",
         "started": "2026-07-11T12:34:56Z",
         "durationMs": 50,
-        "stdout": {"path":".cowshed/job/8/out","bytes":1024,"summary":{"version":1,"text":"bounded","truncated":true}},
-        "stderr": {"path":".cowshed/job/8/err","bytes":1,"summary":{"version":1,"text":"","truncated":false}},
+        "stdout": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/8/out"}},"bytes":1024,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"bounded","truncated":true}},
+        "stderr": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/8/err"}},"bytes":1,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"","truncated":false}},
         "trace": {"traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"00f067aa0ba902b7"},
         "outputLimit": {"limitBytes":1024,"crossingBytes":1025},
         "stdin": {"kind":"empty","bytes":0,"complete":true}
@@ -290,8 +295,8 @@ fn exec_record_enforces_terminal_invariants_both_directions() {
         "started": "2026-07-11T12:34:56Z",
         "durationMs": 3,
         "exit": {"kind":"exited","code":0},
-        "stdout": {"path":".cowshed/job/9/out","bytes":0,"summary":{"version":1,"text":"","truncated":false}},
-        "stderr": {"path":".cowshed/job/9/err","bytes":0,"summary":{"version":1,"text":"","truncated":false}},
+        "stdout": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/9/out"}},"bytes":0,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"","truncated":false}},
+        "stderr": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/9/err"}},"bytes":0,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"","truncated":false}},
         "stdin": {"kind":"empty","bytes":0,"complete":true}
     });
     let record: ExecRecord = serde_json::from_value(value.clone()).unwrap();
