@@ -1246,11 +1246,15 @@ fn undo_image(
     current: &WorkspaceRef,
     replacement: &WorkspaceRef,
 ) -> Result<PathBuf, ApfsStorageError> {
-    let label = CheckpointLabel::new(format!(
-        "{PRE_RESTORE_PREFIX}{}",
-        replacement.incarnation().as_str()
-    ))?;
-    checkpoint_image(config, current, &label)
+    Ok(layout(config, current.repo())?
+        .project()
+        .checkpoints
+        .join(current.name().as_str())
+        .join(format!(
+            "{PRE_RESTORE_PREFIX}{}.{}",
+            replacement.incarnation().as_str(),
+            current.format().extension()
+        )))
 }
 
 fn retired_image_path(

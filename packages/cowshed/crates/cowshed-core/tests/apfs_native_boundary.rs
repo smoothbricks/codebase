@@ -130,6 +130,25 @@ impl FailingDetachRunner {
 impl CommandRunner for FailingDetachRunner {
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if request
+            .args
+            .first()
+            .is_some_and(|argument| argument == "info")
+        {
+            let device = request
+                .args
+                .last()
+                .expect("device")
+                .to_string_lossy()
+                .trim_start_matches("/dev/")
+                .to_owned();
+            return Ok(CommandOutput::success(
+                format!(
+                    "<?xml version=\"1.0\"?><plist><dict><key>DeviceIdentifier</key><string>{device}</string><key>VolumeName</key><string>cowshed.acme--widget.main</string></dict></plist>"
+                )
+                .into_bytes(),
+            ));
+        }
         let is_detach = request
             .args
             .first()
@@ -1050,6 +1069,7 @@ fn kernel_mount_facts_survive_host_restart_and_prevent_detached_compaction() {
     drop(first);
 
     let runner = RecordingRunner::default();
+    runner.set_volume_name("cowshed.acme--widget.main");
     let restarted = MacOsApfsExecutionHost::with_mount_source(
         runner.clone(),
         fixture.config(),
@@ -1077,6 +1097,59 @@ fn kernel_mount_facts_survive_host_restart_and_prevent_detached_compaction() {
                 .first()
                 .is_some_and(|argument| argument == "info")
     }));
+    restarted
+        .detach_mounted(&workspace(ImageFormat::Sparse), false)
+        .expect("restart-safe detach");
+    let detach = runner.requests().last().cloned().expect("detach request");
+    assert_eq!(detach.program, Path::new("/usr/bin/hdiutil"));
+    assert_eq!(
+        detach.args,
+        [
+            std::ffi::OsString::from("detach"),
+            std::ffi::OsString::from("-quiet"),
+            fixture.config().main_mount.into_os_string(),
+        ]
+    );
+}
+
+#[test]
+fn restart_safe_detach_honors_force_only_after_normal_detach_fails() {
+    let fixture = Fixture::new("kernel-restart-force");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    create_image(canonical.image(), ImageFormat::Sparse);
+    let source = FakeKernelMountSource::default();
+    source.set(vec![KernelMountSnapshot::new(
+        43,
+        fixture.config().main_mount,
+        "/dev/disk10s1",
+        true,
+        true,
+    )]);
+    let runner = FailingDetachRunner::new(2);
+    let host = MacOsApfsExecutionHost::with_mount_source(
+        runner.clone(),
+        fixture.config(),
+        WorkspaceMetadataTemplate {
+            project_root: fixture.root.join("project"),
+            base_commit: "0123456789abcdef".to_owned(),
+            created_at: "2026-07-13T00:00:00Z".to_owned(),
+            created_trace: "kernel-restart-force".to_owned(),
+            grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
+                .expect("grants"),
+        },
+        source,
+    )
+    .expect("host");
+
+    host.detach_mounted(&workspace(ImageFormat::Sparse), false)
+        .expect_err("non-forced restart detach must not escalate");
+    host.detach_mounted(&workspace(ImageFormat::Sparse), true)
+        .expect("forced restart detach");
+    assert_eq!(
+        *runner.detach_attempts.lock().expect("detach attempts"),
+        [false, false, true]
+    );
 }
 
 #[test]
@@ -1121,6 +1194,14 @@ fn canonical_path_with_unrelated_volume_fails_closed_without_detaching() {
         error
             .to_string()
             .contains("refusing to heal unrelated mount")
+    );
+    let error = host
+        .detach_mounted(&workspace(ImageFormat::Sparse), true)
+        .expect_err("restart-safe detach must reject an impostor source");
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to detach unrelated mount")
     );
     assert!(
         runner.requests().iter().all(|request| request
@@ -1171,7 +1252,11 @@ fn wrong_kernel_mount_flags_are_detected_and_healed_by_mountpoint() {
     host.heal_mount(&workspace, &fixture.config().main_mount)
         .expect("heal by mountpoint");
     let requests = runner.requests();
-    assert_eq!(requests.len(), 3, "two identity reads and one detach");
+    assert_eq!(
+        requests.len(),
+        4,
+        "three source-bound identity reads and one detach"
+    );
     let detach = requests.last().expect("detach request");
     assert_eq!(detach.program, Path::new("/usr/bin/hdiutil"));
     assert_eq!(
@@ -1225,6 +1310,157 @@ fn interrupted_restore_image_publication(
     host.restore_swap(&staged, &canonical, &undo)
         .expect_err("injected image publication crash");
     (host, canonical, staged, undo, replacement)
+}
+
+#[test]
+fn stateless_recovery_completes_image_before_sidecar_publication_after_restart() {
+    let fixture = Fixture::new("publish-image-boundary");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    let staged = layout
+        .project()
+        .project_root
+        .join(".staging/main-00000000000000000000000000000001.sparseimage");
+    create_image(&staged, ImageFormat::Sparse);
+    std::fs::write(&staged, b"published generation").expect("staged bytes");
+    let host = native_host(&fixture, RecordingRunner::default());
+    host.set_restore_failpoint(RestoreFailpoint::AfterCanonicalImageRename);
+    host.publish_image(&staged, canonical.image())
+        .expect_err("crash after image rename");
+    assert!(canonical.image().exists());
+    assert!(!sidecar_path(canonical.image()).exists());
+    assert!(sidecar_path(&staged).exists());
+
+    drop(host);
+    let restarted = native_host(&fixture, RecordingRunner::default());
+    restarted
+        .recover_pending(&fixture.config())
+        .expect("complete sidecar publication");
+    assert_eq!(
+        std::fs::read(canonical.image()).expect("canonical"),
+        b"published generation"
+    );
+    DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("canonical metadata");
+    assert!(!sidecar_path(&staged).exists());
+    restarted
+        .recover_pending(&fixture.config())
+        .expect("repeated recovery is idempotent");
+}
+
+#[test]
+fn recovery_ignores_unscoped_and_non_internal_restore_lookalikes() {
+    let fixture = Fixture::new("restore-lookalikes");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    create_image(canonical.image(), ImageFormat::Sparse);
+    std::fs::write(canonical.image(), b"live generation").expect("canonical");
+
+    for root in [
+        fixture.root.join("caches"),
+        fixture.root.join("mnt"),
+        fixture.root.join("telemetry"),
+    ] {
+        std::fs::create_dir_all(&root).expect("lookalike root");
+        std::fs::write(
+            root.join("pre-restore-00000000000000000000000000000002.sparseimage.grants.json"),
+            b"not metadata",
+        )
+        .expect("lookalike");
+    }
+    let invalid_checkpoints = [
+        "pre-restore-user.sparseimage",
+        "pre-restore-0000000000000000000000000000000.sparseimage",
+        "pre-restore-gggggggggggggggggggggggggggggggg.sparseimage",
+    ]
+    .map(|name| layout.project().checkpoints.join("main").join(name));
+    for checkpoint in &invalid_checkpoints {
+        create_image(checkpoint, ImageFormat::Sparse);
+        std::fs::write(checkpoint, b"user checkpoint").expect("checkpoint");
+    }
+
+    let session = WorkspaceName::new("session-a").expect("session");
+    let session_canonical = layout
+        .session_image(&session, ImageFormat::Sparse)
+        .expect("session canonical");
+    create_image(session_canonical.image(), ImageFormat::Sparse);
+    std::fs::write(session_canonical.image(), b"live session").expect("session");
+    let mut session_metadata = metadata(ImageFormat::Sparse);
+    session_metadata.workspace = session.clone();
+    session_metadata
+        .write_for_image(session_canonical.image())
+        .expect("session metadata");
+    let mismatched_undo = layout
+        .project()
+        .checkpoints
+        .join("main/pre-restore-00000000000000000000000000000002.sparseimage");
+    create_image(&mismatched_undo, ImageFormat::Sparse);
+    std::fs::write(&mismatched_undo, b"unrelated undo").expect("undo");
+    session_metadata
+        .write_for_image(&mismatched_undo)
+        .expect("mismatched undo metadata");
+
+    let host = native_host(&fixture, RecordingRunner::default());
+    host.recover_pending(&fixture.config())
+        .expect("ignore lookalikes");
+    assert_eq!(
+        std::fs::read(canonical.image()).expect("canonical"),
+        b"live generation"
+    );
+    assert!(
+        invalid_checkpoints
+            .iter()
+            .all(|checkpoint| checkpoint.exists())
+    );
+    assert_eq!(
+        std::fs::read(session_canonical.image()).expect("session"),
+        b"live session"
+    );
+    assert!(mismatched_undo.exists());
+}
+
+#[test]
+fn recovery_rejects_a_non_directory_store_root_and_ignores_file_children() {
+    let file_root = Fixture::new("recovery-file-root");
+    let file_config = file_root.config();
+    std::fs::remove_dir_all(&file_config.store_root).expect("remove store directory");
+    std::fs::write(&file_config.store_root, b"not a directory").expect("file store root");
+    assert!(
+        native_host(&file_root, RecordingRunner::default())
+            .recover_pending(&file_config)
+            .is_err(),
+        "a non-directory store root is corruption, not an empty store"
+    );
+
+    let child_file = Fixture::new("recovery-file-child");
+    let child_config = child_file.config();
+    std::fs::create_dir_all(&child_config.store_root).expect("store root");
+    std::fs::write(child_config.store_root.join("not-a-project"), b"file").expect("child file");
+    native_host(&child_file, RecordingRunner::default())
+        .recover_pending(&child_config)
+        .expect("non-directory children are not project roots");
+}
+
+#[test]
+fn recovery_never_publishes_metadata_without_its_staged_image() {
+    let fixture = Fixture::new("sidecar-without-image");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    let staged = layout
+        .project()
+        .project_root
+        .join(".staging/main-00000000000000000000000000000002.sparseimage");
+    std::fs::create_dir_all(staged.parent().expect("staging parent")).expect("staging");
+    let mut next = metadata(ImageFormat::Sparse);
+    next.workspace_incarnation =
+        WorkspaceIncarnation::new("00000000000000000000000000000002").expect("incarnation");
+    next.write_for_image(&staged)
+        .expect("orphan staging metadata");
+
+    native_host(&fixture, RecordingRunner::default())
+        .recover_pending(&fixture.config())
+        .expect("recovery");
+    assert!(sidecar_path(&staged).exists());
+    assert!(!sidecar_path(canonical.image()).exists());
 }
 
 #[test]

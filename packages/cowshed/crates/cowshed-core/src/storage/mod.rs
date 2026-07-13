@@ -28,6 +28,7 @@ impl CheckpointLabel {
         let value = value.into();
         let bytes = value.as_bytes();
         let valid = (1..=128).contains(&bytes.len())
+            && !value.starts_with("pre-restore-")
             && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
             && bytes.iter().all(|byte| {
                 byte.is_ascii_lowercase()
@@ -449,7 +450,17 @@ mod tests {
                 label
             );
         }
-        for invalid in ["", ".", "..", "Upper", "-leading", "slash/name", "a b"] {
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "Upper",
+            "-leading",
+            "slash/name",
+            "a b",
+            "pre-restore-user",
+            "pre-restore-00000000000000000000000000000002",
+        ] {
             assert!(
                 CheckpointLabel::new(invalid).is_err(),
                 "accepted {invalid:?}"
