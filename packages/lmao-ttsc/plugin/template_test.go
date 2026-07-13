@@ -246,6 +246,9 @@ func TestSpecializedLiteralLogInlineUsesRegisteredDenseOperandForEveryLevel(t *t
 		t.Run(level, func(t *testing.T) {
 			block := emittedLogBlock(level, 37, callMessagePhysicalSpecialized, 0)
 			identifiers := collectNodeText(block, shimast.KindIdentifier)
+			if containsText(identifiers, "stats") || containsText(identifiers, "totalWrites") {
+				t.Fatalf("%s specialized inline retained per-write stats accounting: %q", level, identifiers)
+			}
 			if !containsText(identifiers, "_logHeaders") || !containsText(identifiers, "vocabularyBinding") {
 				t.Fatalf("%s specialized inline omitted its dense storage: %q", level, identifiers)
 			}

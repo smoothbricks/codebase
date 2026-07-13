@@ -19,7 +19,6 @@
 //	  const $$i = $$b._traceRoot.writeLogEntry($$b, 8);
 //	  $$l._writeIndex = $$i;
 //	  if ($$b.message_values) { $$b.message_values[$$i] = 'msg'; }
-//	  $$b.constructor.stats.totalWrites++;
 //	  if ($$b.line_values) { $$b.line_values[$$i] = 3; ... }
 //	  if ($$b.userId_values) { $$b.userId_values[$$i] = 'u1'; ... }
 //	}
@@ -474,9 +473,6 @@ func (t *fileTransformer) applyLogInlines(inlines []logInline) {
 		} else {
 			stmts = append(stmts, guardedMessageWrite(buf, idx, in.message))
 		}
-		stmts = append(stmts, factory.NewExpressionStatement(factory.NewPostfixUnaryExpression(
-			propAccess(propAccess(propAccess(buf, "constructor"), "stats"), "totalWrites"),
-			shimast.KindPlusPlusToken)))
 
 		lineValue := in.lineArg
 		if lineValue == nil {
