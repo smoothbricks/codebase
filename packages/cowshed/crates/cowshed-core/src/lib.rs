@@ -5,7 +5,8 @@ pub mod api {
     pub mod dto;
 
     pub use capability::{
-        Coordinator, CoordinatorToken, Cowshed, Project, WorkspaceHandle, WorkspaceRef,
+        Coordinator, CoordinatorToken, Cowshed, JobHandle, Project, Session, WorkspaceHandle,
+        WorkspaceRef,
     };
     pub use dto::*;
 }
@@ -23,5 +24,6 @@ pub mod storage;
 pub use error::{CowshedError, ErrorCode, Result};
 
 pub use api::{
-    Coordinator, CoordinatorToken, Cowshed, Project, WorkspaceHandle, WorkspaceRef,
+    Coordinator, CoordinatorToken, Cowshed, JobHandle, Project, Session, WorkspaceHandle,
+    WorkspaceRef,
 };

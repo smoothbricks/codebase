@@ -410,11 +410,11 @@ pub enum Platform {
     Linux,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PortBlock {
-    pub base: u16,
-    pub size: u16,
+    pub(crate) base: u16,
+    pub(crate) size: u16,
 }
 
 impl PortBlock {
@@ -426,6 +426,14 @@ impl PortBlock {
         }
     }
 
+    pub const fn base(self) -> u16 {
+        self.base
+    }
+
+    pub const fn size(self) -> u16 {
+        self.size
+    }
+
     pub fn validate(self) -> Result<(), MetadataError> {
         Self::new(self.base, self.size).map(|_| ())
     }
@@ -433,6 +441,23 @@ impl PortBlock {
     pub fn ports(self) -> Result<RangeInclusive<u16>, MetadataError> {
         self.validate()?;
         Ok(self.base..=self.base + (self.size - 1))
+    }
+}
+
+impl<'de> Deserialize<'de> for PortBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            base: u16,
+            size: u16,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.base, wire.size).map_err(serde::de::Error::custom)
     }
 }
 
