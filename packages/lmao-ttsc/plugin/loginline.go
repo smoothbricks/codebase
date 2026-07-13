@@ -104,6 +104,11 @@ func schemaFieldFromSetterCall(chk *shimchecker.Checker, call *shimast.CallExpre
 	if paramType == nil {
 		return schemaField{}, false
 	}
+	if paramType.IsStringLiteral() {
+		if value, ok := paramType.AsLiteralType().Value().(string); ok {
+			return schemaField{kind: fieldEnum, enumValues: []string{value}}, true
+		}
+	}
 	if paramType.IsUnion() {
 		values := make([]string, 0, len(paramType.Types()))
 		for _, member := range paramType.Types() {
@@ -277,23 +282,22 @@ func (t *fileTransformer) findLogInline(call *shimast.CallExpression) (*logInlin
 				if len(l.args) != 1 {
 					return nil, false
 				}
-				if _, known := in.schema[l.name]; !known {
-					field, resolved := schemaFieldFromSetterCall(t.checker, l.node)
-					if !resolved {
-						return nil, false // not a schema field setter: bail, never miscompile
-					}
-					in.schema[l.name] = field
+				currentField, known := in.schema[l.name]
+				if resolvedField, resolved := schemaFieldFromSetterCall(t.checker, l.node); resolved {
+					in.schema[l.name] = resolvedField
+					known = true
+				} else if !known {
+					return nil, false // not a schema field setter: bail, never miscompile
 				}
 				contextualType := t.checker.GetContextualType(l.args[0], 0)
 				if values := finiteStringLiteralUnion(t.checker, contextualType); len(values) > 0 {
 					// A finite contextual string union comes from the checker-proven
 					// schema setter; broad category/text setters contextualize as string.
 					in.schema[l.name] = schemaField{kind: fieldEnum, enumValues: values}
-				}
-				if in.schema[l.name].kind == fieldDirect {
-					if values := finiteStringLiteralUnion(t.checker, t.checker.GetTypeAtLocation(l.args[0])); len(values) > 0 {
-						in.schema[l.name] = schemaField{kind: fieldEnum, enumValues: values}
-					}
+				} else if in.schema[l.name].kind == fieldDirect && currentField.kind != fieldDirect {
+					// A resolved signature can be broader than its instantiated schema
+					// property. Keep any checker-proven boolean or enum lane classification.
+					in.schema[l.name] = currentField
 				}
 				in.writes = append(in.writes, tagWrite{field: l.name, arg: l.args[0]})
 			}

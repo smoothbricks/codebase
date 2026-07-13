@@ -132,7 +132,7 @@ const schemaBuilderImpl: SchemaBuilder = {
    * - S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']) - for tag attributes
    * - S.enum(['dev', 'staging', 'prod']).default('dev').sync() - feature flag
    */
-  enum: <T extends readonly string[]>(values: T): SchemaOrFlagBuilder<T[number]> & LazyEnumSchema<T[number]> => {
+  enum: <const T extends readonly string[]>(values: T): SchemaOrFlagBuilder<T[number]> & LazyEnumSchema<T[number]> => {
     const schema = ArrowS.enum(values);
     return createSchemaWithFlagBuilder(schema);
   },

@@ -4,10 +4,13 @@
  */
 
 import { describe, expect, it } from 'bun:test';
+import type { TagWriter } from '../codegen/fixedPositionWriterGenerator.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { defineCodeError } from '../result.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
+import type { InferSchema } from '../schema/types.js';
+import type { FluentLogEntry } from '../spanContext.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 import { createTestTracerOptions } from './test-helpers.js';
 
@@ -19,6 +22,36 @@ const testSchema = defineLogSchema({
   userId: S.category(),
   customField: S.category(),
 });
+
+const inlineEnumSchema = defineLogSchema({
+  outcome: S.enum(['failure', 'success']),
+  category: S.category(),
+});
+
+type InlineEnumOutcome = InferSchema<typeof inlineEnumSchema>['outcome'];
+
+function assertInlineEnumInference(
+  outcome: InlineEnumOutcome,
+  category: string,
+  tag: TagWriter<typeof inlineEnumSchema>,
+  log: FluentLogEntry<typeof inlineEnumSchema>,
+): void {
+  const exactOutcome: 'failure' | 'success' = outcome;
+
+  tag.outcome('failure').outcome('success');
+  log.outcome('failure').outcome('success');
+  tag.category(category);
+  log.category(category);
+
+  // @ts-expect-error - enum setters must reject values outside the inferred literal union
+  tag.outcome('pending');
+  // @ts-expect-error - enum setters must reject values outside the inferred literal union
+  log.outcome('pending');
+
+  void exactOutcome;
+}
+
+void assertInlineEnumInference;
 
 // Create op context factory
 const opContext = defineOpContext({
