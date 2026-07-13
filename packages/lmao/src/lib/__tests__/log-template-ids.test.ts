@@ -236,9 +236,10 @@ describe('runtime Op-local log template IDs', () => {
     child.message(1, 'done');
     const childLogger = createSpanLogger(libraryContext.logBinding.logSchema, child);
     childLogger._infoTemplate(1).value('payload');
-    const RemappedView = remappedOp.remappedViewClass;
-    if (!RemappedView) throw new Error('mapped and prefixed Op did not provide a remapped view');
-    parent._children.push(new RemappedView(child));
+    const remapDescriptor = remappedOp.remapDescriptor;
+    if (!remapDescriptor) throw new Error('mapped and prefixed Op did not provide a remap descriptor');
+    child._remapDescriptor = remapDescriptor;
+    parent._children.push(child);
 
     const table = convertSpanTreeToArrowTable(parent);
     const messages = table.getChild('message');

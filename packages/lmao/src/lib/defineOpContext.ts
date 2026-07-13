@@ -213,7 +213,7 @@ function buildOpContextFactory<
   // See agent-todo/opgroup-refactor.md lines 58-70, 525-547 for rationale.
   const logBinding = {
     logSchema: mergedSchema,
-    remappedViewClass: undefined,
+    remapDescriptor: undefined,
   };
 
   // WHY: build the binding first so Ops created by defineOp carry it via _opContextBinding.
