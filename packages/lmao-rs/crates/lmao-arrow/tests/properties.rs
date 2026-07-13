@@ -6,9 +6,10 @@ use std::sync::Arc;
 use arrow_array::Array;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt32Type;
-use lmao_arrow::{ColumnDictionary, MockSpan, build_trace_chunk_envelope, convert_span_trees};
 use lmao_arrow::{
-    VOCABULARY_DENSE_INDICES, VOCABULARY_IDS, VOCABULARY_VALUES, static_vocabulary_dictionary,
+    ColumnDictionary, ConvertError, MockSpan, StableVocabularyCatalog,
+    StableVocabularyCatalogError, StableVocabularyEntry, StableVocabularyKind,
+    StableVocabularyLookupError, build_trace_chunk_envelope, convert_span_trees,
 };
 use lmao_core::{SpanIdentity, TraceId};
 use proptest::prelude::*;
@@ -122,21 +123,63 @@ fn ipc_bytes(batch: &arrow_array::RecordBatch) -> Vec<u8> {
     out
 }
 
-const DENSE_ZERO_LOG_ID: u32 = 15_317_875;
+const UNICODE_LOG_ID: u32 = 377_410;
 const OTHER_STATIC_LOG_ID: u32 = 9_474_871;
+const DENSE_ZERO_LOG_ID: u32 = 15_317_875;
+const STATIC_SPAN_ID: u32 = 15_419_721;
 
-fn static_ordinal_values() -> Vec<&'static str> {
-    VOCABULARY_DENSE_INDICES
-        .iter()
-        .map(|dense| VOCABULARY_VALUES[*dense as usize])
-        .collect()
+static FIXTURE_ENTRIES: [StableVocabularyEntry<'static>; 4] = [
+    StableVocabularyEntry {
+        id: UNICODE_LOG_ID,
+        kind: StableVocabularyKind::LogTemplate,
+        value: "json-sensitive <>& \u{2028}\u{2029}",
+    },
+    StableVocabularyEntry {
+        id: OTHER_STATIC_LOG_ID,
+        kind: StableVocabularyKind::LogTemplate,
+        value: "literal braces: {ok} for {region}",
+    },
+    StableVocabularyEntry {
+        id: DENSE_ZERO_LOG_ID,
+        kind: StableVocabularyKind::LogTemplate,
+        value: "No items to validate",
+    },
+    StableVocabularyEntry {
+        id: STATIC_SPAN_ID,
+        kind: StableVocabularyKind::SpanName,
+        value: "validate-items",
+    },
+];
+
+// Value order is independent from stable-ID order: No…, json…, literal…, validate….
+static FIXTURE_VALUE_ORDER: [u32; 4] = [2, 0, 1, 3];
+
+fn fixture_catalog() -> StableVocabularyCatalog<'static> {
+    StableVocabularyCatalog::try_new(&FIXTURE_ENTRIES, &FIXTURE_VALUE_ORDER).unwrap()
+}
+
+fn entry(
+    id: u32,
+    kind: StableVocabularyKind,
+    value: &'static str,
+) -> StableVocabularyEntry<'static> {
+    StableVocabularyEntry { id, kind, value }
+}
+
+fn catalog_error<'a>(
+    entries: &'a [StableVocabularyEntry<'a>],
+    ordinals_by_value: &'a [u32],
+) -> StableVocabularyCatalogError {
+    match StableVocabularyCatalog::try_new(entries, ordinals_by_value) {
+        Ok(_) => panic!("catalog unexpectedly passed validation"),
+        Err(error) => error,
+    }
 }
 
 fn static_ordinal_for_value(value: &str) -> u32 {
-    VOCABULARY_DENSE_INDICES
-        .iter()
-        .position(|dense| VOCABULARY_VALUES[*dense as usize] == value)
-        .expect("fixture value is registered") as u32
+    fixture_catalog()
+        .key_for_value(value)
+        .expect("fixture value is registered")
 }
 
 fn packed(entry_type: u8, vocabulary_id: u32) -> u32 {
@@ -167,42 +210,214 @@ fn message_dictionary(
 }
 
 #[test]
-fn message_dictionary_reuses_static_prefix_and_appends_first_seen_dynamic_suffix() {
-    let static_only = dictionary_span(
-        "static-only",
-        1,
-        &[
-            (1, packed(8, DENSE_ZERO_LOG_ID), None),
-            (2, packed(8, OTHER_STATIC_LOG_ID), None),
-            (3, 2, None),
-        ],
+fn catalog_rejects_ids_outside_nonzero_u24_range() {
+    for (name, id) in [("zero", 0), ("above-u24", 0x0100_0000)] {
+        let entries = [entry(id, StableVocabularyKind::LogTemplate, "value")];
+        assert_eq!(
+            catalog_error(&entries, &[0]),
+            StableVocabularyCatalogError::InvalidId { ordinal: 0, id },
+            "case {name}",
+        );
+    }
+}
+
+#[test]
+fn catalog_rejects_duplicate_and_descending_ids() {
+    for (name, first, second) in [("duplicate", 7, 7), ("descending", 9, 7)] {
+        let entries = [
+            entry(first, StableVocabularyKind::LogTemplate, "a"),
+            entry(second, StableVocabularyKind::LogTemplate, "b"),
+        ];
+        assert_eq!(
+            catalog_error(&entries, &[0, 1]),
+            StableVocabularyCatalogError::IdsNotStrictlyIncreasing {
+                ordinal: 1,
+                previous: first,
+                id: second,
+            },
+            "case {name}",
+        );
+    }
+}
+
+#[test]
+fn catalog_rejects_invalid_value_permutations() {
+    let entries = [
+        entry(1, StableVocabularyKind::LogTemplate, "z"),
+        entry(2, StableVocabularyKind::LogTemplate, "a"),
+        entry(3, StableVocabularyKind::LogTemplate, "m"),
+    ];
+
+    assert_eq!(
+        catalog_error(&entries, &[1, 2]),
+        StableVocabularyCatalogError::ValueOrderLengthMismatch {
+            entries: 3,
+            ordinals: 2,
+        },
     );
-    let static_batch = convert_span_trees(&[static_only]).unwrap();
+    assert_eq!(
+        catalog_error(&entries, &[1, 3, 0]),
+        StableVocabularyCatalogError::ValueOrdinalOutOfRange {
+            position: 1,
+            ordinal: 3,
+            entry_count: 3,
+        },
+    );
+    assert_eq!(
+        catalog_error(&entries, &[1, 1, 0]),
+        StableVocabularyCatalogError::ValueOrderNotStrictlyIncreasing {
+            position: 1,
+            previous_ordinal: 1,
+            ordinal: 1,
+        },
+    );
+    assert_eq!(
+        catalog_error(&entries, &[0, 1, 2]),
+        StableVocabularyCatalogError::ValueOrderNotStrictlyIncreasing {
+            position: 1,
+            previous_ordinal: 0,
+            ordinal: 1,
+        },
+    );
+}
+
+#[test]
+fn catalog_uses_binary_id_and_utf8_value_order_lookups() {
+    let catalog = fixture_catalog();
+
+    assert_eq!(
+        catalog.key_for_id(UNICODE_LOG_ID, StableVocabularyKind::LogTemplate),
+        Ok(0),
+    );
+    assert_eq!(
+        catalog.key_for_id(STATIC_SPAN_ID, StableVocabularyKind::SpanName),
+        Ok(3),
+    );
+    assert_eq!(
+        catalog.key_for_id(1_000_000, StableVocabularyKind::LogTemplate),
+        Err(StableVocabularyLookupError::UnknownId(1_000_000)),
+    );
+    assert_eq!(catalog.key_for_value("No items to validate"), Some(2));
+    assert_eq!(
+        catalog.key_for_value("json-sensitive <>& \u{2028}\u{2029}"),
+        Some(0),
+    );
+    assert_eq!(catalog.key_for_value("not registered"), None);
+    assert_eq!(
+        catalog.key_for_id(STATIC_SPAN_ID, StableVocabularyKind::LogTemplate),
+        Err(StableVocabularyLookupError::KindMismatch {
+            id: STATIC_SPAN_ID,
+            expected: StableVocabularyKind::LogTemplate,
+            actual: StableVocabularyKind::SpanName,
+        }),
+    );
+}
+
+#[test]
+fn duplicate_value_lookup_chooses_the_lowest_stable_id() {
+    let entries = [
+        entry(11, StableVocabularyKind::LogTemplate, "duplicate"),
+        entry(29, StableVocabularyKind::SpanName, "duplicate"),
+        entry(41, StableVocabularyKind::LogTemplate, "later"),
+    ];
+    let catalog = StableVocabularyCatalog::try_new(&entries, &[0, 1, 2]).unwrap();
+
+    assert_eq!(catalog.key_for_value("duplicate"), Some(0));
+    assert_eq!(
+        catalog.key_for_id(11, StableVocabularyKind::LogTemplate),
+        Ok(0),
+    );
+}
+
+#[test]
+fn conversion_reports_unknown_id_with_absolute_overflow_row() {
+    let mut root = dictionary_span(
+        "unknown-id",
+        1,
+        &[(1, 8, Some("first".into())), (2, 2, None)],
+    );
+    root.overflow = Some(Box::new(dictionary_span(
+        "unknown-id",
+        1,
+        &[(3, packed(8, 123_456), None)],
+    )));
+
+    match convert_span_trees(&[root], &fixture_catalog()).unwrap_err() {
+        ConvertError::InvalidVocabularyId { row, id } => {
+            assert_eq!((row, id), (2, 123_456));
+        }
+        other => panic!("unexpected conversion error: {other}"),
+    }
+}
+
+#[test]
+fn conversion_reports_kind_mismatch_with_absolute_child_row() {
+    let mut root = dictionary_span("kind-mismatch", 1, &[(1, 2, None)]);
+    let mut child = dictionary_span("kind-mismatch", 2, &[(2, packed(8, STATIC_SPAN_ID), None)]);
+    child.identity = Arc::new(SpanIdentity {
+        thread_id: 0xABCD,
+        span_id: 2,
+        trace_id: root.identity.trace_id.clone(),
+        parent: Some(root.identity.clone()),
+    });
+    root.children.push(child);
+
+    match convert_span_trees(&[root], &fixture_catalog()).unwrap_err() {
+        ConvertError::VocabularyKindMismatch {
+            row,
+            id,
+            expected,
+            actual,
+        } => {
+            assert_eq!((row, id), (1, STATIC_SPAN_ID));
+            assert_eq!(expected, StableVocabularyKind::LogTemplate);
+            assert_eq!(actual, StableVocabularyKind::SpanName);
+        }
+        other => panic!("unexpected conversion error: {other}"),
+    }
+}
+
+#[test]
+fn message_dictionary_reuses_static_prefix_and_appends_first_seen_dynamic_suffix() {
+    let static_rows = [
+        (1, packed(8, DENSE_ZERO_LOG_ID), None),
+        (2, packed(8, OTHER_STATIC_LOG_ID), None),
+        (3, packed(1, STATIC_SPAN_ID), None),
+        (4, 2, None),
+    ];
+    let catalog = fixture_catalog();
+    let static_batch =
+        convert_span_trees(&[dictionary_span("static-only", 1, &static_rows)], &catalog).unwrap();
+    let second_static_batch = convert_span_trees(
+        &[dictionary_span("static-only-again", 2, &static_rows)],
+        &catalog,
+    )
+    .unwrap();
+    let static_message = static_batch.column(7).as_dictionary::<UInt32Type>();
+    let second_static_message = second_static_batch.column(7).as_dictionary::<UInt32Type>();
+    assert!(
+        Arc::ptr_eq(static_message.values(), second_static_message.values()),
+        "static-only conversions reuse the catalog's cached Arrow dictionary",
+    );
     let (static_keys, static_values) = message_dictionary(&static_batch);
     assert_eq!(
         static_values.len(),
-        VOCABULARY_VALUES.len(),
+        catalog.len(),
         "static-only rows add no suffix"
-    );
-    assert!(
-        std::ptr::eq(static_values, static_vocabulary_dictionary().as_ref()),
-        "static-only conversion reuses the cached dictionary allocation",
     );
     assert_eq!(
         (0..static_values.len())
             .map(|index| static_values.value(index))
             .collect::<Vec<_>>(),
-        static_ordinal_values(),
+        FIXTURE_ENTRIES
+            .iter()
+            .map(|entry| entry.value)
+            .collect::<Vec<_>>(),
     );
-    assert_eq!(
-        static_keys.value(0),
-        VOCABULARY_IDS.binary_search(&DENSE_ZERO_LOG_ID).unwrap() as u32,
-    );
-    assert_eq!(
-        static_keys.value(1),
-        VOCABULARY_IDS.binary_search(&OTHER_STATIC_LOG_ID).unwrap() as u32,
-    );
-    assert!(static_keys.is_null(2));
+    assert_eq!(static_keys.value(0), 2);
+    assert_eq!(static_keys.value(1), 1);
+    assert_eq!(static_keys.value(2), 3);
+    assert!(static_keys.is_null(3));
 
     let mut root = dictionary_span(
         "mixed-tree",
@@ -237,18 +452,22 @@ fn message_dictionary_reuses_static_prefix_and_appends_first_seen_dynamic_suffix
     });
     root.children.push(child);
 
-    let mixed_batch = convert_span_trees(&[root]).unwrap();
+    let mixed_batch = convert_span_trees(&[root], &catalog).unwrap();
     let (keys, values) = message_dictionary(&mixed_batch);
     assert_eq!(
-        (VOCABULARY_VALUES.len()..values.len())
+        (catalog.len()..values.len())
             .map(|index| values.value(index))
             .collect::<Vec<_>>(),
         ["dynamic-z", "dynamic-a", "dynamic-child"],
         "dynamic suffix follows first encounter across overflow and child rows",
     );
-    let suffix = VOCABULARY_VALUES.len() as u32;
-    let other_ordinal = VOCABULARY_IDS.binary_search(&OTHER_STATIC_LOG_ID).unwrap() as u32;
-    let zero_ordinal = VOCABULARY_IDS.binary_search(&DENSE_ZERO_LOG_ID).unwrap() as u32;
+    let suffix = u32::try_from(catalog.len()).unwrap();
+    let other_ordinal = catalog
+        .key_for_id(OTHER_STATIC_LOG_ID, StableVocabularyKind::LogTemplate)
+        .unwrap();
+    let zero_ordinal = catalog
+        .key_for_id(DENSE_ZERO_LOG_ID, StableVocabularyKind::LogTemplate)
+        .unwrap();
     assert_eq!(
         (0..keys.len())
             .map(|row| (!keys.is_null(row)).then(|| keys.value(row)))
@@ -333,17 +552,18 @@ proptest! {
             root.children.push(child);
         }
 
-        let batch = convert_span_trees(&[root]).unwrap();
+        let catalog = fixture_catalog();
+        let batch = convert_span_trees(&[root], &catalog).unwrap();
         let (keys, values) = message_dictionary(&batch);
         prop_assert_eq!(batch.num_rows(), rows.len());
         let mut seen = HashSet::new();
         let expected_suffix = rows.iter().filter_map(|(_, raw, _)| raw.as_deref()).filter(|value| {
-            static_vocabulary_dictionary().iter().flatten().all(|static_value| static_value != *value)
+            FIXTURE_ENTRIES.iter().all(|entry| entry.value != *value)
                 && seen.insert(*value)
         }).collect::<Vec<_>>();
-        prop_assert_eq!(values.len(), VOCABULARY_VALUES.len() + expected_suffix.len());
+        prop_assert_eq!(values.len(), catalog.len() + expected_suffix.len());
         for (offset, expected) in expected_suffix.iter().enumerate() {
-            prop_assert_eq!(values.value(VOCABULARY_VALUES.len() + offset), *expected);
+            prop_assert_eq!(values.value(catalog.len() + offset), *expected);
         }
         for (row, (_, _, expected)) in rows.iter().enumerate() {
             match expected {
@@ -365,8 +585,14 @@ proptest! {
     /// (AxE H-SIM-4 style trace-byte identity).
     #[test]
     fn identical_trees_serialize_identically(n in 0usize..50) {
-        let a = convert_span_trees(&[build_tree(n, "trace-a")]).unwrap();
-        let b = convert_span_trees(&[build_tree(n, "trace-a")]).unwrap();
+        let a = convert_span_trees(
+            &[build_tree(n, "trace-a")],
+            &StableVocabularyCatalog::EMPTY,
+        ).unwrap();
+        let b = convert_span_trees(
+            &[build_tree(n, "trace-a")],
+            &StableVocabularyCatalog::EMPTY,
+        ).unwrap();
         prop_assert_eq!(ipc_bytes(&a), ipc_bytes(&b));
     }
 
@@ -386,7 +612,10 @@ proptest! {
             }
         });
 
-        let batch = convert_span_trees(std::slice::from_ref(&tree)).unwrap();
+        let batch = convert_span_trees(
+            std::slice::from_ref(&tree),
+            &StableVocabularyCatalog::EMPTY,
+        ).unwrap();
         prop_assert_eq!(batch.num_rows(), expected.len());
         let ts = batch.column(0).as_primitive::<arrow_array::types::Int64Type>();
         let et = batch.column(6).as_dictionary::<arrow_array::types::UInt8Type>();
@@ -401,7 +630,10 @@ proptest! {
     /// different file_ref → different chunk_id).
     #[test]
     fn envelope_is_deterministic(n in 0usize..30) {
-        let batch = convert_span_trees(&[build_tree(n, "trace-env")]).unwrap();
+        let batch = convert_span_trees(
+            &[build_tree(n, "trace-env")],
+            &StableVocabularyCatalog::EMPTY,
+        ).unwrap();
         let e1 = build_trace_chunk_envelope("s3://bucket/chunk-1", &batch);
         let e2 = build_trace_chunk_envelope("s3://bucket/chunk-1", &batch);
         let e3 = build_trace_chunk_envelope("s3://bucket/chunk-2", &batch);
