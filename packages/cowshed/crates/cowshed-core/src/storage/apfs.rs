@@ -14,9 +14,10 @@ use crate::metadata::{ImageFormat, WorkspaceIncarnation, WorkspaceName, Workspac
 use crate::repository::RepoId;
 
 use super::lifecycle::{
-    AdoptPlan, AdoptRequest, CheckpointPlan, CheckpointRef, CreatePlan, Destination, ExecuteError,
-    ExpectedState, ForkPlan, ImmutablePlan, KernelMountFact, LifecycleBackend, LifecyclePlanner,
-    LifecycleReceipt, LifecycleWorkspace, MountState, ObservedState, Operation, Pin, PlanError,
+    AdoptPlan, AdoptRequest, CheckpointFact, CheckpointPlan, CheckpointRef, CreatePlan,
+    DerivedWorkspace, Destination, ExecuteError, ExpectedState, ForkPlan, ImmutablePlan,
+    KernelMountFact, LifecycleBackend, LifecyclePlanner, LifecycleReceipt, LifecycleWorkspace,
+    MountIntent, MountState, ObservedState, Operation, OperationIdentity, Pin, PlanError,
     PurePlanner, RestoreMode, RestorePlan, RestoreReceipt, RetirePlan, RetiredRef, Revision,
     StorageFact, StorageGcReport, Substrate, SubstrateStats, execute_checked,
 };
@@ -135,6 +136,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         destination: &Path,
         format: ImageFormat,
     ) -> Result<(), ApfsStorageError>;
+    fn copy_tree(&self, source: &Path, destination: &Path) -> Result<(), ApfsStorageError>;
     fn attach_verified(
         &self,
         image: &Path,
@@ -153,6 +155,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         mount_point: &Path,
         workspace: &LifecycleWorkspace,
         forked_from: Option<&WorkspaceName>,
+        identity: &OperationIdentity,
     ) -> Result<(), ApfsStorageError>;
     fn validate_marker(
         &self,
@@ -176,13 +179,28 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         force: bool,
     ) -> Result<(), ApfsStorageError>;
     fn publish_image(&self, staged: &Path, canonical: &Path) -> Result<(), ApfsStorageError>;
+    fn publish_adopt(
+        &self,
+        source_checkout: &Path,
+        pre_cowshed_checkout: &Path,
+        staged: &Path,
+        canonical: &Path,
+    ) -> Result<(), ApfsStorageError>;
     fn publish_metadata(
         &self,
         image: &Path,
         workspace: &LifecycleWorkspace,
         revision: Revision,
         policy: MetadataPolicy,
+        identity: Option<&OperationIdentity>,
         source_image: Option<&Path>,
+    ) -> Result<(), ApfsStorageError>;
+    fn publish_checkpoint_fact(
+        &self,
+        image: &Path,
+        label: &CheckpointLabel,
+        revision: Revision,
+        pin: Pin,
     ) -> Result<(), ApfsStorageError>;
     fn restore_swap(
         &self,
@@ -208,6 +226,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     fn reclaim_image(&self, image: &Path, format: ImageFormat) -> Result<(), ApfsStorageError>;
     fn list(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError>;
     fn mounts(&self, repo: &RepoId) -> Result<Vec<KernelMountFact>, ApfsStorageError>;
+    fn checkpoints(&self, repo: &RepoId) -> Result<Vec<CheckpointFact>, ApfsStorageError>;
     fn recover_pending(&self, config: &ApfsSubstrateConfig) -> Result<(), ApfsStorageError>;
     fn stats(
         &self,
@@ -414,14 +433,15 @@ where
     ) -> Result<CheckpointPlan, PlanError> {
         self.planner.plan_checkpoint(workspace, label, pin)
     }
-
     fn plan_restore(
         &self,
         workspace: &LifecycleWorkspace,
         checkpoint: &CheckpointRef,
         mode: RestoreMode,
+        identity: OperationIdentity,
     ) -> Result<RestorePlan, PlanError> {
-        self.planner.plan_restore(workspace, checkpoint, mode)
+        self.planner
+            .plan_restore(workspace, checkpoint, mode, identity)
     }
 
     fn plan_retire(&self, workspace: &LifecycleWorkspace) -> Result<RetirePlan, PlanError> {
@@ -487,15 +507,17 @@ where
         .await
     }
 
-    async fn list(&self, repo: &RepoId) -> Result<Vec<LifecycleWorkspace>, Self::Error> {
+    async fn list(&self, repo: &RepoId) -> Result<Vec<DerivedWorkspace>, Self::Error> {
         let repo = repo.clone();
         self.dispatch_locked(move |host, _| {
             let storage = host.list(&repo)?;
             let mounts = host.mounts(&repo)?;
-            Ok(super::lifecycle::derive_workspaces(storage, mounts)?
-                .into_iter()
-                .map(|workspace| workspace.workspace)
-                .collect())
+            let checkpoints = host.checkpoints(&repo)?;
+            Ok(super::lifecycle::derive_workspaces(
+                storage,
+                mounts,
+                checkpoints,
+            )?)
         })
         .await
     }
@@ -505,7 +527,8 @@ where
         self.dispatch_locked(move |host, _| {
             let storage = host.list(workspace.repo())?;
             let mounts = host.mounts(workspace.repo())?;
-            let derived = super::lifecycle::derive_workspaces(storage, mounts)?;
+            let checkpoints = host.checkpoints(workspace.repo())?;
+            let derived = super::lifecycle::derive_workspaces(storage, mounts, checkpoints)?;
             derived
                 .into_iter()
                 .find(|candidate| candidate.workspace == workspace)
@@ -515,14 +538,19 @@ where
         .await
     }
 
-    async fn ensure_mounted(&self, workspace: &LifecycleWorkspace) -> Result<PathBuf, Self::Error> {
+    async fn ensure_mounted(
+        &self,
+        workspace: &LifecycleWorkspace,
+        intent: MountIntent,
+    ) -> Result<PathBuf, Self::Error> {
         let workspace = workspace.clone();
         self.dispatch_locked(move |host, config| {
             let mount_point = mount_point(&config, &workspace)?;
             host.heal_mount(&workspace, &mount_point)?;
             let storage = host.list(workspace.repo())?;
             let mounts = host.mounts(workspace.repo())?;
-            let derived = super::lifecycle::derive_workspaces(storage, mounts)?;
+            let checkpoints = host.checkpoints(workspace.repo())?;
+            let derived = super::lifecycle::derive_workspaces(storage, mounts, checkpoints)?;
             let state = derived
                 .into_iter()
                 .find(|candidate| candidate.workspace == workspace)
@@ -534,9 +562,15 @@ where
             }
             let canonical = canonical_image_path(&config, &workspace)?;
             let attachment = host.attach_verified(&canonical, workspace.format())?;
-            if let Err(primary) = host.mount(&attachment, &mount_point, false).and_then(|()| {
-                host.validate_marker(&mount_point, &MarkerExpectation::from_workspace(&workspace))
-            }) {
+            if let Err(primary) = host
+                .mount(&attachment, &mount_point, intent.browse)
+                .and_then(|()| {
+                    host.validate_marker(
+                        &mount_point,
+                        &MarkerExpectation::from_workspace(&workspace),
+                    )
+                })
+            {
                 return detach_after_failure(host.as_ref(), attachment, primary, "ensure mounted");
             }
             host.retain_mounted(&workspace, attachment)?;
@@ -633,14 +667,39 @@ where
     }
 }
 
-struct CloneExecution {
-    format: ImageFormat,
-    fork: bool,
+struct AdoptExecution<'a> {
+    repo: &'a RepoId,
+    requested_format: ImageFormat,
+    source_checkout: &'a Path,
+    pre_cowshed_checkout: &'a Path,
+    identity: &'a OperationIdentity,
 }
 
-struct RestoreExecution {
+struct CloneExecution<'a> {
+    source: &'a WorkspaceName,
+    destination: &'a WorkspaceName,
+    format: ImageFormat,
+    fork: bool,
+    identity: &'a OperationIdentity,
+}
+
+struct RestoreExecution<'a> {
+    workspace: &'a WorkspaceName,
+    label: &'a CheckpointLabel,
     mode: RestoreMode,
     format: ImageFormat,
+    identity: &'a OperationIdentity,
+}
+
+struct Preparation<'a> {
+    image: &'a Path,
+    mount_point: &'a Path,
+    workspace: &'a LifecycleWorkspace,
+    forked_from: Option<&'a WorkspaceName>,
+    identity: &'a OperationIdentity,
+    copy_source: Option<&'a Path>,
+    chown: bool,
+    relabel: bool,
 }
 
 fn apply_operation<H: ApfsExecutionHost>(
@@ -651,22 +710,40 @@ fn apply_operation<H: ApfsExecutionHost>(
     incarnations: &dyn IncarnationSource,
 ) -> Result<Applied, ApfsStorageError> {
     match operation {
-        Operation::Adopt { repo, format } => {
-            apply_adopt(host, config, expected, repo, *format, incarnations)
-        }
+        Operation::Adopt {
+            repo,
+            format,
+            source_checkout,
+            pre_cowshed_checkout,
+            identity,
+        } => apply_adopt(
+            host,
+            config,
+            expected,
+            AdoptExecution {
+                repo,
+                requested_format: *format,
+                source_checkout,
+                pre_cowshed_checkout,
+                identity,
+            },
+            incarnations,
+        ),
         Operation::Create {
             source,
             destination,
             format,
+            identity,
         } => apply_clone(
             host,
             config,
             expected,
-            source,
-            destination,
             CloneExecution {
+                source,
+                destination,
                 format: *format,
                 fork: false,
+                identity,
             },
             incarnations,
         ),
@@ -674,15 +751,17 @@ fn apply_operation<H: ApfsExecutionHost>(
             source,
             destination,
             format,
+            identity,
         } => apply_clone(
             host,
             config,
             expected,
-            source,
-            destination,
             CloneExecution {
+                source,
+                destination,
                 format: *format,
                 fork: true,
+                identity,
             },
             incarnations,
         ),
@@ -697,15 +776,17 @@ fn apply_operation<H: ApfsExecutionHost>(
             label,
             mode,
             format,
+            identity,
         } => apply_restore(
             host,
             config,
             expected,
-            workspace,
-            label,
             RestoreExecution {
+                workspace,
+                label,
                 mode: *mode,
                 format: *format,
+                identity,
             },
             incarnations,
         ),
@@ -717,10 +798,26 @@ fn apply_adopt<H: ApfsExecutionHost>(
     host: &H,
     config: &ApfsSubstrateConfig,
     expected: &[ExpectedState],
-    repo: &RepoId,
-    requested_format: ImageFormat,
+    execution: AdoptExecution<'_>,
     incarnations: &dyn IncarnationSource,
 ) -> Result<Applied, ApfsStorageError> {
+    let AdoptExecution {
+        repo,
+        requested_format,
+        source_checkout,
+        pre_cowshed_checkout,
+        identity,
+    } = execution;
+    if identity.project_root != source_checkout || config.main_mount != source_checkout {
+        return Err(ApfsStorageError::InvalidPlan(
+            "adopt source must equal operation project root and canonical main mount",
+        ));
+    }
+    if pre_cowshed_checkout.exists() {
+        return Err(ApfsStorageError::InvalidPlan(
+            "pre-cowshed checkout already exists",
+        ));
+    }
     let topology = absent_expected(expected)?;
     let incarnation = incarnations.mint()?;
     let staged_stem = staging_stem(config, repo, &main_name(), &incarnation)?;
@@ -755,25 +852,35 @@ fn apply_adopt<H: ApfsExecutionHost>(
         &workspace,
         workspace.revision(),
         MetadataPolicy::Fresh,
+        Some(identity),
         None,
     )?;
     if let Err(primary) = prepare_image(
         host,
-        &created.path,
-        &staging_mount,
-        &workspace,
-        None,
-        created.format == ImageFormat::Asif,
-        false,
+        Preparation {
+            image: &created.path,
+            mount_point: &staging_mount,
+            workspace: &workspace,
+            forked_from: None,
+            identity,
+            copy_source: Some(source_checkout),
+            chown: created.format == ImageFormat::Asif,
+            relabel: false,
+        },
     ) {
         let cleanup = host.reclaim_image(&created.path, created.format);
         return combine_cleanup("adopt preparation", primary, cleanup);
     }
-    if let Err(primary) = host.publish_image(&created.path, &canonical) {
+    if let Err(primary) = host.publish_adopt(
+        source_checkout,
+        pre_cowshed_checkout,
+        &created.path,
+        &canonical,
+    ) {
         let cleanup = host.reclaim_image(&created.path, created.format);
         return combine_cleanup("adopt publication", primary, cleanup);
     }
-    mount_canonical(host, &canonical, &config.main_mount, &workspace)?;
+    mount_canonical(host, &canonical, source_checkout, &workspace)?;
     Ok(Applied::Lifecycle(LifecycleReceipt {
         resulting_revision: workspace.revision(),
         workspace,
@@ -784,12 +891,16 @@ fn apply_clone<H: ApfsExecutionHost>(
     host: &H,
     config: &ApfsSubstrateConfig,
     expected: &[ExpectedState],
-    source_name: &WorkspaceName,
-    destination_name: &WorkspaceName,
-    execution: CloneExecution,
+    execution: CloneExecution<'_>,
     incarnations: &dyn IncarnationSource,
 ) -> Result<Applied, ApfsStorageError> {
-    let CloneExecution { format, fork } = execution;
+    let CloneExecution {
+        source: source_name,
+        destination: destination_name,
+        format,
+        fork,
+        identity,
+    } = execution;
     let source = active_expected(expected, source_name, format)?;
     let destination_topology = absent_expected(expected)?;
     let incarnation = incarnations.mint()?;
@@ -815,6 +926,7 @@ fn apply_clone<H: ApfsExecutionHost>(
         &workspace,
         workspace.revision(),
         MetadataPolicy::Fresh,
+        Some(identity),
         Some(&source_image),
     ) {
         let cleanup = host.reclaim_image(&staged, format);
@@ -822,12 +934,16 @@ fn apply_clone<H: ApfsExecutionHost>(
     }
     if let Err(primary) = prepare_image(
         host,
-        &staged,
-        &staging_mount,
-        &workspace,
-        forked_from,
-        false,
-        true,
+        Preparation {
+            image: &staged,
+            mount_point: &staging_mount,
+            workspace: &workspace,
+            forked_from,
+            identity,
+            copy_source: None,
+            chown: false,
+            relabel: true,
+        },
     ) {
         let cleanup = host.reclaim_image(&staged, format);
         return combine_cleanup("clone preparation", primary, cleanup);
@@ -863,10 +979,16 @@ fn apply_checkpoint<H: ApfsExecutionHost>(
         &workspace,
         checkpoint_revision,
         MetadataPolicy::Preserve,
+        None,
         Some(&source),
     ) {
         let cleanup = host.reclaim_image(&checkpoint, format);
         return combine_cleanup("checkpoint metadata", primary, cleanup);
+    }
+    if let Err(primary) = host.publish_checkpoint_fact(&checkpoint, label, checkpoint_revision, pin)
+    {
+        let cleanup = host.reclaim_image(&checkpoint, format);
+        return combine_cleanup("checkpoint fact", primary, cleanup);
     }
     let attachment = match host.attach_verified(&checkpoint, format) {
         Ok(attachment) => attachment,
@@ -888,12 +1010,16 @@ fn apply_restore<H: ApfsExecutionHost>(
     host: &H,
     config: &ApfsSubstrateConfig,
     expected: &[ExpectedState],
-    workspace_name: &WorkspaceName,
-    label: &CheckpointLabel,
-    execution: RestoreExecution,
+    execution: RestoreExecution<'_>,
     incarnations: &dyn IncarnationSource,
 ) -> Result<Applied, ApfsStorageError> {
-    let RestoreExecution { mode, format } = execution;
+    let RestoreExecution {
+        workspace: workspace_name,
+        label,
+        mode,
+        format,
+        identity,
+    } = execution;
     let current = active_expected(expected, workspace_name, format)?;
     let checkpoint = checkpoint_image(config, &current, label)?;
     if mode == RestoreMode::VerifyOnly {
@@ -931,6 +1057,7 @@ fn apply_restore<H: ApfsExecutionHost>(
         &replacement,
         replacement.revision(),
         MetadataPolicy::Preserve,
+        Some(identity),
         Some(&checkpoint),
     ) {
         let cleanup = host.reclaim_image(&staged, format).and_then(|()| {
@@ -940,12 +1067,16 @@ fn apply_restore<H: ApfsExecutionHost>(
     }
     if let Err(primary) = prepare_image(
         host,
-        &staged,
-        &staging_mount,
-        &replacement,
-        None,
-        false,
-        true,
+        Preparation {
+            image: &staged,
+            mount_point: &staging_mount,
+            workspace: &replacement,
+            forked_from: None,
+            identity,
+            copy_source: None,
+            chown: false,
+            relabel: true,
+        },
     ) {
         let cleanup = host.reclaim_image(&staged, format).and_then(|()| {
             mount_canonical(host, &canonical, &mount_point(config, &current)?, &current)
@@ -1006,13 +1137,18 @@ fn apply_retire<H: ApfsExecutionHost>(
 
 fn prepare_image<H: ApfsExecutionHost>(
     host: &H,
-    image: &Path,
-    mount_point: &Path,
-    workspace: &LifecycleWorkspace,
-    forked_from: Option<&WorkspaceName>,
-    chown: bool,
-    relabel: bool,
+    preparation: Preparation<'_>,
 ) -> Result<(), ApfsStorageError> {
+    let Preparation {
+        image,
+        mount_point,
+        workspace,
+        forked_from,
+        identity,
+        copy_source,
+        chown,
+        relabel,
+    } = preparation;
     let attachment = host.attach_verified(image, workspace.format())?;
     let prepared = host.mount(&attachment, mount_point, false).and_then(|()| {
         if chown {
@@ -1024,7 +1160,10 @@ fn prepare_image<H: ApfsExecutionHost>(
                 &volume_name(workspace.repo(), workspace.name()),
             )?;
         }
-        host.write_marker(mount_point, workspace, forked_from)?;
+        if let Some(source) = copy_source {
+            host.copy_tree(source, mount_point)?;
+        }
+        host.write_marker(mount_point, workspace, forked_from, identity)?;
         host.validate_marker(mount_point, &MarkerExpectation::from_workspace(workspace))
     });
     match prepared {

@@ -16,6 +16,15 @@ pub struct CopyReport {
     pub changed_entries: usize,
 }
 
+impl<R> CommandRunner for &R
+where
+    R: CommandRunner + ?Sized,
+{
+    fn run(&self, request: &CommandRequest) -> std::result::Result<CommandOutput, CommandRunError> {
+        (**self).run(request)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TreeCopier<R> {
     runner: R,

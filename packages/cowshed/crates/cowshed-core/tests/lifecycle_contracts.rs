@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::ThreadId;
 
 use async_trait::async_trait;
-use cowshed_core::metadata::{ImageFormat, WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
+use cowshed_core::metadata::{
+    GrantSet, ImageFormat, PortBlock, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+};
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::lifecycle::*;
@@ -14,6 +16,16 @@ fn repo() -> RepoId {
 }
 fn make_incarnation(digit: char) -> WorkspaceIncarnation {
     WorkspaceIncarnation::new(digit.to_string().repeat(32)).unwrap()
+}
+fn identity() -> OperationIdentity {
+    OperationIdentity {
+        project_root: PathBuf::from("/project"),
+        base_commit: "0123456789abcdef".to_owned(),
+        created_at: "2026-07-13T00:00:00Z".to_owned(),
+        created_trace: "lifecycle-contract".to_owned(),
+        grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
+            .expect("grants"),
+    }
 }
 fn workspace(name: &str, revision: u64, topology: u64) -> LifecycleWorkspace {
     LifecycleWorkspace::new(
@@ -79,6 +91,7 @@ fn planning_is_deterministic_capability_free_and_has_no_effects() {
         repo: repo(),
         name: WorkspaceName::session("topic").unwrap(),
         topology_revision: Revision::new(11),
+        identity: identity(),
     };
     let first = planner.plan_create(&source, destination.clone()).unwrap();
     let second = planner.plan_create(&source, destination).unwrap();
@@ -184,8 +197,9 @@ impl LifecyclePlanner for ContractSubstrate {
         workspace: &LifecycleWorkspace,
         checkpoint: &CheckpointRef,
         mode: RestoreMode,
+        identity: OperationIdentity,
     ) -> Result<RestorePlan, PlanError> {
-        PurePlanner.plan_restore(workspace, checkpoint, mode)
+        PurePlanner.plan_restore(workspace, checkpoint, mode, identity)
     }
 
     fn plan_retire(&self, workspace: &LifecycleWorkspace) -> Result<RetirePlan, PlanError> {
@@ -239,9 +253,13 @@ impl Substrate for ContractSubstrate {
         }
     }
 
-    async fn list(&self, repo: &RepoId) -> Result<Vec<LifecycleWorkspace>, Self::Error> {
+    async fn list(&self, repo: &RepoId) -> Result<Vec<DerivedWorkspace>, Self::Error> {
         if repo == self.workspace.repo() {
-            Ok(vec![self.workspace.clone()])
+            Ok(vec![DerivedWorkspace {
+                workspace: self.workspace.clone(),
+                mount_state: MountState::Mounted { mount_id: 77 },
+                checkpoints: Vec::new(),
+            }])
         } else {
             Err("wrong repository")
         }
@@ -255,7 +273,11 @@ impl Substrate for ContractSubstrate {
         }
     }
 
-    async fn ensure_mounted(&self, workspace: &LifecycleWorkspace) -> Result<PathBuf, Self::Error> {
+    async fn ensure_mounted(
+        &self,
+        workspace: &LifecycleWorkspace,
+        _: MountIntent,
+    ) -> Result<PathBuf, Self::Error> {
         if workspace == &self.workspace {
             Ok(PathBuf::from("/canonical").join(workspace.name().as_str()))
         } else {
@@ -299,13 +321,19 @@ async fn finalized_substrate_surface_returns_direct_values_and_canonical_paths()
         workspace: ws.clone(),
     };
 
-    assert_eq!(substrate.list(&repo()).await.unwrap(), vec![ws.clone()]);
+    assert_eq!(
+        substrate.list(&repo()).await.unwrap()[0].workspace,
+        ws.clone()
+    );
     assert_eq!(
         substrate.mount_state(&ws).await.unwrap(),
         MountState::Mounted { mount_id: 77 }
     );
     assert_eq!(
-        substrate.ensure_mounted(&ws).await.unwrap(),
+        substrate
+            .ensure_mounted(&ws, MountIntent { browse: true })
+            .await
+            .unwrap(),
         PathBuf::from("/canonical/topic")
     );
     assert_eq!(
@@ -355,13 +383,14 @@ fn value_accessors_and_every_fact_field_are_observable() {
         repo: repo(),
         name: WorkspaceName::session("destination").unwrap(),
         topology_revision: Revision::new(5),
+        identity: identity(),
     };
     let create = PurePlanner.plan_create(&ws, destination).unwrap();
     let create_actual: Vec<_> = create.expected().iter().map(observed).collect();
     assert_eq!(revalidate(create.expected(), &create_actual), Ok(()));
 
     let restore = PurePlanner
-        .plan_restore(&ws, &checkpoint, RestoreMode::Replace)
+        .plan_restore(&ws, &checkpoint, RestoreMode::Replace, identity())
         .unwrap();
     let restore_actual: Vec<_> = restore.expected().iter().map(observed).collect();
     assert_eq!(revalidate(restore.expected(), &restore_actual), Ok(()));
@@ -445,7 +474,7 @@ fn restore_rejects_each_checkpoint_identity_mismatch() {
             false,
         );
         assert_eq!(
-            PurePlanner.plan_restore(&ws, &checkpoint, RestoreMode::Replace),
+            PurePlanner.plan_restore(&ws, &checkpoint, RestoreMode::Replace, identity()),
             Err(PlanError::CheckpointMismatch)
         );
     }
@@ -472,7 +501,7 @@ async fn every_stale_precondition_conflicts_with_zero_effects() {
         false,
     );
     let plan = PurePlanner
-        .plan_restore(&ws, &checkpoint, RestoreMode::Replace)
+        .plan_restore(&ws, &checkpoint, RestoreMode::Replace, identity())
         .unwrap();
     let canonical: Vec<_> = plan.expected().iter().map(observed).collect();
     let mut stale_matrix = Vec::new();
@@ -554,7 +583,7 @@ fn duplicate_canonical_volume_names_are_rejected_before_mount_joining() {
 
     for mounts in mount_tables {
         assert_eq!(
-            derive_workspaces(storage(), mounts),
+            derive_workspaces(storage(), mounts, Vec::new()),
             Err(DerivationError::DuplicateVolumeName(
                 "shared-volume".to_owned()
             ))
@@ -566,7 +595,7 @@ proptest! {
     #[test]
     fn generated_plans_are_deterministic(revision in any::<u64>(), topology in any::<u64>(), suffix in 0u16..1000) {
         let source = workspace("main", revision, topology);
-        let destination = Destination { repo: repo(), name: WorkspaceName::session(format!("topic-{suffix}")).unwrap(), topology_revision: Revision::new(topology) };
+        let destination = Destination { repo: repo(), name: WorkspaceName::session(format!("topic-{suffix}")).unwrap(), topology_revision: Revision::new(topology), identity: identity() };
         prop_assert_eq!(PurePlanner.plan_fork(&source, destination.clone()).unwrap(), PurePlanner.plan_fork(&source, destination).unwrap());
     }
 
@@ -574,7 +603,7 @@ proptest! {
     fn derived_enumeration_uses_only_storage_and_kernel_facts(mounted in proptest::collection::btree_set(0u8..20, 0..20), count in 0u8..20) {
         let storage: Vec<_> = (0..count).map(|index| StorageFact { workspace: workspace(&format!("ws-{index}"), 0, 0), volume_name: format!("volume-{index}") }).collect();
         let mounts: Vec<_> = mounted.iter().map(|index| KernelMountFact { mount_id: u64::from(*index) + 100, volume_name: format!("volume-{index}") }).collect();
-        let derived = derive_workspaces(storage, mounts).unwrap();
+        let derived = derive_workspaces(storage, mounts, Vec::new()).unwrap();
         prop_assert_eq!(derived.len(), usize::from(count));
         for item in derived {
             let index: u8 = item.workspace.name().as_str().strip_prefix("ws-").unwrap().parse().unwrap();
@@ -608,7 +637,7 @@ proptest! {
         }];
 
         prop_assert_eq!(
-            derive_workspaces(storage, mounts),
+            derive_workspaces(storage, mounts, Vec::new()),
             Err(DerivationError::DuplicateVolumeName(volume_name))
         );
     }
