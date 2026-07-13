@@ -392,7 +392,7 @@ impl PortBlock {
 
     pub fn ports(self) -> Result<RangeInclusive<u16>, MetadataError> {
         self.validate()?;
-        Ok(self.base..=self.base + self.size - 1)
+        Ok(self.base..=self.base + (self.size - 1))
     }
 }
 
@@ -545,15 +545,22 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, MetadataError> {
 }
 
 pub fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), MetadataError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| MetadataError::InvalidPath(path.to_owned()))?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
+    write_json_with_nonce(path, value, nonce)
+}
 
+fn write_json_with_nonce<T: Serialize + ?Sized>(
+    path: &Path,
+    value: &T,
+    nonce: u128,
+) -> Result<(), MetadataError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| MetadataError::InvalidPath(path.to_owned()))?;
     let mut opened = None;
     for attempt in 0..128_u8 {
         let mut temp_name = file_name.to_os_string();
@@ -674,6 +681,23 @@ mod tests {
                 "stale": true
             }
         })
+    }
+
+    fn marker_from_json() -> WorkspaceMarker {
+        serde_json::from_value(json!({
+            "version": 1,
+            "repoId": "acme/widget",
+            "projectRoot": "/project",
+            "workspace": "raven",
+            "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+            "role": "workspace",
+            "imageFormat": "asif",
+            "baseCommit": "8f31c2d",
+            "createdAt": "2026-07-11T12:00:00Z",
+            "forkedFrom": null,
+            "createdTrace": "4bf92f"
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -798,6 +822,220 @@ mod tests {
         let path = directory.join("metadata.json");
         assert!(write_json(&path, &Fails).is_err());
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn metadata_errors_expose_stable_messages_and_causes() {
+        let io_error = MetadataError::Io {
+            path: PathBuf::from("/metadata.json"),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "disk unavailable"),
+        };
+        assert_eq!(
+            io_error.to_string(),
+            "metadata I/O failed for /metadata.json: disk unavailable"
+        );
+        assert_eq!(
+            io_error
+                .source()
+                .expect("I/O errors retain their cause")
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let source = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let json_error = MetadataError::Json {
+            path: PathBuf::from("/metadata.json"),
+            source,
+        };
+        assert!(
+            json_error
+                .to_string()
+                .starts_with("invalid metadata JSON in /metadata.json: EOF while parsing")
+        );
+        assert!(
+            json_error
+                .source()
+                .expect("JSON errors retain their cause")
+                .downcast_ref::<serde_json::Error>()
+                .is_some()
+        );
+
+        let validation_error = WorkspaceName::new("Invalid").unwrap_err();
+        assert_eq!(
+            validation_error.to_string(),
+            "invalid workspace name \"Invalid\""
+        );
+        assert!(validation_error.source().is_none());
+    }
+
+    #[test]
+    fn workspace_name_and_incarnation_accessors_preserve_values() {
+        let main = WorkspaceName::new("main").unwrap();
+        let session = WorkspaceName::new("raven-2").unwrap();
+        assert!(main.is_main());
+        assert!(!session.is_main());
+        assert_eq!(main.as_str(), "main");
+        assert_eq!(session.to_string(), "raven-2");
+
+        let value = "0198f2c0b7e34dc795f17b238b331c80";
+        let incarnation = WorkspaceIncarnation::new(value).unwrap();
+        assert_eq!(incarnation.as_str(), value);
+        assert_eq!(incarnation.to_string(), value);
+    }
+
+    #[test]
+    fn role_and_marker_validation_reject_every_inconsistent_state() {
+        let main = WorkspaceName::new("main").unwrap();
+        let session = WorkspaceName::new("raven").unwrap();
+        validate_role_name(WorkspaceRole::Main, &main).unwrap();
+        validate_role_name(WorkspaceRole::Workspace, &session).unwrap();
+        assert!(matches!(
+            validate_role_name(WorkspaceRole::Main, &session),
+            Err(MetadataError::WorkspaceRoleMismatch { workspace, role })
+                if workspace == "raven" && role == WorkspaceRole::Main
+        ));
+        assert!(matches!(
+            validate_role_name(WorkspaceRole::Workspace, &main),
+            Err(MetadataError::WorkspaceRoleMismatch { workspace, role })
+                if workspace == "main" && role == WorkspaceRole::Workspace
+        ));
+
+        let mut marker = marker_from_json();
+        marker.validate().unwrap();
+        marker.version = METADATA_VERSION + 1;
+        assert!(matches!(
+            marker.validate(),
+            Err(MetadataError::UnsupportedVersion {
+                kind: "workspace marker",
+                version: 2
+            })
+        ));
+        marker.version = METADATA_VERSION;
+        marker.role = WorkspaceRole::Main;
+        assert!(matches!(
+            marker.validate(),
+            Err(MetadataError::WorkspaceRoleMismatch { .. })
+        ));
+        marker.role = WorkspaceRole::Workspace;
+        marker.forked_from = Some(WorkspaceName::new("main").unwrap());
+        assert!(matches!(
+            marker.validate(),
+            Err(MetadataError::ReservedSessionName)
+        ));
+    }
+
+    #[test]
+    fn port_blocks_and_platform_grants_enforce_boundaries() {
+        let lowest = PortBlock::new(0, PORT_BLOCK_SIZE).unwrap();
+        let highest = PortBlock::new(u16::MAX - PORT_BLOCK_SIZE + 1, PORT_BLOCK_SIZE).unwrap();
+        assert_eq!(lowest.ports().unwrap(), 0..=15);
+        assert_eq!(highest.ports().unwrap(), (u16::MAX - 15)..=u16::MAX);
+        for invalid in [
+            PortBlock { base: 80, size: 0 },
+            PortBlock {
+                base: 80,
+                size: PORT_BLOCK_SIZE - 1,
+            },
+            PortBlock {
+                base: u16::MAX - 14,
+                size: PORT_BLOCK_SIZE,
+            },
+        ] {
+            assert!(matches!(
+                invalid.validate(),
+                Err(MetadataError::InvalidPortBlock { base, size })
+                    if base == invalid.base && size == invalid.size
+            ));
+        }
+
+        let macos = GrantSet::closed_baseline(Some(lowest)).unwrap();
+        assert_eq!(macos.port_block, Some(lowest));
+        assert_eq!(macos.revision, 0);
+        assert!(macos.read.is_empty() && macos.write.is_empty() && macos.egress.is_empty());
+        macos.validate(Platform::Macos).unwrap();
+        assert!(
+            GrantSet::closed_baseline(Some(PortBlock {
+                base: u16::MAX,
+                size: PORT_BLOCK_SIZE,
+            }))
+            .is_err()
+        );
+
+        let linux = GrantSet::closed_baseline(None).unwrap();
+        linux.validate(Platform::Linux).unwrap();
+        assert!(matches!(
+            linux.validate(Platform::Macos),
+            Err(MetadataError::InvalidPortBlock { base: 0, size: 0 })
+        ));
+        assert!(matches!(
+            macos.validate(Platform::Linux),
+            Err(MetadataError::InvalidPortBlock {
+                base: 0,
+                size: PORT_BLOCK_SIZE
+            })
+        ));
+    }
+
+    #[test]
+    fn detached_sidecar_write_persists_and_validates_before_creation() {
+        let directory = temp_directory("sidecar-write");
+        let image = directory.join("raven.asif");
+        let metadata: DetachedWorkspaceMetadata =
+            serde_json::from_value(frozen_sidecar_json()).unwrap();
+        metadata.write_for_image(&image).unwrap();
+        let sidecar = sidecar_path(&image);
+        assert!(sidecar.is_file());
+        assert_eq!(
+            DetachedWorkspaceMetadata::read_for_image(&image).unwrap(),
+            metadata
+        );
+
+        let wrong_image = directory.join("wrong.sparseimage");
+        assert!(matches!(
+            metadata.write_for_image(&wrong_image),
+            Err(MetadataError::ImageFormatMismatch { .. })
+        ));
+        assert!(!sidecar_path(&wrong_image).exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn atomic_write_retries_only_name_collisions() {
+        let directory = temp_directory("atomic-collision");
+        let path = directory.join("metadata.json");
+        let nonce = 42;
+        let collision = directory.join(format!(
+            "metadata.json.tmp.{}.{nonce}.0",
+            std::process::id()
+        ));
+        fs::write(&collision, "do not replace").unwrap();
+
+        let value = json!({ "revision": 9 });
+        write_json_with_nonce(&path, &value, nonce).unwrap();
+        assert_eq!(fs::read_to_string(&collision).unwrap(), "do not replace");
+        assert_eq!(read_json::<serde_json::Value>(&path).unwrap(), value);
+        assert!(
+            !directory
+                .join(format!(
+                    "metadata.json.tmp.{}.{nonce}.1",
+                    std::process::id()
+                ))
+                .exists()
+        );
+
+        let missing_parent_path = directory.join("missing").join("metadata.json");
+        let error = write_json_with_nonce(&missing_parent_path, &value, nonce).unwrap_err();
+        assert!(matches!(
+            error,
+            MetadataError::Io { path: error_path, source }
+                if error_path == directory.join("missing").join(format!(
+                    "metadata.json.tmp.{}.{nonce}.0",
+                    std::process::id()
+                )) && source.kind() == io::ErrorKind::NotFound
+        ));
         fs::remove_dir_all(directory).unwrap();
     }
 }
