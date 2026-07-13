@@ -5,6 +5,11 @@ use super::dto::{
     PushReport, RebaseOptions, RemoveOptions, RevisionResult, RunSandboxMode, StdinSource,
     WorkspaceIncarnation, WorkspaceInfo,
 };
+use super::server::MAX_BINARY_FRAME_BYTES;
+#[cfg(unix)]
+use super::server::{
+    HANDSHAKE_VERSION, MAX_HANDSHAKE_BYTES, MAX_JSON_FRAME_BYTES as MAX_RPC_BYTES, codec,
+};
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::WorkspaceName;
 use crate::repository::{ProjectPaths, RepoId, RepositoryBinding};
@@ -23,13 +28,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::sync::{mpsc, oneshot};
 use url::Url;
-
-const HANDSHAKE_VERSION: u32 = 1;
-const MAX_HANDSHAKE_BYTES: usize = 4096;
-#[cfg(unix)]
-const MAX_RPC_BYTES: usize = 16 * 1024 * 1024;
-
-const MAX_BINARY_FRAME_BYTES: usize = 64 * 1024;
 
 pub(crate) struct BinaryDownload {
     bytes: Vec<u8>,
@@ -869,23 +867,6 @@ impl fmt::Debug for AuthenticatedControllerChannel {
 }
 
 #[cfg(unix)]
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ClientHello<'a> {
-    version: u32,
-    nonce: &'a str,
-}
-
-#[cfg(unix)]
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ServerHello {
-    version: u32,
-    nonce: String,
-    repo_id: RepoId,
-}
-
-#[cfg(unix)]
 fn handshake_error(message: impl Into<String>) -> CowshedError {
     CowshedError::new(
         ErrorCode::EnvironmentMissing,
@@ -996,28 +977,6 @@ async fn read_frame(stream: &mut tokio::net::UnixStream) -> Result<Vec<u8>> {
         .await
         .map_err(|error| handshake_error(format!("coordinator handshake read failed: {error}")))?;
     Ok(bytes)
-}
-
-#[cfg(unix)]
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RpcRequest<'a> {
-    id: u64,
-    method: &'a str,
-    params: &'a Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    binary_length: Option<u32>,
-}
-
-#[cfg(unix)]
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RpcResponse {
-    id: u64,
-    ok: bool,
-    result: Option<Value>,
-    error: Option<CowshedError>,
-    binary_length: Option<u32>,
 }
 
 #[cfg(unix)]
@@ -1172,20 +1131,25 @@ fn spawn_controller_actor(mut stream: tokio::net::UnixStream) -> Arc<dyn Control
             };
             let exchange = async {
                 let binary_length = match &lane {
-                    ActorLane::Upload(bytes) => Some(bytes.len() as u32),
+                    ActorLane::Upload(bytes) => Some(u32::try_from(bytes.len()).map_err(|_| {
+                        ActorFailure::Fatal(CowshedError::internal(
+                            "controller RPC binary request exceeds the 64 KiB frame limit",
+                        ))
+                    })?),
                     ActorLane::Json | ActorLane::Download(_) => None,
                 };
-                let request = serde_json::to_vec(&RpcRequest {
-                    id,
-                    method,
-                    params: &params,
-                    binary_length,
-                })
-                .map_err(|error| {
-                    ActorFailure::Fatal(CowshedError::internal(format!(
-                        "controller RPC request encoding failed: {error}"
-                    )))
-                })?;
+                let request = codec::encode_rpc_request(id, method, &params, binary_length)
+                    .map_err(|error| {
+                        if error.is_too_large() {
+                            ActorFailure::Fatal(CowshedError::internal(
+                                "controller RPC request is too large",
+                            ))
+                        } else {
+                            ActorFailure::Fatal(CowshedError::internal(format!(
+                                "controller RPC request encoding failed: {error}"
+                            )))
+                        }
+                    })?;
                 write_rpc_frame(&mut stream, &request)
                     .await
                     .map_err(ActorFailure::Fatal)?;
@@ -1197,20 +1161,22 @@ fn spawn_controller_actor(mut stream: tokio::net::UnixStream) -> Arc<dyn Control
                 let response = read_rpc_frame(&mut stream)
                     .await
                     .map_err(ActorFailure::Fatal)?;
-                let response: RpcResponse = serde_json::from_slice(&response).map_err(|error| {
+                let response = codec::decode_rpc_response(&response).map_err(|error| {
                     ActorFailure::Fatal(CowshedError::internal(format!(
                         "controller RPC response decoding failed: {error}"
                     )))
                 })?;
-                if response.id != id {
+                let (response_id, response_ok, response_result, response_error, binary_length) =
+                    response.into_parts();
+                if response_id != id {
                     return Err(ActorFailure::Fatal(CowshedError::internal(
                         "controller RPC response id did not match request",
                     )));
                 }
-                let result = match (response.ok, response.result, response.error) {
+                let result = match (response_ok, response_result, response_error) {
                     (true, Some(result), None) => result,
                     (false, None, Some(error)) => {
-                        if response.binary_length.is_some() {
+                        if binary_length.is_some() {
                             return Err(ActorFailure::Fatal(CowshedError::internal(
                                 "controller RPC error response declared unsolicited binary data",
                             )));
@@ -1225,7 +1191,7 @@ fn spawn_controller_actor(mut stream: tokio::net::UnixStream) -> Arc<dyn Control
                 };
                 match lane {
                     ActorLane::Json | ActorLane::Upload(_) => {
-                        if response.binary_length.is_some() {
+                        if binary_length.is_some() {
                             return Err(ActorFailure::Fatal(CowshedError::internal(
                                 "controller RPC response declared unsolicited binary data",
                             )));
@@ -1233,11 +1199,16 @@ fn spawn_controller_actor(mut stream: tokio::net::UnixStream) -> Arc<dyn Control
                         Ok(ActorResponse::Json(result))
                     }
                     ActorLane::Download(expected_offset) => {
-                        let binary_length = response.binary_length.ok_or_else(|| {
+                        let binary_length = binary_length.ok_or_else(|| {
                             ActorFailure::Fatal(CowshedError::internal(
                                 "controller RPC download response omitted binaryLength",
                             ))
-                        })? as usize;
+                        })?;
+                        let binary_length = usize::try_from(binary_length).map_err(|_| {
+                            ActorFailure::Fatal(CowshedError::internal(
+                                "controller RPC binary response length does not fit this platform",
+                            ))
+                        })?;
                         if binary_length > MAX_BINARY_FRAME_BYTES {
                             return Err(ActorFailure::Fatal(CowshedError::internal(
                                 "controller RPC binary response exceeds the 64 KiB frame limit",
@@ -1249,8 +1220,13 @@ fn spawn_controller_actor(mut stream: tokio::net::UnixStream) -> Arc<dyn Control
                                     "controller RPC download metadata is invalid: {error}"
                                 )))
                             })?;
+                        let binary_length_u64 = u64::try_from(binary_length).map_err(|_| {
+                            ActorFailure::Fatal(CowshedError::internal(
+                                "controller RPC download offset overflowed",
+                            ))
+                        })?;
                         let expected_next = expected_offset
-                            .checked_add(binary_length as u64)
+                            .checked_add(binary_length_u64)
                             .ok_or_else(|| {
                                 ActorFailure::Fatal(CowshedError::internal(
                                     "controller RPC download offset overflowed",
@@ -1297,26 +1273,25 @@ async fn acquire_coordinator_token(descriptor: OwnedFd) -> Result<(Cowshed, Coor
         handshake_error(format!("coordinator descriptor setup failed: {error}"))
     })?;
     let nonce = fresh_nonce();
-    let hello = serde_json::to_vec(&ClientHello {
-        version: HANDSHAKE_VERSION,
-        nonce: &nonce,
-    })
-    .map_err(|error| handshake_error(format!("coordinator handshake encoding failed: {error}")))?;
+    let hello = codec::encode_client_hello(&nonce).map_err(|error| {
+        handshake_error(format!("coordinator handshake encoding failed: {error}"))
+    })?;
     write_frame(&mut stream, &hello).await?;
     let response = read_frame(&mut stream).await?;
-    let response: ServerHello = serde_json::from_slice(&response).map_err(|error| {
+    let response = codec::decode_server_hello(&response).map_err(|error| {
         handshake_error(format!(
             "coordinator handshake response is invalid: {error}"
         ))
     })?;
-    if response.version != HANDSHAKE_VERSION || response.nonce != nonce {
+    let (version, response_nonce, repo_id) = response.into_parts();
+    if version != HANDSHAKE_VERSION || response_nonce != nonce {
         return Err(handshake_error(
             "coordinator handshake nonce or protocol version did not match",
         ));
     }
     let runtime = spawn_controller_actor(stream);
     let token = CoordinatorToken {
-        repo_id: response.repo_id,
+        repo_id,
         channel: AuthenticatedControllerChannel {
             runtime: Arc::clone(&runtime),
         },
@@ -2006,12 +1981,8 @@ mod tests {
         } else {
             "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
         };
-        let response = serde_json::to_vec(&json!({
-            "version": HANDSHAKE_VERSION,
-            "nonce": nonce,
-            "repoId": "acme/widget",
-        }))
-        .unwrap();
+        let repo_id = RepoId::parse("acme/widget").unwrap();
+        let response = codec::encode_server_hello(nonce, &repo_id).unwrap();
         write_frame(&mut stream, &response).await
     }
 
@@ -2035,19 +2006,11 @@ mod tests {
         result: Value,
         binary_length: Option<usize>,
     ) {
-        let mut response = json!({
-            "id": id,
-            "ok": true,
-            "result": result,
-            "error": null,
-        });
-        if let Some(binary_length) = binary_length {
-            response
-                .as_object_mut()
-                .unwrap()
-                .insert("binaryLength".into(), json!(binary_length));
-        }
-        let response = serde_json::to_vec(&response).unwrap();
+        let binary_length = binary_length
+            .map(u32::try_from)
+            .transpose()
+            .expect("test binary length fits wire");
+        let response = codec::encode_rpc_success(id, &result, binary_length).unwrap();
         write_rpc_frame(stream, &response).await.unwrap();
     }
 
@@ -2629,6 +2592,30 @@ mod tests {
         );
         assert!(stdout.next().await.is_none());
         assert!(stderr.next().await.is_none());
+        server_task.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_codec_rejects_unknown_response_fields() {
+        let (runtime, mut server) = actor_pair();
+        let server_task = tokio::spawn(async move {
+            let (_, request) = read_rpc_request(&mut server).await;
+            let response = serde_json::to_vec(&json!({
+                "id": request["id"],
+                "ok": true,
+                "result": {},
+                "error": null,
+                "binaryLength": null,
+                "extra": true,
+            }))
+            .unwrap();
+            write_rpc_frame(&mut server, &response).await.unwrap();
+        });
+
+        let error = runtime.call("project.list", json!({})).await.unwrap_err();
+        assert!(error.message.contains("response decoding failed"));
+        assert!(error.message.contains("unknown field"));
         server_task.await.unwrap();
     }
 
