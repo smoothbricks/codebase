@@ -12,11 +12,11 @@ use cowshed_core::api::{
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::job_artifact::{
-    ArtifactConfig, ArtifactError, ArtifactStore, CommitmentPriorContext, OutputTargets,
-    ProtectedRecord, PublicationStage, StreamKind, StreamTarget, controller_commitment_schema,
-    controller_commitments_from_batch, controller_commitments_to_batch, open_stream_reader,
-    read_stream, reconcile_commitments, recover_records, recover_records_with_budget,
-    validate_commitments,
+    ArtifactConfig, ArtifactError, ArtifactStore, CommitmentPriorContext, JobArtifactToken,
+    OutputTargets, ProtectedRecord, PublicationStage, StreamKind, StreamTarget,
+    controller_commitment_schema, controller_commitments_from_batch,
+    controller_commitments_to_batch, open_stream_reader, read_stream, reconcile_commitments,
+    recover_records, recover_records_with_budget, validate_commitments,
 };
 use proptest::prelude::*;
 
@@ -75,6 +75,14 @@ fn store(root: &Path, config: ArtifactConfig) -> ArtifactStore {
     )
     .unwrap()
 }
+fn begin(
+    store: &mut ArtifactStore,
+    grant_revision: u64,
+    targets: OutputTargets,
+) -> JobArtifactToken {
+    let job_id = store.next_job_id().unwrap();
+    store.begin_job(job_id, grant_revision, targets).unwrap()
+}
 
 #[test]
 fn invalid_configs_are_rejected_before_creating_protected_layout() {
@@ -113,7 +121,7 @@ fn invalid_configs_are_rejected_before_creating_protected_layout() {
 #[test]
 fn threshold_crossing_spills_only_the_crossing_stream_and_round_trips_arrow() {
     let root = TempRoot::new("threshold");
-    let store = store(
+    let mut store = store(
         root.path(),
         ArtifactConfig {
             inline_cap_bytes: 4,
@@ -122,10 +130,10 @@ fn threshold_crossing_spills_only_the_crossing_stream_and_round_trips_arrow() {
             ..ArtifactConfig::default()
         },
     );
-    let mut writer = store.start_job(7, OutputTargets::default()).unwrap();
-    writer.write_stdout(b"four").unwrap();
-    writer.write_stderr(b"spill").unwrap();
-    let sealed = writer.seal(JobState::Exited).unwrap();
+    let token = begin(&mut store, 7, OutputTargets::default());
+    store.append(&token, StreamKind::Stdout, b"four").unwrap();
+    store.append(&token, StreamKind::Stderr, b"spill").unwrap();
+    let sealed = store.finish(token, JobState::Exited).unwrap();
 
     assert!(matches!(
         sealed.record.stdout.storage.artifact(),
@@ -190,7 +198,7 @@ fn threshold_crossing_spills_only_the_crossing_stream_and_round_trips_arrow() {
 #[test]
 fn supervisor_budget_is_shared_but_stdout_and_stderr_transition_independently() {
     let root = TempRoot::new("budget");
-    let store = store(
+    let mut store = store(
         root.path(),
         ArtifactConfig {
             inline_cap_bytes: 10,
@@ -199,12 +207,12 @@ fn supervisor_budget_is_shared_but_stdout_and_stderr_transition_independently() 
             ..ArtifactConfig::default()
         },
     );
-    let mut writer = store.start_job(1, OutputTargets::default()).unwrap();
-    writer.write_stdout(b"1234").unwrap();
+    let token = begin(&mut store, 1, OutputTargets::default());
+    store.append(&token, StreamKind::Stdout, b"1234").unwrap();
     assert_eq!(store.buffered_bytes(), 4);
-    writer.write_stderr(b"x").unwrap();
+    store.append(&token, StreamKind::Stderr, b"x").unwrap();
     assert_eq!(store.buffered_bytes(), 4);
-    let sealed = writer.seal(JobState::Exited).unwrap();
+    let sealed = store.finish(token, JobState::Exited).unwrap();
     assert!(matches!(
         sealed.record.stdout.storage.artifact(),
         ProtectedOutput::Inline { .. }
@@ -219,7 +227,7 @@ fn supervisor_budget_is_shared_but_stdout_and_stderr_transition_independently() 
 #[test]
 fn many_tiny_live_buffers_never_exceed_supervisor_retained_budget() {
     let root = TempRoot::new("many-tiny");
-    let store = store(
+    let mut store = store(
         root.path(),
         ArtifactConfig {
             inline_cap_bytes: 64,
@@ -228,21 +236,48 @@ fn many_tiny_live_buffers_never_exceed_supervisor_retained_budget() {
             ..ArtifactConfig::default()
         },
     );
-    let mut writers = Vec::new();
+    let mut tokens = Vec::new();
     for _ in 0..64 {
-        let mut writer = store.start_job(1, OutputTargets::default()).unwrap();
-        writer.write_stdout(b"x").unwrap();
+        let token = begin(&mut store, 1, OutputTargets::default());
+        store.append(&token, StreamKind::Stdout, b"x").unwrap();
         assert!(store.buffered_bytes() <= 16);
-        writers.push(writer);
+        tokens.push(token);
     }
-    drop(writers);
+    for token in tokens {
+        store.abort(token).unwrap();
+    }
     assert_eq!(store.buffered_bytes(), 0);
+}
+
+#[test]
+fn stale_and_foreign_tokens_are_typed_conflicts() {
+    let root = TempRoot::new("stale-token");
+    let mut actor_store = store(root.path(), ArtifactConfig::default());
+    let stale_id = actor_store.next_job_id().unwrap();
+    let stale = actor_store
+        .begin_job(stale_id, 1, OutputTargets::default())
+        .unwrap();
+    actor_store.abort(stale).unwrap();
+    assert!(matches!(
+        actor_store.begin_job(stale_id, 1, OutputTargets::default()),
+        Err(ArtifactError::TokenConflict { .. })
+    ));
+
+    let foreign_root = TempRoot::new("foreign-token");
+    let mut foreign_store = store(foreign_root.path(), ArtifactConfig::default());
+    let foreign = begin(&mut foreign_store, 1, OutputTargets::default());
+    assert!(matches!(
+        actor_store.append(&foreign, StreamKind::Stdout, b"foreign"),
+        Err(ArtifactError::TokenConflict { message, .. })
+            if message.contains("another artifact store")
+    ));
+    foreign_store.abort(foreign).unwrap();
 }
 
 #[test]
 fn combined_quota_accepts_exact_boundary_and_reports_first_crossing() {
     let exact_root = TempRoot::new("quota-exact");
-    let exact = store(
+    let mut exact = store(
         exact_root.path(),
         ArtifactConfig {
             inline_cap_bytes: 16,
@@ -251,18 +286,22 @@ fn combined_quota_accepts_exact_boundary_and_reports_first_crossing() {
             ..ArtifactConfig::default()
         },
     );
-    let mut exact_writer = exact.start_job(1, OutputTargets::default()).unwrap();
-    exact_writer.write_stdout(b"123").unwrap();
-    exact_writer.write_stderr(b"45").unwrap();
-    assert!(exact_writer.output_limit().is_none());
-    let exact_sealed = exact_writer.seal(JobState::Exited).unwrap();
+    let exact_token = begin(&mut exact, 1, OutputTargets::default());
+    exact
+        .append(&exact_token, StreamKind::Stdout, b"123")
+        .unwrap();
+    exact
+        .append(&exact_token, StreamKind::Stderr, b"45")
+        .unwrap();
+    assert!(exact.output_limit(&exact_token).unwrap().is_none());
+    let exact_sealed = exact.finish(exact_token, JobState::Exited).unwrap();
     assert_eq!(
         exact_sealed.record.stdout.bytes + exact_sealed.record.stderr.bytes,
         5
     );
 
     let crossed_root = TempRoot::new("quota-crossed");
-    let crossed = store(
+    let mut crossed = store(
         crossed_root.path(),
         ArtifactConfig {
             inline_cap_bytes: 16,
@@ -271,25 +310,32 @@ fn combined_quota_accepts_exact_boundary_and_reports_first_crossing() {
             ..ArtifactConfig::default()
         },
     );
-    let mut crossed_writer = crossed.start_job(1, OutputTargets::default()).unwrap();
-    crossed_writer.write_stdout(b"123").unwrap();
-    let error = crossed_writer.write_stderr(b"456").unwrap_err();
-    assert!(matches!(
-        error,
-        ArtifactError::OutputQuotaExceeded {
-            limit_bytes: 5,
-            crossing_bytes: 6
-        }
-    ));
-    assert_eq!(crossed_writer.output_limit().unwrap().crossing_bytes, 6);
-    assert!(matches!(
-        crossed_writer.write_stdout(b"ignored").unwrap_err(),
-        ArtifactError::OutputQuotaExceeded {
-            limit_bytes: 5,
-            crossing_bytes: 6
-        }
-    ));
-    let sealed = crossed_writer.seal(JobState::OutputLimit).unwrap();
+    let crossed_token = begin(&mut crossed, 1, OutputTargets::default());
+    crossed
+        .append(&crossed_token, StreamKind::Stdout, b"123")
+        .unwrap();
+    let crossing = crossed
+        .append(&crossed_token, StreamKind::Stderr, b"456")
+        .unwrap();
+    assert_eq!(crossing.accepted_bytes, 2);
+    assert_eq!(crossing.output_limit.as_ref().unwrap().limit_bytes, 5);
+    assert_eq!(crossing.output_limit.as_ref().unwrap().crossing_bytes, 6);
+    assert_eq!(
+        crossed
+            .output_limit(&crossed_token)
+            .unwrap()
+            .unwrap()
+            .crossing_bytes,
+        6
+    );
+    let rejected = crossed
+        .append(&crossed_token, StreamKind::Stdout, b"ignored")
+        .unwrap();
+    assert_eq!(rejected.accepted_bytes, 0);
+    assert_eq!(rejected.output_limit, crossing.output_limit);
+    let sealed = crossed
+        .finish(crossed_token, JobState::OutputLimit)
+        .unwrap();
     assert_eq!(sealed.record.stdout.bytes + sealed.record.stderr.bytes, 5);
     assert_eq!(sealed.record.output_limit, sealed.output_limit);
     assert_eq!(sealed.record.output_limit.as_ref().unwrap().limit_bytes, 5);
@@ -321,10 +367,10 @@ fn invalid_utf8_is_tagged_base64_and_survives_json_and_arrow() {
     assert!(BinaryData::new(vec![0; MAX_INLINE_OUTPUT_BYTES + 1]).is_err());
 
     let root = TempRoot::new("binary");
-    let store = store(root.path(), ArtifactConfig::default());
-    let mut writer = store.start_job(1, OutputTargets::default()).unwrap();
-    writer.write_stdout(&bytes).unwrap();
-    let sealed = writer.seal(JobState::Exited).unwrap();
+    let mut store = store(root.path(), ArtifactConfig::default());
+    let token = begin(&mut store, 1, OutputTargets::default());
+    store.append(&token, StreamKind::Stdout, &bytes).unwrap();
+    let sealed = store.finish(token, JobState::Exited).unwrap();
     let stream_json = serde_json::to_value(&sealed.record.stdout).unwrap();
     assert_eq!(
         stream_json["storage"]["artifact"]["data"]["encoding"],
@@ -347,17 +393,18 @@ fn invalid_utf8_is_tagged_base64_and_survives_json_and_arrow() {
 #[test]
 fn restart_allocates_after_inline_only_record_without_numeric_directory() {
     let root = TempRoot::new("restart");
-    let first = store(root.path(), ArtifactConfig::default());
-    let writer = first.start_job(1, OutputTargets::default()).unwrap();
-    assert_eq!(writer.job_id().get(), 1);
-    writer.seal(JobState::Exited).unwrap();
+    let mut first = store(root.path(), ArtifactConfig::default());
+    let first_token = begin(&mut first, 1, OutputTargets::default());
+    assert_eq!(first_token.job_id().get(), 1);
+    first.finish(first_token, JobState::Exited).unwrap();
     assert!(!root.path().join(".cowshed/job/1").exists());
     drop(first);
 
-    let restarted = store(root.path(), ArtifactConfig::default());
+    let mut restarted = store(root.path(), ArtifactConfig::default());
     assert_eq!(restarted.recovery().next_job_id.get(), 2);
-    let second = restarted.start_job(1, OutputTargets::default()).unwrap();
+    let second = begin(&mut restarted, 1, OutputTargets::default());
     assert_eq!(second.job_id().get(), 2);
+    restarted.abort(second).unwrap();
 }
 
 #[test]
@@ -382,7 +429,7 @@ fn redirect_sealing_uses_owned_descriptor_and_reads_only_independent_artifact() 
         unsafe { libc::fcntl(redirect_fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
         0
     );
-    let store = store(
+    let mut store = store(
         root.path(),
         ArtifactConfig {
             inline_cap_bytes: 2,
@@ -391,25 +438,26 @@ fn redirect_sealing_uses_owned_descriptor_and_reads_only_independent_artifact() 
             ..ArtifactConfig::default()
         },
     );
-    let mut writer = store
-        .start_job(
-            1,
-            OutputTargets {
-                stdout: StreamTarget::Redirect {
-                    source: source.clone(),
-                    descriptor,
-                },
-                stderr: StreamTarget::Captured,
+    let token = begin(
+        &mut store,
+        1,
+        OutputTargets {
+            stdout: StreamTarget::Redirect {
+                source: source.clone(),
+                descriptor,
             },
-        )
-        .unwrap();
+            stderr: StreamTarget::Captured,
+        },
+    );
     assert_ne!(
         unsafe { libc::fcntl(redirect_fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
         0
     );
-    writer.write_stdout(b"protected").unwrap();
+    store
+        .append(&token, StreamKind::Stdout, b"protected")
+        .unwrap();
     fs::write(root.path().join(source.as_path()), b"mutated before seal").unwrap();
-    let sealed = writer.seal(JobState::Exited).unwrap();
+    let sealed = store.finish(token, JobState::Exited).unwrap();
     assert!(matches!(
         sealed.record.stdout.storage,
         OutputStorage::Redirect {
@@ -443,12 +491,9 @@ fn redirect_sealing_uses_owned_descriptor_and_reads_only_independent_artifact() 
 #[test]
 fn recovery_truncates_only_incomplete_tail_and_rejects_complete_corruption() {
     let root = TempRoot::new("recovery-tail");
-    let store = store(root.path(), ArtifactConfig::default());
-    store
-        .start_job(1, OutputTargets::default())
-        .unwrap()
-        .seal(JobState::Exited)
-        .unwrap();
+    let mut store = store(root.path(), ArtifactConfig::default());
+    let token = begin(&mut store, 1, OutputTargets::default());
+    store.finish(token, JobState::Exited).unwrap();
     let records = root.path().join(".cowshed/job/records.arrow");
     let valid_len = fs::metadata(&records).unwrap().len();
     OpenOptions::new()
@@ -478,10 +523,12 @@ fn recovery_truncates_only_incomplete_tail_and_rejects_complete_corruption() {
 #[test]
 fn commitment_continuity_and_terminal_reconciliation_are_enforced() {
     let root = TempRoot::new("commitment-reconcile");
-    let store = store(root.path(), ArtifactConfig::default());
-    let mut writer = store.start_job(7, OutputTargets::default()).unwrap();
-    writer.write_stdout(b"authority").unwrap();
-    let sealed = writer.seal(JobState::Exited).unwrap();
+    let mut store = store(root.path(), ArtifactConfig::default());
+    let token = begin(&mut store, 7, OutputTargets::default());
+    store
+        .append(&token, StreamKind::Stdout, b"authority")
+        .unwrap();
+    let sealed = store.finish(token, JobState::Exited).unwrap();
     let repo_id = RepoId::parse("acme/widget").unwrap();
     let incarnation = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();
     let commitments = [
@@ -556,7 +603,7 @@ fn commitment_continuity_and_terminal_reconciliation_are_enforced() {
 #[test]
 fn checkpoint_reconciliation_rejects_altered_manifest_fields() {
     let root = TempRoot::new("checkpoint-reconcile");
-    let store = store(root.path(), ArtifactConfig::default());
+    let mut store = store(root.path(), ArtifactConfig::default());
     let sealed = store.checkpoint(1).unwrap();
     let recovery = recover_records(&root.path().join(".cowshed/job/records.arrow")).unwrap();
     let repo_id = RepoId::parse("acme/widget").unwrap();
@@ -674,24 +721,24 @@ fn sealed_output_publication_is_atomic_independent_and_policy_checked() {
 
     let root = TempRoot::new("publication");
     fs::create_dir(root.path().join("published")).unwrap();
-    let initial_store = store(
+    let mut initial_store = store(
         root.path(),
         ArtifactConfig {
             inline_cap_bytes: 4,
             ..ArtifactConfig::default()
         },
     );
-    let mut writer = initial_store
-        .start_job(1, OutputTargets::default())
+    let token = begin(&mut initial_store, 1, OutputTargets::default());
+    initial_store
+        .append(&token, StreamKind::Stdout, b"sealed output")
         .unwrap();
-    writer.write_stdout(b"sealed output").unwrap();
-    let sealed = writer.seal(JobState::Exited).unwrap();
+    let sealed = initial_store.finish(token, JobState::Exited).unwrap();
     let protected = match sealed.record.stdout.storage.artifact() {
         ProtectedOutput::File { path } => root.path().join(path.as_path()),
         ProtectedOutput::Inline { .. } => panic!("expected promoted protected output"),
     };
     drop(initial_store);
-    let store = store(
+    let mut store = store(
         root.path(),
         ArtifactConfig {
             inline_cap_bytes: 4,
@@ -761,16 +808,18 @@ fn output_publication_rejects_control_paths_symlinks_and_corrupt_evidence() {
     fs::create_dir(root.path().join("published")).unwrap();
     fs::create_dir(root.path().join("outside")).unwrap();
     symlink(root.path().join("outside"), root.path().join("linked")).unwrap();
-    let store = store(
+    let mut store = store(
         root.path(),
         ArtifactConfig {
             inline_cap_bytes: 1,
             ..ArtifactConfig::default()
         },
     );
-    let mut writer = store.start_job(1, OutputTargets::default()).unwrap();
-    writer.write_stdout(b"authority").unwrap();
-    let sealed = writer.seal(JobState::Exited).unwrap();
+    let token = begin(&mut store, 1, OutputTargets::default());
+    store
+        .append(&token, StreamKind::Stdout, b"authority")
+        .unwrap();
+    let sealed = store.finish(token, JobState::Exited).unwrap();
 
     for path in [".cowshed/leak", "linked/leak"] {
         let error = store
@@ -838,7 +887,7 @@ fn output_publication_rejects_control_paths_symlinks_and_corrupt_evidence() {
 #[test]
 fn checkpoint_and_background_force_every_visible_prefix_to_durable_files() {
     let root = TempRoot::new("checkpoint-prefixes");
-    let store = store(
+    let mut store = store(
         root.path(),
         ArtifactConfig {
             inline_cap_bytes: 64,
@@ -846,14 +895,13 @@ fn checkpoint_and_background_force_every_visible_prefix_to_durable_files() {
             ..ArtifactConfig::default()
         },
     );
-    let committed = store
-        .start_job(1, OutputTargets::default())
-        .unwrap()
-        .seal(JobState::Exited)
+    let committed_token = begin(&mut store, 1, OutputTargets::default());
+    let committed = store.finish(committed_token, JobState::Exited).unwrap();
+    let active_token = begin(&mut store, 2, OutputTargets::default());
+    store
+        .append(&active_token, StreamKind::Stdout, b"background-prefix")
         .unwrap();
-    let mut writer = store.start_job(2, OutputTargets::default()).unwrap();
-    writer.write_stdout(b"background-prefix").unwrap();
-    writer.prepare_background().unwrap();
+    store.prepare_background(&active_token).unwrap();
     assert_eq!(
         fs::read(root.path().join(".cowshed/job/2/out")).unwrap(),
         b"background-prefix"
@@ -878,7 +926,7 @@ fn checkpoint_and_background_force_every_visible_prefix_to_durable_files() {
         .record
         .visible_jobs
         .iter()
-        .find(|job| job.job_id == writer.job_id())
+        .find(|job| job.job_id == active_token.job_id())
         .unwrap();
     assert_eq!(active.stdout.bytes, b"background-prefix".len() as u64);
     assert_eq!(
@@ -896,7 +944,7 @@ fn checkpoint_and_background_force_every_visible_prefix_to_durable_files() {
             .any(|job| job.job_id == committed.record.job_id)
     );
 
-    drop(writer);
+    store.abort(active_token).unwrap();
     drop(store);
     let reopened = ArtifactStore::open(
         root.path(),
@@ -914,17 +962,19 @@ fn checkpoint_and_background_force_every_visible_prefix_to_durable_files() {
 #[test]
 fn open_rejects_missing_corrupt_and_swapped_file_backed_streams() {
     let root = TempRoot::new("open-file-validation");
-    let store = store(
+    let mut store = store(
         root.path(),
         ArtifactConfig {
             inline_cap_bytes: 1,
             ..ArtifactConfig::default()
         },
     );
-    let mut writer = store.start_job(1, OutputTargets::default()).unwrap();
-    writer.write_stdout(b"stdout-authority").unwrap();
-    writer.write_stderr(b"err").unwrap();
-    writer.seal(JobState::Exited).unwrap();
+    let token = begin(&mut store, 1, OutputTargets::default());
+    store
+        .append(&token, StreamKind::Stdout, b"stdout-authority")
+        .unwrap();
+    store.append(&token, StreamKind::Stderr, b"err").unwrap();
+    store.finish(token, JobState::Exited).unwrap();
     drop(store);
 
     let out = root.path().join(".cowshed/job/1/out");
@@ -995,7 +1045,7 @@ fn verified_file_rejects_each_metadata_length_and_hash_violation() {
         Mutation::Directory,
     ] {
         let root = TempRoot::new(&format!("verified-file-{mutation:?}"));
-        let store = store(
+        let mut store = store(
             root.path(),
             ArtifactConfig {
                 inline_cap_bytes: 1,
@@ -1003,9 +1053,9 @@ fn verified_file_rejects_each_metadata_length_and_hash_violation() {
             },
         );
         let expected = b"sealed-authority";
-        let mut writer = store.start_job(1, OutputTargets::default()).unwrap();
-        writer.write_stdout(expected).unwrap();
-        let sealed = writer.seal(JobState::Exited).unwrap();
+        let token = begin(&mut store, 1, OutputTargets::default());
+        store.append(&token, StreamKind::Stdout, expected).unwrap();
+        let sealed = store.finish(token, JobState::Exited).unwrap();
         let path = root.path().join(".cowshed/job/1/out");
 
         {
@@ -1104,16 +1154,18 @@ fn verified_open_rejects_a_symlinked_workspace_root() {
     let container = TempRoot::new("symlinked-workspace-root");
     let actual = container.path().join("actual");
     fs::create_dir(&actual).unwrap();
-    let store = store(
+    let mut store = store(
         &actual,
         ArtifactConfig {
             inline_cap_bytes: 1,
             ..ArtifactConfig::default()
         },
     );
-    let mut writer = store.start_job(1, OutputTargets::default()).unwrap();
-    writer.write_stdout(b"protected").unwrap();
-    let sealed = writer.seal(JobState::Exited).unwrap();
+    let token = begin(&mut store, 1, OutputTargets::default());
+    store
+        .append(&token, StreamKind::Stdout, b"protected")
+        .unwrap();
+    let sealed = store.finish(token, JobState::Exited).unwrap();
     let alias = container.path().join("alias");
     symlink(&actual, &alias).unwrap();
 
@@ -1126,8 +1178,8 @@ fn verified_open_rejects_a_symlinked_workspace_root() {
 #[test]
 fn streaming_recovery_enforces_retained_budget_before_payload_allocation() {
     let root = TempRoot::new("recovery-budget");
-    let store = store(root.path(), ArtifactConfig::default());
-    store.start_job(1, OutputTargets::default()).unwrap();
+    let mut store = store(root.path(), ArtifactConfig::default());
+    let _token = begin(&mut store, 1, OutputTargets::default());
     let records = root.path().join(".cowshed/job/records.arrow");
     let error = recover_records_with_budget(&records, 1).unwrap_err();
     assert!(matches!(
@@ -1143,18 +1195,19 @@ fn streaming_recovery_enforces_retained_budget_before_payload_allocation() {
 fn completion_seals_before_independent_publication_outcomes() {
     let root = TempRoot::new("seal-publish");
     fs::create_dir(root.path().join("published")).unwrap();
-    let store = store(
+    let mut store = store(
         root.path(),
         ArtifactConfig {
             inline_cap_bytes: 1,
             ..ArtifactConfig::default()
         },
     );
-    let mut writer = store.start_job(5, OutputTargets::default()).unwrap();
-    writer.write_stdout(b"stdout").unwrap();
-    writer.write_stderr(b"stderr").unwrap();
-    let completed = writer
-        .seal_and_publish(
+    let token = begin(&mut store, 5, OutputTargets::default());
+    store.append(&token, StreamKind::Stdout, b"stdout").unwrap();
+    store.append(&token, StreamKind::Stderr, b"stderr").unwrap();
+    let completed = store
+        .finish_and_publish(
+            token,
             JobState::Exited,
             Some(OutputPublication {
                 path: WorkspacePath::new(".cowshed/forbidden").unwrap(),
@@ -1195,7 +1248,7 @@ fn completion_seals_before_independent_publication_outcomes() {
 #[test]
 fn incremental_reader_verifies_large_files_while_vec_convenience_is_bounded() {
     let root = TempRoot::new("incremental-reader");
-    let store = store(
+    let mut store = store(
         root.path(),
         ArtifactConfig {
             inline_cap_bytes: 1,
@@ -1203,9 +1256,9 @@ fn incremental_reader_verifies_large_files_while_vec_convenience_is_bounded() {
         },
     );
     let bytes = vec![0x5a; MAX_INLINE_OUTPUT_BYTES + 1];
-    let mut writer = store.start_job(1, OutputTargets::default()).unwrap();
-    writer.write_stdout(&bytes).unwrap();
-    let sealed = writer.seal(JobState::Exited).unwrap();
+    let token = begin(&mut store, 1, OutputTargets::default());
+    store.append(&token, StreamKind::Stdout, &bytes).unwrap();
+    let sealed = store.finish(token, JobState::Exited).unwrap();
     assert!(matches!(
         read_stream(root.path(), &sealed.record.stdout),
         Err(ArtifactError::StreamTooLarge {
@@ -1252,7 +1305,7 @@ fn incremental_reader_verifies_large_files_while_vec_convenience_is_bounded() {
 fn verified_reader_bounds_chunks_and_finish_consumes_the_exact_remainder() {
     for inline_cap_bytes in [64, 1] {
         let root = TempRoot::new(&format!("reader-bound-{inline_cap_bytes}"));
-        let store = store(
+        let mut store = store(
             root.path(),
             ArtifactConfig {
                 inline_cap_bytes,
@@ -1260,9 +1313,9 @@ fn verified_reader_bounds_chunks_and_finish_consumes_the_exact_remainder() {
             },
         );
         let expected = b"abcdef";
-        let mut writer = store.start_job(1, OutputTargets::default()).unwrap();
-        writer.write_stdout(expected).unwrap();
-        let sealed = writer.seal(JobState::Exited).unwrap();
+        let token = begin(&mut store, 1, OutputTargets::default());
+        store.append(&token, StreamKind::Stdout, expected).unwrap();
+        let sealed = store.finish(token, JobState::Exited).unwrap();
 
         let mut partial = open_stream_reader(root.path(), &sealed.record.stdout).unwrap();
         assert_eq!(partial.read_chunk(&mut []).unwrap(), 0);
@@ -1286,12 +1339,9 @@ fn verified_reader_bounds_chunks_and_finish_consumes_the_exact_remainder() {
     }
 
     let empty_root = TempRoot::new("reader-empty");
-    let empty_store = store(empty_root.path(), ArtifactConfig::default());
-    let sealed = empty_store
-        .start_job(1, OutputTargets::default())
-        .unwrap()
-        .seal(JobState::Exited)
-        .unwrap();
+    let mut empty_store = store(empty_root.path(), ArtifactConfig::default());
+    let empty_token = begin(&mut empty_store, 1, OutputTargets::default());
+    let sealed = empty_store.finish(empty_token, JobState::Exited).unwrap();
     let mut empty = open_stream_reader(empty_root.path(), &sealed.record.stdout).unwrap();
     let mut byte = [0_u8; 1];
     assert_eq!(empty.read_chunk(&mut byte).unwrap(), 0);

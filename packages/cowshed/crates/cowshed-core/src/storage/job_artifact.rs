@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, ListArray, RecordBatch, StringArray, StructArray,
@@ -57,13 +57,13 @@ pub enum ArtifactError {
     Arrow(String),
     #[error("artifact integrity failure at byte {offset}: {message}")]
     Integrity { offset: u64, message: String },
-    #[error("combined output quota {limit_bytes} crossed at {crossing_bytes} bytes")]
-    OutputQuotaExceeded {
-        limit_bytes: u64,
-        crossing_bytes: u64,
+    #[error("artifact write integrity failure: {0}")]
+    WriteIntegrity(String),
+    #[error("artifact token conflict for job {job_id:?}: {message}")]
+    TokenConflict {
+        job_id: JobId,
+        message: &'static str,
     },
-    #[error("artifact writer is poisoned: {0}")]
-    WriterPoisoned(String),
     #[error("failed to secure redirect descriptor for {path}: {message}")]
     RedirectDescriptor { path: PathBuf, message: String },
     #[error(
@@ -445,30 +445,18 @@ pub struct RecoveryReport {
     pub next_job_id: JobId,
 }
 
-#[derive(Clone)]
 pub struct ArtifactStore {
-    inner: Arc<StoreInner>,
-}
-
-struct StoreInner {
     workspace_root: PathBuf,
+    token_namespace: Sha256Digest,
     repo_id: RepoId,
     workspace_incarnation: WorkspaceIncarnation,
     config: ArtifactConfig,
-    budget: Mutex<BufferBudget>,
-    allocation: Mutex<AllocationState>,
-    /// Lock order: `checkpoint_barrier`, checkpoint barrier id, a briefly-held `live_writers`
-    /// registry lock, an individual live writer, buffer budget, records lock, allocation,
-    /// committed jobs. The exclusive checkpoint holder snapshots the registry before writers.
-    checkpoint_barrier: RwLock<()>,
-    last_checkpoint_barrier: Mutex<u64>,
-    live_writers: Mutex<BTreeMap<JobId, Arc<Mutex<LiveJobState>>>>,
-    #[cfg(test)]
-    checkpoint_test_hook:
-        Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
-    records_lock: Mutex<()>,
-    records_poison: Mutex<Option<ArtifactError>>,
-    committed_jobs: Mutex<BTreeMap<JobId, JobArtifactRecord>>,
+    budget: BufferBudget,
+    next_job_id: u64,
+    next_sequence: u64,
+    last_checkpoint_barrier: u64,
+    live_jobs: BTreeMap<JobId, LiveJobState>,
+    committed_jobs: BTreeMap<JobId, JobArtifactRecord>,
     recovery: RecoveryReport,
 }
 
@@ -498,12 +486,6 @@ impl BufferBudget {
             .checked_sub(bytes)
             .expect("artifact stream releases only its own reservation");
     }
-}
-
-#[derive(Debug)]
-struct AllocationState {
-    next_job_id: u64,
-    next_sequence: u64,
 }
 
 impl ArtifactStore {
@@ -555,11 +537,10 @@ impl ArtifactStore {
             .max()
             .unwrap_or(0);
         let maximum = directory_max.max(record_max);
-        let next = maximum
+        let next_job_id = maximum
             .checked_add(1)
             .ok_or(ArtifactError::InvalidConfig("job id allocation exhausted"))?;
-        let next_job_id = JobId::new(next)?;
-        recovery.next_job_id = next_job_id;
+        recovery.next_job_id = JobId::new(next_job_id)?;
         let next_sequence = recovery
             .frames
             .iter()
@@ -573,7 +554,6 @@ impl ArtifactStore {
             .ok_or(ArtifactError::InvalidConfig(
                 "record sequence allocation exhausted",
             ))?;
-
         let last_checkpoint_barrier = recovery
             .frames
             .iter()
@@ -587,7 +567,6 @@ impl ArtifactStore {
             })
             .max()
             .unwrap_or(0);
-
         let mut committed_jobs = BTreeMap::new();
         for frame in &recovery.frames {
             let ProtectedRecord::Job(record) = &frame.record else {
@@ -605,234 +584,153 @@ impl ArtifactStore {
                 ));
             }
         }
-
+        let token_namespace = Sha256Digest::compute(workspace_root.as_os_str().as_encoded_bytes());
         Ok(Self {
-            inner: Arc::new(StoreInner {
-                workspace_root,
-                repo_id,
-                workspace_incarnation,
-                budget: Mutex::new(BufferBudget {
-                    used: 0,
-                    limit: config.supervisor_buffer_budget_bytes,
-                }),
-                allocation: Mutex::new(AllocationState {
-                    next_job_id: next,
-                    next_sequence,
-                }),
-                checkpoint_barrier: RwLock::new(()),
-                last_checkpoint_barrier: Mutex::new(last_checkpoint_barrier),
-                live_writers: Mutex::new(BTreeMap::new()),
-                #[cfg(test)]
-                checkpoint_test_hook: Mutex::new(None),
-                records_lock: Mutex::new(()),
-                records_poison: Mutex::new(None),
-                committed_jobs: Mutex::new(committed_jobs),
-                recovery,
-                config,
-            }),
+            workspace_root,
+            token_namespace,
+            repo_id,
+            workspace_incarnation,
+            budget: BufferBudget {
+                used: 0,
+                limit: config.supervisor_buffer_budget_bytes,
+            },
+            next_job_id,
+            next_sequence,
+            last_checkpoint_barrier,
+            live_jobs: BTreeMap::new(),
+            committed_jobs,
+            recovery,
+            config,
         })
     }
 
     pub fn recovery(&self) -> &RecoveryReport {
-        &self.inner.recovery
+        &self.recovery
+    }
+
+    pub fn next_job_id(&self) -> Result<JobId, ArtifactError> {
+        JobId::new(self.next_job_id).map_err(ArtifactError::from)
     }
 
     pub fn buffered_bytes(&self) -> usize {
-        self.inner.budget.lock().expect("buffer budget lock").used
+        self.budget.used
     }
 
-    pub fn start_job(
-        &self,
+    pub fn begin_job(
+        &mut self,
+        job_id: JobId,
         grant_revision: u64,
         mut targets: OutputTargets,
-    ) -> Result<JobArtifactWriter, ArtifactError> {
-        let _barrier = self
-            .inner
-            .checkpoint_barrier
-            .read()
-            .expect("checkpoint barrier");
-        secure_redirect_target(&self.inner.workspace_root, &mut targets.stdout)?;
-        secure_redirect_target(&self.inner.workspace_root, &mut targets.stderr)?;
-        let job_id = {
-            let mut allocation = self.inner.allocation.lock().expect("allocation lock");
-            let job_id = JobId::new(allocation.next_job_id)?;
-            allocation.next_job_id = allocation
-                .next_job_id
-                .checked_add(1)
-                .ok_or(ArtifactError::InvalidConfig("job id allocation exhausted"))?;
-            job_id
-        };
-
-        let empty_stdout = empty_stream(&targets.stdout)?;
-        let empty_stderr = empty_stream(&targets.stderr)?;
+    ) -> Result<JobArtifactToken, ArtifactError> {
+        if job_id.get() != self.next_job_id {
+            return Err(ArtifactError::TokenConflict {
+                job_id,
+                message: "job id is not the next expected artifact id",
+            });
+        }
+        if self.live_jobs.contains_key(&job_id) || self.committed_jobs.contains_key(&job_id) {
+            return Err(ArtifactError::TokenConflict {
+                job_id,
+                message: "job id already has artifact state",
+            });
+        }
+        let following_job_id = self
+            .next_job_id
+            .checked_add(1)
+            .ok_or(ArtifactError::InvalidConfig("job id allocation exhausted"))?;
+        secure_redirect_target(&self.workspace_root, &mut targets.stdout)?;
+        secure_redirect_target(&self.workspace_root, &mut targets.stderr)?;
         let admission = JobArtifactRecord {
-            repo_id: self.inner.repo_id.clone(),
-            workspace_incarnation: self.inner.workspace_incarnation.clone(),
+            repo_id: self.repo_id.clone(),
+            workspace_incarnation: self.workspace_incarnation.clone(),
             job_id,
             sequence: 0,
             state: JobState::Running,
             grant_revision,
             output_limit: None,
-            stdout: empty_stdout,
-            stderr: empty_stderr,
+            stdout: empty_stream(&targets.stdout)?,
+            stderr: empty_stream(&targets.stderr)?,
         };
         self.append_record(admission)?;
-        let state = Arc::new(Mutex::new(LiveJobState {
-            grant_revision,
-            stdout: StreamWriterState::new(StreamKind::Stdout, targets.stdout),
-            stderr: StreamWriterState::new(StreamKind::Stderr, targets.stderr),
-            quota: QuotaLedger {
-                accepted: 0,
-                limit: self.inner.config.combined_output_quota_bytes,
-                crossing: None,
-            },
-            sealed: false,
-            poisoned: None,
-        }));
-        let replaced = self
-            .inner
-            .live_writers
-            .lock()
-            .expect("live writers lock")
-            .insert(job_id, Arc::clone(&state));
-        debug_assert!(replaced.is_none(), "allocated job ids are unique");
-
-        Ok(JobArtifactWriter {
-            store: self.clone(),
+        let replaced = self.live_jobs.insert(
             job_id,
-            state,
+            LiveJobState {
+                grant_revision,
+                stdout: StreamWriterState::new(StreamKind::Stdout, targets.stdout),
+                stderr: StreamWriterState::new(StreamKind::Stderr, targets.stderr),
+                quota: QuotaLedger {
+                    accepted: 0,
+                    limit: self.config.combined_output_quota_bytes,
+                    crossing: None,
+                },
+                failed: false,
+            },
+        );
+        debug_assert!(replaced.is_none(), "validated job ids are unique");
+        self.next_job_id = following_job_id;
+        Ok(JobArtifactToken {
+            job_id,
+            namespace: self.token_namespace,
         })
     }
 
     fn append_record(
-        &self,
+        &mut self,
         mut record: JobArtifactRecord,
     ) -> Result<(JobArtifactRecord, Sha256Digest), ArtifactError> {
-        if let Some(error) = self
-            .inner
-            .records_poison
-            .lock()
-            .expect("records poison lock")
-            .clone()
-        {
-            return Err(error);
-        }
-        let _guard = self.inner.records_lock.lock().expect("records lock");
         if !matches!(record.state, JobState::Queued | JobState::Running)
-            && self
-                .inner
-                .committed_jobs
-                .lock()
-                .expect("committed jobs lock")
-                .contains_key(&record.job_id)
+            && self.committed_jobs.contains_key(&record.job_id)
         {
             return Err(integrity(
                 0,
                 "duplicate terminal artifact record for job id",
             ));
         }
-        let mut allocation = self.inner.allocation.lock().expect("allocation lock");
-        record.sequence = allocation.next_sequence;
+        record.sequence = self.next_sequence;
         record.validate()?;
         let batch = protected_record_to_batch(&ProtectedRecord::Job(record.clone()))?;
         let payload = encode_batch(&batch)?;
         let digest = Sha256Digest::compute(&payload);
-        if let Err(error) =
-            append_framed_batch(&records_path(&self.inner.workspace_root), &payload, digest)
-        {
-            if matches!(error, ArtifactError::WriterPoisoned(_)) {
-                *self
-                    .inner
-                    .records_poison
-                    .lock()
-                    .expect("records poison lock") = Some(error.clone());
-            }
-            return Err(error);
-        }
-        allocation.next_sequence =
-            allocation
-                .next_sequence
+        append_framed_batch(&records_path(&self.workspace_root), &payload, digest)?;
+        self.next_sequence =
+            self.next_sequence
                 .checked_add(1)
                 .ok_or(ArtifactError::InvalidConfig(
                     "record sequence allocation exhausted",
                 ))?;
         if !matches!(record.state, JobState::Queued | JobState::Running) {
-            self.inner
-                .committed_jobs
-                .lock()
-                .expect("committed jobs lock")
-                .insert(record.job_id, record.clone());
+            self.committed_jobs.insert(record.job_id, record.clone());
         }
         Ok((record, digest))
     }
 
-    /// Atomically freezes artifact admissions and writes, durably materializes every visible
-    /// stream, and appends a manifest whose records digest is computed under the records lock.
-    pub fn checkpoint(&self, barrier_id: u64) -> Result<SealedCheckpointManifest, ArtifactError> {
+    pub fn checkpoint(
+        &mut self,
+        barrier_id: u64,
+    ) -> Result<SealedCheckpointManifest, ArtifactError> {
         if barrier_id == 0 {
             return Err(integrity(0, "checkpoint barrier id must be positive"));
         }
-        let _barrier = self
-            .inner
-            .checkpoint_barrier
-            .write()
-            .expect("checkpoint barrier");
-        if barrier_id
-            <= *self
-                .inner
-                .last_checkpoint_barrier
-                .lock()
-                .expect("checkpoint barrier id")
-        {
+        if barrier_id <= self.last_checkpoint_barrier {
             return Err(integrity(
                 0,
                 "checkpoint barrier id must increase monotonically",
             ));
         }
-        #[cfg(test)]
-        if let Some((entered, resume)) = self
-            .inner
-            .checkpoint_test_hook
-            .lock()
-            .expect("checkpoint test hook")
-            .take()
-        {
-            entered.send(()).expect("checkpoint test entered receiver");
-            resume.recv().expect("checkpoint test resume sender");
-        }
-        let live = self
-            .inner
-            .live_writers
-            .lock()
-            .expect("live writers lock")
-            .iter()
-            .map(|(job_id, state)| (*job_id, Arc::clone(state)))
-            .collect::<Vec<_>>();
         let mut visible = self
-            .inner
             .committed_jobs
-            .lock()
-            .expect("committed jobs lock")
             .values()
             .map(VisibleJobCommitment::from_record)
             .collect::<BTreeMap<_, _>>();
-        for (job_id, state) in live {
-            let mut state = state.lock().expect("live writer lock");
-            let commitment = state.durable_commitment(self, job_id)?;
+        let workspace_root = &self.workspace_root;
+        let workspace_incarnation = &self.workspace_incarnation;
+        let budget = &mut self.budget;
+        for (&job_id, state) in &mut self.live_jobs {
+            let commitment =
+                state.durable_commitment(workspace_root, budget, workspace_incarnation, job_id)?;
             visible.insert(job_id, commitment);
         }
-
-        if let Some(error) = self
-            .inner
-            .records_poison
-            .lock()
-            .expect("records poison lock")
-            .clone()
-        {
-            return Err(error);
-        }
-        let _records = self.inner.records_lock.lock().expect("records lock");
-        let path = records_path(&self.inner.workspace_root);
+        let path = records_path(&self.workspace_root);
         let records_sha256 = match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.len() == 0 => Sha256Digest::compute(RECORD_MAGIC),
             Ok(_) => hash_file_incrementally(&path)?,
@@ -843,8 +741,8 @@ impl ArtifactStore {
         };
         let record = CheckpointManifestRecord {
             version: RECORD_SCHEMA_VERSION as u16,
-            repo_id: self.inner.repo_id.clone(),
-            origin_incarnation: self.inner.workspace_incarnation.clone(),
+            repo_id: self.repo_id.clone(),
+            origin_incarnation: self.workspace_incarnation.clone(),
             barrier_id,
             visible_jobs: visible.into_values().collect(),
             records_sha256,
@@ -854,21 +752,8 @@ impl ArtifactStore {
             protected_record_to_batch(&ProtectedRecord::CheckpointManifest(record.clone()))?;
         let payload = encode_batch(&batch)?;
         let manifest_batch_sha256 = Sha256Digest::compute(&payload);
-        if let Err(error) = append_framed_batch(&path, &payload, manifest_batch_sha256) {
-            if matches!(error, ArtifactError::WriterPoisoned(_)) {
-                *self
-                    .inner
-                    .records_poison
-                    .lock()
-                    .expect("records poison lock") = Some(error.clone());
-            }
-            return Err(error);
-        }
-        *self
-            .inner
-            .last_checkpoint_barrier
-            .lock()
-            .expect("checkpoint barrier id") = barrier_id;
+        append_framed_batch(&path, &payload, manifest_batch_sha256)?;
+        self.last_checkpoint_barrier = barrier_id;
         Ok(SealedCheckpointManifest {
             record,
             manifest_batch_sha256,
@@ -876,8 +761,7 @@ impl ArtifactStore {
     }
 
     pub fn records_prefix_sha256(&self) -> Result<Sha256Digest, ArtifactError> {
-        let _records = self.inner.records_lock.lock().expect("records lock");
-        hash_file_incrementally(&records_path(&self.inner.workspace_root))
+        hash_file_incrementally(&records_path(&self.workspace_root))
     }
 }
 
@@ -963,12 +847,13 @@ struct QuotaLedger {
 }
 
 impl QuotaLedger {
-    fn preview(&self, requested: usize) -> Result<QuotaAdmission, ArtifactError> {
-        if let Some(crossing_bytes) = self.crossing {
-            return Err(ArtifactError::OutputQuotaExceeded {
-                limit_bytes: self.limit,
-                crossing_bytes,
-            });
+    fn preview(&self, requested: usize) -> QuotaAdmission {
+        if let Some(crossing) = self.crossing {
+            return QuotaAdmission {
+                accepted: 0,
+                total: self.accepted,
+                crossing: Some(crossing),
+            };
         }
         let requested_u64 = u64::try_from(requested).unwrap_or(u64::MAX);
         let observed = self.accepted.saturating_add(requested_u64);
@@ -979,16 +864,23 @@ impl QuotaLedger {
                 .unwrap_or(usize::MAX)
                 .min(requested)
         };
-        Ok(QuotaAdmission {
+        QuotaAdmission {
             accepted,
             total: self.accepted.saturating_add(accepted as u64),
             crossing: (observed > self.limit).then_some(observed),
-        })
+        }
     }
 
     fn commit(&mut self, admission: QuotaAdmission) {
         self.accepted = admission.total;
         self.crossing = admission.crossing;
+    }
+
+    fn output_limit(&self) -> Option<OutputLimitInfo> {
+        self.crossing.map(|crossing_bytes| OutputLimitInfo {
+            limit_bytes: self.limit,
+            crossing_bytes,
+        })
     }
 }
 
@@ -1004,207 +896,56 @@ struct LiveJobState {
     stdout: StreamWriterState,
     stderr: StreamWriterState,
     quota: QuotaLedger,
-    sealed: bool,
-    poisoned: Option<ArtifactError>,
+    failed: bool,
 }
 
 impl LiveJobState {
     fn durable_commitment(
         &mut self,
-        store: &ArtifactStore,
+        workspace_root: &Path,
+        budget: &mut BufferBudget,
+        workspace_incarnation: &WorkspaceIncarnation,
         job_id: JobId,
     ) -> Result<VisibleJobCommitment, ArtifactError> {
-        if let Some(error) = &self.poisoned {
-            return Err(error.clone());
+        if self.failed {
+            return Err(ArtifactError::TokenConflict {
+                job_id,
+                message: "job artifact stream failed; abort is required",
+            });
         }
-        let stdout = self.stdout.durable_prefix(store, job_id)?;
-        let stderr = self.stderr.durable_prefix(store, job_id)?;
+        let stdout = self.stdout.durable_prefix(workspace_root, budget, job_id)?;
+        let stderr = self.stderr.durable_prefix(workspace_root, budget, job_id)?;
         Ok(VisibleJobCommitment {
-            workspace_incarnation: store.inner.workspace_incarnation.clone(),
+            workspace_incarnation: workspace_incarnation.clone(),
             job_id,
             state: JobState::Running,
             stdout: VisibleStreamCommitment::from_stream(&stdout),
             stderr: VisibleStreamCommitment::from_stream(&stderr),
         })
     }
+
+    fn release_budget(&mut self, budget: &mut BufferBudget) {
+        self.stdout.release_reserved(budget);
+        self.stderr.release_reserved(budget);
+    }
 }
 
-pub struct JobArtifactWriter {
-    store: ArtifactStore,
+#[derive(Debug, Eq, PartialEq)]
+pub struct JobArtifactToken {
     job_id: JobId,
-    state: Arc<Mutex<LiveJobState>>,
+    namespace: Sha256Digest,
 }
 
-impl JobArtifactWriter {
+impl JobArtifactToken {
     pub fn job_id(&self) -> JobId {
         self.job_id
     }
-
-    pub fn write_stdout(&mut self, bytes: &[u8]) -> Result<(), ArtifactError> {
-        self.write(StreamKind::Stdout, bytes)
-    }
-
-    pub fn write_stderr(&mut self, bytes: &[u8]) -> Result<(), ArtifactError> {
-        self.write(StreamKind::Stderr, bytes)
-    }
-
-    fn write(&mut self, stream: StreamKind, bytes: &[u8]) -> Result<(), ArtifactError> {
-        let _barrier = self
-            .store
-            .inner
-            .checkpoint_barrier
-            .read()
-            .expect("checkpoint barrier");
-        let mut live = self.state.lock().expect("live writer lock");
-        if let Some(error) = &live.poisoned {
-            return Err(error.clone());
-        }
-        let admission = live.quota.preview(bytes.len())?;
-        if admission.accepted != 0 {
-            let state = match stream {
-                StreamKind::Stdout => &mut live.stdout,
-                StreamKind::Stderr => &mut live.stderr,
-            };
-            if let Err(error) = state.append(&self.store, self.job_id, &bytes[..admission.accepted])
-            {
-                let poisoned = ArtifactError::WriterPoisoned(error.to_string());
-                live.poisoned = Some(poisoned.clone());
-                return Err(poisoned);
-            }
-        }
-        live.quota.commit(admission);
-        match admission.crossing {
-            Some(crossing_bytes) => Err(ArtifactError::OutputQuotaExceeded {
-                limit_bytes: live.quota.limit,
-                crossing_bytes,
-            }),
-            None => Ok(()),
-        }
-    }
-
-    pub fn output_limit(&self) -> Option<OutputLimitInfo> {
-        let live = self.state.lock().expect("live writer lock");
-        live.quota.crossing.map(|crossing_bytes| OutputLimitInfo {
-            limit_bytes: live.quota.limit,
-            crossing_bytes,
-        })
-    }
-
-    /// Makes both captured prefixes durable before the supervisor acknowledges backgrounding.
-    pub fn prepare_background(&self) -> Result<(), ArtifactError> {
-        let _barrier = self
-            .store
-            .inner
-            .checkpoint_barrier
-            .read()
-            .expect("checkpoint barrier");
-        let mut live = self.state.lock().expect("live writer lock");
-        if let Some(error) = &live.poisoned {
-            return Err(error.clone());
-        }
-        live.stdout.durable_prefix(&self.store, self.job_id)?;
-        live.stderr.durable_prefix(&self.store, self.job_id)?;
-        Ok(())
-    }
-
-    pub fn seal(self, state: JobState) -> Result<SealedJobArtifacts, ArtifactError> {
-        let _barrier = self
-            .store
-            .inner
-            .checkpoint_barrier
-            .read()
-            .expect("checkpoint barrier");
-        let mut live = self.state.lock().expect("live writer lock");
-        if let Some(error) = &live.poisoned {
-            return Err(error.clone());
-        }
-        if matches!(state, JobState::Queued | JobState::Running) {
-            return Err(ArtifactError::InvalidTerminalState(
-                "seal requires a terminal job state",
-            ));
-        }
-        if live.quota.crossing.is_some() != matches!(state, JobState::OutputLimit) {
-            return Err(ArtifactError::InvalidTerminalState(
-                "output-limit state must agree with quota crossing",
-            ));
-        }
-        let output_limit = live.quota.crossing.map(|crossing_bytes| OutputLimitInfo {
-            limit_bytes: live.quota.limit,
-            crossing_bytes,
-        });
-        let stdout = live.stdout.finish(&self.store, self.job_id)?;
-        let stderr = live.stderr.finish(&self.store, self.job_id)?;
-        let record = JobArtifactRecord {
-            repo_id: self.store.inner.repo_id.clone(),
-            workspace_incarnation: self.store.inner.workspace_incarnation.clone(),
-            job_id: self.job_id,
-            sequence: 0,
-            state,
-            grant_revision: live.grant_revision,
-            output_limit: output_limit.clone(),
-            stdout,
-            stderr,
-        };
-        let (record, terminal_batch_sha256) = self.store.append_record(record)?;
-        live.sealed = true;
-        drop(live);
-        self.store
-            .inner
-            .live_writers
-            .lock()
-            .expect("live writers lock")
-            .remove(&self.job_id);
-        Ok(SealedJobArtifacts {
-            record,
-            terminal_batch_sha256,
-            output_limit,
-        })
-    }
-
-    /// Establishes the durable terminal record before independently attempting publications.
-    pub fn seal_and_publish(
-        self,
-        state: JobState,
-        stdout: Option<OutputPublication>,
-        stderr: Option<OutputPublication>,
-    ) -> Result<CompletedJobArtifacts, ArtifactError> {
-        let store = self.store.clone();
-        let sealed = self.seal(state)?;
-        let job_id = sealed.record.job_id;
-        let stdout_publication = stdout
-            .as_ref()
-            .map(|request| store.publish_output(job_id, StreamKind::Stdout, request));
-        let stderr_publication = stderr
-            .as_ref()
-            .map(|request| store.publish_output(job_id, StreamKind::Stderr, request));
-        Ok(CompletedJobArtifacts {
-            sealed,
-            stdout_publication,
-            stderr_publication,
-        })
-    }
 }
 
-impl Drop for JobArtifactWriter {
-    fn drop(&mut self) {
-        let _barrier = self
-            .store
-            .inner
-            .checkpoint_barrier
-            .read()
-            .expect("checkpoint barrier");
-        let mut live = self.state.lock().expect("live writer lock");
-        if !live.sealed {
-            live.stdout.release_budget(&self.store);
-            live.stderr.release_budget(&self.store);
-            self.store
-                .inner
-                .live_writers
-                .lock()
-                .expect("live writers lock")
-                .remove(&self.job_id);
-        }
-    }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppendOutcome {
+    pub accepted_bytes: usize,
+    pub output_limit: Option<OutputLimitInfo>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1228,31 +969,219 @@ pub struct SealedCheckpointManifest {
 }
 
 impl ArtifactStore {
-    pub fn publish_output(
+    fn validate_token(&self, token: &JobArtifactToken) -> Result<(), ArtifactError> {
+        if token.namespace != self.token_namespace {
+            return Err(ArtifactError::TokenConflict {
+                job_id: token.job_id,
+                message: "token belongs to another artifact store",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn append(
+        &mut self,
+        token: &JobArtifactToken,
+        stream: StreamKind,
+        bytes: &[u8],
+    ) -> Result<AppendOutcome, ArtifactError> {
+        self.validate_token(token)?;
+        let workspace_root = &self.workspace_root;
+        let inline_cap_bytes = self.config.inline_cap_bytes;
+        let budget = &mut self.budget;
+        let live = self
+            .live_jobs
+            .get_mut(&token.job_id)
+            .ok_or(ArtifactError::TokenConflict {
+                job_id: token.job_id,
+                message: "token does not name a live job",
+            })?;
+        if live.failed {
+            return Err(ArtifactError::TokenConflict {
+                job_id: token.job_id,
+                message: "job artifact stream failed; abort is required",
+            });
+        }
+        let admission = live.quota.preview(bytes.len());
+        if admission.accepted != 0 {
+            let writer = match stream {
+                StreamKind::Stdout => &mut live.stdout,
+                StreamKind::Stderr => &mut live.stderr,
+            };
+            if let Err(error) = writer.append(
+                workspace_root,
+                inline_cap_bytes,
+                budget,
+                token.job_id,
+                &bytes[..admission.accepted],
+            ) {
+                live.failed = true;
+                return Err(error);
+            }
+        }
+        live.quota.commit(admission);
+        Ok(AppendOutcome {
+            accepted_bytes: admission.accepted,
+            output_limit: live.quota.output_limit(),
+        })
+    }
+
+    pub fn output_limit(
         &self,
+        token: &JobArtifactToken,
+    ) -> Result<Option<OutputLimitInfo>, ArtifactError> {
+        self.validate_token(token)?;
+        let live = self
+            .live_jobs
+            .get(&token.job_id)
+            .ok_or(ArtifactError::TokenConflict {
+                job_id: token.job_id,
+                message: "token does not name a live job",
+            })?;
+        Ok(live.quota.output_limit())
+    }
+
+    /// Makes both captured prefixes durable before the supervisor acknowledges backgrounding.
+    pub fn prepare_background(&mut self, token: &JobArtifactToken) -> Result<(), ArtifactError> {
+        self.validate_token(token)?;
+        let workspace_root = &self.workspace_root;
+        let budget = &mut self.budget;
+        let live = self
+            .live_jobs
+            .get_mut(&token.job_id)
+            .ok_or(ArtifactError::TokenConflict {
+                job_id: token.job_id,
+                message: "token does not name a live job",
+            })?;
+        if live.failed {
+            return Err(ArtifactError::TokenConflict {
+                job_id: token.job_id,
+                message: "job artifact stream failed; abort is required",
+            });
+        }
+        live.stdout
+            .durable_prefix(workspace_root, budget, token.job_id)?;
+        live.stderr
+            .durable_prefix(workspace_root, budget, token.job_id)?;
+        Ok(())
+    }
+
+    pub fn finish(
+        &mut self,
+        token: JobArtifactToken,
+        state: JobState,
+    ) -> Result<SealedJobArtifacts, ArtifactError> {
+        self.validate_token(&token)?;
+        let mut live =
+            self.live_jobs
+                .remove(&token.job_id)
+                .ok_or(ArtifactError::TokenConflict {
+                    job_id: token.job_id,
+                    message: "token does not name a live job",
+                })?;
+        let output_limit = live.quota.output_limit();
+        let result = (|| {
+            if live.failed {
+                return Err(ArtifactError::TokenConflict {
+                    job_id: token.job_id,
+                    message: "job artifact stream failed; abort was required",
+                });
+            }
+            if matches!(state, JobState::Queued | JobState::Running) {
+                return Err(ArtifactError::InvalidTerminalState(
+                    "finish requires a terminal job state",
+                ));
+            }
+            if live.quota.crossing.is_some() != matches!(state, JobState::OutputLimit) {
+                return Err(ArtifactError::InvalidTerminalState(
+                    "output-limit state must agree with quota crossing",
+                ));
+            }
+            let stdout =
+                live.stdout
+                    .finish(&self.workspace_root, &mut self.budget, token.job_id)?;
+            let stderr =
+                live.stderr
+                    .finish(&self.workspace_root, &mut self.budget, token.job_id)?;
+            let record = JobArtifactRecord {
+                repo_id: self.repo_id.clone(),
+                workspace_incarnation: self.workspace_incarnation.clone(),
+                job_id: token.job_id,
+                sequence: 0,
+                state,
+                grant_revision: live.grant_revision,
+                output_limit: output_limit.clone(),
+                stdout,
+                stderr,
+            };
+            let (record, terminal_batch_sha256) = self.append_record(record)?;
+            Ok(SealedJobArtifacts {
+                record,
+                terminal_batch_sha256,
+                output_limit,
+            })
+        })();
+        if result.is_err() {
+            live.release_budget(&mut self.budget);
+        }
+        result
+    }
+
+    pub fn abort(&mut self, token: JobArtifactToken) -> Result<(), ArtifactError> {
+        self.validate_token(&token)?;
+        let mut live =
+            self.live_jobs
+                .remove(&token.job_id)
+                .ok_or(ArtifactError::TokenConflict {
+                    job_id: token.job_id,
+                    message: "token does not name a live job",
+                })?;
+        live.release_budget(&mut self.budget);
+        Ok(())
+    }
+
+    /// Establishes the durable terminal record before independently attempting publications.
+    pub fn finish_and_publish(
+        &mut self,
+        token: JobArtifactToken,
+        state: JobState,
+        stdout: Option<OutputPublication>,
+        stderr: Option<OutputPublication>,
+    ) -> Result<CompletedJobArtifacts, ArtifactError> {
+        let sealed = self.finish(token, state)?;
+        let job_id = sealed.record.job_id;
+        let stdout_publication = stdout
+            .as_ref()
+            .map(|request| self.publish_output(job_id, StreamKind::Stdout, request));
+        let stderr_publication = stderr
+            .as_ref()
+            .map(|request| self.publish_output(job_id, StreamKind::Stderr, request));
+        Ok(CompletedJobArtifacts {
+            sealed,
+            stdout_publication,
+            stderr_publication,
+        })
+    }
+
+    pub fn publish_output(
+        &mut self,
         job_id: JobId,
         stream: StreamKind,
         publication: &OutputPublication,
     ) -> Result<(), ArtifactError> {
-        let info = {
-            let jobs = self
-                .inner
-                .committed_jobs
-                .lock()
-                .expect("committed jobs lock");
-            let record = jobs
+        let record =
+            self.committed_jobs
                 .get(&job_id)
                 .ok_or_else(|| ArtifactError::Publication {
                     path: publication.path.as_path().to_owned(),
                     stage: PublicationStage::ValidateDestination,
                     message: "job has no durable terminal artifact record".into(),
                 })?;
-            match stream {
-                StreamKind::Stdout => record.stdout.clone(),
-                StreamKind::Stderr => record.stderr.clone(),
-            }
+        let info = match stream {
+            StreamKind::Stdout => &record.stdout,
+            StreamKind::Stderr => &record.stderr,
         };
-        publication::publish(&self.inner.workspace_root, &info, publication)
+        publication::publish(&self.workspace_root, info, publication)
     }
 }
 
@@ -1281,18 +1210,20 @@ impl StreamWriterState {
 
     fn append(
         &mut self,
-        store: &ArtifactStore,
+        workspace_root: &Path,
+        inline_cap_bytes: usize,
+        budget: &mut BufferBudget,
         job_id: JobId,
         bytes: &[u8],
     ) -> Result<(), ArtifactError> {
         if self.buffer.is_some() {
-            if !self.try_buffer_append(store, bytes)? {
-                self.transition_from_buffer(store, job_id)?;
-                let path = protected_absolute(store, job_id, self.kind);
+            if !self.try_buffer_append(inline_cap_bytes, budget, bytes)? {
+                self.transition_from_buffer(workspace_root, budget, job_id)?;
+                let path = protected_absolute(workspace_root, job_id, self.kind);
                 self.protected_file
                     .as_mut()
                     .ok_or_else(|| {
-                        ArtifactError::WriterPoisoned(
+                        ArtifactError::WriteIntegrity(
                             "spill transition has no canonical file".into(),
                         )
                     })?
@@ -1300,21 +1231,19 @@ impl StreamWriterState {
                     .map_err(|error| io_error(&path, error))?;
             }
         } else {
-            let path = protected_absolute(store, job_id, self.kind);
+            let path = protected_absolute(workspace_root, job_id, self.kind);
             self.protected_file
                 .as_mut()
                 .expect("spill file exists")
                 .write_all(bytes)
                 .map_err(|error| io_error(&path, error))?;
         }
-
         if let StreamTarget::Redirect { source, descriptor } = &mut self.target {
-            let path = store.inner.workspace_root.join(source.as_path());
+            let path = workspace_root.join(source.as_path());
             descriptor
                 .write_all(bytes)
                 .map_err(|error| io_error(&path, error))?;
         }
-
         self.bytes = self.bytes.checked_add(bytes.len() as u64).ok_or(
             ArtifactError::InvalidTerminalState("stream byte count overflow"),
         )?;
@@ -1324,19 +1253,19 @@ impl StreamWriterState {
 
     fn try_buffer_append(
         &mut self,
-        store: &ArtifactStore,
+        inline_cap_bytes: usize,
+        budget: &mut BufferBudget,
         bytes: &[u8],
     ) -> Result<bool, ArtifactError> {
         let buffer = self.buffer.as_mut().expect("buffer state was checked");
         let Some(desired_len) = buffer.len().checked_add(bytes.len()) else {
             return Ok(false);
         };
-        if desired_len > store.inner.config.inline_cap_bytes {
+        if desired_len > inline_cap_bytes {
             return Ok(false);
         }
         let old_capacity = buffer.capacity();
         let reserved_growth = desired_len.saturating_sub(old_capacity);
-        let mut budget = store.inner.budget.lock().expect("buffer budget lock");
         if !budget.try_reserve(reserved_growth) {
             return Ok(false);
         }
@@ -1366,35 +1295,36 @@ impl StreamWriterState {
 
     fn transition_from_buffer(
         &mut self,
-        store: &ArtifactStore,
+        workspace_root: &Path,
+        budget: &mut BufferBudget,
         job_id: JobId,
     ) -> Result<(), ArtifactError> {
         let buffered = self.buffer.as_ref().expect("transition requires a buffer");
-        let path = protected_absolute(store, job_id, self.kind);
-        let mut file = create_protected_file(store, job_id, self.kind)?;
+        let path = protected_absolute(workspace_root, job_id, self.kind);
+        let mut file = create_protected_file(workspace_root, job_id, self.kind)?;
         if let Err(error) = file.write_all(buffered) {
             self.protected_file = Some(file);
             return Err(io_error(&path, error));
         }
         self.protected_file = Some(file);
         self.buffer = None;
-        self.release_reserved(store);
+        self.release_reserved(budget);
         Ok(())
     }
 
     fn durable_prefix(
         &mut self,
-        store: &ArtifactStore,
+        workspace_root: &Path,
+        budget: &mut BufferBudget,
         job_id: JobId,
     ) -> Result<StreamInfo, ArtifactError> {
         if self.buffer.is_some() {
-            self.transition_from_buffer(store, job_id)?;
+            self.transition_from_buffer(workspace_root, budget, job_id)?;
         }
-        let path = protected_absolute(store, job_id, self.kind);
-        let file = self
-            .protected_file
-            .as_mut()
-            .ok_or_else(|| ArtifactError::WriterPoisoned("durable prefix has no file".into()))?;
+        let path = protected_absolute(workspace_root, job_id, self.kind);
+        let file = self.protected_file.as_mut().ok_or_else(|| {
+            ArtifactError::WriteIntegrity("durable prefix has no canonical file".into())
+        })?;
         file.flush().map_err(|error| io_error(&path, error))?;
         set_sealed_permissions(file, &path)?;
         file.sync_all().map_err(|error| io_error(&path, error))?;
@@ -1423,19 +1353,20 @@ impl StreamWriterState {
 
     fn finish(
         &mut self,
-        store: &ArtifactStore,
+        workspace_root: &Path,
+        budget: &mut BufferBudget,
         job_id: JobId,
     ) -> Result<StreamInfo, ArtifactError> {
         let digest = Sha256Digest::from_bytes(self.hasher.clone().finalize().into());
         let target = std::mem::replace(&mut self.target, StreamTarget::Captured);
         if let StreamTarget::Redirect { source, descriptor } = &target {
-            let source_absolute = store.inner.workspace_root.join(source.as_path());
+            let source_absolute = workspace_root.join(source.as_path());
             descriptor
                 .sync_all()
                 .map_err(|error| io_error(&source_absolute, error))?;
         }
         let artifact = if let Some(buffer) = self.buffer.take() {
-            self.release_reserved(store);
+            self.release_reserved(budget);
             ProtectedOutput::Inline {
                 data: BinaryData::new(buffer)?,
             }
@@ -1445,9 +1376,9 @@ impl StreamWriterState {
                 self.protected_file
                     .take()
                     .expect("spilled stream has a canonical file"),
-                &protected_absolute(store, job_id, self.kind),
+                &protected_absolute(workspace_root, job_id, self.kind),
             )?;
-            verify_file_content(&store.inner.workspace_root, &path, self.bytes, digest)?;
+            verify_file_content(workspace_root, &path, self.bytes, digest)?;
             ProtectedOutput::File { path }
         };
         let storage = match target {
@@ -1464,20 +1395,11 @@ impl StreamWriterState {
         Ok(info)
     }
 
-    fn release_reserved(&mut self, store: &ArtifactStore) {
+    fn release_reserved(&mut self, budget: &mut BufferBudget) {
         if self.reserved != 0 {
-            store
-                .inner
-                .budget
-                .lock()
-                .expect("buffer budget lock")
-                .release(self.reserved);
+            budget.release(self.reserved);
             self.reserved = 0;
         }
-    }
-
-    fn release_budget(&mut self, store: &ArtifactStore) {
-        self.release_reserved(store);
     }
 }
 
@@ -1489,10 +1411,8 @@ fn protected_relative(job_id: JobId, stream: StreamKind) -> Result<WorkspacePath
     ))?)
 }
 
-fn protected_absolute(store: &ArtifactStore, job_id: JobId, stream: StreamKind) -> PathBuf {
-    store
-        .inner
-        .workspace_root
+fn protected_absolute(workspace_root: &Path, job_id: JobId, stream: StreamKind) -> PathBuf {
+    workspace_root
         .join(".cowshed")
         .join("job")
         .join(job_id.get().to_string())
@@ -1500,25 +1420,21 @@ fn protected_absolute(store: &ArtifactStore, job_id: JobId, stream: StreamKind) 
 }
 
 fn create_protected_file(
-    store: &ArtifactStore,
+    workspace_root: &Path,
     job_id: JobId,
     stream: StreamKind,
 ) -> Result<File, ArtifactError> {
-    let path = protected_absolute(store, job_id, stream);
-    verify_no_symlinks(&store.inner.workspace_root, &path).map_err(|error| {
-        ArtifactError::Integrity {
-            offset: 0,
-            message: error.to_string(),
-        }
+    let path = protected_absolute(workspace_root, job_id, stream);
+    verify_no_symlinks(workspace_root, &path).map_err(|error| ArtifactError::Integrity {
+        offset: 0,
+        message: error.to_string(),
     })?;
-    let job_root = ensure_private_job_root(&store.inner.workspace_root)?;
+    let job_root = ensure_private_job_root(workspace_root)?;
     let parent = job_root.join(job_id.get().to_string());
     ensure_private_directory(&parent)?;
-    verify_no_symlinks(&store.inner.workspace_root, &path).map_err(|error| {
-        ArtifactError::Integrity {
-            offset: 0,
-            message: error.to_string(),
-        }
+    verify_no_symlinks(workspace_root, &path).map_err(|error| ArtifactError::Integrity {
+        offset: 0,
+        message: error.to_string(),
     })?;
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
@@ -2253,7 +2169,7 @@ fn rollback_append(
         .and_then(|_| file.sync_data());
     match rollback {
         Ok(()) => io_error(path, primary),
-        Err(rollback) => ArtifactError::WriterPoisoned(format!(
+        Err(rollback) => ArtifactError::WriteIntegrity(format!(
             "records append failed ({primary}) and rollback failed ({rollback})"
         )),
     }
@@ -3835,8 +3751,7 @@ mod tests {
     use crate::api::dto::{
         AdmissionCommitment, CONTROLLER_COMMITMENT_VERSION, CheckpointCommitment, RestoreCommitment,
     };
-    use std::sync::mpsc;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn repo() -> RepoId {
         RepoId::parse("acme/widget").unwrap()
@@ -4020,14 +3935,15 @@ mod tests {
     }
 
     #[test]
-    fn append_record_refuses_poison_and_duplicate_terminal_after_seal() {
+    fn terminal_records_and_tokens_reject_duplicate_stale_and_foreign_use() {
         let root = temp_root("append-guards");
-        let store = store_at(&root, ArtifactConfig::default());
-        let sealed = store
-            .start_job(1, OutputTargets::default())
-            .unwrap()
-            .seal(JobState::Exited)
+        let mut store = store_at(&root, ArtifactConfig::default());
+        let job_id = store.next_job_id().unwrap();
+        let token = store
+            .begin_job(job_id, 1, OutputTargets::default())
             .unwrap();
+        let namespace = token.namespace;
+        let sealed = store.finish(token, JobState::Exited).unwrap();
         let records = records_path(&root);
         let sealed_len = fs::metadata(&records).unwrap().len();
 
@@ -4038,26 +3954,35 @@ mod tests {
         ));
         assert_eq!(fs::metadata(&records).unwrap().len(), sealed_len);
 
-        let poison = ArtifactError::WriterPoisoned("injected poison".into());
-        *store
-            .inner
-            .records_poison
-            .lock()
-            .expect("records poison lock") = Some(poison.clone());
-        let mut running = valid_job_record(2);
-        running.state = JobState::Running;
-        assert_eq!(store.append_record(running), Err(poison));
-        assert_eq!(fs::metadata(&records).unwrap().len(), sealed_len);
+        let stale = JobArtifactToken { job_id, namespace };
+        assert!(matches!(
+            store.append(&stale, StreamKind::Stdout, b"late"),
+            Err(ArtifactError::TokenConflict { .. })
+        ));
+
+        let foreign_root = temp_root("foreign-token");
+        let mut foreign = store_at(&foreign_root, ArtifactConfig::default());
+        let foreign_job_id = foreign.next_job_id().unwrap();
+        let foreign_token = foreign
+            .begin_job(foreign_job_id, 1, OutputTargets::default())
+            .unwrap();
+        assert!(matches!(
+            store.append(&foreign_token, StreamKind::Stdout, b"foreign"),
+            Err(ArtifactError::TokenConflict { message, .. })
+                if message.contains("another artifact store")
+        ));
+        foreign.abort(foreign_token).unwrap();
 
         drop(store);
         fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(foreign_root).unwrap();
     }
 
     #[test]
     fn checkpoint_hashes_missing_and_exactly_empty_records_as_magic_prefix() {
         for (case, precreate_empty) in [("missing", false), ("empty", true)] {
             let root = temp_root(case);
-            let store = store_at(&root, ArtifactConfig::default());
+            let mut store = store_at(&root, ArtifactConfig::default());
             if precreate_empty {
                 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -4108,7 +4033,7 @@ mod tests {
             ),
             Err(ArtifactError::Integrity { .. })
         ));
-        let historical_store = ArtifactStore::open(
+        let mut historical_store = ArtifactStore::open(
             &historical_root,
             repo(),
             incarnation(),
@@ -4123,10 +4048,10 @@ mod tests {
         fs::remove_dir_all(historical_root).unwrap();
 
         let current_root = temp_root("current-manifest");
-        let current_store = store_at(&current_root, ArtifactConfig::default());
+        let mut current_store = store_at(&current_root, ArtifactConfig::default());
         current_store.checkpoint(7).unwrap();
         drop(current_store);
-        let reopened = store_at(&current_root, ArtifactConfig::default());
+        let mut reopened = store_at(&current_root, ArtifactConfig::default());
         assert!(matches!(
             reopened.checkpoint(7),
             Err(ArtifactError::Integrity { .. })
@@ -4199,10 +4124,9 @@ mod tests {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let root = temp_root("protected-descriptors");
-        let store = store_at(&root, ArtifactConfig::default());
         let job_id = JobId::new(1).unwrap();
-        let mut file = create_protected_file(&store, job_id, StreamKind::Stdout).unwrap();
-        let path = protected_absolute(&store, job_id, StreamKind::Stdout);
+        let mut file = create_protected_file(&root, job_id, StreamKind::Stdout).unwrap();
+        let path = protected_absolute(&root, job_id, StreamKind::Stdout);
         let metadata = file.metadata().unwrap();
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         assert_eq!(metadata.nlink(), 1);
@@ -4232,7 +4156,6 @@ mod tests {
             hash_file_incrementally(&hash_alias),
             Err(ArtifactError::Io { .. })
         ));
-        drop(store);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4303,29 +4226,23 @@ mod tests {
     #[test]
     fn buffer_budget_tracks_actual_capacity_and_releases_on_spill_boundaries() {
         let root = temp_root("buffer-capacity");
-        let store = store_at(
-            &root,
-            ArtifactConfig {
-                inline_cap_bytes: 4,
-                supervisor_buffer_budget_bytes: 4,
-                ..ArtifactConfig::default()
-            },
-        );
+        let mut budget = BufferBudget { used: 0, limit: 4 };
         let mut stream = StreamWriterState::new(StreamKind::Stdout, StreamTarget::Captured);
         let job_id = JobId::new(1).unwrap();
-        stream.append(&store, job_id, b"abc").unwrap();
+        stream
+            .append(&root, 4, &mut budget, job_id, b"abc")
+            .unwrap();
         assert_eq!(stream.reserved, stream.buffer.as_ref().unwrap().capacity());
-        assert_eq!(store.buffered_bytes(), stream.reserved);
-        assert!(store.buffered_bytes() <= 4);
-        stream.append(&store, job_id, b"d").unwrap();
+        assert_eq!(budget.used, stream.reserved);
+        assert!(budget.used <= 4);
+        stream.append(&root, 4, &mut budget, job_id, b"d").unwrap();
         assert_eq!(stream.buffer.as_ref().unwrap().len(), 4);
-        assert_eq!(store.buffered_bytes(), stream.reserved);
-        stream.append(&store, job_id, b"e").unwrap();
+        assert_eq!(budget.used, stream.reserved);
+        stream.append(&root, 4, &mut budget, job_id, b"e").unwrap();
         assert!(stream.buffer.is_none());
-        assert_eq!(store.buffered_bytes(), 0);
+        assert_eq!(budget.used, 0);
         assert_eq!(fs::read(root.join(".cowshed/job/1/out")).unwrap(), b"abcde");
         drop(stream);
-        drop(store);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4373,9 +4290,11 @@ mod tests {
     #[test]
     fn streaming_recovery_checks_header_complement_lengths_and_incomplete_tail() {
         let root = temp_root("stream-headers");
-        let store = store_at(&root, ArtifactConfig::default());
-        let writer = store.start_job(1, OutputTargets::default()).unwrap();
-        drop(writer);
+        let mut store = store_at(&root, ArtifactConfig::default());
+        let token = store
+            .begin_job(JobId::new(1).unwrap(), 1, OutputTargets::default())
+            .unwrap();
+        store.abort(token).unwrap();
         drop(store);
         let path = records_path(&root);
         let valid = fs::read(&path).unwrap();
@@ -4425,8 +4344,10 @@ mod tests {
     #[test]
     fn recovery_rejects_wrong_manifest_prefix_and_duplicate_terminal_ids() {
         let wrong_root = temp_root("wrong-prefix");
-        let wrong_store = store_at(&wrong_root, ArtifactConfig::default());
-        let writer = wrong_store.start_job(1, OutputTargets::default()).unwrap();
+        let mut wrong_store = store_at(&wrong_root, ArtifactConfig::default());
+        let wrong_token = wrong_store
+            .begin_job(JobId::new(1).unwrap(), 1, OutputTargets::default())
+            .unwrap();
         let wrong = CheckpointManifestRecord {
             version: RECORD_SCHEMA_VERSION as u16,
             repo_id: repo(),
@@ -4448,16 +4369,17 @@ mod tests {
             Err(ArtifactError::Integrity { message, .. })
                 if message.contains("prefix digest")
         ));
-        drop(writer);
+        wrong_store.abort(wrong_token).unwrap();
         drop(wrong_store);
         fs::remove_dir_all(wrong_root).unwrap();
 
         let duplicate_root = temp_root("duplicate-terminal");
-        let duplicate_store = store_at(&duplicate_root, ArtifactConfig::default());
+        let mut duplicate_store = store_at(&duplicate_root, ArtifactConfig::default());
+        let duplicate_token = duplicate_store
+            .begin_job(JobId::new(1).unwrap(), 1, OutputTargets::default())
+            .unwrap();
         let sealed = duplicate_store
-            .start_job(1, OutputTargets::default())
-            .unwrap()
-            .seal(JobState::Exited)
+            .finish(duplicate_token, JobState::Exited)
             .unwrap();
         let mut duplicate = sealed.record.clone();
         duplicate.sequence += 1;
@@ -4479,44 +4401,43 @@ mod tests {
     }
 
     #[test]
-    fn exclusive_checkpoint_barrier_blocks_concurrent_writes() {
-        let root = temp_root("barrier-blocks");
-        let store = store_at(&root, ArtifactConfig::default());
-        let mut writer = store.start_job(1, OutputTargets::default()).unwrap();
-        let (entered_send, entered_receive) = mpsc::channel();
-        let (resume_send, resume_receive) = mpsc::channel();
-        *store
-            .inner
-            .checkpoint_test_hook
-            .lock()
-            .expect("checkpoint test hook") = Some((entered_send, resume_receive));
-        let checkpoint_store = store.clone();
-        let checkpoint = std::thread::spawn(move || checkpoint_store.checkpoint(1));
-        entered_receive
-            .recv_timeout(Duration::from_secs(2))
-            .expect("checkpoint entered exclusive barrier");
-
-        let (write_send, write_receive) = mpsc::channel();
-        let write = std::thread::spawn(move || {
-            let result = writer.write_stdout(b"after-barrier");
-            write_send.send(result).unwrap();
-            writer
-        });
-        assert!(matches!(
-            write_receive.recv_timeout(Duration::from_millis(50)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
-        resume_send.send(()).unwrap();
-        checkpoint.join().unwrap().unwrap();
-        write_receive
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap()
+    fn checkpoint_snapshots_only_messages_sequenced_before_the_barrier() {
+        let root = temp_root("actor-checkpoint-order");
+        let mut store = store_at(&root, ArtifactConfig::default());
+        let token = store
+            .begin_job(JobId::new(1).unwrap(), 1, OutputTargets::default())
             .unwrap();
-        let writer = write.join().unwrap();
-        let sealed = writer.seal(JobState::Exited).unwrap();
+        store
+            .append(&token, StreamKind::Stdout, b"before-checkpoint")
+            .unwrap();
+        let first = store.checkpoint(1).unwrap();
+        let first_visible = &first.record.visible_jobs[0].stdout;
+        assert_eq!(first_visible.bytes, b"before-checkpoint".len() as u64);
+        assert_eq!(
+            first_visible.sha256,
+            Sha256Digest::compute(b"before-checkpoint")
+        );
+
+        store.append(&token, StreamKind::Stdout, b"-after").unwrap();
+        let second = store.checkpoint(2).unwrap();
+        let second_visible = &second.record.visible_jobs[0].stdout;
+        assert_eq!(
+            second_visible.bytes,
+            b"before-checkpoint-after".len() as u64
+        );
+        assert_eq!(
+            second_visible.sha256,
+            Sha256Digest::compute(b"before-checkpoint-after")
+        );
+        assert_eq!(
+            first.record.visible_jobs[0].stdout.bytes,
+            b"before-checkpoint".len() as u64
+        );
+
+        let sealed = store.finish(token, JobState::Exited).unwrap();
         assert_eq!(
             read_stream(&root, &sealed.record.stdout).unwrap(),
-            b"after-barrier"
+            b"before-checkpoint-after"
         );
         drop(store);
         fs::remove_dir_all(root).unwrap();
@@ -4532,10 +4453,11 @@ mod tests {
             .write(true)
             .open(root.join(source.as_path()))
             .unwrap();
-        let store = store_at(&root, ArtifactConfig::default());
+        let mut store = store_at(&root, ArtifactConfig::default());
         FAIL_REDIRECT_FCNTL.store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(matches!(
-            store.start_job(
+            store.begin_job(
+                JobId::new(1).unwrap(),
                 1,
                 OutputTargets {
                     stdout: StreamTarget::Redirect { source, descriptor },
