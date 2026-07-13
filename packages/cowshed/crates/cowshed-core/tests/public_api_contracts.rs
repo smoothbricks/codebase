@@ -448,10 +448,11 @@ fn json_envelope_has_exact_discriminated_success_and_failure_shapes() {
     let success = JsonEnvelope::Success(MountResult {
         workspace: workspace(),
         mount: PathBuf::from("/mnt/raven"),
+        base_commit: Some(oid('a')),
     });
     assert_eq!(
         serde_json::to_value(&success).unwrap(),
-        json!({"ok":true,"result":{"workspace":"raven","mount":"/mnt/raven"}})
+        json!({"ok":true,"result":{"workspace":"raven","mount":"/mnt/raven","baseCommit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}})
     );
     assert_eq!(
         serde_json::to_value(JsonEnvelope::Success(EmptyResult {})).unwrap(),

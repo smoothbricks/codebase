@@ -375,7 +375,8 @@ documented lower/camel-case strings, and every optional field is omitted rather 
   `state` is `"attached" | "detached"`. Detached rows without a cached marker snapshot omit all three marker-derived
   optionals.
 - `EnsureReport = { workspace, mount, action }`, where action is `"alreadyMounted" | "attached" | "healed"`.
-  `MountResult = { workspace, mount }`; `EmptyResult` serializes as exactly `{}`.
+  `MountResult = { workspace, mount, baseCommit? }`; lifecycle creation/restoration fills `baseCommit`, while
+  attachment/query results may omit it. `EmptyResult` serializes as exactly `{}`.
 - `DoctorReport = { healthy, findings }`; `Finding = { code, severity, message, hint, path? }`, and severity is
   `"info" | "warning" | "error"`. `GcReport = { examined, reclaimed, retainedPinned, freedBytes, dryRun }`.
 - `JobId` is a positive integer no greater than `2^53-1`.
