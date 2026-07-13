@@ -324,6 +324,7 @@ pub enum RestoreFailpoint {
     AfterCanonicalImageRename = 6,
     AfterCanonicalSidecarRename = 7,
     CanonicalParentFsyncFailure = 8,
+    PersistentCanonicalParentFsyncFailure = 9,
 }
 
 fn store_directory_exists(store_root: &Path) -> Result<bool, ApfsStorageError> {
@@ -702,12 +703,27 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     RestoreFailpoint::CanonicalParentFsyncFailure => {
                         "canonical parent fsync"
                     }
+                    RestoreFailpoint::PersistentCanonicalParentFsyncFailure => {
+                        "persistent canonical parent fsync"
+                    }
                 }
             )))
         } else {
             Ok(())
         }
     }
+    fn sync_canonical_parent(&self, canonical: &Path) -> Result<(), ApfsStorageError> {
+        if self.restore_failpoint.load(AtomicOrdering::SeqCst)
+            == RestoreFailpoint::PersistentCanonicalParentFsyncFailure as u8
+        {
+            return Err(ApfsStorageError::Host(format!(
+                "injected persistent canonical parent fsync failure: {}",
+                canonical.display()
+            )));
+        }
+        sync_parent!(canonical)
+    }
+
     pub fn backend(&self) -> &MacOsApfsBackend<R> {
         &self.backend
     }
@@ -1718,7 +1734,7 @@ where
                 .map_err(|error| io_error("publish canonical image", canonical, error))?;
             self.trip_restore_failpoint(RestoreFailpoint::AfterCanonicalImageRename)?;
             self.trip_restore_failpoint(RestoreFailpoint::CanonicalParentFsyncFailure)?;
-            sync_parent!(canonical)
+            self.sync_canonical_parent(canonical)
         })();
         let Err(primary) = publication else {
             return Ok(());
@@ -1735,7 +1751,7 @@ where
                         canonical.display()
                     )));
                 }
-                sync_parent!(canonical)
+                self.sync_canonical_parent(canonical)
             })();
             return match verified {
                 Ok(()) => Ok(()),
@@ -1799,6 +1815,9 @@ where
         })();
 
         if let Err(primary) = publication {
+            if canonical.exists() || sidecar_path(canonical).exists() {
+                return Err(primary);
+            }
             let cleanup = (|| {
                 let stub = source_checkout.join(".envrc");
                 match fs::remove_file(&stub) {
