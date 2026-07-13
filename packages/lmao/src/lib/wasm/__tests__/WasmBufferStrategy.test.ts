@@ -3,6 +3,8 @@
  */
 
 import { afterEach, beforeAll, describe, expect, it } from 'bun:test';
+import { getColumnValue, getRawTimestamp } from '../../__tests__/arrow-test-helpers.js';
+import { convertToLeasedArrowTable } from '../../convertToArrow.js';
 import { createOpMetadata } from '../../opContext/defineOp.js';
 import { resolveMessage } from '../../resolveMessage.js';
 import { S } from '../../schema/builder.js';
@@ -12,6 +14,7 @@ import { NO_NODE, iterateSpanChildren, iterateSpanTree } from '../../traceTopolo
 import { WasmBufferStrategy } from '../WasmBufferStrategy.js';
 import { createWasmAllocator } from '../wasmAllocator.js';
 import { createWasmTraceRoot } from '../wasmTraceRoot.js';
+import type { WasmSpanBufferInstance } from '../wasmSpanBuffer.js';
 
 describe('WasmBufferStrategy', () => {
   // Simple schema for testing
@@ -373,6 +376,80 @@ describe('WasmBufferStrategy', () => {
 
       expect(() => strategy.releaseBuffer(root)).toThrow(/stale/);
       expect(strategy.getStats()).toEqual({ allocCount: 0, freeCount: 0, bumpPtr: 192, capacity: 64 });
+    });
+  });
+
+  describe('leased Arrow conversion', () => {
+    it('survives a WASM memory epoch change, releases safely, and reuses freed slabs', async () => {
+      const leasedStrategy = await WasmBufferStrategy.create<typeof testSchema>({
+        capacity: 8,
+        initialPages: 1,
+        maxPages: 18,
+      });
+      const leasedTracer: TracerLifecycleHooks<typeof testSchema> = {
+        onTraceStart: () => {},
+        onTraceEnd: () => {},
+        onSpanStart: () => {},
+        onSpanEnd: () => {},
+        onStatsWillResetFor: () => {},
+        getFlagEvaluatorForContext: () => undefined,
+        bufferStrategy: leasedStrategy,
+      };
+      const traceRoot = createWasmTraceRoot(leasedStrategy.allocator, 'leased-wasm', leasedTracer);
+      const root = leasedStrategy.createSpanBuffer(
+        testSchema,
+        traceRoot,
+        testMetadata,
+        8,
+      ) as WasmSpanBufferInstance<typeof testSchema>;
+      root.timestamp[0] = 9_001n;
+      root.entry_type[0] = 8;
+      root.message(0, 'leased-wasm-row');
+      root.latency(0, 17.5);
+      root.success(0, true);
+      root.operation(0, 1);
+      root._writeIndex = 1;
+
+      const f64Pointer = root._familyPtrs.f64;
+      const topologyGeneration = traceRoot._topology.generation;
+      const memoryVersion = leasedStrategy.allocator.memoryVersion;
+      const memoryBuffer = leasedStrategy.allocator.memory.buffer;
+      const lease = convertToLeasedArrowTable(root);
+      expect(lease.released).toBe(false);
+      expect(getColumnValue(lease.table, 'latency', 0)).toBe(17.5);
+      expect(getColumnValue(lease.table, 'success', 0)).toBe(true);
+      expect(getColumnValue(lease.table, 'operation', 0)).toBe('READ');
+
+      const bytesToGrow = memoryBuffer.byteLength - leasedStrategy.getStats().bumpPtr + 8;
+      const growth = leasedStrategy.allocator.allocExact(bytesToGrow, 8);
+      expect(growth).toBeGreaterThan(0);
+      expect(leasedStrategy.allocator.memory.buffer).not.toBe(memoryBuffer);
+      expect(leasedStrategy.allocator.memoryVersion).toBeGreaterThan(memoryVersion);
+      expect(getRawTimestamp(lease.table, 0)).toBe(9_001n);
+      expect(getColumnValue(lease.table, 'latency', 0)).toBe(17.5);
+      expect(getColumnValue(lease.table, 'message', 0)).toBe('leased-wasm-row');
+      expect(traceRoot._topology.generation).toBe(topologyGeneration);
+
+      leasedStrategy.releaseBuffer(root);
+      expect(traceRoot._topology.generation).toBe(topologyGeneration);
+      expect(() => traceRoot._topology.assertLive(root)).toThrow(/stale/);
+      expect(root.timestamp[0]).toBe(9_001n);
+      expect(getColumnValue(lease.table, 'latency', 0)).toBe(17.5);
+      lease.release();
+      expect(lease.released).toBe(true);
+      expect(traceRoot._topology.generation).toBe(topologyGeneration + 1);
+      expect(() => root.timestamp).toThrow(/generation .* released/);
+      expect(() => lease.release()).not.toThrow();
+
+      const nextTraceRoot = createWasmTraceRoot(leasedStrategy.allocator, 'leased-wasm-next', leasedTracer);
+      const next = leasedStrategy.createSpanBuffer(
+        testSchema,
+        nextTraceRoot,
+        testMetadata,
+        8,
+      ) as WasmSpanBufferInstance<typeof testSchema>;
+      expect(next._familyPtrs.f64).toBe(f64Pointer);
+      leasedStrategy.releaseBuffer(next);
     });
   });
 });

@@ -10,7 +10,8 @@
 import { Column, type Table, tableFromColumns } from '@uwdata/flechette';
 import type { CapacityStatsEntry } from './arrow/capacityStats.js';
 import { cleanupDebug } from './cleanupDiagnostics.js';
-import { convertSpanTreeToArrowTable } from './convertToArrow.js';
+import { convertSpanTreeToLeasedArrowTable } from './convertToArrow.js';
+import type { ArrowLease } from './arrow/lease.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
 import type { AnySpanBuffer, OpMetadata } from './types.js';
 
@@ -381,13 +382,16 @@ export class FlushScheduler {
 
     // Convert all buffers to Arrow tables and concatenate
     const tables: Table[] = [];
+    const leases: ArrowLease[] = [];
 
     for (const buffer of buffersToFlush) {
       try {
-        const table = convertSpanTreeToArrowTable(buffer, undefined, modulesToLogStatsForConversion);
-
-        if (table.numRows > 0) {
-          tables.push(table);
+        const lease = convertSpanTreeToLeasedArrowTable(buffer, undefined, modulesToLogStatsForConversion);
+        if (lease.table.numRows > 0) {
+          leases.push(lease);
+          tables.push(lease.table);
+        } else {
+          lease.release();
         }
       } catch (error) {
         console.error('Error converting buffer to Arrow table:', error);
@@ -455,6 +459,9 @@ export class FlushScheduler {
         pendingBuffers: this.buffers.size,
       });
       // Do NOT reset buffers on failure to avoid data loss
+    }
+    finally {
+      for (const lease of leases) lease.release();
     }
   }
 

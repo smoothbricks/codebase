@@ -17,6 +17,9 @@ export class TraceTopology {
   count = 0;
   root = NO_NODE;
   generation = 1;
+  private activeLeases = 0;
+  private releasePending = false;
+  private pendingRelease: (() => void) | undefined;
 
   constructor() {
     this.firstChild.fill(NO_NODE);
@@ -54,6 +57,7 @@ export class TraceTopology {
 
   assertLive(buffer: AnySpanBuffer): void {
     if (
+      this.releasePending ||
       buffer._traceRoot._topology !== this ||
       buffer._topologyGeneration !== this.generation ||
       buffer._nodeIndex >= this.count ||
@@ -63,7 +67,45 @@ export class TraceTopology {
     }
   }
 
-  release(): void {
+  /** Pin this topology generation until the returned idempotent release runs. */
+  acquireLease(): () => void {
+    if (this.releasePending || this.count === 0 || this.root === NO_NODE) {
+      throw new Error('Cannot lease a released span topology');
+    }
+    this.activeLeases++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.activeLeases--;
+      if (this.activeLeases === 0 && this.releasePending) this.finishRelease();
+    };
+  }
+
+  get leaseCount(): number {
+    return this.activeLeases;
+  }
+
+  release(finalizer?: () => void): void {
+    if (this.releasePending) throw new Error('Span buffer topology release is already pending');
+    if (this.activeLeases !== 0) {
+      this.releasePending = true;
+      this.pendingRelease = finalizer;
+      return;
+    }
+    finalizer?.();
+    this.clearReleasedTopology();
+  }
+
+  private finishRelease(): void {
+    const finalizer = this.pendingRelease;
+    this.pendingRelease = undefined;
+    finalizer?.();
+    this.clearReleasedTopology();
+  }
+
+  private clearReleasedTopology(): void {
+    this.releasePending = false;
     for (let index = 0; index < this.count; index++) this.buffers[index] = undefined;
     this.firstChild.fill(NO_NODE);
     this.lastChild.fill(NO_NODE);

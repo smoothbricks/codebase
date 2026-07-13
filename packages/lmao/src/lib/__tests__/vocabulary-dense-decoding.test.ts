@@ -2,7 +2,11 @@ import { describe, expect, it } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { Column, type Table } from '@uwdata/flechette';
 import { getVocabularyDictionaryPrefix } from '../arrow/vocabularyDictionary.js';
-import { convertToArrowTable } from '../convertToArrow.js';
+import {
+  convertSpanTreeToLeasedArrowTable,
+  convertToArrowTable,
+  convertToLeasedArrowTable,
+} from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { resolveMessage } from '../resolveMessage.js';
 import { S } from '../schema/builder.js';
@@ -169,7 +173,8 @@ describe('global vocabulary dense decoding', () => {
     await tracer.trace('dense-zero-static-prefix', op);
 
     const buffer = tracer.rootBuffers[0];
-    const table = convertToArrowTable(buffer);
+    const lease = convertSpanTreeToLeasedArrowTable(buffer);
+    const table = lease.table;
     const { dictionary, keys, message } = requireMessageDictionary(table);
     const prefix = getVocabularyDictionaryPrefix(buffer._vocabularyGeneration);
     const prefixValues = Array.from(prefix.column);
@@ -192,6 +197,10 @@ describe('global vocabulary dense decoding', () => {
     ]);
     expect(dictionary.data).toHaveLength(2);
     expect(dictionary.data[0]).toBe(getVocabularyDictionaryPrefix(buffer._vocabularyGeneration).column.data[0]);
+    tracer.bufferStrategy.releaseBuffer(buffer);
+    expect(message.get(4)).toBe('dynamic-b');
+    lease.release();
+    expect(lease.released).toBe(true);
   });
 
   it('reuses the pinned cached dictionary object when overflow rows need no dynamic suffix', async () => {
@@ -205,7 +214,8 @@ describe('global vocabulary dense decoding', () => {
     const overflow = tracer.rootBuffers[0]._overflow;
     if (!overflow) throw new Error('Expected static log rows to create an overflow segment');
 
-    const table = convertToArrowTable(overflow);
+    const lease = convertToLeasedArrowTable(overflow);
+    const table = lease.table;
     const { dictionary, keys, message } = requireMessageDictionary(table);
     const prefix = getVocabularyDictionaryPrefix(overflow._vocabularyGeneration);
     expect(dictionary).toBe(prefix.column);
@@ -213,6 +223,10 @@ describe('global vocabulary dense decoding', () => {
     expect(Array.from({ length: message.length }, (_, row) => message.get(row))).toEqual(
       Array.from({ length: message.length }, () => prefix.column.get(0)),
     );
+    tracer.bufferStrategy.releaseBuffer(overflow);
+    expect(dictionary.get(0)).toBe(prefix.column.get(0));
+    lease.release();
+    expect(lease.released).toBe(true);
   });
 
   it('packs registered dense bindings for every level while dynamic rows stay in the raw message lane', async () => {
@@ -275,7 +289,8 @@ describe('global vocabulary dense decoding', () => {
 
     registerVocabularyFragment(makeFragment(['registered after buffer creation']));
 
-    const table = convertToArrowTable(buffer);
+    const lease = convertSpanTreeToLeasedArrowTable(buffer);
+    const table = lease.table;
     const messageColumn = table.getChild('message');
     if (!messageColumn) throw new Error('Arrow table did not contain message column');
     expect(Array.from({ length: 20 }, (_, index) => messageColumn.get(index + 2))).toEqual(
@@ -285,6 +300,13 @@ describe('global vocabulary dense decoding', () => {
     expect(dictionary.data[0]).toBe(getVocabularyDictionaryPrefix(buffer._vocabularyGeneration).column.data[0]);
     expect(Array.from(dictionary)).toContain('pinned generation literal');
     expect(Array.from(dictionary)).not.toContain('registered after buffer creation');
+    expect(lease.released).toBe(false);
+    tracer.bufferStrategy.releaseBuffer(buffer);
+    expect(() => buffer._traceRoot._topology.assertLive(buffer)).toThrow('stale');
+    expect(messageColumn.get(2)).toBe('pinned generation literal');
+    lease[Symbol.dispose]();
+    expect(lease.released).toBe(true);
+    expect(() => buffer._traceRoot._topology.assertLive(buffer)).toThrow('stale');
   });
 
   it('rejects a packed dense index outside the buffer generation', async () => {
