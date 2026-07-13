@@ -234,7 +234,7 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             identity: identity()?,
         })?;
         let main = substrate
-            .execute_adopt(adopt)
+            .execute_adopt_staged(adopt, |_| async { Ok::<(), std::io::Error>(()) })
             .await
             .map_err(|error| std::io::Error::other(format!("adopt: {error}")))?
             .workspace;

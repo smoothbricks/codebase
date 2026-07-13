@@ -19,7 +19,7 @@ use super::lifecycle::{
     KernelMountFact, LifecycleBackend, LifecyclePlanner, LifecycleReceipt, LifecycleWorkspace,
     MountIntent, MountState, ObservedState, Operation, OperationIdentity, Pin, PlanError,
     PurePlanner, RestoreMode, RestorePlan, RestoreReceipt, RetirePlan, RetiredRef, Revision,
-    StorageFact, StorageGcReport, Substrate, SubstrateStats, execute_checked,
+    StorageFact, StorageGcReport, Substrate, SubstrateStats, execute_checked, revalidate,
 };
 use super::{CheckpointLabel, StorageLayout, StorageLayoutError};
 
@@ -106,6 +106,35 @@ pub struct PublishedImage {
     pub workspace: LifecycleWorkspace,
     pub image: PathBuf,
     pub mount_point: PathBuf,
+}
+
+/// Mounted, controller-private adoption stage. It is not published into workspace enumeration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdoptStage {
+    pub workspace: LifecycleWorkspace,
+    pub mount_point: PathBuf,
+}
+
+#[derive(Debug, Error)]
+pub enum AdoptExecutionError<E> {
+    #[error("APFS adopt staging failed: {0}")]
+    Storage(#[source] ApfsStorageError),
+    #[error("adopt initializer failed: {0}")]
+    Initializer(E),
+    #[error(
+        "adopt initializer failed and staging cleanup also failed: initializer={initializer}; cleanup={cleanup}"
+    )]
+    InitializerCleanup {
+        initializer: E,
+        #[source]
+        cleanup: ApfsStorageError,
+    },
+}
+
+impl<E> From<ApfsStorageError> for AdoptExecutionError<E> {
+    fn from(error: ApfsStorageError) -> Self {
+        Self::Storage(error)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -434,6 +463,94 @@ where
         &self.host
     }
 
+    /// Prepare an unenumerated mounted clone, let the controller initialize it, then publish it.
+    ///
+    /// The lifecycle lock remains owned across the callback. The canonical image and main
+    /// mountpoint are not changed until `initialize` returns success.
+    pub async fn execute_adopt_staged<F, Fut, E>(
+        &self,
+        plan: AdoptPlan,
+        initialize: F,
+    ) -> Result<LifecycleReceipt, AdoptExecutionError<E>>
+    where
+        F: FnOnce(AdoptStage) -> Fut + Send,
+        Fut: Future<Output = Result<(), E>> + Send,
+        E: Send,
+    {
+        let backend = CheckedApfsBackend {
+            host: Arc::clone(&self.host),
+            lane: Arc::clone(&self.lane),
+            config: Arc::clone(&self.config),
+            incarnations: Arc::clone(&self.incarnations),
+            expected: plan.expected().to_vec(),
+        };
+        let mut guard = backend.acquire(plan.operation()).await?;
+        let actual = backend
+            .read_authoritative(&mut guard, plan.expected())
+            .await?;
+        revalidate(plan.expected(), &actual).map_err(ApfsStorageError::from)?;
+
+        let host = Arc::clone(&self.host);
+        let config = Arc::clone(&self.config);
+        let incarnations = Arc::clone(&self.incarnations);
+        let expected = plan.expected().to_vec();
+        let operation = plan.operation().clone();
+        let prepared = self
+            .lane
+            .dispatch(move || {
+                let Operation::Adopt {
+                    repo,
+                    format,
+                    source_checkout,
+                    pre_cowshed_checkout,
+                    identity,
+                } = &operation
+                else {
+                    return Err(ApfsStorageError::InvalidPlan(
+                        "staged adopt executor requires an adopt operation",
+                    ));
+                };
+                prepare_adopt_stage(
+                    host.as_ref(),
+                    &config,
+                    &expected,
+                    AdoptExecution {
+                        repo,
+                        requested_format: *format,
+                        source_checkout,
+                        pre_cowshed_checkout,
+                        identity,
+                    },
+                    incarnations.as_ref(),
+                )
+            })
+            .await?;
+
+        if let Err(initializer) = initialize(prepared.stage.clone()).await {
+            let host = Arc::clone(&self.host);
+            let cleanup = self
+                .lane
+                .dispatch(move || abort_prepared_adopt(host.as_ref(), prepared))
+                .await;
+            return Err(match cleanup {
+                Ok(()) => AdoptExecutionError::Initializer(initializer),
+                Err(cleanup) => AdoptExecutionError::InitializerCleanup {
+                    initializer,
+                    cleanup,
+                },
+            });
+        }
+
+        let host = Arc::clone(&self.host);
+        let applied = self
+            .lane
+            .dispatch(move || commit_prepared_adopt(host.as_ref(), prepared))
+            .await?;
+        match applied {
+            Applied::Lifecycle(receipt) => Ok(receipt),
+            _ => Err(ApfsStorageError::UnexpectedResult.into()),
+        }
+    }
     async fn execute<P: ImmutablePlan>(&self, plan: &P) -> Result<Applied, ApfsStorageError> {
         let backend = CheckedApfsBackend {
             host: Arc::clone(&self.host),
@@ -537,13 +654,6 @@ where
     L: ApfsBlockingLane,
 {
     type Error = ApfsStorageError;
-
-    async fn execute_adopt(&self, plan: AdoptPlan) -> Result<LifecycleReceipt, Self::Error> {
-        match self.execute(&plan).await? {
-            Applied::Lifecycle(receipt) => Ok(receipt),
-            _ => Err(ApfsStorageError::UnexpectedResult),
-        }
-    }
 
     async fn execute_create(&self, plan: CreatePlan) -> Result<LifecycleReceipt, Self::Error> {
         match self.execute(&plan).await? {
@@ -789,6 +899,15 @@ struct AdoptExecution<'a> {
     pre_cowshed_checkout: &'a Path,
     identity: &'a OperationIdentity,
 }
+
+struct PreparedAdopt<A> {
+    stage: AdoptStage,
+    attachment: A,
+    staged_image: PathBuf,
+    canonical_image: PathBuf,
+    source_checkout: PathBuf,
+    pre_cowshed_checkout: PathBuf,
+}
 fn workspace_lock_path(
     config: &ApfsSubstrateConfig,
     repo: &RepoId,
@@ -891,25 +1010,9 @@ fn apply_operation<H: ApfsExecutionHost>(
     incarnations: &dyn IncarnationSource,
 ) -> Result<Applied, ApfsStorageError> {
     match operation {
-        Operation::Adopt {
-            repo,
-            format,
-            source_checkout,
-            pre_cowshed_checkout,
-            identity,
-        } => apply_adopt(
-            host,
-            config,
-            expected,
-            AdoptExecution {
-                repo,
-                requested_format: *format,
-                source_checkout,
-                pre_cowshed_checkout,
-                identity,
-            },
-            incarnations,
-        ),
+        Operation::Adopt { .. } => Err(ApfsStorageError::InvalidPlan(
+            "adopt operations require the staged controller executor",
+        )),
         Operation::Create {
             source,
             destination,
@@ -975,13 +1078,13 @@ fn apply_operation<H: ApfsExecutionHost>(
     }
 }
 
-fn apply_adopt<H: ApfsExecutionHost>(
+fn prepare_adopt_stage<H: ApfsExecutionHost>(
     host: &H,
     config: &ApfsSubstrateConfig,
     expected: &[ExpectedState],
     execution: AdoptExecution<'_>,
     incarnations: &dyn IncarnationSource,
-) -> Result<Applied, ApfsStorageError> {
+) -> Result<PreparedAdopt<H::Attachment>, ApfsStorageError> {
     let AdoptExecution {
         repo,
         requested_format,
@@ -1025,49 +1128,130 @@ fn apply_adopt<H: ApfsExecutionHost>(
         created.format,
     )
     .map_err(|_| ApfsStorageError::InvalidPlan("invalid adopted workspace identity"))?;
-    let canonical = canonical_image_path(config, &workspace)?;
-    let staging_mount = staging_mount(config, &workspace)?;
+    let canonical_image = canonical_image_path(config, &workspace)?;
+    let mount_point = staging_mount(config, &workspace)?;
 
-    host.publish_metadata(
+    if let Err(primary) = host.publish_metadata(
         &created.path,
         &workspace,
         workspace.revision(),
         MetadataPolicy::Fresh,
         Some(identity),
         None,
-    )?;
-    if let Err(primary) = prepare_image(
-        host,
-        Preparation {
-            image: &created.path,
-            mount_point: &staging_mount,
-            workspace: &workspace,
-            forked_from: None,
-            identity,
-            copy_source: Some(source_checkout),
-            chown: created.format == ImageFormat::Asif,
-            relabel: false,
-        },
     ) {
-        let cleanup = host.reclaim_image(&created.path, created.format);
+        return combine_cleanup(
+            "adopt metadata preparation",
+            primary,
+            host.reclaim_image(&created.path, created.format),
+        );
+    }
+    let attachment = match host.attach_verified(&created.path, workspace.format()) {
+        Ok(attachment) => attachment,
+        Err(primary) => {
+            return combine_cleanup(
+                "adopt attachment preparation",
+                primary,
+                host.reclaim_image(&created.path, created.format),
+            );
+        }
+    };
+    let prepared = host.mount(&attachment, &mount_point, false).and_then(|()| {
+        if created.format == ImageFormat::Asif {
+            host.chown_volume_root(&mount_point)?;
+        }
+        host.copy_tree(source_checkout, &mount_point)?;
+        host.write_marker(&mount_point, &workspace, None, identity)?;
+        host.validate_marker(&mount_point, &MarkerExpectation::from_workspace(&workspace))
+    });
+    if let Err(primary) = prepared {
+        let cleanup = detach_and_reclaim_adopt(host, attachment, &created.path, created.format);
         return combine_cleanup("adopt preparation", primary, cleanup);
     }
-    if let Err(primary) = host.publish_adopt(
+
+    Ok(PreparedAdopt {
+        stage: AdoptStage {
+            workspace,
+            mount_point,
+        },
+        attachment,
+        staged_image: created.path,
+        canonical_image,
+        source_checkout: source_checkout.to_owned(),
+        pre_cowshed_checkout: pre_cowshed_checkout.to_owned(),
+    })
+}
+
+fn abort_prepared_adopt<H: ApfsExecutionHost>(
+    host: &H,
+    prepared: PreparedAdopt<H::Attachment>,
+) -> Result<(), ApfsStorageError> {
+    detach_and_reclaim_adopt(
+        host,
+        prepared.attachment,
+        &prepared.staged_image,
+        prepared.stage.workspace.format(),
+    )
+}
+
+fn detach_and_reclaim_adopt<H: ApfsExecutionHost>(
+    host: &H,
+    attachment: H::Attachment,
+    staged_image: &Path,
+    format: ImageFormat,
+) -> Result<(), ApfsStorageError> {
+    let detached = host.detach(attachment, false);
+    let reclaimed = host.reclaim_image(staged_image, format);
+    match detached {
+        Ok(()) => reclaimed,
+        Err(primary) => combine_cleanup("adopt staging detach", primary, reclaimed),
+    }
+}
+
+fn commit_prepared_adopt<H: ApfsExecutionHost>(
+    host: &H,
+    prepared: PreparedAdopt<H::Attachment>,
+) -> Result<Applied, ApfsStorageError> {
+    let PreparedAdopt {
+        stage,
+        attachment,
+        staged_image,
+        canonical_image,
         source_checkout,
         pre_cowshed_checkout,
-        &created.path,
-        &canonical,
+    } = prepared;
+    if let Err(primary) = host.validate_marker(
+        &stage.mount_point,
+        &MarkerExpectation::from_workspace(&stage.workspace),
+    ) {
+        let cleanup =
+            detach_and_reclaim_adopt(host, attachment, &staged_image, stage.workspace.format());
+        return combine_cleanup("adopt post-initialization validation", primary, cleanup);
+    }
+    if let Err(primary) = host.detach(attachment, false) {
+        return combine_cleanup(
+            "adopt staging detach",
+            primary,
+            host.reclaim_image(&staged_image, stage.workspace.format()),
+        );
+    }
+    if let Err(primary) = host.publish_adopt(
+        &source_checkout,
+        &pre_cowshed_checkout,
+        &staged_image,
+        &canonical_image,
     ) {
         let cleanup = match primary.disposition() {
-            PublicationDisposition::RolledBack => host.reclaim_image(&created.path, created.format),
+            PublicationDisposition::RolledBack => {
+                host.reclaim_image(&staged_image, stage.workspace.format())
+            }
             PublicationDisposition::ForwardOnly => Ok(()),
         };
         return combine_cleanup("adopt publication", primary.into_source(), cleanup);
     }
-    mount_canonical(host, &canonical, source_checkout, &workspace)?;
+    mount_canonical(host, &canonical_image, &source_checkout, &stage.workspace)?;
     Ok(Applied::Lifecycle(LifecycleReceipt {
-        resulting_revision: workspace.revision(),
-        workspace,
+        resulting_revision: stage.workspace.revision(),
+        workspace: stage.workspace,
     }))
 }
 

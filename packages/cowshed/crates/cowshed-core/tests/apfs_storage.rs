@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,8 +13,9 @@ use cowshed_core::metadata::{
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
-    ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig,
-    IncarnationSource, LockMode, MarkerExpectation, MetadataPolicy, PublicationError, volume_name,
+    AdoptExecutionError, ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate,
+    ApfsSubstrateConfig, IncarnationSource, LockMode, MarkerExpectation, MetadataPolicy,
+    PublicationError, volume_name,
 };
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, CheckpointFact, Destination, ExpectedState, KernelMountFact, LifecyclePlanner,
@@ -34,6 +35,7 @@ struct FakeState {
     published: BTreeMap<(RepoId, WorkspaceName), StorageFact>,
     mounted: BTreeMap<(RepoId, WorkspaceName), KernelMountFact>,
     formats: BTreeMap<(RepoId, WorkspaceName), ImageFormat>,
+    staged: BTreeMap<PathBuf, StorageFact>,
     checkpoints: Vec<CheckpointFact>,
     next_mount_id: u64,
     paths: Vec<PathBuf>,
@@ -46,6 +48,8 @@ struct FakeHost {
     marker_validations_before_failure: Arc<AtomicUsize>,
     fail_metadata_once: Arc<AtomicBool>,
     fail_restored_metadata_once: Arc<AtomicBool>,
+    fail_reclaim_once: Arc<AtomicBool>,
+    mounted_paths: Arc<Mutex<BTreeSet<PathBuf>>>,
 }
 
 impl Default for FakeHost {
@@ -55,6 +59,8 @@ impl Default for FakeHost {
             marker_validations_before_failure: Arc::new(AtomicUsize::new(usize::MAX)),
             fail_metadata_once: Arc::default(),
             fail_restored_metadata_once: Arc::default(),
+            fail_reclaim_once: Arc::default(),
+            mounted_paths: Arc::default(),
         }
     }
 }
@@ -122,6 +128,14 @@ impl FakeHost {
     fn fail_next_restored_metadata(&self) {
         self.fail_restored_metadata_once
             .store(true, Ordering::SeqCst);
+    }
+
+    fn fail_next_reclaim(&self) {
+        self.fail_reclaim_once.store(true, Ordering::SeqCst);
+    }
+
+    fn mounted_paths_now(&self) -> BTreeSet<PathBuf> {
+        self.mounted_paths.lock().expect("mounted paths").clone()
     }
 }
 
@@ -253,7 +267,6 @@ impl ApfsExecutionHost for FakeHost {
         self.record("copy-until-quiescent");
         Ok(())
     }
-
     fn mount(
         &self,
         attachment: &Self::Attachment,
@@ -266,6 +279,10 @@ impl ApfsExecutionHost for FakeHost {
             .expect("fake state")
             .mount_paths
             .push(mount_point.to_owned());
+        self.mounted_paths
+            .lock()
+            .expect("mounted paths")
+            .insert(mount_point.to_owned());
         self.record(format!("mount:{:?}", attachment.format));
         Ok(())
     }
@@ -320,9 +337,9 @@ impl ApfsExecutionHost for FakeHost {
             Ok(())
         }
     }
-
     fn detach(&self, _: Self::Attachment, force: bool) -> Result<(), ApfsStorageError> {
         self.record(format!("detach:{force}"));
+        self.mounted_paths.lock().expect("mounted paths").clear();
         Ok(())
     }
 
@@ -362,26 +379,35 @@ impl ApfsExecutionHost for FakeHost {
             .remove(&(workspace.repo().clone(), workspace.name().clone()));
         Ok(())
     }
-
-    fn publish_image(&self, _: &Path, _: &Path) -> Result<(), PublicationError> {
+    fn publish_image(&self, staged: &Path, _: &Path) -> Result<(), PublicationError> {
         self.record("atomic-publish-image");
+        let mut state = self.state.lock().expect("fake state");
+        if let Some(fact) = state.staged.remove(staged) {
+            let key = (fact.workspace.repo().clone(), fact.workspace.name().clone());
+            state.formats.insert(key.clone(), fact.workspace.format());
+            state.published.insert(key, fact);
+        }
         Ok(())
     }
-
     fn publish_adopt(
         &self,
         _: &Path,
         _: &Path,
-        _: &Path,
+        staged: &Path,
         _: &Path,
     ) -> Result<(), PublicationError> {
         self.record("atomic-adopt-handoff+publish");
+        let mut state = self.state.lock().expect("fake state");
+        if let Some(fact) = state.staged.remove(staged) {
+            let key = (fact.workspace.repo().clone(), fact.workspace.name().clone());
+            state.formats.insert(key.clone(), fact.workspace.format());
+            state.published.insert(key, fact);
+        }
         Ok(())
     }
-
     fn publish_metadata(
         &self,
-        _: &Path,
+        image: &Path,
         workspace: &LifecycleWorkspace,
         revision: Revision,
         policy: MetadataPolicy,
@@ -397,7 +423,22 @@ impl ApfsExecutionHost for FakeHost {
         if revision != workspace.revision() && policy == MetadataPolicy::Fresh {
             return Err(ApfsStorageError::Host("fresh revision mismatch".to_owned()));
         }
-        self.seed(workspace);
+        let fact = StorageFact {
+            workspace: workspace.clone(),
+            volume_name: volume_name(workspace.repo(), workspace.name()),
+        };
+        if image
+            .components()
+            .any(|component| component.as_os_str() == ".staging")
+        {
+            self.state
+                .lock()
+                .expect("fake state")
+                .staged
+                .insert(image.to_owned(), fact);
+        } else {
+            self.seed(workspace);
+        }
         Ok(())
     }
 
@@ -484,10 +525,16 @@ impl ApfsExecutionHost for FakeHost {
         self.record_path(trash);
         Ok(())
     }
-
-    fn reclaim_image(&self, _: &Path, _: ImageFormat) -> Result<(), ApfsStorageError> {
+    fn reclaim_image(&self, image: &Path, _: ImageFormat) -> Result<(), ApfsStorageError> {
         self.record("idempotent-reclaim");
-        Ok(())
+        self.state.lock().expect("fake state").staged.remove(image);
+        if self.fail_reclaim_once.swap(false, Ordering::SeqCst) {
+            Err(ApfsStorageError::Host(
+                "injected reclaim failure".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn list(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError> {
@@ -661,7 +708,37 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
         .plan_adopt(adopt_request(ImageFormat::Sparse))
         .expect("adopt plan");
 
-    let receipt = substrate.execute_adopt(plan).await.expect("adopt");
+    let callback_host = host.clone();
+    let receipt = substrate
+        .execute_adopt_staged(plan, move |stage| async move {
+            assert!(stage.workspace.name().is_main());
+            assert!(
+                stage
+                    .mount_point
+                    .components()
+                    .any(|component| component.as_os_str() == ".staging")
+            );
+            assert_eq!(
+                callback_host.mounted_paths_now(),
+                BTreeSet::from([stage.mount_point])
+            );
+            assert!(
+                callback_host
+                    .list(&repo())
+                    .expect("controller listing")
+                    .is_empty(),
+                "the mounted stage must not be visible in canonical enumeration"
+            );
+            assert!(
+                !callback_host
+                    .events()
+                    .contains(&"atomic-adopt-handoff+publish".to_owned())
+            );
+            callback_host.record("controller-initialize");
+            Ok::<(), &'static str>(())
+        })
+        .await
+        .expect("adopt");
 
     assert_eq!(receipt.workspace.format(), ImageFormat::Sparse);
     assert_eq!(receipt.workspace.revision(), Revision::new(1));
@@ -669,8 +746,8 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
     assert_eq!(receipt.workspace.topology_revision(), Revision::new(1));
     assert_eq!(
         lane.count(),
-        3,
-        "one kernel-lock acquisition, one authoritative read, and one blocking apply"
+        4,
+        "lock, authoritative read, staged preparation, and post-callback commit"
     );
     assert_eq!(
         host.events(),
@@ -684,6 +761,8 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
             "copy-until-quiescent",
             "marker-identity:apfs-storage",
             "write-marker",
+            "validate-marker",
+            "controller-initialize",
             "validate-marker",
             "detach:false",
             "atomic-adopt-handoff+publish",
@@ -703,6 +782,81 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
     assert_eq!(
         substrate.caches_root().await.expect("caches"),
         PathBuf::from("/store/caches")
+    );
+}
+
+#[tokio::test]
+async fn initializer_failure_detaches_reclaims_and_never_publishes() {
+    let host = FakeHost::default();
+    let lane = CountingLane::default();
+    let substrate = substrate(host.clone(), lane.clone());
+    let plan = substrate
+        .plan_adopt(adopt_request(ImageFormat::Sparse))
+        .expect("adopt plan");
+    let callback_host = host.clone();
+
+    let error = substrate
+        .execute_adopt_staged(plan, move |stage| async move {
+            assert_eq!(
+                callback_host.mounted_paths_now(),
+                BTreeSet::from([stage.mount_point])
+            );
+            assert!(
+                callback_host
+                    .list(&repo())
+                    .expect("controller listing")
+                    .is_empty()
+            );
+            callback_host.record("controller-rejected");
+            Err("identity commitment rejected")
+        })
+        .await
+        .expect_err("initializer rejection");
+
+    assert!(matches!(
+        error,
+        AdoptExecutionError::Initializer("identity commitment rejected")
+    ));
+    assert!(host.mounted_paths_now().is_empty());
+    assert!(host.list(&repo()).expect("post-abort listing").is_empty());
+    assert_eq!(lane.count(), 4, "abort cleanup uses the blocking lane");
+    let events = host.events();
+    assert!(events.contains(&"controller-rejected".to_owned()));
+    assert!(events.contains(&"detach:false".to_owned()));
+    assert!(events.contains(&"idempotent-reclaim".to_owned()));
+    assert!(!events.contains(&"atomic-adopt-handoff+publish".to_owned()));
+    assert!(!events.contains(&"retain-mounted".to_owned()));
+}
+
+#[tokio::test]
+async fn initializer_and_cleanup_errors_are_both_preserved() {
+    let host = FakeHost::default();
+    host.fail_next_reclaim();
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let plan = substrate
+        .plan_adopt(adopt_request(ImageFormat::Sparse))
+        .expect("adopt plan");
+
+    let error = substrate
+        .execute_adopt_staged(plan, |_| async { Err("tool wiring rejected") })
+        .await
+        .expect_err("initializer and cleanup fail");
+
+    match error {
+        AdoptExecutionError::InitializerCleanup {
+            initializer,
+            cleanup: ApfsStorageError::Host(cleanup),
+        } => {
+            assert_eq!(initializer, "tool wiring rejected");
+            assert_eq!(cleanup, "injected reclaim failure");
+        }
+        other => panic!("unexpected compound adopt error: {other:?}"),
+    }
+    assert!(host.mounted_paths_now().is_empty());
+    assert!(
+        !host
+            .events()
+            .contains(&"atomic-adopt-handoff+publish".to_owned())
     );
 }
 
@@ -729,13 +883,16 @@ async fn adopt_rejects_each_source_identity_mismatch_before_mutation() {
         request.identity.project_root = PathBuf::from(project_root);
         let plan = substrate.plan_adopt(request).expect("adopt plan");
 
-        let error = substrate.execute_adopt(plan).await.unwrap_err();
+        let error = substrate
+            .execute_adopt_staged(plan, |_| async { Ok::<(), &'static str>(()) })
+            .await
+            .unwrap_err();
 
         assert!(matches!(
             error,
-            ApfsStorageError::InvalidPlan(
+            AdoptExecutionError::Storage(ApfsStorageError::InvalidPlan(
                 "adopt source must equal operation project root and canonical main mount"
-            )
+            ))
         ));
         assert_eq!(host.events(), ["lock:1", "observe"]);
         assert_eq!(
@@ -754,7 +911,7 @@ async fn ensure_mounted_is_idempotent_for_an_already_mounted_workspace() {
         .plan_adopt(adopt_request(ImageFormat::Sparse))
         .expect("adopt plan");
     let workspace = substrate
-        .execute_adopt(plan)
+        .execute_adopt_staged(plan, |_| async { Ok::<(), &'static str>(()) })
         .await
         .expect("adopt")
         .workspace;
@@ -784,10 +941,13 @@ async fn marker_mismatch_detaches_and_reclaims_staging_before_publication() {
         .expect("adopt plan");
 
     let error = substrate
-        .execute_adopt(plan)
+        .execute_adopt_staged(plan, |_| async { Ok::<(), &'static str>(()) })
         .await
         .expect_err("marker mismatch");
-    assert!(matches!(error, ApfsStorageError::MarkerMismatch(_)));
+    assert!(matches!(
+        error,
+        AdoptExecutionError::Storage(ApfsStorageError::MarkerMismatch(_))
+    ));
     let events = host.events();
     assert!(events.iter().any(|event| event.starts_with("detach:")));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
