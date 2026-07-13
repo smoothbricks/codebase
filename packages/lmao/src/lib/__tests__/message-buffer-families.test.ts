@@ -592,35 +592,63 @@ describe('specialized message buffer families', () => {
     }
   });
 
-  it('derives Arrow message validity from sentinel IDs and raw value definedness', () => {
-    const root = createPlannedBuffer(
-      'mixed',
-      specializedMixedOp.callsitePlan.SpanBufferClass,
-      specializedMixedOp.metadata,
-    );
-    const rootContext = new specializedMixedOp.callsitePlan.SpanContextClass(
-      root,
-      runtimeSchema,
-      specializedMixedOp.callsitePlan,
-    );
-    specializedMixedOp.callsitePlan.appenders.writeSpanStart(root, 'arrow sentinel root');
-    rootContext._spanLogger._infoTemplate(0);
-    rootContext._spanLogger.debug('');
-    specializedMixedOp.callsitePlan.appenders.writeLogEntry(root, ENTRY_TYPE_DEBUG);
-    specializedMixedOp.callsitePlan.appenders.writeSpanEnd(root, ENTRY_TYPE_SPAN_OK);
+  it('derives Arrow null, raw, and static messages across current and specialized root, child, and overflow', () => {
+    const denseZeroText = textAtDenseZero();
+    for (const { mode, op } of [
+      { mode: 'current' as const, op: mixedOp },
+      { mode: 'specialized' as const, op: specializedMixedOp },
+    ]) {
+      const root = createPlannedBuffer('mixed', op.callsitePlan.SpanBufferClass, op.metadata);
+      const rootContext = new op.callsitePlan.SpanContextClass(root, runtimeSchema, op.callsitePlan);
+      op.callsitePlan.appenders.writeSpanStart(root, `${mode} root`);
+      rootContext._spanLogger._infoTemplate(0);
+      rootContext._spanLogger.debug(`${mode} root raw`);
+      op.callsitePlan.appenders.writeLogEntry(root, ENTRY_TYPE_DEBUG);
+      op.callsitePlan.appenders.writeSpanEnd(root, ENTRY_TYPE_SPAN_OK);
 
-    const table = convertSpanTreeToArrowTable(root);
-    const messages = table.getChild('message');
-    if (!messages) throw new Error('Expected Arrow message column');
-    expect(messages.nullCount).toBe(2);
-    expect(Array.from({ length: table.numRows }, (_, row) => messages.get(row))).toEqual([
-      'arrow sentinel root',
-      null,
-      textAtDenseZero(),
-      '',
-      null,
-    ]);
-    expect('message_nulls' in root).toBe(false);
+      const child = createChildSpanBuffer(
+        root,
+        op.callsitePlan.SpanBufferClass,
+        op.metadata,
+        op.metadata,
+        CAPACITY,
+      );
+      const childContext = new op.callsitePlan.SpanContextClass(child, runtimeSchema, op.callsitePlan);
+      op.callsitePlan.appenders.writeSpanStart(child, `${mode} child`);
+      childContext._spanLogger._infoTemplate(0);
+      childContext._spanLogger.debug(`${mode} child raw`);
+      op.callsitePlan.appenders.writeLogEntry(child, ENTRY_TYPE_DEBUG);
+      op.callsitePlan.appenders.writeSpanEnd(child, ENTRY_TYPE_SPAN_OK);
+
+      const overflow = createOverflowBuffer(child);
+      const overflowContext = new op.callsitePlan.SpanContextClass(overflow, runtimeSchema, op.callsitePlan);
+      overflowContext._spanLogger._infoTemplate(0);
+      overflowContext._spanLogger.debug(`${mode} overflow raw`);
+      op.callsitePlan.appenders.writeLogEntry(overflow, ENTRY_TYPE_DEBUG);
+
+      const table = convertSpanTreeToArrowTable(root);
+      const messages = table.getChild('message');
+      if (!messages) throw new Error('Expected Arrow message column');
+      expect(messages.nullCount).toBe(5);
+      expect(Array.from({ length: table.numRows }, (_, row) => messages.get(row))).toEqual([
+        `${mode} root`,
+        null,
+        denseZeroText,
+        `${mode} root raw`,
+        null,
+        `${mode} child`,
+        null,
+        denseZeroText,
+        `${mode} child raw`,
+        null,
+        denseZeroText,
+        `${mode} overflow raw`,
+        null,
+      ]);
+      expect('message_nulls' in root).toBe(false);
+      expect('message_nulls' in child).toBe(false);
+      expect('message_nulls' in overflow).toBe(false);
+    }
   });
 
   it('represents dense index zero, dynamic/static span names, null/raw rows, and terminal scalars', () => {
