@@ -813,7 +813,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
               return resolved;
             },
             (error: unknown) => {
-              buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_EXCEPTION);
+              buffer._traceRoot._writeSpanEnd(buffer._traceRoot, buffer, ENTRY_TYPE_SPAN_EXCEPTION);
 
               const errorMessage = error instanceof Error ? error.message : String(error);
               const errorStack = error instanceof Error ? error.stack : undefined;
@@ -832,7 +832,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
       writeSpanEnd(buffer, result);
       return result;
     } catch (error) {
-      buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_EXCEPTION);
+      buffer._traceRoot._writeSpanEnd(buffer._traceRoot, buffer, ENTRY_TYPE_SPAN_EXCEPTION);
 
       const errorMessage = error instanceof Error ? error.message : String(error);
       const errorStack = error instanceof Error ? error.stack : undefined;
@@ -871,12 +871,12 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
               if (resolved instanceof Ok || resolved instanceof Err) {
                 writeSpanEnd(buffer, resolved);
               } else {
-                buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_OK);
+                buffer._traceRoot._writeSpanEnd(buffer._traceRoot, buffer, ENTRY_TYPE_SPAN_OK);
               }
               return resolved;
             },
             (error: unknown) => {
-              buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_EXCEPTION);
+              buffer._traceRoot._writeSpanEnd(buffer._traceRoot, buffer, ENTRY_TYPE_SPAN_EXCEPTION);
 
               const errorMessage = error instanceof Error ? error.message : String(error);
               const errorStack = error instanceof Error ? error.stack : undefined;
@@ -896,13 +896,13 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
       if (result instanceof Ok || result instanceof Err) {
         writeSpanEnd(buffer, result);
       } else {
-        buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_OK);
+        buffer._traceRoot._writeSpanEnd(buffer._traceRoot, buffer, ENTRY_TYPE_SPAN_OK);
       }
 
       return result;
     } catch (error) {
       // Sync exception path
-      buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_EXCEPTION);
+      buffer._traceRoot._writeSpanEnd(buffer._traceRoot, buffer, ENTRY_TYPE_SPAN_EXCEPTION);
 
       // Write exception details
       const errorMessage = error instanceof Error ? error.message : String(error);

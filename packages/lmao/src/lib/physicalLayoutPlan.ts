@@ -18,6 +18,7 @@ import type { LogSchema } from './schema/LogSchema.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
 import type { AnySpanBuffer, SpanBuffer } from './types.js';
 import type { SpanContextClass } from './spanContext.js';
+import type { ITraceRoot, TimestampAppendPrimitive } from './traceRoot.js';
 
 export const PHYSICAL_LAYOUT_VERSION = 1;
 
@@ -52,7 +53,11 @@ export interface PhysicalLayoutPlan<
   /** Exact constructor selected at startup for this plan's capability/layout signature. */
   readonly SpanContextClass: SpanContextClass<Ctx>;
   readonly SpanBufferClass: SpanBufferConstructor<T>;
-  readonly SpanLoggerClass: new (buffer: AnySpanBuffer) => SpanLoggerImpl<T>;
+  readonly SpanLoggerClass: new (
+    buffer: AnySpanBuffer,
+    traceRoot: ITraceRoot,
+    appendLogEntry: TimestampAppendPrimitive,
+  ) => SpanLoggerImpl<T>;
   readonly TagWriterClass: new (buffer: AnySpanBuffer) => TagWriter<T>;
   readonly ResultWriterClass: new <R = unknown, E = unknown>(
     buffer: AnySpanBuffer,
@@ -73,19 +78,23 @@ export interface PhysicalLayoutPlan<
 const TRACE_ROOT_CLOCK: PhysicalClock = Object.freeze({
   kind: 'trace-root' as const,
   now(buffer: AnySpanBuffer): Nanoseconds {
-    return buffer._traceRoot.getTimestampNanos();
+    const traceRoot = buffer._traceRoot;
+    return traceRoot._timestampNow(traceRoot);
   },
 });
 
 const TRACE_ROOT_APPENDERS: PhysicalAppenders = Object.freeze({
   writeSpanStart(buffer: AnySpanBuffer, name: string): void {
-    buffer._traceRoot.writeSpanStart(buffer, name);
+    const traceRoot = buffer._traceRoot;
+    traceRoot._writeSpanStart(traceRoot, buffer, name);
   },
   writeSpanEnd(buffer: AnySpanBuffer, entryType: number): void {
-    buffer._traceRoot.writeSpanEnd(buffer, entryType);
+    const traceRoot = buffer._traceRoot;
+    traceRoot._writeSpanEnd(traceRoot, buffer, entryType);
   },
   writeLogEntry(buffer: AnySpanBuffer, entryType: number): number {
-    return buffer._traceRoot.writeLogEntry(buffer, entryType);
+    const traceRoot = buffer._traceRoot;
+    return traceRoot._appendLogEntry(traceRoot, buffer, entryType);
   },
 });
 
@@ -126,7 +135,8 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
     poolRef: null,
     remapDescriptor: null,
     createSpanLogger(buffer: SpanBuffer<T>): SpanLoggerImpl<T> {
-      return new SpanLoggerClass(buffer);
+      const traceRoot = buffer._traceRoot;
+      return new SpanLoggerClass(buffer, traceRoot, traceRoot._appendLogEntry);
     },
     createTagWriter(buffer: AnySpanBuffer): TagWriter<T> {
       return new TagWriterClass(buffer);

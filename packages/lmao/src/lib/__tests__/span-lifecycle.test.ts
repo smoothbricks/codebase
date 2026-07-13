@@ -660,21 +660,47 @@ describe('Fixed Row Layout', () => {
     expect(buffer._spanStartTime).toBe(Nanoseconds.unsafe(111n));
   });
 
-  it('should expose _lastLoggedTime across overflow chain', () => {
-    const opMetadata = createTestOpMetadata();
-    const buffer = createSpanBuffer(testSchema, createTestTraceRoot('test-trace'), opMetadata, 4);
+  it('preserves strict chronological timestamps across root overflow and a child span', async () => {
+    let rootBuffer: AnySpanBuffer | undefined;
+    let childBuffer: AnySpanBuffer | undefined;
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
 
-    buffer._writeIndex = 4;
-    buffer.timestamp[0] = 100n;
-    buffer.timestamp[1] = 200n;
-    buffer.timestamp[2] = 300n;
-    buffer.timestamp[3] = 400n;
+    await trace('timestamp-order-root', async (root) => {
+      rootBuffer = root.buffer;
+      for (let i = 0; i < 100; i++) root.log.info(`root-${i}`);
+      await root.span('timestamp-order-child', async (child) => {
+        childBuffer = child.buffer;
+        for (let i = 0; i < 100; i++) child.log.info(`child-${i}`);
+        return child.ok('child done');
+      });
+      return root.ok('root done');
+    });
 
-    const overflow = buffer.getOrCreateOverflow();
-    overflow._writeIndex = 2;
-    overflow.timestamp[0] = 500n;
-    overflow.timestamp[1] = 600n;
+    if (!rootBuffer || !childBuffer) throw new Error('trace did not expose both lifecycle buffers');
+    expect(rootBuffer._overflow).toBeDefined();
+    expect(childBuffer._overflow).toBeDefined();
 
-    expect(buffer._lastLoggedTime).toBe(Nanoseconds.unsafe(600n));
+    const chronological: bigint[] = [rootBuffer.timestamp[0]];
+    let segment: AnySpanBuffer | undefined = rootBuffer;
+    let first = true;
+    while (segment) {
+      for (let row = first ? 2 : 0; row < segment._writeIndex; row++) chronological.push(segment.timestamp[row]);
+      first = false;
+      segment = segment._overflow;
+    }
+    chronological.push(childBuffer.timestamp[0]);
+    segment = childBuffer;
+    first = true;
+    while (segment) {
+      for (let row = first ? 2 : 0; row < segment._writeIndex; row++) chronological.push(segment.timestamp[row]);
+      first = false;
+      segment = segment._overflow;
+    }
+    chronological.push(childBuffer.timestamp[1], rootBuffer.timestamp[1]);
+
+    expect(chronological).toHaveLength(204);
+    for (let i = 1; i < chronological.length; i++) {
+      expect(chronological[i]).toBeGreaterThan(chronological[i - 1]);
+    }
   });
 });
