@@ -181,11 +181,15 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
 
   releaseBuffer(buffer: AnySpanBuffer): void {
     const root = requireWasmSpanBuffer<T>(buffer);
-    walkSpanTree(root, (segment) => requireWasmSpanBuffer<T>(segment).free());
-    if (root._descriptor.kind === 'root' && root._traceRoot instanceof WasmTraceRoot) {
-      root._traceRoot.free();
-    }
-    root._traceRoot._topology.release();
+    const segments: WasmSpanBufferInstance<T>[] = [];
+    walkSpanTree(root, (segment) => segments.push(requireWasmSpanBuffer<T>(segment)));
+    const topology = root._traceRoot._topology;
+    topology.release(() => {
+      for (const segment of segments) segment.free();
+      if (root._descriptor.kind === 'root' && root._traceRoot instanceof WasmTraceRoot) {
+        root._traceRoot.free();
+      }
+    });
     this.liveRoots.delete(root);
   }
 

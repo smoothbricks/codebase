@@ -3,6 +3,7 @@
  */
 
 import { copyBits, countNulls } from '@smoothbricks/arrow-builder';
+import { Column } from '@uwdata/flechette';
 import type { AnySpanBuffer } from '../types.js';
 
 const UTF8_ENCODER = new TextEncoder();
@@ -102,6 +103,15 @@ export function concatenateNullBitmaps(buffers: AnySpanBuffer[], columnName: str
   }
 
   return { nullBitmap, nullCount };
+}
+
+/** Combine Arrow-native batches by copying only batch references, never values. */
+export function combineColumnChunks(chunks: readonly Column<unknown>[]): Column<unknown> {
+  if (chunks.length === 0) throw new Error('Cannot combine an empty Arrow chunk list');
+  if (chunks.length === 1) return chunks[0];
+  const batches = [];
+  for (const chunk of chunks) batches.push(...chunk.data);
+  return new Column(batches);
 }
 
 /**

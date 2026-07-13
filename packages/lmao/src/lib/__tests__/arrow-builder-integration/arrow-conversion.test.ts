@@ -11,7 +11,12 @@
 
 import { describe, expect, test } from 'bun:test';
 import type { CapacityStatsEntry } from '../../arrow/capacityStats.js';
-import { convertSpanTreeToArrowTable, convertToArrowTable } from '../../convertToArrow.js';
+import {
+  convertSpanTreeToArrowTable,
+  convertSpanTreeToLeasedArrowTable,
+  convertToArrowTable,
+  convertToLeasedArrowTable,
+} from '../../convertToArrow.js';
 import { DEFAULT_METADATA } from '../../opContext/defineOp.js';
 import { S } from '../../schema/builder.js';
 import {
@@ -476,6 +481,137 @@ describe('Arrow Table Conversion', () => {
 
       expect(getColumnValue(table, 'entry_type', 3)).toBe('buffer-capacity');
       expect(toBigInt(getColumnValue(table, 'uint64_value', 3))).toBe(64n); // capacity
+    });
+  });
+
+  describe('leased chunked conversion', () => {
+    test('pins source chunks until idempotent release and preserves exact schema, nulls, and tree preorder', () => {
+      const schema = createTestSchema({ value: S.number(), label: S.category() });
+      const SpanBufferClass = getSpanBufferClass(schema);
+      const root = createSpanBuffer(schema, createTestTraceRoot('leased-tree'), DEFAULT_METADATA, 8);
+      root.timestamp[0] = 1000n;
+      root.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      root.message(0, 'root-start');
+      root.value(0, 11);
+      root.label(0, 'root');
+      root.timestamp[1] = 1100n;
+      root.entry_type[1] = ENTRY_TYPE_SPAN_OK;
+      root._writeIndex = 2;
+
+      const overflow = createOverflowBuffer(root);
+      overflow.timestamp[0] = 1200n;
+      overflow.entry_type[0] = ENTRY_TYPE_INFO;
+      overflow.message(0, 'overflow-log');
+      overflow.value(0, 22);
+      overflow._writeIndex = 1;
+
+      const child = createChildSpanBuffer(root, SpanBufferClass, DEFAULT_METADATA, DEFAULT_METADATA);
+      child.timestamp[0] = 1300n;
+      child.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      child.message(0, 'child-start');
+      child.label(0, 'child');
+      child.value(0, 0);
+      const childValueNulls = child.getNullsIfAllocated('value');
+      if (!(childValueNulls instanceof Uint8Array)) throw new Error('Expected child value validity');
+      childValueNulls[0] &= ~1;
+      child._writeIndex = 1;
+
+      const topology = root._traceRoot._topology;
+      const generation = topology.generation;
+      const lease = convertSpanTreeToLeasedArrowTable(root);
+      expect(lease.released).toBe(false);
+      expect(lease.table.names).toEqual([
+        'timestamp',
+        'trace_id',
+        'thread_id',
+        'span_id',
+        'parent_thread_id',
+        'parent_span_id',
+        'entry_type',
+        'package_name',
+        'package_file',
+        'git_sha',
+        'message',
+        'uint64_value',
+        'value',
+        'label',
+      ]);
+      const timestampColumn = lease.table.getChild('timestamp');
+      if (!timestampColumn) throw new Error('Missing leased timestamp column');
+      const rawTimestamps = timestampColumn.data.flatMap((batch) => {
+        if (!(batch.values instanceof BigInt64Array)) throw new Error('Expected raw BigInt64Array timestamps');
+        return Array.from(batch.values.subarray(0, batch.length));
+      });
+      expect(rawTimestamps).toEqual([1000n, 1100n, 1200n, 1300n]);
+      expect(Array.from({ length: lease.table.numRows }, (_, row) => getColumnValue(lease.table, 'message', row))).toEqual([
+        'root-start',
+        null,
+        'overflow-log',
+        'child-start',
+      ]);
+      expect(Array.from({ length: lease.table.numRows }, (_, row) => getColumnValue(lease.table, 'value', row))).toEqual([
+        11,
+        null,
+        22,
+        null,
+      ]);
+      expect(Array.from({ length: lease.table.numRows }, (_, row) => getColumnValue(lease.table, 'label', row))).toEqual([
+        'root',
+        null,
+        null,
+        'child',
+      ]);
+
+      const valueColumn = lease.table.getChild('value');
+      if (!valueColumn) throw new Error('Missing leased value column');
+      const sourceColumns = [root, overflow, child].map((buffer) => {
+        const source = buffer.getColumnIfAllocated('value');
+        if (!(source instanceof Float64Array)) throw new Error('Expected source Float64Array');
+        return source;
+      });
+      expect(valueColumn.data).toHaveLength(3);
+      expect(valueColumn.data.map((batch) => batch.values.buffer)).toEqual(
+        sourceColumns.map((source) => source.buffer),
+      );
+      expect(topology.generation).toBe(generation);
+      expect(() => topology.assertLive(root)).not.toThrow();
+
+      root._traceRoot.tracer.bufferStrategy.releaseBuffer(root);
+      expect(topology.generation).toBe(generation);
+      expect(() => topology.assertLive(root)).toThrow('stale');
+      expect(getColumnValue(lease.table, 'message', 2)).toBe('overflow-log');
+      lease.release();
+      expect(lease.released).toBe(true);
+      expect(topology.generation).toBe(generation + 1);
+      expect(() => topology.assertLive(root)).toThrow('stale');
+      expect(() => lease.release()).not.toThrow();
+      expect(() => lease[Symbol.dispose]()).not.toThrow();
+    });
+
+    test('keeps the single-buffer Table API semantically identical while exposing leased source reuse', () => {
+      const schema = createTestSchema({ value: S.number() });
+      const root = createSpanBuffer(schema, createTestTraceRoot('leased-single'), DEFAULT_METADATA, 8);
+      root.timestamp[0] = 2000n;
+      root.entry_type[0] = ENTRY_TYPE_INFO;
+      root.message(0, 'single');
+      root.value(0, 42);
+      root._writeIndex = 1;
+
+      const legacy = convertToArrowTable(root);
+      const lease = convertToLeasedArrowTable(root);
+      expect(lease.table.names).toEqual(legacy.names);
+      expect(lease.table.numRows).toBe(legacy.numRows);
+      for (const name of ['timestamp', 'entry_type', 'message', 'value']) {
+        expect(getColumnValue(lease.table, name, 0)).toEqual(getColumnValue(legacy, name, 0));
+      }
+      const source = root.getColumnIfAllocated('value');
+      if (!(source instanceof Float64Array)) throw new Error('Expected source Float64Array');
+      const valueColumn = lease.table.getChild('value');
+      if (!valueColumn) throw new Error('Missing leased value column');
+      expect(valueColumn.data[0]?.values.buffer).toBe(source.buffer);
+      root._traceRoot.tracer.bufferStrategy.releaseBuffer(root);
+      lease[Symbol.dispose]();
+      expect(lease.released).toBe(true);
     });
   });
 });

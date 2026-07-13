@@ -10,6 +10,7 @@
 
 import {
   clearBitRange,
+  countNulls,
   compareStrings,
   createSortedDictionary,
   DictionaryBuilder,
@@ -48,12 +49,14 @@ import {
   makeArrowColumn,
   type Utf8ColumnData,
 } from './arrow/flechette.js';
+import { createArrowLease, type ArrowLease } from './arrow/lease.js';
 import {
   appendVocabularyDictionarySuffix,
   getVocabularyDictionaryPrefix,
 } from './arrow/vocabularyDictionary.js';
 import {
   calculateUtf8Offsets,
+  combineColumnChunks,
   concatenateFloat64Arrays,
   concatenateNullBitmaps,
   concatenateUint8Arrays,
@@ -66,6 +69,7 @@ import { ENTRY_TYPE_NAMES, SYSTEM_SCHEMA_FIELD_NAMES } from './schema/systemSche
 import { getBinaryEncoder, getEnumUtf8, getEnumValues, getSchemaType } from './schema/typeGuards.js';
 import type { LogSchema } from './schema/types.js';
 import type { AnySpanBuffer, OpMetadata } from './types.js';
+import type { VocabularyGeneration } from './vocabularyRegistry.js';
 import { walkSpanTree } from './traceTopology.js';
 import { globalUtf8Cache } from './utf8Cache.js';
 
@@ -444,57 +448,49 @@ function buildNonDictIdentityColumns(
   );
 }
 
-/**
- * Build timestamp column from buffers.
- */
 function buildTimestampColumn(
   buffers: AnySpanBuffer[],
   totalRows: number,
   fields: string[],
   vectors: Column<unknown>[],
+  borrowChunks = false,
 ): void {
+  const timestampType = timestamp(TimeUnit.NANOSECOND);
+  fields.push('timestamp');
+  if (borrowChunks) {
+    const chunks = buffers.map((buffer) =>
+      buildColumn(
+        buildData({
+          type: timestampType,
+          offset: 0,
+          length: buffer._writeIndex,
+          nullCount: 0,
+          data: buffer.timestamp.subarray(0, buffer._writeIndex),
+        }),
+      ),
+    );
+    vectors.push(combineColumnChunks(chunks));
+    return;
+  }
   const allTimestamps = new BigInt64Array(totalRows);
   let offset = 0;
-  for (const buf of buffers) {
-    if (!buf.timestamp) {
-      throw new Error(`Buffer missing timestamps property (_writeIndex: ${buf._writeIndex})`);
-    }
-    allTimestamps.set(buf.timestamp.subarray(0, buf._writeIndex), offset);
-    offset += buf._writeIndex;
+  for (const buffer of buffers) {
+    allTimestamps.set(buffer.timestamp.subarray(0, buffer._writeIndex), offset);
+    offset += buffer._writeIndex;
   }
-  fields.push('timestamp');
   vectors.push(
-    buildColumn(
-      buildData({
-        type: timestamp(TimeUnit.NANOSECOND),
-        offset: 0,
-        length: totalRows,
-        nullCount: 0,
-        data: allTimestamps,
-      }),
-    ),
+    buildColumn(buildData({ type: timestampType, offset: 0, length: totalRows, nullCount: 0, data: allTimestamps })),
   );
 }
 
-/**
- * Build entry_type dictionary column.
- */
 function buildEntryTypeColumn(
   buffers: AnySpanBuffer[],
   totalRows: number,
   fields: string[],
   vectors: Column<unknown>[],
   dictType?: ReturnType<typeof dictionary>,
+  borrowChunks = false,
 ): void {
-  const entryTypeIndices = new Int8Array(totalRows);
-  let offset = 0;
-  for (const buf of buffers) {
-    if (!buf.entry_type) {
-      throw new Error(`Buffer missing operations property (_writeIndex: ${buf._writeIndex})`);
-    }
-    entryTypeIndices.set(buf.entry_type.subarray(0, buf._writeIndex), offset);
-    offset += buf._writeIndex;
-  }
   const entryTypeDictData = buildData({
     type: utf8(),
     offset: 0,
@@ -503,17 +499,29 @@ function buildEntryTypeColumn(
     valueOffsets: calculateUtf8Offsets(ENTRY_TYPE_NAMES),
     data: encodeUtf8Strings(ENTRY_TYPE_NAMES),
   });
+  const entryTypeDictionary = buildColumn(entryTypeDictData);
+  const type = dictType ?? dictionary(utf8(), int8());
   fields.push('entry_type');
+  if (borrowChunks) {
+    const chunks = buffers.map((buffer) => {
+      const source = buffer.entry_type;
+      const values = new Int8Array(source.buffer, source.byteOffset, buffer._writeIndex);
+      return buildColumn(
+        buildData({ type, offset: 0, length: buffer._writeIndex, nullCount: 0, data: values, dictionary: entryTypeDictionary }),
+      );
+    });
+    vectors.push(combineColumnChunks(chunks));
+    return;
+  }
+  const entryTypeIndices = new Int8Array(totalRows);
+  let offset = 0;
+  for (const buffer of buffers) {
+    entryTypeIndices.set(buffer.entry_type.subarray(0, buffer._writeIndex), offset);
+    offset += buffer._writeIndex;
+  }
   vectors.push(
     buildColumn(
-      buildData({
-        type: dictType ?? dictionary(utf8(), int8()),
-        offset: 0,
-        length: totalRows,
-        nullCount: 0,
-        data: entryTypeIndices,
-        dictionary: buildColumn(entryTypeDictData),
-      }),
+      buildData({ type, offset: 0, length: totalRows, nullCount: 0, data: entryTypeIndices, dictionary: entryTypeDictionary }),
     ),
   );
 }
@@ -674,16 +682,18 @@ function buildBinaryColumnFromBuffers(
  * Dictionaries are built from the data in this batch only and are not shared
  * with other batches, even when combined into a Table.
  */
-export function convertToTable(buffer: AnySpanBuffer, systemColumnBuilder?: SystemColumnBuilder): Table {
+export function convertToTable(
+  buffer: AnySpanBuffer,
+  systemColumnBuilder?: SystemColumnBuilder,
+  borrowChunks = false,
+): Table {
   const buffers: AnySpanBuffer[] = [];
   let currentBuffer: AnySpanBuffer | undefined = buffer;
-
   while (currentBuffer) {
     buffers.push(currentBuffer);
     currentBuffer = currentBuffer._overflow;
   }
-
-  return convertBuffersToTable(buffers, systemColumnBuilder);
+  return convertBuffersToTable(buffers, systemColumnBuilder, borrowChunks);
 }
 
 /**
@@ -693,7 +703,11 @@ export function convertToTable(buffer: AnySpanBuffer, systemColumnBuilder?: Syst
  * Dictionaries are built from the data in this batch only and are not shared
  * with other batches, even when combined into a Table.
  */
-function convertBuffersToTable(buffers: AnySpanBuffer[], systemColumnBuilder?: SystemColumnBuilder): Table {
+function convertBuffersToTable(
+  buffers: AnySpanBuffer[],
+  systemColumnBuilder?: SystemColumnBuilder,
+  borrowChunks = false,
+): Table {
   if (buffers.length === 0) return tableFromColumns({});
 
   const totalRows = buffers.reduce((sum, buf) => sum + buf._writeIndex, 0);
@@ -712,7 +726,7 @@ function convertBuffersToTable(buffers: AnySpanBuffer[], systemColumnBuilder?: S
     vectors.push(...systemColumns.vectors);
   } else {
     // Build metadata columns - returns both fields and vectors with matching types
-    const metadataResult = buildMetadataColumnsWithFields(buffers, totalRows);
+    const metadataResult = buildMetadataColumnsWithFields(buffers, totalRows, borrowChunks);
     fields.push(...metadataResult.fields);
     vectors.push(...metadataResult.vectors);
 
@@ -867,33 +881,52 @@ function convertBuffersToTable(buffers: AnySpanBuffer[], systemColumnBuilder?: S
         vectors.push(buildColumn(textData));
       }
     } else if (lmaoType === 'number') {
-      const valueArrays: Float64Array[] = [];
-
-      for (const buf of buffers) {
-        const column = buf.getColumnIfAllocated(columnName);
-        if (column && column instanceof Float64Array) {
-          valueArrays.push(column.subarray(0, buf._writeIndex).slice());
-        } else {
-          valueArrays.push(new F64Array(buf._writeIndex));
-        }
-      }
-
-      const allValues = concatenateFloat64Arrays(valueArrays);
-      const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
-
       const numberType = float64();
       fields.push(arrowFieldName);
-
-      const numberData = buildData({
-        type: numberType,
-        offset: 0,
-        length: totalRows,
-        nullCount,
-        data: allValues,
-        nullBitmap,
-      });
-
-      vectors.push(buildColumn(numberData));
+      const borrowed = borrowChunks
+        ? buffers.map((buffer) => {
+            const column = buffer.getColumnIfAllocated(columnName);
+            const validity = buffer.getNullsIfAllocated(columnName);
+            if (!(column instanceof Float64Array) || !(validity instanceof Uint8Array)) return undefined;
+            return buildColumn(
+              buildData({
+                type: numberType,
+                offset: 0,
+                length: buffer._writeIndex,
+                nullCount: countNulls(validity, buffer._writeIndex),
+                data: column.subarray(0, buffer._writeIndex),
+                nullBitmap: validity.subarray(0, Math.ceil(buffer._writeIndex / 8)),
+              }),
+            );
+          })
+        : undefined;
+      if (borrowed?.every((chunk): chunk is Column<unknown> => chunk !== undefined)) {
+        vectors.push(combineColumnChunks(borrowed));
+      } else {
+        const valueArrays: Float64Array[] = [];
+        for (const buffer of buffers) {
+          const column = buffer.getColumnIfAllocated(columnName);
+          valueArrays.push(
+            column instanceof Float64Array
+              ? column.subarray(0, buffer._writeIndex).slice()
+              : new F64Array(buffer._writeIndex),
+          );
+        }
+        const allValues = concatenateFloat64Arrays(valueArrays);
+        const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
+        vectors.push(
+          buildColumn(
+            buildData({
+              type: numberType,
+              offset: 0,
+              length: totalRows,
+              nullCount,
+              data: allValues,
+              nullBitmap,
+            }),
+          ),
+        );
+      }
     } else if (lmaoType === 'boolean') {
       const valueArrays: Uint8Array[] = [];
 
@@ -941,7 +974,11 @@ function convertBuffersToTable(buffers: AnySpanBuffer[], systemColumnBuilder?: S
  * This is required for Arrow IPC serialization - Schema validates that
  * fields with same dictionary ID have identical type object references.
  */
-function buildMetadataColumnsWithFields(buffers: AnySpanBuffer[], totalRows: number): BuiltMetadataColumns {
+function buildMetadataColumnsWithFields(
+  buffers: AnySpanBuffer[],
+  totalRows: number,
+  borrowChunks = false,
+): BuiltMetadataColumns {
   const fields: string[] = [];
   const vectors: Column<unknown>[] = [];
 
@@ -949,7 +986,7 @@ function buildMetadataColumnsWithFields(buffers: AnySpanBuffer[], totalRows: num
   //               entry_type, package_name, package_file, git_sha
 
   // 1. Timestamp
-  buildTimestampColumn(buffers, totalRows, fields, vectors);
+  buildTimestampColumn(buffers, totalRows, fields, vectors, borrowChunks);
 
   // 2. Trace ID dictionary (built inline from buffers)
   const traceIdSet = new Set<string>();
@@ -998,7 +1035,7 @@ function buildMetadataColumnsWithFields(buffers: AnySpanBuffer[], totalRows: num
   buildNonDictIdentityColumns(buffers, totalRows, fields, vectors);
 
   // 7. Entry type
-  buildEntryTypeColumn(buffers, totalRows, fields, vectors);
+  buildEntryTypeColumn(buffers, totalRows, fields, vectors, undefined, borrowChunks);
 
   // 8-10. Per-buffer metadata columns (package_name, package_file, git_sha)
   for (const [fieldName, metadataGetter] of [
@@ -1034,6 +1071,45 @@ function buildMetadataColumnsWithFields(buffers: AnySpanBuffer[], totalRows: num
   return { fields, vectors };
 }
 
+type MemoryEpochPin = { readonly buffer: ArrayBuffer; release(): void };
+type EpochPinnableAllocator = { pinMemoryEpoch(): MemoryEpochPin };
+type EpochPinnableBuffer = AnySpanBuffer & { readonly _allocator: EpochPinnableAllocator };
+
+function isEpochPinnableBuffer(buffer: AnySpanBuffer): buffer is EpochPinnableBuffer {
+  return '_allocator' in buffer && typeof (buffer as Partial<EpochPinnableBuffer>)._allocator?.pinMemoryEpoch === 'function';
+}
+
+function createLeasedConversion(
+  root: AnySpanBuffer,
+  buffers: readonly AnySpanBuffer[],
+  build: (borrowChunks: boolean) => Table,
+): ArrowLease {
+  const topology = root._traceRoot._topology;
+  topology.assertLive(root);
+  const releaseTopology = topology.acquireLease();
+  const generations = new Set<VocabularyGeneration>();
+  const allocators = new Set<EpochPinnableAllocator>();
+  for (const buffer of buffers) {
+    generations.add(buffer._vocabularyGeneration);
+    if (isEpochPinnableBuffer(buffer)) allocators.add(buffer._allocator);
+  }
+
+  const epochPins = Array.from(allocators, (allocator) => allocator.pinMemoryEpoch());
+  // WASM linear-memory growth cannot preserve borrowed JS TypedArray views, so
+  // its leased result uses the existing Arrow-owned copy path. JS heap buffers
+  // expose their physical chunks directly under the topology lease.
+  const borrowChunks = epochPins.length === 0;
+  try {
+    const table = build(borrowChunks);
+    for (const pin of epochPins) pin.release();
+    return createArrowLease(table, [...buffers, ...generations], [releaseTopology]);
+  } catch (error) {
+    for (const pin of epochPins) pin.release();
+    releaseTopology();
+    throw error;
+  }
+}
+
 /**
  * Convert SpanBuffer (and its overflow chain) to Arrow Table
  */
@@ -1044,6 +1120,23 @@ export function convertToArrowTable<_T extends LogSchema = LogSchema>(
   const batch = convertToTable(buffer, systemColumnBuilder);
   if (batch.numRows === 0) return tableFromColumns({});
   return batch;
+}
+
+/** Borrow JS physical Arrow chunks until the returned lease is released. */
+export function convertToLeasedArrowTable(
+  buffer: AnySpanBuffer,
+  systemColumnBuilder?: SystemColumnBuilder,
+): ArrowLease {
+  const buffers: AnySpanBuffer[] = [];
+  let segment: AnySpanBuffer | undefined = buffer;
+  while (segment) {
+    buffers.push(segment);
+    segment = segment._overflow;
+  }
+  return createLeasedConversion(buffer, buffers, (borrowChunks) => {
+    const table = convertToTable(buffer, systemColumnBuilder, borrowChunks);
+    return table.numRows === 0 ? tableFromColumns({}) : table;
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1062,6 +1155,7 @@ export function convertSpanTreeToArrowTable(
   _systemColumnBuilder?: SystemColumnBuilder,
   modulesToLogStats?: CapacityStatsEntry[],
   periodStartNs?: bigint,
+  borrowChunks = false,
 ): Table {
   // ═══════════════════════════════════════════════════════════════════════════
   // PASS 0: Collect ALL unique schema fields from ALL buffers in the tree
@@ -1273,6 +1367,7 @@ export function convertSpanTreeToArrowTable(
           categoryOriginalToMasked,
           textOriginalToMasked,
           remaps,
+          borrowChunks,
         )
       : undefined;
 
@@ -1292,6 +1387,28 @@ export function convertSpanTreeToArrowTable(
     return batch;
   }
   return tableFromColumns({});
+}
+
+/** Convert a logical trace tree while pinning every borrowed physical chunk. */
+export function convertSpanTreeToLeasedArrowTable(
+  rootBuffer: AnySpanBuffer,
+  systemColumnBuilder?: SystemColumnBuilder,
+  modulesToLogStats?: CapacityStatsEntry[],
+  periodStartNs?: bigint,
+): ArrowLease {
+  const buffers: AnySpanBuffer[] = [];
+  walkSpanTree(rootBuffer, (buffer) => {
+    if (buffer._writeIndex > 0) buffers.push(buffer);
+  });
+  return createLeasedConversion(rootBuffer, buffers, (borrowChunks) =>
+    convertSpanTreeToArrowTable(
+      rootBuffer,
+      systemColumnBuilder,
+      modulesToLogStats,
+      periodStartNs,
+      borrowChunks,
+    ),
+  );
 }
 
 /**
@@ -1314,6 +1431,7 @@ function convertBuffersWithSharedDicts(
   categoryOriginalToMasked: Map<string, Map<string, string>>,
   textOriginalToMasked: Map<string, Map<string, string>>,
   remaps: RemapsByBuffer,
+  borrowChunks = false,
 ): Table {
   const totalRows = buffers.reduce((sum, buf) => sum + buf._writeIndex, 0);
   const fields: string[] = [];
@@ -1330,7 +1448,7 @@ function convertBuffersWithSharedDicts(
   //               entry_type, package_name, package_file, git_sha
 
   // 1. Timestamp
-  buildTimestampColumn(buffers, totalRows, fields, vectors);
+  buildTimestampColumn(buffers, totalRows, fields, vectors, borrowChunks);
 
   // 2. Trace ID (using shared pre-built dictionary)
   const traceIdIndices = new traceIdDict.indexArrayCtor(totalRows);
@@ -1367,7 +1485,7 @@ function convertBuffersWithSharedDicts(
   buildNonDictIdentityColumns(buffers, totalRows, fields, vectors);
 
   // 7. Entry type (with explicit dictionary ID for IPC)
-  buildEntryTypeColumn(buffers, totalRows, fields, vectors, entryTypeDictType);
+  buildEntryTypeColumn(buffers, totalRows, fields, vectors, entryTypeDictType, borrowChunks);
 
   // 8-10. Per-buffer metadata columns using shared pre-built dictionaries
   // Per specs/lmao/01c_context_flow_and_op_wrappers.md:
@@ -1577,6 +1695,28 @@ function convertBuffersWithSharedDicts(
       );
       fields.push(arrowFieldName);
     } else if (lmaoType === 'number') {
+      const borrowed = borrowChunks
+        ? buffers.map((buffer) => {
+            const sourceName = resolveColumnName(buffer, columnName, remaps);
+            if (getNumberScopeValue(buffer, fieldName, remaps) !== undefined) return undefined;
+            const column = buffer.getColumnIfAllocated(sourceName);
+            const validity = buffer.getNullsIfAllocated(sourceName);
+            if (!(column instanceof Float64Array) || !(validity instanceof Uint8Array)) return undefined;
+            return buildColumn(
+              buildData({
+                type: float64(),
+                offset: 0,
+                length: buffer._writeIndex,
+                nullCount: countNulls(validity, buffer._writeIndex),
+                data: column.subarray(0, buffer._writeIndex),
+                nullBitmap: validity.subarray(0, Math.ceil(buffer._writeIndex / 8)),
+              }),
+            );
+          })
+        : undefined;
+      if (borrowed?.every((chunk): chunk is Column<unknown> => chunk !== undefined)) {
+        vectors.push(combineColumnChunks(borrowed));
+      } else {
       const allValues = new F64Array(totalRows);
       const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
       // Start with all nulls (bits cleared) - we'll set bits as we find values
@@ -1649,6 +1789,7 @@ function convertBuffersWithSharedDicts(
           }),
         ),
       );
+      }
       fields.push(arrowFieldName);
     } else if (lmaoType === 'boolean') {
       const requiredBytes = Math.ceil(totalRows / 8);
