@@ -24,7 +24,7 @@
  * - const { span, ok, err } = ctx; // Just works!
  */
 
-import type { TagWriter } from './codegen/fixedPositionWriterGenerator.js';
+import type { TagWriter, WriterState } from './codegen/fixedPositionWriterGenerator.js';
 import {
   createSpanLogger as createSpanLoggerFromGenerator,
   type FluentLogEntry,
@@ -55,7 +55,7 @@ import {
   ENTRY_TYPE_SPAN_RETRY,
 } from './schema/systemSchema.js';
 import type { InferSchema, LogSchema } from './schema/types.js';
-import type { LogBinding, SpanBuffer } from './types.js';
+import type { AnySpanBuffer, LogBinding, SpanBuffer } from './types.js';
 
 // Note: TraceRoot.writeSpanStart() is used instead of direct timestamp writes.
 // The platform-specific TraceRoot (traceRoot.es.ts or traceRoot.node.ts) handles
@@ -134,6 +134,7 @@ function isSpanDispatchFn<Ctx extends OpContext>(value: unknown): value is SpanD
 function isSpanContextInstance<Ctx extends OpContext>(value: unknown): value is SpanContextInstance<Ctx> {
   return (
     isSpanContext<Ctx>(value) &&
+    Reflect.has(value, '_spanBuffer') &&
     Reflect.has(value, '_buffer') &&
     Reflect.has(value, '_schema') &&
     Reflect.has(value, '_logBinding') &&
@@ -213,18 +214,9 @@ export function writeSpanStart<T extends LogSchema>(buffer: SpanBuffer<T>, spanN
 }
 //#endregion smoo/lmao!n/lmao-entry-span-lifecycle-entry-types.start
 
-/**
- * Create a SpanLogger for the given buffer.
- *
- * Per specs/lmao/01i_span_scope_attributes.md: Scope values are stored directly on buffer._scopeValues.
- * The SpanLogger reads/writes scope via buffer._scopeValues - no separate Scope class needed.
- *
- * @param schema - Tag attribute schema with field definitions
- * @param buffer - SpanBuffer to write entries to (per-span instance)
- * @returns SpanLogger with typed methods matching schema
- */
-export function createSpanLogger<T extends LogSchema>(schema: T, buffer: SpanBuffer<T>): SpanLoggerImpl<T> {
-  return createSpanLoggerFromGenerator(schema, buffer);
+/** Create a SpanLogger bound to an existing SpanContext writer state. */
+export function createSpanLogger<T extends LogSchema>(schema: T, state: WriterState): SpanLoggerImpl<T> {
+  return createSpanLoggerFromGenerator(schema, state);
 }
 
 //#region smoo/lmao!n/op-retry.delay
@@ -560,17 +552,11 @@ export function writeSpanEnd<T extends LogSchema, S, E>(buffer: SpanBuffer<T>, r
 //#region smoo/lmao!n/spancontext-type
 /**
  * Constructor type for SpanContext classes created by createSpanContextClass.
- * Takes buffer, schema, spanLogger, tag directly (no temp object allocation).
- *
- * 01j "SpanContext Type Definition": the runtime SpanContext shape, parameterised by a single
- * bundled OpContext (logSchema/flags/deps/...) rather than separate Schema/Deps/FF/Extra params,
- * and SpanFn realized as the monomorphic span0-span8 overloads + variadic span() dispatcher.
+ * The instance itself becomes the writer state after its core fields are assigned.
  */
 export type SpanContextClass<Ctx extends OpContext = OpContext> = new (
   buffer: SpanBuffer<Ctx['logSchema']>,
   schema: Ctx['logSchema'],
-  spanLogger: SpanLoggerImpl<Ctx['logSchema']> | undefined,
-  tag: TagWriter<Ctx['logSchema']> | undefined,
   callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
   contextSource?: Record<string, unknown>,
   contextOverrides?: Record<string, unknown>,
@@ -582,9 +568,9 @@ export type SpanContextClass<Ctx extends OpContext = OpContext> = new (
  * Instance type of SpanContext class - what ops actually receive.
  * This is a type alias that extends the public SpanContext with internal properties.
  */
-export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
-  // Internal properties
-  _buffer: SpanBuffer<Ctx['logSchema']>;
+export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> &
+  WriterState & {
+  _spanBuffer: SpanBuffer<Ctx['logSchema']>;
   _schema: Ctx['logSchema'];
   _spanLogger: SpanLoggerImpl<Ctx['logSchema']>;
   _logBinding: LogBinding;
@@ -783,8 +769,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
    * avoiding both temp object allocation and property lookups in hot paths.
    */
 
-  class SpanContextImpl {
-    declare _buffer: SpanBuffer<Ctx['logSchema']>;
+  class SpanContextImpl implements WriterState {
+    declare readonly _spanBuffer: SpanBuffer<Ctx['logSchema']>;
+    declare _buffer: AnySpanBuffer;
+    declare readonly _appendLogEntry: WriterState['_appendLogEntry'];
     declare _schema: Ctx['logSchema'];
     declare _spanLogger: SpanLoggerImpl<Ctx['logSchema']>;
     declare _logBinding: LogBinding<Ctx['logSchema']>;
@@ -806,8 +794,6 @@ export function createSpanContextClass<Ctx extends OpContext>(
     constructor(
       buffer: SpanBuffer<Ctx['logSchema']>,
       schema: Ctx['logSchema'],
-      spanLogger: SpanLoggerImpl<Ctx['logSchema']> | undefined,
-      tag: TagWriter<Ctx['logSchema']> | undefined,
       callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
       contextSource?: Record<string, unknown>,
       contextOverrides?: Record<string, unknown>,
@@ -818,10 +804,14 @@ export function createSpanContextClass<Ctx extends OpContext>(
       // Destructured-context assembly (01g): every property an op destructures —
       // tag, log, scope (setScope), ok, err, span — is wired here as a closed-over
       // field/closure so `op(({ tag, log, span, ok, err }) => ...)` needs no ctx drilling.
+      this._spanBuffer = buffer;
       this._buffer = buffer;
+      this._appendLogEntry = buffer._traceRoot._appendLogEntry;
       this._schema = schema;
       this._logBinding = logBinding;
       this._physicalLayoutPlan = callsitePlan;
+      const spanLogger = callsitePlan.newSpanLogger?.(this);
+      const tag = callsitePlan.newTagWriter?.(this);
       if (needsLogger) {
         if (!spanLogger) throw new TypeError('SpanContext capability requires a logger');
         this._spanLogger = spanLogger;
@@ -852,11 +842,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
       }
 
       if (hasResult) {
-        this.ok = <V>(value: V): Ok<V, Ctx['logSchema']> =>
-          new Ok<V, Ctx['logSchema']>(value, buffer, callsitePlan.ResultWriterClass);
-
-        this.err = <E>(error: E): Err<E, Ctx['logSchema']> =>
-          new Err<E, Ctx['logSchema']>(error, buffer, callsitePlan.ResultWriterClass);
+        this.ok = <V>(value: V): Ok<V, Ctx['logSchema']> => new Ok<V, Ctx['logSchema']>(value, this);
+        this.err = <E>(error: E): Err<E, Ctx['logSchema']> => new Err<E, Ctx['logSchema']>(error, this);
       }
       //#endregion smoo/lmao!n/codegen-destructured-context
 
@@ -914,7 +901,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
           const target = resolveSpanTarget<Ctx>(
             arguments[fnIdx],
             self._physicalLayoutPlan,
-            self._buffer._opMetadata,
+            self._spanBuffer._opMetadata,
           );
           const childCtx = asSpanContextInstance<Ctx>(
             hasOverrides
@@ -1044,42 +1031,51 @@ export function createSpanContextClass<Ctx extends OpContext>(
     }
 
     get module(): import('./opContext/opTypes.js').OpMetadata {
-      return this._buffer._opMetadata;
+      return this._spanBuffer._opMetadata;
     }
 
     get callee_package(): string {
-      return this._buffer._opMetadata.package_name;
+      return this._spanBuffer._opMetadata.package_name;
     }
 
     get callee_file(): string {
-      return this._buffer._opMetadata.package_file;
+      return this._spanBuffer._opMetadata.package_file;
     }
 
     get callee_line(): number {
       // Access the line_values array directly to read line number at row 0
       // line_values is a Float64Array per the system schema (LazyNumberSchema)
-      return this._buffer.line_values[0];
+      return this._spanBuffer.line_values[0];
     }
 
     get callee_git_sha(): string {
-      return this._buffer._opMetadata.git_sha;
+      return this._spanBuffer._opMetadata.git_sha;
     }
 
     get buffer(): SpanBuffer<Ctx['logSchema']> {
-      return this._buffer;
+      return this._spanBuffer;
     }
 
     //#region smoo/lmao!n/scope-attributes.read
     // 01i read-only scope view: the immutable _scopeValues snapshot (setScope is wired in the
     // destructured-context region; the immutable merge is _setScope in spanLoggerGenerator).
     get scope(): Readonly<Partial<InferSchema<Ctx['logSchema']>>> {
-      return this._buffer._scopeValues;
+      return this._spanBuffer._scopeValues;
     }
     //#endregion smoo/lmao!n/scope-attributes.read
 
     // =========================================================================
     // Internal methods (on prototype)
     // =========================================================================
+
+    _appendWriterEntry(entryType: number): number {
+      if (this._buffer._writeIndex >= this._buffer._capacity) {
+        this._buffer = this._buffer.getOrCreateOverflow();
+        this._spanLogger._prefillScopedAttributesOn(this._buffer);
+      }
+      const traceRoot = this._buffer._traceRoot;
+      return this._appendLogEntry(traceRoot, this._buffer, entryType);
+    }
 
     /**
      * Create a new child context with prototype chain inheritance.
@@ -1127,9 +1123,9 @@ export function createSpanContextClass<Ctx extends OpContext>(
       opMetadata: OpMetadata,
     ): SpanContextInstance<Ctx> {
       const childSchema = callsitePlan.schema;
-      const createdBuffer = this._buffer._traceRoot.tracer.bufferStrategy.createChildSpanBuffer(
-        this._buffer,
-        this._buffer._opMetadata,
+      const createdBuffer = this._spanBuffer._traceRoot.tracer.bufferStrategy.createChildSpanBuffer(
+        this._spanBuffer,
+        this._spanBuffer._opMetadata,
         opMetadata,
         callsitePlan.capacityTier,
         childSchema,
@@ -1142,15 +1138,13 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
       const childFfSource = Object.hasOwn(this, 'ff')
         ? this.ff
-        : this._buffer._traceRoot.tracer.getFlagEvaluatorForContext();
+        : this._spanBuffer._traceRoot.tracer.getFlagEvaluatorForContext();
       if (!isFlagEvaluatorForContext<Ctx>(childFfSource)) {
         throw new TypeError('Span context requires a context evaluator');
       }
       return new callsitePlan.SpanContextClass(
         childBuffer,
         childSchema,
-        callsitePlan.newSpanLogger?.(childBuffer),
-        callsitePlan.newTagWriter?.(childBuffer),
         callsitePlan,
         childCtx,
         undefined,
@@ -1188,7 +1182,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
     spanAuto0<S, E>(line: number, name: string, op: Op<Ctx, [], S, E>): Result<S, E> | Promise<Result<S, E>> {
       const ctx = this._spanAutoPre(line, name, op);
-      const buffer = ctx._buffer;
+      const buffer = ctx._spanBuffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       let isAsync = false;
       try {
@@ -1244,7 +1238,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a1: A1,
     ): Result<S, E> | Promise<Result<S, E>> {
       const ctx = this._spanAutoPre(line, name, op);
-      const buffer = ctx._buffer;
+      const buffer = ctx._spanBuffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       let isAsync = false;
       try {
@@ -1302,7 +1296,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a2: A2,
     ): Result<S, E> | Promise<Result<S, E>> {
       const ctx = this._spanAutoPre(line, name, op);
-      const buffer = ctx._buffer;
+      const buffer = ctx._spanBuffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       let isAsync = false;
       try {
@@ -1362,7 +1356,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a3: A3,
     ): Result<S, E> | Promise<Result<S, E>> {
       const ctx = this._spanAutoPre(line, name, op);
-      const buffer = ctx._buffer;
+      const buffer = ctx._spanBuffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       let isAsync = false;
       try {
@@ -1424,7 +1418,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a4: A4,
     ): Result<S, E> | Promise<Result<S, E>> {
       const ctx = this._spanAutoPre(line, name, op);
-      const buffer = ctx._buffer;
+      const buffer = ctx._spanBuffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       let isAsync = false;
       try {
@@ -1488,7 +1482,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a5: A5,
     ): Result<S, E> | Promise<Result<S, E>> {
       const ctx = this._spanAutoPre(line, name, op);
-      const buffer = ctx._buffer;
+      const buffer = ctx._spanBuffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       let isAsync = false;
       try {
@@ -1554,7 +1548,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a6: A6,
     ): Result<S, E> | Promise<Result<S, E>> {
       const ctx = this._spanAutoPre(line, name, op);
-      const buffer = ctx._buffer;
+      const buffer = ctx._spanBuffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       let isAsync = false;
       try {
@@ -1622,7 +1616,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a7: A7,
     ): Result<S, E> | Promise<Result<S, E>> {
       const ctx = this._spanAutoPre(line, name, op);
-      const buffer = ctx._buffer;
+      const buffer = ctx._spanBuffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       let isAsync = false;
       try {
@@ -1692,7 +1686,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a8: A8,
     ): Result<S, E> | Promise<Result<S, E>> {
       const ctx = this._spanAutoPre(line, name, op);
-      const buffer = ctx._buffer;
+      const buffer = ctx._spanBuffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       let isAsync = false;
       try {
@@ -1764,7 +1758,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       fn: (ctx: SpanContext<Ctx>) => Result<S, E> | Promise<Result<S, E>>,
     ): Result<S, E> {
       const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
-      const buffer = ctx._buffer;
+      const buffer = ctx._spanBuffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         const result = fn(ctx);
@@ -1789,7 +1783,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       fn: (ctx: SpanContext<Ctx>) => Result<S, E> | Promise<Result<S, E>>,
     ): Promise<Result<S, E>> {
       const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
-      const buffer = ctx._buffer;
+      const buffer = ctx._spanBuffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
@@ -1813,7 +1807,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a1: A1,
     ): Promise<Result<S, E>> {
       const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
-      const buffer = ctx._buffer;
+      const buffer = ctx._spanBuffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
@@ -1838,7 +1832,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a2: A2,
     ): Promise<Result<S, E>> {
       const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
-      const buffer = ctx._buffer;
+      const buffer = ctx._spanBuffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
@@ -1864,7 +1858,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a3: A3,
     ): Promise<Result<S, E>> {
       const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
-      const buffer = ctx._buffer;
+      const buffer = ctx._spanBuffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
@@ -1891,7 +1885,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a4: A4,
     ): Promise<Result<S, E>> {
       const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
-      const buffer = ctx._buffer;
+      const buffer = ctx._spanBuffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
@@ -1919,7 +1913,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a5: A5,
     ): Promise<Result<S, E>> {
       const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
-      const buffer = ctx._buffer;
+      const buffer = ctx._spanBuffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
@@ -1956,7 +1950,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a6: A6,
     ): Promise<Result<S, E>> {
       const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
-      const buffer = ctx._buffer;
+      const buffer = ctx._spanBuffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
@@ -1995,7 +1989,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a7: A7,
     ): Promise<Result<S, E>> {
       const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
-      const buffer = ctx._buffer;
+      const buffer = ctx._spanBuffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
@@ -2036,7 +2030,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a8: A8,
     ): Promise<Result<S, E, Ctx['logSchema']>> {
       const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
-      const buffer = ctx._buffer;
+      const buffer = ctx._spanBuffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
