@@ -24,6 +24,16 @@ pub enum RunSandboxMode {
     ReadWrite,
 }
 
+/// The authority tier receiving a generated Seatbelt profile.
+///
+/// An executed child is always a strict, immutable narrowing of the trusted
+/// supervisor profile generated from the same configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxProfileRole {
+    TrustedSupervisor,
+    ExecutedChild,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxConfig {
     pub home: PathBuf,
@@ -71,11 +81,15 @@ impl fmt::Display for SandboxError {
 
 impl std::error::Error for SandboxError {}
 
-/// Generate a complete, deterministic SBPL profile.
+/// Generate a complete, deterministic SBPL profile for one authority tier.
 ///
-/// Paths must already be canonical controller data. Child argv, environment, and
-/// output are deliberately absent from this API and therefore cannot widen it.
-pub fn seatbelt_profile(config: &SandboxConfig) -> Result<String, SandboxError> {
+/// Paths must already be canonical controller data. Child argv, environment,
+/// output, and repository-controlled grants are deliberately absent from the
+/// role selection and therefore cannot remove the executed-child narrowing.
+pub fn seatbelt_profile(
+    config: &SandboxConfig,
+    role: SandboxProfileRole,
+) -> Result<String, SandboxError> {
     validate_path(&config.home)?;
     validate_path(&config.workspace_mount)?;
     validate_path(&config.exec_temp_dir)?;
@@ -111,6 +125,9 @@ pub fn seatbelt_profile(config: &SandboxConfig) -> Result<String, SandboxError> 
 
     push_line(&mut profile, "(version 1)");
     push_line(&mut profile, "(deny default)");
+    // Hard-link creation is a separate SBPL operation from file-write*.
+    // Keep aliases unavailable to both authority tiers.
+    push_line(&mut profile, "(deny file-link)");
     push_line(&mut profile, "(allow file-read-data (subpath \"/\"))");
     push_line(&mut profile, "(allow process-exec process-fork)");
     push_line(&mut profile, "(allow file-map-executable)");
@@ -188,8 +205,10 @@ pub fn seatbelt_profile(config: &SandboxConfig) -> Result<String, SandboxError> 
     if config.mode == RunSandboxMode::ReadWrite {
         push_subpath_rule(&mut profile, "allow file-write*", &config.workspace_mount)?;
     }
+    let workspace_metadata = config.workspace_mount.join(".cowshed");
+    let job_artifacts = workspace_metadata.join("job");
 
-    // SBPL is last-match-wins: immutable secrets and policy denies terminate the profile.
+    // SBPL is last-match-wins: immutable secrets and policy denies close the shared profile.
     for deny in hard_denies
         .into_iter()
         .filter(|path| path.as_ref() != cowshed.as_path())
@@ -197,6 +216,27 @@ pub fn seatbelt_profile(config: &SandboxConfig) -> Result<String, SandboxError> 
         push_exact_and_subpath_rule(&mut profile, "deny file-read* file-write*", deny.as_ref())?;
     }
 
+    match role {
+        SandboxProfileRole::TrustedSupervisor => {
+            // The trusted writer's reserved authority is the final narrow
+            // carve-back, including when the repository itself is read-only.
+            push_exact_and_subpath_rule(&mut profile, "allow file-write*", &job_artifacts)?;
+        }
+        SandboxProfileRole::ExecutedChild => {
+            // These terminal rules are emitted after every configurable or broad
+            // allow. Denying create/unlink at the metadata directory itself
+            // prevents replacing or renaming that ancestor without blocking
+            // writes to unrelated metadata children.
+            // file-write* covers create, data write/truncate, rename, unlink, and
+            // symlink creation. Hard links are separately denied for both tiers.
+            push_literal_rule(
+                &mut profile,
+                "deny file-write-create file-write-unlink",
+                &workspace_metadata,
+            )?;
+            push_exact_and_subpath_rule(&mut profile, "deny file-write*", &job_artifacts)?;
+        }
+    }
     Ok(profile)
 }
 
@@ -289,6 +329,18 @@ fn push_subpath_rule(
     Ok(())
 }
 
+fn push_literal_rule(
+    profile: &mut String,
+    operation: &str,
+    path: &Path,
+) -> Result<(), SandboxError> {
+    push_line(
+        profile,
+        &format!("({operation} (literal \"{}\"))", sbpl_path(path)?),
+    );
+    Ok(())
+}
+
 fn push_exact_and_subpath_rule(
     profile: &mut String,
     operation: &str,
@@ -310,6 +362,15 @@ fn push_line(profile: &mut String, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use std::fs;
+    #[cfg(target_os = "macos")]
+    use std::process::Stdio;
+    #[cfg(target_os = "macos")]
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(target_os = "macos")]
+    static NEXT_SANDBOX_DIR: AtomicU64 = AtomicU64::new(0);
 
     fn config(mode: RunSandboxMode) -> SandboxConfig {
         SandboxConfig {
@@ -368,7 +429,7 @@ mod tests {
         let mut relative = config(RunSandboxMode::ReadOnly);
         relative.home = PathBuf::from("Users/tester");
         assert_eq!(
-            seatbelt_profile(&relative),
+            seatbelt_profile(&relative, SandboxProfileRole::ExecutedChild),
             Err(SandboxError::InvalidPath {
                 path: PathBuf::from("Users/tester"),
                 reason: "path is not absolute",
@@ -381,7 +442,7 @@ mod tests {
             .write
             .push(PathBuf::from("/opt/output/../private"));
         assert_eq!(
-            seatbelt_profile(&traversing),
+            seatbelt_profile(&traversing, SandboxProfileRole::ExecutedChild),
             Err(SandboxError::InvalidPath {
                 path: PathBuf::from("/opt/output/../private"),
                 reason: "path is not canonical",
@@ -391,7 +452,7 @@ mod tests {
         let mut nul = config(RunSandboxMode::ReadOnly);
         nul.allowed_unix_sockets = vec![PathBuf::from("/var/run/socket\0suffix")];
         assert_eq!(
-            seatbelt_profile(&nul),
+            seatbelt_profile(&nul, SandboxProfileRole::ExecutedChild),
             Err(SandboxError::InvalidPath {
                 path: PathBuf::from("/var/run/socket\0suffix"),
                 reason: "path contains NUL",
@@ -404,7 +465,7 @@ mod tests {
         let mut invalid = config(RunSandboxMode::ReadOnly);
         invalid.additional_denies = vec![PathBuf::from("relative/deny")];
         assert_eq!(
-            seatbelt_profile(&invalid),
+            seatbelt_profile(&invalid, SandboxProfileRole::ExecutedChild),
             Err(SandboxError::InvalidPath {
                 path: PathBuf::from("relative/deny"),
                 reason: "path is not absolute",
@@ -415,8 +476,8 @@ mod tests {
     #[test]
     fn profile_is_deterministic_and_has_exactly_sixteen_literal_ports() {
         let config = config(RunSandboxMode::ReadWrite);
-        let first = seatbelt_profile(&config).unwrap();
-        let second = seatbelt_profile(&config).unwrap();
+        let first = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        let second = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
         assert_eq!(first, second);
         assert_eq!(
             first
@@ -434,8 +495,16 @@ mod tests {
 
     #[test]
     fn read_only_removes_only_workspace_write_carve_back() {
-        let read_write = seatbelt_profile(&config(RunSandboxMode::ReadWrite)).unwrap();
-        let read_only = seatbelt_profile(&config(RunSandboxMode::ReadOnly)).unwrap();
+        let read_write = seatbelt_profile(
+            &config(RunSandboxMode::ReadWrite),
+            SandboxProfileRole::ExecutedChild,
+        )
+        .unwrap();
+        let read_only = seatbelt_profile(
+            &config(RunSandboxMode::ReadOnly),
+            SandboxProfileRole::ExecutedChild,
+        )
+        .unwrap();
         let workspace_write = "(allow file-write* (subpath \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount\"))";
         assert!(read_write.contains(workspace_write));
         assert!(!read_only.contains(workspace_write));
@@ -443,8 +512,12 @@ mod tests {
     }
 
     #[test]
-    fn secret_denies_terminate_after_grants_and_carve_backs() {
-        let profile = seatbelt_profile(&config(RunSandboxMode::ReadWrite)).unwrap();
+    fn secret_denies_follow_grants_and_carve_backs() {
+        let profile = seatbelt_profile(
+            &config(RunSandboxMode::ReadWrite),
+            SandboxProfileRole::ExecutedChild,
+        )
+        .unwrap();
         let grant = profile.find("/opt/shared").unwrap();
         let carve_back = profile.rfind("allow file-write*").unwrap();
         let secret = profile.rfind("/Users/tester/.ssh").unwrap();
@@ -458,10 +531,50 @@ mod tests {
             let mut config = config(RunSandboxMode::ReadWrite);
             config.grants.read = vec![PathBuf::from(grant)];
             assert!(matches!(
-                seatbelt_profile(&config),
+                seatbelt_profile(&config, SandboxProfileRole::ExecutedChild),
                 Err(SandboxError::GrantIntersectsDeny { .. })
             ));
         }
+    }
+
+    #[test]
+    fn executed_child_is_a_terminal_narrowing_of_the_supervisor() {
+        let config = config(RunSandboxMode::ReadOnly);
+        let supervisor = seatbelt_profile(&config, SandboxProfileRole::TrustedSupervisor).unwrap();
+        let child = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        let protected_allow = "(allow file-write* (literal \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed/job\") (subpath \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed/job\"))";
+        let ancestor_deny = "(deny file-write-create file-write-unlink (literal \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed\"))";
+        let protected_deny = "(deny file-write* (literal \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed/job\") (subpath \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed/job\"))";
+
+        assert_eq!(supervisor.lines().last(), Some(protected_allow));
+        assert!(!supervisor.contains(ancestor_deny));
+        assert!(!supervisor.contains(protected_deny));
+        assert_eq!(child.lines().last(), Some(protected_deny));
+        assert!(child.rfind("(allow ").unwrap() < child.find(ancestor_deny).unwrap());
+
+        let common_supervisor = supervisor
+            .strip_suffix(&format!("{protected_allow}\n"))
+            .unwrap();
+        let child_suffix = format!("{ancestor_deny}\n{protected_deny}\n");
+        let common_child = child.strip_suffix(&child_suffix).unwrap();
+        assert_eq!(common_child, common_supervisor);
+    }
+
+    #[test]
+    fn protected_artifacts_cannot_be_regranted_or_aliased() {
+        let mut config = config(RunSandboxMode::ReadWrite);
+        let protected_stream = config.workspace_mount.join(".cowshed/job/7/out");
+        config.grants.write.push(protected_stream.clone());
+
+        assert!(matches!(
+            seatbelt_profile(&config, SandboxProfileRole::ExecutedChild),
+            Err(SandboxError::GrantIntersectsDeny { grant, .. })
+                if grant == protected_stream
+        ));
+
+        config.grants.write.pop();
+        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        assert!(profile.lines().any(|line| line == "(deny file-link)"));
     }
 
     #[test]
@@ -475,12 +588,61 @@ mod tests {
     }
     #[cfg(target_os = "macos")]
     #[test]
-    fn generated_profile_is_accepted_by_sandbox_exec() {
-        let profile = seatbelt_profile(&config(RunSandboxMode::ReadOnly)).unwrap();
-        let status = std::process::Command::new("/usr/bin/sandbox-exec")
-            .args(["-p", &profile, "--", "/usr/bin/true"])
+    fn seatbelt_enforces_supervisor_and_child_artifact_authority() {
+        let sequence = NEXT_SANDBOX_DIR.fetch_add(1, Ordering::Relaxed);
+        let root_alias = std::env::temp_dir().join(format!(
+            "cowshed-sandbox-test-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root_alias).unwrap();
+        let root = fs::canonicalize(&root_alias).unwrap();
+
+        let mut config = config(RunSandboxMode::ReadWrite);
+        config.home = root.join("home");
+        config.workspace_mount = root.join("workspace");
+        config.exec_temp_dir = root.join("tmp");
+        config.allowed_unix_sockets.clear();
+        let protected = config.workspace_mount.join(".cowshed/job");
+        fs::create_dir_all(&config.home).unwrap();
+        fs::create_dir_all(&config.exec_temp_dir).unwrap();
+        fs::create_dir_all(&protected).unwrap();
+
+        let supervisor = seatbelt_profile(&config, SandboxProfileRole::TrustedSupervisor).unwrap();
+        let child = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        let canonical_stream = protected.join("out");
+        let child_stream = protected.join("child");
+        let workspace_file = config.workspace_mount.join("ordinary");
+        let hardlink = config.workspace_mount.join("alias");
+
+        let supervisor_write = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &supervisor, "--", "/usr/bin/touch"])
+            .arg(&canonical_stream)
+            .stderr(Stdio::null())
             .status()
             .unwrap();
-        assert!(status.success());
+        let child_write = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &child, "--", "/usr/bin/touch"])
+            .arg(&child_stream)
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        let ordinary_write = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &child, "--", "/usr/bin/touch"])
+            .arg(&workspace_file)
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        let hardlink_attempt = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &supervisor, "--", "/bin/ln"])
+            .args([&canonical_stream, &hardlink])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+
+        fs::remove_dir_all(&root).unwrap();
+        assert!(supervisor_write.success());
+        assert!(!child_write.success());
+        assert!(ordinary_write.success());
+        assert!(!hardlink_attempt.success());
     }
 }
