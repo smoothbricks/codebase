@@ -6,6 +6,12 @@ import {
 
 const encoder = new TextEncoder();
 
+function valueAt(values: Uint8Array, index: number, label: string): number {
+  const value = values[index];
+  if (value === undefined) throw new RangeError(`${label} index ${index} is out of range`);
+  return value;
+}
+
 function encodeLogRecord(text: string): Uint8Array {
   const textBytes = encoder.encode(text);
   const record = new Uint8Array(4 + textBytes.length + 2);
@@ -14,7 +20,19 @@ function encodeLogRecord(text: string): Uint8Array {
   return record;
 }
 
-function contentHash(fragment: Omit<VocabularyFragment, 'contentHash'>): string {
+export function benchmarkVocabularyStableId(text: string, kindTag = 1): number {
+  if (kindTag !== 1 && kindTag !== 2) throw new RangeError(`Unsupported vocabulary kind tag ${kindTag}`);
+  const record = encodeLogRecord(text);
+  const digest = createHash('sha256').update(Uint8Array.of(kindTag)).update(record).digest();
+  const stableId =
+    (valueAt(digest, 0, 'digest') << 16) |
+    (valueAt(digest, 1, 'digest') << 8) |
+    valueAt(digest, 2, 'digest');
+  if (stableId === 0) throw new Error('Vocabulary record produced reserved stable ID zero');
+  return stableId;
+}
+
+function vocabularyContentHash(fragment: Omit<VocabularyFragment, 'contentHash'>): string {
   const algorithm = encoder.encode(fragment.idAlgorithm);
   const byteLength =
     1 +
@@ -59,17 +77,23 @@ function contentHash(fragment: Omit<VocabularyFragment, 'contentHash'>): string 
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-export function registerBenchmarkVocabulary(texts: readonly string[]): Uint32Array {
+export function createBenchmarkVocabularyFragment(
+  texts: readonly string[],
+  kindTag = 1,
+): VocabularyFragment {
+  if (kindTag !== 1 && kindTag !== 2) throw new RangeError(`Unsupported vocabulary kind tag ${kindTag}`);
   const records = texts.map(encodeLogRecord);
   const offsets = new Int32Array(records.length + 1);
   const ids = new Uint32Array(records.length);
   let byteLength = 0;
   for (let ordinal = 0; ordinal < records.length; ordinal++) {
     const record = records[ordinal];
+    if (record === undefined) throw new RangeError(`Missing vocabulary record ${ordinal}`);
     byteLength += record.length;
     offsets[ordinal + 1] = byteLength;
-    const digest = createHash('sha256').update(Uint8Array.of(1)).update(record).digest();
-    ids[ordinal] = (digest[0] << 16) | (digest[1] << 8) | digest[2];
+    const text = texts[ordinal];
+    if (text === undefined) throw new RangeError(`Missing vocabulary text ${ordinal}`);
+    ids[ordinal] = benchmarkVocabularyStableId(text, kindTag);
   }
   const utf8 = new Uint8Array(byteLength);
   let offset = 0;
@@ -81,9 +105,13 @@ export function registerBenchmarkVocabulary(texts: readonly string[]): Uint32Arr
     schemaVersion: 1,
     idAlgorithm: 'sha256-24-v1',
     ids,
-    kindTags: new Uint8Array(texts.length).fill(1),
+    kindTags: new Uint8Array(texts.length).fill(kindTag),
     utf8,
     offsets,
   };
-  return registerVocabularyFragment({ ...fragment, contentHash: contentHash(fragment) });
+  return { ...fragment, contentHash: vocabularyContentHash(fragment) };
+}
+
+export function registerBenchmarkVocabulary(texts: readonly string[]): Uint32Array {
+  return registerVocabularyFragment(createBenchmarkVocabularyFragment(texts));
 }
