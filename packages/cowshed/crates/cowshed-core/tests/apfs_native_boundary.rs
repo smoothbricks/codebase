@@ -1432,11 +1432,13 @@ fn sidecar_first_publication_is_invisible_until_image_rename_and_recovers() {
     let host = native_host(&fixture, RecordingRunner::default());
     host.set_restore_failpoint(RestoreFailpoint::AfterMetadataFsync);
     host.publish_image(&staged, canonical.image())
-        .expect_err("crash after durable sidecar publication");
+        .expect_err("recoverable prepublication failure");
     assert!(!canonical.image().exists());
-    assert!(sidecar_path(canonical.image()).exists());
+    assert!(!sidecar_path(canonical.image()).exists());
     assert!(staged.exists());
-    assert!(!sidecar_path(&staged).exists());
+    assert!(sidecar_path(&staged).exists());
+    std::fs::rename(sidecar_path(&staged), sidecar_path(canonical.image()))
+        .expect("simulate process death after durable sidecar rename");
     assert!(
         host.list(&repo()).expect("sidecar-only listing").is_empty(),
         "readers enumerate images, so sidecar-only publication remains invisible"
@@ -2377,4 +2379,100 @@ fn gc_first_recovers_post_handoff_adopt_before_pruning_staging() {
         .expect("repeated recovery converges");
     assert!(canonical.image().exists());
     assert!(sidecar_path(canonical.image()).exists());
+}
+
+#[test]
+fn publication_failpoints_converge_for_clone_and_adopt_callers() {
+    for failpoint in [
+        RestoreFailpoint::AfterCanonicalSidecarRename,
+        RestoreFailpoint::AfterCanonicalImageRename,
+        RestoreFailpoint::CanonicalParentFsyncFailure,
+    ] {
+        let fixture = Fixture::new(&format!("publish-clone-{failpoint:?}"));
+        let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+        let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+        let staged = layout
+            .project()
+            .project_root
+            .join(".staging/main-00000000000000000000000000000001.sparseimage");
+        create_image(&staged, ImageFormat::Sparse);
+        std::fs::write(&staged, b"clone generation").expect("staged bytes");
+        let host = native_host(&fixture, RecordingRunner::default());
+        host.set_restore_failpoint(failpoint);
+        let result = host.publish_image(&staged, canonical.image());
+        if failpoint == RestoreFailpoint::AfterCanonicalSidecarRename {
+            result.expect_err("prepublication failure");
+            assert!(staged.exists());
+            assert!(sidecar_path(&staged).exists());
+            native_host(&fixture, RecordingRunner::default())
+                .publish_image(&staged, canonical.image())
+                .expect("retry prepublication");
+        } else {
+            result.expect("durable pair is recovered as success");
+        }
+        assert_eq!(
+            std::fs::read(canonical.image()).expect("canonical bytes"),
+            b"clone generation"
+        );
+        DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("canonical metadata");
+        assert!(!staged.exists());
+        assert!(!sidecar_path(&staged).exists());
+    }
+
+    for failpoint in [
+        RestoreFailpoint::AfterCanonicalSidecarRename,
+        RestoreFailpoint::AfterCanonicalImageRename,
+        RestoreFailpoint::CanonicalParentFsyncFailure,
+    ] {
+        let fixture = Fixture::new(&format!("publish-adopt-{failpoint:?}"));
+        let config = fixture.config();
+        let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+        let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+        let staged = layout
+            .project()
+            .project_root
+            .join(".staging/main-00000000000000000000000000000001.sparseimage");
+        create_image(&staged, ImageFormat::Sparse);
+        std::fs::write(&staged, b"adopted generation").expect("staged bytes");
+        std::fs::create_dir_all(&config.main_mount).expect("source");
+        std::fs::write(config.main_mount.join("tracked"), b"original").expect("source bytes");
+        let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.main_mount.display()));
+        let host = native_host(&fixture, RecordingRunner::default());
+        host.set_restore_failpoint(failpoint);
+        let result =
+            host.publish_adopt(&config.main_mount, &pre_cowshed, &staged, canonical.image());
+        if failpoint == RestoreFailpoint::AfterCanonicalSidecarRename {
+            result.expect_err("prepublication adopt failure");
+            assert_eq!(
+                std::fs::read(config.main_mount.join("tracked")).expect("restored source"),
+                b"original"
+            );
+            assert!(!pre_cowshed.exists());
+            native_host(&fixture, RecordingRunner::default())
+                .publish_adopt(&config.main_mount, &pre_cowshed, &staged, canonical.image())
+                .expect("adopt retry");
+        } else {
+            result.expect("durable adopt pair recovers as success");
+        }
+        assert_eq!(
+            std::fs::read(canonical.image()).expect("canonical bytes"),
+            b"adopted generation"
+        );
+        DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("canonical metadata");
+        assert_eq!(
+            std::fs::read(pre_cowshed.join("tracked")).expect("preserved original"),
+            b"original"
+        );
+        assert!(
+            !config.main_mount.join("tracked").exists(),
+            "nonempty original must never remain beneath the mountpoint"
+        );
+        assert!(config.main_mount.join(".envrc").exists());
+        let restarted = native_host(&fixture, RecordingRunner::default());
+        assert_eq!(restarted.list(&repo()).expect("list").len(), 1);
+        restarted.gc(&config).expect("GC convergence");
+        restarted
+            .recover_pending(&config, &[])
+            .expect("recovery convergence");
+    }
 }
