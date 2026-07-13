@@ -34,6 +34,7 @@ import {
 import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
 import type { InferSchema, LogSchema } from '../schema/types.js';
 
+import type { ITraceRoot, TimestampAppendPrimitive } from '../traceRoot.js';
 import type { AnySpanBuffer, SpanBuffer } from '../types.js';
 
 // =============================================================================
@@ -400,7 +401,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
   const enumFluentSetters = generateEnumFluentSetters(enumFieldNames);
 
   return {
-    constructorParams: '',
+    constructorParams: 'traceRoot, appendLogEntry',
 
     // Entry type constants (inlined from lmao.ts)
     classPreamble: `
@@ -421,6 +422,8 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
     constructorCode: `
       this._writeIndex = 1;
       this._buffer._writeIndex = 2;
+      this._traceRoot = traceRoot;
+      this._appendLogEntry = appendLogEntry;
 `,
 
     // Check for overflow before writing, switch to overflow buffer if needed.
@@ -441,7 +444,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       // We sync this._writeIndex so fluent setters write at correct row.
       `info(message) {
       this._checkOverflow();
-      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_INFO);
+      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_INFO);
       this._writeIndex = idx;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
@@ -454,7 +457,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
 
     _infoTemplate(templateId) {
       this._checkOverflow();
-      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_INFO);
+      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_INFO);
       this._writeIndex = idx;
       this._buffer._messageTemplateIds[idx] = templateId;
       if (this._buffer.message_nulls) {
@@ -467,7 +470,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       // Write a debug log entry.
       `debug(message) {
       this._checkOverflow();
-      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_DEBUG);
+      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_DEBUG);
       this._writeIndex = idx;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
@@ -480,7 +483,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
 
     _debugTemplate(templateId) {
       this._checkOverflow();
-      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_DEBUG);
+      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_DEBUG);
       this._writeIndex = idx;
       this._buffer._messageTemplateIds[idx] = templateId;
       if (this._buffer.message_nulls) {
@@ -493,7 +496,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       // Write a warn log entry.
       `warn(message) {
       this._checkOverflow();
-      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_WARN);
+      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_WARN);
       this._writeIndex = idx;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
@@ -506,7 +509,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
 
     _warnTemplate(templateId) {
       this._checkOverflow();
-      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_WARN);
+      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_WARN);
       this._writeIndex = idx;
       this._buffer._messageTemplateIds[idx] = templateId;
       if (this._buffer.message_nulls) {
@@ -519,7 +522,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       // Write an error log entry.
       `error(message) {
       this._checkOverflow();
-      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_ERROR);
+      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_ERROR);
       this._writeIndex = idx;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
@@ -532,7 +535,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
 
     _errorTemplate(templateId) {
       this._checkOverflow();
-      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_ERROR);
+      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_ERROR);
       this._writeIndex = idx;
       this._buffer._messageTemplateIds[idx] = templateId;
       if (this._buffer.message_nulls) {
@@ -545,7 +548,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       // Write a trace log entry.
       `trace(message) {
       this._checkOverflow();
-      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_TRACE);
+      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_TRACE);
       this._writeIndex = idx;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
@@ -558,7 +561,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
 
     _traceTemplate(templateId) {
       this._checkOverflow();
-      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_TRACE);
+      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_TRACE);
       this._writeIndex = idx;
       this._buffer._messageTemplateIds[idx] = templateId;
       if (this._buffer.message_nulls) {
@@ -588,7 +591,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       // Called by FeatureFlagEvaluator to log flag access.
       `ffAccess(flagName, value) {
       this._checkOverflow();
-      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_FF_ACCESS);
+      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_FF_ACCESS);
       this._writeIndex = idx;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = flagName;
@@ -610,7 +613,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       // Called by FeatureFlagEvaluator to log flag usage.
       `ffUsage(flagName, context) {
       this._checkOverflow();
-      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_FF_USAGE);
+      const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_FF_USAGE);
       this._writeIndex = idx;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = flagName;
@@ -714,6 +717,8 @@ function isSpanLoggerConstructor<T extends LogSchema>(
   value: unknown,
 ): value is new (
   buffer: AnySpanBuffer,
+  traceRoot: ITraceRoot,
+  appendLogEntry: TimestampAppendPrimitive,
 ) => SpanLoggerImpl<T> {
   return typeof value === 'function';
 }
@@ -733,6 +738,8 @@ export function createSpanLoggerClass<T extends LogSchema>(
   schema: T,
 ): new (
   buffer: AnySpanBuffer,
+  traceRoot: ITraceRoot,
+  appendLogEntry: TimestampAppendPrimitive,
 ) => SpanLoggerImpl<T> {
   // Check cache first
   let SpanLoggerClass = spanLoggerClassCache.get(schema);
@@ -767,6 +774,6 @@ export function createSpanLoggerClass<T extends LogSchema>(
  */
 export function createSpanLogger<T extends LogSchema>(schema: T, buffer: SpanBuffer<T>): SpanLoggerImpl<T> {
   const SpanLoggerClass = createSpanLoggerClass(schema);
-  return new SpanLoggerClass(buffer);
+  return new SpanLoggerClass(buffer, buffer._traceRoot, buffer._traceRoot._appendLogEntry);
 }
 //#endregion smoo/lmao!n/codegen-spanlogger

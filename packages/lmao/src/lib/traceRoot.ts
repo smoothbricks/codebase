@@ -31,6 +31,9 @@ export interface TracerLifecycleHooks {
   onSpanStart(buffer: unknown): void;
   onSpanEnd(buffer: unknown): void;
   onStatsWillResetFor(buffer: unknown): void;
+  /** Internal evaluator source used when a specialized parent omits the public ff slot. */
+  getFlagEvaluatorForContext(): unknown;
+
 
   /**
    * Buffer strategy for creating child and overflow buffers.
@@ -84,6 +87,12 @@ export const TRACE_ROOT_TRACE_ID_OFFSET = 17;
  */
 export type TraceRootFactory = (trace_id: string, tracer: TracerLifecycleHooks) => ITraceRoot;
 
+/** Platform-fixed primitives copied into the physical plan/generated writer hot path. */
+export type TimestampNowPrimitive = (traceRoot: ITraceRoot) => Nanoseconds;
+export type TimestampAppendPrimitive = (traceRoot: ITraceRoot, buffer: AnySpanBuffer, entryType: number) => number;
+export type SpanStartPrimitive = (traceRoot: ITraceRoot, buffer: AnySpanBuffer, spanName: string) => void;
+export type SpanEndPrimitive = (traceRoot: ITraceRoot, buffer: AnySpanBuffer, entryType: number) => void;
+
 export interface ITraceRoot {
   /**
    * Raw backing buffer containing anchor timestamps and trace_id.
@@ -113,6 +122,12 @@ export interface ITraceRoot {
    * Node.js: stored as number in the shared layout (WASM-readable), but represents hrtime
    */
   readonly anchorPerfNow: number;
+
+  /** Monomorphic platform implementations cached by plans and generated writers. */
+  readonly _timestampNow: TimestampNowPrimitive;
+  readonly _appendLogEntry: TimestampAppendPrimitive;
+  readonly _writeSpanStart: SpanStartPrimitive;
+  readonly _writeSpanEnd: SpanEndPrimitive;
 
   /**
    * Get current timestamp in nanoseconds since Unix epoch.

@@ -18,6 +18,10 @@ import {
   TRACE_ROOT_ANCHOR_PERF_OFFSET,
   TRACE_ROOT_TRACE_ID_LEN_OFFSET,
   TRACE_ROOT_TRACE_ID_OFFSET,
+  type SpanEndPrimitive,
+  type SpanStartPrimitive,
+  type TimestampAppendPrimitive,
+  type TimestampNowPrimitive,
   type TracerLifecycleHooks,
 } from './traceRoot.js';
 import type { AnySpanBuffer } from './types.js';
@@ -34,6 +38,38 @@ const textDecoder = new TextDecoder();
  *
  * Stores anchor data in _system ArrayBuffer and writes timestamps directly from JS.
  */
+function nextTimestamp(root: TraceRoot): Nanoseconds {
+  let timestamp = root._epochHrtimeOffset + process.hrtime.bigint();
+  if (timestamp <= root._lastTimestampNanos) timestamp = root._lastTimestampNanos + 1n;
+  root._lastTimestampNanos = timestamp;
+  return Nanoseconds.unsafe(timestamp);
+}
+
+const timestampNow: TimestampNowPrimitive = (traceRoot) => nextTimestamp(traceRoot as TraceRoot);
+
+const appendLogEntry: TimestampAppendPrimitive = (traceRoot, buffer, entryType) => {
+  const idx = buffer._writeIndex;
+  buffer.timestamp[idx] = nextTimestamp(traceRoot as TraceRoot);
+  buffer.entry_type[idx] = entryType;
+  buffer._writeIndex = idx + 1;
+  return idx;
+};
+
+const writeSpanStartPrimitive: SpanStartPrimitive = (traceRoot, buffer, spanName) => {
+  buffer.timestamp[0] = nextTimestamp(traceRoot as TraceRoot);
+  buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+  if (buffer.message_values) buffer.message(0, spanName);
+  buffer.entry_type[1] = ENTRY_TYPE_SPAN_EXCEPTION;
+  buffer.timestamp[1] = 0n;
+  buffer._writeIndex = 2;
+};
+
+const writeSpanEndPrimitive: SpanEndPrimitive = (traceRoot, buffer, entryType) => {
+  buffer.timestamp[1] = nextTimestamp(traceRoot as TraceRoot);
+  buffer.entry_type[1] = entryType;
+  buffer._sealStatsChain();
+};
+
 export class TraceRoot implements ITraceRoot {
   /**
    * Raw backing buffer containing anchor timestamps and trace_id.
@@ -44,6 +80,10 @@ export class TraceRoot implements ITraceRoot {
    * Tracer reference for lifecycle hooks and event callbacks.
    */
   readonly tracer: TracerLifecycleHooks;
+  readonly _timestampNow = timestampNow;
+  readonly _appendLogEntry = appendLogEntry;
+  readonly _writeSpanStart = writeSpanStartPrimitive;
+  readonly _writeSpanEnd = writeSpanEndPrimitive;
 
   /**
    * Cached TypedArray views for fast JS access.
@@ -51,11 +91,9 @@ export class TraceRoot implements ITraceRoot {
   private readonly _epochView: BigInt64Array;
   private readonly _perfView: Float64Array;
 
-  /**
-   * Cached anchor hrtime as the exact BigInt, so the JS timestamp delta stays
-   * correct after the f64 `anchorPerfNow` loses integer precision (~104 days uptime).
-   */
-  private readonly _anchorHrtimeBigInt: bigint;
+  /** Epoch offset makes each exact timestamp one clock read plus one BigInt addition. */
+  readonly _epochHrtimeOffset: bigint;
+  _lastTimestampNanos = 0n;
 
   constructor(
     trace_id: TraceId,
@@ -77,8 +115,7 @@ export class TraceRoot implements ITraceRoot {
     this._epochView[0] = anchorEpochNanos;
     this._perfView[0] = anchorPerfNow;
 
-    // Keep exact monotonic anchor for JS fallback (avoid Number precision loss after ~104 days uptime)
-    this._anchorHrtimeBigInt = anchorHrtimeBigInt;
+    this._epochHrtimeOffset = anchorEpochNanos - anchorHrtimeBigInt;
 
     // Encode trace_id directly into buffer (no intermediate allocation)
     const u8View = new Uint8Array(this._system, TRACE_ROOT_TRACE_ID_LEN_OFFSET);
@@ -114,9 +151,7 @@ export class TraceRoot implements ITraceRoot {
    * Uses process.hrtime.bigint() for true nanosecond precision.
    */
   getTimestampNanos(): Nanoseconds {
-    const currentHrtime = process.hrtime.bigint();
-    const elapsedNanos = currentHrtime - this._anchorHrtimeBigInt;
-    return Nanoseconds.unsafe(this._epochView[0] + elapsedNanos);
+    return this._timestampNow(this);
   }
 
   /**
@@ -124,15 +159,7 @@ export class TraceRoot implements ITraceRoot {
    *
    */
   writeSpanStart(buffer: AnySpanBuffer, spanName: string): void {
-    buffer.timestamp[0] = this.getTimestampNanos();
-    buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
-    buffer.message(0, spanName);
-
-    // Pre-initialize row 1 as span-exception
-    buffer.entry_type[1] = ENTRY_TYPE_SPAN_EXCEPTION;
-    buffer.timestamp[1] = 0n;
-
-    buffer._writeIndex = 2;
+    this._writeSpanStart(this, buffer, spanName);
   }
 
   /**
@@ -141,9 +168,7 @@ export class TraceRoot implements ITraceRoot {
    *
    */
   writeSpanEnd(buffer: AnySpanBuffer, entryType: number): void {
-    buffer.timestamp[1] = this.getTimestampNanos();
-    buffer.entry_type[1] = entryType;
-    buffer._sealStatsChain();
+    this._writeSpanEnd(this, buffer, entryType);
   }
 
   /**
@@ -151,11 +176,7 @@ export class TraceRoot implements ITraceRoot {
    * SpanLogger uses returned idx for string column writes.
    */
   writeLogEntry(buffer: AnySpanBuffer, entryType: number): number {
-    const idx = buffer._writeIndex;
-    buffer.timestamp[idx] = this.getTimestampNanos();
-    buffer.entry_type[idx] = entryType;
-    buffer._writeIndex = idx + 1;
-    return idx;
+    return this._appendLogEntry(this, buffer, entryType);
   }
 }
 
