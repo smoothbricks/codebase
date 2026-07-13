@@ -264,6 +264,31 @@ impl fmt::Display for VolumeResolutionFailure {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VolumeNameResolutionFailure {
+    InvalidPlist(String),
+    MissingDeviceIdentifier,
+    DeviceMismatch { reported: String },
+    MissingVolumeName,
+    WrongTypeVolumeName,
+    BlankVolumeName,
+}
+
+impl fmt::Display for VolumeNameResolutionFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPlist(message) => write!(f, "invalid disk info plist: {message}"),
+            Self::MissingDeviceIdentifier => f.write_str("disk info plist has no DeviceIdentifier"),
+            Self::DeviceMismatch { reported } => {
+                write!(f, "disk info plist reported a different device: {reported}")
+            }
+            Self::MissingVolumeName => f.write_str("disk info plist has no VolumeName"),
+            Self::WrongTypeVolumeName => f.write_str("disk info plist VolumeName is not a string"),
+            Self::BlankVolumeName => f.write_str("disk info plist VolumeName is blank"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ApfsError {
     InvalidImagePath {
@@ -273,6 +298,9 @@ pub enum ApfsError {
     InvalidStagedStem(PathBuf),
     InvalidCreateRequest(&'static str),
     InvalidDetachTarget(PathBuf),
+    InvalidMountPoint(PathBuf),
+    InvalidVolumeName(String),
+    InvalidVolumeDevice(String),
     UnsupportedOperation {
         operation: &'static str,
         format: ImageFormat,
@@ -288,6 +316,10 @@ pub enum ApfsError {
     VolumeResolutionFailed {
         candidate: String,
         reason: VolumeResolutionFailure,
+    },
+    VolumeNameResolutionFailed {
+        device: String,
+        reason: VolumeNameResolutionFailure,
     },
     VolumeResolutionAndDetachFailed {
         whole_device: String,
@@ -334,6 +366,15 @@ impl fmt::Display for ApfsError {
             Self::InvalidDetachTarget(target) => {
                 write!(f, "invalid APFS detach target: {}", target.display())
             }
+            Self::InvalidMountPoint(path) => {
+                write!(f, "invalid APFS mount point: {}", path.display())
+            }
+            Self::InvalidVolumeName(name) => {
+                write!(f, "invalid APFS volume name: {name:?}")
+            }
+            Self::InvalidVolumeDevice(device) => {
+                write!(f, "invalid APFS volume device: {device}")
+            }
             Self::UnsupportedOperation { operation, format } => {
                 write!(f, "{operation} is not supported for {format:?} images")
             }
@@ -355,6 +396,9 @@ impl fmt::Display for ApfsError {
             }
             Self::VolumeResolutionFailed { candidate, reason } => {
                 write!(f, "could not resolve APFS volume for {candidate}: {reason}")
+            }
+            Self::VolumeNameResolutionFailed { device, reason } => {
+                write!(f, "could not resolve APFS volume name for {device}: {reason}")
             }
             Self::VolumeResolutionAndDetachFailed { whole_device, .. } => write!(
                 f,
@@ -424,6 +468,8 @@ pub trait ApfsBackend {
         destination: &Path,
         format: ImageFormat,
     ) -> Result<(), ApfsError>;
+    fn volume_name(&self, device: &str) -> Result<String, ApfsError>;
+    fn rename_volume(&self, mount_point: &Path, volume_name: &str) -> Result<(), ApfsError>;
     fn attach_verified(
         &self,
         image: &Path,
@@ -728,9 +774,9 @@ impl<R: CommandRunner> ApfsBackend for MacOsApfsBackend<R> {
                 "image capacity must not be empty",
             ));
         }
-        if request.volume_name.is_empty() {
+        if !is_valid_apfs_volume_name(&request.volume_name) {
             return Err(ApfsError::InvalidCreateRequest(
-                "volume name must not be empty",
+                "volume name must be path-safe and at most 255 bytes",
             ));
         }
 
@@ -855,6 +901,38 @@ impl<R: CommandRunner> ApfsBackend for MacOsApfsBackend<R> {
         Ok(())
     }
 
+    fn volume_name(&self, device: &str) -> Result<String, ApfsError> {
+        if !is_kernel_device_path(device) {
+            return Err(ApfsError::InvalidVolumeDevice(device.to_owned()));
+        }
+        let output = self.run_checked(
+            "read APFS volume name",
+            CommandRequest::new(DISKUTIL, ["info", "-plist", device]),
+        )?;
+        parse_volume_name_plist(device, &output.stdout)
+    }
+
+    fn rename_volume(&self, mount_point: &Path, volume_name: &str) -> Result<(), ApfsError> {
+        if !is_canonical_mount_point(mount_point) {
+            return Err(ApfsError::InvalidMountPoint(mount_point.to_owned()));
+        }
+        if !is_valid_apfs_volume_name(volume_name) {
+            return Err(ApfsError::InvalidVolumeName(volume_name.to_owned()));
+        }
+        self.run_checked(
+            "rename APFS volume",
+            CommandRequest::new(
+                DISKUTIL,
+                [
+                    OsString::from("renameVolume"),
+                    mount_point.as_os_str().to_owned(),
+                    OsString::from(volume_name),
+                ],
+            ),
+        )
+        .map(|_| ())
+    }
+
     fn attach_verified(
         &self,
         image: &Path,
@@ -945,16 +1023,7 @@ impl<R: CommandRunner> ApfsBackend for MacOsApfsBackend<R> {
 fn validate_detach_target(target: DetachTarget<'_>) -> Result<OsString, ApfsError> {
     let valid = match target {
         DetachTarget::Device(device) => is_kernel_device_path(device),
-        DetachTarget::MountPoint(path) => {
-            let bytes = path.as_os_str().as_encoded_bytes();
-            bytes.starts_with(b"/")
-                && bytes != b"/"
-                && !bytes.contains(&0)
-                && !path.starts_with("/dev")
-                && bytes[1..]
-                    .split(|byte| *byte == b'/')
-                    .all(|segment| !segment.is_empty() && segment != b"." && segment != b"..")
-        }
+        DetachTarget::MountPoint(path) => is_canonical_mount_point(path),
     };
     if !valid {
         return Err(ApfsError::InvalidDetachTarget(match target {
@@ -966,6 +1035,27 @@ fn validate_detach_target(target: DetachTarget<'_>) -> Result<OsString, ApfsErro
         DetachTarget::Device(device) => OsString::from(device),
         DetachTarget::MountPoint(path) => path.as_os_str().to_owned(),
     })
+}
+
+fn is_canonical_mount_point(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    bytes.starts_with(b"/")
+        && bytes != b"/"
+        && !bytes.contains(&0)
+        && !path.starts_with("/dev")
+        && bytes[1..]
+            .split(|byte| *byte == b'/')
+            .all(|segment| !segment.is_empty() && segment != b"." && segment != b"..")
+}
+
+fn is_valid_apfs_volume_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name.trim() == name
+        && name != "."
+        && name != ".."
+        && !name.as_bytes().contains(&b'/')
+        && !name.as_bytes().contains(&0)
 }
 
 fn is_kernel_device_path(device: &str) -> bool {
@@ -1019,6 +1109,49 @@ fn asif_is_unsupported(output: &CommandOutput) -> bool {
     ]
     .iter()
     .any(|needle| message.contains(needle))
+}
+
+fn parse_volume_name_plist(device: &str, bytes: &[u8]) -> Result<String, ApfsError> {
+    let failed = |reason| ApfsError::VolumeNameResolutionFailed {
+        device: device.to_owned(),
+        reason,
+    };
+    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|error| failed(VolumeNameResolutionFailure::InvalidPlist(error.to_string())))?;
+    let dictionary = value.as_dictionary().ok_or_else(|| {
+        failed(VolumeNameResolutionFailure::InvalidPlist(
+            "root is not a dictionary".into(),
+        ))
+    })?;
+    let reported = dictionary
+        .get("DeviceIdentifier")
+        .ok_or_else(|| failed(VolumeNameResolutionFailure::MissingDeviceIdentifier))?
+        .as_string()
+        .ok_or_else(|| {
+            failed(VolumeNameResolutionFailure::InvalidPlist(
+                "DeviceIdentifier is not a string".into(),
+            ))
+        })?;
+    let reported = device_path(reported).ok_or_else(|| {
+        failed(VolumeNameResolutionFailure::InvalidPlist(format!(
+            "invalid DeviceIdentifier {reported:?}"
+        )))
+    })?;
+    if reported != device {
+        return Err(failed(VolumeNameResolutionFailure::DeviceMismatch {
+            reported,
+        }));
+    }
+    let name = dictionary
+        .get("VolumeName")
+        .ok_or_else(|| failed(VolumeNameResolutionFailure::MissingVolumeName))?
+        .as_string()
+        .ok_or_else(|| failed(VolumeNameResolutionFailure::WrongTypeVolumeName))?
+        .trim();
+    if name.is_empty() {
+        return Err(failed(VolumeNameResolutionFailure::BlankVolumeName));
+    }
+    Ok(name.to_owned())
 }
 
 fn parse_blank_asif_whole_device(bytes: &[u8]) -> Result<String, ApfsError> {
@@ -2731,6 +2864,322 @@ mod tests {
     fn invalid_detach_target_error_preserves_the_rejected_target() {
         let error = ApfsError::InvalidDetachTarget(PathBuf::from("../escape"));
         assert_eq!(error.to_string(), "invalid APFS detach target: ../escape");
+    }
+
+    #[test]
+    fn volume_name_records_checked_diskutil_info_and_returns_trimmed_name() {
+        let output = r#"<?xml version="1.0"?><plist version="1.0"><dict>
+          <key>DeviceIdentifier</key><string>disk12s3</string>
+          <key>VolumeName</key><string>  cowshed.acme--widget.main  </string>
+        </dict></plist>"#;
+        let backend =
+            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success(
+                output,
+            )]));
+
+        assert_eq!(
+            backend.volume_name("/dev/disk12s3").unwrap(),
+            "cowshed.acme--widget.main"
+        );
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].program, Path::new(DISKUTIL));
+        assert_eq!(argv(&requests[0]), ["info", "-plist", "/dev/disk12s3"]);
+    }
+
+    #[test]
+    fn volume_name_rejects_noncanonical_devices_before_spawning() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::default());
+        for device in [
+            "",
+            "disk12s3",
+            "/dev/rdisk12s3",
+            "/dev/disk",
+            "/dev/disk01",
+            "/dev/disk12s03",
+            "/dev/disk12s",
+            "/dev/disk12/child",
+        ] {
+            let error = backend.volume_name(device).unwrap_err();
+            assert!(matches!(
+                error,
+                ApfsError::InvalidVolumeDevice(rejected) if rejected == device
+            ));
+        }
+        assert!(backend.runner().requests().is_empty());
+    }
+
+    #[test]
+    fn volume_name_propagates_checked_diskutil_failure() {
+        let backend =
+            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::failure(
+                3,
+                "not found",
+            )]));
+        let error = backend.volume_name("/dev/disk12s3").unwrap_err();
+        assert!(matches!(
+            error,
+            ApfsError::CommandFailed {
+                operation: "read APFS volume name",
+                output: CommandOutput { status: 3, .. },
+                ..
+            }
+        ));
+        assert_eq!(backend.runner().requests().len(), 1);
+    }
+
+    #[test]
+    fn rename_volume_records_checked_diskutil_rename_volume_command() {
+        let backend =
+            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success([])]));
+
+        backend
+            .rename_volume(
+                Path::new("/Volumes/cowshed-stage"),
+                "cowshed.acme--widget.main",
+            )
+            .unwrap();
+
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].program, Path::new(DISKUTIL));
+        assert_eq!(
+            argv(&requests[0]),
+            [
+                "renameVolume",
+                "/Volumes/cowshed-stage",
+                "cowshed.acme--widget.main",
+            ]
+        );
+    }
+
+    #[test]
+    fn rename_volume_accepts_a_255_byte_path_safe_name() {
+        let name = "a".repeat(255);
+        let backend =
+            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success([])]));
+
+        backend
+            .rename_volume(Path::new("/Volumes/cowshed-stage"), &name)
+            .unwrap();
+
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].args[2], OsString::from(name));
+    }
+
+    #[test]
+    fn rename_volume_rejects_noncanonical_mountpoints_before_spawning() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::default());
+        for mount_point in [
+            "",
+            ".",
+            "Volumes/main",
+            "/",
+            "/dev",
+            "/dev/disk12s3",
+            "/Volumes/../private/tmp",
+            "/Volumes/./main",
+            "/Volumes//main",
+            "/Volumes/main/",
+            "/Volumes/\0main",
+        ] {
+            let error = backend
+                .rename_volume(Path::new(mount_point), "main")
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ApfsError::InvalidMountPoint(path) if path == Path::new(mount_point)
+            ));
+        }
+        assert!(backend.runner().requests().is_empty());
+    }
+
+    #[test]
+    fn rename_volume_rejects_unsafe_or_oversized_names_before_spawning() {
+        let invalid = [
+            String::new(),
+            " ".into(),
+            ".".into(),
+            "..".into(),
+            " leading".into(),
+            "trailing ".into(),
+            "parent/child".into(),
+            "nul\0name".into(),
+            "a".repeat(256),
+            "é".repeat(128),
+        ];
+        let backend = MacOsApfsBackend::new(RecordingRunner::default());
+        for name in invalid {
+            let error = backend
+                .rename_volume(Path::new("/Volumes/cowshed-stage"), &name)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ApfsError::InvalidVolumeName(rejected) if rejected == name
+            ));
+        }
+        assert!(backend.runner().requests().is_empty());
+    }
+
+    #[test]
+    fn rename_volume_propagates_checked_diskutil_failure() {
+        let backend =
+            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::failure(
+                7,
+                "rename failed",
+            )]));
+
+        let error = backend
+            .rename_volume(Path::new("/Volumes/cowshed-stage"), "main")
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApfsError::CommandFailed {
+                operation: "rename APFS volume",
+                request,
+                output: CommandOutput { status: 7, .. },
+            } if request.program == Path::new(DISKUTIL)
+                && argv(&request) == ["renameVolume", "/Volumes/cowshed-stage", "main"]
+        ));
+        assert_eq!(backend.runner().requests().len(), 1);
+    }
+
+    #[test]
+    fn rename_volume_validation_errors_preserve_rejected_values() {
+        assert_eq!(
+            ApfsError::InvalidMountPoint(PathBuf::from("../escape")).to_string(),
+            "invalid APFS mount point: ../escape"
+        );
+        assert_eq!(
+            ApfsError::InvalidVolumeName("bad/name".into()).to_string(),
+            r#"invalid APFS volume name: "bad/name""#
+        );
+    }
+
+    #[test]
+    fn volume_name_plist_rejects_malformed_mismatched_and_missing_identity() {
+        let malformed = parse_volume_name_plist("/dev/disk12s3", b"not a plist").unwrap_err();
+        assert!(matches!(
+            malformed,
+            ApfsError::VolumeNameResolutionFailed {
+                device,
+                reason: VolumeNameResolutionFailure::InvalidPlist(_),
+            } if device == "/dev/disk12s3"
+        ));
+
+        let missing_device = br#"<?xml version="1.0"?><plist><dict>
+          <key>VolumeName</key><string>main</string>
+        </dict></plist>"#;
+        assert!(matches!(
+            parse_volume_name_plist("/dev/disk12s3", missing_device),
+            Err(ApfsError::VolumeNameResolutionFailed {
+                reason: VolumeNameResolutionFailure::MissingDeviceIdentifier,
+                ..
+            })
+        ));
+
+        let wrong_device_type = br#"<?xml version="1.0"?><plist><dict>
+          <key>DeviceIdentifier</key><integer>12</integer>
+          <key>VolumeName</key><string>main</string>
+        </dict></plist>"#;
+        assert!(matches!(
+            parse_volume_name_plist("/dev/disk12s3", wrong_device_type),
+            Err(ApfsError::VolumeNameResolutionFailed {
+                reason: VolumeNameResolutionFailure::InvalidPlist(_),
+                ..
+            })
+        ));
+
+        let mismatch = br#"<?xml version="1.0"?><plist><dict>
+          <key>DeviceIdentifier</key><string>/dev/disk13s1</string>
+          <key>VolumeName</key><string>main</string>
+        </dict></plist>"#;
+        assert!(matches!(
+            parse_volume_name_plist("/dev/disk12s3", mismatch),
+            Err(ApfsError::VolumeNameResolutionFailed {
+                device,
+                reason: VolumeNameResolutionFailure::DeviceMismatch { reported },
+            }) if device == "/dev/disk12s3" && reported == "/dev/disk13s1"
+        ));
+    }
+
+    #[test]
+    fn volume_name_plist_rejects_missing_wrong_type_and_blank_names() {
+        let missing = br#"<?xml version="1.0"?><plist><dict>
+          <key>DeviceIdentifier</key><string>disk12s3</string>
+        </dict></plist>"#;
+        assert!(matches!(
+            parse_volume_name_plist("/dev/disk12s3", missing),
+            Err(ApfsError::VolumeNameResolutionFailed {
+                reason: VolumeNameResolutionFailure::MissingVolumeName,
+                ..
+            })
+        ));
+
+        let wrong_type = br#"<?xml version="1.0"?><plist><dict>
+          <key>DeviceIdentifier</key><string>disk12s3</string>
+          <key>VolumeName</key><integer>7</integer>
+        </dict></plist>"#;
+        assert!(matches!(
+            parse_volume_name_plist("/dev/disk12s3", wrong_type),
+            Err(ApfsError::VolumeNameResolutionFailed {
+                reason: VolumeNameResolutionFailure::WrongTypeVolumeName,
+                ..
+            })
+        ));
+
+        for name in ["", "   ", "\n\t"] {
+            let plist = format!(
+                r#"<?xml version="1.0"?><plist><dict>
+                  <key>DeviceIdentifier</key><string>disk12s3</string>
+                  <key>VolumeName</key><string>{name}</string>
+                </dict></plist>"#
+            );
+            assert!(matches!(
+                parse_volume_name_plist("/dev/disk12s3", plist.as_bytes()),
+                Err(ApfsError::VolumeNameResolutionFailed {
+                    reason: VolumeNameResolutionFailure::BlankVolumeName,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn volume_name_resolution_failure_messages_preserve_typed_details() {
+        let cases = [
+            (
+                VolumeNameResolutionFailure::InvalidPlist("bad shape".into()),
+                "invalid disk info plist: bad shape",
+            ),
+            (
+                VolumeNameResolutionFailure::MissingDeviceIdentifier,
+                "disk info plist has no DeviceIdentifier",
+            ),
+            (
+                VolumeNameResolutionFailure::DeviceMismatch {
+                    reported: "/dev/disk9s1".into(),
+                },
+                "disk info plist reported a different device: /dev/disk9s1",
+            ),
+            (
+                VolumeNameResolutionFailure::MissingVolumeName,
+                "disk info plist has no VolumeName",
+            ),
+            (
+                VolumeNameResolutionFailure::WrongTypeVolumeName,
+                "disk info plist VolumeName is not a string",
+            ),
+            (
+                VolumeNameResolutionFailure::BlankVolumeName,
+                "disk info plist VolumeName is blank",
+            ),
+        ];
+        for (failure, expected) in cases {
+            assert_eq!(failure.to_string(), expected);
+        }
     }
 
     #[test]
