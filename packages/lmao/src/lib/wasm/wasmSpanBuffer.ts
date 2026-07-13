@@ -51,6 +51,7 @@ export interface WasmBufferDescriptor {
   readonly familyPtrs: Readonly<Record<WasmNumericFamily, number>>;
   readonly identityPtr: number;
   readonly ownsIdentity: boolean;
+  memoryVersion: number;
   readonly parent?: WasmBufferDescriptor;
   overflow?: WasmBufferDescriptor;
 }
@@ -96,6 +97,13 @@ export type WasmSpanBufferInstance<T extends LogSchema = LogSchema> = SpanBuffer
   readonly _descriptor: WasmBufferDescriptor;
   readonly _layout: WasmPhysicalLayoutDescriptor;
   readonly _familyPtrs: Readonly<Record<WasmNumericFamily, number>>;
+  _viewVersion: number;
+  _timestampView: BigInt64Array;
+  _entryTypeView: Uint8Array;
+  _identityView: Uint8Array;
+  _identityData: DataView;
+  _refreshViews(version: number): void;
+  _ensureWasmViews(): void;
   _getWasmColumnValue(columnIndex: number): ColumnValueType | undefined;
   _getWasmColumnNulls(columnIndex: number): Uint8Array | undefined;
   readonly _identityOwner: boolean;
@@ -256,18 +264,20 @@ function buildColumnMeta(schema: LogSchema): ColumnMeta[] {
 // Common WasmSpanBuffer Methods (shared via prototype)
 // =============================================================================
 
-function wasmGetTimestamp(this: WasmSpanBufferInstance): BigInt64Array {
+function wasmEnsureViews(this: WasmSpanBufferInstance): void {
   assertWasmBufferLive(this);
-  return new BigInt64Array(this._allocator.memory.buffer, this._systemPtr, this._capacity);
+  const memoryVersion = this._allocator.refreshViews();
+  if (memoryVersion !== this._viewVersion) this._refreshViews(memoryVersion);
+}
+
+function wasmGetTimestamp(this: WasmSpanBufferInstance): BigInt64Array {
+  wasmEnsureViews.call(this);
+  return this._timestampView;
 }
 
 function wasmGetEntryType(this: WasmSpanBufferInstance): Uint8Array {
-  assertWasmBufferLive(this);
-  return new Uint8Array(
-    this._allocator.memory.buffer,
-    this._systemPtr + this._layout.system.entryTypeOffset,
-    this._capacity,
-  );
+  wasmEnsureViews.call(this);
+  return this._entryTypeView;
 }
 
 function assertWasmBufferLive(buffer: WasmSpanBufferInstance): void {
@@ -278,29 +288,28 @@ function assertWasmBufferLive(buffer: WasmSpanBufferInstance): void {
 }
 
 function wasmGetWriteIndex(this: WasmSpanBufferInstance): number {
-  assertWasmBufferLive(this);
-  return this._identityOwner ? this._allocator.readWriteIndex(this._identityPtr) : this._overflowWriteIndex;
+  wasmEnsureViews.call(this);
+  return this._identityOwner ? this._identityData.getUint32(0, true) : this._overflowWriteIndex;
 }
 
 function wasmSetWriteIndex(this: WasmSpanBufferInstance, value: number): void {
-  assertWasmBufferLive(this);
+  wasmEnsureViews.call(this);
   if (this._identityOwner) {
-    new DataView(this._allocator.memory.buffer, this._identityPtr, 128).setUint32(0, value, true);
+    this._identityData.setUint32(0, value, true);
   } else {
     this._overflowWriteIndex = value;
   }
 }
 
 function wasmGetTraceId(this: WasmSpanBufferInstance): string {
-  assertWasmBufferLive(this);
-  const len = this._allocator.readIdentityTraceIdLen(this._identityPtr);
+  wasmEnsureViews.call(this);
+  const len = this._identityView[8];
   if (len === 0) {
     let p = this._parent;
     while (p?._parent) p = p._parent;
     return p ? p.trace_id : '';
   }
-  const traceIdPtr = this._allocator.getIdentityTraceIdPtr(this._identityPtr);
-  return new TextDecoder().decode(new Uint8Array(this._allocator.memory.buffer, traceIdPtr, len));
+  return new TextDecoder().decode(this._identityView.subarray(9, 9 + len));
 }
 
 function wasmGetSpanStartTime(this: WasmSpanBufferInstance): bigint {
@@ -339,8 +348,8 @@ function wasmGetThreadId(this: WasmSpanBufferInstance): bigint {
 }
 
 function wasmGetSpanId(this: WasmSpanBufferInstance): number {
-  assertWasmBufferLive(this);
-  return this._allocator.readIdentitySpanId(this._identityPtr);
+  wasmEnsureViews.call(this);
+  return this._identityData.getUint32(4, true);
 }
 
 /**
@@ -392,7 +401,7 @@ function wasmGetMessageNulls(this: WasmSpanBufferInstance): undefined {
 /** Free each owned WASM block exactly once. */
 function wasmFree(this: WasmSpanBufferInstance): void {
   if (this._descriptor.state === 'freed') return;
-  this._sealStats();
+  if (this._viewVersion !== 0) this._sealStats();
 
   for (const family of ['u8', 'u32', 'f64'] as const) {
     const slab = this._layout.slabs[family];
@@ -410,6 +419,7 @@ function wasmFree(this: WasmSpanBufferInstance): void {
  */
 function wasmIsColumnAllocated(this: WasmSpanBufferInstance, columnIndex: number): boolean {
   assertWasmBufferLive(this);
+  wasmEnsureViews.call(this);
   return this._columnPtrs[columnIndex] >= 0 || this._getWasmColumnValue(columnIndex) !== undefined;
 }
 
@@ -418,6 +428,7 @@ function wasmGetColumnIfAllocated(this: WasmSpanBufferInstance, columnName: stri
   assertWasmBufferLive(this);
   const idx = this._logSchema._columnNames.indexOf(columnName);
   if (idx === -1) return undefined;
+  wasmEnsureViews.call(this);
   return this._getWasmColumnValue(idx);
 }
 
@@ -426,18 +437,20 @@ function wasmGetNullsIfAllocated(this: WasmSpanBufferInstance, columnName: strin
   assertWasmBufferLive(this);
   const idx = this._logSchema._columnNames.indexOf(columnName);
   if (idx === -1) return undefined;
+  wasmEnsureViews.call(this);
   return this._getWasmColumnNulls(idx);
 }
 
 /** Get the current WASM memory backing store. */
 function wasmGetSystem(this: WasmSpanBufferInstance): ArrayBuffer {
-  assertWasmBufferLive(this);
+  wasmEnsureViews.call(this);
   return this._allocator.memory.buffer;
 }
 
+/** Get the canonical identity view for the current memory version. */
 function wasmGetIdentity(this: WasmSpanBufferInstance): Uint8Array {
-  assertWasmBufferLive(this);
-  return new Uint8Array(this._allocator.memory.buffer, this._identityPtr, 128);
+  wasmEnsureViews.call(this);
+  return this._identityView;
 }
 
 function wasmSealStats(this: WasmSpanBufferInstance): void {
@@ -516,48 +529,66 @@ function generateColumnInit(columnMeta: ColumnMeta[]): string {
   return lines.join('\n    ');
 }
 
-function numericArrayType(col: ColumnMeta): string {
-  return col.schemaType === 'number'
-    ? 'Float64Array'
-    : col.schemaType === 'bigUint64'
-      ? 'BigUint64Array'
-      : col.sizeClass === '1b'
-        ? 'Uint8Array'
-        : col.sizeClass === '4b'
-          ? 'Uint32Array'
-          : 'Float64Array';
-}
-
-function generateNumericSetter(col: ColumnMeta, layoutIndex: number): string {
+function generateNumericSetter(col: ColumnMeta): string {
   return `${col.name}(idx, value) {
-    if (this._descriptor.state !== 'live') { const generation = this._descriptor.generation; throw new Error('Cannot access released WASM buffer generation ' + generation + '; generation ' + generation + ' has been released'); }
-    const column = this._layout.columns[${layoutIndex}];
-    const familyPtr = this._familyPtrs[column.family];
-    const nulls = new Uint8Array(this._allocator.memory.buffer, familyPtr + column.nullOffset, column.nullByteLength);
-    const values = new ${numericArrayType(col)}(this._allocator.memory.buffer, familyPtr + column.valueOffset, this._capacity);
-    nulls[idx >>> 3] |= 1 << (idx & 7);
-    values[idx] = value;
+    this._ensureWasmViews();
+    this._${col.name}_nulls[idx >>> 3] |= 1 << (idx & 7);
+    this._${col.name}_values[idx] = value;
     return this;
   }`;
 }
 
-function generateNumericValuesGetter(col: ColumnMeta, layoutIndex: number): string {
+function generateNumericValuesGetter(col: ColumnMeta): string {
   return `get ${col.name}_values() {
-    if (this._descriptor.state !== 'live') throw new Error('Cannot read a released WASM buffer');
-    const column = this._layout.columns[${layoutIndex}];
-    const familyPtr = this._familyPtrs[column.family];
-    return new ${numericArrayType(col)}(this._allocator.memory.buffer, familyPtr + column.valueOffset, this._capacity);
+    this._ensureWasmViews();
+    return this._${col.name}_values;
   }`;
 }
 
-function generateNumericNullsGetter(col: ColumnMeta, layoutIndex: number): string {
-  if (col.isEager) return `get ${col.name}_nulls() { return undefined; }`;
-  return `get ${col.name}_nulls() {
-    if (this._descriptor.state !== 'live') throw new Error('Cannot read a released WASM buffer');
-    const column = this._layout.columns[${layoutIndex}];
-    const familyPtr = this._familyPtrs[column.family];
-    return new Uint8Array(this._allocator.memory.buffer, familyPtr + column.nullOffset, column.nullByteLength);
+function generateNumericNullsGetter(col: ColumnMeta): string {
+  if (col.isEager) {
+    return `get ${col.name}_nulls() {
+    return undefined;
   }`;
+  }
+  return `get ${col.name}_nulls() {
+    this._ensureWasmViews();
+    return this._${col.name}_nulls;
+  }`;
+}
+
+function generateViewRefresh(columnMeta: ColumnMeta[]): string {
+  const lines = [
+    'const memory = this._allocator.memory.buffer;',
+    'this._timestampView = new BigInt64Array(memory, this._systemPtr, this._capacity);',
+    'this._entryTypeView = new Uint8Array(memory, this._systemPtr + this._layout.system.entryTypeOffset, this._capacity);',
+    'this._identityView = new Uint8Array(memory, this._identityPtr, 128);',
+    'this._identityData = new DataView(memory, this._identityPtr, 128);',
+  ];
+  let layoutIndex = 0;
+  for (const col of columnMeta) {
+    if (col.sizeClass === 'string' || col.name === 'message') continue;
+    lines.push(`{
+      const column = this._layout.columns[${layoutIndex}];
+      const familyPtr = this._familyPtrs[column.family];
+      this._${col.name}_nulls = new Uint8Array(memory, familyPtr + column.nullOffset, column.nullByteLength);
+      this._${col.name}_values = new ${
+        col.schemaType === 'number'
+          ? 'Float64Array'
+          : col.schemaType === 'bigUint64'
+            ? 'BigUint64Array'
+            : col.sizeClass === '1b'
+              ? 'Uint8Array'
+              : col.sizeClass === '4b'
+                ? 'Uint32Array'
+                : 'Float64Array'
+      }(memory, familyPtr + column.valueOffset, this._capacity);
+      this._columnPtrs[${col.columnIndex}] = familyPtr + column.nullOffset;
+    }`);
+    layoutIndex++;
+  }
+  lines.push('this._viewVersion = version;', 'this._descriptor.memoryVersion = version;');
+  return lines.join('\n    ');
 }
 
 function generateColumnLookup(columnMeta: ColumnMeta[], nulls: boolean): string {
@@ -576,7 +607,7 @@ function generateColumnLookup(columnMeta: ColumnMeta[], nulls: boolean): string 
 function generateStringSetter(col: ColumnMeta): string {
   if (col.isEager) {
     return `${col.name}(idx, value) {
-    if (this._descriptor.state !== 'live') { const generation = this._descriptor.generation; throw new Error('Cannot access released WASM buffer generation ' + generation + '; generation ' + generation + ' has been released'); }
+    if (this._descriptor.state !== 'live') throw new Error('Cannot write a released WASM buffer');
     this._${col.name}_values[idx] = value;
     return this;
   }`;
@@ -584,7 +615,7 @@ function generateStringSetter(col: ColumnMeta): string {
 
   // Lazy string column: allocate arrays on first write
   return `${col.name}(idx, value) {
-    if (this._descriptor.state !== 'live') { const generation = this._descriptor.generation; throw new Error('Cannot access released WASM buffer generation ' + generation + '; generation ' + generation + ' has been released'); }
+    if (this._descriptor.state !== 'live') throw new Error('Cannot write a released WASM buffer');
     if (this._${col.name}_values === undefined) {
       this._${col.name}_values = new Array(this._capacity);
       const nullBitmapSize = Math.ceil(this._capacity / 8);
@@ -639,7 +670,6 @@ function generateStringNullsGetter(col: ColumnMeta): string {
 function generateColumnMethods(columnMeta: ColumnMeta[]): string {
   const methods: string[] = [];
 
-  let layoutIndex = 0;
   for (const col of columnMeta) {
     // Skip 'message' - handled specially by generateMessageMethods()
     if (col.name === 'message') {
@@ -651,10 +681,9 @@ function generateColumnMethods(columnMeta: ColumnMeta[]): string {
       methods.push(generateStringValuesGetter(col));
       methods.push(generateStringNullsGetter(col));
     } else {
-      methods.push(generateNumericSetter(col, layoutIndex));
-      methods.push(generateNumericValuesGetter(col, layoutIndex));
-      methods.push(generateNumericNullsGetter(col, layoutIndex));
-      layoutIndex++;
+      methods.push(generateNumericSetter(col));
+      methods.push(generateNumericValuesGetter(col));
+      methods.push(generateNumericNullsGetter(col));
     }
   }
 
@@ -739,9 +768,7 @@ class WasmSpanBuffer {
       }
     }
     this._familyPtrs = Object.freeze(familyPtrs);
-    for (const column of this._layout.columns) {
-      this._columnPtrs[column.columnIndex] = familyPtrs[column.family] + column.nullOffset;
-    }
+    this._viewVersion = 0;
 
     this._descriptor = {
       generation: opts._generation ?? 0,
@@ -752,6 +779,7 @@ class WasmSpanBuffer {
       familyPtrs: this._familyPtrs,
       identityPtr: this._identityPtr,
       ownsIdentity: this._identityOwner,
+      memoryVersion: 0,
       parent: opts._parent?._descriptor,
     };
 
@@ -767,10 +795,15 @@ class WasmSpanBuffer {
       this._logHeaders = new Uint32Array(opts.capacity);
       this._message = new Array(opts.capacity);
       ${generateColumnInit(columnMeta)}
+      this._refreshViews(this._allocator.refreshViews());
     } catch (error) {
       this.free();
       throw error;
     }
+  }
+
+  _refreshViews(version) {
+    ${generateViewRefresh(columnMeta)}
   }
 
   _getWasmColumnValue(columnIndex) {
@@ -885,6 +918,7 @@ return WasmSpanBuffer;
     configurable: true,
   });
 
+  WasmSpanBufferClass.prototype._ensureWasmViews = wasmEnsureViews;
   WasmSpanBufferClass.prototype.message = wasmMessage;
   WasmSpanBufferClass.prototype.free = wasmFree;
   WasmSpanBufferClass.prototype.isColumnAllocated = wasmIsColumnAllocated;
