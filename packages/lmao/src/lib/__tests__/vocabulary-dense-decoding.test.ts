@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { Column, type Table } from '@uwdata/flechette';
 import { getVocabularyDictionaryPrefix } from '../arrow/vocabularyDictionary.js';
 import {
@@ -20,11 +21,7 @@ import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 import type { SpanBuffer } from '../types.js';
-import {
-  getVocabularyGeneration,
-  registerVocabularyFragment,
-  type VocabularyFragment,
-} from '../vocabularyRegistry.js';
+import { getVocabularyGeneration, registerVocabularyFragment, type VocabularyFragment } from '../vocabularyRegistry.js';
 import { createTestTracerOptions } from './test-helpers.js';
 
 const encoder = new TextEncoder();
@@ -122,7 +119,9 @@ function requireMessageDictionary(table: Table): {
   if (!batch || !('dictionary' in batch) || !(batch.dictionary instanceof Column)) {
     throw new Error('Arrow message column was not dictionary encoded');
   }
-  if (!(batch.values instanceof Uint8Array || batch.values instanceof Uint16Array || batch.values instanceof Uint32Array)) {
+  if (
+    !(batch.values instanceof Uint8Array || batch.values instanceof Uint16Array || batch.values instanceof Uint32Array)
+  ) {
     throw new Error('Arrow message dictionary did not use unsigned integer keys');
   }
   return { dictionary: batch.dictionary, keys: batch.values, message };
@@ -157,20 +156,41 @@ function requireDenseTemplateLogger(context: object): DenseTemplateLogger {
   return logger;
 }
 
+describe('runtime vocabulary dense decoding', () => {
+  it('imports Arrow vocabulary support without registering static records and exposes the empty key-zero prefix', () => {
+    const probe = Bun.spawnSync({
+      cmd: [
+        process.execPath,
+        fileURLToPath(new URL('./fixtures/empty-vocabulary-runtime.fixture.ts', import.meta.url)),
+      ],
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    if (probe.exitCode !== 0) throw new Error(new TextDecoder().decode(probe.stderr));
 
-describe('global vocabulary dense decoding', () => {
-  it('keeps the canonical static prefix and uses direct dense zero before the first-seen dynamic suffix', async () => {
-    const op = opContext.defineOp('dense-zero-static-prefix', (ctx) => {
+    expect(JSON.parse(new TextDecoder().decode(probe.stdout))).toEqual({
+      generation: 0,
+      ids: [],
+      prefixLength: 1,
+      prefixValues: [''],
+      emptyDenseIndex: 0,
+    });
+  });
+
+  it('uses the returned local binding before the first-seen dynamic suffix', async () => {
+    const staticText = 'local dense prefix literal';
+    const binding = registerVocabularyFragment(makeFragment([staticText]));
+    const op = opContext.defineOp('local-binding-static-prefix', (ctx) => {
       const logger = requireDenseTemplateLogger(ctx);
-      logger._infoTemplate(0);
-      logger._infoTemplate(0);
+      logger._infoTemplate(binding[0]);
+      logger._infoTemplate(binding[0]);
       ctx.log.info('dynamic-b');
       ctx.log.info('dynamic-a');
       ctx.log.info('dynamic-b');
       return ctx.ok(null);
     });
     const tracer = new TestTracer(opContext, createTestTracerOptions());
-    await tracer.trace('dense-zero-static-prefix', op);
+    await tracer.trace('local-binding-static-prefix', op);
 
     const buffer = tracer.rootBuffers[0];
     const lease = convertSpanTreeToLeasedArrowTable(buffer);
@@ -178,19 +198,22 @@ describe('global vocabulary dense decoding', () => {
     const { dictionary, keys, message } = requireMessageDictionary(table);
     const prefix = getVocabularyDictionaryPrefix(buffer._vocabularyGeneration);
     const prefixValues = Array.from(prefix.column);
-    expect(Array.from(dictionary)).toEqual([
-      ...prefixValues,
-      'dense-zero-static-prefix',
-      'dynamic-b',
-      'dynamic-a',
-    ]);
+    expect(Array.from(dictionary)).toEqual([...prefixValues, 'local-binding-static-prefix', 'dynamic-b', 'dynamic-a']);
     const suffixOffset = prefix.length;
-    expect(Array.from(keys)).toEqual([suffixOffset, 0, 0, 0, suffixOffset + 1, suffixOffset + 2, suffixOffset + 1]);
+    expect(Array.from(keys)).toEqual([
+      suffixOffset,
+      0,
+      binding[0],
+      binding[0],
+      suffixOffset + 1,
+      suffixOffset + 2,
+      suffixOffset + 1,
+    ]);
     expect(Array.from({ length: message.length }, (_, row) => message.get(row))).toEqual([
-      'dense-zero-static-prefix',
+      'local-binding-static-prefix',
       null,
-      prefixValues[0],
-      prefixValues[0],
+      staticText,
+      staticText,
       'dynamic-b',
       'dynamic-a',
       'dynamic-b',
@@ -204,9 +227,11 @@ describe('global vocabulary dense decoding', () => {
   });
 
   it('reuses the pinned cached dictionary object when overflow rows need no dynamic suffix', async () => {
+    const staticText = 'local overflow static literal';
+    const binding = registerVocabularyFragment(makeFragment([staticText]));
     const op = opContext.defineOp('static-only-overflow', (ctx) => {
       const logger = requireDenseTemplateLogger(ctx);
-      for (let index = 0; index < 40; index++) logger._infoTemplate(0);
+      for (let index = 0; index < 40; index++) logger._infoTemplate(binding[0]);
       return ctx.ok(null);
     });
     const tracer = new TestTracer(opContext, createTestTracerOptions());
@@ -219,12 +244,12 @@ describe('global vocabulary dense decoding', () => {
     const { dictionary, keys, message } = requireMessageDictionary(table);
     const prefix = getVocabularyDictionaryPrefix(overflow._vocabularyGeneration);
     expect(dictionary).toBe(prefix.column);
-    expect(Array.from(keys)).toEqual(Array.from({ length: message.length }, () => 0));
+    expect(Array.from(keys)).toEqual(Array.from({ length: message.length }, () => binding[0]));
     expect(Array.from({ length: message.length }, (_, row) => message.get(row))).toEqual(
-      Array.from({ length: message.length }, () => prefix.column.get(0)),
+      Array.from({ length: message.length }, () => staticText),
     );
     tracer.bufferStrategy.releaseBuffer(overflow);
-    expect(dictionary.get(0)).toBe(prefix.column.get(0));
+    expect(dictionary.get(binding[0])).toBe(staticText);
     lease.release();
     expect(lease.released).toBe(true);
   });
@@ -309,20 +334,25 @@ describe('global vocabulary dense decoding', () => {
 
   it('rejects a packed dense index outside the buffer generation', async () => {
     let invalidDenseIndex = 0;
-    const op = opContext.defineOp('invalid-dense-index', (ctx) => {
-      const logger = requireDenseTemplateLogger(ctx);
-      invalidDenseIndex = ctx.buffer._vocabularyGeneration.ids.length;
-      logger._infoTemplate(invalidDenseIndex);
-      return ctx.ok(null);
-    }, undefined, {
-      runtimeHint:
-        RUNTIME_HINT_ANALYZED_VALID |
-        RUNTIME_HINT_LOG |
-        RUNTIME_HINT_RESULT |
-        RUNTIME_HINT_MESSAGE_LAYOUT_MIXED |
-        RUNTIME_HINT_MESSAGE_PHYSICAL_PACKED |
-        3,
-    });
+    const op = opContext.defineOp(
+      'invalid-dense-index',
+      (ctx) => {
+        const logger = requireDenseTemplateLogger(ctx);
+        invalidDenseIndex = ctx.buffer._vocabularyGeneration.ids.length;
+        logger._infoTemplate(invalidDenseIndex);
+        return ctx.ok(null);
+      },
+      undefined,
+      {
+        runtimeHint:
+          RUNTIME_HINT_ANALYZED_VALID |
+          RUNTIME_HINT_LOG |
+          RUNTIME_HINT_RESULT |
+          RUNTIME_HINT_MESSAGE_LAYOUT_MIXED |
+          RUNTIME_HINT_MESSAGE_PHYSICAL_PACKED |
+          3,
+      },
+    );
     const tracer = new TestTracer(opContext, createTestTracerOptions());
     await tracer.trace('invalid-dense-index', op);
     const buffer = tracer.rootBuffers[0];
