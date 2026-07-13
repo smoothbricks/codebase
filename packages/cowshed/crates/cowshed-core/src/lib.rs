@@ -1,5 +1,14 @@
 //! Warm, copy-on-write workspaces with explicit controller authority.
 
+pub mod apfs;
+pub mod copy;
 pub mod error;
+pub mod exec;
+pub mod git;
+pub mod metadata;
+pub mod repository;
+pub mod sandbox;
+pub mod secrets;
+pub mod storage;
 
 pub use error::{CowshedError, ErrorCode, Result};
