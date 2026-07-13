@@ -168,9 +168,7 @@ pub fn scan_tree(root: &Path, waivers: &[SecretWaiver]) -> Result<SecretScan, Se
     Ok(result)
 }
 
-fn validate_waivers(
-    waivers: &[SecretWaiver],
-) -> Result<BTreeMap<&Path, &str>, SecretScanError> {
+fn validate_waivers(waivers: &[SecretWaiver]) -> Result<BTreeMap<&Path, &str>, SecretScanError> {
     let mut validated = BTreeMap::new();
     for waiver in waivers {
         if waiver.reason.trim().is_empty() {
@@ -398,43 +396,60 @@ fn find_prefixed_token(
     rule_id: &'static str,
     matches: &mut Vec<LineMatch>,
 ) {
-    let mut offset = 0;
-    while let Some(relative_start) = find_bytes(&line[offset..], prefix) {
-        let start = offset + relative_start;
-        let suffix_start = start + prefix.len();
-        let mut end = suffix_start;
-        while end < line.len() && allowed(line[end]) {
-            end += 1;
-        }
+    if prefix.is_empty() {
+        return;
+    }
+    for start in line
+        .windows(prefix.len())
+        .enumerate()
+        .filter_map(|(start, window)| (window == prefix).then_some(start))
+    {
+        let suffix_start = start
+            .checked_add(prefix.len())
+            .expect("prefix position is within the line");
+        let suffix_len = line[suffix_start..]
+            .iter()
+            .take_while(|byte| allowed(**byte))
+            .count();
+        let end = suffix_start
+            .checked_add(suffix_len)
+            .expect("token suffix is within the line");
         let boundary_ok = start == 0 || !secret_key_byte(line[start - 1]);
-        if boundary_ok && end - suffix_start >= minimum_suffix {
+        if boundary_ok && suffix_len >= minimum_suffix {
             matches.push(LineMatch {
                 start,
                 end,
                 rule_id,
             });
         }
-        offset = suffix_start;
     }
 }
 
 fn find_aws_access_keys(line: &[u8], matches: &mut Vec<LineMatch>) {
-    let mut offset = 0;
-    while let Some(relative_start) = find_bytes(&line[offset..], b"AKIA") {
-        let start = offset + relative_start;
-        let mut end = start + 4;
-        while end < line.len() && aws_key_byte(line[end]) {
-            end += 1;
-        }
+    const PREFIX: &[u8] = b"AKIA";
+    for start in line
+        .windows(PREFIX.len())
+        .enumerate()
+        .filter_map(|(start, window)| (window == PREFIX).then_some(start))
+    {
+        let suffix_start = start
+            .checked_add(PREFIX.len())
+            .expect("prefix position is within the line");
+        let suffix_len = line[suffix_start..]
+            .iter()
+            .take_while(|byte| aws_key_byte(**byte))
+            .count();
+        let end = suffix_start
+            .checked_add(suffix_len)
+            .expect("access key is within the line");
         let boundary_ok = start == 0 || !aws_key_byte(line[start - 1]);
-        if boundary_ok && end - start == 20 {
+        if boundary_ok && suffix_len == 16 {
             matches.push(LineMatch {
                 start,
                 end,
                 rule_id: "token.aws-access-key",
             });
         }
-        offset = start + 4;
     }
 }
 
@@ -471,15 +486,11 @@ fn find_auth_config(file_name: &str, line: &[u8], matches: &mut Vec<LineMatch>) 
     } else {
         matches!(key.trim(), "password" | "token")
     };
-    let value_start = separator
-        + 1
-        + line[separator + 1..]
-            .iter()
-            .take_while(|byte| byte.is_ascii_whitespace())
-            .count();
-    if sensitive && value_start < line.len() {
+    let after_separator = &line[separator.saturating_add(1)..];
+    let value = after_separator.trim_ascii_start();
+    if sensitive && !value.is_empty() {
         matches.push(LineMatch {
-            start: value_start,
+            start: line.len().saturating_sub(value.len()),
             end: line.len(),
             rule_id: if file_name == ".npmrc" {
                 "content.npm-auth"
@@ -523,10 +534,10 @@ fn find_shell_secret(shell_file: bool, envrc: bool, line: &[u8], matches: &mut V
     {
         return;
     }
-    let value_start = leading + usize::from(exported) * b"export ".len() + equal + 1;
-    if value_start < line.len() {
+    let value = declaration[equal.saturating_add(1)..].trim_ascii_start();
+    if !value.is_empty() {
         matches.push(LineMatch {
-            start: value_start,
+            start: line.len().saturating_sub(value.len()),
             end: line.len(),
             rule_id: "content.shell-secret-export",
         });
@@ -583,11 +594,17 @@ fn aws_key_byte(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
     use std::fs;
+    use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{SecretScanError, SecretWaiver, scan_tree};
+    use super::{
+        LineMatch, SecretScanError, SecretWaiver, find_auth_config, find_aws_access_keys,
+        find_pem_marker, find_prefixed_token, find_shell_secret, github_token_byte, redact_line,
+        scan_tree, secret_key_byte, slack_token_byte,
+    };
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -797,5 +814,362 @@ mod tests {
             scan_tree(&missing, &[]),
             Err(SecretScanError::Read { path, .. }) if path == missing
         ));
+    }
+    #[test]
+    fn waiver_paths_reject_each_invalid_shape_and_duplicates() {
+        let tree = TestDir::new();
+        tree.write("fixture.txt", "safe");
+        for path in ["", "/absolute", "dir/../fixture", "./fixture"] {
+            let waiver = SecretWaiver {
+                path: PathBuf::from(path),
+                reason: "documented".to_owned(),
+            };
+            assert!(
+                matches!(
+                    scan_tree(tree.path(), &[waiver]),
+                    Err(SecretScanError::InvalidWaiver { .. })
+                ),
+                "waiver path {path:?} must be rejected"
+            );
+        }
+
+        let waiver = SecretWaiver {
+            path: PathBuf::from("fixture.txt"),
+            reason: "documented".to_owned(),
+        };
+        assert!(matches!(
+            scan_tree(tree.path(), &[waiver.clone(), waiver]),
+            Err(SecretScanError::DuplicateWaiver { path })
+                if path == Path::new("fixture.txt")
+        ));
+    }
+
+    #[test]
+    fn pruning_is_exact_and_only_applies_to_cache_directories() {
+        let tree = TestDir::new();
+        for path in [
+            ".cowshed/cache/hidden.env",
+            "nested/.cowshed/cache/hidden.env",
+            "crate/target/hidden.env",
+        ] {
+            tree.write(path, "ghp_abcdefghijklmnopqrstuvwxyz0123456789");
+        }
+        tree.write("crate/Cargo.toml", "[package]\nname='fixture'");
+        for path in [
+            ".cowshed/not-cache/visible.env",
+            ".cowshed/cacheish/visible.env",
+            "target/visible.env",
+            "ordinary/.gitkeep",
+        ] {
+            tree.write(path, "ghp_abcdefghijklmnopqrstuvwxyz0123456789");
+        }
+
+        let scan = scan_tree(tree.path(), &[]).expect("scan succeeds");
+        let paths: Vec<&Path> = scan
+            .findings
+            .iter()
+            .map(|finding| finding.path.as_path())
+            .collect();
+        for visible in [
+            ".cowshed/not-cache/visible.env",
+            ".cowshed/cacheish/visible.env",
+            "target/visible.env",
+            "ordinary/.gitkeep",
+        ] {
+            assert!(paths.contains(&Path::new(visible)));
+        }
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.to_string_lossy().contains("hidden.env"))
+        );
+    }
+
+    #[test]
+    fn findings_report_one_based_line_numbers() {
+        let tree = TestDir::new();
+        tree.write(
+            "lines.txt",
+            "safe\nghp_abcdefghijklmnopqrstuvwxyz0123456789\nsafe\nAKIAABCDEFGHIJKLMNOP",
+        );
+        let scan = scan_tree(tree.path(), &[]).expect("scan succeeds");
+        assert_eq!(
+            scan.findings
+                .iter()
+                .find(|finding| finding.rule_id == "token.github-pat")
+                .and_then(|finding| finding.line),
+            Some(2)
+        );
+        assert_eq!(
+            scan.findings
+                .iter()
+                .find(|finding| finding.rule_id == "token.aws-access-key")
+                .and_then(|finding| finding.line),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn cloud_and_shell_path_classification_is_exact() {
+        let tree = TestDir::new();
+        for path in [
+            ".aws/credentials",
+            ".azure/profile",
+            ".gcloud/configurations/default",
+            ".config/gcloud/credentials",
+        ] {
+            tree.write(path, "safe");
+        }
+        for path in ["config/gcloud/safe", ".config/other/safe", "aws/safe"] {
+            tree.write(path, "safe");
+        }
+        tree.write("script.txt", "export SERVICE_TOKEN=visible");
+        tree.write("script.sh", "export SERVICE_TOKEN=hidden");
+        tree.write("profile", "export SERVICE_TOKEN=visible");
+        tree.write(".profile", "export SERVICE_TOKEN=hidden");
+
+        let scan = scan_tree(tree.path(), &[]).expect("scan succeeds");
+        let cloud: Vec<&Path> = scan
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id == "filename.cloud-credentials")
+            .map(|finding| finding.path.as_path())
+            .collect();
+        assert_eq!(cloud.len(), 4);
+        for expected in [
+            ".aws/credentials",
+            ".azure/profile",
+            ".gcloud/configurations/default",
+            ".config/gcloud/credentials",
+        ] {
+            assert!(cloud.contains(&Path::new(expected)));
+        }
+        let shell: Vec<&Path> = scan
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id == "content.shell-secret-export")
+            .map(|finding| finding.path.as_path())
+            .collect();
+        assert_eq!(shell, vec![Path::new(".profile"), Path::new("script.sh")]);
+    }
+
+    #[test]
+    fn token_scanners_enforce_boundaries_lengths_and_alphabets() {
+        let mut matches = Vec::new();
+        find_prefixed_token(
+            b"x ghp_abcdefghijklmnopqrst!",
+            b"ghp_",
+            20,
+            github_token_byte,
+            "github",
+            &mut matches,
+        );
+        assert_eq!(
+            matches,
+            vec![LineMatch {
+                start: 2,
+                end: 26,
+                rule_id: "github"
+            }]
+        );
+        matches.clear();
+        for value in [
+            b"_ghp_abcdefghijklmnopqrst".as_slice(),
+            b"ghp_abcdefghijklmnopqrs",
+        ] {
+            find_prefixed_token(
+                value,
+                b"ghp_",
+                20,
+                github_token_byte,
+                "github",
+                &mut matches,
+            );
+        }
+        assert!(matches.is_empty());
+        find_prefixed_token(
+            b"xoxb-abc-def-123",
+            b"xoxb-",
+            10,
+            slack_token_byte,
+            "slack",
+            &mut matches,
+        );
+        assert_eq!(matches.len(), 1);
+        matches.clear();
+        find_prefixed_token(
+            b"xoxb-abc_defghijklmnop",
+            b"xoxb-",
+            10,
+            slack_token_byte,
+            "slack",
+            &mut matches,
+        );
+        assert!(matches.is_empty());
+        assert!(slack_token_byte(b'-'));
+        assert!(!slack_token_byte(b'_'));
+        assert!(!slack_token_byte(b'!'));
+        find_prefixed_token(
+            b"sk-abc_DEF-ghi-jkl-mnop",
+            b"sk-",
+            20,
+            secret_key_byte,
+            "secret",
+            &mut matches,
+        );
+        assert_eq!(matches.len(), 1);
+
+        matches.clear();
+        find_aws_access_keys(b"x AKIAABCDEFGHIJKLMNOP!", &mut matches);
+        assert_eq!(
+            matches,
+            vec![LineMatch {
+                start: 2,
+                end: 22,
+                rule_id: "token.aws-access-key"
+            }]
+        );
+        matches.clear();
+        for value in [
+            b"AAKIAABCDEFGHIJKLMNOP".as_slice(),
+            b"AKIAABCDEFGHIJKLMNO",
+            b"AKIAABCDEFGHIJKLMNO_",
+        ] {
+            find_aws_access_keys(value, &mut matches);
+        }
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn pem_and_auth_scanners_respect_boundaries_and_redact_only_values() {
+        let mut matches = Vec::new();
+        let pem = b"before -----BEGIN EC PRIVATE KEY----- after";
+        find_pem_marker(pem, &mut matches);
+        assert_eq!(redact_line(pem, &matches), "before [REDACTED] after");
+        matches.clear();
+        find_pem_marker(b"-----BEGIN PUBLIC KEY-----", &mut matches);
+        assert!(matches.is_empty());
+
+        find_auth_config(".npmrc", b"registry=https://example.test", &mut matches);
+        let npm = b"//example/:_authToken = npm-secret";
+        find_auth_config(".npmrc", npm, &mut matches);
+        assert_eq!(
+            redact_line(npm, &matches),
+            "//example/:_authToken = [REDACTED]"
+        );
+        matches.clear();
+        find_auth_config(".npmrc", b"password=npm-password", &mut matches);
+        find_auth_config(".npmrc", b"auth-token=npm-token", &mut matches);
+        assert_eq!(matches.len(), 2);
+        assert!(
+            matches
+                .iter()
+                .all(|matched| matched.rule_id == "content.npm-auth")
+        );
+        matches.clear();
+        find_auth_config(".pypirc", b"username: builder", &mut matches);
+        let pypi = b" token: pypi-secret";
+        find_auth_config(".pypirc", pypi, &mut matches);
+        assert_eq!(redact_line(pypi, &matches), " token: [REDACTED]");
+        assert_eq!(matches[0].rule_id, "content.pypi-auth");
+        matches.clear();
+        find_auth_config("other", b"password=visible", &mut matches);
+        find_auth_config(".pypirc", b"password=   ", &mut matches);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn shell_scanner_requires_secret_variable_and_nonempty_value() {
+        let mut matches = Vec::new();
+        let secret = b"  export API_TOKEN= hidden";
+        find_shell_secret(true, false, secret, &mut matches);
+        assert_eq!(
+            redact_line(secret, &matches),
+            "  export API_TOKEN= [REDACTED]"
+        );
+        matches.clear();
+        for line in [
+            b"API_TOKEN=visible".as_slice(),
+            b"export api_TOKEN=visible",
+            b"export API_VALUE=visible",
+            b"export API_TOKEN=   ",
+        ] {
+            find_shell_secret(true, false, line, &mut matches);
+        }
+        assert!(matches.is_empty());
+        find_shell_secret(true, true, b"API_KEY=hidden", &mut matches);
+        assert_eq!(
+            redact_line(b"API_KEY=hidden", &matches),
+            "API_KEY=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn redaction_merges_touching_ranges_but_preserves_gaps() {
+        let line = b"0123456789";
+        let touching = [
+            LineMatch {
+                start: 1,
+                end: 3,
+                rule_id: "a",
+            },
+            LineMatch {
+                start: 3,
+                end: 5,
+                rule_id: "b",
+            },
+        ];
+        assert_eq!(redact_line(line, &touching), "0[REDACTED]56789");
+        let separated = [
+            LineMatch {
+                start: 1,
+                end: 3,
+                rule_id: "a",
+            },
+            LineMatch {
+                start: 4,
+                end: 5,
+                rule_id: "b",
+            },
+        ];
+        assert_eq!(redact_line(line, &separated), "0[REDACTED]3[REDACTED]56789");
+    }
+
+    #[test]
+    fn scan_errors_have_stable_messages_and_sources() {
+        let tree = TestDir::new();
+        let missing = tree.path().join("missing");
+        let read_error = scan_tree(&missing, &[]).expect_err("missing root fails");
+        assert!(read_error.to_string().starts_with("cannot read "));
+        assert_eq!(
+            read_error
+                .source()
+                .and_then(|source| source.downcast_ref::<io::Error>())
+                .map(io::Error::kind),
+            Some(io::ErrorKind::NotFound)
+        );
+
+        let walk_source = walkdir::WalkDir::new(&missing)
+            .into_iter()
+            .next()
+            .expect("walker emits the missing root")
+            .expect_err("missing root produces a walk error");
+        let walk_error = SecretScanError::Walk {
+            path: PathBuf::from("fixture"),
+            source: walk_source,
+        };
+        assert!(walk_error.to_string().starts_with("cannot walk fixture: "));
+        assert!(
+            walk_error
+                .source()
+                .and_then(|source| source.downcast_ref::<walkdir::Error>())
+                .is_some()
+        );
+        let invalid = SecretScanError::InvalidRoot {
+            path: PathBuf::from("fixture"),
+            reason: "bad root",
+        };
+        assert_eq!(invalid.to_string(), "cannot scan fixture: bad root");
+        assert!(invalid.source().is_none());
     }
 }
