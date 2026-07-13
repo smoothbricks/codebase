@@ -19,8 +19,8 @@ use crate::apfs::{
 };
 use crate::copy::TreeCopier;
 use crate::metadata::{
-    DetachedWorkspaceMetadata, ImageFormat, METADATA_VERSION, Platform, WorkspaceMarker,
-    WorkspaceName, WorkspaceRole, sidecar_path,
+    DetachedWorkspaceMetadata, ImageFormat, METADATA_VERSION, Platform, WorkspaceIncarnation,
+    WorkspaceMarker, WorkspaceName, WorkspaceRole, sidecar_path,
 };
 use crate::repository::RepoId;
 use serde::{Deserialize, Serialize};
@@ -180,6 +180,12 @@ pub enum RestoreFailpoint {
 }
 
 fn directory_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Ok(Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(io_error("inspect recovery directory", directory, error)),
+    }
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -203,6 +209,47 @@ fn directory_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageError
             ))),
         })
         .collect()
+}
+
+fn regular_file_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Ok(Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(io_error("inspect recovery directory", directory, error)),
+    }
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(io_error("enumerate recovery directory", directory, error)),
+    };
+    entries
+        .filter_map(|entry| match entry {
+            Ok(entry) => match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) if metadata.file_type().is_file() => Some(Ok(entry.path())),
+                Ok(_) => None,
+                Err(error) => Some(Err(io_error(
+                    "inspect recovery directory",
+                    &entry.path(),
+                    error,
+                ))),
+            },
+            Err(error) => Some(Err(io_error(
+                "read recovery directory entry",
+                directory,
+                error,
+            ))),
+        })
+        .collect()
+}
+
+fn staged_image_format(path: &Path) -> Option<ImageFormat> {
+    let format = ImageFormat::from_image_path(path).ok()?;
+    let stem = path.file_stem()?.to_str()?;
+    let (workspace, incarnation) = stem.rsplit_once('-')?;
+    WorkspaceName::new(workspace).ok()?;
+    WorkspaceIncarnation::new(incarnation).ok()?;
+    Some(format)
 }
 
 fn collect_project_directories(store_root: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
@@ -835,10 +882,48 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             Err(error) => return Err(io_error("enumerate trash", &trash, error)),
         }
 
+        let staging = project.join(super::STAGING_NAMESPACE);
+        let mut staged_images = BTreeMap::new();
+        let mut staged_sidecars = BTreeMap::new();
+        for path in regular_file_children(&staging)? {
+            if let Some(format) = staged_image_format(&path) {
+                staged_images.insert(path, format);
+                continue;
+            }
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".grants.json"))
+            {
+                let image = image_from_sidecar(&path)?;
+                if staged_image_format(&image).is_some() {
+                    staged_sidecars.insert(image, path);
+                }
+            }
+        }
+        for (image, format) in &staged_images {
+            report.examined += 1;
+            if staged_sidecars.contains_key(image) {
+                continue;
+            }
+            self.reclaim_image(image, *format)?;
+            report.reclaimed += 1;
+        }
+        for (image, sidecar) in &staged_sidecars {
+            report.examined += 1;
+            if staged_images.contains_key(image) {
+                continue;
+            }
+            fs::remove_file(sidecar)
+                .map_err(|error| io_error("remove orphan staging metadata", sidecar, error))?;
+            sync_parent!(sidecar)?;
+            report.reclaimed += 1;
+        }
+
         let checkpoint_root = project.join("checkpoints");
         for workspace_directory in directory_children(&checkpoint_root)? {
             let mut checkpoints = Vec::new();
-            for image in directory_children(&workspace_directory)? {
+            for image in regular_file_children(&workspace_directory)? {
                 let Ok(format) = ImageFormat::from_image_path(&image) else {
                     continue;
                 };
@@ -853,7 +938,12 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     .map_err(|error| io_error("read checkpoint age", &image, error))?;
                 checkpoints.push((modified, image, format, fact));
             }
-            checkpoints.sort_by_key(|right| std::cmp::Reverse(right.0));
+            checkpoints.sort_by(|left, right| {
+                right
+                    .0
+                    .cmp(&left.0)
+                    .then_with(|| right.1.cmp(&left.1))
+            });
             for (index, (modified, image, format, fact)) in checkpoints.into_iter().enumerate() {
                 report.examined += 1;
                 if fact.pin == "pinned" {
@@ -1647,7 +1737,7 @@ where
             else {
                 continue;
             };
-            for image in directory_children(&workspace_directory)? {
+            for image in regular_file_children(&workspace_directory)? {
                 if ImageFormat::from_image_path(&image).is_err() {
                     continue;
                 }
@@ -1987,30 +2077,16 @@ where
             ));
         }
         let mut report = StorageGcReport::default();
-        let owners = match fs::read_dir(&config.store_root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(report),
-            Err(error) => return Err(io_error("enumerate APFS store", &config.store_root, error)),
-        };
-        for owner in owners {
-            let owner = owner
-                .map_err(|error| io_error("read APFS owner", &config.store_root, error))?
-                .path();
-            if !owner.is_dir()
-                || owner == config.caches_root
-                || owner.file_name().is_some_and(|name| name == "mnt")
+        for owner in directory_children(&config.store_root)? {
+            if owner == config.caches_root
+                || owner.file_name().is_some_and(|name| {
+                    matches!(name.to_str(), Some("mnt" | "caches" | "gateway" | "telemetry" | "run"))
+                })
             {
                 continue;
             }
-            for repository in fs::read_dir(&owner)
-                .map_err(|error| io_error("enumerate APFS repositories", &owner, error))?
-            {
-                let project = repository
-                    .map_err(|error| io_error("read APFS repository", &owner, error))?
-                    .path();
-                if project.is_dir() {
-                    self.gc_project(&project, &mut report)?;
-                }
+            for project in directory_children(&owner)? {
+                self.gc_project(&project, &mut report)?;
             }
         }
         Ok(report)
