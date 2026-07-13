@@ -261,6 +261,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
   private readonly physicalLayoutPlan: PhysicalLayoutPlan<B['logBinding']['logSchema'], OpContextOf<B>>;
   private readonly flagEvaluator: FlagEvaluator<OpContextOf<B>>;
   private readonly ctxDefaults: Record<string, unknown>;
+  private readonly requiredCtxKeys: readonly string[];
   private readonly deps: Record<string, unknown>;
   private readonly createTraceRoot: TraceRootFactory<B['logBinding']['logSchema']>;
 
@@ -275,6 +276,12 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
     this.logBinding = binding.logBinding;
     this.bufferStrategy = options.bufferStrategy;
     this.ctxDefaults = binding.ctxDefaults ?? EMPTY_SCOPE;
+    const userContextKeys = Object.keys(this.ctxDefaults).sort();
+    const requiredCtxKeys: string[] = [];
+    for (const key of userContextKeys) {
+      if (this.ctxDefaults[key] === null) requiredCtxKeys.push(key);
+    }
+    this.requiredCtxKeys = requiredCtxKeys;
     this.deps = binding.deps ?? EMPTY_SCOPE;
     this.flagEvaluator = this._createFlagEvaluator(binding.flags, options.flagEvaluator);
     this.createTraceRoot = options.createTraceRoot;
@@ -285,7 +292,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
       binding.logBinding.logSchema,
       binding.logBinding,
       undefined,
-      Object.keys(this.ctxDefaults),
+      userContextKeys,
     );
     this.physicalLayoutPlan = getPhysicalLayoutPlan(
       getSpanBufferClass(binding.logBinding.logSchema),
@@ -293,7 +300,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
       this.SpanContextClass,
       undefined,
       'strategy-selected',
-      Object.keys(this.ctxDefaults).sort().join('\u0000'),
+      userContextKeys.join('\u0000'),
     );
 
     // Bind methods for destructuring (per AGENTS.md - "Always destructure")
@@ -711,10 +718,8 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
     const traceId: TraceId = isValidTraceId(overrides.trace_id) ? overrides.trace_id : generateTraceId();
     const schema = this.logBinding.logSchema;
 
-    // Validate null-sentinel required fields and merge user context.
-    // _resolveUserContext ignores trace_id (transport-only field).
-    const overrideRecord: Record<string, unknown> = { ...overrides };
-    const resolvedUserCtx = this._resolveUserContext(overrideRecord);
+    // Validate required null-sentinel fields before allocating the trace root or buffer.
+    this._validateRequiredUserContext(overrides);
 
     // Create TraceRoot via platform-specific factory
     const traceRoot = this.createTraceRoot(traceId, this);
@@ -737,52 +742,40 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
       callsitePlan.newSpanLogger?.(buffer),
       callsitePlan.newTagWriter?.(buffer),
       callsitePlan,
-      resolvedUserCtx,
-      undefined,
+      this.ctxDefaults,
+      overrides,
       this.deps,
       this.flagEvaluator,
     );
   }
 
   /**
-   * Validate null-sentinel required fields and merge with provided overrides.
+   * Validate null-sentinel required fields without materializing a merged
+   * user-context carrier.
    *
    * Per the ctx config pattern:
    * - Properties with null values in ctxDefaults must be provided in overrides
    * - Properties with default values can optionally be overridden
    * - undefined is allowed for optional fields
    */
-  private _resolveUserContext(overrides: Record<string, unknown>): Record<string, unknown> {
-    const ctxDefaults = this.ctxDefaults;
-
-    // Check that all null-sentinel keys are provided in overrides
-    for (const key of Object.keys(ctxDefaults)) {
-      const defaultValue = ctxDefaults[key];
-      if (defaultValue === null) {
-        const providedValue = overrides[key];
-        if (providedValue === null || providedValue === undefined) {
-          throw new Error(
-            `Required context parameter '${key}' must be provided. ` +
-              'Properties with null values in ctx config are required.',
-          );
-        }
+  private _validateRequiredUserContext(overrides: Record<string, unknown>): void {
+    for (const key of this.requiredCtxKeys) {
+      if (!Object.prototype.propertyIsEnumerable.call(overrides, key)) {
+        throw new Error(
+          `Required context parameter '${key}' must be provided. ` +
+            'Properties with null values in ctx config are required.',
+        );
+      }
+      const providedValue = overrides[key];
+      if (providedValue === null || providedValue === undefined) {
+        throw new Error(
+          `Required context parameter '${key}' must be provided. ` +
+            'Properties with null values in ctx config are required.',
+        );
       }
     }
-
-    // Merge defaults with provided overrides (provided values win)
-    const resolvedUserCtx: Record<string, unknown> = { ...ctxDefaults };
-    for (const key of Object.keys(overrides)) {
-      if (key === 'trace_id') {
-        continue;
-      }
-      const value = overrides[key];
-      if (value !== undefined) {
-        resolvedUserCtx[key] = value;
-      }
-    }
-
-    return resolvedUserCtx;
   }
+
 
   /**
    * Execute function with context and handle span-ok/span-err/span-exception writes

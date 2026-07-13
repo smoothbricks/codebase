@@ -834,8 +834,12 @@ export function createSpanContextClass<Ctx extends OpContext>(
       if (hasDeps) this.deps = deps ?? {};
       if (hasFf && ffSource) this.ff = ffSource.forContext(this);
       for (const key of canonicalUserContextKeys) {
-        this[key] =
-          contextOverrides && Object.hasOwn(contextOverrides, key) ? contextOverrides[key] : contextSource?.[key];
+        let value = contextSource?.[key];
+        if (contextOverrides && Object.prototype.propertyIsEnumerable.call(contextOverrides, key)) {
+          const overrideValue = contextOverrides[key];
+          if (overrideValue !== undefined) value = overrideValue;
+        }
+        this[key] = value;
       }
 
       // Regular functions close over constructor args directly - no property lookups
