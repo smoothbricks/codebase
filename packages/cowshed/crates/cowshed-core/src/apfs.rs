@@ -398,7 +398,10 @@ impl fmt::Display for ApfsError {
                 write!(f, "could not resolve APFS volume for {candidate}: {reason}")
             }
             Self::VolumeNameResolutionFailed { device, reason } => {
-                write!(f, "could not resolve APFS volume name for {device}: {reason}")
+                write!(
+                    f,
+                    "could not resolve APFS volume name for {device}: {reason}"
+                )
             }
             Self::VolumeResolutionAndDetachFailed { whole_device, .. } => write!(
                 f,
@@ -1843,9 +1846,11 @@ mod tests {
         assert_eq!(argv(&requests[2]), ["-q", "/dev/rdisk5s2"]);
         assert_eq!(requests[3].program, Path::new(HDIUTIL));
         assert_eq!(argv(&requests[3]), ["detach", "-quiet", "/dev/disk4"]);
-        assert!(!requests
-            .iter()
-            .any(|request| argv(request).first().is_some_and(|arg| arg == "mount")));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| argv(request).first().is_some_and(|arg| arg == "mount"))
+        );
     }
 
     #[test]
@@ -2327,9 +2332,11 @@ mod tests {
         assert!(!image.exists());
         let requests = backend.runner().requests();
         assert_eq!(requests.len(), 3);
-        assert!(!requests
-            .iter()
-            .any(|request| request.program == Path::new(HDIUTIL)));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.program == Path::new(HDIUTIL))
+        );
     }
 
     #[test]
