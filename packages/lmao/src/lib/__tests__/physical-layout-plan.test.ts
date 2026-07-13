@@ -122,7 +122,7 @@ describe('PhysicalLayoutPlan', () => {
     expect(differentSchema.schema).toBe(otherSchema);
   });
 
-  it('owns the schema-specific constructors, capacity, appenders, and reserved vocabulary slot', () => {
+  it('owns the schema-specific constructors, capacity, and appenders', () => {
     const schema = defineLogSchema({ userId: S.category() });
     const SpanBufferClass = getSpanBufferClass(schema);
     const SpanContextClass = createSpanContextClass<OpContext<typeof schema>>(
@@ -142,7 +142,6 @@ describe('PhysicalLayoutPlan', () => {
     expect(plan.ResultWriterClass).toBe(getResultWriterClass(schema));
     expect(plan.capacityTier).toBe(CAPACITY_TIER);
     expect(plan.clock.kind).toBe('trace-root');
-    expect(plan.vocabularyBindingSlot).toBeNull();
     expect(plan.poolRef).toBeNull();
     expect(reusedPlan.clock).toBe(plan.clock);
     expect(reusedPlan.appenders).toBe(plan.appenders);
@@ -166,7 +165,7 @@ describe('PhysicalLayoutPlan', () => {
         return ctx.ok('done');
       },
       undefined,
-      { runtimeHint: HOT_CHILD_HINT, logTemplateIds: [] },
+      { runtimeHint: HOT_CHILD_HINT },
     );
     const childSchema = childOp.SpanBufferClass.schema;
     const plan = childOp.physicalLayoutPlan;

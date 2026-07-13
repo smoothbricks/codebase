@@ -24,6 +24,7 @@ import type { InferSchema } from './schema/types.js';
 import type { SpanBufferStats } from './spanBufferStats.js';
 import type { TraceId } from './traceId.js';
 import type { ITraceRoot } from './traceRoot.js';
+import type { VocabularyGeneration } from './vocabularyRegistry.js';
 
 // Re-export infrastructure types
 export type { LogBinding, RemapDescriptor, RemappedColumn } from './logBinding.js';
@@ -115,11 +116,11 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
    */
   readonly entry_type: Uint8Array;
 
-  /**
-   * Private Op-local compile-time message template IDs. Zero means message_values owns the row.
-   * Allocated only when this buffer's Op has compile-time templates.
-   */
-  readonly _messageTemplateIds?: Uint16Array;
+  /** Packed static-message headers; zero means the row's dynamic message lane owns the value. */
+  readonly _logHeaders: Uint32Array;
+
+  /** Immutable vocabulary generation against which `_logHeaders` dense indices resolve. */
+  readonly _vocabularyGeneration: VocabularyGeneration;
 
   /**
    * Timestamp of span start (row 0).

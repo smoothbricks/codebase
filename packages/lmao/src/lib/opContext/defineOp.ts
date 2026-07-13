@@ -8,7 +8,7 @@
  */
 
 import { intern, PreEncodedEntry } from '@smoothbricks/arrow-builder';
-import { EMPTY_LOG_TEMPLATE_IDS, Op as OpClass } from '../op.js';
+import { Op as OpClass } from '../op.js';
 import { getSpanBufferClass } from '../spanBuffer.js';
 import type { OpGroup, OpGroupOps } from './opGroupTypes.js';
 import type { Op, OpCompileMetadata, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
@@ -44,7 +44,6 @@ export function createOpMetadata(
     package_name_entry: new PreEncodedEntry(package_name, intern(package_name)),
     package_file_entry: new PreEncodedEntry(package_file, intern(package_file)),
     git_sha_entry: new PreEncodedEntry(git_sha, intern(git_sha)),
-    logTemplateIds: EMPTY_LOG_TEMPLATE_IDS,
   };
 }
 
@@ -60,33 +59,12 @@ export const DEFAULT_METADATA: OpMetadata = createOpMetadata('unknown', 'unknown
 
 const DEFAULT_COMPILE_METADATA: OpCompileMetadata = Object.freeze({
   runtimeHint: 0,
-  logTemplateIds: EMPTY_LOG_TEMPLATE_IDS,
 });
 
-function normalizeLogTemplateIds(logTemplateIds: readonly string[]): readonly string[] {
-  const length = logTemplateIds.length;
-  if (length === 0) return EMPTY_LOG_TEMPLATE_IDS;
-  if (length > 65_535) {
-    throw new RangeError(`Op log template table exceeds the u16 ID limit: ${length}`);
-  }
-
-  const normalized = new Array<string>(length);
-  for (let index = 0; index < length; index++) {
-    const template = logTemplateIds[index];
-    if (typeof template !== 'string') {
-      throw new TypeError(`Op log template at index ${index} must be a string`);
-    }
-    normalized[index] = template;
-  }
-  return Object.freeze(normalized);
-}
 
 function normalizeCompileMetadata(compileMetadata?: OpCompileMetadata): OpCompileMetadata {
   if (compileMetadata === undefined) return DEFAULT_COMPILE_METADATA;
-  return Object.freeze({
-    runtimeHint: compileMetadata.runtimeHint,
-    logTemplateIds: normalizeLogTemplateIds(compileMetadata.logTemplateIds),
-  });
+  return Object.freeze({ runtimeHint: compileMetadata.runtimeHint });
 }
 
 // =============================================================================
@@ -239,7 +217,6 @@ export function createDefineOp<Ctx extends OpContext>(
       ...baseMetadata,
       ...metadata,
       name: metadata?.name ?? name,
-      logTemplateIds: normalizedCompileMetadata.logTemplateIds,
     };
 
     // Use the Op class which handles all span/buffer management:
@@ -330,7 +307,7 @@ export function createDefineOps<Ctx extends OpContext>(
         } else {
           const normalizedCompileMetadata = normalizeCompileMetadata(compileMetadata);
           ops[name] = new OpClass(
-            { ...def.metadata, logTemplateIds: normalizedCompileMetadata.logTemplateIds },
+            def.metadata,
             def.SpanBufferClass,
             def.fn,
             def.remapDescriptor,

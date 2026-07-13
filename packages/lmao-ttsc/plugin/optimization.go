@@ -290,23 +290,6 @@ func hasLmaoCallProvenance(chk *shimchecker.Checker, call *shimast.CallExpressio
 	return signature != nil && isLmaoDeclarationNode(signature.Declaration())
 }
 
-func (t *fileTransformer) collectStaticLogVocabulary(call *shimast.CallExpression) {
-	if t.vocabulary == nil || len(call.Arguments.Nodes) != 1 || call.Expression.Kind != shimast.KindPropertyAccessExpression {
-		return
-	}
-	method := call.Expression.AsPropertyAccessExpression()
-	if !logMethods[shimast.NodeText(method.Name())] || !hasLmaoCallProvenance(t.checker, call) {
-		return
-	}
-	receiverType := t.checker.GetTypeAtLocation(method.Expression)
-	if receiverType == nil || !isSpanLoggerType(t.checker, receiverType) {
-		return
-	}
-	if text, literal := literalVocabularyValue(call.Arguments.Nodes[0]); literal {
-		t.vocabulary.add(vocabularyLogTemplate, text, call, t.file.FileName())
-	}
-}
-
 func (t *fileTransformer) collectOptimizations(root *shimast.Node) []hintRewrite {
 	if t.checker == nil {
 		return nil
@@ -319,7 +302,7 @@ func (t *fileTransformer) collectOptimizations(root *shimast.Node) []hintRewrite
 		}
 		if node.Kind == shimast.KindCallExpression {
 			call := node.AsCallExpression()
-			t.collectStaticLogVocabulary(call)
+			t.collectLogVocabulary(call)
 			_, name := calleeNames(call)
 			provenLmaoCall := hasLmaoCallProvenance(t.checker, call)
 			switch name {
