@@ -11,30 +11,34 @@ interface NestedPayload {
   metadata: { tags: string[]; active: boolean };
 }
 
+const isSimplePayload = typia.createIs<SimplePayload>();
+const validateSimplePayload = typia.createValidate<SimplePayload>();
+const isNestedPayload = typia.createIs<NestedPayload>();
+
 describe('Typia transformer smoke test', () => {
-  describe('typia.is<T>()', () => {
+  describe('typia.createIs<T>()', () => {
     it('accepts a correct payload', () => {
-      expect(typia.is<SimplePayload>({ name: 'test', count: 1 })).toBe(true);
+      expect(isSimplePayload({ name: 'test', count: 1 })).toBe(true);
     });
 
     it('rejects wrong field type', () => {
-      expect(typia.is<SimplePayload>({ name: 'test', count: 'nope' })).toBe(false);
+      expect(isSimplePayload({ name: 'test', count: 'nope' })).toBe(false);
     });
 
     it('rejects missing field', () => {
-      expect(typia.is<SimplePayload>({ name: 'test' })).toBe(false);
+      expect(isSimplePayload({ name: 'test' })).toBe(false);
     });
 
     it('accepts extra fields', () => {
-      expect(typia.is<SimplePayload>({ name: 'test', count: 1, extra: true })).toBe(true);
+      expect(isSimplePayload({ name: 'test', count: 1, extra: true })).toBe(true);
     });
 
     it('handles nested objects', () => {
-      expect(typia.is<NestedPayload>({ id: 'x', metadata: { tags: ['a', 'b'], active: true } })).toBe(true);
+      expect(isNestedPayload({ id: 'x', metadata: { tags: ['a', 'b'], active: true } })).toBe(true);
     });
 
     it('rejects nested type mismatch', () => {
-      expect(typia.is<NestedPayload>({ id: 'x', metadata: { tags: 'not-array', active: true } })).toBe(false);
+      expect(isNestedPayload({ id: 'x', metadata: { tags: 'not-array', active: true } })).toBe(false);
     });
   });
 
@@ -50,17 +54,25 @@ describe('Typia transformer smoke test', () => {
     });
   });
 
-  describe('typia.validate<T>()', () => {
-    it('returns success for valid input', () => {
-      const result = typia.validate<SimplePayload>({ name: 'ok', count: 0 });
+  describe('typia.createValidate<T>()', () => {
+    it('returns success and the payload for valid input', () => {
+      const payload = { name: 'ok', count: 0 };
+      const result = validateSimplePayload(payload);
+
       expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data).toEqual(payload);
+      }
     });
 
-    it('returns errors for invalid input', () => {
-      const result = typia.validate<SimplePayload>({ name: 'ok', count: 'bad' });
+    it('returns the field error for invalid input', () => {
+      const result = validateSimplePayload({ name: 'ok', count: 'bad' });
+
       expect(result.success).toBe(false);
       if (!result.success) {
-        expect(result.errors.length).toBeGreaterThan(0);
+        expect(result.errors).toEqual(
+          expect.arrayContaining([expect.objectContaining({ expected: 'number', value: 'bad' })]),
+        );
       }
     });
   });
