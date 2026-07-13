@@ -707,6 +707,46 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
 }
 
 #[tokio::test]
+async fn adopt_rejects_each_source_identity_mismatch_before_mutation() {
+    for (main_mount, project_root) in [
+        ("/project", "/different-project"),
+        ("/different-main-mount", "/project"),
+    ] {
+        let host = FakeHost::default();
+        let lane = CountingLane::default();
+        let substrate = ApfsSubstrate::with_lane_and_incarnations(
+            ApfsSubstrateConfig::new(
+                "/store",
+                "/store/caches",
+                main_mount,
+                ApfsCaseSensitivity::Insensitive,
+            ),
+            host.clone(),
+            lane.clone(),
+            FixedIncarnations::default(),
+        );
+        let mut request = adopt_request(ImageFormat::Sparse);
+        request.identity.project_root = PathBuf::from(project_root);
+        let plan = substrate.plan_adopt(request).expect("adopt plan");
+
+        let error = substrate.execute_adopt(plan).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApfsStorageError::InvalidPlan(
+                "adopt source must equal operation project root and canonical main mount"
+            )
+        ));
+        assert_eq!(host.events(), ["lock:1", "observe"]);
+        assert_eq!(
+            lane.count(),
+            3,
+            "validation may lock and observe, but must not execute a host mutation"
+        );
+    }
+}
+
+#[tokio::test]
 async fn ensure_mounted_is_idempotent_for_an_already_mounted_workspace() {
     let host = FakeHost::default();
     let substrate = substrate(host.clone(), CountingLane::default());
