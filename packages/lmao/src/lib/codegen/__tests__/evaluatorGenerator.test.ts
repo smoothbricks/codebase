@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { createBuffer, createTestSpanContext, createTestSchema } from '../../__tests__/test-helpers.js';
 import type { OpContext } from '../../opContext/types.js';
+import { resolveEntryType } from '../../resolveMessage.js';
 import { S } from '../../schema/builder.js';
 import type { FeatureFlagSchema } from '../../schema/defineFeatureFlags.js';
 import { defineFeatureFlags } from '../../schema/defineFeatureFlags.js';
@@ -254,7 +255,7 @@ describe('EvaluatorGenerator', () => {
       // Context should be applied via with(context)
       let usageIdx = -1;
       for (let i = 0; i < spanBuffer._writeIndex; i++) {
-        if (spanBuffer.entry_type[i] === ENTRY_TYPE_FF_USAGE) {
+        if (resolveEntryType(spanBuffer, i) === ENTRY_TYPE_FF_USAGE) {
           usageIdx = i;
           break;
         }
@@ -389,7 +390,7 @@ function countEntryType(buffer: AnySpanBuffer, entryType: number): number {
   while (current) {
     const writeIndex = current._writeIndex;
     for (let i = 0; i < writeIndex; i++) {
-      if (current.entry_type[i] === entryType) {
+      if (resolveEntryType(current, i) === entryType) {
         count++;
       }
     }

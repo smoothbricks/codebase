@@ -48,7 +48,11 @@ describe('Arrow Binary Format Compliance', () => {
       // Donbuffer._opMetadata = DEFAULT_METADATA;
 
       // Writebuffer.timestamp[0] = BigInt(Date.now()) * 1000000n;
-      buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      {
+        const entryTypes = buffer.entry_type;
+        if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+        entryTypes[0] = ENTRY_TYPE_SPAN_START;
+      };
       buffer.numberValue(0, 42);
       buffer._writeIndex = 1;
 
@@ -74,7 +78,11 @@ describe('Arrow Binary Format Compliance', () => {
       // Write test data using generated methods
       const testValue = 0x12345678;
       buffer.timestamp[0] = BigInt(Date.now()) * 1000000n;
-      buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      {
+        const entryTypes = buffer.entry_type;
+        if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+        entryTypes[0] = ENTRY_TYPE_SPAN_START;
+      };
       buffer.uint32Value(0, testValue);
       buffer._writeIndex = 1;
 
@@ -115,7 +123,11 @@ describe('Arrow Binary Format Compliance', () => {
       for (let i = 0; i < testData.length; i++) {
         const value = testData[i];
         buffer.timestamp[i] = BigInt(Date.now()) * 1000000n;
-        buffer.entry_type[i] = ENTRY_TYPE_SPAN_START;
+        {
+          const entryTypes = buffer.entry_type;
+          if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+          entryTypes[i] = ENTRY_TYPE_SPAN_START;
+        };
 
         if (value === null) {
           // Don't call the method for null values, just leave as default (null)
@@ -166,7 +178,11 @@ describe('Arrow Binary Format Compliance', () => {
 
       for (let i = 0; i < testValues.length; i++) {
         buffer.timestamp[i] = BigInt(Date.now()) * 1000000n;
-        buffer.entry_type[i] = ENTRY_TYPE_SPAN_START;
+        {
+          const entryTypes = buffer.entry_type;
+          if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+          entryTypes[i] = ENTRY_TYPE_SPAN_START;
+        };
         buffer.enumValue(i, testValues[i]);
       }
       buffer._writeIndex = testValues.length;
@@ -202,7 +218,11 @@ describe('Arrow Binary Format Compliance', () => {
 
       for (let i = 0; i < testValues.length; i++) {
         buffer.timestamp[i] = BigInt(Date.now()) * 1000000n;
-        buffer.entry_type[i] = ENTRY_TYPE_SPAN_START;
+        {
+          const entryTypes = buffer.entry_type;
+          if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+          entryTypes[i] = ENTRY_TYPE_SPAN_START;
+        };
         buffer.textValue(i, testValues[i]);
       }
       buffer._writeIndex = testValues.length;
@@ -260,7 +280,11 @@ describe('Arrow Binary Format Compliance', () => {
 
       for (let i = 0; i < testValues.length; i++) {
         buffer.timestamp[i] = BigInt(Date.now()) * 1000000n;
-        buffer.entry_type[i] = ENTRY_TYPE_SPAN_START;
+        {
+          const entryTypes = buffer.entry_type;
+          if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+          entryTypes[i] = ENTRY_TYPE_SPAN_START;
+        };
         buffer.boolValue(i, testValues[i]);
       }
       buffer._writeIndex = testValues.length;

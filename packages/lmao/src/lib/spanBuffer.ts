@@ -35,7 +35,7 @@ import { checkCapacityTuning } from './capacityTuning.js';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { EagerColumnDescriptor } from './physicalLayoutPlan.js';
 import { LogSchema } from './schema/LogSchema.js';
-import type { MessageLayoutFamily } from './runtimeHint.js';
+import type { MessageLayoutFamily, MessagePhysicalLayout } from './runtimeHint.js';
 import type { SpanBufferStats } from './spanBufferStats.js';
 import { copyThreadIdTo, getThreadId } from './threadId.js';
 import type { ITraceRoot } from './traceRoot.js';
@@ -145,6 +145,7 @@ export interface SpanBufferConstructor<T extends LogSchema = LogSchema> {
   readonly schema: T;
   readonly stats: SpanBufferStats;
   readonly messageLayoutFamily: MessageLayoutFamily;
+  readonly messagePhysicalLayout: MessagePhysicalLayout;
   readonly eagerColumns: EagerColumnDescriptor;
 }
 //#endregion smoo/lmao!n/spanbuffer-layout.class-signature
@@ -199,12 +200,14 @@ function getSpanBufferConstructorForBuffer<T extends LogSchema>(buffer: SpanBuff
 function createSpanBufferConstructor<T extends LogSchema>(
   schema: T,
   messageLayoutFamily: MessageLayoutFamily,
+  messagePhysicalLayout: MessagePhysicalLayout,
   generatedClass: GeneratedSpanBufferClass<T>,
   eagerColumns: EagerColumnDescriptor,
 ): SpanBufferConstructor<T> {
   return Object.assign(generatedClass, {
     schema,
     messageLayoutFamily,
+    messagePhysicalLayout,
     eagerColumns,
     stats: {
       capacity: DEFAULT_BUFFER_CAPACITY,
@@ -219,23 +222,30 @@ function createSpanBufferConstructor<T extends LogSchema>(
  * Key is the schema object reference (WeakMap for GC).
  */
 const spanBufferClassCache = new WeakMap<LogSchema, Map<string, object>>();
-const staticStorageSchemas = new WeakMap<LogSchema, LogSchema>();
+const messageStorageSchemas = new WeakMap<LogSchema, Map<string, LogSchema>>();
 const EMPTY_EAGER_COLUMNS: EagerColumnDescriptor = Object.freeze({
   names: Object.freeze([]),
   words: Object.freeze([]),
   key: '',
 });
 
-function getStorageSchema(schema: LogSchema, messageLayoutFamily: MessageLayoutFamily): LogSchema {
-  if (messageLayoutFamily !== 'static-only') return schema;
-  let storageSchema = staticStorageSchemas.get(schema);
+function getStorageSchema(
+  schema: LogSchema,
+  messageLayoutFamily: MessageLayoutFamily,
+  messagePhysicalLayout: MessagePhysicalLayout,
+): LogSchema {
+  let byLayout = messageStorageSchemas.get(schema);
+  const key = `${messageLayoutFamily}:${messagePhysicalLayout}`;
+  let storageSchema = byLayout?.get(key);
   if (storageSchema === undefined) {
     const fields: Record<string, SchemaWithMetadata> = {};
     for (const [name, field] of schema._columns) {
       if (name !== 'message') fields[name] = field;
     }
     storageSchema = new LogSchema(fields);
-    staticStorageSchemas.set(schema, storageSchema);
+    byLayout ??= new Map();
+    byLayout.set(key, storageSchema);
+    messageStorageSchemas.set(schema, byLayout);
   }
   return storageSchema;
 }
@@ -256,12 +266,17 @@ function getStorageSchema(schema: LogSchema, messageLayoutFamily: MessageLayoutF
 export function getSpanBufferClass<T extends LogSchema>(
   schema: T,
   messageLayoutFamily: MessageLayoutFamily = 'mixed',
+  messagePhysicalLayout: MessagePhysicalLayout = 'current',
   eagerColumns: EagerColumnDescriptor = EMPTY_EAGER_COLUMNS,
 ): SpanBufferConstructor<T> {
-  const cacheKey = `${messageLayoutFamily}:${eagerColumns.key}`;
+  const cacheKey = `${messageLayoutFamily}:${messagePhysicalLayout}:${eagerColumns.key}`;
   let familyClasses = spanBufferClassCache.get(schema);
   const cached = familyClasses?.get(cacheKey);
-  if (isSpanBufferConstructorForSchema(cached, schema) && cached.messageLayoutFamily === messageLayoutFamily) {
+  if (
+    isSpanBufferConstructorForSchema(cached, schema) &&
+    cached.messageLayoutFamily === messageLayoutFamily &&
+    cached.messagePhysicalLayout === messagePhysicalLayout
+  ) {
     return cached;
   }
 
@@ -340,19 +355,34 @@ export function getSpanBufferClass<T extends LogSchema>(
        }
        const spanId = ++globalThis.globalSpanCounter;
        const threadId = isChained ? parent.thread_id : getThreadId();
+       void '${messagePhysicalLayout}';
 ` +
-      // Calculate exact system storage. Dynamic-only has no capacity-sized packed-header lane.
-      (messageLayoutFamily === 'dynamic-only'
-        ? `const systemSize = (requestedCapacity * 9 + 7) & ~7;
+      // Calculate exact physical system storage once for the generated class.
+      (messagePhysicalLayout === 'packed'
+        ? `const rowHeaderOffset = requestedCapacity * 8;
+       const systemSize = (requestedCapacity * 12 + 7) & ~7;
        let systemBuffer;
        let identityView;
 `
-        : `const logHeaderOffset = (requestedCapacity * 9 + 3) & ~3;
-       const rawSystemSize = logHeaderOffset + requestedCapacity * 4;
-       const systemSize = (rawSystemSize + 7) & ~7;
+        : messageLayoutFamily === 'dynamic-only'
+          ? `const messageValidityOffset = requestedCapacity * 9;
+       const systemSize = (messageValidityOffset + ((requestedCapacity + 7) >>> 3) + 7) & ~7;
        let systemBuffer;
        let identityView;
-`) +
+`
+          : messagePhysicalLayout === 'current'
+            ? `const messageIdOffset = (requestedCapacity * 9 + 1) & ~1;
+       const messageValidityOffset = messageIdOffset + requestedCapacity * 2;
+       const systemSize = (messageValidityOffset + ((requestedCapacity + 7) >>> 3) + 7) & ~7;
+       let systemBuffer;
+       let identityView;
+`
+            : `const logHeaderOffset = (requestedCapacity * 9 + 3) & ~3;
+       const messageValidityOffset = logHeaderOffset + requestedCapacity * 4;
+       const systemSize = (messageValidityOffset + ((requestedCapacity + 7) >>> 3) + 7) & ~7;
+       let systemBuffer;
+       let identityView;
+` ) +
       // CHAINED BUFFER: overflow storage for same logical span - shares parent identity
       `if (isChained) {
           systemBuffer = new ArrayBuffer(systemSize);
@@ -384,25 +414,48 @@ export function getSpanBufferClass<T extends LogSchema>(
           identityView.set(traceIdBytes, 13);
         }
 ` +
-      // Create exact family views. Headerless buffers never create a header view.
-      `const timestampView = new BigInt64Array(systemBuffer, 0, requestedCapacity);
+      // Create exact physical views. Packed classes never create split entry/header views.
+      (messagePhysicalLayout === 'packed'
+        ? `const timestampView = new BigInt64Array(systemBuffer, 0, requestedCapacity);
+       const rowHeaderView = new Uint32Array(systemBuffer, rowHeaderOffset, requestedCapacity);
+       timestampView.fill(0n);
+       rowHeaderView.fill(0);
+`
+        : `const timestampView = new BigInt64Array(systemBuffer, 0, requestedCapacity);
        const entryTypeView = new Uint8Array(systemBuffer, requestedCapacity * 8, requestedCapacity);
        timestampView.fill(0n);
        entryTypeView.fill(0);
+       const messageNullView = new Uint8Array(systemBuffer, messageValidityOffset, (requestedCapacity + 7) >>> 3);
+       messageNullView.fill(0);
 ` +
-      (messageLayoutFamily === 'dynamic-only'
-        ? ''
-        : `       const logHeaderView = new Uint32Array(systemBuffer, logHeaderOffset, requestedCapacity);
+          (messageLayoutFamily === 'dynamic-only'
+            ? ''
+            : messagePhysicalLayout === 'current'
+              ? `       const messageIdView = new Uint16Array(systemBuffer, messageIdOffset, requestedCapacity);
+       messageIdView.fill(0);
+`
+              : `       const logHeaderView = new Uint32Array(systemBuffer, logHeaderOffset, requestedCapacity);
        logHeaderView.fill(0);
-`) +
-      // Assign properties in optimal order for V8 in-object slots (see comment above)
+`)) +
+      // Assign properties in optimal order for V8 in-object slots.
       `this._writeIndex = 0;
        this._capacity = requestedCapacity;
        this._overflow = undefined;
        this.timestamp = timestampView;
-       this.entry_type = entryTypeView;
 ` +
-      (messageLayoutFamily === 'dynamic-only' ? '' : `       this._logHeaders = logHeaderView;
+      (messagePhysicalLayout === 'packed'
+        ? `       this._rowHeaders = rowHeaderView;
+`
+        : `       this.entry_type = entryTypeView;
+       this.message_nulls = messageNullView;
+` + (messageLayoutFamily === 'dynamic-only'
+          ? ''
+          : messagePhysicalLayout === 'current'
+            ? `       this._messageIds = messageIdView;
+`
+            : `       this._logHeaders = logHeaderView;
+`)) +
+      (messageLayoutFamily === 'static-only' ? '' : `       this.message_values = new Array(requestedCapacity);
 `) +
       `       this._vocabularyGeneration = vocabularyGeneration;
 ` +
@@ -485,6 +538,7 @@ export function getSpanBufferClass<T extends LogSchema>(
     }
     get _logSchema() { return this.constructor.schema; }
     get _messageLayoutFamily() { return this.constructor.messageLayoutFamily; }
+    get _messagePhysicalLayout() { return this.constructor.messagePhysicalLayout; }
     get _columns() { return this.constructor.schema._columns; }
     get _stats() { return this.constructor.stats; }
     _sealStats() {
@@ -513,19 +567,29 @@ export function getSpanBufferClass<T extends LogSchema>(
       else if (pos === 1) this._terminalMessage = val;
       else throw new RangeError('Static-only buffers only accept raw system messages at rows 0 and 1');
       return this;
-    }` : ''}
+    }` : `message(pos, val) {
+      this.message_values[pos] = val;
+      ${messagePhysicalLayout === 'packed' ? '' : 'this.message_nulls[pos >>> 3] |= 1 << (pos & 7);'}
+      return this;
+    }`}
     `,
   };
 
   // Generate class with arrow-builder
-  const generatedClass = getColumnBufferClass(getStorageSchema(schema, messageLayoutFamily), extension);
+  const generatedClass = getColumnBufferClass(getStorageSchema(schema, messageLayoutFamily, messagePhysicalLayout), extension);
   if (!isGeneratedSpanBufferClass<T>(generatedClass)) {
     throw new TypeError('Generated column buffer is missing SpanBuffer methods');
   }
 
   // Add static properties to the generated class
   // These are shared across all instances from the same defineOpContext
-  const SpanBufferClass = createSpanBufferConstructor(schema, messageLayoutFamily, generatedClass, eagerColumns);
+  const SpanBufferClass = createSpanBufferConstructor(
+    schema,
+    messageLayoutFamily,
+    messagePhysicalLayout,
+    generatedClass,
+    eagerColumns,
+  );
 
   // Cache for future use
   familyClasses ??= new Map();

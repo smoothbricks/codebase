@@ -36,13 +36,21 @@ describe('Binary Arrow Conversion', () => {
       const row0 = invokeWriterMethod(nextWriterRow(writer), 'payload', { action: 'click', x: 100, y: 200 });
       invokeWriterMethod(row0, 'requestId', 'req-1');
       buffer.timestamp[0] = 1000n;
-      buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      {
+        const entryTypes = buffer.entry_type;
+        if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+        entryTypes[0] = ENTRY_TYPE_SPAN_START;
+      };
 
       // Write row with a string payload
       const row1 = invokeWriterMethod(nextWriterRow(writer), 'payload', 'simple-string');
       invokeWriterMethod(row1, 'requestId', 'req-2');
       buffer.timestamp[1] = 2000n;
-      buffer.entry_type[1] = ENTRY_TYPE_INFO;
+      {
+        const entryTypes = buffer.entry_type;
+        if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+        entryTypes[1] = ENTRY_TYPE_INFO;
+      };
 
       buffer._writeIndex = 2;
 
@@ -89,7 +97,11 @@ describe('Binary Arrow Conversion', () => {
       };
       invokeWriterMethod(nextWriterRow(writer), 'request', requestData);
       buffer.timestamp[0] = 1000n;
-      buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      {
+        const entryTypes = buffer.entry_type;
+        if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+        entryTypes[0] = ENTRY_TYPE_SPAN_START;
+      };
       buffer._writeIndex = 1;
 
       const table = convertToArrowTable(buffer);
@@ -115,7 +127,11 @@ describe('Binary Arrow Conversion', () => {
       const rawBytes = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
       invokeWriterMethod(nextWriterRow(writer), 'rawData', rawBytes);
       buffer.timestamp[0] = 1000n;
-      buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      {
+        const entryTypes = buffer.entry_type;
+        if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+        entryTypes[0] = ENTRY_TYPE_SPAN_START;
+      };
       buffer._writeIndex = 1;
 
       const table = convertToArrowTable(buffer);
@@ -140,12 +156,20 @@ describe('Binary Arrow Conversion', () => {
       const firstRow = invokeWriterMethod(nextWriterRow(writer), 'payload', { key: 'value' });
       invokeWriterMethod(firstRow, 'requestId', 'req-1');
       buffer.timestamp[0] = 1000n;
-      buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      {
+        const entryTypes = buffer.entry_type;
+        if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+        entryTypes[0] = ENTRY_TYPE_SPAN_START;
+      };
 
       // Row 1: payload NOT set (null)
       invokeWriterMethod(nextWriterRow(writer), 'requestId', 'req-2');
       buffer.timestamp[1] = 2000n;
-      buffer.entry_type[1] = ENTRY_TYPE_INFO;
+      {
+        const entryTypes = buffer.entry_type;
+        if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+        entryTypes[1] = ENTRY_TYPE_INFO;
+      };
 
       buffer._writeIndex = 2;
 
@@ -182,7 +206,11 @@ describe('Binary Arrow Conversion', () => {
         'GET',
       );
       buffer.timestamp[0] = 1000n;
-      buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      {
+        const entryTypes = buffer.entry_type;
+        if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+        entryTypes[0] = ENTRY_TYPE_SPAN_START;
+      };
       buffer._writeIndex = 1;
 
       const table = convertToArrowTable(buffer);
@@ -211,7 +239,11 @@ describe('Binary Arrow Conversion', () => {
       const rootRow = invokeWriterMethod(nextWriterRow(rootWriter), 'payload', { level: 'root', data: [1, 2] });
       invokeWriterMethod(rootRow, 'userId', 'user-root');
       rootBuffer.timestamp[0] = 1000n;
-      rootBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      {
+        const entryTypes = rootBuffer.entry_type;
+        if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+        entryTypes[0] = ENTRY_TYPE_SPAN_START;
+      };
       rootBuffer._writeIndex = 1;
 
       // Create and register child buffer in the root trace topology.
@@ -226,7 +258,11 @@ describe('Binary Arrow Conversion', () => {
       const childRow = invokeWriterMethod(nextWriterRow(childWriter), 'payload', { level: 'child', nested: { a: 1 } });
       invokeWriterMethod(childRow, 'userId', 'user-child');
       childBuffer.timestamp[0] = 2000n;
-      childBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      {
+        const entryTypes = childBuffer.entry_type;
+        if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+        entryTypes[0] = ENTRY_TYPE_SPAN_START;
+      };
       childBuffer._writeIndex = 1;
 
       const table = convertSpanTreeToArrowTable(rootBuffer);
@@ -259,7 +295,11 @@ describe('Binary Arrow Conversion', () => {
 
       invokeWriterMethod(nextWriterRow(writer), 'payload', obj);
       buffer.timestamp[0] = 1000n;
-      buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      {
+        const entryTypes = buffer.entry_type;
+        if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+        entryTypes[0] = ENTRY_TYPE_SPAN_START;
+      };
       buffer._writeIndex = 1;
 
       // Mutate AFTER tagging -- Object.freeze should prevent this from affecting the stored reference
@@ -292,17 +332,29 @@ describe('Binary Arrow Conversion', () => {
       const rootRow0 = invokeWriterMethod(nextWriterRow(rootWriter), 'payload', { req: 1 });
       invokeWriterMethod(invokeWriterMethod(rootRow0, 'userId', 'user-A'), 'action', 'click');
       rootBuffer.timestamp[0] = 1000n;
-      rootBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      {
+        const entryTypes = rootBuffer.entry_type;
+        if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+        entryTypes[0] = ENTRY_TYPE_SPAN_START;
+      };
 
       const rootRow1 = invokeWriterMethod(nextWriterRow(rootWriter), 'payload', { req: 2 });
       invokeWriterMethod(invokeWriterMethod(rootRow1, 'userId', 'user-A'), 'action', 'scroll');
       rootBuffer.timestamp[1] = 2000n;
-      rootBuffer.entry_type[1] = ENTRY_TYPE_INFO;
+      {
+        const entryTypes = rootBuffer.entry_type;
+        if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+        entryTypes[1] = ENTRY_TYPE_INFO;
+      };
 
       const rootRow2 = invokeWriterMethod(nextWriterRow(rootWriter), 'payload', { req: 3 });
       invokeWriterMethod(invokeWriterMethod(rootRow2, 'userId', 'user-B'), 'action', 'click');
       rootBuffer.timestamp[2] = 3000n;
-      rootBuffer.entry_type[2] = ENTRY_TYPE_INFO;
+      {
+        const entryTypes = rootBuffer.entry_type;
+        if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+        entryTypes[2] = ENTRY_TYPE_INFO;
+      };
 
       rootBuffer._writeIndex = 3;
 
@@ -318,7 +370,11 @@ describe('Binary Arrow Conversion', () => {
       const childDataRow = invokeWriterMethod(nextWriterRow(childWriter), 'payload', { req: 4 });
       invokeWriterMethod(invokeWriterMethod(childDataRow, 'userId', 'user-B'), 'action', 'submit');
       childBuffer.timestamp[0] = 4000n;
-      childBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      {
+        const entryTypes = childBuffer.entry_type;
+        if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+        entryTypes[0] = ENTRY_TYPE_SPAN_START;
+      };
 
       childBuffer._writeIndex = 1;
 
@@ -381,7 +437,11 @@ describe('Binary Arrow Conversion', () => {
 
         invokeWriterMethod(nextWriterRow(writer), 'payload', testValue);
         buffer.timestamp[0] = 1000n;
-        buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+        {
+          const entryTypes = buffer.entry_type;
+          if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+          entryTypes[0] = ENTRY_TYPE_SPAN_START;
+        };
         buffer._writeIndex = 1;
 
         const table = convertToArrowTable(buffer);

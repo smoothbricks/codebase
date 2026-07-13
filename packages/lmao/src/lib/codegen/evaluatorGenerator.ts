@@ -8,7 +8,7 @@
 
 import { isRecord } from '@smoothbricks/validation';
 import type { OpContext } from '../opContext/types.js';
-import { resolveMessage } from '../resolveMessage.js';
+import { resolveEntryType, resolveMessage } from '../resolveMessage.js';
 import type { FeatureFlagSchema } from '../schema/defineFeatureFlags.js';
 import type {
   FlagEvaluator,
@@ -188,7 +188,7 @@ class WorkerSafeGeneratedEvaluator<Ctx extends OpContext> implements GeneratedEv
     while (buf) {
       const limit = buf._writeIndex;
       for (let i = limit - 1; i >= 0; i--) {
-        if (buf.entry_type[i] === this.#entryTypeFfAccess && resolveMessage(buf, i) === flagName) {
+        if (resolveEntryType(buf, i) === this.#entryTypeFfAccess && resolveMessage(buf, i) === flagName) {
           return true;
         }
       }

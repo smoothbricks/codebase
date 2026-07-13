@@ -51,6 +51,7 @@ import { createArrowLease, type ArrowLease } from './arrow/lease.js';
 import {
   appendVocabularyDictionarySuffix,
   getVocabularyDictionaryPrefix,
+  PREBUILT_ENTRY_TYPE_DICTIONARY,
 } from './arrow/vocabularyDictionary.js';
 import {
   calculateUtf8Offsets,
@@ -66,8 +67,13 @@ import {
   resolveEnumLookupDescriptor,
 } from './enumMetadata.js';
 import type { RemapDescriptor } from './logBinding.js';
-import { resolveMessage } from './resolveMessage.js';
-import { ENTRY_TYPE_NAMES, SYSTEM_SCHEMA_FIELD_NAMES } from './schema/systemSchema.js';
+import { resolveEntryType, resolveMessage } from './resolveMessage.js';
+import {
+  ENTRY_TYPE_ERROR,
+  ENTRY_TYPE_SPAN_START,
+  ENTRY_TYPE_TRACE,
+  SYSTEM_SCHEMA_FIELD_NAMES,
+} from './schema/systemSchema.js';
 import { getBinaryEncoder, getEnumUtf8, getSchemaType } from './schema/typeGuards.js';
 import type { LogSchema } from './schema/types.js';
 import type { AnySpanBuffer, OpMetadata } from './types.js';
@@ -80,6 +86,7 @@ const F64Array = Float64Array;
 
 type BuiltArrowColumn = { column: Column<unknown>; nullCount: number };
 type BuiltMetadataColumns = { fields: string[]; vectors: Column<unknown>[] };
+type BuiltMessageColumn = { column: Column<unknown>; entryTypeIndices?: Int8Array };
 type RemapsByBuffer = WeakMap<AnySpanBuffer, RemapDescriptor>;
 
 export type SystemColumnBuilder = (
@@ -254,11 +261,39 @@ function indexTypeForCount(count: number): IntType {
   return uint32();
 }
 
+function assertStaticMessageKind(
+  buffer: AnySpanBuffer,
+  row: number,
+  entryType: number,
+  denseIndex: number,
+): void {
+  const generation = buffer._vocabularyGeneration;
+  if (denseIndex >= generation.ids.length) {
+    throw new Error(`Invalid vocabulary dense index ${denseIndex} for generation ${generation.generation}`);
+  }
+  const expectedKind =
+    entryType === ENTRY_TYPE_SPAN_START
+      ? 2
+      : entryType >= ENTRY_TYPE_TRACE && entryType <= ENTRY_TYPE_ERROR
+        ? 1
+        : 0;
+  if (expectedKind === 0) {
+    throw new Error(`Entry type ${entryType} at row ${row} cannot carry a static vocabulary identity`);
+  }
+  const actualKind = generation.kindTags[denseIndex];
+  if (actualKind !== expectedKind) {
+    throw new Error(
+      `Vocabulary kind ${actualKind} at dense index ${denseIndex} does not match entry type ${entryType} at row ${row}`,
+    );
+  }
+}
+
 function buildMessageColumn(
   buffers: AnySpanBuffer[],
   totalRows: number,
   dictionaryId?: number,
-): Column<unknown> {
+  materializeEntryTypes = true,
+): BuiltMessageColumn {
   let generation = buffers[0]._vocabularyGeneration;
   for (let index = 1; index < buffers.length; index++) {
     const candidate = buffers[index]._vocabularyGeneration;
@@ -266,6 +301,7 @@ function buildMessageColumn(
   }
   const prefix = getVocabularyDictionaryPrefix(generation);
   const indices = new Uint32Array(totalRows);
+  const entryTypeIndices = materializeEntryTypes ? new Int8Array(totalRows) : undefined;
   const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
   let nullCount = 0;
   let rowOffset = 0;
@@ -273,27 +309,74 @@ function buildMessageColumn(
   let suffixIndices: Map<string, number> | undefined;
 
   for (const buffer of buffers) {
-    const headers = buffer._logHeaders;
+    const plannedStorage = buffer._opMetadata._physicalLayoutPlan?.arrowExposure.messageIdentityStorage;
+    const messageIdentityStorage =
+      plannedStorage ??
+      (buffer._messagePhysicalLayout === 'current'
+        ? 'local-u16'
+        : buffer._messagePhysicalLayout === 'specialized'
+          ? 'global-u32'
+          : 'packed-row-headers');
     for (let row = 0; row < buffer._writeIndex; row++) {
       const outputRow = rowOffset + row;
-      const header =
+      const hasDedicatedMessage =
         (row === 0 && buffer._spanName !== undefined) ||
-        (row === 1 && buffer._terminalMessage !== undefined) ||
-        headers === undefined
-          ? 0
-          : headers[row];
-      let dictionaryIndex: number;
-      if (header !== 0) {
-        const headerEntryType = header & 0xff;
-        if (headerEntryType !== buffer.entry_type[row]) {
-          throw new Error(`Log header entry type ${headerEntryType} does not match row ${row}`);
+        (row === 1 && buffer._terminalMessage !== undefined);
+      let dictionaryIndex: number | undefined;
+      let entryType: number;
+
+      if (messageIdentityStorage === 'local-u16') {
+        entryType = resolveEntryType(buffer, row);
+        const messageIds = buffer._messageIds;
+        const validity = buffer.message_nulls;
+        if (messageIds === undefined || validity === undefined) {
+          throw new TypeError('Local message layout is missing its Uint16 ID lane or validity bitmap');
         }
-        dictionaryIndex = header >>> 8;
-        if (dictionaryIndex >= buffer._vocabularyGeneration.ids.length) {
-          throw new Error(
-            `Invalid vocabulary dense index ${dictionaryIndex} for generation ${buffer._vocabularyGeneration.generation}`,
-          );
+        const localId = messageIds[row];
+        const identityValid = (validity[row >>> 3] & (1 << (row & 7))) !== 0;
+        if (row === 0 && typeof buffer._spanName === 'number') {
+          if (identityValid && localId !== 0) {
+            throw new Error(`Local row ${row} has conflicting static message identities`);
+          }
+          dictionaryIndex = buffer._spanName;
+        } else if (identityValid && localId !== 0) {
+          if (hasDedicatedMessage || buffer.message_values?.[row] !== undefined) {
+            throw new Error(`Local row ${row} has conflicting static and raw message storage`);
+          }
+          dictionaryIndex = buffer._opMetadata._physicalLayoutPlan?.localMessageDictionary[localId - 1];
+          if (dictionaryIndex === undefined) throw new Error(`Missing local message dictionary entry ${localId}`);
         }
+      } else if (messageIdentityStorage === 'global-u32') {
+        entryType = resolveEntryType(buffer, row);
+        const globalDenseIndices = buffer._logHeaders;
+        const validity = buffer.message_nulls;
+        if (globalDenseIndices === undefined || validity === undefined) {
+          throw new TypeError('Global message layout is missing its dense-ID lane or validity bitmap');
+        }
+        const identityValid = (validity[row >>> 3] & (1 << (row & 7))) !== 0;
+        if (identityValid && buffer.message_values?.[row] === undefined) {
+          if (hasDedicatedMessage) {
+            throw new Error(`Global row ${row} has conflicting static and dedicated message storage`);
+          }
+          dictionaryIndex = globalDenseIndices[row];
+        }
+      } else {
+        const rowHeaders = buffer._rowHeaders;
+        if (rowHeaders === undefined) throw new TypeError('Packed message layout is missing row headers');
+        const header = rowHeaders[row];
+        entryType = header & 0xff;
+        const encodedDenseIndex = header >>> 8;
+        if (encodedDenseIndex !== 0) {
+          if (hasDedicatedMessage) {
+            throw new Error(`Packed row ${row} has conflicting static and dedicated message storage`);
+          }
+          dictionaryIndex = encodedDenseIndex - 1;
+        }
+      }
+
+      if (entryTypeIndices !== undefined) entryTypeIndices[outputRow] = entryType;
+      if (dictionaryIndex !== undefined) {
+        assertStaticMessageKind(buffer, row, entryType, dictionaryIndex);
       } else {
         const message = resolveMessage(buffer, row);
         if (message === undefined) {
@@ -337,20 +420,23 @@ function buildMessageColumn(
     messageDictionary = appendVocabularyDictionarySuffix(prefix, suffix, suffixValues);
   }
 
-  return buildColumn(
-    buildData({
-      type:
-        dictionaryId === undefined
-          ? dictionary(utf8(), uint32())
-          : dictionary(utf8(), uint32(), false, dictionaryId),
-      offset: 0,
-      length: totalRows,
-      nullCount,
-      data: indices,
-      nullBitmap: nullCount > 0 ? nullBitmap : undefined,
-      dictionary: messageDictionary,
-    }),
-  );
+  return {
+    column: buildColumn(
+      buildData({
+        type:
+          dictionaryId === undefined
+            ? dictionary(utf8(), uint32())
+            : dictionary(utf8(), uint32(), false, dictionaryId),
+        offset: 0,
+        length: totalRows,
+        nullCount,
+        data: indices,
+        nullBitmap: nullCount > 0 ? nullBitmap : undefined,
+        dictionary: messageDictionary,
+      }),
+    ),
+    entryTypeIndices,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -485,6 +571,17 @@ function buildTimestampColumn(
   );
 }
 
+
+function canBorrowEntryTypeChunks(buffers: AnySpanBuffer[], borrowChunks: boolean): boolean {
+  return (
+    borrowChunks &&
+    buffers.every((buffer) => {
+      const declared = buffer._opMetadata._physicalLayoutPlan?.arrowExposure.entryTypeStorage;
+      return declared === 'borrowed-u8' || (declared === undefined && buffer.entry_type !== undefined);
+    })
+  );
+}
+
 function buildEntryTypeColumn(
   buffers: AnySpanBuffer[],
   totalRows: number,
@@ -492,21 +589,14 @@ function buildEntryTypeColumn(
   vectors: Column<unknown>[],
   dictType?: ReturnType<typeof dictionary>,
   borrowChunks = false,
+  classifiedEntryTypes?: Int8Array,
 ): void {
-  const entryTypeDictData = buildData({
-    type: utf8(),
-    offset: 0,
-    length: ENTRY_TYPE_NAMES.length,
-    nullCount: 0,
-    valueOffsets: calculateUtf8Offsets(ENTRY_TYPE_NAMES),
-    data: encodeUtf8Strings(ENTRY_TYPE_NAMES),
-  });
-  const entryTypeDictionary = buildColumn(entryTypeDictData);
+  const entryTypeDictionary = PREBUILT_ENTRY_TYPE_DICTIONARY;
   const type = dictType ?? dictionary(utf8(), int8());
   fields.push('entry_type');
-  if (borrowChunks) {
+  if (canBorrowEntryTypeChunks(buffers, borrowChunks)) {
     const chunks = buffers.map((buffer) => {
-      const source = buffer.entry_type;
+      const source = buffer.entry_type!;
       const values = new Int8Array(source.buffer, source.byteOffset, buffer._writeIndex);
       return buildColumn(
         buildData({ type, offset: 0, length: buffer._writeIndex, nullCount: 0, data: values, dictionary: entryTypeDictionary }),
@@ -515,11 +605,14 @@ function buildEntryTypeColumn(
     vectors.push(combineColumnChunks(chunks));
     return;
   }
-  const entryTypeIndices = new Int8Array(totalRows);
-  let offset = 0;
-  for (const buffer of buffers) {
-    entryTypeIndices.set(buffer.entry_type.subarray(0, buffer._writeIndex), offset);
-    offset += buffer._writeIndex;
+  const entryTypeIndices = classifiedEntryTypes ?? new Int8Array(totalRows);
+  if (classifiedEntryTypes === undefined) {
+    let offset = 0;
+    for (const buffer of buffers) {
+      for (let row = 0; row < buffer._writeIndex; row++) {
+        entryTypeIndices[offset++] = resolveEntryType(buffer, row);
+      }
+    }
   }
   vectors.push(
     buildColumn(
@@ -728,15 +821,22 @@ function convertBuffersToTable(
     fields.push(...systemColumns.fields);
     vectors.push(...systemColumns.vectors);
   } else {
-    // Build metadata columns - returns both fields and vectors with matching types
-    const metadataResult = buildMetadataColumnsWithFields(buffers, totalRows, borrowChunks);
+    const borrowEntryTypes = canBorrowEntryTypeChunks(buffers, borrowChunks);
+    const messageResult = buildMessageColumn(buffers, totalRows, undefined, !borrowEntryTypes);
+    // Build metadata columns - returns both fields and vectors with matching types.
+    const metadataResult = buildMetadataColumnsWithFields(
+      buffers,
+      totalRows,
+      borrowChunks,
+      messageResult.entryTypeIndices,
+    );
     fields.push(...metadataResult.fields);
     vectors.push(...metadataResult.vectors);
 
     // Static vocabulary values form an immutable prefix. Only raw messages
     // missing from that prefix are interned into a first-seen suffix.
     fields.push('message');
-    vectors.push(buildMessageColumn(buffers, totalRows));
+    vectors.push(messageResult.column);
   }
 
   // Build user attribute vectors
@@ -982,6 +1082,7 @@ function buildMetadataColumnsWithFields(
   buffers: AnySpanBuffer[],
   totalRows: number,
   borrowChunks = false,
+  classifiedEntryTypes?: Int8Array,
 ): BuiltMetadataColumns {
   const fields: string[] = [];
   const vectors: Column<unknown>[] = [];
@@ -1039,7 +1140,7 @@ function buildMetadataColumnsWithFields(
   buildNonDictIdentityColumns(buffers, totalRows, fields, vectors);
 
   // 7. Entry type
-  buildEntryTypeColumn(buffers, totalRows, fields, vectors, undefined, borrowChunks);
+  buildEntryTypeColumn(buffers, totalRows, fields, vectors, undefined, borrowChunks, classifiedEntryTypes);
 
   // 8-10. Per-buffer metadata columns (package_name, package_file, git_sha)
   for (const [fieldName, metadataGetter] of [
@@ -1448,6 +1549,8 @@ function convertBuffersWithSharedDicts(
   const totalRows = buffers.reduce((sum, buf) => sum + buf._writeIndex, 0);
   const fields: string[] = [];
   const vectors: Column<unknown>[] = [];
+  const borrowEntryTypes = canBorrowEntryTypeChunks(buffers, borrowChunks);
+  const messageResult = buildMessageColumn(buffers, totalRows, 5, !borrowEntryTypes);
 
   // Dictionary types with explicit IDs for IPC serialization
   const traceIdType = dictionary(utf8(), traceIdDict.arrowIndexType, false, 0);
@@ -1497,7 +1600,15 @@ function convertBuffersWithSharedDicts(
   buildNonDictIdentityColumns(buffers, totalRows, fields, vectors);
 
   // 7. Entry type (with explicit dictionary ID for IPC)
-  buildEntryTypeColumn(buffers, totalRows, fields, vectors, entryTypeDictType, borrowChunks);
+  buildEntryTypeColumn(
+    buffers,
+    totalRows,
+    fields,
+    vectors,
+    entryTypeDictType,
+    borrowChunks,
+    messageResult.entryTypeIndices,
+  );
 
   // 8-10. Per-buffer metadata columns using shared pre-built dictionaries
   // Per specs/lmao/01c_context_flow_and_op_wrappers.md:
@@ -1529,7 +1640,7 @@ function convertBuffersWithSharedDicts(
   // ═══════════════════════════════════════════════════════════════════════════
 
   // System attribute column: message (at fixed position 10, before user attributes)
-  vectors.push(buildMessageColumn(buffers, totalRows, 5));
+  vectors.push(messageResult.column);
   fields.push('message');
 
   // System attribute column: uint64_value (for buffer metrics - op durations, counts, etc.)

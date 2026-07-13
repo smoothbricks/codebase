@@ -195,7 +195,12 @@ func containsTemplateIDLane(values []string) bool {
 	return false
 }
 
-func emittedLogBlock(level string, templateID globalVocabularyID) *shimast.Node {
+func emittedLogBlock(
+	level string,
+	templateID globalVocabularyID,
+	physicalLayout callMessagePhysicalLayout,
+	localMessageID uint16,
+) *shimast.Node {
 	list := factory.NewNodeList([]*shimast.Node{factory.NewExpressionStatement(ident("placeholder"))})
 	transformer := &fileTransformer{}
 	if templateID != 0 {
@@ -208,13 +213,15 @@ func emittedLogBlock(level string, templateID globalVocabularyID) *shimast.Node 
 		logExpr:    propAccess(ident("ctx"), "log"),
 		level:      level,
 		message:    callExpr(ident("dynamicMessage"), nil),
-		templateID: templateID,
+		templateID:       templateID,
+		physicalLayout:   physicalLayout,
+		localMessageID:   localMessageID,
 	}})
 	return list.Nodes[0]
 }
 
 func TestCompileMetadataExcludesRemovedPerOpTemplateTable(t *testing.T) {
-	node := compileMetadataNode(opCompileAnalysis{runtimeHint: 123})
+	node := (&fileTransformer{}).compileMetadataNode(opCompileAnalysis{runtimeHint: 123})
 	if strings := collectNodeText(node, shimast.KindStringLiteral); len(strings) != 0 {
 		t.Fatalf("compile metadata retained obsolete per-Op template strings: %q", strings)
 	}
@@ -228,7 +235,7 @@ func TestCompileMetadataExcludesRemovedPerOpTemplateTable(t *testing.T) {
 	}
 }
 
-func TestLiteralLogInlineUsesRegisteredHeaderOperandForEveryLevel(t *testing.T) {
+func TestSpecializedLiteralLogInlineUsesRegisteredDenseOperandForEveryLevel(t *testing.T) {
 	entryTypes := map[string]string{
 		"info":  "8",
 		"debug": "7",
@@ -238,27 +245,27 @@ func TestLiteralLogInlineUsesRegisteredHeaderOperandForEveryLevel(t *testing.T) 
 	}
 	for level, entryType := range entryTypes {
 		t.Run(level, func(t *testing.T) {
-			block := emittedLogBlock(level, 37)
+			block := emittedLogBlock(level, 37, callMessagePhysicalSpecialized, 0)
 			identifiers := collectNodeText(block, shimast.KindIdentifier)
-			if !containsText(identifiers, "_logHeaders") || !containsText(identifiers, "vocabularyBinding") {
-				t.Fatalf("%s literal inline does not pack the registered binding operand into _logHeaders: %q", level, identifiers)
+			if !containsText(identifiers, "_logHeaders") || !containsText(identifiers, "vocabularyBinding") || !containsText(identifiers, "message_nulls") {
+				t.Fatalf("%s specialized inline omitted dense or validity storage: %q", level, identifiers)
 			}
-			if containsTemplateIDLane(identifiers) || containsText(identifiers, "message_values") || containsText(identifiers, "message_nulls") {
-				t.Fatalf("%s literal inline writes a separate template-ID lane or dynamic message storage: %q", level, identifiers)
+			if containsTemplateIDLane(identifiers) || containsText(identifiers, "message_values") || containsText(identifiers, "_messageIds") || containsText(identifiers, "_rowHeaders") {
+				t.Fatalf("%s specialized inline wrote a lane from another physical mode: %q", level, identifiers)
 			}
 			numbers := collectNodeText(block, shimast.KindNumericLiteral)
 			if !containsText(numbers, "4") || containsText(numbers, "37") {
-				t.Fatalf("%s literal inline numeric values = %q, want fragment ordinal 4 and no global ID 37", level, numbers)
+				t.Fatalf("%s specialized inline numeric values = %q, want fragment ordinal 4 and no global ID 37", level, numbers)
 			}
 			if !containsText(numbers, entryType) {
-				t.Fatalf("%s literal inline numeric values = %q, want entry type %s", level, numbers, entryType)
+				t.Fatalf("%s specialized inline numeric values = %q, want entry type %s", level, numbers, entryType)
 			}
 		})
 	}
 }
 
 func TestDynamicLogInlineKeepsSingleMessageEvaluationAndSentinelLaneClear(t *testing.T) {
-	block := emittedLogBlock("info", 0)
+	block := emittedLogBlock("info", 0, callMessagePhysicalSpecialized, 0)
 	identifiers := collectNodeText(block, shimast.KindIdentifier)
 	if containsTemplateIDLane(identifiers) {
 		t.Fatalf("dynamic inline unexpectedly writes a separate template-ID lane: %q", identifiers)
@@ -301,11 +308,11 @@ function createFactoryOps() {
 		t.Fatalf("factory-local vocabulary registration missing\n%s", output)
 	}
 	binding := registration[1]
-	if strings.Count(output, "_state._appendWriterEntry(") != 3 || strings.Count(output, "_state._buffer") != 3 || strings.Count(output, "_logHeaders[$$i]") != 3 {
-		t.Fatalf("factory-local static logs did not lower through the state-owned packed-header seam\n%s", output)
+	if strings.Count(output, "_state._appendWriterEntry(") != 3 || strings.Count(output, "_state._buffer") != 3 || strings.Count(output, "_messageIds[$$i]") != 3 || strings.Count(output, "message_nulls") != 3 {
+		t.Fatalf("factory-local static logs did not lower through current local-ID plus validity storage\n%s", output)
 	}
 	if strings.Count(output, binding+"[") != 4 {
-		t.Fatalf("registered binding uses = %d, want one packed-header operand per static log and one span operand\n%s", strings.Count(output, binding+"["), output)
+		t.Fatalf("registered binding uses = %d, want one vocabulary lookup per static log and one span operand\n%s", strings.Count(output, binding+"["), output)
 	}
 	if strings.Contains(output, "TemplateIds") {
 		t.Fatalf("a separate template-ID lane survived global vocabulary lowering\n%s", output)
@@ -448,8 +455,8 @@ defineOp('structured', (ctx) => {
 	if strings.Contains(output, "jobId:") || strings.Contains(output, "elapsedMs:") {
 		t.Fatalf("structured lowering retained an allocating object literal\n%s", output)
 	}
-	if !strings.Contains(output, "_logHeaders") || !strings.Contains(output, "jobId_values") {
-		t.Fatalf("structured lowering must write the vocabulary ID and fixed schema field directly\n%s", output)
+	if !strings.Contains(output, "_messageIds") || !strings.Contains(output, "jobId_values") {
+		t.Fatalf("current structured lowering must write the callsite-local message ID and fixed schema field directly\n%s", output)
 	}
 }
 

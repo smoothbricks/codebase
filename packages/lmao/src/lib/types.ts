@@ -18,7 +18,7 @@ import type {
   Nanoseconds,
   TypedArray,
 } from '@smoothbricks/arrow-builder';
-import type { MessageLayoutFamily } from './runtimeHint.js';
+import type { MessageLayoutFamily, MessagePhysicalLayout } from './runtimeHint.js';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { LogSchema } from './schema/LogSchema.js';
 import type { InferSchema } from './schema/types.js';
@@ -109,21 +109,25 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
    */
   readonly timestamp: BigInt64Array;
 
-  /**
-   * Entry type enum for each row (Uint8Array, 1 byte per entry).
-   *
-   * Per specs/lmao/01h_entry_types_and_logging_primitives.md:
-   * Values are ENTRY_TYPE_* constants (span-start=1, span-ok=2, etc.)
-   */
-  readonly entry_type: Uint8Array;
+  /** Current and specialized layouts expose this direct lane; packed uses `resolveEntryType`. */
+  readonly entry_type?: Uint8Array;
 
-  /** Packed static-message headers. Omitted by the dynamic-only physical family. */
+  /** Current-mode buffer-local template IDs. Zero selects the raw reference lane. */
+  readonly _messageIds?: Uint16Array;
+
+
+  /** Specialized global dense message identities. Zero selects the raw reference lane. */
   readonly _logHeaders?: Uint32Array;
 
-  /** Immutable vocabulary generation against which `_logHeaders` dense indices resolve. */
+  /** Packed row headers: low 8 bits entry type, high 24 bits dense message index plus one. */
+  readonly _rowHeaders?: Uint32Array;
+
+  /** Immutable vocabulary generation against which packed message indices resolve. */
   readonly _vocabularyGeneration: VocabularyGeneration;
-  /** Concrete physical message family selected once for this buffer constructor. */
+  /** Concrete semantic message family selected once for this buffer constructor. */
   readonly _messageLayoutFamily: MessageLayoutFamily;
+  /** Concrete physical row layout selected once for this buffer constructor. */
+  readonly _messagePhysicalLayout: MessagePhysicalLayout;
 
   /** Dedicated row-0 span name used when the selected capacity lane cannot represent it. */
   _spanName?: string | number;
