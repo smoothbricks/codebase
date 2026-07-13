@@ -66,19 +66,23 @@ fn lock_is_busy(mode: LockMode, kind: io::ErrorKind) -> bool {
     matches!((mode, kind), (LockMode::Try, io::ErrorKind::WouldBlock))
 }
 
-pub struct ImageLockGuard {
-    files: Vec<File>,
+fn should_create_directory(fd: libc::c_int, kind: io::ErrorKind) -> bool {
+    matches!((fd_failed(fd), kind), (true, io::ErrorKind::NotFound))
 }
 
-impl Drop for ImageLockGuard {
-    fn drop(&mut self) {
-        const UNLOCK_OPERATION: libc::c_int = libc::LOCK_UN;
-        for file in self.files.iter().rev() {
-            unsafe {
-                let _ = libc::flock(file.as_raw_fd(), UNLOCK_OPERATION);
-            }
-        }
-    }
+fn mkdir_failed(result: libc::c_int, kind: io::ErrorKind) -> bool {
+    !matches!(
+        (fd_failed(result), kind),
+        (false, _) | (true, io::ErrorKind::AlreadyExists)
+    )
+}
+
+fn should_retry_lock(kind: io::ErrorKind) -> bool {
+    matches!(kind, io::ErrorKind::Interrupted)
+}
+
+pub struct ImageLockGuard {
+    files: Vec<File>,
 }
 
 fn path_component(value: &std::ffi::OsStr, path: &Path) -> Result<CString, ApfsStorageError> {
@@ -133,7 +137,7 @@ fn open_lock_file(root: &Path, path: &Path) -> Result<File, ApfsStorageError> {
         }
         let mut fd =
             unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), DIRECTORY_OPEN_FLAGS) };
-        if fd_failed(fd) && io::Error::last_os_error().kind() == io::ErrorKind::NotFound {
+        if should_create_directory(fd, io::Error::last_os_error().kind()) {
             let created = unsafe {
                 libc::mkdirat(
                     directory.as_raw_fd(),
@@ -141,9 +145,7 @@ fn open_lock_file(root: &Path, path: &Path) -> Result<File, ApfsStorageError> {
                     CONTROLLER_DIRECTORY_MODE,
                 )
             };
-            if fd_failed(created)
-                && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
-            {
+            if mkdir_failed(created, io::Error::last_os_error().kind()) {
                 return Err(io_error(
                     "create controller directory without following symlinks",
                     path,
@@ -189,7 +191,7 @@ fn acquire_image_locks(
                 break;
             }
             let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
+            if should_retry_lock(error.kind()) {
                 continue;
             }
             if lock_is_busy(mode, error.kind()) {
@@ -2776,6 +2778,29 @@ mod tests {
             (LockMode::Wait, io::ErrorKind::Other, false),
         ] {
             assert_eq!(lock_is_busy(mode, kind), busy, "{mode:?}/{kind:?}");
+        }
+        for (fd, kind, create) in [
+            (-1, io::ErrorKind::NotFound, true),
+            (-1, io::ErrorKind::PermissionDenied, false),
+            (0, io::ErrorKind::NotFound, false),
+            (0, io::ErrorKind::Other, false),
+        ] {
+            assert_eq!(should_create_directory(fd, kind), create);
+        }
+        for (result, kind, failed) in [
+            (-1, io::ErrorKind::PermissionDenied, true),
+            (-1, io::ErrorKind::AlreadyExists, false),
+            (0, io::ErrorKind::PermissionDenied, false),
+            (0, io::ErrorKind::Other, false),
+        ] {
+            assert_eq!(mkdir_failed(result, kind), failed);
+        }
+        for (kind, retry) in [
+            (io::ErrorKind::Interrupted, true),
+            (io::ErrorKind::WouldBlock, false),
+            (io::ErrorKind::Other, false),
+        ] {
+            assert_eq!(should_retry_lock(kind), retry);
         }
     }
 
