@@ -6,15 +6,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cowshed_core::api::{
     AdmissionCommitment, BinaryData, CONTROLLER_COMMITMENT_VERSION, ControllerCommitment, JobId,
-    JobState, MAX_INLINE_OUTPUT_BYTES, OutputStorage, OutputSummary, ProtectedOutput, Sha256Digest,
-    StreamInfo, TerminalCommitment, WorkspaceIncarnation, WorkspacePath,
+    JobState, MAX_INLINE_OUTPUT_BYTES, OutputPublication, OutputStorage, OutputSummary,
+    ProtectedOutput, PublicationPolicy, Sha256Digest, StreamInfo, TerminalCommitment,
+    WorkspaceIncarnation, WorkspacePath,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::job_artifact::{
     ArtifactConfig, ArtifactError, ArtifactStore, CommitmentPriorContext, OutputTargets,
-    ProtectedRecord, StreamTarget, controller_commitment_schema, controller_commitments_from_batch,
-    controller_commitments_to_batch, read_stream, reconcile_commitments, recover_records,
-    validate_commitments,
+    ProtectedRecord, PublicationStage, StreamKind, StreamTarget, controller_commitment_schema,
+    controller_commitments_from_batch, controller_commitments_to_batch, read_stream,
+    reconcile_commitments, recover_records, validate_commitments,
 };
 use proptest::prelude::*;
 
@@ -214,7 +215,6 @@ fn many_tiny_live_buffers_never_exceed_supervisor_retained_budget() {
     drop(writers);
     assert_eq!(store.buffered_bytes(), 0);
 }
-
 
 #[test]
 fn combined_quota_accepts_exact_boundary_and_reports_first_crossing() {
@@ -541,6 +541,177 @@ fn controller_commitment_arrow_is_payload_free_and_round_trips_lineage() {
             "controller JSON leaked {forbidden}"
         );
     }
+}
+
+#[test]
+fn sealed_output_publication_is_atomic_independent_and_policy_checked() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = TempRoot::new("publication");
+    fs::create_dir(root.path().join("published")).unwrap();
+    let initial_store = store(
+        root.path(),
+        ArtifactConfig {
+            inline_cap_bytes: 4,
+            ..ArtifactConfig::default()
+        },
+    );
+    let mut writer = initial_store
+        .start_job(1, OutputTargets::default())
+        .unwrap();
+    writer.write_stdout(b"sealed output").unwrap();
+    let sealed = writer
+        .seal(JobState::Exited, summary(""), summary(""))
+        .unwrap();
+    let protected = match sealed.record.stdout.storage.artifact() {
+        ProtectedOutput::File { path } => root.path().join(path.as_path()),
+        ProtectedOutput::Inline { .. } => panic!("expected promoted protected output"),
+    };
+    drop(initial_store);
+    let store = store(
+        root.path(),
+        ArtifactConfig {
+            inline_cap_bytes: 4,
+            ..ArtifactConfig::default()
+        },
+    );
+    let publication = OutputPublication {
+        path: WorkspacePath::new("published/stdout.txt").unwrap(),
+        policy: PublicationPolicy::CreateNew,
+    };
+
+    store
+        .publish_output(sealed.record.job_id, StreamKind::Stdout, &publication)
+        .unwrap();
+    let destination = root.path().join(publication.path.as_path());
+    assert_eq!(fs::read(&destination).unwrap(), b"sealed output");
+    assert_ne!(
+        fs::metadata(&protected).unwrap().ino(),
+        fs::metadata(&destination).unwrap().ino()
+    );
+    assert_eq!(
+        fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    fs::write(&destination, b"caller mutation").unwrap();
+    assert_eq!(
+        read_stream(root.path(), &sealed.record.stdout).unwrap(),
+        b"sealed output"
+    );
+    let error = store
+        .publish_output(sealed.record.job_id, StreamKind::Stdout, &publication)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ArtifactError::Publication {
+            stage: PublicationStage::Publish,
+            ..
+        }
+    ));
+    assert_eq!(fs::read(&destination).unwrap(), b"caller mutation");
+
+    let replace = OutputPublication {
+        policy: PublicationPolicy::Replace,
+        ..publication
+    };
+    store
+        .publish_output(sealed.record.job_id, StreamKind::Stdout, &replace)
+        .unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), b"sealed output");
+    assert!(
+        fs::read_dir(root.path().join("published"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("cowshed-publish"))
+    );
+}
+
+#[test]
+fn output_publication_rejects_control_paths_symlinks_and_corrupt_evidence() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempRoot::new("publication-deny");
+    fs::create_dir(root.path().join("published")).unwrap();
+    fs::create_dir(root.path().join("outside")).unwrap();
+    symlink(root.path().join("outside"), root.path().join("linked")).unwrap();
+    let store = store(
+        root.path(),
+        ArtifactConfig {
+            inline_cap_bytes: 1,
+            ..ArtifactConfig::default()
+        },
+    );
+    let mut writer = store.start_job(1, OutputTargets::default()).unwrap();
+    writer.write_stdout(b"authority").unwrap();
+    let sealed = writer
+        .seal(JobState::Exited, summary(""), summary(""))
+        .unwrap();
+
+    for path in [".cowshed/leak", "linked/leak"] {
+        let error = store
+            .publish_output(
+                sealed.record.job_id,
+                StreamKind::Stdout,
+                &OutputPublication {
+                    path: WorkspacePath::new(path).unwrap(),
+                    policy: PublicationPolicy::CreateNew,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ArtifactError::Publication {
+                stage: PublicationStage::ValidateDestination,
+                ..
+            }
+        ));
+    }
+
+    let uncommitted = OutputPublication {
+        path: WorkspacePath::new("published/uncommitted.txt").unwrap(),
+        policy: PublicationPolicy::CreateNew,
+    };
+    assert!(matches!(
+        store.publish_output(JobId::new(99).unwrap(), StreamKind::Stdout, &uncommitted),
+        Err(ArtifactError::Publication {
+            stage: PublicationStage::ValidateDestination,
+            ..
+        })
+    ));
+    assert!(!root.path().join(uncommitted.path.as_path()).exists());
+
+    let protected = match sealed.record.stdout.storage.artifact() {
+        ProtectedOutput::File { path } => root.path().join(path.as_path()),
+        ProtectedOutput::Inline { .. } => panic!("expected protected file"),
+    };
+    fs::set_permissions(&protected, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(protected, b"tampered").unwrap();
+    let destination = root.path().join("published/corrupt.txt");
+    let error = store
+        .publish_output(
+            sealed.record.job_id,
+            StreamKind::Stdout,
+            &OutputPublication {
+                path: WorkspacePath::new("published/corrupt.txt").unwrap(),
+                policy: PublicationPolicy::CreateNew,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(error, ArtifactError::Integrity { .. }));
+    assert!(!destination.exists());
+    assert!(
+        fs::read_dir(root.path().join("published"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("cowshed-publish"))
+    );
 }
 
 proptest! {

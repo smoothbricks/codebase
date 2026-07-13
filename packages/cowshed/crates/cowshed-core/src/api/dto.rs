@@ -995,31 +995,21 @@ impl ControllerCommitment {
                     "terminal commitment must contain a terminal state",
                 ))
             }
-            Self::Checkpoint(value) if !valid_commitment_id(&value.checkpoint_id) => {
-                Err(DtoError::InvalidJobProjection(
-                    "checkpoint commitment id is invalid",
-                ))
-            }
-            Self::Checkpoint(value) if value.barrier_id == 0 => {
-                Err(DtoError::InvalidJobProjection(
-                    "checkpoint barrier id must be positive",
-                ))
-            }
-            Self::Fork(value)
-                if value.source_incarnation == value.destination_incarnation =>
-            {
+            Self::Checkpoint(value) if !valid_commitment_id(&value.checkpoint_id) => Err(
+                DtoError::InvalidJobProjection("checkpoint commitment id is invalid"),
+            ),
+            Self::Checkpoint(value) if value.barrier_id == 0 => Err(
+                DtoError::InvalidJobProjection("checkpoint barrier id must be positive"),
+            ),
+            Self::Fork(value) if value.source_incarnation == value.destination_incarnation => {
                 Err(DtoError::InvalidJobProjection(
                     "fork source and destination incarnations must differ",
                 ))
             }
-            Self::Restore(value) if !valid_commitment_id(&value.source_checkpoint) => {
-                Err(DtoError::InvalidJobProjection(
-                    "restore source checkpoint id is invalid",
-                ))
-            }
-            Self::Restore(value)
-                if value.source_incarnation == value.destination_incarnation =>
-            {
+            Self::Restore(value) if !valid_commitment_id(&value.source_checkpoint) => Err(
+                DtoError::InvalidJobProjection("restore source checkpoint id is invalid"),
+            ),
+            Self::Restore(value) if value.source_incarnation == value.destination_incarnation => {
                 Err(DtoError::InvalidJobProjection(
                     "restore source and destination incarnations must differ",
                 ))
@@ -1031,9 +1021,9 @@ impl ControllerCommitment {
 
 fn valid_commitment_id(value: &str) -> bool {
     (1..=128).contains(&value.len())
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
-        })
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 #[derive(Serialize)]
@@ -1436,6 +1426,20 @@ pub enum RunSandboxMode {
     ReadOnly,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PublicationPolicy {
+    CreateNew,
+    Replace,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OutputPublication {
+    pub path: WorkspacePath,
+    pub policy: PublicationPolicy,
+}
+
 #[derive(Debug)]
 pub struct ExecRequest {
     pub argv: Vec<String>,
@@ -1444,6 +1448,8 @@ pub struct ExecRequest {
     pub env: HashMap<String, String>,
     pub trace: Option<TraceContext>,
     pub stdin: StdinSource,
+    pub stdout_copy: Option<OutputPublication>,
+    pub stderr_copy: Option<OutputPublication>,
 }
 
 fn valid_ref_name(value: &str) -> bool {
