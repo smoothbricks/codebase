@@ -1165,9 +1165,11 @@ mod tests {
         assert_eq!(requests[1].program, Path::new(FSCK_APFS));
         assert_eq!(requests[2].program, Path::new(DISKUTIL));
         assert_eq!(argv(&requests[2]), ["eject", "/dev/disk10"]);
-        assert!(!requests
-            .iter()
-            .any(|request| argv(request).first().is_some_and(|arg| arg == "mount")));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| argv(request).first().is_some_and(|arg| arg == "mount"))
+        );
     }
 
     #[test]
