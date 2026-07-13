@@ -13,6 +13,7 @@ use crate::repository::{PathLayoutError, ProjectPaths, RepoId};
 
 pub mod bootstrap;
 pub mod lifecycle;
+pub mod recovery;
 
 pub const WORKSPACE_MARKER_PATH: &str = ".cowshed/workspace.json";
 const STAGING_DIRECTORY: &str = ".staging";
