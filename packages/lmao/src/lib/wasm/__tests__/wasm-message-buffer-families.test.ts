@@ -102,9 +102,6 @@ describe('WASM specialized message buffer families', () => {
         allocator,
         capacity: CAPACITY,
         messageLayoutFamily: family,
-        trace_id: createTraceId(`wasm-${family}`),
-        thread_id: 42n,
-        span_id: 1,
       },
       traceRoot,
       EMPTY_SCOPE,
@@ -186,7 +183,7 @@ describe('WASM specialized message buffer families', () => {
       const root = createBuffer(family);
       const child = createWasmChildSpanBuffer(
         root,
-        { allocator, capacity: CAPACITY, messageLayoutFamily: family, thread_id: 42n, span_id: 2 },
+        { allocator, capacity: CAPACITY, messageLayoutFamily: family },
         traceRoot,
         EMPTY_SCOPE,
         metadata,

@@ -31,8 +31,6 @@ import type { AnySpanBuffer } from './types.js';
 /** Shared TextEncoder for trace_id encoding (stateless, reusable) */
 const textEncoder = new TextEncoder();
 
-/** Shared TextDecoder for trace_id decoding (stateless, reusable) */
-const textDecoder = new TextDecoder();
 
 //#region smoo/lmao!n/trace-root-timestamps #node
 /**
@@ -77,6 +75,9 @@ export class TraceRoot<T extends LogSchema = LogSchema> implements ITraceRoot<T>
    * Raw backing buffer containing anchor timestamps and trace_id.
    */
   readonly _system: ArrayBuffer;
+  readonly _traceIdBytes: Uint8Array;
+  readonly trace_id: TraceId;
+
 
   /**
    * Tracer reference for lifecycle hooks and event callbacks.
@@ -108,6 +109,8 @@ export class TraceRoot<T extends LogSchema = LogSchema> implements ITraceRoot<T>
     // Allocate buffer: 17 bytes header + trace_id length
     // trace_id is validated to be ASCII (1 byte per char) so length === byte length
     this._system = new ArrayBuffer(TRACE_ROOT_TRACE_ID_OFFSET + trace_id.length);
+    this._traceIdBytes = new Uint8Array(this._system, TRACE_ROOT_TRACE_ID_OFFSET, trace_id.length);
+    this.trace_id = trace_id;
     this.tracer = tracer;
     this._topology = new TraceTopology();
 
@@ -121,11 +124,9 @@ export class TraceRoot<T extends LogSchema = LogSchema> implements ITraceRoot<T>
 
     this._epochHrtimeOffset = anchorEpochNanos - anchorHrtimeBigInt;
 
-    // Encode trace_id directly into buffer (no intermediate allocation)
-    const u8View = new Uint8Array(this._system, TRACE_ROOT_TRACE_ID_LEN_OFFSET);
-    const traceIdDest = new Uint8Array(this._system, TRACE_ROOT_TRACE_ID_OFFSET, trace_id.length);
-    const { written } = textEncoder.encodeInto(trace_id, traceIdDest);
-    u8View[0] = written;
+    // Encode once into the canonical trace-owned view used by root span identities.
+    const { written } = textEncoder.encodeInto(trace_id, this._traceIdBytes);
+    new Uint8Array(this._system, TRACE_ROOT_TRACE_ID_LEN_OFFSET, 1)[0] = written;
   }
 
   /**
@@ -142,13 +143,6 @@ export class TraceRoot<T extends LogSchema = LogSchema> implements ITraceRoot<T>
     return this._perfView[0];
   }
 
-  /**
-   * Trace ID for this trace.
-   */
-  get trace_id(): TraceId {
-    const len = new Uint8Array(this._system, TRACE_ROOT_TRACE_ID_LEN_OFFSET, 1)[0];
-    return createTraceId(textDecoder.decode(new Uint8Array(this._system, TRACE_ROOT_TRACE_ID_OFFSET, len)));
-  }
 
   /**
    * Get current timestamp in nanoseconds since Unix epoch.
