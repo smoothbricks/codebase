@@ -19,12 +19,13 @@ use thiserror::Error;
 
 use crate::api::dto::{
     AdmissionCommitment, BinaryData, CheckpointCommitment, ControllerCommitment, DtoError,
-    ForkCommitment, JobId, JobState, MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputStorage,
-    OutputSummary, ProtectedOutput, RestoreCommitment, Sha256Digest, StreamInfo,
+    ForkCommitment, JobId, JobState, MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication,
+    OutputStorage, OutputSummary, ProtectedOutput, RestoreCommitment, Sha256Digest, StreamInfo,
     TerminalCommitment, WorkspacePath,
 };
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
+mod publication;
 use crate::storage::verify_no_symlinks;
 
 const RECORD_MAGIC: &[u8; 8] = b"CSARROW1";
@@ -34,6 +35,17 @@ const FRAME_HEADER_BYTES: usize = 24;
 const FRAME_OVERHEAD_BYTES: usize = FRAME_HEADER_BYTES + 32 + BATCH_TRAILER.len();
 const MAX_RECORD_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 const RECORD_SCHEMA_VERSION: u64 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationStage {
+    ValidateDestination,
+    CreateTemporary,
+    Clone,
+    Copy,
+    Sync,
+    Publish,
+    Cleanup,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum ArtifactError {
@@ -56,6 +68,12 @@ pub enum ArtifactError {
     BufferAllocation,
     #[error("invalid terminal artifact state: {0}")]
     InvalidTerminalState(&'static str),
+    #[error("output publication failed during {stage:?} for {path}: {message}")]
+    Publication {
+        path: PathBuf,
+        stage: PublicationStage,
+        message: String,
+    },
     #[error(transparent)]
     Dto(#[from] DtoError),
 }
@@ -367,6 +385,7 @@ struct StoreInner {
     allocation: Mutex<AllocationState>,
     records_lock: Mutex<()>,
     records_poison: Mutex<Option<ArtifactError>>,
+    committed_jobs: Mutex<BTreeMap<JobId, JobArtifactRecord>>,
     recovery: RecoveryReport,
 }
 
@@ -470,6 +489,19 @@ impl ArtifactStore {
                 "record sequence allocation exhausted",
             ))?;
 
+        let committed_jobs = recovery
+            .frames
+            .iter()
+            .filter_map(|frame| match &frame.record {
+                ProtectedRecord::Job(record)
+                    if !matches!(record.state, JobState::Queued | JobState::Running) =>
+                {
+                    Some((record.job_id, record.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+
         Ok(Self {
             inner: Arc::new(StoreInner {
                 workspace_root,
@@ -485,6 +517,7 @@ impl ArtifactStore {
                 }),
                 records_lock: Mutex::new(()),
                 records_poison: Mutex::new(None),
+                committed_jobs: Mutex::new(committed_jobs),
                 recovery,
                 config,
             }),
@@ -583,6 +616,13 @@ impl ArtifactStore {
                 .ok_or(ArtifactError::InvalidConfig(
                     "record sequence allocation exhausted",
                 ))?;
+        if !matches!(record.state, JobState::Queued | JobState::Running) {
+            self.inner
+                .committed_jobs
+                .lock()
+                .expect("committed jobs lock")
+                .insert(record.job_id, record.clone());
+        }
         Ok((record, digest))
     }
 
@@ -818,6 +858,35 @@ pub struct SealedJobArtifacts {
     pub output_limit: Option<OutputLimitInfo>,
 }
 
+impl ArtifactStore {
+    pub fn publish_output(
+        &self,
+        job_id: JobId,
+        stream: StreamKind,
+        publication: &OutputPublication,
+    ) -> Result<(), ArtifactError> {
+        let info = {
+            let jobs = self
+                .inner
+                .committed_jobs
+                .lock()
+                .expect("committed jobs lock");
+            let record = jobs
+                .get(&job_id)
+                .ok_or_else(|| ArtifactError::Publication {
+                    path: publication.path.as_path().to_owned(),
+                    stage: PublicationStage::ValidateDestination,
+                    message: "job has no durable terminal artifact record".into(),
+                })?;
+            match stream {
+                StreamKind::Stdout => record.stdout.clone(),
+                StreamKind::Stderr => record.stderr.clone(),
+            }
+        };
+        publication::publish(&self.inner.workspace_root, &info, publication)
+    }
+}
+
 struct StreamWriterState {
     kind: StreamKind,
     target: StreamTarget,
@@ -904,14 +973,15 @@ impl StreamWriterState {
         if !budget.try_reserve(reserved_growth) {
             return Ok(false);
         }
-        if buffer.try_reserve_exact(desired_len - buffer.len()).is_err() {
+        if buffer
+            .try_reserve_exact(desired_len - buffer.len())
+            .is_err()
+        {
             budget.release(reserved_growth);
             return Err(ArtifactError::BufferAllocation);
         }
         let actual_growth = buffer.capacity().saturating_sub(old_capacity);
-        if actual_growth > reserved_growth
-            && !budget.try_reserve(actual_growth - reserved_growth)
-        {
+        if actual_growth > reserved_growth && !budget.try_reserve(actual_growth - reserved_growth) {
             budget.release(reserved_growth);
             return Ok(false);
         }

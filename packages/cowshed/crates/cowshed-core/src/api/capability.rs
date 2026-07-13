@@ -92,6 +92,8 @@ impl ControllerRuntime for ActorRuntime {
             env,
             trace,
             stdin,
+            stdout_copy,
+            stderr_copy,
         } = request;
         let mode = match mode {
             RunSandboxMode::ReadWrite => "readWrite",
@@ -119,6 +121,8 @@ impl ControllerRuntime for ActorRuntime {
                     "env": env,
                     "trace": trace,
                     "stdin": stdin_metadata,
+                    "stdoutCopy": stdout_copy,
+                    "stderrCopy": stderr_copy,
                 }),
             )
             .await?;
