@@ -18,8 +18,7 @@
 //	  const $$b = $$l._buffer;
 //	  const $$i = $$b._traceRoot.writeLogEntry($$b, 8);
 //	  $$l._writeIndex = $$i;
-//	  if ($$b.message_values) { $$b.message_values[$$i] = 'msg';
-//	    if ($$b.message_nulls) $$b.message_nulls[$$i >>> 3] |= 1 << ($$i & 7); }
+//	  if ($$b.message_values) { $$b.message_values[$$i] = 'msg'; }
 //	  $$b.constructor.stats.totalWrites++;
 //	  if ($$b.line_values) { $$b.line_values[$$i] = 3; ... }
 //	  if ($$b.userId_values) { $$b.userId_values[$$i] = 'u1'; ... }
@@ -162,7 +161,6 @@ func finiteStringLiteralUnion(chk *shimchecker.Checker, typ *shimchecker.Type) [
 	sort.Strings(values)
 	return values
 }
-
 
 // findLogInline analyzes a statement-level call chain. Checker queries only;
 // no mutation (must run in the collect phase).
@@ -385,6 +383,16 @@ func guardedRawWrite(buf, idx *shimast.Node, field string, value *shimast.Node) 
 	return factory.NewIfStatement(values(), factory.NewBlock(factory.NewNodeList(body), true), nil)
 }
 
+// guardedMessageWrite emits the raw message sidecar store without a validity
+// bitmap; undefined is the null sentinel for the current/specialized layouts.
+func guardedMessageWrite(buf, idx, value *shimast.Node) *shimast.Node {
+	values := propAccess(buf, "message_values")
+	at := factory.NewElementAccessExpression(values, nil, idx, shimast.NodeFlagsNone)
+	return factory.NewIfStatement(values, factory.NewBlock(factory.NewNodeList([]*shimast.Node{
+		binaryStmt(at, shimast.KindEqualsToken, value),
+	}), true), nil)
+}
+
 // fixedSchemaWrite emits one unconditional fixed-column value store. Schema
 // resolution proves the lane exists; the null bitmap remains optional.
 func fixedSchemaWrite(buf, idx *shimast.Node, field string, value *shimast.Node) []*shimast.Node {
@@ -404,17 +412,6 @@ func fixedSchemaWrite(buf, idx *shimast.Node, field string, value *shimast.Node)
 	}
 }
 
-// messageValidityWrite marks a current-layout static message as present. The
-// current plan preallocates this bitmap alongside its local Uint16 ID lane.
-func messageValidityWrite(buf, idx *shimast.Node) *shimast.Node {
-	nullSlot := factory.NewElementAccessExpression(propAccess(buf, "message_nulls"), nil,
-		factory.NewBinaryExpression(nil, idx, nil, factory.NewToken(shimast.KindGreaterThanGreaterThanGreaterThanToken), num(3)),
-		shimast.NodeFlagsNone)
-	nullBit := factory.NewBinaryExpression(nil, num(1), nil, factory.NewToken(shimast.KindLessThanLessThanToken),
-		factory.NewParenthesizedExpression(factory.NewBinaryExpression(nil, idx, nil, factory.NewToken(shimast.KindAmpersandToken), num(7))))
-	return binaryStmt(nullSlot, shimast.KindBarEqualsToken, nullBit)
-}
-
 // applyLogInlines splices replacement blocks (phase B — no checker use).
 func (t *fileTransformer) applyLogInlines(inlines []logInline) {
 	for _, in := range inlines {
@@ -428,7 +425,9 @@ func (t *fileTransformer) applyLogInlines(inlines []logInline) {
 		buf := ident("$$b")
 		idx := ident("$$i")
 		vocabularyOperand := func() *shimast.Node {
-			if in.templateID == 0 { return num(0) }
+			if in.templateID == 0 {
+				return num(0)
+			}
 			return t.staticVocabularyOperand(in.templateID)
 		}
 		stmts := []*shimast.Node{constDecl(logger, in.logExpr)}
@@ -448,19 +447,15 @@ func (t *fileTransformer) applyLogInlines(inlines []logInline) {
 		if in.templateID != 0 {
 			switch in.physicalLayout {
 			case callMessagePhysicalCurrent:
-				stmts = append(stmts,
-					binaryStmt(
-						factory.NewElementAccessExpression(propAccess(buf, "_messageIds"), nil, idx, shimast.NodeFlagsNone),
-						shimast.KindEqualsToken, num(int(in.localMessageID))),
-					messageValidityWrite(buf, idx),
-				)
+				stmts = append(stmts, binaryStmt(
+					factory.NewElementAccessExpression(propAccess(buf, "_messageIds"), nil, idx, shimast.NodeFlagsNone),
+					shimast.KindEqualsToken, num(int(in.localMessageID))))
 			case callMessagePhysicalSpecialized:
-				stmts = append(stmts,
-					binaryStmt(
-						factory.NewElementAccessExpression(propAccess(buf, "_logHeaders"), nil, idx, shimast.NodeFlagsNone),
-						shimast.KindEqualsToken, vocabularyOperand()),
-					messageValidityWrite(buf, idx),
-				)
+				denseIdentity := factory.NewParenthesizedExpression(factory.NewBinaryExpression(nil,
+					vocabularyOperand(), nil, factory.NewToken(shimast.KindPlusToken), num(1)))
+				stmts = append(stmts, binaryStmt(
+					factory.NewElementAccessExpression(propAccess(buf, "_logHeaders"), nil, idx, shimast.NodeFlagsNone),
+					shimast.KindEqualsToken, denseIdentity))
 			case callMessagePhysicalPacked:
 				denseIdentity := factory.NewParenthesizedExpression(factory.NewBinaryExpression(nil,
 					vocabularyOperand(), nil, factory.NewToken(shimast.KindPlusToken), num(1)))
@@ -477,7 +472,7 @@ func (t *fileTransformer) applyLogInlines(inlines []logInline) {
 				panic("unknown message layout reached direct log inline emission")
 			}
 		} else {
-			stmts = append(stmts, guardedRawWrite(buf, idx, "message", in.message))
+			stmts = append(stmts, guardedMessageWrite(buf, idx, in.message))
 		}
 		stmts = append(stmts, factory.NewExpressionStatement(factory.NewPostfixUnaryExpression(
 			propAccess(propAccess(propAccess(buf, "constructor"), "stats"), "totalWrites"),

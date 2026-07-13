@@ -58,7 +58,6 @@ export interface WasmBufferDescriptor {
   overflow?: WasmBufferDescriptor;
 }
 
-
 const EMPTY_EAGER_COLUMNS: EagerColumnDescriptor = Object.freeze({
   names: Object.freeze([]),
   words: Object.freeze([]),
@@ -107,7 +106,6 @@ export type WasmSpanBufferInstance<T extends LogSchema = LogSchema> = SpanBuffer
   _entryTypeView?: Uint8Array;
   _messageIds?: Uint16Array;
   _logHeaders?: Uint32Array;
-  message_nulls?: Uint8Array;
   _rowHeaders?: Uint32Array;
   _identityView: Uint8Array;
   _identityData: DataView;
@@ -199,7 +197,6 @@ function getFieldEnumValues(value: unknown): readonly string[] | undefined {
   const enumValues = Reflect.get(value, '__enum_values');
   return Array.isArray(enumValues) ? enumValues : undefined;
 }
-
 
 function isWasmSpanBufferConstructor<T extends LogSchema = LogSchema>(
   value: unknown,
@@ -310,7 +307,9 @@ function wasmGetEntryType(this: WasmUnpackedMessageBuffer): Uint8Array {
 function assertWasmBufferLive(buffer: WasmSpanBufferInstance): void {
   if (buffer._descriptor.state !== 'live') {
     const generation = buffer._descriptor.generation;
-    throw new Error(`Cannot access released WASM buffer generation ${generation}; generation ${generation} has been released`);
+    throw new Error(
+      `Cannot access released WASM buffer generation ${generation}; generation ${generation} has been released`,
+    );
   }
 }
 
@@ -398,17 +397,6 @@ function wasmRawMessage(this: WasmRawMessageBuffer, idx: number, value: string):
   return this;
 }
 
-function wasmValidatedRawMessage(
-  this: WasmRawMessageBuffer & { readonly message_nulls: Uint8Array },
-  idx: number,
-  value: string,
-): WasmRawMessageBuffer {
-  assertWasmBufferLive(this);
-  this._message[idx] = value;
-  this.message_nulls[idx >>> 3] |= 1 << (idx & 7);
-  return this;
-}
-
 function wasmStaticMessage(this: WasmSpanBufferInstance, idx: number, value: string): WasmSpanBufferInstance {
   assertWasmBufferLive(this);
   if (idx === 0) this._spanName = value;
@@ -424,7 +412,6 @@ function wasmGetMessageValues(this: WasmRawMessageBuffer): string[] {
   assertWasmBufferLive(this);
   return this._message;
 }
-
 
 function wasmGetMessageLayoutFamily(this: WasmSpanBufferInstance): MessageLayoutFamily {
   return getWasmSpanBufferConstructor(this).messageLayoutFamily;
@@ -648,20 +635,16 @@ function generateViewRefresh(
     lines.push(
       'this._entryTypeView = new Uint8Array(memory, this._systemPtr + this._layout.system.entryTypeOffset, this._capacity);',
     );
-    if (messageLayoutFamily === 'dynamic-only') {
-      lines.push(
-        'this.message_nulls = new Uint8Array(memory, this._systemPtr + this._layout.system.messageValidityOffset, (this._capacity + 7) >>> 3);',
-      );
-    } else if (messagePhysicalLayout === 'current') {
-      lines.push(
-        'this._messageIds = new Uint16Array(memory, this._systemPtr + this._layout.system.messageIdOffset, this._capacity);',
-        'this.message_nulls = new Uint8Array(memory, this._systemPtr + this._layout.system.messageIdValidityOffset, (this._capacity + 7) >>> 3);',
-      );
-    } else {
-      lines.push(
-        'this._logHeaders = new Uint32Array(memory, this._systemPtr + this._layout.system.messageDenseIndexOffset, this._capacity);',
-        'this.message_nulls = new Uint8Array(memory, this._systemPtr + this._layout.system.messageValidityOffset, (this._capacity + 7) >>> 3);',
-      );
+    if (messageLayoutFamily !== 'dynamic-only') {
+      if (messagePhysicalLayout === 'current') {
+        lines.push(
+          'this._messageIds = new Uint16Array(memory, this._systemPtr + this._layout.system.messageIdOffset, this._capacity);',
+        );
+      } else {
+        lines.push(
+          'this._logHeaders = new Uint32Array(memory, this._systemPtr + this._layout.system.messageDenseIndexOffset, this._capacity);',
+        );
+      }
     }
   }
   lines.push(`if (this._identityOwner) {
@@ -817,10 +800,8 @@ export function getWasmSpanBufferClass<T extends LogSchema>(
   const cacheKey = `${messageLayoutFamily}:${messagePhysicalLayout}:${eagerColumns.key}`;
   let familyClasses = wasmSpanBufferClassCache.get(schema);
   const cached = familyClasses?.get(cacheKey);
-  if (
-    cached !== undefined &&
-    isWasmSpanBufferConstructor(cached, schema, messageLayoutFamily, messagePhysicalLayout)
-  ) return cached;
+  if (cached !== undefined && isWasmSpanBufferConstructor(cached, schema, messageLayoutFamily, messagePhysicalLayout))
+    return cached;
 
   const columnMeta = buildColumnMeta(schema, eagerColumns);
 
@@ -927,8 +908,8 @@ class WasmSpanBuffer {
         messagePhysicalLayout === 'packed'
           ? 'this._rowHeaders.fill(0);'
           : messagePhysicalLayout === 'specialized' && messageLayoutFamily !== 'dynamic-only'
-            ? 'this._logHeaders.fill(0); this.message_nulls.fill(0);'
-            : 'this.message_nulls.fill(0);'
+            ? 'this._logHeaders.fill(0);'
+            : ''
       }
     } catch (error) {
       this.free();
@@ -1062,12 +1043,7 @@ return WasmSpanBuffer;
   });
 
   WasmSpanBufferClass.prototype._ensureWasmViews = wasmEnsureViews;
-  WasmSpanBufferClass.prototype.message =
-    messageLayoutFamily === 'static-only'
-      ? wasmStaticMessage
-      : messagePhysicalLayout === 'packed'
-        ? wasmRawMessage
-        : wasmValidatedRawMessage;
+  WasmSpanBufferClass.prototype.message = messageLayoutFamily === 'static-only' ? wasmStaticMessage : wasmRawMessage;
   WasmSpanBufferClass.prototype.free = wasmFree;
   WasmSpanBufferClass.prototype.isColumnAllocated = wasmIsColumnAllocated;
   WasmSpanBufferClass.prototype.getColumnIfAllocated = wasmGetColumnIfAllocated;
@@ -1148,7 +1124,13 @@ export function createWasmSpanBuffer<T extends LogSchema>(
   schema: T,
   opts: Omit<
     WasmSpanBufferOptions<T>,
-    'logSchema' | '_traceRoot' | '_scopeValues' | '_opMetadata' | '_callsiteMetadata' | '_vocabularyGeneration' | '_layout'
+    | 'logSchema'
+    | '_traceRoot'
+    | '_scopeValues'
+    | '_opMetadata'
+    | '_callsiteMetadata'
+    | '_vocabularyGeneration'
+    | '_layout'
   >,
   _traceRoot: ITraceRoot<T>,
   _scopeValues: Readonly<Record<string, unknown>>,

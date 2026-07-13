@@ -43,7 +43,7 @@ export function isRuntimeHintAnalyzed(runtimeHint: number): boolean {
 export function runtimeHintInitialCapacity(runtimeHint: number): number | undefined {
   if (!isRuntimeHintAnalyzed(runtimeHint)) return undefined;
   const capacity = runtimeHint & RUNTIME_HINT_INITIAL_CAPACITY_MASK;
-  return capacity === 0 ? undefined : Math.max(2, capacity);
+  return capacity < 2 ? undefined : capacity;
 }
 
 export function runtimeHintHasCapability(runtimeHint: number, capability: number): boolean {

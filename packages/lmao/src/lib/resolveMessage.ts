@@ -26,11 +26,6 @@ export function decodeVocabularyMessage(generation: VocabularyGeneration, denseI
   return value;
 }
 
-function isMessageValid(buffer: AnySpanBuffer, row: number): boolean {
-  const validity = buffer.message_nulls;
-  return validity !== undefined && (validity[row >>> 3]! & (1 << (row & 7))) !== 0;
-}
-
 /** Resolve one entry type from either split or packed physical storage. */
 export function resolveEntryType(buffer: AnySpanBuffer, row: number): number {
   const packed = buffer._rowHeaders;
@@ -50,7 +45,6 @@ export function resolveMessage(buffer: AnySpanBuffer, row: number): string | und
   if (row === 1 && buffer._terminalMessage !== undefined) return buffer._terminalMessage;
 
   if (buffer._messagePhysicalLayout === 'current') {
-    if (!isMessageValid(buffer, row)) return undefined;
     const localId = buffer._messageIds?.[row] ?? 0;
     if (localId === 0) return buffer.message_values?.[row];
     const denseIndex = buffer._opMetadata._physicalLayoutPlan?.localMessageDictionary[localId - 1];
@@ -66,10 +60,8 @@ export function resolveMessage(buffer: AnySpanBuffer, row: number): string | und
       : decodeVocabularyMessage(buffer._vocabularyGeneration, encodedDenseIndex - 1);
   }
 
-  if (!isMessageValid(buffer, row)) return undefined;
-  const rawMessage = buffer.message_values?.[row];
-  if (rawMessage !== undefined) return rawMessage;
-  const denseIndex = buffer._logHeaders?.[row];
-  if (denseIndex === undefined) throw new TypeError('Specialized message layout is missing global dense storage');
-  return decodeVocabularyMessage(buffer._vocabularyGeneration, denseIndex);
+  const encodedDenseIndex = buffer._logHeaders?.[row] ?? 0;
+  return encodedDenseIndex === 0
+    ? buffer.message_values?.[row]
+    : decodeVocabularyMessage(buffer._vocabularyGeneration, encodedDenseIndex - 1);
 }
