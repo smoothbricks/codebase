@@ -4,10 +4,12 @@ pub use crate::metadata::{
     WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
 use crate::repository::RepoId;
+use base64::Engine;
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::Digest;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -15,6 +17,8 @@ use std::pin::Pin;
 use tokio::io::AsyncRead;
 
 pub const MAX_JOB_ID: u64 = (1_u64 << 53) - 1;
+pub const MAX_INLINE_OUTPUT_BYTES: usize = 64 * 1024;
+pub const MAX_OUTPUT_SUMMARY_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum DtoError {
@@ -32,6 +36,14 @@ pub enum DtoError {
     InvalidSpanId(String),
     #[error("invalid job projection: {0}")]
     InvalidJobProjection(&'static str),
+    #[error("binary output exceeds the {MAX_INLINE_OUTPUT_BYTES}-byte inline DTO limit")]
+    InlineOutputTooLarge,
+    #[error("invalid binary output encoding")]
+    InvalidBinaryEncoding,
+    #[error("invalid SHA-256 digest {0:?}")]
+    InvalidSha256Digest(String),
+    #[error("invalid stream projection: {0}")]
+    InvalidStreamProjection(&'static str),
     #[error("invalid branch name {0:?}")]
     InvalidBranchName(String),
     #[error("invalid fully-qualified git ref {0:?}")]
@@ -542,12 +554,302 @@ pub struct OutputSummary {
     pub truncated: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Exact, bounded bytes for control-oriented JSON.
+///
+/// Valid UTF-8 is emitted as tagged UTF-8. Every other byte sequence is emitted as tagged
+/// base64. The tag makes the wire representation unambiguous and deserialization never performs
+/// lossy conversion.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct BinaryData(Vec<u8>);
+
+impl BinaryData {
+    pub fn new(data: impl Into<Vec<u8>>) -> Result<Self, DtoError> {
+        let data = data.into();
+        if data.len() > MAX_INLINE_OUTPUT_BYTES {
+            return Err(DtoError::InlineOutputTooLarge);
+        }
+        Ok(Self(data))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum BinaryEncoding {
+    Utf8,
+    Base64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BinaryDataRef<'a> {
+    encoding: BinaryEncoding,
+    data: &'a str,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BinaryDataWire {
+    encoding: BinaryEncoding,
+    data: String,
+}
+
+impl Serialize for BinaryData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match std::str::from_utf8(&self.0) {
+            Ok(data) => BinaryDataRef {
+                encoding: BinaryEncoding::Utf8,
+                data,
+            }
+            .serialize(serializer),
+            Err(_) => {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&self.0);
+                BinaryDataRef {
+                    encoding: BinaryEncoding::Base64,
+                    data: &encoded,
+                }
+                .serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BinaryData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = BinaryDataWire::deserialize(deserializer)?;
+        let bytes = match wire.encoding {
+            BinaryEncoding::Utf8 => wire.data.into_bytes(),
+            BinaryEncoding::Base64 => base64::engine::general_purpose::STANDARD
+                .decode(wire.data)
+                .map_err(|_| serde::de::Error::custom(DtoError::InvalidBinaryEncoding))?,
+        };
+        Self::new(bytes).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A fixed-width SHA-256 digest, serialized as 64 lowercase hexadecimal characters.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Sha256Digest([u8; 32]);
+
+impl Sha256Digest {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn compute(bytes: &[u8]) -> Self {
+        Self(sha2::Sha256::digest(bytes).into())
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn to_hex(self) -> String {
+        let mut output = String::with_capacity(64);
+        for byte in self.0 {
+            use std::fmt::Write as _;
+            write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        output
+    }
+
+    pub fn from_hex(value: &str) -> Result<Self, DtoError> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(DtoError::InvalidSha256Digest(value.to_owned()));
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            let high = hex_nibble(pair[0]);
+            let low = hex_nibble(pair[1]);
+            bytes[index] = (high << 4) | low;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => unreachable!("Sha256Digest::from_hex validates hexadecimal input"),
+    }
+}
+
+impl fmt::Display for Sha256Digest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.to_hex())
+    }
+}
+
+impl Serialize for Sha256Digest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for Sha256Digest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::from_hex(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ProtectedOutput {
+    Inline { data: BinaryData },
+    File { path: WorkspacePath },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum OutputStorage {
+    Captured {
+        artifact: ProtectedOutput,
+    },
+    Redirect {
+        source: WorkspacePath,
+        artifact: ProtectedOutput,
+    },
+}
+
+impl OutputStorage {
+    pub fn artifact(&self) -> &ProtectedOutput {
+        match self {
+            Self::Captured { artifact } | Self::Redirect { artifact, .. } => artifact,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamInfo {
-    pub path: WorkspacePath,
+    pub storage: OutputStorage,
     pub bytes: u64,
+    pub sha256: Sha256Digest,
     pub summary: OutputSummary,
+}
+
+impl StreamInfo {
+    pub fn validate(&self) -> Result<(), DtoError> {
+        if self.summary.version == 0 {
+            return Err(DtoError::InvalidStreamProjection(
+                "summary version must be non-zero",
+            ));
+        }
+        if self.summary.text.len() > MAX_OUTPUT_SUMMARY_BYTES {
+            return Err(DtoError::InvalidStreamProjection(
+                "summary text exceeds the bounded DTO limit",
+            ));
+        }
+        if let ProtectedOutput::Inline { data } = self.storage.artifact() {
+            if self.bytes != data.as_bytes().len() as u64 {
+                return Err(DtoError::InvalidStreamProjection(
+                    "inline byte count does not match data",
+                ));
+            }
+            if self.sha256 != Sha256Digest::compute(data.as_bytes()) {
+                return Err(DtoError::InvalidStreamProjection(
+                    "inline SHA-256 does not match data",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_for(&self, job_id: JobId, leaf: &str) -> Result<(), DtoError> {
+        self.validate()?;
+        if let ProtectedOutput::File { path } = self.storage.artifact() {
+            let expected = format!(".cowshed/job/{}/{leaf}", job_id.get());
+            if path.as_path() != Path::new(&expected) {
+                return Err(DtoError::InvalidStreamProjection(
+                    "protected file path does not match job identity and stream",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamInfoRef<'a> {
+    storage: &'a OutputStorage,
+    bytes: u64,
+    sha256: Sha256Digest,
+    summary: &'a OutputSummary,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StreamInfoWire {
+    storage: OutputStorage,
+    bytes: u64,
+    sha256: Sha256Digest,
+    summary: OutputSummary,
+}
+
+impl Serialize for StreamInfo {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        StreamInfoRef {
+            storage: &self.storage,
+            bytes: self.bytes,
+            sha256: self.sha256,
+            summary: &self.summary,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for StreamInfo {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = StreamInfoWire::deserialize(deserializer)?;
+        let value = Self {
+            storage: wire.storage,
+            bytes: wire.bytes,
+            sha256: wire.sha256,
+            summary: wire.summary,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -567,6 +869,225 @@ pub enum ExitStatus {
 pub struct OutputLimitInfo {
     pub limit_bytes: u64,
     pub crossing_bytes: u64,
+}
+pub const CONTROLLER_COMMITMENT_VERSION: u16 = 1;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdmissionCommitment {
+    pub version: u16,
+    pub order: u64,
+    pub repo_id: RepoId,
+    pub workspace_incarnation: WorkspaceIncarnation,
+    pub job_id: JobId,
+    pub grant_revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalCommitment {
+    pub version: u16,
+    pub order: u64,
+    pub repo_id: RepoId,
+    pub workspace_incarnation: WorkspaceIncarnation,
+    pub job_id: JobId,
+    pub state: JobState,
+    pub grant_revision: u64,
+    pub stdout_bytes: u64,
+    pub stdout_sha256: Sha256Digest,
+    pub stderr_bytes: u64,
+    pub stderr_sha256: Sha256Digest,
+    pub batch_sha256: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CheckpointCommitment {
+    pub version: u16,
+    pub order: u64,
+    pub repo_id: RepoId,
+    pub origin_incarnation: WorkspaceIncarnation,
+    pub checkpoint_id: String,
+    pub barrier_id: u64,
+    pub manifest_batch_sha256: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ForkCommitment {
+    pub version: u16,
+    pub order: u64,
+    pub repo_id: RepoId,
+    pub source_incarnation: WorkspaceIncarnation,
+    pub destination_incarnation: WorkspaceIncarnation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RestoreCommitment {
+    pub version: u16,
+    pub order: u64,
+    pub repo_id: RepoId,
+    pub source_checkpoint: String,
+    pub source_incarnation: WorkspaceIncarnation,
+    pub destination_incarnation: WorkspaceIncarnation,
+}
+
+/// Versioned controller-owned existence, lifecycle, order, and lineage evidence.
+///
+/// Protected payload bytes and artifact paths deliberately do not appear in any variant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ControllerCommitment {
+    Admission(AdmissionCommitment),
+    Terminal(TerminalCommitment),
+    Checkpoint(CheckpointCommitment),
+    Fork(ForkCommitment),
+    Restore(RestoreCommitment),
+}
+
+impl ControllerCommitment {
+    pub fn version(&self) -> u16 {
+        match self {
+            Self::Admission(value) => value.version,
+            Self::Terminal(value) => value.version,
+            Self::Checkpoint(value) => value.version,
+            Self::Fork(value) => value.version,
+            Self::Restore(value) => value.version,
+        }
+    }
+
+    pub fn order(&self) -> u64 {
+        match self {
+            Self::Admission(value) => value.order,
+            Self::Terminal(value) => value.order,
+            Self::Checkpoint(value) => value.order,
+            Self::Fork(value) => value.order,
+            Self::Restore(value) => value.order,
+        }
+    }
+
+    pub fn repo_id(&self) -> &RepoId {
+        match self {
+            Self::Admission(value) => &value.repo_id,
+            Self::Terminal(value) => &value.repo_id,
+            Self::Checkpoint(value) => &value.repo_id,
+            Self::Fork(value) => &value.repo_id,
+            Self::Restore(value) => &value.repo_id,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), DtoError> {
+        if self.version() != CONTROLLER_COMMITMENT_VERSION {
+            return Err(DtoError::InvalidJobProjection(
+                "unsupported controller commitment version",
+            ));
+        }
+        if self.order() == 0 {
+            return Err(DtoError::InvalidJobProjection(
+                "controller commitment order must be positive",
+            ));
+        }
+        match self {
+            Self::Terminal(value)
+                if matches!(value.state, JobState::Queued | JobState::Running) =>
+            {
+                Err(DtoError::InvalidJobProjection(
+                    "terminal commitment must contain a terminal state",
+                ))
+            }
+            Self::Checkpoint(value) if !valid_commitment_id(&value.checkpoint_id) => {
+                Err(DtoError::InvalidJobProjection(
+                    "checkpoint commitment id is invalid",
+                ))
+            }
+            Self::Checkpoint(value) if value.barrier_id == 0 => {
+                Err(DtoError::InvalidJobProjection(
+                    "checkpoint barrier id must be positive",
+                ))
+            }
+            Self::Fork(value)
+                if value.source_incarnation == value.destination_incarnation =>
+            {
+                Err(DtoError::InvalidJobProjection(
+                    "fork source and destination incarnations must differ",
+                ))
+            }
+            Self::Restore(value) if !valid_commitment_id(&value.source_checkpoint) => {
+                Err(DtoError::InvalidJobProjection(
+                    "restore source checkpoint id is invalid",
+                ))
+            }
+            Self::Restore(value)
+                if value.source_incarnation == value.destination_incarnation =>
+            {
+                Err(DtoError::InvalidJobProjection(
+                    "restore source and destination incarnations must differ",
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+fn valid_commitment_id(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum ControllerCommitmentRef<'a> {
+    Admission(&'a AdmissionCommitment),
+    Terminal(&'a TerminalCommitment),
+    Checkpoint(&'a CheckpointCommitment),
+    Fork(&'a ForkCommitment),
+    Restore(&'a RestoreCommitment),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum ControllerCommitmentWire {
+    Admission(AdmissionCommitment),
+    Terminal(TerminalCommitment),
+    Checkpoint(CheckpointCommitment),
+    Fork(ForkCommitment),
+    Restore(RestoreCommitment),
+}
+
+impl Serialize for ControllerCommitment {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        match self {
+            Self::Admission(value) => ControllerCommitmentRef::Admission(value),
+            Self::Terminal(value) => ControllerCommitmentRef::Terminal(value),
+            Self::Checkpoint(value) => ControllerCommitmentRef::Checkpoint(value),
+            Self::Fork(value) => ControllerCommitmentRef::Fork(value),
+            Self::Restore(value) => ControllerCommitmentRef::Restore(value),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ControllerCommitment {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = match ControllerCommitmentWire::deserialize(deserializer)? {
+            ControllerCommitmentWire::Admission(value) => Self::Admission(value),
+            ControllerCommitmentWire::Terminal(value) => Self::Terminal(value),
+            ControllerCommitmentWire::Checkpoint(value) => Self::Checkpoint(value),
+            ControllerCommitmentWire::Fork(value) => Self::Fork(value),
+            ControllerCommitmentWire::Restore(value) => Self::Restore(value),
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -625,11 +1146,15 @@ impl JobInfo {
             (JobState::Exited, Some(ExitStatus::Exited { .. }))
             | (JobState::Signaled | JobState::Killed, Some(ExitStatus::Signaled { .. }))
             | (JobState::OutputLimit | JobState::Failed, _)
-            | (JobState::Queued | JobState::Running, None) => Ok(()),
-            _ => Err(DtoError::InvalidJobProjection(
-                "exit kind does not agree with job state",
-            )),
+            | (JobState::Queued | JobState::Running, None) => {}
+            _ => {
+                return Err(DtoError::InvalidJobProjection(
+                    "exit kind does not agree with job state",
+                ));
+            }
         }
+        self.stdout.validate_for(self.job_id, "out")?;
+        self.stderr.validate_for(self.job_id, "err")
     }
 }
 
@@ -771,11 +1296,15 @@ impl ExecRecord {
         match (&self.state, &self.exit) {
             (JobState::Exited, Some(ExitStatus::Exited { .. }))
             | (JobState::Signaled | JobState::Killed, Some(ExitStatus::Signaled { .. }))
-            | (JobState::OutputLimit | JobState::Failed, _) => Ok(()),
-            _ => Err(DtoError::InvalidJobProjection(
-                "exit kind does not agree with exec record state",
-            )),
+            | (JobState::OutputLimit | JobState::Failed, _) => {}
+            _ => {
+                return Err(DtoError::InvalidJobProjection(
+                    "exit kind does not agree with exec record state",
+                ));
+            }
         }
+        self.stdout.validate_for(self.job_id, "out")?;
+        self.stderr.validate_for(self.job_id, "err")
     }
 }
 

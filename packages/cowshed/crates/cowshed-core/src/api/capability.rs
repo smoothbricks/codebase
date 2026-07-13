@@ -1464,13 +1464,27 @@ mod tests {
             "durationMs": 1,
             "exit": {"kind": "exited", "code": 0},
             "stdout": {
-                "path": ".cowshed/job/7/out",
+                "storage": {
+                    "kind": "captured",
+                    "artifact": {
+                        "kind": "inline",
+                        "data": {"encoding": "utf8", "data": ""}
+                    }
+                },
                 "bytes": 0,
+                "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
                 "summary": {"version": 1, "text": "", "truncated": false}
             },
             "stderr": {
-                "path": ".cowshed/job/7/err",
+                "storage": {
+                    "kind": "captured",
+                    "artifact": {
+                        "kind": "inline",
+                        "data": {"encoding": "utf8", "data": ""}
+                    }
+                },
                 "bytes": 0,
+                "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
                 "summary": {"version": 1, "text": "", "truncated": false}
             },
             "trace": {
