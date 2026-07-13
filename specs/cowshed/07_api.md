@@ -408,10 +408,19 @@ impl WorkspaceHandle {
     pub async fn shell(&self, session: Option<&str>) -> Result<Session, CowshedError>;
     pub async fn list_jobs(&self) -> Result<Vec<JobInfo>, CowshedError>;
     pub async fn job(&self, id: JobId) -> Result<JobHandle, CowshedError>;
-    pub async fn checkpoint(&self, label: Option<&str>) -> Result<String, CowshedError>; // quota-enforced atomically
+    pub async fn checkpoint(&self, opts: CheckpointOptions) -> Result<String, CowshedError>; // quota-enforced atomically
     pub async fn push(&self, opts: PushOptions) -> Result<PushReport, CowshedError>;
     pub async fn grants(&self) -> Result<GrantSet, CowshedError>;   // read-only: observe, never mutate
     // No grant/revoke, restore/destroy/rebase/land/gc, repo mirror, detach, or cross-workspace access.
+}
+```
+
+`CheckpointOptions` carries both the optional validated label and explicit retention intent:
+
+```rust
+pub struct CheckpointOptions {
+    pub label: Option<String>,
+    pub keep: bool,
 }
 ```
 
@@ -470,11 +479,11 @@ subagent holding one cannot grant itself anything.
 
 Externally projected types are defined **once** in `cowshed-core` and reused verbatim by the CLI (`--json` bodies),
 NAPI, and MCP — no adapter redefines a field, and contract goldens (08_testing.md) pin their shapes: `WorkspaceInfo`,
-`EnsureReport`, `GcReport`, `Finding`, `JobId`, `JobState`, `JobInfo`, `StreamInfo`, `OutputStorage`, `ProtectedOutput`,
-`BinaryData`, `OutputSummary`, `OutputPublication`, `PublicationPolicy`, `ControllerCommitment` and its five event
-structs, `PushReport`, `LandReport`, `RevisionTarget`, `GrantSet`/`GrantDelta`/`PortBlock`/`EgressRule`/
+`CheckpointInfo`, `EnsureReport`, `GcReport`, `Finding`, `JobId`, `JobState`, `JobInfo`, `StreamInfo`, `OutputStorage`,
+`ProtectedOutput`, `BinaryData`, `OutputSummary`, `OutputPublication`, `PublicationPolicy`, `ControllerCommitment` and
+its five event structs, `PushReport`, `LandReport`, `RevisionTarget`, `GrantSet`/`GrantDelta`/`PortBlock`/`EgressRule`/
 `RepoRule`/`SimVerb`, `GatewayStatus`, `AuditEvent`, and every `*Options` type (`AdoptOptions`, `CreateOptions`,
-`AttachOptions`, `RemoveOptions`, `RebaseOptions`, `LandOptions`, `PushOptions`).
+`AttachOptions`, `CheckpointOptions`, `RemoveOptions`, `GcOptions`, `RebaseOptions`, `LandOptions`, `PushOptions`).
 
 `JobArtifactRecord`, `ProtectedRecord`, `CheckpointManifestRecord`, and `VisibleJobCommitment` are canonical internal
 storage/Arrow contracts, not CLI/N-API/MCP JSON envelopes. Adapters expose only their bounded constituent result types
@@ -500,12 +509,17 @@ Public request/result and controller-commitment definitions live in `cowshed_cor
 `JobArtifactRecord`/manifest/record envelope and Arrow projections live in `cowshed_core::storage::job_artifact` and
 reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission rather than `null`.
 
-- `WorkspaceInfo = { repoId, workspace, workspaceIncarnation, role, imageFormat, mount, state, branch?, baseCommit?, createdAt?, snapshotStale }`;
-  `state` is `"attached" | "detached"`. Detached rows without a cached marker snapshot omit all three marker-derived
-  optionals.
+- `WorkspaceInfo = { repoId, workspace, workspaceIncarnation, role, imageFormat, mount, state, branch?, baseCommit?, createdAt?, checkpoints, snapshotStale }`;
+  `state` is `"attached" | "detached"`. `checkpoints` is always an array of
+  `CheckpointInfo = { label, revision, pinned }` facts derived from canonical storage. Detached rows without a cached
+  marker snapshot omit all three marker-derived optionals but still report checkpoint facts.
 - `EnsureReport = { workspace, mount, action }`, where action is `"alreadyMounted" | "attached" | "healed"`.
   `MountResult = { workspace, mount, baseCommit? }`; lifecycle creation/restoration fills `baseCommit`, while
   attachment/query results may omit it. `EmptyResult` serializes as exactly `{}`.
+- `AdoptOptions.repoId` is optional only because a trusted remote binding can supply it; local-only adoption requires
+  the explicit value. `CheckpointOptions = { label?, keep }` carries pin intent without granting quota mutation
+  authority. `RemoveOptions.restore` selects the reversible `main` adoption rollback; it is not an alias for forced
+  retirement.
 - `DoctorReport = { healthy, findings }`; `Finding = { code, severity, message, hint, path? }`, and severity is
   `"info" | "warning" | "error"`. `GcReport = { examined, reclaimed, retainedPinned, freedBytes, dryRun }`.
 - `JobId` is a positive integer no greater than `2^53-1`.
@@ -743,6 +757,11 @@ export interface ExecOptions {
   onStderr?: (line: string) => void;
 }
 
+export interface CheckpointOptions {
+  label?: string;
+  keep?: boolean;
+}
+
 export interface WorkspaceHandle {
   readonly name: string;
   readonly mountPath: string;
@@ -750,7 +769,7 @@ export interface WorkspaceHandle {
   background(argv: string[], opts?: ExecOptions): Promise<JobHandle>;
   listJobs(): Promise<JobInfo[]>;
   job(id: JobId): Promise<JobHandle>;
-  checkpoint(label?: string): Promise<string>;
+  checkpoint(opts?: CheckpointOptions): Promise<string>;
   push(opts?: PushOptions): Promise<PushReport>;
   grants(): Promise<GrantSet>; // read-only
 }

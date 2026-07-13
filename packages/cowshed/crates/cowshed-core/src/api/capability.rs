@@ -1,8 +1,8 @@
 use super::dto::{
-    AdoptOptions, AttachOptions, CheckpointQuota, CheckpointResult, CreateOptions, EmptyResult,
-    ExecRequest, GcOptions, GcReport, GitOid, GrantDelta, GrantSet, JobId, JobInfo, JobState,
-    LandOptions, LandReport, MirrorInfo, PushOptions, PushReport, RebaseOptions, RemoveOptions,
-    RevisionResult, RunSandboxMode, StdinSource, WorkspaceInfo,
+    AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult,
+    CreateOptions, EmptyResult, ExecRequest, GcOptions, GcReport, GitOid, GrantDelta, GrantSet,
+    JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo, PushOptions, PushReport,
+    RebaseOptions, RemoveOptions, RevisionResult, RunSandboxMode, StdinSource, WorkspaceInfo,
 };
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::WorkspaceName;
@@ -1482,11 +1482,11 @@ impl WorkspaceHandle {
         })
     }
 
-    pub async fn checkpoint(&self, label: Option<&str>) -> Result<String> {
+    pub async fn checkpoint(&self, options: CheckpointOptions) -> Result<String> {
         let result: CheckpointResult = call_typed(
             &self.runtime,
             "worker.checkpoint",
-            json!({ "workspace": self.name(), "label": label }),
+            json!({ "workspace": self.name(), "options": options }),
         )
         .await?;
         Ok(result.label)
@@ -1887,6 +1887,67 @@ mod tests {
             stdout_copy: None,
             stderr_copy: None,
         }
+    }
+    fn workspace_handle(runtime: Arc<dyn ControllerRuntime>) -> WorkspaceHandle {
+        WorkspaceHandle {
+            workspace: WorkspaceRef {
+                info: WorkspaceInfo {
+                    repo_id: RepoId::parse("acme/widget").unwrap(),
+                    workspace: WorkspaceName::new("raven").unwrap(),
+                    workspace_incarnation: crate::metadata::WorkspaceIncarnation::new(
+                        "0198f2c0b7e34dc795f17b238b331c80",
+                    )
+                    .unwrap(),
+                    role: crate::metadata::WorkspaceRole::Workspace,
+                    image_format: crate::metadata::ImageFormat::Asif,
+                    mount: PathBuf::from("/mnt/raven"),
+                    state: super::super::dto::WorkspaceState::Detached,
+                    branch: None,
+                    base_commit: None,
+                    created_at: None,
+                    checkpoints: Vec::new(),
+                    snapshot_stale: false,
+                },
+                grants: GrantSet::default(),
+                runtime: Arc::clone(&runtime),
+            },
+            runtime,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checkpoint_forwards_label_and_pin_intent() {
+        let (runtime, mut server) = actor_pair();
+        let handle = workspace_handle(runtime);
+        let server_task = tokio::spawn(async move {
+            let (_, request) = read_rpc_request(&mut server).await;
+            assert_eq!(request["method"], "worker.checkpoint");
+            assert_eq!(
+                request["params"],
+                json!({
+                    "workspace": "raven",
+                    "options": {"label": "before-write", "keep": true}
+                })
+            );
+            write_rpc_success(
+                &mut server,
+                request["id"].as_u64().unwrap(),
+                json!({"label": "before-write"}),
+                None,
+            )
+            .await;
+        });
+
+        let label = handle
+            .checkpoint(CheckpointOptions {
+                label: Some("before-write".into()),
+                keep: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(label, "before-write");
+        server_task.await.unwrap();
     }
 
     #[cfg(unix)]

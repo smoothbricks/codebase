@@ -110,6 +110,11 @@ fn workspace_info_attached_and_detached_shapes_are_frozen() {
         branch: Some("raven".into()),
         base_commit: Some(oid('a')),
         created_at: Some(timestamp()),
+        checkpoints: vec![CheckpointInfo {
+            label: "before-write".into(),
+            revision: 7,
+            pinned: true,
+        }],
         snapshot_stale: false,
     };
     assert_eq!(
@@ -125,7 +130,12 @@ fn workspace_info_attached_and_detached_shapes_are_frozen() {
             "branch": "raven",
             "baseCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "createdAt": "2026-07-11T12:34:56Z",
-            "snapshotStale": false
+            "snapshotStale": false,
+            "checkpoints": [{
+                "label": "before-write",
+                "revision": 7,
+                "pinned": true
+            }]
         })
     );
 
@@ -377,12 +387,13 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
     assert_eq!(
         serde_json::to_value(AdoptOptions {
             path: None,
+            repo_id: Some(repo()),
             capacity: Some("100g".into()),
             quarantine: true,
             image_format: Some(ImageFormat::Sparse),
         })
         .unwrap(),
-        json!({"capacity":"100g","quarantine":true,"imageFormat":"sparse"})
+        json!({"repoId":"acme/widget","capacity":"100g","quarantine":true,"imageFormat":"sparse"})
     );
     assert_eq!(
         serde_json::to_value(CreateOptions {
@@ -404,8 +415,20 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
         json!({"browse":true})
     );
     assert_eq!(
-        serde_json::to_value(RemoveOptions { force: false }).unwrap(),
-        json!({"force":false})
+        serde_json::to_value(RemoveOptions {
+            force: false,
+            restore: true,
+        })
+        .unwrap(),
+        json!({"force":false,"restore":true})
+    );
+    assert_eq!(
+        serde_json::to_value(CheckpointOptions {
+            label: Some("before-write".into()),
+            keep: true,
+        })
+        .unwrap(),
+        json!({"label":"before-write","keep":true})
     );
     assert_eq!(
         serde_json::to_value(GcOptions { dry_run: true }).unwrap(),

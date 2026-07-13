@@ -52,12 +52,14 @@ the copy — so adopt is an explicit transaction with defined crash points, not 
 1. Verify: git root, clean-enough state (adopt refuses mid-merge/rebase), free space, the secrets gate, and repository
    identity. Remote discovery may propose normalized lowercase `owner/repo` candidates but never silently chooses or
    mints one. Adoption selects a remote, records its normalized URL and `repo_id`, validates they agree, designates one
-   primary identity if several are bound, and requires `--repo-id owner/repo` for a local-only repository. Load trusted
-   policy only from `~/.cowshed/<owner>/<repo>/policy.json`. Also require that `<root>.pre-cowshed` does **not** already
-   exist (exit 4 — a previous adopt left state behind; resolve it first). Ensure host setup is present — declaratively
-   validated when home-manager/nix-darwin owns it (`programs.cowshed`/`services.cowshed`, 14_nix.md), imperatively
-   applied otherwise — and both dedicated volumes exist: lazily create and mount `cowshed.store` (at `~/.cowshed`) then
-   `cowshed.caches` (nested; ordering and the volume marker in 01_storage.md) before any image is created.
+   primary identity if several are bound, and requires `--repo-id owner/repo` for a local-only repository. Programmatic
+   callers supply the same explicit identity as `AdoptOptions.repo_id`; omission is valid only when remote selection
+   produces the trusted binding. Load trusted policy only from `~/.cowshed/<owner>/<repo>/policy.json`. Also require
+   that `<root>.pre-cowshed` does **not** already exist (exit 4 — a previous adopt left state behind; resolve it first).
+   Ensure host setup is present — declaratively validated when home-manager/nix-darwin owns it
+   (`programs.cowshed`/`services.cowshed`, 14_nix.md), imperatively applied otherwise — and both dedicated volumes
+   exist: lazily create and mount `cowshed.store` (at `~/.cowshed`) then `cowshed.caches` (nested; ordering and the
+   volume marker in 01_storage.md) before any image is created.
 2. Select the supported format, then create the image under a staged, non-enumerated, format-specific name:
    `<owner>/<repo>/.staging/main.asif` for ASIF or `<owner>/<repo>/.staging/main.sparseimage` for SPARSE. Both
    components come from the validated primary `repo_id` and are encoded independently as specified in 01_storage.md.
@@ -170,6 +172,9 @@ source endpoint or CA.
   allocation.
 - `cowshed gc` retains every pinned checkpoint, every checkpoint younger than 14 days, and always the newest five per
   workspace. A supplied label and `--keep` both create explicit pins; only an explicit unpin makes them eligible.
+  `CheckpointOptions.keep` carries the same pin request for programmatic callers. `WorkspaceInfo.checkpoints` always
+  projects the canonical `{label, revision, pinned}` facts (an empty array when none exist), so detached workspaces do
+  not need a mount or cached marker to report their retry points.
 
 ### Checkpoint before writer handoff
 
@@ -324,8 +329,8 @@ The full born-from-host-return-to-host close-out, as one primitive. The target d
 4. Background (spawned detached): detach the mount (escalating to `-force` after a 10 s grace), unlink the trashed image
    and any checkpoints, remove the mountpoint dir. Interrupted cleanup is resumed by `cowshed gc` (idempotent).
 
-`cowshed rm main --restore` is the adoption rollback described above; plain `cowshed rm main` requires `--force` and a
-clean `git status` (exit 4 otherwise).
+`cowshed rm main --restore` is the adoption rollback described above and maps to `RemoveOptions.restore`; plain
+`cowshed rm main` requires `--force` and a clean `git status` (exit 4 otherwise).
 
 ## `cowshed attach` / `cowshed detach`
 
