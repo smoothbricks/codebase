@@ -409,16 +409,23 @@ func TestCanonicalManifestBytesFreezesRecordShapeAndNewline(t *testing.T) {
 	}
 }
 
-func TestWorkspaceVocabularyManifestFreezesCanonicalThirteenRecords(t *testing.T) {
+func TestWorkspaceVocabularyManifestFreezesCanonicalFortyFourRecords(t *testing.T) {
 	manifest, err := loadVocabularyManifest(filepath.Join("..", "..", "..", "lmao.vocabulary.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantHash = "1f92e229d16bd3470e7dc1f15673f689f9350886788f2475a18236e228f6c6ae"
+	const wantHash = "71704d4de103c86fc8ad67aae66e00da962909f1dfdfda0d2a05d4da1d91942a"
 	if manifest.ContentHash != wantHash {
 		t.Fatalf("workspace vocabulary content hash = %s, want %s", manifest.ContentHash, wantHash)
 	}
-	wantIDs := []uint32{273228, 377410, 2878065, 7140773, 8012750, 9474871, 12761596, 13676444, 13700822, 15317875, 15419721, 16094209, 16369894}
+	wantIDs := []uint32{
+		273228, 377410, 710401, 2076023, 2386772, 2827682, 2859671, 2878065,
+		3148344, 4591923, 5230921, 5261009, 6461409, 6878406, 7139468, 7140773,
+		7297412, 7618545, 8012750, 8619290, 9141714, 9474871, 9909391, 10509935,
+		11095986, 11413935, 11765229, 12761596, 12949665, 13304129, 13547163, 13676444,
+		13700822, 14278264, 14696506, 15020928, 15317875, 15339825, 15419721, 15531707,
+		15639725, 16094209, 16343363, 16369894,
+	}
 	gotIDs := make([]uint32, len(manifest.Entries))
 	for index, entry := range manifest.Entries {
 		gotIDs[index] = entry.ID
