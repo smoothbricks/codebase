@@ -13,6 +13,7 @@
 import { afterEach, beforeAll, describe, expect, it } from 'bun:test';
 import { convertToArrowTable } from '../../convertToArrow.js';
 import { defineOpContext } from '../../defineOpContext.js';
+import { JsBufferStrategy } from '../../JsBufferStrategy.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import {
@@ -26,6 +27,7 @@ import {
   ENTRY_TYPE_WARN,
 } from '../../schema/systemSchema.js';
 import { TestTracer } from '../../tracers/TestTracer.js';
+import { createTraceRoot as createNodeTraceRoot } from '../../traceRoot.node.js';
 import { WasmBufferStrategy } from '../WasmBufferStrategy.js';
 import { createWasmTraceRootFactory } from '../wasmTraceRoot.js';
 
@@ -602,6 +604,77 @@ describe('WASM Integration Tests', () => {
       expect(buffer.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
       // Timestamps should reflect the delay
       expect(buffer.timestamp[1]).toBeGreaterThan(buffer.timestamp[0]);
+    });
+  });
+
+  describe('JS/WASM timestamp output parity', () => {
+    it('emits identical timestamped lifecycle rows across overflow and child spans', async () => {
+      const jsSchema = defineLogSchema({
+        userId: S.category(),
+        latency: S.number(),
+        operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
+        success: S.boolean(),
+      });
+      const jsOpContext = defineOpContext({
+        logSchema: jsSchema,
+        ctx: { env: undefined as { region: string } | undefined },
+      });
+      const jsStrategy = new JsBufferStrategy<typeof jsSchema>();
+      const jsTracer = new TestTracer(jsOpContext, {
+        bufferStrategy: jsStrategy,
+        createTraceRoot: createNodeTraceRoot,
+      });
+      const originalDateNow = Date.now;
+      const originalHrtime = process.hrtime.bigint;
+      const originalPerformanceNow = performance.now;
+      const epochMillis = 1_700_000_000_000;
+      const nodeAnchor = 5_000_000n;
+      const performanceAnchor = 1_000;
+
+
+      try {
+        Date.now = () => epochMillis;
+        let nodeTick = 0n;
+        process.hrtime.bigint = () => nodeAnchor + nodeTick++ * 125_000n;
+        await jsTracer.trace('parity-root', async (root) => {
+          for (let i = 0; i < 70; i++) root.log.info(`root-${i}`);
+          await root.span('parity-child', async (child) => {
+            for (let i = 0; i < 70; i++) child.log.info(`child-${i}`);
+            return child.ok('child done');
+          });
+          return root.ok('root done');
+        });
+
+        let performanceTick = 0;
+        Object.defineProperty(performance, 'now', {
+          configurable: true,
+          value: () => performanceAnchor + performanceTick++ * 0.125,
+        });
+        await tracer.trace('parity-root', async (root) => {
+          for (let i = 0; i < 70; i++) root.log.info(`root-${i}`);
+          await root.span('parity-child', async (child) => {
+            for (let i = 0; i < 70; i++) child.log.info(`child-${i}`);
+            return child.ok('child done');
+          });
+          return root.ok('root done');
+        });
+
+        const jsTable = jsStrategy.toArrowTable(jsTracer.rootBuffers[0]);
+        const wasmTable = strategy.toArrowTable(tracer.rootBuffers[0]);
+        expect(wasmTable.numRows).toBe(jsTable.numRows);
+        for (const columnName of ['entry_type', 'message', 'timestamp'] as const) {
+          const jsColumn = jsTable.getChild(columnName);
+          const wasmColumn = wasmTable.getChild(columnName);
+          if (!jsColumn || !wasmColumn) throw new Error(`missing parity column: ${columnName}`);
+          const jsValues = Array.from({ length: jsTable.numRows }, (_, row) => jsColumn.get(row));
+          const wasmValues = Array.from({ length: wasmTable.numRows }, (_, row) => wasmColumn.get(row));
+          expect(wasmValues).toEqual(jsValues);
+        }
+      } finally {
+        Date.now = originalDateNow;
+        process.hrtime.bigint = originalHrtime;
+        Object.defineProperty(performance, 'now', { configurable: true, value: originalPerformanceNow });
+      }
     });
   });
 
