@@ -1,5 +1,5 @@
 // Generated from the canonical root lmao.vocabulary.json manifest.
-// Do not edit; run bun run vocabulary:sync.
+// Do not edit; run bun tooling/lmao-vocabulary.mjs sync.
 
 import { registerVocabularyFragment } from '../lib/vocabularyRegistry.js';
 

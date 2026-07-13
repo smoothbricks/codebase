@@ -1,5 +1,5 @@
 // Generated from the canonical root lmao.vocabulary.json manifest.
-// Do not edit; run bun run vocabulary:sync.
+// Do not edit; run bun tooling/lmao-vocabulary.mjs sync.
 
 pub const VOCABULARY_SCHEMA_VERSION: u32 = 1;
 pub const VOCABULARY_ID_ALGORITHM: &str = "sha256-24-v1";
