@@ -85,7 +85,15 @@ pub struct ExecRequest {
     pub env: HashMap<String, String>,    // filtered through the build-config allowlist
     pub trace: Option<TraceContext>,     // W3C context; propagated into the job env as TRACEPARENT (13_telemetry.md)
     pub stdin: StdinSource,
+    pub stdout_copy: Option<OutputPublication>,
+    pub stderr_copy: Option<OutputPublication>,
 }
+
+pub struct OutputPublication {
+    pub path: WorkspacePath,             // writable caller-visible destination, never artifact authority
+    pub policy: PublicationPolicy,       // CreateNew | Replace
+}
+pub enum PublicationPolicy { CreateNew, Replace }
 
 /// Binary stdin without shell interpolation. N-API projects Inline as Uint8Array/Buffer,
 /// Stream as a backpressured readable, and WorkspaceFile as a relative path object.
@@ -122,14 +130,114 @@ pub enum ExitStatus {
 pub struct OutputSummary {
     pub version: u16,
     pub text: String,
-    pub truncated: bool,                 // the summary omitted source bytes; not spool truncation
+    pub truncated: bool,                 // the summary omitted source bytes; not artifact truncation
+}
+
+/// Opaque bytes bounded by MAX_INLINE_OUTPUT_BYTES. Arrow uses Binary. JSON/N-API uses the exact
+/// wire union `{encoding:"utf8",data:String}|{encoding:"base64",data:String}` and bounds decoded bytes.
+/// Serialization chooses utf8 iff the bytes are valid UTF-8; decoding is lossless in both branches.
+pub struct BinaryData(Bytes);
+
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ProtectedOutput {
+    Inline { data: BinaryData },
+    File { path: WorkspacePath },
+}
+
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum OutputStorage {
+    Captured { artifact: ProtectedOutput },
+    Redirect {
+        source: WorkspacePath,           // mutable live shell destination; never authority
+        artifact: ProtectedOutput,       // independent sealed canonical bytes
+    },
 }
 
 pub struct StreamInfo {
-    pub path: WorkspacePath,             // `.cowshed/job/<id>/out` or `err`, relative to mount
+    pub storage: OutputStorage,
     pub bytes: u64,
+    pub sha256: Sha256Digest,
     pub summary: OutputSummary,
 }
+
+/// Protected in-volume record schema. `version` is carried by the selected variant as `record_version` in Arrow.
+pub struct JobArtifactRecord {
+    pub repo_id: RepoId,
+    pub workspace_incarnation: WorkspaceIncarnation,
+    pub job_id: JobId,
+    pub sequence: u64,
+    pub state: JobState,
+    pub grant_revision: u64,
+    pub stdout: StreamInfo,
+    pub stderr: StreamInfo,
+}
+#[serde(rename_all = "kebab-case")]
+pub enum VisibleStorageKind { CapturedInline, CapturedFile, RedirectInline, RedirectFile }
+pub struct VisibleStreamCommitment {
+    pub storage_kind: VisibleStorageKind,
+    pub bytes: u64,
+    pub sha256: Sha256Digest,
+    pub protected_path: Option<WorkspacePath>, // present exactly for *File
+}
+pub struct VisibleJobCommitment {
+    pub workspace_incarnation: WorkspaceIncarnation,
+    pub job_id: JobId,
+    pub state: JobState,
+    pub stdout: VisibleStreamCommitment,
+    pub stderr: VisibleStreamCommitment,
+}
+pub struct CheckpointManifestRecord {
+    pub version: u16,
+    pub repo_id: RepoId,
+    pub origin_incarnation: WorkspaceIncarnation,
+    pub barrier_id: u64,
+    pub visible_jobs: Vec<VisibleJobCommitment>,
+    pub records_sha256: Sha256Digest,
+}
+pub enum ProtectedRecord {
+    Job(JobArtifactRecord),
+    CheckpointManifest(CheckpointManifestRecord),
+}
+
+/// Compact controller continuity schema. Every event struct flattens identity and carries `version` + `order`.
+pub struct AdmissionCommitment {
+    pub version: u16, pub order: u64, pub repo_id: RepoId,
+    pub workspace_incarnation: WorkspaceIncarnation, pub job_id: JobId, pub grant_revision: u64,
+}
+pub struct TerminalCommitment {
+    pub version: u16, pub order: u64, pub repo_id: RepoId,
+    pub workspace_incarnation: WorkspaceIncarnation, pub job_id: JobId,
+    pub state: JobState, pub grant_revision: u64,
+    pub stdout_bytes: u64, pub stdout_sha256: Sha256Digest,
+    pub stderr_bytes: u64, pub stderr_sha256: Sha256Digest,
+    pub batch_sha256: Sha256Digest,
+}
+
+pub struct CheckpointCommitment {
+    pub version: u16, pub order: u64, pub repo_id: RepoId,
+    pub origin_incarnation: WorkspaceIncarnation, pub checkpoint_id: String,
+    pub barrier_id: u64, pub manifest_batch_sha256: Sha256Digest,
+}
+pub struct ForkCommitment {
+    pub version: u16, pub order: u64, pub repo_id: RepoId,
+    pub source_incarnation: WorkspaceIncarnation, pub destination_incarnation: WorkspaceIncarnation,
+}
+pub struct RestoreCommitment {
+    pub version: u16, pub order: u64, pub repo_id: RepoId, pub source_checkpoint: String,
+    pub source_incarnation: WorkspaceIncarnation, pub destination_incarnation: WorkspaceIncarnation,
+}
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ControllerCommitment {
+    Admission(AdmissionCommitment),
+    Terminal(TerminalCommitment),
+    Checkpoint(CheckpointCommitment),
+    Fork(ForkCommitment),
+    Restore(RestoreCommitment),
+}
+
+For queued/running `JobInfo`, `StreamInfo` is a current bounded view; its artifact becomes authoritative only when the
+corresponding protected batch/file is complete and sealed. Background acknowledgement and checkpointing force any
+memory-only prefix to `File`. Terminal state freezes `storage`, `bytes`, and `sha256`.
 
 /// The single lifecycle/result DTO reused by core, CLI JSON, N-API, MCP, and Arrow projections.
 pub struct JobInfo {
@@ -162,7 +270,7 @@ impl JobHandle {
     pub fn id(&self) -> JobId;
     pub async fn status(&self) -> Result<JobInfo, CowshedError>;
     pub async fn logs(&self, stream: JobStream, follow: bool)
-        -> Result<RawByteStream, CowshedError>; // `next()` yields raw `Bytes` from the backing file
+        -> Result<RawByteStream, CowshedError>; // representation-transparent; always resolves storage.artifact
     pub async fn attach(&self) -> Result<JobAttachment, CowshedError>;
     pub async fn detach(&self) -> Result<(), CowshedError>;          // job continues
     pub async fn wait(&self) -> Result<JobInfo, CowshedError>;
@@ -335,20 +443,24 @@ publication rather than accepting an overwrite. After success, the source may be
 survive are reachable from the returned durable ref. Remote publication and workflow policy are not part of this API.
 
 `WorkspaceHandle::checkpoint` is intentionally available to a worker for retry points, but it is not unbounded storage
-authority. Admission atomically enforces the coordinator-configured per-workspace checkpoint count and byte quotas;
-quota exhaustion is `CowshedError::Conflict` with the current usage and limit, and never triggers implicit pruning or a
-coordinator operation. Restore remains coordinator-only.
+authority. Admission atomically enforces checkpoint count/byte quotas, then runs the 02_workspaces.md barrier: pause
+admissions/artifact writes, promote running memory-only stream prefixes, fsync protected files, append and fsync the
+complete manifest batch, clone while held, and publish the controller manifest-digest/lineage commitment. Quota
+exhaustion is `CowshedError::Conflict`; manifest/commitment mismatch is `CowshedError::Integrity`. Restore remains
+coordinator-only.
 
 `JobInfo.state = OutputLimit` is the explicit result when the configurable combined stdout+stderr quota (default 1 GiB)
-is crossed. Accounting includes persisted and in-flight bytes; the supervisor terminates the process group, observes the
-grace, kills stragglers, drains both pipes, and only then publishes the terminal DTO. No API silently truncates and
-continues the job. Summaries remain a separate bounded diagnostic projection.
+is crossed. Accounting includes protected and in-flight bytes; the supervisor admits no payload beyond the exact
+boundary, terminates the process group, drains pipes, seals artifacts, and only then publishes terminal state. Summaries
+remain a separate bounded diagnostic projection.
 
 The shell connection is a reconnectable view over the persistent, permission-checked, multi-client per-workspace
 supervisor socket (11_shell.md). Dropping a `Session`, `JobHandle`, or transport never unlinks that socket or stops the
-job. Authoritative status comes from controller-owned immutable per-writer telemetry segments delivered through the
-controller-provided non-inheritable writer capability/FD or IPC channel; workspace-local `records.arrow` is never
-trusted for status, authorization, denial, quota, or audit decisions.
+job. Protected complete in-volume Arrow batches and sealed artifacts are authoritative captured-content evidence within
+their origin incarnation/checkpoint boundary. Controller commitments are authoritative for existence/status/order/
+lineage and expected counts/hashes, without payload/path duplication. APIs reconcile both and return `Integrity` for a
+missing committed artifact, invalid complete batch, or digest/lineage contradiction; neither side silently wins.
+Authorization, grant, and gateway audit authority remain controller-owned.
 
 The invariant is the same one that keeps grant files outside the volume (01_storage.md, 04): a capability reachable from
 inside a sandbox must not authorize escalation. `WorkspaceHandle` is that principle expressed in the type system — a
@@ -356,25 +468,37 @@ subagent holding one cannot grant itself anything.
 
 ## DTO freeze (single source of truth)
 
-These types are defined **once** in `cowshed-core` and reused verbatim by the CLI (`--json` bodies), NAPI, and MCP — no
-adapter redefines a field, and the contract goldens (08_testing.md) pin their shapes: `WorkspaceInfo`, `EnsureReport`,
-`GcReport`, `Finding`, `JobId`, `JobState`, `JobInfo`, `StreamInfo`, `OutputSummary`, `ExecRecord`, `PushReport`,
-`LandReport`, `RevisionTarget`, `GrantSet`/`GrantDelta`/`PortBlock`/`EgressRule`/`RepoRule`/`SimVerb`, `GatewayStatus`,
-`AuditEvent`, and every `*Options` type (`AdoptOptions`, `CreateOptions`, `AttachOptions`, `RemoveOptions`,
-`RebaseOptions`, `LandOptions`, `PushOptions`). Field sketches elsewhere in this spec are illustrative; the freeze rule
-— one definition, reused, versioned together — is the contract. `GrantSet.port_block` is the platform union: macOS
-always `PortBlock`, while Linux carries `None` and its JSON/N-API projection omits `portBlock`. Adapters and consumers
-must use that optional shape directly; casts, `null`, zero-sized blocks, and sentinel base values are forbidden. Adding
-a field is a coordinated change across core + goldens, not a per-adapter patch. JSON and N-API use the same camel-case
-projection: `JobInfo.stdout` and `JobInfo.stderr` are `StreamInfo` objects, each with `path`, `bytes`, and `summary`;
-each `summary` has `version`, `text`, and `truncated`. The paths name the in-workspace raw byte files containing every
-byte admitted before any output-limit trip. There are no flattened aliases or adapter-specific spellings. Field names
-are camel-case, but `ErrorCode` values are taxonomy tokens rather than field names: CLI JSON, Rust serde, N-API
-rejection objects, and MCP all use the same kebab-case `not-found`, `environment-missing`, and `sandbox-denied`
-spellings. No adapter camel-cases or otherwise rewrites an error code.
+Externally projected types are defined **once** in `cowshed-core` and reused verbatim by the CLI (`--json` bodies),
+NAPI, and MCP — no adapter redefines a field, and contract goldens (08_testing.md) pin their shapes: `WorkspaceInfo`,
+`EnsureReport`, `GcReport`, `Finding`, `JobId`, `JobState`, `JobInfo`, `StreamInfo`, `OutputStorage`, `ProtectedOutput`,
+`BinaryData`, `OutputSummary`, `OutputPublication`, `PublicationPolicy`, `ControllerCommitment` and its five event
+structs, `PushReport`, `LandReport`, `RevisionTarget`, `GrantSet`/`GrantDelta`/`PortBlock`/`EgressRule`/
+`RepoRule`/`SimVerb`, `GatewayStatus`, `AuditEvent`, and every `*Options` type (`AdoptOptions`, `CreateOptions`,
+`AttachOptions`, `RemoveOptions`, `RebaseOptions`, `LandOptions`, `PushOptions`).
 
-The authoritative Rust definitions live in `cowshed_core::api::dto`; serde uses `camelCase`, enum values use the
-documented lower/camel-case strings, and every optional field is omitted rather than encoded as `null`.
+`JobArtifactRecord`, `ProtectedRecord`, `CheckpointManifestRecord`, and `VisibleJobCommitment` are canonical internal
+storage/Arrow contracts, not CLI/N-API/MCP JSON envelopes. Adapters expose only their bounded constituent result types
+and payload-free controller commitments; they never reveal protected paths or inline storage records.
+
+Field sketches elsewhere in this spec are illustrative; the freeze rule — one definition, reused, versioned together —
+is the contract. `GrantSet.port_block` is the platform union: macOS always `PortBlock`, while Linux carries `None` and
+its JSON/N-API projection omits `portBlock`. Adapters and consumers must use that optional shape directly; casts,
+`null`, zero-sized blocks, and sentinel base values are forbidden. Adding a field is a coordinated change across core +
+goldens, not a per-adapter patch.
+
+JSON and N-API use the same camel-case projection. `StreamInfo` is exactly `{storage,bytes,sha256,summary}`. `storage`
+is `{kind:"captured",artifact}` or `{kind:"redirect",source,artifact}`; an artifact is `{kind:"inline",data}` or
+`{kind:"file",path}`. Inline `data` is the bounded wire union
+`{encoding:"utf8",data:"…"} | {encoding:"base64",data:"…"}`; `sha256` is 64 lowercase hex characters. Ordinary `JobInfo`
+JSON may carry this bounded inline data, while controller commitments carry no payload. No path exists for an inline
+artifact, and no adapter adds a synthetic one. `Redirect.source` is mutable caller-visible state; readers and authority
+always resolve its independent protected `artifact`. `summary` is `{version,text,truncated}`. Field names are
+camel-case, but `ErrorCode` values are taxonomy tokens: every adapter uses the same kebab-case `not-found`,
+`environment-missing`, and `sandbox-denied` plus the unhyphenated `integrity`; no adapter rewrites an error code.
+
+Public request/result and controller-commitment definitions live in `cowshed_core::api::dto`; the protected
+`JobArtifactRecord`/manifest/record envelope and Arrow projections live in `cowshed_core::storage::job_artifact` and
+reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission rather than `null`.
 
 - `WorkspaceInfo = { repoId, workspace, workspaceIncarnation, role, imageFormat, mount, state, branch?, baseCommit?, createdAt?, snapshotStale }`;
   `state` is `"attached" | "detached"`. Detached rows without a cached marker snapshot omit all three marker-derived
@@ -392,14 +516,23 @@ documented lower/camel-case strings, and every optional field is omitted rather 
   ranges are validated. `exit` is the discriminated union `{kind:"exited",code}` or
   `{kind:"signaled",signal,coreDumped}`; it is absent before a process result exists. `outputLimit` is present iff
   `state == "outputLimit"`. Both serialization and deserialization enforce these state / duration / exit / output-limit
-  invariants. `StreamInfo` contains only `{path,bytes,summary}` and never raw output bytes.
+  invariants.
+- `StreamInfo = { storage, bytes, sha256, summary }` with the exact discriminated unions above. JSON decoders reject
+  unknown/multiple discriminants, invalid digest hex, inline data over `MAX_INLINE_OUTPUT_BYTES`, a protected file path
+  outside `.cowshed/job/**`, or a redirect source outside the writable workspace. Complete output bytes never appear in
+  controller commitments; bounded inline output may appear only in protected Arrow Binary and tagged API JSON.
 - `StdinInfo = { kind, bytes, workspacePath?, complete }`; kind is `"empty" | "inline" | "stream" | "workspaceFile"`.
-  Every `cwd`, stream path, and workspace stdin path uses the validated relative `WorkspacePath` domain type: no root,
-  empty component, `.`/`..`, prefix, NUL, or symlink-following open. Public capability methods convert non-UTF8 host
-  paths into typed `CowshedError::Usage`; they never pass a `Path` to `json!` or panic while constructing a controller
-  request.
-- `ExecRecord` repeats the durable `(repoId,workspaceIncarnation,jobId)` key and the terminal job fields
-  `{state,argv,cwd,envHash,grantRevision,trace,started,durationMs,exit?,stdout,stderr,stdin,outputLimit?}`.
+  Every cwd, protected artifact path, redirect source, publication path, and workspace stdin path uses the validated
+  relative `WorkspacePath` domain type: no root, empty component, `.`/`..`, prefix, NUL, or symlink-following open.
+  Public capability methods convert non-UTF8 host paths into typed `CowshedError::Usage`; they never pass a `Path` to
+  `json!` or panic while constructing a controller request.
+- `ProtectedRecord` is exactly `Job(JobArtifactRecord) | CheckpointManifest(CheckpointManifestRecord)`. The Job fields
+  are `{repoId,workspaceIncarnation,jobId,sequence,state,grantRevision,stdout,stderr}`. Protected Arrow begins
+  `record_kind,record_version,repo_id`; Job uses the frozen flat stream columns, while CheckpointManifest uses
+  `{origin_incarnation,barrier_id,visible_jobs,records_sha256}`. Variant-invalid null combinations reject.
+- `ControllerCommitment` is exactly the tagged Admission/Terminal/Checkpoint/Fork/Restore union defined above. Its Arrow
+  prefix is `commitment_kind,commitment_version,commitment_order,repo_id`; it never contains payload/path/summary
+  fields.
 - `RevisionTarget` projects as an exact one-key object `{branch}`, `{ref}`, or `{oid}` and rejects ambiguous/multi-key
   objects. Branch and fully-qualified ref values use validated `BranchName` / `GitRef` domains; raw invalid strings
   cannot be serialized. `ExpectedRefHead` projects as `{missing:true}` or `{oid}`. Oids are validated lowercase 40- or
@@ -423,8 +556,9 @@ documented lower/camel-case strings, and every optional field is omitted rather 
 `ResultBody`; `()` and adapter-local maps cannot satisfy it, so `result:null` is unrepresentable and no public enum
 variant or arbitrary `ok` boolean can bypass the contract. `EmptyResult {}` is the sole empty success and serializes as
 `{}`. The discriminant is also validated when decoding. `CowshedError` is the single structured value
-`{code,message,hint}` with the stable codes `internal`, `usage`, `not-found`, `conflict`, `environment-missing`, and
-`sandbox-denied`.
+`{code,message,hint}` with stable codes `internal`, `usage`, `not-found`, `conflict`, `environment-missing`,
+`sandbox-denied`, and `integrity`. `Integrity` covers missing/altered committed content and invalid complete Arrow
+batches; discarding an incomplete trailing batch is successful recovery with a structured recovery report.
 
 ## Shell client (`cowshed-shell`)
 
@@ -439,33 +573,20 @@ impl Session {
     pub async fn close(self) -> Result<(), CowshedError>;   // named: persist; anonymous: return to pool
 }
 
-/// The single capture record CLI, MCP, and CI all consume (11_shell.md).
-pub struct ExecRecord {
-    pub repo_id: RepoId,
-    pub workspace_incarnation: WorkspaceIncarnation,
-    pub job_id: JobId,
-    pub state: JobState,
-    pub argv: Vec<String>, pub cwd: WorkspacePath, pub env_hash: u64,
-    pub grant_revision: u64,
-    pub trace: TraceContext,
-    pub started: UtcTimestamp, pub duration_ms: u64,
-    pub exit: Option<ExitStatus>,
-    pub stdout: StreamInfo, pub stderr: StreamInfo,
-    pub stdin: StdinInfo,
-    pub output_limit: Option<OutputLimitInfo>,
-}
-
+/// Session uses the protected/controller record DTOs defined in the frozen API block above.
 ```
 
-`ExecRecord` is terminal-only. Its custom serializer and deserializer both reject queued/running states, mismatched exit
-kinds, and any `outputLimit` presence that disagrees with the state; adapters cannot persist an invalid record.
+`JobArtifactRecord` is the protected content record consumed by CLI, MCP, NAPI, and CI. It is not the richer `JobInfo`:
+the latter remains the live/result API projection. Record and commitment constructors, serializers, and deserializers
+run the same validation. `CommitmentPriorContext` plus `validate_commitments` enforce positive global order,
+admission-before-single-terminal, known checkpoints, and acyclic incarnation lineage across batches.
 
 Every foreground and background submission is the same durable job: attachment is a client state, not a second exec
-kind. The allocator commits `JobId` before spawn, so even a pre-spawn failure has a queryable terminal `JobInfo`. Raw
-stdout and stderr are always captured separately at `.cowshed/job/<id>/out` and `.cowshed/job/<id>/err`; streaming reads
-those files (and follows them while running) rather than creating a competing capture path. Summaries are deterministic,
-size-bounded, versioned, and redacted. They may be copied into control results and Arrow records for orientation, but
-must never determine denial, exit, policy, or build success; those decisions use authoritative status and evidence.
+kind. The allocator commits `JobId` before spawn, so even a pre-spawn failure has a queryable terminal `JobInfo`.
+Stdout/stderr remain separate. Small terminal streams are protected inline Arrow Binary; lazy protected files exist only
+after promotion. `JobHandle.logs` and attachments read them representation-transparently through
+`StreamInfo.storage.artifact`. Summaries are deterministic, bounded, versioned, and redacted, and never determine
+denial, exit, policy, or build success.
 
 Arrow records carry `job_id` alongside the standard `trace_id`, `span_id`, and parent linkage. `job_id` joins a job to
 its trace; it is never packed into, substituted for, or derived from `span_id`.
@@ -490,13 +611,13 @@ pub struct CowshedError {
 }
 
 pub enum ErrorCode {
-    Internal, EnvironmentMissing, Usage, NotFound, Conflict, SandboxDenied,
+    Internal, EnvironmentMissing, Usage, NotFound, Conflict, SandboxDenied, Integrity,
 }
 ```
 
-The code maps to stable CLI exits `1, 5, 2, 3, 4, 6` respectively (and wrapper exits `100..105` in the established
-taxonomy order). `hint` is always the same actionable next step the CLI prints on stderr; known operational failures
-never panic or hide an unstructured `anyhow::Error` inside the public value.
+The code maps to stable CLI exits `1, 5, 2, 3, 4, 6, 7` respectively; exec-wrapper failures map to
+`100, 104, 101, 102, 103, 105, 106` for the same variants. `hint` is always the actionable next step printed on CLI
+stderr; known operational failures never panic or hide an unstructured `anyhow::Error` inside the public value.
 
 ## cowshed-napi (`@smoothbricks/cowshed`)
 
@@ -555,9 +676,16 @@ export interface OutputSummary {
   truncated: boolean;
 }
 
+export type BinaryData = { encoding: 'utf8'; data: string } | { encoding: 'base64'; data: string };
+// Both branches are bounded by decoded byte length; utf8 is emitted iff the bytes are valid UTF-8.
+export type ProtectedOutput = { kind: 'inline'; data: BinaryData } | { kind: 'file'; path: string };
+export type OutputStorage =
+  { kind: 'captured'; artifact: ProtectedOutput } | { kind: 'redirect'; source: string; artifact: ProtectedOutput };
+
 export interface StreamInfo {
-  path: string;
+  storage: OutputStorage;
   bytes: number;
+  sha256: string;
   summary: OutputSummary;
 }
 
@@ -597,6 +725,24 @@ export interface JobAttachment {
   detach(): Promise<void>; // closes this view; the job continues
 }
 
+export interface OutputPublication {
+  path: string;
+  policy: 'createNew' | 'replace';
+}
+
+export interface ExecOptions {
+  cwd?: string;
+  mode?: 'readWrite' | 'readOnly';
+  env?: Record<string, string>;
+  trace?: TraceContext;
+  stdin?: Uint8Array | AsyncIterable<Uint8Array> | { workspaceFile: string };
+  stdoutCopy?: OutputPublication;
+  stderrCopy?: OutputPublication;
+  signal?: AbortSignal;
+  onStdout?: (line: string) => void;
+  onStderr?: (line: string) => void;
+}
+
 export interface WorkspaceHandle {
   readonly name: string;
   readonly mountPath: string;
@@ -619,26 +765,33 @@ Promise with `code: "conflict"`; it never silently retries with newer values.
 
 One boundary answer, no ambiguity:
 
-- **Backing files are canonical.** Every exec immediately returns a `JobHandle` with a numeric `jobId`; foreground and
-  background differ only in attachment. Full raw stdout and stderr are independently captured in `.cowshed/job/<id>/out`
-  and `.cowshed/job/<id>/err`. `JobHandle.logs` and an attachment's stream iterables expose those bytes; `JobInfo`
-  exposes stream paths, lengths, and summaries.
-- **JSON is control-only.** A JSON serialization of `JobInfo` carries lifecycle/result metadata and deterministic,
-  bounded, versioned, redacted `stdout.summary` and `stderr.summary` objects; it never contains raw bytes, base64, byte
-  arrays, or a decoded substitute for the backing files. The same summaries appear in Arrow records, and never drive
-  denial, exit, policy, or build-success decisions.
+- **Protected artifacts are canonical.** Every exec immediately returns a `JobHandle` with a numeric `jobId`; foreground
+  and background differ only in attachment. Small terminal streams live inline as protected Arrow Binary; a file is
+  created lazily on promotion. `JobHandle.logs` and attachment stream iterables resolve `storage.artifact`
+  representation-transparently. `Redirect.source` and `stdoutCopy`/`stderrCopy` publication destinations are never used
+  for reads or authority.
+- **JSON is bounded control plus tagged inline data.** Ordinary `JobInfo` may carry `BinaryData` as the exact bounded
+  `utf8|base64` tagged union for an inline protected artifact. It never embeds an unbounded stream or invents a path.
+  Controller commitments never contain either encoding, protected paths, redirect sources, or other output payload.
 - **Bytes, not lines.** Each stream (`stdout`, `stderr`) is an independent `AsyncIterable<Uint8Array>` carrying raw
-  bytes — the transport never assumes UTF-8, so binary output and partial multibyte sequences pass through intact. The
-  `onStdout`/`onStderr` **line callbacks** in `ExecOptions` are convenience sugar layered _over_ the byte iterables
-  (buffer, split on `\n`, decode) for the common text case; they are never the only access path.
+  bytes — the transport never assumes UTF-8. The `onStdout`/`onStderr` line callbacks in `ExecOptions` are convenience
+  sugar over byte iterables and never the only access path.
+- **The controller wire has one bounded binary lane.** JSON is length-framed control only. A request or response may
+  declare top-level camel-case `binaryLength`, followed by exactly one independent u32-length-prefixed raw frame capped
+  at 64 KiB. Inline/stream stdin and attachment writes upload frames. `job.logs` downloads return control metadata
+  `{eof,nextOffset}` and one frame; the actor requires `nextOffset == requestedOffset + binaryLength` with checked
+  arithmetic. JSON-only methods reject binary metadata; binary methods reject missing, oversized, unsolicited, or
+  mismatched frames. The actor serializes frames per connection, and bounded channels preserve cancellation and
+  backpressure without JSON arrays or base64.
+- **Post-terminal publication is independent.** `ExecOptions.stdoutCopy` / `stderrCopy` project
+  `OutputPublication {path,policy}`. They clone/reflink/copy the sealed protected artifact after terminal state, never
+  hardlink, never change `StreamInfo.storage`, and report publication failure separately from process state.
 - **Cancellation** is an `AbortSignal` on `ExecOptions`, attachments, and `JobHandle.logs`/`wait`; aborting stops the
-  client operation. It does not kill the durable job; callers invoke `JobHandle.kill()` explicitly.
-- **Binary stdin** is supported without shell interpolation: `ExecOptions.stdin` accepts the `StdinSource` union of
-  inline `Uint8Array`, backpressured `AsyncIterable<Uint8Array>`, or a workspace-relative file object. File sources use
-  the same canonical no-follow regular-file open as core/MCP/CLI.
+  client operation, not the durable job. Callers invoke `JobHandle.kill()` explicitly.
+- **Binary stdin** is supported without shell interpolation: `ExecOptions.stdin` accepts inline `Uint8Array`,
+  backpressured `AsyncIterable<Uint8Array>`, or a workspace-relative file object with the canonical no-follow open.
 - **Stdin lifecycle is observable.** Open occurs after `JobId` allocation; EOF closes child stdin once, cancellation
-  closes stdin and records incomplete delivery without implicitly killing the job, and events carry only kind, delivered
-  bytes, completion, and optional normalized relative path.
+  records incomplete delivery without implicitly killing the job, and events carry metadata but never inline contents.
 
 **Structured stdin safety.** `WorkspaceFile` must be relative, canonicalize beneath the workspace mount, and be opened
 read-only with no-follow traversal (`openat`-style component walk); symlinks, devices, sockets, directories, escapes,

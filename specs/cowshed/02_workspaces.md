@@ -115,50 +115,74 @@ Budget: ≤ 1 s cold. No pool, no pre-warming.
    `git switch -c cowshed/<name>` from the checked-out state. The `.git` directory arrived complete via CoW — the
    workspace is a standalone repository with **no linked-worktree registration and no back-references** into the host
    checkout.
-7. Print the mount path on stdout; guidance and `next:` hints on stderr.
+7. Publish
+   `ControllerCommitment::Fork(ForkCommitment { version, order, repo_id, source_incarnation, destination_incarnation })`
+   before the new workspace becomes discoverable.
+8. Print the mount path on stdout; guidance and `next:` hints on stderr.
 
 Flags: `--ref <rev>` (after branching, `git switch -c cowshed/<name> <rev>` instead of main's state),
 `--from <workspace>` (clone a session instead of main — sugar over `cowshed fork`), `--browse`.
 
 ## `cowshed fork <src> <dst>`
 
-Clones a _session_ mid-flight: same steps as `cowshed new`, preserving the source image's validated format and extension
-(`sessions/<src>.asif` → `sessions/<dst>.asif`, or `sessions/<src>.sparseimage` → `sessions/<dst>.sparseimage`), and the
-marker records `forkedFrom`. Grants do **not** carry over — the fork starts from the closed baseline, with a freshly
-minted CA and fresh platform endpoint identity. On macOS it receives a newly allocated `portBlock`; on Linux `portBlock`
-remains absent and attach creates a new per-incarnation socket, netns, and connector. Neither platform inherits the
-source endpoint or CA. Two divergent futures from one warm state, ~250 ms on the APFS path.
+Clones a _session_ mid-flight with the same barrier/fencing as `cowshed new`, preserving the source image's validated
+format and extension (`sessions/<src>.asif` → `sessions/<dst>.asif`, or `.sparseimage` → `.sparseimage`). The marker
+records `forkedFrom`, and before destination publication the controller appends
+`ControllerCommitment::Fork(ForkCommitment { version, order, repo_id, source_incarnation, destination_incarnation })`.
+Grants do **not** carry over: the fork starts closed, with a fresh CA and platform endpoint identity. macOS allocates a
+new `portBlock`; Linux leaves it absent and creates a new per-incarnation socket/netns/ connector. Neither inherits the
+source endpoint or CA.
 
 ## `cowshed checkpoint <ws> [label]` / `cowshed restore <ws> <label>`
 
-- Checkpoint: `sync` the workspace volume (freshness — a non-synced clone can miss the last writes; consistency is
-  unconditional, see `cowshed new` step 1), then `clonefile` its image to `checkpoints/<ws>/<label>.<ext>`, preserving
-  `.asif` for ASIF or `.sparseimage` for SPARSE (label defaults to a UTC timestamp). The workspace keeps running; the
-  checkpoint is crash-consistent and fsck-verified in the background.
+- Checkpoint is a supervisor/filesystem barrier. Under the lifecycle lock, cowshed pauses admissions and artifact
+  writes, promotes every running memory-only stream prefix, and fsyncs protected files. It then appends and fsyncs
+  exactly
+  `ProtectedRecord::CheckpointManifest(CheckpointManifestRecord { version, repo_id, origin_incarnation, barrier_id, visible_jobs, records_sha256 })`.
+  `barrier_id` is positive and monotonic within `origin_incarnation`; `records_sha256` hashes the complete
+  protected-record stream prefix immediately before the manifest batch. `visible_jobs` contains
+  `VisibleJobCommitment { workspace_incarnation, job_id, state, stdout, stderr }`; each stream commitment is
+  `{storage_kind, bytes, sha256, protected_path}` with `storage_kind` exactly
+  `captured-inline|captured-file|redirect-inline|redirect-file` and `protected_path` present iff file.
+- With writes still quiesced, cowshed syncs for filesystem freshness and clones the image. The controller atomically
+  publishes
+  `ControllerCommitment::Checkpoint(CheckpointCommitment { version, order, repo_id, origin_incarnation, checkpoint_id, barrier_id, manifest_batch_sha256 })`,
+  then resumes. `manifest_batch_sha256` is the recovery frame's digest for the complete manifest batch. The manifest
+  defines every checkpoint-resident byte: terminal inline data is in a prior protected Job record covered by
+  `records_sha256`; every running prefix is an fsynced protected file. Complete batches/sealed files are immutable;
+  recovery may discard only an incomplete trailing frame while retaining and reporting its `batch_sha256`. Committed
+  digest/count mismatch is `Integrity`.
 - Restore follows the substrate transaction in 09_substrates.md: lock and revalidate the old incarnation/revision; stop
   admissions and drain the supervisor and, on Linux, the connector; detach; prepare and verify a non-enumerated
-  same-format clone; mint and write the fresh `workspaceIncarnation` **before** minting its fresh token; atomically swap
-  the clone into the canonical name; attach and validate; on Linux create the fresh per-incarnation socket and
-  connector; atomically publish detached metadata and switch gateway acceptance from the old endpoint/token to the new
-  endpoint/token at that same boundary; only then admit the new supervisor. The logical workspace identity, primary
+  same-format clone; validate its protected checkpoint manifest against the controller checkpoint commitment; mint and
+  write the fresh `workspaceIncarnation` **before** minting its fresh token; atomically swap the clone into the
+  canonical name; attach and validate; on Linux create the fresh per-incarnation socket and connector. At the same
+  atomic publication boundary, append
+  `ControllerCommitment::Restore(RestoreCommitment { version, order, repo_id, source_checkpoint, source_incarnation, destination_incarnation })`,
+  publish detached metadata, and switch gateway acceptance from the old endpoint/token to the new; only then admit the
+  new supervisor. A missing commitment/artifact, hash/count/batch-digest mismatch, or malformed complete frame fails
+  restore as `Integrity`; cowshed never chooses the newer-looking side. The logical workspace identity, primary
   `repo_id`, CA, and grant binding carry through; a macOS `portBlock` carries through only when present, while Linux has
   none. The displaced image becomes `checkpoints/<ws>/pre-restore-<ts>.<ext>` with its original extension, so restore is
   undoable. Before publication, failure restores the displaced workspace and old token; after the incarnation fence is
   published, recovery completes forward and never exposes both tokens. Copied job records retain the incarnation that
-  produced them, while the new incarnation has its own workspace-local monotonic numeric job sequence.
+  produced them, while the new incarnation allocates workspace-local monotonic numeric job IDs above every inherited
+  allocation.
 - `cowshed gc` retains every pinned checkpoint, every checkpoint younger than 14 days, and always the newest five per
   workspace. A supplied label and `--keep` both create explicit pins; only an explicit unpin makes them eligible.
 
 ### Checkpoint before writer handoff
 
 Before write responsibility passes from one writer to another, the current writer creates a checkpoint after stopping or
-quiescing its writes. The checkpoint is the recovery boundary for the handoff and includes the complete live workspace
-state, including committed and uncommitted files. The next writer may receive a fresh capability for the same attached,
+quiescing its workspace writes. The checkpoint barrier also makes every supervisor-resident captured byte durable and
+publishes the protected manifest/controller commitment pair described above. That checkpoint is the recovery boundary
+for the handoff and includes the complete live workspace state, including committed and uncommitted files, plus exactly
+the job evidence committed by its manifest. The next writer may receive a fresh capability for the same attached,
 writable workspace, or the handoff may create a live copy-on-write fork from that workspace. A fork receives its own
 identity and closed-baseline grants as described above; the source and its checkpoint remain recoverable until the fork
 is accepted or independently preserved. A failed writer can therefore be replaced on the same workspace, or its attempt
-can be abandoned in favor of the checkpoint or an unaffected fork, without conflating handoff with publication or
-retirement.
+can be abandoned in favor of the validated checkpoint or an unaffected fork, without conflating handoff with publication
+or retirement.
 
 ## `cowshed push <ws> [--branch <name>]`
 
