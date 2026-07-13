@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { createHash } from 'node:crypto';
+import { createSpanLogger } from '../codegen/spanLoggerGenerator.js';
 import { convertToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { resolveMessage } from '../resolveMessage.js';
@@ -120,11 +121,12 @@ describe('global vocabulary dense decoding', () => {
     ];
     const binding = registerVocabularyFragment(makeFragment(messages));
     const op = opContext.defineOp('dense-levels', (ctx) => {
-      ctx.log._infoTemplate(binding[0]);
-      ctx.log._debugTemplate(binding[1]);
-      ctx.log._warnTemplate(binding[2]);
-      ctx.log._errorTemplate(binding[3]);
-      ctx.log._traceTemplate(binding[4]);
+      const logger = createSpanLogger(ctx.buffer._logSchema, ctx.buffer);
+      logger._infoTemplate(binding[0]);
+      logger._debugTemplate(binding[1]);
+      logger._warnTemplate(binding[2]);
+      logger._errorTemplate(binding[3]);
+      logger._traceTemplate(binding[4]);
       ctx.log.info('dynamic message');
       return ctx.ok(null);
     });
@@ -137,7 +139,7 @@ describe('global vocabulary dense decoding', () => {
       entryTypes.map((entryType, ordinal) => (binding[ordinal] << 8) | entryType),
     );
     expect(buffer._logHeaders[7]).toBe(0);
-    expect(buffer.message_values.slice(2, 7)).toEqual([undefined, undefined, undefined, undefined, undefined]);
+    for (let row = 2; row < 7; row++) expect(buffer.message_values[row]).toBeUndefined();
     expect(buffer.message_values[7]).toBe('dynamic message');
     expect(Array.from({ length: 6 }, (_, index) => resolveMessage(buffer, index + 2))).toEqual([
       ...messages,
@@ -156,7 +158,8 @@ describe('global vocabulary dense decoding', () => {
   it('keeps overflow rows pinned to their original vocabulary generation after later registration', async () => {
     const firstBinding = registerVocabularyFragment(makeFragment(['pinned generation literal']));
     const op = opContext.defineOp('dense-overflow-generation', (ctx) => {
-      for (let index = 0; index < 20; index++) ctx.log._infoTemplate(firstBinding[0]);
+      const logger = createSpanLogger(ctx.buffer._logSchema, ctx.buffer);
+      for (let index = 0; index < 20; index++) logger._infoTemplate(firstBinding[0]);
       return ctx.ok(null);
     });
     const tracer = new TestTracer(opContext, createTestTracerOptions());
@@ -176,8 +179,9 @@ describe('global vocabulary dense decoding', () => {
   it('rejects a packed dense index outside the buffer generation', async () => {
     let invalidDenseIndex = 0;
     const op = opContext.defineOp('invalid-dense-index', (ctx) => {
+      const logger = createSpanLogger(ctx.buffer._logSchema, ctx.buffer);
       invalidDenseIndex = ctx.buffer._vocabularyGeneration.ids.length;
-      ctx.log._infoTemplate(invalidDenseIndex);
+      logger._infoTemplate(invalidDenseIndex);
       return ctx.ok(null);
     });
     const tracer = new TestTracer(opContext, createTestTracerOptions());

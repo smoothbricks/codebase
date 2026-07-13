@@ -135,12 +135,13 @@ describe('Span Lifecycle', () => {
 
   it('should support spanSync for synchronous child spans', async () => {
     const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
+    const childOp = ctx.defineOp('sync-child-op', (childCtx) => {
+      childCtx.tag.spanName('sync-child');
+      return childCtx.ok('child-ok');
+    });
 
     const result = await tracer.trace('root-task', async (rootCtx) => {
-      const childResult = rootCtx.spanSync('sync-child', (childCtx) => {
-        childCtx.tag.spanName('sync-child');
-        return childCtx.ok('child-ok');
-      });
+      const childResult = rootCtx.spanSync('sync-child', childOp);
 
       expect(childResult).not.toBeInstanceOf(Promise);
       expect(childResult.success).toBe(true);

@@ -15,7 +15,7 @@
 
 import type { PreEncodedEntry } from '@smoothbricks/arrow-builder';
 import type { RemapDescriptor } from './logBinding.js';
-import { getPhysicalLayoutPlan } from './physicalLayoutPlan.js';
+import { getPhysicalLayoutPlan, sealCallsitePlan, type CallsitePlan } from './physicalLayoutPlan.js';
 import type { SpanContext } from './opContext/spanContextTypes.js';
 import type { OpContext, OpContextBinding } from './opContext/types.js';
 import type { Result } from './result.js';
@@ -23,6 +23,7 @@ import { decodeRuntimeHint } from './runtimeHint.js';
 import { createSpanContextClass } from './spanContext.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
 import type { VocabularyGeneration } from './vocabularyRegistry.js';
+import type { WasmLayoutTemplate } from './wasm/wasmPhysicalLayout.js';
 
 // =============================================================================
 // OP METADATA
@@ -64,7 +65,10 @@ export interface OpMetadata {
   /** Pre-encoded git_sha for Arrow dictionary building */
   readonly git_sha_entry: PreEncodedEntry;
   /** Startup-resolved physical layout used by span setup; absent only on raw fallback metadata. */
-  readonly _physicalLayoutPlan?: { readonly vocabularyGeneration: VocabularyGeneration };
+  readonly _physicalLayoutPlan?: {
+    readonly vocabularyGeneration: VocabularyGeneration;
+    readonly wasmLayout: WasmLayoutTemplate;
+  };
 }
 //#endregion smoo/lmao!n/opcontext-hierarchy
 
@@ -103,12 +107,9 @@ export interface OpMetadata {
  */
 export class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
   readonly metadata: OpMetadata;
-  readonly physicalLayoutPlan: object;
+  readonly callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>;
   readonly fn: (ctx: SpanContext<Ctx>, ...args: Args) => Result<S, E> | Promise<Result<S, E>>;
   readonly _opContextBinding?: OpContextBinding<Ctx['logSchema'], Ctx['flags'], Ctx['deps'], Ctx['userCtx']>;
-  readonly SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>;
-  readonly remapDescriptor: RemapDescriptor | undefined;
-  readonly runtimeHint: number;
 
   constructor(
     metadata: OpMetadata,
@@ -135,13 +136,11 @@ export class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
       'strategy-selected',
       layoutKey,
     );
-    this.physicalLayoutPlan = physicalLayoutPlan;
-    this.metadata = Object.freeze({ ...metadata, _physicalLayoutPlan: physicalLayoutPlan });
+    const resolvedMetadata = Object.freeze({ ...metadata, _physicalLayoutPlan: physicalLayoutPlan });
+    this.callsitePlan = sealCallsitePlan(physicalLayoutPlan, resolvedMetadata);
+    this.metadata = resolvedMetadata;
     this.fn = fn;
     this._opContextBinding = opContextBinding;
-    this.SpanBufferClass = physicalLayoutPlan.SpanBufferClass;
-    this.remapDescriptor = physicalLayoutPlan.remapDescriptor ?? undefined;
-    this.runtimeHint = physicalLayoutPlan.runtimeHint;
   }
 
 

@@ -308,9 +308,9 @@ export function createDefineOps<Ctx extends OpContext>(
           const normalizedCompileMetadata = normalizeCompileMetadata(compileMetadata);
           ops[name] = new OpClass(
             def.metadata,
-            def.SpanBufferClass,
+            def.callsitePlan.SpanBufferClass,
             def.fn,
-            def.remapDescriptor,
+            def.callsitePlan.remapDescriptor ?? undefined,
             def._opContextBinding,
             normalizedCompileMetadata.runtimeHint,
           );

@@ -12,9 +12,8 @@
  *
  * SpanContext is implemented as a class factory pattern:
  * - `createSpanContextClass()` returns a class that closes over schema/logBinding
- * - Child contexts use `Object.create(parent)` for prototype inheritance
- * - User properties (deps, ff, env) are inherited via prototype chain
- * - Context overrides work by setting own properties that shadow inherited ones
+ * - Child contexts are constructed directly from the frozen CallsitePlan
+ * - User properties are copied from the parent only when an override context is requested
  *
  * ## Method Binding for Destructuring
  *
@@ -34,20 +33,19 @@ import {
 } from './codegen/spanLoggerGenerator.js';
 import type { RetryPolicy } from './errors/retry-policy.js';
 import { TransientError } from './errors/Transient.js';
-import type { RemapDescriptor } from './logBinding.js';
 import type { Op } from './op.js';
-import { getPhysicalLayoutPlan, type PhysicalLayoutPlan } from './physicalLayoutPlan.js';
 import type { OpContext, OpMetadata, SpanContext, SpanFn, SpanLogger, SpanSyncFn } from './opContext/types.js';
+import type { CallsitePlan, PhysicalLayoutPlan } from './physicalLayoutPlan.js';
 import { Err, hasErrorCode, Ok, type Result } from './result.js';
 import {
   RUNTIME_HINT_DEPS,
   RUNTIME_HINT_FF,
+  RUNTIME_HINT_FULL_CAPABILITIES,
   RUNTIME_HINT_LOG,
   RUNTIME_HINT_RESULT,
   RUNTIME_HINT_SCOPE,
   RUNTIME_HINT_SPAN,
   RUNTIME_HINT_TAG,
-  RUNTIME_HINT_FULL_CAPABILITIES,
 } from './runtimeHint.js';
 import type { FeatureFlagEvaluator, FlagEvaluator, InferFeatureFlagsWithContext } from './schema/evaluator.js';
 import {
@@ -57,7 +55,6 @@ import {
   ENTRY_TYPE_SPAN_RETRY,
 } from './schema/systemSchema.js';
 import type { InferSchema, LogSchema } from './schema/types.js';
-import type { SpanBufferConstructor } from './spanBuffer.js';
 import type { LogBinding, SpanBuffer } from './types.js';
 
 // Note: TraceRoot.writeSpanStart() is used instead of direct timestamp writes.
@@ -107,11 +104,9 @@ type SpanDispatchFn<Ctx extends OpContext, Args extends unknown[] = unknown[], S
 ) => Result<S, E> | Promise<Result<S, E>>;
 
 type SpanDispatchTarget<Ctx extends OpContext> = {
-  readonly SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>;
-  readonly remapDescriptor: RemapDescriptor | undefined;
+  readonly callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>;
   readonly opMetadata: OpMetadata;
   readonly fn: SpanDispatchFn<Ctx>;
-  readonly runtimeHint: number;
 };
 
 function isOpLike(value: unknown): value is Op<OpContext, unknown[], unknown, unknown> {
@@ -119,8 +114,7 @@ function isOpLike(value: unknown): value is Op<OpContext, unknown[], unknown, un
     typeof value === 'object' &&
     value !== null &&
     typeof Reflect.get(value, 'fn') === 'function' &&
-    typeof Reflect.get(value, 'runtimeHint') === 'number' &&
-    typeof Reflect.get(value, 'SpanBufferClass') === 'function' &&
+    typeof Reflect.get(value, 'callsitePlan') === 'object' &&
     typeof Reflect.get(value, 'metadata') === 'object'
   );
 }
@@ -136,33 +130,6 @@ function isSpanDispatchFn<Ctx extends OpContext>(value: unknown): value is SpanD
   return typeof value === 'function';
 }
 
-function isSpanBufferConstructorForSchema<T extends LogSchema>(
-  value: unknown,
-  schema: T,
-): value is SpanBufferConstructor<T> {
-  return (
-    typeof value === 'function' &&
-    Reflect.get(value, 'schema') === schema &&
-    typeof Reflect.get(value, 'stats') === 'object'
-  );
-}
-
-function getBufferConstructor<T extends LogSchema>(buffer: SpanBuffer<T>): SpanBufferConstructor<T> {
-  const ctor = buffer.constructor;
-  if (!isSpanBufferConstructorForSchema(ctor, buffer._logSchema)) {
-    throw new TypeError('Span buffer constructor does not match the buffer schema');
-  }
-  return ctor;
-}
-
-function isSpanBufferForSchema<T extends LogSchema>(buffer: unknown, schema: T): buffer is SpanBuffer<T> {
-  return (
-    typeof buffer === 'object' &&
-    buffer !== null &&
-    Reflect.get(buffer, '_logSchema') === schema &&
-    isSpanBufferConstructorForSchema(Reflect.get(buffer, 'constructor'), schema)
-  );
-}
 
 function isSpanContextInstance<Ctx extends OpContext>(value: unknown): value is SpanContextInstance<Ctx> {
   return (
@@ -174,23 +141,11 @@ function isSpanContextInstance<Ctx extends OpContext>(value: unknown): value is 
   );
 }
 
-function createInheritedContext<Ctx extends OpContext>(parent: SpanContextInstance<Ctx>): SpanContextInstance<Ctx> {
-  const child: unknown = Object.create(parent);
-  if (!isSpanContextInstance<Ctx>(child)) {
-    throw new TypeError('Failed to create child span context');
+function asSpanContextInstance<Ctx extends OpContext>(value: object): SpanContextInstance<Ctx> {
+  if (!isSpanContextInstance<Ctx>(value)) {
+    throw new TypeError('Callsite plan created an invalid child span context');
   }
-  return child;
-}
-
-function createInheritedContextWithOverrides<Ctx extends OpContext>(
-  parent: SpanContextInstance<Ctx>,
-  overrides: object,
-): SpanContextInstance<Ctx> {
-  const child: unknown = Object.assign(Object.create(parent), overrides);
-  if (!isSpanContextInstance<Ctx>(child)) {
-    throw new TypeError('Failed to create overridden child span context');
-  }
-  return child;
+  return value;
 }
 
 function readStringArgument(args: IArguments, index: number, label: string): string {
@@ -203,15 +158,14 @@ function readStringArgument(args: IArguments, index: number, label: string): str
 
 function resolveSpanTarget<Ctx extends OpContext>(
   value: unknown,
-  fallbackBuffer: SpanBuffer<Ctx['logSchema']>,
+  fallbackPlan: CallsitePlan<Ctx['logSchema'], Ctx>,
+  fallbackMetadata: OpMetadata,
 ): SpanDispatchTarget<Ctx> {
   if (isOpInstance<Ctx>(value)) {
     return {
-      SpanBufferClass: value.SpanBufferClass,
-      remapDescriptor: value.remapDescriptor,
+      callsitePlan: value.callsitePlan,
       opMetadata: value.metadata,
       fn: value.fn,
-      runtimeHint: value.runtimeHint,
     };
   }
 
@@ -220,11 +174,9 @@ function resolveSpanTarget<Ctx extends OpContext>(
   }
 
   return {
-    SpanBufferClass: getBufferConstructor(fallbackBuffer),
-    remapDescriptor: fallbackBuffer._remapDescriptor,
-    opMetadata: fallbackBuffer._opMetadata,
+    callsitePlan: fallbackPlan,
+    opMetadata: fallbackMetadata,
     fn: value,
-    runtimeHint: 0,
   };
 }
 
@@ -619,7 +571,7 @@ export type SpanContextClass<Ctx extends OpContext = OpContext> = new (
   schema: Ctx['logSchema'],
   spanLogger: SpanLoggerImpl<Ctx['logSchema']> | undefined,
   tag: TagWriter<Ctx['logSchema']> | undefined,
-  physicalLayoutPlan?: PhysicalLayoutPlan<Ctx['logSchema'], Ctx>,
+  callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
   contextSource?: Record<string, unknown>,
   contextOverrides?: Record<string, unknown>,
   deps?: Record<string, unknown>,
@@ -636,7 +588,7 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
   _schema: Ctx['logSchema'];
   _spanLogger: SpanLoggerImpl<Ctx['logSchema']>;
   _logBinding: LogBinding;
-  _physicalLayoutPlan: PhysicalLayoutPlan<Ctx['logSchema'], Ctx> | undefined;
+  _physicalLayoutPlan: CallsitePlan<Ctx['logSchema'], Ctx>;
 
   // Internal methods
   _newCtx0(): SpanContextInstance<Ctx>;
@@ -644,108 +596,81 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
   _spanPre(
     childCtx: SpanContextInstance<Ctx>,
     line: number,
-    name: string,
-    SpanBufferClass: SpanBufferConstructor,
-    remapDescriptor: import('./logBinding.js').RemapDescriptor | undefined,
-    opMetadata: import('./opContext/opTypes.js').OpMetadata,
-    runtimeHint?: number,
+    name: string | number,
+    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
+    opMetadata: OpMetadata,
   ): SpanContextInstance<Ctx>;
   _spanException(buffer: SpanBuffer<Ctx['logSchema']>, error: unknown): void;
 
-  // Monomorphic span methods (span0-span8)
-  // Transformer ABI carries the Op's immutable remap descriptor alongside its buffer constructor.
   spanSync0<S, E>(
     line: number,
-    name: string,
+    name: string | number,
     childCtx: SpanContextInstance<Ctx>,
-    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-    remapDescriptor: RemapDescriptor | undefined,
-    opMetadata: OpMetadata,
-    fn: (ctx: SpanContext<Ctx>) => Result<S, E>,
-    runtimeHint?: number,
+    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
+    fn: (ctx: SpanContext<Ctx>) => Result<S, E> | Promise<Result<S, E>>,
   ): Result<S, E>;
   span0<S, E>(
     line: number,
-    name: string,
+    name: string | number,
     childCtx: SpanContextInstance<Ctx>,
-    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-    remapDescriptor: import('./logBinding.js').RemapDescriptor | undefined,
-    opMetadata: import('./opContext/opTypes.js').OpMetadata,
+    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
     fn: (ctx: SpanContext<Ctx>) => Result<S, E> | Promise<Result<S, E>>,
-    runtimeHint?: number,
   ): Promise<Result<S, E>>;
   span1<S, E, A1>(
     line: number,
-    name: string,
+    name: string | number,
     childCtx: SpanContextInstance<Ctx>,
-    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-    remapDescriptor: RemapDescriptor | undefined,
-    opMetadata: OpMetadata,
+    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
     fn: (ctx: SpanContext<Ctx>, a1: A1) => Result<S, E> | Promise<Result<S, E>>,
     a1: A1,
-    runtimeHint?: number,
   ): Promise<Result<S, E>>;
   span2<S, E, A1, A2>(
     line: number,
-    name: string,
+    name: string | number,
     childCtx: SpanContextInstance<Ctx>,
-    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-    remapDescriptor: RemapDescriptor | undefined,
-    opMetadata: OpMetadata,
+    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
     fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2) => Result<S, E> | Promise<Result<S, E>>,
     a1: A1,
     a2: A2,
-    runtimeHint?: number,
   ): Promise<Result<S, E>>;
   span3<S, E, A1, A2, A3>(
     line: number,
-    name: string,
+    name: string | number,
     childCtx: SpanContextInstance<Ctx>,
-    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-    remapDescriptor: RemapDescriptor | undefined,
-    opMetadata: OpMetadata,
+    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
     fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3) => Result<S, E> | Promise<Result<S, E>>,
     a1: A1,
     a2: A2,
     a3: A3,
-    runtimeHint?: number,
   ): Promise<Result<S, E>>;
   span4<S, E, A1, A2, A3, A4>(
     line: number,
-    name: string,
+    name: string | number,
     childCtx: SpanContextInstance<Ctx>,
-    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-    remapDescriptor: RemapDescriptor | undefined,
-    opMetadata: OpMetadata,
+    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
     fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4) => Result<S, E> | Promise<Result<S, E>>,
     a1: A1,
     a2: A2,
     a3: A3,
     a4: A4,
-    runtimeHint?: number,
   ): Promise<Result<S, E>>;
   span5<S, E, A1, A2, A3, A4, A5>(
     line: number,
-    name: string,
+    name: string | number,
     childCtx: SpanContextInstance<Ctx>,
-    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-    remapDescriptor: RemapDescriptor | undefined,
-    opMetadata: OpMetadata,
+    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
     fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4, a5: A5) => Result<S, E> | Promise<Result<S, E>>,
     a1: A1,
     a2: A2,
     a3: A3,
     a4: A4,
     a5: A5,
-    runtimeHint?: number,
   ): Promise<Result<S, E>>;
   span6<S, E, A1, A2, A3, A4, A5, A6>(
     line: number,
-    name: string,
+    name: string | number,
     childCtx: SpanContextInstance<Ctx>,
-    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-    remapDescriptor: RemapDescriptor | undefined,
-    opMetadata: OpMetadata,
+    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
     fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4, a5: A5, a6: A6) => Result<S, E> | Promise<Result<S, E>>,
     a1: A1,
     a2: A2,
@@ -753,25 +678,13 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
     a4: A4,
     a5: A5,
     a6: A6,
-    runtimeHint?: number,
   ): Promise<Result<S, E>>;
   span7<S, E, A1, A2, A3, A4, A5, A6, A7>(
     line: number,
-    name: string,
+    name: string | number,
     childCtx: SpanContextInstance<Ctx>,
-    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-    remapDescriptor: RemapDescriptor | undefined,
-    opMetadata: OpMetadata,
-    fn: (
-      ctx: SpanContext<Ctx>,
-      a1: A1,
-      a2: A2,
-      a3: A3,
-      a4: A4,
-      a5: A5,
-      a6: A6,
-      a7: A7,
-    ) => Result<S, E> | Promise<Result<S, E>>,
+    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
+    fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4, a5: A5, a6: A6, a7: A7) => Result<S, E> | Promise<Result<S, E>>,
     a1: A1,
     a2: A2,
     a3: A3,
@@ -779,26 +692,13 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
     a5: A5,
     a6: A6,
     a7: A7,
-    runtimeHint?: number,
   ): Promise<Result<S, E>>;
   span8<S, E, A1, A2, A3, A4, A5, A6, A7, A8>(
     line: number,
-    name: string,
+    name: string | number,
     childCtx: SpanContextInstance<Ctx>,
-    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-    remapDescriptor: RemapDescriptor | undefined,
-    opMetadata: OpMetadata,
-    fn: (
-      ctx: SpanContext<Ctx>,
-      a1: A1,
-      a2: A2,
-      a3: A3,
-      a4: A4,
-      a5: A5,
-      a6: A6,
-      a7: A7,
-      a8: A8,
-    ) => Result<S, E, Ctx['logSchema']> | Promise<Result<S, E, Ctx['logSchema']>>,
+    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
+    fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4, a5: A5, a6: A6, a7: A7, a8: A8) => Result<S, E, Ctx['logSchema']> | Promise<Result<S, E, Ctx['logSchema']>>,
     a1: A1,
     a2: A2,
     a3: A3,
@@ -807,7 +707,6 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
     a6: A6,
     a7: A7,
     a8: A8,
-    runtimeHint?: number,
   ): Promise<Result<S, E, Ctx['logSchema']>>;
 };
 //#endregion smoo/lmao!n/spancontext-type
@@ -845,8 +744,8 @@ function isFlagEvaluatorForContext<Ctx extends OpContext>(value: unknown): value
  * - Closes over schema/logBinding (available to all methods)
  * - Constructor takes buffer, spanLogger, tag directly (no temp object allocation)
  * - Uses prototype methods for internal methods (_spanPre, _spanException, span0-span8)
- * - Supports context inheritance via Object.create(parent) for child spans
- * - Supports context overrides via own properties shadowing inherited ones
+ * - Reuses the parent context as the zero-override source without allocating a carrier object
+ * - Context overrides use the plan's schema-specific context factory
  *
  * @param schemaOnly - Tag attribute schema
  * @param logBinding - LogBinding with schema and stats
@@ -889,7 +788,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
     declare _schema: Ctx['logSchema'];
     declare _spanLogger: SpanLoggerImpl<Ctx['logSchema']>;
     declare _logBinding: LogBinding<Ctx['logSchema']>;
-    declare _physicalLayoutPlan: PhysicalLayoutPlan<Ctx['logSchema'], Ctx> | undefined;
+    declare _physicalLayoutPlan: CallsitePlan<Ctx['logSchema'], Ctx>;
 
     declare tag: TagWriter<Ctx['logSchema']>;
     declare log: SpanLogger<Ctx['logSchema']>;
@@ -909,7 +808,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       schema: Ctx['logSchema'],
       spanLogger: SpanLoggerImpl<Ctx['logSchema']> | undefined,
       tag: TagWriter<Ctx['logSchema']> | undefined,
-      physicalLayoutPlan?: PhysicalLayoutPlan<Ctx['logSchema'], Ctx>,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
       contextSource?: Record<string, unknown>,
       contextOverrides?: Record<string, unknown>,
       deps?: Record<string, unknown>,
@@ -922,7 +821,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       this._buffer = buffer;
       this._schema = schema;
       this._logBinding = logBinding;
-      this._physicalLayoutPlan = physicalLayoutPlan;
+      this._physicalLayoutPlan = callsitePlan;
       if (needsLogger) {
         if (!spanLogger) throw new TypeError('SpanContext capability requires a logger');
         this._spanLogger = spanLogger;
@@ -935,9 +834,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
       if (hasDeps) this.deps = deps ?? {};
       if (hasFf && ffSource) this.ff = ffSource.forContext(this);
       for (const key of canonicalUserContextKeys) {
-        this[key] = contextOverrides && Object.hasOwn(contextOverrides, key)
-          ? contextOverrides[key]
-          : contextSource?.[key];
+        this[key] =
+          contextOverrides && Object.hasOwn(contextOverrides, key) ? contextOverrides[key] : contextSource?.[key];
       }
 
       // Regular functions close over constructor args directly - no property lookups
@@ -950,9 +848,11 @@ export function createSpanContextClass<Ctx extends OpContext>(
       }
 
       if (hasResult) {
-      this.ok = <V>(value: V): Ok<V, Ctx['logSchema']> => new Ok<V, Ctx['logSchema']>(value, schema, buffer);
+        this.ok = <V>(value: V): Ok<V, Ctx['logSchema']> =>
+          new Ok<V, Ctx['logSchema']>(value, buffer, callsitePlan.ResultWriterClass);
 
-      this.err = <E>(error: E): Err<E, Ctx['logSchema']> => new Err<E, Ctx['logSchema']>(error, schema, buffer);
+        this.err = <E>(error: E): Err<E, Ctx['logSchema']> =>
+          new Err<E, Ctx['logSchema']>(error, buffer, callsitePlan.ResultWriterClass);
       }
       //#endregion smoo/lmao!n/codegen-destructured-context
 
@@ -966,208 +866,167 @@ export function createSpanContextClass<Ctx extends OpContext>(
       // Closes over `self` for calling prototype methods
       // Named function for better stack traces
       if (hasSpan) {
-      const self = this;
-      const span: SpanFn<Ctx> = function span(
-        nameOrLine: string | number,
-        _arg1?: unknown,
-        _arg2?: unknown,
-        _arg3?: unknown,
-        _arg4?: unknown,
-        _arg5?: unknown,
-        _arg6?: unknown,
-        _arg7?: unknown,
-        _arg8?: unknown,
-        _arg9?: unknown,
-        _arg10?: unknown,
-        _arg11?: unknown,
-      ): Promise<Result<unknown, unknown>> {
-        // Use arguments.length instead of ...rest to avoid array allocation
-        const len = arguments.length;
+        const self = this;
+        const span: SpanFn<Ctx> = function span(
+          nameOrLine: string | number,
+          _arg1?: unknown,
+          _arg2?: unknown,
+          _arg3?: unknown,
+          _arg4?: unknown,
+          _arg5?: unknown,
+          _arg6?: unknown,
+          _arg7?: unknown,
+          _arg8?: unknown,
+          _arg9?: unknown,
+          _arg10?: unknown,
+          _arg11?: unknown,
+        ): Promise<Result<unknown, unknown>> {
+          // Use arguments.length instead of ...rest to avoid array allocation
+          const len = arguments.length;
 
-        // Detect call pattern:
-        // - span(name, fn) - len=2, typeof arg0 === 'string'
-        // - span(line, name, fn) - len=3, typeof arg0 === 'number'
-        // - span(name, overrides, fn) - len=3, typeof arg0 === 'string', typeof arg1 === 'object'
-        // - span(line, name, overrides, fn) - len=4, typeof arg0 === 'number', typeof arg2 === 'object'
-        // Plus additional args for span arguments
+          // Detect call pattern:
+          // - span(name, fn) - len=2, typeof arg0 === 'string'
+          // - span(line, name, fn) - len=3, typeof arg0 === 'number'
+          // - span(name, overrides, fn) - len=3, typeof arg0 === 'string', typeof arg1 === 'object'
+          // - span(line, name, overrides, fn) - len=4, typeof arg0 === 'number', typeof arg2 === 'object'
+          // Plus additional args for span arguments
 
-        const hasLine = typeof nameOrLine === 'number';
-        const spanLine = hasLine ? nameOrLine : 0;
-        const spanName = hasLine ? readStringArgument(arguments, 1, 'span name') : nameOrLine;
+          const hasLine = typeof nameOrLine === 'number';
+          const spanLine = hasLine ? nameOrLine : 0;
+          const spanName = hasLine ? readStringArgument(arguments, 1, 'span name') : nameOrLine;
 
-        // Index where fn/op or overrides starts
-        const checkIdx = hasLine ? 2 : 1;
-        const maybeOverrides = arguments[checkIdx];
+          // Index where fn/op or overrides starts
+          const checkIdx = hasLine ? 2 : 1;
+          const maybeOverrides = arguments[checkIdx];
 
-        // Check if it's an overrides object (not Op, not function)
-        const hasOverrides =
-          maybeOverrides !== null &&
-          typeof maybeOverrides === 'object' &&
-          !isOpLike(maybeOverrides) &&
-          typeof maybeOverrides !== 'function';
+          // Check if it's an overrides object (not Op, not function)
+          const hasOverrides =
+            maybeOverrides !== null &&
+            typeof maybeOverrides === 'object' &&
+            !isOpLike(maybeOverrides) &&
+            typeof maybeOverrides !== 'function';
 
-        const fnIdx = checkIdx + (hasOverrides ? 1 : 0);
-        const target = resolveSpanTarget<Ctx>(arguments[fnIdx], self._buffer);
+          const fnIdx = checkIdx + (hasOverrides ? 1 : 0);
+          const target = resolveSpanTarget<Ctx>(
+            arguments[fnIdx],
+            self._physicalLayoutPlan,
+            self._buffer._opMetadata,
+          );
+          const childCtx = asSpanContextInstance<Ctx>(
+            hasOverrides
+              ? target.callsitePlan.newCtx1(self, maybeOverrides)
+              : target.callsitePlan.newCtx0(self),
+          );
 
-        // Create child context - use _newCtx0 or _newCtx1 based on overrides
-        const childCtx = hasOverrides ? self._newCtx1(maybeOverrides) : self._newCtx0();
+          // Dispatch to monomorphic methods with all Op properties extracted
+          const argCount = len - fnIdx - 1;
+          switch (argCount) {
+            case 0:
+              return self.span0(spanLine, spanName, childCtx, target.callsitePlan, target.fn);
+            case 1:
+              return self.span1(spanLine, spanName, childCtx, target.callsitePlan, target.fn, arguments[fnIdx + 1]);
+            case 2:
+              return self.span2(
+                spanLine,
+                spanName,
+                childCtx,
+                target.callsitePlan,
+                target.fn,
+                arguments[fnIdx + 1],
+                arguments[fnIdx + 2],
+              );
+            case 3:
+              return self.span3(
+                spanLine,
+                spanName,
+                childCtx,
+                target.callsitePlan,
+                target.fn,
+                arguments[fnIdx + 1],
+                arguments[fnIdx + 2],
+                arguments[fnIdx + 3],
+              );
+            case 4:
+              return self.span4(
+                spanLine,
+                spanName,
+                childCtx,
+                target.callsitePlan,
+                target.fn,
+                arguments[fnIdx + 1],
+                arguments[fnIdx + 2],
+                arguments[fnIdx + 3],
+                arguments[fnIdx + 4],
+              );
+            case 5:
+              return self.span5(
+                spanLine,
+                spanName,
+                childCtx,
+                target.callsitePlan,
+                target.fn,
+                arguments[fnIdx + 1],
+                arguments[fnIdx + 2],
+                arguments[fnIdx + 3],
+                arguments[fnIdx + 4],
+                arguments[fnIdx + 5],
+              );
+            case 6:
+              return self.span6(
+                spanLine,
+                spanName,
+                childCtx,
+                target.callsitePlan,
+                target.fn,
+                arguments[fnIdx + 1],
+                arguments[fnIdx + 2],
+                arguments[fnIdx + 3],
+                arguments[fnIdx + 4],
+                arguments[fnIdx + 5],
+                arguments[fnIdx + 6],
+              );
+            case 7:
+              return self.span7(
+                spanLine,
+                spanName,
+                childCtx,
+                target.callsitePlan,
+                target.fn,
+                arguments[fnIdx + 1],
+                arguments[fnIdx + 2],
+                arguments[fnIdx + 3],
+                arguments[fnIdx + 4],
+                arguments[fnIdx + 5],
+                arguments[fnIdx + 6],
+                arguments[fnIdx + 7],
+              );
+            case 8:
+              return self.span8(
+                spanLine,
+                spanName,
+                childCtx,
+                target.callsitePlan,
+                target.fn,
+                arguments[fnIdx + 1],
+                arguments[fnIdx + 2],
+                arguments[fnIdx + 3],
+                arguments[fnIdx + 4],
+                arguments[fnIdx + 5],
+                arguments[fnIdx + 6],
+                arguments[fnIdx + 7],
+                arguments[fnIdx + 8],
+              );
+            default:
+              throw new Error(`span() supports up to 8 arguments, got ${argCount}`);
+          }
+        };
+        this.span = span;
 
-        // Dispatch to monomorphic methods with all Op properties extracted
-        const argCount = len - fnIdx - 1;
-        switch (argCount) {
-          case 0:
-            return self.span0(
-              spanLine,
-              spanName,
-              childCtx,
-              target.SpanBufferClass,
-              target.remapDescriptor,
-              target.opMetadata,
-              target.fn,
-              target.runtimeHint,
-            );
-          case 1:
-            return self.span1(
-              spanLine,
-              spanName,
-              childCtx,
-              target.SpanBufferClass,
-              target.remapDescriptor,
-              target.opMetadata,
-              target.fn,
-              arguments[fnIdx + 1],
-              target.runtimeHint,
-            );
-          case 2:
-            return self.span2(
-              spanLine,
-              spanName,
-              childCtx,
-              target.SpanBufferClass,
-              target.remapDescriptor,
-              target.opMetadata,
-              target.fn,
-              arguments[fnIdx + 1],
-              arguments[fnIdx + 2],
-              target.runtimeHint,
-            );
-          case 3:
-            return self.span3(
-              spanLine,
-              spanName,
-              childCtx,
-              target.SpanBufferClass,
-              target.remapDescriptor,
-              target.opMetadata,
-              target.fn,
-              arguments[fnIdx + 1],
-              arguments[fnIdx + 2],
-              arguments[fnIdx + 3],
-              target.runtimeHint,
-            );
-          case 4:
-            return self.span4(
-              spanLine,
-              spanName,
-              childCtx,
-              target.SpanBufferClass,
-              target.remapDescriptor,
-              target.opMetadata,
-              target.fn,
-              arguments[fnIdx + 1],
-              arguments[fnIdx + 2],
-              arguments[fnIdx + 3],
-              arguments[fnIdx + 4],
-              target.runtimeHint,
-            );
-          case 5:
-            return self.span5(
-              spanLine,
-              spanName,
-              childCtx,
-              target.SpanBufferClass,
-              target.remapDescriptor,
-              target.opMetadata,
-              target.fn,
-              arguments[fnIdx + 1],
-              arguments[fnIdx + 2],
-              arguments[fnIdx + 3],
-              arguments[fnIdx + 4],
-              arguments[fnIdx + 5],
-              target.runtimeHint,
-            );
-          case 6:
-            return self.span6(
-              spanLine,
-              spanName,
-              childCtx,
-              target.SpanBufferClass,
-              target.remapDescriptor,
-              target.opMetadata,
-              target.fn,
-              arguments[fnIdx + 1],
-              arguments[fnIdx + 2],
-              arguments[fnIdx + 3],
-              arguments[fnIdx + 4],
-              arguments[fnIdx + 5],
-              arguments[fnIdx + 6],
-              target.runtimeHint,
-            );
-          case 7:
-            return self.span7(
-              spanLine,
-              spanName,
-              childCtx,
-              target.SpanBufferClass,
-              target.remapDescriptor,
-              target.opMetadata,
-              target.fn,
-              arguments[fnIdx + 1],
-              arguments[fnIdx + 2],
-              arguments[fnIdx + 3],
-              arguments[fnIdx + 4],
-              arguments[fnIdx + 5],
-              arguments[fnIdx + 6],
-              arguments[fnIdx + 7],
-              target.runtimeHint,
-            );
-          case 8:
-            return self.span8(
-              spanLine,
-              spanName,
-              childCtx,
-              target.SpanBufferClass,
-              target.remapDescriptor,
-              target.opMetadata,
-              target.fn,
-              arguments[fnIdx + 1],
-              arguments[fnIdx + 2],
-              arguments[fnIdx + 3],
-              arguments[fnIdx + 4],
-              arguments[fnIdx + 5],
-              arguments[fnIdx + 6],
-              arguments[fnIdx + 7],
-              arguments[fnIdx + 8],
-              target.runtimeHint,
-            );
-          default:
-            throw new Error(`span() supports up to 8 arguments, got ${argCount}`);
-        }
-      };
-      this.span = span;
-
-      this.spanSync = function spanSync<S, E>(name: string, fn: (ctx: SpanContext<Ctx>) => Result<S, E>): Result<S, E> {
-        const childCtx = self._newCtx0();
-        return self.spanSync0(
-          0,
-          name,
-          childCtx,
-          getBufferConstructor(self._buffer),
-          undefined,
-          self._buffer._opMetadata,
-          fn,
-        );
-      };
+        this.spanSync = function spanSync<S, E>(name: string, op: Op<Ctx, [], S, E>): Result<S, E> {
+          const callsitePlan = op.callsitePlan;
+          const childCtx = asSpanContextInstance<Ctx>(callsitePlan.newCtx0(self));
+          return self.spanSync0(0, name, childCtx, callsitePlan, op.fn);
+        };
       }
       //#endregion smoo/lmao!n/context-flow-span-promise
     }
@@ -1225,7 +1084,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
      * Transformer emits: ctx.span0(line, name, ctx._newCtx0(), fn)
      */
     _newCtx0(): SpanContextInstance<Ctx> {
-      return createInheritedContext(this);
+      return asSpanContextInstance<Ctx>(this._physicalLayoutPlan.newCtx0(this));
     }
 
     /**
@@ -1235,7 +1094,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
      * Transformer emits: ctx.span0(line, name, ctx._newCtx1({ requestId }), fn)
      */
     _newCtx1(overrides: object): SpanContextInstance<Ctx> {
-      return createInheritedContextWithOverrides(this, overrides);
+      return asSpanContextInstance<Ctx>(this._physicalLayoutPlan.newCtx1(this, overrides));
     }
 
     /**
@@ -1259,78 +1118,37 @@ export function createSpanContextClass<Ctx extends OpContext>(
     _spanPre(
       childCtx: SpanContextInstance<Ctx>,
       line: number,
-      name: string,
-      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-      remapDescriptor: RemapDescriptor | undefined,
+      name: string | number,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
       opMetadata: OpMetadata,
-      runtimeHint = 0,
     ): SpanContextInstance<Ctx> {
-      const plannedLayout = opMetadata._physicalLayoutPlan;
-      const physicalLayoutPlan = isPhysicalLayoutPlanForContext<Ctx>(plannedLayout, SpanBufferClass.schema)
-        ? plannedLayout
-        : getPhysicalLayoutPlan<Ctx['logSchema'], Ctx>(
-            SpanBufferClass,
-            runtimeHint,
-            createSpanContextClass<Ctx>(
-              _schemaOnly,
-              logBinding,
-              RUNTIME_HINT_FULL_CAPABILITIES,
-              canonicalUserContextKeys,
-            ),
-            remapDescriptor,
-            'strategy-selected',
-            layoutKey,
-          );
-      const childSchema = physicalLayoutPlan.schema;
-
-      // Use buffer strategy for child span creation (supports both JS and WASM buffers)
-      // Pass schema for cross-library calls where child has different schema than parent
+      const childSchema = callsitePlan.schema;
       const createdBuffer = this._buffer._traceRoot.tracer.bufferStrategy.createChildSpanBuffer(
-        this._buffer, // parentBuffer
-        this._buffer._opMetadata, // callsiteMetadata - WHO called span() (for row 0)
-        opMetadata, // opMetadata - WHICH op is executing (for rows 1+)
-        physicalLayoutPlan.capacityTier,
-        childSchema, // schema - Op's schema for correct tag methods
+        this._buffer,
+        this._buffer._opMetadata,
+        opMetadata,
+        callsitePlan.capacityTier,
+        childSchema,
+        callsitePlan.SpanBufferClass,
       );
-      if (!isSpanBufferForSchema(createdBuffer, childSchema)) {
-        throw new TypeError('Child span buffer does not match the requested schema');
-      }
       const childBuffer = createdBuffer;
-
-      // Cold Arrow traversal interprets this immutable pointer; the hot tree stores raw buffers.
-      childBuffer._remapDescriptor = physicalLayoutPlan.remapDescriptor ?? undefined;
+      childBuffer._remapDescriptor = callsitePlan.remapDescriptor ?? undefined;
       this._buffer._children.push(childBuffer);
-
-      // Write span-start for child span (row 0) and pre-initialize span-end (row 1)
-      physicalLayoutPlan.appenders.writeSpanStart(childBuffer, name);
-
-      // Write line number to row 0 (line() takes pos and value)
+      callsitePlan.appenders.writeSpanStart(childBuffer, name);
       childBuffer.line(0, line);
 
-      const capabilities = physicalLayoutPlan.capabilities;
-      const needsChildLogger =
-        (capabilities & RUNTIME_HINT_LOG) !== 0 ||
-        (capabilities & RUNTIME_HINT_FF) !== 0 ||
-        (capabilities & RUNTIME_HINT_SCOPE) !== 0;
-      const childLogger = needsChildLogger ? physicalLayoutPlan.createSpanLogger(childBuffer) : undefined;
-      const childTag = (capabilities & RUNTIME_HINT_TAG) !== 0
-        ? physicalLayoutPlan.createTagWriter(childBuffer)
-        : undefined;
-      const ChildSpanContextClass = physicalLayoutPlan.SpanContextClass;
-      const childFfSource = (capabilities & RUNTIME_HINT_FF) !== 0
-        ? Object.hasOwn(this, 'ff')
-          ? this.ff
-          : this._buffer._traceRoot.tracer.getFlagEvaluatorForContext()
-        : undefined;
-      if (childFfSource !== undefined && !isFlagEvaluatorForContext<Ctx>(childFfSource)) {
-        throw new TypeError('Feature-flag capability requires a context evaluator');
+      const childFfSource = Object.hasOwn(this, 'ff')
+        ? this.ff
+        : this._buffer._traceRoot.tracer.getFlagEvaluatorForContext();
+      if (!isFlagEvaluatorForContext<Ctx>(childFfSource)) {
+        throw new TypeError('Span context requires a context evaluator');
       }
-      return new ChildSpanContextClass(
+      return new callsitePlan.SpanContextClass(
         childBuffer,
         childSchema,
-        childLogger,
-        childTag,
-        physicalLayoutPlan,
+        callsitePlan.newSpanLogger?.(childBuffer),
+        callsitePlan.newTagWriter?.(childBuffer),
+        callsitePlan,
         childCtx,
         undefined,
         this.deps,
@@ -1361,11 +1179,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
       name: string,
       op: Op<Ctx, Args, S, E>,
     ): SpanContextInstance<Ctx> {
-      const child: unknown = Object.create(this);
-      if (!isSpanContextInstance<Ctx>(child)) {
-        throw new TypeError('Failed to create child span context');
-      }
-      return this._spanPre(child, line, name, op.SpanBufferClass, op.remapDescriptor, op.metadata, op.runtimeHint);
+      const child = asSpanContextInstance<Ctx>(op.callsitePlan.newCtx0(this));
+      return this._spanPre(child, line, name, op.callsitePlan, op.metadata);
     }
 
     spanAuto0<S, E>(line: number, name: string, op: Op<Ctx, [], S, E>): Result<S, E> | Promise<Result<S, E>> {
@@ -1933,26 +1748,26 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
     // =========================================================================
     // Monomorphic span methods (for transformer output)
-    // Transformer emits: ctx.span0(line, name, ctx, fn) or
-    //                    ctx.span0(line, name, Object.assign(Object.create(ctx), overrides), fn)
-    // childCtx inherits from parent via prototype chain, may have user overrides as own properties
+    // Transformer emits: ctx.span0(line, name, plan.newCtx0(ctx), plan, fn)
+    // The frozen plan supplies the exact context source factory for each callsite.
+    // User overrides are materialized by plan.newCtx1 without prototype allocation.
     // =========================================================================
 
     spanSync0<S, E>(
       line: number,
-      name: string,
+      name: string | number,
       childCtx: SpanContextInstance<Ctx>,
-      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-      remapDescriptor: RemapDescriptor | undefined,
-      opMetadata: OpMetadata,
-      fn: (ctx: SpanContext<Ctx>) => Result<S, E>,
-      runtimeHint = 0,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
+      fn: (ctx: SpanContext<Ctx>) => Result<S, E> | Promise<Result<S, E>>,
     ): Result<S, E> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remapDescriptor, opMetadata, runtimeHint);
+      const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         const result = fn(ctx);
+        if (!isSynchronousResult(result)) {
+          throw new TypeError('spanSync operation returned a Promise');
+        }
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1965,15 +1780,12 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
     async span0<S, E>(
       line: number,
-      name: string,
+      name: string | number,
       childCtx: SpanContextInstance<Ctx>,
-      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-      remapDescriptor: RemapDescriptor | undefined,
-      opMetadata: OpMetadata,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
       fn: (ctx: SpanContext<Ctx>) => Result<S, E> | Promise<Result<S, E>>,
-      runtimeHint = 0,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remapDescriptor, opMetadata, runtimeHint);
+      const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
@@ -1991,16 +1803,13 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
     async span1<S, E, A1>(
       line: number,
-      name: string,
+      name: string | number,
       childCtx: SpanContextInstance<Ctx>,
-      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-      remapDescriptor: RemapDescriptor | undefined,
-      opMetadata: OpMetadata,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
       fn: (ctx: SpanContext<Ctx>, a1: A1) => Result<S, E> | Promise<Result<S, E>>,
       a1: A1,
-      runtimeHint = 0,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remapDescriptor, opMetadata, runtimeHint);
+      const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
@@ -2018,17 +1827,14 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
     async span2<S, E, A1, A2>(
       line: number,
-      name: string,
+      name: string | number,
       childCtx: SpanContextInstance<Ctx>,
-      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-      remapDescriptor: RemapDescriptor | undefined,
-      opMetadata: OpMetadata,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
       fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2) => Result<S, E> | Promise<Result<S, E>>,
       a1: A1,
       a2: A2,
-      runtimeHint = 0,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remapDescriptor, opMetadata, runtimeHint);
+      const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
@@ -2046,18 +1852,15 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
     async span3<S, E, A1, A2, A3>(
       line: number,
-      name: string,
+      name: string | number,
       childCtx: SpanContextInstance<Ctx>,
-      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-      remapDescriptor: RemapDescriptor | undefined,
-      opMetadata: OpMetadata,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
       fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3) => Result<S, E> | Promise<Result<S, E>>,
       a1: A1,
       a2: A2,
       a3: A3,
-      runtimeHint = 0,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remapDescriptor, opMetadata, runtimeHint);
+      const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
@@ -2075,19 +1878,16 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
     async span4<S, E, A1, A2, A3, A4>(
       line: number,
-      name: string,
+      name: string | number,
       childCtx: SpanContextInstance<Ctx>,
-      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-      remapDescriptor: RemapDescriptor | undefined,
-      opMetadata: OpMetadata,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
       fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4) => Result<S, E> | Promise<Result<S, E>>,
       a1: A1,
       a2: A2,
       a3: A3,
       a4: A4,
-      runtimeHint = 0,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remapDescriptor, opMetadata, runtimeHint);
+      const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
@@ -2105,20 +1905,17 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
     async span5<S, E, A1, A2, A3, A4, A5>(
       line: number,
-      name: string,
+      name: string | number,
       childCtx: SpanContextInstance<Ctx>,
-      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-      remapDescriptor: RemapDescriptor | undefined,
-      opMetadata: OpMetadata,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
       fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4, a5: A5) => Result<S, E> | Promise<Result<S, E>>,
       a1: A1,
       a2: A2,
       a3: A3,
       a4: A4,
       a5: A5,
-      runtimeHint = 0,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remapDescriptor, opMetadata, runtimeHint);
+      const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
@@ -2136,11 +1933,9 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
     async span6<S, E, A1, A2, A3, A4, A5, A6>(
       line: number,
-      name: string,
+      name: string | number,
       childCtx: SpanContextInstance<Ctx>,
-      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-      remapDescriptor: RemapDescriptor | undefined,
-      opMetadata: OpMetadata,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
       fn: (
         ctx: SpanContext<Ctx>,
         a1: A1,
@@ -2156,9 +1951,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a4: A4,
       a5: A5,
       a6: A6,
-      runtimeHint = 0,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remapDescriptor, opMetadata, runtimeHint);
+      const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
@@ -2176,11 +1970,9 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
     async span7<S, E, A1, A2, A3, A4, A5, A6, A7>(
       line: number,
-      name: string,
+      name: string | number,
       childCtx: SpanContextInstance<Ctx>,
-      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-      remapDescriptor: RemapDescriptor | undefined,
-      opMetadata: OpMetadata,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
       fn: (
         ctx: SpanContext<Ctx>,
         a1: A1,
@@ -2198,9 +1990,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a5: A5,
       a6: A6,
       a7: A7,
-      runtimeHint = 0,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remapDescriptor, opMetadata, runtimeHint);
+      const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
@@ -2218,11 +2009,9 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
     async span8<S, E, A1, A2, A3, A4, A5, A6, A7, A8>(
       line: number,
-      name: string,
+      name: string | number,
       childCtx: SpanContextInstance<Ctx>,
-      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-      remapDescriptor: RemapDescriptor | undefined,
-      opMetadata: OpMetadata,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
       fn: (
         ctx: SpanContext<Ctx>,
         a1: A1,
@@ -2242,9 +2031,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a6: A6,
       a7: A7,
       a8: A8,
-      runtimeHint = 0,
     ): Promise<Result<S, E, Ctx['logSchema']>> {
-      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remapDescriptor, opMetadata, runtimeHint);
+      const ctx = this._spanPre(childCtx, line, name, callsitePlan, callsitePlan.metadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
