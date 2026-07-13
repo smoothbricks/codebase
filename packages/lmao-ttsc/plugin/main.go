@@ -39,7 +39,7 @@ import (
 	"github.com/samchon/ttsc/packages/ttsc/driver"
 )
 
-const pluginName = "@smoothbricks/lmao-transformer"
+const pluginName = "@smoothbricks/lmao-ttsc"
 const pluginVersion = "0.1.6"
 
 func main() {

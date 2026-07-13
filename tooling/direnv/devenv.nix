@@ -40,7 +40,7 @@ in {
     })
     cargo-nextest # Rust test runner
     cargo-mutants # Mutation target inferred by @smoothbricks/nx-plugin
-    # Go toolchain for packages/lmao-transformer/plugin (ttsc transform plugin)
+    # Go toolchain for packages/lmao-ttsc/plugin (ttsc transform plugin)
     go
     sccache # Shared Rust compile cache (cowshed cache layer 3)
     # Git hooks and formatters
