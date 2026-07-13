@@ -249,6 +249,49 @@ describe('WasmSpanBuffer', () => {
       expect(buffer.entry_type[1]).toBe(2);
     });
 
+    it('reuses canonical typed views while memory is stable', () => {
+      const timestamp = buffer.timestamp;
+      const entryType = buffer.entry_type;
+      const identity = buffer._identity;
+      const countValues = getColumn<Float64Array>(buffer, 'count_values');
+      const countNulls = getColumn<Uint8Array>(buffer, 'count_nulls');
+      const count = getMethod<[idx: number, val: number], WasmSpanBufferInstance>(buffer, 'count');
+
+      count(5, 999);
+
+      expect(buffer.timestamp).toBe(timestamp);
+      expect(buffer.entry_type).toBe(entryType);
+      expect(buffer._identity).toBe(identity);
+      expect(getColumn<Float64Array>(buffer, 'count_values')).toBe(countValues);
+      expect(getColumn<Uint8Array>(buffer, 'count_nulls')).toBe(countNulls);
+      expect(countValues[5]).toBe(999);
+    });
+
+    it('rebuilds every canonical view once after memory growth and preserves data', () => {
+      buffer.timestamp[3] = 123n;
+      const count = getMethod<[idx: number, val: number], WasmSpanBufferInstance>(buffer, 'count');
+      count(4, 456);
+      const timestampBefore = buffer.timestamp;
+      const identityBefore = buffer._identity;
+      const countBefore = getColumn<Float64Array>(buffer, 'count_values');
+      const versionBefore = buffer._descriptor.memoryVersion;
+
+      const growthAllocation = allocator.allocExact(allocator.memory.buffer.byteLength, 8);
+      expect(growthAllocation).toBeGreaterThan(0);
+      const timestampAfter = buffer.timestamp;
+      const identityAfter = buffer._identity;
+      const countAfter = getColumn<Float64Array>(buffer, 'count_values');
+
+      expect(buffer._descriptor.memoryVersion).toBeGreaterThan(versionBefore);
+      expect(timestampAfter).not.toBe(timestampBefore);
+      expect(identityAfter).not.toBe(identityBefore);
+      expect(countAfter).not.toBe(countBefore);
+      expect(buffer.timestamp).toBe(timestampAfter);
+      expect(buffer._identity).toBe(identityAfter);
+      expect(getColumn<Float64Array>(buffer, 'count_values')).toBe(countAfter);
+      expect(timestampAfter[3]).toBe(123n);
+      expect(countAfter[4]).toBe(456);
+    });
 
     it('exposes _spanStartTime from row 0', () => {
       buffer.timestamp[0] = 123n;

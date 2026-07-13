@@ -14,6 +14,22 @@ describe('WasmAllocator exact slabs', () => {
     allocator.reset();
   });
 
+  it('exposes stable canonical allocator views until memory grows', () => {
+    expect(allocator.u8).toBe(allocator.u8);
+    expect(allocator.u32).toBe(allocator.u32);
+    expect(allocator.i64).toBe(allocator.i64);
+    expect(allocator.f64).toBe(allocator.f64);
+    const versionBefore = allocator.memoryVersion;
+    const u8Before = allocator.u8;
+
+    const allocation = allocator.allocExact(allocator.memory.buffer.byteLength, 8);
+    expect(allocation).toBeGreaterThan(0);
+
+    expect(allocator.refreshViews()).toBeGreaterThan(versionBefore);
+    expect(allocator.u8).not.toBe(u8Before);
+    expect(allocator.u8).toBe(allocator.u8);
+  });
+
   it('allocates arbitrary exact extents at aligned non-overlapping offsets', () => {
     fc.assert(
       fc.property(
