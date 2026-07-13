@@ -10,7 +10,7 @@
 //! bump-allocated neighbors.
 
 use lmao_arena::raw::{self};
-use lmao_arena::{block_size, Arena, SizeClass};
+use lmao_arena::{Arena, SizeClass, block_size};
 use proptest::prelude::*;
 
 fn size_class_strategy() -> impl Strategy<Value = SizeClass> {

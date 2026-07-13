@@ -13,9 +13,9 @@ use arrow_buffer::NullBuffer;
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 
 use crate::dict::{
-    ColumnDictionary, FirstSeenDictionary, LOG_TEMPLATE_KIND, SPAN_NAME_KIND,
-    StaticLookupError, mixed_vocabulary_dictionary, static_vocabulary_dictionary,
-    static_vocabulary_key, static_vocabulary_value_key,
+    ColumnDictionary, FirstSeenDictionary, LOG_TEMPLATE_KIND, SPAN_NAME_KIND, StaticLookupError,
+    mixed_vocabulary_dictionary, static_vocabulary_dictionary, static_vocabulary_key,
+    static_vocabulary_value_key,
 };
 use crate::source::{SpanSource, walk_pre_order};
 
@@ -68,10 +68,24 @@ pub fn trace_schema() -> Arc<Schema> {
 pub enum ConvertError {
     Arrow(ArrowError),
     RowCountOverflow,
-    InvalidEntryType { row: usize, entry_type: u8 },
-    InvalidVocabularyId { row: usize, id: u32 },
-    VocabularyKindMismatch { row: usize, id: u32, expected: u8, actual: u8 },
-    MissingDynamicMessage { row: usize, entry_type: u8 },
+    InvalidEntryType {
+        row: usize,
+        entry_type: u8,
+    },
+    InvalidVocabularyId {
+        row: usize,
+        id: u32,
+    },
+    VocabularyKindMismatch {
+        row: usize,
+        id: u32,
+        expected: u8,
+        actual: u8,
+    },
+    MissingDynamicMessage {
+        row: usize,
+        entry_type: u8,
+    },
 }
 
 impl fmt::Display for ConvertError {
@@ -85,7 +99,12 @@ impl fmt::Display for ConvertError {
             Self::InvalidVocabularyId { row, id } => {
                 write!(f, "unknown static vocabulary id {id} at row {row}")
             }
-            Self::VocabularyKindMismatch { row, id, expected, actual } => write!(
+            Self::VocabularyKindMismatch {
+                row,
+                id,
+                expected,
+                actual,
+            } => write!(
                 f,
                 "static vocabulary id {id} has kind tag {actual}, expected {expected} at row {row}",
             ),
@@ -165,7 +184,11 @@ pub fn convert_span_trees<S: SpanSource>(roots: &[S]) -> Result<RecordBatch, Con
                                 id,
                             });
                         }
-                        Err(StaticLookupError::KindMismatch { id, expected, actual }) => {
+                        Err(StaticLookupError::KindMismatch {
+                            id,
+                            expected,
+                            actual,
+                        }) => {
                             failure.get_or_insert(ConvertError::VocabularyKindMismatch {
                                 row: absolute_row,
                                 id,
@@ -283,7 +306,10 @@ pub fn convert_span_trees<S: SpanSource>(roots: &[S]) -> Result<RecordBatch, Con
             Arc::new(trace_col),
             Arc::new(UInt64Array::from(thread_ids)),
             Arc::new(UInt32Array::from(span_ids)),
-            Arc::new(UInt64Array::new(parent_thread_ids.into(), Some(parent_nulls.clone()))),
+            Arc::new(UInt64Array::new(
+                parent_thread_ids.into(),
+                Some(parent_nulls.clone()),
+            )),
             Arc::new(UInt32Array::new(parent_span_ids.into(), Some(parent_nulls))),
             Arc::new(entry_col),
             Arc::new(message_col),

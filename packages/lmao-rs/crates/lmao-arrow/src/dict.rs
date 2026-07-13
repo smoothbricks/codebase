@@ -11,8 +11,8 @@
 use std::sync::{Arc, LazyLock};
 
 use arrow_array::StringArray;
-use arrow_schema::ArrowError;
 use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
+use arrow_schema::ArrowError;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::generated::vocabulary::{
@@ -45,7 +45,12 @@ static STATIC_VOCABULARY: LazyLock<StaticVocabulary> = LazyLock::new(|| {
         Buffer::from_vec(utf8.clone()),
         None,
     ));
-    StaticVocabulary { array, utf8, offsets, reverse }
+    StaticVocabulary {
+        array,
+        utf8,
+        offsets,
+        reverse,
+    }
 });
 
 pub fn static_vocabulary_dictionary() -> Arc<StringArray> {
@@ -64,9 +69,13 @@ pub(crate) fn mixed_vocabulary_dictionary(
             ArrowError::InvalidArgumentError("message dictionary byte length overflow".into())
         })
     })?;
-    let total_bytes = STATIC_VOCABULARY.utf8.len().checked_add(dynamic_bytes).ok_or_else(|| {
-        ArrowError::InvalidArgumentError("message dictionary byte length overflow".into())
-    })?;
+    let total_bytes = STATIC_VOCABULARY
+        .utf8
+        .len()
+        .checked_add(dynamic_bytes)
+        .ok_or_else(|| {
+            ArrowError::InvalidArgumentError("message dictionary byte length overflow".into())
+        })?;
     if total_bytes > i32::MAX as usize {
         return Err(ArrowError::InvalidArgumentError(
             "message dictionary exceeds Utf8 offset range".into(),
@@ -96,7 +105,11 @@ pub fn static_vocabulary_key(id: u32, required_kind: u8) -> Result<u32, StaticLo
         .map_err(|_| StaticLookupError::UnknownId(id))?;
     let actual = VOCABULARY_KIND_TAGS[ordinal];
     if actual != required_kind {
-        return Err(StaticLookupError::KindMismatch { id, expected: required_kind, actual });
+        return Err(StaticLookupError::KindMismatch {
+            id,
+            expected: required_kind,
+            actual,
+        });
     }
     Ok(ordinal as u32)
 }
