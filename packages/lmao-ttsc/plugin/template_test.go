@@ -301,11 +301,11 @@ function createFactoryOps() {
 		t.Fatalf("factory-local vocabulary registration missing\n%s", output)
 	}
 	binding := registration[1]
-	if strings.Count(output, "writeLogEntry($$b") != 3 || strings.Count(output, "_logHeaders[$$i]") != 3 {
-		t.Fatalf("factory-local static logs did not lower through the packed registered-header seam\n%s", output)
+	if strings.Count(output, "_state._appendWriterEntry(") != 3 || strings.Count(output, "_state._buffer") != 3 || strings.Count(output, "_logHeaders[$$i]") != 3 {
+		t.Fatalf("factory-local static logs did not lower through the state-owned packed-header seam\n%s", output)
 	}
-	if strings.Count(output, binding+"[") != 7 {
-		t.Fatalf("registered binding uses = %d, want two per static log and one unified static-span operand\n%s", strings.Count(output, binding+"["), output)
+	if strings.Count(output, binding+"[") != 4 {
+		t.Fatalf("registered binding uses = %d, want one packed-header operand per static log and one span operand\n%s", strings.Count(output, binding+"["), output)
 	}
 	if strings.Contains(output, "TemplateIds") {
 		t.Fatalf("a separate template-ID lane survived global vocabulary lowering\n%s", output)
@@ -502,13 +502,53 @@ defineOp('dynamic-enum', (ctx) => {
 	if strings.Count(output, evaluation) != 1 {
 		t.Fatalf("dynamic enum captured evaluations = %d, want exactly one\n%s", strings.Count(output, evaluation), output)
 	}
-	for _, marker := range []string{`case "READ":`, `case "WRITE":`, "return 0", "return 1", "$$b.operation($$i"} {
+	for _, marker := range []string{`$$l._state._physicalLayoutPlan.enumLookup.byField["operation"].encode($$f0)`, "$$b.operation($$i"} {
 		if !strings.Contains(output, marker) {
 			t.Fatalf("dynamic enum lowering missing %q\n%s", marker, output)
 		}
 	}
+	for _, stale := range []string{`case "READ":`, `case "WRITE":`, "return 1", "enumSwitchIIFE"} {
+		if strings.Contains(output, stale) {
+			t.Fatalf("dynamic enum lowering rebuilt stale per-call lookup %q\n%s", stale, output)
+		}
+	}
 	if regexp.MustCompile(`operation_values\[[^]]+\]\s*=\s*\$\$f\d+`).MatchString(output) {
 		t.Fatalf("dynamic enum string was written directly to its Uint8 ordinal lane\n%s", output)
+	}
+}
+
+func TestEveryEnumInlineReusesPlanBoundSchemaEncoder(t *testing.T) {
+	output := transformTemplateFixture(t, `
+declare function nextOperation(): 'READ' | 'WRITE';
+defineOp('enum-plan-reuse', (ctx) => {
+  ctx.tag.operation(nextOperation());
+  ctx.tag.with({ operation: nextOperation() });
+  ctx.log.info('enum fluent').operation(nextOperation());
+  ctx.log.info('enum {operation}', { operation: nextOperation() });
+  return ctx.ok(null).operation(nextOperation()).with({ operation: nextOperation() });
+});
+`)
+
+	if count := strings.Count(output, "nextOperation()") - 1; count != 6 {
+		t.Fatalf("enum source evaluations = %d, want exactly 6 (excluding declaration)\n%s", count, output)
+	}
+	const encoder = `.enumLookup.byField["operation"].encode(`
+	if count := strings.Count(output, encoder); count != 6 {
+		t.Fatalf("plan-bound enum encoder calls = %d, want exactly 6\n%s", count, output)
+	}
+	for _, owner := range []string{
+		`$$t._physicalLayoutPlan.enumLookup.byField["operation"].encode(`,
+		`$$l._state._physicalLayoutPlan.enumLookup.byField["operation"].encode(`,
+		`$$r._state._physicalLayoutPlan.enumLookup.byField["operation"].encode(`,
+	} {
+		if !strings.Contains(output, owner) {
+			t.Fatalf("enum lowering missing plan owner %q\n%s", owner, output)
+		}
+	}
+	for _, stale := range []string{`case "READ":`, `case "WRITE":`, "enumSwitchIIFE", "new Map", "resolveEnumLookupDescriptor"} {
+		if strings.Contains(output, stale) {
+			t.Fatalf("enum lowering rebuilt lookup metadata via %q\n%s", stale, output)
+		}
 	}
 }
 

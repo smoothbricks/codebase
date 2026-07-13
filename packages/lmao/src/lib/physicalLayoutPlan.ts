@@ -12,6 +12,10 @@ import {
   type SpanLoggerConstructor,
   type SpanLoggerImpl,
 } from './codegen/spanLoggerGenerator.js';
+import {
+  resolveEnumLookupDescriptor,
+  type SchemaEnumLookupDescriptor,
+} from './enumMetadata.js';
 import type { RemapDescriptor } from './logBinding.js';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { OpContext } from './opContext/types.js';
@@ -120,6 +124,8 @@ export interface PhysicalLayoutPlan<
   readonly capabilities: number;
   readonly messageLayoutFamily: MessageLayoutFamily;
   readonly eagerColumns: EagerColumnDescriptor;
+  /** Immutable schema-order enum metadata shared by every plan and generated writer. */
+  readonly enumLookup: SchemaEnumLookupDescriptor;
   /** Fixed transformer tier, or undefined to retain adaptive strategy capacity. */
   readonly capacityTier: number | undefined;
   /** Canonical user-context key layout used by the generated context constructor. */
@@ -254,11 +260,12 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
   eagerColumns: EagerColumnDescriptor,
 ): PhysicalLayoutPlan<T, Ctx> {
   const schema = SpanBufferClass.schema;
+  const enumLookup = resolveEnumLookupDescriptor(schema);
   const messageLayoutFamily = runtimeHintMessageLayoutFamily(runtimeHint);
   const PlannedSpanBufferClass = getSpanBufferClass(schema, messageLayoutFamily, eagerColumns);
-  const SpanLoggerClass = createSpanLoggerClass(schema, messageLayoutFamily, eagerColumns.names);
-  const TagWriterClass = getTagWriterClass(schema, eagerColumns.names);
-  const ResultWriterClass = getResultWriterClass(schema, messageLayoutFamily, eagerColumns.names);
+  const SpanLoggerClass = createSpanLoggerClass(schema, messageLayoutFamily, eagerColumns.names, enumLookup);
+  const TagWriterClass = getTagWriterClass(schema, eagerColumns.names, enumLookup);
+  const ResultWriterClass = getResultWriterClass(schema, messageLayoutFamily, eagerColumns.names, enumLookup);
   const capabilities = isRuntimeHintAnalyzed(runtimeHint)
     ? runtimeHint & RUNTIME_HINT_CAPABILITIES_MASK
     : RUNTIME_HINT_FULL_CAPABILITIES;
@@ -278,6 +285,7 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
     capabilities,
     messageLayoutFamily,
     eagerColumns,
+    enumLookup,
     contextLayoutKey,
     SpanContextClass,
     capacityTier: runtimeHintInitialCapacity(runtimeHint),
