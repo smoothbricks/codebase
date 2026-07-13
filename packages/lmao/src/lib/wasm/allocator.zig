@@ -164,6 +164,12 @@ inline fn bytesAt(offset: u32) [*]allowzero u8 {
     return @ptrFromInt(offset);
 }
 
+/// Clear a successfully allocated block before exposing it to callers.
+inline fn zeroBlock(offset: u32, size: u32) void {
+    if (offset == 0) return;
+    @memset(bytesAt(offset)[0..@as(usize, size)], 0);
+}
+
 /// Get the global header at offset 0
 inline fn header() *allowzero Header {
     return ptrAt(Header, 0);
@@ -406,6 +412,24 @@ fn findAndRemoveByOffset(sc: SizeClass, tier: usize, target_offset: u32) bool {
     return false;
 }
 
+/// Return true when an offset is already covered by a free block in this size
+/// class. Checking ancestor tiers also catches a repeated free after its block
+/// was merged into a larger free block.
+fn isOffsetFree(sc: SizeClass, tier: usize, target_offset: u32) bool {
+    var current_tier = tier;
+    while (current_tier < NUM_TIERS) : (current_tier += 1) {
+        const block_size = blockSizeForCapacity(sc, tierToCapacity(current_tier));
+        var current_offset = freelistHeadAtTier(sc, current_tier);
+        while (current_offset != 0) {
+            if (target_offset >= current_offset and target_offset - current_offset < block_size) {
+                return true;
+            }
+            current_offset = ptrAt(FreeBlock, current_offset).next_ptr;
+        }
+    }
+    return false;
+}
+
 // =============================================================================
 // Debug exports (temporary for troubleshooting buddy merge)
 // =============================================================================
@@ -607,6 +631,7 @@ fn allocIdentity() u32 {
         }
 
         h.alloc_count += 1;
+        zeroBlock(head_offset, @sizeOf(Identity));
         return head_offset;
     }
 
@@ -618,11 +643,23 @@ fn allocIdentity() u32 {
     h.bump_ptr = new_bump;
     h.alloc_count += 1;
 
+    zeroBlock(aligned, @sizeOf(Identity));
     return aligned;
+}
+
+/// Return true when an identity block is already on its freelist.
+fn isIdentityFree(target_offset: u32) bool {
+    var current_offset = header().freelist_identity;
+    while (current_offset != 0) {
+        if (current_offset == target_offset) return true;
+        current_offset = ptrAt(FreeBlock, current_offset).next_ptr;
+    }
+    return false;
 }
 
 /// Free an identity block
 fn freeIdentity(offset: u32) void {
+    if (offset == 0 or isIdentityFree(offset)) return;
     const h = header();
     const old_head = h.freelist_identity;
     const free_block = ptrAt(FreeBlock, offset);
@@ -757,14 +794,17 @@ export fn free_col_8b(offset: u32, capacity: u32) void {
 
 /// Allocate with explicit capacity (converts to tier internally).
 fn allocWithCapacity(sc: SizeClass, capacity: u32) u32 {
-    const tier = capacityToTier(capacity);
-    return allocAtTier(sc, tier);
-}
+    const tier = effectiveTier(sc, capacityToTier(capacity));
+    const offset = allocAtTier(sc, tier);
+    zeroBlock(offset, blockSizeForCapacity(sc, tierToCapacity(tier)));
+    return offset;}
 
 /// Free with explicit capacity (converts to tier internally).
 fn freeWithCapacity(offset: u32, sc: SizeClass, capacity: u32) void {
-    const tier = capacityToTier(capacity);
-    freeAtTier(offset, sc, tier);
+    if (offset == 0) return;
+
+    const tier = effectiveTier(sc, capacityToTier(capacity));
+    if (isOffsetFree(sc, tier, offset)) return;    freeAtTier(offset, sc, tier);
 }
 
 // =============================================================================

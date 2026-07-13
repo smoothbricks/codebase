@@ -10,7 +10,7 @@
 //! bump-allocated neighbors.
 
 use lmao_arena::raw::{self};
-use lmao_arena::{Arena, SizeClass, block_size};
+use lmao_arena::{block_size, Arena, SizeClass};
 use proptest::prelude::*;
 
 fn size_class_strategy() -> impl Strategy<Value = SizeClass> {
@@ -241,4 +241,84 @@ proptest! {
             }
         }
     }
+}
+
+#[test]
+fn zero_offset_frees_are_no_ops_for_every_size_class_and_identity() {
+    let mut arena = Arena::new(1 << 20);
+    let free_count = arena.free_count();
+    let bump_ptr = arena.bump_ptr();
+
+    for sc in [
+        SizeClass::SpanSystem,
+        SizeClass::Col1B,
+        SizeClass::Col4B,
+        SizeClass::Col8B,
+    ] {
+        arena.free(0, sc, 64);
+    }
+    arena.free_identity(0);
+
+    assert_eq!(arena.free_count(), free_count);
+    assert_eq!(arena.bump_ptr(), bump_ptr);
+}
+
+#[test]
+fn repeated_free_after_buddy_merge_does_not_duplicate_ownership() {
+    for sc in [
+        SizeClass::SpanSystem,
+        SizeClass::Col1B,
+        SizeClass::Col4B,
+        SizeClass::Col8B,
+    ] {
+        let mut arena = Arena::new(1 << 20);
+        let offset = arena.alloc(sc, 8);
+        arena.free(offset, sc, 8);
+        let free_count = arena.free_count();
+
+        arena.free(offset, sc, 8);
+
+        assert_eq!(
+            arena.free_count(),
+            free_count,
+            "second free for {sc:?} must be ignored"
+        );
+        let first_owner = arena.alloc(sc, 8);
+        let second_owner = arena.alloc(sc, 8);
+        assert_ne!(
+            first_owner, second_owner,
+            "two live {sc:?} owners must not alias"
+        );
+    }
+}
+
+#[test]
+fn repeated_identity_free_does_not_duplicate_ownership() {
+    let mut arena = Arena::new(1 << 20);
+    let offset = arena.alloc_identity();
+    arena.free_identity(offset);
+    let free_count = arena.free_count();
+
+    arena.free_identity(offset);
+
+    assert_eq!(arena.free_count(), free_count);
+    let first_owner = arena.alloc_identity();
+    let second_owner = arena.alloc_identity();
+    assert_ne!(first_owner, second_owner);
+}
+
+#[test]
+fn recycled_column_clears_validity_and_value_bytes() {
+    let mut arena = Arena::new(1 << 20);
+    let capacity = 64;
+    let row = 5;
+    let column = raw::write_col_f64(arena.mem_mut(), 0, row, 91.25, capacity);
+    assert_eq!(raw::read_col_is_valid(arena.mem(), column, row), 1);
+
+    arena.free(column, SizeClass::Col8B, capacity);
+    let recycled = arena.alloc(SizeClass::Col8B, capacity);
+
+    assert_eq!(recycled, column, "test must exercise the recycled block");
+    assert_eq!(raw::read_col_is_valid(arena.mem(), recycled, row), 0);
+    assert_eq!(raw::read_col_f64(arena.mem(), recycled, row, capacity), 0.0);
 }

@@ -671,7 +671,7 @@ function convertBuffersToTable(buffers: AnySpanBuffer[], systemColumnBuilder?: S
       for (const buf of buffers) {
         const column = buf.getColumnIfAllocated(columnName);
         if (column && column instanceof indexArrayCtor) {
-          valueArrays.push(column.subarray(0, buf._writeIndex));
+          valueArrays.push(column.subarray(0, buf._writeIndex).slice());
         } else {
           valueArrays.push(new indexArrayCtor(buf._writeIndex));
         }
@@ -801,7 +801,7 @@ function convertBuffersToTable(buffers: AnySpanBuffer[], systemColumnBuilder?: S
       for (const buf of buffers) {
         const column = buf.getColumnIfAllocated(columnName);
         if (column && column instanceof Float64Array) {
-          valueArrays.push(column.subarray(0, buf._writeIndex));
+          valueArrays.push(column.subarray(0, buf._writeIndex).slice());
         } else {
           valueArrays.push(new F64Array(buf._writeIndex));
         }
@@ -830,7 +830,7 @@ function convertBuffersToTable(buffers: AnySpanBuffer[], systemColumnBuilder?: S
         const column = buf.getColumnIfAllocated(columnName);
         if (column && column instanceof Uint8Array) {
           const requiredBytes = Math.ceil(buf._writeIndex / 8);
-          valueArrays.push(column.subarray(0, requiredBytes));
+          valueArrays.push(column.subarray(0, requiredBytes).slice());
         } else {
           const requiredBytes = Math.ceil(buf._writeIndex / 8);
           valueArrays.push(new Uint8Array(requiredBytes));

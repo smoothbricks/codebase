@@ -320,8 +320,8 @@ function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Me
       exports.span_start(systemPtr, identityPtr, traceRootPtr, cap),
     spanEndOk: (systemPtr, traceRootPtr, cap = capacity) => exports.span_end_ok(systemPtr, traceRootPtr, cap),
     spanEndErr: (systemPtr, traceRootPtr, cap = capacity) => exports.span_end_err(systemPtr, traceRootPtr, cap),
-    writeLogEntry: (systemPtr, traceRootPtr, idx, entryType, cap = capacity) =>
-      exports.write_log_entry(systemPtr, traceRootPtr, idx, entryType, cap),
+    writeLogEntry: (systemPtr, identityPtr, traceRootPtr, entryType, cap = capacity) =>
+      exports.write_log_entry(systemPtr, identityPtr, traceRootPtr, entryType, cap),
 
     // Column writes with optional capacity
     writeColF64: (colOffset, rowIdx, value, cap = capacity) => exports.write_col_f64(colOffset, rowIdx, value, cap),

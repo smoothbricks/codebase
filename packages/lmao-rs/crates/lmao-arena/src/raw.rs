@@ -274,6 +274,32 @@ fn find_and_remove_by_offset<M: Mem>(m: &mut M, sc: SizeClass, tier: usize, targ
     false
 }
 
+#[inline]
+fn clear_bytes<M: Mem>(m: &mut M, offset: u32, len: u32) {
+    debug_assert_ne!(offset, 0);
+    for byte_offset in offset..offset + len {
+        m.write_u8(byte_offset, 0);
+    }
+}
+
+/// Returns true when `offset` is already covered by a free block for this size
+/// class. Checking every tier also catches a repeated free after buddy merging.
+fn capacity_block_is_free<M: Mem>(m: &M, offset: u32, sc: SizeClass) -> bool {
+    for tier in 0..NUM_TIERS {
+        let size = u64::from(block_size(sc, tier_to_capacity(tier)));
+        let mut current = freelist_head(m, sc, tier);
+        while current != 0 {
+            let start = u64::from(current);
+            let target = u64::from(offset);
+            if target >= start && target < start + size {
+                return true;
+            }
+            current = m.read_u32(current + FB_NEXT_PTR);
+        }
+    }
+    false
+}
+
 /// Effective allocation tier for a request.
 ///
 /// DELIBERATE DEVIATION from allocator.zig: a freed block is overlaid with a
@@ -304,11 +330,19 @@ pub fn effective_block_size(sc: SizeClass, capacity: u32) -> u32 {
 
 /// `allocWithCapacity`.
 pub fn alloc_with_capacity<M: Mem>(m: &mut M, sc: SizeClass, capacity: u32) -> u32 {
-    alloc_at_tier(m, sc, effective_tier(sc, capacity_to_tier(capacity)))
+    let size = effective_block_size(sc, capacity);
+    let offset = alloc_at_tier(m, sc, effective_tier(sc, capacity_to_tier(capacity)));
+    if offset != 0 {
+        clear_bytes(m, offset, size);
+    }
+    offset
 }
 
 /// `freeWithCapacity`.
 pub fn free_with_capacity<M: Mem>(m: &mut M, offset: u32, sc: SizeClass, capacity: u32) {
+    if offset == 0 || capacity_block_is_free(m, offset, sc) {
+        return;
+    }
     free_at_tier(
         m,
         offset,
@@ -347,8 +381,22 @@ fn alloc_identity_block<M: Mem>(m: &mut M) -> u32 {
     aligned
 }
 
+fn identity_block_is_free<M: Mem>(m: &M, offset: u32) -> bool {
+    let mut current = m.read_u32(H_FREELIST_IDENTITY);
+    while current != 0 {
+        if current == offset {
+            return true;
+        }
+        current = m.read_u32(current + FB_NEXT_PTR);
+    }
+    false
+}
+
 /// `freeIdentity`.
 pub fn free_identity<M: Mem>(m: &mut M, offset: u32) {
+    if offset == 0 || identity_block_is_free(m, offset) {
+        return;
+    }
     let old_head = m.read_u32(H_FREELIST_IDENTITY);
     m.write_u32(offset + FB_NEXT_PTR, old_head);
     if old_head != 0 {
@@ -380,6 +428,7 @@ pub fn alloc_identity_root_for_js_write<M: Mem>(m: &mut M, trace_id_len: u32) ->
     if offset == 0 {
         return 0;
     }
+    clear_bytes(m, offset, IDENTITY_SIZE as u32);
     let span_id = m.read_u32(H_SPAN_ID_COUNTER) + 1;
     m.write_u32(H_SPAN_ID_COUNTER, span_id);
     m.write_u32(offset + ID_SPAN_ID, span_id);
@@ -395,6 +444,7 @@ pub fn alloc_identity_child<M: Mem>(m: &mut M) -> u32 {
     if offset == 0 {
         return 0;
     }
+    clear_bytes(m, offset, IDENTITY_SIZE as u32);
     let span_id = m.read_u32(H_SPAN_ID_COUNTER) + 1;
     m.write_u32(H_SPAN_ID_COUNTER, span_id);
     m.write_u32(offset + ID_SPAN_ID, span_id);
