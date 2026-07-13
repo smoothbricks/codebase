@@ -322,6 +322,8 @@ pub enum RestoreFailpoint {
     AfterMetadataPublish = 4,
     AfterMetadataFsync = 5,
     AfterCanonicalImageRename = 6,
+    AfterCanonicalSidecarRename = 7,
+    CanonicalParentFsyncFailure = 8,
 }
 
 fn store_directory_exists(store_root: &Path) -> Result<bool, ApfsStorageError> {
@@ -694,6 +696,12 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     RestoreFailpoint::AfterMetadataPublish => "metadata publish",
                     RestoreFailpoint::AfterMetadataFsync => "metadata fsync",
                     RestoreFailpoint::AfterCanonicalImageRename => "canonical image rename",
+                    RestoreFailpoint::AfterCanonicalSidecarRename => {
+                        "canonical sidecar rename"
+                    }
+                    RestoreFailpoint::CanonicalParentFsyncFailure => {
+                        "canonical parent fsync"
+                    }
                 }
             )))
         } else {
@@ -1699,17 +1707,61 @@ where
                 canonical.display()
             )));
         }
-        DetachedWorkspaceMetadata::read_for_image(staged)
+        let expected_metadata = DetachedWorkspaceMetadata::read_for_image(staged)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        Self::rename_sidecar(staged, canonical)?;
-        self.trip_restore_failpoint(RestoreFailpoint::AfterMetadataPublish)?;
-        sync_parent!(&sidecar_path(canonical))?;
-        self.trip_restore_failpoint(RestoreFailpoint::AfterMetadataFsync)?;
-        fs::rename(staged, canonical)
-            .map_err(|error| io_error("publish canonical image", canonical, error))?;
-        self.trip_restore_failpoint(RestoreFailpoint::AfterCanonicalImageRename)?;
-        sync_parent!(canonical)?;
-        Ok(())
+        let publication = (|| {
+            Self::rename_sidecar(staged, canonical)?;
+            self.trip_restore_failpoint(RestoreFailpoint::AfterCanonicalSidecarRename)?;
+            sync_parent!(&sidecar_path(canonical))?;
+            self.trip_restore_failpoint(RestoreFailpoint::AfterMetadataFsync)?;
+            fs::rename(staged, canonical)
+                .map_err(|error| io_error("publish canonical image", canonical, error))?;
+            self.trip_restore_failpoint(RestoreFailpoint::AfterCanonicalImageRename)?;
+            self.trip_restore_failpoint(RestoreFailpoint::CanonicalParentFsyncFailure)?;
+            sync_parent!(canonical)
+        })();
+        let Err(primary) = publication else {
+            return Ok(());
+        };
+
+        let canonical_sidecar = sidecar_path(canonical);
+        if canonical.exists() && canonical_sidecar.exists() {
+            let verified = (|| {
+                let actual = DetachedWorkspaceMetadata::read_for_image(canonical)
+                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+                if actual != expected_metadata || actual.image_format != canonical_format {
+                    return Err(ApfsStorageError::Host(format!(
+                        "durable canonical publication identity mismatch: {}",
+                        canonical.display()
+                    )));
+                }
+                sync_parent!(canonical)
+            })();
+            return match verified {
+                Ok(()) => Ok(()),
+                Err(cleanup) => Err(ApfsStorageError::Cleanup {
+                    operation: "verify durable canonical publication",
+                    primary: Box::new(primary),
+                    cleanup: Box::new(cleanup),
+                }),
+            };
+        }
+
+        let rollback = if !canonical.exists() && canonical_sidecar.exists() && staged.exists() {
+            let staged_sidecar = sidecar_path(staged);
+            fs::rename(&canonical_sidecar, &staged_sidecar)
+                .map_err(|error| {
+                    io_error(
+                        "roll back prepublication canonical metadata",
+                        &staged_sidecar,
+                        error,
+                    )
+                })
+                .and_then(|()| sync_parent!(&staged_sidecar))
+        } else {
+            Ok(())
+        };
+        super::combine_cleanup("roll back partial canonical publication", primary, rollback)
     }
 
     fn publish_adopt(
