@@ -1,0 +1,1 @@
+import '../../lib/vocabularyRegistry.js';
