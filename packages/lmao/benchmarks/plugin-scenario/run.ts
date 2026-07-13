@@ -11,6 +11,12 @@ const lmaoNodeUrl = pathToFileURL(resolve(projectRoot, 'packages/lmao/src/node.t
 const nativePluginPath = resolve(projectRoot, 'packages/lmao-ttsc/plugin.cjs');
 const nativeAdapterUrl = pathToFileURL(resolve(projectRoot, 'packages/lmao-ttsc/src/index.ts')).href;
 const lmaoTtscPackage = await Bun.file(resolve(projectRoot, 'packages/lmao-ttsc/package.json')).json();
+const typescriptPackage = await Bun.file(
+  resolve(projectRoot, 'packages/lmao-ttsc/node_modules/typescript/package.json'),
+).json();
+const ttscAdapterPackage = await Bun.file(
+  resolve(projectRoot, 'packages/lmao-ttsc/node_modules/@ttsc/unplugin/package.json'),
+).json();
 const { createBunTtscPlugin } = await import(nativeAdapterUrl);
 const textDecoder = new TextDecoder();
 
@@ -411,9 +417,10 @@ async function main(): Promise<void> {
       workloadSha256: workloadSha256(sourceBuffer),
       versions: {
         bun: Bun.version,
-        typescript: lmaoTtscPackage.dependencies.typescript,
+        typescript: typescriptPackage.version,
         mitata: mitataPackage.version,
         lmaoTtsc: lmaoTtscPackage.version,
+        ttscAdapter: ttscAdapterPackage.version,
       },
       compilerKind: 'native-ttsc',
       transformProof,
