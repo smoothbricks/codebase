@@ -279,9 +279,9 @@ function writeRetryEntry<T extends LogSchema>(
   // Get current write index and advance for next write
   const index = buffer._writeIndex;
 
-  // Write entry via TraceRoot for timestamp handling
-  // TraceRoot.writeLogEntry writes timestamp and entry_type at the given index
-  buffer._traceRoot._appendLogEntry(buffer._traceRoot, buffer, ENTRY_TYPE_SPAN_RETRY);
+  const traceRoot = buffer._traceRoot;
+  const appendLogEntry = buffer._opMetadata._physicalLayoutPlan?.appendLogEntry ?? traceRoot._appendLogEntry;
+  appendLogEntry(traceRoot, buffer, ENTRY_TYPE_SPAN_RETRY);
 
   // Write retry-specific message: retry:op:{opName} for prefix-based querying
   const opName = buffer._opMetadata?.name ?? 'unknown';
@@ -531,12 +531,17 @@ async function executeWithRetry8<Ctx extends OpContext, S, E, A1, A2, A3, A4, A5
  * @param buffer - SpanBuffer to write to
  * @param result - The result returned by the span function
  */
+function writeSpanEndEntry<T extends LogSchema>(buffer: SpanBuffer<T>, entryType: number): void {
+  const appenders = buffer._opMetadata._physicalLayoutPlan?.appenders;
+  if (appenders === undefined) throw new TypeError('SpanBuffer metadata is missing physical lifecycle appenders');
+  appenders.writeSpanEnd(buffer, entryType);
+}
+
 export function writeSpanEnd<T extends LogSchema, S, E>(buffer: SpanBuffer<T>, result: Result<S, E>): void {
-  // Write entry_type and timestamp via TraceRoot (platform-specific)
   if (result instanceof Ok) {
-    buffer._traceRoot._writeSpanEnd(buffer._traceRoot, buffer, ENTRY_TYPE_SPAN_OK);
+    writeSpanEndEntry(buffer, ENTRY_TYPE_SPAN_OK);
   } else if (result instanceof Err) {
-    buffer._traceRoot._writeSpanEnd(buffer._traceRoot, buffer, ENTRY_TYPE_SPAN_ERR);
+    writeSpanEndEntry(buffer, ENTRY_TYPE_SPAN_ERR);
     // Write error_code if the error has a code property
     if (hasErrorCode(result.error)) {
       buffer.error_code(1, result.error.code);
@@ -806,7 +811,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       // field/closure so `op(({ tag, log, span, ok, err }) => ...)` needs no ctx drilling.
       this._spanBuffer = buffer;
       this._buffer = buffer;
-      this._appendLogEntry = buffer._traceRoot._appendLogEntry;
+      this._appendLogEntry = callsitePlan.appendLogEntry;
       this._schema = schema;
       this._logBinding = logBinding;
       this._physicalLayoutPlan = callsitePlan;
@@ -1160,8 +1165,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
      * Called in catch blocks of span methods.
      */
     _spanException(childBuffer: SpanBuffer<Ctx['logSchema']>, error: unknown): void {
-      // Write entry_type and timestamp via TraceRoot (platform-specific)
-      childBuffer._traceRoot._writeSpanEnd(childBuffer._traceRoot, childBuffer, ENTRY_TYPE_SPAN_EXCEPTION);
+      writeSpanEndEntry(childBuffer, ENTRY_TYPE_SPAN_EXCEPTION);
       const errorMessage = error instanceof Error ? error.message : String(error);
       const errorStack = error instanceof Error ? error.stack : undefined;
       childBuffer.message(1, errorMessage);

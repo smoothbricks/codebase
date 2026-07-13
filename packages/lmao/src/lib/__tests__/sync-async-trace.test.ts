@@ -14,6 +14,7 @@ import { describe, expect, it } from 'bun:test';
 // Must import test-helpers first to initialize timestamp implementation
 import './test-helpers.js';
 import { defineOpContext } from '../defineOpContext.js';
+import { resolveEntryType } from '../resolveMessage.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_OK, ENTRY_TYPE_SPAN_START } from '../schema/systemSchema.js';
@@ -43,7 +44,7 @@ describe('Sync/Async Trace Execution', () => {
         capturedBuffer = ctx.buffer;
 
         // At this point, span-start is written (row 0)
-        expect(ctx.buffer.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
+        expect(resolveEntryType(ctx.buffer, 0)).toBe(ENTRY_TYPE_SPAN_START);
 
         // Row 1 not yet written (happens after function returns)
         return { success: true, value: 42 };
@@ -54,8 +55,8 @@ describe('Sync/Async Trace Execution', () => {
 
       // span-ok should be written to row 1 immediately after sync function returns
       expect(capturedBuffer).toBeDefined();
-      expect(capturedBuffer?.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
-      expect(capturedBuffer?.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(capturedBuffer ? resolveEntryType(capturedBuffer, 0) : undefined).toBe(ENTRY_TYPE_SPAN_START);
+      expect(capturedBuffer ? resolveEntryType(capturedBuffer, 1) : undefined).toBe(ENTRY_TYPE_SPAN_OK);
 
       // Timestamp should be written
       expect(capturedBuffer?.timestamp[1]).toBeGreaterThan(0n);
@@ -78,7 +79,7 @@ describe('Sync/Async Trace Execution', () => {
           capturedBuffer = ctx.buffer;
 
           // span-start written at row 0
-          expect(ctx.buffer.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
+          expect(resolveEntryType(ctx.buffer, 0)).toBe(ENTRY_TYPE_SPAN_START);
 
           throw testError;
         });
@@ -86,8 +87,8 @@ describe('Sync/Async Trace Execution', () => {
 
       // span-exception should be written to row 1 immediately
       expect(capturedBuffer).toBeDefined();
-      expect(capturedBuffer?.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
-      expect(capturedBuffer?.entry_type[1]).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
+      expect(capturedBuffer ? resolveEntryType(capturedBuffer, 0) : undefined).toBe(ENTRY_TYPE_SPAN_START);
+      expect(capturedBuffer ? resolveEntryType(capturedBuffer, 1) : undefined).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
 
       // Exception details should be written
       expect(capturedBuffer?.timestamp[1]).toBeGreaterThan(0n);
@@ -114,7 +115,7 @@ describe('Sync/Async Trace Execution', () => {
         capturedBuffer = ctx.buffer;
 
         // span-start is written at row 0
-        expect(ctx.buffer.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
+        expect(resolveEntryType(ctx.buffer, 0)).toBe(ENTRY_TYPE_SPAN_START);
 
         // Row 1 not yet written (will be written after Promise resolves)
         // At this point, entry_type[1] may be 0 or pre-initialized
@@ -142,8 +143,8 @@ describe('Sync/Async Trace Execution', () => {
 
       // After Promise resolves, span-ok should be written to row 1
       expect(capturedBuffer).toBeDefined();
-      expect(capturedBuffer?.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
-      expect(capturedBuffer?.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(capturedBuffer ? resolveEntryType(capturedBuffer, 0) : undefined).toBe(ENTRY_TYPE_SPAN_START);
+      expect(capturedBuffer ? resolveEntryType(capturedBuffer, 1) : undefined).toBe(ENTRY_TYPE_SPAN_OK);
 
       // Timestamp should be written
       expect(capturedBuffer?.timestamp[1]).toBeGreaterThan(0n);
@@ -166,7 +167,7 @@ describe('Sync/Async Trace Execution', () => {
         capturedBuffer = ctx.buffer;
 
         // span-start written at row 0
-        expect(ctx.buffer.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
+        expect(resolveEntryType(ctx.buffer, 0)).toBe(ENTRY_TYPE_SPAN_START);
 
         // Simulate async work before error
         await new Promise((resolve) => setTimeout(resolve, 10));
@@ -190,8 +191,8 @@ describe('Sync/Async Trace Execution', () => {
 
       // After Promise rejects, span-exception should be written to row 1
       expect(capturedBuffer).toBeDefined();
-      expect(capturedBuffer?.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
-      expect(capturedBuffer?.entry_type[1]).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
+      expect(capturedBuffer ? resolveEntryType(capturedBuffer, 0) : undefined).toBe(ENTRY_TYPE_SPAN_START);
+      expect(capturedBuffer ? resolveEntryType(capturedBuffer, 1) : undefined).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
 
       // Timestamp should be written
       expect(capturedBuffer?.timestamp[1]).toBeGreaterThan(0n);
@@ -227,8 +228,8 @@ describe('Sync/Async Trace Execution', () => {
 
       // Both buffers should have span-ok written
       expect(buffers.length).toBe(2);
-      expect(buffers[0].entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
-      expect(buffers[1].entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(resolveEntryType(buffers[0], 1)).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(resolveEntryType(buffers[1], 1)).toBe(ENTRY_TYPE_SPAN_OK);
 
       // Both traces should be collected
       expect(tracer.rootBuffers.length).toBe(2);
@@ -270,8 +271,8 @@ describe('Sync/Async Trace Execution', () => {
 
       // Both buffers should have span-ok written
       expect(buffers.length).toBe(2);
-      expect(buffers[0].entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
-      expect(buffers[1].entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(resolveEntryType(buffers[0], 1)).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(resolveEntryType(buffers[1], 1)).toBe(ENTRY_TYPE_SPAN_OK);
 
       // Both traces should be collected
       expect(tracer.rootBuffers.length).toBe(2);
@@ -315,9 +316,9 @@ describe('Sync/Async Trace Execution', () => {
 
       // All three buffers should have span-ok
       expect(buffers.length).toBe(3);
-      expect(buffers[0].entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
-      expect(buffers[1].entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
-      expect(buffers[2].entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(resolveEntryType(buffers[0], 1)).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(resolveEntryType(buffers[1], 1)).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(resolveEntryType(buffers[2], 1)).toBe(ENTRY_TYPE_SPAN_OK);
 
       // All three traces should be collected
       expect(tracer.rootBuffers.length).toBe(3);
@@ -347,7 +348,7 @@ describe('Sync/Async Trace Execution', () => {
       expect(result).toEqual({ id: 123 });
 
       // span-ok should be written
-      expect(capturedBuffer?.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(capturedBuffer ? resolveEntryType(capturedBuffer, 1) : undefined).toBe(ENTRY_TYPE_SPAN_OK);
     });
 
     it('should support tags in async trace', async () => {
@@ -374,7 +375,7 @@ describe('Sync/Async Trace Execution', () => {
       expect(result).toEqual({ id: 123 });
 
       // span-ok should be written after Promise resolves
-      expect(capturedBuffer?.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(capturedBuffer ? resolveEntryType(capturedBuffer, 1) : undefined).toBe(ENTRY_TYPE_SPAN_OK);
     });
 
     it('should support logging in sync trace', () => {
@@ -399,7 +400,7 @@ describe('Sync/Async Trace Execution', () => {
       expect(result).toBe('done');
 
       // span-ok at row 1
-      expect(capturedBuffer?.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(capturedBuffer ? resolveEntryType(capturedBuffer, 1) : undefined).toBe(ENTRY_TYPE_SPAN_OK);
 
       // Events logged at rows 2+ (verified by successful completion)
     });
@@ -429,7 +430,7 @@ describe('Sync/Async Trace Execution', () => {
       expect(result).toBe('done');
 
       // span-ok at row 1 (written after Promise resolves)
-      expect(capturedBuffer?.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(capturedBuffer ? resolveEntryType(capturedBuffer, 1) : undefined).toBe(ENTRY_TYPE_SPAN_OK);
     });
   });
 });

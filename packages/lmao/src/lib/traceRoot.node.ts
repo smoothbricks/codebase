@@ -48,25 +48,31 @@ function nextTimestamp(root: TraceRoot): Nanoseconds {
 const timestampNow: TimestampNowPrimitive = (traceRoot) => nextTimestamp(traceRoot as TraceRoot);
 
 const appendLogEntry: TimestampAppendPrimitive = (traceRoot, buffer, entryType) => {
+  const entryTypes = buffer.entry_type;
+  if (entryTypes === undefined) throw new TypeError('Split timestamp appender requires entry_type storage');
   const idx = buffer._writeIndex;
   buffer.timestamp[idx] = nextTimestamp(traceRoot as TraceRoot);
-  buffer.entry_type[idx] = entryType;
+  entryTypes[idx] = entryType;
   buffer._writeIndex = idx + 1;
   return idx;
 };
 
 const writeSpanStartPrimitive: SpanStartPrimitive = (traceRoot, buffer, spanName) => {
+  const entryTypes = buffer.entry_type;
+  if (entryTypes === undefined) throw new TypeError('Split span-start appender requires entry_type storage');
   buffer.timestamp[0] = nextTimestamp(traceRoot as TraceRoot);
-  buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+  entryTypes[0] = ENTRY_TYPE_SPAN_START;
   if (buffer.message_values) buffer.message(0, spanName);
-  buffer.entry_type[1] = ENTRY_TYPE_SPAN_EXCEPTION;
+  entryTypes[1] = ENTRY_TYPE_SPAN_EXCEPTION;
   buffer.timestamp[1] = 0n;
   buffer._writeIndex = 2;
 };
 
 const writeSpanEndPrimitive: SpanEndPrimitive = (traceRoot, buffer, entryType) => {
+  const entryTypes = buffer.entry_type;
+  if (entryTypes === undefined) throw new TypeError('Split span-end appender requires entry_type storage');
   buffer.timestamp[1] = nextTimestamp(traceRoot as TraceRoot);
-  buffer.entry_type[1] = entryType;
+  entryTypes[1] = entryType;
   buffer._sealStatsChain();
 };
 

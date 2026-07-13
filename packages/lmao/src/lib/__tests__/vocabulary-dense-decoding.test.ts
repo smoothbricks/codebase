@@ -9,15 +9,15 @@ import {
 } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { resolveMessage } from '../resolveMessage.js';
+import {
+  RUNTIME_HINT_ANALYZED_VALID,
+  RUNTIME_HINT_LOG,
+  RUNTIME_HINT_MESSAGE_LAYOUT_MIXED,
+  RUNTIME_HINT_MESSAGE_PHYSICAL_PACKED,
+  RUNTIME_HINT_RESULT,
+} from '../runtimeHint.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import {
-  ENTRY_TYPE_DEBUG,
-  ENTRY_TYPE_ERROR,
-  ENTRY_TYPE_INFO,
-  ENTRY_TYPE_TRACE,
-  ENTRY_TYPE_WARN,
-} from '../schema/systemSchema.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 import type { SpanBuffer } from '../types.js';
 import {
@@ -229,7 +229,7 @@ describe('global vocabulary dense decoding', () => {
     expect(lease.released).toBe(true);
   });
 
-  it('packs registered dense bindings for every level while dynamic rows stay in the raw message lane', async () => {
+  it('keeps registered dense bindings semantic through the default current raw lane', async () => {
     const messages = [
       'dense info literal',
       'dense debug literal',
@@ -251,17 +251,18 @@ describe('global vocabulary dense decoding', () => {
     const tracer = new TestTracer(opContext, createTestTracerOptions());
     await tracer.trace('dense-levels', op);
     const buffer = tracer.rootBuffers[0];
-    const headers = buffer._logHeaders;
+    const localIds = buffer._messageIds;
+    const validity = buffer.message_nulls;
     const rawMessages = buffer.message_values;
-    if (!headers || !rawMessages) throw new Error('Expected mixed buffer message lanes');
-
-    const entryTypes = [ENTRY_TYPE_INFO, ENTRY_TYPE_DEBUG, ENTRY_TYPE_WARN, ENTRY_TYPE_ERROR, ENTRY_TYPE_TRACE];
-    expect(Array.from(headers.subarray(2, 7))).toEqual(
-      entryTypes.map((entryType, ordinal) => (binding[ordinal] << 8) | entryType),
-    );
-    expect(headers[7]).toBe(0);
-    for (let row = 2; row < 7; row++) expect(rawMessages[row]).toBeUndefined();
-    expect(rawMessages[7]).toBe('dynamic message');
+    if (!localIds || !validity || !rawMessages) throw new Error('Expected current local-ID, validity, and raw lanes');
+    expect(buffer._messagePhysicalLayout).toBe('current');
+    expect(buffer._opMetadata._physicalLayoutPlan?.localMessageDictionary).toEqual([]);
+    expect('_logHeaders' in buffer).toBe(false);
+    expect(Array.from(localIds.subarray(2, 8))).toEqual([0, 0, 0, 0, 0, 0]);
+    expect(rawMessages.slice(2, 8)).toEqual([...messages, 'dynamic message']);
+    for (let row = 2; row < 8; row++) {
+      expect(validity[row >>> 3] & (1 << (row & 7))).not.toBe(0);
+    }
     expect(Array.from({ length: 6 }, (_, index) => resolveMessage(buffer, index + 2))).toEqual([
       ...messages,
       'dynamic message',
@@ -316,6 +317,14 @@ describe('global vocabulary dense decoding', () => {
       invalidDenseIndex = ctx.buffer._vocabularyGeneration.ids.length;
       logger._infoTemplate(invalidDenseIndex);
       return ctx.ok(null);
+    }, undefined, {
+      runtimeHint:
+        RUNTIME_HINT_ANALYZED_VALID |
+        RUNTIME_HINT_LOG |
+        RUNTIME_HINT_RESULT |
+        RUNTIME_HINT_MESSAGE_LAYOUT_MIXED |
+        RUNTIME_HINT_MESSAGE_PHYSICAL_PACKED |
+        3,
     });
     const tracer = new TestTracer(opContext, createTestTracerOptions());
     await tracer.trace('invalid-dense-index', op);

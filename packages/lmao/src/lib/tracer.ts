@@ -80,7 +80,6 @@ import {
   type SpanContextClass,
   type SpanContextInstance,
   writeSpanEnd,
-  writeSpanStart,
 } from './spanContext.js';
 import { generateTraceId, isValidTraceId, type TraceId } from './traceId.js';
 import type { TraceRootFactory, TracerLifecycleHooks } from './traceRoot.js';
@@ -734,7 +733,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
     );
 
     // Write span-start entry (row 0)
-    writeSpanStart(buffer, name);
+    callsitePlan.appenders.writeSpanStart(buffer, name);
 
     return new callsitePlan.SpanContextClass(
       buffer,
@@ -787,6 +786,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
     fn: (ctx: SpanContext<OpContextOf<B>>) => Result<S, E> | Promise<Result<S, E>>,
   ): Result<S, E> | Promise<Result<S, E>> {
     const buffer = ctx._spanBuffer;
+    const writeSpanEndEntry = ctx._physicalLayoutPlan.appenders.writeSpanEnd;
 
     this.onTraceStart(buffer);
 
@@ -803,7 +803,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
               return resolved;
             },
             (error: unknown) => {
-              buffer._traceRoot._writeSpanEnd(buffer._traceRoot, buffer, ENTRY_TYPE_SPAN_EXCEPTION);
+              writeSpanEndEntry(buffer, ENTRY_TYPE_SPAN_EXCEPTION);
 
               const errorMessage = error instanceof Error ? error.message : String(error);
               const errorStack = error instanceof Error ? error.stack : undefined;
@@ -822,7 +822,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
       writeSpanEnd(buffer, result);
       return result;
     } catch (error) {
-      buffer._traceRoot._writeSpanEnd(buffer._traceRoot, buffer, ENTRY_TYPE_SPAN_EXCEPTION);
+      writeSpanEndEntry(buffer, ENTRY_TYPE_SPAN_EXCEPTION);
 
       const errorMessage = error instanceof Error ? error.message : String(error);
       const errorStack = error instanceof Error ? error.stack : undefined;
@@ -845,6 +845,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
     fn: (ctx: SpanContext<OpContextOf<B>>) => unknown,
   ): unknown {
     const buffer = ctx._spanBuffer;
+    const writeSpanEndEntry = ctx._physicalLayoutPlan.appenders.writeSpanEnd;
 
     // Call trace start hook
     this.onTraceStart(buffer);
@@ -861,12 +862,12 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
               if (resolved instanceof Ok || resolved instanceof Err) {
                 writeSpanEnd(buffer, resolved);
               } else {
-                buffer._traceRoot._writeSpanEnd(buffer._traceRoot, buffer, ENTRY_TYPE_SPAN_OK);
+                writeSpanEndEntry(buffer, ENTRY_TYPE_SPAN_OK);
               }
               return resolved;
             },
             (error: unknown) => {
-              buffer._traceRoot._writeSpanEnd(buffer._traceRoot, buffer, ENTRY_TYPE_SPAN_EXCEPTION);
+              writeSpanEndEntry(buffer, ENTRY_TYPE_SPAN_EXCEPTION);
 
               const errorMessage = error instanceof Error ? error.message : String(error);
               const errorStack = error instanceof Error ? error.stack : undefined;
@@ -886,13 +887,13 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
       if (result instanceof Ok || result instanceof Err) {
         writeSpanEnd(buffer, result);
       } else {
-        buffer._traceRoot._writeSpanEnd(buffer._traceRoot, buffer, ENTRY_TYPE_SPAN_OK);
+        writeSpanEndEntry(buffer, ENTRY_TYPE_SPAN_OK);
       }
 
       return result;
     } catch (error) {
       // Sync exception path
-      buffer._traceRoot._writeSpanEnd(buffer._traceRoot, buffer, ENTRY_TYPE_SPAN_EXCEPTION);
+      writeSpanEndEntry(buffer, ENTRY_TYPE_SPAN_EXCEPTION);
 
       // Write exception details
       const errorMessage = error instanceof Error ? error.message : String(error);

@@ -2,17 +2,22 @@ import { describe, expect, it } from 'bun:test';
 import { createHash } from 'node:crypto';
 import fc from 'fast-check';
 import { defineOpContext } from '../defineOpContext.js';
-import { resolveMessage } from '../resolveMessage.js';
+import { MAX_PACKED_MESSAGE_DENSE_INDEX, resolveEntryType, resolveMessage } from '../resolveMessage.js';
 import {
   RUNTIME_HINT_ANALYZED_VALID,
   RUNTIME_HINT_LOG,
   RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY,
   RUNTIME_HINT_MESSAGE_LAYOUT_MIXED,
   RUNTIME_HINT_MESSAGE_LAYOUT_STATIC_ONLY,
+  RUNTIME_HINT_MESSAGE_PHYSICAL_PACKED,
+  RUNTIME_HINT_MESSAGE_PHYSICAL_SPECIALIZED,
   RUNTIME_HINT_RESULT,
   runtimeHintMessageLayoutFamily,
+  runtimeHintMessagePhysicalLayout,
   type MessageLayoutFamily,
+  type MessagePhysicalLayout,
 } from '../runtimeHint.js';
+import type { OpMetadata } from '../opContext/opTypes.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import {
@@ -36,7 +41,7 @@ import {
   registerVocabularyFragment,
   type VocabularyFragment,
 } from '../vocabularyRegistry.js';
-import { createTestOpMetadata, createTestTraceRoot } from './test-helpers.js';
+import { createTestTraceRoot } from './test-helpers.js';
 
 const CAPACITY = 8;
 const encoder = new TextEncoder();
@@ -125,29 +130,51 @@ function textAtDenseZero(): string {
   return new TextDecoder().decode(record.subarray(4, 4 + textLength));
 }
 
-function hint(familyBits: number): number {
-  return RUNTIME_HINT_ANALYZED_VALID | familyBits | RUNTIME_HINT_LOG | RUNTIME_HINT_RESULT | CAPACITY;
+function hint(familyBits: number, physicalBits = 0, capacity = CAPACITY): number {
+  return RUNTIME_HINT_ANALYZED_VALID | familyBits | physicalBits | RUNTIME_HINT_LOG | RUNTIME_HINT_RESULT | capacity;
 }
 
 const staticOp = context.defineOp('static-family', (ctx) => ctx.ok(null), undefined, {
   runtimeHint: hint(RUNTIME_HINT_MESSAGE_LAYOUT_STATIC_ONLY),
+  localMessageDictionary: [0],
 });
 const dynamicOp = context.defineOp('dynamic-family', (ctx) => ctx.ok(null), undefined, {
   runtimeHint: hint(RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY),
 });
 const mixedOp = context.defineOp('mixed-family', (ctx) => ctx.ok(null), undefined, {
   runtimeHint: hint(RUNTIME_HINT_MESSAGE_LAYOUT_MIXED),
+  localMessageDictionary: [0],
+});
+const fallbackCurrentOp = context.defineOp('fallback-current-family', (ctx) => ctx.ok(null));
+const specializedStaticOp = context.defineOp('specialized-static-family', (ctx) => ctx.ok(null), undefined, {
+  runtimeHint: hint(RUNTIME_HINT_MESSAGE_LAYOUT_STATIC_ONLY, RUNTIME_HINT_MESSAGE_PHYSICAL_SPECIALIZED),
+});
+const specializedDynamicOp = context.defineOp('specialized-dynamic-family', (ctx) => ctx.ok(null), undefined, {
+  runtimeHint: hint(RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY, RUNTIME_HINT_MESSAGE_PHYSICAL_SPECIALIZED),
+});
+const specializedMixedOp = context.defineOp('specialized-mixed-family', (ctx) => ctx.ok(null), undefined, {
+  runtimeHint: hint(RUNTIME_HINT_MESSAGE_LAYOUT_MIXED, RUNTIME_HINT_MESSAGE_PHYSICAL_SPECIALIZED),
+});
+const packedStaticOp = context.defineOp('packed-static-family', (ctx) => ctx.ok(null), undefined, {
+  runtimeHint: hint(RUNTIME_HINT_MESSAGE_LAYOUT_STATIC_ONLY, RUNTIME_HINT_MESSAGE_PHYSICAL_PACKED),
+});
+const packedDynamicOp = context.defineOp('packed-dynamic-family', (ctx) => ctx.ok(null), undefined, {
+  runtimeHint: hint(RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY, RUNTIME_HINT_MESSAGE_PHYSICAL_PACKED),
+});
+const packedMixedOp = context.defineOp('packed-mixed-family', (ctx) => ctx.ok(null), undefined, {
+  runtimeHint: hint(RUNTIME_HINT_MESSAGE_LAYOUT_MIXED, RUNTIME_HINT_MESSAGE_PHYSICAL_PACKED),
 });
 
 function createPlannedBuffer(
   family: MessageLayoutFamily,
   SpanBufferClass: SpanBufferConstructor<typeof runtimeSchema>,
+  metadata: OpMetadata,
 ): SpanBuffer<typeof runtimeSchema> {
   SpanBufferClass.stats.capacity = CAPACITY;
   return createSpanBuffer(
     runtimeSchema,
     createTestTraceRoot('family-layout'),
-    createTestOpMetadata({ name: family }),
+    metadata,
     CAPACITY,
     SpanBufferClass,
   );
@@ -158,25 +185,49 @@ function expectFamilyShape(buffer: AnySpanBuffer, family: MessageLayoutFamily): 
     throw new Error(`Expected ${family} buffer, received ${buffer._messageLayoutFamily}`);
   }
   if (family === 'static-only') {
-    expect(buffer._logHeaders).toBeInstanceOf(Uint32Array);
     expect('message_values' in buffer).toBe(false);
-    expect('message_nulls' in buffer).toBe(false);
     expect(Object.hasOwn(buffer, '_spanName')).toBe(true);
     expect(Object.hasOwn(buffer, '_terminalMessage')).toBe(true);
     expect(Array.isArray(buffer._spanName)).toBe(false);
     expect(ArrayBuffer.isView(buffer._spanName)).toBe(false);
   } else if (family === 'dynamic-only') {
-    expect('_logHeaders' in buffer).toBe(false);
     expect(buffer.message_values).toBeInstanceOf(Array);
-    expect('message_nulls' in buffer).toBe(false);
     expect(Object.hasOwn(buffer, '_spanName')).toBe(true);
     expect(Object.hasOwn(buffer, '_terminalMessage')).toBe(false);
   } else {
-    expect(buffer._logHeaders).toBeInstanceOf(Uint32Array);
     expect(buffer.message_values).toBeInstanceOf(Array);
-    expect('message_nulls' in buffer).toBe(false);
     expect(Object.hasOwn(buffer, '_spanName')).toBe(false);
     expect(Object.hasOwn(buffer, '_terminalMessage')).toBe(false);
+  }
+}
+
+function expectPhysicalShape(buffer: AnySpanBuffer, layout: MessagePhysicalLayout): void {
+  if (buffer._messagePhysicalLayout !== layout) {
+    throw new Error(`Expected ${layout} buffer, received ${buffer._messagePhysicalLayout}`);
+  }
+  const hasStaticMessages = buffer._messageLayoutFamily !== 'dynamic-only';
+  if (layout === 'packed') {
+    expect(buffer._rowHeaders).toBeInstanceOf(Uint32Array);
+    expect('entry_type' in buffer).toBe(false);
+    expect('_messageIds' in buffer).toBe(false);
+    expect('_logHeaders' in buffer).toBe(false);
+    expect('message_nulls' in buffer).toBe(false);
+  } else {
+    expect(buffer.entry_type).toBeInstanceOf(Uint8Array);
+    expect('_rowHeaders' in buffer).toBe(false);
+    if (layout === 'current' && hasStaticMessages) {
+      expect(buffer._messageIds).toBeInstanceOf(Uint16Array);
+      expect('_logHeaders' in buffer).toBe(false);
+      expect(buffer.message_nulls).toBeInstanceOf(Uint8Array);
+    } else if (layout === 'specialized' && hasStaticMessages) {
+      expect('_messageIds' in buffer).toBe(false);
+      expect(buffer._logHeaders).toBeInstanceOf(Uint32Array);
+      expect(buffer.message_nulls).toBeInstanceOf(Uint8Array);
+    } else {
+      expect('_messageIds' in buffer).toBe(false);
+      expect('_logHeaders' in buffer).toBe(false);
+      expect(buffer.message_nulls).toBeInstanceOf(Uint8Array);
+    }
   }
 }
 
@@ -186,7 +237,7 @@ function collectLogRows(root: AnySpanBuffer): Array<{ entryType: number; message
   let first = true;
   while (segment) {
     for (let row = first ? 2 : 0; row < segment._writeIndex; row++) {
-      rows.push({ entryType: segment.entry_type[row], message: resolveMessage(segment, row) });
+      rows.push({ entryType: resolveEntryType(segment, row), message: resolveMessage(segment, row) });
     }
     first = false;
     segment = segment._overflow;
@@ -211,30 +262,246 @@ describe('specialized message buffer families', () => {
     expect(new Set([staticOp.callsitePlan.SpanBufferClass, dynamicOp.callsitePlan.SpanBufferClass, mixedOp.callsitePlan.SpanBufferClass]).size).toBe(3);
   });
 
-  it('omits every unused capacity lane and exposes exact JS storage bytes', () => {
-    const staticBuffer = createPlannedBuffer('static-only', staticOp.callsitePlan.SpanBufferClass);
-    const dynamicBuffer = createPlannedBuffer('dynamic-only', dynamicOp.callsitePlan.SpanBufferClass);
-    const mixedBuffer = createPlannedBuffer('mixed', mixedOp.callsitePlan.SpanBufferClass);
+  it('decodes physical bits conservatively and caches every family/physical constructor dimension', () => {
+    const packedHint = hint(RUNTIME_HINT_MESSAGE_LAYOUT_MIXED, RUNTIME_HINT_MESSAGE_PHYSICAL_PACKED, 64);
+    const specializedHint = hint(
+      RUNTIME_HINT_MESSAGE_LAYOUT_MIXED,
+      RUNTIME_HINT_MESSAGE_PHYSICAL_SPECIALIZED,
+      64,
+    );
+    expect(runtimeHintMessagePhysicalLayout(packedHint)).toBe('packed');
+    expect(runtimeHintMessagePhysicalLayout(specializedHint)).toBe('specialized');
+    expect(runtimeHintMessagePhysicalLayout(hint(RUNTIME_HINT_MESSAGE_LAYOUT_MIXED, 0, 64))).toBe('current');
+    expect(runtimeHintMessagePhysicalLayout(0)).toBe('current');
+    expect(runtimeHintMessagePhysicalLayout(packedHint | RUNTIME_HINT_MESSAGE_PHYSICAL_SPECIALIZED)).toBe('current');
 
-    expectFamilyShape(staticBuffer, 'static-only');
-    expectFamilyShape(dynamicBuffer, 'dynamic-only');
-    expectFamilyShape(mixedBuffer, 'mixed');
-    if (staticBuffer._messageLayoutFamily !== 'static-only' || staticBuffer._logHeaders === undefined) {
-      throw new Error('Expected static-only packed header lane');
+    const classes = [
+      getSpanBufferClass(runtimeSchema, 'static-only', 'current'),
+      getSpanBufferClass(runtimeSchema, 'static-only', 'specialized'),
+      getSpanBufferClass(runtimeSchema, 'static-only', 'packed'),
+      getSpanBufferClass(runtimeSchema, 'mixed', 'current'),
+      getSpanBufferClass(runtimeSchema, 'mixed', 'specialized'),
+      getSpanBufferClass(runtimeSchema, 'mixed', 'packed'),
+      getSpanBufferClass(runtimeSchema, 'dynamic-only', 'current'),
+      getSpanBufferClass(runtimeSchema, 'dynamic-only', 'specialized'),
+      getSpanBufferClass(runtimeSchema, 'dynamic-only', 'packed'),
+    ];
+    expect(new Set(classes).size).toBe(9);
+    expect(getSpanBufferClass(runtimeSchema, 'mixed', 'specialized')).toBe(classes[4]);
+    expect(getSpanBufferClass(runtimeSchema, 'mixed', 'packed')).toBe(classes[5]);
+    expect(specializedStaticOp.callsitePlan.messagePhysicalLayout).toBe('specialized');
+    expect(specializedDynamicOp.callsitePlan.messagePhysicalLayout).toBe('specialized');
+    expect(specializedMixedOp.callsitePlan.messagePhysicalLayout).toBe('specialized');
+    expect(packedStaticOp.callsitePlan.messagePhysicalLayout).toBe('packed');
+    expect(packedDynamicOp.callsitePlan.messagePhysicalLayout).toBe('packed');
+    expect(packedMixedOp.callsitePlan.messagePhysicalLayout).toBe('packed');
+    expect(specializedMixedOp.callsitePlan.arrowExposure.entryTypeStorage).toBe('borrowed-u8');
+    expect(packedMixedOp.callsitePlan.arrowExposure.entryTypeStorage).toBe('derived-row-headers');
+  });
+
+  it('packs low-8 entry types and dense-plus-one high-24 messages with exact lane omissions', () => {
+    const denseZeroText = textAtDenseZero();
+    const cases = [
+      { family: 'static-only' as const, op: packedStaticOp },
+      { family: 'dynamic-only' as const, op: packedDynamicOp },
+      { family: 'mixed' as const, op: packedMixedOp },
+    ];
+
+    for (const { family, op } of cases) {
+      const buffer = createPlannedBuffer(family, op.callsitePlan.SpanBufferClass, op.metadata);
+      expectFamilyShape(buffer, family);
+      expectPhysicalShape(buffer, 'packed');
+      if (buffer._rowHeaders === undefined) throw new Error('Expected packed row headers');
+      if (family === 'static-only') expect('message_values' in buffer).toBe(false);
+      else expect(buffer.message_values).toBeInstanceOf(Array);
+
+      op.callsitePlan.appenders.writeSpanStart(buffer, 0);
+      expect(buffer._rowHeaders[0] & 0xff).toBe(ENTRY_TYPE_SPAN_START);
+      expect(buffer._rowHeaders[0] >>> 8).toBe(1);
+      expect(buffer._rowHeaders[1] & 0xff).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
+      expect(resolveEntryType(buffer, 0)).toBe(ENTRY_TYPE_SPAN_START);
+      expect(resolveMessage(buffer, 0)).toBe(denseZeroText);
+
+      if (family !== 'static-only') {
+        const nullRow = op.callsitePlan.appenders.writeLogEntry(buffer, ENTRY_TYPE_DEBUG);
+        expect(buffer._rowHeaders[nullRow]).toBe(ENTRY_TYPE_DEBUG);
+        expect(resolveMessage(buffer, nullRow)).toBeUndefined();
+        buffer.message(nullRow, `raw-${family}`);
+        expect(buffer._rowHeaders[nullRow] >>> 8).toBe(0);
+        expect(resolveMessage(buffer, nullRow)).toBe(`raw-${family}`);
+      }
     }
-    if (dynamicBuffer._messageLayoutFamily !== 'dynamic-only' || dynamicBuffer.message_values === undefined) {
-      throw new Error('Expected dynamic-only raw message lane');
+  });
+
+  it('accepts the maximum packed dense index, rejects the next index, and preserves topology', () => {
+    const root = createPlannedBuffer('mixed', packedMixedOp.callsitePlan.SpanBufferClass, packedMixedOp.metadata);
+    if (root._rowHeaders === undefined) throw new Error('Expected root packed row headers');
+    packedMixedOp.callsitePlan.appenders.writeSpanStart(root, MAX_PACKED_MESSAGE_DENSE_INDEX);
+    expect(root._rowHeaders[0] >>> 8).toBe(0x00ffffff);
+    expect(() => packedMixedOp.callsitePlan.appenders.writeSpanStart(root, MAX_PACKED_MESSAGE_DENSE_INDEX + 1)).toThrow(
+      '0xFFFFFE',
+    );
+
+    const child = createChildSpanBuffer(
+      root,
+      packedMixedOp.callsitePlan.SpanBufferClass,
+      packedMixedOp.metadata,
+      packedMixedOp.metadata,
+      CAPACITY,
+    );
+    const overflow = createOverflowBuffer(child);
+    for (const buffer of [root, child, overflow]) {
+      expect(buffer.constructor).toBe(packedMixedOp.callsitePlan.SpanBufferClass);
+      expectPhysicalShape(buffer, 'packed');
+      expectFamilyShape(buffer, 'mixed');
     }
-    if (mixedBuffer._messageLayoutFamily !== 'mixed' || mixedBuffer._logHeaders === undefined) {
-      throw new Error('Expected mixed packed header lane');
+    expect(child._parent).toBe(root);
+    expect(overflow._parent).toBe(root);
+    expect(overflow._identity).toBe(child._identity);
+  });
+
+  it('keeps packed lifecycle, facts, and semantic message resolution identical', () => {
+    const denseZeroText = textAtDenseZero();
+    const root = createPlannedBuffer('mixed', packedMixedOp.callsitePlan.SpanBufferClass, packedMixedOp.metadata);
+    const rootContext = new packedMixedOp.callsitePlan.SpanContextClass(root, runtimeSchema, packedMixedOp.callsitePlan);
+    packedMixedOp.callsitePlan.appenders.writeSpanStart(root, 'packed root');
+    rootContext._spanLogger._infoTemplate(0);
+    rootContext._spanLogger.debug('packed raw');
+    packedMixedOp.callsitePlan.appenders.writeSpanEnd(root, ENTRY_TYPE_SPAN_OK);
+
+    expect(Array.from({ length: root._writeIndex }, (_, row) => resolveEntryType(root, row))).toEqual([
+      ENTRY_TYPE_SPAN_START,
+      ENTRY_TYPE_SPAN_OK,
+      ENTRY_TYPE_INFO,
+      ENTRY_TYPE_DEBUG,
+    ]);
+    expect(Array.from({ length: root._writeIndex }, (_, row) => resolveMessage(root, row))).toEqual([
+      'packed root',
+      undefined,
+      denseZeroText,
+      'packed raw',
+    ]);
+    expect(Array.from(extractFacts(root, { includeMetrics: false }))).toEqual([
+      'span:packed root: started',
+      `log:info: ${denseZeroText}`,
+      'log:debug: packed raw',
+      'span:packed root: ok',
+    ]);
+  });
+
+  it('omits every unused capacity lane and exposes exact JS storage bytes for all family/mode pairs', () => {
+    const cases = [
+      { family: 'static-only' as const, mode: 'current' as const, op: staticOp },
+      { family: 'dynamic-only' as const, mode: 'current' as const, op: dynamicOp },
+      { family: 'mixed' as const, mode: 'current' as const, op: mixedOp },
+      { family: 'static-only' as const, mode: 'specialized' as const, op: specializedStaticOp },
+      { family: 'dynamic-only' as const, mode: 'specialized' as const, op: specializedDynamicOp },
+      { family: 'mixed' as const, mode: 'specialized' as const, op: specializedMixedOp },
+      { family: 'static-only' as const, mode: 'packed' as const, op: packedStaticOp },
+      { family: 'dynamic-only' as const, mode: 'packed' as const, op: packedDynamicOp },
+      { family: 'mixed' as const, mode: 'packed' as const, op: packedMixedOp },
+    ];
+    for (const { family, mode, op } of cases) {
+      const buffer = createPlannedBuffer(family, op.callsitePlan.SpanBufferClass, op.metadata);
+      expectFamilyShape(buffer, family);
+      expectPhysicalShape(buffer, mode);
+      const timestampAndEntryBytes = CAPACITY * 9;
+      let expectedSystemBytes: number;
+      if (mode === 'packed') {
+        expectedSystemBytes = (CAPACITY * 12 + 7) & ~7;
+      } else if (family === 'dynamic-only') {
+        expectedSystemBytes = (timestampAndEntryBytes + Math.ceil(CAPACITY / 8) + 7) & ~7;
+      } else if (mode === 'current') {
+        const messageIdOffset = (timestampAndEntryBytes + 1) & ~1;
+        const validityOffset = messageIdOffset + CAPACITY * Uint16Array.BYTES_PER_ELEMENT;
+        expectedSystemBytes = (validityOffset + Math.ceil(CAPACITY / 8) + 7) & ~7;
+        expect(buffer._messageIds?.byteLength).toBe(CAPACITY * Uint16Array.BYTES_PER_ELEMENT);
+      } else {
+        const denseOffset = (timestampAndEntryBytes + 3) & ~3;
+        const validityOffset = denseOffset + CAPACITY * Uint32Array.BYTES_PER_ELEMENT;
+        expectedSystemBytes = (validityOffset + Math.ceil(CAPACITY / 8) + 7) & ~7;
+        expect(buffer._logHeaders?.byteLength).toBe(CAPACITY * Uint32Array.BYTES_PER_ELEMENT);
+      }
+      expect(buffer._system.byteLength - buffer._identity.byteLength).toBe(expectedSystemBytes);
+      if (family !== 'static-only') expect(buffer.message_values?.length).toBe(CAPACITY);
     }
-    if (mixedBuffer.message_values === undefined) throw new Error('Expected mixed raw message lane');
-    expect(staticBuffer._logHeaders.byteLength).toBe(CAPACITY * Uint32Array.BYTES_PER_ELEMENT);
-    expect(mixedBuffer._logHeaders.byteLength).toBe(CAPACITY * Uint32Array.BYTES_PER_ELEMENT);
-    expect(staticBuffer._system.byteLength).toBe(mixedBuffer._system.byteLength);
-    expect(staticBuffer._system.byteLength - dynamicBuffer._system.byteLength).toBe(staticBuffer._logHeaders.byteLength);
-    expect(dynamicBuffer.message_values.length).toBe(CAPACITY);
-    expect(mixedBuffer.message_values.length).toBe(CAPACITY);
+  });
+
+  it('keeps empty-dictionary current plans on ID zero plus raw validity without throwing', () => {
+    const root = createPlannedBuffer(
+      'mixed',
+      fallbackCurrentOp.callsitePlan.SpanBufferClass,
+      fallbackCurrentOp.metadata,
+    );
+    expect(fallbackCurrentOp.callsitePlan.messagePhysicalLayout).toBe('current');
+    expect(fallbackCurrentOp.callsitePlan.localMessageDictionary).toEqual([]);
+    const rootContext = new fallbackCurrentOp.callsitePlan.SpanContextClass(
+      root,
+      runtimeSchema,
+      fallbackCurrentOp.callsitePlan,
+    );
+    fallbackCurrentOp.callsitePlan.appenders.writeSpanStart(root, 'fallback root');
+    expect(() => rootContext._spanLogger._infoTemplate(0)).not.toThrow();
+    const row = root._writeIndex - 1;
+    if (root._messageIds === undefined || root.message_nulls === undefined || root.message_values === undefined) {
+      throw new Error('Expected fallback current ID, validity, and raw lanes');
+    }
+    expect(root._messageIds[row]).toBe(0);
+    expect(root.message_nulls[row >>> 3] & (1 << (row & 7))).not.toBe(0);
+    expect(root.message_values[row]).toBe(textAtDenseZero());
+    expect(resolveMessage(root, row)).toBe(textAtDenseZero());
+  });
+
+  it('shares one frozen current-mode local dictionary across root, child, and overflow buffers', () => {
+    const root = createPlannedBuffer('mixed', mixedOp.callsitePlan.SpanBufferClass, mixedOp.metadata);
+    const child = createChildSpanBuffer(
+      root,
+      mixedOp.callsitePlan.SpanBufferClass,
+      mixedOp.metadata,
+      mixedOp.metadata,
+      CAPACITY,
+    );
+    const overflow = createOverflowBuffer(child);
+    const dictionary = mixedOp.callsitePlan.localMessageDictionary;
+    expect(dictionary).toEqual([0]);
+    expect(Object.isFrozen(dictionary)).toBe(true);
+    for (const buffer of [root, child, overflow]) {
+      const plan = buffer._opMetadata._physicalLayoutPlan;
+      if (!plan) throw new Error('Expected buffer physical layout plan');
+      expect(plan.localMessageDictionary).toBe(dictionary);
+      expect(Object.hasOwn(buffer, '_messageDictionary')).toBe(false);
+      expect('_messageDictionary' in buffer).toBe(false);
+      if (buffer.entry_type === undefined || buffer._messageIds === undefined || buffer.message_nulls === undefined) {
+        throw new Error('Expected current local-ID, validity, and entry-type lanes');
+      }
+      buffer.entry_type[0] = ENTRY_TYPE_INFO;
+      buffer._messageIds[0] = 1;
+      buffer.message_nulls[0] |= 1;
+      buffer._writeIndex = 1;
+      expect(resolveMessage(buffer, 0)).toBe(textAtDenseZero());
+    }
+  });
+
+  it('uses specialized validity to distinguish dense index zero from raw and null rows', () => {
+    const buffer = createPlannedBuffer(
+      'mixed',
+      specializedMixedOp.callsitePlan.SpanBufferClass,
+      specializedMixedOp.metadata,
+    );
+    expectPhysicalShape(buffer, 'specialized');
+    if (buffer.entry_type === undefined || buffer._logHeaders === undefined || buffer.message_nulls === undefined) {
+      throw new Error('Expected specialized entry, dense, and validity lanes');
+    }
+    buffer.entry_type[0] = ENTRY_TYPE_INFO;
+    buffer._logHeaders[0] = 0;
+    buffer.message_nulls[0] |= 1;
+    buffer._writeIndex = 3;
+    expect(resolveMessage(buffer, 0)).toBe(textAtDenseZero());
+    buffer.entry_type[1] = ENTRY_TYPE_DEBUG;
+    buffer.message(1, 'specialized raw');
+    expect(resolveMessage(buffer, 1)).toBe('specialized raw');
+    buffer.entry_type[2] = ENTRY_TYPE_DEBUG;
+    expect(resolveMessage(buffer, 2)).toBeUndefined();
   });
 
   it('represents dense index zero, dynamic/static span names, null/raw rows, and terminal scalars', () => {
@@ -246,18 +513,14 @@ describe('specialized message buffer families', () => {
     ];
 
     for (const { family, op } of cases) {
-      const denseName = createPlannedBuffer(family, op.callsitePlan.SpanBufferClass);
+      const denseName = createPlannedBuffer(family, op.callsitePlan.SpanBufferClass, op.metadata);
       op.callsitePlan.appenders.writeSpanStart(denseName, 0);
-      expect(denseName.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
+      expect(resolveEntryType(denseName, 0)).toBe(ENTRY_TYPE_SPAN_START);
       expect(resolveMessage(denseName, 0)).toBe(denseZeroText);
-      if (family !== 'dynamic-only') {
-        if (denseName._messageLayoutFamily === 'dynamic-only' || denseName._logHeaders === undefined) {
-          throw new Error(`Expected ${family} packed header lane`);
-        }
-        expect(denseName._logHeaders[0]).toBe(ENTRY_TYPE_SPAN_START);
-      }
+      expectPhysicalShape(denseName, 'current');
+      expect(Object.hasOwn(denseName, '_messageDictionary')).toBe(false);
 
-      const dynamicName = createPlannedBuffer(family, op.callsitePlan.SpanBufferClass);
+      const dynamicName = createPlannedBuffer(family, op.callsitePlan.SpanBufferClass, op.metadata);
       op.callsitePlan.appenders.writeSpanStart(dynamicName, `raw ${family} span`);
       expect(resolveMessage(dynamicName, 0)).toBe(`raw ${family} span`);
       expect(resolveMessage(dynamicName, 1)).toBeUndefined();
@@ -282,9 +545,8 @@ describe('specialized message buffer families', () => {
       { family: 'dynamic-only' as const, op: dynamicOp },
       { family: 'mixed' as const, op: mixedOp },
     ]) {
-      const root = createPlannedBuffer(family, op.callsitePlan.SpanBufferClass);
-      const metadata = createTestOpMetadata({ name: `${family}-child` });
-      const child = createChildSpanBuffer(root, op.callsitePlan.SpanBufferClass, metadata, metadata, CAPACITY);
+      const root = createPlannedBuffer(family, op.callsitePlan.SpanBufferClass, op.metadata);
+      const child = createChildSpanBuffer(root, op.callsitePlan.SpanBufferClass, op.metadata, op.metadata, CAPACITY);
       const overflow = createOverflowBuffer(child);
       expect(child.constructor).toBe(op.callsitePlan.SpanBufferClass);
       expect(overflow.constructor).toBe(op.callsitePlan.SpanBufferClass);
@@ -299,7 +561,7 @@ describe('specialized message buffer families', () => {
 
   it('preserves decoded lifecycle and log facts across mixed-family parent/child rows', () => {
     const denseZeroText = textAtDenseZero();
-    const root = createPlannedBuffer('mixed', mixedOp.callsitePlan.SpanBufferClass);
+    const root = createPlannedBuffer('mixed', mixedOp.callsitePlan.SpanBufferClass, mixedOp.metadata);
     const rootContext = new mixedOp.callsitePlan.SpanContextClass(root, runtimeSchema, mixedOp.callsitePlan);
     mixedOp.callsitePlan.appenders.writeSpanStart(root, 'mixed root');
     const rootLogger = rootContext._spanLogger;
@@ -310,8 +572,8 @@ describe('specialized message buffer families', () => {
     const child = createChildSpanBuffer(
       root,
       staticOp.callsitePlan.SpanBufferClass,
-      createTestOpMetadata({ name: 'static child callsite' }),
-      createTestOpMetadata({ name: 'static child op' }),
+      staticOp.metadata,
+      staticOp.metadata,
       CAPACITY,
     );
     const childContext = new staticOp.callsitePlan.SpanContextClass(child, runtimeSchema, staticOp.callsitePlan);
@@ -344,7 +606,7 @@ describe('specialized message buffer families', () => {
           { minLength: CAPACITY, maxLength: 80 },
         ),
         (operations) => {
-          const root = createPlannedBuffer('mixed', mixedOp.callsitePlan.SpanBufferClass);
+          const root = createPlannedBuffer('mixed', mixedOp.callsitePlan.SpanBufferClass, mixedOp.metadata);
           const rootContext = new mixedOp.callsitePlan.SpanContextClass(root, runtimeSchema, mixedOp.callsitePlan);
           mixedOp.callsitePlan.appenders.writeSpanStart(root, 'property root');
           const logger = rootContext._spanLogger;

@@ -20,7 +20,7 @@ import {
   resolveEnumLookupDescriptor,
   type SchemaEnumLookupDescriptor,
 } from '../enumMetadata.js';
-import type { MessageLayoutFamily } from '../runtimeHint.js';
+import type { MessageLayoutFamily, MessagePhysicalLayout } from '../runtimeHint.js';
 import type { InferSchema, LogSchema } from '../schema/types.js';
 import type { AnySpanBuffer } from '../types.js';
 import type { TimestampAppendPrimitive } from '../traceRoot.js';
@@ -296,11 +296,14 @@ export function createTagWriter<T extends LogSchema>(schema: T, state: WriterSta
 // ============================================================================
 
 /** Result-row system setters, specialized once for the plan's message layout family. */
-function createResultWriterExtension(messageLayoutFamily: MessageLayoutFamily): FixedPositionWriterExtension {
+function createResultWriterExtension(
+  messageLayoutFamily: MessageLayoutFamily,
+  messagePhysicalLayout: MessagePhysicalLayout,
+): FixedPositionWriterExtension {
   const messageWrite =
     messageLayoutFamily === 'static-only'
       ? 'this._state._spanBuffer._terminalMessage = text;'
-      : 'this._state._spanBuffer.message_values[1] = text;';
+      : `this._state._spanBuffer.message_values[1] = text;${messagePhysicalLayout === 'packed' ? '' : '\n  this._state._spanBuffer.message_nulls[0] |= 2;'}`;
   return {
     methods: `
 message(text) {
@@ -328,6 +331,7 @@ uint64_value(value) {
 export function generateResultWriterClass(
   schema: LogSchema,
   messageLayoutFamily: MessageLayoutFamily = 'mixed',
+  messagePhysicalLayout: MessagePhysicalLayout = 'current',
   eagerColumns: readonly string[] = [],
   enumLookup: SchemaEnumLookupDescriptor = resolveEnumLookupDescriptor(schema),
 ): string {
@@ -335,7 +339,7 @@ export function generateResultWriterClass(
     schema,
     1,
     'GeneratedResultWriter',
-    createResultWriterExtension(messageLayoutFamily),
+    createResultWriterExtension(messageLayoutFamily, messagePhysicalLayout),
     eagerColumns,
     enumLookup,
   );
@@ -350,15 +354,22 @@ export function generateResultWriterClass(
 export function getResultWriterClass<T extends LogSchema>(
   schema: T,
   messageLayoutFamily: MessageLayoutFamily = 'mixed',
+  messagePhysicalLayout: MessagePhysicalLayout = 'current',
   eagerColumns: readonly string[] = [],
   enumLookup: SchemaEnumLookupDescriptor = resolveEnumLookupDescriptor(schema),
 ): ResultWriterConstructor {
   let familyClasses = resultWriterClassCache.get(schema);
-  const cacheKey = `${messageLayoutFamily}:${eagerColumns.join('\u0000')}`;
+  const cacheKey = `${messageLayoutFamily}:${messagePhysicalLayout}:${eagerColumns.join('\u0000')}`;
   let WriterClass = familyClasses?.get(cacheKey);
 
   if (!WriterClass) {
-    const classCode = generateResultWriterClass(schema, messageLayoutFamily, eagerColumns, enumLookup).trim();
+    const classCode = generateResultWriterClass(
+      schema,
+      messageLayoutFamily,
+      messagePhysicalLayout,
+      eagerColumns,
+      enumLookup,
+    ).trim();
 
     // Compile with new Function()
     const factory = new Function('helpers', 'enumLookup', classCode);
@@ -385,6 +396,12 @@ export function createResultWriter<T extends LogSchema, R = unknown, E = unknown
   schema: T,
   state: WriterState,
 ): ResultWriter<T, R, E> {
-  return new (getResultWriterClass(schema, state._spanBuffer._messageLayoutFamily))<T, R, E>(state);
+  return new (
+    getResultWriterClass(
+      schema,
+      state._spanBuffer._messageLayoutFamily,
+      state._spanBuffer._messagePhysicalLayout,
+    )
+  )<T, R, E>(state);
 }
 //#endregion smoo/lmao!n/codegen-architecture

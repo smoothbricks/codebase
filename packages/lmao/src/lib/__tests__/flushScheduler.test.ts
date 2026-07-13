@@ -23,7 +23,11 @@ function createTestBuffer(): AnySpanBuffer {
   buffer._writeIndex = 5;
   for (let i = 0; i < buffer._writeIndex; i++) {
     buffer.timestamp[i] = BigInt(Date.now()) * 1_000_000n;
-    buffer.entry_type[i] = 1;
+    {
+      const entryTypes = buffer.entry_type;
+      if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+      entryTypes[i] = 1;
+    };
   }
   return buffer;
 }

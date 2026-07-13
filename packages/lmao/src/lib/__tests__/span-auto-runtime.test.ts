@@ -3,7 +3,7 @@ import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { Transient } from '../errors/Transient.js';
 import type { OpContext, OpContextOf, SpanContext } from '../opContext/types.js';
-import { resolveMessage } from '../resolveMessage.js';
+import { resolveEntryType, resolveMessage } from '../resolveMessage.js';
 import {
   RUNTIME_HINT_ANALYZED_VALID,
   RUNTIME_HINT_FF,
@@ -84,7 +84,7 @@ describe('spanAuto synchronous and fallback execution', () => {
 
     const child = childOf(tracer);
     expect(child._writeIndex).toBe(2);
-    expect(child.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+    expect(resolveEntryType(child, 1)).toBe(ENTRY_TYPE_SPAN_OK);
     expect(child._overflow).toBeUndefined();
     expect(hooks).toEqual(['start:sync-child', 'end:sync-child']);
     expect(op.callsitePlan).toBe(plan);
@@ -114,7 +114,7 @@ describe('spanAuto synchronous and fallback execution', () => {
     expect(starts).toBe(1);
     expect(ends).toBe(1);
     expect(child._writeIndex).toBe(2);
-    expect(child.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+    expect(resolveEntryType(child, 1)).toBe(ENTRY_TYPE_SPAN_OK);
     expect(resolveMessage(child, 1)).not.toBe('hook exploded');
   });
 
@@ -135,7 +135,7 @@ describe('spanAuto synchronous and fallback execution', () => {
 
     const child = childOf(tracer);
     expect(child._writeIndex).toBe(2);
-    expect(child.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+    expect(resolveEntryType(child, 1)).toBe(ENTRY_TYPE_SPAN_OK);
     expect(op.callsitePlan).toBe(plan);
     expect(child).toBeInstanceOf(plan.SpanBufferClass);
   });
@@ -160,7 +160,7 @@ describe('spanAuto synchronous and fallback execution', () => {
     });
 
     expect(thenAccesses).toBe(1);
-    expect(childOf(tracer).entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+    expect(resolveEntryType(childOf(tracer), 1)).toBe(ENTRY_TYPE_SPAN_OK);
   });
 
   it('falls back to retry when the first synchronous Result is transient', async () => {
@@ -193,8 +193,8 @@ describe('spanAuto synchronous and fallback execution', () => {
 
     const child = childOf(tracer);
     expect(attempts).toBe(2);
-    expect(child.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
-    expect(child.entry_type[2]).toBe(ENTRY_TYPE_SPAN_RETRY);
+    expect(resolveEntryType(child, 1)).toBe(ENTRY_TYPE_SPAN_OK);
+    expect(resolveEntryType(child, 2)).toBe(ENTRY_TYPE_SPAN_RETRY);
     expect(child._writeIndex).toBe(3);
     expect(op.callsitePlan).toBe(plan);
     expect(child).toBeInstanceOf(plan.SpanBufferClass);
@@ -222,7 +222,7 @@ describe('spanAuto synchronous and fallback execution', () => {
     expect(starts).toBe(1);
     expect(ends).toBe(1);
     expect(child._writeIndex).toBe(2);
-    expect(child.entry_type[1]).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
+    expect(resolveEntryType(child, 1)).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
     expect(resolveMessage(child, 1)).toBe('async exploded');
   });
 });
@@ -279,8 +279,8 @@ describe('runtime hint specialization', () => {
     expect(Object.hasOwn(childContext, 'ok')).toBe(true);
     expect(Object.hasOwn(childContext, 'tag')).toBe(false);
     expect(Object.hasOwn(childContext, 'log')).toBe(false);
-    expect(tracer.rootBuffers[0].entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
-    expect(childOf(tracer).entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+    expect(resolveEntryType(tracer.rootBuffers[0], 1)).toBe(ENTRY_TYPE_SPAN_OK);
+    expect(resolveEntryType(childOf(tracer), 1)).toBe(ENTRY_TYPE_SPAN_OK);
   });
 
   it('honors static capacity including the two-row minimum and preserves overflow rows', async () => {
@@ -310,8 +310,8 @@ describe('runtime hint specialization', () => {
     expect(minimum._capacity).toBe(2);
     expect(minimum._overflow).toBeUndefined();
     expect(overflow._capacity).toBe(3);
-    expect(overflow.entry_type[2]).toBe(ENTRY_TYPE_INFO);
-    expect(overflow._overflow?.entry_type[0]).toBe(ENTRY_TYPE_INFO);
+    expect(resolveEntryType(overflow, 2)).toBe(ENTRY_TYPE_INFO);
+    expect(overflow._overflow ? resolveEntryType(overflow._overflow, 0) : undefined).toBe(ENTRY_TYPE_INFO);
     expect(overflow._overflow ? resolveMessage(overflow._overflow, 0) : undefined).toBe('second');
     expect(convertSpanTreeToArrowTable(tracer.rootBuffers[0]).numRows).toBe(8);
   });

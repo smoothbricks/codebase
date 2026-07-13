@@ -62,17 +62,23 @@ const DEFAULT_COMPILE_METADATA: OpCompileMetadata = Object.freeze({
 });
 
 const EMPTY_EAGER_COLUMNS: readonly string[] = Object.freeze([]);
+const EMPTY_LOCAL_MESSAGE_DICTIONARY: readonly number[] = Object.freeze([]);
 
 
 function normalizeCompileMetadata(compileMetadata?: OpCompileMetadata): OpCompileMetadata {
   if (compileMetadata === undefined) return DEFAULT_COMPILE_METADATA;
   const eagerColumns = compileMetadata.eagerColumns;
+  const localMessageDictionary = compileMetadata.localMessageDictionary;
   return Object.freeze({
     runtimeHint: compileMetadata.runtimeHint,
     eagerColumns:
       eagerColumns === undefined || eagerColumns.length === 0
         ? EMPTY_EAGER_COLUMNS
         : Object.freeze([...new Set(eagerColumns)]),
+    localMessageDictionary:
+      localMessageDictionary === undefined || localMessageDictionary.length === 0
+        ? EMPTY_LOCAL_MESSAGE_DICTIONARY
+        : Object.freeze([...localMessageDictionary]),
   });
 }
 
@@ -244,6 +250,7 @@ export function createDefineOp<Ctx extends OpContext>(
       factoryConfig.opContextBinding,
       normalizedCompileMetadata.runtimeHint,
       normalizedCompileMetadata.eagerColumns ?? EMPTY_EAGER_COLUMNS,
+      normalizedCompileMetadata.localMessageDictionary ?? EMPTY_LOCAL_MESSAGE_DICTIONARY,
     );
   };
 }
@@ -324,6 +331,7 @@ export function createDefineOps<Ctx extends OpContext>(
             def._opContextBinding,
             normalizedCompileMetadata.runtimeHint,
             normalizedCompileMetadata.eagerColumns ?? EMPTY_EAGER_COLUMNS,
+            normalizedCompileMetadata.localMessageDictionary ?? EMPTY_LOCAL_MESSAGE_DICTIONARY,
           );
         }
       } else {

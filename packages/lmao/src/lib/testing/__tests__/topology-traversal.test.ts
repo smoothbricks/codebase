@@ -38,8 +38,16 @@ function addCompletedChild(
     8,
   );
   child.message(0, name);
-  child.entry_type[0] = ENTRY_TYPE_SPAN_START;
-  child.entry_type[1] = ENTRY_TYPE_SPAN_OK;
+  {
+    const entryTypes = child.entry_type;
+    if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+    entryTypes[0] = ENTRY_TYPE_SPAN_START;
+  };
+  {
+    const entryTypes = child.entry_type;
+    if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+    entryTypes[1] = ENTRY_TYPE_SPAN_OK;
+  };
   child._writeIndex = 2;
   return child;
 }

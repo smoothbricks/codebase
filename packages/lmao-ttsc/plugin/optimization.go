@@ -9,17 +9,29 @@ import (
 )
 
 const (
-	runtimeHintTag            uint32 = 1 << 16
-	runtimeHintLog            uint32 = 1 << 17
-	runtimeHintFF             uint32 = 1 << 18
-	runtimeHintSpan           uint32 = 1 << 19
-	runtimeHintResult         uint32 = 1 << 20
-	runtimeHintScope          uint32 = 1 << 21
-	runtimeHintDeps           uint32 = 1 << 22
-	runtimeHintAnalyzed       uint32 = 1 << 23
-	runtimeHintMessageStatic  uint32 = 1 << 24
-	runtimeHintMessageDynamic uint32 = 1 << 25
-	runtimeHintMessageMixed   uint32 = runtimeHintMessageStatic | runtimeHintMessageDynamic
+	runtimeHintTag                        uint32 = 1 << 16
+	runtimeHintLog                        uint32 = 1 << 17
+	runtimeHintFF                         uint32 = 1 << 18
+	runtimeHintSpan                       uint32 = 1 << 19
+	runtimeHintResult                     uint32 = 1 << 20
+	runtimeHintScope                      uint32 = 1 << 21
+	runtimeHintDeps                       uint32 = 1 << 22
+	runtimeHintAnalyzed                   uint32 = 1 << 23
+	runtimeHintMessageStatic              uint32 = 1 << 24
+	runtimeHintMessageDynamic             uint32 = 1 << 25
+	runtimeHintMessageMixed               uint32 = runtimeHintMessageStatic | runtimeHintMessageDynamic
+	runtimeHintMessagePhysicalPacked      uint32 = 1 << 26
+	runtimeHintMessagePhysicalSpecialized uint32 = 1 << 27
+	runtimeHintMessagePhysicalMask        uint32 = runtimeHintMessagePhysicalPacked | runtimeHintMessagePhysicalSpecialized
+	maxPackedDenseIndex                  uint32 = 0x00fffffe
+)
+
+type callMessagePhysicalLayout uint8
+
+const (
+	callMessagePhysicalCurrent callMessagePhysicalLayout = iota
+	callMessagePhysicalSpecialized
+	callMessagePhysicalPacked
 )
 
 var contextCapability = map[string]uint32{
@@ -30,8 +42,9 @@ var contextCapability = map[string]uint32{
 }
 
 type opCompileAnalysis struct {
-	runtimeHint  uint32
-	eagerColumns []string
+	runtimeHint           uint32
+	eagerColumns          []string
+	localMessageDictionary []globalVocabularyID
 }
 
 type hintRewrite struct {
@@ -77,28 +90,72 @@ func isLoop(node *shimast.Node) bool {
 	}
 }
 
+func selectMessagePhysicalLayout(capacity, staticRows, dynamicRows uint32, vocabularySize int) uint32 {
+	if vocabularySize < 0 || vocabularySize > int(maxPackedDenseIndex)+1 {
+		return 0
+	}
+	switch capacity {
+	case 8, 64, 1024:
+	default:
+		return 0
+	}
+	usableRows := capacity - 2
+	if usableRows == 0 || staticRows > usableRows || dynamicRows > usableRows || staticRows != usableRows-dynamicRows {
+		return 0
+	}
+	total := usableRows
+
+	// Quantize the compile-time whole-program counts to the nearest measured
+	// 25% cell. The +total/2 term gives integer round-to-nearest without a
+	// runtime ratio or interpolation in the emitted program.
+	bucket := (staticRows*4 + total/2) / total
+	if capacity == 64 && bucket == 2 {
+		return runtimeHintMessagePhysicalSpecialized
+	}
+	return 0
+}
+
+func callMessagePhysicalLayoutFromHint(physicalHint uint32) callMessagePhysicalLayout {
+	switch physicalHint & runtimeHintMessagePhysicalMask {
+	case runtimeHintMessagePhysicalPacked:
+		return callMessagePhysicalPacked
+	case runtimeHintMessagePhysicalSpecialized:
+		return callMessagePhysicalSpecialized
+	default:
+		// Zero is current; both bits set is invalid and conservatively current.
+		return callMessagePhysicalCurrent
+	}
+}
+
 // analyzeOpFunction is intentionally closed-world. A hint is emitted only when
 // every use of the context parameter is a direct access to a known capability.
-func analyzeOpFunction(fn *shimast.Node, staticLogIDs map[*shimast.CallExpression]globalVocabularyID) uint32 {
+func analyzeOpFunction(
+	fn *shimast.Node,
+	staticLogIDs map[*shimast.CallExpression]globalVocabularyID,
+	vocabularySize int,
+	physicalLogCalls map[*shimast.CallExpression]callMessagePhysicalLayout,
+	currentLogLocalIDs map[*shimast.CallExpression]uint16,
+) (uint32, []globalVocabularyID) {
 	params, body, _, ok := functionParts(fn)
 	if !ok || params == nil || len(params.Nodes) == 0 || body == nil {
-		return 0
+		return 0, nil
 	}
 	first := params.Nodes[0]
 	if first.Kind != shimast.KindParameter || first.Name() == nil || first.Name().Kind != shimast.KindIdentifier {
-		return 0
+		return 0, nil
 	}
 	ctxName := shimast.NodeText(first.Name())
 	if ctxName == "" {
-		return 0
+		return 0, nil
 	}
 
 	valid := true
 	capacityKnown := true
 	capacity := uint32(2) // rows 0 (tags) and 1 (terminal result)
 	caps := uint32(0)
-	hasStaticMessage := false
-	hasDynamicMessage := false
+	staticMessageRows := uint32(0)
+	dynamicMessageRows := uint32(0)
+	staticCalls := make([]*shimast.CallExpression, 0)
 	var visit func(*shimast.Node, bool)
 	visit = func(node *shimast.Node, root bool) {
 		if node == nil || !valid {
@@ -130,7 +187,12 @@ func analyzeOpFunction(fn *shimast.Node, staticLogIDs map[*shimast.CallExpressio
 			}
 			caps |= capability
 			if name == "ff" {
-				hasDynamicMessage = true
+				dynamicMessageRows++
+				if capacityKnown && capacity < 0xffff {
+					capacity++
+				} else {
+					capacityKnown = false
+				}
 			}
 		}
 		if node.Kind == shimast.KindCallExpression {
@@ -141,9 +203,10 @@ func analyzeOpFunction(fn *shimast.Node, staticLogIDs map[*shimast.CallExpressio
 					logAccess := method.Expression.AsPropertyAccessExpression()
 					if shimast.NodeText(logAccess.Name()) == "log" && logAccess.Expression.Kind == shimast.KindIdentifier && shimast.NodeText(logAccess.Expression) == ctxName {
 						if staticLogIDs[call] != 0 {
-							hasStaticMessage = true
+							staticMessageRows++
+							staticCalls = append(staticCalls, call)
 						} else {
-							hasDynamicMessage = true
+							dynamicMessageRows++
 						}
 						if capacityKnown && capacity < 0xffff {
 							capacity++
@@ -161,19 +224,44 @@ func analyzeOpFunction(fn *shimast.Node, staticLogIDs map[*shimast.CallExpressio
 	}
 	visit(body, true)
 	if !valid {
-		return 0
+		return 0, nil
 	}
 	if !capacityKnown {
 		capacity = 0
 	}
 	messageHint := runtimeHintMessageStatic
-	if hasDynamicMessage {
+	if dynamicMessageRows != 0 {
 		messageHint = runtimeHintMessageDynamic
-		if hasStaticMessage {
+		if staticMessageRows != 0 {
 			messageHint = runtimeHintMessageMixed
 		}
 	}
-	return runtimeHintAnalyzed | messageHint | caps | capacity
+	physicalHint := uint32(0)
+	if capacityKnown {
+		physicalHint = selectMessagePhysicalLayout(capacity, staticMessageRows, dynamicMessageRows, vocabularySize)
+	}
+	physicalLayout := callMessagePhysicalLayoutFromHint(physicalHint)
+	var localMessageDictionary []globalVocabularyID
+	var localIDsByGlobalID map[globalVocabularyID]uint16
+	for _, call := range staticCalls {
+		physicalLogCalls[call] = physicalLayout
+		if physicalLayout != callMessagePhysicalCurrent {
+			continue
+		}
+		if localIDsByGlobalID == nil {
+			localMessageDictionary = make([]globalVocabularyID, 0, len(staticCalls))
+			localIDsByGlobalID = make(map[globalVocabularyID]uint16, len(staticCalls))
+		}
+		globalID := staticLogIDs[call]
+		localID := localIDsByGlobalID[globalID]
+		if localID == 0 {
+			localMessageDictionary = append(localMessageDictionary, globalID)
+			localID = uint16(len(localMessageDictionary))
+			localIDsByGlobalID[globalID] = localID
+		}
+		currentLogLocalIDs[call] = localID
+	}
+	return runtimeHintAnalyzed | messageHint | physicalHint | caps | capacity, localMessageDictionary
 }
 
 type eagerColumnSet map[string]struct{}
@@ -501,8 +589,16 @@ func literalLogMessage(node *shimast.Node) (string, bool) {
 // definitely-written user columns. Static log vocabulary remains whole-program
 // metadata collected independently of Op nesting.
 func (t *fileTransformer) analyzeOpCompileMetadata(fn *shimast.Node) opCompileAnalysis {
-	runtimeHint := analyzeOpFunction(fn, t.staticLogIDs)
-	analysis := opCompileAnalysis{runtimeHint: runtimeHint}
+	if t.physicalLogCalls == nil {
+		t.physicalLogCalls = map[*shimast.CallExpression]callMessagePhysicalLayout{}
+	}
+	if t.currentLogLocalIDs == nil {
+		t.currentLogLocalIDs = map[*shimast.CallExpression]uint16{}
+	}
+	runtimeHint, localMessageDictionary := analyzeOpFunction(
+		fn, t.staticLogIDs, t.vocabularySize, t.physicalLogCalls, t.currentLogLocalIDs,
+	)
+	analysis := opCompileAnalysis{runtimeHint: runtimeHint, localMessageDictionary: localMessageDictionary}
 	if runtimeHint&runtimeHintAnalyzed != 0 {
 		analysis.eagerColumns = t.analyzeEagerColumns(fn)
 	}
@@ -718,7 +814,7 @@ func (t *fileTransformer) spanContextApproved(node *shimast.Node) bool {
 	return false
 }
 
-func compileMetadataNode(analysis opCompileAnalysis) *shimast.Node {
+func baseCompileMetadataProperties(analysis opCompileAnalysis) []*shimast.Node {
 	properties := []*shimast.Node{
 		factory.NewPropertyAssignment(nil, ident("runtimeHint"), nil, nil, num(int(analysis.runtimeHint))),
 	}
@@ -730,10 +826,28 @@ func compileMetadataNode(analysis opCompileAnalysis) *shimast.Node {
 		properties = append(properties, factory.NewPropertyAssignment(nil, ident("eagerColumns"), nil, nil,
 			factory.NewArrayLiteralExpression(factory.NewNodeList(elements), false)))
 	}
+	return properties
+}
+
+
+func (t *fileTransformer) compileMetadataNode(analysis opCompileAnalysis) *shimast.Node {
+	properties := baseCompileMetadataProperties(analysis)
+	if len(analysis.localMessageDictionary) > 0 {
+		elements := make([]*shimast.Node, len(analysis.localMessageDictionary))
+		for index, globalID := range analysis.localMessageDictionary {
+			elements[index] = t.staticVocabularyOperand(globalID)
+		}
+		frozenDictionary := callExpr(propAccess(ident("Object"), "freeze"), []*shimast.Node{
+			factory.NewArrayLiteralExpression(factory.NewNodeList(elements), false),
+		})
+		properties = append(properties, factory.NewPropertyAssignment(
+			nil, ident("localMessageDictionary"), nil, nil, frozenDictionary,
+		))
+	}
 	return factory.NewObjectLiteralExpression(factory.NewNodeList(properties), true)
 }
 
-func applyHintRewrites(rewrites []hintRewrite) {
+func (t *fileTransformer) applyHintRewrites(rewrites []hintRewrite) {
 	for _, rewrite := range rewrites {
 		args := append([]*shimast.Node{}, rewrite.call.Arguments.Nodes...)
 		if rewrite.isGroup {
@@ -744,14 +858,14 @@ func applyHintRewrites(rewrites []hintRewrite) {
 			sort.Strings(names)
 			props := make([]*shimast.Node, 0, len(names))
 			for _, name := range names {
-				props = append(props, factory.NewPropertyAssignment(nil, str(name), nil, nil, compileMetadataNode(rewrite.hints[name])))
+				props = append(props, factory.NewPropertyAssignment(nil, str(name), nil, nil, t.compileMetadataNode(rewrite.hints[name])))
 			}
 			args = append(args, factory.NewObjectLiteralExpression(factory.NewNodeList(props), true))
 		} else {
 			for len(args) < 3 {
 				args = append(args, ident("undefined"))
 			}
-			args = append(args, compileMetadataNode(rewrite.single))
+			args = append(args, t.compileMetadataNode(rewrite.single))
 		}
 		rewrite.call.Arguments = factory.NewNodeList(args)
 	}
