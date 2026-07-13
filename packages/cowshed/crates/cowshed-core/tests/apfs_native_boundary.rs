@@ -1,6 +1,8 @@
+use std::fs::{FileTimes, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use cowshed_core::apfs::{
     ApfsCaseSensitivity, CommandOutput, CommandRequest, CommandRunError, CommandRunner,
@@ -11,7 +13,7 @@ use cowshed_core::metadata::{
     WorkspaceIncarnation, WorkspaceName, WorkspaceRole, sidecar_path,
 };
 use cowshed_core::repository::RepoId;
-use cowshed_core::storage::StorageLayout;
+use cowshed_core::storage::{CheckpointLabel, StorageLayout};
 use cowshed_core::storage::apfs::native::{
     KernelMountSnapshot, KernelMountSource, MacOsApfsExecutionHost, RecoveryMarkerSource,
     RestoreFailpoint, SystemKernelMountSource,
@@ -20,7 +22,7 @@ use cowshed_core::storage::apfs::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, MarkerExpectation, MetadataPolicy,
 };
 use cowshed_core::storage::lifecycle::{
-    ExpectedState, LifecycleWorkspace, OperationIdentity, Revision,
+    ExpectedState, LifecycleWorkspace, OperationIdentity, Pin, Revision,
 };
 const ATTACH_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
 <dict><key>content-hint</key><string>GUID_partition_scheme</string><key>dev-entry</key><string>/dev/disk9</string></dict>
@@ -284,6 +286,33 @@ fn identity(fixture: &Fixture) -> OperationIdentity {
         grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
             .expect("grants"),
     }
+}
+
+fn set_modified(path: &Path, seconds_since_epoch: u64) {
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open image for timestamp");
+    file.set_times(
+        FileTimes::new().set_modified(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(seconds_since_epoch),
+        ),
+    )
+    .expect("set image timestamp");
+}
+
+fn make_old(path: &Path) {
+    set_modified(path, 946_684_800);
+}
+
+fn make_future(path: &Path) {
+    set_modified(path, 4_102_444_800);
+}
+
+fn checkpoint_fact_path(image: &Path) -> PathBuf {
+    let mut path = image.as_os_str().to_owned();
+    path.push(".checkpoint.json");
+    PathBuf::from(path)
 }
 
 fn create_image(path: &Path, format: ImageFormat) {
@@ -791,6 +820,119 @@ fn checkpoint_observation_reads_authoritative_detached_metadata() {
 }
 
 #[test]
+fn checkpoint_enumeration_reads_regular_asif_and_sparseimage_files() {
+    let fixture = Fixture::new("checkpoint-regular-files");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let main = WorkspaceName::new("main").expect("main");
+    let host = native_host(&fixture, RecordingRunner::default());
+
+    for (name, format, revision, pin) in [
+        ("asif", ImageFormat::Asif, 11, Pin::Pinned),
+        ("sparse", ImageFormat::Sparse, 12, Pin::Automatic),
+    ] {
+        let label = CheckpointLabel::new(name).expect("label");
+        let image = layout
+            .checkpoint_image(&main, &label, format)
+            .expect("checkpoint")
+            .image()
+            .to_owned();
+        create_image(&image, format);
+        host.publish_checkpoint_fact(&image, &label, Revision::new(revision), pin)
+            .expect("checkpoint fact");
+    }
+
+    let facts = host.checkpoints(&repo()).expect("checkpoint facts");
+    let observed = facts
+        .iter()
+        .map(|fact| (fact.label.as_str(), fact.revision, fact.pin))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed,
+        vec![
+            ("asif", Revision::new(11), Pin::Pinned),
+            ("sparse", Revision::new(12), Pin::Automatic),
+        ]
+    );
+    assert!(
+        facts
+            .iter()
+            .all(|fact| fact.repo == repo() && fact.workspace == main)
+    );
+}
+
+#[test]
+fn checkpoint_gc_reclaims_only_expired_automatic_regular_files_and_sidecars() {
+    let fixture = Fixture::new("checkpoint-retention");
+    let config = fixture.config();
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let main = WorkspaceName::new("main").expect("main");
+    let host = native_host(&fixture, RecordingRunner::default());
+    let create_checkpoint = |name: &str, revision: u64, pin: Pin, format: ImageFormat| {
+        let label = CheckpointLabel::new(name).expect("label");
+        let image = layout
+            .checkpoint_image(&main, &label, format)
+            .expect("checkpoint")
+            .image()
+            .to_owned();
+        create_image(&image, format);
+        host.publish_checkpoint_fact(&image, &label, Revision::new(revision), pin)
+            .expect("checkpoint fact");
+        image
+    };
+
+    let mut newest_five = Vec::new();
+    for index in 0..5 {
+        let format = if index % 2 == 0 {
+            ImageFormat::Asif
+        } else {
+            ImageFormat::Sparse
+        };
+        let image = create_checkpoint(
+            &format!("future-{index}"),
+            index + 1,
+            Pin::Automatic,
+            format,
+        );
+        make_future(&image);
+        newest_five.push(image);
+    }
+    let young = create_checkpoint("young", 6, Pin::Automatic, ImageFormat::Asif);
+    let expired = create_checkpoint("expired", 7, Pin::Automatic, ImageFormat::Sparse);
+    make_old(&expired);
+    let pinned = create_checkpoint("pinned-old", 8, Pin::Pinned, ImageFormat::Asif);
+    make_old(&pinned);
+    drop(host);
+
+    let restarted = native_host(&fixture, RecordingRunner::default());
+    assert_eq!(
+        restarted.checkpoints(&repo()).expect("restart facts").len(),
+        8
+    );
+
+    let report = restarted.gc(&config).expect("checkpoint gc");
+    assert_eq!(report.examined, 8);
+    assert_eq!(report.reclaimed, 1);
+    assert_eq!(report.retained_pinned, 1);
+    assert_eq!(report.retained_recent, 6);
+    assert!(newest_five.iter().all(|image| image.exists()));
+    assert!(young.exists(), "young automatic checkpoint must survive");
+    assert!(pinned.exists(), "old pinned checkpoint must survive");
+    assert!(!expired.exists(), "expired automatic checkpoint is reclaimed");
+    assert!(!sidecar_path(&expired).exists(), "grants sidecar is reclaimed");
+    assert!(
+        !checkpoint_fact_path(&expired).exists(),
+        "checkpoint fact sidecar is reclaimed"
+    );
+    let surviving = restarted.checkpoints(&repo()).expect("surviving facts");
+    assert_eq!(surviving.len(), 7);
+    assert!(
+        surviving
+            .iter()
+            .all(|fact| fact.label.as_str() != "expired")
+    );
+}
+
+#[test]
 fn missing_and_invalid_gc_namespaces_have_distinct_behavior() {
     let fixture = Fixture::new("gc-missing");
     let project = fixture.root.join("acme/widget");
@@ -1280,6 +1422,139 @@ fn stateless_recovery_completes_image_before_sidecar_publication_after_restart()
     restarted
         .recover_pending(&fixture.config())
         .expect("repeated recovery is idempotent");
+}
+
+#[test]
+fn gc_reclaims_sidecarless_staging_crash_images_but_preserves_recoverable_pairs() {
+    let fixture = Fixture::new("staging-orphan");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let staging = layout.project().project_root.join(".staging");
+    let orphan = staging.join("session-a-00000000000000000000000000000002.asif");
+    std::fs::create_dir_all(&staging).expect("staging directory");
+    std::fs::write(&orphan, b"crashed before metadata").expect("orphan staged image");
+    let recoverable =
+        staging.join("main-00000000000000000000000000000001.sparseimage");
+    create_image(&recoverable, ImageFormat::Sparse);
+
+    let report = native_host(&fixture, RecordingRunner::default())
+        .gc(&fixture.config())
+        .expect("staging gc");
+
+    assert_eq!(report.reclaimed, 1);
+    assert!(!orphan.exists(), "sidecarless crash image is reclaimed");
+    assert!(recoverable.exists(), "recoverable staged image is retained");
+    assert_eq!(
+        DetachedWorkspaceMetadata::read_for_image(&recoverable)
+            .expect("recoverable staged metadata"),
+        metadata(ImageFormat::Sparse)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_does_not_follow_symlinked_owner_repository_staging_or_image_paths() {
+    let fixture = Fixture::new("gc-containment");
+    let external = Fixture::new("gc-external-targets");
+    let orphan_name = "main-00000000000000000000000000000002.sparseimage";
+    let write_orphan = |path: &Path, contents: &[u8]| {
+        std::fs::create_dir_all(path.parent().expect("external parent"))
+            .expect("external parent");
+        std::fs::write(path, contents).expect("external staged image");
+    };
+
+    let owner_target = external
+        .root
+        .join("owner-target/repository/.staging")
+        .join(orphan_name);
+    write_orphan(&owner_target, b"owner target");
+    std::os::unix::fs::symlink(
+        external.root.join("owner-target"),
+        fixture.root.join("linked-owner"),
+    )
+    .expect("owner symlink");
+
+    let repository_target = external
+        .root
+        .join("repository-target/.staging")
+        .join(orphan_name);
+    write_orphan(&repository_target, b"repository target");
+    std::fs::create_dir_all(fixture.root.join("real-owner")).expect("real owner");
+    std::os::unix::fs::symlink(
+        external.root.join("repository-target"),
+        fixture.root.join("real-owner/linked-repository"),
+    )
+    .expect("repository symlink");
+
+    let staging_target = external.root.join("staging-target").join(orphan_name);
+    write_orphan(&staging_target, b"staging target");
+    let staging_link = fixture.root.join("staging-owner/repository/.staging");
+    std::fs::create_dir_all(staging_link.parent().expect("staging project"))
+        .expect("staging project");
+    std::os::unix::fs::symlink(external.root.join("staging-target"), &staging_link)
+        .expect("staging symlink");
+
+    let image_target = external.root.join("image-target.sparseimage");
+    write_orphan(&image_target, b"image target");
+    let real_staging = fixture.root.join("image-owner/repository/.staging");
+    std::fs::create_dir_all(&real_staging).expect("real staging");
+    let image_link = real_staging.join(orphan_name);
+    std::os::unix::fs::symlink(&image_target, &image_link).expect("image symlink");
+    let invalid_name = real_staging.join("manual-backup.sparseimage");
+    std::fs::write(&invalid_name, b"not a transaction").expect("manual staging file");
+
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let escaped_label = CheckpointLabel::new("escaped").expect("escaped label");
+    let escaped_checkpoint = layout
+        .checkpoint_image(
+            &WorkspaceName::new("main").expect("main"),
+            &escaped_label,
+            ImageFormat::Sparse,
+        )
+        .expect("escaped checkpoint")
+        .image()
+        .to_owned();
+    std::fs::create_dir_all(escaped_checkpoint.parent().expect("checkpoint directory"))
+        .expect("checkpoint directory");
+    std::os::unix::fs::symlink(&image_target, &escaped_checkpoint)
+        .expect("checkpoint symlink");
+    metadata(ImageFormat::Sparse)
+        .write_for_image(&escaped_checkpoint)
+        .expect("escaped checkpoint metadata");
+    let host = native_host(&fixture, RecordingRunner::default());
+    host.publish_checkpoint_fact(
+        &escaped_checkpoint,
+        &escaped_label,
+        Revision::new(99),
+        Pin::Automatic,
+    )
+    .expect("escaped checkpoint fact");
+    assert!(
+        host.checkpoints(&repo())
+            .expect("checkpoint enumeration")
+            .is_empty()
+    );
+
+    let report = host.gc(&fixture.config()).expect("contained gc");
+
+    assert_eq!(report, Default::default());
+    for (path, contents) in [
+        (&owner_target, b"owner target".as_slice()),
+        (&repository_target, b"repository target".as_slice()),
+        (&staging_target, b"staging target".as_slice()),
+        (&image_target, b"image target".as_slice()),
+    ] {
+        assert_eq!(std::fs::read(path).expect("external target"), contents);
+    }
+    assert!(
+        std::fs::symlink_metadata(&image_link)
+            .expect("image link")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read(&invalid_name).expect("invalid staging name"),
+        b"not a transaction"
+    );
 }
 
 #[test]
