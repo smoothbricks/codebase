@@ -100,14 +100,14 @@ impl fmt::Display for RepoIdComponent {
     }
 }
 
-fn validate_identity_component(
-    value: &str,
-    component: RepoIdComponent,
-) -> Result<(), RepoIdError> {
+fn validate_identity_component(value: &str, component: RepoIdComponent) -> Result<(), RepoIdError> {
     if value.is_empty() {
         return Err(RepoIdError::EmptyComponent { component });
     }
-    if value == "." || value == ".." {
+    if value == "." {
+        return Err(RepoIdError::TraversalComponent { component });
+    }
+    if value == ".." {
         return Err(RepoIdError::TraversalComponent { component });
     }
 
@@ -117,7 +117,8 @@ fn validate_identity_component(
     if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
         return Err(RepoIdError::InvalidComponent { component });
     }
-    if !value.as_bytes()
+    if !value
+        .as_bytes()
         .iter()
         .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(byte))
     {
@@ -136,9 +137,7 @@ pub enum RepoIdError {
     EmptyComponent { component: RepoIdComponent },
     #[error("repository identity {component} component cannot be `.` or `..`")]
     TraversalComponent { component: RepoIdComponent },
-    #[error(
-        "repository identity {component} component must match [a-z0-9][a-z0-9._-]*"
-    )]
+    #[error("repository identity {component} component must match [a-z0-9][a-z0-9._-]*")]
     InvalidComponent { component: RepoIdComponent },
 }
 
@@ -147,10 +146,16 @@ pub enum RepoIdError {
 /// Supported forms are `ssh://`, `https://`, `http://`, `git://`, and the common
 /// SCP-like SSH spelling `user@host:owner/repo.git`.
 pub fn normalize_remote_url(value: &str) -> Result<RepoId, RemoteUrlError> {
-    if value.is_empty() || value.trim() != value {
+    if value.is_empty() {
         return Err(RemoteUrlError::EmptyOrPadded);
     }
-    if value.bytes().any(|byte| byte.is_ascii_control()) || value.contains('\\') {
+    if value.trim() != value {
+        return Err(RemoteUrlError::EmptyOrPadded);
+    }
+    if value.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(RemoteUrlError::InvalidSyntax);
+    }
+    if value.contains('\\') {
         return Err(RemoteUrlError::InvalidSyntax);
     }
 
@@ -159,7 +164,10 @@ pub fn normalize_remote_url(value: &str) -> Result<RepoId, RemoteUrlError> {
         .find_map(|(index, character)| matches!(character, '?' | '#').then_some(index));
     let without_suffix = suffix_start.map_or(value, |index| &value[..index]);
     let path = if let Some((scheme, remainder)) = without_suffix.split_once("://") {
-        if !matches!(scheme.to_ascii_lowercase().as_str(), "ssh" | "https" | "http" | "git") {
+        if !matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "ssh" | "https" | "http" | "git"
+        ) {
             return Err(RemoteUrlError::UnsupportedTransport);
         }
         let (authority, path) = remainder
@@ -184,18 +192,30 @@ pub fn normalize_remote_url(value: &str) -> Result<RepoId, RemoteUrlError> {
 
     let repo = strip_dot_git(repo)?;
     let mut canonical = String::with_capacity(owner.len() + 1 + repo.len());
-    canonical.extend(owner.chars().map(|character| character.to_ascii_lowercase()));
+    canonical.extend(
+        owner
+            .chars()
+            .map(|character| character.to_ascii_lowercase()),
+    );
     canonical.push('/');
     canonical.extend(repo.chars().map(|character| character.to_ascii_lowercase()));
     RepoId::parse(&canonical).map_err(RemoteUrlError::InvalidIdentity)
 }
 
 fn validate_authority(authority: &str) -> Result<(), RemoteUrlError> {
-    if authority.is_empty() || authority.matches('@').count() > 1 {
+    if authority.is_empty() {
         return Err(RemoteUrlError::MissingHost);
     }
-    let host_port = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
-    if host_port.is_empty() || host_port.contains('@') {
+    if authority.matches('@').count() > 1 {
+        return Err(RemoteUrlError::MissingHost);
+    }
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if host_port.is_empty() {
+        return Err(RemoteUrlError::MissingHost);
+    }
+    if host_port.contains('@') {
         return Err(RemoteUrlError::MissingHost);
     }
 
@@ -203,32 +223,51 @@ fn validate_authority(authority: &str) -> Result<(), RemoteUrlError> {
         let (host, port) = bracketed
             .split_once(']')
             .ok_or(RemoteUrlError::InvalidSyntax)?;
-        if !port.is_empty()
-            && (!port.starts_with(':') || port[1..].is_empty() || !port[1..].bytes().all(|b| b.is_ascii_digit()))
-        {
-            return Err(RemoteUrlError::InvalidSyntax);
+        if !port.is_empty() {
+            let digits = port
+                .strip_prefix(':')
+                .ok_or(RemoteUrlError::InvalidSyntax)?;
+            if digits.is_empty() {
+                return Err(RemoteUrlError::InvalidSyntax);
+            }
+            if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(RemoteUrlError::InvalidSyntax);
+            }
         }
         host
     } else {
         let (host, port) = host_port.rsplit_once(':').unwrap_or((host_port, ""));
-        if host_port.contains(':') && (port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit())) {
-            return Err(RemoteUrlError::InvalidSyntax);
+        if host_port.contains(':') {
+            if port.is_empty() {
+                return Err(RemoteUrlError::InvalidSyntax);
+            }
+            if !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(RemoteUrlError::InvalidSyntax);
+            }
         }
         host
     };
 
-    if host.is_empty()
-        || host == "."
-        || host == ".."
-        || host.bytes().any(|byte| byte.is_ascii_whitespace())
-    {
+    if host.is_empty() {
+        return Err(RemoteUrlError::MissingHost);
+    }
+    if host == "." {
+        return Err(RemoteUrlError::MissingHost);
+    }
+    if host == ".." {
+        return Err(RemoteUrlError::MissingHost);
+    }
+    if host.bytes().any(|byte| byte.is_ascii_whitespace()) {
         return Err(RemoteUrlError::MissingHost);
     }
     Ok(())
 }
 
 fn parse_scp_like(value: &str) -> Result<&str, RemoteUrlError> {
-    if value.starts_with('/') || value.starts_with('.') {
+    if value.starts_with('/') {
+        return Err(RemoteUrlError::UnsupportedTransport);
+    }
+    if value.starts_with('.') {
         return Err(RemoteUrlError::UnsupportedTransport);
     }
     let (authority, path) = value
@@ -377,10 +416,13 @@ impl RepositoryBinding {
             match (&identity.remote_name, &identity.remote_url) {
                 (None, None) => {}
                 (Some(name), Some(url)) => {
-                    if name.is_empty()
-                        || name.trim() != name
-                        || name.bytes().any(|byte| byte.is_ascii_control())
-                    {
+                    if name.is_empty() {
+                        return Err(BindingError::InvalidRemoteName);
+                    }
+                    if name.trim() != name {
+                        return Err(BindingError::InvalidRemoteName);
+                    }
+                    if name.bytes().any(|byte| byte.is_ascii_control()) {
                         return Err(BindingError::InvalidRemoteName);
                     }
                     if !remote_names.insert(name.as_str()) {
@@ -510,18 +552,16 @@ impl ProjectPaths {
         let store_root = validate_store_root(store_root.as_ref())?.to_path_buf();
         let owner = encode_layout_owner(repo_id.owner())?;
         let repo = encode_component(repo_id.repo())?;
-        let project_root =
-            checked_join(&store_root, [owner.as_str(), repo.as_str()])?;
-        let mount_root =
-            checked_join(&store_root, ["mnt", owner.as_str(), repo.as_str()])?;
+        let project_root = checked_join(&store_root, [owner.as_str(), repo.as_str()])?;
+        let mount_root = checked_join(&store_root, ["mnt", owner.as_str(), repo.as_str()])?;
 
         Ok(Self {
-            repository_binding: checked_join(&project_root, ["repository.json"] )?,
-            policy: checked_join(&project_root, ["policy.json"] )?,
-            sessions: checked_join(&project_root, ["sessions"] )?,
-            checkpoints: checked_join(&project_root, ["checkpoints"] )?,
-            quarantine: checked_join(&project_root, ["quarantine"] )?,
-            waivers: checked_join(&project_root, ["waivers.json"] )?,
+            repository_binding: checked_join(&project_root, ["repository.json"])?,
+            policy: checked_join(&project_root, ["policy.json"])?,
+            sessions: checked_join(&project_root, ["sessions"])?,
+            checkpoints: checked_join(&project_root, ["checkpoints"])?,
+            quarantine: checked_join(&project_root, ["quarantine"])?,
+            waivers: checked_join(&project_root, ["waivers.json"])?,
             store_root,
             project_root,
             mount_root,
@@ -539,9 +579,10 @@ fn validate_store_root(root: &Path) -> Result<&Path, PathLayoutError> {
     if !root.is_absolute() {
         return Err(PathLayoutError::StoreRootNotAbsolute);
     }
-    if root.components().any(|component| {
-        matches!(component, Component::CurDir | Component::ParentDir)
-    }) {
+    if root
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
         return Err(PathLayoutError::StoreRootNotNormalized);
     }
     Ok(root)
@@ -553,10 +594,14 @@ fn checked_join<'a>(
 ) -> Result<PathBuf, PathLayoutError> {
     let mut candidate = root.to_path_buf();
     for component in components {
-        if component.is_empty()
-            || Path::new(component).components().count() != 1
-            || !matches!(Path::new(component).components().next(), Some(Component::Normal(_)))
-        {
+        if component.is_empty() {
+            return Err(PathLayoutError::UnsafeComponent);
+        }
+        let mut path_components = Path::new(component).components();
+        if !matches!(path_components.next(), Some(Component::Normal(_))) {
+            return Err(PathLayoutError::UnsafeComponent);
+        }
+        if path_components.next().is_some() {
             return Err(PathLayoutError::UnsafeComponent);
         }
         candidate.push(component);
@@ -568,16 +613,21 @@ fn checked_join<'a>(
 }
 
 fn is_lexically_contained(root: &Path, candidate: &Path) -> bool {
-    if validate_store_root(root).is_err() || !candidate.is_absolute() {
+    if validate_store_root(root).is_err() {
+        return false;
+    }
+    if !candidate.is_absolute() {
         return false;
     }
     let Ok(relative) = candidate.strip_prefix(root) else {
         return false;
     };
-    relative.components().next().is_some()
-        && relative
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
+    if relative.components().next().is_none() {
+        return false;
+    }
+    relative
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)))
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -609,12 +659,55 @@ mod tests {
         assert_eq!(parsed.repo(), "widget.rs");
 
         for invalid in [
-            "", "acme", "/repo", "owner/", "a/b/c", "Acme/widget", "acme/Widget",
-            "acme/../widget", "./widget", "acme/%2f", "acme/repo name", "acme/repo\\x",
+            "",
+            "acme",
+            "/repo",
+            "owner/",
+            "a/b/c",
+            "Acme/widget",
+            "acme/Widget",
+            "acme/../widget",
+            "./widget",
+            "acme/%2f",
+            "acme/repo name",
+            "acme/repo\\x",
             "_acme/widget",
         ] {
             assert!(RepoId::parse(invalid).is_err(), "accepted {invalid:?}");
         }
+    }
+
+    #[test]
+    fn repository_identity_interfaces_and_typed_traversal_errors_are_exact() {
+        let identity = repo_id("acme/widget");
+        assert_eq!(identity.as_ref(), "acme/widget");
+        assert_eq!(identity.to_string(), "acme/widget");
+        assert_eq!(RepoIdComponent::Owner.to_string(), "owner");
+        assert_eq!(RepoIdComponent::Repo.to_string(), "repo");
+        assert_eq!(
+            RepoId::parse("./widget"),
+            Err(RepoIdError::TraversalComponent {
+                component: RepoIdComponent::Owner
+            })
+        );
+        assert_eq!(
+            RepoId::parse("../widget"),
+            Err(RepoIdError::TraversalComponent {
+                component: RepoIdComponent::Owner
+            })
+        );
+        assert_eq!(
+            RepoId::parse("acme/."),
+            Err(RepoIdError::TraversalComponent {
+                component: RepoIdComponent::Repo
+            })
+        );
+        assert_eq!(
+            RepoId::parse("acme/.."),
+            Err(RepoIdError::TraversalComponent {
+                component: RepoIdComponent::Repo
+            })
+        );
     }
 
     #[test]
@@ -651,6 +744,52 @@ mod tests {
         ] {
             assert!(normalize_remote_url(remote).is_err(), "accepted {remote:?}");
         }
+    }
+
+    #[test]
+    fn remote_rejection_branches_are_typed_and_dot_git_is_only_a_suffix() {
+        for (remote, expected) in [
+            ("", RemoteUrlError::EmptyOrPadded),
+            (" git@github.com:acme/widget", RemoteUrlError::EmptyOrPadded),
+            (
+                "git@github.com:acme/widget\n",
+                RemoteUrlError::EmptyOrPadded,
+            ),
+            ("git@github.com:acme\\widget", RemoteUrlError::InvalidSyntax),
+            (
+                "git@github.com:acme/wid\nget",
+                RemoteUrlError::InvalidSyntax,
+            ),
+            (
+                "ssh://git@@github.com/acme/widget",
+                RemoteUrlError::MissingHost,
+            ),
+            ("ssh://git@/acme/widget", RemoteUrlError::MissingHost),
+            ("ssh://[::1/acme/widget", RemoteUrlError::InvalidSyntax),
+            ("ssh://[::1]:/acme/widget", RemoteUrlError::InvalidSyntax),
+            ("ssh://[::1]:no/acme/widget", RemoteUrlError::InvalidSyntax),
+            (
+                "ssh://github.com:/acme/widget",
+                RemoteUrlError::InvalidSyntax,
+            ),
+            (
+                "ssh://github.com:no/acme/widget",
+                RemoteUrlError::InvalidSyntax,
+            ),
+            ("ssh://./acme/widget", RemoteUrlError::MissingHost),
+            ("ssh://../acme/widget", RemoteUrlError::MissingHost),
+            ("ssh://bad host/acme/widget", RemoteUrlError::MissingHost),
+        ] {
+            assert_eq!(normalize_remote_url(remote), Err(expected), "{remote:?}");
+        }
+        assert_eq!(
+            normalize_remote_url("ssh://[::1]:22/acme/widget"),
+            Ok(repo_id("acme/widget"))
+        );
+        assert_eq!(
+            normalize_remote_url("https://github.com/acme/widget.git-extra"),
+            Ok(repo_id("acme/widget.git-extra"))
+        );
     }
 
     #[test]
@@ -707,6 +846,57 @@ mod tests {
     }
 
     #[test]
+    fn binding_rejects_each_ambiguous_identity_shape() {
+        assert_eq!(
+            RepositoryBinding::new(vec![]),
+            Err(BindingError::NoIdentities)
+        );
+        for invalid_name in ["", " origin", "origin\n"] {
+            let identity = BoundIdentity {
+                repo_id: repo_id("acme/widget"),
+                remote_name: Some(invalid_name.into()),
+                remote_url: Some("https://github.com/acme/widget".into()),
+                primary: true,
+            };
+            assert_eq!(
+                RepositoryBinding::new(vec![identity]),
+                Err(BindingError::InvalidRemoteName)
+            );
+        }
+
+        let local = BoundIdentity {
+            repo_id: repo_id("acme/widget"),
+            remote_name: None,
+            remote_url: None,
+            primary: true,
+        };
+        assert!(matches!(
+            RepositoryBinding::new(vec![local.clone(), local]),
+            Err(BindingError::PrimaryCount(2) | BindingError::DuplicateRepoId(_))
+        ));
+        let incomplete = BoundIdentity {
+            repo_id: repo_id("acme/widget"),
+            remote_name: Some("origin".into()),
+            remote_url: None,
+            primary: true,
+        };
+        assert_eq!(
+            RepositoryBinding::new(vec![incomplete]),
+            Err(BindingError::IncompleteRemote)
+        );
+        let invalid_url = BoundIdentity {
+            repo_id: repo_id("acme/widget"),
+            remote_name: Some("origin".into()),
+            remote_url: Some("file:///acme/widget".into()),
+            primary: true,
+        };
+        assert!(matches!(
+            RepositoryBinding::new(vec![invalid_url]),
+            Err(BindingError::InvalidRemoteUrl { .. })
+        ));
+    }
+
+    #[test]
     fn binding_allows_explicit_local_only_identity() {
         let local = BoundIdentity {
             repo_id: repo_id("local/tool"),
@@ -720,16 +910,49 @@ mod tests {
     #[test]
     fn derives_contained_project_paths() {
         let paths = ProjectPaths::new("/Users/test/.cowshed", &repo_id("acme/widget")).unwrap();
-        assert_eq!(paths.project_root, Path::new("/Users/test/.cowshed/acme/widget"));
+        assert_eq!(
+            paths.project_root,
+            Path::new("/Users/test/.cowshed/acme/widget")
+        );
         assert_eq!(
             paths.repository_binding,
             Path::new("/Users/test/.cowshed/acme/widget/repository.json")
         );
-        assert_eq!(paths.mount_root, Path::new("/Users/test/.cowshed/mnt/acme/widget"));
+        assert_eq!(
+            paths.mount_root,
+            Path::new("/Users/test/.cowshed/mnt/acme/widget")
+        );
         assert!(paths.contains(&paths.sessions));
         assert!(!paths.contains(Path::new("/Users/test/.cowshed")));
         assert!(!paths.contains(Path::new("/Users/test/.cowshed/acme/../escape")));
         assert!(!paths.contains(Path::new("/Users/test/.cowshed-other/acme/widget")));
+    }
+
+    #[test]
+    fn low_level_path_guards_reject_every_escape_shape() {
+        for component in ["", ".", "..", "../escape", "nested/child", "/absolute"] {
+            assert_eq!(
+                checked_join(Path::new("/store"), [component]),
+                Err(PathLayoutError::UnsafeComponent),
+                "{component:?}"
+            );
+        }
+        assert!(!is_lexically_contained(
+            Path::new("relative"),
+            Path::new("/store/acme")
+        ));
+        assert!(!is_lexically_contained(
+            Path::new("/store"),
+            Path::new("relative")
+        ));
+        assert!(!is_lexically_contained(
+            Path::new("/store"),
+            Path::new("/other/acme")
+        ));
+        assert!(!is_lexically_contained(
+            Path::new("/store"),
+            Path::new("/store")
+        ));
     }
 
     #[test]

@@ -16,3 +16,6 @@ tokio.workspace = true
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 walkdir = "2"
+
+[dev-dependencies]
+proptest = "1"
