@@ -74,7 +74,7 @@ impl std::error::Error for ExecError {
 
 /// Converts authoritative controller inputs into an argv-only sandbox-exec launch.
 /// No child-provided text or environment participates in this plan.
-pub fn plan_exec(request: &ExecRequest, sandbox: &SandboxConfig) -> Result<SpawnPlan, ExecError> {
+pub fn plan_exec(request: ExecRequest, sandbox: &SandboxConfig) -> Result<SpawnPlan, ExecError> {
     validate_argv(&request.argv)?;
     let cwd = contained_cwd(&sandbox.workspace_mount, &request.cwd)?;
     let profile = seatbelt_profile(sandbox).map_err(map_sandbox_error)?;
@@ -83,7 +83,7 @@ pub fn plan_exec(request: &ExecRequest, sandbox: &SandboxConfig) -> Result<Spawn
     args.push(OsString::from("-p"));
     args.push(OsString::from(profile));
     args.push(OsString::from("--"));
-    args.extend(request.argv.iter().cloned());
+    args.extend(request.argv);
 
     Ok(SpawnPlan {
         program: PathBuf::from(SANDBOX_EXEC),
@@ -127,7 +127,7 @@ impl SpawnRunner for SystemSpawnRunner {
 }
 
 pub fn execute_with<R: SpawnRunner>(
-    request: &ExecRequest,
+    request: ExecRequest,
     sandbox: &SandboxConfig,
     runner: &R,
 ) -> Result<ExecOutcome, ExecError> {
@@ -145,7 +145,7 @@ pub fn execute_with<R: SpawnRunner>(
     Ok(ExecOutcome { status })
 }
 
-pub fn execute(request: &ExecRequest, sandbox: &SandboxConfig) -> Result<ExecOutcome, ExecError> {
+pub fn execute(request: ExecRequest, sandbox: &SandboxConfig) -> Result<ExecOutcome, ExecError> {
     execute_with(request, sandbox, &SystemSpawnRunner)
 }
 
@@ -341,11 +341,14 @@ mod tests {
             ],
             cwd: PathBuf::from("nested"),
         };
-        let plan = plan_exec(&request, &tree.sandbox()).unwrap();
+        let plan = plan_exec(request, &tree.sandbox()).unwrap();
         assert_eq!(plan.program, Path::new(SANDBOX_EXEC));
         assert_eq!(plan.args[0], "-p");
         assert_eq!(plan.args[2], "--");
-        assert_eq!(&plan.args[3..], request.argv.as_slice());
+        assert_eq!(
+            &plan.args[3..],
+            ["printf", "%s", "$(touch /tmp/never); a b"]
+        );
         assert_eq!(plan.cwd, tree.cwd);
     }
 
@@ -357,7 +360,7 @@ mod tests {
             cwd: PathBuf::from("../outside"),
         };
         assert!(matches!(
-            plan_exec(&traversal, &tree.sandbox()),
+            plan_exec(traversal, &tree.sandbox()),
             Err(ExecError::SandboxDenied { .. })
         ));
 
@@ -369,7 +372,7 @@ mod tests {
             cwd: PathBuf::from("escape"),
         };
         assert!(matches!(
-            plan_exec(&symlink, &tree.sandbox()),
+            plan_exec(symlink, &tree.sandbox()),
             Err(ExecError::SandboxDenied { .. })
         ));
     }
@@ -386,7 +389,7 @@ mod tests {
             argv: vec![OsString::from("false")],
             cwd: tree.cwd.clone(),
         };
-        let outcome = execute_with(&request, &tree.sandbox(), &runner).unwrap();
+        let outcome = execute_with(request, &tree.sandbox(), &runner).unwrap();
         assert_eq!(outcome.status, status);
         assert_eq!(runner.plans.borrow().len(), 1);
     }
@@ -408,7 +411,7 @@ mod tests {
             cwd: tree.cwd.clone(),
         };
         assert!(matches!(
-            execute_with(&request, &sandbox, &runner),
+            execute_with(request, &sandbox, &runner),
             Err(ExecError::SandboxDenied { .. })
         ));
         assert!(runner.plans.borrow().is_empty());
@@ -432,7 +435,7 @@ mod tests {
             cwd: tree.cwd.clone(),
         };
         assert!(matches!(
-            execute_with(&request, &tree.sandbox(), &FailingRunner),
+            execute_with(request, &tree.sandbox(), &FailingRunner),
             Err(ExecError::WrapperFailure {
                 stage: WrapperStage::Spawn,
                 ..

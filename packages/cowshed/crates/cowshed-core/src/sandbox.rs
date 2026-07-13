@@ -1,30 +1,8 @@
+use std::borrow::Cow;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-/// The macOS loopback allocation assigned to one workspace.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PortBlock {
-    pub base: u16,
-    pub size: u16,
-}
-
-impl PortBlock {
-    pub const REQUIRED_SIZE: u16 = 16;
-
-    pub fn new(base: u16, size: u16) -> Result<Self, SandboxError> {
-        if size != Self::REQUIRED_SIZE {
-            return Err(SandboxError::InvalidPortBlock { base, size });
-        }
-        if base.checked_add(size - 1).is_none() {
-            return Err(SandboxError::InvalidPortBlock { base, size });
-        }
-        Ok(Self { base, size })
-    }
-
-    pub fn ports(self) -> impl ExactSizeIterator<Item = u16> {
-        self.base..=self.base + (self.size - 1)
-    }
-}
+pub use crate::metadata::PortBlock;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EgressGrant {
@@ -101,7 +79,13 @@ pub fn seatbelt_profile(config: &SandboxConfig) -> Result<String, SandboxError> 
     validate_path(&config.home)?;
     validate_path(&config.workspace_mount)?;
     validate_path(&config.exec_temp_dir)?;
-    PortBlock::new(config.port_block.base, config.port_block.size)?;
+    config
+        .port_block
+        .validate()
+        .map_err(|_| SandboxError::InvalidPortBlock {
+            base: config.port_block.base,
+            size: config.port_block.size,
+        })?;
 
     let hard_denies = hard_denies(&config.home, &config.additional_denies)?;
     let read_grants = normalized_paths(&config.grants.read)?;
@@ -109,10 +93,13 @@ pub fn seatbelt_profile(config: &SandboxConfig) -> Result<String, SandboxError> 
     let sockets = normalized_paths(&config.allowed_unix_sockets)?;
 
     for grant in read_grants.iter().chain(write_grants.iter()) {
-        if let Some(deny) = hard_denies.iter().find(|deny| paths_intersect(grant, deny)) {
+        if let Some(deny) = hard_denies
+            .iter()
+            .find(|deny| paths_intersect(grant, deny.as_ref()))
+        {
             return Err(SandboxError::GrantIntersectsDeny {
-                grant: grant.clone(),
-                deny: deny.clone(),
+                grant: (*grant).to_path_buf(),
+                deny: deny.as_ref().to_path_buf(),
             });
         }
     }
@@ -141,7 +128,7 @@ pub fn seatbelt_profile(config: &SandboxConfig) -> Result<String, SandboxError> 
             &mut profile,
             &format!(
                 "(allow network-outbound (remote unix-socket (path-literal \"{}\")))",
-                sbpl_path(&socket)?
+                sbpl_path(socket)?
             ),
         );
     }
@@ -149,7 +136,14 @@ pub fn seatbelt_profile(config: &SandboxConfig) -> Result<String, SandboxError> 
         &mut profile,
         "(allow network-bind network-inbound (local tcp \"localhost:*\"))",
     );
-    for port in config.port_block.ports() {
+    for port in config
+        .port_block
+        .ports()
+        .map_err(|_| SandboxError::InvalidPortBlock {
+            base: config.port_block.base,
+            size: config.port_block.size,
+        })?
+    {
         push_line(
             &mut profile,
             &format!("(allow network-outbound (remote tcp \"localhost:{port}\"))"),
@@ -196,40 +190,51 @@ pub fn seatbelt_profile(config: &SandboxConfig) -> Result<String, SandboxError> 
     }
 
     // SBPL is last-match-wins: immutable secrets and policy denies terminate the profile.
-    for deny in hard_denies.into_iter().filter(|path| path != &cowshed) {
-        push_exact_and_subpath_rule(&mut profile, "deny file-read* file-write*", &deny)?;
+    for deny in hard_denies
+        .into_iter()
+        .filter(|path| path.as_ref() != cowshed.as_path())
+    {
+        push_exact_and_subpath_rule(&mut profile, "deny file-read* file-write*", deny.as_ref())?;
     }
 
     Ok(profile)
 }
 
-fn hard_denies(home: &Path, additional: &[PathBuf]) -> Result<Vec<PathBuf>, SandboxError> {
+fn hard_denies<'a>(
+    home: &Path,
+    additional: &'a [PathBuf],
+) -> Result<Vec<Cow<'a, Path>>, SandboxError> {
     let mut denies = vec![
-        home.join(".cowshed"),
-        home.join(".ssh"),
-        home.join(".gnupg"),
-        home.join(".aws"),
-        home.join(".config/gh"),
-        home.join(".netrc"),
-        home.join(".npmrc"),
-        home.join(".pypirc"),
-        home.join(".cargo/config.toml"),
-        home.join(".cargo/credentials.toml"),
-        home.join(".cargo/bin"),
-        home.join(".gradle/gradle.properties"),
-        home.join("go"),
-        home.join("Library/Keychains"),
+        Cow::Owned(home.join(".cowshed")),
+        Cow::Owned(home.join(".ssh")),
+        Cow::Owned(home.join(".gnupg")),
+        Cow::Owned(home.join(".aws")),
+        Cow::Owned(home.join(".config/gh")),
+        Cow::Owned(home.join(".netrc")),
+        Cow::Owned(home.join(".npmrc")),
+        Cow::Owned(home.join(".pypirc")),
+        Cow::Owned(home.join(".cargo/config.toml")),
+        Cow::Owned(home.join(".cargo/credentials.toml")),
+        Cow::Owned(home.join(".cargo/bin")),
+        Cow::Owned(home.join(".gradle/gradle.properties")),
+        Cow::Owned(home.join("go")),
+        Cow::Owned(home.join("Library/Keychains")),
     ];
-    denies.extend_from_slice(additional);
-    normalized_paths(&denies)
+    denies.extend(additional.iter().map(|path| Cow::Borrowed(path.as_path())));
+    for path in &denies {
+        validate_path(path)?;
+    }
+    denies.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
+    denies.dedup_by(|left, right| left.as_ref() == right.as_ref());
+    Ok(denies)
 }
 
-fn normalized_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>, SandboxError> {
-    let mut paths = paths.to_vec();
+fn normalized_paths(paths: &[PathBuf]) -> Result<Vec<&Path>, SandboxError> {
+    let mut paths: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
     for path in &paths {
         validate_path(path)?;
     }
-    paths.sort();
+    paths.sort_unstable();
     paths.dedup();
     Ok(paths)
 }
@@ -384,7 +389,10 @@ mod tests {
     fn port_block_is_exact_and_cannot_overflow() {
         assert!(PortBlock::new(40_960, 15).is_err());
         assert!(PortBlock::new(u16::MAX - 14, 16).is_err());
-        assert_eq!(PortBlock::new(40_960, 16).unwrap().ports().count(), 16);
+        assert_eq!(
+            PortBlock::new(40_960, 16).unwrap().ports().unwrap().count(),
+            16
+        );
     }
     #[cfg(target_os = "macos")]
     #[test]
