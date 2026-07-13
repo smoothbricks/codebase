@@ -39,15 +39,16 @@ Design rules: async (tokio), no global state, no interior config lookup — ever
 all filesystem/mount state derived per call (01_storage.md).
 
 ```rust
-/// Stateless entry point.
-pub struct Cowshed;
+/// Explicit client for one authenticated, single-owner controller actor.
+pub struct Cowshed { /* sealed actor sender */ }
 impl Cowshed {
-    /// Resolve a project from any path inside the repository.
-    pub async fn open(path: impl AsRef<Path>) -> Result<Project, CowshedError>;
-    /// Acquire affine authority from an inherited, peer-verified controller socket.
-    pub async fn coordinator_token(fd: OwnedFd) -> Result<CoordinatorToken, CowshedError>;
-    /// Bind and consume coordinator authority (unsandboxed controller only) over a resolved project.
-    pub async fn coordinator(project: &Project, token: CoordinatorToken)
+    /// Consume an inherited, peer-verified controller socket, perform the nonce handshake, and return the client plus
+    /// its affine coordinator token. Environment text may identify the fd number but is not authority.
+    pub async fn connect(fd: OwnedFd) -> Result<(Cowshed, CoordinatorToken), CowshedError>;
+    /// Resolve a project from any path inside the repository through that actor.
+    pub async fn open(&self, path: impl AsRef<Path>) -> Result<Project, CowshedError>;
+    /// Bind and consume coordinator authority over a project resolved by the same actor.
+    pub fn coordinator(&self, project: &Project, token: CoordinatorToken)
         -> Result<Coordinator, CowshedError>;
 }
 
@@ -102,7 +103,7 @@ pub struct StdinInfo {
     pub complete: bool,                  // true only after clean source EOF reached child stdin
 }
 
-pub struct TraceContext { pub trace_id: TraceId, pub span_id: SpanId } // validated lowercase hex
+pub struct TraceContext { pub trace_id: TraceId, pub span_id: SpanId } // validated non-zero lowercase hex
 
 /// Positive, workspace-local monotonic identity allocated for every exec submission.
 /// The allocator never reuses a value. Values are capped at 2^53-1 so the same integer is exact
@@ -186,7 +187,7 @@ pub struct GrantSet {
     pub sim: Vec<SimVerb>,               // personal-session simulator broker verbs (04/05/14_nix.md)
 }
 pub enum SimVerb { OpenUrl, Install }    // closed enum; unknown verbs are usage errors
-pub struct PortBlock { pub base: u16, pub size: u16 }   // default size 16, from the reserved range
+pub struct PortBlock { base: u16, size: u16 } // private; `new` and custom JSON decode enforce size 16 + checked end
 pub struct EgressRule {                 // 04_sandbox.md / 05_gateway.md
     pub host: String, pub ports: Vec<u16>,
     pub mode: EgressMode,                // default Intercept (per-workspace CA); Opaque = pass-through CONNECT
@@ -223,9 +224,9 @@ mirror the MCP token model (12_mcp.md) in the type system:
 
 ```rust
 pub enum RevisionTarget {
-    Branch(String),       // refs/heads/<name> in the main workspace repository
-    Ref(String),          // validated fully qualified ref
-    Oid(Oid),             // immutable replay base; never a land destination
+    Branch(BranchName),   // validated `git check-ref-format --branch` domain
+    Ref(GitRef),          // validated fully-qualified `refs/...` domain
+    Oid(GitOid),          // validated lowercase 40- or 64-hex; never a land destination
 }
 
 pub struct RebaseOptions {
@@ -276,7 +277,7 @@ impl Coordinator {
     pub async fn repo_mirror(&self, ws: &str, url: &Url) -> Result<MirrorInfo, CowshedError>;
     pub async fn set_checkpoint_quota(&self, ws: &str, quota: CheckpointQuota) -> Result<(), CowshedError>;
     /// Hand a worker a capability scoped to exactly one workspace.
-    pub fn worker(&self, ws: &str) -> Result<WorkspaceHandle, CowshedError>;
+    pub async fn worker(&self, ws: &str) -> Result<WorkspaceHandle, CowshedError>;
 }
 
 `Coordinator::land` fast-forwards a real `refs/heads/<target_branch>`, not a hidden integration ref. When that target
@@ -366,7 +367,10 @@ must use that optional shape directly; casts, `null`, zero-sized blocks, and sen
 a field is a coordinated change across core + goldens, not a per-adapter patch. JSON and N-API use the same camel-case
 projection: `JobInfo.stdout` and `JobInfo.stderr` are `StreamInfo` objects, each with `path`, `bytes`, and `summary`;
 each `summary` has `version`, `text`, and `truncated`. The paths name the in-workspace raw byte files containing every
-byte admitted before any output-limit trip. There are no flattened aliases or adapter-specific spellings.
+byte admitted before any output-limit trip. There are no flattened aliases or adapter-specific spellings. Field names
+are camel-case, but `ErrorCode` values are taxonomy tokens rather than field names: CLI JSON, Rust serde, N-API
+rejection objects, and MCP all use the same kebab-case `not-found`, `environment-missing`, and `sandbox-denied`
+spellings. No adapter camel-cases or otherwise rewrites an error code.
 
 The authoritative Rust definitions live in `cowshed_core::api::dto`; serde uses `camelCase`, enum values use the
 documented lower/camel-case strings, and every optional field is omitted rather than encoded as `null`.
@@ -381,33 +385,42 @@ documented lower/camel-case strings, and every optional field is omitted rather 
   `"info" | "warning" | "error"`. `GcReport = { examined, reclaimed, retainedPinned, freedBytes, dryRun }`.
 - `JobId` is a positive integer no greater than `2^53-1`.
   `JobInfo = { repoId, workspaceIncarnation, jobId, state, pid?, grantRevision, argv, cwd, started, durationMs?, exit?, stdout, stderr, trace, outputLimit?, stdin }`.
-  `started` is an RFC3339 UTC string. `exit` is the discriminated union `{kind:"exited",code}` or
-  `{kind:"signaled",signal,coreDumped}`; it is absent before a process result exists. `outputLimit` is present iff
-  `state == "outputLimit"`. `StreamInfo` contains only `{path,bytes,summary}` and never raw output bytes.
+  `started` is a full RFC3339 string: `Z` and numeric offsets are accepted, including the RFC3339 leap-second value
+  `:60`; calendar, clock, fraction, and offset ranges are validated. `exit` is the discriminated union
+  `{kind:"exited",code}` or `{kind:"signaled",signal,coreDumped}`; it is absent before a process result exists.
+  `outputLimit` is present iff `state == "outputLimit"`. Both serialization and deserialization enforce these state /
+  duration / exit / output-limit invariants. `StreamInfo` contains only `{path,bytes,summary}` and never raw output
+  bytes.
 - `StdinInfo = { kind, bytes, workspacePath?, complete }`; kind is `"empty" | "inline" | "stream" | "workspaceFile"`.
   Every `cwd`, stream path, and workspace stdin path uses the validated relative `WorkspacePath` domain type: no root,
   empty component, `.`/`..`, prefix, NUL, or symlink-following open.
 - `ExecRecord` repeats the durable `(repoId,workspaceIncarnation,jobId)` key and the terminal job fields
   `{state,argv,cwd,envHash,grantRevision,trace,started,durationMs,exit?,stdout,stderr,stdin,outputLimit?}`.
-- `RevisionTarget` projects as exactly one of `{branch}`, `{ref}`, or `{oid}`. `ExpectedRefHead` projects as
-  `{missing:true}` or `{oid}`. Oids are validated lowercase 40- or 64-hex strings.
+- `RevisionTarget` projects as an exact one-key object `{branch}`, `{ref}`, or `{oid}` and rejects ambiguous/multi-key
+  objects. Branch and fully-qualified ref values use validated `BranchName` / `GitRef` domains; raw invalid strings
+  cannot be serialized. `ExpectedRefHead` projects as `{missing:true}` or `{oid}`. Oids are validated lowercase 40- or
+  64-hex strings.
 - `AdoptOptions = { path?, capacity?, quarantine, imageFormat? }`;
   `CreateOptions = { revision?, fromWorkspace?, browse, slot? }`; `AttachOptions = { browse }`;
   `RemoveOptions = { force }`; `GcOptions = { dryRun }`; `RebaseOptions`, `LandOptions`, and `PushOptions` use the
   expectation fields shown above. All booleans are explicit in JSON; absence never silently means authority was granted.
 - `GrantSet`, `GrantDelta`, `PortBlock`, `EgressRule`, `RepoRule`, and `SimVerb` reuse the metadata definitions.
-  `GrantSet.portBlock` is present on macOS and omitted on Linux; `GrantDelta.expectedRevision` is optional.
+  `GrantSet.portBlock` is present on macOS and omitted on Linux; `GrantDelta.expectedRevision` is optional. `PortBlock`
+  fields are private; `new`, `base()`, and `size()` are the public surface, and custom deserialization invokes the same
+  validation so size zero, any size other than 16, overflow, unknown fields, and struct-literal forgery fail.
 - `PushReport = { sourceHead, destinationRef, previousDestinationHead? }`;
   `LandReport = { landedHead, targetBranch, previousTargetHead?, targetWasCheckedOut, retired }`;
   `MirrorInfo = { url, mirror }`; `CheckpointQuota = { maxCount, maxBytes }`.
 - `GatewayStatus = { running, socket, cacheEntries, cacheBytes, activeWorkspaces }`.
   `AuditEvent = { timestamp, repoId, workspaceIncarnation, workspace, action, decision, reason?, trace }`.
 
-`JsonEnvelope<T>` has only `Success(T)` → `{"ok":true,"result":T}` and `Failure(CowshedError)` →
-`{"ok":false,"error":{"code","message","hint"}}`. The discriminant is validated when decoding. There is no public
-constructor that accepts an arbitrary `ok` boolean and no unit/null success. `CowshedError` is the single structured
-value `{code,message,hint}` with the stable codes `internal`, `usage`, `not-found`, `conflict`, `environment-missing`,
-and `sandbox-denied`.
+`JsonEnvelope<T>` has only the private-body constructors `success(T)` → `{"ok":true,"result":T}` and
+`failure(CowshedError)` → `{"ok":false,"error":{"code","message","hint"}}`. `T` must implement the sealed core-only
+`ResultBody`; `()` and adapter-local maps cannot satisfy it, so `result:null` is unrepresentable and no public enum
+variant or arbitrary `ok` boolean can bypass the contract. `EmptyResult {}` is the sole empty success and serializes as
+`{}`. The discriminant is also validated when decoding. `CowshedError` is the single structured value
+`{code,message,hint}` with the stable codes `internal`, `usage`, `not-found`, `conflict`, `environment-missing`, and
+`sandbox-denied`.
 
 ## Shell client (`cowshed-shell`)
 
