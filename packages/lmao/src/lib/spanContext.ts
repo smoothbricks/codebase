@@ -26,7 +26,6 @@
  */
 
 import type { TagWriter } from './codegen/fixedPositionWriterGenerator.js';
-import { createTagWriter } from './codegen/fixedPositionWriterGenerator.js';
 import {
   createSpanLogger as createSpanLoggerFromGenerator,
   type FluentLogEntry,
@@ -38,19 +37,16 @@ import { TransientError } from './errors/Transient.js';
 import type { RemappedViewConstructor } from './logBinding.js';
 import { Op } from './op.js';
 import type { OpContext, OpMetadata, SpanContext, SpanFn, SpanLogger, SpanSyncFn } from './opContext/types.js';
+import { getPhysicalLayoutPlan, type PhysicalLayoutPlan } from './physicalLayoutPlan.js';
 import { Err, hasErrorCode, Ok, type Result } from './result.js';
 import {
-  isRuntimeHintAnalyzed,
-  RUNTIME_HINT_CAPABILITIES_MASK,
   RUNTIME_HINT_DEPS,
   RUNTIME_HINT_FF,
-  RUNTIME_HINT_FULL_CAPABILITIES,
   RUNTIME_HINT_LOG,
   RUNTIME_HINT_RESULT,
   RUNTIME_HINT_SCOPE,
   RUNTIME_HINT_SPAN,
   RUNTIME_HINT_TAG,
-  runtimeHintInitialCapacity,
 } from './runtimeHint.js';
 import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from './schema/evaluator.js';
 import {
@@ -1184,8 +1180,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
       opMetadata: OpMetadata,
       runtimeHint = 0,
     ): SpanContextInstance<Ctx> {
-      // Get Op's schema for cross-library calls (child may have different schema than parent)
-      const childSchema = SpanBufferClass.schema;
+      const physicalLayoutPlan =
+        (opMetadata._physicalLayoutPlan as PhysicalLayoutPlan<Ctx['logSchema']> | undefined) ??
+        getPhysicalLayoutPlan(SpanBufferClass, runtimeHint);
+      const childSchema = physicalLayoutPlan.schema;
 
       // Use buffer strategy for child span creation (supports both JS and WASM buffers)
       // Pass schema for cross-library calls where child has different schema than parent
@@ -1193,7 +1191,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
         this._buffer, // parentBuffer
         this._buffer._opMetadata, // callsiteMetadata - WHO called span() (for row 0)
         opMetadata, // opMetadata - WHICH op is executing (for rows 1+)
-        runtimeHintInitialCapacity(runtimeHint),
+        physicalLayoutPlan.capacityTier,
         childSchema, // schema - Op's schema for correct tag methods
       );
       if (!isSpanBufferForSchema(createdBuffer, childSchema)) {
@@ -1209,7 +1207,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       this._buffer._children.push(bufferOrView);
 
       // Write span-start for child span (row 0) and pre-initialize span-end (row 1)
-      writeSpanStart(childBuffer, name);
+      physicalLayoutPlan.appenders.writeSpanStart(childBuffer, name);
 
       // Write line number to row 0 (line() takes pos and value)
       childBuffer.line(0, line);
@@ -1219,14 +1217,12 @@ export function createSpanContextClass<Ctx extends OpContext>(
       ctx._schema = childSchema;
       ctx._logBinding = logBinding;
 
-      const capabilities = isRuntimeHintAnalyzed(runtimeHint)
-        ? runtimeHint & RUNTIME_HINT_CAPABILITIES_MASK
-        : RUNTIME_HINT_FULL_CAPABILITIES;
+      const capabilities = physicalLayoutPlan.capabilities;
       const needsLogger =
         (capabilities & RUNTIME_HINT_LOG) !== 0 ||
         (capabilities & RUNTIME_HINT_FF) !== 0 ||
         (capabilities & RUNTIME_HINT_SCOPE) !== 0;
-      const childLogger = needsLogger ? createSpanLogger(childSchema, childBuffer) : undefined;
+      const childLogger = needsLogger ? physicalLayoutPlan.createSpanLogger(childBuffer) : undefined;
       if (childLogger) {
         ctx._spanLogger = childLogger;
       }
@@ -1234,7 +1230,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
         ctx.log = childLogger;
       }
       if ((capabilities & RUNTIME_HINT_TAG) !== 0) {
-        ctx.tag = createTagWriter(childSchema, childBuffer);
+        ctx.tag = physicalLayoutPlan.createTagWriter(childBuffer);
       }
       if ((capabilities & RUNTIME_HINT_DEPS) !== 0) {
         ctx.deps = this.deps;
