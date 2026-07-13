@@ -16,9 +16,10 @@ workspace.** Authority is attached to explicit capabilities, never inferred from
 - **`WorkspaceHandle`** — a worker's non-escalating capability over exactly one workspace: exec, shell, job control,
   checkpoint subject to controller-configured checkpoint quotas, push, and read-only grant inspection. It has no
   grant/revoke, restore/destroy/rebase/land/gc, repo-mirror, or cross-workspace access.
-- **`Coordinator`** — the sole project mutation and cross-workspace authority: adopt/create/fork, grant/revoke,
-  restore/destroy/rebase/land, garbage collection, repository mirroring, slot assignment, checkpoint-quota policy, and
-  minting one-workspace handles. A trusted unsandboxed controller holds it; workers never do.
+- **`Coordinator`** — the sole project mutation, diagnostics, and cross-workspace authority: adopt/create/fork,
+  grant/revoke, restore/destroy/rebase/land, garbage collection, repository mirroring, doctor, slot assignment,
+  checkpoint-quota policy, and minting one-workspace handles. A trusted unsandboxed controller holds it; workers never
+  do.
 
 `CoordinatorToken` is an affine, opaque, non-serializable proof acquired only by consuming a controller-provided
 inherited Unix stream descriptor. Acquisition validates that the descriptor is a connected socket owned by the current
@@ -32,6 +33,12 @@ All capability operations are messages to a single-owner controller/supervisor a
 sender, but they never share mutable authority state behind a mutex. `WorkspaceRef::attach` is deliberately safe,
 idempotent one-workspace attachment; only `Coordinator::detach` may detach because detachment affects running jobs and
 controller fencing.
+
+Every `worker.*`, `job.*`, and `session.*` request is fenced by the immutable
+`{ repoId, workspace, workspaceIncarnation }` captured when `Coordinator::worker` mints the handle. `JobHandle`,
+`JobStdin`, `JobAttachment`, log polling, and `Session` carry that same typed fence; callers never reconstruct it from
+strings or paths. Recreating a workspace does not retarget an old handle: the old handle continues to send its original
+incarnation and the controller rejects it as stale before effects.
 
 ## cowshed-core (Rust)
 
@@ -60,16 +67,21 @@ impl Project {
     pub async fn list(&self) -> Result<Vec<WorkspaceRef>, CowshedError>;
 }
 
-/// Read-only view of one workspace: identity, mount state, grant inspection, and safe ensure/attach.
+/// Read-only view of one workspace: an immutable information/grant snapshot plus safe ensure/attach.
 /// Carries no execution, detach, lifecycle, maintenance, repository-mirror, or grant mutation authority.
-pub struct WorkspaceRef { /* name, image path, detached controller metadata snapshot */ }
+pub struct WorkspaceRef { /* detached WorkspaceInfo + GrantSet snapshot and sealed actor sender */ }
 impl WorkspaceRef {
-    pub fn name(&self) -> &str;
+    pub fn name(&self) -> &WorkspaceName;
     pub fn mount_path(&self) -> &Path;               // canonical, whether or not attached
-    pub async fn info(&self) -> Result<WorkspaceInfo, CowshedError>;
+    pub fn info(&self) -> &WorkspaceInfo;            // captured snapshot; no RPC or copy
+    pub fn grants(&self) -> &GrantSet;               // captured snapshot; no RPC or copy
+    pub fn snapshot(&self) -> (&WorkspaceInfo, &GrantSet);
+    pub fn into_info(self) -> WorkspaceInfo;         // consuming, copy-free list projection
+    pub fn into_snapshot(self) -> (WorkspaceInfo, GrantSet);
+    pub async fn refresh_info(&self) -> Result<WorkspaceInfo, CowshedError>;
+    pub async fn refresh_grants(&self) -> Result<GrantSet, CowshedError>;
     pub async fn ensure(&self) -> Result<EnsureReport, CowshedError>;
     pub async fn attach(&self, opts: AttachOptions) -> Result<(), CowshedError>;
-    pub async fn grants(&self) -> Result<GrantSet, CowshedError>;       // read-only
 }
 ```
 
@@ -265,7 +277,7 @@ pub struct OutputLimitInfo {
 }
 
 /// Control handle for one durable job record; dropping it never kills or deletes the job.
-pub struct JobHandle { /* workspace capability + JobId */ }
+pub struct JobHandle { /* immutable repo/workspace/incarnation fence + JobId + actor sender */ }
 impl JobHandle {
     pub fn id(&self) -> JobId;
     pub async fn status(&self) -> Result<JobInfo, CowshedError>;
@@ -278,10 +290,20 @@ impl JobHandle {
 }
 
 /// A live attachment is only a view over one durable job's raw backing streams.
-pub struct JobAttachment { /* JobStdin + two independent RawByteStream handles */ }
+pub struct JobAttachment { /* immutable fence + JobStdin + two independent RawByteStream handles */ }
 impl JobAttachment {
     pub fn into_parts(self) -> (JobStdin, RawByteStream, RawByteStream);
     pub async fn detach(self) -> Result<(), CowshedError>; // closes this view; the job continues
+}
+
+pub struct JobStdin { /* same immutable fence + JobId + actor sender */ }
+impl JobStdin {
+    pub async fn write(&self, bytes: Bytes) -> Result<(), CowshedError>;
+}
+
+pub struct RawByteStream { /* bounded receiver; polling task retains the same immutable fence */ }
+impl RawByteStream {
+    pub async fn next(&mut self) -> Option<Result<Bytes, CowshedError>>;
 }
 
 pub struct GrantSet {
@@ -337,13 +359,16 @@ pub enum RevisionTarget {
     Ref(GitRef),          // validated fully-qualified `refs/...` domain
     Oid(GitOid),          // validated lowercase 40- or 64-hex; never a land destination
 }
+impl RevisionTarget {
+    pub fn parse_cli(value: impl Into<String>) -> Result<RevisionTarget, DtoError>;
+}
 
 pub struct RebaseOptions {
     pub onto: Option<RevisionTarget>,    // default Branch("main")
     pub fresh: bool,
-    pub expected_workspace_incarnation: Option<[u8; 16]>,
-    pub expected_source_head: Option<Oid>,
-    pub expected_onto_head: Option<Oid>,
+    pub expected_workspace_incarnation: Option<WorkspaceIncarnation>,
+    pub expected_source_head: Option<GitOid>,
+    pub expected_onto_head: Option<GitOid>,
 }
 
 pub struct LandOptions {
@@ -351,32 +376,32 @@ pub struct LandOptions {
     pub check: Option<Vec<String>>,
     pub retire: bool,
     pub push_only: bool,
-    pub expected_workspace_incarnation: Option<[u8; 16]>,
-    pub expected_source_head: Option<Oid>,
+    pub expected_workspace_incarnation: Option<WorkspaceIncarnation>,
+    pub expected_source_head: Option<GitOid>,
     pub expected_target_head: Option<ExpectedRefHead>,
 }
 
 pub struct LandReport {
-    pub landed_head: Oid,
+    pub landed_head: GitOid,
     pub target_branch: String,
-    pub previous_target_head: Option<Oid>,
+    pub previous_target_head: Option<GitOid>,
     pub target_was_checked_out: bool,
     pub retired: bool,
 }
 ```
 
 ```rust
-/// The sole mutation and cross-workspace authority over a project. It is the only capability that can adopt, create,
-/// destroy, fork, grant, revoke, restore, rebase, land, collect garbage, mirror repositories, set checkpoint quotas,
-/// or assign slots.
-pub struct Coordinator { /* Project + controller identity */ }
+/// The sole mutation, diagnostics, and cross-workspace authority over a project. It is the only capability that can
+/// adopt, create, destroy, fork, grant, revoke, restore, rebase, land, collect garbage, diagnose controller state,
+/// mirror repositories, set checkpoint quotas, or assign slots.
+pub struct Coordinator { /* Project + authenticated controller identity */ }
 impl Coordinator {
     pub async fn adopt(&self, opts: AdoptOptions) -> Result<WorkspaceRef, CowshedError>;
     pub async fn create(&self, name: &str, opts: CreateOptions) -> Result<WorkspaceRef, CowshedError>;
     pub async fn fork(&self, src: &str, dst: &str) -> Result<WorkspaceRef, CowshedError>;
     pub async fn grant(&self, ws: &str, delta: GrantDelta) -> Result<GrantSet, CowshedError>;
     pub async fn revoke(&self, ws: &str, delta: GrantDelta) -> Result<GrantSet, CowshedError>;
-    pub async fn rebase(&self, ws: &str, opts: RebaseOptions) -> Result<Oid, CowshedError>;
+    pub async fn rebase(&self, ws: &str, opts: RebaseOptions) -> Result<GitOid, CowshedError>;
     pub async fn land(&self, ws: &str, opts: LandOptions) -> Result<LandReport, CowshedError>;
     pub async fn restore(&self, ws: &str, label: &str) -> Result<(), CowshedError>;
     pub async fn detach(&self, ws: &str) -> Result<EmptyResult, CowshedError>;
@@ -385,9 +410,11 @@ impl Coordinator {
     pub async fn gc(&self, opts: GcOptions) -> Result<GcReport, CowshedError>;
     pub async fn repo_mirror(&self, ws: &str, url: &Url) -> Result<MirrorInfo, CowshedError>;
     pub async fn set_checkpoint_quota(&self, ws: &str, quota: CheckpointQuota) -> Result<(), CowshedError>;
+    pub async fn doctor(&self) -> Result<DoctorReport, CowshedError>;
     /// Hand a worker a capability scoped to exactly one workspace.
     pub async fn worker(&self, ws: &str) -> Result<WorkspaceHandle, CowshedError>;
 }
+```
 
 `Coordinator::land` fast-forwards a real `refs/heads/<target_branch>`, not a hidden integration ref. When that target
 branch is checked out in the main workspace, the operation updates the checked-out branch through the main workspace so
@@ -397,12 +424,15 @@ checked out by an unmanaged linked worktree is refused rather than leaving that 
 revalidated under the target lock immediately before the fast-forward. A mismatch or non-fast-forward retains the source
 workspace and leaves the target branch and visible working state unchanged.
 
+```rust
 /// A worker's capability: it can run and observe work in *its* workspace and hand results
 /// back, but it can never widen its own sandbox or touch another workspace. Escalation is
 /// the coordinator's job. This is the type a subagent receives; it carries no grant mutation.
-pub struct WorkspaceHandle { /* exactly one workspace, non-escalating worker capability */ }
+pub struct WorkspaceHandle {
+    /* WorkspaceRef snapshot + immutable repo/workspace/incarnation fence + actor sender */
+}
 impl WorkspaceHandle {
-    pub fn name(&self) -> &str;
+    pub fn name(&self) -> &WorkspaceName;
     pub fn mount_path(&self) -> &Path;
     pub async fn exec(&self, req: ExecRequest) -> Result<JobHandle, CowshedError>;
     pub async fn shell(&self, session: Option<&str>) -> Result<Session, CowshedError>;
@@ -427,19 +457,19 @@ pub struct CheckpointOptions {
 `PushOptions` and `PushReport` make preservation and retry safety explicit:
 
 ```rust
-pub enum ExpectedRefHead { Missing, Oid(Oid) }
+pub enum ExpectedRefHead { Missing, Oid(GitOid) }
 
 pub struct PushOptions {
     pub branch: Option<String>,
-    pub expected_workspace_incarnation: Option<[u8; 16]>,
-    pub expected_source_head: Option<Oid>,
+    pub expected_workspace_incarnation: Option<WorkspaceIncarnation>,
+    pub expected_source_head: Option<GitOid>,
     pub expected_destination_head: Option<ExpectedRefHead>,
 }
 
 pub struct PushReport {
-    pub source_head: Oid,
+    pub source_head: GitOid,
     pub destination_ref: String,
-    pub previous_destination_head: Option<Oid>,
+    pub previous_destination_head: Option<GitOid>,
 }
 ```
 
@@ -548,9 +578,10 @@ reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission 
   prefix is `commitment_kind,commitment_version,commitment_order,repo_id`; it never contains payload/path/summary
   fields.
 - `RevisionTarget` projects as an exact one-key object `{branch}`, `{ref}`, or `{oid}` and rejects ambiguous/multi-key
-  objects. Branch and fully-qualified ref values use validated `BranchName` / `GitRef` domains; raw invalid strings
-  cannot be serialized. `ExpectedRefHead` projects as `{missing:true}` or `{oid}`. Oids are validated lowercase 40- or
-  64-hex strings.
+  objects. `RevisionTarget::parse_cli` classifies lowercase 40/64-hex first as `GitOid`, then any `refs/...` input as a
+  validated `GitRef`, and otherwise as a validated `BranchName`. Invalid values return `DtoError`; git rev expressions
+  such as `HEAD~1` never fall back to another resolver. `ExpectedRefHead` projects as `{missing:true}` or `{oid}`. Oids
+  are validated lowercase 40- or 64-hex strings.
 - `AdoptOptions = { path?, capacity?, quarantine, imageFormat? }`;
   `CreateOptions = { revision?, fromWorkspace?, browse, slot? }`; `AttachOptions = { browse }`;
   `RemoveOptions = { force }`; `GcOptions = { dryRun }`; `RebaseOptions`, `LandOptions`, and `PushOptions` use the
@@ -579,7 +610,7 @@ batches; discarding an incomplete trailing batch is successful recovery with a s
 Types for the warm-shell layer (11_shell.md); `WorkspaceHandle::shell`/`list_jobs` return these.
 
 ```rust
-pub struct Session { /* supervisor connection, named or anonymous */ }
+pub struct Session { /* immutable fence + exact optional session identity + actor sender */ }
 impl Session {
     pub async fn run(&self, req: ExecRequest) -> Result<JobHandle, CowshedError>;  // allocates a JobId
     pub async fn background(&self, req: ExecRequest) -> Result<JobHandle, CowshedError>;
@@ -589,6 +620,10 @@ impl Session {
 
 /// Session uses the protected/controller record DTOs defined in the frozen API block above.
 ```
+
+`WorkspaceHandle::exec` sends `"session": null`, the canonical direct-exec shape. `Session::run` and
+`Session::background` share the same exec helper and send the session's exact optional identity in `worker.exec`;
+`Session::close` uses the same identity and immutable repo/workspace/incarnation fence.
 
 `JobArtifactRecord` is the protected content record consumed by CLI, MCP, NAPI, and CI. It is not the richer `JobInfo`:
 the latter remains the live/result API projection. Record and commitment constructors, serializers, and deserializers

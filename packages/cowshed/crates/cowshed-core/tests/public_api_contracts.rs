@@ -51,6 +51,16 @@ fn stream(path: &str, bytes: u64, text: &str) -> StreamInfo {
 }
 
 #[test]
+fn workspace_snapshot_accessors_are_public_and_consuming_projections_are_owned() {
+    let _: for<'a> fn(&'a WorkspaceRef) -> &'a WorkspaceInfo = WorkspaceRef::info;
+    let _: for<'a> fn(&'a WorkspaceRef) -> &'a GrantSet = WorkspaceRef::grants;
+    let _: for<'a> fn(&'a WorkspaceRef) -> (&'a WorkspaceInfo, &'a GrantSet) =
+        WorkspaceRef::snapshot;
+    let _: fn(WorkspaceRef) -> WorkspaceInfo = WorkspaceRef::into_info;
+    let _: fn(WorkspaceRef) -> (WorkspaceInfo, GrantSet) = WorkspaceRef::into_snapshot;
+}
+
+#[test]
 fn job_id_and_path_domain_types_reject_unsafe_values() {
     assert!(JobId::new(0).is_err());
     assert_eq!(JobId::new(MAX_JOB_ID).expect("max id").get(), MAX_JOB_ID);
@@ -379,6 +389,46 @@ fn revision_and_expected_head_unions_are_exact_objects() {
         json!("missing"),
     ] {
         assert!(serde_json::from_value::<ExpectedRefHead>(invalid).is_err());
+    }
+}
+#[test]
+fn cli_revision_parser_has_exact_precedence_and_no_rev_expression_fallback() {
+    let oid40 = "a".repeat(40);
+    let oid64 = "b".repeat(64);
+    assert_eq!(
+        RevisionTarget::parse_cli(&oid40).unwrap(),
+        RevisionTarget::Oid(GitOid::new(oid40).unwrap())
+    );
+    assert_eq!(
+        RevisionTarget::parse_cli(&oid64).unwrap(),
+        RevisionTarget::Oid(GitOid::new(oid64).unwrap())
+    );
+    assert_eq!(
+        RevisionTarget::parse_cli("refs/heads/topic").unwrap(),
+        RevisionTarget::Ref(GitRef::new("refs/heads/topic").unwrap())
+    );
+    assert_eq!(
+        RevisionTarget::parse_cli("main").unwrap(),
+        RevisionTarget::Branch(BranchName::new("main").unwrap())
+    );
+    assert_eq!(
+        RevisionTarget::parse_cli("A".repeat(40)).unwrap(),
+        RevisionTarget::Branch(BranchName::new("A".repeat(40)).unwrap())
+    );
+
+    for invalid in [
+        "",
+        "-topic",
+        "HEAD~1",
+        "main^{tree}",
+        "topic..next",
+        "refs/heads/bad..name",
+        "refs/heads/topic.lock",
+    ] {
+        assert!(
+            RevisionTarget::parse_cli(invalid).is_err(),
+            "accepted {invalid:?}"
+        );
     }
 }
 

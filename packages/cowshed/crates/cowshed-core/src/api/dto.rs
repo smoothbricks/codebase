@@ -1568,6 +1568,23 @@ pub enum RevisionTarget {
     Ref(GitRef),
     Oid(GitOid),
 }
+impl RevisionTarget {
+    /// Parses the exact CLI revision grammar without accepting git rev expressions.
+    pub fn parse_cli(value: impl Into<String>) -> Result<Self, DtoError> {
+        let value = value.into();
+        if matches!(value.len(), 40 | 64)
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            GitOid::new(value).map(Self::Oid)
+        } else if value.starts_with("refs/") {
+            GitRef::new(value).map(Self::Ref)
+        } else {
+            BranchName::new(value).map(Self::Branch)
+        }
+    }
+}
 
 impl Serialize for RevisionTarget {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
