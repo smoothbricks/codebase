@@ -188,7 +188,16 @@ fn is_rfc3339_utc(value: &str) -> bool {
         }
         _ => false,
     };
-    (1..=max_day).contains(&day) && hour <= 23 && minute <= 59 && second <= 60 && fraction_valid
+    let leap_second_valid = second <= 59
+        || (second == 60
+            && hour == 23
+            && minute == 59
+            && matches!((month, day), (6, 30) | (12, 31)));
+    (1..=max_day).contains(&day)
+        && hour <= 23
+        && minute <= 59
+        && leap_second_valid
+        && fraction_valid
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -660,8 +669,7 @@ impl<'de> Deserialize<'de> for JobInfo {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecRecord {
     pub repo_id: RepoId,
     pub workspace_incarnation: WorkspaceIncarnation,
@@ -674,13 +682,135 @@ pub struct ExecRecord {
     pub trace: TraceContext,
     pub started: UtcTimestamp,
     pub duration_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub exit: Option<ExitStatus>,
     pub stdout: StreamInfo,
     pub stderr: StreamInfo,
     pub stdin: StdinInfo,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_limit: Option<OutputLimitInfo>,
+}
+
+impl ExecRecord {
+    pub fn validate(&self) -> Result<(), DtoError> {
+        if matches!(self.state, JobState::Queued | JobState::Running) {
+            return Err(DtoError::InvalidJobProjection(
+                "ExecRecord must contain a terminal job state",
+            ));
+        }
+        if matches!(self.state, JobState::OutputLimit) != self.output_limit.is_some() {
+            return Err(DtoError::InvalidJobProjection(
+                "outputLimit must be present exactly for the outputLimit state",
+            ));
+        }
+        match (&self.state, &self.exit) {
+            (JobState::Exited, Some(ExitStatus::Exited { .. }))
+            | (JobState::Signaled | JobState::Killed, Some(ExitStatus::Signaled { .. }))
+            | (JobState::OutputLimit | JobState::Failed, _) => Ok(()),
+            _ => Err(DtoError::InvalidJobProjection(
+                "exit kind does not agree with exec record state",
+            )),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecRecordRef<'a> {
+    repo_id: &'a RepoId,
+    workspace_incarnation: &'a WorkspaceIncarnation,
+    job_id: JobId,
+    state: JobState,
+    argv: &'a [String],
+    cwd: &'a WorkspacePath,
+    env_hash: u64,
+    grant_revision: u64,
+    trace: &'a TraceContext,
+    started: &'a UtcTimestamp,
+    duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit: Option<&'a ExitStatus>,
+    stdout: &'a StreamInfo,
+    stderr: &'a StreamInfo,
+    stdin: &'a StdinInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_limit: Option<&'a OutputLimitInfo>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExecRecordWire {
+    repo_id: RepoId,
+    workspace_incarnation: WorkspaceIncarnation,
+    job_id: JobId,
+    state: JobState,
+    argv: Vec<String>,
+    cwd: WorkspacePath,
+    env_hash: u64,
+    grant_revision: u64,
+    trace: TraceContext,
+    started: UtcTimestamp,
+    duration_ms: u64,
+    exit: Option<ExitStatus>,
+    stdout: StreamInfo,
+    stderr: StreamInfo,
+    stdin: StdinInfo,
+    output_limit: Option<OutputLimitInfo>,
+}
+
+impl Serialize for ExecRecord {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        ExecRecordRef {
+            repo_id: &self.repo_id,
+            workspace_incarnation: &self.workspace_incarnation,
+            job_id: self.job_id,
+            state: self.state,
+            argv: &self.argv,
+            cwd: &self.cwd,
+            env_hash: self.env_hash,
+            grant_revision: self.grant_revision,
+            trace: &self.trace,
+            started: &self.started,
+            duration_ms: self.duration_ms,
+            exit: self.exit.as_ref(),
+            stdout: &self.stdout,
+            stderr: &self.stderr,
+            stdin: &self.stdin,
+            output_limit: self.output_limit.as_ref(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExecRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ExecRecordWire::deserialize(deserializer)?;
+        let value = Self {
+            repo_id: wire.repo_id,
+            workspace_incarnation: wire.workspace_incarnation,
+            job_id: wire.job_id,
+            state: wire.state,
+            argv: wire.argv,
+            cwd: wire.cwd,
+            env_hash: wire.env_hash,
+            grant_revision: wire.grant_revision,
+            trace: wire.trace,
+            started: wire.started,
+            duration_ms: wire.duration_ms,
+            exit: wire.exit,
+            stdout: wire.stdout,
+            stderr: wire.stderr,
+            stdin: wire.stdin,
+            output_limit: wire.output_limit,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 pub enum StdinSource {
