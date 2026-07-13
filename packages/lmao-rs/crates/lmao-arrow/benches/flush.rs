@@ -81,17 +81,17 @@ fn build_flush_input(spans: usize, logs: usize) -> Vec<MockSpan> {
                 parent: None,
             });
             let mut timestamps = vec![0, 1];
-            let mut entry_types = vec![1u8, 2];
+            let mut packed_headers = vec![1u32, 2];
             let mut messages = vec![Some(format!("span-{}", s % 8)), None];
             for i in 0..logs {
                 timestamps.push(2 + i as i64);
-                entry_types.push(5);
+                packed_headers.push(8);
                 messages.push(Some(format!("user {{id}} did thing number {}", i % 64)));
             }
             MockSpan {
                 identity,
                 timestamps,
-                entry_types,
+                packed_headers,
                 messages,
                 overflow: None,
                 children: vec![],
