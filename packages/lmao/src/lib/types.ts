@@ -161,6 +161,12 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   /** Immutable cold-path output remapping attached to this canonical buffer. */
   _remapDescriptor?: import('./logBinding.js').RemapDescriptor;
 
+  /** Whether this physical segment has contributed its rows to shared stats. */
+  _statsSealed: boolean;
+
+  /** Lifecycle rows excluded when this physical segment is sealed (2 for first segment, 0 for overflow). */
+  _statsReservedRows: number;
+
   // ===========================================================================
   // Identity Getters (read from _identity bytes)
   // ===========================================================================
@@ -399,6 +405,12 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
    * @returns The overflow buffer (existing or newly created)
    */
   getOrCreateOverflow(): AnySpanBuffer;
+
+  /** Account this physical segment's completed rows exactly once. */
+  _sealStats(): void;
+
+  /** Account every physical segment in this logical span's overflow chain exactly once. */
+  _sealStatsChain(): void;
 
   /**
    * Check if this span is a parent of another span.
