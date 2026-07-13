@@ -853,7 +853,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     .map_err(|error| io_error("read checkpoint age", &image, error))?;
                 checkpoints.push((modified, image, format, fact));
             }
-            checkpoints.sort_by(|left, right| right.0.cmp(&left.0));
+            checkpoints.sort_by_key(|right| std::cmp::Reverse(right.0));
             for (index, (modified, image, format, fact)) in checkpoints.into_iter().enumerate() {
                 report.examined += 1;
                 if fact.pin == "pinned" {
