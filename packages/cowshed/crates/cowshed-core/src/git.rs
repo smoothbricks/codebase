@@ -315,12 +315,13 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::process::{Command, ExitStatus, Output};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::GitRepository;
+    use super::{GitRepository, ensure_git_success, git_message};
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
     fn repository() -> PathBuf {
@@ -371,6 +372,72 @@ mod tests {
             .expect("run git commit");
         assert!(status.success());
         root
+    }
+
+    fn command_output(exit_code: i32, stderr: &[u8]) -> Output {
+        Output {
+            status: ExitStatus::from_raw(exit_code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_head_has_no_current_branch() {
+        let root = repository();
+        let status = Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&root)
+            .args(["switch", "--detach", "--quiet", "HEAD"])
+            .status()
+            .expect("detach HEAD");
+        assert!(status.success());
+
+        let branch = GitRepository::from_root(&root)
+            .current_branch()
+            .await
+            .expect("detached HEAD is not an error");
+        assert_eq!(branch, None);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn current_branch_propagates_unexpected_git_failure() {
+        let root = repository();
+        let missing_root = root.join("missing");
+        let error = GitRepository::from_root(&missing_root)
+            .current_branch()
+            .await
+            .expect_err("invalid repository root must fail");
+
+        assert_eq!(error.code.as_str(), "internal");
+        assert!(error.message.starts_with("failed to read current branch:"));
+        assert!(!error.message.ends_with(':'));
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn ensure_git_success_propagates_failure_message_and_hint() {
+        ensure_git_success("update reference", command_output(0, b""))
+            .expect("successful git command");
+
+        let error = ensure_git_success("update reference", command_output(7, b"  locked ref\n"))
+            .expect_err("failed git command");
+        assert_eq!(error.code.as_str(), "conflict");
+        assert_eq!(error.message, "failed to update reference: locked ref");
+        assert_eq!(
+            error.hint,
+            "resolve the git conflict and retry the cowshed command"
+        );
+    }
+
+    #[test]
+    fn git_failure_message_uses_status_when_stderr_is_empty() {
+        let output = command_output(9, b" \n\t");
+        assert_eq!(
+            git_message("read object", &output),
+            "failed to read object (git status exit status: 9)"
+        );
     }
 
     #[tokio::test]

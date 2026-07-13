@@ -107,8 +107,7 @@ fn validate_copy_roots(source: &Path, destination: &Path) -> Result<(PathBuf, Pa
             "cowshed adopt <git-root>",
         ));
     }
-    if source == destination || destination.starts_with(&source) || source.starts_with(&destination)
-    {
+    if destination.starts_with(&source) || source.starts_with(&destination) {
         return Err(CowshedError::conflict(
             "adopt copy roots overlap",
             "choose a cowshed store outside the repository tree",
@@ -150,7 +149,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{copy_with_budget, parse_changes};
+    use super::{copy_with_budget, parse_changes, validate_copy_roots};
 
     fn temp_root(label: &str) -> PathBuf {
         let suffix = SystemTime::now()
@@ -200,15 +199,53 @@ mod tests {
         fs::remove_dir_all(destination).expect("remove destination");
     }
 
-    #[tokio::test]
-    async fn rejects_overlapping_roots() {
-        let source = temp_root("overlap");
-        let destination = source.join("child");
-        fs::create_dir(&destination).expect("create child");
-        let error = copy_with_budget(&source, &destination, 2)
-            .await
-            .expect_err("overlap must fail");
-        assert_eq!(error.code.as_str(), "conflict");
-        fs::remove_dir_all(source).expect("remove source");
+    #[test]
+    fn rejects_each_overlapping_root_boundary_and_accepts_disjoint_roots() {
+        let root = temp_root("root-boundaries");
+        let source = root.join("source");
+        let source_child = source.join("child");
+        let destination = root.join("destination");
+        fs::create_dir(&source).expect("create source");
+        fs::create_dir(&source_child).expect("create source child");
+        fs::create_dir(&destination).expect("create destination");
+
+        for (candidate_source, candidate_destination) in [
+            (&source, &source),
+            (&source, &source_child),
+            (&source_child, &source),
+        ] {
+            let error = validate_copy_roots(candidate_source, candidate_destination)
+                .expect_err("overlapping roots must fail");
+            assert_eq!(error.code.as_str(), "conflict");
+        }
+
+        let (canonical_source, canonical_destination) =
+            validate_copy_roots(&source, &destination).expect("siblings are disjoint");
+        assert_eq!(
+            canonical_source,
+            source.canonicalize().expect("source root")
+        );
+        assert_eq!(
+            canonical_destination,
+            destination.canonicalize().expect("destination root")
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn rejects_either_copy_root_when_it_is_not_a_directory() {
+        let root = temp_root("file-boundaries");
+        let directory = root.join("directory");
+        let file = root.join("file");
+        fs::create_dir(&directory).expect("create directory");
+        fs::write(&file, b"not a directory").expect("create file");
+
+        for (candidate_source, candidate_destination) in [(&file, &directory), (&directory, &file)]
+        {
+            let error = validate_copy_roots(candidate_source, candidate_destination)
+                .expect_err("both roots must be directories");
+            assert_eq!(error.code.as_str(), "usage");
+        }
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 }
