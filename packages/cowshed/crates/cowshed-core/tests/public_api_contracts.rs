@@ -1,6 +1,6 @@
 use cowshed_core::api::*;
 use cowshed_core::{CowshedError, ErrorCode};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -65,17 +65,26 @@ fn job_id_and_path_domain_types_reject_unsafe_values() {
     assert!(GitOid::new("a".repeat(39)).is_err());
     assert!(GitOid::new("a".repeat(40)).is_ok());
     assert!(GitOid::new("b".repeat(64)).is_ok());
-    assert!(UtcTimestamp::new("2024-02-29T23:59:59.123Z").is_ok());
+    for valid in [
+        "2024-02-29T23:59:59.123Z",
+        "2026-12-31T23:59:60Z",
+        "2026-07-11T12:34:56+05:30",
+        "2026-07-11T12:34:56-00:00",
+    ] {
+        assert!(UtcTimestamp::new(valid).is_ok(), "rejected {valid}");
+    }
     for invalid in [
         "2023-02-29T00:00:00Z",
         "2026-13-01T00:00:00Z",
         "2026-01-01T24:00:00Z",
-        "2026-01-01T00:00:60Z",
+        "2026-01-01T00:00:61Z",
         "2026-01-01 00:00:00Z",
-        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T00:00:00+24:00",
     ] {
         assert!(UtcTimestamp::new(invalid).is_err(), "accepted {invalid}");
     }
+    assert!(TraceId::new("0".repeat(32)).is_err());
+    assert!(SpanId::new("0".repeat(16)).is_err());
 }
 
 #[test]
@@ -254,9 +263,11 @@ fn output_limit_is_an_explicit_terminal_projection() {
     info.validate().expect("valid output-limit projection");
     assert_eq!(info.state, JobState::OutputLimit);
     assert_eq!(info.output_limit.as_ref().unwrap().crossing_bytes, 1025);
+    let mut invalid = info.clone();
+    invalid.output_limit = None;
+    assert!(serde_json::to_value(invalid).is_err());
     value.as_object_mut().unwrap().remove("outputLimit");
-    let decoded: JobInfo = serde_json::from_value(value).expect("shape decoding");
-    assert!(decoded.validate().is_err());
+    assert!(serde_json::from_value::<JobInfo>(value).is_err());
 }
 
 #[test]
@@ -270,24 +281,38 @@ fn grant_platform_union_omits_linux_port_block() {
         serde_json::to_value(macos).unwrap()["portBlock"],
         json!({"base":40960,"size":16})
     );
+    let block: PortBlock =
+        serde_json::from_value(json!({"base":40960,"size":16})).expect("valid port block");
+    assert_eq!((block.base(), block.size()), (40960, 16));
+    for invalid in [
+        json!({"base":40960,"size":0}),
+        json!({"base":40960,"size":15}),
+        json!({"base":65530,"size":16}),
+        json!({"base":40960,"size":16,"extra":true}),
+    ] {
+        assert!(serde_json::from_value::<PortBlock>(invalid).is_err());
+    }
 }
 
 #[test]
 fn revision_and_expected_head_unions_are_exact_objects() {
     assert_eq!(
-        serde_json::to_value(RevisionTarget::Branch {
-            branch: "main".into()
-        })
-        .unwrap(),
+        serde_json::to_value(RevisionTarget::Branch(BranchName::new("main").unwrap())).unwrap(),
         json!({"branch":"main"})
     );
     assert_eq!(
-        serde_json::to_value(RevisionTarget::Ref {
-            git_ref: "refs/tags/v1".into()
-        })
-        .unwrap(),
+        serde_json::to_value(RevisionTarget::Ref(GitRef::new("refs/tags/v1").unwrap(),)).unwrap(),
         json!({"ref":"refs/tags/v1"})
     );
+    for invalid in [
+        json!({"branch":"-topic"}),
+        json!({"branch":"topic","ref":"refs/heads/topic"}),
+        json!({"ref":"heads/topic"}),
+        json!({"ref":"refs/heads/bad..name"}),
+        json!("main"),
+    ] {
+        assert!(serde_json::from_value::<RevisionTarget>(invalid).is_err());
+    }
     assert_eq!(
         serde_json::to_value(ExpectedRefHead::Missing).unwrap(),
         json!({"missing":true})
@@ -319,7 +344,7 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
     );
     assert_eq!(
         serde_json::to_value(CreateOptions {
-            revision: Some(RevisionTarget::Oid { oid: oid('a') }),
+            revision: Some(RevisionTarget::Oid(oid('a'))),
             from_workspace: Some(workspace()),
             browse: false,
             slot: Some(2),
@@ -365,9 +390,7 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
     assert_eq!(serde_json::to_value(grant_delta).unwrap(), json!({}));
 
     let rebase = RebaseOptions {
-        onto: Some(RevisionTarget::Branch {
-            branch: "main".into(),
-        }),
+        onto: Some(RevisionTarget::Branch(BranchName::new("main").unwrap())),
         fresh: true,
         expected_workspace_incarnation: Some(incarnation()),
         expected_source_head: Some(oid('a')),
@@ -445,7 +468,7 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
 
 #[test]
 fn json_envelope_has_exact_discriminated_success_and_failure_shapes() {
-    let success = JsonEnvelope::Success(MountResult {
+    let success = JsonEnvelope::success(MountResult {
         workspace: workspace(),
         mount: PathBuf::from("/mnt/raven"),
         base_commit: Some(oid('a')),
@@ -455,11 +478,11 @@ fn json_envelope_has_exact_discriminated_success_and_failure_shapes() {
         json!({"ok":true,"result":{"workspace":"raven","mount":"/mnt/raven","baseCommit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}})
     );
     assert_eq!(
-        serde_json::to_value(JsonEnvelope::Success(EmptyResult {})).unwrap(),
+        serde_json::to_value(JsonEnvelope::success(EmptyResult {})).unwrap(),
         json!({"ok":true,"result":{}})
     );
 
-    let failure: JsonEnvelope<EmptyResult> = JsonEnvelope::Failure(CowshedError::new(
+    let failure: JsonEnvelope<EmptyResult> = JsonEnvelope::failure(CowshedError::new(
         ErrorCode::Conflict,
         "workspace raven already exists",
         "cowshed ls",
@@ -478,7 +501,7 @@ fn json_envelope_has_exact_discriminated_success_and_failure_shapes() {
         json!({"ok":true,"result":{},"cmd":"new"}),
         json!({"ok":"true","result":{}}),
     ] {
-        assert!(serde_json::from_value::<JsonEnvelope<Value>>(invalid).is_err());
+        assert!(serde_json::from_value::<JsonEnvelope<EmptyResult>>(invalid).is_err());
     }
 }
 
@@ -498,26 +521,47 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
     fs::write(
         root.join("Cargo.toml"),
         format!(
-            "[package]\nname = \"cowshed-capability-negative\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\ncowshed-core = {{ path = {:?} }}\n",
+            "[package]\nname = \"cowshed-capability-negative\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\ncowshed-core = {{ path = {:?} }}\nserde = \"1\"\n",
             manifest_dir
         ),
     )
     .expect("compile-fail manifest");
-    let cases = [
+    let cases: [(&str, &str, &[&str]); 5] = [
         (
-            "project_grant",
-            "use cowshed_core::Project;\nfn deny(value: &Project) { value.grant(\"raven\"); }\nfn main() {}\n",
-            "grant",
+            "project_authority",
+            "use cowshed_core::Project;\nfn deny(value: &Project) { value.attach(); value.exec(); value.grant(); value.gc(); }\nfn main() {}\n",
+            &["attach", "exec", "grant", "gc"],
         ),
         (
-            "worker_gc",
-            "use cowshed_core::WorkspaceHandle;\nfn deny(value: &WorkspaceHandle) { value.gc(); }\nfn main() {}\n",
-            "gc",
+            "worker_authority",
+            "use cowshed_core::WorkspaceHandle;\nfn deny(value: &WorkspaceHandle) { value.grant(); value.revoke(); value.restore(); value.destroy(); value.rebase(); value.land(); value.gc(); value.repo_mirror(); value.detach(); value.workspace(\"other\"); }\nfn main() {}\n",
+            &[
+                "grant",
+                "revoke",
+                "restore",
+                "destroy",
+                "rebase",
+                "land",
+                "gc",
+                "repo_mirror",
+                "detach",
+                "workspace",
+            ],
         ),
         (
-            "token_default",
-            "use cowshed_core::CoordinatorToken;\nfn main() { let _ = CoordinatorToken::default(); }\n",
-            "default",
+            "token_traits",
+            "use cowshed_core::CoordinatorToken;\nfn must_clone<T: Clone>() {} fn must_serialize<T: serde::Serialize>() {}\nfn main() { must_clone::<CoordinatorToken>(); must_serialize::<CoordinatorToken>(); }\n",
+            &["Clone", "Serialize"],
+        ),
+        (
+            "private_construction",
+            "use cowshed_core::{CoordinatorToken,Cowshed,Project,WorkspaceHandle};\nfn main() { let _ = Cowshed {}; let _ = Project {}; let _ = WorkspaceHandle {}; let _ = CoordinatorToken {}; }\n",
+            &["Cowshed", "Project", "WorkspaceHandle", "CoordinatorToken"],
+        ),
+        (
+            "null_success",
+            "use cowshed_core::api::JsonEnvelope;\nfn main() { let _ = JsonEnvelope::success(()); }\n",
+            &["ResultBody"],
         ),
     ];
     for (name, source, expected) in cases {
@@ -530,10 +574,12 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
             .expect("run cargo check");
         assert!(!output.status.success(), "{name} unexpectedly compiled");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(expected),
-            "{name} failed for an unrelated reason:\n{stderr}"
-        );
+        for expected in expected {
+            assert!(
+                stderr.contains(expected),
+                "{name} did not fail on {expected}:\n{stderr}"
+            );
+        }
     }
     fs::remove_dir_all(root).expect("remove compile-fail fixtures");
 }
