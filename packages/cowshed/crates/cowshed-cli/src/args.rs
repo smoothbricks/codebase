@@ -68,6 +68,9 @@ pub struct ExecArgs {
     pub session: Option<String>,
     pub timeout: Option<OsString>,
     pub background: bool,
+    pub stdout_copy: Option<PathBuf>,
+    pub stderr_copy: Option<PathBuf>,
+    pub replace_output: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -170,7 +173,12 @@ where
         Some("attach") => CommandName::Attach,
         Some("detach") => CommandName::Detach,
         Some("doctor") => CommandName::Doctor,
-        Some(other) => return Err(UsageError::new(format!("unknown command `{other}`"), "<command>")),
+        Some(other) => {
+            return Err(UsageError::new(
+                format!("unknown command `{other}`"),
+                "<command>",
+            ));
+        }
         None => return Err(UsageError::missing_command()),
     };
     index += 1;
@@ -200,7 +208,10 @@ fn parse_global(
         Some("--project") => {
             *index += 1;
             let value = args.get(*index).ok_or_else(|| {
-                UsageError::new("--project requires a git root", "--project <git-root> <command>")
+                UsageError::new(
+                    "--project requires a git root",
+                    "--project <git-root> <command>",
+                )
             })?;
             global.project = Some(PathBuf::from(value));
         }
@@ -258,12 +269,22 @@ fn parse_new(
             Some("--browse") => browse = true,
             Some("--slot") => {
                 let value = take_value(args, &mut index, "--slot", USAGE)?;
-                let text = value.to_str().ok_or_else(|| UsageError::new("--slot must be an unsigned integer", USAGE))?;
-                slot = Some(text.parse().map_err(|_| UsageError::new("--slot must be an unsigned integer", USAGE))?);
+                let text = value
+                    .to_str()
+                    .ok_or_else(|| UsageError::new("--slot must be an unsigned integer", USAGE))?;
+                slot =
+                    Some(text.parse().map_err(|_| {
+                        UsageError::new("--slot must be an unsigned integer", USAGE)
+                    })?);
             }
             Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
             _ if name.is_none() => name = Some(workspace_name(&args[index], true, USAGE)?),
-            _ => return Err(UsageError::new("new accepts exactly one workspace name", USAGE)),
+            _ => {
+                return Err(UsageError::new(
+                    "new accepts exactly one workspace name",
+                    USAGE,
+                ));
+            }
         }
         index += 1;
     }
@@ -288,11 +309,15 @@ fn parse_path(
     let mut workspace = None;
     let mut no_attach = false;
     while index < args.len() {
-        if parse_global(args, &mut index, global)? { continue; }
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
         match args[index].to_str() {
             Some("--no-attach") => no_attach = true,
             Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ if workspace.is_none() => workspace = Some(workspace_name(&args[index], false, USAGE)?),
+            _ if workspace.is_none() => {
+                workspace = Some(workspace_name(&args[index], false, USAGE)?)
+            }
             _ => return Err(UsageError::new("path accepts exactly one workspace", USAGE)),
         }
         index += 1;
@@ -308,7 +333,7 @@ fn parse_exec(
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "exec <ws> [--stdin | --stdin-file <rel> | --stdin-base64 <data>] [--ro] [--cwd <rel>] [--session <name>] [--timeout <dur>] [--background] -- <cmd…>";
+    const USAGE: &str = "exec <ws> [--stdin | --stdin-file <rel> | --stdin-base64 <data>] [--ro] [--cwd <rel>] [--session <name>] [--timeout <dur>] [--background] [--stdout-copy <rel>] [--stderr-copy <rel>] [--replace-output] -- <cmd...>";
     let mut workspace = None;
     let mut stdin = None;
     let mut read_only = false;
@@ -316,96 +341,191 @@ fn parse_exec(
     let mut session = None;
     let mut timeout = None;
     let mut background = false;
+    let mut stdout_copy = None;
+    let mut stderr_copy = None;
+    let mut replace_output = false;
 
     while index < args.len() {
         if args[index] == OsStr::new("--") {
             index += 1;
             break;
         }
-        if parse_global(args, &mut index, global)? { continue; }
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
         match args[index].to_str() {
             Some("--stdin") => set_stdin(&mut stdin, StdinSource::Stream, USAGE)?,
             Some("--stdin-file") => {
                 let value = take_value(args, &mut index, "--stdin-file", USAGE)?;
-                set_stdin(&mut stdin, StdinSource::WorkspaceFile(PathBuf::from(value)), USAGE)?;
+                set_stdin(
+                    &mut stdin,
+                    StdinSource::WorkspaceFile(PathBuf::from(value)),
+                    USAGE,
+                )?;
             }
             Some("--stdin-base64") => {
                 let value = take_value(args, &mut index, "--stdin-base64", USAGE)?;
                 set_stdin(&mut stdin, StdinSource::InlineBase64(value), USAGE)?;
             }
             Some("--ro") => read_only = true,
-            Some("--cwd") => cwd = Some(PathBuf::from(take_value(args, &mut index, "--cwd", USAGE)?)),
+            Some("--cwd") => {
+                cwd = Some(PathBuf::from(take_value(args, &mut index, "--cwd", USAGE)?))
+            }
             Some("--session") => {
                 let value = take_value(args, &mut index, "--session", USAGE)?;
                 session = Some(workspace_name(&value, false, USAGE)?);
             }
             Some("--timeout") => timeout = Some(take_value(args, &mut index, "--timeout", USAGE)?),
             Some("--background") => background = true,
+            Some("--stdout-copy") => {
+                let value = PathBuf::from(take_value(args, &mut index, "--stdout-copy", USAGE)?);
+                set_output_copy(&mut stdout_copy, value, "--stdout-copy", USAGE)?;
+            }
+            Some("--stderr-copy") => {
+                let value = PathBuf::from(take_value(args, &mut index, "--stderr-copy", USAGE)?);
+                set_output_copy(&mut stderr_copy, value, "--stderr-copy", USAGE)?;
+            }
+            Some("--replace-output") => replace_output = true,
             Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ if workspace.is_none() => workspace = Some(workspace_name(&args[index], false, USAGE)?),
-            _ => return Err(UsageError::new("exec requires `--` before the child argv", USAGE)),
+            _ if workspace.is_none() => {
+                workspace = Some(workspace_name(&args[index], false, USAGE)?)
+            }
+            _ => {
+                return Err(UsageError::new(
+                    "exec requires `--` before the child argv",
+                    USAGE,
+                ));
+            }
         }
         index += 1;
     }
     let workspace = workspace.ok_or_else(|| UsageError::new("exec requires a workspace", USAGE))?;
     if index == 0 || args.get(index.wrapping_sub(1)) != Some(&OsString::from("--")) {
-        return Err(UsageError::new("exec requires `--` before the child argv", USAGE));
+        return Err(UsageError::new(
+            "exec requires `--` before the child argv",
+            USAGE,
+        ));
+    }
+    if replace_output && stdout_copy.is_none() && stderr_copy.is_none() {
+        return Err(UsageError::new(
+            "--replace-output requires --stdout-copy or --stderr-copy",
+            USAGE,
+        ));
     }
     args.drain(..index);
     let argv = std::mem::take(args);
     if argv.is_empty() {
-        return Err(UsageError::new("exec requires a child command after `--`", USAGE));
+        return Err(UsageError::new(
+            "exec requires a child command after `--`",
+            USAGE,
+        ));
     }
-    Ok(Command::Exec(ExecArgs { workspace, argv, stdin, read_only, cwd, session, timeout, background }))
+    Ok(Command::Exec(ExecArgs {
+        workspace,
+        argv,
+        stdin,
+        read_only,
+        cwd,
+        session,
+        timeout,
+        background,
+        stdout_copy,
+        stderr_copy,
+        replace_output,
+    }))
 }
 
-fn parse_remove(args: &[OsString], mut index: usize, global: &mut GlobalOptions) -> Result<Command, UsageError> {
+fn parse_remove(
+    args: &[OsString],
+    mut index: usize,
+    global: &mut GlobalOptions,
+) -> Result<Command, UsageError> {
     const USAGE: &str = "rm <ws> [--force]";
     let mut workspace = None;
     let mut force = false;
     while index < args.len() {
-        if parse_global(args, &mut index, global)? { continue; }
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
         match args[index].to_str() {
             Some("--force") => force = true,
             Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ if workspace.is_none() => workspace = Some(workspace_name(&args[index], false, USAGE)?),
+            _ if workspace.is_none() => {
+                workspace = Some(workspace_name(&args[index], false, USAGE)?)
+            }
             _ => return Err(UsageError::new("rm accepts exactly one workspace", USAGE)),
         }
         index += 1;
     }
-    Ok(Command::Remove(RemoveArgs { workspace: workspace.ok_or_else(|| UsageError::new("rm requires a workspace", USAGE))?, force }))
+    Ok(Command::Remove(RemoveArgs {
+        workspace: workspace.ok_or_else(|| UsageError::new("rm requires a workspace", USAGE))?,
+        force,
+    }))
 }
 
-fn parse_attach(args: &[OsString], mut index: usize, global: &mut GlobalOptions) -> Result<Command, UsageError> {
+fn parse_attach(
+    args: &[OsString],
+    mut index: usize,
+    global: &mut GlobalOptions,
+) -> Result<Command, UsageError> {
     const USAGE: &str = "attach <ws> [--browse]";
     let mut workspace = None;
     let mut browse = false;
     while index < args.len() {
-        if parse_global(args, &mut index, global)? { continue; }
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
         match args[index].to_str() {
             Some("--browse") => browse = true,
             Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ if workspace.is_none() => workspace = Some(workspace_name(&args[index], false, USAGE)?),
-            _ => return Err(UsageError::new("attach accepts exactly one workspace", USAGE)),
+            _ if workspace.is_none() => {
+                workspace = Some(workspace_name(&args[index], false, USAGE)?)
+            }
+            _ => {
+                return Err(UsageError::new(
+                    "attach accepts exactly one workspace",
+                    USAGE,
+                ));
+            }
         }
         index += 1;
     }
-    Ok(Command::Attach(AttachArgs { workspace: workspace.ok_or_else(|| UsageError::new("attach requires a workspace", USAGE))?, browse }))
+    Ok(Command::Attach(AttachArgs {
+        workspace: workspace
+            .ok_or_else(|| UsageError::new("attach requires a workspace", USAGE))?,
+        browse,
+    }))
 }
 
-fn parse_detach(args: &[OsString], mut index: usize, global: &mut GlobalOptions) -> Result<Command, UsageError> {
+fn parse_detach(
+    args: &[OsString],
+    mut index: usize,
+    global: &mut GlobalOptions,
+) -> Result<Command, UsageError> {
     const USAGE: &str = "detach <ws>";
     let mut workspace = None;
     while index < args.len() {
-        if parse_global(args, &mut index, global)? { continue; }
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
         match args[index].to_str() {
             Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ if workspace.is_none() => workspace = Some(workspace_name(&args[index], false, USAGE)?),
-            _ => return Err(UsageError::new("detach accepts exactly one workspace", USAGE)),
+            _ if workspace.is_none() => {
+                workspace = Some(workspace_name(&args[index], false, USAGE)?)
+            }
+            _ => {
+                return Err(UsageError::new(
+                    "detach accepts exactly one workspace",
+                    USAGE,
+                ));
+            }
         }
         index += 1;
     }
-    Ok(Command::Detach(DetachArgs { workspace: workspace.ok_or_else(|| UsageError::new("detach requires a workspace", USAGE))? }))
+    Ok(Command::Detach(DetachArgs {
+        workspace: workspace
+            .ok_or_else(|| UsageError::new("detach requires a workspace", USAGE))?,
+    }))
 }
 
 fn parse_empty(
@@ -416,36 +536,79 @@ fn parse_empty(
     parsed: Command,
 ) -> Result<Command, UsageError> {
     while index < args.len() {
-        if parse_global(args, &mut index, global)? { continue; }
-        return Err(UsageError::new(format!("{command} accepts no arguments"), command));
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
+        return Err(UsageError::new(
+            format!("{command} accepts no arguments"),
+            command,
+        ));
     }
     Ok(parsed)
 }
 
-fn take_value(args: &[OsString], index: &mut usize, option: &str, usage: &'static str) -> Result<OsString, UsageError> {
+fn take_value(
+    args: &[OsString],
+    index: &mut usize,
+    option: &str,
+    usage: &'static str,
+) -> Result<OsString, UsageError> {
     *index += 1;
-    args.get(*index).cloned().ok_or_else(|| UsageError::new(format!("{option} requires a value"), usage))
+    args.get(*index)
+        .cloned()
+        .ok_or_else(|| UsageError::new(format!("{option} requires a value"), usage))
 }
 
-fn set_stdin(target: &mut Option<StdinSource>, value: StdinSource, usage: &'static str) -> Result<(), UsageError> {
+fn set_stdin(
+    target: &mut Option<StdinSource>,
+    value: StdinSource,
+    usage: &'static str,
+) -> Result<(), UsageError> {
     if target.is_some() {
-        return Err(UsageError::new("--stdin, --stdin-file, and --stdin-base64 conflict", usage));
+        return Err(UsageError::new(
+            "--stdin, --stdin-file, and --stdin-base64 conflict",
+            usage,
+        ));
     }
     *target = Some(value);
     Ok(())
 }
+fn set_output_copy(
+    target: &mut Option<PathBuf>,
+    value: PathBuf,
+    option: &str,
+    usage: &'static str,
+) -> Result<(), UsageError> {
+    if target.replace(value).is_some() {
+        return Err(UsageError::new(
+            format!("{option} may only be specified once"),
+            usage,
+        ));
+    }
+    Ok(())
+}
 
-fn workspace_name(value: &OsStr, reserve_main: bool, usage: &'static str) -> Result<String, UsageError> {
+fn workspace_name(
+    value: &OsStr,
+    reserve_main: bool,
+    usage: &'static str,
+) -> Result<String, UsageError> {
     let Some(value) = value.to_str() else {
         return Err(UsageError::new("workspace names must be UTF-8", usage));
     };
     let valid = !value.is_empty()
         && value.len() <= 64
         && (value.as_bytes()[0].is_ascii_lowercase() || value.as_bytes()[0].is_ascii_digit())
-        && value.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
     if !valid || (reserve_main && value == "main") {
         return Err(UsageError::new(
-            if reserve_main && value == "main" { "workspace name `main` is reserved" } else { "workspace names must match [a-z0-9][a-z0-9-]{0,63}" },
+            if reserve_main && value == "main" {
+                "workspace name `main` is reserved"
+            } else {
+                "workspace names must match [a-z0-9][a-z0-9-]{0,63}"
+            },
             usage,
         ));
     }
@@ -455,7 +618,6 @@ fn workspace_name(value: &OsStr, reserve_main: bool, usage: &'static str) -> Res
 fn unknown_flag(flag: &str, usage: &'static str) -> UsageError {
     UsageError::new(format!("unknown flag `{flag}`"), usage)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -476,8 +638,17 @@ mod tests {
         {
             use std::os::unix::ffi::{OsStrExt, OsStringExt};
             let opaque = OsString::from_vec(vec![b'f', 0x80, b'o']);
-            let cli = parse_args(vec![OsString::from("exec"), OsString::from("raven"), OsString::from("--"), opaque.clone(), OsString::from("--json")]).unwrap();
-            let Command::Exec(exec) = cli.command else { panic!("expected exec") };
+            let cli = parse_args(vec![
+                OsString::from("exec"),
+                OsString::from("raven"),
+                OsString::from("--"),
+                opaque.clone(),
+                OsString::from("--json"),
+            ])
+            .unwrap();
+            let Command::Exec(exec) = cli.command else {
+                panic!("expected exec")
+            };
             assert_eq!(exec.argv[0].as_bytes(), opaque.as_bytes());
             assert_eq!(exec.argv[1], "--json");
             assert!(!cli.global.json);
@@ -486,10 +657,86 @@ mod tests {
 
     #[test]
     fn exec_rejects_conflicting_stdin_sources_with_resolving_hint() {
-        let error = parse_args(["exec", "raven", "--stdin", "--stdin-file", "input", "--", "cat"]).unwrap_err();
+        let error = parse_args([
+            "exec",
+            "raven",
+            "--stdin",
+            "--stdin-file",
+            "input",
+            "--",
+            "cat",
+        ])
+        .unwrap_err();
         assert_eq!(error.exit_code(), 2);
         assert!(error.message.contains("conflict"));
         assert!(error.hint.starts_with("cowshed exec <ws>"));
+    }
+
+    #[test]
+    fn exec_parses_explicit_output_publication_policy() {
+        let cli = parse_args([
+            "exec",
+            "raven",
+            "--stdout-copy",
+            "artifacts/stdout.log",
+            "--stderr-copy",
+            "artifacts/stderr.log",
+            "--replace-output",
+            "--",
+            "build",
+        ])
+        .unwrap();
+        let Command::Exec(exec) = cli.command else {
+            panic!("expected exec")
+        };
+
+        assert_eq!(
+            exec.stdout_copy.as_deref(),
+            Some(std::path::Path::new("artifacts/stdout.log"))
+        );
+        assert_eq!(
+            exec.stderr_copy.as_deref(),
+            Some(std::path::Path::new("artifacts/stderr.log"))
+        );
+        assert!(exec.replace_output);
+    }
+
+    #[test]
+    fn output_publication_defaults_to_create_new_and_rejects_duplicates() {
+        let cli = parse_args([
+            "exec",
+            "raven",
+            "--stdout-copy",
+            "artifacts/stdout.log",
+            "--",
+            "build",
+        ])
+        .unwrap();
+        let Command::Exec(exec) = cli.command else {
+            panic!("expected exec")
+        };
+        assert!(!exec.replace_output);
+
+        let duplicate = parse_args([
+            "exec",
+            "raven",
+            "--stdout-copy",
+            "one",
+            "--stdout-copy",
+            "two",
+            "--",
+            "build",
+        ])
+        .unwrap_err();
+        assert!(duplicate.message.contains("only be specified once"));
+    }
+
+    #[test]
+    fn replace_output_requires_one_publication_destination() {
+        let error = parse_args(["exec", "raven", "--replace-output", "--", "build"]).unwrap_err();
+
+        assert!(error.message.contains("requires"));
+        assert_eq!(error.exit_code(), 2);
     }
 
     #[test]
@@ -506,8 +753,14 @@ mod tests {
         assert_eq!(error.exit_code(), 2);
         assert_eq!(error.kind, UsageErrorKind::MissingCommand);
         let map = error.command_map().unwrap();
-        for command in ["adopt", "new", "ls", "path", "exec", "rm", "attach", "detach", "doctor"] {
-            assert!(map.lines().any(|line| line.trim_start().starts_with(command)), "missing {command}");
+        for command in [
+            "adopt", "new", "ls", "path", "exec", "rm", "attach", "detach", "doctor",
+        ] {
+            assert!(
+                map.lines()
+                    .any(|line| line.trim_start().starts_with(command)),
+                "missing {command}"
+            );
         }
     }
 }

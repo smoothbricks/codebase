@@ -7,6 +7,7 @@ use cowshed_core::{CowshedError, ErrorCode};
 use output::{Output, write_error_envelope, write_success_envelope};
 use serde_json::json;
 use std::path::PathBuf;
+use std::process::Command;
 
 #[test]
 fn success_and_failure_are_exact_core_envelopes() {
@@ -68,4 +69,47 @@ fn bare_streams_and_records_preserve_machine_bytes() {
     let (stdout, stderr) = output.into_inner();
     assert_eq!(stdout, b"\0raw\n{\"jobId\":7,\"state\":\"running\"}\n");
     assert!(stderr.is_empty());
+}
+
+#[test]
+fn binary_entrypoint_compiles_parser_and_returns_typed_phase_error() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cowshed"))
+        .args(["--json", "exec", "raven", "--", "true"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stderr.is_empty());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "environment-missing");
+}
+
+#[test]
+fn binary_entrypoint_returns_usage_and_command_map() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cowshed"))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("a command is required"));
+    assert!(stderr.contains("commands:"));
+}
+
+#[test]
+fn child_argv_cannot_enable_cli_json_mode() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cowshed"))
+        .args(["exec", "raven", "--", "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("command dispatch is not available")
+    );
 }
