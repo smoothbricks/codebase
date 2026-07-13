@@ -15,7 +15,7 @@
  * Run with: ./run-demo.sh
  */
 
-import { defineLogSchema, defineModule, S } from '@smoothbricks/lmao';
+import { defineLogSchema, defineOpContext, S } from '@smoothbricks/lmao';
 
 // Define schema
 const schema = defineLogSchema({
@@ -25,13 +25,12 @@ const schema = defineLogSchema({
   itemCount: S.number(),
 });
 
-// NO metadata here - the transformer will inject it!
-const module = defineModule({
+const { defineOp } = defineOpContext({
   logSchema: schema,
 });
 
 // Op that demonstrates transformer line number injections
-const _processData = module.op('process-data', async (ctx, userId: string, items: string[]) => {
+const _processData = defineOp('process-data', async (ctx, userId: string, items: string[]) => {
   // These log calls will have .line(N) injected by the transformer
   ctx.log.info('Starting data processing');
   ctx.log.debug('Received items to process');

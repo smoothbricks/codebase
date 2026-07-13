@@ -1,0 +1,123 @@
+{
+  "name": "@smoothbricks/lmao-ttsc",
+  "version": "0.1.6-next.0",
+  "type": "module",
+  "sideEffects": [
+    "./dist/bun-register.js"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./bun": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./bun-register": {
+      "types": "./dist/bun-register.d.ts",
+      "import": "./dist/bun-register.js"
+    },
+    "./ttsc-plugin": {
+      "types": "./plugin.d.cts",
+      "require": "./plugin.cjs",
+      "default": "./plugin.cjs"
+    }
+  },
+  "ttsc": {
+    "plugin": {
+      "transform": "@smoothbricks/lmao-ttsc/ttsc-plugin"
+    }
+  },
+  "files": [
+    "dist",
+    "plugin.cjs",
+    "plugin.d.cts",
+    "plugin",
+    "!**/*.tsbuildinfo"
+  ],
+  "dependencies": {
+    "@ttsc/unplugin": "0.18.4",
+    "ttsc": "^0.18.4",
+    "typescript": "^7.0.2"
+  },
+  "devDependencies": {
+    "@smoothbricks/lmao": "workspace:*",
+    "@smoothbricks/validation": "workspace:*"
+  },
+  "nx": {
+    "sourceRoot": "packages/lmao-ttsc/src",
+    "projectType": "library",
+    "targets": {
+      "lint": {
+        "dependsOn": [
+          "go-vet",
+          "tsc-js",
+          "typecheck",
+          "typecheck-tests"
+        ]
+      },
+      "go-vet": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "{projectRoot}/plugin/**/*.go",
+          "{projectRoot}/plugin/go.mod",
+          "{projectRoot}/scripts/gen-go-work.mjs"
+        ],
+        "options": {
+          "command": "bun ../scripts/gen-go-work.mjs && go vet ./...",
+          "cwd": "{projectRoot}/plugin",
+          "timeoutMs": 600000,
+          "killAfterMs": 10000
+        }
+      },
+      "go-test": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "{projectRoot}/plugin/**/*.go",
+          "{projectRoot}/plugin/go.mod",
+          "{projectRoot}/scripts/gen-go-work.mjs"
+        ],
+        "options": {
+          "command": "bun ../scripts/gen-go-work.mjs && go test ./...",
+          "cwd": "{projectRoot}/plugin",
+          "timeoutMs": 600000,
+          "killAfterMs": 10000
+        }
+      },
+      "test": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "dependsOn": [
+          "go-test"
+        ],
+        "options": {
+          "command": "bun test --timeout=30000 --parallel=3",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 120000,
+          "killAfterMs": 1e4
+        }
+      }
+    },
+    "tags": [
+      "npm:public"
+    ],
+    "name": "lmao-ttsc"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smoothbricks/codebase.git",
+    "directory": "packages/lmao-ttsc"
+  },
+  "scripts": {
+    "test": "nx run lmao-ttsc:test --outputStyle=stream"
+  }
+}
