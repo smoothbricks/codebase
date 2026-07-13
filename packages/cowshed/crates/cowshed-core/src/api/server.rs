@@ -2,7 +2,6 @@ use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::repository::RepoId;
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::num::NonZeroUsize;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -13,6 +12,412 @@ pub const HANDSHAKE_VERSION: u32 = 1;
 pub const MAX_HANDSHAKE_BYTES: usize = 4096;
 pub const MAX_JSON_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_BINARY_FRAME_BYTES: usize = 64 * 1024;
+
+pub(crate) mod codec {
+    use super::{
+        CowshedError, HANDSHAKE_VERSION, MAX_HANDSHAKE_BYTES, MAX_JSON_FRAME_BYTES, RepoId, Value,
+    };
+    use serde::de::DeserializeOwned;
+    use serde::{Deserialize, Serialize};
+    use std::borrow::Cow;
+    use std::fmt;
+    use std::io;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct ClientHelloFields<'a> {
+        version: u32,
+        nonce: Cow<'a, str>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct ServerHelloFields<'a> {
+        version: u32,
+        nonce: Cow<'a, str>,
+        repo_id: Cow<'a, RepoId>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct RpcRequestFields<'a> {
+        id: u64,
+        method: Cow<'a, str>,
+        params: Cow<'a, Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        binary_length: Option<u32>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct RpcResponseFields<'a> {
+        id: u64,
+        ok: bool,
+        result: Option<Cow<'a, Value>>,
+        error: Option<Cow<'a, CowshedError>>,
+        binary_length: Option<u32>,
+    }
+
+    #[derive(Debug)]
+    pub(crate) enum WireCodecError {
+        Empty,
+        TooLarge { maximum: usize },
+        Json(serde_json::Error),
+    }
+
+    impl WireCodecError {
+        pub(crate) const fn is_too_large(&self) -> bool {
+            matches!(self, Self::TooLarge { .. })
+        }
+    }
+
+    impl fmt::Display for WireCodecError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Empty => formatter.write_str("controller JSON frame is empty"),
+                Self::TooLarge { maximum } => {
+                    write!(
+                        formatter,
+                        "controller JSON frame exceeds the {maximum}-byte limit"
+                    )
+                }
+                Self::Json(error) => error.fmt(formatter),
+            }
+        }
+    }
+
+    impl std::error::Error for WireCodecError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Json(error) => Some(error),
+                Self::Empty | Self::TooLarge { .. } => None,
+            }
+        }
+    }
+
+    struct BoundedVecWriter {
+        bytes: Vec<u8>,
+        maximum: usize,
+        exceeded: bool,
+    }
+
+    impl BoundedVecWriter {
+        fn new(maximum: usize) -> Self {
+            Self {
+                bytes: Vec::with_capacity(maximum.min(1024)),
+                maximum,
+                exceeded: false,
+            }
+        }
+    }
+
+    impl io::Write for BoundedVecWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let fits = self
+                .bytes
+                .len()
+                .checked_add(bytes.len())
+                .is_some_and(|length| length <= self.maximum);
+            if !fits {
+                self.exceeded = true;
+                return Err(io::Error::other("controller JSON frame limit exceeded"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn encode<T: Serialize>(value: &T, maximum: usize) -> Result<Vec<u8>, WireCodecError> {
+        let mut writer = BoundedVecWriter::new(maximum);
+        match serde_json::to_writer(&mut writer, value) {
+            Ok(()) if writer.bytes.is_empty() => Err(WireCodecError::Empty),
+            Ok(()) => Ok(writer.bytes),
+            Err(_) if writer.exceeded => Err(WireCodecError::TooLarge { maximum }),
+            Err(error) => Err(WireCodecError::Json(error)),
+        }
+    }
+
+    fn decode<T: DeserializeOwned>(bytes: &[u8], maximum: usize) -> Result<T, WireCodecError> {
+        if bytes.is_empty() {
+            return Err(WireCodecError::Empty);
+        }
+        if bytes.len() > maximum {
+            return Err(WireCodecError::TooLarge { maximum });
+        }
+        serde_json::from_slice(bytes).map_err(WireCodecError::Json)
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct DecodedClientHello(ClientHelloFields<'static>);
+
+    impl DecodedClientHello {
+        pub(crate) fn into_parts(self) -> (u32, String) {
+            (self.0.version, self.0.nonce.into_owned())
+        }
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct DecodedServerHello(ServerHelloFields<'static>);
+
+    impl DecodedServerHello {
+        pub(crate) fn into_parts(self) -> (u32, String, RepoId) {
+            (
+                self.0.version,
+                self.0.nonce.into_owned(),
+                self.0.repo_id.into_owned(),
+            )
+        }
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct DecodedRpcRequest(RpcRequestFields<'static>);
+
+    impl DecodedRpcRequest {
+        pub(crate) const fn id(&self) -> u64 {
+            self.0.id
+        }
+
+        pub(crate) fn method(&self) -> &str {
+            &self.0.method
+        }
+
+        pub(crate) fn params(&self) -> &Value {
+            &self.0.params
+        }
+
+        pub(crate) const fn binary_length(&self) -> Option<u32> {
+            self.0.binary_length
+        }
+
+        pub(crate) fn into_parts(self) -> (u64, String, Value, Option<u32>) {
+            (
+                self.0.id,
+                self.0.method.into_owned(),
+                self.0.params.into_owned(),
+                self.0.binary_length,
+            )
+        }
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct DecodedRpcResponse(RpcResponseFields<'static>);
+
+    impl DecodedRpcResponse {
+        pub(crate) fn into_parts(
+            self,
+        ) -> (u64, bool, Option<Value>, Option<CowshedError>, Option<u32>) {
+            (
+                self.0.id,
+                self.0.ok,
+                self.0.result.map(Cow::into_owned),
+                self.0.error.map(Cow::into_owned),
+                self.0.binary_length,
+            )
+        }
+    }
+
+    pub(crate) fn encode_client_hello(nonce: &str) -> Result<Vec<u8>, WireCodecError> {
+        encode(
+            &ClientHelloFields {
+                version: HANDSHAKE_VERSION,
+                nonce: Cow::Borrowed(nonce),
+            },
+            MAX_HANDSHAKE_BYTES,
+        )
+    }
+
+    pub(crate) fn decode_client_hello(bytes: &[u8]) -> Result<DecodedClientHello, WireCodecError> {
+        decode::<ClientHelloFields<'static>>(bytes, MAX_HANDSHAKE_BYTES).map(DecodedClientHello)
+    }
+
+    pub(crate) fn encode_server_hello(
+        nonce: &str,
+        repo_id: &RepoId,
+    ) -> Result<Vec<u8>, WireCodecError> {
+        encode(
+            &ServerHelloFields {
+                version: HANDSHAKE_VERSION,
+                nonce: Cow::Borrowed(nonce),
+                repo_id: Cow::Borrowed(repo_id),
+            },
+            MAX_HANDSHAKE_BYTES,
+        )
+    }
+
+    pub(crate) fn decode_server_hello(bytes: &[u8]) -> Result<DecodedServerHello, WireCodecError> {
+        decode::<ServerHelloFields<'static>>(bytes, MAX_HANDSHAKE_BYTES).map(DecodedServerHello)
+    }
+
+    pub(crate) fn encode_rpc_request(
+        id: u64,
+        method: &str,
+        params: &Value,
+        binary_length: Option<u32>,
+    ) -> Result<Vec<u8>, WireCodecError> {
+        encode(
+            &RpcRequestFields {
+                id,
+                method: Cow::Borrowed(method),
+                params: Cow::Borrowed(params),
+                binary_length,
+            },
+            MAX_JSON_FRAME_BYTES,
+        )
+    }
+
+    pub(crate) fn decode_rpc_request(bytes: &[u8]) -> Result<DecodedRpcRequest, WireCodecError> {
+        decode::<RpcRequestFields<'static>>(bytes, MAX_JSON_FRAME_BYTES).map(DecodedRpcRequest)
+    }
+
+    pub(crate) fn encode_rpc_success(
+        id: u64,
+        result: &Value,
+        binary_length: Option<u32>,
+    ) -> Result<Vec<u8>, WireCodecError> {
+        encode(
+            &RpcResponseFields {
+                id,
+                ok: true,
+                result: Some(Cow::Borrowed(result)),
+                error: None,
+                binary_length,
+            },
+            MAX_JSON_FRAME_BYTES,
+        )
+    }
+
+    pub(crate) fn encode_rpc_error(
+        id: u64,
+        error: &CowshedError,
+    ) -> Result<Vec<u8>, WireCodecError> {
+        encode(
+            &RpcResponseFields {
+                id,
+                ok: false,
+                result: None,
+                error: Some(Cow::Borrowed(error)),
+                binary_length: None,
+            },
+            MAX_JSON_FRAME_BYTES,
+        )
+    }
+
+    pub(crate) fn decode_rpc_response(bytes: &[u8]) -> Result<DecodedRpcResponse, WireCodecError> {
+        decode::<RpcResponseFields<'static>>(bytes, MAX_JSON_FRAME_BYTES).map(DecodedRpcResponse)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::error::ErrorCode;
+        use serde_json::json;
+
+        fn repo() -> RepoId {
+            RepoId::parse("acme/widget").expect("repo id")
+        }
+
+        #[test]
+        fn directional_hello_codecs_share_one_strict_schema() {
+            let client = encode_client_hello("nonce").expect("encode client hello");
+            assert_eq!(
+                decode_client_hello(&client)
+                    .expect("decode client hello")
+                    .into_parts(),
+                (HANDSHAKE_VERSION, "nonce".into())
+            );
+
+            let server = encode_server_hello("nonce", &repo()).expect("encode server hello");
+            assert_eq!(
+                decode_server_hello(&server)
+                    .expect("decode server hello")
+                    .into_parts(),
+                (HANDSHAKE_VERSION, "nonce".into(), repo())
+            );
+        }
+
+        #[test]
+        fn directional_rpc_codecs_share_one_strict_schema() {
+            let params = json!({"repoId": "acme/widget"});
+            let request =
+                encode_rpc_request(7, "project.list", &params, None).expect("encode request");
+            let request_value: Value = serde_json::from_slice(&request).expect("request JSON");
+            assert!(request_value.get("binaryLength").is_none());
+            assert_eq!(
+                decode_rpc_request(&request)
+                    .expect("decode request")
+                    .into_parts(),
+                (7, "project.list".into(), params, None)
+            );
+
+            let result = json!({"healthy": true});
+            let success = encode_rpc_success(7, &result, Some(4)).expect("encode success");
+            assert_eq!(
+                decode_rpc_response(&success)
+                    .expect("decode success")
+                    .into_parts(),
+                (7, true, Some(result), None, Some(4))
+            );
+
+            let error = CowshedError::new(ErrorCode::Conflict, "stale", "retry");
+            let failure = encode_rpc_error(8, &error).expect("encode failure");
+            assert_eq!(
+                decode_rpc_response(&failure)
+                    .expect("decode failure")
+                    .into_parts(),
+                (8, false, None, Some(error), None)
+            );
+        }
+
+        #[test]
+        fn all_directional_decoders_reject_unknown_fields() {
+            let cases: [(fn(&[u8]) -> bool, &[u8]); 4] = [
+                (
+                    |bytes| decode_client_hello(bytes).is_err(),
+                    br#"{"version":1,"nonce":"n","extra":true}"#,
+                ),
+                (
+                    |bytes| decode_server_hello(bytes).is_err(),
+                    br#"{"version":1,"nonce":"n","repoId":"acme/widget","extra":true}"#,
+                ),
+                (
+                    |bytes| decode_rpc_request(bytes).is_err(),
+                    br#"{"id":1,"method":"project.list","params":{},"extra":true}"#,
+                ),
+                (
+                    |bytes| decode_rpc_response(bytes).is_err(),
+                    br#"{"id":1,"ok":true,"result":{},"error":null,"binaryLength":null,"extra":true}"#,
+                ),
+            ];
+            for (rejects, bytes) in cases {
+                assert!(rejects(bytes));
+            }
+        }
+
+        #[test]
+        fn bounded_codec_rejects_before_exceeding_its_output_limit() {
+            let value = ClientHelloFields {
+                version: HANDSHAKE_VERSION,
+                nonce: Cow::Borrowed("long-nonce"),
+            };
+            assert!(matches!(
+                encode(&value, 8),
+                Err(WireCodecError::TooLarge { maximum: 8 })
+            ));
+            assert!(matches!(
+                decode::<ClientHelloFields<'static>>(b"{}", 1),
+                Err(WireCodecError::TooLarge { maximum: 1 })
+            ));
+            assert!(matches!(
+                decode::<ClientHelloFields<'static>>(b"", MAX_HANDSHAKE_BYTES),
+                Err(WireCodecError::Empty)
+            ));
+        }
+    }
+}
 
 const ROUTER_CLOSED_HINT: &str = "restart the trusted cowshed controller";
 
@@ -231,40 +636,6 @@ impl RouterHandle {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ClientHello {
-    version: u32,
-    nonce: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ServerHello<'a> {
-    version: u32,
-    nonce: &'a str,
-    repo_id: &'a RepoId,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RpcRequest {
-    id: u64,
-    method: String,
-    params: Value,
-    binary_length: Option<u32>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RpcResponse<'a> {
-    id: u64,
-    ok: bool,
-    result: Option<&'a Value>,
-    error: Option<&'a CowshedError>,
-    binary_length: Option<u32>,
-}
-
 /// Serves one inherited stream descriptor until a clean disconnect or a fatal protocol failure.
 /// Dropping this future owns only connection state; routed jobs remain owned by the router actor.
 pub async fn serve_controller_connection(
@@ -287,16 +658,18 @@ pub async fn serve_controller_connection(
         "controller handshake request",
     )
     .await?;
-    let hello: ClientHello = serde_json::from_slice(&hello).map_err(|error| {
+    let hello = codec::decode_client_hello(&hello).map_err(|error| {
         protocol_error(format!("controller handshake request is invalid: {error}"))
     })?;
-    validate_hello(&hello)?;
-    let response = serde_json::to_vec(&ServerHello {
-        version: HANDSHAKE_VERSION,
-        nonce: &hello.nonce,
-        repo_id: authority.repo_id(),
-    })
-    .map_err(|error| protocol_error(format!("controller handshake encoding failed: {error}")))?;
+    let (version, nonce) = hello.into_parts();
+    validate_hello(version, &nonce)?;
+    let response = codec::encode_server_hello(&nonce, authority.repo_id()).map_err(|error| {
+        if error.is_too_large() {
+            protocol_error("controller handshake response has invalid length")
+        } else {
+            protocol_error(format!("controller handshake encoding failed: {error}"))
+        }
+    })?;
     write_frame(
         &mut stream,
         &response,
@@ -313,13 +686,13 @@ pub async fn serve_controller_connection(
         else {
             return Ok(());
         };
-        let request: RpcRequest = serde_json::from_slice(&frame).map_err(|error| {
+        let request = codec::decode_rpc_request(&frame).map_err(|error| {
             protocol_error(format!("controller RPC request is invalid: {error}"))
         })?;
-        if request.id != next_id {
+        if request.id() != next_id {
             let error =
                 protocol_error("controller RPC request id was replayed or arrived out of order");
-            write_rpc_error(&mut stream, request.id, &error).await?;
+            write_rpc_error(&mut stream, request.id(), &error).await?;
             return Err(error);
         }
         next_id = next_id
@@ -327,7 +700,7 @@ pub async fn serve_controller_connection(
             .ok_or_else(|| protocol_error("controller RPC request id overflowed"))?;
 
         if let Err(error) = validate_request(&authority, &request) {
-            write_rpc_error(&mut stream, request.id, &error).await?;
+            write_rpc_error(&mut stream, request.id(), &error).await?;
             if error.code == ErrorCode::Integrity {
                 return Err(error);
             }
@@ -335,12 +708,13 @@ pub async fn serve_controller_connection(
         }
 
         let download_offset = request
-            .params
+            .params()
             .get("offset")
             .and_then(Value::as_u64)
-            .filter(|_| request.method == "job.logs");
+            .filter(|_| request.method() == "job.logs");
+        let (request_id, request_method, request_params, binary_length) = request.into_parts();
 
-        let upload = match request.binary_length {
+        let upload = match binary_length {
             Some(length) => Some(
                 read_binary_frame(
                     &mut stream,
@@ -353,12 +727,7 @@ pub async fn serve_controller_connection(
             None => None,
         };
 
-        let response = router.route(
-            authority.clone(),
-            request.method.clone(),
-            request.params,
-            upload,
-        );
+        let response = router.route(authority.clone(), request_method, request_params, upload);
         tokio::pin!(response);
         let response = loop {
             tokio::select! {
@@ -393,44 +762,43 @@ pub async fn serve_controller_connection(
                 match (download_offset, binary.as_ref()) {
                     (Some(offset), Some(bytes)) => {
                         if let Err(error) = validate_raw_response(&result, offset, bytes.len()) {
-                            write_rpc_error(&mut stream, request.id, &error).await?;
+                            write_rpc_error(&mut stream, request_id, &error).await?;
                             return Err(error);
                         }
                     }
                     (Some(_), None) => {
                         let error =
                             protocol_error("controller router omitted the requested raw-byte lane");
-                        write_rpc_error(&mut stream, request.id, &error).await?;
+                        write_rpc_error(&mut stream, request_id, &error).await?;
                         return Err(error);
                     }
                     (None, Some(_)) => {
                         let error = protocol_error(
                             "controller router attempted a second or unsolicited raw-byte lane",
                         );
-                        write_rpc_error(&mut stream, request.id, &error).await?;
+                        write_rpc_error(&mut stream, request_id, &error).await?;
                         return Err(error);
                     }
                     (None, None) => {}
                 }
-                write_rpc_success(&mut stream, request.id, &result, binary.as_ref()).await?;
+                write_rpc_success(&mut stream, request_id, &result, binary.as_ref()).await?;
                 if let Some(binary) = binary {
                     write_binary_frame(&mut stream, &binary).await?;
                 }
             }
-            Err(error) => write_rpc_error(&mut stream, request.id, &error).await?,
+            Err(error) => write_rpc_error(&mut stream, request_id, &error).await?,
         }
     }
 }
 
-fn validate_hello(hello: &ClientHello) -> Result<()> {
-    if hello.version != HANDSHAKE_VERSION {
+fn validate_hello(version: u32, nonce: &str) -> Result<()> {
+    if version != HANDSHAKE_VERSION {
         return Err(protocol_error(
             "controller handshake protocol version did not match",
         ));
     }
-    if hello.nonce.len() != 64
-        || !hello
-            .nonce
+    if nonce.len() != 64
+        || !nonce
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
@@ -439,14 +807,17 @@ fn validate_hello(hello: &ClientHello) -> Result<()> {
     Ok(())
 }
 
-fn validate_request(authority: &ConnectionAuthority, request: &RpcRequest) -> Result<()> {
-    if !CAPABILITY_METHODS.contains(&request.method.as_str()) {
+fn validate_request(
+    authority: &ConnectionAuthority,
+    request: &codec::DecodedRpcRequest,
+) -> Result<()> {
+    if !CAPABILITY_METHODS.contains(&request.method()) {
         return Err(authority_error(format!(
             "controller method is not in the capability allowlist: {}",
-            request.method
+            request.method()
         )));
     }
-    let params = request.params.as_object().ok_or_else(|| {
+    let params = request.params().as_object().ok_or_else(|| {
         CowshedError::usage(
             "controller RPC params must be a JSON object",
             "send the exact parameters required by the capability method",
@@ -455,7 +826,7 @@ fn validate_request(authority: &ConnectionAuthority, request: &RpcRequest) -> Re
 
     match authority {
         ConnectionAuthority::Coordinator { repo_id } => {
-            if request.method != "project.open" {
+            if request.method() != "project.open" {
                 require_string(params, "repoId", repo_id.as_str())?;
             }
         }
@@ -464,10 +835,10 @@ fn validate_request(authority: &ConnectionAuthority, request: &RpcRequest) -> Re
             workspace,
             workspace_incarnation,
         } => {
-            if !WORKER_METHODS.contains(&request.method.as_str()) {
+            if !WORKER_METHODS.contains(&request.method()) {
                 return Err(authority_error(format!(
                     "worker authority cannot call coordinator method {}",
-                    request.method
+                    request.method()
                 )));
             }
             require_string(params, "repoId", repo_id.as_str())?;
@@ -480,20 +851,20 @@ fn validate_request(authority: &ConnectionAuthority, request: &RpcRequest) -> Re
         }
     }
 
-    if request.method == "job.logs" && params.get("offset").and_then(Value::as_u64).is_none() {
+    if request.method() == "job.logs" && params.get("offset").and_then(Value::as_u64).is_none() {
         return Err(CowshedError::usage(
             "job.logs offset must be an unsigned integer",
             "send the offset returned by the preceding raw-byte frame",
         ));
     }
 
-    match request.binary_length {
+    match request.binary_length() {
         Some(length) if usize::try_from(length).unwrap_or(usize::MAX) > MAX_BINARY_FRAME_BYTES => {
             Err(protocol_error(
                 "controller RPC binary request exceeds the 64 KiB frame limit",
             ))
         }
-        Some(_) if !UPLOAD_METHODS.contains(&request.method.as_str()) => Err(protocol_error(
+        Some(_) if !UPLOAD_METHODS.contains(&request.method()) => Err(protocol_error(
             "controller RPC method does not accept a raw-byte upload lane",
         )),
         None => Ok(()),
@@ -675,14 +1046,13 @@ async fn write_rpc_success(
         .map_err(|_| {
             protocol_error("controller RPC binary response length does not fit the wire")
         })?;
-    let response = serde_json::to_vec(&RpcResponse {
-        id,
-        ok: true,
-        result: Some(result),
-        error: None,
-        binary_length,
-    })
-    .map_err(|error| protocol_error(format!("controller RPC response encoding failed: {error}")))?;
+    let response = codec::encode_rpc_success(id, result, binary_length).map_err(|error| {
+        if error.is_too_large() {
+            protocol_error("controller RPC response has invalid length")
+        } else {
+            protocol_error(format!("controller RPC response encoding failed: {error}"))
+        }
+    })?;
     write_frame(
         stream,
         &response,
@@ -697,17 +1067,14 @@ async fn write_rpc_error(
     id: u64,
     error: &CowshedError,
 ) -> Result<()> {
-    let response = serde_json::to_vec(&RpcResponse {
-        id,
-        ok: false,
-        result: None,
-        error: Some(error),
-        binary_length: None,
-    })
-    .map_err(|encoding| {
-        protocol_error(format!(
-            "controller RPC error response encoding failed: {encoding}"
-        ))
+    let response = codec::encode_rpc_error(id, error).map_err(|encoding| {
+        if encoding.is_too_large() {
+            protocol_error("controller RPC response has invalid length")
+        } else {
+            protocol_error(format!(
+                "controller RPC error response encoding failed: {encoding}"
+            ))
+        }
     })?;
     write_frame(
         stream,
