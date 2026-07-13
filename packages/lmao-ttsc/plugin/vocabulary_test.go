@@ -10,8 +10,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
-	"strconv"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -217,8 +217,8 @@ function createOrdinalOps() {
 	}
 	binding := registration[1]
 	localDictionaryPattern := regexp.MustCompile(`localMessageDictionary:\s*Object\.freeze\(\[\s*` + regexp.QuoteMeta(binding) + `\[` + logOrdinal + `\]\s*\]\)`)
-	if !localDictionaryPattern.MatchString(output) || !strings.Contains(output, "_messageIds[$$i] = 1") || !strings.Contains(output, "message_nulls") {
-		t.Fatalf("current static log did not bind local ID 1 to the log fragment ordinal through %s\n%s", binding, output)
+	if !localDictionaryPattern.MatchString(output) || !strings.Contains(output, "_messageIds[$$i] = 1") || strings.Contains(output, "message_nulls") {
+		t.Fatalf("current static log did not bind local ID 1 without obsolete validity storage through %s\n%s", binding, output)
 	}
 	spanPattern := regexp.MustCompile(`ctx\.span0\([^,]+,\s*` + regexp.QuoteMeta(binding) + `\[` + strconv.Itoa(ordinals[vocabularySpanName]) + `\],\s*child\.callsitePlan\.newCtx0\(ctx\),\s*child\.callsitePlan,\s*child\.fn\)`)
 	if !spanPattern.MatchString(output) {
@@ -281,12 +281,41 @@ func TestValidateVocabularyManifestRejectsMalformedRecordContract(t *testing.T) 
 		{name: "schema version", actual: func() vocabularyManifest { m := cloneManifest(base); m.SchemaVersion = 2; return m }(), expected: base, want: "LMAO1004 schemaVersion must be 1"},
 		{name: "algorithm", actual: func() vocabularyManifest { m := cloneManifest(base); m.IDAlgorithm = "sha256-24-v2"; return m }(), expected: base, want: `LMAO1004 idAlgorithm must be "sha256-24-v1"`},
 		{name: "uppercase hash", actual: func() vocabularyManifest { m := cloneManifest(base); m.ContentHash = strings.Repeat("A", 64); return m }(), expected: base, want: "LMAO1004 contentHash must be 64 lowercase hex characters\nLMAO1006 contentHash does not match canonical fragment"},
-		{name: "entry order", actual: func() vocabularyManifest { m := cloneManifest(withExtra); m.Entries[0], m.Entries[1] = m.Entries[1], m.Entries[0]; m.ContentHash = independentContentHash(m.Entries); return m }(), expected: withExtra, want: "LMAO1006 entries are not sorted by (id, kindTag, record bytes)"},
-		{name: "record-derived ID", actual: func() vocabularyManifest { m := cloneManifest(base); m.Entries[0].Fields[0].Column = "wrong_column"; m.ContentHash = independentContentHash(m.Entries); return m }(), expected: base, want: "LMAO1006 entry id mismatch for log_template \"same\"\nLMAO1007 missing manifest entry log_template \"same\"\nLMAO1007 stale manifest entry log_template \"same\""},
-		{name: "duplicate record and ID", actual: func() vocabularyManifest { m := cloneManifest(base); m.Entries = append(m.Entries, m.Entries[0]); m.ContentHash = independentContentHash(m.Entries); return m }(), expected: base, want: fmt.Sprintf("LMAO1005 duplicate vocabulary id %d\nLMAO1005 duplicate vocabulary record log_template %q", baseID, "same")},
-		{name: "unknown kind", actual: func() vocabularyManifest { m := cloneManifest(base); m.Entries[0].Kind = vocabularyKind("mystery"); return m }(), expected: base, want: "LMAO1004 entry 0 has unknown kind \"mystery\"\nLMAO1007 missing manifest entry log_template \"same\""},
-		{name: "zero ID", actual: func() vocabularyManifest { m := cloneManifest(base); m.Entries[0].ID = 0; m.ContentHash = independentContentHash(m.Entries); return m }(), expected: base, want: "LMAO1004 entry 0 id 0 is outside 1..16777215\nLMAO1006 entry id mismatch for log_template \"same\""},
-		{name: "out-of-range ID", actual: func() vocabularyManifest { m := cloneManifest(base); m.Entries[0].ID = 0x01000000; m.ContentHash = independentContentHash(m.Entries); return m }(), expected: base, want: "LMAO1004 entry 0 id 16777216 is outside 1..16777215\nLMAO1006 entry id mismatch for log_template \"same\""},
+		{name: "entry order", actual: func() vocabularyManifest {
+			m := cloneManifest(withExtra)
+			m.Entries[0], m.Entries[1] = m.Entries[1], m.Entries[0]
+			m.ContentHash = independentContentHash(m.Entries)
+			return m
+		}(), expected: withExtra, want: "LMAO1006 entries are not sorted by (id, kindTag, record bytes)"},
+		{name: "record-derived ID", actual: func() vocabularyManifest {
+			m := cloneManifest(base)
+			m.Entries[0].Fields[0].Column = "wrong_column"
+			m.ContentHash = independentContentHash(m.Entries)
+			return m
+		}(), expected: base, want: "LMAO1006 entry id mismatch for log_template \"same\"\nLMAO1007 missing manifest entry log_template \"same\"\nLMAO1007 stale manifest entry log_template \"same\""},
+		{name: "duplicate record and ID", actual: func() vocabularyManifest {
+			m := cloneManifest(base)
+			m.Entries = append(m.Entries, m.Entries[0])
+			m.ContentHash = independentContentHash(m.Entries)
+			return m
+		}(), expected: base, want: fmt.Sprintf("LMAO1005 duplicate vocabulary id %d\nLMAO1005 duplicate vocabulary record log_template %q", baseID, "same")},
+		{name: "unknown kind", actual: func() vocabularyManifest {
+			m := cloneManifest(base)
+			m.Entries[0].Kind = vocabularyKind("mystery")
+			return m
+		}(), expected: base, want: "LMAO1004 entry 0 has unknown kind \"mystery\"\nLMAO1007 missing manifest entry log_template \"same\""},
+		{name: "zero ID", actual: func() vocabularyManifest {
+			m := cloneManifest(base)
+			m.Entries[0].ID = 0
+			m.ContentHash = independentContentHash(m.Entries)
+			return m
+		}(), expected: base, want: "LMAO1004 entry 0 id 0 is outside 1..16777215\nLMAO1006 entry id mismatch for log_template \"same\""},
+		{name: "out-of-range ID", actual: func() vocabularyManifest {
+			m := cloneManifest(base)
+			m.Entries[0].ID = 0x01000000
+			m.ContentHash = independentContentHash(m.Entries)
+			return m
+		}(), expected: base, want: "LMAO1004 entry 0 id 16777216 is outside 1..16777215\nLMAO1006 entry id mismatch for log_template \"same\""},
 		{name: "missing entry", actual: base, expected: withExtra, want: `LMAO1007 missing manifest entry span_name "extra"`},
 	}
 	for _, tc := range cases {
@@ -319,7 +348,11 @@ func TestLoadVocabularyManifestRejectsMalformedOrNoncanonicalJSON(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	cases := []struct{ name string; data []byte; prefix string }{
+	cases := []struct {
+		name   string
+		data   []byte
+		prefix string
+	}{
 		{name: "invalid JSON", data: []byte(`{"schemaVersion":`), prefix: "LMAO1003 malformed vocabulary manifest:"},
 		{name: "unknown field", data: []byte(`{"schemaVersion":1,"idAlgorithm":"sha256-24-v1","contentHash":"","entries":[],"extra":true}`), prefix: "LMAO1003 malformed vocabulary manifest:"},
 		{name: "trailing value", data: append(append([]byte(nil), canonical...), []byte(" {}")...), prefix: "LMAO1003 malformed vocabulary manifest:"},

@@ -20,6 +20,9 @@ interface FixtureResult {
   hasLogHeaders: boolean;
   hasMessageIds: boolean;
   hasMessageValidity: boolean;
+  hasRawMessages: boolean;
+  encodedMessageIdentities: [number, number];
+  rawMessageSentinels: [string | null, string | null];
   localMessageDictionaryLength: number;
 }
 
@@ -131,7 +134,10 @@ test('plugin ON selects specialized capacity-64 static-50 while OFF stays curren
       hasEntryType: true,
       hasLogHeaders: false,
       hasMessageIds: true,
-      hasMessageValidity: true,
+      hasMessageValidity: false,
+      hasRawMessages: true,
+      encodedMessageIdentities: [0, 0],
+      rawMessageSentinels: ['static-00', 'dynamic-00'],
       localMessageDictionaryLength: 0,
     });
     expect(pluginOn).toMatchObject({
@@ -140,9 +146,13 @@ test('plugin ON selects specialized capacity-64 static-50 while OFF stays curren
       hasEntryType: true,
       hasLogHeaders: true,
       hasMessageIds: false,
-      hasMessageValidity: true,
+      hasMessageValidity: false,
+      hasRawMessages: true,
+      rawMessageSentinels: [null, 'dynamic-00'],
       localMessageDictionaryLength: 0,
     });
+    expect(pluginOn.encodedMessageIdentities[0]).toBeGreaterThan(0);
+    expect(pluginOn.encodedMessageIdentities[1]).toBe(0);
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }

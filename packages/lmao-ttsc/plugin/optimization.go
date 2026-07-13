@@ -23,7 +23,7 @@ const (
 	runtimeHintMessagePhysicalPacked      uint32 = 1 << 26
 	runtimeHintMessagePhysicalSpecialized uint32 = 1 << 27
 	runtimeHintMessagePhysicalMask        uint32 = runtimeHintMessagePhysicalPacked | runtimeHintMessagePhysicalSpecialized
-	maxPackedDenseIndex                  uint32 = 0x00fffffe
+	maxPackedDenseIndex                   uint32 = 0x00fffffe
 )
 
 type callMessagePhysicalLayout uint8
@@ -42,8 +42,8 @@ var contextCapability = map[string]uint32{
 }
 
 type opCompileAnalysis struct {
-	runtimeHint           uint32
-	eagerColumns          []string
+	runtimeHint            uint32
+	eagerColumns           []string
 	localMessageDictionary []globalVocabularyID
 }
 
@@ -828,7 +828,6 @@ func baseCompileMetadataProperties(analysis opCompileAnalysis) []*shimast.Node {
 	}
 	return properties
 }
-
 
 func (t *fileTransformer) compileMetadataNode(analysis opCompileAnalysis) *shimast.Node {
 	properties := baseCompileMetadataProperties(analysis)

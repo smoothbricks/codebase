@@ -469,12 +469,6 @@ export function generateRemappedSpanLoggerClass<T extends LogSchema>(
       const messageColumn = this._buffer.message_values;
       if (messageColumn) {
         messageColumn[idx] = message;
-        const nullBitmap = this._buffer.message_nulls;
-        if (nullBitmap) {
-          const byteIndex = Math.floor(idx / 8);
-          const bitOffset = idx % 8;
-          nullBitmap[byteIndex] |= (1 << bitOffset);
-        }
       }
       for (const [cleanKey, value] of Object.entries(this._scopedAttributes)) {
         const prefixedKey = PREFIX_MAPPING[cleanKey] || cleanKey;

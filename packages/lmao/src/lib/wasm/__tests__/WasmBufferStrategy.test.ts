@@ -87,8 +87,7 @@ describe('WasmBufferStrategy', () => {
       const buffer = strategy.createSpanBuffer(testSchema, traceRoot, testMetadata);
       // Caller must set span name via message() - simulating writeSpanStart behavior
       buffer.message(0, 'test-span');
-      if (buffer.message_nulls === undefined) throw new Error('Expected root message validity lane');
-      buffer.message_nulls[0] |= 1;
+      expect('message_nulls' in buffer).toBe(false);
 
       expect(buffer).toBeDefined();
       expect(buffer._capacity).toBe(64);
@@ -129,8 +128,7 @@ describe('WasmBufferStrategy', () => {
       const child = strategy.createChildSpanBuffer(parent, testMetadata, testMetadata);
       // Caller must set span name via message() - simulating writeSpanStart behavior
       child.message(0, 'child-span');
-      if (child.message_nulls === undefined) throw new Error('Expected child message validity lane');
-      child.message_nulls[0] |= 1;
+      expect('message_nulls' in child).toBe(false);
 
       expect(child).toBeDefined();
       expect(resolveMessage(child, 0)).toBe('child-span');
@@ -203,8 +201,7 @@ describe('WasmBufferStrategy', () => {
       for (let index = 0; index < siblingCount; index++) {
         const child = strategy.createChildSpanBuffer(root, testMetadata, testMetadata);
         child.message(0, `child-${index}`);
-        if (child.message_nulls === undefined) throw new Error('Expected sibling message validity lane');
-        child.message_nulls[0] |= 1;
+        expect('message_nulls' in child).toBe(false);
         expect(child._nodeIndex).toBe(index + 1);
       }
 
@@ -415,8 +412,7 @@ describe('WasmBufferStrategy', () => {
         entryTypes[0] = 8;
       };
       root.message(0, 'leased-wasm-row');
-      if (root.message_nulls === undefined) throw new Error('Expected leased message validity lane');
-      root.message_nulls[0] |= 1;
+      expect('message_nulls' in root).toBe(false);
       root.latency(0, 17.5);
       root.success(0, true);
       root.operation(0, 1);

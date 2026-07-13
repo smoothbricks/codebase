@@ -283,7 +283,7 @@ describe('runtime hint specialization', () => {
     expect(resolveEntryType(childOf(tracer), 1)).toBe(ENTRY_TYPE_SPAN_OK);
   });
 
-  it('honors static capacity including the two-row minimum and preserves overflow rows', async () => {
+  it('keeps invalid capacity adaptive while exact capacity preserves overflow rows', async () => {
     const minimumOp = opContext.defineOp('minimum', (ctx) => ctx.ok(null), undefined, {
       runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_RESULT | 1,
     });
@@ -307,7 +307,7 @@ describe('runtime hint specialization', () => {
 
     const [minimum, overflow] = iterateSpanChildren(tracer.rootBuffers[0]);
     if (!minimum || !overflow) throw new Error('expected minimum and overflow child spans');
-    expect(minimum._capacity).toBe(2);
+    expect(minimum._capacity).toBe(8);
     expect(minimum._overflow).toBeUndefined();
     expect(overflow._capacity).toBe(3);
     expect(resolveEntryType(overflow, 2)).toBe(ENTRY_TYPE_INFO);
