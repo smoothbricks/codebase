@@ -39,8 +39,8 @@
     "verdaccio": "6.5.2"
   },
   "scripts": {
-    "build:all": "nx run @smoothbricks/codebase:vocabulary-check && nx run-many -t build",
-    "build:watch": "nx run @smoothbricks/codebase:vocabulary-check && nx run-many -t build --watch",
+    "build:all": "nx run-many -t build",
+    "build:watch": "nx run-many -t build --watch",
     "clean": "nx run-many -t clean; nx reset",
     "clean:node_modules": "rm -rf node_modules && find e* t* p* -type d -name node_modules -print0 | xargs -0 rm -rvf",
     "clean:trace-db": "find * -name .trace-results.db -delete -print",
@@ -54,9 +54,7 @@
     "reload:node_modules": "tooling/rm_node_modules; bun install",
     "show:tree": "tree --gitignore -d",
     "unlink:all": "for pkg in packages/*; do (cd $pkg && bun unlink); done",
-    "update:devenv": "cd tooling/direnv; devenv update",
-    "vocabulary:check": "nx run @smoothbricks/codebase:vocabulary-check",
-    "vocabulary:sync": "nx run @smoothbricks/codebase:vocabulary-sync"
+    "update:devenv": "cd tooling/direnv; devenv update"
   },
   "sherif": {
     "ignoreDependency": [
@@ -76,33 +74,6 @@
           "port": 4873,
           "config": ".verdaccio/config.yml",
           "storage": "tmp/local-registry/storage"
-        }
-      },
-      "vocabulary-check": {
-        "executor": "@smoothbricks/nx-plugin:bounded-exec",
-        "cache": true,
-        "inputs": [
-          "vocabularyArtifacts",
-          "{workspaceRoot}/packages/lmao-ttsc/examples/**/*.ts",
-          "{workspaceRoot}/packages/lmao-ttsc/examples/tsconfig.json",
-          "{workspaceRoot}/packages/lmao-ttsc/src/**/*.ts",
-          "{workspaceRoot}/packages/lmao-ttsc/tsconfig.test.json"
-        ],
-        "options": {
-          "command": "bun tooling/lmao-vocabulary.mjs check",
-          "cwd": "{workspaceRoot}",
-          "timeoutMs": 600000,
-          "killAfterMs": 10000
-        }
-      },
-      "vocabulary-sync": {
-        "executor": "@smoothbricks/nx-plugin:bounded-exec",
-        "cache": false,
-        "options": {
-          "command": "bun tooling/lmao-vocabulary.mjs sync",
-          "cwd": "{workspaceRoot}",
-          "timeoutMs": 600000,
-          "killAfterMs": 10000
         }
       }
     },
