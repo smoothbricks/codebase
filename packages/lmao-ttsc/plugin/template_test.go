@@ -38,6 +38,9 @@ export interface UserAttributeFields {
   attempt: number;
   success: boolean;
   operation: 'READ' | 'WRITE';
+  outcome: 'failure' | 'success';
+  category: string;
+  text: string;
 }
 export type FluentLogEntry<T extends Record<string, unknown> = UserAttributeFields> = { line(value: number): FluentLogEntry<T> } & { [K in keyof T]: (value: T[K]) => FluentLogEntry<T> };
 export type GeneratedTagWriter<T extends Record<string, unknown> = UserAttributeFields> = { with(values: Partial<T>): GeneratedTagWriter<T> } & { [K in keyof T]: (value: T[K]) => GeneratedTagWriter<T> };
@@ -546,6 +549,55 @@ defineOp('dynamic-enum', (ctx) => {
 	}
 	if regexp.MustCompile(`operation_values\[[^]]+\]\s*=\s*\$\$f\d+`).MatchString(output) {
 		t.Fatalf("dynamic enum string was written directly to its Uint8 ordinal lane\n%s", output)
+	}
+}
+
+func TestLiteralEnumFieldsUsePlanEncoderWhileTextFieldsWriteDirectly(t *testing.T) {
+	output := transformTemplateFixture(t, `
+defineOp('literal-enum', (ctx) => {
+  ctx.log.info('literal enum fields').category('checkout').operation('WRITE').outcome('success').text('completed');
+  return ctx.ok(null);
+});
+`)
+
+	literalTemp := func(literal string) string {
+		t.Helper()
+		pattern := regexp.MustCompile(`const (\$\$f\d+) = ["']` + regexp.QuoteMeta(literal) + `["'];`)
+		matches := pattern.FindAllStringSubmatch(output, -1)
+		if len(matches) != 1 {
+			t.Fatalf("%s literal captures = %d, want exactly one\n%s", literal, len(matches), output)
+		}
+		return matches[0][1]
+	}
+	categoryTemp := literalTemp("checkout")
+	operationTemp := literalTemp("WRITE")
+	outcomeTemp := literalTemp("success")
+	textTemp := literalTemp("completed")
+
+	for field, temp := range map[string]string{
+		"operation": operationTemp,
+		"outcome":   outcomeTemp,
+	} {
+		encodedWrite := regexp.MustCompile(`\$\$b\.` + field + `\(\$\$i,\s*\$\$l\._state\._physicalLayoutPlan\.enumLookup\.byField\["` + field + `"\]\.encode\(` + regexp.QuoteMeta(temp) + `\)\)`)
+		if !encodedWrite.MatchString(output) {
+			t.Fatalf("literal enum %s did not use its buffer positional method and plan-bound encoder\n%s", field, output)
+		}
+		if regexp.MustCompile(regexp.QuoteMeta(field) + `_values\[[^]]+\]\s*=`).MatchString(output) {
+			t.Fatalf("literal enum %s was written directly to its Uint8 ordinal lane\n%s", field, output)
+		}
+	}
+
+	for field, temp := range map[string]string{
+		"category": categoryTemp,
+		"text":     textTemp,
+	} {
+		directWrite := regexp.MustCompile(`\$\$b\.` + field + `_values\[\$\$i\]\s*=\s*` + regexp.QuoteMeta(temp) + `;`)
+		if !directWrite.MatchString(output) {
+			t.Fatalf("text field %s did not retain its direct lane write\n%s", field, output)
+		}
+		if strings.Contains(output, `.enumLookup.byField["`+field+`"]`) {
+			t.Fatalf("text field %s was incorrectly routed through an enum encoder\n%s", field, output)
+		}
 	}
 }
 
