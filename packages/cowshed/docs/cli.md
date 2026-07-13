@@ -4,10 +4,12 @@
 
 Every cowshed command follows the same I/O discipline:
 
-- **stdout** carries machine-readable output only: a bare value (a path, a name, TSV rows) or a JSON envelope with
-  `--json`. If you pipe cowshed, you get data — never prose.
-- **stderr** carries _everything else_: progress, explanations, warnings, and self-driving guidance. Guidance lines are
-  prefixed `cowshed:`; suggested follow-up commands are prefixed `next:`. Agents and humans read the same hints.
+- **Ordinary stdout** carries one control answer: a bare value, TSV rows, or a bounded JSON envelope with `--json`.
+  Job/status JSON contains lifecycle fields, typed artifact handles, byte counts, SHA-256 digests, bounded summaries,
+  and may contain small `Inline.data` bytes tagged as `utf8` or `base64`. Foreground exec, `cowshed job logs`,
+  `cowshed job attach`, and artifact reads are the explicit interfaces for unbounded raw bytes.
+- **stderr** carries progress, explanations, warnings, and self-driving guidance. Guidance lines are prefixed
+  `cowshed:`; suggested follow-up commands are prefixed `next:`. Agents and humans read the same hints.
 - **Exit codes** are stable:
 
 | Code | Meaning                          | Typical cause                                                                                                                       |
@@ -19,19 +21,20 @@ Every cowshed command follows the same I/O discipline:
 | 4    | conflict                         | name in use, workspace busy, restore over unsaved state without `--force`                                                           |
 | 5    | env-missing                      | gateway not running, caches volume absent, direnv missing                                                                           |
 | 6    | sandbox-denied                   | command blocked by the sandbox, confirmed by authoritative evidence; stderr names the path/domain and the grant that would allow it |
+| 7    | integrity                        | committed job content missing, mutated, rolled back, or inconsistent with its controller commitment                                 |
 
 `cowshed exec` passes the child's exit code through **unchanged**; failures of cowshed's own exec wrapper (mount gone
-mid-run, profile generation failed, …) use 100–105 so they can never collide with a child that legitimately exits 1–6.
-Exit 6 is reported only when cowshed has authoritative evidence of a denial — the gateway logged the egress decision, or
-the kernel sandbox telemetry names the blocked operation; otherwise the child's ordinary exit passes through untouched.
+mid-run, profile generation failed, integrity verification failed, …) use 100–106 so they can never collide with a child
+that legitimately exits 1–7. Exit 6 is reported only when cowshed has authoritative evidence of a denial — the gateway
+logged the egress decision, or the kernel sandbox telemetry names the blocked operation; otherwise the child's ordinary
+exit passes through untouched. Exit 7 is reported only for an established content/commitment integrity failure, never
+for a summary mismatch or ordinary child output.
 
 The JSON envelope is uniform:
 
 ```
 $ cowshed new raven --json
-{"ok":true,"result":{"name":"raven","repoId":"acme/widget",
- "path":"~/.cowshed/mnt/acme/widget/raven","branch":"cowshed/raven",
- "base":"6f3a2c1","createdAt":"2026-07-11T14:03:22Z"}}
+{"ok":true,"result":{"workspace":"raven","mount":"/Users/me/.cowshed/mnt/acme/widget/raven","baseCommit":"6f3a2c1"}}
 
 $ cowshed path nonesuch --json
 {"ok":false,"error":{"code":"not-found",
@@ -39,7 +42,9 @@ $ cowshed path nonesuch --json
  "hint":"cowshed ls"}}
 ```
 
-Errors with `--json` still exit with their code; stderr stays human-readable either way.
+Errors with `--json` still exit with their code; stderr stays human-readable either way. A bounded `JobInfo` may encode
+small `Inline.data` bytes in a tagged `utf8` or `base64` form. The size bound is load-bearing: larger and live artifacts
+remain handles, and unbounded bytes require `cowshed job logs`, `cowshed job attach`, or an explicit artifact read.
 
 ## Global flags
 
@@ -49,7 +54,7 @@ Errors with `--json` still exit with their code; stderr stays human-readable eit
 - `-q` / `--quiet` — suppress `cowshed:` progress lines on stderr; errors and `next:` hints still print.
 
 Workspace names are `[a-z0-9][a-z0-9-]*`, unique per project. Commands taking `<name>` accept `main` wherever it makes
-sense (`cowshed path main`, `cowshed exec main -- ...` runs _unsandboxed_ in your adopted checkout and warns on stderr).
+sense. `cowshed exec main -- ...` uses the same closed sandbox and explicit grants as every other workspace.
 
 ## Lifecycle
 
@@ -123,8 +128,9 @@ Nothing on stdout — `rm` has no answer to give.
 
 ### `cowshed exec <name> -- <cmd...>`
 
-Runs a command inside the workspace's sandbox, cwd at the workspace root. Child stdout/stderr pass through untouched
-(cowshed writes nothing to stdout itself); child exit code passes through.
+Runs a command inside the workspace's sandbox, cwd at the workspace root. In foreground raw mode, child stdout/stderr
+pass through as opaque bytes and the child exit code passes through. With `--json`, stdout is instead the bounded final
+control envelope; retrieve full bytes explicitly through job logs, attachment, or the typed artifact reader.
 
 ```
 $ cowshed exec raven -- cargo build -p cowshed-core
@@ -148,7 +154,7 @@ $ echo $?
 ```
 
 Without such evidence, the child's ordinary exit code passes through untouched — cowshed never guesses a denial from
-output text. Failures of the exec wrapper itself use exit codes 100–105.
+output text. Failures of the exec wrapper itself use exit codes 100–106.
 
 ### `cowshed shell <name>`
 
@@ -176,21 +182,29 @@ raven$ echo $PORT
 raven$ bun run dev          # vite reads $PORT; open http://localhost:40961 in your browser
 ```
 
-### `cowshed jobs <name>` — background work
+### `cowshed job list <name>` — background work
 
 Long commands auto-background at the soft timeout (default 120 s; `--timeout <dur>` tunes it, `--background` forces it
-immediately) and keep running under the workspace supervisor, spooling output inside the volume.
-`cowshed exec`/`cowshed shell` accept `--session <name>` for a persistent named shell whose cwd, variables, and jobs
-survive across calls.
+immediately) and keep running under the workspace supervisor. `cowshed exec`/`cowshed shell` accept `--session <name>`
+for a persistent named shell whose cwd, variables, and jobs survive across calls.
 
-```
+Every job has separate stdout/stderr `StreamInfo { storage, bytes, sha256, summary }` handles. `storage` is
+`Captured { artifact }` or `Redirect { source, artifact }`; `artifact` is `Inline { data: BinaryData }` or
+`File { path: WorkspacePath }`. Small terminal streams remain inline and protected files spill lazily, so consumers must
+not assume every short job creates `out` and `err` files.
+
+```sh
 $ cowshed exec raven --background -- bun run build:everything
-j-7f3a
-$ cowshed jobs raven
-j-7f3a	running	bun run build:everything	2m14s
-$ cowshed jobs logs raven j-7f3a --follow      # streamed spool; --stderr for the other stream
-$ cowshed jobs attach raven j-7f3a             # re-attach live stdio
+42
+$ cowshed job list raven
+42	running	bun run build:everything	2m14s
+$ cowshed job logs raven 42 --follow      # raw stdout bytes; --stderr selects the other stream
+$ cowshed job attach raven 42             # re-attach live raw stdio
 ```
+
+Control/status JSON is bounded; it may carry tagged bytes only for a small inline artifact. Logs, attachments, and
+artifact reads resolve the canonical artifact independently of whether it is inline or spilled and preserve arbitrary
+binary output without UTF-8 assumptions or response-size growth.
 
 ### `cowshed ensure [--envrc]`
 
@@ -280,8 +294,13 @@ Project lookup is discovery-only. Workspace inspection may safely ensure or atta
 workspace's exec, shell, jobs, quota-limited checkpoints, push, and grant reads. Only a trusted coordinator may
 grant/revoke, restore/destroy/rebase/land, run gc, or mirror repositories. The persistent per-workspace supervisor
 socket is permission- and peer-checked, supports concurrent clients and reconnect, and is never unlinked merely because
-one client disconnects. Job status authority comes from controller-owned immutable telemetry segments, not editable
-workspace records.
+one client disconnects.
+
+Protected in-volume Arrow records, inline bytes, and spill files are captured-content authority within their origin
+incarnation/checkpoint snapshot. Controller Arrow is continuity authority for job existence, lifecycle, order, lineage,
+terminal state, byte counts, hashes, and batch digest; it carries no artifact payload or path authority and never
+duplicates raw bytes. Every shell/session/descendant is restricted from writing `.cowshed/job/**` before
+repository-controlled startup. A content/commitment mismatch is a typed integrity failure.
 
 MCP coordinator authority is delivered only through an inherited FD/socketpair, never stderr, argv, environment, or a
 workspace file. Worker descriptors are 256-bit, one-use, expire after 30 seconds, are atomically consumed, restart-
@@ -349,10 +368,14 @@ inherited; forks start closed.
 ### `cowshed checkpoint <name> [label]` / `cowshed restore <name> <label>`
 
 Checkpoint clonefiles the workspace image (crash-consistent, fsck-verified) under a label — generated from the UTC
-timestamp when you don't give one; restore swaps the current image for the checkpoint (detach → clone → reattach, ~500
-ms). Restore refuses over unsaved work without `--force` (exit 4), and the displaced image is kept as a
-`pre-restore-<ts>` checkpoint, so a restore is itself undoable. List checkpoints with `cowshed ls --json` or
-`cowshed du`.
+timestamp when you don't give one. Before publication, a supervisor barrier seals complete Arrow batches and spill
+files; a manifest commits every checkpoint-resident job byte. Recovery may discard only incomplete trailing data.
+
+Restore swaps the current image for the checkpoint (detach → clone → reattach, ~500 ms) and mints a new workspace
+incarnation. Protected content remains authoritative for the restored snapshot's origin boundary; compact controller
+commitments preserve lifecycle/order/lineage and hashes across the restore. Restore refuses over unsaved work without
+`--force` (exit 4), and the displaced image is kept as a `pre-restore-<ts>` checkpoint, so a restore is itself undoable.
+List checkpoints with `cowshed ls --json` or `cowshed du`.
 
 ```
 $ cowshed checkpoint raven pre-refactor
@@ -431,14 +454,31 @@ symlinks, devices, sockets, and directories fail closed. EOF closes child stdin 
 records incomplete delivery; it does not implicitly kill the job. Job JSON reports stdin kind, delivered byte count,
 completion, and the normalized relative file path when applicable, never inline contents.
 
-For trivial shell `>`/`2>` commands cowshed may use its optimized capture path, but only after a real shell AST parser
-proves the exact narrow form safe. Anything ambiguous or involving append, fd duplication, pipelines, subshells,
-expansion, symlinks, existing/cross-filesystem targets, or `noclobber` runs through the ordinary shell unchanged.
-Parsing is optimization only, not authorization or correctness.
+A real shell AST may recognize a proven narrow literal `>`/`2>` workspace destination as `OutputStorage::Redirect`. The
+shell writes the live caller-visible `source`; after terminal state cowshed snapshots the admitted bytes into an
+independent protected `artifact` using inline Arrow Binary or clone/reflink/copy file storage. The source is never
+authoritative and is never hardlinked to the artifact. Ambiguous or unrecognized shell text keeps ordinary shell
+semantics, and bytes redirected away from the supervisor's pipes are then absent from the job handle.
 
-### Job output limit
+`cowshed exec` exposes post-terminal publication as `--stdout-copy <rel>` and `--stderr-copy <rel>`. Each requested
+workspace-relative destination defaults to `CreateNew`, so an existing path is an operational conflict rather than an
+implicit overwrite. `--replace-output` upgrades every requested copy in that invocation to `Replace`; using it without
+either copy destination is a usage error. Structured API/JSON requests retain a separate publication policy per stream
+instead of inheriting the CLI-wide switch.
 
-stdout and stderr share a configurable per-job capture quota (default 1 GiB). The quota includes persisted and in-flight
+Copies are published only after the canonical artifact is drained, fsynced, closed, and sealed. A destination is an
+independent clone/reflink when supported, otherwise an ordinary copy, and is atomically renamed under the selected
+policy. Publication does not alter `StreamInfo.storage` and is never used for reads or authority. Failure is a typed
+operational error and does not change the already-established process result.
+
+### Job artifact storage and output limit
+
+`stdout` and `stderr` each use typed captured/redirect storage with a canonical protected `Inline`/`File` artifact. The
+stream handle always reports bytes, SHA-256, and a bounded redacted summary. `Redirect.source` is never authority.
+Representation-transparent logs, attachment, and artifact reads always resolve the canonical `artifact`; small terminal
+bytes may stay inline, and a protected file is spilled lazily only when needed.
+
+The streams share a configurable per-job capture quota (default 1 GiB). The quota includes persisted and in-flight
 bytes. Crossing it terminates the whole process group with TERM, grace, then KILL, drains both pipes, and records the
 explicit `output-limit` terminal state. cowshed never silently truncates output while the command continues. Diagnostic
 summary truncation is separate.

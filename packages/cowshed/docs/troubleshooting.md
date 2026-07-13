@@ -85,6 +85,14 @@ and the gateway audit events for egress (`cowshed audit --denied | tail`). Commo
 - **Denial persists after a grant**: filesystem grants apply from the _next_ exec; a long-running process (watcher, dev
   server) keeps its launch-time profile. Restart that process.
 
+## Artifact integrity (exit 7)
+
+Exit 7 means protected content is missing, mutated, rolled back, or inconsistent with its controller commitment for
+`(repo_id, workspace_incarnation, job_id)`. It is not a child exit, sandbox denial, or summary mismatch, and retries or
+grants do not repair it. Preserve the workspace/checkpoint and follow the `cowshed doctor` integrity report; cowshed
+fails closed rather than choosing the caller-visible redirect source, a publication copy, or whichever record looks
+newer.
+
 **Checkpoint was not pruned.** GC keeps the union of three sets: explicit pins, every checkpoint younger than 14 days,
 and the newest five checkpoints per workspace. A user label and `cowshed checkpoint --keep` both pin; age or count does
 not override a pin. Unpin explicitly before expecting GC to remove it.
@@ -128,8 +136,9 @@ keep long-lived personal workspaces (their own paths stay stable, so their incre
 
 **The store and caches volumes are excluded from backup** — deliberately. Multi-gigabyte images with constant internal
 churn would bloat every backup (and, on the Data volume, every hourly local snapshot — that is why they live on
-dedicated volumes at all; see 01_storage.md), and everything inside them is either reproducible (caches, builds) or
-better protected by git. The durability contract:
+dedicated volumes at all; see 01_storage.md). Source and caches follow the durability rules below. Protected job content
+is authoritative within its origin incarnation/checkpoint snapshot, but a workspace image is still not an off-machine
+backup.
 
 - Committed + pushed (`cowshed push`, or merged in main): it's in main's repo — and main's off-machine durability is its
   **origin remote**, exactly as before adoption. Keep pushing main to origin as usual; the store volume is not a backup.
@@ -139,7 +148,8 @@ better protected by git. The durability contract:
 
 Restoring a machine: clone main's repo from its origin remote, `cowshed adopt` again; workspaces are recreated from
 their saved branches (`cowshed new x --ref refs/cowshed/x/wip`). Checkpoints and images are not backup artifacts — never
-treat them as one.
+treat them as one. Export any terminal job stream you need to retain independently; cowshed materializes a clone,
+reflink, or copy, never a hardlink to protected content.
 
 ## ZFS pool and hierarchy
 
@@ -157,10 +167,12 @@ admits a supervisor or job. No state should accept both tokens; `cowshed doctor`
 
 ## When cowshed itself misbehaves
 
-`cowshed doctor --json` is the bug-report payload: it includes versions, invariant results, and the last few operations
-from the telemetry store (`cowshed logs --since 1h` shows the same thing). State is fully derivable, so the nuclear
-option is safe and small: detach everything (`cowshed detach` per workspace), and every subsequent command re-derives
-reality. There is no cache to clear and no database to reset.
+`cowshed doctor --json` is the bounded bug-report payload: it includes versions, invariant results, continuity metadata,
+hashes, and the last few operations from the telemetry store (`cowshed logs --since 1h` shows the same thing), never raw
+job stdout/stderr. Workspace lifecycle can be re-derived after detach, but protected job content exists only in its
+origin incarnation/checkpoint or an independent export. To reset attachment state, detach each workspace with
+`cowshed detach`; subsequent commands re-derive mounts and controller wiring. There is no cache to clear and no database
+to reset.
 
 For cache-volume corruption specifically there is a bigger, equally safe hammer: nothing unique lives on
 `cowshed.caches`, so `diskutil apfs deleteVolume` and letting cowshed lazily recreate it is always an option — the
