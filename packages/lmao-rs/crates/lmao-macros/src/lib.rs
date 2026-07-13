@@ -281,15 +281,22 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
                 })
             }
 
-            /// Start a span buffer at the ratchet-recommended capacity.
+            /// Start a dynamically named span buffer at the ratchet-recommended capacity.
             #vis fn start(
                 identity: ::std::sync::Arc<::lmao_core::SpanIdentity>,
+                name: impl Into<::lmao_core::SharedStr>,
                 anchor: &::lmao_core::TraceAnchor,
                 clock: &dyn ::lmao_core::Clock,
             ) -> Self {
                 let capacity = Self::ratchet().lock().unwrap().capacity();
                 Self {
-                    span: ::lmao_core::SpanBuffer::start(identity, capacity, anchor, clock),
+                    span: ::lmao_core::SpanBuffer::start_dynamic(
+                        identity,
+                        capacity,
+                        name.into(),
+                        anchor,
+                        clock,
+                    ),
                     #(#col_inits,)*
                 }
             }
