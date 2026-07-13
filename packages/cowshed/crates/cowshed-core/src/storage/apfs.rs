@@ -159,6 +159,11 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         expected: &MarkerExpectation,
     ) -> Result<(), ApfsStorageError>;
     fn detach(&self, attachment: Self::Attachment, force: bool) -> Result<(), ApfsStorageError>;
+    fn heal_mount(
+        &self,
+        workspace: &WorkspaceRef,
+        mount_point: &Path,
+    ) -> Result<(), ApfsStorageError>;
     fn retain_mounted(
         &self,
         workspace: &WorkspaceRef,
@@ -181,6 +186,14 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         canonical: &Path,
         undo: &Path,
     ) -> Result<(), ApfsStorageError>;
+    fn publish_restored_metadata(
+        &self,
+        staged: &Path,
+        canonical: &Path,
+        workspace: &WorkspaceRef,
+        revision: Revision,
+        source_image: &Path,
+    ) -> Result<(), ApfsStorageError>;
     fn rollback_restore(
         &self,
         canonical: &Path,
@@ -191,6 +204,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     fn reclaim_image(&self, image: &Path, format: ImageFormat) -> Result<(), ApfsStorageError>;
     fn list(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError>;
     fn mounts(&self, repo: &RepoId) -> Result<Vec<KernelMountFact>, ApfsStorageError>;
+    fn recover_pending(&self, config: &ApfsSubstrateConfig) -> Result<(), ApfsStorageError>;
     fn stats(
         &self,
         workspace: &WorkspaceRef,
@@ -354,7 +368,12 @@ where
         let _guard = Arc::clone(&self.lifecycle_exclusion).lock_owned().await;
         let host = Arc::clone(&self.host);
         let config = Arc::clone(&self.config);
-        self.lane.dispatch(move || job(host, config)).await
+        self.lane
+            .dispatch(move || {
+                host.recover_pending(&config)?;
+                job(host, config)
+            })
+            .await
     }
 }
 
@@ -495,6 +514,8 @@ where
     async fn ensure_mounted(&self, workspace: &WorkspaceRef) -> Result<PathBuf, Self::Error> {
         let workspace = workspace.clone();
         self.dispatch_locked(move |host, config| {
+            let mount_point = mount_point(&config, &workspace)?;
+            host.heal_mount(&workspace, &mount_point)?;
             let storage = host.list(workspace.repo())?;
             let mounts = host.mounts(workspace.repo())?;
             let derived = super::lifecycle::derive_workspaces(storage, mounts)?;
@@ -503,7 +524,6 @@ where
                 .find(|candidate| candidate.workspace == workspace)
                 .map(|candidate| candidate.mount_state)
                 .ok_or(ApfsStorageError::InvalidPlan("workspace is not published"))?;
-            let mount_point = mount_point(&config, &workspace)?;
             if matches!(state, MountState::Mounted { .. }) {
                 return Ok(mount_point);
             }
@@ -574,8 +594,14 @@ where
         expected: &[ExpectedState],
     ) -> Result<Vec<ObservedState>, Self::Error> {
         let host = Arc::clone(&self.host);
+        let config = Arc::clone(&self.config);
         let expected = expected.to_vec();
-        self.lane.dispatch(move || host.observe(&expected)).await
+        self.lane
+            .dispatch(move || {
+                host.recover_pending(&config)?;
+                host.observe(&expected)
+            })
+            .await
     }
 
     async fn apply(
@@ -698,6 +724,8 @@ fn apply_adopt<H: ApfsExecutionHost>(
         capacity: config.capacity.clone(),
         volume_name: volume_name(repo, &main_name()),
         case_sensitivity: config.case_sensitivity,
+        owner_uid: unsafe { libc::getuid() },
+        owner_gid: unsafe { libc::getgid() },
         image_format: match requested_format {
             ImageFormat::Asif => ImageFormatSelection::Auto,
             ImageFormat::Sparse => ImageFormatSelection::Exact(ImageFormat::Sparse),
@@ -922,6 +950,19 @@ fn apply_restore<H: ApfsExecutionHost>(
             .and_then(|()| host.rollback_restore(&canonical, &undo, &staged))
             .and_then(|()| mount_canonical(host, &canonical, &canonical_mount, &current));
         return combine_cleanup("restore rollback", primary, cleanup);
+    }
+    if let Err(primary) = host.publish_restored_metadata(
+        &staged,
+        &canonical,
+        &replacement,
+        replacement.revision(),
+        &checkpoint,
+    ) {
+        let cleanup = host
+            .detach_mounted(&replacement, false)
+            .and_then(|()| host.rollback_restore(&canonical, &undo, &staged))
+            .and_then(|()| mount_canonical(host, &canonical, &canonical_mount, &current));
+        return combine_cleanup("restore metadata publication", primary, cleanup);
     }
     Ok(Applied::Restore(RestoreReceipt {
         previous_incarnation,
