@@ -25,7 +25,8 @@ SpanBuffers, enabling per-op tuning.
 
 1. **Zero Configuration** - Works out of the box
 2. **Adaptive Performance** - Adjusts to workload
-3. **Memory Safety** - Never causes OOM
+3. **Measured Memory Safety** - Enforces effective-memory limits and observable backpressure; arbitrary workloads can
+   still exhaust process memory
 4. **Optimal Throughput** - Balances memory vs performance
 5. **Environment Agnostic** - Same code everywhere
 6. **Per-Span Buffers** - Each span gets its own buffer (created by op wrapper), avoiding trace_id/span_id TypedArrays
@@ -45,6 +46,21 @@ SpanBuffers, enabling per-op tuning.
 growth-history/compaction-history) are **aspirational illustrations, not shipped** — the production tuner is
 intentionally minimal. Memory-pressure / idle response is handled by `FlushScheduler`
 ([§FlushScheduler Design](#smoo/lmao!n/buffer-tuning-flush)), not the capacity tuner.
+
+### Shipped versus target performance contract
+
+The shipped tuner is the utilization ratchet above. Predictive growth, memory-pressure compaction, usage-driven
+promotion, and multi-buffer coordination remain target designs unless their sections explicitly say shipped.
+
+Tuning decisions MUST use **effective memory**: JS heap plus external/backing-store bytes, committed WASM pages
+(including free/orphaned blocks), Arrow-owned output, source bytes pinned by active `ArrowLease`s, temporary
+dictionary/UTF-8/null buffers, and cache/allocator overhead. Shared startup `PhysicalLayoutPlan` and `VocabularyBinding`
+state is reported separately and may be amortized only with a published divisor.
+
+The warmed fixed-capacity write remains the zero-new-heap-allocation target. Capacity adjustment, first lazy-column
+write, overflow-chain creation, statistics emission, `memory.grow()`, and flush are slow/cold paths. Tuning MUST NOT add
+shape-changing properties or polymorphic access to generated buffers. The common capacity check remains one predictable
+not-overflow branch; overflow frequency and latency are reported separately.
 
 ### Core Principle: Observe and Adapt
 
@@ -318,6 +334,16 @@ The `FlushScheduler` manages background flushing of multiple root buffers (one p
    - The application composes all library schemas into a single `ModuleContext` at startup
    - All buffers created from that module share the same `module.logSchema` schema
    - The conversion function validates this requirement and throws if schemas differ
+
+**Current versus target ownership.** The shipped scheduler may coalesce multiple roots into one table. The target
+defines one logical request/trace flush measurement and one `ArrowLease` per request result. Transport or Arrow-native
+chunks may be coalesced later, but request boundaries remain visible for semantic checksums, p50/p95/p99/p99.9,
+effective-memory attribution, cancellation, and release.
+
+Before conversion the trace is frozen. Contiguous primitive/null regions may be borrowed; overflow remains chunked when
+supported, otherwise one explicit Arrow-owned concatenation copy is counted. UTF-8, dictionary, synthesized-null, and
+concatenated buffers are Arrow-owned. Mutable source buffers cannot reset, pool, recycle, or suffer invalidating WASM
+growth while a lease is active. Asynchronous transport owns the lease until consumption completes.
 
 **Flush Cycle**:
 
@@ -663,6 +689,17 @@ class MonitoredBuffer extends SelfTuningBuffer {
   }
 }
 ```
+
+### Benchmark acceptance gates
+
+Capacity/tuning Mitata scenarios MUST follow
+[01b1 §Required Mitata Protocol](./01b1_buffer_performance_optimizations.md#smoo/lmao!n/buffer-perf-benchmark-protocol):
+plugin-off, plugin-on/current, and candidates use identical semantic checksums, position-balanced ordering,
+machine-readable raw samples, and p50/p95/p99/p99.9 for startup, span setup, warmed writes, overflow/adjustment, and
+complete per-request Arrow flush. Allocation, GC, branch/IC, and effective-memory observations are auxiliary
+instrumentation alongside Mitata and may be unavailable. Reject warmed fixed-capacity allocations, post-warmup
+hidden-class transitions or polymorphic hot ICs, an unstable common capacity branch, unbounded lease queues, semantic
+differences, or regressions beyond the predeclared noise threshold.
 
 ## Implementation Example
 
@@ -1327,22 +1364,8 @@ This ensures tracers can capture the complete stats picture before they're lost 
 
 ## Summary
 
-Self-tuning buffers provide:
-
-- **Zero configuration** - Works out of the box
-- **Adaptive capacity** - Grows and shrinks automatically
-- **Memory awareness** - Responds to system pressure
-- **Workload optimization** - Adapts to usage patterns
-- **Global coordination** - Multiple buffers share resources
-- **Per-span isolation** - Each span gets its own buffer for sorted output
-- **Buffer chaining** - Overflow handled gracefully while tuning learns optimal size
-- **Freelist optimization** - Buffer pooling for GC optimization (WASM strategy; JS uses V8 GC)
-- **Column promotion** - Lazy columns automatically promote to eager when heavily used
-- **Buffer statistics** - Periodic logging of tuning metrics via structured entry types
-
-**Important Note**: This self-tuning is specifically designed for trace logging, where we have clear metrics (spans per
-module, overflow rates, utilization patterns, column usage). The tuning mechanism is part of the trace logging system,
-not a general-purpose buffer library. Each span's own buffer eliminates the need for trace_id/span_id TypedArrays since
-they're constant per buffer.
-
-The result: a logging system that "just works" whether you're on a Raspberry Pi or a 64-core server.
+Self-tuning currently provides the shipped utilization ratchet, aligned capacities, overflow chaining, scheduler-driven
+flush, WASM freelist reuse, and structured capacity statistics described by their implementation-status notes. Richer
+predictive tuning, usage-driven promotion, and multi-buffer coordination are targets, not shipped facts. Success means
+bounded, observable effective memory and better phase-specific benchmark results—not universal zero overhead, zero copy,
+or immunity from OOM.

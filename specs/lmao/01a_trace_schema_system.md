@@ -28,24 +28,64 @@ requirements. The system optimizes each type appropriately rather than forcing t
 
 LMAO provides three distinct string types with different storage strategies optimized for different access patterns.
 
-**CRITICAL**: Strings are **NOT interned on the hot path**. CATEGORY and TEXT columns store raw JS strings in `string[]`
-arrays during logging. Dictionary building and UTF-8 encoding happen only during cold-path Arrow conversion. This keeps
-logging lightweight while conversion can be heavier.
+#### Shipped representation
 
-| Type         | Hot Path Storage       | Cold Path (Arrow Conversion)      | Memory Growth     | Use Case                     |
-| ------------ | ---------------------- | --------------------------------- | ----------------- | ---------------------------- |
-| **ENUM**     | Uint8Array (1 byte)    | Zero work (pre-built dictionary)  | Bounded (fixed)   | Known compile-time values    |
-| **CATEGORY** | string[] (raw strings) | Sort + dedupe → sorted dictionary | Per-flush bounded | Values that often repeat     |
-| **TEXT**     | string[] (raw strings) | 2-pass conditional dictionary     | Per-flush bounded | Unique values, rarely repeat |
+The shipped implementation does **not** intern strings on the warmed entry path. `CATEGORY` and `TEXT` columns store raw
+JS strings in `string[]`; dictionary construction and UTF-8 encoding occur during Arrow conversion. This describes the
+current Op-local implementation, not the clean-cutover target below.
+
+| Type         | Shipped entry storage  | Shipped Arrow conversion            | Semantic intent                 |
+| ------------ | ---------------------- | ----------------------------------- | ------------------------------- |
+| **ENUM**     | Numeric typed index    | Predefined dictionary               | Closed compile-time value set   |
+| **CATEGORY** | `string[]` raw strings | Sort/dedupe and encode              | Repeating runtime values        |
+| **TEXT**     | `string[]` raw strings | Conditional/raw string construction | High-cardinality runtime values |
+
+#### Target representation: schema physicalization
+
+At startup, a canonical log schema is lowered to an immutable `PhysicalLayoutPlan`. The plan fixes column order,
+physical widths and offsets, eager/lazy placement, null bitmaps, static message-index lanes, dynamic reference lanes,
+and backend-specific factories. The runtime caches the plan and generated classes by **schema identity + physical layout
+version + backend kind**. Prefix/remap information that changes physical writes is part of the key or an immutable
+binding layered over the cached plan; it is never rediscovered per entry.
+
+Schema lowering produces **static**, **structured**, or **dynamic** callsite classes. A `mixed` physical plan contains
+both static-index and dynamic-reference lanes; `mixed` is not a callsite class.
+
+The schema type continues to describe semantics, not whether a particular value happened to be observed before:
+
+| Type         | Target warmed entry storage                                 | Target flush behavior                              |
+| ------------ | ----------------------------------------------------------- | -------------------------------------------------- |
+| **ENUM**     | Fixed-width numeric index                                   | Reuse the plan's closed dictionary                 |
+| **CATEGORY** | Dynamic reference lane for runtime strings                  | Deduplicate/encode through reusable category state |
+| **TEXT**     | Dynamic reference lane preserving raw/high-cardinality data | Encode without CATEGORY identity semantics         |
+
+Compiler-known message vocabulary is separate from user `CATEGORY`/`TEXT` columns. Checker-proven literal operational
+templates use `kindTag = 1` (`LOG_TEMPLATE`), and checker-proven literal span names use `kindTag = 2` (`SPAN_NAME`);
+both store process-dense `Uint32` indices that are Arrow-ready. Non-literal span names and dynamic diagnostic messages
+use tagged dynamic reference lanes and are encoded on the overflow/flush slow path. They MUST NOT enter the static lane
+through warmed-path interning.
+
+This division is normative:
+
+- A dynamic `CATEGORY` remains dynamic even when it repeats. Deduplication is a flush representation choice.
+- A dynamic `TEXT` remains dynamic and high-cardinality; it MUST NOT be promoted to a static template.
+- The LMAO runtime installer MUST be imported and evaluated before module registration. The registry validates each
+  typed-array fragment and copies/merges it into a runtime-owned immutable dictionary generation; module fragment arrays
+  remain inputs, never borrowed Arrow storage. Its returned `VocabularyBinding` maps `binding[ordinal]` directly to a
+  process-dense Arrow index.
+- Dense indices are process-local and append-only by fragment registration order. A new immutable generation preserves
+  the prior generation as an unchanged prefix and appends unseen decoded values, keeping old bindings prefix-valid.
+  Stable IDs and decoded values are deterministic, but dense indices and dictionary order are not cross-process
+  guarantees. Index `0` is valid; null is represented by the Arrow validity bitmap.
+- The target warmed entry write performs fixed monomorphic stores and allocates nothing while capacity remains. Startup,
+  span setup, overflow/slow path, and per-request flush have separate allocation budgets.
+- Per-request flush reuses the `PhysicalLayoutPlan`, backend class, vocabulary binding, dictionary generation, scratch
+  arenas, and Arrow-compatible views. The target is few or no allocations; an `ArrowLease` pins runtime-owned storage
+  and the exact immutable dictionary generation until release, never a caller's mutable fragment arrays.
 
 See
 **[Buffer Performance Optimizations](./01b1_buffer_performance_optimizations.md#string-interning-and-utf-8-caching-architecture)**
-for implementation details, including:
-
-- Why hot-path interning was rejected
-- SIEVE cache usage for UTF-8 encoding
-- Dictionary building strategies per type
-- Memory growth prevention mechanisms
+for the shipped conversion path and optimization roadmap.
 
 ### String Type Decision Matrix <a id="smoo/lmao!n/schema-string-types.matrix"></a>
 

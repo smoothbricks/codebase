@@ -32,10 +32,39 @@ Problems:
 TypedArrays bypass all these costs:
 
 ```javascript
-// Direct memory access, no allocations
-buffer.timestamp[idx] = Date.now(); // 8 bytes written directly
-buffer.userIds[idx] = 123; // 4 bytes written directly
+// Warmed write phase: direct stores into existing views
+buffer.timestamp[idx] = timestamp;
+buffer.userIds[idx] = 123;
 ```
+
+## Enforceable Performance and Measurement Contract <a id="smoo/lmao!n/buffer-perf-contract"></a>
+
+The unit of proof is a phase, never the whole logging system:
+
+1. **Startup** builds `PhysicalLayoutPlan`, performs versioned `VocabularyBinding`, generates classes/accessors, and
+   pre-encodes fixed dictionaries. Time, allocations, code size, and shared memory are reported independently.
+2. **Span setup** creates the buffer object, backing storage/views, identity, tree links, and initial rows. It has a
+   bounded allocation budget but is not allocation-free.
+3. **Warmed entry writes** target zero new heap allocations after warmup for an existing fixed-capacity buffer. Stores
+   MUST stay monomorphic with stable hidden classes/inline caches; the common capacity decision MUST be one predictable
+   not-overflow branch. First write to a lazy column is a slow path.
+4. **Overflow and other slow paths** MAY allocate a continuation, grow WASM, encode an uncached string, or update tuning
+   state. Frequency, latency percentiles, allocation bytes, and branch behavior are measured separately.
+5. **Per-request Arrow flush** MAY allocate dictionaries, UTF-8/offset/null buffers, wrappers, and contiguous output. It
+   MUST avoid per-value builder append, maximize borrowed/chunked Arrow-native reuse, and return an `ArrowLease` when
+   Arrow borrows buffer memory.
+
+Effective memory MUST include JS heap, external/backing-store bytes, committed WASM pages and fragmentation, Arrow-owned
+output, bytes pinned by active leases, temporary conversion buffers, cache contents, and observed allocator/GC overhead.
+Report peak and retained deltas per request; `heapUsed` alone is not proof of a bound.
+
+**Acceptance gate.** Use the repository-standard Mitata benchmark runner with plugin-off, plugin-on/current, and every
+candidate variant. Require identical semantic checksums, position-balance variants across runs, and retain
+schema-versioned machine-readable raw samples and environment metadata. Report p50/p95/p99/p99.9 for every phase,
+effective-memory components, allocations/op, and GC events/pauses when available. Fail on checksum mismatch, warmed
+fixed-capacity allocation, polymorphic/megamorphic hot ICs, hidden-class transitions after warmup, an unpredictable
+common overflow branch, or a percentile/memory regression outside the predeclared noise threshold. Text/Markdown
+summaries MUST be commit-message-ready.
 
 ## V8 Optimization Patterns <a id="smoo/lmao!n/buffer-perf-v8-patterns"></a>
 
@@ -294,13 +323,13 @@ Strings are expensive:
 
 ### Hot Path vs Cold Path: Deferred Processing
 
-**CRITICAL DESIGN PRINCIPLE**: The hot path (logging) should be as lightweight as possible. All expensive string
-entry_type (dictionary building, UTF-8 encoding, sorting) are deferred to the cold path (Arrow conversion).
+**CRITICAL DESIGN PRINCIPLE**: Defer dictionary building, UTF-8 encoding, and sorting from warmed entry writes to
+per-request Arrow flush. This shifts cost; it does not erase it.
 
 ```
 HOT PATH (logging)                    COLD PATH (Arrow conversion)
 ────────────────────                  ────────────────────────────
-• ENUM: Map lookup → Uint8 write      • Zero work (pre-built)
+• ENUM: Map lookup → Uint8 write      • Wrap pre-built indices/dictionary
 • CATEGORY: string[] assignment       • Sort + dedupe + UTF-8 encode
 • TEXT: string[] assignment           • 2-pass conditional dictionary
 
@@ -316,7 +345,7 @@ logging latency minimal.
 The system provides three string types with different performance/memory tradeoffs. **See
 [01a_trace_schema_system.md](./01a_trace_schema_system.md) for complete API documentation.**
 
-#### 1. ENUM: Pre-built Sorted Dictionary (Zero Hot-Path Cost)
+#### 1. ENUM: Pre-built Sorted Dictionary (Fixed Warmed-Write Work)
 
 **Use Case**: Known values at compile time (entry types, log levels, status codes)
 
@@ -375,7 +404,7 @@ class GeneratedEnumColumn {
     this.values[idx] = dictIdx;
   }
 
-  // COLD PATH: Zero work - everything pre-computed
+  // COLD PATH: wrap pre-computed payload; count view/Arrow wrappers
   toArrow(): ArrowColumn {
     return {
       type: 'dictionary',
@@ -401,18 +430,19 @@ class GeneratedEnumColumn {
 
 **Performance Characteristics:**
 
-| Operation       | Cost                                | Allocations       |
-| --------------- | ----------------------------------- | ----------------- |
-| Startup         | O(n log n) sort + O(n) UTF-8 encode | Dictionary arrays |
-| Hot path write  | O(1) switch + array write           | Zero              |
-| Cold path flush | O(1) slice                          | Index array copy  |
+| Operation                   | Cost                                | Allocations                       |
+| --------------------------- | ----------------------------------- | --------------------------------- |
+| Startup                     | O(n log n) sort + O(n) UTF-8 encode | Dictionary arrays                 |
+| Warmed fixed-capacity write | O(1) switch + array write           | Target: zero new heap allocations |
+| Cold path flush             | O(1) slice                          | Index array copy                  |
 
 #### 2. CATEGORY: Raw String Storage + Cold-Path Dictionary (Repeated Values)
 
 **Use Case**: Runtime values that repeat (user IDs, actions, regions)
 
-**Key Insight**: Store raw JS strings in `string[]` on hot path (zero cost). Build sorted dictionary with SIEVE-cached
-UTF-8 encoding only during Arrow conversion (cold path). **NO interning on hot path.**
+**Key Insight**: Store raw JS string references in `string[]` during warmed writes. The assignment requires no new
+allocation when capacity and the string already exist; producer string allocation is not erased. Build the sorted
+dictionary during per-request Arrow flush. **NO interning on the warmed write path.**
 
 ```typescript
 // Schema definition
@@ -426,7 +456,7 @@ const schema = {
 class CategoryColumn {
   private strings: string[] = []; // Just JS string references
 
-  // HOT PATH: Just store reference (zero work, NO interning)
+  // WARMED PATH: store an existing string reference; producer allocation is separate
   write(idx: number, value: string): void {
     this.strings[idx] = value; // Direct array assignment only
   }
@@ -513,12 +543,12 @@ export const globalUtf8Cache = new Utf8Cache();
 
 **Performance Characteristics:**
 
-| Operation       | Cost                         | Allocations       |
-| --------------- | ---------------------------- | ----------------- |
-| Hot path write  | O(1) array assignment        | Zero              |
-| Cold path flush | O(n log n) sort + O(n) UTF-8 | Dictionary arrays |
-| UTF-8 (cached)  | O(1) SIEVE get               | Zero              |
-| UTF-8 (miss)    | O(k) encode + O(1) SIEVE set | Uint8Array        |
+| Operation                   | Cost                         | Allocations                                              |
+| --------------------------- | ---------------------------- | -------------------------------------------------------- |
+| Warmed fixed-capacity write | O(1) array assignment        | Target: zero new heap allocations                        |
+| Per-request flush           | O(n log n) sort + O(n) UTF-8 | Dictionary/Arrow output arrays                           |
+| UTF-8 cache hit             | O(1) SIEVE get               | No required new encoded-byte buffer; lookup work remains |
+| UTF-8 miss                  | O(k) encode + O(1) SIEVE set | Uint8Array                                               |
 
 **Why No Hot-Path Interning for CATEGORY:**
 
@@ -548,7 +578,7 @@ const schema = {
 class TextColumn {
   private strings: string[] = []; // Just JS string references
 
-  // HOT PATH: Just store reference (zero work)
+  // WARMED PATH: store an existing string reference; producer allocation is separate
   write(idx: number, value: string): void {
     this.strings[idx] = value;
   }
@@ -638,11 +668,11 @@ class TextColumn {
 
 **Performance Characteristics:**
 
-| Operation       | Cost                                      | Allocations              |
-| --------------- | ----------------------------------------- | ------------------------ |
-| Hot path write  | O(1) array assignment                     | Zero                     |
-| Cold path flush | O(n) count + O(n log n) sort + O(n) UTF-8 | Dictionary/values arrays |
-| Post-flush      | Strings array cleared                     | Zero (GC releases)       |
+| Operation                   | Cost                                      | Allocations                                         |
+| --------------------------- | ----------------------------------------- | --------------------------------------------------- |
+| Warmed fixed-capacity write | O(1) array assignment                     | Target: zero new heap allocations                   |
+| Per-request flush           | O(n) count + O(n log n) sort + O(n) UTF-8 | Dictionary/values arrays                            |
+| Post-flush                  | Strings array reference cleared           | GC/reclamation is observable, not immediate or free |
 
 ### String Type Comparison
 
@@ -652,7 +682,7 @@ class TextColumn {
 | **Hot path work**      | Switch + array write      | Array assignment only       | Array assignment only       |
 | **Hot path cost**      | O(1)                      | O(1)                        | O(1)                        |
 | **Hot path interning** | No (compile-time switch)  | **No** (deferred to cold)   | **No** (deferred to cold)   |
-| **Cold path**          | Zero (pre-computed)       | Sort + dedupe + SIEVE UTF-8 | 2-pass + conditional dict   |
+| **Cold path**          | Wrap pre-computed payload | Sort + dedupe + SIEVE UTF-8 | 2-pass + conditional dict   |
 | **Memory bound**       | Fixed (schema)            | Per-flush (strings cleared) | Per-flush (strings cleared) |
 | **Dictionary sorted**  | ✓ At startup              | ✓ At flush                  | ✓ If used                   |
 | **UTF-8 timing**       | At startup (pre-computed) | At flush (SIEVE cached)     | At flush                    |
@@ -847,68 +877,19 @@ class NullBitmapBuffer {
 
 ## Benchmarking
 
-### Micro-benchmarks
+### Required Mitata Protocol <a id="smoo/lmao!n/buffer-perf-benchmark-protocol"></a>
 
-```typescript
-// Measure hot path performance
-function benchmarkWrites() {
-  const buffer = new SpanBuffer(10000);
-  const iterations = 1000000;
+Repository-standard Mitata scenarios MUST exercise startup, span setup, warmed fixed-capacity writes, first-use/overflow
+slow paths, and complete request→trace→Arrow flush separately. Each scenario runs plugin-off, plugin-on/current, and
+candidates with position-balanced order; validates an identical semantic checksum; preserves machine-readable raw
+samples; and publishes p50/p95/p99/p99.9 plus environment/commit identifiers. Allocation, effective-memory, GC,
+IC/hidden-class, and branch observations are auxiliary instrumentation alongside Mitata; unavailable evidence is
+`unavailable`, never zero.
 
-  console.time('writes');
-
-  for (let i = 0; i < iterations; i++) {
-    buffer.writeHot(Date.now(), 1, 123);
-  }
-
-  console.timeEnd('writes');
-
-  const nanosPerWrite = (performance.now() * 1e6) / iterations;
-  console.log(`${nanosPerWrite.toFixed(1)}ns per write`);
-}
-
-// Compare with object allocation
-function benchmarkObjects() {
-  const logs = [];
-  const iterations = 1000000;
-
-  console.time('objects');
-
-  for (let i = 0; i < iterations; i++) {
-    logs.push({
-      timestamp: Date.now(),
-      operation: 1,
-      userId: 123,
-    });
-  }
-
-  console.timeEnd('objects');
-}
-```
-
-### Memory profiling
-
-```typescript
-// Track memory usage
-function profileMemory() {
-  const before = process.memoryUsage();
-
-  const buffer = new SpanBuffer(1000000);
-
-  // Fill buffer
-  for (let i = 0; i < 1000000; i++) {
-    buffer.write(Date.now(), 1, i);
-  }
-
-  const after = process.memoryUsage();
-
-  console.log('Memory used:', {
-    heap: (after.heapUsed - before.heapUsed) / 1024 / 1024 + ' MB',
-    external: (after.external - before.external) / 1024 / 1024 + ' MB',
-    perEntry: (after.external - before.external) / 1000000 + ' bytes',
-  });
-}
-```
+Microbenchmarks MAY isolate fixed stores, but MUST use precomputed values and already-allocated buffers. End-to-end
+flush benchmarks include dictionary/UTF-8/null handling, overflow shape, lease acquisition/release, and a
+consumer-visible Arrow checksum. Retain per-position data to detect warmup, thermal, or ordering bias and emit
+Markdown/text suitable for a commit message.
 
 ## Common Pitfalls
 
@@ -971,12 +952,15 @@ write(value: number) {
 
 ### The Flush Cycle
 
-Memory is managed in flush cycles. Each cycle:
+Memory is managed in request-attributable flush cycles:
 
-1. **Hot path**: Accumulate data in buffers (fast writes)
-2. **Flush trigger**: Capacity threshold, time interval, or explicit flush
-3. **Cold path**: Convert to Arrow, serialize, send
-4. **Cleanup**: Release memory for GC
+1. **Warmed write path**: accumulate into buffer-owned storage.
+2. **Flush trigger**: freeze the request trace.
+3. **Cold conversion**: borrow contiguous/chunked regions under `ArrowLease` or create Arrow-owned conversion buffers.
+4. **Cleanup**: reset, recycle, or GC source memory only after every borrowing lease is released.
+
+Transport batching MAY group completed request outputs but MUST preserve per-request latency, checksum, memory, and
+ownership accounting. WASM growth that invalidates views is forbidden while a lease pins the current memory epoch.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -990,7 +974,7 @@ Memory is managed in flush cycles. Each cycle:
 │  │ Write data   │  trigger  │ Convert to   │  send      │ Clear TEXT │ │
 │  │ to buffers   │──────────▶│ Arrow tables │───────────▶│ strings[]  │ │
 │  │              │           │              │            │            │ │
-│  │ ENUM: idx    │           │ ENUM: zero   │            │ CATEGORY:  │ │
+│  │ ENUM: idx    │           │ ENUM: wrap   │            │ CATEGORY:  │ │
 │  │ CATEGORY: idx│           │ CATEGORY:    │            │ reset flush│ │
 │  │ TEXT: string │           │  sort+UTF-8  │            │ state only │ │
 │  │              │           │ TEXT: 2-pass │            │            │ │
@@ -1343,8 +1327,8 @@ class ModuleContext {
 // lineNumber is written directly to lineNumber_values TypedArray (NOT stored as property)
 ```
 
-**Why pre-encode**: These strings are written to Arrow columns frequently. Pre-encoding at module creation means zero
-UTF-8 encoding cost during Arrow conversion.
+**Why pre-encode**: These strings are written to Arrow columns frequently. Pre-encoding at module creation moves UTF-8
+encoding to startup; per-request lookup/copy/wrapper costs remain measured.
 
 ### Design Decisions
 
@@ -1471,4 +1455,5 @@ Buffer performance optimizations leverage:
 - **Sequential access** - Prefetch friendly
 - **Hot path isolation** - Fast common case
 
-Result: <100ns writes with zero allocations, bounded memory growth.
+Result target: warmed fixed-capacity writes introduce zero new heap allocations and use fixed monomorphic stores with a
+predictable capacity branch. Startup, span setup, overflow, and request flush retain separate measured budgets.

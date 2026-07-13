@@ -268,78 +268,97 @@ span-ok: op:fetchPayment (success on attempt 3)
 
 ### Log Level Entry Types <a id="smoo/lmao!n/lmao-entry-log-level-entry-types"></a>
 
-Structured logging with message templates and typed attributes - **APPENDS new rows starting at row 2**:
+Structured logging appends rows starting at row 2. The shipped entry-type enum includes all five levels:
 
-- **`info`** - Information messages with optional structured data
-- **`debug`** - Debug messages with optional structured data
-- **`warn`** - Warning messages with optional structured data
-- **`error`** - Error messages with optional structured data
+- **`trace`** - Most verbose diagnostic events
+- **`debug`** - Diagnostic events
+- **`info`** - Structured operational information
+- **`warn`** - Structured operational warning
+- **`error`** - Structured operational failure
 
-> **Implementation status.** The shipped enum (`ENTRY_TYPE_NAMES` in `packages/lmao/src/lib/schema/systemSchema.ts`)
-> also defines a **`trace`** level (most verbose: `trace < debug < info < warn < error`), which this list omits. The
-> source is authoritative; aligning this section is tracked by `smoo/lmao!n/lmao-entry-spec-source-reconcile`.
+#### Static operational templates and diagnostic raw messages
 
-These entry types enable gradual migration from console.log by providing structured logging with the familiar log
-levels, but with typed attributes instead of just string concatenation.
+The clean-cutover target has two deliberate policies; they MUST NOT be blended:
 
-#### The `message` Column: Format Strings, NOT Interpolation
-
-**CRITICAL DESIGN DECISION**: Log messages use FORMAT STRINGS stored in the `message` column.
-
-Template placeholders use `{{fieldName}}` syntax (double braces), not `${fieldName}`.
-
-When you write:
+1. **Operational `info`/`warn`/`error`** require a compiler-visible literal template. Runtime values belong in an
+   object-literal field set whose keys are schema-known. Template interpolation, string concatenation, a dynamic message
+   expression, and a dynamically shaped attributes object are rejected. Target placeholders use `{fieldName}`; `{{` and
+   `}}` encode literal braces. This clean-cutover grammar explicitly replaces the shipped `{{fieldName}}` placeholder
+   form. The stored template is never rendered on the entry path.
+2. **Diagnostic `debug`/`trace`** may retain the existing raw dynamic string-reference form when the whole argument is
+   an existing string value. Avoidable interpolation and concatenation are rejected: use a literal template plus
+   object-literal fields when structure is available. A raw diagnostic string uses the dynamic message lane; it does not
+   become operational vocabulary.
 
 ```typescript
-const processUser = op(async ({ log }, userData) => {
-  log.info('User {{userId}} processed {{count}} items').with({ userId: 'user-123', count: 42 });
+log.info('User {userId} processed {count} items', { userId, count }); // valid structured operational form
+log.warn('Queue depth {depth} exceeded {limit}', { depth, limit }); // valid structured operational form
+log.info('Parser emitted {{token}}', {}); // valid: escaped braces, no field; stored text is "Parser emitted {token}"
+log.error(`Request ${requestId} failed`); // invalid: interpolation
+log.info(messageFromConfig); // invalid: dynamic operational message
+
+log.debug(debugText); // valid dynamic diagnostic reference
+log.trace('packet {packetId}', { packetId }); // valid structured diagnostic template
+log.debug(`packet ${packetId}`); // invalid: avoidable interpolation
+```
+
+The target callsite classes are **static** (literal with no fields), **structured** (literal plus object-literal
+fields), and **dynamic** (an allowed existing diagnostic string reference). `mixed` is not a callsite class; it names
+only a physical buffer/layout that contains both a static-index lane and a dynamic-reference lane.
+
+#### Message physical representation (Target, Not Yet Shipped)
+
+Every compiler-known log template or literal span name has a fragment-local ordinal. `kindTag = 1` means `LOG_TEMPLATE`;
+`kindTag = 2` means `SPAN_NAME`. Checker-proven literal span names use the static lane, while non-literal span names
+remain dynamic. The LMAO runtime installer MUST be imported and evaluated before any module invokes the Symbol-keyed
+registration callback. Direct `binding[ordinal]` indexing yields the process-dense `Uint32` message index; there is no
+warmed method dispatch or `messageIndex()` lookup.
+
+The registry validates the typed fragment and copies/merges it into a runtime-owned immutable dictionary generation.
+Module arrays are inputs, not borrowed mutable Arrow storage. Dense indices are process-local and append-only in
+fragment registration order: each new generation preserves the previous generation as an unchanged prefix and appends
+only unseen decoded values, so prior bindings remain prefix-valid. Stable IDs and decoded values are deterministic;
+dense indices and dictionary ordering are not deterministic across processes. Dense index `0` is valid and null is
+represented only by the Arrow validity bitmap.
+
+The warmed path performs no hash lookup, interning, string rendering, object enumeration, backend dispatch, or
+allocation. Dynamic references are resolved during overflow/flush processing. Per-request flush reuses the active
+vocabulary dictionary and `PhysicalLayoutPlan`; an `ArrowLease` pins the exact runtime-owned storage and immutable
+dictionary generation until export finishes, never the module's fragment arrays.
+
+Precompiled libraries register and own their vocabulary fragment inputs when evaluated. The application neither
+recompiles nor assumes ownership of library templates. Registration IDs are stable content-derived identifiers, while
+dense message indices are process-local hot/Arrow indices; they are not interchangeable.
+
+#### The `message` Column: Operational Templates and Diagnostic Raw References
+
+Operational messages use format templates stored logically in the `message` column; the target stores their dense
+vocabulary indices. Diagnostic `debug`/`trace` may instead use the raw dynamic-reference policy above. Target template
+placeholders use `{fieldName}`, with `{{` and `}}` for literal braces. The shipped `{{fieldName}}` grammar is replaced,
+not accepted as an alias in the clean cutover.
+
+```typescript
+const processUser = op(async ({ log }) => {
+  log.info('User {userId} processed {count} items', { userId: 'user-123', count: 42 });
 });
 ```
 
-The system stores:
+The logical row contains the template identity plus typed `userId` and `count` fields. It never contains a rendered
+string. This preserves queryable template identity, typed aggregation, and one stable vocabulary entry without
+allocating an interpolated message per call.
 
-| Column    | Value                                         | Type         |
-| --------- | --------------------------------------------- | ------------ |
-| `message` | `'User {{userId}} processed {{count}} items'` | S.category() |
-| `userId`  | `'user-123'`                                  | S.category() |
-| `count`   | `42`                                          | S.number()   |
+```sql
+SELECT userId, count(*), avg(count)
+FROM traces
+WHERE message = 'User {userId} processed {count} items'
+GROUP BY userId;
+```
 
-**The message is NOT interpolated.** The template `'User {{userId}} processed {{count}} items'` is stored verbatim.
-
-**Why Format Strings?**
-
-1. **String Interning**: `message` uses `S.category()` type. Each unique template is interned once. Even if you log
-   `"User {{userId}} processed {{count}} items"` 10,000 times with different values, the template string is stored ONCE.
-
-2. **Queryable Templates**: You can find all logs matching a specific template:
-
-   ```sql
-   SELECT * FROM traces WHERE message = 'User {{userId}} processed {{count}} items';
-   ```
-
-3. **Analytics on Values**: Group and aggregate by the actual values:
-
-   ```sql
-   SELECT userId, count(*), avg(count)
-   FROM traces
-   WHERE message = 'User {{userId}} processed {{count}} items'
-   GROUP BY userId;
-   ```
-
-4. **Type Safety**: Values are stored in typed columns (`count` as Float64, not as part of a string).
-
-**Contrast with Traditional Logging**:
+Traditional interpolation remains invalid because it destroys template identity:
 
 ```typescript
-// Traditional - interpolated string, no structure
-console.log(`User ${userId} processed ${count} items`);
-// Stores: "User user-123 processed 42 items" - unique string every time!
-
-// LMAO - format string with typed values
-const processUser = op(async ({ log }) => {
-  log.info('User {{userId}} processed {{count}} items').with({ userId: 'user-123', count: 42 });
-});
-// Stores: template once, values in typed columns - structured and efficient!
+console.log(`User ${userId} processed ${count} items`); // unstructured, allocates a rendered string
+log.info('User {userId} processed {count} items', { userId, count }); // structured target form
 ```
 
 **Row Behavior**: Unlike `tag.*` which overwrites row 0, `log.*` methods APPEND new rows:
@@ -531,10 +550,10 @@ const processRecords = op(async ({ log, tag, ok }, records) => {
 3. **Type safety**: Stored as `BigUint64Array`, converted to Arrow `uint64`
 4. **Query efficiency**: Direct column access without JSON parsing
 
-### SpanLogger Zero-Allocation Design <a id="smoo/lmao!n/lmao-entry-spanlogger-zero-allocation-design"></a>
+### SpanLogger Allocation Design <a id="smoo/lmao!n/lmao-entry-spanlogger-zero-allocation-design"></a>
 
-After exploring several approaches, we arrived at a zero-allocation design where the `SpanLogger` instance serves
-multiple roles:
+The shipped design avoids a per-call builder allocation by reusing each span's `SpanLogger`; span setup still creates
+the instance. The target warmed entry write allocates nothing while capacity remains:
 
 #### Design Evolution and Trade-offs
 
@@ -636,10 +655,10 @@ class LogAPI {
 #### Key Insights
 
 1. **Destructured APIs**: `tag` and `log` destructured directly from context - cleaner than nested access
-2. **Zero allocation chaining**: All fluent methods return the same instance for continued chaining
+2. **No per-call chaining allocation**: All fluent methods return the same instance for continued chaining
 3. **Runtime class generation**: TagAPI and LogAPI classes built at runtime with `new Function` for typed methods
 4. **Per-span instances**: Each span creates new tag/log instances with direct buffer references
-5. **Sorted output**: Each span's entries stay together in final Arrow output
+5. **Span-local grouping**: Each span's entries stay together in final Arrow output; this does not order dictionaries
 6. **Prototype compilation**: Attribute methods compiled onto prototypes at module context creation time
 7. **Module boundary safety**: Unknown columns written as null when called from deeper contexts
 8. **Reserved method names**: `with` is reserved and cannot be used as attribute column names
@@ -657,20 +676,19 @@ const processUser = op(async ({ tag, log, scope, span, ok, err }, userData) => {
   tag({ userId: 'user-123', requestId: 'req-456', operation: 'CREATE' });
 
   // ===== LOG MESSAGES (log) =====
-  // FORMAT STRING PATTERN - template stored in message, values in typed columns
-  // The message is NOT interpolated - template and values stored separately!
+  // TARGET FORMAT: {field} placeholder; {{ and }} encode literal braces.
 
-  log.info('Processing user {{userId}}').with({ userId: 123 });
-  // Stores: message='Processing user {{userId}}', userId=123
+  log.info('Processing user {userId}', { userId: 123 });
+  // Logical message='Processing user {userId}', userId=123
 
-  log.debug('Query on {{table}} took {{duration}}ms').with({ table: 'users', duration: 12.5 });
-  // Stores: message='Query on {{table}} took {{duration}}ms', table='users', duration=12.5
+  log.debug('Query on {table} took {duration}ms', { table: 'users', duration: 12.5 });
+  // Logical message='Query on {table} took {duration}ms', table='users', duration=12.5
 
-  log.warn('Rate limit {{current}}/{{max}}').with({ current: 95, max: 100 });
-  // Stores: message='Rate limit {{current}}/{{max}}', current=95, max=100
+  log.warn('Rate limit {current}/{max}', { current: 95, max: 100 });
+  // Logical message='Rate limit {current}/{max}', current=95, max=100
 
-  log.error('Connection to {{host}} failed').with({ host: 'db.example.com' });
-  // Stores: message='Connection to {{host}} failed', host='db.example.com'
+  log.error('Connection to {host} failed', { host: 'db.example.com' });
+  // Logical message='Connection to {host} failed', host='db.example.com'
 
   // ===== SCOPED ATTRIBUTES (scope) =====
   // Set once, propagates to all entries and child spans
@@ -695,7 +713,7 @@ const processUser = op(async ({ tag, log, scope, span, ok, err }, userData) => {
 
 #### Performance Characteristics
 
-- **Zero allocation**: Only the SpanLogger instance is allocated
+- **Shipped allocation profile**: Span setup allocates the SpanLogger; individual fluent calls allocate no builder
 - **Prototype methods**: All tag operations pre-compiled at module context creation time
 - **V8 optimization**: Single object with stable hidden class for optimal JIT compilation
 - **Memory efficiency**: No intermediate objects or proxies
@@ -716,7 +734,7 @@ This unrolling eliminates the object allocation and `Object.keys()` iteration at
 the transformer is enabled. Without the transformer, `with()` still works but has minor overhead from iterating the
 object keys.
 
-This design achieves the fluent API ergonomics while maintaining the zero-overhead performance goals.
+This design preserves fluent ergonomics while the target keeps each warmed, in-capacity entry write allocation-free.
 
 ### Type Safety with Generics <a id="smoo/lmao!n/lmao-entry-type-safety-with-generics"></a>
 
@@ -846,12 +864,11 @@ When defining attribute schemas, these names must be avoided to prevent conflict
 - `span-exception` entries created when exceptions bypass normal completion
 - Direct TypedArray writes for minimal overhead
 
-Each span's context (tag + log) references its own buffer, avoiding traceid+spanid appends and keeping entries neatly
-sorted in Arrow output.
+Each span's context (`tag` + `log`) references its own buffer, avoiding trace-id/span-id appends and preserving
+span-local row grouping in Arrow output. This is not a guarantee about vocabulary dictionary ordering.
 
 The `log` API is for explicit logging during execution, while `ok()`/`err()` are for span completion. Both use the same
-underlying entry type system. Each span's log instance references its own buffer, avoiding traceid+spanid appends and
-keeping logs neatly sorted in Arrow output.
+underlying entry type system and the span's own buffer.
 
 ## Fluent Result API <a id="smoo/lmao!n/lmao-entry-fluent-result-api"></a>
 
@@ -1113,9 +1130,9 @@ function createSpanCompletion(entryType: 'span-ok' | 'span-err', result?: any, a
 #### Log Entry Pattern
 
 ```typescript
-// IMPORTANT: messageTemplate is a FORMAT STRING, not an interpolated message!
-// Example: 'User {{userId}} created' - the template is stored verbatim
-// Values like userId are written to their own typed columns (userId_values)
+// TARGET GRAMMAR: {field} is a placeholder; {{ and }} encode literal braces.
+// Example: 'User {userId} created' is stored as template identity, never rendered on the entry path.
+// Values such as userId are written to their own typed columns.
 function createLogEntry(
   level: 'info' | 'debug' | 'warn' | 'error',
   messageTemplate: string, // FORMAT STRING - stored as-is, NOT interpolated
@@ -1129,8 +1146,8 @@ function createLogEntry(
   writers.writeModule(getCurrentModule());
   writers.writeMessage(messageTemplate); // message = message TEMPLATE (not interpolated!)
 
-  // Attribute VALUES go in their own columns
-  // Template references like {{userId}} are NOT replaced - stored verbatim
+  // Attribute VALUES go in their own columns.
+  // Template references such as {userId} are stored verbatim, not replaced.
   // (attribute columns are written by the codegen'd writers — 01g §Schema-Driven Column Writers)
   if (attributes) {
     for (const [key, value] of Object.entries(attributes)) {
@@ -1229,8 +1246,8 @@ The system enforces entry type constraints at the API level:
 
 - **All entry types**: `timestamp`, `trace_id`, `thread_id`, `span_id`, `entry_type`, `module`, `message`
 - **Span lifecycle** (`span-start`, `span-ok`, `span-err`, `span-exception`): `message` contains span name
-- **Log level types** (`info`, `debug`, `warn`, `error`): `message` contains message TEMPLATE (format string, not
-  interpolated)
+- **Operational log types** (`info`, `warn`, `error`): `message` identifies a literal template (never interpolated)
+- **Diagnostic log types** (`debug`, `trace`): `message` identifies a literal template or an allowed raw dynamic string
 - **Feature flag types** (`ff-access`, `ff-usage`): `message` contains flag name, `ff_value` contains the evaluated
   value
 - **Op metrics** (`op-invocations`, `op-errors`, `op-exceptions`, `op-duration-*`): `message` contains op name,
@@ -1241,19 +1258,20 @@ The system enforces entry type constraints at the API level:
 
 ### The `message` Column by Entry Type <a id="smoo/lmao!n/lmao-entry-the-message-column-by-entry-type"></a>
 
-| Entry Type                                            | `message` Contains                                       |
-| ----------------------------------------------------- | -------------------------------------------------------- |
-| `span-start`, `span-ok`, `span-err`, `span-exception` | Span name (e.g., `'create-user'`)                        |
-| `info`, `debug`, `warn`, `error`                      | Log message template (e.g., `'User {{userId}} created'`) |
-| `ff-access`, `ff-usage`                               | Flag name (e.g., `'advancedValidation'`, `'darkMode'`)   |
-| `op-*` (all 8 op metric types)                        | Op name (e.g., `'GET'`, `'createUser'`)                  |
-| `period-start`, `buffer-*` (5 types)                  | unused (null)                                            |
+| Entry Type                                            | `message` Contains                                             |
+| ----------------------------------------------------- | -------------------------------------------------------------- |
+| `span-start`, `span-ok`, `span-err`, `span-exception` | Span name (e.g., `'create-user'`)                              |
+| `info`, `warn`, `error`                               | Literal operational template (e.g., `'User {userId} created'`) |
+| `debug`, `trace`                                      | Literal template or allowed raw dynamic diagnostic string      |
+| `ff-access`, `ff-usage`                               | Flag name (e.g., `'advancedValidation'`, `'darkMode'`)         |
+| `op-*` (all 8 op metric types)                        | Op name (e.g., `'GET'`, `'createUser'`)                        |
+| `period-start`, `buffer-*` (5 types)                  | unused (null)                                                  |
 
 ### Fixed Row Constraints <a id="smoo/lmao!n/lmao-entry-fixed-row-constraints"></a>
 
 - **Row 0**: Always `span-start` - created at span initialization
 - **Row 1**: Always completion type (`span-ok`, `span-err`, or `span-exception`) - pre-initialized as `span-exception`
-- **Row 2+**: Event entries (`info`, `debug`, `warn`, `error`, `ff-access`, `ff-usage`)
+- **Row 2+**: Event entries (`trace`, `debug`, `info`, `warn`, `error`, `ff-access`, `ff-usage`)
 
 **Metrics rows** (`period-start`, `op-*`, `buffer-*`) are written during flush cycles, not during span execution. They
 are appended to the global trace buffer, not to individual SpanBuffers.
@@ -1278,9 +1296,10 @@ Entry types use Arrow's dictionary encoding:
 
 The entry type system is designed for minimal hot path overhead:
 
-- **Pre-generated writers**: Column writers generated at op definition time
-- **No conditionals**: Entry type determines exact code path
-- **Direct memory writes**: No intermediate objects or transformations
+- **Pre-generated writers**: Target column writers are generated and bound during startup
+- **Specialized callsites**: Static, structured, and dynamic callsite classes each have a fixed path
+- **Physical mixed layout**: Only a buffer with both static-index and dynamic-reference lanes is called mixed
+- **Direct memory writes**: Warmed in-capacity target calls perform fixed stores without intermediate objects
 
 ## Integration Points <a id="smoo/lmao!n/lmao-entry-integration-points"></a>
 
