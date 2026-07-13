@@ -22,6 +22,7 @@
 
 import { isRecord } from '@smoothbricks/validation';
 import type { SpanLoggerImpl } from './codegen/spanLoggerGenerator.js';
+import type { RemapDescriptor, RemappedColumn } from './logBinding.js';
 import {
   ENTRY_TYPE_DEBUG,
   ENTRY_TYPE_ERROR,
@@ -141,6 +142,35 @@ export function createPrefixMapping<T extends LogSchema>(schema: T, prefix: stri
   }
 
   return mapping;
+}
+
+/**
+ * Create immutable output-to-source metadata for cold Arrow traversal.
+ *
+ * The mapping is already fully composed by OpGroup prefix/map operations. Keeping
+ * both the frozen lookup and output schema entries avoids wrapping child buffers
+ * or reconstructing schema metadata during each traversal.
+ */
+export function createRemapDescriptor(
+  sourceSchema: LogSchema,
+  outputToSourceMapping: Record<string, string>,
+): RemapDescriptor {
+  const sourceNames: Record<string, string> = {};
+  const columns: RemappedColumn[] = [];
+
+  for (const [outputName, sourceName] of Object.entries(outputToSourceMapping)) {
+    sourceNames[outputName] = sourceName;
+    const fieldSchema = sourceSchema.fields[sourceName];
+    if (fieldSchema !== undefined) {
+      const column: RemappedColumn = Object.freeze([outputName, fieldSchema]);
+      columns.push(column);
+    }
+  }
+
+  return Object.freeze({
+    sourceNames: Object.freeze(sourceNames),
+    columns: Object.freeze(columns),
+  });
 }
 
 // ============================================================================
