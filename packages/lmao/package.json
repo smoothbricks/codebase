@@ -2,7 +2,10 @@
   "name": "@smoothbricks/lmao",
   "version": "0.2.3-next.0",
   "type": "module",
-  "sideEffects": false,
+  "sideEffects": [
+    "./dist/vocabulary/register/v1.js",
+    "./src/vocabulary/register/v1.ts"
+  ],
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -13,6 +16,12 @@
       "development": "./src/index.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./vocabulary/register/v1": {
+      "types": "./dist/vocabulary/register/v1.d.ts",
+      "development": "./src/vocabulary/register/v1.ts",
+      "import": "./dist/vocabulary/register/v1.js",
+      "default": "./dist/vocabulary/register/v1.js"
     },
     "./node": {
       "types": "./dist/node.d.ts",
