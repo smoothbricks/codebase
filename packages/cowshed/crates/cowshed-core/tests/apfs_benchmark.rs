@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use cowshed_core::apfs::{
-    ApfsBackend, ApfsCaseSensitivity, CreateImageRequest, ImageFormatSelection, MacOsApfsBackend,
-    SystemCommandRunner,
+    ApfsBackend, ApfsCaseSensitivity, AttachedImage, CreateImageRequest, ImageFormatSelection,
+    MacOsApfsBackend, SystemCommandRunner,
 };
 use cowshed_core::metadata::ImageFormat;
 
@@ -61,6 +61,29 @@ impl Drop for BenchmarkRoot {
 }
 
 #[cfg(target_os = "macos")]
+struct AttachmentGuard<'a> {
+    backend: &'a MacOsApfsBackend<SystemCommandRunner>,
+    attachment: Option<AttachedImage>,
+}
+
+#[cfg(target_os = "macos")]
+impl AttachmentGuard<'_> {
+    fn detach(mut self) -> Result<(), cowshed_core::apfs::ApfsError> {
+        let attachment = self.attachment.take().expect("attachment is present");
+        self.backend.detach(&attachment, false)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for AttachmentGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(attachment) = self.attachment.take() {
+            let _ = self.backend.detach(&attachment, true);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn benchmark_format(format: ImageFormat) -> Result<(), Box<dyn std::error::Error>> {
     let root = BenchmarkRoot(PathBuf::from(format!(
         "/private/tmp/cowshed-bench-{}-{}",
@@ -77,6 +100,8 @@ fn benchmark_format(format: ImageFormat) -> Result<(), Box<dyn std::error::Error
         capacity: "1g".to_owned(),
         volume_name: format!("cowshed.bench.{}", format.extension()),
         case_sensitivity: ApfsCaseSensitivity::Insensitive,
+        owner_uid: unsafe { libc::getuid() },
+        owner_gid: unsafe { libc::getgid() },
         image_format: ImageFormatSelection::Exact(format),
     };
     let created = match backend.create_staged_image(&request) {
@@ -105,12 +130,16 @@ fn benchmark_format(format: ImageFormat) -> Result<(), Box<dyn std::error::Error
             return Err(format!("{format:?} clonefile max regressed: {clone_max:?}").into());
         }
 
-        let mut attach_samples = Vec::with_capacity(5);
-        for _ in 0..5 {
+        let mut attach_samples = Vec::with_capacity(10);
+        for _ in 0..10 {
             let started = Instant::now();
             let attachment = backend.attach_verified(&created.path, format)?;
+            let guard = AttachmentGuard {
+                backend: &backend,
+                attachment: Some(attachment),
+            };
             attach_samples.push(started.elapsed());
-            backend.detach(&attachment, false)?;
+            guard.detach()?;
         }
         attach_samples.sort_unstable();
         let attach_median = attach_samples[attach_samples.len() / 2];

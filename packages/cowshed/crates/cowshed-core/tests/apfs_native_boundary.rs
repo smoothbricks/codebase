@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use cowshed_core::apfs::{
     ApfsCaseSensitivity, CommandOutput, CommandRequest, CommandRunError, CommandRunner,
@@ -12,7 +12,10 @@ use cowshed_core::metadata::{
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::StorageLayout;
-use cowshed_core::storage::apfs::native::{MacOsApfsExecutionHost, WorkspaceMetadataTemplate};
+use cowshed_core::storage::apfs::native::{
+    KernelMountSnapshot, KernelMountSource, MacOsApfsExecutionHost, RestoreFailpoint,
+    SystemKernelMountSource, WorkspaceMetadataTemplate,
+};
 use cowshed_core::storage::apfs::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, MarkerExpectation, MetadataPolicy,
 };
@@ -45,16 +48,28 @@ fn successful_output(request: &CommandRequest) -> CommandOutput {
 }
 
 #[derive(Clone, Default)]
-struct RecordingRunner(Arc<AtomicUsize>);
+struct RecordingRunner {
+    calls: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<CommandRequest>>>,
+}
 
 impl RecordingRunner {
     fn calls(&self) -> usize {
-        self.0.load(Ordering::SeqCst)
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn requests(&self) -> Vec<CommandRequest> {
+        self.requests.lock().expect("requests").clone()
     }
 }
+
 impl CommandRunner for RecordingRunner {
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-        self.0.fetch_add(1, Ordering::SeqCst);
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.requests
+            .lock()
+            .expect("requests")
+            .push(request.clone());
         Ok(successful_output(request))
     }
 }
@@ -63,6 +78,7 @@ impl CommandRunner for RecordingRunner {
 struct FailingDetachRunner {
     calls: Arc<AtomicUsize>,
     failures_remaining: Arc<AtomicUsize>,
+    detach_attempts: Arc<Mutex<Vec<bool>>>,
 }
 
 impl FailingDetachRunner {
@@ -70,6 +86,7 @@ impl FailingDetachRunner {
         Self {
             calls: Arc::default(),
             failures_remaining: Arc::new(AtomicUsize::new(failures)),
+            detach_attempts: Arc::default(),
         }
     }
 }
@@ -81,6 +98,12 @@ impl CommandRunner for FailingDetachRunner {
             .args
             .first()
             .is_some_and(|argument| argument == "detach");
+        if is_detach {
+            self.detach_attempts
+                .lock()
+                .expect("detach attempts")
+                .push(request.args.iter().any(|argument| argument == "-force"));
+        }
         if is_detach
             && self
                 .failures_remaining
@@ -93,6 +116,21 @@ impl CommandRunner for FailingDetachRunner {
         } else {
             Ok(successful_output(request))
         }
+    }
+}
+
+#[derive(Clone, Default)]
+struct FakeKernelMountSource(Arc<Mutex<Vec<KernelMountSnapshot>>>);
+
+impl FakeKernelMountSource {
+    fn set(&self, mounts: Vec<KernelMountSnapshot>) {
+        *self.0.lock().expect("kernel mounts") = mounts;
+    }
+}
+
+impl KernelMountSource for FakeKernelMountSource {
+    fn mounts(&self) -> Result<Vec<KernelMountSnapshot>, ApfsStorageError> {
+        Ok(self.0.lock().expect("kernel mounts").clone())
     }
 }
 
@@ -289,7 +327,7 @@ fn canonical_publication_moves_complete_image_and_sidecar_together() {
 }
 
 #[test]
-fn restore_swap_and_rollback_keep_image_metadata_generations_paired() {
+fn restore_swap_keeps_old_metadata_until_verified_publication_and_rolls_back_generations() {
     let fixture = Fixture::new("restore-swap");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
     let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
@@ -322,9 +360,9 @@ fn restore_swap_and_rollback_keep_image_metadata_generations_paired() {
     assert_eq!(std::fs::read(&undo).expect("undo"), b"old generation");
     assert_eq!(
         DetachedWorkspaceMetadata::read_for_image(canonical.image())
-            .expect("new metadata")
+            .expect("pre-publication metadata")
             .workspace_incarnation,
-        next_metadata.workspace_incarnation
+        metadata(ImageFormat::Sparse).workspace_incarnation
     );
     assert_eq!(
         DetachedWorkspaceMetadata::read_for_image(&undo)
@@ -333,6 +371,8 @@ fn restore_swap_and_rollback_keep_image_metadata_generations_paired() {
         metadata(ImageFormat::Sparse).workspace_incarnation
     );
 
+    std::fs::remove_file(PathBuf::from(format!("{}.restore.json", staged.display())))
+        .expect("simulate cleanup race after durable rollback intent");
     host.rollback_restore(canonical.image(), &undo, &staged)
         .expect("rollback");
     assert_eq!(
@@ -341,6 +381,7 @@ fn restore_swap_and_rollback_keep_image_metadata_generations_paired() {
     );
     assert!(!staged.exists());
     assert!(!sidecar_path(&staged).exists());
+    assert!(!PathBuf::from(format!("{}.restore.json", staged.display())).exists());
     assert_eq!(
         DetachedWorkspaceMetadata::read_for_image(canonical.image())
             .expect("restored metadata")
@@ -413,23 +454,9 @@ fn mount_registry_actor_owns_attachment_state_and_blocks_mounted_compaction() {
         .expect("retain attachment");
 
     assert_eq!(mount_id, 1);
-    assert_eq!(
-        host.mounts(&repo()).expect("mount facts"),
-        [cowshed_core::storage::lifecycle::KernelMountFact {
-            mount_id: 1,
-            volume_name: "cowshed.acme--widget.main".to_owned(),
-        }]
-    );
-    assert!(
-        host.compact(image.image(), ImageFormat::Sparse)
-            .expect_err("mounted image must not compact")
-            .to_string()
-            .contains("cannot compact mounted image")
-    );
 
     host.detach_mounted(&workspace, false)
         .expect("detach retained image");
-    assert!(host.mounts(&repo()).expect("mount facts").is_empty());
     assert_eq!(
         runner.calls(),
         5,
@@ -518,6 +545,8 @@ fn lifecycle_create_selection_mismatches_fail_before_native_commands() {
         capacity: "1g".to_owned(),
         volume_name: "cowshed.acme--widget.main".to_owned(),
         case_sensitivity: ApfsCaseSensitivity::Insensitive,
+        owner_uid: unsafe { libc::getuid() },
+        owner_gid: unsafe { libc::getgid() },
         image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
     };
     assert!(matches!(
@@ -761,7 +790,6 @@ fn reverse_teardown_drains_actor_state_and_detaches_every_attachment() {
 
     host.detach_all_reverse().expect("reverse detach");
 
-    assert!(host.mounts(&repo()).expect("mount facts").is_empty());
     assert_eq!(runner.calls(), 4, "attach, resolve, fsck, detach");
 }
 
@@ -809,11 +837,14 @@ fn failed_detach_restores_actor_state_and_force_retries_exactly_once() {
 
     host.detach_mounted(&workspace, false)
         .expect_err("busy detach must fail");
-    assert_eq!(host.mounts(&repo()).expect("restored fact").len(), 1);
 
     runner.failures_remaining.store(1, Ordering::SeqCst);
     host.detach_mounted(&workspace, true).expect("forced retry");
-    assert!(host.mounts(&repo()).expect("drained fact").is_empty());
+    assert_eq!(
+        *runner.detach_attempts.lock().expect("detach attempts"),
+        [false, false, true],
+        "failed detach must restore actor ownership, then force retry must cross normal and forced detach targets"
+    );
 }
 
 #[test]
@@ -904,4 +935,441 @@ fn published_listing_distinguishes_missing_sessions_from_an_invalid_sessions_pat
 
     std::fs::write(&layout.project().sessions, b"not a directory").expect("sessions file");
     assert!(host.list(&repo()).is_err());
+}
+
+#[test]
+fn kernel_mount_facts_survive_host_restart_and_prevent_detached_compaction() {
+    let fixture = Fixture::new("kernel-restart");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    create_image(canonical.image(), ImageFormat::Sparse);
+    let source = FakeKernelMountSource::default();
+    source.set(vec![KernelMountSnapshot::new(
+        42,
+        fixture.config().main_mount,
+        true,
+        true,
+    )]);
+    let template = || WorkspaceMetadataTemplate {
+        project_root: fixture.root.join("project"),
+        base_commit: "0123456789abcdef".to_owned(),
+        created_at: "2026-07-13T00:00:00Z".to_owned(),
+        created_trace: "kernel-restart".to_owned(),
+        grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
+            .expect("grants"),
+    };
+    let first = MacOsApfsExecutionHost::with_mount_source(
+        RecordingRunner::default(),
+        fixture.config(),
+        template(),
+        source.clone(),
+    )
+    .expect("first host");
+    assert_eq!(first.mounts(&repo()).expect("first facts")[0].mount_id, 42);
+    drop(first);
+
+    let runner = RecordingRunner::default();
+    let restarted = MacOsApfsExecutionHost::with_mount_source(
+        runner.clone(),
+        fixture.config(),
+        template(),
+        source,
+    )
+    .expect("restarted host");
+    assert_eq!(
+        restarted.mounts(&repo()).expect("restart facts")[0].mount_id,
+        42
+    );
+    assert!(
+        restarted
+            .compact(canonical.image(), ImageFormat::Sparse)
+            .expect_err("kernel-mounted image must not compact")
+            .to_string()
+            .contains("cannot compact mounted image")
+    );
+    assert_eq!(runner.calls(), 0);
+}
+
+#[test]
+fn wrong_kernel_mount_flags_are_detected_and_healed_by_mountpoint() {
+    let fixture = Fixture::new("wrong-flags");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    create_image(canonical.image(), ImageFormat::Sparse);
+    let source = FakeKernelMountSource::default();
+    source.set(vec![KernelMountSnapshot::new(
+        7,
+        fixture.config().main_mount,
+        false,
+        false,
+    )]);
+    let runner = RecordingRunner::default();
+    let host = MacOsApfsExecutionHost::with_mount_source(
+        runner.clone(),
+        fixture.config(),
+        WorkspaceMetadataTemplate {
+            project_root: fixture.root.join("project"),
+            base_commit: "0123456789abcdef".to_owned(),
+            created_at: "2026-07-13T00:00:00Z".to_owned(),
+            created_trace: "wrong-flags".to_owned(),
+            grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
+                .expect("grants"),
+        },
+        source.clone(),
+    )
+    .expect("host");
+    let workspace = workspace(ImageFormat::Sparse);
+    assert!(
+        host.mounts(&repo())
+            .expect_err("wrong flags")
+            .to_string()
+            .contains("non-canonical flags")
+    );
+
+    host.heal_mount(&workspace, &fixture.config().main_mount)
+        .expect("heal by mountpoint");
+    assert_eq!(runner.calls(), 1, "wrong mount detached by mountpoint");
+    let requests = runner.requests();
+    assert_eq!(requests[0].program, Path::new("/usr/bin/hdiutil"));
+    assert_eq!(
+        requests[0].args,
+        [
+            std::ffi::OsString::from("detach"),
+            std::ffi::OsString::from("-quiet"),
+            fixture.config().main_mount.into_os_string(),
+        ]
+    );
+    source.set(Vec::new());
+    assert!(host.mounts(&repo()).expect("healed facts").is_empty());
+}
+
+fn interrupted_restore_image_publication(
+    fixture: &Fixture,
+    failpoint: RestoreFailpoint,
+) -> (
+    MacOsApfsExecutionHost<RecordingRunner>,
+    PathBuf,
+    PathBuf,
+    PathBuf,
+    DetachedWorkspaceMetadata,
+) {
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical = layout
+        .main_image(ImageFormat::Sparse)
+        .expect("canonical")
+        .image()
+        .to_owned();
+    let staged = layout
+        .project()
+        .project_root
+        .join(".staging/main-next.sparseimage");
+    let undo = layout
+        .project()
+        .checkpoints
+        .join("main/pre-restore-next.sparseimage");
+    create_image(&canonical, ImageFormat::Sparse);
+    std::fs::write(&canonical, b"old generation").expect("old image");
+    create_image(&staged, ImageFormat::Sparse);
+    std::fs::write(&staged, b"new generation").expect("new image");
+    let mut replacement = metadata(ImageFormat::Sparse);
+    replacement.workspace_incarnation =
+        WorkspaceIncarnation::new("00000000000000000000000000000002").expect("next incarnation");
+    replacement
+        .write_for_image(&staged)
+        .expect("replacement metadata");
+    let host = host(fixture, RecordingRunner::default());
+    host.set_restore_failpoint(failpoint);
+    host.restore_swap(&staged, &canonical, &undo)
+        .expect_err("injected image publication crash");
+    (host, canonical, staged, undo, replacement)
+}
+
+#[test]
+fn recovery_rolls_forward_published_metadata_before_undo_rename() {
+    let fixture = Fixture::new("published-before-undo");
+    let (host, canonical, staged, undo, replacement) =
+        interrupted_restore_image_publication(&fixture, RestoreFailpoint::AfterImageSwap);
+    replacement
+        .write_for_image(&canonical)
+        .expect("simulate committed metadata");
+
+    host.recover_pending(&fixture.config())
+        .expect("roll forward");
+
+    assert_eq!(
+        std::fs::read(&canonical).expect("canonical"),
+        b"new generation"
+    );
+    assert_eq!(std::fs::read(&undo).expect("undo"), b"old generation");
+    assert!(!staged.exists());
+    assert_eq!(
+        DetachedWorkspaceMetadata::read_for_image(&canonical)
+            .expect("canonical metadata")
+            .workspace_incarnation,
+        replacement.workspace_incarnation
+    );
+}
+
+#[test]
+fn recovery_fails_closed_when_published_metadata_is_missing() {
+    let fixture = Fixture::new("published-metadata-missing");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    let staged = layout
+        .project()
+        .project_root
+        .join(".staging/main-next.sparseimage");
+    let undo = layout
+        .project()
+        .checkpoints
+        .join("main/pre-restore-next.sparseimage");
+    create_image(canonical.image(), ImageFormat::Sparse);
+    std::fs::write(canonical.image(), b"old generation").expect("old image");
+    create_image(&staged, ImageFormat::Sparse);
+    std::fs::write(&staged, b"new generation").expect("new image");
+    let next_incarnation =
+        WorkspaceIncarnation::new("00000000000000000000000000000002").expect("next incarnation");
+    let mut next_metadata = metadata(ImageFormat::Sparse);
+    next_metadata.workspace_incarnation = next_incarnation.clone();
+    next_metadata
+        .write_for_image(&staged)
+        .expect("next metadata");
+    let replacement = WorkspaceRef::new(
+        repo(),
+        WorkspaceName::new("main").expect("main"),
+        next_incarnation,
+        Revision::new(2),
+        Revision::new(1),
+        WorkspaceRole::Main,
+        ImageFormat::Sparse,
+    )
+    .expect("replacement");
+    let host = host(&fixture, RecordingRunner::default());
+    host.restore_swap(&staged, canonical.image(), &undo)
+        .expect("image publication");
+    host.set_restore_failpoint(RestoreFailpoint::AfterMetadataPublish);
+    host.publish_restored_metadata(
+        &staged,
+        canonical.image(),
+        &replacement,
+        replacement.revision(),
+        &undo,
+    )
+    .expect_err("metadata failpoint");
+    std::fs::remove_file(sidecar_path(canonical.image())).expect("remove published metadata");
+
+    host.recover_pending(&fixture.config())
+        .expect_err("published state without canonical metadata must fail closed");
+    assert!(PathBuf::from(format!("{}.restore.json", staged.display())).exists());
+}
+#[test]
+fn recovery_accepts_an_already_rolled_back_canonical_inode() {
+    let fixture = Fixture::new("already-rolled-back");
+    let (host, canonical, staged, _, _) =
+        interrupted_restore_image_publication(&fixture, RestoreFailpoint::AfterImageSwap);
+    let temporary = canonical.with_extension("swap");
+    std::fs::rename(&canonical, &temporary).expect("stage new canonical");
+    std::fs::rename(&staged, &canonical).expect("restore old canonical");
+    std::fs::rename(&temporary, &staged).expect("restage replacement");
+
+    host.recover_pending(&fixture.config())
+        .expect("recognize old canonical");
+
+    assert_eq!(
+        std::fs::read(&canonical).expect("canonical"),
+        b"old generation"
+    );
+    assert!(!staged.exists());
+}
+
+#[test]
+fn recovery_restores_missing_prepublication_canonical_metadata() {
+    let fixture = Fixture::new("missing-canonical-metadata");
+    let (host, canonical, staged, undo, _) =
+        interrupted_restore_image_publication(&fixture, RestoreFailpoint::AfterUndoRename);
+    std::fs::remove_file(sidecar_path(&canonical)).expect("remove interrupted sidecar");
+
+    host.recover_pending(&fixture.config())
+        .expect("restore metadata from undo");
+
+    assert_eq!(
+        std::fs::read(&canonical).expect("canonical"),
+        b"old generation"
+    );
+    assert!(!staged.exists());
+    assert!(!undo.exists());
+    assert_eq!(
+        DetachedWorkspaceMetadata::read_for_image(&canonical)
+            .expect("canonical metadata")
+            .workspace_incarnation,
+        metadata(ImageFormat::Sparse).workspace_incarnation
+    );
+}
+
+#[test]
+fn restore_journal_recovers_each_publication_boundary_deterministically() {
+    for failpoint in [
+        RestoreFailpoint::AfterImageSwap,
+        RestoreFailpoint::AfterUndoRename,
+        RestoreFailpoint::AfterMetadataPublish,
+        RestoreFailpoint::AfterMetadataFsync,
+    ] {
+        let fixture = Fixture::new(&format!("restore-journal-{failpoint:?}"));
+        let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+        let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+        let staged = layout
+            .project()
+            .project_root
+            .join(".staging/main-next.sparseimage");
+        let undo = layout
+            .project()
+            .checkpoints
+            .join("main/pre-restore-next.sparseimage");
+        create_image(canonical.image(), ImageFormat::Sparse);
+        std::fs::write(canonical.image(), b"old generation").expect("old image");
+        create_image(&staged, ImageFormat::Sparse);
+        std::fs::write(&staged, b"new generation").expect("new image");
+        let next_incarnation = WorkspaceIncarnation::new("00000000000000000000000000000002")
+            .expect("next incarnation");
+        let mut next_metadata = metadata(ImageFormat::Sparse);
+        next_metadata.workspace_incarnation = next_incarnation.clone();
+        next_metadata
+            .write_for_image(&staged)
+            .expect("next metadata");
+        let replacement = WorkspaceRef::new(
+            repo(),
+            WorkspaceName::new("main").expect("main"),
+            next_incarnation.clone(),
+            Revision::new(2),
+            Revision::new(1),
+            WorkspaceRole::Main,
+            ImageFormat::Sparse,
+        )
+        .expect("replacement");
+        let host = host(&fixture, RecordingRunner::default());
+        host.set_restore_failpoint(failpoint);
+
+        if matches!(
+            failpoint,
+            RestoreFailpoint::AfterImageSwap | RestoreFailpoint::AfterUndoRename
+        ) {
+            host.restore_swap(&staged, canonical.image(), &undo)
+                .expect_err("injected image publication crash");
+        } else {
+            host.restore_swap(&staged, canonical.image(), &undo)
+                .expect("image publication");
+            host.publish_restored_metadata(
+                &staged,
+                canonical.image(),
+                &replacement,
+                replacement.revision(),
+                &undo,
+            )
+            .expect_err("injected metadata publication crash");
+            if failpoint == RestoreFailpoint::AfterMetadataPublish {
+                std::fs::copy(canonical.image(), &staged)
+                    .expect("simulate redundant staged image after publication");
+            }
+        }
+
+        let journal_path = PathBuf::from(format!("{}.restore.json", staged.display()));
+        let journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal_path).expect("durable restore journal"))
+                .expect("journal JSON");
+        let old_inode = journal["oldInode"].as_u64().expect("old inode");
+        let new_inode = journal["newInode"].as_u64().expect("new inode");
+        assert!(old_inode > 1 && new_inode > 1 && old_inode != new_inode);
+
+        host.recover_pending(&fixture.config())
+            .expect("restart recovery");
+        let canonical_metadata =
+            DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("metadata");
+        let metadata_was_published = matches!(
+            failpoint,
+            RestoreFailpoint::AfterMetadataPublish | RestoreFailpoint::AfterMetadataFsync
+        );
+        assert_eq!(
+            std::fs::read(canonical.image()).expect("canonical bytes"),
+            if metadata_was_published {
+                b"new generation".as_slice()
+            } else {
+                b"old generation".as_slice()
+            },
+            "{failpoint:?}"
+        );
+        if metadata_was_published {
+            assert_eq!(
+                std::fs::read(&undo).expect("retained undo"),
+                b"old generation",
+                "{failpoint:?}"
+            );
+        }
+
+        assert_eq!(
+            canonical_metadata.workspace_incarnation,
+            if metadata_was_published {
+                next_incarnation
+            } else {
+                metadata(ImageFormat::Sparse).workspace_incarnation
+            },
+            "{failpoint:?}"
+        );
+        assert!(
+            !PathBuf::from(format!("{}.restore.json", staged.display())).exists(),
+            "{failpoint:?}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn system_mount_source_observes_the_live_root_mount() {
+    let mounts = SystemKernelMountSource.mounts().expect("getmntinfo");
+    assert!(!mounts.is_empty());
+    assert!(
+        mounts
+            .iter()
+            .any(|mount| mount.mount_point == Path::new("/"))
+    );
+    assert!(mounts.iter().all(|mount| mount.mount_id != 0));
+}
+
+#[test]
+fn kernel_mount_flag_truth_table_requires_nobrowse_and_owners() {
+    for (nobrowse, owners, expected_valid) in [
+        (true, true, true),
+        (true, false, false),
+        (false, true, false),
+        (false, false, false),
+    ] {
+        let fixture = Fixture::new(&format!("flag-table-{nobrowse}-{owners}"));
+        let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+        let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+        create_image(canonical.image(), ImageFormat::Sparse);
+        let source = FakeKernelMountSource::default();
+        source.set(vec![KernelMountSnapshot::new(
+            91,
+            fixture.config().main_mount,
+            nobrowse,
+            owners,
+        )]);
+        let host = MacOsApfsExecutionHost::with_mount_source(
+            RecordingRunner::default(),
+            fixture.config(),
+            WorkspaceMetadataTemplate {
+                project_root: fixture.root.join("project"),
+                base_commit: "0123456789abcdef".to_owned(),
+                created_at: "2026-07-13T00:00:00Z".to_owned(),
+                created_trace: "flag-table".to_owned(),
+                grants: GrantSet::closed_baseline(Some(
+                    PortBlock::new(20000, 16).expect("port block"),
+                ))
+                .expect("grants"),
+            },
+            source,
+        )
+        .expect("host");
+        let result = host.mounts(&repo());
+        assert_eq!(result.is_ok(), expected_valid, "{nobrowse}/{owners}");
+    }
 }

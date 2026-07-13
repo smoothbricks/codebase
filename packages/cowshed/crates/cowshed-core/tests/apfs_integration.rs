@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -230,7 +232,13 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             .await
             .map_err(|error| std::io::Error::other(format!("adopt: {error}")))?
             .workspace;
-        assert_eq!(main.format(), format);
+        if main.format() != format {
+            return Err(std::io::Error::other(format!(
+                "requested {format:?}, native capability selected {:?}",
+                main.format()
+            ))
+            .into());
+        }
         assert_eq!(
             substrate
                 .ensure_mounted(&main)
@@ -238,6 +246,9 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
                 .map_err(|error| std::io::Error::other(format!("ensure main: {error}")))?,
             main_mount
         );
+        let mounted_root = fs::metadata(&main_mount)?;
+        assert_eq!(mounted_root.uid(), unsafe { libc::getuid() });
+        assert_eq!(mounted_root.gid(), unsafe { libc::getgid() });
 
         let payload = main_mount.join("payload.txt");
         fs::write(&payload, b"checkpoint baseline\n")?;

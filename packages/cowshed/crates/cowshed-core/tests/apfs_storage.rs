@@ -42,6 +42,7 @@ struct FakeHost {
     state: Arc<Mutex<FakeState>>,
     marker_validations_before_failure: Arc<AtomicUsize>,
     fail_metadata_once: Arc<AtomicBool>,
+    fail_restored_metadata_once: Arc<AtomicBool>,
 }
 
 impl Default for FakeHost {
@@ -50,6 +51,7 @@ impl Default for FakeHost {
             state: Arc::default(),
             marker_validations_before_failure: Arc::new(AtomicUsize::new(usize::MAX)),
             fail_metadata_once: Arc::default(),
+            fail_restored_metadata_once: Arc::default(),
         }
     }
 }
@@ -112,6 +114,11 @@ impl FakeHost {
 
     fn fail_next_metadata(&self) {
         self.fail_metadata_once.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_next_restored_metadata(&self) {
+        self.fail_restored_metadata_once
+            .store(true, Ordering::SeqCst);
     }
 }
 
@@ -294,6 +301,10 @@ impl ApfsExecutionHost for FakeHost {
         Ok(())
     }
 
+    fn heal_mount(&self, _: &WorkspaceRef, _: &Path) -> Result<(), ApfsStorageError> {
+        Ok(())
+    }
+
     fn retain_mounted(
         &self,
         workspace: &WorkspaceRef,
@@ -366,6 +377,32 @@ impl ApfsExecutionHost for FakeHost {
         Ok(())
     }
 
+    fn publish_restored_metadata(
+        &self,
+        _: &Path,
+        canonical: &Path,
+        workspace: &WorkspaceRef,
+        revision: Revision,
+        source_image: &Path,
+    ) -> Result<(), ApfsStorageError> {
+        self.record("publish-restored-metadata-after-mount");
+        if self
+            .fail_restored_metadata_once
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(ApfsStorageError::Host(
+                "injected restored metadata failure".to_owned(),
+            ));
+        }
+        self.publish_metadata(
+            canonical,
+            workspace,
+            revision,
+            MetadataPolicy::Preserve,
+            Some(source_image),
+        )
+    }
+
     fn rollback_restore(&self, _: &Path, _: &Path, _: &Path) -> Result<(), ApfsStorageError> {
         self.record("rollback-before-publication");
         Ok(())
@@ -405,6 +442,10 @@ impl ApfsExecutionHost for FakeHost {
             .filter(|((mounted_repo, _), _)| mounted_repo == repo)
             .map(|(_, fact)| fact.clone())
             .collect())
+    }
+
+    fn recover_pending(&self, _: &ApfsSubstrateConfig) -> Result<(), ApfsStorageError> {
+        Ok(())
     }
 
     fn stats(&self, _: &WorkspaceRef, _: &Path) -> Result<SubstrateStats, ApfsStorageError> {
@@ -699,6 +740,46 @@ async fn restore_post_swap_marker_failure_rolls_back_and_remounts_old_image() {
 }
 
 #[tokio::test]
+async fn restore_metadata_publication_failure_rolls_back_after_verified_mount() {
+    let host = FakeHost::default();
+    let current = workspace("raven", ImageFormat::Sparse, 7);
+    host.seed(&current);
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
+        current.clone(),
+        CheckpointLabel::new("ready").expect("label"),
+        Revision::new(8),
+        true,
+    );
+    let plan = substrate
+        .plan_restore(&current, &checkpoint, RestoreMode::Replace)
+        .expect("restore plan");
+    host.fail_next_restored_metadata();
+    host.clear_events();
+
+    substrate
+        .execute_restore(plan)
+        .await
+        .expect_err("restored metadata publication failure");
+
+    let events = host.events();
+    let publication = events
+        .iter()
+        .position(|event| event == "publish-restored-metadata-after-mount")
+        .expect("publication attempt");
+    let marker = events[..publication]
+        .iter()
+        .rposition(|event| event == "validate-marker")
+        .expect("canonical marker");
+    let rollback = events
+        .iter()
+        .position(|event| event == "rollback-before-publication")
+        .expect("rollback");
+    assert!(marker < publication && publication < rollback);
+    assert_eq!(events.last().map(String::as_str), Some("retain-mounted"));
+}
+
+#[tokio::test]
 async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin() {
     let host = FakeHost::default();
     let source = workspace("main", ImageFormat::Sparse, 5);
@@ -771,6 +852,23 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
         source.topology_revision()
     );
 
+    let restore_events = host.events();
+    let restore_swap = restore_events
+        .iter()
+        .position(|event| event == "atomic-restore-swap+undo")
+        .expect("restore swap");
+    let restore_marker = restore_events
+        .iter()
+        .rposition(|event| event == "validate-marker")
+        .expect("canonical marker validation");
+    let metadata_publication = restore_events
+        .iter()
+        .position(|event| event == "publish-restored-metadata-after-mount")
+        .expect("restored metadata publication");
+    assert!(
+        restore_swap < restore_marker && restore_marker < metadata_publication,
+        "replacement metadata must publish only after canonical mount and marker verification"
+    );
     assert_eq!(
         host.mount_paths()
             .iter()
