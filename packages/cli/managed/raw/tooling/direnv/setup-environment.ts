@@ -67,9 +67,7 @@ try {
 }
 
 async function installLocalDependencies(): Promise<void> {
-  // bun install runs the root prepare script, which patches TypeScript with
-  // ts-patch. Multiple concurrent direnv activations can otherwise race while
-  // mutating the same files under node_modules.
+  // Serialize concurrent direnv activations installing into the same node_modules.
   await withSetupLock(async () => {
     await runSetupCommand('bun install --no-summary', $`bun install --no-summary`);
   });
@@ -106,16 +104,12 @@ async function acquireLock(lockDir: string): Promise<void> {
       await mkdir(lockDir, { recursive: false });
       return;
     } catch (error) {
-      if (!isFileExistsError(error) || Date.now() > deadline) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST') || Date.now() > deadline) {
         throw error;
       }
       await Bun.sleep(100);
     }
   }
-}
-
-function isFileExistsError(error: unknown): boolean {
-  return error instanceof Error && 'code' in error && error.code === 'EEXIST';
 }
 
 function replayCapturedOutput(error: unknown): void {
