@@ -47,7 +47,12 @@ async function buildVariant(
       ? [
           createBunTtscPlugin({
             project: projectPath,
-            plugins: [{ transform: '@smoothbricks/lmao-ttsc/ttsc-plugin' }],
+            plugins: [
+              {
+                transform: '@smoothbricks/lmao-ttsc/ttsc-plugin',
+                vocabularyManifest: resolve(dirname(sourcePath), '../../../../lmao.vocabulary.json'),
+              },
+            ],
           }),
         ]
       : [];
@@ -70,15 +75,28 @@ async function buildVariant(
 }
 async function assertTransformProof(offEntrypoint: string, onEntrypoint: string) {
   const [offSource, onSource] = await Promise.all([Bun.file(offEntrypoint).text(), Bun.file(onEntrypoint).text()]);
-  const signature = /runtimeHint:\s*\d+,\s*logTemplateIds:\s*\[/g;
-  const offSignatures = offSource.match(signature)?.length ?? 0;
-  const onSignatures = onSource.match(signature)?.length ?? 0;
-  if (offSignatures !== 0 || onSignatures !== 1) {
+  const runtimeHintSignature = /runtimeHint:\s*\d+/g;
+  const denseHeaderSignature = /_logHeaders\[/g;
+  const registrationSignature = /registerLmaoVocabulary\w*\(\{/g;
+  const offRuntimeHints = offSource.match(runtimeHintSignature)?.length ?? 0;
+  const onRuntimeHints = onSource.match(runtimeHintSignature)?.length ?? 0;
+  const offDenseHeaders = offSource.match(denseHeaderSignature)?.length ?? 0;
+  const onDenseHeaders = onSource.match(denseHeaderSignature)?.length ?? 0;
+  const offRegistrations = offSource.match(registrationSignature)?.length ?? 0;
+  const onRegistrations = onSource.match(registrationSignature)?.length ?? 0;
+  if (
+    offRuntimeHints !== 0 ||
+    onRuntimeHints !== 1 ||
+    offDenseHeaders !== 0 ||
+    onDenseHeaders === 0 ||
+    offRegistrations !== 0 ||
+    onRegistrations !== 1
+  ) {
     throw new Error(
-      `Plugin transform proof failed: expected OFF=0 and ON=1 injected metadata signatures; received OFF=${offSignatures}, ON=${onSignatures}`,
+      `Plugin transform proof failed: expected OFF runtime/dense/registration=0/0/0 and ON=1/>0/1; received OFF=${offRuntimeHints}/${offDenseHeaders}/${offRegistrations}, ON=${onRuntimeHints}/${onDenseHeaders}/${onRegistrations}`,
     );
   }
-  return { offSignatures, onSignatures };
+  return { offRuntimeHints, onRuntimeHints, offDenseHeaders, onDenseHeaders, offRegistrations, onRegistrations };
 }
 
 async function runProcess(entrypoint: string, args: readonly string[]): Promise<string> {
@@ -165,8 +183,13 @@ try {
     const differingRow = offSemantic.rows.findIndex(
       (row, index) => JSON.stringify(row) !== JSON.stringify(onSemantic.rows[index]),
     );
+    const transformedLines = (await Bun.file(onEntrypoint).text()).split('\n');
+    const operationWriteIndex = transformedLines.findIndex((line) => line.includes('operation_values[$$i] ='));
+    const operationWriteBlock = transformedLines
+      .slice(Math.max(0, operationWriteIndex - 24), operationWriteIndex + 3)
+      .map((line) => line.trim());
     throw new Error(
-      `Semantic parity failed: OFF=${offSemantic.checksum}, ON=${onSemantic.checksum}, first differing row=${differingRow}`,
+      `Semantic parity failed: source expression=.operation(index % 2 === 0 ? 'READ' : 'WRITE'); OFF=${offSemantic.checksum}, ON=${onSemantic.checksum}, first differing row=${differingRow}, OFF row=${JSON.stringify(offSemantic.rows[differingRow])}, ON row=${JSON.stringify(onSemantic.rows[differingRow])}, transformed operation block=${JSON.stringify(operationWriteBlock)}`,
     );
   }
   if (offSemantic.rowCount !== onSemantic.rowCount) {
@@ -183,7 +206,7 @@ try {
   await Promise.all([persist(cli.offOutput, offJson), persist(cli.onOutput, onJson)]);
 
   process.stderr.write(
-    `transform proof: OFF=${transformProof.offSignatures}, ON=${transformProof.onSignatures} injected metadata signature\n` +
+    `transform proof: OFF runtime/dense/registration=${transformProof.offRuntimeHints}/${transformProof.offDenseHeaders}/${transformProof.offRegistrations}, ON=${transformProof.onRuntimeHints}/${transformProof.onDenseHeaders}/${transformProof.onRegistrations}\n` +
       `semantic parity: ${offSemantic.checksum} (${offSemantic.rowCount} decoded Arrow rows)\n` +
       `${cli.offOutput ? `OFF Mitata JSON: ${resolve(cli.offOutput)}\n` : ''}` +
       `${cli.onOutput ? `ON Mitata JSON: ${resolve(cli.onOutput)}\n` : ''}`,

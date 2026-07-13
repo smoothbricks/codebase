@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -16,13 +17,13 @@ const templateFixtureDeclarations = `
 export interface OpCompileMetadata {
   readonly runtimeHint: number;
 }
-export class FluentLogEntry { line(value: number): this; }
+export type FluentLogEntry<T extends Record<string, unknown> = { jobId: string; elapsedMs: number; attempt: number; success: boolean; operation: 'READ' | 'WRITE' }> = { line(value: number): FluentLogEntry<T> } & { [K in keyof T]: (value: T[K]) => FluentLogEntry<T> };
 export class SpanLogger {
-  info(message: string): FluentLogEntry;
-  debug(message: string): FluentLogEntry;
-  warn(message: string): FluentLogEntry;
-  error(message: string): FluentLogEntry;
-  trace(message: string): FluentLogEntry;
+  info(message: string, fields?: Record<string, unknown>): FluentLogEntry;
+  debug(message: string, fields?: Record<string, unknown>): FluentLogEntry;
+  warn(message: string, fields?: Record<string, unknown>): FluentLogEntry;
+  error(message: string, fields?: Record<string, unknown>): FluentLogEntry;
+  trace(message: string, fields?: Record<string, unknown>): FluentLogEntry;
   jobId(value: string): FluentLogEntry;
   elapsedMs(value: number): FluentLogEntry;
   attempt(value: number): FluentLogEntry;
@@ -318,5 +319,198 @@ defineOp('value-contexts', (ctx) => {
 	}
 	if strings.Contains(output, "ctx.log.info('initializer literal')") || strings.Contains(output, "ctx.log.warn('conditional literal')") || strings.Contains(output, "ctx.log.error('argument literal')") {
 		t.Fatalf("literal value-context call survived alongside its template rewrite\n%s", output)
+	}
+}
+
+func diagnosticCodes(err error) []string {
+	if err == nil {
+		return nil
+	}
+	lines := strings.Split(err.Error(), "\n")
+	codes := make([]string, 0, len(lines))
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) > 0 {
+			codes = append(codes, fields[0])
+		}
+	}
+	return codes
+}
+
+func TestOperationalTemplatesLowerWithoutFieldBagAllocation(t *testing.T) {
+	result := runTemplateFixture(t, `
+declare function value(label: string): string;
+declare function numberValue(label: string): number;
+defineOp('structured', (ctx) => {
+  ctx.log.info('plain static');
+  ctx.log.warn(` + "`no substitution`" + `);
+  ctx.log.error('error static');
+  ctx.log.info('info {jobId}', { jobId: value('info') });
+  ctx.log.warn('warn {elapsedMs}', { elapsedMs: numberValue('warn') });
+  ctx.log.error('job {{literal}} {jobId}', { jobId: value('error') });
+  return ctx.ok(null);
+});
+	`)
+	if result.err != nil {
+		t.Fatalf("template fixture transform failed: %v", result.err)
+	}
+	output := result.output
+
+	wantTemplates := map[string]bool{
+		"plain static": false, "no substitution": false, "error static": false,
+		"info {jobId}": false, "warn {elapsedMs}": false, "job {literal} {jobId}": false,
+	}
+	wantField := map[string]string{"info {jobId}": "jobId", "warn {elapsedMs}": "elapsedMs", "job {literal} {jobId}": "jobId"}
+	for _, entry := range result.manifest.Entries {
+		if _, wanted := wantTemplates[entry.Text]; wanted {
+			wantTemplates[entry.Text] = true
+		}
+		if field, structured := wantField[entry.Text]; structured {
+			if len(entry.Fields) != 1 || entry.Fields[0].Name != field {
+				t.Fatalf("%q vocabulary fields = %+v, want exactly %s", entry.Text, entry.Fields, field)
+			}
+		}
+	}
+	for template, found := range wantTemplates {
+		if !found {
+			t.Fatalf("vocabulary manifest missing %q: %+v", template, result.manifest.Entries)
+		}
+	}
+	for _, expression := range []string{"value('info')", "numberValue('warn')", "value('error')"} {
+		if strings.Count(output, expression) != 1 {
+			t.Fatalf("%s evaluations = %d, want exactly one\n%s", expression, strings.Count(output, expression), output)
+		}
+	}
+	if strings.Contains(output, "jobId:") || strings.Contains(output, "elapsedMs:") {
+		t.Fatalf("structured lowering retained an allocating object literal\n%s", output)
+	}
+	if !strings.Contains(output, "_logHeaders") || !strings.Contains(output, "jobId_values") {
+		t.Fatalf("structured lowering must write the vocabulary ID and fixed schema field directly\n%s", output)
+	}
+}
+
+func TestStructuredFieldsEvaluateExactlyOnceInSourceOrder(t *testing.T) {
+	output := transformTemplateFixture(t, `
+declare function numberValue(label: string): number;
+declare function stringValue(label: string): string;
+defineOp('order', (ctx) => {
+  ctx.log.error('{jobId} took {elapsedMs} on {attempt}', {
+    jobId: stringValue('first'),
+    elapsedMs: numberValue('second'),
+    attempt: numberValue('third'),
+  });
+  return ctx.ok(null);
+});
+`)
+
+	markers := []string{"ctx.log", "stringValue('first')", "numberValue('second')", "numberValue('third')"}
+	previous := -1
+	for _, marker := range markers {
+		if strings.Count(output, marker) != 1 {
+			t.Fatalf("%s evaluations = %d, want exactly one\n%s", marker, strings.Count(output, marker), output)
+		}
+		position := strings.Index(output, marker)
+		if position <= previous {
+			t.Fatalf("evaluation order is not receiver, jobId, elapsedMs, attempt\n%s", output)
+		}
+		previous = position
+	}
+	for _, lane := range []string{"jobId_values", "elapsedMs_values", "attempt_values"} {
+		if strings.Count(output, lane) != 1 {
+			t.Fatalf("fixed field lane %s writes = %d, want one\n%s", lane, strings.Count(output, lane), output)
+		}
+	}
+	if strings.Contains(output, "jobId:") || strings.Contains(output, "elapsedMs:") || strings.Contains(output, "attempt:") {
+		t.Fatalf("structured lowering retained the source field object\n%s", output)
+	}
+}
+
+func TestDynamicEnumFieldEvaluatesOnceAndWritesEncodedOrdinal(t *testing.T) {
+	output := transformTemplateFixture(t, `
+declare function nextOperation(): 'READ' | 'WRITE';
+defineOp('dynamic-enum', (ctx) => {
+  ctx.log.info('enum operation').operation(nextOperation());
+  return ctx.ok(null);
+});
+`)
+
+	const evaluation = "const $$f0 = nextOperation();"
+	if strings.Count(output, evaluation) != 1 {
+		t.Fatalf("dynamic enum captured evaluations = %d, want exactly one\n%s", strings.Count(output, evaluation), output)
+	}
+	for _, marker := range []string{`case "READ":`, `case "WRITE":`, "return 0", "return 1", "$$b.operation($$i"} {
+		if !strings.Contains(output, marker) {
+			t.Fatalf("dynamic enum lowering missing %q\n%s", marker, output)
+		}
+	}
+	if regexp.MustCompile(`operation_values\[[^]]+\]\s*=\s*\$\$f\d+`).MatchString(output) {
+		t.Fatalf("dynamic enum string was written directly to its Uint8 ordinal lane\n%s", output)
+	}
+}
+
+func TestDebugAndTraceRetainRawDynamicText(t *testing.T) {
+	output := transformTemplateFixture(t, `
+declare function debugText(): string;
+declare function traceText(): string;
+defineOp('diagnostic-dynamic', (ctx) => {
+  ctx.log.debug(debugText());
+  ctx.log.trace(traceText());
+  return ctx.ok(null);
+});
+`)
+
+	for _, call := range []string{"ctx.log.debug(debugText())", "ctx.log.trace(traceText())"} {
+		if strings.Count(output, call) != 1 {
+			t.Fatalf("raw dynamic diagnostic call %q occurrences = %d, want one\n%s", call, strings.Count(output, call), output)
+		}
+	}
+}
+
+func TestStructuredTemplatePolicyDiagnostics(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		code string
+	}{
+		{name: "dynamic info", body: "declare const text: string; defineOp('x', ctx => { ctx.log.info(text); return ctx.ok(null); });", code: "LMAO_DYNAMIC_OPERATIONAL_TEXT"},
+		{name: "interpolated warn", body: "declare const text: string; defineOp('x', ctx => { ctx.log.warn(`prefix ${text}`); return ctx.ok(null); });", code: "LMAO_DYNAMIC_OPERATIONAL_TEXT"},
+		{name: "concatenated error", body: "declare const text: string; defineOp('x', ctx => { ctx.log.error('prefix ' + text); return ctx.ok(null); });", code: "LMAO_DYNAMIC_OPERATIONAL_TEXT"},
+		{name: "interpolated debug", body: "declare const text: string; defineOp('x', ctx => { ctx.log.debug(`prefix ${text}`); return ctx.ok(null); });", code: "LMAO_AVOIDABLE_INTERPOLATION"},
+		{name: "concatenated trace", body: "declare const text: string; defineOp('x', ctx => { ctx.log.trace('prefix ' + text); return ctx.ok(null); });", code: "LMAO_AVOIDABLE_INTERPOLATION"},
+		{name: "identifier bag", body: "declare const fields: Record<string, unknown>; defineOp('x', ctx => { ctx.log.info('{jobId}', fields); return ctx.ok(null); });", code: "LMAO_FIELDS_NOT_OBJECT_LITERAL"},
+		{name: "array bag", body: "defineOp('x', ctx => { ctx.log.info('{jobId}', ['x']); return ctx.ok(null); });", code: "LMAO_FIELDS_NOT_OBJECT_LITERAL"},
+		{name: "null bag", body: "defineOp('x', ctx => { ctx.log.info('{jobId}', null); return ctx.ok(null); });", code: "LMAO_FIELDS_NOT_OBJECT_LITERAL"},
+		{name: "spread property", body: "declare const rest: Record<string, unknown>; defineOp('x', ctx => { ctx.log.info('{jobId}', { ...rest, jobId: 'x' }); return ctx.ok(null); });", code: "LMAO_FIELDS_NOT_OBJECT_LITERAL"},
+		{name: "computed property", body: "defineOp('x', ctx => { ctx.log.info('{jobId}', { ['jobId']: 'x' }); return ctx.ok(null); });", code: "LMAO_FIELDS_NOT_OBJECT_LITERAL"},
+		{name: "getter property", body: "defineOp('x', ctx => { ctx.log.info('{jobId}', { get jobId() { return 'x'; } }); return ctx.ok(null); });", code: "LMAO_FIELDS_NOT_OBJECT_LITERAL"},
+		{name: "method property", body: "defineOp('x', ctx => { ctx.log.info('{jobId}', { jobId() { return 'x'; } }); return ctx.ok(null); });", code: "LMAO_FIELDS_NOT_OBJECT_LITERAL"},
+		{name: "unknown placeholder", body: "defineOp('x', ctx => { ctx.log.info('{unknown}', { jobId: 'x' }); return ctx.ok(null); });", code: "LMAO_PLACEHOLDER_MISMATCH"},
+		{name: "duplicate placeholder", body: "defineOp('x', ctx => { ctx.log.info('{jobId} {jobId}', { jobId: 'x' }); return ctx.ok(null); });", code: "LMAO_PLACEHOLDER_MISMATCH"},
+		{name: "missing placeholder", body: "defineOp('x', ctx => { ctx.log.info('job complete', { jobId: 'x' }); return ctx.ok(null); });", code: "LMAO_PLACEHOLDER_MISMATCH"},
+		{name: "missing field", body: "defineOp('x', ctx => { ctx.log.info('{jobId} {elapsedMs}', { jobId: 'x' }); return ctx.ok(null); });", code: "LMAO_PLACEHOLDER_MISMATCH"},
+		{name: "duplicate field", body: "defineOp('x', ctx => { ctx.log.info('{jobId}', { jobId: 'x', jobId: 'y' }); return ctx.ok(null); });", code: "LMAO_PLACEHOLDER_MISMATCH"},
+		{name: "unclosed placeholder", body: "defineOp('x', ctx => { ctx.log.info('job {jobId', { jobId: 'x' }); return ctx.ok(null); });", code: "LMAO_PLACEHOLDER_MISMATCH"},
+		{name: "stray closing brace", body: "defineOp('x', ctx => { ctx.log.info('job jobId}', { jobId: 'x' }); return ctx.ok(null); });", code: "LMAO_PLACEHOLDER_MISMATCH"},
+		{name: "empty placeholder", body: "defineOp('x', ctx => { ctx.log.info('job {}', {}); return ctx.ok(null); });", code: "LMAO_PLACEHOLDER_MISMATCH"},
+		{name: "unknown schema field", body: "defineOp('x', ctx => { ctx.log.info('{other}', { other: 'x' }); return ctx.ok(null); });", code: "LMAO_PLACEHOLDER_MISMATCH"},
+		{name: "field type mismatch", body: "defineOp('x', ctx => { ctx.log.info('{elapsedMs}', { elapsedMs: 'slow' }); return ctx.ok(null); });", code: "LMAO_PLACEHOLDER_MISMATCH"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := runTemplateFixture(t, test.body)
+			codes := diagnosticCodes(result.err)
+			if len(codes) != 1 || codes[0] != test.code {
+				t.Fatalf("diagnostic codes = %q, want exactly [%s]; error = %v", codes, test.code, result.err)
+			}
+			expectedPos := strings.Index(result.source, "ctx.log.") - 1
+			expectedLocation := filepath.ToSlash(result.inputPath) + ":" + strconv.Itoa(expectedPos)
+			if !strings.Contains(result.err.Error(), expectedLocation) {
+				t.Fatalf("diagnostic location = %v, want call-expression full-start %s", result.err, expectedLocation)
+			}
+			if result.output != "" {
+				t.Fatalf("rejected source was mutated/emitted:\n%s", result.output)
+			}
+		})
 	}
 }

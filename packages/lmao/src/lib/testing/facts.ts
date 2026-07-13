@@ -88,7 +88,7 @@ export function spanException<N extends string, M extends string>(name: N, messa
 /**
  * Log levels.
  */
-export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error';
 
 /**
  * A log fact: `log:${level}: ${message}`

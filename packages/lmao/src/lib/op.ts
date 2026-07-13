@@ -22,6 +22,7 @@ import type { Result } from './result.js';
 import { decodeRuntimeHint } from './runtimeHint.js';
 import { createSpanContextClass } from './spanContext.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
+import type { VocabularyGeneration } from './vocabularyRegistry.js';
 
 // =============================================================================
 // OP METADATA
@@ -41,10 +42,8 @@ import type { SpanBufferConstructor } from './spanBuffer.js';
 // two levels of the 01j Context Hierarchy.
 export interface OpCompileMetadata {
   readonly runtimeHint: number;
-  readonly logTemplateIds: readonly string[];
 }
 
-export const EMPTY_LOG_TEMPLATE_IDS: readonly string[] = Object.freeze([]);
 
 export interface OpMetadata {
   /** Op name for metrics tracking (distinct from span names which are provided at call sites) */
@@ -64,10 +63,8 @@ export interface OpMetadata {
   readonly package_file_entry: PreEncodedEntry;
   /** Pre-encoded git_sha for Arrow dictionary building */
   readonly git_sha_entry: PreEncodedEntry;
-  /** Op-local compile-time log templates; ID n resolves at index n - 1. */
-  readonly logTemplateIds: readonly string[];
   /** Startup-resolved physical layout used by span setup; absent only on raw fallback metadata. */
-  readonly _physicalLayoutPlan?: object;
+  readonly _physicalLayoutPlan?: { readonly vocabularyGeneration: VocabularyGeneration };
 }
 //#endregion smoo/lmao!n/opcontext-hierarchy
 

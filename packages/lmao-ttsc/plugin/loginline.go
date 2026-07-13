@@ -40,6 +40,7 @@
 package main
 
 import (
+	"sort"
 	"strings"
 
 	shimast "github.com/microsoft/typescript-go/shim/ast"
@@ -89,6 +90,77 @@ func isSpanLoggerType(chk *shimchecker.Checker, t *shimchecker.Type) bool {
 	return false
 }
 
+func schemaFieldFromSetterCall(chk *shimchecker.Checker, call *shimast.CallExpression) (schemaField, bool) {
+	signature := chk.GetResolvedSignature(call.AsNode())
+	if signature == nil {
+		return schemaField{}, false
+	}
+	params := shimchecker.Signature_parameters(signature)
+	if len(params) == 0 {
+		return schemaField{}, false
+	}
+	paramType := shimchecker.Checker_getTypeOfSymbol(chk, params[0])
+	if paramType == nil {
+		return schemaField{}, false
+	}
+	if paramType.IsUnion() {
+		values := make([]string, 0, len(paramType.Types()))
+		for _, member := range paramType.Types() {
+			if !member.IsStringLiteral() {
+				memberText := chk.TypeToString(member)
+				if memberText == "null" || memberText == "undefined" {
+					continue
+				}
+				values = nil
+				break
+			}
+			value, ok := member.AsLiteralType().Value().(string)
+			if !ok {
+				values = nil
+				break
+			}
+			values = append(values, value)
+		}
+		if len(values) > 0 {
+			sort.Strings(values)
+			return schemaField{kind: fieldEnum, enumValues: values}, true
+		}
+	}
+	switch chk.TypeToString(paramType) {
+	case "string", "number":
+		return schemaField{kind: fieldDirect}, true
+	case "boolean":
+		return schemaField{kind: fieldBool}, true
+	default:
+		return schemaField{}, false
+	}
+}
+
+func finiteStringLiteralUnion(chk *shimchecker.Checker, typ *shimchecker.Type) []string {
+	if typ == nil || !typ.IsUnion() {
+		return nil
+	}
+	values := make([]string, 0, len(typ.Types()))
+	for _, member := range typ.Types() {
+		if member.IsStringLiteral() {
+			if value, ok := member.AsLiteralType().Value().(string); ok {
+				values = append(values, value)
+				continue
+			}
+		}
+		memberText := chk.TypeToString(member)
+		if memberText != "null" && memberText != "undefined" {
+			return nil
+		}
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	sort.Strings(values)
+	return values
+}
+
+
 // findLogInline analyzes a statement-level call chain. Checker queries only;
 // no mutation (must run in the collect phase).
 func (t *fileTransformer) findLogInline(call *shimast.CallExpression) (*logInline, bool) {
@@ -123,7 +195,7 @@ func (t *fileTransformer) findLogInline(call *shimast.CallExpression) (*logInlin
 		if recvType == nil || !isSpanLoggerType(t.checker, recvType) {
 			return nil, false
 		}
-		if len(links[0].args) != 1 {
+		if len(links[0].args) < 1 || len(links[0].args) > 2 {
 			return nil, false
 		}
 		templateID := t.staticLogIDs[links[0].node]
@@ -137,7 +209,37 @@ func (t *fileTransformer) findLogInline(call *shimast.CallExpression) (*logInlin
 			message:    links[0].args[0],
 			templateID: templateID,
 			line:       t.lineOf(links[0].node.AsNode()),
-			schema:     extractLogSchema(t.checker, recvType),
+			schema:     resolvedLogSchema(t.checker, recvType, links[0].node),
+		}
+		if len(links[0].args) == 2 {
+			if links[0].args[1].Kind != shimast.KindObjectLiteralExpression {
+				return nil, false
+			}
+			fieldsType := t.checker.GetContextualType(links[0].args[1], 0)
+			for _, prop := range links[0].args[1].AsObjectLiteralExpression().Properties.Nodes {
+				var write tagWrite
+				switch prop.Kind {
+				case shimast.KindPropertyAssignment:
+					assignment := prop.AsPropertyAssignment()
+					nameNode := assignment.Name()
+					if nameNode.Kind != shimast.KindIdentifier && nameNode.Kind != shimast.KindStringLiteral {
+						return nil, false
+					}
+					write = tagWrite{field: shimast.NodeText(nameNode), arg: assignment.Initializer}
+				case shimast.KindShorthandPropertyAssignment:
+					write = tagWrite{field: shimast.NodeText(prop.Name()), arg: prop.Name()}
+				default:
+					return nil, false
+				}
+				if fieldsType != nil {
+					if propertyType := shimchecker.Checker_getTypeOfPropertyOfType(t.checker, fieldsType, write.field); propertyType != nil {
+						if values := finiteStringLiteralUnion(t.checker, propertyType); len(values) > 0 {
+							in.schema[write.field] = schemaField{kind: fieldEnum, enumValues: values}
+						}
+					}
+				}
+				in.writes = append(in.writes, write)
+			}
 		}
 		for _, l := range links[1:] {
 			switch {
@@ -172,7 +274,22 @@ func (t *fileTransformer) findLogInline(call *shimast.CallExpression) (*logInlin
 					return nil, false
 				}
 				if _, known := in.schema[l.name]; !known {
-					return nil, false // not a schema field setter: bail, never miscompile
+					field, resolved := schemaFieldFromSetterCall(t.checker, l.node)
+					if !resolved {
+						return nil, false // not a schema field setter: bail, never miscompile
+					}
+					in.schema[l.name] = field
+				}
+				contextualType := t.checker.GetContextualType(l.args[0], 0)
+				if values := finiteStringLiteralUnion(t.checker, contextualType); len(values) > 0 {
+					// A finite contextual string union comes from the checker-proven
+					// schema setter; broad category/text setters contextualize as string.
+					in.schema[l.name] = schemaField{kind: fieldEnum, enumValues: values}
+				}
+				if in.schema[l.name].kind == fieldDirect {
+					if values := finiteStringLiteralUnion(t.checker, t.checker.GetTypeAtLocation(l.args[0])); len(values) > 0 {
+						in.schema[l.name] = schemaField{kind: fieldEnum, enumValues: values}
+					}
 				}
 				in.writes = append(in.writes, tagWrite{field: l.name, arg: l.args[0]})
 			}
@@ -185,6 +302,46 @@ func (t *fileTransformer) findLogInline(call *shimast.CallExpression) (*logInlin
 // methods that would otherwise classify as string fields.
 func extractLogSchema(chk *shimchecker.Checker, logType *shimchecker.Type) map[string]schemaField {
 	schema := extractSchema(chk, logType)
+	// Generated setters include null/undefined in their parameter union.
+	// extractSchema intentionally recognizes only all-literal unions, so
+	// recover the precise enum dictionary here while ignoring nullable members.
+	for _, symbol := range shimchecker.Checker_getPropertiesOfType(chk, logType) {
+		name := symbol.Name
+		if name == "with" || strings.HasPrefix(name, "_") || logMethods[name] || name == "line" {
+			continue
+		}
+		propertyType := shimchecker.Checker_getTypeOfSymbol(chk, symbol)
+		signatures := shimchecker.Checker_getSignaturesOfType(chk, propertyType, shimchecker.SignatureKindCall)
+		if len(signatures) == 0 {
+			continue
+		}
+		parameters := shimchecker.Signature_parameters(signatures[0])
+		if len(parameters) == 0 {
+			continue
+		}
+		parameterType := shimchecker.Checker_getTypeOfSymbol(chk, parameters[0])
+		if parameterType == nil || !parameterType.IsUnion() {
+			continue
+		}
+		values := make([]string, 0, len(parameterType.Types()))
+		for _, member := range parameterType.Types() {
+			if member.IsStringLiteral() {
+				if value, ok := member.AsLiteralType().Value().(string); ok {
+					values = append(values, value)
+					continue
+				}
+			}
+			memberText := chk.TypeToString(member)
+			if memberText != "null" && memberText != "undefined" {
+				values = nil
+				break
+			}
+		}
+		if len(values) > 0 {
+			sort.Strings(values)
+			schema[name] = schemaField{kind: fieldEnum, enumValues: values}
+		}
+	}
 	for name := range logMethods {
 		delete(schema, name)
 	}
@@ -221,6 +378,25 @@ func guardedRawWrite(buf, idx *shimast.Node, field string, value *shimast.Node) 
 	return factory.NewIfStatement(values(), factory.NewBlock(factory.NewNodeList(body), true), nil)
 }
 
+// fixedSchemaWrite emits one unconditional fixed-column value store. Schema
+// resolution proves the lane exists; the null bitmap remains optional.
+func fixedSchemaWrite(buf, idx *shimast.Node, field string, value *shimast.Node) []*shimast.Node {
+	values := propAccess(buf, field+"_values")
+	nulls := func() *shimast.Node { return propAccess(buf, field+"_nulls") }
+	valueSlot := factory.NewElementAccessExpression(values, nil, idx, shimast.NodeFlagsNone)
+	nullSlot := factory.NewElementAccessExpression(nulls(), nil,
+		factory.NewBinaryExpression(nil, idx, nil, factory.NewToken(shimast.KindGreaterThanGreaterThanGreaterThanToken), num(3)),
+		shimast.NodeFlagsNone)
+	nullBit := factory.NewBinaryExpression(nil, num(1), nil, factory.NewToken(shimast.KindLessThanLessThanToken),
+		factory.NewParenthesizedExpression(factory.NewBinaryExpression(nil, idx, nil, factory.NewToken(shimast.KindAmpersandToken), num(7))))
+	return []*shimast.Node{
+		binaryStmt(valueSlot, shimast.KindEqualsToken, value),
+		factory.NewIfStatement(nulls(), factory.NewBlock(factory.NewNodeList([]*shimast.Node{
+			binaryStmt(nullSlot, shimast.KindBarEqualsToken, nullBit),
+		}), false), nil),
+	}
+}
+
 // applyLogInlines splices replacement blocks (phase B — no checker use).
 func (t *fileTransformer) applyLogInlines(inlines []logInline) {
 	for _, in := range inlines {
@@ -242,14 +418,22 @@ func (t *fileTransformer) applyLogInlines(inlines []logInline) {
 			factory.NewBlock(factory.NewNodeList([]*shimast.Node{
 				factory.NewExpressionStatement(callExpr(propAccess(ident("$$l"), "_checkOverflow"), nil)),
 			}), false), nil)
-		stmts := []*shimast.Node{
-			constDecl(logger, in.logExpr),
+		stmts := []*shimast.Node{constDecl(logger, in.logExpr)}
+		// Evaluate arguments before entering the logger path. A throwing field
+		// initializer therefore cannot leave a partially written row.
+		capturedWrites := make([]tagWrite, len(in.writes))
+		for index, write := range in.writes {
+			value := ident("$$f" + itoa(index))
+			stmts = append(stmts, constDecl(value, write.arg))
+			capturedWrites[index] = tagWrite{field: write.field, arg: value}
+		}
+		stmts = append(stmts,
 			overflowCheck,
 			constDecl(buf, propAccess(logger, "_buffer")),
 			constDecl(idx, callExpr(propAccess(propAccess(buf, "_traceRoot"), "writeLogEntry"),
 				[]*shimast.Node{buf, num(logEntryTypes[in.level]), vocabularyOperand()})),
 			binaryStmt(propAccess(logger, "_writeIndex"), shimast.KindEqualsToken, idx),
-		}
+		)
 		if in.templateID != 0 {
 			packed := factory.NewBinaryExpression(nil,
 				factory.NewParenthesizedExpression(factory.NewBinaryExpression(nil,
@@ -273,7 +457,7 @@ func (t *fileTransformer) applyLogInlines(inlines []logInline) {
 		}
 		stmts = append(stmts, guardedRawWrite(buf, idx, "line", lineValue))
 
-		for _, w := range in.writes {
+		for _, w := range capturedWrites {
 			info := in.schema[w.field]
 			switch info.kind {
 			case fieldEnum:
@@ -300,7 +484,7 @@ func (t *fileTransformer) applyLogInlines(inlines []logInline) {
 				stmts = append(stmts, factory.NewExpressionStatement(
 					callExpr(propAccess(buf, w.field), []*shimast.Node{idx, w.arg})))
 			default:
-				stmts = append(stmts, guardedRawWrite(buf, idx, w.field, w.arg))
+				stmts = append(stmts, fixedSchemaWrite(buf, idx, w.field, w.arg)...)
 			}
 		}
 		in.list.Nodes[in.index] = factory.NewBlock(factory.NewNodeList(stmts), true)

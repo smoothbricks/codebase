@@ -18,22 +18,24 @@ const schema = defineLogSchema({
 
 const opContext = defineOpContext({ logSchema: schema });
 const { defineOp } = opContext;
+const childSpanName: string = 'plugin-baseline-child';
+
 
 const baselineOp = defineOp('plugin-baseline', async (ctx, logCount: number) => {
   ctx.tag.userId('user-42').operation('READ').index(0).detail('root-tag');
 
   for (let index = 0; index < logCount; index++) {
     ctx.log
-      .info(`overflow-log-${index}`)
+      .info('Processing complete')
       .userId(`user-${index % 3}`)
       .operation(index % 2 === 0 ? 'READ' : 'WRITE')
       .index(index)
       .detail(`detail-${index}`);
   }
 
-  const child = await ctx.span('plugin-baseline-child', async (childCtx) => {
+  const child = await ctx.span(childSpanName, async (childCtx) => {
     childCtx.tag.userId('child-user').operation('READ').index(99).detail('child-tag');
-    childCtx.log.info('child-log').index(100).detail('child-detail');
+    childCtx.log.info('Validation passed').index(100).detail('child-detail');
     return childCtx.ok({ child: true });
   });
 

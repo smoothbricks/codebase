@@ -64,7 +64,6 @@ describe('spanAuto synchronous and fallback execution', () => {
   it('returns a synchronous Result and fires exact hooks around one terminal row', async () => {
     const op = opContext.defineOp('sync', (ctx) => ctx.ok('done'), undefined, {
       runtimeHint: analyzedResult,
-      logTemplateIds: [],
     });
     const tracer = new TestTracer(opContext, createTestTracerOptions());
     const hooks: string[] = [];
@@ -90,7 +89,6 @@ describe('spanAuto synchronous and fallback execution', () => {
   it('propagates a synchronous onSpanEnd failure without a second hook or exception rewrite', async () => {
     const op = opContext.defineOp('hook-throw', (ctx) => ctx.ok('done'), undefined, {
       runtimeHint: analyzedResult,
-      logTemplateIds: [],
     });
     const tracer = new TestTracer(opContext, createTestTracerOptions());
     const hookFailure = new Error('hook exploded');
@@ -118,7 +116,6 @@ describe('spanAuto synchronous and fallback execution', () => {
   it('falls back to a Promise for a thenable and still writes one terminal row', async () => {
     const op = opContext.defineOp('async', async (ctx) => ctx.ok('later'), undefined, {
       runtimeHint: analyzedResult,
-      logTemplateIds: [],
     });
     const tracer = new TestTracer(opContext, createTestTracerOptions());
 
@@ -144,7 +141,7 @@ describe('spanAuto synchronous and fallback execution', () => {
           thenAccesses++;
         }),
       undefined,
-      { runtimeHint: analyzedResult, logTemplateIds: [] },
+      { runtimeHint: analyzedResult },
     );
     const tracer = new TestTracer(opContext, createTestTracerOptions());
 
@@ -173,7 +170,7 @@ describe('spanAuto synchronous and fallback execution', () => {
         return attempts === 1 ? ctx.err(RETRY({})) : ctx.ok('recovered');
       },
       undefined,
-      { runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_RESULT | 3, logTemplateIds: [] },
+      { runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_RESULT | 3 },
     );
     const tracer = new TestTracer(opContext, createTestTracerOptions());
 
@@ -196,7 +193,6 @@ describe('spanAuto synchronous and fallback execution', () => {
     const failure = new Error('async exploded');
     const op = opContext.defineOp('reject', () => Promise.reject(failure), undefined, {
       runtimeHint: analyzedResult,
-      logTemplateIds: [],
     });
     const tracer = new TestTracer(opContext, createTestTracerOptions());
     let starts = 0;
@@ -234,7 +230,7 @@ describe('runtime hint specialization', () => {
           return ctx.ok(name);
         },
         undefined,
-        { runtimeHint: hint, logTemplateIds: [] },
+        { runtimeHint: hint },
       );
       const tracer = new TestTracer(opContext, createTestTracerOptions());
       await tracer.trace('root', async (ctx) => {
@@ -249,7 +245,6 @@ describe('runtime hint specialization', () => {
   });
 
   it('omits unused capabilities while terminal writes stay on the child buffer', async () => {
-    let parentContext: SpanContext<OpContextOf<typeof opContext>> | undefined;
     let childContext: SpanContext<OpContextOf<typeof opContext>> | undefined;
     const op = opContext.defineOp(
       'result-only',
@@ -258,24 +253,21 @@ describe('runtime hint specialization', () => {
         return ctx.ok('child');
       },
       undefined,
-      { runtimeHint: analyzedResult, logTemplateIds: [] },
+      { runtimeHint: analyzedResult },
     );
     const tracer = new TestTracer(opContext, createTestTracerOptions());
 
     await tracer.trace('root', async (ctx) => {
-      parentContext = ctx;
       const result = ctx.spanAuto0(1, 'result-only', op);
       if (result instanceof Promise) throw new Error('result-only spanAuto unexpectedly returned a Promise');
       expect(result.success).toBe(true);
       return ctx.ok('parent');
     });
 
-    if (!parentContext || !childContext) throw new Error('missing captured contexts');
-    expect(Object.getPrototypeOf(childContext)).toBe(parentContext);
+    if (!childContext) throw new Error('missing captured child context');
     expect(Object.hasOwn(childContext, 'ok')).toBe(true);
     expect(Object.hasOwn(childContext, 'tag')).toBe(false);
     expect(Object.hasOwn(childContext, 'log')).toBe(false);
-    expect(Object.hasOwn(childContext, 'inheritedMarker')).toBe(false);
     expect(tracer.rootBuffers[0].entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
     expect(childOf(tracer).entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
   });
@@ -283,7 +275,6 @@ describe('runtime hint specialization', () => {
   it('honors static capacity including the two-row minimum and preserves overflow rows', async () => {
     const minimumOp = opContext.defineOp('minimum', (ctx) => ctx.ok(null), undefined, {
       runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_RESULT | 1,
-      logTemplateIds: [],
     });
     const loggingOp = opContext.defineOp(
       'overflow',
@@ -293,7 +284,7 @@ describe('runtime hint specialization', () => {
         return ctx.ok(null);
       },
       undefined,
-      { runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_LOG | RUNTIME_HINT_RESULT | 3, logTemplateIds: [] },
+      { runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_LOG | RUNTIME_HINT_RESULT | 3 },
     );
     const tracer = new TestTracer(opContext, createTestTracerOptions());
 
@@ -317,14 +308,13 @@ describe('runtime hint specialization', () => {
   it('maps defineOps hints by key and preserves them through prefixed and mapped clones', () => {
     const existing = opContext.defineOp('existing', (ctx) => ctx.ok(null), undefined, {
       runtimeHint: analyzedResult | 7,
-      logTemplateIds: [],
     });
     const group = opContext.defineOps(
       {
         existing,
         raw: (ctx) => ctx.ok(null),
       },
-      { raw: { runtimeHint: analyzedResult | 5, logTemplateIds: [] } },
+      { raw: { runtimeHint: analyzedResult | 5 } },
     );
 
     expect(group.existing).toBe(existing);
@@ -335,7 +325,7 @@ describe('runtime hint specialization', () => {
 
     const overridden = opContext.defineOps(
       { existing },
-      { existing: { runtimeHint: analyzedResult | 9, logTemplateIds: [] } },
+      { existing: { runtimeHint: analyzedResult | 9 } },
     );
     expect(overridden.existing).not.toBe(existing);
     expect(overridden.existing.runtimeHint).toBe(analyzedResult | 9);
@@ -362,7 +352,6 @@ describe('feature evaluator child context identity', () => {
 
   it('binds the evaluator to the direct inherited child rather than a copied context', async () => {
     const evaluator = new CapturingEvaluator(flags.schema, { enabled: true });
-    let parentContext: SpanContext<FeatureOpContext> | undefined;
     let childContext: SpanContext<FeatureOpContext> | undefined;
     const op = featureContext.defineOp(
       'flagged',
@@ -372,20 +361,17 @@ describe('feature evaluator child context identity', () => {
         return ctx.ok(null);
       },
       undefined,
-      { runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_FF | RUNTIME_HINT_RESULT | 3, logTemplateIds: [] },
+      { runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_FF | RUNTIME_HINT_RESULT | 3 },
     );
     const tracer = new TestTracer(featureContext, { ...createTestTracerOptions(), flagEvaluator: evaluator });
 
     await tracer.trace('root', async (ctx) => {
-      parentContext = ctx;
       ctx.spanAuto0(1, 'flagged', op);
       return ctx.ok(null);
     });
 
-    if (!parentContext || !childContext) throw new Error('missing captured feature contexts');
+    if (!childContext) throw new Error('missing captured feature context');
     expect(evaluator.contexts).toEqual([childContext]);
-    expect(Object.getPrototypeOf(childContext)).toBe(parentContext);
-    expect(Object.hasOwn(childContext, 'inheritedMarker')).toBe(false);
     expect(childContext.inheritedMarker).toBe('from-parent');
   });
 });

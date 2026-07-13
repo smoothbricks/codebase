@@ -34,6 +34,7 @@ import { createTraceId } from '../src/lib/traceId.js';
 import { createTraceRoot } from '../src/lib/traceRoot.node.js';
 import { TestTracer } from '../src/lib/tracers/TestTracer.js';
 import type { AnySpanBuffer, SpanBuffer } from '../src/lib/types.js';
+import { registerBenchmarkVocabulary } from './vocabularyFixture.js';
 
 const MESSAGE_KINDS = ['static', 'dynamic', 'mixed'] as const;
 const LOG_COUNTS = [0, 1, 50] as const;
@@ -44,6 +45,7 @@ const TEMPLATES = Object.freeze([
   'response committed',
   'request cleanup complete',
 ]);
+const TEMPLATE_BINDING = registerBenchmarkVocabulary(TEMPLATES);
 const USER_SCHEMA = defineLogSchema({ marker: S.category() });
 const OP_CONTEXT = defineOpContext({ logSchema: USER_SCHEMA });
 const FULL_SCHEMA = OP_CONTEXT.logBinding.logSchema;
@@ -85,14 +87,11 @@ interface Scenario {
   root: AnySpanBuffer;
   buffers: AnySpanBuffer[];
   staticDictionary: ReadonlyMap<string, number>;
-  staticTemplateIndices: Uint32Array;
+  staticDenseIndices: Uint32Array;
 }
 
-function metadataWithTemplates(name: string) {
-  return Object.freeze({
-    ...createOpMetadata(name, '@smoothbricks/arrow-flush-bench', 'arrow-flush-path.bench.ts', 'bench', 1),
-    logTemplateIds: TEMPLATES,
-  });
+function metadataForScenario(name: string) {
+  return createOpMetadata(name, '@smoothbricks/arrow-flush-bench', 'arrow-flush-path.bench.ts', 'bench', 1);
 }
 
 function initializeSpan(buffer: AnySpanBuffer, name: string, timestampBase: bigint): void {
@@ -108,7 +107,7 @@ function writeLogs(buffer: SpanBuffer, kind: MessageKind, count: number): void {
   const logger = createSpanLogger(FULL_SCHEMA, buffer);
   for (let index = 0; index < count; index++) {
     if (kind === 'static' || (kind === 'mixed' && (index & 1) === 0)) {
-      logger._infoTemplate((index % TEMPLATES.length) + 1);
+      logger._infoTemplate(TEMPLATE_BINDING[index % TEMPLATES.length]!);
     } else {
       logger.info(`dynamic request ${index % 11}`);
     }
@@ -126,7 +125,7 @@ function collectBuffers(root: AnySpanBuffer): AnySpanBuffer[] {
 function makeScenario(kind: MessageKind, logCount: number, topology: Topology): Scenario {
   const capacity = topology === 'overflow-capacity' ? 8 : 64;
   const depth = topology === 'depth-3-tree' ? 3 : 1;
-  const metadata = metadataWithTemplates(`${kind}-${logCount}-${topology}`);
+  const metadata = metadataForScenario(`${kind}-${logCount}-${topology}`);
   const traceRoot = createTraceRoot(createTraceId(`arrow-flush-${kind}-${logCount}-${topology}`), TRACER);
   const root = createSpanBuffer(FULL_SCHEMA, traceRoot, metadata, capacity);
   initializeSpan(root, 'root-span', 1_000n);
@@ -149,9 +148,9 @@ function makeScenario(kind: MessageKind, logCount: number, topology: Topology): 
   for (let level = 0; level < depth; level++) staticValues.add(level === 0 ? 'root-span' : `child-span-${level}`);
   const staticDictionary = new Map<string, number>();
   for (const value of staticValues) staticDictionary.set(value, staticDictionary.size);
-  const staticTemplateIndices = new Uint32Array(TEMPLATES.length + 1);
-  for (let templateId = 1; templateId <= TEMPLATES.length; templateId++) {
-    staticTemplateIndices[templateId] = staticDictionary.get(TEMPLATES[templateId - 1]!)!;
+  const staticDenseIndices = new Uint32Array(Math.max(...TEMPLATE_BINDING) + 1);
+  for (let ordinal = 0; ordinal < TEMPLATES.length; ordinal++) {
+    staticDenseIndices[TEMPLATE_BINDING[ordinal]!] = staticDictionary.get(TEMPLATES[ordinal]!)!;
   }
 
   return {
@@ -164,7 +163,7 @@ function makeScenario(kind: MessageKind, logCount: number, topology: Topology): 
     root,
     buffers,
     staticDictionary,
-    staticTemplateIndices,
+    staticDenseIndices,
   };
 }
 
@@ -310,11 +309,10 @@ function directNumericStaticSuffixModel(scenario: Scenario): DirectNumericResult
   let outputRow = 0;
   let dynamicLookupCount = 0;
   for (const buffer of scenario.buffers) {
-    const templateIds = buffer._messageTemplateIds;
     for (let row = 0; row < buffer._writeIndex; row++, outputRow++) {
-      const templateId = templateIds?.[row] ?? 0;
-      if (templateId !== 0) {
-        indices[outputRow] = scenario.staticTemplateIndices[templateId]!;
+      const header = buffer._logHeaders[row]!;
+      if (header !== 0) {
+        indices[outputRow] = scenario.staticDenseIndices[header >>> 8]!;
         continue;
       }
 
@@ -675,7 +673,7 @@ function writeStringRows(buffer: SpanBuffer, rows: readonly StringRow[], offset:
 
 function makeStringScenario(profile: StringProfile, topology: Topology): StringScenario {
   const rows = Array.from({ length: profile.rowCount ?? STRING_ROW_COUNT }, (_, index) => profile.row(index));
-  const metadata = metadataWithTemplates(`strings-${profile.name}-${topology}`);
+  const metadata = metadataForScenario(`strings-${profile.name}-${topology}`);
   const traceRoot = createTraceRoot(createTraceId(`arrow-strings-${profile.name}-${topology}`), STRING_TRACER);
   const capacity = topology === 'overflow-capacity' ? 8 : Math.max(64, rows.length);
   const root = createSpanBuffer(STRING_FULL_SCHEMA, traceRoot, metadata, capacity);

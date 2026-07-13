@@ -19,6 +19,7 @@ import type { SpanBufferConstructor } from './spanBuffer.js';
 import type { AnySpanBuffer, SpanBuffer } from './types.js';
 import type { SpanContextClass } from './spanContext.js';
 import type { ITraceRoot, TimestampAppendPrimitive } from './traceRoot.js';
+import { getVocabularyGeneration, type VocabularyGeneration } from './vocabularyRegistry.js';
 
 export const PHYSICAL_LAYOUT_VERSION = 1;
 
@@ -66,8 +67,8 @@ export interface PhysicalLayoutPlan<
   ) => ResultWriter<T, R, E>;
   readonly clock: PhysicalClock;
   readonly appenders: PhysicalAppenders;
-  /** Vocabulary binding is a later startup phase; this stable slot owns no binding yet. */
-  readonly vocabularyBindingSlot: null;
+  /** Immutable global vocabulary generation used by dense row identities in this plan. */
+  readonly vocabularyGeneration: VocabularyGeneration;
   /** Reserved immutable ownership slot; buffer pooling is a later task. */
   readonly poolRef: null;
   readonly remapDescriptor: RemapDescriptor | null;
@@ -108,6 +109,7 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
   backendKind: PhysicalBackendKind,
   SpanContextClass: SpanContextClass<Ctx>,
   contextLayoutKey: string,
+  vocabularyGeneration: VocabularyGeneration,
 ): PhysicalLayoutPlan<T, Ctx> {
   const schema = SpanBufferClass.schema;
   const SpanLoggerClass = createSpanLoggerClass(schema);
@@ -131,7 +133,7 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
     ResultWriterClass,
     clock: TRACE_ROOT_CLOCK,
     appenders: TRACE_ROOT_APPENDERS,
-    vocabularyBindingSlot: null,
+    vocabularyGeneration,
     poolRef: null,
     remapDescriptor: null,
     createSpanLogger(buffer: SpanBuffer<T>): SpanLoggerImpl<T> {
@@ -159,10 +161,18 @@ export function getPhysicalLayoutPlan<T extends LogSchema, Ctx extends OpContext
     basePlans.set(schema, byKey);
   }
 
-  const key = `${PHYSICAL_LAYOUT_VERSION}:${backendKind}:${runtimeHint}:${contextLayoutKey}`;
+  const vocabularyGeneration = getVocabularyGeneration();
+  const key = `${PHYSICAL_LAYOUT_VERSION}:${backendKind}:${runtimeHint}:${contextLayoutKey}:${vocabularyGeneration.generation}`;
   let base = byKey.get(key) as PhysicalLayoutPlan<T, Ctx> | undefined;
   if (!base) {
-    base = createBasePlan(SpanBufferClass, runtimeHint, backendKind, SpanContextClass, contextLayoutKey);
+    base = createBasePlan(
+      SpanBufferClass,
+      runtimeHint,
+      backendKind,
+      SpanContextClass,
+      contextLayoutKey,
+      vocabularyGeneration,
+    );
     byKey.set(key, base);
   } else if (base.SpanBufferClass !== SpanBufferClass) {
     throw new TypeError('Physical layout cache key resolved to a different SpanBuffer constructor');

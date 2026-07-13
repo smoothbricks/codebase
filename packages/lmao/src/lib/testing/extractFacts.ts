@@ -18,6 +18,7 @@ import {
   ENTRY_TYPE_SPAN_ERR,
   ENTRY_TYPE_SPAN_EXCEPTION,
   ENTRY_TYPE_SPAN_OK,
+  ENTRY_TYPE_TRACE,
   ENTRY_TYPE_WARN,
 } from '../schema/systemSchema.js';
 import type { SpanBuffer } from '../types.js';
@@ -112,7 +113,7 @@ const DEFAULT_OPTIONS: Required<ExtractFactsOptions> = {
  *
  * Walks the buffer tree depth-first and produces facts for:
  * - Span lifecycle (started, ok, err, exception)
- * - Log entries (info, warn, error, debug)
+ * - Log entries (trace, debug, info, warn, error)
  * - Tag values (from row 0 of each span)
  * - Scope values (propagated through tree)
  * - Feature flag accesses
@@ -185,7 +186,7 @@ function walkBuffer<T extends LogSchema>(
   // Buffer layout per specs/lmao/01h_entry_types_and_logging_primitives.md:
   // - Row 0: span-start (tags overwrite this row's attribute columns)
   // - Row 1: span-ok/err/exception (completion status)
-  // - Row 2+: log entries (info/debug/warn/error), ff entries
+  // - Row 2+: log entries (trace/debug/info/warn/error), ff entries
   const entryTypes = buffer.entry_type;
 
   // Process log/ff entries from row 2 onwards
@@ -196,7 +197,8 @@ function walkBuffer<T extends LogSchema>(
       case ENTRY_TYPE_INFO:
       case ENTRY_TYPE_DEBUG:
       case ENTRY_TYPE_WARN:
-      case ENTRY_TYPE_ERROR: {
+      case ENTRY_TYPE_ERROR:
+      case ENTRY_TYPE_TRACE: {
         if (opts.includeLogs) {
           const level = entryTypeToLogLevel(entryType);
           facts.push(logFact(level, resolveMessage(buffer, row) ?? ''));
@@ -314,6 +316,8 @@ function isNull(nulls: Uint8Array, index: number): boolean {
  */
 function entryTypeToLogLevel(entryType: number): LogLevel {
   switch (entryType) {
+    case ENTRY_TYPE_TRACE:
+      return 'trace';
     case ENTRY_TYPE_DEBUG:
       return 'debug';
     case ENTRY_TYPE_INFO:
