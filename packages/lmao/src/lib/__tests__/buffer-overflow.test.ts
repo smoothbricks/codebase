@@ -3,6 +3,7 @@ import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import fc from 'fast-check';
 import { createSpanLogger } from '../codegen/spanLoggerGenerator.js';
 import { DEFAULT_METADATA } from '../opContext/defineOp.js';
+import { resolveMessage } from '../resolveMessage.js';
 import { S } from '../schema/builder.js';
 import { LogSchema } from '../schema/LogSchema.js';
 import { mergeWithSystemSchema } from '../schema/systemSchema.js';
@@ -509,7 +510,7 @@ describe('Buffer Overflow Property Tests', () => {
       expect(overflowProbe._userId_values).toBeUndefined();
 
       // Row 0 has the actual entry (message IS allocated because .info() writes to it)
-      expect(overflowBuffer.message_values[0]).toBe('msg-6');
+      expect(resolveMessage(overflowBuffer, 0)).toBe('msg-6');
     });
 
     it('should prefill scoped attributes across multiple overflow buffers', () => {

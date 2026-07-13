@@ -4,6 +4,7 @@ import '../../__tests__/test-helpers.js';
 import { describe, expect, it } from 'bun:test';
 import { createTestTracerOptions } from '../../__tests__/test-helpers.js';
 import { convertSpanTreeToArrowTable } from '../../convertToArrow.js';
+import { resolveMessage } from '../../resolveMessage.js';
 import { defineLogSchema, defineOpContext, S } from '../../defineOpContext.js';
 import { ArrayQueueTracer } from '../ArrayQueueTracer.js';
 
@@ -31,7 +32,7 @@ describe('ArrayQueueTracer', () => {
       await trace('queued-trace', testOp);
 
       expect(tracer.queue).toHaveLength(1);
-      expect(tracer.queue[0].message_values[0]).toBe('queued-trace');
+      expect(resolveMessage(tracer.queue[0], 0)).toBe('queued-trace');
     });
 
     it('should queue multiple traces in order', async () => {
@@ -45,9 +46,9 @@ describe('ArrayQueueTracer', () => {
       await trace('third', testOp);
 
       expect(tracer.queue).toHaveLength(3);
-      expect(tracer.queue[0].message_values[0]).toBe('first');
-      expect(tracer.queue[1].message_values[0]).toBe('second');
-      expect(tracer.queue[2].message_values[0]).toBe('third');
+      expect(resolveMessage(tracer.queue[0], 0)).toBe('first');
+      expect(resolveMessage(tracer.queue[1], 0)).toBe('second');
+      expect(resolveMessage(tracer.queue[2], 0)).toBe('third');
     });
 
     it('should queue buffer even if trace throws', async () => {
@@ -61,7 +62,7 @@ describe('ArrayQueueTracer', () => {
       await expect(trace('failing', failOp)).rejects.toThrow('boom');
 
       expect(tracer.queue).toHaveLength(1);
-      expect(tracer.queue[0].message_values[0]).toBe('failing');
+      expect(resolveMessage(tracer.queue[0], 0)).toBe('failing');
     });
   });
 
@@ -78,8 +79,8 @@ describe('ArrayQueueTracer', () => {
       const drained = tracer.drain();
 
       expect(drained).toHaveLength(2);
-      expect(drained[0].message_values[0]).toBe('a');
-      expect(drained[1].message_values[0]).toBe('b');
+      expect(resolveMessage(drained[0], 0)).toBe('a');
+      expect(resolveMessage(drained[1], 0)).toBe('b');
     });
 
     it('should clear queue after drain', async () => {
@@ -116,7 +117,7 @@ describe('ArrayQueueTracer', () => {
       await trace('after', testOp);
 
       expect(tracer.queue).toHaveLength(1);
-      expect(tracer.queue[0].message_values[0]).toBe('after');
+      expect(resolveMessage(tracer.queue[0], 0)).toBe('after');
     });
 
     it('should return independent array (not reference to internal queue)', async () => {
@@ -178,7 +179,7 @@ describe('ArrayQueueTracer', () => {
 
       const [buffer] = tracer.drain();
       expect(buffer._children).toHaveLength(1);
-      expect(buffer._children[0].message_values[0]).toBe('child-span');
+      expect(resolveMessage(buffer._children[0], 0)).toBe('child-span');
     });
   });
 });

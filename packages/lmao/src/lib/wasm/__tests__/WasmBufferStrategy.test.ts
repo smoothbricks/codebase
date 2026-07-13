@@ -4,6 +4,7 @@
 
 import { afterEach, beforeAll, describe, expect, it } from 'bun:test';
 import { createOpMetadata } from '../../opContext/defineOp.js';
+import { resolveMessage } from '../../resolveMessage.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import type { TracerLifecycleHooks } from '../../traceRoot.js';
@@ -85,7 +86,7 @@ describe('WasmBufferStrategy', () => {
 
       expect(buffer).toBeDefined();
       expect(buffer._capacity).toBe(64);
-      expect(buffer.message_values[0]).toBe('test-span');
+      expect(resolveMessage(buffer, 0)).toBe('test-span');
       expect(String(buffer.trace_id)).toBe('test-trace-id');
     });
 
@@ -124,7 +125,7 @@ describe('WasmBufferStrategy', () => {
       child.message(0, 'child-span');
 
       expect(child).toBeDefined();
-      expect(child.message_values[0]).toBe('child-span');
+      expect(resolveMessage(child, 0)).toBe('child-span');
       expect(child.trace_id).toBe(parent.trace_id);
       expect(child.parent_span_id).toBe(parent.span_id);
       // Note: parent._children is NOT populated by the strategy - SpanContext handles that.

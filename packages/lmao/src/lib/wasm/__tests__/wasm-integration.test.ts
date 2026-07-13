@@ -13,6 +13,7 @@
 import { afterEach, beforeAll, describe, expect, it } from 'bun:test';
 import { convertToArrowTable } from '../../convertToArrow.js';
 import { defineOpContext } from '../../defineOpContext.js';
+import { resolveMessage } from '../../resolveMessage.js';
 import { JsBufferStrategy } from '../../JsBufferStrategy.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
@@ -120,7 +121,7 @@ describe('WASM Integration Tests', () => {
       expect(buffer.timestamp[1]).toBeGreaterThanOrEqual(buffer.timestamp[0]);
 
       // Verify span name is set
-      expect(buffer.message_values[0]).toBe('test-op');
+      expect(resolveMessage(buffer, 0)).toBe('test-op');
     });
 
     it('writes trace_id correctly', async () => {
@@ -231,8 +232,8 @@ describe('WASM Integration Tests', () => {
       expect(parent._children).toHaveLength(2);
 
       const [child1, child2] = parent._children;
-      expect(child1.message_values[0]).toBe('child-1');
-      expect(child2.message_values[0]).toBe('child-2');
+      expect(resolveMessage(child1, 0)).toBe('child-1');
+      expect(resolveMessage(child2, 0)).toBe('child-2');
       expect(child1.parent_span_id).toBe(parent.span_id);
       expect(child2.parent_span_id).toBe(parent.span_id);
       // Siblings should have different span IDs
@@ -254,9 +255,7 @@ describe('WASM Integration Tests', () => {
       expect(buffer.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
       expect(buffer.entry_type[1]).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
 
-      // Verify error message was written - use message_values getter
-      const messageValues = buffer.message_values;
-      const messages = messageValues.slice(0, buffer._writeIndex).filter((m: string) => m !== undefined);
+      const messages = Array.from({ length: buffer._writeIndex }, (_, row) => resolveMessage(buffer, row));
       expect(messages).toContain('test error');
     });
 
@@ -325,10 +324,7 @@ describe('WASM Integration Tests', () => {
       expect(entryTypes).toContain(ENTRY_TYPE_DEBUG);
       expect(entryTypes).toContain(ENTRY_TYPE_WARN);
 
-      // Messages are written via message_values getter (SpanLogger uses this)
-      // Access via the getter since that's what SpanLogger writes to
-      const messageValues = buffer.message_values;
-      const messages = messageValues.slice(0, buffer._writeIndex).filter((m: string) => m !== undefined);
+      const messages = Array.from({ length: buffer._writeIndex }, (_, row) => resolveMessage(buffer, row));
       expect(messages).toContain('info message');
       expect(messages).toContain('debug message');
       expect(messages).toContain('warn message');
@@ -368,7 +364,7 @@ describe('WASM Integration Tests', () => {
 
       expect(root.trace_id).toBe(rootTraceId);
       expect(root.span_id).toBe(rootSpanId);
-      expect(root.message_values[0]).toBe('owned-root');
+      expect(resolveMessage(root, 0)).toBe('owned-root');
       expect(tracer.rootBuffers[1].trace_id).not.toBe(rootTraceId);
     });
 
@@ -698,8 +694,8 @@ describe('WASM Integration Tests', () => {
       expect(buffer1.trace_id).not.toBe(buffer2.trace_id);
 
       // Different span names
-      expect(buffer1.message_values[0]).toBe('trace-1');
-      expect(buffer2.message_values[0]).toBe('trace-2');
+      expect(resolveMessage(buffer1, 0)).toBe('trace-1');
+      expect(resolveMessage(buffer2, 0)).toBe('trace-2');
 
       // Different user IDs
       expect(buffer1.userId_values?.[0]).toBe('user-1');

@@ -14,6 +14,7 @@ import type { ColumnValueType } from '@smoothbricks/arrow-builder';
 import { getSchemaType } from '@smoothbricks/arrow-builder';
 import { checkCapacityTuning } from '../capacityTuning.js';
 import type { OpMetadata } from '../op.js';
+import type { MessageLayoutFamily } from '../runtimeHint.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { SpanBufferStats } from '../spanBufferStats.js';
 import type { ITraceRoot } from '../traceRoot.js';
@@ -66,6 +67,7 @@ export interface WasmSpanBufferOptions<T extends LogSchema = LogSchema> {
   span_id: number;
   parent_thread_id?: bigint;
   parent_span_id?: number;
+  messageLayoutFamily?: MessageLayoutFamily;
   logSchema: T;
   _traceRoot: ITraceRoot<T>;
   _scopeValues: Readonly<Record<string, unknown>>;
@@ -114,8 +116,8 @@ export type WasmSpanBufferInstance<T extends LogSchema = LogSchema> = SpanBuffer
   _children: WasmSpanBufferInstance<T>[];
   _overflow?: WasmSpanBufferInstance<T>;
 
-  // Override message column - WASM stores as JS array (not WASM memory)
-  readonly _message: string[];
+  // Present only for dynamic-only and mixed physical families.
+  readonly _message?: string[];
 
   // ===========================================================================
   // WASM-specific methods
@@ -133,12 +135,15 @@ export type WasmSpanBufferInstance<T extends LogSchema = LogSchema> = SpanBuffer
   getNullsIfAllocated(columnName: string): Uint8Array | undefined;
 };
 
+type WasmRawMessageBuffer = WasmSpanBufferInstance & { readonly _message: string[] };
+
 /**
  * Constructor type for generated WASM SpanBuffer classes.
  */
 export interface WasmSpanBufferConstructor<T extends LogSchema = LogSchema> {
   new (opts: WasmSpanBufferOptions<T>): WasmSpanBufferInstance<T>;
   readonly schema: T;
+  readonly messageLayoutFamily: MessageLayoutFamily;
   stats: SpanBufferStats;
 }
 
@@ -185,12 +190,14 @@ function getFieldEnumValues(value: unknown): readonly string[] | undefined {
 function isWasmSpanBufferConstructor<T extends LogSchema = LogSchema>(
   value: unknown,
   schema?: T,
+  messageLayoutFamily?: MessageLayoutFamily,
 ): value is WasmSpanBufferConstructor<T> {
   return (
     typeof value === 'function' &&
     typeof Reflect.get(value, 'schema') === 'object' &&
     Reflect.get(value, 'schema') !== null &&
     (schema === undefined || Reflect.get(value, 'schema') === schema) &&
+    (messageLayoutFamily === undefined || Reflect.get(value, 'messageLayoutFamily') === messageLayoutFamily) &&
     typeof Reflect.get(value, 'stats') === 'object' &&
     Reflect.get(value, 'stats') !== null
   );
@@ -202,8 +209,10 @@ export function isWasmSpanBufferInstance<T extends LogSchema = LogSchema>(
   return typeof value === 'object' && value !== null && typeof Reflect.get(value, '_systemPtr') === 'number';
 }
 
-function getWasmSpanBufferConstructor(instance: { constructor: unknown }): WasmSpanBufferConstructor {
-  if (!isWasmSpanBufferConstructor(instance.constructor)) {
+function getWasmSpanBufferConstructor<T extends LogSchema>(
+  instance: WasmSpanBufferInstance<T>,
+): WasmSpanBufferConstructor<T> {
+  if (!isWasmSpanBufferConstructor(instance.constructor, instance._logSchema)) {
     throw new Error('Expected generated WasmSpanBuffer constructor');
   }
   return instance.constructor;
@@ -373,29 +382,31 @@ function wasmGetHasParent(this: WasmSpanBufferInstance): boolean {
   return this._parent !== null;
 }
 
-/**
- * Message column setter.
- */
-function wasmMessage(this: WasmSpanBufferInstance, idx: number, value: string): WasmSpanBufferInstance {
+function wasmRawMessage(this: WasmRawMessageBuffer, idx: number, value: string): WasmRawMessageBuffer {
   assertWasmBufferLive(this);
   this._message[idx] = value;
+  return this;
+}
+
+function wasmStaticMessage(this: WasmSpanBufferInstance, idx: number, value: string): WasmSpanBufferInstance {
+  assertWasmBufferLive(this);
+  if (idx === 0) this._spanName = value;
+  else if (idx === 1) this._terminalMessage = value;
+  else throw new RangeError('Static-only buffers only accept raw system messages at rows 0 and 1');
   return this;
 }
 
 /**
  * Get message column values.
  */
-function wasmGetMessageValues(this: WasmSpanBufferInstance): string[] {
+function wasmGetMessageValues(this: WasmRawMessageBuffer): string[] {
   assertWasmBufferLive(this);
   return this._message;
 }
 
-/**
- * Get message column nulls (always undefined for eager column).
- */
-function wasmGetMessageNulls(this: WasmSpanBufferInstance): undefined {
-  assertWasmBufferLive(this);
-  return undefined;
+
+function wasmGetMessageLayoutFamily(this: WasmSpanBufferInstance): MessageLayoutFamily {
+  return getWasmSpanBufferConstructor(this).messageLayoutFamily;
 }
 
 /** Free each owned WASM block exactly once. */
@@ -557,7 +568,7 @@ function generateNumericNullsGetter(col: ColumnMeta): string {
   }`;
 }
 
-function generateViewRefresh(columnMeta: ColumnMeta[]): string {
+function generateViewRefresh(columnMeta: ColumnMeta[], messageLayoutFamily: MessageLayoutFamily): string {
   const lines = [
     'const memory = this._allocator.memory.buffer;',
     'this._timestampView = new BigInt64Array(memory, this._systemPtr, this._capacity);',
@@ -565,6 +576,11 @@ function generateViewRefresh(columnMeta: ColumnMeta[]): string {
     'this._identityView = new Uint8Array(memory, this._identityPtr, 128);',
     'this._identityData = new DataView(memory, this._identityPtr, 128);',
   ];
+  if (messageLayoutFamily !== 'dynamic-only') {
+    lines.push(
+      'this._logHeaders = new Uint32Array(memory, this._systemPtr + this._layout.system.logHeaderOffset, this._capacity);',
+    );
+  }
   let layoutIndex = 0;
   for (const col of columnMeta) {
     if (col.sizeClass === 'string' || col.name === 'message') continue;
@@ -694,11 +710,8 @@ function generateColumnMethods(columnMeta: ColumnMeta[]): string {
 // Class Cache and Generation
 // =============================================================================
 
-/**
- * Cache for generated WASM SpanBuffer classes.
- * Key is the schema object reference (WeakMap for GC).
- */
-const wasmSpanBufferClassCache = new WeakMap<LogSchema, object>();
+/** Cache for generated WASM SpanBuffer classes, partitioned by schema and message family. */
+const wasmSpanBufferClassCache = new WeakMap<LogSchema, Map<MessageLayoutFamily, object>>();
 
 /**
  * Generate a WASM SpanBuffer class for the given schema.
@@ -708,9 +721,13 @@ const wasmSpanBufferClassCache = new WeakMap<LogSchema, object>();
  * @param schema - LogSchema defining the buffer structure
  * @returns WasmSpanBufferConstructor for creating buffer instances
  */
-export function getWasmSpanBufferClass<T extends LogSchema>(schema: T): WasmSpanBufferConstructor<T> {
-  const cached = wasmSpanBufferClassCache.get(schema);
-  if (cached !== undefined && isWasmSpanBufferConstructor(cached, schema)) return cached;
+export function getWasmSpanBufferClass<T extends LogSchema>(
+  schema: T,
+  messageLayoutFamily: MessageLayoutFamily = 'mixed',
+): WasmSpanBufferConstructor<T> {
+  let familyClasses = wasmSpanBufferClassCache.get(schema);
+  const cached = familyClasses?.get(messageLayoutFamily);
+  if (cached !== undefined && isWasmSpanBufferConstructor(cached, schema, messageLayoutFamily)) return cached;
 
   // Pre-compute column metadata
   const columnMeta = buildColumnMeta(schema);
@@ -744,6 +761,9 @@ class WasmSpanBuffer {
     if (this._identityPtr === 0) throw new Error('WASM identity allocation failed');
 
     this._layout = opts._layout;
+    if (this._layout.messageLayoutFamily !== '${messageLayoutFamily}') {
+      throw new TypeError('WASM layout descriptor does not match its generated message family');
+    }
     this._columnPtrs = new Int32Array(${columnMeta.length}).fill(-1);
     const familyPtrs = { u8: 0, u32: 0, f64: 0 };
     this._systemPtr = opts.allocator.allocExact(this._layout.system.byteLength, this._layout.system.alignment);
@@ -792,10 +812,18 @@ class WasmSpanBuffer {
     this._statsReservedRows = 2;
 
     try {
-      this._logHeaders = new Uint32Array(opts.capacity);
-      this._message = new Array(opts.capacity);
+      ${
+        messageLayoutFamily === 'static-only'
+          ? `this._spanName = undefined;
+      this._terminalMessage = undefined;`
+          : messageLayoutFamily === 'dynamic-only'
+            ? `this._spanName = undefined;
+      this._message = new Array(opts.capacity);`
+            : 'this._message = new Array(opts.capacity);'
+      }
       ${generateColumnInit(columnMeta)}
       this._refreshViews(this._allocator.refreshViews());
+      ${messageLayoutFamily === 'dynamic-only' ? '' : 'this._logHeaders.fill(0);'}
     } catch (error) {
       this.free();
       throw error;
@@ -803,7 +831,7 @@ class WasmSpanBuffer {
   }
 
   _refreshViews(version) {
-    ${generateViewRefresh(columnMeta)}
+    ${generateViewRefresh(columnMeta, messageLayoutFamily)}
   }
 
   _getWasmColumnValue(columnIndex) {
@@ -875,13 +903,15 @@ return WasmSpanBuffer;
     enumerable: true,
     configurable: true,
   });
-  Object.defineProperty(WasmSpanBufferClass.prototype, 'message_values', {
-    get: wasmGetMessageValues,
-    enumerable: true,
-    configurable: true,
-  });
-  Object.defineProperty(WasmSpanBufferClass.prototype, 'message_nulls', {
-    get: wasmGetMessageNulls,
+  if (messageLayoutFamily !== 'static-only') {
+    Object.defineProperty(WasmSpanBufferClass.prototype, 'message_values', {
+      get: wasmGetMessageValues,
+      enumerable: true,
+      configurable: true,
+    });
+  }
+  Object.defineProperty(WasmSpanBufferClass.prototype, '_messageLayoutFamily', {
+    get: wasmGetMessageLayoutFamily,
     enumerable: true,
     configurable: true,
   });
@@ -919,7 +949,8 @@ return WasmSpanBuffer;
   });
 
   WasmSpanBufferClass.prototype._ensureWasmViews = wasmEnsureViews;
-  WasmSpanBufferClass.prototype.message = wasmMessage;
+  WasmSpanBufferClass.prototype.message =
+    messageLayoutFamily === 'static-only' ? wasmStaticMessage : wasmRawMessage;
   WasmSpanBufferClass.prototype.free = wasmFree;
   WasmSpanBufferClass.prototype.isColumnAllocated = wasmIsColumnAllocated;
   WasmSpanBufferClass.prototype.getColumnIfAllocated = wasmGetColumnIfAllocated;
@@ -932,6 +963,12 @@ return WasmSpanBuffer;
   // Add static schema property
   Object.defineProperty(WasmSpanBufferClass, 'schema', {
     value: schema,
+    writable: false,
+    enumerable: true,
+    configurable: false,
+  });
+  Object.defineProperty(WasmSpanBufferClass, 'messageLayoutFamily', {
+    value: messageLayoutFamily,
     writable: false,
     enumerable: true,
     configurable: false,
@@ -956,8 +993,9 @@ return WasmSpanBuffer;
     throw new Error('Generated WasmSpanBuffer constructor lost its schema identity');
   }
 
-  // Cache the class
-  wasmSpanBufferClassCache.set(schema, WasmSpanBufferClass);
+  familyClasses ??= new Map();
+  familyClasses.set(messageLayoutFamily, WasmSpanBufferClass);
+  wasmSpanBufferClassCache.set(schema, familyClasses);
 
   return WasmSpanBufferClass;
 }
@@ -988,12 +1026,13 @@ export function createWasmSpanBuffer<T extends LogSchema>(
   _opMetadata: OpMetadata,
   _callsiteMetadata: OpMetadata,
 ): WasmSpanBufferInstance<T> {
-  const WasmSpanBufferClass = getWasmSpanBufferClass(schema);
+  const messageLayoutFamily = opts.messageLayoutFamily ?? 'mixed';
+  const WasmSpanBufferClass = getWasmSpanBufferClass(schema, messageLayoutFamily);
   return new WasmSpanBufferClass({
     ...opts,
     _identityMode: 'root',
     _generation: ++nextWasmBufferGeneration,
-    _layout: getWasmPhysicalLayout(schema, opts.capacity),
+    _layout: getWasmPhysicalLayout(schema, opts.capacity, messageLayoutFamily),
     logSchema: schema,
     _traceRoot,
     _scopeValues,
@@ -1041,8 +1080,8 @@ export function createWasmChildSpanBuffer<T extends LogSchema>(
 ): WasmSpanBufferInstance<T> {
   // Use provided schema (for cross-library calls) or parent's schema
   const childSchema = opts.schema ?? parent._logSchema;
-  const WasmSpanBufferClass = getWasmSpanBufferClass(childSchema);
-
+  const messageLayoutFamily = opts.messageLayoutFamily ?? parent._messageLayoutFamily;
+  const WasmSpanBufferClass = getWasmSpanBufferClass(childSchema, messageLayoutFamily);
   const child = new WasmSpanBufferClass({
     ...opts,
     logSchema: childSchema,
@@ -1052,7 +1091,7 @@ export function createWasmChildSpanBuffer<T extends LogSchema>(
     _identityMode: 'child',
     _parent: parent,
     _generation: ++nextWasmBufferGeneration,
-    _layout: getWasmPhysicalLayout(childSchema, opts.capacity),
+    _layout: getWasmPhysicalLayout(childSchema, opts.capacity, messageLayoutFamily),
     _traceRoot,
     _scopeValues,
     _opMetadata,
@@ -1080,7 +1119,7 @@ export function createWasmOverflowBuffer<T extends LogSchema>(
   _opMetadata: OpMetadata,
   _callsiteMetadata: OpMetadata,
 ): WasmSpanBufferInstance<T> {
-  const WasmSpanBufferClass = getWasmSpanBufferClass(buffer._logSchema);
+  const WasmSpanBufferClass = getWasmSpanBufferConstructor(buffer);
 
   const overflow = new WasmSpanBufferClass({
     allocator: buffer._allocator,

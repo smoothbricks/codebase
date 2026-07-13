@@ -22,6 +22,7 @@
 import { bufferHelpers, type ColumnEntry } from '@smoothbricks/arrow-builder';
 import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
 import type { InferSchema, LogSchema } from '../schema/types.js';
+import type { MessageLayoutFamily } from '../runtimeHint.js';
 import type { AnySpanBuffer } from '../types.js';
 
 /**
@@ -298,7 +299,7 @@ const tagWriterClassCache = new WeakMap<LogSchema, unknown>();
 /**
  * Cache for ResultWriter classes (position 1).
  */
-const resultWriterClassCache = new WeakMap<LogSchema, unknown>();
+const resultWriterClassCache = new WeakMap<LogSchema, Map<MessageLayoutFamily, unknown>>();
 
 // ============================================================================
 // TagWriter API
@@ -376,21 +377,26 @@ export function createTagWriter<T extends LogSchema>(schema: T, buffer: AnySpanB
  * Constructor sets _isError, _result, and _error based on the isError flag.
  * Result/error values are already accessible via the properties set in constructor.
  */
-const resultWriterExtension: FixedPositionWriterExtension = {
-  constructorParams: 'resultOrError, isError',
-  constructorCode: `
-    this._isError = isError;
-    if (isError) {
-      this._error = resultOrError;
-      this._result = undefined;
-    } else {
-      this._result = resultOrError;
-      this._error = undefined;
-    }
-  `,
-  methods: `
+function createResultWriterExtension(messageLayoutFamily: MessageLayoutFamily): FixedPositionWriterExtension {
+  const messageWrite =
+    messageLayoutFamily === 'static-only'
+      ? 'this._buffer._terminalMessage = text;'
+      : 'this._buffer.message_values[this._pos] = text;';
+  return {
+    constructorParams: 'resultOrError, isError',
+    constructorCode: `
+      this._isError = isError;
+      if (isError) {
+        this._error = resultOrError;
+        this._result = undefined;
+      } else {
+        this._result = resultOrError;
+        this._error = undefined;
+      }
+    `,
+    methods: `
 message(text) {
-  this._buffer.message(this._pos, text);
+  ${messageWrite}
   return this;
 }
 
@@ -404,14 +410,23 @@ uint64_value(value) {
   return this;
 }
 `,
-};
+  };
+}
 
 /**
  * Generate ResultWriter class code for a schema.
  * ResultWriter writes to position 1 (result row).
  */
-export function generateResultWriterClass(schema: LogSchema): string {
-  return generateFixedPositionWriterClass(schema, 1, 'GeneratedResultWriter', resultWriterExtension);
+export function generateResultWriterClass(
+  schema: LogSchema,
+  messageLayoutFamily: MessageLayoutFamily = 'mixed',
+): string {
+  return generateFixedPositionWriterClass(
+    schema,
+    1,
+    'GeneratedResultWriter',
+    createResultWriterExtension(messageLayoutFamily),
+  );
 }
 
 /**
@@ -422,15 +437,17 @@ export function generateResultWriterClass(schema: LogSchema): string {
  */
 export function getResultWriterClass<T extends LogSchema>(
   schema: T,
+  messageLayoutFamily: MessageLayoutFamily = 'mixed',
 ): new <R = unknown, E = unknown>(
   buffer: AnySpanBuffer,
   resultOrError: unknown,
   isError: boolean,
 ) => ResultWriter<T, R, E> {
-  let WriterClass = resultWriterClassCache.get(schema);
+  let familyClasses = resultWriterClassCache.get(schema);
+  let WriterClass = familyClasses?.get(messageLayoutFamily);
 
   if (!WriterClass) {
-    const classCode = generateResultWriterClass(schema).trim();
+    const classCode = generateResultWriterClass(schema, messageLayoutFamily).trim();
 
     // Compile with new Function()
     const factory = new Function('helpers', classCode);
@@ -440,7 +457,9 @@ export function getResultWriterClass<T extends LogSchema>(
       throw new Error('Failed to generate ResultWriter constructor');
     }
 
-    resultWriterClassCache.set(schema, WriterClass);
+    familyClasses ??= new Map();
+    familyClasses.set(messageLayoutFamily, WriterClass);
+    resultWriterClassCache.set(schema, familyClasses);
   }
 
   if (!isResultWriterConstructor<T>(WriterClass)) {
@@ -465,7 +484,7 @@ export function createResultWriter<T extends LogSchema, R = unknown, E = unknown
   resultOrError: R | E,
   isError: boolean,
 ): ResultWriter<T, R, E> {
-  const WriterClass = getResultWriterClass(schema);
+  const WriterClass = getResultWriterClass(schema, buffer._messageLayoutFamily);
   return new WriterClass(buffer, resultOrError, isError);
 }
 //#endregion smoo/lmao!n/codegen-architecture

@@ -35,6 +35,7 @@ import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
 import type { InferSchema, LogSchema } from '../schema/types.js';
 
 import type { ITraceRoot, TimestampAppendPrimitive } from '../traceRoot.js';
+import type { MessageLayoutFamily } from '../runtimeHint.js';
 import type { AnySpanBuffer, SpanBuffer } from '../types.js';
 
 // =============================================================================
@@ -394,7 +395,7 @@ function generatePrefillScopedAttributesMethod(
 /**
  * Build the extension for SpanLogger that extends ColumnWriter
  */
-function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
+function buildSpanLoggerExtension(schema: LogSchema, messageLayoutFamily: MessageLayoutFamily): ColumnWriterExtension {
   const schemaFields = schema._columns;
 
   // Collect enum mappings
@@ -465,12 +466,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_INFO);
       this._writeIndex = idx;
-      if (this._buffer.message_values) {
-        this._buffer.message_values[idx] = helpers.normalizeOperationalTemplate(message);
-        if (this._buffer.message_nulls) {
-          helpers.setNullBit(this._buffer.message_nulls, idx);
-        }
-      }
+      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = helpers.normalizeOperationalTemplate(message);`}
       if (fields !== undefined) {
         this.with(fields);
       }
@@ -481,10 +477,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_INFO);
       this._writeIndex = idx;
-      this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_INFO) >>> 0;
-      if (this._buffer.message_nulls) {
-        helpers.setNullBit(this._buffer.message_nulls, idx);
-      }
+      ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : `this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_INFO) >>> 0;`}
       return this;
     }
 
@@ -494,12 +487,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_DEBUG);
       this._writeIndex = idx;
-      if (this._buffer.message_values) {
-        this._buffer.message_values[idx] = message;
-        if (this._buffer.message_nulls) {
-          helpers.setNullBit(this._buffer.message_nulls, idx);
-        }
-      }
+      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = message;`}
       return this;
     }
 
@@ -507,10 +495,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_DEBUG);
       this._writeIndex = idx;
-      this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_DEBUG) >>> 0;
-      if (this._buffer.message_nulls) {
-        helpers.setNullBit(this._buffer.message_nulls, idx);
-      }
+      ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : `this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_DEBUG) >>> 0;`}
       return this;
     }
 
@@ -520,12 +505,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_WARN);
       this._writeIndex = idx;
-      if (this._buffer.message_values) {
-        this._buffer.message_values[idx] = helpers.normalizeOperationalTemplate(message);
-        if (this._buffer.message_nulls) {
-          helpers.setNullBit(this._buffer.message_nulls, idx);
-        }
-      }
+      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = helpers.normalizeOperationalTemplate(message);`}
       if (fields !== undefined) {
         this.with(fields);
       }
@@ -536,10 +516,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_WARN);
       this._writeIndex = idx;
-      this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_WARN) >>> 0;
-      if (this._buffer.message_nulls) {
-        helpers.setNullBit(this._buffer.message_nulls, idx);
-      }
+      ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : `this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_WARN) >>> 0;`}
       return this;
     }
 
@@ -549,12 +526,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_ERROR);
       this._writeIndex = idx;
-      if (this._buffer.message_values) {
-        this._buffer.message_values[idx] = helpers.normalizeOperationalTemplate(message);
-        if (this._buffer.message_nulls) {
-          helpers.setNullBit(this._buffer.message_nulls, idx);
-        }
-      }
+      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = helpers.normalizeOperationalTemplate(message);`}
       if (fields !== undefined) {
         this.with(fields);
       }
@@ -565,10 +537,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_ERROR);
       this._writeIndex = idx;
-      this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_ERROR) >>> 0;
-      if (this._buffer.message_nulls) {
-        helpers.setNullBit(this._buffer.message_nulls, idx);
-      }
+      ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : `this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_ERROR) >>> 0;`}
       return this;
     }
 
@@ -578,12 +547,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_TRACE);
       this._writeIndex = idx;
-      if (this._buffer.message_values) {
-        this._buffer.message_values[idx] = message;
-        if (this._buffer.message_nulls) {
-          helpers.setNullBit(this._buffer.message_nulls, idx);
-        }
-      }
+      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = message;`}
       return this;
     }
 
@@ -591,10 +555,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_TRACE);
       this._writeIndex = idx;
-      this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_TRACE) >>> 0;
-      if (this._buffer.message_nulls) {
-        helpers.setNullBit(this._buffer.message_nulls, idx);
-      }
+      ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : `this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_TRACE) >>> 0;`}
       return this;
     }
 
@@ -621,12 +582,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_FF_ACCESS);
       this._writeIndex = idx;
-      if (this._buffer.message_values) {
-        this._buffer.message_values[idx] = flagName;
-        if (this._buffer.message_nulls) {
-          helpers.setNullBit(this._buffer.message_nulls, idx);
-        }
-      }
+      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Feature flag write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = flagName;`}
       if (this._buffer.ff_value_values) {
         const strValue = value === null || value === undefined ? 'null' : String(value);
         this._buffer.ff_value_values[idx] = strValue;
@@ -643,12 +599,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       this._checkOverflow();
       const idx = this._appendLogEntry(this._traceRoot, this._buffer, ENTRY_TYPE_FF_USAGE);
       this._writeIndex = idx;
-      if (this._buffer.message_values) {
-        this._buffer.message_values[idx] = flagName;
-        if (this._buffer.message_nulls) {
-          helpers.setNullBit(this._buffer.message_nulls, idx);
-        }
-      }
+      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Feature flag write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = flagName;`}
       if (context) {
         this.with(context);
       }
@@ -739,7 +690,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
 /**
  * Cache for generated SpanLogger classes per schema.
  */
-const spanLoggerClassCache = new WeakMap<LogSchema, unknown>();
+const spanLoggerClassCache = new WeakMap<LogSchema, Map<MessageLayoutFamily, unknown>>();
 
 function isSpanLoggerConstructor<T extends LogSchema>(
   value: unknown,
@@ -764,16 +715,17 @@ function isSpanLoggerConstructor<T extends LogSchema>(
  */
 export function createSpanLoggerClass<T extends LogSchema>(
   schema: T,
+  messageLayoutFamily: MessageLayoutFamily = 'mixed',
 ): new (
   buffer: AnySpanBuffer,
   traceRoot: ITraceRoot,
   appendLogEntry: TimestampAppendPrimitive,
 ) => SpanLoggerImpl<T> {
-  // Check cache first
-  let SpanLoggerClass = spanLoggerClassCache.get(schema);
+  let familyClasses = spanLoggerClassCache.get(schema);
+  let SpanLoggerClass = familyClasses?.get(messageLayoutFamily);
 
   if (!SpanLoggerClass) {
-    const extension = buildSpanLoggerExtension(schema);
+    const extension = buildSpanLoggerExtension(schema, messageLayoutFamily);
 
     // Use arrow-builder's getColumnWriterClass with our extension
     const WriterClass = getColumnWriterClass(schema, extension);
@@ -784,7 +736,9 @@ export function createSpanLoggerClass<T extends LogSchema>(
       throw new Error('Failed to generate SpanLogger constructor');
     }
 
-    spanLoggerClassCache.set(schema, SpanLoggerClass);
+    familyClasses ??= new Map();
+    familyClasses.set(messageLayoutFamily, SpanLoggerClass);
+    spanLoggerClassCache.set(schema, familyClasses);
   }
 
   if (!isSpanLoggerConstructor<T>(SpanLoggerClass)) {

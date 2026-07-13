@@ -3,6 +3,7 @@ import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { Transient } from '../errors/Transient.js';
 import type { OpContext, OpContextOf, SpanContext } from '../opContext/types.js';
+import { resolveMessage } from '../resolveMessage.js';
 import {
   RUNTIME_HINT_ANALYZED_VALID,
   RUNTIME_HINT_FF,
@@ -68,8 +69,8 @@ describe('spanAuto synchronous and fallback execution', () => {
     const plan = op.callsitePlan;
     const tracer = new TestTracer(opContext, createTestTracerOptions());
     const hooks: string[] = [];
-    tracer.onSpanStart = (buffer) => hooks.push(`start:${buffer.message_values[0]}`);
-    tracer.onSpanEnd = (buffer) => hooks.push(`end:${buffer.message_values[0]}`);
+    tracer.onSpanStart = (buffer) => hooks.push(`start:${resolveMessage(buffer, 0)}`);
+    tracer.onSpanEnd = (buffer) => hooks.push(`end:${resolveMessage(buffer, 0)}`);
 
     await tracer.trace('root', async (ctx) => {
       const result = ctx.spanAuto0(41, 'sync-child', op);
@@ -113,7 +114,7 @@ describe('spanAuto synchronous and fallback execution', () => {
     expect(ends).toBe(1);
     expect(child._writeIndex).toBe(2);
     expect(child.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
-    expect(child.message_values[1]).not.toBe('hook exploded');
+    expect(resolveMessage(child, 1)).not.toBe('hook exploded');
   });
 
   it('falls back to a Promise for a thenable and still writes one terminal row', async () => {
@@ -221,7 +222,7 @@ describe('spanAuto synchronous and fallback execution', () => {
     expect(ends).toBe(1);
     expect(child._writeIndex).toBe(2);
     expect(child.entry_type[1]).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
-    expect(child.message_values[1]).toBe('async exploded');
+    expect(resolveMessage(child, 1)).toBe('async exploded');
   });
 });
 
@@ -310,7 +311,7 @@ describe('runtime hint specialization', () => {
     expect(overflow._capacity).toBe(3);
     expect(overflow.entry_type[2]).toBe(ENTRY_TYPE_INFO);
     expect(overflow._overflow?.entry_type[0]).toBe(ENTRY_TYPE_INFO);
-    expect(overflow._overflow?.message_values[0]).toBe('second');
+    expect(overflow._overflow ? resolveMessage(overflow._overflow, 0) : undefined).toBe('second');
     expect(convertSpanTreeToArrowTable(tracer.rootBuffers[0]).numRows).toBe(8);
   });
 
