@@ -1,28 +1,33 @@
-//! Two-pass span-tree → single `RecordBatch` conversion (`01k`, `01f`).
+//! Two-pass span-tree → single `RecordBatch` conversion.
 
+use std::error::Error;
+use std::fmt;
 use std::sync::Arc;
 
 use arrow_array::builder::BooleanBufferBuilder;
 use arrow_array::{
-    ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt8Array, UInt32Array,
-    UInt64Array,
+    Array, ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt8Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_buffer::NullBuffer;
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 
-use crate::dict::ColumnDictionary;
+use crate::dict::{
+    ColumnDictionary, FirstSeenDictionary, LOG_TEMPLATE_KIND, SPAN_NAME_KIND,
+    StaticLookupError, mixed_vocabulary_dictionary, static_vocabulary_dictionary,
+    static_vocabulary_key, static_vocabulary_value_key,
+};
 use crate::source::{SpanSource, walk_pre_order};
 
-/// Wire names for the 23 entry types (`01h`), indexed by discriminant − 1. The
-/// entry_type dictionary is static — known at schema-definition time, zero flush work
-/// (`01a`'s `enum` strategy).
-pub const ENTRY_TYPE_NAMES: [&str; 23] = [
+pub const ENTRY_TYPE_NAMES: [&str; 24] = [
     "span-start",
     "span-ok",
     "span-err",
     "span-exception",
-    "info",
+    "span-retry",
+    "trace",
     "debug",
+    "info",
     "warn",
     "error",
     "ff-access",
@@ -37,18 +42,14 @@ pub const ENTRY_TYPE_NAMES: [&str; 23] = [
     "op-duration-min",
     "op-duration-max",
     "buffer-writes",
-    "buffer-overflow-writes",
-    "buffer-created",
-    "buffer-overflows",
+    "buffer-spans",
+    "buffer-capacity",
 ];
 
 fn dict_type(key: DataType) -> DataType {
     DataType::Dictionary(Box::new(key), Box::new(DataType::Utf8))
 }
 
-/// The flat trace-table schema (`01f`): every event is one row; core columns always
-/// present. Attribute columns (sparse, schema-defined) are appended by the
-/// macro-generated layer later — this is the invariant prefix.
 pub fn trace_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("timestamp", DataType::Int64, false),
@@ -63,27 +64,138 @@ pub fn trace_schema() -> Arc<Schema> {
     ]))
 }
 
-/// Convert one flush's root buffers into a SINGLE RecordBatch with dictionaries
-/// shared across all roots (`01k`: this is why a flush is one batch, not N).
-pub fn convert_span_trees<S: SpanSource>(roots: &[S]) -> Result<RecordBatch, ArrowError> {
-    // ---- Pass 1: count rows, accumulate string dictionaries. ----
+#[derive(Debug)]
+pub enum ConvertError {
+    Arrow(ArrowError),
+    RowCountOverflow,
+    InvalidEntryType { row: usize, entry_type: u8 },
+    InvalidVocabularyId { row: usize, id: u32 },
+    VocabularyKindMismatch { row: usize, id: u32, expected: u8, actual: u8 },
+    MissingDynamicMessage { row: usize, entry_type: u8 },
+}
+
+impl fmt::Display for ConvertError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Arrow(error) => error.fmt(f),
+            Self::RowCountOverflow => f.write_str("Arrow row count exceeds usize"),
+            Self::InvalidEntryType { row, entry_type } => {
+                write!(f, "invalid packed entry type {entry_type} at row {row}")
+            }
+            Self::InvalidVocabularyId { row, id } => {
+                write!(f, "unknown static vocabulary id {id} at row {row}")
+            }
+            Self::VocabularyKindMismatch { row, id, expected, actual } => write!(
+                f,
+                "static vocabulary id {id} has kind tag {actual}, expected {expected} at row {row}",
+            ),
+            Self::MissingDynamicMessage { row, entry_type } => write!(
+                f,
+                "dynamic entry type {entry_type} is missing its message at row {row}",
+            ),
+        }
+    }
+}
+
+impl Error for ConvertError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Arrow(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<ArrowError> for ConvertError {
+    fn from(value: ArrowError) -> Self {
+        Self::Arrow(value)
+    }
+}
+
+#[inline]
+fn required_vocabulary_kind(entry_type: u8) -> Option<u8> {
+    match entry_type {
+        1 => Some(SPAN_NAME_KIND),
+        6..=10 => Some(LOG_TEMPLATE_KIND),
+        _ => None,
+    }
+}
+
+#[inline]
+fn split_packed_header(header: u32) -> (u8, u32) {
+    (header as u8, header >> 8)
+}
+
+pub fn convert_span_trees<S: SpanSource>(roots: &[S]) -> Result<RecordBatch, ConvertError> {
     let mut total_rows = 0usize;
     let mut trace_dict = ColumnDictionary::default();
-    let mut message_dict = ColumnDictionary::default();
-    walk_pre_order(roots, &mut |b: &S| {
-        let rows = b.row_count();
-        total_rows += rows;
-        trace_dict.observe(b.identity().trace_id.as_str());
-        for row in 0..rows {
-            if let Some(m) = b.message(row) {
-                message_dict.observe(m);
+    let mut dynamic_messages = FirstSeenDictionary::default();
+    let mut failure = None;
+    let mut absolute_row = 0usize;
+    walk_pre_order(roots, &mut |buffer: &S| {
+        let rows = buffer.row_count();
+        total_rows = match total_rows.checked_add(rows) {
+            Some(total) => total,
+            None => {
+                failure.get_or_insert(ConvertError::RowCountOverflow);
+                total_rows
             }
+        };
+        trace_dict.observe(buffer.identity().trace_id.as_str());
+        for row in 0..rows {
+            let (entry_type, vocabulary_id) = split_packed_header(buffer.packed_header(row));
+            if entry_type == 0 || entry_type as usize > ENTRY_TYPE_NAMES.len() {
+                failure.get_or_insert(ConvertError::InvalidEntryType {
+                    row: absolute_row,
+                    entry_type,
+                });
+            } else if vocabulary_id != 0 {
+                match required_vocabulary_kind(entry_type) {
+                    None => {
+                        failure.get_or_insert(ConvertError::InvalidVocabularyId {
+                            row: absolute_row,
+                            id: vocabulary_id,
+                        });
+                    }
+                    Some(kind) => match static_vocabulary_key(vocabulary_id, kind) {
+                        Ok(_) => {}
+                        Err(StaticLookupError::UnknownId(id)) => {
+                            failure.get_or_insert(ConvertError::InvalidVocabularyId {
+                                row: absolute_row,
+                                id,
+                            });
+                        }
+                        Err(StaticLookupError::KindMismatch { id, expected, actual }) => {
+                            failure.get_or_insert(ConvertError::VocabularyKindMismatch {
+                                row: absolute_row,
+                                id,
+                                expected,
+                                actual,
+                            });
+                        }
+                    },
+                }
+            } else if let Some(message) = buffer.dynamic_message(row) {
+                if static_vocabulary_value_key(message).is_none() {
+                    dynamic_messages.observe(message);
+                }
+            } else if required_vocabulary_kind(entry_type).is_some() {
+                failure.get_or_insert(ConvertError::MissingDynamicMessage {
+                    row: absolute_row,
+                    entry_type,
+                });
+            }
+            absolute_row += 1;
         }
     });
-    let trace_dict = trace_dict.finalize_indexed();
-    let message_dict = message_dict.finalize_indexed();
+    if let Some(error) = failure {
+        return Err(error);
+    }
 
-    // ---- Pass 2: exact-size columns, sequential writes. ----
+    let trace_dict = trace_dict.finalize_indexed();
+    let static_values = static_vocabulary_dictionary();
+    let static_message_count = static_values.len() as u32;
+
     let mut timestamps = Vec::with_capacity(total_rows);
     let mut trace_keys = Vec::with_capacity(total_rows);
     let mut thread_ids = Vec::with_capacity(total_rows);
@@ -96,83 +208,86 @@ pub fn convert_span_trees<S: SpanSource>(roots: &[S]) -> Result<RecordBatch, Arr
     let mut message_valid = BooleanBufferBuilder::new(total_rows);
     let mut line_numbers = Vec::with_capacity(total_rows);
 
-    walk_pre_order(roots, &mut |b: &S| {
-        let id = b.identity();
+    walk_pre_order(roots, &mut |buffer: &S| {
+        let identity = buffer.identity();
         let trace_key = trace_dict
-            .index_of(id.trace_id.as_str())
-            .expect("trace_id observed in pass 1");
-        let (p_thread, p_span, p_ok) = match &id.parent {
-            Some(p) => (p.thread_id, p.span_id, true),
+            .index_of(identity.trace_id.as_str())
+            .expect("trace ID observed in pass 1");
+        let (parent_thread, parent_span, has_parent) = match &identity.parent {
+            Some(parent) => (parent.thread_id, parent.span_id, true),
             None => (0, 0, false),
         };
-        for row in 0..b.row_count() {
-            timestamps.push(b.timestamp(row));
+        for row in 0..buffer.row_count() {
+            timestamps.push(buffer.timestamp(row));
             trace_keys.push(trace_key);
-            thread_ids.push(id.thread_id);
-            span_ids.push(id.span_id);
-            parent_thread_ids.push(p_thread);
-            parent_span_ids.push(p_span);
-            parent_valid.append(p_ok);
-            // Discriminants are 1-based; 0 (unwritten row) is unreachable because we
-            // only walk rows < row_count.
-            entry_keys.push(b.entry_type(row).saturating_sub(1));
-            match b.message(row) {
-                Some(m) => {
-                    message_keys.push(message_dict.index_of(m).expect("observed in pass 1"));
-                    message_valid.append(true);
-                }
-                None => {
-                    message_keys.push(0);
-                    message_valid.append(false);
-                }
+            thread_ids.push(identity.thread_id);
+            span_ids.push(identity.span_id);
+            parent_thread_ids.push(parent_thread);
+            parent_span_ids.push(parent_span);
+            parent_valid.append(has_parent);
+            let (entry_type, vocabulary_id) = split_packed_header(buffer.packed_header(row));
+            entry_keys.push(entry_type - 1);
+            if vocabulary_id != 0 {
+                message_keys.push(
+                    static_vocabulary_key(
+                        vocabulary_id,
+                        required_vocabulary_kind(entry_type)
+                            .expect("validated static row kind in pass 1"),
+                    )
+                    .expect("validated static vocabulary ID in pass 1"),
+                );
+                message_valid.append(true);
+            } else if let Some(message) = buffer.dynamic_message(row) {
+                message_keys.push(match static_vocabulary_value_key(message) {
+                    Some(key) => key,
+                    None => {
+                        static_message_count
+                            + dynamic_messages
+                                .index_of(message)
+                                .expect("dynamic message observed in pass 1")
+                    }
+                });
+                message_valid.append(true);
+            } else {
+                message_keys.push(0);
+                message_valid.append(false);
             }
-            line_numbers.push(b.line_number(row));
+            line_numbers.push(buffer.line_number(row));
         }
     });
-    debug_assert_eq!(
-        timestamps.len(),
-        total_rows,
-        "pass-1/pass-2 row-count drift"
-    );
 
     let parent_nulls = NullBuffer::new(parent_valid.finish());
     let message_nulls = NullBuffer::new(message_valid.finish());
-
-    let entry_values = StringArray::from_iter_values(ENTRY_TYPE_NAMES);
     let entry_col = DictionaryArray::try_new(
         UInt8Array::from(entry_keys),
-        Arc::new(entry_values) as ArrayRef,
+        Arc::new(StringArray::from_iter_values(ENTRY_TYPE_NAMES)) as ArrayRef,
     )?;
     let trace_col = DictionaryArray::try_new(
         UInt32Array::from(trace_keys),
         Arc::new(StringArray::from_iter_values(trace_dict.values.iter())) as ArrayRef,
     )?;
-    // An all-null dictionary column still needs ≥1 dictionary value slot.
-    let message_values: ArrayRef = if message_dict.is_empty() {
-        Arc::new(StringArray::from(vec![""]))
+    let message_values: ArrayRef = if dynamic_messages.is_empty() {
+        static_values
     } else {
-        Arc::new(StringArray::from_iter_values(message_dict.values.iter()))
+        mixed_vocabulary_dictionary(&dynamic_messages.values)?
     };
     let message_col = DictionaryArray::try_new(
         UInt32Array::new(message_keys.into(), Some(message_nulls)),
         message_values,
     )?;
 
-    RecordBatch::try_new(
+    Ok(RecordBatch::try_new(
         trace_schema(),
         vec![
             Arc::new(Int64Array::from(timestamps)),
             Arc::new(trace_col),
             Arc::new(UInt64Array::from(thread_ids)),
             Arc::new(UInt32Array::from(span_ids)),
-            Arc::new(UInt64Array::new(
-                parent_thread_ids.into(),
-                Some(parent_nulls.clone()),
-            )),
+            Arc::new(UInt64Array::new(parent_thread_ids.into(), Some(parent_nulls.clone()))),
             Arc::new(UInt32Array::new(parent_span_ids.into(), Some(parent_nulls))),
             Arc::new(entry_col),
             Arc::new(message_col),
             Arc::new(UInt32Array::from(line_numbers)),
         ],
-    )
+    )?)
 }
