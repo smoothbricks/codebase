@@ -9,6 +9,7 @@ type Variant = 'OFF' | 'ON';
 
 interface CliOptions {
   quick: boolean;
+  preflight: boolean;
   offOutput?: string;
   onOutput?: string;
   abbaOutputDir?: string;
@@ -21,11 +22,12 @@ interface SemanticOutput {
 }
 
 function parseCli(argv: readonly string[]): CliOptions {
-  const options: CliOptions = { quick: false };
+  const options: CliOptions = { quick: false, preflight: false };
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index];
     if (argument === undefined) throw new RangeError(`Missing argument at index ${index}`);
     if (argument === '--quick') options.quick = true;
+    else if (argument === '--preflight') options.preflight = true;
     else if (argument === '--off-output') options.offOutput = argv[++index];
     else if (argument.startsWith('--off-output=')) options.offOutput = argument.slice('--off-output='.length);
     else if (argument === '--on-output') options.onOutput = argv[++index];
@@ -58,7 +60,6 @@ async function buildVariant(
             plugins: [
               {
                 transform: '@smoothbricks/lmao-ttsc/ttsc-plugin',
-                vocabularyManifest: resolve(dirname(sourcePath), '../../../../lmao.vocabulary.json'),
               },
             ],
           }),
@@ -215,29 +216,31 @@ try {
     throw new Error(`Semantic row counts differ: OFF=${offSemantic.rowCount}, ON=${onSemantic.rowCount}`);
   }
 
-  const benchmarkArgs = cli.quick ? ['--benchmark', '--quick'] : ['--benchmark'];
-  if (cli.abbaOutputDir) {
-    const outputDir = resolve(cli.abbaOutputDir);
-    await mkdir(outputDir, { recursive: true });
-    const positions = [
-      ['OFF', offEntrypoint, 'off-pos1.json'],
-      ['ON', onEntrypoint, 'on-pos2.json'],
-      ['ON', onEntrypoint, 'on-pos1.json'],
-      ['OFF', offEntrypoint, 'off-pos2.json'],
-    ] as const;
-    for (const [variant, entrypoint, filename] of positions) {
-      const json = await runProcess(entrypoint, benchmarkArgs);
-      parseJson<unknown>(variant, `Mitata benchmark ${filename}`, json);
-      await persist(join(outputDir, filename), json);
+  if (!cli.preflight) {
+    const benchmarkArgs = cli.quick ? ['--benchmark', '--quick'] : ['--benchmark'];
+    if (cli.abbaOutputDir) {
+      const outputDir = resolve(cli.abbaOutputDir);
+      await mkdir(outputDir, { recursive: true });
+      const positions = [
+        ['OFF', offEntrypoint, 'off-pos1.json'],
+        ['ON', onEntrypoint, 'on-pos2.json'],
+        ['ON', onEntrypoint, 'on-pos1.json'],
+        ['OFF', offEntrypoint, 'off-pos2.json'],
+      ] as const;
+      for (const [variant, entrypoint, filename] of positions) {
+        const json = await runProcess(entrypoint, benchmarkArgs);
+        parseJson<unknown>(variant, `Mitata benchmark ${filename}`, json);
+        await persist(join(outputDir, filename), json);
+      }
+    } else {
+      const [offJson, onJson] = await Promise.all([
+        runProcess(offEntrypoint, benchmarkArgs),
+        runProcess(onEntrypoint, benchmarkArgs),
+      ]);
+      parseJson<unknown>('OFF', 'Mitata benchmark', offJson);
+      parseJson<unknown>('ON', 'Mitata benchmark', onJson);
+      await Promise.all([persist(cli.offOutput, offJson), persist(cli.onOutput, onJson)]);
     }
-  } else {
-    const [offJson, onJson] = await Promise.all([
-      runProcess(offEntrypoint, benchmarkArgs),
-      runProcess(onEntrypoint, benchmarkArgs),
-    ]);
-    parseJson<unknown>('OFF', 'Mitata benchmark', offJson);
-    parseJson<unknown>('ON', 'Mitata benchmark', onJson);
-    await Promise.all([persist(cli.offOutput, offJson), persist(cli.onOutput, onJson)]);
   }
 
   process.stderr.write(
