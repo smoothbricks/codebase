@@ -16,9 +16,12 @@ import { createOverflowBuffer, createSpanBuffer, getSpanBufferClass } from '../s
 import type { TracerLifecycleHooks } from '../src/lib/traceRoot.js';
 import { createTraceRoot } from '../src/lib/traceRoot.node.js';
 import type { AnySpanBuffer } from '../src/lib/types.js';
+import { resolveMessage } from '../src/lib/resolveMessage.js';
+import { registerBenchmarkVocabulary } from './vocabularyFixture.js';
 
 const LOG_COUNTS = [0, 1, 50] as const;
 const LITERAL_MESSAGE = 'request accepted';
+const LITERAL_BINDING = registerBenchmarkVocabulary([LITERAL_MESSAGE]);
 const LINE = 137;
 const QUICK = process.argv.includes('--quick');
 const REQUESTS_PER_SAMPLE = QUICK ? 4 : 200;
@@ -75,14 +78,6 @@ const tracer: TracerLifecycleHooks = {
   },
 };
 
-const literalMetadata = Object.freeze({
-  ...DEFAULT_METADATA,
-  logTemplateIds: Object.freeze([LITERAL_MESSAGE]),
-});
-
-function metadataFor(mode: MessageMode) {
-  return mode === 'literal' ? literalMetadata : DEFAULT_METADATA;
-}
 
 function resetSharedStats(): void {
   const stats = getSpanBufferClass(schema).stats;
@@ -91,11 +86,11 @@ function resetSharedStats(): void {
   stats.spansCreated = 0;
 }
 
-function newRootBuffer(mode: MessageMode, counters: Counters): AnySpanBuffer {
+function newRootBuffer(_mode: MessageMode, counters: Counters): AnySpanBuffer {
   resetSharedStats();
   const root = createTraceRoot('log-call-path', tracer);
   counters.buffersCreated++;
-  return createSpanBuffer(schema, root, metadataFor(mode), CAPACITY);
+  return createSpanBuffer(schema, root, DEFAULT_METADATA, CAPACITY);
 }
 
 function messageFor(mode: MessageMode, request: number, log: number, counters: Counters): string {
@@ -112,10 +107,7 @@ function setLine(buffer: AnySpanBuffer, row: number): void {
 }
 
 function resolvedMessage(buffer: AnySpanBuffer, row: number): string {
-  const value = buffer.message_values[row];
-  if (value !== undefined) return value;
-  const id = buffer._messageTemplateIds?.[row] ?? 0;
-  return id === 0 ? '' : (buffer._opMetadata?.logTemplateIds[id - 1] ?? '');
+  return resolveMessage(buffer, row) ?? '';
 }
 
 function mix(hash: number, value: number): number {
@@ -176,7 +168,7 @@ function runCurrentFluent(logCount: number, mode: MessageMode): Observation {
   return finalize(counters, hash, rows, rows);
 }
 
-/** The current compile-time literal shape: template ID output followed by injected line output. */
+/** The current compile-time literal shape: dense vocabulary header followed by injected line output. */
 function runCurrentTransformerOutput(logCount: number): Observation {
   const counters = emptyCounters();
   let hash = 2_166_136_261;
@@ -186,7 +178,7 @@ function runCurrentTransformerOutput(logCount: number): Observation {
     const logger = createSpanLogger(schema, root);
     counters.writerObjects++;
     for (let log = 0; log < logCount; log++) {
-      logger._infoTemplate(1).line(LINE);
+      logger._infoTemplate(LITERAL_BINDING[0]!).line(LINE);
       counters.statsUpdateOps++;
     }
     const observed = inspectRequest(root);
@@ -270,9 +262,9 @@ function runModel(logCount: number, mode: MessageMode, options: ModelOptions): O
   }
   return finalize(counters, hash, rows, rows);
 }
-function newTimedRoot(mode: MessageMode): AnySpanBuffer {
+function newTimedRoot(_mode: MessageMode): AnySpanBuffer {
   resetSharedStats();
-  return createSpanBuffer(schema, createTraceRoot('log-call-path', tracer), metadataFor(mode), CAPACITY);
+  return createSpanBuffer(schema, createTraceRoot('log-call-path', tracer), DEFAULT_METADATA, CAPACITY);
 }
 
 function timedMessage(mode: MessageMode, request: number, log: number): string {
@@ -282,7 +274,7 @@ function timedMessage(mode: MessageMode, request: number, log: number): string {
 function consumeFinalBuffer(buffer: AnySpanBuffer): number {
   const row = buffer._writeIndex - 1;
   const messageLength = buffer.message_values?.[row]?.length ?? 0;
-  return buffer._writeIndex + (buffer.entry_type[row] ?? 0) + messageLength + (buffer._messageTemplateIds?.[row] ?? 0);
+  return buffer._writeIndex + (buffer.entry_type[row] ?? 0) + messageLength + (buffer._logHeaders[row] ?? 0);
 }
 
 function timeCurrentFluent(logCount: number, mode: MessageMode): number {
@@ -301,7 +293,7 @@ function timeCurrentTransformerOutput(logCount: number): number {
   let sink = 0;
   for (let request = 0; request < REQUESTS_PER_SAMPLE; request++) {
     const logger = createSpanLogger(schema, newTimedRoot('literal'));
-    for (let log = 0; log < logCount; log++) logger._infoTemplate(1).line(LINE);
+    for (let log = 0; log < logCount; log++) logger._infoTemplate(LITERAL_BINDING[0]!).line(LINE);
     sink ^= consumeFinalBuffer(logger._buffer);
   }
   return sink;
@@ -381,7 +373,7 @@ function variantsFor(logCount: number, mode: MessageMode): ScenarioVariant[] {
   ];
   if (mode === 'literal') {
     variants.push({
-      label: 'current/transformer-template-direct-output',
+      label: 'current/transformer-dense-header-output',
       verify: () => runCurrentTransformerOutput(logCount),
       timed: () => timeCurrentTransformerOutput(logCount),
     });

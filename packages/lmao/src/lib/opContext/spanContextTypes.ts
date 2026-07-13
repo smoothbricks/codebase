@@ -68,24 +68,29 @@ export type TagWriter<T extends LogSchema> = {
 /**
  * SpanLogger - public API surface for structured logging.
  *
- * Includes core methods (info/debug/warn/error) from BaseSpanLogger
- * and schema-specific methods from ColumnWriter.
- * Internal methods (_setScope, _buffer, etc.) are hidden from this type.
+ * Operational info/warn/error calls accept either a static template or the
+ * untransformed fallback form `(template, fields)`. Debug/trace retain the raw
+ * dynamic message API. The transformer lowers supported calls to direct writes;
+ * internal methods and buffers remain hidden from this type.
  *
- * Per specs/lmao/01h_entry_types_and_logging_primitives.md:
- * - Each level (info/debug/warn/error) creates a log entry
- * - Returns FluentLogEntry for chaining field setters
- * - Generated at runtime via createSpanLoggerFromGenerator()
+ * Per specs/lmao/01h_entry_types_and_logging_primitives.md, each call creates
+ * exactly one log entry. The generated runtime implementation binds structured
+ * fallback fields to the schema-specific column writers.
  */
 export interface SpanLogger<T extends LogSchema> {
-  /** Log at info level */
-  info(message: string): FluentLogEntry<T>;
+  /** Log a static info template, optionally with schema-bound fallback fields */
+  info(template: string): FluentLogEntry<T>;
+  info(template: string, fields: Partial<InferSchema<T>>): FluentLogEntry<T>;
   /** Log at debug level */
   debug(message: string): FluentLogEntry<T>;
-  /** Log at warn level */
-  warn(message: string): FluentLogEntry<T>;
-  /** Log at error level */
-  error(message: string): FluentLogEntry<T>;
+  /** Log a static warn template, optionally with schema-bound fallback fields */
+  warn(template: string): FluentLogEntry<T>;
+  warn(template: string, fields: Partial<InferSchema<T>>): FluentLogEntry<T>;
+  /** Log a static error template, optionally with schema-bound fallback fields */
+  error(template: string): FluentLogEntry<T>;
+  error(template: string, fields: Partial<InferSchema<T>>): FluentLogEntry<T>;
+  /** Log at trace level */
+  trace(message: string): FluentLogEntry<T>;
 }
 
 /**

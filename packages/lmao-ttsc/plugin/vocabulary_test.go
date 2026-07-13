@@ -374,6 +374,25 @@ func TestCanonicalManifestBytesFreezesRecordShapeAndNewline(t *testing.T) {
 	}
 }
 
+func TestWorkspaceVocabularyManifestFreezesCanonicalThirteenRecords(t *testing.T) {
+	manifest, err := loadVocabularyManifest(filepath.Join("..", "..", "..", "lmao.vocabulary.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantHash = "1f92e229d16bd3470e7dc1f15673f689f9350886788f2475a18236e228f6c6ae"
+	if manifest.ContentHash != wantHash {
+		t.Fatalf("workspace vocabulary content hash = %s, want %s", manifest.ContentHash, wantHash)
+	}
+	wantIDs := []uint32{273228, 377410, 2878065, 7140773, 8012750, 9474871, 12761596, 13676444, 13700822, 15317875, 15419721, 16094209, 16369894}
+	gotIDs := make([]uint32, len(manifest.Entries))
+	for index, entry := range manifest.Entries {
+		gotIDs[index] = entry.ID
+	}
+	if !reflect.DeepEqual(gotIDs, wantIDs) {
+		t.Fatalf("workspace vocabulary IDs = %v, want canonical 13 records %v", gotIDs, wantIDs)
+	}
+}
+
 func TestWriteManifestAtomicRepeatedNoOpPreservesExactFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "lmao.vocabulary.json")
 	data := []byte("canonical\x00💩\n")
