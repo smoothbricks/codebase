@@ -289,16 +289,43 @@ fn mark_non_stdio_close_on_exec(limit: libc::rlim_t) -> io::Result<()> {
     mark_descriptor_range_close_on_exec_with(limit, mark_descriptor_close_on_exec)
 }
 
+pub(crate) fn prepare_child_descriptors(command: &mut Command) -> Result<(), SpawnFailure> {
+    #[cfg(not(target_os = "macos"))]
+    let descriptor_limit = descriptor_limit().map_err(|source| SpawnFailure {
+        stage: WrapperStage::PrepareChildDescriptors,
+        source,
+    })?;
+    #[cfg(target_os = "macos")]
+    let mut descriptors = Box::<[libc::proc_fdinfo]>::new_uninit_slice(SUPERVISOR_FD_CEILING);
+
+    unsafe {
+        #[cfg(target_os = "macos")]
+        command.pre_exec(move || {
+            mark_macos_non_stdio_close_on_exec(&mut descriptors)
+                .map_err(|_| io::Error::from_raw_os_error(DESCRIPTOR_PREPARATION_ERRNO))
+        });
+        #[cfg(not(target_os = "macos"))]
+        command.pre_exec(move || {
+            mark_non_stdio_close_on_exec(descriptor_limit)
+                .map_err(|_| io::Error::from_raw_os_error(DESCRIPTOR_PREPARATION_ERRNO))
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn classify_spawn_error(source: io::Error) -> SpawnFailure {
+    SpawnFailure {
+        stage: if source.raw_os_error() == Some(DESCRIPTOR_PREPARATION_ERRNO) {
+            WrapperStage::PrepareChildDescriptors
+        } else {
+            WrapperStage::Spawn
+        },
+        source,
+    }
+}
+
 impl SpawnRunner for SystemSpawnRunner {
     fn run(&self, plan: &SpawnPlan) -> Result<ExitStatus, SpawnFailure> {
-        #[cfg(not(target_os = "macos"))]
-        let descriptor_limit = descriptor_limit().map_err(|source| SpawnFailure {
-            stage: WrapperStage::PrepareChildDescriptors,
-            source,
-        })?;
-        #[cfg(target_os = "macos")]
-        let mut descriptors = Box::<[libc::proc_fdinfo]>::new_uninit_slice(SUPERVISOR_FD_CEILING);
-
         let mut command = Command::new(&plan.program);
         command
             .args(&plan.args)
@@ -306,27 +333,9 @@ impl SpawnRunner for SystemSpawnRunner {
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
-        unsafe {
-            #[cfg(target_os = "macos")]
-            command.pre_exec(move || {
-                mark_macos_non_stdio_close_on_exec(&mut descriptors)
-                    .map_err(|_| io::Error::from_raw_os_error(DESCRIPTOR_PREPARATION_ERRNO))
-            });
-            #[cfg(not(target_os = "macos"))]
-            command.pre_exec(move || {
-                mark_non_stdio_close_on_exec(descriptor_limit)
-                    .map_err(|_| io::Error::from_raw_os_error(DESCRIPTOR_PREPARATION_ERRNO))
-            });
-        }
+        prepare_child_descriptors(&mut command)?;
 
-        let mut child = command.spawn().map_err(|source| SpawnFailure {
-            stage: if source.raw_os_error() == Some(DESCRIPTOR_PREPARATION_ERRNO) {
-                WrapperStage::PrepareChildDescriptors
-            } else {
-                WrapperStage::Spawn
-            },
-            source,
-        })?;
+        let mut child = command.spawn().map_err(classify_spawn_error)?;
         child.wait().map_err(|source| SpawnFailure {
             stage: WrapperStage::Wait,
             source,
