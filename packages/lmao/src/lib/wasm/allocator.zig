@@ -75,9 +75,11 @@ const Header = extern struct {
 
     // === Cold fields ===
     thread_id_set: u8, // offset 144: 1 if thread_id has been set
+    _pad1: [3]u8, // offset 145-147: Align exact freelist head
+    freelist_exact: u32, // offset 148: Exact-length/alignment freelist head
 
-    // Padding to 192 bytes (192 - 145 = 47 bytes)
-    _reserved: [47]u8,
+    // Padding to 192 bytes (192 - 152 = 40 bytes)
+    _reserved: [40]u8,
 
     comptime {
         std.debug.assert(@sizeOf(Header) == 192);
@@ -120,6 +122,20 @@ const FreeBlock = extern struct {
 
     comptime {
         std.debug.assert(@sizeOf(FreeBlock) == 20);
+    }
+};
+
+/// Intrusive metadata stored in an exact allocation while it is free.
+/// Exact allocations reserve at least this much storage, even when their
+/// logical byte length is smaller.
+const ExactFreeBlock = extern struct {
+    next_ptr: u32,
+    byte_len: u32,
+    alignment: u32,
+    storage_len: u32,
+
+    comptime {
+        std.debug.assert(@sizeOf(ExactFreeBlock) == 16);
     }
 };
 
@@ -205,6 +221,43 @@ inline fn blockSizeForCapacity(sc: SizeClass, capacity: u32) u32 {
     };
 }
 
+<<<<<<< HEAD
+=======
+/// Effective allocation tier for a request.
+///
+/// FIX (was a latent memory-corruption bug): a freed block is overlaid with a
+/// 20-byte `FreeBlock` (see below), but `col_1b` blocks at capacity 8/16 are
+/// only 9/18 bytes. Freeing or splitting one of those blocks wrote the
+/// FreeBlock header past the end of the block, silently corrupting whatever
+/// lived in the next 11/2 bytes — typically a buddy-split sibling or a live
+/// neighbor block. We clamp such requests up to the first tier whose block
+/// size actually fits a FreeBlock; buddy doubling stays intact and callers
+/// still get a block valid for the requested capacity (just over-provisioned
+/// underneath). Affects only col_1b cap 8 → tier 2 (36B) and cap 16 → tier 2.
+/// Ported from lmao-arena's `raw::effective_tier` (packages/lmao-rs/crates/lmao-arena/src/raw.rs),
+/// which the Rust allocator applies for the same reason; keep both in sync.
+inline fn effectiveTier(sc: SizeClass, tier: usize) usize {
+    var t = tier;
+    while (blockSizeForCapacity(sc, tierToCapacity(t)) < @sizeOf(FreeBlock) and t + 1 < NUM_TIERS) {
+        t += 1;
+    }
+    return t;
+}
+
+inline fn isValidExactAlignment(alignment: u32) bool {
+    return alignment != 0 and (alignment & (alignment - 1)) == 0;
+}
+
+inline fn exactStorageLen(byte_len: u32) u32 {
+    return @max(byte_len, @as(u32, @sizeOf(ExactFreeBlock)));
+}
+
+/// Return the linear-memory size without overflowing wasm32 usize at 4 GiB.
+inline fn memorySizeBytes() u64 {
+    return @as(u64, @wasmMemorySize(0)) * 65536;
+}
+
+>>>>>>> 67c24006f (perf(lmao): allocate exact WASM layout slabs)
 // =============================================================================
 // Allocator Core
 // =============================================================================
@@ -488,6 +541,7 @@ export fn init() void {
             fl.* = 0;
         }
         h.freelist_identity = 0;
+        h.freelist_exact = 0;
     }
     // Don't reset thread_id - it persists across init calls
 }
@@ -506,6 +560,7 @@ export fn reset() void {
         fl.* = 0;
     }
     h.freelist_identity = 0;
+    h.freelist_exact = 0;
     // Don't reset thread_id - it persists across reset calls
 }
 
@@ -525,25 +580,6 @@ export fn get_free_count() u32 {
     return header().free_count;
 }
 
-/// Get span system block size for given capacity.
-export fn get_span_system_size(capacity: u32) u32 {
-    return blockSizeForCapacity(.span_system, capacity);
-}
-
-/// Get 1-byte column block size for given capacity.
-export fn get_col_1b_size(capacity: u32) u32 {
-    return blockSizeForCapacity(.col_1b, capacity);
-}
-
-/// Get 4-byte column block size for given capacity.
-export fn get_col_4b_size(capacity: u32) u32 {
-    return blockSizeForCapacity(.col_4b, capacity);
-}
-
-/// Get 8-byte column block size for given capacity.
-export fn get_col_8b_size(capacity: u32) u32 {
-    return blockSizeForCapacity(.col_8b, capacity);
-}
 
 // =============================================================================
 // Exported Functions - Thread ID
@@ -746,51 +782,8 @@ export fn read_write_index(identity_ptr: u32) u32 {
     return ptrAt(Identity, identity_ptr).write_index;
 }
 
-// =============================================================================
-// Exported Functions - Block Allocation (capacity-aware)
-// =============================================================================
-// Each OpContext may have different capacity, so capacity is passed to each call.
-// Capacity must be a power of 2 between 8 and 512.
+// Capacity-tiered allocation remains private to the arena's self-tuning internals.
 
-/// Allocate a span system block (timestamp + entry_type for capacity rows).
-export fn alloc_span_system(capacity: u32) u32 {
-    return allocWithCapacity(.span_system, capacity);
-}
-
-/// Free a span system block.
-export fn free_span_system(offset: u32, capacity: u32) void {
-    freeWithCapacity(offset, .span_system, capacity);
-}
-
-/// Allocate a 1-byte column block (for enum/boolean).
-export fn alloc_col_1b(capacity: u32) u32 {
-    return allocWithCapacity(.col_1b, capacity);
-}
-
-/// Free a 1-byte column block.
-export fn free_col_1b(offset: u32, capacity: u32) void {
-    freeWithCapacity(offset, .col_1b, capacity);
-}
-
-/// Allocate a 4-byte column block (for u32/i32/f32).
-export fn alloc_col_4b(capacity: u32) u32 {
-    return allocWithCapacity(.col_4b, capacity);
-}
-
-/// Free a 4-byte column block.
-export fn free_col_4b(offset: u32, capacity: u32) void {
-    freeWithCapacity(offset, .col_4b, capacity);
-}
-
-/// Allocate an 8-byte column block (for f64/i64).
-export fn alloc_col_8b(capacity: u32) u32 {
-    return allocWithCapacity(.col_8b, capacity);
-}
-
-/// Free an 8-byte column block.
-export fn free_col_8b(offset: u32, capacity: u32) void {
-    freeWithCapacity(offset, .col_8b, capacity);
-}
 
 /// Allocate with explicit capacity (converts to tier internally).
 fn allocWithCapacity(sc: SizeClass, capacity: u32) u32 {
@@ -805,6 +798,88 @@ fn freeWithCapacity(offset: u32, sc: SizeClass, capacity: u32) void {
 
     const tier = effectiveTier(sc, capacityToTier(capacity));
     if (isOffsetFree(sc, tier, offset)) return;    freeAtTier(offset, sc, tier);
+}
+
+// =============================================================================
+// Exported Functions - Exact Block Allocation
+// =============================================================================
+
+/// Allocate exactly `byte_len` logical bytes at the requested alignment.
+/// Free blocks are reused only when both logical length and alignment match.
+export fn alloc_exact(byte_len: u32, alignment: u32) u32 {
+    if (!isValidExactAlignment(alignment)) return 0;
+
+    const h = header();
+    var previous_offset: u32 = 0;
+    var current_offset = h.freelist_exact;
+
+    while (current_offset != 0) {
+        const free_block = ptrAt(ExactFreeBlock, current_offset);
+        if (free_block.byte_len == byte_len and free_block.alignment == alignment) {
+            if (previous_offset == 0) {
+                h.freelist_exact = free_block.next_ptr;
+            } else {
+                ptrAt(ExactFreeBlock, previous_offset).next_ptr = free_block.next_ptr;
+            }
+
+            zeroBlock(current_offset, byte_len);
+            h.alloc_count += 1;
+            return current_offset;
+        }
+
+        previous_offset = current_offset;
+        current_offset = free_block.next_ptr;
+    }
+
+    const storage_alignment = @max(alignment, @as(u32, @alignOf(ExactFreeBlock)));
+    const alignment_mask = storage_alignment - 1;
+    const bump_with_padding = std.math.add(u32, h.bump_ptr, alignment_mask) catch return 0;
+    const aligned = bump_with_padding & ~alignment_mask;
+    const storage_len = exactStorageLen(byte_len);
+    const new_bump = std.math.add(u32, aligned, storage_len) catch return 0;
+
+    const current_size = memorySizeBytes();
+    if (@as(u64, new_bump) > current_size) {
+        const needed = @as(u64, new_bump) - current_size;
+        const pages_needed = (needed + 65535) / 65536;
+        const result = @wasmMemoryGrow(0, @as(usize, @intCast(pages_needed)));
+        if (result == -1) return 0;
+    }
+
+    h.bump_ptr = new_bump;
+    h.alloc_count += 1;
+    zeroBlock(aligned, byte_len);
+    return aligned;
+}
+
+/// Return an exact allocation to its intrusive freelist. Invalid, out-of-range,
+/// zero, misaligned, and repeated frees are ignored without changing counters.
+export fn free_exact(offset: u32, byte_len: u32, alignment: u32) void {
+    if (offset < @sizeOf(Header) or !isValidExactAlignment(alignment)) return;
+
+    const alignment_mask = alignment - 1;
+    if ((offset & alignment_mask) != 0) return;
+    const storage_alignment_mask = @max(alignment, @as(u32, @alignOf(ExactFreeBlock))) - 1;
+    if ((offset & storage_alignment_mask) != 0) return;
+
+    const storage_len = exactStorageLen(byte_len);
+    const end = std.math.add(u32, offset, storage_len) catch return;
+    const h = header();
+    if (end > h.bump_ptr or @as(u64, end) > memorySizeBytes()) return;
+
+    var current_offset = h.freelist_exact;
+    while (current_offset != 0) {
+        if (current_offset == offset) return;
+        current_offset = ptrAt(ExactFreeBlock, current_offset).next_ptr;
+    }
+
+    const free_block = ptrAt(ExactFreeBlock, offset);
+    free_block.next_ptr = h.freelist_exact;
+    free_block.byte_len = byte_len;
+    free_block.alignment = alignment;
+    free_block.storage_len = storage_len;
+    h.freelist_exact = offset;
+    h.free_count += 1;
 }
 
 // =============================================================================

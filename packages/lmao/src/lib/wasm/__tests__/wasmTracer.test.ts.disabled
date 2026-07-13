@@ -137,8 +137,8 @@ describe('WasmTracer', () => {
 
       // Allocator should have all the expected methods
       expect(tracer.allocator.memory).toBeInstanceOf(WebAssembly.Memory);
-      expect(typeof tracer.allocator.allocSpanSystem).toBe('function');
-      expect(typeof tracer.allocator.freeSpanSystem).toBe('function');
+      expect(typeof tracer.allocator.allocExact).toBe('function');
+      expect(typeof tracer.allocator.freeExact).toBe('function');
       expect(typeof tracer.allocator.getAllocCount).toBe('function');
     });
   });

@@ -201,26 +201,6 @@ pub extern "C" fn get_freelist_merge_count(sc: u8, capacity: u32) -> u32 {
     with_mem(|m| raw::freelist_merge_count(m, size_class(sc), capacity))
 }
 
-// Block size queries — pure math.
-#[unsafe(no_mangle)]
-pub extern "C" fn get_span_system_size(capacity: u32) -> u32 {
-    lmao_arena::block_size(SizeClass::SpanSystem, capacity)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn get_col_1b_size(capacity: u32) -> u32 {
-    lmao_arena::block_size(SizeClass::Col1B, capacity)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn get_col_4b_size(capacity: u32) -> u32 {
-    lmao_arena::block_size(SizeClass::Col4B, capacity)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn get_col_8b_size(capacity: u32) -> u32 {
-    lmao_arena::block_size(SizeClass::Col8B, capacity)
-}
 
 // =============================================================================
 // Thread id
@@ -290,49 +270,18 @@ pub extern "C" fn read_write_index(identity_ptr: u32) -> u32 {
     with_mem(|m| raw::read_write_index(m, identity_ptr))
 }
 
-// =============================================================================
-// Capacity-tiered block alloc/free
-// =============================================================================
+// Exact physical slab allocation
 
 #[unsafe(no_mangle)]
-pub extern "C" fn alloc_span_system(capacity: u32) -> u32 {
-    with_mem(|m| raw::alloc_with_capacity(m, SizeClass::SpanSystem, capacity))
+pub extern "C" fn alloc_exact(byte_len: u32, alignment: u32) -> u32 {
+    with_mem(|m| raw::alloc_exact(m, byte_len, alignment))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn free_span_system(offset: u32, capacity: u32) {
-    with_mem(|m| raw::free_with_capacity(m, offset, SizeClass::SpanSystem, capacity));
+pub extern "C" fn free_exact(offset: u32, byte_len: u32, alignment: u32) {
+    with_mem(|m| raw::free_exact(m, offset, byte_len, alignment));
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn alloc_col_1b(capacity: u32) -> u32 {
-    with_mem(|m| raw::alloc_with_capacity(m, SizeClass::Col1B, capacity))
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn free_col_1b(offset: u32, capacity: u32) {
-    with_mem(|m| raw::free_with_capacity(m, offset, SizeClass::Col1B, capacity));
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn alloc_col_4b(capacity: u32) -> u32 {
-    with_mem(|m| raw::alloc_with_capacity(m, SizeClass::Col4B, capacity))
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn free_col_4b(offset: u32, capacity: u32) {
-    with_mem(|m| raw::free_with_capacity(m, offset, SizeClass::Col4B, capacity));
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn alloc_col_8b(capacity: u32) -> u32 {
-    with_mem(|m| raw::alloc_with_capacity(m, SizeClass::Col8B, capacity))
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn free_col_8b(offset: u32, capacity: u32) {
-    with_mem(|m| raw::free_with_capacity(m, offset, SizeClass::Col8B, capacity));
-}
 
 // =============================================================================
 // TraceRoot + span lifecycle + column IO
@@ -478,9 +427,9 @@ mod tests {
         assert_eq!(read_identity_trace_id_len(identity), 4);
 
         let cap = 64u32;
-        let system = alloc_span_system(cap);
+        let system = alloc_exact(cap * 9, 8);
         assert_ne!(system, 0);
-        let root = alloc_col_8b(8); // 16+ byte scratch for TraceRoot
+        let root = alloc_exact(16, 8);
         init_trace_root(root);
 
         span_start(system, identity, root, cap);
@@ -493,18 +442,44 @@ mod tests {
 
         let idx = write_log_entry(system, identity, root, 5, cap);
         assert_eq!(idx, 2);
-        let col = write_col_f64(0, idx, 42.5, cap);
-        assert_ne!(col, 0);
-        assert_eq!(read_col_f64(col, idx, cap), 42.5);
-        assert_eq!(read_col_is_valid(col, idx), 1);
-        assert_eq!(read_col_is_valid(col, idx + 1), 0);
 
         span_end_ok(system, root, cap);
         assert_eq!(read_entry_type(system, 1, cap), raw::ENTRY_TYPE_SPAN_OK);
 
-        free_col_8b(col, cap);
-        free_span_system(system, cap);
+        free_exact(root, 16, 8);
+        free_exact(system, cap * 9, 8);
         free_identity(identity);
         assert!(get_free_count() >= 3);
+
+        // Exact-size slab allocations preserve the caller's alignment and own
+        // disjoint byte ranges without rounding the request into a column family.
+        reset();
+        let requests = [(1, 1), (3, 2), (7, 4), (17, 8), (65, 16), (257, 64)];
+        let mut slabs: Vec<(u32, u32, u32)> = Vec::new();
+        for (byte_len, alignment) in requests {
+            let offset = alloc_exact(byte_len, alignment);
+            assert_ne!(offset, 0);
+            assert_eq!(offset % alignment, 0, "exact slab alignment");
+            for &(other_offset, other_len, _) in &slabs {
+                assert!(
+                    offset + byte_len <= other_offset || offset >= other_offset + other_len,
+                    "exact slab ranges must not overlap"
+                );
+            }
+            slabs.push((offset, byte_len, alignment));
+        }
+        assert_eq!(get_alloc_count(), slabs.len() as u32);
+
+        // Releasing an exact allocation is idempotent and returns precisely the
+        // same address to the exact-size/alignment family without aliasing live owners.
+        let (released, byte_len, alignment) = slabs[3];
+        free_exact(released, byte_len, alignment);
+        let free_count = get_free_count();
+        free_exact(released, byte_len, alignment);
+        assert_eq!(get_free_count(), free_count);
+        let recycled = alloc_exact(byte_len, alignment);
+        assert_eq!(recycled, released);
+        let distinct = alloc_exact(byte_len, alignment);
+        assert_ne!(distinct, recycled);
     }
 }

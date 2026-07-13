@@ -14,6 +14,8 @@
  */
 
 import type { Nanoseconds } from '@smoothbricks/arrow-builder';
+import type { BufferStrategy } from './bufferStrategy.js';
+import type { LogSchema } from './schema/LogSchema.js';
 import type { AnySpanBuffer } from './types.js';
 
 export type { SpanIdentity, TraceId } from './traceId.js';
@@ -25,7 +27,7 @@ export { createTraceId, extractSpanIdentity, generateTraceId, isValidTraceId, MA
  * Extracted to avoid circular dependency - Tracer implements this.
  */
 //#region smoo/lmao!n/buffer-tuning-observability
-export interface TracerLifecycleHooks {
+export interface TracerLifecycleHooks<T extends LogSchema = LogSchema> {
   onTraceStart(buffer: unknown): void;
   onTraceEnd(buffer: unknown): void;
   onSpanStart(buffer: unknown): void;
@@ -34,22 +36,12 @@ export interface TracerLifecycleHooks {
   /** Internal evaluator source used when a specialized parent omits the public ff slot. */
   getFlagEvaluatorForContext(): unknown;
 
-
   /**
    * Buffer strategy for creating child and overflow buffers.
    * SpanContext uses this to create child spans with the correct strategy (JS or WASM).
    * Note: Caller must call writeSpanStart() after createChildSpanBuffer() to set span name.
    */
-  readonly bufferStrategy: {
-    createChildSpanBuffer(
-      parentBuffer: AnySpanBuffer,
-      callsiteMetadata: unknown,
-      opMetadata: unknown,
-      capacity?: number,
-      schema?: unknown,
-    ): AnySpanBuffer;
-    createOverflowBuffer(buffer: AnySpanBuffer): AnySpanBuffer;
-  };
+  readonly bufferStrategy: BufferStrategy<T>;
 }
 //#endregion smoo/lmao!n/buffer-tuning-observability
 
@@ -85,7 +77,10 @@ export const TRACE_ROOT_TRACE_ID_OFFSET = 17;
  *
  * The factory creates anchor timestamps internally using platform-specific APIs.
  */
-export type TraceRootFactory = (trace_id: string, tracer: TracerLifecycleHooks) => ITraceRoot;
+export type TraceRootFactory<T extends LogSchema = LogSchema> = (
+  trace_id: string,
+  tracer: TracerLifecycleHooks<T>,
+) => ITraceRoot<T>;
 
 /** Platform-fixed primitives copied into the physical plan/generated writer hot path. */
 export type TimestampNowPrimitive = (traceRoot: ITraceRoot) => Nanoseconds;
@@ -93,7 +88,7 @@ export type TimestampAppendPrimitive = (traceRoot: ITraceRoot, buffer: AnySpanBu
 export type SpanStartPrimitive = (traceRoot: ITraceRoot, buffer: AnySpanBuffer, spanName: string) => void;
 export type SpanEndPrimitive = (traceRoot: ITraceRoot, buffer: AnySpanBuffer, entryType: number) => void;
 
-export interface ITraceRoot {
+export interface ITraceRoot<T extends LogSchema = LogSchema> {
   /**
    * Raw backing buffer containing anchor timestamps and trace_id.
    * The WASM path can read this directly without BigInt extraction.
@@ -103,7 +98,7 @@ export interface ITraceRoot {
   /**
    * Tracer reference for lifecycle hooks and event callbacks.
    */
-  readonly tracer: TracerLifecycleHooks;
+  readonly tracer: TracerLifecycleHooks<T>;
 
   /**
    * Trace ID for this trace.
