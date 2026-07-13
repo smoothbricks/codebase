@@ -55,7 +55,7 @@ func decimalBytes(values []byte) string {
 }
 
 func TestVocabularyRegistrationEmitsExactSection6FragmentAndOrdinalOperands(t *testing.T) {
-	entries := []vocabularyManifestEntry{
+	entries := []vocabularyCatalogEntry{
 		{ID: 0x010203, Kind: vocabularyLogTemplate, Text: "A\x00💩", Fields: []vocabularyField{{Name: "user💩", Column: "user_id"}, {Name: "e\u0301", Column: "é"}}},
 		{ID: 0x0a0b0c, Kind: vocabularySpanName, Text: "é", Fields: []vocabularyField{}},
 	}
@@ -153,9 +153,9 @@ func TestVocabularyRegistrationEmptyFragmentEmitsNothing(t *testing.T) {
 }
 
 func TestPrependVocabularyRegistrationPreservesDirectivesAndImportPosition(t *testing.T) {
-	entry := vocabularyManifestEntry{ID: 7, Kind: vocabularySpanName, Text: "work", Fields: []vocabularyField{}}
+	entry := vocabularyCatalogEntry{ID: 7, Kind: vocabularySpanName, Text: "work", Fields: []vocabularyField{}}
 	emitContext := shimprinter.NewEmitContext()
-	_, registration := vocabularyRegistrationStatements(emitContext, []vocabularyManifestEntry{entry})
+	_, registration := vocabularyRegistrationStatements(emitContext, []vocabularyCatalogEntry{entry})
 	sourceFile := loadRegistrationTestSource(t, `"use client";
 import { dependency } from "./dependency";
 const body = dependency;
@@ -182,13 +182,13 @@ const body = dependency;
 }
 
 func TestVocabularyRegistrationBindingAvoidsPreferredSourceName(t *testing.T) {
-	entry := vocabularyManifestEntry{ID: 9, Kind: vocabularyLogTemplate, Text: "collision", Fields: []vocabularyField{}}
+	entry := vocabularyCatalogEntry{ID: 9, Kind: vocabularyLogTemplate, Text: "collision", Fields: []vocabularyField{}}
 	emitContext := shimprinter.NewEmitContext()
-	binding, registration := vocabularyRegistrationStatements(emitContext, []vocabularyManifestEntry{entry})
+	binding, registration := vocabularyRegistrationStatements(emitContext, []vocabularyCatalogEntry{entry})
 	sourceFile := loadRegistrationTestSource(t, "const $$lmaoVocabulary = 7;\n")
 	statements := append([]*shimast.Node(nil), sourceFile.Statements.Nodes...)
 	statements = append(statements, constDecl(ident("localID"), (&fileTransformer{
-		vocabularyBinding: binding,
+		vocabularyBinding:  binding,
 		vocabularyOrdinals: map[globalVocabularyID]int{9: 0},
 	}).staticVocabularyOperand(9)))
 	sourceFile.Statements = factory.NewNodeList(statements)
@@ -205,46 +205,5 @@ func TestVocabularyRegistrationBindingAvoidsPreferredSourceName(t *testing.T) {
 	}
 	if !strings.Contains(output, "const $$lmaoVocabulary = 7;") || !strings.Contains(output, "const localID = "+match[1]+"[0];") {
 		t.Fatalf("source binding or generated-binding callsite was not preserved:\n%s", output)
-	}
-}
-
-func TestManifestSupersetEmitsOnlyFileRecordsWithLocalOrdinalOperands(t *testing.T) {
-	unrelated := vocabularyManifestEntry{ID: 11, Kind: vocabularyLogTemplate, Text: "other module", Fields: []vocabularyField{}}
-	span := vocabularyManifestEntry{ID: 22, Kind: vocabularySpanName, Text: "spän💩", Fields: []vocabularyField{}}
-	log := vocabularyManifestEntry{ID: 33, Kind: vocabularyLogTemplate, Text: "user é", Fields: []vocabularyField{{Name: "user", Column: "user_id"}}}
-	manifest := vocabularyManifest{Entries: []vocabularyManifestEntry{unrelated, span, log}}
-	spanKey, err := keyFromManifestEntry(span)
-	if err != nil {
-		t.Fatal(err)
-	}
-	logKey, err := keyFromManifestEntry(log)
-	if err != nil {
-		t.Fatal(err)
-	}
-	entries := manifestEntriesForFile(manifest, map[vocabularyKey]struct{}{logKey: {}, spanKey: {}})
-	emitContext := shimprinter.NewEmitContext()
-	binding, registration := vocabularyRegistrationStatements(emitContext, entries)
-	transformer := fileTransformer{vocabularyBinding: binding, vocabularyOrdinals: vocabularyOrdinals(entries)}
-	sourceFile := loadRegistrationTestSource(t, "export const untouched = 1;\n")
-	statements := append([]*shimast.Node(nil), sourceFile.Statements.Nodes...)
-	statements = append(statements,
-		constDecl(ident("spanLocalID"), transformer.staticVocabularyOperand(globalVocabularyID(span.ID))),
-		constDecl(ident("logLocalID"), transformer.staticVocabularyOperand(globalVocabularyID(log.ID))),
-	)
-	sourceFile.Statements = factory.NewNodeList(statements)
-	prependVocabularyRegistration(sourceFile, registration)
-	shimast.SetParentInChildrenUnset(sourceFile.AsNode())
-	output := emitRegistrationTestSource(sourceFile, emitContext)
-
-	match := regexp.MustCompile(`const (\$\$lmaoVocabulary\w*) = \$\$registerLmaoVocabulary\w*\(\{`).FindStringSubmatch(output)
-	if len(match) != 2 {
-		t.Fatalf("generated file-local vocabulary binding not found:\n%s", output)
-	}
-	if !strings.Contains(output, "ids: new Uint32Array([22, 33])") || strings.Contains(output, "ids: new Uint32Array([11") {
-		t.Fatalf("file fragment did not exclude the unrelated app-wide manifest record:\n%s", output)
-	}
-	if !strings.Contains(output, "const spanLocalID = "+match[1]+"[0];") ||
-		!strings.Contains(output, "const logLocalID = "+match[1]+"[1];") {
-		t.Fatalf("file-local operands do not bind the selected records by ordinal:\n%s", output)
 	}
 }

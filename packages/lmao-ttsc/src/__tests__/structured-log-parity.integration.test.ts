@@ -6,7 +6,6 @@ import { createBunTtscPlugin } from '../index.js';
 
 const fixturePath = fileURLToPath(new URL('./fixtures/structured-log-parity.ts', import.meta.url));
 const projectPath = fileURLToPath(new URL('../../tsconfig.test.json', import.meta.url));
-const manifestPath = fileURLToPath(new URL('../../../../lmao.vocabulary.json', import.meta.url));
 
 interface FixtureResult {
   result: { ok: boolean; value: string };
@@ -29,7 +28,6 @@ async function buildFixture(pluginEnabled: boolean, outputDir: string): Promise<
             plugins: [
               {
                 transform: '@smoothbricks/lmao-ttsc/ttsc-plugin',
-                vocabularyManifest: '../../lmao.vocabulary.json',
               },
             ],
           }),
@@ -67,18 +65,8 @@ test('plugin OFF and ON preserve decoded facts and effects while ON uses dense v
   try {
     const offDir = join(temporaryRoot, 'off');
     const onDir = join(temporaryRoot, 'on');
-    const [offEntrypoint, onEntrypoint] = await Promise.all([
-      buildFixture(false, offDir),
-      buildFixture(true, onDir),
-    ]);
-    const [pluginOff, pluginOn] = await Promise.all([
-      executeFixture(offEntrypoint),
-      executeFixture(onEntrypoint),
-    ]);
-    const manifest = await Bun.file(manifestPath).json();
-    expect(manifest.entries).toHaveLength(13);
-    expect(manifest.contentHash).toBe('1f92e229d16bd3470e7dc1f15673f689f9350886788f2475a18236e228f6c6ae');
-
+    const [offEntrypoint, onEntrypoint] = await Promise.all([buildFixture(false, offDir), buildFixture(true, onDir)]);
+    const [pluginOff, pluginOn] = await Promise.all([executeFixture(offEntrypoint), executeFixture(onEntrypoint)]);
 
     const expectedSemantics = {
       result: { ok: true, value: 'complete' },

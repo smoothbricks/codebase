@@ -26,7 +26,6 @@ test('the exported Bun adapter applies the explicitly selected native plugin', a
           plugins: [
             {
               transform: '@smoothbricks/lmao-ttsc/ttsc-plugin',
-              vocabularyManifest: '../../lmao.vocabulary.json',
             },
           ],
         }),

@@ -82,7 +82,7 @@ export function defineOps(definitions: Record<string, Op | ((ctx: SpanContext) =
 type templateFixtureResult struct {
 	output    string
 	err       error
-	manifest  vocabularyManifest
+	catalog   vocabularyCatalog
 	inputPath string
 	source    string
 }
@@ -108,45 +108,44 @@ func runTemplateFixture(t *testing.T, body string) templateFixtureResult {
 		}
 	}
 
-	program, _, err := driver.LoadProgram(root, filepath.Join(root, "tsconfig.json"), driver.LoadProgramOptions{})
+	configPath := filepath.Join(root, "tsconfig.json")
+	program, _, err := driver.LoadProgram(root, configPath, driver.LoadProgramOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer program.Close()
-	options := compilerOptions{
-		cwd:          root,
-		tsconfig:     filepath.Join(root, "tsconfig.json"),
-		manifestPath: filepath.Join(root, "lmao.vocabulary.json"),
+	var inputSource *shimast.SourceFile
+	for _, sourceFile := range program.SourceFiles() {
+		if sourceFile != nil && filepath.Clean(sourceFile.FileName()) == filepath.Clean(inputPath) {
+			inputSource = sourceFile
+			break
+		}
 	}
-	_, manifest, err := collectProgramCompilation(program, options, false)
+	if inputSource == nil {
+		t.Fatal("template fixture input source was not loaded")
+	}
+
+	options := compilerOptions{cwd: root, tsconfig: configPath}
+	compilation, err := collectProgramCompilation(program, options)
 	if err != nil {
 		return templateFixtureResult{err: err, inputPath: inputPath, source: source}
 	}
-	manifestBytes, err := canonicalManifestBytes(manifest)
-	if err != nil {
-		t.Fatal(err)
+	collected := compilation.files[inputSource]
+	if collected == nil {
+		t.Fatal("template fixture source was absent from whole-program compilation")
 	}
-	if err := os.WriteFile(options.manifestPath, manifestBytes, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	catalog := vocabularyCatalog{Entries: append([]vocabularyCatalogEntry(nil), collected.registrationEntries...)}
 	transform, err := lmaoPluginTransform(program, options)
 	if err != nil {
 		return templateFixtureResult{err: err, inputPath: inputPath, source: source}
 	}
-	for _, sourceFile := range program.SourceFiles() {
-		if sourceFile == nil || filepath.Clean(sourceFile.FileName()) != filepath.Clean(inputPath) {
-			continue
-		}
-		emitContext := shimprinter.NewEmitContext()
-		result := transform(emitContext, sourceFile)
-		if result == nil {
-			t.Fatal("template fixture transform returned nil")
-		}
-		printer := shimprinter.NewPrinter(shimprinter.PrinterOptions{}, shimprinter.PrintHandlers{}, emitContext)
-		return templateFixtureResult{output: shimprinter.EmitSourceFile(printer, result), manifest: manifest, inputPath: inputPath, source: source}
+	emitContext := shimprinter.NewEmitContext()
+	result := transform(emitContext, inputSource)
+	if result == nil {
+		t.Fatal("template fixture transform returned nil")
 	}
-	t.Fatal("template fixture input source was not loaded")
-	return templateFixtureResult{}
+	printer := shimprinter.NewPrinter(shimprinter.PrinterOptions{}, shimprinter.PrintHandlers{}, emitContext)
+	return templateFixtureResult{output: shimprinter.EmitSourceFile(printer, result), catalog: catalog, inputPath: inputPath, source: source}
 }
 
 func transformTemplateFixture(t *testing.T, body string) string {
@@ -455,7 +454,7 @@ defineOp('structured', (ctx) => {
 		"info {jobId}": false, "warn {elapsedMs}": false, "job {literal} {jobId}": false,
 	}
 	wantField := map[string]string{"info {jobId}": "jobId", "warn {elapsedMs}": "elapsedMs", "job {literal} {jobId}": "jobId"}
-	for _, entry := range result.manifest.Entries {
+	for _, entry := range result.catalog.Entries {
 		if _, wanted := wantTemplates[entry.Text]; wanted {
 			wantTemplates[entry.Text] = true
 		}
@@ -467,7 +466,7 @@ defineOp('structured', (ctx) => {
 	}
 	for template, found := range wantTemplates {
 		if !found {
-			t.Fatalf("vocabulary manifest missing %q: %+v", template, result.manifest.Entries)
+			t.Fatalf("vocabulary catalog missing %q: %+v", template, result.catalog.Entries)
 		}
 	}
 	for _, expression := range []string{"value('info')", "numberValue('warn')", "value('error')"} {
