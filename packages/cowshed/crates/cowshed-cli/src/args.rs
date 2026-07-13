@@ -137,32 +137,54 @@ impl fmt::Display for UsageError {
 
 impl std::error::Error for UsageError {}
 
+#[derive(Clone, Copy)]
+enum CommandName {
+    Adopt,
+    New,
+    List,
+    Path,
+    Exec,
+    Remove,
+    Attach,
+    Detach,
+    Doctor,
+}
+
 pub fn parse_args<I, T>(args: I) -> Result<Cli, UsageError>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString>,
 {
-    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let mut args: Vec<OsString> = args.into_iter().map(Into::into).collect();
     let mut global = GlobalOptions::default();
     let mut index = 0;
     while index < args.len() && parse_global(&args, &mut index, &mut global)? {}
 
-    let Some(command) = args.get(index).and_then(|arg| arg.to_str()) else {
-        return Err(UsageError::missing_command());
+    let command = match args.get(index).and_then(|arg| arg.to_str()) {
+        Some("adopt") => CommandName::Adopt,
+        Some("new") => CommandName::New,
+        Some("ls") => CommandName::List,
+        Some("path") => CommandName::Path,
+        Some("exec") => CommandName::Exec,
+        Some("rm") => CommandName::Remove,
+        Some("attach") => CommandName::Attach,
+        Some("detach") => CommandName::Detach,
+        Some("doctor") => CommandName::Doctor,
+        Some(other) => return Err(UsageError::new(format!("unknown command `{other}`"), "<command>")),
+        None => return Err(UsageError::missing_command()),
     };
     index += 1;
 
     let command = match command {
-        "adopt" => parse_adopt(&args, index, &mut global)?,
-        "new" => parse_new(&args, index, &mut global)?,
-        "ls" => parse_empty(&args, index, &mut global, "ls", Command::List)?,
-        "path" => parse_path(&args, index, &mut global)?,
-        "exec" => parse_exec(&args, index, &mut global)?,
-        "rm" => parse_remove(&args, index, &mut global)?,
-        "attach" => parse_attach(&args, index, &mut global)?,
-        "detach" => parse_detach(&args, index, &mut global)?,
-        "doctor" => parse_empty(&args, index, &mut global, "doctor", Command::Doctor)?,
-        other => return Err(UsageError::new(format!("unknown command `{other}`"), "<command>")),
+        CommandName::Adopt => parse_adopt(&args, index, &mut global)?,
+        CommandName::New => parse_new(&args, index, &mut global)?,
+        CommandName::List => parse_empty(&args, index, &mut global, "ls", Command::List)?,
+        CommandName::Path => parse_path(&args, index, &mut global)?,
+        CommandName::Exec => parse_exec(&mut args, index, &mut global)?,
+        CommandName::Remove => parse_remove(&args, index, &mut global)?,
+        CommandName::Attach => parse_attach(&args, index, &mut global)?,
+        CommandName::Detach => parse_detach(&args, index, &mut global)?,
+        CommandName::Doctor => parse_empty(&args, index, &mut global, "doctor", Command::Doctor)?,
     };
     Ok(Cli { global, command })
 }
@@ -282,7 +304,7 @@ fn parse_path(
 }
 
 fn parse_exec(
-    args: &[OsString],
+    args: &mut Vec<OsString>,
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
@@ -329,7 +351,8 @@ fn parse_exec(
     if index == 0 || args.get(index.wrapping_sub(1)) != Some(&OsString::from("--")) {
         return Err(UsageError::new("exec requires `--` before the child argv", USAGE));
     }
-    let argv = args[index..].to_vec();
+    args.drain(..index);
+    let argv = std::mem::take(args);
     if argv.is_empty() {
         return Err(UsageError::new("exec requires a child command after `--`", USAGE));
     }
