@@ -257,7 +257,7 @@ function getRetryableError<S, E>(result: Result<S, E>, attempt: number): Transie
  */
 export function writeSpanStart<T extends LogSchema>(buffer: SpanBuffer<T>, spanName: string): void {
   // Delegate to TraceRoot - platform-specific implementation handles timestamps
-  buffer._traceRoot.writeSpanStart(buffer, spanName);
+  buffer._traceRoot._writeSpanStart(buffer._traceRoot, buffer, spanName);
 }
 //#endregion smoo/lmao!n/lmao-entry-span-lifecycle-entry-types.start
 
@@ -337,7 +337,7 @@ function writeRetryEntry<T extends LogSchema>(
 
   // Write entry via TraceRoot for timestamp handling
   // TraceRoot.writeLogEntry writes timestamp and entry_type at the given index
-  buffer._traceRoot.writeLogEntry(buffer, ENTRY_TYPE_SPAN_RETRY);
+  buffer._traceRoot._appendLogEntry(buffer._traceRoot, buffer, ENTRY_TYPE_SPAN_RETRY);
 
   // Write retry-specific message: retry:op:{opName} for prefix-based querying
   const opName = buffer._opMetadata?.name ?? 'unknown';
@@ -590,9 +590,9 @@ async function executeWithRetry8<Ctx extends OpContext, S, E, A1, A2, A3, A4, A5
 export function writeSpanEnd<T extends LogSchema, S, E>(buffer: SpanBuffer<T>, result: Result<S, E>): void {
   // Write entry_type and timestamp via TraceRoot (platform-specific)
   if (result instanceof Ok) {
-    buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_OK);
+    buffer._traceRoot._writeSpanEnd(buffer._traceRoot, buffer, ENTRY_TYPE_SPAN_OK);
   } else if (result instanceof Err) {
-    buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_ERR);
+    buffer._traceRoot._writeSpanEnd(buffer._traceRoot, buffer, ENTRY_TYPE_SPAN_ERR);
     // Write error_code if the error has a code property
     if (hasErrorCode(result.error)) {
       buffer.error_code(1, result.error.code);
@@ -1346,7 +1346,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
      */
     _spanException(childBuffer: SpanBuffer<Ctx['logSchema']>, error: unknown): void {
       // Write entry_type and timestamp via TraceRoot (platform-specific)
-      childBuffer._traceRoot.writeSpanEnd(childBuffer, ENTRY_TYPE_SPAN_EXCEPTION);
+      childBuffer._traceRoot._writeSpanEnd(childBuffer._traceRoot, childBuffer, ENTRY_TYPE_SPAN_EXCEPTION);
       const errorMessage = error instanceof Error ? error.message : String(error);
       const errorStack = error instanceof Error ? error.stack : undefined;
       childBuffer.message(1, errorMessage);
