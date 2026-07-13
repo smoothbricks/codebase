@@ -201,7 +201,6 @@ pub extern "C" fn get_freelist_merge_count(sc: u8, capacity: u32) -> u32 {
     with_mem(|m| raw::freelist_merge_count(m, size_class(sc), capacity))
 }
 
-
 // =============================================================================
 // Thread id
 // =============================================================================
@@ -281,7 +280,6 @@ pub extern "C" fn alloc_exact(byte_len: u32, alignment: u32) -> u32 {
 pub extern "C" fn free_exact(offset: u32, byte_len: u32, alignment: u32) {
     with_mem(|m| raw::free_exact(m, offset, byte_len, alignment));
 }
-
 
 // =============================================================================
 // TraceRoot + span lifecycle + column IO
