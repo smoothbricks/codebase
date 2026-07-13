@@ -1,8 +1,9 @@
 use super::dto::{
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult,
-    CreateOptions, EmptyResult, ExecRequest, GcOptions, GcReport, GitOid, GrantDelta, GrantSet,
-    JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo, PushOptions, PushReport,
-    RebaseOptions, RemoveOptions, RevisionResult, RunSandboxMode, StdinSource, WorkspaceInfo,
+    CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GitOid, GrantDelta,
+    GrantSet, JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo, PushOptions,
+    PushReport, RebaseOptions, RemoveOptions, RevisionResult, RunSandboxMode, StdinSource,
+    WorkspaceIncarnation, WorkspaceInfo,
 };
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::WorkspaceName;
@@ -35,6 +36,23 @@ pub(crate) struct BinaryDownload {
     eof: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct WorkspaceAuthority {
+    repo_id: RepoId,
+    workspace: WorkspaceName,
+    workspace_incarnation: WorkspaceIncarnation,
+}
+
+impl WorkspaceAuthority {
+    fn from_info(info: &WorkspaceInfo) -> Self {
+        Self {
+            repo_id: info.repo_id.clone(),
+            workspace: info.workspace.clone(),
+            workspace_incarnation: info.workspace_incarnation.clone(),
+        }
+    }
+}
+
 #[async_trait]
 pub(crate) trait ControllerRuntime: Send + Sync {
     async fn call(&self, method: &'static str, params: Value) -> Result<Value>;
@@ -45,16 +63,21 @@ pub(crate) trait ControllerRuntime: Send + Sync {
         params: Value,
         expected_offset: u64,
     ) -> Result<BinaryDownload>;
-    async fn exec(&self, workspace: &WorkspaceName, request: ExecRequest) -> Result<JobId>;
+    async fn exec(
+        &self,
+        authority: &WorkspaceAuthority,
+        session: Option<&str>,
+        request: ExecRequest,
+    ) -> Result<JobId>;
     async fn logs(
         &self,
-        workspace: &WorkspaceName,
+        authority: Arc<WorkspaceAuthority>,
         id: JobId,
         stream: JobStream,
         follow: bool,
     ) -> Result<RawByteStream>;
-    async fn attach(&self, workspace: &WorkspaceName, id: JobId) -> Result<JobAttachment>;
-    async fn kill(&self, workspace: &WorkspaceName, id: JobId) -> Result<()>;
+    async fn attach(&self, authority: Arc<WorkspaceAuthority>, id: JobId) -> Result<JobAttachment>;
+    async fn kill(&self, authority: &WorkspaceAuthority, id: JobId) -> Result<()>;
 }
 
 #[cfg(unix)]
@@ -172,7 +195,12 @@ impl ControllerRuntime for ActorRuntime {
         }
     }
 
-    async fn exec(&self, workspace: &WorkspaceName, request: ExecRequest) -> Result<JobId> {
+    async fn exec(
+        &self,
+        authority: &WorkspaceAuthority,
+        session: Option<&str>,
+        request: ExecRequest,
+    ) -> Result<JobId> {
         let ExecRequest {
             argv,
             cwd,
@@ -198,7 +226,10 @@ impl ControllerRuntime for ActorRuntime {
             StdinSource::Stream(stream) => (json!({ "kind": "stream" }), None, Some(stream)),
         };
         let params = json!({
-            "workspace": workspace,
+            "repoId": authority.repo_id,
+            "workspace": authority.workspace,
+            "workspaceIncarnation": authority.workspace_incarnation,
+            "session": session,
             "argv": argv,
             "cwd": cwd,
             "mode": mode,
@@ -235,7 +266,9 @@ impl ControllerRuntime for ActorRuntime {
                 self.upload(
                     "worker.stdinChunk",
                     json!({
-                        "workspace": workspace,
+                        "repoId": authority.repo_id,
+                        "workspace": authority.workspace,
+                        "workspaceIncarnation": authority.workspace_incarnation,
                         "jobId": job_id,
                     }),
                     Bytes::copy_from_slice(&buffer[..count]),
@@ -245,7 +278,12 @@ impl ControllerRuntime for ActorRuntime {
             }
             self.call(
                 "worker.stdinClose",
-                json!({ "workspace": workspace, "jobId": job_id }),
+                json!({
+                    "repoId": authority.repo_id,
+                    "workspace": authority.workspace,
+                    "workspaceIncarnation": authority.workspace_incarnation,
+                    "jobId": job_id,
+                }),
             )
             .await
             .and_then(decode_empty)?;
@@ -255,29 +293,33 @@ impl ControllerRuntime for ActorRuntime {
 
     async fn logs(
         &self,
-        workspace: &WorkspaceName,
+        authority: Arc<WorkspaceAuthority>,
         id: JobId,
         stream: JobStream,
         follow: bool,
     ) -> Result<RawByteStream> {
         Ok(poll_job_stream(
             Arc::new(self.clone()),
-            workspace.clone(),
+            authority,
             id,
             stream,
             follow,
         ))
     }
 
-    async fn attach(&self, workspace: &WorkspaceName, id: JobId) -> Result<JobAttachment> {
-        let stdout = self.logs(workspace, id, JobStream::Stdout, true).await?;
-        let stderr = self.logs(workspace, id, JobStream::Stderr, true).await?;
+    async fn attach(&self, authority: Arc<WorkspaceAuthority>, id: JobId) -> Result<JobAttachment> {
+        let stdout = self
+            .logs(Arc::clone(&authority), id, JobStream::Stdout, true)
+            .await?;
+        let stderr = self
+            .logs(Arc::clone(&authority), id, JobStream::Stderr, true)
+            .await?;
         let runtime: Arc<dyn ControllerRuntime> = Arc::new(self.clone());
         Ok(JobAttachment {
-            workspace: workspace.clone(),
+            authority: Arc::clone(&authority),
             id,
             stdin: JobStdin {
-                workspace: workspace.clone(),
+                authority,
                 id,
                 runtime: Arc::clone(&runtime),
             },
@@ -287,10 +329,18 @@ impl ControllerRuntime for ActorRuntime {
         })
     }
 
-    async fn kill(&self, workspace: &WorkspaceName, id: JobId) -> Result<()> {
-        self.call("job.kill", json!({ "workspace": workspace, "jobId": id }))
-            .await
-            .and_then(decode_empty)
+    async fn kill(&self, authority: &WorkspaceAuthority, id: JobId) -> Result<()> {
+        self.call(
+            "job.kill",
+            json!({
+                "repoId": authority.repo_id,
+                "workspace": authority.workspace,
+                "workspaceIncarnation": authority.workspace_incarnation,
+                "jobId": id,
+            }),
+        )
+        .await
+        .and_then(decode_empty)
     }
 }
 
@@ -314,7 +364,7 @@ fn actor_reply_error() -> CowshedError {
 
 fn poll_job_stream(
     runtime: Arc<dyn ControllerRuntime>,
-    workspace: WorkspaceName,
+    authority: Arc<WorkspaceAuthority>,
     id: JobId,
     stream: JobStream,
     follow: bool,
@@ -328,7 +378,9 @@ fn poll_job_stream(
                 value = runtime.download(
                     "job.logs",
                     json!({
-                        "workspace": workspace,
+                        "repoId": authority.repo_id,
+                        "workspace": authority.workspace,
+                        "workspaceIncarnation": authority.workspace_incarnation,
                         "jobId": id,
                         "stream": stream,
                         "follow": follow,
@@ -378,7 +430,12 @@ fn poll_job_stream(
                     _ = sender.closed() => break,
                     value = runtime.call(
                         "job.status",
-                        json!({ "workspace": workspace, "jobId": id }),
+                        json!({
+                            "repoId": authority.repo_id,
+                            "workspace": authority.workspace,
+                            "workspaceIncarnation": authority.workspace_incarnation,
+                            "jobId": id,
+                        }),
                     ) => value.and_then(|value| {
                         serde_json::from_value(value).map_err(|error| {
                             CowshedError::internal(format!(
@@ -457,7 +514,7 @@ impl RawByteStream {
 }
 
 pub struct JobStdin {
-    workspace: WorkspaceName,
+    authority: Arc<WorkspaceAuthority>,
     id: JobId,
     runtime: Arc<dyn ControllerRuntime>,
 }
@@ -468,7 +525,9 @@ impl JobStdin {
             .upload(
                 "job.attachWrite",
                 json!({
-                    "workspace": self.workspace,
+                    "repoId": self.authority.repo_id,
+                    "workspace": self.authority.workspace,
+                    "workspaceIncarnation": self.authority.workspace_incarnation,
                     "jobId": self.id,
                 }),
                 bytes,
@@ -482,14 +541,14 @@ impl fmt::Debug for JobStdin {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("JobStdin")
-            .field("workspace", &self.workspace)
+            .field("authority", &self.authority)
             .field("id", &self.id)
             .finish_non_exhaustive()
     }
 }
 
 pub struct JobAttachment {
-    workspace: WorkspaceName,
+    authority: Arc<WorkspaceAuthority>,
     id: JobId,
     stdin: JobStdin,
     stdout: RawByteStream,
@@ -507,7 +566,12 @@ impl JobAttachment {
             .runtime
             .call(
                 "job.detach",
-                json!({ "workspace": self.workspace, "jobId": self.id }),
+                json!({
+                    "repoId": self.authority.repo_id,
+                    "workspace": self.authority.workspace,
+                    "workspaceIncarnation": self.authority.workspace_incarnation,
+                    "jobId": self.id,
+                }),
             )
             .await?;
         decode_empty(value)
@@ -518,7 +582,7 @@ impl fmt::Debug for JobAttachment {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("JobAttachment")
-            .field("workspace", &self.workspace)
+            .field("authority", &self.authority)
             .field("id", &self.id)
             .finish_non_exhaustive()
     }
@@ -706,7 +770,30 @@ impl WorkspaceRef {
         &self.info.mount
     }
 
-    pub async fn info(&self) -> Result<WorkspaceInfo> {
+    /// Returns the immutable information captured by the RPC that created this reference.
+    pub fn info(&self) -> &WorkspaceInfo {
+        &self.info
+    }
+
+    /// Returns the immutable grants captured by the RPC that created this reference.
+    pub fn grants(&self) -> &GrantSet {
+        &self.grants
+    }
+
+    pub fn snapshot(&self) -> (&WorkspaceInfo, &GrantSet) {
+        (&self.info, &self.grants)
+    }
+
+    pub fn into_info(self) -> WorkspaceInfo {
+        self.info
+    }
+
+    pub fn into_snapshot(self) -> (WorkspaceInfo, GrantSet) {
+        (self.info, self.grants)
+    }
+
+    /// Refreshes workspace information from the controller without changing this snapshot.
+    pub async fn refresh_info(&self) -> Result<WorkspaceInfo> {
         call_typed(
             &self.runtime,
             "workspace.info",
@@ -734,7 +821,8 @@ impl WorkspaceRef {
         Ok(())
     }
 
-    pub async fn grants(&self) -> Result<GrantSet> {
+    /// Refreshes grants from the controller without changing this snapshot.
+    pub async fn refresh_grants(&self) -> Result<GrantSet> {
         call_typed(
             &self.runtime,
             "workspace.grants",
@@ -1393,6 +1481,15 @@ impl Coordinator {
         .await
     }
 
+    pub async fn doctor(&self) -> Result<DoctorReport> {
+        call_typed(
+            &self.runtime,
+            "coordinator.doctor",
+            json!({ "repoId": self.project.repo_id }),
+        )
+        .await
+    }
+
     pub async fn worker(&self, workspace: &str) -> Result<WorkspaceHandle> {
         let wire: WorkspaceWire = call_typed(
             &self.runtime,
@@ -1400,10 +1497,8 @@ impl Coordinator {
             json!({ "repoId": self.project.repo_id, "workspace": workspace }),
         )
         .await?;
-        Ok(WorkspaceHandle {
-            workspace: WorkspaceRef::from_wire(wire, Arc::clone(&self.runtime)),
-            runtime: Arc::clone(&self.runtime),
-        })
+        let workspace = WorkspaceRef::from_wire(wire, Arc::clone(&self.runtime));
+        Ok(WorkspaceHandle::new(workspace, Arc::clone(&self.runtime)))
     }
 
     async fn empty_call(&self, method: &'static str, params: Value) -> Result<()> {
@@ -1424,12 +1519,22 @@ impl fmt::Debug for Coordinator {
 /// Non-escalating capability for exactly one workspace.
 pub struct WorkspaceHandle {
     workspace: WorkspaceRef,
+    authority: Arc<WorkspaceAuthority>,
     runtime: Arc<dyn ControllerRuntime>,
 }
 
 impl WorkspaceHandle {
+    fn new(workspace: WorkspaceRef, runtime: Arc<dyn ControllerRuntime>) -> Self {
+        let authority = Arc::new(WorkspaceAuthority::from_info(workspace.info()));
+        Self {
+            workspace,
+            authority,
+            runtime,
+        }
+    }
+
     pub fn name(&self) -> &WorkspaceName {
-        self.workspace.name()
+        &self.authority.workspace
     }
 
     pub fn mount_path(&self) -> &Path {
@@ -1437,23 +1542,23 @@ impl WorkspaceHandle {
     }
 
     pub async fn exec(&self, request: ExecRequest) -> Result<JobHandle> {
-        let id = self.runtime.exec(self.name(), request).await?;
-        Ok(JobHandle {
-            workspace: self.name().clone(),
-            id,
-            runtime: Arc::clone(&self.runtime),
-        })
+        exec_job(&self.runtime, Arc::clone(&self.authority), None, request).await
     }
 
     pub async fn shell(&self, session: Option<&str>) -> Result<Session> {
         let _: EmptyResult = call_typed(
             &self.runtime,
             "worker.shell",
-            json!({ "workspace": self.name(), "session": session }),
+            json!({
+                "repoId": self.authority.repo_id,
+                "workspace": self.authority.workspace,
+                "workspaceIncarnation": self.authority.workspace_incarnation,
+                "session": session,
+            }),
         )
         .await?;
         Ok(Session {
-            workspace: self.name().clone(),
+            authority: Arc::clone(&self.authority),
             name: session.map(str::to_owned),
             runtime: Arc::clone(&self.runtime),
         })
@@ -1463,7 +1568,11 @@ impl WorkspaceHandle {
         call_typed(
             &self.runtime,
             "worker.listJobs",
-            json!({ "workspace": self.name() }),
+            json!({
+                "repoId": self.authority.repo_id,
+                "workspace": self.authority.workspace,
+                "workspaceIncarnation": self.authority.workspace_incarnation,
+            }),
         )
         .await
     }
@@ -1472,11 +1581,16 @@ impl WorkspaceHandle {
         let _: JobInfo = call_typed(
             &self.runtime,
             "worker.job",
-            json!({ "workspace": self.name(), "jobId": id }),
+            json!({
+                "repoId": self.authority.repo_id,
+                "workspace": self.authority.workspace,
+                "workspaceIncarnation": self.authority.workspace_incarnation,
+                "jobId": id,
+            }),
         )
         .await?;
         Ok(JobHandle {
-            workspace: self.name().clone(),
+            authority: Arc::clone(&self.authority),
             id,
             runtime: Arc::clone(&self.runtime),
         })
@@ -1486,7 +1600,12 @@ impl WorkspaceHandle {
         let result: CheckpointResult = call_typed(
             &self.runtime,
             "worker.checkpoint",
-            json!({ "workspace": self.name(), "options": options }),
+            json!({
+                "repoId": self.authority.repo_id,
+                "workspace": self.authority.workspace,
+                "workspaceIncarnation": self.authority.workspace_incarnation,
+                "options": options,
+            }),
         )
         .await?;
         Ok(result.label)
@@ -1496,14 +1615,42 @@ impl WorkspaceHandle {
         call_typed(
             &self.runtime,
             "worker.push",
-            json!({ "workspace": self.name(), "options": options }),
+            json!({
+                "repoId": self.authority.repo_id,
+                "workspace": self.authority.workspace,
+                "workspaceIncarnation": self.authority.workspace_incarnation,
+                "options": options,
+            }),
         )
         .await
     }
 
     pub async fn grants(&self) -> Result<GrantSet> {
-        self.workspace.grants().await
+        call_typed(
+            &self.runtime,
+            "workspace.grants",
+            json!({
+                "repoId": self.authority.repo_id,
+                "workspace": self.authority.workspace,
+                "workspaceIncarnation": self.authority.workspace_incarnation,
+            }),
+        )
+        .await
     }
+}
+
+async fn exec_job(
+    runtime: &Arc<dyn ControllerRuntime>,
+    authority: Arc<WorkspaceAuthority>,
+    session: Option<&str>,
+    request: ExecRequest,
+) -> Result<JobHandle> {
+    let id = runtime.exec(&authority, session, request).await?;
+    Ok(JobHandle {
+        authority,
+        id,
+        runtime: Arc::clone(runtime),
+    })
 }
 
 impl fmt::Debug for WorkspaceHandle {
@@ -1516,7 +1663,7 @@ impl fmt::Debug for WorkspaceHandle {
 }
 
 pub struct JobHandle {
-    workspace: WorkspaceName,
+    authority: Arc<WorkspaceAuthority>,
     id: JobId,
     runtime: Arc<dyn ControllerRuntime>,
 }
@@ -1530,19 +1677,26 @@ impl JobHandle {
         call_typed(
             &self.runtime,
             "job.status",
-            json!({ "workspace": self.workspace, "jobId": self.id }),
+            json!({
+                "repoId": self.authority.repo_id,
+                "workspace": self.authority.workspace,
+                "workspaceIncarnation": self.authority.workspace_incarnation,
+                "jobId": self.id,
+            }),
         )
         .await
     }
 
     pub async fn logs(&self, stream: JobStream, follow: bool) -> Result<RawByteStream> {
         self.runtime
-            .logs(&self.workspace, self.id, stream, follow)
+            .logs(Arc::clone(&self.authority), self.id, stream, follow)
             .await
     }
 
     pub async fn attach(&self) -> Result<JobAttachment> {
-        self.runtime.attach(&self.workspace, self.id).await
+        self.runtime
+            .attach(Arc::clone(&self.authority), self.id)
+            .await
     }
 
     pub async fn detach(&self) -> Result<()> {
@@ -1553,20 +1707,30 @@ impl JobHandle {
         call_typed(
             &self.runtime,
             "job.wait",
-            json!({ "workspace": self.workspace, "jobId": self.id }),
+            json!({
+                "repoId": self.authority.repo_id,
+                "workspace": self.authority.workspace,
+                "workspaceIncarnation": self.authority.workspace_incarnation,
+                "jobId": self.id,
+            }),
         )
         .await
     }
 
     pub async fn kill(&self) -> Result<()> {
-        self.runtime.kill(&self.workspace, self.id).await
+        self.runtime.kill(&self.authority, self.id).await
     }
 
     async fn empty_call(&self, method: &'static str) -> Result<()> {
         let _: EmptyResult = call_typed(
             &self.runtime,
             method,
-            json!({ "workspace": self.workspace, "jobId": self.id }),
+            json!({
+                "repoId": self.authority.repo_id,
+                "workspace": self.authority.workspace,
+                "workspaceIncarnation": self.authority.workspace_incarnation,
+                "jobId": self.id,
+            }),
         )
         .await?;
         Ok(())
@@ -1577,26 +1741,27 @@ impl fmt::Debug for JobHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("JobHandle")
-            .field("workspace", &self.workspace)
+            .field("authority", &self.authority)
             .field("id", &self.id)
             .finish_non_exhaustive()
     }
 }
 
 pub struct Session {
-    workspace: WorkspaceName,
+    authority: Arc<WorkspaceAuthority>,
     name: Option<String>,
     runtime: Arc<dyn ControllerRuntime>,
 }
 
 impl Session {
     pub async fn run(&self, request: ExecRequest) -> Result<JobHandle> {
-        let id = self.runtime.exec(&self.workspace, request).await?;
-        Ok(JobHandle {
-            workspace: self.workspace.clone(),
-            id,
-            runtime: Arc::clone(&self.runtime),
-        })
+        exec_job(
+            &self.runtime,
+            Arc::clone(&self.authority),
+            self.name.as_deref(),
+            request,
+        )
+        .await
     }
 
     pub async fn background(&self, request: ExecRequest) -> Result<JobHandle> {
@@ -1611,7 +1776,12 @@ impl Session {
         let _: EmptyResult = call_typed(
             &self.runtime,
             "session.close",
-            json!({ "workspace": self.workspace, "session": self.name }),
+            json!({
+                "repoId": self.authority.repo_id,
+                "workspace": self.authority.workspace,
+                "workspaceIncarnation": self.authority.workspace_incarnation,
+                "session": self.name,
+            }),
         )
         .await?;
         Ok(())
@@ -1622,7 +1792,7 @@ impl fmt::Debug for Session {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Session")
-            .field("workspace", &self.workspace)
+            .field("authority", &self.authority)
             .field("name", &self.name)
             .finish_non_exhaustive()
     }
@@ -1642,6 +1812,7 @@ mod tests {
         status_calls: AtomicUsize,
         stdin_writes: AtomicUsize,
         active_calls: AtomicUsize,
+        rpc_calls: AtomicUsize,
     }
 
     struct ActiveCall<'a>(&'a AtomicUsize);
@@ -1655,6 +1826,7 @@ mod tests {
     #[async_trait]
     impl ControllerRuntime for TestRuntime {
         async fn call(&self, method: &'static str, _params: Value) -> Result<Value> {
+            self.rpc_calls.fetch_add(1, Ordering::SeqCst);
             match method {
                 "job.status" => {
                     let call = self.status_calls.fetch_add(1, Ordering::SeqCst);
@@ -1727,13 +1899,18 @@ mod tests {
             }
         }
 
-        async fn exec(&self, _workspace: &WorkspaceName, _request: ExecRequest) -> Result<JobId> {
+        async fn exec(
+            &self,
+            _authority: &WorkspaceAuthority,
+            _session: Option<&str>,
+            _request: ExecRequest,
+        ) -> Result<JobId> {
             Err(CowshedError::internal("unexpected test exec"))
         }
 
         async fn logs(
             &self,
-            _workspace: &WorkspaceName,
+            _authority: Arc<WorkspaceAuthority>,
             _id: JobId,
             _stream: JobStream,
             _follow: bool,
@@ -1741,11 +1918,15 @@ mod tests {
             Err(CowshedError::internal("unexpected test logs"))
         }
 
-        async fn attach(&self, _workspace: &WorkspaceName, _id: JobId) -> Result<JobAttachment> {
+        async fn attach(
+            &self,
+            _authority: Arc<WorkspaceAuthority>,
+            _id: JobId,
+        ) -> Result<JobAttachment> {
             Err(CowshedError::internal("unexpected test attach"))
         }
 
-        async fn kill(&self, _workspace: &WorkspaceName, _id: JobId) -> Result<()> {
+        async fn kill(&self, _authority: &WorkspaceAuthority, _id: JobId) -> Result<()> {
             Err(CowshedError::internal("test controller rejected kill"))
         }
     }
@@ -1888,31 +2069,85 @@ mod tests {
             stderr_copy: None,
         }
     }
-    fn workspace_handle(runtime: Arc<dyn ControllerRuntime>) -> WorkspaceHandle {
-        WorkspaceHandle {
-            workspace: WorkspaceRef {
-                info: WorkspaceInfo {
-                    repo_id: RepoId::parse("acme/widget").unwrap(),
-                    workspace: WorkspaceName::new("raven").unwrap(),
-                    workspace_incarnation: crate::metadata::WorkspaceIncarnation::new(
-                        "0198f2c0b7e34dc795f17b238b331c80",
-                    )
-                    .unwrap(),
-                    role: crate::metadata::WorkspaceRole::Workspace,
-                    image_format: crate::metadata::ImageFormat::Asif,
-                    mount: PathBuf::from("/mnt/raven"),
-                    state: super::super::dto::WorkspaceState::Detached,
-                    branch: None,
-                    base_commit: None,
-                    created_at: None,
-                    checkpoints: Vec::new(),
-                    snapshot_stale: false,
-                },
-                grants: GrantSet::default(),
-                runtime: Arc::clone(&runtime),
+    fn workspace_ref(runtime: Arc<dyn ControllerRuntime>) -> WorkspaceRef {
+        WorkspaceRef {
+            info: WorkspaceInfo {
+                repo_id: RepoId::parse("acme/widget").unwrap(),
+                workspace: WorkspaceName::new("raven").unwrap(),
+                workspace_incarnation: WorkspaceIncarnation::new(
+                    "0198f2c0b7e34dc795f17b238b331c80",
+                )
+                .unwrap(),
+                role: crate::metadata::WorkspaceRole::Workspace,
+                image_format: crate::metadata::ImageFormat::Asif,
+                mount: PathBuf::from("/mnt/raven"),
+                state: super::super::dto::WorkspaceState::Detached,
+                branch: None,
+                base_commit: None,
+                created_at: None,
+                checkpoints: Vec::new(),
+                snapshot_stale: false,
             },
+            grants: GrantSet::default(),
             runtime,
         }
+    }
+
+    fn workspace_handle(runtime: Arc<dyn ControllerRuntime>) -> WorkspaceHandle {
+        WorkspaceHandle::new(workspace_ref(Arc::clone(&runtime)), runtime)
+    }
+
+    fn test_authority() -> Arc<WorkspaceAuthority> {
+        Arc::new(WorkspaceAuthority {
+            repo_id: RepoId::parse("acme/widget").unwrap(),
+            workspace: WorkspaceName::new("raven").unwrap(),
+            workspace_incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
+                .unwrap(),
+        })
+    }
+    #[cfg(unix)]
+    fn coordinator(runtime: Arc<dyn ControllerRuntime>) -> Coordinator {
+        let repo_id = RepoId::parse("acme/widget").unwrap();
+        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+            repo_id: repo_id.clone(),
+            remote_name: None,
+            remote_url: None,
+            primary: true,
+        }])
+        .unwrap();
+        let project = Project {
+            repo_id: repo_id.clone(),
+            binding,
+            git_root: PathBuf::from("/repo"),
+            paths: ProjectPaths::new("/tmp/cowshed-capability-tests", &repo_id).unwrap(),
+            runtime: Arc::clone(&runtime),
+        };
+        Coordinator {
+            project,
+            runtime: Arc::clone(&runtime),
+            _channel: AuthenticatedControllerChannel { runtime },
+        }
+    }
+
+    #[test]
+    fn workspace_snapshot_accessors_do_not_call_the_controller_or_copy_on_consumption() {
+        let runtime = Arc::new(TestRuntime::default());
+        let runtime_trait: Arc<dyn ControllerRuntime> = runtime.clone();
+        let workspace = workspace_ref(runtime_trait);
+        let (info, grants) = workspace.snapshot();
+        assert!(std::ptr::eq(info, workspace.info()));
+        assert!(std::ptr::eq(grants, workspace.grants()));
+        assert_eq!(info.workspace.as_str(), "raven");
+
+        let (info, grants) = workspace.into_snapshot();
+        assert_eq!(info.workspace.as_str(), "raven");
+        assert_eq!(grants, GrantSet::default());
+        let runtime_trait: Arc<dyn ControllerRuntime> = runtime.clone();
+        assert_eq!(
+            workspace_ref(runtime_trait).into_info().workspace.as_str(),
+            "raven"
+        );
+        assert_eq!(runtime.rpc_calls.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(unix)]
@@ -1926,8 +2161,10 @@ mod tests {
             assert_eq!(
                 request["params"],
                 json!({
+                    "repoId": "acme/widget",
                     "workspace": "raven",
-                    "options": {"label": "before-write", "keep": true}
+                    "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                    "options": {"label": "before-write", "keep": true},
                 })
             );
             write_rpc_success(
@@ -1947,6 +2184,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(label, "before-write");
+        server_task.await.unwrap();
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_handle_keeps_the_original_incarnation_after_snapshot_mutation() {
+        let (runtime, mut server) = actor_pair();
+        let mut handle = workspace_handle(runtime);
+        handle.workspace.info.workspace_incarnation =
+            WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let server_task = tokio::spawn(async move {
+            let (_, request) = read_rpc_request(&mut server).await;
+            assert_eq!(request["method"], "worker.listJobs");
+            assert_eq!(
+                request["params"],
+                json!({
+                    "repoId": "acme/widget",
+                    "workspace": "raven",
+                    "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                })
+            );
+            write_rpc_success(
+                &mut server,
+                request["id"].as_u64().unwrap(),
+                json!([]),
+                None,
+            )
+            .await;
+        });
+
+        assert!(handle.list_jobs().await.unwrap().is_empty());
+        server_task.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn coordinator_doctor_uses_the_exact_owned_capability_method() {
+        let (runtime, mut server) = actor_pair();
+        let coordinator = coordinator(runtime);
+        let server_task = tokio::spawn(async move {
+            let (_, request) = read_rpc_request(&mut server).await;
+            assert_eq!(request["method"], "coordinator.doctor");
+            assert_eq!(request["params"], json!({"repoId": "acme/widget"}));
+            write_rpc_success(
+                &mut server,
+                request["id"].as_u64().unwrap(),
+                json!({"healthy": true, "findings": []}),
+                None,
+            )
+            .await;
+        });
+
+        assert_eq!(
+            coordinator.doctor().await.unwrap(),
+            DoctorReport {
+                healthy: true,
+                findings: Vec::new(),
+            }
+        );
         server_task.await.unwrap();
     }
 
@@ -1999,8 +2294,23 @@ mod tests {
             let (header, request) = read_rpc_request(&mut server).await;
             assert_eq!(request["method"], "worker.exec");
             assert_eq!(request["binaryLength"], expected.len());
-            assert_eq!(request["params"]["stdin"], json!({"kind": "inline"}));
-            assert!(request["params"]["stdin"].get("bytes").is_none());
+            assert_eq!(
+                request["params"],
+                json!({
+                    "repoId": "acme/widget",
+                    "workspace": "raven",
+                    "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                    "session": null,
+                    "argv": ["cat"],
+                    "cwd": null,
+                    "mode": "readWrite",
+                    "env": {},
+                    "trace": null,
+                    "stdin": {"kind": "inline"},
+                    "stdoutCopy": null,
+                    "stderrCopy": null,
+                })
+            );
             assert!(!header.contains(&0));
             assert!(!header.contains(&0xff));
             let frame = read_binary_frame(&mut server, expected.len())
@@ -2010,14 +2320,95 @@ mod tests {
             write_rpc_success(&mut server, request["id"].as_u64().unwrap(), json!(7), None).await;
         });
 
-        let id = runtime
-            .exec(
-                &WorkspaceName::new("raven").unwrap(),
-                exec_request(StdinSource::Inline(payload)),
-            )
+        let handle = workspace_handle(runtime);
+        let job = handle
+            .exec(exec_request(StdinSource::Inline(payload)))
             .await
             .unwrap();
-        assert_eq!(id, JobId::new(7).unwrap());
+        assert_eq!(job.id(), JobId::new(7).unwrap());
+        server_task.await.unwrap();
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn named_session_run_and_background_preserve_exact_session_identity() {
+        let (runtime, mut server) = actor_pair();
+        let server_task = tokio::spawn(async move {
+            let (_, shell) = read_rpc_request(&mut server).await;
+            assert_eq!(shell["method"], "worker.shell");
+            assert_eq!(
+                shell["params"],
+                json!({
+                    "repoId": "acme/widget",
+                    "workspace": "raven",
+                    "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                    "session": "build-7",
+                })
+            );
+            write_rpc_success(&mut server, shell["id"].as_u64().unwrap(), json!({}), None).await;
+
+            for job_id in [7_u64, 8] {
+                let (_, exec) = read_rpc_request(&mut server).await;
+                assert_eq!(exec["method"], "worker.exec");
+                assert_eq!(
+                    exec["params"],
+                    json!({
+                        "repoId": "acme/widget",
+                        "workspace": "raven",
+                        "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                        "session": "build-7",
+                        "argv": ["cat"],
+                        "cwd": null,
+                        "mode": "readWrite",
+                        "env": {},
+                        "trace": null,
+                        "stdin": {"kind": "empty"},
+                        "stdoutCopy": null,
+                        "stderrCopy": null,
+                    })
+                );
+                write_rpc_success(
+                    &mut server,
+                    exec["id"].as_u64().unwrap(),
+                    json!(job_id),
+                    None,
+                )
+                .await;
+            }
+
+            let (_, close) = read_rpc_request(&mut server).await;
+            assert_eq!(close["method"], "session.close");
+            assert_eq!(
+                close["params"],
+                json!({
+                    "repoId": "acme/widget",
+                    "workspace": "raven",
+                    "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                    "session": "build-7",
+                })
+            );
+            write_rpc_success(&mut server, close["id"].as_u64().unwrap(), json!({}), None).await;
+        });
+
+        let handle = workspace_handle(runtime);
+        let session = handle.shell(Some("build-7")).await.unwrap();
+        assert!(session.is_named());
+        assert_eq!(
+            session
+                .run(exec_request(StdinSource::Empty))
+                .await
+                .unwrap()
+                .id(),
+            JobId::new(7).unwrap()
+        );
+        assert_eq!(
+            session
+                .background(exec_request(StdinSource::Empty))
+                .await
+                .unwrap()
+                .id(),
+            JobId::new(8).unwrap()
+        );
+        session.close().await.unwrap();
         server_task.await.unwrap();
     }
 
@@ -2031,13 +2422,38 @@ mod tests {
             let (_, exec) = read_rpc_request(&mut server).await;
             assert_eq!(exec["method"], "worker.exec");
             assert!(exec.get("binaryLength").is_none());
-            assert_eq!(exec["params"]["stdin"], json!({"kind": "stream"}));
+            assert_eq!(
+                exec["params"],
+                json!({
+                    "repoId": "acme/widget",
+                    "workspace": "raven",
+                    "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                    "session": null,
+                    "argv": ["cat"],
+                    "cwd": null,
+                    "mode": "readWrite",
+                    "env": {},
+                    "trace": null,
+                    "stdin": {"kind": "stream"},
+                    "stdoutCopy": null,
+                    "stderrCopy": null,
+                })
+            );
             write_rpc_success(&mut server, exec["id"].as_u64().unwrap(), json!(7), None).await;
 
             let (chunk_header, chunk) = read_rpc_request(&mut server).await;
             assert_eq!(chunk["method"], "worker.stdinChunk");
             assert_eq!(chunk["binaryLength"], expected.len());
             assert!(chunk["params"].get("bytes").is_none());
+            assert_eq!(
+                chunk["params"],
+                json!({
+                    "repoId": "acme/widget",
+                    "workspace": "raven",
+                    "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                    "jobId": 7,
+                })
+            );
             assert!(!chunk_header.contains(&0));
             assert!(!chunk_header.contains(&0xff));
             let frame = read_binary_frame(&mut server, expected.len())
@@ -2049,12 +2465,23 @@ mod tests {
             let (_, close) = read_rpc_request(&mut server).await;
             assert_eq!(close["method"], "worker.stdinClose");
             assert!(close.get("binaryLength").is_none());
+            assert_eq!(
+                close["params"],
+                json!({
+                    "repoId": "acme/widget",
+                    "workspace": "raven",
+                    "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                    "jobId": 7,
+                })
+            );
             write_rpc_success(&mut server, close["id"].as_u64().unwrap(), json!({}), None).await;
         });
 
+        let authority = test_authority();
         let id = runtime
             .exec(
-                &WorkspaceName::new("raven").unwrap(),
+                &authority,
+                None,
                 exec_request(StdinSource::Stream(Box::pin(std::io::Cursor::new(payload)))),
             )
             .await
@@ -2074,6 +2501,15 @@ mod tests {
             assert_eq!(request["method"], "job.attachWrite");
             assert_eq!(request["binaryLength"], expected.len());
             assert!(request["params"].get("bytes").is_none());
+            assert_eq!(
+                request["params"],
+                json!({
+                    "repoId": "acme/widget",
+                    "workspace": "raven",
+                    "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                    "jobId": 7,
+                })
+            );
             assert!(!header.contains(&0));
             assert!(!header.contains(&0xff));
             let frame = read_binary_frame(&mut server, expected.len())
@@ -2089,7 +2525,7 @@ mod tests {
             .await;
         });
         let stdin = JobStdin {
-            workspace: WorkspaceName::new("raven").unwrap(),
+            authority: test_authority(),
             id: JobId::new(7).unwrap(),
             runtime,
         };
@@ -2097,32 +2533,81 @@ mod tests {
         stdin.write(payload).await.unwrap();
         server_task.await.unwrap();
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_status_uses_the_handle_repo_workspace_and_incarnation() {
+        let (runtime, mut server) = actor_pair();
+        let handle = JobHandle {
+            authority: test_authority(),
+            id: JobId::new(7).unwrap(),
+            runtime,
+        };
+        let server_task = tokio::spawn(async move {
+            let (_, request) = read_rpc_request(&mut server).await;
+            assert_eq!(request["method"], "job.status");
+            assert_eq!(
+                request["params"],
+                json!({
+                    "repoId": "acme/widget",
+                    "workspace": "raven",
+                    "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                    "jobId": 7,
+                })
+            );
+            write_rpc_success(
+                &mut server,
+                request["id"].as_u64().unwrap(),
+                terminal_job_value(),
+                None,
+            )
+            .await;
+        });
+
+        assert_eq!(
+            handle.status().await.unwrap().job_id,
+            JobId::new(7).unwrap()
+        );
+        server_task.await.unwrap();
+    }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn stdout_and_stderr_downloads_remain_separate_raw_streams() {
         let (runtime, mut server) = actor_pair();
-        let workspace = WorkspaceName::new("raven").unwrap();
+        let authority = test_authority();
         let id = JobId::new(7).unwrap();
         let mut stdout = poll_job_stream(
             Arc::clone(&runtime),
-            workspace.clone(),
+            Arc::clone(&authority),
             id,
             JobStream::Stdout,
             false,
         );
-        let mut stderr = poll_job_stream(runtime, workspace, id, JobStream::Stderr, false);
+        let mut stderr = poll_job_stream(runtime, authority, id, JobStream::Stderr, false);
         let server_task = tokio::spawn(async move {
             for _ in 0..2 {
                 let (_, request) = read_rpc_request(&mut server).await;
                 assert_eq!(request["method"], "job.logs");
                 assert!(request.get("binaryLength").is_none());
-                let payload: &[u8] = match request["params"]["stream"].as_str().unwrap() {
+                let stream = request["params"]["stream"].as_str().unwrap();
+                let offset = request["params"]["offset"].as_u64().unwrap();
+                assert_eq!(
+                    request["params"],
+                    json!({
+                        "repoId": "acme/widget",
+                        "workspace": "raven",
+                        "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                        "jobId": 7,
+                        "stream": stream,
+                        "follow": false,
+                        "offset": offset,
+                    })
+                );
+                let payload: &[u8] = match stream {
                     "stdout" => &[0, 0xff, b'o'],
                     "stderr" => &[0x80, 0, b'e'],
                     stream => panic!("unexpected stream {stream}"),
                 };
-                let offset = request["params"]["offset"].as_u64().unwrap();
                 write_rpc_success(
                     &mut server,
                     request["id"].as_u64().unwrap(),
@@ -2337,7 +2822,7 @@ mod tests {
         let runtime_trait: Arc<dyn ControllerRuntime> = runtime.clone();
         let mut stream = poll_job_stream(
             runtime_trait,
-            WorkspaceName::new("raven").unwrap(),
+            test_authority(),
             JobId::new(7).unwrap(),
             JobStream::Stdout,
             true,
@@ -2355,7 +2840,7 @@ mod tests {
         let runtime_trait: Arc<dyn ControllerRuntime> = runtime.clone();
         let mut stream = poll_job_stream(
             runtime_trait,
-            WorkspaceName::new("raven").unwrap(),
+            test_authority(),
             JobId::new(7).unwrap(),
             JobStream::Stdout,
             true,
@@ -2377,7 +2862,7 @@ mod tests {
         let runtime_trait: Arc<dyn ControllerRuntime> = runtime.clone();
         let mut stream = poll_job_stream(
             runtime_trait,
-            WorkspaceName::new("raven").unwrap(),
+            test_authority(),
             JobId::new(7).unwrap(),
             JobStream::Stdout,
             false,
@@ -2399,7 +2884,7 @@ mod tests {
         let runtime_trait: Arc<dyn ControllerRuntime> = runtime.clone();
         let stream = poll_job_stream(
             runtime_trait,
-            WorkspaceName::new("raven").unwrap(),
+            test_authority(),
             JobId::new(7).unwrap(),
             JobStream::Stdout,
             false,
@@ -2422,7 +2907,7 @@ mod tests {
         let runtime_trait: Arc<dyn ControllerRuntime> = runtime.clone();
         let stream = poll_job_stream(
             runtime_trait,
-            WorkspaceName::new("raven").unwrap(),
+            test_authority(),
             JobId::new(7).unwrap(),
             JobStream::Stdout,
             true,
@@ -2445,7 +2930,6 @@ mod tests {
     async fn attachment_parts_support_concurrent_stdin_stdout_and_stderr() {
         let runtime = Arc::new(TestRuntime::default());
         let runtime_trait: Arc<dyn ControllerRuntime> = runtime.clone();
-        let workspace = WorkspaceName::new("raven").unwrap();
         let id = JobId::new(7).unwrap();
         let (stdout_sender, stdout_receiver) = mpsc::channel(1);
         let (stderr_sender, stderr_receiver) = mpsc::channel(1);
@@ -2458,11 +2942,12 @@ mod tests {
             .await
             .unwrap();
         drop((stdout_sender, stderr_sender));
+        let authority = test_authority();
         let attachment = JobAttachment {
-            workspace: workspace.clone(),
+            authority: Arc::clone(&authority),
             id,
             stdin: JobStdin {
-                workspace,
+                authority,
                 id,
                 runtime: Arc::clone(&runtime_trait),
             },
@@ -2491,7 +2976,7 @@ mod tests {
     async fn kill_awaits_and_returns_the_controller_result() {
         let runtime: Arc<dyn ControllerRuntime> = Arc::new(TestRuntime::default());
         let handle = JobHandle {
-            workspace: WorkspaceName::new("raven").unwrap(),
+            authority: test_authority(),
             id: JobId::new(7).unwrap(),
             runtime,
         };
