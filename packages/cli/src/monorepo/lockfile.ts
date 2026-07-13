@@ -5,6 +5,8 @@ import { escapeRegex, getWorkspacePackages } from '../lib/workspace.js';
 
 export interface SyncBunLockfileVersionsOptions {
   log?: boolean;
+  /** `git add` bun.lock after rewriting it, for the pre-commit self-heal path. */
+  stage?: boolean;
 }
 
 // Temporary Bun workaround. Delete this sync function, validateBunLockfileVersions,
@@ -16,6 +18,12 @@ export interface SyncBunLockfileVersionsOptions {
 // - https://github.com/oven-sh/bun/issues/18906
 // - https://github.com/oven-sh/bun/issues/20477
 // - https://github.com/oven-sh/bun/issues/20829
+//
+// Any `bun install` rewrites the workspace versions from package.json, reverting
+// this sync between releases. The pre-commit hook therefore runs
+// `smoo monorepo sync-bun-lockfile-versions --stage` on every commit so drift is
+// healed at the commit that would otherwise carry it — validation must never
+// fail a committer for drift a routine `bun install` introduced.
 export function syncBunLockfileVersions(root: string, options: SyncBunLockfileVersionsOptions = {}): number {
   const log = options.log ?? true;
   const lockfilePath = join(root, 'bun.lock');
@@ -59,10 +67,15 @@ export function syncBunLockfileVersions(root: string, options: SyncBunLockfileVe
   }
   if (updated > 0) {
     writeFileSync(lockfilePath, lockfile);
+    if (options.stage) {
+      execSync('git add bun.lock', { cwd: root, stdio: ['pipe', 'pipe', 'pipe'] });
+    }
   }
-  if (log) {
+  if (log || updated > 0) {
     console.log(
-      updated > 0 ? `Updated ${updated} workspace version(s) in bun.lock` : 'All workspace versions already in sync.',
+      updated > 0
+        ? `Updated ${updated} workspace version(s) in bun.lock${options.stage ? ' (staged)' : ''}`
+        : 'All workspace versions already in sync.',
     );
   }
   return updated;

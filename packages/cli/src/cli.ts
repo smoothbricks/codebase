@@ -76,10 +76,13 @@ function buildProgram(): Command {
       const { validateCommitMessageFile } = await import('./monorepo/index.js');
       validateCommitMessageFile(commitMsgFile, options, await findRepoRoot());
     });
-  monorepo.command('sync-bun-lockfile-versions').action(async () => {
-    const { syncBunLockfileVersions } = await import('./monorepo/index.js');
-    syncBunLockfileVersions(await findRepoRoot());
-  });
+  monorepo
+    .command('sync-bun-lockfile-versions')
+    .option('--stage', 'stage bun.lock when versions were resynced (pre-commit self-heal); quiet when clean')
+    .action(async (options: { stage?: boolean }) => {
+      const { syncBunLockfileVersions } = await import('./monorepo/index.js');
+      syncBunLockfileVersions(await findRepoRoot(), options.stage ? { log: false, stage: true } : {});
+    });
   monorepo
     .command('list-release-packages')
     .option('--fail-empty', 'fail when no owned release packages are found')
