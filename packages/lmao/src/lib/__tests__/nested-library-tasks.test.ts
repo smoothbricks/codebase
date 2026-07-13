@@ -24,6 +24,7 @@ import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { TestTracer } from '../tracers/TestTracer.js';
+import { iterateSpanChildren, iterateSpanTree, NO_NODE } from '../traceTopology.js';
 import type { AnySpanBuffer } from '../types.js';
 import { createTestTracerOptions } from './test-helpers.js';
 
@@ -128,6 +129,9 @@ describe('Nested Library Tasks', () => {
       expect(level2Buffer).toBeDefined();
       expect(level3Buffer).toBeDefined();
       expect(level4Buffer).toBeDefined();
+      if (!rootBuffer || !level2Buffer || !level3Buffer || !level4Buffer) {
+        throw new Error('nested trace did not expose all buffers');
+      }
 
       // Verify parent-child relationships
       // Root has no parent
@@ -142,11 +146,11 @@ describe('Nested Library Tasks', () => {
       // Level 4's parent is level 3
       expect(level4Buffer?._parent).toBe(level3Buffer);
 
-      // Verify children array
-      expect(rootBuffer?._children).toContain(level2Buffer);
-      expect(level2Buffer?._children).toContain(level3Buffer);
-      expect(level3Buffer?._children).toContain(level4Buffer);
-      expect(level4Buffer?._children.length).toBe(0);
+      // Verify logical child topology and leaf termination
+      expect(Array.from(iterateSpanChildren(rootBuffer))).toEqual([level2Buffer]);
+      expect(Array.from(iterateSpanChildren(level2Buffer))).toEqual([level3Buffer]);
+      expect(Array.from(iterateSpanChildren(level3Buffer))).toEqual([level4Buffer]);
+      expect(level4Buffer._traceRoot._topology.firstChild[level4Buffer._nodeIndex]).toBe(NO_NODE);
 
       // Verify all share the same traceId
       const traceId = rootBuffer?.trace_id;
@@ -428,21 +432,18 @@ describe('Nested Library Tasks', () => {
       expect(appBuffer).toBeDefined();
       if (!appBuffer) throw new Error('appBuffer is undefined');
 
-      // Walk tree to collect all buffers
-      const allBuffers: AnySpanBuffer[] = [];
-      const collectBuffers = (buf: AnySpanBuffer) => {
-        allBuffers.push(buf);
-        for (const child of buf._children) {
-          collectBuffers(child);
-        }
-      };
-      collectBuffers(appBuffer);
+      // Collect physical buffers in canonical preorder without recursive test traversal
+      const allBuffers = Array.from(iterateSpanTree(appBuffer));
 
       // Should have 5 buffers: app, http, db, cache, auth
       expect(allBuffers.length).toBe(5);
 
       // Verify parent-child chain
-      const httpBuffer = allBuffers.find((b) => b._children.length > 0 && b !== appBuffer);
+      const httpBuffer = allBuffers.find(
+        (buffer) =>
+          buffer !== appBuffer &&
+          buffer._traceRoot._topology.firstChild[buffer._nodeIndex] !== NO_NODE,
+      );
       expect(httpBuffer).toBeDefined();
       expect(httpBuffer?._parent).toBe(appBuffer);
 

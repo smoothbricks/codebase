@@ -21,6 +21,7 @@ import type { LogSchema } from '../schema/LogSchema.js';
 import { EMPTY_SCOPE, type SpanBufferConstructor } from '../spanBuffer.js';
 import type { ITraceRoot } from '../traceRoot.js';
 import type { AnySpanBuffer, SpanBuffer } from '../types.js';
+import { walkSpanTree } from '../traceTopology.js';
 import { createWasmAllocator, type WasmAllocator, type WasmAllocatorOptions } from './wasmAllocator.js';
 import {
   createWasmChildSpanBuffer,
@@ -124,6 +125,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
       opMetadata, // _opMetadata
       opMetadata, // _callsiteMetadata (same as opMetadata for root)
     );
+    traceRoot._topology.registerRoot(wasmBuffer);
     this.liveRoots.add(wasmBuffer);
 
     return wasmBuffer;
@@ -159,6 +161,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
       opMetadata, // _opMetadata
       callsiteMetadata, // _callsiteMetadata
     );
+    parentBuffer._traceRoot._topology.registerChild(parentBuffer, child);
 
     return child;
   }
@@ -172,6 +175,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
       buffer._opMetadata, // _opMetadata (same as original)
       buffer._callsiteMetadata ?? buffer._opMetadata, // _callsiteMetadata (same as original, fallback to opMetadata)
     );
+    buffer._traceRoot._topology.adoptOverflow(buffer, overflow);
 
     return overflow;
   }
@@ -183,40 +187,20 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
 
   releaseBuffer(buffer: AnySpanBuffer): void {
     const root = requireWasmSpanBuffer<T>(buffer);
-    this.freeSpanTree(root);
+    walkSpanTree(root, (segment) => requireWasmSpanBuffer<T>(segment).free());
     if (root._descriptor.kind === 'root' && root._traceRoot instanceof WasmTraceRoot) {
       root._traceRoot.free();
     }
+    root._traceRoot._topology.release();
     this.liveRoots.delete(root);
   }
 
-  /**
-   * Recursively free all WASM memory for a span tree.
-   */
-  private freeSpanTree(buffer: WasmSpanBufferInstance<T>): void {
-    // Free children first (depth-first)
-    if (buffer._children) {
-      for (const child of buffer._children) {
-        this.freeSpanTree(child);
-      }
-    }
-
-    // Free overflow chain
-    if (buffer._overflow) {
-      this.freeSpanTree(buffer._overflow);
-    }
-
-    // Free this buffer's WASM memory
-    if (typeof buffer.free === 'function') {
-      buffer.free();
-    }
-  }
-
   private invalidateSpanTree(buffer: WasmSpanBufferInstance<T>): void {
-    for (const child of buffer._children) this.invalidateSpanTree(child);
-    if (buffer._overflow) this.invalidateSpanTree(buffer._overflow);
-    buffer._columnPtrs.fill(-1);
-    buffer._descriptor.state = 'freed';
+    walkSpanTree(buffer, (segment) => {
+      const wasmSegment = requireWasmSpanBuffer<T>(segment);
+      wasmSegment._columnPtrs.fill(-1);
+      wasmSegment._descriptor.state = 'freed';
+    });
   }
 
   /** Reset invalidates every live handle before allocator offsets are reused. */
@@ -224,6 +208,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
     for (const root of this.liveRoots) {
       this.invalidateSpanTree(root);
       if (root._traceRoot instanceof WasmTraceRoot) root._traceRoot.invalidate();
+      root._traceRoot._topology.release();
     }
     this.liveRoots.clear();
     this.allocator.reset();

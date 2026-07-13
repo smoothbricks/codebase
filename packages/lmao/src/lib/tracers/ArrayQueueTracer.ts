@@ -67,7 +67,7 @@ export class ArrayQueueTracer<B extends OpContextBinding = OpContextBinding> ext
    * Consume all queued buffers and clear the queue.
    * Returns an independent copy of the queue contents.
    *
-   * @returns Array of root buffers (with child spans in _children tree)
+   * @returns Array of root buffers whose children live in the trace topology arena
    */
   drain(): SpanBuffer<B['logBinding']['logSchema']>[] {
     const buffers = [...this.queue];

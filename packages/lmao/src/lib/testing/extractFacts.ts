@@ -22,6 +22,7 @@ import {
   ENTRY_TYPE_WARN,
 } from '../schema/systemSchema.js';
 import type { SpanBuffer } from '../types.js';
+import { iterateSpanChildren } from '../traceTopology.js';
 import {
   createFactArray,
   type FactArray,
@@ -108,6 +109,11 @@ const DEFAULT_OPTIONS: Required<ExtractFactsOptions> = {
   tagFields: [],
 };
 
+type WalkFrame<T extends LogSchema> = {
+  buffer: SpanBuffer<T>;
+  children?: Generator<SpanBuffer<T>>;
+};
+
 /**
  * Extract facts from a SpanBuffer tree.
  *
@@ -140,7 +146,29 @@ export function extractFacts<T extends LogSchema>(
   const opts = { ...DEFAULT_OPTIONS, ...options };
   const facts: TraceFact[] = [];
 
-  walkBuffer(rootBuffer, facts, opts);
+  const stack: WalkFrame<T>[] = [{ buffer: rootBuffer }];
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    if (!frame) break;
+
+    if (!frame.children) {
+      if (frame.buffer._writeIndex === 0) {
+        stack.pop();
+        continue;
+      }
+      enterBuffer(frame.buffer, facts, opts);
+      frame.children = iterateSpanChildren(frame.buffer);
+    }
+
+    const next = frame.children.next();
+    if (!next.done) {
+      stack.push({ buffer: next.value });
+      continue;
+    }
+
+    leaveBuffer(frame.buffer, facts, opts);
+    stack.pop();
+  }
 
   return createFactArray(facts);
 }
@@ -148,110 +176,68 @@ export function extractFacts<T extends LogSchema>(
 /**
  * Walk a buffer and its children, extracting facts.
  */
-function walkBuffer<T extends LogSchema>(
+function enterBuffer<T extends LogSchema>(
   buffer: SpanBuffer<T>,
   facts: TraceFact[],
   opts: Required<ExtractFactsOptions>,
 ): void {
-  // Span name is in message_values[0] (written by writeSpanStart)
   const spanName = resolveMessage(buffer, 0) ?? '';
   const writeIndex = buffer._writeIndex;
+  if (writeIndex === 0) return;
 
-  if (writeIndex === 0) {
-    // Empty buffer - no facts to extract
-    return;
-  }
-
-  // Always emit span:started as first fact for this span
   facts.push(spanStarted(spanName));
-
-  // Extract scope facts (from buffer's scope values)
   if (opts.includeScope && buffer._scopeValues) {
     for (const [key, value] of Object.entries(buffer._scopeValues)) {
-      if (value !== undefined && value !== null) {
-        facts.push(scopeFact(key, String(value)));
-      }
+      if (value !== undefined && value !== null) facts.push(scopeFact(key, String(value)));
     }
   }
-
-  // Extract tag facts from row 0 (ctx.tag writes here)
-  // Also check row 1 (completion row - .with() on ok()/err())
-  // And rows 2+ (log rows - .with() on log.*)
   if (opts.includeTags) {
-    for (let row = 0; row < writeIndex; row++) {
-      extractTagFacts(buffer, row, facts, opts);
-    }
+    for (let row = 0; row < writeIndex; row++) extractTagFacts(buffer, row, facts, opts);
   }
 
-  // Buffer layout per specs/lmao/01h_entry_types_and_logging_primitives.md:
-  // - Row 0: span-start (tags overwrite this row's attribute columns)
-  // - Row 1: span-ok/err/exception (completion status)
-  // - Row 2+: log entries (trace/debug/info/warn/error), ff entries
   const entryTypes = buffer.entry_type;
-
-  // Process log/ff entries from row 2 onwards
   for (let row = 2; row < writeIndex; row++) {
     const entryType = entryTypes[row];
-
     switch (entryType) {
       case ENTRY_TYPE_INFO:
       case ENTRY_TYPE_DEBUG:
       case ENTRY_TYPE_WARN:
       case ENTRY_TYPE_ERROR:
-      case ENTRY_TYPE_TRACE: {
-        if (opts.includeLogs) {
-          const level = entryTypeToLogLevel(entryType);
-          facts.push(logFact(level, resolveMessage(buffer, row) ?? ''));
-        }
+      case ENTRY_TYPE_TRACE:
+        if (opts.includeLogs) facts.push(logFact(entryTypeToLogLevel(entryType), resolveMessage(buffer, row) ?? ''));
         break;
-      }
-
       case ENTRY_TYPE_FF_ACCESS:
-      case ENTRY_TYPE_FF_USAGE: {
-        if (opts.includeFF) {
-          extractFFfacts(buffer, row, facts);
-        }
+      case ENTRY_TYPE_FF_USAGE:
+        if (opts.includeFF) extractFFfacts(buffer, row, facts);
         break;
-      }
     }
   }
+}
 
-  // Recurse into children BEFORE completing this span
-  // This maintains the natural execution order in facts
-  for (const child of buffer._children) {
-    walkBuffer(child as SpanBuffer<T>, facts, opts);
-  }
-
-  // Completion status is ALWAYS at row 1 (not last row)
-  // Row 1 is pre-initialized as span-exception, overwritten by ok()/err()
+function leaveBuffer<T extends LogSchema>(
+  buffer: SpanBuffer<T>,
+  facts: TraceFact[],
+  opts: Required<ExtractFactsOptions>,
+): void {
+  const writeIndex = buffer._writeIndex;
+  if (writeIndex === 0) return;
+  const spanName = resolveMessage(buffer, 0) ?? '';
   if (writeIndex >= 2) {
-    const completionEntryType = entryTypes[1];
-
-    switch (completionEntryType) {
+    switch (buffer.entry_type[1]) {
       case ENTRY_TYPE_SPAN_OK:
         facts.push(spanOk(spanName));
         break;
-
-      case ENTRY_TYPE_SPAN_ERR: {
-        const errorCode = getErrorCode(buffer, 1);
-        facts.push(spanErr(spanName, errorCode));
+      case ENTRY_TYPE_SPAN_ERR:
+        facts.push(spanErr(spanName, getErrorCode(buffer, 1)));
         break;
-      }
-
-      case ENTRY_TYPE_SPAN_EXCEPTION: {
-        const message = getExceptionMessage(buffer, 1);
-        facts.push(spanException(spanName, message));
+      case ENTRY_TYPE_SPAN_EXCEPTION:
+        facts.push(spanException(spanName, getExceptionMessage(buffer, 1)));
         break;
-      }
     }
   }
-
-  // Extract duration metric if requested
   if (opts.includeMetrics) {
     const duration = getSpanDuration(buffer);
-    if (duration !== undefined) {
-      facts.push(metricFact(`${spanName}:duration_ns`, Number(duration)));
-    }
+    if (duration !== undefined) facts.push(metricFact(`${spanName}:duration_ns`, Number(duration)));
   }
 }
 

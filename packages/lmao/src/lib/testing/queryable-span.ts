@@ -18,6 +18,7 @@
 import { resolveMessage } from '../resolveMessage.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { SpanBuffer } from '../types.js';
+import { iterateSpanChildren, iterateSpanTree } from '../traceTopology.js';
 import { type ExtractFactsOptions, extractFacts } from './extractFacts.js';
 import type { FactArray } from './facts.js';
 
@@ -61,53 +62,40 @@ class QueryableSpanImpl<T extends LogSchema> implements QueryableSpan<T> {
   }
 
   find(name: string): QueryableSpan<T> | undefined {
-    return findInChildren(this.buffer._children, name);
+    for (const descendant of iterateDescendantSpans(this.buffer)) {
+      if (resolveMessage(descendant, 0) === name) return new QueryableSpanImpl(descendant);
+    }
+    return undefined;
   }
 
   findAll(name: string): QueryableSpan<T>[] {
     const results: QueryableSpan<T>[] = [];
-    collectAll(this.buffer._children, name, results);
+    for (const descendant of iterateDescendantSpans(this.buffer)) {
+      if (resolveMessage(descendant, 0) === name) results.push(new QueryableSpanImpl(descendant));
+    }
     return results;
   }
 
   get children(): QueryableSpan<T>[] {
     const result: QueryableSpan<T>[] = [];
-    for (const child of this.buffer._children) {
-      result.push(new QueryableSpanImpl(child));
-    }
+    for (const child of iterateSpanChildren(this.buffer)) result.push(new QueryableSpanImpl(child));
     return result;
   }
 
   names(): string[] {
     const result: string[] = [];
-    collectNames(this.buffer._children, result);
+    for (const descendant of iterateDescendantSpans(this.buffer)) {
+      result.push(resolveMessage(descendant, 0) ?? '');
+    }
     return result;
   }
 }
 
-function findInChildren<T extends LogSchema>(children: SpanBuffer<T>[], name: string): QueryableSpan<T> | undefined {
-  for (const child of children) {
-    if (resolveMessage(child, 0) === name) {
-      return new QueryableSpanImpl(child);
-    }
-    const found = findInChildren(child._children, name);
-    if (found) return found;
-  }
-  return undefined;
-}
-
-function collectAll<T extends LogSchema>(children: SpanBuffer<T>[], name: string, results: QueryableSpan<T>[]): void {
-  for (const child of children) {
-    if (resolveMessage(child, 0) === name) {
-      results.push(new QueryableSpanImpl(child));
-    }
-    collectAll(child._children, name, results);
-  }
-}
-
-function collectNames<T extends LogSchema>(children: SpanBuffer<T>[], result: string[]): void {
-  for (const child of children) {
-    result.push(resolveMessage(child, 0) ?? '');
-    collectNames(child._children, result);
+function* iterateDescendantSpans<T extends LogSchema>(root: SpanBuffer<T>): Generator<SpanBuffer<T>> {
+  let previousNodeIndex = root._nodeIndex;
+  for (const buffer of iterateSpanTree(root)) {
+    if (buffer._nodeIndex === previousNodeIndex) continue;
+    previousNodeIndex = buffer._nodeIndex;
+    yield buffer;
   }
 }

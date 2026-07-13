@@ -28,6 +28,7 @@ import {
   ENTRY_TYPE_WARN,
 } from '../../schema/systemSchema.js';
 import { createTraceRoot as createNodeTraceRoot } from '../../traceRoot.node.js';
+import { iterateSpanChildren } from '../../traceTopology.js';
 import { TestTracer } from '../../tracers/TestTracer.js';
 import { WasmBufferStrategy } from '../WasmBufferStrategy.js';
 import { createWasmTraceRoot } from '../wasmTraceRoot.js';
@@ -53,6 +54,15 @@ interface WasmBufferInternals {
 function asWasm<T>(buffer: T): T & WasmBufferInternals {
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- test helper narrows to the generated WASM-only fields asserted below.
   return buffer as T & WasmBufferInternals;
+}
+
+function requireOnlySpanChild(parent: Parameters<typeof iterateSpanChildren>[0], label: string) {
+  const children = iterateSpanChildren(parent);
+  const first = children.next();
+  if (first.done) throw new Error(`${label} has no child span`);
+  const extra = children.next();
+  if (!extra.done) throw new Error(`${label} has more than one child span`);
+  return first.value;
 }
 
 describe('WASM Integration Tests', () => {
@@ -89,7 +99,7 @@ describe('WASM Integration Tests', () => {
   afterEach(() => {
     // Release all WASM memory for buffers
     for (const buffer of tracer.rootBuffers) {
-      strategy.releaseBuffer(buffer);
+      if (buffer._traceRoot._topology.count !== 0) strategy.releaseBuffer(buffer);
     }
     // Clear tracer state
     tracer.clear();
@@ -187,14 +197,10 @@ describe('WASM Integration Tests', () => {
       });
 
       const parent = tracer.rootBuffers[0];
-      expect(parent._children).toHaveLength(1);
-
-      const child = parent._children[0];
-      // Child should share trace_id with parent
+      if (!parent) throw new Error('nested trace did not produce a root buffer');
+      const child = requireOnlySpanChild(parent, 'nested trace root');
       expect(child.trace_id).toBe(parent.trace_id);
-      // Child's parent_span_id should be parent's span_id
       expect(child.parent_span_id).toBe(parent.span_id);
-      // Child should have its own span_id
       expect(child.span_id).not.toBe(parent.span_id);
     });
 
@@ -210,13 +216,11 @@ describe('WASM Integration Tests', () => {
       });
 
       const root = tracer.rootBuffers[0];
-      expect(root._children).toHaveLength(1);
-
-      const level1 = root._children[0];
-      expect(level1._children).toHaveLength(1);
+      if (!root) throw new Error('deep trace did not produce a root buffer');
+      const level1 = requireOnlySpanChild(root, 'deep trace root');
       expect(level1.parent_span_id).toBe(root.span_id);
 
-      const level2 = level1._children[0];
+      const level2 = requireOnlySpanChild(level1, 'level-1 span');
       expect(level2.parent_span_id).toBe(level1.span_id);
       expect(level2.trace_id).toBe(root.trace_id);
     });
@@ -229,14 +233,19 @@ describe('WASM Integration Tests', () => {
       });
 
       const parent = tracer.rootBuffers[0];
-      expect(parent._children).toHaveLength(2);
-
-      const [child1, child2] = parent._children;
+      if (!parent) throw new Error('sibling trace did not produce a root buffer');
+      const children = iterateSpanChildren(parent);
+      const first = children.next();
+      if (first.done) throw new Error('sibling trace did not produce its first child');
+      const second = children.next();
+      if (second.done) throw new Error('sibling trace did not produce its second child');
+      if (!children.next().done) throw new Error('sibling trace produced an unexpected extra child');
+      const child1 = first.value;
+      const child2 = second.value;
       expect(resolveMessage(child1, 0)).toBe('child-1');
       expect(resolveMessage(child2, 0)).toBe('child-2');
       expect(child1.parent_span_id).toBe(parent.span_id);
       expect(child2.parent_span_id).toBe(parent.span_id);
-      // Siblings should have different span IDs
       expect(child1.span_id).not.toBe(child2.span_id);
     });
   });
@@ -344,14 +353,16 @@ describe('WASM Integration Tests', () => {
   });
 
   describe('Identity ownership', () => {
-    it('keeps the root trace owned by the root when a child is released and recycled', async () => {
+    it('invalidates released root and child handles before recycled memory is reused', async () => {
       await tracer.trace('owned-root', async (ctx) => {
         await ctx.span('released-child', async (child) => child.ok('child done'));
         return ctx.ok('root done');
       });
 
       const root = tracer.rootBuffers[0];
-      const child = root._children[0];
+      if (!root) throw new Error('released trace did not produce a root buffer');
+      const child = requireOnlySpanChild(root, 'released trace root');
+      const topology = root._traceRoot._topology;
       const rootTraceId = root.trace_id;
       const rootSpanId = root.span_id;
       expect(child.trace_id).toBe(rootTraceId);
@@ -359,13 +370,17 @@ describe('WASM Integration Tests', () => {
       expect(child.parent_span_id).toBe(rootSpanId);
       expect(child._identity).not.toEqual(root._identity);
 
-      strategy.releaseBuffer(child);
-      await tracer.trace('recycled-child-identity', async (ctx) => ctx.ok('done'));
+      strategy.releaseBuffer(root);
+      expect(topology.count).toBe(0);
+      expect(() => topology.assertLive(root)).toThrow(/stale/);
+      expect(() => topology.assertLive(child)).toThrow(/stale/);
+      expect(() => iterateSpanChildren(root).next()).toThrow(/stale/);
 
-      expect(root.trace_id).toBe(rootTraceId);
-      expect(root.span_id).toBe(rootSpanId);
-      expect(resolveMessage(root, 0)).toBe('owned-root');
-      expect(tracer.rootBuffers[1].trace_id).not.toBe(rootTraceId);
+      await tracer.trace('recycled-child-identity', async (ctx) => ctx.ok('done'));
+      const recycled = tracer.rootBuffers[1];
+      if (!recycled) throw new Error('recycled trace did not produce a root buffer');
+      expect(recycled.trace_id).not.toBe(rootTraceId);
+      expect(resolveMessage(recycled, 0)).toBe('recycled-child-identity');
     });
 
     it('preserves logical span identity and linkage across overflow segments', async () => {
@@ -390,7 +405,7 @@ describe('WASM Integration Tests', () => {
       expect(rootOverflow.parent_span_id).toBe(root.parent_span_id);
       expect(rootOverflow._identity).toEqual(root._identity);
 
-      const child = root._children[0];
+      const child = requireOnlySpanChild(root, 'overflow trace root');
       const childOverflow = child._overflow;
       if (!childOverflow) throw new Error('child logs did not create an overflow segment');
       expect(child.trace_id).toBe(root.trace_id);
@@ -415,7 +430,7 @@ describe('WASM Integration Tests', () => {
 
       const released = tracer.rootBuffers[0];
       strategy.releaseBuffer(released);
-      strategy.releaseBuffer(released);
+      expect(() => strategy.releaseBuffer(released)).toThrow(/stale/);
 
       await tracer.trace('first-new-owner', async (ctx) => {
         ctx.tag.latency(11.5);
@@ -669,6 +684,135 @@ describe('WASM Integration Tests', () => {
         Date.now = originalDateNow;
         process.hrtime.bigint = originalHrtime;
         Object.defineProperty(performance, 'now', { configurable: true, value: originalPerformanceNow });
+      }
+    });
+
+    it('preserves ordered Arrow rows for root, child, grandchild, random, and overflow workloads', async () => {
+      const jsStrategy = new JsBufferStrategy<typeof schema>();
+      const jsTracer = new TestTracer(opContext, {
+        bufferStrategy: jsStrategy,
+        createTraceRoot: createNodeTraceRoot,
+      });
+      const workloads = [
+        {
+          name: 'root',
+          run: async (target: typeof tracer) => {
+            await target.trace('ordered-root', async (root) => {
+              root.tag.latency(1.25).success(true).operation('CREATE');
+              root.log.info('ordered-root-log');
+              return root.ok('root done');
+            });
+            return ['ordered-root'];
+          },
+        },
+        {
+          name: 'child',
+          run: async (target: typeof tracer) => {
+            await target.trace('ordered-parent', async (root) => {
+              await root.span('ordered-child-0', async (child) => child.ok('first child done'));
+              await root.span('ordered-child-1', async (child) => child.ok('second child done'));
+              return root.ok('parent done');
+            });
+            return ['ordered-parent', 'ordered-child-0', 'ordered-child-1'];
+          },
+        },
+        {
+          name: 'grandchild',
+          run: async (target: typeof tracer) => {
+            await target.trace('ordered-grand-root', async (root) => {
+              await root.span('ordered-branch', async (child) => {
+                await child.span('ordered-grandchild', async (grandchild) => grandchild.ok('grandchild done'));
+                return child.ok('branch done');
+              });
+              await root.span('ordered-sibling', async (child) => child.ok('sibling done'));
+              return root.ok('grand root done');
+            });
+            return ['ordered-grand-root', 'ordered-branch', 'ordered-grandchild', 'ordered-sibling'];
+          },
+        },
+        {
+          name: 'random',
+          run: async (target: typeof tracer) => {
+            let state = 0x6d2b_79f5;
+            const next = () => {
+              state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+              return state;
+            };
+            const expected = ['random-root'];
+            await target.trace('random-root', async (root) => {
+              for (let childIndex = 0; childIndex < 24; childIndex++) {
+                const childName = `random-child-${childIndex}`;
+                expected.push(childName);
+                await root.span(childName, async (child) => {
+                  const logCount = next() % 6;
+                  for (let logIndex = 0; logIndex < logCount; logIndex++) {
+                    child.log.info(`random-log-${childIndex}-${logIndex}`);
+                  }
+                  const grandchildCount = next() % 4;
+                  for (let grandchildIndex = 0; grandchildIndex < grandchildCount; grandchildIndex++) {
+                    const grandchildName = `random-grandchild-${childIndex}-${grandchildIndex}`;
+                    expected.push(grandchildName);
+                    await child.span(grandchildName, async (grandchild) => {
+                      grandchild.tag.latency(next() % 10_000).operation('UPDATE');
+                      return grandchild.ok('random grandchild done');
+                    });
+                  }
+                  return child.ok('random child done');
+                });
+              }
+              return root.ok('random root done');
+            });
+            return expected;
+          },
+        },
+        {
+          name: 'overflow',
+          run: async (target: typeof tracer) => {
+            await target.trace('overflow-parity-root', async (root) => {
+              for (let index = 0; index < 70; index++) root.log.info(`overflow-root-${index}`);
+              await root.span('overflow-parity-child', async (child) => {
+                for (let index = 0; index < 70; index++) child.log.info(`overflow-child-${index}`);
+                return child.ok('overflow child done');
+              });
+              return root.ok('overflow root done');
+            });
+            return ['overflow-parity-root', 'overflow-parity-child'];
+          },
+        },
+      ];
+
+      for (const workload of workloads) {
+        const jsRootIndex = jsTracer.rootBuffers.length;
+        const wasmRootIndex = tracer.rootBuffers.length;
+        const jsExpected = await workload.run(jsTracer);
+        const wasmExpected = await workload.run(tracer);
+        expect(wasmExpected).toEqual(jsExpected);
+
+        const jsRoot = jsTracer.rootBuffers[jsRootIndex];
+        if (!jsRoot) throw new Error(`${workload.name} JS workload did not produce a root buffer`);
+        const wasmRoot = tracer.rootBuffers[wasmRootIndex];
+        if (!wasmRoot) throw new Error(`${workload.name} WASM workload did not produce a root buffer`);
+        const jsTable = jsStrategy.toArrowTable(jsRoot);
+        const wasmTable = strategy.toArrowTable(wasmRoot);
+        expect(wasmTable.numRows).toBe(jsTable.numRows);
+
+        for (const columnName of ['entry_type', 'message', 'latency', 'success', 'operation']) {
+          const jsColumn = jsTable.getChild(columnName);
+          const wasmColumn = wasmTable.getChild(columnName);
+          if (!jsColumn || !wasmColumn) throw new Error(`${workload.name} is missing parity column ${columnName}`);
+          const jsValues = Array.from({ length: jsTable.numRows }, (_, row) => jsColumn.get(row));
+          const wasmValues = Array.from({ length: wasmTable.numRows }, (_, row) => wasmColumn.get(row));
+          expect(wasmValues).toEqual(jsValues);
+        }
+
+        const entryTypes = wasmTable.getChild('entry_type');
+        const messages = wasmTable.getChild('message');
+        if (!entryTypes || !messages) throw new Error(`${workload.name} is missing ordered span columns`);
+        const spanOrder: unknown[] = [];
+        for (let row = 0; row < wasmTable.numRows; row++) {
+          if (entryTypes.get(row) === 'span-start') spanOrder.push(messages.get(row));
+        }
+        expect(spanOrder).toEqual(wasmExpected);
       }
     });
   });

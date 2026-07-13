@@ -3,6 +3,7 @@ import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import { DEFAULT_METADATA } from '../../opContext/defineOp.js';
 import { S } from '../../schema/builder.js';
 import { createSpanBuffer, getSpanBufferClass } from '../../spanBuffer.js';
+import { NO_NODE } from '../../traceTopology.js';
 
 import { createBuffer, createTestSchema, createTestTraceRoot, createTraceId } from '../test-helpers.js';
 
@@ -34,7 +35,9 @@ describe('Buffer Foundation', () => {
     expect(buf.count_values).toBeInstanceOf(Float64Array); // number → Float64Array
 
     // Metadata
-    expect(buf._children).toBeInstanceOf(Array);
+    const topology = buf._traceRoot._topology;
+    expect(topology.buffers[topology.root]).toBe(buf);
+    expect(topology.firstChild[buf._nodeIndex]).toBe(NO_NODE);
     expect(buf._writeIndex).toBe(0);
     expect(buf._capacity).toBe(DEFAULT_BUFFER_CAPACITY);
   });
@@ -50,7 +53,7 @@ describe('Buffer Foundation', () => {
     expect(buf.span_id).toBeGreaterThan(0);
     expect(buf._hasParent).toBe(false);
     expect(buf._parent).toBeUndefined();
-    expect(buf._children).toHaveLength(0);
+    expect(buf._traceRoot._topology.firstChild[buf._nodeIndex]).toBe(NO_NODE);
   });
 
   it('provides access to buffer stats via constructor', () => {

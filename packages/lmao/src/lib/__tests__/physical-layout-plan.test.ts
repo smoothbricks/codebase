@@ -17,6 +17,7 @@ import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { getSpanBufferClass } from '../spanBuffer.js';
 import { createSpanContextClass, isPhysicalLayoutPlanForContext } from '../spanContext.js';
 import { TestTracer } from '../tracers/TestTracer.js';
+import { iterateSpanChildren } from '../traceTopology.js';
 import { createTestTracerOptions } from './test-helpers.js';
 
 const CAPACITY_TIER = 17;
@@ -186,7 +187,7 @@ describe('PhysicalLayoutPlan', () => {
 
     await tracer.trace('root', parentOp);
 
-    const children = tracer.rootBuffers[0]._children;
+    const children = Array.from(iterateSpanChildren(tracer.rootBuffers[0]));
     expect(children).toHaveLength(2);
     expect(children.every((buffer) => buffer instanceof plan.SpanBufferClass)).toBe(true);
     expect(children.map((buffer) => buffer._capacity)).toEqual([CAPACITY_TIER, CAPACITY_TIER]);
@@ -287,8 +288,9 @@ describe('PhysicalLayoutPlan', () => {
     expect(resultOnly.callsitePlan).toBe(plan);
     expect(resultContexts).toHaveLength(2);
     expect(resultContexts.every((ctx) => ctx instanceof plan.SpanContextClass)).toBe(true);
-    const children = tracer.rootBuffers[0]?._children;
-    if (!children) throw new Error('expected repeated child buffers');
+    const rootBuffer = tracer.rootBuffers[0];
+    if (!rootBuffer) throw new Error('expected repeated child buffers');
+    const children = Array.from(iterateSpanChildren(rootBuffer));
     expect(children).toHaveLength(2);
     expect(children.every((buffer) => buffer instanceof plan.SpanBufferClass)).toBe(true);
   });

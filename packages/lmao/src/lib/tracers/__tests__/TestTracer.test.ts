@@ -13,6 +13,7 @@ import { defineOpContext } from '../../defineOpContext.js';
 import { resolveMessage } from '../../resolveMessage.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
+import { iterateSpanChildren } from '../../traceTopology.js';
 import { TestTracer } from '../TestTracer.js';
 
 describe('TestTracer', () => {
@@ -86,9 +87,11 @@ describe('TestTracer', () => {
       expect(tracer.rootBuffers).toHaveLength(1);
       const rootBuffer = tracer.rootBuffers[0];
 
-      // Child spans are in _children array
-      expect(rootBuffer._children).toHaveLength(1);
-      expect(resolveMessage(rootBuffer._children[0], 0)).toBe('child-span');
+      const children = Array.from(iterateSpanChildren(rootBuffer));
+      expect(children).toHaveLength(1);
+      const [child] = children;
+      if (!child) throw new Error('expected child span');
+      expect(resolveMessage(child, 0)).toBe('child-span');
     });
 
     it('should support deeply nested spans', async () => {
@@ -106,10 +109,16 @@ describe('TestTracer', () => {
       });
 
       const root = tracer.rootBuffers[0];
-      expect(root._children).toHaveLength(1);
-      expect(resolveMessage(root._children[0], 0)).toBe('span-l2');
-      expect(root._children[0]._children).toHaveLength(1);
-      expect(resolveMessage(root._children[0]._children[0], 0)).toBe('span-l3');
+      const level2Children = Array.from(iterateSpanChildren(root));
+      expect(level2Children).toHaveLength(1);
+      const [level2] = level2Children;
+      if (!level2) throw new Error('expected level-2 span');
+      expect(resolveMessage(level2, 0)).toBe('span-l2');
+      const level3Children = Array.from(iterateSpanChildren(level2));
+      expect(level3Children).toHaveLength(1);
+      const [level3] = level3Children;
+      if (!level3) throw new Error('expected level-3 span');
+      expect(resolveMessage(level3, 0)).toBe('span-l3');
     });
   });
 

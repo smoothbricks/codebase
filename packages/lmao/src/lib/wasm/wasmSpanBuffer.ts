@@ -118,9 +118,8 @@ export type WasmSpanBufferInstance<T extends LogSchema = LogSchema> = SpanBuffer
   readonly _identityOwner: boolean;
   _overflowWriteIndex: number;
 
-  // Override tree structure with WASM-typed versions
+  // Preserve WASM-typed parent and overflow links.
   _parent?: WasmSpanBufferInstance<T>;
-  _children: WasmSpanBufferInstance<T>[];
   _overflow?: WasmSpanBufferInstance<T>;
 
   // Present only for dynamic-only and mixed physical families.
@@ -786,7 +785,8 @@ class WasmSpanBuffer {
     this._capacity = opts.capacity;
     this._logSchema = opts.logSchema;
     this._parent = opts._parent ?? null;
-    this._children = [];
+    this._nodeIndex = 4294967295;
+    this._topologyGeneration = 0;
     this._overflow = null;
     this._overflowWriteIndex = 0;
 

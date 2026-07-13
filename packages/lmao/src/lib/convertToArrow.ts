@@ -55,7 +55,6 @@ import {
   concatenateUint8Arrays,
   encodeUtf8Strings,
   getArrowFieldName,
-  walkSpanTree,
 } from './arrow/utils.js';
 import type { RemapDescriptor } from './logBinding.js';
 import { resolveMessage } from './resolveMessage.js';
@@ -63,6 +62,7 @@ import { ENTRY_TYPE_NAMES, SYSTEM_SCHEMA_FIELD_NAMES } from './schema/systemSche
 import { getBinaryEncoder, getEnumUtf8, getEnumValues, getSchemaType } from './schema/typeGuards.js';
 import type { LogSchema } from './schema/types.js';
 import type { AnySpanBuffer, OpMetadata } from './types.js';
+import { walkSpanTree } from './traceTopology.js';
 import { globalUtf8Cache } from './utf8Cache.js';
 
 const DictBuilder = DictionaryBuilder;

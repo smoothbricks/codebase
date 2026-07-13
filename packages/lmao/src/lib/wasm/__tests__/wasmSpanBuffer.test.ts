@@ -14,6 +14,7 @@ import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { createSpanBuffer, EMPTY_SCOPE } from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
+import { iterateSpanChildren, NO_NODE } from '../../traceTopology.js';
 import { createWasmAllocator, type WasmAllocator } from '../wasmAllocator.js';
 import { getWasmPhysicalLayout } from '../wasmPhysicalLayout.js';
 import {
@@ -264,9 +265,12 @@ describe('WasmSpanBuffer', () => {
 
     it('initializes tree structure', () => {
       const buffer = createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 1n, span_id: 1 });
+      traceRoot._topology.registerRoot(buffer);
 
       expect(buffer._parent).toBeNull();
-      expect(buffer._children).toEqual([]);
+      expect(buffer._nodeIndex).toBe(traceRoot._topology.root);
+      expect(traceRoot._topology.buffers[buffer._nodeIndex]).toBe(buffer);
+      expect(traceRoot._topology.firstChild[buffer._nodeIndex]).toBe(NO_NODE);
       expect(buffer._overflow).toBeNull();
     });
   });
@@ -649,6 +653,7 @@ describe('WasmSpanBuffer', () => {
       allocator.setThreadId(0, 1); // thread_id = 1n
 
       const parent = createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 1n, span_id: 1 });
+      traceRoot._topology.registerRoot(parent);
 
       const child = createWasmChildSpanBuffer(
         parent,
@@ -659,11 +664,10 @@ describe('WasmSpanBuffer', () => {
         createTestOpMetadata({ name: 'child-span', line: 0 }),
       );
 
-      // Manually push to _children - SpanContext does this with possible RemappedBufferView wrapper
-      parent._children.push(child);
+      traceRoot._topology.registerChild(parent, child);
 
       expect(child._parent).toBe(parent);
-      expect(parent._children).toContain(child);
+      expect(Array.from(iterateSpanChildren(parent))).toEqual([child]);
       expect(child.trace_id).toBe(testTraceId('trace-123'));
       // Parent and child share thread_id from global header
       expect(child.parent_thread_id).toBe(1n);

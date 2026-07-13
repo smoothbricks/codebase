@@ -287,7 +287,7 @@ export function getSpanBufferClass<T extends LogSchema>(
   // 2. _capacity - compared on EVERY write (overflow check)
   // 3. _overflow - checked when overflow occurs
   // 4. timestamp/entry_type - TypedArray refs accessed on EVERY write
-  // 5. _children/_parent - modified/accessed during span creation
+  // 5. _nodeIndex/_parent - modified/accessed during span creation
   // 6. _traceRoot - accessed for timestamp anchors on EVERY write
   // 7. _identity/_logBinding - accessed during span operations
   // 8-N. Cold properties - only accessed during Arrow conversion
@@ -331,7 +331,7 @@ export function getSpanBufferClass<T extends LogSchema>(
     // First ~10-12 properties are stored directly on the object (fastest access).
     // Slots 1-3: HOTTEST (every log entry) - _writeIndex, _capacity, _overflow
     // Slots 4-5: HOT (TypedArray refs) - timestamp, entry_type
-    // Slots 6-7: WARM (tree structure) - _children, _parent
+    // Slots 6-7: WARM (tree structure) - _nodeIndex, _parent
     // Slots 8-10: WARM (context) - _traceRoot, _scopeValues, _identity
     // Slots 11: WARM (system) - _system
     // Slots 12+: COLD (Arrow conversion only) - _callsiteMetadata, _opMetadata
@@ -414,7 +414,8 @@ export function getSpanBufferClass<T extends LogSchema>(
           ? `       this._spanName = undefined;
 `
           : '') +
-      `       this._children = [];
+      `       this._nodeIndex = 4294967295;
+       this._topologyGeneration = 0;
        this._parent = isChained ? parent._parent : parent;
        this._traceRoot = traceRoot;
        this._scopeValues = parent ? parent._scopeValues : EMPTY_SCOPE;
@@ -572,18 +573,19 @@ export function createSpanBuffer<T extends LogSchema>(
   // Track non-chained buffer creation for capacity tuning
   stats.spansCreated++;
 
-  // Create root buffer (no parent)
-  // Root spans use same metadata for both callsite and op (no distinction at root)
-  return new SpanBufferClass(
+  // Create root buffer (no parent), then register its stable logical node.
+  const buffer = new SpanBufferClass(
     actualCapacity,
     stats,
-    undefined, // no parent
-    false, // not chained
-    opMetadata, // callsiteMetadata for row 0
-    opMetadata, // opMetadata for rows 1+ (same as callsite for root)
-    traceRoot, // pre-built TraceRoot with trace_id, anchors, tracer
+    undefined,
+    false,
+    opMetadata,
+    opMetadata,
+    traceRoot,
     opMetadata._physicalLayoutPlan?.vocabularyGeneration ?? getVocabularyGeneration(),
   );
+  traceRoot._topology.registerRoot(buffer);
+  return buffer;
 }
 //#endregion smoo/lmao!n/spanbuffer-layout.create-root
 
@@ -620,6 +622,7 @@ export function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>)
 
   // Link current buffer to next
   buffer._overflow = nextBuffer;
+  buffer._traceRoot._topology.adoptOverflow(buffer, nextBuffer);
 
   return nextBuffer;
 }
@@ -667,6 +670,7 @@ export function createChildSpanBuffer<T extends LogSchema>(
     opMetadata._physicalLayoutPlan?.vocabularyGeneration ?? getVocabularyGeneration(),
   );
 
+  parentBuffer._traceRoot._topology.registerChild(parentBuffer, childBuffer);
   return childBuffer;
 }
 //#endregion smoo/lmao!n/spanbuffer-layout.create-child

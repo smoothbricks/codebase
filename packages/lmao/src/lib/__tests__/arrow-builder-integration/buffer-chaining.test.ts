@@ -10,6 +10,7 @@ import {
   getSpanBufferClass,
   type SpanBufferConstructor,
 } from '../../spanBuffer.js';
+import { iterateSpanChildren, NO_NODE } from '../../traceTopology.js';
 
 import type { SpanBuffer } from '../../types.js';
 import { createBuffer, createTestSchema, createTestTraceRoot, createTraceId } from '../test-helpers.js';
@@ -117,7 +118,6 @@ describe('Buffer Chaining', () => {
       const parentBuffer = createBuffer(schema);
 
       const childBuffer = createChildSpanBuffer(parentBuffer, SpanBufferClass, DEFAULT_METADATA, DEFAULT_METADATA);
-      parentBuffer._children.push(childBuffer);
 
       const nextChildBuffer = createOverflowBuffer(childBuffer);
 
@@ -125,21 +125,20 @@ describe('Buffer Chaining', () => {
       expect(nextChildBuffer._parent).toBe(parentBuffer);
 
       // Should NOT be added to parent's children (it's a continuation, not a new span)
-      expect(parentBuffer._children).toHaveLength(1);
-      expect(parentBuffer._children[0]).toBe(childBuffer);
+      expect(Array.from(iterateSpanChildren(parentBuffer))).toEqual([childBuffer]);
     });
 
-    it('should create empty children array for chained buffer', () => {
+    it('should share logical child topology with a chained buffer', () => {
       const buffer = createBuffer(schema);
 
       // Add a child to original buffer
       const childBuffer = createChildSpanBuffer(buffer, SpanBufferClass, DEFAULT_METADATA, DEFAULT_METADATA);
-      buffer._children.push(childBuffer);
 
       const nextBuffer = createOverflowBuffer(buffer);
 
-      // Chained buffer should have empty children array
-      expect(nextBuffer._children).toHaveLength(0);
+      // Overflow segments share the logical span node and its children.
+      expect(nextBuffer._nodeIndex).toBe(buffer._nodeIndex);
+      expect(Array.from(iterateSpanChildren(nextBuffer))).toEqual([childBuffer]);
     });
   });
 
@@ -247,31 +246,29 @@ describe('Buffer Chaining', () => {
       const buffer1 = createOverflowBuffer(rootBuffer);
       const child1 = createChildSpanBuffer(buffer1, SpanBufferClass, DEFAULT_METADATA, DEFAULT_METADATA);
       const child2 = createChildSpanBuffer(buffer1, SpanBufferClass, DEFAULT_METADATA, DEFAULT_METADATA);
-      buffer1._children.push(child1, child2);
 
       // Create second chained buffer with children
       const buffer2 = createOverflowBuffer(buffer1);
       const child3 = createChildSpanBuffer(buffer2, SpanBufferClass, DEFAULT_METADATA, DEFAULT_METADATA);
-      buffer2._children.push(child3);
 
-      // Verify topology
-      // Overflow buffers inherit the logical parent (rootBuffer has no parent → undefined)
+      // Verify physical overflow links and allocation-free logical topology.
+      const topology = rootBuffer._traceRoot._topology;
       expect(rootBuffer._parent).toBeUndefined();
       expect(rootBuffer._overflow).toBe(buffer1);
-      expect(rootBuffer._children).toHaveLength(0);
-
-      // buffer1 is an OVERFLOW of rootBuffer, so it inherits rootBuffer._parent (undefined)
       expect(buffer1._parent).toBeUndefined();
       expect(buffer1._overflow).toBe(buffer2);
-      expect(buffer1._children).toHaveLength(2);
-      expect(buffer1._children[0]).toBe(child1);
-      expect(buffer1._children[1]).toBe(child2);
-
-      // buffer2 is an OVERFLOW of buffer1, so it inherits buffer1._parent (undefined)
       expect(buffer2._parent).toBeUndefined();
       expect(buffer2._overflow).toBeUndefined();
-      expect(buffer2._children).toHaveLength(1);
-      expect(buffer2._children[0]).toBe(child3);
+      expect(buffer1._nodeIndex).toBe(rootBuffer._nodeIndex);
+      expect(buffer2._nodeIndex).toBe(rootBuffer._nodeIndex);
+      expect(topology.count).toBe(4);
+      expect(topology.buffers[topology.root]).toBe(rootBuffer);
+      expect(topology.firstChild[rootBuffer._nodeIndex]).toBe(child1._nodeIndex);
+      expect(topology.nextSibling[child1._nodeIndex]).toBe(child2._nodeIndex);
+      expect(topology.nextSibling[child2._nodeIndex]).toBe(child3._nodeIndex);
+      expect(topology.nextSibling[child3._nodeIndex]).toBe(NO_NODE);
+      expect(topology.lastChild[rootBuffer._nodeIndex]).toBe(child3._nodeIndex);
+      expect(Array.from(iterateSpanChildren(rootBuffer))).toEqual([child1, child2, child3]);
 
       // Verify identity sharing
       expect(rootBuffer.trace_id).toBe(traceId);
