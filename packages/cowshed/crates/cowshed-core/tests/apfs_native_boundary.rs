@@ -1,5 +1,3 @@
-use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,7 +20,7 @@ use cowshed_core::storage::apfs::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, MarkerExpectation, MetadataPolicy,
 };
 use cowshed_core::storage::lifecycle::{
-    ExpectedState, LifecycleWorkspace, OperationIdentity, Pin, Revision,
+    ExpectedState, LifecycleWorkspace, OperationIdentity, Revision,
 };
 const ATTACH_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
 <dict><key>content-hint</key><string>GUID_partition_scheme</string><key>dev-entry</key><string>/dev/disk9</string></dict>
@@ -286,17 +284,6 @@ fn identity(fixture: &Fixture) -> OperationIdentity {
         grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
             .expect("grants"),
     }
-}
-
-fn make_old(path: &Path) {
-    let path = CString::new(path.as_os_str().as_bytes()).expect("path");
-    let old = libc::timespec {
-        tv_sec: 946_684_800,
-        tv_nsec: 0,
-    };
-    let times = [old, old];
-    let result = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) };
-    assert_eq!(result, 0, "set old checkpoint timestamp");
 }
 
 fn create_image(path: &Path, format: ImageFormat) {
