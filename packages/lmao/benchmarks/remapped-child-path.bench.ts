@@ -1,12 +1,19 @@
 import { bench, do_not_optimize, group, run, summary } from 'mitata';
-import { createTestOpMetadata, createTestSchema, createTestTraceRoot } from '../src/lib/__tests__/test-helpers.js';
-import { convertSpanTreeToArrowTable } from '../src/lib/convertToArrow.js';
+import {
+  defineLogSchema,
+  defineOpContext,
+  JsBufferStrategy,
+  S,
+  type SchemaWithMetadata,
+  TestTracer,
+} from '../src/index.js';
+import { convertSpanTreeToLeasedArrowTable } from '../src/lib/convertToArrow.js';
 import { createRemapDescriptor } from '../src/lib/library.js';
 import type { RemapDescriptor } from '../src/lib/logBinding.js';
-import { S } from '../src/lib/schema/builder.js';
 import type { LogSchema } from '../src/lib/schema/LogSchema.js';
-import { createChildSpanBuffer, createSpanBuffer, getSpanBufferClass } from '../src/lib/spanBuffer.js';
-import { writeSpanStart } from '../src/lib/spanContext.js';
+import { createChildSpanBuffer, createSpanBuffer } from '../src/lib/spanBuffer.js';
+import { createTraceRoot } from '../src/lib/traceRoot.node.js';
+import { iterateSpanChildren } from '../src/lib/traceTopology.js';
 import type { AnySpanBuffer } from '../src/lib/types.js';
 
 const QUICK = process.argv.includes('--quick');
@@ -20,15 +27,20 @@ const CAPACITY = 8;
 const MANY_MAPPING_COUNT = 8;
 
 const LABELS = {
-  unprefixed: 'unprefixed-raw-current',
-  current: 'current-remapped-view+_columns',
-  modeled: 'modeled-raw-child+immutable-cold-descriptor',
+  unprefixed: 'unprefixed-raw+topology',
+  current: 'legacy-remapped-view+topology',
+  modeled: 'CallsitePlan-descriptor+topology',
 } as const;
 
-type MutableBuffer = AnySpanBuffer & Record<string, unknown>;
 type LegacyRemapWrapper = (buffer: AnySpanBuffer) => AnySpanBuffer;
 type BenchmarkValue = Readonly<{ checksum: number; allocationCount: number; visitedObjects: number }>;
 type TreeMode = 'unprefixed' | 'current' | 'modeled';
+
+interface BufferPlan {
+  readonly schema: LogSchema;
+  createRoot(): AnySpanBuffer;
+  createChild(parent: AnySpanBuffer, spanName: string): AnySpanBuffer;
+}
 
 interface Workload {
   readonly depth: number;
@@ -38,8 +50,8 @@ interface Workload {
   readonly publicNames: readonly string[];
   readonly rawNames: readonly string[];
   readonly descriptor: RemapDescriptor;
-  readonly publicSchema: LogSchema;
-  readonly rawSchema: LogSchema;
+  readonly publicPlan: BufferPlan;
+  readonly rawPlan: BufferPlan;
   readonly wrapLegacyBuffer: LegacyRemapWrapper;
 }
 
@@ -50,20 +62,44 @@ interface TreeFixture {
   readonly depth: number;
   readonly mappingCount: number;
   readonly allocationCount: number;
+  readonly legacyViews: ReadonlyMap<AnySpanBuffer, AnySpanBuffer> | undefined;
 }
 
-const METADATA = createTestOpMetadata({
-  name: 'remapped-child-path-benchmark',
-  package_name: '@smoothbricks/lmao',
-  package_file: 'benchmarks/remapped-child-path.bench.ts',
-  git_sha: 'benchmark',
-  line: 1,
-});
-
-function numberFields(names: readonly string[]): Record<string, ReturnType<typeof S.number>> {
-  const fields: Record<string, ReturnType<typeof S.number>> = {};
+function numberFields(names: readonly string[]): Record<string, SchemaWithMetadata> {
+  const fields: Record<string, SchemaWithMetadata> = {};
   for (const name of names) fields[name] = S.number();
   return fields;
+}
+
+function createBufferPlan(fields: Record<string, SchemaWithMetadata>, label: string): BufferPlan {
+  const context = defineOpContext({ logSchema: defineLogSchema(fields) });
+  const op = context.defineOp(label, (ctx) => ctx.ok(undefined));
+  const plan = op.callsitePlan;
+  const tracer = new TestTracer(context, {
+    bufferStrategy: new JsBufferStrategy(),
+    createTraceRoot,
+  });
+
+  return {
+    schema: plan.schema,
+    createRoot() {
+      const root = createSpanBuffer(
+        plan.schema,
+        createTraceRoot(`${label}-trace`, tracer),
+        plan.metadata,
+        CAPACITY,
+        plan.SpanBufferClass,
+      );
+      plan.appenders.writeSpanStart(root, `${label}-root`);
+      root._writeIndex = 1;
+      return root;
+    },
+    createChild(parent, spanName) {
+      const child = createChildSpanBuffer(parent, plan.SpanBufferClass, plan.metadata, plan.metadata, CAPACITY);
+      plan.appenders.writeSpanStart(child, spanName);
+      return child;
+    },
+  };
 }
 
 function createLegacyRemapWrapper(outputToSourceMapping: Readonly<Record<string, string>>): LegacyRemapWrapper {
@@ -96,9 +132,13 @@ function createWorkload(depth: number, mappingCount: number): Workload {
   const rawNames = Object.freeze(Array.from({ length: mappingCount }, (_, index) => `value_${index}`));
   const outputToSourceMapping: Record<string, string> = {};
   for (let index = 0; index < publicNames.length; index++) {
-    outputToSourceMapping[publicNames[index]!] = rawNames[index]!;
+    const publicName = publicNames[index];
+    const rawName = rawNames[index];
+    if (publicName === undefined || rawName === undefined) throw new Error('Invalid remap workload');
+    outputToSourceMapping[publicName] = rawName;
   }
-  const rawSchema = createTestSchema(numberFields(rawNames));
+  const publicPlan = createBufferPlan(numberFields(publicNames), `public-${depth}-${mappingCount}`);
+  const rawPlan = createBufferPlan(numberFields(rawNames), `raw-${depth}-${mappingCount}`);
   return {
     depth,
     mappingCount,
@@ -106,47 +146,41 @@ function createWorkload(depth: number, mappingCount: number): Workload {
     mappingLabel: mappingCount === 1 ? 'one-mapping' : 'many-mappings',
     publicNames,
     rawNames,
-    descriptor: createRemapDescriptor(rawSchema, outputToSourceMapping),
-    publicSchema: createTestSchema(numberFields(publicNames)),
-    rawSchema,
+    descriptor: createRemapDescriptor(rawPlan.schema, outputToSourceMapping),
+    publicPlan,
+    rawPlan,
     wrapLegacyBuffer: createLegacyRemapWrapper(outputToSourceMapping),
   };
 }
 
-function createRoot(schema: LogSchema): AnySpanBuffer {
-  return createSpanBuffer(schema, createTestTraceRoot('remapped-child-benchmark'), METADATA, CAPACITY);
-}
-
 function writeDeterministicRow(buffer: AnySpanBuffer, names: readonly string[], level: number): void {
-  writeSpanStart(buffer, `child-${level}`);
-  const writable = buffer as MutableBuffer;
   for (let columnIndex = 0; columnIndex < names.length; columnIndex++) {
-    const writer = writable[names[columnIndex]!];
-    if (typeof writer !== 'function') throw new TypeError(`Missing generated writer for ${names[columnIndex]}`);
+    const name = names[columnIndex];
+    if (name === undefined) throw new Error('Missing deterministic column name');
+    const writer = Reflect.get(buffer, name);
+    if (typeof writer !== 'function') throw new TypeError(`Missing generated writer for ${name}`);
     Reflect.apply(writer, buffer, [0, level * 100 + columnIndex + 1]);
   }
   buffer._writeIndex = 1;
 }
 
 function appendTree(root: AnySpanBuffer, workload: Workload, mode: TreeMode): TreeFixture {
-  let rawParent = root;
-  const childSchema = mode === 'unprefixed' ? workload.publicSchema : workload.rawSchema;
+  let parent = root;
+  const bufferPlan = mode === 'unprefixed' ? workload.publicPlan : workload.rawPlan;
   const childNames = mode === 'unprefixed' ? workload.publicNames : workload.rawNames;
-  const ChildBufferClass = getSpanBufferClass(childSchema);
+  const legacyViews = mode === 'current' ? new Map<AnySpanBuffer, AnySpanBuffer>() : undefined;
   let allocationCount = 0;
 
   for (let level = 1; level <= workload.depth; level++) {
-    const child = createChildSpanBuffer(rawParent, ChildBufferClass, METADATA, METADATA, CAPACITY);
+    const child = bufferPlan.createChild(parent, `child-${level}`);
     allocationCount++;
     writeDeterministicRow(child, childNames, level);
-    if (mode === 'current') {
-      rawParent._children.push(workload.wrapLegacyBuffer(child));
+    if (mode !== 'unprefixed') child._remapDescriptor = workload.descriptor;
+    if (legacyViews !== undefined) {
+      legacyViews.set(child, workload.wrapLegacyBuffer(child));
       allocationCount++;
-    } else {
-      if (mode === 'modeled') child._remapDescriptor = workload.descriptor;
-      rawParent._children.push(child);
     }
-    rawParent = child;
+    parent = child;
   }
 
   return {
@@ -156,39 +190,57 @@ function appendTree(root: AnySpanBuffer, workload: Workload, mode: TreeMode): Tr
     depth: workload.depth,
     mappingCount: workload.mappingCount,
     allocationCount,
+    legacyViews,
   };
+}
+
+function readNumber(values: unknown, label: string): number {
+  if (typeof values !== 'object' || values === null) throw new Error(`Missing ${label}`);
+  const value = Reflect.get(values, '0');
+  if (typeof value !== 'number') throw new Error(`Missing ${label}`);
+  return value;
+}
+
+function onlyChild(parent: AnySpanBuffer): AnySpanBuffer | undefined {
+  let child: AnySpanBuffer | undefined;
+  for (const candidate of iterateSpanChildren(parent)) {
+    if (child !== undefined) throw new Error('Benchmark tree unexpectedly has sibling spans');
+    child = candidate;
+  }
+  return child;
 }
 
 function mappedTreeChecksum(tree: TreeFixture): BenchmarkValue {
   let checksum = 0;
   let visitedObjects = 0;
   let level = 0;
-  let children = tree.root._children;
+  let parent = tree.root;
 
-  while (children.length > 0) {
-    const visibleChild = children[0]!;
+  for (;;) {
+    const rawChild = onlyChild(parent);
+    if (rawChild === undefined) break;
     level++;
+    let visibleChild = rawChild;
+    if (tree.legacyViews !== undefined) {
+      const legacyView = tree.legacyViews.get(rawChild);
+      if (legacyView === undefined) throw new Error(`Missing legacy remap view at depth ${level}`);
+      visibleChild = legacyView;
+    }
     visitedObjects++;
     let mappedColumnIndex = 0;
     if (tree.mode === 'modeled') {
-      const columns = tree.descriptor.columns;
-      const storage = visibleChild as MutableBuffer;
-      for (let columnIndex = 0; columnIndex < columns.length; columnIndex++) {
-        const entry = columns[columnIndex]!;
-        const values = storage[entry[3]] as ArrayLike<number> | undefined;
-        const value = values?.[0];
-        if (value === undefined) throw new Error(`Missing modeled value for ${entry[0]} at depth ${level}`);
-        checksum = (checksum * 1_000_003 + value + columnIndex) >>> 0;
+      for (const entry of tree.descriptor.columns) {
+        const value = readNumber(Reflect.get(rawChild, entry[3]), `modeled value for ${entry[0]} at depth ${level}`);
+        checksum = (checksum * 1_000_003 + value + mappedColumnIndex) >>> 0;
         mappedColumnIndex++;
       }
     } else {
-      // Mirror the legacy Arrow pass 0: the benchmark-local wrapper exposes
-      // constructor-built prefixed columns and remaps access to canonical storage.
       for (const [publicName] of visibleChild._columns) {
         if (!publicName.startsWith('lib_value_')) continue;
-        const values = visibleChild.getColumnIfAllocated(publicName) as ArrayLike<number> | undefined;
-        const value = values?.[0];
-        if (value === undefined) throw new Error(`Missing current value for ${publicName} at depth ${level}`);
+        const value = readNumber(
+          visibleChild.getColumnIfAllocated(publicName),
+          `visible value for ${publicName} at depth ${level}`,
+        );
         checksum = (checksum * 1_000_003 + value + mappedColumnIndex) >>> 0;
         mappedColumnIndex++;
       }
@@ -196,7 +248,7 @@ function mappedTreeChecksum(tree: TreeFixture): BenchmarkValue {
     if (mappedColumnIndex !== tree.mappingCount) {
       throw new Error(`Expected ${tree.mappingCount} mapped columns, visited ${mappedColumnIndex}`);
     }
-    children = visibleChild._children;
+    parent = rawChild;
   }
 
   if (level !== tree.depth) throw new Error(`Expected depth ${tree.depth}, visited ${level}`);
@@ -204,25 +256,22 @@ function mappedTreeChecksum(tree: TreeFixture): BenchmarkValue {
 }
 
 function registrationSample(workload: Workload, mode: TreeMode): BenchmarkValue {
-  const root = createRoot(mode === 'unprefixed' ? workload.publicSchema : workload.rawSchema);
+  const bufferPlan = mode === 'unprefixed' ? workload.publicPlan : workload.rawPlan;
+  const root = bufferPlan.createRoot();
   let last: TreeFixture | undefined;
   let allocationCount = 1;
   for (let iteration = 0; iteration < REGISTRATION_ITERATIONS; iteration++) {
-    root._children.length = 0;
     last = appendTree(root, workload, mode);
     allocationCount += last.allocationCount;
   }
-  if (!last) throw new Error('Registration sample did not execute');
-  // Registration timing intentionally stops at ownership/linkage. Semantic mapped
-  // traversal is validated once in validateMappedChecksums before Mitata runs.
-  const checksum = (last.root === root ? 1 : 0) + root._children.length + workload.depth + workload.mappingCount;
-  root._children.length = 0;
+  if (last === undefined) throw new Error('Registration sample did not execute');
+  const checksum = root._traceRoot._topology.count + workload.depth + workload.mappingCount;
   return { checksum, allocationCount, visitedObjects: 0 };
 }
 
 function createTraversalFixture(workload: Workload, mode: TreeMode): TreeFixture {
-  const root = createRoot(mode === 'unprefixed' ? workload.publicSchema : workload.rawSchema);
-  return appendTree(root, workload, mode);
+  const bufferPlan = mode === 'unprefixed' ? workload.publicPlan : workload.rawPlan;
+  return appendTree(bufferPlan.createRoot(), workload, mode);
 }
 
 function traversalSample(tree: TreeFixture): BenchmarkValue {
@@ -237,17 +286,22 @@ function traversalSample(tree: TreeFixture): BenchmarkValue {
 }
 
 function arrowOutputChecksum(tree: TreeFixture, publicNames: readonly string[]): number {
-  const table = convertSpanTreeToArrowTable(tree.root);
-  let checksum = table.numRows;
-  for (const name of publicNames) {
-    const column = table.getChild(name);
-    if (!column) throw new Error(`Arrow output is missing mapped column ${name}`);
-    for (let row = 0; row < table.numRows; row++) {
-      const value = column.get(row);
-      if (typeof value === 'number') checksum = (checksum * 1_000_003 + value) >>> 0;
+  const lease = convertSpanTreeToLeasedArrowTable(tree.root);
+  try {
+    const { table } = lease;
+    let checksum = table.numRows;
+    for (const name of publicNames) {
+      const column = table.getChild(name);
+      if (column === null) throw new Error(`Arrow output is missing mapped column ${name}`);
+      for (let row = 0; row < table.numRows; row++) {
+        const value = column.get(row);
+        if (typeof value === 'number') checksum = (checksum * 1_000_003 + value) >>> 0;
+      }
     }
+    return checksum;
+  } finally {
+    lease.release();
   }
-  return checksum;
 }
 
 function validateArrowSemantics(workload: Workload): void {
@@ -265,14 +319,11 @@ function validateArrowSemantics(workload: Workload): void {
 }
 
 function validateMappedChecksums(workload: Workload): void {
-  const fixtures = [
-    createTraversalFixture(workload, 'unprefixed'),
-    createTraversalFixture(workload, 'current'),
-    createTraversalFixture(workload, 'modeled'),
-  ];
-  const checksums = fixtures.map((fixture) => mappedTreeChecksum(fixture).checksum);
-  if (checksums.some((checksum) => checksum !== checksums[0])) {
-    throw new Error(`Mapped traversal checksum mismatch: ${checksums.join(', ')}`);
+  const expected = mappedTreeChecksum(createTraversalFixture(workload, 'unprefixed')).checksum;
+  const current = mappedTreeChecksum(createTraversalFixture(workload, 'current')).checksum;
+  const modeled = mappedTreeChecksum(createTraversalFixture(workload, 'modeled')).checksum;
+  if (current !== expected || modeled !== expected) {
+    throw new Error(`Mapped traversal checksum mismatch: ${expected}, ${current}, ${modeled}`);
   }
 }
 
