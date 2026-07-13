@@ -31,24 +31,24 @@ impl GitRepository {
             });
         }
 
-        let git_dir_output = run_git_at(
-            path,
-            ["rev-parse", "--path-format=absolute", "--git-dir"],
-        )
-        .await?;
+        let git_dir_output =
+            run_git_at(path, ["rev-parse", "--path-format=absolute", "--git-dir"]).await?;
         if git_dir_output.status.success() {
             let git_dir = parse_one_path(&git_dir_output.stdout, "git directory")?;
-            if git_dir.file_name() == Some(OsStr::new(".git")) {
-                if let Some(root) = git_dir.parent() {
-                    return Ok(Self {
-                        root: root.to_path_buf(),
-                    });
-                }
+            if git_dir.file_name() == Some(OsStr::new(".git"))
+                && let Some(root) = git_dir.parent()
+            {
+                return Ok(Self {
+                    root: root.to_path_buf(),
+                });
             }
         }
 
         Err(CowshedError::environment_missing(
-            format!("{} is not inside a standalone git repository", path.display()),
+            format!(
+                "{} is not inside a standalone git repository",
+                path.display()
+            ),
             "cowshed adopt <git-root>",
         ))
     }
