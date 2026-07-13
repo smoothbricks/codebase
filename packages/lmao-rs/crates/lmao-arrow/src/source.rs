@@ -47,13 +47,11 @@ impl SpanSource for SpanBuffer {
     }
 
     fn packed_header(&self, row: usize) -> u32 {
-        self.entry_type_at(row)
-            .map(|entry_type| u32::from(entry_type.as_u8()))
-            .unwrap_or(0)
+        self.packed_header_at(row).unwrap_or(0)
     }
 
     fn dynamic_message(&self, row: usize) -> Option<&str> {
-        self.message_at(row)
+        self.dynamic_message_at(row)
     }
 
     fn line_number(&self, row: usize) -> u32 {
@@ -96,7 +94,7 @@ fn walk_node<'a, S: SpanSource, F: FnMut(&'a S)>(node: &'a S, f: &mut F) {
 pub struct MockSpan {
     pub identity: std::sync::Arc<SpanIdentity>,
     pub timestamps: Vec<i64>,
-    pub entry_types: Vec<u8>,
+    pub packed_headers: Vec<u32>,
     /// Parallel to rows; `None` = null dynamic message.
     pub messages: Vec<Option<String>>,
     pub overflow: Option<Box<MockSpan>>,
@@ -117,7 +115,7 @@ impl SpanSource for MockSpan {
     }
 
     fn packed_header(&self, row: usize) -> u32 {
-        u32::from(self.entry_types[row])
+        self.packed_headers[row]
     }
 
     fn dynamic_message(&self, row: usize) -> Option<&str> {

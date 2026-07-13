@@ -3,13 +3,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use lmao_arrow::{ColumnDictionary, MockSpan, SpanSource, build_trace_chunk_envelope, convert_span_trees};
 use arrow_array::Array;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt32Type;
+use lmao_arrow::{ColumnDictionary, MockSpan, build_trace_chunk_envelope, convert_span_trees};
 use lmao_arrow::{
-    VOCABULARY_DENSE_INDICES, VOCABULARY_IDS, VOCABULARY_VALUES,
-    static_vocabulary_dictionary,
+    VOCABULARY_DENSE_INDICES, VOCABULARY_IDS, VOCABULARY_VALUES, static_vocabulary_dictionary,
 };
 use lmao_core::{SpanIdentity, TraceId};
 use proptest::prelude::*;
@@ -73,7 +72,7 @@ fn build_tree(n: usize, trace: &str) -> MockSpan {
     let mut child = MockSpan {
         identity: child_id,
         timestamps: vec![10],
-        entry_types: vec![1],
+        packed_headers: vec![1],
         messages: vec![Some("child-span".into())],
         overflow: None,
         children: vec![],
@@ -81,7 +80,7 @@ fn build_tree(n: usize, trace: &str) -> MockSpan {
     let mut root = MockSpan {
         identity: root_id,
         timestamps: vec![0, 1],
-        entry_types: vec![1, 2],
+        packed_headers: vec![1, 2],
         messages: vec![Some("root-span".into()), None],
         overflow: None,
         children: vec![],
@@ -90,7 +89,7 @@ fn build_tree(n: usize, trace: &str) -> MockSpan {
     let mut overflow = MockSpan {
         identity: child.identity.clone(),
         timestamps: vec![],
-        entry_types: vec![],
+        packed_headers: vec![],
         messages: vec![],
         overflow: None,
         children: vec![],
@@ -103,7 +102,7 @@ fn build_tree(n: usize, trace: &str) -> MockSpan {
             &mut overflow
         };
         target.timestamps.push(ts);
-        target.entry_types.push(et as u8);
+        target.packed_headers.push(et);
         target.messages.push(msg);
     }
     if !overflow.timestamps.is_empty() {
@@ -144,56 +143,8 @@ fn packed(entry_type: u8, vocabulary_id: u32) -> u32 {
     (vocabulary_id << 8) | u32::from(entry_type)
 }
 
-#[derive(Debug)]
-struct DictionarySpan {
-    identity: Arc<SpanIdentity>,
-    timestamps: Vec<i64>,
-    packed_headers: Vec<u32>,
-    messages: Vec<Option<String>>,
-    overflow: Option<Box<DictionarySpan>>,
-    children: Vec<DictionarySpan>,
-}
-
-impl SpanSource for DictionarySpan {
-    fn identity(&self) -> &SpanIdentity {
-        &self.identity
-    }
-
-    fn row_count(&self) -> usize {
-        self.timestamps.len()
-    }
-
-    fn timestamp(&self, row: usize) -> i64 {
-        self.timestamps[row]
-    }
-
-    fn packed_header(&self, row: usize) -> u32 {
-        self.packed_headers[row]
-    }
-
-    fn dynamic_message(&self, row: usize) -> Option<&str> {
-        self.messages.get(row).and_then(|message| message.as_deref())
-    }
-
-    fn line_number(&self, _row: usize) -> u32 {
-        0
-    }
-
-    fn overflow(&self) -> Option<&Self> {
-        self.overflow.as_deref()
-    }
-
-    fn children(&self) -> &[Self] {
-        &self.children
-    }
-}
-
-fn dictionary_span(
-    trace: &str,
-    span_id: u32,
-    rows: &[(i64, u32, Option<String>)],
-) -> DictionarySpan {
-    DictionarySpan {
+fn dictionary_span(trace: &str, span_id: u32, rows: &[(i64, u32, Option<String>)]) -> MockSpan {
+    MockSpan {
         identity: Arc::new(SpanIdentity {
             thread_id: 0xABCD,
             span_id,
@@ -208,10 +159,10 @@ fn dictionary_span(
     }
 }
 
-fn message_dictionary(batch: &arrow_array::RecordBatch) -> (&arrow_array::UInt32Array, &arrow_array::StringArray) {
-    let message = batch
-        .column(7)
-        .as_dictionary::<UInt32Type>();
+fn message_dictionary(
+    batch: &arrow_array::RecordBatch,
+) -> (&arrow_array::UInt32Array, &arrow_array::StringArray) {
+    let message = batch.column(7).as_dictionary::<UInt32Type>();
     (message.keys(), message.values().as_string::<i32>())
 }
 
@@ -228,13 +179,19 @@ fn message_dictionary_reuses_static_prefix_and_appends_first_seen_dynamic_suffix
     );
     let static_batch = convert_span_trees(&[static_only]).unwrap();
     let (static_keys, static_values) = message_dictionary(&static_batch);
-    assert_eq!(static_values.len(), VOCABULARY_VALUES.len(), "static-only rows add no suffix");
+    assert_eq!(
+        static_values.len(),
+        VOCABULARY_VALUES.len(),
+        "static-only rows add no suffix"
+    );
     assert!(
         std::ptr::eq(static_values, static_vocabulary_dictionary().as_ref()),
         "static-only conversion reuses the cached dictionary allocation",
     );
     assert_eq!(
-        (0..static_values.len()).map(|index| static_values.value(index)).collect::<Vec<_>>(),
+        (0..static_values.len())
+            .map(|index| static_values.value(index))
+            .collect::<Vec<_>>(),
         static_ordinal_values(),
     );
     assert_eq!(
@@ -283,7 +240,9 @@ fn message_dictionary_reuses_static_prefix_and_appends_first_seen_dynamic_suffix
     let mixed_batch = convert_span_trees(&[root]).unwrap();
     let (keys, values) = message_dictionary(&mixed_batch);
     assert_eq!(
-        (VOCABULARY_VALUES.len()..values.len()).map(|index| values.value(index)).collect::<Vec<_>>(),
+        (VOCABULARY_VALUES.len()..values.len())
+            .map(|index| values.value(index))
+            .collect::<Vec<_>>(),
         ["dynamic-z", "dynamic-a", "dynamic-child"],
         "dynamic suffix follows first encounter across overflow and child rows",
     );
@@ -291,7 +250,9 @@ fn message_dictionary_reuses_static_prefix_and_appends_first_seen_dynamic_suffix
     let other_ordinal = VOCABULARY_IDS.binary_search(&OTHER_STATIC_LOG_ID).unwrap() as u32;
     let zero_ordinal = VOCABULARY_IDS.binary_search(&DENSE_ZERO_LOG_ID).unwrap() as u32;
     assert_eq!(
-        (0..keys.len()).map(|row| (!keys.is_null(row)).then(|| keys.value(row))).collect::<Vec<_>>(),
+        (0..keys.len())
+            .map(|row| (!keys.is_null(row)).then(|| keys.value(row)))
+            .collect::<Vec<_>>(),
         [
             Some(other_ordinal),
             Some(suffix),
@@ -303,7 +264,9 @@ fn message_dictionary_reuses_static_prefix_and_appends_first_seen_dynamic_suffix
         ],
     );
     assert_eq!(
-        (0..keys.len()).map(|row| (!keys.is_null(row)).then(|| values.value(keys.value(row) as usize))).collect::<Vec<_>>(),
+        (0..keys.len())
+            .map(|row| (!keys.is_null(row)).then(|| values.value(keys.value(row) as usize)))
+            .collect::<Vec<_>>(),
         [
             Some("literal braces: {ok} for {region}"),
             Some("dynamic-z"),
@@ -319,8 +282,16 @@ fn message_dictionary_reuses_static_prefix_and_appends_first_seen_dynamic_suffix
 fn dictionary_row_strategy() -> impl Strategy<Value = (u32, Option<String>, Option<String>)> {
     prop_oneof![
         Just((2, None, None)),
-        Just((packed(8, DENSE_ZERO_LOG_ID), None, Some("No items to validate".into()))),
-        Just((packed(8, OTHER_STATIC_LOG_ID), None, Some("literal braces: {ok} for {region}".into()))),
+        Just((
+            packed(8, DENSE_ZERO_LOG_ID),
+            None,
+            Some("No items to validate".into())
+        )),
+        Just((
+            packed(8, OTHER_STATIC_LOG_ID),
+            None,
+            Some("literal braces: {ok} for {region}".into())
+        )),
         "dynamic-[a-z]{0,8}".prop_map(|message| (8, Some(message.clone()), Some(message))),
     ]
 }

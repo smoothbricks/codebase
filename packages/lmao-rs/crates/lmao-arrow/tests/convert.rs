@@ -32,13 +32,12 @@ fn real_root(trace: &str, span_id: u32, logs: usize) -> SpanBuffer {
         trace_id: TraceId::new(trace).unwrap(),
         parent: None,
     });
-    let mut buf = SpanBuffer::start(identity.clone(), 8, &anchor, &clock);
-    buf.set_name("root-op");
+    let mut buf = SpanBuffer::start_dynamic(identity.clone(), 8, "root-op".into(), &anchor, &clock);
     buf.set_callsite("src/fixture.rs", 41);
     for i in 0..logs {
-        buf.append_msg(
+        buf.append_dynamic(
             EntryType::Info,
-            "log {i}",
+            Some("log {i}".into()),
             100 + i as u32,
             &anchor,
             &clock,
@@ -52,8 +51,8 @@ fn real_root(trace: &str, span_id: u32, logs: usize) -> SpanBuffer {
         trace_id: identity.trace_id.clone(),
         parent: Some(identity),
     });
-    let mut child = SpanBuffer::start(child_identity, 8, &anchor, &clock);
-    child.set_name("child-op");
+    let mut child =
+        SpanBuffer::start_dynamic(child_identity, 8, "child-op".into(), &anchor, &clock);
     child.end_ok(&anchor, &clock);
     buf.add_child(child);
     buf
