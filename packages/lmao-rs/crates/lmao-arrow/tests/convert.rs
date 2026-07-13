@@ -62,7 +62,8 @@ fn real_root(trace: &str, span_id: u32, logs: usize) -> SpanBuffer {
 fn converts_core_span_buffers_with_overflow() {
     // 20 logs in a capacity-8 buffer forces overflow chaining.
     let roots = [real_root("trace-x", 1, 20), real_root("trace-y", 2, 3)];
-    let batch = convert_span_trees(&roots, &StableVocabularyCatalog::EMPTY).unwrap();
+    let empty_catalog = StableVocabularyCatalog::EMPTY;
+    let batch = convert_span_trees(&roots, &empty_catalog).unwrap();
     // Root 1: 2 fixed rows + 20 logs + child (2 rows); root 2: 2 + 3 + 2.
     assert_eq!(batch.num_rows(), 24 + 7);
     // Row 1 of each span is a completion entry (span-ok, discriminant 2 → key 1).
@@ -113,11 +114,8 @@ fn converts_core_span_buffers_with_overflow() {
 
 #[test]
 fn single_trace_is_single_partition() {
-    let batch = convert_span_trees(
-        &[real_root("only-trace", 1, 4)],
-        &StableVocabularyCatalog::EMPTY,
-    )
-    .unwrap();
+    let empty_catalog = StableVocabularyCatalog::EMPTY;
+    let batch = convert_span_trees(&[real_root("only-trace", 1, 4)], &empty_catalog).unwrap();
     assert_eq!(
         inspect_partition_cardinality(&batch),
         PartitionCardinality::Single
@@ -137,11 +135,8 @@ fn pyarrow_reads_our_ipc() {
         return;
     }
 
-    let batch = convert_span_trees(
-        &[real_root("pyarrow-trace", 1, 10)],
-        &StableVocabularyCatalog::EMPTY,
-    )
-    .unwrap();
+    let empty_catalog = StableVocabularyCatalog::EMPTY;
+    let batch = convert_span_trees(&[real_root("pyarrow-trace", 1, 10)], &empty_catalog).unwrap();
     let dir = std::env::temp_dir().join("lmao-rs-pyarrow-verify");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("chunk.arrow");
