@@ -1,4 +1,4 @@
-module smoothbricks.dev/lmao-transformer-plugin
+module smoothbricks.dev/lmao-ttsc-plugin
 
 go 1.26
 

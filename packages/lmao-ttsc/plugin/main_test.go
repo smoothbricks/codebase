@@ -12,14 +12,14 @@ import (
 )
 
 func TestNearestPackage(t *testing.T) {
-	// This file lives inside @smoothbricks/lmao-transformer.
+	// This file lives inside @smoothbricks/lmao-ttsc.
 	abs, err := filepath.Abs("main.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	name, rel := nearestPackage(abs)
-	if name != "@smoothbricks/lmao-transformer" {
-		t.Fatalf("nearestPackage name = %q, want @smoothbricks/lmao-transformer", name)
+	if name != "@smoothbricks/lmao-ttsc" {
+		t.Fatalf("nearestPackage name = %q, want @smoothbricks/lmao-ttsc", name)
 	}
 	if rel != "plugin/main.go" {
 		t.Fatalf("nearestPackage rel = %q, want plugin/main.go", rel)
