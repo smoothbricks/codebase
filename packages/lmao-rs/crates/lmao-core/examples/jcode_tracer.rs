@@ -107,7 +107,10 @@ async fn main() {
             tokio::select! {
                 _ = interval.tick() => {
                     if !pending.is_empty() {
-                        // Production: lmao_arrow::convert_span_trees(&pending) -> RecordBatch
+                        // Production: lmao_arrow::convert_span_trees(
+                        //     &pending,
+                        //     &lmao_arrow::StableVocabularyCatalog::EMPTY,
+                        // ) -> RecordBatch
                         flushes += 1;
                         spans += pending.len();
                         entries += pending.iter().map(|b| b.write_index()).sum::<usize>();
