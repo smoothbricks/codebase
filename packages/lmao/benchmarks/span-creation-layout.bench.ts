@@ -10,14 +10,11 @@ import {
   getTagWriterClass,
   type WriterState,
 } from '../src/lib/codegen/fixedPositionWriterGenerator.js';
-import { createSpanLoggerClass } from '../src/lib/codegen/spanLoggerGenerator.js';
+import { createSpanLoggerClass, type SpanLoggerImpl } from '../src/lib/codegen/spanLoggerGenerator.js';
 import type { OpMetadata } from '../src/lib/op.js';
-import {
-  getPhysicalLayoutPlan,
-  sealCallsitePlan,
-  type CallsitePlan,
-} from '../src/lib/physicalLayoutPlan.js';
-import type { OpContext } from '../src/lib/opContext/types.js';
+import type { OpContext, SpanContext } from '../src/lib/opContext/types.js';
+import { type CallsitePlan, getPhysicalLayoutPlan, sealCallsitePlan } from '../src/lib/physicalLayoutPlan.js';
+import { resolveEntryType } from '../src/lib/resolveMessage.js';
 import { Ok } from '../src/lib/result.js';
 import {
   decodeRuntimeHint,
@@ -26,6 +23,7 @@ import {
   RUNTIME_HINT_RESULT,
   RUNTIME_HINT_SPAN,
 } from '../src/lib/runtimeHint.js';
+import { FeatureFlagEvaluator, type InferFeatureFlagsWithContext } from '../src/lib/schema/evaluator.js';
 import {
   createChildSpanBuffer,
   createOverflowBuffer,
@@ -41,18 +39,16 @@ import {
 import { iterateSpanChildren } from '../src/lib/traceTopology.js';
 import type { AnySpanBuffer, SpanBuffer } from '../src/lib/types.js';
 
-const CAPACITIES = [8, 64, 1024] as const;
+const CAPACITIES: readonly [8, 64, 1024] = [8, 64, 1024];
 const QUICK = process.argv.includes('--quick');
 const CAPACITY_ARGUMENT = process.argv.find((argument) => argument.startsWith('--capacity='));
-const SELECTED_CAPACITY = CAPACITY_ARGUMENT === undefined
-  ? undefined
-  : Number(CAPACITY_ARGUMENT.slice('--capacity='.length));
+const SELECTED_CAPACITY =
+  CAPACITY_ARGUMENT === undefined ? undefined : Number(CAPACITY_ARGUMENT.slice('--capacity='.length));
 const MEMORY_BATCH_SIZE = QUICK ? 4 : 32;
 const SCENARIO_ARGUMENT = process.argv.find((argument) => argument.startsWith('--scenario='));
 const SELECTED_SCENARIO = SCENARIO_ARGUMENT?.slice('--scenario='.length);
-const CAPACITY_FILTER = SELECTED_CAPACITY === undefined
-  ? CAPACITIES
-  : CAPACITIES.filter((capacity) => capacity === SELECTED_CAPACITY);
+const CAPACITY_FILTER =
+  SELECTED_CAPACITY === undefined ? CAPACITIES : CAPACITIES.filter((capacity) => capacity === SELECTED_CAPACITY);
 if (CAPACITY_ARGUMENT !== undefined && CAPACITY_FILTER.length === 0) {
   throw new Error(`Unsupported capacity ${CAPACITY_ARGUMENT}; expected 8, 64, or 1024`);
 }
@@ -64,9 +60,26 @@ const SpanLoggerClass = createSpanLoggerClass(schema);
 const TagWriterClass = getTagWriterClass(schema);
 const ResultWriterClass = getResultWriterClass(schema);
 
-type BenchmarkContext = OpContext & { logSchema: typeof schema };
-type Context = SpanContextInstance<BenchmarkContext>;
+type BenchmarkContext = OpContext<typeof schema, Record<never, never>, Record<never, never>, Record<never, never>>;
+type Context = SpanContext<BenchmarkContext>;
+type RuntimeContext = SpanContextInstance<BenchmarkContext>;
 const SpanContextClass = createSpanContextClass<BenchmarkContext>(schema, logBinding);
+
+class BenchmarkFeatureFlagEvaluator extends FeatureFlagEvaluator<BenchmarkContext> {
+  get<K extends keyof InferFeatureFlagsWithContext<BenchmarkContext> & string>(
+    _flag: K,
+  ): Promise<InferFeatureFlagsWithContext<BenchmarkContext>[K]>;
+  get(_flag: string): Promise<unknown>;
+  get(_flag: string): Promise<unknown> {
+    return Promise.resolve(undefined);
+  }
+
+  forContext(_ctx: Context): BenchmarkFeatureFlagEvaluator {
+    return this;
+  }
+}
+
+const benchmarkFeatureFlags = new BenchmarkFeatureFlagEvaluator();
 
 interface BenchmarkPlan {
   metadata: OpMetadata;
@@ -76,7 +89,7 @@ interface BenchmarkPlan {
 const benchmarkPlans = new Map<number, BenchmarkPlan>();
 
 function benchmarkPlan(capacity: number, runtimeHint?: number): BenchmarkPlan {
-  const resolvedHint = runtimeHint ?? (RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_FULL_CAPABILITIES | capacity);
+  const resolvedHint = runtimeHint ?? RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_FULL_CAPABILITIES | capacity;
   const cached = benchmarkPlans.get(resolvedHint);
   if (cached) return cached;
   const planSpanContextClass = createSpanContextClass<BenchmarkContext>(
@@ -113,24 +126,59 @@ function createRoot(capacity: number): SpanBuffer<typeof schema> {
   return createSpanBuffer(schema, createTestTraceRoot(), benchmarkPlan(capacity).metadata, capacity);
 }
 
-
-function createRootContext(root: SpanBuffer<typeof schema>): { context: Context; retained: object[] } {
+function createRootContext(root: SpanBuffer<typeof schema>): { context: RuntimeContext; retained: object[] } {
   const context = new SpanContextClass(root, schema, benchmarkPlan(root._capacity).callsitePlan);
   return { context, retained: [context.log, context.tag] };
 }
 
-function finishRoot(root: SpanBuffer<typeof schema>, result = new Ok(1, schema, root)): void {
+function finishRoot(root: SpanBuffer<typeof schema>, result = new Ok(1)): void {
   writeSpanEnd(root, result);
 }
 
-function createWriterState(root: SpanBuffer<typeof schema>): WriterState {
+interface BenchmarkWriterState extends WriterState {
+  _spanLogger?: SpanLoggerImpl<typeof schema>;
+}
+
+function createWriterState(root: SpanBuffer<typeof schema>): BenchmarkWriterState {
   const callsitePlan = benchmarkPlan(root._capacity).callsitePlan;
-  return {
+  const state: BenchmarkWriterState = {
     _spanBuffer: root,
     _buffer: root,
     _appendLogEntry: callsitePlan.appendLogEntry,
     _physicalLayoutPlan: callsitePlan,
+    _appendWriterEntry(entryType: number): number {
+      if (state._buffer._writeIndex >= state._buffer._capacity) {
+        state._buffer = state._buffer.getOrCreateOverflow();
+        state._spanLogger?._prefillScopedAttributesOn(state._buffer);
+      }
+      return state._appendLogEntry(state._buffer._traceRoot, state._buffer, entryType);
+    },
   };
+  return state;
+}
+
+function isBenchmarkBuffer(buffer: AnySpanBuffer): buffer is SpanBuffer<typeof schema> {
+  return buffer._logSchema === schema;
+}
+
+function requireBenchmarkBuffer(buffer: AnySpanBuffer): SpanBuffer<typeof schema> {
+  if (!isBenchmarkBuffer(buffer)) throw new TypeError('Benchmark buffer schema does not match');
+  return buffer;
+}
+
+function isRuntimeContext(value: unknown): value is RuntimeContext {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    Reflect.get(value, '_schema') === schema &&
+    typeof Reflect.get(value, '_newCtx0') === 'function' &&
+    typeof Reflect.get(value, 'span0') === 'function'
+  );
+}
+
+function requireRuntimeContext(value: unknown): RuntimeContext {
+  if (!isRuntimeContext(value)) throw new TypeError('Benchmark child context is invalid');
+  return value;
 }
 
 function childrenOf(buffer: AnySpanBuffer): AnySpanBuffer[] {
@@ -144,7 +192,7 @@ function messageAt(buffer: AnySpanBuffer, row: number): string {
 
 function lifecycleChecksum(outcome: Outcome): string {
   const encode = (buffer: AnySpanBuffer, parent: AnySpanBuffer | undefined): string => {
-    const rows = Array.from(buffer.entry_type.slice(0, buffer._writeIndex)).join(',');
+    const rows = Array.from({ length: buffer._writeIndex }, (_, row) => resolveEntryType(buffer, row)).join(',');
     const messages = Array.from({ length: buffer._writeIndex }, (_, row) => messageAt(buffer, row)).join(',');
     const overflow: string[] = [];
     let next = buffer._overflow;
@@ -221,9 +269,10 @@ function exactRetainedStorage(outcomes: readonly Outcome[]): {
 }
 
 function forceGarbageCollection(): void {
-  const bun = Reflect.get(globalThis, 'Bun') as { gc?: (force?: boolean) => void } | undefined;
+  const bun = Reflect.get(globalThis, 'Bun');
+  const bunGc = typeof bun === 'object' && bun !== null ? Reflect.get(bun, 'gc') : undefined;
   const gc = Reflect.get(globalThis, 'gc');
-  if (bun?.gc) bun.gc(true);
+  if (typeof bunGc === 'function') Reflect.apply(bunGc, bun, [true]);
   else if (typeof gc === 'function') Reflect.apply(gc, globalThis, []);
 }
 
@@ -240,37 +289,39 @@ async function measureEffectiveMemory(name: string, scenario: Scenario): Promise
   const arrayBuffersBefore = before.arrayBuffers ?? 0;
   const arrayBuffersAfter = after.arrayBuffers ?? 0;
 
-  process.stderr.write(`effective-memory ${JSON.stringify({
-    scenario: name,
-    variant: scenario.label,
-    retainedOutcomes: outcomes.length,
-    processDeltaBytes: {
-      heapUsed: heapUsedDelta,
-      external: externalDelta,
-      arrayBuffers: arrayBuffersAfter - arrayBuffersBefore,
-      rss: after.rss - before.rss,
-      effectiveHeapPlusExternal: heapUsedDelta + externalDelta,
-    },
-    exactRetained: storage,
-    perOutcome: {
-      effectiveHeapPlusExternalBytes: (heapUsedDelta + externalDelta) / outcomes.length,
-      backingStoreBytes: storage.backingStoreBytes / outcomes.length,
-      reachableDomainObjects: storage.reachableDomainObjects / outcomes.length,
-    },
-    components: {
-      wasm: 'not-exercised',
-      arrowLease: 'not-exercised',
-      arrowTemporary: 'not-exercised',
-      dictionary: 'not-exercised',
-      cache: 'not-exercised',
-    },
-  })}\n`);
+  process.stderr.write(
+    `effective-memory ${JSON.stringify({
+      scenario: name,
+      variant: scenario.label,
+      retainedOutcomes: outcomes.length,
+      processDeltaBytes: {
+        heapUsed: heapUsedDelta,
+        external: externalDelta,
+        arrayBuffers: arrayBuffersAfter - arrayBuffersBefore,
+        rss: after.rss - before.rss,
+        effectiveHeapPlusExternal: heapUsedDelta + externalDelta,
+      },
+      exactRetained: storage,
+      perOutcome: {
+        effectiveHeapPlusExternalBytes: (heapUsedDelta + externalDelta) / outcomes.length,
+        backingStoreBytes: storage.backingStoreBytes / outcomes.length,
+        reachableDomainObjects: storage.reachableDomainObjects / outcomes.length,
+      },
+      components: {
+        wasm: 'not-exercised',
+        arrowLease: 'not-exercised',
+        arrowTemporary: 'not-exercised',
+        dictionary: 'not-exercised',
+        cache: 'not-exercised',
+      },
+    })}\n`,
+  );
 }
 
 function rootCreationScenarios(capacity: number): Scenario[] {
   const complete = (root: SpanBuffer<typeof schema>): Outcome => {
     writeSpanStart(root, 'root');
-    const result = new Ok(1, schema, root);
+    const result = new Ok(1);
     finishRoot(root, result);
     return { root, contexts: [], retained: [result] };
   };
@@ -280,7 +331,16 @@ function rootCreationScenarios(capacity: number): Scenario[] {
       label: 'production strategy',
       run: () => {
         const traceRoot = createTestTraceRoot();
-        return complete(traceRoot.tracer.bufferStrategy.createSpanBuffer(schema, traceRoot, benchmarkPlan(capacity).metadata, capacity));
+        return complete(
+          requireBenchmarkBuffer(
+            traceRoot.tracer.bufferStrategy.createSpanBuffer(
+              schema,
+              traceRoot,
+              benchmarkPlan(capacity).metadata,
+              capacity,
+            ),
+          ),
+        );
       },
     },
   ];
@@ -292,7 +352,12 @@ function setupScenarios(capacity: number): Scenario[] {
     writeSpanStart(root, 'root');
     const retained: object[] = [];
     const contexts: Context[] = [];
-    if (kind === 'logger') retained.push(new SpanLoggerClass(createWriterState(root)));
+    if (kind === 'logger') {
+      const state = createWriterState(root);
+      const logger = new SpanLoggerClass(state);
+      state._spanLogger = logger;
+      retained.push(logger);
+    }
     if (kind === 'tag') retained.push(new TagWriterClass(createWriterState(root)));
     if (kind === 'result') retained.push(new ResultWriterClass(createWriterState(root)));
     if (kind === 'context') {
@@ -300,7 +365,7 @@ function setupScenarios(capacity: number): Scenario[] {
       retained.push(context.log, context.tag);
       contexts.push(context);
     }
-    const result = new Ok(1, schema, root);
+    const result = new Ok(1);
     retained.push(result);
     finishRoot(root, result);
     return { root, contexts, retained };
@@ -320,22 +385,39 @@ function childCreationScenarios(capacity: number): Scenario[] {
     writeSpanStart(root, 'root');
     const child = factory(root);
     writeSpanStart(child, 'child');
-    const childResult = new Ok(1, schema, child);
+    const childResult = new Ok(1);
     finishRoot(child, childResult);
-    const rootResult = new Ok(1, schema, root);
+    const rootResult = new Ok(1);
     finishRoot(root, rootResult);
     return { root, contexts: [], retained: [childResult, rootResult] };
   };
   return [
     {
       label: 'production factory',
-      run: () => complete((root) => createChildSpanBuffer(root, SpanBufferClass, benchmarkPlan(capacity).metadata, benchmarkPlan(capacity).metadata, capacity)),
+      run: () =>
+        complete((root) =>
+          createChildSpanBuffer(
+            root,
+            SpanBufferClass,
+            benchmarkPlan(capacity).metadata,
+            benchmarkPlan(capacity).metadata,
+            capacity,
+          ),
+        ),
     },
     {
       label: 'production strategy',
       run: () =>
         complete((root) =>
-          root._traceRoot.tracer.bufferStrategy.createChildSpanBuffer(root, benchmarkPlan(capacity).metadata, benchmarkPlan(capacity).metadata, capacity, schema),
+          requireBenchmarkBuffer(
+            root._traceRoot.tracer.bufferStrategy.createChildSpanBuffer(
+              root,
+              benchmarkPlan(capacity).metadata,
+              benchmarkPlan(capacity).metadata,
+              capacity,
+              schema,
+            ),
+          ),
         ),
     },
   ];
@@ -343,11 +425,11 @@ function childCreationScenarios(capacity: number): Scenario[] {
 
 function overflowCreationScenarios(capacity: number): Scenario[] {
   const complete = (factory: (root: SpanBuffer<typeof schema>) => SpanBuffer<typeof schema>): Outcome => {
-    (SpanBufferClass.stats as { capacity: number }).capacity = capacity;
+    SpanBufferClass.stats.capacity = capacity;
     const root = createRoot(capacity);
     writeSpanStart(root, 'root');
     factory(root);
-    const result = new Ok(1, schema, root);
+    const result = new Ok(1);
     finishRoot(root, result);
     return { root, contexts: [], retained: [result] };
   };
@@ -355,24 +437,31 @@ function overflowCreationScenarios(capacity: number): Scenario[] {
     { label: 'production factory', run: () => complete(createOverflowBuffer) },
     {
       label: 'production strategy',
-      run: () => complete((root) => root._traceRoot.tracer.bufferStrategy.createOverflowBuffer(root)),
+      run: () =>
+        complete((root) => requireBenchmarkBuffer(root._traceRoot.tracer.bufferStrategy.createOverflowBuffer(root))),
     },
-    { label: 'production instance method', run: () => complete((root) => root.getOrCreateOverflow()) },
+    {
+      label: 'production instance method',
+      run: () => complete((root) => requireBenchmarkBuffer(root.getOrCreateOverflow())),
+    },
   ];
 }
 
-function makeRootFixture(capacity: number): { root: SpanBuffer<typeof schema>; context: Context; retained: object[] } {
+function makeRootFixture(capacity: number): {
+  root: SpanBuffer<typeof schema>;
+  context: RuntimeContext;
+  retained: object[];
+} {
   const root = createRoot(capacity);
   writeSpanStart(root, 'root');
   const { context, retained } = createRootContext(root);
-  const featureFlags = { forContext: () => featureFlags };
-  context.ff = featureFlags as Context['ff'];
+  context.ff = benchmarkFeatureFlags;
   context.deps = {};
   return { root, context, retained };
 }
 
 function finalizeFixture(root: SpanBuffer<typeof schema>, contexts: Context[], retained: object[]): Outcome {
-  const result = new Ok(1, schema, root);
+  const result = new Ok(1);
   retained.push(result);
   finishRoot(root, result);
   return { root, contexts, retained };
@@ -396,16 +485,16 @@ function contextShapeScenarios(capacity: number, depth: 0 | 1 | 3): Scenario[] {
     const contexts: Context[] = [context];
     if (depth === 1) {
       await context.span('child', (child) => {
-        contexts.push(child as Context);
+        contexts.push(child);
         const result = child.ok(1);
         retained.push(result);
         return result;
       });
     } else {
       await context.span('child-1', async (child1) => {
-        contexts.push(child1 as Context);
+        contexts.push(child1);
         await child1.span('child-2', (child2) => {
-          contexts.push(child2 as Context);
+          contexts.push(child2);
           const result = child2.ok(1);
           retained.push(result);
           return result;
@@ -423,37 +512,31 @@ function contextShapeScenarios(capacity: number, depth: 0 | 1 | 3): Scenario[] {
     const contexts: Context[] = [context];
     if (depth === 1) {
       await context.span0(0, 'child', context._newCtx0(), benchmarkPlan(capacity).callsitePlan, (child) => {
-        contexts.push(child as Context);
+        contexts.push(child);
         const result = child.ok(1);
         retained.push(result);
         return result;
       });
     } else {
-      await context.span0(
-        0,
-        'child-1',
-        context._newCtx0(),
-        benchmarkPlan(capacity).callsitePlan,
-        async (child1) => {
-          const directChild1 = child1 as Context;
-          contexts.push(directChild1);
-          await directChild1.span0(
-            0,
-            'child-2',
-            directChild1._newCtx0(),
-            benchmarkPlan(capacity).callsitePlan,
-            (child2) => {
-              contexts.push(child2 as Context);
-              const result = child2.ok(1);
-              retained.push(result);
-              return result;
-            },
-          );
-          const result = child1.ok(1);
-          retained.push(result);
-          return result;
-        },
-      );
+      await context.span0(0, 'child-1', context._newCtx0(), benchmarkPlan(capacity).callsitePlan, async (child1) => {
+        const directChild1 = requireRuntimeContext(child1);
+        contexts.push(directChild1);
+        await directChild1.span0(
+          0,
+          'child-2',
+          directChild1._newCtx0(),
+          benchmarkPlan(capacity).callsitePlan,
+          (child2) => {
+            contexts.push(child2);
+            const result = child2.ok(1);
+            retained.push(result);
+            return result;
+          },
+        );
+        const result = child1.ok(1);
+        retained.push(result);
+        return result;
+      });
     }
     return finalizeFixture(root, contexts, retained);
   };
@@ -486,8 +569,8 @@ function capabilityScenarios(capacity: number): Scenario[] {
       const { root, context, retained } = makeRootFixture(capacity);
       const contexts: Context[] = [context];
       const childPlan = benchmarkPlan(capacity, hint).callsitePlan;
-      await context.span0(0, 'child', childPlan.newCtx0(context), childPlan, (child) => {
-        contexts.push(child as Context);
+      await context.span0(0, 'child', requireRuntimeContext(childPlan.newCtx0(context)), childPlan, (child) => {
+        contexts.push(child);
         const result = child.ok(1);
         retained.push(result);
         return result;
