@@ -6,20 +6,40 @@
  */
 
 import { bench, do_not_optimize, group, run, summary } from 'mitata';
-import { createSpanLogger } from '../src/lib/codegen/spanLoggerGenerator.js';
+import { type WriterState } from '../src/lib/codegen/fixedPositionWriterGenerator.js';
+import { createSpanLogger, type SpanLoggerImpl } from '../src/lib/codegen/spanLoggerGenerator.js';
 import { JsBufferStrategy } from '../src/lib/JsBufferStrategy.js';
 import { DEFAULT_METADATA } from '../src/lib/opContext/defineOp.js';
+import { getPhysicalLayoutPlan, sealCallsitePlan } from '../src/lib/physicalLayoutPlan.js';
+import { RUNTIME_HINT_ANALYZED_VALID, RUNTIME_HINT_FULL_CAPABILITIES } from '../src/lib/runtimeHint.js';
 import { S } from '../src/lib/schema/builder.js';
 import { LogSchema } from '../src/lib/schema/LogSchema.js';
 import { ENTRY_TYPE_INFO, mergeWithSystemSchema } from '../src/lib/schema/systemSchema.js';
 import { createOverflowBuffer, createSpanBuffer, getSpanBufferClass } from '../src/lib/spanBuffer.js';
 import type { TracerLifecycleHooks } from '../src/lib/traceRoot.js';
 import { createTraceRoot } from '../src/lib/traceRoot.node.js';
+import { createSpanContextClass } from '../src/lib/spanContext.js';
 import type { AnySpanBuffer } from '../src/lib/types.js';
 import { resolveMessage } from '../src/lib/resolveMessage.js';
 import { registerBenchmarkVocabulary } from './vocabularyFixture.js';
 
 const LOG_COUNTS = [0, 1, 50] as const;
+const LOG_COUNT_ARGUMENT = process.argv.find((argument) => argument.startsWith('--logs='));
+const SELECTED_LOG_COUNT = LOG_COUNT_ARGUMENT === undefined ? undefined : Number(LOG_COUNT_ARGUMENT.slice('--logs='.length));
+const LOG_COUNT_FILTER = SELECTED_LOG_COUNT === undefined
+  ? LOG_COUNTS
+  : LOG_COUNTS.filter((count) => count === SELECTED_LOG_COUNT);
+if (LOG_COUNT_ARGUMENT !== undefined && LOG_COUNT_FILTER.length === 0) {
+  throw new Error(`Unsupported ${LOG_COUNT_ARGUMENT}; expected 0, 1, or 50`);
+}
+const MODE_ARGUMENT = process.argv.find((argument) => argument.startsWith('--mode='));
+const SELECTED_MODE = MODE_ARGUMENT?.slice('--mode='.length);
+const MESSAGE_MODES = (['literal', 'dynamic'] as const).filter(
+  (mode) => SELECTED_MODE === undefined || mode === SELECTED_MODE,
+);
+if (MODE_ARGUMENT !== undefined && MESSAGE_MODES.length === 0) {
+  throw new Error(`Unsupported ${MODE_ARGUMENT}; expected literal or dynamic`);
+}
 const LITERAL_MESSAGE = 'request accepted';
 const LITERAL_BINDING = registerBenchmarkVocabulary([LITERAL_MESSAGE]);
 const LINE = 137;
@@ -28,6 +48,42 @@ const REQUESTS_PER_SAMPLE = QUICK ? 4 : 200;
 const CAPACITY = 8;
 
 const schema = new LogSchema(mergeWithSystemSchema({ marker: S.number() }));
+const SpanBufferClass = getSpanBufferClass(schema);
+const SpanContextClass = createSpanContextClass(schema, { logSchema: schema });
+const physicalLayoutPlan = getPhysicalLayoutPlan(
+  SpanBufferClass,
+  RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_FULL_CAPABILITIES | CAPACITY,
+  SpanContextClass,
+);
+const BENCHMARK_METADATA = Object.freeze({ ...DEFAULT_METADATA, _physicalLayoutPlan: physicalLayoutPlan });
+const callsitePlan = sealCallsitePlan(physicalLayoutPlan, BENCHMARK_METADATA);
+
+interface BenchmarkWriterState extends WriterState {
+  _spanLogger?: SpanLoggerImpl<typeof schema>;
+}
+
+function createBenchmarkSpanLogger(root: AnySpanBuffer): SpanLoggerImpl<typeof schema> {
+  const plannedAppend = Reflect.get(callsitePlan, 'appendLogEntry');
+  const appendLogEntry = typeof plannedAppend === 'function'
+    ? plannedAppend as WriterState['_appendLogEntry']
+    : root._traceRoot._appendLogEntry;
+  const state: BenchmarkWriterState = {
+    _spanBuffer: root,
+    _buffer: root,
+    _appendLogEntry: appendLogEntry,
+    _physicalLayoutPlan: callsitePlan,
+    _appendWriterEntry(entryType: number): number {
+      if (state._buffer._writeIndex >= state._buffer._capacity) {
+        state._buffer = state._buffer.getOrCreateOverflow();
+        state._spanLogger?._prefillScopedAttributesOn(state._buffer);
+      }
+      return state._appendLogEntry(state._buffer._traceRoot, state._buffer, entryType);
+    },
+  };
+  const logger = createSpanLogger(schema, state);
+  state._spanLogger = logger;
+  return logger;
+}
 type MessageMode = 'literal' | 'dynamic';
 type AppendMode = 'trace-root-method' | 'inline';
 type OverflowMode = 'method' | 'inline-compare';
@@ -90,7 +146,9 @@ function newRootBuffer(_mode: MessageMode, counters: Counters): AnySpanBuffer {
   resetSharedStats();
   const root = createTraceRoot('log-call-path', tracer);
   counters.buffersCreated++;
-  return createSpanBuffer(schema, root, DEFAULT_METADATA, CAPACITY);
+  const buffer = createSpanBuffer(schema, root, BENCHMARK_METADATA, CAPACITY);
+  buffer._writeIndex = 2;
+  return buffer;
 }
 
 function messageFor(mode: MessageMode, request: number, log: number, counters: Counters): string {
@@ -154,7 +212,7 @@ function runCurrentFluent(logCount: number, mode: MessageMode): Observation {
   let rows = 0;
   for (let request = 0; request < REQUESTS_PER_SAMPLE; request++) {
     const root = newRootBuffer(mode, counters);
-    const logger = createSpanLogger(schema, root);
+    const logger = createBenchmarkSpanLogger(root);
     counters.writerObjects++;
     for (let log = 0; log < logCount; log++) {
       logger.info(messageFor(mode, request, log, counters)).line(LINE);
@@ -175,7 +233,7 @@ function runCurrentTransformerOutput(logCount: number): Observation {
   let rows = 0;
   for (let request = 0; request < REQUESTS_PER_SAMPLE; request++) {
     const root = newRootBuffer('literal', counters);
-    const logger = createSpanLogger(schema, root);
+    const logger = createBenchmarkSpanLogger(root);
     counters.writerObjects++;
     for (let log = 0; log < logCount; log++) {
       logger._infoTemplate(LITERAL_BINDING[0]!).line(LINE);
@@ -264,7 +322,9 @@ function runModel(logCount: number, mode: MessageMode, options: ModelOptions): O
 }
 function newTimedRoot(_mode: MessageMode): AnySpanBuffer {
   resetSharedStats();
-  return createSpanBuffer(schema, createTraceRoot('log-call-path', tracer), DEFAULT_METADATA, CAPACITY);
+  const buffer = createSpanBuffer(schema, createTraceRoot('log-call-path', tracer), BENCHMARK_METADATA, CAPACITY);
+  buffer._writeIndex = 2;
+  return buffer;
 }
 
 function timedMessage(mode: MessageMode, request: number, log: number): string {
@@ -274,17 +334,21 @@ function timedMessage(mode: MessageMode, request: number, log: number): string {
 function consumeFinalBuffer(buffer: AnySpanBuffer): number {
   const row = buffer._writeIndex - 1;
   const messageLength = buffer.message_values?.[row]?.length ?? 0;
-  return buffer._writeIndex + (buffer.entry_type[row] ?? 0) + messageLength + (buffer._logHeaders[row] ?? 0);
+  const splitHeaders = Reflect.get(buffer, '_logHeaders') as Uint32Array | undefined;
+  const currentIds = Reflect.get(buffer, '_messageIds') as Uint16Array | undefined;
+  const packedHeaders = Reflect.get(buffer, '_rowHeaders') as Uint32Array | undefined;
+  const messageIdentity = splitHeaders?.[row] ?? currentIds?.[row] ?? packedHeaders?.[row] ?? 0;
+  return buffer._writeIndex + (buffer.entry_type[row] ?? 0) + messageLength + messageIdentity;
 }
 
 function timeCurrentFluent(logCount: number, mode: MessageMode): number {
   let sink = 0;
   for (let request = 0; request < REQUESTS_PER_SAMPLE; request++) {
-    const logger = createSpanLogger(schema, newTimedRoot(mode));
+    const logger = createBenchmarkSpanLogger(newTimedRoot(mode));
     for (let log = 0; log < logCount; log++) {
       logger.info(timedMessage(mode, request, log)).line(LINE);
     }
-    sink ^= consumeFinalBuffer(logger._buffer);
+    sink ^= consumeFinalBuffer((Reflect.get(logger, '_state') as WriterState)._buffer);
   }
   return sink;
 }
@@ -292,9 +356,9 @@ function timeCurrentFluent(logCount: number, mode: MessageMode): number {
 function timeCurrentTransformerOutput(logCount: number): number {
   let sink = 0;
   for (let request = 0; request < REQUESTS_PER_SAMPLE; request++) {
-    const logger = createSpanLogger(schema, newTimedRoot('literal'));
+    const logger = createBenchmarkSpanLogger(newTimedRoot('literal'));
     for (let log = 0; log < logCount; log++) logger._infoTemplate(LITERAL_BINDING[0]!).line(LINE);
-    sink ^= consumeFinalBuffer(logger._buffer);
+    sink ^= consumeFinalBuffer((Reflect.get(logger, '_state') as WriterState)._buffer);
   }
   return sink;
 }
@@ -436,8 +500,8 @@ function preflight(logCount: number, messageMode: MessageMode, variants: readonl
   }
 }
 
-for (const messageMode of ['literal', 'dynamic'] as const) {
-  for (const logCount of LOG_COUNTS) {
+for (const messageMode of MESSAGE_MODES) {
+  for (const logCount of LOG_COUNT_FILTER) {
     const variants = variantsFor(logCount, messageMode);
     preflight(logCount, messageMode, variants);
     summary(() => {
@@ -459,5 +523,8 @@ for (const messageMode of ['literal', 'dynamic'] as const) {
 }
 
 const format = process.argv.includes('--json') ? 'json' : process.argv.includes('--markdown') ? 'markdown' : 'mitata';
+const filterArgument = process.argv.find((argument) => argument.startsWith('--filter='));
+const filter = filterArgument === undefined ? undefined : new RegExp(filterArgument.slice('--filter='.length));
 
-await run({ format, colors: format === 'mitata' });
+if (format === 'json') await run({ format: { json: { samples: true } }, filter, colors: false });
+else await run({ format, filter, colors: format === 'mitata' });
