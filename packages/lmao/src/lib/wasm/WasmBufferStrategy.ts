@@ -29,6 +29,7 @@ import {
   isWasmSpanBufferInstance,
   type WasmSpanBufferInstance,
 } from './wasmSpanBuffer.js';
+import { WasmTraceRoot } from './wasmTraceRoot.js';
 
 // Spec link (88): realizes specs/lmao/01q_wasm_memory_architecture.md#smoo/lmao!n/wasm-mem (OpContext integration + trace completion).
 //#region smoo/lmao!n/wasm-mem.strategy
@@ -75,6 +76,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
    * Shared across all buffers created by this strategy.
    */
   readonly allocator: WasmAllocator;
+  private readonly liveRoots = new Set<WasmSpanBufferInstance>();
 
   /**
    * Private constructor - use static create() method.
@@ -117,6 +119,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
       opMetadata, // _opMetadata
       opMetadata, // _callsiteMetadata (same as opMetadata for root)
     );
+    this.liveRoots.add(wasmBuffer);
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- generated WASM buffers implement the SpanBuffer contract for the same schema.
     return wasmBuffer as unknown as SpanBuffer<T>;
@@ -174,8 +177,12 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
   }
 
   releaseBuffer(buffer: AnySpanBuffer): void {
-    // Walk the span tree and free all WASM memory
-    this.freeSpanTree(requireWasmSpanBuffer(buffer));
+    const root = requireWasmSpanBuffer(buffer);
+    this.freeSpanTree(root);
+    if (root._descriptor.kind === 'root' && root._traceRoot instanceof WasmTraceRoot) {
+      root._traceRoot.free();
+    }
+    this.liveRoots.delete(root);
   }
 
   /**
@@ -200,11 +207,20 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
     }
   }
 
-  /**
-   * Reset the allocator (for testing/benchmarking).
-   * WARNING: This invalidates ALL buffers created by this strategy.
-   */
+  private invalidateSpanTree(buffer: WasmSpanBufferInstance): void {
+    for (const child of buffer._children) this.invalidateSpanTree(child);
+    if (buffer._overflow) this.invalidateSpanTree(buffer._overflow);
+    buffer._columnPtrs.fill(-1);
+    buffer._descriptor.state = 'freed';
+  }
+
+  /** Reset invalidates every live handle before allocator offsets are reused. */
   reset(): void {
+    for (const root of this.liveRoots) {
+      this.invalidateSpanTree(root);
+      if (root._traceRoot instanceof WasmTraceRoot) root._traceRoot.invalidate();
+    }
+    this.liveRoots.clear();
     this.allocator.reset();
   }
 
