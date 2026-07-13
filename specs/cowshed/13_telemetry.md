@@ -36,12 +36,12 @@ Propagation across cowshed's own boundaries:
 - The shell supervisor **injects `TRACEPARENT` into each job's environment** (04_sandbox.md exec pipeline). The
   control-channel `run` message carries the traceparent (11_shell.md protocol), so a job's span parents to the exec that
   launched it — and any lmao-instrumented tool inside the job continues the same trace with no cowshed plumbing.
-- **Job records** carry `repo_id`, `workspace_incarnation`, and the workspace-local numeric `job_id` beside standard
-  lmao `trace_id` / `thread_id` / `span_id` / `parent_thread_id` / `parent_span_id`, `grant_revision`, and `env_hash`
-  (11_shell.md). `job_id` links the span to job control and `.cowshed/job/<job_id>/…`; it never substitutes for or
-  reuses `span_id`. The durable correlation key is `(repo_id, workspace_incarnation, job_id)` (camelCase:
-  `(repoId, workspaceIncarnation, jobId)`), so records copied through checkpoints remain distinct from jobs submitted in
-  a later incarnation.
+- **Job spans** carry `repo_id`, `workspace_incarnation`, and workspace-local numeric `job_id` beside standard lmao
+  `trace_id` / `thread_id` / `span_id` / `parent_thread_id` / `parent_span_id`, `grant_revision`, and `env_hash`
+  (11_shell.md). `job_id` joins the span to job control and protected evidence representation-transparently; it promises
+  no per-job file path and never substitutes for `span_id`. The durable key is
+  `(repo_id, workspace_incarnation, job_id)` (camelCase `(repoId, workspaceIncarnation,jobId)`), so copied checkpoint
+  history remains distinct from jobs submitted in a later incarnation.
 - **Deferred work** — `rm` teardown, `gc` completing interrupted cleanup, autosave ticks (02_workspaces.md) — persists
   the originating traceparent in the trash entry / grants sidecar and continues as a **deferred span**; a causal (not
   parental) relation to the originating trace is a span **link**, not a parent.
@@ -92,67 +92,154 @@ Under interception (05_gateway.md), most granted traffic is request-visible, so 
 Interception makes tier 3 richer than a tunnel would: an intercepted request is workspace-exact **with request-level
 detail** (verb, path, bytes) and an outbound-injected `traceparent`, even when the inbound client is silent.
 
-## Storage: Arrow segments, one substrate
+## Storage: two authority tiers, one Arrow substrate
 
-There is **exactly one telemetry storage form**: lmao spans/events flushed as Arrow IPC segments. No parallel text log,
-no NDJSON files, no per-command debug logs (Tradeoffs).
+Cowshed uses Arrow IPC for both tiers, but placement and authority differ:
 
-- **Controller telemetry + authoritative job state + gateway audit** — lifecycle operations, authoritative job
-  transitions (including `output-limit`), gateway audit events, grant mutations, autosave/gc/doctor runs, and
-  per-command debug events flush under `~/.cowshed/telemetry/`. The controller gives each producer either a dedicated
-  IPC channel or a write-only inherited capability/FD; it is close-on-exec/non-inheritable before any workspace child
-  starts and is never named by a workspace-readable path or token.
-- **Immutable per-writer segments** — a segment has one exclusively allocated writer. A completed segment is sealed and
-  never reopened or shared for append; publication is atomic, and rotation/recovery starts a new segment. Partitioning
-  by day is a query/retention layout, not shared-file append. `cowshed gc` drops whole sealed segments.
-- **The one text-file survivor**: `~/.cowshed/telemetry/daemon-stderr.log`, the launchd `StandardErrorPath` target — it
-  exists for the crashes that happen **before a tracer can initialize** (bad binary, missing volume). It stays tiny
-  because nothing else ever writes there; `cowshed doctor` flags it when it is non-empty.
-- **Exec convenience projection** — `.cowshed/job/records.arrow` travels with checkpoints but is workspace-writable and
-  therefore never authoritative. It may help reproduce a run, but controller queries, job status, denial correlation,
-  output-limit state, audit joins, and all security decisions use controller-owned immutable segments. Full retained job
-  output remains separate opaque byte files at `.cowshed/job/<job_id>/out` and `err`.
-- **Diagnostic summaries** — both the in-volume job record and the store-side job event carry separate `stdout` and
-  `stderr` stream structs, each `{path, bytes, summary}`. Their nested summaries are the same deterministic, bounded,
-  versioned, RTK/ContextCrawler-style projections emitted on the shell control channel: ordered signature context plus
-  fixed head/tail context, with fixed line/byte/match budgets. Configured secrets, tokens, and paths are redacted before
-  any summary leaves the supervisor; no unredacted summary field or event exists. The summary `version` identifies the
-  complete selection, normalization, and redaction ruleset, and `truncated` records that the projection omitted source
-  bytes, so readers can compare like with like.
-- **Durability policy.** Audit-relevant events flush on decision boundaries or a short timer, whichever comes first; the
-  crash window is **at most one unflushed batch**, stated plainly. That window is the accepted price of a single storage
-  substrate (Tradeoffs); events that must never be lost in-window (today: none identified) would warrant a per-event
-  flush, not a second format.
+- **Protected in-volume evidence** — `.cowshed/job/records.arrow` contains allocation/lifecycle batches, terminal exec
+  records, checkpoint manifests, bounded summaries, and small terminal stdout/stderr as Arrow Binary. Larger or
+  checkpoint-forced streams spill lazily to protected `.cowshed/job/<job_id>/out|err` files. Complete batches and sealed
+  files are authoritative captured-content evidence only within their recorded origin incarnation/checkpoint boundary.
+  They are not workspace-writable: the supervisor is the sole live writer and the mandatory child profile denies every
+  mutation beneath `.cowshed/job/**` before repository-controlled startup (04_sandbox.md/11_shell.md).
+- **Controller continuity commitments and telemetry** — lifecycle spans, compact job commitments,
+  checkpoint/fork/restore lineage, gateway audit, grant mutations, autosave/gc/doctor, and debug events flush under
+  `~/.cowshed/telemetry/`. Controller job commitments own existence, lifecycle/status, ordering, lineage, byte counts,
+  and expected hashes. They never contain inline output, a protected artifact path, a redirect source, or any other raw
+  stdout/stderr payload duplication.
+- **Controller immutable per-writer segments** — controller telemetry/commitment segments each have one exclusively
+  allocated writer. Authoritative commitments use exactly one Arrow IPC batch containing one row per segment at
+  `<host-telemetry-root>/<yyyy-mm-dd>/commitment-<order:020>-<writer_uuid>.arrow`, where the UTC partition is an exact
+  calendar date and `writer_uuid` is lowercase hyphenated UUID text owned by that controller session. A completed
+  segment is mode `0600`, sealed by create-new atomic rename, parent-directory-fsynced, and never reopened, replaced, or
+  shared for append. Recovery no-follow enumerates exact date partitions and commitment names, rejects links, malformed
+  or duplicate names/orders, validates every batch against `CommitmentPriorContext`, and accepts only one globally
+  contiguous order across partitions. Unrelated telemetry names and unsealed dot-prefixed temporary names are not
+  commitment authority. Partitioning by day is a query/retention layout, not shared-file append. This rule does not
+  describe the separately locked protected `.cowshed/job/records.arrow` framed stream above.
+- **Controller producer capability delivery** — each controller telemetry producer receives a dedicated IPC channel or
+  inherited write-only capability/FD. It is close-on-exec/non-inheritable before any workspace child starts and is never
+  named by a workspace-readable path or token. Admission and terminal/checkpoint commitments are flushed and atomically
+  published before their corresponding operation is acknowledged. The short-timer one-batch crash window applies only to
+  non-commitment diagnostic/audit events; gateway decision boundaries retain the flush policy below.
+- **The one text-file survivor** — `~/.cowshed/telemetry/daemon-stderr.log`, the launchd `StandardErrorPath` target,
+  exists only for crashes before tracer initialization. `doctor` flags it when non-empty.
 
-## Event schema
+`StreamInfo` is the shared content descriptor:
 
-One schema family across store segments and in-volume records — schema-regular and dictionary-heavy, which is the
-columnar sweet spot. JSON/MCP uses the camelCase rendering of the same fields; Arrow names are canonical snake_case:
+```
+ProtectedOutput = Inline { data: BinaryData } | File { path: WorkspacePath }
+OutputStorage   = Captured { artifact: ProtectedOutput }
+                | Redirect { source: WorkspacePath, artifact: ProtectedOutput }
+StreamInfo      = { storage, bytes, sha256, summary }
+```
 
-| Column                               | Arrow type                       | Notes                                                                                                                                                   |
-| ------------------------------------ | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ts`                                 | `Timestamp(ns)`                  | per-trace anchored (lmao 01b3)                                                                                                                          |
-| `kind`                               | `Dictionary<u8,Utf8>`            | `lifecycle-step` / `job` / `npm` / `cargo` / `go` / `intercept` / `opaque` / `connect` / `repo-mirror` / `sim` / `grant` / `autosave` / `gc` / `doctor` |
-| `repo_id`, `ws`                      | `Dictionary<u16,Utf8>`           | stable repository identity plus workspace name                                                                                                          |
-| `workspace_incarnation`              | `FixedSizeBinary(16)` (nullable) | required for jobs; immutable controller-minted incarnation                                                                                              |
-| `job_id`                             | `UInt64` (nullable)              | workspace-local job handle; joins control, raw files, and trace; never a span id                                                                        |
-| `trace_id`                           | `Dictionary<*,Utf8>`             | standard lmao trace identity; propagated from W3C `traceparent`                                                                                         |
-| `thread_id`, `span_id`               | `UInt64`, `UInt32`               | standard lmao thread/span identity                                                                                                                      |
-| `parent_thread_id`, `parent_span_id` | `UInt64`, `UInt32` (nullable)    | standard lmao parent identity; causal links use lmao's link column                                                                                      |
-| `rev`                                | `UInt64`                         | grant revision in force                                                                                                                                 |
-| `host` / `name`                      | `Dictionary<u16,Utf8>`           | egress host or package name                                                                                                                             |
-| `method`, `path`, `url`              | `Utf8` (nullable)                | intercepted/mirror requests only                                                                                                                        |
-| `status`, `decision`                 | `UInt16`, `Dictionary`           | HTTP status; `allow`/`deny`/`offline`; job state includes `output-limit`                                                                                |
-| `bytes`, `duration_ms`               | `UInt64`                         |                                                                                                                                                         |
-| `cache`                              | `Dictionary<u8,Utf8>`            | `hit`/`miss`, mirror endpoints only                                                                                                                     |
-| `stdout`, `stderr`                   | `Struct` (nullable)              | `{path, bytes, summary:{version, text, truncated}}`; paths reference raw bytes retained before any output-limit trip; summary text is redacted          |
-| `attrs`                              | `Map<Utf8,Utf8>`                 | kind-specific tail (exit code, errno, label, …)                                                                                                         |
+Inline bytes are bounded by the frozen inline-output limit. Protected Arrow represents them as Binary. Ordinary
+`JobInfo` JSON uses the exact `BinaryData` wire union `{encoding:"utf8",data} | {encoding:"base64",data}`, selecting
+UTF-8 only for valid bytes and bounding both branches by decoded length. `Redirect.source` is mutable/non-authoritative;
+reads resolve its independent protected `artifact`. Controller commitments carry only count/hash—never the storage
+union, either inline encoding, or payload/path. Summaries remain bounded diagnostic projections and establish no
+outcome.
 
-Summary generation is a pure versioned projection: identical retained stream bytes, versions, and configuration emit
-identical nested summary structs. Summaries are diagnostic and lossy; they **never** establish sandbox denial,
-exit/signal, output-limit, policy or audit decisions, or build/test success. The combined per-job stdout+stderr capture
-quota is configurable and defaults to 1 GiB; crossing it produces the authoritative `output-limit` state after
-TERM/grace/KILL and pipe drain. Summary truncation is independent of that terminal state.
+## Protected exec and checkpoint schema
+
+Protected Arrow is the exact tagged/versioned union:
+
+```rust
+enum ProtectedRecord {
+    Job(JobArtifactRecord),
+    CheckpointManifest(CheckpointManifestRecord),
+}
+struct CheckpointManifestRecord {
+    version: u16,
+    repo_id: RepoId,
+    origin_incarnation: WorkspaceIncarnation,
+    barrier_id: u64,
+    visible_jobs: Vec<VisibleJobCommitment>,
+    records_sha256: Sha256Digest,
+}
+struct VisibleJobCommitment {
+    workspace_incarnation: WorkspaceIncarnation,
+    job_id: JobId,
+    state: JobState,
+    stdout: VisibleStreamCommitment,
+    stderr: VisibleStreamCommitment,
+}
+struct VisibleStreamCommitment {
+    storage_kind: VisibleStorageKind,
+    bytes: u64,
+    sha256: Sha256Digest,
+    protected_path: Option<WorkspacePath>,
+}
+```
+
+`barrier_id` is positive and monotonic within `origin_incarnation`. `VisibleStorageKind` is exactly
+`captured-inline|captured-file|redirect-inline|redirect-file`; `protected_path` is present exactly for a file kind.
+`records_sha256` hashes the bytes of the complete protected-record stream prefix immediately before the manifest batch.
+All running memory-only prefixes promote and all files fsync before this record is appended; terminal inline bytes live
+in a prior `ProtectedRecord::Job` covered by the prefix digest. Recovery frames retain their `batch_sha256`; recovery
+may discard/report only an incomplete trailing frame.
+
+The flat Arrow schema begins `record_kind, record_version, repo_id`. A Job row then uses
+`workspace_incarnation, job_id, sequence, state, grant_revision`, followed by the existing
+`stdout_storage_kind, stdout_source_path, stdout_inline_bytes, stdout_protected_path, stdout_bytes, stdout_sha256, stdout_summary_version, stdout_summary_text, stdout_summary_truncated`
+and equivalent `stderr_*` columns. A CheckpointManifest row instead uses
+`origin_incarnation, barrier_id, visible_jobs, records_sha256`, with
+`visible_jobs: List<Struct<workspace_incarnation,job_id,state,stdout,stderr>>`. Columns outside the selected variant are
+null and validators reject every other null combination.
+
+## Controller commitment schema
+
+Controller continuity is the exact tagged/versioned union:
+
+```rust
+enum ControllerCommitment {
+    Admission(AdmissionCommitment),
+    Terminal(TerminalCommitment),
+    Checkpoint(CheckpointCommitment),
+    Fork(ForkCommitment),
+    Restore(RestoreCommitment),
+}
+struct AdmissionCommitment {
+    version: u16, order: u64, repo_id: RepoId,
+    workspace_incarnation: WorkspaceIncarnation, job_id: JobId, grant_revision: u64,
+}
+struct TerminalCommitment {
+    version: u16, order: u64, repo_id: RepoId,
+    workspace_incarnation: WorkspaceIncarnation, job_id: JobId, state: JobState, grant_revision: u64,
+    stdout_bytes: u64, stdout_sha256: Sha256Digest,
+    stderr_bytes: u64, stderr_sha256: Sha256Digest, batch_sha256: Sha256Digest,
+}
+struct CheckpointCommitment {
+    version: u16, order: u64, repo_id: RepoId, origin_incarnation: WorkspaceIncarnation,
+    checkpoint_id: String, barrier_id: u64, manifest_batch_sha256: Sha256Digest,
+}
+struct ForkCommitment {
+    version: u16, order: u64, repo_id: RepoId,
+    source_incarnation: WorkspaceIncarnation, destination_incarnation: WorkspaceIncarnation,
+}
+struct RestoreCommitment {
+    version: u16, order: u64, repo_id: RepoId, source_checkpoint: String,
+    source_incarnation: WorkspaceIncarnation, destination_incarnation: WorkspaceIncarnation,
+}
+```
+
+The flat controller Arrow columns are exactly `commitment_kind, commitment_version, commitment_order, repo_id` plus
+variant-selected
+`workspace_incarnation, job_id, grant_revision, state, stdout_bytes, stdout_sha256, stderr_bytes, stderr_sha256, batch_sha256, origin_incarnation, checkpoint_id, barrier_id, manifest_batch_sha256, source_incarnation, destination_incarnation, source_checkpoint`.
+Non-selected fields are null and the tag controls required fields.
+
+`order` is positive, globally unique, and strictly increasing. `CommitmentPriorContext` carries the previous order,
+known admissions/terminals/checkpoints, and incarnation lineage into `validate_commitments` across batches/segments.
+Validation requires admission before one terminal, terminal-only `state`, matching repositories, existing checkpoint
+sources, and acyclic fork/restore lineage. Constructors and Arrow/JSON encode/decode invoke the same row and collection
+validator; no derive-only path bypasses it.
+
+No commitment variant contains `inline_bytes`, `protected_path`, `source_path`, summary text, or output payload.
+`reconcile_commitments` compares protected content counts/hashes plus Job `batch_sha256` and checkpoint
+`manifest_batch_sha256`; missing/altered content, invalid complete frames, or order/lineage/digest contradiction is
+typed `Integrity`. Neither tier overwrites the other. An incomplete trailing frame alone is successful reported recovery
+with its `batch_sha256` retained for diagnosis.
 
 ## Inspection
 
@@ -171,17 +258,15 @@ events for long `--json` operations, are wire formats on a pipe to a live consum
 
 ## Querying
 
-- **Capability-scoped**, mirroring the coordinator/worker split (07_api.md, 12_mcp.md): a **coordinator** queries the
-  controller-owned store; a **worker** queries one-workspace job views whose authoritative state is served by the
-  controller/supervisor capability, with the in-volume projection used only as non-authoritative reproduction data.
-- **`lmao-query` selectors are the assertion surface** for 08_testing.md. The escape and integration tiers assert over
-  traces with `never`/`count` selectors instead of scraping text: `never(gateway.allow ∧ host ∉ grants)`,
-  `every(rm → supervisor-stop precedes detach)`, `count(secret-deny-ordering-violation) == 0`. Because lmao is
-  deterministic under an injected `Clock`, integration runs emit **golden trace fixtures**, and the crash-recovery
-  tables (02_workspaces.md adopt/rm) become schedules with trace assertions rather than hoped-for behavior.
-- **`cowshed doctor --bench`** reports real p50/p99 from the store's accumulated lifecycle spans — turning the
-  08_testing.md budgets from single-run estimates into SLOs monitored over actual usage (the direct fix for "a p99 from
-  20 samples").
+- **Capability-scoped**, mirroring the coordinator/worker split (07_api.md, 12_mcp.md): a coordinator queries controller
+  continuity commitments and telemetry. A worker queries one workspace's reconciled lifecycle view and reads captured
+  bytes representation-transparently from protected in-volume artifacts. Controller rows never serve raw output, and
+  protected rows alone never claim cross-incarnation completeness.
+- **`lmao-query` selectors are the assertion surface** for 08_testing.md. Escape/integration tiers assert over traces
+  and commitments with `never`/`count` selectors rather than scraping text. Integrity joins explicitly require the
+  protected terminal/manifest batch digests, counts, and stream hashes to match controller commitments.
+- **`cowshed doctor --bench`** reports real p50/p99 from accumulated lifecycle spans, turning the 08_testing.md budgets
+  into SLOs monitored over actual usage.
 
 ## What columns buy
 
@@ -191,8 +276,8 @@ events for long `--json` operations, are wire formats on a pipe to a live consum
   time T vs what it tried").
 - **Fleet questions, zero infra** — egress-denial hot spots, mirror hit rates, image-growth trajectories, grant churn,
   per-task cost — as queries over local files.
-- **Cheap retention** — dictionary + zstd columnar audit is an order of magnitude smaller than NDJSON; gc drops
-  segments.
+- **Cheap diagnostic retention** — dictionary + zstd columnar spans are far smaller than NDJSON; gc may drop ordinary
+  diagnostic segments. Controller commitment segments are continuity authority and may not be pruned into an order gap.
 - **Checkpoint evidence diffing** — "diff the job histories of these two forks" is a query; a coordinator can select the
   winning fork of a `land --check` by its trace.
 
@@ -213,7 +298,9 @@ flush of that class, not a second format.
 **Batched audit flush accepted.** A per-request flush would be the most durable but throttles the gateway. The one-batch
 crash window is the accepted cost, bounded by the decision-boundary/short-timer flush policy above.
 
-**In-volume exec records are not status or audit authority.** They travel with checkpoints and aid reproduction, but a
-job can rewrite them. Authoritative job lifecycle/quota events and gateway audit events are controller-owned immutable
-per-writer segments; grant authority remains in controller-owned grant files. Any disagreement resolves in favor of the
-outside-the-workspace source.
+**Tiered job authority.** Protected in-volume records and artifacts are not editable convenience projections: the child
+profile makes them supervisor-only, and complete batches/sealed files are authoritative captured-content evidence inside
+their origin incarnation/checkpoint boundary. They cannot prove that a later job or incarnation was not omitted by
+restoring the entire image. Compact controller commitments therefore own existence/status/order/lineage and the hashes
+that detect rollback, while never duplicating raw output. Any disagreement is typed `Integrity`; no blanket “outside
+wins” or “newer wins” rule exists.
