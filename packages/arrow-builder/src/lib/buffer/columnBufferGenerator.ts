@@ -490,9 +490,11 @@ return ${className};
  * Cache for generated ColumnBuffer classes.
  */
 //#region smoo/lmao!n/buffer-codegen.get-class
-const classCache = new Map<string, new (capacity: number, ...args: unknown[]) => AnyColumnBuffer>();
-
 type ColumnBufferConstructor = new (capacity: number, ...ctorArgs: unknown[]) => AnyColumnBuffer;
+type ColumnBufferClassCache = Map<string, ColumnBufferConstructor>;
+
+const classCache: ColumnBufferClassCache = new Map();
+const discriminatedClassCaches = new WeakMap<object, ColumnBufferClassCache>();
 
 type ColumnBufferFactory = (...factoryArgs: unknown[]) => ColumnBufferConstructor;
 
@@ -517,10 +519,13 @@ function createCacheKey(schema: ColumnSchema, extension?: ColumnBufferExtension)
 
 /**
  * Create or retrieve a cached ColumnBuffer class for the given schema and extension.
+ * An opaque discriminator gives an owner a GC-safe identity partition while preserving
+ * structural class sharing for callers that do not provide one.
  */
 export function getColumnBufferClass<S extends ColumnSchema>(
   schema: S,
   extension?: ColumnBufferExtension,
+  cacheDiscriminator?: object,
 ): new (
   capacity: number,
   ...args: unknown[]
@@ -528,12 +533,23 @@ export function getColumnBufferClass<S extends ColumnSchema>(
 export function getColumnBufferClass(
   schema: ColumnSchema,
   extension?: ColumnBufferExtension,
+  cacheDiscriminator?: object,
 ): new (
   capacity: number,
   ...args: unknown[]
 ) => AnyColumnBuffer {
+  let cache = classCache;
+  if (cacheDiscriminator !== undefined) {
+    let discriminatedCache = discriminatedClassCaches.get(cacheDiscriminator);
+    if (discriminatedCache === undefined) {
+      discriminatedCache = new Map();
+      discriminatedClassCaches.set(cacheDiscriminator, discriminatedCache);
+    }
+    cache = discriminatedCache;
+  }
+
   const cacheKey = createCacheKey(schema, extension);
-  let BufferClass = classCache.get(cacheKey);
+  let BufferClass = cache.get(cacheKey);
 
   if (!BufferClass) {
     const classCode = generateColumnBufferClass(schema, 'GeneratedColumnBuffer', extension).trim();
@@ -559,7 +575,7 @@ export function getColumnBufferClass(
     }
 
     BufferClass = generatedClass;
-    classCache.set(cacheKey, BufferClass);
+    cache.set(cacheKey, BufferClass);
   }
 
   return BufferClass;
