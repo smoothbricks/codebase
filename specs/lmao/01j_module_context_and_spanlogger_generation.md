@@ -13,7 +13,140 @@ handles:
 6. **Schema compilation** for both standard and library modules
 7. **User-extensible context** via `.ctx<Extra>()` for custom properties
 
-This system operates at build/startup time to generate efficient runtime code with zero overhead.
+This system performs code generation at build/startup time; the target makes warmed, in-capacity entry writes
+allocation-free.
+
+## Physicalization and Cache Lifecycle (Target, Not Yet Shipped)
+
+The shipped system generates Op-local `SpanBuffer`/writer classes and remapped library views as described in the
+implementation-status notes below. The clean-cutover target moves all schema- and backend-dependent decisions to
+startup. It does not claim that the current structures already have this shape.
+
+Startup canonicalizes the schema and creates one immutable `PhysicalLayoutPlan` containing concrete columns, offsets,
+widths, null bitmaps, eager/lazy decisions, static message-index lanes, dynamic reference lanes, and backend factories.
+A three-dimensional cache keyed by **schema identity + physical layout version + backend kind** shares the plan and its
+buffer/writer/flush classes. Library prefix/remap state is an immutable binding over that physical plan (or part of the
+cache key when it changes stores), never a name lookup performed by a warmed callsite.
+
+Generated APIs are specialized into **static**, **structured**, or **dynamic** callsite classes. After warmup a callsite
+sees one stable receiver shape, one fixed entry kind, one fixed representation, and a fixed sequence of direct stores.
+`mixed` is reserved for a physical buffer/layout containing both a static-index lane and a dynamic-reference lane; it is
+not a callsite class. The warmed entry path MUST NOT enumerate fields, resolve schemas, compute property names, look up
+vocabulary, choose a backend, render strings, or allocate. Capacity failure branches to an explicit overflow/slow-path
+helper and must not pollute the in-capacity path with changing shapes.
+
+Allocation claims are phase-specific:
+
+| Phase                  | Target contract                                                                                                   |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| **Startup**            | May allocate heavily to canonicalize schemas, register vocabulary, build plans/classes, and reserve arenas.       |
+| **Span setup**         | Minimize and amortize allocations; do not describe it as the warmed entry path.                                   |
+| **Warmed entry write** | Zero allocation and fixed monomorphic stores while capacity remains.                                              |
+| **Overflow/slow path** | May allocate or grow explicitly; behavior and counters are predictable.                                           |
+| **Per-request flush**  | Few or no allocations by reusing layout/backend classes, scratch arenas, dictionary generations, and Arrow views. |
+
+Flush returns an `ArrowLease` over runtime-owned Arrow-compatible buffers rather than transferring untracked reusable
+storage. The lease pins the buffer arena and exact immutable vocabulary dictionary generation until the exporter
+releases it; it never pins a module's caller-owned fragment arrays. This permits near-zero-allocation
+request→trace→Arrow conversion without recycling memory still observed by a consumer.
+
+The shipped scheduler currently may coalesce roots, so its flush unit is not necessarily one request. It also does not
+yet provide the target async Arrow/WASM lease pinning, and the current WASM backend recreates JavaScript views after
+linear-memory growth. These are measured shipped costs; they MUST NOT be described as properties of the target
+per-request `ArrowLease` lifecycle.
+
+## Compiler-Emitted Vocabulary Registration (Target ABI)
+
+Compiled application modules and precompiled JS libraries self-register their own vocabulary fragment inputs. The
+application bootstrap MUST import and evaluate the LMAO runtime installer before evaluating any registering module. The
+runtime installer owns the callback stored at `globalThis[Symbol.for('@smoothbricks/lmao/vocabulary/register/v1')]`;
+emitted modules call it but never install or replace it.
+
+The runtime type contract is:
+
+```typescript
+interface VocabularyFragmentV1 {
+  schemaVersion: 1;
+  idAlgorithm: 'sha256-24-v1';
+  contentHash: ContentHash;
+  ids: Uint32Array;
+  kindTags: Uint8Array;
+  utf8: Uint8Array;
+  offsets: Int32Array;
+}
+
+type VocabularyBinding = Uint32Array;
+type RegisterVocabularyV1 = (fragment: VocabularyFragmentV1) => VocabularyBinding;
+```
+
+Compiler-emitted JavaScript is governed by the runtime contract above and need not typecheck as a TypeScript
+declaration. The compiler emits the installer import before registration; ESM dependency evaluation installs the
+callback before the transformed module body executes, and bundlers MUST retain both side effects:
+
+```javascript
+import '@smoothbricks/lmao/vocabulary/register/v1';
+
+const REGISTER_VOCABULARY = Symbol.for('@smoothbricks/lmao/vocabulary/register/v1');
+const binding = globalThis[REGISTER_VOCABULARY](fragment);
+const denseMessageIndex = binding[ordinal]; // warmed direct typed-array load
+```
+
+For `N` records, `ids.length === kindTags.length === N` and `offsets.length === N + 1`. `offsets[0]` is zero,
+`offsets[N]` is `utf8.byteLength`, and adjacent entries delimit one complete record. Each record uses this exact
+little-endian grammar:
+
+```text
+u32le textLength
+u8[textLength] textUtf8
+u16le fieldCount
+repeat fieldCount times:
+  u16le nameLength
+  u8[nameLength] nameUtf8
+  u16le columnLength
+  u8[columnLength] columnUtf8
+```
+
+For record `i`, `ids[i]` is the first 24 SHA-256 bits, interpreted big-endian, over `kindTags[i] || recordBytes`.
+`contentHash` is lowercase SHA-256 hex over this exact canonical byte stream:
+
+```text
+u8 schemaVersion
+u16le algorithmLength | u8[algorithmLength] idAlgorithmUtf8
+u32le ids.length | repeated(ids.length times: u32le id)
+u32le kindTags.length | u8[kindTags.length] kindTags
+u32le utf8.length | u8[utf8.length] utf8
+u32le offsets.length | repeated(offsets.length times: i32le offset)
+```
+
+This canonical serialization, rather than host TypedArray byte order, defines fragment identity.
+
+`kindTags[i] = 1` is `LOG_TEMPLATE`; `kindTags[i] = 2` is `SPAN_NAME`. Checker-proven literal span names register as
+`SPAN_NAME`; non-literal span names remain dynamic references. Static templates and structured templates are registered;
+dynamic strings are not.
+
+The registry validates versions, lengths, offsets, record grammar, IDs, kind tags, and `contentHash`, then copies/merges
+the fragment into a runtime-owned immutable dictionary generation. Caller-owned typed arrays are registration inputs,
+not borrowed mutable Arrow storage. Dense Arrow indices are process-local and append-only in fragment registration
+order. A new generation preserves the previous generation as an unchanged prefix and appends only unseen decoded values,
+so old bindings remain prefix-valid. Stable IDs and decoded values are deterministic; dense indices and dictionary
+ordering are not deterministic across processes. Dense index `0` is valid; null is represented only by the Arrow
+validity bitmap.
+
+The returned `VocabularyBinding` maps each fragment-local ordinal through direct `binding[ordinal]` indexing. Generated
+code MUST NOT call a warmed `messageIndex()` helper. An `ArrowLease` pins the exact runtime-owned immutable dictionary
+generation used by its Arrow output, never a registering module's arrays.
+
+Libraries retain ownership of their emitted fragment declarations and registration calls. An application may prefix or
+bind a library's schema columns, but MUST NOT copy, renumber, or synthesize that library's vocabulary. Duplicate
+evaluation is idempotent for the same schema version, algorithm, content hash, and decoded fragment; invalid or
+incompatible input fails during startup rather than falling back to hot-path string lookup. Detailed transformer
+emission is specified elsewhere.
+
+Target template placeholders use `{field}`; `{{` and `}}` encode literal braces. This replaces the shipped `{{field}}`
+grammar. `info`/`warn`/`error` callsites bind literal templates and object-literal fields; `debug`/`trace` may bind a
+literal template or use an existing raw dynamic string reference, but avoidable interpolation remains invalid. Callsite
+classes are static, structured, or dynamic. A physical layout may be mixed when it carries both static-index and
+dynamic-reference lanes.
 
 ## Context Hierarchy <a id="smoo/lmao!n/opcontext-hierarchy"></a>
 
@@ -700,6 +833,10 @@ const processOrder = op(async ({ span, log, tag, deps, ff }, order: Order) => {
 
 Libraries define their logSchema and dependencies:
 
+> **Status note**: The example below documents the shipped/legacy `defineModule`-style library surface. In the target
+> architecture, the precompiled library additionally emits and owns its versioned vocabulary registration fragment;
+> application wiring consumes its `VocabularyBinding` while continuing to own prefix/remap composition.
+
 ```typescript
 // @my-company/http-tracing/src/index.ts
 import { defineModule, S } from '@smoothbricks/lmao';
@@ -796,13 +933,13 @@ An ESLint rule should prevent capturing `tag` or `log` in variables.
 ### Build-Time vs Runtime Costs
 
 - **Build/Startup**: Schema compilation and class generation (~1-5ms per module)
-- **Runtime**: Zero overhead for method calls - all mapping pre-computed
+- **Runtime target**: Warmed, in-capacity entry calls use fixed monomorphic stores with zero allocation
 - **Memory**: Shared ModuleContext across all ops in same module
 
 ### Generated Code Efficiency
 
 ```typescript
-// Generated method (zero overhead):
+// Target warmed method (fixed stores, zero allocation):
 userId(value) {
   this.buffer.writeUserId(value);  // Direct method call
   return this;
@@ -821,7 +958,7 @@ setAttribute(name, value) {
 - **Dual module references**: `callsiteModule` for row 0's gitSha/packageName/packagePath, `module` for rows 1+
 - **Direct lineNumber writes**: lineNumber passed as argument to span(), written directly to `lineNumber_values[0]` (NO
   intermediate object storage, NO lineNumber property on any context)
-- **Interned span names**: `spanName` is interned for dictionary encoding during Arrow conversion
+- **Shipped span names**: `spanName` is interned during Arrow conversion; the target stores a bound dense index
 - **Reference to ModuleContext**: References to shared module metadata (no duplication)
 
 ## Integration Points

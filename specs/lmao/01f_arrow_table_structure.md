@@ -8,28 +8,40 @@ The Arrow Table Structure defines the final queryable format produced by the tra
 2. **Realistic trace data examples** showing spans, tags, and console.log compatibility
 3. **ClickHouse query patterns** for common analytical use cases
 4. **Performance characteristics** of the columnar format
-5. **Zero-copy conversion patterns** for efficient cold-path processing
+5. **Ownership-aware conversion patterns** for efficient cold-path processing
 6. **Arrow conversion interface** defining how lmao and arrow-builder coordinate during conversion
 
-## Zero-Copy Mandate <a id="smoo/lmao!n/arrow-table-zero-copy"></a>
+## Arrow Ownership and Copy Contract <a id="smoo/lmao!n/arrow-table-zero-copy"></a>
 
-**CRITICAL**: All Arrow conversions MUST wrap **direct TypedArray references** (`subarray()` views). The builder pattern
-is **PROHIBITED** because it copies every value during append operations.
+Conversion does not guarantee payload borrowing across all columns. It uses the cheapest correct mode per physical
+column:
 
-> **Implementation status.** The realization uses `@uwdata/flechette`, not `apache-arrow`: the zero-copy wrap is a
-> flechette `Batch` constructor taking `values: x.subarray(0, length)`, surfaced through the
-> `create{Uint8,Uint16,Uint32,Int32,Float64,Bool,Utf8,Dictionary*}Data` helpers in
-> `packages/arrow-builder/src/lib/arrow/data.ts`. The `arrow.makeData()` / `arrow.makeBuilder()` names below are the
-> original apache-arrow framing; the commitment (direct TypedArray references, no builder) is unchanged — only the
-> library API differs. See [Implementation](#implementation).
+| Input / boundary                                      | Required mode                                          | Owner and lifetime                                                           |
+| ----------------------------------------------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------- |
+| Contiguous primitive or compatible null region        | Borrow bounded `subarray()` payload when supported     | SpanBuffer/WASM owns bytes; `ArrowLease` pins backing store and memory epoch |
+| Overflow chain accepted as Arrow chunks               | Wrap each physical chunk                               | One lease pins every source chunk; wrapper/view allocations still count      |
+| Consumer requires one contiguous region               | Allocate once and bulk-copy chunks                     | Arrow owns output; charge allocation and copied bytes to flush               |
+| Dictionary/category/text                              | Build required indices, UTF-8, offsets, and dictionary | Arrow owns constructed buffers; immutable shared dictionaries may be leased  |
+| Mutable/incompatible input or unpinned async lifetime | Copy to Arrow-owned storage                            | Lifetime correctness overrides copy avoidance                                |
 
-### Reference Pattern <a id="smoo/lmao!n/arrow-table-zero-copy.reference"></a>
+Per-value builder `append()` is PROHIBITED for bulk columns. Direct wrapping can still allocate JS view/wrapper objects;
+those count toward flush allocations.
 
-The correct zero-copy approach uses flechette's `DirectBatch` constructor with `subarray()` views over TypedArrays (see
-`@uwdata/flechette` `batch.js`):
+**Shipped versus target.** Shipped flechette wraps final TypedArrays and bulk-concatenates overflow/null data when
+contiguity is required; dictionary/UTF-8 construction allocates. The target preserves Arrow-native chunks wherever
+consumers accept them and carries explicit `ArrowLease` ownership through asynchronous consumption. Until that lifetime
+contract is end to end, borrowed views cannot outlive synchronous consumption.
+
+`PhysicalLayoutPlan` determines direct compatibility/chunk/copy policy. Versioned `VocabularyBinding` occurs at startup
+and may supply immutable dictionaries/layout fragments; request flush does not mutate the plan.
+
+### Contiguous Borrowing Reference <a id="smoo/lmao!n/arrow-table-zero-copy.reference"></a>
+
+For a contiguous primitive, use flechette's direct `Batch` constructor with a bounded `subarray()` and retain the lease
+that pins the source. Do not use the illustrative per-value builder.
 
 ```typescript
-// CORRECT: Zero-copy with arrow.makeData()
+// Borrowed payload: lease pins source bytes; view and Batch wrappers still allocate.
 return arrow.makeData({
   type: dataType,
   offset: 0,
@@ -46,7 +58,7 @@ for (let i = 0; i < length; i++) {
 }
 ```
 
-**Why Zero-Copy Matters**:
+**Why ownership-aware reuse matters**:
 
 - **Performance**: Builder pattern iterates through every value, calling append() for each one
 - **Memory**: Creates intermediate buffers during build process
@@ -55,7 +67,7 @@ for (let i = 0; i < length; i++) {
 
 ### Conversion Strategies by Column Type <a id="smoo/lmao!n/arrow-table-zero-copy.strategies"></a>
 
-Different column types require different zero-copy strategies:
+Different column types use different borrow/build/copy strategies:
 
 #### 1. Primitive Types (Float64, Uint8, etc.)
 
@@ -137,14 +149,13 @@ if (useDictionary) {
 
 ### Buffer Concatenation for Chained Buffers <a id="smoo/lmao!n/arrow-table-zero-copy.concat"></a>
 
-When SpanBuffer chains need concatenation (buffer.\_next), use this helper:
+Overflow is physically chunked. Preserve Arrow-native chunks when accepted; otherwise allocate one Arrow-owned output
+and bulk-copy each chunk, charging allocation and copied bytes to this request's flush.
 
 ```typescript
 /**
- * Concatenate multiple TypedArrays into a single array (zero-copy until final result)
- *
- * This is needed when converting chained SpanBuffers to a single Arrow column.
- * Uses typed array .set() method which is optimized by VMs.
+ * Concatenate physical chunks into one Arrow-owned array when contiguity is required.
+ * Prefer Arrow-native chunks when the consumer accepts them.
  */
 function concatenateTypedArrays<T extends TypedArray>(arrays: T[]): T {
   const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
@@ -171,8 +182,8 @@ return arrow.makeData({
 });
 ```
 
-**Note**: While concatenation requires one copy, it's still more efficient than the builder pattern which copies during
-every append() call.
+**Note**: Concatenation is an explicit one-copy fallback. It remains preferable to per-value builder append but is
+visible in allocation, copied-byte, and effective-memory results.
 
 ### Null Bitmap Construction <a id="smoo/lmao!n/arrow-table-zero-copy.null-bitmap"></a>
 
@@ -215,24 +226,25 @@ system becomes a row in the final table, enabling rich analytical queries while 
 - **Nullable columns**: Sparse data handled efficiently with null values
 - **Dictionary encoding**: Repeated strings stored efficiently
 - **Type optimization**: Appropriate data types for storage and performance
-- **Zero-copy conversion**: Direct TypedArray references without intermediate copies
+- **Ownership-aware conversion**: Borrow compatible payloads under `ArrowLease`, preserve chunks when possible, and
+  otherwise account for Arrow-owned conversion copies.
 
 ## Column Schema <a id="smoo/lmao!n/arrow-table-schema"></a>
 
 ### Core System Columns (Always Present) <a id="smoo/lmao!n/arrow-table-schema.core"></a>
 
-| Column Name        | Type                 | Description                                                                                                   | Example Values                                                                                                   |
-| ------------------ | -------------------- | ------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `timestamp`        | `timestamp[ns]`      | When event occurred (nanoseconds, BigInt64 storage)                                                           | `2024-01-01T10:00:00.000000123Z`                                                                                 |
-| `trace_id`         | `dictionary<string>` | Request correlation (TraceId branded string, W3C format)                                                      | `'4bf92f3577b34da6a3ce929d0e0e4736'`, `'req-abc123'`                                                             |
-| `thread_id`        | `uint64`             | Thread/worker identifier (crypto-secure random, once/thread)                                                  | `0x1a2b3c4d5e6f7890`                                                                                             |
-| `span_id`          | `uint32`             | Unit of work within thread (incrementing counter)                                                             | `1`, `2`, `42`                                                                                                   |
-| `parent_thread_id` | `uint64` (nullable)  | Parent span's thread (null for root spans)                                                                    | `0x1a2b3c4d5e6f7890` or `null`                                                                                   |
-| `parent_span_id`   | `uint32` (nullable)  | Parent span's ID (null for root spans)                                                                        | `1`, `2` or `null`                                                                                               |
-| `entry_type`       | `dictionary<string>` | Log entry type (see [Entry Types](#entry-type-system))                                                        | `'span-start'`, `'span-ok'`, `'op-invocations'`, `'buffer-writes'`, etc.                                         |
-| `package_name`     | `dictionary<string>` | npm package name (see [Module Identification](#module-identification) section)                                | `'@smoothbricks/lmao'`, `'@mycompany/user-service'`                                                              |
-| `package_file`     | `dictionary<string>` | Path within package, relative to package.json (see [Module Identification](#module-identification) section)   | `'src/services/user.ts'`, `'lib/handlers/auth.ts'`                                                               |
-| `message`          | `dictionary<string>` | Span name, log message template, exception message, result message, OR flag name (see Message Column section) | `'create-user'`, `'User {{userId}} created'`, `'Processing {{count}} items'`, `'TypeError: x is not a function'` |
+| Column Name        | Type                 | Description                                                                                                   | Example Values                                                                                               |
+| ------------------ | -------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `timestamp`        | `timestamp[ns]`      | When event occurred (nanoseconds, BigInt64 storage)                                                           | `2024-01-01T10:00:00.000000123Z`                                                                             |
+| `trace_id`         | `dictionary<string>` | Request correlation (TraceId branded string, W3C format)                                                      | `'4bf92f3577b34da6a3ce929d0e0e4736'`, `'req-abc123'`                                                         |
+| `thread_id`        | `uint64`             | Thread/worker identifier (crypto-secure random, once/thread)                                                  | `0x1a2b3c4d5e6f7890`                                                                                         |
+| `span_id`          | `uint32`             | Unit of work within thread (incrementing counter)                                                             | `1`, `2`, `42`                                                                                               |
+| `parent_thread_id` | `uint64` (nullable)  | Parent span's thread (null for root spans)                                                                    | `0x1a2b3c4d5e6f7890` or `null`                                                                               |
+| `parent_span_id`   | `uint32` (nullable)  | Parent span's ID (null for root spans)                                                                        | `1`, `2` or `null`                                                                                           |
+| `entry_type`       | `dictionary<string>` | Log entry type (see [Entry Types](#entry-type-system))                                                        | `'span-start'`, `'span-ok'`, `'op-invocations'`, `'buffer-writes'`, etc.                                     |
+| `package_name`     | `dictionary<string>` | npm package name (see [Module Identification](#module-identification) section)                                | `'@smoothbricks/lmao'`, `'@mycompany/user-service'`                                                          |
+| `package_file`     | `dictionary<string>` | Path within package, relative to package.json (see [Module Identification](#module-identification) section)   | `'src/services/user.ts'`, `'lib/handlers/auth.ts'`                                                           |
+| `message`          | `dictionary<string>` | Span name, log message template, exception message, result message, OR flag name (see Message Column section) | `'create-user'`, `'User {userId} created'`, `'Processing {count} items'`, `'TypeError: x is not a function'` |
 
 ### Lazy System Columns (Sparse/Nullable) <a id="smoo/lmao!n/arrow-table-schema.lazy"></a>
 
@@ -251,12 +263,13 @@ rather than every row.
    (`log.info('Done').uint64(bytesProcessed)`) use the same column
 3. **Sparse data**: Most trace rows don't have a uint64 value - only metrics rows and entries where `.uint64()` is
    called
-4. **Storage efficiency**: `BigUint64Array` with null bitmap means zero overhead for rows that don't use it
+4. **Storage efficiency**: `BigUint64Array` plus a null bitmap uses no value payload bytes for null rows; bitmap and
+   column backing-store overhead remain accounted
 
 **Note on Span Identification**:
 
 - `trace_id`: Branded `TraceId` string, validated (non-empty, max 128 chars, ASCII). Shared by reference across all
-  spans in a trace (zero-copy).
+  spans in a trace (no per-span string payload copy).
 - `thread_id` + `span_id`: Extracted from `SpanIdentity` 25-byte ArrayBuffer during Arrow conversion.
 - `parent_thread_id` + `parent_span_id`: Also from `SpanIdentity`, null for root spans (hasParent flag = 0).
 
@@ -425,7 +438,7 @@ SpanIdentity (25 bytes):
 
 `TraceId` is a branded string type that is:
 
-- **Shared by reference**: All spans in a trace reference the same string (zero-copy)
+- **Shared by reference**: All spans in a trace reference the same string; object/reference overhead is still accounted
 - **Validated**: Non-empty, max 128 characters, ASCII only
 - **W3C Compatible**: `generateTraceId()` produces 32 lowercase hex characters
 
@@ -523,7 +536,7 @@ Worker B (thread_id: 0xCCC): span_id 1, 2...              (all traces combined)
 
 **Why This Design**:
 
-- **Zero overhead**: Just `i++`, nothing else
+- **Fixed increment work**: One thread-local `i++`; benchmarked as part of span setup rather than called zero-overhead
 - **No synchronization**: Each thread has its own counter
 - **No Map lookups**: No per-trace state to manage
 - **No cleanup logic**: No trace completion tracking needed
@@ -672,7 +685,7 @@ thread_id: 0x1a2b3c4d5e6f7890, span_id: 2, parent_thread_id: 0x1a2b3c4d5e6f7890,
 | ------------ | -------------------- | ------- | -------------------- | -------------- | -------------------------- | ------------ | ------------------------- | ------------------------------ | ----------------------------------------------- | ----------- | ----------- | -------------------------------------- | ------------- | ----------------------------------------------------------------------- | ----------- | ------- | -------- | --------------- | --------------- | -------- |
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.000Z` | `span-start` | `@mycompany/user-service` | `src/controllers/user.ts`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.002Z` | `ff-access`  | `@mycompany/user-service` | `src/controllers/user.ts`      | `advancedValidation`                            | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | `true`   |
-| `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.005Z` | `info`       | `@mycompany/user-service` | `src/controllers/user.ts`      | `Starting registration for {{userId}}`          | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.005Z` | `info`       | `@mycompany/user-service` | `src/controllers/user.ts`      | `Starting registration for {userId}`            | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 2       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.010Z` | `span-start` | `@mycompany/user-service` | `src/services/validation.ts`   | `validate-email`                                | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 2       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.015Z` | `tag`        | `@mycompany/user-service` | `src/services/validation.ts`   | `validate-email`                                | 200         | `POST`      | `https://api.*****.com/validate-email` | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 2       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.045Z` | `tag`        | `@mycompany/user-service` | `src/services/validation.ts`   | `validate-email`                                | 200         | `POST`      | `https://api.*****.com/validate-email` | 30.2          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
@@ -691,7 +704,7 @@ thread_id: 0x1a2b3c4d5e6f7890, span_id: 2, parent_thread_id: 0x1a2b3c4d5e6f7890,
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 5       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.245Z` | `tag`        | `@mycompany/user-service` | `src/services/notification.ts` | `send-welcome-email`                            | 202         | `POST`      | `https://email.*****.com/send`         | 140.3         | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 5       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.246Z` | `span-ok`    | `@mycompany/user-service` | `src/services/notification.ts` | `send-welcome-email`                            | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.250Z` | `tag`        | `@mycompany/user-service` | `src/controllers/user.ts`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | 1.0             | null     |
-| `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.251Z` | `info`       | `@mycompany/user-service` | `src/controllers/user.ts`      | `Registration completed for {{userId}}`         | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.251Z` | `info`       | `@mycompany/user-service` | `src/controllers/user.ts`      | `Registration completed for {userId}`           | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.252Z` | `span-ok`    | `@mycompany/user-service` | `src/controllers/user.ts`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 
 ## The `message` System Column <a id="smoo/lmao!n/arrow-table-message"></a>
@@ -709,7 +722,7 @@ The `message` column serves different purposes based on entry type:
 | ----------------------------------- | ------------------------------------------------------------ | --------------------------- |
 | `span-start`, `span-ok`, `span-err` | Span name (e.g., `'create-user'`)                            | User `.uint64()` value      |
 | `span-exception`                    | Exception message (e.g., `'TypeError: x is not a function'`) | -                           |
-| `info`, `debug`, `warn`, `error`    | Log message template (e.g., `'User {{userId}} created'`)     | User `.uint64()` value      |
+| `info`, `debug`, `warn`, `error`    | Log message template (e.g., `'User {userId} created'`)       | User `.uint64()` value      |
 | `ff-access`, `ff-usage`             | Flag name (e.g., `'advancedValidation'`, `'darkMode'`)       | -                           |
 | `period-start`                      | -                                                            | Period start timestamp (ns) |
 | `op-*` (all 8 op metric types)      | Op name (e.g., `'GET'`, `'createUser'`)                      | Metric value (count or ns)  |
@@ -724,20 +737,20 @@ When you write:
 ```typescript
 // Inside an op function:
 const myOp = op(async ({ log }) => {
-  log.info('User {{userId}} created with {{itemCount}} items').userId(123).itemCount(5);
+  log.info('User {userId} created with {itemCount} items', { userId: 123, itemCount: 5 });
 });
 ```
 
 The system stores:
 
-| Column      | Value                                                |
-| ----------- | ---------------------------------------------------- |
-| `message`   | `'User {{userId}} created with {{itemCount}} items'` |
-| `userId`    | `123`                                                |
-| `itemCount` | `5`                                                  |
+| Column      | Value                                            |
+| ----------- | ------------------------------------------------ |
+| `message`   | `'User {userId} created with {itemCount} items'` |
+| `userId`    | `123`                                            |
+| `itemCount` | `5`                                              |
 
-**The message is NOT interpolated.** The template string `'User {{userId}} created...'` is stored verbatim in the
-`message` column, while the actual values (`123`, `5`) are stored in their respective typed attribute columns.
+**The message is NOT interpolated.** The target template `'User {userId} created...'` is stored verbatim in the
+`message` column, while actual values (`123`, `5`) are stored in their respective typed attribute columns.
 
 ### Why This Design? <a id="smoo/lmao!n/arrow-table-message.why"></a>
 
@@ -760,7 +773,7 @@ Because templates are stored separately from values, you can:
 
 ```sql
 -- Find all occurrences of a specific log pattern
-SELECT * FROM traces WHERE message = 'User {{userId}} created with {{itemCount}} items';
+SELECT * FROM traces WHERE message = 'User {userId} created with {itemCount} items';
 
 -- Group by log template to find most frequent messages
 SELECT message, count(*) as occurrences
@@ -772,7 +785,7 @@ ORDER BY occurrences DESC;
 -- Analyze specific template with different values
 SELECT userId, itemCount, timestamp
 FROM traces
-WHERE message = 'User {{userId}} created with {{itemCount}} items'
+WHERE message = 'User {userId} created with {itemCount} items'
 ORDER BY timestamp;
 ```
 
@@ -787,12 +800,12 @@ Instead of separate `span_name`, `message`, and `ffName` columns (most always nu
 
 ### Example Data <a id="smoo/lmao!n/arrow-table-message.example"></a>
 
-| entry_type   | message                                              | userId | itemCount |
-| ------------ | ---------------------------------------------------- | ------ | --------- |
-| `span-start` | `'create-user'`                                      | `123`  | `null`    |
-| `info`       | `'User {{userId}} created with {{itemCount}} items'` | `123`  | `5`       |
-| `debug`      | `'Processing batch for {{userId}}'`                  | `123`  | `null`    |
-| `span-ok`    | `'create-user'`                                      | `123`  | `null`    |
+| entry_type   | message                                          | userId | itemCount |
+| ------------ | ------------------------------------------------ | ------ | --------- |
+| `span-start` | `'create-user'`                                  | `123`  | `null`    |
+| `info`       | `'User {userId} created with {itemCount} items'` | `123`  | `5`       |
+| `debug`      | `'Processing batch for {userId}'`                | `123`  | `null`    |
+| `span-ok`    | `'create-user'`                                  | `123`  | `null`    |
 
 ### Contrast with Traditional Logging <a id="smoo/lmao!n/arrow-table-message.contrast"></a>
 
@@ -807,7 +820,7 @@ console.log(`User ${userId} created with ${itemCount} items`);
 
 ```typescript
 // Inside an op function:
-log.info('User {{userId}} created with {{itemCount}} items').userId(123).itemCount(5);
+log.info('User {userId} created with {itemCount} items', { userId: 123, itemCount: 5 });
 // Stores: template in message, values in typed columns - structured, queryable
 ```
 
@@ -822,7 +835,8 @@ log.info('User {{userId}} created with {{itemCount}} items').userId(123).itemCou
 
 ### 2. Structured Logging via Entry Type Enum <a id="smoo/lmao!n/arrow-table.patterns-structured"></a>
 
-- **Log levels with structure**: `log.info('Template {{var}}').var(value)` → `entry_type='info'` with typed attributes
+- **Log levels with structure**: `log.info('Template {var}', { var: value })` → `entry_type='info'` with typed
+  attributes
 - **Template storage**: Log message TEMPLATES stored in unified `message` column (NOT interpolated strings)
 - **Values in attribute columns**: Actual values stored separately in typed columns for type safety and queryability
 - **Optional attributes**: Structured data can accompany log messages
@@ -1138,6 +1152,24 @@ ORDER BY overflow_pct DESC;
 
 ## Performance Characteristics <a id="smoo/lmao!n/arrow-table.perf"></a>
 
+### Per-request flush and effective-memory gate
+
+Every request→trace→Arrow benchmark includes both conversion passes, tree/overflow traversal, dictionary/UTF-8 work,
+null handling, Batch/Column/Table wrappers, lease acquisition/release, and a consumer-visible semantic checksum.
+Transport batching cannot replace per-request measurements.
+
+Effective memory is peak/retained JS heap plus external backing stores, committed WASM pages/fragmentation, Arrow-owned
+output, active-lease pinned bytes, dictionaries/caches, temporary concatenation/null/UTF-8 buffers, and allocator/GC
+overhead. Report logical payload, copied bytes, wrapper allocations, chunk count, and lease-pinned bytes separately.
+
+Arrow Mitata scenarios MUST follow
+[01b1 §Required Mitata Protocol](./01b1_buffer_performance_optimizations.md#smoo/lmao!n/buffer-perf-benchmark-protocol):
+use position-balanced plugin-off, plugin-on/current, and candidates with machine-readable raw samples and publish
+p50/p95/p99/p99.9 plus commit-message-ready summaries. Allocation/GC, copied-byte, wrapper, chunk, lease, and
+effective-memory observations are auxiliary instrumentation alongside Mitata and may be unavailable. Reject checksum
+changes, lease violations, hidden source mutation, unbounded retained memory, per-value append, or regressions beyond
+the predeclared noise gate.
+
 ### Timestamp Precision (High-Resolution Anchored Design) <a id="smoo/lmao!n/arrow-table.perf-timestamp"></a>
 
 The timestamp system uses a high-precision anchored design that captures a single time reference at trace root creation,
@@ -1165,8 +1197,8 @@ then uses high-resolution timers for all subsequent timestamps. See
   - Converted to nanoseconds for consistency
   - Arrow type: `timestamp[ns]` (nanosecond)
 
-**Hot Path Storage**: All timestamps stored as `BigInt64Array` (nanoseconds since epoch) during logging. No object
-allocations, no `Date.now()` calls per entry.
+**Hot Path Storage**: Timestamps use `BigInt64Array`. For an existing buffer, the fixed store is part of the warmed
+zero-new-heap-allocation target; trace-anchor setup and fallback timestamp APIs are measured separately.
 
 **Cold Path Conversion**: Converted to Arrow `TimestampNanosecond` type, compatible with ClickHouse `DateTime64(9)`.
 
@@ -1188,7 +1220,7 @@ allocations, no `Date.now()` calls per entry.
 
 **Benefits**:
 
-- Zero allocations per timestamp
+- No new timestamp-object allocation required by the warmed fixed store itself
 - Sub-millisecond precision enables detailed performance analysis
 - All spans in trace share same anchor (comparable, consistent)
 - DST/NTP safe - anchor per trace, traces are short-lived
@@ -1237,13 +1269,14 @@ efficiency and shared dictionaries.
 ## Implementation <a id="smoo/lmao!n/arrow-table-impl"></a>
 
 The conversion lives in `packages/lmao/src/lib/convertToArrow.ts` (`convertSpanTreeToArrowTable`, the two-pass tree walk
-of [01k](./01k_tree_walker_and_arrow_conversion.md)). The columnar back-end is **`@uwdata/flechette`** (not
-`apache-arrow`): the [Zero-Copy Mandate](#zero-copy-mandate) is honored by constructing flechette `Batch` objects
-directly from `subarray()` views — the builder pattern is never used. The generic zero-copy `Batch` constructors live in
-`packages/arrow-builder/src/lib/arrow/data.ts`:
+of [01k](./01k_tree_walker_and_arrow_conversion.md)). The back-end is `@uwdata/flechette`. Final contiguous TypedArrays
+are wrapped by bounded views; overflow/null concatenation performs one explicit bulk copy, and UTF-8/dictionary
+construction owns its output. This is the shipped ownership behavior; every copied boundary remains explicit. Helpers
+live in `packages/arrow-builder/src/lib/arrow/data.ts`:
 
 - `createUint8Data` / `createUint16Data` / `createUint32Data` / `createInt32Data` / `createFloat64Data` /
-  `createBoolData` — primitive columns: `values: values.subarray(0, length)` wrapped in a flechette `Batch` (no copy).
+  `createBoolData` — primitive columns borrow bounded `values.subarray(0, length)` payloads under the applicable
+  lifetime.
 - `createUtf8Data` — plain UTF-8 columns from a packed `data` buffer + `Int32Array` offsets.
 - `createDictionary8Data` / `createDictionary16Data` / `createDictionary32Data` — dictionary columns: an index array +
   the shared UTF-8 dictionary `Column`, the index width chosen by unique count.
@@ -1261,12 +1294,12 @@ system columns. Dictionary building (`DictionaryBuilder`, `createSortedDictionar
 ### Primitive Columns (Float64, Uint8, etc.) <a id="smoo/lmao!n/arrow-table-impl.primitive"></a>
 
 ```typescript
-// Collect value arrays from each buffer (subarray = zero-copy view)
+// Borrow bounded views from each physical chunk.
 const valueArrays = buffers.map((buf) => buf.column.subarray(0, buf._writeIndex));
-// Concatenate across the overflow chain (one copy, still cheaper than builder per-value append)
+// Shipped contiguous fallback: one Arrow-owned bulk concatenation copy.
 const allValues = concatenateFloat64Arrays(valueArrays);
 const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
-// Wrap as a flechette Batch — values.subarray() is referenced, not copied
+// Wrap as a flechette Batch; the bounded payload is borrowed, while view/Batch wrappers are counted
 const batch = createFloat64Data(allValues, allValues.length, nullBitmap);
 vectors.push(new Column([batch]));
 ```
@@ -1281,10 +1314,10 @@ vectors.push(new Column([batch]));
 
 **Performance Benefits**:
 
-- **No per-value iteration**: Builder pattern called append() for every value
-- **Minimal allocation**: One concatenation vs builder's internal buffer growth
-- **Direct memory references**: TypedArrays passed directly to Arrow without copying
-- **Dictionary efficiency**: Indices already in correct format, just wrap with dictionary
+- **No per-value builder append** for bulk primitive columns
+- **Bounded copies**: preserve chunks when possible; otherwise report one concatenation rather than repeated growth
+- **Direct borrowing where ownership permits**: source bytes remain pinned under a lease
+- **Dictionary efficiency**: compatible indices can be wrapped with the shared dictionary
 
 ## Integration Points <a id="smoo/lmao!n/arrow-table.integration"></a>
 
@@ -1304,7 +1337,7 @@ This Arrow table structure integrates with:
 - **[Tree Walker and Arrow Conversion](./01k_tree_walker_and_arrow_conversion.md)**: Two-pass tree conversion with
   dictionary building, UTF-8 caching, and shared dictionaries across RecordBatches
 - **Background Processing Pipeline**: Batch conversion from buffers to Arrow/Parquet
-- **@uwdata/flechette batch.js**: Reference implementation for zero-copy Arrow data construction
+- **@uwdata/flechette batch.js**: Reference implementation for direct Arrow payload borrowing
 
 The flat table structure enables rich analytical queries while maintaining the performance benefits of columnar storage
 and efficient null handling.

@@ -185,6 +185,158 @@ controls exposed a large first-registration bias. No performance win is claimed.
 implemented representation change; a global prebuilt dictionary and header packing remain proposed prerequisites to seek
 a measured Roadmap F win.
 
+## Clean-cutover target: registered structured vocabulary
+
+This section is the authoritative compiler/runtime ABI target; it is **not shipped**. It replaces the Op-local `u16`
+representation above rather than layering another ID space over it. The clean cutover removes `logTemplateIds` and its
+private lane after every caller uses the registration ABI. No compatibility alias or dual write survives the cutover.
+
+### Checker recognition and source policy
+
+The compiler recognizes a call by checker semantics, not by the spelling `ctx.log` or by containment in `defineOp`. The
+resolved receiver must be LMAO `SpanLogger`/`GeneratedSpanLogger`, and the invoked `info`/`debug`/`warn`/`error`/`trace`
+declaration must have LMAO provenance. Typed aliases, parameters, imported logger-bearing helpers, and property paths
+therefore participate; unrelated same-named methods, `any`/`unknown`, unproved unions, and dynamic computed members do
+not. All proved LMAO logger callsites in source are subject to the same policy:
+
+- operational `info`/`warn`/`error` text is literal; dynamic text, interpolation, and concatenation are compile errors;
+- a `structured` call uses a second plain object literal and matching `{field}` placeholders. `{{` and `}}` escape
+  literal braces. This clean-cutover grammar replaces the shipped `{{field}}` placeholder spelling;
+- a `static` call has literal text and no fields. Literal `debug`/`trace` may be `static` or `structured`; an existing
+  runtime string reference is `dynamic`, unregistered, and stored on the raw lane, while avoidable interpolation is
+  rejected; and
+- `mixed` is reserved for a physical buffer family carrying both numeric vocabulary and dynamic lanes. It is not a
+  callsite class or kind tag. `kindTags` are entry semantic kinds.
+
+Checker-proven literal trace/span names are registered as `SPAN_NAME`; dynamic names remain on the dynamic string lane.
+Shipped code stores all span names as strings, so span-name registration is target-only and must preserve the public
+Promise/microtask contract.
+
+```typescript
+// Source in an application or independently compiled library.
+export function report(log: SpanLogger, ctx: OpContext, job: Job, elapsedMs: number) {
+  log.info('completed {jobId} in {elapsedMs}ms', { jobId: job.id, elapsedMs });
+  log.info('literal braces: {{ok}}');
+  log.trace(traceText); // supported dynamic lane
+  return ctx.span('complete-job', completeJobOp, job.id); // registered SPAN_NAME
+}
+```
+
+The compiler removes the fields object. The following registration is emitted **JavaScript**, and the installer import
+is a compiler-emitted/imported side-effect dependency so ESM installs the callback first:
+
+```javascript
+import '@smoothbricks/lmao/vocabulary/register/v1';
+const REGISTER_VOCABULARY = Symbol.for('@smoothbricks/lmao/vocabulary/register/v1');
+const $$binding = globalThis[REGISTER_VOCABULARY]($$typedArrayFragment);
+
+const $$v0 = job.id;
+const $$v1 = elapsedMs;
+log._infoStructured2($$binding[0], LINE, $$v0, $$v1);
+log._infoStatic0($$binding[1], LINE);
+log.trace(traceText);
+return ctx.spanVocabulary1(LINE, $$binding[2], completeJobOp, job.id);
+```
+
+Private seam names may change, but warmed registered writes use direct `binding[ordinal]` loads and fixed monomorphic
+stores with zero object, array, rest-argument, or interpolated-string allocation. The target span-name seam remains
+Promise-based like `span1`; dynamic names continue through public `span(name, ...)`. Dense index zero is valid, and
+nullable rows use a validity bitmap rather than an index sentinel. A predictable overflow/slow path remains correct.
+
+### Versioned fragment registration
+
+The runtime type contract, separate from emitted JavaScript, is:
+
+```typescript
+type VocabularyFragmentV1 = {
+  schemaVersion: 1;
+  idAlgorithm: 'sha256-24-v1';
+  contentHash: string;
+  ids: Uint32Array;
+  kindTags: Uint8Array;
+  utf8: Uint8Array;
+  offsets: Int32Array;
+};
+type VocabularyBinding = Uint32Array;
+type RegisterVocabularyV1 = (fragment: VocabularyFragmentV1) => VocabularyBinding;
+```
+
+For `N = ids.length`, `kindTags.length` and binding length are `N`; `offsets.length` is `N + 1`, `offsets[0]` is zero,
+`offsets[N]` is `utf8.length`, and offsets are monotonic and in range. Record `i` is
+`utf8.subarray(offsets[i], offsets[i + 1])` with exact bytes:
+
+```text
+u32le textLen | text UTF8 | u16le fieldCount |
+repeated(u16le nameLen | name UTF8 | u16le columnLen | column UTF8)
+```
+
+`kindTags[i]` is `1` (`LOG_TEMPLATE`) or `2` (`SPAN_NAME`). `ids[i]` is the first 24 bits, interpreted big-endian, of
+`SHA-256(kindTag || recordBytes)`. `contentHash` is lowercase SHA-256 hex of:
+
+```text
+u8 schemaVersion |
+u16le algorithmLen | idAlgorithm UTF8 |
+u32le ids.length | repeated(u32le id) |
+u32le kindTags.length | kindTags bytes |
+u32le utf8.length | utf8 bytes |
+u32le offsets.length | repeated(i32le offset)
+```
+
+This makes numeric array serialization explicitly little-endian, independent of host typed-array byte order. The
+callback validates lengths, integer ranges, tags, UTF-8, grammar, IDs, and hash.
+
+Every precompiled library/chunk imports the LMAO installer side effect, obtains the shared Symbol, registers during
+module evaluation, and closes over the binding. The consuming build needs neither source/checker graph nor a second
+transform. Bundling retains installation/registration side effects and each callsite-to-binding pairing.
+
+The runtime validates then copies or merges inputs into a runtime-owned immutable dictionary generation. New fragments
+append unseen values in registration order; dense indices are not sorted or canonical. Existing bindings remain
+prefix-valid forever, and each generation is exactly its predecessor plus appended values. An `ArrowLease` pins the
+exact backing store, WASM epoch, chunks, and dictionary generation used by its batch until explicit release. Stable IDs
+and content bytes—not dense indices—provide deterministic cross-order identity and checksums; only decoded values and
+schema semantics are deterministic across registration orders.
+
+Registration is idempotent for byte-identical fragments and deduplicates equal `(kindTag,id,recordBytes)` records.
+Reusing an ID for different kind/bytes, or `contentHash` for another fragment, is fatal before the fragment is writable.
+An unavailable/incompatible callback is a strict-build diagnostic or startup failure, never a guessed index. Startup
+contributes bindings to the immutable `PhysicalLayoutPlan`; live shapes never mutate and warmed writes have no
+registration/version branch.
+
+### Diagnostics, fallbacks, and order
+
+`LMAO_DYNAMIC_OPERATIONAL_TEXT`, `LMAO_AVOIDABLE_INTERPOLATION`, `LMAO_FIELDS_NOT_OBJECT_LITERAL`, and
+`LMAO_PLACEHOLDER_MISMATCH` reject the source-policy violations above. In strict optimized mode,
+`LMAO_LOGGER_PROOF_REQUIRED` rejects an apparent typed LMAO call that cannot be proven. A genuinely unrelated/unproved
+call is left byte-shape unchanged; a proved LMAO policy violation never silently takes the raw fallback. This prevents
+optimizer success from changing vocabulary coverage.
+
+The emitted call evaluates its receiver first, arguments left-to-right, and each field initializer exactly once in
+source property order. Compiler temporaries may precede stores only to preserve this order. Throws, getters reached by
+field value expressions, and other side effects remain at their source-relative point; runtime field expressions never
+move into module registration. Vocabulary lowering also preserves the public span contract: automatic `span()` to
+`spanAutoN` selection remains forbidden, so Promise assimilation and microtask turns do not change.
+
+### Promotion gates
+
+Repo-standard Mitata scenarios must compare `plugin-off`, `plugin-on/current`, and target variants with a
+position-balanced schedule in order-reversed independent processes. They record machine-readable raw samples, semantic
+checksums, p50/p95/p99/p99.9, and allocation/GC metadata where available, and produce a commit-message-ready summary.
+Any checksum, decode, collision, or evaluation-order difference fails promotion.
+
+Semantic acceptance covers `static` templates, `structured` fields and brace escapes, dynamic debug/trace text, literal
+`SPAN_NAME` entries, and dynamic span-name fallback. It checks binding length, append-only prefix stability, dense zero
+with validity-based nulls, exact record bytes/hashes, decoded Arrow values, and unchanged Promise/microtask observations
+under at least two reversed registration orders.
+
+Measurements are separate for `startup`, `span setup`, `warmed entry write`, `overflow/slow path`, and
+`per-request flush`; one phase cannot hide another. The warmed target must allocate zero, use fixed monomorphic stores,
+improve p50 by at least 10% over `plugin-on/current`, and regress no reported tail percentile by more than 3%. The
+overflow path must remain correct and bounded with no greater than 3% p99.9 regression. Per-request flush must reuse the
+`PhysicalLayoutPlan`, process-dense Arrow vocabulary, and `ArrowLease`, allocate few or no objects, and regress no
+percentile by more than 3%. Startup and span setup costs are explicit and must not regress more than 3% unless the
+commit summary names and justifies the trade. Until every gate passes, the target remains unpromoted and no
+zero-overhead claim is permitted.
+
 ## The bigger design space: typed macros over the schema, not just call sites
 
 The verdicts above treat the transformer as a call-site rewriter. Its real
@@ -238,18 +390,18 @@ allocation overhead, purely additive to the existing ABI.
 The refuted micro-batching staged values and paid `.set()` overhead. A possible future variant would pack **compile-time
 constants** such as entry type, the already-implemented Op-local template ID, and line number into one u32/u64 literal
 and emit one element write instead of separate lane writes. No packed row header is implemented or measured.
-### F. Template/name dictionaries: Op-local hot store implemented; global vocabulary proposed
 
-**Implemented subset.** Literal log messages eligible under the checker rules above use private per-Op `u16` IDs in the
-hot store. This subset deduplicates and avoids the per-row literal string write, then restores the exact public string
-at cold conversion. It does **not** create a program-wide dictionary, a stable trace vocabulary, or a new Arrow column.
-The local-store benchmark has now been run and did not meet the promotion gate, so no performance win is claimed.
+### F. Template/name dictionaries: shipped Op-local store versus specified global target
+**Implemented subset.** Literal log messages eligible under the shipped checker rules use private per-Op `u16` IDs in
+the hot store. This subset deduplicates and avoids the per-row literal string write, then restores the exact public
+string at cold conversion. It does **not** create a program-wide dictionary, a stable trace vocabulary, or a new Arrow
+column. The local-store benchmark did not meet the promotion gate, so no performance win is claimed.
 
-**Still proposed.** A future whole-program pass could collect log templates **and span names**, assign globally stable
-IDs, emit a prebuilt sorted dictionary shared across flushes and hosts, and generate a checked-in/versioned manifest.
-That manifest could become the trace-vocabulary artifact AxE 08-trace-testing requires: selector-by-template could
-become selector-by-stable-ID, and renaming a span could visibly change a reviewed contract. None of global stable IDs,
-span-name vocabulary, checked-in manifest generation, or prebuilt dictionary emission is shipped today.
+**Specified, not shipped.** The clean-cutover ABI above expands checker-semantic coverage to `static`/`structured`
+logger callsites and literal `SPAN_NAME` records, emits stable content-derived `u24` identities, and registers fragments
+into append-only runtime-dense Arrow bindings. Independently compiled libraries self-register without source at the
+consuming build. None of stable IDs, fragment registration, `VocabularyBinding`, registered span names, or runtime-owned
+immutable dictionary generations is shipped. The target cannot be promoted until its phase-specific gates pass.
 
 ### G. Smaller, cheap wins
 
@@ -313,9 +465,9 @@ analyses (usage-driven pre-allocation, dead columns, vocabulary contracts) that 
    not preserve the public Promise path's observable microtask schedule.
 4. **Next, measure first**: benchmark the shipped fixed-arity/hint path and the separate Op-local template-ID path on
    target runtimes. Keep structural correctness and ABI claims separate from performance claims.
-5. **Design next**: compile-time buffer-class emission (A) plus static eager sets (B). For F, separately evaluate the
-   still-proposed global stable template/span-name vocabulary, checked-in manifest, and prebuilt dictionary; do not
-   conflate them with the shipped private Op-local lane. Either design could later inform header packing (E).
+5. **Implement behind measurement**: compile-time buffer-class emission (A), static eager sets (B), and the specified
+   registered vocabulary target (F). Keep their benchmark variants separate from the shipped private Op-local lane;
+   clean cutover removes that lane only after all semantic and performance gates pass.
 6. **With lmao-wasm, only after measurement**: evaluate an `alloc_span_with_columns` descriptor export for allocation
    batching (D).
 7. **Don't**: value-level write batching or export-call amortization for tag/log writes; the measurements above refute

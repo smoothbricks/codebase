@@ -5,6 +5,34 @@
 **Observation**: Most logging systems are either too slow (string concatenation at runtime) or too hard to query
 (unstructured). We need something that's blazing fast at runtime but produces rich, queryable data.
 
+## Performance Contract and Status <a id="smoo/lmao!n/lmao-trace-performance-contract"></a>
+
+Performance claims are phase-specific. “Zero” never means that an entire request, trace, or Arrow flush performs no
+work, allocation, or copy.
+
+| Phase                        | Shipped behavior                                                                                                | Enforceable target                                                                                                                                                                               |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Startup / vocabulary binding | Generated classes, schemas, dictionaries, and accessors are created before steady-state writes.                 | Charge `PhysicalLayoutPlan` construction and versioned `VocabularyBinding` registration here; report time, allocations, code size, and shared memory separately.                                 |
+| Span setup                   | A SpanBuffer, views, identity bytes, tree links, and some string arrays are created.                            | Bounded setup allocations with stable generated shapes; setup is never described as allocation-free.                                                                                             |
+| Warmed entry write           | Fixed stores append timestamps, entry types, and already-selected fields. Dynamic strings remain JS references. | Zero **new heap allocations for the warmed fixed-capacity case**, fixed monomorphic stores, stable hidden classes/ICs, and one predictable capacity branch. First-use lazy columns are excluded. |
+| Overflow / other slow paths  | A continuation or lazy column may allocate; WASM may bump-allocate or grow.                                     | Explicit, bounded, observable slow path, measured separately from warmed writes.                                                                                                                 |
+| Per-request Arrow flush      | Tree walking, dictionaries/UTF-8, null handling, wrappers, and sometimes concatenation allocate or copy.        | Few/no avoidable allocations, maximal Arrow-native reuse, and an explicit `ArrowLease` for borrowed-buffer lifetime.                                                                             |
+
+**Effective memory** is the maximum request-attributable live set: JavaScript heap and backing stores, external
+`ArrayBuffer`/TypedArray bytes, committed WASM pages (including free/stranded space), Arrow-owned output, borrowed
+buffers pinned by an `ArrowLease`, temporary dictionaries/UTF-8/null bitmaps, caches, and allocator/GC metadata. Shared
+startup state MAY be amortized only when its raw size and divisor are emitted.
+
+The shipped implementation separates hot writes from cold conversion and generates fixed-shape buffers. The target
+contract above is accepted only when the repository-standard Mitata scenarios follow
+[01b1 §Required Mitata Protocol](./01b1_buffer_performance_optimizations.md#smoo/lmao!n/buffer-perf-benchmark-protocol):
+plugin-off, plugin-on/current, and candidates use identical semantic checksums, position-balanced ordering, and
+machine-readable raw samples. Report p50/p95/p99/p99.9 for every phase. Allocation, GC, IC/hidden-class, and branch
+observations are auxiliary instrumentation alongside Mitata; when unavailable they are reported as unavailable, not
+zero. A candidate fails on semantic mismatch, warmed fixed-capacity allocation, polymorphic/megamorphic hot ICs,
+post-warmup hidden-class transitions, an unstable common overflow branch, a lease-lifetime violation, or a regression
+beyond the Mitata scenario's predeclared noise threshold.
+
 ## Design Rationale: Why op() + span()? <a id="smoo/lmao!n/lmao-trace-design-rationale-why-op-span"></a>
 
 Understanding the design rationale helps explain WHY the current `op()` + `span()` pattern was chosen over alternatives.
@@ -53,13 +81,13 @@ await httpRoot.span('GET', GET, 'https://example.com');
 
 **Why this approach was chosen**:
 
-| Aspect          | Alternative (rejected) | Chosen Approach                  |
-| --------------- | ---------------------- | -------------------------------- |
-| Deps allocation | Per-span closures      | Zero - just Op refs              |
-| Ergonomics      | `ctx.tag.userId()`     | `tag.userId()`                   |
-| Span naming     | Definition time        | Call site (flexible)             |
-| Module binding  | Implicit               | Explicit via Op class            |
-| V8 optimization | Closure-heavy          | Plain class, stable hidden class |
+| Aspect          | Alternative (rejected) | Chosen Approach                           |
+| --------------- | ---------------------- | ----------------------------------------- |
+| Deps binding    | Per-span closures      | Op refs; no dependency-closure allocation |
+| Ergonomics      | `ctx.tag.userId()`     | `tag.userId()`                            |
+| Span naming     | Definition time        | Call site (flexible)                      |
+| Module binding  | Implicit               | Explicit via Op class                     |
+| V8 optimization | Closure-heavy          | Plain class, stable hidden class          |
 
 ### Line Number Injection <a id="smoo/lmao!n/lmao-trace-line-number-injection"></a>
 
@@ -109,7 +137,9 @@ integration. It consists of these main components:
 
 **Purpose**: Queryable data format for analysis and storage.
 
-- Zero-copy conversion from runtime buffers to Apache Arrow format.
+- Borrow contiguous primitive buffers where ownership permits, preserve Arrow-native chunks where possible, and make
+  explicit Arrow-owned copies for concatenation, UTF-8, dictionaries, or lifetime isolation.
+- `ArrowLease` keeps borrowed SpanBuffer/WASM storage alive until the consumer releases it.
 - **WHY**: Enables efficient querying, compression, and integration with data analysis tools.
 
 ### 4. [Context Flow and Op/Span Pattern](./01c_context_flow_and_op_wrappers.md) <a id="smoo/lmao!n/lmao-trace-4-context-flow-and-opspan-pattern01ccontextflowandopwrappersmd"></a>
@@ -121,7 +151,7 @@ integration. It consists of these main components:
 - **Dual Module Attribution**: `callsiteModule` for row 0 (where span was invoked), `module` for rows 1+ (where code
   executes)
 - **Context destructuring**: `{ span, log, tag, deps }` for ergonomic access
-- **WHY**: Zero per-span allocation for deps, flexible naming, clean business logic
+- **WHY**: No per-span dependency-closure allocation; span setup still has the costs in the phase contract.
 
 ### 5. [AI Agent Integration](./01d_ai_agent_integration.md) <a id="smoo/lmao!n/lmao-trace-5-ai-agent-integration01daiagentintegrationmd"></a>
 
@@ -160,12 +190,14 @@ integration. It consists of these main components:
 ## Core Architecture Principles <a id="smoo/lmao!n/lmao-trace-core-architecture-principles"></a>
 
 - **Two-Phase Logging**: Separate runtime writes from background processing.
-- **Data-Oriented Design**: Use columnar storage and null bitmaps for performance, and near instant conversion to
-  columnar formats like Apache Arrow.
-- **CPU-Friendly Performance**: Design patterns that leverage V8 optimizations like hidden classes and inline caches,
-  and are friendly to the CPU's branch predictor.
-- **Runtime Codegen**: Use new Function() code generation at application startup to avoid runtime overhead.
-- **Zero-Allocation Deps**: Dependencies are Op references, not per-span closures.
+- **Data-Oriented Design**: Use columnar storage and null bitmaps for performance, then reuse those buffers in Arrow
+  where the ownership boundary permits.
+- **CPU-Friendly Performance**: Generated hot objects MUST retain stable hidden classes and monomorphic inline caches;
+  the common fixed-capacity write MUST use fixed stores and a predictable not-overflow branch.
+- **Runtime Codegen**: Charge `new Function()` generation and `PhysicalLayoutPlan`/`VocabularyBinding` setup to startup,
+  not the warmed write.
+- **Dependency References**: `deps` contains Op references and introduces no per-span dependency closures; this narrow
+  claim does not make span setup allocation-free.
 - **Call-Site Naming**: Span names provided at invocation for contextual flexibility.
 
 ## The Op + Span Pattern <a id="smoo/lmao!n/lmao-trace-the-op-span-pattern"></a>
@@ -182,7 +214,7 @@ const GET = op(async ({ span, log, tag, deps }, url: string) => {
   tag.method('GET');
   tag.url(url);
 
-  // deps are just Op references - zero allocation
+  // deps are Op references; this step creates no dependency closure
   const result = await span('fetch', fetchOp, url);
 
   log.info('Request completed');
@@ -277,7 +309,7 @@ const GET = op(async ({ span, deps }, url: string) => {
 
 ## Key Innovations <a id="smoo/lmao!n/lmao-trace-key-innovations"></a>
 
-1. **Zero-Allocation Deps**: Op references instead of per-span closures
+1. **Dependency References**: Op references avoid per-span dependency closures; benchmark total span setup separately
 2. **Call-Site Naming**: `span('name', op, args)` for contextual flexibility
 3. **Context Destructuring**: `{ span, log, tag, deps }` for clean code
 4. **Self-Tuning Buffers**: Each module learns optimal capacity from usage patterns
@@ -366,7 +398,7 @@ const SpanLoggerClass = new Function(
     '}'
 )();
 
-// At runtime (hot path) - zero overhead:
+// At runtime (warmed fixed-capacity path): generated direct stores; allocation behavior is benchmark-enforced.
 logger.userId('123').requestId('req-456');
 ```
 
@@ -379,11 +411,9 @@ logger.userId('123').requestId('req-456');
 
 ### 4. Prototype-Based Context Inheritance <a id="smoo/lmao!n/lmao-trace-4-prototype-based-context-inheritance"></a>
 
-`Object.create(proto)` is faster than object spreads `{...parent}` because:
-
-- No property enumeration
-- No copying - just prototype chain link
-- Maintains hidden class stability
+`Object.create(proto)` avoids copying enumerable context fields. It still allocates the child context object during span
+setup. The prototype link preserves the expected generated property-access shape without implying a universal
+allocation- or copy-free operation.
 
 **Why Object Spread Breaks Hidden Classes:**
 
@@ -529,13 +559,13 @@ The trace logging system integrates with these platform components:
 
 ## Quick Reference: op() + span() Design <a id="smoo/lmao!n/lmao-trace-quick-reference-op-span-design"></a>
 
-| Aspect             | Alternative (rejected)      | Chosen Approach                |
-| ------------------ | --------------------------- | ------------------------------ |
-| **Definition**     | `task('name', fn)`          | `op(fn)`                       |
-| **Invocation**     | `await GET(ctx, url)`       | `await span('GET', GET, url)`  |
-| **Name timing**    | Definition time             | Call site                      |
-| **Deps**           | Per-span closures           | Op references (zero alloc)     |
-| **Context**        | `ctx.tag.userId()`          | `tag.userId()` (destructured)  |
-| **Nested calls**   | `ctx.deps.retry.attempt(1)` | `span('retry', deps.retry, 1)` |
-| **Module binding** | Implicit in closure         | Explicit in Op class           |
-| **Line numbers**   | `.line(N)` fluent method    | First arg to span()            |
+| Aspect             | Alternative (rejected)      | Chosen Approach                       |
+| ------------------ | --------------------------- | ------------------------------------- |
+| **Definition**     | `task('name', fn)`          | `op(fn)`                              |
+| **Invocation**     | `await GET(ctx, url)`       | `await span('GET', GET, url)`         |
+| **Name timing**    | Definition time             | Call site                             |
+| **Deps**           | Per-span closures           | Op references (no dependency closure) |
+| **Context**        | `ctx.tag.userId()`          | `tag.userId()` (destructured)         |
+| **Nested calls**   | `ctx.deps.retry.attempt(1)` | `span('retry', deps.retry, 1)`        |
+| **Module binding** | Implicit in closure         | Explicit in Op class                  |
+| **Line numbers**   | `.line(N)` fluent method    | First arg to span()                   |
