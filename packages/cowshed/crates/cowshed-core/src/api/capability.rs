@@ -1,8 +1,8 @@
 use super::dto::{
     AdoptOptions, AttachOptions, CheckpointQuota, CheckpointResult, CreateOptions, EmptyResult,
-    ExecRequest, GcOptions, GcReport, GitOid, GrantDelta, GrantSet, JobId, JobInfo, LandOptions,
-    LandReport, MirrorInfo, PushOptions, PushReport, RebaseOptions, RemoveOptions, RevisionResult,
-    RunSandboxMode, StdinSource, WorkspaceInfo,
+    ExecRequest, GcOptions, GcReport, GitOid, GrantDelta, GrantSet, JobId, JobInfo, JobState,
+    LandOptions, LandReport, MirrorInfo, PushOptions, PushReport, RebaseOptions, RemoveOptions,
+    RevisionResult, RunSandboxMode, StdinSource, WorkspaceInfo,
 };
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::WorkspaceName;
@@ -38,9 +38,9 @@ pub(crate) trait ControllerRuntime: Send + Sync {
         id: JobId,
         stream: JobStream,
         follow: bool,
-    ) -> Result<JobByteStream>;
+    ) -> Result<RawByteStream>;
     async fn attach(&self, workspace: &WorkspaceName, id: JobId) -> Result<JobAttachment>;
-    fn kill(&self, workspace: &WorkspaceName, id: JobId) -> Result<()>;
+    async fn kill(&self, workspace: &WorkspaceName, id: JobId) -> Result<()>;
 }
 
 #[cfg(unix)]
@@ -185,103 +185,132 @@ impl ControllerRuntime for ActorRuntime {
         id: JobId,
         stream: JobStream,
         follow: bool,
-    ) -> Result<JobByteStream> {
-        let (sender, receiver) = mpsc::channel(8);
-        let runtime = self.clone();
-        let workspace = workspace.clone();
-        tokio::spawn(async move {
-            let mut offset = 0_u64;
-            loop {
-                let value = runtime
-                    .call(
-                        "job.logs",
-                        json!({
-                            "workspace": workspace,
-                            "jobId": id,
-                            "stream": stream,
-                            "follow": follow,
-                            "offset": offset,
-                        }),
-                    )
-                    .await;
-                let chunk = match value.and_then(|value| {
-                    serde_json::from_value::<LogChunk>(value).map_err(|error| {
-                        CowshedError::internal(format!(
-                            "controller returned an invalid job.logs response: {error}"
-                        ))
-                    })
-                }) {
-                    Ok(chunk) => chunk,
-                    Err(error) => {
-                        let _ = sender.send(Err(error)).await;
-                        break;
-                    }
-                };
-                if !chunk.bytes.is_empty() {
-                    offset = offset.saturating_add(chunk.bytes.len() as u64);
-                    if sender.send(Ok(Bytes::from(chunk.bytes))).await.is_err() {
-                        break;
-                    }
-                }
-                if chunk.eof && !follow {
-                    break;
-                }
-                if chunk.eof {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-            }
-        });
-        Ok(JobByteStream { receiver })
+    ) -> Result<RawByteStream> {
+        Ok(poll_job_stream(
+            Arc::new(self.clone()),
+            workspace.clone(),
+            id,
+            stream,
+            follow,
+        ))
     }
 
     async fn attach(&self, workspace: &WorkspaceName, id: JobId) -> Result<JobAttachment> {
         let stdout = self.logs(workspace, id, JobStream::Stdout, true).await?;
         let stderr = self.logs(workspace, id, JobStream::Stderr, true).await?;
-        let (stdin, mut writes) = mpsc::channel::<StdinWrite>(8);
-        let runtime = self.clone();
-        let attached_workspace = workspace.clone();
-        tokio::spawn(async move {
-            while let Some(write) = writes.recv().await {
-                let result = runtime
-                    .call(
-                        "job.attachWrite",
-                        json!({
-                            "workspace": attached_workspace,
-                            "jobId": id,
-                            "bytes": write.bytes.as_ref(),
-                        }),
-                    )
-                    .await
-                    .and_then(decode_empty);
-                let _ = write.reply.send(result);
-            }
-        });
+        let runtime: Arc<dyn ControllerRuntime> = Arc::new(self.clone());
         Ok(JobAttachment {
             workspace: workspace.clone(),
             id,
-            stdin,
+            stdin: JobStdin {
+                workspace: workspace.clone(),
+                id,
+                runtime: Arc::clone(&runtime),
+            },
             stdout,
             stderr,
-            runtime: Arc::new(self.clone()),
+            runtime,
         })
     }
 
-    fn kill(&self, workspace: &WorkspaceName, id: JobId) -> Result<()> {
-        let (reply, _response) = oneshot::channel();
-        self.sender
-            .try_send(ActorMessage {
-                method: "job.kill",
-                params: json!({ "workspace": workspace, "jobId": id }),
-                reply,
-            })
-            .map_err(|error| {
-                CowshedError::new(
-                    ErrorCode::EnvironmentMissing,
-                    format!("could not queue job kill: {error}"),
-                    "retry cowshed job kill",
-                )
-            })
+    async fn kill(&self, workspace: &WorkspaceName, id: JobId) -> Result<()> {
+        self.call("job.kill", json!({ "workspace": workspace, "jobId": id }))
+            .await
+            .and_then(decode_empty)
     }
+}
+
+fn poll_job_stream(
+    runtime: Arc<dyn ControllerRuntime>,
+    workspace: WorkspaceName,
+    id: JobId,
+    stream: JobStream,
+    follow: bool,
+) -> RawByteStream {
+    let (sender, receiver) = mpsc::channel(8);
+    tokio::spawn(async move {
+        let mut offset = 0_u64;
+        loop {
+            let value = tokio::select! {
+                _ = sender.closed() => break,
+                value = runtime.call(
+                    "job.logs",
+                    json!({
+                        "workspace": workspace,
+                        "jobId": id,
+                        "stream": stream,
+                        "follow": follow,
+                        "offset": offset,
+                    }),
+                ) => value,
+            };
+            let chunk = match value.and_then(|value| {
+                serde_json::from_value::<LogChunk>(value).map_err(|error| {
+                    CowshedError::internal(format!(
+                        "controller returned an invalid job.logs response: {error}"
+                    ))
+                })
+            }) {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    tokio::select! {
+                        _ = sender.closed() => {}
+                        _ = sender.send(Err(error)) => {}
+                    }
+                    break;
+                }
+            };
+            if !chunk.bytes.is_empty() {
+                offset = offset.saturating_add(chunk.bytes.len() as u64);
+                let bytes = Bytes::from(chunk.bytes);
+                let sent = tokio::select! {
+                    _ = sender.closed() => false,
+                    result = sender.send(Ok(bytes)) => result.is_ok(),
+                };
+                if !sent {
+                    break;
+                }
+            }
+            if !follow {
+                break;
+            }
+            if chunk.eof {
+                let status: Result<JobInfo> = tokio::select! {
+                    _ = sender.closed() => break,
+                    value = runtime.call(
+                        "job.status",
+                        json!({ "workspace": workspace, "jobId": id }),
+                    ) => value.and_then(|value| {
+                        serde_json::from_value(value).map_err(|error| {
+                            CowshedError::internal(format!(
+                                "controller returned an invalid job.status response: {error}"
+                            ))
+                        })
+                    }),
+                };
+                match status {
+                    Ok(info) if is_terminal_job_state(info.state) => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        tokio::select! {
+                            _ = sender.closed() => {}
+                            _ = sender.send(Err(error)) => {}
+                        }
+                        break;
+                    }
+                }
+            }
+            tokio::select! {
+                _ = sender.closed() => break,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+            }
+        }
+    });
+    RawByteStream { receiver }
+}
+
+fn is_terminal_job_state(state: JobState) -> bool {
+    !matches!(state, JobState::Queued | JobState::Running)
 }
 
 async fn call_typed<T: DeserializeOwned>(
@@ -323,58 +352,61 @@ struct LogChunk {
     eof: bool,
 }
 
-pub struct JobByteStream {
+pub struct RawByteStream {
     receiver: mpsc::Receiver<Result<Bytes>>,
 }
 
-impl JobByteStream {
+impl RawByteStream {
     pub async fn next(&mut self) -> Option<Result<Bytes>> {
         self.receiver.recv().await
     }
 }
 
-struct StdinWrite {
-    bytes: Bytes,
-    reply: oneshot::Sender<Result<()>>,
+pub struct JobStdin {
+    workspace: WorkspaceName,
+    id: JobId,
+    runtime: Arc<dyn ControllerRuntime>,
+}
+
+impl JobStdin {
+    pub async fn write(&self, bytes: Bytes) -> Result<()> {
+        let value = self
+            .runtime
+            .call(
+                "job.attachWrite",
+                json!({
+                    "workspace": self.workspace,
+                    "jobId": self.id,
+                    "bytes": bytes.as_ref(),
+                }),
+            )
+            .await?;
+        decode_empty(value)
+    }
+}
+
+impl fmt::Debug for JobStdin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JobStdin")
+            .field("workspace", &self.workspace)
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
 }
 
 pub struct JobAttachment {
     workspace: WorkspaceName,
     id: JobId,
-    stdin: mpsc::Sender<StdinWrite>,
-    stdout: JobByteStream,
-    stderr: JobByteStream,
+    stdin: JobStdin,
+    stdout: RawByteStream,
+    stderr: RawByteStream,
     runtime: Arc<dyn ControllerRuntime>,
 }
 
 impl JobAttachment {
-    pub fn stdout(&mut self) -> &mut JobByteStream {
-        &mut self.stdout
-    }
-
-    pub fn stderr(&mut self) -> &mut JobByteStream {
-        &mut self.stderr
-    }
-
-    pub async fn write(&self, bytes: Bytes) -> Result<()> {
-        let (reply, response) = oneshot::channel();
-        self.stdin
-            .send(StdinWrite { bytes, reply })
-            .await
-            .map_err(|_| {
-                CowshedError::new(
-                    ErrorCode::EnvironmentMissing,
-                    "job attachment stdin channel closed",
-                    "reattach to the durable job",
-                )
-            })?;
-        response.await.map_err(|_| {
-            CowshedError::new(
-                ErrorCode::EnvironmentMissing,
-                "job attachment closed before stdin was acknowledged",
-                "reattach to the durable job",
-            )
-        })?
+    pub fn into_parts(self) -> (JobStdin, RawByteStream, RawByteStream) {
+        (self.stdin, self.stdout, self.stderr)
     }
 
     pub async fn detach(self) -> Result<()> {
@@ -1243,7 +1275,7 @@ impl JobHandle {
         .await
     }
 
-    pub async fn logs(&self, stream: JobStream, follow: bool) -> Result<JobByteStream> {
+    pub async fn logs(&self, stream: JobStream, follow: bool) -> Result<RawByteStream> {
         self.runtime
             .logs(&self.workspace, self.id, stream, follow)
             .await
@@ -1266,8 +1298,8 @@ impl JobHandle {
         .await
     }
 
-    pub fn kill(&self) -> Result<()> {
-        self.runtime.kill(&self.workspace, self.id)
+    pub async fn kill(&self) -> Result<()> {
+        self.runtime.kill(&self.workspace, self.id).await
     }
 
     async fn empty_call(&self, method: &'static str) -> Result<()> {
@@ -1339,7 +1371,105 @@ impl fmt::Debug for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future;
     use std::mem::{needs_drop, size_of};
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct TestRuntime {
+        mode: AtomicU8,
+        log_calls: AtomicUsize,
+        status_calls: AtomicUsize,
+        stdin_writes: AtomicUsize,
+        active_calls: AtomicUsize,
+    }
+
+    struct ActiveCall<'a>(&'a AtomicUsize);
+
+    impl Drop for ActiveCall<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl ControllerRuntime for TestRuntime {
+        async fn call(&self, method: &'static str, _params: Value) -> Result<Value> {
+            match method {
+                "job.logs" => {
+                    self.log_calls.fetch_add(1, Ordering::SeqCst);
+                    if self.mode.load(Ordering::SeqCst) == 1 {
+                        self.active_calls.fetch_add(1, Ordering::SeqCst);
+                        let _active = ActiveCall(&self.active_calls);
+                        future::pending().await
+                    } else {
+                        Ok(json!({"bytes": [], "eof": true}))
+                    }
+                }
+                "job.status" => {
+                    self.status_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(terminal_job_value())
+                }
+                "job.attachWrite" => {
+                    self.stdin_writes.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({}))
+                }
+                _ => Ok(json!({})),
+            }
+        }
+
+        async fn exec(&self, _workspace: &WorkspaceName, _request: ExecRequest) -> Result<JobId> {
+            Err(CowshedError::internal("unexpected test exec"))
+        }
+
+        async fn logs(
+            &self,
+            _workspace: &WorkspaceName,
+            _id: JobId,
+            _stream: JobStream,
+            _follow: bool,
+        ) -> Result<RawByteStream> {
+            Err(CowshedError::internal("unexpected test logs"))
+        }
+
+        async fn attach(&self, _workspace: &WorkspaceName, _id: JobId) -> Result<JobAttachment> {
+            Err(CowshedError::internal("unexpected test attach"))
+        }
+
+        async fn kill(&self, _workspace: &WorkspaceName, _id: JobId) -> Result<()> {
+            Err(CowshedError::internal("test controller rejected kill"))
+        }
+    }
+
+    fn terminal_job_value() -> Value {
+        json!({
+            "repoId": "acme/widget",
+            "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+            "jobId": 7,
+            "state": "exited",
+            "grantRevision": 1,
+            "argv": ["true"],
+            "cwd": "packages/app",
+            "started": "2016-12-31T23:59:60Z",
+            "durationMs": 1,
+            "exit": {"kind": "exited", "code": 0},
+            "stdout": {
+                "path": ".cowshed/job/7/out",
+                "bytes": 0,
+                "summary": {"version": 1, "text": "", "truncated": false}
+            },
+            "stderr": {
+                "path": ".cowshed/job/7/err",
+                "bytes": 0,
+                "summary": {"version": 1, "text": "", "truncated": false}
+            },
+            "trace": {
+                "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                "spanId": "00f067aa0ba902b7"
+            },
+            "stdin": {"kind": "empty", "bytes": 0, "complete": true}
+        })
+    }
 
     #[test]
     fn authority_tokens_and_handles_are_affine_owned_values() {
@@ -1409,5 +1539,106 @@ mod tests {
         let error = cowshed.open(path).await.unwrap_err();
         assert_eq!(error.code, ErrorCode::Usage);
         assert!(error.message.contains("UTF-8"));
+    }
+
+    #[tokio::test]
+    async fn followed_stream_closes_at_terminal_state_without_empty_chunks() {
+        let runtime = Arc::new(TestRuntime::default());
+        let runtime_trait: Arc<dyn ControllerRuntime> = runtime.clone();
+        let mut stream = poll_job_stream(
+            runtime_trait,
+            WorkspaceName::new("raven").unwrap(),
+            JobId::new(7).unwrap(),
+            JobStream::Stdout,
+            true,
+        );
+
+        assert!(stream.next().await.is_none());
+        assert_eq!(runtime.log_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.status_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_cancels_an_in_flight_poll() {
+        let runtime = Arc::new(TestRuntime::default());
+        runtime.mode.store(1, Ordering::SeqCst);
+        let runtime_trait: Arc<dyn ControllerRuntime> = runtime.clone();
+        let stream = poll_job_stream(
+            runtime_trait,
+            WorkspaceName::new("raven").unwrap(),
+            JobId::new(7).unwrap(),
+            JobStream::Stdout,
+            true,
+        );
+        while runtime.active_calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while runtime.active_calls.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("poll task did not stop after receiver drop");
+    }
+
+    #[tokio::test]
+    async fn attachment_parts_support_concurrent_stdin_stdout_and_stderr() {
+        let runtime = Arc::new(TestRuntime::default());
+        let runtime_trait: Arc<dyn ControllerRuntime> = runtime.clone();
+        let workspace = WorkspaceName::new("raven").unwrap();
+        let id = JobId::new(7).unwrap();
+        let (stdout_sender, stdout_receiver) = mpsc::channel(1);
+        let (stderr_sender, stderr_receiver) = mpsc::channel(1);
+        stdout_sender
+            .send(Ok(Bytes::from_static(b"out")))
+            .await
+            .unwrap();
+        stderr_sender
+            .send(Ok(Bytes::from_static(b"err")))
+            .await
+            .unwrap();
+        drop((stdout_sender, stderr_sender));
+        let attachment = JobAttachment {
+            workspace: workspace.clone(),
+            id,
+            stdin: JobStdin {
+                workspace,
+                id,
+                runtime: Arc::clone(&runtime_trait),
+            },
+            stdout: RawByteStream {
+                receiver: stdout_receiver,
+            },
+            stderr: RawByteStream {
+                receiver: stderr_receiver,
+            },
+            runtime: runtime_trait,
+        };
+        let (stdin, mut stdout, mut stderr) = attachment.into_parts();
+
+        let (write, out, err) = tokio::join!(
+            stdin.write(Bytes::from_static(b"input")),
+            stdout.next(),
+            stderr.next()
+        );
+        write.unwrap();
+        assert_eq!(out.unwrap().unwrap(), Bytes::from_static(b"out"));
+        assert_eq!(err.unwrap().unwrap(), Bytes::from_static(b"err"));
+        assert_eq!(runtime.stdin_writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn kill_awaits_and_returns_the_controller_result() {
+        let runtime: Arc<dyn ControllerRuntime> = Arc::new(TestRuntime::default());
+        let handle = JobHandle {
+            workspace: WorkspaceName::new("raven").unwrap(),
+            id: JobId::new(7).unwrap(),
+            runtime,
+        };
+        let error = handle.kill().await.unwrap_err();
+        assert!(error.message.contains("rejected kill"));
     }
 }
