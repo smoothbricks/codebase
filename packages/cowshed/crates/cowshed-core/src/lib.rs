@@ -8,6 +8,7 @@ pub mod exec;
 pub mod git;
 pub mod metadata;
 pub mod repository;
+pub mod runtime;
 pub mod sandbox;
 pub mod secrets;
 pub mod storage;
