@@ -27,7 +27,7 @@ fn test_span(capacity: usize) -> (SpanBuffer, TraceAnchor, TickClock) {
         trace_id: TraceId::new("prop-test-trace").unwrap(),
         parent: None,
     });
-    let buf = SpanBuffer::start(identity, capacity, &anchor, &clock);
+    let buf = SpanBuffer::start_dynamic(identity, capacity, "span".into(), &anchor, &clock);
     (buf, anchor, clock)
 }
 
@@ -83,7 +83,7 @@ proptest! {
     ) {
         let (mut buf, anchor, clock) = test_span(1 << capacity_exp);
         for i in 0..n_appends {
-            let row = buf.append(EntryType::Info, &anchor, &clock);
+            let row = buf.append_dynamic(EntryType::Info, None, 0, &anchor, &clock);
             if i + 2 < buf.capacity() {
                 prop_assert_eq!(row, i + 2);
             }
@@ -165,9 +165,9 @@ fn buffer_bytes(buf: &lmao_core::SpanBuffer) -> Vec<u8> {
         out.extend_from_slice(b.identity.trace_id.as_str().as_bytes());
         for row in 0..b.capacity() {
             out.extend_from_slice(&b.timestamp_at(row).unwrap_or(0).to_le_bytes());
-            out.push(b.entry_type_at(row).map(|e| e.as_u8()).unwrap_or(0));
+            out.extend_from_slice(&b.packed_header_at(row).unwrap_or(0).to_le_bytes());
             out.extend_from_slice(&b.line_at(row).to_le_bytes());
-            if let Some(m) = b.message_at(row) {
+            if let Some(m) = b.dynamic_message_at(row) {
                 out.extend_from_slice(m.as_bytes());
             }
             out.push(0xFE);

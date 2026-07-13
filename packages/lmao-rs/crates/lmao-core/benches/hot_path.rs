@@ -50,14 +50,15 @@ fn bench_span_lifecycle(c: &mut Criterion) {
 
     c.bench_function("span_lifecycle_cap8_fixed_clock", |b| {
         b.iter(|| {
-            let mut s = SpanBuffer::start(id.clone(), 8, &fixed_anchor, &fixed);
+            let mut s =
+                SpanBuffer::start_dynamic(id.clone(), 8, "span".into(), &fixed_anchor, &fixed);
             s.end_ok(&fixed_anchor, &fixed);
             black_box(s)
         })
     });
     c.bench_function("span_lifecycle_cap8_system_clock", |b| {
         b.iter(|| {
-            let mut s = SpanBuffer::start(id.clone(), 8, &sys_anchor, &sys);
+            let mut s = SpanBuffer::start_dynamic(id.clone(), 8, "span".into(), &sys_anchor, &sys);
             s.end_ok(&sys_anchor, &sys);
             black_box(s)
         })
@@ -75,9 +76,10 @@ fn bench_span_50_logs(c: &mut Criterion) {
 
     c.bench_function("span_plus_50_logs_fixed_clock", |b| {
         b.iter(|| {
-            let mut s = SpanBuffer::start(id.clone(), 64, &fixed_anchor, &fixed);
+            let mut s =
+                SpanBuffer::start_dynamic(id.clone(), 64, "span".into(), &fixed_anchor, &fixed);
             for _ in 0..50 {
-                s.append(EntryType::Info, &fixed_anchor, &fixed);
+                s.append_dynamic(EntryType::Info, None, 0, &fixed_anchor, &fixed);
             }
             s.end_ok(&fixed_anchor, &fixed);
             black_box(s)
@@ -85,9 +87,9 @@ fn bench_span_50_logs(c: &mut Criterion) {
     });
     c.bench_function("span_plus_50_logs_system_clock", |b| {
         b.iter(|| {
-            let mut s = SpanBuffer::start(id.clone(), 64, &sys_anchor, &sys);
+            let mut s = SpanBuffer::start_dynamic(id.clone(), 64, "span".into(), &sys_anchor, &sys);
             for _ in 0..50 {
-                s.append(EntryType::Info, &sys_anchor, &sys);
+                s.append_dynamic(EntryType::Info, None, 0, &sys_anchor, &sys);
             }
             s.end_ok(&sys_anchor, &sys);
             black_box(s)
@@ -105,10 +107,10 @@ fn bench_append_only(c: &mut Criterion) {
 
     c.bench_function("append_1000_no_overflow_fixed_clock", |b| {
         b.iter_batched(
-            || SpanBuffer::start(id.clone(), 1024, &anchor, &fixed),
+            || SpanBuffer::start_dynamic(id.clone(), 1024, "span".into(), &anchor, &fixed),
             |mut s| {
                 for _ in 0..1000 {
-                    s.append(EntryType::Info, &anchor, &fixed);
+                    s.append_dynamic(EntryType::Info, None, 0, &anchor, &fixed);
                 }
                 black_box(s)
             },
@@ -163,9 +165,9 @@ fn bench_clock_variants(c: &mut Criterion) {
 
     c.bench_function("span_50_logs_precise_clock", |b| {
         b.iter(|| {
-            let mut s = SpanBuffer::start(id.clone(), 64, &sys_anchor, &sys);
+            let mut s = SpanBuffer::start_dynamic(id.clone(), 64, "span".into(), &sys_anchor, &sys);
             for _ in 0..50 {
-                s.append(EntryType::Info, &sys_anchor, &sys);
+                s.append_dynamic(EntryType::Info, None, 0, &sys_anchor, &sys);
             }
             s.end_ok(&sys_anchor, &sys);
             black_box(s)
@@ -173,9 +175,10 @@ fn bench_clock_variants(c: &mut Criterion) {
     });
     c.bench_function("span_50_logs_coarse_clock_16", |b| {
         b.iter(|| {
-            let mut s = SpanBuffer::start(id.clone(), 64, &coarse_anchor, &coarse);
+            let mut s =
+                SpanBuffer::start_dynamic(id.clone(), 64, "span".into(), &coarse_anchor, &coarse);
             for _ in 0..50 {
-                s.append(EntryType::Info, &coarse_anchor, &coarse);
+                s.append_dynamic(EntryType::Info, None, 0, &coarse_anchor, &coarse);
             }
             coarse.invalidate(); // span boundary stays precise
             s.end_ok(&coarse_anchor, &coarse);
@@ -216,7 +219,7 @@ fn bench_schema_tag_write(c: &mut Criterion) {
 
     let fixed = FixedClock;
     let anchor = TraceAnchor::capture(&fixed);
-    let mut buf = BenchSchema::start(identity(), &anchor, &fixed);
+    let mut buf = BenchSchema::start(identity(), "benchmark", &anchor, &fixed);
     // warm all three columns
     buf.tag_latency(0.0).tag_outcome(0).tag_route("warm");
     let route: std::sync::Arc<str> = "GET /api/v1/sessions".into();
