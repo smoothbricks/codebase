@@ -122,7 +122,8 @@ func collectProgramCompilation(prog *driver.Program, options compilerOptions, va
 	for _, sf := range prog.SourceFiles() {
 		if sf == nil || sf.IsDeclarationFile { continue }
 		t := &fileTransformer{file: sf, cwd: options.cwd, checker: prog.Checker, processed: map[*shimast.CallExpression]bool{}, opSpans: map[*shimast.CallExpression]bool{}, vocabulary: collector}
-		compilation.files[sf] = &collectedFile{transformer: t, hintRewrites: t.collectOptimizations(sf.AsNode())}
+		t.collectOptimizations(sf.AsNode(), false)
+		compilation.files[sf] = &collectedFile{transformer: t}
 	}
 	if err := collector.diagnosticError(); err != nil { return nil, vocabularyManifest{}, err }
 	expected, err := buildVocabularyManifest(collector); if err != nil { return nil, vocabularyManifest{}, err }
@@ -134,6 +135,7 @@ func collectProgramCompilation(prog *driver.Program, options compilerOptions, va
 	staticLogs, staticSpans := resolveVocabularyIDs(manifest, collector)
 	for sf, collected := range compilation.files {
 		collected.transformer.staticLogIDs = staticLogs; collected.transformer.staticSpanNameIDs = staticSpans
+		collected.hintRewrites = collected.transformer.collectOptimizations(sf.AsNode(), true)
 		collected.registrationEntries = manifestEntriesForFile(manifest, collector.fileKeys[sf.FileName()])
 		collected.transformer.vocabularyOrdinals = vocabularyOrdinals(collected.registrationEntries)
 		collected.tagInlines, collected.logInlines, collected.resultInlines = collected.transformer.collectTagInlines(sf.AsNode())

@@ -18,6 +18,7 @@ import type {
   Nanoseconds,
   TypedArray,
 } from '@smoothbricks/arrow-builder';
+import type { MessageLayoutFamily } from './runtimeHint.js';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { LogSchema } from './schema/LogSchema.js';
 import type { InferSchema } from './schema/types.js';
@@ -116,11 +117,19 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
    */
   readonly entry_type: Uint8Array;
 
-  /** Packed static-message headers; zero means the row's dynamic message lane owns the value. */
-  readonly _logHeaders: Uint32Array;
+  /** Packed static-message headers. Omitted by the dynamic-only physical family. */
+  readonly _logHeaders?: Uint32Array;
 
   /** Immutable vocabulary generation against which `_logHeaders` dense indices resolve. */
   readonly _vocabularyGeneration: VocabularyGeneration;
+  /** Concrete physical message family selected once for this buffer constructor. */
+  readonly _messageLayoutFamily: MessageLayoutFamily;
+
+  /** Dedicated row-0 span name used when the selected capacity lane cannot represent it. */
+  _spanName?: string | number;
+
+  /** Dedicated row-1 raw result/exception text for static-only buffers. */
+  _terminalMessage?: string;
 
   /**
    * Timestamp of span start (row 0).
@@ -288,12 +297,9 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   // These are explicitly typed here since they're always present from systemSchema.
   // ===========================================================================
 
-  /**
-   * Message column values - category strings (eager, always allocated).
-   * Contains span names, log messages, exception messages, etc.
-   */
-  readonly message_values: string[];
-  readonly message_nulls: Uint8Array;
+  /** Raw per-row message lane. Omitted by the static-only physical family. */
+  readonly message_values?: string[];
+  readonly message_nulls?: Uint8Array;
 
   /**
    * Line number column values - Float64Array (lazy but always present).
@@ -506,11 +512,13 @@ export type SpanBuffer<T extends LogSchema> = AnySpanBuffer & {
   [key: `${string}_nulls`]: Uint8Array | undefined;
 } & {
   // Schema-specific column data
-  readonly [K in keyof FilterSchemaFields<T['fields']> as `${K & string}_values`]: ValuesArrayType<
-    FilterSchemaFields<T['fields']>[K]
-  >;
+  readonly [K in keyof FilterSchemaFields<T['fields']> as K extends 'message'
+    ? never
+    : `${K & string}_values`]: ValuesArrayType<FilterSchemaFields<T['fields']>[K]>;
 } & {
-  readonly [K in keyof FilterSchemaFields<T['fields']> as `${K & string}_nulls`]: Uint8Array;
+  readonly [K in keyof FilterSchemaFields<T['fields']> as K extends 'message'
+    ? never
+    : `${K & string}_nulls`]: Uint8Array;
 } & {
   // Schema-specific setter methods (return this for method chaining)
   [K in keyof FilterSchemaFields<T['fields']>]: (

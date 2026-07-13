@@ -11,6 +11,7 @@ import type { OpMetadata } from './opContext/opTypes.js';
 import type { OpContext } from './opContext/types.js';
 import {
   isRuntimeHintAnalyzed,
+  type MessageLayoutFamily,
   RUNTIME_HINT_CAPABILITIES_MASK,
   RUNTIME_HINT_FF,
   RUNTIME_HINT_FULL_CAPABILITIES,
@@ -18,10 +19,11 @@ import {
   RUNTIME_HINT_SCOPE,
   RUNTIME_HINT_TAG,
   runtimeHintInitialCapacity,
+  runtimeHintMessageLayoutFamily,
 } from './runtimeHint.js';
 import type { LogSchema } from './schema/LogSchema.js';
-import { ENTRY_TYPE_SPAN_START } from './schema/systemSchema.js';
-import type { SpanBufferConstructor } from './spanBuffer.js';
+import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from './schema/systemSchema.js';
+import { getSpanBufferClass, type SpanBufferConstructor } from './spanBuffer.js';
 import type { AnySpanBuffer, SpanBuffer } from './types.js';
 import type { SpanContextClass } from './spanContext.js';
 import type { ITraceRoot, TimestampAppendPrimitive } from './traceRoot.js';
@@ -54,6 +56,7 @@ export interface PhysicalLayoutPlan<
   readonly schema: T;
   readonly runtimeHint: number;
   readonly capabilities: number;
+  readonly messageLayoutFamily: MessageLayoutFamily;
   /** Fixed transformer tier, or undefined to retain adaptive strategy capacity. */
   readonly capacityTier: number | undefined;
   /** Canonical user-context key layout used by the generated context constructor. */
@@ -118,14 +121,16 @@ const TRACE_ROOT_CLOCK: PhysicalClock = Object.freeze({
   },
 });
 
-const TRACE_ROOT_APPENDERS: PhysicalAppenders = Object.freeze({
+const MIXED_APPENDERS: PhysicalAppenders = Object.freeze({
   writeSpanStart(buffer: AnySpanBuffer, name: string | number): void {
     if (typeof name === 'number') {
       const traceRoot = buffer._traceRoot;
       buffer.timestamp[0] = traceRoot._timestampNow(traceRoot);
       buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer._logHeaders[0] = ((name << 8) | ENTRY_TYPE_SPAN_START) >>> 0;
-      if (buffer.message_nulls) buffer.message_nulls[0] |= 1;
+      buffer._logHeaders![0] = ((name << 8) | ENTRY_TYPE_SPAN_START) >>> 0;
+      buffer.entry_type[1] = ENTRY_TYPE_SPAN_EXCEPTION;
+      buffer.timestamp[1] = 0n;
+      buffer._writeIndex = 2;
       return;
     }
     const traceRoot = buffer._traceRoot;
@@ -141,6 +146,39 @@ const TRACE_ROOT_APPENDERS: PhysicalAppenders = Object.freeze({
   },
 });
 
+const STATIC_ONLY_APPENDERS: PhysicalAppenders = Object.freeze({
+  ...MIXED_APPENDERS,
+  writeSpanStart(buffer: AnySpanBuffer, name: string | number): void {
+    const traceRoot = buffer._traceRoot;
+    buffer.timestamp[0] = traceRoot._timestampNow(traceRoot);
+    buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+    if (typeof name === 'number') buffer._logHeaders![0] = ((name << 8) | ENTRY_TYPE_SPAN_START) >>> 0;
+    else buffer._spanName = name;
+    buffer.entry_type[1] = ENTRY_TYPE_SPAN_EXCEPTION;
+    buffer.timestamp[1] = 0n;
+    buffer._writeIndex = 2;
+  },
+});
+
+const DYNAMIC_ONLY_APPENDERS: PhysicalAppenders = Object.freeze({
+  ...MIXED_APPENDERS,
+  writeSpanStart(buffer: AnySpanBuffer, name: string | number): void {
+    const traceRoot = buffer._traceRoot;
+    buffer.timestamp[0] = traceRoot._timestampNow(traceRoot);
+    buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+    buffer._spanName = name;
+    buffer.entry_type[1] = ENTRY_TYPE_SPAN_EXCEPTION;
+    buffer.timestamp[1] = 0n;
+    buffer._writeIndex = 2;
+  },
+});
+
+const APPENDERS_BY_MESSAGE_LAYOUT: Readonly<Record<MessageLayoutFamily, PhysicalAppenders>> = Object.freeze({
+  'static-only': STATIC_ONLY_APPENDERS,
+  mixed: MIXED_APPENDERS,
+  'dynamic-only': DYNAMIC_ONLY_APPENDERS,
+});
+
 const basePlans = new WeakMap<LogSchema, Map<string, object>>();
 const remappedPlans = new WeakMap<object, WeakMap<RemapDescriptor, object>>();
 
@@ -154,9 +192,11 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
   vocabularyGeneration: VocabularyGeneration,
 ): PhysicalLayoutPlan<T, Ctx> {
   const schema = SpanBufferClass.schema;
-  const SpanLoggerClass = createSpanLoggerClass(schema);
+  const messageLayoutFamily = runtimeHintMessageLayoutFamily(runtimeHint);
+  const PlannedSpanBufferClass = getSpanBufferClass(schema, messageLayoutFamily);
+  const SpanLoggerClass = createSpanLoggerClass(schema, messageLayoutFamily);
   const TagWriterClass = getTagWriterClass(schema);
-  const ResultWriterClass = getResultWriterClass(schema);
+  const ResultWriterClass = getResultWriterClass(schema, messageLayoutFamily);
   const capabilities = isRuntimeHintAnalyzed(runtimeHint)
     ? runtimeHint & RUNTIME_HINT_CAPABILITIES_MASK
     : RUNTIME_HINT_FULL_CAPABILITIES;
@@ -169,7 +209,7 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
       }
     : undefined;
   const newTagWriter = needsTag ? (buffer: AnySpanBuffer): TagWriter<T> => new TagWriterClass(buffer) : undefined;
-  const wasmLayout = createWasmLayoutTemplate(schema);
+  const wasmLayout = createWasmLayoutTemplate(schema, messageLayoutFamily);
 
   return Object.freeze({
     version: PHYSICAL_LAYOUT_VERSION,
@@ -177,15 +217,16 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
     schema,
     runtimeHint,
     capabilities,
+    messageLayoutFamily,
     contextLayoutKey,
     SpanContextClass,
     capacityTier: runtimeHintInitialCapacity(runtimeHint),
-    SpanBufferClass,
+    SpanBufferClass: PlannedSpanBufferClass,
     SpanLoggerClass,
     TagWriterClass,
     ResultWriterClass,
     clock: TRACE_ROOT_CLOCK,
-    appenders: TRACE_ROOT_APPENDERS,
+    appenders: APPENDERS_BY_MESSAGE_LAYOUT[messageLayoutFamily],
     vocabularyGeneration,
     poolRef: null,
     remapDescriptor: null,
@@ -213,7 +254,8 @@ export function getPhysicalLayoutPlan<T extends LogSchema, Ctx extends OpContext
   }
 
   const vocabularyGeneration = getVocabularyGeneration();
-  const key = `${PHYSICAL_LAYOUT_VERSION}:${backendKind}:${runtimeHint}:${contextLayoutKey}:${vocabularyGeneration.generation}`;
+  const messageLayoutFamily = runtimeHintMessageLayoutFamily(runtimeHint);
+  const key = `${PHYSICAL_LAYOUT_VERSION}:${backendKind}:${runtimeHint}:${messageLayoutFamily}:${contextLayoutKey}:${vocabularyGeneration.generation}`;
   let base = byKey.get(key) as PhysicalLayoutPlan<T, Ctx> | undefined;
   if (!base) {
     base = createBasePlan(
@@ -225,8 +267,8 @@ export function getPhysicalLayoutPlan<T extends LogSchema, Ctx extends OpContext
       vocabularyGeneration,
     );
     byKey.set(key, base);
-  } else if (base.SpanBufferClass !== SpanBufferClass) {
-    throw new TypeError('Physical layout cache key resolved to a different SpanBuffer constructor');
+  } else if (base.SpanBufferClass.messageLayoutFamily !== messageLayoutFamily) {
+    throw new TypeError('Physical layout cache key resolved to a different message family');
   } else if (base.SpanContextClass !== SpanContextClass) {
     throw new TypeError('Physical layout cache key resolved to a different SpanContext constructor');
   }

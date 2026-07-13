@@ -1,4 +1,5 @@
 import { getSchemaType } from '@smoothbricks/arrow-builder';
+import type { MessageLayoutFamily } from '../runtimeHint.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 
 export type WasmNumericFamily = 'u8' | 'u32' | 'f64';
@@ -33,18 +34,21 @@ export interface WasmSystemSlabLayoutDescriptor {
   readonly alignment: 8;
   readonly timestampOffset: 0;
   readonly entryTypeOffset: number;
+  readonly logHeaderOffset?: number;
 }
 
 export type WasmSlabLayoutDescriptor = WasmSystemSlabLayoutDescriptor | WasmNumericSlabLayoutDescriptor;
 
 export interface WasmPhysicalLayoutDescriptor {
   readonly capacity: number;
+  readonly messageLayoutFamily: MessageLayoutFamily;
   readonly system: WasmSystemSlabLayoutDescriptor;
   readonly slabs: Readonly<Record<WasmNumericFamily, WasmNumericSlabLayoutDescriptor | null>>;
   readonly columns: readonly WasmColumnLayoutDescriptor[];
 }
 
 export interface WasmLayoutTemplate {
+  readonly messageLayoutFamily: MessageLayoutFamily;
   readonly columns: readonly WasmColumnLayoutTemplate[];
   forCapacity(capacity: number): WasmPhysicalLayoutDescriptor;
 }
@@ -55,6 +59,7 @@ function align(value: number, alignment: number): number {
 
 function freezeExactLayout(
   capacity: number,
+  messageLayoutFamily: MessageLayoutFamily,
   templates: readonly WasmColumnLayoutTemplate[],
 ): WasmPhysicalLayoutDescriptor {
   if (!Number.isSafeInteger(capacity) || capacity <= 0) {
@@ -86,16 +91,29 @@ function freezeExactLayout(
     return byteLength === 0 ? null : Object.freeze({ family, byteLength, alignment });
   };
 
-  const system = Object.freeze({
-    family: 'system' as const,
-    byteLength: capacity * 9,
-    alignment: 8 as const,
-    timestampOffset: 0,
-    entryTypeOffset: capacity * 8,
-  });
+  const entryTypeOffset = capacity * 8;
+  const systemByteLength = capacity * 9;
+  const system =
+    messageLayoutFamily === 'dynamic-only'
+      ? Object.freeze({
+          family: 'system' as const,
+          byteLength: systemByteLength,
+          alignment: 8 as const,
+          timestampOffset: 0 as const,
+          entryTypeOffset,
+        })
+      : Object.freeze({
+          family: 'system' as const,
+          byteLength: align(systemByteLength, 4) + capacity * 4,
+          alignment: 8 as const,
+          timestampOffset: 0 as const,
+          entryTypeOffset,
+          logHeaderOffset: align(systemByteLength, 4),
+        });
 
   return Object.freeze({
     capacity,
+    messageLayoutFamily,
     system,
     slabs: Object.freeze({
       u8: slab('u8', 1),
@@ -106,7 +124,7 @@ function freezeExactLayout(
   });
 }
 
-function buildWasmLayoutTemplate(schema: LogSchema): WasmLayoutTemplate {
+function buildWasmLayoutTemplate(schema: LogSchema, messageLayoutFamily: MessageLayoutFamily): WasmLayoutTemplate {
   const columns: WasmColumnLayoutTemplate[] = [];
   let columnIndex = 0;
 
@@ -138,11 +156,12 @@ function buildWasmLayoutTemplate(schema: LogSchema): WasmLayoutTemplate {
   const frozenColumns = Object.freeze(columns);
   const descriptors = new Map<number, WasmPhysicalLayoutDescriptor>();
   return Object.freeze({
+    messageLayoutFamily,
     columns: frozenColumns,
     forCapacity(capacity: number): WasmPhysicalLayoutDescriptor {
       let descriptor = descriptors.get(capacity);
       if (descriptor === undefined) {
-        descriptor = freezeExactLayout(capacity, frozenColumns);
+        descriptor = freezeExactLayout(capacity, messageLayoutFamily, frozenColumns);
         descriptors.set(capacity, descriptor);
       }
       return descriptor;
@@ -150,17 +169,27 @@ function buildWasmLayoutTemplate(schema: LogSchema): WasmLayoutTemplate {
   });
 }
 
-const templates = new WeakMap<LogSchema, WasmLayoutTemplate>();
+const templates = new WeakMap<LogSchema, Map<MessageLayoutFamily, WasmLayoutTemplate>>();
 
-export function createWasmLayoutTemplate(schema: LogSchema): WasmLayoutTemplate {
-  let template = templates.get(schema);
+export function createWasmLayoutTemplate(
+  schema: LogSchema,
+  messageLayoutFamily: MessageLayoutFamily = 'mixed',
+): WasmLayoutTemplate {
+  let familyTemplates = templates.get(schema);
+  let template = familyTemplates?.get(messageLayoutFamily);
   if (template === undefined) {
-    template = buildWasmLayoutTemplate(schema);
-    templates.set(schema, template);
+    template = buildWasmLayoutTemplate(schema, messageLayoutFamily);
+    familyTemplates ??= new Map();
+    familyTemplates.set(messageLayoutFamily, template);
+    templates.set(schema, familyTemplates);
   }
   return template;
 }
 
-export function getWasmPhysicalLayout(schema: LogSchema, capacity: number): WasmPhysicalLayoutDescriptor {
-  return createWasmLayoutTemplate(schema).forCapacity(capacity);
+export function getWasmPhysicalLayout(
+  schema: LogSchema,
+  capacity: number,
+  messageLayoutFamily: MessageLayoutFamily = 'mixed',
+): WasmPhysicalLayoutDescriptor {
+  return createWasmLayoutTemplate(schema, messageLayoutFamily).forCapacity(capacity);
 }
