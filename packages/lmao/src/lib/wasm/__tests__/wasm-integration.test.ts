@@ -26,10 +26,10 @@ import {
   ENTRY_TYPE_SPAN_START,
   ENTRY_TYPE_WARN,
 } from '../../schema/systemSchema.js';
-import { TestTracer } from '../../tracers/TestTracer.js';
 import { createTraceRoot as createNodeTraceRoot } from '../../traceRoot.node.js';
+import { TestTracer } from '../../tracers/TestTracer.js';
 import { WasmBufferStrategy } from '../WasmBufferStrategy.js';
-import { createWasmTraceRootFactory } from '../wasmTraceRoot.js';
+import { createWasmTraceRoot } from '../wasmTraceRoot.js';
 
 /**
  * Type for accessing WASM-specific internal buffer properties.
@@ -81,7 +81,7 @@ describe('WASM Integration Tests', () => {
 
     tracer = new TestTracer(opContext, {
       bufferStrategy: strategy,
-      createTraceRoot: createWasmTraceRootFactory(strategy.allocator),
+      createTraceRoot: (traceId, lifecycle) => createWasmTraceRoot(strategy.allocator, traceId, lifecycle),
     });
   });
 
@@ -98,7 +98,7 @@ describe('WASM Integration Tests', () => {
     // Create fresh tracer for next test
     tracer = new TestTracer(opContext, {
       bufferStrategy: strategy,
-      createTraceRoot: createWasmTraceRootFactory(strategy.allocator),
+      createTraceRoot: (traceId, lifecycle) => createWasmTraceRoot(strategy.allocator, traceId, lifecycle),
     });
   });
 
@@ -630,7 +630,6 @@ describe('WASM Integration Tests', () => {
       const epochMillis = 1_700_000_000_000;
       const nodeAnchor = 5_000_000n;
       const performanceAnchor = 1_000;
-
 
       try {
         Date.now = () => epochMillis;

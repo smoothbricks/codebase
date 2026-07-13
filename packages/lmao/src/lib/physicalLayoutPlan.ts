@@ -20,6 +20,7 @@ import type { AnySpanBuffer, SpanBuffer } from './types.js';
 import type { SpanContextClass } from './spanContext.js';
 import type { ITraceRoot, TimestampAppendPrimitive } from './traceRoot.js';
 import { getVocabularyGeneration, type VocabularyGeneration } from './vocabularyRegistry.js';
+import { createWasmLayoutTemplate, type WasmLayoutTemplate } from './wasm/wasmPhysicalLayout.js';
 
 export const PHYSICAL_LAYOUT_VERSION = 1;
 
@@ -69,6 +70,8 @@ export interface PhysicalLayoutPlan<
   readonly appenders: PhysicalAppenders;
   /** Immutable global vocabulary generation used by dense row identities in this plan. */
   readonly vocabularyGeneration: VocabularyGeneration;
+  /** Cached immutable WASM layout template for exact per-capacity descriptors. */
+  readonly wasmLayout: WasmLayoutTemplate;
   /** Reserved immutable ownership slot; buffer pooling is a later task. */
   readonly poolRef: null;
   readonly remapDescriptor: RemapDescriptor | null;
@@ -115,6 +118,7 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
   const SpanLoggerClass = createSpanLoggerClass(schema);
   const TagWriterClass = getTagWriterClass(schema);
   const ResultWriterClass = getResultWriterClass(schema);
+  const wasmLayout = createWasmLayoutTemplate(schema);
 
   return Object.freeze({
     version: PHYSICAL_LAYOUT_VERSION,
@@ -134,6 +138,7 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
     clock: TRACE_ROOT_CLOCK,
     appenders: TRACE_ROOT_APPENDERS,
     vocabularyGeneration,
+    wasmLayout,
     poolRef: null,
     remapDescriptor: null,
     createSpanLogger(buffer: SpanBuffer<T>): SpanLoggerImpl<T> {

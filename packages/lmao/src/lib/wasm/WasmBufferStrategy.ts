@@ -34,10 +34,8 @@ import { WasmTraceRoot } from './wasmTraceRoot.js';
 // Spec link (88): realizes specs/lmao/01q_wasm_memory_architecture.md#smoo/lmao!n/wasm-mem (OpContext integration + trace completion).
 //#region smoo/lmao!n/wasm-mem.strategy
 
-function requireWasmSpanBuffer(buffer: AnySpanBuffer): WasmSpanBufferInstance {
-  if (!isWasmSpanBufferInstance(buffer)) {
-    throw new Error('Expected WASM-backed span buffer');
-  }
+function requireWasmSpanBuffer<T extends LogSchema>(buffer: unknown): WasmSpanBufferInstance<T> {
+  if (!isWasmSpanBufferInstance<T>(buffer)) throw new Error('Expected WASM-backed span buffer');
   return buffer;
 }
 
@@ -76,7 +74,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
    * Shared across all buffers created by this strategy.
    */
   readonly allocator: WasmAllocator;
-  private readonly liveRoots = new Set<WasmSpanBufferInstance>();
+  private readonly liveRoots = new Set<WasmSpanBufferInstance<T>>();
 
   /**
    * Private constructor - use static create() method.
@@ -100,7 +98,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
     return new WasmBufferStrategy<T>(allocator);
   }
 
-  createSpanBuffer(schema: T, traceRoot: ITraceRoot, opMetadata: OpMetadata, capacity?: number): SpanBuffer<T> {
+  createSpanBuffer(schema: T, traceRoot: ITraceRoot<T>, opMetadata: OpMetadata, capacity?: number): SpanBuffer<T> {
     const effectiveCapacity = capacity ?? this.allocator.capacity;
 
     // Create WASM buffer
@@ -121,8 +119,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
     );
     this.liveRoots.add(wasmBuffer);
 
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- generated WASM buffers implement the SpanBuffer contract for the same schema.
-    return wasmBuffer as unknown as SpanBuffer<T>;
+    return wasmBuffer;
   }
 
   createChildSpanBuffer(
@@ -132,11 +129,11 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
     capacity?: number,
     schema?: T,
   ): SpanBuffer<T> {
-    const wasmParent = requireWasmSpanBuffer(parentBuffer);
+    const wasmParent = requireWasmSpanBuffer<T>(parentBuffer);
     const effectiveCapacity = capacity ?? wasmParent._capacity;
 
     // Use provided schema (for cross-library calls) or parent's schema
-    const childSchema = schema ?? (parentBuffer._logSchema as T);
+    const childSchema = schema ?? parentBuffer._logSchema;
 
     const child = createWasmChildSpanBuffer(
       wasmParent,
@@ -153,12 +150,11 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
       callsiteMetadata, // _callsiteMetadata
     );
 
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- child buffers preserve the requested schema contract.
-    return child as unknown as SpanBuffer<T>;
+    return child;
   }
 
   createOverflowBuffer(buffer: SpanBuffer<T>): SpanBuffer<T> {
-    const wasmBuffer = requireWasmSpanBuffer(buffer);
+    const wasmBuffer = requireWasmSpanBuffer<T>(buffer);
     const overflow = createWasmOverflowBuffer(
       wasmBuffer,
       buffer._traceRoot, // _traceRoot (same as original)
@@ -167,8 +163,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
       buffer._callsiteMetadata ?? buffer._opMetadata, // _callsiteMetadata (same as original, fallback to opMetadata)
     );
 
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- overflow buffers are schema-compatible continuations of the same span.
-    return overflow as unknown as SpanBuffer<T>;
+    return overflow;
   }
 
   toArrowTable(buffer: AnySpanBuffer): Table {
@@ -177,7 +172,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
   }
 
   releaseBuffer(buffer: AnySpanBuffer): void {
-    const root = requireWasmSpanBuffer(buffer);
+    const root = requireWasmSpanBuffer<T>(buffer);
     this.freeSpanTree(root);
     if (root._descriptor.kind === 'root' && root._traceRoot instanceof WasmTraceRoot) {
       root._traceRoot.free();
@@ -188,7 +183,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
   /**
    * Recursively free all WASM memory for a span tree.
    */
-  private freeSpanTree(buffer: WasmSpanBufferInstance): void {
+  private freeSpanTree(buffer: WasmSpanBufferInstance<T>): void {
     // Free children first (depth-first)
     if (buffer._children) {
       for (const child of buffer._children) {
@@ -207,7 +202,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
     }
   }
 
-  private invalidateSpanTree(buffer: WasmSpanBufferInstance): void {
+  private invalidateSpanTree(buffer: WasmSpanBufferInstance<T>): void {
     for (const child of buffer._children) this.invalidateSpanTree(child);
     if (buffer._overflow) this.invalidateSpanTree(buffer._overflow);
     buffer._columnPtrs.fill(-1);

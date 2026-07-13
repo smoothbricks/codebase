@@ -53,6 +53,9 @@ const H_FREELIST_IDENTITY: u32 = 16;
 const H_THREAD_ID: u32 = 24;
 const H_FREELISTS: u32 = 32; // [u32; 28]
 const H_THREAD_ID_SET: u32 = 144;
+/// Head of the exact-block freelist. This occupies bytes 148..152 of the
+/// header's existing reserved tail; the header remains 192 bytes.
+const H_FREELIST_EXACT: u32 = 148;
 
 // --- FreeBlock field offsets (overlaid on freed memory) ---
 const FB_NEXT_PTR: u32 = 0;
@@ -61,6 +64,13 @@ const FB_REUSE_COUNT: u32 = 8;
 const FB_SPLIT_COUNT: u32 = 12;
 const FB_MERGE_COUNT: u32 = 16;
 const _: () = assert!(FB_MERGE_COUNT as usize + 4 == FREE_BLOCK_SIZE);
+
+// --- ExactFreeBlock field offsets (overlaid on freed memory) ---
+const EFB_NEXT_PTR: u32 = 0;
+const EFB_BYTE_LEN: u32 = 4;
+const EFB_ALIGNMENT: u32 = 8;
+const EFB_STORAGE_LEN: u32 = 12;
+const EXACT_FREE_BLOCK_SIZE: u32 = 16;
 
 // --- Identity field offsets ---
 const ID_WRITE_INDEX: u32 = 0;
@@ -112,6 +122,7 @@ pub fn reset<M: Mem>(m: &mut M) {
         m.write_u32(H_FREELISTS + 4 * i as u32, 0);
     }
     m.write_u32(H_FREELIST_IDENTITY, 0);
+    m.write_u32(H_FREELIST_EXACT, 0);
     // thread_id persists across reset calls
 }
 
@@ -349,6 +360,94 @@ pub fn free_with_capacity<M: Mem>(m: &mut M, offset: u32, sc: SizeClass, capacit
         sc,
         effective_tier(sc, capacity_to_tier(capacity)),
     );
+}
+
+/// Allocate an exactly described logical block from the general intrusive
+/// freelist, falling back to an aligned bump allocation. Freed blocks smaller
+/// than the freelist metadata reserve enough physical storage for the node,
+/// while matching and zeroing retain the caller's exact logical byte length.
+pub fn alloc_exact<M: Mem>(m: &mut M, byte_len: u32, alignment: u32) -> u32 {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return 0;
+    }
+
+    let mut previous = 0;
+    let mut current = m.read_u32(H_FREELIST_EXACT);
+    while current != 0 {
+        let next = m.read_u32(current + EFB_NEXT_PTR);
+        if m.read_u32(current + EFB_BYTE_LEN) == byte_len
+            && m.read_u32(current + EFB_ALIGNMENT) == alignment
+        {
+            if previous == 0 {
+                m.write_u32(H_FREELIST_EXACT, next);
+            } else {
+                m.write_u32(previous + EFB_NEXT_PTR, next);
+            }
+            clear_bytes(m, current, byte_len);
+            bump_counter(m, H_ALLOC_COUNT);
+            return current;
+        }
+        previous = current;
+        current = next;
+    }
+
+    let storage_len = byte_len.max(EXACT_FREE_BLOCK_SIZE);
+    let storage_alignment = alignment.max(4);
+    let Some(aligned) = m
+        .read_u32(H_BUMP_PTR)
+        .checked_add(storage_alignment - 1)
+        .map(|value| value & !(storage_alignment - 1))
+    else {
+        return 0;
+    };
+    let Some(new_bump) = aligned.checked_add(storage_len) else {
+        return 0;
+    };
+    if new_bump > m.size() && !m.grow_to(new_bump) {
+        return 0;
+    }
+
+    m.write_u32(H_BUMP_PTR, new_bump);
+    clear_bytes(m, aligned, byte_len);
+    bump_counter(m, H_ALLOC_COUNT);
+    aligned
+}
+
+/// Return an exact block to the general intrusive freelist. Invalid descriptors,
+/// null offsets, out-of-range blocks, and offsets already present in the list
+/// are ignored so malformed or repeated frees cannot corrupt the list.
+pub fn free_exact<M: Mem>(m: &mut M, offset: u32, byte_len: u32, alignment: u32) {
+    if offset < HEADER_SIZE as u32
+        || alignment == 0
+        || !alignment.is_power_of_two()
+        || offset & (alignment.max(4) - 1) != 0
+    {
+        return;
+    }
+
+    let storage_len = byte_len.max(EXACT_FREE_BLOCK_SIZE);
+    let Some(end) = offset.checked_add(storage_len) else {
+        return;
+    };
+    if end > m.size() || end > m.read_u32(H_BUMP_PTR) {
+        return;
+    }
+
+    let mut current = m.read_u32(H_FREELIST_EXACT);
+    while current != 0 {
+        if current == offset {
+            return;
+        }
+        current = m.read_u32(current + EFB_NEXT_PTR);
+    }
+
+    let head = m.read_u32(H_FREELIST_EXACT);
+    m.write_u32(offset + EFB_NEXT_PTR, head);
+    m.write_u32(offset + EFB_BYTE_LEN, byte_len);
+    m.write_u32(offset + EFB_ALIGNMENT, alignment);
+    m.write_u32(offset + EFB_STORAGE_LEN, storage_len);
+    m.write_u32(H_FREELIST_EXACT, offset);
+    bump_counter(m, H_FREE_COUNT);
 }
 
 // --- Identity blocks (fixed 128B, separate freelist, no buddy) ---

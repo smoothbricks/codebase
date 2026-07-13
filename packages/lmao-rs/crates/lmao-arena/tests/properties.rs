@@ -241,6 +241,42 @@ proptest! {
             }
         }
     }
+
+    /// Exact slabs honor every advertised alignment and keep all live logical
+    /// extents disjoint. A released descriptor is reusable exactly once, while
+    /// a repeated release is ignored rather than duplicating ownership.
+    #[test]
+    fn exact_slabs_are_aligned_disjoint_and_single_owner(
+        requests in prop::collection::vec((1u32..2048, 0u32..8), 1..100),
+    ) {
+        let mut arena = Arena::new(lmao_arena::HEADER_SIZE);
+        let mut live: Vec<(u32, u32, u32)> = Vec::with_capacity(requests.len());
+
+        for (byte_len, alignment_power) in requests {
+            let alignment = 1u32 << alignment_power;
+            let offset = raw::alloc_exact(arena.mem_mut(), byte_len, alignment);
+            prop_assert_ne!(offset, 0);
+            prop_assert_eq!(offset % alignment, 0);
+            for &(other_offset, other_len, _) in &live {
+                prop_assert!(
+                    offset + byte_len <= other_offset || offset >= other_offset + other_len,
+                    "live exact slabs overlap"
+                );
+            }
+            live.push((offset, byte_len, alignment));
+        }
+
+        let (released, byte_len, alignment) = *live.last().unwrap();
+        raw::free_exact(arena.mem_mut(), released, byte_len, alignment);
+        let free_count = arena.free_count();
+        raw::free_exact(arena.mem_mut(), released, byte_len, alignment);
+        prop_assert_eq!(arena.free_count(), free_count, "repeat free must be idempotent");
+
+        let recycled = raw::alloc_exact(arena.mem_mut(), byte_len, alignment);
+        prop_assert_eq!(recycled, released, "matching exact descriptor must reuse its address");
+        let second_owner = raw::alloc_exact(arena.mem_mut(), byte_len, alignment);
+        prop_assert_ne!(second_owner, recycled, "two live exact slabs must not alias");
+    }
 }
 
 #[test]
