@@ -1226,10 +1226,10 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             report.reclaimed += 1;
         }
         for (image, sidecar) in &staged_sidecars {
-            report.examined += 1;
             if staged_images.contains_key(image) {
                 continue;
             }
+            report.examined += 1;
             let Some(format) = staged_image_format(image) else {
                 continue;
             };
