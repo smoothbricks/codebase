@@ -4,7 +4,7 @@ import fc from 'fast-check';
 import { defineOpContext } from '../../defineOpContext.js';
 import { resolveEagerColumns, type EagerColumnDescriptor } from '../../physicalLayoutPlan.js';
 import { createTestOpMetadata, createTestTraceRoot, TEST_TRACER } from '../../__tests__/test-helpers.js';
-import { resolveMessage } from '../../resolveMessage.js';
+import { resolveEntryType, resolveMessage } from '../../resolveMessage.js';
 import {
   RUNTIME_HINT_ANALYZED_VALID,
   RUNTIME_HINT_RESULT,
@@ -124,21 +124,21 @@ describe('WasmSpanBuffer', () => {
 
   describe('getWasmSpanBufferClass', () => {
     it('generates a class constructor', () => {
-      const WasmSpanBufferClass = getWasmSpanBufferClass(testSchema, 'mixed', testEagerColumns);
+      const WasmSpanBufferClass = getWasmSpanBufferClass(testSchema, 'mixed', 'current', testEagerColumns);
       expect(typeof WasmSpanBufferClass).toBe('function');
       expect(WasmSpanBufferClass.schema).toBe(testSchema);
     });
 
     it('caches classes per schema', () => {
-      const class1 = getWasmSpanBufferClass(testSchema, 'mixed', testEagerColumns);
-      const class2 = getWasmSpanBufferClass(testSchema, 'mixed', testEagerColumns);
+      const class1 = getWasmSpanBufferClass(testSchema, 'mixed', 'current', testEagerColumns);
+      const class2 = getWasmSpanBufferClass(testSchema, 'mixed', 'current', testEagerColumns);
       expect(class1).toBe(class2);
     });
 
     it('creates different classes for different schemas', () => {
       const schema2 = defineLogSchema({ otherField: S.number() });
-      const class1 = getWasmSpanBufferClass(testSchema, 'mixed', testEagerColumns);
-      const class2 = getWasmSpanBufferClass(schema2, 'mixed', resolveEagerColumns(schema2));
+      const class1 = getWasmSpanBufferClass(testSchema, 'mixed', 'current', testEagerColumns);
+      const class2 = getWasmSpanBufferClass(schema2, 'mixed', 'current', resolveEagerColumns(schema2));
       expect(class1).not.toBe(class2);
     });
   });
@@ -147,15 +147,22 @@ describe('WasmSpanBuffer', () => {
     it('produces aligned, exact, non-overlapping family descriptors for arbitrary capacities', () => {
       fc.assert(
         fc.property(fc.integer({ min: 1, max: 512 }), (capacity) => {
-          const layout = getWasmPhysicalLayout(testSchema, capacity, 'mixed', testEagerColumns);
-          expect(layout).toBe(getWasmPhysicalLayout(testSchema, capacity, 'mixed', testEagerColumns));
+          const layout = getWasmPhysicalLayout(testSchema, capacity, 'mixed', 'current', testEagerColumns);
+          expect(layout).toBe(getWasmPhysicalLayout(testSchema, capacity, 'mixed', 'current', testEagerColumns));
           expect(Object.isFrozen(layout)).toBe(true);
           expect(layout.system.timestampOffset).toBe(0);
           expect(layout.system.entryTypeOffset).toBe(capacity * 8);
-          const logHeaderOffset = (capacity * 9 + 3) & ~3;
+          const messageIdOffset = (capacity * 9 + 1) & ~1;
+          const messageIdValidityOffset = messageIdOffset + capacity * Uint16Array.BYTES_PER_ELEMENT;
+          const expectedByteLength = (messageIdValidityOffset + Math.ceil(capacity / 8) + 7) & ~7;
           expect(layout.messageLayoutFamily).toBe('mixed');
-          expect(layout.system.logHeaderOffset).toBe(logHeaderOffset);
-          expect(layout.system.byteLength).toBe(logHeaderOffset + capacity * Uint32Array.BYTES_PER_ELEMENT);
+          expect(layout.messagePhysicalLayout).toBe('current');
+          expect(layout.system.messageIdOffset).toBe(messageIdOffset);
+          expect(layout.system.messageIdValidityOffset).toBe(messageIdValidityOffset);
+          expect(layout.system.messageDenseIndexOffset).toBeNull();
+          expect(layout.system.messageValidityOffset).toBeNull();
+          expect(layout.system.rowHeaderOffset).toBeNull();
+          expect(layout.system.byteLength).toBe(expectedByteLength);
 
           for (const family of ['u8', 'u32', 'f64'] as const) {
             const slab = layout.slabs[family];
@@ -284,6 +291,7 @@ describe('WasmSpanBuffer', () => {
 
     it('provides entry_type view into WASM memory', () => {
       const entryType = buffer.entry_type;
+      if (entryType === undefined) throw new Error('Expected split entry-type lane');
       expect(entryType).toBeInstanceOf(Uint8Array);
       expect(entryType.length).toBe(CAPACITY);
     });
@@ -296,10 +304,11 @@ describe('WasmSpanBuffer', () => {
 
     it('can write to entry_type array', () => {
       const entryType = buffer.entry_type;
+      if (entryType === undefined) throw new Error('Expected split entry-type lane');
       entryType[0] = 1; // SPAN_START
       entryType[1] = 2; // SPAN_OK
-      expect(buffer.entry_type[0]).toBe(1);
-      expect(buffer.entry_type[1]).toBe(2);
+      expect(resolveEntryType(buffer, 0)).toBe(1);
+      expect(resolveEntryType(buffer, 1)).toBe(2);
     });
 
     it('reuses canonical typed views while memory is stable', () => {
@@ -384,6 +393,8 @@ describe('WasmSpanBuffer', () => {
       buffer.message(0, 'span-start message');
       buffer.message(1, 'span-end message');
       buffer.message(2, 'log entry');
+      if (buffer.message_nulls === undefined) throw new Error('Expected message validity lane');
+      buffer.message_nulls[0] |= 0b111;
       expect(resolveMessage(buffer, 0)).toBe('span-start message');
       expect(resolveMessage(buffer, 1)).toBe('span-end message');
       expect(resolveMessage(buffer, 2)).toBe('log entry');

@@ -108,6 +108,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
   ): SpanBuffer<T> {
     const effectiveCapacity = capacity ?? this.allocator.capacity;
     const messageLayoutFamily = plannedClass?.messageLayoutFamily ?? 'mixed';
+    const messagePhysicalLayout = plannedClass?.messagePhysicalLayout ?? 'current';
     // Create WASM buffer
     const wasmBuffer = createWasmSpanBuffer(
       schema,
@@ -115,6 +116,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
         allocator: this.allocator,
         capacity: effectiveCapacity,
         messageLayoutFamily,
+        messagePhysicalLayout,
       },
       traceRoot, // _traceRoot
       EMPTY_SCOPE, // _scopeValues
@@ -141,6 +143,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
     // Use provided schema (for cross-library calls) or parent's schema
     const childSchema = schema ?? parentBuffer._logSchema;
     const messageLayoutFamily = plannedClass?.messageLayoutFamily ?? wasmParent._messageLayoutFamily;
+    const messagePhysicalLayout = plannedClass?.messagePhysicalLayout ?? wasmParent._messagePhysicalLayout;
 
     const child = createWasmChildSpanBuffer(
       wasmParent,
@@ -149,6 +152,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
         capacity: effectiveCapacity,
         schema: childSchema, // Pass schema for correct buffer class
         messageLayoutFamily,
+        messagePhysicalLayout,
       },
       parentBuffer._traceRoot, // _traceRoot (inherit from parent)
       parentBuffer._scopeValues, // _scopeValues (inherit from parent)

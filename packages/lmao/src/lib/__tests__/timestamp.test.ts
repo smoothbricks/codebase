@@ -3,6 +3,7 @@ import { describe, expect, it } from 'bun:test';
 import { Nanoseconds } from '@smoothbricks/arrow-builder';
 import fc from 'fast-check';
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
+import { resolveEntryType } from '../resolveMessage.js';
 import { ENTRY_TYPE_INFO, ENTRY_TYPE_SPAN_OK, ENTRY_TYPE_SPAN_START } from '../schema/systemSchema.js';
 import { createTraceId } from '../traceId.js';
 import { createTraceRoot as createEsTraceRoot, TraceRoot as EsTraceRoot } from '../traceRoot.es.js';
@@ -311,10 +312,12 @@ describe('Platform timestamp append contract', () => {
         () => appendLifecycle(es, esBuffer),
       );
 
-      expect(Array.from(esBuffer.entry_type.slice(0, 4))).toEqual(Array.from(nodeBuffer.entry_type.slice(0, 4)));
+      expect(Array.from({ length: 4 }, (_, row) => resolveEntryType(esBuffer, row))).toEqual(
+        Array.from({ length: 4 }, (_, row) => resolveEntryType(nodeBuffer, row)),
+      );
       expect(Array.from(esBuffer.timestamp.slice(0, 4))).toEqual(Array.from(nodeBuffer.timestamp.slice(0, 4)));
-      expect(nodeBuffer.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
-      expect(nodeBuffer.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(resolveEntryType(nodeBuffer, 0)).toBe(ENTRY_TYPE_SPAN_START);
+      expect(resolveEntryType(nodeBuffer, 1)).toBe(ENTRY_TYPE_SPAN_OK);
     } finally {
       process.hrtime.bigint = original;
     }

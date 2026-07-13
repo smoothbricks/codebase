@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test';
 import '../../__tests__/test-helpers.js';
 import { createTestTracerOptions } from '../../__tests__/test-helpers.js';
 import { defineOpContext } from '../../defineOpContext.js';
+import { resolveEntryType } from '../../resolveMessage.js';
 import { TestTracer } from '../../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../../types.js';
 import { S } from '../builder.js';
@@ -20,7 +21,7 @@ function countEntryType(buffer: AnySpanBuffer, entryType: number): number {
   while (current) {
     const writeIndex = current._writeIndex;
     for (let i = 0; i < writeIndex; i++) {
-      if (current.entry_type[i] === entryType) {
+      if (resolveEntryType(current, i) === entryType) {
         count++;
       }
     }

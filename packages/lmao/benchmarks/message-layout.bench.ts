@@ -1,4 +1,20 @@
 import { bench, group, run, summary } from 'mitata';
+import { defineOpContext } from '../src/lib/defineOpContext.js';
+import {
+  RUNTIME_HINT_ANALYZED_VALID,
+  RUNTIME_HINT_LOG,
+  RUNTIME_HINT_MESSAGE_LAYOUT_MIXED,
+  RUNTIME_HINT_RESULT,
+} from '../src/lib/runtimeHint.js';
+import { S } from '../src/lib/schema/builder.js';
+import { defineLogSchema } from '../src/lib/schema/defineLogSchema.js';
+import {
+  createChildSpanBuffer,
+  createOverflowBuffer,
+  createSpanBuffer,
+} from '../src/lib/spanBuffer.js';
+import type { AnySpanBuffer } from '../src/lib/types.js';
+import { createTestTraceRoot } from '../src/lib/__tests__/test-helpers.js';
 
 const CAPACITIES = [8, 64, 1024] as const;
 const STATIC_RATIOS = [0, 25, 50, 75, 100] as const;
@@ -8,6 +24,8 @@ const REFERENCE_BYTES = 8;
 const QUICK = process.argv.includes('--quick');
 const FORMAT = parseFormat(argumentValue('--format'));
 const TARGET_HOT_WRITES = QUICK ? 64 : 8_192;
+const FILTER_TEXT = argumentValue('--filter');
+const FILTER = FILTER_TEXT === undefined ? undefined : new RegExp(FILTER_TEXT);
 
 const SPECIALIZED_LABEL = 'specialized-split-u8+u32-dense-index';
 const PACKED_LABEL = 'packed-u32-header';
@@ -320,6 +338,7 @@ type ScenarioMetadata = {
   currentPhysicalLayout: string;
   hotWritesPerInvocation: number;
   persistent: Record<string, PersistentCounts>;
+  expectedSelector: string;
 };
 
 function assertEquivalent(layouts: readonly MessageLayout[], capacity: number, staticRatio: number): number {
@@ -336,7 +355,128 @@ function assertEquivalent(layouts: readonly MessageLayout[], capacity: number, s
   return expected;
 }
 
+const SHARING_BUFFER_PAIRS = QUICK ? 8 : 128;
+const sharingSchema = defineLogSchema({ marker: S.category() });
+const sharingContext = defineOpContext({ logSchema: sharingSchema });
+const sharingOp = sharingContext.defineOp('benchmark-local-message-dictionary', (ctx) => ctx.ok(null), undefined, {
+  runtimeHint:
+    RUNTIME_HINT_ANALYZED_VALID |
+    RUNTIME_HINT_LOG |
+    RUNTIME_HINT_RESULT |
+    RUNTIME_HINT_MESSAGE_LAYOUT_MIXED |
+    8,
+  localMessageDictionary: [0],
+});
+const sharingPlan = sharingOp.metadata._physicalLayoutPlan;
+if (!sharingPlan) throw new Error('Expected benchmark callsite to own a PhysicalLayoutPlan');
+sharingPlan.SpanBufferClass.stats.capacity = 8;
+const sharingRoot = createSpanBuffer(
+  sharingContext.logBinding.logSchema,
+  createTestTraceRoot('message-layout-sharing'),
+  sharingOp.metadata,
+  8,
+  sharingPlan.SpanBufferClass,
+);
+const sharingBuffers: AnySpanBuffer[] = [sharingRoot];
+for (let index = 0; index < SHARING_BUFFER_PAIRS; index++) {
+  const child = createChildSpanBuffer(
+    sharingRoot,
+    sharingPlan.SpanBufferClass,
+    sharingOp.metadata,
+    sharingOp.metadata,
+    8,
+  );
+  sharingBuffers.push(child, createOverflowBuffer(child));
+}
+
+const sharedDictionary = sharingPlan.localMessageDictionary;
+const sharedEncoder = sharingPlan.encodeLocalMessage;
+const uniquePlans = new Set<object>();
+const uniqueDictionaries = new Set<readonly number[]>();
+const uniqueEncoders = new Set<(globalDenseIndex: number) => number>();
+let bufferOwnedDictionaryObjects = 0;
+if (!Object.isFrozen(sharedDictionary)) throw new Error('Callsite local message dictionary must be frozen');
+if (sharedDictionary.length === 0) throw new Error('Sharing gate requires a nonempty local message dictionary');
+if (sharedEncoder(sharedDictionary[0]!) !== 1 || sharedEncoder(0xffff_ffff) !== 0) {
+  throw new Error('Callsite local message encoder violated its 1-based ID contract');
+}
+for (const buffer of sharingBuffers) {
+  const plan = buffer._opMetadata._physicalLayoutPlan;
+  if (!plan) throw new Error('Buffer did not retain its callsite PhysicalLayoutPlan');
+  uniquePlans.add(plan);
+  uniqueDictionaries.add(plan.localMessageDictionary);
+  uniqueEncoders.add(plan.encodeLocalMessage);
+  if (plan !== sharingPlan || plan.localMessageDictionary !== sharedDictionary || plan.encodeLocalMessage !== sharedEncoder) {
+    throw new Error('Root, child, or overflow buffer did not reuse the callsite dictionary and encoder identities');
+  }
+  for (const key of ['_messageDictionary', 'localMessageDictionary', 'encodeLocalMessage']) {
+    if (Object.hasOwn(buffer, key)) bufferOwnedDictionaryObjects++;
+  }
+}
+if (
+  uniquePlans.size !== 1 ||
+  uniqueDictionaries.size !== 1 ||
+  uniqueEncoders.size !== 1 ||
+  bufferOwnedDictionaryObjects !== 0
+) {
+  throw new Error('Per-buffer message dictionary or encoder allocation detected');
+}
+const sharingMetadata = {
+  bufferCount: sharingBuffers.length,
+  rootBuffers: 1,
+  childBuffers: SHARING_BUFFER_PAIRS,
+  overflowBuffers: SHARING_BUFFER_PAIRS,
+  physicalLayoutPlanObjects: uniquePlans.size,
+  localMessageDictionaryObjects: uniqueDictionaries.size,
+  localMessageEncoderObjects: uniqueEncoders.size,
+  bufferOwnedDictionaryObjects,
+  dictionaryFrozen: Object.isFrozen(sharedDictionary),
+  dictionaryLength: sharedDictionary.length,
+  knownDenseLocalId: sharedEncoder(sharedDictionary[0]!),
+  missingDenseLocalId: sharedEncoder(0xffff_ffff),
+} as const;
+
+group('message-layout/callsite-dictionary-sharing', () => {
+  bench('callsite-local-dictionary-shared-identity', () => {
+    let identityMatches = 0;
+    for (const buffer of sharingBuffers) {
+      const plan = buffer._opMetadata._physicalLayoutPlan;
+      if (
+        plan === sharingPlan &&
+        plan.localMessageDictionary === sharedDictionary &&
+        plan.encodeLocalMessage === sharedEncoder
+      ) {
+        identityMatches++;
+      }
+    }
+    return identityMatches;
+  }).baseline(true);
+});
+
 const labels = ['current', SPECIALIZED_LABEL, PACKED_LABEL] as const;
+const expectedSelector: Readonly<Record<number, Readonly<Record<number, (typeof labels)[number]>>>> = Object.freeze({
+  8: Object.freeze({
+    0: 'current',
+    25: 'current',
+    50: 'current',
+    75: 'current',
+    100: 'current',
+  }),
+  64: Object.freeze({
+    0: 'current',
+    25: 'current',
+    50: SPECIALIZED_LABEL,
+    75: 'current',
+    100: 'current',
+  }),
+  1024: Object.freeze({
+    0: 'current',
+    25: 'current',
+    50: 'current',
+    75: 'current',
+    100: 'current',
+  }),
+});
 const persistentMetadata: ScenarioMetadata[] = [];
 
 for (const capacity of CAPACITIES) {
@@ -362,6 +502,7 @@ for (const capacity of CAPACITIES) {
       currentPhysicalLayout: currentPhysicalLabel(staticRatio),
       hotWritesPerInvocation: repetitions * capacity,
       persistent: Object.fromEntries(labels.map((label, index) => [label, hotLayouts[index]!.counts])),
+      expectedSelector: expectedSelector[capacity]![staticRatio]!,
     });
 
     group(`message-layout/hot-write/capacity-${capacity}/static-${staticRatio}%`, () => {
@@ -388,6 +529,12 @@ for (const capacity of CAPACITIES) {
 // stderr, never sampled inside a timed callback. Mitata owns heap/GC telemetry.
 if (!process.argv.includes('--no-metadata')) {
   console.error(`message-layout persistent metadata: ${JSON.stringify(persistentMetadata)}`);
+  console.error(`message-layout sharing metadata: ${JSON.stringify(sharingMetadata)}`);
 }
 
-await run({ format: FORMAT, colors: FORMAT !== 'json' && FORMAT !== 'quiet', throw: true });
+await run({
+  format: FORMAT,
+  colors: FORMAT !== 'json' && FORMAT !== 'quiet',
+  throw: true,
+  ...(FILTER === undefined ? {} : { filter: FILTER }),
+});

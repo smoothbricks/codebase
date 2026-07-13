@@ -87,12 +87,14 @@ const timestampNow: TimestampNowPrimitive = (traceRoot) => {
 const appendLogEntry: TimestampAppendPrimitive = (traceRoot, buffer, entryType) => {
   const root = traceRoot as WasmTraceRoot;
   root._assertLive();
-  if (isWasmSpanBuffer(buffer) && buffer._identityOwner) {
+  if (isWasmSpanBuffer(buffer) && buffer._messagePhysicalLayout !== 'packed' && buffer._identityOwner) {
     return root.allocator.writeLogEntry(buffer._systemPtr, buffer._identityPtr, root._traceRootPtr, entryType);
   }
   const idx = buffer._writeIndex;
+  const entryTypes = buffer.entry_type;
+  if (entryTypes === undefined) throw new TypeError('Split WASM appender requires entry_type storage');
   buffer.timestamp[idx] = timestampNow(root);
-  buffer.entry_type[idx] = entryType;
+  entryTypes[idx] = entryType;
   buffer._writeIndex = idx + 1;
   return idx;
 };
@@ -100,15 +102,17 @@ const appendLogEntry: TimestampAppendPrimitive = (traceRoot, buffer, entryType) 
 const writeSpanStartPrimitive: SpanStartPrimitive = (traceRoot, buffer, spanName) => {
   const root = traceRoot as WasmTraceRoot;
   root._assertLive();
-  if (isWasmSpanBuffer(buffer)) {
+  if (isWasmSpanBuffer(buffer) && buffer._messagePhysicalLayout !== 'packed') {
     root.allocator.spanStart(buffer._systemPtr, buffer._identityPtr, root._traceRootPtr);
     buffer._message[0] = spanName;
     return;
   }
+  const entryTypes = buffer.entry_type;
+  if (entryTypes === undefined) throw new TypeError('Split WASM span-start appender requires entry_type storage');
   buffer.timestamp[0] = timestampNow(root);
-  buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+  entryTypes[0] = ENTRY_TYPE_SPAN_START;
   buffer.message(0, spanName);
-  buffer.entry_type[1] = ENTRY_TYPE_SPAN_EXCEPTION;
+  entryTypes[1] = ENTRY_TYPE_SPAN_EXCEPTION;
   buffer.timestamp[1] = 0n;
   buffer._writeIndex = 2;
 };
@@ -116,14 +120,20 @@ const writeSpanStartPrimitive: SpanStartPrimitive = (traceRoot, buffer, spanName
 const writeSpanEndPrimitive: SpanEndPrimitive = (traceRoot, buffer, entryType) => {
   const root = traceRoot as WasmTraceRoot;
   root._assertLive();
-  if (isWasmSpanBuffer(buffer)) {
+  if (isWasmSpanBuffer(buffer) && buffer._messagePhysicalLayout !== 'packed') {
     if (entryType === 2) root.allocator.spanEndOk(buffer._systemPtr, root._traceRootPtr);
     else root.allocator.spanEndErr(buffer._systemPtr, root._traceRootPtr);
-    if (entryType !== 2 && entryType !== 3) buffer.entry_type[1] = entryType;
+    if (entryType !== 2 && entryType !== 3) {
+      const splitEntryTypes = buffer.entry_type;
+      if (splitEntryTypes === undefined) throw new TypeError('Split WASM buffer is missing entry_type storage');
+      splitEntryTypes[1] = entryType;
+    }
     return;
   }
+  const entryTypes = buffer.entry_type;
+  if (entryTypes === undefined) throw new TypeError('Split WASM span-end appender requires entry_type storage');
   buffer.timestamp[1] = timestampNow(root);
-  buffer.entry_type[1] = entryType;
+  entryTypes[1] = entryType;
 };
 
 export class WasmTraceRoot<T extends LogSchema = LogSchema> implements ITraceRoot<T> {

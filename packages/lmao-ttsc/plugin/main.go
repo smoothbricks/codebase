@@ -121,7 +121,7 @@ func collectProgramCompilation(prog *driver.Program, options compilerOptions, va
 	compilation := &programCompilation{files: map[*shimast.SourceFile]*collectedFile{}}
 	for _, sf := range prog.SourceFiles() {
 		if sf == nil || sf.IsDeclarationFile { continue }
-		t := &fileTransformer{file: sf, cwd: options.cwd, checker: prog.Checker, processed: map[*shimast.CallExpression]bool{}, opSpans: map[*shimast.CallExpression]bool{}, vocabulary: collector}
+		t := &fileTransformer{file: sf, cwd: options.cwd, checker: prog.Checker, processed: map[*shimast.CallExpression]bool{}, opSpans: map[*shimast.CallExpression]bool{}, physicalLogCalls: map[*shimast.CallExpression]callMessagePhysicalLayout{}, currentLogLocalIDs: map[*shimast.CallExpression]uint16{}, vocabulary: collector}
 		t.collectOptimizations(sf.AsNode(), false)
 		compilation.files[sf] = &collectedFile{transformer: t}
 	}
@@ -134,7 +134,7 @@ func collectProgramCompilation(prog *driver.Program, options compilerOptions, va
 	}
 	staticLogs, staticSpans := resolveVocabularyIDs(manifest, collector)
 	for sf, collected := range compilation.files {
-		collected.transformer.staticLogIDs = staticLogs; collected.transformer.staticSpanNameIDs = staticSpans
+		collected.transformer.staticLogIDs = staticLogs; collected.transformer.staticSpanNameIDs = staticSpans; collected.transformer.vocabularySize = len(manifest.Entries)
 		collected.hintRewrites = collected.transformer.collectOptimizations(sf.AsNode(), true)
 		collected.registrationEntries = manifestEntriesForFile(manifest, collector.fileKeys[sf.FileName()])
 		collected.transformer.vocabularyOrdinals = vocabularyOrdinals(collected.registrationEntries)
@@ -150,7 +150,7 @@ func lmaoPluginTransform(prog *driver.Program, options compilerOptions) (driver.
 		collected := compilation.files[sf]; if collected == nil { panic("source file missing from finalized LMAO compilation") }
 		t := collected.transformer
 		binding, registration := vocabularyRegistrationStatements(ec, collected.registrationEntries); t.vocabularyBinding = binding
-		applyHintRewrites(collected.hintRewrites); t.applyTagInlines(collected.tagInlines); t.applyLogInlines(collected.logInlines); t.applyResultInlines(collected.resultInlines); t.walk(sf.AsNode())
+		t.applyHintRewrites(collected.hintRewrites); t.applyTagInlines(collected.tagInlines); t.applyLogInlines(collected.logInlines); t.applyResultInlines(collected.resultInlines); t.walk(sf.AsNode())
 		prependVocabularyRegistration(sf, registration)
 		shimast.SetParentInChildrenUnset(sf.AsNode())
 		return sf
@@ -242,8 +242,11 @@ type fileTransformer struct {
 	opSpans map[*shimast.CallExpression]bool
 	staticLogIDs        map[*shimast.CallExpression]globalVocabularyID
 	staticSpanNameIDs   map[*shimast.CallExpression]globalVocabularyID
+	physicalLogCalls    map[*shimast.CallExpression]callMessagePhysicalLayout
+	currentLogLocalIDs map[*shimast.CallExpression]uint16
 	vocabulary          *programVocabularyCollector
 	vocabularyOrdinals  map[globalVocabularyID]int
+	vocabularySize      int
 	vocabularyBinding   *shimast.Node
 	checker             *shimchecker.Checker
 }

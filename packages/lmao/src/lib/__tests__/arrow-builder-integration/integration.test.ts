@@ -146,7 +146,11 @@ describe('Buffer Integration', () => {
 
     // Set required system columns
     buffer.timestamp[0] = 1000n;
-    buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+    {
+      const entryTypes = buffer.entry_type;
+      if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+      entryTypes[0] = ENTRY_TYPE_SPAN_START;
+    };
     buffer._writeIndex = 1;
 
     // Convert to Arrow table
@@ -190,7 +194,11 @@ describe('Buffer Integration', () => {
 
     // Set required system columns
     buffer.timestamp[0] = 1000n;
-    buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+    {
+      const entryTypes = buffer.entry_type;
+      if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+      entryTypes[0] = ENTRY_TYPE_SPAN_START;
+    };
     buffer._writeIndex = 1;
 
     // Convert to Arrow table
@@ -232,7 +240,11 @@ describe('Buffer Integration', () => {
 
     // Set required system columns
     buffer.timestamp[0] = 1000n;
-    buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+    {
+      const entryTypes = buffer.entry_type;
+      if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+      entryTypes[0] = ENTRY_TYPE_SPAN_START;
+    };
     buffer._writeIndex = 1;
 
     // Convert to Arrow table
@@ -302,7 +314,11 @@ describe('Buffer Integration', () => {
 
       // Set system columns
       buffer.timestamp[0] = 1000n;
-      buffer.entry_type[0] = ENTRY_TYPE_INFO;
+      {
+        const entryTypes = buffer.entry_type;
+        if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+        entryTypes[0] = ENTRY_TYPE_INFO;
+      };
       buffer._writeIndex = 1;
 
       // Convert to Arrow using arrow-builder

@@ -12,6 +12,9 @@ const (
 	messageLayoutDynamicOnly uint32 = 0x02000000
 	messageLayoutMixed      uint32 = 0x03000000
 	messageLayoutMask       uint32 = 0x03000000
+	messagePhysicalPacked      uint32 = 0x04000000
+	messagePhysicalSpecialized uint32 = 0x08000000
+	messagePhysicalMask        uint32 = 0x0c000000
 )
 
 func emittedRuntimeHints(t *testing.T, output string) []uint32 {
@@ -66,7 +69,7 @@ defineOp('unanalyzed-bailout', (ctx) => {
 		runtimeHintAnalyzed | messageLayoutStaticOnly | runtimeHintLog | runtimeHintResult | 3,
 		runtimeHintAnalyzed | messageLayoutStaticOnly | runtimeHintLog | runtimeHintResult | 3,
 		runtimeHintAnalyzed | messageLayoutDynamicOnly | runtimeHintLog | runtimeHintResult | 3,
-		runtimeHintAnalyzed | messageLayoutDynamicOnly | runtimeHintFF | runtimeHintResult | 2,
+		runtimeHintAnalyzed | messageLayoutDynamicOnly | runtimeHintFF | runtimeHintResult | 3,
 		runtimeHintAnalyzed | messageLayoutMixed | runtimeHintLog | runtimeHintResult | 4,
 		runtimeHintAnalyzed | messageLayoutStaticOnly | runtimeHintResult | 2,
 		0,
@@ -105,5 +108,142 @@ func TestMessageLayoutFamilyHintBitsMatchRuntimeABI(t *testing.T) {
 	}
 	if runtimeHintMessageMixed != messageLayoutMask {
 		t.Fatalf("mixed encoding = %#x, want family mask %#x", runtimeHintMessageMixed, messageLayoutMask)
+	}
+}
+
+func TestMessagePhysicalLayoutSelectorExactMatrix(t *testing.T) {
+	testCases := []struct {
+		name        string
+		capacity    uint32
+		staticRows  uint32
+		dynamicRows uint32
+		want        uint32
+	}{
+		{"capacity-8-static-0", 8, 0, 6, 0},
+		{"capacity-8-static-25", 8, 1, 5, 0},
+		{"capacity-8-static-50", 8, 3, 3, 0},
+		{"capacity-8-static-75", 8, 5, 1, 0},
+		{"capacity-8-static-100", 8, 6, 0, 0},
+		{"capacity-64-static-0", 64, 0, 62, 0},
+		{"capacity-64-static-25", 64, 15, 47, 0},
+		{"capacity-64-static-50", 64, 31, 31, messagePhysicalSpecialized},
+		{"capacity-64-static-75", 64, 46, 16, 0},
+		{"capacity-64-static-100", 64, 62, 0, 0},
+		{"capacity-1024-static-0", 1024, 0, 1022, 0},
+		{"capacity-1024-static-25", 1024, 255, 767, 0},
+		{"capacity-1024-static-50", 1024, 511, 511, 0},
+		{"capacity-1024-static-75", 1024, 766, 256, 0},
+		{"capacity-1024-static-100", 1024, 1022, 0, 0},
+	}
+
+	checksum := uint32(0)
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := selectMessagePhysicalLayout(testCase.capacity, testCase.staticRows, testCase.dynamicRows, 1)
+			if got != testCase.want {
+				t.Errorf("selectMessagePhysicalLayout(%d, %d, %d) = %#x, want %#x", testCase.capacity, testCase.staticRows, testCase.dynamicRows, got, testCase.want)
+			}
+		})
+		checksum = (checksum << 2) | (testCase.want >> 26)
+	}
+	if checksum != 0x8000 {
+		t.Fatalf("selector matrix checksum = %#x, want 0x8000", checksum)
+	}
+}
+
+func TestMessagePhysicalLayoutSelectorFallsBackForUnsafeInputs(t *testing.T) {
+	testCases := []struct {
+		name           string
+		capacity       uint32
+		staticRows     uint32
+		dynamicRows    uint32
+		vocabularySize int
+	}{
+		{"adaptive-capacity", 0, 0, 0, 1},
+		{"reserved-two-rows-only", 2, 0, 0, 1},
+		{"row-count-under-capacity", 64, 30, 31, 1},
+		{"row-count-over-capacity", 64, 32, 31, 1},
+		{"unknown-capacity-tier", 63, 31, 30, 1},
+		{"oversized-capacity", 0x10000, 0x7fff, 0x7fff, 1},
+		{"dense-index-beyond-max", 64, 31, 31, int(maxPackedDenseIndex) + 2},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := selectMessagePhysicalLayout(testCase.capacity, testCase.staticRows, testCase.dynamicRows, testCase.vocabularySize); got != 0 {
+				t.Errorf("unsafe selector result = %#x, want split", got)
+			}
+		})
+	}
+}
+
+func TestMessagePhysicalLayoutHintBitsMatchRuntimeABI(t *testing.T) {
+	if runtimeHintMessagePhysicalPacked != messagePhysicalPacked {
+		t.Fatalf("compiler packed bit = %#x, want bit 26 %#x", runtimeHintMessagePhysicalPacked, messagePhysicalPacked)
+	}
+	if runtimeHintMessagePhysicalSpecialized != messagePhysicalSpecialized {
+		t.Fatalf("compiler specialized bit = %#x, want bit 27 %#x", runtimeHintMessagePhysicalSpecialized, messagePhysicalSpecialized)
+	}
+	if runtimeHintMessagePhysicalPacked|runtimeHintMessagePhysicalSpecialized != messagePhysicalMask {
+		t.Fatalf("compiler physical mask = %#x, want %#x", runtimeHintMessagePhysicalPacked|runtimeHintMessagePhysicalSpecialized, messagePhysicalMask)
+	}
+	if messagePhysicalMask&messageLayoutMask != 0 {
+		t.Fatalf("physical mask %#x overlaps family mask %#x", messagePhysicalMask, messageLayoutMask)
+	}
+}
+
+func TestMessagePhysicalLayoutLoopAndUnsafeBodiesStayCurrent(t *testing.T) {
+	output := transformTemplateFixture(t, `
+declare const values: readonly string[];
+declare function consume(value: unknown): void;
+defineOp('loop-adaptive', (ctx) => {
+  for (const value of values) ctx.log.debug(value);
+  return ctx.ok(null);
+});
+defineOp('unsafe-unknown', (ctx) => {
+  consume(ctx);
+  return null;
+});
+`)
+	hints := emittedRuntimeHints(t, output)
+	want := []uint32{
+		runtimeHintAnalyzed | runtimeHintMessageDynamic | runtimeHintLog | runtimeHintResult,
+		0,
+	}
+	if len(hints) != len(want) {
+		t.Fatalf("fallback hints = %v, want %v\n%s", hints, want, output)
+	}
+	for index := range want {
+		if hints[index] != want[index] {
+			t.Errorf("fallback hint %d = %#x, want %#x", index, hints[index], want[index])
+		}
+		if hints[index]&messagePhysicalMask != 0 {
+			t.Errorf("fallback hint %d unexpectedly selected a specialized physical mode: %#x", index, hints[index])
+		}
+	}
+}
+
+func TestCurrentMessageDictionaryIsFrozenDeduplicatedAndUsesNonzeroLocalIDs(t *testing.T) {
+	output := transformTemplateFixture(t, `
+defineOp('current-local-dictionary', (ctx) => {
+  ctx.log.info('repeated literal');
+  ctx.log.debug('repeated literal');
+  ctx.log.warn('distinct literal');
+  return ctx.ok(null);
+});
+`)
+	if !strings.Contains(output, "localMessageDictionary: Object.freeze([") {
+		t.Fatalf("current compile metadata omitted its frozen local dictionary\n%s", output)
+	}
+	if count := strings.Count(output, "_messageIds[$$i] = 1"); count != 2 {
+		t.Fatalf("repeated current literal local-ID writes = %d, want 2\n%s", count, output)
+	}
+	if count := strings.Count(output, "_messageIds[$$i] = 2"); count != 1 {
+		t.Fatalf("distinct current literal local-ID writes = %d, want 1\n%s", count, output)
+	}
+	if count := strings.Count(output, "message_nulls"); count != 3 {
+		t.Fatalf("current validity writes = %d, want 3\n%s", count, output)
+	}
+	if strings.Contains(output, "_messageDictionary") {
+		t.Fatalf("compiler emitted a forbidden per-buffer dictionary field\n%s", output)
 	}
 }

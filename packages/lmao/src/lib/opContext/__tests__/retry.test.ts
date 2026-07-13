@@ -24,6 +24,7 @@ import { Code } from '../../errors/CodeError.js';
 import { exponentialBackoff, fixedDelay, linearBackoff, Transient, TransientError } from '../../errors/Transient.js';
 import type { OpContextOf, SpanContext } from '../../opContext/types.js';
 import type { Result } from '../../result.js';
+import { resolveEntryType } from '../../resolveMessage.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { ENTRY_TYPE_SPAN_RETRY } from '../../schema/systemSchema.js';
@@ -486,10 +487,9 @@ describe('LMAO Op Retry', () => {
       // Row 0: span-start
       // Row 1: span-ok/span-err
       // Row 2+: log entries and span-retry entries
-      const entryTypes = spanBuffer.entry_type;
       const retryEntries: number[] = [];
       for (let i = 2; i < spanBuffer._writeIndex; i++) {
-        if (entryTypes[i] === ENTRY_TYPE_SPAN_RETRY) {
+        if (resolveEntryType(spanBuffer, i) === ENTRY_TYPE_SPAN_RETRY) {
           retryEntries.push(i);
         }
       }
@@ -500,7 +500,10 @@ describe('LMAO Op Retry', () => {
       // Verify message format: retry:op:{opName}
       // Note: For inline functions, the opMetadata name comes from the parent context
       // which in this test is 'root' (the root trace name)
-      const messages = requireStringArray(spanBuffer.getColumnIfAllocated('message'), 'retry messages');
+      if (spanBuffer._messageLayoutFamily === 'static-only' || spanBuffer.message_values === undefined) {
+        throw new Error(`expected retry raw message lane, received ${spanBuffer._messageLayoutFamily}`);
+      }
+      const messages = requireStringArray(spanBuffer.message_values, 'retry messages');
       const retryAttempts = requireFloat64Array(spanBuffer.getColumnIfAllocated('retry_attempt'), 'retry attempts');
       const retryDelays = requireFloat64Array(spanBuffer.getColumnIfAllocated('retry_delay_ms'), 'retry delays');
       for (const idx of retryEntries) {
@@ -530,10 +533,9 @@ describe('LMAO Op Retry', () => {
       if (!spanBuffer) throw new Error('expected no-retry span buffer');
 
       // Check for any retry entries
-      const entryTypes = spanBuffer.entry_type;
       let retryCount = 0;
       for (let i = 0; i < spanBuffer._writeIndex; i++) {
-        if (entryTypes[i] === ENTRY_TYPE_SPAN_RETRY) {
+        if (resolveEntryType(spanBuffer, i) === ENTRY_TYPE_SPAN_RETRY) {
           retryCount++;
         }
       }
@@ -558,10 +560,9 @@ describe('LMAO Op Retry', () => {
       if (!spanBuffer) throw new Error('expected exhausted-retry span buffer');
 
       // Check for retry entries
-      const entryTypes = spanBuffer.entry_type;
       let retryCount = 0;
       for (let i = 0; i < spanBuffer._writeIndex; i++) {
-        if (entryTypes[i] === ENTRY_TYPE_SPAN_RETRY) {
+        if (resolveEntryType(spanBuffer, i) === ENTRY_TYPE_SPAN_RETRY) {
           retryCount++;
         }
       }
@@ -591,10 +592,9 @@ describe('LMAO Op Retry', () => {
       if (!spanBuffer) throw new Error('expected retry error-code span buffer');
 
       // Find retry entry
-      const entryTypes = spanBuffer.entry_type;
       let retryIdx = -1;
       for (let i = 2; i < spanBuffer._writeIndex; i++) {
-        if (entryTypes[i] === ENTRY_TYPE_SPAN_RETRY) {
+        if (resolveEntryType(spanBuffer, i) === ENTRY_TYPE_SPAN_RETRY) {
           retryIdx = i;
           break;
         }
@@ -736,10 +736,9 @@ describe('LMAO Op Retry', () => {
       // Verify 4 retry entries (attempts 1-4 failed)
       const [spanBuffer] = iterateSpanChildren(tracer.rootBuffers[0]);
       if (!spanBuffer) throw new Error('expected multi-retry span buffer');
-      const entryTypes = spanBuffer.entry_type;
       let retryCount = 0;
       for (let i = 0; i < spanBuffer._writeIndex; i++) {
-        if (entryTypes[i] === ENTRY_TYPE_SPAN_RETRY) {
+        if (resolveEntryType(spanBuffer, i) === ENTRY_TYPE_SPAN_RETRY) {
           retryCount++;
         }
       }

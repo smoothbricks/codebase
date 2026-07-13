@@ -2,8 +2,17 @@ import { beforeEach, describe, expect, it } from 'bun:test';
 import fc from 'fast-check';
 import { createTestOpMetadata, createTestTraceRoot, createTestTracerOptions } from '../../__tests__/test-helpers.js';
 import { defineOpContext } from '../../defineOpContext.js';
-import { resolveMessage } from '../../resolveMessage.js';
-import type { MessageLayoutFamily } from '../../runtimeHint.js';
+import { MAX_PACKED_MESSAGE_DENSE_INDEX, resolveEntryType, resolveMessage } from '../../resolveMessage.js';
+import {
+  RUNTIME_HINT_ANALYZED_VALID,
+  RUNTIME_HINT_LOG,
+  RUNTIME_HINT_MESSAGE_LAYOUT_MIXED,
+  RUNTIME_HINT_MESSAGE_PHYSICAL_SPECIALIZED,
+  RUNTIME_HINT_RESULT,
+  type MessageLayoutFamily,
+  type MessagePhysicalLayout,
+} from '../../runtimeHint.js';
+import type { OpMetadata } from '../../opContext/opTypes.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import {
@@ -33,6 +42,20 @@ const CAPACITY = 8;
 const context = defineOpContext({ logSchema: defineLogSchema({ marker: S.category(), count: S.number() }) });
 const schema = context.logBinding.logSchema;
 const lifecycleTracer = new TestTracer(context, createTestTracerOptions<typeof schema>());
+const currentMixedOp = context.defineOp('wasm-current-mixed', (ctx) => ctx.ok(null), undefined, {
+  runtimeHint:
+    RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_LOG | RUNTIME_HINT_RESULT | RUNTIME_HINT_MESSAGE_LAYOUT_MIXED | CAPACITY,
+  localMessageDictionary: [0],
+});
+const specializedMixedOp = context.defineOp('wasm-specialized-mixed', (ctx) => ctx.ok(null), undefined, {
+  runtimeHint:
+    RUNTIME_HINT_ANALYZED_VALID |
+    RUNTIME_HINT_LOG |
+    RUNTIME_HINT_RESULT |
+    RUNTIME_HINT_MESSAGE_LAYOUT_MIXED |
+    RUNTIME_HINT_MESSAGE_PHYSICAL_SPECIALIZED |
+    CAPACITY,
+});
 
 function align(value: number, alignment: number): number {
   return (value + alignment - 1) & ~(alignment - 1);
@@ -48,26 +71,86 @@ function expectWasmFamilyShape(
   expect(buffer._layout.messageLayoutFamily).toBe(family);
   expect(buffer._descriptor.layout).toBe(buffer._layout);
   if (family === 'static-only') {
-    expect(buffer._logHeaders).toBeInstanceOf(Uint32Array);
     expect('message_values' in buffer).toBe(false);
-    expect('message_nulls' in buffer).toBe(false);
     expect(Object.hasOwn(buffer, '_message')).toBe(false);
     expect(Object.hasOwn(buffer, '_spanName')).toBe(true);
     expect(Object.hasOwn(buffer, '_terminalMessage')).toBe(true);
   } else if (family === 'dynamic-only') {
-    expect('_logHeaders' in buffer).toBe(false);
     expect(buffer.message_values).toBeInstanceOf(Array);
-    expect('message_nulls' in buffer).toBe(false);
     expect(Object.hasOwn(buffer, '_message')).toBe(true);
     expect(Object.hasOwn(buffer, '_spanName')).toBe(true);
     expect(Object.hasOwn(buffer, '_terminalMessage')).toBe(false);
   } else {
-    expect(buffer._logHeaders).toBeInstanceOf(Uint32Array);
     expect(buffer.message_values).toBeInstanceOf(Array);
-    expect('message_nulls' in buffer).toBe(false);
     expect(Object.hasOwn(buffer, '_message')).toBe(true);
     expect(Object.hasOwn(buffer, '_spanName')).toBe(false);
     expect(Object.hasOwn(buffer, '_terminalMessage')).toBe(false);
+  }
+}
+
+function expectWasmPhysicalShape(
+  buffer: WasmSpanBufferInstance<typeof schema>,
+  physicalLayout: MessagePhysicalLayout,
+): void {
+  if (buffer._messagePhysicalLayout !== physicalLayout) {
+    throw new Error(`Expected ${physicalLayout} WASM buffer, received ${buffer._messagePhysicalLayout}`);
+  }
+  expect(buffer._layout.messagePhysicalLayout).toBe(physicalLayout);
+  const hasStaticMessages = buffer._messageLayoutFamily !== 'dynamic-only';
+  if (physicalLayout === 'packed') {
+    expect(buffer._rowHeaders).toBeInstanceOf(Uint32Array);
+    expect('entry_type' in buffer).toBe(false);
+    expect('_messageIds' in buffer).toBe(false);
+    expect('_logHeaders' in buffer).toBe(false);
+    expect('message_nulls' in buffer).toBe(false);
+  } else {
+    expect(buffer.entry_type).toBeInstanceOf(Uint8Array);
+    expect('_rowHeaders' in buffer).toBe(false);
+    if (physicalLayout === 'current' && hasStaticMessages) {
+      expect(buffer._messageIds).toBeInstanceOf(Uint16Array);
+      expect('_logHeaders' in buffer).toBe(false);
+      expect(buffer.message_nulls).toBeInstanceOf(Uint8Array);
+    } else if (physicalLayout === 'specialized' && hasStaticMessages) {
+      expect('_messageIds' in buffer).toBe(false);
+      expect(buffer._logHeaders).toBeInstanceOf(Uint32Array);
+      expect(buffer.message_nulls).toBeInstanceOf(Uint8Array);
+    } else {
+      expect('_messageIds' in buffer).toBe(false);
+      expect('_logHeaders' in buffer).toBe(false);
+      expect(buffer.message_nulls).toBeInstanceOf(Uint8Array);
+    }
+  }
+}
+
+function writeEntryType(buffer: AnySpanBuffer, row: number, entryType: number): void {
+  if (buffer._rowHeaders !== undefined) {
+    buffer._rowHeaders[row] = ((buffer._rowHeaders[row] & 0xffffff00) | entryType) >>> 0;
+    return;
+  }
+  if (buffer.entry_type === undefined) throw new Error('Expected split entry-type lane');
+  {
+    const entryTypes = buffer.entry_type;
+    if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
+    entryTypes[row] = entryType;
+  };
+}
+
+function writeStaticDense(buffer: AnySpanBuffer, row: number, entryType: number, denseIndex: number): void {
+  if (buffer._rowHeaders !== undefined) {
+    buffer._rowHeaders[row] = (((denseIndex + 1) << 8) | entryType) >>> 0;
+    return;
+  }
+  if (buffer.entry_type === undefined || buffer.message_nulls === undefined) {
+    throw new Error('Expected nonpacked entry-type and validity lanes');
+  }
+  buffer.entry_type[row] = entryType;
+  buffer.message_nulls[row >>> 3] |= 1 << (row & 7);
+  if (buffer._messagePhysicalLayout === 'current') {
+    if (buffer._messageIds === undefined) throw new Error('Expected current local-ID lane');
+    buffer._messageIds[row] = denseIndex + 1;
+  } else {
+    if (buffer._logHeaders === undefined) throw new Error('Expected specialized global dense lane');
+    buffer._logHeaders[row] = denseIndex;
   }
 }
 
@@ -95,109 +178,207 @@ describe('WASM specialized message buffer families', () => {
     traceRoot = new WasmTraceRoot<typeof schema>(allocator, createTraceId('wasm-message-family'), lifecycleTracer);
   });
 
-  function createBuffer(family: MessageLayoutFamily): WasmSpanBufferInstance<typeof schema> {
+  function createBuffer(
+    family: MessageLayoutFamily,
+    physicalLayout: MessagePhysicalLayout = 'current',
+    opMetadata: OpMetadata = metadata,
+  ): WasmSpanBufferInstance<typeof schema> {
     return createWasmSpanBuffer(
       schema,
       {
         allocator,
         capacity: CAPACITY,
         messageLayoutFamily: family,
+        messagePhysicalLayout: physicalLayout,
       },
       traceRoot,
       EMPTY_SCOPE,
-      metadata,
-      metadata,
+      opMetadata,
+      opMetadata,
     );
   }
 
-  it('caches distinct family classes and exact byte descriptors for arbitrary capacities', () => {
-    expect(getWasmSpanBufferClass(schema, 'static-only')).toBe(getWasmSpanBufferClass(schema, 'static-only'));
-    expect(new Set([
-      getWasmSpanBufferClass(schema, 'static-only'),
-      getWasmSpanBufferClass(schema, 'dynamic-only'),
-      getWasmSpanBufferClass(schema, 'mixed'),
-    ]).size).toBe(3);
-    const staticTemplate = createWasmLayoutTemplate(schema, 'static-only');
-    const dynamicTemplate = createWasmLayoutTemplate(schema, 'dynamic-only');
-    const mixedTemplate = createWasmLayoutTemplate(schema, 'mixed');
-    expect(staticTemplate).toBe(createWasmLayoutTemplate(schema, 'static-only'));
-    expect(new Set([staticTemplate, dynamicTemplate, mixedTemplate]).size).toBe(3);
+  it('caches all family/mode classes and exposes exact lane offsets and bytes for arbitrary capacities', () => {
+    const families = ['static-only', 'dynamic-only', 'mixed'] as const;
+    const modes = ['current', 'specialized', 'packed'] as const;
+    const classes = families.flatMap((family) => modes.map((mode) => getWasmSpanBufferClass(schema, family, mode)));
+    const templates = families.flatMap((family) => modes.map((mode) => createWasmLayoutTemplate(schema, family, mode)));
+    expect(new Set(classes).size).toBe(9);
+    expect(new Set(templates).size).toBe(9);
+    for (const family of families) {
+      for (const mode of modes) {
+        expect(getWasmSpanBufferClass(schema, family, mode)).toBe(getWasmSpanBufferClass(schema, family, mode));
+        expect(createWasmLayoutTemplate(schema, family, mode)).toBe(createWasmLayoutTemplate(schema, family, mode));
+      }
+    }
 
     fc.assert(
       fc.property(fc.integer({ min: 1, max: 512 }), (capacity) => {
-        const staticLayout = getWasmPhysicalLayout(schema, capacity, 'static-only');
-        const dynamicLayout = getWasmPhysicalLayout(schema, capacity, 'dynamic-only');
-        const mixedLayout = getWasmPhysicalLayout(schema, capacity, 'mixed');
-        const headerOffset = align(capacity * 9, Uint32Array.BYTES_PER_ELEMENT);
+        const timestampBytes = capacity * BigUint64Array.BYTES_PER_ELEMENT;
+        const entryTypeBytes = capacity * Uint8Array.BYTES_PER_ELEMENT;
+        const validityBytes = Math.ceil(capacity / 8);
+        for (const family of families) {
+          for (const mode of modes) {
+            const template = createWasmLayoutTemplate(schema, family, mode);
+            const layout = getWasmPhysicalLayout(schema, capacity, family, mode);
+            const hasStaticMessages = family !== 'dynamic-only';
+            expect(layout).toBe(template.forCapacity(capacity));
+            expect(layout.messageLayoutFamily).toBe(family);
+            expect(layout.messagePhysicalLayout).toBe(mode);
+            expect(layout.system.timestampOffset).toBe(0);
+            expect(layout.system.messageValueOffset).toBe(family === 'static-only' ? null : 0);
 
-        expect(staticLayout).toBe(staticTemplate.forCapacity(capacity));
-        expect(dynamicLayout).toBe(dynamicTemplate.forCapacity(capacity));
-        expect(mixedLayout).toBe(mixedTemplate.forCapacity(capacity));
-        expect(staticLayout.messageLayoutFamily).toBe('static-only');
-        expect(dynamicLayout.messageLayoutFamily).toBe('dynamic-only');
-        expect(mixedLayout.messageLayoutFamily).toBe('mixed');
-        expect(staticLayout.system.logHeaderOffset).toBe(headerOffset);
-        expect(mixedLayout.system.logHeaderOffset).toBe(headerOffset);
-        expect(dynamicLayout.system.logHeaderOffset).toBeUndefined();
-        expect(dynamicLayout.system.byteLength).toBe(capacity * 9);
-        expect(staticLayout.system.byteLength).toBe(headerOffset + capacity * Uint32Array.BYTES_PER_ELEMENT);
-        expect(mixedLayout.system.byteLength).toBe(staticLayout.system.byteLength);
-        expect(staticLayout.columns).toEqual(dynamicLayout.columns);
-        expect(dynamicLayout.columns).toEqual(mixedLayout.columns);
-        expect(staticLayout.slabs).toEqual(dynamicLayout.slabs);
-        expect(dynamicLayout.slabs).toEqual(mixedLayout.slabs);
+            if (mode === 'packed') {
+              const rowHeaderOffset = align(timestampBytes, Uint32Array.BYTES_PER_ELEMENT);
+              expect(layout.system.entryTypeOffset).toBeNull();
+              expect(layout.system.messageIdOffset).toBeNull();
+              expect(layout.system.messageIdValidityOffset).toBeNull();
+              expect(layout.system.messageDenseIndexOffset).toBeNull();
+              expect(layout.system.messageValidityOffset).toBeNull();
+              expect(layout.system.rowHeaderOffset).toBe(rowHeaderOffset);
+              expect(layout.system.byteLength).toBe(
+                align(rowHeaderOffset + capacity * Uint32Array.BYTES_PER_ELEMENT, BigUint64Array.BYTES_PER_ELEMENT),
+              );
+            } else {
+              const entryTypeOffset = timestampBytes;
+              expect(layout.system.entryTypeOffset).toBe(entryTypeOffset);
+              expect(layout.system.rowHeaderOffset).toBeNull();
+              if (!hasStaticMessages) {
+                const messageValidityOffset = entryTypeOffset + entryTypeBytes;
+                expect(layout.system.messageIdOffset).toBeNull();
+                expect(layout.system.messageIdValidityOffset).toBeNull();
+                expect(layout.system.messageDenseIndexOffset).toBeNull();
+                expect(layout.system.messageValidityOffset).toBe(messageValidityOffset);
+                expect(layout.system.byteLength).toBe(
+                  align(messageValidityOffset + validityBytes, BigUint64Array.BYTES_PER_ELEMENT),
+                );
+              } else if (mode === 'current') {
+                const messageIdOffset = align(entryTypeOffset + entryTypeBytes, Uint16Array.BYTES_PER_ELEMENT);
+                const messageIdValidityOffset = messageIdOffset + capacity * Uint16Array.BYTES_PER_ELEMENT;
+                expect(layout.system.messageIdOffset).toBe(messageIdOffset);
+                expect(layout.system.messageIdValidityOffset).toBe(messageIdValidityOffset);
+                expect(layout.system.messageDenseIndexOffset).toBeNull();
+                expect(layout.system.messageValidityOffset).toBeNull();
+                expect(layout.system.byteLength).toBe(
+                  align(messageIdValidityOffset + validityBytes, BigUint64Array.BYTES_PER_ELEMENT),
+                );
+              } else {
+                const messageDenseIndexOffset = align(
+                  entryTypeOffset + entryTypeBytes,
+                  Uint32Array.BYTES_PER_ELEMENT,
+                );
+                const messageValidityOffset = messageDenseIndexOffset + capacity * Uint32Array.BYTES_PER_ELEMENT;
+                expect(layout.system.messageIdOffset).toBeNull();
+                expect(layout.system.messageIdValidityOffset).toBeNull();
+                expect(layout.system.messageDenseIndexOffset).toBe(messageDenseIndexOffset);
+                expect(layout.system.messageValidityOffset).toBe(messageValidityOffset);
+                expect(layout.system.byteLength).toBe(
+                  align(messageValidityOffset + validityBytes, BigUint64Array.BYTES_PER_ELEMENT),
+                );
+              }
+            }
+          }
+        }
       }),
       { numRuns: 100 },
     );
   });
 
-  it('allocates only the selected lanes and preserves dense-zero/null/raw semantics', () => {
+  it('allocates current and specialized lanes and distinguishes dense-zero, null, and raw rows', () => {
+    if (getVocabularyGeneration().ids.length === 0) throw new Error('Expected the test vocabulary to contain dense zero');
+    for (const { mode, op } of [
+      { mode: 'current' as const, op: currentMixedOp },
+      { mode: 'specialized' as const, op: specializedMixedOp },
+    ]) {
+      const buffer = createBuffer('mixed', mode, op.metadata);
+      expectWasmFamilyShape(buffer, 'mixed');
+      expectWasmPhysicalShape(buffer, mode);
+      writeStaticDense(buffer, 0, ENTRY_TYPE_INFO, 0);
+      buffer._writeIndex = 3;
+      expect(resolveEntryType(buffer, 0)).toBe(ENTRY_TYPE_INFO);
+      expect(resolveMessage(buffer, 0)).toBeDefined();
+      if (mode === 'current') expect(buffer._messageIds?.[0]).toBe(1);
+      else expect(buffer._logHeaders?.[0]).toBe(0);
+      const validity = buffer.message_nulls;
+      if (validity === undefined) throw new Error(`Expected ${mode} validity lane`);
+      expect(validity[0] & 1).toBe(1);
+
+      writeEntryType(buffer, 1, ENTRY_TYPE_DEBUG);
+      expect(resolveMessage(buffer, 1)).toBeUndefined();
+      buffer.message(1, `${mode} raw`);
+      validity[0] |= 1 << 1;
+      expect(resolveMessage(buffer, 1)).toBe(`${mode} raw`);
+      writeEntryType(buffer, 2, ENTRY_TYPE_DEBUG);
+      expect(resolveMessage(buffer, 2)).toBeUndefined();
+    }
+  });
+
+  it('allocates packed lanes for all families and preserves dense-zero/max/null/raw semantics', () => {
     if (getVocabularyGeneration().ids.length === 0) throw new Error('Expected the test vocabulary to contain dense zero');
     for (const family of ['static-only', 'dynamic-only', 'mixed'] as const) {
-      const buffer = createBuffer(family);
+      const buffer = createBuffer(family, 'packed');
       expectWasmFamilyShape(buffer, family);
-      buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      expectWasmPhysicalShape(buffer, 'packed');
+      if (buffer._rowHeaders === undefined) throw new Error('Expected packed WASM headers');
+      writeStaticDense(buffer, 0, ENTRY_TYPE_SPAN_START, 0);
       buffer._writeIndex = 2;
-      if (family === 'dynamic-only') buffer._spanName = 0;
-      else {
-        if (!buffer._logHeaders) throw new Error('Expected WASM header lane');
-        buffer._logHeaders[0] = ENTRY_TYPE_SPAN_START;
-      }
+      expect(buffer._rowHeaders[0] >>> 8).toBe(1);
+      expect(resolveEntryType(buffer, 0)).toBe(ENTRY_TYPE_SPAN_START);
       expect(resolveMessage(buffer, 0)).toBeDefined();
-      expect(resolveMessage(buffer, 1)).toBeUndefined();
 
-      if (family === 'static-only') {
-        expect(() => buffer.message(2, 'raw')).toThrow('rows 0 and 1');
-      } else {
-        buffer.entry_type[2] = ENTRY_TYPE_DEBUG;
+      buffer._rowHeaders[1] = (((MAX_PACKED_MESSAGE_DENSE_INDEX + 1) << 8) | ENTRY_TYPE_SPAN_OK) >>> 0;
+      expect(buffer._rowHeaders[1] >>> 8).toBe(0x00ffffff);
+      if (family !== 'static-only') {
+        writeEntryType(buffer, 2, ENTRY_TYPE_DEBUG);
         buffer._writeIndex = 3;
         expect(resolveMessage(buffer, 2)).toBeUndefined();
-        buffer.message(2, `raw ${family}`);
-        expect(resolveMessage(buffer, 2)).toBe(`raw ${family}`);
+        buffer.message(2, `raw-packed-${family}`);
+        expect(buffer._rowHeaders[2] >>> 8).toBe(0);
+        expect(resolveMessage(buffer, 2)).toBe(`raw-packed-${family}`);
       }
     }
   });
 
-  it('propagates family, pointers, and omissions through child and overflow descriptors', () => {
+  it('propagates family, physical layout, pointers, and omissions through child and overflow descriptors', () => {
     for (const family of ['static-only', 'dynamic-only', 'mixed'] as const) {
-      const root = createBuffer(family);
-      const child = createWasmChildSpanBuffer(
-        root,
-        { allocator, capacity: CAPACITY, messageLayoutFamily: family },
-        traceRoot,
-        EMPTY_SCOPE,
-        metadata,
-        metadata,
-      );
-      const overflow = createWasmOverflowBuffer(child, traceRoot, EMPTY_SCOPE, metadata, metadata);
-      expect(child.constructor).toBe(getWasmSpanBufferClass(schema, family));
-      expect(overflow.constructor).toBe(child.constructor);
-      expect(child._descriptor.parent).toBe(root._descriptor);
-      expect(overflow._descriptor.parent).toBe(root._descriptor);
-      expect(overflow._identityPtr).toBe(child._identityPtr);
-      expect(overflow._layout).toBe(child._layout);
-      expectWasmFamilyShape(child, family);
-      expectWasmFamilyShape(overflow, family);
+      for (const physicalLayout of ['current', 'specialized', 'packed'] as const) {
+        const modeMetadata =
+          physicalLayout === 'current'
+            ? currentMixedOp.metadata
+            : physicalLayout === 'specialized'
+              ? specializedMixedOp.metadata
+              : metadata;
+        const root = createBuffer(family, physicalLayout, modeMetadata);
+        const child = createWasmChildSpanBuffer(
+          root,
+          { allocator, capacity: CAPACITY, messageLayoutFamily: family },
+          traceRoot,
+          EMPTY_SCOPE,
+          modeMetadata,
+          modeMetadata,
+        );
+        const overflow = createWasmOverflowBuffer(child, traceRoot, EMPTY_SCOPE, modeMetadata, modeMetadata);
+        if (physicalLayout === 'current') {
+          const dictionary = currentMixedOp.callsitePlan.localMessageDictionary;
+          expect(root._opMetadata._physicalLayoutPlan?.localMessageDictionary).toBe(dictionary);
+          expect(child._opMetadata._physicalLayoutPlan?.localMessageDictionary).toBe(dictionary);
+          expect(overflow._opMetadata._physicalLayoutPlan?.localMessageDictionary).toBe(dictionary);
+          for (const buffer of [root, child, overflow]) {
+            expect(Object.hasOwn(buffer, '_messageDictionary')).toBe(false);
+            expect('_messageDictionary' in buffer).toBe(false);
+          }
+        }
+        expect(child.constructor).toBe(getWasmSpanBufferClass(schema, family, physicalLayout));
+        expect(overflow.constructor).toBe(child.constructor);
+        expect(child._descriptor.parent).toBe(root._descriptor);
+        expect(overflow._descriptor.parent).toBe(root._descriptor);
+        expect(overflow._identityPtr).toBe(child._identityPtr);
+        expect(overflow._layout).toBe(child._layout);
+        expectWasmFamilyShape(child, family);
+        expectWasmFamilyShape(overflow, family);
+        expectWasmPhysicalShape(child, physicalLayout);
+        expectWasmPhysicalShape(overflow, physicalLayout);
+      }
     }
   });
 
@@ -205,6 +386,7 @@ describe('WASM specialized message buffer families', () => {
     if (getVocabularyGeneration().ids.length === 0) throw new Error('Expected the test vocabulary to contain dense zero');
     fc.assert(
       fc.property(
+        fc.constantFrom<MessagePhysicalLayout>('current', 'specialized', 'packed'),
         fc.array(
           fc.oneof(
             fc.constant({ kind: 'static' as const, text: undefined }),
@@ -213,17 +395,23 @@ describe('WASM specialized message buffer families', () => {
           ),
           { minLength: CAPACITY, maxLength: 64 },
         ),
-        (operations) => {
-          const JsClass = getSpanBufferClass(schema, 'mixed');
+        (physicalLayout, operations) => {
+          const modeMetadata =
+            physicalLayout === 'current'
+              ? currentMixedOp.metadata
+              : physicalLayout === 'specialized'
+                ? specializedMixedOp.metadata
+                : metadata;
+          const JsClass = getSpanBufferClass(schema, 'mixed', physicalLayout);
           JsClass.stats.capacity = CAPACITY;
-          const jsRoot = createSpanBuffer(schema, createTestTraceRoot('js-wasm-parity'), metadata, CAPACITY, JsClass);
-          const wasmRoot = createBuffer('mixed');
-          jsRoot.entry_type[0] = ENTRY_TYPE_SPAN_START;
-          jsRoot.entry_type[1] = ENTRY_TYPE_SPAN_OK;
+          const jsRoot = createSpanBuffer(schema, createTestTraceRoot('js-wasm-parity'), modeMetadata, CAPACITY, JsClass);
+          const wasmRoot = createBuffer('mixed', physicalLayout, modeMetadata);
+          writeEntryType(jsRoot, 0, ENTRY_TYPE_SPAN_START);
+          writeEntryType(jsRoot, 1, ENTRY_TYPE_SPAN_OK);
           jsRoot.message(0, 'parity root');
           jsRoot._writeIndex = 2;
-          wasmRoot.entry_type[0] = ENTRY_TYPE_SPAN_START;
-          wasmRoot.entry_type[1] = ENTRY_TYPE_SPAN_OK;
+          writeEntryType(wasmRoot, 0, ENTRY_TYPE_SPAN_START);
+          writeEntryType(wasmRoot, 1, ENTRY_TYPE_SPAN_OK);
           wasmRoot.message(0, 'parity root');
           wasmRoot._writeIndex = 2;
 
@@ -238,26 +426,33 @@ describe('WASM specialized message buffer families', () => {
               jsRow = 0;
             }
             if (wasmRow === CAPACITY) {
-              wasmSegment = createWasmOverflowBuffer(wasmSegment, traceRoot, EMPTY_SCOPE, metadata, metadata);
+              wasmSegment = createWasmOverflowBuffer(
+                wasmSegment,
+                traceRoot,
+                EMPTY_SCOPE,
+                modeMetadata,
+                modeMetadata,
+              );
               wasmRow = 0;
             }
             const entryType = operation.kind === 'dynamic' ? ENTRY_TYPE_DEBUG : ENTRY_TYPE_INFO;
-            jsSegment.entry_type[jsRow] = entryType;
-            wasmSegment.entry_type[wasmRow] = entryType;
+            writeEntryType(jsSegment, jsRow, entryType);
+            writeEntryType(wasmSegment, wasmRow, entryType);
             if (operation.kind === 'static') {
-              if (
-                jsSegment._messageLayoutFamily !== 'mixed' ||
-                wasmSegment._messageLayoutFamily !== 'mixed' ||
-                jsSegment._logHeaders === undefined ||
-                wasmSegment._logHeaders === undefined
-              ) {
-                throw new Error('Expected mixed header lanes');
-              }
-              jsSegment._logHeaders[jsRow] = entryType;
-              wasmSegment._logHeaders[wasmRow] = entryType;
+              writeStaticDense(jsSegment, jsRow, entryType, 0);
+              writeStaticDense(wasmSegment, wasmRow, entryType, 0);
             } else if (operation.kind === 'dynamic') {
               jsSegment.message(jsRow, operation.text);
               wasmSegment.message(wasmRow, operation.text);
+              if (physicalLayout !== 'packed') {
+                const jsValidity = jsSegment.message_nulls;
+                const wasmValidity = wasmSegment.message_nulls;
+                if (jsValidity === undefined || wasmValidity === undefined) {
+                  throw new Error(`Expected ${physicalLayout} parity validity lanes`);
+                }
+                jsValidity[jsRow >>> 3] |= 1 << (jsRow & 7);
+                wasmValidity[wasmRow >>> 3] |= 1 << (wasmRow & 7);
+              }
             }
             expected.push(resolveMessage(jsSegment, jsRow));
             jsSegment._writeIndex = ++jsRow;
@@ -274,6 +469,7 @@ describe('WASM specialized message buffer families', () => {
             segment = segment._overflow
           ) {
             expectWasmFamilyShape(segment, 'mixed');
+            expectWasmPhysicalShape(segment, physicalLayout);
           }
         },
       ),

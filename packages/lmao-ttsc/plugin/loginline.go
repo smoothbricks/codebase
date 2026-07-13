@@ -61,16 +61,19 @@ var logEntryTypes = map[string]int{
 }
 
 type logInline struct {
-	list       *shimast.NodeList
-	index      int
-	logExpr    *shimast.Node // the `ctx.log` expression
-	level      string        // info/debug/...
-	message    *shimast.Node
-	templateID globalVocabularyID // nonzero only for checker-proved registered literals
-	line       int           // source line of the log call (spec 01o §6, folded in)
-	lineArg    *shimast.Node // explicit .line(N) argument if present in source
-	writes     []tagWrite    // chained attribute writes in execution order
-	schema     map[string]schemaField
+	list           *shimast.NodeList
+	index          int
+	call           *shimast.CallExpression
+	logExpr        *shimast.Node // the `ctx.log` expression
+	level          string        // info/debug/...
+	message        *shimast.Node
+	templateID     globalVocabularyID // nonzero only for checker-proved registered literals
+	localMessageID uint16
+	physicalLayout callMessagePhysicalLayout
+	line           int           // source line of the log call (spec 01o §6, folded in)
+	lineArg        *shimast.Node // explicit .line(N) argument if present in source
+	writes         []tagWrite    // chained attribute writes in execution order
+	schema         map[string]schemaField
 }
 
 func isSpanLoggerType(chk *shimchecker.Checker, t *shimchecker.Type) bool {
@@ -202,14 +205,18 @@ func (t *fileTransformer) findLogInline(call *shimast.CallExpression) (*logInlin
 		if templateID == 0 {
 			return nil, false // preserve permitted raw debug/trace calls byte-for-byte
 		}
+		physicalLayout := t.physicalLogCalls[links[0].node]
 
 		in := &logInline{
-			logExpr:    next,
-			level:      links[0].name,
-			message:    links[0].args[0],
-			templateID: templateID,
-			line:       t.lineOf(links[0].node.AsNode()),
-			schema:     resolvedLogSchema(t.checker, recvType, links[0].node),
+			call:           call,
+			logExpr:        next,
+			level:          links[0].name,
+			message:        links[0].args[0],
+			templateID:     templateID,
+			localMessageID: t.currentLogLocalIDs[links[0].node],
+			physicalLayout: physicalLayout,
+			line:           t.lineOf(links[0].node.AsNode()),
+			schema:         resolvedLogSchema(t.checker, recvType, links[0].node),
 		}
 		if len(links[0].args) == 2 {
 			if links[0].args[1].Kind != shimast.KindObjectLiteralExpression {
@@ -397,9 +404,26 @@ func fixedSchemaWrite(buf, idx *shimast.Node, field string, value *shimast.Node)
 	}
 }
 
+// messageValidityWrite marks a current-layout static message as present. The
+// current plan preallocates this bitmap alongside its local Uint16 ID lane.
+func messageValidityWrite(buf, idx *shimast.Node) *shimast.Node {
+	nullSlot := factory.NewElementAccessExpression(propAccess(buf, "message_nulls"), nil,
+		factory.NewBinaryExpression(nil, idx, nil, factory.NewToken(shimast.KindGreaterThanGreaterThanGreaterThanToken), num(3)),
+		shimast.NodeFlagsNone)
+	nullBit := factory.NewBinaryExpression(nil, num(1), nil, factory.NewToken(shimast.KindLessThanLessThanToken),
+		factory.NewParenthesizedExpression(factory.NewBinaryExpression(nil, idx, nil, factory.NewToken(shimast.KindAmpersandToken), num(7))))
+	return binaryStmt(nullSlot, shimast.KindBarEqualsToken, nullBit)
+}
+
 // applyLogInlines splices replacement blocks (phase B — no checker use).
 func (t *fileTransformer) applyLogInlines(inlines []logInline) {
 	for _, in := range inlines {
+		if in.physicalLayout == callMessagePhysicalCurrent && in.localMessageID == 0 {
+			// Unanalyzed/current calls have no callsite-local dictionary entry;
+			// leave the original chain for the generic generated logger path.
+			delete(t.processed, in.call)
+			continue
+		}
 		logger := ident("$$l")
 		buf := ident("$$b")
 		idx := ident("$$i")
@@ -422,15 +446,36 @@ func (t *fileTransformer) applyLogInlines(inlines []logInline) {
 			constDecl(buf, propAccess(propAccess(logger, "_state"), "_buffer")),
 		)
 		if in.templateID != 0 {
-			packed := factory.NewBinaryExpression(nil,
-				factory.NewParenthesizedExpression(factory.NewBinaryExpression(nil,
-					factory.NewParenthesizedExpression(factory.NewBinaryExpression(nil, vocabularyOperand(), nil,
-						factory.NewToken(shimast.KindLessThanLessThanToken), num(8))), nil,
-					factory.NewToken(shimast.KindBarToken), num(logEntryTypes[in.level]))), nil,
-				factory.NewToken(shimast.KindGreaterThanGreaterThanGreaterThanToken), num(0))
-			stmts = append(stmts, binaryStmt(
-				factory.NewElementAccessExpression(propAccess(buf, "_logHeaders"), nil, idx, shimast.NodeFlagsNone),
-				shimast.KindEqualsToken, packed))
+			switch in.physicalLayout {
+			case callMessagePhysicalCurrent:
+				stmts = append(stmts,
+					binaryStmt(
+						factory.NewElementAccessExpression(propAccess(buf, "_messageIds"), nil, idx, shimast.NodeFlagsNone),
+						shimast.KindEqualsToken, num(int(in.localMessageID))),
+					messageValidityWrite(buf, idx),
+				)
+			case callMessagePhysicalSpecialized:
+				stmts = append(stmts,
+					binaryStmt(
+						factory.NewElementAccessExpression(propAccess(buf, "_logHeaders"), nil, idx, shimast.NodeFlagsNone),
+						shimast.KindEqualsToken, vocabularyOperand()),
+					messageValidityWrite(buf, idx),
+				)
+			case callMessagePhysicalPacked:
+				denseIdentity := factory.NewParenthesizedExpression(factory.NewBinaryExpression(nil,
+					vocabularyOperand(), nil, factory.NewToken(shimast.KindPlusToken), num(1)))
+				packed := factory.NewBinaryExpression(nil,
+					factory.NewParenthesizedExpression(factory.NewBinaryExpression(nil,
+						factory.NewParenthesizedExpression(factory.NewBinaryExpression(nil, denseIdentity, nil,
+							factory.NewToken(shimast.KindLessThanLessThanToken), num(8))), nil,
+						factory.NewToken(shimast.KindBarToken), num(logEntryTypes[in.level]))), nil,
+					factory.NewToken(shimast.KindGreaterThanGreaterThanGreaterThanToken), num(0))
+				stmts = append(stmts, binaryStmt(
+					factory.NewElementAccessExpression(propAccess(buf, "_rowHeaders"), nil, idx, shimast.NodeFlagsNone),
+					shimast.KindEqualsToken, packed))
+			default:
+				panic("unknown message layout reached direct log inline emission")
+			}
 		} else {
 			stmts = append(stmts, guardedRawWrite(buf, idx, "message", in.message))
 		}

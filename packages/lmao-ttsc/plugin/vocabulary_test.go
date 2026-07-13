@@ -190,7 +190,7 @@ func TestVocabularyFragmentArraysAndHashFreezeExactBytes(t *testing.T) {
 	}
 }
 
-func TestCompiledStaticVocabularyUsesFragmentOrdinalBindings(t *testing.T) {
+func TestCompiledStaticVocabularyUsesCurrentLocalDictionaryOrdinalBindings(t *testing.T) {
 	output := transformTemplateFixture(t, `
 function createOrdinalOps() {
   const child = defineOp('ordinal-child', (ctx) => { return ctx.ok(null); });
@@ -216,9 +216,9 @@ function createOrdinalOps() {
 		t.Fatalf("static log allocation did not use state-owned append with registered vocabulary metadata\n%s", output)
 	}
 	binding := registration[1]
-	packedHeaderPattern := regexp.MustCompile(`_logHeaders\[[^\]]+\]\s*=\s*[^;\n]*` + regexp.QuoteMeta(binding) + `\[` + logOrdinal + `\][^;\n]*;`)
-	if !packedHeaderPattern.MatchString(output) {
-		t.Fatalf("static log packed header did not reuse the log record's fragment ordinal through %s\n%s", binding, output)
+	localDictionaryPattern := regexp.MustCompile(`localMessageDictionary:\s*Object\.freeze\(\[\s*` + regexp.QuoteMeta(binding) + `\[` + logOrdinal + `\]\s*\]\)`)
+	if !localDictionaryPattern.MatchString(output) || !strings.Contains(output, "_messageIds[$$i] = 1") || !strings.Contains(output, "message_nulls") {
+		t.Fatalf("current static log did not bind local ID 1 to the log fragment ordinal through %s\n%s", binding, output)
 	}
 	spanPattern := regexp.MustCompile(`ctx\.span0\([^,]+,\s*` + regexp.QuoteMeta(binding) + `\[` + strconv.Itoa(ordinals[vocabularySpanName]) + `\],\s*child\.callsitePlan\.newCtx0\(ctx\),\s*child\.callsitePlan,\s*child\.fn\)`)
 	if !spanPattern.MatchString(output) {

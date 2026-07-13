@@ -13,16 +13,21 @@ export const RUNTIME_HINT_MESSAGE_LAYOUT_STATIC_ONLY = 0x01000000;
 export const RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY = 0x02000000;
 export const RUNTIME_HINT_MESSAGE_LAYOUT_MIXED = 0x03000000;
 export const RUNTIME_HINT_MESSAGE_LAYOUT_MASK = 0x03000000;
-export const RUNTIME_HINT_RESERVED_MASK = 0xfc000000;
+export const RUNTIME_HINT_MESSAGE_PHYSICAL_PACKED = 0x04000000;
+export const RUNTIME_HINT_MESSAGE_PHYSICAL_SPECIALIZED = 0x08000000;
+export const RUNTIME_HINT_MESSAGE_PHYSICAL_MASK = 0x0c000000;
+export const RUNTIME_HINT_RESERVED_MASK = 0xf0000000;
 
 export const RUNTIME_HINT_FULL_CAPABILITIES = RUNTIME_HINT_CAPABILITIES_MASK;
 export type MessageLayoutFamily = 'static-only' | 'mixed' | 'dynamic-only';
+export type MessagePhysicalLayout = 'current' | 'specialized' | 'packed';
 
 export interface DecodedRuntimeHint {
   readonly analyzed: boolean;
   readonly initialCapacity: number | undefined;
   readonly capabilities: number;
   readonly messageLayoutFamily: MessageLayoutFamily;
+  readonly messagePhysicalLayout: MessagePhysicalLayout;
 }
 
 export function isRuntimeHintAnalyzed(runtimeHint: number): boolean {
@@ -60,6 +65,18 @@ export function runtimeHintMessageLayoutFamily(runtimeHint: number): MessageLayo
   }
 }
 
+export function runtimeHintMessagePhysicalLayout(runtimeHint: number): MessagePhysicalLayout {
+  if (!isRuntimeHintAnalyzed(runtimeHint)) return 'current';
+  switch (runtimeHint & RUNTIME_HINT_MESSAGE_PHYSICAL_MASK) {
+    case RUNTIME_HINT_MESSAGE_PHYSICAL_PACKED:
+      return 'packed';
+    case RUNTIME_HINT_MESSAGE_PHYSICAL_SPECIALIZED:
+      return 'specialized';
+    default:
+      return 'current';
+  }
+}
+
 export function decodeRuntimeHint(runtimeHint: number): DecodedRuntimeHint {
   if (!isRuntimeHintAnalyzed(runtimeHint)) {
     return {
@@ -67,6 +84,7 @@ export function decodeRuntimeHint(runtimeHint: number): DecodedRuntimeHint {
       initialCapacity: undefined,
       capabilities: RUNTIME_HINT_FULL_CAPABILITIES,
       messageLayoutFamily: 'mixed',
+      messagePhysicalLayout: 'current',
     };
   }
 
@@ -75,5 +93,6 @@ export function decodeRuntimeHint(runtimeHint: number): DecodedRuntimeHint {
     initialCapacity: runtimeHintInitialCapacity(runtimeHint),
     capabilities: runtimeHint & RUNTIME_HINT_CAPABILITIES_MASK,
     messageLayoutFamily: runtimeHintMessageLayoutFamily(runtimeHint),
+    messagePhysicalLayout: runtimeHintMessagePhysicalLayout(runtimeHint),
   };
 }

@@ -35,7 +35,9 @@ import {
 import { getSchemaType } from '../schema/typeGuards.js';
 import type { InferSchema, LogSchema } from '../schema/types.js';
 
-import type { MessageLayoutFamily } from '../runtimeHint.js';
+import type { MessageLayoutFamily, MessagePhysicalLayout } from '../runtimeHint.js';
+import { decodeVocabularyMessage } from '../resolveMessage.js';
+import type { VocabularyGeneration } from '../vocabularyRegistry.js';
 import type { AnySpanBuffer } from '../types.js';
 
 // =============================================================================
@@ -51,6 +53,7 @@ import type { AnySpanBuffer } from '../types.js';
 export const SPAN_LOGGER_HELPERS: {
   normalizeOperationalTemplate: (template: string) => string;
   setNullBit: (bitmap: Uint8Array, idx: number) => void;
+  decodeVocabularyMessage: (generation: VocabularyGeneration, denseIndex: number) => string;
   fillNullBitmapRange: (bitmap: Uint8Array, startIdx: number, endIdx: number) => void;
   fillBooleanBitmapRange: (bitmap: Uint8Array, startIdx: number, endIdx: number, value: boolean) => void;
 } = {
@@ -58,6 +61,7 @@ export const SPAN_LOGGER_HELPERS: {
     if (template.indexOf('{{') === -1 && template.indexOf('}}') === -1) return template;
     return template.replaceAll('{{', '{').replaceAll('}}', '}');
   },
+  decodeVocabularyMessage,
   setNullBit: (bitmap: Uint8Array, idx: number) => {
     bitmap[idx >>> 3] |= 1 << (idx & 7);
   },
@@ -390,6 +394,7 @@ function generatePrefillScopedAttributesMethod(
 function buildSpanLoggerExtension(
   schema: LogSchema,
   messageLayoutFamily: MessageLayoutFamily,
+  messagePhysicalLayout: MessagePhysicalLayout,
   eagerColumns: readonly string[],
   enumLookup: SchemaEnumLookupDescriptor,
 ): ColumnWriterExtension {
@@ -406,6 +411,24 @@ function buildSpanLoggerExtension(
   const setScopeMethod = generateSetScopeMethod();
   const prefillMethod = generatePrefillScopedAttributesMethod(schemaFields, enumEncoderNames);
   const enumFluentSetters = generateEnumFluentSetters(enumLookup.ordered, enumEncoderNames);
+  const staticMessageWrite = (entryType: number): string => {
+    switch (messagePhysicalLayout) {
+      case 'current':
+        return `const localMessageId = this._state._physicalLayoutPlan.encodeLocalMessage(vocabularyIndex);
+      if (localMessageId === 0) {
+        this._buffer.message_values[idx] = helpers.decodeVocabularyMessage(this._buffer._vocabularyGeneration, vocabularyIndex);
+      } else {
+        this._buffer._messageIds[idx] = localMessageId;
+      }
+      helpers.setNullBit(this._buffer.message_nulls, idx);`;
+      case 'specialized':
+        return `this._buffer._logHeaders[idx] = vocabularyIndex;
+      helpers.setNullBit(this._buffer.message_nulls, idx);`;
+      case 'packed':
+        return `if (vocabularyIndex > 0x00fffffe) throw new RangeError('Packed message dense index exceeds 0xFFFFFE');
+      this._buffer._rowHeaders[idx] = ((((vocabularyIndex + 1) << 8) | ${entryType}) >>> 0);`;
+    }
+  };
 
   return {
     preallocatedColumns: eagerColumns,
@@ -429,7 +452,7 @@ ${enumEncoderBindings.join('\n')}
       // Context-owned append advances the shared active buffer and returns the literal row.
       `info(message, fields) {
       const idx = this._state._appendWriterEntry(ENTRY_TYPE_INFO);
-      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = helpers.normalizeOperationalTemplate(message);`}
+      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = helpers.normalizeOperationalTemplate(message);${messagePhysicalLayout === 'packed' ? '' : '\n      helpers.setNullBit(this._buffer.message_nulls, idx);'}`}
       if (fields !== undefined) {
         this.with(fields);
       }
@@ -438,7 +461,7 @@ ${enumEncoderBindings.join('\n')}
 
     _infoTemplate(vocabularyIndex) {
       const idx = this._state._appendWriterEntry(ENTRY_TYPE_INFO);
-      ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : `this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_INFO) >>> 0;`}
+      ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : staticMessageWrite(ENTRY_TYPE_INFO)}
       return this;
     }
 
@@ -446,13 +469,13 @@ ${enumEncoderBindings.join('\n')}
       // Write a debug log entry.
       `debug(message) {
       const idx = this._state._appendWriterEntry(ENTRY_TYPE_DEBUG);
-      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = message;`}
+      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = message;${messagePhysicalLayout === 'packed' ? '' : '\n      helpers.setNullBit(this._buffer.message_nulls, idx);'}`}
       return this;
     }
 
     _debugTemplate(vocabularyIndex) {
       const idx = this._state._appendWriterEntry(ENTRY_TYPE_DEBUG);
-      ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : `this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_DEBUG) >>> 0;`}
+      ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : staticMessageWrite(ENTRY_TYPE_DEBUG)}
       return this;
     }
 
@@ -460,7 +483,7 @@ ${enumEncoderBindings.join('\n')}
       // Write a warn log entry.
       `warn(message, fields) {
       const idx = this._state._appendWriterEntry(ENTRY_TYPE_WARN);
-      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = helpers.normalizeOperationalTemplate(message);`}
+      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = helpers.normalizeOperationalTemplate(message);${messagePhysicalLayout === 'packed' ? '' : '\n      helpers.setNullBit(this._buffer.message_nulls, idx);'}`}
       if (fields !== undefined) {
         this.with(fields);
       }
@@ -469,7 +492,7 @@ ${enumEncoderBindings.join('\n')}
 
     _warnTemplate(vocabularyIndex) {
       const idx = this._state._appendWriterEntry(ENTRY_TYPE_WARN);
-      ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : `this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_WARN) >>> 0;`}
+      ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : staticMessageWrite(ENTRY_TYPE_WARN)}
       return this;
     }
 
@@ -477,7 +500,7 @@ ${enumEncoderBindings.join('\n')}
       // Write an error log entry.
       `error(message, fields) {
       const idx = this._state._appendWriterEntry(ENTRY_TYPE_ERROR);
-      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = helpers.normalizeOperationalTemplate(message);`}
+      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = helpers.normalizeOperationalTemplate(message);${messagePhysicalLayout === 'packed' ? '' : '\n      helpers.setNullBit(this._buffer.message_nulls, idx);'}`}
       if (fields !== undefined) {
         this.with(fields);
       }
@@ -486,7 +509,7 @@ ${enumEncoderBindings.join('\n')}
 
     _errorTemplate(vocabularyIndex) {
       const idx = this._state._appendWriterEntry(ENTRY_TYPE_ERROR);
-      ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : `this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_ERROR) >>> 0;`}
+      ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : staticMessageWrite(ENTRY_TYPE_ERROR)}
       return this;
     }
 
@@ -494,13 +517,13 @@ ${enumEncoderBindings.join('\n')}
       // Write a trace log entry.
       `trace(message) {
       const idx = this._state._appendWriterEntry(ENTRY_TYPE_TRACE);
-      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = message;`}
+      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Dynamic log write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = message;${messagePhysicalLayout === 'packed' ? '' : '\n      helpers.setNullBit(this._buffer.message_nulls, idx);'}`}
       return this;
     }
 
     _traceTemplate(vocabularyIndex) {
       const idx = this._state._appendWriterEntry(ENTRY_TYPE_TRACE);
-      ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : `this._buffer._logHeaders[idx] = ((vocabularyIndex << 8) | ENTRY_TYPE_TRACE) >>> 0;`}
+      ${messageLayoutFamily === 'dynamic-only' ? `throw new TypeError('Static log write reached a dynamic-only callsite plan');` : staticMessageWrite(ENTRY_TYPE_TRACE)}
       return this;
     }
 
@@ -525,7 +548,7 @@ ${enumEncoderBindings.join('\n')}
       // Called by FeatureFlagEvaluator to log flag access.
       `ffAccess(flagName, value) {
       const idx = this._state._appendWriterEntry(ENTRY_TYPE_FF_ACCESS);
-      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Feature flag write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = flagName;`}
+      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Feature flag write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = flagName;${messagePhysicalLayout === 'packed' ? '' : '\n      helpers.setNullBit(this._buffer.message_nulls, idx);'}`}
       if (this._buffer.ff_value_values) {
         const strValue = value === null || value === undefined ? 'null' : String(value);
         this._buffer.ff_value_values[idx] = strValue;
@@ -540,7 +563,7 @@ ${enumEncoderBindings.join('\n')}
       // Called by FeatureFlagEvaluator to log flag usage.
       `ffUsage(flagName, context) {
       const idx = this._state._appendWriterEntry(ENTRY_TYPE_FF_USAGE);
-      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Feature flag write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = flagName;`}
+      ${messageLayoutFamily === 'static-only' ? `throw new TypeError('Feature flag write reached a static-only callsite plan');` : `this._buffer.message_values[idx] = flagName;${messagePhysicalLayout === 'packed' ? '' : '\n      helpers.setNullBit(this._buffer.message_nulls, idx);'}`}
       if (context) {
         this.with(context);
       }
@@ -664,15 +687,22 @@ function generateStateBoundSpanLoggerClass(
 export function createSpanLoggerClass<T extends LogSchema>(
   schema: T,
   messageLayoutFamily: MessageLayoutFamily = 'mixed',
+  messagePhysicalLayout: MessagePhysicalLayout = 'current',
   eagerColumns: readonly string[] = [],
   enumLookup: SchemaEnumLookupDescriptor = resolveEnumLookupDescriptor(schema),
 ): SpanLoggerConstructor<T> {
-  const cacheKey = `${messageLayoutFamily}:${eagerColumns.join('\u0000')}`;
+  const cacheKey = `${messageLayoutFamily}:${messagePhysicalLayout}:${eagerColumns.join('\u0000')}`;
   let familyClasses = spanLoggerClassCache.get(schema);
   let SpanLoggerClass = familyClasses?.get(cacheKey);
 
   if (!SpanLoggerClass) {
-    const extension = buildSpanLoggerExtension(schema, messageLayoutFamily, eagerColumns, enumLookup);
+    const extension = buildSpanLoggerExtension(
+      schema,
+      messageLayoutFamily,
+      messagePhysicalLayout,
+      eagerColumns,
+      enumLookup,
+    );
     const classCode = generateStateBoundSpanLoggerClass(schema, extension).trim();
     SpanLoggerClass = new Function('helpers', 'enumLookup', classCode)(SPAN_LOGGER_HELPERS, enumLookup);
 

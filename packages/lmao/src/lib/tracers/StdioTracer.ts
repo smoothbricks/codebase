@@ -32,7 +32,7 @@
  */
 
 import type { OpContextBinding } from '../opContext/types.js';
-import { resolveMessage } from '../resolveMessage.js';
+import { resolveEntryType, resolveMessage } from '../resolveMessage.js';
 import {
   ENTRY_TYPE_DEBUG,
   ENTRY_TYPE_ERROR,
@@ -155,21 +155,22 @@ function getLogLevel(entryType: number): string | null {
 }
 
 function formatTemplateMessage(buffer: AnySpanBuffer, row: number, template: string): string {
-  return template.replace(/\{\{([A-Za-z0-9_]+)\}\}/g, (_full, key: string) => {
+  return template.replace(/\{([A-Za-z0-9_]+)\}/g, (_full, key: string) => {
+    const placeholder = `{${key}}`;
     const values = Reflect.get(buffer, `${key}_values`) as unknown;
-    if (values == null) return `{{${key}}}`;
+    if (values == null) return placeholder;
 
     if (Array.isArray(values)) {
       const value = values[row];
-      return value === null || value === undefined ? `{{${key}}}` : String(value);
+      return value === null || value === undefined ? placeholder : String(value);
     }
 
     if (ArrayBuffer.isView(values)) {
       const value = Reflect.get(values, row) as unknown;
-      return value === null || value === undefined ? `{{${key}}}` : String(value);
+      return value === null || value === undefined ? placeholder : String(value);
     }
 
-    return `{{${key}}}`;
+    return placeholder;
   });
 }
 
@@ -269,7 +270,7 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
       const end = current._writeIndex;
 
       for (let i = start; i < end; i++) {
-        const level = getLogLevel(current.entry_type[i]);
+        const level = getLogLevel(resolveEntryType(current, i));
         if (!level) continue;
 
         const template = resolveMessage(current, i) ?? '';
@@ -314,7 +315,7 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
     const startTs = rootBuffer.timestamp[0];
     const endTs = rootBuffer.timestamp[1];
     const duration = formatDuration(endTs - startTs);
-    const entryType = rootBuffer.entry_type[1];
+    const entryType = resolveEntryType(rootBuffer, 1);
     const status = getStatus(entryType);
     const ts = formatTimestamp(endTs);
 
@@ -348,7 +349,7 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
     const startTs = childBuffer.timestamp[0];
     const endTs = childBuffer.timestamp[1];
     const duration = formatDuration(endTs - startTs);
-    const entryType = childBuffer.entry_type[1];
+    const entryType = resolveEntryType(childBuffer, 1);
     const status = getStatus(entryType);
     const ts = formatTimestamp(endTs);
 

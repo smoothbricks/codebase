@@ -12,6 +12,7 @@
 
 import { describe, expect, it } from 'bun:test';
 import { createTestLogger } from '../../__tests__/test-helpers.js';
+import { resolveEntryType } from '../../resolveMessage.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import {
@@ -103,7 +104,7 @@ describe('createSpanLoggerClass', () => {
       const { buffer, logger } = createTestLogger(schema);
 
       logger.info('Test message');
-      expect(buffer.entry_type[2]).toBe(ENTRY_TYPE_INFO);
+      expect(resolveEntryType(buffer, 2)).toBe(ENTRY_TYPE_INFO);
     });
 
     it('should write entry type for debug()', () => {
@@ -111,7 +112,7 @@ describe('createSpanLoggerClass', () => {
       const { buffer, logger } = createTestLogger(schema);
 
       logger.debug('Debug message');
-      expect(buffer.entry_type[2]).toBe(ENTRY_TYPE_DEBUG);
+      expect(resolveEntryType(buffer, 2)).toBe(ENTRY_TYPE_DEBUG);
     });
 
     it('should write entry type for warn()', () => {
@@ -119,7 +120,7 @@ describe('createSpanLoggerClass', () => {
       const { buffer, logger } = createTestLogger(schema);
 
       logger.warn('Warning message');
-      expect(buffer.entry_type[2]).toBe(ENTRY_TYPE_WARN);
+      expect(resolveEntryType(buffer, 2)).toBe(ENTRY_TYPE_WARN);
     });
 
     it('should write entry type for error()', () => {
@@ -127,7 +128,7 @@ describe('createSpanLoggerClass', () => {
       const { buffer, logger } = createTestLogger(schema);
 
       logger.error('Error message');
-      expect(buffer.entry_type[2]).toBe(ENTRY_TYPE_ERROR);
+      expect(resolveEntryType(buffer, 2)).toBe(ENTRY_TYPE_ERROR);
     });
 
     it('should write entry type for trace()', () => {
@@ -135,7 +136,7 @@ describe('createSpanLoggerClass', () => {
       const { buffer, logger } = createTestLogger(schema);
 
       logger.trace('Trace message');
-      expect(buffer.entry_type[2]).toBe(ENTRY_TYPE_TRACE);
+      expect(resolveEntryType(buffer, 2)).toBe(ENTRY_TYPE_TRACE);
     });
 
     it('should write timestamp for log entries', () => {
@@ -166,9 +167,9 @@ describe('createSpanLoggerClass', () => {
       logger.info('First').info('Second').warn('Third');
 
       expect(buffer._writeIndex - 1).toBe(4);
-      expect(buffer.entry_type[2]).toBe(ENTRY_TYPE_INFO);
-      expect(buffer.entry_type[3]).toBe(ENTRY_TYPE_INFO);
-      expect(buffer.entry_type[4]).toBe(ENTRY_TYPE_WARN);
+      expect(resolveEntryType(buffer, 2)).toBe(ENTRY_TYPE_INFO);
+      expect(resolveEntryType(buffer, 3)).toBe(ENTRY_TYPE_INFO);
+      expect(resolveEntryType(buffer, 4)).toBe(ENTRY_TYPE_WARN);
     });
   });
 
