@@ -21,6 +21,7 @@ import {
   createOverflowBuffer as createOverflowBufferImpl,
   createSpanBuffer as createSpanBufferImpl,
   getSpanBufferClass,
+  resolveSpanBufferCapacity,
   type SpanBufferConstructor,
 } from './spanBuffer.js';
 import type { ITraceRoot } from './traceRoot.js';
@@ -87,8 +88,21 @@ export class JsBufferStrategy<T extends LogSchema = LogSchema> implements Buffer
     schema?: T,
     plannedClass?: SpanBufferConstructor<T>,
   ): SpanBuffer<T> {
-    const SpanBufferClass = plannedClass ?? this.getSpanBufferClassForSchema(schema ?? parentBuffer._logSchema);
-    return createChildSpanBufferImpl(parentBuffer, SpanBufferClass, callsiteMetadata, opMetadata, capacity);
+    const targetSchema = schema ?? parentBuffer._logSchema;
+    const metadataSpanBufferClass = opMetadata._physicalLayoutPlan?.SpanBufferClass;
+    if (
+      metadataSpanBufferClass !== undefined &&
+      !isSpanBufferConstructorForSchema(metadataSpanBufferClass, targetSchema)
+    ) {
+      throw new TypeError('Planned SpanBuffer class does not match schema');
+    }
+    const plannedSpanBufferClass = plannedClass ?? metadataSpanBufferClass;
+    const SpanBufferClass = plannedSpanBufferClass ?? this.getSpanBufferClassForSchema(targetSchema);
+    const actualCapacity =
+      plannedSpanBufferClass === undefined
+        ? resolveSpanBufferCapacity(capacity, SpanBufferClass.stats.capacity)
+        : capacity;
+    return createChildSpanBufferImpl(parentBuffer, SpanBufferClass, callsiteMetadata, opMetadata, actualCapacity);
   }
 
   createOverflowBuffer(buffer: SpanBuffer<T>): SpanBuffer<T> {
