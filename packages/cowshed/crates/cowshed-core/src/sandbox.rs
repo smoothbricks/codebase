@@ -335,7 +335,10 @@ mod tests {
 
     #[test]
     fn sandbox_errors_report_the_rejected_values() {
-        let invalid_port = SandboxError::InvalidPortBlock { base: 65_520, size: 8 };
+        let invalid_port = SandboxError::InvalidPortBlock {
+            base: 65_520,
+            size: 8,
+        };
         assert_eq!(
             invalid_port.to_string(),
             "invalid macOS port block at 65520 with size 8; exactly 16 ports are required"
