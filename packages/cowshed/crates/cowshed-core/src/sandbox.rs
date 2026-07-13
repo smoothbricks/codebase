@@ -75,7 +75,11 @@ impl fmt::Display for SandboxError {
                 "invalid macOS port block at {base} with size {size}; exactly 16 ports are required"
             ),
             Self::InvalidPath { path, reason } => {
-                write!(formatter, "invalid sandbox path {}: {reason}", path.display())
+                write!(
+                    formatter,
+                    "invalid sandbox path {}: {reason}",
+                    path.display()
+                )
             }
             Self::GrantIntersectsDeny { grant, deny } => write!(
                 formatter,
@@ -105,10 +109,7 @@ pub fn seatbelt_profile(config: &SandboxConfig) -> Result<String, SandboxError> 
     let sockets = normalized_paths(&config.allowed_unix_sockets)?;
 
     for grant in read_grants.iter().chain(write_grants.iter()) {
-        if let Some(deny) = hard_denies
-            .iter()
-            .find(|deny| paths_intersect(grant, deny))
-        {
+        if let Some(deny) = hard_denies.iter().find(|deny| paths_intersect(grant, deny)) {
             return Err(SandboxError::GrantIntersectsDeny {
                 grant: grant.clone(),
                 deny: deny.clone(),
@@ -151,9 +152,7 @@ pub fn seatbelt_profile(config: &SandboxConfig) -> Result<String, SandboxError> 
     for port in config.port_block.ports() {
         push_line(
             &mut profile,
-            &format!(
-                "(allow network-outbound (remote tcp \"localhost:{port}\"))"
-            ),
+            &format!("(allow network-outbound (remote tcp \"localhost:{port}\"))"),
         );
     }
 
@@ -191,17 +190,9 @@ pub fn seatbelt_profile(config: &SandboxConfig) -> Result<String, SandboxError> 
             &caches.join(suffix),
         )?;
     }
-    push_subpath_rule(
-        &mut profile,
-        "allow file-read*",
-        &config.workspace_mount,
-    )?;
+    push_subpath_rule(&mut profile, "allow file-read*", &config.workspace_mount)?;
     if config.mode == RunSandboxMode::ReadWrite {
-        push_subpath_rule(
-            &mut profile,
-            "allow file-write*",
-            &config.workspace_mount,
-        )?;
+        push_subpath_rule(&mut profile, "allow file-write*", &config.workspace_mount)?;
     }
 
     // SBPL is last-match-wins: immutable secrets and policy denies terminate the profile.
@@ -318,7 +309,9 @@ mod tests {
     fn config(mode: RunSandboxMode) -> SandboxConfig {
         SandboxConfig {
             home: PathBuf::from("/Users/tester"),
-            workspace_mount: PathBuf::from("/Users/tester/.cowshed/acme/widget/workspaces/raven/mount"),
+            workspace_mount: PathBuf::from(
+                "/Users/tester/.cowshed/acme/widget/workspaces/raven/mount",
+            ),
             exec_temp_dir: PathBuf::from("/private/tmp/cowshed-raven"),
             port_block: PortBlock::new(40_960, 16).unwrap(),
             mode,
@@ -403,5 +396,4 @@ mod tests {
             .unwrap();
         assert!(status.success());
     }
-
 }
