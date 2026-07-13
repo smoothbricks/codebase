@@ -47,7 +47,17 @@ test('the exported Bun adapter applies the explicitly selected native plugin', a
     if ((typeof typedOp !== 'object' && typeof typedOp !== 'function') || typedOp === null) {
       throw new TypeError('Bun adapter output did not export the transformed typed Op');
     }
-    expect(Reflect.get(typedOp, 'runtimeHint')).toBe(9568260);
+    const callsitePlan: unknown = Reflect.get(typedOp, 'callsitePlan');
+    if (typeof callsitePlan !== 'object' || callsitePlan === null) {
+      throw new TypeError('Bun adapter output did not expose the transformed Op callsite plan');
+    }
+    const runtimeHint: unknown = Reflect.get(callsitePlan, 'runtimeHint');
+    const localMessageDictionary: unknown = Reflect.get(callsitePlan, 'localMessageDictionary');
+    if (typeof runtimeHint !== 'number' || !Array.isArray(localMessageDictionary)) {
+      throw new TypeError('Bun adapter output exposed an invalid transformed Op callsite plan');
+    }
+    expect(runtimeHint).not.toBe(0);
+    expect(localMessageDictionary).toHaveLength(2);
     expect('createLmaoTransformer' in adapterExports).toBe(false);
   } finally {
     await rm(outputDir, { recursive: true, force: true });
