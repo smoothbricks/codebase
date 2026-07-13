@@ -73,7 +73,7 @@ fn plan(kind: TransactionKind, suffix: &str) -> CheckedLifecyclePlan {
 
 fn initial(kind: TransactionKind) -> RecoveryModel {
     match RecoveryModel::begin(plan(kind, "fixture"), observations(kind)) {
-        BeginOutcome::Started(model) => model,
+        BeginOutcome::Started(model) => *model,
         BeginOutcome::Conflict(conflict) => panic!("fresh plan conflicted: {conflict:?}"),
     }
 }
@@ -83,7 +83,7 @@ fn interrupted(kind: TransactionKind, phase: TransactionPhase) -> RecoveryModel 
         .interrupt(plan(kind, "failpoint"), observations(kind))
         .unwrap()
     {
-        ExecutionOutcome::Interrupted(model) => model,
+        ExecutionOutcome::Interrupted(model) => *model,
         ExecutionOutcome::Conflict(conflict) => panic!("fresh plan conflicted: {conflict:?}"),
     }
 }
@@ -398,7 +398,7 @@ fn restore_retains_displaced_generation_as_undo_with_original_metadata() {
         CheckedLifecyclePlan::new(spec(TransactionKind::Restore, "undo"), expected).unwrap(),
         observed.clone(),
     ) {
-        BeginOutcome::Started(model) => model,
+        BeginOutcome::Started(model) => *model,
         BeginOutcome::Conflict(conflict) => {
             panic!("retention-only change conflicted: {conflict:?}")
         }
@@ -644,7 +644,7 @@ proptest! {
         let kind = ALL_KINDS[usize::from(kind_index)];
         let observed = observations(kind);
         let mut interrupted = match RecoveryModel::begin(plan(kind, &suffix), observed) {
-            BeginOutcome::Started(model) => model,
+            BeginOutcome::Started(model) => *model,
             BeginOutcome::Conflict(conflict) => panic!("fresh generated plan conflicted: {conflict:?}"),
         };
         for _ in 0..crash_steps {

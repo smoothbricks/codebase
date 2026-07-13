@@ -303,10 +303,9 @@ impl CheckedLifecyclePlan {
         if let (Some(current), Some(next)) = (
             expected.incarnation.as_ref(),
             spec.next_incarnation.as_ref(),
-        ) {
-            if current == next {
-                return Err(RecoveryError::ReusedIncarnation);
-            }
+        ) && current == next
+        {
+            return Err(RecoveryError::ReusedIncarnation);
         }
         Ok(Self { spec, expected })
     }
@@ -352,13 +351,13 @@ impl RecoveryConflict {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BeginOutcome {
-    Started(RecoveryModel),
+    Started(Box<RecoveryModel>),
     Conflict(RecoveryConflict),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutionOutcome {
-    Interrupted(RecoveryModel),
+    Interrupted(Box<RecoveryModel>),
     Conflict(RecoveryConflict),
 }
 
@@ -450,12 +449,12 @@ impl Failpoint {
     ) -> Result<ExecutionOutcome, RecoveryError> {
         let kind = plan.spec.kind;
         let mut model = match RecoveryModel::begin(plan, observed) {
-            BeginOutcome::Started(model) => model,
+            BeginOutcome::Started(model) => *model,
             BeginOutcome::Conflict(conflict) => return Ok(ExecutionOutcome::Conflict(conflict)),
         };
         loop {
             if model.phase == self.after {
-                return Ok(ExecutionOutcome::Interrupted(model));
+                return Ok(ExecutionOutcome::Interrupted(Box::new(model)));
             }
             if matches!(
                 model.phase,
@@ -507,7 +506,7 @@ impl RecoveryModel {
             MetadataGeneration::Absent
         };
         let old_authority = authoritative.incarnation.as_ref().map(|_| Generation::Old);
-        BeginOutcome::Started(Self {
+        BeginOutcome::Started(Box::new(Self {
             plan,
             authoritative,
             phase: TransactionPhase::Prepare,
@@ -521,7 +520,7 @@ impl RecoveryModel {
             cleanup_present: false,
             retained_checkpoint: None,
             events: Vec::new(),
-        })
+        }))
     }
 
     pub fn spec(&self) -> &TransactionSpec {
