@@ -84,25 +84,14 @@ if (!root) throw new Error('Specialized message parity fixture produced no root'
 if (root._messageLayoutFamily !== 'mixed' || root.message_values === undefined) {
   throw new Error('Specialized parity requires mixed-family raw message storage');
 }
-const encodedMessageIdentities: [number, number] = (() => {
-  if (root._messagePhysicalLayout === 'current') {
-    const messageIds = root._messageIds;
-    if (messageIds === undefined) throw new Error('Current parity buffer omitted local message IDs');
-    return [messageIds[2], messageIds[33]];
-  }
-  if (root._messagePhysicalLayout === 'specialized') {
-    const logHeaders = root._logHeaders;
-    if (logHeaders === undefined) throw new Error('Specialized parity buffer omitted dense message identities');
-    return [logHeaders[2], logHeaders[33]];
-  }
-  throw new Error(`Unexpected parity physical layout ${root._messagePhysicalLayout}`);
-})();
+const plan = specializedParityOp.callsitePlan;
+const messageIdentityStorage = plan.arrowExposure.messageIdentityStorage;
 const rawMessageSentinels = [root.message_values[2] ?? null, root.message_values[33] ?? null];
 const logFacts = extractFacts(root).byNamespace('log');
 const segments = [{
   capacity: root._capacity,
   writeIndex: root._writeIndex,
-  physicalLayout: Reflect.get(root, '_messagePhysicalLayout'),
+  physicalLayout: plan.messagePhysicalLayout,
 }];
 const checksum = createHash('sha256').update(JSON.stringify(logFacts)).digest('hex');
 process.stdout.write(
@@ -112,15 +101,14 @@ process.stdout.write(
     logFacts,
     checksum,
     segments,
-    physicalLayout: Reflect.get(root, '_messagePhysicalLayout'),
+    physicalLayout: plan.messagePhysicalLayout,
+    messageIdentityStorage,
     hasRowHeaders: '_rowHeaders' in root,
     hasEntryType: 'entry_type' in root,
     hasLogHeaders: '_logHeaders' in root,
     hasMessageIds: '_messageIds' in root,
     hasMessageValidity: 'message_nulls' in root,
     hasRawMessages: 'message_values' in root,
-    encodedMessageIdentities,
     rawMessageSentinels,
-    localMessageDictionaryLength: specializedParityOp.callsitePlan.localMessageDictionary.length,
   })}\n`,
 );
