@@ -15,10 +15,12 @@
 
 import type { PreEncodedEntry } from '@smoothbricks/arrow-builder';
 import type { RemapDescriptor } from './logBinding.js';
+import { getPhysicalLayoutPlan } from './physicalLayoutPlan.js';
 import type { SpanContext } from './opContext/spanContextTypes.js';
 import type { OpContext, OpContextBinding } from './opContext/types.js';
-import { getPhysicalLayoutPlan, type PhysicalLayoutPlan } from './physicalLayoutPlan.js';
 import type { Result } from './result.js';
+import { decodeRuntimeHint } from './runtimeHint.js';
+import { createSpanContextClass } from './spanContext.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
 
 // =============================================================================
@@ -64,8 +66,8 @@ export interface OpMetadata {
   readonly git_sha_entry: PreEncodedEntry;
   /** Op-local compile-time log templates; ID n resolves at index n - 1. */
   readonly logTemplateIds: readonly string[];
-  /** Startup-resolved physical layout used by span setup. */
-  readonly _physicalLayoutPlan?: PhysicalLayoutPlan;
+  /** Startup-resolved physical layout used by span setup; absent only on raw fallback metadata. */
+  readonly _physicalLayoutPlan?: object;
 }
 //#endregion smoo/lmao!n/opcontext-hierarchy
 
@@ -94,7 +96,7 @@ export interface OpMetadata {
  *
  * Phase 2 architecture:
  * - SpanBufferClass carries static schema + stats (shared by all ops from same defineOpContext)
- * - remapDescriptor is immutable cold-path metadata for prefixed/mapped ops
+ * - remapDescriptor is an immutable cold-path binding for prefixed/mapped ops
  * - No LogBinding - stats accessed via SpanBufferClass.stats
  *
  * @typeParam Ctx - OpContext with deps, ff, env (contravariant position)
@@ -104,11 +106,11 @@ export interface OpMetadata {
  */
 export class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
   readonly metadata: OpMetadata;
-  readonly physicalLayoutPlan: PhysicalLayoutPlan<Ctx['logSchema']>;
-  readonly SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>;
+  readonly physicalLayoutPlan: object;
   readonly fn: (ctx: SpanContext<Ctx>, ...args: Args) => Result<S, E> | Promise<Result<S, E>>;
-  readonly remapDescriptor?: RemapDescriptor;
-  readonly _opContextBinding?: OpContextBinding;
+  readonly _opContextBinding?: OpContextBinding<Ctx['logSchema'], Ctx['flags'], Ctx['deps'], Ctx['userCtx']>;
+  readonly SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>;
+  readonly remapDescriptor: RemapDescriptor | undefined;
   readonly runtimeHint: number;
 
   constructor(
@@ -116,17 +118,36 @@ export class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
     SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
     fn: (ctx: SpanContext<Ctx>, ...args: Args) => Result<S, E> | Promise<Result<S, E>>,
     remapDescriptor?: RemapDescriptor,
-    opContextBinding?: OpContextBinding,
+    opContextBinding?: OpContextBinding<Ctx['logSchema'], Ctx['flags'], Ctx['deps'], Ctx['userCtx']>,
     runtimeHint = 0,
   ) {
-    const physicalLayoutPlan = getPhysicalLayoutPlan(SpanBufferClass, runtimeHint, remapDescriptor);
+    const userContextKeys = Object.keys(opContextBinding?.ctxDefaults ?? {}).sort();
+    const layoutKey = userContextKeys.join('\u0000');
+    const capabilities = decodeRuntimeHint(runtimeHint).capabilities;
+    const SpanContextClass = createSpanContextClass<Ctx>(
+      SpanBufferClass.schema,
+      opContextBinding?.logBinding ?? { logSchema: SpanBufferClass.schema },
+      capabilities,
+      userContextKeys,
+    );
+    const physicalLayoutPlan = getPhysicalLayoutPlan<Ctx['logSchema'], Ctx>(
+      SpanBufferClass,
+      runtimeHint,
+      SpanContextClass,
+      remapDescriptor,
+      'strategy-selected',
+      layoutKey,
+    );
     this.physicalLayoutPlan = physicalLayoutPlan;
     this.metadata = Object.freeze({ ...metadata, _physicalLayoutPlan: physicalLayoutPlan });
-    this.SpanBufferClass = physicalLayoutPlan.SpanBufferClass;
     this.fn = fn;
-    this.remapDescriptor = remapDescriptor;
     this._opContextBinding = opContextBinding;
+    this.SpanBufferClass = physicalLayoutPlan.SpanBufferClass;
+    this.remapDescriptor = physicalLayoutPlan.remapDescriptor ?? undefined;
     this.runtimeHint = physicalLayoutPlan.runtimeHint;
   }
+
+
+
 }
 //#endregion smoo/lmao!n/op-class
