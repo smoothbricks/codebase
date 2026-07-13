@@ -166,18 +166,29 @@ fn is_rfc3339_utc(value: &str) -> bool {
         2 => 28,
         _ => return false,
     };
-    let time_end = if bytes.last() == Some(&b'Z') {
-        bytes.len() - 1
+    let (time_end, offset_seconds) = if bytes.last() == Some(&b'Z') {
+        (bytes.len() - 1, 0_i64)
     } else if bytes.len() >= 25 {
         let sign = bytes.len() - 6;
-        let valid_offset = matches!(bytes[sign], b'+' | b'-')
-            && bytes[sign + 3] == b':'
-            && digits(sign + 1, sign + 3).is_some_and(|hour| hour <= 23)
-            && digits(sign + 4, sign + 6).is_some_and(|minute| minute <= 59);
-        if !valid_offset {
+        let (Some(offset_hour), Some(offset_minute)) =
+            (digits(sign + 1, sign + 3), digits(sign + 4, sign + 6))
+        else {
+            return false;
+        };
+        if !matches!(bytes[sign], b'+' | b'-')
+            || bytes[sign + 3] != b':'
+            || offset_hour > 23
+            || offset_minute > 59
+        {
             return false;
         }
-        sign
+        let magnitude = i64::from(offset_hour * 3600 + offset_minute * 60);
+        let offset = if bytes[sign] == b'+' {
+            magnitude
+        } else {
+            -magnitude
+        };
+        (sign, offset)
     } else {
         return false;
     };
@@ -188,16 +199,72 @@ fn is_rfc3339_utc(value: &str) -> bool {
         }
         _ => false,
     };
-    let leap_second_valid = second <= 59
+    let calendar_valid = (1..=max_day).contains(&day) && hour <= 23 && minute <= 59;
+    let second_valid = second <= 59
         || (second == 60
-            && hour == 23
-            && minute == 59
-            && matches!((month, day), (6, 30) | (12, 31)));
-    (1..=max_day).contains(&day)
-        && hour <= 23
-        && minute <= 59
-        && leap_second_valid
-        && fraction_valid
+            && calendar_valid
+            && is_published_leap_second(year, month, day, hour, minute, offset_seconds));
+    calendar_valid && second_valid && fraction_valid
+}
+
+fn days_from_civil(year: u32, month: u32, day: u32) -> i64 {
+    let mut year = i64::from(year);
+    let month = i64::from(month);
+    year -= i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn is_published_leap_second(
+    year: u32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    offset_seconds: i64,
+) -> bool {
+    const INSERTION_DATES: &[(u32, u32, u32)] = &[
+        (1972, 6, 30),
+        (1972, 12, 31),
+        (1973, 12, 31),
+        (1974, 12, 31),
+        (1975, 12, 31),
+        (1976, 12, 31),
+        (1977, 12, 31),
+        (1978, 12, 31),
+        (1979, 12, 31),
+        (1981, 6, 30),
+        (1982, 6, 30),
+        (1983, 6, 30),
+        (1985, 6, 30),
+        (1987, 12, 31),
+        (1989, 12, 31),
+        (1990, 12, 31),
+        (1992, 6, 30),
+        (1993, 6, 30),
+        (1994, 6, 30),
+        (1995, 12, 31),
+        (1997, 6, 30),
+        (1998, 12, 31),
+        (2005, 12, 31),
+        (2008, 12, 31),
+        (2012, 6, 30),
+        (2015, 6, 30),
+        (2016, 12, 31),
+    ];
+
+    let utc_after_leap = days_from_civil(year, month, day) * 86_400
+        + i64::from(hour) * 3_600
+        + i64::from(minute) * 60
+        + 60
+        - offset_seconds;
+    INSERTION_DATES.iter().any(|&(year, month, day)| {
+        utc_after_leap == (days_from_civil(year, month, day) + 1) * 86_400
+    })
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
