@@ -8,6 +8,7 @@ use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::WorkspaceName;
 use crate::repository::{ProjectPaths, RepoId, RepositoryBinding};
 use async_trait::async_trait;
+use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -20,6 +21,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::sync::{mpsc, oneshot};
+use url::Url;
 
 const HANDSHAKE_VERSION: u32 = 1;
 const MAX_HANDSHAKE_BYTES: usize = 4096;
@@ -29,8 +31,16 @@ const MAX_RPC_BYTES: usize = 16 * 1024 * 1024;
 #[async_trait]
 pub(crate) trait ControllerRuntime: Send + Sync {
     async fn call(&self, method: &'static str, params: Value) -> Result<Value>;
-
     async fn exec(&self, workspace: &WorkspaceName, request: ExecRequest) -> Result<JobId>;
+    async fn logs(
+        &self,
+        workspace: &WorkspaceName,
+        id: JobId,
+        stream: JobStream,
+        follow: bool,
+    ) -> Result<JobByteStream>;
+    async fn attach(&self, workspace: &WorkspaceName, id: JobId) -> Result<JobAttachment>;
+    fn kill(&self, workspace: &WorkspaceName, id: JobId) -> Result<()>;
 }
 
 #[cfg(unix)]
@@ -41,6 +51,7 @@ struct ActorMessage {
 }
 
 #[cfg(unix)]
+#[derive(Clone)]
 struct ActorRuntime {
     sender: mpsc::Sender<ActorMessage>,
 }
@@ -167,6 +178,110 @@ impl ControllerRuntime for ActorRuntime {
         }
         Ok(job_id)
     }
+
+    async fn logs(
+        &self,
+        workspace: &WorkspaceName,
+        id: JobId,
+        stream: JobStream,
+        follow: bool,
+    ) -> Result<JobByteStream> {
+        let (sender, receiver) = mpsc::channel(8);
+        let runtime = self.clone();
+        let workspace = workspace.clone();
+        tokio::spawn(async move {
+            let mut offset = 0_u64;
+            loop {
+                let value = runtime
+                    .call(
+                        "job.logs",
+                        json!({
+                            "workspace": workspace,
+                            "jobId": id,
+                            "stream": stream,
+                            "follow": follow,
+                            "offset": offset,
+                        }),
+                    )
+                    .await;
+                let chunk = match value.and_then(|value| {
+                    serde_json::from_value::<LogChunk>(value).map_err(|error| {
+                        CowshedError::internal(format!(
+                            "controller returned an invalid job.logs response: {error}"
+                        ))
+                    })
+                }) {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        break;
+                    }
+                };
+                if !chunk.bytes.is_empty() {
+                    offset = offset.saturating_add(chunk.bytes.len() as u64);
+                    if sender.send(Ok(Bytes::from(chunk.bytes))).await.is_err() {
+                        break;
+                    }
+                }
+                if chunk.eof && !follow {
+                    break;
+                }
+                if chunk.eof {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        });
+        Ok(JobByteStream { receiver })
+    }
+
+    async fn attach(&self, workspace: &WorkspaceName, id: JobId) -> Result<JobAttachment> {
+        let stdout = self.logs(workspace, id, JobStream::Stdout, true).await?;
+        let stderr = self.logs(workspace, id, JobStream::Stderr, true).await?;
+        let (stdin, mut writes) = mpsc::channel::<StdinWrite>(8);
+        let runtime = self.clone();
+        let attached_workspace = workspace.clone();
+        tokio::spawn(async move {
+            while let Some(write) = writes.recv().await {
+                let result = runtime
+                    .call(
+                        "job.attachWrite",
+                        json!({
+                            "workspace": attached_workspace,
+                            "jobId": id,
+                            "bytes": write.bytes.as_ref(),
+                        }),
+                    )
+                    .await
+                    .and_then(decode_empty);
+                let _ = write.reply.send(result);
+            }
+        });
+        Ok(JobAttachment {
+            workspace: workspace.clone(),
+            id,
+            stdin,
+            stdout,
+            stderr,
+            runtime: Arc::new(self.clone()),
+        })
+    }
+
+    fn kill(&self, workspace: &WorkspaceName, id: JobId) -> Result<()> {
+        let (reply, _response) = oneshot::channel();
+        self.sender
+            .try_send(ActorMessage {
+                method: "job.kill",
+                params: json!({ "workspace": workspace, "jobId": id }),
+                reply,
+            })
+            .map_err(|error| {
+                CowshedError::new(
+                    ErrorCode::EnvironmentMissing,
+                    format!("could not queue job kill: {error}"),
+                    "retry cowshed job kill",
+                )
+            })
+    }
 }
 
 async fn call_typed<T: DeserializeOwned>(
@@ -180,6 +295,116 @@ async fn call_typed<T: DeserializeOwned>(
             ErrorCode::Internal,
             format!("controller returned an invalid {method} response: {error}"),
             "cowshed doctor --json",
+        )
+    })
+}
+
+fn decode_empty(value: Value) -> Result<()> {
+    serde_json::from_value::<EmptyResult>(value)
+        .map(|_| ())
+        .map_err(|error| {
+            CowshedError::internal(format!(
+                "controller returned an invalid empty result: {error}"
+            ))
+        })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JobStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LogChunk {
+    bytes: Vec<u8>,
+    eof: bool,
+}
+
+pub struct JobByteStream {
+    receiver: mpsc::Receiver<Result<Bytes>>,
+}
+
+impl JobByteStream {
+    pub async fn next(&mut self) -> Option<Result<Bytes>> {
+        self.receiver.recv().await
+    }
+}
+
+struct StdinWrite {
+    bytes: Bytes,
+    reply: oneshot::Sender<Result<()>>,
+}
+
+pub struct JobAttachment {
+    workspace: WorkspaceName,
+    id: JobId,
+    stdin: mpsc::Sender<StdinWrite>,
+    stdout: JobByteStream,
+    stderr: JobByteStream,
+    runtime: Arc<dyn ControllerRuntime>,
+}
+
+impl JobAttachment {
+    pub fn stdout(&mut self) -> &mut JobByteStream {
+        &mut self.stdout
+    }
+
+    pub fn stderr(&mut self) -> &mut JobByteStream {
+        &mut self.stderr
+    }
+
+    pub async fn write(&self, bytes: Bytes) -> Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.stdin
+            .send(StdinWrite { bytes, reply })
+            .await
+            .map_err(|_| {
+                CowshedError::new(
+                    ErrorCode::EnvironmentMissing,
+                    "job attachment stdin channel closed",
+                    "reattach to the durable job",
+                )
+            })?;
+        response.await.map_err(|_| {
+            CowshedError::new(
+                ErrorCode::EnvironmentMissing,
+                "job attachment closed before stdin was acknowledged",
+                "reattach to the durable job",
+            )
+        })?
+    }
+
+    pub async fn detach(self) -> Result<()> {
+        let value = self
+            .runtime
+            .call(
+                "job.detach",
+                json!({ "workspace": self.workspace, "jobId": self.id }),
+            )
+            .await?;
+        decode_empty(value)
+    }
+}
+
+impl fmt::Debug for JobAttachment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JobAttachment")
+            .field("workspace", &self.workspace)
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+fn encode_value<T: Serialize>(kind: &'static str, value: &T) -> Result<Value> {
+    serde_json::to_value(value).map_err(|error| {
+        CowshedError::new(
+            ErrorCode::Usage,
+            format!("{kind} is not representable as JSON: {error}"),
+            "use UTF-8 paths and validated cowshed option values",
         )
     })
 }
@@ -207,12 +432,14 @@ pub struct Cowshed {
 
 impl Cowshed {
     pub async fn open(&self, path: impl AsRef<Path>) -> Result<Project> {
-        let wire: ProjectWire = call_typed(
-            &self.runtime,
-            "project.open",
-            json!({ "path": path.as_ref() }),
-        )
-        .await?;
+        let path = path.as_ref().to_str().ok_or_else(|| {
+            CowshedError::usage(
+                "project path is not valid UTF-8",
+                "use a UTF-8 project path",
+            )
+        })?;
+        let wire: ProjectWire =
+            call_typed(&self.runtime, "project.open", json!({ "path": path })).await?;
         let paths = ProjectPaths::new(&wire.store_root, &wire.repo_id).map_err(|error| {
             CowshedError::new(
                 ErrorCode::Internal,
@@ -735,6 +962,7 @@ impl Coordinator {
     }
 
     pub async fn adopt(&self, options: AdoptOptions) -> Result<WorkspaceRef> {
+        let options = encode_value("adopt options", &options)?;
         self.workspace_result(
             "coordinator.adopt",
             json!({ "repoId": self.project.repo_id, "options": options }),
@@ -782,6 +1010,7 @@ impl Coordinator {
         workspace: &str,
         delta: GrantDelta,
     ) -> Result<GrantSet> {
+        let delta = encode_value("grant delta", &delta)?;
         call_typed(
             &self.runtime,
             method,
@@ -817,8 +1046,9 @@ impl Coordinator {
         .await
     }
 
-    pub async fn detach(&self, workspace: &str) -> Result<()> {
-        self.empty_call(
+    pub async fn detach(&self, workspace: &str) -> Result<EmptyResult> {
+        call_typed(
+            &self.runtime,
             "coordinator.detach",
             json!({ "repoId": self.project.repo_id, "workspace": workspace }),
         )
@@ -850,11 +1080,11 @@ impl Coordinator {
         .await
     }
 
-    pub async fn repo_mirror(&self, workspace: &str, url: &str) -> Result<MirrorInfo> {
+    pub async fn repo_mirror(&self, workspace: &str, url: &Url) -> Result<MirrorInfo> {
         call_typed(
             &self.runtime,
             "coordinator.repoMirror",
-            json!({ "repoId": self.project.repo_id, "workspace": workspace, "url": url }),
+            json!({ "repoId": self.project.repo_id, "workspace": workspace, "url": url.as_str() }),
         )
         .await
     }
@@ -1013,6 +1243,16 @@ impl JobHandle {
         .await
     }
 
+    pub async fn logs(&self, stream: JobStream, follow: bool) -> Result<JobByteStream> {
+        self.runtime
+            .logs(&self.workspace, self.id, stream, follow)
+            .await
+    }
+
+    pub async fn attach(&self) -> Result<JobAttachment> {
+        self.runtime.attach(&self.workspace, self.id).await
+    }
+
     pub async fn detach(&self) -> Result<()> {
         self.empty_call("job.detach").await
     }
@@ -1026,8 +1266,8 @@ impl JobHandle {
         .await
     }
 
-    pub async fn kill(&self) -> Result<()> {
-        self.empty_call("job.kill").await
+    pub fn kill(&self) -> Result<()> {
+        self.runtime.kill(&self.workspace, self.id)
     }
 
     async fn empty_call(&self, method: &'static str) -> Result<()> {
@@ -1154,5 +1394,20 @@ mod tests {
         assert_eq!(error.code, ErrorCode::EnvironmentMissing);
         assert!(error.message.contains("nonce"));
         server.await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_utf8_project_path_is_a_typed_usage_error() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let (sender, _receiver) = mpsc::channel(1);
+        let cowshed = Cowshed {
+            runtime: Arc::new(ActorRuntime { sender }),
+        };
+        let path = PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff]));
+        let error = cowshed.open(path).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Usage);
+        assert!(error.message.contains("UTF-8"));
     }
 }

@@ -68,6 +68,7 @@ fn job_id_and_path_domain_types_reject_unsafe_values() {
     for valid in [
         "2024-02-29T23:59:59.123Z",
         "2026-12-31T23:59:60Z",
+        "2026-06-30T23:59:60Z",
         "2026-07-11T12:34:56+05:30",
         "2026-07-11T12:34:56-00:00",
     ] {
@@ -78,6 +79,8 @@ fn job_id_and_path_domain_types_reject_unsafe_values() {
         "2026-13-01T00:00:00Z",
         "2026-01-01T24:00:00Z",
         "2026-01-01T00:00:61Z",
+        "2026-07-01T23:59:60Z",
+        "2026-12-31T22:59:60Z",
         "2026-01-01 00:00:00Z",
         "2026-01-01T00:00:00+24:00",
     ] {
@@ -268,6 +271,38 @@ fn output_limit_is_an_explicit_terminal_projection() {
     assert!(serde_json::to_value(invalid).is_err());
     value.as_object_mut().unwrap().remove("outputLimit");
     assert!(serde_json::from_value::<JobInfo>(value).is_err());
+}
+
+#[test]
+fn exec_record_enforces_terminal_invariants_both_directions() {
+    let value = json!({
+        "repoId": "acme/widget",
+        "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+        "jobId": 9,
+        "state": "exited",
+        "argv": ["true"],
+        "cwd": "packages/app",
+        "envHash": 17,
+        "grantRevision": 9,
+        "trace": {"traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"00f067aa0ba902b7"},
+        "started": "2026-07-11T12:34:56Z",
+        "durationMs": 3,
+        "exit": {"kind":"exited","code":0},
+        "stdout": {"path":".cowshed/job/9/out","bytes":0,"summary":{"version":1,"text":"","truncated":false}},
+        "stderr": {"path":".cowshed/job/9/err","bytes":0,"summary":{"version":1,"text":"","truncated":false}},
+        "stdin": {"kind":"empty","bytes":0,"complete":true}
+    });
+    let record: ExecRecord = serde_json::from_value(value.clone()).unwrap();
+    record.validate().unwrap();
+    assert_eq!(serde_json::to_value(&record).unwrap(), value);
+
+    let mut invalid_record = record;
+    invalid_record.state = JobState::Running;
+    assert!(serde_json::to_value(invalid_record).is_err());
+
+    let mut invalid_value = value;
+    invalid_value["state"] = json!("signaled");
+    assert!(serde_json::from_value::<ExecRecord>(invalid_value).is_err());
 }
 
 #[test]
