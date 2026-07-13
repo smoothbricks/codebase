@@ -434,6 +434,14 @@ pub enum WorkspaceState {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CheckpointInfo {
+    pub label: String,
+    pub revision: u64,
+    pub pinned: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceInfo {
     pub repo_id: RepoId,
     pub workspace: WorkspaceName,
@@ -448,6 +456,7 @@ pub struct WorkspaceInfo {
     pub base_commit: Option<GitOid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<UtcTimestamp>,
+    pub checkpoints: Vec<CheckpointInfo>,
     pub snapshot_stale: bool,
 }
 
@@ -1667,6 +1676,8 @@ pub struct AdoptOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<RepoId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub capacity: Option<String>,
     pub quarantine: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1691,10 +1702,19 @@ pub struct AttachOptions {
     pub browse: bool,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct CheckpointOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub keep: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoveOptions {
     pub force: bool,
+    pub restore: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
