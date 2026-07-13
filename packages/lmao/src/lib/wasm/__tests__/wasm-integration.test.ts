@@ -11,6 +11,7 @@
  */
 
 import { afterEach, beforeAll, describe, expect, it } from 'bun:test';
+import { convertToArrowTable } from '../../convertToArrow.js';
 import { defineOpContext } from '../../defineOpContext.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
@@ -57,6 +58,7 @@ describe('WASM Integration Tests', () => {
     userId: S.category(),
     latency: S.number(),
     operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
+    success: S.boolean(),
   });
 
   // Define op context - env is optional (undefined by default, not null-sentinel)
@@ -340,6 +342,165 @@ describe('WASM Integration Tests', () => {
       // Use entry type constant from systemSchema
       const entryTypes = Array.from(buffer.entry_type.slice(0, buffer._writeIndex));
       expect(entryTypes).toContain(ENTRY_TYPE_ERROR);
+    });
+  });
+
+  describe('Identity ownership', () => {
+    it('keeps the root trace owned by the root when a child is released and recycled', async () => {
+      await tracer.trace('owned-root', async (ctx) => {
+        await ctx.span('released-child', async (child) => child.ok('child done'));
+        return ctx.ok('root done');
+      });
+
+      const root = tracer.rootBuffers[0];
+      const child = root._children[0];
+      const rootTraceId = root.trace_id;
+      const rootSpanId = root.span_id;
+      expect(child.trace_id).toBe(rootTraceId);
+      expect(child.span_id).not.toBe(rootSpanId);
+      expect(child.parent_span_id).toBe(rootSpanId);
+      expect(child._identity).not.toEqual(root._identity);
+
+      strategy.releaseBuffer(child);
+      await tracer.trace('recycled-child-identity', async (ctx) => ctx.ok('done'));
+
+      expect(root.trace_id).toBe(rootTraceId);
+      expect(root.span_id).toBe(rootSpanId);
+      expect(root.message_values[0]).toBe('owned-root');
+      expect(tracer.rootBuffers[1].trace_id).not.toBe(rootTraceId);
+    });
+
+    it('preserves logical span identity and linkage across overflow segments', async () => {
+      await tracer.trace('overflow-root', async (ctx) => {
+        for (let i = 0; i < 64; i++) {
+          ctx.log.info(`root-log-${i}`);
+        }
+        await ctx.span('overflow-child', async (child) => {
+          for (let i = 0; i < 64; i++) {
+            child.log.info(`child-log-${i}`);
+          }
+          return child.ok('child done');
+        });
+        return ctx.ok('root done');
+      });
+
+      const root = tracer.rootBuffers[0];
+      const rootOverflow = root._overflow;
+      if (!rootOverflow) throw new Error('root logs did not create an overflow segment');
+      expect(rootOverflow.trace_id).toBe(root.trace_id);
+      expect(rootOverflow.span_id).toBe(root.span_id);
+      expect(rootOverflow.parent_span_id).toBe(root.parent_span_id);
+      expect(rootOverflow._identity).toEqual(root._identity);
+
+      const child = root._children[0];
+      const childOverflow = child._overflow;
+      if (!childOverflow) throw new Error('child logs did not create an overflow segment');
+      expect(child.trace_id).toBe(root.trace_id);
+      expect(child.span_id).not.toBe(root.span_id);
+      expect(child.parent_span_id).toBe(root.span_id);
+      expect(childOverflow.trace_id).toBe(child.trace_id);
+      expect(childOverflow.span_id).toBe(child.span_id);
+      expect(childOverflow.parent_span_id).toBe(child.parent_span_id);
+      expect(childOverflow._identity).toEqual(child._identity);
+    });
+  });
+
+  describe('Released memory ownership', () => {
+    it('keeps two new traces independent after repeated tree release', async () => {
+      await tracer.trace('released-tree', async (ctx) => {
+        await ctx.span('released-child', async (child) => {
+          child.tag.latency(1);
+          return child.ok('done');
+        });
+        return ctx.ok('done');
+      });
+
+      const released = tracer.rootBuffers[0];
+      strategy.releaseBuffer(released);
+      strategy.releaseBuffer(released);
+
+      await tracer.trace('first-new-owner', async (ctx) => {
+        ctx.tag.latency(11.5);
+        return ctx.ok('done');
+      });
+      await tracer.trace('second-new-owner', async (ctx) => {
+        ctx.tag.latency(22.5);
+        return ctx.ok('done');
+      });
+
+      const firstTable = strategy.toArrowTable(tracer.rootBuffers[1]);
+      const secondTable = strategy.toArrowTable(tracer.rootBuffers[2]);
+      expect(firstTable.getChild('message')?.get(0)).toBe('first-new-owner');
+      expect(firstTable.getChild('latency')?.get(0)).toBe(11.5);
+      expect(secondTable.getChild('message')?.get(0)).toBe('second-new-owner');
+      expect(secondTable.getChild('latency')?.get(0)).toBe(22.5);
+    });
+
+    it('keeps single-buffer Arrow output isolated from recycled WASM memory', async () => {
+      await tracer.trace('arrow-first', async (ctx) => {
+        ctx.tag.latency(91.25).success(true).operation('READ');
+        return ctx.ok('done');
+      });
+
+      const firstBuffer = tracer.rootBuffers[0];
+      const firstTable = convertToArrowTable(firstBuffer);
+      expect(firstTable.numRows).toBe(2);
+      expect(firstTable.getChild('message')?.get(0)).toBe('arrow-first');
+      expect(firstTable.getChild('latency')?.get(0)).toBe(91.25);
+      expect(firstTable.getChild('success')?.get(0)).toBe(true);
+      expect(firstTable.getChild('operation')?.get(0)).toBe('READ');
+
+      strategy.releaseBuffer(firstBuffer);
+      await tracer.trace('arrow-second', async (ctx) => {
+        ctx.tag.latency(-17.5).success(false).operation('DELETE');
+        return ctx.ok('done');
+      });
+
+      const secondTable = convertToArrowTable(tracer.rootBuffers[1]);
+      expect(secondTable.getChild('latency')?.get(0)).toBe(-17.5);
+      expect(secondTable.getChild('success')?.get(0)).toBe(false);
+      expect(secondTable.getChild('operation')?.get(0)).toBe('DELETE');
+      expect(firstTable.getChild('message')?.get(0)).toBe('arrow-first');
+      expect(firstTable.getChild('latency')?.get(0)).toBe(91.25);
+      expect(firstTable.getChild('success')?.get(0)).toBe(true);
+      expect(firstTable.getChild('operation')?.get(0)).toBe('READ');
+    });
+
+    it('keeps span-tree Arrow output isolated from recycled WASM memory', async () => {
+      await tracer.trace('tree-first', async (ctx) => {
+        ctx.tag.latency(1.25);
+        await ctx.span('child-first', async (child) => {
+          child.tag.latency(2.5);
+          return child.ok('done');
+        });
+        return ctx.ok('done');
+      });
+
+      const firstBuffer = tracer.rootBuffers[0];
+      const firstTable = strategy.toArrowTable(firstBuffer);
+      expect(firstTable.numRows).toBe(4);
+      expect(firstTable.getChild('message')?.get(0)).toBe('tree-first');
+      expect(firstTable.getChild('message')?.get(2)).toBe('child-first');
+      expect(firstTable.getChild('latency')?.get(0)).toBe(1.25);
+      expect(firstTable.getChild('latency')?.get(2)).toBe(2.5);
+
+      strategy.releaseBuffer(firstBuffer);
+      await tracer.trace('tree-second', async (ctx) => {
+        ctx.tag.latency(101.25);
+        await ctx.span('child-second', async (child) => {
+          child.tag.latency(202.5);
+          return child.ok('done');
+        });
+        return ctx.ok('done');
+      });
+
+      const secondTable = strategy.toArrowTable(tracer.rootBuffers[1]);
+      expect(secondTable.getChild('latency')?.get(0)).toBe(101.25);
+      expect(secondTable.getChild('latency')?.get(2)).toBe(202.5);
+      expect(firstTable.getChild('message')?.get(0)).toBe('tree-first');
+      expect(firstTable.getChild('message')?.get(2)).toBe('child-first');
+      expect(firstTable.getChild('latency')?.get(0)).toBe(1.25);
+      expect(firstTable.getChild('latency')?.get(2)).toBe(2.5);
     });
   });
 
