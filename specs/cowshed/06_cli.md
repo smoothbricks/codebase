@@ -33,6 +33,9 @@ single frozen shape; contract goldens (08_testing.md) enforce it, and any packag
 stale, not authoritative. Long operations additionally emit NDJSON progress events on stderr with `--json`
 (`{"event":"attach","ms":233}`) — NDJSON here is a **wire encoding on a pipe to a live consumer**, the same role it
 plays for `--ndjson` export flags; cowshed never writes NDJSON to disk (telemetry storage is Arrow, 13_telemetry.md).
+The CLI output module serializes `cowshed_core::api::JsonEnvelope<T>` and `CowshedError` directly. It has no local JSON
+value tree, error record, or envelope encoder. The sealed `ResultBody` bound rejects `()` and anonymous adapter maps;
+empty success is exactly the named `EmptyResult {}` body, never `null`.
 
 ### JSON result bodies (frozen)
 
