@@ -69,21 +69,35 @@ fn mutates_host(operation: &HostOperation) -> bool {
     matches!(
         operation,
         HostOperation::EnsureDirectory(_)
+            | HostOperation::CreateApfsVolume { .. }
+            | HostOperation::MountApfsVolume { .. }
             | HostOperation::RunCommand(_)
             | HostOperation::WriteMarkerAtomic { .. }
     )
 }
 
 fn command_line(operation: &HostOperation) -> Option<String> {
-    let HostOperation::RunCommand(command) = operation else {
-        return None;
-    };
-    Some(
-        std::iter::once(command.program().to_owned())
-            .chain(command.args().iter().cloned())
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
+    match operation {
+        HostOperation::RunCommand(command) | HostOperation::CreateApfsVolume { command, .. } => {
+            Some(
+                std::iter::once(command.program().to_owned())
+                    .chain(command.args().iter().cloned())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        }
+        HostOperation::MountApfsVolume { mountpoint, volume } => {
+            let identifier = match volume {
+                VolumeRef::ExistingExact(identifier) => identifier.clone(),
+                VolumeRef::Created(id) => format!("<created:{id:?}>"),
+            };
+            Some(format!(
+                "/usr/sbin/diskutil mount -nobrowse -mountPoint {} {identifier}",
+                mountpoint.display()
+            ))
+        }
+        _ => None,
+    }
 }
 
 #[test]
@@ -310,9 +324,9 @@ fn apfs_plan_has_exact_roots_commands_markers_and_store_first_order() {
         commands,
         [
             "/usr/sbin/diskutil apfs addVolume disk3 APFS cowshed.store -nomount",
-            "/usr/sbin/diskutil mount -nobrowse -mountPoint /Users/alice/.cowshed cowshed.store",
+            "/usr/sbin/diskutil mount -nobrowse -mountPoint /Users/alice/.cowshed <created:OperationId(0)>",
             "/usr/sbin/diskutil apfs addVolume disk3 APFS cowshed.caches -nomount",
-            "/usr/sbin/diskutil mount -nobrowse -mountPoint /Users/alice/.cowshed/caches cowshed.caches",
+            "/usr/sbin/diskutil mount -nobrowse -mountPoint /Users/alice/.cowshed/caches <created:OperationId(1)>",
         ]
     );
 
@@ -842,6 +856,7 @@ struct SpyHost {
     observed_off_caller: AtomicBool,
     caller: ThreadId,
     mountpoint: MountpointState,
+    creates: AtomicUsize,
 }
 
 impl SpyHost {
@@ -853,6 +868,7 @@ impl SpyHost {
             observed_off_caller: AtomicBool::new(false),
             caller: std::thread::current().id(),
             mountpoint,
+            creates: AtomicUsize::new(0),
         }
     }
 
@@ -887,11 +903,42 @@ impl BootstrapHost for SpyHost {
         Ok(())
     }
 
-    fn run_command(&self, _command: &HostCommand) -> Result<HostCommandOutput, HostError> {
+    fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
         self.record(true);
+        let stdout = if command
+            .args()
+            .starts_with(&["apfs".to_owned(), "addVolume".to_owned()])
+        {
+            let slice = self.creates.fetch_add(1, Ordering::SeqCst) + 8;
+            format!("Created new APFS Volume disk3s{slice}\n").into_bytes()
+        } else if command
+            .args()
+            .starts_with(&["info".to_owned(), "-plist".to_owned()])
+        {
+            let identifier = &command.args()[2];
+            let name = if identifier == "disk3s8" {
+                "cowshed.store"
+            } else {
+                "cowshed.caches"
+            };
+            format!(
+                "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>\
+                 <key>DeviceIdentifier</key><string>{identifier}</string>\
+                 <key>APFSContainerReference</key><string>disk3</string>\
+                 <key>VolumeName</key><string>{name}</string>\
+                 <key>FilesystemType</key><string>apfs</string>\
+                 <key>MountPoint</key><string></string>\
+                 <key>APFSSnapshot</key><false/>\
+                 </dict></plist>"
+            )
+            .into_bytes()
+        } else {
+            Vec::new()
+        };
         Ok(HostCommandOutput {
             success: true,
-            ..HostCommandOutput::default()
+            stdout,
+            stderr: Vec::new(),
         })
     }
 
@@ -1146,7 +1193,15 @@ async fn every_host_effect_crosses_the_injected_blocking_lane() {
         lane.dispatches.load(Ordering::SeqCst),
         plan.operations().len()
     );
-    assert_eq!(host.effects.load(Ordering::SeqCst), plan.operations().len());
+    let creation_attestations = plan
+        .operations()
+        .iter()
+        .filter(|operation| matches!(operation, HostOperation::CreateApfsVolume { .. }))
+        .count();
+    assert_eq!(
+        host.effects.load(Ordering::SeqCst),
+        plan.operations().len() + creation_attestations
+    );
 }
 
 #[tokio::test]
@@ -1211,6 +1266,14 @@ async fn tokio_lane_moves_platform_work_off_the_async_worker() {
     execute_bootstrap(&plan, Arc::clone(&host), &TokioBlockingLane)
         .await
         .unwrap();
-    assert_eq!(host.effects.load(Ordering::SeqCst), plan.operations().len());
+    let creation_attestations = plan
+        .operations()
+        .iter()
+        .filter(|operation| matches!(operation, HostOperation::CreateApfsVolume { .. }))
+        .count();
+    assert_eq!(
+        host.effects.load(Ordering::SeqCst),
+        plan.operations().len() + creation_attestations
+    );
     assert!(host.observed_off_caller.load(Ordering::SeqCst));
 }

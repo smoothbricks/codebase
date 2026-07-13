@@ -1,10 +1,14 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use async_trait::async_trait;
+use plist::Value;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub mod native;
 
 pub const VOLUME_MARKER_FILE: &str = ".cowshed-volume.json";
 pub const APFS_STORE_VOLUME: &str = "cowshed.store";
@@ -488,6 +492,15 @@ impl HostCommand {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct OperationId(u8);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VolumeRef {
+    ExistingExact(String),
+    Created(OperationId),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExistingMarkerEvidence {
     Missing,
@@ -561,6 +574,16 @@ pub enum HostOperation {
         substrate: SubstrateKind,
     },
     EnsureDirectory(PathBuf),
+    CreateApfsVolume {
+        id: OperationId,
+        container: String,
+        name: &'static str,
+        command: HostCommand,
+    },
+    MountApfsVolume {
+        mountpoint: PathBuf,
+        volume: VolumeRef,
+    },
     RunCommand(HostCommand),
     WriteMarkerAtomic {
         path: PathBuf,
@@ -642,6 +665,7 @@ fn plan_apfs(
     let mut operations = vec![guard(roots.store(), VolumeRole::Store, SubstrateKind::Apfs)];
     plan_apfs_volume(
         &mut operations,
+        OperationId(0),
         container,
         roots.store(),
         APFS_STORE_VOLUME,
@@ -655,6 +679,7 @@ fn plan_apfs(
     ));
     plan_apfs_volume(
         &mut operations,
+        OperationId(1),
         container,
         roots.caches(),
         APFS_CACHES_VOLUME,
@@ -666,9 +691,10 @@ fn plan_apfs(
 
 fn plan_apfs_volume(
     operations: &mut Vec<HostOperation>,
+    id: OperationId,
     container: &str,
     mountpoint: &Path,
-    volume_name: &str,
+    volume_name: &'static str,
     role: VolumeRole,
     state: &ExistingStorage,
 ) {
@@ -676,18 +702,23 @@ fn plan_apfs_volume(
         ExistingStorage::MountedValid { .. } => {}
         ExistingStorage::Absent => {
             operations.push(HostOperation::EnsureDirectory(mountpoint.to_owned()));
-            operations.push(command(
-                DISKUTIL,
-                [
-                    "apfs",
-                    "addVolume",
-                    container,
-                    "APFS",
-                    volume_name,
-                    "-nomount",
-                ],
-            ));
-            operations.push(apfs_mount(mountpoint, volume_name));
+            operations.push(HostOperation::CreateApfsVolume {
+                id,
+                container: container.to_owned(),
+                name: volume_name,
+                command: HostCommand::new(
+                    DISKUTIL,
+                    [
+                        "apfs",
+                        "addVolume",
+                        container,
+                        "APFS",
+                        volume_name,
+                        "-nomount",
+                    ],
+                ),
+            });
+            operations.push(apfs_mount(mountpoint, VolumeRef::Created(id)));
             operations.push(marker(
                 mountpoint,
                 VolumeMarker::new(role, SubstrateKind::Apfs),
@@ -697,23 +728,20 @@ fn plan_apfs_volume(
             exact_identifier, ..
         } => {
             operations.push(HostOperation::EnsureDirectory(mountpoint.to_owned()));
-            operations.push(apfs_mount(mountpoint, exact_identifier));
+            operations.push(apfs_mount(
+                mountpoint,
+                VolumeRef::ExistingExact(exact_identifier.clone()),
+            ));
             operations.push(guard(mountpoint, role, SubstrateKind::Apfs));
         }
     }
 }
 
-fn apfs_mount(mountpoint: &Path, exact_identifier: &str) -> HostOperation {
-    command(
-        DISKUTIL,
-        [
-            "mount",
-            "-nobrowse",
-            "-mountPoint",
-            &mountpoint.to_string_lossy(),
-            exact_identifier,
-        ],
-    )
+fn apfs_mount(mountpoint: &Path, volume: VolumeRef) -> HostOperation {
+    HostOperation::MountApfsVolume {
+        mountpoint: mountpoint.to_owned(),
+        volume,
+    }
 }
 
 fn plan_zfs(
@@ -1029,25 +1057,70 @@ where
     H: BootstrapHost + 'static,
     L: BlockingLane,
 {
+    let mut created_volumes = BTreeMap::new();
     for operation in plan.operations() {
+        let operation = resolve_operation(operation, &created_volumes)?;
         let host = Arc::clone(&host);
-        let operation = operation.clone();
-        lane.dispatch(Box::new(move || apply_operation(host.as_ref(), &operation)))
-            .await?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        lane.dispatch(Box::new(move || {
+            let result = apply_operation(host.as_ref(), &operation)?;
+            sender.send(result).map_err(|_| {
+                BootstrapExecutionError::BlockingLane(
+                    "bootstrap operation result receiver closed".to_owned(),
+                )
+            })
+        }))
+        .await?;
+        let result = receiver.try_recv().map_err(|error| {
+            BootstrapExecutionError::BlockingLane(format!(
+                "bootstrap operation produced no result: {error}"
+            ))
+        })?;
+        if let Some((id, exact_identifier)) = result
+            && created_volumes.insert(id, exact_identifier).is_some()
+        {
+            return Err(BootstrapExecutionError::DuplicateOperationId(id));
+        }
     }
     Ok(())
+}
+
+fn resolve_operation(
+    operation: &HostOperation,
+    created_volumes: &BTreeMap<OperationId, String>,
+) -> Result<HostOperation, BootstrapExecutionError> {
+    let HostOperation::MountApfsVolume { mountpoint, volume } = operation else {
+        return Ok(operation.clone());
+    };
+    let exact_identifier = match volume {
+        VolumeRef::ExistingExact(identifier) => identifier,
+        VolumeRef::Created(id) => created_volumes
+            .get(id)
+            .ok_or(BootstrapExecutionError::UnresolvedCreatedVolume(*id))?,
+    };
+    Ok(HostOperation::RunCommand(HostCommand::new(
+        DISKUTIL,
+        [
+            "mount",
+            "-nobrowse",
+            "-mountPoint",
+            &mountpoint.to_string_lossy(),
+            exact_identifier,
+        ],
+    )))
 }
 
 fn apply_operation(
     host: &dyn BootstrapHost,
     operation: &HostOperation,
-) -> Result<(), BootstrapExecutionError> {
+) -> Result<Option<(OperationId, String)>, BootstrapExecutionError> {
     match operation {
         HostOperation::VerifyZfsDelegation {
             pool,
             required_root,
         } => host
             .verify_zfs_delegation(pool, required_root)
+            .map(|()| None)
             .map_err(BootstrapExecutionError::Host),
         HostOperation::GuardMountpoint {
             path,
@@ -1057,13 +1130,13 @@ fn apply_operation(
             .inspect_mountpoint(path)
             .map_err(BootstrapExecutionError::Host)?
         {
-            MountpointState::Missing | MountpointState::EmptyDirectory => Ok(()),
+            MountpointState::Missing | MountpointState::EmptyDirectory => Ok(None),
             MountpointState::NonEmptyDirectoryWithoutMount => {
                 Err(BootstrapExecutionError::MaskedData(path.clone()))
             }
             MountpointState::Mounted { marker } => {
                 require_mounted_marker(marker.as_deref(), *role, *substrate)
-                    .map(|_| ())
+                    .map(|_| None)
                     .map_err(|source| BootstrapExecutionError::MountGuard {
                         path: path.clone(),
                         source,
@@ -1072,26 +1145,140 @@ fn apply_operation(
         },
         HostOperation::EnsureDirectory(path) => host
             .create_dir_all(path)
+            .map(|()| None)
             .map_err(BootstrapExecutionError::Host),
-        HostOperation::RunCommand(command) => {
-            let output = host
-                .run_command(command)
-                .map_err(BootstrapExecutionError::Host)?;
-            if output.success {
-                Ok(())
-            } else {
-                Err(BootstrapExecutionError::CommandFailed {
-                    command: command.clone(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                })
-            }
+        HostOperation::CreateApfsVolume {
+            id,
+            container,
+            name,
+            command,
+        } => {
+            let output = run_host_command(host, command)?;
+            let exact_identifier = parse_created_apfs_identifier(&output.stdout)?;
+            let info_command =
+                HostCommand::new(DISKUTIL, ["info", "-plist", exact_identifier.as_str()]);
+            let info = run_host_command(host, &info_command)?;
+            attest_created_apfs_info(&info.stdout, &exact_identifier, container, name)?;
+            Ok(Some((*id, exact_identifier)))
         }
+        HostOperation::MountApfsVolume { .. } => {
+            Err(BootstrapExecutionError::UnresolvedMountOperation)
+        }
+        HostOperation::RunCommand(command) => run_host_command(host, command).map(|_| None),
         HostOperation::WriteMarkerAtomic { path, marker } => {
             let contents = marker.to_json().map_err(BootstrapExecutionError::Marker)?;
             host.write_file_atomic(path, &contents)
+                .map(|()| None)
                 .map_err(BootstrapExecutionError::Host)
         }
     }
+}
+
+fn run_host_command(
+    host: &dyn BootstrapHost,
+    command: &HostCommand,
+) -> Result<HostCommandOutput, BootstrapExecutionError> {
+    let output = host
+        .run_command(command)
+        .map_err(BootstrapExecutionError::Host)?;
+    if output.success {
+        Ok(output)
+    } else {
+        Err(BootstrapExecutionError::CommandFailed {
+            command: command.clone(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
+fn parse_created_apfs_identifier(stdout: &[u8]) -> Result<String, BootstrapExecutionError> {
+    let stdout = std::str::from_utf8(stdout).map_err(|_| {
+        BootstrapExecutionError::CreatedVolumeOutput(
+            "diskutil addVolume output is not UTF-8".to_owned(),
+        )
+    })?;
+    let prefix = "Created new APFS Volume ";
+    let identifiers: Vec<_> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix(prefix))
+        .collect();
+    if identifiers.len() != 1 {
+        return Err(BootstrapExecutionError::CreatedVolumeOutput(format!(
+            "expected one created DeviceIdentifier, found {}",
+            identifiers.len()
+        )));
+    }
+    let identifier = identifiers[0];
+    if !valid_apfs_volume_identifier(identifier) {
+        return Err(BootstrapExecutionError::CreatedVolumeOutput(format!(
+            "malformed created DeviceIdentifier {identifier:?}"
+        )));
+    }
+    Ok(identifier.to_owned())
+}
+
+fn valid_apfs_volume_identifier(identifier: &str) -> bool {
+    let Some(rest) = identifier.strip_prefix("disk") else {
+        return false;
+    };
+    let Some((disk, slice)) = rest.split_once('s') else {
+        return false;
+    };
+    !disk.is_empty()
+        && disk.bytes().all(|byte| byte.is_ascii_digit())
+        && !slice.is_empty()
+        && slice.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn attest_created_apfs_info(
+    bytes: &[u8],
+    expected_identifier: &str,
+    expected_container: &str,
+    expected_name: &str,
+) -> Result<(), BootstrapExecutionError> {
+    let value = Value::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|error| BootstrapExecutionError::CreatedVolumeAttestation(error.to_string()))?;
+    let dictionary = value.as_dictionary().ok_or_else(|| {
+        BootstrapExecutionError::CreatedVolumeAttestation(
+            "diskutil info plist root is not a dictionary".to_owned(),
+        )
+    })?;
+    for (key, expected) in [
+        ("DeviceIdentifier", expected_identifier),
+        ("APFSContainerReference", expected_container),
+        ("VolumeName", expected_name),
+        ("FilesystemType", "apfs"),
+    ] {
+        let actual = dictionary.get(key).and_then(Value::as_string);
+        if actual != Some(expected) {
+            return Err(BootstrapExecutionError::CreatedVolumeAttestation(format!(
+                "{key} is {actual:?}, expected {expected:?}"
+            )));
+        }
+    }
+    if !matches!(dictionary.get("MountPoint"), Some(Value::String(value)) if value.is_empty()) {
+        return Err(BootstrapExecutionError::CreatedVolumeAttestation(
+            "new APFS volume is not authoritatively unmounted".to_owned(),
+        ));
+    }
+    if !matches!(dictionary.get("APFSSnapshot"), Some(Value::Boolean(false))) {
+        return Err(BootstrapExecutionError::CreatedVolumeAttestation(
+            "new APFS object is not an ordinary volume".to_owned(),
+        ));
+    }
+    for role_key in ["APFSVolumeRole", "APFSVolumeRoles", "Roles"] {
+        match dictionary.get(role_key) {
+            None => {}
+            Some(Value::Array(values)) if values.is_empty() => {}
+            Some(Value::String(value)) if value.is_empty() => {}
+            Some(_) => {
+                return Err(BootstrapExecutionError::CreatedVolumeAttestation(format!(
+                    "new APFS volume unexpectedly has {role_key} metadata"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -1114,4 +1301,14 @@ pub enum BootstrapExecutionError {
     },
     #[error(transparent)]
     Marker(MarkerError),
+    #[error("bootstrap plan reused APFS creation operation {0:?}")]
+    DuplicateOperationId(OperationId),
+    #[error("APFS mount references creation operation {0:?} before it completed")]
+    UnresolvedCreatedVolume(OperationId),
+    #[error("APFS mount operation reached execution without an exact DeviceIdentifier")]
+    UnresolvedMountOperation,
+    #[error("cannot identify the newly created APFS volume: {0}")]
+    CreatedVolumeOutput(String),
+    #[error("new APFS volume failed exact diskutil info attestation: {0}")]
+    CreatedVolumeAttestation(String),
 }
