@@ -26,6 +26,8 @@ import type { AnySpanBuffer } from '../types.js';
 import type { WasmAllocator } from './wasmAllocator.js';
 import { TraceTopology } from '../traceTopology.js';
 
+const traceIdEncoder = new TextEncoder();
+
 // Spec link (88): realizes specs/lmao/01q_wasm_memory_architecture.md#smoo/lmao!n/wasm-mem (span lifecycle writer).
 //#region smoo/lmao!n/wasm-mem.trace-root
 
@@ -134,6 +136,7 @@ export class WasmTraceRoot<T extends LogSchema = LogSchema> implements ITraceRoo
 
   /** Trace ID string */
   readonly trace_id: TraceId;
+  readonly _traceIdBytes: Uint8Array;
 
   /** Tracer reference for lifecycle hooks */
   readonly tracer: TracerLifecycleHooks<T>;
@@ -152,6 +155,7 @@ export class WasmTraceRoot<T extends LogSchema = LogSchema> implements ITraceRoo
   constructor(allocator: WasmAllocator, trace_id: TraceId, tracer: TracerLifecycleHooks<T>) {
     this.allocator = allocator;
     this.trace_id = trace_id;
+    this._traceIdBytes = traceIdEncoder.encode(trace_id);
     this.tracer = tracer;
     this._topology = new TraceTopology();
 

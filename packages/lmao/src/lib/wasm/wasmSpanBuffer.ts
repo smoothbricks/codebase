@@ -69,11 +69,6 @@ let nextWasmBufferGeneration = 0;
 export interface WasmSpanBufferOptions<T extends LogSchema = LogSchema> {
   allocator: WasmAllocator;
   capacity: number;
-  trace_id: string;
-  thread_id: bigint;
-  span_id: number;
-  parent_thread_id?: bigint;
-  parent_span_id?: number;
   messageLayoutFamily?: MessageLayoutFamily;
   logSchema: T;
   _traceRoot: ITraceRoot<T>;
@@ -83,7 +78,7 @@ export interface WasmSpanBufferOptions<T extends LogSchema = LogSchema> {
   _vocabularyGeneration: VocabularyGeneration;
   _layout: WasmPhysicalLayoutDescriptor;
   _identityMode?: WasmIdentityMode;
-  _identityPtr?: number;
+  _identitySource?: WasmSpanBufferInstance<T>;
   _parent?: WasmSpanBufferInstance<T>;
   _generation?: number;
 }
@@ -111,6 +106,9 @@ export type WasmSpanBufferInstance<T extends LogSchema = LogSchema> = SpanBuffer
   _entryTypeView: Uint8Array;
   _identityView: Uint8Array;
   _identityData: DataView;
+  _identitySource?: WasmSpanBufferInstance<T>;
+  readonly _threadId: bigint;
+  readonly _spanId: number;
   _refreshViews(version: number): void;
   _ensureWasmViews(): void;
   _getWasmColumnValue(columnIndex: number): ColumnValueType | undefined;
@@ -321,14 +319,8 @@ function wasmSetWriteIndex(this: WasmSpanBufferInstance, value: number): void {
 }
 
 function wasmGetTraceId(this: WasmSpanBufferInstance): string {
-  wasmEnsureViews.call(this);
-  const len = this._identityView[8];
-  if (len === 0) {
-    let p = this._parent;
-    while (p?._parent) p = p._parent;
-    return p ? p.trace_id : '';
-  }
-  return new TextDecoder().decode(this._identityView.subarray(9, 9 + len));
+  assertWasmBufferLive(this);
+  return this._traceRoot.trace_id;
 }
 
 function wasmGetSpanStartTime(this: WasmSpanBufferInstance): bigint {
@@ -361,14 +353,12 @@ function wasmGetLastLoggedTime(this: WasmSpanBufferInstance): bigint | null {
  */
 function wasmGetThreadId(this: WasmSpanBufferInstance): bigint {
   assertWasmBufferLive(this);
-  const high = this._allocator.getThreadIdHigh();
-  const low = this._allocator.getThreadIdLow();
-  return (BigInt(high) << 32n) | BigInt(low);
+  return this._threadId;
 }
 
 function wasmGetSpanId(this: WasmSpanBufferInstance): number {
-  wasmEnsureViews.call(this);
-  return this._identityData.getUint32(4, true);
+  assertWasmBufferLive(this);
+  return this._spanId;
 }
 
 /**
@@ -621,8 +611,14 @@ function generateViewRefresh(columnMeta: ColumnMeta[], messageLayoutFamily: Mess
     'const memory = this._allocator.memory.buffer;',
     'this._timestampView = new BigInt64Array(memory, this._systemPtr, this._capacity);',
     'this._entryTypeView = new Uint8Array(memory, this._systemPtr + this._layout.system.entryTypeOffset, this._capacity);',
-    'this._identityView = new Uint8Array(memory, this._identityPtr, 128);',
-    'this._identityData = new DataView(memory, this._identityPtr, 128);',
+    `if (this._identityOwner) {
+      this._identityView = new Uint8Array(memory, this._identityPtr, 128);
+      this._identityData = new DataView(memory, this._identityPtr, 128);
+    } else {
+      this._identitySource._ensureWasmViews();
+      this._identityView = this._identitySource._identityView;
+      this._identityData = this._identitySource._identityData;
+    }`,
   ];
   if (messageLayoutFamily !== 'dynamic-only') {
     lines.push(
@@ -792,19 +788,23 @@ class WasmSpanBuffer {
 
     const identityMode = opts._identityMode ?? 'root';
     this._identityOwner = identityMode !== 'overflow';
+    this._identitySource = identityMode === 'overflow' ? opts._identitySource : undefined;
     if (identityMode === 'overflow') {
-      if (!opts._identityPtr) throw new Error('Overflow buffer requires a nonzero shared identity pointer');
-      this._identityPtr = opts._identityPtr;
+      if (!this._identitySource) throw new Error('Overflow buffer requires an identity owner');
+      this._identityPtr = this._identitySource._identityPtr;
     } else if (identityMode === 'child') {
       this._identityPtr = opts.allocator.allocIdentityChild();
     } else {
-      const traceIdBytes = new TextEncoder().encode(opts.trace_id);
+      const traceIdBytes = opts._traceRoot._traceIdBytes;
       const packed = opts.allocator.allocIdentityRootForJsWrite(traceIdBytes.length);
       this._identityPtr = Number(packed >> 32n);
       const traceIdOffset = Number(packed & 0xFFFFFFFFn);
       if (this._identityPtr !== 0) opts.allocator.u8.set(traceIdBytes, traceIdOffset);
     }
     if (this._identityPtr === 0) throw new Error('WASM identity allocation failed');
+    this._threadId =
+      (BigInt(opts.allocator.getThreadIdHigh() >>> 0) << 32n) | BigInt(opts.allocator.getThreadIdLow() >>> 0);
+    this._spanId = this._identitySource?.span_id ?? opts.allocator.readIdentitySpanId(this._identityPtr);
 
     this._layout = opts._layout;
     if (this._layout.messageLayoutFamily !== '${messageLayoutFamily}') {
@@ -1108,9 +1108,6 @@ export function createWasmChildSpanBuffer<T extends LogSchema>(
   opts: Omit<
     WasmSpanBufferOptions<T>,
     | 'logSchema'
-    | 'trace_id'
-    | 'parent_thread_id'
-    | 'parent_span_id'
     | '_traceRoot'
     | '_scopeValues'
     | '_opMetadata'
@@ -1133,9 +1130,6 @@ export function createWasmChildSpanBuffer<T extends LogSchema>(
   const child = new WasmSpanBufferClass({
     ...opts,
     logSchema: childSchema,
-    trace_id: '',
-    parent_thread_id: parent.thread_id,
-    parent_span_id: parent.span_id,
     _identityMode: 'child',
     _parent: parent,
     _generation: ++nextWasmBufferGeneration,
@@ -1172,11 +1166,6 @@ export function createWasmOverflowBuffer<T extends LogSchema>(
   const overflow = new WasmSpanBufferClass({
     allocator: buffer._allocator,
     capacity: buffer._capacity,
-    trace_id: '',
-    thread_id: buffer.thread_id,
-    span_id: buffer.span_id,
-    parent_thread_id: buffer.parent_thread_id,
-    parent_span_id: buffer.parent_span_id,
     logSchema: buffer._logSchema,
     _traceRoot,
     _scopeValues,
@@ -1184,7 +1173,7 @@ export function createWasmOverflowBuffer<T extends LogSchema>(
     _callsiteMetadata,
     _vocabularyGeneration: buffer._vocabularyGeneration,
     _identityMode: 'overflow',
-    _identityPtr: buffer._identityPtr,
+    _identitySource: buffer._identitySource ?? buffer,
     _parent: buffer._parent,
     _generation: ++nextWasmBufferGeneration,
     _layout: buffer._layout,

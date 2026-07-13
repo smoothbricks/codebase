@@ -60,18 +60,15 @@ describe('WasmSpanBuffer', () => {
     allocator = await createWasmAllocator({ capacity: CAPACITY });
     allocator.reset();
     allocator.setThreadId(0, 42); // high=0, low=42 -> thread_id = 42n
-    traceRoot = new WasmTraceRoot(allocator, testTraceId('test-trace'), TEST_TRACER);
+    traceRoot = new WasmTraceRoot(allocator, testTraceId('trace-123'), TEST_TRACER);
   });
 
-  function createTestWasmBuffer(overrides: { trace_id?: string; thread_id?: bigint; span_id?: number } = {}) {
+  function createTestWasmBuffer() {
     return createWasmSpanBuffer(
       testSchema,
       {
         allocator,
         capacity: CAPACITY,
-        trace_id: overrides.trace_id ? testTraceId(overrides.trace_id) : testTraceId('trace-123'),
-        thread_id: overrides.thread_id ?? 42n,
-        span_id: overrides.span_id ?? 1,
       },
       traceRoot,
       EMPTY_SCOPE,
@@ -117,9 +114,6 @@ describe('WasmSpanBuffer', () => {
       {
         allocator,
         capacity: CAPACITY,
-        trace_id: testTraceId('compiler-eager-trace'),
-        thread_id: 42n,
-        span_id: 1,
       },
       traceRoot,
       EMPTY_SCOPE,
@@ -224,7 +218,7 @@ describe('WasmSpanBuffer', () => {
 
   describe('instance creation', () => {
     it('creates instance with correct identity', () => {
-      const buffer = createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 42n, span_id: 1 });
+      const buffer = createTestWasmBuffer();
 
       expect(buffer.trace_id).toBe(testTraceId('trace-123'));
       expect(buffer.thread_id).toBe(42n);
@@ -237,11 +231,11 @@ describe('WasmSpanBuffer', () => {
     it('creates instance with parent identity via child buffer', () => {
       // Parent identity is now set by linking buffers, not via opts
       // Create parent first, then create child that references it
-      const parent = createTestWasmBuffer({ trace_id: 'trace-456', thread_id: 100n, span_id: 2 });
+      const parent = createTestWasmBuffer();
 
       const child = createWasmChildSpanBuffer(
         parent,
-        { allocator, capacity: CAPACITY, thread_id: 100n, span_id: 5 },
+        { allocator, capacity: CAPACITY },
         traceRoot,
         EMPTY_SCOPE,
         createTestOpMetadata(),
@@ -257,14 +251,14 @@ describe('WasmSpanBuffer', () => {
     it('allocates system block from WASM', () => {
       const beforeAllocs = allocator.getAllocCount();
 
-      createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 1n, span_id: 1 });
+      createTestWasmBuffer();
 
       // Should have allocated at least the system block
       expect(allocator.getAllocCount()).toBeGreaterThan(beforeAllocs);
     });
 
     it('initializes tree structure', () => {
-      const buffer = createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 1n, span_id: 1 });
+      const buffer = createTestWasmBuffer();
       traceRoot._topology.registerRoot(buffer);
 
       expect(buffer._parent).toBeNull();
@@ -279,7 +273,7 @@ describe('WasmSpanBuffer', () => {
     let buffer: WasmSpanBufferInstance;
 
     beforeEach(() => {
-      buffer = createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 1n, span_id: 1 });
+      buffer = createTestWasmBuffer();
     });
 
     it('provides timestamp view into WASM memory', () => {
@@ -383,7 +377,7 @@ describe('WasmSpanBuffer', () => {
     let buffer: WasmSpanBufferInstance;
 
     beforeEach(() => {
-      buffer = createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 1n, span_id: 1 });
+      buffer = createTestWasmBuffer();
     });
 
     it('can write message values', () => {
@@ -405,7 +399,7 @@ describe('WasmSpanBuffer', () => {
     let buffer: WasmSpanBufferInstance;
 
     beforeEach(() => {
-      buffer = createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 1n, span_id: 1 });
+      buffer = createTestWasmBuffer();
     });
 
     it('userId column starts undefined', () => {
@@ -471,7 +465,7 @@ describe('WasmSpanBuffer', () => {
     let buffer: WasmSpanBufferInstance;
 
     beforeEach(() => {
-      buffer = createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 1n, span_id: 1 });
+      buffer = createTestWasmBuffer();
     });
 
     it('reserves numeric bytes in the family slab without materializing the lazy lane', () => {
@@ -514,7 +508,7 @@ describe('WasmSpanBuffer', () => {
 
   describe('eager numeric columns', () => {
     it('statusCode column is pre-allocated', () => {
-      const buffer = createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 1n, span_id: 1 });
+      const buffer = createTestWasmBuffer();
 
       // statusCode is at index 3 and marked eager
       expect(buffer.isColumnAllocated(3)).toBe(true);
@@ -544,7 +538,7 @@ describe('WasmSpanBuffer', () => {
       const root = createCompilerEagerWasmBuffer();
       const child = createWasmChildSpanBuffer(
         root,
-        { allocator, capacity: CAPACITY, thread_id: 42n, span_id: 2 },
+        { allocator, capacity: CAPACITY },
         traceRoot,
         EMPTY_SCOPE,
         compilerEagerOp.metadata,
@@ -621,7 +615,7 @@ describe('WasmSpanBuffer', () => {
 
   describe('free()', () => {
     it('releases each owned exact slab and identity once', () => {
-      const buffer = createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 1n, span_id: 1 });
+      const buffer = createTestWasmBuffer();
       const ownedSlabs = Object.values(buffer._layout.slabs).filter((slab) => slab !== null).length;
       const freesBefore = allocator.getFreeCount();
 
@@ -632,7 +626,7 @@ describe('WasmSpanBuffer', () => {
     });
 
     it('is idempotent and rejects every stale accessor and writer', () => {
-      const buffer = createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 1n, span_id: 1 });
+      const buffer = createTestWasmBuffer();
       const count = getMethod<[idx: number, val: number], WasmSpanBufferInstance>(buffer, 'count');
       buffer.free();
       const freesAfterFirstRelease = allocator.getFreeCount();
@@ -652,12 +646,12 @@ describe('WasmSpanBuffer', () => {
       // thread_id is global in WASM header, shared by parent and child
       allocator.setThreadId(0, 1); // thread_id = 1n
 
-      const parent = createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 1n, span_id: 1 });
+      const parent = createTestWasmBuffer();
       traceRoot._topology.registerRoot(parent);
 
       const child = createWasmChildSpanBuffer(
         parent,
-        { allocator, capacity: CAPACITY, thread_id: 2n, span_id: 2 },
+        { allocator, capacity: CAPACITY },
         traceRoot,
         EMPTY_SCOPE,
         createTestOpMetadata(),
@@ -685,7 +679,7 @@ describe('WasmSpanBuffer', () => {
       // thread_id is global in WASM header
       allocator.setThreadId(0, 1); // thread_id = 1n
 
-      const buffer = createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 1n, span_id: 1 });
+      const buffer = createTestWasmBuffer();
 
       const overflow = createWasmOverflowBuffer(
         buffer,
@@ -714,7 +708,7 @@ describe('WasmSpanBuffer', () => {
       // thread_id is global in WASM header
       allocator.setThreadId(0, 1); // thread_id = 1n
 
-      const buffer = createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 1n, span_id: 1 });
+      const buffer = createTestWasmBuffer();
 
       // Get custom inspect
       const inspectSymbol = Symbol.for('nodejs.util.inspect.custom');
