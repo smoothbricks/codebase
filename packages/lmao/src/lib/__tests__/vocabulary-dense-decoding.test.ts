@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { createHash } from 'node:crypto';
+import { Column, type Table } from '@uwdata/flechette';
+import { getVocabularyDictionaryPrefix } from '../arrow/vocabularyDictionary.js';
 import { createSpanLogger } from '../codegen/spanLoggerGenerator.js';
 import { convertToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
@@ -106,11 +108,88 @@ function makeFragment(texts: readonly string[]): VocabularyFragment {
   return { ...fragment, contentHash: fragmentHash(fragment) };
 }
 
+function requireMessageDictionary(table: Table): {
+  readonly message: Column<unknown>;
+  readonly dictionary: Column<unknown>;
+  readonly keys: Uint8Array | Uint16Array | Uint32Array;
+} {
+  const message = table.getChild('message');
+  if (!message) throw new Error('Arrow table did not contain message column');
+  const batch = message.data[0];
+  if (!batch || !('dictionary' in batch) || !(batch.dictionary instanceof Column)) {
+    throw new Error('Arrow message column was not dictionary encoded');
+  }
+  if (!(batch.values instanceof Uint8Array || batch.values instanceof Uint16Array || batch.values instanceof Uint32Array)) {
+    throw new Error('Arrow message dictionary did not use unsigned integer keys');
+  }
+  return { dictionary: batch.dictionary, keys: batch.values, message };
+}
+
 const schema = defineLogSchema({ marker: S.category() });
 const opContext = defineOpContext({ logSchema: schema });
 
 
 describe('global vocabulary dense decoding', () => {
+  it('keeps the canonical static prefix and uses direct dense zero before the first-seen dynamic suffix', async () => {
+    const op = opContext.defineOp('dense-zero-static-prefix', (ctx) => {
+      const logger = createSpanLogger(ctx.buffer._logSchema, ctx.buffer);
+      logger._infoTemplate(0);
+      logger._infoTemplate(0);
+      ctx.log.info('dynamic-b');
+      ctx.log.info('dynamic-a');
+      ctx.log.info('dynamic-b');
+      return ctx.ok(null);
+    });
+    const tracer = new TestTracer(opContext, createTestTracerOptions());
+    await tracer.trace('dense-zero-static-prefix', op);
+
+    const buffer = tracer.rootBuffers[0];
+    const table = convertToArrowTable(buffer);
+    const { dictionary, keys, message } = requireMessageDictionary(table);
+    const prefix = getVocabularyDictionaryPrefix(buffer._vocabularyGeneration);
+    const prefixValues = Array.from(prefix.column);
+    expect(Array.from(dictionary)).toEqual([
+      ...prefixValues,
+      'dense-zero-static-prefix',
+      'dynamic-b',
+      'dynamic-a',
+    ]);
+    const suffixOffset = prefix.length;
+    expect(Array.from(keys)).toEqual([suffixOffset, 0, 0, 0, suffixOffset + 1, suffixOffset + 2, suffixOffset + 1]);
+    expect(Array.from({ length: message.length }, (_, row) => message.get(row))).toEqual([
+      'dense-zero-static-prefix',
+      null,
+      prefixValues[0],
+      prefixValues[0],
+      'dynamic-b',
+      'dynamic-a',
+      'dynamic-b',
+    ]);
+    expect(dictionary.data).toHaveLength(2);
+    expect(dictionary.data[0]).toBe(prefix.column.data[0]);
+  });
+
+  it('reuses the pinned cached dictionary object when overflow rows need no dynamic suffix', async () => {
+    const op = opContext.defineOp('static-only-overflow', (ctx) => {
+      const logger = createSpanLogger(ctx.buffer._logSchema, ctx.buffer);
+      for (let index = 0; index < 40; index++) logger._infoTemplate(0);
+      return ctx.ok(null);
+    });
+    const tracer = new TestTracer(opContext, createTestTracerOptions());
+    await tracer.trace('static-only-overflow', op);
+    const overflow = tracer.rootBuffers[0]._overflow;
+    if (!overflow) throw new Error('Expected static log rows to create an overflow segment');
+
+    const table = convertToArrowTable(overflow);
+    const { dictionary, keys, message } = requireMessageDictionary(table);
+    const prefix = getVocabularyDictionaryPrefix(overflow._vocabularyGeneration);
+    expect(dictionary).toBe(prefix.column);
+    expect(Array.from(keys)).toEqual(Array.from({ length: message.length }, () => 0));
+    expect(Array.from({ length: message.length }, (_, row) => message.get(row))).toEqual(
+      Array.from({ length: message.length }, () => prefix.column.get(0)),
+    );
+  });
+
   it('packs registered dense bindings for every level while dynamic rows stay in the raw message lane', async () => {
     const messages = [
       'dense info literal',
@@ -177,6 +256,11 @@ describe('global vocabulary dense decoding', () => {
     expect(Array.from({ length: 20 }, (_, index) => messageColumn.get(index + 2))).toEqual(
       Array.from({ length: 20 }, () => 'pinned generation literal'),
     );
+    const { dictionary } = requireMessageDictionary(table);
+    const prefix = getVocabularyDictionaryPrefix(buffer._vocabularyGeneration);
+    expect(dictionary.data[0]).toBe(prefix.column.data[0]);
+    expect(Array.from(dictionary)).toContain('pinned generation literal');
+    expect(Array.from(dictionary)).not.toContain('registered after buffer creation');
   });
 
   it('rejects a packed dense index outside the buffer generation', async () => {

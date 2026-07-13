@@ -18,10 +18,10 @@ pub trait SpanSource {
     /// Number of valid rows in THIS buffer (not counting overflow/children).
     fn row_count(&self) -> usize;
     fn timestamp(&self, row: usize) -> i64;
-    fn entry_type(&self, row: usize) -> u8;
-    /// Format-string template / span name / flag name for the row (`01f`: the
-    /// `message` column is dictionary-encoded and NEVER interpolated).
-    fn message(&self, row: usize) -> Option<&str>;
+    /// Private packed u32 row header: entry type in low 8 bits, vocabulary ID in high 24.
+    fn packed_header(&self, row: usize) -> u32;
+    /// Dynamic row text; static rows store no source string.
+    fn dynamic_message(&self, row: usize) -> Option<&str>;
     /// Callsite line for the row (`01f` lineNumber system column; 0 = unset).
     fn line_number(&self, row: usize) -> u32;
     /// Overflow continuation (same identity), yielded immediately after this buffer
@@ -46,11 +46,13 @@ impl SpanSource for SpanBuffer {
         self.timestamp_at(row).unwrap_or(0)
     }
 
-    fn entry_type(&self, row: usize) -> u8 {
-        self.entry_type_at(row).map(|e| e.as_u8()).unwrap_or(0)
+    fn packed_header(&self, row: usize) -> u32 {
+        self.entry_type_at(row)
+            .map(|entry_type| u32::from(entry_type.as_u8()))
+            .unwrap_or(0)
     }
 
-    fn message(&self, row: usize) -> Option<&str> {
+    fn dynamic_message(&self, row: usize) -> Option<&str> {
         self.message_at(row)
     }
 
@@ -95,7 +97,7 @@ pub struct MockSpan {
     pub identity: std::sync::Arc<SpanIdentity>,
     pub timestamps: Vec<i64>,
     pub entry_types: Vec<u8>,
-    /// Parallel to rows; `None` = null message.
+    /// Parallel to rows; `None` = null dynamic message.
     pub messages: Vec<Option<String>>,
     pub overflow: Option<Box<MockSpan>>,
     pub children: Vec<MockSpan>,
@@ -114,11 +116,11 @@ impl SpanSource for MockSpan {
         self.timestamps[row]
     }
 
-    fn entry_type(&self, row: usize) -> u8 {
-        self.entry_types[row]
+    fn packed_header(&self, row: usize) -> u32 {
+        u32::from(self.entry_types[row])
     }
 
-    fn message(&self, row: usize) -> Option<&str> {
+    fn dynamic_message(&self, row: usize) -> Option<&str> {
         self.messages.get(row).and_then(|m| m.as_deref())
     }
 
