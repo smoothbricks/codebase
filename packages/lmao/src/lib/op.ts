@@ -15,13 +15,21 @@
 
 import type { PreEncodedEntry } from '@smoothbricks/arrow-builder';
 import type { RemapDescriptor } from './logBinding.js';
-import { getPhysicalLayoutPlan, sealCallsitePlan, type CallsitePlan } from './physicalLayoutPlan.js';
+import { getPhysicalLayoutPlan, sealCallsitePlan } from './physicalLayoutPlan.js';
+import type {
+  ArrowExposurePlan,
+  CallsitePlan,
+  EagerColumnDescriptor,
+  PhysicalAppenders,
+} from './physicalLayoutPlan.js';
+import type { LogSchema } from './schema/LogSchema.js';
 import type { SpanContext } from './opContext/spanContextTypes.js';
 import type { OpContext, OpContextBinding } from './opContext/types.js';
 import type { Result } from './result.js';
 import { decodeRuntimeHint } from './runtimeHint.js';
 import { createSpanContextClass } from './spanContext.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
+import type { TimestampAppendPrimitive } from './traceRoot.js';
 import type { VocabularyGeneration } from './vocabularyRegistry.js';
 import type { WasmLayoutTemplate } from './wasm/wasmPhysicalLayout.js';
 
@@ -48,7 +56,7 @@ export interface OpCompileMetadata {
 }
 
 
-export interface OpMetadata {
+export interface OpMetadata<T extends LogSchema = LogSchema> {
   /** Op name for metrics tracking (distinct from span names which are provided at call sites) */
   readonly name: string;
   /** Package name from package.json */
@@ -68,14 +76,15 @@ export interface OpMetadata {
   readonly git_sha_entry: PreEncodedEntry;
   /** Startup-resolved physical layout used by span setup; absent only on raw fallback metadata. */
   readonly _physicalLayoutPlan?: {
-    readonly eagerColumns: import('./physicalLayoutPlan.js').EagerColumnDescriptor;
+    readonly SpanBufferClass: SpanBufferConstructor<T>;
+    readonly eagerColumns: EagerColumnDescriptor;
     readonly vocabularyGeneration: VocabularyGeneration;
     readonly localMessageDictionary: readonly number[];
     readonly encodeLocalMessage: (globalDenseIndex: number) => number;
     readonly wasmLayout: WasmLayoutTemplate;
-    readonly appendLogEntry: import('./traceRoot.js').TimestampAppendPrimitive;
-    readonly arrowExposure: import('./physicalLayoutPlan.js').ArrowExposurePlan;
-    readonly appenders: import('./physicalLayoutPlan.js').PhysicalAppenders;
+    readonly appendLogEntry: TimestampAppendPrimitive;
+    readonly arrowExposure: ArrowExposurePlan;
+    readonly appenders: PhysicalAppenders;
   };
 }
 //#endregion smoo/lmao!n/opcontext-hierarchy
