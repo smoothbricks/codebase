@@ -12,6 +12,42 @@ const ZIG_STEP_PATTERN = /\bb\.step\(\s*["']([^"']+)["']\s*,/g;
 const VALID_ZIG_STEP_NAME = /^[A-Za-z0-9_-]+$/;
 const BUILD_OUTPUT_TARGET_PATTERN = /-(?:js|web|html|css|ios|android|native|napi|bun|wasm)$/;
 
+// Cargo workspace inference: a package.json sitting next to a Cargo.toml that
+// declares [workspace] gets direct cargo-test/test targets, cargo-lint feeding
+// the lint aggregate, mutation (cargo-mutants), bench, and — per cdylib member
+// crate — a cargo-wasm build producing dist/<crate>.wasm. Explicit nx.targets
+// entries in the package.json always win over inference.
+const CARGO_WORKSPACE_PATTERN = /^\s*\[workspace\]/m;
+const CARGO_MEMBERS_PATTERN = /^\s*members\s*=\s*\[([^\]]*)\]/m;
+const CARGO_MEMBER_ENTRY_PATTERN = /["']([^"']+)["']/g;
+const CARGO_PACKAGE_NAME_PATTERN = /^\s*name\s*=\s*["']([^"']+)["']/m;
+const CARGO_CDYLIB_PATTERN = /^\s*crate-type\s*=\s*\[[^\]]*["']cdylib["']/m;
+const CARGO_WASM_RELEASE_PROFILE_PATTERN = /^\s*\[profile\.wasm-release\]/m;
+const CARGO_INPUTS = [
+  '{projectRoot}/**/*.rs',
+  '{projectRoot}/**/Cargo.toml',
+  '{projectRoot}/Cargo.lock',
+  '{projectRoot}/.cargo/config.toml',
+  '!{projectRoot}/target/**',
+];
+
+function createCargoTestTarget(projectRoot: string): TargetConfiguration {
+  return {
+    executor: '@smoothbricks/nx-plugin:bounded-exec',
+    cache: true,
+    inputs: CARGO_INPUTS,
+    options: {
+      command: 'cargo test --workspace',
+      cwd: projectRoot,
+      timeoutMs: 600000,
+      killAfterMs: 10000,
+    },
+    configurations: {
+      production: { command: 'cargo test --workspace --release' },
+    },
+  };
+}
+
 export const createNodesV2: CreateNodesV2 = [
   '**/package.json',
   async (projectConfigurationFiles, _options, context) => {
@@ -87,6 +123,73 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     validationTargets.push('typecheck-tests');
   } else if (hasLibTsconfig) {
     validationTargets.push('typecheck');
+  }
+
+  const cargo = await readCargoWorkspace(absoluteProjectRoot);
+  if (cargo) {
+    const declared = packageJson.nx?.targets ?? {};
+    if (!('cargo-test' in declared)) {
+      targets['cargo-test'] = createCargoTestTarget(projectRoot);
+    }
+    if (!('cargo-lint' in declared)) {
+      targets['cargo-lint'] = {
+        executor: 'nx:run-commands',
+        cache: true,
+        inputs: CARGO_INPUTS,
+        options: {
+          commands: ['cargo fmt --all --check', 'cargo clippy --workspace --all-targets -- -D warnings'],
+          cwd: projectRoot,
+          parallel: false,
+        },
+      };
+    }
+    validationTargets.push('cargo-lint');
+    if (!('test' in declared) && typeof packageJson.scripts?.test !== 'string') {
+      // Execute Cargo directly: workspace targetDefaults may replace test.dependsOn.
+      targets.test = createCargoTestTarget(projectRoot);
+    }
+    if (!('mutation' in declared)) {
+      // Mutation runs are minutes-to-hours: never cached, never part of build/lint.
+      // CI runs these per-PR via `cargo mutants --in-diff` (see mutants.toml docs).
+      targets.mutation = {
+        executor: 'nx:run-commands',
+        cache: false,
+        options: { command: 'cargo mutants --workspace', cwd: projectRoot },
+      };
+    }
+    if (!('bench' in declared)) {
+      targets.bench = {
+        executor: 'nx:run-commands',
+        cache: false,
+        options: { command: 'cargo bench --workspace', cwd: projectRoot },
+      };
+    }
+    if (cargo.cdylibCrates.length > 0 && !('cargo-wasm' in declared)) {
+      const profile = cargo.hasWasmReleaseProfile ? 'wasm-release' : 'release';
+      const buildAndCopy = (crate: string, profileName: string | null) => {
+        const artifact = crate.replace(/-/g, '_');
+        const profileFlag = profileName === null ? '' : ` --profile ${profileName}`;
+        const outputDirectory = profileName ?? 'debug';
+        return `cargo build${profileFlag} --target wasm32-unknown-unknown -p ${crate} && mkdir -p dist && cp target/wasm32-unknown-unknown/${outputDirectory}/${artifact}.wasm dist/${artifact}.wasm`;
+      };
+      targets['cargo-wasm'] = {
+        executor: 'nx:run-commands',
+        cache: true,
+        inputs: CARGO_INPUTS,
+        outputs: ['{projectRoot}/dist/**/*.wasm'],
+        options: {
+          commands: cargo.cdylibCrates.map((crate) => buildAndCopy(crate, profile)),
+          cwd: projectRoot,
+          parallel: false,
+        },
+        configurations: {
+          development: {
+            commands: cargo.cdylibCrates.map((crate) => buildAndCopy(crate, null)),
+          },
+        },
+      };
+      hasBuildOutputTarget = true;
+    }
   }
 
   const zigSteps = await readZigSteps(absoluteProjectRoot, projectRoot);
@@ -209,6 +312,43 @@ function hasPackageLocalBuildOutputTarget(packageJson: PackageJson): boolean {
   }
 
   return Object.keys(targets).some((targetName) => BUILD_OUTPUT_TARGET_PATTERN.test(targetName));
+}
+
+interface CargoWorkspace {
+  cdylibCrates: string[];
+  hasWasmReleaseProfile: boolean;
+}
+
+async function readCargoWorkspace(absoluteProjectRoot: string): Promise<CargoWorkspace | null> {
+  const cargoTomlPath = join(absoluteProjectRoot, 'Cargo.toml');
+  if (!existsSync(cargoTomlPath)) {
+    return null;
+  }
+
+  const cargoToml = await readFile(cargoTomlPath, 'utf-8');
+  if (!CARGO_WORKSPACE_PATTERN.test(cargoToml)) {
+    // Member crates get their targets from the workspace-root package.json,
+    // never per-crate — one Nx project per Cargo workspace.
+    return null;
+  }
+
+  const cdylibCrates: string[] = [];
+  const membersList = CARGO_MEMBERS_PATTERN.exec(cargoToml)?.[1] ?? '';
+  for (const match of membersList.matchAll(CARGO_MEMBER_ENTRY_PATTERN)) {
+    const memberTomlPath = join(absoluteProjectRoot, match[1], 'Cargo.toml');
+    if (!existsSync(memberTomlPath)) {
+      continue;
+    }
+    const memberToml = await readFile(memberTomlPath, 'utf-8');
+    if (CARGO_CDYLIB_PATTERN.test(memberToml)) {
+      const name = CARGO_PACKAGE_NAME_PATTERN.exec(memberToml)?.[1];
+      if (name && !cdylibCrates.includes(name)) {
+        cdylibCrates.push(name);
+      }
+    }
+  }
+
+  return { cdylibCrates, hasWasmReleaseProfile: CARGO_WASM_RELEASE_PROFILE_PATTERN.test(cargoToml) };
 }
 
 async function readZigSteps(absoluteProjectRoot: string, projectRoot: string): Promise<string[]> {

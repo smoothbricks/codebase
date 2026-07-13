@@ -39,6 +39,7 @@ in {
       targets = ["wasm32-unknown-unknown"];
     })
     cargo-nextest # Rust test runner
+    cargo-mutants # Mutation target inferred by @smoothbricks/nx-plugin
     sccache # Shared Rust compile cache (cowshed cache layer 3)
     # Git hooks and formatters
     git-format-staged
