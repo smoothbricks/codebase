@@ -8,7 +8,138 @@
 //! (Rust's default SipHash was separately measured losing to JS Map — 5.8 µs vs
 //! 3.3 µs — which is why the hasher is FxHash; see `benches/flush.rs`.)
 
+use std::sync::{Arc, LazyLock};
+
+use arrow_array::StringArray;
+use arrow_schema::ArrowError;
+use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use rustc_hash::{FxHashMap, FxHashSet};
+
+use crate::generated::vocabulary::{
+    VOCABULARY_DENSE_INDICES, VOCABULARY_IDS, VOCABULARY_KIND_TAGS, VOCABULARY_VALUES,
+};
+
+pub const LOG_TEMPLATE_KIND: u8 = 1;
+pub const SPAN_NAME_KIND: u8 = 2;
+
+struct StaticVocabulary {
+    array: Arc<StringArray>,
+    utf8: Vec<u8>,
+    offsets: Vec<i32>,
+    reverse: FxHashMap<&'static str, u32>,
+}
+
+static STATIC_VOCABULARY: LazyLock<StaticVocabulary> = LazyLock::new(|| {
+    let mut utf8 = Vec::new();
+    let mut offsets = Vec::with_capacity(VOCABULARY_IDS.len() + 1);
+    let mut reverse = FxHashMap::default();
+    offsets.push(0);
+    for (ordinal, dense_index) in VOCABULARY_DENSE_INDICES.iter().copied().enumerate() {
+        let value = VOCABULARY_VALUES[dense_index as usize];
+        reverse.entry(value).or_insert(ordinal as u32);
+        utf8.extend_from_slice(value.as_bytes());
+        offsets.push(i32::try_from(utf8.len()).expect("generated vocabulary exceeds Utf8 range"));
+    }
+    let array = Arc::new(StringArray::new(
+        OffsetBuffer::new(ScalarBuffer::from(offsets.clone())),
+        Buffer::from_vec(utf8.clone()),
+        None,
+    ));
+    StaticVocabulary { array, utf8, offsets, reverse }
+});
+
+pub fn static_vocabulary_dictionary() -> Arc<StringArray> {
+    Arc::clone(&STATIC_VOCABULARY.array)
+}
+
+/// Build a mixed dictionary with two bulk prefix copies (offsets and bytes), then
+/// encode only novel first-seen dynamic suffix values. Arrow's Utf8 array requires
+/// contiguous buffers; unlike Utf8View it cannot reference disjoint static/dynamic
+/// buffers, and the public schema is frozen as Utf8 rather than Utf8View.
+pub(crate) fn mixed_vocabulary_dictionary(
+    dynamic_values: &[&str],
+) -> Result<Arc<StringArray>, ArrowError> {
+    let dynamic_bytes = dynamic_values.iter().try_fold(0usize, |total, value| {
+        total.checked_add(value.len()).ok_or_else(|| {
+            ArrowError::InvalidArgumentError("message dictionary byte length overflow".into())
+        })
+    })?;
+    let total_bytes = STATIC_VOCABULARY.utf8.len().checked_add(dynamic_bytes).ok_or_else(|| {
+        ArrowError::InvalidArgumentError("message dictionary byte length overflow".into())
+    })?;
+    if total_bytes > i32::MAX as usize {
+        return Err(ArrowError::InvalidArgumentError(
+            "message dictionary exceeds Utf8 offset range".into(),
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(total_bytes);
+    bytes.extend_from_slice(&STATIC_VOCABULARY.utf8);
+    let mut offsets = Vec::with_capacity(STATIC_VOCABULARY.offsets.len() + dynamic_values.len());
+    offsets.extend_from_slice(&STATIC_VOCABULARY.offsets);
+    let mut offset = STATIC_VOCABULARY.utf8.len();
+    for value in dynamic_values {
+        bytes.extend_from_slice(value.as_bytes());
+        offset += value.len();
+        offsets.push(offset as i32);
+    }
+    Ok(Arc::new(StringArray::new(
+        OffsetBuffer::new(ScalarBuffer::from(offsets)),
+        Buffer::from_vec(bytes),
+        None,
+    )))
+}
+
+pub fn static_vocabulary_key(id: u32, required_kind: u8) -> Result<u32, StaticLookupError> {
+    let ordinal = VOCABULARY_IDS
+        .binary_search(&id)
+        .map_err(|_| StaticLookupError::UnknownId(id))?;
+    let actual = VOCABULARY_KIND_TAGS[ordinal];
+    if actual != required_kind {
+        return Err(StaticLookupError::KindMismatch { id, expected: required_kind, actual });
+    }
+    Ok(ordinal as u32)
+}
+
+pub fn static_vocabulary_value_key(value: &str) -> Option<u32> {
+    STATIC_VOCABULARY.reverse.get(value).copied()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticLookupError {
+    UnknownId(u32),
+    KindMismatch { id: u32, expected: u8, actual: u8 },
+}
+
+/// Flush-local novel dynamic values in first-observation order. Empty construction
+/// is allocation-free, so static-only batches never allocate a dynamic map/vector.
+#[derive(Debug, Default)]
+pub(crate) struct FirstSeenDictionary<'a> {
+    pub values: Vec<&'a str>,
+    index: FxHashMap<&'a str, u32>,
+}
+
+impl<'a> FirstSeenDictionary<'a> {
+    #[inline]
+    pub fn observe(&mut self, value: &'a str) {
+        if self.index.contains_key(value) {
+            return;
+        }
+        let index = self.values.len() as u32;
+        self.values.push(value);
+        self.index.insert(value, index);
+    }
+
+    #[inline]
+    pub fn index_of(&self, value: &str) -> Option<u32> {
+        self.index.get(value).copied()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}
 
 /// Dictionary accumulated in pass 1 for one string column
 /// (`ColumnDictionary` in convertToArrow.ts). Borrows its keys from the buffers.
