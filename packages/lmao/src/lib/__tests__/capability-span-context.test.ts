@@ -38,7 +38,9 @@ type CapturedContext = SpanContext<Context>;
 const TEST_FAILURE = defineCodeError('TEST_FAILURE')<{ reason: string }>();
 const CAPABILITY_NAMES = ['tag', 'log', 'ff', 'span', 'spanSync', 'ok', 'err', 'setScope', 'deps'];
 const RESULT_ONLY_KEYS = [
+  '_spanBuffer',
   '_buffer',
+  '_appendLogEntry',
   '_schema',
   '_logBinding',
   '_physicalLayoutPlan',
@@ -48,7 +50,9 @@ const RESULT_ONLY_KEYS = [
   'err',
 ];
 const LOG_RESULT_KEYS = [
+  '_spanBuffer',
   '_buffer',
+  '_appendLogEntry',
   '_schema',
   '_logBinding',
   '_physicalLayoutPlan',
@@ -60,7 +64,9 @@ const LOG_RESULT_KEYS = [
   'err',
 ];
 const LOG_SPAN_RESULT_KEYS = [
+  '_spanBuffer',
   '_buffer',
+  '_appendLogEntry',
   '_schema',
   '_logBinding',
   '_physicalLayoutPlan',
@@ -74,7 +80,9 @@ const LOG_SPAN_RESULT_KEYS = [
   'spanSync',
 ];
 const FULL_FALLBACK_KEYS = [
+  '_spanBuffer',
   '_buffer',
+  '_appendLogEntry',
   '_schema',
   '_logBinding',
   '_physicalLayoutPlan',
@@ -95,6 +103,37 @@ const FULL_FALLBACK_KEYS = [
 function requireCaptured(value: CapturedContext | undefined, label: string): CapturedContext {
   if (!value) throw new Error(`missing ${label} context`);
   return value;
+}
+
+function requireObject(value: unknown, label: string): object {
+  if ((typeof value !== 'object' && typeof value !== 'function') || value === null) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  return value;
+}
+
+function expectContextWriterState(ctx: CapturedContext): void {
+  expect(Object.hasOwn(ctx, '_spanBuffer')).toBe(true);
+  expect(Object.hasOwn(ctx, '_buffer')).toBe(true);
+  expect(Object.hasOwn(ctx, '_appendLogEntry')).toBe(true);
+  expect(Object.hasOwn(ctx, '_physicalLayoutPlan')).toBe(true);
+  expect(Object.hasOwn(ctx, '_state')).toBe(false);
+  expect(Object.hasOwn(ctx, '_traceRoot')).toBe(false);
+  expect(Object.hasOwn(ctx, '_appendWriterEntry')).toBe(false);
+}
+
+function expectThinWriter(writer: object, state: CapturedContext): void {
+  expect(Reflect.ownKeys(writer)).toEqual(['_state']);
+  expect(Reflect.get(writer, '_state')).toBe(state);
+  for (const duplicatedField of [
+    '_buffer',
+    '_spanBuffer',
+    '_traceRoot',
+    '_appendLogEntry',
+    '_physicalLayoutPlan',
+  ]) {
+    expect(Object.hasOwn(writer, duplicatedField)).toBe(false);
+  }
 }
 
 function constructorOf(value: object): Function {
@@ -189,6 +228,13 @@ describe('capability-specialized SpanContext shapes', () => {
             const mask = maskIndex << 16;
             const captured = await captureRoot(RUNTIME_HINT_ANALYZED_VALID | mask | 2, `mask-${maskIndex}`);
             expect(capabilitySnapshot(captured)).toEqual(expectedCapabilityNames(mask));
+            expectContextWriterState(captured);
+            const needsLogger = (mask & (RUNTIME_HINT_LOG | RUNTIME_HINT_FF | RUNTIME_HINT_SCOPE)) !== 0;
+            expect(Object.hasOwn(captured, '_spanLogger')).toBe(needsLogger);
+            if (needsLogger) {
+              expectThinWriter(requireObject(Reflect.get(captured, '_spanLogger'), 'capability logger'), captured);
+            }
+            if ((mask & RUNTIME_HINT_TAG) !== 0) expectThinWriter(captured.tag, captured);
             expect(mask & ~RUNTIME_HINT_CAPABILITIES_MASK).toBe(0);
           }
         },
@@ -259,6 +305,77 @@ describe('specialized SpanContext runtime semantics', () => {
       return super.getSync(ctx, flag);
     }
   }
+
+  it('reuses one context-owned WriterState across logger, tag, and result chains', async () => {
+    function inspectWriters(ctx: CapturedContext, label: string): void {
+      expectContextWriterState(ctx);
+      expect(Reflect.get(ctx, '_spanBuffer')).toBe(Reflect.get(ctx, '_buffer'));
+
+      const tag = ctx.tag;
+      expectThinWriter(tag, ctx);
+      expect(tag.marker(`${label}-tag`)).toBe(tag);
+
+      const logger = ctx.log;
+      expectThinWriter(logger, ctx);
+      expect(Object.is(logger.info(`${label}-log`).marker(`${label}-log-marker`), logger)).toBe(true);
+
+      const ok = ctx.ok({ label });
+      expect(Reflect.get(ok, '_state')).toBe(ctx);
+      expect(Object.hasOwn(ok, '_writer')).toBe(false);
+      expect(ok.with({ marker: `${label}-ok` })).toBe(ok);
+      const okWriter = requireObject(Reflect.get(ok, '_writer'), `${label} Ok writer`);
+      expectThinWriter(okWriter, ctx);
+      expect(ok.message(`${label} ok`).line(101)).toBe(ok);
+      expect(Reflect.get(ok, '_writer')).toBe(okWriter);
+
+      const err = ctx.err(TEST_FAILURE({ reason: label }));
+      expect(Reflect.get(err, '_state')).toBe(ctx);
+      expect(Object.hasOwn(err, '_writer')).toBe(false);
+      expect(err.with({ marker: `${label}-err` })).toBe(err);
+      const errWriter = requireObject(Reflect.get(err, '_writer'), `${label} Err writer`);
+      expectThinWriter(errWriter, ctx);
+      expect(err.message(`${label} error`).line(202)).toBe(err);
+      expect(Reflect.get(err, '_writer')).toBe(errWriter);
+    }
+
+    async function run(runtimeHint: number, name: string): Promise<void> {
+      let rootContext: CapturedContext | undefined;
+      let childContext: CapturedContext | undefined;
+      const child = context.defineOp(
+        `${name}-child`,
+        (ctx) => {
+          childContext = ctx;
+          inspectWriters(ctx, `${name}-child`);
+          return ctx.ok('child');
+        },
+        undefined,
+        { runtimeHint },
+      );
+      const root = context.defineOp(
+        name,
+        async (ctx) => {
+          rootContext = ctx;
+          inspectWriters(ctx, `${name}-root`);
+          const childResult = await ctx.span(`${name}-child`, child);
+          if (!childResult.success) throw new Error(`${name} child failed`);
+          return ctx.ok('root');
+        },
+        undefined,
+        { runtimeHint },
+      );
+      const tracer = new TestTracer(context, createTestTracerOptions());
+      const result = await tracer.trace(name, root);
+
+      expect(result.success).toBe(true);
+      const capturedRoot = requireCaptured(rootContext, `${name} root`);
+      const capturedChild = requireCaptured(childContext, `${name} child`);
+      expect(capturedRoot).not.toBe(capturedChild);
+      expect(Reflect.get(capturedRoot, '_spanBuffer')).not.toBe(Reflect.get(capturedChild, '_spanBuffer'));
+    }
+
+    await run(RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_FULL_CAPABILITIES | 8, 'shared-state-specialized');
+    await run(0, 'shared-state-fallback');
+  });
 
   it('binds repeated feature evaluations to contexts created by one CallsitePlan', async () => {
     const evaluator = new CapturingEvaluator(flags.schema, { enabled: true });
@@ -342,6 +459,15 @@ describe('specialized SpanContext runtime semantics', () => {
     const [overflowChild] = iterateSpanChildren(overflowRoot);
     if (!overflowChild) throw new Error('missing overflow child buffer');
     expect(overflowChild._overflow).toBeDefined();
+    expectContextWriterState(capturedRoot);
+    expectContextWriterState(capturedChild);
+    expectThinWriter(capturedRoot.log, capturedRoot);
+    expectThinWriter(capturedChild.log, capturedChild);
+    expect(capturedRoot).not.toBe(capturedChild);
+    expect(Reflect.get(capturedRoot, '_spanBuffer')).toBe(overflowRoot);
+    expect(Reflect.get(capturedRoot, '_buffer')).toBe(overflowRoot);
+    expect(Reflect.get(capturedChild, '_spanBuffer')).toBe(overflowChild);
+    expect(Reflect.get(capturedChild, '_buffer')).toBe(overflowChild._overflow);
   });
 
   it('matches ok, err, log, tag, span, and scope semantics between specialized and fallback contexts', async () => {

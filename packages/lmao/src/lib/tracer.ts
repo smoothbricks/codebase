@@ -739,8 +739,6 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
     return new callsitePlan.SpanContextClass(
       buffer,
       schema,
-      callsitePlan.newSpanLogger?.(buffer),
-      callsitePlan.newTagWriter?.(buffer),
       callsitePlan,
       this.ctxDefaults,
       overrides,
@@ -788,7 +786,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
     ctx: SpanContextInstance<OpContextOf<B>>,
     fn: (ctx: SpanContext<OpContextOf<B>>) => Result<S, E> | Promise<Result<S, E>>,
   ): Result<S, E> | Promise<Result<S, E>> {
-    const buffer = ctx._buffer;
+    const buffer = ctx._spanBuffer;
 
     this.onTraceStart(buffer);
 
@@ -846,7 +844,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
     ctx: SpanContextInstance<OpContextOf<B>>,
     fn: (ctx: SpanContext<OpContextOf<B>>) => unknown,
   ): unknown {
-    const buffer = ctx._buffer;
+    const buffer = ctx._spanBuffer;
 
     // Call trace start hook
     this.onTraceStart(buffer);

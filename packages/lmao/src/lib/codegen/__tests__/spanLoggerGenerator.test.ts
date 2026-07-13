@@ -56,31 +56,46 @@ describe('createSpanLoggerClass', () => {
   });
 
   describe('instance creation', () => {
-    it('should create instance with buffer and createNextBuffer', () => {
+    it('should create instance with a state-backed buffer getter', () => {
       const schema = defineLogSchema({ userId: S.category() });
       const { buffer, logger } = createTestLogger(schema);
 
       expect(logger).toBeDefined();
-      expect(logger._buffer).toBe(buffer);
+      expect(Reflect.get(Reflect.get(logger, '_state'), 'buffer')).toBe(buffer);
       expect(buffer._scopeValues).toBeDefined();
     });
 
-    it('should start with _writeIndex = 1', () => {
+    it('should start at the first append row', () => {
       const schema = defineLogSchema({});
-      const { logger } = createTestLogger(schema);
+      const { buffer } = createTestLogger(schema);
 
-      expect(logger._writeIndex).toBe(1);
+      expect(buffer._writeIndex - 1).toBe(1);
+    });
+    it('owns only the shared WriterState reference', () => {
+      const schema = defineLogSchema({ userId: S.category() });
+      const { buffer, logger } = createTestLogger(schema);
+
+      expect(Reflect.ownKeys(logger)).toEqual(['_state']);
+      expect(Object.hasOwn(logger, '_buffer')).toBe(false);
+      expect(Object.hasOwn(logger, '_writeIndex')).toBe(false);
+      expect(Object.hasOwn(logger, '_spanBuffer')).toBe(false);
+      expect(Object.hasOwn(logger, '_traceRoot')).toBe(false);
+      expect(Object.hasOwn(logger, '_appendLogEntry')).toBe(false);
+      expect(Object.hasOwn(logger, '_physicalLayoutPlan')).toBe(false);
+
+      const state = Reflect.get(logger, '_state');
+      expect(Reflect.get(state, 'buffer')).toBe(buffer);
     });
   });
 
   describe('logging methods', () => {
-    it('should increment _writeIndex on info()', () => {
+    it('should advance the active buffer write index on info()', () => {
       const schema = defineLogSchema({ userId: S.category() });
-      const { logger } = createTestLogger(schema);
+      const { buffer, logger } = createTestLogger(schema);
 
-      expect(logger._writeIndex).toBe(1);
+      expect(buffer._writeIndex - 1).toBe(1);
       logger.info('Test message');
-      expect(logger._writeIndex).toBe(2);
+      expect(buffer._writeIndex - 1).toBe(2);
     });
 
     it('should write entry type for info()', () => {
@@ -150,7 +165,7 @@ describe('createSpanLoggerClass', () => {
       // FluentLogEntry includes logging methods for continued chaining
       logger.info('First').info('Second').warn('Third');
 
-      expect(logger._writeIndex).toBe(4);
+      expect(buffer._writeIndex - 1).toBe(4);
       expect(buffer.entry_type[2]).toBe(ENTRY_TYPE_INFO);
       expect(buffer.entry_type[3]).toBe(ENTRY_TYPE_INFO);
       expect(buffer.entry_type[4]).toBe(ENTRY_TYPE_WARN);

@@ -31,9 +31,8 @@
  * ```
  */
 
-import type { ResultWriter, ResultWriterConstructor } from './codegen/fixedPositionWriterGenerator.js';
+import type { ResultWriter, WriterState } from './codegen/fixedPositionWriterGenerator.js';
 import type { InferSchema, LogSchema } from './schema/types.js';
-import type { AnySpanBuffer } from './types.js';
 
 // =============================================================================
 // TAGGED ERROR INTERFACE
@@ -68,14 +67,10 @@ type BoundResultWriter<T extends LogSchema, R, E> = ResultWriter<T, R, E>;
 
 function ensureResultWriter<T extends LogSchema, R, E>(
   writer: BoundResultWriter<T, R, E> | undefined,
-  ResultWriterClass: ResultWriterConstructor<T> | undefined,
-  buffer: AnySpanBuffer | undefined,
-  resultOrError: R | E,
-  isError: boolean,
+  state: WriterState | undefined,
 ): BoundResultWriter<T, R, E> | undefined {
-  if (writer) return writer;
-  if (!ResultWriterClass || !buffer) return undefined;
-  return new ResultWriterClass<R, E>(buffer, resultOrError, isError);
+  if (writer || !state) return writer;
+  return new state._physicalLayoutPlan.ResultWriterClass<T, R, E>(state);
 }
 
 function isErrPredicate<E>(value: ErrMatcher<E>): value is ErrPredicate<E> {
@@ -117,19 +112,18 @@ function createCodeErrorValue<Code extends string, Fields extends object>(
 export class Ok<V, T extends LogSchema = LogSchema> {
   readonly value: V;
 
-  private readonly _buffer: AnySpanBuffer | undefined;
-  private readonly _ResultWriterClass: ResultWriterConstructor<T> | undefined;
-  private _writer: BoundResultWriter<T, V, never> | undefined;
+  private readonly _state: WriterState | undefined;
+  private declare _writer: BoundResultWriter<T, V, never> | undefined;
 
-  constructor(value: V, buffer?: AnySpanBuffer, ResultWriterClass?: ResultWriterConstructor<T>) {
+  constructor(value: V, state?: WriterState) {
     this.value = value;
-    this._buffer = buffer;
-    this._ResultWriterClass = ResultWriterClass;
+    this._state = state;
   }
 
   private _resultWriter(): BoundResultWriter<T, V, never> | undefined {
-    this._writer = ensureResultWriter<T, V, never>(this._writer, this._ResultWriterClass, this._buffer, this.value, false);
-    return this._writer;
+    const writer = ensureResultWriter<T, V, never>(this._writer, this._state);
+    if (writer) this._writer = writer;
+    return writer;
   }
 
   /** Discriminant for type narrowing. */
@@ -166,7 +160,7 @@ export class Ok<V, T extends LogSchema = LogSchema> {
 
   /** Transform the success value. */
   map<U>(fn: (value: V) => U): Ok<U, T> {
-    return new Ok<U, T>(fn(this.value), this._buffer, this._ResultWriterClass);
+    return new Ok<U, T>(fn(this.value), this._state);
   }
 
   /** No-op for Ok (error transformation). */
@@ -264,19 +258,18 @@ export class Ok<V, T extends LogSchema = LogSchema> {
 export class Err<E, T extends LogSchema = LogSchema> {
   readonly error: E;
 
-  private readonly _buffer: AnySpanBuffer | undefined;
-  private readonly _ResultWriterClass: ResultWriterConstructor<T> | undefined;
-  private _writer: BoundResultWriter<T, never, E> | undefined;
+  private readonly _state: WriterState | undefined;
+  private declare _writer: BoundResultWriter<T, never, E> | undefined;
 
-  constructor(error: E, buffer?: AnySpanBuffer, ResultWriterClass?: ResultWriterConstructor<T>) {
+  constructor(error: E, state?: WriterState) {
     this.error = error;
-    this._buffer = buffer;
-    this._ResultWriterClass = ResultWriterClass;
+    this._state = state;
   }
 
   private _resultWriter(): BoundResultWriter<T, never, E> | undefined {
-    this._writer = ensureResultWriter<T, never, E>(this._writer, this._ResultWriterClass, this._buffer, this.error, true);
-    return this._writer;
+    const writer = ensureResultWriter<T, never, E>(this._writer, this._state);
+    if (writer) this._writer = writer;
+    return writer;
   }
 
   /** Discriminant for type narrowing. */
@@ -343,7 +336,7 @@ export class Err<E, T extends LogSchema = LogSchema> {
 
   /** Transform the error. */
   mapErr<F>(fn: (error: E) => F): Err<F, T> {
-    return new Err<F, T>(fn(this.error), this._buffer, this._ResultWriterClass);
+    return new Err<F, T>(fn(this.error), this._state);
   }
 
   /** No-op for Err (returns self). */
