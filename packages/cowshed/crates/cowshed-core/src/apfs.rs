@@ -232,6 +232,29 @@ impl std::error::Error for CloneFileError {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VolumeResolutionFailure {
+    Missing,
+    Ambiguous(Vec<String>),
+    InvalidPlist(String),
+}
+
+impl fmt::Display for VolumeResolutionFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => f.write_str("no APFS volume device was reported"),
+            Self::Ambiguous(devices) => {
+                write!(
+                    f,
+                    "multiple APFS volume devices were reported: {}",
+                    devices.join(", ")
+                )
+            }
+            Self::InvalidPlist(message) => write!(f, "invalid APFS list plist: {message}"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ApfsError {
     InvalidImagePath {
@@ -252,6 +275,15 @@ pub enum ApfsError {
     },
     UnsupportedMacOsVersion(String),
     InvalidAttachmentPlist(String),
+    VolumeResolutionFailed {
+        candidate: String,
+        reason: VolumeResolutionFailure,
+    },
+    VolumeResolutionAndDetachFailed {
+        whole_device: String,
+        resolution: Box<ApfsError>,
+        detach: Box<ApfsError>,
+    },
     VerificationFailed {
         device: String,
         output: CommandOutput,
@@ -303,6 +335,13 @@ impl fmt::Display for ApfsError {
             Self::InvalidAttachmentPlist(message) => {
                 write!(f, "invalid attachment plist: {message}")
             }
+            Self::VolumeResolutionFailed { candidate, reason } => {
+                write!(f, "could not resolve APFS volume for {candidate}: {reason}")
+            }
+            Self::VolumeResolutionAndDetachFailed { whole_device, .. } => write!(
+                f,
+                "resolving the APFS volume attached from {whole_device} failed, and detaching it also failed"
+            ),
             Self::VerificationFailed { device, output } => write!(
                 f,
                 "fsck_apfs failed for {device} with status {}",
@@ -329,6 +368,7 @@ impl std::error::Error for ApfsError {
             Self::FileOperation { source, .. } => Some(source),
             Self::Clone(error) => Some(error),
             Self::VerificationAndDetachFailed { detach, .. } => Some(detach),
+            Self::VolumeResolutionAndDetachFailed { detach, .. } => Some(detach),
             _ => None,
         }
     }
@@ -467,6 +507,21 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
         self.run_checked("create SPARSE image", command).map(|_| ())
     }
 
+    fn resolve_apfs_volume(&self, candidate: &str) -> Result<String, ApfsError> {
+        let output = self.run_checked(
+            "resolve APFS volume",
+            CommandRequest::new(
+                DISKUTIL,
+                [
+                    OsString::from("apfs"),
+                    OsString::from("list"),
+                    OsString::from("-plist"),
+                ],
+            ),
+        )?;
+        parse_volume_list_plist(candidate, &output.stdout)
+    }
+
     fn attach_without_mounting(
         &self,
         image: &Path,
@@ -499,7 +554,20 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
             ),
         };
         let output = self.run_checked("attach image without mounting", request)?;
-        let (whole_device, volume_device) = parse_attachment_plist(&output.stdout)?;
+        let (whole_device, candidate) = parse_attachment_plist(&output.stdout)?;
+        let volume_device = match self.resolve_apfs_volume(&candidate) {
+            Ok(volume_device) => volume_device,
+            Err(resolution) => {
+                return match self.detach_device(format, &whole_device, false) {
+                    Ok(()) => Err(resolution),
+                    Err(detach) => Err(ApfsError::VolumeResolutionAndDetachFailed {
+                        whole_device,
+                        resolution: Box::new(resolution),
+                        detach: Box::new(detach),
+                    }),
+                };
+            }
+        };
         Ok(AttachedImage {
             image: image.to_owned(),
             format,
@@ -693,7 +761,7 @@ impl<R: CommandRunner> ApfsBackend for MacOsApfsBackend<R> {
             FSCK_APFS,
             [
                 OsString::from("-q"),
-                OsString::from(&attachment.volume_device),
+                OsString::from(raw_device_from(&attachment.volume_device)),
             ],
         );
         let output = self.runner.run(&request)?;
@@ -801,23 +869,37 @@ fn asif_is_unsupported(output: &CommandOutput) -> bool {
 }
 
 fn parse_attachment_plist(bytes: &[u8]) -> Result<(String, String), ApfsError> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| ApfsError::InvalidAttachmentPlist("output is not UTF-8 XML".into()))?;
+    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|error| ApfsError::InvalidAttachmentPlist(error.to_string()))?;
+    let system_entities = value
+        .as_dictionary()
+        .and_then(|root| root.get("system-entities"))
+        .and_then(plist::Value::as_array)
+        .ok_or_else(|| ApfsError::InvalidAttachmentPlist("missing system-entities array".into()))?;
     let mut entities = Vec::new();
-    let mut cursor = 0;
-    while let Some(relative) = text[cursor..].find("<key>dev-entry</key>") {
-        let start = cursor + relative;
-        let end = text[start..]
-            .find("</dict>")
-            .map(|offset| start + offset)
-            .unwrap_or(text.len());
-        let dict = &text[start..end];
-        if let Some(device) = plist_string_after_key(dict, "dev-entry") {
-            let hint = plist_string_after_key(dict, "content-hint").unwrap_or_default();
-            let kind = plist_string_after_key(dict, "volume-kind").unwrap_or_default();
-            entities.push((xml_unescape(device), xml_unescape(hint), xml_unescape(kind)));
-        }
-        cursor = end.saturating_add(7);
+    for entity in system_entities {
+        let dictionary = entity.as_dictionary().ok_or_else(|| {
+            ApfsError::InvalidAttachmentPlist("system-entities entry is not a dictionary".into())
+        })?;
+        let Some(device) = dictionary
+            .get("dev-entry")
+            .and_then(plist::Value::as_string)
+        else {
+            continue;
+        };
+        let device = device_path(device).unwrap_or_else(|| device.to_owned());
+        let hint = dictionary
+            .get("content-hint")
+            .and_then(plist::Value::as_string)
+            .unwrap_or_default()
+            .to_owned();
+        let kind = dictionary
+            .get("volume-kind")
+            .or_else(|| dictionary.get("filesystem-type"))
+            .and_then(plist::Value::as_string)
+            .unwrap_or_default()
+            .to_owned();
+        entities.push((device, hint, kind));
     }
     if entities.is_empty() {
         return Err(ApfsError::InvalidAttachmentPlist(
@@ -825,13 +907,38 @@ fn parse_attachment_plist(bytes: &[u8]) -> Result<(String, String), ApfsError> {
         ));
     }
 
-    let volume = entities
-        .iter()
-        .filter(|(_, hint, kind)| {
-            let hint = hint.to_ascii_lowercase();
-            hint.contains("apfs_volume") || kind.eq_ignore_ascii_case("apfs")
+    let mut reported_whole_devices = entities.iter().filter(|(device, hint, _)| {
+        device_depth(device) == 0 && hint.eq_ignore_ascii_case("GUID_partition_scheme")
+    });
+    let reported_whole = reported_whole_devices.next();
+    if reported_whole_devices.next().is_some() {
+        return Err(ApfsError::InvalidAttachmentPlist(
+            "multiple whole image devices".into(),
+        ));
+    }
+
+    let physical_store = reported_whole.and_then(|(whole, _, _)| {
+        entities
+            .iter()
+            .filter(|(device, hint, kind)| {
+                let hint = hint.to_ascii_lowercase();
+                device_is_descendant_of(device, whole)
+                    && hint.contains("apfs")
+                    && !hint.contains("apfs_volume")
+                    && !kind.eq_ignore_ascii_case("apfs")
+            })
+            .max_by_key(|(device, _, _)| device_depth(device))
+    });
+    let candidate = physical_store
+        .or_else(|| {
+            entities
+                .iter()
+                .filter(|(_, hint, kind)| {
+                    let hint = hint.to_ascii_lowercase();
+                    hint.contains("apfs_volume") || kind.eq_ignore_ascii_case("apfs")
+                })
+                .max_by_key(|(device, _, _)| device_depth(device))
         })
-        .max_by_key(|(device, _, _)| device_depth(device))
         .or_else(|| {
             entities
                 .iter()
@@ -839,28 +946,119 @@ fn parse_attachment_plist(bytes: &[u8]) -> Result<(String, String), ApfsError> {
                 .max_by_key(|(device, _, _)| device_depth(device))
         })
         .map(|(device, _, _)| device.clone())
-        .ok_or_else(|| ApfsError::InvalidAttachmentPlist("no APFS volume device".into()))?;
+        .ok_or_else(|| ApfsError::InvalidAttachmentPlist("no APFS device candidate".into()))?;
 
-    let whole = whole_device_from(&volume)
-        .ok_or_else(|| ApfsError::InvalidAttachmentPlist("invalid APFS volume device".into()))?;
-    Ok((whole, volume))
+    let whole = match reported_whole {
+        Some((device, _, _)) => device.clone(),
+        None => whole_device_from(&candidate)
+            .ok_or_else(|| ApfsError::InvalidAttachmentPlist("invalid APFS device".into()))?,
+    };
+    Ok((whole, candidate))
 }
 
-fn plist_string_after_key<'a>(dict: &'a str, key: &str) -> Option<&'a str> {
-    let marker = format!("<key>{key}</key>");
-    let rest = &dict[dict.find(&marker)? + marker.len()..];
-    let open = rest.find("<string>")? + "<string>".len();
-    let close = rest[open..].find("</string>")? + open;
-    Some(&rest[open..close])
+fn parse_volume_list_plist(candidate: &str, bytes: &[u8]) -> Result<String, ApfsError> {
+    let invalid = |message| ApfsError::VolumeResolutionFailed {
+        candidate: candidate.to_owned(),
+        reason: VolumeResolutionFailure::InvalidPlist(message),
+    };
+    let candidate_path = volume_device_path(candidate)
+        .ok_or_else(|| invalid(format!("invalid APFS device candidate {candidate:?}")))?;
+    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|error| invalid(error.to_string()))?;
+    let containers = value
+        .as_dictionary()
+        .and_then(|root| root.get("Containers"))
+        .and_then(plist::Value::as_array)
+        .ok_or_else(|| invalid("missing Containers array".into()))?;
+    let mut matching_containers: usize = 0;
+    let mut devices = Vec::new();
+    for container in containers {
+        let dictionary = container
+            .as_dictionary()
+            .ok_or_else(|| invalid("container is not a dictionary".into()))?;
+        let mut container_volumes = Vec::new();
+        if let Some(volumes) = dictionary.get("Volumes") {
+            let volumes = volumes
+                .as_array()
+                .ok_or_else(|| invalid("Volumes is not an array".into()))?;
+            for volume in volumes {
+                let identifier = volume
+                    .as_dictionary()
+                    .and_then(|dictionary| dictionary.get("DeviceIdentifier"))
+                    .and_then(plist::Value::as_string)
+                    .ok_or_else(|| invalid("volume has no DeviceIdentifier string".into()))?;
+                let device = volume_device_path(identifier).ok_or_else(|| {
+                    invalid(format!("invalid volume DeviceIdentifier {identifier:?}"))
+                })?;
+                container_volumes.push(device);
+            }
+        }
+
+        let volume_matches = container_volumes
+            .iter()
+            .any(|device| device == &candidate_path);
+        let mut physical_store_matches = false;
+        if let Some(physical_stores) = dictionary.get("PhysicalStores") {
+            let physical_stores = physical_stores
+                .as_array()
+                .ok_or_else(|| invalid("PhysicalStores is not an array".into()))?;
+            for physical_store in physical_stores {
+                let identifier = physical_store
+                    .as_dictionary()
+                    .and_then(|dictionary| dictionary.get("DeviceIdentifier"))
+                    .and_then(plist::Value::as_string)
+                    .ok_or_else(|| {
+                        invalid("physical store has no DeviceIdentifier string".into())
+                    })?;
+                let device = volume_device_path(identifier).ok_or_else(|| {
+                    invalid(format!(
+                        "invalid physical store DeviceIdentifier {identifier:?}"
+                    ))
+                })?;
+                physical_store_matches |= device == candidate_path;
+            }
+        }
+
+        if volume_matches || physical_store_matches {
+            matching_containers += 1;
+            devices.extend(container_volumes);
+        }
+    }
+
+    if matching_containers == 0 || devices.is_empty() {
+        return Err(ApfsError::VolumeResolutionFailed {
+            candidate: candidate.to_owned(),
+            reason: VolumeResolutionFailure::Missing,
+        });
+    }
+    if matching_containers != 1 || devices.len() != 1 {
+        return Err(ApfsError::VolumeResolutionFailed {
+            candidate: candidate.to_owned(),
+            reason: VolumeResolutionFailure::Ambiguous(devices),
+        });
+    }
+    Ok(devices.pop().expect("one device was counted"))
 }
 
-fn xml_unescape(value: &str) -> String {
-    value
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
+fn device_path(identifier: &str) -> Option<String> {
+    let relative = identifier.strip_prefix("/dev/").unwrap_or(identifier);
+    let tail = relative.strip_prefix("disk")?;
+    let mut parts = tail.split('s');
+    let disk = parts.next()?;
+    if disk.is_empty() || !disk.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    for partition in parts {
+        if partition.is_empty() || !partition.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(format!("/dev/{relative}"))
+}
+
+fn volume_device_path(identifier: &str) -> Option<String> {
+    let device = device_path(identifier)?;
+    (device_depth(&device) > 0).then_some(device)
 }
 
 fn device_depth(device: &str) -> usize {
@@ -870,10 +1068,23 @@ fn device_depth(device: &str) -> usize {
     tail.bytes().filter(|byte| *byte == b's').count()
 }
 
+fn device_is_descendant_of(device: &str, whole: &str) -> bool {
+    device
+        .strip_prefix(whole)
+        .is_some_and(|suffix| suffix.starts_with('s'))
+}
+
 fn whole_device_from(device: &str) -> Option<String> {
     let tail = device.strip_prefix("/dev/disk")?;
     let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
     (digits > 0).then(|| format!("/dev/disk{}", &tail[..digits]))
+}
+
+fn raw_device_from(device: &str) -> String {
+    match device.strip_prefix("/dev/") {
+        Some(relative) => format!("/dev/r{relative}"),
+        None => format!("r{device}"),
+    }
 }
 
 fn clonefile_native(source: &Path, destination: &Path) -> Result<(), CloneFileError> {
@@ -947,10 +1158,76 @@ mod tests {
     use std::collections::VecDeque;
 
     const PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
-      <dict><key>dev-entry</key><string>/dev/disk10</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
-      <dict><key>dev-entry</key><string>/dev/disk9s2</string><key>content-hint</key><string>Apple_APFS</string></dict>
-      <dict><key>dev-entry</key><string>/dev/disk10s1</string><key>content-hint</key><string>Apple_APFS_Volume</string><key>volume-kind</key><string>apfs</string></dict>
+      <dict><key>dev-entry</key><string>disk10</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
+      <dict><key>dev-entry</key><string>disk9s2</string><key>content-hint</key><string>Apple_APFS</string></dict>
+      <dict><key>dev-entry</key><string>disk10s1</string><key>content-hint</key><string>Apple_APFS_Volume</string><key>volume-kind</key><string>apfs</string></dict>
     </array></dict></plist>"#;
+
+    const VOLUME_LIST_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
+      <key>Containers</key><array><dict><key>Volumes</key><array>
+        <dict><key>DeviceIdentifier</key><string>disk10s1</string></dict>
+      </array></dict></array>
+    </dict></plist>"#;
+
+    const SPARSE_ATTACH_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
+      <dict><key>dev-entry</key><string>/dev/disk4</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
+      <dict><key>dev-entry</key><string>/dev/disk4s1</string><key>content-hint</key><string>Apple_APFS</string></dict>
+      <dict><key>dev-entry</key><string>/dev/disk5</string><key>content-hint</key><string>EF57347C-0000-11AA-AA11-00306543ECAC</string></dict>
+      <dict><key>dev-entry</key><string>/dev/disk5s1</string><key>content-hint</key><string>41504653-0000-11AA-AA11-00306543ECAC</string><key>volume-kind</key><string>apfs</string></dict>
+    </array></dict></plist>"#;
+
+    const SPARSE_VOLUME_LIST_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
+      <key>Containers</key><array><dict>
+        <key>PhysicalStores</key><array>
+          <dict><key>DeviceIdentifier</key><string>disk4s1</string></dict>
+        </array>
+        <key>Volumes</key><array>
+          <dict><key>DeviceIdentifier</key><string>disk5s2</string></dict>
+        </array>
+      </dict></array>
+    </dict></plist>"#;
+
+    const EMPTY_VOLUME_LIST_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
+      <key>Containers</key><array><dict>
+        <key>PhysicalStores</key><array>
+          <dict><key>DeviceIdentifier</key><string>disk4s1</string></dict>
+        </array>
+        <key>Volumes</key><array/>
+      </dict></array>
+    </dict></plist>"#;
+
+    const AMBIGUOUS_VOLUME_LIST_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
+      <key>Containers</key><array><dict>
+        <key>PhysicalStores</key><array>
+          <dict><key>DeviceIdentifier</key><string>disk4s1</string></dict>
+        </array>
+        <key>Volumes</key><array>
+          <dict><key>DeviceIdentifier</key><string>disk5s2</string></dict>
+          <dict><key>DeviceIdentifier</key><string>/dev/disk5s3</string></dict>
+        </array>
+      </dict></array>
+    </dict></plist>"#;
+
+    const DUPLICATE_CONTAINER_MATCH_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
+      <key>Containers</key><array>
+        <dict>
+          <key>PhysicalStores</key><array>
+            <dict><key>DeviceIdentifier</key><string>disk4s1</string></dict>
+          </array>
+          <key>Volumes</key><array>
+            <dict><key>DeviceIdentifier</key><string>disk5s2</string></dict>
+          </array>
+        </dict>
+        <dict>
+          <key>PhysicalStores</key><array>
+            <dict><key>DeviceIdentifier</key><string>disk4s1</string></dict>
+          </array>
+          <key>Volumes</key><array>
+            <dict><key>DeviceIdentifier</key><string>disk6s2</string></dict>
+          </array>
+        </dict>
+      </array>
+    </dict></plist>"#;
 
     #[derive(Default)]
     struct RecordingRunner {
@@ -1088,6 +1365,7 @@ mod tests {
     fn asif_attach_never_reaches_hdiutil_and_mount_follows_fsck() {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success(PLIST),
+            CommandOutput::success(VOLUME_LIST_PLIST),
             CommandOutput::success([]),
             CommandOutput::success([]),
         ]));
@@ -1104,37 +1382,53 @@ mod tests {
         assert_eq!(
             requests
                 .iter()
-                .map(|r| r.program.as_path())
+                .map(|request| request.program.as_path())
                 .collect::<Vec<_>>(),
             [
                 Path::new(DISKUTIL),
+                Path::new(DISKUTIL),
                 Path::new(FSCK_APFS),
-                Path::new(DISKUTIL)
+                Path::new(DISKUTIL),
             ]
         );
         assert_eq!(
             argv(&requests[0])[..5],
             ["image", "attach", "--nobrowse", "--noMount", "--plist"]
         );
-        assert_eq!(argv(&requests[1]), ["-q", "/dev/disk10s1"]);
+        assert_eq!(argv(&requests[1]), ["apfs", "list", "-plist"]);
+        assert_eq!(argv(&requests[2]), ["-q", "/dev/rdisk10s1"]);
         assert_eq!(
-            argv(&requests[2])[..3],
+            argv(&requests[3])[..3],
             ["mount", "nobrowse", "-mountPoint"]
         );
+        assert_eq!(argv(&requests[3]).last().unwrap(), "/dev/disk10s1");
         let _ = fs::remove_dir(mount);
     }
 
     #[test]
-    fn sparse_attach_uses_hdiutil() {
+    fn sparse_attach_resolves_volume_via_diskutil_before_raw_fsck() {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            CommandOutput::success(PLIST),
+            CommandOutput::success(SPARSE_ATTACH_PLIST),
+            CommandOutput::success(SPARSE_VOLUME_LIST_PLIST),
             CommandOutput::success([]),
         ]));
-        backend
+        let attachment = backend
             .attach_verified(Path::new("session.sparseimage"), ImageFormat::Sparse)
             .unwrap();
+        assert_eq!(attachment.whole_device(), "/dev/disk4");
+        assert_eq!(attachment.volume_device(), "/dev/disk5s2");
         let requests = backend.runner().requests();
-        assert_eq!(requests[0].program, Path::new(HDIUTIL));
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.program.as_path())
+                .collect::<Vec<_>>(),
+            [
+                Path::new(HDIUTIL),
+                Path::new(DISKUTIL),
+                Path::new(FSCK_APFS)
+            ]
+        );
         assert_eq!(
             argv(&requests[0]),
             [
@@ -1144,32 +1438,134 @@ mod tests {
                 "on",
                 "-nomount",
                 "-plist",
-                "session.sparseimage"
+                "session.sparseimage",
             ]
         );
+        assert_eq!(argv(&requests[1]), ["apfs", "list", "-plist"]);
+        assert_eq!(argv(&requests[2]), ["-q", "/dev/rdisk5s2"]);
     }
 
     #[test]
-    fn failed_verification_detaches_without_mounting() {
+    fn failed_verification_detaches_the_whole_sparse_image_device() {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            CommandOutput::success(PLIST),
+            CommandOutput::success(SPARSE_ATTACH_PLIST),
+            CommandOutput::success(SPARSE_VOLUME_LIST_PLIST),
             CommandOutput::failure(8, "not clean"),
             CommandOutput::success([]),
         ]));
         let error = backend
-            .attach_verified(Path::new("session.asif"), ImageFormat::Asif)
+            .attach_verified(Path::new("session.sparseimage"), ImageFormat::Sparse)
             .unwrap_err();
-        assert!(matches!(error, ApfsError::VerificationFailed { .. }));
+        assert!(matches!(
+            error,
+            ApfsError::VerificationFailed {
+                device,
+                output: CommandOutput { status: 8, .. },
+            } if device == "/dev/disk5s2"
+        ));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 3);
-        assert_eq!(requests[1].program, Path::new(FSCK_APFS));
-        assert_eq!(requests[2].program, Path::new(DISKUTIL));
-        assert_eq!(argv(&requests[2]), ["eject", "/dev/disk10"]);
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[2].program, Path::new(FSCK_APFS));
+        assert_eq!(argv(&requests[2]), ["-q", "/dev/rdisk5s2"]);
+        assert_eq!(requests[3].program, Path::new(HDIUTIL));
+        assert_eq!(argv(&requests[3]), ["detach", "-quiet", "/dev/disk4"]);
         assert!(
             !requests
                 .iter()
                 .any(|request| argv(request).first().is_some_and(|arg| arg == "mount"))
         );
+    }
+
+    #[test]
+    fn missing_volume_resolution_detaches_the_whole_image_before_failing() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success(SPARSE_ATTACH_PLIST),
+            CommandOutput::success(EMPTY_VOLUME_LIST_PLIST),
+            CommandOutput::success([]),
+        ]));
+        let error = backend
+            .attach_verified(Path::new("session.sparseimage"), ImageFormat::Sparse)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApfsError::VolumeResolutionFailed {
+                candidate,
+                reason: VolumeResolutionFailure::Missing,
+            } if candidate == "/dev/disk4s1"
+        ));
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(argv(&requests[1]), ["apfs", "list", "-plist"]);
+        assert_eq!(requests[2].program, Path::new(HDIUTIL));
+        assert_eq!(argv(&requests[2]), ["detach", "-quiet", "/dev/disk4"]);
+    }
+
+    #[test]
+    fn ambiguous_volume_and_detach_failures_preserve_both_typed_errors() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success(SPARSE_ATTACH_PLIST),
+            CommandOutput::success(AMBIGUOUS_VOLUME_LIST_PLIST),
+            CommandOutput::failure(16, "busy"),
+        ]));
+        let error = backend
+            .attach_verified(Path::new("session.sparseimage"), ImageFormat::Sparse)
+            .unwrap_err();
+
+        assert!(std::error::Error::source(&error).is_some());
+        match error {
+            ApfsError::VolumeResolutionAndDetachFailed {
+                whole_device,
+                resolution,
+                detach,
+            } => {
+                assert_eq!(whole_device, "/dev/disk4");
+                assert!(matches!(
+                    *resolution,
+                    ApfsError::VolumeResolutionFailed {
+                        candidate,
+                        reason: VolumeResolutionFailure::Ambiguous(devices),
+                    } if candidate == "/dev/disk4s1"
+                        && devices == ["/dev/disk5s2", "/dev/disk5s3"]
+                ));
+                assert!(matches!(
+                    *detach,
+                    ApfsError::CommandFailed {
+                        operation: "detach image",
+                        output: CommandOutput { status: 16, .. },
+                        ..
+                    }
+                ));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(argv(&requests[2]), ["detach", "-quiet", "/dev/disk4"]);
+    }
+
+    #[test]
+    fn failed_volume_resolution_command_detaches_and_preserves_command_error() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success(SPARSE_ATTACH_PLIST),
+            CommandOutput::failure(3, "list failed"),
+            CommandOutput::success([]),
+        ]));
+        let error = backend
+            .attach_verified(Path::new("session.sparseimage"), ImageFormat::Sparse)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApfsError::CommandFailed {
+                operation: "resolve APFS volume",
+                output: CommandOutput { status: 3, .. },
+                ..
+            }
+        ));
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(argv(&requests[2]), ["detach", "-quiet", "/dev/disk4"]);
     }
 
     #[test]
@@ -1732,6 +2128,56 @@ mod tests {
         fs::remove_dir(directory).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "creates and attaches a real macOS sparse APFS image"]
+    fn real_sparse_attach_resolves_and_verifies_the_synthesized_volume() {
+        let stem = temp_path("real-sparse-resolution", "stem").with_extension("");
+        let image = stem.with_extension(ImageFormat::Sparse.extension());
+        let backend = MacOsApfsBackend::new(SystemCommandRunner);
+        let result = (|| -> Result<(), ApfsError> {
+            let created = backend.create_staged_image(&CreateImageRequest {
+                staged_stem: stem,
+                capacity: "64m".into(),
+                volume_name: "cowshed-apfs-resolution".into(),
+                case_sensitivity: ApfsCaseSensitivity::Insensitive,
+                image_format: ImageFormatSelection::Exact(ImageFormat::Sparse),
+            })?;
+            let attachment = backend.attach_verified(&created.path, created.format)?;
+            assert!(attachment.volume_device().starts_with("/dev/disk"));
+            assert_ne!(attachment.whole_device(), attachment.volume_device());
+            backend.detach(&attachment, false)?;
+            Ok(())
+        })();
+        let _ = fs::remove_file(image);
+        result.unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "creates and attaches a real macOS ASIF APFS image"]
+    fn real_asif_attach_normalizes_bare_devices_and_verifies_the_volume() {
+        let stem = temp_path("real-asif-resolution", "stem").with_extension("");
+        let image = stem.with_extension(ImageFormat::Asif.extension());
+        let backend = MacOsApfsBackend::new(SystemCommandRunner);
+        let result = (|| -> Result<(), ApfsError> {
+            let created = backend.create_staged_image(&CreateImageRequest {
+                staged_stem: stem,
+                capacity: "64m".into(),
+                volume_name: "cowshed-asif-resolution".into(),
+                case_sensitivity: ApfsCaseSensitivity::Insensitive,
+                image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
+            })?;
+            let attachment = backend.attach_verified(&created.path, created.format)?;
+            assert!(attachment.whole_device().starts_with("/dev/disk"));
+            assert!(attachment.volume_device().starts_with("/dev/disk"));
+            backend.detach(&attachment, false)?;
+            Ok(())
+        })();
+        let _ = fs::remove_file(image);
+        result.unwrap();
+    }
+
     #[test]
     fn plist_selects_apfs_volume_and_whole_image_device() {
         assert_eq!(
@@ -1741,28 +2187,150 @@ mod tests {
     }
 
     #[test]
+    fn sparse_attachment_plist_preserves_image_whole_device_over_container_device() {
+        assert_eq!(
+            parse_attachment_plist(SPARSE_ATTACH_PLIST.as_bytes()).unwrap(),
+            ("/dev/disk4".into(), "/dev/disk4s1".into())
+        );
+    }
+
+    #[test]
+    fn attachment_candidate_filter_rejects_unrelated_and_non_apfs_devices() {
+        let plist = br#"<plist><dict><key>system-entities</key><array>
+          <dict><key>dev-entry</key><string>disk1</string>
+            <key>content-hint</key><string>GUID_partition_scheme</string></dict>
+          <dict><key>dev-entry</key><string>disk9s1</string>
+            <key>content-hint</key><string>Apple_APFS</string></dict>
+          <dict><key>dev-entry</key><string>disk1s2s9</string>
+            <key>content-hint</key><string>Apple_HFS</string></dict>
+          <dict><key>dev-entry</key><string>disk1s1</string>
+            <key>content-hint</key><string>Apple_APFS_Volume</string>
+            <key>volume-kind</key><string>apfs</string></dict>
+        </array></dict></plist>"#;
+        assert_eq!(
+            parse_attachment_plist(plist).unwrap(),
+            ("/dev/disk1".into(), "/dev/disk1s1".into())
+        );
+    }
+
+    #[test]
+    fn volume_list_plist_selects_one_volume_and_rejects_zero_or_many() {
+        assert_eq!(
+            parse_volume_list_plist("/dev/disk4s1", SPARSE_VOLUME_LIST_PLIST.as_bytes()).unwrap(),
+            "/dev/disk5s2"
+        );
+        assert!(matches!(
+            parse_volume_list_plist("/dev/disk4s1", EMPTY_VOLUME_LIST_PLIST.as_bytes()),
+            Err(ApfsError::VolumeResolutionFailed {
+                candidate,
+                reason: VolumeResolutionFailure::Missing,
+            }) if candidate == "/dev/disk4s1"
+        ));
+        assert!(matches!(
+            parse_volume_list_plist("/dev/disk4s1", AMBIGUOUS_VOLUME_LIST_PLIST.as_bytes()),
+            Err(ApfsError::VolumeResolutionFailed {
+                candidate,
+                reason: VolumeResolutionFailure::Ambiguous(devices),
+            }) if candidate == "/dev/disk4s1"
+                && devices == ["/dev/disk5s2", "/dev/disk5s3"]
+        ));
+    }
+
+    #[test]
+    fn duplicate_container_matches_are_ambiguous_even_with_one_volume_each() {
+        assert!(matches!(
+            parse_volume_list_plist("/dev/disk4s1", DUPLICATE_CONTAINER_MATCH_PLIST.as_bytes()),
+            Err(ApfsError::VolumeResolutionFailed {
+                candidate,
+                reason: VolumeResolutionFailure::Ambiguous(devices),
+            }) if candidate == "/dev/disk4s1"
+                && devices == ["/dev/disk5s2", "/dev/disk6s2"]
+        ));
+    }
+
+    #[test]
+    fn volume_resolution_failure_messages_preserve_typed_details() {
+        assert_eq!(
+            VolumeResolutionFailure::Missing.to_string(),
+            "no APFS volume device was reported"
+        );
+        assert_eq!(
+            VolumeResolutionFailure::Ambiguous(vec!["/dev/disk5s1".into(), "/dev/disk5s2".into()])
+                .to_string(),
+            "multiple APFS volume devices were reported: /dev/disk5s1, /dev/disk5s2"
+        );
+        assert_eq!(
+            VolumeResolutionFailure::InvalidPlist("bad shape".into()).to_string(),
+            "invalid APFS list plist: bad shape"
+        );
+    }
+
+    #[test]
+    fn volume_list_plist_rejects_malformed_shapes_and_device_identifiers() {
+        for plist in [
+            b"not a plist".as_slice(),
+            br#"<?xml version="1.0"?><plist><dict></dict></plist>"#.as_slice(),
+            br#"<?xml version="1.0"?><plist><dict><key>Containers</key><array>
+                <dict><key>Volumes</key><array><dict><key>DeviceIdentifier</key>
+                <string>not-a-device</string></dict></array></dict>
+                </array></dict></plist>"#
+                .as_slice(),
+        ] {
+            assert!(matches!(
+                parse_volume_list_plist("/dev/disk5s1", plist),
+                Err(ApfsError::VolumeResolutionFailed {
+                    candidate,
+                    reason: VolumeResolutionFailure::InvalidPlist(_),
+                }) if candidate == "/dev/disk5s1"
+            ));
+        }
+    }
+
+    #[test]
+    fn device_identifier_helpers_preserve_block_and_raw_volume_identity() {
+        assert_eq!(device_path("disk12"), Some("/dev/disk12".into()));
+        assert_eq!(device_path("disk12s3"), Some("/dev/disk12s3".into()));
+        assert_eq!(volume_device_path("disk12s3"), Some("/dev/disk12s3".into()));
+        assert_eq!(
+            volume_device_path("/dev/disk12s3s1"),
+            Some("/dev/disk12s3s1".into())
+        );
+        assert_eq!(volume_device_path("disk12"), None);
+        for invalid in ["disks1", "disk12s", "disk12sx", "/dev/not-a-disk"] {
+            assert_eq!(device_path(invalid), None);
+            assert_eq!(volume_device_path(invalid), None);
+        }
+        assert_eq!(raw_device_from("/dev/disk12s3"), "/dev/rdisk12s3");
+    }
+
+    #[test]
     fn plist_accepts_each_apfs_volume_marker_and_prefers_deepest_volume() {
-        let hint_only = br#"<plist><dict><key>dev-entry</key><string>/dev/disk4</string></dict>
+        let hint_only = br#"<plist><dict><key>system-entities</key><array>
+            <dict><key>dev-entry</key><string>/dev/disk4</string></dict>
             <dict><key>dev-entry</key><string>/dev/disk4s1</string>
-            <key>content-hint</key><string>Apple_APFS_Volume</string></dict></plist>"#;
+            <key>content-hint</key><string>Apple_APFS_Volume</string></dict>
+            </array></dict></plist>"#;
         assert_eq!(
             parse_attachment_plist(hint_only).unwrap(),
             ("/dev/disk4".into(), "/dev/disk4s1".into())
         );
 
-        let kind_only = br#"<plist><dict><key>dev-entry</key><string>/dev/disk5</string></dict>
+        let kind_only = br#"<plist><dict><key>system-entities</key><array>
+            <dict><key>dev-entry</key><string>/dev/disk5</string></dict>
             <dict><key>dev-entry</key><string>/dev/disk5s2</string>
-            <key>volume-kind</key><string>APFS</string></dict></plist>"#;
+            <key>volume-kind</key><string>APFS</string></dict>
+            </array></dict></plist>"#;
         assert_eq!(
             parse_attachment_plist(kind_only).unwrap(),
             ("/dev/disk5".into(), "/dev/disk5s2".into())
         );
 
-        let nested = br#"<plist>
+        let nested = br#"<plist><dict><key>system-entities</key><array>
             <dict><key>dev-entry</key><string>/dev/disk7s1</string>
             <key>content-hint</key><string>Apple_APFS</string></dict>
             <dict><key>dev-entry</key><string>/dev/disk7s1s2</string>
-            <key>content-hint</key><string>Apple_APFS</string></dict></plist>"#;
+            <key>content-hint</key><string>Apple_APFS</string></dict>
+            </array></dict></plist>"#;
         assert_eq!(
             parse_attachment_plist(nested).unwrap(),
             ("/dev/disk7".into(), "/dev/disk7s1s2".into())
@@ -1781,12 +2349,14 @@ mod tests {
         assert_eq!(whole_device_from("/dev/disk"), None);
         assert_eq!(whole_device_from("/dev/not-a-disk"), None);
 
-        let invalid = br#"<dict><key>dev-entry</key><string>/dev/not-a-disk</string>
-            <key>volume-kind</key><string>apfs</string></dict>"#;
+        let invalid = br#"<plist><dict><key>system-entities</key><array>
+            <dict><key>dev-entry</key><string>/dev/not-a-disk</string>
+            <key>volume-kind</key><string>apfs</string></dict>
+            </array></dict></plist>"#;
         assert!(matches!(
             parse_attachment_plist(invalid),
             Err(ApfsError::InvalidAttachmentPlist(message))
-                if message == "invalid APFS volume device"
+                if message == "invalid APFS device"
         ));
     }
 
