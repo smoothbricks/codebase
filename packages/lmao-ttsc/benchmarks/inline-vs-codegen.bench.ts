@@ -1,176 +1,256 @@
 /**
- * Transformer-output-shape benchmark — spec 01o §4 / lmao-rs optimization q.
+ * Transformer-output-shape benchmark for six fixed-position tag writes.
  *
- * Compares the per-span cost of writing 6 tag fields (1 enum, 2 category
- * strings, 2 numbers, 1 boolean) through:
+ * The benchmark uses a compiler-style CallsitePlan and its real SpanContext-owned
+ * WriterState. It compares the generic object fallback, the generated fluent
+ * writer, direct transformer output, and the staged batching candidate.
  *
- *  A. fluent-chain      — runtime fluent builder calls (no transformer)
- *  B. codegen-writer    — new Function() generated writer (lmao runtime today)
- *  C. inlined-direct    — direct TypedArray writes with compile-time-known
- *                         enum indices and eagerness (native tag-inliner output;
- *                         zero runtime codegen — CSP-safe)
- *  D. inlined-batched   — C, but numeric writes packed into one staging
- *                         Float64Array + one .set() (the "compile-time
- *                         batching" candidate for amortizing a wasm boundary)
- *
- * Wasm-boundary reference numbers (from packages/lmao/benchmarks/
- * wasm-boundary.bench.ts on this machine, Apple M5 Max): per-value export
- * call ~39-42 ns; JS TypedArray view write into wasm memory ~7.6 ns; plain
- * JS array/TypedArray write ~0.5-2 ns.
- *
- * Run: bun benchmarks/inline-vs-codegen.bench.ts
+ * Run: bun packages/lmao-ttsc/benchmarks/inline-vs-codegen.bench.ts --quick
  */
 
-import { bench, group, run } from 'mitata';
+import { bench, do_not_optimize, group, run } from 'mitata';
+import {
+  createSpanBuffer,
+  createTraceRoot,
+  defineLogSchema,
+  defineOpContext,
+  JsBufferStrategy,
+  Ok,
+  S,
+  TestTracer,
+  type SpanBuffer,
+} from '../../lmao/src/node.ts';
+import type { WriterState } from '../../lmao/src/lib/codegen/fixedPositionWriterGenerator.ts';
+import type { TagWriter as ContextTagWriter } from '../../lmao/src/lib/opContext/spanContextTypes.ts';
+import {
+  RUNTIME_HINT_ANALYZED_VALID,
+  RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY,
+  RUNTIME_HINT_TAG,
+} from '../../lmao/src/lib/runtimeHint.ts';
 
-const CAP = 64;
+const CAPACITY = 64;
+const FORMAT = process.argv.includes('--json') ? 'json' : process.argv.includes('--markdown') ? 'markdown' : 'mitata';
+const OPERATIONS: readonly ['DELETE', 'INSERT', 'SELECT', 'UPDATE'] = ['DELETE', 'INSERT', 'SELECT', 'UPDATE'];
+const EAGER_COLUMNS: readonly string[] = ['operation', 'userId', 'region', 'latencyMs', 'retries', 'cached'];
 
-// Columnar buffer matching the generated SpanBuffer field layout:
-// per-field `{name}_nulls` bitmap view + `{name}_values` view/array.
-function makeBuffer() {
+const schema = defineLogSchema({
+  operation: S.enum(OPERATIONS),
+  userId: S.category(),
+  region: S.category(),
+  latencyMs: S.number(),
+  retries: S.number(),
+  cached: S.boolean(),
+});
+const opContext = defineOpContext({ logSchema: schema });
+const tracer = new TestTracer(opContext, {
+  bufferStrategy: new JsBufferStrategy(),
+  createTraceRoot,
+});
+const benchmarkOp = opContext.defineOp(
+  'inline-vs-codegen',
+  () => new Ok(undefined),
+  undefined,
+  {
+    runtimeHint:
+      RUNTIME_HINT_ANALYZED_VALID |
+      RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY |
+      RUNTIME_HINT_TAG |
+      CAPACITY,
+    eagerColumns: EAGER_COLUMNS,
+  },
+);
+const plan = benchmarkOp.callsitePlan;
+
+interface TagViews {
+  operationNulls: Uint8Array;
+  operationValues: Uint8Array;
+  userIdNulls: Uint8Array;
+  userIdValues: string[];
+  regionNulls: Uint8Array;
+  regionValues: string[];
+  latencyMsNulls: Uint8Array;
+  latencyMsValues: Float64Array;
+  retriesNulls: Uint8Array;
+  retriesValues: Float64Array;
+  cachedNulls: Uint8Array;
+  cachedValues: Uint8Array;
+}
+
+interface Bundle {
+  buffer: SpanBuffer<typeof plan.schema>;
+  context: WriterState & { readonly tag: ContextTagWriter<typeof plan.schema> };
+  views: TagViews;
+}
+
+function stringValues(value: unknown, name: string): string[] {
+  if (!Array.isArray(value) || !value.every((item) => typeof item === 'string')) {
+    throw new TypeError(`${name} did not expose string-array storage`);
+  }
+  return value;
+}
+
+function uint8Values(value: unknown, name: string): Uint8Array {
+  if (!(value instanceof Uint8Array)) throw new TypeError(`${name} did not expose Uint8Array storage`);
+  return value;
+}
+
+function float64Values(value: unknown, name: string): Float64Array {
+  if (!(value instanceof Float64Array)) throw new TypeError(`${name} did not expose Float64Array storage`);
+  return value;
+}
+
+function makeBundle(label: string): Bundle {
+  const traceRoot = createTraceRoot(`inline-vs-codegen-${label}`, tracer);
+  const buffer = createSpanBuffer(plan.schema, traceRoot, plan.metadata, CAPACITY, plan.SpanBufferClass);
+  plan.appenders.writeSpanStart(buffer, benchmarkOp.metadata.name);
+  const context = new plan.SpanContextClass(buffer, plan.schema, plan);
+  const views: TagViews = {
+    operationNulls: uint8Values(buffer.operation_nulls, 'operation_nulls'),
+    operationValues: uint8Values(buffer.operation_values, 'operation_values'),
+    userIdNulls: uint8Values(buffer.userId_nulls, 'userId_nulls'),
+    userIdValues: stringValues(buffer.userId_values, 'userId_values'),
+    regionNulls: uint8Values(buffer.region_nulls, 'region_nulls'),
+    regionValues: stringValues(buffer.region_values, 'region_values'),
+    latencyMsNulls: uint8Values(buffer.latencyMs_nulls, 'latencyMs_nulls'),
+    latencyMsValues: float64Values(buffer.latencyMs_values, 'latencyMs_values'),
+    retriesNulls: uint8Values(buffer.retries_nulls, 'retries_nulls'),
+    retriesValues: float64Values(buffer.retries_values, 'retries_values'),
+    cachedNulls: uint8Values(buffer.cached_nulls, 'cached_nulls'),
+    cachedValues: uint8Values(buffer.cached_values, 'cached_values'),
+  };
+  return { buffer, context, views };
+}
+
+type TagValues = {
+  operation: 'SELECT';
+  userId: string;
+  region: string;
+  latencyMs: number;
+  retries: number;
+  cached: boolean;
+};
+
+function valuesFor(iteration: number): TagValues {
   return {
-    operation_nulls: new Uint8Array(1),
-    operation_values: new Uint8Array(CAP), // enum indices
-    userId_nulls: new Uint8Array(1),
-    userId_values: [] as (string | undefined)[], // category: raw push, strings stay in JS
-    region_nulls: new Uint8Array(1),
-    region_values: [] as (string | undefined)[],
-    latencyMs_nulls: new Uint8Array(1),
-    latencyMs_values: new Float64Array(CAP),
-    retries_nulls: new Uint8Array(1),
-    retries_values: new Float64Array(CAP),
-    cached_nulls: new Uint8Array(1),
-    cached_values: new Uint8Array(1), // bit-packed bool
+    operation: 'SELECT',
+    userId: `u${iteration}`,
+    region: 'eu-west',
+    latencyMs: iteration,
+    retries: 2,
+    cached: (iteration & 1) === 0,
   };
 }
-type Buf = ReturnType<typeof makeBuffer>;
 
-const OPERATIONS = ['DELETE', 'INSERT', 'SELECT', 'UPDATE'] as const; // sorted
+function writeObjectFallback(bundle: Bundle, iteration: number): number {
+  bundle.context.tag.with(valuesFor(iteration));
+  return checksum(bundle);
+}
 
-// --- A: fluent builder (runtime fallback shape) -----------------------------
-class FluentTag {
-  constructor(private b: Buf) {}
-  operation(v: string) {
-    this.b.operation_nulls[0] |= 1;
-    this.b.operation_values[0] = OPERATIONS.indexOf(v as (typeof OPERATIONS)[number]);
-    return this;
-  }
-  userId(v: string) {
-    this.b.userId_nulls[0] |= 1;
-    this.b.userId_values[0] = v;
-    return this;
-  }
-  region(v: string) {
-    this.b.region_nulls[0] |= 1;
-    this.b.region_values[0] = v;
-    return this;
-  }
-  latencyMs(v: number) {
-    this.b.latencyMs_nulls[0] |= 1;
-    this.b.latencyMs_values[0] = v;
-    return this;
-  }
-  retries(v: number) {
-    this.b.retries_nulls[0] |= 1;
-    this.b.retries_values[0] = v;
-    return this;
-  }
-  cached(v: boolean) {
-    this.b.cached_nulls[0] |= 1;
-    if (v) this.b.cached_values[0] |= 1;
-    else this.b.cached_values[0] &= ~1;
-    return this;
+function writeGeneratedFluent(bundle: Bundle, iteration: number): number {
+  bundle.context.tag
+    .operation('SELECT')
+    .userId(`u${iteration}`)
+    .region('eu-west')
+    .latencyMs(iteration)
+    .retries(2)
+    .cached((iteration & 1) === 0);
+  return checksum(bundle);
+}
+
+function writeDirect(bundle: Bundle, iteration: number): number {
+  const views = bundle.views;
+  views.operationNulls[0] |= 1;
+  views.operationValues[0] = 2;
+  views.userIdNulls[0] |= 1;
+  views.userIdValues[0] = `u${iteration}`;
+  views.regionNulls[0] |= 1;
+  views.regionValues[0] = 'eu-west';
+  views.latencyMsNulls[0] |= 1;
+  views.latencyMsValues[0] = iteration;
+  views.retriesNulls[0] |= 1;
+  views.retriesValues[0] = 2;
+  views.cachedNulls[0] |= 1;
+  if ((iteration & 1) === 0) views.cachedValues[0] |= 1;
+  else views.cachedValues[0] &= ~1;
+  return checksum(bundle);
+}
+
+const staging = new Float64Array(3);
+
+function writeBatched(bundle: Bundle, iteration: number): number {
+  const views = bundle.views;
+  staging[0] = 2;
+  staging[1] = iteration;
+  staging[2] = 2;
+  views.userIdValues[0] = `u${iteration}`;
+  views.regionValues[0] = 'eu-west';
+  views.operationNulls[0] |= 1;
+  views.userIdNulls[0] |= 1;
+  views.regionNulls[0] |= 1;
+  views.latencyMsNulls[0] |= 1;
+  views.retriesNulls[0] |= 1;
+  views.cachedNulls[0] |= 1;
+  if ((iteration & 1) === 0) views.cachedValues[0] |= 1;
+  else views.cachedValues[0] &= ~1;
+  views.operationValues[0] = staging[0];
+  views.latencyMsValues[0] = staging[1];
+  views.retriesValues[0] = staging[2];
+  return checksum(bundle);
+}
+
+function checksum(bundle: Bundle): number {
+  const views = bundle.views;
+  const userId = views.userIdValues[0];
+  const region = views.regionValues[0];
+  return (
+    views.operationValues[0] * 1_000_003 +
+    (userId?.length ?? 0) * 10_007 +
+    (region?.length ?? 0) * 101 +
+    Math.trunc(views.latencyMsValues[0]) * 17 +
+    Math.trunc(views.retriesValues[0]) * 5 +
+    ((views.cachedValues[0] & 1) !== 0 ? 1 : 0)
+  );
+}
+
+const objectBundle = makeBundle('object');
+const generatedBundle = makeBundle('generated');
+const directBundle = makeBundle('direct');
+const batchedBundle = makeBundle('batched');
+
+const expected = writeObjectFallback(objectBundle, 42);
+for (const observation of [
+  ['generated WriterState fluent chain', writeGeneratedFluent(generatedBundle, 42)],
+  ['compiler direct writes', writeDirect(directBundle, 42)],
+  ['staged direct writes', writeBatched(batchedBundle, 42)],
+]) {
+  const label = observation[0];
+  const checksumValue = observation[1];
+  if (typeof label !== 'string' || typeof checksumValue !== 'number' || checksumValue !== expected) {
+    throw new Error(`${String(label)} semantic checksum differed before timing`);
   }
 }
 
-// --- B: runtime-codegen writer (new Function, lmao's current trick) ----------
-// eslint-disable-next-line @typescript-eslint/no-implied-eval
-const codegenWriter = new Function(
-  'b',
-  'op',
-  'userId',
-  'region',
-  'latencyMs',
-  'retries',
-  'cached',
-  `
-  b.operation_nulls[0] |= 1;
-  b.operation_values[0] = op === 'DELETE' ? 0 : op === 'INSERT' ? 1 : op === 'SELECT' ? 2 : 3;
-  b.userId_nulls[0] |= 1;
-  b.userId_values[0] = userId;
-  b.region_nulls[0] |= 1;
-  b.region_values[0] = region;
-  b.latencyMs_nulls[0] |= 1;
-  b.latencyMs_values[0] = latencyMs;
-  b.retries_nulls[0] |= 1;
-  b.retries_values[0] = retries;
-  b.cached_nulls[0] |= 1;
-  if (cached) b.cached_values[0] |= 1; else b.cached_values[0] &= ~1;
-`,
-) as (b: Buf, op: string, userId: string, region: string, latencyMs: number, retries: number, cached: boolean) => void;
+let objectIteration = 0;
+let generatedIteration = 0;
+let directIteration = 0;
+let batchedIteration = 0;
 
-// --- D: staging buffer for batched numeric writes ----------------------------
-const staging = new Float64Array(3); // enumIdx, latencyMs, retries
-
-const buf = makeBuffer();
-let i = 0;
-
-group('6 tag writes (enum + 2 category + 2 num + bool)', () => {
-  bench('A fluent-chain (no transformer)', () => {
-    new FluentTag(buf)
-      .operation('SELECT')
-      .userId(`u${i}`)
-      .region('eu-west')
-      .latencyMs(i)
-      .retries(2)
-      .cached((i & 1) === 0);
-    i++;
+group('6 tag writes (enum + 2 category + 2 number + boolean)', () => {
+  bench('A fluent with-object (runtime fallback)', () => {
+    do_not_optimize(writeObjectFallback(objectBundle, objectIteration++));
   });
 
-  bench('B codegen-writer (new Function)', () => {
-    codegenWriter(buf, 'SELECT', `u${i}`, 'eu-west', i, 2, (i & 1) === 0);
-    i++;
+  bench('B plan-generated fluent chain (WriterState)', () => {
+    do_not_optimize(writeGeneratedFluent(generatedBundle, generatedIteration++));
   });
 
-  bench('C inlined-direct (transformer output)', () => {
-    // Exactly what the native tag inliner emits: enum index folded to a constant
-    // (literal 'SELECT' → 2), direct writes, bit ops for bool.
-    buf.operation_nulls[0] |= 1;
-    buf.operation_values[0] = 2;
-    buf.userId_nulls[0] |= 1;
-    buf.userId_values[0] = `u${i}`;
-    buf.region_nulls[0] |= 1;
-    buf.region_values[0] = 'eu-west';
-    buf.latencyMs_nulls[0] |= 1;
-    buf.latencyMs_values[0] = i;
-    buf.retries_nulls[0] |= 1;
-    buf.retries_values[0] = 2;
-    buf.cached_nulls[0] |= 1;
-    if ((i & 1) === 0) buf.cached_values[0] |= 1;
-    else buf.cached_values[0] &= ~1;
-    i++;
+  bench('C inlined direct (transformer output)', () => {
+    do_not_optimize(writeDirect(directBundle, directIteration++));
   });
 
-  bench('D inlined-batched (staging + one set)', () => {
-    staging[0] = 2;
-    staging[1] = i;
-    staging[2] = 2;
-    buf.userId_values[0] = `u${i}`;
-    buf.region_values[0] = 'eu-west';
-    buf.operation_nulls[0] |= 1;
-    buf.userId_nulls[0] |= 1;
-    buf.region_nulls[0] |= 1;
-    buf.latencyMs_nulls[0] |= 1;
-    buf.retries_nulls[0] |= 1;
-    buf.cached_nulls[0] |= 1;
-    if ((i & 1) === 0) buf.cached_values[0] |= 1;
-    else buf.cached_values[0] &= ~1;
-    // One contiguous copy standing in for a single bulk boundary crossing.
-    buf.latencyMs_values.set(staging.subarray(1, 2), 0);
-    buf.retries_values.set(staging.subarray(2, 3), 0);
-    buf.operation_values[0] = staging[0];
-    i++;
+  bench('D inlined batched (staging candidate)', () => {
+    do_not_optimize(writeBatched(batchedBundle, batchedIteration++));
   });
 });
 
-await run();
+await run({ format: FORMAT, throw: true });
