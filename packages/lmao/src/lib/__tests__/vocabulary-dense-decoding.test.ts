@@ -252,17 +252,14 @@ describe('global vocabulary dense decoding', () => {
     await tracer.trace('dense-levels', op);
     const buffer = tracer.rootBuffers[0];
     const localIds = buffer._messageIds;
-    const validity = buffer.message_nulls;
     const rawMessages = buffer.message_values;
-    if (!localIds || !validity || !rawMessages) throw new Error('Expected current local-ID, validity, and raw lanes');
+    if (!localIds || !rawMessages) throw new Error('Expected current local-ID and raw lanes');
     expect(buffer._messagePhysicalLayout).toBe('current');
     expect(buffer._opMetadata._physicalLayoutPlan?.localMessageDictionary).toEqual([]);
     expect('_logHeaders' in buffer).toBe(false);
+    expect('message_nulls' in buffer).toBe(false);
     expect(Array.from(localIds.subarray(2, 8))).toEqual([0, 0, 0, 0, 0, 0]);
     expect(rawMessages.slice(2, 8)).toEqual([...messages, 'dynamic message']);
-    for (let row = 2; row < 8; row++) {
-      expect(validity[row >>> 3] & (1 << (row & 7))).not.toBe(0);
-    }
     expect(Array.from({ length: 6 }, (_, index) => resolveMessage(buffer, index + 2))).toEqual([
       ...messages,
       'dynamic message',

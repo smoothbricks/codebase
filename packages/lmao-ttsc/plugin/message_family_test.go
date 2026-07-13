@@ -8,10 +8,10 @@ import (
 )
 
 const (
-	messageLayoutStaticOnly uint32 = 0x01000000
-	messageLayoutDynamicOnly uint32 = 0x02000000
-	messageLayoutMixed      uint32 = 0x03000000
-	messageLayoutMask       uint32 = 0x03000000
+	messageLayoutStaticOnly    uint32 = 0x01000000
+	messageLayoutDynamicOnly   uint32 = 0x02000000
+	messageLayoutMixed         uint32 = 0x03000000
+	messageLayoutMask          uint32 = 0x03000000
 	messagePhysicalPacked      uint32 = 0x04000000
 	messagePhysicalSpecialized uint32 = 0x08000000
 	messagePhysicalMask        uint32 = 0x0c000000
@@ -88,6 +88,53 @@ defineOp('unanalyzed-bailout', (ctx) => {
 		if count := strings.Count(output, once); count != 1 {
 			t.Errorf("%s evaluation occurrences = %d, want exactly one\n%s", once, count, output)
 		}
+	}
+}
+
+func TestCompilerCapacityIsTwoReservedRowsPlusStaticallyKnownLogRows(t *testing.T) {
+	output := transformTemplateFixture(t, `
+defineOp('reserved-only', (ctx) => ctx.ok(null));
+defineOp('one-static-log', (ctx) => {
+  ctx.log.info('one');
+  return ctx.ok(null);
+});
+defineOp('three-static-logs', (ctx) => {
+  ctx.log.info('one');
+  ctx.log.warn('two');
+  ctx.log.error('three');
+  return ctx.ok(null);
+});
+`)
+
+	wantCapacities := []uint32{2, 3, 5}
+	hints := emittedRuntimeHints(t, output)
+	if len(hints) != len(wantCapacities) {
+		t.Fatalf("capacity hints = %v, want %d hints\n%s", hints, len(wantCapacities), output)
+	}
+	for index, want := range wantCapacities {
+		if got := hints[index] & 0xffff; got != want {
+			t.Errorf("op %d capacity = %d, want two reserved rows plus logs = %d", index, got, want)
+		}
+	}
+}
+
+func TestCompilerCapacityBeyondUint16FallsBackToAdaptive(t *testing.T) {
+	var source strings.Builder
+	source.WriteString("defineOp('oversized-static-body', (ctx) => {\n")
+	for range 0xfffe {
+		source.WriteString("ctx.log.info('same static row');\n")
+	}
+	source.WriteString("return ctx.ok(null);\n});\n")
+
+	hints := emittedRuntimeHints(t, transformTemplateFixture(t, source.String()))
+	if len(hints) != 1 {
+		t.Fatalf("oversized body hints = %v, want one", hints)
+	}
+	if capacity := hints[0] & 0xffff; capacity != 0 {
+		t.Fatalf("oversized body capacity = %d, want adaptive zero", capacity)
+	}
+	if hints[0]&runtimeHintAnalyzed == 0 || hints[0]&runtimeHintLog == 0 || hints[0]&runtimeHintResult == 0 {
+		t.Fatalf("oversized body lost safe capability analysis: %#x", hints[0])
 	}
 }
 
@@ -240,10 +287,26 @@ defineOp('current-local-dictionary', (ctx) => {
 	if count := strings.Count(output, "_messageIds[$$i] = 2"); count != 1 {
 		t.Fatalf("distinct current literal local-ID writes = %d, want 1\n%s", count, output)
 	}
-	if count := strings.Count(output, "message_nulls"); count != 3 {
-		t.Fatalf("current validity writes = %d, want 3\n%s", count, output)
+	if strings.Contains(output, "message_nulls") || strings.Contains(output, "message_values") {
+		t.Fatalf("static-only current lowering emitted raw message storage\n%s", output)
 	}
 	if strings.Contains(output, "_messageDictionary") {
 		t.Fatalf("compiler emitted a forbidden per-buffer dictionary field\n%s", output)
+	}
+}
+
+func TestMixedCurrentStaticWriteStoresIdentityOnly(t *testing.T) {
+	output := transformTemplateFixture(t, `
+defineOp('current-mixed-sidecar', (ctx) => {
+  ctx.log.info('static literal');
+  ctx.log.debug(String(Date.now()));
+  return ctx.ok(null);
+});
+`)
+	if !strings.Contains(output, "_messageIds[$$i] = 1") {
+		t.Fatalf("mixed current static write omitted its local identity\n%s", output)
+	}
+	if strings.Contains(output, "message_values[$$i] = undefined") || strings.Contains(output, "message_nulls") {
+		t.Fatalf("mixed current static write emitted a redundant raw-sidecar clear or validity write\n%s", output)
 	}
 }

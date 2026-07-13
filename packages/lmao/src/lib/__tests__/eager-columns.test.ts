@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import fc from 'fast-check';
+import { defineOpContext } from '../defineOpContext.js';
 import { createRemapDescriptor } from '../library.js';
 import {
   getPhysicalLayoutPlan,
@@ -7,7 +8,13 @@ import {
   type EagerColumnDescriptor,
 } from '../physicalLayoutPlan.js';
 import type { OpContext } from '../opContext/types.js';
-import { RUNTIME_HINT_ANALYZED_VALID, RUNTIME_HINT_LOG, RUNTIME_HINT_RESULT } from '../runtimeHint.js';
+import {
+  RUNTIME_HINT_ANALYZED_VALID,
+  RUNTIME_HINT_LOG,
+  RUNTIME_HINT_RESULT,
+  RUNTIME_HINT_TAG,
+  runtimeHintInitialCapacity,
+} from '../runtimeHint.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { LogSchema } from '../schema/LogSchema.js';
@@ -18,8 +25,9 @@ import {
   getSpanBufferClass,
 } from '../spanBuffer.js';
 import { createSpanContextClass } from '../spanContext.js';
+import { TestTracer } from '../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../types.js';
-import { createTestOpMetadata, createTestTraceRoot } from './test-helpers.js';
+import { createTestOpMetadata, createTestTraceRoot, createTestTracerOptions } from './test-helpers.js';
 
 const HINT = RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_LOG | RUNTIME_HINT_RESULT | 8;
 
@@ -180,6 +188,77 @@ describe('compiler-proven eager user columns', () => {
     expect(overflowNumberNulls[0] & 0b00001000).toBe(0);
     expect(root.getColumnIfAllocated('lazyString')?.[4]).toBe('materialized lazily');
     expect(root.getColumnIfAllocated('lazyBoolean')).toBeUndefined();
+  });
+
+  it('uses exact analyzed capacities 2 through 7 with eager lanes while invalid and zero hints stay adaptive', async () => {
+    const schema = defineLogSchema({ proven: S.category(), lazy: S.category() });
+    const opContext = defineOpContext({ logSchema: schema });
+    const tracer = new TestTracer(opContext, createTestTracerOptions());
+
+    for (const capacity of [2, 3, 4, 5, 6, 7]) {
+      const observed: AnySpanBuffer[] = [];
+      const exactOp = opContext.defineOp(
+        `exact-${capacity}`,
+        (ctx) => {
+          observed.push(ctx.buffer);
+          ctx.tag.proven(`capacity-${capacity}`);
+          return ctx.ok(capacity);
+        },
+        undefined,
+        {
+          runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_TAG | RUNTIME_HINT_RESULT | capacity,
+          eagerColumns: ['proven'],
+        },
+      );
+      const parentOp = opContext.defineOp(`parent-${capacity}`, async (ctx) => {
+        await ctx.span(`child-${capacity}`, exactOp);
+        return ctx.ok(capacity);
+      });
+
+      await tracer.trace(`root-${capacity}`, exactOp);
+      await tracer.trace(`parent-root-${capacity}`, parentOp);
+
+      expect(runtimeHintInitialCapacity(exactOp.callsitePlan.runtimeHint)).toBe(capacity);
+      expect(observed.map((buffer) => buffer._capacity)).toEqual([capacity, capacity]);
+      for (const buffer of observed) {
+        expectCompilerEagerStorage(buffer, 'proven');
+        expectLazyStorage(buffer, 'lazy');
+      }
+    }
+
+    const adaptiveBuffers: AnySpanBuffer[] = [];
+    const adaptiveOp = opContext.defineOp('adaptive-zero', (ctx) => {
+      adaptiveBuffers.push(ctx.buffer);
+      return ctx.ok('adaptive');
+    });
+    const invalidOneOp = opContext.defineOp(
+      'adaptive-invalid-one',
+      (ctx) => {
+        adaptiveBuffers.push(ctx.buffer);
+        return ctx.ok('adaptive');
+      },
+      undefined,
+      { runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_RESULT | 1 },
+    );
+    const adaptiveStats = adaptiveOp.callsitePlan.SpanBufferClass.stats;
+    const invalidStats = invalidOneOp.callsitePlan.SpanBufferClass.stats;
+    const originalAdaptiveCapacity = adaptiveStats.capacity;
+    const originalInvalidCapacity = invalidStats.capacity;
+    try {
+      adaptiveStats.capacity = 5;
+      await tracer.trace('adaptive-minimum', adaptiveOp);
+      invalidStats.capacity = 13;
+      await tracer.trace('adaptive-stats', invalidOneOp);
+    } finally {
+      adaptiveStats.capacity = originalAdaptiveCapacity;
+      invalidStats.capacity = originalInvalidCapacity;
+    }
+
+    expect(runtimeHintInitialCapacity(0)).toBeUndefined();
+    expect(runtimeHintInitialCapacity(RUNTIME_HINT_ANALYZED_VALID)).toBeUndefined();
+    expect(runtimeHintInitialCapacity(RUNTIME_HINT_ANALYZED_VALID | 1)).toBeUndefined();
+    expect(adaptiveBuffers.map((buffer) => buffer._capacity)).toEqual([8, 13]);
+    for (const buffer of adaptiveBuffers) expectLazyStorage(buffer, 'proven');
   });
 
   it('keeps plugin-off metadata all-lazy', () => {

@@ -34,8 +34,8 @@ import {
 import { checkCapacityTuning } from './capacityTuning.js';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { EagerColumnDescriptor } from './physicalLayoutPlan.js';
-import { LogSchema } from './schema/LogSchema.js';
 import type { MessageLayoutFamily, MessagePhysicalLayout } from './runtimeHint.js';
+import { LogSchema } from './schema/LogSchema.js';
 import type { SpanBufferStats } from './spanBufferStats.js';
 import { copyThreadIdTo, getThreadId } from './threadId.js';
 import type { ITraceRoot } from './traceRoot.js';
@@ -50,7 +50,6 @@ export type { ITraceRoot };
  * Used as default _scopeValues for all buffers until setScope() is called.
  */
 export const EMPTY_SCOPE: Readonly<Record<string, unknown>> = Object.freeze({});
-
 
 // ============================================================================
 // Thread-local state (generated once per process/worker)
@@ -365,24 +364,21 @@ export function getSpanBufferClass<T extends LogSchema>(
        let identityView;
 `
         : messageLayoutFamily === 'dynamic-only'
-          ? `const messageValidityOffset = requestedCapacity * 9;
-       const systemSize = (messageValidityOffset + ((requestedCapacity + 7) >>> 3) + 7) & ~7;
+          ? `const systemSize = (requestedCapacity * 9 + 7) & ~7;
        let systemBuffer;
        let identityView;
 `
           : messagePhysicalLayout === 'current'
             ? `const messageIdOffset = (requestedCapacity * 9 + 1) & ~1;
-       const messageValidityOffset = messageIdOffset + requestedCapacity * 2;
-       const systemSize = (messageValidityOffset + ((requestedCapacity + 7) >>> 3) + 7) & ~7;
+       const systemSize = (messageIdOffset + requestedCapacity * 2 + 7) & ~7;
        let systemBuffer;
        let identityView;
 `
             : `const logHeaderOffset = (requestedCapacity * 9 + 3) & ~3;
-       const messageValidityOffset = logHeaderOffset + requestedCapacity * 4;
-       const systemSize = (messageValidityOffset + ((requestedCapacity + 7) >>> 3) + 7) & ~7;
+       const systemSize = (logHeaderOffset + requestedCapacity * 4 + 7) & ~7;
        let systemBuffer;
        let identityView;
-` ) +
+`) +
       // CHAINED BUFFER: overflow storage for same logical span - shares parent identity
       `if (isChained) {
           systemBuffer = new ArrayBuffer(systemSize);
@@ -425,8 +421,6 @@ export function getSpanBufferClass<T extends LogSchema>(
        const entryTypeView = new Uint8Array(systemBuffer, requestedCapacity * 8, requestedCapacity);
        timestampView.fill(0n);
        entryTypeView.fill(0);
-       const messageNullView = new Uint8Array(systemBuffer, messageValidityOffset, (requestedCapacity + 7) >>> 3);
-       messageNullView.fill(0);
 ` +
           (messageLayoutFamily === 'dynamic-only'
             ? ''
@@ -447,15 +441,17 @@ export function getSpanBufferClass<T extends LogSchema>(
         ? `       this._rowHeaders = rowHeaderView;
 `
         : `       this.entry_type = entryTypeView;
-       this.message_nulls = messageNullView;
-` + (messageLayoutFamily === 'dynamic-only'
-          ? ''
-          : messagePhysicalLayout === 'current'
-            ? `       this._messageIds = messageIdView;
+` +
+          (messageLayoutFamily === 'dynamic-only'
+            ? ''
+            : messagePhysicalLayout === 'current'
+              ? `       this._messageIds = messageIdView;
 `
-            : `       this._logHeaders = logHeaderView;
+              : `       this._logHeaders = logHeaderView;
 `)) +
-      (messageLayoutFamily === 'static-only' ? '' : `       this.message_values = new Array(requestedCapacity);
+      (messageLayoutFamily === 'static-only'
+        ? ''
+        : `       this.message_values = new Array(requestedCapacity);
 `) +
       `       this._vocabularyGeneration = vocabularyGeneration;
 ` +
@@ -562,21 +558,27 @@ export function getSpanBufferClass<T extends LogSchema>(
       checkCapacityTuning(this.constructor.stats);
       return tracer.bufferStrategy.createOverflowBuffer(this);
     }
-    ${messageLayoutFamily === 'static-only' ? `message(pos, val) {
+    ${
+      messageLayoutFamily === 'static-only'
+        ? `message(pos, val) {
       if (pos === 0) this._spanName = val;
       else if (pos === 1) this._terminalMessage = val;
       else throw new RangeError('Static-only buffers only accept raw system messages at rows 0 and 1');
       return this;
-    }` : `message(pos, val) {
+    }`
+        : `message(pos, val) {
       this.message_values[pos] = val;
-      ${messagePhysicalLayout === 'packed' ? '' : 'this.message_nulls[pos >>> 3] |= 1 << (pos & 7);'}
       return this;
-    }`}
+    }`
+    }
     `,
   };
 
   // Generate class with arrow-builder
-  const generatedClass = getColumnBufferClass(getStorageSchema(schema, messageLayoutFamily, messagePhysicalLayout), extension);
+  const generatedClass = getColumnBufferClass(
+    getStorageSchema(schema, messageLayoutFamily, messagePhysicalLayout),
+    extension,
+  );
   if (!isGeneratedSpanBufferClass<T>(generatedClass)) {
     throw new TypeError('Generated column buffer is missing SpanBuffer methods');
   }
@@ -616,7 +618,15 @@ export function getSpanBufferClass<T extends LogSchema>(
  *
  * @returns SpanBuffer with typed setters for schema fields
  */
-const MIN_CAPACITY = 8;
+export const MIN_ADAPTIVE_BUFFER_CAPACITY = 8;
+
+export function resolveSpanBufferCapacity(explicitCapacity: number | undefined, adaptiveCapacity: number): number {
+  if (explicitCapacity === undefined) return Math.max(MIN_ADAPTIVE_BUFFER_CAPACITY, adaptiveCapacity);
+  if (!Number.isSafeInteger(explicitCapacity) || explicitCapacity < 2) {
+    throw new RangeError('Explicit span buffer capacity must be a safe integer of at least 2');
+  }
+  return explicitCapacity;
+}
 
 //#region smoo/lmao!n/spanbuffer-layout.create-root
 export function createSpanBuffer<T extends LogSchema>(
@@ -629,8 +639,8 @@ export function createSpanBuffer<T extends LogSchema>(
   const SpanBufferClass = plannedClass ?? getSpanBufferClass(schema);
   const stats = SpanBufferClass.stats;
 
-  // Use provided capacity or default from class stats, enforce minimum
-  const actualCapacity = Math.max(MIN_CAPACITY, capacity ?? stats.capacity);
+  // An analyzed nonzero hint is an exact physical capacity. Only adaptive/default capacity is floored.
+  const actualCapacity = resolveSpanBufferCapacity(capacity, stats.capacity);
 
   // Track non-chained buffer creation for capacity tuning
   stats.spansCreated++;
@@ -715,7 +725,7 @@ export function createChildSpanBuffer<T extends LogSchema>(
   capacity?: number,
 ): SpanBuffer<T> {
   const stats = SpanBufferClass.stats;
-  const actualCapacity = capacity ?? stats.capacity;
+  const actualCapacity = resolveSpanBufferCapacity(capacity, stats.capacity);
 
   // Track non-chained buffer creation for capacity tuning
   stats.spansCreated++;

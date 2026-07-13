@@ -10,8 +10,8 @@
 
 import {
   clearBitRange,
-  countNulls,
   compareStrings,
+  countNulls,
   createSortedDictionary,
   DictionaryBuilder,
   type FinalizedDictionary,
@@ -47,12 +47,7 @@ import {
   makeArrowColumn,
   type Utf8ColumnData,
 } from './arrow/flechette.js';
-import { createArrowLease, type ArrowLease } from './arrow/lease.js';
-import {
-  appendVocabularyDictionarySuffix,
-  getVocabularyDictionaryPrefix,
-  PREBUILT_ENTRY_TYPE_DICTIONARY,
-} from './arrow/vocabularyDictionary.js';
+import { type ArrowLease, createArrowLease } from './arrow/lease.js';
 import {
   calculateUtf8Offsets,
   combineColumnChunks,
@@ -63,11 +58,13 @@ import {
   getArrowFieldName,
 } from './arrow/utils.js';
 import {
-  type EnumLookupDescriptor,
-  resolveEnumLookupDescriptor,
-} from './enumMetadata.js';
+  appendVocabularyDictionarySuffix,
+  getVocabularyDictionaryPrefix,
+  PREBUILT_ENTRY_TYPE_DICTIONARY,
+} from './arrow/vocabularyDictionary.js';
+import { type EnumLookupDescriptor, resolveEnumLookupDescriptor } from './enumMetadata.js';
 import type { RemapDescriptor } from './logBinding.js';
-import { resolveEntryType, resolveMessage } from './resolveMessage.js';
+import { resolveEntryType } from './resolveMessage.js';
 import {
   ENTRY_TYPE_ERROR,
   ENTRY_TYPE_SPAN_START,
@@ -76,10 +73,10 @@ import {
 } from './schema/systemSchema.js';
 import { getBinaryEncoder, getEnumUtf8, getSchemaType } from './schema/typeGuards.js';
 import type { LogSchema } from './schema/types.js';
-import type { AnySpanBuffer, OpMetadata } from './types.js';
-import type { VocabularyGeneration } from './vocabularyRegistry.js';
 import { walkSpanTree } from './traceTopology.js';
+import type { AnySpanBuffer, OpMetadata } from './types.js';
 import { globalUtf8Cache } from './utf8Cache.js';
+import type { VocabularyGeneration } from './vocabularyRegistry.js';
 
 const DictBuilder = DictionaryBuilder;
 const F64Array = Float64Array;
@@ -261,22 +258,13 @@ function indexTypeForCount(count: number): IntType {
   return uint32();
 }
 
-function assertStaticMessageKind(
-  buffer: AnySpanBuffer,
-  row: number,
-  entryType: number,
-  denseIndex: number,
-): void {
+function assertStaticMessageKind(buffer: AnySpanBuffer, row: number, entryType: number, denseIndex: number): void {
   const generation = buffer._vocabularyGeneration;
   if (denseIndex >= generation.ids.length) {
     throw new Error(`Invalid vocabulary dense index ${denseIndex} for generation ${generation.generation}`);
   }
   const expectedKind =
-    entryType === ENTRY_TYPE_SPAN_START
-      ? 2
-      : entryType >= ENTRY_TYPE_TRACE && entryType <= ENTRY_TYPE_ERROR
-        ? 1
-        : 0;
+    entryType === ENTRY_TYPE_SPAN_START ? 2 : entryType >= ENTRY_TYPE_TRACE && entryType <= ENTRY_TYPE_ERROR ? 1 : 0;
   if (expectedKind === 0) {
     throw new Error(`Entry type ${entryType} at row ${row} cannot carry a static vocabulary identity`);
   }
@@ -320,27 +308,21 @@ function buildMessageColumn(
     for (let row = 0; row < buffer._writeIndex; row++) {
       const outputRow = rowOffset + row;
       const hasDedicatedMessage =
-        (row === 0 && buffer._spanName !== undefined) ||
-        (row === 1 && buffer._terminalMessage !== undefined);
+        (row === 0 && buffer._spanName !== undefined) || (row === 1 && buffer._terminalMessage !== undefined);
       let dictionaryIndex: number | undefined;
       let entryType: number;
 
       if (messageIdentityStorage === 'local-u16') {
         entryType = resolveEntryType(buffer, row);
-        const messageIds = buffer._messageIds;
-        const validity = buffer.message_nulls;
-        if (messageIds === undefined || validity === undefined) {
-          throw new TypeError('Local message layout is missing its Uint16 ID lane or validity bitmap');
-        }
-        const localId = messageIds[row];
-        const identityValid = (validity[row >>> 3] & (1 << (row & 7))) !== 0;
+        const localId = buffer._messageIds?.[row];
+        const rawMessage = buffer.message_values?.[row];
         if (row === 0 && typeof buffer._spanName === 'number') {
-          if (identityValid && localId !== 0) {
+          if ((localId !== undefined && localId > 0) || rawMessage !== undefined) {
             throw new Error(`Local row ${row} has conflicting static message identities`);
           }
           dictionaryIndex = buffer._spanName;
-        } else if (identityValid && localId !== 0) {
-          if (hasDedicatedMessage || buffer.message_values?.[row] !== undefined) {
+        } else if (localId !== undefined && localId > 0) {
+          if (hasDedicatedMessage || rawMessage !== undefined) {
             throw new Error(`Local row ${row} has conflicting static and raw message storage`);
           }
           dictionaryIndex = buffer._opMetadata._physicalLayoutPlan?.localMessageDictionary[localId - 1];
@@ -348,17 +330,12 @@ function buildMessageColumn(
         }
       } else if (messageIdentityStorage === 'global-u32') {
         entryType = resolveEntryType(buffer, row);
-        const globalDenseIndices = buffer._logHeaders;
-        const validity = buffer.message_nulls;
-        if (globalDenseIndices === undefined || validity === undefined) {
-          throw new TypeError('Global message layout is missing its dense-ID lane or validity bitmap');
-        }
-        const identityValid = (validity[row >>> 3] & (1 << (row & 7))) !== 0;
-        if (identityValid && buffer.message_values?.[row] === undefined) {
-          if (hasDedicatedMessage) {
-            throw new Error(`Global row ${row} has conflicting static and dedicated message storage`);
+        const encodedDenseIndex = buffer._logHeaders?.[row];
+        if (encodedDenseIndex !== undefined && encodedDenseIndex > 0) {
+          if (hasDedicatedMessage || buffer.message_values?.[row] !== undefined) {
+            throw new Error(`Global row ${row} has conflicting static and raw message storage`);
           }
-          dictionaryIndex = globalDenseIndices[row];
+          dictionaryIndex = encodedDenseIndex - 1;
         }
       } else {
         const rowHeaders = buffer._rowHeaders;
@@ -373,12 +350,24 @@ function buildMessageColumn(
           dictionaryIndex = encodedDenseIndex - 1;
         }
       }
+      const dedicatedDenseIndex = row === 0 && typeof buffer._spanName === 'number' ? buffer._spanName : undefined;
+      if (dedicatedDenseIndex !== undefined) {
+        if (buffer.message_values?.[row] !== undefined) {
+          throw new Error(`Row ${row} has conflicting dedicated static and raw message storage`);
+        }
+        dictionaryIndex ??= dedicatedDenseIndex;
+      }
 
       if (entryTypeIndices !== undefined) entryTypeIndices[outputRow] = entryType;
       if (dictionaryIndex !== undefined) {
         assertStaticMessageKind(buffer, row, entryType, dictionaryIndex);
       } else {
-        const message = resolveMessage(buffer, row);
+        const message =
+          row === 0 && typeof buffer._spanName === 'string'
+            ? buffer._spanName
+            : row === 1 && buffer._terminalMessage !== undefined
+              ? buffer._terminalMessage
+              : buffer.message_values?.[row];
         if (message === undefined) {
           nullCount++;
           continue;
@@ -424,9 +413,7 @@ function buildMessageColumn(
     column: buildColumn(
       buildData({
         type:
-          dictionaryId === undefined
-            ? dictionary(utf8(), uint32())
-            : dictionary(utf8(), uint32(), false, dictionaryId),
+          dictionaryId === undefined ? dictionary(utf8(), uint32()) : dictionary(utf8(), uint32(), false, dictionaryId),
         offset: 0,
         length: totalRows,
         nullCount,
@@ -571,7 +558,6 @@ function buildTimestampColumn(
   );
 }
 
-
 function canBorrowEntryTypeChunks(buffers: AnySpanBuffer[], borrowChunks: boolean): boolean {
   return (
     borrowChunks &&
@@ -596,10 +582,18 @@ function buildEntryTypeColumn(
   fields.push('entry_type');
   if (canBorrowEntryTypeChunks(buffers, borrowChunks)) {
     const chunks = buffers.map((buffer) => {
-      const source = buffer.entry_type!;
+      const source = buffer.entry_type;
+      if (source === undefined) throw new TypeError('Current/specialized buffer is missing entry types');
       const values = new Int8Array(source.buffer, source.byteOffset, buffer._writeIndex);
       return buildColumn(
-        buildData({ type, offset: 0, length: buffer._writeIndex, nullCount: 0, data: values, dictionary: entryTypeDictionary }),
+        buildData({
+          type,
+          offset: 0,
+          length: buffer._writeIndex,
+          nullCount: 0,
+          data: values,
+          dictionary: entryTypeDictionary,
+        }),
       );
     });
     vectors.push(combineColumnChunks(chunks));
@@ -616,7 +610,14 @@ function buildEntryTypeColumn(
   }
   vectors.push(
     buildColumn(
-      buildData({ type, offset: 0, length: totalRows, nullCount: 0, data: entryTypeIndices, dictionary: entryTypeDictionary }),
+      buildData({
+        type,
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: entryTypeIndices,
+        dictionary: entryTypeDictionary,
+      }),
     ),
   );
 }
@@ -1181,7 +1182,9 @@ type EpochPinnableAllocator = { pinMemoryEpoch(): MemoryEpochPin };
 type EpochPinnableBuffer = AnySpanBuffer & { readonly _allocator: EpochPinnableAllocator };
 
 function isEpochPinnableBuffer(buffer: AnySpanBuffer): buffer is EpochPinnableBuffer {
-  return '_allocator' in buffer && typeof (buffer as Partial<EpochPinnableBuffer>)._allocator?.pinMemoryEpoch === 'function';
+  return (
+    '_allocator' in buffer && typeof (buffer as Partial<EpochPinnableBuffer>)._allocator?.pinMemoryEpoch === 'function'
+  );
 }
 
 function createLeasedConversion(
@@ -1325,7 +1328,6 @@ export function convertSpanTreeToArrowTable(
     }
   }
 
-
   // Metadata column dictionaries
   // For traceId (metadata), use DictionaryBuilder (values not pre-encoded)
   const traceIdBuilder = new DictBuilder(globalUtf8Cache);
@@ -1451,7 +1453,6 @@ export function convertSpanTreeToArrowTable(
     textDicts.set(name, builder.finalize(false)); // not sorted
   }
 
-
   // ═══════════════════════════════════════════════════════════════════════════
   // PASS 2: Collect all buffers with non-zero rows
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1513,13 +1514,7 @@ export function convertSpanTreeToLeasedArrowTable(
     if (buffer._writeIndex > 0) buffers.push(buffer);
   });
   return createLeasedConversion(rootBuffer, buffers, (borrowChunks) =>
-    convertSpanTreeToArrowTable(
-      rootBuffer,
-      systemColumnBuilder,
-      modulesToLogStats,
-      periodStartNs,
-      borrowChunks,
-    ),
+    convertSpanTreeToArrowTable(rootBuffer, systemColumnBuilder, modulesToLogStats, periodStartNs, borrowChunks),
   );
 }
 
@@ -1840,78 +1835,78 @@ function convertBuffersWithSharedDicts(
       if (borrowed?.every((chunk): chunk is Column<unknown> => chunk !== undefined)) {
         vectors.push(combineColumnChunks(borrowed));
       } else {
-      const allValues = new F64Array(totalRows);
-      const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
-      // Start with all nulls (bits cleared) - we'll set bits as we find values
-      let nullCount = 0;
-      let rowOffset = 0;
+        const allValues = new F64Array(totalRows);
+        const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
+        // Start with all nulls (bits cleared) - we'll set bits as we find values
+        let nullCount = 0;
+        let rowOffset = 0;
 
-      for (const buf of buffers) {
-        const sourceName = resolveColumnName(buf, columnName, remaps);
-        const col = buf.getColumnIfAllocated(sourceName);
-        const srcNulls = buf.getNullsIfAllocated(sourceName);
-        // Check if this buffer has a scope value for this field
-        const scopeValue = getNumberScopeValue(buf, fieldName, remaps);
+        for (const buf of buffers) {
+          const sourceName = resolveColumnName(buf, columnName, remaps);
+          const col = buf.getColumnIfAllocated(sourceName);
+          const srcNulls = buf.getNullsIfAllocated(sourceName);
+          // Check if this buffer has a scope value for this field
+          const scopeValue = getNumberScopeValue(buf, fieldName, remaps);
 
-        if (col instanceof Float64Array) {
-          allValues.set(col.subarray(0, buf._writeIndex), rowOffset);
-          if (srcNulls) {
-            // Process each row - direct write wins, then scope, then null
-            for (let i = 0; i < buf._writeIndex; i++) {
-              const srcByte = i >>> 3;
-              const srcBit = i & 7;
-              const isValid = (srcNulls[srcByte] & (1 << srcBit)) !== 0;
-              const rowIdx = rowOffset + i;
-              if (isValid) {
-                // Direct write - mark as valid
-                nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
-              } else if (scopeValue !== undefined) {
-                // No direct write, but have scope value - use it
-                allValues[rowIdx] = scopeValue;
-                nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
-              } else {
-                // No direct write and no scope - null
-                nullCount++;
+          if (col instanceof Float64Array) {
+            allValues.set(col.subarray(0, buf._writeIndex), rowOffset);
+            if (srcNulls) {
+              // Process each row - direct write wins, then scope, then null
+              for (let i = 0; i < buf._writeIndex; i++) {
+                const srcByte = i >>> 3;
+                const srcBit = i & 7;
+                const isValid = (srcNulls[srcByte] & (1 << srcBit)) !== 0;
+                const rowIdx = rowOffset + i;
+                if (isValid) {
+                  // Direct write - mark as valid
+                  nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+                } else if (scopeValue !== undefined) {
+                  // No direct write, but have scope value - use it
+                  allValues[rowIdx] = scopeValue;
+                  nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+                } else {
+                  // No direct write and no scope - null
+                  nullCount++;
+                }
               }
+            } else {
+              // No null bitmap means column was allocated but no writes - check scope
+              for (let i = 0; i < buf._writeIndex; i++) {
+                const rowIdx = rowOffset + i;
+                if (scopeValue !== undefined) {
+                  allValues[rowIdx] = scopeValue;
+                  nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+                } else {
+                  nullCount++;
+                }
+              }
+            }
+          } else if (scopeValue !== undefined) {
+            // Column not allocated but we have scope - fill all rows with scope value
+            for (let i = 0; i < buf._writeIndex; i++) {
+              const rowIdx = rowOffset + i;
+              allValues[rowIdx] = scopeValue;
+              nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
             }
           } else {
-            // No null bitmap means column was allocated but no writes - check scope
-            for (let i = 0; i < buf._writeIndex; i++) {
-              const rowIdx = rowOffset + i;
-              if (scopeValue !== undefined) {
-                allValues[rowIdx] = scopeValue;
-                nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
-              } else {
-                nullCount++;
-              }
-            }
+            // Column doesn't exist for this buffer and no scope - all nulls
+            nullCount += buf._writeIndex;
           }
-        } else if (scopeValue !== undefined) {
-          // Column not allocated but we have scope - fill all rows with scope value
-          for (let i = 0; i < buf._writeIndex; i++) {
-            const rowIdx = rowOffset + i;
-            allValues[rowIdx] = scopeValue;
-            nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
-          }
-        } else {
-          // Column doesn't exist for this buffer and no scope - all nulls
-          nullCount += buf._writeIndex;
+          rowOffset += buf._writeIndex;
         }
-        rowOffset += buf._writeIndex;
-      }
 
-      vectors.push(
-        buildColumn(
-          buildData({
-            type: float64(),
-            offset: 0,
-            length: totalRows,
-            nullCount,
-            data: allValues,
-            nullBitmap: nullCount > 0 ? nullBitmap : undefined,
-          }),
-        ),
-      );
+        vectors.push(
+          buildColumn(
+            buildData({
+              type: float64(),
+              offset: 0,
+              length: totalRows,
+              nullCount,
+              data: allValues,
+              nullBitmap: nullCount > 0 ? nullBitmap : undefined,
+            }),
+          ),
+        );
       }
       fields.push(arrowFieldName);
     } else if (lmaoType === 'boolean') {
@@ -2008,7 +2003,6 @@ function convertBuffersWithSharedDicts(
       // Start with all nulls (bits cleared) - we'll set bits as we find values
       let nullCount = 0;
       let rowOffset = 0;
-
 
       for (const buf of buffers) {
         const sourceName = resolveColumnName(buf, columnName, remaps);

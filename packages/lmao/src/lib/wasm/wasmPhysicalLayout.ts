@@ -42,9 +42,7 @@ export interface WasmSystemSlabLayoutDescriptor {
   readonly timestampOffset: 0;
   readonly entryTypeOffset: number | null;
   readonly messageIdOffset: number | null;
-  readonly messageIdValidityOffset: number | null;
   readonly messageDenseIndexOffset: number | null;
-  readonly messageValidityOffset: number | null;
   readonly rowHeaderOffset: number | null;
   /** Logical row offset into the JS raw-message sidecar; contributes no WASM bytes. */
   readonly messageValueOffset: 0 | null;
@@ -115,9 +113,7 @@ function freezeExactLayout(
   let systemByteLength = capacity * 8;
   let entryTypeOffset: number | null = null;
   let messageIdOffset: number | null = null;
-  let messageIdValidityOffset: number | null = null;
   let messageDenseIndexOffset: number | null = null;
-  let messageValidityOffset: number | null = null;
   let rowHeaderOffset: number | null = null;
 
   if (messagePhysicalLayout === 'packed') {
@@ -130,17 +126,10 @@ function freezeExactLayout(
       if (messagePhysicalLayout === 'current') {
         messageIdOffset = align(systemByteLength, 2);
         systemByteLength = messageIdOffset + capacity * 2;
-        messageIdValidityOffset = systemByteLength;
-        systemByteLength = messageIdValidityOffset + nullByteLength;
       } else {
         messageDenseIndexOffset = align(systemByteLength, 4);
         systemByteLength = messageDenseIndexOffset + capacity * 4;
-        messageValidityOffset = systemByteLength;
-        systemByteLength = messageValidityOffset + nullByteLength;
       }
-    } else {
-      messageValidityOffset = systemByteLength;
-      systemByteLength = messageValidityOffset + nullByteLength;
     }
   }
 
@@ -151,9 +140,7 @@ function freezeExactLayout(
     timestampOffset: 0,
     entryTypeOffset,
     messageIdOffset,
-    messageIdValidityOffset,
     messageDenseIndexOffset,
-    messageValidityOffset,
     rowHeaderOffset,
     messageValueOffset,
   });
@@ -220,7 +207,13 @@ function buildWasmLayoutTemplate(
     forCapacity(capacity: number): WasmPhysicalLayoutDescriptor {
       let descriptor = descriptors.get(capacity);
       if (descriptor === undefined) {
-        descriptor = freezeExactLayout(capacity, messageLayoutFamily, messagePhysicalLayout, frozenColumns, eagerColumns);
+        descriptor = freezeExactLayout(
+          capacity,
+          messageLayoutFamily,
+          messagePhysicalLayout,
+          frozenColumns,
+          eagerColumns,
+        );
         descriptors.set(capacity, descriptor);
       }
       return descriptor;
@@ -255,5 +248,7 @@ export function getWasmPhysicalLayout(
   messagePhysicalLayout: MessagePhysicalLayout = 'current',
   eagerColumns: EagerColumnDescriptor = EMPTY_EAGER_COLUMNS,
 ): WasmPhysicalLayoutDescriptor {
-  return createWasmLayoutTemplate(schema, messageLayoutFamily, messagePhysicalLayout, eagerColumns).forCapacity(capacity);
+  return createWasmLayoutTemplate(schema, messageLayoutFamily, messagePhysicalLayout, eagerColumns).forCapacity(
+    capacity,
+  );
 }
