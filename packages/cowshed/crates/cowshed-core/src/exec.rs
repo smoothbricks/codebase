@@ -9,7 +9,7 @@ use crate::sandbox::{SandboxConfig, SandboxError, seatbelt_profile};
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExecRequest {
+pub struct SandboxExecRequest {
     pub argv: Vec<OsString>,
     /// Absolute, or relative to the workspace mount.
     pub cwd: PathBuf,
@@ -74,7 +74,10 @@ impl std::error::Error for ExecError {
 
 /// Converts authoritative controller inputs into an argv-only sandbox-exec launch.
 /// No child-provided text or environment participates in this plan.
-pub fn plan_exec(request: ExecRequest, sandbox: &SandboxConfig) -> Result<SpawnPlan, ExecError> {
+pub fn plan_exec(
+    request: SandboxExecRequest,
+    sandbox: &SandboxConfig,
+) -> Result<SpawnPlan, ExecError> {
     validate_argv(&request.argv)?;
     let cwd = contained_cwd(&sandbox.workspace_mount, &request.cwd)?;
     let profile = seatbelt_profile(sandbox).map_err(map_sandbox_error)?;
@@ -127,7 +130,7 @@ impl SpawnRunner for SystemSpawnRunner {
 }
 
 pub fn execute_with<R: SpawnRunner>(
-    request: ExecRequest,
+    request: SandboxExecRequest,
     sandbox: &SandboxConfig,
     runner: &R,
 ) -> Result<ExecOutcome, ExecError> {
@@ -145,7 +148,10 @@ pub fn execute_with<R: SpawnRunner>(
     Ok(ExecOutcome { status })
 }
 
-pub fn execute(request: ExecRequest, sandbox: &SandboxConfig) -> Result<ExecOutcome, ExecError> {
+pub fn execute(
+    request: SandboxExecRequest,
+    sandbox: &SandboxConfig,
+) -> Result<ExecOutcome, ExecError> {
     execute_with(request, sandbox, &SystemSpawnRunner)
 }
 
@@ -369,7 +375,7 @@ mod tests {
             ),
         ] {
             let error = plan_exec(
-                ExecRequest {
+                SandboxExecRequest {
                     argv,
                     cwd: tree.cwd.clone(),
                 },
@@ -410,7 +416,7 @@ mod tests {
     #[test]
     fn argv_is_passed_as_distinct_values_without_a_shell() {
         let tree = TestTree::new();
-        let request = ExecRequest {
+        let request = SandboxExecRequest {
             argv: vec![
                 OsString::from("printf"),
                 OsString::from("%s"),
@@ -432,7 +438,7 @@ mod tests {
     #[test]
     fn cwd_traversal_and_symlink_escape_are_authoritative_denials() {
         let tree = TestTree::new();
-        let traversal = ExecRequest {
+        let traversal = SandboxExecRequest {
             argv: vec![OsString::from("true")],
             cwd: PathBuf::from("../outside"),
         };
@@ -444,7 +450,7 @@ mod tests {
         let outside = tree.root.join("outside");
         fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, tree.workspace.join("escape")).unwrap();
-        let symlink = ExecRequest {
+        let symlink = SandboxExecRequest {
             argv: vec![OsString::from("true")],
             cwd: PathBuf::from("escape"),
         };
@@ -462,7 +468,7 @@ mod tests {
             status,
             plans: RefCell::new(vec![]),
         };
-        let request = ExecRequest {
+        let request = SandboxExecRequest {
             argv: vec![OsString::from("false")],
             cwd: tree.cwd.clone(),
         };
@@ -483,7 +489,7 @@ mod tests {
             .grants
             .read
             .push(PathBuf::from("/Users/tester/.ssh"));
-        let request = ExecRequest {
+        let request = SandboxExecRequest {
             argv: vec![OsString::from("true")],
             cwd: tree.cwd.clone(),
         };
@@ -507,7 +513,7 @@ mod tests {
         }
 
         let tree = TestTree::new();
-        let request = ExecRequest {
+        let request = SandboxExecRequest {
             argv: vec![OsString::from("true")],
             cwd: tree.cwd.clone(),
         };
