@@ -8,60 +8,316 @@
 //! (Rust's default SipHash was separately measured losing to JS Map — 5.8 µs vs
 //! 3.3 µs — which is why the hasher is FxHash; see `benches/flush.rs`.)
 
-use std::sync::{Arc, LazyLock};
+use std::error::Error;
+use std::fmt;
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::StringArray;
 use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::ArrowError;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::generated::vocabulary::{
-    VOCABULARY_DENSE_INDICES, VOCABULARY_IDS, VOCABULARY_KIND_TAGS, VOCABULARY_VALUES,
-};
-
-pub const LOG_TEMPLATE_KIND: u8 = 1;
-pub const SPAN_NAME_KIND: u8 = 2;
-
-struct StaticVocabulary {
-    array: Arc<StringArray>,
-    utf8: Vec<u8>,
-    offsets: Vec<i32>,
-    reverse: FxHashMap<&'static str, u32>,
+/// Semantic kind carried by a stable vocabulary entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StableVocabularyKind {
+    LogTemplate = 1,
+    SpanName = 2,
 }
 
-static STATIC_VOCABULARY: LazyLock<StaticVocabulary> = LazyLock::new(|| {
-    let mut utf8 = Vec::new();
-    let mut offsets = Vec::with_capacity(VOCABULARY_IDS.len() + 1);
-    let mut reverse = FxHashMap::default();
-    offsets.push(0);
-    for (ordinal, dense_index) in VOCABULARY_DENSE_INDICES.iter().copied().enumerate() {
-        let value = VOCABULARY_VALUES[dense_index as usize];
-        reverse.entry(value).or_insert(ordinal as u32);
-        utf8.extend_from_slice(value.as_bytes());
-        offsets.push(i32::try_from(utf8.len()).expect("generated vocabulary exceeds Utf8 range"));
-    }
-    let array = Arc::new(StringArray::new(
-        OffsetBuffer::new(ScalarBuffer::from(offsets.clone())),
-        Buffer::from_vec(utf8.clone()),
-        None,
-    ));
-    StaticVocabulary {
-        array,
-        utf8,
-        offsets,
-        reverse,
-    }
-});
+impl TryFrom<u8> for StableVocabularyKind {
+    type Error = StableVocabularyKindError;
 
-pub fn static_vocabulary_dictionary() -> Arc<StringArray> {
-    Arc::clone(&STATIC_VOCABULARY.array)
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::LogTemplate),
+            2 => Ok(Self::SpanName),
+            _ => Err(StableVocabularyKindError(value)),
+        }
+    }
 }
 
-/// Build a mixed dictionary with two bulk prefix copies (offsets and bytes), then
-/// encode only novel first-seen dynamic suffix values. Arrow's Utf8 array requires
-/// contiguous buffers; unlike Utf8View it cannot reference disjoint static/dynamic
-/// buffers, and the public schema is frozen as Utf8 rather than Utf8View.
-pub(crate) fn mixed_vocabulary_dictionary(
+/// An invalid serialized stable-vocabulary kind tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StableVocabularyKindError(pub u8);
+
+impl fmt::Display for StableVocabularyKindError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid stable vocabulary kind tag {}", self.0)
+    }
+}
+
+impl Error for StableVocabularyKindError {}
+
+/// One caller-owned stable vocabulary entry, in stable-ID order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StableVocabularyEntry<'a> {
+    pub id: u32,
+    pub kind: StableVocabularyKind,
+    pub value: &'a str,
+}
+
+/// Validation failure for [`StableVocabularyCatalog::try_new`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StableVocabularyCatalogError {
+    TooManyEntries {
+        count: usize,
+    },
+    InvalidId {
+        ordinal: usize,
+        id: u32,
+    },
+    IdsNotStrictlyIncreasing {
+        ordinal: usize,
+        previous: u32,
+        id: u32,
+    },
+    ValueOrderLengthMismatch {
+        entries: usize,
+        ordinals: usize,
+    },
+    ValueOrdinalOutOfRange {
+        position: usize,
+        ordinal: u32,
+        entry_count: usize,
+    },
+    ValueOrderNotStrictlyIncreasing {
+        position: usize,
+        previous_ordinal: u32,
+        ordinal: u32,
+    },
+    Utf8LengthOverflow,
+}
+
+impl fmt::Display for StableVocabularyCatalogError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooManyEntries { count } => {
+                write!(
+                    f,
+                    "stable vocabulary has {count} entries, exceeding u32 ordinals"
+                )
+            }
+            Self::InvalidId { ordinal, id } => write!(
+                f,
+                "stable vocabulary entry {ordinal} has ID {id}, outside the nonzero u24 range",
+            ),
+            Self::IdsNotStrictlyIncreasing {
+                ordinal,
+                previous,
+                id,
+            } => write!(
+                f,
+                "stable vocabulary IDs are not strictly increasing at entry {ordinal}: {previous} then {id}",
+            ),
+            Self::ValueOrderLengthMismatch { entries, ordinals } => write!(
+                f,
+                "stable vocabulary has {entries} entries but {ordinals} value-order ordinals",
+            ),
+            Self::ValueOrdinalOutOfRange {
+                position,
+                ordinal,
+                entry_count,
+            } => write!(
+                f,
+                "stable vocabulary value-order position {position} references ordinal {ordinal}, but entry count is {entry_count}",
+            ),
+            Self::ValueOrderNotStrictlyIncreasing {
+                position,
+                previous_ordinal,
+                ordinal,
+            } => write!(
+                f,
+                "stable vocabulary value order is not strictly increasing at position {position}: ordinal {previous_ordinal} then {ordinal}",
+            ),
+            Self::Utf8LengthOverflow => {
+                f.write_str("stable vocabulary exceeds Arrow Utf8's i32 offset range")
+            }
+        }
+    }
+}
+
+impl Error for StableVocabularyCatalogError {}
+
+/// Stable-ID lookup failure against a validated catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StableVocabularyLookupError {
+    UnknownId(u32),
+    KindMismatch {
+        id: u32,
+        expected: StableVocabularyKind,
+        actual: StableVocabularyKind,
+    },
+}
+
+/// Validated immutable vocabulary provenance supplied by the producer.
+///
+/// `entries_by_id` is strictly increasing by stable u24 ID. `ordinals_by_value`
+/// is a permutation of Arrow ordinals into that slice, sorted by
+/// `(UTF-8 value, ordinal)`; it is not a JavaScript process-dense index table.
+/// Construction validates both borrowed slices without allocating. The first
+/// static-only conversion caches this catalog's Arrow-owned prefix.
+#[derive(Debug)]
+pub struct StableVocabularyCatalog<'a> {
+    entries_by_id: &'a [StableVocabularyEntry<'a>],
+    ordinals_by_value: &'a [u32],
+    total_utf8_bytes: usize,
+    arrow_values: OnceLock<Arc<StringArray>>,
+}
+
+impl<'a> StableVocabularyCatalog<'a> {
+    // A const lets every caller own its cache; using a static would recreate a
+    // process-global Arrow allocation and conflate unrelated producers.
+    #[allow(clippy::declare_interior_mutable_const)]
+    pub const EMPTY: Self = Self {
+        entries_by_id: &[],
+        ordinals_by_value: &[],
+        total_utf8_bytes: 0,
+        arrow_values: OnceLock::new(),
+    };
+
+    pub fn try_new(
+        entries_by_id: &'a [StableVocabularyEntry<'a>],
+        ordinals_by_value: &'a [u32],
+    ) -> Result<Self, StableVocabularyCatalogError> {
+        if u32::try_from(entries_by_id.len()).is_err() {
+            return Err(StableVocabularyCatalogError::TooManyEntries {
+                count: entries_by_id.len(),
+            });
+        }
+
+        let mut previous_id = None;
+        let mut total_utf8_bytes = 0usize;
+        for (ordinal, entry) in entries_by_id.iter().enumerate() {
+            if entry.id == 0 || entry.id > 0x00ff_ffff {
+                return Err(StableVocabularyCatalogError::InvalidId {
+                    ordinal,
+                    id: entry.id,
+                });
+            }
+            if let Some(previous) = previous_id
+                && entry.id <= previous
+            {
+                return Err(StableVocabularyCatalogError::IdsNotStrictlyIncreasing {
+                    ordinal,
+                    previous,
+                    id: entry.id,
+                });
+            }
+            previous_id = Some(entry.id);
+            total_utf8_bytes = total_utf8_bytes
+                .checked_add(entry.value.len())
+                .ok_or(StableVocabularyCatalogError::Utf8LengthOverflow)?;
+            if total_utf8_bytes > i32::MAX as usize {
+                return Err(StableVocabularyCatalogError::Utf8LengthOverflow);
+            }
+        }
+
+        if ordinals_by_value.len() != entries_by_id.len() {
+            return Err(StableVocabularyCatalogError::ValueOrderLengthMismatch {
+                entries: entries_by_id.len(),
+                ordinals: ordinals_by_value.len(),
+            });
+        }
+
+        let mut previous_value_ordinal = None;
+        for (position, &ordinal) in ordinals_by_value.iter().enumerate() {
+            let Some(entry) = entries_by_id.get(ordinal as usize) else {
+                return Err(StableVocabularyCatalogError::ValueOrdinalOutOfRange {
+                    position,
+                    ordinal,
+                    entry_count: entries_by_id.len(),
+                });
+            };
+            if let Some(previous_ordinal) = previous_value_ordinal {
+                let previous = &entries_by_id[previous_ordinal as usize];
+                if (previous.value.as_bytes(), previous_ordinal)
+                    >= (entry.value.as_bytes(), ordinal)
+                {
+                    return Err(
+                        StableVocabularyCatalogError::ValueOrderNotStrictlyIncreasing {
+                            position,
+                            previous_ordinal,
+                            ordinal,
+                        },
+                    );
+                }
+            }
+            previous_value_ordinal = Some(ordinal);
+        }
+
+        Ok(Self {
+            entries_by_id,
+            ordinals_by_value,
+            total_utf8_bytes,
+            arrow_values: OnceLock::new(),
+        })
+    }
+
+    #[inline]
+    pub fn entries(&self) -> &'a [StableVocabularyEntry<'a>] {
+        self.entries_by_id
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.entries_by_id.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entries_by_id.is_empty()
+    }
+
+    #[inline]
+    pub fn key_for_id(
+        &self,
+        id: u32,
+        required_kind: StableVocabularyKind,
+    ) -> Result<u32, StableVocabularyLookupError> {
+        let ordinal = self
+            .entries_by_id
+            .binary_search_by_key(&id, |entry| entry.id)
+            .map_err(|_| StableVocabularyLookupError::UnknownId(id))?;
+        let actual = self.entries_by_id[ordinal].kind;
+        if actual != required_kind {
+            return Err(StableVocabularyLookupError::KindMismatch {
+                id,
+                expected: required_kind,
+                actual,
+            });
+        }
+        Ok(ordinal as u32)
+    }
+
+    #[inline]
+    pub fn key_for_value(&self, value: &str) -> Option<u32> {
+        let value = value.as_bytes();
+        let mut lower = 0usize;
+        let mut upper = self.ordinals_by_value.len();
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2;
+            let ordinal = self.ordinals_by_value[middle];
+            if self.entries_by_id[ordinal as usize].value.as_bytes() < value {
+                lower = middle + 1;
+            } else {
+                upper = middle;
+            }
+        }
+        let ordinal = *self.ordinals_by_value.get(lower)?;
+        (self.entries_by_id[ordinal as usize].value.as_bytes() == value).then_some(ordinal)
+    }
+
+    fn static_arrow_values(&self) -> Arc<StringArray> {
+        Arc::clone(self.arrow_values.get_or_init(|| {
+            build_vocabulary_dictionary(self, &[])
+                .expect("validated stable vocabulary must fit Arrow Utf8")
+        }))
+    }
+}
+
+fn build_vocabulary_dictionary(
+    catalog: &StableVocabularyCatalog<'_>,
     dynamic_values: &[&str],
 ) -> Result<Arc<StringArray>, ArrowError> {
     let dynamic_bytes = dynamic_values.iter().try_fold(0usize, |total, value| {
@@ -69,9 +325,8 @@ pub(crate) fn mixed_vocabulary_dictionary(
             ArrowError::InvalidArgumentError("message dictionary byte length overflow".into())
         })
     })?;
-    let total_bytes = STATIC_VOCABULARY
-        .utf8
-        .len()
+    let total_bytes = catalog
+        .total_utf8_bytes
         .checked_add(dynamic_bytes)
         .ok_or_else(|| {
             ArrowError::InvalidArgumentError("message dictionary byte length overflow".into())
@@ -81,16 +336,24 @@ pub(crate) fn mixed_vocabulary_dictionary(
             "message dictionary exceeds Utf8 offset range".into(),
         ));
     }
+    let offset_count = catalog
+        .len()
+        .checked_add(dynamic_values.len())
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| {
+            ArrowError::InvalidArgumentError("message dictionary entry count overflow".into())
+        })?;
 
     let mut bytes = Vec::with_capacity(total_bytes);
-    bytes.extend_from_slice(&STATIC_VOCABULARY.utf8);
-    let mut offsets = Vec::with_capacity(STATIC_VOCABULARY.offsets.len() + dynamic_values.len());
-    offsets.extend_from_slice(&STATIC_VOCABULARY.offsets);
-    let mut offset = STATIC_VOCABULARY.utf8.len();
+    let mut offsets = Vec::with_capacity(offset_count);
+    offsets.push(0);
+    for entry in catalog.entries_by_id {
+        bytes.extend_from_slice(entry.value.as_bytes());
+        offsets.push(bytes.len() as i32);
+    }
     for value in dynamic_values {
         bytes.extend_from_slice(value.as_bytes());
-        offset += value.len();
-        offsets.push(offset as i32);
+        offsets.push(bytes.len() as i32);
     }
     Ok(Arc::new(StringArray::new(
         OffsetBuffer::new(ScalarBuffer::from(offsets)),
@@ -99,29 +362,17 @@ pub(crate) fn mixed_vocabulary_dictionary(
     )))
 }
 
-pub fn static_vocabulary_key(id: u32, required_kind: u8) -> Result<u32, StaticLookupError> {
-    let ordinal = VOCABULARY_IDS
-        .binary_search(&id)
-        .map_err(|_| StaticLookupError::UnknownId(id))?;
-    let actual = VOCABULARY_KIND_TAGS[ordinal];
-    if actual != required_kind {
-        return Err(StaticLookupError::KindMismatch {
-            id,
-            expected: required_kind,
-            actual,
-        });
+/// Return this catalog's static Arrow prefix, or build the unavoidable combined
+/// static-prefix/dynamic-suffix Arrow dictionary for a mixed conversion.
+pub(crate) fn vocabulary_dictionary(
+    catalog: &StableVocabularyCatalog<'_>,
+    dynamic_values: &[&str],
+) -> Result<Arc<StringArray>, ArrowError> {
+    if dynamic_values.is_empty() {
+        Ok(catalog.static_arrow_values())
+    } else {
+        build_vocabulary_dictionary(catalog, dynamic_values)
     }
-    Ok(ordinal as u32)
-}
-
-pub fn static_vocabulary_value_key(value: &str) -> Option<u32> {
-    STATIC_VOCABULARY.reverse.get(value).copied()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StaticLookupError {
-    UnknownId(u32),
-    KindMismatch { id: u32, expected: u8, actual: u8 },
 }
 
 /// Flush-local novel dynamic values in first-observation order. Empty construction
@@ -146,11 +397,6 @@ impl<'a> FirstSeenDictionary<'a> {
     #[inline]
     pub fn index_of(&self, value: &str) -> Option<u32> {
         self.index.get(value).copied()
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
     }
 }
 

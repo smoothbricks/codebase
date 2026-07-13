@@ -20,9 +20,6 @@
 mod archive;
 mod convert;
 mod dict;
-mod generated {
-    pub mod vocabulary;
-}
 mod source;
 
 pub use archive::{
@@ -31,14 +28,9 @@ pub use archive::{
 };
 pub use convert::{ConvertError, ENTRY_TYPE_NAMES, convert_span_trees, trace_schema};
 pub use dict::{
-    ColumnDictionary, FinalizedDictionary, LOG_TEMPLATE_KIND, SPAN_NAME_KIND,
-    static_vocabulary_dictionary, static_vocabulary_key, static_vocabulary_value_key,
-};
-pub use generated::vocabulary::{
-    VOCABULARY_CONTENT_HASH, VOCABULARY_DENSE_INDICES, VOCABULARY_FRAGMENT_UTF8,
-    VOCABULARY_FRAGMENT_UTF8_OFFSETS, VOCABULARY_ID_ALGORITHM, VOCABULARY_IDS,
-    VOCABULARY_KIND_TAGS, VOCABULARY_SCHEMA_VERSION, VOCABULARY_UTF8, VOCABULARY_UTF8_OFFSETS,
-    VOCABULARY_VALUES, lookup_vocabulary_id,
+    ColumnDictionary, FinalizedDictionary, StableVocabularyCatalog, StableVocabularyCatalogError,
+    StableVocabularyEntry, StableVocabularyKind, StableVocabularyKindError,
+    StableVocabularyLookupError,
 };
 pub use source::{MockSpan, SpanSource, walk_pre_order};
 
