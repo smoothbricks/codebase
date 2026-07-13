@@ -585,13 +585,14 @@ proptest! {
     /// (AxE H-SIM-4 style trace-byte identity).
     #[test]
     fn identical_trees_serialize_identically(n in 0usize..50) {
+        let empty_catalog = StableVocabularyCatalog::EMPTY;
         let a = convert_span_trees(
             &[build_tree(n, "trace-a")],
-            &StableVocabularyCatalog::EMPTY,
+            &empty_catalog,
         ).unwrap();
         let b = convert_span_trees(
             &[build_tree(n, "trace-a")],
-            &StableVocabularyCatalog::EMPTY,
+            &empty_catalog,
         ).unwrap();
         prop_assert_eq!(ipc_bytes(&a), ipc_bytes(&b));
     }
@@ -612,9 +613,10 @@ proptest! {
             }
         });
 
+        let empty_catalog = StableVocabularyCatalog::EMPTY;
         let batch = convert_span_trees(
             std::slice::from_ref(&tree),
-            &StableVocabularyCatalog::EMPTY,
+            &empty_catalog,
         ).unwrap();
         prop_assert_eq!(batch.num_rows(), expected.len());
         let ts = batch.column(0).as_primitive::<arrow_array::types::Int64Type>();
@@ -630,9 +632,10 @@ proptest! {
     /// different file_ref → different chunk_id).
     #[test]
     fn envelope_is_deterministic(n in 0usize..30) {
+        let empty_catalog = StableVocabularyCatalog::EMPTY;
         let batch = convert_span_trees(
             &[build_tree(n, "trace-env")],
-            &StableVocabularyCatalog::EMPTY,
+            &empty_catalog,
         ).unwrap();
         let e1 = build_trace_chunk_envelope("s3://bucket/chunk-1", &batch);
         let e2 = build_trace_chunk_envelope("s3://bucket/chunk-1", &batch);
