@@ -152,6 +152,102 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('infers cargo workspace targets including per-cdylib wasm builds', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/ferris/package.json', '{"name":"ferris"}\n');
+      await workspace.write(
+        'packages/ferris/Cargo.toml',
+        '[workspace]\nmembers = ["crates/ferris-core", "crates/ferris-wasm"]\n\n[profile.wasm-release]\ninherits = "release"\n',
+      );
+      await workspace.write('packages/ferris/crates/ferris-core/Cargo.toml', '[package]\nname = "ferris-core"\n');
+      await workspace.write(
+        'packages/ferris/crates/ferris-wasm/Cargo.toml',
+        '[package]\nname = "ferris-wasm"\n\n[lib]\ncrate-type = ["cdylib", "rlib"]\n',
+      );
+
+      const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
+
+      expect(Object.keys(targets).sort()).toEqual([
+        'bench',
+        'build',
+        'cargo-lint',
+        'cargo-test',
+        'cargo-wasm',
+        'clean',
+        'lint',
+        'mutation',
+        'test',
+      ]);
+      expect(targets['cargo-test']?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
+      expect(targets['cargo-test']?.options).toMatchObject({
+        command: 'cargo test --workspace',
+        cwd: 'packages/ferris',
+      });
+      expect(targets['cargo-test']?.inputs).toEqual([
+        '{projectRoot}/**/*.rs',
+        '{projectRoot}/**/Cargo.toml',
+        '{projectRoot}/Cargo.lock',
+        '{projectRoot}/.cargo/config.toml',
+        '!{projectRoot}/target/**',
+      ]);
+      expect(targets['cargo-lint']?.options).toMatchObject({
+        commands: ['cargo fmt --all --check', 'cargo clippy --workspace --all-targets -- -D warnings'],
+      });
+      expect(targets.lint?.dependsOn).toEqual(['cargo-lint']);
+      expect(targets.test?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
+      expect(targets.test?.options).toMatchObject({
+        command: 'cargo test --workspace',
+        cwd: 'packages/ferris',
+      });
+      expect(targets.mutation?.cache).toBe(false);
+      expect(targets.mutation?.options).toMatchObject({ command: 'cargo mutants --workspace' });
+      expect(targets['cargo-wasm']?.outputs).toEqual(['{projectRoot}/dist/**/*.wasm']);
+      expect(targets['cargo-wasm']?.options).toMatchObject({
+        commands: [
+          'cargo build --profile wasm-release --target wasm32-unknown-unknown -p ferris-wasm && mkdir -p dist && cp target/wasm32-unknown-unknown/wasm-release/ferris_wasm.wasm dist/ferris_wasm.wasm',
+        ],
+      });
+      expect(targets['cargo-wasm']?.configurations?.development).toEqual({
+        commands: [
+          'cargo build --target wasm32-unknown-unknown -p ferris-wasm && mkdir -p dist && cp target/wasm32-unknown-unknown/debug/ferris_wasm.wasm dist/ferris_wasm.wasm',
+        ],
+      });
+      // cargo-wasm matches the *-wasm build-output pattern → aggregate build/clean exist
+      expect(targets.build?.executor).toBe('nx:noop');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('lets explicit nx.targets override cargo inference and skips non-workspace Cargo.toml', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write(
+        'packages/custom/package.json',
+        '{"name":"custom","nx":{"targets":{"cargo-wasm":{"options":{"command":"custom"}},"test":{}}}}\n',
+      );
+      await workspace.write('packages/custom/Cargo.toml', '[workspace]\nmembers = ["crates/x"]\n');
+      await workspace.write(
+        'packages/custom/crates/x/Cargo.toml',
+        '[package]\nname = "x"\n\n[lib]\ncrate-type = ["cdylib"]\n',
+      );
+
+      const targets = await inferProjectTargets(workspace, 'packages/custom/package.json');
+      expect(targets['cargo-wasm']).toBeUndefined();
+      expect(targets.test).toBeUndefined();
+      expect(targets['cargo-test']).toBeDefined();
+
+      // A member crate's own Cargo.toml (no [workspace]) infers nothing.
+      await workspace.write('packages/member/package.json', '{"name":"member"}\n');
+      await workspace.write('packages/member/Cargo.toml', '[package]\nname = "member"\n');
+      const memberTargets = await inferProjectTargets(workspace, 'packages/member/package.json');
+      expect(memberTargets).toEqual({});
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('leaves build.zig without b.step declarations to smoo validation', async () => {
     const workspace = await createWorkspace();
     try {
