@@ -28,9 +28,23 @@ const MAX_HANDSHAKE_BYTES: usize = 4096;
 #[cfg(unix)]
 const MAX_RPC_BYTES: usize = 16 * 1024 * 1024;
 
+const MAX_BINARY_FRAME_BYTES: usize = 64 * 1024;
+
+pub(crate) struct BinaryDownload {
+    bytes: Vec<u8>,
+    eof: bool,
+}
+
 #[async_trait]
 pub(crate) trait ControllerRuntime: Send + Sync {
     async fn call(&self, method: &'static str, params: Value) -> Result<Value>;
+    async fn upload(&self, method: &'static str, params: Value, bytes: Bytes) -> Result<Value>;
+    async fn download(
+        &self,
+        method: &'static str,
+        params: Value,
+        expected_offset: u64,
+    ) -> Result<BinaryDownload>;
     async fn exec(&self, workspace: &WorkspaceName, request: ExecRequest) -> Result<JobId>;
     async fn logs(
         &self,
@@ -44,10 +58,43 @@ pub(crate) trait ControllerRuntime: Send + Sync {
 }
 
 #[cfg(unix)]
-struct ActorMessage {
-    method: &'static str,
-    params: Value,
-    reply: oneshot::Sender<Result<Value>>,
+enum ActorMessage {
+    Json {
+        method: &'static str,
+        params: Value,
+        reply: oneshot::Sender<Result<ActorResponse>>,
+    },
+    Upload {
+        method: &'static str,
+        params: Value,
+        bytes: Bytes,
+        reply: oneshot::Sender<Result<ActorResponse>>,
+    },
+    Download {
+        method: &'static str,
+        params: Value,
+        expected_offset: u64,
+        reply: oneshot::Sender<Result<ActorResponse>>,
+    },
+}
+
+#[cfg(unix)]
+enum ActorResponse {
+    Json(Value),
+    Download(BinaryDownload),
+}
+
+#[cfg(unix)]
+enum ActorLane {
+    Json,
+    Upload(Bytes),
+    Download(u64),
+}
+
+#[cfg(unix)]
+enum ActorFailure {
+    Recoverable(CowshedError),
+    Fatal(CowshedError),
 }
 
 #[cfg(unix)]
@@ -62,26 +109,67 @@ impl ControllerRuntime for ActorRuntime {
     async fn call(&self, method: &'static str, params: Value) -> Result<Value> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ActorMessage {
+            .send(ActorMessage::Json {
                 method,
                 params,
                 reply,
             })
             .await
-            .map_err(|_| {
-                CowshedError::new(
-                    ErrorCode::EnvironmentMissing,
-                    "controller actor channel closed",
-                    "restart the trusted cowshed controller",
-                )
-            })?;
-        response.await.map_err(|_| {
-            CowshedError::new(
-                ErrorCode::EnvironmentMissing,
-                "controller actor stopped before replying",
-                "restart the trusted cowshed controller",
-            )
-        })?
+            .map_err(|_| actor_send_error())?;
+        match response.await.map_err(|_| actor_reply_error())?? {
+            ActorResponse::Json(value) => Ok(value),
+            ActorResponse::Download(_) => Err(CowshedError::internal(
+                "controller actor returned binary data to a JSON-only call",
+            )),
+        }
+    }
+
+    async fn upload(&self, method: &'static str, params: Value, bytes: Bytes) -> Result<Value> {
+        if bytes.len() > MAX_BINARY_FRAME_BYTES {
+            return Err(CowshedError::internal(
+                "controller RPC binary request exceeds the 64 KiB frame limit",
+            ));
+        }
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ActorMessage::Upload {
+                method,
+                params,
+                bytes,
+                reply,
+            })
+            .await
+            .map_err(|_| actor_send_error())?;
+        match response.await.map_err(|_| actor_reply_error())?? {
+            ActorResponse::Json(value) => Ok(value),
+            ActorResponse::Download(_) => Err(CowshedError::internal(
+                "controller actor returned binary data to an upload call",
+            )),
+        }
+    }
+
+    async fn download(
+        &self,
+        method: &'static str,
+        params: Value,
+        expected_offset: u64,
+    ) -> Result<BinaryDownload> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ActorMessage::Download {
+                method,
+                params,
+                expected_offset,
+                reply,
+            })
+            .await
+            .map_err(|_| actor_send_error())?;
+        match response.await.map_err(|_| actor_reply_error())?? {
+            ActorResponse::Download(download) => Ok(download),
+            ActorResponse::Json(_) => Err(CowshedError::internal(
+                "controller actor omitted binary data from a download call",
+            )),
+        }
     }
 
     async fn exec(&self, workspace: &WorkspaceName, request: ExecRequest) -> Result<JobId> {
@@ -99,33 +187,31 @@ impl ControllerRuntime for ActorRuntime {
             RunSandboxMode::ReadWrite => "readWrite",
             RunSandboxMode::ReadOnly => "readOnly",
         };
-        let (stdin_metadata, mut stream) = match stdin {
-            StdinSource::Empty => (json!({ "kind": "empty" }), None),
-            StdinSource::Inline(bytes) => {
-                (json!({ "kind": "inline", "bytes": bytes.as_ref() }), None)
-            }
+        let (stdin_metadata, inline, mut stream) = match stdin {
+            StdinSource::Empty => (json!({ "kind": "empty" }), None, None),
+            StdinSource::Inline(bytes) => (json!({ "kind": "inline" }), Some(bytes), None),
             StdinSource::WorkspaceFile(path) => (
                 json!({ "kind": "workspaceFile", "workspacePath": path }),
                 None,
+                None,
             ),
-            StdinSource::Stream(stream) => (json!({ "kind": "stream" }), Some(stream)),
+            StdinSource::Stream(stream) => (json!({ "kind": "stream" }), None, Some(stream)),
         };
-        let result = self
-            .call(
-                "worker.exec",
-                json!({
-                    "workspace": workspace,
-                    "argv": argv,
-                    "cwd": cwd,
-                    "mode": mode,
-                    "env": env,
-                    "trace": trace,
-                    "stdin": stdin_metadata,
-                    "stdoutCopy": stdout_copy,
-                    "stderrCopy": stderr_copy,
-                }),
-            )
-            .await?;
+        let params = json!({
+            "workspace": workspace,
+            "argv": argv,
+            "cwd": cwd,
+            "mode": mode,
+            "env": env,
+            "trace": trace,
+            "stdin": stdin_metadata,
+            "stdoutCopy": stdout_copy,
+            "stderrCopy": stderr_copy,
+        });
+        let result = match inline {
+            Some(bytes) => self.upload("worker.exec", params, bytes).await?,
+            None => self.call("worker.exec", params).await?,
+        };
         let job_id: JobId = serde_json::from_value(result).map_err(|error| {
             CowshedError::new(
                 ErrorCode::Internal,
@@ -134,7 +220,7 @@ impl ControllerRuntime for ActorRuntime {
             )
         })?;
         if let Some(reader) = stream.as_mut() {
-            let mut buffer = [0_u8; 64 * 1024];
+            let mut buffer = [0_u8; MAX_BINARY_FRAME_BYTES];
             loop {
                 let count = reader.read(&mut buffer).await.map_err(|error| {
                     CowshedError::new(
@@ -146,39 +232,23 @@ impl ControllerRuntime for ActorRuntime {
                 if count == 0 {
                     break;
                 }
-                let _: EmptyResult = serde_json::from_value(
-                    self.call(
-                        "worker.stdinChunk",
-                        json!({
-                            "workspace": workspace,
-                            "jobId": job_id,
-                            "bytes": &buffer[..count],
-                        }),
-                    )
-                    .await?,
+                self.upload(
+                    "worker.stdinChunk",
+                    json!({
+                        "workspace": workspace,
+                        "jobId": job_id,
+                    }),
+                    Bytes::copy_from_slice(&buffer[..count]),
                 )
-                .map_err(|error| {
-                    CowshedError::new(
-                        ErrorCode::Internal,
-                        format!("controller rejected a stdin chunk response: {error}"),
-                        "cowshed doctor --json",
-                    )
-                })?;
+                .await
+                .and_then(decode_empty)?;
             }
-            let _: EmptyResult = serde_json::from_value(
-                self.call(
-                    "worker.stdinClose",
-                    json!({ "workspace": workspace, "jobId": job_id }),
-                )
-                .await?,
+            self.call(
+                "worker.stdinClose",
+                json!({ "workspace": workspace, "jobId": job_id }),
             )
-            .map_err(|error| {
-                CowshedError::new(
-                    ErrorCode::Internal,
-                    format!("controller rejected stdin close response: {error}"),
-                    "cowshed doctor --json",
-                )
-            })?;
+            .await
+            .and_then(decode_empty)?;
         }
         Ok(job_id)
     }
@@ -224,6 +294,24 @@ impl ControllerRuntime for ActorRuntime {
     }
 }
 
+#[cfg(unix)]
+fn actor_send_error() -> CowshedError {
+    CowshedError::new(
+        ErrorCode::EnvironmentMissing,
+        "controller actor channel closed",
+        "restart the trusted cowshed controller",
+    )
+}
+
+#[cfg(unix)]
+fn actor_reply_error() -> CowshedError {
+    CowshedError::new(
+        ErrorCode::EnvironmentMissing,
+        "controller actor stopped before replying",
+        "restart the trusted cowshed controller",
+    )
+}
+
 fn poll_job_stream(
     runtime: Arc<dyn ControllerRuntime>,
     workspace: WorkspaceName,
@@ -235,9 +323,9 @@ fn poll_job_stream(
     tokio::spawn(async move {
         let mut offset = 0_u64;
         loop {
-            let value = tokio::select! {
+            let chunk = tokio::select! {
                 _ = sender.closed() => break,
-                value = runtime.call(
+                value = runtime.download(
                     "job.logs",
                     json!({
                         "workspace": workspace,
@@ -246,15 +334,10 @@ fn poll_job_stream(
                         "follow": follow,
                         "offset": offset,
                     }),
+                    offset,
                 ) => value,
             };
-            let chunk = match value.and_then(|value| {
-                serde_json::from_value::<LogChunk>(value).map_err(|error| {
-                    CowshedError::internal(format!(
-                        "controller returned an invalid job.logs response: {error}"
-                    ))
-                })
-            }) {
+            let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) => {
                     tokio::select! {
@@ -267,7 +350,17 @@ fn poll_job_stream(
             let had_bytes = !chunk.bytes.is_empty();
             let eof = chunk.eof;
             if had_bytes {
-                offset = offset.saturating_add(chunk.bytes.len() as u64);
+                offset = match offset.checked_add(chunk.bytes.len() as u64) {
+                    Some(next_offset) => next_offset,
+                    None => {
+                        let error = CowshedError::internal("job.logs response offset overflowed");
+                        tokio::select! {
+                            _ = sender.closed() => {}
+                            _ = sender.send(Err(error)) => {}
+                        }
+                        break;
+                    }
+                };
                 let bytes = Bytes::from(chunk.bytes);
                 let sent = tokio::select! {
                     _ = sender.closed() => false,
@@ -353,13 +446,6 @@ pub enum JobStream {
     Stderr,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct LogChunk {
-    bytes: Vec<u8>,
-    eof: bool,
-}
-
 pub struct RawByteStream {
     receiver: mpsc::Receiver<Result<Bytes>>,
 }
@@ -378,18 +464,17 @@ pub struct JobStdin {
 
 impl JobStdin {
     pub async fn write(&self, bytes: Bytes) -> Result<()> {
-        let value = self
-            .runtime
-            .call(
+        self.runtime
+            .upload(
                 "job.attachWrite",
                 json!({
                     "workspace": self.workspace,
                     "jobId": self.id,
-                    "bytes": bytes.as_ref(),
                 }),
+                bytes,
             )
-            .await?;
-        decode_empty(value)
+            .await
+            .and_then(decode_empty)
     }
 }
 
@@ -827,20 +912,32 @@ async fn read_frame(stream: &mut tokio::net::UnixStream) -> Result<Vec<u8>> {
 
 #[cfg(unix)]
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RpcRequest<'a> {
     id: u64,
     method: &'a str,
     params: &'a Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binary_length: Option<u32>,
 }
 
 #[cfg(unix)]
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RpcResponse {
     id: u64,
     ok: bool,
     result: Option<Value>,
     error: Option<CowshedError>,
+    binary_length: Option<u32>,
+}
+
+#[cfg(unix)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RpcBinaryResult {
+    eof: bool,
+    next_offset: u64,
 }
 
 #[cfg(unix)]
@@ -895,6 +992,70 @@ async fn read_rpc_frame(stream: &mut tokio::net::UnixStream) -> Result<Vec<u8>> 
 }
 
 #[cfg(unix)]
+async fn write_binary_frame(stream: &mut tokio::net::UnixStream, bytes: &[u8]) -> Result<()> {
+    if bytes.len() > MAX_BINARY_FRAME_BYTES {
+        return Err(CowshedError::internal(
+            "controller RPC binary request exceeds the 64 KiB frame limit",
+        ));
+    }
+    stream
+        .write_u32(bytes.len() as u32)
+        .await
+        .map_err(|error| {
+            CowshedError::new(
+                ErrorCode::EnvironmentMissing,
+                format!("controller RPC binary write failed: {error}"),
+                "restart the trusted cowshed controller",
+            )
+        })?;
+    stream.write_all(bytes).await.map_err(|error| {
+        CowshedError::new(
+            ErrorCode::EnvironmentMissing,
+            format!("controller RPC binary write failed: {error}"),
+            "restart the trusted cowshed controller",
+        )
+    })
+}
+
+#[cfg(unix)]
+async fn read_binary_frame(
+    stream: &mut tokio::net::UnixStream,
+    expected_length: usize,
+) -> Result<Vec<u8>> {
+    if expected_length > MAX_BINARY_FRAME_BYTES {
+        return Err(CowshedError::internal(
+            "controller RPC binary response exceeds the 64 KiB frame limit",
+        ));
+    }
+    let actual_length = stream.read_u32().await.map_err(|error| {
+        CowshedError::new(
+            ErrorCode::EnvironmentMissing,
+            format!("controller RPC binary read failed: {error}"),
+            "restart the trusted cowshed controller",
+        )
+    })? as usize;
+    if actual_length > MAX_BINARY_FRAME_BYTES {
+        return Err(CowshedError::internal(
+            "controller RPC binary response has an oversized frame",
+        ));
+    }
+    if actual_length != expected_length {
+        return Err(CowshedError::internal(format!(
+            "controller RPC binary response length mismatch: declared {expected_length}, framed {actual_length}"
+        )));
+    }
+    let mut bytes = vec![0_u8; actual_length];
+    stream.read_exact(&mut bytes).await.map_err(|error| {
+        CowshedError::new(
+            ErrorCode::EnvironmentMissing,
+            format!("controller RPC binary read failed: {error}"),
+            "restart the trusted cowshed controller",
+        )
+    })?;
+    Ok(bytes)
+}
+
+#[cfg(unix)]
 fn spawn_controller_actor(mut stream: tokio::net::UnixStream) -> Arc<dyn ControllerRuntime> {
     let (sender, mut receiver) = mpsc::channel::<ActorMessage>(32);
     tokio::spawn(async move {
@@ -902,42 +1063,133 @@ fn spawn_controller_actor(mut stream: tokio::net::UnixStream) -> Arc<dyn Control
         while let Some(message) = receiver.recv().await {
             let id = next_id;
             next_id = next_id.saturating_add(1);
-            let result = async {
+            let (method, params, lane, reply) = match message {
+                ActorMessage::Json {
+                    method,
+                    params,
+                    reply,
+                } => (method, params, ActorLane::Json, reply),
+                ActorMessage::Upload {
+                    method,
+                    params,
+                    bytes,
+                    reply,
+                } => (method, params, ActorLane::Upload(bytes), reply),
+                ActorMessage::Download {
+                    method,
+                    params,
+                    expected_offset,
+                    reply,
+                } => (method, params, ActorLane::Download(expected_offset), reply),
+            };
+            let exchange = async {
+                let binary_length = match &lane {
+                    ActorLane::Upload(bytes) => Some(bytes.len() as u32),
+                    ActorLane::Json | ActorLane::Download(_) => None,
+                };
                 let request = serde_json::to_vec(&RpcRequest {
                     id,
-                    method: message.method,
-                    params: &message.params,
+                    method,
+                    params: &params,
+                    binary_length,
                 })
                 .map_err(|error| {
-                    CowshedError::internal(format!(
+                    ActorFailure::Fatal(CowshedError::internal(format!(
                         "controller RPC request encoding failed: {error}"
-                    ))
+                    )))
                 })?;
-                write_rpc_frame(&mut stream, &request).await?;
-                let response = read_rpc_frame(&mut stream).await?;
+                write_rpc_frame(&mut stream, &request)
+                    .await
+                    .map_err(ActorFailure::Fatal)?;
+                if let ActorLane::Upload(bytes) = &lane {
+                    write_binary_frame(&mut stream, bytes)
+                        .await
+                        .map_err(ActorFailure::Fatal)?;
+                }
+                let response = read_rpc_frame(&mut stream)
+                    .await
+                    .map_err(ActorFailure::Fatal)?;
                 let response: RpcResponse = serde_json::from_slice(&response).map_err(|error| {
-                    CowshedError::internal(format!(
+                    ActorFailure::Fatal(CowshedError::internal(format!(
                         "controller RPC response decoding failed: {error}"
-                    ))
+                    )))
                 })?;
                 if response.id != id {
-                    return Err(CowshedError::internal(
+                    return Err(ActorFailure::Fatal(CowshedError::internal(
                         "controller RPC response id did not match request",
-                    ));
+                    )));
                 }
-                match (response.ok, response.result, response.error) {
-                    (true, Some(result), None) => Ok(result),
-                    (false, None, Some(error)) => Err(error),
-                    _ => Err(CowshedError::internal(
-                        "controller RPC response has an invalid envelope",
-                    )),
+                let result = match (response.ok, response.result, response.error) {
+                    (true, Some(result), None) => result,
+                    (false, None, Some(error)) => {
+                        if response.binary_length.is_some() {
+                            return Err(ActorFailure::Fatal(CowshedError::internal(
+                                "controller RPC error response declared unsolicited binary data",
+                            )));
+                        }
+                        return Err(ActorFailure::Recoverable(error));
+                    }
+                    _ => {
+                        return Err(ActorFailure::Fatal(CowshedError::internal(
+                            "controller RPC response has an invalid envelope",
+                        )));
+                    }
+                };
+                match lane {
+                    ActorLane::Json | ActorLane::Upload(_) => {
+                        if response.binary_length.is_some() {
+                            return Err(ActorFailure::Fatal(CowshedError::internal(
+                                "controller RPC response declared unsolicited binary data",
+                            )));
+                        }
+                        Ok(ActorResponse::Json(result))
+                    }
+                    ActorLane::Download(expected_offset) => {
+                        let binary_length = response.binary_length.ok_or_else(|| {
+                            ActorFailure::Fatal(CowshedError::internal(
+                                "controller RPC download response omitted binaryLength",
+                            ))
+                        })? as usize;
+                        if binary_length > MAX_BINARY_FRAME_BYTES {
+                            return Err(ActorFailure::Fatal(CowshedError::internal(
+                                "controller RPC binary response exceeds the 64 KiB frame limit",
+                            )));
+                        }
+                        let metadata: RpcBinaryResult =
+                            serde_json::from_value(result).map_err(|error| {
+                                ActorFailure::Fatal(CowshedError::internal(format!(
+                                    "controller RPC download metadata is invalid: {error}"
+                                )))
+                            })?;
+                        let expected_next = expected_offset
+                            .checked_add(binary_length as u64)
+                            .ok_or_else(|| {
+                                ActorFailure::Fatal(CowshedError::internal(
+                                    "controller RPC download offset overflowed",
+                                ))
+                            })?;
+                        if metadata.next_offset != expected_next {
+                            return Err(ActorFailure::Fatal(CowshedError::internal(
+                                "controller RPC download nextOffset was not exact",
+                            )));
+                        }
+                        let bytes = read_binary_frame(&mut stream, binary_length)
+                            .await
+                            .map_err(ActorFailure::Fatal)?;
+                        Ok(ActorResponse::Download(BinaryDownload {
+                            bytes,
+                            eof: metadata.eof,
+                        }))
+                    }
                 }
             }
             .await;
-            let stop = result
-                .as_ref()
-                .is_err_and(|error| error.code == ErrorCode::EnvironmentMissing);
-            let _ = message.reply.send(result);
+            let (result, stop) = match exchange {
+                Ok(response) => (Ok(response), false),
+                Err(ActorFailure::Recoverable(error)) => (Err(error), false),
+                Err(ActorFailure::Fatal(error)) => (Err(error), true),
+            };
+            let _ = reply.send(result);
             if stop {
                 break;
             }
@@ -1404,31 +1656,74 @@ mod tests {
     impl ControllerRuntime for TestRuntime {
         async fn call(&self, method: &'static str, _params: Value) -> Result<Value> {
             match method {
-                "job.logs" => {
-                    let call = self.log_calls.fetch_add(1, Ordering::SeqCst);
-                    match self.mode.load(Ordering::SeqCst) {
-                        1 => {
-                            self.active_calls.fetch_add(1, Ordering::SeqCst);
-                            let _active = ActiveCall(&self.active_calls);
-                            future::pending().await
-                        }
-                        2 => match call {
-                            0 => Ok(json!({"bytes": [97, 98, 99], "eof": false})),
-                            1 => Ok(json!({"bytes": [100, 101, 102], "eof": false})),
-                            _ => Ok(json!({"bytes": [103, 104, 105], "eof": true})),
-                        },
-                        _ => Ok(json!({"bytes": [], "eof": true})),
+                "job.status" => {
+                    let call = self.status_calls.fetch_add(1, Ordering::SeqCst);
+                    if self.mode.load(Ordering::SeqCst) == 4 && call == 0 {
+                        Ok(running_job_value())
+                    } else {
+                        Ok(terminal_job_value())
                     }
                 }
-                "job.status" => {
-                    self.status_calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(terminal_job_value())
-                }
-                "job.attachWrite" => {
-                    self.stdin_writes.fetch_add(1, Ordering::SeqCst);
-                    Ok(json!({}))
-                }
                 _ => Ok(json!({})),
+            }
+        }
+
+        async fn upload(
+            &self,
+            method: &'static str,
+            _params: Value,
+            _bytes: Bytes,
+        ) -> Result<Value> {
+            if method == "job.attachWrite" {
+                self.stdin_writes.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(json!({}))
+        }
+
+        async fn download(
+            &self,
+            method: &'static str,
+            _params: Value,
+            _expected_offset: u64,
+        ) -> Result<BinaryDownload> {
+            assert_eq!(method, "job.logs");
+            let call = self.log_calls.fetch_add(1, Ordering::SeqCst);
+            match self.mode.load(Ordering::SeqCst) {
+                1 => {
+                    self.active_calls.fetch_add(1, Ordering::SeqCst);
+                    let _active = ActiveCall(&self.active_calls);
+                    future::pending().await
+                }
+                2 => match call {
+                    0 => Ok(BinaryDownload {
+                        bytes: b"abc".to_vec(),
+                        eof: false,
+                    }),
+                    1 => Ok(BinaryDownload {
+                        bytes: b"def".to_vec(),
+                        eof: false,
+                    }),
+                    _ => Ok(BinaryDownload {
+                        bytes: b"ghi".to_vec(),
+                        eof: true,
+                    }),
+                },
+                3 => Ok(BinaryDownload {
+                    bytes: vec![b'x'],
+                    eof: false,
+                }),
+                4 if call == 0 => Ok(BinaryDownload {
+                    bytes: Vec::new(),
+                    eof: true,
+                }),
+                4 => Ok(BinaryDownload {
+                    bytes: b"after-eof".to_vec(),
+                    eof: true,
+                }),
+                _ => Ok(BinaryDownload {
+                    bytes: Vec::new(),
+                    eof: true,
+                }),
             }
         }
 
@@ -1499,6 +1794,15 @@ mod tests {
         })
     }
 
+    fn running_job_value() -> Value {
+        let mut value = terminal_job_value();
+        let object = value.as_object_mut().unwrap();
+        object.insert("state".into(), json!("running"));
+        object.remove("durationMs");
+        object.remove("exit");
+        value
+    }
+
     #[test]
     fn authority_tokens_and_handles_are_affine_owned_values() {
         assert!(needs_drop::<CoordinatorToken>());
@@ -1528,6 +1832,61 @@ mod tests {
         }))
         .unwrap();
         write_frame(&mut stream, &response).await
+    }
+
+    #[cfg(unix)]
+    fn actor_pair() -> (Arc<dyn ControllerRuntime>, tokio::net::UnixStream) {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        (spawn_controller_actor(client), server)
+    }
+
+    #[cfg(unix)]
+    async fn read_rpc_request(stream: &mut tokio::net::UnixStream) -> (Vec<u8>, Value) {
+        let bytes = read_rpc_frame(stream).await.unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap();
+        (bytes, value)
+    }
+
+    #[cfg(unix)]
+    async fn write_rpc_success(
+        stream: &mut tokio::net::UnixStream,
+        id: u64,
+        result: Value,
+        binary_length: Option<usize>,
+    ) {
+        let mut response = json!({
+            "id": id,
+            "ok": true,
+            "result": result,
+            "error": null,
+        });
+        if let Some(binary_length) = binary_length {
+            response
+                .as_object_mut()
+                .unwrap()
+                .insert("binaryLength".into(), json!(binary_length));
+        }
+        let response = serde_json::to_vec(&response).unwrap();
+        write_rpc_frame(stream, &response).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn write_raw_frame(stream: &mut tokio::net::UnixStream, bytes: &[u8]) {
+        stream.write_u32(bytes.len() as u32).await.unwrap();
+        stream.write_all(bytes).await.unwrap();
+    }
+
+    fn exec_request(stdin: StdinSource) -> ExecRequest {
+        ExecRequest {
+            argv: vec!["cat".into()],
+            cwd: None,
+            mode: RunSandboxMode::ReadWrite,
+            env: std::collections::HashMap::new(),
+            trace: None,
+            stdin,
+            stdout_copy: None,
+            stderr_copy: None,
+        }
     }
 
     #[cfg(unix)]
@@ -1569,6 +1928,348 @@ mod tests {
         assert!(error.message.contains("UTF-8"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inline_stdin_is_a_raw_frame_and_never_json_bytes() {
+        let (runtime, mut server) = actor_pair();
+        let payload = Bytes::from_static(&[0, 0xff, 0x80, b'[', b'1', b',', b'2', b']']);
+        let expected = payload.clone();
+        let server_task = tokio::spawn(async move {
+            let (header, request) = read_rpc_request(&mut server).await;
+            assert_eq!(request["method"], "worker.exec");
+            assert_eq!(request["binaryLength"], expected.len());
+            assert_eq!(request["params"]["stdin"], json!({"kind": "inline"}));
+            assert!(request["params"]["stdin"].get("bytes").is_none());
+            assert!(!header.contains(&0));
+            assert!(!header.contains(&0xff));
+            let frame = read_binary_frame(&mut server, expected.len())
+                .await
+                .unwrap();
+            assert_eq!(frame, expected.as_ref());
+            write_rpc_success(&mut server, request["id"].as_u64().unwrap(), json!(7), None).await;
+        });
+
+        let id = runtime
+            .exec(
+                &WorkspaceName::new("raven").unwrap(),
+                exec_request(StdinSource::Inline(payload)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(id, JobId::new(7).unwrap());
+        server_task.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streamed_stdin_chunks_and_close_preserve_binary_framing() {
+        let (runtime, mut server) = actor_pair();
+        let payload = vec![0, 0xff, 0x80, b'x'];
+        let expected = payload.clone();
+        let server_task = tokio::spawn(async move {
+            let (_, exec) = read_rpc_request(&mut server).await;
+            assert_eq!(exec["method"], "worker.exec");
+            assert!(exec.get("binaryLength").is_none());
+            assert_eq!(exec["params"]["stdin"], json!({"kind": "stream"}));
+            write_rpc_success(&mut server, exec["id"].as_u64().unwrap(), json!(7), None).await;
+
+            let (chunk_header, chunk) = read_rpc_request(&mut server).await;
+            assert_eq!(chunk["method"], "worker.stdinChunk");
+            assert_eq!(chunk["binaryLength"], expected.len());
+            assert!(chunk["params"].get("bytes").is_none());
+            assert!(!chunk_header.contains(&0));
+            assert!(!chunk_header.contains(&0xff));
+            let frame = read_binary_frame(&mut server, expected.len())
+                .await
+                .unwrap();
+            assert_eq!(frame, expected);
+            write_rpc_success(&mut server, chunk["id"].as_u64().unwrap(), json!({}), None).await;
+
+            let (_, close) = read_rpc_request(&mut server).await;
+            assert_eq!(close["method"], "worker.stdinClose");
+            assert!(close.get("binaryLength").is_none());
+            write_rpc_success(&mut server, close["id"].as_u64().unwrap(), json!({}), None).await;
+        });
+
+        let id = runtime
+            .exec(
+                &WorkspaceName::new("raven").unwrap(),
+                exec_request(StdinSource::Stream(Box::pin(std::io::Cursor::new(payload)))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(id, JobId::new(7).unwrap());
+        server_task.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attachment_stdin_write_uses_one_exact_raw_frame() {
+        let (runtime, mut server) = actor_pair();
+        let payload = Bytes::from_static(&[0, 0xfe, 0xff, b'i', b'n']);
+        let expected = payload.clone();
+        let server_task = tokio::spawn(async move {
+            let (header, request) = read_rpc_request(&mut server).await;
+            assert_eq!(request["method"], "job.attachWrite");
+            assert_eq!(request["binaryLength"], expected.len());
+            assert!(request["params"].get("bytes").is_none());
+            assert!(!header.contains(&0));
+            assert!(!header.contains(&0xff));
+            let frame = read_binary_frame(&mut server, expected.len())
+                .await
+                .unwrap();
+            assert_eq!(frame, expected.as_ref());
+            write_rpc_success(
+                &mut server,
+                request["id"].as_u64().unwrap(),
+                json!({}),
+                None,
+            )
+            .await;
+        });
+        let stdin = JobStdin {
+            workspace: WorkspaceName::new("raven").unwrap(),
+            id: JobId::new(7).unwrap(),
+            runtime,
+        };
+
+        stdin.write(payload).await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdout_and_stderr_downloads_remain_separate_raw_streams() {
+        let (runtime, mut server) = actor_pair();
+        let workspace = WorkspaceName::new("raven").unwrap();
+        let id = JobId::new(7).unwrap();
+        let mut stdout = poll_job_stream(
+            Arc::clone(&runtime),
+            workspace.clone(),
+            id,
+            JobStream::Stdout,
+            false,
+        );
+        let mut stderr = poll_job_stream(runtime, workspace, id, JobStream::Stderr, false);
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (_, request) = read_rpc_request(&mut server).await;
+                assert_eq!(request["method"], "job.logs");
+                assert!(request.get("binaryLength").is_none());
+                let payload: &[u8] = match request["params"]["stream"].as_str().unwrap() {
+                    "stdout" => &[0, 0xff, b'o'],
+                    "stderr" => &[0x80, 0, b'e'],
+                    stream => panic!("unexpected stream {stream}"),
+                };
+                let offset = request["params"]["offset"].as_u64().unwrap();
+                write_rpc_success(
+                    &mut server,
+                    request["id"].as_u64().unwrap(),
+                    json!({"eof": true, "nextOffset": offset + payload.len() as u64}),
+                    Some(payload.len()),
+                )
+                .await;
+                write_raw_frame(&mut server, payload).await;
+            }
+        });
+
+        assert_eq!(
+            stdout.next().await.unwrap().unwrap().as_ref(),
+            &[0, 0xff, b'o']
+        );
+        assert_eq!(
+            stderr.next().await.unwrap().unwrap().as_ref(),
+            &[0x80, 0, b'e']
+        );
+        assert!(stdout.next().await.is_none());
+        assert!(stderr.next().await.is_none());
+        server_task.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn actor_rejects_binary_protocol_violations() {
+        {
+            let (runtime, mut server) = actor_pair();
+            let server_task = tokio::spawn(async move {
+                let (_, request) = read_rpc_request(&mut server).await;
+                write_rpc_success(
+                    &mut server,
+                    request["id"].as_u64().unwrap() + 1,
+                    json!({}),
+                    None,
+                )
+                .await;
+            });
+            let error = runtime.call("project.list", json!({})).await.unwrap_err();
+            assert!(error.message.contains("id did not match"));
+            server_task.await.unwrap();
+        }
+        {
+            let (runtime, mut server) = actor_pair();
+            let server_task = tokio::spawn(async move {
+                let (_, request) = read_rpc_request(&mut server).await;
+                write_rpc_success(
+                    &mut server,
+                    request["id"].as_u64().unwrap(),
+                    json!({}),
+                    Some(0),
+                )
+                .await;
+            });
+            let error = runtime.call("project.list", json!({})).await.unwrap_err();
+            assert!(error.message.contains("unsolicited binary"));
+            server_task.await.unwrap();
+        }
+        {
+            let (runtime, mut server) = actor_pair();
+            let server_task = tokio::spawn(async move {
+                let (_, request) = read_rpc_request(&mut server).await;
+                write_rpc_success(
+                    &mut server,
+                    request["id"].as_u64().unwrap(),
+                    json!({"eof": true, "nextOffset": 0}),
+                    None,
+                )
+                .await;
+            });
+            let error = runtime
+                .download("job.logs", json!({}), 0)
+                .await
+                .err()
+                .unwrap();
+            assert!(error.message.contains("omitted binaryLength"));
+            server_task.await.unwrap();
+        }
+        {
+            let (runtime, mut server) = actor_pair();
+            let server_task = tokio::spawn(async move {
+                let (_, request) = read_rpc_request(&mut server).await;
+                write_rpc_success(
+                    &mut server,
+                    request["id"].as_u64().unwrap(),
+                    json!({"eof": false, "nextOffset": MAX_BINARY_FRAME_BYTES + 1}),
+                    Some(MAX_BINARY_FRAME_BYTES + 1),
+                )
+                .await;
+            });
+            let error = runtime
+                .download("job.logs", json!({}), 0)
+                .await
+                .err()
+                .unwrap();
+            assert!(error.message.contains("64 KiB"));
+            server_task.await.unwrap();
+        }
+        {
+            let (runtime, mut server) = actor_pair();
+            let server_task = tokio::spawn(async move {
+                let (_, request) = read_rpc_request(&mut server).await;
+                write_rpc_success(
+                    &mut server,
+                    request["id"].as_u64().unwrap(),
+                    json!({"eof": false, "nextOffset": 4}),
+                    Some(3),
+                )
+                .await;
+            });
+            let error = runtime
+                .download("job.logs", json!({}), 0)
+                .await
+                .err()
+                .unwrap();
+            assert!(error.message.contains("nextOffset"));
+            server_task.await.unwrap();
+        }
+        {
+            let (runtime, mut server) = actor_pair();
+            let server_task = tokio::spawn(async move {
+                let (_, request) = read_rpc_request(&mut server).await;
+                write_rpc_success(
+                    &mut server,
+                    request["id"].as_u64().unwrap(),
+                    json!({"eof": false, "nextOffset": 3}),
+                    Some(3),
+                )
+                .await;
+                write_raw_frame(&mut server, b"ab").await;
+            });
+            let error = runtime
+                .download("job.logs", json!({}), 0)
+                .await
+                .err()
+                .unwrap();
+            assert!(error.message.contains("length mismatch"));
+            server_task.await.unwrap();
+        }
+        {
+            let (runtime, mut server) = actor_pair();
+            let server_task = tokio::spawn(async move {
+                let (_, request) = read_rpc_request(&mut server).await;
+                write_rpc_success(
+                    &mut server,
+                    request["id"].as_u64().unwrap(),
+                    json!({"eof": false, "nextOffset": 1}),
+                    Some(1),
+                )
+                .await;
+            });
+            let error = runtime
+                .download("job.logs", json!({}), 0)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.code, ErrorCode::EnvironmentMissing);
+            assert!(error.message.contains("binary read failed"));
+            server_task.await.unwrap();
+        }
+        {
+            let (runtime, mut server) = actor_pair();
+            let server_task = tokio::spawn(async move {
+                let (_, request) = read_rpc_request(&mut server).await;
+                let response = serde_json::to_vec(&json!({
+                    "id": request["id"],
+                    "ok": true,
+                    "result": null,
+                    "error": null,
+                }))
+                .unwrap();
+                write_rpc_frame(&mut server, &response).await.unwrap();
+            });
+            let error = runtime.call("project.list", json!({})).await.unwrap_err();
+            assert!(error.message.contains("invalid envelope"));
+            server_task.await.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oversized_upload_is_rejected_without_touching_the_wire() {
+        let (runtime, mut server) = actor_pair();
+        let server_task = tokio::spawn(async move {
+            let (_, request) = read_rpc_request(&mut server).await;
+            assert_eq!(request["id"], 1);
+            assert_eq!(request["method"], "project.list");
+            assert!(request.get("binaryLength").is_none());
+            write_rpc_success(&mut server, 1, json!([]), None).await;
+        });
+
+        let error = runtime
+            .upload(
+                "job.attachWrite",
+                json!({}),
+                Bytes::from(vec![0; MAX_BINARY_FRAME_BYTES + 1]),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("64 KiB"));
+        assert_eq!(
+            runtime.call("project.list", json!({})).await.unwrap(),
+            json!([])
+        );
+        server_task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn followed_stream_closes_at_terminal_state_without_empty_chunks() {
         let runtime = Arc::new(TestRuntime::default());
@@ -1584,6 +2285,28 @@ mod tests {
         assert!(stream.next().await.is_none());
         assert_eq!(runtime.log_calls.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.status_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn followed_stream_resumes_after_nonterminal_eof_then_closes_at_terminal_eof() {
+        let runtime = Arc::new(TestRuntime::default());
+        runtime.mode.store(4, Ordering::SeqCst);
+        let runtime_trait: Arc<dyn ControllerRuntime> = runtime.clone();
+        let mut stream = poll_job_stream(
+            runtime_trait,
+            WorkspaceName::new("raven").unwrap(),
+            JobId::new(7).unwrap(),
+            JobStream::Stdout,
+            true,
+        );
+
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"after-eof")
+        );
+        assert!(stream.next().await.is_none());
+        assert_eq!(runtime.log_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(runtime.status_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1606,6 +2329,30 @@ mod tests {
         assert_eq!(bytes, b"abcdefghi");
         assert_eq!(runtime.log_calls.load(Ordering::SeqCst), 3);
         assert_eq!(runtime.status_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn slow_consumer_bounds_completed_log_polls_to_channel_capacity() {
+        let runtime = Arc::new(TestRuntime::default());
+        runtime.mode.store(3, Ordering::SeqCst);
+        let runtime_trait: Arc<dyn ControllerRuntime> = runtime.clone();
+        let stream = poll_job_stream(
+            runtime_trait,
+            WorkspaceName::new("raven").unwrap(),
+            JobId::new(7).unwrap(),
+            JobStream::Stdout,
+            false,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while runtime.log_calls.load(Ordering::SeqCst) < 9 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("producer did not fill the bounded channel");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(runtime.log_calls.load(Ordering::SeqCst), 9);
+        drop(stream);
     }
     #[tokio::test]
     async fn dropping_stream_cancels_an_in_flight_poll() {

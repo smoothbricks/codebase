@@ -898,6 +898,8 @@ pub struct TerminalCommitment {
     pub stderr_bytes: u64,
     pub stderr_sha256: Sha256Digest,
     pub batch_sha256: Sha256Digest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_limit: Option<OutputLimitInfo>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -993,6 +995,23 @@ impl ControllerCommitment {
             {
                 Err(DtoError::InvalidJobProjection(
                     "terminal commitment must contain a terminal state",
+                ))
+            }
+            Self::Terminal(value)
+                if value.output_limit.is_some() != matches!(value.state, JobState::OutputLimit) =>
+            {
+                Err(DtoError::InvalidJobProjection(
+                    "terminal output limit evidence must agree with state",
+                ))
+            }
+            Self::Terminal(value)
+                if value
+                    .output_limit
+                    .as_ref()
+                    .is_some_and(|limit| limit.crossing_bytes <= limit.limit_bytes) =>
+            {
+                Err(DtoError::InvalidJobProjection(
+                    "terminal output limit crossing must exceed its limit",
                 ))
             }
             Self::Checkpoint(value) if !valid_commitment_id(&value.checkpoint_id) => Err(
