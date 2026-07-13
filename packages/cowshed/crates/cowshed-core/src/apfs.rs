@@ -140,6 +140,12 @@ pub struct CreatedImage {
     pub format: ImageFormat,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DetachTarget<'a> {
+    Device(&'a str),
+    MountPoint(&'a Path),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttachedImage {
     image: PathBuf,
@@ -263,6 +269,7 @@ pub enum ApfsError {
     },
     InvalidStagedStem(PathBuf),
     InvalidCreateRequest(&'static str),
+    InvalidDetachTarget(PathBuf),
     UnsupportedOperation {
         operation: &'static str,
         format: ImageFormat,
@@ -316,6 +323,9 @@ impl fmt::Display for ApfsError {
                 path.display()
             ),
             Self::InvalidCreateRequest(message) => f.write_str(message),
+            Self::InvalidDetachTarget(target) => {
+                write!(f, "invalid APFS detach target: {}", target.display())
+            }
             Self::UnsupportedOperation { operation, format } => {
                 write!(f, "{operation} is not supported for {format:?} images")
             }
@@ -414,6 +424,12 @@ pub trait ApfsBackend {
         browse: bool,
     ) -> Result<(), ApfsError>;
     fn detach(&self, attachment: &AttachedImage, force: bool) -> Result<(), ApfsError>;
+    fn detach_target(
+        &self,
+        format: ImageFormat,
+        target: DetachTarget<'_>,
+        force: bool,
+    ) -> Result<(), ApfsError>;
     fn delete_image(&self, image: &Path, format: ImageFormat) -> Result<(), ApfsError>;
 }
 
@@ -576,19 +592,20 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
         })
     }
 
-    fn detach_device(
+    fn detach_target_checked(
         &self,
         format: ImageFormat,
-        whole_device: &str,
+        target: DetachTarget<'_>,
         force: bool,
     ) -> Result<(), ApfsError> {
+        let target = validate_detach_target(target)?;
         let request = match format {
             ImageFormat::Asif => {
                 let mut args = vec![OsString::from("eject")];
                 if force {
                     args.push(OsString::from("force"));
                 }
-                args.push(OsString::from(whole_device));
+                args.push(target);
                 CommandRequest::new(DISKUTIL, args)
             }
             ImageFormat::Sparse => {
@@ -596,11 +613,20 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
                 if force {
                     args.push(OsString::from("-force"));
                 }
-                args.push(OsString::from(whole_device));
+                args.push(target);
                 CommandRequest::new(HDIUTIL, args)
             }
         };
         self.run_checked("detach image", request).map(|_| ())
+    }
+
+    fn detach_device(
+        &self,
+        format: ImageFormat,
+        whole_device: &str,
+        force: bool,
+    ) -> Result<(), ApfsError> {
+        self.detach_target_checked(format, DetachTarget::Device(whole_device), force)
     }
 }
 
@@ -813,6 +839,15 @@ impl<R: CommandRunner> ApfsBackend for MacOsApfsBackend<R> {
         self.detach_device(attachment.format, &attachment.whole_device, force)
     }
 
+    fn detach_target(
+        &self,
+        format: ImageFormat,
+        target: DetachTarget<'_>,
+        force: bool,
+    ) -> Result<(), ApfsError> {
+        self.detach_target_checked(format, target, force)
+    }
+
     fn delete_image(&self, image: &Path, format: ImageFormat) -> Result<(), ApfsError> {
         validate_image_path(image, format)?;
         match fs::remove_file(image) {
@@ -825,6 +860,44 @@ impl<R: CommandRunner> ApfsBackend for MacOsApfsBackend<R> {
             }),
         }
     }
+}
+
+fn validate_detach_target(target: DetachTarget<'_>) -> Result<OsString, ApfsError> {
+    let valid = match target {
+        DetachTarget::Device(device) => is_kernel_device_path(device),
+        DetachTarget::MountPoint(path) => {
+            let bytes = path.as_os_str().as_encoded_bytes();
+            bytes.starts_with(b"/")
+                && bytes != b"/"
+                && !bytes.contains(&0)
+                && !path.starts_with("/dev")
+                && bytes[1..]
+                    .split(|byte| *byte == b'/')
+                    .all(|segment| !segment.is_empty() && segment != b"." && segment != b"..")
+        }
+    };
+    if !valid {
+        return Err(ApfsError::InvalidDetachTarget(match target {
+            DetachTarget::Device(device) => PathBuf::from(device),
+            DetachTarget::MountPoint(path) => path.to_owned(),
+        }));
+    }
+    Ok(match target {
+        DetachTarget::Device(device) => OsString::from(device),
+        DetachTarget::MountPoint(path) => path.as_os_str().to_owned(),
+    })
+}
+
+fn is_kernel_device_path(device: &str) -> bool {
+    let Some(relative) = device.strip_prefix("/dev/disk") else {
+        return false;
+    };
+    let mut components = relative.split('s');
+    components.all(|component| {
+        !component.is_empty()
+            && component.bytes().all(|byte| byte.is_ascii_digit())
+            && (component == "0" || !component.starts_with('0'))
+    })
 }
 
 fn validate_image_path(path: &Path, format: ImageFormat) -> Result<(), ApfsError> {
@@ -1469,11 +1542,9 @@ mod tests {
         assert_eq!(argv(&requests[2]), ["-q", "/dev/rdisk5s2"]);
         assert_eq!(requests[3].program, Path::new(HDIUTIL));
         assert_eq!(argv(&requests[3]), ["detach", "-quiet", "/dev/disk4"]);
-        assert!(
-            !requests
-                .iter()
-                .any(|request| argv(request).first().is_some_and(|arg| arg == "mount"))
-        );
+        assert!(!requests
+            .iter()
+            .any(|request| argv(request).first().is_some_and(|arg| arg == "mount")));
     }
 
     #[test]
@@ -2102,6 +2173,94 @@ mod tests {
             argv(&requests[0]),
             ["detach", "-quiet", "-force", "/dev/disk12"]
         );
+    }
+
+    #[test]
+    fn detach_target_records_format_specific_device_and_mountpoint_commands() {
+        let cases: [(ImageFormat, DetachTarget<'_>, bool, &str, &[&str]); 4] = [
+            (
+                ImageFormat::Asif,
+                DetachTarget::Device("/dev/disk3s1"),
+                true,
+                DISKUTIL,
+                &["eject", "force", "/dev/disk3s1"],
+            ),
+            (
+                ImageFormat::Asif,
+                DetachTarget::MountPoint(Path::new("/Volumes/cowshed/main")),
+                false,
+                DISKUTIL,
+                &["eject", "/Volumes/cowshed/main"],
+            ),
+            (
+                ImageFormat::Sparse,
+                DetachTarget::Device("/dev/disk4"),
+                true,
+                HDIUTIL,
+                &["detach", "-quiet", "-force", "/dev/disk4"],
+            ),
+            (
+                ImageFormat::Sparse,
+                DetachTarget::MountPoint(Path::new("/Volumes/cowshed/session")),
+                false,
+                HDIUTIL,
+                &["detach", "-quiet", "/Volumes/cowshed/session"],
+            ),
+        ];
+
+        for (format, target, force, program, expected_argv) in cases {
+            let backend =
+                MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success([])]));
+            backend.detach_target(format, target, force).unwrap();
+            let requests = backend.runner().requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].program, Path::new(program));
+            assert_eq!(argv(&requests[0]), expected_argv);
+        }
+    }
+
+    #[test]
+    fn detach_target_rejects_unvalidated_devices_and_mountpoints_before_spawning() {
+        let invalid = [
+            DetachTarget::Device("disk1"),
+            DetachTarget::Device("/dev/rdisk1"),
+            DetachTarget::Device("/dev/disk"),
+            DetachTarget::Device("/dev/disk01"),
+            DetachTarget::Device("/dev/disk1s01"),
+            DetachTarget::Device("/dev/disk1s"),
+            DetachTarget::Device("/dev/disk1/child"),
+            DetachTarget::MountPoint(Path::new("relative/mount")),
+            DetachTarget::MountPoint(Path::new("/")),
+            DetachTarget::MountPoint(Path::new("/dev")),
+            DetachTarget::MountPoint(Path::new("/dev/disk1")),
+            DetachTarget::MountPoint(Path::new("/Volumes/../private/tmp")),
+            DetachTarget::MountPoint(Path::new("/Volumes/./main")),
+            DetachTarget::MountPoint(Path::new("/Volumes//main")),
+            DetachTarget::MountPoint(Path::new("/Volumes/main/")),
+            DetachTarget::MountPoint(Path::new("/Volumes/\0main")),
+        ];
+        let backend = MacOsApfsBackend::new(RecordingRunner::default());
+
+        for target in invalid {
+            let expected = match target {
+                DetachTarget::Device(device) => PathBuf::from(device),
+                DetachTarget::MountPoint(path) => path.to_owned(),
+            };
+            let error = backend
+                .detach_target(ImageFormat::Sparse, target, false)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ApfsError::InvalidDetachTarget(path) if path == expected
+            ));
+        }
+        assert!(backend.runner().requests().is_empty());
+    }
+
+    #[test]
+    fn invalid_detach_target_error_preserves_the_rejected_target() {
+        let error = ApfsError::InvalidDetachTarget(PathBuf::from("../escape"));
+        assert_eq!(error.to_string(), "invalid APFS detach target: ../escape");
     }
 
     #[test]
