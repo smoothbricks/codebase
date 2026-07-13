@@ -35,9 +35,7 @@ function isWasmExportFunction(value: unknown): value is WasmExportFunction {
   return typeof value === 'function';
 }
 
-function requireWasmFunction(
-  name: 'init' | 'set_thread_id' | 'init_trace_root' | 'span_start',
-): VoidWasmExport;
+function requireWasmFunction(name: 'init' | 'set_thread_id' | 'init_trace_root' | 'span_start'): VoidWasmExport;
 function requireWasmFunction(
   name:
     | 'alloc_exact'

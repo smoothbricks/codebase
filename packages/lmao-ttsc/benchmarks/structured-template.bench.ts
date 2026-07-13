@@ -10,6 +10,7 @@
  */
 
 import { bench, do_not_optimize, group, run, summary } from 'mitata';
+import { registerBenchmarkVocabulary } from '../../lmao/benchmarks/vocabularyFixture.ts';
 import type { WriterState } from '../../lmao/src/lib/codegen/fixedPositionWriterGenerator.ts';
 import { resolveMessage } from '../../lmao/src/lib/resolveMessage.ts';
 import {
@@ -23,7 +24,6 @@ import {
   createTraceRoot,
   defineLogSchema,
   defineOpContext,
-  ENTRY_TYPE_DEBUG,
   ENTRY_TYPE_INFO,
   JsBufferStrategy,
   Ok,
@@ -32,7 +32,6 @@ import {
   type SpanLoggerImpl,
   TestTracer,
 } from '../../lmao/src/node.ts';
-import { registerBenchmarkVocabulary } from '../../lmao/benchmarks/vocabularyFixture.ts';
 
 const QUICK = process.argv.includes('--quick');
 const FORMAT = process.argv.includes('--json') ? 'json' : process.argv.includes('--markdown') ? 'markdown' : 'mitata';
@@ -146,16 +145,11 @@ function makeRuntimeBundle(label: string, dynamic: boolean, implementation: Impl
   const messageLayout = staticLowered
     ? RUNTIME_HINT_MESSAGE_LAYOUT_STATIC_ONLY
     : RUNTIME_HINT_MESSAGE_LAYOUT_DYNAMIC_ONLY;
-  const benchmarkOp = opContext.defineOp(
-    `structured-template-${label}`,
-    () => new Ok(undefined),
-    undefined,
-    {
-      runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_LOG | messageLayout | CAPACITY,
-      eagerColumns: EAGER_COLUMNS,
-      localMessageDictionary: staticLowered ? [STATIC_MESSAGE_INDEX] : [],
-    },
-  );
+  const benchmarkOp = opContext.defineOp(`structured-template-${label}`, () => new Ok(undefined), undefined, {
+    runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_LOG | messageLayout | CAPACITY,
+    eagerColumns: EAGER_COLUMNS,
+    localMessageDictionary: staticLowered ? [STATIC_MESSAGE_INDEX] : [],
+  });
   const plan = benchmarkOp.callsitePlan;
   const staticMessageId = staticLowered ? plan.encodeLocalMessage(STATIC_MESSAGE_INDEX) : 0;
   if (staticLowered && staticMessageId === 0) {
@@ -252,12 +246,13 @@ function evaluateObject(tracker: Tracker, count: number, iteration: number): Par
     case 1:
       note(tracker, 'u');
       return { userId: `user-${iteration & 15}` };
-    case 2:
+    case 2: {
       note(tracker, 'u');
       const userId = `user-${iteration & 15}`;
       note(tracker, 'r');
       return { userId, retries: iteration & 3 };
-    case 5:
+    }
+    case 5: {
       note(tracker, 'u');
       const fullUserId = `user-${iteration & 15}`;
       note(tracker, 'r');
@@ -268,6 +263,7 @@ function evaluateObject(tracker: Tracker, count: number, iteration: number): Par
       const latencyMs = iteration + 0.25;
       note(tracker, 'c');
       return { retries, region, latencyMs, cached: (iteration & 1) === 0, userId: fullUserId };
+    }
     default:
       throw new Error(`Unsupported attribute count: ${count}`);
   }
@@ -283,7 +279,13 @@ function checksumIteration(checksum: bigint, message: string, values: AttributeV
   return next;
 }
 
-function applyUnrolled(bundle: RuntimeBundle, message: string, values: AttributeValues, count: number, debug: boolean): void {
+function applyUnrolled(
+  bundle: RuntimeBundle,
+  message: string,
+  values: AttributeValues,
+  count: number,
+  debug: boolean,
+): void {
   const logger = bundle.context._spanLogger;
   const entry = bundle.staticLowered
     ? logger._infoTemplate(STATIC_MESSAGE_INDEX)
@@ -365,12 +367,7 @@ function storedChecksum(bundle: RuntimeBundle, row: number, count: number): bigi
   return checksum;
 }
 
-function finishChecksum(
-  semantic: bigint,
-  tracker: Tracker,
-  bundle: RuntimeBundle,
-  attributeCount: number,
-): RunResult {
+function finishChecksum(semantic: bigint, tracker: Tracker, bundle: RuntimeBundle, attributeCount: number): RunResult {
   const row = bundle.buffer._writeIndex - 1;
   return {
     checksum: (semantic ^ tracker.hash ^ BigInt(tracker.count) ^ storedChecksum(bundle, row, attributeCount)) & MASK_64,
@@ -396,7 +393,11 @@ function makeRunner(
   dynamic: boolean,
   implementation: Implementation,
 ): Runner {
-  const bundle = makeRuntimeBundle(`${label}-${attributeCount}-${dynamic ? 'dynamic' : 'static'}`, dynamic, implementation);
+  const bundle = makeRuntimeBundle(
+    `${label}-${attributeCount}-${dynamic ? 'dynamic' : 'static'}`,
+    dynamic,
+    implementation,
+  );
   const tracker: Tracker = { count: 0, hash: 0n, trace: undefined };
 
   function execute(tracked: boolean): RunResult {
@@ -416,7 +417,8 @@ function makeRunner(
           : sourceObject(attributeCount, iteration);
         if (implementation === 'current') bundle.context._spanLogger.info(message).with(attributes);
         else bundle.context._spanLogger.info(message, attributes);
-        if (tracked) semantic = checksumIteration(semantic, message, sourceValues(attributeCount, iteration), attributeCount);
+        if (tracked)
+          semantic = checksumIteration(semantic, message, sourceValues(attributeCount, iteration), attributeCount);
       } else {
         const values = tracked
           ? evaluateValues(tracker, attributeCount, iteration)

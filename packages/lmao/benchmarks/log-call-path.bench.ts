@@ -6,51 +6,62 @@
  */
 
 import { bench, do_not_optimize, group, run, summary } from 'mitata';
-import { type WriterState } from '../src/lib/codegen/fixedPositionWriterGenerator.js';
+import type { WriterState } from '../src/lib/codegen/fixedPositionWriterGenerator.js';
 import { createSpanLogger, type SpanLoggerImpl } from '../src/lib/codegen/spanLoggerGenerator.js';
 import { JsBufferStrategy } from '../src/lib/JsBufferStrategy.js';
 import { DEFAULT_METADATA } from '../src/lib/opContext/defineOp.js';
+import type { OpContext } from '../src/lib/opContext/types.js';
 import { getPhysicalLayoutPlan, sealCallsitePlan } from '../src/lib/physicalLayoutPlan.js';
+import { resolveMessage } from '../src/lib/resolveMessage.js';
 import { RUNTIME_HINT_ANALYZED_VALID, RUNTIME_HINT_FULL_CAPABILITIES } from '../src/lib/runtimeHint.js';
 import { S } from '../src/lib/schema/builder.js';
 import { LogSchema } from '../src/lib/schema/LogSchema.js';
 import { ENTRY_TYPE_INFO, mergeWithSystemSchema } from '../src/lib/schema/systemSchema.js';
 import { createOverflowBuffer, createSpanBuffer, getSpanBufferClass } from '../src/lib/spanBuffer.js';
+import { createSpanContextClass } from '../src/lib/spanContext.js';
 import type { TracerLifecycleHooks } from '../src/lib/traceRoot.js';
 import { createTraceRoot } from '../src/lib/traceRoot.node.js';
-import { createSpanContextClass } from '../src/lib/spanContext.js';
-import type { AnySpanBuffer } from '../src/lib/types.js';
-import { resolveMessage } from '../src/lib/resolveMessage.js';
+import type { SpanBuffer } from '../src/lib/types.js';
 import { registerBenchmarkVocabulary } from './vocabularyFixture.js';
 
-const LOG_COUNTS = [0, 1, 50] as const;
+type MessageMode = 'literal' | 'dynamic';
+type AppendMode = 'trace-root-method' | 'inline';
+type OverflowMode = 'method' | 'inline-compare';
+type MessageBranchMode = 'optional' | 'required';
+type AccountingMode = 'per-entry' | 'segment';
+
+const LOG_COUNTS: readonly number[] = [0, 1, 50];
 const LOG_COUNT_ARGUMENT = process.argv.find((argument) => argument.startsWith('--logs='));
-const SELECTED_LOG_COUNT = LOG_COUNT_ARGUMENT === undefined ? undefined : Number(LOG_COUNT_ARGUMENT.slice('--logs='.length));
-const LOG_COUNT_FILTER = SELECTED_LOG_COUNT === undefined
-  ? LOG_COUNTS
-  : LOG_COUNTS.filter((count) => count === SELECTED_LOG_COUNT);
+const SELECTED_LOG_COUNT =
+  LOG_COUNT_ARGUMENT === undefined ? undefined : Number(LOG_COUNT_ARGUMENT.slice('--logs='.length));
+const LOG_COUNT_FILTER =
+  SELECTED_LOG_COUNT === undefined ? LOG_COUNTS : LOG_COUNTS.filter((count) => count === SELECTED_LOG_COUNT);
 if (LOG_COUNT_ARGUMENT !== undefined && LOG_COUNT_FILTER.length === 0) {
   throw new Error(`Unsupported ${LOG_COUNT_ARGUMENT}; expected 0, 1, or 50`);
 }
 const MODE_ARGUMENT = process.argv.find((argument) => argument.startsWith('--mode='));
 const SELECTED_MODE = MODE_ARGUMENT?.slice('--mode='.length);
-const MESSAGE_MODES = (['literal', 'dynamic'] as const).filter(
-  (mode) => SELECTED_MODE === undefined || mode === SELECTED_MODE,
-);
+const MESSAGE_MODE_VALUES: readonly MessageMode[] = ['literal', 'dynamic'];
+const MESSAGE_MODES = MESSAGE_MODE_VALUES.filter((mode) => SELECTED_MODE === undefined || mode === SELECTED_MODE);
 if (MODE_ARGUMENT !== undefined && MESSAGE_MODES.length === 0) {
   throw new Error(`Unsupported ${MODE_ARGUMENT}; expected literal or dynamic`);
 }
 const LITERAL_MESSAGE = 'request accepted';
 const LITERAL_BINDING = registerBenchmarkVocabulary([LITERAL_MESSAGE]);
+const LITERAL_VOCABULARY_INDEX = LITERAL_BINDING[0];
+if (LITERAL_VOCABULARY_INDEX === undefined) throw new Error('Literal vocabulary binding is missing');
 const LINE = 137;
 const QUICK = process.argv.includes('--quick');
 const REQUESTS_PER_SAMPLE = QUICK ? 4 : 200;
 const CAPACITY = 8;
 
 const schema = new LogSchema(mergeWithSystemSchema({ marker: S.number() }));
+type BenchmarkContext = OpContext<typeof schema>;
+type BenchmarkSpanBuffer = SpanBuffer<typeof schema>;
+
 const SpanBufferClass = getSpanBufferClass(schema);
-const SpanContextClass = createSpanContextClass(schema, { logSchema: schema });
-const physicalLayoutPlan = getPhysicalLayoutPlan(
+const SpanContextClass = createSpanContextClass<BenchmarkContext>(schema, { logSchema: schema });
+const physicalLayoutPlan = getPhysicalLayoutPlan<typeof schema, BenchmarkContext>(
   SpanBufferClass,
   RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_FULL_CAPABILITIES | CAPACITY,
   SpanContextClass,
@@ -59,22 +70,30 @@ const BENCHMARK_METADATA = Object.freeze({ ...DEFAULT_METADATA, _physicalLayoutP
 const callsitePlan = sealCallsitePlan(physicalLayoutPlan, BENCHMARK_METADATA);
 
 interface BenchmarkWriterState extends WriterState {
+  readonly _spanBuffer: BenchmarkSpanBuffer;
+  _buffer: BenchmarkSpanBuffer;
   _spanLogger?: SpanLoggerImpl<typeof schema>;
 }
 
-function createBenchmarkSpanLogger(root: AnySpanBuffer): SpanLoggerImpl<typeof schema> {
-  const plannedAppend = Reflect.get(callsitePlan, 'appendLogEntry');
-  const appendLogEntry = typeof plannedAppend === 'function'
-    ? plannedAppend as WriterState['_appendLogEntry']
-    : root._traceRoot._appendLogEntry;
+function requireBenchmarkSpanBuffer(buffer: unknown): BenchmarkSpanBuffer {
+  if (!(buffer instanceof SpanBufferClass)) {
+    throw new TypeError('Benchmark tracer received a buffer from a different schema');
+  }
+  return buffer;
+}
+
+function createBenchmarkSpanLogger(root: BenchmarkSpanBuffer): {
+  logger: SpanLoggerImpl<typeof schema>;
+  state: BenchmarkWriterState;
+} {
   const state: BenchmarkWriterState = {
     _spanBuffer: root,
     _buffer: root,
-    _appendLogEntry: appendLogEntry,
+    _appendLogEntry: callsitePlan.appendLogEntry,
     _physicalLayoutPlan: callsitePlan,
     _appendWriterEntry(entryType: number): number {
       if (state._buffer._writeIndex >= state._buffer._capacity) {
-        state._buffer = state._buffer.getOrCreateOverflow();
+        state._buffer = requireBenchmarkSpanBuffer(state._buffer.getOrCreateOverflow());
         state._spanLogger?._prefillScopedAttributesOn(state._buffer);
       }
       return state._appendLogEntry(state._buffer._traceRoot, state._buffer, entryType);
@@ -82,13 +101,8 @@ function createBenchmarkSpanLogger(root: AnySpanBuffer): SpanLoggerImpl<typeof s
   };
   const logger = createSpanLogger(schema, state);
   state._spanLogger = logger;
-  return logger;
+  return { logger, state };
 }
-type MessageMode = 'literal' | 'dynamic';
-type AppendMode = 'trace-root-method' | 'inline';
-type OverflowMode = 'method' | 'inline-compare';
-type MessageBranchMode = 'optional' | 'required';
-type AccountingMode = 'per-entry' | 'segment';
 
 interface Observation {
   semantic: string;
@@ -119,21 +133,23 @@ function emptyCounters(): Counters {
   };
 }
 
-const bufferStrategy = new JsBufferStrategy<typeof schema>({ capacity: CAPACITY });
-const tracer: TracerLifecycleHooks = {
+const bufferStrategy = new JsBufferStrategy<typeof schema>();
+const tracer: TracerLifecycleHooks<typeof schema> = {
   bufferStrategy,
   onTraceStart() {},
   onTraceEnd() {},
   onSpanStart() {},
   onSpanEnd() {},
   onStatsWillResetFor(buffer) {
-    const stats = (buffer as AnySpanBuffer)._stats;
+    const stats = requireBenchmarkSpanBuffer(buffer)._stats;
     stats.totalWrites = 0;
     stats.spansCreated = 1;
     stats.capacity = CAPACITY;
   },
+  getFlagEvaluatorForContext() {
+    return undefined;
+  },
 };
-
 
 function resetSharedStats(): void {
   const stats = getSpanBufferClass(schema).stats;
@@ -142,7 +158,7 @@ function resetSharedStats(): void {
   stats.spansCreated = 0;
 }
 
-function newRootBuffer(_mode: MessageMode, counters: Counters): AnySpanBuffer {
+function newRootBuffer(_mode: MessageMode, counters: Counters): BenchmarkSpanBuffer {
   resetSharedStats();
   const root = createTraceRoot('log-call-path', tracer);
   counters.buffersCreated++;
@@ -157,14 +173,14 @@ function messageFor(mode: MessageMode, request: number, log: number, counters: C
   return `request-${request}-log-${log}`;
 }
 
-function setLine(buffer: AnySpanBuffer, row: number): void {
+function setLine(buffer: BenchmarkSpanBuffer, row: number): void {
   buffer.line_values[row] = LINE;
   if (buffer.line_nulls) {
     buffer.line_nulls[row >> 3] |= 1 << (row & 7);
   }
 }
 
-function resolvedMessage(buffer: AnySpanBuffer, row: number): string {
+function resolvedMessage(buffer: BenchmarkSpanBuffer, row: number): string {
   return resolveMessage(buffer, row) ?? '';
 }
 
@@ -179,17 +195,19 @@ function mixString(hash: number, value: string): number {
 }
 
 /** Hashes all non-timestamp row data and counts physical writes/buffers. */
-function inspectRequest(root: AnySpanBuffer): { hash: number; rows: number; buffers: number } {
+function inspectRequest(root: BenchmarkSpanBuffer): { hash: number; rows: number; buffers: number } {
   let hash = 2_166_136_261;
   let rows = 0;
   let buffers = 0;
-  let buffer: AnySpanBuffer | undefined = root;
+  let buffer: BenchmarkSpanBuffer | undefined = root;
   while (buffer) {
     buffers++;
     for (let row = buffer === root ? 2 : 0; row < buffer._writeIndex; row++) {
-      hash = mix(hash, buffer.entry_type[row]!);
+      const entryType = buffer.entry_type?.[row];
+      if (entryType === undefined) throw new Error(`Missing entry type at row ${row}`);
+      hash = mix(hash, entryType);
       hash = mixString(hash, resolvedMessage(buffer, row));
-      hash = mix(hash, buffer.line_values?.[row] ?? 0);
+      hash = mix(hash, buffer.line_values[row] ?? 0);
       rows++;
     }
     buffer = buffer._overflow;
@@ -212,7 +230,7 @@ function runCurrentFluent(logCount: number, mode: MessageMode): Observation {
   let rows = 0;
   for (let request = 0; request < REQUESTS_PER_SAMPLE; request++) {
     const root = newRootBuffer(mode, counters);
-    const logger = createBenchmarkSpanLogger(root);
+    const { logger } = createBenchmarkSpanLogger(root);
     counters.writerObjects++;
     for (let log = 0; log < logCount; log++) {
       logger.info(messageFor(mode, request, log, counters)).line(LINE);
@@ -233,10 +251,10 @@ function runCurrentTransformerOutput(logCount: number): Observation {
   let rows = 0;
   for (let request = 0; request < REQUESTS_PER_SAMPLE; request++) {
     const root = newRootBuffer('literal', counters);
-    const logger = createBenchmarkSpanLogger(root);
+    const { logger } = createBenchmarkSpanLogger(root);
     counters.writerObjects++;
     for (let log = 0; log < logCount; log++) {
-      logger._infoTemplate(LITERAL_BINDING[0]!).line(LINE);
+      logger._infoTemplate(LITERAL_VOCABULARY_INDEX).line(LINE);
       counters.statsUpdateOps++;
     }
     const observed = inspectRequest(root);
@@ -267,13 +285,13 @@ function runModel(logCount: number, mode: MessageMode, options: ModelOptions): O
     for (let log = 0; log < logCount; log++) {
       if (buffer._writeIndex >= buffer._capacity) {
         if (options.accounting === 'segment' && segmentWrites !== 0) {
-          buffer.constructor.stats.totalWrites += segmentWrites;
+          SpanBufferClass.stats.totalWrites += segmentWrites;
           counters.statsUpdateOps++;
           counters.segmentAccountingOps++;
           segmentWrites = 0;
         }
         if (options.overflow === 'method') {
-          buffer = buffer.getOrCreateOverflow();
+          buffer = requireBenchmarkSpanBuffer(buffer.getOrCreateOverflow());
         } else {
           buffer = buffer._overflow ?? createOverflowBuffer(buffer);
         }
@@ -286,31 +304,36 @@ function runModel(logCount: number, mode: MessageMode, options: ModelOptions): O
       } else {
         row = buffer._writeIndex;
         buffer.timestamp[row] = buffer._traceRoot.getTimestampNanos();
-        buffer.entry_type[row] = ENTRY_TYPE_INFO;
+        const entryTypes = buffer.entry_type;
+        if (entryTypes === undefined) throw new TypeError('Benchmark buffer has no entry-type lane');
+        entryTypes[row] = ENTRY_TYPE_INFO;
         buffer._writeIndex = row + 1;
       }
 
       const message = messageFor(mode, request, log, counters);
+      const messageValues = buffer.message_values;
+      const messageNulls = buffer.message_nulls;
       if (options.messageBranch === 'optional') {
-        if (buffer.message_values) {
-          buffer.message_values[row] = message;
-          if (buffer.message_nulls) buffer.message_nulls[row >> 3] |= 1 << (row & 7);
+        if (messageValues !== undefined) {
+          messageValues[row] = message;
+          if (messageNulls !== undefined) messageNulls[row >> 3] |= 1 << (row & 7);
         }
       } else {
-        buffer.message_values[row] = message;
-        if (buffer.message_nulls) buffer.message_nulls[row >> 3] |= 1 << (row & 7);
+        if (messageValues === undefined) throw new TypeError('Benchmark buffer has no message lane');
+        messageValues[row] = message;
+        if (messageNulls !== undefined) messageNulls[row >> 3] |= 1 << (row & 7);
       }
       setLine(buffer, row);
 
       if (options.accounting === 'per-entry') {
-        buffer.constructor.stats.totalWrites++;
+        SpanBufferClass.stats.totalWrites++;
         counters.statsUpdateOps++;
       } else {
         segmentWrites++;
       }
     }
     if (options.accounting === 'segment' && segmentWrites !== 0) {
-      buffer.constructor.stats.totalWrites += segmentWrites;
+      SpanBufferClass.stats.totalWrites += segmentWrites;
       counters.statsUpdateOps++;
       counters.segmentAccountingOps++;
     }
@@ -320,7 +343,7 @@ function runModel(logCount: number, mode: MessageMode, options: ModelOptions): O
   }
   return finalize(counters, hash, rows, rows);
 }
-function newTimedRoot(_mode: MessageMode): AnySpanBuffer {
+function newTimedRoot(_mode: MessageMode): BenchmarkSpanBuffer {
   resetSharedStats();
   const buffer = createSpanBuffer(schema, createTraceRoot('log-call-path', tracer), BENCHMARK_METADATA, CAPACITY);
   buffer._writeIndex = 2;
@@ -331,24 +354,21 @@ function timedMessage(mode: MessageMode, request: number, log: number): string {
   return mode === 'literal' ? LITERAL_MESSAGE : `request-${request}-log-${log}`;
 }
 
-function consumeFinalBuffer(buffer: AnySpanBuffer): number {
+function consumeFinalBuffer(buffer: BenchmarkSpanBuffer): number {
   const row = buffer._writeIndex - 1;
   const messageLength = buffer.message_values?.[row]?.length ?? 0;
-  const splitHeaders = Reflect.get(buffer, '_logHeaders') as Uint32Array | undefined;
-  const currentIds = Reflect.get(buffer, '_messageIds') as Uint16Array | undefined;
-  const packedHeaders = Reflect.get(buffer, '_rowHeaders') as Uint32Array | undefined;
-  const messageIdentity = splitHeaders?.[row] ?? currentIds?.[row] ?? packedHeaders?.[row] ?? 0;
-  return buffer._writeIndex + (buffer.entry_type[row] ?? 0) + messageLength + messageIdentity;
+  const messageIdentity = buffer._logHeaders?.[row] ?? buffer._messageIds?.[row] ?? buffer._rowHeaders?.[row] ?? 0;
+  return buffer._writeIndex + (buffer.entry_type?.[row] ?? 0) + messageLength + messageIdentity;
 }
 
 function timeCurrentFluent(logCount: number, mode: MessageMode): number {
   let sink = 0;
   for (let request = 0; request < REQUESTS_PER_SAMPLE; request++) {
-    const logger = createBenchmarkSpanLogger(newTimedRoot(mode));
+    const { logger, state } = createBenchmarkSpanLogger(newTimedRoot(mode));
     for (let log = 0; log < logCount; log++) {
       logger.info(timedMessage(mode, request, log)).line(LINE);
     }
-    sink ^= consumeFinalBuffer((Reflect.get(logger, '_state') as WriterState)._buffer);
+    sink ^= consumeFinalBuffer(state._buffer);
   }
   return sink;
 }
@@ -356,9 +376,9 @@ function timeCurrentFluent(logCount: number, mode: MessageMode): number {
 function timeCurrentTransformerOutput(logCount: number): number {
   let sink = 0;
   for (let request = 0; request < REQUESTS_PER_SAMPLE; request++) {
-    const logger = createBenchmarkSpanLogger(newTimedRoot('literal'));
-    for (let log = 0; log < logCount; log++) logger._infoTemplate(LITERAL_BINDING[0]!).line(LINE);
-    sink ^= consumeFinalBuffer((Reflect.get(logger, '_state') as WriterState)._buffer);
+    const { logger, state } = createBenchmarkSpanLogger(newTimedRoot('literal'));
+    for (let log = 0; log < logCount; log++) logger._infoTemplate(LITERAL_VOCABULARY_INDEX).line(LINE);
+    sink ^= consumeFinalBuffer(state._buffer);
   }
   return sink;
 }
@@ -372,12 +392,12 @@ function timeModel(logCount: number, mode: MessageMode, options: ModelOptions): 
     for (let log = 0; log < logCount; log++) {
       if (buffer._writeIndex >= buffer._capacity) {
         if (options.accounting === 'segment' && segmentWrites !== 0) {
-          buffer.constructor.stats.totalWrites += segmentWrites;
+          SpanBufferClass.stats.totalWrites += segmentWrites;
           segmentWrites = 0;
         }
         buffer =
           options.overflow === 'method'
-            ? buffer.getOrCreateOverflow()
+            ? requireBenchmarkSpanBuffer(buffer.getOrCreateOverflow())
             : (buffer._overflow ?? createOverflowBuffer(buffer));
       }
 
@@ -387,27 +407,32 @@ function timeModel(logCount: number, mode: MessageMode, options: ModelOptions): 
       } else {
         row = buffer._writeIndex;
         buffer.timestamp[row] = buffer._traceRoot.getTimestampNanos();
-        buffer.entry_type[row] = ENTRY_TYPE_INFO;
+        const entryTypes = buffer.entry_type;
+        if (entryTypes === undefined) throw new TypeError('Benchmark buffer has no entry-type lane');
+        entryTypes[row] = ENTRY_TYPE_INFO;
         buffer._writeIndex = row + 1;
       }
 
       const message = timedMessage(mode, request, log);
+      const messageValues = buffer.message_values;
+      const messageNulls = buffer.message_nulls;
       if (options.messageBranch === 'optional') {
-        if (buffer.message_values) {
-          buffer.message_values[row] = message;
-          if (buffer.message_nulls) buffer.message_nulls[row >> 3] |= 1 << (row & 7);
+        if (messageValues !== undefined) {
+          messageValues[row] = message;
+          if (messageNulls !== undefined) messageNulls[row >> 3] |= 1 << (row & 7);
         }
       } else {
-        buffer.message_values[row] = message;
-        if (buffer.message_nulls) buffer.message_nulls[row >> 3] |= 1 << (row & 7);
+        if (messageValues === undefined) throw new TypeError('Benchmark buffer has no message lane');
+        messageValues[row] = message;
+        if (messageNulls !== undefined) messageNulls[row >> 3] |= 1 << (row & 7);
       }
       setLine(buffer, row);
 
-      if (options.accounting === 'per-entry') buffer.constructor.stats.totalWrites++;
+      if (options.accounting === 'per-entry') SpanBufferClass.stats.totalWrites++;
       else segmentWrites++;
     }
     if (options.accounting === 'segment' && segmentWrites !== 0) {
-      buffer.constructor.stats.totalWrites += segmentWrites;
+      SpanBufferClass.stats.totalWrites += segmentWrites;
     }
     sink ^= consumeFinalBuffer(buffer);
   }
@@ -442,10 +467,10 @@ function variantsFor(logCount: number, mode: MessageMode): ScenarioVariant[] {
       timed: () => timeCurrentTransformerOutput(logCount),
     });
   }
-  const inlineOverflow = { ...MODEL_CURRENT, overflow: 'inline-compare' } as const;
-  const inlineAppend = { ...MODEL_CURRENT, append: 'inline' } as const;
-  const requiredMessage = { ...MODEL_CURRENT, messageBranch: 'required' } as const;
-  const segmentAccounting = { ...MODEL_CURRENT, accounting: 'segment' } as const;
+  const inlineOverflow: ModelOptions = { ...MODEL_CURRENT, overflow: 'inline-compare' };
+  const inlineAppend: ModelOptions = { ...MODEL_CURRENT, append: 'inline' };
+  const requiredMessage: ModelOptions = { ...MODEL_CURRENT, messageBranch: 'required' };
+  const segmentAccounting: ModelOptions = { ...MODEL_CURRENT, accounting: 'segment' };
   variants.push(
     {
       label: 'model-only/current-mechanics',
@@ -476,9 +501,15 @@ function variantsFor(logCount: number, mode: MessageMode): ScenarioVariant[] {
   return variants;
 }
 
+function variantAt(variants: readonly ScenarioVariant[], index: number): ScenarioVariant {
+  const variant = variants[index];
+  if (variant === undefined) throw new RangeError(`Missing benchmark variant at index ${index}`);
+  return variant;
+}
+
 /** Semantic validation is deliberately outside every timed Mitata callback. */
 function preflight(logCount: number, messageMode: MessageMode, variants: readonly ScenarioVariant[]): void {
-  const baseline = variants[0]!.verify();
+  const baseline = variantAt(variants, 0).verify();
   const expectedWrites = logCount * REQUESTS_PER_SAMPLE;
   if (baseline.rows !== expectedWrites || baseline.writes !== expectedWrites) {
     throw new Error(
@@ -486,7 +517,7 @@ function preflight(logCount: number, messageMode: MessageMode, variants: readonl
     );
   }
   for (let index = 1; index < variants.length; index++) {
-    const variant = variants[index]!;
+    const variant = variantAt(variants, index);
     const observed = variant.verify();
     if (
       observed.semantic !== baseline.semantic ||
@@ -509,7 +540,7 @@ for (const messageMode of MESSAGE_MODES) {
         `log-call-path/${messageMode}/${logCount}-logs [capacity=${CAPACITY}, requests=${REQUESTS_PER_SAMPLE}, timestamps=excluded]`,
         () => {
           for (let index = 0; index < variants.length; index++) {
-            const variant = variants[index]!;
+            const variant = variantAt(variants, index);
             bench(variant.label, () => {
               const sink = variant.timed();
               do_not_optimize(sink);

@@ -527,38 +527,38 @@ benchmarkGroup('getBytes() access', () => {
 
 // Enable boxplot visualization
 if (!QUICK) {
-boxplot(() => {
-  group('All patterns - spanId read', () => {
-    bench('Lazy', () => {
-      let sum = 0;
-      for (let i = 0; i < INSTANCE_COUNT; i++) {
-        sum += lazyInstances[i].spanId;
-      }
-      return sum;
-    });
-    bench('Cached', () => {
-      let sum = 0;
-      for (let i = 0; i < INSTANCE_COUNT; i++) {
-        sum += cachedInstances[i].spanId;
-      }
-      return sum;
-    });
-    bench('Hybrid', () => {
-      let sum = 0;
-      for (let i = 0; i < INSTANCE_COUNT; i++) {
-        sum += hybridInstances[i].spanId;
-      }
-      return sum;
-    });
-    bench('Direct', () => {
-      let sum = 0;
-      for (let i = 0; i < INSTANCE_COUNT; i++) {
-        sum += directInstances[i].spanId;
-      }
-      return sum;
+  boxplot(() => {
+    group('All patterns - spanId read', () => {
+      bench('Lazy', () => {
+        let sum = 0;
+        for (let i = 0; i < INSTANCE_COUNT; i++) {
+          sum += lazyInstances[i].spanId;
+        }
+        return sum;
+      });
+      bench('Cached', () => {
+        let sum = 0;
+        for (let i = 0; i < INSTANCE_COUNT; i++) {
+          sum += cachedInstances[i].spanId;
+        }
+        return sum;
+      });
+      bench('Hybrid', () => {
+        let sum = 0;
+        for (let i = 0; i < INSTANCE_COUNT; i++) {
+          sum += hybridInstances[i].spanId;
+        }
+        return sum;
+      });
+      bench('Direct', () => {
+        let sum = 0;
+        for (let i = 0; i < INSTANCE_COUNT; i++) {
+          sum += directInstances[i].spanId;
+        }
+        return sum;
+      });
     });
   });
-});
 }
 
 // Run all benchmarks

@@ -23,7 +23,8 @@ interface SemanticOutput {
 function parseCli(argv: readonly string[]): CliOptions {
   const options: CliOptions = { quick: false };
   for (let index = 0; index < argv.length; index++) {
-    const argument = argv[index]!;
+    const argument = argv[index];
+    if (argument === undefined) throw new RangeError(`Missing argument at index ${index}`);
     if (argument === '--quick') options.quick = true;
     else if (argument === '--off-output') options.offOutput = argv[++index];
     else if (argument.startsWith('--off-output=')) options.offOutput = argument.slice('--off-output='.length);

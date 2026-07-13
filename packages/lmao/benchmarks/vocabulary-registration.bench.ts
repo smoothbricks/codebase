@@ -2,13 +2,10 @@ import { bench, do_not_optimize, group, run, summary } from 'mitata';
 import {
   getVocabularyGeneration,
   registerVocabularyFragment,
-  VocabularyRegistrationError,
   type VocabularyFragment,
+  VocabularyRegistrationError,
 } from '../src/lib/vocabularyRegistry.js';
-import {
-  benchmarkVocabularyStableId,
-  createBenchmarkVocabularyFragment,
-} from './vocabularyFixture.js';
+import { benchmarkVocabularyStableId, createBenchmarkVocabularyFragment } from './vocabularyFixture.js';
 
 const FULL_SIZES: readonly number[] = Object.freeze([1, 16, 256, 65_535]);
 const QUICK_SIZES: readonly number[] = Object.freeze([1, 16, 256, 1_024]);
@@ -68,7 +65,10 @@ function collisionFreeTexts(label: string, size: number, reserved: Set<number>):
   return texts;
 }
 
-function sortedLookup(fragment: VocabularyFragment, binding: Uint32Array): {
+function sortedLookup(
+  fragment: VocabularyFragment,
+  binding: Uint32Array,
+): {
   readonly ids: Uint32Array;
   readonly dense: Uint32Array;
 } {
@@ -117,7 +117,10 @@ function assertProductionRegistration(
   const generation = getVocabularyGeneration();
   for (let ordinal = 0; ordinal < fragment.ids.length; ordinal++) {
     const denseIndex = requireNumber(binding, ordinal, 'binding');
-    if (requireNumber(generation.ids, denseIndex, 'generation stable IDs') !== requireNumber(fragment.ids, ordinal, 'fragment stable IDs')) {
+    if (
+      requireNumber(generation.ids, denseIndex, 'generation stable IDs') !==
+      requireNumber(fragment.ids, ordinal, 'fragment stable IDs')
+    ) {
       throw new Error(`Generation stable ID mismatch at ordinal ${ordinal}`);
     }
   }
@@ -128,7 +131,10 @@ function validateHashFailure(fragment: VocabularyFragment): string {
   try {
     registerVocabularyFragment(mismatched);
   } catch (error) {
-    if (error instanceof VocabularyRegistrationError && error.message.includes('LMAO_VOCABULARY_CONTENT_HASH_MISMATCH')) {
+    if (
+      error instanceof VocabularyRegistrationError &&
+      error.message.includes('LMAO_VOCABULARY_CONTENT_HASH_MISMATCH')
+    ) {
       return error.message;
     }
     throw error;
@@ -155,7 +161,8 @@ for (const size of SIZES) {
     throw new Error(`Duplicate registration checksum mismatch for size ${size}`);
   }
   const generation = getVocabularyGeneration();
-  const fragmentBytes = fragment.ids.byteLength + fragment.kindTags.byteLength + fragment.utf8.byteLength + fragment.offsets.byteLength;
+  const fragmentBytes =
+    fragment.ids.byteLength + fragment.kindTags.byteLength + fragment.utf8.byteLength + fragment.offsets.byteLength;
   console.error(
     `size=${size} fragment-bytes=${fragmentBytes} binding-bytes=${binding.byteLength} generation=${generation.generation}`,
   );
@@ -177,7 +184,11 @@ for (const size of SIZES) {
         let sum = 0;
         for (let iteration = 0; iteration < LOOKUPS_PER_INVOCATION; iteration++) {
           const ordinal = iteration % size;
-          sum += coldStableIdRemap(requireNumber(fragment.ids, ordinal, 'fragment stable IDs'), sorted.ids, sorted.dense);
+          sum += coldStableIdRemap(
+            requireNumber(fragment.ids, ordinal, 'fragment stable IDs'),
+            sorted.ids,
+            sorted.dense,
+          );
         }
         do_not_optimize(sum);
       });

@@ -28,19 +28,9 @@ const STATIC_BINDING = registerBenchmarkVocabulary(STATIC_STRINGS);
 const SCHEMA = defineLogSchema({ value: S.number() });
 const CONTEXT = defineOpContext({ logSchema: SCHEMA });
 const RUNTIME_SCHEMA = CONTEXT.logBinding.logSchema;
-const METADATA = createOpMetadata(
-  'wasm-owned-memory',
-  '@smoothbricks/lmao',
-  'wasm-owned-memory.bench.ts',
-  'bench',
-  1,
-);
+const METADATA = createOpMetadata('wasm-owned-memory', '@smoothbricks/lmao', 'wasm-owned-memory.bench.ts', 'bench', 1);
 const LAYOUT_OP = CONTEXT.defineOp('wasm-owned-memory-layout', (ctx) => ctx.ok(null), undefined, {
-  runtimeHint:
-    RUNTIME_HINT_ANALYZED_VALID |
-    RUNTIME_HINT_MESSAGE_LAYOUT_MIXED |
-    RUNTIME_HINT_RESULT |
-    64,
+  runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_MESSAGE_LAYOUT_MIXED | RUNTIME_HINT_RESULT | 64,
 });
 
 type NativeFormat = 'json' | 'markdown' | 'mitata' | 'quiet';
@@ -150,7 +140,9 @@ async function validateGrowthAndPinning(): Promise<void> {
   invariant(allocator.f64.byteLength === 18 * PAGE_BYTES, 'refreshed getter must cover grown memory');
 }
 
-function lifecycleFor(strategy: WasmBufferStrategy<typeof RUNTIME_SCHEMA>): TracerLifecycleHooks<typeof RUNTIME_SCHEMA> {
+function lifecycleFor(
+  strategy: WasmBufferStrategy<typeof RUNTIME_SCHEMA>,
+): TracerLifecycleHooks<typeof RUNTIME_SCHEMA> {
   return {
     onTraceStart: () => undefined,
     onTraceEnd: () => undefined,
