@@ -27,7 +27,12 @@ import {
   ENTRY_TYPE_WARN,
 } from '../schema/systemSchema.js';
 import type { WriterState } from './fixedPositionWriterGenerator.js';
-import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
+import {
+  resolveEnumLookupDescriptor,
+  type EnumLookupDescriptor,
+  type SchemaEnumLookupDescriptor,
+} from '../enumMetadata.js';
+import { getSchemaType } from '../schema/typeGuards.js';
 import type { InferSchema, LogSchema } from '../schema/types.js';
 
 import type { MessageLayoutFamily } from '../runtimeHint.js';
@@ -244,38 +249,24 @@ export type ScopeUpdate<T extends LogSchema> = {
   [K in keyof InferSchema<T>]?: InferSchema<T>[K] | null;
 };
 
-/**
- * Generate enum value mapping code
- * Creates a switch-case statement for compile-time enum mapping
- */
-function generateEnumMapping(fieldName: string, enumValues: readonly string[]): string {
-  const cases = enumValues.map((value, index) => `    case ${JSON.stringify(value)}: return ${index};`).join('\n');
-
-  return `
-  function getEnumIndex_${fieldName}(value) {
-    switch(value) {
-${cases}
-      default: return 0;
-    }
-  }`;
-}
 
 /**
  * Generate override fluent setters for enum fields.
  * These convert string values to numeric indices before writing to the buffer.
  * The buffer expects numeric indices (after the enum map removal change).
  */
-function generateEnumFluentSetters(enumFieldNames: Set<string>): string {
+function generateEnumFluentSetters(
+  enumFields: readonly EnumLookupDescriptor[],
+  enumEncoderNames: Readonly<Record<string, string>>,
+): string {
   const setters: string[] = [];
 
-  for (const fieldName of enumFieldNames) {
+  for (const { fieldName } of enumFields) {
+    const encoderName = enumEncoderNames[fieldName];
     setters.push(`
-    /**
-     * Override fluent setter for ${fieldName} to convert string → index.
-     * Buffer expects numeric index, not string value.
-     */
+    /** Convert the declared enum string to its schema-order index. */
     ${fieldName}(value) {
-      const idx = getEnumIndex_${fieldName}(value);
+      const idx = ${encoderName}(value);
       this._buffer.${fieldName}(this._writeIndex, idx);
       return this;
     }`);
@@ -325,7 +316,7 @@ function generateSetScopeMethod(): string {
  */
 function generatePrefillScopedAttributesMethod(
   schemaFields: readonly ColumnEntry[],
-  enumFieldNames: Set<string>,
+  enumEncoderNames: Readonly<Record<string, string>>,
 ): string {
   const columnFills = schemaFields.map(([fieldName, fieldSchema]) => {
     const columnName = fieldName;
@@ -350,8 +341,9 @@ function generatePrefillScopedAttributesMethod(
 
     // Value processing based on type
     let valueExpr = 'scopeValue';
-    if (lmaoType === 'enum' && enumFieldNames.has(fieldName)) {
-      valueExpr = `getEnumIndex_${fieldName}(scopeValue)`;
+    const enumEncoderName = enumEncoderNames[fieldName];
+    if (lmaoType === 'enum' && enumEncoderName !== undefined) {
+      valueExpr = `${enumEncoderName}(scopeValue)`;
     }
 
     // For string arrays (category/text), use manual loop instead of fill()
@@ -399,27 +391,21 @@ function buildSpanLoggerExtension(
   schema: LogSchema,
   messageLayoutFamily: MessageLayoutFamily,
   eagerColumns: readonly string[],
+  enumLookup: SchemaEnumLookupDescriptor,
 ): ColumnWriterExtension {
   const schemaFields = schema._columns;
 
-  // Collect enum mappings
-  const enumMappings: string[] = [];
-  const enumFieldNames = new Set<string>();
-
-  for (const [fieldName, fieldSchema] of schemaFields) {
-    const lmaoType = getSchemaType(fieldSchema);
-    const enumValues = getEnumValues(fieldSchema);
-
-    if (lmaoType === 'enum' && enumValues) {
-      enumMappings.push(generateEnumMapping(fieldName, enumValues));
-      enumFieldNames.add(fieldName);
-    }
-  }
+  const enumEncoderNames = Object.create(null) as Record<string, string>;
+  const enumEncoderBindings = enumLookup.ordered.map(({ fieldName }, index) => {
+    const encoderName = `encodeEnum${index}`;
+    enumEncoderNames[fieldName] = encoderName;
+    return `  const ${encoderName} = enumLookup.byField[${JSON.stringify(fieldName)}].encode;`;
+  });
 
   // Generate methods
   const setScopeMethod = generateSetScopeMethod();
-  const prefillMethod = generatePrefillScopedAttributesMethod(schemaFields, enumFieldNames);
-  const enumFluentSetters = generateEnumFluentSetters(enumFieldNames);
+  const prefillMethod = generatePrefillScopedAttributesMethod(schemaFields, enumEncoderNames);
+  const enumFluentSetters = generateEnumFluentSetters(enumLookup.ordered, enumEncoderNames);
 
   return {
     preallocatedColumns: eagerColumns,
@@ -433,8 +419,7 @@ function buildSpanLoggerExtension(
   const ENTRY_TYPE_TRACE = ${ENTRY_TYPE_TRACE};
   const ENTRY_TYPE_FF_ACCESS = ${ENTRY_TYPE_FF_ACCESS};
   const ENTRY_TYPE_FF_USAGE = ${ENTRY_TYPE_FF_USAGE};
-
-  ${enumMappings.join('\n')}
+${enumEncoderBindings.join('\n')}
 `,
 
     methods:
@@ -639,6 +624,7 @@ function buildSpanLoggerExtension(
     // Use singleton helpers object (created once at module load)
     dependencies: {
       helpers: SPAN_LOGGER_HELPERS,
+      enumLookup,
     },
   };
 }
@@ -679,15 +665,16 @@ export function createSpanLoggerClass<T extends LogSchema>(
   schema: T,
   messageLayoutFamily: MessageLayoutFamily = 'mixed',
   eagerColumns: readonly string[] = [],
+  enumLookup: SchemaEnumLookupDescriptor = resolveEnumLookupDescriptor(schema),
 ): SpanLoggerConstructor<T> {
   const cacheKey = `${messageLayoutFamily}:${eagerColumns.join('\u0000')}`;
   let familyClasses = spanLoggerClassCache.get(schema);
   let SpanLoggerClass = familyClasses?.get(cacheKey);
 
   if (!SpanLoggerClass) {
-    const extension = buildSpanLoggerExtension(schema, messageLayoutFamily, eagerColumns);
+    const extension = buildSpanLoggerExtension(schema, messageLayoutFamily, eagerColumns, enumLookup);
     const classCode = generateStateBoundSpanLoggerClass(schema, extension).trim();
-    SpanLoggerClass = new Function('helpers', classCode)(SPAN_LOGGER_HELPERS);
+    SpanLoggerClass = new Function('helpers', 'enumLookup', classCode)(SPAN_LOGGER_HELPERS, enumLookup);
 
     if (!isSpanLoggerConstructor<LogSchema>(SpanLoggerClass)) {
       throw new Error('Failed to generate SpanLogger constructor');

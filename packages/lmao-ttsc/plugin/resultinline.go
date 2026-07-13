@@ -165,6 +165,7 @@ func (t *fileTransformer) findResultInline(call *shimast.CallExpression) (*resul
 func (t *fileTransformer) applyResultInlines(inlines []resultInline) {
 	for _, in := range inlines {
 		res := ident("$$r")
+		state := ident("$$s")
 		buf := ident("$$b")
 
 		var writes []*shimast.Node
@@ -172,21 +173,15 @@ func (t *fileTransformer) applyResultInlines(inlines []resultInline) {
 			info, known := in.schema[w.field]
 			switch {
 			case known && info.kind == fieldEnum:
-				var enumIdx *shimast.Node
-				if isCompileTimeLiteral(w.arg) && w.arg.Kind == shimast.KindStringLiteral {
-					v := 0
-					for i, ev := range info.enumValues {
-						if ev == shimast.NodeText(w.arg) {
-							v = i
-							break
-						}
-					}
-					enumIdx = num(v)
-				} else {
-					enumIdx = enumSwitchIIFE(w.arg, info.enumValues)
-				}
+				enumLookup := propAccess(
+					propAccess(propAccess(propAccess(res, "_state"), "_physicalLayoutPlan"), "enumLookup"),
+					"byField",
+				)
 				writes = append(writes, factory.NewExpressionStatement(
-					callExpr(propAccess(buf, w.field), []*shimast.Node{num(1), enumIdx})))
+					callExpr(propAccess(buf, w.field), []*shimast.Node{
+						num(1),
+						enumEncodeCall(enumLookup, w.field, w.arg),
+					})))
 			case known && info.kind == fieldBool:
 				writes = append(writes, factory.NewExpressionStatement(
 					callExpr(propAccess(buf, w.field), []*shimast.Node{num(1), w.arg})))
@@ -197,7 +192,14 @@ func (t *fileTransformer) applyResultInlines(inlines []resultInline) {
 
 		stmts := []*shimast.Node{
 			constDecl(res, in.okCall),
-			constDecl(buf, propAccess(res, "_buffer")),
+			constDecl(state, propAccess(res, "_state")),
+			constDecl(buf, factory.NewBinaryExpression(
+				nil,
+				state,
+				nil,
+				factory.NewToken(shimast.KindAmpersandAmpersandToken),
+				propAccess(state, "_spanBuffer"),
+			)),
 			factory.NewIfStatement(buf, factory.NewBlock(factory.NewNodeList(writes), true), nil),
 		}
 		if in.isReturn {

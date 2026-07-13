@@ -211,12 +211,11 @@ function createOrdinalOps() {
 		ordinals[entry.Kind] = ordinal
 	}
 	logOrdinal := strconv.Itoa(ordinals[vocabularyLogTemplate])
-	logPattern := regexp.MustCompile(`writeLogEntry\([^,]+,\s*8,\s*([$A-Za-z0-9_]+)\[` + logOrdinal + `\]\)`)
-	match := logPattern.FindStringSubmatch(output)
-	if len(match) != 2 {
-		t.Fatalf("static log allocation did not read its dense ID from the log record's fragment ordinal\n%s", output)
+	registration := regexp.MustCompile(`const (\$\$lmaoVocabulary\w*) = \$\$registerLmaoVocabulary\w*\(\{`).FindStringSubmatch(output)
+	if len(registration) != 2 || !strings.Contains(output, "_state._appendWriterEntry(8)") {
+		t.Fatalf("static log allocation did not use state-owned append with registered vocabulary metadata\n%s", output)
 	}
-	binding := match[1]
+	binding := registration[1]
 	packedHeaderPattern := regexp.MustCompile(`_logHeaders\[[^\]]+\]\s*=\s*[^;\n]*` + regexp.QuoteMeta(binding) + `\[` + logOrdinal + `\][^;\n]*;`)
 	if !packedHeaderPattern.MatchString(output) {
 		t.Fatalf("static log packed header did not reuse the log record's fragment ordinal through %s\n%s", binding, output)
@@ -225,8 +224,8 @@ function createOrdinalOps() {
 	if !spanPattern.MatchString(output) {
 		t.Fatalf("static span did not read its fragment ordinal through unified span0 CallsitePlan dispatch using %s\n%s", binding, output)
 	}
-	if strings.Contains(output, "spanStatic0(") || strings.Count(output, binding+"[") != 3 {
-		t.Fatalf("static span did not use exactly one vocabulary operand on unified dispatch\n%s", output)
+	if strings.Contains(output, "spanStatic0(") || strings.Count(output, binding+"[") != 2 {
+		t.Fatalf("static log and span did not each use exactly one registered vocabulary operand\n%s", output)
 	}
 }
 

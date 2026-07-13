@@ -44,8 +44,6 @@ import { buildSortedCategoryDictionary, buildTextDictionary } from './arrow/dict
 import {
   type DictionaryColumnData,
   type GenericColumnData,
-  getArrowIndexArrayConstructorOr,
-  getArrowIndexTypeOr,
   makeArrowColumn,
   type Utf8ColumnData,
 } from './arrow/flechette.js';
@@ -63,10 +61,14 @@ import {
   encodeUtf8Strings,
   getArrowFieldName,
 } from './arrow/utils.js';
+import {
+  type EnumLookupDescriptor,
+  resolveEnumLookupDescriptor,
+} from './enumMetadata.js';
 import type { RemapDescriptor } from './logBinding.js';
 import { resolveMessage } from './resolveMessage.js';
 import { ENTRY_TYPE_NAMES, SYSTEM_SCHEMA_FIELD_NAMES } from './schema/systemSchema.js';
-import { getBinaryEncoder, getEnumUtf8, getEnumValues, getSchemaType } from './schema/typeGuards.js';
+import { getBinaryEncoder, getEnumUtf8, getSchemaType } from './schema/typeGuards.js';
 import type { LogSchema } from './schema/types.js';
 import type { AnySpanBuffer, OpMetadata } from './types.js';
 import type { VocabularyGeneration } from './vocabularyRegistry.js';
@@ -247,8 +249,8 @@ function isStringArray(value: unknown): value is string[] {
 }
 
 function indexTypeForCount(count: number): IntType {
-  if (count <= 255) return uint8();
-  if (count <= 65535) return uint16();
+  if (count <= 0x100) return uint8();
+  if (count <= 0x1_0000) return uint16();
   return uint32();
 }
 
@@ -714,6 +716,7 @@ function convertBuffersToTable(
   if (totalRows === 0) return tableFromColumns({});
 
   const schema: LogSchema = buffers[0]._logSchema;
+  const enumLookup = resolveEnumLookupDescriptor(schema);
 
   // Build vectors first, then derive schema from them
   // This ensures Field types and vector data types are identical (Arrow IPC requirement)
@@ -746,11 +749,12 @@ function convertBuffersToTable(
     const columnName = fieldName; // User columns have no prefix
 
     if (lmaoType === 'enum') {
-      const enumValues = getEnumValues(fieldSchema) || [];
+      const descriptor = enumLookup.byField[fieldName];
+      if (!descriptor) throw new TypeError(`Enum lookup missing for field '${fieldName}'`);
+      const enumValues = descriptor.values;
       const enumUtf8 = getEnumUtf8(fieldSchema);
-      // Get constructors from schema metadata
-      const indexArrayCtor = getArrowIndexArrayConstructorOr(fieldSchema);
-      const arrowIndexType = getArrowIndexTypeOr(fieldSchema, uint8());
+      const indexArrayCtor = descriptor.indexArrayConstructor;
+      const arrowIndexType = indexTypeForCount(enumValues.length);
       // Collect value arrays - need to handle different TypedArray types
       const valueArrays: (Uint8Array | Uint16Array | Uint32Array)[] = [];
       for (const buf of buffers) {
@@ -1164,13 +1168,17 @@ export function convertSpanTreeToArrowTable(
   // ═══════════════════════════════════════════════════════════════════════════
   const mergedSchemaFields = new Map<string, unknown>();
   const remaps: RemapsByBuffer = new WeakMap();
+  const enumLookupsByField = new Map<string, EnumLookupDescriptor>();
 
   walkSpanTree(rootBuffer, (buffer, remapDescriptor) => {
+    const enumLookup = resolveEnumLookupDescriptor(buffer._logSchema);
     if (remapDescriptor) {
       remaps.set(buffer, remapDescriptor);
-      for (const [fieldName, , fieldSchema] of remapDescriptor.columns) {
+      for (const [fieldName, sourceName, fieldSchema] of remapDescriptor.columns) {
         if (!SYSTEM_SCHEMA_FIELD_NAMES.has(fieldName) && !mergedSchemaFields.has(fieldName)) {
           mergedSchemaFields.set(fieldName, fieldSchema);
+          const descriptor = enumLookup.byField[sourceName];
+          if (descriptor) enumLookupsByField.set(fieldName, descriptor);
         }
       }
       return;
@@ -1178,6 +1186,8 @@ export function convertSpanTreeToArrowTable(
     for (const [fieldName, fieldSchema] of buffer._columns) {
       if (!SYSTEM_SCHEMA_FIELD_NAMES.has(fieldName) && !mergedSchemaFields.has(fieldName)) {
         mergedSchemaFields.set(fieldName, fieldSchema);
+        const descriptor = enumLookup.byField[fieldName];
+        if (descriptor) enumLookupsByField.set(fieldName, descriptor);
       }
     }
   });
@@ -1364,6 +1374,7 @@ export function convertSpanTreeToArrowTable(
           categoryDicts,
           textDicts,
           schemaFields,
+          enumLookupsByField,
           categoryOriginalToMasked,
           textOriginalToMasked,
           remaps,
@@ -1428,6 +1439,7 @@ function convertBuffersWithSharedDicts(
   categoryDicts: Map<string, FinalizedDictionary>,
   textDicts: Map<string, FinalizedDictionary>,
   schemaFields: Array<[string, unknown]>,
+  enumLookupsByField: ReadonlyMap<string, EnumLookupDescriptor>,
   categoryOriginalToMasked: Map<string, Map<string, string>>,
   textOriginalToMasked: Map<string, Map<string, string>>,
   remaps: RemapsByBuffer,
@@ -1874,22 +1886,18 @@ function convertBuffersWithSharedDicts(
       );
       fields.push(arrowFieldName);
     } else if (lmaoType === 'enum') {
-      const enumValues = getEnumValues(fieldSchema) || [];
+      const descriptor = enumLookupsByField.get(fieldName);
+      if (!descriptor) throw new TypeError(`Enum lookup missing for field '${fieldName}'`);
+      const enumValues = descriptor.values;
       const enumUtf8 = getEnumUtf8(fieldSchema);
-      // Get constructors from schema metadata
-      const indexArrayCtor = getArrowIndexArrayConstructorOr(fieldSchema);
-      const arrowIndexType = getArrowIndexTypeOr(fieldSchema, uint8());
+      const indexArrayCtor = descriptor.indexArrayConstructor;
+      const arrowIndexType = indexTypeForCount(enumValues.length);
       const allIndices = new indexArrayCtor(totalRows);
       const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
       // Start with all nulls (bits cleared) - we'll set bits as we find values
       let nullCount = 0;
       let rowOffset = 0;
 
-      // Build enum value to index mapping for scope lookup
-      const enumValueToIndex = new Map<string, number>();
-      for (let i = 0; i < enumValues.length; i++) {
-        enumValueToIndex.set(enumValues[i], i);
-      }
 
       for (const buf of buffers) {
         const sourceName = resolveColumnName(buf, columnName, remaps);
@@ -1897,10 +1905,7 @@ function convertBuffersWithSharedDicts(
         const srcNulls = buf.getNullsIfAllocated(sourceName);
         // Check if this buffer has a scope value for this field
         const scopeValue = getStringScopeValue(buf, fieldName, remaps);
-        let scopeEncodedValue: number | undefined;
-        if (scopeValue !== undefined) {
-          scopeEncodedValue = enumValueToIndex.get(scopeValue);
-        }
+        const scopeEncodedValue = scopeValue === undefined ? undefined : descriptor.encode(scopeValue);
 
         if (col instanceof indexArrayCtor) {
           allIndices.set(col.subarray(0, buf._writeIndex), rowOffset);

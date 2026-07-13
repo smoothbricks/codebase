@@ -44,6 +44,7 @@ type schemaField struct {
 type tagWrite struct {
 	field string
 	arg   *shimast.Node
+	node  *shimast.CallExpression
 }
 
 // --- chain detection ---------------------------------------------------------
@@ -87,7 +88,7 @@ func (t *fileTransformer) findTagChain(call *shimast.CallExpression) (ctxExpr *s
 			if len(current.Arguments.Nodes) != 1 {
 				return nil, nil, nil, false
 			}
-			tagCalls = append([]tagWrite{{field: name, arg: current.Arguments.Nodes[0]}}, tagCalls...)
+			tagCalls = append([]tagWrite{{field: name, arg: current.Arguments.Nodes[0], node: current}}, tagCalls...)
 		}
 
 		next := pa.Expression
@@ -111,6 +112,19 @@ func (t *fileTransformer) findTagChain(call *shimast.CallExpression) (ctxExpr *s
 		writes = tagCalls
 		for _, props := range withProps {
 			writes = append(writes, props...)
+		}
+		for _, write := range writes {
+			currentField := schema[write.field]
+			if values := finiteStringLiteralUnion(t.checker, t.checker.GetContextualType(write.arg, 0)); len(values) > 0 {
+				schema[write.field] = schemaField{kind: fieldEnum, enumValues: values, eager: currentField.eager}
+				continue
+			}
+			if write.node != nil {
+				if resolvedField, resolved := schemaFieldFromSetterCall(t.checker, write.node); resolved {
+					resolvedField.eager = currentField.eager
+					schema[write.field] = resolvedField
+				}
+			}
 		}
 		if len(writes) == 0 {
 			return nil, nil, nil, false
@@ -203,9 +217,10 @@ func isCompileTimeLiteral(n *shimast.Node) bool {
 }
 
 type inlineEmitter struct {
-	bufferExpr *shimast.Node // ctx._buffer
-	varCounter int
-	stmts      []*shimast.Node
+	bufferExpr     *shimast.Node // ctx._buffer
+	enumLookupExpr *shimast.Node // ctx._physicalLayoutPlan.enumLookup.byField
+	varCounter     int
+	stmts          []*shimast.Node
 }
 
 func (e *inlineEmitter) freshVar() *shimast.Node {
@@ -251,7 +266,7 @@ func (e *inlineEmitter) emitField(w tagWrite, schema map[string]schemaField) {
 		return
 	}
 	if known && info.kind == fieldEnum {
-		e.emitEnum(w, info, literal)
+		e.emitEnum(w, info)
 		return
 	}
 	eager := known && info.eager
@@ -288,23 +303,15 @@ func (e *inlineEmitter) emitBool(w tagWrite, eager, literal bool) {
 	e.stmts = append(e.stmts, notNullGuard(v, ifBody))
 }
 
-func (e *inlineEmitter) emitEnum(w tagWrite, info schemaField, literal bool) {
+func (e *inlineEmitter) emitEnum(w tagWrite, info schemaField) {
 	if !info.eager {
 		e.emitNullsSet(w.field)
 	}
-	if literal && w.arg.Kind == shimast.KindStringLiteral {
-		idx := 0
-		for i, v := range info.enumValues {
-			if v == shimast.NodeText(w.arg) {
-				idx = i
-				break
-			}
-		}
-		e.stmts = append(e.stmts, binaryStmt(e.columnAccess(w.field, "values"), shimast.KindEqualsToken, num(idx)))
-		return
-	}
-	e.stmts = append(e.stmts, binaryStmt(e.columnAccess(w.field, "values"), shimast.KindEqualsToken,
-		enumSwitchIIFE(w.arg, info.enumValues)))
+	e.stmts = append(e.stmts, binaryStmt(
+		e.columnAccess(w.field, "values"),
+		shimast.KindEqualsToken,
+		enumEncodeCall(e.enumLookupExpr, w.field, w.arg),
+	))
 }
 
 func (e *inlineEmitter) emitDirect(w tagWrite, eager, literal bool) {
@@ -341,23 +348,10 @@ func notNullGuard(v *shimast.Node, body []*shimast.Node) *shimast.Node {
 	return factory.NewIfStatement(cond, factory.NewBlock(factory.NewNodeList(body), true), nil)
 }
 
-// enumSwitchIIFE builds `(($$v) => { switch ($$v) { case 'A': return 0; ... default: return 0; } })(arg)`.
-func enumSwitchIIFE(arg *shimast.Node, values []string) *shimast.Node {
-	param := ident("$$v")
-	var clauses []*shimast.Node
-	for i, v := range values {
-		clauses = append(clauses, factory.NewCaseOrDefaultClause(shimast.KindCaseClause, str(v),
-			factory.NewNodeList([]*shimast.Node{factory.NewReturnStatement(num(i))})))
-	}
-	clauses = append(clauses, factory.NewCaseOrDefaultClause(shimast.KindDefaultClause, nil,
-		factory.NewNodeList([]*shimast.Node{factory.NewReturnStatement(num(0))})))
-	sw := factory.NewSwitchStatement(ident("$$v"), factory.NewCaseBlock(factory.NewNodeList(clauses)))
-	arrow := factory.NewArrowFunction(nil, nil,
-		factory.NewNodeList([]*shimast.Node{factory.NewParameterDeclaration(nil, nil, param, nil, nil, nil)}),
-		nil, nil, factory.NewToken(shimast.KindEqualsGreaterThanToken),
-		factory.NewBlock(factory.NewNodeList([]*shimast.Node{sw}), true))
-	return factory.NewCallExpression(factory.NewParenthesizedExpression(arrow), nil, nil,
-		factory.NewNodeList([]*shimast.Node{arg}), shimast.NodeFlagsNone)
+// enumEncodeCall reuses the schema-order encoder already bound to the callsite plan.
+func enumEncodeCall(enumLookupExpr *shimast.Node, field string, arg *shimast.Node) *shimast.Node {
+	descriptor := factory.NewElementAccessExpression(enumLookupExpr, nil, str(field), shimast.NodeFlagsNone)
+	return callExpr(propAccess(descriptor, "encode"), []*shimast.Node{arg})
 }
 
 // --- two-phase statement-level entry ----------------------------------------------
@@ -447,7 +441,17 @@ func (t *fileTransformer) collectTagInlines(root *shimast.Node) ([]tagInline, []
 // applyTagInlines splices the replacement blocks (phase B — no checker use).
 func (t *fileTransformer) applyTagInlines(inlines []tagInline) {
 	for _, in := range inlines {
-		e := &inlineEmitter{bufferExpr: propAccess(in.ctxExpr, "_buffer")}
+		state := ident("$$t")
+		e := &inlineEmitter{
+			bufferExpr: propAccess(state, "_spanBuffer"),
+			enumLookupExpr: propAccess(
+				propAccess(propAccess(state, "_physicalLayoutPlan"), "enumLookup"),
+				"byField",
+			),
+			stmts: []*shimast.Node{
+				constDecl(state, propAccess(propAccess(in.ctxExpr, "tag"), "_state")),
+			},
+		}
 		for _, w := range in.writes {
 			e.emitField(w, in.schema)
 		}
