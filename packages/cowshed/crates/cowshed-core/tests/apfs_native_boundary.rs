@@ -1,8 +1,9 @@
 use std::fs::{FileTimes, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use cowshed_core::apfs::{
     ApfsCaseSensitivity, CommandOutput, CommandRequest, CommandRunError, CommandRunner,
@@ -19,7 +20,8 @@ use cowshed_core::storage::apfs::native::{
     RestoreFailpoint, SystemKernelMountSource,
 };
 use cowshed_core::storage::apfs::{
-    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, MarkerExpectation, MetadataPolicy,
+    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, LockMode, MarkerExpectation,
+    MetadataPolicy,
 };
 use cowshed_core::storage::lifecycle::{
     ExpectedState, LifecycleWorkspace, OperationIdentity, Pin, Revision,
@@ -275,6 +277,33 @@ fn native_host(
         ByteRecoveryMarkers,
     )
     .expect("native APFS host")
+}
+
+fn native_host_at(root: &Path) -> MacOsApfsExecutionHost<RecordingRunner> {
+    MacOsApfsExecutionHost::with_recovery_sources(
+        RecordingRunner::default(),
+        ApfsSubstrateConfig::new(
+            root,
+            root.join("caches"),
+            root.join("mount"),
+            ApfsCaseSensitivity::Insensitive,
+        ),
+        SystemKernelMountSource,
+        ByteRecoveryMarkers,
+    )
+    .expect("native APFS host")
+}
+
+fn wait_for_path(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn identity(fixture: &Fixture) -> OperationIdentity {
@@ -2141,4 +2170,125 @@ fn kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
         let result = host.mounts(&repo());
         assert_eq!(result.is_ok(), expected_valid, "{nobrowse}/{owners}");
     }
+}
+
+#[test]
+fn flock_child_helper() {
+    let Ok(root) = std::env::var("COWSHED_FLOCK_HELPER_ROOT") else {
+        return;
+    };
+    let lock =
+        PathBuf::from(std::env::var_os("COWSHED_FLOCK_HELPER_LOCK").expect("helper lock path"));
+    let ready =
+        PathBuf::from(std::env::var_os("COWSHED_FLOCK_HELPER_READY").expect("helper ready path"));
+    let release = PathBuf::from(
+        std::env::var_os("COWSHED_FLOCK_HELPER_RELEASE").expect("helper release path"),
+    );
+    let host = native_host_at(Path::new(&root));
+    let _guard = host
+        .lock_images(&[lock], LockMode::Wait)
+        .expect("helper lock")
+        .expect("blocking helper lock");
+    std::fs::write(&ready, b"ready").expect("signal ready");
+    wait_for_path(&release);
+    if std::env::var_os("COWSHED_FLOCK_HELPER_CRASH").is_some() {
+        std::process::abort();
+    }
+}
+
+#[test]
+fn independent_hosts_and_processes_serialize_and_crash_releases_the_lock() {
+    let fixture = Fixture::new("flock-process");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let lock = layout
+        .main_image(ImageFormat::Sparse)
+        .expect("main")
+        .lock()
+        .to_owned();
+    let first = native_host_at(&fixture.root);
+    let second = native_host_at(&fixture.root);
+    let guard = first
+        .lock_images(std::slice::from_ref(&lock), LockMode::Wait)
+        .expect("first lock")
+        .expect("blocking first lock");
+    assert!(
+        second
+            .lock_images(std::slice::from_ref(&lock), LockMode::Try)
+            .expect("second try lock")
+            .is_none(),
+        "independent hosts must contend through the kernel"
+    );
+    drop(guard);
+    drop(
+        second
+            .lock_images(std::slice::from_ref(&lock), LockMode::Try)
+            .expect("second lock after release")
+            .expect("released lock must be available"),
+    );
+
+    for crash in [false, true] {
+        let ready = fixture.root.join(format!("child-{crash}.ready"));
+        let release = fixture.root.join(format!("child-{crash}.release"));
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .arg("--exact")
+            .arg("flock_child_helper")
+            .env("COWSHED_FLOCK_HELPER_ROOT", &fixture.root)
+            .env("COWSHED_FLOCK_HELPER_LOCK", &lock)
+            .env("COWSHED_FLOCK_HELPER_READY", &ready)
+            .env("COWSHED_FLOCK_HELPER_RELEASE", &release)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if crash {
+            command.env("COWSHED_FLOCK_HELPER_CRASH", "1");
+        }
+        let mut child = command.spawn().expect("spawn lock helper");
+        wait_for_path(&ready);
+        assert!(
+            first
+                .lock_images(std::slice::from_ref(&lock), LockMode::Try)
+                .expect("parent try while child owns")
+                .is_none(),
+            "another process must own the lock"
+        );
+        std::fs::write(&release, b"release").expect("release helper");
+        let status = child.wait().expect("wait for helper");
+        assert_eq!(status.success(), !crash);
+        drop(
+            first
+                .lock_images(std::slice::from_ref(&lock), LockMode::Try)
+                .expect("lock after child exit")
+                .expect("process exit must release flock"),
+        );
+    }
+}
+
+#[test]
+fn gc_skips_staging_owned_by_an_active_lifecycle_lock() {
+    let fixture = Fixture::new("gc-active-staging");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    let staged = layout
+        .project()
+        .project_root
+        .join(".staging/main-00000000000000000000000000000001.sparseimage");
+    create_image(&staged, ImageFormat::Sparse);
+    let owner = native_host_at(&fixture.root);
+    let collector = native_host_at(&fixture.root);
+    let guard = owner
+        .lock_images(&[canonical.lock().to_owned()], LockMode::Wait)
+        .expect("owner lock")
+        .expect("blocking owner lock");
+
+    let report = collector.gc(&fixture.config()).expect("contended gc");
+    assert_eq!(report.examined, 1);
+    assert_eq!(report.reclaimed, 0);
+    assert!(staged.exists());
+    assert!(sidecar_path(&staged).exists());
+
+    drop(guard);
+    let report = collector.gc(&fixture.config()).expect("released gc");
+    assert!(report.reclaimed >= 1);
+    assert!(!staged.exists());
+    assert!(!sidecar_path(&staged).exists());
 }

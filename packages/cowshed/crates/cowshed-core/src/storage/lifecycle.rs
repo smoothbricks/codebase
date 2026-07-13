@@ -336,6 +336,7 @@ pub enum Operation {
     },
     Retire {
         workspace: WorkspaceName,
+        format: ImageFormat,
     },
 }
 
@@ -536,6 +537,7 @@ impl LifecyclePlanner for PurePlanner {
             expected: vec![ExpectedState::active(workspace)],
             operation: Operation::Retire {
                 workspace: workspace.name.clone(),
+                format: workspace.format,
             },
         })
     }

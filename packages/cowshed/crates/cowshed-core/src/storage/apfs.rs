@@ -1,11 +1,11 @@
 pub mod native;
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use thiserror::Error;
-use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::apfs::{
     ApfsCaseSensitivity, ApfsError, CreateImageRequest, CreatedImage, ImageFormatSelection,
@@ -113,10 +113,21 @@ pub struct RetiredImage {
     pub retired: RetiredRef,
     pub image: PathBuf,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LockMode {
+    Wait,
+    Try,
+}
 
 /// Synchronous macOS/filesystem boundary. Implementations must use the primitives in
 /// `crate::apfs`; the storage executor calls this trait only through [`ApfsBlockingLane`].
 pub trait ApfsExecutionHost: Send + Sync + 'static {
+    type LockGuard: Send + 'static;
+    fn lock_images(
+        &self,
+        images: &[PathBuf],
+        mode: LockMode,
+    ) -> Result<Option<Self::LockGuard>, ApfsStorageError>;
     type Attachment: Send + 'static;
 
     fn observe(&self, expected: &[ExpectedState]) -> Result<Vec<ObservedState>, ApfsStorageError>;
@@ -267,6 +278,13 @@ pub enum ApfsStorageError {
     Apfs(#[from] ApfsError),
     #[error("storage layout failed: {0}")]
     Layout(#[from] StorageLayoutError),
+    #[error("{operation} {path} failed: {source}")]
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("lifecycle conflict: {0}")]
     Conflict(#[from] super::lifecycle::Conflict),
     #[error("derived APFS state is inconsistent: {0}")]
@@ -314,7 +332,6 @@ pub struct ApfsSubstrate<H, L = TokioApfsBlockingLane> {
     lane: Arc<L>,
     config: Arc<ApfsSubstrateConfig>,
     incarnations: Arc<dyn IncarnationSource>,
-    lifecycle_exclusion: Arc<Mutex<()>>,
 }
 
 impl<H, L> Clone for ApfsSubstrate<H, L> {
@@ -325,7 +342,6 @@ impl<H, L> Clone for ApfsSubstrate<H, L> {
             lane: Arc::clone(&self.lane),
             config: Arc::clone(&self.config),
             incarnations: Arc::clone(&self.incarnations),
-            lifecycle_exclusion: Arc::clone(&self.lifecycle_exclusion),
         }
     }
 }
@@ -360,7 +376,6 @@ where
             lane: Arc::new(lane),
             config: Arc::new(config),
             incarnations: Arc::new(incarnations),
-            lifecycle_exclusion: Arc::new(Mutex::new(())),
         }
     }
 
@@ -377,23 +392,41 @@ where
             lane: Arc::clone(&self.lane),
             config: Arc::clone(&self.config),
             incarnations: Arc::clone(&self.incarnations),
-            lifecycle_exclusion: Arc::clone(&self.lifecycle_exclusion),
             expected: plan.expected().to_vec(),
         };
         execute_checked(&backend, plan).await.map_err(Into::into)
     }
 
-    async fn dispatch_locked<T, F>(&self, job: F) -> Result<T, ApfsStorageError>
+    async fn dispatch_read<T, F>(&self, job: F) -> Result<T, ApfsStorageError>
     where
         T: Send + 'static,
         F: FnOnce(Arc<H>, Arc<ApfsSubstrateConfig>) -> Result<T, ApfsStorageError> + Send + 'static,
     {
-        let _guard = Arc::clone(&self.lifecycle_exclusion).lock_owned().await;
+        let host = Arc::clone(&self.host);
+        let config = Arc::clone(&self.config);
+        self.lane.dispatch(move || job(host, config)).await
+    }
+
+    async fn dispatch_with_locks<T, F>(
+        &self,
+        lock_paths: Vec<PathBuf>,
+        recover: bool,
+        job: F,
+    ) -> Result<T, ApfsStorageError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<H>, Arc<ApfsSubstrateConfig>) -> Result<T, ApfsStorageError> + Send + 'static,
+    {
         let host = Arc::clone(&self.host);
         let config = Arc::clone(&self.config);
         self.lane
             .dispatch(move || {
-                host.recover_pending(&config)?;
+                let _guard = host.lock_images(&lock_paths, LockMode::Wait)?.ok_or(
+                    ApfsStorageError::InvalidPlan("blocking image lock unexpectedly unavailable"),
+                )?;
+                if recover {
+                    host.recover_pending(&config)?;
+                }
                 job(host, config)
             })
             .await
@@ -500,7 +533,13 @@ where
     }
 
     async fn reclaim(&self, retired: RetiredRef) -> Result<(), Self::Error> {
-        self.dispatch_locked(move |host, config| {
+        let lock_paths = vec![workspace_lock_path(
+            &self.config,
+            retired.workspace().repo(),
+            retired.workspace().name(),
+            retired.workspace().format(),
+        )?];
+        self.dispatch_with_locks(lock_paths, true, move |host, config| {
             let image = retired_image_path(&config, retired.workspace())?;
             host.reclaim_image(&image, retired.workspace().format())
         })
@@ -509,7 +548,7 @@ where
 
     async fn list(&self, repo: &RepoId) -> Result<Vec<DerivedWorkspace>, Self::Error> {
         let repo = repo.clone();
-        self.dispatch_locked(move |host, _| {
+        self.dispatch_read(move |host, _| {
             let storage = host.list(&repo)?;
             let mounts = host.mounts(&repo)?;
             let checkpoints = host.checkpoints(&repo)?;
@@ -524,7 +563,7 @@ where
 
     async fn mount_state(&self, workspace: &LifecycleWorkspace) -> Result<MountState, Self::Error> {
         let workspace = workspace.clone();
-        self.dispatch_locked(move |host, _| {
+        self.dispatch_read(move |host, _| {
             let storage = host.list(workspace.repo())?;
             let mounts = host.mounts(workspace.repo())?;
             let checkpoints = host.checkpoints(workspace.repo())?;
@@ -543,8 +582,14 @@ where
         workspace: &LifecycleWorkspace,
         intent: MountIntent,
     ) -> Result<PathBuf, Self::Error> {
+        let lock_paths = vec![workspace_lock_path(
+            &self.config,
+            workspace.repo(),
+            workspace.name(),
+            workspace.format(),
+        )?];
         let workspace = workspace.clone();
-        self.dispatch_locked(move |host, config| {
+        self.dispatch_with_locks(lock_paths, true, move |host, config| {
             let mount_point = mount_point(&config, &workspace)?;
             host.heal_mount(&workspace, &mount_point)?;
             let storage = host.list(workspace.repo())?;
@@ -580,9 +625,17 @@ where
     }
 
     async fn unmount(&self, workspace: &LifecycleWorkspace) -> Result<(), Self::Error> {
+        let lock_paths = vec![workspace_lock_path(
+            &self.config,
+            workspace.repo(),
+            workspace.name(),
+            workspace.format(),
+        )?];
         let workspace = workspace.clone();
-        self.dispatch_locked(move |host, _| host.detach_mounted(&workspace, false))
-            .await
+        self.dispatch_with_locks(lock_paths, true, move |host, _| {
+            host.detach_mounted(&workspace, false)
+        })
+        .await
     }
 
     async fn caches_root(&self) -> Result<PathBuf, Self::Error> {
@@ -591,7 +644,7 @@ where
 
     async fn stats(&self, workspace: &LifecycleWorkspace) -> Result<SubstrateStats, Self::Error> {
         let workspace = workspace.clone();
-        self.dispatch_locked(move |host, config| {
+        self.dispatch_read(move |host, config| {
             let image = canonical_image_path(&config, &workspace)?;
             host.stats(&workspace, &image)
         })
@@ -599,7 +652,7 @@ where
     }
 
     async fn gc(&self) -> Result<StorageGcReport, Self::Error> {
-        self.dispatch_locked(move |host, config| host.gc(&config))
+        self.dispatch_read(move |host, config| host.gc(&config))
             .await
     }
 }
@@ -609,7 +662,6 @@ struct CheckedApfsBackend<H, L> {
     lane: Arc<L>,
     config: Arc<ApfsSubstrateConfig>,
     incarnations: Arc<dyn IncarnationSource>,
-    lifecycle_exclusion: Arc<Mutex<()>>,
     expected: Vec<ExpectedState>,
 }
 
@@ -619,12 +671,21 @@ where
     H: ApfsExecutionHost,
     L: ApfsBlockingLane,
 {
-    type Guard = OwnedMutexGuard<()>;
+    type Guard = H::LockGuard;
     type Output = Applied;
     type Error = ApfsStorageError;
 
-    async fn acquire(&self, _: &Operation) -> Result<Self::Guard, Self::Error> {
-        Ok(Arc::clone(&self.lifecycle_exclusion).lock_owned().await)
+    async fn acquire(&self, operation: &Operation) -> Result<Self::Guard, Self::Error> {
+        let lock_paths = operation_lock_paths(&self.config, &self.expected, operation)?;
+        let host = Arc::clone(&self.host);
+        self.lane
+            .dispatch(move || {
+                host.lock_images(&lock_paths, LockMode::Wait)?
+                    .ok_or(ApfsStorageError::InvalidPlan(
+                        "blocking image lock unexpectedly unavailable",
+                    ))
+            })
+            .await
     }
 
     async fn read_authoritative(
@@ -673,6 +734,72 @@ struct AdoptExecution<'a> {
     source_checkout: &'a Path,
     pre_cowshed_checkout: &'a Path,
     identity: &'a OperationIdentity,
+}
+fn workspace_lock_path(
+    config: &ApfsSubstrateConfig,
+    repo: &RepoId,
+    workspace: &WorkspaceName,
+    format: ImageFormat,
+) -> Result<PathBuf, ApfsStorageError> {
+    let storage = layout(config, repo)?;
+    if workspace.is_main() {
+        Ok(storage.main_image(format)?.lock().to_owned())
+    } else {
+        Ok(storage.session_image(workspace, format)?.lock().to_owned())
+    }
+}
+
+fn operation_lock_paths(
+    config: &ApfsSubstrateConfig,
+    expected: &[ExpectedState],
+    operation: &Operation,
+) -> Result<Vec<PathBuf>, ApfsStorageError> {
+    let repo = match operation {
+        Operation::Adopt { repo, .. } => repo,
+        _ => expected_repo(expected)?,
+    };
+    let mut locks = match operation {
+        Operation::Adopt { format, .. } => {
+            let main = main_name();
+            let mut locks = vec![workspace_lock_path(config, repo, &main, *format)?];
+            if *format == ImageFormat::Asif {
+                locks.push(workspace_lock_path(
+                    config,
+                    repo,
+                    &main,
+                    ImageFormat::Sparse,
+                )?);
+            }
+            locks
+        }
+        Operation::Create {
+            source,
+            destination,
+            format,
+            ..
+        }
+        | Operation::Fork {
+            source,
+            destination,
+            format,
+            ..
+        } => vec![
+            workspace_lock_path(config, repo, source, *format)?,
+            workspace_lock_path(config, repo, destination, *format)?,
+        ],
+        Operation::Checkpoint {
+            workspace, format, ..
+        }
+        | Operation::Restore {
+            workspace, format, ..
+        }
+        | Operation::Retire {
+            workspace, format, ..
+        } => vec![workspace_lock_path(config, repo, workspace, *format)?],
+    };
+    locks.sort();
+    locks.dedup();
+    Ok(locks)
 }
 
 struct CloneExecution<'a> {
@@ -790,7 +917,7 @@ fn apply_operation<H: ApfsExecutionHost>(
             },
             incarnations,
         ),
-        Operation::Retire { workspace } => apply_retire(host, config, expected, workspace),
+        Operation::Retire { workspace, .. } => apply_retire(host, config, expected, workspace),
     }
 }
 
@@ -1435,4 +1562,129 @@ pub fn volume_name(repo: &RepoId, workspace: &WorkspaceName) -> String {
         repo.repo(),
         workspace.as_str()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::GrantSet;
+
+    fn identity() -> OperationIdentity {
+        OperationIdentity {
+            project_root: PathBuf::from("/project"),
+            base_commit: "0123456789abcdef".to_owned(),
+            created_at: "2026-07-13T00:00:00Z".to_owned(),
+            created_trace: "lock-table".to_owned(),
+            grants: GrantSet::default(),
+        }
+    }
+
+    #[test]
+    fn every_mutating_operation_maps_to_its_exact_canonical_lock_set() {
+        let config = ApfsSubstrateConfig::new(
+            "/tmp/cowshed-lock-table/store",
+            "/tmp/cowshed-lock-table/caches",
+            "/tmp/cowshed-lock-table/main",
+            ApfsCaseSensitivity::Sensitive,
+        );
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        let main = main_name();
+        let source = WorkspaceName::session("source").expect("source");
+        let destination = WorkspaceName::session("destination").expect("destination");
+        let expected = vec![ExpectedState::Exists {
+            repo: repo.clone(),
+            name: source.clone(),
+            incarnation: WorkspaceIncarnation::new("00000000000000000000000000000001")
+                .expect("incarnation"),
+            revision: Revision::new(1),
+            topology_revision: Revision::new(1),
+            retired: false,
+        }];
+        let main_asif =
+            workspace_lock_path(&config, &repo, &main, ImageFormat::Asif).expect("main asif");
+        let main_sparse =
+            workspace_lock_path(&config, &repo, &main, ImageFormat::Sparse).expect("main sparse");
+        let source_sparse =
+            workspace_lock_path(&config, &repo, &source, ImageFormat::Sparse).expect("source");
+        let destination_sparse =
+            workspace_lock_path(&config, &repo, &destination, ImageFormat::Sparse)
+                .expect("destination");
+        let mut clone_locks = vec![source_sparse.clone(), destination_sparse.clone()];
+        clone_locks.sort();
+        let cases = [
+            (
+                Operation::Adopt {
+                    repo: repo.clone(),
+                    format: ImageFormat::Asif,
+                    source_checkout: PathBuf::from("/project"),
+                    pre_cowshed_checkout: PathBuf::from("/project.pre-cowshed"),
+                    identity: identity(),
+                },
+                vec![main_asif, main_sparse.clone()],
+            ),
+            (
+                Operation::Adopt {
+                    repo: repo.clone(),
+                    format: ImageFormat::Sparse,
+                    source_checkout: PathBuf::from("/project"),
+                    pre_cowshed_checkout: PathBuf::from("/project.pre-cowshed"),
+                    identity: identity(),
+                },
+                vec![main_sparse],
+            ),
+            (
+                Operation::Create {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                    format: ImageFormat::Sparse,
+                    identity: identity(),
+                },
+                clone_locks.clone(),
+            ),
+            (
+                Operation::Fork {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                    format: ImageFormat::Sparse,
+                    identity: identity(),
+                },
+                clone_locks,
+            ),
+            (
+                Operation::Checkpoint {
+                    workspace: source.clone(),
+                    label: CheckpointLabel::new("automatic").expect("label"),
+                    pin: Pin::Automatic,
+                    format: ImageFormat::Sparse,
+                },
+                vec![source_sparse.clone()],
+            ),
+            (
+                Operation::Restore {
+                    workspace: source.clone(),
+                    label: CheckpointLabel::new("automatic").expect("label"),
+                    mode: RestoreMode::Replace,
+                    format: ImageFormat::Sparse,
+                    identity: identity(),
+                },
+                vec![source_sparse.clone()],
+            ),
+            (
+                Operation::Retire {
+                    workspace: source,
+                    format: ImageFormat::Sparse,
+                },
+                vec![source_sparse],
+            ),
+        ];
+
+        for (operation, mut wanted) in cases {
+            wanted.sort();
+            assert_eq!(
+                operation_lock_paths(&config, &expected, &operation).expect("lock mapping"),
+                wanted,
+                "{operation:?}"
+            );
+        }
+    }
 }
