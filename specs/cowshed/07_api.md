@@ -162,19 +162,17 @@ impl JobHandle {
     pub fn id(&self) -> JobId;
     pub async fn status(&self) -> Result<JobInfo, CowshedError>;
     pub async fn logs(&self, stream: JobStream, follow: bool)
-        -> Result<JobByteStream, CowshedError>; // `next()` yields raw `Bytes` from the backing file
+        -> Result<RawByteStream, CowshedError>; // `next()` yields raw `Bytes` from the backing file
     pub async fn attach(&self) -> Result<JobAttachment, CowshedError>;
     pub async fn detach(&self) -> Result<(), CowshedError>;          // job continues
     pub async fn wait(&self) -> Result<JobInfo, CowshedError>;
-    pub fn kill(&self) -> Result<(), CowshedError>;                  // complete process tree
+    pub async fn kill(&self) -> Result<(), CowshedError>;            // awaits complete process-tree termination
 }
 
 /// A live attachment is only a view over one durable job's raw backing streams.
-pub struct JobAttachment { /* acknowledged stdin sink + independent JobByteStream stdout/stderr */ }
+pub struct JobAttachment { /* JobStdin + two independent RawByteStream handles */ }
 impl JobAttachment {
-    pub fn stdout(&mut self) -> &mut JobByteStream;
-    pub fn stderr(&mut self) -> &mut JobByteStream;
-    pub async fn write(&self, bytes: Bytes) -> Result<(), CowshedError>;
+    pub fn into_parts(self) -> (JobStdin, RawByteStream, RawByteStream);
     pub async fn detach(self) -> Result<(), CowshedError>; // closes this view; the job continues
 }
 
@@ -388,8 +386,9 @@ documented lower/camel-case strings, and every optional field is omitted rather 
   `"info" | "warning" | "error"`. `GcReport = { examined, reclaimed, retainedPinned, freedBytes, dryRun }`.
 - `JobId` is a positive integer no greater than `2^53-1`.
   `JobInfo = { repoId, workspaceIncarnation, jobId, state, pid?, grantRevision, argv, cwd, started, durationMs?, exit?, stdout, stderr, trace, outputLimit?, stdin }`.
-  `started` is a full RFC3339 string: `Z` and numeric offsets are accepted. The leap-second value `:60` is accepted only
-  at `23:59:60` on June 30 or December 31; arbitrary dates/minutes reject it. Calendar, clock, fraction, and offset
+  `started` is a full RFC3339 string: `Z` and numeric offsets are accepted. A `:60` value is normalized to UTC and
+  accepted only when it denotes a published IERS leap instant (for example `2016-12-31T18:59:60-05:00`); local
+  `23:59:60` alone is insufficient, and unannounced future leap seconds reject. Calendar, clock, fraction, and offset
   ranges are validated. `exit` is the discriminated union `{kind:"exited",code}` or
   `{kind:"signaled",signal,coreDumped}`; it is absent before a process result exists. `outputLimit` is present iff
   `state == "outputLimit"`. Both serialization and deserialization enforce these state / duration / exit / output-limit
@@ -529,9 +528,6 @@ export interface WorkspaceRef {
   grants(): Promise<GrantSet>; // read-only
 }
 ```
-
-Errors are `Error` instances with `code` set to the taxonomy name (`"conflict"`, `"notFound"`, `"sandboxDenied"`, …) and
-`hint` when available — mirroring the CLI's JSON envelope, so a caller can share handling between CLI and NAPI use.
 
 The capability split is preserved across the boundary by _how a caller connects, not by a caller-supplied authority
 string_: `connectCoordinator` accepts only the opaque receiving endpoint for the controller-created inherited
