@@ -260,7 +260,9 @@ fn poll_job_stream(
                     break;
                 }
             };
-            if !chunk.bytes.is_empty() {
+            let had_bytes = !chunk.bytes.is_empty();
+            let eof = chunk.eof;
+            if had_bytes {
                 offset = offset.saturating_add(chunk.bytes.len() as u64);
                 let bytes = Bytes::from(chunk.bytes);
                 let sent = tokio::select! {
@@ -271,10 +273,10 @@ fn poll_job_stream(
                     break;
                 }
             }
-            if !follow {
-                break;
-            }
-            if chunk.eof {
+            if eof {
+                if !follow {
+                    break;
+                }
                 let status: Result<JobInfo> = tokio::select! {
                     _ = sender.closed() => break,
                     value = runtime.call(
@@ -300,9 +302,11 @@ fn poll_job_stream(
                     }
                 }
             }
-            tokio::select! {
-                _ = sender.closed() => break,
-                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+            if !had_bytes || eof {
+                tokio::select! {
+                    _ = sender.closed() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                }
             }
         }
     });
@@ -1397,13 +1401,19 @@ mod tests {
         async fn call(&self, method: &'static str, _params: Value) -> Result<Value> {
             match method {
                 "job.logs" => {
-                    self.log_calls.fetch_add(1, Ordering::SeqCst);
-                    if self.mode.load(Ordering::SeqCst) == 1 {
-                        self.active_calls.fetch_add(1, Ordering::SeqCst);
-                        let _active = ActiveCall(&self.active_calls);
-                        future::pending().await
-                    } else {
-                        Ok(json!({"bytes": [], "eof": true}))
+                    let call = self.log_calls.fetch_add(1, Ordering::SeqCst);
+                    match self.mode.load(Ordering::SeqCst) {
+                        1 => {
+                            self.active_calls.fetch_add(1, Ordering::SeqCst);
+                            let _active = ActiveCall(&self.active_calls);
+                            future::pending().await
+                        }
+                        2 => match call {
+                            0 => Ok(json!({"bytes": [97, 98, 99], "eof": false})),
+                            1 => Ok(json!({"bytes": [100, 101, 102], "eof": false})),
+                            _ => Ok(json!({"bytes": [103, 104, 105], "eof": true})),
+                        },
+                        _ => Ok(json!({"bytes": [], "eof": true})),
                     }
                 }
                 "job.status" => {
@@ -1558,6 +1568,27 @@ mod tests {
         assert_eq!(runtime.status_calls.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn non_follow_stream_reads_every_page_byte_for_byte_through_eof() {
+        let runtime = Arc::new(TestRuntime::default());
+        runtime.mode.store(2, Ordering::SeqCst);
+        let runtime_trait: Arc<dyn ControllerRuntime> = runtime.clone();
+        let mut stream = poll_job_stream(
+            runtime_trait,
+            WorkspaceName::new("raven").unwrap(),
+            JobId::new(7).unwrap(),
+            JobStream::Stdout,
+            false,
+        );
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+
+        assert_eq!(bytes, b"abcdefghi");
+        assert_eq!(runtime.log_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(runtime.status_calls.load(Ordering::SeqCst), 0);
+    }
     #[tokio::test]
     async fn dropping_stream_cancels_an_in_flight_poll() {
         let runtime = Arc::new(TestRuntime::default());
