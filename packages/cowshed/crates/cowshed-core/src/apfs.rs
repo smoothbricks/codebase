@@ -14,6 +14,7 @@ use std::process::Command;
 const DISKUTIL: &str = "/usr/sbin/diskutil";
 const HDIUTIL: &str = "/usr/bin/hdiutil";
 const FSCK_APFS: &str = "/sbin/fsck_apfs";
+const NEWFS_APFS: &str = "/System/Library/Filesystems/apfs.fs/Contents/Resources/newfs_apfs";
 const SYNC: &str = "/bin/sync";
 const SW_VERS: &str = "/usr/bin/sw_vers";
 
@@ -132,6 +133,8 @@ pub struct CreateImageRequest {
     pub volume_name: String,
     pub case_sensitivity: ApfsCaseSensitivity,
     pub image_format: ImageFormatSelection,
+    pub owner_uid: u32,
+    pub owner_gid: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -306,6 +309,11 @@ pub enum ApfsError {
         source: io::Error,
     },
     Clone(CloneFileError),
+    AsifCreationAndCleanupFailed {
+        primary: Box<ApfsError>,
+        detach: Option<Box<ApfsError>>,
+        remove: Option<Box<ApfsError>>,
+    },
 }
 
 impl fmt::Display for ApfsError {
@@ -367,6 +375,9 @@ impl fmt::Display for ApfsError {
                 source,
             } => write!(f, "{} {} failed: {}", operation, path.display(), source),
             Self::Clone(error) => error.fmt(f),
+            Self::AsifCreationAndCleanupFailed { .. } => {
+                f.write_str("ASIF creation failed, and staged-image cleanup also failed")
+            }
         }
     }
 }
@@ -379,6 +390,7 @@ impl std::error::Error for ApfsError {
             Self::Clone(error) => Some(error),
             Self::VerificationAndDetachFailed { detach, .. } => Some(detach),
             Self::VolumeResolutionAndDetachFailed { detach, .. } => Some(detach),
+            Self::AsifCreationAndCleanupFailed { primary, .. } => Some(primary),
             _ => None,
         }
     }
@@ -477,7 +489,7 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
 
     fn create_asif(&self, path: &Path, request: &CreateImageRequest) -> Result<(), ApfsError> {
         validate_image_path(path, ImageFormat::Asif)?;
-        let command = CommandRequest::new(
+        let create = CommandRequest::new(
             DISKUTIL,
             [
                 OsString::from("image"),
@@ -490,11 +502,84 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
                 OsString::from("--volumeName"),
                 OsString::from(&request.volume_name),
                 OsString::from("--fs"),
-                OsString::from("APFS"),
+                OsString::from("None"),
                 path.as_os_str().to_owned(),
             ],
         );
-        self.run_checked("create ASIF image", command).map(|_| ())
+        self.run_checked("create ASIF image", create)?;
+
+        let attach = CommandRequest::new(
+            DISKUTIL,
+            [
+                OsString::from("image"),
+                OsString::from("attach"),
+                OsString::from("--nobrowse"),
+                OsString::from("--noMount"),
+                OsString::from("--plist"),
+                path.as_os_str().to_owned(),
+            ],
+        );
+        let output = match self.run_checked("attach blank ASIF image", attach) {
+            Ok(output) => output,
+            Err(primary) => return Err(self.cleanup_failed_asif(path, primary, None)),
+        };
+        let whole_device = match parse_blank_asif_whole_device(&output.stdout) {
+            Ok(device) => device,
+            Err(primary) => return Err(self.cleanup_failed_asif(path, primary, None)),
+        };
+        let case_flag = match request.case_sensitivity {
+            ApfsCaseSensitivity::Sensitive => "-e",
+            ApfsCaseSensitivity::Insensitive => "-i",
+        };
+        let format = CommandRequest::new(
+            NEWFS_APFS,
+            [
+                OsString::from("-U"),
+                OsString::from(request.owner_uid.to_string()),
+                OsString::from("-G"),
+                OsString::from(request.owner_gid.to_string()),
+                OsString::from(case_flag),
+                OsString::from("-v"),
+                OsString::from(&request.volume_name),
+                OsString::from(&whole_device),
+            ],
+        );
+        if let Err(primary) = self.run_checked("format ASIF APFS volume", format) {
+            let detach = self
+                .detach_device(ImageFormat::Asif, &whole_device, true)
+                .err();
+            return Err(self.cleanup_failed_asif(path, primary, detach));
+        }
+        if let Err(primary) = self.detach_device(ImageFormat::Asif, &whole_device, true) {
+            return Err(self.cleanup_failed_asif(path, primary, None));
+        }
+        Ok(())
+    }
+
+    fn cleanup_failed_asif(
+        &self,
+        path: &Path,
+        primary: ApfsError,
+        detach: Option<ApfsError>,
+    ) -> ApfsError {
+        let remove = match fs::remove_file(path) {
+            Ok(()) => None,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(source) => Some(ApfsError::FileOperation {
+                operation: "remove failed ASIF image",
+                path: path.to_owned(),
+                source,
+            }),
+        };
+        if detach.is_none() && remove.is_none() {
+            primary
+        } else {
+            ApfsError::AsifCreationAndCleanupFailed {
+                primary: Box::new(primary),
+                detach: detach.map(Box::new),
+                remove: remove.map(Box::new),
+            }
+        }
     }
 
     fn create_sparse(&self, path: &Path, request: &CreateImageRequest) -> Result<(), ApfsError> {
@@ -648,13 +733,6 @@ impl<R: CommandRunner> ApfsBackend for MacOsApfsBackend<R> {
                 "volume name must not be empty",
             ));
         }
-        if request.image_format == ImageFormatSelection::Exact(ImageFormat::Asif)
-            && request.case_sensitivity == ApfsCaseSensitivity::Sensitive
-        {
-            return Err(ApfsError::InvalidCreateRequest(
-                "ASIF creation cannot request case-sensitive APFS",
-            ));
-        }
 
         match request.image_format {
             ImageFormatSelection::Auto => {
@@ -674,7 +752,7 @@ impl<R: CommandRunner> ApfsBackend for MacOsApfsBackend<R> {
                             });
                         }
                         Err(ApfsError::CommandFailed {
-                            operation,
+                            operation: "create ASIF image",
                             request: command,
                             output,
                         }) if asif_is_unsupported(&output) => {
@@ -687,7 +765,7 @@ impl<R: CommandRunner> ApfsBackend for MacOsApfsBackend<R> {
                                     }
                                 })?;
                             }
-                            let _ = (operation, command);
+                            let _ = command;
                         }
                         Err(error) => return Err(error),
                     }
@@ -943,6 +1021,39 @@ fn asif_is_unsupported(output: &CommandOutput) -> bool {
     .any(|needle| message.contains(needle))
 }
 
+fn parse_blank_asif_whole_device(bytes: &[u8]) -> Result<String, ApfsError> {
+    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|error| ApfsError::InvalidAttachmentPlist(error.to_string()))?;
+    let system_entities = value
+        .as_dictionary()
+        .and_then(|root| root.get("system-entities"))
+        .and_then(plist::Value::as_array)
+        .ok_or_else(|| ApfsError::InvalidAttachmentPlist("missing system-entities array".into()))?;
+    let mut whole_devices = Vec::new();
+    for entity in system_entities {
+        let Some(device) = entity
+            .as_dictionary()
+            .and_then(|dictionary| dictionary.get("dev-entry"))
+            .and_then(plist::Value::as_string)
+            .and_then(device_path)
+        else {
+            continue;
+        };
+        if device_depth(&device) == 0 && is_kernel_device_path(&device) {
+            whole_devices.push(device);
+        }
+    }
+    match whole_devices.len() {
+        1 => Ok(whole_devices.pop().expect("one whole device was counted")),
+        0 => Err(ApfsError::InvalidAttachmentPlist(
+            "no canonical whole image device".into(),
+        )),
+        _ => Err(ApfsError::InvalidAttachmentPlist(
+            "multiple whole image devices".into(),
+        )),
+    }
+}
+
 fn parse_attachment_plist(bytes: &[u8]) -> Result<(String, String), ApfsError> {
     let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
         .map_err(|error| ApfsError::InvalidAttachmentPlist(error.to_string()))?;
@@ -1085,7 +1196,7 @@ fn parse_volume_list_plist(candidate: &str, bytes: &[u8]) -> Result<String, Apfs
                     .ok_or_else(|| {
                         invalid("physical store has no DeviceIdentifier string".into())
                     })?;
-                let device = volume_device_path(identifier).ok_or_else(|| {
+                let device = device_path(identifier).ok_or_else(|| {
                     invalid(format!(
                         "invalid physical store DeviceIdentifier {identifier:?}"
                     ))
@@ -1238,10 +1349,19 @@ mod tests {
       <dict><key>dev-entry</key><string>disk10s1</string><key>content-hint</key><string>Apple_APFS_Volume</string><key>volume-kind</key><string>apfs</string></dict>
     </array></dict></plist>"#;
 
+    const BLANK_ASIF_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
+      <dict><key>dev-entry</key><string>disk8</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
+    </array></dict></plist>"#;
+
     const VOLUME_LIST_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
-      <key>Containers</key><array><dict><key>Volumes</key><array>
-        <dict><key>DeviceIdentifier</key><string>disk10s1</string></dict>
-      </array></dict></array>
+      <key>Containers</key><array><dict>
+        <key>PhysicalStores</key><array>
+          <dict><key>DeviceIdentifier</key><string>disk12</string></dict>
+        </array>
+        <key>Volumes</key><array>
+          <dict><key>DeviceIdentifier</key><string>disk10s1</string></dict>
+        </array>
+      </dict></array>
     </dict></plist>"#;
 
     const SPARSE_ATTACH_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
@@ -1701,6 +1821,8 @@ mod tests {
                 volume_name: "cowshed.owner--repo.main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Auto,
+                owner_uid: 502,
+                owner_gid: 20,
             })
             .unwrap();
         assert_eq!(
@@ -1723,9 +1845,12 @@ mod tests {
     }
 
     #[test]
-    fn auto_tahoe_create_records_asif_command_and_extension() {
+    fn auto_tahoe_create_records_staged_asif_formatting_commands() {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success("26.0\n"),
+            CommandOutput::success([]),
+            CommandOutput::success(BLANK_ASIF_PLIST),
+            CommandOutput::success([]),
             CommandOutput::success([]),
         ]));
         let created = backend
@@ -1735,6 +1860,8 @@ mod tests {
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Auto,
+                owner_uid: 502,
+                owner_gid: 20,
             })
             .unwrap();
 
@@ -1751,7 +1878,13 @@ mod tests {
                 .iter()
                 .map(|request| request.program.as_path())
                 .collect::<Vec<_>>(),
-            [Path::new(SW_VERS), Path::new(DISKUTIL)]
+            [
+                Path::new(SW_VERS),
+                Path::new(DISKUTIL),
+                Path::new(DISKUTIL),
+                Path::new(NEWFS_APFS),
+                Path::new(DISKUTIL),
+            ]
         );
         assert_eq!(
             argv(&requests[1]),
@@ -1766,10 +1899,26 @@ mod tests {
                 "--volumeName",
                 "main",
                 "--fs",
-                "APFS",
+                "None",
                 ".staging/auto.asif",
             ]
         );
+        assert_eq!(
+            argv(&requests[2]),
+            [
+                "image",
+                "attach",
+                "--nobrowse",
+                "--noMount",
+                "--plist",
+                ".staging/auto.asif",
+            ]
+        );
+        assert_eq!(
+            argv(&requests[3]),
+            ["-U", "502", "-G", "20", "-i", "-v", "main", "/dev/disk8"]
+        );
+        assert_eq!(argv(&requests[4]), ["eject", "force", "/dev/disk8"]);
     }
 
     #[test]
@@ -1783,6 +1932,8 @@ mod tests {
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Sensitive,
                 image_format: ImageFormatSelection::Auto,
+                owner_uid: 502,
+                owner_gid: 20,
             })
             .unwrap();
 
@@ -1816,9 +1967,13 @@ mod tests {
     }
 
     #[test]
-    fn exact_asif_records_only_diskutil_command_and_extension() {
-        let backend =
-            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success([])]));
+    fn exact_asif_records_unprivileged_formatting_and_extension() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success([]),
+            CommandOutput::success(BLANK_ASIF_PLIST),
+            CommandOutput::success([]),
+            CommandOutput::success([]),
+        ]));
         let created = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: PathBuf::from(".staging/exact"),
@@ -1826,6 +1981,8 @@ mod tests {
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
+                owner_uid: 501,
+                owner_gid: 80,
             })
             .unwrap();
 
@@ -1837,25 +1994,24 @@ mod tests {
             }
         );
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].program, Path::new(DISKUTIL));
+        assert_eq!(requests.len(), 4);
         assert_eq!(
-            argv(&requests[0]),
+            requests
+                .iter()
+                .map(|request| request.program.as_path())
+                .collect::<Vec<_>>(),
             [
-                "image",
-                "create",
-                "blank",
-                "--format",
-                "ASIF",
-                "--size",
-                "5g",
-                "--volumeName",
-                "main",
-                "--fs",
-                "APFS",
-                ".staging/exact.asif",
+                Path::new(DISKUTIL),
+                Path::new(DISKUTIL),
+                Path::new(NEWFS_APFS),
+                Path::new(DISKUTIL),
             ]
         );
+        assert_eq!(
+            argv(&requests[2]),
+            ["-U", "501", "-G", "80", "-i", "-v", "main", "/dev/disk8"]
+        );
+        assert_eq!(argv(&requests[3]), ["eject", "force", "/dev/disk8"]);
     }
 
     #[test]
@@ -1869,6 +2025,8 @@ mod tests {
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Sensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Sparse),
+                owner_uid: 502,
+                owner_gid: 20,
             })
             .unwrap();
 
@@ -1915,6 +2073,8 @@ mod tests {
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
+                owner_uid: 502,
+                owner_gid: 20,
             })
             .unwrap_err();
 
@@ -1945,6 +2105,8 @@ mod tests {
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Sparse),
+                owner_uid: 502,
+                owner_gid: 20,
             })
             .unwrap_err();
 
@@ -1962,23 +2124,277 @@ mod tests {
     }
 
     #[test]
-    fn exact_asif_rejects_case_sensitive_creation_without_spawning() {
-        let backend = MacOsApfsBackend::new(RecordingRunner::default());
-        let error = backend
+    fn exact_asif_case_sensitive_creation_uses_newfs_e_flag() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success([]),
+            CommandOutput::success(BLANK_ASIF_PLIST),
+            CommandOutput::success([]),
+            CommandOutput::success([]),
+        ]));
+        let created = backend
             .create_staged_image(&CreateImageRequest {
-                staged_stem: PathBuf::from(".staging/exact"),
+                staged_stem: PathBuf::from(".staging/sensitive-asif"),
                 capacity: "5g".into(),
-                volume_name: "main".into(),
+                volume_name: "sensitive".into(),
                 case_sensitivity: ApfsCaseSensitivity::Sensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
+                owner_uid: 777,
+                owner_gid: 88,
+            })
+            .unwrap();
+
+        assert_eq!(created.format, ImageFormat::Asif);
+        assert_eq!(created.path, Path::new(".staging/sensitive-asif.asif"));
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            argv(&requests[2]),
+            [
+                "-U",
+                "777",
+                "-G",
+                "88",
+                "-e",
+                "-v",
+                "sensitive",
+                "/dev/disk8",
+            ]
+        );
+    }
+
+    #[test]
+    fn post_create_asif_attach_failure_never_falls_back_and_removes_image() {
+        let stem = temp_path("asif-attach-failure", "stem").with_extension("");
+        let image = stem.with_extension(ImageFormat::Asif.extension());
+        fs::write(&image, b"partial").unwrap();
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success("26.0\n"),
+            CommandOutput::success([]),
+            CommandOutput::failure(1, "unsupported after create"),
+        ]));
+        let error = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: stem,
+                capacity: "5g".into(),
+                volume_name: "main".into(),
+                case_sensitivity: ApfsCaseSensitivity::Insensitive,
+                image_format: ImageFormatSelection::Auto,
+                owner_uid: 502,
+                owner_gid: 20,
             })
             .unwrap_err();
 
         assert!(matches!(
             error,
-            ApfsError::InvalidCreateRequest("ASIF creation cannot request case-sensitive APFS")
+            ApfsError::CommandFailed {
+                operation: "attach blank ASIF image",
+                ..
+            }
         ));
-        assert!(backend.runner().requests().is_empty());
+        assert!(!image.exists());
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 3);
+        assert!(!requests
+            .iter()
+            .any(|request| request.program == Path::new(HDIUTIL)));
+    }
+
+    #[test]
+    fn post_create_cleanup_treats_a_missing_staged_image_as_already_removed() {
+        let stem = temp_path("asif-missing-cleanup", "stem").with_extension("");
+        let image = stem.with_extension(ImageFormat::Asif.extension());
+        assert!(!image.exists());
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success([]),
+            CommandOutput::failure(9, "attach failed"),
+        ]));
+        let error = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: stem,
+                capacity: "5g".into(),
+                volume_name: "main".into(),
+                case_sensitivity: ApfsCaseSensitivity::Insensitive,
+                image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
+                owner_uid: 502,
+                owner_gid: 20,
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApfsError::CommandFailed {
+                operation: "attach blank ASIF image",
+                output: CommandOutput { status: 9, .. },
+                ..
+            }
+        ));
+        assert_eq!(backend.runner().requests().len(), 2);
+    }
+
+    #[test]
+    fn failed_newfs_detaches_and_removes_staged_asif() {
+        let stem = temp_path("asif-newfs-failure", "stem").with_extension("");
+        let image = stem.with_extension(ImageFormat::Asif.extension());
+        fs::write(&image, b"partial").unwrap();
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success([]),
+            CommandOutput::success(BLANK_ASIF_PLIST),
+            CommandOutput::failure(70, "format failed"),
+            CommandOutput::success([]),
+        ]));
+        let error = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: stem,
+                capacity: "5g".into(),
+                volume_name: "main".into(),
+                case_sensitivity: ApfsCaseSensitivity::Insensitive,
+                image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
+                owner_uid: 502,
+                owner_gid: 20,
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApfsError::CommandFailed {
+                operation: "format ASIF APFS volume",
+                output: CommandOutput { status: 70, .. },
+                ..
+            }
+        ));
+        assert!(!image.exists());
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[2].program, Path::new(NEWFS_APFS));
+        assert_eq!(argv(&requests[3]), ["eject", "force", "/dev/disk8"]);
+    }
+
+    #[test]
+    fn failed_newfs_preserves_detach_cleanup_failure_and_removes_image() {
+        let stem = temp_path("asif-detach-cleanup-failure", "stem").with_extension("");
+        let image = stem.with_extension(ImageFormat::Asif.extension());
+        fs::write(&image, b"partial").unwrap();
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success([]),
+            CommandOutput::success(BLANK_ASIF_PLIST),
+            CommandOutput::failure(70, "format failed"),
+            CommandOutput::failure(16, "busy"),
+        ]));
+        let error = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: stem,
+                capacity: "5g".into(),
+                volume_name: "main".into(),
+                case_sensitivity: ApfsCaseSensitivity::Insensitive,
+                image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
+                owner_uid: 502,
+                owner_gid: 20,
+            })
+            .unwrap_err();
+
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(matches!(
+            error,
+            ApfsError::AsifCreationAndCleanupFailed {
+                primary,
+                detach: Some(detach),
+                remove: None,
+            } if matches!(
+                *primary,
+                ApfsError::CommandFailed {
+                    operation: "format ASIF APFS volume",
+                    ..
+                }
+            ) && matches!(
+                *detach,
+                ApfsError::CommandFailed {
+                    operation: "detach image",
+                    output: CommandOutput { status: 16, .. },
+                    ..
+                }
+            )
+        ));
+        assert!(!image.exists());
+    }
+
+    #[test]
+    fn failed_newfs_preserves_remove_cleanup_failure_after_detach() {
+        let stem = temp_path("asif-remove-cleanup-failure", "stem").with_extension("");
+        let image = stem.with_extension(ImageFormat::Asif.extension());
+        fs::create_dir(&image).unwrap();
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success([]),
+            CommandOutput::success(BLANK_ASIF_PLIST),
+            CommandOutput::failure(70, "format failed"),
+            CommandOutput::success([]),
+        ]));
+        let error = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: stem,
+                capacity: "5g".into(),
+                volume_name: "main".into(),
+                case_sensitivity: ApfsCaseSensitivity::Insensitive,
+                image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
+                owner_uid: 502,
+                owner_gid: 20,
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApfsError::AsifCreationAndCleanupFailed {
+                primary,
+                detach: None,
+                remove: Some(remove),
+            } if matches!(
+                *primary,
+                ApfsError::CommandFailed {
+                    operation: "format ASIF APFS volume",
+                    ..
+                }
+            ) && matches!(
+                *remove,
+                ApfsError::FileOperation {
+                    operation: "remove failed ASIF image",
+                    ..
+                }
+            )
+        ));
+        fs::remove_dir(image).unwrap();
+    }
+
+    #[test]
+    fn failed_final_asif_eject_removes_image_without_publishing() {
+        let stem = temp_path("asif-final-eject-failure", "stem").with_extension("");
+        let image = stem.with_extension(ImageFormat::Asif.extension());
+        fs::write(&image, b"formatted").unwrap();
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success([]),
+            CommandOutput::success(BLANK_ASIF_PLIST),
+            CommandOutput::success([]),
+            CommandOutput::failure(16, "busy"),
+        ]));
+        let error = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: stem,
+                capacity: "5g".into(),
+                volume_name: "main".into(),
+                case_sensitivity: ApfsCaseSensitivity::Insensitive,
+                image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
+                owner_uid: 502,
+                owner_gid: 20,
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApfsError::CommandFailed {
+                operation: "detach image",
+                output: CommandOutput { status: 16, .. },
+                ..
+            }
+        ));
+        assert!(!image.exists());
     }
 
     #[test]
@@ -2070,6 +2486,8 @@ mod tests {
                 volume_name: "cowshed.owner--repo.main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Auto,
+                owner_uid: 502,
+                owner_gid: 20,
             })
             .unwrap();
         assert_eq!(created.format, ImageFormat::Sparse);
@@ -2118,6 +2536,8 @@ mod tests {
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Auto,
+                owner_uid: 502,
+                owner_gid: 20,
             })
             .unwrap_err();
         assert!(matches!(
@@ -2156,6 +2576,8 @@ mod tests {
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Auto,
+                owner_uid: 502,
+                owner_gid: 20,
             })
             .unwrap();
         assert_eq!(created.format, ImageFormat::Sparse);
@@ -2349,6 +2771,8 @@ mod tests {
                 volume_name: "cowshed-apfs-resolution".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Sparse),
+                owner_uid: 502,
+                owner_gid: 20,
             })?;
             let attachment = backend.attach_verified(&created.path, created.format)?;
             assert!(attachment.volume_device().starts_with("/dev/disk"));
@@ -2374,6 +2798,8 @@ mod tests {
                 volume_name: "cowshed-asif-resolution".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
+                owner_uid: 502,
+                owner_gid: 20,
             })?;
             let attachment = backend.attach_verified(&created.path, created.format)?;
             assert!(attachment.whole_device().starts_with("/dev/disk"));
@@ -2383,6 +2809,35 @@ mod tests {
         })();
         let _ = fs::remove_file(image);
         result.unwrap();
+    }
+
+    #[test]
+    fn blank_asif_plist_requires_one_canonical_whole_device() {
+        assert_eq!(
+            parse_blank_asif_whole_device(BLANK_ASIF_PLIST.as_bytes()).unwrap(),
+            "/dev/disk8"
+        );
+        let missing = br#"<?xml version="1.0"?><plist><dict>
+          <key>system-entities</key><array>
+            <dict><key>dev-entry</key><string>disk8s1</string></dict>
+          </array>
+        </dict></plist>"#;
+        assert!(matches!(
+            parse_blank_asif_whole_device(missing),
+            Err(ApfsError::InvalidAttachmentPlist(message))
+                if message == "no canonical whole image device"
+        ));
+        let ambiguous = br#"<?xml version="1.0"?><plist><dict>
+          <key>system-entities</key><array>
+            <dict><key>dev-entry</key><string>disk8</string></dict>
+            <dict><key>dev-entry</key><string>/dev/disk9</string></dict>
+          </array>
+        </dict></plist>"#;
+        assert!(matches!(
+            parse_blank_asif_whole_device(ambiguous),
+            Err(ApfsError::InvalidAttachmentPlist(message))
+                if message == "multiple whole image devices"
+        ));
     }
 
     #[test]
