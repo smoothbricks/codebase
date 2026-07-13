@@ -524,8 +524,8 @@ fn classify_clone_error(source: &Path, destination: &Path, error: io::Error) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Ref, RefCell};
     use std::collections::VecDeque;
-    use std::sync::Mutex;
 
     const PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
       <dict><key>dev-entry</key><string>/dev/disk9</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
@@ -535,21 +535,21 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingRunner {
-        requests: Mutex<Vec<CommandRequest>>,
-        outputs: Mutex<VecDeque<CommandOutput>>,
+        requests: RefCell<Vec<CommandRequest>>,
+        outputs: RefCell<VecDeque<CommandOutput>>,
     }
 
     impl RecordingRunner {
         fn with_outputs(outputs: impl IntoIterator<Item = CommandOutput>) -> Self {
-            Self { requests: Mutex::new(Vec::new()), outputs: Mutex::new(outputs.into_iter().collect()) }
+            Self { requests: RefCell::new(Vec::new()), outputs: RefCell::new(outputs.into_iter().collect()) }
         }
-        fn requests(&self) -> Vec<CommandRequest> { self.requests.lock().unwrap().clone() }
+        fn requests(&self) -> Ref<'_, Vec<CommandRequest>> { self.requests.borrow() }
     }
 
     impl CommandRunner for RecordingRunner {
         fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-            self.requests.lock().unwrap().push(request.clone());
-            Ok(self.outputs.lock().unwrap().pop_front().expect("test supplied an output for each command"))
+            self.requests.borrow_mut().push(request.clone());
+            Ok(self.outputs.borrow_mut().pop_front().expect("test supplied an output for each command"))
         }
     }
 
@@ -643,7 +643,7 @@ mod tests {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success([])]));
         let error = backend.sync_and_clone(Path::new("main.asif"), Path::new("session.sparseimage"), ImageFormat::Asif).unwrap_err();
         assert!(matches!(error, ApfsError::Clone(CloneFileError::InvalidImagePath { .. })));
-        assert_eq!(backend.runner().requests(), [CommandRequest::new(SYNC, std::iter::empty::<OsString>())]);
+        assert_eq!(backend.runner().requests().as_slice(), [CommandRequest::new(SYNC, std::iter::empty::<OsString>())]);
     }
 
     #[test]
