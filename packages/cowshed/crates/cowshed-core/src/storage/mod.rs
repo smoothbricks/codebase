@@ -13,6 +13,7 @@ use crate::repository::{PathLayoutError, ProjectPaths, RepoId};
 
 pub mod apfs;
 pub mod bootstrap;
+pub mod job_artifact;
 pub mod lifecycle;
 pub mod recovery;
 
