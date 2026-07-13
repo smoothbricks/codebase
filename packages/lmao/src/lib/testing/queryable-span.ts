@@ -15,13 +15,14 @@
  * @module queryable-span
  */
 
+import { resolveMessage } from '../resolveMessage.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { SpanBuffer } from '../types.js';
 import { type ExtractFactsOptions, extractFacts } from './extractFacts.js';
 import type { FactArray } from './facts.js';
 
 export interface QueryableSpan<T extends LogSchema = LogSchema> {
-  /** Span name (from message_values[0]) */
+  /** Resolved span name. */
   readonly name: string;
 
   /** Extract all facts from this span and its children */
@@ -52,7 +53,7 @@ class QueryableSpanImpl<T extends LogSchema> implements QueryableSpan<T> {
   constructor(readonly buffer: SpanBuffer<T>) {}
 
   get name(): string {
-    return this.buffer.message_values[0];
+    return resolveMessage(this.buffer, 0) ?? '';
   }
 
   facts(options?: ExtractFactsOptions): FactArray {
@@ -60,32 +61,36 @@ class QueryableSpanImpl<T extends LogSchema> implements QueryableSpan<T> {
   }
 
   find(name: string): QueryableSpan<T> | undefined {
-    return findInChildren(this.buffer._children as SpanBuffer<T>[], name);
+    return findInChildren(this.buffer._children, name);
   }
 
   findAll(name: string): QueryableSpan<T>[] {
     const results: QueryableSpan<T>[] = [];
-    collectAll(this.buffer._children as SpanBuffer<T>[], name, results);
+    collectAll(this.buffer._children, name, results);
     return results;
   }
 
   get children(): QueryableSpan<T>[] {
-    return (this.buffer._children as SpanBuffer<T>[]).map((child) => new QueryableSpanImpl(child));
+    const result: QueryableSpan<T>[] = [];
+    for (const child of this.buffer._children) {
+      result.push(new QueryableSpanImpl(child));
+    }
+    return result;
   }
 
   names(): string[] {
     const result: string[] = [];
-    collectNames(this.buffer._children as SpanBuffer<T>[], result);
+    collectNames(this.buffer._children, result);
     return result;
   }
 }
 
 function findInChildren<T extends LogSchema>(children: SpanBuffer<T>[], name: string): QueryableSpan<T> | undefined {
   for (const child of children) {
-    if (child.message_values[0] === name) {
+    if (resolveMessage(child, 0) === name) {
       return new QueryableSpanImpl(child);
     }
-    const found = findInChildren(child._children as SpanBuffer<T>[], name);
+    const found = findInChildren(child._children, name);
     if (found) return found;
   }
   return undefined;
@@ -93,16 +98,16 @@ function findInChildren<T extends LogSchema>(children: SpanBuffer<T>[], name: st
 
 function collectAll<T extends LogSchema>(children: SpanBuffer<T>[], name: string, results: QueryableSpan<T>[]): void {
   for (const child of children) {
-    if (child.message_values[0] === name) {
+    if (resolveMessage(child, 0) === name) {
       results.push(new QueryableSpanImpl(child));
     }
-    collectAll(child._children as SpanBuffer<T>[], name, results);
+    collectAll(child._children, name, results);
   }
 }
 
 function collectNames<T extends LogSchema>(children: SpanBuffer<T>[], result: string[]): void {
   for (const child of children) {
-    result.push(child.message_values[0]);
-    collectNames(child._children as SpanBuffer<T>[], result);
+    result.push(resolveMessage(child, 0) ?? '');
+    collectNames(child._children, result);
   }
 }

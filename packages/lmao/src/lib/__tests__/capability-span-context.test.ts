@@ -3,6 +3,7 @@ import fc from 'fast-check';
 import { defineOpContext } from '../defineOpContext.js';
 import type { OpContext, OpContextOf, SpanContext } from '../opContext/types.js';
 import { Ok, defineCodeError } from '../result.js';
+import { resolveMessage } from '../resolveMessage.js';
 import {
   RUNTIME_HINT_ANALYZED_VALID,
   RUNTIME_HINT_CAPABILITIES_MASK,
@@ -142,11 +143,11 @@ function bufferSnapshot(tracer: TestTracer<typeof context>) {
   if (!child) throw new Error('missing completed child buffer');
   return {
     rootEntryTypes: Array.from(root.entry_type.subarray(0, root._writeIndex)),
-    rootMessages: root.message_values.slice(0, root._writeIndex),
+    rootMessages: Array.from({ length: root._writeIndex }, (_, row) => resolveMessage(root, row)),
     rootMarkers: root.marker_values.slice(0, root._writeIndex),
     rootErrorCodes: root.error_code_values.slice(0, root._writeIndex),
     childEntryTypes: Array.from(child.entry_type.subarray(0, child._writeIndex)),
-    childMessages: child.message_values.slice(0, child._writeIndex),
+    childMessages: Array.from({ length: child._writeIndex }, (_, row) => resolveMessage(child, row)),
   };
 }
 

@@ -5,6 +5,7 @@ import { defineOpContext } from '../defineOpContext.js';
 import { createRemapDescriptor } from '../library.js';
 import { getPhysicalLayoutPlan, PHYSICAL_LAYOUT_VERSION } from '../physicalLayoutPlan.js';
 import type { OpContext } from '../opContext/types.js';
+import { resolveMessage } from '../resolveMessage.js';
 import {
   RUNTIME_HINT_ANALYZED_VALID,
   RUNTIME_HINT_LOG,
@@ -161,7 +162,7 @@ describe('PhysicalLayoutPlan', () => {
         ctx.tag.userId('planned-user');
         ctx.log.info('planned-log');
         writtenUsers.push(ctx.buffer.userId_values[0]);
-        writtenMessages.push(ctx.buffer.message_values[2]);
+        writtenMessages.push(resolveMessage(ctx.buffer, 2));
         return ctx.ok('done');
       },
       undefined,

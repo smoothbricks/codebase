@@ -18,7 +18,7 @@ import type { BufferStrategy } from '../bufferStrategy.js';
 import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import type { OpMetadata } from '../opContext/opTypes.js';
 import type { LogSchema } from '../schema/LogSchema.js';
-import { EMPTY_SCOPE } from '../spanBuffer.js';
+import { EMPTY_SCOPE, type SpanBufferConstructor } from '../spanBuffer.js';
 import type { ITraceRoot } from '../traceRoot.js';
 import type { AnySpanBuffer, SpanBuffer } from '../types.js';
 import { createWasmAllocator, type WasmAllocator, type WasmAllocatorOptions } from './wasmAllocator.js';
@@ -98,15 +98,22 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
     return new WasmBufferStrategy<T>(allocator);
   }
 
-  createSpanBuffer(schema: T, traceRoot: ITraceRoot<T>, opMetadata: OpMetadata, capacity?: number): SpanBuffer<T> {
+  createSpanBuffer(
+    schema: T,
+    traceRoot: ITraceRoot<T>,
+    opMetadata: OpMetadata,
+    capacity?: number,
+    plannedClass?: SpanBufferConstructor<T>,
+  ): SpanBuffer<T> {
     const effectiveCapacity = capacity ?? this.allocator.capacity;
-
+    const messageLayoutFamily = plannedClass?.messageLayoutFamily ?? 'mixed';
     // Create WASM buffer
     const wasmBuffer = createWasmSpanBuffer(
       schema,
       {
         allocator: this.allocator,
         capacity: effectiveCapacity,
+        messageLayoutFamily,
         trace_id: traceRoot.trace_id,
         // thread_id and span_id come from WASM (global header and allocator respectively)
         thread_id: 0n, // Will be read from WASM header
@@ -128,12 +135,14 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
     opMetadata: OpMetadata,
     capacity?: number,
     schema?: T,
+    plannedClass?: SpanBufferConstructor<T>,
   ): SpanBuffer<T> {
     const wasmParent = requireWasmSpanBuffer<T>(parentBuffer);
     const effectiveCapacity = capacity ?? wasmParent._capacity;
 
     // Use provided schema (for cross-library calls) or parent's schema
     const childSchema = schema ?? parentBuffer._logSchema;
+    const messageLayoutFamily = plannedClass?.messageLayoutFamily ?? wasmParent._messageLayoutFamily;
 
     const child = createWasmChildSpanBuffer(
       wasmParent,
@@ -143,6 +152,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
         thread_id: 0n, // Will be read from WASM header
         span_id: 0, // Will be assigned by WASM allocator
         schema: childSchema, // Pass schema for correct buffer class
+        messageLayoutFamily,
       },
       parentBuffer._traceRoot, // _traceRoot (inherit from parent)
       parentBuffer._scopeValues, // _scopeValues (inherit from parent)

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from 'bun:test';
 import { S as ArrowS, Nanoseconds } from '@smoothbricks/arrow-builder';
 import fc from 'fast-check';
 import { createTestOpMetadata, TEST_TRACER } from '../../__tests__/test-helpers.js';
+import { resolveMessage } from '../../resolveMessage.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { EMPTY_SCOPE } from '../../spanBuffer.js';
@@ -105,7 +106,10 @@ describe('WasmSpanBuffer', () => {
           expect(Object.isFrozen(layout)).toBe(true);
           expect(layout.system.timestampOffset).toBe(0);
           expect(layout.system.entryTypeOffset).toBe(capacity * 8);
-          expect(layout.system.byteLength).toBe(capacity * 9);
+          const logHeaderOffset = (capacity * 9 + 3) & ~3;
+          expect(layout.messageLayoutFamily).toBe('mixed');
+          expect(layout.system.logHeaderOffset).toBe(logHeaderOffset);
+          expect(layout.system.byteLength).toBe(logHeaderOffset + capacity * Uint32Array.BYTES_PER_ELEMENT);
 
           for (const family of ['u8', 'u32', 'f64'] as const) {
             const slab = layout.slabs[family];
@@ -331,10 +335,9 @@ describe('WasmSpanBuffer', () => {
       buffer.message(0, 'span-start message');
       buffer.message(1, 'span-end message');
       buffer.message(2, 'log entry');
-
-      expect(buffer._message[0]).toBe('span-start message');
-      expect(buffer._message[1]).toBe('span-end message');
-      expect(buffer._message[2]).toBe('log entry');
+      expect(resolveMessage(buffer, 0)).toBe('span-start message');
+      expect(resolveMessage(buffer, 1)).toBe('span-end message');
+      expect(resolveMessage(buffer, 2)).toBe('log entry');
     });
 
     it('returns this for chaining', () => {
