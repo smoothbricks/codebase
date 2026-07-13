@@ -2476,3 +2476,59 @@ fn publication_failpoints_converge_for_clone_and_adopt_callers() {
             .expect("recovery convergence");
     }
 }
+
+#[test]
+fn persistent_parent_fsync_failure_never_restores_adopt_source_beside_canonical_pair() {
+    let fixture = Fixture::new("persistent-adopt-fsync");
+    let config = fixture.config();
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    let staged = layout
+        .project()
+        .project_root
+        .join(".staging/main-00000000000000000000000000000001.sparseimage");
+    create_image(&staged, ImageFormat::Sparse);
+    std::fs::write(&staged, b"durable adopted generation").expect("staged bytes");
+    std::fs::create_dir_all(&config.main_mount).expect("source");
+    std::fs::write(config.main_mount.join("tracked"), b"irreplaceable original")
+        .expect("source bytes");
+    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.main_mount.display()));
+    let host = native_host(&fixture, RecordingRunner::default());
+    host.set_restore_failpoint(RestoreFailpoint::PersistentCanonicalParentFsyncFailure);
+    let error = host
+        .publish_adopt(&config.main_mount, &pre_cowshed, &staged, canonical.image())
+        .expect_err("persistent fsync remains uncertain");
+    assert!(matches!(error, ApfsStorageError::Cleanup { .. }));
+    assert!(canonical.image().exists());
+    assert!(sidecar_path(canonical.image()).exists());
+    assert_eq!(
+        std::fs::read(pre_cowshed.join("tracked")).expect("preserved original"),
+        b"irreplaceable original"
+    );
+    assert!(!config.main_mount.join("tracked").exists());
+    assert!(config.main_mount.join(".envrc").exists());
+
+    drop(host);
+    let restarted = native_host(&fixture, RecordingRunner::default());
+    restarted
+        .recover_pending(&config, &[])
+        .expect("fresh-host recovery");
+    restarted.gc(&config).expect("fresh-host GC");
+    for _ in 0..2 {
+        let facts = restarted.list(&repo()).expect("idempotent list");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(
+            std::fs::read(canonical.image()).expect("canonical bytes"),
+            b"durable adopted generation"
+        );
+        assert_eq!(
+            std::fs::read(pre_cowshed.join("tracked")).expect("preserved original"),
+            b"irreplaceable original"
+        );
+        assert!(!config.main_mount.join("tracked").exists());
+        assert!(config.main_mount.join(".envrc").exists());
+        restarted
+            .recover_pending(&config, &[])
+            .expect("repeated recovery");
+    }
+}
