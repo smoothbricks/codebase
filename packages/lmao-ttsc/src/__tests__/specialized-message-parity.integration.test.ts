@@ -15,15 +15,14 @@ interface FixtureResult {
   checksum: string;
   segments: Array<{ capacity: number; writeIndex: number; physicalLayout: 'current' | 'specialized' }>;
   physicalLayout: 'current' | 'specialized';
+  messageIdentityStorage: 'local-u16' | 'global-u32' | 'packed-row-headers';
   hasRowHeaders: boolean;
   hasEntryType: boolean;
   hasLogHeaders: boolean;
   hasMessageIds: boolean;
   hasMessageValidity: boolean;
   hasRawMessages: boolean;
-  encodedMessageIdentities: [number, number];
   rawMessageSentinels: [string | null, string | null];
-  localMessageDictionaryLength: number;
 }
 
 async function buildFixture(
@@ -130,18 +129,18 @@ test('plugin ON selects specialized capacity-64 static-50 while OFF stays curren
     expect(pluginOn.segments).toEqual([{ capacity: 64, writeIndex: 64, physicalLayout: 'specialized' }]);
     expect(pluginOff).toMatchObject({
       physicalLayout: 'current',
+      messageIdentityStorage: 'local-u16',
       hasRowHeaders: false,
       hasEntryType: true,
       hasLogHeaders: false,
       hasMessageIds: true,
       hasMessageValidity: false,
       hasRawMessages: true,
-      encodedMessageIdentities: [0, 0],
       rawMessageSentinels: ['static-00', 'dynamic-00'],
-      localMessageDictionaryLength: 0,
     });
     expect(pluginOn).toMatchObject({
       physicalLayout: 'specialized',
+      messageIdentityStorage: 'global-u32',
       hasRowHeaders: false,
       hasEntryType: true,
       hasLogHeaders: true,
@@ -149,10 +148,7 @@ test('plugin ON selects specialized capacity-64 static-50 while OFF stays curren
       hasMessageValidity: false,
       hasRawMessages: true,
       rawMessageSentinels: [null, 'dynamic-00'],
-      localMessageDictionaryLength: 0,
     });
-    expect(pluginOn.encodedMessageIdentities[0]).toBeGreaterThan(0);
-    expect(pluginOn.encodedMessageIdentities[1]).toBe(0);
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }

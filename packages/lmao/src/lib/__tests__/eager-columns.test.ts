@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'bun:test';
 import fc from 'fast-check';
+import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
+import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import { createRemapDescriptor } from '../library.js';
 import {
   getPhysicalLayoutPlan,
@@ -201,12 +203,15 @@ describe('compiler-proven eager user columns', () => {
         `exact-${capacity}`,
         (ctx) => {
           observed.push(ctx.buffer);
-          ctx.tag.proven(`capacity-${capacity}`);
+          for (let index = 0; index < 8; index++) {
+            ctx.log.debug(`capacity-${capacity}-${index}`).proven(`capacity-${capacity}-${index}`);
+          }
           return ctx.ok(capacity);
         },
         undefined,
         {
-          runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_TAG | RUNTIME_HINT_RESULT | capacity,
+          runtimeHint:
+            RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_LOG | RUNTIME_HINT_RESULT | RUNTIME_HINT_TAG | capacity,
           eagerColumns: ['proven'],
         },
       );
@@ -220,7 +225,22 @@ describe('compiler-proven eager user columns', () => {
 
       expect(runtimeHintInitialCapacity(exactOp.callsitePlan.runtimeHint)).toBe(capacity);
       expect(observed.map((buffer) => buffer._capacity)).toEqual([capacity, capacity]);
+      expect(observed).toHaveLength(2);
       for (const buffer of observed) {
+        expect(buffer.constructor).toBe(exactOp.callsitePlan.SpanBufferClass);
+        const overflow = buffer._overflow;
+        if (!overflow) throw new Error(`Expected exact capacity ${capacity} to overflow`);
+        expect(overflow.constructor).toBe(exactOp.callsitePlan.SpanBufferClass);
+        expect(overflow._identity).toBe(buffer._identity);
+
+        const table = convertSpanTreeToArrowTable(buffer);
+        const proven = table.getChild('proven');
+        if (!proven) throw new Error('Expected proven Arrow column');
+        expect(
+          Array.from({ length: table.numRows }, (_, row) => proven.get(row)).filter(
+            (value): value is string => typeof value === 'string',
+          ),
+        ).toEqual(Array.from({ length: 8 }, (_, index) => `capacity-${capacity}-${index}`));
         expectCompilerEagerStorage(buffer, 'proven');
         expectLazyStorage(buffer, 'lazy');
       }
@@ -259,6 +279,39 @@ describe('compiler-proven eager user columns', () => {
     expect(runtimeHintInitialCapacity(RUNTIME_HINT_ANALYZED_VALID | 1)).toBeUndefined();
     expect(adaptiveBuffers.map((buffer) => buffer._capacity)).toEqual([8, 13]);
     for (const buffer of adaptiveBuffers) expectLazyStorage(buffer, 'proven');
+  });
+
+  it('rejects schema-incompatible planned classes before root or child allocation', () => {
+    const incompatibleContext = defineOpContext({ logSchema: defineLogSchema({ left: S.number() }) });
+    const compatibleContext = defineOpContext({ logSchema: defineLogSchema({ right: S.number() }) });
+    const incompatibleOp = incompatibleContext.defineOp('incompatible-plan', (ctx) => ctx.ok(null));
+    const compatibleOp = compatibleContext.defineOp('compatible-plan', (ctx) => ctx.ok(null));
+    const schema = compatibleOp.callsitePlan.schema;
+    const traceRoot = createTestTraceRoot('schema-mismatch');
+    const parent = createSpanBuffer(
+      schema,
+      traceRoot,
+      compatibleOp.metadata,
+      8,
+      compatibleOp.callsitePlan.SpanBufferClass,
+    );
+    const incompatibleStats = incompatibleOp.callsitePlan.SpanBufferClass.stats;
+    const spansCreated = incompatibleStats.spansCreated;
+
+    expect(() => createSpanBuffer(schema, traceRoot, incompatibleOp.metadata)).toThrow(
+      'Planned SpanBuffer class does not match schema',
+    );
+    const strategy = new JsBufferStrategy<typeof schema>();
+    expect(() =>
+      strategy.createChildSpanBuffer(
+        parent,
+        compatibleOp.metadata,
+        incompatibleOp.metadata,
+        undefined,
+        schema,
+      ),
+    ).toThrow('Planned SpanBuffer class does not match schema');
+    expect(incompatibleStats.spansCreated).toBe(spansCreated);
   });
 
   it('keeps plugin-off metadata all-lazy', () => {
