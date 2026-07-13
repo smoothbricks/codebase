@@ -587,7 +587,7 @@ describe('WasmSpanBuffer', () => {
       overflow.provenNumber(3, null);
 
       const jsBuffer = createSpanBuffer(
-        compilerEagerSchema,
+        planSchema,
         createTestTraceRoot('compiler-eager-js'),
         compilerEagerOp.metadata,
         CAPACITY,
