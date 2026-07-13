@@ -44,13 +44,13 @@ const CHECKPOINT_FACT_SUFFIX: &str = ".checkpoint.json";
 const SELF_HEALING_STUB: &[u8] = b"cowshed ensure --attach\n";
 
 const ROOT_OPEN_FLAGS: libc::c_int =
-    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    libc::O_RDONLY + libc::O_DIRECTORY + libc::O_NOFOLLOW + libc::O_CLOEXEC;
 const DIRECTORY_OPEN_FLAGS: libc::c_int =
-    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    libc::O_RDONLY + libc::O_DIRECTORY + libc::O_NOFOLLOW + libc::O_CLOEXEC;
 const LOCK_FILE_OPEN_FLAGS: libc::c_int =
-    libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    libc::O_RDWR + libc::O_CREAT + libc::O_NOFOLLOW + libc::O_CLOEXEC;
 const WAIT_LOCK_OPERATION: libc::c_int = libc::LOCK_EX;
-const TRY_LOCK_OPERATION: libc::c_int = libc::LOCK_EX | libc::LOCK_NB;
+const TRY_LOCK_OPERATION: libc::c_int = libc::LOCK_EX + libc::LOCK_NB;
 const LOCK_FILE_MODE: libc::c_uint = 0o600;
 const CONTROLLER_DIRECTORY_MODE: libc::mode_t = 0o700;
 
@@ -356,26 +356,6 @@ pub enum RestoreFailpoint {
     PersistentCanonicalParentFsyncFailure = 9,
 }
 
-fn store_directory_exists(store_root: &Path) -> Result<bool, ApfsStorageError> {
-    match fs::symlink_metadata(store_root) {
-        Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
-        Ok(_) => Err(ApfsStorageError::Host(format!(
-            "APFS store root is not a directory: {}",
-            store_root.display()
-        ))),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(io_error("inspect APFS store root", store_root, error)),
-    }
-}
-
-fn directory_exists_no_follow(directory: &Path) -> Result<bool, ApfsStorageError> {
-    match fs::symlink_metadata(directory) {
-        Ok(metadata) => Ok(metadata.file_type().is_dir()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(io_error("inspect recovery directory", directory, error)),
-    }
-}
-
 fn directory_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
     match fs::symlink_metadata(directory) {
         Ok(metadata) if metadata.file_type().is_dir() => {}
@@ -462,9 +442,6 @@ fn staged_image_format(path: &Path) -> Option<ImageFormat> {
 }
 fn collect_project_directories(store_root: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
     let mut projects = Vec::new();
-    if !store_directory_exists(store_root)? {
-        return Ok(projects);
-    }
     for owner in directory_children(store_root)? {
         let Some(owner_name) = owner.file_name().and_then(|name| name.to_str()) else {
             continue;
@@ -475,13 +452,7 @@ fn collect_project_directories(store_root: &Path) -> Result<Vec<PathBuf>, ApfsSt
         ) {
             continue;
         }
-        for project in directory_children(&owner)? {
-            if directory_exists_no_follow(&project.join("checkpoints"))?
-                || directory_exists_no_follow(&project.join(super::STAGING_NAMESPACE))?
-            {
-                projects.push(project);
-            }
-        }
+        projects.extend(directory_children(&owner)?);
     }
     Ok(projects)
 }
@@ -2659,9 +2630,6 @@ where
         }
         self.recover_pending(config, &[])?;
         let mut report = StorageGcReport::default();
-        if !store_directory_exists(&config.store_root)? {
-            return Ok(report);
-        }
         for owner in directory_children(&config.store_root)? {
             if owner == config.caches_root
                 || owner.file_name().is_some_and(|name| {
