@@ -283,7 +283,6 @@ fn staged_image_format(path: &Path) -> Option<ImageFormat> {
     WorkspaceIncarnation::new(incarnation).ok()?;
     Some(format)
 }
-
 fn collect_project_directories(store_root: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
     let mut projects = Vec::new();
     if !store_directory_exists(store_root)? {

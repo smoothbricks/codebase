@@ -1558,6 +1558,179 @@ fn gc_does_not_follow_symlinked_owner_repository_staging_or_image_paths() {
 }
 
 #[test]
+fn adopt_publication_moves_source_aside_writes_stub_and_publishes_image_atomically() {
+    let fixture = Fixture::new("adopt-publication");
+    let config = fixture.config();
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    let staged = layout
+        .project()
+        .project_root
+        .join(".staging/main-00000000000000000000000000000001.sparseimage");
+    create_image(&staged, ImageFormat::Sparse);
+    std::fs::create_dir_all(&config.main_mount).expect("source");
+    std::fs::write(config.main_mount.join("tracked"), b"source").expect("source file");
+    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.main_mount.display()));
+
+    native_host(&fixture, RecordingRunner::default())
+        .publish_adopt(&config.main_mount, &pre_cowshed, &staged, canonical.image())
+        .expect("publish adopt");
+
+    assert_eq!(
+        std::fs::read(pre_cowshed.join("tracked")).expect("retained source"),
+        b"source"
+    );
+    assert_eq!(
+        std::fs::read(config.main_mount.join(".envrc")).expect("stub"),
+        b"cowshed ensure --attach\n"
+    );
+    assert!(canonical.image().exists());
+    assert!(sidecar_path(canonical.image()).exists());
+    assert!(!staged.exists());
+}
+
+#[test]
+fn adopt_recovery_waits_for_handoff_then_completes_publication_after_restart() {
+    let before = Fixture::new("adopt-before-handoff");
+    let before_config = before.config();
+    let before_layout = StorageLayout::new(&before.root, &repo()).expect("layout");
+    let before_canonical = before_layout
+        .main_image(ImageFormat::Sparse)
+        .expect("canonical");
+    let before_staged = before_layout
+        .project()
+        .project_root
+        .join(".staging/main-00000000000000000000000000000001.sparseimage");
+    create_image(&before_staged, ImageFormat::Sparse);
+    std::fs::create_dir_all(&before_config.main_mount).expect("source");
+    std::fs::write(before_config.main_mount.join("tracked"), b"source").expect("source file");
+    let before_host = native_host(&before, RecordingRunner::default());
+    before_host
+        .recover_pending(&before_config)
+        .expect("pre-handoff recovery");
+    assert!(before_staged.exists());
+    assert!(!before_canonical.image().exists());
+    let cleanup = before_host.gc(&before_config).expect("staging cleanup");
+    assert_eq!(cleanup.examined, 1);
+    assert_eq!(cleanup.reclaimed, 1);
+    assert!(!before_staged.exists());
+    assert!(!sidecar_path(&before_staged).exists());
+    assert_eq!(
+        std::fs::read(before_config.main_mount.join("tracked")).expect("original source"),
+        b"source"
+    );
+
+    let after = Fixture::new("adopt-after-handoff");
+    let after_config = after.config();
+    let after_layout = StorageLayout::new(&after.root, &repo()).expect("layout");
+    let after_canonical = after_layout
+        .main_image(ImageFormat::Sparse)
+        .expect("canonical");
+    let after_staged = after_layout
+        .project()
+        .project_root
+        .join(".staging/main-00000000000000000000000000000001.sparseimage");
+    create_image(&after_staged, ImageFormat::Sparse);
+    std::fs::create_dir_all(&after_config.main_mount).expect("source");
+    std::fs::write(after_config.main_mount.join("tracked"), b"source").expect("source file");
+    let after_pre = PathBuf::from(format!("{}.pre-cowshed", after_config.main_mount.display()));
+    std::fs::rename(&after_config.main_mount, &after_pre).expect("simulate handoff crash");
+
+    native_host(&after, RecordingRunner::default())
+        .recover_pending(&after_config)
+        .expect("post-handoff recovery");
+    assert!(after_canonical.image().exists());
+    assert!(!after_staged.exists());
+    assert_eq!(
+        std::fs::read(after_config.main_mount.join(".envrc")).expect("stub"),
+        b"cowshed ensure --attach\n"
+    );
+    assert_eq!(
+        std::fs::read(after_pre.join("tracked")).expect("retained source"),
+        b"source"
+    );
+}
+
+#[test]
+fn checkpoint_pin_facts_survive_restart_and_gc_prunes_only_old_automatic_excess() {
+    let fixture = Fixture::new("checkpoint-retention");
+    let config = fixture.config();
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let main = WorkspaceName::new("main").expect("main");
+    let host = native_host(&fixture, RecordingRunner::default());
+    let create_checkpoint = |name: &str, revision: u64, pin: Pin| {
+        let label = CheckpointLabel::new(name).expect("label");
+        let image = layout
+            .checkpoint_image(&main, &label, ImageFormat::Sparse)
+            .expect("checkpoint")
+            .image()
+            .to_owned();
+        create_image(&image, ImageFormat::Sparse);
+        host.publish_checkpoint_fact(&image, &label, Revision::new(revision), pin)
+            .expect("checkpoint fact");
+        image
+    };
+
+    let mut newest_five = Vec::new();
+    for index in 0..5 {
+        let image = create_checkpoint(&format!("future-{index}"), index + 1, Pin::Automatic);
+        make_future(&image);
+        newest_five.push(image);
+    }
+    let young = create_checkpoint("young", 6, Pin::Automatic);
+    let expired = create_checkpoint("expired", 7, Pin::Automatic);
+    make_old(&expired);
+    let pinned = create_checkpoint("pinned-old", 8, Pin::Pinned);
+    make_old(&pinned);
+    drop(host);
+
+    let restarted = native_host(&fixture, RecordingRunner::default());
+    let facts = restarted.checkpoints(&repo()).expect("restart facts");
+    assert_eq!(facts.len(), 8);
+    assert!(facts.iter().any(|fact| {
+        fact.label.as_str() == "young"
+            && fact.revision == Revision::new(6)
+            && fact.pin == Pin::Automatic
+    }));
+    assert!(facts.iter().any(|fact| {
+        fact.label.as_str() == "pinned-old"
+            && fact.revision == Revision::new(8)
+            && fact.pin == Pin::Pinned
+    }));
+
+    let report = restarted.gc(&config).expect("gc");
+    assert_eq!(report.examined, 8);
+    assert_eq!(report.reclaimed, 1);
+    assert_eq!(report.retained_pinned, 1);
+    assert_eq!(report.retained_recent, 6);
+    assert!(newest_five.iter().all(|image| image.exists()));
+    assert!(
+        young.exists(),
+        "young checkpoint must survive beyond newest five"
+    );
+    assert!(pinned.exists(), "old pinned checkpoint must survive");
+    assert!(
+        !expired.exists(),
+        "old automatic checkpoint beyond five is pruned"
+    );
+    assert!(!sidecar_path(&expired).exists(), "grants sidecar is pruned");
+    assert!(
+        !checkpoint_fact_path(&expired).exists(),
+        "checkpoint fact sidecar is pruned"
+    );
+
+    let surviving = restarted.checkpoints(&repo()).expect("surviving facts");
+    assert_eq!(surviving.len(), 7);
+    assert_eq!(
+        surviving
+            .iter()
+            .filter(|fact| fact.pin == Pin::Pinned)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn recovery_ignores_unscoped_and_non_internal_restore_lookalikes() {
     let fixture = Fixture::new("restore-lookalikes");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
