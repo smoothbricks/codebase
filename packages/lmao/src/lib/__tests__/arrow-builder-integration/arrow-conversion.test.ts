@@ -28,7 +28,6 @@ import {
   ENTRY_TYPE_WARN,
 } from '../../schema/systemSchema.js';
 import { createChildSpanBuffer, createOverflowBuffer, createSpanBuffer, getSpanBufferClass } from '../../spanBuffer.js';
-import type { SpanBuffer } from '../../types.js';
 import { getColumnValue, getRawTimestamp } from '../arrow-test-helpers.js';
 import { createTestOpMetadata, createTestSchema, createTestTraceRoot } from '../test-helpers.js';
 
@@ -249,14 +248,13 @@ describe('Arrow Table Conversion', () => {
       parentBuffer.spanType(0, 'parent');
       parentBuffer._writeIndex = 1;
 
-      // Create child span and register with parent
+      // Create child span; the factory registers it with the parent topology.
       const childBuffer = createChildSpanBuffer(
         parentBuffer,
         SpanBufferClass,
         DEFAULT_METADATA,
         DEFAULT_METADATA,
-      ) as SpanBuffer<typeof schema>;
-      parentBuffer._children.push(childBuffer); // Explicit registration per spanBuffer.ts
+      );
 
       childBuffer.timestamp[0] = 1500n;
       childBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
@@ -306,9 +304,8 @@ describe('Arrow Table Conversion', () => {
       parentBuffer.message(0, 'parent');
       parentBuffer._writeIndex = 1;
 
-      // Create first child and register with parent
+      // Create first child; the factory registers it with the parent topology.
       const child1Buffer = createChildSpanBuffer(parentBuffer, SpanBufferClass, DEFAULT_METADATA, DEFAULT_METADATA);
-      parentBuffer._children.push(child1Buffer); // Explicit registration per spanBuffer.ts
       child1Buffer.timestamp[0] = 1100n;
       child1Buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       child1Buffer.message(0, 'child-1');
@@ -317,9 +314,8 @@ describe('Arrow Table Conversion', () => {
       child1Buffer.message(1, 'child-1');
       child1Buffer._writeIndex = 2;
 
-      // Create second child and register with parent
+      // Create second child; the factory preserves sibling insertion order.
       const child2Buffer = createChildSpanBuffer(parentBuffer, SpanBufferClass, DEFAULT_METADATA, DEFAULT_METADATA);
-      parentBuffer._children.push(child2Buffer); // Explicit registration per spanBuffer.ts
       child2Buffer.timestamp[0] = 1300n;
       child2Buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       child2Buffer.message(0, 'child-2');

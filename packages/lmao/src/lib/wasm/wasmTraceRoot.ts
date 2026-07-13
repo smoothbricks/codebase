@@ -24,6 +24,7 @@ import type {
 } from '../traceRoot.js';
 import type { AnySpanBuffer } from '../types.js';
 import type { WasmAllocator } from './wasmAllocator.js';
+import { TraceTopology } from '../traceTopology.js';
 
 // Spec link (88): realizes specs/lmao/01q_wasm_memory_architecture.md#smoo/lmao!n/wasm-mem (span lifecycle writer).
 //#region smoo/lmao!n/wasm-mem.trace-root
@@ -136,6 +137,7 @@ export class WasmTraceRoot<T extends LogSchema = LogSchema> implements ITraceRoo
 
   /** Tracer reference for lifecycle hooks */
   readonly tracer: TracerLifecycleHooks<T>;
+  readonly _topology: TraceTopology;
   readonly _timestampNow = timestampNow;
   readonly _appendLogEntry = appendLogEntry;
   readonly _writeSpanStart = writeSpanStartPrimitive;
@@ -151,6 +153,7 @@ export class WasmTraceRoot<T extends LogSchema = LogSchema> implements ITraceRoo
     this.allocator = allocator;
     this.trace_id = trace_id;
     this.tracer = tracer;
+    this._topology = new TraceTopology();
 
     this._system = new ArrayBuffer(16);
     // Native TraceRoot is exactly two aligned 8-byte fields.

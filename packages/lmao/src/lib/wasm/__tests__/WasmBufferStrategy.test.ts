@@ -8,6 +8,7 @@ import { resolveMessage } from '../../resolveMessage.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import type { TracerLifecycleHooks } from '../../traceRoot.js';
+import { NO_NODE, iterateSpanChildren, iterateSpanTree } from '../../traceTopology.js';
 import { WasmBufferStrategy } from '../WasmBufferStrategy.js';
 import { createWasmAllocator } from '../wasmAllocator.js';
 import { createWasmTraceRoot } from '../wasmTraceRoot.js';
@@ -128,9 +129,13 @@ describe('WasmBufferStrategy', () => {
       expect(resolveMessage(child, 0)).toBe('child-span');
       expect(child.trace_id).toBe(parent.trace_id);
       expect(child.parent_span_id).toBe(parent.span_id);
-      // Note: parent._children is NOT populated by the strategy - SpanContext handles that.
-      // The strategy only sets up the parent-child relationship via child._parent.
       expect(child._parent).toBe(parent);
+
+      const children = iterateSpanChildren(parent);
+      const registered = children.next();
+      if (registered.done) throw new Error('topology did not register the child span');
+      expect(registered.value).toBe(child);
+      expect(children.next().done).toBe(true);
     });
 
     it('inherits capacity from parent by default', async () => {
@@ -169,10 +174,49 @@ describe('WasmBufferStrategy', () => {
 
       expect(overflow).toBeDefined();
       expect(overflow._capacity).toBe(buffer._capacity);
-      // Note: Currently overflow allocates its own identity block with new span_id
-      // TODO: Overflow should share identity with parent buffer
       expect(overflow.trace_id).toBe(buffer.trace_id);
+      expect(overflow.span_id).toBe(buffer.span_id);
+      expect(overflow.parent_span_id).toBe(buffer.parent_span_id);
+      expect(overflow._nodeIndex).toBe(buffer._nodeIndex);
+      expect(overflow._topologyGeneration).toBe(buffer._topologyGeneration);
+      expect(traceRoot._topology.count).toBe(1);
       expect(buffer._overflow).toBe(overflow);
+      expect(Array.from(iterateSpanTree(buffer))).toEqual([buffer, overflow]);
+    });
+  });
+
+  describe('trace topology', () => {
+    it('registers many siblings in insertion order while growing every topology lane', async () => {
+      const traceRoot = createWasmTraceRoot(strategy.allocator, 'many-siblings-trace', mockTracer);
+      const root = strategy.createSpanBuffer(testSchema, traceRoot, testMetadata);
+      const siblingCount = 257;
+      const legacyChildLane = ['_', 'children'].join('');
+      expect(Reflect.has(root, legacyChildLane)).toBe(false);
+
+      for (let index = 0; index < siblingCount; index++) {
+        const child = strategy.createChildSpanBuffer(root, testMetadata, testMetadata);
+        child.message(0, `child-${index}`);
+        expect(child._nodeIndex).toBe(index + 1);
+      }
+
+      const topology = traceRoot._topology;
+      expect(topology.count).toBe(siblingCount + 1);
+      expect(topology.buffers.length).toBeGreaterThanOrEqual(siblingCount + 1);
+      expect(topology.firstChild.length).toBe(topology.buffers.length);
+      expect(topology.lastChild.length).toBe(topology.buffers.length);
+      expect(topology.nextSibling.length).toBe(topology.buffers.length);
+      expect(topology.firstChild[root._nodeIndex]).toBe(1);
+      expect(topology.lastChild[root._nodeIndex]).toBe(siblingCount);
+      expect(topology.nextSibling[siblingCount]).toBe(NO_NODE);
+
+      let observed = 0;
+      for (const child of iterateSpanChildren(root)) {
+        expect(child._nodeIndex).toBe(observed + 1);
+        expect(resolveMessage(child, 0)).toBe(`child-${observed}`);
+        expect(Reflect.has(child, legacyChildLane)).toBe(false);
+        observed++;
+      }
+      expect(observed).toBe(siblingCount);
     });
   });
 
@@ -220,6 +264,54 @@ describe('WasmBufferStrategy', () => {
       // Should have freed both buffers
       expect(statsAfter.freeCount).toBeGreaterThan(statsBefore.freeCount);
     });
+
+    it('releases and resets chains deeper than recursive walkers can traverse', async () => {
+      const deepSchema = defineLogSchema({});
+      const deepStrategy = await WasmBufferStrategy.create<typeof deepSchema>({
+        capacity: 8,
+        initialPages: 16,
+        maxPages: 256,
+      });
+      const deepTracer: TracerLifecycleHooks<typeof deepSchema> = {
+        onTraceStart: () => {},
+        onTraceEnd: () => {},
+        onSpanStart: () => {},
+        onSpanEnd: () => {},
+        onStatsWillResetFor: () => {},
+        getFlagEvaluatorForContext: () => undefined,
+        bufferStrategy: deepStrategy,
+      };
+      const depth = 20_000;
+      const buildChain = (traceId: string) => {
+        const traceRoot = createWasmTraceRoot(deepStrategy.allocator, traceId, deepTracer);
+        const root = deepStrategy.createSpanBuffer(deepSchema, traceRoot, testMetadata);
+        let leaf = root;
+        for (let level = 0; level < depth; level++) {
+          leaf = deepStrategy.createChildSpanBuffer(leaf, testMetadata, testMetadata);
+        }
+        return { leaf, root, topology: traceRoot._topology };
+      };
+
+      const released = buildChain('deep-release-trace');
+      const releaseGeneration = released.topology.generation;
+      expect(released.topology.count).toBe(depth + 1);
+      deepStrategy.releaseBuffer(released.root);
+      expect(released.topology.count).toBe(0);
+      expect(released.topology.root).toBe(NO_NODE);
+      expect(released.topology.generation).toBe(releaseGeneration + 1);
+      expect(() => released.topology.assertLive(released.leaf)).toThrow(/stale/);
+      expect(() => deepStrategy.releaseBuffer(released.root)).toThrow(/stale/);
+
+      const reset = buildChain('deep-reset-trace');
+      const resetGeneration = reset.topology.generation;
+      expect(reset.topology.count).toBe(depth + 1);
+      deepStrategy.reset();
+      expect(reset.topology.count).toBe(0);
+      expect(reset.topology.root).toBe(NO_NODE);
+      expect(reset.topology.generation).toBe(resetGeneration + 1);
+      expect(() => reset.topology.assertLive(reset.leaf)).toThrow(/stale/);
+      expect(() => iterateSpanChildren(reset.root).next()).toThrow(/stale/);
+    });
   });
 
   describe('getStats()', () => {
@@ -239,11 +331,11 @@ describe('WasmBufferStrategy', () => {
 
   describe('reset()', () => {
     it('resets allocator state', async () => {
-      const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
+      const firstTraceRoot = createWasmTraceRoot(strategy.allocator, 'first-test-trace-id', mockTracer);
+      const secondTraceRoot = createWasmTraceRoot(strategy.allocator, 'second-test-trace-id', mockTracer);
 
-      // Create some buffers
-      strategy.createSpanBuffer(testSchema, traceRoot, testMetadata);
-      strategy.createSpanBuffer(testSchema, traceRoot, testMetadata);
+      strategy.createSpanBuffer(testSchema, firstTraceRoot, testMetadata);
+      strategy.createSpanBuffer(testSchema, secondTraceRoot, testMetadata);
 
       const statsBeforeReset = strategy.getStats();
       expect(statsBeforeReset.allocCount).toBeGreaterThan(0);
@@ -259,21 +351,27 @@ describe('WasmBufferStrategy', () => {
       const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
       const root = strategy.createSpanBuffer(testSchema, traceRoot, testMetadata);
       const child = strategy.createChildSpanBuffer(root, testMetadata, testMetadata);
-      root._children.push(child);
       const overflow = strategy.createOverflowBuffer(root);
       root.timestamp[0] = 11n;
       child.timestamp[0] = 22n;
       overflow.timestamp[0] = 33n;
+      const topologyGeneration = traceRoot._topology.generation;
 
       strategy.reset();
 
       expect(() => root.timestamp).toThrow(/generation .* released/);
       expect(() => child.timestamp).toThrow(/generation .* released/);
       expect(() => overflow.timestamp).toThrow(/generation .* released/);
+      expect(() => traceRoot._topology.assertLive(root)).toThrow(/stale/);
+      expect(() => traceRoot._topology.assertLive(child)).toThrow(/stale/);
+      expect(() => traceRoot._topology.assertLive(overflow)).toThrow(/stale/);
+      expect(() => iterateSpanChildren(root).next()).toThrow(/stale/);
+      expect(traceRoot._topology.generation).toBe(topologyGeneration + 1);
+      expect(traceRoot._topology.count).toBe(0);
+      expect(traceRoot._topology.root).toBe(NO_NODE);
       expect(strategy.getStats()).toEqual({ allocCount: 0, freeCount: 0, bumpPtr: 192, capacity: 64 });
 
-      strategy.releaseBuffer(root);
-      strategy.releaseBuffer(root);
+      expect(() => strategy.releaseBuffer(root)).toThrow(/stale/);
       expect(strategy.getStats()).toEqual({ allocCount: 0, freeCount: 0, bumpPtr: 192, capacity: 64 });
     });
   });

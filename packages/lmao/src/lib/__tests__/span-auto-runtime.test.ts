@@ -22,6 +22,7 @@ import {
   ENTRY_TYPE_SPAN_RETRY,
 } from '../schema/systemSchema.js';
 import { TestTracer } from '../tracers/TestTracer.js';
+import { iterateSpanChildren } from '../traceTopology.js';
 import { createTestTracerOptions } from './test-helpers.js';
 
 const schema = defineLogSchema({ marker: S.category() });
@@ -29,7 +30,7 @@ const opContext = defineOpContext({ logSchema: schema, ctx: { inheritedMarker: '
 const analyzedResult = RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_RESULT | 2;
 
 function childOf(tracer: TestTracer<typeof opContext>) {
-  const child = tracer.rootBuffers[0]?._children[0];
+  const [child] = iterateSpanChildren(tracer.rootBuffers[0]);
   if (!child) throw new Error('expected one child span buffer');
   return child;
 }
@@ -304,8 +305,8 @@ describe('runtime hint specialization', () => {
       return ctx.ok(null);
     });
 
-    const minimum = tracer.rootBuffers[0]._children[0];
-    const overflow = tracer.rootBuffers[0]._children[1];
+    const [minimum, overflow] = iterateSpanChildren(tracer.rootBuffers[0]);
+    if (!minimum || !overflow) throw new Error('expected minimum and overflow child spans');
     expect(minimum._capacity).toBe(2);
     expect(minimum._overflow).toBeUndefined();
     expect(overflow._capacity).toBe(3);

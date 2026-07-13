@@ -100,8 +100,7 @@ export class JsBufferStrategy<T extends LogSchema = LogSchema> implements Buffer
     return convertSpanTreeToArrowTable(buffer);
   }
 
-  releaseBuffer(_buffer: AnySpanBuffer): void {
-    // No-op for JS strategy - GC handles memory
-    // The buffer will be collected when no references remain
+  releaseBuffer(buffer: AnySpanBuffer): void {
+    buffer._traceRoot._topology.release();
   }
 }

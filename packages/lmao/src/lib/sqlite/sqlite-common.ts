@@ -4,6 +4,7 @@ import { resolveMessage } from '../resolveMessage.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import { getSchemaType } from '../schema/typeGuards.js';
 import type { AnySpanBuffer } from '../types.js';
+import { iterateSpanTree, NO_NODE } from '../traceTopology.js';
 
 export const SPANS_TABLE_INIT_SQL = `
   CREATE TABLE IF NOT EXISTS spans (
@@ -228,36 +229,23 @@ export function parseSqliteTableInfoRows(
   return rows.map((row, rowIndex) => parseSqliteTableInfoRow(row, boundary, rowIndex));
 }
 
-function* walkOverflowSegments(
-  buffer: AnySpanBuffer,
-  traceId: string,
-  spanId: number,
-  parentSpanId: number,
-  rowOffset: number,
-): Generator<SpanSegment> {
-  yield {
-    buffer,
-    traceId,
-    spanId,
-    parentSpanId,
-    rowOffset,
-  };
-
-  if (buffer._overflow) {
-    yield* walkOverflowSegments(buffer._overflow, traceId, spanId, parentSpanId, rowOffset + buffer._writeIndex);
-  }
-}
-
-function* walkTree(buffer: AnySpanBuffer): Generator<SpanSegment> {
-  yield* walkOverflowSegments(buffer, buffer.trace_id, buffer.span_id, buffer.parent_span_id, 0);
-
-  for (const child of buffer._children) {
-    yield* walkTree(child);
-  }
-}
-
 export function* walkSpanSegments(rootBuffer: AnySpanBuffer): Generator<SpanSegment> {
-  yield* walkTree(rootBuffer);
+  let logicalNode = NO_NODE;
+  let rowOffset = 0;
+  for (const buffer of iterateSpanTree(rootBuffer)) {
+    if (buffer._nodeIndex !== logicalNode) {
+      logicalNode = buffer._nodeIndex;
+      rowOffset = 0;
+    }
+    yield {
+      buffer,
+      traceId: buffer.trace_id,
+      spanId: buffer.span_id,
+      parentSpanId: buffer.parent_span_id,
+      rowOffset,
+    };
+    rowOffset += buffer._writeIndex;
+  }
 }
 
 export function getMissingSchemaColumns(

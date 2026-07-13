@@ -6,6 +6,7 @@ import { createTestTracerOptions } from '../../__tests__/test-helpers.js';
 import { convertSpanTreeToArrowTable } from '../../convertToArrow.js';
 import { resolveMessage } from '../../resolveMessage.js';
 import { defineLogSchema, defineOpContext, S } from '../../defineOpContext.js';
+import { iterateSpanChildren } from '../../traceTopology.js';
 import { ArrayQueueTracer } from '../ArrayQueueTracer.js';
 
 describe('ArrayQueueTracer', () => {
@@ -178,8 +179,11 @@ describe('ArrayQueueTracer', () => {
       await trace('root', parentOp);
 
       const [buffer] = tracer.drain();
-      expect(buffer._children).toHaveLength(1);
-      expect(resolveMessage(buffer._children[0], 0)).toBe('child-span');
+      const children = Array.from(iterateSpanChildren(buffer));
+      expect(children).toHaveLength(1);
+      const [child] = children;
+      if (!child) throw new Error('expected queued child span');
+      expect(resolveMessage(child, 0)).toBe('child-span');
     });
   });
 });

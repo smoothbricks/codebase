@@ -322,7 +322,6 @@ describe('specialized message buffer families', () => {
       createTestOpMetadata({ name: 'static child op' }),
       CAPACITY,
     );
-    root._children.push(child);
     staticOp.callsitePlan.appenders.writeSpanStart(child, 0);
     const childLogger = staticOp.callsitePlan.newSpanLogger?.(child);
     if (!childLogger) throw new Error('Expected static logger');
