@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
-import { createBuffer } from '../../__tests__/test-helpers.js';
+import { JsBufferStrategy } from '../../JsBufferStrategy.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import {
   ENTRY_TYPE_DEBUG,
@@ -12,27 +12,22 @@ import {
 } from '../../schema/systemSchema.js';
 import { createTraceId } from '../../traceId.js';
 import type { TracerLifecycleHooks } from '../../traceRoot.js';
-import type { AnySpanBuffer } from '../../types.js';
 import { createWasmAllocator, type WasmAllocator } from '../wasmAllocator.js';
 import { createWasmTraceRoot } from '../wasmTraceRoot.js';
 
-function createMockSpanBuffer(): AnySpanBuffer {
-  return createBuffer(defineLogSchema({}));
-}
+const mockSchema = defineLogSchema({});
 
 /**
  * Mock tracer that implements TracerLifecycleHooks for testing.
  */
-const mockTracer: TracerLifecycleHooks = {
+const mockTracer: TracerLifecycleHooks<typeof mockSchema> = {
   onTraceStart: () => {},
   onTraceEnd: () => {},
   onSpanStart: () => {},
   onSpanEnd: () => {},
   onStatsWillResetFor: () => {},
-  bufferStrategy: {
-    createChildSpanBuffer: createMockSpanBuffer,
-    createOverflowBuffer: createMockSpanBuffer,
-  },
+  getFlagEvaluatorForContext: () => undefined,
+  bufferStrategy: new JsBufferStrategy<typeof mockSchema>(),
 };
 
 describe('WasmTraceRoot', () => {
@@ -111,7 +106,7 @@ describe('WasmTraceRoot', () => {
   describe('writeSpanStartPtr (low-level pointer API)', () => {
     it('sets entry_type[0] = SPAN_START (1)', () => {
       const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
-      const systemPtr = allocator.allocSpanSystem();
+      const systemPtr = allocator.allocExact(64 * 9, 8);
       const identityPtr = allocator.allocIdentityChild();
 
       traceRoot.writeSpanStartPtr(systemPtr, identityPtr);
@@ -121,7 +116,7 @@ describe('WasmTraceRoot', () => {
 
     it('sets entry_type[1] = SPAN_EXCEPTION (4) for crash safety', () => {
       const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
-      const systemPtr = allocator.allocSpanSystem();
+      const systemPtr = allocator.allocExact(64 * 9, 8);
       const identityPtr = allocator.allocIdentityChild();
 
       traceRoot.writeSpanStartPtr(systemPtr, identityPtr);
@@ -131,7 +126,7 @@ describe('WasmTraceRoot', () => {
 
     it('sets _writeIndex to 2', () => {
       const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
-      const systemPtr = allocator.allocSpanSystem();
+      const systemPtr = allocator.allocExact(64 * 9, 8);
       const identityPtr = allocator.allocIdentityChild();
 
       traceRoot.writeSpanStartPtr(systemPtr, identityPtr);
@@ -141,7 +136,7 @@ describe('WasmTraceRoot', () => {
 
     it('writes a valid timestamp at row 0', () => {
       const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
-      const systemPtr = allocator.allocSpanSystem();
+      const systemPtr = allocator.allocExact(64 * 9, 8);
       const identityPtr = allocator.allocIdentityChild();
 
       traceRoot.writeSpanStartPtr(systemPtr, identityPtr);
@@ -154,7 +149,7 @@ describe('WasmTraceRoot', () => {
   describe('writeSpanEndOkPtr (low-level pointer API)', () => {
     it('sets entry_type[1] = SPAN_OK (2)', () => {
       const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
-      const systemPtr = allocator.allocSpanSystem();
+      const systemPtr = allocator.allocExact(64 * 9, 8);
       const identityPtr = allocator.allocIdentityChild();
 
       traceRoot.writeSpanStartPtr(systemPtr, identityPtr);
@@ -165,7 +160,7 @@ describe('WasmTraceRoot', () => {
 
     it('writes a valid timestamp at row 1', () => {
       const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
-      const systemPtr = allocator.allocSpanSystem();
+      const systemPtr = allocator.allocExact(64 * 9, 8);
       const identityPtr = allocator.allocIdentityChild();
 
       traceRoot.writeSpanStartPtr(systemPtr, identityPtr);
@@ -177,7 +172,7 @@ describe('WasmTraceRoot', () => {
 
     it('writes timestamp >= span start timestamp', () => {
       const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
-      const systemPtr = allocator.allocSpanSystem();
+      const systemPtr = allocator.allocExact(64 * 9, 8);
       const identityPtr = allocator.allocIdentityChild();
 
       traceRoot.writeSpanStartPtr(systemPtr, identityPtr);
@@ -193,7 +188,7 @@ describe('WasmTraceRoot', () => {
   describe('writeSpanEndErrPtr (low-level pointer API)', () => {
     it('sets entry_type[1] = SPAN_ERR (3)', () => {
       const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
-      const systemPtr = allocator.allocSpanSystem();
+      const systemPtr = allocator.allocExact(64 * 9, 8);
       const identityPtr = allocator.allocIdentityChild();
 
       traceRoot.writeSpanStartPtr(systemPtr, identityPtr);
@@ -204,7 +199,7 @@ describe('WasmTraceRoot', () => {
 
     it('writes a valid timestamp at row 1', () => {
       const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
-      const systemPtr = allocator.allocSpanSystem();
+      const systemPtr = allocator.allocExact(64 * 9, 8);
       const identityPtr = allocator.allocIdentityChild();
 
       traceRoot.writeSpanStartPtr(systemPtr, identityPtr);
@@ -218,7 +213,7 @@ describe('WasmTraceRoot', () => {
   describe('writeLogEntryPtr (low-level pointer API)', () => {
     it('returns correct row index starting at 2', () => {
       const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
-      const systemPtr = allocator.allocSpanSystem();
+      const systemPtr = allocator.allocExact(64 * 9, 8);
       const identityPtr = allocator.allocIdentityChild();
 
       traceRoot.writeSpanStartPtr(systemPtr, identityPtr);
@@ -229,7 +224,7 @@ describe('WasmTraceRoot', () => {
 
     it('increments write index for each log entry', () => {
       const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
-      const systemPtr = allocator.allocSpanSystem();
+      const systemPtr = allocator.allocExact(64 * 9, 8);
       const identityPtr = allocator.allocIdentityChild();
 
       traceRoot.writeSpanStartPtr(systemPtr, identityPtr);
@@ -246,7 +241,7 @@ describe('WasmTraceRoot', () => {
 
     it('writes correct entry type', () => {
       const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
-      const systemPtr = allocator.allocSpanSystem();
+      const systemPtr = allocator.allocExact(64 * 9, 8);
       const identityPtr = allocator.allocIdentityChild();
 
       traceRoot.writeSpanStartPtr(systemPtr, identityPtr);
@@ -261,7 +256,7 @@ describe('WasmTraceRoot', () => {
 
     it('writes valid timestamps for log entries', () => {
       const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
-      const systemPtr = allocator.allocSpanSystem();
+      const systemPtr = allocator.allocExact(64 * 9, 8);
       const identityPtr = allocator.allocIdentityChild();
 
       traceRoot.writeSpanStartPtr(systemPtr, identityPtr);
@@ -275,7 +270,7 @@ describe('WasmTraceRoot', () => {
   describe('readWriteIndex', () => {
     it('returns 2 after writeSpanStartPtr', () => {
       const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
-      const systemPtr = allocator.allocSpanSystem();
+      const systemPtr = allocator.allocExact(64 * 9, 8);
       const identityPtr = allocator.allocIdentityChild();
 
       traceRoot.writeSpanStartPtr(systemPtr, identityPtr);
@@ -285,7 +280,7 @@ describe('WasmTraceRoot', () => {
 
     it('reflects log entries written', () => {
       const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
-      const systemPtr = allocator.allocSpanSystem();
+      const systemPtr = allocator.allocExact(64 * 9, 8);
       const identityPtr = allocator.allocIdentityChild();
 
       traceRoot.writeSpanStartPtr(systemPtr, identityPtr);
@@ -326,9 +321,9 @@ describe('WasmTraceRoot', () => {
     it('can write to multiple system blocks', () => {
       const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
 
-      const systemPtr1 = allocator.allocSpanSystem();
+      const systemPtr1 = allocator.allocExact(64 * 9, 8);
       const identityPtr1 = allocator.allocIdentityChild();
-      const systemPtr2 = allocator.allocSpanSystem();
+      const systemPtr2 = allocator.allocExact(64 * 9, 8);
       const identityPtr2 = allocator.allocIdentityChild();
 
       traceRoot.writeSpanStartPtr(systemPtr1, identityPtr1);
@@ -343,9 +338,9 @@ describe('WasmTraceRoot', () => {
     it('maintains separate state for each span buffer', () => {
       const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
 
-      const systemPtr1 = allocator.allocSpanSystem();
+      const systemPtr1 = allocator.allocExact(64 * 9, 8);
       const identityPtr1 = allocator.allocIdentityChild();
-      const systemPtr2 = allocator.allocSpanSystem();
+      const systemPtr2 = allocator.allocExact(64 * 9, 8);
       const identityPtr2 = allocator.allocIdentityChild();
 
       traceRoot.writeSpanStartPtr(systemPtr1, identityPtr1);

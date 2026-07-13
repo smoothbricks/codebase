@@ -494,6 +494,7 @@ export type SpanBuffer<T extends LogSchema> = AnySpanBuffer & {
 
   // Override schema access with the concrete schema for this buffer family
   readonly _logSchema: T;
+  _traceRoot: ITraceRoot<T>;
   _scopeValues: Readonly<Partial<InferSchema<T>>>;
 
   // Override methods with typed versions

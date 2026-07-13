@@ -11,9 +11,11 @@
 
 import { Nanoseconds } from '@smoothbricks/arrow-builder';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from '../schema/systemSchema.js';
+import type { LogSchema } from '../schema/LogSchema.js';
 import { createTraceId, type TraceId } from '../traceId.js';
 import type {
   ITraceRoot,
+  TraceRootFactory,
   SpanEndPrimitive,
   SpanStartPrimitive,
   TimestampAppendPrimitive,
@@ -121,7 +123,7 @@ const writeSpanEndPrimitive: SpanEndPrimitive = (traceRoot, buffer, entryType) =
   buffer.entry_type[1] = entryType;
 };
 
-export class WasmTraceRoot implements ITraceRoot {
+export class WasmTraceRoot<T extends LogSchema = LogSchema> implements ITraceRoot<T> {
   /** Byte offset in WASM memory where TraceRoot data lives */
   readonly _traceRootPtr: number;
   private _state: 'live' | 'freed' = 'live';
@@ -133,7 +135,7 @@ export class WasmTraceRoot implements ITraceRoot {
   readonly trace_id: TraceId;
 
   /** Tracer reference for lifecycle hooks */
-  readonly tracer: TracerLifecycleHooks;
+  readonly tracer: TracerLifecycleHooks<T>;
   readonly _timestampNow = timestampNow;
   readonly _appendLogEntry = appendLogEntry;
   readonly _writeSpanStart = writeSpanStartPrimitive;
@@ -145,18 +147,14 @@ export class WasmTraceRoot implements ITraceRoot {
    */
   readonly _system: ArrayBuffer;
 
-  constructor(allocator: WasmAllocator, trace_id: TraceId, tracer: TracerLifecycleHooks) {
+  constructor(allocator: WasmAllocator, trace_id: TraceId, tracer: TracerLifecycleHooks<T>) {
     this.allocator = allocator;
     this.trace_id = trace_id;
     this.tracer = tracer;
 
-    // Create minimal _system buffer (not actually used, but required by interface)
     this._system = new ArrayBuffer(16);
-
-    // Allocate an 8B column block for TraceRoot data (16 bytes needed, 8B block is large enough)
-    // The 8B column block size is: ceil(capacity/8) + capacity*8 = 8 + 512 = 520 bytes for capacity 64
-    // We only need 16 bytes, so this works fine
-    const traceRootPtr = allocator.alloc8B();
+    // Native TraceRoot is exactly two aligned 8-byte fields.
+    const traceRootPtr = allocator.allocExact(16, 8);
     if (traceRootPtr === 0) {
       throw new Error('WASM trace-root allocation failed');
     }
@@ -309,7 +307,7 @@ export class WasmTraceRoot implements ITraceRoot {
   /** Free the TraceRoot allocation exactly once. */
   free(): void {
     if (this._state === 'freed') return;
-    this.allocator.free8B(this._traceRootPtr);
+    this.allocator.freeExact(this._traceRootPtr, 16, 8);
     this._state = 'freed';
   }
 }
@@ -326,12 +324,12 @@ export class WasmTraceRoot implements ITraceRoot {
  * @param trace_id - Trace ID for this trace
  * @param tracer - Tracer lifecycle hooks
  */
-export function createWasmTraceRoot(
+export function createWasmTraceRoot<T extends LogSchema = LogSchema>(
   allocator: WasmAllocator,
   trace_id: string,
-  tracer: TracerLifecycleHooks,
-): WasmTraceRoot {
-  return new WasmTraceRoot(allocator, createTraceId(trace_id), tracer);
+  tracer: TracerLifecycleHooks<T>,
+): WasmTraceRoot<T> {
+  return new WasmTraceRoot<T>(allocator, createTraceId(trace_id), tracer);
 }
 
 /**
@@ -342,9 +340,10 @@ export function createWasmTraceRoot(
  * @param allocator - WASM allocator instance
  * @returns Factory function compatible with TraceRootFactory type
  */
-export function createWasmTraceRootFactory(allocator: WasmAllocator) {
-  return (trace_id: string, tracer: TracerLifecycleHooks): WasmTraceRoot => {
-    return new WasmTraceRoot(allocator, createTraceId(trace_id), tracer);
-  };
+export function createWasmTraceRootFactory<T extends LogSchema = LogSchema>(
+  allocator: WasmAllocator,
+): TraceRootFactory<T> {
+  return (trace_id: string, tracer: TracerLifecycleHooks<T>): WasmTraceRoot<T> =>
+    new WasmTraceRoot<T>(allocator, createTraceId(trace_id), tracer);
 }
 //#endregion smoo/lmao!n/wasm-mem.trace-root

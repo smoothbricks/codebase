@@ -24,19 +24,7 @@ export interface WasmAllocator {
   /** The underlying WASM memory */
   readonly memory: WebAssembly.Memory;
 
-  /** WASM exports for direct function calls (hot path optimization) */
-  readonly exports: {
-    write_col_f64: (colOffset: number, rowIdx: number, value: number, capacity: number) => number;
-    write_col_u32: (colOffset: number, rowIdx: number, value: number, capacity: number) => number;
-    write_col_u8: (colOffset: number, rowIdx: number, value: number, capacity: number) => number;
-    write_log_entry: (
-      systemPtr: number,
-      identityPtr: number,
-      traceRootPtr: number,
-      entryType: number,
-      capacity: number,
-    ) => number;
-  };
+
 
   /** Cached views (recreated after grow, but pre-sized to avoid grow for benchmarks) */
   readonly u8: Uint8Array;
@@ -53,17 +41,10 @@ export interface WasmAllocator {
   /** Reset all freelists (for testing/benchmarking) */
   reset(): void;
 
-  // Block allocation - capacity determines tier and block size
-  allocSpanSystem(capacity?: number): number;
-  alloc1B(capacity?: number): number;
-  alloc4B(capacity?: number): number;
-  alloc8B(capacity?: number): number;
+  /** Allocate and release an exact logical byte extent with explicit alignment. */
+  allocExact(byteLength: number, alignment: number): number;
+  freeExact(offset: number, byteLength: number, alignment: number): void;
 
-  // Block deallocation - returns block to freelist, may trigger buddy merge
-  freeSpanSystem(offset: number, capacity?: number): void;
-  free1B(offset: number, capacity?: number): void;
-  free4B(offset: number, capacity?: number): void;
-  free8B(offset: number, capacity?: number): void;
 
   // Span lifecycle (writes timestamp + entry_type)
   spanStart(systemPtr: number, identityPtr: number, traceRootPtr: number, capacity?: number): void;
@@ -78,10 +59,6 @@ export interface WasmAllocator {
     capacity?: number,
   ): number;
 
-  // Column writes (auto-allocate if offset is 0)
-  writeColF64(colOffset: number, rowIdx: number, value: number, capacity?: number): number;
-  writeColU32(colOffset: number, rowIdx: number, value: number, capacity?: number): number;
-  writeColU8(colOffset: number, rowIdx: number, value: number, capacity?: number): number;
 
   // TraceRoot initialization
   initTraceRoot(traceRootPtr: number): void;
@@ -90,10 +67,6 @@ export interface WasmAllocator {
   getBumpPtr(): number;
   getAllocCount(): number;
   getFreeCount(): number;
-  getSpanSystemSize(capacity?: number): number;
-  getCol1BSize(capacity?: number): number;
-  getCol4BSize(capacity?: number): number;
-  getCol8BSize(capacity?: number): number;
 
   // Reading (for Arrow conversion)
   readTimestamp(systemPtr: number, rowIdx: number): bigint;
@@ -151,16 +124,10 @@ export interface WasmAllocatorOptions {
 interface WasmExports {
   init(): void;
   reset(): void;
+  alloc_exact(byteLength: number, alignment: number): number;
+  free_exact(offset: number, byteLength: number, alignment: number): void;
 
-  alloc_span_system(capacity: number): number;
-  alloc_col_1b(capacity: number): number;
-  alloc_col_4b(capacity: number): number;
-  alloc_col_8b(capacity: number): number;
 
-  free_span_system(offset: number, capacity: number): void;
-  free_col_1b(offset: number, capacity: number): void;
-  free_col_4b(offset: number, capacity: number): void;
-  free_col_8b(offset: number, capacity: number): void;
 
   span_start(systemPtr: number, identityPtr: number, traceRootPtr: number, capacity: number): void;
   span_end_ok(systemPtr: number, traceRootPtr: number, capacity: number): void;
@@ -182,10 +149,6 @@ interface WasmExports {
   get_bump_ptr(): number;
   get_alloc_count(): number;
   get_free_count(): number;
-  get_span_system_size(capacity: number): number;
-  get_col_1b_size(capacity: number): number;
-  get_col_4b_size(capacity: number): number;
-  get_col_8b_size(capacity: number): number;
 
   read_timestamp(systemPtr: number, rowIdx: number): bigint;
   read_entry_type(systemPtr: number, rowIdx: number, capacity: number): number;
@@ -220,9 +183,7 @@ function isWasmExports(value: unknown): value is WasmExports {
     return false;
   }
 
-  return (
-    typeof Reflect.get(value, 'init') === 'function' && typeof Reflect.get(value, 'alloc_span_system') === 'function'
-  );
+  return typeof Reflect.get(value, 'init') === 'function' && typeof Reflect.get(value, 'alloc_exact') === 'function';
 }
 
 // =============================================================================
@@ -263,15 +224,7 @@ function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Me
   return {
     memory,
     capacity,
-    exports: {
-      write_col_f64: exports.write_col_f64,
-      write_col_u32: exports.write_col_u32,
-      write_col_u8: exports.write_col_u8,
-      write_log_entry: exports.write_log_entry,
-    },
-
     get u8() {
-      // Check if memory grew since last access
       if (memory.buffer !== currentBuffer) {
         currentBuffer = memory.buffer;
         views = createViews(memory);
@@ -302,18 +255,9 @@ function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Me
 
     init: exports.init,
     reset: exports.reset,
+    allocExact: exports.alloc_exact,
+    freeExact: exports.free_exact,
 
-    // Allocation with optional capacity (defaults to instance capacity)
-    allocSpanSystem: (cap = capacity) => exports.alloc_span_system(cap),
-    alloc1B: (cap = capacity) => exports.alloc_col_1b(cap),
-    alloc4B: (cap = capacity) => exports.alloc_col_4b(cap),
-    alloc8B: (cap = capacity) => exports.alloc_col_8b(cap),
-
-    // Deallocation with optional capacity
-    freeSpanSystem: (offset, cap = capacity) => exports.free_span_system(offset, cap),
-    free1B: (offset, cap = capacity) => exports.free_col_1b(offset, cap),
-    free4B: (offset, cap = capacity) => exports.free_col_4b(offset, cap),
-    free8B: (offset, cap = capacity) => exports.free_col_8b(offset, cap),
 
     // Span lifecycle with optional capacity
     spanStart: (systemPtr, identityPtr, traceRootPtr, cap = capacity) =>
@@ -323,20 +267,12 @@ function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Me
     writeLogEntry: (systemPtr, identityPtr, traceRootPtr, entryType, cap = capacity) =>
       exports.write_log_entry(systemPtr, identityPtr, traceRootPtr, entryType, cap),
 
-    // Column writes with optional capacity
-    writeColF64: (colOffset, rowIdx, value, cap = capacity) => exports.write_col_f64(colOffset, rowIdx, value, cap),
-    writeColU32: (colOffset, rowIdx, value, cap = capacity) => exports.write_col_u32(colOffset, rowIdx, value, cap),
-    writeColU8: (colOffset, rowIdx, value, cap = capacity) => exports.write_col_u8(colOffset, rowIdx, value, cap),
 
     initTraceRoot: exports.init_trace_root,
 
     getBumpPtr: exports.get_bump_ptr,
     getAllocCount: exports.get_alloc_count,
     getFreeCount: exports.get_free_count,
-    getSpanSystemSize: (cap = capacity) => exports.get_span_system_size(cap),
-    getCol1BSize: (cap = capacity) => exports.get_col_1b_size(cap),
-    getCol4BSize: (cap = capacity) => exports.get_col_4b_size(cap),
-    getCol8BSize: (cap = capacity) => exports.get_col_8b_size(cap),
 
     readTimestamp: exports.read_timestamp,
     readEntryType: (systemPtr, rowIdx, cap = capacity) => exports.read_entry_type(systemPtr, rowIdx, cap),

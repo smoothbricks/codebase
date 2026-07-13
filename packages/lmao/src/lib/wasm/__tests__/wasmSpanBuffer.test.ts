@@ -1,11 +1,13 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
 import { S as ArrowS, Nanoseconds } from '@smoothbricks/arrow-builder';
+import fc from 'fast-check';
 import { createTestOpMetadata, TEST_TRACER } from '../../__tests__/test-helpers.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { EMPTY_SCOPE } from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
 import { createWasmAllocator, type WasmAllocator } from '../wasmAllocator.js';
+import { getWasmPhysicalLayout } from '../wasmPhysicalLayout.js';
 import {
   createWasmChildSpanBuffer,
   createWasmOverflowBuffer,
@@ -94,6 +96,76 @@ describe('WasmSpanBuffer', () => {
     });
   });
 
+  describe('exact physical layout', () => {
+    it('produces aligned, exact, non-overlapping family descriptors for arbitrary capacities', () => {
+      fc.assert(
+        fc.property(fc.integer({ min: 1, max: 512 }), (capacity) => {
+          const layout = getWasmPhysicalLayout(testSchema, capacity);
+          expect(layout).toBe(getWasmPhysicalLayout(testSchema, capacity));
+          expect(Object.isFrozen(layout)).toBe(true);
+          expect(layout.system.timestampOffset).toBe(0);
+          expect(layout.system.entryTypeOffset).toBe(capacity * 8);
+          expect(layout.system.byteLength).toBe(capacity * 9);
+
+          for (const family of ['u8', 'u32', 'f64'] as const) {
+            const slab = layout.slabs[family];
+            const columns = layout.columns.filter((column) => column.family === family);
+            expect(slab === null).toBe(columns.length === 0);
+            if (slab === null) continue;
+
+            const ranges: Array<readonly [number, number]> = [];
+            for (const column of columns) {
+              expect(column.valueOffset % column.alignment).toBe(0);
+              expect(column.nullByteLength).toBe(Math.ceil(capacity / 8));
+              expect(column.valueLength).toBe(capacity * column.byteWidth);
+              expect(column.nullOffset + column.nullByteLength).toBeLessThanOrEqual(column.valueOffset);
+              expect(column.valueOffset + column.valueLength).toBeLessThanOrEqual(slab.byteLength);
+
+              const columnRanges = [
+                [column.nullOffset, column.nullOffset + column.nullByteLength],
+                [column.valueOffset, column.valueOffset + column.valueLength],
+              ] as const;
+              for (const [start, end] of columnRanges) {
+                for (const [otherStart, otherEnd] of ranges) {
+                  expect(end <= otherStart || start >= otherEnd).toBe(true);
+                }
+                ranges.push([start, end]);
+              }
+            }
+          }
+        }),
+      );
+    });
+
+    it('allocates one exact slab per numeric family and no blocks on numeric writes', () => {
+      const allocsBefore = allocator.getAllocCount();
+      const buffer = createTestWasmBuffer();
+      const allocatedSlabs = Object.values(buffer._layout.slabs).filter((slab) => slab !== null).length;
+      expect(allocator.getAllocCount() - allocsBefore).toBe(2 + allocatedSlabs); // identity + system + families
+
+      const ranges: Array<readonly [number, number]> = [
+        [buffer._systemPtr, buffer._systemPtr + buffer._layout.system.byteLength],
+      ];
+      for (const family of ['u8', 'u32', 'f64'] as const) {
+        const slab = buffer._layout.slabs[family];
+        if (slab === null) continue;
+        const start = buffer._familyPtrs[family];
+        const end = start + slab.byteLength;
+        expect(start % slab.alignment).toBe(0);
+        for (const [otherStart, otherEnd] of ranges) {
+          expect(end <= otherStart || start >= otherEnd).toBe(true);
+        }
+        ranges.push([start, end]);
+      }
+
+      const count = getMethod<[idx: number, val: number], WasmSpanBufferInstance>(buffer, 'count');
+      const isAdmin = getMethod<[idx: number, val: boolean], WasmSpanBufferInstance>(buffer, 'isAdmin');
+      count(3, 42);
+      isAdmin(4, true);
+      expect(allocator.getAllocCount() - allocsBefore).toBe(2 + allocatedSlabs);
+    });
+  });
+
   describe('instance creation', () => {
     it('creates instance with correct identity', () => {
       const buffer = createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 42n, span_id: 1 });
@@ -177,12 +249,6 @@ describe('WasmSpanBuffer', () => {
       expect(buffer.entry_type[1]).toBe(2);
     });
 
-    it('views reflect same WASM memory', () => {
-      buffer.timestamp[5] = 999n;
-      // Get a new view and verify it sees the same data
-      const newView = buffer.timestamp;
-      expect(newView[5]).toBe(999n);
-    });
 
     it('exposes _spanStartTime from row 0', () => {
       buffer.timestamp[0] = 123n;
@@ -307,15 +373,16 @@ describe('WasmSpanBuffer', () => {
       buffer = createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 1n, span_id: 1 });
     });
 
-    it('count column starts unallocated', () => {
-      expect(buffer.isColumnAllocated(2)).toBe(false); // count is at index 2
+    it('reserves the numeric column inside its family slab at construction', () => {
+      expect(buffer.isColumnAllocated(2)).toBe(true); // count is at index 2
+      expect(getColumn<Float64Array>(buffer, 'count_values').byteOffset).toBeGreaterThan(buffer._familyPtrs.f64);
     });
 
-    it('allocates count column on first write', () => {
+    it('writes without allocating another block', () => {
       const count = getMethod<[idx: number, val: number], WasmSpanBufferInstance>(buffer, 'count');
+      const allocsBefore = allocator.getAllocCount();
       count(0, 42);
-
-      expect(buffer.isColumnAllocated(2)).toBe(true);
+      expect(allocator.getAllocCount()).toBe(allocsBefore);
     });
 
     it('writes to numeric column', () => {
@@ -347,29 +414,30 @@ describe('WasmSpanBuffer', () => {
   });
 
   describe('free()', () => {
-    it('frees system block', () => {
+    it('releases each owned exact slab and identity once', () => {
       const buffer = createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 1n, span_id: 1 });
-
+      const ownedSlabs = Object.values(buffer._layout.slabs).filter((slab) => slab !== null).length;
       const freesBefore = allocator.getFreeCount();
+
       buffer.free();
 
-      expect(allocator.getFreeCount()).toBeGreaterThan(freesBefore);
+      expect(allocator.getFreeCount() - freesBefore).toBe(2 + ownedSlabs); // identity + system + families
+      expect(buffer._descriptor.state).toBe('freed');
     });
 
-    it('frees allocated column blocks', () => {
+    it('is idempotent and rejects every stale accessor and writer', () => {
       const buffer = createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 1n, span_id: 1 });
-
-      // Write to lazy columns to allocate them
       const count = getMethod<[idx: number, val: number], WasmSpanBufferInstance>(buffer, 'count');
-      const isAdmin = getMethod<[idx: number, val: boolean], WasmSpanBufferInstance>(buffer, 'isAdmin');
-      count(0, 42);
-      isAdmin(0, true);
+      buffer.free();
+      const freesAfterFirstRelease = allocator.getFreeCount();
 
-      const freesBefore = allocator.getFreeCount();
       buffer.free();
 
-      // Should free system block + statusCode (eager) + count + isAdmin
-      expect(allocator.getFreeCount()).toBeGreaterThan(freesBefore + 1);
+      expect(allocator.getFreeCount()).toBe(freesAfterFirstRelease);
+      expect(() => buffer.timestamp).toThrow(/generation .* released/);
+      expect(() => buffer.entry_type).toThrow(/generation .* released/);
+      expect(() => buffer._identity).toThrow(/generation .* released/);
+      expect(() => count(0, 42)).toThrow(/generation .* released/);
     });
   });
 
@@ -398,6 +466,11 @@ describe('WasmSpanBuffer', () => {
       // Parent and child share thread_id from global header
       expect(child.parent_thread_id).toBe(1n);
       expect(child.parent_span_id).toBe(1);
+      expect(child._identityPtr).not.toBe(parent._identityPtr);
+      expect(child._identityOwner).toBe(true);
+      expect(child._descriptor.kind).toBe('child');
+      expect(child._descriptor.parent).toBe(parent._descriptor);
+      expect(child._descriptor.generation).toBeGreaterThan(parent._descriptor.generation);
     });
   });
 
@@ -420,9 +493,13 @@ describe('WasmSpanBuffer', () => {
       expect(overflow._parent).toBe(buffer._parent); // Same parent (null for root)
       expect(overflow.trace_id).toBe(testTraceId('trace-123'));
       expect(overflow.thread_id).toBe(1n);
-      // Note: span_id is unique per identity block, not shared with original
-      // overflow has its own span_id from allocIdentityChild
-      expect(overflow.span_id).toBeGreaterThan(0);
+      expect(overflow.span_id).toBe(buffer.span_id);
+      expect(overflow._identityPtr).toBe(buffer._identityPtr);
+      expect(overflow._identityOwner).toBe(false);
+      expect(overflow._descriptor.kind).toBe('overflow');
+      expect(overflow._descriptor.parent).toBeUndefined();
+      expect(buffer._descriptor.overflow).toBe(overflow._descriptor);
+      expect(overflow._descriptor.generation).toBeGreaterThan(buffer._descriptor.generation);
     });
   });
 

@@ -25,7 +25,7 @@ describe('WasmBufferStrategy', () => {
 
   // Mock tracer lifecycle hooks for WasmTraceRoot
   let strategy: WasmBufferStrategy<typeof testSchema>;
-  let mockTracer: TracerLifecycleHooks;
+  let mockTracer: TracerLifecycleHooks<typeof testSchema>;
 
   beforeAll(async () => {
     strategy = await WasmBufferStrategy.create<typeof testSchema>({
@@ -42,6 +42,7 @@ describe('WasmBufferStrategy', () => {
       onSpanStart: () => {},
       onSpanEnd: () => {},
       onStatsWillResetFor: () => {},
+      getFlagEvaluatorForContext: () => undefined,
       bufferStrategy: strategy,
     };
   });
@@ -251,6 +252,28 @@ describe('WasmBufferStrategy', () => {
       const statsAfterReset = strategy.getStats();
       expect(statsAfterReset.allocCount).toBe(0);
       expect(statsAfterReset.freeCount).toBe(0);
+    });
+
+    it('invalidates root, child, and overflow generations before offsets are reused', async () => {
+      const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
+      const root = strategy.createSpanBuffer(testSchema, traceRoot, testMetadata);
+      const child = strategy.createChildSpanBuffer(root, testMetadata, testMetadata);
+      root._children.push(child);
+      const overflow = strategy.createOverflowBuffer(root);
+      root.timestamp[0] = 11n;
+      child.timestamp[0] = 22n;
+      overflow.timestamp[0] = 33n;
+
+      strategy.reset();
+
+      expect(() => root.timestamp).toThrow(/generation .* released/);
+      expect(() => child.timestamp).toThrow(/generation .* released/);
+      expect(() => overflow.timestamp).toThrow(/generation .* released/);
+      expect(strategy.getStats()).toEqual({ allocCount: 0, freeCount: 0, bumpPtr: 192, capacity: 64 });
+
+      strategy.releaseBuffer(root);
+      strategy.releaseBuffer(root);
+      expect(strategy.getStats()).toEqual({ allocCount: 0, freeCount: 0, bumpPtr: 192, capacity: 64 });
     });
   });
 });
