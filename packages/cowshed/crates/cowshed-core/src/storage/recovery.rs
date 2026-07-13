@@ -5,6 +5,7 @@ use thiserror::Error;
 use crate::metadata::WorkspaceIncarnation;
 
 /// Objects in these namespaces are controller implementation details and never canonical listings.
+pub const CHECKPOINT_NAMESPACE: &str = ".checkpoints";
 pub const STAGING_NAMESPACE: &str = ".staging";
 pub const TRASH_NAMESPACE: &str = ".trash";
 
@@ -72,15 +73,11 @@ pub struct Authority {
 }
 
 impl Authority {
-    pub fn new(
-        incarnation: WorkspaceIncarnation,
-        token: impl Into<String>,
-    ) -> Result<Self, RecoveryError> {
-        let token = token.into();
-        if token.is_empty() {
-            return Err(RecoveryError::EmptyToken);
+    fn mint(incarnation: WorkspaceIncarnation, transaction_id: &str) -> Self {
+        Self {
+            token: format!("gateway-{transaction_id}-{}", incarnation.as_str()),
+            incarnation,
         }
-        Ok(Self { incarnation, token })
     }
 
     pub fn incarnation(&self) -> &WorkspaceIncarnation {
@@ -95,6 +92,7 @@ impl Authority {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ObjectNamespace {
     Canonical,
+    Checkpoint,
     Staging,
     Trash,
 }
@@ -111,6 +109,13 @@ impl StoredObject {
         Self {
             name: name.into(),
             namespace: ObjectNamespace::Canonical,
+        }
+    }
+
+    pub fn checkpoint(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            namespace: ObjectNamespace::Checkpoint,
         }
     }
 
@@ -137,7 +142,7 @@ impl StoredObject {
     }
 }
 
-/// Enumerate only canonical state. In-flight and cleanup objects are invisible by construction.
+/// Enumerate only canonical state. In-flight, retained, and cleanup objects are invisible.
 pub fn enumerate_published(objects: impl IntoIterator<Item = StoredObject>) -> Vec<String> {
     objects
         .into_iter()
@@ -149,14 +154,13 @@ pub fn enumerate_published(objects: impl IntoIterator<Item = StoredObject>) -> V
         .collect()
 }
 
-/// Immutable inputs retained by every recoverable phase record.
+/// Capability-free durable inputs for a lifecycle transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransactionSpec {
     kind: TransactionKind,
     logical_name: String,
     transaction_id: String,
-    old_authority: Option<Authority>,
-    new_authority: Option<Authority>,
+    next_incarnation: Option<WorkspaceIncarnation>,
 }
 
 impl TransactionSpec {
@@ -164,8 +168,7 @@ impl TransactionSpec {
         kind: TransactionKind,
         logical_name: impl Into<String>,
         transaction_id: impl Into<String>,
-        old_authority: Option<Authority>,
-        new_authority: Option<Authority>,
+        next_incarnation: Option<WorkspaceIncarnation>,
     ) -> Result<Self, RecoveryError> {
         let logical_name = logical_name.into();
         let transaction_id = transaction_id.into();
@@ -176,45 +179,22 @@ impl TransactionSpec {
             return Err(RecoveryError::EmptyTransactionId);
         }
         match kind {
-            TransactionKind::Adopt | TransactionKind::Create => {
-                if old_authority.is_some() {
-                    return Err(RecoveryError::UnexpectedOldAuthority(kind));
-                }
-                if new_authority.is_none() {
-                    return Err(RecoveryError::MissingNewAuthority(kind));
-                }
-            }
-            TransactionKind::Restore => {
-                if old_authority.is_none() {
-                    return Err(RecoveryError::MissingOldAuthority(kind));
-                }
-                if new_authority.is_none() {
-                    return Err(RecoveryError::MissingNewAuthority(kind));
+            TransactionKind::Adopt | TransactionKind::Create | TransactionKind::Restore => {
+                if next_incarnation.is_none() {
+                    return Err(RecoveryError::MissingNextIncarnation(kind));
                 }
             }
             TransactionKind::Retire => {
-                if old_authority.is_none() {
-                    return Err(RecoveryError::MissingOldAuthority(kind));
+                if next_incarnation.is_some() {
+                    return Err(RecoveryError::UnexpectedNextIncarnation(kind));
                 }
-                if new_authority.is_some() {
-                    return Err(RecoveryError::UnexpectedNewAuthority(kind));
-                }
-            }
-        }
-        if let (Some(old), Some(new)) = (&old_authority, &new_authority) {
-            if old.incarnation == new.incarnation {
-                return Err(RecoveryError::ReusedIncarnation);
-            }
-            if old.token == new.token {
-                return Err(RecoveryError::ReusedToken);
             }
         }
         Ok(Self {
             kind,
             logical_name,
             transaction_id,
-            old_authority,
-            new_authority,
+            next_incarnation,
         })
     }
 
@@ -230,31 +210,156 @@ impl TransactionSpec {
         &self.transaction_id
     }
 
-    pub fn old_authority(&self) -> Option<&Authority> {
-        self.old_authority.as_ref()
-    }
-
-    pub fn new_authority(&self) -> Option<&Authority> {
-        self.new_authority.as_ref()
+    pub fn next_incarnation(&self) -> Option<&WorkspaceIncarnation> {
+        self.next_incarnation.as_ref()
     }
 
     pub fn staging_object(&self) -> Option<StoredObject> {
-        self.new_authority.as_ref().map(|_| {
+        self.next_incarnation.as_ref().map(|_| {
             StoredObject::staging(format!(
-                "{}/{}-{}",
-                STAGING_NAMESPACE, self.logical_name, self.transaction_id
+                "{STAGING_NAMESPACE}/{}-{}",
+                self.logical_name, self.transaction_id
             ))
         })
     }
 
+    /// Only a retire operation creates reclaimable trash.
     pub fn cleanup_object(&self) -> Option<StoredObject> {
-        self.old_authority.as_ref().map(|_| {
+        (self.kind == TransactionKind::Retire).then(|| {
             StoredObject::trash(format!(
-                "{}/{}-{}",
-                TRASH_NAMESPACE, self.logical_name, self.transaction_id
+                "{TRASH_NAMESPACE}/{}-{}",
+                self.logical_name, self.transaction_id
             ))
         })
     }
+
+    pub fn restore_checkpoint_object(&self) -> Option<StoredObject> {
+        (self.kind == TransactionKind::Restore).then(|| {
+            StoredObject::checkpoint(format!(
+                "{CHECKPOINT_NAMESPACE}/{}-pre-restore-{}",
+                self.logical_name, self.transaction_id
+            ))
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CheckpointMetadata {
+    pub revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FormatMetadata {
+    pub version: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TopologyMetadata {
+    pub revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetentionMetadata {
+    pub retain_until_revision: u64,
+}
+
+/// Facts read from the authoritative lifecycle store while lifecycle exclusion is held.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthoritativeObservations {
+    pub incarnation: Option<WorkspaceIncarnation>,
+    pub grant_revision: u64,
+    pub checkpoint: Option<CheckpointMetadata>,
+    pub format: FormatMetadata,
+    pub topology: TopologyMetadata,
+    pub retired: bool,
+    pub retention: RetentionMetadata,
+}
+
+/// A capability-free plan checked by the lifecycle planner before storage execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckedLifecyclePlan {
+    spec: TransactionSpec,
+    expected: AuthoritativeObservations,
+}
+
+impl CheckedLifecyclePlan {
+    pub fn new(
+        spec: TransactionSpec,
+        expected: AuthoritativeObservations,
+    ) -> Result<Self, RecoveryError> {
+        if matches!(
+            spec.kind,
+            TransactionKind::Restore | TransactionKind::Retire
+        ) && expected.incarnation.is_none()
+        {
+            return Err(RecoveryError::MissingCurrentIncarnation(spec.kind));
+        }
+        if expected.retired {
+            return Err(RecoveryError::AlreadyRetired(spec.kind));
+        }
+        if spec.kind == TransactionKind::Restore && expected.checkpoint.is_none() {
+            return Err(RecoveryError::MissingRestoreCheckpoint);
+        }
+        if let (Some(current), Some(next)) = (
+            expected.incarnation.as_ref(),
+            spec.next_incarnation.as_ref(),
+        ) {
+            if current == next {
+                return Err(RecoveryError::ReusedIncarnation);
+            }
+        }
+        Ok(Self { spec, expected })
+    }
+
+    pub fn spec(&self) -> &TransactionSpec {
+        &self.spec
+    }
+
+    pub fn expected(&self) -> &AuthoritativeObservations {
+        &self.expected
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum StaleDimension {
+    Incarnation,
+    GrantRevision,
+    Checkpoint,
+    Format,
+    Topology,
+    Retirement,
+}
+
+/// A lifecycle conflict detected before the first storage effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryConflict {
+    stale: Vec<StaleDimension>,
+}
+
+impl RecoveryConflict {
+    pub fn stale_dimensions(&self) -> &[StaleDimension] {
+        &self.stale
+    }
+
+    pub const fn effect_count(&self) -> usize {
+        0
+    }
+
+    pub const fn phase(&self) -> Option<TransactionPhase> {
+        None
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BeginOutcome {
+    Started(RecoveryModel),
+    Conflict(RecoveryConflict),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecutionOutcome {
+    Interrupted(RecoveryModel),
+    Conflict(RecoveryConflict),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -271,6 +376,37 @@ pub enum MetadataGeneration {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetainedCheckpoint {
+    object: StoredObject,
+    displaced_incarnation: WorkspaceIncarnation,
+    source_checkpoint: Option<CheckpointMetadata>,
+    format: FormatMetadata,
+    retention: RetentionMetadata,
+}
+
+impl RetainedCheckpoint {
+    pub fn object(&self) -> &StoredObject {
+        &self.object
+    }
+
+    pub fn displaced_incarnation(&self) -> &WorkspaceIncarnation {
+        &self.displaced_incarnation
+    }
+
+    pub const fn source_checkpoint(&self) -> Option<CheckpointMetadata> {
+        self.source_checkpoint
+    }
+
+    pub const fn format(&self) -> FormatMetadata {
+        self.format
+    }
+
+    pub const fn retention(&self) -> RetentionMetadata {
+        self.retention
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProtocolEvent {
     PreparedAtHiddenName,
     StagedValidated,
@@ -278,6 +414,7 @@ pub enum ProtocolEvent {
     TokenMinted,
     StagedAuthorityFlushedAndVerified,
     CanonicalSwap,
+    PreRestoreCheckpointRetained,
     CanonicalValidated,
     AtomicMetadataReplace,
     MetadataParentFsync,
@@ -306,12 +443,19 @@ impl Failpoint {
         self.after
     }
 
-    pub fn interrupt(self, spec: TransactionSpec) -> Result<RecoveryModel, RecoveryError> {
-        let kind = spec.kind;
-        let mut model = RecoveryModel::begin(spec);
+    pub fn interrupt(
+        self,
+        plan: CheckedLifecyclePlan,
+        observed: AuthoritativeObservations,
+    ) -> Result<ExecutionOutcome, RecoveryError> {
+        let kind = plan.spec.kind;
+        let mut model = match RecoveryModel::begin(plan, observed) {
+            BeginOutcome::Started(model) => model,
+            BeginOutcome::Conflict(conflict) => return Ok(ExecutionOutcome::Conflict(conflict)),
+        };
         loop {
             if model.phase == self.after {
-                return Ok(model);
+                return Ok(ExecutionOutcome::Interrupted(model));
             }
             if matches!(
                 model.phase,
@@ -332,42 +476,60 @@ impl Failpoint {
 /// Methods consume `self`, so a completed phase record cannot be mutated behind a planner's back.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryModel {
-    spec: TransactionSpec,
+    plan: CheckedLifecyclePlan,
+    authoritative: AuthoritativeObservations,
     phase: TransactionPhase,
     canonical: MetadataGeneration,
     metadata: MetadataGeneration,
     synced_metadata: MetadataGeneration,
     accepted_authority: Option<Generation>,
     admitted_authority: Option<Generation>,
+    minted_authority: Option<Authority>,
     staging_present: bool,
     cleanup_present: bool,
+    retained_checkpoint: Option<RetainedCheckpoint>,
     events: Vec<ProtocolEvent>,
 }
 
 impl RecoveryModel {
-    pub fn begin(spec: TransactionSpec) -> Self {
-        let old = if spec.old_authority.is_some() {
+    /// Revalidate every authoritative lifecycle dimension before creating a Prepare record.
+    pub fn begin(
+        plan: CheckedLifecyclePlan,
+        authoritative: AuthoritativeObservations,
+    ) -> BeginOutcome {
+        let stale = stale_dimensions(plan.expected(), &authoritative);
+        if !stale.is_empty() {
+            return BeginOutcome::Conflict(RecoveryConflict { stale });
+        }
+        let old = if authoritative.incarnation.is_some() {
             MetadataGeneration::Old
         } else {
             MetadataGeneration::Absent
         };
-        let old_authority = spec.old_authority.as_ref().map(|_| Generation::Old);
-        Self {
-            spec,
+        let old_authority = authoritative.incarnation.as_ref().map(|_| Generation::Old);
+        BeginOutcome::Started(Self {
+            plan,
+            authoritative,
             phase: TransactionPhase::Prepare,
             canonical: old,
             metadata: old,
             synced_metadata: old,
             accepted_authority: old_authority,
             admitted_authority: None,
+            minted_authority: None,
             staging_present: false,
             cleanup_present: false,
+            retained_checkpoint: None,
             events: Vec::new(),
-        }
+        })
     }
 
     pub fn spec(&self) -> &TransactionSpec {
-        &self.spec
+        self.plan.spec()
+    }
+
+    pub fn plan(&self) -> &CheckedLifecyclePlan {
+        &self.plan
     }
 
     pub const fn phase(&self) -> TransactionPhase {
@@ -394,12 +556,20 @@ impl RecoveryModel {
         self.admitted_authority
     }
 
+    pub fn minted_authority(&self) -> Option<&Authority> {
+        self.minted_authority.as_ref()
+    }
+
     pub const fn staging_present(&self) -> bool {
         self.staging_present
     }
 
     pub const fn cleanup_present(&self) -> bool {
         self.cleanup_present
+    }
+
+    pub fn retained_checkpoint(&self) -> Option<&RetainedCheckpoint> {
+        self.retained_checkpoint.as_ref()
     }
 
     pub fn events(&self) -> &[ProtocolEvent] {
@@ -410,7 +580,7 @@ impl RecoveryModel {
     pub fn advance(mut self) -> Result<Self, RecoveryError> {
         self.phase = match self.phase {
             TransactionPhase::Prepare => {
-                self.staging_present = self.spec.new_authority.is_some();
+                self.staging_present = self.spec().next_incarnation.is_some();
                 self.events.push(ProtocolEvent::PreparedAtHiddenName);
                 TransactionPhase::Prepared
             }
@@ -418,7 +588,7 @@ impl RecoveryModel {
                 self.events.push(ProtocolEvent::StagedValidated);
                 TransactionPhase::Validated
             }
-            TransactionPhase::Validated if self.spec.kind == TransactionKind::Retire => {
+            TransactionPhase::Validated if self.spec().kind == TransactionKind::Retire => {
                 self.swap_canonical();
                 TransactionPhase::CanonicalSwapped
             }
@@ -427,6 +597,14 @@ impl RecoveryModel {
                 TransactionPhase::IncarnationMinted
             }
             TransactionPhase::IncarnationMinted => {
+                let authority = Authority::mint(
+                    self.spec()
+                        .next_incarnation
+                        .clone()
+                        .expect("replacement transactions have a next incarnation"),
+                    &self.spec().transaction_id,
+                );
+                self.minted_authority = Some(authority);
                 self.events.push(ProtocolEvent::TokenMinted);
                 TransactionPhase::TokenMinted
             }
@@ -451,22 +629,31 @@ impl RecoveryModel {
             TransactionPhase::DetachedMetadataReplaced => {
                 self.synced_metadata = self.metadata;
                 self.events.push(ProtocolEvent::MetadataParentFsync);
-                let from = self.spec.old_authority.as_ref().map(|_| Generation::Old);
-                let to = self.spec.new_authority.as_ref().map(|_| Generation::New);
+                let from = self
+                    .authoritative
+                    .incarnation
+                    .as_ref()
+                    .map(|_| Generation::Old);
+                let to = self
+                    .spec()
+                    .next_incarnation
+                    .as_ref()
+                    .map(|_| Generation::New);
                 self.accepted_authority = to;
                 self.events
                     .push(ProtocolEvent::AuthorityCutover { from, to });
                 TransactionPhase::Published
             }
-            TransactionPhase::Published if self.spec.new_authority.is_some() => {
+            TransactionPhase::Published if self.spec().next_incarnation.is_some() => {
                 self.admitted_authority = Some(Generation::New);
                 self.events.push(ProtocolEvent::NewAdmission);
                 TransactionPhase::Admitted
             }
-            TransactionPhase::Published | TransactionPhase::Admitted => {
+            TransactionPhase::Published | TransactionPhase::Admitted if self.cleanup_present => {
                 self.events.push(ProtocolEvent::CleanupDeferred);
                 TransactionPhase::CleanupPending
             }
+            TransactionPhase::Published | TransactionPhase::Admitted => TransactionPhase::Complete,
             TransactionPhase::CleanupPending => {
                 self.reclaim_cleanup();
                 TransactionPhase::Complete
@@ -482,7 +669,7 @@ impl RecoveryModel {
     pub fn recover(mut self) -> Self {
         match self.phase.recovery_disposition() {
             RecoveryDisposition::RollBack => {
-                let old = if self.spec.old_authority.is_some() {
+                let old = if self.authoritative.incarnation.is_some() {
                     MetadataGeneration::Old
                 } else {
                     MetadataGeneration::Absent
@@ -490,10 +677,16 @@ impl RecoveryModel {
                 self.canonical = old;
                 self.metadata = old;
                 self.synced_metadata = old;
-                self.accepted_authority = self.spec.old_authority.as_ref().map(|_| Generation::Old);
+                self.accepted_authority = self
+                    .authoritative
+                    .incarnation
+                    .as_ref()
+                    .map(|_| Generation::Old);
                 self.admitted_authority = self.accepted_authority;
+                self.minted_authority = None;
                 self.staging_present = false;
                 self.cleanup_present = false;
+                self.retained_checkpoint = None;
                 self.events.push(ProtocolEvent::RollbackBeforePublication);
                 self.phase = TransactionPhase::RolledBack;
             }
@@ -502,21 +695,25 @@ impl RecoveryModel {
                 self.canonical = target;
                 self.metadata = target;
                 self.synced_metadata = target;
-                self.accepted_authority = self.spec.new_authority.as_ref().map(|_| Generation::New);
+                self.accepted_authority = self
+                    .spec()
+                    .next_incarnation
+                    .as_ref()
+                    .map(|_| Generation::New);
                 self.admitted_authority = self.accepted_authority;
                 self.staging_present = false;
-                if self.cleanup_present {
-                    self.phase = TransactionPhase::CleanupPending;
+                self.phase = if self.cleanup_present {
+                    TransactionPhase::CleanupPending
                 } else {
-                    self.phase = TransactionPhase::Complete;
-                }
+                    TransactionPhase::Complete
+                };
             }
             RecoveryDisposition::Settled => {}
         }
         self
     }
 
-    /// GC only reclaims debris already classified by recovery; it never chooses rollback or roll-forward.
+    /// GC only reclaims retire debris; it never reclaims retained restore checkpoints.
     pub fn gc_pass(mut self) -> (Self, GcPass) {
         if self.phase != TransactionPhase::CleanupPending {
             return (self, GcPass::default());
@@ -535,7 +732,7 @@ impl RecoveryModel {
     }
 
     fn target_generation(&self) -> MetadataGeneration {
-        if self.spec.new_authority.is_some() {
+        if self.spec().next_incarnation.is_some() {
             MetadataGeneration::New
         } else {
             MetadataGeneration::Absent
@@ -545,7 +742,25 @@ impl RecoveryModel {
     fn swap_canonical(&mut self) {
         self.canonical = self.target_generation();
         self.staging_present = false;
-        self.cleanup_present = self.spec.old_authority.is_some();
+        self.cleanup_present = self.spec().kind == TransactionKind::Retire;
+        if self.spec().kind == TransactionKind::Restore {
+            self.retained_checkpoint = Some(RetainedCheckpoint {
+                object: self
+                    .spec()
+                    .restore_checkpoint_object()
+                    .expect("restore transactions retain an undo checkpoint"),
+                displaced_incarnation: self
+                    .authoritative
+                    .incarnation
+                    .clone()
+                    .expect("checked restore plans have a current incarnation"),
+                source_checkpoint: self.authoritative.checkpoint,
+                format: self.authoritative.format,
+                retention: self.authoritative.retention,
+            });
+            self.events
+                .push(ProtocolEvent::PreRestoreCheckpointRetained);
+        }
         self.events.push(ProtocolEvent::CanonicalSwap);
     }
 
@@ -557,6 +772,32 @@ impl RecoveryModel {
     }
 }
 
+fn stale_dimensions(
+    expected: &AuthoritativeObservations,
+    authoritative: &AuthoritativeObservations,
+) -> Vec<StaleDimension> {
+    let mut stale = Vec::new();
+    if expected.incarnation != authoritative.incarnation {
+        stale.push(StaleDimension::Incarnation);
+    }
+    if expected.grant_revision != authoritative.grant_revision {
+        stale.push(StaleDimension::GrantRevision);
+    }
+    if expected.checkpoint != authoritative.checkpoint {
+        stale.push(StaleDimension::Checkpoint);
+    }
+    if expected.format != authoritative.format {
+        stale.push(StaleDimension::Format);
+    }
+    if expected.topology != authoritative.topology {
+        stale.push(StaleDimension::Topology);
+    }
+    if expected.retired != authoritative.retired {
+        stale.push(StaleDimension::Retirement);
+    }
+    stale
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GcPass {
     pub examined: usize,
@@ -565,24 +806,22 @@ pub struct GcPass {
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum RecoveryError {
-    #[error("gateway token must not be empty")]
-    EmptyToken,
     #[error("logical workspace name must not be empty")]
     EmptyLogicalName,
     #[error("transaction id must not be empty")]
     EmptyTransactionId,
-    #[error("{0:?} requires old authority")]
-    MissingOldAuthority(TransactionKind),
-    #[error("{0:?} does not accept old authority")]
-    UnexpectedOldAuthority(TransactionKind),
-    #[error("{0:?} requires new authority")]
-    MissingNewAuthority(TransactionKind),
-    #[error("{0:?} does not accept new authority")]
-    UnexpectedNewAuthority(TransactionKind),
+    #[error("{0:?} requires a next incarnation")]
+    MissingNextIncarnation(TransactionKind),
+    #[error("{0:?} does not accept a next incarnation")]
+    UnexpectedNextIncarnation(TransactionKind),
+    #[error("{0:?} requires a current incarnation")]
+    MissingCurrentIncarnation(TransactionKind),
+    #[error("{0:?} cannot start from an already retired workspace")]
+    AlreadyRetired(TransactionKind),
+    #[error("Restore requires a concrete checkpoint identity")]
+    MissingRestoreCheckpoint,
     #[error("replacement must mint a fresh workspace incarnation")]
     ReusedIncarnation,
-    #[error("replacement must mint a fresh gateway token")]
-    ReusedToken,
     #[error("{phase:?} is not reachable for {kind:?}")]
     UnreachableFailpoint {
         kind: TransactionKind,

@@ -2,33 +2,90 @@ use std::collections::BTreeSet;
 
 use cowshed_core::metadata::WorkspaceIncarnation;
 use cowshed_core::storage::recovery::{
-    Authority, Failpoint, GcPass, Generation, MetadataGeneration, ObjectNamespace, ProtocolEvent,
-    RecoveryDisposition, RecoveryError, RecoveryModel, StoredObject, TransactionKind,
+    AuthoritativeObservations, BeginOutcome, CheckedLifecyclePlan, CheckpointMetadata,
+    ExecutionOutcome, Failpoint, FormatMetadata, GcPass, Generation, MetadataGeneration,
+    ObjectNamespace, ProtocolEvent, RecoveryDisposition, RecoveryError, RecoveryModel,
+    RetentionMetadata, StaleDimension, StoredObject, TopologyMetadata, TransactionKind,
     TransactionPhase, TransactionSpec, enumerate_published,
 };
 use proptest::prelude::*;
 
-fn authority(digit: char, token: &str) -> Authority {
-    Authority::new(
-        WorkspaceIncarnation::new(digit.to_string().repeat(32)).unwrap(),
-        token,
-    )
-    .unwrap()
+const ALL_KINDS: [TransactionKind; 4] = [
+    TransactionKind::Adopt,
+    TransactionKind::Create,
+    TransactionKind::Restore,
+    TransactionKind::Retire,
+];
+
+const ALL_PHASES: [TransactionPhase; 14] = [
+    TransactionPhase::Prepare,
+    TransactionPhase::Prepared,
+    TransactionPhase::Validated,
+    TransactionPhase::IncarnationMinted,
+    TransactionPhase::TokenMinted,
+    TransactionPhase::StagedAuthoritySynced,
+    TransactionPhase::CanonicalSwapped,
+    TransactionPhase::CanonicalValidated,
+    TransactionPhase::DetachedMetadataReplaced,
+    TransactionPhase::Published,
+    TransactionPhase::Admitted,
+    TransactionPhase::CleanupPending,
+    TransactionPhase::Complete,
+    TransactionPhase::RolledBack,
+];
+
+const STALE_DIMENSIONS: [StaleDimension; 6] = [
+    StaleDimension::Incarnation,
+    StaleDimension::GrantRevision,
+    StaleDimension::Checkpoint,
+    StaleDimension::Format,
+    StaleDimension::Topology,
+    StaleDimension::Retirement,
+];
+
+fn incarnation(digit: char) -> WorkspaceIncarnation {
+    WorkspaceIncarnation::new(digit.to_string().repeat(32)).unwrap()
+}
+
+fn observations(kind: TransactionKind) -> AuthoritativeObservations {
+    AuthoritativeObservations {
+        incarnation: matches!(kind, TransactionKind::Restore | TransactionKind::Retire)
+            .then(|| incarnation('a')),
+        grant_revision: 17,
+        checkpoint: Some(CheckpointMetadata { revision: 23 }),
+        format: FormatMetadata { version: 3 },
+        topology: TopologyMetadata { revision: 29 },
+        retired: false,
+        retention: RetentionMetadata {
+            retain_until_revision: 101,
+        },
+    }
 }
 
 fn spec(kind: TransactionKind, suffix: &str) -> TransactionSpec {
-    let old = authority('a', &format!("old-{suffix}"));
-    let new = authority('b', &format!("new-{suffix}"));
-    let (old, new) = match kind {
-        TransactionKind::Adopt | TransactionKind::Create => (None, Some(new)),
-        TransactionKind::Restore => (Some(old), Some(new)),
-        TransactionKind::Retire => (Some(old), None),
-    };
-    TransactionSpec::new(kind, "topic", format!("tx-{suffix}"), old, new).unwrap()
+    let next = (kind != TransactionKind::Retire).then(|| incarnation('b'));
+    TransactionSpec::new(kind, "topic", format!("tx-{suffix}"), next).unwrap()
+}
+
+fn plan(kind: TransactionKind, suffix: &str) -> CheckedLifecyclePlan {
+    CheckedLifecyclePlan::new(spec(kind, suffix), observations(kind)).unwrap()
 }
 
 fn initial(kind: TransactionKind) -> RecoveryModel {
-    RecoveryModel::begin(spec(kind, "fixture"))
+    match RecoveryModel::begin(plan(kind, "fixture"), observations(kind)) {
+        BeginOutcome::Started(model) => model,
+        BeginOutcome::Conflict(conflict) => panic!("fresh plan conflicted: {conflict:?}"),
+    }
+}
+
+fn interrupted(kind: TransactionKind, phase: TransactionPhase) -> RecoveryModel {
+    match Failpoint::after(phase)
+        .interrupt(plan(kind, "failpoint"), observations(kind))
+        .unwrap()
+    {
+        ExecutionOutcome::Interrupted(model) => model,
+        ExecutionOutcome::Conflict(conflict) => panic!("fresh plan conflicted: {conflict:?}"),
+    }
 }
 
 fn advance_to(mut model: RecoveryModel, target: TransactionPhase) -> RecoveryModel {
@@ -62,159 +119,242 @@ fn old(kind: TransactionKind) -> MetadataGeneration {
 }
 
 fn expected_old_authority(kind: TransactionKind) -> Option<Generation> {
-    match kind {
-        TransactionKind::Adopt | TransactionKind::Create => None,
-        TransactionKind::Restore | TransactionKind::Retire => Some(Generation::Old),
-    }
+    matches!(kind, TransactionKind::Restore | TransactionKind::Retire).then_some(Generation::Old)
 }
 
 fn expected_new_authority(kind: TransactionKind) -> Option<Generation> {
-    match kind {
-        TransactionKind::Adopt | TransactionKind::Create | TransactionKind::Restore => {
-            Some(Generation::New)
-        }
-        TransactionKind::Retire => None,
-    }
+    (kind != TransactionKind::Retire).then_some(Generation::New)
 }
 
 fn event_position(events: &[ProtocolEvent], expected: &ProtocolEvent) -> usize {
     events.iter().position(|event| event == expected).unwrap()
 }
 
-#[test]
-fn transaction_specs_require_the_authority_shape_and_fresh_restore_credentials() {
-    let old_authority = authority('a', "old");
-    let new_authority = authority('b', "new");
+fn make_stale(
+    mut observed: AuthoritativeObservations,
+    dimension: StaleDimension,
+) -> AuthoritativeObservations {
+    match dimension {
+        StaleDimension::Incarnation => observed.incarnation = Some(incarnation('c')),
+        StaleDimension::GrantRevision => observed.grant_revision += 1,
+        StaleDimension::Checkpoint => {
+            observed.checkpoint = Some(CheckpointMetadata { revision: 24 });
+        }
+        StaleDimension::Format => observed.format.version += 1,
+        StaleDimension::Topology => observed.topology.revision += 1,
+        StaleDimension::Retirement => observed.retired = !observed.retired,
+    }
+    observed
+}
 
+#[test]
+fn transaction_specs_are_capability_free_and_require_the_incarnation_shape() {
     assert_eq!(
-        TransactionSpec::new(
-            TransactionKind::Adopt,
-            "main",
-            "tx",
-            Some(old_authority.clone()),
-            Some(new_authority.clone()),
-        ),
-        Err(RecoveryError::UnexpectedOldAuthority(
-            TransactionKind::Adopt
+        TransactionSpec::new(TransactionKind::Create, "ws", "tx", None),
+        Err(RecoveryError::MissingNextIncarnation(
+            TransactionKind::Create
         ))
     );
     assert_eq!(
-        TransactionSpec::new(TransactionKind::Create, "ws", "tx", None, None),
-        Err(RecoveryError::MissingNewAuthority(TransactionKind::Create))
-    );
-    assert_eq!(
-        TransactionSpec::new(
-            TransactionKind::Restore,
-            "ws",
-            "tx",
-            None,
-            Some(new_authority.clone()),
-        ),
-        Err(RecoveryError::MissingOldAuthority(TransactionKind::Restore))
-    );
-    assert_eq!(
-        TransactionSpec::new(
-            TransactionKind::Retire,
-            "ws",
-            "tx",
-            None,
-            Some(new_authority.clone()),
-        ),
-        Err(RecoveryError::MissingOldAuthority(TransactionKind::Retire))
-    );
-    assert_eq!(
-        TransactionSpec::new(
-            TransactionKind::Retire,
-            "ws",
-            "tx",
-            Some(old_authority.clone()),
-            Some(new_authority.clone()),
-        ),
-        Err(RecoveryError::UnexpectedNewAuthority(
+        TransactionSpec::new(TransactionKind::Retire, "ws", "tx", Some(incarnation('b')),),
+        Err(RecoveryError::UnexpectedNextIncarnation(
             TransactionKind::Retire
         ))
     );
     assert_eq!(
-        TransactionSpec::new(
-            TransactionKind::Restore,
-            "ws",
-            "tx",
-            Some(old_authority.clone()),
-            Some(authority('a', "different")),
-        ),
-        Err(RecoveryError::ReusedIncarnation)
-    );
-    assert_eq!(
-        TransactionSpec::new(
-            TransactionKind::Restore,
-            "ws",
-            "tx",
-            Some(old_authority.clone()),
-            Some(authority('b', "old")),
-        ),
-        Err(RecoveryError::ReusedToken)
-    );
-    assert_eq!(
-        TransactionSpec::new(
-            TransactionKind::Restore,
-            "",
-            "tx",
-            Some(old_authority.clone()),
-            Some(new_authority.clone()),
-        ),
+        TransactionSpec::new(TransactionKind::Restore, "", "tx", Some(incarnation('b'))),
         Err(RecoveryError::EmptyLogicalName)
     );
     assert_eq!(
-        TransactionSpec::new(
-            TransactionKind::Restore,
-            "ws",
-            "",
-            Some(old_authority.clone()),
-            Some(new_authority),
-        ),
+        TransactionSpec::new(TransactionKind::Restore, "ws", "", Some(incarnation('b'))),
         Err(RecoveryError::EmptyTransactionId)
     );
+
+    let restore = spec(TransactionKind::Restore, "shape");
+    let mut absent = observations(TransactionKind::Restore);
+    absent.incarnation = None;
     assert_eq!(
-        Authority::new(WorkspaceIncarnation::new("c".repeat(32)).unwrap(), ""),
-        Err(RecoveryError::EmptyToken)
+        CheckedLifecyclePlan::new(restore.clone(), absent),
+        Err(RecoveryError::MissingCurrentIncarnation(
+            TransactionKind::Restore
+        ))
+    );
+    let mut retired = observations(TransactionKind::Restore);
+    retired.retired = true;
+    assert_eq!(
+        CheckedLifecyclePlan::new(restore.clone(), retired),
+        Err(RecoveryError::AlreadyRetired(TransactionKind::Restore))
+    );
+    let mut without_checkpoint = observations(TransactionKind::Restore);
+    without_checkpoint.checkpoint = None;
+    assert_eq!(
+        CheckedLifecyclePlan::new(restore.clone(), without_checkpoint),
+        Err(RecoveryError::MissingRestoreCheckpoint)
+    );
+    let mut reused = observations(TransactionKind::Restore);
+    reused.incarnation = restore.next_incarnation().cloned();
+    assert_eq!(
+        CheckedLifecyclePlan::new(restore.clone(), reused),
+        Err(RecoveryError::ReusedIncarnation)
     );
 }
 
 #[test]
-fn spec_and_object_accessors_expose_every_recoverable_record_field() {
+fn prepare_stages_only_replacements_and_non_retire_completion_skips_cleanup() {
+    for kind in [
+        TransactionKind::Adopt,
+        TransactionKind::Create,
+        TransactionKind::Restore,
+    ] {
+        let prepared = initial(kind).advance().unwrap();
+        assert_eq!(prepared.phase(), TransactionPhase::Prepared);
+        assert!(prepared.staging_present());
+
+        let admitted = advance_to(prepared, TransactionPhase::Admitted);
+        let complete = admitted.advance().unwrap();
+        assert_eq!(complete.phase(), TransactionPhase::Complete);
+        assert!(!complete.cleanup_present());
+        assert!(
+            !complete
+                .events()
+                .iter()
+                .any(|event| event == &ProtocolEvent::CleanupDeferred)
+        );
+    }
+
+    let prepared = initial(TransactionKind::Retire).advance().unwrap();
+    assert_eq!(prepared.phase(), TransactionPhase::Prepared);
+    assert!(!prepared.staging_present());
+}
+
+#[test]
+fn capability_is_absent_from_plan_and_every_record_before_token_minted() {
+    let checked = plan(TransactionKind::Restore, "capability");
+    let durable_input = format!("{checked:?}");
+    assert!(!durable_input.contains("gateway-"));
+
+    for phase in [
+        TransactionPhase::Prepare,
+        TransactionPhase::Prepared,
+        TransactionPhase::Validated,
+        TransactionPhase::IncarnationMinted,
+    ] {
+        let record = interrupted(TransactionKind::Restore, phase);
+        assert_eq!(record.minted_authority(), None, "phase {phase:?}");
+        assert!(
+            !format!("{record:?}").contains("gateway-"),
+            "phase {phase:?}"
+        );
+    }
+
+    let token_minted = interrupted(TransactionKind::Restore, TransactionPhase::TokenMinted);
+    let authority = token_minted.minted_authority().unwrap();
+    assert_eq!(authority.incarnation(), &incarnation('b'));
+    assert!(authority.token().starts_with("gateway-tx-failpoint-"));
+}
+
+#[test]
+fn spec_and_object_accessors_distinguish_checkpoint_retention_from_trash() {
     let record = spec(TransactionKind::Restore, "fields");
     assert_eq!(record.kind(), TransactionKind::Restore);
     assert_eq!(record.logical_name(), "topic");
     assert_eq!(record.transaction_id(), "tx-fields");
-    assert_eq!(record.old_authority().unwrap().token(), "old-fields");
-    assert_eq!(
-        record.old_authority().unwrap().incarnation().as_str(),
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    );
-    assert_eq!(record.new_authority().unwrap().token(), "new-fields");
-    assert_eq!(
-        record.new_authority().unwrap().incarnation().as_str(),
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-    );
+    assert_eq!(record.next_incarnation().unwrap(), &incarnation('b'));
 
     let staging = record.staging_object().unwrap();
     assert_eq!(staging.namespace(), ObjectNamespace::Staging);
     assert_eq!(staging.name(), ".staging/topic-tx-fields");
-    let cleanup = record.cleanup_object().unwrap();
-    assert_eq!(cleanup.namespace(), ObjectNamespace::Trash);
-    assert_eq!(cleanup.name(), ".trash/topic-tx-fields");
+    assert_eq!(record.cleanup_object(), None);
+    let retained = record.restore_checkpoint_object().unwrap();
+    assert_eq!(retained.namespace(), ObjectNamespace::Checkpoint);
+    assert_eq!(retained.name(), ".checkpoints/topic-pre-restore-tx-fields");
+
+    let retire = spec(TransactionKind::Retire, "retire");
+    assert_eq!(retire.staging_object(), None);
+    assert_eq!(retire.restore_checkpoint_object(), None);
     assert_eq!(
-        spec(TransactionKind::Adopt, "no-old").cleanup_object(),
-        None
-    );
-    assert_eq!(
-        spec(TransactionKind::Retire, "no-new").staging_object(),
-        None
+        retire.cleanup_object().unwrap().namespace(),
+        ObjectNamespace::Trash
     );
 }
 
 #[test]
-fn restore_orders_incarnation_token_flush_publication_fsync_cutover_and_admission() {
+fn every_stale_authority_dimension_returns_a_structured_zero_effect_conflict() {
+    for dimension in STALE_DIMENSIONS {
+        let expected = observations(TransactionKind::Restore);
+        let conflict = match RecoveryModel::begin(
+            CheckedLifecyclePlan::new(spec(TransactionKind::Restore, "stale"), expected.clone())
+                .unwrap(),
+            make_stale(expected, dimension),
+        ) {
+            BeginOutcome::Conflict(conflict) => conflict,
+            BeginOutcome::Started(_) => panic!("{dimension:?} mismatch started execution"),
+        };
+        assert_eq!(conflict.stale_dimensions(), &[dimension]);
+        assert_eq!(conflict.effect_count(), 0);
+        assert_eq!(conflict.phase(), None);
+    }
+}
+
+#[test]
+fn execute_revalidates_all_dimensions_before_any_failpoint_or_prepare_effect() {
+    let expected = observations(TransactionKind::Restore);
+    let mut observed = expected.clone();
+    for dimension in STALE_DIMENSIONS {
+        observed = make_stale(observed, dimension);
+    }
+    for failpoint in ALL_PHASES {
+        let outcome = Failpoint::after(failpoint)
+            .interrupt(
+                CheckedLifecyclePlan::new(
+                    spec(TransactionKind::Restore, "all-stale"),
+                    expected.clone(),
+                )
+                .unwrap(),
+                observed.clone(),
+            )
+            .unwrap();
+        let ExecutionOutcome::Conflict(conflict) = outcome else {
+            panic!("stale execution reached failpoint {failpoint:?}");
+        };
+        assert_eq!(conflict.stale_dimensions(), STALE_DIMENSIONS.as_slice());
+        assert_eq!(conflict.effect_count(), 0);
+        assert_eq!(conflict.phase(), None);
+    }
+}
+
+#[test]
+fn all_failpoints_are_deterministically_reachable_or_rejected_for_each_kind() {
+    for kind in ALL_KINDS {
+        let mut model = initial(kind);
+        let mut reachable = Vec::new();
+        loop {
+            reachable.push(model.phase());
+            if model.phase() == TransactionPhase::Complete {
+                break;
+            }
+            model = model.advance().unwrap();
+        }
+
+        for phase in ALL_PHASES {
+            let result = Failpoint::after(phase).interrupt(plan(kind, "table"), observations(kind));
+            if reachable.contains(&phase) {
+                let ExecutionOutcome::Interrupted(record) = result.unwrap() else {
+                    panic!("fresh {kind:?} plan conflicted at {phase:?}");
+                };
+                assert_eq!(record.phase(), phase);
+            } else {
+                assert_eq!(
+                    result,
+                    Err(RecoveryError::UnreachableFailpoint { kind, phase })
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn restore_orders_identity_token_flush_publication_fsync_cutover_and_admission() {
     let completed = complete(initial(TransactionKind::Restore));
     assert_eq!(completed.phase(), TransactionPhase::Complete);
     assert_eq!(completed.canonical(), MetadataGeneration::New);
@@ -248,79 +388,108 @@ fn restore_orders_incarnation_token_flush_publication_fsync_cutover_and_admissio
 }
 
 #[test]
-fn reusable_failpoint_fixture_materializes_exact_recoverable_records() {
-    let failpoint = Failpoint::after(TransactionPhase::TokenMinted);
-    assert_eq!(failpoint.phase(), TransactionPhase::TokenMinted);
-    let interrupted = failpoint
-        .interrupt(spec(TransactionKind::Restore, "failpoint"))
-        .unwrap();
-    assert_eq!(interrupted.phase(), TransactionPhase::TokenMinted);
-    assert_eq!(interrupted.spec().kind(), TransactionKind::Restore);
-    assert_eq!(
-        Failpoint::after(TransactionPhase::TokenMinted)
-            .interrupt(spec(TransactionKind::Retire, "unreachable")),
-        Err(RecoveryError::UnreachableFailpoint {
-            kind: TransactionKind::Retire,
-            phase: TransactionPhase::TokenMinted,
-        })
-    );
-}
+fn restore_retains_displaced_generation_as_undo_with_original_metadata() {
+    let expected = observations(TransactionKind::Restore);
+    let mut observed = expected.clone();
+    observed.retention = RetentionMetadata {
+        retain_until_revision: 777,
+    };
+    let model = match RecoveryModel::begin(
+        CheckedLifecyclePlan::new(spec(TransactionKind::Restore, "undo"), expected).unwrap(),
+        observed.clone(),
+    ) {
+        BeginOutcome::Started(model) => model,
+        BeginOutcome::Conflict(conflict) => {
+            panic!("retention-only change conflicted: {conflict:?}")
+        }
+    };
+    let swapped = advance_to(model, TransactionPhase::CanonicalSwapped);
+    assert!(!swapped.cleanup_present());
+    let retained = swapped.retained_checkpoint().unwrap();
+    assert_eq!(retained.object().namespace(), ObjectNamespace::Checkpoint);
+    assert_eq!(retained.displaced_incarnation(), &incarnation('a'));
+    assert_eq!(retained.source_checkpoint(), observed.checkpoint);
+    assert_eq!(retained.format(), observed.format);
+    assert_eq!(retained.retention(), observed.retention);
 
-#[test]
-fn prepare_materializes_only_replacement_staging() {
-    let create = initial(TransactionKind::Create).advance().unwrap();
-    assert_eq!(create.phase(), TransactionPhase::Prepared);
-    assert!(create.staging_present());
+    let before_publication = swapped.clone().recover();
+    assert_eq!(before_publication.phase(), TransactionPhase::RolledBack);
+    assert_eq!(before_publication.retained_checkpoint(), None);
 
-    let retire = initial(TransactionKind::Retire).advance().unwrap();
-    assert_eq!(retire.phase(), TransactionPhase::Prepared);
-    assert!(!retire.staging_present());
-
-    let retire = advance_to(retire, TransactionPhase::Validated)
-        .advance()
-        .unwrap();
-    assert_eq!(retire.phase(), TransactionPhase::CanonicalSwapped);
+    let published = advance_to(swapped, TransactionPhase::Published);
+    let recovered = published.recover();
+    assert_eq!(recovered.phase(), TransactionPhase::Complete);
+    assert!(recovered.retained_checkpoint().is_some());
+    let (after_gc, report) = recovered.clone().gc_pass();
+    assert_eq!(after_gc, recovered);
+    assert_eq!(report, GcPass::default());
+    assert!(after_gc.retained_checkpoint().is_some());
     assert!(
-        !retire
+        !after_gc
             .events()
             .iter()
-            .any(|event| event == &ProtocolEvent::IncarnationMinted)
+            .any(|event| event == &ProtocolEvent::CleanupReclaimed)
     );
 }
 
 #[test]
-fn retire_revokes_old_authority_at_publication_and_never_admits_a_replacement() {
-    let published = advance_to(
+fn only_retire_uses_trash_and_reclaim_cleanup() {
+    for kind in [
+        TransactionKind::Adopt,
+        TransactionKind::Create,
+        TransactionKind::Restore,
+    ] {
+        let completed = complete(initial(kind));
+        assert!(!completed.cleanup_present());
+        assert!(
+            !completed
+                .events()
+                .iter()
+                .any(|event| event == &ProtocolEvent::CleanupReclaimed)
+        );
+    }
+
+    let cleanup = advance_to(
         initial(TransactionKind::Retire),
-        TransactionPhase::Published,
+        TransactionPhase::CleanupPending,
     );
-    assert_eq!(published.canonical(), MetadataGeneration::Absent);
-    assert_eq!(published.metadata(), MetadataGeneration::Absent);
-    assert_eq!(published.synced_metadata(), MetadataGeneration::Absent);
-    assert_eq!(published.accepted_authority(), None);
-    assert_eq!(published.admitted_authority(), None);
+    assert!(cleanup.cleanup_present());
+    assert_eq!(cleanup.retained_checkpoint(), None);
+    let (collected, report) = cleanup.gc_pass();
     assert_eq!(
-        published.events().last(),
-        Some(&ProtocolEvent::AuthorityCutover {
-            from: Some(Generation::Old),
-            to: None,
-        })
+        report,
+        GcPass {
+            examined: 1,
+            reclaimed: 1,
+        }
     );
-    assert!(
-        !published
-            .events()
-            .iter()
-            .any(|event| event == &ProtocolEvent::NewAdmission)
+    assert_eq!(collected.phase(), TransactionPhase::Complete);
+    assert!(!collected.cleanup_present());
+    assert_eq!(
+        collected.events().last(),
+        Some(&ProtocolEvent::CleanupReclaimed)
     );
-    let cleanup = published.advance().unwrap();
-    assert_eq!(cleanup.phase(), TransactionPhase::CleanupPending);
-    assert_eq!(cleanup.admitted_authority(), None);
-    assert!(
-        !cleanup
-            .events()
-            .iter()
-            .any(|event| event == &ProtocolEvent::NewAdmission)
-    );
+}
+
+#[test]
+fn endpoint_authority_is_exclusive_at_every_durable_phase() {
+    for kind in ALL_KINDS {
+        let mut model = initial(kind);
+        loop {
+            if let Some(admitted) = model.admitted_authority() {
+                assert_eq!(model.accepted_authority(), Some(admitted));
+            }
+            if model.phase().recovery_disposition() == RecoveryDisposition::RollBack {
+                assert_eq!(model.accepted_authority(), expected_old_authority(kind));
+            } else if model.phase() != TransactionPhase::RolledBack {
+                assert_eq!(model.accepted_authority(), expected_new_authority(kind));
+            }
+            if model.phase() == TransactionPhase::Complete {
+                break;
+            }
+            model = model.advance().unwrap();
+        }
+    }
 }
 
 #[test]
@@ -354,17 +523,11 @@ fn every_phase_has_an_explicit_one_way_recovery_disposition() {
 }
 
 #[test]
-fn all_interrupted_adopt_create_restore_and_retire_records_converge_idempotently() {
-    for kind in [
-        TransactionKind::Adopt,
-        TransactionKind::Create,
-        TransactionKind::Restore,
-        TransactionKind::Retire,
-    ] {
+fn all_interrupted_records_converge_idempotently_without_losing_restore_undo() {
+    for kind in ALL_KINDS {
         let mut interrupted = initial(kind);
         loop {
-            let crash_phase = interrupted.phase();
-            let direction = crash_phase.recovery_disposition();
+            let direction = interrupted.phase().recovery_disposition();
             let recovered_once = interrupted.clone().recover();
             let recovered_twice = recovered_once.clone().recover();
             assert_eq!(recovered_once, recovered_twice);
@@ -385,6 +548,7 @@ fn all_interrupted_adopt_create_restore_and_retire_records_converge_idempotently
                         expected_old_authority(kind)
                     );
                     assert!(!recovered_once.cleanup_present());
+                    assert_eq!(recovered_once.retained_checkpoint(), None);
                 }
                 RecoveryDisposition::RollForward => {
                     assert_eq!(recovered_once.canonical(), target(kind));
@@ -398,13 +562,16 @@ fn all_interrupted_adopt_create_restore_and_retire_records_converge_idempotently
                         recovered_once.admitted_authority(),
                         expected_new_authority(kind)
                     );
-                    let expected_phase =
-                        if matches!(kind, TransactionKind::Restore | TransactionKind::Retire) {
-                            TransactionPhase::CleanupPending
-                        } else {
-                            TransactionPhase::Complete
-                        };
+                    let expected_phase = if kind == TransactionKind::Retire {
+                        TransactionPhase::CleanupPending
+                    } else {
+                        TransactionPhase::Complete
+                    };
                     assert_eq!(recovered_once.phase(), expected_phase);
+                    assert_eq!(
+                        recovered_once.retained_checkpoint().is_some(),
+                        kind == TransactionKind::Restore
+                    );
                 }
                 RecoveryDisposition::Settled => assert_eq!(recovered_once, interrupted),
             }
@@ -434,41 +601,7 @@ fn metadata_replace_without_parent_fsync_is_still_before_the_fence() {
     assert_eq!(recovered.synced_metadata(), MetadataGeneration::Old);
     assert_eq!(recovered.accepted_authority(), Some(Generation::Old));
     assert_eq!(recovered.admitted_authority(), Some(Generation::Old));
-}
-
-#[test]
-fn gc_only_reclaims_recovery_classified_debris_and_is_idempotent() {
-    let swapped = advance_to(
-        initial(TransactionKind::Restore),
-        TransactionPhase::CanonicalSwapped,
-    );
-    assert!(swapped.cleanup_present());
-    let (untouched, report) = swapped.clone().gc_pass();
-    assert_eq!(untouched, swapped);
-    assert_eq!(report, GcPass::default());
-
-    let recovery_classified = advance_to(swapped, TransactionPhase::Published).recover();
-    assert_eq!(
-        recovery_classified.phase(),
-        TransactionPhase::CleanupPending
-    );
-    let (collected_once, first) = recovery_classified.gc_pass();
-    assert_eq!(
-        first,
-        GcPass {
-            examined: 1,
-            reclaimed: 1
-        }
-    );
-    assert_eq!(collected_once.phase(), TransactionPhase::Complete);
-    assert!(!collected_once.cleanup_present());
-    assert_eq!(
-        collected_once.events().last(),
-        Some(&ProtocolEvent::CleanupReclaimed)
-    );
-    let (collected_twice, second) = collected_once.clone().gc_pass();
-    assert_eq!(collected_twice, collected_once);
-    assert_eq!(second, GcPass::default());
+    assert_eq!(recovered.retained_checkpoint(), None);
 }
 
 #[test]
@@ -489,9 +622,10 @@ fn settled_transactions_refuse_further_execution() {
 }
 
 #[test]
-fn canonical_enumeration_is_sorted_deduplicated_and_excludes_hidden_namespaces() {
+fn canonical_enumeration_is_sorted_deduplicated_and_excludes_internal_namespaces() {
     let objects = vec![
         StoredObject::staging("same"),
+        StoredObject::checkpoint("undo"),
         StoredObject::canonical("zeta"),
         StoredObject::trash("same"),
         StoredObject::canonical("alpha"),
@@ -504,16 +638,15 @@ proptest! {
     #[test]
     fn generated_failpoints_recover_and_gc_to_identical_fixed_points(
         kind_index in 0u8..4,
-        crash_steps in 0u8..16,
+        crash_steps in 0u8..20,
         suffix in "[a-z0-9]{1,16}",
     ) {
-        let kind = [
-            TransactionKind::Adopt,
-            TransactionKind::Create,
-            TransactionKind::Restore,
-            TransactionKind::Retire,
-        ][usize::from(kind_index)];
-        let mut interrupted = RecoveryModel::begin(spec(kind, &suffix));
+        let kind = ALL_KINDS[usize::from(kind_index)];
+        let observed = observations(kind);
+        let mut interrupted = match RecoveryModel::begin(plan(kind, &suffix), observed) {
+            BeginOutcome::Started(model) => model,
+            BeginOutcome::Conflict(conflict) => panic!("fresh generated plan conflicted: {conflict:?}"),
+        };
         for _ in 0..crash_steps {
             if matches!(interrupted.phase(), TransactionPhase::Complete | TransactionPhase::RolledBack) {
                 break;
@@ -521,24 +654,59 @@ proptest! {
             interrupted = interrupted.advance().unwrap();
         }
 
+        if let Some(admitted) = interrupted.admitted_authority() {
+            prop_assert_eq!(interrupted.accepted_authority(), Some(admitted));
+        }
         let recovered_once = interrupted.recover();
         let recovered_twice = recovered_once.clone().recover();
         prop_assert_eq!(&recovered_once, &recovered_twice);
         prop_assert!(!recovered_once.staging_present());
 
+        let restore_undo = recovered_once.retained_checkpoint().cloned();
         let (gc_once, _) = recovered_once.gc_pass();
         let (gc_twice, _) = gc_once.clone().gc_pass();
-        prop_assert_eq!(gc_once, gc_twice);
+        prop_assert_eq!(&gc_once, &gc_twice);
+        prop_assert_eq!(gc_once.retained_checkpoint(), restore_undo.as_ref());
     }
 
     #[test]
-    fn generated_hidden_objects_never_enter_enumeration(
+    fn generated_single_stale_dimensions_never_create_a_prepare_record(
+        dimension_index in 0usize..STALE_DIMENSIONS.len(),
+        grant_revision in 0u64..u64::MAX,
+        checkpoint_revision in 0u64..u64::MAX,
+        format_version in 0u32..u32::MAX,
+        topology_revision in 0u64..u64::MAX,
+    ) {
+        let dimension = STALE_DIMENSIONS[dimension_index];
+        let mut expected = observations(TransactionKind::Restore);
+        expected.grant_revision = grant_revision;
+        expected.checkpoint = Some(CheckpointMetadata { revision: checkpoint_revision });
+        expected.format = FormatMetadata { version: format_version };
+        expected.topology = TopologyMetadata { revision: topology_revision };
+        let observed = make_stale(expected.clone(), dimension);
+        let checked = CheckedLifecyclePlan::new(
+            spec(TransactionKind::Restore, "generated-stale"),
+            expected,
+        ).unwrap();
+
+        let BeginOutcome::Conflict(conflict) = RecoveryModel::begin(checked, observed) else {
+            prop_assert!(false, "{dimension:?} mismatch started execution");
+            unreachable!();
+        };
+        prop_assert_eq!(conflict.stale_dimensions(), &[dimension]);
+        prop_assert_eq!(conflict.effect_count(), 0);
+        prop_assert_eq!(conflict.phase(), None);
+    }
+
+    #[test]
+    fn generated_internal_objects_never_enter_enumeration(
         entries in proptest::collection::vec("[a-z0-9-]{1,20}", 0..40),
     ) {
-        let mut objects = Vec::with_capacity(entries.len() * 3);
+        let mut objects = Vec::with_capacity(entries.len() * 4);
         let mut expected = BTreeSet::new();
         for (index, name) in entries.into_iter().enumerate() {
             objects.push(StoredObject::staging(format!("{name}-{index}")));
+            objects.push(StoredObject::checkpoint(format!("{name}-{index}")));
             objects.push(StoredObject::trash(format!("{name}-{index}")));
             if index % 3 == 0 {
                 expected.insert(name.clone());
