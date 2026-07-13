@@ -110,9 +110,10 @@ Shape:
 ### Trusted supervisor and child profiles
 
 The revision-bound profile above is the **supervisor profile**. It grants the trusted supervisor write access to
-`<workspace mount>/.cowshed/job/**` so the supervisor can allocate job IDs, capture streams, and write job records.
-That authority must never reach an executed shell. Every anonymous shell, named session, one-shot command, and descendant
-therefore runs under a second profile which intersects with the supervisor profile and only removes authority:
+`<workspace mount>/.cowshed/job/**` so the supervisor can allocate job IDs, capture streams, and write protected job
+records and lazy spill files. That authority must never reach repository-controlled code. Before any anonymous shell,
+named session, one-shot command, shell startup file, direnv hook, repository hook, or other workspace code can run,
+cowshed installs a second **child profile** which intersects with the supervisor profile and only removes authority:
 
 ```scheme
 ;; Final filesystem rule in every macOS child profile. Because SBPL is
@@ -121,11 +122,12 @@ therefore runs under a second profile which intersects with the supervisor profi
   (subpath "<workspace mount>/.cowshed/job"))
 ```
 
-The corresponding Linux child Landlock ruleset omits every write right for that subtree. Both platforms deny creating
-children, opening for write, truncating, replacing, renaming, unlinking, linking, changing metadata, and reaching a
-protected inode through a symlink, hardlink, bind mount, alternate spelling, `/proc`, or inherited descriptor. The
-supervisor opens job backing files itself and marks every writable artifact descriptor and controller-writer channel
-close-on-exec/non-inheritable before spawning any shell. Read access may remain available for `cowshed job logs` and
+The corresponding Linux child Landlock ruleset omits every write right for that subtree before `execve`. Both platforms
+deny creating children, opening for write, truncating, replacing, renaming, unlinking, linking, changing metadata, and
+reaching a protected inode through a symlink, hardlink, bind mount, alternate spelling, `/proc`, or inherited
+descriptor. The supervisor marks every writable protected-artifact descriptor and controller-writer channel
+close-on-exec/non-inheritable before spawning any shell. No protected inode may have a hardlink alias in a
+workspace-writable subtree. Read access may remain available for representation-transparent `cowshed job logs` and
 workspace-local inspection; write authority does not.
 
 This split also applies to a one-shot `cowshed exec` that does not use the persistent pool: the trusted cowshed parent
@@ -339,23 +341,32 @@ These anchors are trust configuration, not secrets, so they are exported/written
 
 ## Exec pipeline
 
-`cowshed exec <ws> [--ro] -- cmd…` / `Workspace::exec(ExecRequest)`:
+`cowshed exec <ws> [--ro] -- cmd…` / `WorkspaceHandle::exec(ExecRequest)` (07_api.md):
 
 1. Resolve workspace (marker), verify mounted (heal via ensure logic if not).
 2. Snapshot grants; validate cwd against policy; refuse commands whose cwd escapes the mount in rw mode. If the active
    supervisor's launch revision differs after an effective filesystem mutation, drain it as specified above and relaunch
    from this snapshot before admitting the exec; reject a targeted named session that belongs to the stale revision.
-3. Compose env: identity + cache wiring (03_caches.md) + `TRACEPARENT` for the job's span (13_telemetry.md) + the
-   workspace's own `.envrc` via fail-closed `direnv export` (see "devenv / Nix inside the sandbox") + caller env
-   filtered through an allowlist (build-configuration variables only — never `*_TOKEN`, `*_SECRET`, `AWS_*`, etc.).
-4. Allocate the next workspace-local monotonic numeric job ID. The trusted supervisor exclusively creates and opens the
-   job directory and backing files, then launches the shell under an inner command profile whose final rule denies every
-   write mutation beneath `.cowshed/job/**`. The inner profile also applies request-specific narrowing such as `--ro`;
-   it may never add authority absent from the revision-bound supervisor envelope.
-5. Tee the complete bytes received on the child stdout and stderr pipes separately to protected
-   `.cowshed/job/<numeric-id>/out` and `.cowshed/job/<numeric-id>/err` while streaming them to the caller. Publish
-   complete Arrow record batches at `.cowshed/job/records.arrow`, seal terminal artifacts, and report exit code, PIDs,
-   and the enforced supervisor grant revision.
+3. Allocate the next workspace-local monotonic numeric job ID, append a complete
+   `ProtectedRecord::Job(JobArtifactRecord)` admission batch, and publish
+   `ControllerCommitment::Admission(AdmissionCommitment)` before process creation. Only the trusted supervisor opens the
+   protected record stream.
+4. Compile and install the child profile before starting an environment loader or shell. The trusted parent contributes
+   identity, cache wiring (03_caches.md), `TRACEPARENT`, and caller env filtered to build-configuration variables. A
+   restricted loader child—not the supervisor—runs fail-closed `direnv export` and any workspace `.envrc`; it returns
+   the resulting environment through a bounded non-authoritative channel. The target shell starts under the same or a
+   narrower child restriction, whose final rule denies every mutation beneath `.cowshed/job/**`. Thus no shell startup,
+   direnv/repository hook, named session, one-shot, or descendant ever executes with supervisor artifact-write
+   authority. Request-specific `--ro` may narrow further but never add authority.
+5. Read stdout and stderr as separate opaque byte streams, incrementally hash and quota-account them, and begin in
+   bounded memory. Terminal streams at or below the inline limit are stored as Arrow Binary in a complete protected
+   batch. A stream creates `.cowshed/job/<numeric-id>/out` or `err` only when it crosses that limit or a checkpoint/live
+   replay requirement forces promotion; promotion writes the complete buffered prefix before appending. AST-proven shell
+   redirection is authoritative only when the supervisor controls the actual writable descriptor and applies the same
+   exact quota boundary; polling/tailing a path is forbidden. Explicit post-terminal publication and protected redirect
+   snapshots use independent clone/reflink/copy artifacts, never hardlinks (11_shell.md). Drain, fsync, seal, and
+   publish the terminal Arrow batch before the controller terminal commitment; report exit code, PIDs, hashes, and the
+   enforced supervisor grant revision.
 
 ## Sandbox-denial evidence
 
