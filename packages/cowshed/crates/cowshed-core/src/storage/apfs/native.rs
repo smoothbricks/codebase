@@ -43,15 +43,39 @@ const CHECKPOINT_FACT_VERSION: u32 = 1;
 const CHECKPOINT_FACT_SUFFIX: &str = ".checkpoint.json";
 const SELF_HEALING_STUB: &[u8] = b"cowshed ensure --attach\n";
 
+const ROOT_OPEN_FLAGS: libc::c_int =
+    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+const DIRECTORY_OPEN_FLAGS: libc::c_int =
+    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+const LOCK_FILE_OPEN_FLAGS: libc::c_int =
+    libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+const WAIT_LOCK_OPERATION: libc::c_int = libc::LOCK_EX;
+const TRY_LOCK_OPERATION: libc::c_int = libc::LOCK_EX | libc::LOCK_NB;
+const LOCK_FILE_MODE: libc::c_uint = 0o600;
+const CONTROLLER_DIRECTORY_MODE: libc::mode_t = 0o700;
+
+fn fd_failed(fd: libc::c_int) -> bool {
+    fd == -1
+}
+
+fn flock_succeeded(result: libc::c_int) -> bool {
+    result == 0
+}
+
+fn lock_is_busy(mode: LockMode, kind: io::ErrorKind) -> bool {
+    matches!((mode, kind), (LockMode::Try, io::ErrorKind::WouldBlock))
+}
+
 pub struct ImageLockGuard {
     files: Vec<File>,
 }
 
 impl Drop for ImageLockGuard {
     fn drop(&mut self) {
+        const UNLOCK_OPERATION: libc::c_int = libc::LOCK_UN;
         for file in self.files.iter().rev() {
             unsafe {
-                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+                let _ = libc::flock(file.as_raw_fd(), UNLOCK_OPERATION);
             }
         }
     }
@@ -73,13 +97,8 @@ fn open_lock_file(root: &Path, path: &Path) -> Result<File, ApfsStorageError> {
     }
     let root_name = CString::new(root.as_os_str().as_bytes())
         .map_err(|_| ApfsStorageError::Host("store root contains NUL".to_owned()))?;
-    let root_fd = unsafe {
-        libc::open(
-            root_name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if root_fd < 0 {
+    let root_fd = unsafe { libc::open(root_name.as_ptr(), ROOT_OPEN_FLAGS) };
+    if fd_failed(root_fd) {
         return Err(io_error(
             "open controller store without following symlinks",
             root,
@@ -99,11 +118,11 @@ fn open_lock_file(root: &Path, path: &Path) -> Result<File, ApfsStorageError> {
                 libc::openat(
                     directory.as_raw_fd(),
                     name.as_ptr(),
-                    libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    0o600,
+                    LOCK_FILE_OPEN_FLAGS,
+                    LOCK_FILE_MODE,
                 )
             };
-            if fd < 0 {
+            if fd_failed(fd) {
                 return Err(io_error(
                     "open lifecycle lock without following symlinks",
                     path,
@@ -112,31 +131,29 @@ fn open_lock_file(root: &Path, path: &Path) -> Result<File, ApfsStorageError> {
             }
             return Ok(unsafe { File::from_raw_fd(fd) });
         }
-        let mut fd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 && io::Error::last_os_error().kind() == io::ErrorKind::NotFound {
-            let created = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
-            if created != 0 && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists {
+        let mut fd =
+            unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), DIRECTORY_OPEN_FLAGS) };
+        if fd_failed(fd) && io::Error::last_os_error().kind() == io::ErrorKind::NotFound {
+            let created = unsafe {
+                libc::mkdirat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    CONTROLLER_DIRECTORY_MODE,
+                )
+            };
+            if fd_failed(created)
+                && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
+            {
                 return Err(io_error(
                     "create controller directory without following symlinks",
                     path,
                     io::Error::last_os_error(),
                 ));
             }
-            fd = unsafe {
-                libc::openat(
-                    directory.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
+            fd =
+                unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), DIRECTORY_OPEN_FLAGS) };
         }
-        if fd < 0 {
+        if fd_failed(fd) {
             return Err(io_error(
                 "open controller directory without following symlinks",
                 path,
@@ -162,12 +179,12 @@ fn acquire_image_locks(
     for path in paths {
         let file = open_lock_file(root, &path)?;
         let operation = match mode {
-            LockMode::Wait => libc::LOCK_EX,
-            LockMode::Try => libc::LOCK_EX | libc::LOCK_NB,
+            LockMode::Wait => WAIT_LOCK_OPERATION,
+            LockMode::Try => TRY_LOCK_OPERATION,
         };
         loop {
             let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
-            if result == 0 {
+            if flock_succeeded(result) {
                 files.push(file);
                 break;
             }
@@ -175,7 +192,7 @@ fn acquire_image_locks(
             if error.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            if mode == LockMode::Try && error.kind() == io::ErrorKind::WouldBlock {
+            if lock_is_busy(mode, error.kind()) {
                 return Ok(None);
             }
             return Err(io_error("acquire lifecycle lock", &path, error));
@@ -2725,5 +2742,56 @@ fn swap_paths(left: &Path, right: &Path) -> Result<(), ApfsStorageError> {
         Err(ApfsStorageError::Host(
             "atomic APFS restore swap requires macOS renameatx_np".to_owned(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_flag_and_result_tables_are_exact() {
+        assert_eq!(
+            ROOT_OPEN_FLAGS,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        );
+        assert_eq!(DIRECTORY_OPEN_FLAGS, ROOT_OPEN_FLAGS);
+        assert_eq!(
+            LOCK_FILE_OPEN_FLAGS,
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        );
+        assert_eq!(WAIT_LOCK_OPERATION, libc::LOCK_EX);
+        assert_eq!(TRY_LOCK_OPERATION, libc::LOCK_EX | libc::LOCK_NB);
+        assert_eq!(LOCK_FILE_MODE, 0o600);
+        assert_eq!(CONTROLLER_DIRECTORY_MODE, 0o700);
+
+        for (fd, failed) in [(-1, true), (0, false), (1, false)] {
+            assert_eq!(fd_failed(fd), failed, "fd={fd}");
+            assert_eq!(flock_succeeded(fd), fd == 0, "result={fd}");
+        }
+        for (mode, kind, busy) in [
+            (LockMode::Try, io::ErrorKind::WouldBlock, true),
+            (LockMode::Wait, io::ErrorKind::WouldBlock, false),
+            (LockMode::Try, io::ErrorKind::Other, false),
+            (LockMode::Wait, io::ErrorKind::Other, false),
+        ] {
+            assert_eq!(lock_is_busy(mode, kind), busy, "{mode:?}/{kind:?}");
+        }
+    }
+
+    #[test]
+    fn parent_sync_rejects_root_and_missing_parent() {
+        assert!(matches!(
+            sync_parent_path(Path::new("/")),
+            Err(ApfsStorageError::InvalidPlan(_))
+        ));
+        let missing = PathBuf::from(format!(
+            "/tmp/cowshed-missing-parent-{}/child",
+            std::process::id()
+        ));
+        assert!(matches!(
+            sync_parent_path(&missing),
+            Err(ApfsStorageError::Io { .. })
+        ));
     }
 }
