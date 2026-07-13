@@ -16,8 +16,11 @@
  */
 
 import { bufferHelpers, type ColumnEntry } from '@smoothbricks/arrow-builder';
+import {
+  resolveEnumLookupDescriptor,
+  type SchemaEnumLookupDescriptor,
+} from '../enumMetadata.js';
 import type { MessageLayoutFamily } from '../runtimeHint.js';
-import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
 import type { InferSchema, LogSchema } from '../schema/types.js';
 import type { AnySpanBuffer } from '../types.js';
 import type { TimestampAppendPrimitive } from '../traceRoot.js';
@@ -56,6 +59,7 @@ export interface WriterState {
   readonly _appendLogEntry: TimestampAppendPrimitive;
   readonly _physicalLayoutPlan: {
     readonly ResultWriterClass: ResultWriterConstructor;
+    readonly enumLookup: SchemaEnumLookupDescriptor;
   };
   /** Append one dynamic row, centralizing overflow and active-buffer updates. */
   _appendWriterEntry(entryType: number): number;
@@ -90,31 +94,10 @@ function isResultWriterConstructor(value: unknown): value is ResultWriterConstru
   return typeof value === 'function';
 }
 
-/**
- * Generate enum value mapping code.
- * Creates a switch-case statement for compile-time enum mapping.
- */
-function generateEnumMapping(fieldName: string, enumValues: readonly string[]): string {
-  const cases = enumValues.map((value, index) => `    case ${JSON.stringify(value)}: return ${index};`).join('\n');
-
-  return `
-  function getEnumIndex_${fieldName}(value) {
-    switch(value) {
-${cases}
-      default: return 0;
-    }
-  }`;
-}
 
 /** Generate a state-bound setter for one schema attribute and literal row. */
-function generateSetterMethod(
-  fieldName: string,
-  schema: unknown,
-  hasEnumMapping: boolean,
-  position: number,
-): string {
-  const lmaoType = getSchemaType(schema);
-  const value = lmaoType === 'enum' && hasEnumMapping ? `getEnumIndex_${fieldName}(value)` : 'value';
+function generateSetterMethod(fieldName: string, enumEncoderName: string | undefined, position: number): string {
+  const value = enumEncoderName ? `${enumEncoderName}(value)` : 'value';
   return `
     ${fieldName}(value) {
       this._state._spanBuffer.${fieldName}(${position}, ${value});
@@ -128,13 +111,12 @@ function generateSetterMethod(
  */
 function generateWithMethod(
   schemaFields: readonly ColumnEntry[],
-  enumFieldNames: Set<string>,
+  enumEncoderNames: Readonly<Record<string, string>>,
   position: number,
 ): string {
   const columnWrites = schemaFields.map(([fieldName]) => {
-    const valueExpr = enumFieldNames.has(fieldName)
-      ? `getEnumIndex_${fieldName}(attributes.${fieldName})`
-      : `attributes.${fieldName}`;
+    const enumEncoderName = enumEncoderNames[fieldName];
+    const valueExpr = enumEncoderName ? `${enumEncoderName}(attributes.${fieldName})` : `attributes.${fieldName}`;
 
     return `
       if ('${fieldName}' in attributes && attributes.${fieldName} !== null && attributes.${fieldName} !== undefined) {
@@ -165,29 +147,22 @@ export function generateFixedPositionWriterClass(
   className: string,
   extension?: FixedPositionWriterExtension,
   eagerColumns: readonly string[] = [],
+  enumLookup: SchemaEnumLookupDescriptor = resolveEnumLookupDescriptor(schema),
 ): string {
   const schemaFields = schema._columns;
   void eagerColumns;
+  const enumEncoderNames = Object.create(null) as Record<string, string>;
+  const enumEncoderBindings = enumLookup.ordered.map(({ fieldName }, index) => {
+    const encoderName = `encodeEnum${index}`;
+    enumEncoderNames[fieldName] = encoderName;
+    return `  const ${encoderName} = enumLookup.byField[${JSON.stringify(fieldName)}].encode;`;
+  });
 
-  // Generate enum mapping functions
-  const enumMappings: string[] = [];
-  const enumFieldNames = new Set<string>();
-
-  for (const [fieldName, fieldSchema] of schemaFields) {
-    const lmaoType = getSchemaType(fieldSchema);
-    const enumValues = getEnumValues(fieldSchema);
-
-    if (lmaoType === 'enum' && enumValues) {
-      enumMappings.push(generateEnumMapping(fieldName, enumValues));
-      enumFieldNames.add(fieldName);
-    }
-  }
-
-  const setterMethods = schemaFields.map(([fieldName, fieldSchema]) =>
-    generateSetterMethod(fieldName, fieldSchema, enumFieldNames.has(fieldName), position),
+  const setterMethods = schemaFields.map(([fieldName]) =>
+    generateSetterMethod(fieldName, enumEncoderNames[fieldName], position),
   );
 
-  const withMethod = generateWithMethod(schemaFields, enumFieldNames, position);
+  const withMethod = generateWithMethod(schemaFields, enumEncoderNames, position);
 
   const constructorSignature = 'state';
   const constructorBody = ['    this._state = state;'];
@@ -205,8 +180,7 @@ export function generateFixedPositionWriterClass(
   // Generated class stores only `_state`; every method embeds its fixed row literal.
   const classCode = `
   'use strict';
-
-  ${enumMappings.join('\n')}
+${enumEncoderBindings.join('\n')}
 
   class ${className} {
     constructor(${constructorSignature}) {
@@ -260,8 +234,19 @@ uint64_value(value) {
  * Generate TagWriter class code for a schema.
  * TagWriter writes to position 0 (span-start row).
  */
-export function generateTagWriterClass(schema: LogSchema, eagerColumns: readonly string[] = []): string {
-  return generateFixedPositionWriterClass(schema, 0, 'GeneratedTagWriter', tagWriterExtension, eagerColumns);
+export function generateTagWriterClass(
+  schema: LogSchema,
+  eagerColumns: readonly string[] = [],
+  enumLookup: SchemaEnumLookupDescriptor = resolveEnumLookupDescriptor(schema),
+): string {
+  return generateFixedPositionWriterClass(
+    schema,
+    0,
+    'GeneratedTagWriter',
+    tagWriterExtension,
+    eagerColumns,
+    enumLookup,
+  );
 }
 
 /**
@@ -273,16 +258,17 @@ export function generateTagWriterClass(schema: LogSchema, eagerColumns: readonly
 export function getTagWriterClass<T extends LogSchema>(
   schema: T,
   eagerColumns: readonly string[] = [],
+  enumLookup: SchemaEnumLookupDescriptor = resolveEnumLookupDescriptor(schema),
 ): TagWriterConstructor<T> {
   const cacheKey = eagerColumns.join('\u0000');
   let classes = tagWriterClassCache.get(schema);
   let WriterClass = classes?.get(cacheKey);
 
   if (!WriterClass) {
-    const classCode = generateTagWriterClass(schema, eagerColumns).trim();
+    const classCode = generateTagWriterClass(schema, eagerColumns, enumLookup).trim();
 
-    const factory = new Function('helpers', classCode);
-    WriterClass = factory(bufferHelpers);
+    const factory = new Function('helpers', 'enumLookup', classCode);
+    WriterClass = factory(bufferHelpers, enumLookup);
 
     if (!isTagWriterConstructor<LogSchema>(WriterClass)) {
       throw new Error('Failed to generate TagWriter constructor');
@@ -343,6 +329,7 @@ export function generateResultWriterClass(
   schema: LogSchema,
   messageLayoutFamily: MessageLayoutFamily = 'mixed',
   eagerColumns: readonly string[] = [],
+  enumLookup: SchemaEnumLookupDescriptor = resolveEnumLookupDescriptor(schema),
 ): string {
   return generateFixedPositionWriterClass(
     schema,
@@ -350,6 +337,7 @@ export function generateResultWriterClass(
     'GeneratedResultWriter',
     createResultWriterExtension(messageLayoutFamily),
     eagerColumns,
+    enumLookup,
   );
 }
 
@@ -363,17 +351,18 @@ export function getResultWriterClass<T extends LogSchema>(
   schema: T,
   messageLayoutFamily: MessageLayoutFamily = 'mixed',
   eagerColumns: readonly string[] = [],
+  enumLookup: SchemaEnumLookupDescriptor = resolveEnumLookupDescriptor(schema),
 ): ResultWriterConstructor {
   let familyClasses = resultWriterClassCache.get(schema);
   const cacheKey = `${messageLayoutFamily}:${eagerColumns.join('\u0000')}`;
   let WriterClass = familyClasses?.get(cacheKey);
 
   if (!WriterClass) {
-    const classCode = generateResultWriterClass(schema, messageLayoutFamily, eagerColumns).trim();
+    const classCode = generateResultWriterClass(schema, messageLayoutFamily, eagerColumns, enumLookup).trim();
 
     // Compile with new Function()
-    const factory = new Function('helpers', classCode);
-    WriterClass = factory(bufferHelpers);
+    const factory = new Function('helpers', 'enumLookup', classCode);
+    WriterClass = factory(bufferHelpers, enumLookup);
 
     if (!isResultWriterConstructor(WriterClass)) {
       throw new Error('Failed to generate ResultWriter constructor');

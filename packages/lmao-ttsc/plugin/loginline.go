@@ -407,17 +407,6 @@ func (t *fileTransformer) applyLogInlines(inlines []logInline) {
 			if in.templateID == 0 { return num(0) }
 			return t.staticVocabularyOperand(in.templateID)
 		}
-		// Overflow happy-path inline: one compare instead of a method call;
-		// the (rare) overflow path still runs the runtime's _checkOverflow,
-		// which owns buffer switching, capacity tuning, and scope prefill.
-		overflowCheck := factory.NewIfStatement(
-			factory.NewBinaryExpression(nil,
-				propAccess(propAccess(ident("$$l"), "_buffer"), "_writeIndex"), nil,
-				factory.NewToken(shimast.KindGreaterThanEqualsToken),
-				propAccess(propAccess(ident("$$l"), "_buffer"), "_capacity")),
-			factory.NewBlock(factory.NewNodeList([]*shimast.Node{
-				factory.NewExpressionStatement(callExpr(propAccess(ident("$$l"), "_checkOverflow"), nil)),
-			}), false), nil)
 		stmts := []*shimast.Node{constDecl(logger, in.logExpr)}
 		// Evaluate arguments before entering the logger path. A throwing field
 		// initializer therefore cannot leave a partially written row.
@@ -428,11 +417,9 @@ func (t *fileTransformer) applyLogInlines(inlines []logInline) {
 			capturedWrites[index] = tagWrite{field: write.field, arg: value}
 		}
 		stmts = append(stmts,
-			overflowCheck,
-			constDecl(buf, propAccess(logger, "_buffer")),
-			constDecl(idx, callExpr(propAccess(propAccess(buf, "_traceRoot"), "writeLogEntry"),
-				[]*shimast.Node{buf, num(logEntryTypes[in.level]), vocabularyOperand()})),
-			binaryStmt(propAccess(logger, "_writeIndex"), shimast.KindEqualsToken, idx),
+			constDecl(idx, callExpr(propAccess(propAccess(logger, "_state"), "_appendWriterEntry"),
+				[]*shimast.Node{num(logEntryTypes[in.level])})),
+			constDecl(buf, propAccess(propAccess(logger, "_state"), "_buffer")),
 		)
 		if in.templateID != 0 {
 			packed := factory.NewBinaryExpression(nil,
@@ -461,23 +448,16 @@ func (t *fileTransformer) applyLogInlines(inlines []logInline) {
 			info := in.schema[w.field]
 			switch info.kind {
 			case fieldEnum:
-				// Positional buffer method, string→index folded when literal
-				// (mirrors the generated enum override setter).
-				var enumIdx *shimast.Node
-				if isCompileTimeLiteral(w.arg) && w.arg.Kind == shimast.KindStringLiteral {
-					v := 0
-					for i, ev := range info.enumValues {
-						if ev == shimast.NodeText(w.arg) {
-							v = i
-							break
-						}
-					}
-					enumIdx = num(v)
-				} else {
-					enumIdx = enumSwitchIIFE(w.arg, info.enumValues)
-				}
+				// Runtime schema order, not checker union order, is the dictionary ABI.
+				enumLookup := propAccess(
+					propAccess(propAccess(propAccess(logger, "_state"), "_physicalLayoutPlan"), "enumLookup"),
+					"byField",
+				)
 				stmts = append(stmts, factory.NewExpressionStatement(
-					callExpr(propAccess(buf, w.field), []*shimast.Node{idx, enumIdx})))
+					callExpr(propAccess(buf, w.field), []*shimast.Node{
+						idx,
+						enumEncodeCall(enumLookup, w.field, w.arg),
+					})))
 			case fieldBool:
 				// Bit-packed at row granularity — go through the buffer's
 				// positional method like the generated setter does.
