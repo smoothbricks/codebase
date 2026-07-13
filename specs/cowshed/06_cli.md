@@ -34,6 +34,21 @@ stale, not authoritative. Long operations additionally emit NDJSON progress even
 (`{"event":"attach","ms":233}`) — NDJSON here is a **wire encoding on a pipe to a live consumer**, the same role it
 plays for `--ndjson` export flags; cowshed never writes NDJSON to disk (telemetry storage is Arrow, 13_telemetry.md).
 
+### JSON result bodies (frozen)
+
+Every command uses a named `cowshed-core` DTO as its `result`; adapters never assemble anonymous maps. `adopt`, `new`,
+`fork`, `restore`, `attach`, and `path` return `MountResult { workspace, mount }`. `detach`, `rm`, job detach/kill, and
+successful policy mutations with no additional observation return the literal empty object `{}` through `EmptyResult`
+(never `null`, `true`, or a message string). `doctor` returns `DoctorReport { healthy, findings }`; each `Finding` has
+`code`, `severity`, `message`, `hint`, and optional `path`. `ls` returns `WorkspaceInfo[]`; `ensure` returns
+`EnsureReport`; `gc` returns `GcReport`. Exec and job commands return the frozen job DTOs in 07_api.md. Commands whose
+normal stdout is a scalar use a named one-field body (`CheckpointResult { label }`, `RevisionResult { oid }`,
+`SlotResult { slot }`) so JSON never changes shape when another field is added.
+
+The controller transport never places raw stdout/stderr bytes in a JSON body. `StreamInfo.path` names the raw spool and
+its `summary` is only the bounded diagnostic projection. A detached workspace omits unavailable `branch`, `baseCommit`,
+and `createdAt` fields; it does not emit `null`, attach as a side effect, or invent defaults.
+
 ### Exec and job JSON (frozen)
 
 Every `cowshed exec` submission, foreground or background, atomically allocates a positive, workspace-local,

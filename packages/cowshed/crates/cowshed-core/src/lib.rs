@@ -1,5 +1,14 @@
 //! Warm, copy-on-write workspaces with explicit controller authority.
 
+pub mod api {
+    pub mod capability;
+    pub mod dto;
+
+    pub use capability::{
+        Coordinator, CoordinatorToken, Cowshed, Project, WorkspaceHandle, WorkspaceRef,
+    };
+    pub use dto::*;
+}
 pub mod apfs;
 pub mod copy;
 pub mod error;
@@ -12,3 +21,7 @@ pub mod secrets;
 pub mod storage;
 
 pub use error::{CowshedError, ErrorCode, Result};
+
+pub use api::{
+    Coordinator, CoordinatorToken, Cowshed, Project, WorkspaceHandle, WorkspaceRef,
+};
