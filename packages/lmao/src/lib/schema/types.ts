@@ -207,7 +207,7 @@ export interface SchemaBuilder {
    * Use for: Operations, HTTP methods, entry types, status enums
    * Example: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE'])
    */
-  enum<T extends readonly string[]>(values: T): SchemaOrFlagBuilder<T[number]>;
+  enum<const T extends readonly string[]>(values: T): SchemaOrFlagBuilder<T[number]>;
 
   /**
    * Category - Values that often repeat (limited cardinality)
