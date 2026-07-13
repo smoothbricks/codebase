@@ -2771,6 +2771,56 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn recovery_enumerators_are_no_follow_and_type_exact() {
+        let root =
+            std::env::temp_dir().join(format!("cowshed-apfs-enumerators-{}", uuid::Uuid::new_v4()));
+        let directory = root.join("directory");
+        let child_directory = directory.join("child");
+        let regular_file = directory.join("entry.asif");
+        let directory_link = root.join("directory-link");
+        let file_link = directory.join("entry-link.asif");
+        std::fs::create_dir_all(&child_directory).expect("child directory");
+        std::fs::write(&regular_file, b"image").expect("regular file");
+        std::os::unix::fs::symlink(&directory, &directory_link).expect("directory symlink");
+        std::os::unix::fs::symlink(&regular_file, &file_link).expect("file symlink");
+
+        assert!(
+            directory_children(&root.join("missing"))
+                .expect("missing directory")
+                .is_empty()
+        );
+        assert!(
+            directory_children(&directory_link)
+                .expect("directory symlink")
+                .is_empty()
+        );
+        assert!(directory_children(&regular_file).is_err());
+        assert_eq!(
+            directory_children(&directory).expect("directory children"),
+            vec![child_directory]
+        );
+
+        assert!(
+            regular_file_children(&root.join("missing"))
+                .expect("missing directory")
+                .is_empty()
+        );
+        assert!(
+            regular_file_children(&directory_link)
+                .expect("directory symlink")
+                .is_empty()
+        );
+        assert!(regular_file_children(&regular_file).is_err());
+        assert_eq!(
+            regular_file_children(&directory).expect("regular file children"),
+            vec![regular_file]
+        );
+
+        std::fs::remove_dir_all(root).expect("fixture cleanup");
+    }
+
     #[test]
     fn parent_sync_rejects_root_and_missing_parent() {
         assert!(matches!(
