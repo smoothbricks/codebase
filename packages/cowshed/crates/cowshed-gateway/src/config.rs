@@ -1,4 +1,10 @@
-use std::{fmt, net::SocketAddr, num::NonZeroUsize, path::PathBuf, time::Duration};
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    num::NonZeroUsize,
+    path::PathBuf,
+    time::Duration,
+};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use subtle::ConstantTimeEq;
@@ -202,8 +208,50 @@ fn validate_identifier(field: &'static str, value: &str) -> Result<(), ConfigErr
     Ok(())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControlTcpConfig {
+    pub address: SocketAddr,
+    pub credential_file: PathBuf,
+}
+
+impl ControlTcpConfig {
+    pub fn new(credential_file: PathBuf) -> Self {
+        Self {
+            address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7_644),
+            credential_file,
+        }
+    }
+
+    fn validate(
+        &self,
+        host_root: Option<&std::path::Path>,
+        authorized_uid: u32,
+    ) -> Result<(), ConfigError> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        if self.address != SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7_644) {
+            return Err(ConfigError::InvalidControlTcpAddress);
+        }
+        let root = host_root.ok_or(ConfigError::MissingProductionControlSocket)?;
+        if !self.credential_file.is_absolute() || self.credential_file.parent() != Some(root) {
+            return Err(ConfigError::InvalidControlCredentialFile);
+        }
+        let metadata = std::fs::symlink_metadata(&self.credential_file)
+            .map_err(|_| ConfigError::InvalidControlCredentialFile)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != authorized_uid
+            || metadata.permissions().mode() & 0o777 != 0o600
+        {
+            return Err(ConfigError::InvalidControlCredentialFile);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct GatewayLimits {
+    pub max_sessions: usize,
     pub workspace_active: usize,
     pub workspace_queued: usize,
     pub global_active: usize,
@@ -216,6 +264,7 @@ pub struct GatewayLimits {
 impl Default for GatewayLimits {
     fn default() -> Self {
         Self {
+            max_sessions: 1024,
             workspace_active: 32,
             workspace_queued: 64,
             global_active: 256,
@@ -230,6 +279,7 @@ impl Default for GatewayLimits {
 impl GatewayLimits {
     pub fn validate(&self) -> Result<(), ConfigError> {
         let fields = [
+            self.max_sessions,
             self.workspace_active,
             self.workspace_queued,
             self.global_active,
@@ -241,7 +291,8 @@ impl GatewayLimits {
         if fields.into_iter().any(|value| value == 0) {
             return Err(ConfigError::ZeroLimit);
         }
-        if self.workspace_active > self.global_active
+        if self.max_sessions > 4096
+            || self.workspace_active > self.global_active
             || self.workspace_queued > self.global_queued
             || self.leaf_cache_workspace > self.leaf_cache_global
         {
@@ -361,6 +412,9 @@ impl Default for MirrorCacheConfig {
 #[derive(Clone, Debug)]
 pub struct GatewayConfig {
     pub control_socket: Option<PathBuf>,
+    pub control_tcp: Option<ControlTcpConfig>,
+    /// Controller-owned, one-way simulator artifact drop directory.
+    pub simulator_drop_root: Option<PathBuf>,
     /// Authoritative private directory for Linux workspace data sockets.
     pub data_socket_root: Option<PathBuf>,
     pub authorized_control_uid: u32,
@@ -374,6 +428,8 @@ impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             control_socket: None,
+            control_tcp: None,
+            simulator_drop_root: None,
             data_socket_root: None,
             authorized_control_uid: unsafe { libc::geteuid() },
             limits: GatewayLimits::default(),
@@ -393,6 +449,14 @@ impl GatewayConfig {
             && !path.is_absolute()
         {
             return Err(ConfigError::RelativeSocketPath);
+        }
+        if let Some(tcp) = &self.control_tcp {
+            tcp.validate(
+                self.control_socket
+                    .as_deref()
+                    .and_then(std::path::Path::parent),
+                self.authorized_control_uid,
+            )?;
         }
         #[cfg(target_os = "linux")]
         {
@@ -544,6 +608,12 @@ pub enum ConfigError {
     InvalidProductionCacheRoot,
     #[error("gateway mirror cache low-water/TTL limits are invalid")]
     InvalidMirrorCacheLimits,
+    #[error("gateway control TCP listener must be exactly 127.0.0.1:7644")]
+    InvalidControlTcpAddress,
+    #[error(
+        "gateway controller credential must be a real mode-0600 file directly under the validated host root"
+    )]
+    InvalidControlCredentialFile,
     #[error(transparent)]
     Policy(#[from] crate::policy::PolicyError),
 }

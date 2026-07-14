@@ -18,21 +18,28 @@ use tokio::{
 
 use crate::{
     cache::{Cache, CacheError},
-    config::{ConfigError, GatewayConfig, WorkspaceEndpoint, WorkspaceSession},
+    config::{ConfigError, ControlTcpConfig, GatewayConfig, WorkspaceEndpoint, WorkspaceSession},
+    control::ControlError,
     interfaces::{
-        AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus, ConnectError,
-        CredentialProvider, UpstreamConnector,
+        AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus, ConnectError, CredentialError,
+        CredentialProvider, SystemConnector, UpstreamConnector,
     },
     mirror::{MirrorCacheStatus, MirrorService},
-    policy::{CanonicalTarget, EgressMode, MirrorProtocol, PolicyDenial, normalize_path},
+    policy::{
+        CanonicalHost, CanonicalTarget, EgressMode, MirrorProtocol, PolicyDenial, TargetScheme,
+        normalize_path,
+    },
     proxy,
-    telemetry::ArrowAuditConfig,
+    repo_mirror::{Git2RepoTransport, RepoMirrorError, RepoMirrorHandle, RepoTransport},
+    sim_broker::{SimBrokerError, SimBrokerHandle, SimRunner, XcrunSimRunner},
+    telemetry::{ArrowAuditConfig, ArrowAuditSink, AuditTailHandle},
     tls::{CaSigner, LeafCache, TlsError},
 };
+
 #[cfg(target_os = "macos")]
-use crate::{
-    interfaces::SystemConnector, platform::KeychainCredentialProvider, telemetry::ArrowAuditSink,
-};
+use crate::platform::KeychainCredentialProvider;
+#[cfg(target_os = "linux")]
+use crate::platform::SystemdCredentialProvider;
 
 #[derive(Clone)]
 pub struct GatewayHandle {
@@ -45,6 +52,35 @@ impl fmt::Debug for GatewayHandle {
             .debug_struct("GatewayHandle")
             .finish_non_exhaustive()
     }
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum BrokerAuditKind {
+    RepoMirror,
+    Sim,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum BrokerAuditStatus {
+    Allowed,
+    Denied,
+    Failed,
+    Completed,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BrokerAuditEvent {
+    pub workspace_id: String,
+    pub kind: BrokerAuditKind,
+    pub method: Option<String>,
+    pub path: Option<String>,
+    pub status: BrokerAuditStatus,
+    pub classification: Option<String>,
+    pub bytes: u64,
+}
+
+#[async_trait::async_trait]
+pub(crate) trait BrokerAuditor: Send + Sync {
+    async fn record_broker(&self, event: BrokerAuditEvent) -> Result<(), AuditError>;
 }
 
 impl GatewayHandle {
@@ -81,6 +117,22 @@ impl GatewayHandle {
             .await
             .map_err(|_| GatewayError::Stopped)
     }
+    async fn record_broker_event(&self, event: BrokerAuditEvent) -> Result<(), AuditError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::BrokerAudit { event, reply })
+            .await
+            .map_err(|error| AuditError(error.to_string()))?;
+        receive
+            .await
+            .map_err(|_| AuditError("gateway actor stopped".to_owned()))?
+    }
+}
+
+#[async_trait::async_trait]
+impl BrokerAuditor for GatewayHandle {
+    async fn record_broker(&self, event: BrokerAuditEvent) -> Result<(), AuditError> {
+        self.record_broker_event(event).await
+    }
 }
 
 /// Owning daemon object. Dropping it force-closes listeners and active streams.
@@ -89,32 +141,47 @@ pub struct Gateway {
     actor: Option<JoinHandle<Result<(), GatewayError>>>,
     control: Option<ControlRuntime>,
     drain_timeout: Duration,
+    repo_mirror: RepoMirrorHandle,
+    sim_broker: SimBrokerHandle,
+    repo_mirror_task: Option<JoinHandle<()>>,
+    sim_broker_task: Option<JoinHandle<()>>,
 }
 
 impl Gateway {
-    /// Starts the production host daemon with macOS Keychain credentials,
-    /// platform-verifying upstream TLS, and durable Arrow telemetry.
+    /// Starts the production host daemon with the platform credential provider,
+    /// platform-verifying upstream TLS, durable Arrow telemetry, and native
+    /// repository/simulator broker adapters.
     pub async fn start_host(
         config: GatewayConfig,
         telemetry: ArrowAuditConfig,
     ) -> Result<Self, GatewayError> {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = (config, telemetry);
-            Err(GatewayError::UnsupportedProductionPlatform)
+            return Err(GatewayError::UnsupportedProductionPlatform);
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             config.validate()?;
             config.validate_host_cache_layout()?;
             let connector =
                 SystemConnector::new(config.timeouts.connect, config.timeouts.tls_handshake)?;
             let audit = ArrowAuditSink::start(telemetry)?;
-            Self::start(
+            #[cfg(target_os = "macos")]
+            let credentials: Arc<dyn CredentialProvider> =
+                Arc::new(KeychainCredentialProvider::new());
+            #[cfg(target_os = "linux")]
+            let credentials: Arc<dyn CredentialProvider> =
+                Arc::new(SystemdCredentialProvider::from_environment()?);
+            let tail = audit.tail_handle();
+            Self::start_runtime(
                 config,
-                Arc::new(KeychainCredentialProvider::new()),
+                credentials,
                 Arc::new(connector),
                 Arc::new(audit),
+                Arc::new(Git2RepoTransport),
+                Arc::new(XcrunSimRunner),
+                Some(tail),
             )
             .await
         }
@@ -126,6 +193,46 @@ impl Gateway {
         connector: Arc<dyn UpstreamConnector>,
         audit: Arc<dyn AuditSink>,
     ) -> Result<Self, GatewayError> {
+        Self::start_with_brokers(
+            config,
+            credentials,
+            connector,
+            audit,
+            Arc::new(Git2RepoTransport),
+            Arc::new(XcrunSimRunner),
+        )
+        .await
+    }
+
+    pub async fn start_with_brokers(
+        config: GatewayConfig,
+        credentials: Arc<dyn CredentialProvider>,
+        connector: Arc<dyn UpstreamConnector>,
+        audit: Arc<dyn AuditSink>,
+        repo_transport: Arc<dyn RepoTransport>,
+        sim_runner: Arc<dyn SimRunner>,
+    ) -> Result<Self, GatewayError> {
+        Self::start_runtime(
+            config,
+            credentials,
+            connector,
+            audit,
+            repo_transport,
+            sim_runner,
+            None,
+        )
+        .await
+    }
+
+    async fn start_runtime(
+        config: GatewayConfig,
+        credentials: Arc<dyn CredentialProvider>,
+        connector: Arc<dyn UpstreamConnector>,
+        audit: Arc<dyn AuditSink>,
+        repo_transport: Arc<dyn RepoTransport>,
+        sim_runner: Arc<dyn SimRunner>,
+        audit_tail: Option<AuditTailHandle>,
+    ) -> Result<Self, GatewayError> {
         config.validate()?;
         let mirror_service =
             MirrorService::new(Cache::open(config.mirror_cache.cache_config()).await?);
@@ -133,6 +240,28 @@ impl Gateway {
         let (cancellations, cancellation_receiver) = mpsc::channel(config.limits.global_queued);
         let (commands, receiver) = mpsc::channel(config.command_capacity.get());
         let handle = GatewayHandle { commands };
+        let auditor: Arc<dyn BrokerAuditor> = Arc::new(handle.clone());
+        let repo_root = config.mirror_cache.cache_root.join("repo");
+        let (repo_mirror, repo_mirror_task) = RepoMirrorHandle::start(
+            repo_root,
+            config.command_capacity.get(),
+            Arc::clone(&credentials),
+            repo_transport,
+            Arc::clone(&auditor),
+        )?;
+        let (sim_broker, sim_broker_task) = match SimBrokerHandle::start(
+            config.simulator_drop_root.clone(),
+            config.command_capacity.get(),
+            sim_runner,
+            auditor,
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                repo_mirror.shutdown().await;
+                let _ = repo_mirror_task.await;
+                return Err(error.into());
+            }
+        };
         let state = Actor::new(
             config.clone(),
             ActorChannels {
@@ -147,17 +276,33 @@ impl Gateway {
             connector,
             audit,
             mirror_service,
+            BrokerHandles {
+                repo_mirror: repo_mirror.clone(),
+                sim_broker: sim_broker.clone(),
+            },
         );
         let actor = tokio::spawn(state.run());
         let control = match &config.control_socket {
             Some(path) => {
-                match ControlRuntime::start(path, config.authorized_control_uid, handle.clone())
-                    .await
+                match ControlRuntime::start(
+                    path,
+                    config.authorized_control_uid,
+                    handle.clone(),
+                    repo_mirror.clone(),
+                    sim_broker.clone(),
+                    audit_tail.clone(),
+                    config.control_tcp.as_ref(),
+                )
+                .await
                 {
                     Ok(control) => Some(control),
                     Err(error) => {
                         let _ = handle.send(Command::ForceStop).await;
                         let _ = actor.await;
+                        repo_mirror.shutdown().await;
+                        sim_broker.shutdown().await;
+                        let _ = repo_mirror_task.await;
+                        let _ = sim_broker_task.await;
                         return Err(error);
                     }
                 }
@@ -169,6 +314,10 @@ impl Gateway {
             actor: Some(actor),
             control,
             drain_timeout: config.timeouts.request_total,
+            repo_mirror,
+            sim_broker,
+            repo_mirror_task: Some(repo_mirror_task),
+            sim_broker_task: Some(sim_broker_task),
         })
     }
 
@@ -190,6 +339,14 @@ impl Gateway {
                 .await
                 .map_err(|error| GatewayError::Task(error.to_string()))??;
         }
+        self.repo_mirror.shutdown().await;
+        self.sim_broker.shutdown().await;
+        if let Some(task) = self.repo_mirror_task.take() {
+            let _ = task.await;
+        }
+        if let Some(task) = self.sim_broker_task.take() {
+            let _ = task.await;
+        }
         Ok(())
     }
 }
@@ -201,8 +358,16 @@ impl Drop for Gateway {
             actor.abort();
         }
         if let Some(control) = &self.control {
-            control.task.abort();
+            for task in &control.tasks {
+                task.abort();
+            }
             let _ = std::fs::remove_file(&control.path);
+        }
+        if let Some(task) = &self.repo_mirror_task {
+            task.abort();
+        }
+        if let Some(task) = &self.sim_broker_task {
+            task.abort();
         }
     }
 }
@@ -246,6 +411,10 @@ pub(crate) enum Command {
         attempt: AuditAttempt,
         reply: oneshot::Sender<bool>,
     },
+    BrokerAudit {
+        event: BrokerAuditEvent,
+        reply: oneshot::Sender<Result<(), AuditError>>,
+    },
     QueueExpired {
         queue_id: u64,
     },
@@ -274,6 +443,7 @@ pub(crate) enum Authentication {
 pub(crate) enum RequestTarget {
     Generic(CanonicalTarget),
     LocalMirror,
+    LocalSim,
     MirrorRedirect {
         protocol: MirrorProtocol,
         target: CanonicalTarget,
@@ -319,6 +489,12 @@ pub(crate) struct Admission {
     pub request_path: String,
     pub upstream_path: String,
     pub trace_id: Option<String>,
+    pub span_id: u64,
+    pub trace_flags: u8,
+    pub parent_span_id: Option<u64>,
+    pub upstream_span_id: Option<u64>,
+    pub tracestate: Option<String>,
+    pub trace_classification: Option<String>,
     completion: Option<CompletionLease>,
 }
 
@@ -362,6 +538,12 @@ impl AdmissionSeed {
             request_path: self.request_path,
             upstream_path: self.upstream_path,
             trace_id: self.trace_id,
+            span_id: (permit_id << 1) | 1,
+            trace_flags: 1,
+            parent_span_id: None,
+            upstream_span_id: None,
+            tracestate: None,
+            trace_classification: None,
             completion: Some(completion),
         }
     }
@@ -431,6 +613,7 @@ impl Admission {
 #[derive(Clone, Debug)]
 pub(crate) struct AuditDraft {
     pub workspace_id: String,
+    pub repo_id: String,
     pub revision: u64,
     pub endpoint: String,
     pub kind: AuditKind,
@@ -441,6 +624,10 @@ pub(crate) struct AuditDraft {
     pub http_status: Option<u16>,
     pub bytes: u64,
     pub trace_id: Option<String>,
+    pub span_id: u64,
+    pub parent_span_id: Option<u64>,
+    pub upstream_span_id: Option<u64>,
+    pub tracestate: Option<String>,
     pub grant_hint: Option<String>,
     pub classification: Option<String>,
     pub mirror_cache_status: Option<MirrorCacheStatus>,
@@ -457,6 +644,7 @@ impl AuditDraft {
                 .try_into()
                 .unwrap_or(u64::MAX),
             workspace_id: self.workspace_id,
+            repo_id: self.repo_id,
             revision: self.revision,
             endpoint: self.endpoint,
             kind: self.kind,
@@ -467,6 +655,14 @@ impl AuditDraft {
             http_status: self.http_status,
             bytes: self.bytes,
             trace_id: self.trace_id,
+            span_id: if self.span_id == 0 {
+                sequence
+            } else {
+                self.span_id
+            },
+            parent_span_id: self.parent_span_id,
+            upstream_span_id: self.upstream_span_id,
+            tracestate: self.tracestate,
             grant_hint: self.grant_hint,
             classification: self.classification,
             mirror_cache_status: self.mirror_cache_status,
@@ -536,6 +732,10 @@ struct ActorChannels {
     cancellations: mpsc::Sender<u64>,
     cancellation_receiver: mpsc::Receiver<u64>,
 }
+struct BrokerHandles {
+    repo_mirror: RepoMirrorHandle,
+    sim_broker: SimBrokerHandle,
+}
 
 struct Actor {
     config: GatewayConfig,
@@ -549,6 +749,8 @@ struct Actor {
     connector: Arc<dyn UpstreamConnector>,
     audit: Arc<dyn AuditSink>,
     mirror_service: MirrorService,
+    repo_mirror: RepoMirrorHandle,
+    sim_broker: SimBrokerHandle,
     sessions: HashMap<String, SessionState>,
     revisions: HashMap<String, u64>,
     permits: HashMap<u64, PermitState>,
@@ -574,6 +776,7 @@ impl Actor {
         connector: Arc<dyn UpstreamConnector>,
         audit: Arc<dyn AuditSink>,
         mirror_service: MirrorService,
+        brokers: BrokerHandles,
     ) -> Self {
         let ActorChannels {
             receiver,
@@ -583,6 +786,10 @@ impl Actor {
             cancellations,
             cancellation_receiver,
         } = channels;
+        let BrokerHandles {
+            repo_mirror,
+            sim_broker,
+        } = brokers;
         Self {
             leaf_cache: LeafCache::new(config.limits, config.timeouts),
             commands,
@@ -596,6 +803,8 @@ impl Actor {
             connector,
             audit,
             mirror_service,
+            repo_mirror,
+            sim_broker,
             sessions: HashMap::new(),
             revisions: HashMap::new(),
             permits: HashMap::new(),
@@ -659,6 +868,10 @@ impl Actor {
                             let recorded = self.audit_denial(&workspace_id, attempt).await;
                             let _ = reply.send(recorded);
                         }
+                        Command::BrokerAudit { event, reply } => {
+                            let result = self.broker_audit(event).await;
+                            let _ = reply.send(result);
+                        }
                         Command::QueueExpired { queue_id } => {
                             self.expire_queued(queue_id).await;
                         }
@@ -700,6 +913,13 @@ impl Actor {
         session.validate()?;
         self.config.validate_session_endpoint(&session)?;
         let signer = CaSigner::parse(&session.ca)?;
+        if (!self.sessions.contains_key(&session.workspace_id)
+            && self.sessions.len() >= self.config.limits.max_sessions)
+            || (!self.revisions.contains_key(&session.workspace_id)
+                && self.revisions.len() >= self.config.limits.max_sessions)
+        {
+            return Err(GatewayError::SessionCapacity);
+        }
         if self
             .revisions
             .get(&session.workspace_id)
@@ -759,6 +979,17 @@ impl Actor {
             return Err(GatewayError::Draining);
         }
 
+        self.repo_mirror
+            .bind_session(
+                workspace_id.clone(),
+                session.repo_id.clone(),
+                session.policy.clone(),
+            )
+            .await?;
+        self.sim_broker
+            .bind_session(workspace_id.clone(), session.repo_id.clone())
+            .await?;
+
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1).max(1);
         let endpoint_label = endpoint_label(&session.endpoint);
@@ -816,6 +1047,12 @@ impl Actor {
             .remove(workspace_id)
             .expect("session was checked");
         session.stop().await;
+        self.repo_mirror
+            .unbind_session(workspace_id.to_owned())
+            .await?;
+        self.sim_broker
+            .unbind_session(workspace_id.to_owned())
+            .await?;
         self.leaf_cache.drop_workspace(workspace_id);
         self.cancel_queued(workspace_id).await;
         Ok(())
@@ -838,6 +1075,8 @@ impl Actor {
             connection_stop: connection_rx.clone(),
             audit_stop: audit_rx.clone(),
             mirror_service: self.mirror_service.clone(),
+            repo_mirror: self.repo_mirror.clone(),
+            sim_broker: self.sim_broker.clone(),
         };
         tokio::spawn(proxy::accept_loop(
             listener,
@@ -1215,6 +1454,7 @@ impl Actor {
         };
         let draft = AuditDraft {
             workspace_id: workspace_id.to_owned(),
+            repo_id: session.repo_id.clone(),
             revision: session.revision,
             endpoint: session.endpoint_label.clone(),
             kind: attempt.kind,
@@ -1225,11 +1465,62 @@ impl Actor {
             http_status: Some(attempt.http_status.as_u16()),
             bytes: 0,
             trace_id: None,
+            span_id: 0,
+            parent_span_id: None,
+            upstream_span_id: None,
+            tracestate: None,
             grant_hint: None,
             classification: Some(attempt.classification.to_owned()),
             mirror_cache_status: None,
         };
         self.record(draft).await
+    }
+
+    async fn broker_audit(&mut self, event: BrokerAuditEvent) -> Result<(), AuditError> {
+        let Some(session) = self.sessions.get(&event.workspace_id) else {
+            return Err(AuditError("broker workspace is not installed".to_owned()));
+        };
+        let (repo_id, revision, endpoint) = (
+            session.repo_id.clone(),
+            session.revision,
+            session.endpoint_label.clone(),
+        );
+        let kind = match event.kind {
+            BrokerAuditKind::RepoMirror => AuditKind::RepoMirror,
+            BrokerAuditKind::Sim => AuditKind::Sim,
+        };
+        let status = match event.status {
+            BrokerAuditStatus::Allowed => AuditStatus::Allowed,
+            BrokerAuditStatus::Denied => AuditStatus::Denied,
+            BrokerAuditStatus::Failed => AuditStatus::Failed,
+            BrokerAuditStatus::Completed => AuditStatus::Completed,
+        };
+        let draft = AuditDraft {
+            workspace_id: event.workspace_id,
+            repo_id,
+            revision,
+            endpoint,
+            kind,
+            host: None,
+            method: event.method,
+            path: event.path,
+            status,
+            http_status: None,
+            bytes: event.bytes,
+            trace_id: None,
+            span_id: 0,
+            parent_span_id: None,
+            upstream_span_id: None,
+            tracestate: None,
+            grant_hint: None,
+            classification: event.classification,
+            mirror_cache_status: None,
+        };
+        if self.record(draft).await {
+            Ok(())
+        } else {
+            Err(AuditError("gateway audit is unavailable".to_owned()))
+        }
     }
 
     fn mint_leaf(
@@ -1470,6 +1761,24 @@ fn build_seed(
                 intent.path.clone(),
             )
         }
+        RequestTarget::LocalSim => {
+            if intent.method != Method::POST || intent.path != "/sim" {
+                return Err(("simulator broker accepts only POST /sim", None));
+            }
+            (
+                CanonicalTarget {
+                    scheme: TargetScheme::Http,
+                    host: CanonicalHost::Dns("simulator.local".to_owned()),
+                    port: 80,
+                },
+                EgressMode::Intercept,
+                false,
+                None,
+                false,
+                false,
+                intent.path.clone(),
+            )
+        }
     };
     Ok(AdmissionSeed {
         workspace_id: workspace_id.to_owned(),
@@ -1507,6 +1816,7 @@ fn pending_audit_draft(
 ) -> AuditDraft {
     AuditDraft {
         workspace_id: seed.workspace_id.clone(),
+        repo_id: seed.repo_id.clone(),
         revision: seed.revision,
         endpoint: seed.endpoint.clone(),
         kind: seed.audit_kind,
@@ -1517,6 +1827,10 @@ fn pending_audit_draft(
         http_status: http_status.map(|status| status.as_u16()),
         bytes: 0,
         trace_id: seed.trace_id.clone(),
+        span_id: 0,
+        parent_span_id: None,
+        upstream_span_id: None,
+        tracestate: None,
         grant_hint: None,
         classification: classification.map(str::to_owned),
         mirror_cache_status: None,
@@ -1534,10 +1848,11 @@ fn denial_draft(
     let host = match &intent.target {
         RequestTarget::Generic(target) => Some(target.authority()),
         RequestTarget::MirrorRedirect { target, .. } => Some(target.authority()),
-        RequestTarget::LocalMirror => None,
+        RequestTarget::LocalMirror | RequestTarget::LocalSim => None,
     };
     AuditDraft {
         workspace_id: workspace_id.to_owned(),
+        repo_id: session.repo_id.clone(),
         revision: session.revision,
         endpoint: session.endpoint_label.clone(),
         kind: intent.audit_kind,
@@ -1548,6 +1863,10 @@ fn denial_draft(
         http_status: Some(http_status.as_u16()),
         bytes: 0,
         trace_id: intent.trace_id.clone(),
+        span_id: 0,
+        parent_span_id: None,
+        upstream_span_id: None,
+        tracestate: None,
         grant_hint: hint,
         classification: None,
         mirror_cache_status: None,
@@ -1640,7 +1959,7 @@ fn unlink_endpoint(endpoint: &WorkspaceEndpoint) {
 struct ControlRuntime {
     path: std::path::PathBuf,
     stop: watch::Sender<bool>,
-    task: JoinHandle<()>,
+    tasks: Vec<JoinHandle<()>>,
 }
 
 impl ControlRuntime {
@@ -1648,7 +1967,13 @@ impl ControlRuntime {
         path: &Path,
         authorized_uid: u32,
         handle: GatewayHandle,
+        repo_mirror: RepoMirrorHandle,
+        sim_broker: SimBrokerHandle,
+        audit_tail: Option<AuditTailHandle>,
+        tcp: Option<&ControlTcpConfig>,
     ) -> Result<Self, GatewayError> {
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+
         let parent = path.parent().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1656,52 +1981,164 @@ impl ControlRuntime {
             )
         })?;
         let metadata = std::fs::symlink_metadata(parent)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != authorized_uid
+            || metadata.permissions().mode() & 0o022 != 0
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "control socket parent must be an existing real directory",
+                "control socket parent must be an owned, non-writable real directory",
             )
             .into());
         }
-        if path.exists() {
-            std::fs::remove_file(path)?;
+        match std::fs::symlink_metadata(path) {
+            Ok(existing)
+                if existing.file_type().is_socket() && existing.uid() == authorized_uid =>
+            {
+                std::fs::remove_file(path)?;
+            }
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "control socket path is not an owned Unix socket",
+                )
+                .into());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         let listener = UnixListener::bind(path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            let _ = std::fs::remove_file(path);
+            return Err(error.into());
         }
-        let (stop, mut stopped) = watch::channel(false);
-        let owned_path = path.to_path_buf();
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    result = listener.accept() => {
-                        let Ok((stream, _)) = result else { break };
-                        let Ok(credentials) = stream.peer_cred() else { continue };
-                        if credentials.uid() != authorized_uid { continue; }
-                        let handle = handle.clone();
-                        tokio::spawn(async move { crate::control::serve_control(stream, handle).await; });
+        let tcp_runtime = if let Some(tcp) = tcp {
+            let credential =
+                match crate::control::ControllerCredential::from_file(&tcp.credential_file) {
+                    Ok(credential) => Arc::new(credential),
+                    Err(error) => {
+                        let _ = std::fs::remove_file(path);
+                        return Err(GatewayError::Control(error));
                     }
-                    changed = stopped.changed() => {
-                        if changed.is_err() || *stopped.borrow() { break; }
-                    }
+                };
+            let listener = match TcpListener::bind(tcp.address).await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    let _ = std::fs::remove_file(path);
+                    return Err(error.into());
                 }
-            }
+            };
+            Some((listener, credential))
+        } else {
+            None
+        };
+
+        let services = crate::control::ControlServices {
+            handle,
+            repo_mirror,
+            sim_broker,
+            audit_tail,
+        };
+        let capacity = 1024;
+        let (stop, stopped) = watch::channel(false);
+        let unix_services = services.clone();
+        let unix_stopped = stopped.clone();
+        let unix_task = tokio::spawn(async move {
+            run_unix_control(
+                listener,
+                authorized_uid,
+                capacity,
+                unix_services,
+                unix_stopped,
+            )
+            .await;
         });
+        let mut tasks = vec![unix_task];
+        if let Some((listener, credential)) = tcp_runtime {
+            let tcp_task = tokio::spawn(async move {
+                run_tcp_control(listener, credential, capacity, services, stopped).await;
+            });
+            tasks.push(tcp_task);
+        }
         Ok(Self {
-            path: owned_path,
+            path: path.to_path_buf(),
             stop,
-            task,
+            tasks,
         })
     }
 
-    async fn stop(self) {
+    async fn stop(mut self) {
         let _ = self.stop.send(true);
-        let _ = self.task.await;
+        for task in self.tasks.drain(..) {
+            let _ = task.await;
+        }
         let _ = std::fs::remove_file(self.path);
     }
+}
+
+async fn run_unix_control(
+    listener: UnixListener,
+    authorized_uid: u32,
+    capacity: usize,
+    services: crate::control::ControlServices,
+    mut stopped: watch::Receiver<bool>,
+) {
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let Ok((stream, _)) = result else { break };
+                let Ok(credentials) = stream.peer_cred() else { continue };
+                if credentials.uid() != authorized_uid || connections.len() >= capacity {
+                    continue;
+                }
+                let services = services.clone();
+                connections.spawn(async move {
+                    crate::control::serve_control_unix(stream, services).await;
+                });
+            }
+            _ = connections.join_next(), if !connections.is_empty() => {}
+            changed = stopped.changed() => {
+                if changed.is_err() || *stopped.borrow() { break; }
+            }
+        }
+    }
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+}
+
+async fn run_tcp_control(
+    listener: TcpListener,
+    credential: Arc<crate::control::ControllerCredential>,
+    capacity: usize,
+    services: crate::control::ControlServices,
+    mut stopped: watch::Receiver<bool>,
+) {
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let Ok((stream, peer)) = result else { break };
+                if peer.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                    || connections.len() >= capacity
+                {
+                    continue;
+                }
+                let services = services.clone();
+                let credential = Arc::clone(&credential);
+                connections.spawn(async move {
+                    crate::control::serve_control_tcp(stream, credential, services).await;
+                });
+            }
+            _ = connections.join_next(), if !connections.is_empty() => {}
+            changed = stopped.changed() => {
+                if changed.is_err() || *stopped.borrow() { break; }
+            }
+        }
+    }
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
 }
 
 #[derive(Debug, Error)]
@@ -1716,6 +2153,16 @@ pub enum GatewayError {
     Audit(#[from] AuditError),
     #[error(transparent)]
     Connector(#[from] ConnectError),
+    #[error(transparent)]
+    Credential(#[from] CredentialError),
+    #[error(transparent)]
+    Control(#[from] ControlError),
+    #[error(transparent)]
+    RepoMirror(#[from] RepoMirrorError),
+    #[error(transparent)]
+    SimBroker(#[from] SimBrokerError),
+    #[error("gateway session capacity is exhausted")]
+    SessionCapacity,
     #[error("gateway I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("gateway is draining")]
