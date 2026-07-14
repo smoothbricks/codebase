@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 use std::fs::{FileTimes, OpenOptions};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -3315,7 +3317,6 @@ fn restore_recovery_rejects_fact_without_canonical_image() {
     assert!(undo.exists());
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn system_mount_source_observes_the_live_root_mount() {
     let mounts = SystemKernelMountSource.mounts().expect("getmntinfo");
