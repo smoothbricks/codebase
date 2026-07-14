@@ -712,16 +712,23 @@ stderr; known operational failures never panic or hide an unstructured `anyhow::
 
 ## cowshed-napi (`@smoothbricks/cowshed`)
 
-napi-rs, async (tokio runtime owned by the addon), Promise-returning. Names follow JS conventions; semantics are 1:1
-with cowshed-core. The exception is `ErrorCode`: its serialized `code` value is the global kebab-case taxonomy token in
-every adapter (`not-found`, `environment-missing`, `sandbox-denied`). JS class/method/property names may be camelCase;
-error code values never are.
+napi-rs, async (Tokio runtime owned by the addon), Promise-returning. Node and Bun load the same `.node` addon; a
+separate `bun:ffi` ABI is deliberately absent because lifecycle calls are IO-bound and Node cannot consume Bun FFI.
+Names follow JS conventions; semantics are 1:1 with cowshed-core. The exception is `ErrorCode`: its serialized `code`
+value is the global kebab-case taxonomy token in every adapter (`not-found`, `environment-missing`, `sandbox-denied`).
+JS class/method/property names may be camelCase; error code values never are.
 
 The authority split holds across the NAPI boundary too — `Project` is read-only discovery, `Coordinator` is the only
 mutation surface, `WorkspaceHandle` is the non-escalating worker capability:
 
 ```ts
-export function openProject(path: string): Promise<Project>;
+export interface CoordinatorEndpoint {
+  readonly __opaqueCoordinatorEndpoint: unique symbol;
+}
+
+/** Takes ownership of fd, sets close-on-exec, and permits exactly one connection attempt. */
+export function coordinatorEndpoint(fd: number): CoordinatorEndpoint;
+export function openProject(endpoint: CoordinatorEndpoint, path: string): Promise<Project>;
 
 export interface Project {
   // discovery + read-only
@@ -742,19 +749,21 @@ export interface WorkspaceRef {
 ```
 
 The capability split is preserved across the boundary by _how a caller connects, not by a caller-supplied authority
-string_: `connectCoordinator` accepts only the opaque receiving endpoint for the controller-created inherited
-FD/socketpair and consumes/closes it after binding; coordinator authority never enters JavaScript as token text.
-`connectWorkspace(workerDescriptor)` consumes a distinct 256-bit, one-use, 30-second-TTL descriptor minted for exactly
-one workspace. The in-volume gateway token is not an N-API or MCP credential.
+string_. `coordinatorEndpoint` wraps only an already inherited controller socket; it does not mint authority. The
+read-only `openProject` consumes that endpoint, completes the peer/nonce handshake, opens the explicit project path,
+then discards `CoordinatorToken` before returning `Project`. Reuse fails, and dropping an unused endpoint closes its
+descriptor.
+
+The mutation surface accepts a fresh endpoint plus project path because the handshake identifies the repository while
+`Cowshed::open` still requires the checkout path. `connectWorkspace(workerDescriptor)` consumes a distinct 256-bit,
+one-use, 30-second-TTL descriptor minted for exactly one workspace. The in-volume gateway token is not an N-API or MCP
+credential.
 
 ```ts
-export interface CoordinatorEndpoint {
-  readonly __opaqueCoordinatorEndpoint: unique symbol;
-}
 export interface WorkerDescriptor {
   readonly __opaqueWorkerDescriptor: unique symbol;
 }
-export function connectCoordinator(endpoint: CoordinatorEndpoint): Promise<Coordinator>;
+export function connectCoordinator(endpoint: CoordinatorEndpoint, path: string): Promise<Coordinator>;
 export function connectWorkspace(descriptor: WorkerDescriptor): Promise<WorkspaceHandle>;
 
 /** Positive exact integer, local to one workspace and never reused. */

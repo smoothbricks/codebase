@@ -2,9 +2,69 @@
   "name": "@smoothbricks/cowshed",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "test": "nx test cowshed --outputStyle=stream",
+    "build:napi": "nx run cowshed:cargo-napi"
+  },
   "nx": {
     "name": "cowshed",
     "targets": {
+      "cargo-napi": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "inputs": [
+          "{projectRoot}/crates/**/*.rs",
+          "{projectRoot}/crates/**/Cargo.toml",
+          "{projectRoot}/Cargo.toml",
+          "{projectRoot}/Cargo.lock",
+          "{projectRoot}/.cargo/config.toml",
+          "{projectRoot}/scripts/build-napi.ts"
+        ],
+        "outputs": [
+          "{projectRoot}/dist/cowshed.node"
+        ],
+        "options": {
+          "cwd": "packages/cowshed",
+          "command": "bun scripts/build-napi.ts"
+        }
+      },
+      "napi-test": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "dependsOn": [
+          "cargo-napi",
+          "tsc-js"
+        ],
+        "options": {
+          "command": "bun test --timeout=30000 src/native.test.ts",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 120000,
+          "killAfterMs": 10000
+        }
+      },
+      "test": {
+        "executor": "nx:noop",
+        "dependsOn": [
+          "cargo-test",
+          "napi-test",
+          "^build",
+          "build"
+        ]
+      },
       "integration-apfs": {
         "executor": "nx:run-commands",
         "cache": false,
@@ -23,6 +83,14 @@
       }
     }
   },
-  "type": "module",
+  "dependencies": {
+    "typia": "^12.0.1"
+  },
+  "devDependencies": {
+    "@smoothbricks/lmao": "workspace:*",
+    "@smoothbricks/validation": "workspace:*",
+    "@types/node": "~24.0.0",
+    "typescript": "^6.0.3"
+  },
   "description": "Warm git workspaces: instant isolated copy-on-write workspaces with layered sandboxing (CLI, Rust API, NAPI bindings)"
 }
