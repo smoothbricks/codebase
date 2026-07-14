@@ -1,6 +1,7 @@
 use std::{
     convert::Infallible,
     future::Future,
+    io::Cursor,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -19,6 +20,7 @@ use hyper::{
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     sync::{mpsc, oneshot, watch},
     time::{Instant, Sleep, timeout},
 };
@@ -26,8 +28,8 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::{
     actor::{
-        Admission, AdmissionError, AuditDraft, Authentication, BoundListener, Command,
-        RequestIntent, RequestTarget,
+        Admission, AdmissionError, AuditAttempt, AuditDraft, Authentication, BoundListener,
+        Command, CompletionLease, RequestIntent, RequestTarget,
     },
     config::GatewayTimeouts,
     interfaces::{
@@ -42,6 +44,7 @@ const MAX_HEADERS: usize = 100;
 const MAX_HEADER_FIELD: usize = 16 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
+const MAX_CLIENT_HELLO: usize = 64 * 1024;
 
 type ResponseBody = ProxyBody;
 type ServiceResult = Result<Response<ResponseBody>, Infallible>;
@@ -129,7 +132,14 @@ async fn handle_request(
     fixed_target: Option<CanonicalTarget>,
 ) -> ServiceResult {
     if let Err(error) = validate_request(&request) {
-        return Ok(problem(error.status, error.message, None));
+        return Ok(audited_problem(
+            &context,
+            &request,
+            error.status,
+            error.message,
+            "malformed-request",
+        )
+        .await);
     }
     let authentication = match inherited_authentication {
         Authentication::Generation(generation) => Authentication::Generation(generation),
@@ -137,17 +147,29 @@ async fn handle_request(
     };
     if request.method() == Method::CONNECT {
         if fixed_target.is_some() {
-            return Ok(problem(
+            return Ok(audited_problem(
+                &context,
+                &request,
                 StatusCode::METHOD_NOT_ALLOWED,
                 "nested CONNECT is forbidden",
-                None,
-            ));
+                "nested-connect",
+            )
+            .await);
         }
         return Ok(handle_connect(request, context, authentication).await);
     }
     let (target, path, audit_kind) = match request_target(&request, fixed_target.as_ref()) {
         Ok(value) => value,
-        Err(error) => return Ok(problem(error.status, error.message, None)),
+        Err(error) => {
+            return Ok(audited_problem(
+                &context,
+                &request,
+                error.status,
+                error.message,
+                "invalid-target",
+            )
+            .await);
+        }
     };
     let trace_id = None;
     let intent = RequestIntent {
@@ -166,7 +188,7 @@ async fn handle_request(
     {
         complete_now(
             &context,
-            &admission,
+            admission,
             AuditStatus::Denied,
             Some(StatusCode::FORBIDDEN),
             Some("authority-mismatch"),
@@ -184,7 +206,7 @@ async fn handle_request(
     if health == UpstreamHealth::Offline {
         complete_now(
             &context,
-            &admission,
+            admission,
             AuditStatus::Offline,
             Some(StatusCode::SERVICE_UNAVAILABLE),
             Some("upstream-offline"),
@@ -217,7 +239,7 @@ async fn handle_request(
         Ok(Err(_)) => {
             complete_now(
                 &context,
-                &admission,
+                admission,
                 AuditStatus::Failed,
                 Some(StatusCode::BAD_GATEWAY),
                 Some("connect-failed"),
@@ -234,7 +256,7 @@ async fn handle_request(
         Err(_) => {
             complete_now(
                 &context,
-                &admission,
+                admission,
                 AuditStatus::TimedOut,
                 Some(StatusCode::GATEWAY_TIMEOUT),
                 Some("connect-timeout"),
@@ -257,7 +279,7 @@ async fn handle_request(
             Err(status) => {
                 complete_now(
                     &context,
-                    &admission,
+                    admission,
                     AuditStatus::Failed,
                     Some(status),
                     Some("credential-failed"),
@@ -282,7 +304,7 @@ async fn handle_request(
         Ok(Err(_)) => {
             complete_now(
                 &context,
-                &admission,
+                admission,
                 AuditStatus::Failed,
                 Some(StatusCode::BAD_GATEWAY),
                 Some("upstream-protocol"),
@@ -299,7 +321,7 @@ async fn handle_request(
         Err(_) => {
             complete_now(
                 &context,
-                &admission,
+                admission,
                 AuditStatus::TimedOut,
                 Some(StatusCode::GATEWAY_TIMEOUT),
                 Some("upstream-handshake-timeout"),
@@ -327,7 +349,7 @@ async fn handle_request(
         Ok(Err(_)) => {
             complete_now(
                 &context,
-                &admission,
+                admission,
                 AuditStatus::Failed,
                 Some(StatusCode::BAD_GATEWAY),
                 Some("upstream-response"),
@@ -344,7 +366,7 @@ async fn handle_request(
         Err(_) => {
             complete_now(
                 &context,
-                &admission,
+                admission,
                 AuditStatus::TimedOut,
                 Some(StatusCode::GATEWAY_TIMEOUT),
                 Some("response-headers-timeout"),
@@ -381,29 +403,38 @@ async fn handle_connect(
     let authority = match request.uri().authority() {
         Some(authority) => authority.as_str(),
         None => {
-            return problem(
+            return audited_problem(
+                &context,
+                &request,
                 StatusCode::BAD_REQUEST,
                 "CONNECT requires host and explicit port",
-                None,
-            );
+                "connect-authority-missing",
+            )
+            .await;
         }
     };
     let target = match CanonicalTarget::from_authority(authority, TargetScheme::Https) {
         Ok(target) => target,
         Err(_) => {
-            return problem(
+            return audited_problem(
+                &context,
+                &request,
                 StatusCode::BAD_REQUEST,
                 "CONNECT authority is invalid",
-                None,
-            );
+                "connect-authority-invalid",
+            )
+            .await;
         }
     };
     if !host_matches(request.headers(), &target) {
-        return problem(
+        return audited_problem(
+            &context,
+            &request,
             StatusCode::BAD_REQUEST,
             "Host differs from CONNECT authority",
-            None,
-        );
+            "connect-host-mismatch",
+        )
+        .await;
     }
     let intent = RequestIntent {
         target: RequestTarget::Generic(target.clone()),
@@ -416,10 +447,12 @@ async fn handle_connect(
         Ok(admission) => admission,
         Err(error) => return problem(error.status, error.message, error.hint.as_deref()),
     };
-    if context.connector.health(&target).await == UpstreamHealth::Offline {
+    if !matches!(admission.mode, EgressMode::Opaque)
+        && context.connector.health(&target).await == UpstreamHealth::Offline
+    {
         complete_now(
             &context,
-            &admission,
+            admission,
             AuditStatus::Offline,
             Some(StatusCode::SERVICE_UNAVAILABLE),
             Some("upstream-offline"),
@@ -437,45 +470,7 @@ async fn handle_connect(
                 purpose: UpstreamPurpose::OpaqueTcp,
                 private_network_authorized: admission.private_network_authorized,
             };
-            let upstream = match timeout(
-                context.timeouts.connect,
-                context.connector.connect(&authorized),
-            )
-            .await
-            {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(_)) => {
-                    complete_now(
-                        &context,
-                        &admission,
-                        AuditStatus::Failed,
-                        Some(StatusCode::BAD_GATEWAY),
-                        Some("connect-failed"),
-                        0,
-                        AuditKind::Opaque,
-                    )
-                    .await;
-                    return problem(StatusCode::BAD_GATEWAY, "upstream connection failed", None);
-                }
-                Err(_) => {
-                    complete_now(
-                        &context,
-                        &admission,
-                        AuditStatus::TimedOut,
-                        Some(StatusCode::GATEWAY_TIMEOUT),
-                        Some("connect-timeout"),
-                        0,
-                        AuditKind::Opaque,
-                    )
-                    .await;
-                    return problem(
-                        StatusCode::GATEWAY_TIMEOUT,
-                        "upstream connect timed out",
-                        None,
-                    );
-                }
-            };
-            spawn_opaque(upgraded, upstream, context, admission);
+            spawn_opaque(upgraded, authorized, context, admission);
             empty(StatusCode::OK)
         }
         EgressMode::Intercept => {
@@ -494,7 +489,7 @@ async fn handle_connect(
             {
                 complete_now(
                     &context,
-                    &admission,
+                    admission,
                     AuditStatus::Failed,
                     Some(StatusCode::SERVICE_UNAVAILABLE),
                     Some("actor-stopped"),
@@ -509,7 +504,7 @@ async fn handle_connect(
                 _ => {
                     complete_now(
                         &context,
-                        &admission,
+                        admission,
                         AuditStatus::Failed,
                         Some(StatusCode::BAD_GATEWAY),
                         Some("leaf-signing"),
@@ -532,37 +527,175 @@ async fn handle_connect(
 
 fn spawn_opaque(
     upgraded: hyper::upgrade::OnUpgrade,
-    mut upstream: crate::interfaces::BoxIo,
+    authorized: AuthorizedTarget,
     context: AcceptContext,
     admission: Admission,
 ) {
     tokio::spawn(async move {
         let mut connection_stop = watch_for_session_stop(&context);
-        let result = match upgraded.await {
-            Ok(upgraded) => {
-                let mut client = TokioIo::new(upgraded);
-                tokio::select! {
-                    result = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {
-                        result.map(|(from_client, from_upstream)| from_client.saturating_add(from_upstream))
-                    }
-                    _ = tokio::time::sleep(context.timeouts.tunnel_total) => {
-                        complete_now(&context, &admission, AuditStatus::TimedOut, Some(StatusCode::GATEWAY_TIMEOUT), Some("tunnel-total-timeout"), 0, AuditKind::Opaque).await;
+        let upgraded = match upgraded.await {
+            Ok(upgraded) => upgraded,
+            Err(_) => {
+                complete_now(
+                    &context,
+                    admission,
+                    AuditStatus::Failed,
+                    None,
+                    Some("upgrade-failed"),
+                    0,
+                    AuditKind::Opaque,
+                )
+                .await;
+                return;
+            }
+        };
+        let mut client = TokioIo::new(upgraded);
+        let captured = tokio::select! {
+            result = timeout(
+                context.timeouts.tls_handshake,
+                capture_client_hello(&mut client, &admission.target.host),
+            ) => {
+                match result {
+                    Ok(Ok(captured)) => captured,
+                    Ok(Err(error)) => {
+                        complete_now(
+                            &context,
+                            admission,
+                            AuditStatus::Denied,
+                            Some(StatusCode::FORBIDDEN),
+                            Some(error.classification()),
+                            0,
+                            AuditKind::Opaque,
+                        ).await;
                         return;
                     }
-                    changed = connection_stop.changed() => {
-                        let _ = changed;
-                        complete_now(&context, &admission, AuditStatus::Cancelled, None, Some("session-rotated"), 0, AuditKind::Opaque).await;
+                    Err(_) => {
+                        complete_now(
+                            &context,
+                            admission,
+                            AuditStatus::TimedOut,
+                            Some(StatusCode::GATEWAY_TIMEOUT),
+                            Some("client-hello-timeout"),
+                            0,
+                            AuditKind::Opaque,
+                        ).await;
                         return;
                     }
                 }
             }
-            Err(_) => Err(std::io::Error::other("upgrade failed")),
+            _ = connection_stop.changed() => {
+                complete_now(
+                    &context,
+                    admission,
+                    AuditStatus::Cancelled,
+                    None,
+                    Some("session-rotated"),
+                    0,
+                    AuditKind::Opaque,
+                ).await;
+                return;
+            }
+        };
+
+        if context.connector.health(&authorized.target).await == UpstreamHealth::Offline {
+            complete_now(
+                &context,
+                admission,
+                AuditStatus::Offline,
+                Some(StatusCode::SERVICE_UNAVAILABLE),
+                Some("upstream-offline"),
+                0,
+                AuditKind::Opaque,
+            )
+            .await;
+            return;
+        }
+        let mut upstream = match timeout(
+            context.timeouts.connect,
+            context.connector.connect(&authorized),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(_)) => {
+                complete_now(
+                    &context,
+                    admission,
+                    AuditStatus::Failed,
+                    Some(StatusCode::BAD_GATEWAY),
+                    Some("connect-failed"),
+                    0,
+                    AuditKind::Opaque,
+                )
+                .await;
+                return;
+            }
+            Err(_) => {
+                complete_now(
+                    &context,
+                    admission,
+                    AuditStatus::TimedOut,
+                    Some(StatusCode::GATEWAY_TIMEOUT),
+                    Some("connect-timeout"),
+                    0,
+                    AuditKind::Opaque,
+                )
+                .await;
+                return;
+            }
+        };
+        match timeout(context.timeouts.connect, upstream.write_all(&captured)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                complete_now(
+                    &context,
+                    admission,
+                    AuditStatus::Failed,
+                    Some(StatusCode::BAD_GATEWAY),
+                    Some("client-hello-replay"),
+                    0,
+                    AuditKind::Opaque,
+                )
+                .await;
+                return;
+            }
+            Err(_) => {
+                complete_now(
+                    &context,
+                    admission,
+                    AuditStatus::TimedOut,
+                    Some(StatusCode::GATEWAY_TIMEOUT),
+                    Some("client-hello-replay-timeout"),
+                    0,
+                    AuditKind::Opaque,
+                )
+                .await;
+                return;
+            }
+        }
+        let replayed = captured.len() as u64;
+        let result = tokio::select! {
+            result = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {
+                result.map(|(from_client, from_upstream)| {
+                    replayed
+                        .saturating_add(from_client)
+                        .saturating_add(from_upstream)
+                })
+            }
+            _ = tokio::time::sleep(context.timeouts.tunnel_total) => {
+                complete_now(&context, admission, AuditStatus::TimedOut, Some(StatusCode::GATEWAY_TIMEOUT), Some("tunnel-total-timeout"), replayed, AuditKind::Opaque).await;
+                return;
+            }
+            _ = connection_stop.changed() => {
+                complete_now(&context, admission, AuditStatus::Cancelled, None, Some("session-rotated"), replayed, AuditKind::Opaque).await;
+                return;
+            }
         };
         match result {
             Ok(bytes) => {
                 complete_now(
                     &context,
-                    &admission,
+                    admission,
                     AuditStatus::Completed,
                     Some(StatusCode::OK),
                     None,
@@ -574,17 +707,83 @@ fn spawn_opaque(
             Err(_) => {
                 complete_now(
                     &context,
-                    &admission,
+                    admission,
                     AuditStatus::Failed,
                     None,
                     Some("tunnel-io"),
-                    0,
+                    replayed,
                     AuditKind::Opaque,
                 )
                 .await
             }
         }
     });
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ClientHelloError {
+    Io,
+    NotTls,
+    TooLarge,
+    MissingSni,
+    SniMismatch,
+}
+
+impl ClientHelloError {
+    const fn classification(self) -> &'static str {
+        match self {
+            Self::Io => "client-hello-io",
+            Self::NotTls => "client-hello-invalid",
+            Self::TooLarge => "client-hello-too-large",
+            Self::MissingSni => "sni-missing",
+            Self::SniMismatch => "sni-mismatch",
+        }
+    }
+}
+
+async fn capture_client_hello<I>(
+    client: &mut I,
+    expected_host: &CanonicalHost,
+) -> Result<Vec<u8>, ClientHelloError>
+where
+    I: AsyncRead + Unpin,
+{
+    let mut acceptor = rustls::server::Acceptor::default();
+    let mut captured = Vec::with_capacity(4 * 1024);
+    let mut chunk = [0_u8; 4 * 1024];
+    loop {
+        let remaining = MAX_CLIENT_HELLO.saturating_sub(captured.len());
+        if remaining == 0 {
+            return Err(ClientHelloError::TooLarge);
+        }
+        let limit = remaining.min(chunk.len());
+        let read = client
+            .read(&mut chunk[..limit])
+            .await
+            .map_err(|_| ClientHelloError::Io)?;
+        if read == 0 {
+            return Err(ClientHelloError::NotTls);
+        }
+        captured.extend_from_slice(&chunk[..read]);
+        let mut cursor = Cursor::new(&chunk[..read]);
+        let consumed = acceptor
+            .read_tls(&mut cursor)
+            .map_err(|_| ClientHelloError::NotTls)?;
+        if consumed != read {
+            return Err(ClientHelloError::NotTls);
+        }
+        let Some(accepted) = acceptor.accept().map_err(|_| ClientHelloError::NotTls)? else {
+            continue;
+        };
+        let client_hello = accepted.client_hello();
+        let sni = client_hello
+            .server_name()
+            .ok_or(ClientHelloError::MissingSni)?;
+        if !sni_matches(Some(sni), expected_host) {
+            return Err(ClientHelloError::SniMismatch);
+        }
+        return Ok(captured);
+    }
 }
 
 fn spawn_intercept(
@@ -599,7 +798,7 @@ fn spawn_intercept(
             Err(_) => {
                 complete_now(
                     &context,
-                    &admission,
+                    admission,
                     AuditStatus::Failed,
                     None,
                     Some("upgrade-failed"),
@@ -620,7 +819,7 @@ fn spawn_intercept(
             Ok(Err(_)) => {
                 complete_now(
                     &context,
-                    &admission,
+                    admission,
                     AuditStatus::Denied,
                     None,
                     Some("client-tls"),
@@ -633,7 +832,7 @@ fn spawn_intercept(
             Err(_) => {
                 complete_now(
                     &context,
-                    &admission,
+                    admission,
                     AuditStatus::TimedOut,
                     None,
                     Some("client-tls-timeout"),
@@ -647,7 +846,7 @@ fn spawn_intercept(
         if !sni_matches(tls.get_ref().1.server_name(), &admission.target.host) {
             complete_now(
                 &context,
-                &admission,
+                admission,
                 AuditStatus::Denied,
                 Some(StatusCode::FORBIDDEN),
                 Some("sni-mismatch"),
@@ -682,13 +881,13 @@ fn spawn_intercept(
                 } else {
                     (AuditStatus::Failed, Some("intercept-io"))
                 };
-                complete_now(&context, &admission, status, Some(StatusCode::OK), classification, 0, AuditKind::Connect).await;
+                complete_now(&context, admission, status, Some(StatusCode::OK), classification, 0, AuditKind::Connect).await;
             }
             _ = stopped.changed() => {
-                complete_now(&context, &admission, AuditStatus::Cancelled, None, Some("session-rotated"), 0, AuditKind::Connect).await;
+                complete_now(&context, admission, AuditStatus::Cancelled, None, Some("session-rotated"), 0, AuditKind::Connect).await;
             }
             _ = tokio::time::sleep(context.timeouts.tunnel_total) => {
-                complete_now(&context, &admission, AuditStatus::TimedOut, None, Some("tunnel-total-timeout"), 0, AuditKind::Connect).await;
+                complete_now(&context, admission, AuditStatus::TimedOut, None, Some("tunnel-total-timeout"), 0, AuditKind::Connect).await;
             }
         }
     });
@@ -990,12 +1189,61 @@ fn strip_hop_headers(headers: &mut HeaderMap) {
     }
 }
 
+async fn audited_problem(
+    context: &AcceptContext,
+    request: &Request<Incoming>,
+    status: StatusCode,
+    message: &'static str,
+    classification: &'static str,
+) -> Response<ResponseBody> {
+    let (reply, receive) = oneshot::channel();
+    let attempt = AuditAttempt {
+        kind: if request.method() == Method::CONNECT {
+            AuditKind::Connect
+        } else {
+            AuditKind::Http
+        },
+        host: request
+            .uri()
+            .authority()
+            .map(|authority| authority.to_string()),
+        method: request.method().to_string(),
+        path: request
+            .uri()
+            .path_and_query()
+            .map_or_else(|| "/".to_owned(), ToString::to_string),
+        status: AuditStatus::Denied,
+        http_status: status,
+        classification,
+    };
+    if context
+        .commands
+        .send(Command::AuditDenial {
+            workspace_id: context.workspace_id.clone(),
+            attempt,
+            reply,
+        })
+        .await
+        .is_err()
+        || !matches!(receive.await, Ok(true))
+    {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit service is unavailable",
+            None,
+        );
+    }
+    problem(status, message, None)
+}
+
 async fn admit(
     context: &AcceptContext,
     authentication: Authentication,
     intent: RequestIntent,
 ) -> Result<Admission, AdmissionError> {
     let (reply, receive) = oneshot::channel();
+    let (cancel, cancelled) = oneshot::channel();
+    let _cancellation = AdmissionCancellation(Some(cancel));
     context
         .commands
         .send(Command::Admit {
@@ -1003,6 +1251,7 @@ async fn admit(
             authentication,
             intent,
             reply,
+            cancelled,
         })
         .await
         .map_err(|_| AdmissionError {
@@ -1019,23 +1268,27 @@ async fn admit(
     })?
 }
 
+struct AdmissionCancellation(Option<oneshot::Sender<()>>);
+
+impl Drop for AdmissionCancellation {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+
 async fn complete_now(
-    context: &AcceptContext,
-    admission: &Admission,
+    _context: &AcceptContext,
+    admission: Admission,
     status: AuditStatus,
     http_status: Option<StatusCode>,
     classification: Option<&str>,
     bytes: u64,
     kind: AuditKind,
 ) {
-    let draft = completion_draft(admission, status, http_status, classification, bytes, kind);
-    let _ = context
-        .commands
-        .send(Command::Complete {
-            permit_id: admission.permit_id,
-            draft,
-        })
-        .await;
+    let draft = completion_draft(&admission, status, http_status, classification, bytes, kind);
+    admission.finish(draft);
 }
 
 fn completion_draft(
@@ -1067,39 +1320,34 @@ fn completion_draft(
 }
 
 struct Completion {
-    commands: mpsc::Sender<Command>,
-    permit_id: u64,
+    lease: Option<CompletionLease>,
     draft: Option<AuditDraft>,
 }
 
 impl Completion {
-    fn new(commands: mpsc::Sender<Command>, admission: Admission, status: StatusCode) -> Self {
+    fn new(_commands: mpsc::Sender<Command>, mut admission: Admission, status: StatusCode) -> Self {
+        let draft = completion_draft(
+            &admission,
+            AuditStatus::Completed,
+            Some(status),
+            None,
+            0,
+            admission.audit_kind,
+        );
         Self {
-            commands,
-            permit_id: admission.permit_id,
-            draft: Some(completion_draft(
-                &admission,
-                AuditStatus::Completed,
-                Some(status),
-                None,
-                0,
-                admission.audit_kind,
-            )),
+            lease: Some(admission.take_completion()),
+            draft: Some(draft),
         }
     }
 
     fn send(&mut self, status: AuditStatus, classification: Option<&str>, bytes: u64) {
-        let Some(mut draft) = self.draft.take() else {
+        let (Some(lease), Some(mut draft)) = (self.lease.take(), self.draft.take()) else {
             return;
         };
         draft.status = status;
         draft.classification = classification.map(str::to_owned);
         draft.bytes = bytes;
-        let commands = self.commands.clone();
-        let permit_id = self.permit_id;
-        tokio::spawn(async move {
-            let _ = commands.send(Command::Complete { permit_id, draft }).await;
-        });
+        lease.finish(draft);
     }
 }
 
