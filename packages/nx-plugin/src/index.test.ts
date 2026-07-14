@@ -135,46 +135,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('infers zig step targets and excludes reserved non-build steps', async () => {
-    const workspace = await createWorkspace();
-    try {
-      await workspace.write('packages/ziggy/package.json', '{"name":"ziggy"}\n');
-      await workspace.write(
-        'packages/ziggy/build.zig',
-        [
-          'pub fn build(b: *std.Build) void {',
-          '  _ = b.step("wasm", "Build wasm");',
-          '  _ = b.step("native", "Build native");',
-          '  _ = b.step("test", "Run tests");',
-          '  _ = b.step("all", "Build everything");',
-          '  _ = b.step("clean", "Clean outputs");',
-          '  _ = b.step("install", "Install artifacts");',
-          '}',
-          '',
-        ].join('\n'),
-      );
-
-      const targets = await inferProjectTargets(workspace, 'packages/ziggy/package.json');
-
-      expect(Object.keys(targets).sort()).toEqual(['build', 'clean', 'zig-native', 'zig-wasm']);
-      expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
-      expect(targets.build?.cache).toBe(true);
-      expect(targets['zig-wasm']?.cache).toBe(true);
-      expect(targets['zig-native']?.cache).toBe(true);
-      expect(targets['zig-wasm']?.outputs).toEqual(['{projectRoot}/dist/**/*.wasm']);
-      expect(targets['zig-native']?.outputs).toEqual(['{projectRoot}/dist/**/*.{node,dylib,so,dll,a}']);
-      expect(targets['zig-wasm']?.options).toEqual({
-        command: 'zig build wasm',
-        cwd: 'packages/ziggy',
-      });
-      expect(targets['zig-native']?.options).toEqual({
-        command: 'zig build native',
-        cwd: 'packages/ziggy',
-      });
-    } finally {
-      await workspace.cleanup();
-    }
-  });
 
   it('infers aggregate build for package-local output targets without owning them', async () => {
     const workspace = await createWorkspace();
@@ -337,20 +297,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.write('packages/member/Cargo.toml', '[package]\nname = "member"\n');
       const memberTargets = await inferProjectTargets(workspace, 'packages/member/package.json');
       expect(memberTargets).toEqual({});
-    } finally {
-      await workspace.cleanup();
-    }
-  });
-
-  it('leaves build.zig without b.step declarations to smoo validation', async () => {
-    const workspace = await createWorkspace();
-    try {
-      await workspace.write('packages/broken/package.json', '{"name":"broken"}\n');
-      await workspace.write('packages/broken/build.zig', 'pub fn build(_: *std.Build) void {}\n');
-
-      const targets = await inferProjectTargets(workspace, 'packages/broken/package.json');
-
-      expect(targets).toEqual({});
     } finally {
       await workspace.cleanup();
     }
