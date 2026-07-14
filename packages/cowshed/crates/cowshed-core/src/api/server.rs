@@ -374,27 +374,23 @@ pub(crate) mod codec {
 
         #[test]
         fn all_directional_decoders_reject_unknown_fields() {
-            let cases: [(fn(&[u8]) -> bool, &[u8]); 4] = [
-                (
-                    |bytes| decode_client_hello(bytes).is_err(),
-                    br#"{"version":1,"nonce":"n","extra":true}"#,
-                ),
-                (
-                    |bytes| decode_server_hello(bytes).is_err(),
-                    br#"{"version":1,"nonce":"n","repoId":"acme/widget","extra":true}"#,
-                ),
-                (
-                    |bytes| decode_rpc_request(bytes).is_err(),
-                    br#"{"id":1,"method":"project.list","params":{},"extra":true}"#,
-                ),
-                (
-                    |bytes| decode_rpc_response(bytes).is_err(),
-                    br#"{"id":1,"ok":true,"result":{},"error":null,"binaryLength":null,"extra":true}"#,
-                ),
-            ];
-            for (rejects, bytes) in cases {
-                assert!(rejects(bytes));
-            }
+            assert!(decode_client_hello(br#"{"version":1,"nonce":"n","extra":true}"#).is_err());
+            assert!(
+                decode_server_hello(
+                    br#"{"version":1,"nonce":"n","repoId":"acme/widget","extra":true}"#
+                )
+                .is_err()
+            );
+            assert!(
+                decode_rpc_request(br#"{"id":1,"method":"project.list","params":{},"extra":true}"#)
+                    .is_err()
+            );
+            assert!(
+                decode_rpc_response(
+                    br#"{"id":1,"ok":true,"result":{},"error":null,"binaryLength":null,"extra":true}"#
+                )
+                .is_err()
+            );
         }
 
         #[test]
