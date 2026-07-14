@@ -160,18 +160,22 @@ cowshed churn at all:
   durability is still git. Same-volume clonefile is preserved by construction — main → sessions → checkpoints and trash
   renames all stay within `cowshed.store`.
 
-Both volumes are created lazily on first use
+Both volumes are created lazily by explicit foreground `cowshed adopt`
 (`diskutil apfs addVolume <container> APFS <cowshed.caches|cowshed.store> -nomount`, then mounted `-nobrowse`) and share
-the container's free-space pool — no sizing, no space cost for the split. macOS auto-mounts container volumes at boot,
-but `-nobrowse` is not sticky: `cowshed ensure` re-mounts with canonical flags after reboot, and `cowshed doctor`
-verifies presence and flags of both.
+the container's free-space pool — no sizing, no space cost for the split. The complete create/mount/ownership
+transaction uses the one provisioning authorization session described in 14_nix.md. macOS auto-mounts container volumes
+at boot, but `-nobrowse` is not sticky: `cowshed ensure`, `cowshed doctor`, and login agents validate presence, markers,
+ownership, and flags. If either dedicated volume is absent, unmounted, incomplete, or mounted with noncanonical flags,
+every existing-only command fails before mutation with `environment-missing` and `next: cowshed adopt`; only explicit
+foreground adopt may remount or repair it.
 
 **Mount ordering and the unmounted-masking guard.** The layout nests: the caches volume and every workspace mount at
-directories that live _on_ the store volume, so `cowshed.store` mounts first — the login agent and `cowshed ensure`
-sequence store → caches → workspaces. When the store volume is not mounted, `~/.cowshed` is a bare, empty directory on
-Data; the volume-root marker `.cowshed-volume.json` is how every cowshed command tells the difference — marker absent ⇒
-treat as unmounted and heal before doing anything (the same shape as the workspace stub `.envrc`). The underlying Data
-directory is kept empty by construction so nothing ever silently lands on Data behind an unmounted volume.
+directories that live _on_ the store volume, so validation and foreground adopt sequence store → caches → workspaces.
+When the store volume is not mounted, `~/.cowshed` is a bare, empty directory on Data; the volume-root marker
+`.cowshed-volume.json` is how every cowshed command tells the difference — marker absent ⇒ treat as unmounted and
+require foreground adopt before doing anything (the same shape as the workspace stub `.envrc`). A launchd/background job
+reports the remediation but never repairs storage or triggers authorization. The underlying Data directory is kept empty
+by construction so nothing ever silently lands on Data behind an unmounted volume.
 
 Why volumes and not paths on Data: Data takes hourly APFS local snapshots, and a snapshot pins every since-rewritten
 block of a multi-GB churning image — ghosts that path-level `tmutil addexclusion` does **not** prevent (exclusion stops
