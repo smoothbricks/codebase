@@ -573,15 +573,18 @@ enum CommitmentRequest {
         draft: CommitmentDraft,
         reply: oneshot::Sender<Result<u64>>,
     },
+    #[cfg(any(target_os = "macos", test))]
     AdmittedLifecycleIncarnations {
         repo_id: RepoId,
         reply: oneshot::Sender<Result<BTreeSet<WorkspaceIncarnation>>>,
     },
+    #[cfg(any(target_os = "macos", test))]
     EnsureWorkspaceIntroduced {
         repo_id: RepoId,
         workspace_incarnation: WorkspaceIncarnation,
         reply: oneshot::Sender<Result<Option<u64>>>,
     },
+    #[cfg(any(target_os = "macos", test))]
     EnsureWorkspaceRetired {
         repo_id: RepoId,
         workspace_incarnation: WorkspaceIncarnation,
@@ -619,6 +622,7 @@ impl CommitmentPublisher {
                     CommitmentRequest::Publish { draft, reply } => {
                         let _ = reply.send(publish_draft(&mut store, draft));
                     }
+                    #[cfg(any(target_os = "macos", test))]
                     CommitmentRequest::AdmittedLifecycleIncarnations { repo_id, reply } => {
                         let result = store
                             .refresh()
@@ -626,6 +630,7 @@ impl CommitmentPublisher {
                             .map(|()| store.admitted_lifecycle_incarnations(&repo_id));
                         let _ = reply.send(result);
                     }
+                    #[cfg(any(target_os = "macos", test))]
                     CommitmentRequest::EnsureWorkspaceIntroduced {
                         repo_id,
                         workspace_incarnation,
@@ -659,6 +664,7 @@ impl CommitmentPublisher {
                             });
                         let _ = reply.send(result);
                     }
+                    #[cfg(any(target_os = "macos", test))]
                     CommitmentRequest::EnsureWorkspaceRetired {
                         repo_id,
                         workspace_incarnation,
@@ -718,6 +724,7 @@ impl std::fmt::Debug for CommitmentPublisherHandle {
 }
 
 impl CommitmentPublisherHandle {
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) async fn ensure_workspace_introduced(
         &mut self,
         repo_id: RepoId,
@@ -733,6 +740,7 @@ impl CommitmentPublisherHandle {
         receive_commitment_reply(receive).await
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) async fn ensure_workspace_retired(
         &mut self,
         repo_id: RepoId,
@@ -748,6 +756,7 @@ impl CommitmentPublisherHandle {
         receive_commitment_reply(receive).await
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) async fn admitted_lifecycle_incarnations(
         &self,
         repo_id: RepoId,

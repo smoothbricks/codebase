@@ -1690,6 +1690,7 @@ fn clonefile_native(source: &Path, destination: &Path) -> Result<(), CloneFileEr
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn classify_clone_error(source: &Path, destination: &Path, error: io::Error) -> CloneFileError {
     // Darwin EXDEV=18 and EEXIST=17; raw codes are used because std does not
     // expose a cross-device ErrorKind on all supported Rust versions.

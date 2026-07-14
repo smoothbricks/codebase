@@ -1355,6 +1355,7 @@ fn run_host_command(
     }
 }
 
+#[cfg(target_os = "macos")]
 fn parse_created_apfs_identifier(stdout: &[u8]) -> Result<String, BootstrapExecutionError> {
     let stdout = std::str::from_utf8(stdout).map_err(|_| {
         BootstrapExecutionError::CreatedVolumeOutput(
@@ -1381,6 +1382,7 @@ fn parse_created_apfs_identifier(stdout: &[u8]) -> Result<String, BootstrapExecu
     Ok(identifier.to_owned())
 }
 
+#[cfg(target_os = "macos")]
 fn valid_apfs_volume_identifier(identifier: &str) -> bool {
     let Some(rest) = identifier.strip_prefix("disk") else {
         return false;
@@ -1394,6 +1396,7 @@ fn valid_apfs_volume_identifier(identifier: &str) -> bool {
         && slice.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+#[cfg(target_os = "macos")]
 fn attest_created_apfs_info(
     bytes: &[u8],
     expected_identifier: &str,
