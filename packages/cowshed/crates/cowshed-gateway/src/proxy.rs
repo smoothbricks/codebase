@@ -1,9 +1,12 @@
 use std::{
     convert::Infallible,
     future::Future,
-    io::Cursor,
+    io::{self, Cursor},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -23,9 +26,9 @@ use hyper::{
 };
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     sync::{mpsc, oneshot, watch},
-    time::{Instant, Sleep, timeout},
+    time::{Instant, Sleep, timeout, timeout_at},
 };
 use tokio_rustls::TlsAcceptor;
 
@@ -46,6 +49,8 @@ use crate::{
         MirrorOutcome, MirrorRequest, MirrorService, MirrorUpstream,
     },
     policy::{CanonicalHost, CanonicalTarget, EgressMode, TargetScheme, normalize_path},
+    repo_mirror::RepoMirrorHandle,
+    sim_broker::{SimBrokerError, SimBrokerHandle, SimRequest},
 };
 
 const MAX_TARGET: usize = 8 * 1024;
@@ -54,6 +59,7 @@ const MAX_HEADER_FIELD: usize = 16 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 const MAX_CLIENT_HELLO: usize = 64 * 1024;
+const MAX_SIM_REQUEST: usize = 64 * 1024;
 const MAX_H2_CONCURRENT_STREAMS: u32 = 32;
 const MAX_H2_SEND_BUFFER: usize = 64 * 1024;
 const MAX_H2_RESET_STREAMS: usize = 32;
@@ -71,6 +77,11 @@ pub(crate) struct AcceptContext {
     pub timeouts: GatewayTimeouts,
     pub connection_stop: watch::Receiver<bool>,
     pub audit_stop: watch::Receiver<bool>,
+    // Intentionally carried only as a structural fence: data-plane routing must
+    // never expose the control-plane repository mirror.
+    #[allow(dead_code)]
+    pub repo_mirror: RepoMirrorHandle,
+    pub sim_broker: SimBrokerHandle,
 }
 
 pub(crate) async fn accept_loop(
@@ -156,6 +167,8 @@ async fn handle_request(
     inherited_authentication: Authentication,
     fixed_target: Option<CanonicalTarget>,
 ) -> ServiceResult {
+    let admitted_at = Instant::now();
+    let request_deadline = admitted_at + context.timeouts.request_total;
     if let Err(error) = validate_request(&request) {
         return Ok(audited_problem(
             &context,
@@ -181,7 +194,7 @@ async fn handle_request(
             )
             .await);
         }
-        return Ok(handle_connect(request, context, authentication).await);
+        return Ok(handle_connect(request, context, authentication, admitted_at).await);
     }
     let (target, path, audit_kind) = match request_target(&request, fixed_target.as_ref()) {
         Ok(value) => value,
@@ -204,10 +217,11 @@ async fn handle_request(
         audit_kind,
         trace_id,
     };
-    let admission = match admit(&context, authentication, intent).await {
+    let mut admission = match admit(&context, authentication, intent).await {
         Ok(admission) => admission,
         Err(error) => return Ok(problem(error.status, error.message, error.hint.as_deref())),
     };
+    apply_trace_context(request.headers(), &mut admission);
     if let Some(fixed) = fixed_target
         && admission.target != fixed
     {
@@ -227,9 +241,20 @@ async fn handle_request(
             None,
         ));
     }
+    if audit_kind == AuditKind::Sim {
+        return Ok(handle_sim_request(request, context, admission, request_deadline).await);
+    }
     let health = upstream_health(&context, &admission.target).await;
     if admission.protocol.is_some() {
-        return Ok(handle_mirror_request(request, context, admission, health, audit_kind).await);
+        return Ok(handle_mirror_request(
+            request,
+            context,
+            admission,
+            health,
+            audit_kind,
+            admitted_at,
+        )
+        .await);
     }
     if health == UpstreamHealth::Offline {
         complete_now(
@@ -257,8 +282,14 @@ async fn handle_request(
         purpose,
         private_network_authorized: admission.private_network_authorized,
     };
-    let upstream = match timeout(
-        context.timeouts.connect,
+    let connector_timeout = context.timeouts.connect
+        + if purpose == UpstreamPurpose::TlsHttp {
+            context.timeouts.tls_handshake
+        } else {
+            Duration::ZERO
+        };
+    let upstream = match timeout_at(
+        stage_deadline(request_deadline, connector_timeout),
         context.connector.connect(&authorized),
     )
     .await
@@ -282,12 +313,17 @@ async fn handle_request(
             ));
         }
         Err(_) => {
+            let classification = if Instant::now() >= request_deadline {
+                "request-total-timeout"
+            } else {
+                "connect-timeout"
+            };
             complete_now(
                 &context,
                 admission,
                 AuditStatus::TimedOut,
                 Some(StatusCode::GATEWAY_TIMEOUT),
-                Some("connect-timeout"),
+                Some(classification),
                 0,
                 audit_kind,
             )
@@ -316,16 +352,17 @@ async fn handle_request(
             None,
         ));
     }
-    let request = match prepare_upstream_request(
+    let (request, mut request_timeout) = match prepare_upstream_request(
         request,
         &admission,
         &admission.upstream_path,
         &context,
         upstream.transport,
+        request_deadline,
     )
     .await
     {
-        Ok(request) => request,
+        Ok(prepared) => prepared,
         Err(status) => {
             complete_now(
                 &context,
@@ -344,8 +381,8 @@ async fn handle_request(
             ));
         }
     };
-    let mut sender = match timeout(
-        context.timeouts.response_headers,
+    let mut sender = match timeout_at(
+        stage_deadline(request_deadline, context.timeouts.response_headers),
         handshake_upstream(upstream),
     )
     .await
@@ -369,12 +406,17 @@ async fn handle_request(
             ));
         }
         Err(_) => {
+            let classification = if Instant::now() >= request_deadline {
+                "request-total-timeout"
+            } else {
+                "upstream-handshake-timeout"
+            };
             complete_now(
                 &context,
                 admission,
                 AuditStatus::TimedOut,
                 Some(StatusCode::GATEWAY_TIMEOUT),
-                Some("upstream-handshake-timeout"),
+                Some(classification),
                 0,
                 audit_kind,
             )
@@ -386,37 +428,61 @@ async fn handle_request(
             ));
         }
     };
-    let response = match timeout(
-        context.timeouts.response_headers,
+    let response = match timeout_at(
+        stage_deadline(request_deadline, context.timeouts.response_headers),
         sender.send_request(request),
     )
     .await
     {
         Ok(Ok(response)) => response,
         Ok(Err(_)) => {
+            let request_timeout = request_timeout.try_recv().ok();
+            let (audit_status, http_status, classification, message) = request_timeout.map_or(
+                (
+                    AuditStatus::Failed,
+                    StatusCode::BAD_GATEWAY,
+                    "upstream-response",
+                    "upstream response failed",
+                ),
+                |timed_out| {
+                    (
+                        AuditStatus::TimedOut,
+                        StatusCode::GATEWAY_TIMEOUT,
+                        timed_out.classification(),
+                        "request body timed out",
+                    )
+                },
+            );
             complete_now(
                 &context,
                 admission,
-                AuditStatus::Failed,
-                Some(StatusCode::BAD_GATEWAY),
-                Some("upstream-response"),
+                audit_status,
+                Some(http_status),
+                Some(classification),
                 0,
                 audit_kind,
             )
             .await;
-            return Ok(problem(
-                StatusCode::BAD_GATEWAY,
-                "upstream response failed",
-                None,
-            ));
+            return Ok(problem(http_status, message, None));
         }
         Err(_) => {
+            let body_timeout = request_timeout.try_recv().ok();
+            let classification = body_timeout.map_or_else(
+                || {
+                    if Instant::now() >= request_deadline {
+                        "request-total-timeout"
+                    } else {
+                        "response-headers-timeout"
+                    }
+                },
+                RequestBodyTimeout::classification,
+            );
             complete_now(
                 &context,
                 admission,
                 AuditStatus::TimedOut,
                 Some(StatusCode::GATEWAY_TIMEOUT),
-                Some("response-headers-timeout"),
+                Some(classification),
                 0,
                 audit_kind,
             )
@@ -432,15 +498,243 @@ async fn handle_request(
     let (mut parts, body) = response.into_parts();
     strip_response_secrets(&mut parts.headers);
     strip_hop_headers(&mut parts.headers);
+    let total_deadline = admitted_at + response_total_duration(&parts.headers, context.timeouts);
     let completion = Completion::new(context.commands.clone(), admission, status, None);
     let body = ProxyBody::stream(
         body.map_err(|error| -> BoxError { Box::new(error) })
             .boxed(),
         completion,
+        Some(request_timeout),
         context.timeouts.body_idle,
-        context.timeouts.request_total,
+        total_deadline,
     );
     Ok(Response::from_parts(parts, body))
+}
+
+async fn handle_sim_request(
+    request: Request<Incoming>,
+    context: AcceptContext,
+    admission: Admission,
+    request_deadline: Instant,
+) -> Response<ResponseBody> {
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if content_type != Some("application/json") {
+        complete_now(
+            &context,
+            admission,
+            AuditStatus::Denied,
+            Some(StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            Some("sim-content-type"),
+            0,
+            AuditKind::Sim,
+        )
+        .await;
+        return problem(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "simulator requests require application/json",
+            None,
+        );
+    }
+
+    let body = Limited::new(request.into_body(), MAX_SIM_REQUEST).boxed();
+    let (signal, mut request_timeout) = oneshot::channel();
+    let body = TimedRequestBody::new(body, signal, context.timeouts.body_idle, request_deadline);
+    let bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => {
+            let timed_out = request_timeout.try_recv().ok();
+            let (status, audit_status, classification, message) = timed_out.map_or(
+                (
+                    StatusCode::BAD_REQUEST,
+                    AuditStatus::Denied,
+                    "sim-request-body",
+                    "simulator request body is invalid",
+                ),
+                |timed_out| {
+                    (
+                        StatusCode::GATEWAY_TIMEOUT,
+                        AuditStatus::TimedOut,
+                        timed_out.classification(),
+                        "simulator request body timed out",
+                    )
+                },
+            );
+            complete_now(
+                &context,
+                admission,
+                audit_status,
+                Some(status),
+                Some(classification),
+                0,
+                AuditKind::Sim,
+            )
+            .await;
+            return problem(status, message, None);
+        }
+    };
+    let sim_request = match serde_json::from_slice::<SimRequest>(&bytes) {
+        Ok(request) => request,
+        Err(_) => {
+            complete_now(
+                &context,
+                admission,
+                AuditStatus::Denied,
+                Some(StatusCode::BAD_REQUEST),
+                Some("sim-request-json"),
+                0,
+                AuditKind::Sim,
+            )
+            .await;
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "simulator request JSON is invalid",
+                None,
+            );
+        }
+    };
+    let result = match timeout_at(
+        request_deadline,
+        context
+            .sim_broker
+            .request(admission.workspace_id.clone(), sim_request),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            let (status, audit_status, classification) = sim_error(&error);
+            complete_now(
+                &context,
+                admission,
+                audit_status,
+                Some(status),
+                Some(classification),
+                0,
+                AuditKind::Sim,
+            )
+            .await;
+            return problem(status, "simulator operation was rejected", None);
+        }
+        Err(_) => {
+            complete_now(
+                &context,
+                admission,
+                AuditStatus::TimedOut,
+                Some(StatusCode::GATEWAY_TIMEOUT),
+                Some("request-total-timeout"),
+                0,
+                AuditKind::Sim,
+            )
+            .await;
+            return problem(
+                StatusCode::GATEWAY_TIMEOUT,
+                "simulator operation timed out",
+                None,
+            );
+        }
+    };
+    let payload = match serde_json::to_vec(&result) {
+        Ok(payload) => payload,
+        Err(_) => {
+            complete_now(
+                &context,
+                admission,
+                AuditStatus::Failed,
+                Some(StatusCode::INTERNAL_SERVER_ERROR),
+                Some("sim-response-json"),
+                0,
+                AuditKind::Sim,
+            )
+            .await;
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "simulator response encoding failed",
+                None,
+            );
+        }
+    };
+    complete_now(
+        &context,
+        admission,
+        AuditStatus::Completed,
+        Some(StatusCode::OK),
+        None,
+        payload.len() as u64,
+        AuditKind::Sim,
+    )
+    .await;
+    let body = Full::new(Bytes::from(payload))
+        .map_err(|never| -> BoxError { match never {} })
+        .boxed();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(ProxyBody::boxed(body))
+        .expect("static simulator response is valid")
+}
+
+fn sim_error(error: &SimBrokerError) -> (StatusCode, AuditStatus, &'static str) {
+    match error {
+        SimBrokerError::NotGranted => (
+            StatusCode::FORBIDDEN,
+            AuditStatus::Denied,
+            "sim-not-granted",
+        ),
+        SimBrokerError::InvalidScheme => (
+            StatusCode::FORBIDDEN,
+            AuditStatus::Denied,
+            "sim-invalid-scheme",
+        ),
+        SimBrokerError::ApprovalRequired => (
+            StatusCode::FORBIDDEN,
+            AuditStatus::Denied,
+            "sim-approval-required",
+        ),
+        SimBrokerError::InstallDisabled => (
+            StatusCode::FORBIDDEN,
+            AuditStatus::Denied,
+            "sim-install-disabled",
+        ),
+        SimBrokerError::ProjectNotConfigured | SimBrokerError::UnknownWorkspace => {
+            (StatusCode::FORBIDDEN, AuditStatus::Denied, "sim-project")
+        }
+        SimBrokerError::Capacity => (
+            StatusCode::TOO_MANY_REQUESTS,
+            AuditStatus::Limited,
+            "sim-capacity",
+        ),
+        SimBrokerError::RunnerTimeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            AuditStatus::TimedOut,
+            "sim-runner-timeout",
+        ),
+        SimBrokerError::AuditUnavailable | SimBrokerError::Stopped => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            AuditStatus::Failed,
+            "sim-unavailable",
+        ),
+        SimBrokerError::InvalidUrl
+        | SimBrokerError::InvalidReceipt
+        | SimBrokerError::InvalidApp
+        | SimBrokerError::DigestMismatch
+        | SimBrokerError::InvalidDigest
+        | SimBrokerError::InvalidIdentifier
+        | SimBrokerError::ReceiptReplay => (
+            StatusCode::BAD_REQUEST,
+            AuditStatus::Denied,
+            "sim-invalid-request",
+        ),
+        SimBrokerError::InsecureDropRoot
+        | SimBrokerError::RunnerFailed
+        | SimBrokerError::InvalidRunnerOutput => {
+            (StatusCode::BAD_GATEWAY, AuditStatus::Failed, "sim-failed")
+        }
+    }
 }
 
 enum UpstreamSender {
@@ -500,6 +794,7 @@ async fn handle_mirror_request(
     mut admission: Admission,
     health: UpstreamHealth,
     audit_kind: AuditKind,
+    admitted_at: Instant,
 ) -> Response<ResponseBody> {
     let protocol = admission
         .protocol
@@ -541,7 +836,9 @@ async fn handle_mirror_request(
             impersonate: admission.impersonate,
             private_network_authorized: admission.private_network_authorized,
             trace_id: admission.trace_id.as_deref(),
-            permit_id: admission.permit_id,
+            upstream_span_id: admission.upstream_span_id,
+            trace_flags: admission.trace_flags,
+            tracestate: admission.tracestate.as_deref(),
         };
         match context
             .mirror_service
@@ -554,6 +851,8 @@ async fn handle_mirror_request(
                 let (mut parts, body) = response.response.into_parts();
                 strip_response_secrets(&mut parts.headers);
                 strip_hop_headers(&mut parts.headers);
+                let total_deadline =
+                    admitted_at + response_total_duration(&parts.headers, context.timeouts);
                 let completion = Completion::new(
                     context.commands.clone(),
                     admission,
@@ -563,8 +862,9 @@ async fn handle_mirror_request(
                 let body = ProxyBody::stream(
                     body,
                     completion,
+                    None,
                     context.timeouts.body_idle,
-                    context.timeouts.request_total,
+                    total_deadline,
                 );
                 return Response::from_parts(parts, body);
             }
@@ -572,6 +872,10 @@ async fn handle_mirror_request(
                 let generation = admission.generation;
                 let request_path = admission.request_path.clone();
                 let trace_id = admission.trace_id.clone();
+                let parent_span_id = Some(admission.span_id);
+                let trace_flags = admission.trace_flags;
+                let tracestate = admission.tracestate.clone();
+                let trace_classification = admission.trace_classification.clone();
                 let redirected = redirect.request;
                 let target = redirected.target.clone();
                 let upstream_path = redirected.path.clone();
@@ -603,6 +907,11 @@ async fn handle_mirror_request(
                             return problem(error.status, error.message, error.hint.as_deref());
                         }
                     };
+                admission.parent_span_id = parent_span_id;
+                admission.trace_flags = trace_flags;
+                admission.tracestate = tracestate;
+                admission.trace_classification = trace_classification;
+                admission.upstream_span_id = Some(admission.span_id.wrapping_add(1).max(1));
                 let cache_scope = if admission.credential_allowed {
                     MirrorCacheScope::Project(admission.repo_id.clone())
                 } else {
@@ -690,7 +999,9 @@ struct ProxyMirrorUpstream<'a> {
     impersonate: bool,
     private_network_authorized: bool,
     trace_id: Option<&'a str>,
-    permit_id: u64,
+    upstream_span_id: Option<u64>,
+    trace_flags: u8,
+    tracestate: Option<&'a str>,
 }
 
 #[async_trait]
@@ -738,14 +1049,23 @@ impl MirrorUpstream for ProxyMirrorUpstream<'_> {
         if !self.impersonate {
             let trace_id = self
                 .trace_id
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("{:032x}", self.permit_id));
-            let trace = format!("00-{trace_id}-{:016x}-01", self.permit_id);
+                .ok_or_else(|| -> CacheBodyError { "mirror trace id is missing".into() })?;
+            let upstream_span_id = self
+                .upstream_span_id
+                .ok_or_else(|| -> CacheBodyError { "mirror upstream span id is missing".into() })?;
+            let trace = serialize_traceparent(trace_id, upstream_span_id, self.trace_flags);
             outbound.headers_mut().insert(
                 HeaderName::from_static("traceparent"),
                 HeaderValue::from_str(&trace)
                     .map_err(|error| -> CacheBodyError { Box::new(error) })?,
             );
+            if let Some(tracestate) = self.tracestate {
+                outbound.headers_mut().insert(
+                    HeaderName::from_static("tracestate"),
+                    HeaderValue::from_str(tracestate)
+                        .map_err(|error| -> CacheBodyError { Box::new(error) })?,
+                );
+            }
         }
         if self.credential_allowed {
             let query = CredentialQuery {
@@ -823,6 +1143,7 @@ async fn handle_connect(
     mut request: Request<Incoming>,
     context: AcceptContext,
     authentication: Authentication,
+    admitted_at: Instant,
 ) -> Response<ResponseBody> {
     let authority = match request.uri().authority() {
         Some(authority) => authority.as_str(),
@@ -867,10 +1188,12 @@ async fn handle_connect(
         audit_kind: AuditKind::Connect,
         trace_id: None,
     };
-    let admission = match admit(&context, authentication, intent).await {
+    let mut admission = match admit(&context, authentication, intent).await {
         Ok(admission) => admission,
         Err(error) => return problem(error.status, error.message, error.hint.as_deref()),
     };
+    admission.trace_id = Some(format!("{:032x}", admission.permit_id.max(1)));
+    admission.upstream_span_id = Some(admission.span_id.wrapping_add(1).max(1));
     if !matches!(admission.mode, EgressMode::Opaque)
         && upstream_health(&context, &target).await == UpstreamHealth::Offline
     {
@@ -894,7 +1217,7 @@ async fn handle_connect(
                 purpose: UpstreamPurpose::OpaqueTcp,
                 private_network_authorized: admission.private_network_authorized,
             };
-            spawn_opaque(upgraded, authorized, context, admission);
+            spawn_opaque(upgraded, authorized, context, admission, admitted_at);
             empty(StatusCode::OK)
         }
         EgressMode::Intercept => {
@@ -943,8 +1266,81 @@ async fn handle_connect(
                     );
                 }
             };
-            spawn_intercept(upgraded, leaf, context, admission);
+            spawn_intercept(upgraded, leaf, context, admission, admitted_at);
             empty(StatusCode::OK)
+        }
+    }
+}
+
+struct ActivityIo<T> {
+    inner: T,
+    started: Instant,
+    activity_ns: Arc<AtomicU64>,
+}
+
+impl<T> ActivityIo<T> {
+    fn new(inner: T, started: Instant, activity_ns: Arc<AtomicU64>) -> Self {
+        Self {
+            inner,
+            started,
+            activity_ns,
+        }
+    }
+
+    fn touch(&self) {
+        let elapsed = Instant::now().saturating_duration_since(self.started);
+        self.activity_ns.store(
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for ActivityIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buffer.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buffer);
+        if matches!(result, Poll::Ready(Ok(()))) && buffer.filled().len() > before {
+            this.touch();
+        }
+        result
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_write(cx, buffer);
+        if matches!(result, Poll::Ready(Ok(written)) if written > 0) {
+            this.touch();
+        }
+        result
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+async fn wait_for_opaque_idle(started: Instant, activity_ns: &AtomicU64, idle: Duration) {
+    loop {
+        let observed = activity_ns.load(Ordering::Acquire);
+        tokio::time::sleep_until(started + Duration::from_nanos(observed) + idle).await;
+        if activity_ns.load(Ordering::Acquire) == observed {
+            return;
         }
     }
 }
@@ -954,6 +1350,7 @@ fn spawn_opaque(
     authorized: AuthorizedTarget,
     context: AcceptContext,
     admission: Admission,
+    admitted_at: Instant,
 ) {
     tokio::spawn(async move {
         let mut audit_stop = watch_for_audit_stop(&context);
@@ -1116,6 +1513,11 @@ fn spawn_opaque(
                 }
             }
             let replayed = captured.len() as u64;
+            let activity_started = Instant::now();
+            let activity_ns = Arc::new(AtomicU64::new(0));
+            let mut client = ActivityIo::new(client, activity_started, Arc::clone(&activity_ns));
+            let mut upstream =
+                ActivityIo::new(upstream, activity_started, Arc::clone(&activity_ns));
             let result = tokio::select! {
                 result = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {
                     result.map(|(from_client, from_upstream)| {
@@ -1124,7 +1526,15 @@ fn spawn_opaque(
                             .saturating_add(from_upstream)
                     })
                 }
-                _ = tokio::time::sleep(context.timeouts.tunnel_total) => {
+                () = wait_for_opaque_idle(
+                    activity_started,
+                    activity_ns.as_ref(),
+                    context.timeouts.body_idle,
+                ) => {
+                    complete_now(&context, admission, AuditStatus::TimedOut, Some(StatusCode::GATEWAY_TIMEOUT), Some("opaque-idle-timeout"), replayed, AuditKind::Opaque).await;
+                    return;
+                }
+                _ = tokio::time::sleep_until(admitted_at + context.timeouts.tunnel_total) => {
                     complete_now(&context, admission, AuditStatus::TimedOut, Some(StatusCode::GATEWAY_TIMEOUT), Some("tunnel-total-timeout"), replayed, AuditKind::Opaque).await;
                     return;
                 }
@@ -1252,6 +1662,7 @@ fn spawn_intercept(
     leaf: Arc<rustls::ServerConfig>,
     context: AcceptContext,
     admission: Admission,
+    admitted_at: Instant,
 ) {
     tokio::spawn(async move {
         let mut audit_stop = watch_for_audit_stop(&context);
@@ -1356,7 +1767,13 @@ fn spawn_intercept(
                         .header_read_timeout(context.timeouts.request_headers)
                         .max_headers(MAX_HEADERS)
                         .serve_connection(TokioIo::new(tls), service);
-                    drive_intercept(connection, &context, admission).await;
+                    drive_intercept(
+                        connection,
+                        &context,
+                        admission,
+                        admitted_at + context.timeouts.tunnel_total,
+                    )
+                    .await;
                 }
                 NegotiatedTransport::Http2 => {
                     let nested_context = context.clone();
@@ -1379,7 +1796,13 @@ fn spawn_intercept(
                         .max_pending_accept_reset_streams(MAX_H2_RESET_STREAMS)
                         .max_local_error_reset_streams(MAX_H2_RESET_STREAMS);
                     let connection = builder.serve_connection(TokioIo::new(tls), service);
-                    drive_intercept(connection, &context, admission).await;
+                    drive_intercept(
+                        connection,
+                        &context,
+                        admission,
+                        admitted_at + context.timeouts.tunnel_total,
+                    )
+                    .await;
                 }
                 NegotiatedTransport::Raw => unreachable!("TLS ALPN cannot select raw transport"),
             }
@@ -1397,8 +1820,12 @@ fn spawn_intercept(
     });
 }
 
-async fn drive_intercept<F>(connection: F, context: &AcceptContext, admission: Admission)
-where
+async fn drive_intercept<F>(
+    connection: F,
+    context: &AcceptContext,
+    admission: Admission,
+    total_deadline: Instant,
+) where
     F: Future<Output = Result<(), hyper::Error>>,
 {
     let mut stopped = watch_for_session_stop(context);
@@ -1415,7 +1842,7 @@ where
         _ = stopped.changed() => {
             complete_now(context, admission, AuditStatus::Cancelled, None, Some("session-rotated"), 0, AuditKind::Connect).await;
         }
-        _ = tokio::time::sleep(context.timeouts.tunnel_total) => {
+        _ = tokio::time::sleep_until(total_deadline) => {
             complete_now(context, admission, AuditStatus::TimedOut, None, Some("tunnel-total-timeout"), 0, AuditKind::Connect).await;
         }
     }
@@ -1441,7 +1868,14 @@ async fn prepare_upstream_request(
     path: &str,
     context: &AcceptContext,
     transport: NegotiatedTransport,
-) -> Result<Request<BoxBody<Bytes, BoxError>>, StatusCode> {
+    total_deadline: Instant,
+) -> Result<
+    (
+        Request<BoxBody<Bytes, BoxError>>,
+        oneshot::Receiver<RequestBodyTimeout>,
+    ),
+    StatusCode,
+> {
     let (mut parts, body) = request.into_parts();
     strip_client_secrets(&mut parts.headers);
     strip_hop_headers(&mut parts.headers);
@@ -1453,13 +1887,22 @@ async fn prepare_upstream_request(
     if !admission.impersonate {
         let trace_id = admission
             .trace_id
-            .clone()
-            .unwrap_or_else(|| format!("{:032x}", admission.permit_id));
-        let trace = format!("00-{trace_id}-{:016x}-01", admission.permit_id);
+            .as_deref()
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        let upstream_span_id = admission
+            .upstream_span_id
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        let trace = serialize_traceparent(trace_id, upstream_span_id, admission.trace_flags);
         parts.headers.insert(
             HeaderName::from_static("traceparent"),
             HeaderValue::from_str(&trace).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
         );
+        if let Some(tracestate) = admission.tracestate.as_deref() {
+            parts.headers.insert(
+                HeaderName::from_static("tracestate"),
+                HeaderValue::from_str(tracestate).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            );
+        }
     }
     if admission.credential_allowed {
         let protocol = admission
@@ -1507,7 +1950,187 @@ async fn prepare_upstream_request(
     }
     .map_err(|_| StatusCode::BAD_REQUEST)?;
     let body = Limited::new(body, MAX_REQUEST_BODY).boxed();
-    Ok(Request::from_parts(parts, body))
+    let (signal, request_timeout) = oneshot::channel();
+    let body =
+        TimedRequestBody::new(body, signal, context.timeouts.body_idle, total_deadline).boxed();
+    Ok((Request::from_parts(parts, body), request_timeout))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IncomingTraceContext {
+    trace_id: String,
+    parent_span_id: u64,
+    flags: u8,
+    tracestate: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TraceContextAdmission {
+    Absent,
+    Valid(IncomingTraceContext),
+    Invalid,
+}
+
+fn parse_trace_context(headers: &HeaderMap) -> TraceContextAdmission {
+    let mut parents = headers.get_all("traceparent").iter();
+    let Some(parent) = parents.next() else {
+        return if headers.contains_key("tracestate") {
+            TraceContextAdmission::Invalid
+        } else {
+            TraceContextAdmission::Absent
+        };
+    };
+    if parents.next().is_some() {
+        return TraceContextAdmission::Invalid;
+    }
+    let Ok(parent) = parent.to_str() else {
+        return TraceContextAdmission::Invalid;
+    };
+    let Some((trace_id, parent_span_id, flags)) = parse_traceparent(parent) else {
+        return TraceContextAdmission::Invalid;
+    };
+    let tracestate = match parse_tracestate(headers) {
+        Ok(value) => value,
+        Err(()) => return TraceContextAdmission::Invalid,
+    };
+    TraceContextAdmission::Valid(IncomingTraceContext {
+        trace_id,
+        parent_span_id,
+        flags,
+        tracestate,
+    })
+}
+
+fn parse_traceparent(value: &str) -> Option<(String, u64, u8)> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 55
+        || bytes[2] != b'-'
+        || bytes[35] != b'-'
+        || bytes[52] != b'-'
+        || !bytes[..55]
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 2 | 35 | 52) || byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let version = u8::from_str_radix(&value[..2], 16).ok()?;
+    if version == u8::MAX
+        || (version == 0 && bytes.len() != 55)
+        || (version != 0 && bytes.len() > 55 && (bytes[55] != b'-' || value.ends_with('-')))
+    {
+        return None;
+    }
+    let trace_id = &value[3..35];
+    let parent = &value[36..52];
+    if trace_id.bytes().all(|byte| byte == b'0') || parent.bytes().all(|byte| byte == b'0') {
+        return None;
+    }
+    let parent_span_id = u64::from_str_radix(parent, 16).ok()?;
+    let flags = u8::from_str_radix(&value[53..55], 16).ok()?;
+    Some((trace_id.to_ascii_lowercase(), parent_span_id, flags))
+}
+
+fn parse_tracestate(headers: &HeaderMap) -> Result<Option<String>, ()> {
+    let values = headers.get_all("tracestate");
+    let mut members = Vec::new();
+    let mut total = 0_usize;
+    for value in values.iter() {
+        let value = value.to_str().map_err(|_| ())?;
+        total = total
+            .checked_add(value.len())
+            .and_then(|length| length.checked_add(usize::from(!members.is_empty())))
+            .ok_or(())?;
+        if total > 512 {
+            return Err(());
+        }
+        for member in value.split(',') {
+            let member = member.trim_matches([' ', '\t']);
+            let (key, value) = member.split_once('=').ok_or(())?;
+            if !valid_tracestate_key(key)
+                || value.is_empty()
+                || value.len() > 256
+                || value.starts_with([' ', '\t'])
+                || value.ends_with([' ', '\t'])
+                || !value
+                    .bytes()
+                    .all(|byte| (0x20..=0x7e).contains(&byte) && byte != b',' && byte != b'=')
+                || members
+                    .iter()
+                    .any(|existing: &String| existing.starts_with(&format!("{key}=")))
+            {
+                return Err(());
+            }
+            members.push(format!("{key}={value}"));
+            if members.len() > 32 {
+                return Err(());
+            }
+        }
+    }
+    Ok((!members.is_empty()).then(|| members.join(",")))
+}
+
+fn valid_tracestate_key(key: &str) -> bool {
+    let (tenant, system) = key
+        .split_once('@')
+        .map_or((None, key), |(tenant, system)| (Some(tenant), system));
+    if let Some(tenant) = tenant
+        && (tenant.is_empty()
+            || tenant.len() > 241
+            || !tenant
+                .bytes()
+                .enumerate()
+                .all(|(index, byte)| valid_key_byte(byte, index == 0, true)))
+    {
+        return false;
+    }
+    !system.is_empty()
+        && system.len() <= 14
+        && system
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| valid_key_byte(byte, index == 0, false))
+}
+
+fn valid_key_byte(byte: u8, first: bool, tenant: bool) -> bool {
+    if first {
+        return byte.is_ascii_lowercase() || (tenant && byte.is_ascii_digit());
+    }
+    byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'*' | b'/')
+}
+
+fn serialize_traceparent(trace_id: &str, span_id: u64, flags: u8) -> String {
+    format!("00-{trace_id}-{span_id:016x}-{flags:02x}")
+}
+
+fn apply_trace_context(headers: &HeaderMap, admission: &mut Admission) {
+    admission.upstream_span_id = Some(admission.span_id.wrapping_add(1).max(1));
+    match parse_trace_context(headers) {
+        TraceContextAdmission::Valid(context) => {
+            admission.trace_id = Some(context.trace_id);
+            admission.parent_span_id = Some(context.parent_span_id);
+            admission.trace_flags = context.flags;
+            admission.tracestate = context.tracestate;
+            admission.trace_classification = None;
+        }
+        TraceContextAdmission::Absent => {
+            admission
+                .trace_id
+                .get_or_insert_with(|| format!("{:032x}", admission.permit_id.max(1)));
+            admission.parent_span_id = None;
+            admission.tracestate = None;
+            admission.trace_classification = None;
+        }
+        TraceContextAdmission::Invalid => {
+            admission
+                .trace_id
+                .get_or_insert_with(|| format!("{:032x}", admission.permit_id.max(1)));
+            admission.trace_flags = 1;
+            admission.parent_span_id = None;
+            admission.tracestate = None;
+            admission.trace_classification = Some("invalid-trace-context".to_owned());
+        }
+    }
 }
 
 fn request_target(
@@ -1520,15 +2143,15 @@ fn request_target(
         .map(|value| value.as_str())
         .unwrap_or("/")
         .to_owned();
-    let local_mirror_kind = if fixed.is_none()
+    let local_kind = if fixed.is_none()
         && request.uri().scheme().is_none()
         && request.uri().authority().is_none()
     {
-        local_mirror_kind(request.uri().path())
+        local_request_kind(request.uri().path())
     } else {
         None
     };
-    if local_mirror_kind.is_none() {
+    if local_kind.is_none() {
         normalize_path(request.uri().path())
             .map_err(|_| RequestError::bad("request path is ambiguous"))?;
     }
@@ -1567,8 +2190,13 @@ fn request_target(
         }
         return Ok((RequestTarget::Generic(target), path, AuditKind::Http));
     }
-    if let Some(kind) = local_mirror_kind {
-        return Ok((RequestTarget::LocalMirror, path, kind));
+    if let Some(kind) = local_kind {
+        let target = if kind == AuditKind::Sim {
+            RequestTarget::LocalSim
+        } else {
+            RequestTarget::LocalMirror
+        };
+        return Ok((target, path, kind));
     }
     Err(RequestError::bad(
         "generic proxy requests require absolute-form URI",
@@ -1604,7 +2232,10 @@ fn extract_mirror_trace(path: &str, kind: AuditKind) -> Option<(String, Option<S
     ))
 }
 
-fn local_mirror_kind(path: &str) -> Option<AuditKind> {
+fn local_request_kind(path: &str) -> Option<AuditKind> {
+    if path == "/sim" {
+        return Some(AuditKind::Sim);
+    }
     if path == "/npm" || path.starts_with("/npm/") {
         Some(AuditKind::Npm)
     } else if path == "/cargo" || path.starts_with("/cargo/") {
@@ -1949,6 +2580,7 @@ fn completion_draft(
 ) -> AuditDraft {
     AuditDraft {
         workspace_id: admission.workspace_id.clone(),
+        repo_id: admission.repo_id.clone(),
         revision: admission.revision,
         endpoint: admission.endpoint.clone(),
         kind,
@@ -1962,8 +2594,14 @@ fn completion_draft(
             .trace_id
             .clone()
             .or_else(|| Some(format!("{:032x}", admission.permit_id))),
+        span_id: admission.span_id,
+        parent_span_id: admission.parent_span_id,
+        upstream_span_id: admission.upstream_span_id,
+        tracestate: admission.tracestate.clone(),
         grant_hint: None,
-        classification: classification.map(str::to_owned),
+        classification: classification
+            .map(str::to_owned)
+            .or_else(|| admission.trace_classification.clone()),
         mirror_cache_status: None,
     }
 }
@@ -2000,7 +2638,9 @@ impl Completion {
             return;
         };
         draft.status = status;
-        draft.classification = classification.map(str::to_owned);
+        if let Some(classification) = classification {
+            draft.classification = Some(classification.to_owned());
+        }
         draft.bytes = bytes;
         lease.finish(draft);
     }
@@ -2013,11 +2653,126 @@ impl Drop for Completion {
     }
 }
 
+fn stage_deadline(total_deadline: Instant, duration: Duration) -> Instant {
+    std::cmp::min(total_deadline, Instant::now() + duration)
+}
+
+fn response_total_duration(headers: &HeaderMap, timeouts: GatewayTimeouts) -> Duration {
+    let streaming = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+    if streaming {
+        timeouts.tunnel_total
+    } else {
+        timeouts.request_total
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestBodyTimeout {
+    Idle,
+    Total,
+}
+
+impl RequestBodyTimeout {
+    const fn classification(self) -> &'static str {
+        match self {
+            Self::Idle => "request-body-idle-timeout",
+            Self::Total => "request-total-timeout",
+        }
+    }
+}
+
+pin_project_lite::pin_project! {
+    struct TimedRequestBody {
+        #[pin]
+        inner: BoxBody<Bytes, BoxError>,
+        signal: Option<oneshot::Sender<RequestBodyTimeout>>,
+        #[pin]
+        idle: Sleep,
+        idle_duration: Duration,
+        #[pin]
+        total: Sleep,
+    }
+}
+
+impl TimedRequestBody {
+    fn new(
+        inner: BoxBody<Bytes, BoxError>,
+        signal: oneshot::Sender<RequestBodyTimeout>,
+        idle: Duration,
+        total_deadline: Instant,
+    ) -> Self {
+        Self {
+            inner,
+            signal: Some(signal),
+            idle: tokio::time::sleep(idle),
+            idle_duration: idle,
+            total: tokio::time::sleep_until(total_deadline),
+        }
+    }
+}
+
+impl Body for TimedRequestBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let mut this = self.project();
+        let timed_out = if this.total.as_mut().poll(cx).is_ready() {
+            Some(RequestBodyTimeout::Total)
+        } else if this.idle.as_mut().poll(cx).is_ready() {
+            Some(RequestBodyTimeout::Idle)
+        } else {
+            None
+        };
+        if let Some(timed_out) = timed_out {
+            if let Some(signal) = this.signal.take() {
+                let _ = signal.send(timed_out);
+            }
+            return Poll::Ready(Some(Err(timed_out.classification().into())));
+        }
+        match this.inner.as_mut().poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if frame.data_ref().is_some_and(|data| !data.is_empty()) {
+                    this.idle
+                        .as_mut()
+                        .reset(Instant::now() + *this.idle_duration);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                *this.signal = None;
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                *this.signal = None;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 pin_project_lite::pin_project! {
     pub(crate) struct ProxyBody {
         #[pin]
         inner: BoxBody<Bytes, BoxError>,
         completion: Option<Completion>,
+        request_timeout: Option<oneshot::Receiver<RequestBodyTimeout>>,
         bytes: u64,
         #[pin]
         idle: Sleep,
@@ -2031,16 +2786,18 @@ impl ProxyBody {
     fn stream(
         inner: BoxBody<Bytes, BoxError>,
         completion: Completion,
+        request_timeout: Option<oneshot::Receiver<RequestBodyTimeout>>,
         idle: Duration,
-        total: Duration,
+        total_deadline: Instant,
     ) -> Self {
         Self {
             inner,
             completion: Some(completion),
+            request_timeout,
             bytes: 0,
             idle: tokio::time::sleep(idle),
             idle_duration: idle,
-            total: tokio::time::sleep(total),
+            total: tokio::time::sleep_until(total_deadline),
         }
     }
 
@@ -2049,10 +2806,11 @@ impl ProxyBody {
         Self {
             inner,
             completion: None,
+            request_timeout: None,
             bytes: 0,
             idle: tokio::time::sleep(long),
             idle_duration: long,
-            total: tokio::time::sleep(long),
+            total: tokio::time::sleep_until(Instant::now() + long),
         }
     }
 }
@@ -2066,6 +2824,24 @@ impl Body for ProxyBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let mut this = self.project();
+        if let Some(receiver) = this.request_timeout.as_mut() {
+            match Pin::new(receiver).poll(cx) {
+                Poll::Ready(Ok(timed_out)) => {
+                    if let Some(completion) = this.completion.as_mut() {
+                        completion.send(
+                            AuditStatus::TimedOut,
+                            Some(timed_out.classification()),
+                            *this.bytes,
+                        );
+                    }
+                    *this.completion = None;
+                    *this.request_timeout = None;
+                    return Poll::Ready(Some(Err(timed_out.classification().into())));
+                }
+                Poll::Ready(Err(_)) => *this.request_timeout = None,
+                Poll::Pending => {}
+            }
+        }
         if this.total.as_mut().poll(cx).is_ready() {
             if let Some(completion) = this.completion.as_mut() {
                 completion.send(
@@ -2262,5 +3038,233 @@ mod tests {
         assert_eq!(go_path, "/go/example.com/mod/@v/list");
         assert_eq!(go_trace, npm_trace);
         assert!(extract_mirror_trace("/npm/t/invalid/react", AuditKind::Npm).is_none());
+    }
+    #[test]
+    fn generic_w3c_context_is_strictly_parsed_and_canonically_serialized() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            HeaderValue::from_static("00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-03"),
+        );
+        headers.append(
+            "tracestate",
+            HeaderValue::from_static("vendor=value, tenant@system=opaque"),
+        );
+        let TraceContextAdmission::Valid(context) = parse_trace_context(&headers) else {
+            panic!("valid generic W3C context was rejected");
+        };
+        assert_eq!(context.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(context.parent_span_id, 0x00f0_67aa_0ba9_02b7);
+        assert_eq!(context.flags, 3);
+        assert_eq!(
+            context.tracestate.as_deref(),
+            Some("vendor=value,tenant@system=opaque")
+        );
+        assert_eq!(
+            serialize_traceparent(&context.trace_id, 0x1122_3344_5566_7788, context.flags),
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-1122334455667788-03"
+        );
+    }
+
+    #[test]
+    fn invalid_w3c_context_is_rejected_as_one_unit() {
+        for value in [
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+            "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+            "not-a-traceparent",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "traceparent",
+                HeaderValue::from_str(value).expect("ASCII test header"),
+            );
+            assert_eq!(
+                parse_trace_context(&headers),
+                TraceContextAdmission::Invalid,
+                "{value}"
+            );
+        }
+
+        let mut duplicate_state = HeaderMap::new();
+        duplicate_state.insert(
+            "traceparent",
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+        duplicate_state.insert(
+            "tracestate",
+            HeaderValue::from_static("vendor=one,vendor=two"),
+        );
+        assert_eq!(
+            parse_trace_context(&duplicate_state),
+            TraceContextAdmission::Invalid
+        );
+
+        let mut orphan_state = HeaderMap::new();
+        orphan_state.insert("tracestate", HeaderValue::from_static("vendor=one"));
+        assert_eq!(
+            parse_trace_context(&orphan_state),
+            TraceContextAdmission::Invalid
+        );
+    }
+    #[derive(Debug)]
+    struct PendingBody;
+
+    impl Body for PendingBody {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
+        }
+    }
+
+    fn pending_body() -> BoxBody<Bytes, BoxError> {
+        PendingBody.boxed()
+    }
+
+    #[test]
+    fn sse_uses_streaming_total_while_ordinary_responses_do_not() {
+        let timeouts = GatewayTimeouts {
+            request_total: Duration::from_secs(15 * 60),
+            tunnel_total: Duration::from_secs(60 * 60),
+            ..GatewayTimeouts::default()
+        };
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            response_total_duration(&headers, timeouts),
+            Duration::from_secs(15 * 60)
+        );
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        assert_eq!(
+            response_total_duration(&headers, timeouts),
+            Duration::from_secs(60 * 60)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_body_idle_and_total_timers_classify_independently() {
+        let (idle_signal, idle_receive) = oneshot::channel();
+        let idle_body = TimedRequestBody::new(
+            pending_body(),
+            idle_signal,
+            Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let idle_task = tokio::spawn(async move {
+            let mut idle_body = Box::pin(idle_body);
+            std::future::poll_fn(|cx| idle_body.as_mut().poll_frame(cx))
+                .await
+                .expect("timeout frame")
+                .expect_err("idle timeout is an error")
+                .to_string()
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(
+            idle_receive.await.expect("idle timeout signal"),
+            RequestBodyTimeout::Idle
+        );
+        assert_eq!(
+            idle_task.await.expect("idle task"),
+            "request-body-idle-timeout"
+        );
+
+        let (total_signal, total_receive) = oneshot::channel();
+        let total_body = TimedRequestBody::new(
+            pending_body(),
+            total_signal,
+            Duration::from_secs(10),
+            Instant::now() + Duration::from_secs(5),
+        );
+        let total_task = tokio::spawn(async move {
+            let mut total_body = Box::pin(total_body);
+            std::future::poll_fn(|cx| total_body.as_mut().poll_frame(cx))
+                .await
+                .expect("timeout frame")
+                .expect_err("total timeout is an error")
+                .to_string()
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(
+            total_receive.await.expect("total timeout signal"),
+            RequestBodyTimeout::Total
+        );
+        assert_eq!(
+            total_task.await.expect("total task"),
+            "request-total-timeout"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn response_idle_and_admission_total_timers_cancel_the_body() {
+        let now = Instant::now();
+        let idle_body = ProxyBody {
+            inner: pending_body(),
+            completion: None,
+            request_timeout: None,
+            bytes: 0,
+            idle: tokio::time::sleep(Duration::from_secs(5)),
+            idle_duration: Duration::from_secs(5),
+            total: tokio::time::sleep_until(now + Duration::from_secs(10)),
+        };
+        let idle_task = tokio::spawn(async move {
+            let mut idle_body = Box::pin(idle_body);
+            std::future::poll_fn(|cx| idle_body.as_mut().poll_frame(cx))
+                .await
+                .expect("timeout frame")
+                .expect_err("response idle timeout is an error")
+                .to_string()
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(idle_task.await.expect("idle task"), "body idle timeout");
+
+        let now = Instant::now();
+        let total_body = ProxyBody {
+            inner: pending_body(),
+            completion: None,
+            request_timeout: None,
+            bytes: 0,
+            idle: tokio::time::sleep(Duration::from_secs(10)),
+            idle_duration: Duration::from_secs(10),
+            total: tokio::time::sleep_until(now + Duration::from_secs(5)),
+        };
+        let total_task = tokio::spawn(async move {
+            let mut total_body = Box::pin(total_body);
+            std::future::poll_fn(|cx| total_body.as_mut().poll_frame(cx))
+                .await
+                .expect("timeout frame")
+                .expect_err("response total timeout is an error")
+                .to_string()
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(total_task.await.expect("total task"), "request total timeout");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn opaque_idle_deadline_moves_only_when_bytes_are_observed() {
+        let started = Instant::now();
+        let activity = Arc::new(AtomicU64::new(0));
+        let watched = Arc::clone(&activity);
+        let idle = tokio::spawn(async move {
+            wait_for_opaque_idle(started, watched.as_ref(), Duration::from_secs(5)).await;
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        activity.store(4_000_000_000, Ordering::Release);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!idle.is_finished(), "activity extended the opaque idle deadline");
+        tokio::time::advance(Duration::from_secs(4)).await;
+        idle.await.expect("opaque idle watcher");
     }
 }
