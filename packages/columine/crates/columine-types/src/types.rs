@@ -427,6 +427,9 @@ pub enum Opcode {
     /// Same encoding as 0x80; first-wins — writes only when the key is absent
     /// (opcodes.zig:236, dispatch vm.zig:1774/2775).
     BatchStructMapUpsertFirst = 0x81,
+    /// Same row operands as 0x80 followed by comparison_field_idx:u8; replaces
+    /// only when the incoming scalar comparison is strictly greater.
+    BatchStructMapUpsertMax = 0x82,
     /// slot:u8, val_col:u8 (body opcode inside FOR_EACH/FLAT_MAP blocks)
     ListAppend = 0x84,
     /// slot:u8, num_vals:u8, \[(val_col:u8, field_idx:u8) × N\]
@@ -506,6 +509,7 @@ impl Opcode {
             0x4b => Self::BatchAggMaxI64,
             0x80 => Self::BatchStructMapUpsertLast,
             0x81 => Self::BatchStructMapUpsertFirst,
+            0x82 => Self::BatchStructMapUpsertMax,
             0x84 => Self::ListAppend,
             0x85 => Self::ListAppendStruct,
             0x90 => Self::NestedSetInsert,
