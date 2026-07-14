@@ -158,17 +158,21 @@ fn prepare_root(root: &Path) -> Result<(), AuditError> {
     if !root.is_absolute() {
         return Err(AuditError("telemetry root must be absolute".to_owned()));
     }
-    if let Ok(metadata) = fs::symlink_metadata(root)
-        && metadata.file_type().is_symlink()
-    {
-        return Err(AuditError("telemetry root cannot be a symlink".to_owned()));
+    let metadata =
+        fs::symlink_metadata(root).map_err(io_error("opening existing telemetry root"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(AuditError(
+            "telemetry root must be an existing real directory".to_owned(),
+        ));
     }
-    fs::create_dir_all(root).map_err(io_error("creating telemetry root"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(root, fs::Permissions::from_mode(0o700))
-            .map_err(io_error("securing telemetry root"))?;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(AuditError(
+                "telemetry root must deny group and other access".to_owned(),
+            ));
+        }
     }
     Ok(())
 }

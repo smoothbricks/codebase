@@ -996,6 +996,13 @@ async fn unix_socket_churn_unlinks_every_session() {
 async fn arrow_audit_sink_publishes_durable_single_batch_segments() {
     let root = std::env::temp_dir().join(format!("cowshed-gateway-audit-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir(&root).expect("provision audit root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("secure audit root");
+    }
     let sink =
         ArrowAuditSink::start(ArrowAuditConfig::new(root.clone()).expect("audit configuration"))
             .expect("start Arrow sink");
