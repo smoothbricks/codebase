@@ -2845,16 +2845,19 @@ async fn h2_session_cancellation_closes_stream_and_is_audited() {
         matches!(terminal, None | Some(Err(_))),
         "cancelled h2 body produced more data"
     );
-    let mut saw_cancelled_connect = false;
-    while let Ok(Some(event)) = timeout(Duration::from_millis(200), audit_rx.recv()).await {
-        if event.kind == AuditKind::Connect
-            && event.status == AuditStatus::Cancelled
-            && event.classification.as_deref() == Some("session-rotated")
-        {
-            saw_cancelled_connect = true;
-            break;
+    let saw_cancelled_connect = timeout(Duration::from_secs(2), async {
+        while let Some(event) = audit_rx.recv().await {
+            if event.kind == AuditKind::Connect
+                && event.status == AuditStatus::Cancelled
+                && event.classification.as_deref() == Some("session-rotated")
+            {
+                return true;
+            }
         }
-    }
+        false
+    })
+    .await
+    .unwrap_or(false);
     assert!(saw_cancelled_connect, "missing cancelled h2 CONNECT audit");
     gate.notify_waiters();
     drop(sender);
