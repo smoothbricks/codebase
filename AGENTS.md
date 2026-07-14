@@ -176,7 +176,7 @@ tsconfigPath: "/path/to/packages/lmao/tsconfig.json"      ❌ (files not found)
 ### Nx Target Inference And New Package Checklist
 
 **`@smoothbricks/nx-plugin` owns transformer-aware TypeScript targets.** It infers `tsc-js` from `tsconfig.lib.json`,
-`typecheck-tests` from `tsconfig.test.json`, `zig-*` targets from `build.zig` steps, and aggregate `build` / `lint`
+`typecheck-tests` from `tsconfig.test.json`, Cargo workspace targets from `Cargo.toml`, and aggregate `build` / `lint`
 targets. Do not configure `@nx/js/typescript`: its native inference runs `tsc`/`tsgo` directly and cannot load the
 repository's Typia and LMAO transformers. Do not add package-local stubs for inferred targets unless there is a concrete
 package-specific override.
@@ -186,7 +186,9 @@ Concrete target sources:
 - `tsc-js`: `@smoothbricks/nx-plugin`, from `tsconfig.lib.json`; runs `ttsc` so configured transformers execute.
 - `typecheck-tests`: `@smoothbricks/nx-plugin`, from `tsconfig.test.json`; required for packages that use `bun test`
   because Bun executes tests without typechecking.
-- `zig-*`: `@smoothbricks/nx-plugin`, from named `b.step("...")` entries in `build.zig`.
+- `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`: `@smoothbricks/nx-plugin`, from a workspace-root
+  `Cargo.toml`.
+- `cargo-wasm`: `@smoothbricks/nx-plugin`, when a Cargo workspace contains `cdylib` member crates.
 - `build`: aggregate inferred only when at least one concrete build target exists.
 - `lint`: aggregate validation target, never a formatter.
 
@@ -200,12 +202,12 @@ binding. Do not install TypeScript 7 under the unscoped `typescript` name: its r
 `readConfigFile`. Keep every workspace `typescript` declaration aligned so Bun's isolated dependency hoisting cannot
 shadow the API package.
 
-**Target names are `{tool}-{output}` names.** Use names like `tsc-js`, `tsdown-js`, and `zig-wasm`. `build` and `lint`
+**Target names are `{tool}-{output}` names.** Use names like `tsc-js`, `tsdown-js`, and `cargo-wasm`. `build` and `lint`
 are aggregates that depend on output-family wildcards such as `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`,
 `*-native`, `*-napi`, `*-bun`, and `*-wasm`. Do not create colon-style Nx target names such as `build:wasm` or
 `lint:fix`: Nx CLI syntax already uses `project:target:configuration`, so colon target names are ambiguous with
 configurations and make package-script aliases harder to reason about. Package scripts may still be named `build:wasm`
-if they delegate to a real target such as `nx run pkg:zig-wasm`.
+if they delegate to a real target such as `nx run pkg:cargo-wasm`.
 
 **Commits must be atomic conventional commits.** Release changelogs are generated from commit history, so split
 unrelated features, fixes, docs, and chores into separate commits with accurate conventional prefixes and scopes. Do not
@@ -215,9 +217,6 @@ bundle two independent features into one commit just because they were implement
 tests without typechecking. That config gets `typecheck-tests`; the test tsconfig must use `noEmit` and must not write
 `dist-test`. It must not be `composite`, and package root `tsconfig.json` must not reference `./tsconfig.test.json`; Nx
 runs it through the inferred `typecheck-tests` target after `build`.
-
-**Zig targets come from `build.zig`.** A package `build.zig` must declare at least one `b.step(...)`; each step becomes
-a `zig-*` tool-output target.
 
 If the package is published to npm, add `"npm:public"` to `package.json` `"nx".tags`. If the package is private or
 internal-only, do not add that tag. `smoo` and release workflows use `npm:public` as the source of truth.

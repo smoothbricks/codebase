@@ -42,12 +42,6 @@ export const variants: Record<string, GenerateVariant> = {
     args: (name) => ['--name', name, '--variant', 'ts-lib'],
     options: [{ flag: '--public', description: 'configure for npm publication' }],
   },
-  'ts-zig': {
-    generator: 'create-package',
-    description: 'Create a TypeScript + Zig/WASM hybrid package',
-    args: (name) => ['--name', name, '--variant', 'ts-zig'],
-    options: [{ flag: '--public', description: 'configure for npm publication' }],
-  },
   'make-public': {
     generator: 'make-public',
     description: 'Promote a private package to npm publication',

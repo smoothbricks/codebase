@@ -11,7 +11,7 @@
     "variant": {
       "type": "string",
       "description": "Package variant to scaffold.",
-      "enum": ["ts-lib", "ts-zig"],
+      "enum": ["ts-lib"],
       "default": "ts-lib"
     },
     "public": {

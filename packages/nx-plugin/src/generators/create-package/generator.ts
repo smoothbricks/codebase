@@ -1,4 +1,4 @@
-// Scaffold a new workspace package. Invoked by `smoo g ts-lib|ts-zig <name>`.
+// Scaffold a new TypeScript workspace package. Invoked by `smoo g ts-lib <name>`.
 // CLI wiring: packages/cli/src/generate/index.ts (variant registry)
 import { readJson, type Tree, writeJson } from 'nx/src/devkit-exports.js';
 
@@ -15,10 +15,6 @@ export default async function generator(tree: Tree, schema: CreatePackageGenerat
   }
 
   writeCommonFiles(tree, schema, packageName, projectRoot, rootPkg);
-
-  if (schema.variant === 'ts-zig') {
-    writeZigFiles(tree, schema, projectRoot);
-  }
 }
 
 function extractScope(name: string | undefined): string | null {
@@ -158,122 +154,6 @@ function buildPackageJson(
 
   return packageJson;
 }
-
-function writeZigFiles(tree: Tree, schema: CreatePackageGeneratorSchema, projectRoot: string): void {
-  // Modify package.json for ts-zig variant
-  const packageJson = readJson<Record<string, unknown>>(tree, `${projectRoot}/package.json`);
-
-  // Add wasm export and remove development condition
-  const exports = packageJson.exports;
-  if (!isRecord(exports)) {
-    // invariant throw: writeCommonFiles always emits an object-valued exports map.
-    throw new Error('generated package.json exports must be an object');
-  }
-  exports['./wasm'] = `./dist/${schema.name}.wasm`;
-  const dotExport = exports['.'];
-  if (!isRecord(dotExport)) {
-    // invariant throw: writeCommonFiles always emits an object-valued "." export.
-    throw new Error('generated package.json "." export must be an object');
-  }
-  delete dotExport.development;
-
-  // Add build scripts
-  const scripts = packageJson.scripts;
-  if (!isRecord(scripts)) {
-    // invariant throw: writeCommonFiles always emits an object-valued scripts map.
-    throw new Error('generated package.json scripts must be an object');
-  }
-  scripts['build:zig'] = `nx run ${schema.name}:zig-wasm`;
-  scripts['build:ts'] = `nx run ${schema.name}:tsc-js`;
-  scripts.build = 'bun run build:ts && bun run build:zig';
-
-  // Change files for zig packages (no src published)
-  packageJson.files = ['dist'];
-
-  writeJson(tree, `${projectRoot}/package.json`, packageJson);
-
-  // Modify tsconfig.lib.json for ts-zig
-  const tsconfigLib = readJson<Record<string, unknown>>(tree, `${projectRoot}/tsconfig.lib.json`);
-  const libCompilerOptions = tsconfigLib.compilerOptions;
-  if (!isRecord(libCompilerOptions)) {
-    // invariant throw: writeCommonFiles always emits compilerOptions for library builds.
-    throw new Error('generated tsconfig.lib.json compilerOptions must be an object');
-  }
-  libCompilerOptions.lib = ['es2022', 'webworker'];
-  libCompilerOptions.declaration = true;
-  libCompilerOptions.sourceMap = true;
-  libCompilerOptions.skipLibCheck = true;
-  writeJson(tree, `${projectRoot}/tsconfig.lib.json`, tsconfigLib);
-
-  // Modify tsconfig.test.json for ts-zig
-  const tsconfigTest = readJson<Record<string, unknown>>(tree, `${projectRoot}/tsconfig.test.json`);
-  const testCompilerOptions = tsconfigTest.compilerOptions;
-  if (!isRecord(testCompilerOptions)) {
-    // invariant throw: writeCommonFiles always emits compilerOptions for test builds.
-    throw new Error('generated tsconfig.test.json compilerOptions must be an object');
-  }
-  testCompilerOptions.lib = ['es2022', 'webworker'];
-  writeJson(tree, `${projectRoot}/tsconfig.test.json`, tsconfigTest);
-
-  // Write build.zig
-  tree.write(
-    `${projectRoot}/build.zig`,
-    `const std = @import("std");
-
-pub fn build(b: *std.Build) void {
-    const optimize = b.standardOptimizeOption(.{});
-
-    const wasm_step = b.step("wasm", "Build WASM artifact");
-
-    const wasm_target = b.resolveTargetQuery(.{
-        .cpu_arch = .wasm32,
-        .os_tag = .freestanding,
-    });
-
-    const lib = b.addExecutable(.{
-        .name = "${schema.name}",
-        .root_source_file = b.path("src/${schema.name}.zig"),
-        .target = wasm_target,
-        .optimize = optimize,
-    });
-    lib.entry = .disabled;
-    lib.rdynamic = true;
-
-    const install = b.addInstallArtifact(lib, .{
-        .dest_dir = .{ .override = .{ .custom = "../dist" } },
-    });
-    wasm_step.dependOn(&install.step);
-}
-`,
-  );
-
-  // Write build.zig.zon
-  tree.write(
-    `${projectRoot}/build.zig.zon`,
-    `.{
-    .name = .${schema.name},
-    .version = "0.0.0",
-    .minimum_zig_version = "0.14.0",
-    .dependencies = .{},
-    .paths = .{
-        "build.zig",
-        "build.zig.zon",
-        "src",
-    },
-}
-`,
-  );
-
-  // Write src/<name>.zig
-  tree.write(
-    `${projectRoot}/src/${schema.name}.zig`,
-    `export fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
-`,
-  );
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }

@@ -18,9 +18,6 @@ dist-node
 dist-ts-plugin
 tmp
 out-tsc
-.zig-cache
-zig-out/
-**/zig-pkg/
 
 # dependencies
 node_modules

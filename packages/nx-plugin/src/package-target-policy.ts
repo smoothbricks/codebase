@@ -354,7 +354,6 @@ function isSafeNxScriptCommand(command: string): boolean {
     /^tsdown(?:\s|$)/.test(trimmed) ||
     /^vite\s+(?:build|dev|preview)(?:\s|$)/.test(trimmed) ||
     /^astro\s+(?:build|dev|preview|check)(?:\s|$)/.test(trimmed) ||
-    /^zig\s+build(?:\s|$)/.test(trimmed) ||
     /^bun\s+[./\w-]*build[\w.-]*\.ts(?:\s|$)/.test(trimmed) ||
     /(?:^|\s)(?:bench|benchmark)(?:\s|$)/.test(trimmed) ||
     /^wrangler\s+build(?:\s|$)/.test(trimmed)
@@ -417,10 +416,6 @@ function targetNameForCommand(command: string): string | null {
   }
   if (/^tsdown(?:\s|$)/.test(trimmed)) {
     return 'tsdown-js';
-  }
-  const zigStep = /^zig\s+build\s+([A-Za-z0-9_-]+)(?:\s|$)/.exec(trimmed)?.[1];
-  if (zigStep) {
-    return `zig-${zigStep}`;
   }
   if (/^wrangler\s+build(?:\s|$)/.test(trimmed)) {
     return 'build';
@@ -582,19 +577,6 @@ function directoryContainsTestFiles(path: string): boolean {
     }
   }
   return false;
-}
-
-function validateBuildZigPolicy(root: string, packagePath: string): NxPolicyIssue[] {
-  const path = join(root, packagePath, 'build.zig');
-  if (!existsSync(path)) {
-    return [];
-  }
-  if (/\bb\.step\s*\(/.test(readFileSync(path, 'utf8'))) {
-    return [];
-  }
-  return [
-    { path: join(root, packagePath), message: `${packagePath}/build.zig must define at least one b.step(...) target` },
-  ];
 }
 
 function validateExplicitNxTargets(
@@ -952,18 +934,6 @@ function directoryContainsTestFilesTree(tree: Tree, path: string): boolean {
   return false;
 }
 
-function validateBuildZigPolicyTree(tree: Tree, packagePath: string): NxPolicyIssue[] {
-  const path = `${packagePath}/build.zig`;
-  if (!tree.exists(path)) {
-    return [];
-  }
-  const content = tree.read(path, 'utf-8');
-  if (content && /\bb\.step\s*\(/.test(content)) {
-    return [];
-  }
-  return [{ path: packagePath, message: `${packagePath}/build.zig must define at least one b.step(...) target` }];
-}
-
 function validateTestEntrypointPresenceTree(
   tree: Tree,
   packagePath: string,
@@ -998,7 +968,6 @@ export function checkPackageTargetPolicyTree(tree: Tree, options: PackageTargetP
 
     issues.push(...validateExplicitNxTargets(pkg, packagePath, resolvedProject));
     issues.push(...validateTestEntrypointPresenceTree(tree, packagePath, pkg));
-    issues.push(...validateBuildZigPolicyTree(tree, packagePath));
     issues.push(...validatePackageScriptPolicy(pkg, packagePath, workspaceNames, { resolvedTargets }));
   }
 
@@ -1222,7 +1191,6 @@ export function checkPackageTargetPolicy(root: string, options: PackageTargetPol
 
     issues.push(...validateExplicitNxTargets(pkg, packagePath, resolvedProject));
     issues.push(...validateTestEntrypointPresence(root, packagePath, pkg));
-    issues.push(...validateBuildZigPolicy(root, packagePath));
     issues.push(...validatePackageScriptPolicy(pkg, packagePath, workspaceNames, { resolvedTargets: resolvedProject }));
   }
 

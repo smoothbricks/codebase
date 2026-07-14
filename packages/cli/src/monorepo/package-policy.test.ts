@@ -262,7 +262,7 @@ describe('workspace package script policy', () => {
     try {
       expect(validateWorkspaceDependencies(root)).toBe(2);
 
-      const resolvedTargetsByProject = new Map([['native', new Set(['build', 'tsc-js', 'zig-wasm'])]]);
+      const resolvedTargetsByProject = new Map([['native', new Set(['build', 'tsc-js', 'tsdown-js'])]]);
       applyWorkspaceDependencyDefaults(root, { resolvedTargetsByProject });
 
       const native = await readJson(join(root, 'packages/native/package.json'));
@@ -284,17 +284,17 @@ describe('workspace package script policy', () => {
           dependencies: { '@smoothbricks/lib': 'workspace:*' },
           scripts: {
             'build:custom': 'nx run native:build:custom',
-            'build:zig': 'nx run native:build:zig',
+            'build:bundle': 'nx run native:build:bundle',
             'build:ts': 'nx run native:build:ts',
           },
           nx: {
             name: 'native',
             targets: {
-              build: { dependsOn: ['^build', 'build:ts', 'build:zig', 'build:custom'] },
+              build: { dependsOn: ['^build', 'build:ts', 'build:bundle', 'build:custom'] },
               'build:custom': {},
-              'build:zig': {
+              'build:bundle': {
                 executor: 'nx:run-commands',
-                options: { command: 'zig build wasm', cwd: '{projectRoot}' },
+                options: { command: 'tsdown', cwd: '{projectRoot}' },
               },
               'build:ts': {
                 executor: 'nx:run-commands',
@@ -307,25 +307,21 @@ describe('workspace package script policy', () => {
     });
     try {
       await writeJson(join(root, 'packages/native/tsconfig.lib.json'), {});
-      await writeFile(
-        join(root, 'packages/native/build.zig'),
-        'pub fn build(b: *std.Build) void { _ = b.step("wasm", "Build wasm"); }\n',
-      );
       expect(validateWorkspaceDependencies(root)).toBe(6);
 
-      const resolvedTargetsByProject = new Map([['native', new Set(['build', 'custom', 'tsc-js', 'zig-wasm'])]]);
+      const resolvedTargetsByProject = new Map([['native', new Set(['build', 'custom', 'tsc-js', 'tsdown-js'])]]);
       applyWorkspaceDependencyDefaults(root, { resolvedTargetsByProject });
 
       const native = await readJson(join(root, 'packages/native/package.json'));
       expect(native.scripts).toEqual({
         'build:custom': 'nx run native:custom',
-        'build:zig': 'nx run native:zig-wasm',
+        'build:bundle': 'nx run native:tsdown-js',
         'build:ts': 'nx run native:tsc-js',
       });
       expect(native.nx).toEqual({
         name: 'native',
         targets: {
-          build: { dependsOn: ['^build', 'tsc-js', 'zig-wasm', 'custom'] },
+          build: { dependsOn: ['^build', 'tsc-js', 'tsdown-js', 'custom'] },
         },
       });
       expect(validateWorkspaceDependencies(root, { resolvedTargetsByProject })).toBe(0);
@@ -344,7 +340,7 @@ describe('workspace package script policy', () => {
           nx: {
             name: 'native',
             targets: {
-              build: { executor: 'nx:noop', dependsOn: ['^build', 'tsc-js', 'zig-wasm', 'custom'] },
+              build: { executor: 'nx:noop', dependsOn: ['^build', 'tsc-js', 'tsdown-js', 'custom'] },
             },
           },
         },
@@ -352,14 +348,10 @@ describe('workspace package script policy', () => {
     });
     try {
       await writeJson(join(root, 'packages/native/tsconfig.lib.json'), {});
-      await writeFile(
-        join(root, 'packages/native/build.zig'),
-        'pub fn build(b: *std.Build) void { _ = b.step("wasm", "Build wasm"); }\n',
-      );
       const resolvedTargetsByProject = new Map([
         [
           'native',
-          { targets: new Set(['build', 'tsc-js', 'zig-wasm']), buildDependsOn: ['^build', 'tsc-js', 'zig-wasm'] },
+          { targets: new Set(['build', 'tsc-js', 'tsdown-js']), buildDependsOn: ['^build', 'tsc-js', 'tsdown-js'] },
         ],
       ]);
 
@@ -369,7 +361,7 @@ describe('workspace package script policy', () => {
       expect(native.nx).toEqual({
         name: 'native',
         targets: {
-          build: { executor: 'nx:noop', dependsOn: ['^build', 'tsc-js', 'zig-wasm', 'custom'] },
+          build: { executor: 'nx:noop', dependsOn: ['^build', 'tsc-js', 'tsdown-js', 'custom'] },
         },
       });
     } finally {
@@ -389,8 +381,8 @@ describe('workspace package script policy', () => {
             targets: {
               build: {
                 executor: 'nx:run-commands',
-                options: { command: 'zig build wasm', cwd: '{projectRoot}' },
-                dependsOn: ['^build', 'zig-wasm'],
+                options: { command: 'tsdown', cwd: '{projectRoot}' },
+                dependsOn: ['^build', 'tsdown-js'],
               },
             },
           },
@@ -398,12 +390,8 @@ describe('workspace package script policy', () => {
       ],
     });
     try {
-      await writeFile(
-        join(root, 'packages/native/build.zig'),
-        'pub fn build(b: *std.Build) void { _ = b.step("wasm", "Build wasm"); }\n',
-      );
       const resolvedTargetsByProject = new Map([
-        ['native', { targets: new Set(['build', 'zig-wasm']), buildDependsOn: ['^build', 'zig-wasm'] }],
+        ['native', { targets: new Set(['build', 'tsdown-js']), buildDependsOn: ['^build', 'tsdown-js'] }],
       ]);
 
       applyWorkspaceDependencyDefaults(root, { resolvedTargetsByProject });
@@ -414,8 +402,8 @@ describe('workspace package script policy', () => {
         targets: {
           build: {
             executor: 'nx:run-commands',
-            options: { command: 'zig build wasm', cwd: '{projectRoot}' },
-            dependsOn: ['^build', 'zig-wasm'],
+            options: { command: 'tsdown', cwd: '{projectRoot}' },
+            dependsOn: ['^build', 'tsdown-js'],
           },
         },
       });
@@ -434,7 +422,7 @@ describe('workspace package script policy', () => {
           nx: {
             name: 'native',
             targets: {
-              build: { executor: 'nx:noop', dependsOn: ['^build', 'tsc-js', 'zig-wasm'] },
+              build: { executor: 'nx:noop', dependsOn: ['^build', 'tsc-js', 'tsdown-js'] },
             },
           },
         },
@@ -444,7 +432,7 @@ describe('workspace package script policy', () => {
       const resolvedTargetsByProject = new Map([
         [
           'native',
-          { targets: new Set(['build', 'tsc-js', 'zig-wasm']), buildDependsOn: ['^build', 'tsc-js', 'zig-wasm'] },
+          { targets: new Set(['build', 'tsc-js', 'tsdown-js']), buildDependsOn: ['^build', 'tsc-js', 'tsdown-js'] },
         ],
       ]);
 
@@ -498,7 +486,7 @@ describe('workspace package script policy', () => {
     });
     try {
       const resolvedTargetsByProject = new Map([
-        ['native', { targets: new Set(['build', 'tsc-js', 'zig-wasm']), buildDependsOn: buildOutputDependencies }],
+        ['native', { targets: new Set(['build', 'tsc-js', 'tsdown-js']), buildDependsOn: buildOutputDependencies }],
       ]);
 
       applyWorkspaceDependencyDefaults(root, { resolvedTargetsByProject });
@@ -553,20 +541,6 @@ describe('workspace package script policy', () => {
           },
         },
       });
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('rejects build.zig without steps', async () => {
-    const root = await createWorkspace({
-      rootName: '@smoothbricks/codebase',
-      packages: [{ dir: 'native', name: '@smoothbricks/native', nx: { name: 'native' } }],
-    });
-    try {
-      await writeFile(join(root, 'packages/native/build.zig'), 'pub fn build(b: *std.Build) void { _ = b; }\n');
-
-      expect(validateWorkspaceDependencies(root)).toBe(1);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -728,17 +702,13 @@ describe('workspace package script policy', () => {
     }
   });
 
-  it('accepts noEmit test tsconfig and build.zig with an explicit step', async () => {
+  it('accepts a noEmit test tsconfig', async () => {
     const root = await createWorkspace({
       rootName: '@smoothbricks/codebase',
       packages: [{ dir: 'native', name: '@smoothbricks/native', nx: { name: 'native', targets: { lint: {} } } }],
     });
     try {
       await writeJson(join(root, 'packages/native/tsconfig.test.json'), { compilerOptions: { noEmit: true } });
-      await writeFile(
-        join(root, 'packages/native/build.zig'),
-        'pub fn build(b: *std.Build) void { _ = b.step("build", "Build native artifact"); }\n',
-      );
 
       expect(validateWorkspaceDependencies(root)).toBe(0);
     } finally {

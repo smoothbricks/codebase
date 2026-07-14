@@ -427,30 +427,6 @@ describe('package target policy', () => {
     }
   });
 
-  it('validates build.zig has steps', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'smoothbricks-pkg-target-'));
-    try {
-      await writeJson(join(root, 'package.json'), {
-        name: '@scope/root',
-        private: true,
-        workspaces: ['packages/*'],
-      });
-      const pkgDir = join(root, 'packages/wasm');
-      await mkdir(pkgDir, { recursive: true });
-      await writeJson(join(pkgDir, 'package.json'), {
-        name: '@scope/wasm',
-        nx: { name: 'wasm' },
-      });
-      // build.zig without b.step(...)
-      await writeFile(join(pkgDir, 'build.zig'), 'const std = @import("std");\n');
-
-      const issues = checkPackageTargetPolicy(root);
-      expect(issues.some((i) => i.message.includes('build.zig must define at least one b.step'))).toBe(true);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
   it('requires test entrypoint when test files exist', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoothbricks-pkg-target-'));
     try {
@@ -637,30 +613,6 @@ describe('checkPackageTargetPolicyTree', () => {
     expect(issues.length).toBeGreaterThanOrEqual(2);
     expect(issues.some((i) => i.message.includes('build:ts') && i.message.includes('colon target names'))).toBe(true);
     expect(issues.some((i) => i.message.includes('lint:fix') && i.message.includes('colon target names'))).toBe(true);
-  });
-
-  it('validates build.zig has steps', () => {
-    addProject(tree, 'wasm', 'packages/wasm');
-    writeJsonFile(tree, 'packages/wasm/package.json', {
-      name: '@scope/wasm',
-      nx: { name: 'wasm' },
-    });
-    tree.write('packages/wasm/build.zig', 'const std = @import("std");\n');
-
-    const issues = checkPackageTargetPolicyTree(tree);
-    expect(issues.some((i) => i.message.includes('build.zig must define at least one b.step'))).toBe(true);
-  });
-
-  it('passes build.zig with valid steps', () => {
-    addProject(tree, 'wasm', 'packages/wasm');
-    writeJsonFile(tree, 'packages/wasm/package.json', {
-      name: '@scope/wasm',
-      nx: { name: 'wasm' },
-    });
-    tree.write('packages/wasm/build.zig', 'const step = b.step("wasm", "Build wasm");\n');
-
-    const issues = checkPackageTargetPolicyTree(tree);
-    expect(issues.filter((i) => i.message.includes('build.zig'))).toEqual([]);
   });
 
   it('requires test entrypoint when test files exist', () => {
