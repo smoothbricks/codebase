@@ -1,10 +1,8 @@
-#[path = "../src/output.rs"]
-mod output;
+use cowshed_cli::output::{Output, write_error_envelope, write_success_envelope};
 
 use cowshed_core::api::{EmptyResult, MountResult};
 use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::{CowshedError, ErrorCode};
-use output::{Output, write_error_envelope, write_success_envelope};
 use serde_json::json;
 use std::path::PathBuf;
 use std::process::Command;
@@ -72,17 +70,17 @@ fn bare_streams_and_records_preserve_machine_bytes() {
 }
 
 #[test]
-fn binary_entrypoint_compiles_parser_and_returns_typed_phase_error() {
+fn binary_entrypoint_returns_typed_json_usage_error() {
     let output = Command::new(env!("CARGO_BIN_EXE_cowshed"))
-        .args(["--json", "exec", "raven", "--", "true"])
+        .args(["--json", "exec", "raven", "--unknown"])
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(output.status.code(), Some(2));
     assert!(output.stderr.is_empty());
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["ok"], false);
-    assert_eq!(envelope["error"]["code"], "environment-missing");
+    assert_eq!(envelope["error"]["code"], "usage");
 }
 
 #[test]
@@ -101,15 +99,23 @@ fn binary_entrypoint_returns_usage_and_command_map() {
 #[test]
 fn child_argv_cannot_enable_cli_json_mode() {
     let output = Command::new(env!("CARGO_BIN_EXE_cowshed"))
-        .args(["exec", "raven", "--", "--json"])
+        .args([
+            "exec",
+            "raven",
+            "--stdin",
+            "--stdin-file",
+            "input",
+            "--",
+            "--json",
+        ])
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("command dispatch is not available")
+            .contains("conflict")
     );
 }

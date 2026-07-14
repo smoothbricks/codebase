@@ -68,17 +68,22 @@ impl<W: Write, E: Write> Output<W, E> {
         writeln!(self.stderr, "cowshed: {message}")
     }
 
-    /// Emits an actionable next command on stderr unless quiet mode suppresses it.
+    /// Emits an actionable next command on stderr. Quiet mode never suppresses hints.
     pub fn hint(&mut self, command: &str) -> io::Result<()> {
-        if self.quiet {
-            return Ok(());
-        }
         writeln!(self.stderr, "next: {command}")
     }
 
     /// Emits an error on stderr. Errors are never suppressed by quiet mode.
     pub fn error(&mut self, message: &str) -> io::Result<()> {
         writeln!(self.stderr, "cowshed: {message}")
+    }
+
+    pub fn writers_mut(&mut self) -> (&mut (dyn Write + Send), &mut (dyn Write + Send))
+    where
+        W: Send,
+        E: Send,
+    {
+        (&mut self.stdout, &mut self.stderr)
     }
 
     pub fn into_inner(self) -> (W, E) {
@@ -109,14 +114,14 @@ mod tests {
     }
 
     #[test]
-    fn quiet_suppresses_guidance_but_not_errors() {
+    fn quiet_suppresses_guidance_but_not_hints_or_errors() {
         let mut output = Output::new(Vec::new(), Vec::new(), true);
         output.guidance("hidden").unwrap();
-        output.hint("hidden").unwrap();
-        output.error("still visible").unwrap();
+        output.hint("still visible").unwrap();
+        output.error("also visible").unwrap();
         let (stdout, stderr) = output.into_inner();
         assert!(stdout.is_empty());
-        assert_eq!(stderr, b"cowshed: still visible\n");
+        assert_eq!(stderr, b"next: still visible\ncowshed: also visible\n");
     }
 
     #[test]
