@@ -25,6 +25,10 @@ struct FakeService {
     presentation: Option<ExecPresentation>,
     child_exit: ExitStatus,
     fail_list: Option<CowshedError>,
+    fail_push: Option<CowshedError>,
+    push_options: Option<PushOptions>,
+    rebase_options: Option<RebaseOptions>,
+    land_options: Option<LandOptions>,
     shutdowns: Option<Arc<AtomicUsize>>,
     shutdown_error: Option<CowshedError>,
 }
@@ -38,6 +42,10 @@ impl Default for FakeService {
             presentation: None,
             child_exit: ExitStatus::Exited { code: 0 },
             fail_list: None,
+            fail_push: None,
+            push_options: None,
+            rebase_options: None,
+            land_options: None,
             shutdowns: None,
             shutdown_error: None,
         }
@@ -54,6 +62,35 @@ impl CliService for FakeService {
     async fn create(&mut self, name: &str, options: CreateOptions) -> Result<WorkspaceInfo> {
         self.events.push(format!("new:{name}:{}", options.browse));
         Ok(workspace(name, WorkspaceState::Attached))
+    }
+
+    async fn fork(&mut self, source: &str, destination: &str) -> Result<WorkspaceInfo> {
+        self.events.push(format!("fork:{source}:{destination}"));
+        Ok(workspace(destination, WorkspaceState::Attached))
+    }
+
+    async fn checkpoint(&mut self, name: &str, options: CheckpointOptions) -> Result<String> {
+        self.events.push(format!(
+            "checkpoint:{name}:{:?}:{}",
+            options.label, options.keep
+        ));
+        Ok(options
+            .label
+            .unwrap_or_else(|| "2026-07-14T00-00-00Z".into()))
+    }
+
+    async fn restore(&mut self, name: &str, label: &str) -> Result<WorkspaceInfo> {
+        self.events.push(format!("restore:{name}:{label}"));
+        Ok(workspace(name, WorkspaceState::Attached))
+    }
+
+    async fn ensure_current(&mut self, path: PathBuf) -> Result<EnsureReport> {
+        self.events.push(format!("ensure:{}", path.display()));
+        Ok(EnsureReport {
+            workspace: WorkspaceName::new("raven").unwrap(),
+            mount: PathBuf::from("/mnt/raven"),
+            action: EnsureAction::AlreadyMounted,
+        })
     }
 
     async fn list(&mut self) -> Result<Vec<WorkspaceInfo>> {
@@ -73,7 +110,8 @@ impl CliService for FakeService {
     }
 
     async fn remove(&mut self, name: &str, options: RemoveOptions) -> Result<()> {
-        self.events.push(format!("rm:{name}:{}", options.force));
+        self.events
+            .push(format!("rm:{name}:{}:{}", options.force, options.restore));
         Ok(())
     }
 
@@ -96,6 +134,50 @@ impl CliService for FakeService {
         })
     }
 
+    async fn gc(&mut self, options: GcOptions) -> Result<GcReport> {
+        self.events.push(format!("gc:{}", options.dry_run));
+        Ok(GcReport {
+            examined: 9,
+            reclaimed: u64::from(!options.dry_run) * 3,
+            retained_pinned: 2,
+            freed_bytes: u64::from(!options.dry_run) * 4096,
+            dry_run: options.dry_run,
+        })
+    }
+
+    async fn push(&mut self, name: &str, options: PushOptions) -> Result<PushReport> {
+        self.push_options = Some(options.clone());
+        self.events.push(format!("push:{name}:{options:?}"));
+        if let Some(error) = self.fail_push.take() {
+            return Err(error);
+        }
+        Ok(PushReport {
+            source_head: GitOid::new("2".repeat(40)).unwrap(),
+            destination_ref: format!(
+                "refs/cowshed/{name}/heads/{}",
+                options.branch.as_deref().unwrap_or(name)
+            ),
+            previous_destination_head: None,
+        })
+    }
+
+    async fn rebase(&mut self, name: &str, options: RebaseOptions) -> Result<GitOid> {
+        self.rebase_options = Some(options.clone());
+        self.events.push(format!("rebase:{name}:{options:?}"));
+        Ok(GitOid::new("3".repeat(40)).unwrap())
+    }
+
+    async fn land(&mut self, name: &str, options: LandOptions) -> Result<LandReport> {
+        self.land_options = Some(options.clone());
+        self.events.push(format!("land:{name}:{options:?}"));
+        Ok(LandReport {
+            landed_head: GitOid::new("4".repeat(40)).unwrap(),
+            target_branch: options.target_branch.unwrap_or_else(|| "main".into()),
+            previous_target_head: Some(GitOid::new("1".repeat(40)).unwrap()),
+            target_was_checked_out: true,
+            retired: options.retire,
+        })
+    }
     async fn exec(
         &mut self,
         command: ExecCommand,
@@ -278,12 +360,220 @@ async fn all_nine_parser_commands_dispatch_and_obey_machine_output_contracts() {
             "ls",
             "path:raven:false",
             "exec:raven",
-            "rm:raven:true",
+            "rm:raven:true:false",
             "attach:raven:true",
             "detach:raven",
             "doctor",
         ]
     );
+}
+
+#[tokio::test]
+async fn lifecycle_commands_delegate_exact_options_and_keep_stdout_machine_only() {
+    let mut service = FakeService::default();
+    let incarnation = "0198f2c0b7e34dc795f17b238b331c80";
+    let source = "1111111111111111111111111111111111111111";
+    let destination = "2222222222222222222222222222222222222222";
+
+    let (_, stdout, stderr) = run(&mut service, ["fork", "raven", "falcon"]).await;
+    assert_eq!(stdout, b"/mnt/falcon\n");
+    assert_eq!(stderr, b"next: cowshed exec falcon -- <cmd>\n");
+
+    let (_, stdout, stderr) = run(
+        &mut service,
+        ["checkpoint", "raven", "pre-land", "--keep", "--json"],
+    )
+    .await;
+    assert_eq!(
+        stdout,
+        b"{\"ok\":true,\"result\":{\"label\":\"pre-land\"}}\n"
+    );
+    assert!(stderr.is_empty());
+
+    let (_, stdout, stderr) = run(&mut service, ["restore", "raven", "pre-land", "--json"]).await;
+    assert_eq!(
+        stdout,
+        format!(
+            "{{\"ok\":true,\"result\":{{\"workspace\":\"raven\",\"mount\":\"/mnt/raven\",\"baseCommit\":\"{}\"}}}}\n",
+            "1".repeat(40)
+        )
+        .as_bytes()
+    );
+    assert_eq!(stderr, b"next: cowshed exec raven -- git status\n");
+
+    let (_, stdout, stderr) = run(&mut service, ["ensure", "--envrc"]).await;
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+
+    let (_, stdout, stderr) = run(&mut service, ["gc", "--dry-run"]).await;
+    assert_eq!(stdout, b"0\n");
+    assert_eq!(
+        stderr,
+        b"cowshed: dry run examined 9 objects and would reclaim 0\n"
+    );
+
+    let (_, stdout, stderr) = run(
+        &mut service,
+        [
+            "push",
+            "raven",
+            "--branch",
+            "release",
+            "--expected-workspace-incarnation",
+            incarnation,
+            "--expected-source-head",
+            source,
+            "--expected-destination-head",
+            destination,
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(
+        stdout,
+        format!(
+            "{{\"ok\":true,\"result\":{{\"sourceHead\":\"{}\",\"destinationRef\":\"refs/cowshed/raven/heads/release\"}}}}\n",
+            "2".repeat(40)
+        )
+        .as_bytes()
+    );
+    assert!(stderr.is_empty());
+    assert_eq!(
+        service.push_options,
+        Some(PushOptions {
+            branch: Some("release".into()),
+            expected_workspace_incarnation: Some(WorkspaceIncarnation::new(incarnation).unwrap()),
+            expected_source_head: Some(GitOid::new(source).unwrap()),
+            expected_destination_head: Some(ExpectedRefHead::Oid(
+                GitOid::new(destination).unwrap()
+            )),
+        })
+    );
+
+    let (_, stdout, stderr) = run(
+        &mut service,
+        [
+            "rebase",
+            "raven",
+            "--onto",
+            "refs/heads/release",
+            "--fresh",
+            "--expected-workspace-incarnation",
+            incarnation,
+            "--expected-source-head",
+            source,
+            "--expected-onto-head",
+            destination,
+        ],
+    )
+    .await;
+    assert_eq!(stdout, format!("{}\n", "3".repeat(40)).as_bytes());
+    assert!(stderr.is_empty());
+    assert_eq!(
+        service.rebase_options,
+        Some(RebaseOptions {
+            onto: Some(RevisionTarget::Ref(
+                GitRef::new("refs/heads/release").unwrap()
+            )),
+            fresh: true,
+            expected_workspace_incarnation: Some(WorkspaceIncarnation::new(incarnation).unwrap()),
+            expected_source_head: Some(GitOid::new(source).unwrap()),
+            expected_onto_head: Some(GitOid::new(destination).unwrap()),
+        })
+    );
+
+    let (_, stdout, stderr) = run(
+        &mut service,
+        [
+            "land",
+            "raven",
+            "--target",
+            "release",
+            "--check",
+            "cargo test",
+            "--check",
+            "cargo clippy",
+            "--no-retire",
+            "--push-only",
+            "--expected-workspace-incarnation",
+            incarnation,
+            "--expected-source-head",
+            source,
+            "--expected-target-head",
+            "missing",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(
+        stdout,
+        format!(
+            "{{\"ok\":true,\"result\":{{\"landedHead\":\"{}\",\"targetBranch\":\"release\",\"previousTargetHead\":\"{}\",\"targetWasCheckedOut\":true,\"retired\":false}}}}\n",
+            "4".repeat(40),
+            "1".repeat(40)
+        )
+        .as_bytes()
+    );
+    assert!(stderr.is_empty());
+    assert_eq!(
+        service.land_options,
+        Some(LandOptions {
+            target_branch: Some("release".into()),
+            check: Some(vec!["cargo test".into(), "cargo clippy".into()]),
+            retire: false,
+            push_only: true,
+            expected_workspace_incarnation: Some(WorkspaceIncarnation::new(incarnation).unwrap()),
+            expected_source_head: Some(GitOid::new(source).unwrap()),
+            expected_target_head: Some(ExpectedRefHead::Missing),
+        })
+    );
+
+    let (_, stdout, stderr) = run(&mut service, ["rm", "main", "--restore", "--json"]).await;
+    assert_eq!(stdout, b"{\"ok\":true,\"result\":{}}\n");
+    assert_eq!(stderr, b"next: cowshed gc\n");
+    assert!(
+        service
+            .events
+            .iter()
+            .any(|event| event == "rm:main:false:true")
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_conflicts_and_non_utf8_revisions_fail_without_partial_output() {
+    let mut service = FakeService {
+        fail_push: Some(CowshedError::conflict(
+            "push destination head is stale",
+            "refresh and retry",
+        )),
+        ..FakeService::default()
+    };
+    let cli = parse_args(["push", "raven", "--json"]).unwrap();
+    let mut output = Output::new(Vec::new(), Vec::new(), false);
+    let error = dispatch(&mut service, cli, tokio::io::empty(), &mut output)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+    let (stdout, stderr) = output.into_inner();
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+
+    let opaque = OsString::from_vec(vec![b'm', 0x80, b'a', b'i', b'n']);
+    let cli = parse_args(vec![
+        OsString::from("rebase"),
+        OsString::from("raven"),
+        OsString::from("--onto"),
+        opaque,
+    ])
+    .unwrap();
+    let mut output = Output::new(Vec::new(), Vec::new(), false);
+    let error = dispatch(&mut service, cli, tokio::io::empty(), &mut output)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Usage);
+    assert!(error.message.contains("valid UTF-8"));
+    assert!(service.rebase_options.is_none());
+    assert!(output.into_inner().0.is_empty());
 }
 
 #[tokio::test]
@@ -443,6 +733,18 @@ impl CliService for SerializedCreateService {
     async fn adopt(&mut self, _: AdoptOptions) -> Result<WorkspaceInfo> {
         unreachable!()
     }
+    async fn fork(&mut self, _: &str, _: &str) -> Result<WorkspaceInfo> {
+        unreachable!()
+    }
+    async fn checkpoint(&mut self, _: &str, _: CheckpointOptions) -> Result<String> {
+        unreachable!()
+    }
+    async fn restore(&mut self, _: &str, _: &str) -> Result<WorkspaceInfo> {
+        unreachable!()
+    }
+    async fn ensure_current(&mut self, _: PathBuf) -> Result<EnsureReport> {
+        unreachable!()
+    }
     async fn list(&mut self) -> Result<Vec<WorkspaceInfo>> {
         unreachable!()
     }
@@ -459,6 +761,18 @@ impl CliService for SerializedCreateService {
         unreachable!()
     }
     async fn doctor(&mut self) -> Result<DoctorReport> {
+        unreachable!()
+    }
+    async fn gc(&mut self, _: GcOptions) -> Result<GcReport> {
+        unreachable!()
+    }
+    async fn push(&mut self, _: &str, _: PushOptions) -> Result<PushReport> {
+        unreachable!()
+    }
+    async fn rebase(&mut self, _: &str, _: RebaseOptions) -> Result<GitOid> {
+        unreachable!()
+    }
+    async fn land(&mut self, _: &str, _: LandOptions) -> Result<LandReport> {
         unreachable!()
     }
     async fn exec(
