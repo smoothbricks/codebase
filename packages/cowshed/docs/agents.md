@@ -4,6 +4,24 @@ cowshed's CLI is designed to be **self-driving**: an agent that can run shell co
 without reading this document, because every command narrates its effects and next steps on stderr. This document makes
 the implicit contract explicit.
 
+Start with [usage.md](usage.md) for adoption, the multi-repository mental model, repository selection, and the current
+command map. This guide focuses on deeper automation contracts.
+
+## Select the repository before the workspace
+
+`main` is repository-scoped. cwd or `--project <git-root>` selects one adopted repository; then `new` clones that
+repository's `main` unless `--from <workspace>` selects another source inside the same repository. A host can therefore
+run agents against many warm repositories without a host-global main.
+
+Harnesses should pass `--project` explicitly rather than make correctness depend on their process cwd:
+
+```sh
+PROJECT=~/src/api
+cowshed new task-4821 --project "$PROJECT" --json
+```
+
+`--repo-id` is only an adoption-time identity input. It is not how ordinary commands select a repository.
+
 ## The two-stream rule
 
 - **Parse ordinary control stdout.** It contains one answer: a path, a name, TSV rows, or a bounded `--json` envelope.
@@ -19,14 +37,15 @@ exit code when something fails. Treat explicit raw streams as opaque bytes; do n
 them.
 
 ```sh
-WS_PATH=$(cowshed new task-4821)          # stdout only: the mountpoint
-# stderr (seen by the agent, not captured): cowshed: ... / next: cowshed exec task-4821 -- ...
+PROJECT=~/src/api
+WS_PATH=$(cowshed new task-4821 --project "$PROJECT") # stdout only: the mountpoint
+# stderr remains visible to the agent: cowshed: ... / next: cowshed exec task-4821 -- ...
 ```
 
 Prefer `--json` when you want structure:
 
 ```sh
-cowshed new task-4821 --json | jq -r .result.path
+cowshed new task-4821 --project ~/src/api --json | jq -r .result.mount
 ```
 
 ## Warm workspaces for coding agents
@@ -37,27 +56,28 @@ cleanup.
 
 ```sh
 # spawn
-WS=task-$RANDOM
-WS_PATH=$(cowshed new "$WS")
+PROJECT=~/src/api
+WS=task-4821
+WS_PATH=$(cowshed new "$WS" --project "$PROJECT")
 
-# work — either cd into it (inherits your session's permissions)...
+# work — either cd into it with the caller's ordinary host permissions...
 cd "$WS_PATH" && bun test
 
 # ...or run sandboxed (recommended for autonomous work):
-cowshed exec "$WS" -- bun install
-cowshed exec "$WS" -- bun test
-cowshed exec "$WS" -- cargo clippy --workspace
+cowshed exec "$WS" --project "$PROJECT" -- bun install
+cowshed exec "$WS" --project "$PROJECT" -- bun test
+cowshed exec "$WS" --project "$PROJECT" -- cargo clippy --workspace
 
 # ship & destroy
-cowshed exec "$WS" -- git commit -am "implement feature"
-cowshed push "$WS"
-cowshed rm "$WS"
+cowshed exec "$WS" --project "$PROJECT" -- git commit -am "implement feature"
+cowshed push "$WS" --project "$PROJECT"
+cowshed rm "$WS" --project "$PROJECT"
 ```
 
 Notes for harness integration:
 
-- `cowshed new` is fast (~250 ms) and safe to call per-task. Names must be unique per project; exit 4 means the name is
-  taken — pick another, don't retry the same one.
+- `cowshed new` uses copy-on-write storage and is safe to call per task. Names are unique within the selected
+  repository; exit 4 means the name is taken — pick another instead of retrying the same name.
 - The workspace branch is `cowshed/<name>`; `cowshed push` delivers it to the main repo's refs, where a human (or a
   merge queue) takes over. Never push to main's checked-out branch.
 - `cowshed rm` refuses (exit 4) if the branch was never pushed — that's your signal work would be lost. Push first or
