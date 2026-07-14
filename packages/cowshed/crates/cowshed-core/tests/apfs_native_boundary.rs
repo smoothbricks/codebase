@@ -2821,6 +2821,104 @@ fn restore_recovery_selects_current_undo_generation_among_older_history() {
     );
 }
 
+#[test]
+fn retired_workspace_restart_ignores_multiple_retained_restore_generations() {
+    let fixture = Fixture::new("retired-repeated-restore-history");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let workspace_name = WorkspaceName::session("raven").expect("workspace");
+    let canonical = layout
+        .session_image(&workspace_name, ImageFormat::Sparse)
+        .expect("canonical");
+    let original = WorkspaceIncarnation::new("00000000000000000000000000000001").expect("original");
+    let first_destination =
+        WorkspaceIncarnation::new("00000000000000000000000000000002").expect("first destination");
+    let second_destination =
+        WorkspaceIncarnation::new("00000000000000000000000000000003").expect("second destination");
+    let checkpoint_directory = layout.project().checkpoints.join("raven");
+    let first_undo =
+        checkpoint_directory.join(format!("pre-restore-{first_destination}.sparseimage"));
+    let second_undo =
+        checkpoint_directory.join(format!("pre-restore-{second_destination}.sparseimage"));
+    let write_generation = |image: &Path, incarnation: &WorkspaceIncarnation| {
+        create_image(image, ImageFormat::Sparse);
+        let mut detached = metadata(ImageFormat::Sparse);
+        detached.workspace = workspace_name.clone();
+        detached.workspace_incarnation = incarnation.clone();
+        detached
+            .write_for_image(image)
+            .expect("generation metadata");
+    };
+    write_generation(&first_undo, &original);
+    write_generation(&second_undo, &first_destination);
+    write_generation(canonical.image(), &second_destination);
+    let trash = layout
+        .project()
+        .sessions
+        .join(".trash")
+        .join(format!("raven-{second_destination}.sparseimage"));
+    std::fs::create_dir_all(trash.parent().expect("trash parent")).expect("trash directory");
+    let host = native_host(&fixture, RecordingRunner::default());
+    host.retire_image(canonical.image(), &trash)
+        .expect("retire restored workspace");
+    drop(host);
+
+    let host = native_host(&fixture, RecordingRunner::default());
+    host.recover_pending(&fixture.config(), &[])
+        .expect("retained undo history is not pending recovery");
+    host.recover_pending(&fixture.config(), &[])
+        .expect("repeated restart remains converged");
+
+    assert!(!canonical.image().exists());
+    assert!(!restore_recovery_fact_path(canonical.image()).exists());
+    for retained in [&first_undo, &second_undo] {
+        assert!(retained.exists());
+        assert!(sidecar_path(retained).exists());
+        assert!(ca_key_path(retained).exists());
+    }
+    assert!(trash.exists());
+    assert!(sidecar_path(&trash).exists());
+    assert!(ca_key_path(&trash).exists());
+}
+
+#[test]
+fn restore_recovery_rejects_fact_without_canonical_image() {
+    let fixture = Fixture::new("restore-fact-without-canonical");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    let destination =
+        WorkspaceIncarnation::new("00000000000000000000000000000002").expect("destination");
+    let undo = layout
+        .project()
+        .checkpoints
+        .join(format!("main/pre-restore-{destination}.sparseimage"));
+    create_image(&undo, ImageFormat::Sparse);
+    let fact_path = restore_recovery_fact_path(canonical.image());
+    std::fs::write(
+        &fact_path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "repoId": repo(),
+            "workspace": "main",
+            "sourceCheckpoint": "baseline",
+            "sourceIncarnation": metadata(ImageFormat::Sparse).workspace_incarnation,
+            "replacedIncarnation": metadata(ImageFormat::Sparse).workspace_incarnation,
+            "destinationIncarnation": destination,
+        }))
+        .expect("fact JSON"),
+    )
+    .expect("orphan fact");
+
+    let error = native_host(&fixture, RecordingRunner::default())
+        .recover_pending(&fixture.config(), &[])
+        .expect_err("fact without canonical must fail closed");
+    let ApfsStorageError::MarkerMismatch(message) = error else {
+        panic!("expected restore integrity error, got {error:?}");
+    };
+    assert!(message.contains(&canonical.image().display().to_string()));
+    assert!(message.contains(&fact_path.display().to_string()));
+    assert!(undo.exists());
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn system_mount_source_observes_the_live_root_mount() {
