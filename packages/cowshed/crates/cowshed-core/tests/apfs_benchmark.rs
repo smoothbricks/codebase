@@ -1,10 +1,14 @@
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
 use cowshed_core::apfs::{
     ApfsBackend, ApfsCaseSensitivity, AttachedImage, CreateImageRequest, ImageFormatSelection,
     MacOsApfsBackend, SystemCommandRunner,
 };
+#[cfg(target_os = "macos")]
 use cowshed_core::metadata::ImageFormat;
 
 #[test]
