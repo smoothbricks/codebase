@@ -1,0 +1,16 @@
+[package]
+name = "columine-event-processor"
+description = "Unified event processor: parse -> columns -> (dedup) -> Arrow IPC (ports event_processor.zig both variants + dedup/{bloom,checkpoint}.zig)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+columine-arrow = { path = "../columine-arrow" }
+columine-parsing = { path = "../columine-parsing" }
+columine-types = { path = "../columine-types" }
+
+[dev-dependencies]
+proptest = { workspace = true }

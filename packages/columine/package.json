@@ -22,10 +22,10 @@
     "dist/**/*.wasm"
   ],
   "scripts": {
-    "build:zig": "nx run columine:zig-wasm",
     "build:ts": "nx run columine:tsc-js",
-    "build": "bun run build:ts && bun run build:zig",
-    "test": "nx run columine:test --outputStyle=stream"
+    "build": "bun run build:ts && bun run build:wasm",
+    "test": "nx run columine:test --outputStyle=stream",
+    "build:wasm": "nx run columine:cargo-wasm"
   },
   "nx": {
     "targets": {
@@ -43,6 +43,30 @@
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
           "killAfterMs": 10000
+        }
+      },
+      "cargo-wasm": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "inputs": [
+          "{projectRoot}/crates/**/*.rs",
+          "{projectRoot}/crates/**/Cargo.toml",
+          "{projectRoot}/Cargo.toml",
+          "{projectRoot}/Cargo.lock",
+          "{projectRoot}/.cargo/config.toml",
+          "{projectRoot}/justfile"
+        ],
+        "outputs": [
+          "{projectRoot}/dist/columine.wasm",
+          "{projectRoot}/dist/event_processor.wasm"
+        ],
+        "options": {
+          "commands": [
+            "just wasm",
+            "just wasm-ep"
+          ],
+          "cwd": "{projectRoot}",
+          "parallel": false
         }
       }
     },

@@ -1,0 +1,49 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "UNLICENSED"
+publish = false
+repository = "https://github.com/smoothbricks/smoothbricks"
+
+[workspace.dependencies]
+columine-types = { path = "crates/columine-types" }
+columine-vm = { path = "crates/columine-vm" }
+rustc-hash = "2"
+# Portable RoaringFormatSpec (same spec rawr implements — cookies 12346/12347).
+roaring = { version = "0.11", default-features = false, features = ["std"] }
+proptest = "1"
+criterion = { version = "0.5", default-features = false }
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Keeps wasm32 exports in the same size class as Zig's ReleaseSmall build.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+panic = "abort"
+
+# Perf-attribution side profile: same as wasm-release but speed-optimized.
+# Not the shipping profile — used to separate opt-level cost from structural cost.
+[profile.wasm-perf]
+inherits = "release"
+opt-level = 3
+panic = "abort"
+
+[profile.wasm-s]
+inherits = "release"
+opt-level = "s"
+panic = "abort"
+
+[profile.wasm-release.package.columine-vm]
+opt-level = 3
+
+# The parsing hot loops (json scanner/extractor) benefit from real inlining
+# the same way the VM dispatch does; measured in tools/simd-ingest-bench.ts.
+[profile.wasm-release.package.columine-parsing]
+opt-level = 3

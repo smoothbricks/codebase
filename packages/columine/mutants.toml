@@ -1,0 +1,9 @@
+# Arid mutation-testing policy from specs/sim/07-mutation-testing.md:
+# every survivor is classified as equivalent, invalid, budget-timeout, unreached,
+# or oracle-gap before it can be accepted.
+timeout_multiplier = 2.0
+minimum_test_timeout = 30.0
+
+# Comparison/benchmark scaffolding, never a dependency of shipped crates —
+# mutating it produces classification noise, not oracle signal (arid).
+exclude_globs = ["crates/scan-simd-compare/**"]
