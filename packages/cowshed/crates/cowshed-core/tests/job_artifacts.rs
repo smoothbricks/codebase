@@ -9,10 +9,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arrow_schema::DataType;
 use cowshed_core::api::{
     AdmissionCommitment, BinaryData, CONTROLLER_COMMITMENT_VERSION, CheckpointCommitment,
-    CommandArg, ControllerCommitment, DtoError, JobId, JobState, MAX_COMMAND_ARG_BYTES,
-    MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication, OutputStorage, ProtectedOutput,
-    PublicationPolicy, Sha256Digest, StreamInfo, TerminalCommitment, WorkspaceIncarnation,
-    WorkspacePath,
+    CommandArg, ControllerCommitment, DtoError, ForkCommitment, JobId, JobState,
+    MAX_COMMAND_ARG_BYTES, MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication,
+    OutputStorage, ProtectedOutput, PublicationPolicy, RestoreCommitment, Sha256Digest, StreamInfo,
+    TerminalCommitment, WorkspaceIncarnation, WorkspaceIntroducedCommitment, WorkspacePath,
+    WorkspaceRetiredCommitment,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::job_artifact::{
@@ -775,6 +776,201 @@ fn controller_commitment_arrow_is_payload_free_and_round_trips_lineage() {
             "controller JSON leaked {forbidden}"
         );
     }
+}
+
+#[test]
+fn workspace_lifecycle_replay_preserves_retired_jobs_and_rejects_stale_order() {
+    let repo = RepoId::parse("acme/widget").unwrap();
+    let incarnation =
+        WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();
+    let empty = Sha256Digest::compute(&[]);
+    let history = vec![
+        ControllerCommitment::WorkspaceIntroduced(WorkspaceIntroducedCommitment {
+            version: CONTROLLER_COMMITMENT_VERSION,
+            order: 1,
+            repo_id: repo.clone(),
+            workspace_incarnation: incarnation.clone(),
+        }),
+        ControllerCommitment::Admission(AdmissionCommitment {
+            version: CONTROLLER_COMMITMENT_VERSION,
+            order: 2,
+            repo_id: repo.clone(),
+            workspace_incarnation: incarnation.clone(),
+            job_id: JobId::new(1).unwrap(),
+            grant_revision: 7,
+        }),
+        ControllerCommitment::Terminal(TerminalCommitment {
+            version: CONTROLLER_COMMITMENT_VERSION,
+            order: 3,
+            repo_id: repo.clone(),
+            workspace_incarnation: incarnation.clone(),
+            job_id: JobId::new(1).unwrap(),
+            state: JobState::Exited,
+            grant_revision: 7,
+            stdout_bytes: 0,
+            stdout_sha256: empty,
+            stderr_bytes: 0,
+            stderr_sha256: empty,
+            batch_sha256: empty,
+            output_limit: None,
+        }),
+        ControllerCommitment::WorkspaceRetired(WorkspaceRetiredCommitment {
+            version: CONTROLLER_COMMITMENT_VERSION,
+            order: 4,
+            repo_id: repo.clone(),
+            workspace_incarnation: incarnation.clone(),
+        }),
+    ];
+    let baseline = CommitmentPriorContext::new(repo.clone(), []);
+    assert_eq!(
+        validate_commitments(&baseline, &history)
+            .unwrap()
+            .last_order(),
+        4
+    );
+
+    let batch = controller_commitments_to_batch(&history).unwrap();
+    assert_eq!(
+        controller_commitments_from_batch(&batch, &baseline).unwrap(),
+        history
+    );
+    for row in [0, 3] {
+        assert!(!batch.column(4).is_null(row));
+        for column in 5..batch.num_columns() {
+            assert!(
+                batch.column(column).is_null(row),
+                "unexpected lifecycle value in {}",
+                batch.schema().field(column).name()
+            );
+        }
+    }
+    assert_eq!(
+        serde_json::to_value(&history[0]).unwrap(),
+        serde_json::json!({
+            "kind": "workspaceIntroduced",
+            "version": 1,
+            "order": 1,
+            "repoId": "acme/widget",
+            "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80"
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(&history[3]).unwrap(),
+        serde_json::json!({
+            "kind": "workspaceRetired",
+            "version": 1,
+            "order": 4,
+            "repoId": "acme/widget",
+            "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80"
+        })
+    );
+
+    let introduced = history[0].clone();
+    let retired = history[3].clone();
+    let admission = history[1].clone();
+    let terminal = history[2].clone();
+    let cases = [
+        vec![with_order(admission.clone(), 1)],
+        vec![
+            introduced.clone(),
+            with_order(retired.clone(), 2),
+            with_order(admission, 3),
+        ],
+        vec![introduced.clone(), with_order(introduced.clone(), 2)],
+        vec![
+            introduced.clone(),
+            with_order(retired.clone(), 2),
+            with_order(retired.clone(), 3),
+        ],
+        vec![with_order(retired.clone(), 1)],
+        vec![
+            introduced.clone(),
+            with_order(retired.clone(), 2),
+            with_order(introduced, 3),
+        ],
+        vec![
+            history[0].clone(),
+            history[1].clone(),
+            with_order(retired, 3),
+            with_order(terminal, 4),
+        ],
+    ];
+    for values in cases {
+        assert!(matches!(
+            validate_commitments(&baseline, &values),
+            Err(ArtifactError::Integrity { .. })
+        ));
+    }
+}
+
+fn with_order(mut commitment: ControllerCommitment, order: u64) -> ControllerCommitment {
+    match &mut commitment {
+        ControllerCommitment::WorkspaceIntroduced(value) => value.order = order,
+        ControllerCommitment::WorkspaceRetired(value) => value.order = order,
+        ControllerCommitment::Admission(value) => value.order = order,
+        ControllerCommitment::Terminal(value) => value.order = order,
+        ControllerCommitment::Checkpoint(value) => value.order = order,
+        ControllerCommitment::Fork(value) => value.order = order,
+        ControllerCommitment::Restore(value) => value.order = order,
+    }
+    commitment
+}
+
+#[test]
+fn lineage_variants_introduce_only_fresh_destinations() {
+    let repo = RepoId::parse("acme/widget").unwrap();
+    let source = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();
+    let forked = WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").unwrap();
+    let restored = WorkspaceIncarnation::new("2198f2c0b7e34dc795f17b238b331c80").unwrap();
+    let baseline = CommitmentPriorContext::new(repo.clone(), []);
+    let history = vec![
+        ControllerCommitment::WorkspaceIntroduced(WorkspaceIntroducedCommitment {
+            version: CONTROLLER_COMMITMENT_VERSION,
+            order: 1,
+            repo_id: repo.clone(),
+            workspace_incarnation: source.clone(),
+        }),
+        ControllerCommitment::Checkpoint(CheckpointCommitment {
+            version: CONTROLLER_COMMITMENT_VERSION,
+            order: 2,
+            repo_id: repo.clone(),
+            origin_incarnation: source.clone(),
+            checkpoint_id: "checkpoint-1".into(),
+            barrier_id: 1,
+            manifest_batch_sha256: Sha256Digest::compute(b"manifest"),
+        }),
+        ControllerCommitment::Fork(ForkCommitment {
+            version: CONTROLLER_COMMITMENT_VERSION,
+            order: 3,
+            repo_id: repo.clone(),
+            source_incarnation: source.clone(),
+            destination_incarnation: forked.clone(),
+        }),
+        ControllerCommitment::Restore(RestoreCommitment {
+            version: CONTROLLER_COMMITMENT_VERSION,
+            order: 4,
+            repo_id: repo.clone(),
+            source_checkpoint: "checkpoint-1".into(),
+            source_incarnation: source,
+            destination_incarnation: restored.clone(),
+        }),
+        ControllerCommitment::Admission(AdmissionCommitment {
+            version: CONTROLLER_COMMITMENT_VERSION,
+            order: 5,
+            repo_id: repo,
+            workspace_incarnation: restored,
+            job_id: JobId::new(1).unwrap(),
+            grant_revision: 1,
+        }),
+    ];
+    validate_commitments(&baseline, &history).unwrap();
+
+    let mut duplicate = history;
+    duplicate.push(with_order(duplicate[2].clone(), 6));
+    assert!(matches!(
+        validate_commitments(&baseline, &duplicate),
+        Err(ArtifactError::Integrity { .. })
+    ));
 }
 
 #[test]

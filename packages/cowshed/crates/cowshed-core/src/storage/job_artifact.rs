@@ -25,7 +25,8 @@ use crate::api::dto::{
     DtoError, ForkCommitment, JobId, JobState, MAX_ARGV_BYTES, MAX_COMMAND_ARG_BYTES,
     MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary,
     ProtectedOutput, RestoreCommitment, Sha256Digest, StreamInfo, TerminalCommitment,
-    WorkspacePath, validate_command_argv,
+    WorkspaceIntroducedCommitment, WorkspacePath, WorkspaceRetiredCommitment,
+    validate_command_argv,
 };
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
@@ -3226,6 +3227,14 @@ fn flatten_controller(value: &ControllerCommitment) -> ControllerFlatRow<'_> {
         source_checkpoint: None,
     };
     match value {
+        ControllerCommitment::WorkspaceIntroduced(value) => {
+            row.kind = "workspaceIntroduced";
+            row.workspace_incarnation = Some(value.workspace_incarnation.as_str());
+        }
+        ControllerCommitment::WorkspaceRetired(value) => {
+            row.kind = "workspaceRetired";
+            row.workspace_incarnation = Some(value.workspace_incarnation.as_str());
+        }
         ControllerCommitment::Admission(value) => {
             row.kind = "admission";
             row.workspace_incarnation = Some(value.workspace_incarnation.as_str());
@@ -3389,6 +3398,24 @@ pub fn controller_commitments_from_batch(
         let repo_id = RepoId::parse(required_string(batch, 3, row)?)
             .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
         let value = match kind {
+            "workspaceIntroduced" => {
+                require_variant_columns(batch, row, &[4])?;
+                ControllerCommitment::WorkspaceIntroduced(WorkspaceIntroducedCommitment {
+                    version,
+                    order,
+                    repo_id,
+                    workspace_incarnation: required_incarnation(batch, 4, row)?,
+                })
+            }
+            "workspaceRetired" => {
+                require_variant_columns(batch, row, &[4])?;
+                ControllerCommitment::WorkspaceRetired(WorkspaceRetiredCommitment {
+                    version,
+                    order,
+                    repo_id,
+                    workspace_incarnation: required_incarnation(batch, 4, row)?,
+                })
+            }
             "admission" => {
                 require_variant_columns(batch, row, &[4, 5, 6])?;
                 ControllerCommitment::Admission(AdmissionCommitment {
@@ -3555,7 +3582,9 @@ struct DurableJobKey {
 pub struct CommitmentPriorContext {
     repo_id: RepoId,
     last_order: u64,
-    known_incarnations: BTreeSet<WorkspaceIncarnation>,
+    active_incarnations: BTreeSet<WorkspaceIncarnation>,
+    introduced_incarnations: BTreeSet<WorkspaceIncarnation>,
+    retired_incarnations: BTreeSet<WorkspaceIncarnation>,
     admissions: BTreeMap<DurableJobKey, u64>,
     terminals: BTreeSet<DurableJobKey>,
     checkpoints: BTreeMap<String, WorkspaceIncarnation>,
@@ -3570,7 +3599,9 @@ impl CommitmentPriorContext {
         Self {
             repo_id,
             last_order: 0,
-            known_incarnations: known_incarnations.into_iter().collect(),
+            active_incarnations: known_incarnations.into_iter().collect(),
+            introduced_incarnations: BTreeSet::new(),
+            retired_incarnations: BTreeSet::new(),
             admissions: BTreeMap::new(),
             terminals: BTreeSet::new(),
             checkpoints: BTreeMap::new(),
@@ -3580,6 +3611,10 @@ impl CommitmentPriorContext {
 
     pub fn last_order(&self) -> u64 {
         self.last_order
+    }
+
+    pub(crate) fn is_retired(&self, incarnation: &WorkspaceIncarnation) -> bool {
+        self.retired_incarnations.contains(incarnation)
     }
 }
 
@@ -3612,9 +3647,47 @@ pub fn validate_commitments(
         }
         context.last_order = commitment.order();
         match commitment {
+            ControllerCommitment::WorkspaceIntroduced(value) => {
+                if context
+                    .introduced_incarnations
+                    .contains(&value.workspace_incarnation)
+                    || context
+                        .retired_incarnations
+                        .contains(&value.workspace_incarnation)
+                {
+                    return Err(ArtifactError::Integrity {
+                        offset: 0,
+                        message: "workspace incarnation is introduced more than once or after retirement"
+                            .into(),
+                    });
+                }
+                context
+                    .introduced_incarnations
+                    .insert(value.workspace_incarnation.clone());
+                context
+                    .active_incarnations
+                    .insert(value.workspace_incarnation.clone());
+            }
+            ControllerCommitment::WorkspaceRetired(value) => {
+                if context
+                    .retired_incarnations
+                    .contains(&value.workspace_incarnation)
+                    || !context
+                        .active_incarnations
+                        .remove(&value.workspace_incarnation)
+                {
+                    return Err(ArtifactError::Integrity {
+                        offset: 0,
+                        message: "workspace retirement has no active source or is duplicated".into(),
+                    });
+                }
+                context
+                    .retired_incarnations
+                    .insert(value.workspace_incarnation.clone());
+            }
             ControllerCommitment::Admission(value) => {
                 if !context
-                    .known_incarnations
+                    .active_incarnations
                     .contains(&value.workspace_incarnation)
                 {
                     return Err(ArtifactError::Integrity {
@@ -3638,6 +3711,15 @@ pub fn validate_commitments(
                 }
             }
             ControllerCommitment::Terminal(value) => {
+                if !context
+                    .active_incarnations
+                    .contains(&value.workspace_incarnation)
+                {
+                    return Err(ArtifactError::Integrity {
+                        offset: 0,
+                        message: "terminal commitment follows workspace retirement".into(),
+                    });
+                }
                 let key = DurableJobKey {
                     workspace_incarnation: value.workspace_incarnation.clone(),
                     job_id: value.job_id,
@@ -3663,7 +3745,7 @@ pub fn validate_commitments(
             }
             ControllerCommitment::Checkpoint(value) => {
                 if !context
-                    .known_incarnations
+                    .active_incarnations
                     .contains(&value.origin_incarnation)
                 {
                     return Err(ArtifactError::Integrity {
@@ -3698,11 +3780,14 @@ pub fn validate_commitments(
             }
             ControllerCommitment::Fork(value) => {
                 if !context
-                    .known_incarnations
+                    .active_incarnations
                     .contains(&value.source_incarnation)
-                    || !context
-                        .known_incarnations
-                        .insert(value.destination_incarnation.clone())
+                    || context
+                        .introduced_incarnations
+                        .contains(&value.destination_incarnation)
+                    || context
+                        .retired_incarnations
+                        .contains(&value.destination_incarnation)
                 {
                     return Err(ArtifactError::Integrity {
                         offset: 0,
@@ -3710,21 +3795,45 @@ pub fn validate_commitments(
                             .into(),
                     });
                 }
+                context
+                    .introduced_incarnations
+                    .insert(value.destination_incarnation.clone());
+                context
+                    .active_incarnations
+                    .insert(value.destination_incarnation.clone());
             }
             ControllerCommitment::Restore(value) => {
                 if context.checkpoints.get(&value.source_checkpoint)
                     != Some(&value.source_incarnation)
                     || !context
-                        .known_incarnations
-                        .insert(value.destination_incarnation.clone())
+                        .active_incarnations
+                        .contains(&value.source_incarnation)
+                    || context
+                        .introduced_incarnations
+                        .contains(&value.destination_incarnation)
+                    || context
+                        .retired_incarnations
+                        .contains(&value.destination_incarnation)
                 {
                     return Err(ArtifactError::Integrity {
                         offset: 0,
                         message:
-                            "restore lineage checkpoint is absent or destination already exists"
+                            "restore lineage checkpoint is absent, source is retired, or destination already exists"
                                 .into(),
                     });
                 }
+                context
+                    .active_incarnations
+                    .remove(&value.source_incarnation);
+                context
+                    .retired_incarnations
+                    .insert(value.source_incarnation.clone());
+                context
+                    .introduced_incarnations
+                    .insert(value.destination_incarnation.clone());
+                context
+                    .active_incarnations
+                    .insert(value.destination_incarnation.clone());
             }
         }
     }
@@ -3802,7 +3911,10 @@ pub fn reconcile_commitments(
                     });
                 }
             }
-            ControllerCommitment::Fork(_) | ControllerCommitment::Restore(_) => {}
+            ControllerCommitment::WorkspaceIntroduced(_)
+            | ControllerCommitment::WorkspaceRetired(_)
+            | ControllerCommitment::Fork(_)
+            | ControllerCommitment::Restore(_) => {}
         }
     }
     Ok(context)

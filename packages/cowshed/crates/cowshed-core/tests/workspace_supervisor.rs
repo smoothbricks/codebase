@@ -298,6 +298,8 @@ impl CommitmentSink for FakeCommitments {
         self.next_order += 1;
         self.order
             .send(OrderObservation::Commitment(match &commitment {
+                ControllerCommitment::WorkspaceIntroduced(_) => "workspace-introduced",
+                ControllerCommitment::WorkspaceRetired(_) => "workspace-retired",
                 ControllerCommitment::Admission(_) => "admission",
                 ControllerCommitment::Terminal(_) => "terminal",
                 ControllerCommitment::Checkpoint(_) => "checkpoint",
