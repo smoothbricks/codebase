@@ -43,6 +43,12 @@
       "import": "./dist/es.js",
       "default": "./dist/es.js"
     },
+    "./wasm": {
+      "types": "./dist/wasm.d.ts",
+      "development": "./src/wasm.ts",
+      "import": "./dist/wasm.js",
+      "default": "./dist/wasm.js"
+    },
     "./cloudflare": {
       "types": "./dist/cloudflare.d.ts",
       "development": "./src/cloudflare.ts",
