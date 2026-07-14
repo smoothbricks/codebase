@@ -3045,36 +3045,34 @@ fn binding_from_remotes(
         .map(|(remote, _)| *remote)
         .ok_or_else(|| CowshedError::internal("selected repository candidate is missing"))?;
 
+    let remote_url = persistable_remote_url(&selected.url)
+        .ok_or_else(|| CowshedError::internal("normalized repository URL cannot be persisted"))?;
     RepositoryBinding::new(vec![crate::repository::BoundIdentity {
         repo_id: selected_repo_id,
         remote_name: Some(selected.name.clone()),
-        remote_url: Some(persistable_remote_url(&selected.url)),
+        remote_url: Some(remote_url),
         primary: true,
     }])
     .map_err(binding_integrity_error)
 }
 
-fn persistable_remote_url(value: &str) -> String {
+fn persistable_remote_url(value: &str) -> Option<String> {
     let suffix = value
         .char_indices()
         .find_map(|(index, character)| matches!(character, '?' | '#').then_some(index));
     let without_suffix = suffix.map_or(value, |index| &value[..index]);
     if let Some((scheme, remainder)) = without_suffix.split_once("://") {
-        let (authority, path) = remainder
-            .split_once('/')
-            .expect("normalized remote URL has a repository path");
+        let (authority, path) = remainder.split_once('/')?;
         let authority = authority
             .rsplit_once('@')
             .map_or(authority, |(_, host)| host);
-        format!("{scheme}://{authority}/{path}")
+        Some(format!("{scheme}://{authority}/{path}"))
     } else {
-        let (authority, path) = without_suffix
-            .split_once(':')
-            .expect("normalized SCP-like remote has a repository path");
+        let (authority, path) = without_suffix.split_once(':')?;
         let authority = authority
             .rsplit_once('@')
             .map_or(authority, |(_, host)| host);
-        format!("{authority}:{path}")
+        Some(format!("{authority}:{path}"))
     }
 }
 
@@ -3122,9 +3120,10 @@ fn validate_binding_against_remotes(
     binding.validate().map_err(native_integrity_error)?;
     for identity in &binding.identities {
         if let (Some(name), Some(url)) = (&identity.remote_name, &identity.remote_url)
-            && !remotes
-                .iter()
-                .any(|remote| &remote.name == name && persistable_remote_url(&remote.url) == *url)
+            && !remotes.iter().any(|remote| {
+                &remote.name == name
+                    && persistable_remote_url(&remote.url).as_deref() == Some(url.as_str())
+            })
         {
             return Err(CowshedError::conflict(
                 format!("repository binding remote {name} does not match Git configuration"),

@@ -14,10 +14,11 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use cowshed_gateway::{
-    Cache, CacheBodyError, CacheConfig, CanonicalTarget, ConfigError, GatewayConfig, MirrorBody,
-    MirrorCacheConfig, MirrorCacheScope, MirrorCacheStatus, MirrorError, MirrorFetchRequest,
-    MirrorOutcome, MirrorProtocol, MirrorRequest, MirrorResourceKind, MirrorRoute, MirrorService,
-    MirrorUpstream, ObjectExpectation, TargetScheme, UpstreamHealth, WorkspacePolicy,
+    Cache, CacheBodyError, CacheConfig, CacheError, CanonicalTarget, ConfigError, GatewayConfig,
+    MirrorBody, MirrorCacheConfig, MirrorCacheScope, MirrorCacheStatus, MirrorError,
+    MirrorFetchRequest, MirrorOutcome, MirrorProtocol, MirrorRequest, MirrorResourceKind,
+    MirrorRoute, MirrorService, MirrorUpstream, ObjectExpectation, TargetScheme, UpstreamHealth,
+    WorkspacePolicy,
 };
 use http::{HeaderMap, Method, Response, StatusCode, header};
 use http_body_util::{BodyExt as _, Full};
@@ -43,6 +44,7 @@ impl TestRoot {
             high_water_bytes: 1024 * 1024,
             low_water_bytes: 512 * 1024,
             metadata_ttl: Duration::from_secs(300),
+            fill_wait_timeout: Duration::from_secs(1),
         }
     }
 }
@@ -445,6 +447,37 @@ async fn stale_metadata_304_refreshes_and_200_replaces_atomically() {
 }
 
 #[tokio::test]
+async fn coalesced_fill_waits_have_a_hard_timeout() {
+    let root = TestRoot::new();
+    let mut config = root.cache_config();
+    config.fill_wait_timeout = Duration::from_millis(10);
+    let service = MirrorService::new(Cache::open(config).await.expect("open cache"));
+    let request = request(
+        MirrorProtocol::Npm,
+        target("registry.npmjs.org"),
+        "/timeout",
+        MirrorCacheScope::Anonymous,
+        false,
+        None,
+    );
+    let upstream = QueueUpstream::new([metadata_response(b"held fill", "\"held\"")]);
+    let leader = service
+        .execute(request.clone(), UpstreamHealth::Healthy, &upstream)
+        .await
+        .expect("start leader fill without consuming it");
+
+    let error = service
+        .execute(request, UpstreamHealth::Healthy, &upstream)
+        .await
+        .expect_err("coalesced wait must time out");
+    assert!(matches!(
+        error,
+        MirrorError::Cache(CacheError::FillWaitTimeout)
+    ));
+    drop(leader);
+}
+
+#[tokio::test]
 async fn scoped_cache_entries_never_cross_project_or_anonymous_boundaries() {
     let root = TestRoot::new();
     let service = service(&root).await;
@@ -508,6 +541,7 @@ async fn inactive_lru_eviction_respects_an_active_reader_pin() {
         high_water_bytes: 140_000,
         low_water_bytes: 131_200,
         metadata_ttl: Duration::from_secs(300),
+        fill_wait_timeout: Duration::from_secs(1),
     };
     let service = MirrorService::new(Cache::open(config).await.expect("open small cache"));
     let upstream = QueueUpstream::new([

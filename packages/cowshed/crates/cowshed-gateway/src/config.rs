@@ -308,6 +308,7 @@ pub struct MirrorCacheConfig {
     pub high_water_bytes: u64,
     pub low_water_bytes: u64,
     pub metadata_ttl: Duration,
+    pub fill_wait_timeout: Duration,
 }
 
 impl MirrorCacheConfig {
@@ -317,6 +318,7 @@ impl MirrorCacheConfig {
             high_water_bytes: DEFAULT_HIGH_WATER_BYTES,
             low_water_bytes: DEFAULT_LOW_WATER_BYTES,
             metadata_ttl: Duration::from_secs(5 * 60),
+            fill_wait_timeout: Duration::from_secs(15 * 60),
         }
     }
 
@@ -324,7 +326,10 @@ impl MirrorCacheConfig {
         if !self.cache_root.is_absolute() {
             return Err(ConfigError::MissingMirrorCacheRoot);
         }
-        if self.low_water_bytes >= self.high_water_bytes || self.metadata_ttl.is_zero() {
+        if self.low_water_bytes >= self.high_water_bytes
+            || self.metadata_ttl.is_zero()
+            || self.fill_wait_timeout.is_zero()
+        {
             return Err(ConfigError::InvalidMirrorCacheLimits);
         }
         let metadata = std::fs::symlink_metadata(&self.cache_root)
@@ -341,6 +346,7 @@ impl MirrorCacheConfig {
             high_water_bytes: self.high_water_bytes,
             low_water_bytes: self.low_water_bytes,
             metadata_ttl: self.metadata_ttl,
+            fill_wait_timeout: self.fill_wait_timeout,
         }
     }
 }
