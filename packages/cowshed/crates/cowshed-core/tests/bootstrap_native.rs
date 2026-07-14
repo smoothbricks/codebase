@@ -425,6 +425,109 @@ async fn detached_exact_volume_requires_explicit_provisioning_without_prompt() {
 }
 
 #[tokio::test]
+async fn mismounted_exact_volume_is_rejected_before_existing_only_dispatch() {
+    let selected = select_substrate(
+        StatFsEvidence::Apfs {
+            mount_source: "/dev/disk3s5".into(),
+            container: Some("disk3".to_owned()),
+        },
+        None,
+    )
+    .unwrap();
+    let plan = plan_bootstrap(
+        selected,
+        Path::new("/Users/alice"),
+        BootstrapEvidence::Apfs {
+            store: ExistingStorage::mounted_valid("disk3s8"),
+            caches: ExistingStorage::mis_mounted_incomplete("disk3s9", "/Volumes/cowshed-wrong"),
+        },
+    )
+    .unwrap();
+    assert!(plan.operations().iter().any(|operation| matches!(
+        operation,
+        HostOperation::ProvisionApfsVolumes { volumes, .. }
+            if matches!(
+                volumes.as_slice(),
+                [volume]
+                    if matches!(
+                        volume.kind(),
+                        ApfsProvisionKind::RepairMisMounted {
+                            exact_identifier,
+                            current_mountpoint,
+                        } if exact_identifier == "disk3s9"
+                            && current_mountpoint == Path::new("/Volumes/cowshed-wrong")
+                    )
+            )
+    )));
+
+    let host = Arc::new(ValidationHost::default());
+    let lane = CountingLane::default();
+    let error = execute_native_bootstrap_plan(
+        &plan,
+        NativeBootstrapMode::ExistingOnly,
+        Arc::clone(&host),
+        &lane,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        NativeBootstrapError::StorageSetupRequired {
+            hint: "next: cowshed adopt",
+            ..
+        }
+    ));
+    assert_eq!(lane.dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(host.inspections.load(Ordering::SeqCst), 0);
+    assert_eq!(host.mutations.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn canonical_mount_flag_repair_does_not_require_a_prepublished_marker() {
+    let selected = select_substrate(
+        StatFsEvidence::Apfs {
+            mount_source: "/dev/disk3s5".into(),
+            container: Some("disk3".to_owned()),
+        },
+        None,
+    )
+    .unwrap();
+    let plan = plan_bootstrap(
+        selected,
+        Path::new("/Users/alice"),
+        BootstrapEvidence::Apfs {
+            store: ExistingStorage::mounted_valid("disk3s8"),
+            caches: ExistingStorage::mis_mounted_incomplete(
+                "disk3s9",
+                "/Users/alice/.cowshed/caches",
+            ),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        plan.operations(),
+        [
+            HostOperation::GuardMountpoint {
+                role: VolumeRole::Store,
+                ..
+            },
+            HostOperation::ProvisionApfsVolumes { volumes, .. }
+        ] if matches!(
+            volumes.as_slice(),
+            [volume]
+                if matches!(
+                    volume.kind(),
+                    ApfsProvisionKind::RepairMisMounted {
+                        exact_identifier,
+                        current_mountpoint,
+                    } if exact_identifier == "disk3s9"
+                        && current_mountpoint == Path::new("/Users/alice/.cowshed/caches")
+                )
+        )
+    ));
+}
+
+#[tokio::test]
 async fn already_correct_volumes_validate_in_both_modes_without_mutation() {
     for mode in [
         NativeBootstrapMode::Provision,
