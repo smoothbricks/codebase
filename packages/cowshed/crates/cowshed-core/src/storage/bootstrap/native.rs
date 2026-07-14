@@ -281,6 +281,16 @@ struct StatFsSnapshot {
     mount_source: PathBuf,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     mountpoint: PathBuf,
+    nobrowse: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MountedVolumeEvidence {
+    exact_identifier: String,
+    mountpoint: PathBuf,
+    nobrowse: bool,
+    uid: u32,
+    gid: u32,
 }
 
 trait EvidenceSource {
@@ -290,7 +300,11 @@ trait EvidenceSource {
         command: &HostCommand,
     ) -> Result<HostCommandOutput, NativeBootstrapError>;
     fn inspect_mountpoint(&mut self, path: &Path) -> Result<MountpointState, NativeBootstrapError>;
-    fn mounted_identifier(&mut self, path: &Path) -> Result<String, NativeBootstrapError>;
+    fn mounted_volume(
+        &mut self,
+        path: &Path,
+    ) -> Result<MountedVolumeEvidence, NativeBootstrapError>;
+    fn invoking_identity(&mut self) -> (u32, u32);
 }
 
 struct SystemEvidenceSource<'a> {
@@ -313,15 +327,33 @@ impl EvidenceSource for SystemEvidenceSource<'_> {
         self.host.inspect_mountpoint(path).map_err(Into::into)
     }
 
-    fn mounted_identifier(&mut self, path: &Path) -> Result<String, NativeBootstrapError> {
+    fn mounted_volume(
+        &mut self,
+        path: &Path,
+    ) -> Result<MountedVolumeEvidence, NativeBootstrapError> {
         let snapshot = system_statfs(path)?;
-        if snapshot.mountpoint != path {
+        let metadata =
+            fs::symlink_metadata(path).map_err(|source| NativeBootstrapError::StatFs {
+                path: path.to_owned(),
+                source,
+            })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(NativeBootstrapError::MountEvidenceMismatch {
                 path: path.to_owned(),
-                identifier: snapshot.mount_source.display().to_string(),
+                identifier: "mountpoint is not a no-follow directory".to_owned(),
             });
         }
-        exact_device_identifier(&snapshot.mount_source)
+        Ok(MountedVolumeEvidence {
+            exact_identifier: exact_device_identifier(&snapshot.mount_source)?,
+            mountpoint: snapshot.mountpoint,
+            nobrowse: snapshot.nobrowse,
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        })
+    }
+
+    fn invoking_identity(&mut self) -> (u32, u32) {
+        (unsafe { libc::getuid() }, unsafe { libc::getgid() })
     }
 }
 
@@ -612,30 +644,54 @@ fn classify_volume(
     };
     match state {
         MountpointState::Mounted { marker } => {
-            let mounted_identifier = source.mounted_identifier(expected_mountpoint)?;
-            if mounted_identifier != volume.identifier {
+            let mounted = source.mounted_volume(expected_mountpoint)?;
+            if mounted.exact_identifier != volume.identifier
+                || mounted.mountpoint != expected_mountpoint
+            {
                 return Err(NativeBootstrapError::MountEvidenceMismatch {
                     path: expected_mountpoint.to_owned(),
-                    identifier: mounted_identifier,
+                    identifier: mounted.exact_identifier,
                 });
             }
-            let Some(marker) = marker else {
+            let marker_missing = marker.is_none();
+            if let Some(marker) = marker {
+                require_mounted_marker(Some(&marker), role, SubstrateKind::Apfs).map_err(
+                    |error| NativeBootstrapError::InvalidMountedMarker {
+                        path: expected_mountpoint.to_owned(),
+                        message: error.to_string(),
+                    },
+                )?;
+            }
+            if !mounted.nobrowse {
+                return Ok(ExistingStorage::mis_mounted_incomplete(
+                    &volume.identifier,
+                    expected_mountpoint,
+                ));
+            }
+            let (uid, gid) = source.invoking_identity();
+            if marker_missing || mounted.uid != uid || mounted.gid != gid {
                 return Ok(ExistingStorage::mounted_incomplete(&volume.identifier));
-            };
-            require_mounted_marker(Some(&marker), role, SubstrateKind::Apfs).map_err(|error| {
-                NativeBootstrapError::InvalidMountedMarker {
-                    path: expected_mountpoint.to_owned(),
-                    message: error.to_string(),
-                }
-            })?;
+            }
             Ok(ExistingStorage::mounted_valid(&volume.identifier))
         }
         MountpointState::Missing | MountpointState::EmptyDirectory => match &volume.mountpoint {
             None => Ok(ExistingStorage::detached_incomplete(&volume.identifier)),
-            Some(mountpoint) => Err(NativeBootstrapError::InvalidVolumeMountpoint {
-                identifier: volume.identifier.clone(),
-                mountpoint: Some(mountpoint.clone()),
-            }),
+            Some(mountpoint) => {
+                require_canonical(mountpoint)?;
+                let mounted = source.mounted_volume(mountpoint)?;
+                if mounted.exact_identifier != volume.identifier
+                    || mounted.mountpoint != *mountpoint
+                {
+                    return Err(NativeBootstrapError::MountEvidenceMismatch {
+                        path: mountpoint.clone(),
+                        identifier: mounted.exact_identifier,
+                    });
+                }
+                Ok(ExistingStorage::mis_mounted_incomplete(
+                    &volume.identifier,
+                    mountpoint,
+                ))
+            }
         },
         MountpointState::NonEmptyDirectoryWithoutMount => {
             Err(NativeBootstrapError::MaskedMountpoint {
@@ -678,7 +734,12 @@ trait PrivilegedCommandSession {
 #[cfg(target_os = "macos")]
 trait ApfsProvisionIo {
     fn prepare_mountpoint(&self, path: &Path) -> Result<(), HostError>;
-    fn attest_mounted(&self, path: &Path, exact_identifier: &str) -> Result<(), HostError>;
+    fn attest_mounted(
+        &self,
+        path: &Path,
+        exact_identifier: &str,
+        require_nobrowse: bool,
+    ) -> Result<(), HostError>;
     fn attest_owner(&self, path: &Path, uid: u32, gid: u32) -> Result<(), HostError>;
     fn write_marker(&self, path: &Path, contents: &[u8]) -> Result<(), HostError>;
 }
@@ -701,14 +762,29 @@ impl ApfsProvisionIo for SystemApfsProvisionIo {
         }
     }
 
-    fn attest_mounted(&self, path: &Path, exact_identifier: &str) -> Result<(), HostError> {
+    fn attest_mounted(
+        &self,
+        path: &Path,
+        exact_identifier: &str,
+        require_nobrowse: bool,
+    ) -> Result<(), HostError> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|source| host_io_error("inspect mounted APFS path", path, source))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(HostError::new(format!(
+                "mounted APFS path is not a no-follow directory: {path:?}"
+            )));
+        }
         let snapshot = system_statfs(path).map_err(|error| HostError::new(error.to_string()))?;
         let actual = exact_device_identifier(&snapshot.mount_source)
             .map_err(|error| HostError::new(error.to_string()))?;
-        if snapshot.mountpoint != path || actual != exact_identifier {
+        if snapshot.mountpoint != path
+            || actual != exact_identifier
+            || (require_nobrowse && !snapshot.nobrowse)
+        {
             return Err(HostError::new(format!(
-                "mounted APFS identity at {path:?} is {actual:?} from {:?}, expected {exact_identifier:?}",
-                snapshot.mountpoint
+                "mounted APFS identity at {path:?} is {actual:?} from {:?} with nobrowse={}, expected {exact_identifier:?}",
+                snapshot.mountpoint, snapshot.nobrowse
             )));
         }
         Ok(())
@@ -819,9 +895,41 @@ where
                 run_privileged_command(&mut session, &mount)?;
                 exact_identifier.clone()
             }
+            ApfsProvisionKind::RepairMisMounted {
+                exact_identifier,
+                current_mountpoint,
+            } => {
+                io.attest_mounted(current_mountpoint, exact_identifier, false)?;
+                let info =
+                    HostCommand::new(DISKUTIL, ["info", "-plist", exact_identifier.as_str()]);
+                let output = run_privileged_command(&mut session, &info)?;
+                attest_mounted_apfs_info(
+                    &output.stdout,
+                    exact_identifier,
+                    container,
+                    volume.name(),
+                    current_mountpoint,
+                )?;
+                let unmount = HostCommand::new(DISKUTIL, ["unmount", exact_identifier.as_str()]);
+                run_privileged_command(&mut session, &unmount)?;
+                io.prepare_mountpoint(volume.mountpoint())?;
+                let mountpoint = path_argument(volume.mountpoint())?;
+                let mount = HostCommand::new(
+                    DISKUTIL,
+                    [
+                        "mount".to_owned(),
+                        "-nobrowse".to_owned(),
+                        "-mountPoint".to_owned(),
+                        mountpoint,
+                        exact_identifier.clone(),
+                    ],
+                );
+                run_privileged_command(&mut session, &mount)?;
+                exact_identifier.clone()
+            }
         };
 
-        io.attest_mounted(volume.mountpoint(), &exact_identifier)?;
+        io.attest_mounted(volume.mountpoint(), &exact_identifier, true)?;
         let info = HostCommand::new(DISKUTIL, ["info", "-plist", exact_identifier.as_str()]);
         let output = run_privileged_command(&mut session, &info)?;
         attest_mounted_apfs_info(
@@ -886,13 +994,24 @@ fn validate_provision_batch(
                 volume.name()
             )));
         }
-        if let ApfsProvisionKind::RepairMounted { exact_identifier }
-        | ApfsProvisionKind::RecoverDetached { exact_identifier } = volume.kind()
-            && !valid_volume_identifier(exact_identifier.as_bytes())
-        {
+        let exact_identifier = match volume.kind() {
+            ApfsProvisionKind::Create => continue,
+            ApfsProvisionKind::RepairMounted { exact_identifier }
+            | ApfsProvisionKind::RecoverDetached { exact_identifier }
+            | ApfsProvisionKind::RepairMisMounted {
+                exact_identifier, ..
+            } => exact_identifier,
+        };
+        if !valid_volume_identifier(exact_identifier.as_bytes()) {
             return Err(HostError::new(format!(
                 "invalid APFS recovery identifier {exact_identifier:?}"
             )));
+        }
+        if let ApfsProvisionKind::RepairMisMounted {
+            current_mountpoint, ..
+        } = volume.kind()
+        {
+            require_host_canonical(current_mountpoint)?;
         }
     }
     Ok(())
@@ -1228,6 +1347,7 @@ fn system_statfs(path: &Path) -> Result<StatFsSnapshot, NativeBootstrapError> {
             &stats.f_mntonname,
             path,
         )?)),
+        nobrowse: stats.f_flags & libc::MNT_DONTBROWSE as u32 != 0,
     })
 }
 
@@ -1509,7 +1629,8 @@ mod tests {
         statfs: StatFsSnapshot,
         command_output: HostCommandOutput,
         mountpoints: BTreeMap<PathBuf, MountpointState>,
-        mounted_identifiers: BTreeMap<PathBuf, String>,
+        mounted_volumes: BTreeMap<PathBuf, MountedVolumeEvidence>,
+        invoking_identity: (u32, u32),
         commands: Vec<HostCommand>,
     }
 
@@ -1538,13 +1659,20 @@ mod tests {
             })
         }
 
-        fn mounted_identifier(&mut self, path: &Path) -> Result<String, NativeBootstrapError> {
-            self.mounted_identifiers.get(path).cloned().ok_or_else(|| {
+        fn mounted_volume(
+            &mut self,
+            path: &Path,
+        ) -> Result<MountedVolumeEvidence, NativeBootstrapError> {
+            self.mounted_volumes.get(path).cloned().ok_or_else(|| {
                 NativeBootstrapError::MountEvidenceMismatch {
                     path: path.to_owned(),
-                    identifier: "missing mounted identifier test evidence".to_owned(),
+                    identifier: "missing mounted volume test evidence".to_owned(),
                 }
             })
+        }
+
+        fn invoking_identity(&mut self) -> (u32, u32) {
+            self.invoking_identity
         }
     }
 
@@ -1576,6 +1704,7 @@ mod tests {
                 fs_type: "apfs".to_owned(),
                 mount_source: PathBuf::from("/dev/disk3s5"),
                 mountpoint: PathBuf::from("/System/Volumes/Data"),
+                nobrowse: true,
             },
             command_output: HostCommandOutput {
                 success: true,
@@ -1592,13 +1721,29 @@ mod tests {
                     MountpointState::Missing,
                 ),
             ]),
-            mounted_identifiers: BTreeMap::from([
-                (PathBuf::from("/Users/alice/.cowshed"), "disk3s8".to_owned()),
+            mounted_volumes: BTreeMap::from([
+                (
+                    PathBuf::from("/Users/alice/.cowshed"),
+                    MountedVolumeEvidence {
+                        exact_identifier: "disk3s8".to_owned(),
+                        mountpoint: PathBuf::from("/Users/alice/.cowshed"),
+                        nobrowse: true,
+                        uid: 501,
+                        gid: 20,
+                    },
+                ),
                 (
                     PathBuf::from("/Users/alice/.cowshed/caches"),
-                    "disk3s9".to_owned(),
+                    MountedVolumeEvidence {
+                        exact_identifier: "disk3s9".to_owned(),
+                        mountpoint: PathBuf::from("/Users/alice/.cowshed/caches"),
+                        nobrowse: true,
+                        uid: 501,
+                        gid: 20,
+                    },
                 ),
             ]),
+            invoking_identity: (501, 20),
             commands: Vec::new(),
         }
     }
@@ -1609,7 +1754,7 @@ mod tests {
         Acquire,
         Command { program: String, args: Vec<String> },
         Prepare(PathBuf),
-        AttestMounted(PathBuf, String),
+        AttestMounted(PathBuf, String, bool),
         AttestOwner(PathBuf, u32, u32),
         Marker(PathBuf, Vec<u8>),
         Free,
@@ -1655,10 +1800,16 @@ mod tests {
             Ok(())
         }
 
-        fn attest_mounted(&self, path: &Path, exact_identifier: &str) -> Result<(), HostError> {
+        fn attest_mounted(
+            &self,
+            path: &Path,
+            exact_identifier: &str,
+            require_nobrowse: bool,
+        ) -> Result<(), HostError> {
             self.events.borrow_mut().push(ProvisionEvent::AttestMounted(
                 path.to_owned(),
                 exact_identifier.to_owned(),
+                require_nobrowse,
             ));
             Ok(())
         }
@@ -1761,7 +1912,7 @@ mod tests {
         valid.mountpoints.insert(
             PathBuf::from("/Users/alice/.cowshed"),
             MountpointState::Mounted {
-                marker: Some(marker),
+                marker: Some(marker.clone()),
             },
         );
         let gathered = gather_apfs_evidence(
@@ -1774,6 +1925,88 @@ mod tests {
             gathered.bootstrap,
             BootstrapEvidence::Apfs { store: ExistingStorage::MountedValid { ref exact_identifier }, .. }
                 if exact_identifier == "disk3s8"
+        ));
+
+        let mut wrong_owner = source(inventory.clone());
+        wrong_owner.mountpoints.insert(
+            PathBuf::from("/Users/alice/.cowshed"),
+            MountpointState::Mounted {
+                marker: Some(marker.clone()),
+            },
+        );
+        wrong_owner
+            .mounted_volumes
+            .get_mut(Path::new("/Users/alice/.cowshed"))
+            .unwrap()
+            .uid = 0;
+        let gathered = gather_apfs_evidence(
+            &mut wrong_owner,
+            Path::new("/Users/alice/project"),
+            Path::new("/Users/alice"),
+        )
+        .unwrap();
+        assert!(matches!(
+            gathered.bootstrap,
+            BootstrapEvidence::Apfs {
+                store: ExistingStorage::MountedIncomplete { ref exact_identifier },
+                ..
+            } if exact_identifier == "disk3s8"
+        ));
+
+        let mut wrong_group = source(inventory.clone());
+        wrong_group.mountpoints.insert(
+            PathBuf::from("/Users/alice/.cowshed"),
+            MountpointState::Mounted {
+                marker: Some(marker.clone()),
+            },
+        );
+        wrong_group
+            .mounted_volumes
+            .get_mut(Path::new("/Users/alice/.cowshed"))
+            .unwrap()
+            .gid = 0;
+        let gathered = gather_apfs_evidence(
+            &mut wrong_group,
+            Path::new("/Users/alice/project"),
+            Path::new("/Users/alice"),
+        )
+        .unwrap();
+        assert!(matches!(
+            gathered.bootstrap,
+            BootstrapEvidence::Apfs {
+                store: ExistingStorage::MountedIncomplete { ref exact_identifier },
+                ..
+            } if exact_identifier == "disk3s8"
+        ));
+
+        let mut wrong_flags = source(inventory.clone());
+        wrong_flags.mountpoints.insert(
+            PathBuf::from("/Users/alice/.cowshed"),
+            MountpointState::Mounted {
+                marker: Some(marker.clone()),
+            },
+        );
+        wrong_flags
+            .mounted_volumes
+            .get_mut(Path::new("/Users/alice/.cowshed"))
+            .unwrap()
+            .nobrowse = false;
+        let gathered = gather_apfs_evidence(
+            &mut wrong_flags,
+            Path::new("/Users/alice/project"),
+            Path::new("/Users/alice"),
+        )
+        .unwrap();
+        assert!(matches!(
+            gathered.bootstrap,
+            BootstrapEvidence::Apfs {
+                store: ExistingStorage::MisMountedIncomplete {
+                    ref exact_identifier,
+                    ref current_mountpoint,
+                },
+                ..
+            } if exact_identifier == "disk3s8"
+                && current_mountpoint == Path::new("/Users/alice/.cowshed")
         ));
 
         let mut incomplete = source(inventory.clone());
@@ -1862,22 +2095,39 @@ mod tests {
     }
 
     #[test]
-    fn existing_only_planning_refuses_mismounted_volume_before_mutation_dispatch() {
+    fn mismounted_exact_volume_plans_one_session_repair() {
         let volumes = volume(APFS_STORE_VOLUME, "disk3s8", Some("/Volumes/cowshed-wrong"))
             + &volume("Data", "disk3s5", Some("/System/Volumes/Data"));
         let mut source = source(plist(&container("disk3", &volumes)));
+        source.mounted_volumes.insert(
+            PathBuf::from("/Volumes/cowshed-wrong"),
+            MountedVolumeEvidence {
+                exact_identifier: "disk3s8".to_owned(),
+                mountpoint: PathBuf::from("/Volumes/cowshed-wrong"),
+                nobrowse: false,
+                uid: 0,
+                gid: 0,
+            },
+        );
 
-        assert!(matches!(
-            plan_native_bootstrap(
-                &mut source,
-                Path::new("/Users/alice/project"),
-                Path::new("/Users/alice")
-            ),
-            Err(NativeBootstrapError::InvalidVolumeMountpoint {
-                identifier,
-                mountpoint: Some(path),
-            }) if identifier == "disk3s8" && path == Path::new("/Volumes/cowshed-wrong")
-        ));
+        let plan = plan_native_bootstrap(
+            &mut source,
+            Path::new("/Users/alice/project"),
+            Path::new("/Users/alice"),
+        )
+        .unwrap();
+        assert!(plan.operations().iter().any(|operation| matches!(
+            operation,
+            HostOperation::ProvisionApfsVolumes { volumes, .. }
+                if volumes.iter().any(|volume| matches!(
+                    volume.kind(),
+                    ApfsProvisionKind::RepairMisMounted {
+                        exact_identifier,
+                        current_mountpoint,
+                    } if exact_identifier == "disk3s8"
+                        && current_mountpoint == Path::new("/Volumes/cowshed-wrong")
+                ))
+        )));
         assert_eq!(source.commands.len(), 1);
         assert_eq!(source.commands[0].args(), ["apfs", "list", "-plist"]);
     }
@@ -2160,7 +2410,7 @@ mod tests {
         );
         let mounted = events
             .iter()
-            .position(|event| matches!(event, ProvisionEvent::AttestMounted(_, identifier) if identifier == "disk3s9"))
+            .position(|event| matches!(event, ProvisionEvent::AttestMounted(_, identifier, true) if identifier == "disk3s9"))
             .unwrap();
         let marker = events
             .iter()
@@ -2273,13 +2523,162 @@ mod tests {
             .unwrap();
         let attested = events
             .iter()
-            .position(|event| matches!(event, ProvisionEvent::AttestMounted(_, _)))
+            .position(|event| matches!(event, ProvisionEvent::AttestMounted(_, _, true)))
             .unwrap();
         let marker = events
             .iter()
             .position(|event| matches!(event, ProvisionEvent::Marker(_, _)))
             .unwrap();
         assert!(mount < attested && attested < marker);
+        assert!(matches!(events.first(), Some(ProvisionEvent::Acquire)));
+        assert!(matches!(events.last(), Some(ProvisionEvent::Free)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mismounted_volume_is_unmounted_and_repaired_inside_one_session() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let outputs = VecDeque::from([
+            Ok(HostCommandOutput {
+                success: true,
+                stdout: provision_info(
+                    "disk3s9",
+                    "disk3",
+                    APFS_CACHES_VOLUME,
+                    "/Volumes/cowshed-wrong",
+                ),
+                stderr: Vec::new(),
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                ..HostCommandOutput::default()
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                ..HostCommandOutput::default()
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                stdout: provision_info(
+                    "disk3s9",
+                    "disk3",
+                    APFS_CACHES_VOLUME,
+                    "/Users/alice/.cowshed/caches",
+                ),
+                stderr: Vec::new(),
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                ..HostCommandOutput::default()
+            }),
+        ]);
+        let volume = ApfsVolumeProvision {
+            name: APFS_CACHES_VOLUME,
+            mountpoint: PathBuf::from("/Users/alice/.cowshed/caches"),
+            role: VolumeRole::Caches,
+            kind: ApfsProvisionKind::RepairMisMounted {
+                exact_identifier: "disk3s9".to_owned(),
+                current_mountpoint: PathBuf::from("/Volumes/cowshed-wrong"),
+            },
+        };
+        let acquire_events = Rc::clone(&events);
+        provision_apfs_volumes_with(
+            "disk3",
+            &[volume],
+            504,
+            20,
+            move || {
+                acquire_events.borrow_mut().push(ProvisionEvent::Acquire);
+                Ok(FakePrivilegedSession {
+                    events: Rc::clone(&acquire_events),
+                    outputs,
+                })
+            },
+            &FakeProvisionIo {
+                events: Rc::clone(&events),
+            },
+        )
+        .unwrap();
+
+        let events = events.borrow();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProvisionEvent::Acquire))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProvisionEvent::Free))
+                .count(),
+            1
+        );
+        let commands: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProvisionEvent::Command { program, args } => Some((program, args)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(commands.len(), 5);
+        assert_eq!(commands[0].1.as_slice(), ["info", "-plist", "disk3s9"]);
+        assert_eq!(commands[1].1.as_slice(), ["unmount", "disk3s9"]);
+        assert_eq!(
+            commands[2].1.as_slice(),
+            [
+                "mount",
+                "-nobrowse",
+                "-mountPoint",
+                "/Users/alice/.cowshed/caches",
+                "disk3s9",
+            ]
+        );
+        assert_eq!(commands[3].1.as_slice(), ["info", "-plist", "disk3s9"]);
+        assert_eq!(commands[4].0, CHOWN);
+        assert_eq!(
+            commands[4].1.as_slice(),
+            ["504:20", "/Users/alice/.cowshed/caches"]
+        );
+        let pre_attestation = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ProvisionEvent::AttestMounted(path, identifier, false)
+                        if path == Path::new("/Volumes/cowshed-wrong")
+                            && identifier == "disk3s9"
+                )
+            })
+            .unwrap();
+        let unmount = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ProvisionEvent::Command { args, .. }
+                        if args.first().is_some_and(|arg| arg == "unmount")
+                )
+            })
+            .unwrap();
+        let canonical_attestation = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ProvisionEvent::AttestMounted(path, identifier, true)
+                        if path == Path::new("/Users/alice/.cowshed/caches")
+                            && identifier == "disk3s9"
+                )
+            })
+            .unwrap();
+        let marker = events
+            .iter()
+            .position(|event| matches!(event, ProvisionEvent::Marker(_, _)))
+            .unwrap();
+        assert!(pre_attestation < unmount && unmount < canonical_attestation);
+        assert!(canonical_attestation < marker);
         assert!(matches!(events.first(), Some(ProvisionEvent::Acquire)));
         assert!(matches!(events.last(), Some(ProvisionEvent::Free)));
     }

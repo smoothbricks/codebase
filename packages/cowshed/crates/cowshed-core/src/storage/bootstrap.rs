@@ -524,6 +524,12 @@ pub enum ExistingStorage {
     DetachedIncomplete {
         exact_identifier: String,
     },
+    /// Exact reserved-name cowshed APFS volume mounted at a noncanonical path or without the
+    /// canonical `nobrowse` flag. Only explicit provisioning may unmount and repair it.
+    MisMountedIncomplete {
+        exact_identifier: String,
+        current_mountpoint: PathBuf,
+    },
 }
 
 impl ExistingStorage {
@@ -552,12 +558,25 @@ impl ExistingStorage {
         }
     }
 
+    pub fn mis_mounted_incomplete(
+        exact_identifier: impl Into<String>,
+        current_mountpoint: impl Into<PathBuf>,
+    ) -> Self {
+        Self::MisMountedIncomplete {
+            exact_identifier: exact_identifier.into(),
+            current_mountpoint: current_mountpoint.into(),
+        }
+    }
+
     fn exact_identifier(&self) -> Option<&str> {
         match self {
             Self::Absent => None,
             Self::MountedValid { exact_identifier }
             | Self::MountedIncomplete { exact_identifier }
             | Self::DetachedIncomplete { exact_identifier }
+            | Self::MisMountedIncomplete {
+                exact_identifier, ..
+            }
             | Self::ExistingUnmounted {
                 exact_identifier, ..
             } => Some(exact_identifier),
@@ -584,8 +603,16 @@ pub enum BootstrapEvidence {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApfsProvisionKind {
     Create,
-    RepairMounted { exact_identifier: String },
-    RecoverDetached { exact_identifier: String },
+    RepairMounted {
+        exact_identifier: String,
+    },
+    RecoverDetached {
+        exact_identifier: String,
+    },
+    RepairMisMounted {
+        exact_identifier: String,
+        current_mountpoint: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -719,11 +746,12 @@ fn plan_apfs(
         ExistingStorage::Absent
             | ExistingStorage::MountedIncomplete { .. }
             | ExistingStorage::DetachedIncomplete { .. }
+            | ExistingStorage::MisMountedIncomplete { .. }
     );
     let mut operations = Vec::new();
     let mut volumes = Vec::new();
 
-    if !matches!(store, ExistingStorage::MountedIncomplete { .. }) {
+    if !mounted_but_unpublished_at(store, roots.store()) {
         operations.push(guard(roots.store(), VolumeRole::Store, SubstrateKind::Apfs));
     }
     plan_apfs_volume(
@@ -735,7 +763,7 @@ fn plan_apfs(
         store,
     );
 
-    if !store_is_batched && !matches!(caches, ExistingStorage::MountedIncomplete { .. }) {
+    if !store_is_batched && !mounted_but_unpublished_at(caches, roots.caches()) {
         operations.push(guard(
             roots.caches(),
             VolumeRole::Caches,
@@ -758,6 +786,17 @@ fn plan_apfs(
         });
     }
     Ok(operations)
+}
+
+fn mounted_but_unpublished_at(state: &ExistingStorage, path: &Path) -> bool {
+    matches!(state, ExistingStorage::MountedIncomplete { .. })
+        || matches!(
+            state,
+            ExistingStorage::MisMountedIncomplete {
+                current_mountpoint,
+                ..
+            } if current_mountpoint == path
+        )
 }
 
 fn plan_apfs_volume(
@@ -793,6 +832,20 @@ fn plan_apfs_volume(
                 role,
                 kind: ApfsProvisionKind::RecoverDetached {
                     exact_identifier: exact_identifier.clone(),
+                },
+            });
+        }
+        ExistingStorage::MisMountedIncomplete {
+            exact_identifier,
+            current_mountpoint,
+        } => {
+            volumes.push(ApfsVolumeProvision {
+                name: volume_name,
+                mountpoint: mountpoint.to_owned(),
+                role,
+                kind: ApfsProvisionKind::RepairMisMounted {
+                    exact_identifier: exact_identifier.clone(),
+                    current_mountpoint: current_mountpoint.clone(),
                 },
             });
         }
@@ -939,7 +992,9 @@ fn validate_existing_marker(
 fn validate_zfs_evidence(state: &ExistingStorage, expected: &str) -> Result<(), PlanError> {
     if matches!(
         state,
-        ExistingStorage::MountedIncomplete { .. } | ExistingStorage::DetachedIncomplete { .. }
+        ExistingStorage::MountedIncomplete { .. }
+            | ExistingStorage::DetachedIncomplete { .. }
+            | ExistingStorage::MisMountedIncomplete { .. }
     ) {
         return Err(PlanError::ImpossibleStorageTopology(
             "incomplete APFS provisioning evidence cannot describe a ZFS dataset",
@@ -999,6 +1054,9 @@ fn plan_zfs_mounted_dataset(
             unreachable!("incomplete APFS evidence was rejected for ZFS planning")
         }
         ExistingStorage::DetachedIncomplete { .. } => {
+            unreachable!("incomplete APFS evidence was rejected for ZFS planning")
+        }
+        ExistingStorage::MisMountedIncomplete { .. } => {
             unreachable!("incomplete APFS evidence was rejected for ZFS planning")
         }
     }
