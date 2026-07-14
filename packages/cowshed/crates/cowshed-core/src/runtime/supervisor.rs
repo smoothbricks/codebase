@@ -564,9 +564,21 @@ impl ArtifactSink for ArtifactStoreSink {
     }
 }
 
-struct CommitmentRequest {
-    draft: CommitmentDraft,
-    reply: oneshot::Sender<Result<u64>>,
+enum CommitmentRequest {
+    Publish {
+        draft: CommitmentDraft,
+        reply: oneshot::Sender<Result<u64>>,
+    },
+    EnsureWorkspaceIntroduced {
+        repo_id: RepoId,
+        workspace_incarnation: WorkspaceIncarnation,
+        reply: oneshot::Sender<Result<Option<u64>>>,
+    },
+    EnsureWorkspaceRetired {
+        repo_id: RepoId,
+        workspace_incarnation: WorkspaceIncarnation,
+        reply: oneshot::Sender<Result<Option<u64>>>,
+    },
 }
 
 /// Dedicated repo-wide owner for commitment order and durable publication.
@@ -595,20 +607,66 @@ impl CommitmentPublisher {
         tokio::spawn(async move {
             let mut store = store;
             while let Some(request) = receiver.recv().await {
-                let result = store
-                    .next_order()
-                    .map_err(map_commitment_error)
-                    .and_then(|order| {
-                        store
-                            .publish(request.draft.into_commitment(order))
-                            .map_err(map_commitment_error)?;
-                        Ok(order)
-                    });
-                let _ = request.reply.send(result);
+                match request {
+                    CommitmentRequest::Publish { draft, reply } => {
+                        let _ = reply.send(publish_draft(&mut store, draft));
+                    }
+                    CommitmentRequest::EnsureWorkspaceIntroduced {
+                        repo_id,
+                        workspace_incarnation,
+                        reply,
+                    } => {
+                        let result = if store.workspace_is_retired(&workspace_incarnation) {
+                            Err(CowshedError::integrity(
+                                "active storage fact references a retired workspace incarnation",
+                                "cowshed doctor --json",
+                            ))
+                        } else if store.workspace_is_introduced(&workspace_incarnation) {
+                            Ok(None)
+                        } else {
+                            publish_draft(
+                                &mut store,
+                                CommitmentDraft::WorkspaceIntroduced {
+                                    repo_id,
+                                    workspace_incarnation,
+                                },
+                            )
+                            .map(Some)
+                        };
+                        let _ = reply.send(result);
+                    }
+                    CommitmentRequest::EnsureWorkspaceRetired {
+                        repo_id,
+                        workspace_incarnation,
+                        reply,
+                    } => {
+                        let result = if store.workspace_is_retired(&workspace_incarnation) {
+                            Ok(None)
+                        } else {
+                            publish_draft(
+                                &mut store,
+                                CommitmentDraft::WorkspaceRetired {
+                                    repo_id,
+                                    workspace_incarnation,
+                                },
+                            )
+                            .map(Some)
+                        };
+                        let _ = reply.send(result);
+                    }
+                }
             }
         });
         Ok(CommitmentPublisherHandle { sender })
     }
+}
+
+fn publish_draft(store: &mut CommitmentStore, draft: CommitmentDraft) -> Result<u64> {
+    let order = store.next_order().map_err(map_commitment_error)?;
+    store
+        .publish(draft.into_commitment(order))
+        .map_err(map_commitment_error)?;
+    Ok(order)
 }
 
 #[derive(Clone)]
@@ -624,25 +682,63 @@ impl std::fmt::Debug for CommitmentPublisherHandle {
     }
 }
 
+impl CommitmentPublisherHandle {
+    pub(crate) async fn ensure_workspace_introduced(
+        &mut self,
+        repo_id: RepoId,
+        workspace_incarnation: WorkspaceIncarnation,
+    ) -> Result<Option<u64>> {
+        let (reply, receive) = oneshot::channel();
+        self.send(CommitmentRequest::EnsureWorkspaceIntroduced {
+            repo_id,
+            workspace_incarnation,
+            reply,
+        })
+        .await?;
+        receive_commitment_reply(receive).await
+    }
+
+    pub(crate) async fn ensure_workspace_retired(
+        &mut self,
+        repo_id: RepoId,
+        workspace_incarnation: WorkspaceIncarnation,
+    ) -> Result<Option<u64>> {
+        let (reply, receive) = oneshot::channel();
+        self.send(CommitmentRequest::EnsureWorkspaceRetired {
+            repo_id,
+            workspace_incarnation,
+            reply,
+        })
+        .await?;
+        receive_commitment_reply(receive).await
+    }
+
+    async fn send(&self, request: CommitmentRequest) -> Result<()> {
+        self.sender.send(request).await.map_err(|_| {
+            CowshedError::environment_missing(
+                "repo commitment publisher is unavailable",
+                "reattach the project",
+            )
+        })
+    }
+}
+
+async fn receive_commitment_reply<T>(receive: oneshot::Receiver<Result<T>>) -> Result<T> {
+    receive.await.map_err(|_| {
+        CowshedError::environment_missing(
+            "repo commitment publisher stopped before durable acknowledgement",
+            "reattach the project",
+        )
+    })?
+}
+
 #[async_trait]
 impl CommitmentSink for CommitmentPublisherHandle {
     async fn publish(&mut self, draft: CommitmentDraft) -> Result<u64> {
         let (reply, receive) = oneshot::channel();
-        self.sender
-            .send(CommitmentRequest { draft, reply })
-            .await
-            .map_err(|_| {
-                CowshedError::environment_missing(
-                    "repo commitment publisher is unavailable",
-                    "reattach the project",
-                )
-            })?;
-        receive.await.map_err(|_| {
-            CowshedError::environment_missing(
-                "repo commitment publisher stopped before durable acknowledgement",
-                "reattach the project",
-            )
-        })?
+        self.send(CommitmentRequest::Publish { draft, reply })
+            .await?;
+        receive_commitment_reply(receive).await
     }
 }
 
@@ -2787,4 +2883,55 @@ fn retiring_error() -> CowshedError {
         "workspace supervisor is quiescing or retired",
         "reattach an active workspace before starting work",
     )
+}
+
+#[cfg(test)]
+mod lifecycle_commitment_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn publisher_recovers_lifecycle_idempotently_before_reclaim() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-lifecycle-publisher-{}",
+            Uuid::new_v4().simple()
+        ));
+        let repo_id = RepoId::parse("acme/widget").unwrap();
+        let incarnation = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let store = CommitmentStore::open(&root, repo_id.clone(), [incarnation.clone()]).unwrap();
+        let mut publisher = CommitmentPublisher::start(store, 4).unwrap();
+
+        assert_eq!(
+            publisher
+                .ensure_workspace_introduced(repo_id.clone(), incarnation.clone())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            publisher
+                .ensure_workspace_introduced(repo_id.clone(), incarnation.clone())
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            publisher
+                .ensure_workspace_retired(repo_id.clone(), incarnation.clone())
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            publisher
+                .ensure_workspace_retired(repo_id.clone(), incarnation)
+                .await
+                .unwrap(),
+            None
+        );
+        drop(publisher);
+
+        let reopened = CommitmentStore::open(&root, repo_id, []).unwrap();
+        assert_eq!(reopened.next_order().unwrap(), 3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

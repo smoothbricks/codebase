@@ -1226,6 +1226,7 @@ impl NativeProjectRuntimeHost {
         bootstrap_mode: crate::storage::bootstrap::native::NativeBootstrapMode,
     ) -> Result<Self> {
         use crate::storage::apfs::ApfsExecutionHost;
+        use crate::storage::lifecycle::Substrate;
 
         let git = crate::git::GitRepository::discover(project_root).await?;
         git.ensure_adoptable().await?;
@@ -1286,6 +1287,15 @@ impl NativeProjectRuntimeHost {
         .await
         .map_err(|error| CowshedError::internal(format!("APFS recovery task failed: {error}")))?
         .map_err(native_storage_error)?;
+        let retired_project_root = layout.project().project_root.clone();
+        let retired_repo = repo_id.clone();
+        let retired = crate::storage::lifecycle::dispatch_blocking(move || {
+            native_retired_refs(&retired_project_root, &retired_repo)
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("retired workspace recovery task failed: {error}"))
+        })??;
         let known_incarnations = facts
             .iter()
             .map(|fact| fact.workspace.incarnation().clone())
@@ -1294,14 +1304,32 @@ impl NativeProjectRuntimeHost {
                     .iter()
                     .map(|fact| fact.workspace.incarnation().clone()),
             )
+            .chain(
+                retired
+                    .iter()
+                    .map(|fact| fact.workspace().incarnation().clone()),
+            )
             .collect::<Vec<_>>();
         let telemetry_root = bootstrap.roots().store().join("telemetry");
-        let commitments = super::supervisor::CommitmentPublisher::open(
+        let mut commitments = super::supervisor::CommitmentPublisher::open(
             &telemetry_root,
             repo_id.clone(),
             known_incarnations,
             ROUTER_CAPACITY,
         )?;
+        for retirement in &retired {
+            commitments
+                .ensure_workspace_retired(
+                    repo_id.clone(),
+                    retirement.workspace().incarnation().clone(),
+                )
+                .await?;
+        }
+        for fact in &facts {
+            commitments
+                .ensure_workspace_introduced(repo_id.clone(), fact.workspace.incarnation().clone())
+                .await?;
+        }
         let fence_root = layout.project().project_root.join(".restore-fences");
         for publication in &pending {
             let evidence_path =
@@ -1330,6 +1358,11 @@ impl NativeProjectRuntimeHost {
                     .map_err(native_storage_error)?;
             }
         }
+        let substrate = crate::storage::apfs::ApfsSubstrate::new(config, host);
+        for retirement in retired {
+            // The retirement commitment is durable before any best-effort trash reclamation.
+            let _ = substrate.reclaim(retirement).await;
+        }
         let descriptor = ProjectDescriptor {
             repo_id,
             binding,
@@ -1340,7 +1373,7 @@ impl NativeProjectRuntimeHost {
             descriptor,
             git,
             layout,
-            substrate: crate::storage::apfs::ApfsSubstrate::new(config, host),
+            substrate,
             commitments,
             supervisors: std::collections::BTreeMap::new(),
             sessions: std::collections::BTreeMap::new(),
@@ -1808,6 +1841,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             })
             .await
             .map_err(native_staged_error)?;
+        self.commitments
+            .ensure_workspace_introduced(
+                self.descriptor.repo_id.clone(),
+                receipt.workspace.incarnation().clone(),
+            )
+            .await?;
         let name = receipt.workspace.name().clone();
         self.ensure_supervisor(&name).await?;
         self.snapshot_named(&name).await
@@ -1853,7 +1892,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let host_root = self.descriptor.git_root.clone();
         let start = options.revision.as_ref().map(revision_target);
         let destination = workspace.clone();
-        self.substrate
+        let receipt = self
+            .substrate
             .execute_create_staged(plan, move |stage| async move {
                 crate::git::GitRepository::from_root(&stage.mount_point)
                     .prepare_workspace(&destination.to_string(), &host_root, start.as_deref())
@@ -1861,6 +1901,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             })
             .await
             .map_err(native_staged_error)?;
+        self.commitments
+            .ensure_workspace_introduced(
+                self.descriptor.repo_id.clone(),
+                receipt.workspace.incarnation().clone(),
+            )
+            .await?;
         self.ensure_supervisor(&workspace).await?;
         self.snapshot_named(&workspace).await
     }
@@ -1899,22 +1945,18 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 },
             )
             .map_err(native_integrity_error)?;
-        let mut commitments = self.commitments.clone();
-        let repo_id = self.descriptor.repo_id.clone();
-        let source_incarnation = source_fact.derived.workspace.incarnation().clone();
-        self.substrate
-            .execute_fork_staged(plan, move |stage| async move {
-                commitments
-                    .publish(CommitmentDraft::Fork {
-                        repo_id,
-                        source_incarnation,
-                        destination_incarnation: stage.workspace.incarnation().clone(),
-                    })
-                    .await
-                    .map(|_| ())
-            })
+        let receipt = self
+            .substrate
+            .execute_fork_staged(plan, |_stage| async { Ok::<_, CowshedError>(()) })
             .await
             .map_err(native_staged_error)?;
+        self.commitments
+            .publish(CommitmentDraft::Fork {
+                repo_id: self.descriptor.repo_id.clone(),
+                source_incarnation: source_fact.derived.workspace.incarnation().clone(),
+                destination_incarnation: receipt.workspace.incarnation().clone(),
+            })
+            .await?;
         self.ensure_supervisor(&destination).await?;
         self.snapshot_named(&destination).await
     }
@@ -2144,11 +2186,18 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .substrate
             .plan_retire(&current.derived.workspace)
             .map_err(native_integrity_error)?;
+        let mut commitments = self.commitments.clone();
+        let repo_id = self.descriptor.repo_id.clone();
         let retired = self
             .substrate
-            .execute_retire(plan)
+            .execute_retire_staged(plan, move |retired| async move {
+                commitments
+                    .ensure_workspace_retired(repo_id, retired.workspace().incarnation().clone())
+                    .await
+                    .map(|_| ())
+            })
             .await
-            .map_err(native_storage_error)?;
+            .map_err(native_retire_error)?;
         let substrate = self.substrate.clone();
         std::mem::drop(tokio::spawn(async move {
             // Retirement removed the canonical image from discovery. Reclamation is deliberately
@@ -3320,6 +3369,170 @@ fn supervisor_sandbox(
 }
 
 #[cfg(target_os = "macos")]
+fn native_retired_refs(
+    project_root: &Path,
+    repo_id: &RepoId,
+) -> Result<Vec<crate::storage::lifecycle::RetiredRef>> {
+    use crate::metadata::{
+        DetachedWorkspaceMetadata, ImageFormat, PublicationState, WorkspaceRole,
+    };
+    use crate::storage::lifecycle::{LifecycleWorkspace, RetiredRef, Revision};
+
+    let trash = project_root.join("sessions").join(".trash");
+    let entries = match std::fs::read_dir(&trash) {
+        Ok(entries) => entries
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| {
+                CowshedError::integrity(
+                    format!("cannot enumerate retired workspace trash: {error}"),
+                    "cowshed doctor --json",
+                )
+            })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(CowshedError::integrity(
+                format!("cannot enumerate retired workspace trash: {error}"),
+                "cowshed doctor --json",
+            ));
+        }
+    };
+    let mut images = entries
+        .into_iter()
+        .filter_map(|entry| {
+            ImageFormat::from_image_path(&entry.path())
+                .ok()
+                .map(|format| (entry, format))
+        })
+        .collect::<Vec<_>>();
+    images.sort_by_key(|(entry, _)| entry.file_name());
+
+    let mut retired = Vec::new();
+    retired
+        .try_reserve(images.len())
+        .map_err(|_| CowshedError::internal("cannot reserve retired workspace recovery facts"))?;
+    for (entry, format) in images {
+        let file_type = entry.file_type().map_err(|error| {
+            CowshedError::integrity(
+                format!("cannot inspect retired workspace image: {error}"),
+                "cowshed doctor --json",
+            )
+        })?;
+        if !file_type.is_file() {
+            return Err(CowshedError::integrity(
+                format!(
+                    "retired workspace image is not a regular file: {}",
+                    entry.path().display()
+                ),
+                "cowshed doctor --json",
+            ));
+        }
+        let metadata = DetachedWorkspaceMetadata::read_for_image(&entry.path())
+            .map_err(native_integrity_error)?;
+        if metadata.repo_id != *repo_id
+            || metadata.workspace.is_main()
+            || metadata.image_format != format
+            || metadata.publication_state != PublicationState::Active
+        {
+            return Err(CowshedError::integrity(
+                format!(
+                    "retired workspace metadata identity mismatch: {}",
+                    entry.path().display()
+                ),
+                "cowshed doctor --json",
+            ));
+        }
+        let expected = trash.join(format!(
+            "{}-{}.{}",
+            metadata.workspace.as_str(),
+            metadata.workspace_incarnation.as_str(),
+            format.extension()
+        ));
+        if entry.path() != expected {
+            return Err(CowshedError::integrity(
+                format!(
+                    "retired workspace path disagrees with metadata identity: {}",
+                    entry.path().display()
+                ),
+                "cowshed doctor --json",
+            ));
+        }
+        let revision = Revision::new(metadata.grants.revision);
+        let workspace = LifecycleWorkspace::new(
+            metadata.repo_id,
+            metadata.workspace,
+            metadata.workspace_incarnation,
+            revision,
+            revision,
+            WorkspaceRole::Workspace,
+            format,
+        )
+        .map_err(native_integrity_error)?;
+        let resulting_revision = revision
+            .get()
+            .checked_add(1)
+            .map(Revision::new)
+            .ok_or_else(|| {
+                CowshedError::integrity(
+                    "retired workspace revision overflow",
+                    "cowshed doctor --json",
+                )
+            })?;
+        retired.push(RetiredRef::new(workspace, resulting_revision));
+    }
+    Ok(retired)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod retired_recovery_tests {
+    use super::*;
+    use crate::metadata::{
+        DetachedWorkspaceMetadata, GrantSet, ImageFormat, METADATA_VERSION, Platform, PortBlock,
+        PublicationState,
+    };
+
+    #[test]
+    fn retired_trash_is_a_verified_restart_baseline_fact() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-retired-recovery-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let project_root = root.join("acme/widget");
+        let trash = project_root.join("sessions/.trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        let repo_id = RepoId::parse("acme/widget").unwrap();
+        let incarnation = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let image = trash.join(format!("raven-{}.asif", incarnation.as_str()));
+        std::fs::write(&image, b"retired image").unwrap();
+        let mut grants =
+            GrantSet::closed_baseline(Some(PortBlock::new(49_152, 16).unwrap())).unwrap();
+        grants.revision = 4;
+        DetachedWorkspaceMetadata {
+            version: METADATA_VERSION,
+            repo_id: repo_id.clone(),
+            workspace: WorkspaceName::new("raven").unwrap(),
+            workspace_incarnation: incarnation.clone(),
+            image_format: ImageFormat::Asif,
+            platform: Platform::Macos,
+            publication_state: PublicationState::Active,
+            updated_at: "2026-07-14T00:00:00Z".into(),
+            grants,
+            info_snapshot: None,
+        }
+        .write_for_image(&image)
+        .unwrap();
+
+        let retired = native_retired_refs(&project_root, &repo_id).unwrap();
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].workspace().incarnation(), &incarnation);
+        assert_eq!(
+            retired[0].resulting_revision(),
+            crate::storage::lifecycle::Revision::new(5)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RestoreFenceEvidence {
@@ -3346,6 +3559,16 @@ fn native_staged_error(
             format!("{initializer}; cleanup also failed: {cleanup}"),
             "cowshed doctor --json",
         ),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn native_retire_error(
+    error: crate::storage::apfs::RetireExecutionError<CowshedError>,
+) -> CowshedError {
+    match error {
+        crate::storage::apfs::RetireExecutionError::Storage(error) => native_storage_error(error),
+        crate::storage::apfs::RetireExecutionError::Fence { source, .. } => source,
     }
 }
 

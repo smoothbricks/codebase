@@ -194,6 +194,20 @@ pub enum RestoreExecutionError<P, F> {
     },
 }
 
+#[derive(Debug, Error)]
+pub enum RetireExecutionError<F> {
+    #[error("workspace retirement failed: {0}")]
+    Storage(#[source] ApfsStorageError),
+    #[error("workspace retired but durable lifecycle publication failed: {source}")]
+    Fence { source: F, retired: RetiredRef },
+}
+
+impl<F> From<ApfsStorageError> for RetireExecutionError<F> {
+    fn from(error: ApfsStorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
 impl<P, F> From<ApfsStorageError> for RestoreExecutionError<P, F> {
     fn from(error: ApfsStorageError) -> Self {
         Self::Storage(error)
@@ -960,6 +974,31 @@ where
         }
         Ok(pending.receipt)
     }
+    /// Make a workspace durably undiscoverable, then publish its retirement before reclamation.
+    ///
+    /// A callback failure is forward-only: the returned retired reference names the preserved
+    /// trash image, allowing the caller or startup recovery to retry lifecycle publication before
+    /// idempotent reclamation.
+    pub async fn execute_retire_staged<F, Fut, E>(
+        &self,
+        plan: RetirePlan,
+        fence: F,
+    ) -> Result<RetiredRef, RetireExecutionError<E>>
+    where
+        F: FnOnce(RetiredRef) -> Fut + Send,
+        Fut: Future<Output = Result<(), E>> + Send,
+        E: Send,
+    {
+        let retired = match self.execute(&plan).await? {
+            Applied::Retired(retired) => retired,
+            _ => return Err(ApfsStorageError::UnexpectedResult.into()),
+        };
+        if let Err(source) = fence(retired.clone()).await {
+            return Err(RetireExecutionError::Fence { source, retired });
+        }
+        Ok(retired)
+    }
+
     async fn execute<P: ImmutablePlan>(&self, plan: &P) -> Result<Applied, ApfsStorageError> {
         let backend = CheckedApfsBackend {
             host: Arc::clone(&self.host),

@@ -3613,6 +3613,10 @@ impl CommitmentPriorContext {
         self.last_order
     }
 
+    pub(crate) fn is_introduced(&self, incarnation: &WorkspaceIncarnation) -> bool {
+        self.introduced_incarnations.contains(incarnation)
+    }
+
     pub(crate) fn is_retired(&self, incarnation: &WorkspaceIncarnation) -> bool {
         self.retired_incarnations.contains(incarnation)
     }
@@ -3657,8 +3661,9 @@ pub fn validate_commitments(
                 {
                     return Err(ArtifactError::Integrity {
                         offset: 0,
-                        message: "workspace incarnation is introduced more than once or after retirement"
-                            .into(),
+                        message:
+                            "workspace incarnation is introduced more than once or after retirement"
+                                .into(),
                     });
                 }
                 context
@@ -3678,7 +3683,8 @@ pub fn validate_commitments(
                 {
                     return Err(ArtifactError::Integrity {
                         offset: 0,
-                        message: "workspace retirement has no active source or is duplicated".into(),
+                        message: "workspace retirement has no active source or is duplicated"
+                            .into(),
                     });
                 }
                 context

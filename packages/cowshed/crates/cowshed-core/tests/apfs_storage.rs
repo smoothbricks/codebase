@@ -15,7 +15,7 @@ use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
     AdoptExecutionError, ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate,
     ApfsSubstrateConfig, IncarnationSource, LockMode, MarkerExpectation, MetadataPolicy,
-    PublicationError, RestoreStage, volume_name,
+    PublicationError, RestoreStage, RetireExecutionError, volume_name,
 };
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, CheckpointFact, Destination, ExpectedState, KernelMountFact, LifecyclePlanner,
@@ -1415,6 +1415,41 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
         .expect("unmount");
     assert_eq!(host.events(), ["lock:1", "detach-mounted:false"]);
 }
+#[tokio::test]
+async fn staged_retire_fences_after_durable_undiscovery_and_preserves_trash_on_failure() {
+    let host = FakeHost::default();
+    let current = workspace("raven", ImageFormat::Asif, 4);
+    host.seed(&current);
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let plan = substrate.plan_retire(&current).expect("retire plan");
+    let callback_host = host.clone();
+
+    let error = substrate
+        .execute_retire_staged(plan, move |retired| async move {
+            assert_eq!(retired.workspace().name().as_str(), "raven");
+            assert!(
+                callback_host
+                    .events()
+                    .contains(&"atomic-retire-to-trash".to_owned()),
+                "retirement must be durable before its lifecycle fence"
+            );
+            Err::<(), _>("injected commitment failure")
+        })
+        .await
+        .expect_err("fence failure must preserve a recoverable retired reference");
+    let RetireExecutionError::Fence { source, retired } = error else {
+        panic!("expected forward-only retirement fence failure");
+    };
+    assert_eq!(source, "injected commitment failure");
+    assert!(
+        !host.events().contains(&"idempotent-reclaim".to_owned()),
+        "fence failure must not reclaim unpublished retirement trash"
+    );
+
+    substrate.reclaim(retired).await.expect("recovery reclaim");
+    assert!(host.events().contains(&"idempotent-reclaim".to_owned()));
+}
+
 #[tokio::test]
 async fn retire_reclaim_stats_and_gc_cross_only_the_blocking_lane() {
     let host = FakeHost::default();
