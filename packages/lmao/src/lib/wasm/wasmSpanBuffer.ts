@@ -21,7 +21,12 @@ import type { SpanBufferStats } from '../spanBufferStats.js';
 import type { ITraceRoot } from '../traceRoot.js';
 import type { SpanBuffer } from '../types.js';
 import { getVocabularyGeneration, type VocabularyGeneration } from '../vocabularyRegistry.js';
-import type { WasmAllocator } from './wasmAllocator.js';
+import {
+  WASM_NO_LAYOUT_OFFSET,
+  WASM_SPAN_IDENTITY_CHILD,
+  WASM_SPAN_IDENTITY_ROOT,
+  type WasmAllocator,
+} from './wasmAllocator.js';
 import {
   getWasmPhysicalLayout,
   type WasmNumericFamily,
@@ -49,6 +54,8 @@ export interface WasmBufferDescriptor {
   readonly kind: WasmIdentityMode;
   state: WasmBufferState;
   readonly layout: WasmPhysicalLayoutDescriptor;
+  readonly allocationPtr: number;
+  readonly allocationByteLength: number;
   readonly systemPtr: number;
   readonly familyPtrs: Readonly<Record<WasmNumericFamily, number>>;
   readonly identityPtr: number;
@@ -92,6 +99,9 @@ export type WasmSpanBufferInstance<T extends LogSchema = LogSchema> = SpanBuffer
   // ===========================================================================
   /** Byte offset into WASM memory for system columns (timestamp + entry_type) */
   readonly _systemPtr: number;
+  /** Owning root/child/overflow superblock returned by the allocator. */
+  readonly _allocationPtr: number;
+  readonly _allocationByteLength: number;
   /** Byte offset into WASM memory for identity block (writeIndex, span_id, trace_id) */
   readonly _identityPtr: number;
   /** Array of byte offsets for each column (-1 = not allocated) */
@@ -421,19 +431,12 @@ function wasmGetMessagePhysicalLayout(this: WasmSpanBufferInstance): MessagePhys
   return getWasmSpanBufferConstructor(this).messagePhysicalLayout;
 }
 
-/** Free each owned WASM block exactly once. */
+/** Free the one owned root/child/overflow superblock exactly once. */
 function wasmFree(this: WasmSpanBufferInstance): void {
   if (this._descriptor.state === 'freed') return;
   if (this._viewVersion !== 0) this._sealStats();
 
-  for (const family of ['u8', 'u32', 'f64'] as const) {
-    const slab = this._layout.slabs[family];
-    if (slab !== null) this._allocator.freeExact(this._familyPtrs[family], slab.byteLength, slab.alignment);
-  }
-  this._allocator.freeExact(this._systemPtr, this._layout.system.byteLength, this._layout.system.alignment);
-  if (this._identityOwner) {
-    this._allocator.freeIdentity(this._identityPtr);
-  }
+  this._allocator.freeSpanSuperblock(this._allocationPtr, this._allocationByteLength);
   this._descriptor.state = 'freed';
 }
 
@@ -817,27 +820,6 @@ class WasmSpanBuffer {
     this._topologyGeneration = 0;
     this._overflow = null;
     this._overflowWriteIndex = 0;
-
-    const identityMode = opts._identityMode ?? 'root';
-    this._identityOwner = identityMode !== 'overflow';
-    this._identitySource = identityMode === 'overflow' ? opts._identitySource : undefined;
-    if (identityMode === 'overflow') {
-      if (!this._identitySource) throw new Error('Overflow buffer requires an identity owner');
-      this._identityPtr = this._identitySource._identityPtr;
-    } else if (identityMode === 'child') {
-      this._identityPtr = opts.allocator.allocIdentityChild();
-    } else {
-      const traceIdBytes = opts._traceRoot._traceIdBytes;
-      const packed = opts.allocator.allocIdentityRootForJsWrite(traceIdBytes.length);
-      this._identityPtr = Number(packed >> 32n);
-      const traceIdOffset = Number(packed & 0xFFFFFFFFn);
-      if (this._identityPtr !== 0) opts.allocator.u8.set(traceIdBytes, traceIdOffset);
-    }
-    if (this._identityPtr === 0) throw new Error('WASM identity allocation failed');
-    this._threadId =
-      (BigInt(opts.allocator.getThreadIdHigh() >>> 0) << 32n) | BigInt(opts.allocator.getThreadIdLow() >>> 0);
-    this._spanId = this._identitySource?.span_id ?? opts.allocator.readIdentitySpanId(this._identityPtr);
-
     this._layout = opts._layout;
     if (this._layout.messageLayoutFamily !== '${messageLayoutFamily}') {
       throw new TypeError('WASM layout descriptor does not match its generated message family');
@@ -845,44 +827,6 @@ class WasmSpanBuffer {
     if (this._layout.messagePhysicalLayout !== '${messagePhysicalLayout}') {
       throw new TypeError('WASM layout descriptor does not match its generated physical layout');
     }
-    this._columnPtrs = new Int32Array(${columnMeta.length}).fill(-1);
-    const familyPtrs = { u8: 0, u32: 0, f64: 0 };
-    this._systemPtr = opts.allocator.allocExact(this._layout.system.byteLength, this._layout.system.alignment);
-    if (this._systemPtr === 0) {
-      if (this._identityOwner) opts.allocator.freeIdentity(this._identityPtr);
-      throw new Error('WASM exact system-slab allocation failed');
-    }
-    for (const family of ['u8', 'u32', 'f64']) {
-      const slab = this._layout.slabs[family];
-      if (slab === null) continue;
-      familyPtrs[family] = opts.allocator.allocExact(slab.byteLength, slab.alignment);
-      if (familyPtrs[family] === 0) {
-        for (const allocatedFamily of ['u8', 'u32', 'f64']) {
-          const allocatedSlab = this._layout.slabs[allocatedFamily];
-          if (allocatedSlab !== null && familyPtrs[allocatedFamily] !== 0) {
-            opts.allocator.freeExact(familyPtrs[allocatedFamily], allocatedSlab.byteLength, allocatedSlab.alignment);
-          }
-        }
-        opts.allocator.freeExact(this._systemPtr, this._layout.system.byteLength, this._layout.system.alignment);
-        if (this._identityOwner) opts.allocator.freeIdentity(this._identityPtr);
-        throw new Error('WASM exact column-family slab allocation failed');
-      }
-    }
-    this._familyPtrs = Object.freeze(familyPtrs);
-    this._viewVersion = 0;
-
-    this._descriptor = {
-      generation: opts._generation ?? 0,
-      kind: identityMode,
-      state: 'live',
-      layout: this._layout,
-      systemPtr: this._systemPtr,
-      familyPtrs: this._familyPtrs,
-      identityPtr: this._identityPtr,
-      ownsIdentity: this._identityOwner,
-      memoryVersion: 0,
-      parent: opts._parent?._descriptor,
-    };
 
     this._traceRoot = opts._traceRoot;
     this._scopeValues = opts._scopeValues;
@@ -891,26 +835,80 @@ class WasmSpanBuffer {
     this._vocabularyGeneration = opts._vocabularyGeneration;
     this._statsSealed = false;
     this._statsReservedRows = 2;
+    this._columnPtrs = new Int32Array(${columnMeta.length}).fill(-1);
+    ${
+      messageLayoutFamily === 'static-only'
+        ? `this._spanName = undefined;
+    this._terminalMessage = undefined;`
+        : messageLayoutFamily === 'dynamic-only'
+          ? `this._spanName = undefined;
+    this._message = new Array(opts.capacity);`
+          : 'this._message = new Array(opts.capacity);'
+    }
+    ${generateColumnInit(columnMeta)}
+
+    const identityMode = opts._identityMode ?? 'root';
+    this._identityOwner = identityMode !== 'overflow';
+    this._identitySource = identityMode === 'overflow' ? opts._identitySource : undefined;
+    const superblock = this._identityOwner ? this._layout.spanSuperblock : this._layout.overflowSuperblock;
+    this._allocationByteLength = superblock.byteLength;
+    if (identityMode === 'overflow') {
+      if (!this._identitySource) throw new Error('Overflow buffer requires an identity owner');
+      this._allocationPtr = opts.allocator.createOverflowSpan(superblock.byteLength);
+      this._identityPtr = this._identitySource._identityPtr;
+    } else {
+      const traceRootPtr = opts._traceRoot._traceRootPtr;
+      if (!Number.isInteger(traceRootPtr) || traceRootPtr <= 0) {
+        throw new TypeError('WASM span requires a live WasmTraceRoot');
+      }
+      const traceIdBytes = identityMode === 'root' ? opts._traceRoot._traceIdBytes : undefined;
+      this._allocationPtr = opts.allocator.createAndStartSpan(
+        identityMode === 'child' ? ${WASM_SPAN_IDENTITY_CHILD} : ${WASM_SPAN_IDENTITY_ROOT},
+        traceIdBytes?.length ?? 0,
+        superblock.byteLength,
+        superblock.systemOffset,
+        this._layout.system.entryTypeOffset ?? ${WASM_NO_LAYOUT_OFFSET},
+        this._layout.system.rowHeaderOffset ?? ${WASM_NO_LAYOUT_OFFSET},
+        traceRootPtr,
+      );
+      this._identityPtr = this._allocationPtr;
+      if (this._allocationPtr !== 0 && traceIdBytes !== undefined) {
+        opts.allocator.u8.set(traceIdBytes, this._identityPtr + 9);
+      }
+    }
+    if (this._allocationPtr === 0) throw new Error('WASM span superblock allocation failed');
+
+    this._systemPtr = this._allocationPtr + superblock.systemOffset;
+    const familyPtrs = { u8: 0, u32: 0, f64: 0 };
+    for (const family of ['u8', 'u32', 'f64']) {
+      const familyOffset = superblock.familyOffsets[family];
+      if (familyOffset !== 0) familyPtrs[family] = this._allocationPtr + familyOffset;
+    }
+    this._familyPtrs = Object.freeze(familyPtrs);
+    const allocatorWords = opts.allocator.u32;
+    this._threadId =
+      this._identitySource?.thread_id ?? ((BigInt(allocatorWords[7]) << 32n) | BigInt(allocatorWords[6]));
+    this._spanId = this._identitySource?.span_id ?? allocatorWords[(this._identityPtr + 4) >>> 2];
+    this._viewVersion = 0;
+    this._spanStartedAtAllocation = this._identityOwner;
+
+    this._descriptor = {
+      generation: opts._generation ?? 0,
+      kind: identityMode,
+      state: 'live',
+      layout: this._layout,
+      allocationPtr: this._allocationPtr,
+      allocationByteLength: this._allocationByteLength,
+      systemPtr: this._systemPtr,
+      familyPtrs: this._familyPtrs,
+      identityPtr: this._identityPtr,
+      ownsIdentity: this._identityOwner,
+      memoryVersion: 0,
+      parent: opts._parent?._descriptor,
+    };
 
     try {
-      ${
-        messageLayoutFamily === 'static-only'
-          ? `this._spanName = undefined;
-      this._terminalMessage = undefined;`
-          : messageLayoutFamily === 'dynamic-only'
-            ? `this._spanName = undefined;
-      this._message = new Array(opts.capacity);`
-            : 'this._message = new Array(opts.capacity);'
-      }
-      ${generateColumnInit(columnMeta)}
       this._refreshViews(this._allocator.refreshViews());
-      ${
-        messagePhysicalLayout === 'packed'
-          ? 'this._rowHeaders.fill(0);'
-          : messagePhysicalLayout === 'specialized' && messageLayoutFamily !== 'dynamic-only'
-            ? 'this._logHeaders.fill(0);'
-            : ''
-      }
     } catch (error) {
       this.free();
       throw error;

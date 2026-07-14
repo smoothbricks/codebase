@@ -10,7 +10,7 @@
 //! bump-allocated neighbors.
 
 use lmao_arena::raw::{self};
-use lmao_arena::{Arena, SizeClass, block_size};
+use lmao_arena::{Arena, Mem, SizeClass, block_size};
 use proptest::prelude::*;
 
 fn size_class_strategy() -> impl Strategy<Value = SizeClass> {
@@ -357,4 +357,115 @@ fn recycled_column_clears_validity_and_value_bytes() {
     assert_eq!(recycled, column, "test must exercise the recycled block");
     assert_eq!(raw::read_col_is_valid(arena.mem(), recycled, row), 0);
     assert_eq!(raw::read_col_f64(arena.mem(), recycled, row, capacity), 0.0);
+}
+
+#[test]
+fn packed_root_span_allocates_and_initializes_in_one_operation() {
+    const CAPACITY: u32 = 64;
+    const SUPERBLOCK_BYTES: u32 = 1024;
+    const SYSTEM_OFFSET: u32 = 128;
+    const ENTRY_TYPE_OFFSET: u32 = CAPACITY * 8;
+
+    let mut arena = Arena::new(1 << 20);
+    raw::set_thread_id(arena.mem_mut(), 0, 42);
+    let trace_root = raw::alloc_exact(arena.mem_mut(), 32, 8);
+    raw::init_trace_root(arena.mem_mut(), trace_root, 1_000.0, 10.0);
+    let allocations_before = arena.alloc_count();
+
+    let span = raw::create_and_start_span(
+        arena.mem_mut(),
+        raw::SPAN_IDENTITY_ROOT,
+        16,
+        raw::SpanLayout {
+            superblock_byte_len: SUPERBLOCK_BYTES,
+            system_offset: SYSTEM_OFFSET,
+            entry_type_offset: ENTRY_TYPE_OFFSET,
+            row_header_offset: raw::NO_LAYOUT_OFFSET,
+        },
+        trace_root,
+        12.0,
+    );
+
+    assert_ne!(span, 0);
+    assert_eq!(arena.alloc_count() - allocations_before, 1);
+    assert_eq!(raw::read_identity_span_id(arena.mem(), span), 1);
+    assert_eq!(raw::read_identity_trace_id_len(arena.mem(), span), 16);
+    assert_eq!(raw::read_write_index(arena.mem(), span), 2);
+    let system = span + SYSTEM_OFFSET;
+    assert_eq!(raw::read_timestamp(arena.mem(), system, 0), 1_002_000_000);
+    assert_eq!(
+        raw::read_entry_type(arena.mem(), system, 0, CAPACITY),
+        raw::ENTRY_TYPE_SPAN_START
+    );
+    assert_eq!(
+        raw::read_entry_type(arena.mem(), system, 1, CAPACITY),
+        raw::ENTRY_TYPE_SPAN_EXCEPTION
+    );
+    assert_eq!(raw::read_timestamp(arena.mem(), system, 1), 0);
+
+    raw::free_exact(arena.mem_mut(), span, SUPERBLOCK_BYTES, 8);
+    assert_eq!(arena.free_count(), 1);
+    let recycled = raw::create_overflow_span(arena.mem_mut(), SUPERBLOCK_BYTES);
+    assert_eq!(recycled, span);
+}
+
+#[test]
+fn packed_child_and_overflow_validate_layout_and_clear_recycled_bytes() {
+    const SUPERBLOCK_BYTES: u32 = 256;
+    const SYSTEM_OFFSET: u32 = 128;
+    const ROW_HEADER_OFFSET: u32 = 64;
+
+    let mut arena = Arena::new(1 << 20);
+    let trace_root = raw::alloc_exact(arena.mem_mut(), 32, 8);
+    raw::init_trace_root(arena.mem_mut(), trace_root, 2_000.0, 20.0);
+    let allocations_before_invalid = arena.alloc_count();
+    let invalid = raw::create_and_start_span(
+        arena.mem_mut(),
+        raw::SPAN_IDENTITY_CHILD,
+        0,
+        raw::SpanLayout {
+            superblock_byte_len: SYSTEM_OFFSET,
+            system_offset: SYSTEM_OFFSET,
+            entry_type_offset: raw::NO_LAYOUT_OFFSET,
+            row_header_offset: ROW_HEADER_OFFSET,
+        },
+        trace_root,
+        21.0,
+    );
+    assert_eq!(invalid, 0);
+    assert_eq!(arena.alloc_count(), allocations_before_invalid);
+
+    let child = raw::create_and_start_span(
+        arena.mem_mut(),
+        raw::SPAN_IDENTITY_CHILD,
+        0,
+        raw::SpanLayout {
+            superblock_byte_len: SUPERBLOCK_BYTES,
+            system_offset: SYSTEM_OFFSET,
+            entry_type_offset: raw::NO_LAYOUT_OFFSET,
+            row_header_offset: ROW_HEADER_OFFSET,
+        },
+        trace_root,
+        21.0,
+    );
+    assert_ne!(child, 0);
+    assert_eq!(raw::read_identity_trace_id_len(arena.mem(), child), 0);
+    assert_eq!(
+        arena
+            .mem()
+            .read_u32(child + SYSTEM_OFFSET + ROW_HEADER_OFFSET),
+        u32::from(raw::ENTRY_TYPE_SPAN_START)
+    );
+    assert_eq!(
+        arena
+            .mem()
+            .read_u32(child + SYSTEM_OFFSET + ROW_HEADER_OFFSET + 4),
+        u32::from(raw::ENTRY_TYPE_SPAN_EXCEPTION)
+    );
+
+    raw::free_exact(arena.mem_mut(), child, SUPERBLOCK_BYTES, 8);
+    arena.mem_mut().write_u8(child + SUPERBLOCK_BYTES - 1, 0xff);
+    let overflow = raw::create_overflow_span(arena.mem_mut(), SUPERBLOCK_BYTES);
+    assert_eq!(overflow, child);
+    assert_eq!(arena.mem().read_u8(overflow + SUPERBLOCK_BYTES - 1), 0);
 }

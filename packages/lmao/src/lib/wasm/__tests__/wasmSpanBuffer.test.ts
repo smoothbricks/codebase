@@ -8,6 +8,7 @@ import { resolveEntryType, resolveMessage } from '../../resolveMessage.js';
 import { RUNTIME_HINT_ANALYZED_VALID, RUNTIME_HINT_RESULT, RUNTIME_HINT_TAG } from '../../runtimeHint.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
+import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from '../../schema/systemSchema.js';
 import { createSpanBuffer, EMPTY_SCOPE } from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
 import { iterateSpanChildren, NO_NODE } from '../../traceTopology.js';
@@ -154,6 +155,15 @@ describe('WasmSpanBuffer', () => {
           expect(layout.system.rowHeaderOffset).toBeNull();
           expect(layout.system.byteLength).toBe(expectedByteLength);
 
+          expect(Object.isFrozen(layout.spanSuperblock)).toBe(true);
+          expect(Object.isFrozen(layout.overflowSuperblock)).toBe(true);
+          expect(layout.spanSuperblock.identityOffset).toBe(0);
+          expect(layout.overflowSuperblock.identityOffset).toBeNull();
+          expect(layout.spanSuperblock.systemOffset % layout.system.alignment).toBe(0);
+          expect(layout.overflowSuperblock.systemOffset % layout.system.alignment).toBe(0);
+          expect(layout.spanSuperblock.byteLength).toBeLessThanOrEqual(layout.spanSuperblock.legacyByteLength);
+          expect(layout.overflowSuperblock.byteLength).toBeLessThanOrEqual(layout.overflowSuperblock.legacyByteLength);
+
           for (const family of ['u8', 'u32', 'f64'] as const) {
             const slab = layout.slabs[family];
             const columns = layout.columns.filter((column) => column.family === family);
@@ -184,13 +194,16 @@ describe('WasmSpanBuffer', () => {
       );
     });
 
-    it('allocates one exact slab per numeric family and no blocks on numeric writes', () => {
+    it('allocates one packed superblock and no further blocks on numeric writes', () => {
       const allocsBefore = allocator.getAllocCount();
       const buffer = createTestWasmBuffer();
-      const allocatedSlabs = Object.values(buffer._layout.slabs).filter((slab) => slab !== null).length;
-      expect(allocator.getAllocCount() - allocsBefore).toBe(2 + allocatedSlabs); // identity + system + families
+      expect(allocator.getAllocCount() - allocsBefore).toBe(1);
+      expect(buffer._allocationPtr).toBe(buffer._identityPtr);
+      expect(buffer._systemPtr).toBe(buffer._allocationPtr + buffer._layout.spanSuperblock.systemOffset);
+      expect(buffer._allocationByteLength).toBe(buffer._layout.spanSuperblock.byteLength);
 
       const ranges: Array<readonly [number, number]> = [
+        [buffer._identityPtr, buffer._identityPtr + 128],
         [buffer._systemPtr, buffer._systemPtr + buffer._layout.system.byteLength],
       ];
       for (const family of ['u8', 'u32', 'f64'] as const) {
@@ -199,6 +212,7 @@ describe('WasmSpanBuffer', () => {
         const start = buffer._familyPtrs[family];
         const end = start + slab.byteLength;
         expect(start % slab.alignment).toBe(0);
+        expect(start).toBe(buffer._allocationPtr + buffer._layout.spanSuperblock.familyOffsets[family]);
         for (const [otherStart, otherEnd] of ranges) {
           expect(end <= otherStart || start >= otherEnd).toBe(true);
         }
@@ -209,7 +223,7 @@ describe('WasmSpanBuffer', () => {
       const isAdmin = getMethod<[idx: number, val: boolean], WasmSpanBufferInstance>(buffer, 'isAdmin');
       count(3, 42);
       isAdmin(4, true);
-      expect(allocator.getAllocCount() - allocsBefore).toBe(2 + allocatedSlabs);
+      expect(allocator.getAllocCount() - allocsBefore).toBe(1);
     });
   });
 
@@ -223,6 +237,27 @@ describe('WasmSpanBuffer', () => {
       expect(buffer.parent_thread_id).toBe(0n);
       expect(buffer.parent_span_id).toBe(0);
       expect(buffer._hasParent).toBe(false);
+    });
+
+    it('consumes native lifecycle initialization without restamping row 0', () => {
+      const buffer = createTestWasmBuffer();
+      const entryTypes = buffer.entry_type;
+      if (entryTypes === undefined) throw new Error('missing entry types');
+
+      expect(buffer._spanStartedAtAllocation).toBe(true);
+      expect(buffer._writeIndex).toBe(2);
+      expect(entryTypes[0]).toBe(ENTRY_TYPE_SPAN_START);
+      expect(entryTypes[1]).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
+      buffer.timestamp[0] = 123_456_789n;
+
+      traceRoot.writeSpanStart(buffer, 'prestarted-span');
+
+      expect(buffer._spanStartedAtAllocation).toBe(false);
+      expect(buffer.timestamp[0]).toBe(123_456_789n);
+      const messages = buffer.message_values;
+      if (messages === undefined) throw new Error('missing messages');
+      expect(messages[0]).toBe('prestarted-span');
+      expect(buffer._writeIndex).toBe(2);
     });
 
     it('creates instance with parent identity via child buffer', () => {
@@ -614,14 +649,13 @@ describe('WasmSpanBuffer', () => {
   });
 
   describe('free()', () => {
-    it('releases each owned exact slab and identity once', () => {
+    it('releases its owned superblock once', () => {
       const buffer = createTestWasmBuffer();
-      const ownedSlabs = Object.values(buffer._layout.slabs).filter((slab) => slab !== null).length;
       const freesBefore = allocator.getFreeCount();
 
       buffer.free();
 
-      expect(allocator.getFreeCount() - freesBefore).toBe(2 + ownedSlabs); // identity + system + families
+      expect(allocator.getFreeCount() - freesBefore).toBe(1);
       expect(buffer._descriptor.state).toBe('freed');
     });
 
@@ -680,6 +714,7 @@ describe('WasmSpanBuffer', () => {
       allocator.setThreadId(0, 1); // thread_id = 1n
 
       const buffer = createTestWasmBuffer();
+      const allocsBefore = allocator.getAllocCount();
 
       const overflow = createWasmOverflowBuffer(
         buffer,
@@ -688,6 +723,7 @@ describe('WasmSpanBuffer', () => {
         createTestOpMetadata(),
         createTestOpMetadata(),
       );
+      expect(allocator.getAllocCount() - allocsBefore).toBe(1);
 
       expect(buffer._overflow).toBe(overflow);
       expect(overflow._parent).toBe(buffer._parent); // Same parent (null for root)
