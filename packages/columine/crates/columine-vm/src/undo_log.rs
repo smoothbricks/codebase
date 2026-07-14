@@ -50,6 +50,10 @@ pub enum FlatUndoOp {
     /// (prev_value low + key high) — 16-byte SCALAR slot. Post-parity
     /// extension: the frozen Zig ABI never journaled scalar writes.
     ScalarUpdate = 14,
+    /// Restore `pad1` (1..=8) raw bytes at absolute state offset `key` from
+    /// `aux`'s little-endian bytes. Used as paired before/after entries for
+    /// nested arenas and variable payloads without widening this 24-byte ABI.
+    StateBytes = 15,
     /// Rollback a single struct-map scalar field to a captured (bit, bytes)
     /// state, or remove a newly-created row (vm.zig:157 doc: slot = dest
     /// slot; key = row key; `_pad1` = field_idx; `_pad2` = SMF flags; aux =
@@ -72,26 +76,26 @@ pub const SMR_ROW_ABSENT: u8 = 0x02;
 /// vm.zig:193 `FlatUndoEntry` (`extern struct`) — one serialized undo/redo
 /// entry. C layout: op@0, slot@1, _pad1@2, _pad2@3, key@4, prev_value@8,
 /// four implicit padding bytes (aux is u64-aligned), aux@16; size 24.
-/// `_pad1`/`_pad2` are real data for STRUCT_MAP_* (field_idx/flags) and
-/// FACT_* (`fact_idx` little-endian) ops; both bytes remain in the pinned ABI.
+/// `_pad1`/`_pad2` are real data for STRUCT_MAP_* (field_idx/flags),
+/// FACT_* (`fact_idx` little-endian), and STATE_BYTES (length) ops.
 /// Following crate convention the struct is plain Rust; the byte contract
 /// lives in [`FlatUndoEntry::write_to`] / [`FlatUndoEntry::read_from`], pinned
 /// by layout tests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlatUndoEntry {
     pub op: FlatUndoOp,
-    /// Slot index (0xFF = derived fact).
+    /// Slot index (0xFF = derived fact); ignored by STATE_BYTES.
     pub slot: u8,
-    /// STRUCT_MAP_FIELD: field_idx. FACT_*: fact_idx low byte.
+    /// STRUCT_MAP_FIELD: field_idx. FACT_*: fact_idx low. STATE_BYTES: length.
     pub pad1: u8,
     /// STRUCT_MAP_*: SMF/SMR flags. FACT_*: fact_idx high byte.
     pub pad2: u8,
-    /// HashMap/HashSet key, or the full u32 derived-fact key.
+    /// Container/fact key, or absolute state offset for STATE_BYTES.
     pub key: u32,
-    /// Previous value (updates/deletes), or physical table slot for facts.
+    /// Previous value, physical fact slot, or zero for STATE_BYTES.
     pub prev_value: u32,
-    /// Previous timestamp bits (f64), target/restored derived-fact u64 value,
-    /// field cell bytes, or prior bitset bytes — per-op documented above.
+    /// Previous timestamp bits, target/restored fact value, field/bitset bytes,
+    /// or raw STATE_BYTES payload — per-op documented above.
     pub aux: u64,
 }
 
@@ -142,6 +146,7 @@ impl FlatUndoEntry {
             14 => FlatUndoOp::ScalarUpdate,
             12 => FlatUndoOp::StructMapField,
             13 => FlatUndoOp::StructMapRow,
+            15 => FlatUndoOp::StateBytes,
             _ => return None,
         };
         Some(Self {

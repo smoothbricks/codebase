@@ -576,6 +576,8 @@ pub struct UndoState {
     export_start: u32,
     export_count: u32,
     export_overflow: bool,
+    /// Reused pre-mutation bytes for post-mutation paired diff journaling.
+    capture_scratch: Vec<u8>,
 }
 
 impl Default for UndoState {
@@ -595,6 +597,7 @@ impl Default for UndoState {
             export_start: 0,
             export_count: 0,
             export_overflow: false,
+            capture_scratch: Vec::new(),
         }
     }
 }
@@ -676,6 +679,63 @@ impl UndoState {
         }
     }
 
+    /// Capture discontiguous state regions before a mutation whose exact byte
+    /// changes are only known afterward. Capacity is reserved up front so a
+    /// first overflow snapshots the true pre-mutation state, never post-state.
+    fn begin_state_capture(&mut self, state: &[u8], ranges: &[(u32, u32)]) -> bool {
+        if !self.enabled || self.overflow {
+            return false;
+        }
+        let max_entries = ranges.iter().map(|(_, len)| len.div_ceil(8)).sum::<u32>();
+        if self.count().saturating_add(max_entries) > UNDO_CAPACITY {
+            self.snapshot(state);
+            self.overflow_entry = None;
+            self.overflow = true;
+            return false;
+        }
+
+        self.capture_scratch.clear();
+        let capture_len = ranges.iter().map(|(_, len)| *len as usize).sum();
+        self.capture_scratch.reserve(capture_len);
+        for &(offset, len) in ranges {
+            let start = offset as usize;
+            let end = start + len as usize;
+            self.capture_scratch.extend_from_slice(&state[start..end]);
+        }
+        true
+    }
+
+    /// Emit only changed 1..=8-byte chunks from a prior `begin_state_capture`.
+    fn finish_state_capture(&mut self, delta_mode: bool, state: &[u8], ranges: &[(u32, u32)]) {
+        let mut scratch_offset = 0usize;
+        for &(state_offset, len) in ranges {
+            let mut relative = 0u32;
+            while relative < len {
+                let chunk_len = (len - relative).min(8);
+                let before_start = scratch_offset + relative as usize;
+                let before_end = before_start + chunk_len as usize;
+                let after_start = (state_offset + relative) as usize;
+                let after_end = after_start + chunk_len as usize;
+                let before = &self.capture_scratch[before_start..before_end];
+                let after = &state[after_start..after_end];
+                if before != after {
+                    let undo_entry =
+                        state_bytes_entry(state_offset + relative, chunk_len as u8, before);
+                    let redo_entry =
+                        state_bytes_entry(state_offset + relative, chunk_len as u8, after);
+                    if delta_mode {
+                        self.append_pair_snapshot(state, undo_entry, redo_entry);
+                    } else {
+                        self.append_undo_only_snapshot(state, undo_entry);
+                    }
+                }
+                relative += chunk_len;
+            }
+            scratch_offset += len as usize;
+        }
+        self.capture_scratch.clear();
+    }
+
     /// vm.zig:311 `saveChangeFlags`.
     fn save_change_flags(&mut self, state: &[u8]) {
         let num_slots = state[StateHeaderOffset::NUM_SLOTS as usize] as u32;
@@ -702,6 +762,22 @@ impl UndoState {
         }
         state[StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG as usize] =
             self.saved_change_flags[num_slots as usize];
+    }
+}
+
+fn state_bytes_entry(offset: u32, len: u8, value: &[u8]) -> FlatUndoEntry {
+    debug_assert!((1..=8).contains(&len));
+    debug_assert_eq!(usize::from(len), value.len());
+    let mut cell = [0u8; 8];
+    cell[..value.len()].copy_from_slice(value);
+    FlatUndoEntry {
+        op: FlatUndoOp::StateBytes,
+        slot: 0,
+        pad1: len,
+        pad2: 0,
+        key: offset,
+        prev_value: 0,
+        aux: u64::from_le_bytes(cell),
     }
 }
 
@@ -966,6 +1042,15 @@ pub fn rollback_entry(env: &mut BitmapEnv, state: &mut [u8], entry: &FlatUndoEnt
                 );
             }
         }
+        FlatUndoOp::StateBytes => {
+            let len = u32::from(entry.pad1);
+            if len == 0 || len > 8 || entry.key.saturating_add(len) > state.len() as u32 {
+                return;
+            }
+            let cell = entry.aux.to_le_bytes();
+            state[entry.key as usize..(entry.key + len) as usize]
+                .copy_from_slice(&cell[..len as usize]);
+        }
         FlatUndoOp::ListAppendUndo => {
             // vm.zig:464 — restore the ORDERED_LIST count (raw SIZE field;
             // getSlotMeta cannot bind ORDERED_LIST's repurposed metadata).
@@ -1207,6 +1292,16 @@ fn append_mutation_state(
     } else {
         undo.append_undo_only_snapshot(state, undo_e);
     }
+}
+
+fn nested_journal_ranges(state: &[u8], meta: &SlotMetaView) -> [(u32, u32); 2] {
+    let arena_header = nested::arena_header_offset(meta.offset, meta.capacity);
+    let arena_capacity = bytes::read_u32(state, arena_header);
+    let slot_data_len = arena_header + nested::ARENA_HDR_SIZE + arena_capacity - meta.offset;
+    [
+        (meta.meta_base, SLOT_META_SIZE),
+        (meta.offset, slot_data_len),
+    ]
 }
 
 // =============================================================================
@@ -3660,12 +3755,18 @@ impl Vm {
                         (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
                     bpc += 4;
                     let meta = SlotMetaView::read(state, slot);
+                    let journal_ranges = nested_journal_ranges(state, &meta);
+                    let captured = self.undo.begin_state_capture(state, &journal_ranges);
                     let result = nested::nested_set_insert(
                         state,
                         &meta,
                         cell_u32(cols, outer_key_col, child_idx),
                         cell_u32(cols, elem_col, child_idx),
                     );
+                    if captured {
+                        self.undo
+                            .finish_state_capture(delta_mode, state, &journal_ranges);
+                    }
                     if result == ErrorCode::CapacityExceeded {
                         NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
                         return NEEDS_GROWTH;
@@ -3678,6 +3779,8 @@ impl Vm {
                         (body[bpc + 1], body[bpc + 2], body[bpc + 3], body[bpc + 4]);
                     bpc += 5;
                     let meta = SlotMetaView::read(state, slot);
+                    let journal_ranges = nested_journal_ranges(state, &meta);
+                    let captured = self.undo.begin_state_capture(state, &journal_ranges);
                     let result = nested::nested_map_upsert_last(
                         state,
                         &meta,
@@ -3685,6 +3788,10 @@ impl Vm {
                         cell_u32(cols, inner_key_col, child_idx),
                         cell_u32(cols, val_col, child_idx),
                     );
+                    if captured {
+                        self.undo
+                            .finish_state_capture(delta_mode, state, &journal_ranges);
+                    }
                     if result == ErrorCode::CapacityExceeded {
                         NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
                         return NEEDS_GROWTH;
@@ -3697,12 +3804,18 @@ impl Vm {
                         (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
                     bpc += 4;
                     let meta = SlotMetaView::read(state, slot);
+                    let journal_ranges = nested_journal_ranges(state, &meta);
+                    let captured = self.undo.begin_state_capture(state, &journal_ranges);
                     let result = nested::nested_agg_update(
                         state,
                         &meta,
                         cell_u32(cols, outer_key_col, child_idx),
                         cell_f64(cols, val_col, child_idx).to_bits(),
                     );
+                    if captured {
+                        self.undo
+                            .finish_state_capture(delta_mode, state, &journal_ranges);
+                    }
                     if result == ErrorCode::CapacityExceeded {
                         NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
                         return NEEDS_GROWTH;
