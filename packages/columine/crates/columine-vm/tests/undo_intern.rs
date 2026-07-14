@@ -147,7 +147,7 @@ fn rollback_agg_update_restores_previous_f64_value_and_count() {
     state[off..off + 8].copy_from_slice(&10.0f64.to_bits().to_le_bytes());
     state[off + 8..off + 16].copy_from_slice(&5u64.to_le_bytes());
     let prev_val_bits = 10.0f64.to_bits();
-    let prev_count: u32 = 5;
+    let prev_count: u64 = 5;
 
     // Simulate an aggregate update
     state[off..off + 8].copy_from_slice(&25.0f64.to_bits().to_le_bytes());
@@ -179,7 +179,7 @@ fn rollback_count_update_restores_previous_u64_count() {
     let off = SLOT_OFFSET as usize;
 
     state[off..off + 8].copy_from_slice(&42u64.to_le_bytes());
-    let prev_count: u32 = 42;
+    let prev_count: u64 = 42;
 
     state[off..off + 8].copy_from_slice(&99u64.to_le_bytes());
     assert_eq!(
@@ -481,4 +481,59 @@ proptest! {
         prop_assert_eq!(*offsets.last().unwrap(), si.data_len());
         prop_assert_eq!(si.data_bytes().len() as u32, si.data_len());
     }
+}
+
+/// Post-parity fix pin: counts past u32::MAX round-trip through the widened
+/// journal lanes (prev_value low + key high) — the deleted Zig truncated.
+#[test]
+fn rollback_count_update_preserves_counts_past_u32_max() {
+    let mut state = mk_slot_state(0, SlotType::Aggregate as u8);
+    let meta_base = STATE_HEADER_SIZE as usize;
+    state[meta_base + 13] = AggType::Count as u8;
+    let meta = meta_of(&state);
+    let off = SLOT_OFFSET as usize;
+
+    let big: u64 = (1 << 33) + 7;
+    state[off..off + 8].copy_from_slice(&(big + 1).to_le_bytes());
+    rollback_count_update(&mut state, &meta, big);
+    assert_eq!(
+        u64::from_le_bytes(state[off..off + 8].try_into().unwrap()),
+        big
+    );
+}
+
+/// Post-parity fix pin: rollforward skips zeroed no-op redo markers (the
+/// undo-only lanes of evictions/derived-fact appends) instead of panicking
+/// on them as corruption.
+#[test]
+fn rollforward_skips_zeroed_noop_markers() {
+    use columine_vm::undo_log::{FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp};
+    let mut state = mk_slot_state(0, SlotType::Aggregate as u8);
+    let meta_base = STATE_HEADER_SIZE as usize;
+    state[meta_base + 13] = AggType::Count as u8;
+    let off = SLOT_OFFSET as usize;
+    state[off..off + 8].copy_from_slice(&1u64.to_le_bytes());
+
+    let count_entry = FlatUndoEntry {
+        op: FlatUndoOp::CountUpdate,
+        slot: 0,
+        pad1: 0,
+        pad2: 0,
+        key: 0,
+        prev_value: 7,
+        aux: 0,
+    };
+    let mut seg = vec![0u8; 3 * FLAT_UNDO_ENTRY_SIZE as usize];
+    let mut buf = [0u8; FLAT_UNDO_ENTRY_SIZE as usize];
+    count_entry.write_to(&mut buf);
+    // entry 0 valid, entry 1 zeroed no-op marker, entry 2 valid.
+    seg[..24].copy_from_slice(&buf);
+    seg[48..72].copy_from_slice(&buf);
+
+    let mut vm = columine_vm::vm::Vm::default();
+    vm.delta_apply_rollforward_segment(&mut state, &seg, FLAT_UNDO_ENTRY_SIZE);
+    assert_eq!(
+        u64::from_le_bytes(state[off..off + 8].try_into().unwrap()),
+        7
+    );
 }
