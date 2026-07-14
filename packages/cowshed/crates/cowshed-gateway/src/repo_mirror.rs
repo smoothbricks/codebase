@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fmt,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -20,9 +21,13 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Duration, Instant, timeout, timeout_at};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+};
 use url::Url;
 use uuid::Uuid;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::{
     actor::{BrokerAuditEvent, BrokerAuditKind, BrokerAuditStatus, BrokerAuditor},
@@ -35,6 +40,8 @@ use crate::{
         normalize_path,
     },
 };
+pub const GATEWAY_GIT_FETCH_HELPER_ARG: &str = "__cowshed-gateway-git-fetch";
+const MAX_HELPER_FRAME: u64 = 1024 * 1024;
 
 const MAX_BINDINGS: usize = 4096;
 const MAX_MIRRORS: usize = 4096;
@@ -73,11 +80,43 @@ impl fmt::Debug for RepoCredential {
     }
 }
 
+struct FetchCancellation {
+    cancelled: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl FetchCancellation {
+    fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.is_cancelled() {
+            notified.await;
+        }
+    }
+}
+
 pub struct RepoFetchPlan {
     pub remote: String,
     pub destination: PathBuf,
     pub credential: Option<RepoCredential>,
-    cancellation: Arc<AtomicBool>,
+    cancellation: Arc<FetchCancellation>,
 }
 
 impl RepoFetchPlan {
@@ -85,7 +124,7 @@ impl RepoFetchPlan {
         remote: String,
         destination: PathBuf,
         credential: Option<RepoCredential>,
-        cancellation: Arc<AtomicBool>,
+        cancellation: Arc<FetchCancellation>,
     ) -> Self {
         Self {
             remote,
@@ -96,7 +135,7 @@ impl RepoFetchPlan {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancellation.load(Ordering::Acquire)
+        self.cancellation.is_cancelled()
     }
 }
 
@@ -120,12 +159,16 @@ pub enum RepoFetchOutcome {
 #[async_trait]
 pub trait RepoTransport: Send + Sync + 'static {
     async fn fetch(&self, plan: RepoFetchPlan) -> Result<RepoFetchOutcome, RepoMirrorError>;
+    fn owns_cancellation(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone)]
 pub struct Git2RepoTransport {
     connector: Arc<dyn UpstreamConnector>,
     connect_timeout: Duration,
+    helper_executable: Option<PathBuf>,
     response_timeout: Duration,
 }
 
@@ -141,11 +184,13 @@ impl fmt::Debug for Git2RepoTransport {
 
 impl Git2RepoTransport {
     pub fn new(
+        helper_executable: Option<PathBuf>,
         connector: Arc<dyn UpstreamConnector>,
         connect_timeout: Duration,
         response_timeout: Duration,
     ) -> Self {
         Self {
+            helper_executable,
             connector,
             connect_timeout,
             response_timeout,
@@ -245,6 +290,62 @@ impl Git2RepoTransport {
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HelperRequestOut<'a> {
+    version: u16,
+    remote: &'a str,
+    destination: &'a Path,
+    allowed_root: &'a Path,
+    credential: Option<HelperCredentialOut<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HelperCredentialOut<'a> {
+    header_name: &'a str,
+    header_value: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HelperRequest {
+    version: u16,
+    remote: String,
+    destination: PathBuf,
+    allowed_root: PathBuf,
+    credential: Option<HelperCredential>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HelperCredential {
+    header_name: String,
+    header_value: String,
+}
+
+impl Drop for HelperCredential {
+    fn drop(&mut self) {
+        self.header_value.zeroize();
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HelperResponse {
+    ok: bool,
+    head: Option<String>,
+    error_code: Option<String>,
+}
+
+#[derive(Debug, Error)]
+pub enum GitFetchHelperError {
+    #[error("gateway Git fetch helper protocol is invalid")]
+    InvalidProtocol,
+    #[error("gateway Git fetch helper I/O failed")]
+    Io(#[from] std::io::Error),
+}
+
 #[async_trait]
 impl RepoTransport for Git2RepoTransport {
     async fn fetch(&self, plan: RepoFetchPlan) -> Result<RepoFetchOutcome, RepoMirrorError> {
@@ -254,63 +355,231 @@ impl RepoTransport for Git2RepoTransport {
         if let Some(location) = self.preflight(&plan).await? {
             return Ok(RepoFetchOutcome::Redirect { location });
         }
-        let destination = plan.destination.clone();
-        let cancellation = Arc::clone(&plan.cancellation);
-        tokio::task::spawn_blocking(move || {
-            let result = fetch_git2(plan);
-            if cancellation.load(Ordering::Acquire) {
-                remove_tree(&destination);
-            }
-            result
-        })
-        .await
-        .map_err(|_| RepoMirrorError::FetchFailed)?
+        let executable = self
+            .helper_executable
+            .as_deref()
+            .ok_or(RepoMirrorError::HelperUnavailable)?;
+        run_fetch_helper(executable, plan).await
+    }
+
+    fn owns_cancellation(&self) -> bool {
+        true
     }
 }
 
-fn fetch_git2(mut plan: RepoFetchPlan) -> Result<RepoFetchOutcome, RepoMirrorError> {
-    if plan.is_cancelled() {
-        return Err(RepoMirrorError::Cancelled);
+async fn run_fetch_helper(
+    executable: &Path,
+    plan: RepoFetchPlan,
+) -> Result<RepoFetchOutcome, RepoMirrorError> {
+    validate_helper_executable(executable)?;
+    let allowed_root = plan
+        .destination
+        .parent()
+        .ok_or(RepoMirrorError::HelperUnavailable)?;
+    let credential = plan
+        .credential
+        .as_ref()
+        .map(|credential| HelperCredentialOut {
+            header_name: &credential.header_name,
+            header_value: credential.header_value.as_str(),
+        });
+    let request = HelperRequestOut {
+        version: 1,
+        remote: &plan.remote,
+        destination: &plan.destination,
+        allowed_root,
+        credential,
+    };
+    let encoded =
+        Zeroizing::new(serde_json::to_vec(&request).map_err(|_| RepoMirrorError::HelperProtocol)?);
+    if encoded.len() > MAX_HELPER_FRAME as usize {
+        return Err(RepoMirrorError::HelperProtocol);
     }
-    let repository =
-        git2::Repository::init_bare(&plan.destination).map_err(|_| RepoMirrorError::FetchFailed)?;
+    let mut child = Command::new(executable)
+        .arg(GATEWAY_GIT_FETCH_HELPER_ARG)
+        .current_dir(allowed_root)
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| RepoMirrorError::HelperUnavailable)?;
+    let mut stdin = child.stdin.take().ok_or(RepoMirrorError::HelperProtocol)?;
+    let stdout = child.stdout.take().ok_or(RepoMirrorError::HelperProtocol)?;
+    let writer = tokio::spawn(async move {
+        stdin.write_all(&encoded).await?;
+        stdin.shutdown().await
+    });
+    let reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout
+            .take(MAX_HELPER_FRAME + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        Ok::<_, std::io::Error>(bytes)
+    });
+    let status = tokio::select! {
+        status = child.wait() => status.map_err(|_| RepoMirrorError::FetchFailed)?,
+        _ = plan.cancellation.cancelled() => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            writer.abort();
+            reader.abort();
+            remove_tree(&plan.destination);
+            return Err(RepoMirrorError::Cancelled);
+        }
+    };
+    writer
+        .await
+        .map_err(|_| RepoMirrorError::FetchFailed)?
+        .map_err(|_| RepoMirrorError::FetchFailed)?;
+    let response = reader
+        .await
+        .map_err(|_| RepoMirrorError::FetchFailed)?
+        .map_err(|_| RepoMirrorError::FetchFailed)?;
+    if !status.success() || response.is_empty() || response.len() > MAX_HELPER_FRAME as usize {
+        remove_tree(&plan.destination);
+        return Err(RepoMirrorError::FetchFailed);
+    }
+    let response: HelperResponse =
+        serde_json::from_slice(&response).map_err(|_| RepoMirrorError::HelperProtocol)?;
+    if !response.ok {
+        remove_tree(&plan.destination);
+        return Err(RepoMirrorError::FetchFailed);
+    }
+    Ok(RepoFetchOutcome::Fetched {
+        head: response.head,
+    })
+}
+
+fn validate_helper_executable(path: &Path) -> Result<(), RepoMirrorError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    if !path.is_absolute() {
+        return Err(RepoMirrorError::HelperUnavailable);
+    }
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| RepoMirrorError::HelperUnavailable)?;
+    let mode = metadata.permissions().mode();
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || mode & 0o022 != 0
+        || mode & 0o100 == 0
     {
-        let mut config = repository
-            .config()
-            .map_err(|_| RepoMirrorError::FetchFailed)?;
-        config
-            .set_bool("core.bare", true)
-            .map_err(|_| RepoMirrorError::FetchFailed)?;
+        return Err(RepoMirrorError::HelperUnavailable);
+    }
+    Ok(())
+}
+
+pub fn run_gateway_git_fetch_helper() -> Result<(), GitFetchHelperError> {
+    use std::io::{Read as _, Write as _};
+
+    let mut bytes = Zeroizing::new(Vec::new());
+    std::io::stdin()
+        .take(MAX_HELPER_FRAME + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() > MAX_HELPER_FRAME as usize {
+        return Err(GitFetchHelperError::InvalidProtocol);
+    }
+    let request: HelperRequest =
+        serde_json::from_slice(&bytes).map_err(|_| GitFetchHelperError::InvalidProtocol)?;
+    if request.version != 1 || !validate_helper_destination(&request) {
+        return Err(GitFetchHelperError::InvalidProtocol);
+    }
+    let response = match fetch_git2_helper(request) {
+        Ok(head) => HelperResponse {
+            ok: true,
+            head,
+            error_code: None,
+        },
+        Err(()) => HelperResponse {
+            ok: false,
+            head: None,
+            error_code: Some("fetch-failed".to_owned()),
+        },
+    };
+    let encoded = Zeroizing::new(
+        serde_json::to_vec(&response).map_err(|_| GitFetchHelperError::InvalidProtocol)?,
+    );
+    if encoded.len() > MAX_HELPER_FRAME as usize {
+        return Err(GitFetchHelperError::InvalidProtocol);
+    }
+    std::io::stdout().write_all(&encoded)?;
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
+fn validate_helper_destination(request: &HelperRequest) -> bool {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    if !request.allowed_root.is_absolute() || !request.destination.is_absolute() {
+        return false;
+    }
+    let Ok(root_metadata) = std::fs::symlink_metadata(&request.allowed_root) else {
+        return false;
+    };
+    let Ok(destination_metadata) = std::fs::symlink_metadata(&request.destination) else {
+        return false;
+    };
+    if !root_metadata.is_dir()
+        || root_metadata.file_type().is_symlink()
+        || !destination_metadata.is_dir()
+        || destination_metadata.file_type().is_symlink()
+        || root_metadata.uid() != unsafe { libc::geteuid() }
+        || destination_metadata.uid() != unsafe { libc::geteuid() }
+        || root_metadata.permissions().mode() & 0o022 != 0
+    {
+        return false;
+    }
+    let Ok(root) = std::fs::canonicalize(&request.allowed_root) else {
+        return false;
+    };
+    let Ok(destination) = std::fs::canonicalize(&request.destination) else {
+        return false;
+    };
+    let name_ok = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with('.') && name.ends_with(".tmp"));
+    destination.parent() == Some(root.as_path())
+        && name_ok
+        && std::fs::read_dir(&destination).is_ok_and(|mut entries| entries.next().is_none())
+}
+
+fn fetch_git2_helper(mut request: HelperRequest) -> Result<Option<String>, ()> {
+    let repository = git2::Repository::init_bare(&request.destination).map_err(|_| ())?;
+    {
+        let mut config = repository.config().map_err(|_| ())?;
+        config.set_bool("core.bare", true).map_err(|_| ())?;
         config
             .set_str("core.hooksPath", "/dev/null")
-            .map_err(|_| RepoMirrorError::FetchFailed)?;
+            .map_err(|_| ())?;
         config
             .set_str("protocol.file.allow", "never")
-            .map_err(|_| RepoMirrorError::FetchFailed)?;
+            .map_err(|_| ())?;
         config
             .set_str("protocol.ext.allow", "never")
-            .map_err(|_| RepoMirrorError::FetchFailed)?;
+            .map_err(|_| ())?;
         config
             .set_bool("http.followRedirects", false)
-            .map_err(|_| RepoMirrorError::FetchFailed)?;
+            .map_err(|_| ())?;
     }
     let mut remote = repository
-        .remote_anonymous(&plan.remote)
-        .map_err(|_| RepoMirrorError::FetchFailed)?;
+        .remote_anonymous(&request.remote)
+        .map_err(|_| ())?;
     let mut callbacks = RemoteCallbacks::new();
-    let cancellation = Arc::clone(&plan.cancellation);
-    callbacks.transfer_progress(move |_| !cancellation.load(Ordering::Acquire));
     callbacks.credentials(|_, _, _| Err(git2::Error::from_str("interactive credentials disabled")));
     let mut fetch = FetchOptions::new();
     fetch.remote_callbacks(callbacks);
     fetch.follow_redirects(RemoteRedirect::None);
     fetch.download_tags(AutotagOption::All);
     fetch.prune(git2::FetchPrune::On);
-    let header = plan.credential.take().map(|credential| {
+    let header = request.credential.take().map(|credential| {
         Zeroizing::new(format!(
             "{}: {}",
-            credential.header_name,
-            credential.header_value.as_str()
+            credential.header_name, credential.header_value
         ))
     });
     if let Some(header) = header.as_ref() {
@@ -322,11 +591,8 @@ fn fetch_git2(mut plan: RepoFetchPlan) -> Result<RepoFetchOutcome, RepoMirrorErr
             Some(&mut fetch),
             None,
         )
-        .map_err(|_| RepoMirrorError::FetchFailed)?;
-    if plan.is_cancelled() {
-        return Err(RepoMirrorError::Cancelled);
-    }
-    let head = repository.references().ok().and_then(|mut references| {
+        .map_err(|_| ())?;
+    Ok(repository.references().ok().and_then(|mut references| {
         references.find_map(|reference| {
             let reference = reference.ok()?;
             if !reference.is_branch() {
@@ -334,8 +600,7 @@ fn fetch_git2(mut plan: RepoFetchPlan) -> Result<RepoFetchOutcome, RepoMirrorErr
             }
             reference.target().map(|oid| oid.to_string())
         })
-    });
-    Ok(RepoFetchOutcome::Fetched { head })
+    }))
 }
 
 #[derive(Clone)]
@@ -505,6 +770,7 @@ async fn run(
                 let _ = reply.send(Ok(()));
             }
             Message::Mirror { request, reply } => {
+                let cancellation = Arc::new(FetchCancellation::new());
                 let operation = mirror(
                     request,
                     MirrorContext {
@@ -515,12 +781,15 @@ async fn run(
                         transport: transport.as_ref(),
                         auditor: auditor.as_ref(),
                         deadlines,
+                        cancellation: Arc::clone(&cancellation),
                     },
                 );
                 tokio::pin!(operation);
                 let result = tokio::select! {
                     result = &mut operation => result,
                     changed = shutdown.changed() => {
+                        cancellation.cancel();
+                        let _ = timeout(Duration::from_secs(2), &mut operation).await;
                         let _ = reply.send(Err(RepoMirrorError::Cancelled));
                         if changed.is_err() || *shutdown.borrow() {
                             break;
@@ -542,6 +811,7 @@ struct MirrorContext<'a> {
     transport: &'a dyn RepoTransport,
     auditor: &'a dyn BrokerAuditor,
     deadlines: RepoDeadlines,
+    cancellation: Arc<FetchCancellation>,
 }
 
 async fn mirror(
@@ -556,9 +826,10 @@ async fn mirror(
         transport,
         auditor,
         deadlines,
+        cancellation,
     } = context;
     let deadline = Instant::now() + deadlines.total;
-    validate_identifier(&request.repo_id)?;
+    validate_repo_id(&request.repo_id)?;
     let binding = bindings
         .get(&request.workspace_id)
         .ok_or(RepoMirrorError::UnknownWorkspace)?;
@@ -633,6 +904,7 @@ async fn mirror(
             transport,
             deadlines,
             deadline,
+            cancellation,
         },
     )
     .await;
@@ -735,16 +1007,6 @@ fn admit_remote(binding: &Binding, remote: &CanonicalRemote) -> Result<(), RepoM
     Ok(())
 }
 
-struct CancellationGuard {
-    cancelled: Arc<AtomicBool>,
-}
-
-impl Drop for CancellationGuard {
-    fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::Release);
-    }
-}
-
 struct FetchContext<'a> {
     request: &'a RepoMirrorRequest,
     binding: &'a Binding,
@@ -753,6 +1015,7 @@ struct FetchContext<'a> {
     transport: &'a dyn RepoTransport,
     deadlines: RepoDeadlines,
     deadline: Instant,
+    cancellation: Arc<FetchCancellation>,
 }
 
 async fn fetch_redirects(
@@ -767,6 +1030,7 @@ async fn fetch_redirects(
         transport,
         deadlines,
         deadline,
+        cancellation,
     } = context;
     for redirect_count in 0..=MAX_REDIRECTS {
         if Instant::now() >= deadline {
@@ -782,10 +1046,14 @@ async fn fetch_redirects(
             path: remote.path.clone(),
         };
         let credential_deadline = deadline.min(Instant::now() + deadlines.credential);
-        let credential = timeout_at(credential_deadline, credentials.lookup(&query))
-            .await
-            .map_err(|_| RepoMirrorError::CredentialTimeout)?
-            .map_err(|_| RepoMirrorError::CredentialUnavailable)?;
+        let credential = tokio::select! {
+            result = timeout_at(credential_deadline, credentials.lookup(&query)) => {
+                result
+                    .map_err(|_| RepoMirrorError::CredentialTimeout)?
+                    .map_err(|_| RepoMirrorError::CredentialUnavailable)?
+            }
+            _ = cancellation.cancelled() => return Err(RepoMirrorError::Cancelled),
+        };
         let credential = match credential {
             Some(record) if record.validate_for(&query) => Some(RepoCredential {
                 header_name: record.header_name.as_str().to_owned(),
@@ -794,21 +1062,27 @@ async fn fetch_redirects(
             Some(_) => return Err(RepoMirrorError::CredentialScopeMismatch),
             None => None,
         };
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let _guard = CancellationGuard {
-            cancelled: Arc::clone(&cancelled),
+        let operation = transport.fetch(RepoFetchPlan::new(
+            remote.canonical.clone(),
+            destination.clone(),
+            credential,
+            Arc::clone(&cancellation),
+        ));
+        tokio::pin!(operation);
+        let outcome = tokio::select! {
+            result = &mut operation => result?,
+            _ = cancellation.cancelled() => {
+                if transport.owns_cancellation() {
+                    let _ = operation.await;
+                }
+                return Err(RepoMirrorError::Cancelled);
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                cancellation.cancel();
+                let _ = timeout(Duration::from_secs(2), &mut operation).await;
+                return Err(RepoMirrorError::FetchTimeout);
+            }
         };
-        let outcome = timeout_at(
-            deadline,
-            transport.fetch(RepoFetchPlan::new(
-                remote.canonical.clone(),
-                destination.clone(),
-                credential,
-                cancelled,
-            )),
-        )
-        .await
-        .map_err(|_| RepoMirrorError::FetchTimeout)??;
         match outcome {
             RepoFetchOutcome::Fetched { head } => return Ok((remote, head)),
             RepoFetchOutcome::Redirect { location } if redirect_count < MAX_REDIRECTS => {
@@ -962,12 +1236,20 @@ fn hash_component(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
-fn validate_identifier(value: &str) -> Result<(), RepoMirrorError> {
-    if value.is_empty()
-        || value.len() > 128
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+fn validate_repo_id(value: &str) -> Result<(), RepoMirrorError> {
+    let (owner, name) = value
+        .split_once('/')
+        .ok_or(RepoMirrorError::InvalidRepoId)?;
+    if name.contains('/')
+        || matches!(owner, "." | "..")
+        || matches!(name, "." | "..")
+        || [owner, name].into_iter().any(|component| {
+            component.is_empty()
+                || component.len() > 128
+                || !component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
     {
         return Err(RepoMirrorError::InvalidRepoId);
     }
@@ -984,7 +1266,11 @@ impl RepoMirrorError {
             Self::CredentialUnavailable
             | Self::CredentialScopeMismatch
             | Self::CredentialTimeout => "repo-credential-denied",
-            Self::FetchFailed | Self::FetchTimeout | Self::Cancelled => "repo-fetch-failed",
+            Self::FetchFailed
+            | Self::FetchTimeout
+            | Self::Cancelled
+            | Self::HelperUnavailable
+            | Self::HelperProtocol => "repo-fetch-failed",
             Self::PublicationFailed => "repo-publication-failed",
             _ => "repo-request-rejected",
         }
@@ -1021,6 +1307,10 @@ pub enum RepoMirrorError {
     FetchTimeout,
     #[error("repository transport fetch was cancelled")]
     Cancelled,
+    #[error("repository Git fetch helper is unavailable")]
+    HelperUnavailable,
+    #[error("repository Git fetch helper protocol failed")]
+    HelperProtocol,
     #[error("repository mirror publication failed")]
     PublicationFailed,
     #[error("repository mirror root is insecure")]
@@ -1218,7 +1508,7 @@ mod tests {
         )
         .expect("start");
         handle
-            .bind_session("ws".to_owned(), "repo".to_owned(), policy("/org"))
+            .bind_session("ws".to_owned(), "owner/repo".to_owned(), policy("/org"))
             .await
             .expect("bind");
         let started_wait = started.notified();
@@ -1227,7 +1517,7 @@ mod tests {
             request_handle
                 .mirror(RepoMirrorRequest {
                     workspace_id: "ws".to_owned(),
-                    repo_id: "repo".to_owned(),
+                    repo_id: "owner/repo".to_owned(),
                     remote: "https://git.example.test/org/repo.git".to_owned(),
                 })
                 .await
@@ -1268,14 +1558,14 @@ mod tests {
         )
         .expect("start");
         handle
-            .bind_session("ws".to_owned(), "repo".to_owned(), policy("/org"))
+            .bind_session("ws".to_owned(), "owner/repo".to_owned(), policy("/org"))
             .await
             .expect("bind");
         assert!(matches!(
             handle
                 .mirror(RepoMirrorRequest {
                     workspace_id: "ws".to_owned(),
-                    repo_id: "repo".to_owned(),
+                    repo_id: "owner/repo".to_owned(),
                     remote: "https://git.example.test/org/repo.git".to_owned(),
                 })
                 .await,
@@ -1291,6 +1581,7 @@ mod tests {
         let root = fixture_root("preflight");
         let request = Arc::new(Mutex::new(Vec::new()));
         let transport = Git2RepoTransport::new(
+            None,
             Arc::new(RedirectConnector {
                 request: Arc::clone(&request),
             }),
@@ -1305,7 +1596,7 @@ mod tests {
                     header_name: "authorization".to_owned(),
                     header_value: Zeroizing::new("Bearer scoped-secret".to_owned()),
                 }),
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(FetchCancellation::new()),
             ))
             .await
             .expect("redirect");
@@ -1364,18 +1655,18 @@ mod tests {
         )
         .expect("start");
         handle
-            .bind_session("ws-a".to_owned(), "repo-a".to_owned(), policy("/org"))
+            .bind_session("ws-a".to_owned(), "owner/repo-a".to_owned(), policy("/org"))
             .await
             .expect("bind a");
         handle
-            .bind_session("ws-b".to_owned(), "repo-b".to_owned(), policy("/org"))
+            .bind_session("ws-b".to_owned(), "owner/repo-b".to_owned(), policy("/org"))
             .await
             .expect("bind b");
 
         let outside = handle
             .mirror(RepoMirrorRequest {
                 workspace_id: "ws-a".to_owned(),
-                repo_id: "repo-a".to_owned(),
+                repo_id: "owner/repo-a".to_owned(),
                 remote: "https://git.example.test/outside/repo.git".to_owned(),
             })
             .await;
@@ -1386,7 +1677,7 @@ mod tests {
         let first = handle
             .mirror(RepoMirrorRequest {
                 workspace_id: "ws-a".to_owned(),
-                repo_id: "repo-a".to_owned(),
+                repo_id: "owner/repo-a".to_owned(),
                 remote: "https://git.example.test/org/repo.git".to_owned(),
             })
             .await
@@ -1416,7 +1707,7 @@ mod tests {
         let second = handle
             .mirror(RepoMirrorRequest {
                 workspace_id: "ws-b".to_owned(),
-                repo_id: "repo-b".to_owned(),
+                repo_id: "owner/repo-b".to_owned(),
                 remote: "https://git.example.test/org/repo.git".to_owned(),
             })
             .await
@@ -1433,7 +1724,7 @@ mod tests {
             handle
                 .mirror(RepoMirrorRequest {
                     workspace_id: "ws-a".to_owned(),
-                    repo_id: "repo-b".to_owned(),
+                    repo_id: "owner/repo-b".to_owned(),
                     remote: "https://git.example.test/org/repo.git".to_owned(),
                 })
                 .await,
@@ -1444,7 +1735,7 @@ mod tests {
         let redirect_denied = handle
             .mirror(RepoMirrorRequest {
                 workspace_id: "ws-a".to_owned(),
-                repo_id: "repo-a".to_owned(),
+                repo_id: "owner/repo-a".to_owned(),
                 remote: "https://git.example.test/org/redirect.git".to_owned(),
             })
             .await;
@@ -1490,14 +1781,14 @@ mod tests {
         )
         .expect("start");
         handle
-            .bind_session("ws".to_owned(), "repo".to_owned(), policy("/org"))
+            .bind_session("ws".to_owned(), "owner/repo".to_owned(), policy("/org"))
             .await
             .expect("bind");
         assert!(matches!(
             handle
                 .mirror(RepoMirrorRequest {
                     workspace_id: "ws".to_owned(),
-                    repo_id: "repo".to_owned(),
+                    repo_id: "owner/repo".to_owned(),
                     remote: "http://git.example.test/org/repo.git".to_owned(),
                 })
                 .await,
@@ -1507,6 +1798,54 @@ mod tests {
         assert!(transport.calls.lock().expect("calls").is_empty());
         handle.shutdown().await;
         task.await.expect("join");
+        remove_tree_read_only(&root);
+    }
+    #[tokio::test]
+    async fn helper_process_is_killed_reaped_and_cleaned_on_repeated_cancellation() {
+        let root = fixture_root("helper-cancel");
+        let helper = root.join("blocking-helper");
+        std::fs::copy("/bin/cat", &helper).expect("copy blocking helper");
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
+            .expect("secure blocking helper");
+        let fifo = root.join(GATEWAY_GIT_FETCH_HELPER_ARG);
+        let fifo_path =
+            std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(fifo.as_os_str()))
+                .expect("FIFO path");
+        let created = unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) };
+        assert_eq!(
+            created,
+            0,
+            "create blocking FIFO: {}",
+            std::io::Error::last_os_error()
+        );
+
+        for attempt in 0..8 {
+            let destination = root.join(format!("attempt-{attempt}"));
+            std::fs::create_dir(&destination).expect("create unpublished destination");
+            let cancellation = Arc::new(FetchCancellation::new());
+            let plan = RepoFetchPlan::new(
+                "https://git.example.test/org/repo.git".to_owned(),
+                destination.clone(),
+                None,
+                Arc::clone(&cancellation),
+            );
+            let fetch = tokio::spawn({
+                let helper = helper.clone();
+                async move { run_fetch_helper(&helper, plan).await }
+            });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancellation.cancel();
+            let result = timeout(Duration::from_secs(1), fetch)
+                .await
+                .expect("helper cancellation deadline")
+                .expect("helper task joined");
+            assert!(matches!(result, Err(RepoMirrorError::Cancelled)));
+            assert!(
+                !destination.exists(),
+                "cancelled helper left unpublished destination"
+            );
+        }
+
         remove_tree_read_only(&root);
     }
 }

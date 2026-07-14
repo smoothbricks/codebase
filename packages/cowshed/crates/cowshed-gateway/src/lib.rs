@@ -51,7 +51,8 @@ pub use policy::{
     MirrorRoute, PolicyError, ResolvedMirrorRoute, TargetScheme, WorkspacePolicy, normalize_path,
 };
 pub use repo_mirror::{
-    MirrorInfo, RepoFetchOutcome, RepoFetchPlan, RepoMirrorError, RepoMirrorRequest, RepoTransport,
+    GATEWAY_GIT_FETCH_HELPER_ARG, GitFetchHelperError, MirrorInfo, RepoFetchOutcome, RepoFetchPlan,
+    RepoMirrorError, RepoMirrorRequest, RepoTransport, run_gateway_git_fetch_helper,
 };
 pub use sim_broker::{
     SimBrokerError, SimCommand, SimCommandOutput, SimDevice, SimGrant, SimInstallApproval,

@@ -178,6 +178,7 @@ impl Gateway {
                 Arc::new(SystemdCredentialProvider::from_environment()?);
             let tail = audit.tail_handle();
             let repo_transport: Arc<dyn RepoTransport> = Arc::new(Git2RepoTransport::new(
+                config.git_helper_executable.clone(),
                 Arc::clone(&connector),
                 config.timeouts.connect,
                 config.timeouts.response_headers,
@@ -202,6 +203,7 @@ impl Gateway {
         audit: Arc<dyn AuditSink>,
     ) -> Result<Self, GatewayError> {
         let repo_transport: Arc<dyn RepoTransport> = Arc::new(Git2RepoTransport::new(
+            config.git_helper_executable.clone(),
             Arc::clone(&connector),
             config.timeouts.connect,
             config.timeouts.response_headers,
