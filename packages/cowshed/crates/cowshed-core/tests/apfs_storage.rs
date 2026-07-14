@@ -539,7 +539,8 @@ impl ApfsExecutionHost for FakeHost {
         workspace: &LifecycleWorkspace,
         revision: Revision,
         source_image: &Path,
-    ) -> Result<(), ApfsStorageError> {
+        replaced_incarnation: &WorkspaceIncarnation,
+    ) -> Result<cowshed_core::storage::apfs::PendingPublicationFact, ApfsStorageError> {
         self.record("publish-restored-metadata-after-mount");
         if self
             .fail_restored_metadata_once
@@ -556,7 +557,29 @@ impl ApfsExecutionHost for FakeHost {
             MetadataPolicy::PendingFence,
             None,
             Some(source_image),
-        )
+        )?;
+        Ok(cowshed_core::storage::apfs::PendingPublicationFact {
+            workspace: workspace.clone(),
+            image: canonical.to_owned(),
+            mount_point: if workspace.name().is_main() {
+                PathBuf::from("/project")
+            } else {
+                PathBuf::from(format!(
+                    "/store/mnt/{}/{}",
+                    workspace.repo(),
+                    workspace.name()
+                ))
+            },
+            source_checkpoint: source_image
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("checkpoint name")
+                .to_owned(),
+            source_incarnation: WorkspaceIncarnation::new("ffffffffffffffffffffffffffffffff")
+                .expect("source incarnation"),
+            replaced_incarnation: replaced_incarnation.clone(),
+            destination_incarnation: workspace.incarnation().clone(),
+        })
     }
 
     fn activate_restored_metadata(&self, canonical: &Path) -> Result<(), ApfsStorageError> {
@@ -632,6 +655,11 @@ impl ApfsExecutionHost for FakeHost {
                         "ffffffffffffffffffffffffffffffff",
                     )
                     .expect("source incarnation"),
+                    replaced_incarnation: WorkspaceIncarnation::new(
+                        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    )
+                    .expect("replaced incarnation"),
+                    destination_incarnation: fact.workspace.incarnation().clone(),
                 },
             )
             .collect())
@@ -1435,6 +1463,84 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
         .await
         .expect("unmount");
     assert_eq!(host.events(), ["lock:1", "detach-mounted:false"]);
+}
+
+#[tokio::test]
+async fn repeated_restore_preserves_checkpoint_replaced_and_destination_identities() {
+    let host = FakeHost::default();
+    let original = workspace("main", ImageFormat::Sparse, 7);
+    host.seed(&original);
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let label = CheckpointLabel::new("retained-origin").expect("checkpoint label");
+    let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
+        original.clone(),
+        label.clone(),
+        Revision::new(8),
+        true,
+    );
+    let checkpoint_source =
+        WorkspaceIncarnation::new("ffffffffffffffffffffffffffffffff").expect("checkpoint source");
+
+    let expected_source = checkpoint_source.clone();
+    let expected_replaced = original.incarnation().clone();
+    let first = substrate
+        .execute_restore_staged(
+            substrate
+                .plan_restore(&original, &checkpoint, RestoreMode::Replace, identity())
+                .expect("first restore plan"),
+            |_| async { Ok::<(), &'static str>(()) },
+            move |fence| async move {
+                assert_eq!(fence.pending.source_checkpoint, "retained-origin");
+                assert_eq!(fence.pending.source_incarnation, expected_source);
+                assert_eq!(fence.pending.replaced_incarnation, expected_replaced);
+                assert_eq!(
+                    fence.pending.destination_incarnation,
+                    *fence.pending.workspace.incarnation()
+                );
+                Ok::<(), &'static str>(())
+            },
+        )
+        .await
+        .expect("first restore");
+
+    let repeated_checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
+        first.workspace.clone(),
+        label,
+        Revision::new(8),
+        true,
+    );
+    let first_destination = first.workspace.incarnation().clone();
+    let expected_source = checkpoint_source.clone();
+    let expected_replaced = first_destination.clone();
+    let second = substrate
+        .execute_restore_staged(
+            substrate
+                .plan_restore(
+                    &first.workspace,
+                    &repeated_checkpoint,
+                    RestoreMode::Replace,
+                    identity(),
+                )
+                .expect("second restore plan"),
+            |_| async { Ok::<(), &'static str>(()) },
+            move |fence| async move {
+                assert_eq!(fence.pending.source_checkpoint, "retained-origin");
+                assert_eq!(fence.pending.source_incarnation, expected_source);
+                assert_eq!(fence.pending.replaced_incarnation, expected_replaced);
+                assert_eq!(
+                    fence.pending.destination_incarnation,
+                    *fence.pending.workspace.incarnation()
+                );
+                Ok::<(), &'static str>(())
+            },
+        )
+        .await
+        .expect("second restore");
+
+    assert_eq!(first.previous_incarnation, *original.incarnation());
+    assert_eq!(second.previous_incarnation, first_destination);
+    assert_ne!(checkpoint_source, second.previous_incarnation);
+    assert_ne!(second.previous_incarnation, *second.workspace.incarnation());
 }
 #[tokio::test]
 async fn staged_retire_fences_after_durable_undiscovery_and_preserves_trash_on_failure() {

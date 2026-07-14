@@ -176,15 +176,18 @@ source endpoint or CA.
   new supervisor. A missing commitment/artifact, hash/count/batch-digest mismatch, or malformed complete frame fails
   restore as `Integrity`; cowshed never chooses the newer-looking side. The logical workspace identity, primary
   `repo_id`, CA, and grant binding carry through; a macOS `portBlock` carries through only when present, while Linux has
-  none. The displaced image becomes `checkpoints/<ws>/pre-restore-<ts>.<ext>` with its original extension, so restore is
-  undoable. Before publication, failure restores the displaced workspace and old token; after the incarnation fence is
-  published, recovery completes forward and never exposes both tokens. Copied job records retain the incarnation that
-  produced them, while the new incarnation allocates workspace-local monotonic numeric job IDs above every inherited
-  allocation. Restore restart recovery reads only substrate facts: the canonical/pending detached metadata, the
-  displaced `pre-restore-*` image/grant/CA sidecars, and the exact sibling `.restore.json` recovery fact described in
-  01_storage.md. Before durable pending-metadata publication it restores the old generation; afterward it leaves the new
-  generation pending for idempotent controller-commitment publication and activation. Repeating recovery or activation
-  has the same result. The project runtime persists no restore fence, journal, or `.restore-fences` path.
+  none. The displaced image becomes `checkpoints/<ws>/pre-restore-<destination_incarnation>.<ext>` with its original
+  extension, so restore is undoable. The checkpoint source incarnation, the replaced active incarnation, and the fresh
+  destination incarnation are distinct roles; on repeated restore the checkpoint source can differ from the replaced
+  active generation. Before publication, failure restores the displaced workspace and old token; after the incarnation
+  fence is published, recovery completes forward and never exposes both tokens. Copied job records retain the
+  incarnation that produced them, while the new incarnation allocates workspace-local monotonic numeric job IDs above
+  every inherited allocation. Restore restart recovery reads only substrate facts: the canonical/pending detached
+  metadata, the destination-keyed displaced image/grant/CA sidecars, and the exact sibling `.restore.json` recovery fact
+  described in 01_storage.md. Before durable pending-metadata publication it restores the old generation; afterward it
+  leaves the new generation pending for idempotent controller-commitment publication and activation. Repeating startup
+  recovery and activation cleanup has the same result. The project runtime persists no restore fence, journal, or
+  `.restore-fences` path.
 
 - `cowshed gc` retains every pinned checkpoint, every checkpoint younger than 14 days, and always the newest five per
   workspace. A supplied label and `--keep` both create explicit pins; only an explicit unpin makes them eligible.

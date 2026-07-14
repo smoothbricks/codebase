@@ -262,12 +262,15 @@ gateway signs per-host interception leaves with it; only the public CA cert ever
 (04_sandbox.md/05_gateway.md). Schema in 04_sandbox.md.
 
 During macOS restore, `<canonical-image>.restore.json` is the sole recovery fact for an interrupted image/metadata
-publication. Its exact, unknown-field-denying schema is
-`{version, repoId, workspace, sourceCheckpoint, sourceIncarnation}`; every identity must agree with the canonical
-pending detached metadata. The fact is fsynced before pending metadata publication and removed, with a parent-directory
-fsync, only after the controller commitment is durably published and detached metadata is activated. Recovery combines
-that fact with the canonical and `pre-restore-*` image/grant/CA sidecars to choose rollback or idempotent completion.
-There is no runtime restore journal, `.restore-fences` directory, database row, or second mutable source of truth.
+publication. Its exact v2, unknown-field-denying schema is
+`{version, repoId, workspace, sourceCheckpoint, sourceIncarnation, replacedIncarnation, destinationIncarnation}`.
+`sourceCheckpoint` and `sourceIncarnation` identify the retained checkpoint and must match its detached metadata;
+`replacedIncarnation` must match the displaced image/grant/CA generation; and `destinationIncarnation` must match both
+the canonical pending metadata and the `pre-restore-<destinationIncarnation>` undo name. The fact is fsynced before
+pending metadata publication and removed, with a parent-directory fsync, only after the controller commitment is durably
+published and detached metadata is activated. Recovery uses that complete identity tuple to ignore retained older undo
+generations and choose rollback or idempotent completion. There is no runtime restore journal, `.restore-fences`
+directory, database row, or second mutable source of truth.
 
 ## Retention
 

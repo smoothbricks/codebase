@@ -2226,6 +2226,12 @@ fn recovery_rolls_back_when_published_metadata_is_missing() {
         .project()
         .checkpoints
         .join("main/pre-restore-00000000000000000000000000000002.sparseimage");
+    let source_checkpoint = layout
+        .project()
+        .checkpoints
+        .join("main/recovery-source.sparseimage");
+    create_image(&source_checkpoint, ImageFormat::Sparse);
+    write_ca_key(&source_checkpoint, b"source-ca-key");
     create_image(canonical.image(), ImageFormat::Sparse);
     std::fs::write(canonical.image(), b"old generation").expect("old image");
     create_image(&staged, ImageFormat::Sparse);
@@ -2256,7 +2262,8 @@ fn recovery_rolls_back_when_published_metadata_is_missing() {
         canonical.image(),
         &replacement,
         replacement.revision(),
-        &undo,
+        &source_checkpoint,
+        &metadata(ImageFormat::Sparse).workspace_incarnation,
     )
     .expect_err("metadata failpoint");
     std::fs::remove_file(sidecar_path(canonical.image())).expect("remove published metadata");
@@ -2350,6 +2357,12 @@ fn stateless_restore_recovery_converges_each_publication_boundary() {
             .project()
             .checkpoints
             .join("main/pre-restore-00000000000000000000000000000002.sparseimage");
+        let source_checkpoint = layout
+            .project()
+            .checkpoints
+            .join("main/recovery-source.sparseimage");
+        create_image(&source_checkpoint, ImageFormat::Sparse);
+        write_ca_key(&source_checkpoint, b"source-ca-key");
         create_image(canonical.image(), ImageFormat::Sparse);
         std::fs::write(canonical.image(), b"old generation").expect("old image");
         write_ca_key(canonical.image(), b"old-ca-key");
@@ -2410,7 +2423,8 @@ fn stateless_restore_recovery_converges_each_publication_boundary() {
                 canonical.image(),
                 &replacement,
                 replacement.revision(),
-                &undo,
+                &source_checkpoint,
+                &metadata(ImageFormat::Sparse).workspace_incarnation,
             )
             .expect_err("injected metadata publication crash");
         }
@@ -2429,10 +2443,8 @@ fn stateless_restore_recovery_converges_each_publication_boundary() {
                 pending[0].source_incarnation,
                 metadata(ImageFormat::Sparse).workspace_incarnation
             );
-            assert_eq!(
-                pending[0].source_checkpoint,
-                format!("pre-restore-{next_incarnation}")
-            );
+            assert_eq!(pending[0].source_checkpoint, "recovery-source");
+            assert_eq!(pending[0].destination_incarnation, next_incarnation);
             host.activate_restored_metadata(&pending[0].image)
                 .expect("idempotent forward activation");
             assert!(
@@ -2503,6 +2515,9 @@ fn restore_recovery_selects_current_undo_generation_among_older_history() {
         WorkspaceIncarnation::new("00000000000000000000000000000003").expect("second destination");
     let original_incarnation = metadata(ImageFormat::Sparse).workspace_incarnation;
     let checkpoint_directory = layout.project().checkpoints.join("main");
+    let source_checkpoint = checkpoint_directory.join("second-restore.sparseimage");
+    create_image(&source_checkpoint, ImageFormat::Sparse);
+    write_ca_key(&source_checkpoint, b"checkpoint-source-ca-key");
     let older_undo =
         checkpoint_directory.join(format!("pre-restore-{first_destination}.sparseimage"));
     let current_undo =
@@ -2531,19 +2546,29 @@ fn restore_recovery_selects_current_undo_generation_among_older_history() {
     pending_metadata
         .write_for_image(canonical.image())
         .expect("pending canonical metadata");
+    let recovery_fact = serde_json::json!({
+        "version": 2,
+        "repoId": repo(),
+        "workspace": "main",
+        "sourceCheckpoint": "second-restore",
+        "sourceIncarnation": original_incarnation.clone(),
+        "replacedIncarnation": first_destination.clone(),
+        "destinationIncarnation": second_destination.clone(),
+    });
     std::fs::write(
         restore_recovery_fact_path(canonical.image()),
-        serde_json::to_vec(&serde_json::json!({
-            "version": 1,
-            "repoId": repo(),
-            "workspace": "main",
-            "sourceCheckpoint": "second-restore",
-            "sourceIncarnation": first_destination,
-            "destinationIncarnation": second_destination,
-        }))
-        .expect("restore recovery fact JSON"),
+        serde_json::to_vec(&recovery_fact).expect("restore recovery fact JSON"),
     )
     .expect("restore recovery fact");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(restore_recovery_fact_path(canonical.image()))
+                .expect("read restore recovery fact"),
+        )
+        .expect("decode restore recovery fact"),
+        recovery_fact,
+        "restore recovery fact has an exact v2 schema"
+    );
 
     let host = native_host(&fixture, RecordingRunner::default());
     host.recover_pending(&fixture.config(), &[])
@@ -2567,16 +2592,113 @@ fn restore_recovery_selects_current_undo_generation_among_older_history() {
     assert!(ca_key_path(&older_undo).exists());
     let pending = host.pending_publications(&repo()).expect("pending restore");
     assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].source_incarnation, original_incarnation);
     assert_eq!(
-        pending[0].source_incarnation,
+        pending[0].replaced_incarnation,
         current_undo_metadata.workspace_incarnation
     );
+    assert_eq!(pending[0].destination_incarnation, second_destination);
     assert_eq!(pending[0].source_checkpoint, "second-restore");
+    let invalid_facts = [
+        (
+            "source checkpoint",
+            serde_json::json!({
+                "version": 2,
+                "repoId": repo(),
+                "workspace": "main",
+                "sourceCheckpoint": "missing-source",
+                "sourceIncarnation": original_incarnation.clone(),
+                "replacedIncarnation": first_destination.clone(),
+                "destinationIncarnation": second_destination.clone(),
+            }),
+        ),
+        (
+            "source incarnation",
+            serde_json::json!({
+                "version": 2,
+                "repoId": repo(),
+                "workspace": "main",
+                "sourceCheckpoint": "second-restore",
+                "sourceIncarnation": first_destination.clone(),
+                "replacedIncarnation": first_destination.clone(),
+                "destinationIncarnation": second_destination.clone(),
+            }),
+        ),
+        (
+            "replaced incarnation",
+            serde_json::json!({
+                "version": 2,
+                "repoId": repo(),
+                "workspace": "main",
+                "sourceCheckpoint": "second-restore",
+                "sourceIncarnation": original_incarnation.clone(),
+                "replacedIncarnation": original_incarnation.clone(),
+                "destinationIncarnation": second_destination.clone(),
+            }),
+        ),
+        (
+            "destination incarnation",
+            serde_json::json!({
+                "version": 2,
+                "repoId": repo(),
+                "workspace": "main",
+                "sourceCheckpoint": "second-restore",
+                "sourceIncarnation": original_incarnation.clone(),
+                "replacedIncarnation": first_destination.clone(),
+                "destinationIncarnation": first_destination.clone(),
+            }),
+        ),
+        (
+            "unknown field",
+            serde_json::json!({
+                "version": 2,
+                "repoId": repo(),
+                "workspace": "main",
+                "sourceCheckpoint": "second-restore",
+                "sourceIncarnation": original_incarnation.clone(),
+                "replacedIncarnation": first_destination.clone(),
+                "destinationIncarnation": second_destination.clone(),
+                "runtimeJournal": true,
+            }),
+        ),
+    ];
+    for (field, invalid_fact) in invalid_facts {
+        std::fs::write(
+            restore_recovery_fact_path(canonical.image()),
+            serde_json::to_vec(&invalid_fact).expect("invalid fact JSON"),
+        )
+        .expect("invalid restore fact");
+        assert!(
+            host.pending_publications(&repo()).is_err(),
+            "forged or unknown {field} must be rejected"
+        );
+    }
+    std::fs::write(
+        restore_recovery_fact_path(canonical.image()),
+        serde_json::to_vec(&recovery_fact).expect("valid fact JSON"),
+    )
+    .expect("restore valid recovery fact");
 
     host.activate_restored_metadata(canonical.image())
         .expect("activate recovered restore");
+    std::fs::write(
+        restore_recovery_fact_path(canonical.image()),
+        serde_json::to_vec(&recovery_fact).expect("lingering fact JSON"),
+    )
+    .expect("simulate crash before activation fact cleanup");
+    host.activate_restored_metadata(canonical.image())
+        .expect("clean lingering activation fact");
+    host.activate_restored_metadata(canonical.image())
+        .expect("repeated activation is idempotent");
     host.recover_pending(&fixture.config(), &[])
         .expect("post-activation recovery");
+    host.recover_pending(&fixture.config(), &[])
+        .expect("repeated post-activation recovery");
+    assert!(
+        host.pending_publications(&repo())
+            .expect("active facts")
+            .is_empty()
+    );
     assert!(!restore_recovery_fact_path(canonical.image()).exists());
     assert!(
         older_undo.exists(),
@@ -2591,6 +2713,47 @@ fn restore_recovery_selects_current_undo_generation_among_older_history() {
             .expect("activated metadata")
             .workspace_incarnation,
         WorkspaceIncarnation::new("00000000000000000000000000000003").expect("second destination")
+    );
+    pending_metadata
+        .write_for_image(canonical.image())
+        .expect("restore pending metadata for forged fact");
+    let forged_fact = serde_json::json!({
+        "version": 2,
+        "repoId": repo(),
+        "workspace": "main",
+        "sourceCheckpoint": "second-restore",
+        "sourceIncarnation": original_incarnation.clone(),
+        "replacedIncarnation": original_incarnation.clone(),
+        "destinationIncarnation": second_destination,
+    });
+    std::fs::write(
+        restore_recovery_fact_path(canonical.image()),
+        serde_json::to_vec(&forged_fact).expect("forged fact JSON"),
+    )
+    .expect("forged restore fact");
+    let error = host
+        .recover_pending(&fixture.config(), &[])
+        .expect_err("forged replaced incarnation must be rejected");
+    assert!(matches!(error, ApfsStorageError::MarkerMismatch(_)));
+    let legacy_v1_fact = serde_json::json!({
+        "version": 1,
+        "repoId": repo(),
+        "workspace": "main",
+        "sourceCheckpoint": "second-restore",
+        "sourceIncarnation": original_incarnation.clone(),
+        "destinationIncarnation": WorkspaceIncarnation::new(
+            "00000000000000000000000000000003"
+        )
+        .expect("second destination"),
+    });
+    std::fs::write(
+        restore_recovery_fact_path(canonical.image()),
+        serde_json::to_vec(&legacy_v1_fact).expect("legacy fact JSON"),
+    )
+    .expect("legacy restore fact");
+    assert!(
+        host.pending_publications(&repo()).is_err(),
+        "v1 facts without replacedIncarnation require clean restore recreation"
     );
     assert_ne!(
         original_incarnation,
