@@ -8,7 +8,9 @@ to itself.
 ## Repository identity
 
 A _project_ is a checkout bound to one or more stable repository identities. A `repo_id` is machine-independent and has
-exactly two validated components:
+exactly two validated components. A Cowshed installation may adopt any number of projects. Each project's primary
+`repo_id` owns exactly one warm `main` workspace plus its own session/checkpoint namespace; `main` is never a
+machine-global singleton.
 
 ```
 repo_id = lowercase(owner) + "/" + lowercase(repo)
@@ -180,14 +182,14 @@ precious.
 
 ## Runtime state: derived, never stored
 
-| Question                | Source of truth                                                                 |
-| ----------------------- | ------------------------------------------------------------------------------- |
-| Which workspaces exist? | `readdir` for `.asif`/`.sparseimage` images in `sessions/` (+ exactly one main) |
-| Image format            | Sibling metadata `imageFormat`, validated against the image extension           |
-| What is attached where? | Kernel mount table (`getmntinfo`), matched by volume name                       |
-| Workspace identity      | In-image marker `.cowshed/workspace.json`                                       |
-| Grants                  | Sibling file `<image>.grants.json`                                              |
-| Concurrency             | `flock` on `<image>.lock` per lifecycle operation                               |
+| Question                | Source of truth                                                                                             |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Which workspaces exist? | For the selected primary `repo_id`, `readdir` its `sessions/` images plus that project's exactly one `main` |
+| Image format            | Sibling metadata `imageFormat`, validated against the image extension                                       |
+| What is attached where? | Kernel mount table (`getmntinfo`), matched by volume name                                                   |
+| Workspace identity      | In-image marker `.cowshed/workspace.json`                                                                   |
+| Grants                  | Sibling file `<image>.grants.json`                                                                          |
+| Concurrency             | `flock` on `<image>.lock` per lifecycle operation                                                           |
 
 The detached metadata required for discovery and attach lives in `<image>.grants.json`; at minimum it contains the
 workspace identity and `imageFormat`, in addition to the grant schema in 04_sandbox.md. Thus `cowshed ls` and attach do
