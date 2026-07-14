@@ -238,7 +238,7 @@ fn read_systemd_credential(
             "systemd credential file has invalid type, ownership, mode, or size".to_owned(),
         ));
     }
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
