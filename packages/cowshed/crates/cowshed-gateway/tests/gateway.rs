@@ -768,7 +768,7 @@ async fn read_response_head(stream: &mut TcpStream) -> String {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn allow_deny_malformed_token_and_audit_fields() {
-    let (upstream_port, mut captured, _upstream) = http_fixture(1, None).await;
+    let (upstream_port, mut captured, _upstream) = http_fixture(2, None).await;
     let endpoint = free_endpoint();
     let (audit_tx, mut audit_rx) = mpsc::channel(8);
     let gateway = gateway(
@@ -815,7 +815,11 @@ async fn allow_deny_malformed_token_and_audit_fields() {
         response.contains("cowshed grant &lt;ws&gt;") || response.contains("cowshed grant <ws>")
     );
 
-    let allowed = absolute_request("allowed.test", upstream_port, &token, "/allowed/item");
+    let allowed = absolute_request("allowed.test", upstream_port, &token, "/allowed/item")
+        .replace(
+            "\r\n\r\n",
+            "\r\ntraceparent: 00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-03\r\ntracestate: vendor=opaque\r\n\r\n",
+        );
     let response = proxy_request(endpoint, allowed).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(!response.to_ascii_lowercase().contains("set-cookie"));
@@ -826,6 +830,25 @@ async fn allow_deny_malformed_token_and_audit_fields() {
             .to_ascii_lowercase()
             .contains("proxy-authorization")
     );
+    assert!(forwarded.contains(
+        "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-"
+    ));
+    assert!(!forwarded.contains("00F067AA0BA902B7"));
+    assert!(forwarded.contains("tracestate: vendor=opaque"));
+    let invalid_trace =
+        absolute_request("allowed.test", upstream_port, &token, "/allowed/invalid")
+            .replace(
+                "\r\n\r\n",
+                "\r\ntraceparent: 00-00000000000000000000000000000000-00f067aa0ba902b7-01\r\ntracestate: vendor=opaque\r\n\r\n",
+            );
+    let invalid_response = proxy_request(endpoint, invalid_trace).await;
+    assert!(
+        invalid_response.starts_with("HTTP/1.1 200"),
+        "{invalid_response}"
+    );
+    let invalid_forwarded = captured.recv().await.expect("invalid trace forwarded");
+    assert!(!invalid_forwarded.contains("00000000000000000000000000000000"));
+    assert!(!invalid_forwarded.contains("tracestate:"));
 
     let unauthorized = timeout(Duration::from_secs(1), audit_rx.recv())
         .await
@@ -855,8 +878,25 @@ async fn allow_deny_malformed_token_and_audit_fields() {
     assert_eq!(allowed.method.as_deref(), Some("GET"));
     assert_eq!(allowed.path.as_deref(), Some("/allowed/item"));
     assert_eq!(allowed.bytes, 2);
-    assert!(allowed.trace_id.is_some());
-    assert!(unauthorized.sequence < denied.sequence && denied.sequence < allowed.sequence);
+    assert_eq!(
+        allowed.trace_id.as_deref(),
+        Some("4bf92f3577b34da6a3ce929d0e0e4736")
+    );
+    assert_eq!(allowed.parent_span_id, Some(0x00f0_67aa_0ba9_02b7));
+    assert_ne!(allowed.upstream_span_id, Some(allowed.span_id));
+    assert_eq!(allowed.tracestate.as_deref(), Some("vendor=opaque"));
+    let invalid = timeout(Duration::from_secs(1), audit_rx.recv())
+        .await
+        .expect("invalid trace audit timeout")
+        .expect("invalid trace audit");
+    assert_eq!(invalid.classification.as_deref(), Some("invalid-trace-context"));
+    assert!(invalid.parent_span_id.is_none());
+    assert!(invalid.tracestate.is_none());
+    assert!(
+        unauthorized.sequence < denied.sequence
+            && denied.sequence < allowed.sequence
+            && allowed.sequence < invalid.sequence
+    );
     gateway.drain().await.expect("drain gateway");
 }
 
@@ -1275,6 +1315,7 @@ async fn active_queue_and_overflow_limits_are_enforced() {
     let endpoint = free_endpoint();
     let mut config = test_config();
     config.limits = GatewayLimits {
+        max_sessions: 2,
         workspace_active: 1,
         workspace_queued: 1,
         global_active: 1,
@@ -1366,6 +1407,7 @@ async fn queued_request_timeout_cancels_without_leaking_a_slot() {
     let endpoint = free_endpoint();
     let mut config = test_config();
     config.limits = GatewayLimits {
+        max_sessions: 2,
         workspace_active: 1,
         workspace_queued: 1,
         global_active: 1,
@@ -1628,6 +1670,7 @@ async fn arrow_audit_sink_publishes_durable_single_batch_segments() {
         sequence: 1,
         timestamp_unix_ms: 1_700_000_000_000,
         workspace_id: "audit-ws".to_owned(),
+        repo_id: "repo-audit".to_owned(),
         revision: 3,
         endpoint: "127.0.0.1:40960".to_owned(),
         kind: AuditKind::Npm,
@@ -1638,6 +1681,10 @@ async fn arrow_audit_sink_publishes_durable_single_batch_segments() {
         http_status: Some(200),
         bytes: 12,
         trace_id: Some("00000000000000000000000000000001".to_owned()),
+        span_id: 1,
+        upstream_span_id: Some(2),
+        parent_span_id: None,
+        tracestate: None,
         grant_hint: None,
         classification: None,
         mirror_cache_status: Some(MirrorCacheStatus::Filled),
@@ -1649,6 +1696,7 @@ async fn arrow_audit_sink_publishes_durable_single_batch_segments() {
             sequence: 2,
             timestamp_unix_ms: 1_700_000_000_001,
             workspace_id: "audit-ws".to_owned(),
+            repo_id: "repo-audit".to_owned(),
             revision: 3,
             endpoint: "127.0.0.1:40960".to_owned(),
             kind: AuditKind::Http,
@@ -1659,6 +1707,10 @@ async fn arrow_audit_sink_publishes_durable_single_batch_segments() {
             http_status: Some(200),
             bytes: 12,
             trace_id: None,
+            span_id: 3,
+            upstream_span_id: Some(4),
+            parent_span_id: None,
+            tracestate: None,
             grant_hint: None,
             classification: None,
             mirror_cache_status: Some(MirrorCacheStatus::Hit),
@@ -1666,7 +1718,9 @@ async fn arrow_audit_sink_publishes_durable_single_batch_segments() {
         .await
         .expect_err("non-mirror cache status must be rejected");
     assert!(invalid.0.contains("non-mirror"));
-    sink.flush().await.expect("flush Arrow audit");
+    sink.flush()
+        .await
+        .expect_err("invalid event hard-stops the audit writer");
     let partition = std::fs::read_dir(&root)
         .expect("read telemetry root")
         .next()
@@ -1701,11 +1755,11 @@ async fn arrow_audit_sink_publishes_durable_single_batch_segments() {
     )
     .expect("read Arrow stream");
     let batch = reader.next().expect("one batch").expect("valid batch");
-    assert_eq!(batch.num_rows(), 1);
-    assert_eq!(batch.schema().field(0).name(), "sequence");
-    assert_eq!(batch.schema().field(15).name(), "mirror_cache_status");
+    assert_eq!(batch.num_rows(), 4);
+    assert_eq!(batch.schema().field(0).name(), "timestamp");
+    assert_eq!(batch.schema().field(22).name(), "mirror_cache_status");
     let cache_status = batch
-        .column(15)
+        .column(22)
         .as_any()
         .downcast_ref::<arrow_array::StringArray>()
         .expect("mirror cache status string column");
@@ -2059,6 +2113,7 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
     let single_permit_config = || {
         let mut config = test_config();
         config.limits = GatewayLimits {
+            max_sessions: 2,
             workspace_active: 1,
             workspace_queued: 1,
             global_active: 1,
@@ -2275,6 +2330,7 @@ async fn queued_disconnect_and_drain_reclaim_all_capacity() {
     });
     let mut config = test_config();
     config.limits = GatewayLimits {
+        max_sessions: 2,
         workspace_active: 1,
         workspace_queued: 1,
         global_active: 1,
@@ -2376,6 +2432,7 @@ async fn queued_disconnect_and_drain_reclaim_all_capacity() {
 async fn client_tls_failures_reclaim_permits_and_pre_admission_denials_are_audited() {
     let mut config = test_config();
     config.limits = GatewayLimits {
+        max_sessions: 2,
         workspace_active: 1,
         workspace_queued: 1,
         global_active: 1,
