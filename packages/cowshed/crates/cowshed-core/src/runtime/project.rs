@@ -11,11 +11,11 @@ use tokio::task::JoinHandle;
 use url::Url;
 
 use crate::api::dto::{
-    AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult,
+    AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg,
     CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GitOid, GrantDelta,
     GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo, PushOptions, PushReport,
     RebaseOptions, RemoveOptions, RevisionResult, RunSandboxMode, StdinSource,
-    WorkspaceIncarnation, WorkspaceInfo,
+    WorkspaceIncarnation, WorkspaceInfo, validate_command_argv,
 };
 use crate::api::server::{
     ConnectionAuthority, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
@@ -1070,7 +1070,7 @@ struct ExecWire {
     workspace: WorkspaceName,
     workspace_incarnation: WorkspaceIncarnation,
     session: Option<String>,
-    argv: Vec<String>,
+    argv: Vec<CommandArg>,
     cwd: Option<crate::api::dto::WorkspacePath>,
     mode: ExecModeWire,
     env: std::collections::HashMap<String, String>,
@@ -1098,12 +1098,13 @@ enum StdinWire {
     },
 }
 
-/// The sole temporary UTF-8 argv boundary. Runtime and supervisor code receive `ExecRequest`
-/// without inspecting or rewriting argv, so the pending tagged byte-safe argv cutover is localized.
 fn decode_exec_request(
     request: &RouterRequest,
 ) -> Result<(WorkerScope, Option<String>, ExecRequest)> {
     let wire: ExecWire = decode_params(request.params(), request.method())?;
+    validate_command_argv(&wire.argv).map_err(|error| {
+        CowshedError::usage(error.to_string(), "provide a valid bounded command argv")
+    })?;
     let stdin = match wire.stdin {
         StdinWire::Empty => {
             if request.upload().is_some() {
@@ -2315,7 +2316,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 .exec(
                     None,
                     ExecRequest {
-                        argv: vec!["/bin/sh".into(), "-c".into(), check.clone()],
+                        argv: vec!["/bin/sh".into(), "-c".into(), check.clone().into()],
                         cwd: None,
                         mode: RunSandboxMode::ReadWrite,
                         env: std::collections::HashMap::new(),

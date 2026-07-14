@@ -1,22 +1,26 @@
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use arrow_schema::DataType;
 use cowshed_core::api::{
     AdmissionCommitment, BinaryData, CONTROLLER_COMMITMENT_VERSION, CheckpointCommitment,
-    ControllerCommitment, JobId, JobState, MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo,
-    OutputPublication, OutputStorage, ProtectedOutput, PublicationPolicy, Sha256Digest, StreamInfo,
-    TerminalCommitment, WorkspaceIncarnation, WorkspacePath,
+    CommandArg, ControllerCommitment, DtoError, JobId, JobState, MAX_COMMAND_ARG_BYTES,
+    MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication, OutputStorage, ProtectedOutput,
+    PublicationPolicy, Sha256Digest, StreamInfo, TerminalCommitment, WorkspaceIncarnation,
+    WorkspacePath,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::job_artifact::{
     ArtifactConfig, ArtifactError, ArtifactStore, CommitmentPriorContext, JobArtifactToken,
     OutputTargets, ProtectedRecord, PublicationStage, StreamKind, StreamTarget,
     controller_commitment_schema, controller_commitments_from_batch,
-    controller_commitments_to_batch, open_stream_reader, read_stream, reconcile_commitments,
-    recover_records, recover_records_with_budget, validate_commitments,
+    controller_commitments_to_batch, open_stream_reader, protected_record_schema, read_stream,
+    reconcile_commitments, recover_records, recover_records_with_budget, validate_commitments,
 };
 use proptest::prelude::*;
 
@@ -75,13 +79,24 @@ fn store(root: &Path, config: ArtifactConfig) -> ArtifactStore {
     )
     .unwrap()
 }
+fn begin_with_argv(
+    store: &mut ArtifactStore,
+    grant_revision: u64,
+    argv: &[CommandArg],
+    targets: OutputTargets,
+) -> JobArtifactToken {
+    let job_id = store.next_job_id().unwrap();
+    store
+        .begin_job(job_id, grant_revision, argv, targets)
+        .unwrap()
+}
+
 fn begin(
     store: &mut ArtifactStore,
     grant_revision: u64,
     targets: OutputTargets,
 ) -> JobArtifactToken {
-    let job_id = store.next_job_id().unwrap();
-    store.begin_job(job_id, grant_revision, targets).unwrap()
+    begin_with_argv(store, grant_revision, &["true".into()], targets)
 }
 
 #[test]
@@ -255,11 +270,11 @@ fn stale_and_foreign_tokens_are_typed_conflicts() {
     let mut actor_store = store(root.path(), ArtifactConfig::default());
     let stale_id = actor_store.next_job_id().unwrap();
     let stale = actor_store
-        .begin_job(stale_id, 1, OutputTargets::default())
+        .begin_job(stale_id, 1, &["true".into()], OutputTargets::default())
         .unwrap();
     actor_store.abort(stale).unwrap();
     assert!(matches!(
-        actor_store.begin_job(stale_id, 1, OutputTargets::default()),
+        actor_store.begin_job(stale_id, 1, &["true".into()], OutputTargets::default()),
         Err(ArtifactError::TokenConflict { .. })
     ));
 
@@ -353,6 +368,68 @@ fn combined_quota_accepts_exact_boundary_and_reports_first_crossing() {
         read_stream(crossed_root.path(), &sealed.record.stderr).unwrap(),
         b"45"
     );
+}
+
+#[test]
+fn unsafe_argv_rejects_before_artifact_creation_or_id_advance() {
+    let root = TempRoot::new("unsafe-argv");
+    let mut store = store(root.path(), ArtifactConfig::default());
+    let job_id = store.next_job_id().unwrap();
+    let records = root.path().join(".cowshed/job/records.arrow");
+
+    let nul = [CommandArg::from(OsString::from_vec(vec![b'x', 0]))];
+    assert!(matches!(
+        store.begin_job(job_id, 1, &nul, OutputTargets::default()),
+        Err(ArtifactError::Dto(DtoError::CommandArgumentContainsNul))
+    ));
+    assert_eq!(store.next_job_id().unwrap(), job_id);
+    assert!(!records.exists());
+
+    let oversize = [CommandArg::from(OsString::from_vec(vec![
+        b'x';
+        MAX_COMMAND_ARG_BYTES
+            + 1
+    ]))];
+    assert!(matches!(
+        store.begin_job(job_id, 1, &oversize, OutputTargets::default()),
+        Err(ArtifactError::Dto(DtoError::CommandArgumentTooLarge))
+    ));
+    assert_eq!(store.next_job_id().unwrap(), job_id);
+    assert!(!records.exists());
+}
+
+#[test]
+fn non_utf8_argv_round_trips_through_binary_arrow_and_recovery() {
+    let root = TempRoot::new("argv-binary");
+    let mut store = store(root.path(), ArtifactConfig::default());
+    let raw = vec![0xff, b'a', 0x80];
+    let argv = vec![
+        CommandArg::from(OsString::from_vec(raw.clone())),
+        CommandArg::from("--flag"),
+    ];
+    let token = begin_with_argv(&mut store, 7, &argv, OutputTargets::default());
+    let sealed = store.finish(token, JobState::Exited).unwrap();
+    assert_eq!(sealed.record.argv, argv);
+
+    let schema = protected_record_schema();
+    let field = schema.field_with_name("argv").unwrap();
+    let DataType::List(item) = field.data_type() else {
+        panic!("argv must be an Arrow list");
+    };
+    assert_eq!(item.data_type(), &DataType::Binary);
+
+    let recovery = recover_records(&root.path().join(".cowshed/job/records.arrow")).unwrap();
+    let recovered = recovery
+        .frames
+        .iter()
+        .filter_map(|frame| match &frame.record {
+            ProtectedRecord::Job(record) if record.state == JobState::Exited => Some(record),
+            _ => None,
+        })
+        .next()
+        .expect("terminal job record");
+    assert_eq!(recovered.argv, argv);
+    assert_eq!(recovered.argv[0].as_os_str().as_bytes(), raw);
 }
 
 #[test]

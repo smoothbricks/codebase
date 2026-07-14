@@ -1,13 +1,15 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::{
-    CONTROLLER_COMMITMENT_VERSION, ControllerCommitment, ExecRequest, JobId, JobState,
-    OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary, ProtectedOutput,
-    RunSandboxMode, Sha256Digest, StdinSource, StreamInfo, WorkspacePath,
+    CONTROLLER_COMMITMENT_VERSION, CommandArg, ControllerCommitment, ExecRequest, JobId, JobState,
+    MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary,
+    ProtectedOutput, RunSandboxMode, Sha256Digest, StdinSource, StreamInfo, WorkspacePath,
 };
 use cowshed_core::error::{CowshedError, ErrorCode, Result};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
@@ -146,7 +148,13 @@ impl ArtifactSink for FakeArtifactSink {
         Ok(self.next)
     }
 
-    fn admit(&mut self, expected_job_id: JobId, _grant_revision: u64) -> Result<()> {
+    fn admit(
+        &mut self,
+        expected_job_id: JobId,
+        _grant_revision: u64,
+        argv: &[CommandArg],
+    ) -> Result<()> {
+        assert!(!argv.is_empty());
         assert_eq!(expected_job_id, self.next);
         self.observations
             .send(ArtifactObservation::Admit(expected_job_id))
@@ -473,6 +481,54 @@ async fn complete(spawned: &Spawned, stdout: &[u8], stderr: &[u8], exit: Process
 
 async fn open_named(handle: &WorkspaceSupervisorHandle, name: &str) -> SessionToken {
     handle.open_session(Some(name.into())).await.unwrap()
+}
+
+#[tokio::test]
+async fn non_utf8_argv_reaches_spawn_and_job_info_without_loss() {
+    let mut h = harness(1, 1024, false, false);
+    let raw = vec![0xff, b'x', 0x80];
+    let mut exec = request(StdinSource::Empty);
+    exec.argv = vec![
+        CommandArg::from(OsString::from_vec(raw.clone())),
+        CommandArg::from("--flag"),
+    ];
+    let job = h.handle.exec(None, exec).await.unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    assert_eq!(spawned.request.argv[0].as_os_str().as_bytes(), raw);
+    let info = h.handle.info(job).await.unwrap();
+    assert_eq!(info.argv[0].as_os_str().as_bytes(), raw);
+    complete(&spawned, b"", b"", ProcessExit::Exited(0)).await;
+    h.handle.wait(job).await.unwrap();
+}
+
+#[tokio::test]
+async fn unsafe_argv_rejects_before_artifact_commitment_or_spawn_effects() {
+    let mut h = harness(1, 1024, false, false);
+    for argument in [
+        OsString::from_vec(vec![b'x', 0]),
+        OsString::from_vec(vec![b'x'; MAX_COMMAND_ARG_BYTES + 1]),
+    ] {
+        let mut exec = request(StdinSource::Empty);
+        exec.argv = vec![CommandArg::from(argument)];
+        let error = h.handle.exec(None, exec).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Usage);
+        assert!(matches!(
+            h.spawned.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            h.artifacts.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            h.commitments.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            h.order.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
 }
 
 #[tokio::test]

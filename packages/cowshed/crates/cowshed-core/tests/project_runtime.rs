@@ -1,10 +1,12 @@
+use std::ffi::OsString;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::dto::{
-    AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult,
+    AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg,
     CreateOptions, DoctorReport, EnsureAction, EnsureReport, Finding, FindingSeverity, GcOptions,
     GcReport, GitOid, GrantDelta, GrantSet, ImageFormat, JobId, JobInfo, LandOptions, LandReport,
     MirrorInfo, PortBlock, PushOptions, PushReport, RebaseOptions, RemoveOptions, WorkspaceInfo,
@@ -35,6 +37,7 @@ enum Event {
     RestorePending(WorkspaceName),
     RestoreEvidence(WorkspaceName),
     RestoreActivate(WorkspaceName),
+    Exec(Vec<Vec<u8>>),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -578,10 +581,19 @@ impl ProjectRuntimeHost for FakeHost {
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         _session: Option<String>,
-        _request: cowshed_core::api::dto::ExecRequest,
+        request: cowshed_core::api::dto::ExecRequest,
     ) -> Result<JobId> {
         self.require_incarnation(&workspace, &incarnation)?;
-        Err(Self::worker_unavailable())
+        self.events
+            .send(Event::Exec(
+                request
+                    .argv
+                    .iter()
+                    .map(|argument| argument.as_os_str().as_bytes().to_vec())
+                    .collect(),
+            ))
+            .ok();
+        JobId::new(1).map_err(|error| CowshedError::internal(error.to_string()))
     }
 
     async fn stdin_write(
@@ -735,6 +747,63 @@ async fn adopt(router: &RouterHandle, repo: &RepoId) -> Value {
     )
     .await
     .expect("adopt")
+}
+
+#[tokio::test]
+async fn router_decodes_tagged_non_utf8_argv_without_a_string_boundary() {
+    let root = test_root();
+    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    let adopted = adopt(&router, &repo).await;
+    while events.try_recv().is_ok() {}
+    let incarnation = adopted["info"]["workspaceIncarnation"].clone();
+    let raw = vec![0xff, b'a', 0x80];
+    let argv = vec![
+        CommandArg::from(OsString::from_vec(raw.clone())),
+        CommandArg::from("--flag"),
+    ];
+    let params = json!({
+        "repoId": repo,
+        "workspace": "main",
+        "workspaceIncarnation": incarnation,
+        "session": null,
+        "argv": serde_json::to_value(&argv).unwrap(),
+        "cwd": null,
+        "mode": "readWrite",
+        "env": {},
+        "trace": null,
+        "stdin": {"kind":"empty"},
+        "stdoutCopy": null,
+        "stderrCopy": null
+    });
+    assert_eq!(
+        route(
+            &router,
+            coordinator(repo.clone()),
+            "worker.exec",
+            params.clone()
+        )
+        .await
+        .unwrap(),
+        json!(1)
+    );
+    assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
+    let Some(Event::Exec(decoded)) = events.recv().await else {
+        panic!("missing exec event");
+    };
+    assert_eq!(decoded, vec![raw, b"--flag".to_vec()]);
+
+    for invalid_argv in [
+        json!([{"encoding":"base64","data":"%%%"}]),
+        json!([{"encoding":"utf8","data":"\u{0}"}]),
+    ] {
+        let mut invalid = params.clone();
+        invalid["argv"] = invalid_argv;
+        let error = route(&router, coordinator(repo.clone()), "worker.exec", invalid)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Usage);
+        assert!(events.try_recv().is_err(), "invalid argv reached the host");
+    }
 }
 
 #[tokio::test]

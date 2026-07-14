@@ -89,9 +89,16 @@ impl WorkspaceRef {
 
 ```rust
 pub enum RunSandboxMode { ReadWrite, ReadOnly }
+pub const MAX_COMMAND_ARG_BYTES: usize = 128 * 1024;
+pub const MAX_ARGV_BYTES: usize = 1024 * 1024;
+
+/// Immutable OS-native argument. From<OsString>/From<String>/From<&str> preserve ownership;
+/// as_os_str borrows and into_os_string consumes without a lossy text conversion.
+pub struct CommandArg(OsString);
+
 
 pub struct ExecRequest {
-    pub argv: Vec<String>,
+    pub argv: Vec<CommandArg>,
     pub cwd: Option<PathBuf>,            // relative to mount; default mount root
     pub mode: RunSandboxMode,            // default ReadWrite
     pub env: HashMap<String, String>,    // filtered through the build-config allowlist
@@ -259,7 +266,7 @@ pub struct JobInfo {
     pub state: JobState,
     pub pid: Option<u32>,
     pub grant_revision: u64,
-    pub argv: Vec<String>,
+    pub argv: Vec<CommandArg>,
     pub cwd: Option<WorkspacePath>,        // None is the workspace mount root
     pub started: UtcTimestamp,
     pub duration_ms: Option<u64>,
@@ -554,6 +561,13 @@ reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission 
   `"info" | "warning" | "error"`. `GcReport = { examined, reclaimed, retainedPinned, freedBytes, dryRun }`.
 - `JobId` is a positive integer no greater than `2^53-1`.
   `JobInfo = { repoId, workspaceIncarnation, jobId, state, pid?, grantRevision, argv, cwd, started, durationMs?, exit?, stdout, stderr, trace, outputLimit?, stdin }`.
+  Every element of `argv` is the exact tagged `CommandArg` object
+  `{encoding:"utf8",data:String} | {encoding:"base64",data:String}`. Serialization selects `utf8` if and only if the
+  Unix argument bytes are valid UTF-8; otherwise it emits canonical standard base64. Decoders deny unknown fields and
+  encodings and reject malformed or non-canonical base64, base64 used for valid UTF-8, decoded NUL, arguments above 128
+  KiB, total argv above 1 MiB, an empty vector or `argv[0]`, and a byte representation the host platform cannot
+  reproduce exactly. Validation happens before RPC dispatch, process allocation/spawn, and protected-artifact effects.
+  Protected Arrow stores `argv` as a required `List<Binary>` and recovery revalidates each raw argument and both bounds.
   `started` is a full RFC3339 string: `Z` and numeric offsets are accepted. A `:60` value is normalized to UTC and
   accepted only when it denotes a published IERS leap instant (for example `2016-12-31T18:59:60-05:00`); local
   `23:59:60` alone is insufficient, and unannounced future leap seconds reject. Calendar, clock, fraction, and offset
@@ -728,6 +742,9 @@ export interface OutputSummary {
   truncated: boolean;
 }
 
+export type CommandArg = { encoding: 'utf8'; data: string } | { encoding: 'base64'; data: string };
+// Per argument: 128 KiB decoded. Per argv: 1 MiB decoded. NUL and non-canonical tags reject.
+
 export type BinaryData = { encoding: 'utf8'; data: string } | { encoding: 'base64'; data: string };
 // Both branches are bounded by decoded byte length; utf8 is emitted iff the bytes are valid UTF-8.
 export type ProtectedOutput = { kind: 'inline'; data: BinaryData } | { kind: 'file'; path: string };
@@ -748,7 +765,7 @@ export interface JobInfo {
   state: 'queued' | 'running' | 'exited' | 'signaled' | 'killed' | 'outputLimit' | 'failed';
   pid?: number;
   grantRevision: number;
-  argv: string[];
+  argv: CommandArg[];
   cwd: string;
   started: Date;
   durationMs?: number;
@@ -803,8 +820,8 @@ export interface CheckpointOptions {
 export interface WorkspaceHandle {
   readonly name: string;
   readonly mountPath: string;
-  exec(argv: string[], opts?: ExecOptions): Promise<JobHandle>;
-  background(argv: string[], opts?: ExecOptions): Promise<JobHandle>;
+  exec(argv: Array<string | Uint8Array>, opts?: ExecOptions): Promise<JobHandle>;
+  background(argv: Array<string | Uint8Array>, opts?: ExecOptions): Promise<JobHandle>;
   listJobs(): Promise<JobInfo[]>;
   job(id: JobId): Promise<JobHandle>;
   checkpoint(opts?: CheckpointOptions): Promise<string>;
@@ -827,6 +844,12 @@ One boundary answer, no ambiguity:
   created lazily on promotion. `JobHandle.logs` and attachment stream iterables resolve `storage.artifact`
   representation-transparently. `Redirect.source` and `stdoutCopy`/`stderrCopy` publication destinations are never used
   for reads or authority.
+- **Command arguments are OS bytes, never text-normalized.** Rust moves `OsString` into `CommandArg`; the controller
+  request and `JobInfo` reuse its one exact tagged serde shape, and protected Arrow stores a Binary list. Valid UTF-8
+  takes the readable `utf8` branch without base64 allocation. Non-UTF-8 Unix bytes take canonical base64 across JSON,
+  are restored before supervisor planning, and are consumed into `OsString` for spawn without `String`,
+  `to_string_lossy`, replacement characters, or a second wire union. The 128 KiB argument and 1 MiB argv bounds are
+  checked before RPC, spawn, and artifact mutation.
 - **JSON is bounded control plus tagged inline data.** Ordinary `JobInfo` may carry `BinaryData` as the exact bounded
   `utf8|base64` tagged union for an inline protected artifact. It never embeds an unbounded stream or invents a path.
   Controller commitments never contain either encoding, protected paths, redirect sources, or other output payload.

@@ -1,7 +1,10 @@
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -18,10 +21,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::api::dto::{
-    AdmissionCommitment, BinaryData, CheckpointCommitment, ControllerCommitment, DtoError,
-    ForkCommitment, JobId, JobState, MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication,
-    OutputStorage, OutputSummary, ProtectedOutput, RestoreCommitment, Sha256Digest, StreamInfo,
-    TerminalCommitment, WorkspacePath,
+    AdmissionCommitment, BinaryData, CheckpointCommitment, CommandArg, ControllerCommitment,
+    DtoError, ForkCommitment, JobId, JobState, MAX_ARGV_BYTES, MAX_COMMAND_ARG_BYTES,
+    MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary,
+    ProtectedOutput, RestoreCommitment, Sha256Digest, StreamInfo, TerminalCommitment,
+    WorkspacePath, validate_command_argv,
 };
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
@@ -34,7 +38,7 @@ const BATCH_TRAILER: &[u8; 8] = b"CSEND001";
 const FRAME_HEADER_BYTES: usize = 24;
 const FRAME_OVERHEAD_BYTES: usize = FRAME_HEADER_BYTES + 32 + BATCH_TRAILER.len();
 const MAX_RECORD_BATCH_BYTES: u64 = 8 * 1024 * 1024;
-const RECORD_SCHEMA_VERSION: u64 = 1;
+const RECORD_SCHEMA_VERSION: u64 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicationStage {
@@ -189,6 +193,7 @@ pub struct JobArtifactRecord {
     pub sequence: u64,
     pub state: JobState,
     pub grant_revision: u64,
+    pub argv: Vec<CommandArg>,
     pub output_limit: Option<OutputLimitInfo>,
     pub stdout: StreamInfo,
     pub stderr: StreamInfo,
@@ -196,6 +201,7 @@ pub struct JobArtifactRecord {
 
 impl JobArtifactRecord {
     pub fn validate(&self) -> Result<(), ArtifactError> {
+        validate_command_argv(&self.argv)?;
         if self.sequence == 0 {
             return Err(ArtifactError::Integrity {
                 offset: 0,
@@ -620,8 +626,10 @@ impl ArtifactStore {
         &mut self,
         job_id: JobId,
         grant_revision: u64,
+        argv: &[CommandArg],
         mut targets: OutputTargets,
     ) -> Result<JobArtifactToken, ArtifactError> {
+        validate_command_argv(argv)?;
         if job_id.get() != self.next_job_id {
             return Err(ArtifactError::TokenConflict {
                 job_id,
@@ -647,6 +655,7 @@ impl ArtifactStore {
             sequence: 0,
             state: JobState::Running,
             grant_revision,
+            argv: argv.to_vec(),
             output_limit: None,
             stdout: empty_stream(&targets.stdout)?,
             stderr: empty_stream(&targets.stderr)?,
@@ -656,6 +665,7 @@ impl ArtifactStore {
             job_id,
             LiveJobState {
                 grant_revision,
+                argv: argv.to_vec(),
                 stdout: StreamWriterState::new(StreamKind::Stdout, targets.stdout),
                 stderr: StreamWriterState::new(StreamKind::Stderr, targets.stderr),
                 quota: QuotaLedger {
@@ -893,6 +903,7 @@ struct QuotaAdmission {
 
 struct LiveJobState {
     grant_revision: u64,
+    argv: Vec<CommandArg>,
     stdout: StreamWriterState,
     stderr: StreamWriterState,
     quota: QuotaLedger,
@@ -1110,6 +1121,7 @@ impl ArtifactStore {
                 sequence: 0,
                 state,
                 grant_revision: live.grant_revision,
+                argv: live.argv.clone(),
                 output_limit: output_limit.clone(),
                 stdout,
                 stderr,
@@ -2494,6 +2506,11 @@ pub fn protected_record_schema() -> Arc<Schema> {
         field("records_sha256", DataType::Binary, true),
         field("output_limit_bytes", DataType::UInt64, true),
         field("output_crossing_bytes", DataType::UInt64, true),
+        field(
+            "argv",
+            DataType::List(Arc::new(field("item", DataType::Binary, false))),
+            true,
+        ),
     ]))
 }
 
@@ -2563,6 +2580,36 @@ fn flatten_storage(storage: &OutputStorage) -> FlatStorage<'_> {
     }
 }
 
+#[cfg(unix)]
+fn artifact_arg_bytes(value: &OsStr) -> Result<&[u8], ArtifactError> {
+    Ok(value.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn artifact_arg_bytes(value: &OsStr) -> Result<&[u8], ArtifactError> {
+    value
+        .to_str()
+        .map(str::as_bytes)
+        .ok_or(ArtifactError::Dto(DtoError::InvalidPlatformCommandArgument))
+}
+
+fn command_argv_array(argv: &[CommandArg]) -> Result<ListArray, ArtifactError> {
+    validate_command_argv(argv)?;
+    let mut encoded = Vec::with_capacity(argv.len());
+    for argument in argv {
+        encoded.push(artifact_arg_bytes(argument.as_os_str())?);
+    }
+    let values = BinaryArray::from_iter_values(encoded);
+    let count = i32::try_from(argv.len())
+        .map_err(|_| ArtifactError::Arrow("too many command arguments".into()))?;
+    Ok(ListArray::new(
+        Arc::new(field("item", DataType::Binary, false)),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, count])),
+        Arc::new(values),
+        None,
+    ))
+}
+
 fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, ArtifactError> {
     let stdout = flatten_storage(&record.stdout.storage);
     let stderr = flatten_storage(&record.stderr.storage);
@@ -2624,6 +2671,7 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
                 .as_ref()
                 .map(|limit| limit.crossing_bytes),
         ])),
+        Arc::new(command_argv_array(&record.argv)?),
     ];
     RecordBatch::try_new(protected_record_schema(), columns)
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
@@ -2667,6 +2715,7 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
             ));
         }
     };
+    let argv = decode_command_argv(batch, 32)?;
     Ok(JobArtifactRecord {
         repo_id,
         workspace_incarnation,
@@ -2674,6 +2723,7 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
         sequence,
         state,
         grant_revision,
+        argv,
         output_limit,
         stdout,
         stderr,
@@ -2803,6 +2853,7 @@ fn checkpoint_manifest_to_batch(
     )])));
     columns.push(new_null_array(schema.field(30).data_type(), 1));
     columns.push(new_null_array(schema.field(31).data_type(), 1));
+    columns.push(new_null_array(schema.field(32).data_type(), 1));
     RecordBatch::try_new(schema, columns).map_err(|error| ArtifactError::Arrow(error.to_string()))
 }
 
@@ -2941,6 +2992,57 @@ fn decode_stream(batch: &RecordBatch, offset: usize) -> Result<StreamInfo, Artif
             truncated: boolean(batch, offset + 8)?.value(0),
         },
     })
+}
+
+fn decode_command_argv(
+    batch: &RecordBatch,
+    index: usize,
+) -> Result<Vec<CommandArg>, ArtifactError> {
+    let values = list(batch, index)?.value(0);
+    let values = downcast::<BinaryArray>(values.as_ref(), "argv.values")?;
+    if values.is_empty() || values.value(0).is_empty() {
+        return Err(ArtifactError::Dto(DtoError::InvalidCommandArgv));
+    }
+    let mut total = 0_usize;
+    for row in 0..values.len() {
+        if values.is_null(row) {
+            return Err(ArtifactError::Arrow(
+                "command argv contains a null argument".into(),
+            ));
+        }
+        let bytes = values.value(row);
+        if bytes.len() > MAX_COMMAND_ARG_BYTES {
+            return Err(ArtifactError::Dto(DtoError::CommandArgumentTooLarge));
+        }
+        if bytes.contains(&0) {
+            return Err(ArtifactError::Dto(DtoError::CommandArgumentContainsNul));
+        }
+        total = total
+            .checked_add(bytes.len())
+            .ok_or(ArtifactError::Dto(DtoError::CommandArgvTooLarge))?;
+        if total > MAX_ARGV_BYTES {
+            return Err(ArtifactError::Dto(DtoError::CommandArgvTooLarge));
+        }
+        #[cfg(not(unix))]
+        std::str::from_utf8(bytes)
+            .map_err(|_| ArtifactError::Dto(DtoError::InvalidPlatformCommandArgument))?;
+    }
+    let mut argv = Vec::new();
+    argv.try_reserve_exact(values.len())
+        .map_err(|_| ArtifactError::BufferAllocation)?;
+    for row in 0..values.len() {
+        let bytes = values.value(row);
+        #[cfg(unix)]
+        let value = OsString::from_vec(bytes.to_vec());
+        #[cfg(not(unix))]
+        let value = OsString::from(
+            std::str::from_utf8(bytes)
+                .map_err(|_| ArtifactError::Dto(DtoError::InvalidPlatformCommandArgument))?,
+        );
+        argv.push(CommandArg::from(value));
+    }
+    validate_command_argv(&argv)?;
+    Ok(argv)
 }
 
 fn downcast<'a, T: 'static>(array: &'a dyn Array, name: &str) -> Result<&'a T, ArtifactError> {
@@ -3707,7 +3809,9 @@ pub fn reconcile_commitments(
 }
 
 fn require_job_columns(batch: &RecordBatch, row: usize) -> Result<(), ArtifactError> {
-    const REQUIRED: &[usize] = &[3, 4, 5, 6, 7, 8, 12, 13, 14, 15, 16, 17, 21, 22, 23, 24, 25];
+    const REQUIRED: &[usize] = &[
+        3, 4, 5, 6, 7, 8, 12, 13, 14, 15, 16, 17, 21, 22, 23, 24, 25, 32,
+    ];
     for &column in REQUIRED {
         if batch.column(column).is_null(row) {
             return Err(ArtifactError::Arrow(format!(
@@ -3799,6 +3903,7 @@ mod tests {
             sequence: 1,
             state: JobState::Exited,
             grant_revision: 1,
+            argv: vec!["true".into()],
             output_limit: None,
             stdout: inline_stream(b""),
             stderr: inline_stream(b""),
@@ -3940,7 +4045,7 @@ mod tests {
         let mut store = store_at(&root, ArtifactConfig::default());
         let job_id = store.next_job_id().unwrap();
         let token = store
-            .begin_job(job_id, 1, OutputTargets::default())
+            .begin_job(job_id, 1, &["true".into()], OutputTargets::default())
             .unwrap();
         let namespace = token.namespace;
         let sealed = store.finish(token, JobState::Exited).unwrap();
@@ -3964,7 +4069,12 @@ mod tests {
         let mut foreign = store_at(&foreign_root, ArtifactConfig::default());
         let foreign_job_id = foreign.next_job_id().unwrap();
         let foreign_token = foreign
-            .begin_job(foreign_job_id, 1, OutputTargets::default())
+            .begin_job(
+                foreign_job_id,
+                1,
+                &["true".into()],
+                OutputTargets::default(),
+            )
             .unwrap();
         assert!(matches!(
             store.append(&foreign_token, StreamKind::Stdout, b"foreign"),
@@ -4292,7 +4402,12 @@ mod tests {
         let root = temp_root("stream-headers");
         let mut store = store_at(&root, ArtifactConfig::default());
         let token = store
-            .begin_job(JobId::new(1).unwrap(), 1, OutputTargets::default())
+            .begin_job(
+                JobId::new(1).unwrap(),
+                1,
+                &["true".into()],
+                OutputTargets::default(),
+            )
             .unwrap();
         store.abort(token).unwrap();
         drop(store);
@@ -4346,7 +4461,12 @@ mod tests {
         let wrong_root = temp_root("wrong-prefix");
         let mut wrong_store = store_at(&wrong_root, ArtifactConfig::default());
         let wrong_token = wrong_store
-            .begin_job(JobId::new(1).unwrap(), 1, OutputTargets::default())
+            .begin_job(
+                JobId::new(1).unwrap(),
+                1,
+                &["true".into()],
+                OutputTargets::default(),
+            )
             .unwrap();
         let wrong = CheckpointManifestRecord {
             version: RECORD_SCHEMA_VERSION as u16,
@@ -4376,7 +4496,12 @@ mod tests {
         let duplicate_root = temp_root("duplicate-terminal");
         let mut duplicate_store = store_at(&duplicate_root, ArtifactConfig::default());
         let duplicate_token = duplicate_store
-            .begin_job(JobId::new(1).unwrap(), 1, OutputTargets::default())
+            .begin_job(
+                JobId::new(1).unwrap(),
+                1,
+                &["true".into()],
+                OutputTargets::default(),
+            )
             .unwrap();
         let sealed = duplicate_store
             .finish(duplicate_token, JobState::Exited)
@@ -4405,7 +4530,12 @@ mod tests {
         let root = temp_root("actor-checkpoint-order");
         let mut store = store_at(&root, ArtifactConfig::default());
         let token = store
-            .begin_job(JobId::new(1).unwrap(), 1, OutputTargets::default())
+            .begin_job(
+                JobId::new(1).unwrap(),
+                1,
+                &["true".into()],
+                OutputTargets::default(),
+            )
             .unwrap();
         store
             .append(&token, StreamKind::Stdout, b"before-checkpoint")
@@ -4459,6 +4589,7 @@ mod tests {
             store.begin_job(
                 JobId::new(1).unwrap(),
                 1,
+                &["true".into()],
                 OutputTargets {
                     stdout: StreamTarget::Redirect { source, descriptor },
                     stderr: StreamTarget::Captured,

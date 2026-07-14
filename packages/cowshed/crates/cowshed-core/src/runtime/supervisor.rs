@@ -14,9 +14,10 @@ use uuid::Uuid;
 
 use crate::api::dto::{
     AdmissionCommitment, BinaryData, CONTROLLER_COMMITMENT_VERSION, CheckpointCommitment,
-    ControllerCommitment, ExecRequest, ExitStatus, JobId, JobInfo, JobState, OutputLimitInfo,
-    OutputPublication, OutputStorage, OutputSummary, ProtectedOutput, Sha256Digest, StdinInfo,
-    StdinKind, StdinSource, StreamInfo, TraceContext, TraceId, UtcTimestamp, WorkspacePath,
+    CommandArg, ControllerCommitment, ExecRequest, ExitStatus, JobId, JobInfo, JobState,
+    OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary, ProtectedOutput,
+    Sha256Digest, StdinInfo, StdinKind, StdinSource, StreamInfo, TraceContext, TraceId,
+    UtcTimestamp, WorkspacePath, validate_command_argv,
 };
 use crate::error::{CowshedError, Result};
 use crate::exec::{
@@ -262,7 +263,7 @@ pub struct ArtifactSeal {
 
 pub trait ArtifactSink: Send {
     fn next_job_id(&self) -> Result<JobId>;
-    fn admit(&mut self, job_id: JobId, grant_revision: u64) -> Result<()>;
+    fn admit(&mut self, job_id: JobId, grant_revision: u64, argv: &[CommandArg]) -> Result<()>;
     fn prepare_background(&mut self, job_id: JobId) -> Result<()>;
     fn write(&mut self, job_id: JobId, stream: OutputStream, bytes: &[u8])
     -> Result<ArtifactWrite>;
@@ -440,10 +441,10 @@ impl ArtifactSink for ArtifactStoreSink {
         self.store.next_job_id().map_err(map_artifact_error)
     }
 
-    fn admit(&mut self, job_id: JobId, grant_revision: u64) -> Result<()> {
+    fn admit(&mut self, job_id: JobId, grant_revision: u64, argv: &[CommandArg]) -> Result<()> {
         let token = self
             .store
-            .begin_job(job_id, grant_revision, OutputTargets::default())
+            .begin_job(job_id, grant_revision, argv, OutputTargets::default())
             .map_err(map_artifact_error)?;
         if token.job_id() != job_id || self.tokens.insert(job_id, token).is_some() {
             return Err(CowshedError::integrity(
@@ -1707,13 +1708,15 @@ impl SupervisorActor {
             stdout_copy,
             stderr_copy,
         } = request;
-        let argv_os = match request_argv_to_os(&argv) {
-            Ok(argv) => argv,
-            Err(error) => {
-                let _ = reply.send(Err(error));
-                return;
-            }
-        };
+        if let Err(error) = validate_command_argv(&argv) {
+            let _ = reply.send(Err(CowshedError::usage(
+                error.to_string(),
+                "provide a valid bounded command argv",
+            )));
+            return;
+        }
+        let info_argv = argv.clone();
+        let argv_os = request_argv_to_os(argv);
         let (cwd, merged_env, session_identity) = match session.as_ref() {
             Some(token) => {
                 let state = self
@@ -1746,7 +1749,10 @@ impl SupervisorActor {
                 return;
             }
         };
-        if let Err(error) = self.artifacts.admit(job_id, self.authority.grant_revision) {
+        if let Err(error) = self
+            .artifacts
+            .admit(job_id, self.authority.grant_revision, &info_argv)
+        {
             let _ = reply.send(Err(error));
             return;
         }
@@ -1787,7 +1793,7 @@ impl SupervisorActor {
             state: JobState::Running,
             pid: None,
             grant_revision: self.authority.grant_revision,
-            argv,
+            argv: info_argv,
             cwd: cwd.clone(),
             started,
             duration_ms: None,
@@ -2495,21 +2501,8 @@ async fn pump_reader(
     }
 }
 
-fn request_argv_to_os(argv: &[String]) -> Result<Vec<OsString>> {
-    if argv.is_empty() || argv[0].is_empty() {
-        return Err(CowshedError::usage(
-            "exec requires a non-empty argv and argv[0]",
-            "provide an executable as argv[0]",
-        ));
-    }
-    if argv.iter().any(|value| value.as_bytes().contains(&0)) {
-        return Err(CowshedError::usage(
-            "exec argv contains NUL",
-            "remove NUL bytes from argv",
-        ));
-    }
-    // Keep the public DTO conversion isolated here. The DTO will become tagged byte-safe.
-    Ok(argv.iter().map(OsString::from).collect())
+fn request_argv_to_os(argv: Vec<CommandArg>) -> Vec<OsString> {
+    argv.into_iter().map(CommandArg::into_os_string).collect()
 }
 
 fn stdin_info(stdin: &StdinSource) -> StdinInfo {
