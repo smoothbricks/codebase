@@ -35,10 +35,10 @@
 
 use crate::{aggregates, bitmap_ops, bytes, hash_table, nested, slot_growth};
 use columine_types::types::{
-    CONDITION_TREE_STATE_BYTES, EMPTY_KEY, ErrorCode, Opcode, PROGRAM_HASH_PREFIX,
-    PROGRAM_HEADER_SIZE, PROGRAM_MAGIC, SLOT_META_SIZE, STATE_FORMAT_VERSION, STATE_HEADER_SIZE,
-    STATE_MAGIC, SlotMetaOffset, SlotType, SlotTypeFlags, StateFlags, StateHeaderOffset, TOMBSTONE,
-    align8, next_power_of_2,
+    CONDITION_TREE_STATE_BYTES, DERIVED_FACT_EMPTY_IDENTITY, EMPTY_KEY, ErrorCode, Opcode,
+    PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE, PROGRAM_MAGIC, SLOT_META_SIZE, STATE_FORMAT_VERSION,
+    STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType, SlotTypeFlags, StateFlags,
+    StateHeaderOffset, TOMBSTONE, align8, next_power_of_2,
 };
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -268,10 +268,10 @@ pub fn calculate_state_size(program: &[u8]) -> u32 {
                 SlotType::Array => size += capacity * 4 + capacity * 8,
                 SlotType::ConditionTree => {
                     size += CONDITION_TREE_STATE_BYTES;
-                    // Derived facts HashMap: keys + values_lo + values_hi.
+                    // Derived facts: interleaved u64 identities, then u32 low/high values.
                     if capacity > 0 {
                         size = align8(size);
-                        size += capacity * 12;
+                        size += capacity * 16;
                     }
                 }
                 // These use their own opcodes, not SLOT_DEF.
@@ -548,8 +548,14 @@ pub fn init_state(state: &mut [u8], program: &[u8]) -> Result<(), ErrorCode> {
                         data_offset = align8(data_offset);
                         let derived_facts_offset = data_offset;
 
-                        bytes::fill_u32(state, data_offset, capacity, EMPTY_KEY);
-                        data_offset += capacity * 4;
+                        for pos in 0..capacity {
+                            bytes::write_u64(
+                                state,
+                                data_offset + pos * 8,
+                                DERIVED_FACT_EMPTY_IDENTITY,
+                            );
+                        }
+                        data_offset += capacity * 8;
                         bytes::zero(state, data_offset, capacity * 4);
                         data_offset += capacity * 4;
                         bytes::zero(state, data_offset, capacity * 4);

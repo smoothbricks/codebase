@@ -26,8 +26,9 @@ pub fn slot_data_size(
                 16
             }
         }
+        // Condition state + interleaved u64 identities + u32 low/high values.
         SlotType::ConditionTree => {
-            CONDITION_TREE_STATE_BYTES + if capacity > 0 { capacity * 12 } else { 0 }
+            CONDITION_TREE_STATE_BYTES + if capacity > 0 { capacity * 16 } else { 0 }
         }
         SlotType::Scalar => 16,
         // FIXED semantics (telos idea i-87c94893): slot_growth.zig carried a
