@@ -1,4 +1,5 @@
 use crate::args::{AdoptArgs, Cli, Command, ExecArgs, StdinSource as CliStdinSource};
+use crate::gateway_service;
 use crate::output::Output;
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -73,6 +74,9 @@ pub trait CliService: Send {
         stdout: &mut (dyn Write + Send),
         stderr: &mut (dyn Write + Send),
     ) -> Result<ExecResult>;
+    async fn reconcile_gateway(&mut self) -> Result<()> {
+        Ok(())
+    }
     async fn shutdown(self) -> Result<()>
     where
         Self: Sized;
@@ -102,6 +106,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Push(_)
         | Command::Rebase(_)
         | Command::Land(_)
+        | Command::Gateway(_)
         | Command::Doctor => RuntimeOpenMode::ExistingOnly,
     }
 }
@@ -378,6 +383,12 @@ impl CliService for ActorBridge {
         }
     }
 
+    async fn reconcile_gateway(&mut self) -> Result<()> {
+        let repo_id = self.coordinator()?.project().repo_id().clone();
+        gateway_service::reconcile_native_project(&repo_id)
+            .await
+            .map(|_| ())
+    }
     async fn shutdown(self) -> Result<()> {
         ActorBridge::shutdown(self).await
     }
@@ -485,11 +496,15 @@ where
     W: Write + Send,
     E: Write + Send,
 {
+    if requires_gateway_before_dispatch(&cli.command) {
+        service.reconcile_gateway().await?;
+    }
     let json = cli.global.json;
     match cli.command {
         Command::Adopt(args) => {
             let options = adopt_options(args)?;
             let info = service.adopt(options).await?;
+            service.reconcile_gateway().await?;
             emit_mount(output, json, &info)?;
             output.hint("cowshed new <name>").map_err(output_error)?;
             Ok(success())
@@ -505,6 +520,7 @@ where
                     slot: args.slot,
                 };
             let info = service.create(&args.name, options).await?;
+            service.reconcile_gateway().await?;
             emit_mount(output, json, &info)?;
             output
                 .hint(&format!("cowshed exec {} -- <cmd>", args.name))
@@ -513,6 +529,7 @@ where
         }
         Command::Fork(args) => {
             let info = service.fork(&args.source, &args.destination).await?;
+            service.reconcile_gateway().await?;
             emit_mount(output, json, &info)?;
             output
                 .hint(&format!("cowshed exec {} -- <cmd>", args.destination))
@@ -541,6 +558,7 @@ where
         Command::Restore(args) => {
             let label = os_utf8(args.label)?;
             let info = service.restore(&args.workspace, &label).await?;
+            service.reconcile_gateway().await?;
             emit_mount(output, json, &info)?;
             output
                 .hint(&format!("cowshed exec {} -- git status", args.workspace))
@@ -549,6 +567,7 @@ where
         }
         Command::Ensure(args) => {
             let report = service.ensure_current(invocation_cwd()?).await?;
+            service.reconcile_gateway().await?;
             if json {
                 output.success(report.clone()).map_err(output_error)?;
             } else if args.envrc {
@@ -577,6 +596,9 @@ where
         }
         Command::Path(args) => {
             let info = service.path(&args.workspace, args.no_attach).await?;
+            if !args.no_attach {
+                service.reconcile_gateway().await?;
+            }
             if args.no_attach && info.state == WorkspaceState::Detached {
                 output
                     .guidance("workspace is detached; returning its configured mount path")
@@ -618,6 +640,7 @@ where
                     },
                 )
                 .await?;
+            service.reconcile_gateway().await?;
             if json {
                 output.success(EmptyResult {}).map_err(output_error)?;
             }
@@ -633,6 +656,7 @@ where
                     },
                 )
                 .await?;
+            service.reconcile_gateway().await?;
             if json {
                 output.success(EmptyResult {}).map_err(output_error)?;
             }
@@ -640,6 +664,7 @@ where
         }
         Command::Detach(args) => {
             service.detach(&args.workspace).await?;
+            service.reconcile_gateway().await?;
             if json {
                 output.success(EmptyResult {}).map_err(output_error)?;
             }
@@ -722,6 +747,7 @@ where
             Ok(success())
         }
         Command::Land(args) => {
+            let reconcile_gateway = args.retire;
             let options = LandOptions {
                 target_branch: args.target.map(os_branch).transpose()?,
                 check: (!args.checks.is_empty())
@@ -742,6 +768,9 @@ where
                 expected_target_head: args.expected_target_head.map(os_expected_ref).transpose()?,
             };
             let report = service.land(&args.workspace, options).await?;
+            if reconcile_gateway {
+                service.reconcile_gateway().await?;
+            }
             if json {
                 output.success(report.clone()).map_err(output_error)?;
             } else {
@@ -761,7 +790,17 @@ where
                 code: if healthy { 0 } else { 5 },
             })
         }
+        Command::Gateway(_) => Err(CowshedError::internal(
+            "gateway commands must be dispatched by the host service entrypoint",
+        )),
     }
+}
+
+fn requires_gateway_before_dispatch(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Exec(_) | Command::Ensure(_) | Command::Doctor
+    )
 }
 
 fn success() -> DispatchExit {

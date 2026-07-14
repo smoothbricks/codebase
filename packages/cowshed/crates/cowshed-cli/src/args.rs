@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::PathBuf;
 
-pub const COMMAND_MAP: &str = "commands:\n  adopt [path]       adopt a checkout\n  new <name>         create a workspace\n  fork <src> <dst>   fork a workspace\n  checkpoint <ws>    create a checkpoint\n  restore <ws> <id>  restore a checkpoint\n  ensure             heal the current workspace\n  ls                 list workspaces\n  path <ws>          print a workspace mount\n  exec <ws> -- <cmd> run an argv command\n  rm <ws>            remove a workspace\n  attach <ws>        attach a workspace\n  detach <ws>        detach a workspace\n  gc                 reclaim storage\n  push <ws>          preserve a workspace ref\n  rebase <ws>        rebase a workspace\n  land <ws>          land a workspace\n  doctor             check invariants";
+pub const COMMAND_MAP: &str = "commands:\n  adopt [path]       adopt a checkout\n  new <name>         create a workspace\n  fork <src> <dst>   fork a workspace\n  checkpoint <ws>    create a checkpoint\n  restore <ws> <id>  restore a checkpoint\n  ensure             heal the current workspace\n  ls                 list workspaces\n  path <ws>          print a workspace mount\n  exec <ws> -- <cmd> run an argv command\n  rm <ws>            remove a workspace\n  attach <ws>        attach a workspace\n  detach <ws>        detach a workspace\n  gc                 reclaim storage\n  push <ws>          preserve a workspace ref\n  rebase <ws>        rebase a workspace\n  land <ws>          land a workspace\n  doctor             check invariants\n  gateway <action>   manage the host gateway";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GlobalOptions {
@@ -36,6 +36,15 @@ pub enum Command {
     Rebase(RebaseArgs),
     Land(LandArgs),
     Doctor,
+    Gateway(GatewayCommand),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GatewayCommand {
+    Start,
+    Stop,
+    Status,
+    Run,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -231,6 +240,7 @@ enum CommandName {
     Rebase,
     Land,
     Doctor,
+    Gateway,
 }
 
 pub fn parse_args<I, T>(args: I) -> Result<Cli, UsageError>
@@ -261,6 +271,7 @@ where
         Some("rebase") => CommandName::Rebase,
         Some("land") => CommandName::Land,
         Some("doctor") => CommandName::Doctor,
+        Some("gateway") => CommandName::Gateway,
         Some(other) => {
             return Err(UsageError::new(
                 format!("unknown command `{other}`"),
@@ -289,8 +300,46 @@ where
         CommandName::Rebase => parse_rebase(&args, index, &mut global)?,
         CommandName::Land => parse_land(&args, index, &mut global)?,
         CommandName::Doctor => parse_empty(&args, index, &mut global, "doctor", Command::Doctor)?,
+        CommandName::Gateway => parse_gateway(&args, index, &mut global)?,
     };
     Ok(Cli { global, command })
+}
+
+fn parse_gateway(
+    args: &[OsString],
+    mut index: usize,
+    global: &mut GlobalOptions,
+) -> Result<Command, UsageError> {
+    let usage = "gateway <start|stop|status|run>";
+    let action = match args.get(index).and_then(|argument| argument.to_str()) {
+        Some("start") => GatewayCommand::Start,
+        Some("stop") => GatewayCommand::Stop,
+        Some("status") => GatewayCommand::Status,
+        Some("run") => GatewayCommand::Run,
+        Some(other) => {
+            return Err(UsageError::new(
+                format!("unknown gateway action `{other}`"),
+                usage,
+            ));
+        }
+        None => return Err(UsageError::new("gateway action is required", usage)),
+    };
+    index += 1;
+    while index < args.len() && parse_global(args, &mut index, global)? {}
+    if index != args.len() {
+        let argument = args[index].to_string_lossy();
+        return Err(UsageError::new(
+            format!("unexpected gateway argument `{argument}`"),
+            usage,
+        ));
+    }
+    if global.project.is_some() {
+        return Err(UsageError::new(
+            "--project is not valid for gateway commands",
+            usage,
+        ));
+    }
+    Ok(Command::Gateway(action))
 }
 
 fn parse_global(
