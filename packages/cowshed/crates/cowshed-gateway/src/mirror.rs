@@ -1,17 +1,19 @@
-use std::{fmt, time::SystemTime};
+use std::{collections::HashMap, fmt, time::SystemTime};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, header};
 use http_body_util::{BodyExt as _, Empty, combinators::BoxBody};
+use serde_json::Value;
 use thiserror::Error;
+use tokio::sync::{mpsc, oneshot};
 use url::Url;
 
 use crate::{
     cache::{
         Cache, CacheAcquire, CacheBodyError, CacheError, CacheKey, CacheNamespace, CachedResponse,
-        ObjectExpectation,
+        ObjectDigest, ObjectExpectation,
     },
     interfaces::UpstreamHealth,
     policy::{CanonicalTarget, MirrorProtocol, normalize_path},
@@ -20,7 +22,8 @@ use crate::{
 const MAX_REDIRECTS: u8 = 5;
 const MAX_LOCATION_BYTES: usize = 8 * 1024;
 const MAX_OBJECT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_METADATA_BYTES: u64 = 8 * 1024 * 1024;
+const HEALTH_COMMAND_CAPACITY: usize = 64;
 
 pub type MirrorBody = BoxBody<Bytes, CacheBodyError>;
 
@@ -78,6 +81,11 @@ impl MirrorRequest {
             return Err(MirrorError::UnscopedCredential);
         }
         strip_request_secrets(&mut headers);
+        headers.remove(header::ACCEPT_ENCODING);
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
         let metadata = classify(protocol, &upstream_path, expected)?;
         if metadata
             .expected
@@ -108,6 +116,25 @@ impl MirrorRequest {
             redirects_remaining: self.redirects_remaining,
         }
     }
+    pub fn from_redirect(
+        fetch: MirrorFetchRequest,
+        cache_scope: MirrorCacheScope,
+        credentialed: bool,
+    ) -> Result<Self, MirrorError> {
+        let redirects_remaining = fetch.redirects_remaining;
+        let mut request = Self::new(
+            fetch.protocol,
+            fetch.target,
+            fetch.method,
+            fetch.path,
+            fetch.headers,
+            cache_scope,
+            credentialed,
+            None,
+        )?;
+        request.redirects_remaining = redirects_remaining;
+        Ok(request)
+    }
 
     fn cache_key(&self) -> Result<CacheKey, CacheError> {
         let namespace = match &self.cache_scope {
@@ -121,7 +148,7 @@ impl MirrorRequest {
             self.protocol.as_str(),
             self.target.origin(),
             self.upstream_path.clone(),
-            self.metadata.expected.map(|expected| expected.sha256),
+            self.metadata.expected.map(|expected| expected.digest),
         )
     }
 }
@@ -144,9 +171,11 @@ pub trait MirrorUpstream: Send + Sync {
     ) -> Result<Response<MirrorBody>, CacheBodyError>;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum MirrorCacheStatus {
     Hit,
+    OfflineHit,
     Filled,
     Revalidated,
     Bypassed,
@@ -181,22 +210,45 @@ pub enum MirrorOutcome {
 #[derive(Clone, Debug)]
 pub struct MirrorService {
     cache: Cache,
+    health: mpsc::Sender<HealthCommand>,
 }
 
 impl MirrorService {
     pub fn new(cache: Cache) -> Self {
-        Self { cache }
+        let (health, mut receiver) = mpsc::channel(HEALTH_COMMAND_CAPACITY);
+        tokio::spawn(async move {
+            let mut origins = HashMap::new();
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    HealthCommand::Get { origin, reply } => {
+                        let _ = reply.send(
+                            origins
+                                .get(&origin)
+                                .copied()
+                                .unwrap_or(UpstreamHealth::Unknown),
+                        );
+                    }
+                    HealthCommand::Record { origin, health } => {
+                        origins.insert(origin, health);
+                    }
+                }
+            }
+        });
+        Self { cache, health }
     }
 
     pub async fn execute<U>(
         &self,
         mut request: MirrorRequest,
-        health: UpstreamHealth,
+        observed_health: UpstreamHealth,
         upstream: &U,
     ) -> Result<MirrorOutcome, MirrorError>
     where
         U: MirrorUpstream + ?Sized,
     {
+        let health = self
+            .effective_health(&request.target, observed_health)
+            .await;
         if request.redirects_remaining > MAX_REDIRECTS {
             return Err(MirrorError::TooManyRedirects);
         }
@@ -211,7 +263,11 @@ impl MirrorService {
                     Ok(hit) => {
                         return Ok(MirrorOutcome::Response(MirrorResponse {
                             response: response_from_hit(hit, request.method == Method::HEAD)?,
-                            cache_status: MirrorCacheStatus::Hit,
+                            cache_status: if health == UpstreamHealth::Offline {
+                                MirrorCacheStatus::OfflineHit
+                            } else {
+                                MirrorCacheStatus::Hit
+                            },
                         }));
                     }
                     Err(CacheError::DigestMismatch | CacheError::InvalidMetadata) => continue,
@@ -223,9 +279,7 @@ impl MirrorService {
                         CacheError::FillAborted
                         | CacheError::DigestMismatch
                         | CacheError::CacheMiss,
-                    ) => {
-                        continue;
-                    }
+                    ) => continue,
                     Err(error) => return Err(error.into()),
                 },
                 CacheAcquire::Fill(permit) => {
@@ -246,7 +300,9 @@ impl MirrorService {
                     if let Some(previous) = &previous {
                         add_conditionals(&mut fetch.headers, previous);
                     }
-                    let response = upstream.fetch(fetch).await.map_err(MirrorError::Upstream)?;
+                    let mut response = self
+                        .fetch_observed(&request.target, fetch, upstream)
+                        .await?;
                     if response.status() == StatusCode::NOT_MODIFIED {
                         if previous.is_none() {
                             permit.bypass().await?;
@@ -263,6 +319,13 @@ impl MirrorService {
                         permit.bypass().await?;
                         return redirect_outcome(&request, &response);
                     }
+                    if response.status() == StatusCode::OK
+                        && request.metadata.kind == MirrorResourceKind::Metadata
+                        && cacheable(&request, &response)
+                    {
+                        response = rewrite_metadata_response(&request, response).await?;
+                    }
+                    validate_representation(&response)?;
                     if response.status() != StatusCode::OK || !cacheable(&request, &response) {
                         permit.bypass().await?;
                         return Ok(MirrorOutcome::Response(MirrorResponse {
@@ -273,7 +336,13 @@ impl MirrorService {
                     if request.metadata.kind == MirrorResourceKind::Immutable
                         && request.metadata.expected.is_none()
                     {
-                        request.metadata.expected = Some(declared_expectation(&response)?);
+                        permit.bypass().await?;
+                        return Err(MirrorError::MissingIntegrity);
+                    }
+                    if let Some(expected) = &mut request.metadata.expected
+                        && expected.length == 0
+                    {
+                        expected.length = response_content_length(&response)?;
                     }
                     let max_bytes = response_limit(&request, &response)?;
                     let (mut parts, body) = response.into_parts();
@@ -308,10 +377,9 @@ impl MirrorService {
     where
         U: MirrorUpstream + ?Sized,
     {
-        let response = upstream
-            .fetch(request.to_fetch())
-            .await
-            .map_err(MirrorError::Upstream)?;
+        let response = self
+            .fetch_observed(&request.target, request.to_fetch(), upstream)
+            .await?;
         if response.status().is_redirection() {
             redirect_outcome(request, &response)
         } else {
@@ -321,6 +389,72 @@ impl MirrorService {
             }))
         }
     }
+
+    async fn fetch_observed<U>(
+        &self,
+        target: &CanonicalTarget,
+        request: MirrorFetchRequest,
+        upstream: &U,
+    ) -> Result<Response<MirrorBody>, MirrorError>
+    where
+        U: MirrorUpstream + ?Sized,
+    {
+        match upstream.fetch(request).await {
+            Ok(response) => {
+                self.record_health(target, UpstreamHealth::Healthy).await;
+                Ok(response)
+            }
+            Err(error) => {
+                self.record_health(target, UpstreamHealth::Offline).await;
+                Err(MirrorError::Upstream(error))
+            }
+        }
+    }
+
+    async fn effective_health(
+        &self,
+        target: &CanonicalTarget,
+        observed: UpstreamHealth,
+    ) -> UpstreamHealth {
+        if observed != UpstreamHealth::Unknown {
+            self.record_health(target, observed).await;
+            return observed;
+        }
+        let (reply, receive) = oneshot::channel();
+        if self
+            .health
+            .send(HealthCommand::Get {
+                origin: target.origin(),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return UpstreamHealth::Unknown;
+        }
+        receive.await.unwrap_or(UpstreamHealth::Unknown)
+    }
+
+    async fn record_health(&self, target: &CanonicalTarget, health: UpstreamHealth) {
+        let _ = self
+            .health
+            .send(HealthCommand::Record {
+                origin: target.origin(),
+                health,
+            })
+            .await;
+    }
+}
+
+enum HealthCommand {
+    Get {
+        origin: String,
+        reply: oneshot::Sender<UpstreamHealth>,
+    },
+    Record {
+        origin: String,
+        health: UpstreamHealth,
+    },
 }
 
 fn response_from_hit(
@@ -347,6 +481,245 @@ fn response_from_hit(
             .map_err(|_| MirrorError::InvalidCachedResponse)
     }
 }
+async fn rewrite_metadata_response(
+    request: &MirrorRequest,
+    response: Response<MirrorBody>,
+) -> Result<Response<MirrorBody>, MirrorError> {
+    if request.protocol == MirrorProtocol::Npm
+        && !response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json"))
+    {
+        return Ok(response);
+    }
+    if response_content_length_optional(&response)?
+        .is_some_and(|length| length > MAX_METADATA_BYTES)
+    {
+        return Err(MirrorError::MetadataTooLarge);
+    }
+    let (mut parts, mut body) = response.into_parts();
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(MirrorError::Upstream)?;
+        if let Ok(data) = frame.into_data() {
+            if bytes
+                .len()
+                .checked_add(data.len())
+                .is_none_or(|length| length > MAX_METADATA_BYTES as usize)
+            {
+                return Err(MirrorError::MetadataTooLarge);
+            }
+            bytes.extend_from_slice(&data);
+        }
+    }
+    let rewritten = match request.protocol {
+        MirrorProtocol::Npm => rewrite_npm_packument(request, &bytes)?,
+        MirrorProtocol::Cargo if request.upstream_path == "/config.json" => {
+            rewrite_cargo_config(&bytes)?
+        }
+        MirrorProtocol::Cargo => {
+            validate_cargo_index(&bytes)?;
+            bytes
+        }
+        MirrorProtocol::Go => {
+            validate_go_metadata(&request.upstream_path, &bytes)?;
+            bytes
+        }
+    };
+    parts.headers.remove(header::ETAG);
+    parts.headers.remove(header::LAST_MODIFIED);
+    parts.headers.remove(header::CONTENT_ENCODING);
+    parts.headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&rewritten.len().to_string())
+            .map_err(|_| MirrorError::InvalidContentLength)?,
+    );
+    Ok(Response::from_parts(
+        parts,
+        http_body_util::Full::new(Bytes::from(rewritten))
+            .map_err(|never| -> CacheBodyError { match never {} })
+            .boxed(),
+    ))
+}
+
+fn rewrite_npm_packument(request: &MirrorRequest, bytes: &[u8]) -> Result<Vec<u8>, MirrorError> {
+    let mut document: Value =
+        serde_json::from_slice(bytes).map_err(|_| MirrorError::InvalidMetadata)?;
+    let versions = document
+        .get_mut("versions")
+        .and_then(Value::as_object_mut)
+        .ok_or(MirrorError::InvalidMetadata)?;
+    for version in versions.values_mut() {
+        let dist = version
+            .get_mut("dist")
+            .and_then(Value::as_object_mut)
+            .ok_or(MirrorError::InvalidMetadata)?;
+        let tarball = dist
+            .get("tarball")
+            .and_then(Value::as_str)
+            .ok_or(MirrorError::InvalidMetadata)?;
+        let tarball_url = Url::parse(tarball).map_err(|_| MirrorError::InvalidMetadata)?;
+        let target =
+            CanonicalTarget::from_url(&tarball_url).map_err(|_| MirrorError::InvalidMetadata)?;
+        if target != request.target {
+            return Err(MirrorError::UnsafeMetadataOrigin);
+        }
+        let integrity = dist
+            .get("integrity")
+            .and_then(Value::as_str)
+            .ok_or(MirrorError::MissingIntegrity)?;
+        parse_sri(integrity).ok_or(MirrorError::MissingIntegrity)?;
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("cowshed-integrity", integrity);
+        if let Some(length) = dist.get("size").and_then(Value::as_u64) {
+            query.append_pair("cowshed-length", &length.to_string());
+        }
+        let query = query.finish();
+        let local = format!("/npm{}?{query}", tarball_url.path());
+        dist.insert("tarball".to_owned(), Value::String(local));
+    }
+    serde_json::to_vec(&document).map_err(|_| MirrorError::InvalidMetadata)
+}
+
+fn rewrite_cargo_config(bytes: &[u8]) -> Result<Vec<u8>, MirrorError> {
+    let mut document: Value =
+        serde_json::from_slice(bytes).map_err(|_| MirrorError::InvalidMetadata)?;
+    let object = document
+        .as_object_mut()
+        .ok_or(MirrorError::InvalidMetadata)?;
+    object.insert(
+        "dl".to_owned(),
+        Value::String(
+            "/cargo/crates/{crate}/{version}/download?cowshed-integrity=sha256-{sha256-checksum}"
+                .to_owned(),
+        ),
+    );
+    object.remove("api");
+    serde_json::to_vec(&document).map_err(|_| MirrorError::InvalidMetadata)
+}
+
+fn validate_cargo_index(bytes: &[u8]) -> Result<(), MirrorError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| MirrorError::InvalidMetadata)?;
+    let mut entries = 0usize;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let entry: Value = serde_json::from_str(line).map_err(|_| MirrorError::InvalidMetadata)?;
+        let object = entry.as_object().ok_or(MirrorError::InvalidMetadata)?;
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or(MirrorError::InvalidMetadata)?;
+        let version = object
+            .get("vers")
+            .and_then(Value::as_str)
+            .ok_or(MirrorError::InvalidMetadata)?;
+        let checksum = object
+            .get("cksum")
+            .and_then(Value::as_str)
+            .ok_or(MirrorError::MissingIntegrity)?;
+        if name.is_empty() || version.is_empty() || decode_hex_32(checksum).is_none() {
+            return Err(MirrorError::InvalidMetadata);
+        }
+        entries += 1;
+    }
+    if entries == 0 {
+        return Err(MirrorError::InvalidMetadata);
+    }
+    Ok(())
+}
+
+fn validate_go_metadata(path: &str, bytes: &[u8]) -> Result<(), MirrorError> {
+    if path.starts_with("/tile/") || path == "/latest" {
+        return Ok(());
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| MirrorError::InvalidMetadata)?;
+    if path.starts_with("/lookup/") {
+        let has_checksum = text.lines().any(|line| {
+            line.split_once(" h1:").is_some_and(|(_, encoded)| {
+                STANDARD
+                    .decode(encoded.trim())
+                    .is_ok_and(|digest| digest.len() == 32)
+            })
+        });
+        return has_checksum
+            .then_some(())
+            .ok_or(MirrorError::MissingIntegrity);
+    }
+    if path.ends_with("/@v/list") {
+        return text
+            .lines()
+            .filter(|line| !line.is_empty())
+            .all(|line| line.starts_with('v') && !line.contains(char::is_whitespace))
+            .then_some(())
+            .ok_or(MirrorError::InvalidMetadata);
+    }
+    if path.ends_with(".info") {
+        let info: Value =
+            serde_json::from_slice(bytes).map_err(|_| MirrorError::InvalidMetadata)?;
+        let object = info.as_object().ok_or(MirrorError::InvalidMetadata)?;
+        return (object.get("Version").and_then(Value::as_str).is_some()
+            && object.get("Time").and_then(Value::as_str).is_some())
+        .then_some(())
+        .ok_or(MirrorError::InvalidMetadata);
+    }
+    if path.ends_with(".mod") {
+        return text
+            .lines()
+            .map(str::trim)
+            .any(|line| line.starts_with("module "))
+            .then_some(())
+            .ok_or(MirrorError::InvalidMetadata);
+    }
+    Err(MirrorError::InvalidMetadata)
+}
+
+fn parse_sri(value: &str) -> Option<ObjectDigest> {
+    let mut sha256 = None;
+    for token in value.split_ascii_whitespace() {
+        let (algorithm, encoded) = token.split_once('-')?;
+        let decoded = STANDARD
+            .decode(encoded.split_once('?').map_or(encoded, |(hash, _)| hash))
+            .ok()?;
+        match algorithm {
+            "sha512" => return decoded.try_into().ok().map(ObjectDigest::Sha512),
+            "sha256" => sha256 = decoded.try_into().ok().map(ObjectDigest::Sha256),
+            _ => {}
+        }
+    }
+    sha256
+}
+
+fn response_content_length(response: &Response<MirrorBody>) -> Result<u64, MirrorError> {
+    response_content_length_optional(response)?.ok_or(MirrorError::MissingContentLength)
+}
+
+fn response_content_length_optional(
+    response: &Response<MirrorBody>,
+) -> Result<Option<u64>, MirrorError> {
+    response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| MirrorError::InvalidContentLength)?
+                .parse::<u64>()
+                .map_err(|_| MirrorError::InvalidContentLength)
+        })
+        .transpose()
+}
+
+fn validate_representation(response: &Response<MirrorBody>) -> Result<(), MirrorError> {
+    if response
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .is_some_and(|value| value.as_bytes() != b"identity")
+    {
+        return Err(MirrorError::UnsupportedEncoding);
+    }
+    Ok(())
+}
 
 fn empty_body() -> MirrorBody {
     Empty::<Bytes>::new()
@@ -362,49 +735,6 @@ fn add_conditionals(headers: &mut HeaderMap, response: &CachedResponse) {
     } else if let Some(last_modified) = response.last_modified() {
         headers.insert(header::IF_MODIFIED_SINCE, last_modified.clone());
     }
-}
-fn declared_expectation(response: &Response<MirrorBody>) -> Result<ObjectExpectation, MirrorError> {
-    let length = response
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .ok_or(MirrorError::MissingContentLength)?
-        .to_str()
-        .map_err(|_| MirrorError::InvalidContentLength)?
-        .parse::<u64>()
-        .map_err(|_| MirrorError::InvalidContentLength)?;
-    if length > MAX_OBJECT_BYTES {
-        return Err(MirrorError::ObjectTooLarge);
-    }
-    let digest = response
-        .headers()
-        .get(HeaderName::from_static("content-digest"))
-        .and_then(|value| value.to_str().ok())
-        .and_then(parse_digest_header)
-        .or_else(|| {
-            response
-                .headers()
-                .get(HeaderName::from_static("digest"))
-                .and_then(|value| value.to_str().ok())
-                .and_then(parse_digest_header)
-        })
-        .ok_or(MirrorError::MissingIntegrity)?;
-    Ok(ObjectExpectation {
-        length,
-        sha256: digest,
-    })
-}
-
-fn parse_digest_header(value: &str) -> Option<[u8; 32]> {
-    for member in value.split(',') {
-        let (algorithm, encoded) = member.trim().split_once('=')?;
-        if !algorithm.trim().eq_ignore_ascii_case("sha-256") {
-            continue;
-        }
-        let encoded = encoded.trim().trim_matches(':');
-        let decoded = STANDARD.decode(encoded).ok()?;
-        return decoded.try_into().ok();
-    }
-    None
 }
 
 fn response_limit(
@@ -437,6 +767,17 @@ fn response_limit(
 
 fn cacheable(request: &MirrorRequest, response: &Response<MirrorBody>) -> bool {
     if response.headers().contains_key(header::SET_COOKIE) {
+        return false;
+    }
+    let unsupported_vary = response
+        .headers()
+        .get_all(header::VARY)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .any(|name| !name.eq_ignore_ascii_case("accept-encoding"));
+    if unsupported_vary {
         return false;
     }
     let cache_control = response
@@ -474,6 +815,15 @@ fn redirect_outcome(
 ) -> Result<MirrorOutcome, MirrorError> {
     if request.redirects_remaining == 0 {
         return Err(MirrorError::TooManyRedirects);
+    }
+    if !matches!(
+        response.status(),
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    ) {
+        return Err(MirrorError::UnsafeRedirect);
     }
     let location = response
         .headers()
@@ -524,7 +874,7 @@ fn redirect_outcome(
 fn classify(
     protocol: MirrorProtocol,
     path_and_query: &str,
-    expected: Option<ObjectExpectation>,
+    supplied: Option<ObjectExpectation>,
 ) -> Result<MirrorProtocolMetadata, MirrorError> {
     let path = path_and_query
         .split_once('?')
@@ -535,11 +885,58 @@ fn classify(
         MirrorProtocol::Cargo => classify_cargo(path)?,
         MirrorProtocol::Go => classify_go(path)?,
     };
+    let encoded = parse_protocol_expectation(path_and_query)?;
+    let expected = match (supplied, encoded) {
+        (Some(left), Some(right)) if left != right => return Err(MirrorError::IntegrityConflict),
+        (Some(expected), _) | (_, Some(expected)) => Some(expected),
+        (None, None) => None,
+    };
     Ok(MirrorProtocolMetadata {
         kind,
         identity,
         expected,
     })
+}
+
+fn parse_protocol_expectation(
+    path_and_query: &str,
+) -> Result<Option<ObjectExpectation>, MirrorError> {
+    let Some((_, query)) = path_and_query.split_once('?') else {
+        return Ok(None);
+    };
+    let mut integrity = None;
+    let mut length = 0;
+    for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        match name.as_ref() {
+            "cowshed-integrity" if integrity.is_none() => integrity = Some(value.into_owned()),
+            "cowshed-length" => {
+                length = value
+                    .parse::<u64>()
+                    .map_err(|_| MirrorError::InvalidContentLength)?;
+            }
+            _ => {}
+        }
+    }
+    let Some(integrity) = integrity else {
+        return Ok(None);
+    };
+    let digest = if let Some(hex) = integrity.strip_prefix("sha256-") {
+        ObjectDigest::Sha256(decode_hex_32(hex).ok_or(MirrorError::MissingIntegrity)?)
+    } else {
+        parse_sri(&integrity).ok_or(MirrorError::MissingIntegrity)?
+    };
+    Ok(Some(ObjectExpectation { length, digest }))
+}
+
+fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut decoded = [0; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] = (hex(pair[0]).ok()? << 4) | hex(pair[1]).ok()?;
+    }
+    Some(decoded)
 }
 
 fn classify_npm(path: &str) -> Result<(MirrorResourceKind, String), MirrorError> {
@@ -612,11 +1009,12 @@ fn classify_go(path: &str) -> Result<(MirrorResourceKind, String), MirrorError> 
     let relative = path
         .strip_prefix('/')
         .ok_or(MirrorError::InvalidProtocolPath)?;
-    if let Some(sumdb) = relative.strip_prefix("sumdb/") {
-        if sumdb.is_empty() {
-            return Err(MirrorError::InvalidProtocolPath);
-        }
-        return Ok((MirrorResourceKind::Metadata, format!("sumdb/{sumdb}")));
+    if relative.starts_with("lookup/")
+        || relative.starts_with("tile/")
+        || relative == "latest"
+        || relative.starts_with("sumdb/")
+    {
+        return Ok((MirrorResourceKind::Metadata, relative.to_owned()));
     }
     let (module, resource) = relative
         .split_once("/@v/")
@@ -624,9 +1022,9 @@ fn classify_go(path: &str) -> Result<(MirrorResourceKind, String), MirrorError> 
     if module.is_empty() || resource.is_empty() {
         return Err(MirrorError::InvalidProtocolPath);
     }
-    let kind = if resource.ends_with(".zip") || resource.ends_with(".mod") {
+    let kind = if resource.ends_with(".zip") {
         MirrorResourceKind::Immutable
-    } else if resource == "list" || resource.ends_with(".info") {
+    } else if resource == "list" || resource.ends_with(".info") || resource.ends_with(".mod") {
         MirrorResourceKind::Metadata
     } else {
         return Err(MirrorError::InvalidProtocolPath);
@@ -753,10 +1151,20 @@ pub enum MirrorError {
     MethodNotAllowed,
     #[error("credential-bearing mirrors require a project cache scope")]
     UnscopedCredential,
-    #[error("mirror immutable object lacks expected length and SHA-256")]
+    #[error("mirror immutable object lacks expected length and a supported digest")]
     MissingIntegrity,
     #[error("mirror object exceeds the 2 GiB maximum")]
     ObjectTooLarge,
+    #[error("mirror metadata exceeds the 8 MiB parser limit")]
+    MetadataTooLarge,
+    #[error("mirror metadata is malformed")]
+    InvalidMetadata,
+    #[error("mirror metadata points at an unadmitted origin")]
+    UnsafeMetadataOrigin,
+    #[error("mirror protocol integrity metadata conflicts")]
+    IntegrityConflict,
+    #[error("mirror upstream ignored canonical identity encoding")]
+    UnsupportedEncoding,
     #[error("mirror protocol path is invalid")]
     InvalidProtocolPath,
     #[error("mirror cache miss while upstream is offline")]

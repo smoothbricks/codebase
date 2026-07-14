@@ -12,7 +12,7 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use http_body::{Body, Frame, SizeHint};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
+use sha2::{Digest as _, Sha256, Sha512};
 use thiserror::Error;
 use tokio::{
     fs::{self, File, OpenOptions},
@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 pub const DEFAULT_HIGH_WATER_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 pub const DEFAULT_LOW_WATER_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-const CACHE_VERSION: u8 = 1;
+const CACHE_VERSION: u8 = 2;
 const HEADER_REGION: u64 = 64 * 1024;
 const MAX_HEADER_BYTES: usize = HEADER_REGION as usize - 4;
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
@@ -81,7 +81,7 @@ pub struct CacheKey {
     protocol: &'static str,
     origin: String,
     path: String,
-    immutable_digest: Option<[u8; 32]>,
+    immutable_digest: Option<ObjectDigest>,
 }
 
 impl CacheKey {
@@ -90,7 +90,7 @@ impl CacheKey {
         protocol: &'static str,
         origin: String,
         path: String,
-        immutable_digest: Option<[u8; 32]>,
+        immutable_digest: Option<ObjectDigest>,
     ) -> Result<Self, CacheError> {
         if protocol.is_empty() || origin.is_empty() || path.is_empty() {
             return Err(CacheError::InvalidKey);
@@ -123,7 +123,16 @@ impl CacheKey {
         update_component(&mut digest, self.path.as_bytes());
         if let Some(expected) = self.immutable_digest {
             digest.update([1]);
-            digest.update(expected);
+            match expected {
+                ObjectDigest::Sha256(value) => {
+                    digest.update([1]);
+                    digest.update(value);
+                }
+                ObjectDigest::Sha512(value) => {
+                    digest.update([2]);
+                    digest.update(value);
+                }
+            }
         } else {
             digest.update([0]);
         }
@@ -136,10 +145,32 @@ fn update_component(digest: &mut Sha256, value: &[u8]) {
     digest.update(value);
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ObjectDigest {
+    Sha256([u8; 32]),
+    Sha512([u8; 64]),
+}
+
+impl ObjectDigest {
+    fn algorithm(self) -> &'static str {
+        match self {
+            Self::Sha256(_) => "sha256",
+            Self::Sha512(_) => "sha512",
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Sha256(value) => value,
+            Self::Sha512(value) => value,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ObjectExpectation {
     pub length: u64,
-    pub sha256: [u8; 32],
+    pub digest: ObjectDigest,
 }
 
 #[derive(Clone, Debug)]
@@ -292,6 +323,9 @@ impl Cache {
             pending: None,
             pending_offset: 0,
             digest: Sha256::new(),
+            expected_sha512: response.expected.and_then(|expected| {
+                matches!(expected.digest, ObjectDigest::Sha512(_)).then(Sha512::new)
+            }),
             bytes: 0,
             max_bytes,
             response: Some(response),
@@ -501,6 +535,7 @@ pub struct CacheFillBody<B> {
     pending: Option<Bytes>,
     pending_offset: usize,
     digest: Sha256,
+    expected_sha512: Option<Sha512>,
     bytes: u64,
     max_bytes: u64,
     response: Option<CachedResponse>,
@@ -580,6 +615,9 @@ where
                         }
                         self.pending_offset = 0;
                         self.digest.update(&pending);
+                        if let Some(digest) = &mut self.expected_sha512 {
+                            digest.update(&pending);
+                        }
                         self.bytes = self.bytes.saturating_add(pending.len() as u64);
                         return Poll::Ready(Some(Ok(Frame::data(pending))));
                     }
@@ -609,10 +647,14 @@ where
                     let temp_path = self.temp_path.take().expect("temporary path exists");
                     response.content_length = self.bytes;
                     response.content_sha256 = self.digest.clone().finalize().into();
+                    let content_sha512 = self
+                        .expected_sha512
+                        .take()
+                        .map(|digest| <[u8; 64]>::from(digest.finalize()));
                     let cleanup = TempCleanup(temp_path.clone());
                     let future = Box::pin(async move {
                         let _cleanup = cleanup;
-                        finalize_fill(writer, temp_path, response, permit).await
+                        finalize_fill(writer, temp_path, response, content_sha512, permit).await
                     });
                     self.state = FillState::Finalizing(future);
                 }
@@ -654,12 +696,17 @@ async fn finalize_fill(
     mut writer: File,
     temp_path: PathBuf,
     response: CachedResponse,
+    content_sha512: Option<[u8; 64]>,
     mut permit: FillPermit,
 ) -> Result<(), CacheError> {
-    if let Some(expected) = response.expected
-        && (response.content_length != expected.length
-            || response.content_sha256 != expected.sha256)
-    {
+    let integrity_matches = response.expected.is_none_or(|expected| {
+        response.content_length == expected.length
+            && match expected.digest {
+                ObjectDigest::Sha256(digest) => response.content_sha256 == digest,
+                ObjectDigest::Sha512(digest) => content_sha512 == Some(digest),
+            }
+    });
+    if !integrity_matches {
         drop(writer);
         let _ = fs::remove_file(&temp_path).await;
         permit.finish_without_commit().await?;
@@ -1145,7 +1192,8 @@ struct DiskRecord {
     content_length: u64,
     content_sha256: String,
     expected_length: Option<u64>,
-    expected_sha256: Option<String>,
+    expected_algorithm: Option<String>,
+    expected_digest: Option<String>,
     stored_unix_ms: u64,
 }
 
@@ -1172,9 +1220,12 @@ impl DiskRecord {
             content_length: response.content_length,
             content_sha256: hex_encode(&response.content_sha256),
             expected_length: response.expected.map(|expected| expected.length),
-            expected_sha256: response
+            expected_algorithm: response
                 .expected
-                .map(|expected| hex_encode(&expected.sha256)),
+                .map(|expected| expected.digest.algorithm().to_owned()),
+            expected_digest: response
+                .expected
+                .map(|expected| hex_encode(expected.digest.as_bytes())),
             stored_unix_ms: response.stored_unix_ms,
         })
     }
@@ -1183,14 +1234,23 @@ impl DiskRecord {
         if self.version != CACHE_VERSION || stored_bytes < HEADER_REGION {
             return Err(CacheError::InvalidMetadata);
         }
+
         let digest = hex_decode_32(&self.key_sha256)?;
         let content_sha256 = hex_decode_32(&self.content_sha256)?;
-        let expected = match (self.expected_length, self.expected_sha256) {
-            (Some(length), Some(sha256)) => Some(ObjectExpectation {
+        let expected = match (
+            self.expected_length,
+            self.expected_algorithm.as_deref(),
+            self.expected_digest,
+        ) {
+            (Some(length), Some("sha256"), Some(digest)) => Some(ObjectExpectation {
                 length,
-                sha256: hex_decode_32(&sha256)?,
+                digest: ObjectDigest::Sha256(hex_decode_32(&digest)?),
             }),
-            (None, None) => None,
+            (Some(length), Some("sha512"), Some(digest)) => Some(ObjectExpectation {
+                length,
+                digest: ObjectDigest::Sha512(hex_decode_64(&digest)?),
+            }),
+            (None, None, None) => None,
             _ => return Err(CacheError::InvalidMetadata),
         };
         let mut headers = HeaderMap::new();
@@ -1234,13 +1294,28 @@ fn is_sensitive_header(name: &HeaderName) -> bool {
         || name.as_str().eq_ignore_ascii_case("npm-otp")
 }
 
+#[cfg(unix)]
+fn root_is_owned_and_private(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    metadata.uid() == unsafe { libc::geteuid() } && metadata.permissions().mode() & 0o077 == 0
+}
+
+#[cfg(not(unix))]
+fn root_is_owned_and_private(_metadata: &std::fs::Metadata) -> bool {
+    true
+}
+
 async fn validate_root(root: &Path) -> Result<(), CacheError> {
     let metadata = fs::symlink_metadata(root).await.map_err(|error| {
         CacheError::InvalidRoot(format!("existing cache root cannot be opened: {error}"))
     })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || !root_is_owned_and_private(&metadata)
+    {
         return Err(CacheError::InvalidRoot(
-            "cache root must be an existing real directory".to_owned(),
+            "cache root must be an existing owned mode-0700 real directory".to_owned(),
         ));
     }
     Ok(())
@@ -1323,6 +1398,9 @@ async fn open_and_validate(path: &Path, response: &CachedResponse) -> Result<Fil
     file.seek(SeekFrom::Start(HEADER_REGION)).await?;
     let mut remaining = response.content_length;
     let mut digest = Sha256::new();
+    let mut expected_sha512 = response
+        .expected
+        .and_then(|expected| matches!(expected.digest, ObjectDigest::Sha512(_)).then(Sha512::new));
     let mut buffer = vec![0; STREAM_CHUNK_BYTES];
     while remaining > 0 {
         let length = usize::try_from(remaining.min(buffer.len() as u64))
@@ -1332,14 +1410,22 @@ async fn open_and_validate(path: &Path, response: &CachedResponse) -> Result<Fil
             return Err(CacheError::DigestMismatch);
         }
         digest.update(&buffer[..read]);
+        if let Some(expected_sha512) = &mut expected_sha512 {
+            expected_sha512.update(&buffer[..read]);
+        }
         remaining -= read as u64;
     }
     let actual: [u8; 32] = digest.finalize().into();
-    if actual != response.content_sha256
-        || response.expected.is_some_and(|expected| {
-            expected.length != response.content_length || expected.sha256 != actual
-        })
-    {
+    let expected_matches = response.expected.is_none_or(|expected| {
+        expected.length == response.content_length
+            && match expected.digest {
+                ObjectDigest::Sha256(digest) => digest == actual,
+                ObjectDigest::Sha512(digest) => {
+                    expected_sha512.map(|value| <[u8; 64]>::from(value.finalize())) == Some(digest)
+                }
+            }
+    });
+    if actual != response.content_sha256 || !expected_matches {
         return Err(CacheError::DigestMismatch);
     }
     file.seek(SeekFrom::Start(HEADER_REGION)).await?;
@@ -1413,6 +1499,17 @@ fn hex_decode_32(value: &str) -> Result<[u8; 32], CacheError> {
         return Err(CacheError::InvalidMetadata);
     }
     let mut decoded = [0; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Ok(decoded)
+}
+
+fn hex_decode_64(value: &str) -> Result<[u8; 64], CacheError> {
+    if value.len() != 128 {
+        return Err(CacheError::InvalidMetadata);
+    }
+    let mut decoded = [0; 64];
     for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
         decoded[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
     }
