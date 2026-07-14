@@ -49,19 +49,25 @@ remain handles, and unbounded bytes require `cowshed job logs`, `cowshed job att
 ## Global flags
 
 - `--json` — JSON envelope on stdout instead of bare values/TSV. Available on every command.
-- `--project <path|name>` — operate on a project you're not standing in. Default: the project owning the current
-  directory (walking up to a `.cowshed/workspace.json` marker or an adopted git root). Exit 3 if neither resolves.
+- `--project <git-root>` — select an adopted repository explicitly. Default: discover the standalone Git root owning the
+  current directory, then validate its cowshed repository binding. Exit 3 if neither resolves.
 - `-q` / `--quiet` — suppress `cowshed:` progress lines on stderr; errors and `next:` hints still print.
 
 Workspace names are `[a-z0-9][a-z0-9-]*`, unique per project. Commands taking `<name>` accept `main` wherever it makes
 sense. `cowshed exec main -- ...` uses the same closed sandbox and explicit grants as every other workspace.
 
+A host may adopt many repositories. Each repository binding owns one `main` and an independent namespace of workspace
+names and checkpoints. cwd or `--project` selects the repository before a command interprets its workspace argument;
+`main` is therefore repository-scoped, not host-global. `--repo-id` is used only while adopting a repository whose
+identity cannot be derived unambiguously from its remotes.
+
 ## Lifecycle
 
 ### `cowshed adopt`
 
-Run once, inside an existing checkout. Converts it into an image-backed **main workspace** at the same path. This is the
-only cowshed operation that copies data (one-time; clonefile cannot cross volumes into a new image).
+Run once inside each existing checkout you want cowshed to manage. Adoption converts that repository into an
+image-backed **main workspace** at the same path. A host may have any number of adopted repositories and therefore any
+number of repository-scoped mains. Adoption is the only operation that copies the source tree into a new image.
 
 On macOS, this foreground `cowshed adopt` is the **only** command allowed to provision native storage. The first adopt
 on a machine may display one administrator authorization prompt from `diskutil` while cowshed creates and mounts the
@@ -86,24 +92,31 @@ next: cowshed new <name>
 <project-root>
 ```
 
-### `cowshed new <name> [--ref <rev>] [--browse]`
+### `cowshed new <name> [--ref <rev> | --from <workspace>] [--browse]`
 
-Clones **main's live image** (there are no templates) and mounts it.
+Clones a live image from the repository selected by cwd or `--project`, then mounts it. The source is that repository's
+`main` by default:
 
-```
-$ cowshed new raven
-cowshed: cloned acme/widget main image (copy-on-write)
-cowshed: verified clone (fsck, pre-mount) and attached at ~/.cowshed/mnt/acme/widget/raven
-cowshed: branch cowshed/raven created from main @ 6f3a2c1
-cowshed: port block 40960–40975 (macOS: gateway at 40960; your dev servers at 40961+)
-cowshed: sandbox: closed (write: own volume, designated cache subtrees, temp; egress: gateway only)
-next: cowshed exec raven -- bun test
-~/.cowshed/mnt/acme/widget/raven
+```sh
+cd ~/src/api
+cowshed new raven
 ```
 
-The clone is crash-consistent (like a power cut) and fsck-verified on its device _before_ mounting (attach `-nomount` →
-verify → mount). `--ref` starts the branch elsewhere than main's HEAD; source catches up via git, caches stay warm
-regardless. `--browse` makes the volume visible in Finder (default is nobrowse).
+From another cwd, select the same repository explicitly:
+
+```sh
+cowshed new raven --project ~/src/api
+```
+
+Use `--from` to clone another workspace inside the selected repository:
+
+```sh
+cowshed new raven-alt --from raven --project ~/src/api
+```
+
+Cross-repository `--from` is forbidden; select another repository with cwd or `--project` instead. `--ref` starts the
+new Git branch at another revision and is mutually exclusive with `--from`. The storage clone remains warm regardless.
+`--browse` makes the volume visible in Finder; the default mount is nobrowse.
 
 ### `cowshed ls`
 
