@@ -2,8 +2,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_ipc::reader::StreamReader;
@@ -14,6 +14,7 @@ use cowshed_core::api::{
     WorkspaceRetiredCommitment,
 };
 use cowshed_core::repository::RepoId;
+use cowshed_core::runtime::supervisor::{CommitmentDraft, CommitmentPublisher, CommitmentSink};
 use cowshed_core::storage::commitment_store::{
     CommitmentDate, CommitmentPublicationPoint, CommitmentStore, CommitmentStoreEnvironment,
     CommitmentStoreError,
@@ -123,6 +124,10 @@ fn repo() -> RepoId {
     RepoId::parse("acme/widget").unwrap()
 }
 
+fn foreign_repo() -> RepoId {
+    RepoId::parse("other/repository").unwrap()
+}
+
 fn incarnation() -> WorkspaceIncarnation {
     WorkspaceIncarnation::new(INCARNATION).unwrap()
 }
@@ -178,6 +183,72 @@ fn terminal(order: u64, job_id: u64) -> ControllerCommitment {
         order,
         repo_id: repo(),
         workspace_incarnation: incarnation(),
+        job_id: JobId::new(job_id).unwrap(),
+        state: JobState::Exited,
+        grant_revision: 7,
+        stdout_bytes: 0,
+        stdout_sha256: empty,
+        stderr_bytes: 0,
+        stderr_sha256: empty,
+        batch_sha256: Sha256Digest::compute(b"terminal batch"),
+        output_limit: None,
+    })
+}
+
+fn introduced_for(
+    order: u64,
+    repo_id: RepoId,
+    workspace_incarnation: WorkspaceIncarnation,
+) -> ControllerCommitment {
+    ControllerCommitment::WorkspaceIntroduced(WorkspaceIntroducedCommitment {
+        version: CONTROLLER_COMMITMENT_VERSION,
+        order,
+        repo_id,
+        workspace_incarnation,
+    })
+}
+
+fn retired_for(
+    order: u64,
+    repo_id: RepoId,
+    workspace_incarnation: WorkspaceIncarnation,
+) -> ControllerCommitment {
+    ControllerCommitment::WorkspaceRetired(WorkspaceRetiredCommitment {
+        version: CONTROLLER_COMMITMENT_VERSION,
+        order,
+        repo_id,
+        workspace_incarnation,
+    })
+}
+
+fn admission_for(
+    order: u64,
+    repo_id: RepoId,
+    workspace_incarnation: WorkspaceIncarnation,
+    job_id: u64,
+) -> ControllerCommitment {
+    ControllerCommitment::Admission(AdmissionCommitment {
+        version: CONTROLLER_COMMITMENT_VERSION,
+        order,
+        repo_id,
+        workspace_incarnation,
+        job_id: JobId::new(job_id).unwrap(),
+        grant_revision: 7,
+    })
+}
+
+fn terminal_for(
+    order: u64,
+    repo_id: RepoId,
+    workspace_incarnation: WorkspaceIncarnation,
+    job_id: u64,
+) -> ControllerCommitment {
+    let empty = Sha256Digest::compute(&[]);
+    ControllerCommitment::Terminal(TerminalCommitment {
+        version: CONTROLLER_COMMITMENT_VERSION,
+        order,
+        repo_id,
+        workspace_incarnation,
         job_id: JobId::new(job_id).unwrap(),
         state: JobState::Exited,
         grant_revision: 7,
@@ -301,6 +372,126 @@ fn reopen_with_only_current_storage_facts_accepts_retired_workspace_job_history(
     assert_eq!(sealed_segments(root.path()).len(), 4);
 }
 
+#[test]
+fn interleaved_repositories_reopen_with_only_the_opening_repos_baseline() {
+    let root = TempRoot::new("multi-repo-reopen");
+    let partition = date(2026, 3, 4);
+    let shared_incarnation = incarnation();
+    let repo_a = repo();
+    let repo_b = foreign_repo();
+    let mut store_a = CommitmentStore::open_with_environment(
+        root.path(),
+        repo_a.clone(),
+        [shared_incarnation.clone()],
+        Box::new(FixedEnvironment::new(partition)),
+    )
+    .unwrap();
+    store_a
+        .publish(introduced_for(
+            1,
+            repo_a.clone(),
+            shared_incarnation.clone(),
+        ))
+        .unwrap();
+    store_a
+        .publish(admission_for(
+            2,
+            repo_a.clone(),
+            shared_incarnation.clone(),
+            1,
+        ))
+        .unwrap();
+
+    let mut store_b = CommitmentStore::open_with_environment(
+        root.path(),
+        repo_b.clone(),
+        [shared_incarnation.clone()],
+        Box::new(FixedEnvironment::new(partition)),
+    )
+    .unwrap();
+    store_b
+        .publish(introduced_for(
+            3,
+            repo_b.clone(),
+            shared_incarnation.clone(),
+        ))
+        .unwrap();
+    store_b
+        .publish(admission_for(
+            4,
+            repo_b.clone(),
+            shared_incarnation.clone(),
+            1,
+        ))
+        .unwrap();
+    store_b
+        .publish(terminal_for(
+            5,
+            repo_b.clone(),
+            shared_incarnation.clone(),
+            1,
+        ))
+        .unwrap();
+    store_b
+        .publish(retired_for(6, repo_b.clone(), shared_incarnation.clone()))
+        .unwrap();
+    drop(store_a);
+    drop(store_b);
+
+    let mut reopened_a = CommitmentStore::open_with_environment(
+        root.path(),
+        repo_a.clone(),
+        [shared_incarnation.clone()],
+        Box::new(FixedEnvironment::new(partition)),
+    )
+    .unwrap();
+    assert_eq!(reopened_a.next_order().unwrap(), 7);
+    reopened_a
+        .publish(terminal_for(
+            7,
+            repo_a.clone(),
+            shared_incarnation.clone(),
+            1,
+        ))
+        .unwrap();
+    reopened_a
+        .publish(retired_for(8, repo_a, shared_incarnation.clone()))
+        .unwrap();
+    drop(reopened_a);
+
+    assert_eq!(
+        CommitmentStore::open(root.path(), repo_b, [])
+            .unwrap()
+            .next_order()
+            .unwrap(),
+        9
+    );
+    assert_eq!(sealed_segments(root.path()).len(), 8);
+}
+
+#[test]
+fn stale_store_instances_refresh_after_each_advance_and_publish_in_turn() {
+    let root = TempRoot::new("stale-turns");
+    let partition = date(2026, 3, 5);
+    let mut first = store_with_environment(root.path(), FixedEnvironment::new(partition)).unwrap();
+    let mut second = store_with_environment(root.path(), FixedEnvironment::new(partition)).unwrap();
+
+    first.publish(admission(1, 1)).unwrap();
+    assert!(matches!(
+        second.publish(admission(1, 2)),
+        Err(CommitmentStoreError::Conflict { order: 1 })
+    ));
+    assert_eq!(second.next_order().unwrap(), 2);
+    second.publish(admission(2, 2)).unwrap();
+
+    assert!(matches!(
+        first.publish(terminal(2, 1)),
+        Err(CommitmentStoreError::Conflict { order: 2 })
+    ));
+    assert_eq!(first.next_order().unwrap(), 3);
+    first.publish(terminal(3, 1)).unwrap();
+    assert_eq!(sealed_segments(root.path()).len(), 3);
+}
 #[test]
 fn order_remains_contiguous_across_utc_date_partitions() {
     let root = TempRoot::new("cross-date");
@@ -525,7 +716,7 @@ fn published_segment_is_private_and_parent_directory_is_synced() {
 }
 
 #[test]
-fn existing_sealed_order_conflicts_without_overwrite_or_state_advance() {
+fn existing_sealed_order_conflicts_without_overwrite_and_refreshes_state() {
     let root = TempRoot::new("existing-destination");
     let partition = date(2026, 10, 12);
     let mut store = store_with_environment(root.path(), FixedEnvironment::new(partition)).unwrap();
@@ -539,7 +730,7 @@ fn existing_sealed_order_conflicts_without_overwrite_or_state_advance() {
         store.publish(admission(1, 2)),
         Err(CommitmentStoreError::Conflict { order: 1 })
     ));
-    assert_eq!(store.next_order().unwrap(), 1);
+    assert_eq!(store.next_order().unwrap(), 2);
     assert_eq!(fs::read(&segment).unwrap(), original);
     assert_eq!(sealed_segments(root.path()), vec![segment]);
 }
@@ -580,5 +771,76 @@ fn concurrent_stores_cannot_publish_the_same_global_order() {
             .next_order()
             .unwrap(),
         2
+    );
+}
+
+struct CollisionEnvironment {
+    root: PathBuf,
+    date: CommitmentDate,
+    writer: Arc<OnceLock<Uuid>>,
+    collided: Arc<AtomicBool>,
+}
+
+impl CommitmentStoreEnvironment for CollisionEnvironment {
+    fn utc_date(&self) -> io::Result<CommitmentDate> {
+        Ok(self.date)
+    }
+
+    fn publication_point(&self, point: CommitmentPublicationPoint) -> io::Result<()> {
+        if point == CommitmentPublicationPoint::BeforeRename
+            && !self.collided.swap(true, Ordering::SeqCst)
+        {
+            let writer = self
+                .writer
+                .get()
+                .copied()
+                .ok_or_else(|| io::Error::other("writer id was not initialized"))?;
+            let directory = self.root.join(self.date.to_string());
+            let segment = directory.join(sealed_name(1, writer));
+            write_batches(&segment, &[admission(1, 1)]);
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn publisher_retries_a_deliberate_same_order_collision_with_the_next_order() {
+    let root = TempRoot::new("publisher-collision");
+    let writer = Arc::new(OnceLock::new());
+    let collided = Arc::new(AtomicBool::new(false));
+    let store = CommitmentStore::open_with_environment(
+        root.path(),
+        repo(),
+        [incarnation()],
+        Box::new(CollisionEnvironment {
+            root: root.path().to_path_buf(),
+            date: date(2026, 11, 13),
+            writer: Arc::clone(&writer),
+            collided: Arc::clone(&collided),
+        }),
+    )
+    .unwrap();
+    writer.set(store.writer_id()).unwrap();
+    let mut publisher = CommitmentPublisher::start(store, 4).unwrap();
+
+    let order = publisher
+        .publish(CommitmentDraft::Admission {
+            repo_id: repo(),
+            workspace_incarnation: incarnation(),
+            job_id: JobId::new(2).unwrap(),
+            grant_revision: 7,
+        })
+        .await
+        .unwrap();
+
+    assert!(collided.load(Ordering::SeqCst));
+    assert_eq!(order, 2);
+    assert_eq!(sealed_segments(root.path()).len(), 2);
+    assert_eq!(
+        CommitmentStore::open(root.path(), repo(), [incarnation()])
+            .unwrap()
+            .next_order()
+            .unwrap(),
+        3
     );
 }
