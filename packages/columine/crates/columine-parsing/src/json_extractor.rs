@@ -285,11 +285,10 @@ pub fn extract_json_events(
             return Err(err);
         }
         count += 1;
-        // ZIG-PARITY: an exactly-capacity batch is rejected (`count >= capacity` runs after every event); intended fix: accept full batches, resolved at the event_processor level.
-        // Zig checks `count >= capacity` unconditionally after each event, so
-        // an exactly-capacity batch is rejected too. Mirrored bug-for-bug —
-        // the off-by-one is flagged for the stage-4B/event-processor audit.
-        if count >= columns.capacity as usize {
+        // Refuse only when MORE events follow a full batch — an
+        // exactly-capacity batch is legal. (The deleted Zig checked
+        // `count >= capacity` after every event, rejecting full batches.)
+        if count >= columns.capacity as usize && !parser.is_array_end() {
             return Err(ExtractionError::TooManyEvents);
         }
     }
@@ -928,77 +927,12 @@ impl<'a> MsgpackValueWriter<'a> {
 /// json_extractor.zig carries its OWN `parseTimestampToMicros`, which drifts
 /// from json_scanner.zig's `parseIso8601ToMicros` in three observable ways,
 /// all mirrored here:
-/// - no year range check (year 0001 is accepted; the scanner rejects <1970),
-/// - a fraction longer than 3 digits yields 0 ms (the scanner takes the
-///   first three),
-/// - a non-digit fraction of length 1..=3 rejects the whole timestamp (the
-///   scanner's `catch 0` accepts it with 0 ms),
-/// - fields are strict digits (the scanner's parseInt accepts a leading '+').
-// ZIG-PARITY: this is one of two drifted timestamp parsers (extractor variant vs json_scanner::parse_iso8601_to_micros); intended fix: unify on one parser with deliberate fraction/sign semantics.
+/// Delegates to the ONE canonical parser (`json_scanner::parse_iso8601_to_micros`)
+/// — the deleted Zig carried two drifted variants; unified post-parity on
+/// deliberate semantics: strict digits, digit-only fractions (garbage
+/// rejects), first three fraction digits are the milliseconds, 1970..=2099.
 pub fn parse_timestamp_to_micros(value: &str) -> Option<i64> {
-    let s = value.as_bytes();
-    if s.len() < 20 || s[s.len() - 1] != b'Z' {
-        return None;
-    }
-    let year = parse_digits(&s[0..4])?;
-    if s[4] != b'-' {
-        return None;
-    }
-    let month = parse_digits(&s[5..7])?;
-    if s[7] != b'-' {
-        return None;
-    }
-    let day = parse_digits(&s[8..10])?;
-    if s[10] != b'T' {
-        return None;
-    }
-    let hour = parse_digits(&s[11..13])?;
-    if s[13] != b':' {
-        return None;
-    }
-    let minute = parse_digits(&s[14..16])?;
-    if s[16] != b':' {
-        return None;
-    }
-    let second = parse_digits(&s[17..19])?;
-    let mut millis: i64 = 0;
-    if s.len() > 20 && s[19] == b'.' {
-        let fraction = &s[20..s.len() - 1];
-        if (1..=3).contains(&fraction.len()) {
-            millis = parse_digits(fraction)?;
-            for _ in fraction.len()..3 {
-                millis *= 10;
-            }
-        }
-        // Zig: fraction length 0 or >3 leaves millis at 0 without rejecting.
-    }
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
-        return None;
-    }
-    let y = year - i64::from(month <= 2);
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2).div_euclid(5) + day - 1;
-    let doe = yoe * 365 + yoe.div_euclid(4) - yoe.div_euclid(100) + doy;
-    let epoch_days = era * 146_097 + doe - 719_468;
-    let total_seconds = epoch_days * 86_400 + hour * 3_600 + minute * 60 + second;
-    Some(total_seconds * 1_000_000 + millis * 1_000)
-}
-
-fn parse_digits(bytes: &[u8]) -> Option<i64> {
-    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    Some(
-        bytes
-            .iter()
-            .fold(0_i64, |total, digit| total * 10 + i64::from(digit - b'0')),
-    )
+    crate::json_scanner::parse_iso8601_to_micros(value).ok()
 }
 
 #[cfg(test)]
@@ -1270,33 +1204,36 @@ mod tests {
         assert_eq!(parse_timestamp_to_micros("not a date"), None);
         assert_eq!(parse_timestamp_to_micros(""), None);
     }
-    /// Pins the drift between json_extractor.zig's own timestamp parser and
-    /// json_scanner.zig's (see parse_timestamp_to_micros doc).
+    /// Post-parity fix pin: ONE canonical timestamp parser (the deleted Zig
+    /// carried two drifted variants) with deliberate semantics — 1970..=2099
+    /// years, digit-only fractions (garbage rejects), first three fraction
+    /// digits are the milliseconds, strict digits everywhere.
     #[test]
-    fn parse_timestamp_to_micros_extractor_variant_drift() {
+    fn parse_timestamp_unified_semantics() {
         use crate::json_scanner::parse_iso8601_to_micros;
-        // No year-range check here; the scanner rejects years before 1970.
-        assert!(parse_timestamp_to_micros("1900-01-15T10:30:00Z").is_some());
+        // Year range applies uniformly.
+        assert_eq!(parse_timestamp_to_micros("1900-01-15T10:30:00Z"), None);
         assert!(parse_iso8601_to_micros("1900-01-15T10:30:00Z").is_err());
-        // Fraction longer than 3 digits: extractor drops it to 0 ms, the
-        // scanner keeps the first three digits.
+        // Fraction >3 digits: first three are the milliseconds — uniformly.
         let base = parse_timestamp_to_micros("2024-01-15T10:30:00Z").unwrap();
         assert_eq!(
             parse_timestamp_to_micros("2024-01-15T10:30:00.1234Z"),
-            Some(base)
+            Some(base + 123_000)
         );
         assert_eq!(
             parse_iso8601_to_micros("2024-01-15T10:30:00.1234Z").unwrap(),
             base + 123_000
         );
-        // Non-digit short fraction: extractor rejects, scanner accepts as 0.
+        // Garbage fraction rejects — uniformly.
         assert_eq!(parse_timestamp_to_micros("2024-01-15T10:30:00.abZ"), None);
-        assert!(parse_iso8601_to_micros("2024-01-15T10:30:00.abZ").is_ok());
+        assert!(parse_iso8601_to_micros("2024-01-15T10:30:00.abZ").is_err());
+        // Leading '+' in a field rejects (strict digits).
+        assert!(parse_iso8601_to_micros("2024-+1-15T10:30:00Z").is_err());
     }
-    /// Zig rejects an exactly-capacity batch (`count >= capacity` runs after
-    /// every event, including the last) — mirrored bug-for-bug.
+    /// Post-parity fix pin: an exactly-capacity batch is ACCEPTED; only a
+    /// larger one refuses. (The deleted Zig rejected full batches.)
     #[test]
-    fn extract_json_events_rejects_exactly_capacity_batch() {
+    fn extract_json_events_accepts_exactly_capacity_batch() {
         let fields = [field(ArrowType::Utf8)];
         let mut c = DynamicColumns::new(&fields, 1);
         let mut work = [0; 64];
@@ -1308,7 +1245,7 @@ mod tests {
                 &mut work,
                 &mut ExtractionDiagnostic::default()
             ),
-            Err(ExtractionError::TooManyEvents)
+            Ok(1)
         );
     }
     /// The $extra writer is lazy: a tiny work buffer is fine as long as every

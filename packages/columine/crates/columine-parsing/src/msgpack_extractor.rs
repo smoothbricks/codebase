@@ -19,15 +19,14 @@ pub fn extract_msgpack_events(
     }
     let mut reader = Reader::new(input);
     let mut count = 0;
-    // ZIG-PARITY: an exactly-capacity batch is rejected (`count >= capacity` runs after every event); intended fix: accept full batches, resolved at the event_processor level.
-    // Zig checks `count >= capacity` after EVERY event, so an exactly-capacity
-    // batch is rejected too — mirrored bug-for-bug (flagged for the stage-4B
-    // event-processor audit, same as the JSON extractor).
+    // Refuse only when MORE events follow a full batch — an exactly-capacity
+    // batch is legal. (The deleted Zig checked `count >= capacity` after
+    // every event, rejecting full batches.)
     if stream {
         while !reader.at_end() {
             extract_msgpack_event(&mut reader, config, columns, work_buffer)?;
             count += 1;
-            if count >= columns.capacity as usize {
+            if count >= columns.capacity as usize && !reader.at_end() {
                 return Err(ExtractionError::TooManyEvents);
             }
         }
@@ -35,12 +34,14 @@ pub fn extract_msgpack_events(
         let size = reader
             .read_array_header()
             .ok_or(ExtractionError::InvalidJson)?;
+        // The header declares the batch size up front: refuse only a batch
+        // genuinely larger than capacity; exactly-capacity is legal.
+        if size as usize > columns.capacity as usize {
+            return Err(ExtractionError::TooManyEvents);
+        }
         for _ in 0..size {
             extract_msgpack_event(&mut reader, config, columns, work_buffer)?;
             count += 1;
-            if count >= columns.capacity as usize {
-                return Err(ExtractionError::TooManyEvents);
-            }
         }
     }
     Ok(count)
@@ -82,11 +83,14 @@ fn extract_msgpack_fields(
     let mut set = [false; 64];
     let mut extra_count: u32 = 0;
     let mut extra_end: usize = 0;
-    // ZIG-PARITY: when the $extra work buffer is under 5 bytes, undeclared fields are silently dropped instead of erroring; intended fix: refuse loudly (Err) on an unusable buffer.
-    // Zig: `extra_active = fallback set AND work_buffer.len >= 5`; when the
-    // buffer is too small for even the header, undeclared fields are silently
-    // SKIPPED and the fallback column nulls — not an error.
-    let extra_active = config.fallback_column.is_some() && work_buffer.len() >= 5;
+    // A fallback column with an unusably small work buffer (< 5 bytes: not
+    // even the msgpack header fits) is a configuration error — refuse loudly
+    // instead of silently dropping undeclared fields (the deleted Zig
+    // skipped them and nulled the fallback column).
+    if config.fallback_column.is_some() && work_buffer.len() < 5 {
+        return Err(ExtractionError::OutOfMemory);
+    }
+    let extra_active = config.fallback_column.is_some();
     for _ in 0..fields {
         let key_start = reader.position();
         let key = reader.read_string().ok_or(ExtractionError::InvalidJson)?;
@@ -341,9 +345,9 @@ mod tests {
         assert_eq!(columns.cell(1, 0), Some(ColumnValue::Utf8("order".into())));
     }
     #[test]
-    fn extract_msgpack_events_rejects_exactly_capacity_batch() {
-        // Zig's post-event `count >= capacity` check fires even when the
-        // stream ends exactly at capacity.
+    fn extract_msgpack_events_accepts_exactly_capacity_batch() {
+        // Post-parity fix pin: a stream ending exactly at capacity is legal
+        // (the deleted Zig rejected it); one event past capacity refuses.
         let fields = [field(ArrowType::Utf8)];
         let mut input = vec![0x81];
         str_(&mut input, "id");
@@ -358,13 +362,27 @@ mod tests {
                 &mut work,
                 true
             ),
+            Ok(1)
+        );
+        let mut two = input.clone();
+        two.extend_from_slice(&input);
+        let mut columns2 = DynamicColumns::new(&fields, 1);
+        assert_eq!(
+            extract_msgpack_events(
+                &two,
+                &config(&fields, &["id"]),
+                &mut columns2,
+                &mut work,
+                true
+            ),
             Err(ExtractionError::TooManyEvents)
         );
     }
     #[test]
-    fn extract_msgpack_events_tiny_work_buffer_skips_undeclared() {
-        // Zig: fallback configured but work_buffer < 5 bytes → extra_active
-        // is false; undeclared fields are skipped and $extra nulls, no error.
+    fn extract_msgpack_events_tiny_work_buffer_refuses() {
+        // Post-parity fix pin: fallback configured but work_buffer < 5 bytes
+        // is a configuration error — loud refusal, never a silent drop (the
+        // deleted Zig skipped undeclared fields and nulled $extra).
         let fields = [field(ArrowType::Utf8), field(ArrowType::Binary)];
         let mut input = vec![0x82];
         str_(&mut input, "id");
@@ -380,11 +398,9 @@ mod tests {
                 &mut columns,
                 &mut work,
                 true
-            )
-            .unwrap(),
-            1
+            ),
+            Err(ExtractionError::OutOfMemory)
         );
-        assert!(columns.is_null(1, 0));
     }
     #[test]
     fn extract_msgpack_events_extra_copies_raw_key_value_bytes() {

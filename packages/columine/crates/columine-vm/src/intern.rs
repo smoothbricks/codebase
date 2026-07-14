@@ -7,11 +7,11 @@
 //! equals `data_len`), plus an open-addressing hash table (FNV-1a u32 hash,
 //! linear probing, no tombstones — interning never removes).
 //!
-// ZIG-PARITY: intern buffers are sized once at init and never grow (Zig bump-heap model, no overflow checks); intended fix: grow or return Err instead of the checked panic.
-// Sizing: `data` = cap×32 ("assume ~32 bytes per string"), `offsets` = cap+1,
-// hash = nextPowerOf2(cap×2). The Zig has NO overflow checks (overruns the
-// heap / probes forever — ReleaseSmall UB); here exceeding capacity is a
-// checked panic.
+// Initial sizing: `data` = cap×32 ("assume ~32 bytes per string"),
+// `offsets` = cap+1, hash = nextPowerOf2(cap×2) — and every buffer GROWS on
+// demand (the deleted Zig bump-heap model had no overflow checks and
+// overran/probed forever past capacity; interned u32 handles stay stable
+// across growth because growth only appends).
 //!
 //! The `intern_*` exports (intern.zig:182-220) are the wasm ABI over a
 //! global singleton + 4 MB bump heap — that surface belongs to the bindings
@@ -33,8 +33,8 @@ pub fn hash_bytes(bytes: &[u8]) -> u32 {
     h
 }
 
-/// intern.zig:19 `StringIntern`. Buffers are `Vec`s sized once at
-/// construction and never reallocated, matching the Zig bump-heap model.
+/// intern.zig:19 `StringIntern`. Buffers start at the Zig sizing model and
+/// grow on demand; u32 handles are stable (growth only appends).
 #[derive(Debug)]
 pub struct StringIntern {
     data: Vec<u8>,
@@ -74,9 +74,13 @@ impl StringIntern {
     /// content before returning (FNV-1a collisions are real, e.g.
     /// "costarring"/"liquid").
     pub fn intern(&mut self, s: &[u8]) -> u32 {
+        // Keep load factor <= 1/2 so probes terminate; rehash doubles the
+        // table and re-seats every live hash (handles unchanged).
+        if (self.count + 1) * 2 > self.hash_cap {
+            self.grow_hash();
+        }
         let h = hash_bytes(s);
         let mut slot = h & (self.hash_cap - 1);
-        let mut probed: u32 = 0;
         loop {
             let key = self.hash_keys[slot as usize];
             if key == EMPTY {
@@ -91,29 +95,44 @@ impl StringIntern {
                 }
             }
             slot = (slot + 1) & (self.hash_cap - 1);
-            probed += 1;
-            // Zig probes forever on a full table (ReleaseSmall UB/hang);
-            // a full intern table is a programmer bug here.
-            assert!(
-                probed <= self.hash_cap,
-                "StringIntern hash table full (cap {}) — size the intern capacity for the schema",
-                self.hash_cap
-            );
         }
     }
 
-    /// intern.zig:120 `insertNew`.
+    /// Double the hash table and re-seat all live entries. Handles (indices
+    /// into `offsets`) are untouched.
+    fn grow_hash(&mut self) {
+        let new_cap = self.hash_cap * 2;
+        let mut keys = vec![EMPTY; new_cap as usize];
+        let mut indices = vec![0u32; new_cap as usize];
+        for i in 0..self.hash_cap as usize {
+            let key = self.hash_keys[i];
+            if key == EMPTY {
+                continue;
+            }
+            let mut slot = key & (new_cap - 1);
+            while keys[slot as usize] != EMPTY {
+                slot = (slot + 1) & (new_cap - 1);
+            }
+            keys[slot as usize] = key;
+            indices[slot as usize] = self.hash_indices[i];
+        }
+        self.hash_keys = keys;
+        self.hash_indices = indices;
+        self.hash_cap = new_cap;
+    }
+
+    /// intern.zig:120 `insertNew` — buffers grow on demand.
     fn insert_new(&mut self, s: &[u8], h: u32, slot: u32) -> u32 {
         let idx = self.count;
-        // Zig overruns the bump heap past capacity (no check) — programmer
-        // bug here, checked.
-        assert!(
-            (idx as usize) < self.offsets.len() - 1,
-            "StringIntern offsets capacity exceeded ({} strings)",
-            idx
-        );
+        if (idx as usize) >= self.offsets.len() - 1 {
+            let new_len = (self.offsets.len() - 1) * 2 + 1;
+            self.offsets.resize(new_len, 0);
+        }
         let start = self.data_len as usize;
         let end = start + s.len();
+        if end > self.data.len() {
+            self.data.resize(end.max(self.data.len() * 2), 0);
+        }
         assert!(
             end <= self.data.len(),
             "StringIntern data capacity exceeded ({} + {} > {})",
@@ -225,16 +244,28 @@ mod tests {
         assert_eq!(si.get(b), b"liquid");
     }
 
-    /// Documented divergence: the Zig overruns its bump heap / probes
-    /// forever past capacity (ReleaseSmall UB); here it's a checked
-    /// programmer-bug panic.
+    /// Post-parity fix pin: capacity is a starting size, not a ceiling —
+    /// buffers and the hash table grow on demand (the deleted Zig overran
+    /// its bump heap / probed forever past capacity). Handles stay stable
+    /// and dedup keeps working across every growth boundary.
     #[test]
-    #[should_panic(expected = "offsets capacity exceeded")]
-    fn exceeding_string_capacity_panics_instead_of_zig_ub() {
-        // initial_cap 16 → offsets_cap 17 → at most 16 strings.
+    fn growth_past_initial_capacity_keeps_handles_and_dedup() {
         let mut si = StringIntern::new(16);
-        for i in 0..17u32 {
-            si.intern(format!("s{i}").as_bytes());
+        let mut handles = Vec::new();
+        for i in 0..1000u32 {
+            handles.push(
+                si.intern(format!("string-number-{i}-padded-to-force-data-growth").as_bytes()),
+            );
+        }
+        for (i, &h) in handles.iter().enumerate() {
+            assert_eq!(
+                si.get(h),
+                format!("string-number-{i}-padded-to-force-data-growth").as_bytes()
+            );
+            assert_eq!(
+                si.intern(format!("string-number-{i}-padded-to-force-data-growth").as_bytes()),
+                h
+            );
         }
     }
 }

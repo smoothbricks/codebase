@@ -156,11 +156,10 @@ impl<'a> DynamicColumn<'a> {
         }
     }
 
-    /// ZIG-PARITY: dynamic_record_batch.zig's `int64` constructor tags the
-    /// column `.Int32` (zig line 164). Harmless — both are "fixed-width,
-    /// data buffer only" in `add_column`'s switch — but the tag is kept
-    /// verbatim so any future per-type branching reproduces Zig; intended
-    /// fix at the post-parity sweep: tag Int64.
+    /// Tags the column `.Int64` (the deleted Zig tagged `.Int32` — harmless
+    /// while `add_column` treats both as "fixed-width, data buffer only",
+    /// but a lie any future per-type branching would inherit; fixed
+    /// post-parity).
     pub fn int64(
         field_idx: u32,
         nullable: bool,
@@ -169,7 +168,7 @@ impl<'a> DynamicColumn<'a> {
     ) -> Self {
         Self {
             field_idx,
-            arrow_type: ArrowType::Int32,
+            arrow_type: ArrowType::Int64,
             nullable,
             validity,
             data,
@@ -519,8 +518,8 @@ mod tests {
         assert_eq!(col.arrow_type, ArrowType::Utf8);
         assert!(!col.nullable);
         let int_col = DynamicColumn::int64(2, false, None, &[]);
-        // ZIG-PARITY tag (see constructor doc).
-        assert_eq!(int_col.arrow_type, ArrowType::Int32);
+        // Post-parity fix pin: the tag tells the truth (Zig tagged Int32).
+        assert_eq!(int_col.arrow_type, ArrowType::Int64);
         assert!(int_col.offsets.is_none());
     }
 

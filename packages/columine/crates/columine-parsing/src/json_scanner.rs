@@ -154,20 +154,20 @@ pub fn parse_iso8601_to_micros(value: &str) -> Result<i64, TimestampError> {
     {
         return Err(TimestampError::InvalidFormat);
     }
-    // Zig parses the fraction with `parseInt(...) catch 0`: a garbage
-    // fraction yields 0 milliseconds, it never rejects the timestamp.
+    // Deliberate unified fraction semantics (post-parity; the deleted Zig
+    // had two drifted parsers — `catch 0` garbage-acceptance in one, reject
+    // + longer-than-3-yields-0 in the other): every fraction char must be a
+    // digit (garbage REJECTS), the first three digits are the milliseconds
+    // (ISO truncation), and an empty fraction after '.' rejects.
     let millis = if bytes.len() > 20 && bytes[19] == b'.' {
         let fraction = &bytes[20..bytes.len() - 1];
-        if fraction.len() >= 3 {
-            zig_int(&fraction[..3]).unwrap_or(0)
-        } else if fraction.is_empty() {
-            0
-        } else {
-            // Zig right-pads to three digits ("1" -> "100") before parsing.
-            let mut padded = [b'0'; 3];
-            padded[..fraction.len()].copy_from_slice(fraction);
-            zig_int(&padded).unwrap_or(0)
+        if fraction.is_empty() || !fraction.iter().all(u8::is_ascii_digit) {
+            return Err(TimestampError::InvalidFormat);
         }
+        let mut padded = [b'0'; 3];
+        let take = fraction.len().min(3);
+        padded[..take].copy_from_slice(&fraction[..take]);
+        zig_int(&padded)?
     } else {
         0
     };
@@ -177,16 +177,10 @@ pub fn parse_iso8601_to_micros(value: &str) -> Result<i64, TimestampError> {
         + i64::from(second);
     Ok(seconds * 1_000_000 + millis * 1_000)
 }
-/// `std.fmt.parseInt` semantics for the slice widths used here: an optional
-/// leading '+' is accepted ("2024-+1-15T..." parses month 1 in Zig). The Zig
-/// year field is parseInt(i32) and also accepts '-', but any sign-bearing
-/// 4-char year falls outside the 1970..=2099 range check, so rejecting '-'
-/// here produces the identical InvalidFormat outcome.
+/// Strict digits (unified post-parity: the deleted Zig's parseInt accepted
+/// a leading '+', e.g. "2024-+1-15T…" parsed month 1).
 fn zig_int(bytes: &[u8]) -> Result<i64, TimestampError> {
-    let digits = match bytes.first() {
-        Some(b'+') => &bytes[1..],
-        _ => bytes,
-    };
+    let digits = bytes;
     if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         return Err(TimestampError::InvalidFormat);
     }
@@ -263,18 +257,13 @@ mod tests {
         );
     }
     #[test]
-    fn parse_iso8601_to_micros_garbage_fraction_yields_zero_millis() {
-        // Zig: `parseInt(frac) catch 0` — a non-numeric fraction is 0 ms,
-        // never a rejection.
+    fn parse_iso8601_to_micros_garbage_fraction_rejects() {
+        // Post-parity unified semantics: a non-digit fraction REJECTS (the
+        // deleted Zig's `parseInt catch 0` silently read it as 0 ms).
         let base = parse_iso8601_to_micros("2024-01-15T10:30:00Z").unwrap();
-        assert_eq!(
-            parse_iso8601_to_micros("2024-01-15T10:30:00.abcZ").unwrap(),
-            base
-        );
-        assert_eq!(
-            parse_iso8601_to_micros("2024-01-15T10:30:00.1x3Z").unwrap(),
-            base
-        );
+        assert!(parse_iso8601_to_micros("2024-01-15T10:30:00.abcZ").is_err());
+        assert!(parse_iso8601_to_micros("2024-01-15T10:30:00.1x3Z").is_err());
+        let _ = base;
         // Extra fraction digits beyond three are ignored (first three win).
         assert_eq!(
             parse_iso8601_to_micros("2024-01-15T10:30:00.123456Z").unwrap(),

@@ -426,7 +426,7 @@ mod tests {
             write_arrow_ipc_from_dynamic_columns(&dynamic, &config, &mut dyn_out, &mut dyn_meta)
                 .unwrap();
 
-        // ZIG-PARITY nuance: the base path emits empty validity buffers for
+        // WHY (kept wire behavior): the base path emits empty validity buffers for
         // the non-nullable id/type/timestamp columns AND the dynamic path
         // does the same (validity passed only when nullable) — so the two
         // streams agree byte for byte.

@@ -422,9 +422,10 @@ pub fn evict_expired(
             continue;
         }
 
-        // vm.zig:809 — journal the eviction. Faithful quirk: `appendMutation`
-        // is called with delta_mode=false even inside a delta batch, so evict
-        // entries never get a redo lane (the Zig discards the redo argument).
+        // vm.zig:809 — journal the eviction. Evictions are undo-only BY
+        // DESIGN: an eviction has no meaningful forward replay (rollforward
+        // re-derives expiry from TTL state), so its redo lane is the zeroed
+        // no-op marker that delta_apply_rollforward_segment skips.
         if undo.enabled {
             match meta.slot_type() {
                 SlotType::HashMap => {
@@ -551,11 +552,10 @@ pub const UNDO_CAPACITY: u32 = 16384;
 pub struct UndoState {
     /// `g_undo_entries[0..g_undo_count]`.
     entries: Vec<FlatUndoEntry>,
-    /// `g_redo_entries` — parallel lane. Zig leaves lanes untouched for
-    /// undo-only appends (exporting stale bytes there); Rust stores a zeroed
-    /// placeholder so exports are deterministic. ZIG-PARITY: Zig exports
-    /// undefined redo bytes for undo-only entries inside a delta window;
-    /// intended fix is Zig-side (never export past an undo-only entry).
+    /// `g_redo_entries` — parallel lane. Undo-only appends store the zeroed
+    /// entry as an explicit no-op marker (op byte 0), which rollforward
+    /// skips — deterministic exports, garbage-free replay. (The deleted Zig
+    /// exported undefined bytes for these lanes.)
     redo: Vec<FlatUndoEntry>,
     /// `g_delta_count` — pairs are valid up to here.
     delta_count: u32,
@@ -906,11 +906,18 @@ pub fn rollback_entry(env: &mut BitmapEnv, state: &mut [u8], entry: &FlatUndoEnt
         }
         FlatUndoOp::AggUpdate => {
             let meta = SlotMetaView::read(state, entry.slot);
-            undo_log::rollback_agg_update(state, &meta, entry.prev_value, entry.aux);
+            let count = u64::from(entry.prev_value) | (u64::from(entry.key) << 32);
+            undo_log::rollback_agg_update(state, &meta, count, entry.aux);
         }
         FlatUndoOp::CountUpdate => {
             let meta = SlotMetaView::read(state, entry.slot);
-            undo_log::rollback_count_update(state, &meta, entry.prev_value);
+            let count = u64::from(entry.prev_value) | (u64::from(entry.key) << 32);
+            undo_log::rollback_count_update(state, &meta, count);
+        }
+        FlatUndoOp::ScalarUpdate => {
+            let meta = SlotMetaView::read(state, entry.slot);
+            let ts = u64::from(entry.prev_value) | (u64::from(entry.key) << 32);
+            undo_log::rollback_scalar_update(state, &meta, entry.aux, f64::from_bits(ts));
         }
         FlatUndoOp::FactInsertNew => {
             // vm.zig:421 — tombstone the derived-fact key.
@@ -1454,10 +1461,8 @@ fn write_struct_map_array_fields(
 // Aggregate execution (vm.zig:1297-1329)
 // =============================================================================
 
-/// vm.zig:1297 `execAgg` for f64 slots (16-byte value+count layout).
-/// ZIG-PARITY: the undo entry's `prev_value` truncates the u64 count to u32
-/// in BOTH directions (counts > u32::MAX roll back wrong); intended fix is a
-/// widened journal lane at the post-parity sweep.
+/// vm.zig:1297 `execAgg` for f64 slots (16-byte value+count layout). The
+/// full u64 count rides prev_value (low) + key (high) journal lanes.
 #[allow(clippy::too_many_arguments)]
 fn exec_agg_f64(
     undo: &mut UndoState,
@@ -1484,7 +1489,10 @@ fn exec_agg_f64(
                 slot,
                 pad1: 0,
                 pad2: 0,
-                key: 0,
+                // Full u64 count: low half in prev_value, high half in the
+                // otherwise-unused key lane (the deleted Zig truncated to
+                // u32, so counts past 4.29e9 rolled back wrong).
+                key: (count >> 32) as u32,
                 prev_value: count as u32,
                 aux,
             };
@@ -1526,7 +1534,10 @@ fn exec_agg_i64(
                 slot,
                 pad1: 0,
                 pad2: 0,
-                key: 0,
+                // Full u64 count: low half in prev_value, high half in the
+                // otherwise-unused key lane (the deleted Zig truncated to
+                // u32, so counts past 4.29e9 rolled back wrong).
+                key: (count >> 32) as u32,
                 prev_value: count as u32,
                 aux,
             };
@@ -1558,13 +1569,13 @@ fn exec_agg_count(
     let prev_count = bytes::read_u64(state, meta.offset);
     let next_count = prev_count + matched;
     if undo.enabled {
-        // ZIG-PARITY: COUNT journal truncates u64 counts to u32 (see undo_log).
+        // Full u64 count: prev_value low + key high lanes (see undo_log).
         let cu = |prev: u64| FlatUndoEntry {
             op: FlatUndoOp::CountUpdate,
             slot,
             pad1: 0,
             pad2: 0,
-            key: 0,
+            key: (prev >> 32) as u32,
             prev_value: prev as u32,
             aux: 0,
         };
@@ -1579,12 +1590,14 @@ fn exec_agg_count(
 /// INVALID_PROGRAM on unknown subtypes; the body arm silently ignores them
 /// (vm.zig:2146 `else => {}`) — a faithful asymmetry.
 ///
-/// ZIG-PARITY: scalar-slot writes are NOT undo-journaled anywhere in vm.zig —
-/// a speculative BATCH_SCALAR_LATEST mutation survives rollback unless the
-/// undo-log-overflow shadow snapshot happens to cover it; intended fix is a
-/// SCALAR_UPDATE journal op at the post-parity sweep.
+/// Scalar writes ARE undo-journaled (ScalarUpdate, one undo/redo pair per
+/// call when the slot changed) — the deleted Zig journaled nothing here, so
+/// a speculative BATCH_SCALAR_LATEST mutation survived rollback unless the
+/// overflow shadow snapshot happened to cover it.
 #[allow(clippy::too_many_arguments)]
 fn exec_scalar_latest(
+    undo: &mut UndoState,
+    delta_mode: bool,
     state: &mut [u8],
     slot: u8,
     val_col: &[u8],
@@ -1596,6 +1609,8 @@ fn exec_scalar_latest(
     let meta = SlotMetaView::read(state, slot);
     let data = meta.offset;
     let scalar_type = meta.agg_type_byte(state);
+    let prev_value = bytes::read_u64(state, data);
+    let prev_ts = bytes::read_f64(state, data + 8);
 
     // AggType: SCALAR_U32 = 8, SCALAR_F64 = 9, SCALAR_I64 = 10 (types.zig:214-216;
     // 6-7 are the reserved gap — a prior misread as 5/6/7 made every scalar op a
@@ -1640,6 +1655,31 @@ fn exec_scalar_latest(
             if strict_subtype {
                 return ErrorCode::InvalidProgram;
             }
+        }
+    }
+
+    if undo.enabled {
+        let next_value = bytes::read_u64(state, data);
+        let next_ts = bytes::read_f64(state, data + 8);
+        if next_value != prev_value || next_ts.to_bits() != prev_ts.to_bits() {
+            // value bits ride aux; timestamp bits ride prev_value (low) +
+            // key (high) — same split as the widened count lanes.
+            let su = |value: u64, ts: f64| FlatUndoEntry {
+                op: FlatUndoOp::ScalarUpdate,
+                slot,
+                pad1: 0,
+                pad2: 0,
+                key: (ts.to_bits() >> 32) as u32,
+                prev_value: ts.to_bits() as u32,
+                aux: value,
+            };
+            append_mutation_state(
+                undo,
+                delta_mode,
+                state,
+                su(prev_value, prev_ts),
+                su(next_value, next_ts),
+            );
         }
     }
     ErrorCode::Ok
@@ -1767,7 +1807,7 @@ impl Vm {
     }
 
     /// vm.zig:1003 `vm_evict_all_expired`.
-    /// ZIG-PARITY: on a bad state magic this returns INVALID_STATE (4) through
+    /// WHY (kept contract): on a bad state magic this returns INVALID_STATE (4) through
     /// a channel whose meaning is "total evicted count" — callers cannot
     /// distinguish "4 evicted" from "invalid state"; intended fix is a
     /// distinct error surface at the post-parity sweep.
@@ -2213,6 +2253,8 @@ impl Vm {
                     pc += 3;
                     let cmp_vals = col_f64(col_at(cols, cmp_col as usize), batch_len);
                     let result = exec_scalar_latest(
+                        &mut self.undo,
+                        delta_mode,
                         state,
                         slot,
                         col_at(cols, val_col as usize),
@@ -2418,6 +2460,8 @@ impl Vm {
                     // Body arm: unknown scalar subtype is silently ignored
                     // (vm.zig:2146) — strict_subtype=false.
                     let _ = exec_scalar_latest(
+                        &mut self.undo,
+                        delta_mode,
                         state,
                         slot,
                         col_at(cols, val_col as usize),
@@ -3618,6 +3662,14 @@ impl Vm {
         }
         let count = redo_segment.len() / FLAT_UNDO_ENTRY_SIZE as usize;
         for i in 0..count {
+            // Undo-only journal items (evictions, derived-fact appends) have
+            // no forward effect: their redo lane is the explicit zeroed
+            // no-op marker (op byte 0). Skip them — the deleted Zig exported
+            // undefined bytes here, and treating the marker as corruption
+            // would panic mid-rollforward.
+            if redo_segment[i * FLAT_UNDO_ENTRY_SIZE as usize] == 0 {
+                continue;
+            }
             let entry = parse_entry(redo_segment, i);
             rollback_entry(&mut self.bitmap_env, state, &entry);
         }

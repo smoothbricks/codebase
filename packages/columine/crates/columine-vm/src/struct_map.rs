@@ -160,10 +160,11 @@ impl StructMapSlot {
         None
     }
 
-    // ZIG-PARITY: struct_map's insert probe does NO first-tombstone reuse while hash_table's does; intended fix: unify probe placement policy across containers.
-    /// struct_map.zig:92 `findInsert` — insert-or-update probe. See the
-    /// module doc for why this deliberately does NOT do first-tombstone
-    /// reuse like `hash_table.zig`.
+    /// struct_map.zig:92 `findInsert` — insert-or-update probe, unified on
+    /// the hash_table policy post-parity: probe for an existing key first,
+    /// reusing the first tombstone seen. (The deleted Zig claimed a
+    /// tombstone immediately, so an insert could shadow a live copy of the
+    /// same key sitting past it.)
     pub fn find_insert(&self, state: &[u8], key: u32) -> Option<Probe> {
         if key == EMPTY_KEY || key == TOMBSTONE {
             return None;
@@ -173,17 +174,25 @@ impl StructMapSlot {
             "probe mask requires pow2 cap"
         );
         let mut pos = hash_key(key, self.capacity);
+        let mut first_tombstone: Option<u32> = None;
         for _ in 0..self.capacity {
             let k = self.key_at(state, pos);
             if k == key {
                 return Some(Probe { pos, found: true });
             }
-            if k == EMPTY_KEY || k == TOMBSTONE {
-                return Some(Probe { pos, found: false });
+            if k == TOMBSTONE {
+                if first_tombstone.is_none() {
+                    first_tombstone = Some(pos);
+                }
+            } else if k == EMPTY_KEY {
+                return Some(Probe {
+                    pos: first_tombstone.unwrap_or(pos),
+                    found: false,
+                });
             }
             pos = (pos + 1) & (self.capacity - 1);
         }
-        None
+        first_tombstone.map(|pos| Probe { pos, found: false })
     }
 
     /// struct_map.zig:106 `rowPtr` — absolute byte offset of the row at hash

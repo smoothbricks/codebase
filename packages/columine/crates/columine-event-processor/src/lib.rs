@@ -270,11 +270,11 @@ impl EventProcessor {
                 .map_err(|_| ResultCode::ParseError),
             InputFormat::MsgpackStream => msgpack_scanner::parse_msgpack_stream(input, cols)
                 .map_err(|_| ResultCode::ParseError),
-            // ZIG-PARITY: columine's base path treats ARROW_PASSTHROUGH as
-            // OK-with-empty-columns (`.ARROW_PASSTHROUGH => .OK`) while its
-            // extraction path and the AxE artifact refuse INVALID_FORMAT;
-            // intended fix: refuse on both paths.
-            InputFormat::ArrowPassthrough => Ok(()),
+            // ARROW_PASSTHROUGH refuses uniformly post-parity (the deleted
+            // Zig's base path answered OK with empty columns while the
+            // extraction path refused INVALID_FORMAT — one input format,
+            // two answers).
+            InputFormat::ArrowPassthrough => Err(ResultCode::InvalidFormat),
         };
         if parse_result.is_err() {
             write_result_header(output, ResultCode::ParseError, 0, 0, 0, 0);
