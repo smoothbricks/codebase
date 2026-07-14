@@ -57,6 +57,7 @@ pub(crate) struct AcceptContext {
     pub connector: Arc<dyn UpstreamConnector>,
     pub timeouts: GatewayTimeouts,
     pub connection_stop: watch::Receiver<bool>,
+    pub audit_stop: watch::Receiver<bool>,
 }
 
 pub(crate) async fn accept_loop(
@@ -64,6 +65,7 @@ pub(crate) async fn accept_loop(
     context: AcceptContext,
     mut accept_stop: watch::Receiver<bool>,
     connection_stop: watch::Receiver<bool>,
+    audit_stop: watch::Receiver<bool>,
 ) {
     match listener {
         BoundListener::Tcp(listener) => loop {
@@ -71,7 +73,7 @@ pub(crate) async fn accept_loop(
                 result = listener.accept() => {
                     let Ok((stream, _)) = result else { break };
                     let _ = stream.set_nodelay(true);
-                    spawn_connection(stream, context.clone(), connection_stop.clone());
+                    spawn_connection(stream, context.clone(), connection_stop.clone(), audit_stop.clone());
                 }
                 changed = accept_stop.changed() => {
                     if changed.is_err() || *accept_stop.borrow() { break; }
@@ -82,7 +84,7 @@ pub(crate) async fn accept_loop(
             tokio::select! {
                 result = listener.accept() => {
                     let Ok((stream, _)) = result else { break };
-                    spawn_connection(stream, context.clone(), connection_stop.clone());
+                    spawn_connection(stream, context.clone(), connection_stop.clone(), audit_stop.clone());
                 }
                 changed = accept_stop.changed() => {
                     if changed.is_err() || *accept_stop.borrow() { break; }
@@ -96,6 +98,7 @@ fn spawn_connection<I>(
     stream: I,
     context: AcceptContext,
     mut connection_stop: watch::Receiver<bool>,
+    mut audit_stop: watch::Receiver<bool>,
 ) where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
@@ -122,6 +125,12 @@ fn spawn_connection<I>(
                 if changed.is_ok() && *connection_stop.borrow() {
                     connection.as_mut().graceful_shutdown();
                     let _ = timeout(context.timeouts.request_total, &mut connection).await;
+                }
+            }
+            changed = audit_stop.changed() => {
+                if changed.is_ok() && *audit_stop.borrow() {
+                    // Dropping the Hyper connection cancels the in-flight service future,
+                    // including connector, credential, request-body, and response-body work.
                 }
             }
         }
@@ -535,190 +544,197 @@ fn spawn_opaque(
     admission: Admission,
 ) {
     tokio::spawn(async move {
-        let mut connection_stop = watch_for_session_stop(&context);
-        let upgraded = match upgraded.await {
-            Ok(upgraded) => upgraded,
-            Err(_) => {
-                complete_now(
-                    &context,
-                    admission,
-                    AuditStatus::Failed,
-                    None,
-                    Some("upgrade-failed"),
-                    0,
-                    AuditKind::Opaque,
-                )
-                .await;
-                return;
-            }
-        };
-        let mut client = TokioIo::new(upgraded);
-        let captured = tokio::select! {
-            result = timeout(
-                context.timeouts.tls_handshake,
-                capture_client_hello(&mut client, &admission.target.host),
-            ) => {
-                match result {
-                    Ok(Ok(captured)) => captured,
-                    Ok(Err(error)) => {
-                        complete_now(
-                            &context,
-                            admission,
-                            AuditStatus::Denied,
-                            Some(StatusCode::FORBIDDEN),
-                            Some(error.classification()),
-                            0,
-                            AuditKind::Opaque,
-                        ).await;
-                        return;
-                    }
-                    Err(_) => {
-                        complete_now(
-                            &context,
-                            admission,
-                            AuditStatus::TimedOut,
-                            Some(StatusCode::GATEWAY_TIMEOUT),
-                            Some("client-hello-timeout"),
-                            0,
-                            AuditKind::Opaque,
-                        ).await;
-                        return;
+        let mut audit_stop = watch_for_audit_stop(&context);
+        let transport = async move {
+            let mut connection_stop = watch_for_session_stop(&context);
+            let upgraded = match upgraded.await {
+                Ok(upgraded) => upgraded,
+                Err(_) => {
+                    complete_now(
+                        &context,
+                        admission,
+                        AuditStatus::Failed,
+                        None,
+                        Some("upgrade-failed"),
+                        0,
+                        AuditKind::Opaque,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let mut client = TokioIo::new(upgraded);
+            let captured = tokio::select! {
+                result = timeout(
+                    context.timeouts.tls_handshake,
+                    capture_client_hello(&mut client, &admission.target.host),
+                ) => {
+                    match result {
+                        Ok(Ok(captured)) => captured,
+                        Ok(Err(error)) => {
+                            complete_now(
+                                &context,
+                                admission,
+                                AuditStatus::Denied,
+                                Some(StatusCode::FORBIDDEN),
+                                Some(error.classification()),
+                                0,
+                                AuditKind::Opaque,
+                            ).await;
+                            return;
+                        }
+                        Err(_) => {
+                            complete_now(
+                                &context,
+                                admission,
+                                AuditStatus::TimedOut,
+                                Some(StatusCode::GATEWAY_TIMEOUT),
+                                Some("client-hello-timeout"),
+                                0,
+                                AuditKind::Opaque,
+                            ).await;
+                            return;
+                        }
                     }
                 }
-            }
-            _ = connection_stop.changed() => {
-                complete_now(
-                    &context,
-                    admission,
-                    AuditStatus::Cancelled,
-                    None,
-                    Some("session-rotated"),
-                    0,
-                    AuditKind::Opaque,
-                ).await;
-                return;
-            }
-        };
+                _ = connection_stop.changed() => {
+                    complete_now(
+                        &context,
+                        admission,
+                        AuditStatus::Cancelled,
+                        None,
+                        Some("session-rotated"),
+                        0,
+                        AuditKind::Opaque,
+                    ).await;
+                    return;
+                }
+            };
 
-        if context.connector.health(&authorized.target).await == UpstreamHealth::Offline {
-            complete_now(
-                &context,
-                admission,
-                AuditStatus::Offline,
-                Some(StatusCode::SERVICE_UNAVAILABLE),
-                Some("upstream-offline"),
-                0,
-                AuditKind::Opaque,
+            if context.connector.health(&authorized.target).await == UpstreamHealth::Offline {
+                complete_now(
+                    &context,
+                    admission,
+                    AuditStatus::Offline,
+                    Some(StatusCode::SERVICE_UNAVAILABLE),
+                    Some("upstream-offline"),
+                    0,
+                    AuditKind::Opaque,
+                )
+                .await;
+                return;
+            }
+            let mut upstream = match timeout(
+                context.timeouts.connect,
+                context.connector.connect(&authorized),
             )
-            .await;
-            return;
-        }
-        let mut upstream = match timeout(
-            context.timeouts.connect,
-            context.connector.connect(&authorized),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(_)) => {
-                complete_now(
-                    &context,
-                    admission,
-                    AuditStatus::Failed,
-                    Some(StatusCode::BAD_GATEWAY),
-                    Some("connect-failed"),
-                    0,
-                    AuditKind::Opaque,
-                )
-                .await;
-                return;
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(_)) => {
+                    complete_now(
+                        &context,
+                        admission,
+                        AuditStatus::Failed,
+                        Some(StatusCode::BAD_GATEWAY),
+                        Some("connect-failed"),
+                        0,
+                        AuditKind::Opaque,
+                    )
+                    .await;
+                    return;
+                }
+                Err(_) => {
+                    complete_now(
+                        &context,
+                        admission,
+                        AuditStatus::TimedOut,
+                        Some(StatusCode::GATEWAY_TIMEOUT),
+                        Some("connect-timeout"),
+                        0,
+                        AuditKind::Opaque,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            match timeout(context.timeouts.connect, upstream.write_all(&captured)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    complete_now(
+                        &context,
+                        admission,
+                        AuditStatus::Failed,
+                        Some(StatusCode::BAD_GATEWAY),
+                        Some("client-hello-replay"),
+                        0,
+                        AuditKind::Opaque,
+                    )
+                    .await;
+                    return;
+                }
+                Err(_) => {
+                    complete_now(
+                        &context,
+                        admission,
+                        AuditStatus::TimedOut,
+                        Some(StatusCode::GATEWAY_TIMEOUT),
+                        Some("client-hello-replay-timeout"),
+                        0,
+                        AuditKind::Opaque,
+                    )
+                    .await;
+                    return;
+                }
             }
-            Err(_) => {
-                complete_now(
-                    &context,
-                    admission,
-                    AuditStatus::TimedOut,
-                    Some(StatusCode::GATEWAY_TIMEOUT),
-                    Some("connect-timeout"),
-                    0,
-                    AuditKind::Opaque,
-                )
-                .await;
-                return;
+            let replayed = captured.len() as u64;
+            let result = tokio::select! {
+                result = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {
+                    result.map(|(from_client, from_upstream)| {
+                        replayed
+                            .saturating_add(from_client)
+                            .saturating_add(from_upstream)
+                    })
+                }
+                _ = tokio::time::sleep(context.timeouts.tunnel_total) => {
+                    complete_now(&context, admission, AuditStatus::TimedOut, Some(StatusCode::GATEWAY_TIMEOUT), Some("tunnel-total-timeout"), replayed, AuditKind::Opaque).await;
+                    return;
+                }
+                _ = connection_stop.changed() => {
+                    complete_now(&context, admission, AuditStatus::Cancelled, None, Some("session-rotated"), replayed, AuditKind::Opaque).await;
+                    return;
+                }
+            };
+            match result {
+                Ok(bytes) => {
+                    complete_now(
+                        &context,
+                        admission,
+                        AuditStatus::Completed,
+                        Some(StatusCode::OK),
+                        None,
+                        bytes,
+                        AuditKind::Opaque,
+                    )
+                    .await
+                }
+                Err(_) => {
+                    complete_now(
+                        &context,
+                        admission,
+                        AuditStatus::Failed,
+                        None,
+                        Some("tunnel-io"),
+                        replayed,
+                        AuditKind::Opaque,
+                    )
+                    .await
+                }
             }
         };
-        match timeout(context.timeouts.connect, upstream.write_all(&captured)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                complete_now(
-                    &context,
-                    admission,
-                    AuditStatus::Failed,
-                    Some(StatusCode::BAD_GATEWAY),
-                    Some("client-hello-replay"),
-                    0,
-                    AuditKind::Opaque,
-                )
-                .await;
-                return;
-            }
-            Err(_) => {
-                complete_now(
-                    &context,
-                    admission,
-                    AuditStatus::TimedOut,
-                    Some(StatusCode::GATEWAY_TIMEOUT),
-                    Some("client-hello-replay-timeout"),
-                    0,
-                    AuditKind::Opaque,
-                )
-                .await;
-                return;
-            }
-        }
-        let replayed = captured.len() as u64;
-        let result = tokio::select! {
-            result = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {
-                result.map(|(from_client, from_upstream)| {
-                    replayed
-                        .saturating_add(from_client)
-                        .saturating_add(from_upstream)
-                })
-            }
-            _ = tokio::time::sleep(context.timeouts.tunnel_total) => {
-                complete_now(&context, admission, AuditStatus::TimedOut, Some(StatusCode::GATEWAY_TIMEOUT), Some("tunnel-total-timeout"), replayed, AuditKind::Opaque).await;
-                return;
-            }
-            _ = connection_stop.changed() => {
-                complete_now(&context, admission, AuditStatus::Cancelled, None, Some("session-rotated"), replayed, AuditKind::Opaque).await;
-                return;
-            }
-        };
-        match result {
-            Ok(bytes) => {
-                complete_now(
-                    &context,
-                    admission,
-                    AuditStatus::Completed,
-                    Some(StatusCode::OK),
-                    None,
-                    bytes,
-                    AuditKind::Opaque,
-                )
-                .await
-            }
-            Err(_) => {
-                complete_now(
-                    &context,
-                    admission,
-                    AuditStatus::Failed,
-                    None,
-                    Some("tunnel-io"),
-                    replayed,
-                    AuditKind::Opaque,
-                )
-                .await
-            }
+        tokio::select! {
+            _ = audit_stop.changed() => {}
+            _ = transport => {}
         }
     });
 }
@@ -779,11 +795,19 @@ where
             continue;
         };
         let client_hello = accepted.client_hello();
-        let sni = client_hello
-            .server_name()
-            .ok_or(ClientHelloError::MissingSni)?;
-        if !sni_matches(Some(sni), expected_host) {
-            return Err(ClientHelloError::SniMismatch);
+        match expected_host {
+            CanonicalHost::Dns(_) => {
+                let sni = client_hello
+                    .server_name()
+                    .ok_or(ClientHelloError::MissingSni)?;
+                if !sni_matches(Some(sni), expected_host) {
+                    return Err(ClientHelloError::SniMismatch);
+                }
+            }
+            CanonicalHost::Ip(_) if client_hello.server_name().is_some() => {
+                return Err(ClientHelloError::SniMismatch);
+            }
+            CanonicalHost::Ip(_) => {}
         }
         return Ok(captured);
     }
@@ -796,108 +820,119 @@ fn spawn_intercept(
     admission: Admission,
 ) {
     tokio::spawn(async move {
-        let upgraded = match upgraded.await {
-            Ok(upgraded) => upgraded,
-            Err(_) => {
-                complete_now(
-                    &context,
-                    admission,
-                    AuditStatus::Failed,
-                    None,
-                    Some("upgrade-failed"),
-                    0,
-                    AuditKind::Connect,
-                )
-                .await;
-                return;
-            }
-        };
-        let tls = match timeout(
-            context.timeouts.tls_handshake,
-            TlsAcceptor::from(leaf).accept(TokioIo::new(upgraded)),
-        )
-        .await
-        {
-            Ok(Ok(tls)) => tls,
-            Ok(Err(_)) => {
+        let mut audit_stop = watch_for_audit_stop(&context);
+        let transport = async move {
+            let upgraded = match upgraded.await {
+                Ok(upgraded) => upgraded,
+                Err(_) => {
+                    complete_now(
+                        &context,
+                        admission,
+                        AuditStatus::Failed,
+                        None,
+                        Some("upgrade-failed"),
+                        0,
+                        AuditKind::Connect,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let tls = match timeout(
+                context.timeouts.tls_handshake,
+                TlsAcceptor::from(leaf).accept(TokioIo::new(upgraded)),
+            )
+            .await
+            {
+                Ok(Ok(tls)) => tls,
+                Ok(Err(_)) => {
+                    complete_now(
+                        &context,
+                        admission,
+                        AuditStatus::Denied,
+                        None,
+                        Some("client-tls"),
+                        0,
+                        AuditKind::Connect,
+                    )
+                    .await;
+                    return;
+                }
+                Err(_) => {
+                    complete_now(
+                        &context,
+                        admission,
+                        AuditStatus::TimedOut,
+                        None,
+                        Some("client-tls-timeout"),
+                        0,
+                        AuditKind::Connect,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if !sni_matches(tls.get_ref().1.server_name(), &admission.target.host) {
                 complete_now(
                     &context,
                     admission,
                     AuditStatus::Denied,
-                    None,
-                    Some("client-tls"),
+                    Some(StatusCode::FORBIDDEN),
+                    Some("sni-mismatch"),
                     0,
                     AuditKind::Connect,
                 )
                 .await;
                 return;
             }
-            Err(_) => {
-                complete_now(
-                    &context,
-                    admission,
-                    AuditStatus::TimedOut,
-                    None,
-                    Some("client-tls-timeout"),
-                    0,
-                    AuditKind::Connect,
+            let nested_context = context.clone();
+            let fixed_target = admission.target.clone();
+            let generation = admission.generation;
+            let service = service_fn(move |request| {
+                handle_request(
+                    request,
+                    nested_context.clone(),
+                    Authentication::Generation(generation),
+                    Some(fixed_target.clone()),
                 )
-                .await;
-                return;
+            });
+            let connection = server_http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(context.timeouts.request_headers)
+                .max_headers(MAX_HEADERS)
+                .serve_connection(TokioIo::new(tls), service);
+            let mut stopped = watch_for_session_stop(&context);
+            tokio::pin!(connection);
+            tokio::select! {
+                result = &mut connection => {
+                    let (status, classification) = if result.is_ok() {
+                        (AuditStatus::Completed, None)
+                    } else {
+                        (AuditStatus::Failed, Some("intercept-io"))
+                    };
+                    complete_now(&context, admission, status, Some(StatusCode::OK), classification, 0, AuditKind::Connect).await;
+                }
+                _ = stopped.changed() => {
+                    complete_now(&context, admission, AuditStatus::Cancelled, None, Some("session-rotated"), 0, AuditKind::Connect).await;
+                }
+                _ = tokio::time::sleep(context.timeouts.tunnel_total) => {
+                    complete_now(&context, admission, AuditStatus::TimedOut, None, Some("tunnel-total-timeout"), 0, AuditKind::Connect).await;
+                }
             }
         };
-        if !sni_matches(tls.get_ref().1.server_name(), &admission.target.host) {
-            complete_now(
-                &context,
-                admission,
-                AuditStatus::Denied,
-                Some(StatusCode::FORBIDDEN),
-                Some("sni-mismatch"),
-                0,
-                AuditKind::Connect,
-            )
-            .await;
-            return;
-        }
-        let nested_context = context.clone();
-        let fixed_target = admission.target.clone();
-        let generation = admission.generation;
-        let service = service_fn(move |request| {
-            handle_request(
-                request,
-                nested_context.clone(),
-                Authentication::Generation(generation),
-                Some(fixed_target.clone()),
-            )
-        });
-        let connection = server_http1::Builder::new()
-            .timer(TokioTimer::new())
-            .header_read_timeout(context.timeouts.request_headers)
-            .max_headers(MAX_HEADERS)
-            .serve_connection(TokioIo::new(tls), service);
-        let mut stopped = watch_for_session_stop(&context);
-        tokio::pin!(connection);
         tokio::select! {
-            result = &mut connection => {
-                let (status, classification) = if result.is_ok() {
-                    (AuditStatus::Completed, None)
-                } else {
-                    (AuditStatus::Failed, Some("intercept-io"))
-                };
-                complete_now(&context, admission, status, Some(StatusCode::OK), classification, 0, AuditKind::Connect).await;
-            }
-            _ = stopped.changed() => {
-                complete_now(&context, admission, AuditStatus::Cancelled, None, Some("session-rotated"), 0, AuditKind::Connect).await;
-            }
-            _ = tokio::time::sleep(context.timeouts.tunnel_total) => {
-                complete_now(&context, admission, AuditStatus::TimedOut, None, Some("tunnel-total-timeout"), 0, AuditKind::Connect).await;
-            }
+            _ = audit_stop.changed() => {}
+            _ = transport => {}
         }
     });
 }
 
 fn watch_for_session_stop(context: &AcceptContext) -> watch::Receiver<bool> {
     context.connection_stop.clone()
+}
+
+fn watch_for_audit_stop(context: &AcceptContext) -> watch::Receiver<bool> {
+    context.audit_stop.clone()
 }
 
 async fn prepare_upstream_request(

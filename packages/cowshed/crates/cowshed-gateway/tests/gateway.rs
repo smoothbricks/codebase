@@ -1490,15 +1490,20 @@ async fn revision_tombstone_and_rotation_preserve_authority() {
 async fn audit_failure_is_fail_closed_and_marks_gateway_draining() {
     let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
-        .expect("bind active opaque upstream");
+        .expect("bind active HTTP upstream");
     let upstream_port = upstream.local_addr().expect("upstream address").port();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let active_upstream = tokio::spawn(async move {
-        let (mut stream, _) = upstream.accept().await.expect("accept opaque stream");
-        let mut discarded = Vec::new();
+        let (mut stream, _) = upstream.accept().await.expect("accept HTTP stream");
+        let request = read_headers(&mut stream).await;
+        started_tx.send(()).expect("signal in-flight request");
+        let mut trailing = Vec::new();
         stream
-            .read_to_end(&mut discarded)
+            .read_to_end(&mut trailing)
             .await
             .expect("audit failure closes active stream");
+        assert!(request.contains("GET /allowed"));
+        assert!(trailing.is_empty(), "bytes arrived after audit hard-stop");
     });
     let endpoint = free_endpoint();
     let gateway = gateway(
@@ -1518,9 +1523,7 @@ async fn audit_failure_is_fail_closed_and_marks_gateway_draining() {
         21,
         1,
         WorkspacePolicy {
-            grants: vec![
-                EgressGrant::opaque("audit-active.test", upstream_port).expect("opaque grant"),
-            ],
+            grants: vec![grant("audit-active.test", upstream_port)],
             mirrors: Vec::new(),
         },
     );
@@ -1530,28 +1533,25 @@ async fn audit_failure_is_fail_closed_and_marks_gateway_draining() {
         .await
         .expect("install session");
     let mut active = TcpStream::connect(endpoint).await.expect("connect gateway");
-    let connect = format!(
-        "CONNECT audit-active.test:{upstream_port} HTTP/1.1\r\nHost: audit-active.test:{upstream_port}\r\nProxy-Authorization: Bearer {token}\r\n\r\n"
-    );
     active
-        .write_all(connect.as_bytes())
+        .write_all(
+            absolute_request("audit-active.test", upstream_port, &token, "/allowed").as_bytes(),
+        )
         .await
-        .expect("write CONNECT");
-    assert!(
-        read_response_head(&mut active)
-            .await
-            .starts_with("HTTP/1.1 200")
-    );
-    active
-        .write_all(&tls_client_hello("audit-active.test"))
+        .expect("write in-flight request");
+    timeout(Duration::from_secs(1), started_rx)
         .await
-        .expect("write ClientHello");
+        .expect("in-flight request timeout")
+        .expect("in-flight request signal");
     let denied = proxy_request(
         endpoint,
         absolute_request("denied.test", 443, &token, "/blocked"),
     )
     .await;
-    assert!(denied.starts_with("HTTP/1.1 503"), "{denied}");
+    assert!(
+        denied.is_empty() || denied.starts_with("HTTP/1.1 503"),
+        "{denied}"
+    );
     assert!(gateway.handle().status().await.expect("status").draining);
     timeout(Duration::from_secs(1), active_upstream)
         .await
@@ -1595,7 +1595,10 @@ async fn opaque_rejects_non_tls_missing_and_mismatched_sni_without_connector_cal
         23,
         1,
         WorkspacePolicy {
-            grants: vec![EgressGrant::opaque("expected.test", 443).expect("opaque grant")],
+            grants: vec![
+                EgressGrant::opaque("expected.test", 443).expect("opaque DNS grant"),
+                EgressGrant::opaque("127.0.0.1", 444).expect("opaque IP grant"),
+            ],
             mirrors: Vec::new(),
         },
     );
@@ -1626,6 +1629,26 @@ async fn opaque_rejects_non_tls_missing_and_mismatched_sni_without_connector_cal
     .await;
     await_reclaimed(&gateway).await;
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+    opaque_payload(
+        endpoint,
+        &token,
+        "127.0.0.1",
+        444,
+        &tls_client_hello("127.0.0.1"),
+    )
+    .await;
+    await_reclaimed(&gateway).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    opaque_payload(
+        endpoint,
+        &token,
+        "127.0.0.1",
+        444,
+        &tls_client_hello("conflict.test"),
+    )
+    .await;
+    await_reclaimed(&gateway).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     gateway.drain().await.expect("drain gateway");
 }
 
