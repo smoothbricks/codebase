@@ -22,6 +22,27 @@ const buildOutputDependencies = [
 ];
 
 describe('@smoothbricks/nx-plugin inferred targets', () => {
+  it('names standalone package projects from package metadata', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write(
+        'specs/prototype/package.json',
+        '{"name":"standalone-package","nx":{"name":"standalone-project"}}\n',
+      );
+      await workspace.write('specs/package-fallback/package.json', '{"name":"package-fallback"}\n');
+
+      const explicit = await inferProject(workspace, 'specs/prototype/package.json');
+      const fallback = await inferProject(workspace, 'specs/package-fallback/package.json');
+
+      expect(explicit?.name).toBe('standalone-project');
+      expect(explicit?.targets).toEqual({});
+      expect(fallback?.name).toBe('package-fallback');
+      expect(fallback?.targets).toEqual({});
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('infers validation and aggregate build targets without owning TypeScript lib build', async () => {
     const workspace = await createWorkspace();
     try {
@@ -288,12 +309,14 @@ interface WorkspaceFixture {
   cleanup(): Promise<void>;
 }
 
+async function inferProject(workspace: WorkspaceFixture, packageJsonPath: string) {
+  const result = await inferTargets([packageJsonPath], undefined, workspace.context);
+  return result[0]?.[1].projects?.[dirname(packageJsonPath)];
+}
+
 async function inferProjectTargets(
   workspace: WorkspaceFixture,
   packageJsonPath: string,
 ): Promise<Record<string, TargetConfiguration>> {
-  const result = await inferTargets([packageJsonPath], undefined, workspace.context);
-  const projectRoot = dirname(packageJsonPath);
-
-  return result[0]?.[1].projects?.[projectRoot]?.targets ?? {};
+  return (await inferProject(workspace, packageJsonPath))?.targets ?? {};
 }

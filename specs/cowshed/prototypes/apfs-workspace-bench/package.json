@@ -1,0 +1,14 @@
+{
+  "name": "apfs-workspace-bench",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench": "bun run bench.ts",
+    "scan": "bun run scan-inodes.ts",
+    "classify": "bun run classify-inodes.ts"
+  },
+  "dependencies": {
+    "commander": "^15.0.0",
+    "tinybench": "6.0.2"
+  }
+}

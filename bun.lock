@@ -72,6 +72,10 @@
         "typescript": "^6.0.3",
       },
     },
+    "packages/cowshed": {
+      "name": "@smoothbricks/cowshed",
+      "version": "0.1.0",
+    },
     "packages/duration": {
       "name": "@smoothbricks/duration",
       "version": "0.1.1",
@@ -940,6 +944,8 @@
     "@smoothbricks/cli": ["@smoothbricks/cli@workspace:packages/cli"],
 
     "@smoothbricks/columine": ["@smoothbricks/columine@workspace:packages/columine"],
+
+    "@smoothbricks/cowshed": ["@smoothbricks/cowshed@workspace:packages/cowshed"],
 
     "@smoothbricks/duration": ["@smoothbricks/duration@workspace:packages/duration"],
 

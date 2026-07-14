@@ -226,6 +226,14 @@ describe('release planning with fixture git repositories', () => {
     });
   });
 
+  it('kills timed-out fixture Git process groups so descendants cannot hold output pipes open', async () => {
+    await withFixtureRepo(async (root) => {
+      await expect(
+        git(root, ['-c', "alias.hold-pipes=!sh -c 'sleep 30 & exit 0'", 'hold-pipes'], undefined, 100),
+      ).rejects.toThrow('timed out after 100ms');
+    });
+  }, 5_000);
+
   it('repairs a scoped package from its project-name release tag without creating a package-name tag', async () => {
     await withFixtureRepo(async (author) => {
       await writeWorkspace(author);
