@@ -810,9 +810,21 @@ pub fn derive_workspaces(
         .into_iter()
         .map(|mount| (mount.volume_name, mount.mount_id))
         .collect();
+    let mut seen_checkpoints = BTreeSet::new();
     let mut checkpoints_by_workspace: BTreeMap<(RepoId, WorkspaceName), Vec<CheckpointFact>> =
         BTreeMap::new();
     for checkpoint in checkpoints {
+        let key = (
+            checkpoint.repo.clone(),
+            checkpoint.workspace.clone(),
+            checkpoint.label.clone(),
+        );
+        if !seen_checkpoints.insert(key) {
+            return Err(DerivationError::DuplicateCheckpoint {
+                workspace: checkpoint.workspace,
+                label: checkpoint.label,
+            });
+        }
         checkpoints_by_workspace
             .entry((checkpoint.repo.clone(), checkpoint.workspace.clone()))
             .or_default()
@@ -837,9 +849,6 @@ pub fn derive_workspaces(
             checkpoints,
         });
     }
-    if let Some(((_, workspace), _)) = checkpoints_by_workspace.into_iter().next() {
-        return Err(DerivationError::OrphanCheckpoint(workspace));
-    }
     result.sort_by(|a, b| a.workspace.name.cmp(&b.workspace.name));
     Ok(result)
 }
@@ -850,8 +859,11 @@ pub enum DerivationError {
     DuplicateWorkspace(WorkspaceName),
     #[error("duplicate canonical volume name {0}")]
     DuplicateVolumeName(String),
-    #[error("checkpoint belongs to unpublished workspace {0}")]
-    OrphanCheckpoint(WorkspaceName),
+    #[error("duplicate checkpoint {workspace}/{label}")]
+    DuplicateCheckpoint {
+        workspace: WorkspaceName,
+        label: CheckpointLabel,
+    },
 }
 
 /// Dispatch a blocking command or filesystem operation away from async runtime workers.

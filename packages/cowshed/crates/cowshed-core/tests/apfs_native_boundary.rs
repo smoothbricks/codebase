@@ -26,7 +26,8 @@ use cowshed_core::storage::apfs::{
     MetadataPolicy, PublicationDisposition,
 };
 use cowshed_core::storage::lifecycle::{
-    ExpectedState, LifecycleWorkspace, OperationIdentity, Pin, Revision, StorageGcReason,
+    ExpectedState, LifecycleWorkspace, OperationIdentity, Pin, RetiredRef, Revision,
+    StorageGcReason, derive_workspaces,
 };
 use cowshed_core::storage::{CheckpointLabel, StorageLayout, StorageLayoutError};
 use cowshed_core::workspace_credentials::mint_workspace_credentials;
@@ -287,6 +288,29 @@ fn metadata(format: ImageFormat) -> DetachedWorkspaceMetadata {
             .expect("grants"),
         info_snapshot: None,
     }
+}
+
+fn write_session_metadata(image: &Path, workspace: &str, incarnation: &str, format: ImageFormat) {
+    let mut detached = metadata(format);
+    detached.workspace = WorkspaceName::session(workspace).expect("session workspace");
+    detached.workspace_incarnation =
+        WorkspaceIncarnation::new(incarnation).expect("workspace incarnation");
+    detached
+        .write_for_image(image)
+        .expect("session detached metadata");
+}
+
+fn session_workspace(workspace: &str, incarnation: &str) -> LifecycleWorkspace {
+    LifecycleWorkspace::new(
+        repo(),
+        WorkspaceName::session(workspace).expect("session workspace"),
+        WorkspaceIncarnation::new(incarnation).expect("workspace incarnation"),
+        Revision::new(0),
+        Revision::new(0),
+        WorkspaceRole::Workspace,
+        ImageFormat::Sparse,
+    )
+    .expect("lifecycle workspace")
 }
 
 fn native_host(
@@ -627,8 +651,16 @@ fn stats_count_only_images_and_gc_drains_session_trash_then_compacts_detached_sp
     active_metadata
         .write_for_image(active.image())
         .expect("active metadata");
-    let trash = layout.project().sessions.join(".trash/retired.sparseimage");
+    let trash = layout
+        .project()
+        .sessions
+        .join(".trash/retired-00000000000000000000000000000001.sparseimage");
     create_image(&trash, ImageFormat::Sparse);
+    let mut retired_metadata = metadata(ImageFormat::Sparse);
+    retired_metadata.workspace = WorkspaceName::session("retired").expect("retired workspace");
+    retired_metadata
+        .write_for_image(&trash)
+        .expect("retired metadata");
     let cache_image = fixture.root.join("caches/acme/sessions/cache.sparseimage");
     create_image(&cache_image, ImageFormat::Sparse);
 
@@ -688,6 +720,9 @@ fn marker_validation_checks_every_detached_identity_dimension() {
     let mount = fixture.root.join("mounted");
     host.write_marker(&mount, &workspace, None, &identity(&fixture))
         .expect("write marker");
+    let private_key = fixture.root.join("marker.ca.key");
+    host.mint_workspace_credentials(&workspace, &mount, &private_key)
+        .expect("workspace credentials");
     let expected = MarkerExpectation {
         repo: workspace.repo().clone(),
         workspace: workspace.name().clone(),
@@ -1102,6 +1137,219 @@ fn checkpoint_gc_reclaims_only_expired_automatic_regular_files_and_sidecars() {
             .iter()
             .all(|fact| fact.label.as_str() != "expired")
     );
+}
+
+#[test]
+fn retired_reclaim_excludes_workspace_immediately_and_removes_every_restore_artifact() {
+    const FIRST: &str = "00000000000000000000000000000001";
+    const SECOND: &str = "00000000000000000000000000000002";
+    const CURRENT: &str = "00000000000000000000000000000003";
+    let fixture = Fixture::new("retired-complete-reclaim");
+    let config = fixture.config();
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let host = native_host(&fixture, RecordingRunner::default());
+    let main = layout.main_image(ImageFormat::Sparse).expect("main");
+    create_image(main.image(), ImageFormat::Sparse);
+    let name = WorkspaceName::session("retired").expect("retired workspace");
+    let canonical = layout
+        .session_image(&name, ImageFormat::Sparse)
+        .expect("session image");
+    create_image(canonical.image(), ImageFormat::Sparse);
+    write_session_metadata(canonical.image(), "retired", CURRENT, ImageFormat::Sparse);
+
+    let label = CheckpointLabel::new("pinned").expect("checkpoint label");
+    let checkpoint = layout
+        .checkpoint_image(&name, &label, ImageFormat::Sparse)
+        .expect("checkpoint")
+        .image()
+        .to_owned();
+    create_image(&checkpoint, ImageFormat::Sparse);
+    write_session_metadata(&checkpoint, "retired", FIRST, ImageFormat::Sparse);
+    host.publish_checkpoint_fact(&checkpoint, &label, Revision::new(3), Pin::Pinned)
+        .expect("pinned checkpoint fact");
+
+    let checkpoint_directory = layout.project().checkpoints.join("retired");
+    let first_undo = checkpoint_directory.join(format!("pre-restore-{SECOND}.sparseimage"));
+    create_image(&first_undo, ImageFormat::Sparse);
+    write_session_metadata(&first_undo, "retired", FIRST, ImageFormat::Sparse);
+    let second_undo = checkpoint_directory.join(format!("pre-restore-{CURRENT}.sparseimage"));
+    create_image(&second_undo, ImageFormat::Sparse);
+    write_session_metadata(&second_undo, "retired", SECOND, ImageFormat::Sparse);
+    let mountpoint = layout.workspace_mount(&name).expect("workspace mountpoint");
+    std::fs::create_dir_all(&mountpoint).expect("empty mountpoint");
+
+    let trash = layout
+        .project()
+        .sessions
+        .join(format!(".trash/retired-{CURRENT}.sparseimage"));
+    host.retire_image(canonical.image(), &trash)
+        .expect("logical retirement");
+    drop(host);
+
+    let restarted = native_host(&fixture, RecordingRunner::default());
+    let derived = derive_workspaces(
+        restarted.list(&repo()).expect("published facts"),
+        restarted.mounts(&repo()).expect("kernel mounts"),
+        restarted.checkpoints(&repo()).expect("checkpoint facts"),
+    )
+    .expect("retired checkpoints do not republish the workspace");
+    assert_eq!(derived.len(), 1);
+    assert!(derived[0].workspace.name().is_main());
+
+    let retired = RetiredRef::new(session_workspace("retired", CURRENT), Revision::new(1));
+    restarted
+        .reclaim_retired(&config, &retired)
+        .expect("background reclaim");
+    restarted
+        .reclaim_retired(&config, &retired)
+        .expect("idempotent repeated reclaim");
+
+    for image in [&trash, &checkpoint, &first_undo, &second_undo] {
+        assert!(!image.exists(), "{} image remains", image.display());
+        assert!(
+            !sidecar_path(image).exists(),
+            "{} grants remain",
+            image.display()
+        );
+        assert!(
+            !ca_key_path(image).exists(),
+            "{} CA key remains",
+            image.display()
+        );
+        assert!(
+            !checkpoint_fact_path(image).exists(),
+            "{} checkpoint fact remains",
+            image.display()
+        );
+    }
+    assert!(!checkpoint_directory.exists());
+    assert!(!mountpoint.exists());
+}
+
+#[test]
+fn retired_gc_revalidates_stale_plans_and_resumes_from_sidecar_authority() {
+    const CURRENT: &str = "00000000000000000000000000000003";
+    let fixture = Fixture::new("retired-gc-resume");
+    let config = fixture.config();
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let host = native_host(&fixture, RecordingRunner::default());
+    let name = WorkspaceName::session("retired").expect("retired workspace");
+    let canonical = layout
+        .session_image(&name, ImageFormat::Sparse)
+        .expect("session image");
+    create_image(canonical.image(), ImageFormat::Sparse);
+    write_session_metadata(canonical.image(), "retired", CURRENT, ImageFormat::Sparse);
+    let checkpoint_label = CheckpointLabel::new("keep").expect("checkpoint label");
+    let checkpoint = layout
+        .checkpoint_image(&name, &checkpoint_label, ImageFormat::Sparse)
+        .expect("checkpoint")
+        .image()
+        .to_owned();
+    create_image(&checkpoint, ImageFormat::Sparse);
+    write_session_metadata(&checkpoint, "retired", CURRENT, ImageFormat::Sparse);
+    host.publish_checkpoint_fact(
+        &checkpoint,
+        &checkpoint_label,
+        Revision::new(2),
+        Pin::Pinned,
+    )
+    .expect("pinned fact");
+    let trash = layout
+        .project()
+        .sessions
+        .join(format!(".trash/retired-{CURRENT}.sparseimage"));
+    host.retire_image(canonical.image(), &trash)
+        .expect("logical retirement");
+
+    let stale_plan = host
+        .preview_gc(&config, &repo())
+        .expect("retired GC preview");
+    assert_eq!(stale_plan.candidates().len(), 1);
+    assert_eq!(
+        stale_plan.candidates()[0].reason(),
+        StorageGcReason::RetiredWorkspace
+    );
+    assert_eq!(stale_plan.retained_pinned(), 0);
+    host.publish_checkpoint_fact(
+        &checkpoint,
+        &checkpoint_label,
+        Revision::new(2),
+        Pin::Automatic,
+    )
+    .expect("change checkpoint after preview");
+    let stale = host
+        .execute_gc(&config, stale_plan)
+        .expect_err("changed retired artifact makes plan stale");
+    assert!(matches!(stale, ApfsStorageError::GcPlanStale));
+    assert!(trash.exists(), "stale plan mutated retirement authority");
+    assert!(checkpoint.exists(), "stale plan mutated checkpoint");
+
+    host.publish_checkpoint_fact(
+        &checkpoint,
+        &checkpoint_label,
+        Revision::new(2),
+        Pin::Pinned,
+    )
+    .expect("restore pinned checkpoint");
+    std::fs::remove_file(&checkpoint)
+        .expect("simulate checkpoint image deletion before sidecar cleanup");
+    std::fs::remove_file(&trash).expect("simulate image deletion before sidecar cleanup");
+    drop(host);
+
+    let restarted = native_host(&fixture, RecordingRunner::default());
+    let plan = restarted
+        .preview_gc(&config, &repo())
+        .expect("sidecar resumes retired cleanup");
+    assert_eq!(plan.candidates().len(), 1);
+    assert_eq!(plan.retained_pinned(), 0);
+    let report = restarted
+        .execute_gc(&config, plan)
+        .expect("resume interrupted retirement GC");
+    assert_eq!(report.reclaimed, 1);
+    assert!(!checkpoint.exists());
+    assert!(!sidecar_path(&checkpoint).exists());
+    assert!(!checkpoint_fact_path(&checkpoint).exists());
+    assert!(!sidecar_path(&trash).exists());
+    assert!(!ca_key_path(&trash).exists());
+}
+
+#[test]
+fn malformed_foreign_orphan_checkpoint_is_rejected_without_cleanup_authority() {
+    let fixture = Fixture::new("malformed-orphan-checkpoint");
+    let config = fixture.config();
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let host = native_host(&fixture, RecordingRunner::default());
+    let name = WorkspaceName::session("orphan").expect("orphan workspace");
+    let label = CheckpointLabel::new("foreign").expect("checkpoint label");
+    let checkpoint = layout
+        .checkpoint_image(&name, &label, ImageFormat::Sparse)
+        .expect("checkpoint")
+        .image()
+        .to_owned();
+    create_image(&checkpoint, ImageFormat::Sparse);
+    write_session_metadata(
+        &checkpoint,
+        "orphan",
+        "00000000000000000000000000000001",
+        ImageFormat::Sparse,
+    );
+    host.publish_checkpoint_fact(&checkpoint, &label, Revision::new(1), Pin::Pinned)
+        .expect("checkpoint fact");
+    let fact_path = checkpoint_fact_path(&checkpoint);
+    let mut fact: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&fact_path).expect("read fact")).expect("JSON fact");
+    fact["repoId"] = serde_json::Value::String("foreign/project".to_owned());
+    std::fs::write(
+        &fact_path,
+        serde_json::to_vec_pretty(&fact).expect("serialize fact"),
+    )
+    .expect("write foreign fact");
+
+    assert!(host.checkpoints(&repo()).is_err());
+    assert!(host.preview_gc(&config, &repo()).is_err());
+    assert!(checkpoint.exists(), "malformed orphan was deleted");
+    assert!(sidecar_path(&checkpoint).exists());
+    assert!(checkpoint_fact_path(&checkpoint).exists());
 }
 
 #[test]
@@ -1584,6 +1832,7 @@ fn sidecar_first_publication_is_invisible_until_image_rename_and_recovers() {
         .join(".staging/main-00000000000000000000000000000001.sparseimage");
     create_image(&staged, ImageFormat::Sparse);
     std::fs::write(&staged, b"published generation").expect("staged bytes");
+    let staged_ca_key = std::fs::read(ca_key_path(&staged)).expect("staged CA key");
     let host = native_host(&fixture, RecordingRunner::default());
     host.set_restore_failpoint(RestoreFailpoint::AfterMetadataFsync);
     host.publish_image(&staged, canonical.image())
@@ -1611,7 +1860,7 @@ fn sidecar_first_publication_is_invisible_until_image_rename_and_recovers() {
     DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("canonical metadata");
     assert_eq!(
         std::fs::read(ca_key_path(canonical.image())).expect("canonical CA key"),
-        b"fixture-ca-private-key"
+        staged_ca_key
     );
     assert!(!sidecar_path(&staged).exists());
     assert!(!ca_key_path(&staged).exists());

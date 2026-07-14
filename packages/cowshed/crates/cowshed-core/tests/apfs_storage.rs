@@ -20,7 +20,8 @@ use cowshed_core::storage::apfs::{
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, CheckpointFact, Destination, ExpectedState, KernelMountFact, LifecyclePlanner,
     LifecycleWorkspace, MountIntent, MountState, ObservedState, OperationIdentity, Pin,
-    RestoreMode, Revision, StorageFact, StorageGcPlan, StorageGcReport, Substrate, SubstrateStats,
+    RestoreMode, RetiredRef, Revision, StorageFact, StorageGcPlan, StorageGcReport, Substrate,
+    SubstrateStats,
 };
 use proptest::prelude::*;
 
@@ -609,6 +610,20 @@ impl ApfsExecutionHost for FakeHost {
     fn reclaim_image(&self, image: &Path, _: ImageFormat) -> Result<(), ApfsStorageError> {
         self.record("idempotent-reclaim");
         self.state.lock().expect("fake state").staged.remove(image);
+        if self.fail_reclaim_once.swap(false, Ordering::SeqCst) {
+            Err(ApfsStorageError::Host(
+                "injected reclaim failure".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+    fn reclaim_retired(
+        &self,
+        _: &ApfsSubstrateConfig,
+        _: &RetiredRef,
+    ) -> Result<(), ApfsStorageError> {
+        self.record("idempotent-reclaim");
         if self.fail_reclaim_once.swap(false, Ordering::SeqCst) {
             Err(ApfsStorageError::Host(
                 "injected reclaim failure".to_owned(),
