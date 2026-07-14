@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(any(target_os = "macos", test))]
+use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, OsString};
 use std::fmt;
 use std::fs::{self, File};
@@ -163,6 +165,7 @@ impl CommitmentStore {
         self.writer_id
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn workspace_is_introduced(
         &self,
         repo_id: &RepoId,
@@ -171,6 +174,7 @@ impl CommitmentStore {
         self.context.is_introduced(repo_id, incarnation)
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn workspace_is_retired(
         &self,
         repo_id: &RepoId,
@@ -179,6 +183,7 @@ impl CommitmentStore {
         self.context.is_retired(repo_id, incarnation)
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn admitted_lifecycle_incarnations(
         &self,
         repo_id: &RepoId,

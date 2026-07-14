@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, mpsc};
 
 use async_trait::async_trait;
+#[cfg(target_os = "macos")]
 use plist::Value;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
