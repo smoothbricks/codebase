@@ -1,9 +1,16 @@
+#![cfg_attr(target_arch = "wasm32", no_std)]
 //! `span_start.{wasm,node}` — timestamp-accuracy proof instrumentation.
 //!
 //! Ports AxE's `timestamp_proof_{layout,wasm,napi}.zig` (228 LOC) into
 //! lmao-rs: this is LMAO proof machinery (measures span-timestamp accuracy
 //! for the proof harness `proofs/timestamp-accuracy.proof.ts` in AxE), not
 //! runtime code. Export names are byte-compatible with the Zig artifacts.
+
+#[cfg(target_arch = "wasm32")]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+    core::arch::wasm32::unreachable()
+}
 
 pub mod layout;
 
@@ -101,6 +108,7 @@ mod wasm {
     }
 }
 
+#[cfg_attr(test, allow(dead_code))]
 #[cfg(all(feature = "napi", not(target_arch = "wasm32")))]
 mod node {
     //! The `span_start.node` surface (timestamp_proof_napi.zig, napi-rs
@@ -109,6 +117,7 @@ mod node {
     //! `Instant` (the `std.time.Timer` equivalent).
 
     use crate::layout;
+    use napi::JsArrayBuffer;
     use napi::bindgen_prelude::*;
     use napi_derive::napi;
     use std::sync::Mutex;
@@ -163,19 +172,32 @@ mod node {
     }
 
     #[napi(js_name = "initTraceRoot")]
-    pub fn init_trace_root(trace_root_system: Buffer) -> Result<()> {
+    pub fn init_trace_root(trace_root_system: JsArrayBuffer) -> Result<()> {
+        let trace_root_system = trace_root_system.into_value()?;
         upsert_anchor(key_of(trace_root_system.as_ref()))
     }
 
     #[napi(js_name = "spanStart")]
-    pub fn span_start(mut system: Buffer, capacity: u32, trace_root_system: Buffer) -> Result<()> {
+    pub fn span_start(
+        system: JsArrayBuffer,
+        capacity: u32,
+        trace_root_system: JsArrayBuffer,
+    ) -> Result<()> {
+        let mut system = system.into_value()?;
+        let trace_root_system = trace_root_system.into_value()?;
         let ts = current_timestamp(key_of(trace_root_system.as_ref()))?;
         layout::write_span_start(system.as_mut(), capacity, ts);
         Ok(())
     }
 
     #[napi(js_name = "spanEndOk")]
-    pub fn span_end_ok(mut system: Buffer, capacity: u32, trace_root_system: Buffer) -> Result<()> {
+    pub fn span_end_ok(
+        system: JsArrayBuffer,
+        capacity: u32,
+        trace_root_system: JsArrayBuffer,
+    ) -> Result<()> {
+        let mut system = system.into_value()?;
+        let trace_root_system = trace_root_system.into_value()?;
         let ts = current_timestamp(key_of(trace_root_system.as_ref()))?;
         layout::write_span_end(system.as_mut(), capacity, layout::ENTRY_TYPE_SPAN_OK, ts);
         Ok(())
@@ -183,10 +205,12 @@ mod node {
 
     #[napi(js_name = "spanEndErr")]
     pub fn span_end_err(
-        mut system: Buffer,
+        system: JsArrayBuffer,
         capacity: u32,
-        trace_root_system: Buffer,
+        trace_root_system: JsArrayBuffer,
     ) -> Result<()> {
+        let mut system = system.into_value()?;
+        let trace_root_system = trace_root_system.into_value()?;
         let ts = current_timestamp(key_of(trace_root_system.as_ref()))?;
         layout::write_span_end(system.as_mut(), capacity, layout::ENTRY_TYPE_SPAN_ERR, ts);
         Ok(())
@@ -194,11 +218,13 @@ mod node {
 
     #[napi(js_name = "writeLogEntry")]
     pub fn write_log_entry(
-        mut system: Buffer,
+        system: JsArrayBuffer,
         capacity: u32,
-        trace_root_system: Buffer,
+        trace_root_system: JsArrayBuffer,
         entry_type: u8,
     ) -> Result<u32> {
+        let mut system = system.into_value()?;
+        let trace_root_system = trace_root_system.into_value()?;
         let ts = current_timestamp(key_of(trace_root_system.as_ref()))?;
         Ok(layout::write_log_entry(
             system.as_mut(),
