@@ -554,6 +554,25 @@ pub struct DoctorReport {
     pub findings: Vec<Finding>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GcReason {
+    RetiredWorkspace,
+    OrphanStagingImage,
+    OrphanStagingMetadata,
+    ExpiredCheckpoint,
+    DetachedImageCompaction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GcCandidate {
+    pub identity: Sha256Digest,
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub reason: GcReason,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GcReport {
@@ -562,6 +581,7 @@ pub struct GcReport {
     pub retained_pinned: u64,
     pub freed_bytes: u64,
     pub dry_run: bool,
+    pub candidates: Vec<GcCandidate>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

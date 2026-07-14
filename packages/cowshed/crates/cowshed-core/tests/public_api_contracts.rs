@@ -303,16 +303,35 @@ fn ensure_doctor_gc_and_empty_results_have_exact_shapes() {
         })
     );
 
+    let gc_identity = Sha256Digest::compute(b"expired-checkpoint");
     let gc = GcReport {
         examined: 9,
         reclaimed: 3,
         retained_pinned: 2,
         freed_bytes: 4096,
         dry_run: true,
+        candidates: vec![GcCandidate {
+            identity: gc_identity,
+            path: PathBuf::from("/store/checkpoints/raven/old.asif"),
+            bytes: 4096,
+            reason: GcReason::ExpiredCheckpoint,
+        }],
     };
     assert_eq!(
         serde_json::to_value(gc).expect("gc JSON"),
-        json!({"examined":9,"reclaimed":3,"retainedPinned":2,"freedBytes":4096,"dryRun":true})
+        json!({
+            "examined":9,
+            "reclaimed":3,
+            "retainedPinned":2,
+            "freedBytes":4096,
+            "dryRun":true,
+            "candidates":[{
+                "identity":gc_identity.to_string(),
+                "path":"/store/checkpoints/raven/old.asif",
+                "bytes":4096,
+                "reason":"expiredCheckpoint"
+            }]
+        })
     );
     assert_eq!(serde_json::to_value(EmptyResult {}).unwrap(), json!({}));
 }

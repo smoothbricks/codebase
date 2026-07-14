@@ -284,10 +284,12 @@ _conventions_, enforced by `cowshed gc`, never by a background daemon deleting w
   checkpoints both consume the cap. Exact `<=` boundaries are admitted, while `>` returns `Conflict` before cloning or
   publishing any checkpoint image, fact, or detached metadata. A sibling workspace never consumes this workspace's
   coordinator-owned quota.
-- `cowshed gc` is the single enforcement point: drain trash, prune expired checkpoints, remove orphan mountpoints,
-  `hdiutil compact` detached images whose written size exceeds referenced by a threshold, and (on ZFS) prune orphaned
-  `cowshed:*` origin snapshots (09_substrates.md). It reports freed bytes on stdout; `--dry-run` lists what it would
-  remove on stderr.
+- Garbage collection is two-phase. `preview_gc(repo)` is a read-only enumeration that returns an immutable plan of exact
+  candidates with stable SHA-256 identity, host path, allocated bytes, and closed reason. Pinned checkpoints are
+  retained and never become candidates. `execute_gc(plan)` acquires all plan locks without waiting, re-enumerates at the
+  plan's observation time, and rejects a pin/incarnation/path/byte/concurrency change as stale before any mutation. Only
+  an unchanged plan drains trash/orphan staging objects, prunes expired checkpoints, and compacts detached sparse
+  images; execution reports actual freed bytes.
 - `cowshed du` reports **written vs referenced** bytes per workspace and per checkpoint (the number that matters for CoW
   substrates — referenced is shared with the base, written is the true cost). `--json` for fleet dashboards. This is how
   a coordinator decides which long-lived workspaces to `cowshed rebase --fresh` (02_workspaces.md) to shed accumulated
