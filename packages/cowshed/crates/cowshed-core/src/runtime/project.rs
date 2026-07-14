@@ -4561,7 +4561,6 @@ fn native_retired_refs(
         let metadata = DetachedWorkspaceMetadata::read_for_image(&entry.path())
             .map_err(native_integrity_error)?;
         if metadata.repo_id != *repo_id
-            || metadata.workspace.is_main()
             || metadata.image_format != format
             || metadata.publication_state != PublicationState::Active
         {
@@ -4588,6 +4587,11 @@ fn native_retired_refs(
                 "cowshed doctor --json",
             ));
         }
+        let role = if metadata.workspace.is_main() {
+            WorkspaceRole::Main
+        } else {
+            WorkspaceRole::Workspace
+        };
         let revision = Revision::new(metadata.grants.revision);
         let workspace = LifecycleWorkspace::new(
             metadata.repo_id,
@@ -4595,7 +4599,7 @@ fn native_retired_refs(
             metadata.workspace_incarnation,
             revision,
             revision,
-            WorkspaceRole::Workspace,
+            role,
             format,
         )
         .map_err(native_integrity_error)?;
@@ -4659,6 +4663,51 @@ mod retired_recovery_tests {
         assert_eq!(
             retired[0].resulting_revision(),
             crate::storage::lifecycle::Revision::new(5)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retired_main_trash_preserves_main_role_for_restart_reclamation() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-retired-main-recovery-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let project_root = root.join("acme/widget");
+        let trash = project_root.join("sessions/.trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        let repo_id = RepoId::parse("acme/widget").unwrap();
+        let incarnation = WorkspaceIncarnation::new("2198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let image = trash.join(format!("main-{}.sparseimage", incarnation.as_str()));
+        std::fs::write(&image, b"retired main image").unwrap();
+        let mut grants =
+            GrantSet::closed_baseline(Some(PortBlock::new(49_168, 16).unwrap())).unwrap();
+        grants.revision = 8;
+        DetachedWorkspaceMetadata {
+            version: METADATA_VERSION,
+            repo_id: repo_id.clone(),
+            workspace: WorkspaceName::new("main").unwrap(),
+            workspace_incarnation: incarnation.clone(),
+            image_format: ImageFormat::Sparse,
+            platform: Platform::Macos,
+            publication_state: PublicationState::Active,
+            updated_at: "2026-07-14T00:00:00Z".into(),
+            grants,
+            info_snapshot: None,
+        }
+        .write_for_image(&image)
+        .unwrap();
+
+        let retired = native_retired_refs(&project_root, &repo_id).unwrap();
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].workspace().incarnation(), &incarnation);
+        assert_eq!(
+            retired[0].workspace().role(),
+            crate::metadata::WorkspaceRole::Main
+        );
+        assert_eq!(
+            retired[0].resulting_revision(),
+            crate::storage::lifecycle::Revision::new(9)
         );
         std::fs::remove_dir_all(root).unwrap();
     }

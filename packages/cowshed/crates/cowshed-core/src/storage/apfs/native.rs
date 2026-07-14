@@ -1534,7 +1534,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         if metadata.repo_id != *repo
             || metadata.image_format != format
             || metadata.publication_state != PublicationState::Active
-            || metadata.workspace.is_main()
         {
             return Err(ApfsStorageError::MarkerMismatch(format!(
                 "retired metadata disagrees with trash image {}",
@@ -1557,11 +1556,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 trash_image.display()
             )));
         }
-        let canonical = project.join("sessions").join(format!(
-            "{}.{}",
-            workspace.name().as_str(),
-            format.extension()
-        ));
+        let canonical = super::canonical_image_path(&self.config, &workspace)?;
         if canonical
             .try_exists()
             .map_err(|error| io_error("inspect retired canonical image", &canonical, error))?
