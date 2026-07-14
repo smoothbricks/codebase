@@ -2131,6 +2131,9 @@ impl NativeProjectRuntimeHost {
             old.retire().await?;
             self.sessions.retain(|(workspace, _), _| workspace != name);
         }
+        crate::git::GitRepository::from_root(&mount)
+            .ensure_cowshed_excludes()
+            .await?;
         let port_block = current.metadata.grants.port_block.ok_or_else(|| {
             CowshedError::integrity(
                 "macOS workspace metadata has no port block",

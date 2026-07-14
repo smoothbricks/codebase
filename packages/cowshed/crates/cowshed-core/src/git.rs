@@ -1,5 +1,8 @@
 use std::ffi::{OsStr, OsString};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
@@ -153,6 +156,107 @@ impl GitRepository {
             return Err(git_internal("read repository status", &output));
         }
         Ok(!output.stdout.is_empty())
+    }
+
+    pub async fn ensure_cowshed_excludes(&self) -> Result<()> {
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || {
+            let git_directory = root.join(".git");
+            let info_directory = git_directory.join("info");
+            for directory in [&git_directory, &info_directory] {
+                let metadata = fs::symlink_metadata(directory).map_err(|error| {
+                    CowshedError::integrity(
+                        format!(
+                            "cannot inspect Git metadata directory {}: {error}",
+                            directory.display()
+                        ),
+                        "restore the standalone workspace Git metadata and retry",
+                    )
+                })?;
+                if !metadata.file_type().is_dir() {
+                    return Err(CowshedError::integrity(
+                        format!(
+                            "Git metadata path is not a real directory: {}",
+                            directory.display()
+                        ),
+                        "restore the standalone workspace Git metadata and retry",
+                    ));
+                }
+            }
+            let exclude = info_directory.join("exclude");
+            let mut file = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .create(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&exclude)
+                .map_err(|error| {
+                    CowshedError::integrity(
+                        format!(
+                            "cannot open Git exclude file {}: {error}",
+                            exclude.display()
+                        ),
+                        "restore the standalone workspace Git metadata and retry",
+                    )
+                })?;
+            let mut existing = Vec::new();
+            file.read_to_end(&mut existing).map_err(|error| {
+                CowshedError::integrity(
+                    format!(
+                        "cannot read Git exclude file {}: {error}",
+                        exclude.display()
+                    ),
+                    "repair .git/info/exclude and retry",
+                )
+            })?;
+            let mut addition = Vec::new();
+            for pattern in [b".cowshed/".as_slice(), b".fseventsd/".as_slice()] {
+                if !existing
+                    .split(|byte| *byte == b'\n')
+                    .any(|line| line == pattern)
+                {
+                    if !existing.is_empty() && !existing.ends_with(b"\n") && addition.is_empty() {
+                        addition.push(b'\n');
+                    }
+                    addition.extend_from_slice(pattern);
+                    addition.push(b'\n');
+                }
+            }
+            if !addition.is_empty() {
+                file.write_all(&addition).map_err(|error| {
+                    CowshedError::integrity(
+                        format!(
+                            "cannot update Git exclude file {}: {error}",
+                            exclude.display()
+                        ),
+                        "repair .git/info/exclude and retry",
+                    )
+                })?;
+                file.sync_all().map_err(|error| {
+                    CowshedError::integrity(
+                        format!(
+                            "cannot sync Git exclude file {}: {error}",
+                            exclude.display()
+                        ),
+                        "repair .git/info/exclude and retry",
+                    )
+                })?;
+                File::open(&info_directory)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|error| {
+                        CowshedError::integrity(
+                            format!(
+                                "cannot sync Git info directory {}: {error}",
+                                info_directory.display()
+                            ),
+                            "repair .git/info and retry",
+                        )
+                    })?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("Git exclude task failed: {error}")))?
     }
 
     /// Whether `commit` is contained by a host branch or a Cowshed preservation ref.
@@ -522,6 +626,47 @@ mod tests {
         assert!(!repo.is_dirty().await.expect("read clean status"));
         fs::write(root.join("untracked"), b"dirty\n").expect("write untracked file");
         assert!(repo.is_dirty().await.expect("read dirty status"));
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn cowshed_excludes_are_idempotent_preserve_user_patterns_and_hide_runtime_state() {
+        let root = repository();
+        let exclude = root.join(".git/info/exclude");
+        fs::write(&exclude, b"user-pattern").expect("seed user exclude");
+        let repo = GitRepository::from_root(&root);
+        repo.ensure_cowshed_excludes().await.expect("first wiring");
+        repo.ensure_cowshed_excludes()
+            .await
+            .expect("idempotent wiring");
+        assert_eq!(
+            fs::read(&exclude).expect("read excludes"),
+            b"user-pattern\n.cowshed/\n.fseventsd/\n"
+        );
+        fs::create_dir(root.join(".cowshed")).expect("runtime metadata");
+        fs::create_dir(root.join(".fseventsd")).expect("APFS metadata");
+        assert!(!repo.is_dirty().await.expect("runtime state is ignored"));
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn cowshed_exclude_wiring_rejects_a_symlink_target() {
+        let root = repository();
+        let exclude = root.join(".git/info/exclude");
+        let unrelated = root.join("unrelated");
+        fs::write(&unrelated, b"preserve\n").expect("unrelated file");
+        fs::remove_file(&exclude).expect("remove real exclude");
+        std::os::unix::fs::symlink(&unrelated, &exclude).expect("exclude symlink");
+
+        let error = GitRepository::from_root(&root)
+            .ensure_cowshed_excludes()
+            .await
+            .expect_err("symlink must fail closed");
+        assert_eq!(error.code.as_str(), "integrity");
+        assert_eq!(
+            fs::read(&unrelated).expect("unrelated bytes"),
+            b"preserve\n"
+        );
         fs::remove_dir_all(root).expect("remove fixture");
     }
 

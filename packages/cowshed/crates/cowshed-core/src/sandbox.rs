@@ -129,6 +129,24 @@ pub fn seatbelt_profile(
     // Keep aliases unavailable to both authority tiers.
     push_line(&mut profile, "(deny file-link)");
     push_line(&mut profile, "(allow file-read-data (subpath \"/\"))");
+    // Directory metadata is distinct from file-read-data in Seatbelt. Toolchain
+    // launchers (notably /usr/bin/git -> xcrun) must traverse their immutable
+    // system roots without gaining metadata access to the user's home.
+    for root in [
+        "/Applications",
+        "/Library",
+        "/System",
+        "/bin",
+        "/opt",
+        "/nix",
+        "/private/var/select",
+        "/sbin",
+        "/usr",
+        "/var/select",
+    ] {
+        push_exact_and_subpath_rule(&mut profile, "allow file-read*", Path::new(root))?;
+        push_readable_ancestors(&mut profile, Path::new(root))?;
+    }
     push_line(&mut profile, "(allow process-exec process-fork)");
     push_line(&mut profile, "(allow file-map-executable)");
     push_line(&mut profile, "(allow sysctl-read)");
@@ -183,6 +201,14 @@ pub fn seatbelt_profile(
 
     // The store-wide deny intentionally precedes only narrow controller-owned carve-backs.
     push_subpath_rule(&mut profile, "deny file-read* file-write*", &cowshed)?;
+    // `getcwd(2)` and path resolution need read access to every exact ancestor.
+    // Literal rules reveal no sibling subtree and are emitted after the store-wide
+    // deny so an own workspace nested under ~/.cowshed remains reachable.
+    push_readable_ancestors(&mut profile, &config.workspace_mount)?;
+    push_readable_ancestors(&mut profile, &config.exec_temp_dir)?;
+    for path in read_grants.iter().chain(write_grants.iter()) {
+        push_readable_ancestors(&mut profile, path)?;
+    }
     push_subpath_rule(&mut profile, "allow file-read*", &caches)?;
     for suffix in [
         "cargo/registry",
@@ -214,6 +240,18 @@ pub fn seatbelt_profile(
         .filter(|path| path.as_ref() != cowshed.as_path())
     {
         push_exact_and_subpath_rule(&mut profile, "deny file-read* file-write*", deny.as_ref())?;
+    }
+
+    for protected in [
+        crate::storage::WORKSPACE_MARKER_PATH,
+        crate::workspace_credentials::CA_CERTIFICATE_PATH,
+        crate::workspace_credentials::WORKSPACE_TOKEN_PATH,
+    ] {
+        push_literal_rule(
+            &mut profile,
+            "deny file-write*",
+            &config.workspace_mount.join(protected),
+        )?;
     }
 
     match role {
@@ -315,6 +353,13 @@ fn sbpl_path(path: &Path) -> Result<String, SandboxError> {
         .to_string_lossy()
         .replace('\\', "\\\\")
         .replace('"', "\\\""))
+}
+
+fn push_readable_ancestors(profile: &mut String, path: &Path) -> Result<(), SandboxError> {
+    for ancestor in path.ancestors() {
+        push_literal_rule(profile, "allow file-read*", ancestor)?;
+    }
+    Ok(())
 }
 
 fn push_subpath_rule(
@@ -512,6 +557,32 @@ mod tests {
     }
 
     #[test]
+    fn profile_allows_system_tool_metadata_and_exact_workspace_ancestors() {
+        let profile = seatbelt_profile(
+            &config(RunSandboxMode::ReadWrite),
+            SandboxProfileRole::ExecutedChild,
+        )
+        .unwrap();
+        assert!(profile.contains(
+            "(allow file-read* (literal \"/Applications\") (subpath \"/Applications\"))"
+        ));
+        assert!(profile.contains("(allow file-read* (literal \"/usr\") (subpath \"/usr\"))"));
+        assert!(!profile.contains("(allow file-read* (literal \"/Users\") (subpath \"/Users\"))"));
+
+        let store_deny = profile
+            .find("(deny file-read* file-write* (subpath \"/Users/tester/.cowshed\"))")
+            .unwrap();
+        let mount_parent = profile
+            .find(
+                "(allow file-read* (literal \"/Users/tester/.cowshed/acme/widget/workspaces/raven\"))",
+            )
+            .unwrap();
+        let secret_deny = profile.rfind("/Users/tester/.ssh").unwrap();
+        assert!(store_deny < mount_parent);
+        assert!(mount_parent < secret_deny);
+    }
+
+    #[test]
     fn secret_denies_follow_grants_and_carve_backs() {
         let profile = seatbelt_profile(
             &config(RunSandboxMode::ReadWrite),
@@ -545,12 +616,16 @@ mod tests {
         let protected_allow = "(allow file-write* (literal \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed/job\") (subpath \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed/job\"))";
         let ancestor_deny = "(deny file-write-create file-write-unlink (literal \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed\"))";
         let protected_deny = "(deny file-write* (literal \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed/job\") (subpath \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed/job\"))";
+        let token_deny = "(deny file-write* (literal \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed/token\"))";
 
         assert_eq!(supervisor.lines().last(), Some(protected_allow));
         assert!(!supervisor.contains(ancestor_deny));
         assert!(!supervisor.contains(protected_deny));
         assert_eq!(child.lines().last(), Some(protected_deny));
         assert!(child.rfind("(allow ").unwrap() < child.find(ancestor_deny).unwrap());
+        assert!(supervisor.contains(token_deny));
+        assert!(child.contains(token_deny));
+        assert!(child.find("allow file-write*").unwrap() < child.find(token_deny).unwrap());
 
         let common_supervisor = supervisor
             .strip_suffix(&format!("{protected_allow}\n"))
