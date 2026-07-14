@@ -17,11 +17,13 @@ use tokio::{
 };
 
 use crate::{
+    cache::{Cache, CacheError},
     config::{ConfigError, GatewayConfig, WorkspaceEndpoint, WorkspaceSession},
     interfaces::{
         AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus, ConnectError,
         CredentialProvider, UpstreamConnector,
     },
+    mirror::MirrorService,
     policy::{CanonicalTarget, EgressMode, MirrorProtocol, PolicyDenial},
     proxy,
     telemetry::ArrowAuditConfig,
@@ -124,6 +126,8 @@ impl Gateway {
         audit: Arc<dyn AuditSink>,
     ) -> Result<Self, GatewayError> {
         config.validate()?;
+        let mirror_service =
+            MirrorService::new(Cache::open(config.mirror_cache.cache_config()).await?);
         let (completions, completion_receiver) = mpsc::channel(config.limits.global_active);
         let (cancellations, cancellation_receiver) = mpsc::channel(config.limits.global_queued);
         let (commands, receiver) = mpsc::channel(config.command_capacity.get());
@@ -141,6 +145,7 @@ impl Gateway {
             credentials,
             connector,
             audit,
+            mirror_service,
         );
         let actor = tokio::spawn(state.run());
         let control = match &config.control_socket {
@@ -526,6 +531,7 @@ struct Actor {
     credentials: Arc<dyn CredentialProvider>,
     connector: Arc<dyn UpstreamConnector>,
     audit: Arc<dyn AuditSink>,
+    mirror_service: MirrorService,
     sessions: HashMap<String, SessionState>,
     revisions: HashMap<String, u64>,
     permits: HashMap<u64, PermitState>,
@@ -550,6 +556,7 @@ impl Actor {
         credentials: Arc<dyn CredentialProvider>,
         connector: Arc<dyn UpstreamConnector>,
         audit: Arc<dyn AuditSink>,
+        mirror_service: MirrorService,
     ) -> Self {
         let ActorChannels {
             receiver,
@@ -571,6 +578,7 @@ impl Actor {
             credentials,
             connector,
             audit,
+            mirror_service,
             sessions: HashMap::new(),
             revisions: HashMap::new(),
             permits: HashMap::new(),
@@ -812,6 +820,7 @@ impl Actor {
             timeouts: self.config.timeouts,
             connection_stop: connection_rx.clone(),
             audit_stop: audit_rx.clone(),
+            mirror_service: self.mirror_service.clone(),
         };
         tokio::spawn(proxy::accept_loop(
             listener,
@@ -1639,6 +1648,8 @@ impl ControlRuntime {
 pub enum GatewayError {
     #[error(transparent)]
     Config(#[from] ConfigError),
+    #[error(transparent)]
+    Cache(#[from] CacheError),
     #[error(transparent)]
     Tls(#[from] TlsError),
     #[error(transparent)]

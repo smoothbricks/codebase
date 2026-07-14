@@ -5,7 +5,10 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::policy::WorkspacePolicy;
+use crate::{
+    cache::{CacheConfig, DEFAULT_HIGH_WATER_BYTES, DEFAULT_LOW_WATER_BYTES},
+    policy::WorkspacePolicy,
+};
 
 pub const TOKEN_BYTES: usize = 32;
 pub const MACOS_PORT_MIN: u16 = 40_960;
@@ -299,6 +302,55 @@ impl GatewayTimeouts {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MirrorCacheConfig {
+    pub cache_root: PathBuf,
+    pub high_water_bytes: u64,
+    pub low_water_bytes: u64,
+    pub metadata_ttl: Duration,
+}
+
+impl MirrorCacheConfig {
+    pub fn new(cache_root: PathBuf) -> Self {
+        Self {
+            cache_root,
+            high_water_bytes: DEFAULT_HIGH_WATER_BYTES,
+            low_water_bytes: DEFAULT_LOW_WATER_BYTES,
+            metadata_ttl: Duration::from_secs(5 * 60),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !self.cache_root.is_absolute() {
+            return Err(ConfigError::MissingMirrorCacheRoot);
+        }
+        if self.low_water_bytes >= self.high_water_bytes || self.metadata_ttl.is_zero() {
+            return Err(ConfigError::InvalidMirrorCacheLimits);
+        }
+        let metadata = std::fs::symlink_metadata(&self.cache_root)
+            .map_err(|_| ConfigError::InsecureMirrorCacheRoot)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ConfigError::InsecureMirrorCacheRoot);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cache_config(&self) -> CacheConfig {
+        CacheConfig {
+            root: self.cache_root.clone(),
+            high_water_bytes: self.high_water_bytes,
+            low_water_bytes: self.low_water_bytes,
+            metadata_ttl: self.metadata_ttl,
+        }
+    }
+}
+
+impl Default for MirrorCacheConfig {
+    fn default() -> Self {
+        Self::new(PathBuf::new())
+    }
+}
+
 /// Host daemon configuration. Runtime protocol limits are deliberately not configurable.
 #[derive(Clone, Debug)]
 pub struct GatewayConfig {
@@ -309,6 +361,7 @@ pub struct GatewayConfig {
     pub limits: GatewayLimits,
     pub timeouts: GatewayTimeouts,
     pub command_capacity: NonZeroUsize,
+    pub mirror_cache: MirrorCacheConfig,
 }
 
 impl Default for GatewayConfig {
@@ -320,6 +373,7 @@ impl Default for GatewayConfig {
             limits: GatewayLimits::default(),
             timeouts: GatewayTimeouts::default(),
             command_capacity: NonZeroUsize::new(1024).expect("1024 is non-zero"),
+            mirror_cache: MirrorCacheConfig::default(),
         }
     }
 }
@@ -328,6 +382,7 @@ impl GatewayConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.limits.validate()?;
         self.timeouts.validate()?;
+        self.mirror_cache.validate()?;
         if let Some(path) = &self.control_socket
             && !path.is_absolute()
         {
@@ -438,6 +493,12 @@ pub enum ConfigError {
     ZeroTimeout,
     #[error("gateway timeout ordering is inconsistent")]
     InconsistentTimeouts,
+    #[error("gateway mirror cache root is required and must be absolute")]
+    MissingMirrorCacheRoot,
+    #[error("gateway mirror cache root must be a pre-existing real directory")]
+    InsecureMirrorCacheRoot,
+    #[error("gateway mirror cache low-water/TTL limits are invalid")]
+    InvalidMirrorCacheLimits,
     #[error(transparent)]
     Policy(#[from] crate::policy::PolicyError),
 }
