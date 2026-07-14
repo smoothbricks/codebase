@@ -1,0 +1,14 @@
+[package]
+name = "columine-arrow"
+description = "Columnar event buffers + Arrow IPC stream writer (ports columine's parsing/columns.zig and arrow/{dynamic_schema,dynamic_record_batch,ipc_writer}.zig)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+columine-types = { path = "../columine-types" }
+
+[dev-dependencies]
+proptest = { workspace = true }

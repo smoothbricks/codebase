@@ -1,0 +1,17 @@
+[package]
+name = "columine-ep-wasm"
+description = "event_processor.wasm replacement: the ep_* export surface over axe-event-processor with EpWiring::columine() (ports event_processor.zig's WASM/FFI export layer)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[lib]
+# cdylib for the wasm artifact; rlib so the extern layer is testable natively.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+columine-event-processor = { path = "../../../columine/crates/columine-event-processor" }
+columine-arrow = { path = "../../../columine/crates/columine-arrow" }
+columine-types = { path = "../../../columine/crates/columine-types" }
