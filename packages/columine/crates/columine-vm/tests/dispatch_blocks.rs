@@ -412,6 +412,9 @@ fn ordered_list_inside_flat_map() {
 
     let mut state = init(&prog);
     let mut vm = Vm::default();
+    let before = state.clone();
+    vm.undo_enable(&state);
+    let checkpoint = vm.undo_checkpoint();
 
     let types = [TYPE_A, TYPE_A];
     let offsets = [0u32, 2, 3];
@@ -421,13 +424,15 @@ fn ordered_list_inside_flat_map() {
         u32s_as_bytes(&offsets),
         u32s_as_bytes(&child_vals),
     ];
-    assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 2));
+    assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &cols, 2),);
 
     assert_eq!(3, slot_size(&state, 0));
     let off = slot_offset(&state, 0);
     assert_eq!(10, bytes::read_u32(&state, off));
     assert_eq!(20, bytes::read_u32(&state, off + 4));
     assert_eq!(30, bytes::read_u32(&state, off + 8));
+    let after = state.clone();
+    assert_delta_roundtrip(&mut vm, &before, &after, checkpoint);
 }
 
 // =============================================================================

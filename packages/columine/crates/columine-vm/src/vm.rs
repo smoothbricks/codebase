@@ -3622,8 +3622,11 @@ impl Vm {
                     }
 
                     let write_off = slot_offset + count * elem_size;
-                    let payload_range = [(write_off, elem_size)];
-                    let captured = self.undo.begin_state_capture(state, &payload_range, 1);
+                    let payload_ranges = [
+                        (write_off, elem_size),
+                        (meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
+                    ];
+                    let captured = self.undo.begin_state_capture(state, &payload_ranges, 1);
                     if self.undo.enabled {
                         let lau = |prev: u32| FlatUndoEntry {
                             op: FlatUndoOp::ListAppendUndo,
@@ -3659,7 +3662,7 @@ impl Vm {
                         ChangeFlag::INSERTED;
                     if captured {
                         self.undo
-                            .finish_state_capture(delta_mode, state, &payload_range);
+                            .finish_state_capture(delta_mode, state, &payload_ranges);
                     }
                 }
 
@@ -3697,8 +3700,11 @@ impl Vm {
                     let descriptor_size = align8(u32::from(num_fields));
                     let rows_base = slot_offset + descriptor_size;
                     let row_off = rows_base + count * row_size;
-                    let payload_range = [(row_off, row_size)];
-                    let captured = self.undo.begin_state_capture(state, &payload_range, 1);
+                    let payload_ranges = [
+                        (row_off, row_size),
+                        (meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
+                    ];
+                    let captured = self.undo.begin_state_capture(state, &payload_ranges, 1);
                     if self.undo.enabled {
                         let lau = |prev: u32| FlatUndoEntry {
                             op: FlatUndoOp::ListAppendUndo,
@@ -3772,7 +3778,7 @@ impl Vm {
                         ChangeFlag::INSERTED;
                     if captured {
                         self.undo
-                            .finish_state_capture(delta_mode, state, &payload_range);
+                            .finish_state_capture(delta_mode, state, &payload_ranges);
                     }
                 }
 
