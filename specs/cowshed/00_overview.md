@@ -98,9 +98,11 @@ The workspace holds only public trust anchors; the CA private key stays with the
 The `<owner>/<repo>` pair is the primary project `repo_id`: lowercase `owner/repo` normalized from an explicitly
 selected remote URL, stable across machines and checkout moves. The controller records that repository binding,
 validates it on every open, permits multiple bound identities with exactly one primary, and requires an explicit
-`repo_id` for a local-only repository. Discovery may propose candidates but never silently mints or selects one. Each
-component is validated and encoded independently before path joining. Trusted project policy lives only at
-`~/.cowshed/<owner>/<repo>/policy.json`, outside every workspace and denied to sandboxes (01_storage.md).
+`repo_id` for a local-only repository. Discovery never mints an identity: it may select a remote only when every
+normalized candidate has the same `repo_id`; distinct candidates require an explicit matching `repo_id`, with `origin`
+preferred only among remotes for that same identity. Each component is validated and encoded independently before path
+joining. Trusted project policy lives only at `~/.cowshed/<owner>/<repo>/policy.json`, outside every workspace and
+denied to sandboxes (01_storage.md).
 
 State is derived, never stored: the workspace clones are the registry (readdir / `zfs list`), the kernel mount table is
 the attachment state (getmntinfo), the controller-owned remote binding establishes repository identity, and an

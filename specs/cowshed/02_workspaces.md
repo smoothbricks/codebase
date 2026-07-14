@@ -56,13 +56,15 @@ daemons mutate it during the copy — so adopt is an explicit transaction with d
 script:
 
 1. Verify: git root, clean-enough state (adopt refuses mid-merge/rebase), free space, the secrets gate, and repository
-   identity. Remote discovery may propose normalized lowercase `owner/repo` candidates but never silently chooses or
-   mints one. Adoption selects a remote, records its normalized URL and `repo_id`, validates they agree, designates one
-   primary identity if several are bound, and requires `--repo-id owner/repo` for a local-only repository. Programmatic
-   callers supply the same explicit identity as `AdoptOptions.repo_id`; omission is valid only when remote selection
-   produces the trusted binding. Load trusted policy only from `~/.cowshed/<owner>/<repo>/policy.json`. Also require
-   that `<root>.pre-cowshed` does **not** already exist (exit 4 — a previous adopt left state behind; resolve it first).
-   Ensure host setup is present — declaratively validated when home-manager/nix-darwin owns it
+   identity. Normalize every configured remote to a lowercase `owner/repo` candidate. With no remotes,
+   `--repo-id owner/repo` is required and the primary binding records no fabricated remote name or URL. With remotes, an
+   explicit `--repo-id` must match a candidate; without it, all candidates must normalize to one identity. `origin` may
+   break a tie only among remotes for that same identity. Record the selected remote name and its credential-, query-,
+   and fragment-free URL, and validate that URL still normalizes to the recorded primary `repo_id`. Programmatic callers
+   supply the same explicit identity as `AdoptOptions.repo_id`; the coordinator rejects any disagreement with the
+   provisional binding before image mutation. Load trusted policy only from `~/.cowshed/<owner>/<repo>/policy.json`.
+   Also require that `<root>.pre-cowshed` does **not** already exist (exit 4 — a previous adopt left state behind;
+   resolve it first). Ensure host setup is present — declaratively validated when home-manager/nix-darwin owns it
    (`programs.cowshed`/`services.cowshed`, 14_nix.md), imperatively applied otherwise — and both dedicated volumes
    exist: lazily create and mount `cowshed.store` (at `~/.cowshed`) then `cowshed.caches` (nested; ordering and the
    volume marker in 01_storage.md) before any image is created.
