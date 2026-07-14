@@ -1997,7 +1997,6 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 &current.derived.workspace,
                 label.clone(),
                 if options.keep || explicitly_labeled {
-
                     crate::storage::lifecycle::Pin::Pinned
                 } else {
                     crate::storage::lifecycle::Pin::Automatic
@@ -2153,7 +2152,6 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             let _ = substrate.reclaim(retired).await;
         }));
         Ok(())
-
     }
 
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport> {
@@ -2786,17 +2784,16 @@ async fn enforce_adopt_secret_policy(
     quarantine: bool,
 ) -> Result<()> {
     crate::storage::lifecycle::dispatch_blocking(move || {
-        let waivers = match crate::metadata::read_json::<Vec<crate::secrets::SecretWaiver>>(
-            &waivers_path,
-        ) {
-            Ok(waivers) => waivers,
-            Err(crate::metadata::MetadataError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                Vec::new()
-            }
-            Err(error) => return Err(native_integrity_error(error)),
-        };
+        let waivers =
+            match crate::metadata::read_json::<Vec<crate::secrets::SecretWaiver>>(&waivers_path) {
+                Ok(waivers) => waivers,
+                Err(crate::metadata::MetadataError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    Vec::new()
+                }
+                Err(error) => return Err(native_integrity_error(error)),
+            };
         let scan = crate::secrets::scan_tree(&root, &waivers).map_err(secret_scan_error)?;
         if scan.findings.is_empty() {
             return Ok(());
@@ -2820,9 +2817,10 @@ async fn enforce_adopt_secret_policy(
 fn secret_scan_error(error: crate::secrets::SecretScanError) -> CowshedError {
     match error {
         crate::secrets::SecretScanError::InvalidWaiver { .. }
-        | crate::secrets::SecretScanError::DuplicateWaiver { .. } => {
-            CowshedError::integrity(error.to_string(), "repair the controller-owned waivers file")
-        }
+        | crate::secrets::SecretScanError::DuplicateWaiver { .. } => CowshedError::integrity(
+            error.to_string(),
+            "repair the controller-owned waivers file",
+        ),
         crate::secrets::SecretScanError::InvalidRoot { .. }
         | crate::secrets::SecretScanError::Walk { .. }
         | crate::secrets::SecretScanError::Read { .. } => CowshedError::environment_missing(
@@ -2923,7 +2921,9 @@ fn quarantine_secret_files(
             .map_err(|error| quarantine_io_error("secure quarantined secret", &temporary, error))?;
             std::fs::File::open(&temporary)
                 .and_then(|file| file.sync_all())
-                .map_err(|error| quarantine_io_error("sync quarantined secret", &temporary, error))?;
+                .map_err(|error| {
+                    quarantine_io_error("sync quarantined secret", &temporary, error)
+                })?;
             if !files_equal(&source, &temporary)? {
                 return Err(CowshedError::conflict(
                     format!(
@@ -2937,8 +2937,9 @@ fn quarantine_secret_files(
                 quarantine_io_error("publish quarantined secret", &destination, error)
             })?;
             sync_parent(&destination)?;
-            std::fs::remove_file(&source)
-                .map_err(|error| quarantine_io_error("remove quarantined source", &source, error))?;
+            std::fs::remove_file(&source).map_err(|error| {
+                quarantine_io_error("remove quarantined source", &source, error)
+            })?;
             sync_parent(&source)
         })();
         if prepared.is_err() {
@@ -2956,7 +2957,10 @@ fn secure_quarantine_directory(root: &Path, relative: &Path) -> Result<PathBuf> 
         if let Some(component) = component {
             let std::path::Component::Normal(component) = component else {
                 return Err(CowshedError::integrity(
-                    format!("secret quarantine path escapes its root: {}", relative.display()),
+                    format!(
+                        "secret quarantine path escapes its root: {}",
+                        relative.display()
+                    ),
                     "run cowshed doctor --json",
                 ));
             };
