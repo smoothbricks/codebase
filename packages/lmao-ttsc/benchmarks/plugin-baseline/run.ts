@@ -254,7 +254,7 @@ try {
   }
 
   process.stderr.write(
-    `transform proof: OFF runtime/dense/registration=${transformProof.offRuntimeHints}/${transformProof.offDenseHeaders}/${transformProof.offRegistrations}, ON hint=${transformProof.onRuntimeHint}/dense=${transformProof.onDenseHeaders}/registration=${transformProof.onRegistrations}\n` +
+    `transform proof: OFF runtime/dense/registration/materializations/classes=${transformProof.offRuntimeHints}/${transformProof.offDenseHeaders}/${transformProof.offRegistrations}/${transformProof.offSpanBufferMaterializations}/${transformProof.offSourceSpanBufferClasses}, ON runtime/dense/registration/materializations/classes=${transformProof.onRuntimeHints}/${transformProof.onDenseHeaders}/${transformProof.onRegistrations}/${transformProof.onSpanBufferMaterializations}/${transformProof.onSourceSpanBufferClasses}\n` +
       `semantic parity: ${offSemantic.checksum} (${offSemantic.rowCount} decoded Arrow rows)\n` +
       `${cli.abbaOutputDir ? `ABBA Mitata JSON directory: ${resolve(cli.abbaOutputDir)}\n` : ''}` +
       `${cli.offOutput ? `OFF Mitata JSON: ${resolve(cli.offOutput)}\n` : ''}` +
