@@ -26,8 +26,8 @@ pub use control::{ControlError, ControlFailureCode, GatewayControlClient, contro
 pub use interfaces::{
     AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus, AuthorizedTarget, BoxIo,
     ConnectError, CredentialError, CredentialProtocol, CredentialProvider, CredentialQuery,
-    CredentialRecord, DiscardAudit, GatewayIo, NoCredentials, SystemConnector, UpstreamConnector,
-    UpstreamHealth, UpstreamPurpose,
+    CredentialRecord, GatewayIo, SystemConnector, UpstreamConnector, UpstreamHealth,
+    UpstreamPurpose,
 };
 pub use platform::KeychainCredentialProvider;
 pub use policy::{
