@@ -9,6 +9,13 @@ use crate::error::{CowshedError, Result};
 const RSYNC: &str = "/usr/bin/rsync";
 const DEFAULT_PASS_BUDGET: usize = 6;
 const CHURN_SAMPLE_LIMIT: usize = 8;
+const APFS_ROOT_METADATA_EXCLUDES: [&str; 5] = [
+    "--exclude=/.DocumentRevisions-V100",
+    "--exclude=/.Spotlight-V100",
+    "--exclude=/.TemporaryItems",
+    "--exclude=/.Trashes",
+    "--exclude=/.fseventsd",
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CopyReport {
@@ -67,6 +74,11 @@ where
                     OsString::from("-aE"),
                     OsString::from("--delete"),
                     OsString::from("--itemize-changes"),
+                    OsString::from(APFS_ROOT_METADATA_EXCLUDES[0]),
+                    OsString::from(APFS_ROOT_METADATA_EXCLUDES[1]),
+                    OsString::from(APFS_ROOT_METADATA_EXCLUDES[2]),
+                    OsString::from(APFS_ROOT_METADATA_EXCLUDES[3]),
+                    OsString::from(APFS_ROOT_METADATA_EXCLUDES[4]),
                     OsString::from("--out-format=%i"),
                     OsString::from("--"),
                     source_contents.as_os_str().to_owned(),
@@ -233,6 +245,14 @@ mod tests {
             .expect("write source git metadata");
         fs::write(source.join("nested/file"), b"warm state\n").expect("write source file");
         fs::write(destination.join("stale-secret"), b"remove me\n").expect("write stale file");
+        let apfs_metadata = destination.join(".fseventsd");
+        fs::create_dir(&apfs_metadata).expect("create destination APFS metadata");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&apfs_metadata, fs::Permissions::from_mode(0o000))
+                .expect("make destination APFS metadata unreadable");
+        }
 
         let report = copy_with_budget(&source, &destination, 3)
             .await
@@ -248,6 +268,13 @@ mod tests {
         );
         assert!(!destination.join("stale-secret").exists());
 
+        assert!(apfs_metadata.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&apfs_metadata, fs::Permissions::from_mode(0o700))
+                .expect("restore destination APFS metadata permissions");
+        }
         fs::remove_dir_all(source).expect("remove source");
         fs::remove_dir_all(destination).expect("remove destination");
     }
