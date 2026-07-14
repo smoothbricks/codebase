@@ -177,8 +177,34 @@ impl GitRepository {
             ])
             .await?;
         if !output.status.success() {
+            return Err(git_internal("check host commit preservation refs", &output));
+        }
+        Ok(!output.stdout.is_empty())
+    }
+
+    /// Whether `commit` is contained by a remote-tracking ref in this repository.
+    ///
+    /// This is the conservative, offline proof used before deleting an adopted main image:
+    /// local heads disappear with that image, while a remote-tracking ref records a push/fetch
+    /// boundary whose remote retains the commit.
+    pub async fn commit_is_remote_preserved(&self, commit: &str) -> Result<bool> {
+        let object = format!("{commit}^{{commit}}");
+        let exists = self.run(["cat-file", "-e", object.as_str()]).await?;
+        if !exists.status.success() {
+            return Ok(false);
+        }
+        let output = self
+            .run([
+                "for-each-ref",
+                "--format=%(refname)",
+                "--contains",
+                commit,
+                "refs/remotes",
+            ])
+            .await?;
+        if !output.status.success() {
             return Err(git_internal(
-                "check host commit preservation refs",
+                "check remote commit preservation refs",
                 &output,
             ));
         }
@@ -567,6 +593,25 @@ mod tests {
                 .await
                 .expect("main preserves its head")
         );
+        assert!(
+            !host_repo
+                .commit_is_remote_preserved(&host_head)
+                .await
+                .expect("local head is not remotely preserved")
+        );
+        let status = Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&host)
+            .args(["update-ref", "refs/remotes/origin/main", &host_head])
+            .status()
+            .expect("write remote-tracking ref");
+        assert!(status.success());
+        assert!(
+            host_repo
+                .commit_is_remote_preserved(&host_head)
+                .await
+                .expect("remote-tracking ref preserves head")
+        );
 
         let session = host.with_extension("session");
         let status = Command::new("/usr/bin/git")
@@ -620,12 +665,7 @@ mod tests {
         let status = Command::new("/usr/bin/git")
             .arg("-C")
             .arg(&session)
-            .args([
-                "push",
-                "-q",
-                "origin",
-                "HEAD:refs/cowshed/raven/heads/main",
-            ])
+            .args(["push", "-q", "origin", "HEAD:refs/cowshed/raven/heads/main"])
             .status()
             .expect("publish preservation ref");
         assert!(status.success());

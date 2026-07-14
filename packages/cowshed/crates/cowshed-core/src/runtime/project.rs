@@ -1525,10 +1525,9 @@ impl NativeProjectRuntimeHost {
                             format!("detached metadata disagrees with {}", image.display()),
                         ));
                     }
-                    let info = metadata.require_info_snapshot().map_err(|error| {
-                        crate::storage::apfs::ApfsStorageError::Host(error.to_string())
-                    })?;
-                    if info.project_root != project_root {
+                    if let Some(info) = metadata.info_snapshot.as_ref()
+                        && info.project_root != project_root
+                    {
                         return Err(crate::storage::apfs::ApfsStorageError::MarkerMismatch(
                             format!(
                                 "persisted project root {} disagrees with controller root {}",
@@ -1825,7 +1824,59 @@ impl NativeProjectRuntimeHost {
         Ok(())
     }
 
+    async fn require_main_restore_safe(
+        &self,
+        workspace: &NativeWorkspace,
+        pre_cowshed_checkout: &Path,
+    ) -> Result<()> {
+        let fence = self.removal_git_fence(workspace).await?;
+        if fence.dirty || fence.in_progress.is_some() {
+            return Err(CowshedError::conflict(
+                "main has uncommitted or in-progress Git work",
+                "commit and push the work, or retry with: cowshed rm main --restore --force",
+            ));
+        }
+        let current_git =
+            crate::git::GitRepository::from_root(current_snapshot_mount(self, workspace)?);
+        let retained_git = crate::git::GitRepository::discover(pre_cowshed_checkout)
+            .await
+            .map_err(|_| {
+                CowshedError::conflict(
+                    "retained pre-cowshed checkout cannot prove main commit preservation",
+                    "restore the exact retained checkout, push main, or retry with --force",
+                )
+            })?;
+        let preserved_locally = retained_git
+            .commit_is_preserved(fence.head.as_str())
+            .await?;
+        let preserved_remotely = current_git
+            .commit_is_remote_preserved(fence.head.as_str())
+            .await?;
+        if !preserved_locally && !preserved_remotely {
+            return Err(CowshedError::conflict(
+                format!(
+                    "main head {} is not preserved by the retained checkout or a remote ref",
+                    fence.head
+                ),
+                "push or land main, or retry with: cowshed rm main --restore --force",
+            ));
+        }
+        Ok(())
+    }
+
     async fn verify_checkout_identity(&self, path: &Path, description: &str) -> Result<()> {
+        let path_metadata = tokio::fs::symlink_metadata(path).await.map_err(|_| {
+            CowshedError::conflict(
+                format!("{description} is not the exact retained checkout directory"),
+                "restore the exact .pre-cowshed tree or move the collision aside",
+            )
+        })?;
+        if !path_metadata.file_type().is_dir() || path_metadata.file_type().is_symlink() {
+            return Err(CowshedError::conflict(
+                format!("{description} is not the exact retained checkout directory"),
+                "restore the exact .pre-cowshed tree or move the collision aside",
+            ));
+        }
         let git = crate::git::GitRepository::discover(path)
             .await
             .map_err(|_| {
@@ -1834,6 +1885,24 @@ impl NativeProjectRuntimeHost {
                     "restore the exact .pre-cowshed tree or move the collision aside",
                 )
             })?;
+        let candidate_root = tokio::fs::canonicalize(path).await.map_err(|_| {
+            CowshedError::conflict(
+                format!("{description} cannot be resolved as an exact checkout root"),
+                "restore the exact .pre-cowshed tree or move the collision aside",
+            )
+        })?;
+        let discovered_root = tokio::fs::canonicalize(git.root()).await.map_err(|_| {
+            CowshedError::conflict(
+                format!("{description} has no resolvable Git root"),
+                "restore the exact .pre-cowshed tree or move the collision aside",
+            )
+        })?;
+        if candidate_root != discovered_root {
+            return Err(CowshedError::conflict(
+                format!("{description} is nested inside another checkout"),
+                "restore the exact .pre-cowshed checkout root and retry",
+            ));
+        }
         let binding = binding_from_git(&git, Some(&self.descriptor.repo_id)).await?;
         if binding.primary().map_err(native_integrity_error)?.repo_id != self.descriptor.repo_id {
             return Err(CowshedError::conflict(
@@ -2702,7 +2771,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         }
 
         self.validate_binding().await?;
-        let current = match self.current(&workspace).await {
+        let mut current = match self.current(&workspace).await {
             Ok(current) => current,
             Err(error) if options.restore && error.code == ErrorCode::NotFound => {
                 let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
@@ -2725,6 +2794,28 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
 
         if options.restore {
             let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
+            if !options.force {
+                self.verify_checkout_identity(&pre_cowshed, "retained pre-cowshed checkout")
+                    .await?;
+                let initially_detached =
+                    matches!(current.derived.mount_state, MountState::Detached);
+                if initially_detached {
+                    self.substrate
+                        .ensure_mounted(&current.derived.workspace, MountIntent { browse: false })
+                        .await
+                        .map_err(native_storage_error)?;
+                    current = self.current(&workspace).await?;
+                }
+                if let Err(error) = self.require_main_restore_safe(&current, &pre_cowshed).await {
+                    if initially_detached {
+                        self.substrate
+                            .unmount(&current.derived.workspace)
+                            .await
+                            .map_err(native_storage_error)?;
+                    }
+                    return Err(error);
+                }
+            }
             self.adopt_rollback_state(&current, &pre_cowshed).await?;
             let incarnation = current.derived.workspace.incarnation().clone();
             self.stop_supervisor(&workspace).await?;

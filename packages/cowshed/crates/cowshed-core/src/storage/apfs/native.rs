@@ -470,6 +470,23 @@ fn exact_mount_stub(path: &Path) -> Result<bool, ApfsStorageError> {
         .map_err(|error| io_error("read adoption mount stub", &entry.path(), error))
 }
 
+fn exact_empty_directory(path: &Path) -> Result<bool, ApfsStorageError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_error("inspect adoption rollback path", path, error)),
+    };
+    if !metadata.file_type().is_dir() {
+        return Ok(false);
+    }
+    fs::read_dir(path)
+        .map_err(|error| io_error("enumerate adoption rollback path", path, error))?
+        .next()
+        .transpose()
+        .map(|entry| entry.is_none())
+        .map_err(|error| io_error("read adoption rollback path", path, error))
+}
+
 fn remove_exact_mount_stub(path: &Path) -> Result<(), ApfsStorageError> {
     if !exact_mount_stub(path)? {
         return Err(ApfsStorageError::InvalidPlan(
@@ -515,15 +532,27 @@ fn restore_adopted_checkout_paths(
     }
 
     let pre_is_stub = exact_mount_stub(pre_cowshed_checkout)?;
-    match (source_is_stub, pre_is_stub) {
-        (true, false) => {
+    let pre_is_empty = !pre_is_stub && exact_empty_directory(pre_cowshed_checkout)?;
+    match (source_is_stub, pre_is_stub, pre_is_empty) {
+        (true, false, _) => {
             swap_paths(source_checkout, pre_cowshed_checkout)?;
             sync_parent_path(source_checkout)?;
             remove_exact_mount_stub(pre_cowshed_checkout)
         }
-        (false, true) => {
+        (false, true, _) => {
             // A prior attempt completed the atomic swap and crashed before stub cleanup.
             remove_exact_mount_stub(pre_cowshed_checkout)
+        }
+        (false, false, true) => {
+            // A prior attempt removed the stub file and crashed before removing its directory.
+            fs::remove_dir(pre_cowshed_checkout).map_err(|error| {
+                io_error(
+                    "remove cleared adoption mountpoint",
+                    pre_cowshed_checkout,
+                    error,
+                )
+            })?;
+            sync_parent_path(pre_cowshed_checkout)
         }
         _ => Err(ApfsStorageError::InvalidPlan(
             "adoption rollback paths are missing the exact retained checkout and canonical mount stub",
@@ -4452,6 +4481,28 @@ mod tests {
 
         restore_adopted_checkout_paths(&source, &retained)
             .expect("completed rollback is idempotent");
+        std::fs::remove_dir_all(parent).expect("fixture cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn adoption_rollback_retry_removes_a_cleared_mount_stub_directory() {
+        let parent = std::env::temp_dir().join(format!(
+            "cowshed-adopt-rollback-cleared-stub-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = parent.join("project");
+        let retained = pre_cowshed_path(&source);
+        std::fs::create_dir_all(source.join(".git")).expect("restored git metadata");
+        std::fs::write(source.join(".git/HEAD"), b"retained\n").expect("restored HEAD");
+        std::fs::create_dir_all(&retained).expect("cleared mount stub");
+
+        restore_adopted_checkout_paths(&source, &retained).expect("retry cleared cleanup");
+        assert!(!retained.exists());
+        assert_eq!(
+            std::fs::read(source.join(".git/HEAD")).expect("restored HEAD"),
+            b"retained\n"
+        );
         std::fs::remove_dir_all(parent).expect("fixture cleanup");
     }
 
