@@ -179,6 +179,7 @@ impl Gateway {
             let tail = audit.tail_handle();
             let repo_transport: Arc<dyn RepoTransport> = Arc::new(Git2RepoTransport::new(
                 Arc::clone(&connector),
+                config.timeouts.connect,
                 config.timeouts.response_headers,
             ));
             Self::start_runtime(
@@ -202,6 +203,7 @@ impl Gateway {
     ) -> Result<Self, GatewayError> {
         let repo_transport: Arc<dyn RepoTransport> = Arc::new(Git2RepoTransport::new(
             Arc::clone(&connector),
+            config.timeouts.connect,
             config.timeouts.response_headers,
         ));
         Self::start_runtime(
@@ -260,6 +262,8 @@ impl Gateway {
             Arc::clone(&credentials),
             repo_transport,
             Arc::clone(&auditor),
+            config.timeouts.response_headers,
+            config.timeouts.request_total,
         )?;
         let (sim_broker, sim_broker_task) = match SimBrokerHandle::start(
             config.simulator_drop_root.clone(),

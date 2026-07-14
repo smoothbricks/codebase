@@ -2,7 +2,10 @@ use std::{
     collections::HashMap,
     fmt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -15,8 +18,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
-use tokio::time::{Duration, timeout};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::{Duration, Instant, timeout, timeout_at};
 use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -74,6 +77,27 @@ pub struct RepoFetchPlan {
     pub remote: String,
     pub destination: PathBuf,
     pub credential: Option<RepoCredential>,
+    cancellation: Arc<AtomicBool>,
+}
+
+impl RepoFetchPlan {
+    fn new(
+        remote: String,
+        destination: PathBuf,
+        credential: Option<RepoCredential>,
+        cancellation: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            remote,
+            destination,
+            credential,
+            cancellation,
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.load(Ordering::Acquire)
+    }
 }
 
 impl fmt::Debug for RepoFetchPlan {
@@ -101,6 +125,7 @@ pub trait RepoTransport: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct Git2RepoTransport {
     connector: Arc<dyn UpstreamConnector>,
+    connect_timeout: Duration,
     response_timeout: Duration,
 }
 
@@ -108,15 +133,21 @@ impl fmt::Debug for Git2RepoTransport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Git2RepoTransport")
+            .field("connect_timeout", &self.connect_timeout)
             .field("response_timeout", &self.response_timeout)
             .finish_non_exhaustive()
     }
 }
 
 impl Git2RepoTransport {
-    pub fn new(connector: Arc<dyn UpstreamConnector>, response_timeout: Duration) -> Self {
+    pub fn new(
+        connector: Arc<dyn UpstreamConnector>,
+        connect_timeout: Duration,
+        response_timeout: Duration,
+    ) -> Self {
         Self {
             connector,
+            connect_timeout,
             response_timeout,
         }
     }
@@ -127,15 +158,20 @@ impl Git2RepoTransport {
         url.set_path(&path);
         url.set_query(Some("service=git-upload-pack"));
         let target = CanonicalTarget::from_url(&url).map_err(|_| RepoMirrorError::InvalidRemote)?;
-        let connection = self
-            .connector
-            .connect(&AuthorizedTarget {
+        if plan.is_cancelled() {
+            return Err(RepoMirrorError::Cancelled);
+        }
+        let connection = timeout(
+            self.connect_timeout,
+            self.connector.connect(&AuthorizedTarget {
                 target: target.clone(),
                 purpose: UpstreamPurpose::TlsHttp,
                 private_network_authorized: true,
-            })
-            .await
-            .map_err(|_| RepoMirrorError::FetchFailed)?;
+            }),
+        )
+        .await
+        .map_err(|_| RepoMirrorError::FetchTimeout)?
+        .map_err(|_| RepoMirrorError::FetchFailed)?;
         let request_target = format!(
             "{}?{}",
             url.path(),
@@ -212,16 +248,30 @@ impl Git2RepoTransport {
 #[async_trait]
 impl RepoTransport for Git2RepoTransport {
     async fn fetch(&self, plan: RepoFetchPlan) -> Result<RepoFetchOutcome, RepoMirrorError> {
+        if plan.is_cancelled() {
+            return Err(RepoMirrorError::Cancelled);
+        }
         if let Some(location) = self.preflight(&plan).await? {
             return Ok(RepoFetchOutcome::Redirect { location });
         }
-        tokio::task::spawn_blocking(move || fetch_git2(plan))
-            .await
-            .map_err(|_| RepoMirrorError::FetchFailed)?
+        let destination = plan.destination.clone();
+        let cancellation = Arc::clone(&plan.cancellation);
+        tokio::task::spawn_blocking(move || {
+            let result = fetch_git2(plan);
+            if cancellation.load(Ordering::Acquire) {
+                remove_tree(&destination);
+            }
+            result
+        })
+        .await
+        .map_err(|_| RepoMirrorError::FetchFailed)?
     }
 }
 
 fn fetch_git2(mut plan: RepoFetchPlan) -> Result<RepoFetchOutcome, RepoMirrorError> {
+    if plan.is_cancelled() {
+        return Err(RepoMirrorError::Cancelled);
+    }
     let repository =
         git2::Repository::init_bare(&plan.destination).map_err(|_| RepoMirrorError::FetchFailed)?;
     {
@@ -248,6 +298,8 @@ fn fetch_git2(mut plan: RepoFetchPlan) -> Result<RepoFetchOutcome, RepoMirrorErr
         .remote_anonymous(&plan.remote)
         .map_err(|_| RepoMirrorError::FetchFailed)?;
     let mut callbacks = RemoteCallbacks::new();
+    let cancellation = Arc::clone(&plan.cancellation);
+    callbacks.transfer_progress(move |_| !cancellation.load(Ordering::Acquire));
     callbacks.credentials(|_, _, _| Err(git2::Error::from_str("interactive credentials disabled")));
     let mut fetch = FetchOptions::new();
     fetch.remote_callbacks(callbacks);
@@ -271,6 +323,9 @@ fn fetch_git2(mut plan: RepoFetchPlan) -> Result<RepoFetchOutcome, RepoMirrorErr
             None,
         )
         .map_err(|_| RepoMirrorError::FetchFailed)?;
+    if plan.is_cancelled() {
+        return Err(RepoMirrorError::Cancelled);
+    }
     let head = repository.references().ok().and_then(|mut references| {
         references.find_map(|reference| {
             let reference = reference.ok()?;
@@ -286,6 +341,7 @@ fn fetch_git2(mut plan: RepoFetchPlan) -> Result<RepoFetchOutcome, RepoMirrorErr
 #[derive(Clone)]
 pub(crate) struct RepoMirrorHandle {
     sender: mpsc::Sender<Message>,
+    shutdown: watch::Sender<bool>,
 }
 
 impl fmt::Debug for RepoMirrorHandle {
@@ -303,11 +359,25 @@ impl RepoMirrorHandle {
         credentials: Arc<dyn CredentialProvider>,
         transport: Arc<dyn RepoTransport>,
         auditor: Arc<dyn BrokerAuditor>,
+        credential_timeout: Duration,
+        total_timeout: Duration,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), RepoMirrorError> {
         prepare_root(&root)?;
         let (sender, receiver) = mpsc::channel(capacity.max(1));
-        let handle = Self { sender };
-        let task = tokio::spawn(run(receiver, root, credentials, transport, auditor));
+        let (shutdown, stopped) = watch::channel(false);
+        let handle = Self { sender, shutdown };
+        let task = tokio::spawn(run(
+            receiver,
+            stopped,
+            root,
+            credentials,
+            transport,
+            auditor,
+            RepoDeadlines {
+                credential: credential_timeout,
+                total: total_timeout,
+            },
+        ));
         Ok((handle, task))
     }
 
@@ -342,7 +412,7 @@ impl RepoMirrorHandle {
     }
 
     pub(crate) async fn shutdown(&self) {
-        let _ = self.call(|reply| Message::Shutdown { reply }).await;
+        let _ = self.shutdown.send(true);
     }
 
     async fn call<T>(
@@ -373,9 +443,6 @@ enum Message {
         request: RepoMirrorRequest,
         reply: oneshot::Sender<Result<MirrorInfo, RepoMirrorError>>,
     },
-    Shutdown {
-        reply: oneshot::Sender<Result<(), RepoMirrorError>>,
-    },
 }
 
 #[derive(Clone)]
@@ -384,16 +451,36 @@ struct Binding {
     policy: WorkspacePolicy,
 }
 
+#[derive(Clone, Copy)]
+struct RepoDeadlines {
+    credential: Duration,
+    total: Duration,
+}
+
 async fn run(
     mut receiver: mpsc::Receiver<Message>,
+    mut shutdown: watch::Receiver<bool>,
     root: PathBuf,
     credentials: Arc<dyn CredentialProvider>,
     transport: Arc<dyn RepoTransport>,
     auditor: Arc<dyn BrokerAuditor>,
+    deadlines: RepoDeadlines,
 ) {
     let mut bindings = HashMap::<String, Binding>::new();
     let mut mirrors = HashMap::<(String, String), MirrorInfo>::new();
-    while let Some(message) = receiver.recv().await {
+    loop {
+        let message = tokio::select! {
+            message = receiver.recv() => {
+                let Some(message) = message else { break };
+                message
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+        };
         match message {
             Message::Bind {
                 workspace_id,
@@ -418,35 +505,59 @@ async fn run(
                 let _ = reply.send(Ok(()));
             }
             Message::Mirror { request, reply } => {
-                let result = mirror(
+                let operation = mirror(
                     request,
-                    &root,
-                    &bindings,
-                    &mut mirrors,
-                    credentials.as_ref(),
-                    transport.as_ref(),
-                    auditor.as_ref(),
-                )
-                .await;
+                    MirrorContext {
+                        root: &root,
+                        bindings: &bindings,
+                        mirrors: &mut mirrors,
+                        credentials: credentials.as_ref(),
+                        transport: transport.as_ref(),
+                        auditor: auditor.as_ref(),
+                        deadlines,
+                    },
+                );
+                tokio::pin!(operation);
+                let result = tokio::select! {
+                    result = &mut operation => result,
+                    changed = shutdown.changed() => {
+                        let _ = reply.send(Err(RepoMirrorError::Cancelled));
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 let _ = reply.send(result);
-            }
-            Message::Shutdown { reply } => {
-                let _ = reply.send(Ok(()));
-                break;
             }
         }
     }
 }
 
+struct MirrorContext<'a> {
+    root: &'a Path,
+    bindings: &'a HashMap<String, Binding>,
+    mirrors: &'a mut HashMap<(String, String), MirrorInfo>,
+    credentials: &'a dyn CredentialProvider,
+    transport: &'a dyn RepoTransport,
+    auditor: &'a dyn BrokerAuditor,
+    deadlines: RepoDeadlines,
+}
+
 async fn mirror(
     request: RepoMirrorRequest,
-    root: &Path,
-    bindings: &HashMap<String, Binding>,
-    mirrors: &mut HashMap<(String, String), MirrorInfo>,
-    credentials: &dyn CredentialProvider,
-    transport: &dyn RepoTransport,
-    auditor: &dyn BrokerAuditor,
+    context: MirrorContext<'_>,
 ) -> Result<MirrorInfo, RepoMirrorError> {
+    let MirrorContext {
+        root,
+        bindings,
+        mirrors,
+        credentials,
+        transport,
+        auditor,
+        deadlines,
+    } = context;
+    let deadline = Instant::now() + deadlines.total;
     validate_identifier(&request.repo_id)?;
     let binding = bindings
         .get(&request.workspace_id)
@@ -513,12 +624,16 @@ async fn mirror(
     std::fs::create_dir(&temp).map_err(|_| RepoMirrorError::PublicationFailed)?;
 
     let result = fetch_redirects(
-        &request,
-        binding,
         original,
-        temp.clone(),
-        credentials,
-        transport,
+        FetchContext {
+            request: &request,
+            binding,
+            destination: temp.clone(),
+            credentials,
+            transport,
+            deadlines,
+            deadline,
+        },
     )
     .await;
     let (final_remote, head) = match result {
@@ -620,15 +735,43 @@ fn admit_remote(binding: &Binding, remote: &CanonicalRemote) -> Result<(), RepoM
     Ok(())
 }
 
-async fn fetch_redirects(
-    request: &RepoMirrorRequest,
-    binding: &Binding,
-    mut remote: CanonicalRemote,
+struct CancellationGuard {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+struct FetchContext<'a> {
+    request: &'a RepoMirrorRequest,
+    binding: &'a Binding,
     destination: PathBuf,
-    credentials: &dyn CredentialProvider,
-    transport: &dyn RepoTransport,
+    credentials: &'a dyn CredentialProvider,
+    transport: &'a dyn RepoTransport,
+    deadlines: RepoDeadlines,
+    deadline: Instant,
+}
+
+async fn fetch_redirects(
+    mut remote: CanonicalRemote,
+    context: FetchContext<'_>,
 ) -> Result<(CanonicalRemote, Option<String>), RepoMirrorError> {
+    let FetchContext {
+        request,
+        binding,
+        destination,
+        credentials,
+        transport,
+        deadlines,
+        deadline,
+    } = context;
     for redirect_count in 0..=MAX_REDIRECTS {
+        if Instant::now() >= deadline {
+            return Err(RepoMirrorError::FetchTimeout);
+        }
         admit_remote(binding, &remote)?;
         let query = CredentialQuery {
             workspace_id: request.workspace_id.clone(),
@@ -638,9 +781,10 @@ async fn fetch_redirects(
             method: Method::GET,
             path: remote.path.clone(),
         };
-        let credential = credentials
-            .lookup(&query)
+        let credential_deadline = deadline.min(Instant::now() + deadlines.credential);
+        let credential = timeout_at(credential_deadline, credentials.lookup(&query))
             .await
+            .map_err(|_| RepoMirrorError::CredentialTimeout)?
             .map_err(|_| RepoMirrorError::CredentialUnavailable)?;
         let credential = match credential {
             Some(record) if record.validate_for(&query) => Some(RepoCredential {
@@ -650,14 +794,22 @@ async fn fetch_redirects(
             Some(_) => return Err(RepoMirrorError::CredentialScopeMismatch),
             None => None,
         };
-        match transport
-            .fetch(RepoFetchPlan {
-                remote: remote.canonical.clone(),
-                destination: destination.clone(),
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _guard = CancellationGuard {
+            cancelled: Arc::clone(&cancelled),
+        };
+        let outcome = timeout_at(
+            deadline,
+            transport.fetch(RepoFetchPlan::new(
+                remote.canonical.clone(),
+                destination.clone(),
                 credential,
-            })
-            .await?
-        {
+                cancelled,
+            )),
+        )
+        .await
+        .map_err(|_| RepoMirrorError::FetchTimeout)??;
+        match outcome {
             RepoFetchOutcome::Fetched { head } => return Ok((remote, head)),
             RepoFetchOutcome::Redirect { location } if redirect_count < MAX_REDIRECTS => {
                 remove_tree(&destination);
@@ -829,8 +981,10 @@ impl RepoMirrorError {
             Self::NotAdmitted => "repo-not-admitted",
             Self::InvalidRemote | Self::NonCanonicalRemote => "repo-invalid-remote",
             Self::InvalidRedirect | Self::TooManyRedirects => "repo-redirect-denied",
-            Self::CredentialUnavailable | Self::CredentialScopeMismatch => "repo-credential-denied",
-            Self::FetchFailed => "repo-fetch-failed",
+            Self::CredentialUnavailable
+            | Self::CredentialScopeMismatch
+            | Self::CredentialTimeout => "repo-credential-denied",
+            Self::FetchFailed | Self::FetchTimeout | Self::Cancelled => "repo-fetch-failed",
             Self::PublicationFailed => "repo-publication-failed",
             _ => "repo-request-rejected",
         }
@@ -857,10 +1011,16 @@ pub enum RepoMirrorError {
     TooManyRedirects,
     #[error("repository credential store is unavailable")]
     CredentialUnavailable,
+    #[error("repository credential lookup timed out")]
+    CredentialTimeout,
     #[error("repository credential scope does not match")]
     CredentialScopeMismatch,
     #[error("repository transport fetch failed")]
     FetchFailed,
+    #[error("repository transport fetch timed out")]
+    FetchTimeout,
+    #[error("repository transport fetch was cancelled")]
+    Cancelled,
     #[error("repository mirror publication failed")]
     PublicationFailed,
     #[error("repository mirror root is insecure")]
@@ -883,7 +1043,10 @@ mod tests {
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::{
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
+        sync::Notify,
+    };
 
     use super::*;
 
@@ -899,6 +1062,17 @@ mod tests {
         ) -> Result<Option<crate::CredentialRecord>, crate::CredentialError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(None)
+        }
+    }
+    struct NeverCredentials;
+
+    #[async_trait]
+    impl CredentialProvider for NeverCredentials {
+        async fn lookup(
+            &self,
+            _query: &CredentialQuery,
+        ) -> Result<Option<crate::CredentialRecord>, crate::CredentialError> {
+            std::future::pending().await
         }
     }
 
@@ -927,6 +1101,18 @@ mod tests {
             Ok(outcome)
         }
     }
+    struct NeverTransport {
+        started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RepoTransport for NeverTransport {
+        async fn fetch(&self, _plan: RepoFetchPlan) -> Result<RepoFetchOutcome, RepoMirrorError> {
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
     struct RedirectConnector {
         request: Arc<Mutex<Vec<u8>>>,
     }
@@ -1011,6 +1197,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_cancels_pending_fetch_without_waiting_for_total_deadline() {
+        let root = fixture_root("drain");
+        let started = Arc::new(Notify::new());
+        let transport = Arc::new(NeverTransport {
+            started: Arc::clone(&started),
+        });
+        let auditor = Arc::new(FixtureAuditor::default());
+        let credentials = Arc::new(CountingCredentials {
+            calls: AtomicUsize::new(0),
+        });
+        let (handle, task) = RepoMirrorHandle::start(
+            root.clone(),
+            4,
+            credentials,
+            transport,
+            auditor,
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+        )
+        .expect("start");
+        handle
+            .bind_session("ws".to_owned(), "repo".to_owned(), policy("/org"))
+            .await
+            .expect("bind");
+        let started_wait = started.notified();
+        let request_handle = handle.clone();
+        let request = tokio::spawn(async move {
+            request_handle
+                .mirror(RepoMirrorRequest {
+                    workspace_id: "ws".to_owned(),
+                    repo_id: "repo".to_owned(),
+                    remote: "https://git.example.test/org/repo.git".to_owned(),
+                })
+                .await
+        });
+        timeout(Duration::from_secs(1), started_wait)
+            .await
+            .expect("fetch started");
+        timeout(Duration::from_millis(100), handle.shutdown())
+            .await
+            .expect("shutdown signal");
+        timeout(Duration::from_millis(100), task)
+            .await
+            .expect("actor stopped")
+            .expect("actor joined");
+        assert!(matches!(
+            request.await.expect("request joined"),
+            Err(RepoMirrorError::Cancelled | RepoMirrorError::Stopped)
+        ));
+        remove_tree_read_only(&root);
+    }
+
+    #[tokio::test]
+    async fn credential_lookup_obeys_stage_deadline() {
+        let root = fixture_root("credential-timeout");
+        let transport = Arc::new(FixtureTransport {
+            calls: Mutex::new(Vec::new()),
+            outcomes: Mutex::new(VecDeque::new()),
+        });
+        let auditor = Arc::new(FixtureAuditor::default());
+        let (handle, task) = RepoMirrorHandle::start(
+            root.clone(),
+            4,
+            Arc::new(NeverCredentials),
+            transport,
+            auditor,
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        )
+        .expect("start");
+        handle
+            .bind_session("ws".to_owned(), "repo".to_owned(), policy("/org"))
+            .await
+            .expect("bind");
+        assert!(matches!(
+            handle
+                .mirror(RepoMirrorRequest {
+                    workspace_id: "ws".to_owned(),
+                    repo_id: "repo".to_owned(),
+                    remote: "https://git.example.test/org/repo.git".to_owned(),
+                })
+                .await,
+            Err(RepoMirrorError::CredentialTimeout)
+        ));
+        handle.shutdown().await;
+        task.await.expect("join");
+        remove_tree_read_only(&root);
+    }
+
+    #[tokio::test]
     async fn production_transport_discovers_redirect_before_git_fetch() {
         let root = fixture_root("preflight");
         let request = Arc::new(Mutex::new(Vec::new()));
@@ -1019,16 +1295,18 @@ mod tests {
                 request: Arc::clone(&request),
             }),
             Duration::from_secs(1),
+            Duration::from_secs(1),
         );
         let outcome = transport
-            .fetch(RepoFetchPlan {
-                remote: "https://git.example.test/org/repo.git".to_owned(),
-                destination: root.join("unused.git"),
-                credential: Some(RepoCredential {
+            .fetch(RepoFetchPlan::new(
+                "https://git.example.test/org/repo.git".to_owned(),
+                root.join("unused.git"),
+                Some(RepoCredential {
                     header_name: "authorization".to_owned(),
                     header_value: Zeroizing::new("Bearer scoped-secret".to_owned()),
                 }),
-            })
+                Arc::new(AtomicBool::new(false)),
+            ))
             .await
             .expect("redirect");
         assert_eq!(
@@ -1081,6 +1359,8 @@ mod tests {
             credentials.clone(),
             transport.clone(),
             auditor.clone(),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
         )
         .expect("start");
         handle
@@ -1205,6 +1485,8 @@ mod tests {
             credentials.clone(),
             transport.clone(),
             auditor,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
         )
         .expect("start");
         handle
