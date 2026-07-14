@@ -172,12 +172,15 @@ Plans remain pure, immutable, and capability-free: they contain validated logica
 and intended operations, but no open descriptors, caller-supplied mounted paths, or executed side effects. CLI commands
 may synchronously wait at the outermost process boundary; library consumers await futures.
 
-Selection is convention, not guesswork. `statfs` of the project root selects APFS images when it reports APFS. When it
-reports ZFS, cowshed uses the containing dataset only if its pool has a suitable delegated cowshed root. If `statfs`
-cannot identify such a dataset (including a non-ZFS checkout whose workspace data should live on ZFS), selection
-requires an explicit `.cowshed.toml` `[substrate] kind = "zfs"` and `pool = "<pool>"`; cowshed never scans pools or
-silently picks one. A configured pool must contain or permit creation of the exact hierarchy below. `cowshed doctor`
-prints the selected substrate, pool, and evidence.
+Selection is convention, not guesswork, and the host storage anchor is distinct from the selected project path. On
+macOS, `statfs` of the invoking user's home directory selects the APFS container that owns `cowshed.store` and
+`cowshed.caches`; cowshed never derives that container from the project root because an adopted root is itself mounted
+from a workspace image, and an unadopted source may live on another filesystem. The project path is still validated
+lexically and supplies repository identity/copy input, not host-volume authority. On Linux, `statfs` of an existing ZFS
+project selects its containing dataset only if the pool has a suitable delegated cowshed root. A non-ZFS checkout whose
+workspace data should live on ZFS requires an explicit `.cowshed.toml` `[substrate] kind = "zfs"` and `pool = "<pool>"`;
+cowshed never scans pools or silently picks one. A configured pool must contain or permit creation of the exact
+hierarchy below. `cowshed doctor` prints the selected substrate, pool, and evidence.
 
 ## APFS image substrate (reference)
 
