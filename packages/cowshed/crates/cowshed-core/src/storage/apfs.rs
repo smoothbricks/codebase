@@ -1068,6 +1068,69 @@ where
         Ok(retired)
     }
 
+    /// Retire adopted main only after its exact pre-cowshed checkout has been restored.
+    ///
+    /// Ordinary lifecycle planning keeps main permanent. This narrow terminal path requires the
+    /// main image to be detached and still match the exact current lifecycle identity, then moves
+    /// its image, sidecar, and CA key to recoverable trash before publishing the retirement fence.
+    pub async fn execute_restored_main_retirement<F, Fut, E>(
+        &self,
+        workspace: &LifecycleWorkspace,
+        fence: F,
+    ) -> Result<RetiredRef, RetireExecutionError<E>>
+    where
+        F: FnOnce(RetiredRef) -> Fut + Send,
+        Fut: Future<Output = Result<(), E>> + Send,
+        E: Send,
+    {
+        if !workspace.name().is_main() {
+            return Err(
+                ApfsStorageError::InvalidPlan("restored-main retirement requires main").into(),
+            );
+        }
+        let workspace = workspace.clone();
+        let lock_paths = vec![workspace_lock_path(
+            &self.config,
+            workspace.repo(),
+            workspace.name(),
+            workspace.format(),
+        )?];
+        let retired = self
+            .dispatch_with_locks(lock_paths, true, move |host, config| {
+                let volume = volume_name(workspace.repo(), workspace.name());
+                if host
+                    .mounts(workspace.repo())?
+                    .iter()
+                    .any(|mount| mount.volume_name == volume)
+                {
+                    return Err(ApfsStorageError::InvalidPlan(
+                        "restored main image remains mounted",
+                    ));
+                }
+                if !host
+                    .list(workspace.repo())?
+                    .into_iter()
+                    .any(|fact| fact.workspace == workspace)
+                {
+                    return Err(ApfsStorageError::MarkerMismatch(
+                        "restored main image no longer matches its lifecycle identity".to_owned(),
+                    ));
+                }
+                let canonical = canonical_image_path(&config, &workspace)?;
+                let trash = retired_image_path(&config, &workspace)?;
+                host.retire_image(&canonical, &trash)?;
+                let revision = workspace.revision().get().checked_add(1).ok_or(
+                    ApfsStorageError::InvalidPlan("restored main retirement revision overflow"),
+                )?;
+                Ok(RetiredRef::new(workspace, Revision::new(revision)))
+            })
+            .await?;
+        if let Err(source) = fence(retired.clone()).await {
+            return Err(RetireExecutionError::Fence { source, retired });
+        }
+        Ok(retired)
+    }
+
     async fn execute<P: ImmutablePlan>(&self, plan: &P) -> Result<Applied, ApfsStorageError> {
         let backend = CheckedApfsBackend {
             host: Arc::clone(&self.host),

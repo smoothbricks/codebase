@@ -1313,6 +1313,116 @@ fn claim_port_block(staging: &Path, base: u16) -> std::io::Result<Option<PathBuf
 }
 
 #[cfg(target_os = "macos")]
+fn remove_terminal_storage_tree(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(CowshedError::environment_missing(
+                format!(
+                    "cannot inspect terminal project storage {}: {error}",
+                    path.display()
+                ),
+                "check controller storage permissions and retry",
+            ));
+        }
+    };
+    if metadata.file_type().is_dir() {
+        let entries = std::fs::read_dir(path).map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot enumerate terminal project storage {}: {error}",
+                    path.display()
+                ),
+                "check controller storage permissions and retry",
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot read terminal project storage {}: {error}",
+                        path.display()
+                    ),
+                    "check controller storage permissions and retry",
+                )
+            })?;
+            remove_terminal_storage_tree(&entry.path())?;
+        }
+        std::fs::remove_dir(path).map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot remove terminal project directory {}: {error}",
+                    path.display()
+                ),
+                "check controller storage permissions and retry",
+            )
+        })
+    } else if metadata.file_type().is_file()
+        && metadata.len() == 0
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".lock"))
+    {
+        std::fs::remove_file(path).map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot remove terminal project lock {}: {error}",
+                    path.display()
+                ),
+                "check controller storage permissions and retry",
+            )
+        })
+    } else {
+        Err(CowshedError::integrity(
+            format!(
+                "terminal project storage contains an unexpected retained artifact: {}",
+                path.display()
+            ),
+            "run cowshed doctor --json before removing the project binding",
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clean_terminal_project_storage(project_root: &Path, binding: &Path) -> Result<()> {
+    for name in [".staging", "checkpoints", "sessions"] {
+        remove_terminal_storage_tree(&project_root.join(name))?;
+    }
+    for entry in std::fs::read_dir(project_root).map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "cannot enumerate terminal project root {}: {error}",
+                project_root.display()
+            ),
+            "check controller storage permissions and retry",
+        )
+    })? {
+        let path = entry
+            .map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot read terminal project root {}: {error}",
+                        project_root.display()
+                    ),
+                    "check controller storage permissions and retry",
+                )
+            })?
+            .path();
+        if path != binding
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".lock"))
+        {
+            remove_terminal_storage_tree(&path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn verified_recovery_facts<'a>(
     facts: &'a [crate::storage::lifecycle::StorageFact],
     pending: &[crate::storage::apfs::PendingPublicationFact],
@@ -1349,20 +1459,6 @@ impl NativeProjectRuntimeHost {
                     "launch the controller with a canonical HOME",
                 )
             })?;
-        let binding_repo_id = if matches!(
-            &bootstrap_mode,
-            crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly
-        ) {
-            repo_id_from_workspace_marker(&git_root).await?
-        } else {
-            requested_repo_id.cloned()
-        };
-        let candidate = binding_from_git(&git, binding_repo_id.as_ref()).await?;
-        let repo_id = candidate
-            .primary()
-            .map_err(native_integrity_error)?
-            .repo_id
-            .clone();
         let bootstrap = crate::storage::bootstrap::native::bootstrap_system_storage(
             &git_root,
             &home,
@@ -1379,6 +1475,29 @@ impl NativeProjectRuntimeHost {
                 "remove the unsupported substrate override and retry",
             ));
         }
+        let existing_only = matches!(
+            &bootstrap_mode,
+            crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly
+        );
+        let mut binding_repo_id = if existing_only {
+            repo_id_from_workspace_marker(&git_root).await?
+        } else {
+            requested_repo_id.cloned()
+        };
+        if existing_only && binding_repo_id.is_none() {
+            let storage =
+                crate::storage::bootstrap::ValidatedHostStorage::new(bootstrap.roots().clone());
+            binding_repo_id = crate::gateway_inventory::NativeGatewayInventory::new(storage)
+                .repository_for_project_root(&git_root)
+                .await
+                .map_err(native_integrity_error)?;
+        }
+        let candidate = binding_from_git(&git, binding_repo_id.as_ref()).await?;
+        let repo_id = candidate
+            .primary()
+            .map_err(native_integrity_error)?
+            .repo_id
+            .clone();
         let layout = crate::storage::StorageLayout::new(bootstrap.roots().store(), &repo_id)
             .map_err(native_integrity_error)?;
         let binding = load_or_validate_binding(&layout, candidate, &git).await?;
@@ -1947,6 +2066,10 @@ impl NativeProjectRuntimeHost {
                     "restore the exact binding and retry",
                 ));
             }
+            let parent = path
+                .parent()
+                .ok_or_else(|| CowshedError::internal("repository binding has no parent"))?;
+            clean_terminal_project_storage(parent, &path)?;
             std::fs::remove_file(&path).map_err(|error| {
                 CowshedError::environment_missing(
                     format!(
@@ -1956,9 +2079,6 @@ impl NativeProjectRuntimeHost {
                     "check controller storage permissions and retry",
                 )
             })?;
-            let parent = path
-                .parent()
-                .ok_or_else(|| CowshedError::internal("repository binding has no parent"))?;
             std::fs::File::open(parent)
                 .and_then(|directory| directory.sync_all())
                 .map_err(|error| {
@@ -1969,7 +2089,18 @@ impl NativeProjectRuntimeHost {
                         ),
                         "check controller storage permissions and retry",
                     )
-                })
+                })?;
+            match std::fs::remove_dir(parent) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
+                Err(error) => Err(CowshedError::environment_missing(
+                    format!(
+                        "cannot remove terminal project directory {}: {error}",
+                        parent.display()
+                    ),
+                    "check controller storage permissions and retry",
+                )),
+            }
         })
         .await
         .map_err(|error| CowshedError::internal(format!("binding cleanup task failed: {error}")))?
@@ -2255,6 +2386,34 @@ impl NativeProjectRuntimeHost {
             // best-effort here: an interrupted task leaves trash for the next idempotent gc pass.
             let _ = substrate.reclaim(retired).await;
         }));
+        Ok(())
+    }
+
+    async fn retire_restored_main(&mut self, current: NativeWorkspace) -> Result<()> {
+        use crate::storage::lifecycle::Substrate;
+
+        let mut commitments = self.commitments.clone();
+        let repo_id = self.descriptor.repo_id.clone();
+        let retired = self
+            .substrate
+            .execute_restored_main_retirement(
+                &current.derived.workspace,
+                move |retired| async move {
+                    commitments
+                        .ensure_workspace_retired(
+                            repo_id,
+                            retired.workspace().incarnation().clone(),
+                        )
+                        .await
+                        .map(|_| ())
+                },
+            )
+            .await
+            .map_err(native_retire_error)?;
+        self.substrate
+            .reclaim(retired)
+            .await
+            .map_err(native_storage_error)?;
         Ok(())
     }
 
@@ -2826,7 +2985,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
 
         if options.restore {
             let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
-            if !options.force {
+            let initial_rollback_state = self.adopt_rollback_state(&current, &pre_cowshed).await?;
+            if !options.force && initial_rollback_state != NativeAdoptRollbackState::Complete {
                 self.verify_checkout_identity(&pre_cowshed, "retained pre-cowshed checkout")
                     .await?;
                 let initially_detached =
@@ -2848,7 +3008,6 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     return Err(error);
                 }
             }
-            self.adopt_rollback_state(&current, &pre_cowshed).await?;
             let incarnation = current.derived.workspace.incarnation().clone();
             self.stop_supervisor(&workspace).await?;
             let current = self.current(&workspace).await?;
@@ -2870,7 +3029,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     "retry adoption rollback before removing project state",
                 ));
             }
-            self.retire_workspace(current).await?;
+            self.retire_restored_main(current).await?;
             self.remove_project_binding_after_restore().await?;
             return Ok(());
         }
@@ -4874,6 +5033,60 @@ mod port_reservation_tests {
         let marker = root.join("port-40960.reservation");
         symlink(i32::MAX.to_string(), &marker).expect("stale marker");
         assert!(claim_port_block(&root, 40_960).expect("reclaim").is_some());
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod terminal_project_cleanup_tests {
+    use super::clean_terminal_project_storage;
+
+    fn root(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "cowshed-terminal-project-{label}-{}",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    #[test]
+    fn cleanup_removes_only_empty_structure_and_zero_length_locks() {
+        let root = root("safe");
+        let binding = root.join("repository.json");
+        std::fs::create_dir_all(root.join(".staging")).expect("staging");
+        std::fs::create_dir_all(root.join("checkpoints/main")).expect("checkpoints");
+        std::fs::create_dir_all(root.join("sessions/.trash")).expect("trash");
+        std::fs::write(root.join("sessions/raven.sparseimage.lock"), b"").expect("session lock");
+        std::fs::write(root.join("main.sparseimage.lock"), b"").expect("main lock");
+        std::fs::write(&binding, b"binding").expect("binding");
+        std::fs::write(root.join("policy.json"), b"preserve").expect("policy");
+
+        clean_terminal_project_storage(&root, &binding).expect("terminal cleanup");
+        assert!(binding.is_file());
+        assert_eq!(
+            std::fs::read(root.join("policy.json")).expect("policy"),
+            b"preserve"
+        );
+        assert!(!root.join(".staging").exists());
+        assert!(!root.join("checkpoints").exists());
+        assert!(!root.join("sessions").exists());
+        assert!(!root.join("main.sparseimage.lock").exists());
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn cleanup_preserves_and_rejects_an_unreclaimed_image() {
+        let root = root("blocked");
+        let binding = root.join("repository.json");
+        let image = root.join("sessions/.trash/main-retired.sparseimage");
+        std::fs::create_dir_all(image.parent().expect("trash")).expect("trash");
+        std::fs::write(&image, b"image").expect("retained image");
+        std::fs::write(&binding, b"binding").expect("binding");
+
+        let error = clean_terminal_project_storage(&root, &binding)
+            .expect_err("unreclaimed image must block binding cleanup");
+        assert_eq!(error.code.as_str(), "integrity");
+        assert_eq!(std::fs::read(&image).expect("image preserved"), b"image");
+        assert!(binding.is_file());
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 }

@@ -1607,6 +1607,39 @@ async fn staged_retire_fences_after_durable_undiscovery_and_preserves_trash_on_f
 }
 
 #[tokio::test]
+async fn restored_main_retirement_is_a_distinct_fenced_terminal_path() {
+    let host = FakeHost::default();
+    let main = workspace("main", ImageFormat::Sparse, 4);
+    host.seed(&main);
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let callback_host = host.clone();
+
+    let retired = substrate
+        .execute_restored_main_retirement(&main, move |retired| async move {
+            assert_eq!(retired.workspace().name().as_str(), "main");
+            assert!(
+                callback_host
+                    .events()
+                    .contains(&"atomic-retire-to-trash".to_owned()),
+                "main image must be durably undiscoverable before the lifecycle fence"
+            );
+            Ok::<(), &'static str>(())
+        })
+        .await
+        .expect("retire restored main");
+    assert_eq!(retired.resulting_revision(), Revision::new(5));
+    assert!(
+        !host.events().contains(&"idempotent-reclaim".to_owned()),
+        "reclamation remains a post-fence action"
+    );
+    substrate
+        .reclaim(retired)
+        .await
+        .expect("reclaim main trash");
+    assert!(host.events().contains(&"idempotent-reclaim".to_owned()));
+}
+
+#[tokio::test]
 async fn retire_reclaim_stats_and_gc_cross_only_the_blocking_lane() {
     let host = FakeHost::default();
     let current = workspace("raven", ImageFormat::Asif, 4);
