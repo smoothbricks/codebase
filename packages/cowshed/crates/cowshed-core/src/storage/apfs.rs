@@ -2248,17 +2248,51 @@ fn commit_prepared_restore<H: ApfsExecutionHost>(
             return combine_cleanup("restore metadata publication", primary, cleanup);
         }
     };
-    if fact.workspace != stage.workspace
-        || fact.image != canonical_image
-        || fact.mount_point != canonical_mount
-        || fact.source_checkpoint != source_checkpoint
-        || fact.replaced_incarnation != *current.incarnation()
-        || fact.destination_incarnation != *stage.workspace.incarnation()
-        || fact.source_incarnation == *stage.workspace.incarnation()
-    {
-        return Err(ApfsStorageError::MarkerMismatch(
-            "restored publication fact disagrees with prepared restore".to_owned(),
-        ));
+    if fact.workspace != stage.workspace {
+        return Err(ApfsStorageError::MarkerMismatch(format!(
+            "restored publication workspace mismatch: expected={:?}, actual={:?}",
+            stage.workspace, fact.workspace
+        )));
+    }
+    if fact.image != canonical_image {
+        return Err(ApfsStorageError::MarkerMismatch(format!(
+            "restored publication image mismatch: expected={}, actual={}",
+            canonical_image.display(),
+            fact.image.display()
+        )));
+    }
+    if fact.mount_point != canonical_mount {
+        return Err(ApfsStorageError::MarkerMismatch(format!(
+            "restored publication mount point mismatch: expected={}, actual={}",
+            canonical_mount.display(),
+            fact.mount_point.display()
+        )));
+    }
+    if fact.source_checkpoint != source_checkpoint {
+        return Err(ApfsStorageError::MarkerMismatch(format!(
+            "restored publication source checkpoint mismatch: expected={source_checkpoint}, actual={}",
+            fact.source_checkpoint
+        )));
+    }
+    if fact.replaced_incarnation != *current.incarnation() {
+        return Err(ApfsStorageError::MarkerMismatch(format!(
+            "restored publication replaced incarnation mismatch: expected={}, actual={}",
+            current.incarnation(),
+            fact.replaced_incarnation
+        )));
+    }
+    if fact.destination_incarnation != *stage.workspace.incarnation() {
+        return Err(ApfsStorageError::MarkerMismatch(format!(
+            "restored publication destination incarnation mismatch: expected={}, actual={}",
+            stage.workspace.incarnation(),
+            fact.destination_incarnation
+        )));
+    }
+    if fact.source_incarnation == *stage.workspace.incarnation() {
+        return Err(ApfsStorageError::MarkerMismatch(format!(
+            "restored publication source incarnation equals destination: {}",
+            fact.source_incarnation
+        )));
     }
     Ok(CommittedRestore::Pending(Box::new(PendingRestore {
         receipt: RestoreReceipt {

@@ -2332,6 +2332,66 @@ fn recovery_restores_missing_prepublication_canonical_metadata() {
 }
 
 #[test]
+fn restored_publication_preserves_authoritative_workspace_topology() {
+    let fixture = Fixture::new("authoritative-restored-publication");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    let destination =
+        WorkspaceIncarnation::new("00000000000000000000000000000002").expect("destination");
+    let staged = layout
+        .project()
+        .project_root
+        .join(format!(".staging/main-{destination}.sparseimage"));
+    let undo = layout
+        .project()
+        .checkpoints
+        .join(format!("main/pre-restore-{destination}.sparseimage"));
+    let source = layout
+        .project()
+        .checkpoints
+        .join("main/baseline.sparseimage");
+    create_image(canonical.image(), ImageFormat::Sparse);
+    create_image(&source, ImageFormat::Sparse);
+    create_image(&staged, ImageFormat::Sparse);
+    let mut staged_metadata = metadata(ImageFormat::Sparse);
+    staged_metadata.workspace_incarnation = destination.clone();
+    staged_metadata
+        .write_for_image(&staged)
+        .expect("destination metadata");
+    let authoritative = LifecycleWorkspace::new(
+        repo(),
+        WorkspaceName::new("main").expect("main"),
+        destination.clone(),
+        Revision::new(2),
+        Revision::new(47),
+        WorkspaceRole::Main,
+        ImageFormat::Sparse,
+    )
+    .expect("authoritative replacement");
+    let replaced = metadata(ImageFormat::Sparse).workspace_incarnation;
+    let host = native_host(&fixture, RecordingRunner::default());
+    host.restore_swap(&staged, canonical.image(), &undo)
+        .expect("restore swap");
+
+    let fact = host
+        .publish_restored_metadata(
+            &staged,
+            canonical.image(),
+            &authoritative,
+            authoritative.revision(),
+            &source,
+            &replaced,
+        )
+        .expect("publish restored metadata");
+
+    assert_eq!(fact.workspace, authoritative);
+    assert_eq!(fact.source_checkpoint, "baseline");
+    assert_eq!(fact.source_incarnation, replaced);
+    assert_eq!(fact.replaced_incarnation, replaced);
+    assert_eq!(fact.destination_incarnation, destination);
+}
+
+#[test]
 fn stateless_restore_recovery_converges_each_publication_boundary() {
     for failpoint in [
         RestoreFailpoint::AfterUndoSidecar,

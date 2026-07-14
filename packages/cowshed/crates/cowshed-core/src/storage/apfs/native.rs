@@ -2649,8 +2649,20 @@ where
         self.trip_restore_failpoint(RestoreFailpoint::AfterRestoreMetadataParentFsync)?;
         let metadata = DetachedWorkspaceMetadata::read_for_image(canonical)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        if metadata.repo_id != *workspace.repo()
+            || metadata.workspace != *workspace.name()
+            || metadata.workspace_incarnation != *workspace.incarnation()
+            || metadata.image_format != workspace.format()
+            || metadata.grants.revision != revision.get()
+            || metadata.publication_state != PublicationState::PendingFence
+        {
+            return Err(ApfsStorageError::MarkerMismatch(format!(
+                "published restore metadata disagrees with authoritative workspace: {}",
+                canonical.display()
+            )));
+        }
         Ok(PendingPublicationFact {
-            workspace: metadata_workspace_ref(&metadata)?,
+            workspace: workspace.clone(),
             image: canonical.to_owned(),
             mount_point: self.expected_mount_point(&metadata)?,
             source_checkpoint: recovery_fact.source_checkpoint.to_string(),
