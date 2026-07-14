@@ -303,6 +303,7 @@ pub struct AuditEvent {
     pub sequence: u64,
     pub timestamp_unix_ms: u64,
     pub workspace_id: String,
+    pub repo_id: String,
     pub revision: u64,
     pub endpoint: String,
     pub kind: AuditKind,
@@ -313,6 +314,10 @@ pub struct AuditEvent {
     pub http_status: Option<u16>,
     pub bytes: u64,
     pub trace_id: Option<String>,
+    pub span_id: u64,
+    pub upstream_span_id: Option<u64>,
+    pub parent_span_id: Option<u64>,
+    pub tracestate: Option<String>,
     pub grant_hint: Option<String>,
     pub classification: Option<String>,
     pub mirror_cache_status: Option<MirrorCacheStatus>,
@@ -328,6 +333,9 @@ pub enum AuditKind {
     Npm,
     Cargo,
     Go,
+    Sim,
+    RepoMirror,
+    AuditTail,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
