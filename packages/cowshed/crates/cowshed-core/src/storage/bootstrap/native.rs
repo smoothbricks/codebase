@@ -14,6 +14,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 
+use crate::error::CowshedError;
 use plist::{Dictionary, Value};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -34,8 +35,9 @@ use super::{
     APFS_CACHES_VOLUME, APFS_STORE_VOLUME, ApfsProvisionKind, ApfsVolumeProvision, BlockingLane,
     BootstrapEvidence, BootstrapExecutionError, BootstrapHost, BootstrapPlan, DISKUTIL,
     ExistingStorage, HostCommand, HostCommandOutput, HostError, HostOperation, MountpointState,
-    PlanError, SelectionError, StatFsEvidence, SubstrateKind, TokioBlockingLane, VolumeMarker,
-    VolumeRole, execute_bootstrap, plan_bootstrap, require_mounted_marker, select_substrate,
+    PlanError, SelectionError, StatFsEvidence, SubstrateKind, TokioBlockingLane,
+    ValidatedHostStorage, VolumeMarker, VolumeRole, execute_bootstrap, plan_bootstrap,
+    require_mounted_marker, select_substrate,
 };
 
 #[cfg(unix)]
@@ -155,6 +157,66 @@ pub async fn bootstrap_system_storage(
         .map_err(|_| NativeBootstrapError::EvidenceLaneClosed)??;
     execute_native_bootstrap_plan(&plan, mode, host, &lane).await?;
     Ok(plan)
+}
+/// Validate the invoking user's pre-existing, machine-global host storage.
+///
+/// The home directory is the sole filesystem-selection anchor. This boundary gathers the same
+/// exact APFS inventory, ownership, mount-flag, and marker evidence as bootstrap, then executes
+/// only the planner's read-only mount guards. Any required setup is rejected before a mutating
+/// host operation or authorization request can be dispatched.
+pub async fn validate_existing_host_storage(home: &Path) -> crate::Result<ValidatedHostStorage> {
+    if !cfg!(target_os = "macos") {
+        return Err(existing_host_storage_error(
+            NativeBootstrapError::UnsupportedPlatform(std::env::consts::OS),
+        ));
+    }
+
+    let host = Arc::new(SystemBootstrapHost);
+    let lane = TokioBlockingLane;
+    let home = home.to_owned();
+    let gather_home = home.clone();
+    let gather_host = Arc::clone(&host);
+    let (sender, receiver) = oneshot::channel();
+    lane.dispatch(Box::new(move || {
+        let mut source = SystemEvidenceSource {
+            host: gather_host.as_ref(),
+        };
+        let result = plan_existing_host_storage(&mut source, &gather_home);
+        sender.send(result).map_err(|_| {
+            BootstrapExecutionError::BlockingLane(
+                "existing host-storage evidence receiver closed".to_owned(),
+            )
+        })
+    }))
+    .await
+    .map_err(NativeBootstrapError::Execution)
+    .map_err(existing_host_storage_error)?;
+
+    let plan = receiver
+        .await
+        .map_err(|_| NativeBootstrapError::EvidenceLaneClosed)
+        .and_then(|result| result)
+        .map_err(existing_host_storage_error)?;
+    validate_existing_plan(&plan, host, &lane).await
+}
+
+async fn validate_existing_plan<H, L>(
+    plan: &BootstrapPlan,
+    host: Arc<H>,
+    lane: &L,
+) -> crate::Result<ValidatedHostStorage>
+where
+    H: BootstrapHost + 'static,
+    L: BlockingLane,
+{
+    execute_native_bootstrap_plan(plan, NativeBootstrapMode::ExistingOnly, host, lane)
+        .await
+        .map_err(existing_host_storage_error)?;
+    Ok(ValidatedHostStorage::new(plan.roots().clone()))
+}
+
+fn existing_host_storage_error(error: NativeBootstrapError) -> CowshedError {
+    CowshedError::environment_missing(error.to_string(), "next: cowshed adopt")
 }
 
 /// Apply a previously planned native bootstrap with an explicit provisioning capability.
@@ -372,12 +434,28 @@ fn plan_native_bootstrap(
     plan_bootstrap(selected, home, gathered.bootstrap).map_err(Into::into)
 }
 
+fn plan_existing_host_storage(
+    source: &mut impl EvidenceSource,
+    home: &Path,
+) -> Result<BootstrapPlan, NativeBootstrapError> {
+    let gathered = gather_existing_apfs_evidence(source, home)?;
+    let selected = select_substrate(gathered.statfs, None)?;
+    plan_bootstrap(selected, home, gathered.bootstrap).map_err(Into::into)
+}
+
 fn gather_apfs_evidence(
     source: &mut impl EvidenceSource,
     project_root: &Path,
     home: &Path,
 ) -> Result<GatheredEvidence, NativeBootstrapError> {
     require_canonical(project_root)?;
+    gather_existing_apfs_evidence(source, home)
+}
+
+fn gather_existing_apfs_evidence(
+    source: &mut impl EvidenceSource,
+    home: &Path,
+) -> Result<GatheredEvidence, NativeBootstrapError> {
     require_canonical(home)?;
     let snapshot = source.statfs(home)?;
     if snapshot.fs_type != "apfs" {
@@ -1621,6 +1699,7 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
     #[cfg(target_os = "macos")]
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::storage::bootstrap::VolumeMarker;
@@ -1754,6 +1833,117 @@ mod tests {
             ]),
             invoking_identity: (501, 20),
             commands: Vec::new(),
+        }
+    }
+
+    fn healthy_existing_source() -> FakeEvidenceSource {
+        let volumes = volume("Data", "disk3s5", Some("/System/Volumes/Data"))
+            + &volume(APFS_STORE_VOLUME, "disk3s8", Some("/Users/alice/.cowshed"))
+            + &volume(
+                APFS_CACHES_VOLUME,
+                "disk3s9",
+                Some("/Users/alice/.cowshed/caches"),
+            );
+        let mut source = source(plist(&container("disk3", &volumes)));
+        source.mountpoints.insert(
+            PathBuf::from("/Users/alice/.cowshed"),
+            MountpointState::Mounted {
+                marker: Some(
+                    VolumeMarker::new(VolumeRole::Store, SubstrateKind::Apfs)
+                        .to_json()
+                        .expect("store marker"),
+                ),
+            },
+        );
+        source.mountpoints.insert(
+            PathBuf::from("/Users/alice/.cowshed/caches"),
+            MountpointState::Mounted {
+                marker: Some(
+                    VolumeMarker::new(VolumeRole::Caches, SubstrateKind::Apfs)
+                        .to_json()
+                        .expect("caches marker"),
+                ),
+            },
+        );
+        source
+    }
+
+    #[derive(Default)]
+    struct ReadOnlyValidationHost {
+        inspections: AtomicUsize,
+        mutation_calls: AtomicUsize,
+        authorization_calls: AtomicUsize,
+    }
+
+    impl BootstrapHost for ReadOnlyValidationHost {
+        fn verify_zfs_delegation(
+            &self,
+            _pool: &str,
+            _required_root: &str,
+        ) -> Result<(), HostError> {
+            Err(HostError::new("unexpected ZFS validation"))
+        }
+
+        fn inspect_mountpoint(&self, path: &Path) -> Result<MountpointState, HostError> {
+            self.inspections.fetch_add(1, Ordering::SeqCst);
+            let role = if path == Path::new("/Users/alice/.cowshed") {
+                VolumeRole::Store
+            } else if path == Path::new("/Users/alice/.cowshed/caches") {
+                VolumeRole::Caches
+            } else {
+                return Err(HostError::new(format!(
+                    "unexpected mountpoint inspection: {}",
+                    path.display()
+                )));
+            };
+            Ok(MountpointState::Mounted {
+                marker: Some(
+                    VolumeMarker::new(role, SubstrateKind::Apfs)
+                        .to_json()
+                        .expect("validation marker"),
+                ),
+            })
+        }
+
+        fn create_dir_all(&self, _path: &Path) -> Result<(), HostError> {
+            self.mutation_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn run_command(&self, _command: &HostCommand) -> Result<HostCommandOutput, HostError> {
+            self.mutation_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(HostCommandOutput::default())
+        }
+
+        fn provision_apfs_volumes(
+            &self,
+            _container: &str,
+            _volumes: &[ApfsVolumeProvision],
+        ) -> Result<(), HostError> {
+            self.mutation_calls.fetch_add(1, Ordering::SeqCst);
+            self.authorization_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn write_file_atomic(&self, _path: &Path, _contents: &[u8]) -> Result<(), HostError> {
+            self.mutation_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct ValidationLane {
+        dispatches: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl BlockingLane for ValidationLane {
+        async fn dispatch(
+            &self,
+            job: super::super::BlockingJob,
+        ) -> Result<(), BootstrapExecutionError> {
+            self.dispatches.fetch_add(1, Ordering::SeqCst);
+            job()
         }
     }
 
@@ -2821,6 +3011,161 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, ProvisionEvent::Marker(_, _)))
         );
+    }
+
+    #[tokio::test]
+    async fn existing_host_storage_returns_roots_and_queries_only_home_without_mutation() {
+        let mut source = healthy_existing_source();
+        let plan = plan_existing_host_storage(&mut source, Path::new("/Users/alice"))
+            .expect("healthy plan");
+
+        assert_eq!(source.statfs_paths, [PathBuf::from("/Users/alice")]);
+        assert_eq!(source.commands.len(), 1);
+        assert_eq!(source.commands[0].program(), DISKUTIL);
+        assert_eq!(source.commands[0].args(), ["apfs", "list", "-plist"]);
+        assert!(
+            plan.operations()
+                .iter()
+                .all(|operation| matches!(operation, HostOperation::GuardMountpoint { .. }))
+        );
+
+        let host = Arc::new(ReadOnlyValidationHost::default());
+        let lane = ValidationLane::default();
+        let validated = validate_existing_plan(&plan, Arc::clone(&host), &lane)
+            .await
+            .expect("existing storage validates");
+
+        assert_eq!(validated.home(), Path::new("/Users/alice"));
+        assert_eq!(validated.store(), Path::new("/Users/alice/.cowshed"));
+        assert_eq!(
+            validated.caches(),
+            Path::new("/Users/alice/.cowshed/caches")
+        );
+        assert_eq!(
+            validated.telemetry(),
+            Path::new("/Users/alice/.cowshed/telemetry")
+        );
+        assert_eq!(host.inspections.load(Ordering::SeqCst), 2);
+        assert_eq!(host.mutation_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(host.authorization_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(lane.dispatches.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn missing_marker_is_setup_required_before_executor_dispatch() {
+        let mut source = healthy_existing_source();
+        source.mountpoints.insert(
+            PathBuf::from("/Users/alice/.cowshed"),
+            MountpointState::Mounted { marker: None },
+        );
+        source.mountpoints.insert(
+            PathBuf::from("/Users/alice/.cowshed/caches"),
+            MountpointState::Mounted { marker: None },
+        );
+        let plan = plan_existing_host_storage(&mut source, Path::new("/Users/alice"))
+            .expect("missing marker produces a repair plan");
+        assert!(
+            plan.operations()
+                .iter()
+                .any(|operation| matches!(operation, HostOperation::ProvisionApfsVolumes { .. }))
+        );
+
+        let host = Arc::new(ReadOnlyValidationHost::default());
+        let lane = ValidationLane::default();
+        let error = validate_existing_plan(&plan, Arc::clone(&host), &lane)
+            .await
+            .expect_err("existing-only validation must reject marker repair");
+
+        assert_eq!(error.code, crate::error::ErrorCode::EnvironmentMissing);
+        assert_eq!(error.hint, "next: cowshed adopt");
+        assert!(error.message.contains("storage setup is required"));
+        assert_eq!(lane.dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(host.inspections.load(Ordering::SeqCst), 0);
+        assert_eq!(host.mutation_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(host.authorization_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn wrong_marker_is_an_operational_adopt_error() {
+        let mut source = healthy_existing_source();
+        source.mountpoints.insert(
+            PathBuf::from("/Users/alice/.cowshed/caches"),
+            MountpointState::Mounted {
+                marker: Some(
+                    VolumeMarker::new(VolumeRole::Store, SubstrateKind::Apfs)
+                        .to_json()
+                        .expect("wrong marker"),
+                ),
+            },
+        );
+
+        let native = plan_existing_host_storage(&mut source, Path::new("/Users/alice"))
+            .expect_err("wrong role must fail closed");
+        assert!(matches!(
+            native,
+            NativeBootstrapError::InvalidMountedMarker { .. }
+        ));
+        let error = existing_host_storage_error(native);
+        assert_eq!(error.code, crate::error::ErrorCode::EnvironmentMissing);
+        assert_eq!(error.hint, "next: cowshed adopt");
+    }
+
+    #[tokio::test]
+    async fn wrong_owner_and_flags_require_setup_without_mutating_dispatch() {
+        for unsafe_evidence in ["owner", "flags"] {
+            let mut source = healthy_existing_source();
+            for path in [
+                Path::new("/Users/alice/.cowshed"),
+                Path::new("/Users/alice/.cowshed/caches"),
+            ] {
+                let mounted = source
+                    .mounted_volumes
+                    .get_mut(path)
+                    .expect("mounted volume evidence");
+                match unsafe_evidence {
+                    "owner" => mounted.uid = 0,
+                    "flags" => mounted.nobrowse = false,
+                    _ => unreachable!(),
+                }
+            }
+
+            let plan = plan_existing_host_storage(&mut source, Path::new("/Users/alice"))
+                .expect("unsafe evidence produces a repair plan");
+            let host = Arc::new(ReadOnlyValidationHost::default());
+            let lane = ValidationLane::default();
+            let error = validate_existing_plan(&plan, Arc::clone(&host), &lane)
+                .await
+                .expect_err("existing-only validation rejects unsafe roots");
+
+            assert_eq!(error.code, crate::error::ErrorCode::EnvironmentMissing);
+            assert_eq!(error.hint, "next: cowshed adopt");
+            assert_eq!(lane.dispatches.load(Ordering::SeqCst), 0);
+            assert_eq!(host.mutation_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(host.authorization_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_storage_setup_plan_is_rejected_without_authorization() {
+        let inventory = plist(&container(
+            "disk3",
+            &volume("Data", "disk3s5", Some("/System/Volumes/Data")),
+        ));
+        let mut source = source(inventory);
+        let plan = plan_existing_host_storage(&mut source, Path::new("/Users/alice"))
+            .expect("absence produces a setup plan");
+        let host = Arc::new(ReadOnlyValidationHost::default());
+        let lane = ValidationLane::default();
+
+        let error = validate_existing_plan(&plan, Arc::clone(&host), &lane)
+            .await
+            .expect_err("existing-only validation rejects provisioning");
+
+        assert_eq!(error.code, crate::error::ErrorCode::EnvironmentMissing);
+        assert_eq!(error.hint, "next: cowshed adopt");
+        assert_eq!(lane.dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(host.mutation_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(host.authorization_calls.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(target_os = "macos")]
