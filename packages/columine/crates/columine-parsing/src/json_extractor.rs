@@ -493,15 +493,34 @@ pub(crate) fn extract_typed_value(
                 ));
             }
         },
-        ArrowType::Int32 | ArrowType::Int64 => match token {
-            Token::Number(value) => Some(ColumnValue::Int64(
-                value
-                    .parse::<i64>()
-                    .or_else(|_| value.parse::<f64>().map(|v| v as i64))
-                    .map_err(|_| {
-                        invalid_number(diagnostic, column as u32, arrow_type, actual, row)
-                    })?,
-            )),
+        // json_extractor.zig (typed event schemas): Int32 is STRICT — integer
+        // JSON numbers only (no float truncation, no strings); Int64 keeps
+        // bigint-as-string + ISO timestamps because JSON cannot represent the
+        // full range losslessly, but a decimal NUMBER is invalid_number for
+        // both (the old float-truncation lane is gone).
+        ArrowType::Int32 => match token {
+            Token::Number(value) => Some(ColumnValue::Int64(i64::from(
+                value.parse::<i32>().map_err(|_| {
+                    invalid_number(diagnostic, column as u32, arrow_type, actual, row)
+                })?,
+            ))),
+            Token::Null => None,
+            _ => {
+                return Err(invalid_field_type(
+                    diagnostic,
+                    column as u32,
+                    arrow_type,
+                    actual,
+                    row,
+                ));
+            }
+        },
+        ArrowType::Int64 => match token {
+            Token::Number(value) => {
+                Some(ColumnValue::Int64(value.parse::<i64>().map_err(|_| {
+                    invalid_number(diagnostic, column as u32, arrow_type, actual, row)
+                })?))
+            }
             Token::String(value) => Some(ColumnValue::Int64(
                 value
                     .parse()
@@ -1006,6 +1025,34 @@ mod tests {
         .unwrap();
         c.end_row();
         c
+    }
+    fn try_one_value(json: &[u8], kind: ArrowType) -> Result<(), ExtractionError> {
+        let mut c = DynamicColumns::new(&[field(kind)], 1);
+        c.begin_row();
+        let mut p = JsonParser::new(json);
+        extract_typed_value(
+            &mut p,
+            kind,
+            &mut c,
+            0,
+            &mut ExtractionDiagnostic::default(),
+        )
+        .map(|_| ())
+    }
+    /// f33e06007 (execute full typed event schemas): Int32 is STRICT —
+    /// integer JSON numbers only; Int64 rejects decimal-number truncation
+    /// but keeps bigint-as-string + ISO timestamps.
+    #[test]
+    fn int32_rejects_strings_and_decimals() {
+        assert!(try_one_value(br#""1""#, ArrowType::Int32).is_err());
+        assert!(try_one_value(b"1.5", ArrowType::Int32).is_err());
+        assert!(try_one_value(b"7", ArrowType::Int32).is_ok());
+    }
+    #[test]
+    fn int64_rejects_decimal_numbers_but_keeps_strings() {
+        assert!(try_one_value(b"1.5", ArrowType::Int64).is_err());
+        assert!(try_one_value(br#""9007199254740993""#, ArrowType::Int64).is_ok());
+        assert!(try_one_value(b"42", ArrowType::Int64).is_ok());
     }
     #[test]
     fn extract_typed_value_string() {

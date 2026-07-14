@@ -9,6 +9,8 @@
  *   - Input columns copied into WASM memory for each batch
  *
  * Why a separate loader?
+ *   When columine is used standalone (without axe-runtime), it loads its own
+ *   smaller reducer-only WASM binary. When used via axe-runtime, the superset
  *   binary is injected via setBackend() and this loader is never called.
  */
 
@@ -600,6 +602,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
  * Load columine's reducer-only WASM backend.
  *
  * Searches for columine.wasm in default locations relative to this module.
+ * For standalone columine usage (without axe-runtime).
  *
  * @param wasmPath - Optional explicit path to columine.wasm
  * @param memoryPages - WASM memory size in 64KB pages (default: 256 = 16MB)
