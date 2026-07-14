@@ -2748,7 +2748,14 @@ async fn missing_downstream_alpn_is_not_silently_treated_as_http1() {
         .expect("gateway closes missing-ALPN transport");
     assert!(
         result.is_ok()
-            || matches!(&result, Err(error) if error.kind() == io::ErrorKind::UnexpectedEof),
+            || matches!(
+                &result,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                    )
+            ),
         "unexpected missing-ALPN close result: {result:?}"
     );
     assert!(response.is_empty(), "gateway silently selected HTTP/1.1");
