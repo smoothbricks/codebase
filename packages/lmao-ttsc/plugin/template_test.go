@@ -515,8 +515,8 @@ defineOp('order', (ctx) => {
 		previous = position
 	}
 	for _, lane := range []string{"jobId_values", "elapsedMs_values", "attempt_values"} {
-		if strings.Count(output, lane) != 1 {
-			t.Fatalf("fixed field lane %s writes = %d, want one\n%s", lane, strings.Count(output, lane), output)
+		if strings.Count(output, "$$b."+lane+"[$$i]") != 1 {
+			t.Fatalf("fixed field lane %s writes = %d, want one\n%s", lane, strings.Count(output, "$$b."+lane+"[$$i]"), output)
 		}
 	}
 	if strings.Contains(output, "jobId:") || strings.Contains(output, "elapsedMs:") || strings.Contains(output, "attempt:") {
@@ -582,7 +582,7 @@ defineOp('literal-enum', (ctx) => {
 		if !encodedWrite.MatchString(output) {
 			t.Fatalf("literal enum %s did not use its buffer positional method and plan-bound encoder\n%s", field, output)
 		}
-		if regexp.MustCompile(regexp.QuoteMeta(field) + `_values\[[^]]+\]\s*=`).MatchString(output) {
+		if regexp.MustCompile(`\$\$b\.` + regexp.QuoteMeta(field) + `_values\[[^]]+\]\s*=`).MatchString(output) {
 			t.Fatalf("literal enum %s was written directly to its Uint8 ordinal lane\n%s", field, output)
 		}
 	}

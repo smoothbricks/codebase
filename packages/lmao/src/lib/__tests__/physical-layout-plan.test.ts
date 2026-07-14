@@ -144,14 +144,21 @@ describe('PhysicalLayoutPlan', () => {
     const originalDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'Function');
     if (!originalDescriptor) throw new Error('Expected global Function descriptor');
     const originalFunction = globalThis.Function;
-    let functionCalls = 0;
+    const functionSources: string[] = [];
+    const recordFunctionSource = (argumentList: unknown[]): void => {
+      functionSources.push(String(argumentList.at(-1)));
+    };
+    const spanBufferCompilerCalls = (): number =>
+      functionSources.filter(
+        (source) => source.includes('getOrCreateOverflow()') && source.includes('this._statsReservedRows'),
+      ).length;
     const functionProbe = new Proxy(originalFunction, {
       apply(target, thisArgument, argumentList) {
-        functionCalls++;
+        recordFunctionSource(argumentList);
         return Reflect.apply(target, thisArgument, argumentList);
       },
       construct(target, argumentList, newTarget) {
-        functionCalls++;
+        recordFunctionSource(argumentList);
         return Reflect.construct(target, argumentList, newTarget);
       },
     });
@@ -161,7 +168,7 @@ describe('PhysicalLayoutPlan', () => {
         runtimeHint: matchingHint,
       });
       expect(matching.callsitePlan.SpanBufferClass).toBe(incomingClass);
-      expect(functionCalls).toBe(0);
+      expect(spanBufferCompilerCalls()).toBe(0);
 
       const mismatched = opContext.defineOp('mismatched-layout', (ctx) => ctx.ok('generated'), undefined, {
         runtimeHint: mismatchedHint,
@@ -169,13 +176,13 @@ describe('PhysicalLayoutPlan', () => {
       const selectedClass = mismatched.callsitePlan.SpanBufferClass;
       expect(selectedClass).not.toBe(incomingClass);
       expect(selectedClass.messageLayoutFamily).toBe('static-only');
-      expect(functionCalls).toBe(1);
+      expect(spanBufferCompilerCalls()).toBe(1);
 
       const reused = opContext.defineOp('reused-layout', (ctx) => ctx.ok('reused'), undefined, {
         runtimeHint: mismatchedHint,
       });
       expect(reused.callsitePlan.SpanBufferClass).toBe(selectedClass);
-      expect(functionCalls).toBe(1);
+      expect(spanBufferCompilerCalls()).toBe(1);
     } finally {
       Object.defineProperty(globalThis, 'Function', originalDescriptor);
     }

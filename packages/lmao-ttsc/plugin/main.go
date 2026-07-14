@@ -206,6 +206,9 @@ func lmaoPluginTransform(prog *driver.Program, options compilerOptions) (driver.
 		binding, registration := vocabularyRegistrationStatements(ec, collected.registrationEntries)
 		t.vocabularyBinding = binding
 		t.applyHintRewrites(collected.hintRewrites)
+		if t.spanBufferAotUsed {
+			registration = append(spanBufferAotRuntimeStatements(), registration...)
+		}
 		t.applyTagInlines(collected.tagInlines)
 		t.applyLogInlines(collected.logInlines)
 		t.applyResultInlines(collected.resultInlines)
@@ -370,6 +373,7 @@ type fileTransformer struct {
 	vocabularyOrdinals map[globalVocabularyID]int
 	vocabularySize     int
 	vocabularyBinding  *shimast.Node
+	spanBufferAotUsed  bool
 	checker            *shimchecker.Checker
 }
 

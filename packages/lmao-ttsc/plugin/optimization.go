@@ -45,8 +45,8 @@ type opCompileAnalysis struct {
 	runtimeHint            uint32
 	eagerColumns           []string
 	localMessageDictionary []globalVocabularyID
+	spanBufferFields       []namedSchemaField
 }
-
 type hintRewrite struct {
 	call    *shimast.CallExpression
 	hints   map[string]opCompileAnalysis
@@ -654,6 +654,54 @@ func (t *fileTransformer) tagCapabilityFullyInlined(fn *shimast.Node) bool {
 	return true
 }
 
+var systemSpanBufferFields = []namedSchemaField{
+	{name: "message", field: schemaField{kind: fieldDirect, storage: storageArray, eager: true}},
+	{name: "line", field: schemaField{kind: fieldDirect, storage: storageNumber}},
+	{name: "error_code", field: schemaField{kind: fieldDirect, storage: storageArray}},
+	{name: "retry_attempt", field: schemaField{kind: fieldDirect, storage: storageNumber}},
+	{name: "retry_delay_ms", field: schemaField{kind: fieldDirect, storage: storageNumber}},
+	{name: "exception_stack", field: schemaField{kind: fieldDirect, storage: storageArray}},
+	{name: "ff_value", field: schemaField{kind: fieldDirect, storage: storageArray}},
+	{name: "uint64_value", field: schemaField{kind: fieldDirect, storage: storageBigUint64}},
+}
+
+func (t *fileTransformer) spanBufferFields(fn *shimast.Node) []namedSchemaField {
+	if t.checker == nil {
+		return nil
+	}
+	params, _, _, ok := functionParts(fn)
+	if !ok || params == nil || len(params.Nodes) == 0 {
+		return nil
+	}
+	contextType := t.checker.GetTypeAtLocation(params.Nodes[0])
+	if contextType == nil {
+		return nil
+	}
+	tagType := shimchecker.Checker_getTypeOfPropertyOfType(t.checker, contextType, "tag")
+	if tagType == nil {
+		return nil
+	}
+	userFields, complete := extractOrderedSchema(t.checker, tagType)
+	if !complete {
+		return nil
+	}
+	fields := make([]namedSchemaField, 0, len(systemSpanBufferFields)+len(userFields))
+	fields = append(fields, systemSpanBufferFields...)
+	for _, userField := range userFields {
+		isSystem := false
+		for _, systemField := range systemSpanBufferFields {
+			if userField.name == systemField.name {
+				isSystem = true
+				break
+			}
+		}
+		if !isSystem {
+			fields = append(fields, userField)
+		}
+	}
+	return fields
+}
+
 // analyzeOpCompileMetadata derives runtime execution hints and conservative
 // definitely-written user columns. Static log vocabulary remains whole-program
 // metadata collected independently of Op nesting.
@@ -670,6 +718,7 @@ func (t *fileTransformer) analyzeOpCompileMetadata(fn *shimast.Node) opCompileAn
 	analysis := opCompileAnalysis{runtimeHint: runtimeHint, localMessageDictionary: localMessageDictionary}
 	if runtimeHint&runtimeHintAnalyzed != 0 {
 		analysis.eagerColumns = t.analyzeEagerColumns(fn)
+		analysis.spanBufferFields = t.spanBufferFields(fn)
 		if runtimeHint&runtimeHintTag != 0 && t.tagCapabilityFullyInlined(fn) {
 			analysis.runtimeHint &^= runtimeHintTag
 		}
@@ -787,7 +836,6 @@ func isNamedLmaoType(chk *shimchecker.Checker, node *shimast.Node, name string) 
 	}
 	return false
 }
-
 func hasLmaoCallProvenance(chk *shimchecker.Checker, call *shimast.CallExpression) bool {
 	signature := chk.GetResolvedSignature(call.AsNode())
 	return signature != nil && isLmaoDeclarationNode(signature.Declaration())
@@ -813,13 +861,20 @@ func (t *fileTransformer) collectOptimizations(root *shimast.Node, emitHints boo
 			switch name {
 			case "defineOp":
 				if emitHints && provenLmaoCall && len(call.Arguments.Nodes) >= 2 && len(call.Arguments.Nodes) < 4 && isNamedType(t.checker, call.AsNode(), "Op") {
-					hints = append(hints, hintRewrite{call: call, single: t.analyzeOpCompileMetadata(call.Arguments.Nodes[1])})
+					hints = append(hints, hintRewrite{
+						call:   call,
+						single: t.analyzeOpCompileMetadata(call.Arguments.Nodes[1]),
+					})
 				}
 			case "defineOps":
 				if emitHints && provenLmaoCall && len(call.Arguments.Nodes) == 1 && call.Arguments.Nodes[0].Kind == shimast.KindObjectLiteralExpression && isNamedType(t.checker, call.AsNode(), "OpGroup") {
 					group := collectDefineOpsHints(t, call.Arguments.Nodes[0].AsObjectLiteralExpression())
 					if len(group) > 0 {
-						hints = append(hints, hintRewrite{call: call, hints: group, isGroup: true})
+						hints = append(hints, hintRewrite{
+							call:    call,
+							hints:   group,
+							isGroup: true,
+						})
 					}
 				}
 			case "span":
@@ -903,6 +958,16 @@ func baseCompileMetadataProperties(analysis opCompileAnalysis) []*shimast.Node {
 
 func (t *fileTransformer) compileMetadataNode(analysis opCompileAnalysis) *shimast.Node {
 	properties := baseCompileMetadataProperties(analysis)
+	if artifact := newSpanBufferAotArtifact(analysis); artifact != nil {
+		properties = append(properties, factory.NewPropertyAssignment(
+			nil,
+			ident("materializeSpanBufferClass"),
+			nil,
+			nil,
+			artifact.materializerFunction(),
+		))
+		t.spanBufferAotUsed = true
+	}
 	if len(analysis.localMessageDictionary) > 0 {
 		elements := make([]*shimast.Node, len(analysis.localMessageDictionary))
 		for index, globalID := range analysis.localMessageDictionary {
@@ -929,7 +994,13 @@ func (t *fileTransformer) applyHintRewrites(rewrites []hintRewrite) {
 			sort.Strings(names)
 			props := make([]*shimast.Node, 0, len(names))
 			for _, name := range names {
-				props = append(props, factory.NewPropertyAssignment(nil, str(name), nil, nil, t.compileMetadataNode(rewrite.hints[name])))
+				props = append(props, factory.NewPropertyAssignment(
+					nil,
+					str(name),
+					nil,
+					nil,
+					t.compileMetadataNode(rewrite.hints[name]),
+				))
 			}
 			args = append(args, factory.NewObjectLiteralExpression(factory.NewNodeList(props), true))
 		} else {
