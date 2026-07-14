@@ -44,6 +44,18 @@
           "killAfterMs": 10000
         }
       },
+      "test": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "dependsOn": [
+          "^build"
+        ],
+        "options": {
+          "command": "bun test --timeout=30000 src ../lmao/benchmarks/plugin-scenario/platform.test.ts",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 600000,
+          "killAfterMs": 10000
+        }
+      },
       "lint": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "dependsOn": [
@@ -59,6 +71,9 @@
       "export-browser": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": false,
+        "dependsOn": [
+          "^build"
+        ],
         "outputs": [
           "{projectRoot}/dist/web"
         ],
@@ -67,11 +82,52 @@
           "cwd": "{projectRoot}",
           "timeoutMs": 600000,
           "killAfterMs": 10000
+        },
+        "configurations": {
+          "off-cold": {
+            "env": {
+              "LMAO_BENCH_MODE": "cold",
+              "LMAO_BENCH_TRANSFORM": "off"
+            }
+          },
+          "off-steady": {
+            "env": {
+              "LMAO_BENCH_MODE": "steady",
+              "LMAO_BENCH_TRANSFORM": "off"
+            }
+          },
+          "off-diagnostic": {
+            "env": {
+              "LMAO_BENCH_MODE": "diagnostic",
+              "LMAO_BENCH_TRANSFORM": "off"
+            }
+          },
+          "on-cold": {
+            "env": {
+              "LMAO_BENCH_MODE": "cold",
+              "LMAO_BENCH_TRANSFORM": "on"
+            }
+          },
+          "on-steady": {
+            "env": {
+              "LMAO_BENCH_MODE": "steady",
+              "LMAO_BENCH_TRANSFORM": "on"
+            }
+          },
+          "on-diagnostic": {
+            "env": {
+              "LMAO_BENCH_MODE": "diagnostic",
+              "LMAO_BENCH_TRANSFORM": "on"
+            }
+          }
         }
       },
       "export-hermes": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": false,
+        "dependsOn": [
+          "^build"
+        ],
         "outputs": [
           "{projectRoot}/dist/headless"
         ],
@@ -80,6 +136,44 @@
           "cwd": "{projectRoot}",
           "timeoutMs": 600000,
           "killAfterMs": 10000
+        },
+        "configurations": {
+          "off-cold": {
+            "env": {
+              "LMAO_BENCH_MODE": "cold",
+              "LMAO_BENCH_TRANSFORM": "off"
+            }
+          },
+          "off-steady": {
+            "env": {
+              "LMAO_BENCH_MODE": "steady",
+              "LMAO_BENCH_TRANSFORM": "off"
+            }
+          },
+          "off-diagnostic": {
+            "env": {
+              "LMAO_BENCH_MODE": "diagnostic",
+              "LMAO_BENCH_TRANSFORM": "off"
+            }
+          },
+          "on-cold": {
+            "env": {
+              "LMAO_BENCH_MODE": "cold",
+              "LMAO_BENCH_TRANSFORM": "on"
+            }
+          },
+          "on-steady": {
+            "env": {
+              "LMAO_BENCH_MODE": "steady",
+              "LMAO_BENCH_TRANSFORM": "on"
+            }
+          },
+          "on-diagnostic": {
+            "env": {
+              "LMAO_BENCH_MODE": "diagnostic",
+              "LMAO_BENCH_TRANSFORM": "on"
+            }
+          }
         }
       }
     }

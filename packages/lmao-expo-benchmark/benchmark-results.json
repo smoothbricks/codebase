@@ -1,0 +1,190 @@
+{
+  "beforeAfter": {
+    "hermes-off": {
+      "after_arrow_median": 167480.46875,
+      "after_lifecycle_median": 28808.59375,
+      "arrow_speedup": 1.4650145772594751,
+      "before_arrow_median": 245361.328125,
+      "before_lifecycle_median": 32714.84375,
+      "dynamic_after": 6,
+      "dynamic_before": 4,
+      "lifecycle_speedup": 1.1355932203389831,
+      "variant": "hermes-off"
+    },
+    "hermes-on": {
+      "after_arrow_median": 157470.703125,
+      "after_lifecycle_median": 24414.0625,
+      "arrow_speedup": 1.5333333333333334,
+      "before_arrow_median": 241455.078125,
+      "before_lifecycle_median": 34667.96875,
+      "dynamic_after": 9,
+      "dynamic_before": 4,
+      "lifecycle_speedup": 1.42,
+      "variant": "hermes-on"
+    },
+    "web-off": {
+      "after_arrow_median": 25146.484375,
+      "after_lifecycle_median": 7763.671870634425,
+      "arrow_speedup": 2.7757281551083315,
+      "before_arrow_median": 69799.80468167923,
+      "before_lifecycle_median": 14941.40623981366,
+      "dynamic_after": 6,
+      "dynamic_before": 4,
+      "lifecycle_speedup": 1.9245283016569181,
+      "variant": "web-off"
+    },
+    "web-on": {
+      "after_arrow_median": 27612.30468604481,
+      "after_lifecycle_median": 8618.164058134425,
+      "arrow_speedup": 2.429708222781616,
+      "before_arrow_median": 67089.84374563443,
+      "before_lifecycle_median": 14013.671876455192,
+      "dynamic_after": 9,
+      "dynamic_before": 4,
+      "lifecycle_speedup": 1.6260623239387173,
+      "variant": "web-on"
+    }
+  },
+  "environment": {
+    "bun": "1.3.14",
+    "expo": "57.0.4",
+    "hermesBytecodeVersion": 98,
+    "hermesRelease": "1.0.0",
+    "os": "darwin-arm64",
+    "reactNative": "0.86.0",
+    "ttscMetro": "0.18.4",
+    "typescriptNxHost": "6.0.3",
+    "typescriptTtscMetro": "7.0.2"
+  },
+  "finding": "The already-landed optimization stack is materially faster than the historical foundation on browser and Hermes. Ten additional candidates reached diminishing returns: one was already present and nine were neutral or regressive on at least one required engine, so every experimental delta was reverted.",
+  "generatedAt": "2026-07-14",
+  "optimizationRounds": [
+    {
+      "candidate": "checker-proven fixed-ABI spanSync Op dispatch",
+      "measurements": {
+        "hermesMedianNsPerOp": [23925.78125, 24169.921875],
+        "webMedianNsPerOp": [7861.328129365575, 8251.953127910383]
+      },
+      "outcome": "rejected",
+      "reason": "Hermes improved 1-2%, but browser regressed in both repeats (+6.3% and +11.6% median).",
+      "round": 1
+    },
+    {
+      "candidate": "remove redundant fresh-JS-buffer zero fills",
+      "outcome": "already-present",
+      "reason": "Current getSpanBufferClass already allocates fresh zeroed ArrayBuffers without lane fills; remaining fills are semantic fallback/reuse writes.",
+      "round": 2
+    },
+    {
+      "candidate": "single-segment stats seal callsite fast path",
+      "measurements": {
+        "hermesMedianNsPerOp": 33935.546875,
+        "webMedianNsPerOp": 7958.9843735448085
+      },
+      "outcome": "rejected",
+      "reason": "Browser regressed 7.6%; Hermes regressed 39% median.",
+      "round": 3
+    },
+    {
+      "candidate": "direct current-mixed string span-start lane write",
+      "measurements": {
+        "hermesMedianNsPerOp": 24414.0625,
+        "webMedianNsPerOp": 8837.890629365575
+      },
+      "outcome": "rejected",
+      "reason": "Browser regressed 19.5%; Hermes was flat/slightly worse.",
+      "round": 4
+    },
+    {
+      "candidate": "primitive literal structured-log temp elision",
+      "measurements": {
+        "hermesMedianNsPerOp": 24414.0625,
+        "webOffMedianNsPerOp": 8081.054678768851,
+        "webOnMedianNsPerOp": 8618.164058134425
+      },
+      "outcome": "rejected",
+      "reason": "Browser transformed/control ratio worsened from 0.959 to 1.066; Hermes was flat.",
+      "round": 5
+    },
+    {
+      "candidate": "schema-proven result fixed stores and shared enum lookup",
+      "measurements": {
+        "hermesMedianNsPerOp": 24414.0625,
+        "webOffMedianNsPerOp": 7666.015633731149,
+        "webOnMedianNsPerOp": 7421.8750014551915
+      },
+      "outcome": "rejected-neutral",
+      "reason": "Browser transformed/control ratio was 0.968 versus 0.959 baseline; Hermes median was unchanged.",
+      "round": 6
+    },
+    {
+      "candidate": "fixed root trace dispatch for stable Op with overrides",
+      "measurements": {
+        "hermesMedianNsPerOp": 25878.90625,
+        "webOffMedianNsPerOp": 7788.0859389551915,
+        "webOnMedianNsPerOp": 8471.679691865575
+      },
+      "outcome": "rejected",
+      "reason": "Browser transformed/control ratio regressed to 1.088; Hermes regressed 6%.",
+      "round": 7
+    },
+    {
+      "candidate": "empty user-context constructor loop guard",
+      "measurements": {
+        "hermesMedianNsPerOp": 31738.28125,
+        "webOffMedianNsPerOp": 7885.742190410383,
+        "webOnMedianNsPerOp": 7714.8437485448085
+      },
+      "outcome": "rejected",
+      "reason": "Browser transformed/control ratio worsened to 0.978; Hermes regressed 30%.",
+      "round": 8
+    },
+    {
+      "candidate": "current-mixed dynamic debug/trace direct log inline",
+      "measurements": {
+        "hermesMedianNsPerOp": 24902.34375,
+        "webOffMedianNsPerOp": 8105.468754365575,
+        "webOnMedianNsPerOp": 8227.539066865575
+      },
+      "outcome": "rejected",
+      "reason": "Browser transformed/control ratio regressed to 1.015; Hermes regressed 2%.",
+      "round": 9
+    },
+    {
+      "candidate": "hoist global span-counter initialization to module load",
+      "measurements": {
+        "hermesMedianNsPerOp": 35400.390625,
+        "webOffMedianNsPerOp": 8959.960934589617,
+        "webOnMedianNsPerOp": 7983.398434589617
+      },
+      "outcome": "rejected",
+      "reason": "Browser normalized ratio improved, but Hermes regressed 45% median and showed severe mean outliers.",
+      "round": 10
+    }
+  ],
+  "protocol": {
+    "iterationsPerSample": 2048,
+    "sampleCount": 30,
+    "semanticDigestSha256": "0793a5b0bee3b963c596ce2231a8e2a82cdac243cc972b8eff49005f3df9f719",
+    "statistic": "median ns/op",
+    "warmupIterations": 256
+  },
+  "revisions": {
+    "final": "001f3a92845b6a17116cac3cc5088a626d33e67f",
+    "foundation": "aad7595d8513b4e85bc0466fb939e0a771f52a7e"
+  },
+  "schemaVersion": 1,
+  "semanticParity": {
+    "allFoundationAndFinalVariantsEqual": true,
+    "result": 61,
+    "rowCounts": {
+      "debug": 1,
+      "error": 0,
+      "info": 3,
+      "span-err": 1,
+      "span-ok": 2,
+      "span-start": 3,
+      "warn": 2
+    }
+  }
+}
