@@ -324,6 +324,7 @@ pub enum CommitmentDraft {
         repo_id: RepoId,
         source_checkpoint: String,
         source_incarnation: WorkspaceIncarnation,
+        replaced_incarnation: WorkspaceIncarnation,
         destination_incarnation: WorkspaceIncarnation,
     },
 }
@@ -419,6 +420,7 @@ impl CommitmentDraft {
                 repo_id,
                 source_checkpoint,
                 source_incarnation,
+                replaced_incarnation,
                 destination_incarnation,
             } => ControllerCommitment::Restore(crate::api::dto::RestoreCommitment {
                 version: CONTROLLER_COMMITMENT_VERSION,
@@ -426,6 +428,7 @@ impl CommitmentDraft {
                 repo_id,
                 source_checkpoint,
                 source_incarnation,
+                replaced_incarnation,
                 destination_incarnation,
             }),
         }
@@ -2956,6 +2959,16 @@ mod lifecycle_commitment_tests {
                 .unwrap(),
             None
         );
+        drop(publisher);
+        let mut publisher =
+            CommitmentPublisher::open(&root, repo_id.clone(), [incarnation.clone()], 4).unwrap();
+        assert_eq!(
+            publisher
+                .ensure_workspace_introduced(repo_id.clone(), incarnation.clone())
+                .await
+                .unwrap(),
+            None
+        );
         assert_eq!(
             publisher
                 .ensure_workspace_retired(repo_id.clone(), incarnation.clone())
@@ -3086,6 +3099,7 @@ mod lifecycle_commitment_tests {
                 repo_id: repo_id.clone(),
                 source_checkpoint: "baseline".into(),
                 source_incarnation: source.clone(),
+                replaced_incarnation: source.clone(),
                 destination_incarnation: destination.clone(),
             })
             .await
@@ -3095,6 +3109,7 @@ mod lifecycle_commitment_tests {
                 repo_id: repo_id.clone(),
                 source_checkpoint: "baseline".into(),
                 source_incarnation: source.clone(),
+                replaced_incarnation: destination.clone(),
                 destination_incarnation: second_destination.clone(),
             })
             .await

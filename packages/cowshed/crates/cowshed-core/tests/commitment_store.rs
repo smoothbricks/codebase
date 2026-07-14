@@ -9,9 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use cowshed_core::api::{
-    AdmissionCommitment, CONTROLLER_COMMITMENT_VERSION, ControllerCommitment, JobId, JobState,
-    Sha256Digest, TerminalCommitment, WorkspaceIncarnation, WorkspaceIntroducedCommitment,
-    WorkspaceRetiredCommitment,
+    AdmissionCommitment, CONTROLLER_COMMITMENT_VERSION, CheckpointCommitment, ControllerCommitment,
+    JobId, JobState, RestoreCommitment, Sha256Digest, TerminalCommitment, WorkspaceIncarnation,
+    WorkspaceIntroducedCommitment, WorkspaceRetiredCommitment,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::supervisor::{CommitmentDraft, CommitmentPublisher, CommitmentSink};
@@ -261,6 +261,40 @@ fn terminal_for(
     })
 }
 
+fn checkpoint_for(
+    order: u64,
+    repo_id: RepoId,
+    origin_incarnation: WorkspaceIncarnation,
+) -> ControllerCommitment {
+    ControllerCommitment::Checkpoint(CheckpointCommitment {
+        version: CONTROLLER_COMMITMENT_VERSION,
+        order,
+        repo_id,
+        origin_incarnation,
+        checkpoint_id: "baseline".into(),
+        barrier_id: 1,
+        manifest_batch_sha256: Sha256Digest::compute(b"manifest"),
+    })
+}
+
+fn restore_for(
+    order: u64,
+    repo_id: RepoId,
+    source_incarnation: WorkspaceIncarnation,
+    replaced_incarnation: WorkspaceIncarnation,
+    destination_incarnation: WorkspaceIncarnation,
+) -> ControllerCommitment {
+    ControllerCommitment::Restore(RestoreCommitment {
+        version: CONTROLLER_COMMITMENT_VERSION,
+        order,
+        repo_id,
+        source_checkpoint: "baseline".into(),
+        source_incarnation,
+        replaced_incarnation,
+        destination_incarnation,
+    })
+}
+
 fn sealed_name(order: u64, writer: Uuid) -> String {
     format!("commitment-{order:020}-{}.arrow", writer.hyphenated())
 }
@@ -336,12 +370,13 @@ fn publish_reopen_round_trip_uses_exact_schema_and_one_segment_per_commitment() 
     let mut store = store_with_environment(root.path(), FixedEnvironment::new(partition)).unwrap();
 
     assert_eq!(store.next_order().unwrap(), 1);
-    store.publish(admission(1, 1)).unwrap();
-    store.publish(terminal(2, 1)).unwrap();
-    assert_eq!(store.next_order().unwrap(), 3);
+    store.publish(introduced(1)).unwrap();
+    store.publish(admission(2, 1)).unwrap();
+    store.publish(terminal(3, 1)).unwrap();
+    assert_eq!(store.next_order().unwrap(), 4);
 
     let segments = sealed_segments(root.path());
-    assert_eq!(segments.len(), 2);
+    assert_eq!(segments.len(), 3);
     for segment in &segments {
         let file = File::open(segment).unwrap();
         let mut reader = StreamReader::try_new(file, None).unwrap();
@@ -353,7 +388,7 @@ fn publish_reopen_round_trip_uses_exact_schema_and_one_segment_per_commitment() 
 
     drop(store);
     let reopened = CommitmentStore::open(root.path(), repo(), [incarnation()]).unwrap();
-    assert_eq!(reopened.next_order().unwrap(), 3);
+    assert_eq!(reopened.next_order().unwrap(), 4);
 }
 
 #[test]
@@ -370,6 +405,78 @@ fn reopen_with_only_current_storage_facts_accepts_retired_workspace_job_history(
     let reopened = CommitmentStore::open(root.path(), repo(), []).unwrap();
     assert_eq!(reopened.next_order().unwrap(), 5);
     assert_eq!(sealed_segments(root.path()).len(), 4);
+}
+
+#[test]
+fn restore_destination_baseline_merges_only_after_chronological_replay() {
+    let root = TempRoot::new("restore-reopen");
+    let partition = date(2026, 2, 5);
+    let source = incarnation();
+    let destination = other_incarnation();
+    let repo_id = repo();
+    let mut store = store_with_environment(root.path(), FixedEnvironment::new(partition)).unwrap();
+    store.publish(introduced(1)).unwrap();
+    store
+        .publish(checkpoint_for(2, repo_id.clone(), source.clone()))
+        .unwrap();
+    store
+        .publish(restore_for(
+            3,
+            repo_id.clone(),
+            source.clone(),
+            source,
+            destination.clone(),
+        ))
+        .unwrap();
+    drop(store);
+
+    for _ in 0..2 {
+        let reopened =
+            CommitmentStore::open(root.path(), repo_id.clone(), [destination.clone()]).unwrap();
+        assert_eq!(reopened.next_order().unwrap(), 4);
+    }
+}
+
+#[test]
+fn durable_pending_restore_reopens_in_next_and_subsequent_processes() {
+    let root = TempRoot::new("pending-restore-reopen");
+    let partition = date(2026, 2, 6);
+    let source = incarnation();
+    let destination = other_incarnation();
+    let repo_id = repo();
+    let mut initial =
+        store_with_environment(root.path(), FixedEnvironment::new(partition)).unwrap();
+    initial.publish(introduced(1)).unwrap();
+    initial
+        .publish(checkpoint_for(2, repo_id.clone(), source.clone()))
+        .unwrap();
+    drop(initial);
+
+    let mut crashing = store_with_environment(
+        root.path(),
+        FixedEnvironment::failing(
+            partition,
+            CommitmentPublicationPoint::AfterRenameAndDirectorySync,
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        crashing.publish(restore_for(
+            3,
+            repo_id.clone(),
+            source.clone(),
+            source,
+            destination.clone(),
+        )),
+        Err(CommitmentStoreError::Io { .. })
+    ));
+    drop(crashing);
+
+    for _ in 0..2 {
+        let reopened =
+            CommitmentStore::open(root.path(), repo_id.clone(), [destination.clone()]).unwrap();
+        assert_eq!(reopened.next_order().unwrap(), 4);
+    }
 }
 
 #[test]
@@ -476,21 +583,22 @@ fn stale_store_instances_refresh_after_each_advance_and_publish_in_turn() {
     let mut first = store_with_environment(root.path(), FixedEnvironment::new(partition)).unwrap();
     let mut second = store_with_environment(root.path(), FixedEnvironment::new(partition)).unwrap();
 
-    first.publish(admission(1, 1)).unwrap();
+    first.publish(introduced(1)).unwrap();
+    first.publish(admission(2, 1)).unwrap();
     assert!(matches!(
-        second.publish(admission(1, 2)),
-        Err(CommitmentStoreError::Conflict { order: 1 })
-    ));
-    assert_eq!(second.next_order().unwrap(), 2);
-    second.publish(admission(2, 2)).unwrap();
-
-    assert!(matches!(
-        first.publish(terminal(2, 1)),
+        second.publish(admission(2, 2)),
         Err(CommitmentStoreError::Conflict { order: 2 })
     ));
-    assert_eq!(first.next_order().unwrap(), 3);
-    first.publish(terminal(3, 1)).unwrap();
-    assert_eq!(sealed_segments(root.path()).len(), 3);
+    assert_eq!(second.next_order().unwrap(), 3);
+    second.publish(admission(3, 2)).unwrap();
+
+    assert!(matches!(
+        first.publish(terminal(3, 1)),
+        Err(CommitmentStoreError::Conflict { order: 3 })
+    ));
+    assert_eq!(first.next_order().unwrap(), 4);
+    first.publish(terminal(4, 1)).unwrap();
+    assert_eq!(sealed_segments(root.path()).len(), 4);
 }
 #[test]
 fn order_remains_contiguous_across_utc_date_partitions() {
@@ -500,11 +608,12 @@ fn order_remains_contiguous_across_utc_date_partitions() {
         next: AtomicUsize::new(0),
     };
     let mut store = store_with_environment(root.path(), environment).unwrap();
-    store.publish(admission(1, 1)).unwrap();
-    store.publish(terminal(2, 1)).unwrap();
+    store.publish(introduced(1)).unwrap();
+    store.publish(admission(2, 1)).unwrap();
+    store.publish(terminal(3, 1)).unwrap();
 
     let segments = sealed_segments(root.path());
-    assert_eq!(segments.len(), 2);
+    assert_eq!(segments.len(), 3);
     let partitions: Vec<_> = segments
         .iter()
         .map(|segment| segment.parent().unwrap().file_name().unwrap())
@@ -517,7 +626,7 @@ fn order_remains_contiguous_across_utc_date_partitions() {
             .unwrap()
             .next_order()
             .unwrap(),
-        3
+        4
     );
 }
 
@@ -553,14 +662,15 @@ fn publish_validation_rejects_foreign_unknown_and_invalid_job_transitions() {
     assert_eq!(store.next_order().unwrap(), 1);
     assert!(sealed_segments(root.path()).is_empty());
 
-    store.publish(admission(1, 1)).unwrap();
-    store.publish(terminal(2, 1)).unwrap();
+    store.publish(introduced(1)).unwrap();
+    store.publish(admission(2, 1)).unwrap();
+    store.publish(terminal(3, 1)).unwrap();
     assert!(matches!(
-        store.publish(terminal(3, 1)),
+        store.publish(terminal(4, 1)),
         Err(CommitmentStoreError::Integrity { .. })
     ));
-    assert_eq!(store.next_order().unwrap(), 3);
-    assert_eq!(sealed_segments(root.path()).len(), 2);
+    assert_eq!(store.next_order().unwrap(), 4);
+    assert_eq!(sealed_segments(root.path()).len(), 3);
 }
 
 #[test]
@@ -687,7 +797,7 @@ fn failure_after_rename_is_recovered_without_in_memory_advance() {
     .unwrap();
 
     assert!(matches!(
-        store.publish(admission(1, 1)),
+        store.publish(introduced(1)),
         Err(CommitmentStoreError::Io { .. })
     ));
     assert_eq!(store.next_order().unwrap(), 1);
@@ -705,7 +815,7 @@ fn published_segment_is_private_and_parent_directory_is_synced() {
     let mut store =
         store_with_environment(root.path(), FixedEnvironment::counting(date(2026, 10, 11)))
             .unwrap();
-    store.publish(admission(1, 1)).unwrap();
+    store.publish(introduced(1)).unwrap();
 
     let segments = sealed_segments(root.path());
     assert_eq!(segments.len(), 1);
@@ -723,7 +833,7 @@ fn existing_sealed_order_conflicts_without_overwrite_and_refreshes_state() {
     let directory = root.path().join(partition.to_string());
     fs::create_dir_all(&directory).unwrap();
     let segment = directory.join(sealed_name(1, store.writer_id()));
-    write_batches(&segment, &[admission(1, 1)]);
+    write_batches(&segment, &[introduced(1)]);
     let original = fs::read(&segment).unwrap();
 
     assert!(matches!(
@@ -747,11 +857,11 @@ fn concurrent_stores_cannot_publish_the_same_global_order() {
 
     let first_thread = std::thread::spawn(move || {
         first_barrier.wait();
-        first.publish(admission(1, 1))
+        first.publish(introduced(1))
     });
     let second_thread = std::thread::spawn(move || {
         second_barrier.wait();
-        second.publish(admission(1, 2))
+        second.publish(introduced(1))
     });
     let results = [first_thread.join().unwrap(), second_thread.join().unwrap()];
 
@@ -797,7 +907,7 @@ impl CommitmentStoreEnvironment for CollisionEnvironment {
                 .ok_or_else(|| io::Error::other("writer id was not initialized"))?;
             let directory = self.root.join(self.date.to_string());
             let segment = directory.join(sealed_name(1, writer));
-            write_batches(&segment, &[admission(1, 1)]);
+            write_batches(&segment, &[introduced(1)]);
         }
         Ok(())
     }
