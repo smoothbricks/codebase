@@ -6,6 +6,7 @@ dynamodb-local-metadata.json
 opencode.json
 
 # LLMs
+.codegraph/
 .opencode
 .serena
 .claude/worktrees
