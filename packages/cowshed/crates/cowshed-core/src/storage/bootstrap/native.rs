@@ -31,13 +31,24 @@ use super::VOLUME_MARKER_FILE;
 use super::{
     APFS_CACHES_VOLUME, APFS_STORE_VOLUME, BlockingLane, BootstrapEvidence,
     BootstrapExecutionError, BootstrapHost, BootstrapPlan, DISKUTIL, ExistingStorage, HostCommand,
-    HostCommandOutput, HostError, MountpointState, PlanError, SelectionError, StatFsEvidence,
-    SubstrateKind, TokioBlockingLane, VolumeRole, execute_bootstrap, plan_bootstrap,
-    require_mounted_marker, select_substrate,
+    HostCommandOutput, HostError, HostOperation, MountpointState, PlanError, SelectionError,
+    StatFsEvidence, SubstrateKind, TokioBlockingLane, VolumeRole, execute_bootstrap,
+    plan_bootstrap, require_mounted_marker, select_substrate,
 };
 
 #[cfg(unix)]
 const MARKER_MODE: libc::mode_t = 0o600;
+
+/// Whether native bootstrap may apply its mutating host plan.
+///
+/// `ExistingOnly` is the safe capability for ordinary commands and background services. It may
+/// gather read-only evidence and validate mounted volume markers, but it cannot create directories
+/// or volumes, mount volumes, run mutating commands, or write markers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeBootstrapMode {
+    Provision,
+    ExistingOnly,
+}
 
 /// Stateless production host adapter for trusted storage bootstrap operations.
 #[derive(Clone, Copy, Debug, Default)]
@@ -70,12 +81,15 @@ impl BootstrapHost for SystemBootstrapHost {
     }
 }
 
-/// Gather authoritative APFS evidence, plan bootstrap purely, then execute it on blocking lanes.
+/// Gather authoritative APFS evidence, plan bootstrap purely, then execute it according to the
+/// explicit capability mode.
 ///
-/// The returned plan is the exact plan that completed successfully.
+/// The returned plan is the exact plan that completed successfully. In `ExistingOnly`, a plan
+/// containing any mutating operation is rejected before the execution lane is dispatched.
 pub async fn bootstrap_system_storage(
     project_root: &Path,
     home: &Path,
+    mode: NativeBootstrapMode,
 ) -> Result<BootstrapPlan, NativeBootstrapError> {
     if !cfg!(target_os = "macos") {
         return Err(NativeBootstrapError::UnsupportedPlatform(
@@ -94,7 +108,7 @@ pub async fn bootstrap_system_storage(
         let mut source = SystemEvidenceSource {
             host: gather_host.as_ref(),
         };
-        let result = gather_apfs_evidence(&mut source, &project_root, &gather_home);
+        let result = plan_native_bootstrap(&mut source, &project_root, &gather_home);
         sender.send(result).map_err(|_| {
             BootstrapExecutionError::BlockingLane(
                 "native bootstrap evidence receiver closed".to_owned(),
@@ -104,13 +118,67 @@ pub async fn bootstrap_system_storage(
     .await
     .map_err(NativeBootstrapError::Execution)?;
 
-    let gathered = receiver
+    let plan = receiver
         .await
         .map_err(|_| NativeBootstrapError::EvidenceLaneClosed)??;
-    let selected = select_substrate(gathered.statfs, None)?;
-    let plan = plan_bootstrap(selected, &home, gathered.bootstrap)?;
-    execute_bootstrap(&plan, host, &lane).await?;
+    execute_native_bootstrap_plan(&plan, mode, host, &lane).await?;
     Ok(plan)
+}
+
+/// Apply a previously planned native bootstrap with an explicit provisioning capability.
+///
+/// This boundary is public so alternate foreground/background hosts can share the same fail-closed
+/// policy. `ExistingOnly` rejects the complete plan before dispatch when setup is required.
+pub async fn execute_native_bootstrap_plan<H, L>(
+    plan: &BootstrapPlan,
+    mode: NativeBootstrapMode,
+    host: Arc<H>,
+    lane: &L,
+) -> Result<(), NativeBootstrapError>
+where
+    H: BootstrapHost + 'static,
+    L: BlockingLane,
+{
+    if mode == NativeBootstrapMode::ExistingOnly {
+        let actions = mutating_setup_actions(plan);
+        if !actions.is_empty() {
+            return Err(NativeBootstrapError::StorageSetupRequired {
+                actions,
+                hint: "next: cowshed adopt",
+            });
+        }
+    }
+    execute_bootstrap(plan, host, lane)
+        .await
+        .map_err(NativeBootstrapError::Execution)
+}
+
+fn mutating_setup_actions(plan: &BootstrapPlan) -> Vec<String> {
+    plan.operations()
+        .iter()
+        .filter_map(|operation| match operation {
+            HostOperation::VerifyZfsDelegation { .. } | HostOperation::GuardMountpoint { .. } => {
+                None
+            }
+            HostOperation::EnsureDirectory(path) => {
+                Some(format!("create directory {}", path.display()))
+            }
+            HostOperation::CreateApfsVolume { name, .. } => {
+                Some(format!("create APFS volume {name}"))
+            }
+            HostOperation::MountApfsVolume { mountpoint, .. } => {
+                Some(format!("mount APFS volume at {}", mountpoint.display()))
+            }
+            HostOperation::RunCommand(command) => Some(format!(
+                "run {} {}",
+                command.program(),
+                command.args().join(" ")
+            )),
+            HostOperation::WriteMarkerAtomic { path, .. } => {
+                Some(format!("write volume marker {}", path.display()))
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Error)]
@@ -157,6 +225,11 @@ pub enum NativeBootstrapError {
     MountEvidenceMismatch { path: PathBuf, identifier: String },
     #[error("mounted APFS marker at {path:?} is invalid: {message}")]
     InvalidMountedMarker { path: PathBuf, message: String },
+    #[error("cowshed storage setup is required ({actions:?}); {hint}")]
+    StorageSetupRequired {
+        actions: Vec<String>,
+        hint: &'static str,
+    },
     #[error("native bootstrap evidence blocking lane closed without a result")]
     EvidenceLaneClosed,
     #[error(transparent)]
@@ -208,6 +281,16 @@ impl EvidenceSource for SystemEvidenceSource<'_> {
 struct GatheredEvidence {
     statfs: StatFsEvidence,
     bootstrap: BootstrapEvidence,
+}
+
+fn plan_native_bootstrap(
+    source: &mut impl EvidenceSource,
+    project_root: &Path,
+    home: &Path,
+) -> Result<BootstrapPlan, NativeBootstrapError> {
+    let gathered = gather_apfs_evidence(source, project_root, home)?;
+    let selected = select_substrate(gathered.statfs, None)?;
+    plan_bootstrap(selected, home, gathered.bootstrap).map_err(Into::into)
 }
 
 fn gather_apfs_evidence(
@@ -1069,6 +1152,27 @@ mod tests {
             ),
             Err(NativeBootstrapError::MaskedMountpoint { .. })
         ));
+    }
+
+    #[test]
+    fn existing_only_planning_refuses_mismounted_volume_before_mutation_dispatch() {
+        let volumes = volume(APFS_STORE_VOLUME, "disk3s8", Some("/Volumes/cowshed-wrong"))
+            + &volume("Data", "disk3s5", Some("/System/Volumes/Data"));
+        let mut source = source(plist(&container("disk3", &volumes)));
+
+        assert!(matches!(
+            plan_native_bootstrap(
+                &mut source,
+                Path::new("/Users/alice/project"),
+                Path::new("/Users/alice")
+            ),
+            Err(NativeBootstrapError::InvalidVolumeMountpoint {
+                identifier,
+                mountpoint: Some(path),
+            }) if identifier == "disk3s8" && path == Path::new("/Volumes/cowshed-wrong")
+        ));
+        assert_eq!(source.commands.len(), 1);
+        assert_eq!(source.commands[0].args(), ["apfs", "list", "-plist"]);
     }
 
     #[cfg(unix)]

@@ -63,6 +63,17 @@ sense. `cowshed exec main -- ...` uses the same closed sandbox and explicit gran
 Run once, inside an existing checkout. Converts it into an image-backed **main workspace** at the same path. This is the
 only cowshed operation that copies data (one-time; clonefile cannot cross volumes into a new image).
 
+On macOS, this foreground `cowshed adopt` is the **only** command allowed to provision native storage. The first adopt
+on a machine may display one administrator authorization prompt from `diskutil` while cowshed creates and mounts the
+space-sharing `cowshed.store` and `cowshed.caches` APFS volumes. Once both volumes are present and correctly mounted,
+later adopts only validate them and do not prompt.
+
+Every other command (`new`, `ls`, `path`, `exec`, `rm`, `attach`, `detach`, and `doctor`) opens storage in existing-only
+mode. If either volume is absent or needs mounting, the command exits with `environment-missing`, lists the required
+setup actions, and prints `next: cowshed adopt`; it never creates a volume, repairs a mount, or requests administrator
+authorization. Launchd agents and future background services use the same existing-only entrypoint, so a background
+process can report missing setup but can never cause a macOS authorization prompt.
+
 ```
 $ cd <project-root> && cowshed adopt
 cowshed: created dedicated volumes cowshed.store, cowshed.caches (space-sharing, excluded from backup)

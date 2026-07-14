@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 
 use async_trait::async_trait;
+use cowshed_core::storage::bootstrap::native::{
+    NativeBootstrapError, NativeBootstrapMode, execute_native_bootstrap_plan,
+};
 use cowshed_core::storage::bootstrap::*;
 
 struct InlineLane;
@@ -12,6 +15,62 @@ struct InlineLane;
 impl BlockingLane for InlineLane {
     async fn dispatch(&self, job: BlockingJob) -> Result<(), BootstrapExecutionError> {
         job()
+    }
+}
+
+#[derive(Default)]
+struct CountingLane {
+    dispatches: AtomicUsize,
+}
+
+#[async_trait]
+impl BlockingLane for CountingLane {
+    async fn dispatch(&self, job: BlockingJob) -> Result<(), BootstrapExecutionError> {
+        self.dispatches.fetch_add(1, Ordering::SeqCst);
+        job()
+    }
+}
+
+#[derive(Default)]
+struct ValidationHost {
+    inspections: AtomicUsize,
+    mutations: AtomicUsize,
+}
+
+impl BootstrapHost for ValidationHost {
+    fn verify_zfs_delegation(&self, _pool: &str, _required_root: &str) -> Result<(), HostError> {
+        unreachable!("APFS test plan has no ZFS operation")
+    }
+
+    fn inspect_mountpoint(&self, path: &Path) -> Result<MountpointState, HostError> {
+        self.inspections.fetch_add(1, Ordering::SeqCst);
+        let role = if path.ends_with("caches") {
+            VolumeRole::Caches
+        } else {
+            VolumeRole::Store
+        };
+        Ok(MountpointState::Mounted {
+            marker: Some(
+                VolumeMarker::new(role, SubstrateKind::Apfs)
+                    .to_json()
+                    .unwrap(),
+            ),
+        })
+    }
+
+    fn create_dir_all(&self, _path: &Path) -> Result<(), HostError> {
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn run_command(&self, _command: &HostCommand) -> Result<HostCommandOutput, HostError> {
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+        Ok(HostCommandOutput::default())
+    }
+
+    fn write_file_atomic(&self, _path: &Path, _contents: &[u8]) -> Result<(), HostError> {
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -104,6 +163,26 @@ fn absent_apfs_plan() -> BootstrapPlan {
     .unwrap()
 }
 
+fn mounted_apfs_plan() -> BootstrapPlan {
+    let selected = select_substrate(
+        StatFsEvidence::Apfs {
+            mount_source: "/dev/disk3s5".into(),
+            container: Some("disk3".to_owned()),
+        },
+        None,
+    )
+    .unwrap();
+    plan_bootstrap(
+        selected,
+        Path::new("/Users/alice"),
+        BootstrapEvidence::Apfs {
+            store: ExistingStorage::mounted_valid("disk3s8"),
+            caches: ExistingStorage::mounted_valid("disk3s9"),
+        },
+    )
+    .unwrap()
+}
+
 fn command_argv(command: &HostCommand) -> Vec<String> {
     std::iter::once(command.program().to_owned())
         .chain(command.args().iter().cloned())
@@ -135,9 +214,14 @@ async fn created_volume_identifiers_flow_to_exact_store_then_caches_mounts() {
         creations: AtomicUsize::new(0),
     });
 
-    execute_bootstrap(&absent_apfs_plan(), host, &InlineLane)
-        .await
-        .unwrap();
+    execute_native_bootstrap_plan(
+        &absent_apfs_plan(),
+        NativeBootstrapMode::Provision,
+        host,
+        &InlineLane,
+    )
+    .await
+    .unwrap();
 
     let commands: Vec<_> = receiver
         .try_iter()
@@ -185,6 +269,68 @@ async fn created_volume_identifiers_flow_to_exact_store_then_caches_mounts() {
         ]
         .map(|argv| argv.into_iter().map(str::to_owned).collect::<Vec<_>>())
     );
+}
+
+#[tokio::test]
+async fn existing_only_missing_volumes_rejects_before_dispatch_with_adopt_hint() {
+    let host = Arc::new(ValidationHost::default());
+    let lane = CountingLane::default();
+    let error = execute_native_bootstrap_plan(
+        &absent_apfs_plan(),
+        NativeBootstrapMode::ExistingOnly,
+        Arc::clone(&host),
+        &lane,
+    )
+    .await
+    .unwrap_err();
+
+    match error {
+        NativeBootstrapError::StorageSetupRequired { actions, hint } => {
+            assert_eq!(hint, "next: cowshed adopt");
+            assert!(
+                actions
+                    .iter()
+                    .any(|action| action.contains("cowshed.store"))
+            );
+            assert!(
+                actions
+                    .iter()
+                    .any(|action| action.contains("cowshed.caches"))
+            );
+            assert!(
+                actions
+                    .iter()
+                    .any(|action| action == "mount APFS volume at /Users/alice/.cowshed")
+            );
+            assert!(
+                actions.iter().any(|action| {
+                    action == "mount APFS volume at /Users/alice/.cowshed/caches"
+                })
+            );
+        }
+        error => panic!("unexpected error: {error}"),
+    }
+    assert_eq!(lane.dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(host.mutations.load(Ordering::SeqCst), 0);
+    assert_eq!(host.inspections.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn already_correct_volumes_validate_in_both_modes_without_mutation() {
+    for mode in [
+        NativeBootstrapMode::Provision,
+        NativeBootstrapMode::ExistingOnly,
+    ] {
+        let host = Arc::new(ValidationHost::default());
+        let lane = CountingLane::default();
+        execute_native_bootstrap_plan(&mounted_apfs_plan(), mode, Arc::clone(&host), &lane)
+            .await
+            .unwrap();
+
+        assert_eq!(lane.dispatches.load(Ordering::SeqCst), 2);
+        assert_eq!(host.inspections.load(Ordering::SeqCst), 2);
+        assert_eq!(host.mutations.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[tokio::test]
