@@ -5,7 +5,9 @@ use cowshed_cli::runtime::{
     CliService, ExecCommand, ExecPresentation, ExecResult, dispatch, dispatch_and_shutdown,
 };
 use cowshed_core::api::*;
-use cowshed_core::metadata::{ImageFormat, WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
+use cowshed_core::metadata::{
+    ImageFormat, PortBlock, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+};
 use cowshed_core::repository::RepoId;
 use cowshed_core::{CowshedError, ErrorCode, Result};
 use std::collections::HashSet;
@@ -29,6 +31,9 @@ struct FakeService {
     push_options: Option<PushOptions>,
     rebase_options: Option<RebaseOptions>,
     land_options: Option<LandOptions>,
+    ensure_report: Option<EnsureReport>,
+    ensure_error: Option<CowshedError>,
+    ensure_path: Option<PathBuf>,
     shutdowns: Option<Arc<AtomicUsize>>,
     shutdown_error: Option<CowshedError>,
 }
@@ -46,6 +51,9 @@ impl Default for FakeService {
             push_options: None,
             rebase_options: None,
             land_options: None,
+            ensure_report: None,
+            ensure_error: None,
+            ensure_path: None,
             shutdowns: None,
             shutdown_error: None,
         }
@@ -86,11 +94,18 @@ impl CliService for FakeService {
 
     async fn ensure_current(&mut self, path: PathBuf) -> Result<EnsureReport> {
         self.events.push(format!("ensure:{}", path.display()));
-        Ok(EnsureReport {
+        self.ensure_path = Some(path);
+        if let Some(error) = self.ensure_error.take() {
+            return Err(error);
+        }
+        Ok(self.ensure_report.take().unwrap_or_else(|| EnsureReport {
             workspace: WorkspaceName::new("raven").unwrap(),
             mount: PathBuf::from("/mnt/raven"),
             action: EnsureAction::AlreadyMounted,
-        })
+            go_env: PathBuf::from("/mnt/raven/.cowshed/cache/go/env"),
+            workspace_token: PathBuf::from("/mnt/raven/.cowshed/token"),
+            port_block: None,
+        }))
     }
 
     async fn list(&mut self) -> Result<Vec<WorkspaceInfo>> {
@@ -401,9 +416,25 @@ async fn lifecycle_commands_delegate_exact_options_and_keep_stdout_machine_only(
     );
     assert_eq!(stderr, b"next: cowshed exec raven -- git status\n");
 
+    let token_path =
+        std::env::temp_dir().join(format!("cowshed-cli-envrc-{}-token", std::process::id()));
+    std::fs::write(&token_path, b"tok'en").unwrap();
+    service.ensure_report = Some(EnsureReport {
+        workspace: WorkspaceName::new("raven").unwrap(),
+        mount: PathBuf::from("/mnt/raven"),
+        action: EnsureAction::AlreadyMounted,
+        go_env: PathBuf::from("/mnt/raven/nested dir/it's/go env"),
+        workspace_token: token_path.clone(),
+        port_block: Some(PortBlock::new(40960, 16).unwrap()),
+    });
     let (_, stdout, stderr) = run(&mut service, ["ensure", "--envrc"]).await;
-    assert!(stdout.is_empty());
+    assert_eq!(
+        stdout,
+        b"export GOENV='/mnt/raven/nested dir/it'\\''s/go env'\nexport COWSHED_WORKSPACE_TOKEN='tok'\\''en'\nexport COWSHED_PORT_BASE='40960'\n"
+    );
     assert!(stderr.is_empty());
+    assert_eq!(service.ensure_path, Some(std::env::current_dir().unwrap()));
+    std::fs::remove_file(token_path).unwrap();
 
     let (_, stdout, stderr) = run(&mut service, ["gc", "--dry-run"]).await;
     assert_eq!(stdout, b"0\n");
@@ -537,6 +568,90 @@ async fn lifecycle_commands_delegate_exact_options_and_keep_stdout_machine_only(
             .iter()
             .any(|event| event == "rm:main:false:true")
     );
+}
+
+#[tokio::test]
+async fn ensure_uses_nested_invocation_cwd_and_reports_detached_healing() {
+    const CHILD: &str = "COWSHED_CLI_NESTED_CWD_TEST";
+    if std::env::var_os(CHILD).is_some() {
+        let mut service = FakeService {
+            ensure_report: Some(EnsureReport {
+                workspace: WorkspaceName::new("raven").unwrap(),
+                mount: PathBuf::from("/mnt/raven"),
+                action: EnsureAction::Attached,
+                go_env: PathBuf::from("/mnt/raven/.cowshed/cache/go/env"),
+                workspace_token: PathBuf::from("/mnt/raven/.cowshed/token"),
+                port_block: None,
+            }),
+            ..FakeService::default()
+        };
+        let (_, stdout, stderr) = run(&mut service, ["ensure", "--json"]).await;
+        assert_eq!(
+            stdout,
+            b"{\"ok\":true,\"result\":{\"workspace\":\"raven\",\"mount\":\"/mnt/raven\",\"action\":\"attached\",\"goEnv\":\"/mnt/raven/.cowshed/cache/go/env\",\"workspaceToken\":\"/mnt/raven/.cowshed/token\"}}\n"
+        );
+        assert_eq!(stderr, b"cowshed: workspace raven is ready (attached)\n");
+        assert_eq!(service.ensure_path, Some(std::env::current_dir().unwrap()));
+        return;
+    }
+
+    let root = std::env::temp_dir().join(format!("cowshed-cli-nested-cwd-{}", std::process::id()));
+    let nested = root.join("workspace/deep/path");
+    std::fs::create_dir_all(&nested).unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("ensure_uses_nested_invocation_cwd_and_reports_detached_healing")
+        .arg("--nocapture")
+        .env(CHILD, "1")
+        .current_dir(&nested)
+        .status()
+        .unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(status.success());
+}
+
+#[tokio::test]
+async fn ensure_resolution_and_token_errors_emit_no_partial_machine_output() {
+    let mut resolution_failure = FakeService {
+        ensure_error: Some(CowshedError::not_found(
+            "the current directory is not a cowshed workspace",
+            "cd into a workspace",
+        )),
+        ..FakeService::default()
+    };
+    let cli = parse_args(["ensure", "--json"]).unwrap();
+    let mut output = Output::new(Vec::new(), Vec::new(), false);
+    let error = dispatch(
+        &mut resolution_failure,
+        cli,
+        tokio::io::empty(),
+        &mut output,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::NotFound);
+    assert!(output.into_inner().0.is_empty());
+
+    let mut token_failure = FakeService {
+        ensure_report: Some(EnsureReport {
+            workspace: WorkspaceName::new("raven").unwrap(),
+            mount: PathBuf::from("/mnt/raven"),
+            action: EnsureAction::AlreadyMounted,
+            go_env: PathBuf::from("/mnt/raven/.cowshed/cache/go/env"),
+            workspace_token: PathBuf::from("/definitely/missing/cowshed/token"),
+            port_block: None,
+        }),
+        ..FakeService::default()
+    };
+    let cli = parse_args(["ensure", "--envrc"]).unwrap();
+    let mut output = Output::new(Vec::new(), Vec::new(), false);
+    let error = dispatch(&mut token_failure, cli, tokio::io::empty(), &mut output)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Integrity);
+    let (stdout, stderr) = output.into_inner();
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
 }
 
 #[tokio::test]

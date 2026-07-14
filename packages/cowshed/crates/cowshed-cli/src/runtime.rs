@@ -231,10 +231,13 @@ impl CliService for ActorBridge {
             .await
     }
 
-    async fn ensure_current(&mut self, _path: PathBuf) -> Result<EnsureReport> {
-        Err(CowshedError::internal(
-            "the core API does not yet expose authoritative current-workspace resolution",
-        ))
+    async fn ensure_current(&mut self, path: PathBuf) -> Result<EnsureReport> {
+        self.coordinator()?
+            .project()
+            .workspace_at(path)
+            .await?
+            .ensure()
+            .await
     }
 
     async fn list(&mut self) -> Result<Vec<WorkspaceInfo>> {
@@ -533,10 +536,12 @@ where
                 .map_err(output_error)?;
             Ok(success())
         }
-        Command::Ensure(_) => {
+        Command::Ensure(args) => {
             let report = service.ensure_current(invocation_cwd()?).await?;
             if json {
                 output.success(report.clone()).map_err(output_error)?;
+            } else if args.envrc {
+                emit_envrc(output, &report).await?;
             }
             if report.action != EnsureAction::AlreadyMounted {
                 output
@@ -945,6 +950,54 @@ fn emit_mount<W: Write, E: Write>(
             .bare_line(info.mount.as_os_str().as_bytes())
             .map_err(output_error)
     }
+}
+
+async fn emit_envrc<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    report: &EnsureReport,
+) -> Result<()> {
+    let token = tokio::fs::read(&report.workspace_token)
+        .await
+        .map_err(|error| {
+            CowshedError::integrity(
+                format!(
+                    "could not read workspace token {}: {error}",
+                    report.workspace_token.display()
+                ),
+                "run cowshed ensure again; if this persists, run cowshed doctor",
+            )
+        })?;
+    emit_shell_export(output, b"GOENV", report.go_env.as_os_str().as_bytes())?;
+    emit_shell_export(output, b"COWSHED_WORKSPACE_TOKEN", &token)?;
+    if let Some(port_block) = report.port_block {
+        emit_shell_export(
+            output,
+            b"COWSHED_PORT_BASE",
+            port_block.base().to_string().as_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
+fn emit_shell_export<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    name: &[u8],
+    value: &[u8],
+) -> Result<()> {
+    output
+        .bare(b"export ")
+        .and_then(|()| output.bare(name))
+        .and_then(|()| output.bare(b"='"))
+        .map_err(output_error)?;
+    let mut first = true;
+    for part in value.split(|byte| *byte == b'\'') {
+        if !first {
+            output.bare(b"'\\''").map_err(output_error)?;
+        }
+        first = false;
+        output.bare(part).map_err(output_error)?;
+    }
+    output.bare(b"'\n").map_err(output_error)
 }
 
 const fn ensure_action(action: EnsureAction) -> &'static str {
