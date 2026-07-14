@@ -11,12 +11,12 @@ target `tsc-js`; this plugin must not duplicate or rename that target.
 
 - `typecheck-tests` and `typecheck-tests:watch` from `tsconfig.test.json`
 - `test:watch` from explicit `test` commands for Bun and Vitest packages
-- `zig-*` targets from `build.zig` steps such as `zig-wasm`
+- Cargo workspace targets from a neighboring workspace-root `Cargo.toml`
 - aggregate `build` and `lint` targets
 
 ## Nx Target Naming
 
-Target names are `{tool}-{output}` names. Use names like `tsc-js`, `tsdown-js`, and `zig-wasm`; `build` and `lint` are
+Target names are `{tool}-{output}` names. Use names like `tsc-js`, `tsdown-js`, and `cargo-wasm`; `build` and `lint` are
 aggregates.
 
 Concrete targets come from concrete files:
@@ -25,19 +25,17 @@ Concrete targets come from concrete files:
 - `typecheck-tests:watch` is inferred from `tsconfig.test.json` and runs the same typecheck in watch mode.
 - `test:watch` is inferred when the package already defines an explicit Bun or Vitest `test` command. The plugin derives
   the corresponding watch command and makes it depend on `typecheck-tests`.
-- `zig-*` is inferred from `build.zig`; each explicit `b.step("name", ...)` becomes `zig-name`.
+- A workspace-root `Cargo.toml` provides `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`; workspaces with
+  `cdylib` member crates also receive the cacheable `cargo-wasm` output target.
 - `build` is inferred only when the project has at least one concrete build target to run, such as `tsc-js` from the
-  official TypeScript plugin, a package-local target like `tsdown-js`, or a `zig-*` target from this plugin. It depends
-  on output-family wildcard targets: `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`,
+  official TypeScript plugin, a package-local target like `tsdown-js`, or `cargo-wasm` from this plugin. It depends on
+  output-family wildcard targets: `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`,
   `*-bun`, and `*-wasm`.
-
-This is why Zig appears in the convention: the plugin is not guessing from arbitrary Zig source. SmoothBricks requires
-`build.zig` to expose named build steps so Nx can create cacheable, addressable targets from those steps.
 
 Do not use colon-style Nx target names such as `build:wasm` or `lint:fix`. Nx CLI syntax already uses colons for
 `project:target:configuration`, so colon target names are hard to read, easy to confuse with configurations, and awkward
 to expose through package scripts. Package scripts may still use names like `build:wasm`; they should delegate to a real
-target such as `nx run pkg:zig-wasm`.
+target such as `nx run pkg:cargo-wasm`.
 
 There is no Nx `lint:fix` target; repository formatting is handled by the root `lint:fix` script.
 
@@ -48,9 +46,6 @@ mode. Smoo validation creates/requires this config for test runners that do not 
 `tsconfig.test.json` is not a TypeScript build-mode project. It should reference library tsconfigs it needs to typecheck
 against, but the package root `tsconfig.json` should not reference `./tsconfig.test.json`. Nx runs test typechecking
 through the inferred `typecheck-tests` target, not through `tsc --build`.
-
-Zig targets are inferred only when `build.zig` declares at least one `b.step(...)`. Each step becomes a `zig-*` target,
-so a package `build.zig` must have at least one step.
 
 ## Bun Test Tracing Generator
 

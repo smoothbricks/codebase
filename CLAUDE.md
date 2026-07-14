@@ -128,7 +128,7 @@ carries only what the **receiver** needs to act. For the full rules with code ex
 ### Build and Development
 
 - **Build a project**: `nx build <project-name>`; this is an aggregate over output-family targets such as `tsc-js`,
-  `tsdown-js`, and `zig-wasm`
+  `tsdown-js`, and `cargo-wasm`
 - **Type check source**: `nx tsc-js <project-name>`; `@smoothbricks/nx-plugin` infers the target from
   `tsconfig.lib.json` and runs transformer-aware `ttsc`
 - **Generate a new library**: `nx g @nx/js:lib packages/<name> --publishable --importPath=@my-org/<name>`
@@ -226,29 +226,28 @@ This is an Nx-based monorepo using Bun as the package manager, with devenv/diren
 - **TypeScript** with strict mode and composite projects
 - **Code style**: 2 spaces, single quotes, 120 character line width
 - **Nx uses inferred tasks** - don't add build/typecheck scripts to package.json. `@smoothbricks/nx-plugin` infers
-  transformer-aware `tsc-js` from `tsconfig.lib.json`, `typecheck-tests` from `tsconfig.test.json`, `zig-*` from
-  `build.zig` steps, and aggregate `build` / `lint` targets. Do not configure `@nx/js/typescript`; it bypasses the
-  repository's Typia and LMAO transformers.
+  transformer-aware `tsc-js` from `tsconfig.lib.json`, `typecheck-tests` from `tsconfig.test.json`, Cargo workspace
+  targets from `Cargo.toml`, and aggregate `build` / `lint` targets. Do not configure `@nx/js/typescript`; it bypasses
+  the repository's Typia and LMAO transformers.
 - **Compiler/API split:** The root `@typescript/native` alias installs `typescript@^7.0.2` for `ttsc`; devenv exports
   its `node_modules/@typescript/native/bin/tsc` path through `TTSC_TSGO_BINARY`, and CI persists it through
   `GITHUB_ENV`. JavaScript tools import the full TypeScript API from `typescript@^6.0.3`. Keep both: TypeScript 7 under
   the unscoped name breaks Nx API calls.
 - **Where targets come from:** `tsc-js` comes from `tsconfig.lib.json`, `typecheck-tests` from `tsconfig.test.json`, and
-  `zig-*` from explicit `b.step("...")` entries in `build.zig`. Aggregate `build` exists only when concrete build
-  targets exist.
+  Cargo targets from a workspace-root `Cargo.toml`. `cargo-wasm` is inferred only for `cdylib` member crates. Aggregate
+  `build` exists only when concrete build targets exist.
 - **Bun test packages require test typechecking:** `bun test` executes tests without typechecking, so packages that use
   it must have a no-emit `tsconfig.test.json` that infers `typecheck-tests`.
-- **Nx target names are `{tool}-{output}` names** - use `tsc-js`, `tsdown-js`, and `zig-wasm`; `build` and `lint` are
+- **Nx target names are `{tool}-{output}` names** - use `tsc-js`, `tsdown-js`, and `cargo-wasm`; `build` and `lint` are
   aggregates over output-family wildcards like `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`,
   `*-napi`, `*-bun`, and `*-wasm`. Do not use colon target names such as `build:wasm` or `lint:fix`: Nx CLI syntax
   already means `project:target:configuration`, so colon target names are ambiguous with configurations. Package scripts
-  may still be named `build:wasm` when they delegate to a real target like `nx run pkg:zig-wasm`.
+  may still be named `build:wasm` when they delegate to a real target like `nx run pkg:cargo-wasm`.
 - **Commits must be atomic conventional commits** - release changelogs are generated from commit history, so split
   unrelated features, fixes, docs, and chores into separate commits with accurate conventional prefixes and scopes. Do
   not bundle two independent features into one commit just because they were implemented in one session.
 - **Test typechecking is no-emit** - `typecheck-tests` is inferred from `tsconfig.test.json`, which must use `noEmit`,
   must not be `composite`, must not write `dist-test`, and must not be referenced from package root `tsconfig.json`.
-- **Zig package setup** - `build.zig` must declare at least one `b.step(...)`; each step becomes a `zig-*` target.
 - **Run `nx sync`** after modifying tsconfig files or adding/removing package dependencies to keep TypeScript project
   references in sync. Verify with `nx sync:check`.
 

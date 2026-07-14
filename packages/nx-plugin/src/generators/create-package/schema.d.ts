@@ -1,5 +1,5 @@
 export interface CreatePackageGeneratorSchema {
   name: string;
-  variant: 'ts-lib' | 'ts-zig';
+  variant: 'ts-lib';
   public?: boolean;
 }
