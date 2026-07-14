@@ -1,26 +1,41 @@
+#[cfg(target_os = "macos")]
 use std::error::Error;
+#[cfg(target_os = "macos")]
 use std::fs::{self, File};
+#[cfg(target_os = "macos")]
 use std::io::{Seek, SeekFrom, Write};
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
 use cowshed_core::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
+#[cfg(target_os = "macos")]
 use cowshed_core::metadata::{GrantSet, ImageFormat, PortBlock, WorkspaceName};
+#[cfg(target_os = "macos")]
 use cowshed_core::repository::RepoId;
+#[cfg(target_os = "macos")]
 use cowshed_core::storage::CheckpointLabel;
+#[cfg(target_os = "macos")]
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
+#[cfg(target_os = "macos")]
 use cowshed_core::storage::apfs::{
     ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig, IncarnationSource, TokioApfsBlockingLane,
 };
+#[cfg(target_os = "macos")]
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, Destination, LifecyclePlanner, MountIntent, OperationIdentity, Pin, RestoreMode,
     Revision, Substrate,
 };
 
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RequiredFormats {
     Auto,
@@ -29,6 +44,7 @@ enum RequiredFormats {
     Both,
 }
 
+#[cfg(target_os = "macos")]
 impl RequiredFormats {
     fn from_env() -> Result<Self, String> {
         match std::env::var("COWSHED_APFS_REQUIRED")
@@ -61,10 +77,12 @@ impl RequiredFormats {
     }
 }
 
+#[cfg(target_os = "macos")]
 struct IntegrationRoot {
     path: PathBuf,
 }
 
+#[cfg(target_os = "macos")]
 impl IntegrationRoot {
     fn new(format: ImageFormat) -> Result<Self, Box<dyn Error>> {
         let path = PathBuf::from(format!(
@@ -80,14 +98,17 @@ impl IntegrationRoot {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl Drop for IntegrationRoot {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
 }
 
+#[cfg(target_os = "macos")]
 struct DeterministicIncarnations(AtomicU64);
 
+#[cfg(target_os = "macos")]
 impl IncarnationSource for DeterministicIncarnations {
     fn mint(&self) -> Result<cowshed_core::metadata::WorkspaceIncarnation, ApfsStorageError> {
         let value = self.0.fetch_add(1, Ordering::Relaxed);
@@ -96,11 +117,13 @@ impl IncarnationSource for DeterministicIncarnations {
     }
 }
 
+#[cfg(target_os = "macos")]
 struct AttachmentCleanup<'a> {
     host: &'a MacOsApfsExecutionHost<SystemCommandRunner>,
     armed: bool,
 }
 
+#[cfg(target_os = "macos")]
 impl AttachmentCleanup<'_> {
     fn finish(mut self) -> Result<(), ApfsStorageError> {
         let result = self.host.detach_all_reverse();
@@ -109,6 +132,7 @@ impl AttachmentCleanup<'_> {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl Drop for AttachmentCleanup<'_> {
     fn drop(&mut self) {
         if self.armed {
@@ -117,11 +141,13 @@ impl Drop for AttachmentCleanup<'_> {
     }
 }
 
+#[cfg(target_os = "macos")]
 struct ChurnGuard {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<Result<(), std::io::Error>>>,
 }
 
+#[cfg(target_os = "macos")]
 impl ChurnGuard {
     fn finish(mut self) -> Result<(), Box<dyn Error>> {
         self.stop.store(true, Ordering::Release);
@@ -136,6 +162,7 @@ impl ChurnGuard {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl Drop for ChurnGuard {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
