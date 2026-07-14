@@ -3216,13 +3216,6 @@ where
                 if refreshed != old_metadata {
                     continue;
                 }
-                if !canonical.exists() {
-                    return Err(ApfsStorageError::MarkerMismatch(format!(
-                        "restore recovery has no canonical image: canonical={}, undo_sidecar={}",
-                        canonical.display(),
-                        undo_sidecar.display()
-                    )));
-                }
                 let staged = storage
                     .project()
                     .project_root
@@ -3234,6 +3227,18 @@ where
                         old_metadata.image_format.extension()
                     ));
                 let recovery_fact_path = restore_recovery_fact_path(&canonical);
+                if !canonical.exists() {
+                    if !staged.exists() && !recovery_fact_path.exists() {
+                        continue;
+                    }
+                    return Err(ApfsStorageError::MarkerMismatch(format!(
+                        "restore recovery has no canonical image: canonical={}, staged={}, fact={}, undo_sidecar={}",
+                        canonical.display(),
+                        staged.display(),
+                        recovery_fact_path.display(),
+                        undo_sidecar.display()
+                    )));
+                }
                 if recovery_fact_path.exists() {
                     let recovery_fact: RestoreRecoveryFactWire =
                         crate::metadata::read_json(&recovery_fact_path)
