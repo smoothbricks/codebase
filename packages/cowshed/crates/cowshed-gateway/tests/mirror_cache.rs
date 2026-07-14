@@ -183,14 +183,14 @@ async fn collect(outcome: MirrorOutcome) -> (MirrorCacheStatus, Bytes) {
     (status, bytes)
 }
 
-async fn service(root: &TestRoot) -> MirrorService {
+async fn open_service(root: &TestRoot) -> MirrorService {
     MirrorService::new(Cache::open(root.cache_config()).await.expect("open cache"))
 }
 
 #[tokio::test]
 async fn immutable_fill_hit_offline_and_corruption_refusal() {
     let root = TestRoot::new();
-    let service = service(&root).await;
+    let service = open_service(&root).await;
     let artifact = b"immutable registry object";
     let request = request(
         MirrorProtocol::Npm,
@@ -224,6 +224,19 @@ async fn immutable_fill_hit_offline_and_corruption_refusal() {
     assert_eq!(cached.as_ref(), artifact);
     assert_eq!(offline.call_count(), 0);
 
+    drop(service);
+    tokio::task::yield_now().await;
+    let restarted = open_service(&root).await;
+    let (status, persisted) = collect(
+        restarted
+            .execute(request.clone(), UpstreamHealth::Offline, &offline)
+            .await
+            .expect("serve verified offline hit after actor restart"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::Hit);
+    assert_eq!(persisted.as_ref(), artifact);
+
     let object = std::fs::read_dir(root.path())
         .expect("list cache")
         .map(|entry| entry.expect("cache entry").path())
@@ -240,7 +253,8 @@ async fn immutable_fill_hit_offline_and_corruption_refusal() {
     file.write_all(b"!").expect("corrupt cached byte");
     file.sync_all().expect("sync corruption fixture");
 
-    let error = service
+    drop(file);
+    let error = restarted
         .execute(request, UpstreamHealth::Offline, &offline)
         .await
         .expect_err("corrupt offline object must become a miss");
@@ -252,7 +266,7 @@ async fn immutable_fill_hit_offline_and_corruption_refusal() {
 #[tokio::test]
 async fn immutable_digest_mismatch_never_publishes() {
     let root = TestRoot::new();
-    let service = service(&root).await;
+    let service = open_service(&root).await;
     let expected = expectation(b"right bytes");
     let request = request(
         MirrorProtocol::Cargo,
@@ -290,7 +304,7 @@ async fn immutable_digest_mismatch_never_publishes() {
 #[tokio::test]
 async fn upstream_protocol_digest_can_supply_an_immutable_expectation() {
     let root = TestRoot::new();
-    let service = service(&root).await;
+    let service = open_service(&root).await;
     let artifact = b"header-declared immutable object";
     let request = request(
         MirrorProtocol::Npm,
@@ -329,7 +343,7 @@ async fn upstream_protocol_digest_can_supply_an_immutable_expectation() {
 #[tokio::test]
 async fn simultaneous_misses_coalesce_until_atomic_publish() {
     let root = TestRoot::new();
-    let service = Arc::new(service(&root).await);
+    let service = Arc::new(open_service(&root).await);
     let request = request(
         MirrorProtocol::Npm,
         target("registry.npmjs.org"),
@@ -480,7 +494,7 @@ async fn coalesced_fill_waits_have_a_hard_timeout() {
 #[tokio::test]
 async fn scoped_cache_entries_never_cross_project_or_anonymous_boundaries() {
     let root = TestRoot::new();
-    let service = service(&root).await;
+    let service = open_service(&root).await;
     let project_a = request(
         MirrorProtocol::Npm,
         target("npm.private.test"),
@@ -734,7 +748,7 @@ fn policy_rewrite_is_typed_exact_and_scope_bound() {
 #[tokio::test]
 async fn redirect_is_bounded_same_origin_typed_and_never_followed() {
     let root = TestRoot::new();
-    let service = service(&root).await;
+    let service = open_service(&root).await;
     let request = request(
         MirrorProtocol::Npm,
         target("registry.npmjs.org"),
