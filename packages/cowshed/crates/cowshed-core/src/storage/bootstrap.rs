@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, mpsc};
@@ -492,13 +491,9 @@ impl HostCommand {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct OperationId(u8);
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VolumeRef {
     ExistingExact(String),
-    Created(OperationId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -519,6 +514,16 @@ pub enum ExistingStorage {
         exact_identifier: String,
         marker: ExistingMarkerEvidence,
     },
+    /// Exact cowshed APFS volume mounted at its canonical path, but without a marker because a
+    /// prior provisioning transaction stopped before ownership and publication completed.
+    MountedIncomplete {
+        exact_identifier: String,
+    },
+    /// Exact reserved-name cowshed APFS volume in the selected container, detached before its
+    /// marker could become readable. Only explicit provisioning may re-attest and recover it.
+    DetachedIncomplete {
+        exact_identifier: String,
+    },
 }
 
 impl ExistingStorage {
@@ -535,10 +540,24 @@ impl ExistingStorage {
         }
     }
 
+    pub fn mounted_incomplete(exact_identifier: impl Into<String>) -> Self {
+        Self::MountedIncomplete {
+            exact_identifier: exact_identifier.into(),
+        }
+    }
+
+    pub fn detached_incomplete(exact_identifier: impl Into<String>) -> Self {
+        Self::DetachedIncomplete {
+            exact_identifier: exact_identifier.into(),
+        }
+    }
+
     fn exact_identifier(&self) -> Option<&str> {
         match self {
             Self::Absent => None,
             Self::MountedValid { exact_identifier }
+            | Self::MountedIncomplete { exact_identifier }
+            | Self::DetachedIncomplete { exact_identifier }
             | Self::ExistingUnmounted {
                 exact_identifier, ..
             } => Some(exact_identifier),
@@ -563,6 +582,39 @@ pub enum BootstrapEvidence {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ApfsProvisionKind {
+    Create,
+    RepairMounted { exact_identifier: String },
+    RecoverDetached { exact_identifier: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApfsVolumeProvision {
+    name: &'static str,
+    mountpoint: PathBuf,
+    role: VolumeRole,
+    kind: ApfsProvisionKind,
+}
+
+impl ApfsVolumeProvision {
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub fn mountpoint(&self) -> &Path {
+        &self.mountpoint
+    }
+
+    pub fn role(&self) -> VolumeRole {
+        self.role
+    }
+
+    pub fn kind(&self) -> &ApfsProvisionKind {
+        &self.kind
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostOperation {
     VerifyZfsDelegation {
         pool: String,
@@ -574,15 +626,15 @@ pub enum HostOperation {
         substrate: SubstrateKind,
     },
     EnsureDirectory(PathBuf),
-    CreateApfsVolume {
-        id: OperationId,
-        container: String,
-        name: &'static str,
-        command: HostCommand,
-    },
     MountApfsVolume {
         mountpoint: PathBuf,
         volume: VolumeRef,
+    },
+    /// Provision or recover every incomplete cowshed APFS volume under one explicit
+    /// Authorization Services session.
+    ProvisionApfsVolumes {
+        container: String,
+        volumes: Vec<ApfsVolumeProvision>,
     },
     RunCommand(HostCommand),
     WriteMarkerAtomic {
@@ -662,37 +714,55 @@ fn plan_apfs(
     validate_existing_marker(store, VolumeRole::Store, SubstrateKind::Apfs)?;
     validate_existing_marker(caches, VolumeRole::Caches, SubstrateKind::Apfs)?;
 
-    let mut operations = vec![guard(roots.store(), VolumeRole::Store, SubstrateKind::Apfs)];
+    let store_is_batched = matches!(
+        store,
+        ExistingStorage::Absent
+            | ExistingStorage::MountedIncomplete { .. }
+            | ExistingStorage::DetachedIncomplete { .. }
+    );
+    let mut operations = Vec::new();
+    let mut volumes = Vec::new();
+
+    if !matches!(store, ExistingStorage::MountedIncomplete { .. }) {
+        operations.push(guard(roots.store(), VolumeRole::Store, SubstrateKind::Apfs));
+    }
     plan_apfs_volume(
         &mut operations,
-        OperationId(0),
-        container,
+        &mut volumes,
         roots.store(),
         APFS_STORE_VOLUME,
         VolumeRole::Store,
         store,
     );
-    operations.push(guard(
-        roots.caches(),
-        VolumeRole::Caches,
-        SubstrateKind::Apfs,
-    ));
+
+    if !store_is_batched && !matches!(caches, ExistingStorage::MountedIncomplete { .. }) {
+        operations.push(guard(
+            roots.caches(),
+            VolumeRole::Caches,
+            SubstrateKind::Apfs,
+        ));
+    }
     plan_apfs_volume(
         &mut operations,
-        OperationId(1),
-        container,
+        &mut volumes,
         roots.caches(),
         APFS_CACHES_VOLUME,
         VolumeRole::Caches,
         caches,
     );
+
+    if !volumes.is_empty() {
+        operations.push(HostOperation::ProvisionApfsVolumes {
+            container: container.to_owned(),
+            volumes,
+        });
+    }
     Ok(operations)
 }
 
 fn plan_apfs_volume(
     operations: &mut Vec<HostOperation>,
-    id: OperationId,
-    container: &str,
+    volumes: &mut Vec<ApfsVolumeProvision>,
     mountpoint: &Path,
     volume_name: &'static str,
     role: VolumeRole,
@@ -700,29 +770,31 @@ fn plan_apfs_volume(
 ) {
     match state {
         ExistingStorage::MountedValid { .. } => {}
-        ExistingStorage::Absent => {
-            operations.push(HostOperation::EnsureDirectory(mountpoint.to_owned()));
-            operations.push(HostOperation::CreateApfsVolume {
-                id,
-                container: container.to_owned(),
+        ExistingStorage::Absent => volumes.push(ApfsVolumeProvision {
+            name: volume_name,
+            mountpoint: mountpoint.to_owned(),
+            role,
+            kind: ApfsProvisionKind::Create,
+        }),
+        ExistingStorage::MountedIncomplete { exact_identifier } => {
+            volumes.push(ApfsVolumeProvision {
                 name: volume_name,
-                command: HostCommand::new(
-                    DISKUTIL,
-                    [
-                        "apfs",
-                        "addVolume",
-                        container,
-                        "APFS",
-                        volume_name,
-                        "-nomount",
-                    ],
-                ),
+                mountpoint: mountpoint.to_owned(),
+                role,
+                kind: ApfsProvisionKind::RepairMounted {
+                    exact_identifier: exact_identifier.clone(),
+                },
             });
-            operations.push(apfs_mount(mountpoint, VolumeRef::Created(id)));
-            operations.push(marker(
-                mountpoint,
-                VolumeMarker::new(role, SubstrateKind::Apfs),
-            ));
+        }
+        ExistingStorage::DetachedIncomplete { exact_identifier } => {
+            volumes.push(ApfsVolumeProvision {
+                name: volume_name,
+                mountpoint: mountpoint.to_owned(),
+                role,
+                kind: ApfsProvisionKind::RecoverDetached {
+                    exact_identifier: exact_identifier.clone(),
+                },
+            });
         }
         ExistingStorage::ExistingUnmounted {
             exact_identifier, ..
@@ -865,6 +937,14 @@ fn validate_existing_marker(
 }
 
 fn validate_zfs_evidence(state: &ExistingStorage, expected: &str) -> Result<(), PlanError> {
+    if matches!(
+        state,
+        ExistingStorage::MountedIncomplete { .. } | ExistingStorage::DetachedIncomplete { .. }
+    ) {
+        return Err(PlanError::ImpossibleStorageTopology(
+            "incomplete APFS provisioning evidence cannot describe a ZFS dataset",
+        ));
+    }
     if let Some(actual) = state.exact_identifier()
         && actual != expected
     {
@@ -914,6 +994,12 @@ fn plan_zfs_mounted_dataset(
             ));
             operations.push(command(ZFS, ["mount", dataset]));
             operations.push(guard(mountpoint, role, SubstrateKind::Zfs));
+        }
+        ExistingStorage::MountedIncomplete { .. } => {
+            unreachable!("incomplete APFS evidence was rejected for ZFS planning")
+        }
+        ExistingStorage::DetachedIncomplete { .. } => {
+            unreachable!("incomplete APFS evidence was rejected for ZFS planning")
         }
     }
 }
@@ -1011,6 +1097,11 @@ pub trait BootstrapHost: Send + Sync {
     fn inspect_mountpoint(&self, path: &Path) -> Result<MountpointState, HostError>;
     fn create_dir_all(&self, path: &Path) -> Result<(), HostError>;
     fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError>;
+    fn provision_apfs_volumes(
+        &self,
+        container: &str,
+        volumes: &[ApfsVolumeProvision],
+    ) -> Result<(), HostError>;
     fn write_file_atomic(&self, path: &Path, contents: &[u8]) -> Result<(), HostError>;
 }
 
@@ -1057,54 +1148,45 @@ where
     H: BootstrapHost + 'static,
     L: BlockingLane,
 {
-    let mut created_volumes = BTreeMap::new();
     for operation in plan.operations() {
-        let operation = resolve_operation(operation, &created_volumes)?;
+        let operation = resolve_operation(operation)?;
         let host = Arc::clone(&host);
         let (sender, receiver) = mpsc::sync_channel(1);
         lane.dispatch(Box::new(move || {
-            let result = apply_operation(host.as_ref(), &operation)?;
-            sender.send(result).map_err(|_| {
+            apply_operation(host.as_ref(), &operation)?;
+            sender.send(()).map_err(|_| {
                 BootstrapExecutionError::BlockingLane(
                     "bootstrap operation result receiver closed".to_owned(),
                 )
             })
         }))
         .await?;
-        let result = receiver.try_recv().map_err(|error| {
+        receiver.try_recv().map_err(|error| {
             BootstrapExecutionError::BlockingLane(format!(
                 "bootstrap operation produced no result: {error}"
             ))
         })?;
-        if let Some((id, exact_identifier)) = result
-            && created_volumes.insert(id, exact_identifier).is_some()
-        {
-            return Err(BootstrapExecutionError::DuplicateOperationId(id));
-        }
     }
     Ok(())
 }
 
-fn resolve_operation(
-    operation: &HostOperation,
-    created_volumes: &BTreeMap<OperationId, String>,
-) -> Result<HostOperation, BootstrapExecutionError> {
+fn resolve_operation(operation: &HostOperation) -> Result<HostOperation, BootstrapExecutionError> {
     let HostOperation::MountApfsVolume { mountpoint, volume } = operation else {
         return Ok(operation.clone());
     };
-    let exact_identifier = match volume {
-        VolumeRef::ExistingExact(identifier) => identifier,
-        VolumeRef::Created(id) => created_volumes
-            .get(id)
-            .ok_or(BootstrapExecutionError::UnresolvedCreatedVolume(*id))?,
-    };
+    let VolumeRef::ExistingExact(exact_identifier) = volume;
+    let mountpoint = mountpoint.to_str().ok_or_else(|| {
+        BootstrapExecutionError::Host(HostError::new(format!(
+            "APFS mountpoint is not UTF-8: {mountpoint:?}"
+        )))
+    })?;
     Ok(HostOperation::RunCommand(HostCommand::new(
         DISKUTIL,
         [
             "mount",
             "-nobrowse",
             "-mountPoint",
-            &mountpoint.to_string_lossy(),
+            mountpoint,
             exact_identifier,
         ],
     )))
@@ -1113,14 +1195,13 @@ fn resolve_operation(
 fn apply_operation(
     host: &dyn BootstrapHost,
     operation: &HostOperation,
-) -> Result<Option<(OperationId, String)>, BootstrapExecutionError> {
+) -> Result<(), BootstrapExecutionError> {
     match operation {
         HostOperation::VerifyZfsDelegation {
             pool,
             required_root,
         } => host
             .verify_zfs_delegation(pool, required_root)
-            .map(|()| None)
             .map_err(BootstrapExecutionError::Host),
         HostOperation::GuardMountpoint {
             path,
@@ -1130,13 +1211,13 @@ fn apply_operation(
             .inspect_mountpoint(path)
             .map_err(BootstrapExecutionError::Host)?
         {
-            MountpointState::Missing | MountpointState::EmptyDirectory => Ok(None),
+            MountpointState::Missing | MountpointState::EmptyDirectory => Ok(()),
             MountpointState::NonEmptyDirectoryWithoutMount => {
                 Err(BootstrapExecutionError::MaskedData(path.clone()))
             }
             MountpointState::Mounted { marker } => {
                 require_mounted_marker(marker.as_deref(), *role, *substrate)
-                    .map(|_| None)
+                    .map(|_| ())
                     .map_err(|source| BootstrapExecutionError::MountGuard {
                         path: path.clone(),
                         source,
@@ -1145,30 +1226,17 @@ fn apply_operation(
         },
         HostOperation::EnsureDirectory(path) => host
             .create_dir_all(path)
-            .map(|()| None)
             .map_err(BootstrapExecutionError::Host),
-        HostOperation::CreateApfsVolume {
-            id,
-            container,
-            name,
-            command,
-        } => {
-            let output = run_host_command(host, command)?;
-            let exact_identifier = parse_created_apfs_identifier(&output.stdout)?;
-            let info_command =
-                HostCommand::new(DISKUTIL, ["info", "-plist", exact_identifier.as_str()]);
-            let info = run_host_command(host, &info_command)?;
-            attest_created_apfs_info(&info.stdout, &exact_identifier, container, name)?;
-            Ok(Some((*id, exact_identifier)))
-        }
         HostOperation::MountApfsVolume { .. } => {
             Err(BootstrapExecutionError::UnresolvedMountOperation)
         }
-        HostOperation::RunCommand(command) => run_host_command(host, command).map(|_| None),
+        HostOperation::RunCommand(command) => run_host_command(host, command).map(|_| ()),
+        HostOperation::ProvisionApfsVolumes { container, volumes } => host
+            .provision_apfs_volumes(container, volumes)
+            .map_err(BootstrapExecutionError::Host),
         HostOperation::WriteMarkerAtomic { path, marker } => {
             let contents = marker.to_json().map_err(BootstrapExecutionError::Marker)?;
             host.write_file_atomic(path, &contents)
-                .map(|()| None)
                 .map_err(BootstrapExecutionError::Host)
         }
     }
@@ -1301,10 +1369,6 @@ pub enum BootstrapExecutionError {
     },
     #[error(transparent)]
     Marker(MarkerError),
-    #[error("bootstrap plan reused APFS creation operation {0:?}")]
-    DuplicateOperationId(OperationId),
-    #[error("APFS mount references creation operation {0:?} before it completed")]
-    UnresolvedCreatedVolume(OperationId),
     #[error("APFS mount operation reached execution without an exact DeviceIdentifier")]
     UnresolvedMountOperation,
     #[error("cannot identify the newly created APFS volume: {0}")]
