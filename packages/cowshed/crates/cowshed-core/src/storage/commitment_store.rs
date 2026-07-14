@@ -163,12 +163,27 @@ impl CommitmentStore {
         self.writer_id
     }
 
-    pub(crate) fn workspace_is_introduced(&self, incarnation: &WorkspaceIncarnation) -> bool {
-        self.context.is_introduced(incarnation)
+    pub(crate) fn workspace_is_introduced(
+        &self,
+        repo_id: &RepoId,
+        incarnation: &WorkspaceIncarnation,
+    ) -> bool {
+        self.context.is_introduced(repo_id, incarnation)
     }
 
-    pub(crate) fn workspace_is_retired(&self, incarnation: &WorkspaceIncarnation) -> bool {
-        self.context.is_retired(incarnation)
+    pub(crate) fn workspace_is_retired(
+        &self,
+        repo_id: &RepoId,
+        incarnation: &WorkspaceIncarnation,
+    ) -> bool {
+        self.context.is_retired(repo_id, incarnation)
+    }
+
+    pub fn refresh(&mut self) -> Result<(), CommitmentStoreError> {
+        let lock = acquire_lock(&self.root)?;
+        self.context = recover_context(&self.root, &self.baseline)?;
+        drop(lock);
+        Ok(())
     }
 
     pub fn publish(
@@ -179,6 +194,7 @@ impl CommitmentStore {
         let lock = acquire_lock(&self.root)?;
         let recovered = recover_context(&self.root, &self.baseline)?;
         if recovered.last_order() != self.context.last_order() {
+            self.context = recovered;
             return Err(CommitmentStoreError::Conflict { order });
         }
 
@@ -236,6 +252,7 @@ impl CommitmentStore {
         ) {
             Ok(()) => cleanup.disarm(),
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                self.context = recover_context(&self.root, &self.baseline)?;
                 return Err(CommitmentStoreError::Conflict { order });
             }
             Err(source) => return Err(io_failure("publishing commitment segment", source)),

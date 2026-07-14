@@ -107,14 +107,15 @@ Cowshed uses Arrow IPC for both tiers, but placement and authority differ:
   `~/.cowshed/telemetry/`. Controller job commitments own existence, lifecycle/status, ordering, lineage, byte counts,
   and expected hashes. They never contain inline output, a protected artifact path, a redirect source, or any other raw
   stdout/stderr payload duplication.
-- **Controller immutable per-writer segments** — controller telemetry/commitment segments each have one exclusively
-  allocated writer. Authoritative commitments use exactly one Arrow IPC batch containing one row per segment at
-  `<host-telemetry-root>/<yyyy-mm-dd>/commitment-<order:020>-<writer_uuid>.arrow`, where the UTC partition is an exact
-  calendar date and `writer_uuid` is lowercase hyphenated UUID text owned by that controller session. A completed
-  segment is mode `0600`, sealed by create-new atomic rename, parent-directory-fsynced, and never reopened, replaced, or
-  shared for append. Recovery no-follow enumerates exact date partitions and commitment names, rejects links, malformed
-  or duplicate names/orders, validates every batch against `CommitmentPriorContext`, and accepts only one globally
-  contiguous order across partitions. Unrelated telemetry names and unsealed dot-prefixed temporary names are not
+- **Controller immutable per-writer segments** — all projects on a host share one controller commitment segment
+  namespace; it is not partitioned by repository. Authoritative commitments use exactly one Arrow IPC batch containing
+  one row per segment at `<host-telemetry-root>/<yyyy-mm-dd>/commitment-<order:020>-<writer_uuid>.arrow`, where the UTC
+  partition is an exact calendar date and `writer_uuid` is lowercase hyphenated UUID text owned by that controller
+  session. A completed segment is mode `0600`, sealed by create-new atomic rename, parent-directory-fsynced, and never
+  reopened, replaced, or shared for append. Recovery no-follow enumerates exact date partitions and commitment names,
+  rejects links, malformed or duplicate names/orders, and accepts only one globally contiguous order across every
+  repository and date partition. Validation applies each row to the context selected by its `repo_id`; a valid
+  foreign-repository row is not corruption. Unrelated telemetry names and unsealed dot-prefixed temporary names are not
   commitment authority. Partitioning by day is a query/retention layout, not shared-file append. This rule does not
   describe the separately locked protected `.cowshed/job/records.arrow` framed stream above.
 - **Controller producer capability delivery** — each controller telemetry producer receives a dedicated IPC channel or
@@ -201,11 +202,21 @@ Controller continuity is the exact tagged/versioned union:
 
 ```rust
 enum ControllerCommitment {
+    WorkspaceIntroduced(WorkspaceIntroducedCommitment),
+    WorkspaceRetired(WorkspaceRetiredCommitment),
     Admission(AdmissionCommitment),
     Terminal(TerminalCommitment),
     Checkpoint(CheckpointCommitment),
     Fork(ForkCommitment),
     Restore(RestoreCommitment),
+}
+struct WorkspaceIntroducedCommitment {
+    version: u16, order: u64, repo_id: RepoId,
+    workspace_incarnation: WorkspaceIncarnation,
+}
+struct WorkspaceRetiredCommitment {
+    version: u16, order: u64, repo_id: RepoId,
+    workspace_incarnation: WorkspaceIncarnation,
 }
 struct AdmissionCommitment {
     version: u16, order: u64, repo_id: RepoId,
@@ -236,11 +247,22 @@ variant-selected
 `workspace_incarnation, job_id, grant_revision, state, stdout_bytes, stdout_sha256, stderr_bytes, stderr_sha256, batch_sha256, origin_incarnation, checkpoint_id, barrier_id, manifest_batch_sha256, source_incarnation, destination_incarnation, source_checkpoint`.
 Non-selected fields are null and the tag controls required fields.
 
-`order` is positive, globally unique, and strictly increasing. `CommitmentPriorContext` carries the previous order,
-known admissions/terminals/checkpoints, and incarnation lineage into `validate_commitments` across batches/segments.
-Validation requires admission before one terminal, terminal-only `state`, matching repositories, existing checkpoint
-sources, and acyclic fork/restore lineage. Constructors and Arrow/JSON encode/decode invoke the same row and collection
-validator; no derive-only path bypasses it.
+`order` is positive and belongs to one host-global, strictly increasing, gap-free sequence across all repositories.
+`CommitmentPriorContext` therefore splits into a global `last_order` and a component-safe map from `RepoId` to that
+repository's admissions, terminals, checkpoints, and incarnation lineage. Opening a project merges its verified active
+and retired storage baseline only into that project's component. A foreign repository receives no authority from the
+opening project's baseline: its history must first establish each incarnation through `WorkspaceIntroduced`, `Fork`, or
+`Restore`, and `WorkspaceRetired` removes that authority. Identical incarnation bytes in different repositories remain
+independent because every lookup is repository-scoped. Admission, terminal, checkpoint, fork source, and restore source
+all reject an unknown or retired incarnation in their own repository. Constructors and Arrow/JSON encode/decode invoke
+the same row and collection validator; no derive-only path bypasses it.
+
+Immutable publication uses the filesystem lock only to recover the complete segment set and append one create-new
+segment. A publisher refreshes under that lock before assigning an order to a draft. If another valid writer advances
+the global sequence or deliberately wins the same-order destination, the stale store adopts the recovered context and
+the publisher retries the unchanged draft at the new next order with a bounded conflict count. Such a known concurrent
+advance is an operational conflict, not integrity failure; malformed, duplicate, gapped, or lineage-invalid history
+still fails closed as `Integrity`. A draft is acknowledged exactly once only after its immutable segment is durable.
 
 No commitment variant contains `inline_bytes`, `protected_path`, `source_path`, summary text, or output payload.
 `reconcile_commitments` compares protected content counts/hashes plus Job `batch_sha256` and checkpoint

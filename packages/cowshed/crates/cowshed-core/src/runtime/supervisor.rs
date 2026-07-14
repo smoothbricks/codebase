@@ -38,6 +38,7 @@ const DEFAULT_EVENT_CAPACITY: usize = 64;
 const PROCESS_IO_CHUNK: usize = 64 * 1024;
 const MAX_LOG_READ: usize = 64 * 1024;
 const MAX_PENDING_STDIN_BYTES: usize = 256 * 1024;
+const MAX_COMMITMENT_CONFLICT_RETRIES: usize = 8;
 
 /// Exact immutable authority carried by every cheap supervisor handle.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -581,7 +582,7 @@ enum CommitmentRequest {
     },
 }
 
-/// Dedicated repo-wide owner for commitment order and durable publication.
+/// Dedicated controller owner for globally ordered commitment publication.
 pub struct CommitmentPublisher;
 
 impl CommitmentPublisher {
@@ -616,23 +617,32 @@ impl CommitmentPublisher {
                         workspace_incarnation,
                         reply,
                     } => {
-                        let result = if store.workspace_is_retired(&workspace_incarnation) {
-                            Err(CowshedError::integrity(
-                                "active storage fact references a retired workspace incarnation",
-                                "cowshed doctor --json",
-                            ))
-                        } else if store.workspace_is_introduced(&workspace_incarnation) {
-                            Ok(None)
-                        } else {
-                            publish_draft(
-                                &mut store,
-                                CommitmentDraft::WorkspaceIntroduced {
-                                    repo_id,
-                                    workspace_incarnation,
-                                },
-                            )
-                            .map(Some)
-                        };
+                        let result = store
+                            .refresh()
+                            .map_err(map_commitment_error)
+                            .and_then(|()| {
+                                if store
+                                    .workspace_is_retired(&repo_id, &workspace_incarnation)
+                                {
+                                    Err(CowshedError::integrity(
+                                        "active storage fact references a retired workspace incarnation",
+                                        "cowshed doctor --json",
+                                    ))
+                                } else if store
+                                    .workspace_is_introduced(&repo_id, &workspace_incarnation)
+                                {
+                                    Ok(None)
+                                } else {
+                                    publish_draft(
+                                        &mut store,
+                                        CommitmentDraft::WorkspaceIntroduced {
+                                            repo_id,
+                                            workspace_incarnation,
+                                        },
+                                    )
+                                    .map(Some)
+                                }
+                            });
                         let _ = reply.send(result);
                     }
                     CommitmentRequest::EnsureWorkspaceRetired {
@@ -640,18 +650,23 @@ impl CommitmentPublisher {
                         workspace_incarnation,
                         reply,
                     } => {
-                        let result = if store.workspace_is_retired(&workspace_incarnation) {
-                            Ok(None)
-                        } else {
-                            publish_draft(
-                                &mut store,
-                                CommitmentDraft::WorkspaceRetired {
-                                    repo_id,
-                                    workspace_incarnation,
-                                },
-                            )
-                            .map(Some)
-                        };
+                        let result = store
+                            .refresh()
+                            .map_err(map_commitment_error)
+                            .and_then(|()| {
+                                if store.workspace_is_retired(&repo_id, &workspace_incarnation) {
+                                    Ok(None)
+                                } else {
+                                    publish_draft(
+                                        &mut store,
+                                        CommitmentDraft::WorkspaceRetired {
+                                            repo_id,
+                                            workspace_incarnation,
+                                        },
+                                    )
+                                    .map(Some)
+                                }
+                            });
                         let _ = reply.send(result);
                     }
                 }
@@ -662,11 +677,17 @@ impl CommitmentPublisher {
 }
 
 fn publish_draft(store: &mut CommitmentStore, draft: CommitmentDraft) -> Result<u64> {
-    let order = store.next_order().map_err(map_commitment_error)?;
-    store
-        .publish(draft.into_commitment(order))
-        .map_err(map_commitment_error)?;
-    Ok(order)
+    for attempt in 0..=MAX_COMMITMENT_CONFLICT_RETRIES {
+        store.refresh().map_err(map_commitment_error)?;
+        let order = store.next_order().map_err(map_commitment_error)?;
+        match store.publish(draft.clone().into_commitment(order)) {
+            Ok(()) => return Ok(order),
+            Err(CommitmentStoreError::Conflict { .. })
+                if attempt < MAX_COMMITMENT_CONFLICT_RETRIES => {}
+            Err(error) => return Err(map_commitment_error(error)),
+        }
+    }
+    unreachable!("bounded conflict loop returns on its final attempt")
 }
 
 #[derive(Clone)]

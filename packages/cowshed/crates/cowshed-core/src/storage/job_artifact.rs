@@ -3572,16 +3572,8 @@ fn require_variant_columns(
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct DurableJobKey {
-    workspace_incarnation: WorkspaceIncarnation,
-    job_id: JobId,
-}
-
-#[derive(Clone, Debug)]
-pub struct CommitmentPriorContext {
-    repo_id: RepoId,
-    last_order: u64,
+#[derive(Clone, Debug, Default)]
+struct RepositoryCommitmentContext {
     active_incarnations: BTreeSet<WorkspaceIncarnation>,
     introduced_incarnations: BTreeSet<WorkspaceIncarnation>,
     retired_incarnations: BTreeSet<WorkspaceIncarnation>,
@@ -3591,21 +3583,30 @@ pub struct CommitmentPriorContext {
     last_barriers: BTreeMap<WorkspaceIncarnation, u64>,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DurableJobKey {
+    workspace_incarnation: WorkspaceIncarnation,
+    job_id: JobId,
+}
+
+#[derive(Clone, Debug)]
+pub struct CommitmentPriorContext {
+    last_order: u64,
+    repositories: BTreeMap<RepoId, RepositoryCommitmentContext>,
+}
+
 impl CommitmentPriorContext {
     pub fn new(
         repo_id: RepoId,
         known_incarnations: impl IntoIterator<Item = WorkspaceIncarnation>,
     ) -> Self {
-        Self {
-            repo_id,
-            last_order: 0,
+        let repository = RepositoryCommitmentContext {
             active_incarnations: known_incarnations.into_iter().collect(),
-            introduced_incarnations: BTreeSet::new(),
-            retired_incarnations: BTreeSet::new(),
-            admissions: BTreeMap::new(),
-            terminals: BTreeSet::new(),
-            checkpoints: BTreeMap::new(),
-            last_barriers: BTreeMap::new(),
+            ..RepositoryCommitmentContext::default()
+        };
+        Self {
+            last_order: 0,
+            repositories: BTreeMap::from([(repo_id, repository)]),
         }
     }
 
@@ -3613,12 +3614,20 @@ impl CommitmentPriorContext {
         self.last_order
     }
 
-    pub(crate) fn is_introduced(&self, incarnation: &WorkspaceIncarnation) -> bool {
-        self.introduced_incarnations.contains(incarnation)
+    pub(crate) fn is_introduced(
+        &self,
+        repo_id: &RepoId,
+        incarnation: &WorkspaceIncarnation,
+    ) -> bool {
+        self.repositories
+            .get(repo_id)
+            .is_some_and(|repository| repository.introduced_incarnations.contains(incarnation))
     }
 
-    pub(crate) fn is_retired(&self, incarnation: &WorkspaceIncarnation) -> bool {
-        self.retired_incarnations.contains(incarnation)
+    pub(crate) fn is_retired(&self, repo_id: &RepoId, incarnation: &WorkspaceIncarnation) -> bool {
+        self.repositories
+            .get(repo_id)
+            .is_some_and(|repository| repository.retired_incarnations.contains(incarnation))
     }
 }
 
@@ -3629,12 +3638,6 @@ pub fn validate_commitments(
     let mut context = prior.clone();
     for commitment in commitments {
         commitment.validate()?;
-        if commitment.repo_id() != &context.repo_id {
-            return Err(ArtifactError::Integrity {
-                offset: 0,
-                message: "controller commitment belongs to a foreign repository".into(),
-            });
-        }
         let expected_order =
             context
                 .last_order
@@ -3650,12 +3653,16 @@ pub fn validate_commitments(
             });
         }
         context.last_order = commitment.order();
+        let repository = context
+            .repositories
+            .entry(commitment.repo_id().clone())
+            .or_default();
         match commitment {
             ControllerCommitment::WorkspaceIntroduced(value) => {
-                if context
+                if repository
                     .introduced_incarnations
                     .contains(&value.workspace_incarnation)
-                    || context
+                    || repository
                         .retired_incarnations
                         .contains(&value.workspace_incarnation)
                 {
@@ -3666,18 +3673,18 @@ pub fn validate_commitments(
                                 .into(),
                     });
                 }
-                context
+                repository
                     .introduced_incarnations
                     .insert(value.workspace_incarnation.clone());
-                context
+                repository
                     .active_incarnations
                     .insert(value.workspace_incarnation.clone());
             }
             ControllerCommitment::WorkspaceRetired(value) => {
-                if context
+                if repository
                     .retired_incarnations
                     .contains(&value.workspace_incarnation)
-                    || !context
+                    || !repository
                         .active_incarnations
                         .remove(&value.workspace_incarnation)
                 {
@@ -3687,12 +3694,12 @@ pub fn validate_commitments(
                             .into(),
                     });
                 }
-                context
+                repository
                     .retired_incarnations
                     .insert(value.workspace_incarnation.clone());
             }
             ControllerCommitment::Admission(value) => {
-                if !context
+                if !repository
                     .active_incarnations
                     .contains(&value.workspace_incarnation)
                 {
@@ -3705,7 +3712,7 @@ pub fn validate_commitments(
                     workspace_incarnation: value.workspace_incarnation.clone(),
                     job_id: value.job_id,
                 };
-                if context
+                if repository
                     .admissions
                     .insert(key, value.grant_revision)
                     .is_some()
@@ -3717,20 +3724,21 @@ pub fn validate_commitments(
                 }
             }
             ControllerCommitment::Terminal(value) => {
-                if !context
+                if !repository
                     .active_incarnations
                     .contains(&value.workspace_incarnation)
                 {
                     return Err(ArtifactError::Integrity {
                         offset: 0,
-                        message: "terminal commitment follows workspace retirement".into(),
+                        message: "terminal commitment references an unknown or retired workspace"
+                            .into(),
                     });
                 }
                 let key = DurableJobKey {
                     workspace_incarnation: value.workspace_incarnation.clone(),
                     job_id: value.job_id,
                 };
-                let Some(grant_revision) = context.admissions.get(&key) else {
+                let Some(grant_revision) = repository.admissions.get(&key) else {
                     return Err(ArtifactError::Integrity {
                         offset: 0,
                         message: "terminal commitment precedes job admission".into(),
@@ -3742,7 +3750,7 @@ pub fn validate_commitments(
                         message: "terminal grant revision differs from admission".into(),
                     });
                 }
-                if !context.terminals.insert(key) {
+                if !repository.terminals.insert(key) {
                     return Err(ArtifactError::Integrity {
                         offset: 0,
                         message: "job has more than one terminal commitment".into(),
@@ -3750,7 +3758,7 @@ pub fn validate_commitments(
                 }
             }
             ControllerCommitment::Checkpoint(value) => {
-                if !context
+                if !repository
                     .active_incarnations
                     .contains(&value.origin_incarnation)
                 {
@@ -3759,7 +3767,7 @@ pub fn validate_commitments(
                         message: "checkpoint references an unknown origin incarnation".into(),
                     });
                 }
-                let previous = context
+                let previous = repository
                     .last_barriers
                     .entry(value.origin_incarnation.clone())
                     .or_insert(0);
@@ -3770,7 +3778,7 @@ pub fn validate_commitments(
                     });
                 }
                 *previous = value.barrier_id;
-                if context
+                if repository
                     .checkpoints
                     .insert(
                         value.checkpoint_id.clone(),
@@ -3780,18 +3788,18 @@ pub fn validate_commitments(
                 {
                     return Err(ArtifactError::Integrity {
                         offset: 0,
-                        message: "checkpoint id is not globally unique".into(),
+                        message: "checkpoint id is not unique within its repository".into(),
                     });
                 }
             }
             ControllerCommitment::Fork(value) => {
-                if !context
+                if !repository
                     .active_incarnations
                     .contains(&value.source_incarnation)
-                    || context
+                    || repository
                         .introduced_incarnations
                         .contains(&value.destination_incarnation)
-                    || context
+                    || repository
                         .retired_incarnations
                         .contains(&value.destination_incarnation)
                 {
@@ -3801,23 +3809,23 @@ pub fn validate_commitments(
                             .into(),
                     });
                 }
-                context
+                repository
                     .introduced_incarnations
                     .insert(value.destination_incarnation.clone());
-                context
+                repository
                     .active_incarnations
                     .insert(value.destination_incarnation.clone());
             }
             ControllerCommitment::Restore(value) => {
-                if context.checkpoints.get(&value.source_checkpoint)
+                if repository.checkpoints.get(&value.source_checkpoint)
                     != Some(&value.source_incarnation)
-                    || !context
+                    || !repository
                         .active_incarnations
                         .contains(&value.source_incarnation)
-                    || context
+                    || repository
                         .introduced_incarnations
                         .contains(&value.destination_incarnation)
-                    || context
+                    || repository
                         .retired_incarnations
                         .contains(&value.destination_incarnation)
                 {
@@ -3828,16 +3836,16 @@ pub fn validate_commitments(
                                 .into(),
                     });
                 }
-                context
+                repository
                     .active_incarnations
                     .remove(&value.source_incarnation);
-                context
+                repository
                     .retired_incarnations
                     .insert(value.source_incarnation.clone());
-                context
+                repository
                     .introduced_incarnations
                     .insert(value.destination_incarnation.clone());
-                context
+                repository
                     .active_incarnations
                     .insert(value.destination_incarnation.clone());
             }
