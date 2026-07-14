@@ -106,6 +106,13 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
     }
 }
 
+fn runtime_open_repo_id(command: &Command) -> Result<Option<RepoId>> {
+    match command {
+        Command::Adopt(args) => args.repo_id.as_deref().map(os_repo_id_ref).transpose(),
+        _ => Ok(None),
+    }
+}
+
 pub struct ActorBridge {
     coordinator: Option<Coordinator>,
     connection: Option<JoinHandle<Result<()>>>,
@@ -113,8 +120,11 @@ pub struct ActorBridge {
 }
 
 impl ActorBridge {
-    pub async fn open_for_adopt(project_root: &Path) -> Result<Self> {
-        let runtime = ProjectRuntime::open_for_adopt(project_root).await?;
+    pub async fn open_for_adopt(
+        project_root: &Path,
+        requested_repo_id: Option<RepoId>,
+    ) -> Result<Self> {
+        let runtime = ProjectRuntime::open_for_adopt(project_root, requested_repo_id).await?;
         Self::from_runtime(project_root, runtime).await
     }
 
@@ -769,8 +779,17 @@ fn adopt_options(args: AdoptArgs) -> Result<AdoptOptions> {
 }
 
 fn os_repo_id(value: std::ffi::OsString) -> Result<RepoId> {
-    let value = os_utf8(value)?;
-    RepoId::parse(&value).map_err(|error| {
+    os_repo_id_ref(&value)
+}
+
+fn os_repo_id_ref(value: &std::ffi::OsStr) -> Result<RepoId> {
+    let value = value.to_str().ok_or_else(|| {
+        usage(
+            "this option requires valid UTF-8",
+            "use UTF-8 for control options; child argv may contain arbitrary Unix bytes",
+        )
+    })?;
+    RepoId::parse(value).map_err(|error| {
         usage(
             format!("invalid repository identity: {error}"),
             "use an explicit owner/repository identity",
@@ -1179,9 +1198,10 @@ where
     E: Write + Send,
 {
     let mode = runtime_open_mode(&cli.command);
+    let requested_repo_id = runtime_open_repo_id(&cli.command)?;
     let root = resolve_project_root(&cli).await?;
     let bridge = match mode {
-        RuntimeOpenMode::Provision => ActorBridge::open_for_adopt(&root).await?,
+        RuntimeOpenMode::Provision => ActorBridge::open_for_adopt(&root, requested_repo_id).await?,
         RuntimeOpenMode::ExistingOnly => ActorBridge::open_existing(&root).await?,
     };
     dispatch_and_shutdown(bridge, cli, stdin, output).await
@@ -1240,6 +1260,22 @@ mod tests {
             let parsed = crate::args::parse_args(arguments).unwrap();
             assert_eq!(runtime_open_mode(&parsed.command), expected);
         }
+    }
+
+    #[test]
+    fn adopt_runtime_open_receives_the_parsed_repository_identity() {
+        let parsed = crate::args::parse_args(["adopt", "/repo", "--repo-id", "acme/widget"])
+            .expect("adopt arguments");
+        assert_eq!(
+            runtime_open_repo_id(&parsed.command).expect("runtime open identity"),
+            Some(RepoId::parse("acme/widget").expect("repository identity"))
+        );
+
+        let parsed = crate::args::parse_args(["adopt", "/repo"]).expect("adopt arguments");
+        assert_eq!(
+            runtime_open_repo_id(&parsed.command).expect("optional runtime open identity"),
+            None
+        );
     }
 
     #[test]

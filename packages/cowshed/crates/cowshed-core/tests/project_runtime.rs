@@ -1006,6 +1006,32 @@ async fn log_binary_metadata_carries_the_exact_next_offset() {
 }
 
 #[tokio::test]
+async fn adopt_option_identity_mismatch_rejects_before_host_mutation() {
+    let root = test_root();
+    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    let error = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.adopt",
+        json!({
+            "repoId": repo,
+            "options": AdoptOptions {
+                repo_id: Some(RepoId::parse("other/repository").expect("mismatch identity")),
+                ..AdoptOptions::default()
+            }
+        }),
+    )
+    .await
+    .expect_err("mismatching adopt identity must fail");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(error.message.contains("provisional project binding"));
+    assert!(
+        events.try_recv().is_err(),
+        "identity mismatch reached the runtime host"
+    );
+}
+
+#[tokio::test]
 async fn secret_refusal_precedes_image_initialization_and_quarantine_preserves_paths() {
     let root = test_root();
     let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
@@ -1724,7 +1750,7 @@ async fn crash_reopen_recovers_published_and_pending_state() {
 #[cfg(not(target_os = "macos"))]
 #[tokio::test]
 async fn production_open_modes_return_typed_environment_error_off_macos() {
-    let adopt_error = match ProjectRuntime::open_for_adopt("/tmp/project").await {
+    let adopt_error = match ProjectRuntime::open_for_adopt("/tmp/project", None).await {
         Ok(_) => panic!("non-macOS adopt open must fail"),
         Err(error) => error,
     };

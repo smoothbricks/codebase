@@ -203,10 +203,14 @@ impl ProjectRuntime {
     /// Opens the production runtime with foreground provisioning authority.
     ///
     /// Only the parsed `cowshed adopt` command may call this entrypoint.
-    pub async fn open_for_adopt(project_root: impl AsRef<Path>) -> Result<Self> {
+    pub async fn open_for_adopt(
+        project_root: impl AsRef<Path>,
+        requested_repo_id: Option<RepoId>,
+    ) -> Result<Self> {
         Self::open_native(
             project_root.as_ref(),
             crate::storage::bootstrap::native::NativeBootstrapMode::Provision,
+            requested_repo_id,
         )
         .await
     }
@@ -219,6 +223,7 @@ impl ProjectRuntime {
         Self::open_native(
             project_root.as_ref(),
             crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly,
+            None,
         )
         .await
     }
@@ -226,15 +231,18 @@ impl ProjectRuntime {
     async fn open_native(
         project_root: &Path,
         mode: crate::storage::bootstrap::native::NativeBootstrapMode,
+        requested_repo_id: Option<RepoId>,
     ) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
-            let host = NativeProjectRuntimeHost::open(project_root, mode).await?;
+            let host =
+                NativeProjectRuntimeHost::open(project_root, mode, requested_repo_id.as_ref())
+                    .await?;
             Self::start(host).await
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (project_root, mode);
+            let _ = (project_root, mode, requested_repo_id);
             Err(CowshedError::environment_missing(
                 "the native cowshed project runtime requires macOS APFS",
                 "run the controller on macOS or use an injected test host",
@@ -446,6 +454,17 @@ impl ProjectActor {
         let params: OptionsParams<AdoptOptions> =
             decode_params(request.params(), request.method())?;
         self.require_repo(&params.repo_id)?;
+        if params
+            .options
+            .repo_id
+            .as_ref()
+            .is_some_and(|repo_id| repo_id != &self.host.descriptor().repo_id)
+        {
+            return Err(CowshedError::conflict(
+                "adopt repository identity differs from the provisional project binding",
+                "retry with the repository identity selected while opening the project",
+            ));
+        }
         let snapshot = self.host.adopt(params.options).await?;
         workspace_response(&snapshot)
     }
@@ -1243,6 +1262,7 @@ impl NativeProjectRuntimeHost {
     async fn open(
         project_root: &Path,
         bootstrap_mode: crate::storage::bootstrap::native::NativeBootstrapMode,
+        requested_repo_id: Option<&RepoId>,
     ) -> Result<Self> {
         use crate::storage::apfs::ApfsExecutionHost;
         use crate::storage::lifecycle::Substrate;
@@ -1259,6 +1279,20 @@ impl NativeProjectRuntimeHost {
                     "launch the controller with a canonical HOME",
                 )
             })?;
+        let binding_repo_id = if matches!(
+            &bootstrap_mode,
+            crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly
+        ) {
+            repo_id_from_workspace_marker(&git_root).await?
+        } else {
+            requested_repo_id.cloned()
+        };
+        let candidate = binding_from_git(&git, binding_repo_id.as_ref()).await?;
+        let repo_id = candidate
+            .primary()
+            .map_err(native_integrity_error)?
+            .repo_id
+            .clone();
         let bootstrap = crate::storage::bootstrap::native::bootstrap_system_storage(
             &git_root,
             &home,
@@ -1275,12 +1309,6 @@ impl NativeProjectRuntimeHost {
                 "remove the unsupported substrate override and retry",
             ));
         }
-        let candidate = binding_from_git(&git).await?;
-        let repo_id = candidate
-            .primary()
-            .map_err(native_integrity_error)?
-            .repo_id
-            .clone();
         let layout = crate::storage::StorageLayout::new(bootstrap.roots().store(), &repo_id)
             .map_err(native_integrity_error)?;
         let binding = load_or_validate_binding(&layout, candidate, &git).await?;
@@ -1389,19 +1417,7 @@ impl NativeProjectRuntimeHost {
 
     async fn validate_binding(&self) -> Result<()> {
         let remotes = self.git.remotes().await?;
-        for identity in &self.descriptor.binding.identities {
-            if let (Some(name), Some(url)) = (&identity.remote_name, &identity.remote_url)
-                && !remotes
-                    .iter()
-                    .any(|remote| &remote.name == name && &remote.url == url)
-            {
-                return Err(CowshedError::conflict(
-                    format!("bound remote {name} no longer has its recorded URL"),
-                    "restore the recorded remote or explicitly re-adopt the repository",
-                ));
-            }
-        }
-        Ok(())
+        validate_binding_against_remotes(&self.descriptor.binding, &remotes)
     }
 
     async fn authoritative(&self) -> Result<Vec<NativeWorkspace>> {
@@ -2933,27 +2949,190 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
 }
 
 #[cfg(target_os = "macos")]
-async fn binding_from_git(git: &crate::git::GitRepository) -> Result<RepositoryBinding> {
+async fn binding_from_git(
+    git: &crate::git::GitRepository,
+    requested_repo_id: Option<&RepoId>,
+) -> Result<RepositoryBinding> {
     let remotes = git.remotes().await?;
-    let selected = remotes
-        .iter()
-        .find(|remote| remote.name == "origin")
-        .or_else(|| remotes.first())
-        .ok_or_else(|| {
+    binding_from_remotes(&remotes, requested_repo_id)
+}
+
+fn binding_from_remotes(
+    remotes: &[crate::git::RemoteUrl],
+    requested_repo_id: Option<&RepoId>,
+) -> Result<RepositoryBinding> {
+    if remotes.is_empty() {
+        let repo_id = requested_repo_id.cloned().ok_or_else(|| {
             CowshedError::environment_missing(
                 "repository has no remote from which to derive its identity",
-                "add an origin remote or adopt with an explicit repository identity",
+                "retry adoption with --repo-id owner/repo",
             )
         })?;
-    let repo_id = crate::repository::normalize_remote_url(&selected.url)
-        .map_err(|error| CowshedError::usage(error.to_string(), "fix the selected remote URL"))?;
+        return RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+            repo_id,
+            remote_name: None,
+            remote_url: None,
+            primary: true,
+        }])
+        .map_err(binding_integrity_error);
+    }
+
+    let mut candidates = Vec::with_capacity(remotes.len());
+    for remote in remotes {
+        let repo_id = crate::repository::normalize_remote_url(&remote.url).map_err(|error| {
+            CowshedError::usage(
+                format!(
+                    "Git remote {} has an invalid repository URL: {error}",
+                    remote.name
+                ),
+                format!("fix or remove Git remote {}", remote.name),
+            )
+        })?;
+        candidates.push((remote, repo_id));
+    }
+
+    let available = candidates
+        .iter()
+        .map(|(_, repo_id)| repo_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let selected_repo_id = if let Some(requested_repo_id) = requested_repo_id {
+        if !available.contains(requested_repo_id) {
+            return Err(CowshedError::conflict(
+                format!(
+                    "explicit repository identity {requested_repo_id} does not match any Git remote"
+                ),
+                format!(
+                    "retry with --repo-id matching one of: {}",
+                    available
+                        .iter()
+                        .map(RepoId::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+        }
+        requested_repo_id.clone()
+    } else {
+        if available.len() != 1 {
+            return Err(CowshedError::conflict(
+                "Git remotes resolve to multiple repository identities",
+                format!(
+                    "retry with --repo-id selecting one of: {}",
+                    available
+                        .iter()
+                        .map(RepoId::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+        }
+        available
+            .first()
+            .cloned()
+            .ok_or_else(|| CowshedError::internal("repository candidate set is empty"))?
+    };
+
+    let selected = candidates
+        .iter()
+        .filter(|(_, repo_id)| repo_id == &selected_repo_id)
+        .min_by(|(left, _), (right, _)| {
+            (left.name != "origin", &left.name, &left.url).cmp(&(
+                right.name != "origin",
+                &right.name,
+                &right.url,
+            ))
+        })
+        .map(|(remote, _)| *remote)
+        .ok_or_else(|| CowshedError::internal("selected repository candidate is missing"))?;
+
     RepositoryBinding::new(vec![crate::repository::BoundIdentity {
-        repo_id,
+        repo_id: selected_repo_id,
         remote_name: Some(selected.name.clone()),
-        remote_url: Some(selected.url.clone()),
+        remote_url: Some(persistable_remote_url(&selected.url)),
         primary: true,
     }])
-    .map_err(native_integrity_error)
+    .map_err(binding_integrity_error)
+}
+
+fn persistable_remote_url(value: &str) -> String {
+    let suffix = value
+        .char_indices()
+        .find_map(|(index, character)| matches!(character, '?' | '#').then_some(index));
+    let without_suffix = suffix.map_or(value, |index| &value[..index]);
+    if let Some((scheme, remainder)) = without_suffix.split_once("://") {
+        let (authority, path) = remainder
+            .split_once('/')
+            .expect("normalized remote URL has a repository path");
+        let authority = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        format!("{scheme}://{authority}/{path}")
+    } else {
+        let (authority, path) = without_suffix
+            .split_once(':')
+            .expect("normalized SCP-like remote has a repository path");
+        let authority = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        format!("{authority}:{path}")
+    }
+}
+
+fn binding_integrity_error(error: impl std::fmt::Display) -> CowshedError {
+    CowshedError::integrity(error.to_string(), "repair the repository binding")
+}
+
+#[cfg(target_os = "macos")]
+async fn repo_id_from_workspace_marker(project_root: &Path) -> Result<Option<RepoId>> {
+    let marker_path = project_root.join(crate::storage::WORKSPACE_MARKER_PATH);
+    let marker = crate::storage::lifecycle::dispatch_blocking(move || {
+        match crate::metadata::WorkspaceMarker::read_from(&marker_path) {
+            Ok(marker) => Ok(Some(marker)),
+            Err(crate::metadata::MetadataError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    })
+    .await
+    .map_err(|error| CowshedError::internal(format!("workspace marker task failed: {error}")))?
+    .map_err(native_integrity_error)?;
+    let Some(marker) = marker else {
+        return Ok(None);
+    };
+    if marker.project_root != project_root
+        || !marker.workspace.is_main()
+        || marker.role != crate::metadata::WorkspaceRole::Main
+    {
+        return Err(CowshedError::conflict(
+            "main workspace marker does not match this project root",
+            "reopen the canonical main workspace or repair its marker",
+        ));
+    }
+    Ok(Some(marker.repo_id))
+}
+
+#[cfg(target_os = "macos")]
+fn validate_binding_against_remotes(
+    binding: &RepositoryBinding,
+    remotes: &[crate::git::RemoteUrl],
+) -> Result<()> {
+    binding.validate().map_err(native_integrity_error)?;
+    for identity in &binding.identities {
+        if let (Some(name), Some(url)) = (&identity.remote_name, &identity.remote_url)
+            && !remotes
+                .iter()
+                .any(|remote| &remote.name == name && persistable_remote_url(&remote.url) == *url)
+        {
+            return Err(CowshedError::conflict(
+                format!("repository binding remote {name} does not match Git configuration"),
+                "restore the recorded remote before opening cowshed",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -2962,6 +3141,11 @@ async fn load_or_validate_binding(
     candidate: RepositoryBinding,
     git: &crate::git::GitRepository,
 ) -> Result<RepositoryBinding> {
+    let candidate_repo_id = candidate
+        .primary()
+        .map_err(native_integrity_error)?
+        .repo_id
+        .clone();
     let path = layout.project().repository_binding.clone();
     let loaded = crate::storage::lifecycle::dispatch_blocking(move || {
         match crate::metadata::read_json::<RepositoryBinding>(&path) {
@@ -2978,19 +3162,14 @@ async fn load_or_validate_binding(
     .map_err(|error| CowshedError::internal(error.to_string()))?
     .map_err(native_integrity_error)?;
     let binding = loaded.unwrap_or(candidate);
-    let remotes = git.remotes().await?;
-    for identity in &binding.identities {
-        if let (Some(name), Some(url)) = (&identity.remote_name, &identity.remote_url)
-            && !remotes
-                .iter()
-                .any(|remote| &remote.name == name && &remote.url == url)
-        {
-            return Err(CowshedError::conflict(
-                format!("repository binding remote {name} does not match git configuration"),
-                "restore the recorded remote before opening cowshed",
-            ));
-        }
+    if binding.primary().map_err(native_integrity_error)?.repo_id != candidate_repo_id {
+        return Err(CowshedError::conflict(
+            "persisted repository identity differs from the opened storage layout",
+            "repair the repository binding before opening cowshed",
+        ));
     }
+    let remotes = git.remotes().await?;
+    validate_binding_against_remotes(&binding, &remotes)?;
     Ok(binding)
 }
 
@@ -3802,5 +3981,94 @@ fn native_finding(
         message: error.message,
         hint: error.hint,
         path: None,
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    fn repo_id(value: &str) -> RepoId {
+        RepoId::parse(value).expect("valid repository identity")
+    }
+
+    fn remote(name: &str, url: &str) -> crate::git::RemoteUrl {
+        crate::git::RemoteUrl {
+            name: name.to_owned(),
+            url: url.to_owned(),
+        }
+    }
+
+    #[test]
+    fn local_only_binding_requires_and_preserves_explicit_identity() {
+        let requested = repo_id("acme/widget");
+        let binding = binding_from_remotes(&[], Some(&requested)).expect("local-only binding");
+        assert_eq!(
+            binding.primary().expect("primary"),
+            &crate::repository::BoundIdentity {
+                repo_id: requested,
+                remote_name: None,
+                remote_url: None,
+                primary: true,
+            }
+        );
+
+        let error = binding_from_remotes(&[], None).expect_err("missing identity must fail");
+        assert_eq!(error.code, ErrorCode::EnvironmentMissing);
+        assert!(error.hint.contains("--repo-id"));
+    }
+
+    #[test]
+    fn explicit_identity_must_match_a_normalized_remote_candidate() {
+        let remotes = [remote(
+            "origin",
+            "https://user:secret@example.com/Acme/Widget.git?token=secret#fragment",
+        )];
+        let requested = repo_id("acme/widget");
+        let binding =
+            binding_from_remotes(&remotes, Some(&requested)).expect("matching explicit identity");
+        let primary = binding.primary().expect("primary");
+        assert_eq!(primary.repo_id, requested);
+        assert_eq!(primary.remote_name.as_deref(), Some("origin"));
+        assert_eq!(
+            primary.remote_url.as_deref(),
+            Some("https://example.com/Acme/Widget.git")
+        );
+
+        let error = binding_from_remotes(&remotes, Some(&repo_id("other/repo")))
+            .expect_err("mismatching explicit identity must fail");
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(error.message.contains("does not match any Git remote"));
+    }
+
+    #[test]
+    fn distinct_remote_candidates_require_explicit_selection() {
+        let remotes = [
+            remote("origin", "https://example.com/acme/widget.git"),
+            remote("upstream", "ssh://git@example.com/upstream/widget.git"),
+        ];
+        let error =
+            binding_from_remotes(&remotes, None).expect_err("ambiguous identities must fail");
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(error.hint.contains("--repo-id"));
+        assert!(error.hint.contains("acme/widget"));
+        assert!(error.hint.contains("upstream/widget"));
+    }
+
+    #[test]
+    fn duplicate_same_identity_remotes_are_unambiguous_and_prefer_origin() {
+        let remotes = [
+            remote("backup", "ssh://git@mirror.example/acme/widget.git"),
+            remote("origin", "https://example.com/acme/widget.git"),
+            remote("upstream", "git://example.net/acme/widget.git"),
+        ];
+        let binding = binding_from_remotes(&remotes, None).expect("one normalized identity");
+        let primary = binding.primary().expect("primary");
+        assert_eq!(primary.repo_id, repo_id("acme/widget"));
+        assert_eq!(primary.remote_name.as_deref(), Some("origin"));
+        assert_eq!(
+            primary.remote_url.as_deref(),
+            Some("https://example.com/acme/widget.git")
+        );
     }
 }
