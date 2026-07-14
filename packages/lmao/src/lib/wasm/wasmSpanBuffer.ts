@@ -686,10 +686,19 @@ function generateColumnLookup(columnMeta: ColumnMeta[], nulls: boolean): string 
   return `switch (columnIndex) { ${cases.join(' ')} default: return undefined; }`;
 }
 
+function generateEnsureStringStorage(col: ColumnMeta): string {
+  if (col.isSchemaEager || col.isPreallocated) return '';
+  return `if (this._${col.name}_values === undefined) {
+      this._${col.name}_values = new Array(this._capacity);
+      this._${col.name}_nulls = new Uint8Array((this._capacity + 7) >>> 3);
+    }`;
+}
+
 /**
  * Generate setter method for a string column (stored in JS).
  */
 function generateStringSetter(col: ColumnMeta): string {
+  const ensureStorage = generateEnsureStringStorage(col);
   if (col.isSchemaEager) {
     return `${col.name}(idx, value) {
     if (this._descriptor.state !== 'live') throw new Error('Cannot write a released WASM buffer');
@@ -713,11 +722,7 @@ function generateStringSetter(col: ColumnMeta): string {
   // Lazy string column: allocate arrays on first write
   return `${col.name}(idx, value) {
     if (this._descriptor.state !== 'live') throw new Error('Cannot write a released WASM buffer');
-    if (this._${col.name}_values === undefined) {
-      this._${col.name}_values = new Array(this._capacity);
-      const nullBitmapSize = Math.ceil(this._capacity / 8);
-      this._${col.name}_nulls = new Uint8Array(nullBitmapSize);
-    }
+    ${ensureStorage}
     if (value == null) {
       // Clear validity bit
       this._${col.name}_nulls[idx >>> 3] &= ~(1 << (idx & 7));
@@ -734,7 +739,10 @@ function generateStringSetter(col: ColumnMeta): string {
  * Generate getter for string column values.
  */
 function generateStringValuesGetter(col: ColumnMeta): string {
+  const ensureStorage = generateEnsureStringStorage(col);
   return `get ${col.name}_values() {
+    if (this._descriptor.state !== 'live') throw new Error('Cannot read a released WASM buffer');
+    ${ensureStorage}
     return this._${col.name}_values;
   }`;
 }
@@ -749,7 +757,10 @@ function generateStringNullsGetter(col: ColumnMeta): string {
   }`;
   }
 
+  const ensureStorage = generateEnsureStringStorage(col);
   return `get ${col.name}_nulls() {
+    if (this._descriptor.state !== 'live') throw new Error('Cannot read a released WASM buffer');
+    ${ensureStorage}
     return this._${col.name}_nulls;
   }`;
 }

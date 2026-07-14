@@ -8,7 +8,12 @@ import { resolveEntryType, resolveMessage } from '../../resolveMessage.js';
 import { RUNTIME_HINT_ANALYZED_VALID, RUNTIME_HINT_RESULT, RUNTIME_HINT_TAG } from '../../runtimeHint.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
-import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from '../../schema/systemSchema.js';
+import {
+  ENTRY_TYPE_INFO,
+  ENTRY_TYPE_SPAN_EXCEPTION,
+  ENTRY_TYPE_SPAN_OK,
+  ENTRY_TYPE_SPAN_START,
+} from '../../schema/systemSchema.js';
 import { createSpanBuffer, EMPTY_SCOPE } from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
 import { iterateSpanChildren, NO_NODE } from '../../traceTopology.js';
@@ -260,6 +265,31 @@ describe('WasmSpanBuffer', () => {
       expect(buffer._writeIndex).toBe(2);
     });
 
+    it('uses each buffer capacity for native lifecycle writes', () => {
+      const seededCapacity = 6;
+      const metadata = createTestOpMetadata();
+      const buffer = createWasmSpanBuffer(
+        testSchema,
+        { allocator, capacity: seededCapacity },
+        traceRoot,
+        EMPTY_SCOPE,
+        metadata,
+        metadata,
+      );
+
+      traceRoot.writeSpanStart(buffer, 'seeded-capacity');
+      const row = traceRoot.writeLogEntry(buffer, ENTRY_TYPE_INFO);
+      traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_OK);
+
+      expect(buffer._capacity).toBe(seededCapacity);
+      expect(row).toBe(2);
+      expect(buffer.entry_type?.[0]).toBe(ENTRY_TYPE_SPAN_START);
+      expect(buffer.entry_type?.[1]).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(buffer.entry_type?.[2]).toBe(ENTRY_TYPE_INFO);
+      expect(buffer.timestamp[1]).toBeGreaterThan(0n);
+      expect(buffer.timestamp[2]).toBeGreaterThan(0n);
+    });
+
     it('creates instance with parent identity via child buffer', () => {
       // Parent identity is now set by linking buffers, not via opts
       // Create parent first, then create child that references it
@@ -448,6 +478,19 @@ describe('WasmSpanBuffer', () => {
 
       expect(buffer.getColumnIfAllocated('userId')).toBeDefined();
       expect(buffer.getNullsIfAllocated('userId')).toBeDefined();
+    });
+
+    it('allocates lazy storage for transformer-style direct writes', () => {
+      const userIdNulls = getColumn<Uint8Array>(buffer, 'userId_nulls');
+      const userIdValues = getColumn<string[]>(buffer, 'userId_values');
+
+      userIdNulls[0] |= 1;
+      userIdValues[0] = 'direct-write';
+
+      expect(buffer.getColumnIfAllocated('userId')).toBe(userIdValues);
+      expect(buffer.getNullsIfAllocated('userId')).toBe(userIdNulls);
+      expect(userIdValues[0]).toBe('direct-write');
+      expect(userIdNulls[0] & 1).toBe(1);
     });
 
     it('writes values to category column', () => {
