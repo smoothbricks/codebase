@@ -939,6 +939,7 @@ impl SpawnSink for SystemSpawnSink {
             .env("XDG_CACHE_HOME", &private_cache)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_ATTR_NOSYSTEM", "1")
             .env("TMPDIR", &request.sandbox.exec_temp_dir)
             .env("PWD", &plan.cwd)
             .env("COWSHED_PORT_BASE", &port_base)
