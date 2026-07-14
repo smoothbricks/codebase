@@ -993,6 +993,33 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn macos_descriptor_preparation_marks_real_non_stdio_descriptor_close_on_exec() {
+        use std::os::fd::AsRawFd;
+
+        let tree = TestTree::new();
+        let file = fs::File::open(&tree.root).unwrap();
+        let descriptor = file.as_raw_fd();
+        let original = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        assert_ne!(original, -1);
+        assert_ne!(
+            unsafe { libc::fcntl(descriptor, libc::F_SETFD, original & !libc::FD_CLOEXEC) },
+            -1
+        );
+        let mut descriptors = Box::<[libc::proc_fdinfo]>::new_uninit_slice(SUPERVISOR_FD_CEILING);
+
+        mark_macos_non_stdio_close_on_exec(&mut descriptors).unwrap();
+        let prepared = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        assert_ne!(
+            unsafe { libc::fcntl(descriptor, libc::F_SETFD, original) },
+            -1
+        );
+
+        assert_ne!(prepared, -1);
+        assert_ne!(prepared & libc::FD_CLOEXEC, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn macos_descriptor_preparation_never_marks_stderr_close_on_exec() {
         let original = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_GETFD) };
         assert_ne!(original, -1);
