@@ -379,10 +379,10 @@ fn gather_apfs_evidence(
 ) -> Result<GatheredEvidence, NativeBootstrapError> {
     require_canonical(project_root)?;
     require_canonical(home)?;
-    let snapshot = source.statfs(project_root)?;
+    let snapshot = source.statfs(home)?;
     if snapshot.fs_type != "apfs" {
         return Err(NativeBootstrapError::UnsupportedFilesystem {
-            path: project_root.to_owned(),
+            path: home.to_owned(),
             fs_type: snapshot.fs_type,
         });
     }
@@ -1627,6 +1627,8 @@ mod tests {
 
     struct FakeEvidenceSource {
         statfs: StatFsSnapshot,
+        statfs_overrides: BTreeMap<PathBuf, StatFsSnapshot>,
+        statfs_paths: Vec<PathBuf>,
         command_output: HostCommandOutput,
         mountpoints: BTreeMap<PathBuf, MountpointState>,
         mounted_volumes: BTreeMap<PathBuf, MountedVolumeEvidence>,
@@ -1635,8 +1637,13 @@ mod tests {
     }
 
     impl EvidenceSource for FakeEvidenceSource {
-        fn statfs(&mut self, _path: &Path) -> Result<StatFsSnapshot, NativeBootstrapError> {
-            Ok(self.statfs.clone())
+        fn statfs(&mut self, path: &Path) -> Result<StatFsSnapshot, NativeBootstrapError> {
+            self.statfs_paths.push(path.to_owned());
+            Ok(self
+                .statfs_overrides
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| self.statfs.clone()))
         }
 
         fn run_command(
@@ -1706,6 +1713,8 @@ mod tests {
                 mountpoint: PathBuf::from("/System/Volumes/Data"),
                 nobrowse: true,
             },
+            statfs_overrides: BTreeMap::new(),
+            statfs_paths: Vec::new(),
             command_output: HostCommandOutput {
                 success: true,
                 stdout: inventory,
@@ -1862,6 +1871,68 @@ mod tests {
         assert_eq!(source.commands.len(), 1);
         assert_eq!(source.commands[0].program(), "/usr/sbin/diskutil");
         assert_eq!(source.commands[0].args(), ["apfs", "list", "-plist"]);
+    }
+
+    #[test]
+    fn home_anchor_selects_host_container_when_project_is_on_another_filesystem() {
+        let data = volume("Data", "disk3s5", Some("/System/Volumes/Data"));
+        let cowshed = volume(APFS_STORE_VOLUME, "disk3s8", None)
+            + &volume(APFS_CACHES_VOLUME, "disk3s9", None);
+        let project_container = container(
+            "disk13",
+            &volume("Workspace", "disk13s1", Some("/workspace")),
+        );
+        let mut source = source(plist(
+            &(project_container + &container("disk3", &(data + &cowshed))),
+        ));
+        source.statfs_overrides.insert(
+            PathBuf::from("/workspace/project"),
+            StatFsSnapshot {
+                fs_type: "asif".to_owned(),
+                mount_source: PathBuf::from("/dev/disk13s1"),
+                mountpoint: PathBuf::from("/workspace"),
+                nobrowse: true,
+            },
+        );
+        source.mountpoints.insert(
+            PathBuf::from("/Users/alice/.cowshed"),
+            MountpointState::Mounted {
+                marker: Some(
+                    VolumeMarker::new(VolumeRole::Store, SubstrateKind::Apfs)
+                        .to_json()
+                        .unwrap(),
+                ),
+            },
+        );
+        source.mountpoints.insert(
+            PathBuf::from("/Users/alice/.cowshed/caches"),
+            MountpointState::Mounted {
+                marker: Some(
+                    VolumeMarker::new(VolumeRole::Caches, SubstrateKind::Apfs)
+                        .to_json()
+                        .unwrap(),
+                ),
+            },
+        );
+
+        let plan = plan_native_bootstrap(
+            &mut source,
+            Path::new("/workspace/project"),
+            Path::new("/Users/alice"),
+        )
+        .unwrap();
+
+        assert_eq!(source.statfs_paths, [PathBuf::from("/Users/alice")]);
+        assert!(matches!(
+            plan.substrate(),
+            crate::storage::bootstrap::SelectedSubstrate::Apfs { container, .. } if container == "disk3"
+        ));
+        assert_eq!(plan.operations().len(), 2);
+        assert!(
+            plan.operations()
+                .iter()
+                .all(|operation| matches!(operation, HostOperation::GuardMountpoint { .. }))
+        );
     }
 
     #[test]
