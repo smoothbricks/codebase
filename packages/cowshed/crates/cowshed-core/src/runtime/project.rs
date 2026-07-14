@@ -2144,10 +2144,14 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .execute_retire(plan)
             .await
             .map_err(native_storage_error)?;
-        self.substrate
-            .reclaim(retired)
-            .await
-            .map_err(native_storage_error)
+        let substrate = self.substrate.clone();
+        std::mem::drop(tokio::spawn(async move {
+            // Retirement removed the canonical image from discovery. Reclamation is deliberately
+            // best-effort here: an interrupted task leaves trash for the next idempotent gc pass.
+            let _ = substrate.reclaim(retired).await;
+        }));
+        Ok(())
+
     }
 
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport> {

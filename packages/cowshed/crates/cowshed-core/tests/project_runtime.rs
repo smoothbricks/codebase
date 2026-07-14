@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
@@ -22,7 +23,7 @@ use cowshed_core::runtime::{
 use cowshed_core::{CowshedError, ErrorCode, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use url::Url;
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -35,6 +36,7 @@ enum Event {
     Publish(WorkspaceName),
     Stop(WorkspaceName),
     Retire(WorkspaceName),
+    Reclaim(WorkspaceName),
     RestorePending(WorkspaceName),
     RestoreEvidence(WorkspaceName),
     RestoreActivate(WorkspaceName),
@@ -67,6 +69,7 @@ struct FakeHost {
     fail_create_initializer: bool,
     fail_restore_fence_once: bool,
     doctor_findings: Vec<Finding>,
+    reclaim_gate: Option<Arc<Notify>>,
 }
 
 impl FakeHost {
@@ -100,6 +103,7 @@ impl FakeHost {
             fail_create_initializer,
             fail_restore_fence_once,
             doctor_findings,
+            reclaim_gate: None,
         }
     }
 
@@ -467,7 +471,15 @@ impl ProjectRuntimeHost for FakeHost {
         self.events.send(Event::Stop(workspace.clone())).ok();
         self.state.workspaces.remove(index);
         self.persist()?;
-        self.events.send(Event::Retire(workspace)).ok();
+        self.events.send(Event::Retire(workspace.clone())).ok();
+        let events = self.events.clone();
+        let reclaim_gate = self.reclaim_gate.clone();
+        std::mem::drop(tokio::spawn(async move {
+            if let Some(gate) = reclaim_gate {
+                gate.notified().await;
+            }
+            events.send(Event::Reclaim(workspace)).ok();
+        }));
         Ok(())
     }
 
@@ -1126,6 +1138,63 @@ async fn remove_stops_supervisor_before_retirement() {
         events.recv().await,
         Some(Event::Retire(WorkspaceName::new("gone").expect("name")))
     );
+}
+
+#[tokio::test]
+async fn destroy_returns_after_logical_retirement_before_background_reclaim() {
+    let root = test_root();
+    let (events, mut receiver) = mpsc::unbounded_channel();
+    let gate = Arc::new(Notify::new());
+    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
+    host.reclaim_gate = Some(Arc::clone(&gate));
+    let runtime = ProjectRuntime::start(host).await.expect("runtime");
+    let router = runtime.router();
+    let repo = runtime.descriptor().repo_id.clone();
+    adopt(&router, &repo).await;
+    route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.create",
+        json!({ "repoId": repo, "workspace": "retired", "options": CreateOptions::default() }),
+    )
+    .await
+    .expect("create");
+    while receiver.try_recv().is_ok() {}
+
+    route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.destroy",
+        json!({ "repoId": repo, "workspace": "retired", "options": RemoveOptions::default() }),
+    )
+    .await
+    .expect("logical retirement");
+    let name = WorkspaceName::new("retired").expect("name");
+    assert_eq!(receiver.recv().await, Some(Event::Stop(name.clone())));
+    assert_eq!(receiver.recv().await, Some(Event::Retire(name.clone())));
+    assert!(
+        receiver.try_recv().is_err(),
+        "reclaim ran before destroy returned"
+    );
+
+    let listed = route(
+        &router,
+        coordinator(repo.clone()),
+        "project.list",
+        json!({ "repoId": repo }),
+    )
+    .await
+    .expect("list after retirement");
+    assert!(
+        listed
+            .as_array()
+            .expect("workspaces")
+            .iter()
+            .all(|workspace| workspace["info"]["workspace"] != "retired")
+    );
+    assert_eq!(receiver.recv().await, Some(Event::SnapshotBatch));
+    gate.notify_one();
+    assert_eq!(receiver.recv().await, Some(Event::Reclaim(name)));
 }
 
 #[tokio::test]
