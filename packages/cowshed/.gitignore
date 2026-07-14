@@ -1,3 +1,4 @@
 /target
 *.node
 /mutants.out
+.trace-results.db

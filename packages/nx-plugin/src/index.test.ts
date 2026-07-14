@@ -173,7 +173,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('infers cargo workspace targets including per-cdylib wasm builds', async () => {
+  it('infers cargo workspace targets including explicitly named wasm crate builds', async () => {
     const workspace = await createWorkspace();
     try {
       await workspace.write('packages/ferris/package.json', '{"name":"ferris"}\n');
@@ -241,17 +241,38 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('lets explicit nx.targets override cargo inference and skips non-workspace Cargo.toml', async () => {
+  it('does not infer wasm targets for native N-API cdylib crates', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/cowshed/package.json', '{"name":"cowshed"}\n');
+      await workspace.write('packages/cowshed/Cargo.toml', '[workspace]\nmembers = ["crates/cowshed-napi"]\n');
+      await workspace.write(
+        'packages/cowshed/crates/cowshed-napi/Cargo.toml',
+        '[package]\nname = "cowshed-napi"\n\n[lib]\ncrate-type = ["cdylib"]\n',
+      );
+
+      const targets = await inferProjectTargets(workspace, 'packages/cowshed/package.json');
+
+      expect(targets['cargo-wasm']).toBeUndefined();
+      expect(targets.build).toBeUndefined();
+      expect(targets.clean).toBeUndefined();
+      expect(targets['cargo-test']).toBeDefined();
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('lets explicit nx.targets override wasm inference and skips non-workspace Cargo.toml', async () => {
     const workspace = await createWorkspace();
     try {
       await workspace.write(
         'packages/custom/package.json',
         '{"name":"custom","nx":{"targets":{"cargo-wasm":{"options":{"command":"custom"}},"test":{}}}}\n',
       );
-      await workspace.write('packages/custom/Cargo.toml', '[workspace]\nmembers = ["crates/x"]\n');
+      await workspace.write('packages/custom/Cargo.toml', '[workspace]\nmembers = ["crates/x-wasm"]\n');
       await workspace.write(
-        'packages/custom/crates/x/Cargo.toml',
-        '[package]\nname = "x"\n\n[lib]\ncrate-type = ["cdylib"]\n',
+        'packages/custom/crates/x-wasm/Cargo.toml',
+        '[package]\nname = "x-wasm"\n\n[lib]\ncrate-type = ["cdylib"]\n',
       );
 
       const targets = await inferProjectTargets(workspace, 'packages/custom/package.json');
