@@ -58,6 +58,10 @@ No mounts, no root, no network — pure functions with table-driven cases:
   bytes/count, and the pinned-byte subset across mixed pinned/automatic images. Runtime state machines prove
   `existing checkpoints + one active-image charge`, exact-boundary admission, one-byte/count overflow refusal with zero
   image/fact/metadata effect, and two-workspace isolation.
+- **GC plan purity and revalidation**: preview fixtures freeze candidate identity/path/allocated-byte/reason ordering
+  and byte sums, exclude every pinned checkpoint, and compare repeated previews. Dry-run preserves every image, sidecar,
+  fact, and metadata byte. Pin/incarnation/size changes and a held lifecycle lock make execution return stale-plan
+  `Conflict` before mutation; a fresh unchanged plan reclaims exactly its candidates.
 - **Push CAS and preservation model**: pure state-machine tables cover each omitted/satisfied/mismatched combination of
   expected workspace incarnation, source head, and destination ref head (including expected-missing). A mismatch is a
   `Conflict` that preserves the old destination exactly and leaves the source live; success reports one source object ID

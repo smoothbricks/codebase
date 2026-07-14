@@ -24,9 +24,10 @@ use cowshed_core::storage::apfs::{
     MetadataPolicy, PublicationDisposition,
 };
 use cowshed_core::storage::lifecycle::{
-    ExpectedState, LifecycleWorkspace, OperationIdentity, Pin, Revision,
+    ExpectedState, LifecycleWorkspace, OperationIdentity, Pin, Revision, StorageGcReason,
 };
 use cowshed_core::storage::{CheckpointLabel, StorageLayout, StorageLayoutError};
+use cowshed_core::workspace_credentials::mint_workspace_credentials;
 const ATTACH_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
 <dict><key>content-hint</key><string>GUID_partition_scheme</string><key>dev-entry</key><string>/dev/disk9</string></dict>
 <dict><key>content-hint</key><string>Apple_APFS</string><key>dev-entry</key><string>/dev/disk9s2</string></dict>
@@ -256,6 +257,17 @@ impl Drop for Fixture {
 
 fn repo() -> RepoId {
     RepoId::parse("acme/widget").expect("repo")
+}
+
+fn execute_gc<R>(
+    host: &MacOsApfsExecutionHost<R>,
+    config: &ApfsSubstrateConfig,
+) -> Result<cowshed_core::storage::lifecycle::StorageGcReport, ApfsStorageError>
+where
+    R: CommandRunner + Send + Sync + 'static,
+{
+    let plan = host.preview_gc(config, &repo())?;
+    host.execute_gc(config, plan)
 }
 
 fn metadata(format: ImageFormat) -> DetachedWorkspaceMetadata {
@@ -595,21 +607,24 @@ fn stats_count_only_images_and_gc_drains_session_trash_then_compacts_detached_sp
     assert_eq!(stats.checkpoint_bytes, first_bytes + second_bytes);
     assert_eq!(stats.pinned_checkpoint_bytes, first_bytes);
 
+    let active_name = WorkspaceName::session("active").expect("workspace");
     let active = layout
-        .session_image(
-            &WorkspaceName::session("active").expect("workspace"),
-            ImageFormat::Sparse,
-        )
+        .session_image(&active_name, ImageFormat::Sparse)
         .expect("active");
     create_image(active.image(), ImageFormat::Sparse);
+    let mut active_metadata = metadata(ImageFormat::Sparse);
+    active_metadata.workspace = active_name;
+    active_metadata
+        .write_for_image(active.image())
+        .expect("active metadata");
     let trash = layout.project().sessions.join(".trash/retired.sparseimage");
     create_image(&trash, ImageFormat::Sparse);
     let cache_image = fixture.root.join("caches/acme/sessions/cache.sparseimage");
     create_image(&cache_image, ImageFormat::Sparse);
 
-    let report = host.gc(&fixture.config()).expect("gc");
+    let report = execute_gc(&host, &fixture.config()).expect("gc");
     assert_eq!(report.examined, 4);
-    assert_eq!(report.reclaimed, 1);
+    assert_eq!(report.reclaimed, 2);
     assert!(!trash.exists());
     assert!(!sidecar_path(&trash).exists());
     assert!(active.image().exists());
@@ -990,7 +1005,67 @@ fn checkpoint_gc_reclaims_only_expired_automatic_regular_files_and_sidecars() {
         8
     );
 
-    let report = restarted.gc(&config).expect("checkpoint gc");
+    let plan = restarted.preview_gc(&config, &repo()).expect("GC preview");
+    let repeated = restarted
+        .preview_gc(&config, &repo())
+        .expect("repeated preview");
+    assert_eq!(plan.candidates().len(), 1);
+    assert_eq!(
+        plan.candidates()[0].identity(),
+        repeated.candidates()[0].identity(),
+        "unchanged candidates have stable identities"
+    );
+    let candidate = &plan.candidates()[0];
+    assert_eq!(candidate.path(), expired);
+    assert_eq!(candidate.reason(), StorageGcReason::ExpiredCheckpoint);
+    let expected_bytes = [
+        expired.clone(),
+        sidecar_path(&expired),
+        ca_key_path(&expired),
+        checkpoint_fact_path(&expired),
+    ]
+    .into_iter()
+    .map(|path| {
+        std::fs::metadata(path)
+            .expect("candidate component")
+            .blocks()
+            .saturating_mul(512)
+    })
+    .sum::<u64>();
+    assert_eq!(candidate.bytes(), expected_bytes);
+    assert!(
+        plan.candidates()
+            .iter()
+            .all(|candidate| candidate.path() != pinned),
+        "pinned checkpoints are never candidates"
+    );
+    assert!(expired.exists(), "preview must not mutate");
+
+    restarted
+        .publish_checkpoint_fact(
+            &expired,
+            &CheckpointLabel::new("expired").expect("label"),
+            Revision::new(7),
+            Pin::Pinned,
+        )
+        .expect("pin after preview");
+    let stale = restarted
+        .execute_gc(&config, plan)
+        .expect_err("pin change makes plan stale");
+    assert!(matches!(stale, ApfsStorageError::GcPlanStale));
+    assert!(expired.exists(), "stale execution must not mutate");
+    restarted
+        .publish_checkpoint_fact(
+            &expired,
+            &CheckpointLabel::new("expired").expect("label"),
+            Revision::new(7),
+            Pin::Automatic,
+        )
+        .expect("restore automatic pin");
+    let plan = restarted
+        .preview_gc(&config, &repo())
+        .expect("fresh preview");
+    let report = restarted.execute_gc(&config, plan).expect("checkpoint gc");
     assert_eq!(report.examined, 8);
     assert_eq!(report.reclaimed, 1);
     assert_eq!(report.retained_pinned, 1);
@@ -1026,22 +1101,22 @@ fn missing_and_invalid_gc_namespaces_have_distinct_behavior() {
     std::fs::create_dir_all(&project).expect("project");
     let host = native_host(&fixture, RecordingRunner::default());
     assert_eq!(
-        host.gc(&fixture.config()).expect("missing namespaces"),
+        execute_gc(&host, &fixture.config()).expect("missing namespaces"),
         Default::default()
     );
 
     std::fs::create_dir_all(project.join("sessions")).expect("sessions");
     assert_eq!(
-        host.gc(&fixture.config()).expect("missing trash"),
+        execute_gc(&host, &fixture.config()).expect("missing trash"),
         Default::default()
     );
     std::fs::write(project.join("sessions/.trash"), b"not a directory").expect("trash file");
-    assert!(host.gc(&fixture.config()).is_err());
+    assert!(execute_gc(&host, &fixture.config()).is_err());
 
     std::fs::remove_file(project.join("sessions/.trash")).expect("remove trash file");
     std::fs::remove_dir(project.join("sessions")).expect("remove sessions");
     std::fs::write(project.join("sessions"), b"not a directory").expect("sessions file");
-    assert!(host.gc(&fixture.config()).is_err());
+    assert!(execute_gc(&host, &fixture.config()).is_err());
 }
 
 #[test]
@@ -1207,10 +1282,13 @@ fn gc_distinguishes_a_missing_store_from_a_non_directory_store() {
     );
     let host =
         MacOsApfsExecutionHost::new(RecordingRunner::default(), config.clone()).expect("host");
-    assert_eq!(host.gc(&config).expect("missing store"), Default::default());
+    assert_eq!(
+        execute_gc(&host, &config).expect("missing store"),
+        Default::default()
+    );
 
     std::fs::write(&missing_root, b"not a directory").expect("store file");
-    assert!(host.gc(&config).is_err());
+    assert!(execute_gc(&host, &config).is_err());
 }
 
 #[test]
@@ -1645,9 +1723,11 @@ fn gc_reclaims_sidecarless_staging_crash_images_but_preserves_recoverable_pairs(
     let recoverable = staging.join("main-00000000000000000000000000000001.sparseimage");
     create_image(&recoverable, ImageFormat::Sparse);
 
-    let report = native_host(&fixture, RecordingRunner::default())
-        .gc(&fixture.config())
-        .expect("staging gc");
+    let report = execute_gc(
+        &native_host(&fixture, RecordingRunner::default()),
+        &fixture.config(),
+    )
+    .expect("staging gc");
 
     assert_eq!(report.reclaimed, 1);
     assert!(!orphan.exists(), "sidecarless crash image is reclaimed");
@@ -1747,7 +1827,7 @@ fn gc_does_not_follow_symlinked_owner_repository_staging_or_image_paths() {
             .is_empty()
     );
 
-    let report = host.gc(&fixture.config()).expect("contained gc");
+    let report = execute_gc(&host, &fixture.config()).expect("contained gc");
 
     assert_eq!(report, Default::default());
     for (path, contents) in [
@@ -1829,7 +1909,7 @@ fn adopt_recovery_waits_for_handoff_then_completes_publication_after_restart() {
         .expect("pre-handoff recovery");
     assert!(before_staged.exists());
     assert!(!before_canonical.image().exists());
-    let cleanup = before_host.gc(&before_config).expect("staging cleanup");
+    let cleanup = execute_gc(&before_host, &before_config).expect("staging cleanup");
     assert_eq!(cleanup.examined, 1);
     assert_eq!(cleanup.reclaimed, 0);
     assert!(before_staged.exists());
@@ -1917,7 +1997,7 @@ fn checkpoint_pin_facts_survive_restart_and_gc_prunes_only_old_automatic_excess(
             && fact.pin == Pin::Pinned
     }));
 
-    let report = restarted.gc(&config).expect("gc");
+    let report = execute_gc(&restarted, &config).expect("gc");
     assert_eq!(report.examined, 8);
     assert_eq!(report.reclaimed, 1);
     assert_eq!(report.retained_pinned, 1);
@@ -2515,14 +2595,13 @@ fn gc_skips_staging_owned_by_an_active_lifecycle_lock() {
         .expect("owner lock")
         .expect("blocking owner lock");
 
-    let report = collector.gc(&fixture.config()).expect("contended gc");
-    assert_eq!(report.examined, 1);
-    assert_eq!(report.reclaimed, 0);
+    let error = execute_gc(&collector, &fixture.config()).expect_err("contended GC plan");
+    assert!(matches!(error, ApfsStorageError::GcPlanStale));
     assert!(staged.exists());
     assert!(!sidecar_path(&staged).exists());
 
     drop(guard);
-    let report = collector.gc(&fixture.config()).expect("released gc");
+    let report = execute_gc(&collector, &fixture.config()).expect("released gc");
     assert_eq!(report.examined, 1);
     assert_eq!(report.reclaimed, 1);
     assert!(!staged.exists());
@@ -2582,6 +2661,14 @@ fn gc_first_recovers_post_handoff_adopt_before_pruning_staging() {
         .project_root
         .join(".staging/main-00000000000000000000000000000001.sparseimage");
     create_image(&staged, ImageFormat::Sparse);
+    let credential_mount = fixture.root.join("credential-mount");
+    std::fs::create_dir_all(&credential_mount).expect("credential mount");
+    mint_workspace_credentials(
+        &workspace(ImageFormat::Sparse),
+        &credential_mount,
+        &ca_key_path(&staged),
+    )
+    .expect("valid staged credentials");
     std::fs::write(&staged, b"complete adopted image").expect("staged bytes");
     std::fs::create_dir_all(&config.main_mount).expect("source checkout");
     std::fs::write(config.main_mount.join("tracked"), b"original source").expect("source bytes");
@@ -2589,7 +2676,9 @@ fn gc_first_recovers_post_handoff_adopt_before_pruning_staging() {
     std::fs::rename(&config.main_mount, &pre_cowshed).expect("simulate completed handoff");
 
     let host = native_host(&fixture, RecordingRunner::default());
-    host.gc(&config).expect("GC-first recovery");
+    host.recover_pending(&config, &[])
+        .expect("startup recovery before GC");
+    execute_gc(&host, &config).expect("post-recovery GC");
     assert_eq!(
         std::fs::read(canonical.image()).expect("canonical image"),
         b"complete adopted image"
@@ -2603,7 +2692,7 @@ fn gc_first_recovers_post_handoff_adopt_before_pruning_staging() {
     assert!(!staged.exists());
     assert!(!sidecar_path(&staged).exists());
 
-    host.gc(&config).expect("repeated GC converges");
+    execute_gc(&host, &config).expect("repeated GC converges");
     host.recover_pending(&config, &[])
         .expect("repeated recovery converges");
     assert!(canonical.image().exists());
@@ -2717,7 +2806,7 @@ fn publication_failpoints_converge_for_clone_and_adopt_callers() {
         assert!(config.main_mount.join(".envrc").exists());
         let restarted = native_host(&fixture, RecordingRunner::default());
         assert_eq!(restarted.list(&repo()).expect("list").len(), 1);
-        restarted.gc(&config).expect("GC convergence");
+        execute_gc(&restarted, &config).expect("GC convergence");
         restarted
             .recover_pending(&config, &[])
             .expect("recovery convergence");
@@ -2764,7 +2853,7 @@ fn persistent_parent_fsync_failure_never_restores_adopt_source_beside_canonical_
     restarted
         .recover_pending(&config, &[])
         .expect("fresh-host recovery");
-    restarted.gc(&config).expect("fresh-host GC");
+    execute_gc(&restarted, &config).expect("fresh-host GC");
     for _ in 0..2 {
         let facts = restarted.list(&repo()).expect("idempotent list");
         assert_eq!(facts.len(), 1);
@@ -2836,7 +2925,7 @@ fn sidecar_primary_and_rollback_double_failure_retains_every_forward_artifact() 
     DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("canonical metadata");
     assert!(!staged.exists());
     assert_eq!(restarted.list(&repo()).expect("list").len(), 1);
-    restarted.gc(&config).expect("GC convergence");
+    execute_gc(&restarted, &config).expect("GC convergence");
     restarted
         .recover_pending(&config, &[])
         .expect("idempotent recovery");

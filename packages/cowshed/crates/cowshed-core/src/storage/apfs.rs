@@ -20,7 +20,8 @@ use super::lifecycle::{
     KernelMountFact, LifecycleBackend, LifecyclePlanner, LifecycleReceipt, LifecycleWorkspace,
     MountIntent, MountState, ObservedState, Operation, OperationIdentity, Pin, PlanError,
     PurePlanner, RestoreMode, RestorePlan, RestoreReceipt, RetirePlan, RetiredRef, Revision,
-    StorageFact, StorageGcReport, Substrate, SubstrateStats, execute_checked, revalidate,
+    StorageFact, StorageGcPlan, StorageGcReport, Substrate, SubstrateStats, execute_checked,
+    revalidate,
 };
 use super::{CheckpointLabel, StorageLayout, StorageLayoutError};
 
@@ -422,7 +423,16 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         image: &Path,
     ) -> Result<SubstrateStats, ApfsStorageError>;
     fn compact(&self, image: &Path, format: ImageFormat) -> Result<bool, ApfsStorageError>;
-    fn gc(&self, config: &ApfsSubstrateConfig) -> Result<StorageGcReport, ApfsStorageError>;
+    fn preview_gc(
+        &self,
+        config: &ApfsSubstrateConfig,
+        repo: &RepoId,
+    ) -> Result<StorageGcPlan, ApfsStorageError>;
+    fn execute_gc(
+        &self,
+        config: &ApfsSubstrateConfig,
+        plan: StorageGcPlan,
+    ) -> Result<StorageGcReport, ApfsStorageError>;
 }
 
 #[async_trait]
@@ -478,6 +488,8 @@ pub enum ApfsStorageError {
     InvalidPlan(&'static str),
     #[error("APFS host operation failed: {0}")]
     Host(String),
+    #[error("garbage-collection plan is stale")]
+    GcPlanStale,
     #[error("marker does not match detached APFS metadata: {0}")]
     MarkerMismatch(String),
     #[error("cleanup after {operation} failed: primary={primary}; cleanup={cleanup}")]
@@ -1234,8 +1246,14 @@ where
         .await
     }
 
-    async fn gc(&self) -> Result<StorageGcReport, Self::Error> {
-        self.dispatch_read(move |host, config| host.gc(&config))
+    async fn preview_gc(&self, repo: &RepoId) -> Result<StorageGcPlan, Self::Error> {
+        let repo = repo.clone();
+        self.dispatch_read(move |host, config| host.preview_gc(&config, &repo))
+            .await
+    }
+
+    async fn execute_gc(&self, plan: StorageGcPlan) -> Result<StorageGcReport, Self::Error> {
+        self.dispatch_read(move |host, config| host.execute_gc(&config, plan))
             .await
     }
 }

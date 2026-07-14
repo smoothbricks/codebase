@@ -577,7 +577,10 @@ reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission 
   authority. `RemoveOptions.restore` selects the reversible `main` adoption rollback; it is not an alias for forced
   retirement.
 - `DoctorReport = { healthy, findings }`; `Finding = { code, severity, message, hint, path? }`, and severity is
-  `"info" | "warning" | "error"`. `GcReport = { examined, reclaimed, retainedPinned, freedBytes, dryRun }`.
+  `"info" | "warning" | "error"`. `GcCandidate = { identity: Sha256Digest, path, bytes, reason }`, where reason is the
+  closed `retiredWorkspace | orphanStagingImage | orphanStagingMetadata | expiredCheckpoint | detachedImageCompaction`
+  enum. `GcReport = { examined, reclaimed, retainedPinned, freedBytes, dryRun, candidates }`. Dry-run candidates are the
+  exact immutable substrate plan and never mutable handles; execution revalidates the plan before the first effect.
 - `JobId` is a positive integer no greater than `2^53-1`.
   `JobInfo = { repoId, workspaceIncarnation, jobId, state, pid?, grantRevision, argv, cwd, started, durationMs?, exit?, stdout, stderr, trace, outputLimit?, stdin }`.
   Every element of `argv` is the exact tagged `CommandArg` object

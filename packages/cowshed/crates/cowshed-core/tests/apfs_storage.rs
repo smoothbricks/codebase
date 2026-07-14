@@ -20,7 +20,7 @@ use cowshed_core::storage::apfs::{
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, CheckpointFact, Destination, ExpectedState, KernelMountFact, LifecyclePlanner,
     LifecycleWorkspace, MountIntent, MountState, ObservedState, OperationIdentity, Pin,
-    RestoreMode, Revision, StorageFact, StorageGcReport, Substrate, SubstrateStats,
+    RestoreMode, Revision, StorageFact, StorageGcPlan, StorageGcReport, Substrate, SubstrateStats,
 };
 use proptest::prelude::*;
 
@@ -689,13 +689,27 @@ impl ApfsExecutionHost for FakeHost {
         Ok(format == ImageFormat::Sparse)
     }
 
-    fn gc(&self, _: &ApfsSubstrateConfig) -> Result<StorageGcReport, ApfsStorageError> {
-        self.record("gc-trash+compact-detached");
+    fn preview_gc(
+        &self,
+        _: &ApfsSubstrateConfig,
+        repo: &RepoId,
+    ) -> Result<StorageGcPlan, ApfsStorageError> {
+        self.record("preview-gc");
+        Ok(StorageGcPlan::empty(repo.clone()))
+    }
+
+    fn execute_gc(
+        &self,
+        _: &ApfsSubstrateConfig,
+        _: StorageGcPlan,
+    ) -> Result<StorageGcReport, ApfsStorageError> {
+        self.record("execute-gc");
         Ok(StorageGcReport {
             examined: 2,
             reclaimed: 1,
             retained_pinned: 1,
             retained_recent: 0,
+            freed_bytes: 1024,
         })
     }
 }
@@ -1481,12 +1495,21 @@ async fn retire_reclaim_stats_and_gc_cross_only_the_blocking_lane() {
             pinned_checkpoint_bytes: 2048,
         }
     );
-    assert_eq!(substrate.gc().await.expect("gc").reclaimed, 1);
+    let gc_plan = substrate.preview_gc(&repo()).await.expect("GC preview");
+    assert_eq!(
+        substrate
+            .execute_gc(gc_plan)
+            .await
+            .expect("GC execution")
+            .reclaimed,
+        1
+    );
     assert!(lane.count() >= 5);
     let events = host.events();
     assert!(events.contains(&"atomic-retire-to-trash".to_owned()));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
-    assert!(events.contains(&"gc-trash+compact-detached".to_owned()));
+    assert!(events.contains(&"preview-gc".to_owned()));
+    assert!(events.contains(&"execute-gc".to_owned()));
 }
 
 #[tokio::test]

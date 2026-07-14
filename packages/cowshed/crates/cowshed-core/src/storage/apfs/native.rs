@@ -29,10 +29,12 @@ use crate::workspace_credentials::{
     mint_workspace_credentials, validate_private_key, validate_public_workspace_assets,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::super::lifecycle::{
     CheckpointFact, ExpectedState, KernelMountFact, LifecycleWorkspace, ObservedState,
-    OperationIdentity, Pin, Revision, StorageFact, StorageGcReport, SubstrateStats,
+    OperationIdentity, Pin, Revision, StorageFact, StorageGcCandidate, StorageGcPlan,
+    StorageGcReason, StorageGcReport, SubstrateStats,
 };
 use super::super::{
     CheckpointLabel, WORKSPACE_MARKER_PATH, discover_session_images, verify_no_symlinks,
@@ -233,6 +235,83 @@ fn allocated_file_bytes(metadata: &fs::Metadata) -> u64 {
     {
         metadata.len()
     }
+}
+
+fn gc_reason_tag(reason: StorageGcReason) -> &'static [u8] {
+    match reason {
+        StorageGcReason::RetiredWorkspace => b"retired-workspace",
+        StorageGcReason::OrphanStagingImage => b"orphan-staging-image",
+        StorageGcReason::OrphanStagingMetadata => b"orphan-staging-metadata",
+        StorageGcReason::ExpiredCheckpoint => b"expired-checkpoint",
+        StorageGcReason::DetachedImageCompaction => b"detached-image-compaction",
+    }
+}
+
+fn gc_candidate(
+    reason: StorageGcReason,
+    path: &Path,
+    associated_paths: &[PathBuf],
+    format: Option<ImageFormat>,
+    extra_identity: &[u8],
+) -> Result<StorageGcCandidate, ApfsStorageError> {
+    let mut hasher = Sha256::new();
+    hasher.update(gc_reason_tag(reason));
+    hasher.update(path.as_os_str().as_encoded_bytes());
+    hasher.update(extra_identity);
+    let mut bytes = 0_u64;
+    for associated in associated_paths {
+        let metadata = match fs::symlink_metadata(associated) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => {
+                return Err(ApfsStorageError::Host(format!(
+                    "GC candidate path is not a regular file: {}",
+                    associated.display()
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(io_error("inspect GC candidate", associated, error));
+            }
+        };
+        let allocated = allocated_file_bytes(&metadata);
+        bytes = bytes
+            .checked_add(allocated)
+            .ok_or(ApfsStorageError::InvalidPlan(
+                "GC candidate byte accounting overflow",
+            ))?;
+        hasher.update(associated.as_os_str().as_encoded_bytes());
+        hasher.update(metadata.len().to_le_bytes());
+        hasher.update(allocated.to_le_bytes());
+        let modified = metadata
+            .modified()
+            .map_err(|error| io_error("read GC candidate timestamp", associated, error))?
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        hasher.update(modified.as_secs().to_le_bytes());
+        hasher.update(modified.subsec_nanos().to_le_bytes());
+        if associated != path {
+            hasher.update(
+                fs::read(associated)
+                    .map_err(|error| io_error("read GC candidate identity", associated, error))?,
+            );
+        }
+    }
+    Ok(StorageGcCandidate::new(
+        hasher.finalize().into(),
+        path.to_owned(),
+        bytes,
+        reason,
+        format,
+    ))
+}
+
+fn image_gc_paths(image: &Path) -> Vec<PathBuf> {
+    vec![
+        image.to_owned(),
+        sidecar_path(image),
+        companion_path(image),
+        checkpoint_fact_path(image),
+    ]
 }
 
 fn pre_cowshed_path(project_root: &Path) -> PathBuf {
@@ -1213,16 +1292,17 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         PathBuf::from(lock)
     }
 
-    fn gc_project(
+    fn preview_gc_project(
         &self,
         project: &Path,
-        report: &mut StorageGcReport,
-    ) -> Result<(), ApfsStorageError>
+        repo: &RepoId,
+        observed_at: std::time::SystemTime,
+    ) -> Result<StorageGcPlan, ApfsStorageError>
     where
         R: CommandRunner + Send + Sync + 'static,
     {
         let sessions = project.join("sessions");
-        let session_images = match fs::read_dir(&sessions) {
+        let session_entries = match fs::read_dir(&sessions) {
             Ok(entries) => entries
                 .map(|entry| {
                     entry
@@ -1233,30 +1313,28 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(io_error("enumerate sessions", &sessions, error)),
         };
+        let mut candidates = Vec::new();
+        let mut lock_paths = Vec::new();
+        let mut examined = 0_usize;
+        let mut retained_pinned = 0_usize;
+        let mut retained_recent = 0_usize;
 
         let trash = sessions.join(super::TRASH_NAMESPACE);
-        match fs::read_dir(&trash) {
-            Ok(entries) => {
-                for entry in entries {
-                    let entry =
-                        entry.map_err(|error| io_error("read trash entry", &trash, error))?;
-                    let path = entry.path();
-                    let Ok(format) = ImageFormat::from_image_path(&path) else {
-                        continue;
-                    };
-                    report.examined += 1;
-                    let lock = Self::transient_lock_path(project, &path, format)?;
-                    let Some(_guard) =
-                        acquire_image_locks(&self.config.store_root, &[lock], LockMode::Try)?
-                    else {
-                        continue;
-                    };
-                    self.reclaim_image(&path, format)?;
-                    report.reclaimed += 1;
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io_error("enumerate trash", &trash, error)),
+        for path in regular_file_children(&trash)? {
+            let Ok(format) = ImageFormat::from_image_path(&path) else {
+                continue;
+            };
+            examined = examined
+                .checked_add(1)
+                .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
+            lock_paths.push(Self::transient_lock_path(project, &path, format)?);
+            candidates.push(gc_candidate(
+                StorageGcReason::RetiredWorkspace,
+                &path,
+                &image_gc_paths(&path),
+                Some(format),
+                &[],
+            )?);
         }
 
         let staging = project.join(super::STAGING_NAMESPACE);
@@ -1279,52 +1357,93 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             }
         }
         for (image, format) in &staged_images {
-            report.examined += 1;
+            examined = examined
+                .checked_add(1)
+                .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
             if staged_sidecars.contains_key(image) {
                 continue;
             }
-            let lock = Self::transient_lock_path(project, image, *format)?;
-            let Some(_guard) =
-                acquire_image_locks(&self.config.store_root, &[lock], LockMode::Try)?
-            else {
-                continue;
-            };
-            self.reclaim_image(image, *format)?;
-            report.reclaimed += 1;
+            lock_paths.push(Self::transient_lock_path(project, image, *format)?);
+            candidates.push(gc_candidate(
+                StorageGcReason::OrphanStagingImage,
+                image,
+                &image_gc_paths(image),
+                Some(*format),
+                &[],
+            )?);
         }
         for (image, sidecar) in &staged_sidecars {
             if staged_images.contains_key(image) {
                 continue;
             }
-            report.examined += 1;
+            examined = examined
+                .checked_add(1)
+                .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
             let Some(format) = staged_image_format(image) else {
                 continue;
             };
-            let lock = Self::transient_lock_path(project, image, format)?;
-            let Some(_guard) =
-                acquire_image_locks(&self.config.store_root, &[lock], LockMode::Try)?
-            else {
-                continue;
-            };
-            fs::remove_file(sidecar)
-                .map_err(|error| io_error("remove orphan staging metadata", sidecar, error))?;
-            sync_parent!(sidecar)?;
-            report.reclaimed += 1;
+            lock_paths.push(Self::transient_lock_path(project, image, format)?);
+            candidates.push(gc_candidate(
+                StorageGcReason::OrphanStagingMetadata,
+                sidecar,
+                std::slice::from_ref(sidecar),
+                None,
+                &[],
+            )?);
         }
 
         let checkpoint_root = project.join("checkpoints");
         for workspace_directory in directory_children(&checkpoint_root)? {
+            let workspace_name = workspace_directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    ApfsStorageError::Host(format!(
+                        "checkpoint workspace directory is not UTF-8: {}",
+                        workspace_directory.display()
+                    ))
+                })
+                .and_then(|name| {
+                    WorkspaceName::new(name)
+                        .map_err(|error| ApfsStorageError::Host(error.to_string()))
+                })?;
             let mut checkpoints = Vec::new();
             for image in regular_file_children(&workspace_directory)? {
                 let Ok(format) = ImageFormat::from_image_path(&image) else {
                     continue;
                 };
+                lock_paths.push(super::workspace_lock_path(
+                    &self.config,
+                    repo,
+                    &workspace_name,
+                    format,
+                )?);
                 let fact_path = checkpoint_fact_path(&image);
                 if !fact_path.exists() {
                     continue;
                 }
                 let fact: CheckpointFactWire = crate::metadata::read_json(&fact_path)
                     .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+                let expected_label = image
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .ok_or_else(|| {
+                        ApfsStorageError::Host(format!(
+                            "invalid checkpoint image name: {}",
+                            image.display()
+                        ))
+                    })?;
+                if fact.version != CHECKPOINT_FACT_VERSION
+                    || fact.repo_id != *repo
+                    || fact.workspace != workspace_name
+                    || fact.label.as_str() != expected_label
+                    || !matches!(fact.pin.as_str(), "pinned" | "automatic")
+                {
+                    return Err(ApfsStorageError::Host(format!(
+                        "checkpoint fact does not match image path: {}",
+                        fact_path.display()
+                    )));
+                }
                 let modified = fs::metadata(&image)
                     .and_then(|metadata| metadata.modified())
                     .map_err(|error| io_error("read checkpoint age", &image, error))?;
@@ -1333,52 +1452,158 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             checkpoints
                 .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
             for (index, (modified, image, format, fact)) in checkpoints.into_iter().enumerate() {
-                report.examined += 1;
+                examined = examined
+                    .checked_add(1)
+                    .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
                 if fact.pin == "pinned" {
-                    report.retained_pinned += 1;
+                    retained_pinned = retained_pinned
+                        .checked_add(1)
+                        .ok_or(ApfsStorageError::InvalidPlan("GC retained count overflow"))?;
                     continue;
                 }
-                let younger_than_fourteen_days = std::time::SystemTime::now()
-                    .duration_since(modified)
-                    .map_or(true, |age| {
+                let younger_than_fourteen_days =
+                    observed_at.duration_since(modified).map_or(true, |age| {
                         age < std::time::Duration::from_secs(14 * 24 * 60 * 60)
                     });
                 if index < 5 || younger_than_fourteen_days {
-                    report.retained_recent += 1;
+                    retained_recent = retained_recent
+                        .checked_add(1)
+                        .ok_or(ApfsStorageError::InvalidPlan("GC retained count overflow"))?;
                     continue;
                 }
-                let lock = super::workspace_lock_path(
-                    &self.config,
-                    &fact.repo_id,
-                    &fact.workspace,
-                    format,
-                )?;
-                let Some(_guard) =
-                    acquire_image_locks(&self.config.store_root, &[lock], LockMode::Try)?
-                else {
-                    continue;
-                };
-                self.reclaim_image(&image, format)?;
-                report.reclaimed += 1;
+                let identity = serde_json::to_vec(&fact)
+                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+                candidates.push(gc_candidate(
+                    StorageGcReason::ExpiredCheckpoint,
+                    &image,
+                    &image_gc_paths(&image),
+                    Some(format),
+                    &identity,
+                )?);
             }
         }
 
-        for path in session_images {
-            if matches!(ImageFormat::from_image_path(&path), Ok(ImageFormat::Sparse)) {
-                let lock = Self::lock_path_for_image(&path);
-                let Some(_guard) =
-                    acquire_image_locks(&self.config.store_root, &[lock], LockMode::Try)?
-                else {
-                    continue;
-                };
-                if self.image_is_kernel_mounted(&path)? {
-                    continue;
-                }
-                report.examined += 1;
-                self.backend.compact_image(&path, ImageFormat::Sparse)?;
+        for discovered in discover_session_images(session_entries)? {
+            if discovered.format() != ImageFormat::Sparse {
+                continue;
             }
+            let path = discovered.path();
+            lock_paths.push(Self::lock_path_for_image(path));
+            if self.image_is_kernel_mounted(path)? {
+                continue;
+            }
+            let metadata = DetachedWorkspaceMetadata::read_for_image(path)
+                .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+            if metadata.repo_id != *repo
+                || metadata.workspace != *discovered.workspace()
+                || metadata.image_format != discovered.format()
+                || metadata.publication_state != PublicationState::Active
+            {
+                return Err(ApfsStorageError::MarkerMismatch(format!(
+                    "detached metadata disagrees with session image {}",
+                    path.display()
+                )));
+            }
+            examined = examined
+                .checked_add(1)
+                .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
+            let identity = serde_json::to_vec(&metadata)
+                .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+            candidates.push(gc_candidate(
+                StorageGcReason::DetachedImageCompaction,
+                path,
+                std::slice::from_ref(&path.to_owned()),
+                Some(ImageFormat::Sparse),
+                &identity,
+            )?);
         }
-        Ok(())
+
+        candidates.sort_by(|left, right| {
+            left.path()
+                .cmp(right.path())
+                .then_with(|| gc_reason_tag(left.reason()).cmp(gc_reason_tag(right.reason())))
+        });
+        lock_paths.sort();
+        lock_paths.dedup();
+        Ok(StorageGcPlan::new(
+            repo.clone(),
+            observed_at,
+            candidates,
+            lock_paths,
+            examined,
+            retained_pinned,
+            retained_recent,
+        ))
+    }
+
+    fn execute_gc_plan(
+        &self,
+        project: &Path,
+        plan: StorageGcPlan,
+    ) -> Result<StorageGcReport, ApfsStorageError>
+    where
+        R: CommandRunner + Send + Sync + 'static,
+    {
+        let _guard =
+            acquire_image_locks(&self.config.store_root, plan.lock_paths(), LockMode::Try)?
+                .ok_or(ApfsStorageError::GcPlanStale)?;
+        let current = self.preview_gc_project(project, plan.repo(), plan.observed_at())?;
+        if current != plan {
+            return Err(ApfsStorageError::GcPlanStale);
+        }
+        let mut report = StorageGcReport {
+            examined: plan.examined(),
+            retained_pinned: plan.retained_pinned(),
+            retained_recent: plan.retained_recent(),
+            ..StorageGcReport::default()
+        };
+        for candidate in plan.candidates() {
+            match candidate.reason() {
+                StorageGcReason::RetiredWorkspace
+                | StorageGcReason::OrphanStagingImage
+                | StorageGcReason::ExpiredCheckpoint => {
+                    let format = candidate.format().ok_or(ApfsStorageError::InvalidPlan(
+                        "image GC candidate has no format",
+                    ))?;
+                    self.reclaim_image(candidate.path(), format)?;
+                    report.freed_bytes = report.freed_bytes.checked_add(candidate.bytes()).ok_or(
+                        ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
+                    )?;
+                }
+                StorageGcReason::OrphanStagingMetadata => {
+                    fs::remove_file(candidate.path()).map_err(|error| {
+                        io_error("remove orphan staging metadata", candidate.path(), error)
+                    })?;
+                    sync_parent!(candidate.path())?;
+                    report.freed_bytes = report.freed_bytes.checked_add(candidate.bytes()).ok_or(
+                        ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
+                    )?;
+                }
+                StorageGcReason::DetachedImageCompaction => {
+                    let before =
+                        allocated_file_bytes(&fs::metadata(candidate.path()).map_err(|error| {
+                            io_error("read pre-compaction statistics", candidate.path(), error)
+                        })?);
+                    self.backend
+                        .compact_image(candidate.path(), ImageFormat::Sparse)?;
+                    let after =
+                        allocated_file_bytes(&fs::metadata(candidate.path()).map_err(|error| {
+                            io_error("read post-compaction statistics", candidate.path(), error)
+                        })?);
+                    report.freed_bytes = report
+                        .freed_bytes
+                        .checked_add(before.saturating_sub(after))
+                        .ok_or(ApfsStorageError::InvalidPlan(
+                            "GC freed byte accounting overflow",
+                        ))?;
+                }
+            }
+            report.reclaimed = report
+                .reclaimed
+                .checked_add(1)
+                .ok_or(ApfsStorageError::InvalidPlan("GC reclaimed count overflow"))?;
+        }
+        Ok(report)
     }
 }
 
@@ -3152,23 +3377,32 @@ where
         Ok(true)
     }
 
-    fn gc(&self, config: &ApfsSubstrateConfig) -> Result<StorageGcReport, ApfsStorageError> {
+    fn preview_gc(
+        &self,
+        config: &ApfsSubstrateConfig,
+        repo: &RepoId,
+    ) -> Result<StorageGcPlan, ApfsStorageError> {
         if config.store_root != self.config.store_root {
             return Err(ApfsStorageError::InvalidPlan(
                 "GC config differs from host storage root",
             ));
         }
-        self.recover_pending(config, &[])?;
-        let mut report = StorageGcReport::default();
-        for owner in directory_children(&config.store_root)? {
-            if !is_project_owner_directory(&owner) {
-                continue;
-            }
-            for project in directory_children(&owner)? {
-                self.gc_project(&project, &mut report)?;
-            }
+        let project = layout(config, repo)?.project().project_root.clone();
+        self.preview_gc_project(&project, repo, std::time::SystemTime::now())
+    }
+
+    fn execute_gc(
+        &self,
+        config: &ApfsSubstrateConfig,
+        plan: StorageGcPlan,
+    ) -> Result<StorageGcReport, ApfsStorageError> {
+        if config.store_root != self.config.store_root {
+            return Err(ApfsStorageError::InvalidPlan(
+                "GC config differs from host storage root",
+            ));
         }
-        Ok(report)
+        let project = layout(config, plan.repo())?.project().project_root.clone();
+        self.execute_gc_plan(&project, plan)
     }
 }
 

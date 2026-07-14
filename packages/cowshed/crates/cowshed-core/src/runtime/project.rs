@@ -2381,29 +2381,71 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     }
 
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport> {
-        use crate::storage::lifecycle::Substrate;
+        use crate::storage::lifecycle::{StorageGcReason, Substrate};
+
         self.validate_binding().await?;
+        let plan = self
+            .substrate
+            .preview_gc(&self.descriptor.repo_id)
+            .await
+            .map_err(native_storage_error)?;
+        let candidates = plan
+            .candidates()
+            .iter()
+            .map(|candidate| crate::api::dto::GcCandidate {
+                identity: crate::api::dto::Sha256Digest::from_bytes(candidate.identity()),
+                path: candidate.path().to_owned(),
+                bytes: candidate.bytes(),
+                reason: match candidate.reason() {
+                    StorageGcReason::RetiredWorkspace => {
+                        crate::api::dto::GcReason::RetiredWorkspace
+                    }
+                    StorageGcReason::OrphanStagingImage => {
+                        crate::api::dto::GcReason::OrphanStagingImage
+                    }
+                    StorageGcReason::OrphanStagingMetadata => {
+                        crate::api::dto::GcReason::OrphanStagingMetadata
+                    }
+                    StorageGcReason::ExpiredCheckpoint => {
+                        crate::api::dto::GcReason::ExpiredCheckpoint
+                    }
+                    StorageGcReason::DetachedImageCompaction => {
+                        crate::api::dto::GcReason::DetachedImageCompaction
+                    }
+                },
+            })
+            .collect::<Vec<_>>();
         if options.dry_run {
-            let count = u64::try_from(self.authoritative().await?.len())
-                .map_err(|_| CowshedError::internal("workspace count overflow"))?;
+            let freed_bytes = candidates
+                .iter()
+                .try_fold(0_u64, |sum, candidate| sum.checked_add(candidate.bytes))
+                .ok_or_else(|| CowshedError::internal("GC candidate byte accounting overflow"))?;
             return Ok(GcReport {
-                examined: count,
+                examined: u64::try_from(plan.examined())
+                    .map_err(|_| CowshedError::internal("GC count overflow"))?,
                 reclaimed: 0,
-                retained_pinned: 0,
-                freed_bytes: 0,
+                retained_pinned: u64::try_from(plan.retained_pinned())
+                    .map_err(|_| CowshedError::internal("GC count overflow"))?,
+                freed_bytes,
                 dry_run: true,
+                candidates,
             });
         }
-        let report = self.substrate.gc().await.map_err(native_storage_error)?;
+        let report = self
+            .substrate
+            .execute_gc(plan)
+            .await
+            .map_err(native_storage_error)?;
         Ok(GcReport {
             examined: u64::try_from(report.examined)
-                .map_err(|_| CowshedError::internal("gc count overflow"))?,
+                .map_err(|_| CowshedError::internal("GC count overflow"))?,
             reclaimed: u64::try_from(report.reclaimed)
-                .map_err(|_| CowshedError::internal("gc count overflow"))?,
+                .map_err(|_| CowshedError::internal("GC count overflow"))?,
             retained_pinned: u64::try_from(report.retained_pinned)
-                .map_err(|_| CowshedError::internal("gc count overflow"))?,
-            freed_bytes: 0,
+                .map_err(|_| CowshedError::internal("GC count overflow"))?,
+            freed_bytes: report.freed_bytes,
             dry_run: false,
+            candidates,
         })
     }
 
@@ -3771,6 +3813,10 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
         crate::storage::apfs::ApfsStorageError::Conflict(error) => {
             CowshedError::conflict(error.to_string(), "refresh workspace state and retry")
         }
+        crate::storage::apfs::ApfsStorageError::GcPlanStale => CowshedError::conflict(
+            "garbage-collection plan became stale",
+            "preview garbage collection again and retry",
+        ),
         crate::storage::apfs::ApfsStorageError::PendingPublication(path) => CowshedError::conflict(
             format!("restore publication is pending at {}", path.display()),
             "repair commitment/gateway evidence and retry restore",

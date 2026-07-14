@@ -602,12 +602,142 @@ pub struct RestoreReceipt {
     pub workspace: LifecycleWorkspace,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageGcReason {
+    RetiredWorkspace,
+    OrphanStagingImage,
+    OrphanStagingMetadata,
+    ExpiredCheckpoint,
+    DetachedImageCompaction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageGcCandidate {
+    identity: [u8; 32],
+    path: PathBuf,
+    bytes: u64,
+    reason: StorageGcReason,
+    format: Option<ImageFormat>,
+}
+
+impl StorageGcCandidate {
+    pub(crate) fn new(
+        identity: [u8; 32],
+        path: PathBuf,
+        bytes: u64,
+        reason: StorageGcReason,
+        format: Option<ImageFormat>,
+    ) -> Self {
+        Self {
+            identity,
+            path,
+            bytes,
+            reason,
+            format,
+        }
+    }
+
+    pub const fn identity(&self) -> [u8; 32] {
+        self.identity
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub const fn reason(&self) -> StorageGcReason {
+        self.reason
+    }
+
+    pub(crate) const fn format(&self) -> Option<ImageFormat> {
+        self.format
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageGcPlan {
+    repo: RepoId,
+    observed_at: std::time::SystemTime,
+    candidates: Vec<StorageGcCandidate>,
+    lock_paths: Vec<PathBuf>,
+    examined: usize,
+    retained_pinned: usize,
+    retained_recent: usize,
+}
+
+impl StorageGcPlan {
+    pub(crate) fn new(
+        repo: RepoId,
+        observed_at: std::time::SystemTime,
+        candidates: Vec<StorageGcCandidate>,
+        lock_paths: Vec<PathBuf>,
+        examined: usize,
+        retained_pinned: usize,
+        retained_recent: usize,
+    ) -> Self {
+        Self {
+            repo,
+            observed_at,
+            candidates,
+            lock_paths,
+            examined,
+            retained_pinned,
+            retained_recent,
+        }
+    }
+
+    pub fn empty(repo: RepoId) -> Self {
+        Self::new(
+            repo,
+            std::time::SystemTime::UNIX_EPOCH,
+            Vec::new(),
+            Vec::new(),
+            0,
+            0,
+            0,
+        )
+    }
+
+    pub fn repo(&self) -> &RepoId {
+        &self.repo
+    }
+
+    pub const fn observed_at(&self) -> std::time::SystemTime {
+        self.observed_at
+    }
+
+    pub fn candidates(&self) -> &[StorageGcCandidate] {
+        &self.candidates
+    }
+
+    pub(crate) fn lock_paths(&self) -> &[PathBuf] {
+        &self.lock_paths
+    }
+
+    pub const fn examined(&self) -> usize {
+        self.examined
+    }
+
+    pub const fn retained_pinned(&self) -> usize {
+        self.retained_pinned
+    }
+
+    pub const fn retained_recent(&self) -> usize {
+        self.retained_recent
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StorageGcReport {
     pub examined: usize,
     pub reclaimed: usize,
     pub retained_pinned: usize,
     pub retained_recent: usize,
+    pub freed_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -798,5 +928,6 @@ pub trait Substrate: LifecyclePlanner {
     async fn unmount(&self, workspace: &LifecycleWorkspace) -> Result<(), Self::Error>;
     async fn caches_root(&self) -> Result<PathBuf, Self::Error>;
     async fn stats(&self, workspace: &LifecycleWorkspace) -> Result<SubstrateStats, Self::Error>;
-    async fn gc(&self) -> Result<StorageGcReport, Self::Error>;
+    async fn preview_gc(&self, repo: &RepoId) -> Result<StorageGcPlan, Self::Error>;
+    async fn execute_gc(&self, plan: StorageGcPlan) -> Result<StorageGcReport, Self::Error>;
 }

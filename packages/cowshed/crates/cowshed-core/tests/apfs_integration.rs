@@ -348,14 +348,14 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             .reclaim(retired)
             .await
             .map_err(|error| std::io::Error::other(format!("reclaim: {error}")))?;
-        substrate
-            .unmount(&restored)
+        let gc_plan = substrate
+            .preview_gc(&repo)
             .await
-            .map_err(|error| std::io::Error::other(format!("unmount: {error}")))?;
+            .map_err(|error| std::io::Error::other(format!("preview gc: {error}")))?;
         substrate
-            .gc()
+            .execute_gc(gc_plan)
             .await
-            .map_err(|error| std::io::Error::other(format!("gc: {error}")))?;
+            .map_err(|error| std::io::Error::other(format!("execute gc: {error}")))?;
 
         Ok(format!(
             "lifecycle={:?}, fork={fork_elapsed:?}, logical={}, allocated={}, checkpoints={}",
