@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{CStr, CString, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -22,7 +22,8 @@ use crate::apfs::{
 use crate::copy::TreeCopier;
 use crate::metadata::{
     DetachedWorkspaceMetadata, ImageFormat, METADATA_VERSION, Platform, PublicationState,
-    WorkspaceIncarnation, WorkspaceMarker, WorkspaceName, WorkspaceRole, sidecar_path,
+    WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName, WorkspaceRole,
+    sidecar_path,
 };
 use crate::repository::RepoId;
 use crate::workspace_credentials::{
@@ -431,6 +432,103 @@ fn sync_parent_path(path: &Path) -> Result<(), ApfsStorageError> {
     fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| io_error("sync image directory", parent, error))
+}
+
+fn exact_mount_stub(path: &Path) -> Result<bool, ApfsStorageError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_error("inspect adoption rollback path", path, error)),
+    };
+    if !metadata.file_type().is_dir() {
+        return Ok(false);
+    }
+    let mut entries = fs::read_dir(path)
+        .map_err(|error| io_error("enumerate adoption rollback path", path, error))?;
+    let Some(entry) = entries
+        .next()
+        .transpose()
+        .map_err(|error| io_error("read adoption rollback path", path, error))?
+    else {
+        return Ok(false);
+    };
+    if entries
+        .next()
+        .transpose()
+        .map_err(|error| io_error("read adoption rollback path", path, error))?
+        .is_some()
+        || entry.file_name() != OsStr::new(".envrc")
+        || !entry
+            .file_type()
+            .map_err(|error| io_error("inspect adoption mount stub", &entry.path(), error))?
+            .is_file()
+    {
+        return Ok(false);
+    }
+    fs::read(entry.path())
+        .map(|bytes| bytes == SELF_HEALING_STUB)
+        .map_err(|error| io_error("read adoption mount stub", &entry.path(), error))
+}
+
+fn remove_exact_mount_stub(path: &Path) -> Result<(), ApfsStorageError> {
+    if !exact_mount_stub(path)? {
+        return Err(ApfsStorageError::InvalidPlan(
+            "refusing to remove a path that is not the canonical Cowshed mount stub",
+        ));
+    }
+    let stub = path.join(".envrc");
+    fs::remove_file(&stub).map_err(|error| io_error("remove adoption mount stub", &stub, error))?;
+    fs::remove_dir(path).map_err(|error| io_error("remove adoption mountpoint", path, error))?;
+    sync_parent_path(path)
+}
+
+fn restore_adopted_checkout_paths(
+    source_checkout: &Path,
+    pre_cowshed_checkout: &Path,
+) -> Result<(), ApfsStorageError> {
+    if !source_checkout.is_absolute() || pre_cowshed_checkout != pre_cowshed_path(source_checkout) {
+        return Err(ApfsStorageError::InvalidPlan(
+            "adoption rollback paths are not exact absolute siblings",
+        ));
+    }
+    let source_is_stub = exact_mount_stub(source_checkout)?;
+    let pre_exists = match fs::symlink_metadata(pre_cowshed_checkout) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(io_error(
+                "inspect retained pre-cowshed checkout",
+                pre_cowshed_checkout,
+                error,
+            ));
+        }
+    };
+    if !pre_exists {
+        return if source_is_stub {
+            Err(ApfsStorageError::InvalidPlan(
+                "retained pre-cowshed checkout is missing",
+            ))
+        } else {
+            // A prior attempt completed the swap and mount-stub cleanup.
+            Ok(())
+        };
+    }
+
+    let pre_is_stub = exact_mount_stub(pre_cowshed_checkout)?;
+    match (source_is_stub, pre_is_stub) {
+        (true, false) => {
+            swap_paths(source_checkout, pre_cowshed_checkout)?;
+            sync_parent_path(source_checkout)?;
+            remove_exact_mount_stub(pre_cowshed_checkout)
+        }
+        (false, true) => {
+            // A prior attempt completed the atomic swap and crashed before stub cleanup.
+            remove_exact_mount_stub(pre_cowshed_checkout)
+        }
+        _ => Err(ApfsStorageError::InvalidPlan(
+            "adoption rollback paths are missing the exact retained checkout and canonical mount stub",
+        )),
+    }
 }
 
 const MNT_DONTBROWSE: u64 = 0x0010_0000;
@@ -2495,6 +2593,32 @@ where
         }
     }
 
+    fn restore_adopted_checkout(
+        &self,
+        workspace: &LifecycleWorkspace,
+        source_checkout: &Path,
+        pre_cowshed_checkout: &Path,
+    ) -> Result<(), ApfsStorageError> {
+        if !workspace.name().is_main()
+            || source_checkout != self.config.main_mount
+            || pre_cowshed_checkout != pre_cowshed_path(source_checkout)
+        {
+            return Err(ApfsStorageError::InvalidPlan(
+                "adoption rollback does not target this host's canonical main",
+            ));
+        }
+
+        // Reject a missing retained tree before changing the mount whenever the underlying
+        // canonical stub is already visible.
+        if exact_mount_stub(source_checkout)? && !pre_cowshed_checkout.exists() {
+            return Err(ApfsStorageError::InvalidPlan(
+                "retained pre-cowshed checkout is missing",
+            ));
+        }
+        self.detach_mounted(workspace, false)?;
+        restore_adopted_checkout_paths(source_checkout, pre_cowshed_checkout)
+    }
+
     fn publish_image(&self, staged: &Path, canonical: &Path) -> Result<(), PublicationError> {
         self.verify_controller_path(staged)
             .map_err(PublicationError::rolled_back)?;
@@ -2785,6 +2909,39 @@ where
             },
             |identity| identity.created_at.clone(),
         );
+        let info_snapshot = match policy {
+            MetadataPolicy::Fresh => {
+                let identity = identity.ok_or(ApfsStorageError::InvalidPlan(
+                    "fresh metadata requires operation identity",
+                ))?;
+                Some(WorkspaceInfoSnapshot {
+                    project_root: identity.project_root.clone(),
+                    role: workspace.role(),
+                    base_commit: identity.base_commit.clone(),
+                    branch: identity.branch.clone(),
+                    created_at: identity.created_at.clone(),
+                    forked_from: identity.forked_from.clone(),
+                    captured_at: identity.created_at.clone(),
+                    stale: false,
+                })
+            }
+            MetadataPolicy::Preserve | MetadataPolicy::PendingFence => {
+                let mut info = preserved
+                    .as_ref()
+                    .and_then(|metadata| metadata.info_snapshot.clone())
+                    .ok_or_else(|| {
+                        ApfsStorageError::Host(
+                            crate::metadata::MetadataError::MissingInfoSnapshot.to_string(),
+                        )
+                    })?;
+                info.role = workspace.role();
+                if let Some(identity) = identity {
+                    info.captured_at.clone_from(&identity.created_at);
+                    info.stale = false;
+                }
+                Some(info)
+            }
+        };
         let metadata = DetachedWorkspaceMetadata {
             version: METADATA_VERSION,
             repo_id: workspace.repo().clone(),
@@ -2798,7 +2955,7 @@ where
             },
             updated_at,
             grants,
-            info_snapshot: preserved.and_then(|metadata| metadata.info_snapshot),
+            info_snapshot,
         };
         metadata
             .write_for_image(image)
@@ -4241,6 +4398,90 @@ mod tests {
         std::fs::set_permissions(&system_metadata, std::fs::Permissions::from_mode(0o700))
             .expect("restore metadata fixture permissions");
         std::fs::remove_dir_all(root).expect("fixture cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn adoption_rollback_atomically_restores_the_exact_retained_tree() {
+        let parent =
+            std::env::temp_dir().join(format!("cowshed-adopt-rollback-{}", uuid::Uuid::new_v4()));
+        let source = parent.join("project");
+        let retained = pre_cowshed_path(&source);
+        std::fs::create_dir_all(&source).expect("source stub");
+        std::fs::write(source.join(".envrc"), SELF_HEALING_STUB).expect("source stub contents");
+        std::fs::create_dir_all(retained.join(".git/objects")).expect("retained git metadata");
+        std::fs::write(retained.join(".git/HEAD"), b"ref: refs/heads/main\n")
+            .expect("retained HEAD");
+        std::fs::write(retained.join("bytes"), b"\0exact\xff").expect("retained bytes");
+
+        restore_adopted_checkout_paths(&source, &retained).expect("restore retained checkout");
+
+        assert_eq!(
+            std::fs::read(source.join(".git/HEAD")).expect("restored HEAD"),
+            b"ref: refs/heads/main\n"
+        );
+        assert_eq!(
+            std::fs::read(source.join("bytes")).expect("restored bytes"),
+            b"\0exact\xff"
+        );
+        assert!(!retained.exists(), "swapped mount stub is removed");
+        std::fs::remove_dir_all(parent).expect("fixture cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn adoption_rollback_retry_finishes_cleanup_after_atomic_swap() {
+        let parent = std::env::temp_dir().join(format!(
+            "cowshed-adopt-rollback-retry-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = parent.join("project");
+        let retained = pre_cowshed_path(&source);
+        std::fs::create_dir_all(&source).expect("source stub");
+        std::fs::write(source.join(".envrc"), SELF_HEALING_STUB).expect("source stub contents");
+        std::fs::create_dir_all(retained.join(".git")).expect("retained git metadata");
+        std::fs::write(retained.join(".git/HEAD"), b"retained\n").expect("retained HEAD");
+        swap_paths(&source, &retained).expect("injected crash boundary after swap");
+
+        restore_adopted_checkout_paths(&source, &retained).expect("retry cleanup");
+        assert_eq!(
+            std::fs::read(source.join(".git/HEAD")).expect("restored HEAD"),
+            b"retained\n"
+        );
+        assert!(!retained.exists());
+
+        restore_adopted_checkout_paths(&source, &retained)
+            .expect("completed rollback is idempotent");
+        std::fs::remove_dir_all(parent).expect("fixture cleanup");
+    }
+
+    #[test]
+    fn adoption_rollback_missing_retained_tree_and_collision_are_non_mutating() {
+        let parent = std::env::temp_dir().join(format!(
+            "cowshed-adopt-rollback-refusal-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = parent.join("project");
+        let retained = pre_cowshed_path(&source);
+        std::fs::create_dir_all(&source).expect("source stub");
+        std::fs::write(source.join(".envrc"), SELF_HEALING_STUB).expect("source stub contents");
+        let missing = restore_adopted_checkout_paths(&source, &retained)
+            .expect_err("missing retained checkout");
+        assert!(matches!(missing, ApfsStorageError::InvalidPlan(_)));
+        assert!(exact_mount_stub(&source).expect("source remains exact stub"));
+
+        std::fs::remove_file(source.join(".envrc")).expect("replace source contents");
+        std::fs::write(source.join("unrelated"), b"do not overwrite").expect("collision");
+        std::fs::create_dir_all(retained.join(".git")).expect("retained checkout");
+        let collision = restore_adopted_checkout_paths(&source, &retained)
+            .expect_err("unrelated source collision");
+        assert!(matches!(collision, ApfsStorageError::InvalidPlan(_)));
+        assert_eq!(
+            std::fs::read(source.join("unrelated")).expect("collision preserved"),
+            b"do not overwrite"
+        );
+        assert!(retained.join(".git").is_dir());
+        std::fs::remove_dir_all(parent).expect("fixture cleanup");
     }
 
     #[test]

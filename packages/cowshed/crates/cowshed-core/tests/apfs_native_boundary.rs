@@ -14,7 +14,8 @@ use cowshed_core::apfs::{
 };
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, GrantSet, ImageFormat, METADATA_VERSION, Platform, PortBlock,
-    PublicationState, WorkspaceIncarnation, WorkspaceName, WorkspaceRole, sidecar_path,
+    PublicationState, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole,
+    sidecar_path,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::apfs::native::{
@@ -286,13 +287,38 @@ fn metadata(format: ImageFormat) -> DetachedWorkspaceMetadata {
         updated_at: "2026-07-13T00:00:00Z".to_owned(),
         grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
             .expect("grants"),
-        info_snapshot: None,
+        info_snapshot: Some(WorkspaceInfoSnapshot {
+            project_root: PathBuf::from("/project"),
+            role: WorkspaceRole::Main,
+            base_commit: "0123456789abcdef".to_owned(),
+            branch: Some("main".to_owned()),
+            created_at: "2026-07-13T00:00:00Z".to_owned(),
+            forked_from: None,
+            captured_at: "2026-07-13T00:00:00Z".to_owned(),
+            stale: false,
+        }),
     }
+}
+fn set_metadata_workspace(metadata: &mut DetachedWorkspaceMetadata, workspace: WorkspaceName) {
+    let role = if workspace.is_main() {
+        WorkspaceRole::Main
+    } else {
+        WorkspaceRole::Workspace
+    };
+    metadata.workspace = workspace;
+    metadata
+        .info_snapshot
+        .as_mut()
+        .expect("fixture info snapshot")
+        .role = role;
 }
 
 fn write_session_metadata(image: &Path, workspace: &str, incarnation: &str, format: ImageFormat) {
     let mut detached = metadata(format);
-    detached.workspace = WorkspaceName::session(workspace).expect("session workspace");
+    set_metadata_workspace(
+        &mut detached,
+        WorkspaceName::session(workspace).expect("session workspace"),
+    );
     detached.workspace_incarnation =
         WorkspaceIncarnation::new(incarnation).expect("workspace incarnation");
     detached
@@ -358,6 +384,8 @@ fn identity(fixture: &Fixture) -> OperationIdentity {
         project_root: fixture.root.join("project"),
         base_commit: "0123456789abcdef".to_owned(),
         created_at: "2026-07-13T00:00:00Z".to_owned(),
+        branch: Some("main".to_owned()),
+        forked_from: None,
         created_trace: "trace-apfs-boundary".to_owned(),
         grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
             .expect("grants"),
@@ -647,7 +675,7 @@ fn stats_count_only_images_and_gc_drains_session_trash_then_compacts_detached_sp
         .expect("active");
     create_image(active.image(), ImageFormat::Sparse);
     let mut active_metadata = metadata(ImageFormat::Sparse);
-    active_metadata.workspace = active_name;
+    set_metadata_workspace(&mut active_metadata, active_name);
     active_metadata
         .write_for_image(active.image())
         .expect("active metadata");
@@ -657,7 +685,10 @@ fn stats_count_only_images_and_gc_drains_session_trash_then_compacts_detached_sp
         .join(".trash/retired-00000000000000000000000000000001.sparseimage");
     create_image(&trash, ImageFormat::Sparse);
     let mut retired_metadata = metadata(ImageFormat::Sparse);
-    retired_metadata.workspace = WorkspaceName::session("retired").expect("retired workspace");
+    set_metadata_workspace(
+        &mut retired_metadata,
+        WorkspaceName::session("retired").expect("retired workspace"),
+    );
     retired_metadata
         .write_for_image(&trash)
         .expect("retired metadata");
@@ -893,6 +924,107 @@ fn metadata_publication_writes_the_requested_identity_and_revision() {
     assert_eq!(published.workspace_incarnation, *workspace.incarnation());
     assert_eq!(published.image_format, workspace.format());
     assert_eq!(published.grants.revision, 17);
+    assert_eq!(
+        published
+            .require_info_snapshot()
+            .expect("fresh info snapshot"),
+        &cowshed_core::metadata::WorkspaceInfoSnapshot {
+            project_root: fixture.root.join("project"),
+            role: WorkspaceRole::Main,
+            base_commit: "0123456789abcdef".to_owned(),
+            branch: Some("main".to_owned()),
+            created_at: "2026-07-13T00:00:00Z".to_owned(),
+            forked_from: None,
+            captured_at: "2026-07-13T00:00:00Z".to_owned(),
+            stale: false,
+        }
+    );
+}
+
+#[test]
+fn fresh_session_metadata_persists_branch_fork_and_original_project_root() {
+    let fixture = Fixture::new("session-info-snapshot");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let workspace = session_workspace("raven", "00000000000000000000000000000002");
+    let image = layout
+        .session_image(workspace.name(), ImageFormat::Sparse)
+        .expect("session image");
+    std::fs::create_dir_all(image.image().parent().expect("parent")).expect("parent");
+    std::fs::write(image.image(), b"image").expect("image");
+    let host = native_host(&fixture, RecordingRunner::default());
+    let mut operation = identity(&fixture);
+    operation.branch = Some("cowshed/raven".to_owned());
+    operation.forked_from = Some(WorkspaceName::new("main").expect("main"));
+
+    host.publish_metadata(
+        image.image(),
+        &workspace,
+        Revision::new(3),
+        MetadataPolicy::Fresh,
+        Some(&operation),
+        None,
+    )
+    .expect("publish session metadata");
+
+    let published =
+        DetachedWorkspaceMetadata::read_for_image(image.image()).expect("published metadata");
+    let info = published.require_info_snapshot().expect("session info");
+    assert_eq!(info.project_root, fixture.root.join("project"));
+    assert_eq!(info.role, WorkspaceRole::Workspace);
+    assert_eq!(info.branch.as_deref(), Some("cowshed/raven"));
+    assert_eq!(
+        info.forked_from.as_ref().map(WorkspaceName::as_str),
+        Some("main")
+    );
+}
+
+#[test]
+fn preserved_metadata_keeps_origin_facts_and_refreshes_capture_time() {
+    let fixture = Fixture::new("preserved-info-snapshot");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let source = layout.main_image(ImageFormat::Sparse).expect("source");
+    let destination = layout
+        .checkpoint_image(
+            &WorkspaceName::new("main").expect("main"),
+            &cowshed_core::storage::CheckpointLabel::new("saved").expect("label"),
+            ImageFormat::Sparse,
+        )
+        .expect("destination");
+    create_image(source.image(), ImageFormat::Sparse);
+    create_image(destination.image(), ImageFormat::Sparse);
+    let host = native_host(&fixture, RecordingRunner::default());
+    let workspace = workspace(ImageFormat::Sparse);
+    let original = identity(&fixture);
+    host.publish_metadata(
+        source.image(),
+        &workspace,
+        Revision::new(1),
+        MetadataPolicy::Fresh,
+        Some(&original),
+        None,
+    )
+    .expect("fresh source");
+    let mut refresh = identity(&fixture);
+    refresh.created_at = "2026-07-14T01:02:03Z".to_owned();
+    refresh.branch = Some("wrong-new-branch".to_owned());
+    host.publish_metadata(
+        destination.image(),
+        &workspace,
+        Revision::new(2),
+        MetadataPolicy::Preserve,
+        Some(&refresh),
+        Some(source.image()),
+    )
+    .expect("preserve metadata");
+
+    let published =
+        DetachedWorkspaceMetadata::read_for_image(destination.image()).expect("preserved metadata");
+    let info = published.require_info_snapshot().expect("preserved info");
+    assert_eq!(info.project_root, fixture.root.join("project"));
+    assert_eq!(info.created_at, "2026-07-13T00:00:00Z");
+    assert_eq!(info.branch.as_deref(), Some("main"));
+    assert_eq!(info.captured_at, "2026-07-14T01:02:03Z");
+    assert!(!info.stale);
 }
 
 #[test]
@@ -906,7 +1038,10 @@ fn canonical_identity_mismatches_are_rejected_one_dimension_at_a_time() {
         if mutate == 0 {
             mismatched.repo_id = RepoId::parse("other/widget").expect("other repo");
         } else {
-            mismatched.workspace = WorkspaceName::session("other").expect("other workspace");
+            set_metadata_workspace(
+                &mut mismatched,
+                WorkspaceName::session("other").expect("other workspace"),
+            );
         }
         mismatched
             .write_for_image(canonical.image())
@@ -1560,11 +1695,14 @@ fn session_identity_mismatches_are_rejected_one_dimension_at_a_time() {
             .expect("session image");
         create_image(image.image(), ImageFormat::Sparse);
         let mut mismatched = metadata(ImageFormat::Sparse);
-        mismatched.workspace = session_name;
+        set_metadata_workspace(&mut mismatched, session_name);
         if mutate == 0 {
             mismatched.repo_id = RepoId::parse("other/widget").expect("other repo");
         } else {
-            mismatched.workspace = WorkspaceName::session("other").expect("other workspace");
+            set_metadata_workspace(
+                &mut mismatched,
+                WorkspaceName::session("other").expect("other workspace"),
+            );
         }
         mismatched
             .write_for_image(image.image())
@@ -2326,7 +2464,7 @@ fn recovery_ignores_unscoped_and_non_internal_restore_lookalikes() {
     create_image(session_canonical.image(), ImageFormat::Sparse);
     std::fs::write(session_canonical.image(), b"live session").expect("session");
     let mut session_metadata = metadata(ImageFormat::Sparse);
-    session_metadata.workspace = session.clone();
+    set_metadata_workspace(&mut session_metadata, session.clone());
     session_metadata
         .write_for_image(session_canonical.image())
         .expect("session metadata");
@@ -3091,7 +3229,7 @@ fn retired_workspace_restart_ignores_multiple_retained_restore_generations() {
     let write_generation = |image: &Path, incarnation: &WorkspaceIncarnation| {
         create_image(image, ImageFormat::Sparse);
         let mut detached = metadata(ImageFormat::Sparse);
-        detached.workspace = workspace_name.clone();
+        set_metadata_workspace(&mut detached, workspace_name.clone());
         detached.workspace_incarnation = incarnation.clone();
         detached
             .write_for_image(image)

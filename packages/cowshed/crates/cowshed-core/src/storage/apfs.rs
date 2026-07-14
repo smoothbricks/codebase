@@ -362,6 +362,16 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         workspace: &LifecycleWorkspace,
         force: bool,
     ) -> Result<(), ApfsStorageError>;
+    /// Detach adopted main and atomically restore its exact retained host checkout.
+    ///
+    /// Implementations derive retry state solely from `source_checkout` and its exact
+    /// `pre_cowshed_checkout` sibling. They must never recursively copy or merge either tree.
+    fn restore_adopted_checkout(
+        &self,
+        workspace: &LifecycleWorkspace,
+        source_checkout: &Path,
+        pre_cowshed_checkout: &Path,
+    ) -> Result<(), ApfsStorageError>;
     fn publish_image(&self, staged: &Path, canonical: &Path) -> Result<(), PublicationError>;
     fn publish_adopt(
         &self,
@@ -583,6 +593,43 @@ where
     }
     pub fn host(&self) -> &H {
         &self.host
+    }
+
+    /// Detach main and atomically restore the exact checkout retained by adoption.
+    pub async fn restore_adopted_checkout(
+        &self,
+        workspace: &LifecycleWorkspace,
+        pre_cowshed_checkout: &Path,
+    ) -> Result<(), ApfsStorageError> {
+        if !workspace.name().is_main()
+            || self.config.main_mount == pre_cowshed_checkout
+            || pre_cowshed_checkout.parent() != self.config.main_mount.parent()
+        {
+            return Err(ApfsStorageError::InvalidPlan(
+                "adoption rollback requires main and its exact pre-cowshed sibling",
+            ));
+        }
+        let mut expected_pre = self.config.main_mount.as_os_str().to_owned();
+        expected_pre.push(".pre-cowshed");
+        if Path::new(&expected_pre) != pre_cowshed_checkout {
+            return Err(ApfsStorageError::InvalidPlan(
+                "adoption rollback requires main and its exact pre-cowshed sibling",
+            ));
+        }
+
+        let lock_paths = vec![workspace_lock_path(
+            &self.config,
+            workspace.repo(),
+            workspace.name(),
+            workspace.format(),
+        )?];
+        let workspace = workspace.clone();
+        let source_checkout = self.config.main_mount.clone();
+        let pre_cowshed_checkout = pre_cowshed_checkout.to_owned();
+        self.dispatch_with_locks(lock_paths, true, move |host, _| {
+            host.restore_adopted_checkout(&workspace, &source_checkout, &pre_cowshed_checkout)
+        })
+        .await
     }
 
     /// Prepare an unenumerated mounted clone, let the controller initialize it, then publish it.
@@ -2631,6 +2678,8 @@ mod tests {
             project_root: PathBuf::from("/project"),
             base_commit: "0123456789abcdef".to_owned(),
             created_at: "2026-07-13T00:00:00Z".to_owned(),
+            branch: Some("main".to_owned()),
+            forked_from: None,
             created_trace: "lock-table".to_owned(),
             grants: GrantSet::default(),
         }

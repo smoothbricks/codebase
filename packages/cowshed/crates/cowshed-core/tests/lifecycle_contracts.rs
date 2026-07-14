@@ -22,6 +22,8 @@ fn identity() -> OperationIdentity {
         project_root: PathBuf::from("/project"),
         base_commit: "0123456789abcdef".to_owned(),
         created_at: "2026-07-13T00:00:00Z".to_owned(),
+        branch: Some("main".to_owned()),
+        forked_from: None,
         created_trace: "lifecycle-contract".to_owned(),
         grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
             .expect("grants"),

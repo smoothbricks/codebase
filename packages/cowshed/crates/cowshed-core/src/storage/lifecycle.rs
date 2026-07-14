@@ -296,6 +296,8 @@ pub struct OperationIdentity {
     pub project_root: PathBuf,
     pub base_commit: String,
     pub created_at: String,
+    pub branch: Option<String>,
+    pub forked_from: Option<WorkspaceName>,
     pub created_trace: String,
     pub grants: GrantSet,
 }

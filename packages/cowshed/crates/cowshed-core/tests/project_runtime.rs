@@ -40,7 +40,15 @@ enum Event {
     RestorePending(WorkspaceName),
     RestoreEvidence(WorkspaceName),
     RestoreActivate(WorkspaceName),
-    Exec(Vec<Vec<u8>>),
+    GitSafety(WorkspaceName),
+    Detach(WorkspaceName),
+    AtomicCheckoutRestore(PathBuf),
+    RemoveBinding,
+    Exec {
+        workspace: WorkspaceName,
+        mount: PathBuf,
+        argv: Vec<Vec<u8>>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -67,6 +75,35 @@ struct DurableState {
     checkpoint_quotas: std::collections::BTreeMap<String, CheckpointQuota>,
 }
 
+#[derive(Clone, Debug)]
+struct FakeRemoval {
+    dirty: std::collections::BTreeSet<WorkspaceName>,
+    unpreserved: std::collections::BTreeSet<WorkspaceName>,
+    change_head_at_fence: std::collections::BTreeSet<WorkspaceName>,
+    main_in_progress: bool,
+    pre_cowshed_present: bool,
+    restore_collision: bool,
+    restore_swapped: bool,
+    fail_after_detach_once: bool,
+    fail_after_swap_once: bool,
+}
+
+impl Default for FakeRemoval {
+    fn default() -> Self {
+        Self {
+            dirty: std::collections::BTreeSet::new(),
+            unpreserved: std::collections::BTreeSet::new(),
+            change_head_at_fence: std::collections::BTreeSet::new(),
+            main_in_progress: false,
+            pre_cowshed_present: true,
+            restore_collision: false,
+            restore_swapped: false,
+            fail_after_detach_once: false,
+            fail_after_swap_once: false,
+        }
+    }
+}
+
 struct FakeHost {
     descriptor: ProjectDescriptor,
     state_path: PathBuf,
@@ -76,6 +113,7 @@ struct FakeHost {
     fail_restore_fence_once: bool,
     doctor_findings: Vec<Finding>,
     reclaim_gate: Option<Arc<Notify>>,
+    removal: FakeRemoval,
 }
 
 impl FakeHost {
@@ -110,6 +148,7 @@ impl FakeHost {
             fail_restore_fence_once,
             doctor_findings,
             reclaim_gate: None,
+            removal: FakeRemoval::default(),
         }
     }
 
@@ -179,10 +218,14 @@ impl FakeHost {
                 },
                 image_format: ImageFormat::Asif,
                 mount: workspace.mount.clone().unwrap_or_else(|| {
-                    self.descriptor
-                        .store_root
-                        .join("mnt")
-                        .join(workspace.name.as_str())
+                    if workspace.name.is_main() {
+                        self.descriptor.git_root.clone()
+                    } else {
+                        self.descriptor
+                            .store_root
+                            .join("mnt")
+                            .join(workspace.name.as_str())
+                    }
                 }),
                 state: if workspace.attached {
                     WorkspaceState::Attached
@@ -540,11 +583,17 @@ impl ProjectRuntimeHost for FakeHost {
         self.persist()
     }
 
-    async fn remove(&mut self, workspace: WorkspaceName, _options: RemoveOptions) -> Result<()> {
-        if workspace.is_main() {
-            return Err(CowshedError::conflict(
-                "main cannot be removed",
-                "remove only session workspaces",
+    async fn remove(&mut self, workspace: WorkspaceName, options: RemoveOptions) -> Result<()> {
+        if options.force && options.restore {
+            return Err(CowshedError::usage(
+                "force and restore are ambiguous",
+                "choose one removal mode",
+            ));
+        }
+        if options.restore && !workspace.is_main() {
+            return Err(CowshedError::usage(
+                "restore requires main",
+                "remove the session without restore",
             ));
         }
         let index = self
@@ -553,10 +602,84 @@ impl ProjectRuntimeHost for FakeHost {
             .iter()
             .position(|current| current.name == workspace)
             .ok_or_else(|| CowshedError::not_found("workspace missing", "list workspaces"))?;
-        self.events.send(Event::Stop(workspace.clone())).ok();
+        self.events.send(Event::GitSafety(workspace.clone())).ok();
+
+        if options.restore {
+            if !self.removal.pre_cowshed_present && !self.removal.restore_swapped {
+                return Err(CowshedError::conflict(
+                    "retained pre-cowshed checkout is missing",
+                    "restore the retained tree",
+                ));
+            }
+            if self.removal.restore_collision {
+                return Err(CowshedError::conflict(
+                    "canonical project path contains unrelated data",
+                    "move the collision aside",
+                ));
+            }
+            self.events.send(Event::Stop(workspace.clone())).ok();
+            self.events.send(Event::Detach(workspace.clone())).ok();
+            if std::mem::take(&mut self.removal.fail_after_detach_once) {
+                return Err(CowshedError::environment_missing(
+                    "injected crash after detach",
+                    "retry restore",
+                ));
+            }
+            if !self.removal.restore_swapped {
+                self.events
+                    .send(Event::AtomicCheckoutRestore(
+                        self.descriptor.git_root.clone(),
+                    ))
+                    .ok();
+                self.removal.pre_cowshed_present = false;
+                self.removal.restore_swapped = true;
+                if std::mem::take(&mut self.removal.fail_after_swap_once) {
+                    return Err(CowshedError::environment_missing(
+                        "injected crash after checkout swap",
+                        "retry restore",
+                    ));
+                }
+            }
+        } else {
+            if workspace.is_main() && !options.force {
+                return Err(CowshedError::conflict(
+                    "main requires force",
+                    "retry with force or restore",
+                ));
+            }
+            if workspace.is_main()
+                && (self.removal.main_in_progress || self.removal.dirty.contains(&workspace))
+            {
+                return Err(CowshedError::conflict(
+                    "main is not clean",
+                    "finish or discard Git work",
+                ));
+            }
+            if !workspace.is_main()
+                && !options.force
+                && (self.removal.dirty.contains(&workspace)
+                    || self.removal.unpreserved.contains(&workspace))
+            {
+                return Err(CowshedError::conflict(
+                    "workspace work is not preserved",
+                    "push or land, or retry with force",
+                ));
+            }
+            self.events.send(Event::Stop(workspace.clone())).ok();
+            if self.removal.change_head_at_fence.contains(&workspace) {
+                return Err(CowshedError::conflict(
+                    "workspace HEAD changed during removal",
+                    "review and retry",
+                ));
+            }
+        }
+
         self.state.workspaces.remove(index);
         self.persist()?;
         self.events.send(Event::Retire(workspace.clone())).ok();
+        if options.restore {
+            self.events.send(Event::RemoveBinding).ok();
+        }
         let events = self.events.clone();
         let reclaim_gate = self.reclaim_gate.clone();
         std::mem::drop(tokio::spawn(async move {
@@ -723,14 +846,17 @@ impl ProjectRuntimeHost for FakeHost {
         request: cowshed_core::api::dto::ExecRequest,
     ) -> Result<JobId> {
         self.require_incarnation(&workspace, &incarnation)?;
+        let mount = self.snapshot(self.workspace(&workspace)?).info.mount;
         self.events
-            .send(Event::Exec(
-                request
+            .send(Event::Exec {
+                workspace,
+                mount,
+                argv: request
                     .argv
                     .iter()
                     .map(|argument| argument.as_os_str().as_bytes().to_vec())
                     .collect(),
-            ))
+            })
             .ok();
         JobId::new(1).map_err(|error| CowshedError::internal(error.to_string()))
     }
@@ -870,8 +996,31 @@ async fn start(
     RepoId,
     mpsc::UnboundedReceiver<Event>,
 ) {
+    start_with_removal(
+        root,
+        fail_create,
+        fail_restore,
+        findings,
+        FakeRemoval::default(),
+    )
+    .await
+}
+
+async fn start_with_removal(
+    root: &Path,
+    fail_create: bool,
+    fail_restore: bool,
+    findings: Vec<Finding>,
+    removal: FakeRemoval,
+) -> (
+    ProjectRuntime,
+    RouterHandle,
+    RepoId,
+    mpsc::UnboundedReceiver<Event>,
+) {
     let (events, receiver) = mpsc::unbounded_channel();
-    let host = FakeHost::new(root, events, fail_create, fail_restore, findings);
+    let mut host = FakeHost::new(root, events, fail_create, fail_restore, findings);
+    host.removal = removal;
     let repo = host.descriptor.repo_id.clone();
     let runtime = ProjectRuntime::start(host).await.expect("start runtime");
     let router = runtime.router();
@@ -952,9 +1101,16 @@ async fn router_decodes_tagged_non_utf8_argv_without_a_string_boundary() {
         json!(1)
     );
     assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
-    let Some(Event::Exec(decoded)) = events.recv().await else {
+    let Some(Event::Exec {
+        workspace,
+        mount,
+        argv: decoded,
+    }) = events.recv().await
+    else {
         panic!("missing exec event");
     };
+    assert_eq!(workspace, WorkspaceName::new("main").expect("main"));
+    assert_eq!(mount, root.join("checkout"));
     assert_eq!(decoded, vec![raw, b"--flag".to_vec()]);
 
     for invalid_argv in [
@@ -1112,6 +1268,27 @@ async fn adopt_then_create_list_and_path_use_one_immutable_snapshot() {
     .await
     .expect("list");
     assert_eq!(listed.as_array().expect("array").len(), 2);
+    let listed_workspaces = listed.as_array().expect("array");
+    let main = listed_workspaces
+        .iter()
+        .find(|workspace| workspace["info"]["workspace"] == "main")
+        .expect("main snapshot");
+    let task_snapshot = listed_workspaces
+        .iter()
+        .find(|workspace| workspace["info"]["workspace"] == "task")
+        .expect("task snapshot");
+    assert_eq!(
+        PathBuf::from(main["info"]["mount"].as_str().expect("main mount")),
+        root.join("checkout")
+    );
+    assert_eq!(
+        PathBuf::from(
+            task_snapshot["info"]["mount"]
+                .as_str()
+                .expect("session mount")
+        ),
+        root.join("store/mnt/task")
+    );
     assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
     assert!(events.try_recv().is_err(), "list made an N+1 host call");
 
@@ -1123,11 +1300,9 @@ async fn adopt_then_create_list_and_path_use_one_immutable_snapshot() {
     )
     .await
     .expect("workspace path");
-    assert!(
-        task["info"]["mount"]
-            .as_str()
-            .expect("mount")
-            .ends_with("/task")
+    assert_eq!(
+        PathBuf::from(task["info"]["mount"].as_str().expect("mount")),
+        root.join("store/mnt/task")
     );
     assert_eq!(listed.as_array().expect("array").len(), 2);
 }
@@ -1135,9 +1310,10 @@ async fn adopt_then_create_list_and_path_use_one_immutable_snapshot() {
 #[tokio::test]
 async fn workspace_at_uses_active_mount_facts_and_ensure_returns_authoritative_env_fields() {
     let root = test_root();
-    let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
+    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
     let adopted = adopt(&router, &repo).await;
     let mount = PathBuf::from(adopted["info"]["mount"].as_str().expect("mount"));
+    assert_eq!(mount, root.join("checkout"));
     let nested = mount.join("src/deep/module");
 
     let resolved = route(
@@ -1169,6 +1345,64 @@ async fn workspace_at_uses_active_mount_facts_and_ensure_returns_authoritative_e
         ensured["workspaceToken"],
         mount.join(".cowshed/token").to_string_lossy().as_ref()
     );
+
+    let created = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.create",
+        json!({ "repoId": repo, "workspace": "task", "options": CreateOptions::default() }),
+    )
+    .await
+    .expect("create session");
+    let session_ensure = route(
+        &router,
+        coordinator(repo.clone()),
+        "workspace.ensure",
+        json!({ "repoId": repo, "workspace": "task" }),
+    )
+    .await
+    .expect("ensure session");
+    let session_mount = root.join("store/mnt/task");
+    assert_eq!(
+        session_ensure["goEnv"],
+        session_mount
+            .join(".cowshed/cache/go/env")
+            .to_string_lossy()
+            .as_ref()
+    );
+    while events.try_recv().is_ok() {}
+    route(
+        &router,
+        coordinator(repo.clone()),
+        "worker.exec",
+        json!({
+            "repoId": repo,
+            "workspace": "task",
+            "workspaceIncarnation": created["info"]["workspaceIncarnation"],
+            "session": null,
+            "argv": [{"encoding":"utf8","data":"true"}],
+            "cwd": null,
+            "mode": "readWrite",
+            "env": {},
+            "trace": null,
+            "stdin": {"kind":"empty"},
+            "stdoutCopy": null,
+            "stderrCopy": null
+        }),
+    )
+    .await
+    .expect("session exec");
+    assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
+    let Some(Event::Exec {
+        workspace,
+        mount: exec_mount,
+        ..
+    }) = events.recv().await
+    else {
+        panic!("missing session exec event");
+    };
+    assert_eq!(workspace, WorkspaceName::new("task").expect("task"));
+    assert_eq!(exec_mount, session_mount);
     assert_eq!(ensured["portBlock"], json!({"base": 49152, "size": 16}));
 
     let marker_only = root.join("marker-only");
@@ -1603,12 +1837,312 @@ async fn remove_stops_supervisor_before_retirement() {
     .expect("remove");
     assert_eq!(
         events.recv().await,
+        Some(Event::GitSafety(WorkspaceName::new("gone").expect("name")))
+    );
+    assert_eq!(
+        events.recv().await,
         Some(Event::Stop(WorkspaceName::new("gone").expect("name")))
     );
     assert_eq!(
         events.recv().await,
         Some(Event::Retire(WorkspaceName::new("gone").expect("name")))
     );
+}
+
+#[tokio::test]
+async fn session_removal_refuses_dirty_or_unpreserved_work_unless_forced() {
+    for unsafe_kind in ["dirty", "unpreserved"] {
+        let root = test_root();
+        let name = WorkspaceName::new("unsafe").expect("name");
+        let mut removal = FakeRemoval::default();
+        if unsafe_kind == "dirty" {
+            removal.dirty.insert(name.clone());
+        } else {
+            removal.unpreserved.insert(name.clone());
+        }
+        let (_runtime, router, repo, mut events) =
+            start_with_removal(&root, false, false, Vec::new(), removal).await;
+        adopt(&router, &repo).await;
+        route(
+            &router,
+            coordinator(repo.clone()),
+            "coordinator.create",
+            json!({ "repoId": repo, "workspace": "unsafe", "options": CreateOptions::default() }),
+        )
+        .await
+        .expect("create");
+        while events.try_recv().is_ok() {}
+
+        let error = route(
+            &router,
+            coordinator(repo.clone()),
+            "coordinator.destroy",
+            json!({ "repoId": repo, "workspace": "unsafe", "options": RemoveOptions::default() }),
+        )
+        .await
+        .expect_err("unsafe work must be refused");
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert_eq!(events.recv().await, Some(Event::GitSafety(name.clone())));
+        assert!(
+            events.try_recv().is_err(),
+            "safe refusal must not stop or retire"
+        );
+
+        route(
+            &router,
+            coordinator(repo.clone()),
+            "coordinator.destroy",
+            json!({
+                "repoId": repo,
+                "workspace": "unsafe",
+                "options": RemoveOptions { force: true, restore: false }
+            }),
+        )
+        .await
+        .expect("force explicitly accepts loss");
+        assert_eq!(events.recv().await, Some(Event::GitSafety(name.clone())));
+        assert_eq!(events.recv().await, Some(Event::Stop(name.clone())));
+        assert_eq!(events.recv().await, Some(Event::Retire(name)));
+    }
+}
+
+#[tokio::test]
+async fn head_change_at_retirement_fence_preserves_the_workspace() {
+    let root = test_root();
+    let name = WorkspaceName::new("moving").expect("name");
+    let mut removal = FakeRemoval::default();
+    removal.change_head_at_fence.insert(name.clone());
+    let (_runtime, router, repo, mut events) =
+        start_with_removal(&root, false, false, Vec::new(), removal).await;
+    adopt(&router, &repo).await;
+    route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.create",
+        json!({ "repoId": repo, "workspace": "moving", "options": CreateOptions::default() }),
+    )
+    .await
+    .expect("create");
+    while events.try_recv().is_ok() {}
+
+    let error = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.destroy",
+        json!({ "repoId": repo, "workspace": "moving", "options": RemoveOptions::default() }),
+    )
+    .await
+    .expect_err("changed HEAD must fence retirement");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_eq!(events.recv().await, Some(Event::GitSafety(name.clone())));
+    assert_eq!(events.recv().await, Some(Event::Stop(name)));
+    assert!(events.try_recv().is_err(), "workspace was not retired");
+}
+
+#[tokio::test]
+async fn plain_main_removal_requires_force_and_still_requires_clean_git() {
+    let root = test_root();
+    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    adopt(&router, &repo).await;
+    while events.try_recv().is_ok() {}
+    let error = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.destroy",
+        json!({ "repoId": repo, "workspace": "main", "options": RemoveOptions::default() }),
+    )
+    .await
+    .expect_err("main requires force");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_eq!(
+        events.recv().await,
+        Some(Event::GitSafety(WorkspaceName::new("main").expect("name")))
+    );
+    assert!(events.try_recv().is_err());
+
+    route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.destroy",
+        json!({
+            "repoId": repo,
+            "workspace": "main",
+            "options": RemoveOptions { force: true, restore: false }
+        }),
+    )
+    .await
+    .expect("clean forced main removal");
+
+    let dirty_root = test_root();
+    let main = WorkspaceName::new("main").expect("main");
+    let mut removal = FakeRemoval::default();
+    removal.dirty.insert(main.clone());
+    let (_runtime, router, repo, mut dirty_events) =
+        start_with_removal(&dirty_root, false, false, Vec::new(), removal).await;
+    adopt(&router, &repo).await;
+    while dirty_events.try_recv().is_ok() {}
+    let error = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.destroy",
+        json!({
+            "repoId": repo,
+            "workspace": "main",
+            "options": RemoveOptions { force: true, restore: false }
+        }),
+    )
+    .await
+    .expect_err("force does not waive main cleanliness");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_eq!(dirty_events.recv().await, Some(Event::GitSafety(main)));
+    assert!(dirty_events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn main_restore_detaches_swaps_exact_checkout_and_then_retires() {
+    let root = test_root();
+    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    adopt(&router, &repo).await;
+    while events.try_recv().is_ok() {}
+
+    route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.destroy",
+        json!({
+            "repoId": repo,
+            "workspace": "main",
+            "options": RemoveOptions { force: false, restore: true }
+        }),
+    )
+    .await
+    .expect("adoption rollback");
+    let main = WorkspaceName::new("main").expect("main");
+    assert_eq!(events.recv().await, Some(Event::GitSafety(main.clone())));
+    assert_eq!(events.recv().await, Some(Event::Stop(main.clone())));
+    assert_eq!(events.recv().await, Some(Event::Detach(main.clone())));
+    assert_eq!(
+        events.recv().await,
+        Some(Event::AtomicCheckoutRestore(root.join("checkout")))
+    );
+    assert_eq!(events.recv().await, Some(Event::Retire(main)));
+
+    let listed = route(
+        &router,
+        coordinator(repo.clone()),
+        "project.list",
+        json!({ "repoId": repo }),
+    )
+    .await
+    .expect("list after rollback");
+    assert!(listed.as_array().expect("workspaces").is_empty());
+}
+
+#[tokio::test]
+async fn main_restore_missing_tree_collision_and_force_ambiguity_mutate_nothing() {
+    for refusal in ["missing", "collision"] {
+        let root = test_root();
+        let removal = FakeRemoval {
+            pre_cowshed_present: refusal != "missing",
+            restore_collision: refusal == "collision",
+            ..FakeRemoval::default()
+        };
+        let (_runtime, router, repo, mut events) =
+            start_with_removal(&root, false, false, Vec::new(), removal).await;
+        adopt(&router, &repo).await;
+        while events.try_recv().is_ok() {}
+        let error = route(
+            &router,
+            coordinator(repo.clone()),
+            "coordinator.destroy",
+            json!({
+                "repoId": repo,
+                "workspace": "main",
+                "options": RemoveOptions { force: false, restore: true }
+            }),
+        )
+        .await
+        .expect_err("unsafe restore fact");
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert_eq!(
+            events.recv().await,
+            Some(Event::GitSafety(WorkspaceName::new("main").expect("main")))
+        );
+        assert!(events.try_recv().is_err());
+    }
+
+    let root = test_root();
+    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    adopt(&router, &repo).await;
+    while events.try_recv().is_ok() {}
+    let error = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.destroy",
+        json!({
+            "repoId": repo,
+            "workspace": "main",
+            "options": RemoveOptions { force: true, restore: true }
+        }),
+    )
+    .await
+    .expect_err("ambiguous authority");
+    assert_eq!(error.code, ErrorCode::Usage);
+    assert!(events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn main_restore_retries_after_each_detach_and_swap_crash_boundary() {
+    for boundary in ["detach", "swap"] {
+        let root = test_root();
+        let removal = FakeRemoval {
+            fail_after_detach_once: boundary == "detach",
+            fail_after_swap_once: boundary == "swap",
+            ..FakeRemoval::default()
+        };
+        let (_runtime, router, repo, mut events) =
+            start_with_removal(&root, false, false, Vec::new(), removal).await;
+        adopt(&router, &repo).await;
+        while events.try_recv().is_ok() {}
+        let options = RemoveOptions {
+            force: false,
+            restore: true,
+        };
+        let error = route(
+            &router,
+            coordinator(repo.clone()),
+            "coordinator.destroy",
+            json!({ "repoId": repo, "workspace": "main", "options": options }),
+        )
+        .await
+        .expect_err("injected crash");
+        assert_eq!(error.code, ErrorCode::EnvironmentMissing);
+        while events.try_recv().is_ok() {}
+
+        route(
+            &router,
+            coordinator(repo.clone()),
+            "coordinator.destroy",
+            json!({ "repoId": repo, "workspace": "main", "options": options }),
+        )
+        .await
+        .expect("retry completes rollback");
+        let retried = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            retried
+                .iter()
+                .any(|event| matches!(event, Event::Retire(_)))
+        );
+        let swap_count = retried
+            .iter()
+            .filter(|event| matches!(event, Event::AtomicCheckoutRestore(_)))
+            .count();
+        assert_eq!(
+            swap_count,
+            usize::from(boundary == "detach"),
+            "a completed atomic swap is never repeated"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1641,6 +2175,7 @@ async fn destroy_returns_after_logical_retirement_before_background_reclaim() {
     .await
     .expect("logical retirement");
     let name = WorkspaceName::new("retired").expect("name");
+    assert_eq!(receiver.recv().await, Some(Event::GitSafety(name.clone())));
     assert_eq!(receiver.recv().await, Some(Event::Stop(name.clone())));
     assert_eq!(receiver.recv().await, Some(Event::Retire(name.clone())));
     assert!(
@@ -1745,6 +2280,14 @@ async fn crash_reopen_recovers_published_and_pending_state() {
     .await
     .expect("list after reopen");
     assert_eq!(listed.as_array().expect("array").len(), 1);
+    assert_eq!(
+        PathBuf::from(
+            listed[0]["info"]["mount"]
+                .as_str()
+                .expect("recovered main mount")
+        ),
+        root.join("checkout")
+    );
 }
 
 #[cfg(not(target_os = "macos"))]
