@@ -3145,6 +3145,35 @@ where
                         replacement_incarnation,
                         old_metadata.image_format.extension()
                     ));
+                let recovery_fact_path = restore_recovery_fact_path(&canonical);
+                if recovery_fact_path.exists() {
+                    let recovery_fact: RestoreRecoveryFactWire =
+                        crate::metadata::read_json(&recovery_fact_path)
+                            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+                    if recovery_fact.destination_incarnation.as_str() != replacement_incarnation {
+                        continue;
+                    }
+                    if recovery_fact.version != RESTORE_RECOVERY_FACT_VERSION
+                        || recovery_fact.repo_id != old_metadata.repo_id
+                        || recovery_fact.workspace != old_metadata.workspace
+                        || recovery_fact.source_incarnation != old_metadata.workspace_incarnation
+                        || recovery_fact.source_incarnation == recovery_fact.destination_incarnation
+                    {
+                        return Err(ApfsStorageError::MarkerMismatch(format!(
+                            "restore recovery fact disagrees with selected undo generation: fact={}, undo_sidecar={}",
+                            recovery_fact_path.display(),
+                            undo_sidecar.display()
+                        )));
+                    }
+                } else if !staged.exists() {
+                    let canonical_metadata = DetachedWorkspaceMetadata::read_for_image(&canonical)
+                        .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+                    if canonical_metadata.workspace_incarnation
+                        != old_metadata.workspace_incarnation
+                    {
+                        continue;
+                    }
+                }
                 let canonical_sidecar = sidecar_path(&canonical);
                 let canonical_companion =
                     self.recovery_companion(&canonical, "restore recovery canonical image")?;
