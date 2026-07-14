@@ -987,11 +987,14 @@ async fn local_mirror_route_rewrites_only_the_admitted_scope() {
         "{forwarded}"
     );
 
-    let denied = format!(
+    let public_baseline = format!(
         "GET /npm/private/pkg HTTP/1.1\r\nHost: {endpoint}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
     );
-    let response = proxy_request(endpoint, denied).await;
-    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    let response = proxy_request(endpoint, public_baseline).await;
+    assert!(
+        response.starts_with("HTTP/1.1 502"),
+        "unmatched private scope must fall through to the fixed public baseline: {response}"
+    );
     gateway.drain().await.expect("drain gateway");
 }
 
