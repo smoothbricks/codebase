@@ -9,9 +9,9 @@ use bytes::Bytes;
 use cowshed_core::api::dto::{
     AdoptOptions, AttachOptions, CheckpointInfo, CheckpointOptions, CheckpointQuota,
     CheckpointResult, CommandArg, CreateOptions, DoctorReport, EnsureAction, EnsureReport, Finding,
-    FindingSeverity, GcOptions, GcReport, GitOid, GrantDelta, GrantSet, ImageFormat, JobId, JobInfo,
-    LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions, PushReport, RebaseOptions,
-    RemoveOptions, WorkspaceInfo, WorkspaceState,
+    FindingSeverity, GcOptions, GcReport, GitOid, GrantDelta, GrantSet, ImageFormat, JobId,
+    JobInfo, LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions, PushReport,
+    RebaseOptions, RemoveOptions, WorkspaceInfo, WorkspaceState,
 };
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle};
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
@@ -315,11 +315,8 @@ impl ProjectRuntimeHost for FakeHost {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(
-                        &destination,
-                        std::fs::Permissions::from_mode(0o600),
-                    )
-                    .map_err(|error| CowshedError::internal(error.to_string()))?;
+                    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
+                        .map_err(|error| CowshedError::internal(error.to_string()))?;
                 }
             }
         }
@@ -330,7 +327,6 @@ impl ProjectRuntimeHost for FakeHost {
         self.events.send(Event::Publish(name)).ok();
         Ok(self.snapshot(&workspace))
     }
-
 
     async fn create(
         &mut self,
@@ -894,7 +890,10 @@ async fn secret_refusal_precedes_image_initialization_and_quarantine_preserves_p
     .expect_err("secret must refuse adopt");
     assert_eq!(error.code, ErrorCode::Conflict);
     assert_eq!(events.recv().await, Some(Event::SecretScan));
-    assert!(events.try_recv().is_err(), "refusal reached image initialization");
+    assert!(
+        events.try_recv().is_err(),
+        "refusal reached image initialization"
+    );
 
     let adopted = route(
         &router,
