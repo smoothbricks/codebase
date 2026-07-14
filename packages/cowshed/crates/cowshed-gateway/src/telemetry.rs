@@ -414,8 +414,7 @@ impl AuditWriter {
                 match subscriber.sender.try_send(event.clone()) {
                     Ok(()) => {}
                     Err(
-                        mpsc::error::TrySendError::Closed(_)
-                        | mpsc::error::TrySendError::Full(_),
+                        mpsc::error::TrySendError::Closed(_) | mpsc::error::TrySendError::Full(_),
                     ) => return false,
                 }
             }
@@ -1038,10 +1037,7 @@ mod tests {
         sink.record(event(2, "slow", AuditStatus::Denied))
             .await
             .expect("lagging projection cannot stop the writer");
-        assert_eq!(
-            slow.recv().await.expect("buffered first event").sequence,
-            1
-        );
+        assert_eq!(slow.recv().await.expect("buffered first event").sequence, 1);
         assert!(
             slow.recv().await.is_none(),
             "lagging subscription is disconnected"
@@ -1084,7 +1080,11 @@ mod tests {
         assert_eq!(
             (
                 catch_up.recv().await.expect("catch-up event two").sequence,
-                catch_up.recv().await.expect("catch-up event three").sequence,
+                catch_up
+                    .recv()
+                    .await
+                    .expect("catch-up event three")
+                    .sequence,
             ),
             (2, 3),
             "resubscription catches up from the bounded durable tail"
