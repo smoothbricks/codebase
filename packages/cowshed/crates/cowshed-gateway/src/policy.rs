@@ -361,10 +361,26 @@ impl WorkspacePolicy {
         for route in &self.mirrors {
             route.validate()?;
         }
-        for (index, left) in self.mirrors.iter().enumerate() {
-            if self.mirrors[index + 1..]
+        let scopes = self
+            .mirrors
+            .iter()
+            .enumerate()
+            .flat_map(|(route_index, route)| {
+                route
+                    .admitted_prefixes
+                    .iter()
+                    .map(move |prefix| (route_index, &route.local_prefix, prefix))
+            })
+            .collect::<Vec<_>>();
+        for (index, (left_route, left_local, left_scope)) in scopes.iter().enumerate() {
+            if scopes[index + 1..]
                 .iter()
-                .any(|right| left.local_prefix == right.local_prefix)
+                .any(|(right_route, right_local, right_scope)| {
+                    left_route != right_route
+                        && left_local == right_local
+                        && (mirror_scope_matches(left_scope, right_scope)
+                            || mirror_scope_matches(right_scope, left_scope))
+                })
             {
                 return Err(PolicyError::DuplicateMirrorPrefix);
             }
@@ -388,21 +404,24 @@ impl WorkspacePolicy {
     }
 
     pub fn resolve_mirror(&self, path: &str) -> Option<ResolvedMirrorRoute> {
-        if let Some(route) = self
+        let configured = self
             .mirrors
             .iter()
-            .filter(|route| path.starts_with(&route.local_prefix))
-            .max_by_key(|route| route.local_prefix.len())
-        {
-            let suffix = &path[route.local_prefix.len() - 1..];
-            let (normalized, admission_path) =
-                normalize_mirror_suffix(route.protocol, suffix).ok()?;
-            let admitted_prefix = route
-                .admitted_prefixes
-                .iter()
-                .filter(|prefix| admission_path.starts_with(prefix.as_str()))
-                .max_by_key(|prefix| prefix.len())?
-                .clone();
+            .filter_map(|route| {
+                let suffix =
+                    path.strip_prefix(&route.local_prefix[..route.local_prefix.len() - 1])?;
+                let (normalized, admission_path) =
+                    normalize_mirror_suffix(route.protocol, suffix).ok()?;
+                let admitted_prefix = route
+                    .admitted_prefixes
+                    .iter()
+                    .filter(|prefix| mirror_scope_matches(&admission_path, prefix))
+                    .max_by_key(|prefix| prefix.len())?
+                    .clone();
+                Some((route, normalized, admitted_prefix))
+            })
+            .max_by_key(|(_, _, admitted_prefix)| admitted_prefix.len());
+        if let Some((route, normalized, admitted_prefix)) = configured {
             let base = Url::parse(&route.upstream_origin).ok()?;
             let url = base.join(normalized.trim_start_matches('/')).ok()?;
             return Some(ResolvedMirrorRoute {
@@ -415,6 +434,14 @@ impl WorkspacePolicy {
         }
         resolve_baseline_mirror(path)
     }
+}
+
+fn mirror_scope_matches(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || prefix == "/"
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| prefix.ends_with('/') || suffix.starts_with('/'))
 }
 
 fn resolve_baseline_mirror(path: &str) -> Option<ResolvedMirrorRoute> {

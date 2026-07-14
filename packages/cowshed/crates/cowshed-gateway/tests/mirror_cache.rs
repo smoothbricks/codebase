@@ -742,7 +742,11 @@ fn policy_rewrite_is_typed_exact_and_scope_bound() {
     assert_eq!(resolved.path, "/react/-/react-1.0.0.tgz");
     assert_eq!(resolved.protocol, MirrorProtocol::Npm);
     assert_eq!(resolved.admitted_prefix, "/react/-/");
-    assert!(policy.resolve_mirror("/npm/lodash").is_none());
+    let baseline = policy
+        .resolve_mirror("/npm/lodash")
+        .expect("unmatched private scope falls through to public baseline");
+    assert_eq!(baseline.target, target("registry.npmjs.org"));
+    assert_eq!(baseline.admitted_prefix, "/");
     let scoped = policy
         .resolve_mirror("/npm/@scope%2fpkg")
         .expect("encoded npm scope is admitted without weakening generic paths");
@@ -757,6 +761,107 @@ fn policy_rewrite_is_typed_exact_and_scope_bound() {
         credentialed: false,
     };
     assert!(wrong.validate().is_err());
+}
+
+#[test]
+fn disjoint_private_scopes_coexist_without_shadowing_public_baselines() {
+    let policy = WorkspacePolicy {
+        grants: Vec::new(),
+        mirrors: vec![
+            MirrorRoute {
+                local_prefix: "/npm/".to_owned(),
+                upstream_origin: "https://npm.company.test:443".to_owned(),
+                protocol: MirrorProtocol::Npm,
+                admitted_prefixes: vec!["/@company/".to_owned()],
+                credentialed: true,
+            },
+            MirrorRoute {
+                local_prefix: "/npm/".to_owned(),
+                upstream_origin: "https://npm.other.test:443".to_owned(),
+                protocol: MirrorProtocol::Npm,
+                admitted_prefixes: vec!["/@other/".to_owned()],
+                credentialed: true,
+            },
+            MirrorRoute {
+                local_prefix: "/cargo/".to_owned(),
+                upstream_origin: "https://cargo.company.test:443".to_owned(),
+                protocol: MirrorProtocol::Cargo,
+                admitted_prefixes: vec!["/privatecrate".to_owned()],
+                credentialed: true,
+            },
+            MirrorRoute {
+                local_prefix: "/go/".to_owned(),
+                upstream_origin: "https://go.company.test:443".to_owned(),
+                protocol: MirrorProtocol::Go,
+                admitted_prefixes: vec!["/company.example/".to_owned()],
+                credentialed: true,
+            },
+        ],
+    };
+    policy.validate().expect("disjoint private scopes");
+
+    assert_eq!(
+        policy
+            .resolve_mirror("/npm/react")
+            .expect("public npm baseline")
+            .target,
+        target("registry.npmjs.org")
+    );
+    assert_eq!(
+        policy
+            .resolve_mirror("/npm/@company%2fpkg")
+            .expect("company npm scope")
+            .target,
+        target("npm.company.test")
+    );
+    assert_eq!(
+        policy
+            .resolve_mirror("/npm/@other%2fpkg")
+            .expect("other npm scope")
+            .target,
+        target("npm.other.test")
+    );
+    assert_eq!(
+        policy
+            .resolve_mirror("/cargo/se/rd/serde")
+            .expect("public Cargo baseline")
+            .target,
+        target("index.crates.io")
+    );
+    assert_eq!(
+        policy
+            .resolve_mirror("/cargo/privatecrate")
+            .expect("private Cargo scope")
+            .target,
+        target("cargo.company.test")
+    );
+    assert_eq!(
+        policy
+            .resolve_mirror("/go/golang.org/x/text/@v/list")
+            .expect("public Go baseline")
+            .target,
+        target("proxy.golang.org")
+    );
+    assert_eq!(
+        policy
+            .resolve_mirror("/go/company.example/mod/@v/list")
+            .expect("private Go scope")
+            .target,
+        target("go.company.test")
+    );
+
+    let mut overlapping = policy.clone();
+    overlapping.mirrors.push(MirrorRoute {
+        local_prefix: "/npm/".to_owned(),
+        upstream_origin: "https://shadow.company.test:443".to_owned(),
+        protocol: MirrorProtocol::Npm,
+        admitted_prefixes: vec!["/@company/pkg".to_owned()],
+        credentialed: true,
+    });
+    assert!(matches!(
+        overlapping.validate(),
+        Err(cowshed_gateway::PolicyError::DuplicateMirrorPrefix)
+    ));
 }
 
 #[tokio::test]
