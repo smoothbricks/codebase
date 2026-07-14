@@ -166,7 +166,7 @@ export interface PhysicalLayoutPlan<T extends LogSchema = LogSchema, Ctx extends
   /** Exact constructor selected at startup for this plan's capability/layout signature. */
   readonly SpanContextClass: SpanContextClass<Ctx>;
   readonly SpanBufferClass: SpanBufferConstructor<T>;
-  readonly SpanLoggerClass: SpanLoggerConstructor<T>;
+  readonly SpanLoggerClass: SpanLoggerConstructor<T> | undefined;
   readonly TagWriterClass: TagWriterConstructor<T> | undefined;
   readonly ResultWriterClass: ResultWriterConstructor;
   readonly clock: PhysicalClock;
@@ -449,13 +449,13 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
   const enumLookup = resolveEnumLookupDescriptor(schema);
   const messageLayoutFamily = runtimeHintMessageLayoutFamily(runtimeHint);
   const PlannedSpanBufferClass = getSpanBufferClass(schema, messageLayoutFamily, messagePhysicalLayout, eagerColumns);
-  const SpanLoggerClass = createSpanLoggerClass(
-    schema,
-    messageLayoutFamily,
-    messagePhysicalLayout,
-    eagerColumns.names,
-    enumLookup,
-  );
+  const capabilities = isRuntimeHintAnalyzed(runtimeHint)
+    ? runtimeHint & RUNTIME_HINT_CAPABILITIES_MASK
+    : RUNTIME_HINT_FULL_CAPABILITIES;
+  const needsLogger = (capabilities & (RUNTIME_HINT_LOG | RUNTIME_HINT_FF | RUNTIME_HINT_SCOPE)) !== 0;
+  const SpanLoggerClass = needsLogger
+    ? createSpanLoggerClass(schema, messageLayoutFamily, messagePhysicalLayout, eagerColumns.names, enumLookup)
+    : undefined;
   const ResultWriterClass = getResultWriterClass(
     schema,
     messageLayoutFamily,
@@ -463,13 +463,10 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
     eagerColumns.names,
     enumLookup,
   );
-  const capabilities = isRuntimeHintAnalyzed(runtimeHint)
-    ? runtimeHint & RUNTIME_HINT_CAPABILITIES_MASK
-    : RUNTIME_HINT_FULL_CAPABILITIES;
-  const needsLogger = (capabilities & (RUNTIME_HINT_LOG | RUNTIME_HINT_FF | RUNTIME_HINT_SCOPE)) !== 0;
   const needsTag = (capabilities & RUNTIME_HINT_TAG) !== 0;
   const TagWriterClass = needsTag ? getTagWriterClass(schema, eagerColumns.names, enumLookup) : undefined;
-  const newSpanLogger = needsLogger ? (state: WriterState): SpanLoggerImpl<T> => new SpanLoggerClass(state) : undefined;
+  const newSpanLogger =
+    SpanLoggerClass === undefined ? undefined : (state: WriterState): SpanLoggerImpl<T> => new SpanLoggerClass(state);
   const newTagWriter =
     TagWriterClass === undefined ? undefined : (state: WriterState): TagWriter<T> => new TagWriterClass(state);
   const wasmLayout = createWasmLayoutTemplate(schema, messageLayoutFamily, messagePhysicalLayout, eagerColumns);
