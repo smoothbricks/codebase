@@ -3829,9 +3829,9 @@ pub fn validate_commitments(
             ControllerCommitment::Restore(value) => {
                 if repository.checkpoints.get(&value.source_checkpoint)
                     != Some(&value.source_incarnation)
-                    || !repository
+                    || repository
                         .active_incarnations
-                        .contains(&value.source_incarnation)
+                        .contains(&value.destination_incarnation)
                     || repository
                         .introduced_incarnations
                         .contains(&value.destination_incarnation)
@@ -3842,7 +3842,7 @@ pub fn validate_commitments(
                     return Err(ArtifactError::Integrity {
                         offset: 0,
                         message:
-                            "restore lineage checkpoint is absent, source is retired, or destination already exists"
+                            "restore lineage checkpoint is absent or destination already exists"
                                 .into(),
                     });
                 }

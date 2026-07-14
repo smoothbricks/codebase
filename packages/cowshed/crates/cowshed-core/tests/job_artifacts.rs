@@ -916,11 +916,12 @@ fn with_order(mut commitment: ControllerCommitment, order: u64) -> ControllerCom
 }
 
 #[test]
-fn lineage_variants_introduce_only_fresh_destinations() {
+fn retained_checkpoint_can_restore_repeatedly_only_to_fresh_destinations() {
     let repo = RepoId::parse("acme/widget").unwrap();
     let source = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();
     let forked = WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").unwrap();
-    let restored = WorkspaceIncarnation::new("2198f2c0b7e34dc795f17b238b331c80").unwrap();
+    let first_restore = WorkspaceIncarnation::new("2198f2c0b7e34dc795f17b238b331c80").unwrap();
+    let second_restore = WorkspaceIncarnation::new("3198f2c0b7e34dc795f17b238b331c80").unwrap();
     let baseline = CommitmentPriorContext::new(repo.clone(), []);
     let history = vec![
         ControllerCommitment::WorkspaceIntroduced(WorkspaceIntroducedCommitment {
@@ -950,24 +951,69 @@ fn lineage_variants_introduce_only_fresh_destinations() {
             order: 4,
             repo_id: repo.clone(),
             source_checkpoint: "checkpoint-1".into(),
-            source_incarnation: source,
-            destination_incarnation: restored.clone(),
+            source_incarnation: source.clone(),
+            destination_incarnation: first_restore.clone(),
+        }),
+        ControllerCommitment::Restore(RestoreCommitment {
+            version: CONTROLLER_COMMITMENT_VERSION,
+            order: 5,
+            repo_id: repo.clone(),
+            source_checkpoint: "checkpoint-1".into(),
+            source_incarnation: source.clone(),
+            destination_incarnation: second_restore.clone(),
         }),
         ControllerCommitment::Admission(AdmissionCommitment {
             version: CONTROLLER_COMMITMENT_VERSION,
-            order: 5,
-            repo_id: repo,
-            workspace_incarnation: restored,
+            order: 6,
+            repo_id: repo.clone(),
+            workspace_incarnation: second_restore,
             job_id: JobId::new(1).unwrap(),
             grant_revision: 1,
         }),
     ];
     validate_commitments(&baseline, &history).unwrap();
 
-    let mut duplicate = history;
-    duplicate.push(with_order(duplicate[2].clone(), 6));
+    let mut reused_destination = history.clone();
+    reused_destination.push(ControllerCommitment::Restore(RestoreCommitment {
+        version: CONTROLLER_COMMITMENT_VERSION,
+        order: 7,
+        repo_id: repo.clone(),
+        source_checkpoint: "checkpoint-1".into(),
+        source_incarnation: source.clone(),
+        destination_incarnation: first_restore,
+    }));
     assert!(matches!(
-        validate_commitments(&baseline, &duplicate),
+        validate_commitments(&baseline, &reused_destination),
+        Err(ArtifactError::Integrity { .. })
+    ));
+
+    let mut unknown_checkpoint = history[..2].to_vec();
+    unknown_checkpoint.push(ControllerCommitment::Restore(RestoreCommitment {
+        version: CONTROLLER_COMMITMENT_VERSION,
+        order: 3,
+        repo_id: repo.clone(),
+        source_checkpoint: "unknown".into(),
+        source_incarnation: source.clone(),
+        destination_incarnation: WorkspaceIncarnation::new("4198f2c0b7e34dc795f17b238b331c80")
+            .unwrap(),
+    }));
+    assert!(matches!(
+        validate_commitments(&baseline, &unknown_checkpoint),
+        Err(ArtifactError::Integrity { .. })
+    ));
+
+    let mut mismatched_origin = history[..2].to_vec();
+    mismatched_origin.push(ControllerCommitment::Restore(RestoreCommitment {
+        version: CONTROLLER_COMMITMENT_VERSION,
+        order: 3,
+        repo_id: repo,
+        source_checkpoint: "checkpoint-1".into(),
+        source_incarnation: forked,
+        destination_incarnation: WorkspaceIncarnation::new("5198f2c0b7e34dc795f17b238b331c80")
+            .unwrap(),
+    }));
+    assert!(matches!(
+        validate_commitments(&baseline, &mismatched_origin),
         Err(ArtifactError::Integrity { .. })
     ));
 }

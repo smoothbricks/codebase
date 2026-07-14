@@ -3025,6 +3025,8 @@ mod lifecycle_commitment_tests {
         let foreign_repo = RepoId::parse("other/repository").unwrap();
         let source = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();
         let destination = WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let second_destination =
+            WorkspaceIncarnation::new("4198f2c0b7e34dc795f17b238b331c80").unwrap();
         let foreign_only = WorkspaceIncarnation::new("2198f2c0b7e34dc795f17b238b331c80").unwrap();
         let baseline_only = WorkspaceIncarnation::new("3198f2c0b7e34dc795f17b238b331c80").unwrap();
         let store = CommitmentStore::open(
@@ -3089,6 +3091,15 @@ mod lifecycle_commitment_tests {
             .await
             .unwrap();
         publisher
+            .publish(CommitmentDraft::Restore {
+                repo_id: repo_id.clone(),
+                source_checkpoint: "baseline".into(),
+                source_incarnation: source.clone(),
+                destination_incarnation: second_destination.clone(),
+            })
+            .await
+            .unwrap();
+        publisher
             .publish(CommitmentDraft::WorkspaceIntroduced {
                 repo_id: foreign_repo,
                 workspace_incarnation: foreign_only.clone(),
@@ -3102,6 +3113,7 @@ mod lifecycle_commitment_tests {
             .unwrap();
         assert!(admitted.contains(&source));
         assert!(admitted.contains(&destination));
+        assert!(admitted.contains(&second_destination));
         assert!(!admitted.contains(&foreign_only));
         assert!(!admitted.contains(&baseline_only));
 
@@ -3109,7 +3121,7 @@ mod lifecycle_commitment_tests {
         config.authority = WorkspaceAuthoritySnapshot {
             repo_id: repo_id.clone(),
             workspace: WorkspaceName::new("raven").unwrap(),
-            workspace_incarnation: destination.clone(),
+            workspace_incarnation: second_destination.clone(),
             grant_revision: 8,
             lifecycle_revision: 2,
         };
