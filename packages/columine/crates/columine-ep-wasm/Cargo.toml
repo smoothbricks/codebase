@@ -1,6 +1,6 @@
 [package]
 name = "columine-ep-wasm"
-description = "event_processor.wasm replacement: the ep_* export surface over axe-event-processor with EpWiring::columine() (ports event_processor.zig's WASM/FFI export layer)"
+description = "columine's event_processor.wasm: the 5-function ep_* export surface over columine-event-processor with EpWiring::columine() (caller-buffer protocol, no dedup)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,5 @@ repository.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-columine-event-processor = { path = "../../../columine/crates/columine-event-processor" }
-columine-arrow = { path = "../../../columine/crates/columine-arrow" }
-columine-types = { path = "../../../columine/crates/columine-types" }
+columine-event-processor = { path = "../columine-event-processor" }
+columine-arrow = { path = "../columine-arrow" }

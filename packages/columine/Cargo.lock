@@ -61,7 +61,6 @@ version = "0.0.1"
 dependencies = [
  "columine-arrow",
  "columine-event-processor",
- "columine-types",
 ]
 
 [[package]]

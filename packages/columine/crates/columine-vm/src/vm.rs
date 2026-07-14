@@ -56,25 +56,33 @@ compile_error!("columine-vm input-column views require a little-endian target");
 
 /// vm.zig `getColU32` — a batch column as u32 cells.
 ///
-/// Panics on a misaligned or short column: the Zig side is UB there, and a
-/// wild column pointer is a programmer bug at the JS/FFI boundary.
+/// The Zig contract is pointer + op-determined extent: section columns
+/// (FOR_EACH / scatter sources) are legitimately SHORTER than `batch_len` —
+/// each op reads the count its own semantics dictate (ingest-backends-parity
+/// passes a 40-cell txn column with batch 50). The view therefore clamps to
+/// `min(batch extent, available cells)`: batch-driven kernels iterate the
+/// slice and must never see more than `batch_len` cells (on wasm the
+/// "column" spans to the end of linear memory), while a section column
+/// exposes its own shorter extent and an op that genuinely over-indexes
+/// panics at the access (Zig reads garbage there — UB; checked-stricter
+/// divergence, same class as the other checked-vs-UB sites). Alignment is
+/// still a hard invariant.
 pub fn col_u32(col: &[u8], batch_len: u32) -> &[u32] {
-    let need = batch_len as usize * 4;
-    columine_types::check!(col.len() >= need, "u32 column shorter than batch");
-    // SAFETY: length checked above; alignment checked via the `prefix`
+    let usable = (col.len() & !3).min(batch_len as usize * 4);
+    // SAFETY: length within `col`; alignment checked via the `prefix`
     // assert below; u32 has no invalid bit patterns; the returned slice
     // borrows `col`, so no lifetime extension happens.
-    let (prefix, cells, _) = unsafe { col[..need].align_to::<u32>() };
+    let (prefix, cells, _) = unsafe { col[..usable].align_to::<u32>() };
     columine_types::check!(prefix.is_empty(), "u32 column misaligned");
     cells
 }
 
-/// vm.zig `getColF64` — a batch column as f64 cells.
+/// vm.zig `getColF64` — a batch column as f64 cells (see `col_u32` for the
+/// pointer + op-determined-extent contract).
 pub fn col_f64(col: &[u8], batch_len: u32) -> &[f64] {
-    let need = batch_len as usize * 8;
-    columine_types::check!(col.len() >= need, "f64 column shorter than batch");
+    let usable = (col.len() & !7).min(batch_len as usize * 8);
     // SAFETY: as in `col_u32`; every bit pattern is a valid f64.
-    let (prefix, cells, _) = unsafe { col[..need].align_to::<f64>() };
+    let (prefix, cells, _) = unsafe { col[..usable].align_to::<f64>() };
     columine_types::check!(prefix.is_empty(), "f64 column misaligned");
     cells
 }
@@ -97,12 +105,12 @@ pub fn i64s_as_bytes(v: &[i64]) -> &[u8] {
     unsafe { core::slice::from_raw_parts(v.as_ptr().cast(), v.len() * 8) }
 }
 
-/// vm.zig `getColI64` — a batch column as i64 cells.
+/// vm.zig `getColI64` — a batch column as i64 cells (see `col_u32` for the
+/// pointer + op-determined-extent contract).
 pub fn col_i64(col: &[u8], batch_len: u32) -> &[i64] {
-    let need = batch_len as usize * 8;
-    columine_types::check!(col.len() >= need, "i64 column shorter than batch");
+    let usable = (col.len() & !7).min(batch_len as usize * 8);
     // SAFETY: as in `col_u32`.
-    let (prefix, cells, _) = unsafe { col[..need].align_to::<i64>() };
+    let (prefix, cells, _) = unsafe { col[..usable].align_to::<i64>() };
     columine_types::check!(prefix.is_empty(), "i64 column misaligned");
     cells
 }

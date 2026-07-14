@@ -1,12 +1,11 @@
-//! Pins the wasm export surface against the COLUMINE Zig
-//! `event_processor.wasm` ground truth: five function exports plus the
-//! EXPORTED memory (packages/columine build.zig: `export_memory = true`;
-//! the host writes schema/input at offsets it computes in
-//! wasm-memory-contract.ts — there is no reserve/alloc protocol).
+//! Pins the wasm export surface against the Zig `columine.wasm`-family
+//! ground truth: columine's event_processor.wasm exported exactly FIVE
+//! functions plus the EXPORTED memory (frozen from the Zig artifact's
+//! export section at cutover — the Zig build is deleted; this list is its
+//! tombstone).
 
-/// Every function export of the Zig event_processor.wasm (export section,
-/// parsed mechanically from the columine package's src/event_processor.zig export set (all five `export fn`s)).
-pub const ZIG_EP_EXPORTS: [&str; 5] = [
+/// Every function export of the Zig columine event_processor.wasm.
+pub const ZIG_COLUMINE_EP_EXPORTS: [&str; 5] = [
     "ep_version",
     "ep_create_with_schema",
     "ep_create_with_schema_and_names",
@@ -56,13 +55,13 @@ fn wasm_exports(bytes: &[u8]) -> Vec<(String, u8)> {
 
 #[test]
 fn zig_export_list_is_complete_and_deduped() {
-    let mut names: Vec<&str> = ZIG_EP_EXPORTS.to_vec();
+    let mut names: Vec<&str> = ZIG_COLUMINE_EP_EXPORTS.to_vec();
     names.sort_unstable();
     names.dedup();
     assert_eq!(names.len(), 5, "duplicate names in the checklist");
 }
 
-/// `just wasm-ep` runs this against the built artifact.
+/// `just wasm-ep` (columine justfile) runs this against the built artifact.
 #[test]
 #[ignore = "needs target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm (run `just wasm-ep`)"]
 fn built_wasm_exports_every_zig_symbol_and_memory() {
@@ -78,17 +77,16 @@ fn built_wasm_exports_every_zig_symbol_and_memory() {
         .filter(|(_, k)| *k == 0)
         .map(|(n, _)| n.as_str())
         .collect();
-    let missing: Vec<&&str> = ZIG_EP_EXPORTS
+    let missing: Vec<&&str> = ZIG_COLUMINE_EP_EXPORTS
         .iter()
         .filter(|n| !fn_names.contains(**n))
         .collect();
     assert!(
         missing.is_empty(),
-        "exports missing vs Zig event_processor.wasm: {missing:?}"
+        "exports missing vs Zig columine event_processor.wasm: {missing:?}"
     );
-    // build.zig: export_memory = true — JS reads instance.exports.memory.
     assert!(
         exports.iter().any(|(n, k)| n == "memory" && *k == 2),
-        "memory must be exported (build.zig ep_wasm.export_memory)"
+        "memory must be exported (columine's TS reads instance.exports.memory)"
     );
 }

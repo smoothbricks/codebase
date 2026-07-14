@@ -1,23 +1,21 @@
-//! Columine compilation root — the `columine.wasm` replacement.
+//! `columine.wasm` — the generic reducer-VM export layer (VM without RETE).
 //!
-//! Replaces the `columine_wasm` target of packages/columine's build.zig:
-//! the standalone Parse/Reduce/Compact/Undo VM binary WITHOUT the RETE
-//! engine or ax_eval (those live in AxE's axe-runtime superset). Export
-//! names and u32-offset/linear-memory signatures are byte-compatible with
-//! the Zig build; the package's TS binds by name (src/wasm-backend.ts) and
-//! is pinned by `tests/export_checklist.rs`.
+//! Replaces columine's Zig `columine.wasm` build: 56 `vm_*` function exports
+//! plus EXPORTED memory, enumerated from the Zig artifact's export section
+//! and pinned by `tests/export_checklist.rs`. The surface is the axe
+//! superset artifact minus the RETE/ax_eval/condition-tree families — the
+//! published @smoothbricks/columine npm package ships this artifact as
+//! `dist/columine.wasm` (`"./wasm"` export).
 //!
-//! Statics policy: the library crates own no globals — every Zig module
-//! global (`Vm` undo/bitmap state, delta-export buffers) lives here, in the
-//! binary root, exactly as vm.zig was the linking point for Zig's globals.
-//! Single-threaded wasm is assumed.
+//! The wrapper layer is an adapted copy of axe-superset-wasm's (that crate
+//! additionally wires RETE/eval into its Runtime); both surfaces are pinned
+//! by their own export checklists and smoke tests, which is what catches
+//! wrapper drift. Unify via a shared extern-core macro when this surface
+//! next changes.
 //!
-//! Pointer-bounding policy: Zig exports take unbounded `[*]u8`; Rust slices
-//! need lengths. On wasm32 every raw pointer is bounded by the end of linear
-//! memory (the honest equivalent of Zig's unbounded pointer). On native
-//! (tests, future dylib work) callers register buffer regions
-//! (`__register_region`) and unknown pointers panic — a programmer bug at
-//! the boundary, never UB.
+//! Statics policy: single-threaded wasm assumed (one caller per instance).
+//! Pointer policy: wasm32 pointers bounded by linear memory; native tests
+//! register regions explicitly.
 
 // WHY one crate-level allow instead of 50 identical `# Safety` sections:
 // every unsafe extern here has the SAME contract — the module-doc "Pointer
@@ -86,32 +84,17 @@ fn bound_of(ptr: usize) -> usize {
     end
 }
 
-/// `trusted-ffi` (the libaxe_vm.dylib artifact): registered regions keep
-/// exact bounds (state buffers register themselves at init/grow/undo_enable);
-/// unregistered pointers — production column buffers from bun-ffi-backend.ts,
-/// which never registers — get a fixed trust span. This is the Zig `[*]u8`
-/// C-ABI contract verbatim: the caller's pointer is trusted, and an
-/// out-of-contract access faults exactly as it would under the Zig dylib.
-#[cfg(all(not(target_arch = "wasm32"), feature = "trusted-ffi"))]
-const TRUSTED_FFI_SPAN: usize = 1 << 32;
-
+/// Native builds are tests-only for this crate (the npm package ships only
+/// the wasm artifact — no columine dylib lane): strict region registry.
 #[cfg(not(target_arch = "wasm32"))]
 fn bound_of(ptr: usize) -> usize {
-    let registered = rt()
-        .regions
+    rt().regions
         .iter()
         .find(|(base, len)| ptr >= *base && ptr < base + len)
-        .map(|(base, len)| base + len);
-    #[cfg(feature = "trusted-ffi")]
-    {
-        registered.unwrap_or(ptr + TRUSTED_FFI_SPAN)
-    }
-    #[cfg(not(feature = "trusted-ffi"))]
-    {
-        registered.unwrap_or_else(|| {
+        .map(|(base, len)| base + len)
+        .unwrap_or_else(|| {
             panic!("native caller must __register_region the buffer containing {ptr:#x}")
         })
-    }
 }
 
 /// Native tests register the buffers they pass by raw pointer (wasm32 needs
