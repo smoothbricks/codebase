@@ -198,7 +198,7 @@ where
         return Err(error);
     }
     if flags & libc::FD_CLOEXEC == 0 {
-        let result = fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        let result = fcntl(descriptor, libc::F_SETFD, flags + libc::FD_CLOEXEC);
         if result == -1 {
             return Err(last_error());
         }
@@ -244,6 +244,18 @@ where
 const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
 
 #[cfg(any(target_os = "linux", test))]
+fn close_range_result_with<LastError>(result: libc::c_long, last_error: LastError) -> io::Result<()>
+where
+    LastError: FnOnce() -> io::Error,
+{
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(last_error())
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn mark_non_stdio_close_on_exec_with<CloseRange, MarkDescriptor>(
     limit: libc::rlim_t,
     close_range: CloseRange,
@@ -275,11 +287,7 @@ fn mark_non_stdio_close_on_exec(limit: libc::rlim_t) -> io::Result<()> {
             limit,
             |first, last, flags| {
                 let result = unsafe { libc::syscall(libc::SYS_close_range, first, last, flags) };
-                if result == 0 {
-                    Ok(())
-                } else {
-                    Err(io::Error::last_os_error())
-                }
+                close_range_result_with(result, io::Error::last_os_error)
             },
             mark_descriptor_close_on_exec,
         );
@@ -684,7 +692,12 @@ mod tests {
         let capacity = 2 * entry_size;
 
         assert!(validate_fd_listing_size(-1, capacity).is_err());
-        for invalid in [entry_size - 1, capacity + entry_size] {
+        for invalid in [
+            entry_size - 1,
+            capacity - 1,
+            capacity + 1,
+            capacity + entry_size,
+        ] {
             let error = validate_fd_listing_size(invalid as libc::c_int, capacity).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
             assert_eq!(
@@ -726,6 +739,19 @@ mod tests {
             .unwrap();
             assert_eq!(actual, expected);
         }
+
+        let positive_status_limit = 7;
+        let actual = descriptor_limit_with(|limit| {
+            unsafe {
+                limit.write(libc::rlimit {
+                    rlim_cur: positive_status_limit,
+                    rlim_max: positive_status_limit,
+                });
+            }
+            1
+        })
+        .unwrap();
+        assert_eq!(actual, positive_status_limit);
 
         unsafe {
             libc::close(-1);
@@ -869,6 +895,18 @@ mod tests {
     }
 
     #[test]
+    fn close_range_result_accepts_only_the_success_sentinel() {
+        close_range_result_with(0, || panic!("success must not read errno")).unwrap();
+
+        for result in [-1, 1] {
+            let error =
+                close_range_result_with(result, || io::Error::from_raw_os_error(libc::EPERM))
+                    .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+        }
+    }
+
+    #[test]
     fn close_range_fallback_visits_every_descriptor_below_the_bound() {
         for unavailable_errno in [libc::ENOSYS, libc::EINVAL] {
             let visited = RefCell::new(Vec::new());
@@ -883,6 +921,19 @@ mod tests {
             .unwrap();
 
             assert_eq!(visited.into_inner(), vec![3, 4, 5, 6]);
+        }
+    }
+
+    #[test]
+    fn descriptor_range_obeys_exclusive_limit_at_stdio_boundary() {
+        for (limit, expected) in [(2, &[][..]), (3, &[][..]), (4, &[3][..]), (5, &[3, 4][..])] {
+            let visited = RefCell::new(Vec::new());
+            mark_descriptor_range_close_on_exec_with(limit, |descriptor| {
+                visited.borrow_mut().push(descriptor);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(visited.into_inner(), expected);
         }
     }
 
