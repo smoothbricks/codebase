@@ -3751,6 +3751,7 @@ async fn binding_from_git(
     binding_from_remotes(&remotes, requested_repo_id)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn binding_from_remotes(
     remotes: &[crate::git::RemoteUrl],
     requested_repo_id: Option<&RepoId>,
@@ -3850,6 +3851,7 @@ fn binding_from_remotes(
     .map_err(binding_integrity_error)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn persistable_remote_url(value: &str) -> Option<String> {
     let suffix = value
         .char_indices()
@@ -3870,6 +3872,7 @@ fn persistable_remote_url(value: &str) -> Option<String> {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn binding_integrity_error(error: impl std::fmt::Display) -> CowshedError {
     CowshedError::integrity(error.to_string(), "repair the repository binding")
 }

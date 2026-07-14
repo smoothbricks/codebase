@@ -283,14 +283,14 @@ where
 fn mark_non_stdio_close_on_exec(limit: libc::rlim_t) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        return mark_non_stdio_close_on_exec_with(
+        mark_non_stdio_close_on_exec_with(
             limit,
             |first, last, flags| {
                 let result = unsafe { libc::syscall(libc::SYS_close_range, first, last, flags) };
                 close_range_result_with(result, io::Error::last_os_error)
             },
             mark_descriptor_close_on_exec,
-        );
+        )
     }
 
     #[cfg(not(target_os = "linux"))]
