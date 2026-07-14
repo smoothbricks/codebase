@@ -4111,12 +4111,21 @@ where
         let mut checkpoint_bytes = 0_u64;
         let mut pinned_checkpoint_bytes = 0_u64;
         for checkpoint_image in regular_file_children(&checkpoint_directory)? {
-            if ImageFormat::from_image_path(&checkpoint_image).is_err() {
+            let Ok(checkpoint_format) = ImageFormat::from_image_path(&checkpoint_image) else {
                 continue;
-            }
-            let fact_path = checkpoint_fact_path(&checkpoint_image);
-            let fact: CheckpointFactWire = crate::metadata::read_json(&fact_path)
+            };
+            let checkpoint_metadata = DetachedWorkspaceMetadata::read_for_image(&checkpoint_image)
                 .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+            if checkpoint_metadata.repo_id != *workspace.repo()
+                || checkpoint_metadata.workspace != *workspace.name()
+                || checkpoint_metadata.image_format != checkpoint_format
+                || checkpoint_metadata.publication_state != PublicationState::Active
+            {
+                return Err(ApfsStorageError::MarkerMismatch(format!(
+                    "checkpoint metadata disagrees with image path: {}",
+                    checkpoint_image.display()
+                )));
+            }
             let expected_label = checkpoint_image
                 .file_stem()
                 .and_then(|stem| stem.to_str())
@@ -4126,16 +4135,46 @@ where
                         checkpoint_image.display()
                     ))
                 })?;
-            if fact.version != CHECKPOINT_FACT_VERSION
-                || fact.repo_id != *workspace.repo()
-                || fact.workspace != *workspace.name()
-                || fact.label.as_str() != expected_label
-            {
-                return Err(ApfsStorageError::Host(format!(
-                    "checkpoint fact does not match image path: {}",
-                    fact_path.display()
-                )));
-            }
+            let pinned =
+                if let Some(destination) = expected_label.strip_prefix(super::PRE_RESTORE_PREFIX) {
+                    let destination = WorkspaceIncarnation::new(destination).map_err(|error| {
+                        ApfsStorageError::Host(format!(
+                            "invalid pre-restore checkpoint image {}: {error}",
+                            checkpoint_image.display()
+                        ))
+                    })?;
+                    if checkpoint_metadata.workspace_incarnation == destination {
+                        return Err(ApfsStorageError::MarkerMismatch(format!(
+                            "pre-restore checkpoint retained the destination incarnation: {}",
+                            checkpoint_image.display()
+                        )));
+                    }
+                    false
+                } else {
+                    let fact_path = checkpoint_fact_path(&checkpoint_image);
+                    let fact: CheckpointFactWire = crate::metadata::read_json(&fact_path)
+                        .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+                    if fact.version != CHECKPOINT_FACT_VERSION
+                        || fact.repo_id != *workspace.repo()
+                        || fact.workspace != *workspace.name()
+                        || fact.label.as_str() != expected_label
+                    {
+                        return Err(ApfsStorageError::Host(format!(
+                            "checkpoint fact does not match image path: {}",
+                            fact_path.display()
+                        )));
+                    }
+                    match fact.pin.as_str() {
+                        "pinned" => true,
+                        "automatic" => false,
+                        _ => {
+                            return Err(ApfsStorageError::Host(format!(
+                                "invalid checkpoint pin in {}",
+                                fact_path.display()
+                            )));
+                        }
+                    }
+                };
             let bytes =
                 allocated_file_bytes(&fs::metadata(&checkpoint_image).map_err(|error| {
                     io_error("read checkpoint statistics", &checkpoint_image, error)
@@ -4149,19 +4188,10 @@ where
                     .ok_or(ApfsStorageError::InvalidPlan(
                         "checkpoint byte accounting overflow",
                     ))?;
-            match fact.pin.as_str() {
-                "pinned" => {
-                    pinned_checkpoint_bytes = pinned_checkpoint_bytes.checked_add(bytes).ok_or(
-                        ApfsStorageError::InvalidPlan("pinned checkpoint byte accounting overflow"),
-                    )?;
-                }
-                "automatic" => {}
-                _ => {
-                    return Err(ApfsStorageError::Host(format!(
-                        "invalid checkpoint pin in {}",
-                        fact_path.display()
-                    )));
-                }
+            if pinned {
+                pinned_checkpoint_bytes = pinned_checkpoint_bytes.checked_add(bytes).ok_or(
+                    ApfsStorageError::InvalidPlan("pinned checkpoint byte accounting overflow"),
+                )?;
             }
         }
         Ok(SubstrateStats {
