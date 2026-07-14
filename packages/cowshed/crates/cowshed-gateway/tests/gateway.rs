@@ -2,7 +2,10 @@ use std::{
     collections::BTreeSet,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU16, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -11,9 +14,10 @@ use cowshed_gateway::{
     ArrowAuditConfig, ArrowAuditSink, AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus,
     AuthorizedTarget, BoxIo, CanonicalTarget, ConnectError, ControlError, ControlFailureCode,
     CredentialError, CredentialProtocol, CredentialProvider, CredentialQuery, CredentialRecord,
-    EgressGrant, Gateway, GatewayConfig, GatewayControlClient, GatewayLimits, GatewayTimeouts,
-    HostPattern, MirrorProtocol, MirrorRoute, UpstreamConnector, UpstreamHealth, UpstreamPurpose,
-    WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
+    EgressGrant, Gateway, GatewayConfig, GatewayControlClient, GatewayError, GatewayLimits,
+    GatewayTimeouts, HostPattern, MirrorProtocol, MirrorRoute, UpstreamConnector, UpstreamHealth,
+    UpstreamPurpose, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession,
+    WorkspaceToken,
 };
 use http::HeaderName;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
@@ -21,9 +25,11 @@ use rustls::{
     ClientConfig, RootCertStore,
     pki_types::{CertificateDer, ServerName},
 };
+#[cfg(target_os = "linux")]
+use tokio::net::UnixStream;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream, UnixStream},
+    net::{TcpListener, TcpStream},
     sync::{Notify, mpsc},
     task::JoinHandle,
     time::timeout,
@@ -44,6 +50,19 @@ impl CredentialProvider for NoCredentials {
 }
 
 #[derive(Debug)]
+struct FailingCredentials;
+
+#[async_trait]
+impl CredentialProvider for FailingCredentials {
+    async fn lookup(
+        &self,
+        _query: &CredentialQuery,
+    ) -> Result<Option<CredentialRecord>, CredentialError> {
+        Err(CredentialError::Unavailable("injected failure".to_owned()))
+    }
+}
+
+#[derive(Debug)]
 struct DiscardAudit;
 
 #[async_trait]
@@ -54,6 +73,20 @@ impl AuditSink for DiscardAudit {
 
     async fn flush(&self) -> Result<(), AuditError> {
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct FailingAudit;
+
+#[async_trait]
+impl AuditSink for FailingAudit {
+    async fn record(&self, _event: AuditEvent) -> Result<(), AuditError> {
+        Err(AuditError("injected writer failure".to_owned()))
+    }
+
+    async fn flush(&self) -> Result<(), AuditError> {
+        Err(AuditError("injected writer failure".to_owned()))
     }
 }
 
@@ -82,6 +115,26 @@ impl UpstreamConnector for LocalConnector {
             .await
             .map_err(ConnectError::Io)?;
         Ok(Box::new(stream))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CountingFailConnector {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl UpstreamConnector for CountingFailConnector {
+    async fn health(&self, _target: &CanonicalTarget) -> UpstreamHealth {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        UpstreamHealth::Healthy
+    }
+
+    async fn connect(&self, _target: &AuthorizedTarget) -> Result<BoxIo, ConnectError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(ConnectError::Io(io::Error::other(
+            "injected connect failure",
+        )))
     }
 }
 
@@ -143,9 +196,32 @@ fn ca_fixture() -> CaFixture {
 }
 
 fn free_endpoint() -> SocketAddr {
-    let listener =
-        std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve loopback endpoint");
-    listener.local_addr().expect("fixture local address")
+    static NEXT_PORT: AtomicU16 = AtomicU16::new(cowshed_gateway::MACOS_PORT_MIN);
+    loop {
+        let port = NEXT_PORT.fetch_add(cowshed_gateway::MACOS_PORT_BLOCK_SIZE, Ordering::Relaxed);
+        assert!(
+            port <= cowshed_gateway::MACOS_PORT_MAX,
+            "no free macOS gateway port block"
+        );
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        if std::net::TcpListener::bind(address).is_ok() {
+            return address;
+        }
+    }
+}
+
+fn tls_client_hello(host: &str) -> Vec<u8> {
+    let config = ClientConfig::builder()
+        .with_root_certificates(RootCertStore::empty())
+        .with_no_client_auth();
+    let server_name = ServerName::try_from(host.to_owned()).expect("valid fixture SNI");
+    let mut connection =
+        rustls::ClientConnection::new(Arc::new(config), server_name).expect("TLS client");
+    let mut bytes = Vec::new();
+    connection
+        .write_tls(&mut bytes)
+        .expect("serialize ClientHello");
+    bytes
 }
 
 fn session(
@@ -268,6 +344,52 @@ async fn proxy_request(endpoint: SocketAddr, request: String) -> String {
         .expect("proxy response timeout")
         .expect("read proxy response");
     String::from_utf8(response).expect("HTTP response is UTF-8")
+}
+
+async fn await_reclaimed(gateway: &Gateway) {
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let status = gateway.handle().status().await.expect("gateway status");
+            if status.active == 0 && status.queued == 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("gateway capacity was not reclaimed");
+}
+
+async fn opaque_payload(
+    endpoint: SocketAddr,
+    token: &str,
+    authority: &str,
+    port: u16,
+    payload: &[u8],
+) {
+    let mut stream = TcpStream::connect(endpoint).await.expect("connect gateway");
+    let connect = format!(
+        "CONNECT {authority}:{port} HTTP/1.1\r\nHost: {authority}:{port}\r\nProxy-Authorization: Bearer {token}\r\n\r\n"
+    );
+    stream
+        .write_all(connect.as_bytes())
+        .await
+        .expect("write CONNECT");
+    assert!(
+        read_response_head(&mut stream)
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    stream
+        .write_all(payload)
+        .await
+        .expect("write tunnel payload");
+    stream.shutdown().await.expect("shutdown tunnel writer");
+    let mut discarded = Vec::new();
+    timeout(Duration::from_secs(1), stream.read_to_end(&mut discarded))
+        .await
+        .expect("opaque denial timeout")
+        .expect("read opaque denial");
 }
 
 fn absolute_request(host: &str, port: u16, token: &str, path: &str) -> String {
@@ -514,14 +636,20 @@ async fn opaque_connect_preserves_bytes_exactly() {
         .await
         .expect("bind echo fixture");
     let upstream_port = upstream.local_addr().expect("echo address").port();
+    let payload = tls_client_hello("pinned.test");
+    let expected = payload.clone();
     let echo = tokio::spawn(async move {
         let (mut stream, _) = upstream.accept().await.expect("accept opaque tunnel");
-        let mut bytes = [0u8; 10];
+        let mut bytes = vec![0_u8; expected.len()];
         stream
             .read_exact(&mut bytes)
             .await
-            .expect("read opaque bytes");
-        stream.write_all(&bytes).await.expect("echo opaque bytes");
+            .expect("read opaque ClientHello");
+        assert_eq!(bytes, expected);
+        stream
+            .write_all(&bytes)
+            .await
+            .expect("echo opaque ClientHello");
     });
     let endpoint = free_endpoint();
     let (observed_tx, mut observed_rx) = mpsc::channel(1);
@@ -562,17 +690,16 @@ async fn opaque_connect_preserves_bytes_exactly() {
         .expect("write CONNECT");
     let head = read_response_head(&mut stream).await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    let payload = b"\x00TLS\xffbytes";
     stream
-        .write_all(payload)
+        .write_all(&payload)
         .await
-        .expect("write opaque payload");
-    let mut echoed = [0u8; 10];
+        .expect("write opaque ClientHello");
+    let mut echoed = vec![0_u8; payload.len()];
     stream
         .read_exact(&mut echoed)
         .await
-        .expect("read echoed payload");
-    assert_eq!(&echoed, payload);
+        .expect("read echoed ClientHello");
+    assert_eq!(echoed, payload);
     let observed = observed_rx.recv().await.expect("connector observation");
     assert_eq!(observed.purpose, UpstreamPurpose::OpaqueTcp);
     drop(stream);
@@ -920,6 +1047,10 @@ async fn queued_request_timeout_cancels_without_leaking_a_slot() {
             .await
             .starts_with("HTTP/1.1 200")
     );
+    tunnel
+        .write_all(&tls_client_hello("held.test"))
+        .await
+        .expect("write held ClientHello");
     let started = Instant::now();
     let response = proxy_request(
         endpoint,
@@ -944,6 +1075,7 @@ async fn queued_request_timeout_cancels_without_leaking_a_slot() {
     gateway.drain().await.expect("drain gateway");
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn unix_socket_churn_unlinks_every_session() {
     let root = std::env::temp_dir().join(format!("cowshed-gateway-churn-{}", std::process::id()));
@@ -1131,8 +1263,584 @@ async fn control_socket_is_local_authenticated_and_reports_status() {
     std::fs::remove_dir_all(root).expect("remove control fixture directory");
 }
 
+#[tokio::test]
+async fn revision_tombstone_and_rotation_preserve_authority() {
+    let endpoint = free_endpoint();
+    let gateway = gateway(
+        test_config(),
+        Arc::new(NoCredentials),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+    let make_session = |revision, endpoint| {
+        session(
+            "revision",
+            "repo-revision",
+            WorkspaceEndpoint::Tcp(endpoint),
+            revision as u8,
+            revision,
+            WorkspacePolicy::default(),
+        )
+        .0
+    };
+    gateway
+        .handle()
+        .install(make_session(1, endpoint))
+        .await
+        .expect("install revision one");
+    gateway
+        .handle()
+        .remove("revision", 1)
+        .await
+        .expect("remove revision one");
+    assert!(matches!(
+        gateway.handle().install(make_session(1, endpoint)).await,
+        Err(GatewayError::StaleRevision)
+    ));
+    gateway
+        .handle()
+        .install(make_session(2, endpoint))
+        .await
+        .expect("install revision two");
+
+    let occupied_endpoint = free_endpoint();
+    let occupied = TcpListener::bind(occupied_endpoint)
+        .await
+        .expect("occupy replacement endpoint");
+    assert!(matches!(
+        gateway
+            .handle()
+            .install(make_session(3, occupied_endpoint))
+            .await,
+        Err(GatewayError::Io(_))
+    ));
+    let status = gateway.handle().status().await.expect("rotation status");
+    assert_eq!(status.sessions[0].revision, 2);
+    assert_eq!(status.sessions[0].endpoint, endpoint.to_string());
+    let old_listener = TcpStream::connect(endpoint)
+        .await
+        .expect("old authority remains bound");
+    drop(old_listener);
+    drop(occupied);
+
+    gateway
+        .handle()
+        .install(make_session(3, endpoint))
+        .await
+        .expect("same-endpoint rotation");
+    assert_eq!(
+        gateway.handle().status().await.expect("status").sessions[0].revision,
+        3
+    );
+    gateway.drain().await.expect("drain gateway");
+}
+
+#[tokio::test]
+async fn audit_failure_is_fail_closed_and_marks_gateway_draining() {
+    let endpoint = free_endpoint();
+    let gateway = gateway(
+        test_config(),
+        Arc::new(NoCredentials),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(FailingAudit),
+    )
+    .await;
+    let (installed, token, _) = session(
+        "audit-failure",
+        "repo-audit-failure",
+        WorkspaceEndpoint::Tcp(endpoint),
+        21,
+        1,
+        WorkspacePolicy::default(),
+    );
+    gateway
+        .handle()
+        .install(installed)
+        .await
+        .expect("install session");
+    let denied = proxy_request(
+        endpoint,
+        absolute_request("denied.test", 443, &token, "/blocked"),
+    )
+    .await;
+    assert!(denied.starts_with("HTTP/1.1 503"), "{denied}");
+    assert!(gateway.handle().status().await.expect("status").draining);
+    let replacement = session(
+        "audit-failure",
+        "repo-audit-failure",
+        WorkspaceEndpoint::Tcp(endpoint),
+        22,
+        2,
+        WorkspacePolicy::default(),
+    )
+    .0;
+    assert!(matches!(
+        gateway.handle().install(replacement).await,
+        Err(GatewayError::Draining)
+    ));
+    drop(gateway);
+}
+
+#[tokio::test]
+async fn opaque_rejects_non_tls_missing_and_mismatched_sni_without_connector_calls() {
+    let endpoint = free_endpoint();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let gateway = gateway(
+        test_config(),
+        Arc::new(NoCredentials),
+        Arc::new(CountingFailConnector {
+            calls: Arc::clone(&calls),
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+    let (installed, token, _) = session(
+        "opaque-validation",
+        "repo-opaque-validation",
+        WorkspaceEndpoint::Tcp(endpoint),
+        23,
+        1,
+        WorkspacePolicy {
+            grants: vec![EgressGrant::opaque("expected.test", 443).expect("opaque grant")],
+            mirrors: Vec::new(),
+        },
+    );
+    gateway
+        .handle()
+        .install(installed)
+        .await
+        .expect("install session");
+
+    opaque_payload(endpoint, &token, "expected.test", 443, b"not tls").await;
+    await_reclaimed(&gateway).await;
+    opaque_payload(
+        endpoint,
+        &token,
+        "expected.test",
+        443,
+        &tls_client_hello("other.test"),
+    )
+    .await;
+    await_reclaimed(&gateway).await;
+    opaque_payload(
+        endpoint,
+        &token,
+        "expected.test",
+        443,
+        &tls_client_hello("127.0.0.1"),
+    )
+    .await;
+    await_reclaimed(&gateway).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    gateway.drain().await.expect("drain gateway");
+}
+
+#[tokio::test]
+async fn active_error_and_disconnect_paths_reclaim_single_permit() {
+    let single_permit_config = || {
+        let mut config = test_config();
+        config.limits = GatewayLimits {
+            workspace_active: 1,
+            workspace_queued: 1,
+            global_active: 1,
+            global_queued: 1,
+            origin_active: 1,
+            leaf_cache_workspace: 2,
+            leaf_cache_global: 2,
+        };
+        config
+    };
+
+    {
+        let endpoint = free_endpoint();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gateway = gateway(
+            single_permit_config(),
+            Arc::new(NoCredentials),
+            Arc::new(CountingFailConnector {
+                calls: Arc::clone(&calls),
+            }),
+            Arc::new(DiscardAudit),
+        )
+        .await;
+        let (installed, token, _) = session(
+            "connect-failure",
+            "repo-connect-failure",
+            WorkspaceEndpoint::Tcp(endpoint),
+            24,
+            1,
+            WorkspacePolicy {
+                grants: vec![grant("connect-failure.test", 443)],
+                mirrors: Vec::new(),
+            },
+        );
+        gateway.handle().install(installed).await.expect("install");
+        for _ in 0..2 {
+            let response = proxy_request(
+                endpoint,
+                absolute_request("connect-failure.test", 443, &token, "/allowed"),
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+            await_reclaimed(&gateway).await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        gateway
+            .drain()
+            .await
+            .expect("drain connect-failure gateway");
+    }
+
+    {
+        let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind credential upstream");
+        let upstream_port = upstream.local_addr().expect("upstream address").port();
+        let accepts = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = upstream
+                    .accept()
+                    .await
+                    .expect("accept credential connection");
+                drop(stream);
+            }
+        });
+        let endpoint = free_endpoint();
+        let gateway = gateway(
+            single_permit_config(),
+            Arc::new(FailingCredentials),
+            Arc::new(LocalConnector {
+                health: UpstreamHealth::Healthy,
+                observed: None,
+            }),
+            Arc::new(DiscardAudit),
+        )
+        .await;
+        let (installed, token, _) = session(
+            "credential-failure",
+            "repo-credential-failure",
+            WorkspaceEndpoint::Tcp(endpoint),
+            25,
+            1,
+            WorkspacePolicy {
+                grants: vec![grant("credential-failure.test", upstream_port)],
+                mirrors: Vec::new(),
+            },
+        );
+        gateway.handle().install(installed).await.expect("install");
+        for _ in 0..2 {
+            let response = proxy_request(
+                endpoint,
+                absolute_request("credential-failure.test", upstream_port, &token, "/allowed"),
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+            await_reclaimed(&gateway).await;
+        }
+        timeout(Duration::from_secs(1), accepts)
+            .await
+            .expect("credential accepts timeout")
+            .expect("credential accepts task");
+        gateway.drain().await.expect("drain credential gateway");
+    }
+
+    {
+        let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind header upstream");
+        let upstream_port = upstream.local_addr().expect("upstream address").port();
+        let accepts = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = upstream.accept().await.expect("accept header connection");
+                let _ = read_headers(&mut stream).await;
+            }
+        });
+        let endpoint = free_endpoint();
+        let gateway = gateway(
+            single_permit_config(),
+            Arc::new(NoCredentials),
+            Arc::new(LocalConnector {
+                health: UpstreamHealth::Healthy,
+                observed: None,
+            }),
+            Arc::new(DiscardAudit),
+        )
+        .await;
+        let (installed, token, _) = session(
+            "header-failure",
+            "repo-header-failure",
+            WorkspaceEndpoint::Tcp(endpoint),
+            26,
+            1,
+            WorkspacePolicy {
+                grants: vec![grant("header-failure.test", upstream_port)],
+                mirrors: Vec::new(),
+            },
+        );
+        gateway.handle().install(installed).await.expect("install");
+        for _ in 0..2 {
+            let response = proxy_request(
+                endpoint,
+                absolute_request("header-failure.test", upstream_port, &token, "/allowed"),
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+            await_reclaimed(&gateway).await;
+        }
+        timeout(Duration::from_secs(1), accepts)
+            .await
+            .expect("header accepts timeout")
+            .expect("header accepts task");
+        gateway.drain().await.expect("drain header gateway");
+    }
+
+    {
+        let gate = Arc::new(Notify::new());
+        let (upstream_port, mut captured, _upstream) =
+            http_fixture(1, Some(Arc::clone(&gate))).await;
+        let endpoint = free_endpoint();
+        let gateway = gateway(
+            single_permit_config(),
+            Arc::new(NoCredentials),
+            Arc::new(LocalConnector {
+                health: UpstreamHealth::Healthy,
+                observed: None,
+            }),
+            Arc::new(DiscardAudit),
+        )
+        .await;
+        let (installed, token, _) = session(
+            "disconnect",
+            "repo-disconnect",
+            WorkspaceEndpoint::Tcp(endpoint),
+            27,
+            1,
+            WorkspacePolicy {
+                grants: vec![grant("disconnect.test", upstream_port)],
+                mirrors: Vec::new(),
+            },
+        );
+        gateway.handle().install(installed).await.expect("install");
+        let mut client = TcpStream::connect(endpoint).await.expect("connect client");
+        client
+            .write_all(
+                absolute_request("disconnect.test", upstream_port, &token, "/allowed").as_bytes(),
+            )
+            .await
+            .expect("write request");
+        timeout(Duration::from_secs(1), captured.recv())
+            .await
+            .expect("upstream capture timeout")
+            .expect("upstream capture");
+        drop(client);
+        gate.notify_one();
+        await_reclaimed(&gateway).await;
+        gateway.drain().await.expect("drain disconnect gateway");
+    }
+}
+
+#[tokio::test]
+async fn queued_disconnect_and_drain_reclaim_all_capacity() {
+    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind held tunnel");
+    let upstream_port = upstream.local_addr().expect("upstream address").port();
+    let held = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.expect("accept held tunnel");
+        let mut discarded = Vec::new();
+        stream
+            .read_to_end(&mut discarded)
+            .await
+            .expect("held tunnel closes");
+    });
+    let mut config = test_config();
+    config.limits = GatewayLimits {
+        workspace_active: 1,
+        workspace_queued: 1,
+        global_active: 1,
+        global_queued: 1,
+        origin_active: 1,
+        leaf_cache_workspace: 2,
+        leaf_cache_global: 2,
+    };
+    let endpoint = free_endpoint();
+    let gateway = gateway(
+        config,
+        Arc::new(NoCredentials),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+    let (installed, token, _) = session(
+        "queue-cancel",
+        "repo-queue-cancel",
+        WorkspaceEndpoint::Tcp(endpoint),
+        28,
+        1,
+        WorkspacePolicy {
+            grants: vec![
+                EgressGrant::opaque("held-cancel.test", upstream_port).expect("opaque grant"),
+                grant("queued-cancel.test", 443),
+            ],
+            mirrors: Vec::new(),
+        },
+    );
+    gateway.handle().install(installed).await.expect("install");
+
+    let mut tunnel = TcpStream::connect(endpoint).await.expect("connect tunnel");
+    let connect = format!(
+        "CONNECT held-cancel.test:{upstream_port} HTTP/1.1\r\nHost: held-cancel.test:{upstream_port}\r\nProxy-Authorization: Bearer {token}\r\n\r\n"
+    );
+    tunnel
+        .write_all(connect.as_bytes())
+        .await
+        .expect("write CONNECT");
+    assert!(
+        read_response_head(&mut tunnel)
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    tunnel
+        .write_all(&tls_client_hello("held-cancel.test"))
+        .await
+        .expect("write ClientHello");
+
+    let mut queued = TcpStream::connect(endpoint).await.expect("connect queued");
+    queued
+        .write_all(absolute_request("queued-cancel.test", 443, &token, "/allowed").as_bytes())
+        .await
+        .expect("write queued request");
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if gateway.handle().status().await.expect("status").queued == 1 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("request did not queue");
+    drop(queued);
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let status = gateway.handle().status().await.expect("status");
+            if status.active == 1 && status.queued == 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queued cancellation was not reclaimed");
+
+    timeout(Duration::from_secs(2), gateway.drain())
+        .await
+        .expect("drain timeout")
+        .expect("drain gateway");
+    let mut discarded = Vec::new();
+    timeout(Duration::from_secs(1), tunnel.read_to_end(&mut discarded))
+        .await
+        .expect("tunnel close timeout")
+        .expect("read tunnel close");
+    timeout(Duration::from_secs(1), held)
+        .await
+        .expect("held upstream timeout")
+        .expect("held upstream task");
+}
+
+#[tokio::test]
+async fn client_tls_failures_reclaim_permits_and_pre_admission_denials_are_audited() {
+    let mut config = test_config();
+    config.limits = GatewayLimits {
+        workspace_active: 1,
+        workspace_queued: 1,
+        global_active: 1,
+        global_queued: 1,
+        origin_active: 1,
+        leaf_cache_workspace: 2,
+        leaf_cache_global: 2,
+    };
+    let endpoint = free_endpoint();
+    let (audit_tx, mut audit_rx) = mpsc::channel(8);
+    let gateway = gateway(
+        config,
+        Arc::new(NoCredentials),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(ChannelAudit(audit_tx)),
+    )
+    .await;
+    let (installed, token, _) = session(
+        "client-tls",
+        "repo-client-tls",
+        WorkspaceEndpoint::Tcp(endpoint),
+        29,
+        1,
+        WorkspacePolicy {
+            grants: vec![grant("client-tls.test", 443)],
+            mirrors: Vec::new(),
+        },
+    );
+    gateway.handle().install(installed).await.expect("install");
+
+    let malformed = format!(
+        "CONNECT client-tls.test:443 HTTP/1.1\r\nHost: wrong.test:443\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    let response = proxy_request(endpoint, malformed).await;
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    let denial = timeout(Duration::from_secs(1), audit_rx.recv())
+        .await
+        .expect("denial audit timeout")
+        .expect("denial audit");
+    assert_eq!(denial.status, AuditStatus::Denied);
+    assert_eq!(
+        denial.classification.as_deref(),
+        Some("connect-host-mismatch")
+    );
+
+    for _ in 0..2 {
+        let mut stream = TcpStream::connect(endpoint).await.expect("connect gateway");
+        let connect = format!(
+            "CONNECT client-tls.test:443 HTTP/1.1\r\nHost: client-tls.test:443\r\nProxy-Authorization: Bearer {token}\r\n\r\n"
+        );
+        stream
+            .write_all(connect.as_bytes())
+            .await
+            .expect("write CONNECT");
+        assert!(
+            read_response_head(&mut stream)
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        stream
+            .write_all(b"not a TLS record")
+            .await
+            .expect("write invalid TLS");
+        stream.shutdown().await.expect("shutdown client");
+        let mut discarded = Vec::new();
+        timeout(Duration::from_secs(1), stream.read_to_end(&mut discarded))
+            .await
+            .expect("TLS rejection timeout")
+            .expect("read TLS rejection");
+        await_reclaimed(&gateway).await;
+    }
+    gateway.drain().await.expect("drain gateway");
+}
+
 #[test]
-fn validation_rejects_ambiguous_and_overbroad_policy() {
+fn validation_rejects_ambiguous_policy_and_platform_endpoints() {
     assert!(WorkspaceToken::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").is_err());
     assert!(HostPattern::parse("*.*.example.com").is_err());
     assert!(cowshed_gateway::normalize_path("/a/%2f/b").is_err());
@@ -1140,9 +1848,34 @@ fn validation_rejects_ambiguous_and_overbroad_policy() {
     assert!(
         WorkspaceEndpoint::Tcp(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            40960,
+            cowshed_gateway::MACOS_PORT_MIN,
         ))
         .validate()
+        .is_err()
+    );
+    #[cfg(target_os = "macos")]
+    {
+        assert!(
+            WorkspaceEndpoint::Unix(std::env::temp_dir().join("gateway.sock"))
+                .validate_for_current_platform()
+                .is_err()
+        );
+        assert!(
+            WorkspaceEndpoint::Tcp(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                cowshed_gateway::MACOS_PORT_MIN + 1,
+            ))
+            .validate_for_current_platform()
+            .is_err()
+        );
+    }
+    #[cfg(target_os = "linux")]
+    assert!(
+        WorkspaceEndpoint::Tcp(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            cowshed_gateway::MACOS_PORT_MIN,
+        ))
+        .validate_for_current_platform()
         .is_err()
     );
 }
