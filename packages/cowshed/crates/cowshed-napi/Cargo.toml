@@ -8,3 +8,12 @@ publish.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
+cowshed-core.workspace = true
+libc = "0.2"
+napi.workspace = true
+napi-derive.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+napi-build.workspace = true
