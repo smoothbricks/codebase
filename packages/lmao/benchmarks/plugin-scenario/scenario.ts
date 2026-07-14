@@ -1,4 +1,5 @@
 import {
+  type BufferStrategy,
   convertSpanTreeToArrowTable,
   defineLogSchema,
   defineOpContext,
@@ -21,7 +22,7 @@ const ROOT_DYNAMIC_MESSAGE = 'request 7: detail-constant';
 const SUCCESS_CHILD_INDEX = 10;
 const FAILURE_CHILD_INDEX = 11;
 
-const scenarioSchema = defineLogSchema({
+export const scenarioSchema = defineLogSchema({
   userId: S.category(),
   operation: S.enum(['READ', 'WRITE']),
   index: S.number(),
@@ -30,6 +31,13 @@ const scenarioSchema = defineLogSchema({
 });
 
 export type ScenarioTraceRootFactory = TraceRootFactory<typeof scenarioSchema>;
+export type ScenarioSchema = typeof scenarioSchema;
+export type ScenarioBackend = 'js' | 'wasm';
+export interface ScenarioRuntime {
+  readonly backend: ScenarioBackend;
+  readonly bufferStrategy: BufferStrategy<ScenarioSchema>;
+  readonly createTraceRoot: ScenarioTraceRootFactory;
+}
 
 const scenarioContext = defineOpContext({
   logSchema: scenarioSchema,
@@ -103,10 +111,18 @@ export function resetScenarioBufferStats(): void {
   stats.spansCreated = 0;
 }
 
-export function createScenarioTracer(createTraceRoot: ScenarioTraceRootFactory): ScenarioTracer {
-  return new TestTracer(scenarioContext, {
+export function createJsScenarioRuntime(createTraceRoot: ScenarioTraceRootFactory): ScenarioRuntime {
+  return {
+    backend: 'js',
     bufferStrategy: new JsBufferStrategy(),
     createTraceRoot,
+  };
+}
+
+export function createScenarioTracer(runtime: ScenarioRuntime): ScenarioTracer {
+  return new TestTracer(scenarioContext, {
+    bufferStrategy: runtime.bufferStrategy,
+    createTraceRoot: runtime.createTraceRoot,
   });
 }
 
@@ -138,8 +154,8 @@ function assertDeepEqual(actual: unknown, expected: unknown, label: string): voi
   }
 }
 
-export function generateCanonicalSemanticSnapshot(createTraceRoot: TraceRootFactory<typeof scenarioSchema>): string {
-  const tracer = createScenarioTracer(createTraceRoot);
+export function generateCanonicalSemanticSnapshot(runtime: ScenarioRuntime): string {
+  const tracer = createScenarioTracer(runtime);
   resetScenarioBufferStats();
 
   const result = executeScenario(tracer);
