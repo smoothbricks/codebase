@@ -22,16 +22,16 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_gateway::{
     ArrowAuditConfig, ArrowAuditSink, AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus,
-    AuthorizedTarget, CanonicalTarget, ConnectError, CredentialError, CredentialProtocol,
-    CredentialProvider, CredentialQuery, CredentialRecord, EgressGrant, Gateway, GatewayConfig,
-    GatewayError, GatewayTimeouts, HostPattern, MirrorCacheConfig, MirrorCacheStatus,
-    NegotiatedTransport, UpstreamConnection, UpstreamConnector, UpstreamHealth, UpstreamPurpose,
-    WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
+    AuthorizedTarget, CanonicalTarget, ConnectError, CredentialError, CredentialProvider,
+    CredentialQuery, CredentialRecord, EgressGrant, Gateway, GatewayConfig, GatewayError,
+    GatewayTimeouts, HostPattern, MirrorCacheConfig, MirrorCacheStatus, NegotiatedTransport,
+    UpstreamConnection, UpstreamConnector, UpstreamHealth, UpstreamPurpose, WorkspaceCa,
+    WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 #[cfg(target_os = "macos")]
 use cowshed_gateway::{
-    ControlError, ControlFailureCode, GatewayControlClient, GatewayLimits, MirrorProtocol,
-    MirrorRoute,
+    ControlError, ControlFailureCode, CredentialProtocol, GatewayControlClient, GatewayLimits,
+    MirrorProtocol, MirrorRoute,
 };
 #[cfg(target_os = "macos")]
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Version, header};
