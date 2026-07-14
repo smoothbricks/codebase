@@ -488,6 +488,7 @@ struct SessionState {
     queued: usize,
     accept_stop: watch::Sender<bool>,
     connection_stop: watch::Sender<bool>,
+    audit_stop: watch::Sender<bool>,
     listener_task: JoinHandle<()>,
 }
 
@@ -495,6 +496,7 @@ impl SessionState {
     async fn quiesce(&mut self) {
         let _ = self.accept_stop.send(true);
         let _ = self.connection_stop.send(true);
+        let _ = self.audit_stop.send(true);
         let _ = (&mut self.listener_task).await;
         unlink_endpoint(&self.endpoint);
     }
@@ -737,11 +739,13 @@ impl Actor {
         let endpoint_label = endpoint_label(&session.endpoint);
         let (accept_stop, accept_rx) = watch::channel(false);
         let (connection_stop, connection_rx) = watch::channel(false);
+        let (audit_stop, audit_rx) = watch::channel(false);
         let listener_task = self.spawn_listener(
             workspace_id.clone(),
             listener,
             accept_rx,
             connection_rx.clone(),
+            audit_rx.clone(),
         );
         let revision = session.revision;
         self.sessions.insert(
@@ -759,6 +763,7 @@ impl Actor {
                 queued: 0,
                 accept_stop,
                 connection_stop,
+                audit_stop,
                 listener_task,
             },
         );
@@ -797,6 +802,7 @@ impl Actor {
         listener: BoundListener,
         accept_rx: watch::Receiver<bool>,
         connection_rx: watch::Receiver<bool>,
+        audit_rx: watch::Receiver<bool>,
     ) -> JoinHandle<()> {
         let context = proxy::AcceptContext {
             workspace_id,
@@ -805,12 +811,14 @@ impl Actor {
             connector: Arc::clone(&self.connector),
             timeouts: self.config.timeouts,
             connection_stop: connection_rx.clone(),
+            audit_stop: audit_rx.clone(),
         };
         tokio::spawn(proxy::accept_loop(
             listener,
             context,
             accept_rx,
             connection_rx,
+            audit_rx,
         ))
     }
 
@@ -822,14 +830,17 @@ impl Actor {
     ) {
         let (accept_stop, accept_rx) = watch::channel(false);
         let (connection_stop, connection_rx) = watch::channel(false);
+        let (audit_stop, audit_rx) = watch::channel(false);
         let listener_task = self.spawn_listener(
             workspace_id.to_owned(),
             listener,
             accept_rx,
             connection_rx.clone(),
+            audit_rx.clone(),
         );
         session.accept_stop = accept_stop;
         session.connection_stop = connection_stop;
+        session.audit_stop = audit_stop;
         session.listener_task = listener_task;
     }
 
@@ -1235,7 +1246,7 @@ impl Actor {
         self.draining = true;
         for session in self.sessions.values() {
             let _ = session.accept_stop.send(true);
-            let _ = session.connection_stop.send(true);
+            let _ = session.audit_stop.send(true);
         }
         while let Some(mut pending) = self.queue.pop_front() {
             if let Some(session) = self.sessions.get_mut(&pending.seed.workspace_id) {
