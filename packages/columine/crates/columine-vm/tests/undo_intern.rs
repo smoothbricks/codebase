@@ -440,7 +440,7 @@ proptest! {
     /// The 24-byte wire format round-trips arbitrary entries.
     #[test]
     fn flat_undo_entry_wire_round_trip(
-        op_byte in 1u8..=13,
+        op_byte in 1u8..=15,
         slot in prop::num::u8::ANY,
         pad1 in prop::num::u8::ANY,
         pad2 in prop::num::u8::ANY,
@@ -450,7 +450,7 @@ proptest! {
     ) {
         let mut probe = [0u8; FLAT_UNDO_ENTRY_SIZE as usize];
         probe[0] = op_byte;
-        let op = FlatUndoEntry::read_from(&probe).expect("1..=13 are valid ops").op;
+        let op = FlatUndoEntry::read_from(&probe).expect("1..=15 are valid ops").op;
         let entry = FlatUndoEntry { op, slot, pad1, pad2, key, prev_value, aux };
         let mut buf = [0u8; FLAT_UNDO_ENTRY_SIZE as usize];
         entry.write_to(&mut buf);
