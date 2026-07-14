@@ -1,42 +1,60 @@
+#[cfg(target_os = "macos")]
 use std::{
     collections::BTreeSet,
     convert::Infallible,
+    pin::Pin,
+    sync::atomic::AtomicU16,
+    task::{Context, Poll},
+    time::Instant,
+};
+use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicU16, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
-    task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use async_trait::async_trait;
+#[cfg(target_os = "macos")]
 use bytes::Bytes;
 use cowshed_gateway::{
     ArrowAuditConfig, ArrowAuditSink, AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus,
-    AuthorizedTarget, CanonicalTarget, ConnectError, ControlError, ControlFailureCode,
-    CredentialError, CredentialProtocol, CredentialProvider, CredentialQuery, CredentialRecord,
-    EgressGrant, Gateway, GatewayConfig, GatewayControlClient, GatewayError, GatewayLimits,
-    GatewayTimeouts, HostPattern, MirrorCacheConfig, MirrorCacheStatus, MirrorProtocol,
-    MirrorRoute, NegotiatedTransport, UpstreamConnection, UpstreamConnector, UpstreamHealth,
-    UpstreamPurpose, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession,
-    WorkspaceToken,
+    AuthorizedTarget, CanonicalTarget, ConnectError, CredentialError, CredentialProtocol,
+    CredentialProvider, CredentialQuery, CredentialRecord, EgressGrant, Gateway, GatewayConfig,
+    GatewayError, GatewayTimeouts, HostPattern, MirrorCacheConfig, MirrorCacheStatus,
+    NegotiatedTransport, UpstreamConnection, UpstreamConnector, UpstreamHealth, UpstreamPurpose,
+    WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
+#[cfg(target_os = "macos")]
+use cowshed_gateway::{
+    ControlError, ControlFailureCode, GatewayControlClient, GatewayLimits, MirrorProtocol,
+    MirrorRoute,
+};
+#[cfg(target_os = "macos")]
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Version, header};
+#[cfg(target_os = "macos")]
 use http_body::{Body, Frame, SizeHint};
+#[cfg(target_os = "macos")]
 use http_body_util::{BodyExt as _, Empty, Full};
+#[cfg(target_os = "macos")]
 use hyper::{
     client::conn::http2 as client_http2,
     server::conn::{http1 as server_http1, http2 as server_http2},
     service::service_fn,
 };
+#[cfg(target_os = "macos")]
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+#[cfg(target_os = "macos")]
+use rcgen::Issuer;
+use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+use rustls::pki_types::CertificateDer;
+#[cfg(target_os = "macos")]
 use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
-    pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName},
+    pki_types::{PrivatePkcs8KeyDer, ServerName},
 };
 #[cfg(target_os = "linux")]
 use std::{path::PathBuf, sync::LazyLock};
@@ -49,7 +67,9 @@ use tokio::{
     task::JoinHandle,
     time::timeout,
 };
+#[cfg(target_os = "macos")]
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+#[cfg(target_os = "macos")]
 use zeroize::Zeroizing;
 
 #[cfg(target_os = "linux")]
@@ -77,9 +97,11 @@ impl CredentialProvider for NoCredentials {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct FailingCredentials;
 
+#[cfg(target_os = "macos")]
 #[async_trait]
 impl CredentialProvider for FailingCredentials {
     async fn lookup(
@@ -104,9 +126,11 @@ impl AuditSink for DiscardAudit {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct FailingAudit;
 
+#[cfg(target_os = "macos")]
 #[async_trait]
 impl AuditSink for FailingAudit {
     async fn record(&self, _event: AuditEvent) -> Result<(), AuditError> {
@@ -200,11 +224,13 @@ impl UpstreamConnector for VerifiedTlsConnector {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Clone, Debug)]
 struct CountingFailConnector {
     calls: Arc<AtomicUsize>,
 }
 
+#[cfg(target_os = "macos")]
 #[async_trait]
 impl UpstreamConnector for CountingFailConnector {
     async fn health(&self, _target: &CanonicalTarget) -> UpstreamHealth {
@@ -223,12 +249,14 @@ impl UpstreamConnector for CountingFailConnector {
     }
 }
 
+#[cfg(target_os = "macos")]
 struct FixedCredential {
     repo_id: String,
     origin: String,
     value: String,
 }
 
+#[cfg(target_os = "macos")]
 #[async_trait]
 impl CredentialProvider for FixedCredential {
     async fn lookup(
@@ -247,8 +275,10 @@ impl CredentialProvider for FixedCredential {
     }
 }
 
+#[cfg(target_os = "macos")]
 struct ChannelAudit(mpsc::Sender<AuditEvent>);
 
+#[cfg(target_os = "macos")]
 #[async_trait]
 impl AuditSink for ChannelAudit {
     async fn record(&self, event: AuditEvent) -> Result<(), AuditError> {
@@ -683,6 +713,7 @@ async fn read_headers(stream: &mut TcpStream) -> String {
     String::from_utf8(bytes).expect("HTTP fixture is UTF-8")
 }
 
+#[cfg(target_os = "macos")]
 async fn proxy_request(endpoint: SocketAddr, request: String) -> String {
     let mut stream = TcpStream::connect(endpoint).await.expect("connect gateway");
     stream
@@ -697,6 +728,7 @@ async fn proxy_request(endpoint: SocketAddr, request: String) -> String {
     String::from_utf8(response).expect("HTTP response is UTF-8")
 }
 
+#[cfg(target_os = "macos")]
 async fn await_reclaimed(gateway: &Gateway) {
     timeout(Duration::from_secs(1), async {
         loop {
@@ -711,6 +743,7 @@ async fn await_reclaimed(gateway: &Gateway) {
     .expect("gateway capacity was not reclaimed");
 }
 
+#[cfg(target_os = "macos")]
 async fn opaque_payload(
     endpoint: SocketAddr,
     token: &str,
@@ -749,6 +782,7 @@ fn absolute_request(host: &str, port: u16, token: &str, path: &str) -> String {
     )
 }
 
+#[cfg(target_os = "macos")]
 async fn read_response_head(stream: &mut TcpStream) -> String {
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
