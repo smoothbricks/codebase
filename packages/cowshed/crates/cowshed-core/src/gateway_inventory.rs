@@ -78,6 +78,8 @@ pub enum GatewayInventoryError {
     },
     #[error("repository identity {0} occurs more than once in the store hierarchy")]
     DuplicateRepository(RepoId),
+    #[error("macOS port block base {0} is assigned to more than one workspace")]
+    DuplicatePortBlock(u16),
     #[error("gateway inventory has duplicate or ambiguous mount fact for {0}")]
     AmbiguousMount(String),
     #[error("gateway inventory metadata is invalid at {path}: {message}")]
@@ -213,6 +215,45 @@ impl NativeGatewayInventory {
         })
         .await
         .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
+    }
+    pub async fn all_reserved_port_bases(&self) -> Result<BTreeSet<u16>, GatewayInventoryError> {
+        let inventory = self.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            inventory.all_reserved_port_bases_blocking()
+        })
+        .await
+        .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
+    }
+
+    fn all_reserved_port_bases_blocking(&self) -> Result<BTreeSet<u16>, GatewayInventoryError> {
+        let repositories = discover_repositories(self.storage.store())?;
+        let mut bases = BTreeSet::new();
+        for repo in repositories {
+            let authoritative = self.source.project_facts(&self.storage, &repo)?;
+            let layout = StorageLayout::new(self.storage.store(), &repo).map_err(|error| {
+                GatewayInventoryError::InvalidMetadata {
+                    path: self.storage.store().to_owned(),
+                    message: error.to_string(),
+                }
+            })?;
+            for fact in authoritative.storage {
+                let image = canonical_image_paths(&layout, &fact.workspace)?;
+                let metadata =
+                    read_current_metadata(self.storage.store(), image.image(), &fact.workspace)?;
+                let base = metadata
+                    .grants
+                    .port_block
+                    .ok_or_else(|| GatewayInventoryError::MissingPortBlock {
+                        repo: repo.clone(),
+                        workspace: fact.workspace.name().clone(),
+                    })?
+                    .base();
+                if !bases.insert(base) {
+                    return Err(GatewayInventoryError::DuplicatePortBlock(base));
+                }
+            }
+        }
+        Ok(bases)
     }
 
     fn all_attached_blocking(&self) -> Result<Vec<GatewaySessionFact>, GatewayInventoryError> {
@@ -920,6 +961,14 @@ mod tests {
         let rendered = format!("{facts:?}");
         assert!(!rendered.contains(facts[0].credentials.token()));
         assert!(!rendered.contains("BEGIN PRIVATE KEY"));
+        let error = inventory
+            .all_reserved_port_bases()
+            .await
+            .expect_err("duplicate global port assignment");
+        assert!(matches!(
+            error,
+            GatewayInventoryError::DuplicatePortBlock(40_960)
+        ));
     }
 
     #[tokio::test]

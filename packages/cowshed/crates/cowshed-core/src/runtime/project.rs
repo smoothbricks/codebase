@@ -1258,6 +1258,61 @@ struct NativeProjectRuntimeHost {
 }
 
 #[cfg(target_os = "macos")]
+struct PortGrantReservation {
+    grants: GrantSet,
+    marker: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for PortGrantReservation {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.marker);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 does not deliver a signal; it only asks the kernel whether the PID exists.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(target_os = "macos")]
+fn claim_port_block(staging: &Path, base: u16) -> std::io::Result<Option<PathBuf>> {
+    use std::os::unix::fs::symlink;
+
+    std::fs::create_dir_all(staging)?;
+    let marker = staging.join(format!("port-{base}.reservation"));
+    let owner = std::process::id().to_string();
+    for _ in 0..2 {
+        match symlink(&owner, &marker) {
+            Ok(()) => return Ok(Some(marker)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = std::fs::read_link(&marker)?;
+                let existing = existing
+                    .to_str()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("invalid port reservation marker {}", marker.display()),
+                        )
+                    })?;
+                if process_is_alive(existing) {
+                    return Ok(None);
+                }
+                std::fs::remove_file(&marker)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
 fn verified_recovery_facts<'a>(
     facts: &'a [crate::storage::lifecycle::StorageFact],
     pending: &[crate::storage::apfs::PendingPublicationFact],
@@ -1925,32 +1980,43 @@ impl NativeProjectRuntimeHost {
         }
     }
 
-    async fn fresh_grants(&self) -> Result<GrantSet> {
-        let used = self
-            .authoritative()
-            .await?
-            .into_iter()
-            .filter_map(|workspace| {
-                workspace
-                    .metadata
-                    .grants
-                    .port_block
-                    .map(|block| block.base())
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        for base in (49_152_u16..=65_520_u16).step_by(usize::from(crate::metadata::PORT_BLOCK_SIZE))
+    async fn fresh_grants(&self) -> Result<PortGrantReservation> {
+        let roots = crate::storage::bootstrap::CanonicalRoots::for_home(&self.home)
+            .map_err(native_integrity_error)?;
+        // NativeProjectRuntimeHost is created only after ExistingOnly/Provision bootstrap has
+        // validated these exact roots; preserve that capability while enumerating every repo.
+        let storage = crate::storage::bootstrap::ValidatedHostStorage::new(roots);
+        let reservation_root = storage.store().join(".staging");
+        let used = crate::gateway_inventory::NativeGatewayInventory::new(storage)
+            .all_reserved_port_bases()
+            .await
+            .map_err(native_integrity_error)?;
+        for base in (crate::metadata::MACOS_PORT_BLOCK_MIN
+            ..=crate::metadata::MACOS_PORT_BLOCK_LAST_BASE)
+            .step_by(usize::from(crate::metadata::PORT_BLOCK_SIZE))
         {
-            if !used.contains(&base) {
-                return GrantSet::closed_baseline(Some(
-                    crate::metadata::PortBlock::new(base, crate::metadata::PORT_BLOCK_SIZE)
-                        .map_err(native_integrity_error)?,
-                ))
-                .map_err(native_integrity_error);
+            if used.contains(&base) {
+                continue;
             }
+            let Some(marker) = claim_port_block(&reservation_root, base).map_err(|error| {
+                CowshedError::internal(format!(
+                    "claim macOS port block {base} at {}: {error}",
+                    reservation_root.display()
+                ))
+            })?
+            else {
+                continue;
+            };
+            let grants = GrantSet::closed_baseline(Some(
+                crate::metadata::PortBlock::new(base, crate::metadata::PORT_BLOCK_SIZE)
+                    .map_err(native_integrity_error)?,
+            ))
+            .map_err(native_integrity_error)?;
+            return Ok(PortGrantReservation { grants, marker });
         }
         Err(CowshedError::conflict(
             "no macOS workspace port block remains",
-            "remove an unused workspace or reassign its slot",
+            "remove an unused workspace",
         ))
     }
 
@@ -2195,7 +2261,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         )
         .await?;
 
-        let mut grants = self.fresh_grants().await?;
+        let reservation = self.fresh_grants().await?;
+        let mut grants = reservation.grants.clone();
         grants.revision = 0;
         let identity = self
             .operation_identity(grants, self.git.current_branch().await?, None)
@@ -2264,9 +2331,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .clone()
             .unwrap_or_else(|| WorkspaceName::new("main").expect("fixed main"));
         let source = self.current(&source_name).await?;
+        let reservation = self.fresh_grants().await?;
         let identity = self
             .operation_identity(
-                self.fresh_grants().await?,
+                reservation.grants.clone(),
                 Some(format!("cowshed/{workspace}")),
                 None,
             )
@@ -2395,9 +2463,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 "choose another workspace name",
             ));
         }
+        let reservation = self.fresh_grants().await?;
         let identity = self
             .operation_identity(
-                self.fresh_grants().await?,
+                reservation.grants.clone(),
                 Some(format!("cowshed/{destination}")),
                 Some(source.clone()),
             )
@@ -4636,5 +4705,52 @@ mod binding_tests {
         );
         drop(commitments);
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod port_reservation_tests {
+    use super::claim_port_block;
+    use std::os::unix::fs::symlink;
+
+    fn root(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "cowshed-port-reservation-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn live_reservation_excludes_a_second_allocator_until_release() {
+        let root = root("live");
+        let first = claim_port_block(&root, 40_960)
+            .expect("first claim")
+            .expect("reservation");
+        assert!(
+            claim_port_block(&root, 40_960)
+                .expect("second claim")
+                .is_none()
+        );
+        std::fs::remove_file(first).expect("release");
+        assert!(
+            claim_port_block(&root, 40_960)
+                .expect("claim after release")
+                .is_some()
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn dead_process_reservation_is_reclaimed() {
+        let root = root("stale");
+        std::fs::create_dir_all(&root).expect("root");
+        let marker = root.join("port-40960.reservation");
+        symlink(i32::MAX.to_string(), &marker).expect("stale marker");
+        assert!(claim_port_block(&root, 40_960).expect("reclaim").is_some());
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 }
