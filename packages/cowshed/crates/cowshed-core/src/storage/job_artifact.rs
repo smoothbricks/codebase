@@ -3641,6 +3641,7 @@ impl CommitmentPriorContext {
         self.last_order
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn admitted_lifecycle_incarnations(
         &self,
         repo_id: &RepoId,
@@ -3651,6 +3652,7 @@ impl CommitmentPriorContext {
             .unwrap_or_default()
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn is_introduced(
         &self,
         repo_id: &RepoId,
@@ -3661,6 +3663,7 @@ impl CommitmentPriorContext {
             .is_some_and(|repository| repository.introduced_incarnations.contains(incarnation))
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn is_retired(&self, repo_id: &RepoId, incarnation: &WorkspaceIncarnation) -> bool {
         self.repositories
             .get(repo_id)
