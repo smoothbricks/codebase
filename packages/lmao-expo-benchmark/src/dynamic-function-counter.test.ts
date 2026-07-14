@@ -2,13 +2,14 @@ import { describe, expect, it } from 'bun:test';
 import { createTraceRoot } from '@smoothbricks/lmao/node';
 
 import { runPlatformScenario } from '../../lmao/benchmarks/plugin-scenario/platform.js';
+import { createJsScenarioRuntime } from '../../lmao/benchmarks/plugin-scenario/scenario.js';
 import { observeDynamicFunctionCalls } from './dynamic-function-counter.js';
 
 const COMMON_OPTIONS = {
+  ...createJsScenarioRuntime(createTraceRoot),
   platform: 'test-platform',
   engine: 'test-engine',
   variant: 'test-variant',
-  createTraceRoot,
   now: () => 0,
 };
 

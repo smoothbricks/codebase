@@ -26,19 +26,21 @@ async function executePlatformScenario(): Promise<string> {
   const now = () => performance.now();
 
   try {
-    // This outer timestamp is the only meaningful static-import boundary: the imported
-    // modules evaluate their complete dependency graph before either promise resolves.
-    // Cold runs require a fresh page/process; async web import and synchronous Hermes
-    // require are intentionally compared only within their own engine.
+    // Module initialization includes the selected platform backend. Web compiles and
+    // instantiates the WASM allocator here; native loads the JavaScript trace root.
+    // Cold runs require a fresh page/process, so compare startup only within one engine.
     const moduleInitializationStartedAt = now();
-    const [{ createTraceRoot }, { runPlatformScenario }] = await Promise.all([
-      import('@smoothbricks/lmao/es'),
+    const platformRuntimeModule =
+      runtime.platform === 'web' ? import('./src/platform-runtime.web') : import('./src/platform-runtime.native');
+    const [{ runPlatformScenario }, { createPlatformRuntime, runPlatformSuperblockBenchmark }] = await Promise.all([
       import('../lmao/benchmarks/plugin-scenario/platform'),
+      platformRuntimeModule,
     ]);
+    const scenarioRuntime = await createPlatformRuntime();
     const moduleInitializationMs = now() - moduleInitializationStartedAt;
     const result = runPlatformScenario({
       now,
-      createTraceRoot,
+      ...scenarioRuntime,
       platform: runtime.platform,
       engine: runtime.engine,
       variant: getTransformVariant(),
@@ -46,8 +48,14 @@ async function executePlatformScenario(): Promise<string> {
       ...(mode === 'cold' ? { moduleInitializationMs } : {}),
       ...(functionCounter === undefined ? {} : { getDynamicFunctionCallCount: functionCounter.readForScenario }),
     });
+    const superblockResult = mode === 'steady' ? runPlatformSuperblockBenchmark(scenarioRuntime) : undefined;
     const resultJson = JSON.stringify(result);
     console.log(`LMAO_BENCH_RESULT ${resultJson}`);
+    if (superblockResult !== undefined) {
+      const superblockJson = JSON.stringify(superblockResult);
+      console.log(`LMAO_SUPERBLOCK_RESULT ${superblockJson}`);
+      return `${resultJson}\nLMAO_SUPERBLOCK_RESULT ${superblockJson}`;
+    }
     return resultJson;
   } finally {
     functionCounter?.restore();
@@ -73,7 +81,7 @@ export default function App() {
       },
       (error: unknown) => {
         if (mounted) {
-          const errorText = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+          const errorText = error instanceof Error ? (error.stack ?? `${error.name}: ${error.message}`) : String(error);
           setResultText(`LMAO benchmark failed\n${errorText}`);
         }
       },
