@@ -50,7 +50,7 @@
           "^build"
         ],
         "options": {
-          "command": "bun test --timeout=30000 src ../lmao/benchmarks/plugin-scenario/platform.test.ts",
+          "command": "bun test --timeout=30000 src",
           "cwd": "{projectRoot}",
           "timeoutMs": 600000,
           "killAfterMs": 10000
