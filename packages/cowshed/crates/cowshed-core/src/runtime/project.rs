@@ -1783,6 +1783,10 @@ impl NativeProjectRuntimeHost {
                 self.telemetry_root.clone(),
             ],
         };
+        let admitted_historical_incarnations = self
+            .commitments
+            .admitted_lifecycle_incarnations(self.descriptor.repo_id.clone())
+            .await?;
         let config = super::supervisor::WorkspaceSupervisorConfig {
             authority: super::supervisor::WorkspaceAuthoritySnapshot {
                 repo_id: self.descriptor.repo_id.clone(),
@@ -1794,7 +1798,10 @@ impl NativeProjectRuntimeHost {
             workspace_root: mount,
             default_cwd: None,
             sandbox,
-            artifacts: crate::storage::job_artifact::ArtifactConfig::default(),
+            artifacts: crate::storage::job_artifact::ArtifactConfig {
+                admitted_historical_incarnations,
+                ..crate::storage::job_artifact::ArtifactConfig::default()
+            },
             term_grace: std::time::Duration::from_secs(2),
             actor_capacity: ROUTER_CAPACITY,
             event_capacity: ROUTER_CAPACITY,

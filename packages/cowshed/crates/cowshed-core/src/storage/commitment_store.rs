@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, OsString};
 use std::fmt;
 use std::fs::{self, File};
@@ -177,6 +177,13 @@ impl CommitmentStore {
         incarnation: &WorkspaceIncarnation,
     ) -> bool {
         self.context.is_retired(repo_id, incarnation)
+    }
+
+    pub(crate) fn admitted_lifecycle_incarnations(
+        &self,
+        repo_id: &RepoId,
+    ) -> BTreeSet<WorkspaceIncarnation> {
+        self.context.admitted_lifecycle_incarnations(repo_id)
     }
 
     pub fn refresh(&mut self) -> Result<(), CommitmentStoreError> {

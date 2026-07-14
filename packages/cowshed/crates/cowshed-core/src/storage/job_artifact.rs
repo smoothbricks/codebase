@@ -3614,6 +3614,16 @@ impl CommitmentPriorContext {
         self.last_order
     }
 
+    pub(crate) fn admitted_lifecycle_incarnations(
+        &self,
+        repo_id: &RepoId,
+    ) -> BTreeSet<WorkspaceIncarnation> {
+        self.repositories
+            .get(repo_id)
+            .map(|repository| repository.introduced_incarnations.clone())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn is_introduced(
         &self,
         repo_id: &RepoId,
