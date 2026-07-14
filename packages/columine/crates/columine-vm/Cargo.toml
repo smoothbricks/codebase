@@ -1,0 +1,19 @@
+[package]
+name = "columine-vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+columine-types = { workspace = true }
+
+[dev-dependencies]
+# Differential oracle for the minroar module only — must never re-enter the
+# shipped artifact (it costs 35K of the reducer_vm.wasm size budget).
+roaring = { workspace = true }
+proptest = { workspace = true }
