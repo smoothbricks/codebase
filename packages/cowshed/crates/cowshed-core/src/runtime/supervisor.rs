@@ -787,6 +787,68 @@ impl CommitmentSink for CommitmentPublisherHandle {
     }
 }
 
+fn sandbox_path(sandbox: &SandboxConfig) -> Result<OsString> {
+    let mut paths = vec![sandbox.workspace_mount.join(".cowshed/bin")];
+    let mut seen = paths.iter().cloned().collect::<BTreeSet<_>>();
+    if let Some(path) = developer_directory().map(|directory| directory.join("usr/bin"))
+        && seen.insert(path.clone())
+    {
+        paths.push(path);
+    }
+    for fixed in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+        let path = PathBuf::from(fixed);
+        seen.insert(path.clone());
+        paths.push(path);
+    }
+    if let Some(inherited) = std::env::var_os("PATH") {
+        for path in std::env::split_paths(&inherited) {
+            let admitted = path.is_absolute()
+                && [
+                    Path::new("/nix/store"),
+                    Path::new("/run/current-system"),
+                    Path::new("/opt"),
+                    Path::new("/System"),
+                    Path::new("/Library"),
+                ]
+                .iter()
+                .any(|root| path.starts_with(root));
+            if admitted && seen.insert(path.clone()) {
+                paths.push(path);
+            }
+        }
+    }
+    std::env::join_paths(paths)
+        .map_err(|error| CowshedError::internal(format!("construct sandbox PATH: {error}")))
+}
+
+fn developer_directory() -> Option<PathBuf> {
+    let configured = std::env::var_os("DEVELOPER_DIR").map(PathBuf::from);
+    configured
+        .into_iter()
+        .chain([
+            PathBuf::from("/Applications/Xcode.app/Contents/Developer"),
+            PathBuf::from("/Library/Developer/CommandLineTools"),
+        ])
+        .find(|path| {
+            path.is_absolute()
+                && path.is_dir()
+                && [
+                    Path::new("/Applications"),
+                    Path::new("/Library/Developer"),
+                    Path::new("/System"),
+                ]
+                .iter()
+                .any(|root| path.starts_with(root))
+        })
+}
+
+fn valid_workspace_token(token: &str) -> bool {
+    token.len() == 43
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemSpawnSink;
 
@@ -823,15 +885,80 @@ impl SpawnSink for SystemSpawnSink {
             ));
         }
 
+        let private_root = request.sandbox.workspace_mount.join(".cowshed");
+        let private_home = private_root.join("home");
+        let private_config = private_root.join("config");
+        let private_cache = private_root.join("cache");
+        for directory in [&private_home, &private_config, &private_cache] {
+            tokio::fs::create_dir_all(directory)
+                .await
+                .map_err(|error| {
+                    CowshedError::environment_missing(
+                        format!(
+                            "cannot prepare sandbox environment directory {}: {error}",
+                            directory.display()
+                        ),
+                        "reattach the workspace and retry",
+                    )
+                })?;
+        }
+        let token_path = request
+            .sandbox
+            .workspace_mount
+            .join(crate::workspace_credentials::WORKSPACE_TOKEN_PATH);
+        let workspace_token = tokio::fs::read_to_string(&token_path)
+            .await
+            .map_err(|error| {
+                CowshedError::integrity(
+                    format!(
+                        "cannot read workspace token {}: {error}",
+                        token_path.display()
+                    ),
+                    "reattach the workspace to mint fresh credentials",
+                )
+            })?;
+        if !valid_workspace_token(&workspace_token) {
+            return Err(CowshedError::integrity(
+                format!("workspace token is malformed at {}", token_path.display()),
+                "reattach the workspace to mint fresh credentials",
+            ));
+        }
+        let path = sandbox_path(&request.sandbox)?;
+        let port_base = request.sandbox.port_block.base().to_string();
+        let gateway_http = format!("http://127.0.0.1:{port_base}");
+
         let mut command = tokio::process::Command::new(&plan.program);
         command
+            .env_clear()
             .args(&plan.args)
             .current_dir(&plan.cwd)
             .envs(&request.env)
+            .env("PATH", path)
+            .env("HOME", &private_home)
+            .env("XDG_CONFIG_HOME", &private_config)
+            .env("XDG_CACHE_HOME", &private_cache)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("TMPDIR", &request.sandbox.exec_temp_dir)
+            .env("PWD", &plan.cwd)
+            .env("COWSHED_PORT_BASE", &port_base)
+            .env("COWSHED_WORKSPACE_TOKEN", workspace_token)
+            .env("HTTP_PROXY", &gateway_http)
+            .env("HTTPS_PROXY", &gateway_http)
+            .env("http_proxy", &gateway_http)
+            .env("https_proxy", &gateway_http)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(false);
+        for key in ["LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        if let Some(directory) = developer_directory() {
+            command.env("DEVELOPER_DIR", directory);
+        }
         prepare_child_descriptors(command.as_std_mut()).map_err(map_spawn_failure)?;
         unsafe {
             command.pre_exec(|| {
