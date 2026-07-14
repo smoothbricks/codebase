@@ -6,7 +6,7 @@ use crate::launchd::{
 use crate::output::Output;
 use async_trait::async_trait;
 use cowshed_core::api::{EmptyResult, GatewayStatus as CliGatewayStatus};
-use cowshed_core::metadata::{EgressMode as CoreEgressMode, GrantSet};
+use cowshed_core::metadata::{EgressMode as CoreEgressMode, GrantSet, WorkspaceIncarnation};
 use cowshed_core::repository::RepoId;
 use cowshed_core::{
     CowshedError, GatewaySessionFact, NativeGatewayInventory, Result, ValidatedHostStorage,
@@ -201,12 +201,20 @@ pub fn project_session_prefix(repo_id: &RepoId) -> String {
     format!("p{}.", hex_prefix(&digest, 16))
 }
 
-pub fn stable_workspace_id(repo_id: &RepoId, workspace: &str) -> String {
+/// Stable for one workspace incarnation. Restore and re-adopt rotate the identity so the gateway's
+/// replay-protection tombstone cannot reject a legitimate lifecycle reset.
+pub fn stable_workspace_id(
+    repo_id: &RepoId,
+    workspace: &str,
+    incarnation: &WorkspaceIncarnation,
+) -> String {
     let prefix = project_session_prefix(repo_id);
     let mut hasher = Sha256::new();
     hasher.update(repo_id.as_str().as_bytes());
     hasher.update([0]);
     hasher.update(workspace.as_bytes());
+    hasher.update([0]);
+    hasher.update(incarnation.as_str().as_bytes());
     let digest = hasher.finalize();
     format!("{prefix}w{}", hex_prefix(&digest, 16))
 }
@@ -296,7 +304,11 @@ pub fn session_from_fact(fact: GatewaySessionFact) -> Result<WorkspaceSession> {
         )
     })?;
     let session = WorkspaceSession {
-        workspace_id: stable_workspace_id(&fact.repo_id, fact.workspace.as_str()),
+        workspace_id: stable_workspace_id(
+            &fact.repo_id,
+            fact.workspace.as_str(),
+            &fact.incarnation,
+        ),
         repo_id: fact.repo_id.as_str().to_owned(),
         revision: fact.revision,
         endpoint: WorkspaceEndpoint::Tcp(endpoint),
@@ -362,20 +374,6 @@ pub async fn reconcile_against_status<C: GatewayControl + ?Sized>(
         .map(|session| (session.workspace_id.as_str(), session))
         .collect();
     let mut report = ReconcileReport::default();
-    for (identity, session) in &desired_by_id {
-        let unchanged = installed_by_id
-            .get(identity.as_str())
-            .is_some_and(|installed| installed.revision == session.revision);
-        if !unchanged {
-            control.install(session).await.map_err(|error| {
-                CowshedError::internal(format!(
-                    "could not install gateway session {identity}: {error}"
-                ))
-            })?;
-            report.installed += 1;
-        }
-    }
-
     let desired_ids: BTreeSet<_> = desired_by_id.keys().map(String::as_str).collect();
     for installed in status
         .sessions
@@ -393,6 +391,19 @@ pub async fn reconcile_against_status<C: GatewayControl + ?Sized>(
                     ))
                 })?;
             report.removed += 1;
+        }
+    }
+    for (identity, session) in &desired_by_id {
+        let unchanged = installed_by_id
+            .get(identity.as_str())
+            .is_some_and(|installed| installed.revision == session.revision);
+        if !unchanged {
+            control.install(session).await.map_err(|error| {
+                CowshedError::internal(format!(
+                    "could not install gateway session {identity}: {error}"
+                ))
+            })?;
+            report.installed += 1;
         }
     }
     Ok(report)

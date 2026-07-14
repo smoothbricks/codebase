@@ -11,7 +11,7 @@ use cowshed_cli::launchd::{
 };
 use cowshed_cli::output::Output;
 use cowshed_core::api::GatewayStatus as CliGatewayStatus;
-use cowshed_core::metadata::{EgressMode, EgressRule, GrantSet};
+use cowshed_core::metadata::{EgressMode, EgressRule, GrantSet, WorkspaceIncarnation};
 use cowshed_core::repository::RepoId;
 use cowshed_core::{CowshedError, Result};
 use cowshed_gateway::{
@@ -25,6 +25,12 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+fn workspace_id(repo: &RepoId, workspace: &str, incarnation: u8) -> String {
+    let incarnation =
+        WorkspaceIncarnation::new(format!("{incarnation:032x}")).expect("fixture incarnation");
+    stable_workspace_id(repo, workspace, &incarnation)
+}
 
 fn session(identity: &str, revision: u64, token_byte: u8) -> WorkspaceSession {
     WorkspaceSession {
@@ -119,13 +125,15 @@ fn gateway_parser_is_strict_and_accepts_status_json_after_action() {
 }
 
 #[tokio::test]
-async fn reconcile_replaces_restore_revision_and_removes_only_stale_project_sessions() {
+async fn reconcile_rotates_workspace_incarnation_and_removes_stale_project_sessions() {
     let repo_a = RepoId::parse("acme/widget").expect("repo A");
     let repo_b = RepoId::parse("other/widget").expect("repo B");
     let prefix_a = project_session_prefix(&repo_a);
-    let current = stable_workspace_id(&repo_a, "raven");
-    let stale = stable_workspace_id(&repo_a, "retired");
-    let sibling = stable_workspace_id(&repo_b, "raven");
+    let current = workspace_id(&repo_a, "raven", 2);
+    let prior = workspace_id(&repo_a, "raven", 1);
+    let stale = workspace_id(&repo_a, "retired", 3);
+    let sibling = workspace_id(&repo_b, "raven", 1);
+    assert_ne!(current, prior);
     let control = FakeControl::default();
 
     let report = reconcile_against_status(
@@ -133,7 +141,7 @@ async fn reconcile_replaces_restore_revision_and_removes_only_stale_project_sess
         &prefix_a,
         vec![session(&current, 8, 9)],
         status(vec![
-            installed(&current, 7),
+            installed(&prior, 7),
             installed(&stale, 3),
             installed(&sibling, 5),
         ]),
@@ -142,21 +150,21 @@ async fn reconcile_replaces_restore_revision_and_removes_only_stale_project_sess
     .expect("reconcile succeeds");
 
     assert_eq!(report.installed, 1);
-    assert_eq!(report.removed, 1);
+    assert_eq!(report.removed, 2);
     assert_eq!(
         *control.installs.lock().expect("install lock"),
         vec![(current, 8)]
     );
     assert_eq!(
         *control.removes.lock().expect("remove lock"),
-        vec![(stale, 3)]
+        vec![(prior, 7), (stale, 3)]
     );
 }
 
 #[tokio::test]
 async fn empty_attached_inventory_removes_detached_session() {
     let repo = RepoId::parse("acme/widget").expect("repo");
-    let identity = stable_workspace_id(&repo, "raven");
+    let identity = workspace_id(&repo, "raven", 1);
     let control = FakeControl::default();
     let report = reconcile_against_status(
         &control,
@@ -177,7 +185,7 @@ async fn empty_attached_inventory_removes_detached_session() {
 #[tokio::test]
 async fn unchanged_revision_is_idempotent() {
     let repo = RepoId::parse("acme/widget").expect("repo");
-    let identity = stable_workspace_id(&repo, "raven");
+    let identity = workspace_id(&repo, "raven", 1);
     let control = FakeControl::default();
     let report = reconcile_against_status(
         &control,
@@ -249,8 +257,8 @@ impl GatewayInstaller for FakeInstaller {
 async fn daemon_restart_restores_every_project_inventory_session() {
     let repo_a = RepoId::parse("acme/widget").expect("repo A");
     let repo_b = RepoId::parse("other/tool").expect("repo B");
-    let a = stable_workspace_id(&repo_a, "main");
-    let b = stable_workspace_id(&repo_b, "raven");
+    let a = workspace_id(&repo_a, "main", 1);
+    let b = workspace_id(&repo_b, "raven", 2);
     let inventory = FakeInventory {
         all: Mutex::new(Some(vec![session(&a, 2, 1), session(&b, 7, 2)])),
     };
