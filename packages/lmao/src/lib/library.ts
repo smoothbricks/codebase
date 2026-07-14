@@ -4,65 +4,34 @@
  * WHY: Libraries need to write clean, domain-focused code (ctx.tag.status(200))
  * while avoiding naming conflicts when composed with other libraries.
  *
- * HOW: At composition time (cold path), we generate remapped SpanLogger classes and
- * immutable Arrow remap descriptors. Child buffers retain canonical schema/layout.
+ * HOW: At composition time (cold path), we create immutable Arrow remap descriptors.
+ * Child buffers retain canonical schema/layout.
  *
  * Per specs/lmao/01e_library_integration_pattern.md:
  * - Libraries define clean schemas without prefixes (status, method, url)
  * - Prefixing happens at composition time (http_status, http_method, http_url)
  * - Zero hot path overhead - remapping is composed at module creation
  *
- * WHAT: This module provides schema/prefix mapping utilities, immutable remap
- * descriptors for cold Arrow conversion, and generated remapped SpanLogger classes.
+ * WHAT: This module provides schema/prefix mapping utilities and immutable remap
+ * descriptors for cold Arrow conversion.
  */
 
 import { isRecord } from '@smoothbricks/validation';
-import type { SpanLoggerImpl } from './codegen/spanLoggerGenerator.js';
 import type { RemapDescriptor, RemappedColumn } from './logBinding.js';
-import {
-  ENTRY_TYPE_DEBUG,
-  ENTRY_TYPE_ERROR,
-  ENTRY_TYPE_INFO,
-  ENTRY_TYPE_TRACE,
-  ENTRY_TYPE_WARN,
-} from './schema/systemSchema.js';
-import { getEnumValues, getSchemaType } from './schema/typeGuards.js';
 import { LogSchema, type SchemaFields } from './schema/types.js';
-import type { AnySpanBuffer } from './types.js';
-
-type RemappedSpanLoggerConstructor<T extends LogSchema = LogSchema> = new (
-  buffer: AnySpanBuffer,
-  createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
-  initialScopedAttributes?: Record<string, unknown>,
-) => SpanLoggerImpl<T>;
 
 function isSchemaField(value: unknown): value is SchemaFields[string] {
   return isRecord(value);
 }
 
-function isRemappedSpanLoggerClass<T extends LogSchema>(value: unknown): value is RemappedSpanLoggerConstructor<T> {
-  if (typeof value !== 'function') {
-    return false;
-  }
-  const prototype = Reflect.get(value, 'prototype');
-  return (
-    typeof prototype === 'object' &&
-    prototype !== null &&
-    typeof Reflect.get(prototype, 'with') === 'function' &&
-    typeof Reflect.get(prototype, 'info') === 'function' &&
-    typeof Reflect.get(prototype, 'error') === 'function'
-  );
-}
-
-//#region smoo/lmao!n/codegen-prefixed-remap
 /**
  * Prefix a tag attribute schema
  * Renames all fields with a prefix to avoid conflicts
  *
  * 01j "Library Compilation (Prefixed)": a library defines clean field names
- * (status, method); the consumer applies a prefix (http) at wire time. This block
- * creates the prefixed schema, clean-to-prefixed mapping, immutable Arrow remap
- * descriptor, and RemappedSpanLogger whose clean methods write to prefixed columns.
+ * (status, method); the consumer applies a prefix (http) at wire time. The utilities
+ * below create the prefixed schema, clean-to-prefixed mapping, and immutable Arrow
+ * remap descriptor.
  *
  * Example:
  * - Input: { status: S.number(), method: S.enum(['GET', 'POST']) }
@@ -103,8 +72,8 @@ export interface PrefixMapping {
 /**
  * Create a mapping from clean field names to prefixed column names
  *
- * WHY: This mapping is used by generateRemappedSpanLoggerClass to create methods
- * that write to prefixed columns but expose clean API names.
+ * WHY: This mapping exposes the relationship between clean library field names and
+ * their prefixed column names.
  *
  * @param schema - Clean schema (LogSchema instance)
  * @param prefix - Prefix to apply (e.g., 'http')
@@ -160,388 +129,3 @@ export function createRemapDescriptor(
     columns: Object.freeze(columns),
   });
 }
-
-/** Cache for generated RemappedSpanLogger classes. */
-const remappedSpanLoggerClassCache = new Map<string, RemappedSpanLoggerConstructor>();
-
-/** Create a stable, order-independent mapping cache key. */
-function createMappingCacheKey(mapping: Record<string, string>): string {
-  const sortedEntries = Object.entries(mapping).sort(([a], [b]) => a.localeCompare(b));
-  return JSON.stringify(sortedEntries);
-}
-
-/** Create a stable cache key from schema and prefix mapping. */
-function createSchemaAndMappingCacheKey(schema: LogSchema, mapping: Record<string, string>): string {
-  const schemaKey = JSON.stringify(schema.fields);
-  const mappingKey = createMappingCacheKey(mapping);
-  return `${schemaKey}:${mappingKey}`;
-}
-
-/**
- * Generate enum value mapping code for remapped class
- * Creates a switch-case statement for compile-time enum mapping
- *
- * WHY: Enums need compile-time mapping to Uint8 values for 1-byte storage
- */
-function generateEnumMapping(fieldName: string, enumValues: readonly string[]): string {
-  const cases = enumValues.map((value, index) => `    case ${JSON.stringify(value)}: return ${index};`).join('\n');
-
-  return `
-  function getEnumIndex_${fieldName}(value) {
-    switch(value) {
-${cases}
-      default: return 0;
-    }
-  }`;
-}
-
-/**
- * Generate attribute writer method for remapped SpanLogger
- *
- * WHY: Each method must write to the PREFIXED column while being called by CLEAN name
- * HOW: Method name is cleanName, but buffer access uses prefixedColumnName
- *
- * @param cleanName - Clean method name (e.g., 'status')
- * @param prefixedColumnName - Prefixed column name (e.g., 'http_status')
- * @param schema - Field schema for type-specific handling
- * @param hasEnumMapping - Whether enum mapping function exists
- */
-function generateRemappedAttributeWriter(
-  cleanName: string,
-  prefixedColumnName: string,
-  schema: unknown,
-  hasEnumMapping: boolean,
-): string {
-  const columnName = prefixedColumnName;
-  const lmaoType = getSchemaType(schema);
-
-  // For enums, use pre-generated mapping function (uses cleanName for function)
-  // Generated code: ALWAYS writes to row 0 (span-start) with overwrite semantics
-  // Maps clean method name to prefixed column, marks value as non-null (bit 0)
-  if (lmaoType === 'enum' && hasEnumMapping) {
-    return `
-    ${cleanName}(value) {
-      const idx = 0;
-      const enumIndex = getEnumIndex_${cleanName}(value);
-      this._buffer.${columnName}_values[idx] = enumIndex;
-      this._buffer.${columnName}_nulls[0] |= 1;
-      return this;
-    }`;
-  }
-
-  // For categories, store strings directly
-  // Generated code: writes to row 0, stores string directly, marks non-null
-  if (lmaoType === 'category') {
-    return `
-    ${cleanName}(value) {
-      const idx = 0;
-      if (value === null || value === undefined) {
-        this._buffer.${columnName}_nulls[0] &= ~1;
-        return this;
-      }
-      this._buffer.${columnName}_values[idx] = value;
-      this._buffer.${columnName}_nulls[0] |= 1;
-      return this;
-    }`;
-  }
-
-  // For text, store strings directly
-  // Generated code: writes to row 0, handles null/undefined by clearing bit and returning early,
-  // stores string directly, marks non-null
-  if (lmaoType === 'text') {
-    return `
-    ${cleanName}(value) {
-      const idx = 0;
-      if (value === null || value === undefined) {
-        this._buffer.${columnName}_nulls[0] &= ~1;
-        return this;
-      }
-      this._buffer.${columnName}_values[idx] = value;
-      this._buffer.${columnName}_nulls[0] |= 1;
-      return this;
-    }`;
-  }
-
-  // Boolean: bit-packed storage (8 values per byte)
-  // Generated code: writes to row 0, bit 0 of byte 0 is index 0,
-  // sets or clears value bit, marks non-null
-  if (lmaoType === 'boolean') {
-    return `
-    ${cleanName}(value) {
-      if (value) {
-        this._buffer.${columnName}_values[0] |= 1;
-      } else {
-        this._buffer.${columnName}_values[0] &= ~1;
-      }
-      this._buffer.${columnName}_nulls[0] |= 1;
-      return this;
-    }`;
-  }
-
-  // Generic writer for other types (number)
-  // Generated code: writes to row 0, direct value assignment, marks non-null
-  return `
-    ${cleanName}(value) {
-      const idx = 0;
-      this._buffer.${columnName}_values[idx] = value;
-      this._buffer.${columnName}_nulls[0] |= 1;
-      return this;
-    }`;
-}
-
-/**
- * Generate a remapped SpanLogger class for library prefix support
- *
- * WHY: Library authors write clean code (ctx.tag.status(200)) but buffers use prefixed
- * columns (http_status). This function generates a class at module creation time
- * (cold path) that exposes clean method names but writes to prefixed columns.
- *
- * HOW: Uses new Function() to generate optimized JavaScript code. The generated class
- * has methods named after clean schema fields but writes to prefixed buffer columns.
- *
- * WHAT: Returns executable JavaScript code string for a SpanLogger class with:
- * - Clean method names (status, method, url)
- * - Writes to prefixed columns (http_status, http_method, http_url)
- * - Full support for enum/category/text type handling
- * - Method chaining support
- *
- * @param cleanSchema - Original clean schema (without prefix)
- * @param prefixMapping - Mapping from clean names to prefixed names
- * @param className - Name for the generated class
- * @returns Executable JavaScript code string
- *
- * @example
- * const code = generateRemappedSpanLoggerClass(
- *   { status: S.number(), method: S.enum(['GET', 'POST']) },
- *   { status: 'http_status', method: 'http_method' },
- *   'HttpSpanLogger'
- * );
- * // Generated class has .status() method that writes to http_status
- */
-export function generateRemappedSpanLoggerClass<T extends LogSchema>(
-  cleanSchema: T,
-  prefixMapping: PrefixMapping,
-  className = 'RemappedSpanLogger',
-): string {
-  // Use LogSchema.fieldEntries() to iterate schema fields
-  const schemaFields = cleanSchema._columns;
-
-  // Generate enum mapping functions (use cleanName for function names)
-  const enumMappings: string[] = [];
-  const enumFieldNames = new Set<string>();
-
-  for (const [fieldName, fieldSchema] of schemaFields) {
-    const lmaoType = getSchemaType(fieldSchema);
-    const enumValues = getEnumValues(fieldSchema);
-
-    if (lmaoType === 'enum' && enumValues) {
-      enumMappings.push(generateEnumMapping(fieldName, enumValues));
-      enumFieldNames.add(fieldName);
-    }
-  }
-
-  // Generate attribute writer methods with remapping
-  const attributeWriters = schemaFields.map(([cleanName, fieldSchema]) => {
-    const prefixedName = prefixMapping[cleanName] || cleanName;
-    return generateRemappedAttributeWriter(cleanName, prefixedName, fieldSchema, enumFieldNames.has(cleanName));
-  });
-
-  // Create schema type map for runtime type detection in scope()
-  const schemaTypeMap = Object.fromEntries(
-    schemaFields.map(([fieldName, fieldSchema]) => {
-      return [fieldName, getSchemaType(fieldSchema) || 'unknown'];
-    }),
-  );
-
-  // Create clean-to-prefixed mapping for with() and scope() methods
-  const prefixMappingJson = JSON.stringify(prefixMapping);
-
-  // Entry type constants (imported from lmao.ts at module level, used here for code gen)
-  // These values are inlined into the generated code string below
-
-  // Generate the complete class
-  // Generated code: IIFE wrapper for clean scope
-  const classCode =
-    `(function() {
-  'use strict';
-  ` +
-    // Generated code: getTimestampNanos - platform-aware timestamp function
-    // Node.js: uses process.hrtime.bigint() for true nanosecond precision
-    // Browser: uses performance.timeOrigin + performance.now() for microsecond precision
-    `const getTimestampNanos = (typeof process !== 'undefined' && process.hrtime)
-    ? (() => {
-        const anchorEpochNanos = BigInt(Date.now()) * 1000000n;
-        const anchorHrtime = process.hrtime.bigint();
-        return () => anchorEpochNanos + (process.hrtime.bigint() - anchorHrtime);
-      })()
-    : () => {
-        const epochMicros = Math.round((performance.timeOrigin + performance.now()) * 1000);
-        return BigInt(epochMicros) * 1000n;
-      };
-  ` +
-    // Generated code: enum mapping functions (getEnumIndex_${fieldName})
-    enumMappings.join('\n') +
-    `
-  ` +
-    // Generated code: SCHEMA_TYPES - maps clean field names to lmao types for runtime type detection
-    `const SCHEMA_TYPES = ${JSON.stringify(schemaTypeMap)};
-  ` +
-    // Generated code: PREFIX_MAPPING - maps clean names to prefixed column names
-    `const PREFIX_MAPPING = ${prefixMappingJson};
-  
-  class ${className} {
-    ` +
-    // Generated code: constructor stores buffer, createOverflowBuffer function, and scoped attributes
-    `constructor(buffer, createOverflowBuffer, initialScopedAttributes = {}) {
-      this._buffer = buffer;
-      this._createOverflowBuffer = createOverflowBuffer;
-      this._scopedAttributes = initialScopedAttributes;
-    }
-    ` +
-    // Generated code: tag getter returns this for chainable API (writes to row 0 = span-start)
-    `get tag() {
-      return this;
-    }
-    ` +
-    // Generated code: with() bulk attribute setting - maps clean names to prefixed columns,
-    // stores values directly (strings stored as-is), marks non-null (bit 0)
-    `with(attributes) {
-      const idx = 0;
-      for (const [cleanKey, value] of Object.entries(attributes)) {
-        const prefixedKey = PREFIX_MAPPING[cleanKey] || cleanKey;
-        const columnName = prefixedKey;
-        const column = this._buffer[columnName + '_values'];
-        if (column && value !== null && value !== undefined) {
-          column[idx] = value;
-          const nullBitmap = this._buffer[columnName + '_nulls'];
-          if (nullBitmap) {
-            nullBitmap[0] |= 1;
-          }
-        }
-      }
-      return this;
-    }
-    ` +
-    // Generated code: individual attribute setters (one per schema field)
-    attributeWriters.join('\n') +
-    `
-    ` +
-    // Generated code: scope() stores values in _scopedAttributes,
-    // then pre-fills remaining buffer capacity so future log entries inherit these values
-    `scope(attributes) {
-      for (const [cleanKey, value] of Object.entries(attributes)) {
-        if (value !== null && value !== undefined) {
-          this._scopedAttributes[cleanKey] = value;
-        }
-      }
-      const startIdx = this._buffer._writeIndex;
-      const endIdx = this._buffer._capacity;
-      for (let idx = startIdx; idx < endIdx; idx++) {
-        for (const [cleanKey, value] of Object.entries(this._scopedAttributes)) {
-          const prefixedKey = PREFIX_MAPPING[cleanKey] || cleanKey;
-          const columnName = prefixedKey;
-          const column = this._buffer[columnName + '_values'];
-          if (column) {
-            column[idx] = value;
-            const nullBitmap = this._buffer[columnName + '_nulls'];
-            if (nullBitmap) {
-              const byteIndex = Math.floor(idx / 8);
-              const bitOffset = idx % 8;
-              nullBitmap[byteIndex] |= (1 << bitOffset);
-            }
-          }
-        }
-      }
-    }
-    ` +
-    // Generated code: _writeMessage() writes a log entry - ensures buffer has space,
-    // writes entry type + timestamp + message, applies scoped attributes
-    `_writeMessage(entryType, message) {
-      // Check if buffer is full and create overflow buffer if needed
-      if (this._buffer._writeIndex >= this._buffer._capacity) {
-        const oldBuffer = this._buffer;
-        this._buffer = this._createOverflowBuffer(oldBuffer);
-        oldBuffer._overflow = this._buffer;
-      }
-      const idx = this._buffer._writeIndex;
-      this._buffer.entry_type[idx] = entryType;
-      this._buffer.timestamp[idx] = getTimestampNanos(this._buffer._traceRoot.anchorEpochNanos, this._buffer._traceRoot.anchorPerfNow);
-      const messageColumn = this._buffer.message_values;
-      if (messageColumn) {
-        messageColumn[idx] = message;
-      }
-      for (const [cleanKey, value] of Object.entries(this._scopedAttributes)) {
-        const prefixedKey = PREFIX_MAPPING[cleanKey] || cleanKey;
-        const columnName = prefixedKey;
-        const column = this._buffer[columnName + '_values'];
-        if (column) {
-          column[idx] = value;
-          const nullBitmap = this._buffer[columnName + '_nulls'];
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= (1 << bitOffset);
-          }
-        }
-      }
-      this._buffer._writeIndex++;
-    }
-    ` +
-    // Generated code: message() generic logging with level string mapping to entry type constants
-    `message(level, message) {
-      const entryTypeMap = {
-        'info': ${ENTRY_TYPE_INFO},
-        'debug': ${ENTRY_TYPE_DEBUG},
-        'warn': ${ENTRY_TYPE_WARN},
-        'error': ${ENTRY_TYPE_ERROR},
-        'trace': ${ENTRY_TYPE_TRACE}
-      };
-      this._writeMessage(entryTypeMap[level] || ${ENTRY_TYPE_INFO}, message);
-    }
-    ` +
-    // Generated code: convenience logging methods - each calls _writeMessage with entry type constant
-    `info(message) { this._writeMessage(${ENTRY_TYPE_INFO}, message); }
-    debug(message) { this._writeMessage(${ENTRY_TYPE_DEBUG}, message); }
-    warn(message) { this._writeMessage(${ENTRY_TYPE_WARN}, message); }
-    error(message) { this._writeMessage(${ENTRY_TYPE_ERROR}, message); }
-    trace(message) { this._writeMessage(${ENTRY_TYPE_TRACE}, message); }
-  }
-  return ${className};
-})()`;
-
-  return classCode;
-}
-
-/**
- * Create a remapped SpanLogger class constructor from clean schema and prefix mapping
- *
- * WHY: This is the cold-path function called at module creation time. It compiles
- * the generated class code once and caches the constructor.
- *
- * @param cleanSchema - Clean schema (without prefix)
- * @param prefixMapping - Mapping from clean names to prefixed names
- * @returns Constructor for the remapped SpanLogger class
- */
-export function createRemappedSpanLoggerClass<T extends LogSchema>(
-  cleanSchema: T,
-  prefixMapping: PrefixMapping,
-): RemappedSpanLoggerConstructor<T> {
-  // Check cache first
-  const cacheKey = createSchemaAndMappingCacheKey(cleanSchema, prefixMapping);
-  const cached = remappedSpanLoggerClassCache.get(cacheKey);
-  if (cached && isRemappedSpanLoggerClass<T>(cached)) {
-    return cached;
-  }
-
-  const classCode = generateRemappedSpanLoggerClass(cleanSchema, prefixMapping).trim();
-
-  const GeneratedClass = new Function(`return ${classCode}`)();
-  if (!isRemappedSpanLoggerClass<T>(GeneratedClass)) {
-    throw new TypeError('Generated remapped span logger is missing required logging methods');
-  }
-
-  remappedSpanLoggerClassCache.set(cacheKey, GeneratedClass);
-
-  return GeneratedClass;
-}
-//#endregion smoo/lmao!n/codegen-prefixed-remap
