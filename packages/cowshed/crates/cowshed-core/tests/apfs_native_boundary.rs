@@ -2492,6 +2492,112 @@ fn stateless_restore_recovery_converges_each_publication_boundary() {
     }
 }
 
+#[test]
+fn restore_recovery_selects_current_undo_generation_among_older_history() {
+    let fixture = Fixture::new("restore-current-undo-generation");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    let first_destination =
+        WorkspaceIncarnation::new("00000000000000000000000000000002").expect("first destination");
+    let second_destination =
+        WorkspaceIncarnation::new("00000000000000000000000000000003").expect("second destination");
+    let original_incarnation = metadata(ImageFormat::Sparse).workspace_incarnation;
+    let checkpoint_directory = layout.project().checkpoints.join("main");
+    let older_undo =
+        checkpoint_directory.join(format!("pre-restore-{first_destination}.sparseimage"));
+    let current_undo =
+        checkpoint_directory.join(format!("pre-restore-{second_destination}.sparseimage"));
+
+    create_image(&current_undo, ImageFormat::Sparse);
+    std::fs::write(&current_undo, b"first restored generation").expect("current undo image");
+    let mut current_undo_metadata = metadata(ImageFormat::Sparse);
+    current_undo_metadata.workspace_incarnation = first_destination.clone();
+    current_undo_metadata
+        .write_for_image(&current_undo)
+        .expect("current undo metadata");
+
+    create_image(&older_undo, ImageFormat::Sparse);
+    std::fs::write(&older_undo, b"original generation").expect("older undo image");
+    assert!(
+        older_undo.file_name() < current_undo.file_name(),
+        "sorted recovery enumeration must encounter the older restore first"
+    );
+
+    create_image(canonical.image(), ImageFormat::Sparse);
+    std::fs::write(canonical.image(), b"second restored generation").expect("canonical image");
+    let mut pending_metadata = metadata(ImageFormat::Sparse);
+    pending_metadata.workspace_incarnation = second_destination.clone();
+    pending_metadata.publication_state = PublicationState::PendingFence;
+    pending_metadata
+        .write_for_image(canonical.image())
+        .expect("pending canonical metadata");
+    std::fs::write(
+        restore_recovery_fact_path(canonical.image()),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "repoId": repo(),
+            "workspace": "main",
+            "sourceCheckpoint": "second-restore",
+            "sourceIncarnation": first_destination,
+            "destinationIncarnation": second_destination,
+        }))
+        .expect("restore recovery fact JSON"),
+    )
+    .expect("restore recovery fact");
+
+    let host = native_host(&fixture, RecordingRunner::default());
+    host.recover_pending(&fixture.config(), &[])
+        .expect("first startup recovery");
+    host.recover_pending(&fixture.config(), &[])
+        .expect("repeated startup recovery");
+
+    assert_eq!(
+        std::fs::read(canonical.image()).expect("canonical bytes"),
+        b"second restored generation"
+    );
+    assert_eq!(
+        std::fs::read(&current_undo).expect("current undo bytes"),
+        b"first restored generation"
+    );
+    assert_eq!(
+        std::fs::read(&older_undo).expect("older undo bytes"),
+        b"original generation"
+    );
+    assert!(sidecar_path(&older_undo).exists());
+    assert!(ca_key_path(&older_undo).exists());
+    let pending = host.pending_publications(&repo()).expect("pending restore");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].source_incarnation,
+        current_undo_metadata.workspace_incarnation
+    );
+    assert_eq!(pending[0].source_checkpoint, "second-restore");
+
+    host.activate_restored_metadata(canonical.image())
+        .expect("activate recovered restore");
+    host.recover_pending(&fixture.config(), &[])
+        .expect("post-activation recovery");
+    assert!(!restore_recovery_fact_path(canonical.image()).exists());
+    assert!(
+        older_undo.exists(),
+        "older undo remains a retention candidate"
+    );
+    assert!(
+        current_undo.exists(),
+        "current undo remains a retention candidate"
+    );
+    assert_eq!(
+        DetachedWorkspaceMetadata::read_for_image(canonical.image())
+            .expect("activated metadata")
+            .workspace_incarnation,
+        WorkspaceIncarnation::new("00000000000000000000000000000003").expect("second destination")
+    );
+    assert_ne!(
+        original_incarnation,
+        current_undo_metadata.workspace_incarnation
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn system_mount_source_observes_the_live_root_mount() {
