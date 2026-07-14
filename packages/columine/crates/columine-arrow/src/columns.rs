@@ -590,7 +590,7 @@ impl DynamicColumns {
         }
     }
 
-    /// ZIG-PARITY: Zig has no abandonRow — its extractor error paths simply
+    /// WHY (fix the deleted Zig lacked): Zig had no abandonRow — its extractor error paths simply
     /// never call endRow, leaving appended bytes/validity for the dead row
     /// unpublished (count is not bumped). Dropping the pending row here is
     /// the same observable behavior; kept as an explicit method because the

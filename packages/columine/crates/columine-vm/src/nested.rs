@@ -232,13 +232,21 @@ impl OuterTable {
     /// None = sentinel key, outer load factor exceeded, arena full, or probe
     /// exhaustion (all CAPACITY_EXCEEDED at the op layer).
     ///
-    /// Faithful port notes: the insertion probe treats TOMBSTONE like
-    /// EMPTY_KEY as an immediate insertion point (no first-tombstone scan),
-    /// and a new AGGREGATE inner is ZEROED — deliberately NOT
-    /// `aggregates::init_agg_slot`, whose MIN/MAX infinity sentinels nested
-    /// aggregates replace with a `count == 0` check (nested.zig:217, 329).
-    // ZIG-PARITY: resolve treats TOMBSTONE like EMPTY while lookup probes past it (asymmetric probe policy); intended fix: one tombstone policy for resolve/lookup.
-    // ZIG-PARITY: a new nested AGGREGATE inner is zeroed instead of init_agg_slot's sentinels (count==0 guards compensate); intended fix: one aggregate-init convention.
+    /// The insertion probe uses the unified probe-then-reuse policy
+    /// (post-parity: the deleted Zig claimed a tombstone immediately, so
+    /// resolve could shadow a live outer key sitting past it while lookup
+    /// probed on — an asymmetry that made resolve and lookup disagree).
+    ///
+    /// WHY a new AGGREGATE inner stays ZEROED (deliberate, not drift): the
+    /// arena hands back zeroed memory for free, and every nested MIN/MAX
+    /// reader guards with `count == 0` (nested.zig:217/329 convention)
+    /// instead of `init_agg_slot`'s ±infinity sentinels — writing sentinels
+    /// per inner would cost a write per allocation to change no observable
+    /// behavior (pinned by the nested model proptests). The `count == 0`
+    /// guard is also the algebra-correct shape (~/Dev/_wt/TREAT.md §1):
+    /// count is group-invertible, so emptiness is exactly maintainable and
+    /// is the right emptiness signal for min/max, whose values are the
+    /// support-scan class and carry no meaningful sentinel under deltas.
     pub fn resolve(
         &self,
         state: &mut [u8],
@@ -250,6 +258,8 @@ impl OuterTable {
         }
         debug_assert!(self.cap.is_power_of_two(), "probe mask requires pow2 cap");
         let mut pos = hash_key(outer_key, self.cap);
+        let mut first_tombstone: Option<u32> = None;
+        let mut insert_pos: Option<u32> = None;
         for _ in 0..self.cap {
             let k = self.key_at(state, pos);
             if k == outer_key {
@@ -258,7 +268,14 @@ impl OuterTable {
                     is_new: false,
                 });
             }
-            if k == EMPTY_KEY || k == TOMBSTONE {
+            if k == TOMBSTONE {
+                if first_tombstone.is_none() {
+                    first_tombstone = Some(pos);
+                }
+            } else if k == EMPTY_KEY {
+                insert_pos = Some(first_tombstone.unwrap_or(pos));
+            }
+            if let Some(pos) = insert_pos {
                 // Insert new outer key + allocate inner container.
                 if self.size(state) >= self.cap * 7 / 10 {
                     return None;
@@ -302,12 +319,14 @@ impl OuterTable {
             }
             pos = (pos + 1) & (self.cap - 1);
         }
+        // No EMPTY cell found (table saturated with keys + tombstones):
+        // the load-factor gate above refuses long before this in practice.
         None
     }
 
     /// nested.zig:232 `lookup` — inner container offset for `outer_key`, or
-    /// 0 when absent. Faithful port: only EMPTY_KEY terminates the probe
-    /// (TOMBSTONE cells are probed past, asymmetric with `resolve`).
+    /// 0 when absent. Only EMPTY_KEY terminates the probe; TOMBSTONE cells
+    /// are probed past — symmetric with `resolve` post-parity.
     pub fn lookup(&self, state: &[u8], outer_key: u32) -> u32 {
         let mut pos = hash_key(outer_key, self.cap);
         for _ in 0..self.cap {
@@ -410,9 +429,9 @@ pub fn nested_map_upsert_last(
         return ErrorCode::Ok;
     }
 
-    // ZIG-PARITY: after growth-path regrowth the INSERTED change-flag is set unconditionally even for an overwrite; intended fix: set INSERTED only on genuine inserts.
-    // Inner needs growth (nested.zig:297-305). The unconditional INSERTED
-    // flag after regrowth (even for an overwrite) is faithful to the Zig.
+    // Inner needs growth (nested.zig:297-305). The change flag reflects
+    // what actually happened post-parity: INSERTED only on genuine inserts
+    // (the deleted Zig set INSERTED unconditionally, even for overwrites).
     let new_size = hash_table::hashmap_byte_size(inner.cap * 2);
     let Some(new_off) = outer.arena.alloc(state, new_size) else {
         return ErrorCode::CapacityExceeded;
@@ -420,8 +439,15 @@ pub fn nested_map_upsert_last(
     let grown = inner.rehash_into(state, new_off, inner.cap * 2);
     outer.update_ptr(state, outer_key, new_off);
 
-    let _ = grown.upsert_u32(state, inner_key, value);
-    meta.set_change_flag(state, ChangeFlag::INSERTED);
+    let was_new = grown.upsert_u32(state, inner_key, value).unwrap_or(false);
+    meta.set_change_flag(
+        state,
+        if was_new {
+            ChangeFlag::INSERTED
+        } else {
+            ChangeFlag::UPDATED
+        },
+    );
     ErrorCode::Ok
 }
 

@@ -26,10 +26,11 @@ use columine_event_processor::{
 /// Same wire version as the axe EP artifact (one event_processor lineage).
 pub const VERSION: u32 = 2;
 
-/// Zig `initCommon` wasm clamp — shared lineage with the axe EP artifact.
-/// ZIG-PARITY: the clamp itself is the Zig 256-event ceiling; intended fix
-/// (capacity honesty) lands with the post-parity sweep for both artifacts.
-const WASM_EVENT_CAPACITY: u32 = 256;
+/// Capacity honesty (post-parity): the deleted Zig silently clamped every
+/// wasm instance to 256 events regardless of the requested capacity; the
+/// requested capacity is honored now. A sanity ceiling guards against
+/// unreasonable requests corrupting the address space.
+const MAX_EVENT_CAPACITY: u32 = 1 << 20;
 
 struct EpInstance {
     ep: EventProcessor,
@@ -71,11 +72,10 @@ fn get_processor(handle: u32) -> Option<&'static mut EpInstance> {
 }
 
 fn new_instance(capacity: u32, schema_config: DynamicSchemaConfig) -> Option<Box<EpInstance>> {
-    let column_capacity = if cfg!(target_arch = "wasm32") {
-        capacity.min(WASM_EVENT_CAPACITY)
-    } else {
-        capacity
-    };
+    if capacity == 0 || capacity > MAX_EVENT_CAPACITY {
+        return None;
+    }
+    let column_capacity = capacity;
     // Columine has no dedup (EpWiring::columine()); the policy parameter in
     // the core signature is vestigial on this path — Latest is what the Zig
     // hardcoded.
@@ -166,7 +166,7 @@ pub unsafe extern "C" fn ep_create_log_entry(
     if (output_len as usize) < RESULT_HEADER_SIZE {
         return ResultCode::OutOfMemory as u32;
     }
-    // ZIG-PARITY: Zig `@enumFromInt(format)` on a byte outside {0,1,2,3} is
+    // WHY: a format byte outside the enum refuses loudly (the deleted Zig was UB —2,3} is
     // UB under ReleaseSmall; checked INVALID_FORMAT here. Intended fix: keep
     // the checked behavior at the sweep.
     let format = match format {
