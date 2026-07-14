@@ -3054,16 +3054,43 @@ fn quarantine_io_error(operation: &str, path: &Path, error: std::io::Error) -> C
 
 #[cfg(target_os = "macos")]
 fn pre_cowshed_path(root: &Path) -> Result<PathBuf> {
-    let name = root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            CowshedError::usage(
-                "repository root has no UTF-8 final component",
-                "move the repository to a supported path",
-            )
-        })?;
-    Ok(root.with_file_name(format!(".{name}.pre-cowshed")))
+    if root.file_name().is_none() {
+        return Err(CowshedError::usage(
+            "repository root has no final component",
+            "move the repository to a supported path",
+        ));
+    }
+    let mut path = root.as_os_str().to_owned();
+    path.push(".pre-cowshed");
+    Ok(PathBuf::from(path))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod pre_cowshed_tests {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    use super::*;
+
+    #[test]
+    fn handoff_suffix_preserves_the_exact_repository_path_bytes() {
+        assert_eq!(
+            pre_cowshed_path(Path::new("/tmp/widget")).expect("UTF-8 root"),
+            Path::new("/tmp/widget.pre-cowshed")
+        );
+
+        let mut root = PathBuf::from("/tmp");
+        root.push(OsString::from_vec(vec![b'w', 0x80, b's']));
+        let mut expected = root.as_os_str().as_bytes().to_vec();
+        expected.extend_from_slice(b".pre-cowshed");
+        assert_eq!(
+            pre_cowshed_path(&root)
+                .expect("opaque Unix root")
+                .as_os_str()
+                .as_bytes(),
+            expected
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
