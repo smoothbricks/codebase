@@ -435,6 +435,7 @@ pub struct CanonicalRoots {
     home: PathBuf,
     store: PathBuf,
     caches: PathBuf,
+    telemetry: PathBuf,
 }
 
 impl CanonicalRoots {
@@ -448,10 +449,12 @@ impl CanonicalRoots {
         }
         let store = home.join(".cowshed");
         let caches = store.join("caches");
+        let telemetry = store.join("telemetry");
         Ok(Self {
             home: home.to_owned(),
             store,
             caches,
+            telemetry,
         })
     }
 
@@ -465,6 +468,41 @@ impl CanonicalRoots {
 
     pub fn caches(&self) -> &Path {
         &self.caches
+    }
+
+    pub fn telemetry(&self) -> &Path {
+        &self.telemetry
+    }
+}
+
+/// Canonical host-storage roots whose APFS volumes were authoritatively validated in place.
+///
+/// This type is only constructed by the existing-only native validation boundary. Possession
+/// therefore attests that no provisioning was needed to use the returned machine-global roots.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedHostStorage {
+    roots: CanonicalRoots,
+}
+
+impl ValidatedHostStorage {
+    pub(crate) fn new(roots: CanonicalRoots) -> Self {
+        Self { roots }
+    }
+
+    pub fn home(&self) -> &Path {
+        self.roots.home()
+    }
+
+    pub fn store(&self) -> &Path {
+        self.roots.store()
+    }
+
+    pub fn caches(&self) -> &Path {
+        self.roots.caches()
+    }
+
+    pub fn telemetry(&self) -> &Path {
+        self.roots.telemetry()
     }
 }
 
