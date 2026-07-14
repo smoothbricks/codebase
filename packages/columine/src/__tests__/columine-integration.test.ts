@@ -44,10 +44,12 @@ const WASM_PATH = new URL('../../dist/columine.wasm', import.meta.url);
 const WASM_EXISTS = existsSync(WASM_PATH.pathname);
 
 // =============================================================================
+// BytecodeBuilder (minimal, local to avoid circular dep on axe-runtime)
 // =============================================================================
 
 /**
  * Minimal bytecode builder for test programs.
+ * We avoid importing from axe-runtime to prove columine works standalone.
  */
 function buildProgram(opts: {
   slots: Array<
@@ -87,7 +89,7 @@ function buildProgram(opts: {
   // [32..] content header + init + reduce
 
   const base = PROGRAM_HASH_PREFIX;
-  // Magic "CLM1" (little-endian)
+  // Magic "AXE1" (little-endian)
   program[base + 0] = MAGIC & 0xff;
   program[base + 1] = (MAGIC >> 8) & 0xff;
   program[base + 2] = (MAGIC >> 16) & 0xff;

@@ -1,0 +1,13 @@
+{
+  "//": "Runtime-transform project for @ttsc/unplugin's nearest-tsconfig discovery (see tooling/typia/bun-preload.ts). The package solution tsconfig.json holds only references, which the bun typia plugin cannot transform against; this config gives every src file a real project with the package's own compiler options.",
+  "extends": "../tsconfig.test.json",
+  "compilerOptions": {
+    "composite": false,
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "emitDeclarationOnly": false,
+    "rootDir": "."
+  },
+  "include": ["./**/*.ts", "./**/*.tsx"]
+}
