@@ -158,25 +158,35 @@ other domain errors.
 
 ## N-API
 
-The N-API surface mirrors the Rust types asynchronously. It must preserve numeric job IDs, discriminated typed artifact
-handles, separate opaque-byte streams with backpressure, cancellation through `AbortSignal`, typed terminal state, grant
-revision, and trace identity. It must not flatten job output into one string, assume every stream has a path, put
-unbounded output in ordinary JSON, or derive security evidence from summary text. A bounded inline `BinaryData` uses the
-same tagged `utf8`/`base64` representation as every other frontend.
+Node and Bun use the same napi-rs `.node` addon. There is no separate synchronous `bun:ffi` lane: workspace discovery,
+attachment, execution, and lifecycle calls are IO-bound and remain Promise-based on both runtimes.
+
+The first binding surface is intentionally read-only and endpoint-backed. A trusted spawner supplies a connected
+controller descriptor out of band; `coordinatorEndpoint` takes ownership, marks it close-on-exec, and permits exactly
+one handshake attempt. `openProject` discards coordinator authority before exposing `Project` and `WorkspaceRef`.
 
 ```ts
-import { openProject, connectWorkspace } from '@smoothbricks/cowshed';
+import { coordinatorEndpoint, openProject } from '@smoothbricks/cowshed';
 
-const project = await openProject('<project-root>');
-const coordinator = await project.coordinator();
-const workspace = await coordinator.createWorkspace(`task-${id}`);
-const worker = await connectWorkspace(workerDescriptor);
-const job = await worker.exec(['bun', 'test'], { cwdRel: 'packages/example' });
-const info = await job.wait();
+// `endpointFd` is an inherited socket from the trusted controller, never token text.
+const endpoint = coordinatorEndpoint(endpointFd);
+const project = await openProject(endpoint, '<project-root>');
+const workspaces = await project.listWorkspaces();
+const main = await project.main();
 
-await worker.push();
-await coordinator.destroyWorkspace(workspace.name, { ifPushed: true });
+const current = await main.info();
+const ensured = await main.ensure();
+await main.attach({ browse: false });
+const grants = await main.grants();
 ```
+
+Both runtimes receive the same typed `CowshedError` with stable kebab-case `code`, exact `message`, and actionable
+`hint`. Workspace, ensure, and grant DTOs are serialized directly from cowshed-core and Typia-validated by the
+TypeScript facade.
+
+Coordinator mutation, one-use worker descriptors, jobs, raw-byte streams with backpressure, and `AbortSignal`
+cancellation remain the next binding slice. They must preserve the existing core authority boundaries; the addon does
+not expose raw RPC, `ProjectRuntime`, or the CLI's in-process `ActorBridge` as a shortcut.
 
 The CLI remains the integration point for shell-only consumers. Rust, N-API, CLI, and MCP frontends must agree on
 lifecycle, grant propagation, numeric jobs, tiered artifact storage, bounded summaries and control responses, raw
