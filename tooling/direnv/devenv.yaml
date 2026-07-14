@@ -18,6 +18,3 @@ inputs:
   rust-overlay:
     url: github:oxalica/rust-overlay
     flake: true
-  zig:
-    url: github:mitchellh/zig-overlay
-    flake: true

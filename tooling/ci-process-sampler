@@ -2,8 +2,8 @@
 set -euo pipefail
 
 interval="${CI_PROCESS_SAMPLER_INTERVAL_SECONDS:-10}"
-pattern="${CI_PROCESS_SAMPLER_PATTERN:-nx|node|bun|sh|bash|zig|tsc}"
-args_pattern="${CI_PROCESS_SAMPLER_ARGS_PATTERN:-nx|node|bun|zig|tsc}"
+pattern="${CI_PROCESS_SAMPLER_PATTERN:-nx|node|bun|sh|bash|tsc}"
+args_pattern="${CI_PROCESS_SAMPLER_ARGS_PATTERN:-nx|node|bun|tsc}"
 
 redact_args() {
   sed \

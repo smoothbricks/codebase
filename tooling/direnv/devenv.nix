@@ -8,10 +8,6 @@
 # https://devenv.sh/inputs/
 let
   git-format-staged = inputs.git-format-staged.packages.${pkgs.stdenv.system}.default;
-  zig =
-    if pkgs.stdenv.isDarwin
-    then inputs.zig.packages.${pkgs.stdenv.system}.brew."0.16.0"
-    else inputs.zig.packages.${pkgs.stdenv.system}."0.16.0";
 in {
   # https://devenv.sh/overlays/
   overlays = [
@@ -29,8 +25,6 @@ in {
     nodejs_24
     # Bun.sh for javascript dependencies
     bun
-    # WASM and NAPI extensions
-    zig
     # Rust toolchain for packages/cowshed and packages/lmao-rs: cargo, rustc,
     # clippy, rustfmt via rust-overlay stable, plus rust-src/rust-analyzer for
     # IDE and LSP use. Keep the WASM target on every system; add only the
@@ -110,7 +104,7 @@ in {
   # PATH order: most-specific → least-specific.
   # ttsc needs the native TypeScript 7 binary while Nx imports the TypeScript 6 API.
   # On Darwin, remove Nix CC/CXX so xcodebuild finds Xcode clang with -index-store-path support.
-  # Zig has its own toolchain; bun/node native addons find compilers through node-gyp.
+  # Bun/node native addons find compilers through node-gyp.
   enterShell = ''
     cd "$DEVENV_ROOT/../.."
     export PATH="$("$PWD/tooling/direnv/repo-path")"
