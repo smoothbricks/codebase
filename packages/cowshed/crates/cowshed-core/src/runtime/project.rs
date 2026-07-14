@@ -1258,6 +1258,21 @@ struct NativeProjectRuntimeHost {
 }
 
 #[cfg(target_os = "macos")]
+fn verified_recovery_facts<'a>(
+    facts: &'a [crate::storage::lifecycle::StorageFact],
+    pending: &[crate::storage::apfs::PendingPublicationFact],
+) -> Vec<&'a crate::storage::lifecycle::StorageFact> {
+    let pending_destinations = pending
+        .iter()
+        .map(|fact| fact.destination_incarnation.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    facts
+        .iter()
+        .filter(|fact| !pending_destinations.contains(fact.workspace.incarnation()))
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
 impl NativeProjectRuntimeHost {
     async fn open(
         project_root: &Path,
@@ -1343,14 +1358,10 @@ impl NativeProjectRuntimeHost {
         .map_err(|error| {
             CowshedError::internal(format!("retired workspace recovery task failed: {error}"))
         })??;
-        let known_incarnations = facts
+        let verified_facts = verified_recovery_facts(&facts, &pending);
+        let known_incarnations = verified_facts
             .iter()
             .map(|fact| fact.workspace.incarnation().clone())
-            .chain(
-                pending
-                    .iter()
-                    .map(|fact| fact.workspace.incarnation().clone()),
-            )
             .chain(
                 retired
                     .iter()
@@ -1372,7 +1383,7 @@ impl NativeProjectRuntimeHost {
                 )
                 .await?;
         }
-        for fact in &facts {
+        for fact in verified_facts {
             commitments
                 .ensure_workspace_introduced(repo_id.clone(), fact.workspace.incarnation().clone())
                 .await?;
@@ -1385,7 +1396,7 @@ impl NativeProjectRuntimeHost {
                     repo_id: repo_id.clone(),
                     source_checkpoint: publication.source_checkpoint.clone(),
                     source_incarnation: publication.source_incarnation.clone(),
-                    destination_incarnation: publication.workspace.incarnation().clone(),
+                    destination_incarnation: publication.destination_incarnation.clone(),
                 })
                 .await?;
             host.activate_restored_metadata(&publication.image)
@@ -4069,5 +4080,131 @@ mod binding_tests {
             primary.remote_url.as_deref(),
             Some("https://example.com/acme/widget.git")
         );
+    }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn startup_pending_restore_destination_is_absent_until_restore_fence() {
+        use crate::api::dto::Sha256Digest;
+        use crate::metadata::{ImageFormat, WorkspaceRole};
+        use crate::runtime::supervisor::{CommitmentDraft, CommitmentPublisher, CommitmentSink};
+        use crate::storage::apfs::PendingPublicationFact;
+        use crate::storage::lifecycle::{LifecycleWorkspace, Revision, StorageFact};
+
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-project-pending-restore-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let telemetry = root.join("telemetry");
+        let repo = repo_id("acme/widget");
+        let source = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").expect("source");
+        let destination =
+            WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").expect("destination");
+        let source_workspace = LifecycleWorkspace::new(
+            repo.clone(),
+            WorkspaceName::new("main").expect("main"),
+            source.clone(),
+            Revision::new(1),
+            Revision::new(11),
+            WorkspaceRole::Main,
+            ImageFormat::Sparse,
+        )
+        .expect("source workspace");
+        let destination_workspace = LifecycleWorkspace::new(
+            repo.clone(),
+            WorkspaceName::new("main").expect("main"),
+            destination.clone(),
+            Revision::new(2),
+            Revision::new(11),
+            WorkspaceRole::Main,
+            ImageFormat::Sparse,
+        )
+        .expect("destination workspace");
+        let facts = vec![
+            StorageFact {
+                workspace: source_workspace,
+                volume_name: "cowshed.acme--widget.main".to_owned(),
+            },
+            StorageFact {
+                workspace: destination_workspace.clone(),
+                volume_name: "cowshed.acme--widget.main".to_owned(),
+            },
+        ];
+        let pending = PendingPublicationFact {
+            workspace: destination_workspace,
+            image: root.join("main.sparseimage"),
+            mount_point: root.join("mount"),
+            source_checkpoint: "baseline".to_owned(),
+            source_incarnation: source.clone(),
+            replaced_incarnation: source.clone(),
+            destination_incarnation: destination.clone(),
+        };
+        let pending_slice = std::slice::from_ref(&pending);
+        let verified = verified_recovery_facts(&facts, pending_slice);
+        assert_eq!(verified.len(), 1);
+        assert_eq!(verified[0].workspace.incarnation(), &source);
+
+        let mut commitments = CommitmentPublisher::open(
+            &telemetry,
+            repo.clone(),
+            verified
+                .iter()
+                .map(|fact| fact.workspace.incarnation().clone()),
+            8,
+        )
+        .expect("open commitment publisher");
+        commitments
+            .ensure_workspace_introduced(repo.clone(), source.clone())
+            .await
+            .expect("introduce source");
+        commitments
+            .publish(CommitmentDraft::Checkpoint {
+                repo_id: repo.clone(),
+                origin_incarnation: source.clone(),
+                checkpoint_id: "baseline".to_owned(),
+                barrier_id: 1,
+                manifest_batch_sha256: Sha256Digest::compute(b"baseline manifest"),
+            })
+            .await
+            .expect("publish checkpoint");
+        assert!(
+            !commitments
+                .admitted_lifecycle_incarnations(repo.clone())
+                .await
+                .expect("pre-fence incarnations")
+                .contains(&destination)
+        );
+        commitments
+            .publish(CommitmentDraft::Restore {
+                repo_id: repo.clone(),
+                source_checkpoint: pending.source_checkpoint.clone(),
+                source_incarnation: pending.source_incarnation.clone(),
+                destination_incarnation: pending.destination_incarnation.clone(),
+            })
+            .await
+            .expect("publish recovered restore");
+        assert!(
+            commitments
+                .admitted_lifecycle_incarnations(repo.clone())
+                .await
+                .expect("post-fence incarnations")
+                .contains(&destination)
+        );
+        assert!(
+            commitments
+                .publish(CommitmentDraft::Restore {
+                    repo_id: repo,
+                    source_checkpoint: "unknown".to_owned(),
+                    source_incarnation: source,
+                    destination_incarnation: WorkspaceIncarnation::new(
+                        "2198f2c0b7e34dc795f17b238b331c80"
+                    )
+                    .expect("unknown destination"),
+                })
+                .await
+                .is_err(),
+            "an unknown pending checkpoint must remain rejected"
+        );
+        drop(commitments);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
