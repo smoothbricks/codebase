@@ -174,7 +174,7 @@ pub struct WorkspaceSession {
 impl WorkspaceSession {
     pub fn validate(&self) -> Result<(), ConfigError> {
         validate_identifier("workspace_id", &self.workspace_id)?;
-        validate_identifier("repo_id", &self.repo_id)?;
+        validate_repo_id(&self.repo_id)?;
         self.endpoint.validate_for_current_platform()?;
         self.policy.validate()?;
         Ok(())
@@ -205,6 +205,15 @@ fn validate_identifier(field: &'static str, value: &str) -> Result<(), ConfigErr
     {
         return Err(ConfigError::InvalidIdentifier { field });
     }
+    Ok(())
+}
+fn validate_repo_id(value: &str) -> Result<(), ConfigError> {
+    let (owner, name) = value.split_once('/').ok_or(ConfigError::InvalidRepoId)?;
+    if name.contains('/') || matches!(owner, "." | "..") || matches!(name, "." | "..") {
+        return Err(ConfigError::InvalidRepoId);
+    }
+    validate_identifier("repo_id", owner).map_err(|_| ConfigError::InvalidRepoId)?;
+    validate_identifier("repo_id", name).map_err(|_| ConfigError::InvalidRepoId)?;
     Ok(())
 }
 
@@ -415,6 +424,8 @@ pub struct GatewayConfig {
     pub control_tcp: Option<ControlTcpConfig>,
     /// Controller-owned, one-way simulator artifact drop directory.
     pub simulator_drop_root: Option<PathBuf>,
+    /// Exact trusted executable used for the isolated Git fetch helper.
+    pub git_helper_executable: Option<PathBuf>,
     /// Authoritative private directory for Linux workspace data sockets.
     pub data_socket_root: Option<PathBuf>,
     pub authorized_control_uid: u32,
@@ -430,6 +441,7 @@ impl Default for GatewayConfig {
             control_socket: None,
             control_tcp: None,
             simulator_drop_root: None,
+            git_helper_executable: None,
             data_socket_root: None,
             authorized_control_uid: unsafe { libc::geteuid() },
             limits: GatewayLimits::default(),
@@ -499,6 +511,11 @@ impl GatewayConfig {
         {
             return Err(ConfigError::InvalidProductionCacheRoot);
         }
+        let helper = self
+            .git_helper_executable
+            .as_deref()
+            .ok_or(ConfigError::MissingGitHelperExecutable)?;
+        self.validate_git_helper_executable(helper)?;
         Ok(())
     }
 
@@ -556,12 +573,33 @@ impl GatewayConfig {
         }
         Ok(())
     }
+    fn validate_git_helper_executable(&self, path: &std::path::Path) -> Result<(), ConfigError> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        if !path.is_absolute() {
+            return Err(ConfigError::InvalidGitHelperExecutable);
+        }
+        let metadata =
+            std::fs::symlink_metadata(path).map_err(|_| ConfigError::InvalidGitHelperExecutable)?;
+        let mode = metadata.permissions().mode();
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != self.authorized_control_uid
+            || mode & 0o022 != 0
+            || mode & 0o100 == 0
+        {
+            return Err(ConfigError::InvalidGitHelperExecutable);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("{field} must be 1-128 ASCII identifier characters")]
     InvalidIdentifier { field: &'static str },
+    #[error("repo_id must be exactly two 1-128 ASCII identifier components joined by '/'")]
+    InvalidRepoId,
     #[error("workspace endpoint must be loopback")]
     NonLoopbackEndpoint,
     #[error("workspace endpoint port must be non-zero")]
@@ -600,6 +638,12 @@ pub enum ConfigError {
     MissingMirrorCacheRoot,
     #[error("gateway mirror cache root must be a pre-existing real directory")]
     InsecureMirrorCacheRoot,
+    #[error("production gateway requires an explicit Git fetch helper executable")]
+    MissingGitHelperExecutable,
+    #[error(
+        "gateway Git fetch helper must be an absolute owned executable without group/world write access"
+    )]
+    InvalidGitHelperExecutable,
     #[error("production gateway requires the canonical gateway.sock control endpoint")]
     MissingProductionControlSocket,
     #[error(

@@ -372,7 +372,7 @@ fn configure_project(
     projects: &mut HashMap<String, ProjectState>,
     config: SimProjectConfig,
 ) -> Result<(), SimBrokerError> {
-    validate_identifier(&config.repo_id)?;
+    validate_repo_id(&config.repo_id)?;
     if config.registered_schemes.len() > MAX_SCHEMES
         || (projects.len() >= MAX_PROJECTS && !projects.contains_key(&config.repo_id))
     {
@@ -402,7 +402,7 @@ fn approve_install(
     used_receipts: &mut VecDeque<[u8; 32]>,
     mut approval: SimInstallApproval,
 ) -> Result<(), SimBrokerError> {
-    validate_identifier(&approval.repo_id)?;
+    validate_repo_id(&approval.repo_id)?;
     validate_device(&approval.device)?;
     validate_digest(&approval.artifact_digest)?;
     if approval.human_receipt.len() < 16 || approval.human_receipt.len() > 4096 {
@@ -701,7 +701,7 @@ async fn control_list(
     projects: &HashMap<String, ProjectState>,
     runner: &dyn SimRunner,
 ) -> Result<Vec<SimDevice>, SimBrokerError> {
-    validate_identifier(repo_id)?;
+    validate_repo_id(repo_id)?;
     if !projects.contains_key(repo_id) {
         return Err(SimBrokerError::ProjectNotConfigured);
     }
@@ -738,7 +738,7 @@ async fn control_boot(
     projects: &HashMap<String, ProjectState>,
     runner: &dyn SimRunner,
 ) -> Result<(), SimBrokerError> {
-    validate_identifier(repo_id)?;
+    validate_repo_id(repo_id)?;
     validate_device(device)?;
     if !projects.contains_key(repo_id) {
         return Err(SimBrokerError::ProjectNotConfigured);
@@ -853,6 +853,16 @@ fn validate_identifier(value: &str) -> Result<(), SimBrokerError> {
         return Err(SimBrokerError::InvalidIdentifier);
     }
     Ok(())
+}
+fn validate_repo_id(value: &str) -> Result<(), SimBrokerError> {
+    let (owner, name) = value
+        .split_once('/')
+        .ok_or(SimBrokerError::InvalidIdentifier)?;
+    if name.contains('/') || matches!(owner, "." | "..") || matches!(name, "." | "..") {
+        return Err(SimBrokerError::InvalidIdentifier);
+    }
+    validate_identifier(owner)?;
+    validate_identifier(name)
 }
 
 fn validate_device(value: &str) -> Result<(), SimBrokerError> {
@@ -1013,7 +1023,7 @@ mod tests {
 
     fn project(grants: impl IntoIterator<Item = SimGrant>) -> SimProjectConfig {
         SimProjectConfig {
-            repo_id: "repo-a".to_owned(),
+            repo_id: "owner/repo-a".to_owned(),
             grants: grants.into_iter().collect(),
             registered_schemes: HashSet::from(["cowshed-demo".to_owned()]),
         }
@@ -1040,7 +1050,7 @@ mod tests {
             .await
             .expect("configure");
         handle
-            .bind_session("ws-a".to_owned(), "repo-a".to_owned())
+            .bind_session("ws-a".to_owned(), "owner/repo-a".to_owned())
             .await
             .expect("bind");
 
@@ -1067,11 +1077,11 @@ mod tests {
 
         let contents = b"verified bundle";
         let digest = app_digest(contents);
-        let app = root.join("repo-a").join(format!("{digest}.app"));
+        let app = root.join("owner/repo-a").join(format!("{digest}.app"));
         std::fs::create_dir_all(&app).expect("create app");
         std::fs::write(app.join("Info.plist"), contents).expect("write app");
         let approval = SimInstallApproval {
-            repo_id: "repo-a".to_owned(),
+            repo_id: "owner/repo-a".to_owned(),
             device: "booted".to_owned(),
             artifact_digest: digest.clone(),
             human_receipt: "human-confirmation-0001".to_owned(),
@@ -1114,7 +1124,7 @@ mod tests {
             assert!(matches!(
                 &commands[1],
                 SimCommand::Install { device, app }
-                    if device == "booted" && app.starts_with(root.join("repo-a"))
+                    if device == "booted" && app.starts_with(root.join("owner/repo-a"))
             ));
         }
         {
@@ -1151,7 +1161,7 @@ mod tests {
             .await
             .expect("configure");
         handle
-            .bind_session("ws-a".to_owned(), "repo-a".to_owned())
+            .bind_session("ws-a".to_owned(), "owner/repo-a".to_owned())
             .await
             .expect("bind");
         assert!(matches!(
@@ -1192,7 +1202,7 @@ mod tests {
                 .await
                 .expect("configure");
             handle
-                .bind_session("ws-a".to_owned(), "repo-a".to_owned())
+                .bind_session("ws-a".to_owned(), "owner/repo-a".to_owned())
                 .await
                 .expect("bind");
             let result = handle

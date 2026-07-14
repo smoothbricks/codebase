@@ -1326,6 +1326,7 @@ fn production_cache_root_is_fixed_beneath_control_socket_parent() {
     }
     let mut config = GatewayConfig {
         control_socket: Some(gateway_root.join("gateway.sock")),
+        git_helper_executable: Some(std::env::current_exe().expect("current test executable")),
         mirror_cache: MirrorCacheConfig::new(fixed),
         ..GatewayConfig::default()
     };

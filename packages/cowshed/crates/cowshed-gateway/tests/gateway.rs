@@ -787,7 +787,7 @@ async fn allow_deny_malformed_token_and_audit_fields() {
     };
     let (session, token, _) = session(
         "raven",
-        "repo-one",
+        "owner/repo-one",
         WorkspaceEndpoint::Tcp(endpoint),
         7,
         1,
@@ -830,9 +830,7 @@ async fn allow_deny_malformed_token_and_audit_fields() {
             .to_ascii_lowercase()
             .contains("proxy-authorization")
     );
-    assert!(forwarded.contains(
-        "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-"
-    ));
+    assert!(forwarded.contains("traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-"));
     assert!(!forwarded.contains("00F067AA0BA902B7"));
     assert!(forwarded.contains("tracestate: vendor=opaque"));
     let invalid_trace =
@@ -889,7 +887,10 @@ async fn allow_deny_malformed_token_and_audit_fields() {
         .await
         .expect("invalid trace audit timeout")
         .expect("invalid trace audit");
-    assert_eq!(invalid.classification.as_deref(), Some("invalid-trace-context"));
+    assert_eq!(
+        invalid.classification.as_deref(),
+        Some("invalid-trace-context")
+    );
     assert!(invalid.parent_span_id.is_none());
     assert!(invalid.tracestate.is_none());
     assert!(
@@ -923,7 +924,7 @@ async fn endpoint_identity_precedes_token_authentication() {
     let policy_b = policy_a.clone();
     let (session_a, token_a, _) = session(
         "alpha",
-        "repo-a",
+        "owner/repo-a",
         WorkspaceEndpoint::Tcp(endpoint_a),
         1,
         1,
@@ -931,7 +932,7 @@ async fn endpoint_identity_precedes_token_authentication() {
     );
     let (session_b, token_b, _) = session(
         "bravo",
-        "repo-b",
+        "owner/repo-b",
         WorkspaceEndpoint::Tcp(endpoint_b),
         2,
         1,
@@ -994,7 +995,7 @@ async fn local_mirror_route_rewrites_only_the_admitted_scope() {
     };
     let (session, token, _) = session(
         "mirror",
-        "repo-mirror",
+        "owner/repo-mirror",
         WorkspaceEndpoint::Tcp(endpoint),
         9,
         1,
@@ -1078,7 +1079,7 @@ async fn opaque_connect_preserves_bytes_exactly() {
     };
     let (session, token, _) = session(
         "opaque",
-        "repo-opaque",
+        "owner/repo-opaque",
         WorkspaceEndpoint::Tcp(endpoint),
         3,
         1,
@@ -1133,7 +1134,7 @@ async fn intercept_injects_only_gateway_headers_and_validates_sni() {
     let endpoint = free_endpoint();
     let origin = format!("https://secure.test:{upstream_port}");
     let credentials: Arc<dyn CredentialProvider> = Arc::new(FixedCredential {
-        repo_id: "repo-secure".to_owned(),
+        repo_id: "owner/repo-secure".to_owned(),
         origin,
         value: "Bearer host-secret".to_owned(),
     });
@@ -1153,7 +1154,7 @@ async fn intercept_injects_only_gateway_headers_and_validates_sni() {
     };
     let (session, token, ca_certificate) = session(
         "secure",
-        "repo-secure",
+        "owner/repo-secure",
         WorkspaceEndpoint::Tcp(endpoint),
         4,
         1,
@@ -1220,7 +1221,7 @@ async fn impersonation_suppresses_credentials_and_trace_headers() {
     let gateway = gateway(
         test_config(),
         Arc::new(FixedCredential {
-            repo_id: "repo-plain".to_owned(),
+            repo_id: "owner/repo-plain".to_owned(),
             origin,
             value: "Bearer must-not-appear".to_owned(),
         }),
@@ -1235,7 +1236,7 @@ async fn impersonation_suppresses_credentials_and_trace_headers() {
     impersonated.impersonate = true;
     let (session, token, _) = session(
         "plain",
-        "repo-plain",
+        "owner/repo-plain",
         WorkspaceEndpoint::Tcp(endpoint),
         5,
         1,
@@ -1281,7 +1282,7 @@ async fn dead_upstream_fails_fast_without_connecting() {
     .await;
     let (session, token, _) = session(
         "offline",
-        "repo-offline",
+        "owner/repo-offline",
         WorkspaceEndpoint::Tcp(endpoint),
         6,
         1,
@@ -1336,7 +1337,7 @@ async fn active_queue_and_overflow_limits_are_enforced() {
     .await;
     let (session, token, _) = session(
         "limited",
-        "repo-limited",
+        "owner/repo-limited",
         WorkspaceEndpoint::Tcp(endpoint),
         8,
         1,
@@ -1431,7 +1432,7 @@ async fn queued_request_timeout_cancels_without_leaking_a_slot() {
     .await;
     let (session, token, _) = session(
         "queue-timeout",
-        "repo-queue-timeout",
+        "owner/repo-queue-timeout",
         WorkspaceEndpoint::Tcp(endpoint),
         10,
         1,
@@ -1509,7 +1510,7 @@ async fn unix_socket_churn_unlinks_every_session() {
     for revision in 1..=32 {
         let (session, _token, _) = session(
             "churn",
-            "repo-churn",
+            "owner/repo-churn",
             WorkspaceEndpoint::Unix(socket.clone()),
             revision as u8,
             revision,
@@ -1568,7 +1569,7 @@ async fn linux_data_socket_root_is_enforced_and_serves_requests() {
     };
     let (installed, token, _) = session(
         "linux-request",
-        "repo-linux-request",
+        "owner/repo-linux-request",
         WorkspaceEndpoint::Unix(socket.clone()),
         30,
         1,
@@ -1598,7 +1599,7 @@ async fn linux_data_socket_root_is_enforced_and_serves_requests() {
 
     let outside_session = session(
         "outside",
-        "repo-outside",
+        "owner/repo-outside",
         WorkspaceEndpoint::Unix(outside),
         31,
         1,
@@ -1615,7 +1616,7 @@ async fn linux_data_socket_root_is_enforced_and_serves_requests() {
     std::fs::write(&regular, b"preserve").expect("write unrelated file");
     let regular_session = session(
         "regular",
-        "repo-regular",
+        "owner/repo-regular",
         WorkspaceEndpoint::Unix(regular.clone()),
         32,
         1,
@@ -1633,7 +1634,7 @@ async fn linux_data_socket_root_is_enforced_and_serves_requests() {
 
     let control_session = session(
         "control",
-        "repo-control",
+        "owner/repo-control",
         WorkspaceEndpoint::Unix(control.clone()),
         33,
         1,
@@ -1670,7 +1671,7 @@ async fn arrow_audit_sink_publishes_durable_single_batch_segments() {
         sequence: 1,
         timestamp_unix_ms: 1_700_000_000_000,
         workspace_id: "audit-ws".to_owned(),
-        repo_id: "repo-audit".to_owned(),
+        repo_id: "owner/repo-audit".to_owned(),
         revision: 3,
         endpoint: "127.0.0.1:40960".to_owned(),
         kind: AuditKind::Npm,
@@ -1696,7 +1697,7 @@ async fn arrow_audit_sink_publishes_durable_single_batch_segments() {
             sequence: 2,
             timestamp_unix_ms: 1_700_000_000_001,
             workspace_id: "audit-ws".to_owned(),
-            repo_id: "repo-audit".to_owned(),
+            repo_id: "owner/repo-audit".to_owned(),
             revision: 3,
             endpoint: "127.0.0.1:40960".to_owned(),
             kind: AuditKind::Http,
@@ -1821,7 +1822,7 @@ async fn control_socket_is_local_authenticated_and_reports_status() {
     let endpoint = free_endpoint();
     let (session, _token, _) = session(
         "controlled",
-        "repo-controlled",
+        "owner/repo-controlled",
         WorkspaceEndpoint::Tcp(endpoint),
         42,
         1,
@@ -1880,7 +1881,7 @@ async fn revision_tombstone_and_rotation_preserve_authority() {
     let make_session = |revision, endpoint| {
         session(
             "revision",
-            "repo-revision",
+            "owner/repo-revision",
             WorkspaceEndpoint::Tcp(endpoint),
             revision as u8,
             revision,
@@ -1973,7 +1974,7 @@ async fn audit_failure_is_fail_closed_and_marks_gateway_draining() {
     .await;
     let (installed, token, _) = session(
         "audit-failure",
-        "repo-audit-failure",
+        "owner/repo-audit-failure",
         WorkspaceEndpoint::Tcp(endpoint),
         21,
         1,
@@ -2015,7 +2016,7 @@ async fn audit_failure_is_fail_closed_and_marks_gateway_draining() {
     await_reclaimed(&gateway).await;
     let replacement = session(
         "audit-failure",
-        "repo-audit-failure",
+        "owner/repo-audit-failure",
         WorkspaceEndpoint::Tcp(endpoint),
         22,
         2,
@@ -2045,7 +2046,7 @@ async fn opaque_rejects_non_tls_missing_and_mismatched_sni_without_connector_cal
     .await;
     let (installed, token, _) = session(
         "opaque-validation",
-        "repo-opaque-validation",
+        "owner/repo-opaque-validation",
         WorkspaceEndpoint::Tcp(endpoint),
         23,
         1,
@@ -2139,7 +2140,7 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
         .await;
         let (installed, token, _) = session(
             "connect-failure",
-            "repo-connect-failure",
+            "owner/repo-connect-failure",
             WorkspaceEndpoint::Tcp(endpoint),
             24,
             1,
@@ -2192,7 +2193,7 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
         .await;
         let (installed, token, _) = session(
             "credential-failure",
-            "repo-credential-failure",
+            "owner/repo-credential-failure",
             WorkspaceEndpoint::Tcp(endpoint),
             25,
             1,
@@ -2242,7 +2243,7 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
         .await;
         let (installed, token, _) = session(
             "header-failure",
-            "repo-header-failure",
+            "owner/repo-header-failure",
             WorkspaceEndpoint::Tcp(endpoint),
             26,
             1,
@@ -2285,7 +2286,7 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
         .await;
         let (installed, token, _) = session(
             "disconnect",
-            "repo-disconnect",
+            "owner/repo-disconnect",
             WorkspaceEndpoint::Tcp(endpoint),
             27,
             1,
@@ -2352,7 +2353,7 @@ async fn queued_disconnect_and_drain_reclaim_all_capacity() {
     .await;
     let (installed, token, _) = session(
         "queue-cancel",
-        "repo-queue-cancel",
+        "owner/repo-queue-cancel",
         WorkspaceEndpoint::Tcp(endpoint),
         28,
         1,
@@ -2455,7 +2456,7 @@ async fn client_tls_failures_reclaim_permits_and_pre_admission_denials_are_audit
     .await;
     let (installed, token, _) = session(
         "client-tls",
-        "repo-client-tls",
+        "owner/repo-client-tls",
         WorkspaceEndpoint::Tcp(endpoint),
         29,
         1,
@@ -2570,7 +2571,7 @@ async fn h2_intercept_and_upstream_preserve_streaming_trailers_and_authority() {
     .await;
     let (installed, token, ca_certificate) = session(
         "h2-streaming",
-        "repo-h2-streaming",
+        "owner/repo-h2-streaming",
         WorkspaceEndpoint::Tcp(endpoint),
         31,
         1,
@@ -2685,7 +2686,7 @@ async fn upstream_tls_alpn_selects_h1_fallback_without_downgrading_h2() {
     .await;
     let (installed, token, ca_certificate) = session(
         "h2-h1-fallback",
-        "repo-h2-h1-fallback",
+        "owner/repo-h2-h1-fallback",
         WorkspaceEndpoint::Tcp(endpoint),
         32,
         1,
@@ -2759,7 +2760,7 @@ async fn missing_upstream_alpn_fails_without_sending_http1_bytes() {
     .await;
     let (installed, token, ca_certificate) = session(
         "no-upstream-alpn",
-        "repo-no-upstream-alpn",
+        "owner/repo-no-upstream-alpn",
         WorkspaceEndpoint::Tcp(endpoint),
         33,
         1,
@@ -2823,7 +2824,7 @@ async fn missing_downstream_alpn_is_not_silently_treated_as_http1() {
     let port = 443;
     let (installed, token, ca_certificate) = session(
         "no-downstream-alpn",
-        "repo-no-downstream-alpn",
+        "owner/repo-no-downstream-alpn",
         WorkspaceEndpoint::Tcp(endpoint),
         34,
         1,
@@ -2916,7 +2917,7 @@ async fn h2_session_cancellation_closes_stream_and_is_audited() {
     .await;
     let (installed, token, ca_certificate) = session(
         "cancel-h2",
-        "repo-cancel-h2",
+        "owner/repo-cancel-h2",
         WorkspaceEndpoint::Tcp(endpoint),
         35,
         1,
@@ -3009,7 +3010,7 @@ async fn h2_audit_failure_hard_stops_the_negotiated_connection() {
     let port = 443;
     let (installed, token, ca_certificate) = session(
         "h2-audit-stop",
-        "repo-h2-audit-stop",
+        "owner/repo-h2-audit-stop",
         WorkspaceEndpoint::Tcp(endpoint),
         36,
         1,
@@ -3071,7 +3072,7 @@ async fn direct_https_proxy_uses_negotiated_upstream_h2() {
     .await;
     let (installed, token, _) = session(
         "direct-h2",
-        "repo-direct-h2",
+        "owner/repo-direct-h2",
         WorkspaceEndpoint::Tcp(endpoint),
         37,
         1,
