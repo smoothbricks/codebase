@@ -5,6 +5,9 @@ import type { LogSchema } from '../schema/LogSchema.js';
 
 export type WasmNumericFamily = 'u8' | 'u32' | 'f64';
 
+const WASM_IDENTITY_BYTE_LENGTH = 128;
+const EXACT_FREELIST_METADATA_BYTE_LENGTH = 16;
+
 const EMPTY_EAGER_COLUMNS: EagerColumnDescriptor = Object.freeze({
   names: Object.freeze([]),
   words: Object.freeze([]),
@@ -50,6 +53,15 @@ export interface WasmSystemSlabLayoutDescriptor {
 
 export type WasmSlabLayoutDescriptor = WasmSystemSlabLayoutDescriptor | WasmNumericSlabLayoutDescriptor;
 
+export interface WasmSuperblockLayoutDescriptor {
+  readonly byteLength: number;
+  /** Bytes consumed by the previous separate-allocation shape from an 8-byte-aligned start. */
+  readonly legacyByteLength: number;
+  readonly identityOffset: 0 | null;
+  readonly systemOffset: number;
+  readonly familyOffsets: Readonly<Record<WasmNumericFamily, number>>;
+}
+
 export interface WasmPhysicalLayoutDescriptor {
   readonly capacity: number;
   readonly messageLayoutFamily: MessageLayoutFamily;
@@ -58,6 +70,8 @@ export interface WasmPhysicalLayoutDescriptor {
   readonly system: WasmSystemSlabLayoutDescriptor;
   readonly slabs: Readonly<Record<WasmNumericFamily, WasmNumericSlabLayoutDescriptor | null>>;
   readonly columns: readonly WasmColumnLayoutDescriptor[];
+  readonly spanSuperblock: WasmSuperblockLayoutDescriptor;
+  readonly overflowSuperblock: WasmSuperblockLayoutDescriptor;
 }
 
 export interface WasmLayoutTemplate {
@@ -70,6 +84,44 @@ export interface WasmLayoutTemplate {
 
 function align(value: number, alignment: number): number {
   return (value + alignment - 1) & ~(alignment - 1);
+}
+
+function freezeSuperblockLayout(
+  system: WasmSystemSlabLayoutDescriptor,
+  slabs: Readonly<Record<WasmNumericFamily, WasmNumericSlabLayoutDescriptor | null>>,
+  includesIdentity: boolean,
+): WasmSuperblockLayoutDescriptor {
+  let byteLength = includesIdentity ? WASM_IDENTITY_BYTE_LENGTH : 0;
+  let legacyByteLength = byteLength;
+  const systemAlignment = Math.max(system.alignment, 4);
+  const systemOffset = align(byteLength, systemAlignment);
+  byteLength = systemOffset + system.byteLength;
+  legacyByteLength =
+    align(legacyByteLength, systemAlignment) + Math.max(system.byteLength, EXACT_FREELIST_METADATA_BYTE_LENGTH);
+
+  const familyOffsets: Record<WasmNumericFamily, number> = { u8: 0, u32: 0, f64: 0 };
+  for (const family of ['u8', 'u32', 'f64'] as const) {
+    const slab = slabs[family];
+    if (slab === null) continue;
+    const storageAlignment = Math.max(slab.alignment, 4);
+    const offset = align(byteLength, storageAlignment);
+    familyOffsets[family] = offset;
+    byteLength = offset + slab.byteLength;
+    legacyByteLength =
+      align(legacyByteLength, storageAlignment) + Math.max(slab.byteLength, EXACT_FREELIST_METADATA_BYTE_LENGTH);
+  }
+
+  if (byteLength > legacyByteLength) {
+    throw new Error('WASM superblock exceeded its separate-allocation footprint');
+  }
+
+  return Object.freeze({
+    byteLength,
+    legacyByteLength,
+    identityOffset: includesIdentity ? 0 : null,
+    systemOffset,
+    familyOffsets: Object.freeze(familyOffsets),
+  });
 }
 
 function freezeExactLayout(
@@ -145,17 +197,20 @@ function freezeExactLayout(
     messageValueOffset,
   });
 
+  const slabs = Object.freeze({
+    u8: slab('u8', 1),
+    u32: slab('u32', 4),
+    f64: slab('f64', 8),
+  });
   return Object.freeze({
     capacity,
     messageLayoutFamily,
     messagePhysicalLayout,
     eagerColumns,
     system,
-    slabs: Object.freeze({
-      u8: slab('u8', 1),
-      u32: slab('u32', 4),
-      f64: slab('f64', 8),
-    }),
+    slabs,
+    spanSuperblock: freezeSuperblockLayout(system, slabs, true),
+    overflowSuperblock: freezeSuperblockLayout(system, slabs, false),
     columns: Object.freeze(columns),
   });
 }

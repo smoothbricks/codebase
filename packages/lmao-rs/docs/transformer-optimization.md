@@ -324,13 +324,40 @@ Loops, counts above `0xffff`, or unsafe context analysis encode adaptive capacit
 than whole-program or profile-guided row prediction, and normal overflow chaining remains the correctness fallback.
 Per-op specialized buffer-class generation remains future work.
 
-### D. Allocation batching across the wasm boundary (the batching that pays)
+### D. Allocation batching across the WASM boundary — runtime superblocks shipped
 
-Verdict 2 refuted _write_ batching — writes were never boundary crossings. Allocations are: with `WasmBufferStrategy`,
-span_start + identity + each lazy column's first touch are export calls (~40 ns each). A span touching 8 columns pays
-~10 crossings ≈ 400 ns. With B giving the transformer the op's full column set, it can emit one constant
-column-descriptor and call a (to-be-added) `lmao-wasm` export `alloc_span_with_columns(desc)` — one crossing, arena-side
-loop at ~20 ns/alloc native. ~10x on the per-span allocation overhead, purely additive to the existing ABI.
+Verdict 2 refuted _write_ batching — writes were never boundary crossings. Allocation batching does pay. The shipped
+WASM path now caches aligned root/child and overflow superblock descriptors, then uses one `create_and_start_span(...)`
+export for identity + system + every present numeric-family slab + lifecycle initialization, or one
+`create_overflow_span(...)` export for identity-free overflow storage. Release is likewise one export. The packed byte
+length is asserted never to exceed the previous separate-allocation footprint. Numeric first touch now binds a view into
+already-owned family storage; it does not allocate another WASM block.
+
+This runtime change does not need transformer proof and preserves the full-schema layout. A remaining transformer
+extension could emit each Op's proven numeric field subset so the superblock omits families or columns that operation
+cannot write. That is a memory/layout specialization, not another export-call batching requirement, and remains
+unimplemented pending semantic coverage for dynamic access, `.with(...)`, composed libraries, and untransformed callers.
+
+**Measured result (2026-07-14, Apple M5 Max, Bun 1.3.14, three Mitata runs).** The retained
+`packages/lmao/benchmarks/wasm-boundary.bench.ts` compares balanced allocate/start/free cycles using identical logical
+identity, system, u8, u32, and f64 storage:
+
+| Cycle             | Separate allocations | Superblock |                  Result |
+| ----------------- | -------------------: | ---------: | ----------------------: |
+| child span, run 1 |            460.50 ns |  464.43 ns |  superblock 0.9% slower |
+| child span, run 2 |            477.37 ns |  476.32 ns |  superblock 0.2% faster |
+| child span, run 3 |            453.03 ns |  463.58 ns |  superblock 2.3% slower |
+| overflow, run 1   |            391.17 ns |  345.90 ns | superblock 11.6% faster |
+| overflow, run 2   |            408.72 ns |  359.90 ns | superblock 11.9% faster |
+| overflow, run 3   |            402.54 ns |  352.01 ns | superblock 12.6% faster |
+
+The same machine measured a near-empty WASM call at 0.81–0.87 ns, not the historical ~40 ns estimate. The root/child
+path is therefore neutral within the 3% gate, not a demonstrated speed win; descriptor checks and identity/lifecycle
+initialization consume the saved call overhead. Overflow consistently improves because it avoids four exact
+alloc/free-list operations without identity setup. A representative capacity-64 mixed schema retained exactly the same
+allocator-visible bytes (span 1496B, overflow 1368B); property tests prove packed bytes are never greater across
+capacities 1–512. Keep the superblock for the bounded footprint, simpler ownership, one-call FFI surface, and measured
+overflow win—not for the superseded 10× span-setup projection.
 
 ### E. Compile-time row-header packing (the write batching that works)
 

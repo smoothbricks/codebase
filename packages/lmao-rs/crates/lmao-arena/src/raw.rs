@@ -89,6 +89,18 @@ pub const ENTRY_TYPE_SPAN_OK: u8 = 2;
 pub const ENTRY_TYPE_SPAN_ERR: u8 = 3;
 pub const ENTRY_TYPE_SPAN_EXCEPTION: u8 = 4;
 
+pub const SPAN_IDENTITY_ROOT: u8 = 0;
+pub const SPAN_IDENTITY_CHILD: u8 = 1;
+pub const NO_LAYOUT_OFFSET: u32 = u32::MAX;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpanLayout {
+    pub superblock_byte_len: u32,
+    pub system_offset: u32,
+    pub entry_type_offset: u32,
+    pub row_header_offset: u32,
+}
+
 #[inline]
 fn freelist_off(sc: SizeClass, tier: usize) -> u32 {
     H_FREELISTS + 4 * (sc as u32 * NUM_TIERS as u32 + tier as u32)
@@ -517,6 +529,14 @@ pub fn free_identity<M: Mem>(m: &mut M, offset: u32) {
     bump_counter(m, H_FREE_COUNT);
 }
 
+fn initialize_identity<M: Mem>(m: &mut M, offset: u32, trace_id_len: u32) {
+    let span_id = m.read_u32(H_SPAN_ID_COUNTER) + 1;
+    m.write_u32(H_SPAN_ID_COUNTER, span_id);
+    m.write_u32(offset + ID_SPAN_ID, span_id);
+    m.write_u32(offset + ID_WRITE_INDEX, 0);
+    m.write_u8(offset + ID_TRACE_ID_LEN, trace_id_len as u8);
+}
+
 /// `alloc_identity_root_for_js_write` — returns `(identity_offset << 32) | trace_id_field_offset`,
 /// 0 if the trace id is too long (or OOM).
 pub fn alloc_identity_root_for_js_write<M: Mem>(m: &mut M, trace_id_len: u32) -> u64 {
@@ -528,11 +548,7 @@ pub fn alloc_identity_root_for_js_write<M: Mem>(m: &mut M, trace_id_len: u32) ->
         return 0;
     }
     clear_bytes(m, offset, IDENTITY_SIZE as u32);
-    let span_id = m.read_u32(H_SPAN_ID_COUNTER) + 1;
-    m.write_u32(H_SPAN_ID_COUNTER, span_id);
-    m.write_u32(offset + ID_SPAN_ID, span_id);
-    m.write_u32(offset + ID_WRITE_INDEX, 0);
-    m.write_u8(offset + ID_TRACE_ID_LEN, trace_id_len as u8);
+    initialize_identity(m, offset, trace_id_len);
     let trace_id_field_offset = offset + ID_TRACE_ID;
     (u64::from(offset) << 32) | u64::from(trace_id_field_offset)
 }
@@ -544,11 +560,7 @@ pub fn alloc_identity_child<M: Mem>(m: &mut M) -> u32 {
         return 0;
     }
     clear_bytes(m, offset, IDENTITY_SIZE as u32);
-    let span_id = m.read_u32(H_SPAN_ID_COUNTER) + 1;
-    m.write_u32(H_SPAN_ID_COUNTER, span_id);
-    m.write_u32(offset + ID_SPAN_ID, span_id);
-    m.write_u32(offset + ID_WRITE_INDEX, 0);
-    m.write_u8(offset + ID_TRACE_ID_LEN, 0); // child uses parent's trace_id
+    initialize_identity(m, offset, 0);
     offset
 }
 
@@ -655,6 +667,107 @@ pub fn timestamp_nanos<M: Mem>(m: &M, trace_root_ptr: u32, current_ms: f64) -> i
 
 // --- Span lifecycle ---
 // Span system layout: [timestamp: i64 × capacity][entry_type: u8 × capacity]
+
+fn span_layout_is_valid(layout: SpanLayout) -> bool {
+    let SpanLayout {
+        superblock_byte_len,
+        system_offset,
+        entry_type_offset,
+        row_header_offset,
+    } = layout;
+    if superblock_byte_len < IDENTITY_SIZE as u32 + 16
+        || system_offset < IDENTITY_SIZE as u32
+        || !system_offset.is_multiple_of(8)
+    {
+        return false;
+    }
+    let Some(timestamp_end) = system_offset.checked_add(16) else {
+        return false;
+    };
+    if timestamp_end > superblock_byte_len {
+        return false;
+    }
+
+    match (
+        entry_type_offset != NO_LAYOUT_OFFSET,
+        row_header_offset != NO_LAYOUT_OFFSET,
+    ) {
+        (true, false) => system_offset
+            .checked_add(entry_type_offset)
+            .and_then(|offset| offset.checked_add(2))
+            .is_some_and(|end| end <= superblock_byte_len),
+        (false, true) => system_offset
+            .checked_add(row_header_offset)
+            .and_then(|offset| offset.checked_add(8))
+            .is_some_and(|end| end <= superblock_byte_len),
+        _ => false,
+    }
+}
+
+/// Allocate one span-owned superblock, initialize its embedded identity, and
+/// pre-arm the two lifecycle rows.
+pub fn create_and_start_span<M: Mem>(
+    m: &mut M,
+    identity_mode: u8,
+    trace_id_len: u32,
+    layout: SpanLayout,
+    trace_root_ptr: u32,
+    current_ms: f64,
+) -> u32 {
+    let valid_identity = match identity_mode {
+        SPAN_IDENTITY_ROOT => trace_id_len <= ID_TRACE_ID_MAX,
+        SPAN_IDENTITY_CHILD => trace_id_len == 0,
+        _ => false,
+    };
+    if !valid_identity || !span_layout_is_valid(layout) {
+        return 0;
+    }
+    let SpanLayout {
+        superblock_byte_len,
+        system_offset,
+        entry_type_offset,
+        row_header_offset,
+    } = layout;
+
+    let superblock_ptr = alloc_exact(m, superblock_byte_len, 8);
+    if superblock_ptr == 0 {
+        return 0;
+    }
+
+    initialize_identity(m, superblock_ptr, trace_id_len);
+    let system_ptr = superblock_ptr + system_offset;
+    let timestamp = timestamp_nanos(m, trace_root_ptr, current_ms);
+    m.write_i64(system_ptr, timestamp);
+    m.write_i64(system_ptr + 8, 0);
+    if row_header_offset == NO_LAYOUT_OFFSET {
+        m.write_u8(system_ptr + entry_type_offset, ENTRY_TYPE_SPAN_START);
+        m.write_u8(
+            system_ptr + entry_type_offset + 1,
+            ENTRY_TYPE_SPAN_EXCEPTION,
+        );
+    } else {
+        m.write_u32(
+            system_ptr + row_header_offset,
+            u32::from(ENTRY_TYPE_SPAN_START),
+        );
+        m.write_u32(
+            system_ptr + row_header_offset + 4,
+            u32::from(ENTRY_TYPE_SPAN_EXCEPTION),
+        );
+    }
+    m.write_u32(superblock_ptr + ID_WRITE_INDEX, 2);
+    superblock_ptr
+}
+
+/// Allocate the storage-only superblock for an overflow segment. It deliberately
+/// omits identity and lifecycle rows, so its logical byte length is never larger
+/// than the equivalent separately allocated system/family slabs.
+pub fn create_overflow_span<M: Mem>(m: &mut M, superblock_byte_len: u32) -> u32 {
+    if superblock_byte_len < 16 {
+        return 0;
+    }
+    alloc_exact(m, superblock_byte_len, 8)
+}
 
 /// `span_start` — row 0 = span-start, row 1 pre-armed span-exception, write_index = 2.
 pub fn span_start<M: Mem>(
