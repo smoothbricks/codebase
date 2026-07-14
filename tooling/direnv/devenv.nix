@@ -47,6 +47,21 @@ in {
           "aarch64-unknown-linux-gnu"
         ];
     })
+    # Nightly rides alongside stable as an explicit `cargo-nightly` shim, so
+    # stable stays the default for every existing target. Only the wasm
+    # artifact build uses it: -Zbuild-std + panic=immediate-abort strips the
+    # fmt/panic machinery stable cannot remove (packages/columine justfile
+    # `wasm`; same shim as AxE's devenv). rust-src is required by -Zbuild-std.
+    (let
+      nightly = rust-bin.nightly.latest.minimal.override {
+        extensions = ["rust-src"];
+      };
+    in
+      pkgs.writeShellScriptBin "cargo-nightly" ''
+        export RUSTC="${nightly}/bin/rustc"
+        exec "${nightly}/bin/cargo" "$@"
+      '')
+    just # Task runner for packages/columine (mirrors lmao-rs/axe justfiles)
     cargo-nextest # Rust test runner
     cargo-mutants # Mutation target inferred by @smoothbricks/nx-plugin
     # Go toolchain for packages/lmao-ttsc/plugin (ttsc transform plugin)
