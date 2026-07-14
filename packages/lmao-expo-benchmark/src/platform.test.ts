@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'bun:test';
 import { createTraceRoot } from '@smoothbricks/lmao/node';
 
-import { type PlatformScenarioOptions, type PlatformScenarioResult, runPlatformScenario } from './platform.js';
-import type { ScenarioTraceRootFactory } from './scenario.js';
+import {
+  type PlatformScenarioOptions,
+  type PlatformScenarioResult,
+  runPlatformScenario,
+} from '../../lmao/benchmarks/plugin-scenario/platform.js';
+import type { ScenarioTraceRootFactory } from '../../lmao/benchmarks/plugin-scenario/scenario.js';
 
 const COMMON_OPTIONS = {
   platform: 'test-platform',
