@@ -1,11 +1,8 @@
-#[path = "../src/launchd.rs"]
-mod launchd;
-
 use std::path::{Path, PathBuf};
 
-use launchd::{
-    plan_install, plan_remove, ExistingPlist, InstallState, LaunchAgentSpec, LaunchdError,
-    Mutation, ServiceLifecycle, GATEWAY_LABEL, PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE,
+use cowshed_cli::launchd::{
+    ExistingPlist, GATEWAY_LABEL, InstallState, LaunchAgentSpec, LaunchdError, Mutation,
+    PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE, ServiceLifecycle, plan_install, plan_remove,
 };
 
 const HOME: &str = "/Users/cowshed-test";
