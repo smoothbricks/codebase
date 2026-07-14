@@ -143,16 +143,25 @@ fn every_zig_dispatched_byte_decodes_in_types_registry() {
     }
 }
 
-/// FlatUndoOp: the undo-entry wire ops. Rust declarations must match the
-/// frozen set byte-for-byte and the Rust rollback/decode dispatch must cover
-/// every declared op. (The frozen Zig rollbackEntry covered all 13 — pinned
-/// at harvest time.)
+/// FlatUndoOp: the undo-entry wire ops. The frozen Zig-ABI set must remain a
+/// subset (the tombstone never shrinks or renumbers), post-parity extensions
+/// are the explicit allowlist below, and the Rust rollback/decode dispatch
+/// must cover every declared op.
 #[test]
 fn flat_undo_op_registry_and_rollback_arms_match_fixture() {
+    // WHY an allowlist: the wire contract is ours to evolve post-cutover,
+    // but every extension must be named here deliberately — an unlisted new
+    // op fails the audit exactly like a dropped frozen op.
+    const POST_PARITY_EXTENSIONS: &[(&str, u8)] = &[
+        // Scalar writes were un-journaled in the frozen Zig ABI; journaled
+        // deliberately at the post-parity sweep.
+        ("ScalarUpdate", 14),
+    ];
+
     let rust_undo = read_source(MANIFEST, "src/undo_log.rs");
     let rust_vm = read_source(MANIFEST, "src/vm.rs");
 
-    let frozen: BTreeMap<String, u8> = FLAT_UNDO_OPS
+    let mut frozen: BTreeMap<String, u8> = FLAT_UNDO_OPS
         .iter()
         .map(|(n, b)| (n.to_string(), *b))
         .collect();
@@ -165,9 +174,16 @@ fn flat_undo_op_registry_and_rollback_arms_match_fixture() {
         "frozen FlatUndoOp fixture rotted: {}",
         frozen.len()
     );
+    for (name, byte) in POST_PARITY_EXTENSIONS {
+        assert!(
+            !frozen.values().any(|b| b == byte),
+            "extension {name} reuses a frozen ABI byte {byte:#04x}"
+        );
+        frozen.insert(norm(name), *byte);
+    }
     assert_eq!(
         frozen, rust_decls,
-        "FlatUndoOp declarations diverged from the frozen vm.zig ABI"
+        "FlatUndoOp declarations diverged from frozen ABI + named extensions"
     );
 
     let declared_names: BTreeSet<String> = frozen.keys().cloned().collect();

@@ -781,31 +781,12 @@ pub fn has_array_fields(num_fields: u8, field_types: &[u8]) -> bool {
         })
 }
 
-pub const fn arena_initial_capacity(hash_capacity: u32) -> u32 {
-    hash_capacity * 4
-}
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StructRowLayout {
     pub row_size: u32,
     pub bitset_bytes: u32,
     pub descriptor_size: u32,
-}
-
-pub fn compute_struct_row_layout(num_fields: u8, field_types: &[u8]) -> StructRowLayout {
-    let bitset_bytes = u32::from(num_fields).div_ceil(8);
-    let mut row_size = bitset_bytes;
-    for &field_type in field_types.iter().take(usize::from(num_fields)) {
-        row_size += struct_field_size(StructFieldType::from_u8(field_type).unwrap_or_else(|| {
-            crate::die!("invariant: struct-map descriptor contains an invalid field type")
-        }));
-    }
-    StructRowLayout {
-        row_size,
-        bitset_bytes,
-        descriptor_size: align8(u32::from(num_fields)),
-    }
 }
 
 pub fn struct_field_offset(num_fields: u8, field_types: &[u8], target_field: u8) -> u32 {
@@ -1046,16 +1027,9 @@ mod tests {
             StructFieldType::ArrayBool as u8,
             StructFieldType::Int64 as u8,
         ];
-        let layout = compute_struct_row_layout(4, &fields);
-        // bitset(1) + 1 + 8 + 8 + 8
-        assert_eq!(
-            layout,
-            StructRowLayout {
-                row_size: 26,
-                bitset_bytes: 1,
-                descriptor_size: 8
-            }
-        );
+        // (Row layout itself is computed by the one authoritative padded
+        // helper in columine-vm's state_init; only field-level helpers live
+        // here.)
         assert_eq!(struct_field_offset(4, &fields, 3), 1 + 1 + 8 + 8);
         assert!(has_array_fields(4, &fields));
         assert_eq!(arena_elem_size(StructFieldType::ArrayU32), 4);
@@ -1094,20 +1068,11 @@ mod tests {
         assert_eq!(align8(9), 16);
         assert_eq!(next_power_of_2(0), 16);
         assert_eq!(next_power_of_2(17), 32);
-        assert_eq!(arena_initial_capacity(16), 64);
 
         let fields = [
             StructFieldType::UInt32 as u8,
             StructFieldType::Float64 as u8,
         ];
-        assert_eq!(
-            compute_struct_row_layout(2, &fields),
-            StructRowLayout {
-                row_size: 13,
-                bitset_bytes: 1,
-                descriptor_size: 8
-            }
-        );
         assert_eq!(struct_field_offset(2, &fields, 1), 5);
         assert!(!has_array_fields(2, &fields));
     }

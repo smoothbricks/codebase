@@ -155,21 +155,18 @@ fn compute_struct_row_layout_8_fields_all_uint32() {
     assert_eq!(layout.descriptor_size, 8);
 }
 
-/// Pin the DRIFT between the two Zig copies: the padded (state_init) row size
-/// differs from the unpadded (types.zig) one exactly when row_data % 4 != 0.
+/// The one authoritative layout helper set (the deleted Zig carried a
+/// drifted types.zig twin — unpadded rows, cap*4 arenas — deleted
+/// post-parity along with its Rust port).
 #[test]
-fn padded_layout_drifts_from_types_zig_copy() {
+fn authoritative_layout_helpers_are_padded_and_cap64() {
     let fields = [
         StructFieldType::UInt32 as u8,
         StructFieldType::Float64 as u8,
     ];
     let padded = compute_struct_row_layout_padded(2, &fields);
-    let unpadded = columine_types::types::compute_struct_row_layout(2, &fields);
-    assert_eq!(padded.row_size, 16); // 1+4+8 = 13 → 16
-    assert_eq!(unpadded.row_size, 13);
-    // Arena sizing drift: 64 vs 4 bytes per entry.
+    assert_eq!(padded.row_size, 16); // 1+4+8 = 13 → padded to 16
     assert_eq!(arena_initial_capacity_64(16), 1024);
-    assert_eq!(columine_types::types::arena_initial_capacity(16), 64);
 }
 
 // ---------------------------------------------------------------------------

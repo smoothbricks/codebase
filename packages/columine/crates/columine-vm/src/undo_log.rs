@@ -46,6 +46,10 @@ pub enum FlatUndoOp {
     ListAppendUndo = 10,
     /// Rollback: restore prev count (u64) — 8-byte COUNT slot.
     CountUpdate = 11,
+    /// Rollback: restore prev scalar value (aux) + cmp timestamp
+    /// (prev_value low + key high) — 16-byte SCALAR slot. Post-parity
+    /// extension: the frozen Zig ABI never journaled scalar writes.
+    ScalarUpdate = 14,
     /// Rollback a single struct-map scalar field to a captured (bit, bytes)
     /// state, or remove a newly-created row (vm.zig:157 doc: slot = dest
     /// slot; key = row key; `_pad1` = field_idx; `_pad2` = SMF flags; aux =
@@ -134,6 +138,7 @@ impl FlatUndoEntry {
             9 => FlatUndoOp::FactRetract,
             10 => FlatUndoOp::ListAppendUndo,
             11 => FlatUndoOp::CountUpdate,
+            14 => FlatUndoOp::ScalarUpdate,
             12 => FlatUndoOp::StructMapField,
             13 => FlatUndoOp::StructMapRow,
             _ => return None,
@@ -176,7 +181,7 @@ fn ts_off(meta: &SlotMetaView, pos: u32) -> u32 {
     meta.offset + meta.capacity * 8 + pos * 8
 }
 
-// ZIG-PARITY: rollback is logical, not byte-exact — insert rolls back to TOMBSTONE (not EMPTY) and dead cells keep stale value/timestamp bytes; intended fix: decide the byte-exactness contract with Scenario fork navigation, then either restore bytes or spec logical equality.
+// WHY (kept contract, documented): rollback is logical, not byte-exact — insert rolls back to TOMBSTONE (not EMPTY) and dead cells keep stale value/timestamp bytes; intended fix: decide the byte-exactness contract with Scenario fork navigation, then either restore bytes or spec logical equality.
 /// undo_log.zig:29 `rollbackMapInsert` — tombstone key, decrement size.
 pub fn rollback_map_insert(state: &mut [u8], meta: &SlotMetaView, key: u32) -> bool {
     let tbl = bind_map(meta);
@@ -239,24 +244,30 @@ pub fn rollback_map_delete(
 
 /// undo_log.zig:70 `rollbackAggUpdate` — restore previous value bits and
 /// count of a 16-byte SUM/MIN/MAX/AVG slot (`[value: u64][count: u64]`).
-// ZIG-PARITY: agg-count rollback truncates the u64 count through the u32 prev_value lane (counts above u32::MAX roll back wrong); intended fix: widen the journal lane.
-// The journal carries the u64 count truncated to the entry's u32 prev_value
-// lane and zero-extends it back (undo_log.zig:69 doc admits the truncation).
+// The full u64 count rides the entry's prev_value (low) + key (high) lanes —
+// the deleted Zig truncated to u32, so counts past u32::MAX rolled back wrong.
 pub fn rollback_agg_update(
     state: &mut [u8],
     meta: &SlotMetaView,
-    prev_count: u32,
+    prev_count: u64,
     prev_val_bits: u64,
 ) {
     bytes::write_u64(state, meta.offset, prev_val_bits);
-    bytes::write_u64(state, meta.offset + 8, u64::from(prev_count));
+    bytes::write_u64(state, meta.offset + 8, prev_count);
 }
 
 /// undo_log.zig:79 `rollbackCountUpdate` — restore the count of an 8-byte
 /// COUNT-only slot.
-// ZIG-PARITY: same u64→u32→u64 count truncation as rollback_agg_update.
-pub fn rollback_count_update(state: &mut [u8], meta: &SlotMetaView, prev_count: u32) {
-    bytes::write_u64(state, meta.offset, u64::from(prev_count));
+// Full u64 count (prev_value low + key high lanes) — see rollback_agg_update.
+pub fn rollback_count_update(state: &mut [u8], meta: &SlotMetaView, prev_count: u64) {
+    bytes::write_u64(state, meta.offset, prev_count);
+}
+
+/// Post-parity ScalarUpdate: restore a 16-byte SCALAR slot's value bytes and
+/// comparison timestamp (the deleted Zig never journaled scalar writes).
+pub fn rollback_scalar_update(state: &mut [u8], meta: &SlotMetaView, value: u64, ts: f64) {
+    bytes::write_u64(state, meta.offset, value);
+    bytes::write_f64(state, meta.offset + 8, ts);
 }
 
 /// undo_log.zig:89 `rollbackSetInsert` — tombstone element, decrement size.
@@ -338,11 +349,12 @@ mod tests {
         assert_eq!(FlatUndoOp::CountUpdate as u8, 11);
         assert_eq!(FlatUndoOp::StructMapField as u8, 12);
         assert_eq!(FlatUndoOp::StructMapRow as u8, 13);
+        assert_eq!(FlatUndoOp::ScalarUpdate as u8, 14); // post-parity extension
         assert_eq!(FlatUndoEntry::read_from(&[0u8; 24]), None); // 0 invalid
         assert_eq!(
             FlatUndoEntry::read_from(&{
                 let mut b = [0u8; 24];
-                b[0] = 14;
+                b[0] = 15;
                 b
             }),
             None
