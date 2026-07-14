@@ -255,6 +255,7 @@ trait EvidenceSource {
         command: &HostCommand,
     ) -> Result<HostCommandOutput, NativeBootstrapError>;
     fn inspect_mountpoint(&mut self, path: &Path) -> Result<MountpointState, NativeBootstrapError>;
+    fn mounted_identifier(&mut self, path: &Path) -> Result<String, NativeBootstrapError>;
 }
 
 struct SystemEvidenceSource<'a> {
@@ -275,6 +276,17 @@ impl EvidenceSource for SystemEvidenceSource<'_> {
 
     fn inspect_mountpoint(&mut self, path: &Path) -> Result<MountpointState, NativeBootstrapError> {
         self.host.inspect_mountpoint(path).map_err(Into::into)
+    }
+
+    fn mounted_identifier(&mut self, path: &Path) -> Result<String, NativeBootstrapError> {
+        let snapshot = system_statfs(path)?;
+        if snapshot.mountpoint != path {
+            return Err(NativeBootstrapError::MountEvidenceMismatch {
+                path: path.to_owned(),
+                identifier: snapshot.mount_source.display().to_string(),
+            });
+        }
+        exact_device_identifier(&snapshot.mount_source)
     }
 }
 
@@ -563,8 +575,15 @@ fn classify_volume(
             }),
         };
     };
-    match (&volume.mountpoint, state) {
-        (Some(actual), MountpointState::Mounted { marker }) if actual == expected_mountpoint => {
+    match state {
+        MountpointState::Mounted { marker } => {
+            let mounted_identifier = source.mounted_identifier(expected_mountpoint)?;
+            if mounted_identifier != volume.identifier {
+                return Err(NativeBootstrapError::MountEvidenceMismatch {
+                    path: expected_mountpoint.to_owned(),
+                    identifier: mounted_identifier,
+                });
+            }
             require_mounted_marker(marker.as_deref(), role, SubstrateKind::Apfs).map_err(
                 |error| NativeBootstrapError::InvalidMountedMarker {
                     path: expected_mountpoint.to_owned(),
@@ -573,26 +592,20 @@ fn classify_volume(
             )?;
             Ok(ExistingStorage::mounted_valid(&volume.identifier))
         }
-        (None, MountpointState::Missing | MountpointState::EmptyDirectory) => {
-            Err(NativeBootstrapError::UnauthenticatedUnmountedVolume {
+        MountpointState::Missing | MountpointState::EmptyDirectory => match &volume.mountpoint {
+            None => Err(NativeBootstrapError::UnauthenticatedUnmountedVolume {
                 identifier: volume.identifier.clone(),
-            })
-        }
-        (_, MountpointState::NonEmptyDirectoryWithoutMount) => {
+            }),
+            Some(mountpoint) => Err(NativeBootstrapError::InvalidVolumeMountpoint {
+                identifier: volume.identifier.clone(),
+                mountpoint: Some(mountpoint.clone()),
+            }),
+        },
+        MountpointState::NonEmptyDirectoryWithoutMount => {
             Err(NativeBootstrapError::MaskedMountpoint {
                 path: expected_mountpoint.to_owned(),
             })
         }
-        (Some(actual), _) if actual != expected_mountpoint => {
-            Err(NativeBootstrapError::InvalidVolumeMountpoint {
-                identifier: volume.identifier.clone(),
-                mountpoint: volume.mountpoint.clone(),
-            })
-        }
-        _ => Err(NativeBootstrapError::MountEvidenceMismatch {
-            path: expected_mountpoint.to_owned(),
-            identifier: volume.identifier.clone(),
-        }),
     }
 }
 
@@ -943,6 +956,7 @@ mod tests {
         statfs: StatFsSnapshot,
         command_output: HostCommandOutput,
         mountpoints: BTreeMap<PathBuf, MountpointState>,
+        mounted_identifiers: BTreeMap<PathBuf, String>,
         commands: Vec<HostCommand>,
     }
 
@@ -967,6 +981,15 @@ mod tests {
                 NativeBootstrapError::MountEvidenceMismatch {
                     path: path.to_owned(),
                     identifier: "missing test evidence".to_owned(),
+                }
+            })
+        }
+
+        fn mounted_identifier(&mut self, path: &Path) -> Result<String, NativeBootstrapError> {
+            self.mounted_identifiers.get(path).cloned().ok_or_else(|| {
+                NativeBootstrapError::MountEvidenceMismatch {
+                    path: path.to_owned(),
+                    identifier: "missing mounted identifier test evidence".to_owned(),
                 }
             })
         }
@@ -1014,6 +1037,13 @@ mod tests {
                 (
                     PathBuf::from("/Users/alice/.cowshed/caches"),
                     MountpointState::Missing,
+                ),
+            ]),
+            mounted_identifiers: BTreeMap::from([
+                (PathBuf::from("/Users/alice/.cowshed"), "disk3s8".to_owned()),
+                (
+                    PathBuf::from("/Users/alice/.cowshed/caches"),
+                    "disk3s9".to_owned(),
                 ),
             ]),
             commands: Vec::new(),
@@ -1077,11 +1107,11 @@ mod tests {
     }
 
     #[test]
-    fn mounted_markers_are_validated_and_duplicate_names_are_ambiguous() {
+    fn kernel_mount_identity_and_marker_override_omitted_inventory_mountpoint() {
         let marker = VolumeMarker::new(VolumeRole::Store, SubstrateKind::Apfs)
             .to_json()
             .unwrap();
-        let volumes = volume(APFS_STORE_VOLUME, "disk3s8", Some("/Users/alice/.cowshed"))
+        let volumes = volume(APFS_STORE_VOLUME, "disk3s8", None)
             + &volume("Data", "disk3s5", Some("/System/Volumes/Data"));
         let inventory = plist(&container("disk3", &volumes));
         let mut valid = source(inventory.clone());
