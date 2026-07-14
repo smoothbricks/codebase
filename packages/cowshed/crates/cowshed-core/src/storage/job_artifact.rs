@@ -37,8 +37,14 @@ const BATCH_MAGIC: &[u8; 8] = b"CSBATCH1";
 const BATCH_TRAILER: &[u8; 8] = b"CSEND001";
 const FRAME_HEADER_BYTES: usize = 24;
 const FRAME_OVERHEAD_BYTES: usize = FRAME_HEADER_BYTES + 32 + BATCH_TRAILER.len();
-const MAX_RECORD_BATCH_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_RECORD_BATCH_BYTES: u64 = 8_388_608;
+const IO_BUFFER_BYTES: usize = 65_536;
 const RECORD_SCHEMA_VERSION: u64 = 2;
+#[cfg(unix)]
+const SECURE_DIRECTORY_OPEN_FLAGS: libc::c_int =
+    libc::O_DIRECTORY + libc::O_NOFOLLOW + libc::O_CLOEXEC;
+#[cfg(unix)]
+const SECURE_FILE_OPEN_FLAGS: libc::c_int = libc::O_NOFOLLOW + libc::O_CLOEXEC;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicationStage {
@@ -491,6 +497,20 @@ impl BufferBudget {
             .used
             .checked_sub(bytes)
             .expect("artifact stream releases only its own reservation");
+    }
+}
+fn reconcile_capacity_growth(
+    budget: &mut BufferBudget,
+    reserved_growth: usize,
+    actual_growth: usize,
+) -> bool {
+    match actual_growth.cmp(&reserved_growth) {
+        std::cmp::Ordering::Greater => budget.try_reserve(actual_growth - reserved_growth),
+        std::cmp::Ordering::Less => {
+            budget.release(reserved_growth - actual_growth);
+            true
+        }
+        std::cmp::Ordering::Equal => true,
     }
 }
 
@@ -1289,12 +1309,9 @@ impl StreamWriterState {
             return Err(ArtifactError::BufferAllocation);
         }
         let actual_growth = buffer.capacity().saturating_sub(old_capacity);
-        if actual_growth > reserved_growth && !budget.try_reserve(actual_growth - reserved_growth) {
+        if !reconcile_capacity_growth(budget, reserved_growth, actual_growth) {
             budget.release(reserved_growth);
             return Ok(false);
-        }
-        if actual_growth < reserved_growth {
-            budget.release(reserved_growth - actual_growth);
         }
         let Some(new_reserved) = self.reserved.checked_add(actual_growth) else {
             budget.release(actual_growth);
@@ -1453,7 +1470,6 @@ fn create_protected_file(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         options.mode(0o600);
     }
     let file = options
@@ -1541,7 +1557,7 @@ fn read_file_verified(
     let mut hasher = Sha256::new();
     let mut observed = 0_u64;
     let mut output = Vec::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = [0_u8; IO_BUFFER_BYTES];
     loop {
         let read = file
             .read(&mut buffer)
@@ -1594,12 +1610,7 @@ fn open_artifact_no_follow(
     let absolute = workspace_root.join(relative.as_path());
     let root_name = CString::new(workspace_root.as_os_str().as_bytes())
         .map_err(|_| integrity(0, "workspace root contains a NUL byte"))?;
-    let root_fd = unsafe {
-        libc::open(
-            root_name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
+    let root_fd = unsafe { libc::open(root_name.as_ptr(), SECURE_DIRECTORY_OPEN_FLAGS) };
     if root_fd == -1 {
         return Err(io_error(workspace_root, io::Error::last_os_error()));
     }
@@ -1615,10 +1626,11 @@ fn open_artifact_no_follow(
         let name = CString::new(name.as_bytes())
             .map_err(|_| integrity(0, "protected artifact path contains a NUL byte"))?;
         let last = index + 1 == components.len();
-        let flags = libc::O_RDONLY
-            | libc::O_NOFOLLOW
-            | libc::O_CLOEXEC
-            | if last { 0 } else { libc::O_DIRECTORY };
+        let flags = if last {
+            SECURE_FILE_OPEN_FLAGS
+        } else {
+            SECURE_DIRECTORY_OPEN_FLAGS
+        };
         let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
         if fd == -1 {
             return Err(io_error(&absolute, io::Error::last_os_error()));
@@ -1651,11 +1663,11 @@ fn hash_file_incrementally(path: &Path) -> Result<Sha256Digest, ArtifactError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = options.open(path).map_err(|error| io_error(path, error))?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = [0_u8; IO_BUFFER_BYTES];
     loop {
         let read = file
             .read(&mut buffer)
@@ -1726,7 +1738,7 @@ impl VerifiedStreamReader<'_> {
     }
 
     pub fn finish(mut self) -> Result<(), ArtifactError> {
-        let mut buffer = [0_u8; 64 * 1024];
+        let mut buffer = [0_u8; IO_BUFFER_BYTES];
         while self.read_chunk(&mut buffer)? != 0 {}
         Ok(())
     }
@@ -1810,7 +1822,7 @@ pub fn read_stream(workspace_root: &Path, stream: &StreamInfo) -> Result<Vec<u8>
         .try_reserve_exact(capacity)
         .map_err(|_| ArtifactError::BufferAllocation)?;
     let mut reader = open_stream_reader(workspace_root, stream)?;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = [0_u8; IO_BUFFER_BYTES];
     loop {
         let read = reader.read_chunk(&mut buffer)?;
         if read == 0 {
@@ -4024,6 +4036,31 @@ mod tests {
         running_inline.visible_jobs[0].state = JobState::Running;
         manifests.push(("running inline prefix", running_inline));
 
+        let mut running_stdout_only = valid_manifest.clone();
+        running_stdout_only.visible_jobs[0].state = JobState::Running;
+        running_stdout_only.visible_jobs[0].stdout = VisibleStreamCommitment {
+            storage_kind: VisibleStorageKind::CapturedFile,
+            bytes: 0,
+            sha256: Sha256Digest::compute(b""),
+            protected_path: Some(WorkspacePath::new(".cowshed/job/1/out").unwrap()),
+        };
+        manifests.push(("running with only stdout durable", running_stdout_only));
+
+        let mut running_stderr_only = valid_manifest.clone();
+        running_stderr_only.visible_jobs[0].state = JobState::Running;
+        running_stderr_only.visible_jobs[0].stderr = VisibleStreamCommitment {
+            storage_kind: VisibleStorageKind::CapturedFile,
+            bytes: 0,
+            sha256: Sha256Digest::compute(b""),
+            protected_path: Some(WorkspacePath::new(".cowshed/job/1/err").unwrap()),
+        };
+        manifests.push(("running with only stderr durable", running_stderr_only));
+
+        let mut inline_with_path = valid_manifest.clone();
+        inline_with_path.visible_jobs[0].stdout.protected_path =
+            Some(WorkspacePath::new(".cowshed/job/1/out").unwrap());
+        manifests.push(("inline commitment with protected path", inline_with_path));
+
         for (case, manifest) in manifests {
             assert!(
                 matches!(manifest.validate(), Err(ArtifactError::Integrity { .. })),
@@ -4119,6 +4156,26 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_preserves_non_not_found_metadata_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("checkpoint-metadata-error");
+        let mut store = store_at(&root, ArtifactConfig::default());
+        let job_root = ensure_private_job_root(&root).unwrap();
+        fs::set_permissions(&job_root, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let error = store.checkpoint(1).unwrap_err();
+        assert!(
+            matches!(error, ArtifactError::Io { path, .. } if path == records_path(&root)),
+            "checkpoint must return the records metadata error without attempting publication"
+        );
+
+        fs::set_permissions(&job_root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn reopened_checkpoint_barriers_are_scoped_to_their_manifest_origin() {
         let historical = WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").unwrap();
@@ -4198,6 +4255,22 @@ mod tests {
             budget.release(release);
         }
         assert_eq!(budget.used, 0);
+
+        let cases = [
+            (3, 5, 3, 5, true, 5),
+            (3, 4, 3, 5, false, 3),
+            (3, 5, 3, 2, true, 2),
+            (3, 5, 3, 3, true, 3),
+        ];
+        for (used, limit, reserved, actual, accepted, expected_used) in cases {
+            let mut budget = BufferBudget { used, limit };
+            assert_eq!(
+                reconcile_capacity_growth(&mut budget, reserved, actual),
+                accepted,
+                "used={used}, limit={limit}, reserved={reserved}, actual={actual}"
+            );
+            assert_eq!(budget.used, expected_used);
+        }
     }
 
     #[test]

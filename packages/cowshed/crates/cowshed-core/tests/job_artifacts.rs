@@ -1218,6 +1218,18 @@ fn verified_file_rejects_each_metadata_length_and_hash_violation() {
             )),
             Mutation::Symlink => assert!(matches!(error, ArtifactError::Io { .. })),
         }
+        if matches!(mutation, Mutation::WritableMode) {
+            assert!(matches!(
+                ArtifactStore::open(
+                    root.path(),
+                    RepoId::parse("acme/widget").unwrap(),
+                    WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
+                    ArtifactConfig::default(),
+                ),
+                Err(ArtifactError::Integrity { message, .. })
+                    if message.contains("not sealed")
+            ));
+        }
         if matches!(mutation, Mutation::Directory) {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         }
@@ -1248,6 +1260,15 @@ fn verified_open_rejects_a_symlinked_workspace_root() {
 
     assert!(matches!(
         read_stream(&alias, &sealed.record.stdout),
+        Err(ArtifactError::Io { .. }) | Err(ArtifactError::Integrity { .. })
+    ));
+
+    let protected = actual.join(".cowshed");
+    let backing = actual.join(".cowshed-real");
+    fs::rename(&protected, &backing).unwrap();
+    symlink(".cowshed-real", &protected).unwrap();
+    assert!(matches!(
+        read_stream(&actual, &sealed.record.stdout),
         Err(ArtifactError::Io { .. }) | Err(ArtifactError::Integrity { .. })
     ));
 }
