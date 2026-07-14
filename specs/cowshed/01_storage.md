@@ -261,6 +261,14 @@ CA **private key** sits alongside it (`<image>.ca.key`, 0600, same controller-on
 gateway signs per-host interception leaves with it; only the public CA cert ever enters the image
 (04_sandbox.md/05_gateway.md). Schema in 04_sandbox.md.
 
+During macOS restore, `<canonical-image>.restore.json` is the sole recovery fact for an interrupted image/metadata
+publication. Its exact, unknown-field-denying schema is
+`{version, repoId, workspace, sourceCheckpoint, sourceIncarnation}`; every identity must agree with the canonical
+pending detached metadata. The fact is fsynced before pending metadata publication and removed, with a parent-directory
+fsync, only after the controller commitment is durably published and detached metadata is activated. Recovery combines
+that fact with the canonical and `pre-restore-*` image/grant/CA sidecars to choose rollback or idempotent completion.
+There is no runtime restore journal, `.restore-fences` directory, database row, or second mutable source of truth.
+
 ## Retention
 
 Copy-on-write divergence only ever accumulates — checkpoints, idle workspaces, ZFS origin pins (09_substrates.md), and

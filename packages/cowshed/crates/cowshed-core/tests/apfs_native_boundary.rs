@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
+
 use cowshed_core::apfs::{
     ApfsCaseSensitivity, CommandOutput, CommandRequest, CommandRunError, CommandRunner,
     CreateImageRequest, ImageFormatSelection, MountAccess,
@@ -364,6 +366,12 @@ fn checkpoint_fact_path(image: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn restore_recovery_fact_path(image: &Path) -> PathBuf {
+    let mut path = image.as_os_str().to_owned();
+    path.push(".restore.json");
+    PathBuf::from(path)
+}
+
 fn ca_key_path(image: &Path) -> PathBuf {
     let mut path = image.as_os_str().to_owned();
     path.push(".ca.key");
@@ -380,7 +388,9 @@ fn create_image(path: &Path, format: ImageFormat) {
     std::fs::create_dir_all(path.parent().expect("parent")).expect("image parent");
     std::fs::write(path, b"fixture").expect("image");
     metadata(format).write_for_image(path).expect("sidecar");
-    write_ca_key(path, b"fixture-ca-private-key");
+    let signing_key =
+        KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("fixture P-256 private key");
+    write_ca_key(path, signing_key.serialize_pem().as_bytes());
 }
 
 fn workspace(format: ImageFormat) -> LifecycleWorkspace {
@@ -2363,6 +2373,20 @@ fn stateless_restore_recovery_converges_each_publication_boundary() {
             ImageFormat::Sparse,
         )
         .expect("replacement");
+        let old_credential_mount = fixture.root.join("old-credential-mount");
+        let new_credential_mount = fixture.root.join("new-credential-mount");
+        std::fs::create_dir_all(&old_credential_mount).expect("old credential mount");
+        std::fs::create_dir_all(&new_credential_mount).expect("new credential mount");
+        mint_workspace_credentials(
+            &workspace(ImageFormat::Sparse),
+            &old_credential_mount,
+            &ca_key_path(canonical.image()),
+        )
+        .expect("old credentials");
+        mint_workspace_credentials(&replacement, &new_credential_mount, &ca_key_path(&staged))
+            .expect("replacement credentials");
+        let old_ca_key = std::fs::read(ca_key_path(canonical.image())).expect("old CA key");
+        let new_ca_key = std::fs::read(ca_key_path(&staged)).expect("new CA key");
         let host = native_host(&fixture, RecordingRunner::default());
         host.set_restore_failpoint(failpoint);
         let image_phase = matches!(
@@ -2395,7 +2419,34 @@ fn stateless_restore_recovery_converges_each_publication_boundary() {
         let host = native_host(&fixture, RecordingRunner::default());
         host.recover_pending(&fixture.config(), &[])
             .expect("restart recovery");
-        let metadata_was_published = !image_phase;
+        host.recover_pending(&fixture.config(), &[])
+            .expect("repeated restart recovery is idempotent");
+        let pending = host.pending_publications(&repo()).expect("pending facts");
+        let metadata_was_published = !pending.is_empty();
+        if metadata_was_published {
+            assert_eq!(pending.len(), 1, "{failpoint:?}");
+            assert_eq!(
+                pending[0].source_incarnation,
+                metadata(ImageFormat::Sparse).workspace_incarnation
+            );
+            assert_eq!(
+                pending[0].source_checkpoint,
+                format!("pre-restore-{next_incarnation}")
+            );
+            host.activate_restored_metadata(&pending[0].image)
+                .expect("idempotent forward activation");
+            assert!(
+                host.pending_publications(&repo())
+                    .expect("activated pending facts")
+                    .is_empty()
+            );
+        } else {
+            assert!(pending.is_empty(), "{failpoint:?}");
+        }
+        assert!(
+            !restore_recovery_fact_path(canonical.image()).exists(),
+            "{failpoint:?}"
+        );
         assert_eq!(
             std::fs::read(canonical.image()).expect("canonical bytes"),
             if metadata_was_published {
@@ -2408,9 +2459,9 @@ fn stateless_restore_recovery_converges_each_publication_boundary() {
         assert_eq!(
             std::fs::read(ca_key_path(canonical.image())).expect("canonical CA key"),
             if metadata_was_published {
-                b"new-ca-key".as_slice()
+                new_ca_key.as_slice()
             } else {
-                b"old-ca-key".as_slice()
+                old_ca_key.as_slice()
             },
             "{failpoint:?}"
         );
@@ -2418,7 +2469,7 @@ fn stateless_restore_recovery_converges_each_publication_boundary() {
             assert_eq!(std::fs::read(&undo).expect("undo image"), b"old generation");
             assert_eq!(
                 std::fs::read(ca_key_path(&undo)).expect("undo CA key"),
-                b"old-ca-key"
+                old_ca_key
             );
         } else {
             assert!(!undo.exists(), "{failpoint:?}");

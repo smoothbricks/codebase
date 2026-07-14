@@ -180,7 +180,12 @@ source endpoint or CA.
   undoable. Before publication, failure restores the displaced workspace and old token; after the incarnation fence is
   published, recovery completes forward and never exposes both tokens. Copied job records retain the incarnation that
   produced them, while the new incarnation allocates workspace-local monotonic numeric job IDs above every inherited
-  allocation.
+  allocation. Restore restart recovery reads only substrate facts: the canonical/pending detached metadata, the
+  displaced `pre-restore-*` image/grant/CA sidecars, and the exact sibling `.restore.json` recovery fact described in
+  01_storage.md. Before durable pending-metadata publication it restores the old generation; afterward it leaves the new
+  generation pending for idempotent controller-commitment publication and activation. Repeating recovery or activation
+  has the same result. The project runtime persists no restore fence, journal, or `.restore-fences` path.
+
 - `cowshed gc` retains every pinned checkpoint, every checkpoint younger than 14 days, and always the newest five per
   workspace. A supplied label and `--keep` both create explicit pins; only an explicit unpin makes them eligible.
   `CheckpointOptions.keep` carries the same pin request for programmatic callers. `WorkspaceInfo.checkpoints` always

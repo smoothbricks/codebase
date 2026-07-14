@@ -1349,33 +1349,19 @@ impl NativeProjectRuntimeHost {
                 .ensure_workspace_introduced(repo_id.clone(), fact.workspace.incarnation().clone())
                 .await?;
         }
-        let fence_root = layout.project().project_root.join(".restore-fences");
         for publication in &pending {
-            let evidence_path =
-                restore_fence_evidence_path(&fence_root, publication.workspace.incarnation());
-            let expected_repo = repo_id.clone();
-            let expected_incarnation = publication.workspace.incarnation().clone();
-            let evidence = crate::storage::lifecycle::dispatch_blocking(move || {
-                match crate::metadata::read_json::<RestoreFenceEvidence>(&evidence_path) {
-                    Ok(evidence) => Ok(Some(evidence)),
-                    Err(crate::metadata::MetadataError::Io { source, .. })
-                        if source.kind() == std::io::ErrorKind::NotFound =>
-                    {
-                        Ok(None)
-                    }
-                    Err(error) => Err(error),
-                }
-            })
-            .await
-            .map_err(|error| CowshedError::internal(error.to_string()))?
-            .map_err(native_integrity_error)?;
-            if evidence.is_some_and(|evidence| {
-                evidence.repo_id == expected_repo
-                    && evidence.destination_incarnation == expected_incarnation
-            }) {
-                host.activate_restored_metadata(&publication.image)
-                    .map_err(native_storage_error)?;
-            }
+            use super::supervisor::{CommitmentDraft, CommitmentSink};
+
+            commitments
+                .publish(CommitmentDraft::Restore {
+                    repo_id: repo_id.clone(),
+                    source_checkpoint: publication.source_checkpoint.clone(),
+                    source_incarnation: publication.source_incarnation.clone(),
+                    destination_incarnation: publication.workspace.incarnation().clone(),
+                })
+                .await?;
+            host.activate_restored_metadata(&publication.image)
+                .map_err(native_storage_error)?;
         }
         let substrate = crate::storage::apfs::ApfsSubstrate::new(config, host);
         for retirement in retired {
@@ -2277,71 +2263,27 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 identity,
             )
             .map_err(native_integrity_error)?;
-        let repo_id = self.descriptor.repo_id.clone();
-        let source_incarnation = current.derived.workspace.incarnation().clone();
-        let source_checkpoint = label.to_string();
         let mut commitments = self.commitments.clone();
-        let fence_root = self.layout.project().project_root.join(".restore-fences");
         let result = self
             .substrate
             .execute_restore_staged(
                 plan,
                 |_stage| async { Ok::<_, CowshedError>(()) },
                 move |fence| async move {
-                    let destination_incarnation = fence.pending.workspace.incarnation().clone();
-                    let evidence = RestoreFenceEvidence {
-                        repo_id: repo_id.clone(),
-                        destination_incarnation: destination_incarnation.clone(),
-                    };
-                    let evidence_path =
-                        restore_fence_evidence_path(&fence_root, &destination_incarnation);
                     commitments
                         .publish(CommitmentDraft::Restore {
-                            repo_id,
-                            source_checkpoint,
-                            source_incarnation,
-                            destination_incarnation,
+                            repo_id: fence.pending.workspace.repo().clone(),
+                            source_checkpoint: fence.pending.source_checkpoint,
+                            source_incarnation: fence.pending.source_incarnation,
+                            destination_incarnation: fence.pending.workspace.incarnation().clone(),
                         })
-                        .await?;
-                    crate::storage::lifecycle::dispatch_blocking(move || {
-                        let parent = evidence_path.parent().ok_or_else(|| {
-                            crate::metadata::MetadataError::InvalidPath(evidence_path.clone())
-                        })?;
-                        std::fs::create_dir_all(parent).map_err(|source| {
-                            crate::metadata::MetadataError::Io {
-                                path: parent.to_path_buf(),
-                                source,
-                            }
-                        })?;
-                        crate::metadata::write_json(&evidence_path, &evidence)
-                    })
-                    .await
-                    .map_err(|error| CowshedError::internal(error.to_string()))?
-                    .map_err(native_integrity_error)
+                        .await
+                        .map(|_| ())
                 },
             )
             .await;
         match result {
-            Ok(receipt) => {
-                let evidence_path = restore_fence_evidence_path(
-                    &self.layout.project().project_root.join(".restore-fences"),
-                    receipt.workspace.incarnation(),
-                );
-                crate::storage::lifecycle::dispatch_blocking(move || {
-                    match std::fs::remove_file(&evidence_path) {
-                        Ok(()) => Ok(()),
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                        Err(error) => Err(error),
-                    }
-                })
-                .await
-                .map_err(|error| CowshedError::internal(error.to_string()))?
-                .map_err(|error| {
-                    CowshedError::environment_missing(
-                        format!("cannot remove restore fence evidence: {error}"),
-                        "check controller storage permissions",
-                    )
-                })?;
+            Ok(_) => {
                 self.ensure_supervisor(&workspace).await?;
                 Ok(())
             }
@@ -3745,19 +3687,6 @@ mod retired_recovery_tests {
         );
         std::fs::remove_dir_all(root).unwrap();
     }
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RestoreFenceEvidence {
-    repo_id: RepoId,
-    destination_incarnation: WorkspaceIncarnation,
-}
-
-#[cfg(target_os = "macos")]
-fn restore_fence_evidence_path(root: &Path, incarnation: &WorkspaceIncarnation) -> PathBuf {
-    root.join(format!("{}.json", incarnation.as_str()))
 }
 
 #[cfg(target_os = "macos")]
