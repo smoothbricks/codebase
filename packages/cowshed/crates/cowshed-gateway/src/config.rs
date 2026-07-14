@@ -303,6 +303,8 @@ impl GatewayTimeouts {
 #[derive(Clone, Debug)]
 pub struct GatewayConfig {
     pub control_socket: Option<PathBuf>,
+    /// Authoritative private directory for Linux workspace data sockets.
+    pub data_socket_root: Option<PathBuf>,
     pub authorized_control_uid: u32,
     pub limits: GatewayLimits,
     pub timeouts: GatewayTimeouts,
@@ -313,6 +315,7 @@ impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             control_socket: None,
+            data_socket_root: None,
             authorized_control_uid: unsafe { libc::geteuid() },
             limits: GatewayLimits::default(),
             timeouts: GatewayTimeouts::default(),
@@ -329,6 +332,69 @@ impl GatewayConfig {
             && !path.is_absolute()
         {
             return Err(ConfigError::RelativeSocketPath);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let root = self
+                .data_socket_root
+                .as_deref()
+                .ok_or(ConfigError::MissingDataSocketRoot)?;
+            Self::validate_data_socket_root(root)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_session_endpoint(
+        &self,
+        session: &WorkspaceSession,
+    ) -> Result<(), ConfigError> {
+        #[cfg(target_os = "linux")]
+        {
+            let root = self
+                .data_socket_root
+                .as_deref()
+                .ok_or(ConfigError::MissingDataSocketRoot)?;
+            let WorkspaceEndpoint::Unix(path) = &session.endpoint else {
+                return Err(ConfigError::ExpectedUnixEndpoint);
+            };
+            if path.parent() != Some(root)
+                || self
+                    .control_socket
+                    .as_ref()
+                    .is_some_and(|control| control == path)
+            {
+                return Err(ConfigError::EndpointOutsideDataSocketRoot);
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or(ConfigError::InvalidDataSocketName)?;
+            if path.extension().and_then(|extension| extension.to_str()) != Some("sock")
+                || validate_identifier("workspace socket", stem).is_err()
+            {
+                return Err(ConfigError::InvalidDataSocketName);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = session;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn validate_data_socket_root(root: &std::path::Path) -> Result<(), ConfigError> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        if !root.is_absolute() {
+            return Err(ConfigError::RelativeSocketPath);
+        }
+        let metadata =
+            std::fs::symlink_metadata(root).map_err(|_| ConfigError::InsecureDataSocketRoot)?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(ConfigError::InsecureDataSocketRoot);
         }
         Ok(())
     }
@@ -348,6 +414,14 @@ pub enum ConfigError {
     ExpectedTcpEndpoint,
     #[error("a Unix endpoint is required")]
     ExpectedUnixEndpoint,
+    #[error("Linux gateway data socket root is required")]
+    MissingDataSocketRoot,
+    #[error("Linux gateway data socket root must be an owned mode-0700 real directory")]
+    InsecureDataSocketRoot,
+    #[error("workspace data socket must be directly inside the authoritative root")]
+    EndpointOutsideDataSocketRoot,
+    #[error("workspace data socket name must be an identifier with .sock suffix")]
+    InvalidDataSocketName,
     #[error("gateway endpoints are unsupported on this host platform")]
     UnsupportedHostPlatform,
     #[error("macOS gateway base must reserve 16 ports within 40960-49151")]

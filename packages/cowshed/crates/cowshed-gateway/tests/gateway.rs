@@ -26,6 +26,8 @@ use rustls::{
     pki_types::{CertificateDer, ServerName},
 };
 #[cfg(target_os = "linux")]
+use std::{path::PathBuf, sync::LazyLock};
+#[cfg(target_os = "linux")]
 use tokio::net::UnixStream;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -36,6 +38,19 @@ use tokio::{
 };
 use tokio_rustls::TlsConnector;
 use zeroize::Zeroizing;
+
+#[cfg(target_os = "linux")]
+static LINUX_SOCKET_ROOT: LazyLock<PathBuf> = LazyLock::new(|| {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = std::env::temp_dir().join(format!("cowshed-gateway-data-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir(&root).expect("create Linux data socket root");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+        .expect("secure Linux data socket root");
+    root
+});
+
 #[derive(Debug)]
 struct NoCredentials;
 
@@ -195,6 +210,7 @@ fn ca_fixture() -> CaFixture {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn free_endpoint() -> SocketAddr {
     static NEXT_PORT: AtomicU16 = AtomicU16::new(cowshed_gateway::MACOS_PORT_MIN);
     loop {
@@ -210,6 +226,7 @@ fn free_endpoint() -> SocketAddr {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn tls_client_hello(host: &str) -> Vec<u8> {
     let config = ClientConfig::builder()
         .with_root_certificates(RootCertStore::empty())
@@ -258,7 +275,7 @@ fn grant(host: &str, port: u16) -> EgressGrant {
 }
 
 fn test_config() -> GatewayConfig {
-    GatewayConfig {
+    let config = GatewayConfig {
         timeouts: GatewayTimeouts {
             request_headers: Duration::from_secs(2),
             connect: Duration::from_secs(1),
@@ -270,7 +287,13 @@ fn test_config() -> GatewayConfig {
             leaf_lifetime: Duration::from_secs(60 * 60),
         },
         ..GatewayConfig::default()
-    }
+    };
+    #[cfg(target_os = "linux")]
+    let config = GatewayConfig {
+        data_socket_root: Some(LINUX_SOCKET_ROOT.clone()),
+        ..config
+    };
+    config
 }
 
 async fn gateway(
@@ -414,6 +437,7 @@ async fn read_response_head(stream: &mut TcpStream) -> String {
     String::from_utf8(bytes).expect("response head UTF-8")
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn allow_deny_malformed_token_and_audit_fields() {
     let (upstream_port, mut captured, _upstream) = http_fixture(1, None).await;
@@ -508,6 +532,7 @@ async fn allow_deny_malformed_token_and_audit_fields() {
     gateway.drain().await.expect("drain gateway");
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn endpoint_identity_precedes_token_authentication() {
     let (upstream_port, _captured, _upstream) = http_fixture(1, None).await;
@@ -574,6 +599,7 @@ async fn endpoint_identity_precedes_token_authentication() {
     gateway.drain().await.expect("drain gateway");
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn local_mirror_route_rewrites_only_the_admitted_scope() {
     let (upstream_port, mut captured, _upstream) = http_fixture(1, None).await;
@@ -630,6 +656,7 @@ async fn local_mirror_route_rewrites_only_the_admitted_scope() {
     gateway.drain().await.expect("drain gateway");
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn opaque_connect_preserves_bytes_exactly() {
     let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -717,6 +744,7 @@ async fn opaque_connect_preserves_bytes_exactly() {
     gateway.drain().await.expect("drain gateway");
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn intercept_injects_only_gateway_headers_and_validates_sni() {
     let (upstream_port, mut captured, _upstream) = http_fixture(1, None).await;
@@ -801,6 +829,7 @@ async fn intercept_injects_only_gateway_headers_and_validates_sni() {
     gateway.drain().await.expect("drain gateway");
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn impersonation_suppresses_credentials_and_trace_headers() {
     let (upstream_port, mut captured, _upstream) = http_fixture(1, None).await;
@@ -854,6 +883,7 @@ async fn impersonation_suppresses_credentials_and_trace_headers() {
     gateway.drain().await.expect("drain gateway");
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn dead_upstream_fails_fast_without_connecting() {
     let endpoint = free_endpoint();
@@ -895,6 +925,7 @@ async fn dead_upstream_fails_fast_without_connecting() {
     gateway.drain().await.expect("drain gateway");
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn active_queue_and_overflow_limits_are_enforced() {
     let gate = Arc::new(Notify::new());
@@ -975,6 +1006,7 @@ async fn active_queue_and_overflow_limits_are_enforced() {
     gateway.drain().await.expect("drain gateway");
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn queued_request_timeout_cancels_without_leaking_a_slot() {
     let tunnel_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -1078,10 +1110,8 @@ async fn queued_request_timeout_cancels_without_leaking_a_slot() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn unix_socket_churn_unlinks_every_session() {
-    let root = std::env::temp_dir().join(format!("cowshed-gateway-churn-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir(&root).expect("create fixture directory");
-    let socket = root.join("workspace.sock");
+    let socket = LINUX_SOCKET_ROOT.join("workspace.sock");
+    let _ = std::fs::remove_file(&socket);
     let gateway = gateway(
         test_config(),
         Arc::new(NoCredentials),
@@ -1121,7 +1151,121 @@ async fn unix_socket_churn_unlinks_every_session() {
         );
     }
     gateway.drain().await.expect("drain gateway");
-    std::fs::remove_dir_all(root).expect("remove fixture directory");
+    assert!(LINUX_SOCKET_ROOT.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_data_socket_root_is_enforced_and_serves_requests() {
+    let socket = LINUX_SOCKET_ROOT.join("linux-request.sock");
+    let control = LINUX_SOCKET_ROOT.join("control.sock");
+    let regular = LINUX_SOCKET_ROOT.join("regular.sock");
+    let outside = std::env::temp_dir().join("outside.sock");
+    for path in [&socket, &control, &regular, &outside] {
+        let _ = std::fs::remove_file(path);
+    }
+    let (upstream_port, mut captured, _upstream) = http_fixture(1, None).await;
+    let mut config = test_config();
+    config.control_socket = Some(control.clone());
+    let gateway = gateway(
+        config,
+        Arc::new(NoCredentials),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+
+    let policy = WorkspacePolicy {
+        grants: vec![grant("linux-request.test", upstream_port)],
+        mirrors: Vec::new(),
+    };
+    let (installed, token, _) = session(
+        "linux-request",
+        "repo-linux-request",
+        WorkspaceEndpoint::Unix(socket.clone()),
+        30,
+        1,
+        policy.clone(),
+    );
+    gateway.handle().install(installed).await.expect("install");
+    let mut client = UnixStream::connect(&socket)
+        .await
+        .expect("connect workspace data socket");
+    client
+        .write_all(
+            absolute_request("linux-request.test", upstream_port, &token, "/allowed").as_bytes(),
+        )
+        .await
+        .expect("write proxy request");
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+        .await
+        .expect("Linux proxy timeout")
+        .expect("read Linux proxy response");
+    assert!(
+        response.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    captured.recv().await.expect("captured Linux request");
+
+    let outside_session = session(
+        "outside",
+        "repo-outside",
+        WorkspaceEndpoint::Unix(outside),
+        31,
+        1,
+        policy.clone(),
+    )
+    .0;
+    assert!(matches!(
+        gateway.handle().install(outside_session).await,
+        Err(GatewayError::Config(
+            cowshed_gateway::ConfigError::EndpointOutsideDataSocketRoot
+        ))
+    ));
+
+    std::fs::write(&regular, b"preserve").expect("write unrelated file");
+    let regular_session = session(
+        "regular",
+        "repo-regular",
+        WorkspaceEndpoint::Unix(regular.clone()),
+        32,
+        1,
+        policy.clone(),
+    )
+    .0;
+    assert!(matches!(
+        gateway.handle().install(regular_session).await,
+        Err(GatewayError::Io(_))
+    ));
+    assert_eq!(
+        std::fs::read(&regular).expect("read unrelated file"),
+        b"preserve"
+    );
+
+    let control_session = session(
+        "control",
+        "repo-control",
+        WorkspaceEndpoint::Unix(control.clone()),
+        33,
+        1,
+        policy,
+    )
+    .0;
+    assert!(matches!(
+        gateway.handle().install(control_session).await,
+        Err(GatewayError::Config(
+            cowshed_gateway::ConfigError::EndpointOutsideDataSocketRoot
+        ))
+    ));
+    assert!(control.exists(), "control socket was unlinked");
+
+    gateway.drain().await.expect("drain gateway");
+    let _ = std::fs::remove_file(regular);
 }
 
 #[tokio::test]
@@ -1199,6 +1343,7 @@ async fn arrow_audit_sink_publishes_durable_single_batch_segments() {
     std::fs::remove_dir_all(root).expect("remove audit fixture");
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn control_socket_is_local_authenticated_and_reports_status() {
     let root = std::env::temp_dir().join(format!("cowshed-gateway-control-{}", std::process::id()));
@@ -1263,6 +1408,7 @@ async fn control_socket_is_local_authenticated_and_reports_status() {
     std::fs::remove_dir_all(root).expect("remove control fixture directory");
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn revision_tombstone_and_rotation_preserve_authority() {
     let endpoint = free_endpoint();
@@ -1339,8 +1485,21 @@ async fn revision_tombstone_and_rotation_preserve_authority() {
     gateway.drain().await.expect("drain gateway");
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn audit_failure_is_fail_closed_and_marks_gateway_draining() {
+    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind active opaque upstream");
+    let upstream_port = upstream.local_addr().expect("upstream address").port();
+    let active_upstream = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.expect("accept opaque stream");
+        let mut discarded = Vec::new();
+        stream
+            .read_to_end(&mut discarded)
+            .await
+            .expect("audit failure closes active stream");
+    });
     let endpoint = free_endpoint();
     let gateway = gateway(
         test_config(),
@@ -1358,13 +1517,35 @@ async fn audit_failure_is_fail_closed_and_marks_gateway_draining() {
         WorkspaceEndpoint::Tcp(endpoint),
         21,
         1,
-        WorkspacePolicy::default(),
+        WorkspacePolicy {
+            grants: vec![
+                EgressGrant::opaque("audit-active.test", upstream_port).expect("opaque grant"),
+            ],
+            mirrors: Vec::new(),
+        },
     );
     gateway
         .handle()
         .install(installed)
         .await
         .expect("install session");
+    let mut active = TcpStream::connect(endpoint).await.expect("connect gateway");
+    let connect = format!(
+        "CONNECT audit-active.test:{upstream_port} HTTP/1.1\r\nHost: audit-active.test:{upstream_port}\r\nProxy-Authorization: Bearer {token}\r\n\r\n"
+    );
+    active
+        .write_all(connect.as_bytes())
+        .await
+        .expect("write CONNECT");
+    assert!(
+        read_response_head(&mut active)
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    active
+        .write_all(&tls_client_hello("audit-active.test"))
+        .await
+        .expect("write ClientHello");
     let denied = proxy_request(
         endpoint,
         absolute_request("denied.test", 443, &token, "/blocked"),
@@ -1372,6 +1553,11 @@ async fn audit_failure_is_fail_closed_and_marks_gateway_draining() {
     .await;
     assert!(denied.starts_with("HTTP/1.1 503"), "{denied}");
     assert!(gateway.handle().status().await.expect("status").draining);
+    timeout(Duration::from_secs(1), active_upstream)
+        .await
+        .expect("active stream did not close")
+        .expect("active upstream task");
+    await_reclaimed(&gateway).await;
     let replacement = session(
         "audit-failure",
         "repo-audit-failure",
@@ -1388,6 +1574,7 @@ async fn audit_failure_is_fail_closed_and_marks_gateway_draining() {
     drop(gateway);
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn opaque_rejects_non_tls_missing_and_mismatched_sni_without_connector_calls() {
     let endpoint = free_endpoint();
@@ -1442,6 +1629,7 @@ async fn opaque_rejects_non_tls_missing_and_mismatched_sni_without_connector_cal
     gateway.drain().await.expect("drain gateway");
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn active_error_and_disconnect_paths_reclaim_single_permit() {
     let single_permit_config = || {
@@ -1646,6 +1834,7 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn queued_disconnect_and_drain_reclaim_all_capacity() {
     let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -1758,6 +1947,7 @@ async fn queued_disconnect_and_drain_reclaim_all_capacity() {
         .expect("held upstream task");
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn client_tls_failures_reclaim_permits_and_pre_admission_denials_are_audited() {
     let mut config = test_config();
