@@ -1,11 +1,13 @@
 /**
- * Runtime code generation for TagWriter and ResultWriter classes
+ * Fixed-position TagWriter and ResultWriter classes.
+ *
+ * TagWriter uses source-authored constructors and schema-driven prototype methods so
+ * Hermes can compile the implementation ahead of time. ResultWriter deliberately
+ * retains runtime source generation for isolated performance comparison.
  *
  * These classes provide fluent setter methods that write to a fixed position in a SpanBuffer:
  * - TagWriter: writes to position 0 (span-start row) via ctx.tag.userId("123")
  * - ResultWriter: writes to position 1 (result row) via ctx.ok(data).userId("123")
- *
- * Both share the same codegen and differ only by the literal row embedded in each method.
  *
  * WHY Fixed Positions:
  * - Row 0: span-start entry (written at span creation, attributes set via ctx.tag)
@@ -212,35 +214,110 @@ const resultWriterClassCache = new WeakMap<LogSchema, Map<string, unknown>>();
 // TagWriter API
 // ============================================================================
 
-/**
- * TagWriter extension - adds the reserved system `uint64_value` writer (row 0).
- */
-const tagWriterExtension: FixedPositionWriterExtension = {
-  methods: `
-uint64_value(value) {
-  this._state._spanBuffer.uint64_value(0, value);
-  return this;
+interface RuntimeTagWriter {
+  readonly _state: WriterState;
 }
-`,
-};
 
-/**
- * Generate TagWriter class code for a schema.
- * TagWriter writes to position 0 (span-start row).
- */
-export function generateTagWriterClass(
-  schema: LogSchema,
-  eagerColumns: readonly string[] = [],
-  enumLookup: SchemaEnumLookupDescriptor = resolveEnumLookupDescriptor(schema),
-): string {
-  return generateFixedPositionWriterClass(
-    schema,
-    0,
-    'GeneratedTagWriter',
-    tagWriterExtension,
-    eagerColumns,
-    enumLookup,
-  );
+interface TagFieldPlan {
+  readonly fieldName: string;
+  readonly encode: ((value: unknown) => number) | undefined;
+}
+
+/** Invoke one schema-specific SpanBuffer setter without generating source. */
+function writeTagField(writer: RuntimeTagWriter, fieldName: string, value: unknown): void {
+  const buffer = writer._state._spanBuffer;
+  const columnWriter: unknown = Reflect.get(buffer, fieldName);
+  if (typeof columnWriter !== 'function') {
+    throw new TypeError(`SpanBuffer column writer ${JSON.stringify(fieldName)} is not callable`);
+  }
+  columnWriter.call(buffer, 0, value);
+}
+
+/** Preserve the generated writer's schema order and enum-binding semantics. */
+function createTagFieldPlans(schema: LogSchema, enumLookup: SchemaEnumLookupDescriptor): readonly TagFieldPlan[] {
+  const enumFieldNames = new Set<string>();
+  for (const { fieldName } of enumLookup.ordered) enumFieldNames.add(fieldName);
+
+  return schema._columns.map(([fieldName]) => {
+    if (!enumFieldNames.has(fieldName)) return { fieldName, encode: undefined };
+
+    const descriptor = enumLookup.byField[fieldName];
+    if (!descriptor) {
+      throw new TypeError(`Enum lookup for ${JSON.stringify(fieldName)} is missing`);
+    }
+    return { fieldName, encode: descriptor.encode };
+  });
+}
+
+/** Create a class-method descriptor whose function name is the schema field name. */
+function createTagSetterDescriptor(plan: TagFieldPlan): PropertyDescriptor {
+  const encode = plan.encode;
+  const methods = encode
+    ? {
+        [plan.fieldName](this: RuntimeTagWriter, value: string) {
+          writeTagField(this, plan.fieldName, encode(value));
+          return this;
+        },
+      }
+    : {
+        [plan.fieldName](this: RuntimeTagWriter, value: unknown) {
+          writeTagField(this, plan.fieldName, value);
+          return this;
+        },
+      };
+  const descriptor = Object.getOwnPropertyDescriptor(methods, plan.fieldName);
+  if (!descriptor) throw new Error(`Failed to create TagWriter setter ${JSON.stringify(plan.fieldName)}`);
+  return descriptor;
+}
+
+/** Install the schema-specific fluent API while retaining native class method descriptors. */
+function installTagWriterMethods(prototype: object, plans: readonly TagFieldPlan[]): void {
+  const bulkMethods = {
+    with(this: RuntimeTagWriter, attributes: Readonly<Record<string, unknown>>) {
+      for (const plan of plans) {
+        if (
+          plan.fieldName in attributes &&
+          attributes[plan.fieldName] !== null &&
+          attributes[plan.fieldName] !== undefined
+        ) {
+          const value = attributes[plan.fieldName];
+          writeTagField(this, plan.fieldName, plan.encode ? plan.encode(value) : value);
+        }
+      }
+      return this;
+    },
+  };
+  const withDescriptor = Object.getOwnPropertyDescriptor(bulkMethods, 'with');
+  if (!withDescriptor) throw new Error('Failed to create TagWriter.with');
+  Object.defineProperty(prototype, 'with', withDescriptor);
+
+  for (const plan of plans) {
+    Object.defineProperty(prototype, plan.fieldName, createTagSetterDescriptor(plan));
+  }
+
+  Object.defineProperty(prototype, 'uint64_value', {
+    configurable: true,
+    enumerable: false,
+    writable: true,
+    value: function uint64_value(this: RuntimeTagWriter, value: bigint) {
+      this._state._spanBuffer.uint64_value(0, value);
+      return this;
+    },
+  });
+}
+
+/** Build one source-authored constructor for an existing TagWriter cache key. */
+function createStaticTagWriterConstructor(schema: LogSchema, enumLookup: SchemaEnumLookupDescriptor): unknown {
+  class GeneratedTagWriter {
+    readonly _state: WriterState;
+
+    constructor(state: WriterState) {
+      this._state = state;
+    }
+  }
+
+  installTagWriterMethods(GeneratedTagWriter.prototype, createTagFieldPlans(schema, enumLookup));
+  return GeneratedTagWriter;
 }
 
 /**
@@ -259,13 +336,10 @@ export function getTagWriterClass<T extends LogSchema>(
   let WriterClass = classes?.get(cacheKey);
 
   if (!WriterClass) {
-    const classCode = generateTagWriterClass(schema, eagerColumns, enumLookup).trim();
-
-    const factory = new Function('helpers', 'enumLookup', classCode);
-    WriterClass = factory(bufferHelpers, enumLookup);
+    WriterClass = createStaticTagWriterConstructor(schema, enumLookup);
 
     if (!isTagWriterConstructor<LogSchema>(WriterClass)) {
-      throw new Error('Failed to generate TagWriter constructor');
+      throw new Error('Failed to create TagWriter constructor');
     }
 
     classes ??= new Map();
