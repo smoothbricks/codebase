@@ -1,0 +1,21 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "types": ["bun", "node"],
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "emitDeclarationOnly": false,
+    "noEmit": true
+  },
+  "include": ["src/**/*.test.ts", "src/test-suite-tracer.ts"],
+  "references": [
+    {
+      "path": "../validation/tsconfig.lib.json"
+    },
+    {
+      "path": "./tsconfig.lib.json"
+    }
+  ]
+}
