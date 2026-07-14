@@ -147,6 +147,8 @@ pub struct PendingPublicationFact {
     pub mount_point: PathBuf,
     pub source_checkpoint: String,
     pub source_incarnation: WorkspaceIncarnation,
+    pub replaced_incarnation: WorkspaceIncarnation,
+    pub destination_incarnation: WorkspaceIncarnation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -397,7 +399,8 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         workspace: &LifecycleWorkspace,
         revision: Revision,
         source_image: &Path,
-    ) -> Result<(), ApfsStorageError>;
+        replaced_incarnation: &WorkspaceIncarnation,
+    ) -> Result<PendingPublicationFact, ApfsStorageError>;
     fn activate_restored_metadata(&self, canonical: &Path) -> Result<(), ApfsStorageError>;
     fn rollback_restore(
         &self,
@@ -1424,7 +1427,7 @@ struct PendingRestore {
 
 enum CommittedRestore {
     Verified(RestoreReceipt),
-    Pending(PendingRestore),
+    Pending(Box<PendingRestore>),
 }
 
 struct PreparedCheckpoint {
@@ -2228,33 +2231,42 @@ fn commit_prepared_restore<H: ApfsExecutionHost>(
             .and_then(|()| mount_canonical(host, &canonical_image, &canonical_mount, &current));
         return combine_cleanup("restore rollback", primary, cleanup);
     }
-    if let Err(primary) = host.publish_restored_metadata(
+    let fact = match host.publish_restored_metadata(
         &staged_image,
         &canonical_image,
         &stage.workspace,
         stage.workspace.revision(),
         &checkpoint_image,
+        current.incarnation(),
     ) {
-        let cleanup = host
-            .detach_mounted(&stage.workspace, false)
-            .and_then(|()| host.rollback_restore(&canonical_image, &undo_image, &staged_image))
-            .and_then(|()| mount_canonical(host, &canonical_image, &canonical_mount, &current));
-        return combine_cleanup("restore metadata publication", primary, cleanup);
-    }
-    let fact = PendingPublicationFact {
-        workspace: stage.workspace.clone(),
-        image: canonical_image,
-        mount_point: canonical_mount,
-        source_checkpoint,
-        source_incarnation: current.incarnation().clone(),
+        Ok(fact) => fact,
+        Err(primary) => {
+            let cleanup = host
+                .detach_mounted(&stage.workspace, false)
+                .and_then(|()| host.rollback_restore(&canonical_image, &undo_image, &staged_image))
+                .and_then(|()| mount_canonical(host, &canonical_image, &canonical_mount, &current));
+            return combine_cleanup("restore metadata publication", primary, cleanup);
+        }
     };
-    Ok(CommittedRestore::Pending(PendingRestore {
+    if fact.workspace != stage.workspace
+        || fact.image != canonical_image
+        || fact.mount_point != canonical_mount
+        || fact.source_checkpoint != source_checkpoint
+        || fact.replaced_incarnation != *current.incarnation()
+        || fact.destination_incarnation != *stage.workspace.incarnation()
+        || fact.source_incarnation == *stage.workspace.incarnation()
+    {
+        return Err(ApfsStorageError::MarkerMismatch(
+            "restored publication fact disagrees with prepared restore".to_owned(),
+        ));
+    }
+    Ok(CommittedRestore::Pending(Box::new(PendingRestore {
         receipt: RestoreReceipt {
             previous_incarnation,
             workspace: stage.workspace,
         },
         fact,
-    }))
+    })))
 }
 
 fn apply_retire<H: ApfsExecutionHost>(
