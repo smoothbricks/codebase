@@ -505,11 +505,14 @@ publication rather than accepting an overwrite. After success, the source may be
 survive are reachable from the returned durable ref. Remote publication and workflow policy are not part of this API.
 
 `WorkspaceHandle::checkpoint` is intentionally available to a worker for retry points, but it is not unbounded storage
-authority. Admission atomically enforces checkpoint count/byte quotas, then runs the 02_workspaces.md barrier: pause
-admissions/artifact writes, promote running memory-only stream prefixes, fsync protected files, append and fsync the
-complete manifest batch, clone while held, and publish the controller manifest-digest/lineage commitment. Quota
-exhaustion is `CowshedError::Conflict`; manifest/commitment mismatch is `CowshedError::Integrity`. Restore remains
-coordinator-only.
+authority. `Coordinator::set_checkpoint_quota(ws, quota)` owns a cap for exactly that workspace. Before the supervisor
+barrier, admission reads authoritative `SubstrateStats`: projected count is that workspace's existing checkpoint count
+plus one; projected bytes are all of its existing checkpoint allocated bytes (pinned and unpinned) plus the target
+active image's allocated bytes. `pinned_checkpoint_bytes` is an authoritative reporting subset, not an exclusion from
+quota. Sibling workspaces consume none of the cap. Exact `<=` boundaries pass; `>` is `CowshedError::Conflict` before
+any checkpoint image, fact, metadata, or barrier publication. Only then does cowshed run the 02_workspaces.md barrier,
+clone while held, and publish the controller manifest-digest/lineage commitment. Manifest/commitment mismatch is
+`CowshedError::Integrity`. Restore remains coordinator-only.
 
 `JobInfo.state = OutputLimit` is the explicit result when the configurable combined stdout+stderr quota (default 1 GiB)
 is crossed. Accounting includes protected and in-flight bytes; the supervisor admits no payload beyond the exact

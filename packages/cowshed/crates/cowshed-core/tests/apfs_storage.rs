@@ -679,6 +679,8 @@ impl ApfsExecutionHost for FakeHost {
             logical_bytes: 4096,
             allocated_bytes: 1024,
             checkpoint_count: 3,
+            checkpoint_bytes: 3072,
+            pinned_checkpoint_bytes: 2048,
         })
     }
 
@@ -1475,6 +1477,8 @@ async fn retire_reclaim_stats_and_gc_cross_only_the_blocking_lane() {
             logical_bytes: 4096,
             allocated_bytes: 1024,
             checkpoint_count: 3,
+            checkpoint_bytes: 3072,
+            pinned_checkpoint_bytes: 2048,
         }
     );
     assert_eq!(substrate.gc().await.expect("gc").reclaimed, 1);

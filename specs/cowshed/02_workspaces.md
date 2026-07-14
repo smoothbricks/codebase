@@ -143,6 +143,11 @@ source endpoint or CA.
 
 ## `cowshed checkpoint <ws> [label]` / `cowshed restore <ws> <label>`
 
+- Before pausing the supervisor or cloning, cowshed reads the target workspace's coordinator-owned `CheckpointQuota` and
+  authoritative substrate stats. The projected count is its existing published checkpoint count plus one. The projected
+  bytes are its existing published checkpoint allocated bytes (pinned and automatic) plus the active image's
+  conservative allocated-byte charge. Other workspaces are isolated from this cap. Exact boundaries are allowed; an
+  over-boundary projection is `Conflict` with no checkpoint image, fact, detached-metadata, or barrier publication.
 - Checkpoint is a supervisor/filesystem barrier. Under the lifecycle lock, cowshed pauses admissions and artifact
   writes, promotes every running memory-only stream prefix, and fsyncs protected files. It then appends and fsyncs
   exactly
