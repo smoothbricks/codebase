@@ -633,8 +633,10 @@ fn stats_count_only_images_and_gc_drains_session_trash_then_compacts_detached_sp
     let checkpoints = &layout.project().checkpoints.join("main");
     let first = checkpoints.join("one.sparseimage");
     let second = checkpoints.join("two.asif");
+    let pre_restore = checkpoints.join("pre-restore-00000000000000000000000000000002.sparseimage");
     create_image(&first, ImageFormat::Sparse);
     create_image(&second, ImageFormat::Asif);
+    create_image(&pre_restore, ImageFormat::Sparse);
     std::fs::write(checkpoints.join("not-an-image.txt"), b"ignored").expect("noise");
     let runner = RecordingRunner::default();
     let host = native_host(&fixture, runner.clone());
@@ -657,7 +659,7 @@ fn stats_count_only_images_and_gc_drains_session_trash_then_compacts_detached_sp
         .stats(&workspace(ImageFormat::Sparse), canonical.image())
         .expect("stats");
     assert_eq!(stats.logical_bytes, b"fixture".len() as u64);
-    assert_eq!(stats.checkpoint_count, 2);
+    assert_eq!(stats.checkpoint_count, 3);
     let first_bytes = std::fs::metadata(&first)
         .expect("first metadata")
         .blocks()
@@ -666,7 +668,14 @@ fn stats_count_only_images_and_gc_drains_session_trash_then_compacts_detached_sp
         .expect("second metadata")
         .blocks()
         .saturating_mul(512);
-    assert_eq!(stats.checkpoint_bytes, first_bytes + second_bytes);
+    let pre_restore_bytes = std::fs::metadata(&pre_restore)
+        .expect("pre-restore metadata")
+        .blocks()
+        .saturating_mul(512);
+    assert_eq!(
+        stats.checkpoint_bytes,
+        first_bytes + second_bytes + pre_restore_bytes
+    );
     assert_eq!(stats.pinned_checkpoint_bytes, first_bytes);
 
     let active_name = WorkspaceName::session("active").expect("workspace");
