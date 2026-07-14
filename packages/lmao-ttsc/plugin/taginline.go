@@ -35,8 +35,19 @@ const (
 	fieldEnum
 )
 
+type schemaStorageKind uint8
+
+const (
+	storageArray schemaStorageKind = iota
+	storageBoolean
+	storageNumber
+	storageBigUint64
+	storageEnum
+)
+
 type schemaField struct {
 	kind       schemaFieldKind
+	storage    schemaStorageKind
 	enumValues []string // sorted, for fieldEnum
 	eager      bool
 }
@@ -153,55 +164,79 @@ func isTagWriterType(chk *shimchecker.Checker, t *shimchecker.Type) bool {
 // extractSchema mirrors extractSchemaFromTagType: per property, the first
 // call-signature parameter's type decides the field kind; `_eager: true` on
 // the property type marks eager columns.
-func extractSchema(chk *shimchecker.Checker, tagType *shimchecker.Type) map[string]schemaField {
-	schema := map[string]schemaField{}
+type namedSchemaField struct {
+	name  string
+	field schemaField
+}
+
+func schemaFieldFromProperty(chk *shimchecker.Checker, sym *shimast.Symbol) (schemaField, bool) {
+	propType := shimchecker.Checker_getTypeOfSymbol(chk, sym)
+	sigs := shimchecker.Checker_getSignaturesOfType(chk, propType, shimchecker.SignatureKindCall)
+	if len(sigs) == 0 {
+		return schemaField{}, false
+	}
+	params := shimchecker.Signature_parameters(sigs[0])
+	if len(params) == 0 {
+		return schemaField{}, false
+	}
+	paramType := shimchecker.Checker_getTypeOfSymbol(chk, params[0])
+	eager := false
+	if et := shimchecker.Checker_getTypeOfPropertyOfType(chk, propType, "_eager"); et != nil {
+		eager = chk.TypeToString(et) == "true"
+	}
+	if paramType.IsUnion() {
+		var values []string
+		allLiterals := true
+		for _, member := range paramType.Types() {
+			if member.IsStringLiteral() {
+				if value, isString := member.AsLiteralType().Value().(string); isString {
+					values = append(values, value)
+					continue
+				}
+			}
+			allLiterals = false
+			break
+		}
+		if allLiterals && len(values) > 0 {
+			sort.Strings(values)
+			return schemaField{kind: fieldEnum, storage: storageEnum, enumValues: values, eager: eager}, true
+		}
+	}
+	switch chk.TypeToString(paramType) {
+	case "string":
+		return schemaField{kind: fieldDirect, storage: storageArray, eager: eager}, true
+	case "number":
+		return schemaField{kind: fieldDirect, storage: storageNumber, eager: eager}, true
+	case "boolean":
+		return schemaField{kind: fieldBool, storage: storageBoolean, eager: eager}, true
+	case "bigint":
+		return schemaField{kind: fieldDirect, storage: storageBigUint64, eager: eager}, true
+	default:
+		return schemaField{}, false
+	}
+}
+
+func extractOrderedSchema(chk *shimchecker.Checker, tagType *shimchecker.Type) ([]namedSchemaField, bool) {
+	fields := []namedSchemaField{}
 	for _, sym := range shimchecker.Checker_getPropertiesOfType(chk, tagType) {
 		name := sym.Name
 		if name == "with" || strings.HasPrefix(name, "_") {
 			continue
 		}
-		propType := shimchecker.Checker_getTypeOfSymbol(chk, sym)
-		sigs := shimchecker.Checker_getSignaturesOfType(chk, propType, shimchecker.SignatureKindCall)
-		if len(sigs) == 0 {
-			continue
+		field, ok := schemaFieldFromProperty(chk, sym)
+		if !ok {
+			return nil, false
 		}
-		params := shimchecker.Signature_parameters(sigs[0])
-		if len(params) == 0 {
-			continue
-		}
-		paramType := shimchecker.Checker_getTypeOfSymbol(chk, params[0])
-		eager := false
-		if et := shimchecker.Checker_getTypeOfPropertyOfType(chk, propType, "_eager"); et != nil {
-			eager = chk.TypeToString(et) == "true"
-		}
+		fields = append(fields, namedSchemaField{name: name, field: field})
+	}
+	return fields, true
+}
 
-		if paramType.IsUnion() {
-			var values []string
-			allLiterals := true
-			for _, member := range paramType.Types() {
-				if member.IsStringLiteral() {
-					if v, isStr := member.AsLiteralType().Value().(string); isStr {
-						values = append(values, v)
-						continue
-					}
-				}
-				allLiterals = false
-				break
-			}
-			if allLiterals && len(values) > 0 {
-				sort.Strings(values) // sorted-order indexing matches runtime dictionaries
-				schema[name] = schemaField{kind: fieldEnum, enumValues: values, eager: eager}
-				continue
-			}
-		}
-		switch chk.TypeToString(paramType) {
-		case "string":
-			schema[name] = schemaField{kind: fieldDirect, eager: eager}
-		case "number":
-			schema[name] = schemaField{kind: fieldDirect, eager: eager}
-		case "boolean":
-			schema[name] = schemaField{kind: fieldBool, eager: eager}
-		}
+func extractSchema(chk *shimchecker.Checker, tagType *shimchecker.Type) map[string]schemaField {
+	schema := map[string]schemaField{}
+	fields, _ := extractOrderedSchema(chk, tagType)
+	for _, field := range fields {
+		schema[field.name] = field.field
 	}
 	return schema
 }
