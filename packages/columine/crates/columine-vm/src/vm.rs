@@ -37,9 +37,10 @@ use crate::undo_log::{
     SMR_ROW_ABSENT,
 };
 use columine_types::types::{
-    ChangeFlag, EMPTY_KEY, ErrorCode, Opcode, PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE,
-    PROGRAM_MAGIC, SLOT_META_SIZE, STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType,
-    StateHeaderOffset, StructFieldType, TOMBSTONE, align8, struct_field_size,
+    ChangeFlag, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode, Opcode, PROGRAM_HASH_PREFIX,
+    PROGRAM_HEADER_SIZE, PROGRAM_MAGIC, SLOT_META_SIZE, STATE_HEADER_SIZE, STATE_MAGIC,
+    SlotMetaOffset, SlotType, StateHeaderOffset, StructFieldType, TOMBSTONE, align8,
+    struct_field_size,
 };
 use core::sync::atomic::Ordering;
 
@@ -635,6 +636,20 @@ impl UndoState {
         self.append_undo_only_snapshot(state, entry);
     }
 
+    /// Append a paired before/after mutation through the same bounded journal
+    /// and first-overflow snapshot path as VM-owned delta mutations.
+    ///
+    /// AxE's derived-fact VM uses this public seam because its RETE execution
+    /// lives in a sibling crate while the journal remains owned here.
+    pub fn append_pair(
+        &mut self,
+        state: &[u8],
+        undo_entry: FlatUndoEntry,
+        redo_entry: FlatUndoEntry,
+    ) {
+        self.append_pair_snapshot(state, undo_entry, redo_entry);
+    }
+
     /// vm.zig:240 `undoAppend` — undo-only lane (non-delta batches, evict).
     fn append_undo_only_snapshot(&mut self, state: &[u8], entry: FlatUndoEntry) {
         if self.count() < UNDO_CAPACITY {
@@ -920,50 +935,34 @@ pub fn rollback_entry(env: &mut BitmapEnv, state: &mut [u8], entry: &FlatUndoEnt
             undo_log::rollback_scalar_update(state, &meta, entry.aux, f64::from_bits(ts));
         }
         FlatUndoOp::FactInsertNew => {
-            // vm.zig:421 — tombstone the derived-fact key.
             let derived_offset = get_derived_facts_offset(state);
             let capacity = u32::from(get_derived_facts_capacity(state));
             let slot_idx = entry.prev_value;
             if slot_idx < capacity {
-                bytes::write_u32(state, derived_offset + slot_idx * 4, TOMBSTONE);
+                bytes::write_u64(
+                    state,
+                    derived_offset + slot_idx * 8,
+                    DERIVED_FACT_TOMBSTONE_IDENTITY,
+                );
             }
         }
-        FlatUndoOp::FactInsertUpdate => {
-            // vm.zig:433 — restore values_lo/values_hi. Faithful lane quirk:
-            // values_LO takes the HIGH aux word (aux >> 32) and values_HI the
-            // low word, mirroring the pack order at journal time.
+        FlatUndoOp::FactInsertUpdate | FlatUndoOp::FactRetract => {
             let derived_offset = get_derived_facts_offset(state);
             let capacity = u32::from(get_derived_facts_capacity(state));
             let slot_idx = entry.prev_value;
             if slot_idx < capacity {
-                bytes::write_u32(
-                    state,
-                    derived_offset + capacity * 4 + slot_idx * 4,
-                    (entry.aux >> 32) as u32,
-                );
+                let fact_idx = u16::from_le_bytes([entry.pad1, entry.pad2]);
+                let identity = (u64::from(fact_idx) << 32) | u64::from(entry.key);
+                bytes::write_u64(state, derived_offset + slot_idx * 8, identity);
                 bytes::write_u32(
                     state,
                     derived_offset + capacity * 8 + slot_idx * 4,
                     entry.aux as u32,
                 );
-            }
-        }
-        FlatUndoOp::FactRetract => {
-            // vm.zig:447 — restore key + values_lo + values_hi.
-            let derived_offset = get_derived_facts_offset(state);
-            let capacity = u32::from(get_derived_facts_capacity(state));
-            let slot_idx = entry.prev_value;
-            if slot_idx < capacity {
-                bytes::write_u32(state, derived_offset + slot_idx * 4, entry.key);
                 bytes::write_u32(
                     state,
-                    derived_offset + capacity * 4 + slot_idx * 4,
+                    derived_offset + capacity * 12 + slot_idx * 4,
                     (entry.aux >> 32) as u32,
-                );
-                bytes::write_u32(
-                    state,
-                    derived_offset + capacity * 8 + slot_idx * 4,
-                    entry.aux as u32,
                 );
             }
         }

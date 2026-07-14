@@ -36,11 +36,11 @@ pub enum FlatUndoOp {
     SetDelete = 5,
     /// Rollback: restore prev value (f64/i64) + count (u64) — 16-byte slots.
     AggUpdate = 6,
-    /// Rollback: tombstone derived fact key.
+    /// Rollback: tombstone the derived-fact identity at `prev_value`.
     FactInsertNew = 7,
-    /// Rollback: restore prev derived fact values.
+    /// Restore a derived-fact identity and value at `prev_value`.
     FactInsertUpdate = 8,
-    /// Rollback: restore derived fact key + values.
+    /// Restore a retracted derived-fact identity and value at `prev_value`.
     FactRetract = 9,
     /// Rollback: restore list count to prev_value.
     ListAppendUndo = 10,
@@ -72,25 +72,26 @@ pub const SMR_ROW_ABSENT: u8 = 0x02;
 /// vm.zig:193 `FlatUndoEntry` (`extern struct`) — one serialized undo/redo
 /// entry. C layout: op@0, slot@1, _pad1@2, _pad2@3, key@4, prev_value@8,
 /// four implicit padding bytes (aux is u64-aligned), aux@16; size 24.
-/// `_pad1`/`_pad2` are real data for the STRUCT_MAP_* ops (field_idx and
-/// flags) and zero elsewhere. Following crate convention the struct is plain
-/// Rust; the byte contract lives in [`FlatUndoEntry::write_to`] /
-/// [`FlatUndoEntry::read_from`], pinned by layout tests.
+/// `_pad1`/`_pad2` are real data for STRUCT_MAP_* (field_idx/flags) and
+/// FACT_* (`fact_idx` little-endian) ops; both bytes remain in the pinned ABI.
+/// Following crate convention the struct is plain Rust; the byte contract
+/// lives in [`FlatUndoEntry::write_to`] / [`FlatUndoEntry::read_from`], pinned
+/// by layout tests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlatUndoEntry {
     pub op: FlatUndoOp,
     /// Slot index (0xFF = derived fact).
     pub slot: u8,
-    /// STRUCT_MAP_FIELD: field_idx. Otherwise zero.
+    /// STRUCT_MAP_FIELD: field_idx. FACT_*: fact_idx low byte.
     pub pad1: u8,
-    /// STRUCT_MAP_*: SMF/SMR flags. Otherwise zero.
+    /// STRUCT_MAP_*: SMF/SMR flags. FACT_*: fact_idx high byte.
     pub pad2: u8,
-    /// HashMap/HashSet key or derived-fact combined_key.
+    /// HashMap/HashSet key, or the full u32 derived-fact key.
     pub key: u32,
-    /// Previous value (updates/deletes), or slot_index for facts.
+    /// Previous value (updates/deletes), or physical table slot for facts.
     pub prev_value: u32,
-    /// Previous timestamp bits (f64), packed prev fact values, field cell
-    /// bytes, or prior bitset bytes — per-op documented above.
+    /// Previous timestamp bits (f64), target/restored derived-fact u64 value,
+    /// field cell bytes, or prior bitset bytes — per-op documented above.
     pub aux: u64,
 }
 
