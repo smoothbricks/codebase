@@ -27,6 +27,10 @@ export interface WasmMemoryEpochPin {
   release(): void;
 }
 
+export const WASM_SPAN_IDENTITY_ROOT = 0;
+export const WASM_SPAN_IDENTITY_CHILD = 1;
+export const WASM_NO_LAYOUT_OFFSET = 0xffffffff;
+
 export interface WasmAllocator {
   /** The underlying WASM memory */
   readonly memory: WebAssembly.Memory;
@@ -55,6 +59,23 @@ export interface WasmAllocator {
   /** Allocate and release an exact logical byte extent with explicit alignment. */
   allocExact(byteLength: number, alignment: number): number;
   freeExact(offset: number, byteLength: number, alignment: number): void;
+  /**
+   * Allocate one root/child superblock and pre-arm its lifecycle rows in one
+   * WASM call. All offsets are immutable compile/startup layout constants.
+   */
+  createAndStartSpan(
+    identityMode: typeof WASM_SPAN_IDENTITY_ROOT | typeof WASM_SPAN_IDENTITY_CHILD,
+    traceIdLength: number,
+    superblockByteLength: number,
+    systemOffset: number,
+    entryTypeOffset: number,
+    rowHeaderOffset: number,
+    traceRootPtr: number,
+  ): number;
+  /** Allocate one storage-only overflow superblock in one WASM call. */
+  createOverflowSpan(superblockByteLength: number): number;
+  /** Release one root, child, or overflow superblock. */
+  freeSpanSuperblock(offset: number, byteLength: number): void;
 
   // Span lifecycle (writes timestamp + entry_type)
   spanStart(systemPtr: number, identityPtr: number, traceRootPtr: number, capacity?: number): void;
@@ -135,6 +156,17 @@ interface WasmExports {
   reset(): void;
   alloc_exact(byteLength: number, alignment: number): number;
   free_exact(offset: number, byteLength: number, alignment: number): void;
+  create_and_start_span(
+    identityMode: number,
+    traceIdLength: number,
+    superblockByteLength: number,
+    systemOffset: number,
+    entryTypeOffset: number,
+    rowHeaderOffset: number,
+    traceRootPtr: number,
+  ): number;
+  create_overflow_span(superblockByteLength: number): number;
+  free_span_superblock(offset: number, byteLength: number): void;
 
   span_start(systemPtr: number, identityPtr: number, traceRootPtr: number, capacity: number): void;
   span_end_ok(systemPtr: number, traceRootPtr: number, capacity: number): void;
@@ -190,7 +222,13 @@ function isWasmExports(value: unknown): value is WasmExports {
     return false;
   }
 
-  return typeof Reflect.get(value, 'init') === 'function' && typeof Reflect.get(value, 'alloc_exact') === 'function';
+  return (
+    typeof Reflect.get(value, 'init') === 'function' &&
+    typeof Reflect.get(value, 'alloc_exact') === 'function' &&
+    typeof Reflect.get(value, 'create_and_start_span') === 'function' &&
+    typeof Reflect.get(value, 'create_overflow_span') === 'function' &&
+    typeof Reflect.get(value, 'free_span_superblock') === 'function'
+  );
 }
 
 // =============================================================================
@@ -289,6 +327,33 @@ function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Me
     reset: exports.reset,
     allocExact: exports.alloc_exact,
     freeExact: exports.free_exact,
+    createAndStartSpan: (
+      identityMode,
+      traceIdLength,
+      superblockByteLength,
+      systemOffset,
+      entryTypeOffset,
+      rowHeaderOffset,
+      traceRootPtr,
+    ) => {
+      const offset = exports.create_and_start_span(
+        identityMode,
+        traceIdLength,
+        superblockByteLength,
+        systemOffset,
+        entryTypeOffset,
+        rowHeaderOffset,
+        traceRootPtr,
+      );
+      refreshViews();
+      return offset;
+    },
+    createOverflowSpan: (superblockByteLength) => {
+      const offset = exports.create_overflow_span(superblockByteLength);
+      refreshViews();
+      return offset;
+    },
+    freeSpanSuperblock: exports.free_span_superblock,
 
     // Span lifecycle with optional capacity
     spanStart: (systemPtr, identityPtr, traceRootPtr, cap = capacity) =>
