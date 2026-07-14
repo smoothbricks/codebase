@@ -9,8 +9,11 @@
 //! the dispatch slice's to translate.
 
 use columine_types::types::{
-    AggType, EMPTY_KEY, STATE_HEADER_SIZE, SlotMetaOffset, SlotType, TOMBSTONE,
+    AggType, DERIVED_FACT_EMPTY_IDENTITY, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY,
+    STATE_HEADER_SIZE, SlotMetaOffset, SlotType, TOMBSTONE,
 };
+use columine_vm::bitmap_ops::BitmapEnv;
+use columine_vm::bytes;
 use columine_vm::hash_table::{ENTRY_NONE, ENTRY_U32, FlatTable};
 use columine_vm::intern::StringIntern;
 use columine_vm::meta::SlotMetaView;
@@ -19,6 +22,7 @@ use columine_vm::undo_log::{
     rollback_map_delete, rollback_map_insert, rollback_map_update, rollback_set_delete,
     rollback_set_insert,
 };
+use columine_vm::vm::{Vm, rollback_entry, write_derived_facts_header};
 use proptest::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -535,5 +539,148 @@ fn rollforward_skips_zeroed_noop_markers() {
     assert_eq!(
         u64::from_le_bytes(state[off..off + 8].try_into().unwrap()),
         7
+    );
+}
+
+fn fact_entry(
+    op: FlatUndoOp,
+    fact_idx: u16,
+    key: u32,
+    physical_slot: u32,
+    value: u64,
+) -> FlatUndoEntry {
+    let [pad1, pad2] = fact_idx.to_le_bytes();
+    FlatUndoEntry {
+        op,
+        slot: u8::MAX,
+        pad1,
+        pad2,
+        key,
+        prev_value: physical_slot,
+        aux: value,
+    }
+}
+
+fn mk_derived_state(capacity: u32) -> Vec<u8> {
+    let derived_offset = STATE_HEADER_SIZE;
+    let mut state = vec![0u8; (derived_offset + capacity * 16) as usize];
+    write_derived_facts_header(&mut state, derived_offset, capacity as u16, 1);
+    for pos in 0..capacity {
+        bytes::write_u64(
+            &mut state,
+            derived_offset + pos * 8,
+            DERIVED_FACT_EMPTY_IDENTITY,
+        );
+    }
+    state
+}
+
+fn set_fact_cell(state: &mut [u8], capacity: u32, physical_slot: u32, identity: u64, value: u64) {
+    let derived_offset = STATE_HEADER_SIZE;
+    bytes::write_u64(state, derived_offset + physical_slot * 8, identity);
+    bytes::write_u32(
+        state,
+        derived_offset + capacity * 8 + physical_slot * 4,
+        value as u32,
+    );
+    bytes::write_u32(
+        state,
+        derived_offset + capacity * 12 + physical_slot * 4,
+        (value >> 32) as u32,
+    );
+}
+
+#[test]
+fn paired_fact_update_rolls_back_and_forward_with_full_identity() {
+    let capacity = 4;
+    let physical_slot = 2;
+    let fact_idx = 0x1234;
+    let key = 0xfedc_ba98;
+    let identity = (u64::from(fact_idx) << 32) | u64::from(key);
+    let before_value = 0x1122_3344_5566_7788;
+    let after_value = 0x99aa_bbcc_ddee_ff00;
+
+    let mut before = mk_derived_state(capacity);
+    set_fact_cell(&mut before, capacity, physical_slot, identity, before_value);
+    let mut after = before.clone();
+    set_fact_cell(&mut after, capacity, physical_slot, identity, after_value);
+
+    let undo = fact_entry(
+        FlatUndoOp::FactInsertUpdate,
+        fact_idx,
+        key,
+        physical_slot,
+        before_value,
+    );
+    let redo = fact_entry(
+        FlatUndoOp::FactInsertUpdate,
+        fact_idx,
+        key,
+        physical_slot,
+        after_value,
+    );
+    let mut vm = Vm::default();
+    vm.undo_enable(&before);
+    vm.undo.append_pair(&before, undo, redo);
+    assert_eq!(vm.undo.count(), 1);
+    assert_eq!(vm.undo.delta_count(), 1);
+
+    assert_eq!(vm.delta_export_segment(0, 1), 1);
+    let undo_segment = vm.delta_export_undo_bytes();
+    let redo_segment = vm.delta_export_redo_bytes();
+
+    let mut production = after.clone();
+    vm.undo_rollback(&mut production, 0);
+    assert_eq!(production, before);
+
+    let mut delta_rollback = after.clone();
+    vm.delta_apply_rollback_segment(&mut delta_rollback, &undo_segment, FLAT_UNDO_ENTRY_SIZE);
+    assert_eq!(delta_rollback, before);
+
+    let mut delta_rollforward = before.clone();
+    vm.delta_apply_rollforward_segment(&mut delta_rollforward, &redo_segment, FLAT_UNDO_ENTRY_SIZE);
+    assert_eq!(delta_rollforward, after);
+}
+
+#[test]
+fn fact_insert_and_retract_restore_collision_free_identity_cells() {
+    let capacity = 4;
+    let physical_slot = 1;
+    let fact_idx = 0xabcd;
+    let key = 0xf123_4567;
+    let identity = (u64::from(fact_idx) << 32) | u64::from(key);
+    let value = 0x0123_4567_89ab_cdef;
+    let mut state = mk_derived_state(capacity);
+    set_fact_cell(&mut state, capacity, physical_slot, identity, value);
+
+    rollback_entry(
+        &mut BitmapEnv::default(),
+        &mut state,
+        &fact_entry(FlatUndoOp::FactInsertNew, fact_idx, key, physical_slot, 0),
+    );
+    assert_eq!(
+        bytes::read_u64(&state, STATE_HEADER_SIZE + physical_slot * 8),
+        DERIVED_FACT_TOMBSTONE_IDENTITY,
+    );
+
+    rollback_entry(
+        &mut BitmapEnv::default(),
+        &mut state,
+        &fact_entry(FlatUndoOp::FactRetract, fact_idx, key, physical_slot, value),
+    );
+    assert_eq!(
+        bytes::read_u64(&state, STATE_HEADER_SIZE + physical_slot * 8),
+        identity,
+    );
+    assert_eq!(
+        bytes::read_u32(&state, STATE_HEADER_SIZE + capacity * 8 + physical_slot * 4,),
+        value as u32,
+    );
+    assert_eq!(
+        bytes::read_u32(
+            &state,
+            STATE_HEADER_SIZE + capacity * 12 + physical_slot * 4,
+        ),
+        (value >> 32) as u32,
     );
 }
