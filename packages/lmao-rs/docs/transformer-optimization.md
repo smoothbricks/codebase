@@ -359,6 +359,26 @@ allocator-visible bytes (span 1496B, overflow 1368B); property tests prove packe
 capacities 1–512. Keep the superblock for the bounded footprint, simpler ownership, one-call FFI surface, and measured
 overflow win—not for the superseded 10× span-setup projection.
 
+**Chrome confirmation (2026-07-14, Apple M5 Max, Headless Chrome 150, three fresh-page runs).** The Expo web benchmark
+uses the production `WasmAllocator` wrapper, fetches the shipped `allocator.wasm` over HTTP, performs 4,096 warmups,
+then records 30 alternating samples of 8,192 cycles. It compares the same capacity-64 identity, system, u8, u32, and f64
+storage:
+
+| Cycle             | Separate allocations | Superblock |                 Result |
+| ----------------- | -------------------: | ---------: | ---------------------: |
+| child span, run 1 |            720.21 ns |  683.59 ns | superblock 5.1% faster |
+| child span, run 2 |            781.25 ns |  732.42 ns | superblock 6.3% faster |
+| child span, run 3 |            756.84 ns |  720.21 ns | superblock 4.8% faster |
+| overflow, run 1   |            573.73 ns |  537.11 ns | superblock 6.4% faster |
+| overflow, run 2   |            610.35 ns |  585.94 ns | superblock 4.0% faster |
+| overflow, run 3   |            598.14 ns |  543.21 ns | superblock 9.2% faster |
+
+The identical wrapper harness under Bun measured child-span results from 0.5% slower to 3.6% faster (median run: 3.2%
+faster) and overflow results from 9.6% to 9.9% faster (median run: 9.7% faster). Chrome therefore confirms a small
+root/child improvement and a repeatable overflow improvement, not the superseded 10x projection. The retained browser
+harness is `packages/lmao-expo-benchmark/src/superblock-benchmark.ts`; its CLI entry point is
+`superblock-benchmark.bench.ts`.
+
 ### E. Compile-time row-header packing (the write batching that works)
 
 The refuted micro-batching staged values and paid `.set()` overhead. A possible future variant would pack **compile-time
