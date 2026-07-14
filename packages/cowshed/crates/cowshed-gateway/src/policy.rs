@@ -287,6 +287,21 @@ impl MirrorProtocol {
         }
     }
 
+    pub const fn artifact_origin(self) -> &'static str {
+        match self {
+            Self::Npm => "https://registry.npmjs.org:443",
+            Self::Cargo => "https://static.crates.io:443",
+            Self::Go => "https://proxy.golang.org:443",
+        }
+    }
+
+    pub const fn checksum_origin(self) -> Option<&'static str> {
+        match self {
+            Self::Go => Some("https://sum.golang.org:443"),
+            Self::Npm | Self::Cargo => None,
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Npm => "npm",
@@ -373,30 +388,89 @@ impl WorkspacePolicy {
     }
 
     pub fn resolve_mirror(&self, path: &str) -> Option<ResolvedMirrorRoute> {
-        let route = self
+        if let Some(route) = self
             .mirrors
             .iter()
             .filter(|route| path.starts_with(&route.local_prefix))
-            .max_by_key(|route| route.local_prefix.len())?;
-        let suffix = &path[route.local_prefix.len() - 1..];
-        let (normalized, admission_path) = normalize_mirror_suffix(route.protocol, suffix).ok()?;
-        let admitted_prefix = route
-            .admitted_prefixes
-            .iter()
-            .filter(|prefix| admission_path.starts_with(prefix.as_str()))
-            .max_by_key(|prefix| prefix.len())?
-            .clone();
-        let base = Url::parse(&route.upstream_origin).ok()?;
-        let url = base.join(normalized.trim_start_matches('/')).ok()?;
-        let target = CanonicalTarget::from_url(&url).ok()?;
-        Some(ResolvedMirrorRoute {
-            target,
-            path: normalized,
-            protocol: route.protocol,
-            credentialed: route.credentialed,
-            admitted_prefix,
-        })
+            .max_by_key(|route| route.local_prefix.len())
+        {
+            let suffix = &path[route.local_prefix.len() - 1..];
+            let (normalized, admission_path) =
+                normalize_mirror_suffix(route.protocol, suffix).ok()?;
+            let admitted_prefix = route
+                .admitted_prefixes
+                .iter()
+                .filter(|prefix| admission_path.starts_with(prefix.as_str()))
+                .max_by_key(|prefix| prefix.len())?
+                .clone();
+            let base = Url::parse(&route.upstream_origin).ok()?;
+            let url = base.join(normalized.trim_start_matches('/')).ok()?;
+            return Some(ResolvedMirrorRoute {
+                target: CanonicalTarget::from_url(&url).ok()?,
+                path: normalized,
+                protocol: route.protocol,
+                credentialed: route.credentialed,
+                admitted_prefix,
+            });
+        }
+        resolve_baseline_mirror(path)
     }
+}
+
+fn resolve_baseline_mirror(path: &str) -> Option<ResolvedMirrorRoute> {
+    let (protocol, suffix) = [
+        MirrorProtocol::Npm,
+        MirrorProtocol::Cargo,
+        MirrorProtocol::Go,
+    ]
+    .into_iter()
+    .find_map(|protocol| {
+        path.strip_prefix(protocol.local_prefix())
+            .map(|suffix| (protocol, suffix))
+    })?;
+    let local_suffix = format!("/{suffix}");
+    let (mut upstream_path, _) = normalize_mirror_suffix(protocol, &local_suffix).ok()?;
+    let origin = match protocol {
+        MirrorProtocol::Npm => protocol.baseline_origin(),
+        MirrorProtocol::Cargo if upstream_path.starts_with("/crates/") => {
+            let (route_path, query) = upstream_path
+                .split_once('?')
+                .map_or((upstream_path.as_str(), None), |(path, query)| {
+                    (path, Some(query))
+                });
+            let segments = route_path
+                .trim_start_matches('/')
+                .split('/')
+                .collect::<Vec<_>>();
+            if segments.len() != 4 || segments[0] != "crates" || segments[3] != "download" {
+                return None;
+            }
+            let suffix = query.map_or(String::new(), |query| format!("?{query}"));
+            upstream_path = format!(
+                "/crates/{name}/{name}-{version}.crate{suffix}",
+                name = segments[1],
+                version = segments[2]
+            );
+            protocol.artifact_origin()
+        }
+        MirrorProtocol::Cargo => protocol.baseline_origin(),
+        MirrorProtocol::Go if upstream_path.starts_with("/sumdb/sum.golang.org/") => {
+            upstream_path = upstream_path
+                .strip_prefix("/sumdb/sum.golang.org")
+                .unwrap_or("/")
+                .to_owned();
+            protocol.checksum_origin()?
+        }
+        MirrorProtocol::Go => protocol.baseline_origin(),
+    };
+    let target = CanonicalTarget::from_url(&Url::parse(origin).ok()?).ok()?;
+    Some(ResolvedMirrorRoute {
+        target,
+        path: upstream_path,
+        protocol,
+        credentialed: false,
+        admitted_prefix: "/".to_owned(),
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

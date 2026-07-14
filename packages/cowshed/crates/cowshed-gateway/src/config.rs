@@ -405,6 +405,39 @@ impl GatewayConfig {
         Ok(())
     }
 
+    pub fn validate_host_cache_layout(&self) -> Result<(), ConfigError> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let control = self
+            .control_socket
+            .as_deref()
+            .ok_or(ConfigError::MissingProductionControlSocket)?;
+        if control.file_name().and_then(|name| name.to_str()) != Some("gateway.sock") {
+            return Err(ConfigError::InvalidProductionCacheRoot);
+        }
+        let gateway_root = control
+            .parent()
+            .ok_or(ConfigError::InvalidProductionCacheRoot)?;
+        let expected = gateway_root.join("caches").join("mirror");
+        let canonical_expected = std::fs::canonicalize(&expected)
+            .map_err(|_| ConfigError::InvalidProductionCacheRoot)?;
+        let canonical_configured = std::fs::canonicalize(&self.mirror_cache.cache_root)
+            .map_err(|_| ConfigError::InvalidProductionCacheRoot)?;
+        if canonical_expected != canonical_configured || canonical_configured != expected {
+            return Err(ConfigError::InvalidProductionCacheRoot);
+        }
+        let metadata = std::fs::symlink_metadata(&canonical_configured)
+            .map_err(|_| ConfigError::InvalidProductionCacheRoot)?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != self.authorized_control_uid
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(ConfigError::InvalidProductionCacheRoot);
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_session_endpoint(
         &self,
         session: &WorkspaceSession,
@@ -503,6 +536,12 @@ pub enum ConfigError {
     MissingMirrorCacheRoot,
     #[error("gateway mirror cache root must be a pre-existing real directory")]
     InsecureMirrorCacheRoot,
+    #[error("production gateway requires the canonical gateway.sock control endpoint")]
+    MissingProductionControlSocket,
+    #[error(
+        "production mirror cache must be the owned mode-0700 <gateway-root>/caches/mirror directory"
+    )]
+    InvalidProductionCacheRoot,
     #[error("gateway mirror cache low-water/TTL limits are invalid")]
     InvalidMirrorCacheLimits,
     #[error(transparent)]

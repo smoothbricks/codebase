@@ -21,7 +21,7 @@ mod tls;
 pub use actor::{Gateway, GatewayError, GatewayHandle, GatewayStatus, SessionStatus};
 pub use cache::{
     Cache, CacheBodyError, CacheConfig, CacheError, CacheKey, CacheNamespace, CachedResponse,
-    DEFAULT_HIGH_WATER_BYTES, DEFAULT_LOW_WATER_BYTES, ObjectExpectation,
+    DEFAULT_HIGH_WATER_BYTES, DEFAULT_LOW_WATER_BYTES, ObjectDigest, ObjectExpectation,
 };
 pub use config::{
     ConfigError, GatewayConfig, GatewayLimits, GatewayTimeouts, MACOS_PORT_BLOCK_SIZE,
