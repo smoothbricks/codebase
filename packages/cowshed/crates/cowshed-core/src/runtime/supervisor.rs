@@ -17,7 +17,8 @@ use crate::api::dto::{
     CommandArg, ControllerCommitment, ExecRequest, ExitStatus, JobId, JobInfo, JobState,
     OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary, ProtectedOutput,
     Sha256Digest, StdinInfo, StdinKind, StdinSource, StreamInfo, TraceContext, TraceId,
-    UtcTimestamp, WorkspacePath, validate_command_argv,
+    UtcTimestamp, WorkspaceIntroducedCommitment, WorkspacePath, WorkspaceRetiredCommitment,
+    validate_command_argv,
 };
 use crate::error::{CowshedError, Result};
 use crate::exec::{
@@ -279,6 +280,14 @@ pub trait ArtifactSink: Send {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommitmentDraft {
+    WorkspaceIntroduced {
+        repo_id: RepoId,
+        workspace_incarnation: WorkspaceIncarnation,
+    },
+    WorkspaceRetired {
+        repo_id: RepoId,
+        workspace_incarnation: WorkspaceIncarnation,
+    },
     Admission {
         repo_id: RepoId,
         workspace_incarnation: WorkspaceIncarnation,
@@ -321,6 +330,24 @@ pub enum CommitmentDraft {
 impl CommitmentDraft {
     pub fn into_commitment(self, order: u64) -> ControllerCommitment {
         match self {
+            Self::WorkspaceIntroduced {
+                repo_id,
+                workspace_incarnation,
+            } => ControllerCommitment::WorkspaceIntroduced(WorkspaceIntroducedCommitment {
+                version: CONTROLLER_COMMITMENT_VERSION,
+                order,
+                repo_id,
+                workspace_incarnation,
+            }),
+            Self::WorkspaceRetired {
+                repo_id,
+                workspace_incarnation,
+            } => ControllerCommitment::WorkspaceRetired(WorkspaceRetiredCommitment {
+                version: CONTROLLER_COMMITMENT_VERSION,
+                order,
+                repo_id,
+                workspace_incarnation,
+            }),
             Self::Admission {
                 repo_id,
                 workspace_incarnation,

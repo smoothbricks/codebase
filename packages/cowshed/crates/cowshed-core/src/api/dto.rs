@@ -1109,6 +1109,24 @@ pub const CONTROLLER_COMMITMENT_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceIntroducedCommitment {
+    pub version: u16,
+    pub order: u64,
+    pub repo_id: RepoId,
+    pub workspace_incarnation: WorkspaceIncarnation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceRetiredCommitment {
+    pub version: u16,
+    pub order: u64,
+    pub repo_id: RepoId,
+    pub workspace_incarnation: WorkspaceIncarnation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdmissionCommitment {
     pub version: u16,
     pub order: u64,
@@ -1175,6 +1193,8 @@ pub struct RestoreCommitment {
 /// Protected payload bytes and artifact paths deliberately do not appear in any variant.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControllerCommitment {
+    WorkspaceIntroduced(WorkspaceIntroducedCommitment),
+    WorkspaceRetired(WorkspaceRetiredCommitment),
     Admission(AdmissionCommitment),
     Terminal(TerminalCommitment),
     Checkpoint(CheckpointCommitment),
@@ -1185,6 +1205,8 @@ pub enum ControllerCommitment {
 impl ControllerCommitment {
     pub fn version(&self) -> u16 {
         match self {
+            Self::WorkspaceIntroduced(value) => value.version,
+            Self::WorkspaceRetired(value) => value.version,
             Self::Admission(value) => value.version,
             Self::Terminal(value) => value.version,
             Self::Checkpoint(value) => value.version,
@@ -1195,6 +1217,8 @@ impl ControllerCommitment {
 
     pub fn order(&self) -> u64 {
         match self {
+            Self::WorkspaceIntroduced(value) => value.order,
+            Self::WorkspaceRetired(value) => value.order,
             Self::Admission(value) => value.order,
             Self::Terminal(value) => value.order,
             Self::Checkpoint(value) => value.order,
@@ -1205,6 +1229,8 @@ impl ControllerCommitment {
 
     pub fn repo_id(&self) -> &RepoId {
         match self {
+            Self::WorkspaceIntroduced(value) => &value.repo_id,
+            Self::WorkspaceRetired(value) => &value.repo_id,
             Self::Admission(value) => &value.repo_id,
             Self::Terminal(value) => &value.repo_id,
             Self::Checkpoint(value) => &value.repo_id,
@@ -1283,6 +1309,8 @@ fn valid_commitment_id(value: &str) -> bool {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum ControllerCommitmentRef<'a> {
+    WorkspaceIntroduced(&'a WorkspaceIntroducedCommitment),
+    WorkspaceRetired(&'a WorkspaceRetiredCommitment),
     Admission(&'a AdmissionCommitment),
     Terminal(&'a TerminalCommitment),
     Checkpoint(&'a CheckpointCommitment),
@@ -1293,6 +1321,8 @@ enum ControllerCommitmentRef<'a> {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum ControllerCommitmentWire {
+    WorkspaceIntroduced(WorkspaceIntroducedCommitment),
+    WorkspaceRetired(WorkspaceRetiredCommitment),
     Admission(AdmissionCommitment),
     Terminal(TerminalCommitment),
     Checkpoint(CheckpointCommitment),
@@ -1307,6 +1337,10 @@ impl Serialize for ControllerCommitment {
     {
         self.validate().map_err(serde::ser::Error::custom)?;
         match self {
+            Self::WorkspaceIntroduced(value) => {
+                ControllerCommitmentRef::WorkspaceIntroduced(value)
+            }
+            Self::WorkspaceRetired(value) => ControllerCommitmentRef::WorkspaceRetired(value),
             Self::Admission(value) => ControllerCommitmentRef::Admission(value),
             Self::Terminal(value) => ControllerCommitmentRef::Terminal(value),
             Self::Checkpoint(value) => ControllerCommitmentRef::Checkpoint(value),
@@ -1323,6 +1357,10 @@ impl<'de> Deserialize<'de> for ControllerCommitment {
         D: Deserializer<'de>,
     {
         let value = match ControllerCommitmentWire::deserialize(deserializer)? {
+            ControllerCommitmentWire::WorkspaceIntroduced(value) => {
+                Self::WorkspaceIntroduced(value)
+            }
+            ControllerCommitmentWire::WorkspaceRetired(value) => Self::WorkspaceRetired(value),
             ControllerCommitmentWire::Admission(value) => Self::Admission(value),
             ControllerCommitmentWire::Terminal(value) => Self::Terminal(value),
             ControllerCommitmentWire::Checkpoint(value) => Self::Checkpoint(value),

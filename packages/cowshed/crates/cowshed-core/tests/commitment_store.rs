@@ -10,7 +10,8 @@ use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use cowshed_core::api::{
     AdmissionCommitment, CONTROLLER_COMMITMENT_VERSION, ControllerCommitment, JobId, JobState,
-    Sha256Digest, TerminalCommitment, WorkspaceIncarnation,
+    Sha256Digest, TerminalCommitment, WorkspaceIncarnation, WorkspaceIntroducedCommitment,
+    WorkspaceRetiredCommitment,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::commitment_store::{
@@ -141,6 +142,24 @@ fn store_with_environment(
     CommitmentStore::open_with_environment(root, repo(), [incarnation()], Box::new(environment))
 }
 
+fn introduced(order: u64) -> ControllerCommitment {
+    ControllerCommitment::WorkspaceIntroduced(WorkspaceIntroducedCommitment {
+        version: CONTROLLER_COMMITMENT_VERSION,
+        order,
+        repo_id: repo(),
+        workspace_incarnation: incarnation(),
+    })
+}
+
+fn retired(order: u64) -> ControllerCommitment {
+    ControllerCommitment::WorkspaceRetired(WorkspaceRetiredCommitment {
+        version: CONTROLLER_COMMITMENT_VERSION,
+        order,
+        repo_id: repo(),
+        workspace_incarnation: incarnation(),
+    })
+}
+
 fn admission(order: u64, job_id: u64) -> ControllerCommitment {
     ControllerCommitment::Admission(AdmissionCommitment {
         version: CONTROLLER_COMMITMENT_VERSION,
@@ -264,6 +283,22 @@ fn publish_reopen_round_trip_uses_exact_schema_and_one_segment_per_commitment() 
     drop(store);
     let reopened = CommitmentStore::open(root.path(), repo(), [incarnation()]).unwrap();
     assert_eq!(reopened.next_order().unwrap(), 3);
+}
+
+#[test]
+fn reopen_with_only_current_storage_facts_accepts_retired_workspace_job_history() {
+    let root = TempRoot::new("retired-restart");
+    let mut store =
+        store_with_environment(root.path(), FixedEnvironment::new(date(2026, 2, 4))).unwrap();
+    store.publish(introduced(1)).unwrap();
+    store.publish(admission(2, 1)).unwrap();
+    store.publish(terminal(3, 1)).unwrap();
+    store.publish(retired(4)).unwrap();
+    drop(store);
+
+    let reopened = CommitmentStore::open(root.path(), repo(), []).unwrap();
+    assert_eq!(reopened.next_order().unwrap(), 5);
+    assert_eq!(sealed_segments(root.path()).len(), 4);
 }
 
 #[test]
