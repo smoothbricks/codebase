@@ -1976,6 +1976,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         if let Some(expected) = expected_incarnation.as_ref() {
             Self::require_exact_incarnation(&current, expected)?;
         }
+        let explicitly_labeled = options.label.is_some();
         let label = crate::storage::CheckpointLabel::new(options.label.unwrap_or_else(|| {
             format!(
                 "checkpoint-{}",
@@ -1995,7 +1996,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .plan_checkpoint(
                 &current.derived.workspace,
                 label.clone(),
-                if options.keep {
+                if options.keep || explicitly_labeled {
+
                     crate::storage::lifecycle::Pin::Pinned
                 } else {
                     crate::storage::lifecycle::Pin::Automatic
