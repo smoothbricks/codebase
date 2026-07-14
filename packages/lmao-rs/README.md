@@ -4,10 +4,8 @@ Rust port of the LMAO trace-logging system. Lives beside the TS implementation i
 `specs/lmao/` are the source of truth.
 
 `lmao-wasm` is the production allocator: `packages/lmao/dist/allocator.wasm` is built from this workspace
-(`nx run lmao-rs:cargo-wasm` → `nx run lmao:rust-wasm`) and shipped in the npm package. The original Zig allocator
-remains in-tree as an opt-in reference build (`bun run build:zig-wasm` in `packages/lmao`, loaded via
-`LMAO_WASM_ALLOCATOR=zig`); note it carries a latent freelist bug (FreeBlock bookkeeping overruns sub-20-byte `col_1b`
-blocks at capacity 8/16) that the Rust port fixes by clamping to the first ≥20-byte tier.
+(`nx run lmao-rs:cargo-wasm` → `nx run lmao:rust-wasm`) and shipped in the npm package. Its tiered freelist clamps
+sub-20-byte `col_1b` blocks to the first ≥20-byte tier so free-block bookkeeping always fits.
 
 Nx targets for this project: `build` (via `cargo-wasm`), `test` (`cargo test --workspace`), `lint`
 (`cargo fmt --check` + `clippy -D warnings`), `bench`.
@@ -17,10 +15,10 @@ Nx targets for this project: `build` (via `cargo-wasm`), `test` (`cargo test --w
 | Crate         | Responsibility                                                                                                                                                                                                                                                                             | Primary specs                                      |
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------- |
 | `lmao-core`   | Entry types (23), span identity (thread_id + counter, `Arc<str>` trace ids, parent by reference), fixed row layout (row 0 span-start / tag overwrite, row 1 pre-armed span-exception, rows 2+ append), per-trace timestamp anchoring behind a `Clock` trait, SoA buffers, capacity ratchet | `01h`, `01b4`, `01b`, `01b1`–`01b5`, `01b3`, `01a` |
-| `lmao-arena`  | Buddy/tiered-freelist arena ported from `packages/lmao/src/lib/wasm/allocator.zig` (28 freelists = 7 tiers × 4 size classes, zero-overhead freelists, 192-byte header — layouts pinned with `#[repr(C)]` + const asserts)                                                                  | `01q`                                              |
+| `lmao-arena`  | Buddy/tiered-freelist arena (28 freelists = 7 tiers × 4 size classes, zero-overhead freelists, 192-byte header — layouts pinned with `#[repr(C)]` + const asserts)                                                                                                                         | `01q`                                              |
 | `lmao-arrow`  | Two-pass tree walk → one Arrow `RecordBatch` per flush (pass 1 dictionary accumulation, sorted-dict finalize, pass 2 memcpy columns)                                                                                                                                                       | `01k`, `01f`                                       |
 | `lmao-macros` | `define_log_schema!` / `span!` proc-macros — compile-time replacement for the TS `new Function()` codegen and AST transformer                                                                                                                                                              | `01a`, `01g`, `01j`, `01o`, `01b6`                 |
-| `lmao-wasm`   | `cdylib` for `wasm32-unknown-unknown` exporting the exact `allocator.zig` ABI (same names, sentinel returns, packed-u64 identity convention, `--import-memory`) so `wasmAllocator.ts` loads it unchanged                                                                                   | `01q`                                              |
+| `lmao-wasm`   | `cdylib` for `wasm32-unknown-unknown` exporting the allocator ABI (stable names, sentinel returns, packed-u64 identity convention, `--import-memory`) consumed directly by `wasmAllocator.ts`                                                                                              | `01q`                                              |
 | `lmao-query`  | Tracer-agnostic assertion/query surface (selector → count/never), Arrow + SQLite backends behind features                                                                                                                                                                                  | `AxE/specs/sim/08-trace-testing.md`                |
 
 ## AxE determinism constraints (non-negotiable design rules)
@@ -67,8 +65,7 @@ Without `just`: the same commands are spelled out in `justfile`, and `.cargo/con
 
 ## Port order (suggested)
 
-1. `lmao-arena` alloc/free (port `allocator.zig` mechanically; the property tests encode buddy conservation, reuse, and
-   no-overlap).
+1. `lmao-arena` alloc/free (the property tests encode buddy conservation, reuse, and no-overlap).
 2. `lmao-core` `SpanBuffer::append` + overflow chaining (alloc-gate test goes green).
 3. `lmao-arrow` `convert_span_trees` (bit-identical serialization test goes green).
 4. `lmao-macros` `define_log_schema!` (then re-include macros in `mutants.toml`).
