@@ -11,10 +11,9 @@ use cowshed_gateway::{
     ArrowAuditConfig, ArrowAuditSink, AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus,
     AuthorizedTarget, BoxIo, CanonicalTarget, ConnectError, ControlError, ControlFailureCode,
     CredentialError, CredentialProtocol, CredentialProvider, CredentialQuery, CredentialRecord,
-    DiscardAudit, EgressGrant, Gateway, GatewayConfig, GatewayControlClient, GatewayLimits,
-    GatewayTimeouts, HostPattern, MirrorProtocol, MirrorRoute, NoCredentials, UpstreamConnector,
-    UpstreamHealth, UpstreamPurpose, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy,
-    WorkspaceSession, WorkspaceToken,
+    EgressGrant, Gateway, GatewayConfig, GatewayControlClient, GatewayLimits, GatewayTimeouts,
+    HostPattern, MirrorProtocol, MirrorRoute, UpstreamConnector, UpstreamHealth, UpstreamPurpose,
+    WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 use http::HeaderName;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
@@ -31,6 +30,32 @@ use tokio::{
 };
 use tokio_rustls::TlsConnector;
 use zeroize::Zeroizing;
+#[derive(Debug)]
+struct NoCredentials;
+
+#[async_trait]
+impl CredentialProvider for NoCredentials {
+    async fn lookup(
+        &self,
+        _query: &CredentialQuery,
+    ) -> Result<Option<CredentialRecord>, CredentialError> {
+        Ok(None)
+    }
+}
+
+#[derive(Debug)]
+struct DiscardAudit;
+
+#[async_trait]
+impl AuditSink for DiscardAudit {
+    async fn record(&self, _event: AuditEvent) -> Result<(), AuditError> {
+        Ok(())
+    }
+
+    async fn flush(&self) -> Result<(), AuditError> {
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 struct LocalConnector {

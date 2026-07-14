@@ -249,19 +249,6 @@ pub trait CredentialProvider: Send + Sync + 'static {
     ) -> Result<Option<CredentialRecord>, CredentialError>;
 }
 
-#[derive(Debug, Default)]
-pub struct NoCredentials;
-
-#[async_trait]
-impl CredentialProvider for NoCredentials {
-    async fn lookup(
-        &self,
-        _query: &CredentialQuery,
-    ) -> Result<Option<CredentialRecord>, CredentialError> {
-        Ok(None)
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum CredentialError {
     #[error("credential store unavailable: {0}")]
@@ -321,20 +308,6 @@ pub enum AuditStatus {
 pub trait AuditSink: Send + Sync + 'static {
     async fn record(&self, event: AuditEvent) -> Result<(), AuditError>;
     async fn flush(&self) -> Result<(), AuditError>;
-}
-
-#[derive(Debug, Default)]
-pub struct DiscardAudit;
-
-#[async_trait]
-impl AuditSink for DiscardAudit {
-    async fn record(&self, _event: AuditEvent) -> Result<(), AuditError> {
-        Ok(())
-    }
-
-    async fn flush(&self) -> Result<(), AuditError> {
-        Ok(())
-    }
 }
 
 #[derive(Debug, Error)]
