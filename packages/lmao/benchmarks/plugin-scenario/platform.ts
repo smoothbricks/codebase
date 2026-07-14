@@ -4,11 +4,11 @@ import {
   executeScenario,
   generateCanonicalSemanticSnapshot,
   resetScenarioBufferStats,
-  type ScenarioTraceRootFactory,
+  type ScenarioRuntime,
   type ScenarioTracer,
 } from './scenario';
 
-const PLATFORM_RESULT_SCHEMA_VERSION = 2;
+const PLATFORM_RESULT_SCHEMA_VERSION = 3;
 const PLATFORM_WARMUP_ITERATIONS = 256;
 const PLATFORM_SAMPLE_COUNT = 30;
 const PLATFORM_ITERATIONS_PER_SAMPLE = 2_048;
@@ -16,9 +16,8 @@ const NANOSECONDS_PER_MILLISECOND = 1_000_000;
 
 export type BenchmarkMode = 'cold' | 'steady' | 'diagnostic';
 
-export interface PlatformScenarioOptions {
+export interface PlatformScenarioOptions extends ScenarioRuntime {
   now: () => number;
-  createTraceRoot: ScenarioTraceRootFactory;
   platform: string;
   engine: string;
   variant: string;
@@ -29,10 +28,11 @@ export interface PlatformScenarioOptions {
 }
 
 interface PlatformScenarioResultBase {
-  schemaVersion: 2;
+  schemaVersion: 3;
   platform: string;
   engine: string;
   variant: string;
+  backend: ScenarioRuntime['backend'];
   semanticJson: string;
 }
 
@@ -147,7 +147,7 @@ function runColdScenario(options: PlatformScenarioOptions): ColdPlatformScenario
   // Tracer construction is scenario setup. `firstLifecycleMs` intentionally measures
   // the first trace invocation itself; module graph initialization is reported separately.
   resetScenarioBufferStats();
-  const tracer = createScenarioTracer(options.createTraceRoot);
+  const tracer = createScenarioTracer(options);
   options.onProgress?.('first-lifecycle-start');
   const lifecycleStartedAt = options.now();
   const firstResult = executeScenario(tracer);
@@ -165,13 +165,14 @@ function runColdScenario(options: PlatformScenarioOptions): ColdPlatformScenario
   if (firstArrowTable.numRows === 0) throw new Error('Cold Arrow conversion produced no observable rows');
   tracer.clear();
 
-  const semanticJson = generateCanonicalSemanticSnapshot(options.createTraceRoot);
+  const semanticJson = generateCanonicalSemanticSnapshot(options);
   return {
     schemaVersion: PLATFORM_RESULT_SCHEMA_VERSION,
     mode: 'cold',
     platform: options.platform,
     engine: options.engine,
     variant: options.variant,
+    backend: options.backend,
     unit: 'ms',
     semanticJson,
     moduleInitializationMs,
@@ -185,10 +186,10 @@ function runSteadyScenario(options: PlatformScenarioOptions): SteadyPlatformScen
     throw new Error('Steady mode must not install the dynamic Function observer');
   }
   options.onProgress?.('semantic-start');
-  const semanticJson = generateCanonicalSemanticSnapshot(options.createTraceRoot);
+  const semanticJson = generateCanonicalSemanticSnapshot(options);
   options.onProgress?.('semantic-end');
-  const lifecycleTracer = createScenarioTracer(options.createTraceRoot);
-  const arrowTracer = createScenarioTracer(options.createTraceRoot);
+  const lifecycleTracer = createScenarioTracer(options);
+  const arrowTracer = createScenarioTracer(options);
   resetScenarioBufferStats();
   options.onProgress?.('warmup-start');
   warmLifecycle(lifecycleTracer);
@@ -206,6 +207,7 @@ function runSteadyScenario(options: PlatformScenarioOptions): SteadyPlatformScen
     platform: options.platform,
     engine: options.engine,
     variant: options.variant,
+    backend: options.backend,
     unit: 'ns/op',
     warmupIterations: PLATFORM_WARMUP_ITERATIONS,
     sampleCount: PLATFORM_SAMPLE_COUNT,
@@ -225,7 +227,7 @@ function runDiagnosticScenario(options: PlatformScenarioOptions): DiagnosticPlat
   options.onProgress?.('semantic-start');
   // This semantic pass exercises tracing and Arrow conversion, forcing every lazy
   // compiler reachable from the scenario before the counter is read.
-  const semanticJson = generateCanonicalSemanticSnapshot(options.createTraceRoot);
+  const semanticJson = generateCanonicalSemanticSnapshot(options);
   options.onProgress?.('semantic-end');
   const dynamicFunctionCalls = readDynamicFunctionCallCount() - dynamicFunctionCallsBefore;
   if (!Number.isSafeInteger(dynamicFunctionCalls) || dynamicFunctionCalls < 0) {
@@ -237,6 +239,7 @@ function runDiagnosticScenario(options: PlatformScenarioOptions): DiagnosticPlat
     platform: options.platform,
     engine: options.engine,
     variant: options.variant,
+    backend: options.backend,
     unit: 'count',
     semanticJson,
     dynamicFunctionCalls,

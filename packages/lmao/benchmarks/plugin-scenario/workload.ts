@@ -2,6 +2,7 @@ import { convertSpanTreeToArrowTable } from '@smoothbricks/lmao';
 import { createTraceRoot } from '@smoothbricks/lmao/node';
 import { bench, do_not_optimize, run } from 'mitata';
 import {
+  createJsScenarioRuntime,
   createScenarioTracer,
   executeScenario,
   generateCanonicalSemanticSnapshot,
@@ -10,9 +11,10 @@ import {
 
 const LIFECYCLE_WARMUP_ITERATIONS = 2_048;
 const ARROW_WARMUP_ITERATIONS = 256;
+const scenarioRuntime = createJsScenarioRuntime(createTraceRoot);
 
 async function semanticPreflight(outputPath?: string): Promise<string> {
-  const canonicalJson = await generateCanonicalSemanticSnapshot(createTraceRoot);
+  const canonicalJson = await generateCanonicalSemanticSnapshot(scenarioRuntime);
   if (outputPath !== undefined) {
     await Bun.write(outputPath, canonicalJson);
   }
@@ -22,8 +24,8 @@ async function semanticPreflight(outputPath?: string): Promise<string> {
 async function benchmarkScenario(): Promise<void> {
   await semanticPreflight();
 
-  const lifecycleTracer = createScenarioTracer(createTraceRoot);
-  const arrowTracer = createScenarioTracer(createTraceRoot);
+  const lifecycleTracer = createScenarioTracer(scenarioRuntime);
+  const arrowTracer = createScenarioTracer(scenarioRuntime);
   resetScenarioBufferStats();
 
   for (let index = 0; index < LIFECYCLE_WARMUP_ITERATIONS; index++) {

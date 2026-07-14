@@ -7,7 +7,8 @@
     "start": "expo start",
     "android": "expo start --android",
     "ios": "expo start --ios",
-    "web": "expo start --web"
+    "web": "bun run prepare:web-wasm && expo start --web",
+    "prepare:web-wasm": "mkdir -p public && cp ../lmao/dist/allocator.wasm public/allocator.wasm"
   },
   "dependencies": {
     "@expo/metro-runtime": "57.0.3",
@@ -78,7 +79,7 @@
           "{projectRoot}/dist/web"
         ],
         "options": {
-          "command": "bun expo export --platform web --output-dir dist/web --clear",
+          "command": "bun run prepare:web-wasm && bun expo export --platform web --output-dir dist/web --clear --max-workers 1",
           "cwd": "{projectRoot}",
           "timeoutMs": 600000,
           "killAfterMs": 10000

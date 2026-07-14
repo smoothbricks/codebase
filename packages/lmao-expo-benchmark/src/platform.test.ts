@@ -6,15 +6,22 @@ import {
   type PlatformScenarioResult,
   runPlatformScenario,
 } from '../../lmao/benchmarks/plugin-scenario/platform.js';
-import type { ScenarioTraceRootFactory } from '../../lmao/benchmarks/plugin-scenario/scenario.js';
+import {
+  createJsScenarioRuntime,
+  type ScenarioTraceRootFactory,
+} from '../../lmao/benchmarks/plugin-scenario/scenario.js';
+
+const TEST_RUNTIME = createJsScenarioRuntime(createTraceRoot);
 
 const COMMON_OPTIONS = {
+  ...TEST_RUNTIME,
   platform: 'test-platform',
   engine: 'test-engine',
   variant: 'test-variant',
 };
 
 const COLD_KEYS = [
+  'backend',
   'engine',
   'firstArrowMs',
   'firstLifecycleMs',
@@ -28,6 +35,7 @@ const COLD_KEYS = [
 ];
 
 const STEADY_KEYS = [
+  'backend',
   'engine',
   'iterationsPerSample',
   'lifecycleArrowNsPerOp',
@@ -43,6 +51,7 @@ const STEADY_KEYS = [
 ];
 
 const DIAGNOSTIC_KEYS = [
+  'backend',
   'dynamicFunctionCalls',
   'engine',
   'mode',
@@ -54,10 +63,11 @@ const DIAGNOSTIC_KEYS = [
 ];
 
 function expectCommonResult(result: PlatformScenarioResult): void {
-  expect(result.schemaVersion).toBe(2);
+  expect(result.schemaVersion).toBe(3);
   expect(result.platform).toBe(COMMON_OPTIONS.platform);
   expect(result.engine).toBe(COMMON_OPTIONS.engine);
   expect(result.variant).toBe(COMMON_OPTIONS.variant);
+  expect(result.backend).toBe(COMMON_OPTIONS.backend);
 
   const semanticResult = JSON.parse(result.semanticJson);
   expect(semanticResult.result).toBe(61);
@@ -70,7 +80,6 @@ function createOptions(
 ): PlatformScenarioOptions {
   return {
     ...COMMON_OPTIONS,
-    createTraceRoot,
     ...options,
   };
 }
