@@ -52,6 +52,34 @@ fn init(prog: &[u8]) -> Vec<u8> {
     state
 }
 
+fn assert_delta_roundtrip(vm: &mut Vm, before: &[u8], after: &[u8], checkpoint: u32) {
+    let end = vm.undo_checkpoint();
+    assert!(
+        end > checkpoint,
+        "mutation must emit paired journal entries"
+    );
+    assert_eq!(vm.delta_export_segment(checkpoint, end), end - checkpoint,);
+    let undo = vm.delta_export_undo_bytes();
+    let redo = vm.delta_export_redo_bytes();
+
+    let mut production = after.to_vec();
+    vm.undo_rollback(&mut production, checkpoint);
+    assert_eq!(production, before);
+
+    let mut replay = Vm::default();
+    let mut rolled_back = after.to_vec();
+    replay.delta_apply_rollback_segment(&mut rolled_back, &undo, Vm::delta_export_entry_size());
+    assert_eq!(rolled_back, before);
+
+    let mut rolled_forward = before.to_vec();
+    replay.delta_apply_rollforward_segment(
+        &mut rolled_forward,
+        &redo,
+        Vm::delta_export_entry_size(),
+    );
+    assert_eq!(rolled_forward, after);
+}
+
 fn meta_u32(state: &[u8], slot: u8, off: u32) -> u32 {
     bytes::read_u32(
         state,
@@ -611,7 +639,8 @@ fn struct_map_array_field_overwrite_last_wins_old_arena_data_abandoned() {
 use columine_types::types::SlotType;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::nested::{
-    get_inner_offset, get_inner_set_size, inner_set_contains, read_nested_prefix,
+    arena_header_offset, get_inner_offset, get_inner_set_size, inner_agg_get_count,
+    inner_agg_get_f64, inner_map_get, inner_set_contains, read_nested_prefix,
 };
 
 /// nested.zig `buildNestedSetE2EProgram`.
@@ -619,6 +648,18 @@ fn build_nested_set_e2e_program(type_id: u32) -> Vec<u8> {
     // SLOT_NESTED: outer HASHSET-keyed table cap 32, inner HASHSET cap 8.
     let init_sec = [0x1Au8, 0, 0x09, 32, 0, 1, 8, 0, 1];
     let body = [0x90u8, 0, 1, 2];
+    program(1, 3, &init_sec, &for_each(type_id, &body))
+}
+
+fn build_nested_map_e2e_program(type_id: u32) -> Vec<u8> {
+    let init_sec = [0x1Au8, 0, 0x09, 8, 0, 0, 4, 0, 1];
+    let body = [0x92u8, 0, 1, 2, 3];
+    program(1, 4, &init_sec, &for_each(type_id, &body))
+}
+
+fn build_nested_aggregate_e2e_program(type_id: u32) -> Vec<u8> {
+    let init_sec = [0x1Au8, 0, 0x09, 8, 0, 2, 1, 0, 1];
+    let body = [0x95u8, 0, 1, 2];
     program(1, 3, &init_sec, &for_each(type_id, &body))
 }
 
@@ -666,6 +707,171 @@ fn e2e_nested_set_insert_through_full_vm_pipeline() {
     assert_ne!(0, inner_20);
     assert_eq!(1, get_inner_set_size(&state, inner_20));
     assert!(inner_set_contains(&state, inner_20, 100));
+}
+
+#[test]
+fn nested_set_delta_restores_outer_inner_arena_and_growth() {
+    let type_id = 1u32;
+    let prog = build_nested_set_e2e_program(type_id);
+    let mut state = init(&prog);
+    let before = state.clone();
+    let meta = SlotMetaView::read(&state, 0);
+    let arena_header = arena_header_offset(meta.offset, meta.capacity);
+    assert_eq!(bytes::read_u32(&state, arena_header + 4), 0);
+
+    let mut vm = Vm::default();
+    vm.undo_enable(&state);
+    let checkpoint = vm.undo_checkpoint();
+    let distinct = 18u32;
+    let types = vec![type_id; distinct as usize];
+    let outer_keys = vec![77u32; distinct as usize];
+    let elems: Vec<u32> = (0..distinct).collect();
+    let cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&outer_keys),
+        u32s_as_bytes(&elems),
+    ];
+    assert_eq!(
+        OK,
+        vm.execute_batch_delta(&mut state, &prog, &cols, distinct),
+    );
+
+    let meta = SlotMetaView::read(&state, 0);
+    let inner = get_inner_offset(&state, &meta, 77);
+    assert_ne!(inner, 0);
+    assert_eq!(bytes::read_u32(&state, inner), 32);
+    assert_eq!(get_inner_set_size(&state, inner), distinct);
+    assert!(bytes::read_u32(&state, arena_header + 4) > 0);
+
+    let checkpoint_before_duplicate = vm.undo_checkpoint();
+    let duplicate_types = [type_id];
+    let duplicate_outer = [77u32];
+    let duplicate_elems = [distinct - 1];
+    let duplicate_cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&duplicate_types),
+        u32s_as_bytes(&duplicate_outer),
+        u32s_as_bytes(&duplicate_elems),
+    ];
+    let before_duplicate = state.clone();
+    assert_eq!(
+        OK,
+        vm.execute_batch_delta(&mut state, &prog, &duplicate_cols, 1),
+    );
+    assert_eq!(state, before_duplicate);
+    assert_eq!(vm.undo_checkpoint(), checkpoint_before_duplicate);
+
+    let after = state.clone();
+    assert_delta_roundtrip(&mut vm, &before, &after, checkpoint);
+}
+
+#[test]
+fn nested_map_update_delta_restores_prior_value_and_container_state() {
+    let type_id = 2u32;
+    let prog = build_nested_map_e2e_program(type_id);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let types = [type_id];
+    let outer = [9u32];
+    let inner_keys = [41u32];
+    let first_values = [0x1122_3344u32];
+    let first_cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&outer),
+        u32s_as_bytes(&inner_keys),
+        u32s_as_bytes(&first_values),
+    ];
+    assert_eq!(OK, vm.execute_batch(&mut state, &prog, &first_cols, 1));
+
+    let before = state.clone();
+    let before_meta = SlotMetaView::read(&before, 0);
+    let before_inner = get_inner_offset(&before, &before_meta, 9);
+    let before_arena_used = bytes::read_u32(
+        &before,
+        arena_header_offset(before_meta.offset, before_meta.capacity) + 4,
+    );
+    vm.undo_enable(&state);
+    let checkpoint = vm.undo_checkpoint();
+    let second_values = [0xaabb_ccddu32];
+    let second_cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&outer),
+        u32s_as_bytes(&inner_keys),
+        u32s_as_bytes(&second_values),
+    ];
+    assert_eq!(
+        OK,
+        vm.execute_batch_delta(&mut state, &prog, &second_cols, 1),
+    );
+
+    let after_meta = SlotMetaView::read(&state, 0);
+    let after_inner = get_inner_offset(&state, &after_meta, 9);
+    assert_eq!(after_inner, before_inner);
+    assert_eq!(inner_map_get(&state, after_inner, 41), 0xaabb_ccdd);
+    assert_eq!(
+        bytes::read_u32(
+            &state,
+            arena_header_offset(after_meta.offset, after_meta.capacity) + 4,
+        ),
+        before_arena_used,
+    );
+    let after = state.clone();
+    assert_delta_roundtrip(&mut vm, &before, &after, checkpoint);
+}
+
+#[test]
+fn nested_aggregate_delta_restores_prior_value_count_and_arena_pointer() {
+    let type_id = 3u32;
+    let prog = build_nested_aggregate_e2e_program(type_id);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+    let types = [type_id];
+    let outer = [5u32];
+
+    for value in [4.5f64, 7.25] {
+        let values = [value];
+        let cols: Vec<&[u8]> = vec![
+            u32s_as_bytes(&types),
+            u32s_as_bytes(&outer),
+            f64s_as_bytes(&values),
+        ];
+        assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 1));
+    }
+
+    let before = state.clone();
+    let before_meta = SlotMetaView::read(&before, 0);
+    let before_inner = get_inner_offset(&before, &before_meta, 5);
+    let before_used = bytes::read_u32(
+        &before,
+        arena_header_offset(before_meta.offset, before_meta.capacity) + 4,
+    );
+    assert_eq!(inner_agg_get_f64(&before, before_inner), 11.75);
+    assert_eq!(inner_agg_get_count(&before, before_inner, 1), 2);
+
+    vm.undo_enable(&state);
+    let checkpoint = vm.undo_checkpoint();
+    let values = [3.0f64];
+    let cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&outer),
+        f64s_as_bytes(&values),
+    ];
+    assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &cols, 1),);
+
+    let after_meta = SlotMetaView::read(&state, 0);
+    let after_inner = get_inner_offset(&state, &after_meta, 5);
+    assert_eq!(after_inner, before_inner);
+    assert_eq!(inner_agg_get_f64(&state, after_inner), 14.75);
+    assert_eq!(inner_agg_get_count(&state, after_inner, 1), 3);
+    assert_eq!(
+        bytes::read_u32(
+            &state,
+            arena_header_offset(after_meta.offset, after_meta.capacity) + 4,
+        ),
+        before_used,
+    );
+    let after = state.clone();
+    assert_delta_roundtrip(&mut vm, &before, &after, checkpoint);
 }
 
 // =============================================================================
