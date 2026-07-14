@@ -81,7 +81,7 @@ pub fn read_cmp_value(cmp_col: &[u8], i: u32, cmp_type: CmpType) -> u64 {
 }
 
 /// hashmap_ops.zig:93 `cmpGt` — `a > b` under the cmp_type's semantics.
-fn cmp_gt(a: u64, b: u64, cmp_type: CmpType) -> bool {
+pub(crate) fn cmp_gt(a: u64, b: u64, cmp_type: CmpType) -> bool {
     match cmp_type {
         CmpType::U32 => (a as u32) > (b as u32),
         CmpType::F64 => f64::from_bits(a) > f64::from_bits(b),

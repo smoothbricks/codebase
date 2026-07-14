@@ -276,6 +276,7 @@ export enum Opcode {
   SLOT_STRUCT_MAP = 0x18, // slot, type_flags, cap_lo, cap_hi, num_fields, [field_type × num_fields]
   BATCH_STRUCT_MAP_UPSERT_LAST = 0x80, // slot, key_col, num_vals, [val_col, field_idx] × num_vals, num_array_vals, [(offsets_col, values_col, field_idx) × num_array_vals]
   BATCH_STRUCT_MAP_UPSERT_FIRST = 0x81, // same operands; existing persisted keys are left untouched
+  BATCH_STRUCT_MAP_UPSERT_MAX = 0x82, // same row operands followed by comparison field_idx; replaces only when incoming comparison is strictly greater
 
   // Ordered list ops
   SLOT_ORDERED_LIST = 0x19, // slot, type_flags, cap_lo, cap_hi [, num_fields, field_type × num_fields]

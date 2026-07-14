@@ -103,6 +103,9 @@ pub enum Opcode {
     /// Insert into struct map only when the key is absent from persisted/current
     /// state. Encoding is identical to BATCH_STRUCT_MAP_UPSERT_LAST (opcodes.zig:236).
     BatchStructMapUpsertFirst = 0x81,
+    /// Upsert the whole row only when its mapped scalar comparison field is
+    /// strictly greater. Encoding is 0x80 plus comparison_field_idx:u8.
+    BatchStructMapUpsertMax = 0x82,
     /// Append scalar value to ordered list.
     ListAppend = 0x84,
     /// Append struct row to ordered list.
