@@ -327,7 +327,7 @@ fn ordered_list_struct_append() {
 }
 
 #[test]
-fn ordered_list_undo_restores_count() {
+fn ordered_list_scalar_payload_delta_roundtrip() {
     let prog = build_scalar_list_program(TYPE_A);
     let mut state = init(&prog);
     let mut vm = Vm::default();
@@ -336,18 +336,71 @@ fn ordered_list_undo_restores_count() {
     let vals = [100u32, 200];
     let cols: Vec<&[u8]> = vec![u32s_as_bytes(&types), u32s_as_bytes(&vals)];
     assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 2));
-    assert_eq!(2, slot_size(&state, 0));
+    let before = state.clone();
 
     vm.undo_enable(&state);
-    let cp = vm.undo_checkpoint();
-    let t2 = [TYPE_A];
-    let v2 = [300u32];
-    let cols2: Vec<&[u8]> = vec![u32s_as_bytes(&t2), u32s_as_bytes(&v2)];
-    assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols2, 1));
+    let checkpoint = vm.undo_checkpoint();
+    let next_types = [TYPE_A];
+    let next_values = [0xaabb_ccddu32];
+    let next_cols: Vec<&[u8]> = vec![u32s_as_bytes(&next_types), u32s_as_bytes(&next_values)];
+    assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &next_cols, 1),);
     assert_eq!(3, slot_size(&state, 0));
+    assert_eq!(
+        0xaabb_ccdd,
+        bytes::read_u32(&state, slot_offset(&state, 0) + 8),
+    );
 
-    vm.undo_rollback(&mut state, cp);
-    assert_eq!(2, slot_size(&state, 0));
+    let after = state.clone();
+    assert_delta_roundtrip(&mut vm, &before, &after, checkpoint);
+}
+
+#[test]
+fn ordered_list_struct_payload_delta_roundtrip() {
+    let init_sec = [0x19u8, 0, 7, 8, 0, 0xFF, 2, 0, 4];
+    let body = [0x85u8, 0, 2, 1, 0, 2, 1];
+    let prog = program(1, 3, &init_sec, &for_each(TYPE_A, &body));
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let first_types = [TYPE_A];
+    let first_a = [0x1122_3344u32];
+    let first_b = [0x5566_7788u32];
+    let first_cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&first_types),
+        u32s_as_bytes(&first_a),
+        u32s_as_bytes(&first_b),
+    ];
+    assert_eq!(OK, vm.execute_batch(&mut state, &prog, &first_cols, 1));
+    let before = state.clone();
+
+    vm.undo_enable(&state);
+    let checkpoint = vm.undo_checkpoint();
+    let second_types = [TYPE_A];
+    let second_a = [0x99aa_bbccu32];
+    let second_b = [0xddee_ff00u32];
+    let second_cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&second_types),
+        u32s_as_bytes(&second_a),
+        u32s_as_bytes(&second_b),
+    ];
+    assert_eq!(
+        OK,
+        vm.execute_batch_delta(&mut state, &prog, &second_cols, 1),
+    );
+
+    let meta_base = STATE_HEADER_SIZE;
+    let num_fields = u32::from(state[(meta_base + SlotMetaOffset::AGG_TYPE) as usize]);
+    let row_size = u32::from(bytes::read_u16(
+        &state,
+        meta_base + SlotMetaOffset::TTL_SECONDS,
+    ));
+    let second_row = slot_offset(&state, 0) + align8(num_fields) + row_size;
+    assert_eq!(0x03, state[second_row as usize]);
+    assert_eq!(0x99aa_bbcc, bytes::read_u32(&state, second_row + 1));
+    assert_eq!(0xddee_ff00, bytes::read_u32(&state, second_row + 5));
+
+    let after = state.clone();
+    assert_delta_roundtrip(&mut vm, &before, &after, checkpoint);
 }
 
 #[test]
@@ -598,6 +651,9 @@ fn struct_map_array_field_overwrite_last_wins_old_arena_data_abandoned() {
         ];
         assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 1));
     }
+    let before = state.clone();
+    vm.undo_enable(&state);
+    let checkpoint = vm.undo_checkpoint();
     {
         let types = [TYPE_A];
         let keys = [100u32];
@@ -611,7 +667,7 @@ fn struct_map_array_field_overwrite_last_wins_old_arena_data_abandoned() {
             u32s_as_bytes(&offsets),
             u32s_as_bytes(&values),
         ];
-        assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 1));
+        assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &cols, 1),);
     }
 
     assert_eq!(1, slot_size(&state, 0));
@@ -629,6 +685,8 @@ fn struct_map_array_field_overwrite_last_wins_old_arena_data_abandoned() {
         50,
         bytes::read_u32(&state, arena_data + row.arena_offset + 4)
     );
+    let after = state.clone();
+    assert_delta_roundtrip(&mut vm, &before, &after, checkpoint);
 }
 
 // =============================================================================

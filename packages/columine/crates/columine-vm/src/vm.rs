@@ -682,11 +682,20 @@ impl UndoState {
     /// Capture discontiguous state regions before a mutation whose exact byte
     /// changes are only known afterward. Capacity is reserved up front so a
     /// first overflow snapshots the true pre-mutation state, never post-state.
-    fn begin_state_capture(&mut self, state: &[u8], ranges: &[(u32, u32)]) -> bool {
+    fn begin_state_capture(
+        &mut self,
+        state: &[u8],
+        ranges: &[(u32, u32)],
+        additional_entries: u32,
+    ) -> bool {
         if !self.enabled || self.overflow {
             return false;
         }
-        let max_entries = ranges.iter().map(|(_, len)| len.div_ceil(8)).sum::<u32>();
+        let max_entries = ranges
+            .iter()
+            .map(|(_, len)| len.div_ceil(8))
+            .sum::<u32>()
+            .saturating_add(additional_entries);
         if self.count().saturating_add(max_entries) > UNDO_CAPACITY {
             self.snapshot(state);
             self.overflow_entry = None;
@@ -3270,6 +3279,30 @@ impl Vm {
                         _ => true,
                     };
                     if should_write {
+                        let (array_journal_ranges, array_captured) = if operands.num_array_vals > 0
+                        {
+                            let meta_base = slot_meta_base(operands.slot);
+                            let arena_header =
+                                bytes::read_u32(state, meta_base + SlotMetaOffset::GRACE_SECONDS);
+                            let arena_capacity = bytes::read_u32(state, arena_header);
+                            let ranges = [
+                                (meta_base, SLOT_META_SIZE),
+                                (
+                                    smap.slot_offset,
+                                    arena_header + ARENA_HEADER_SIZE + arena_capacity
+                                        - smap.slot_offset,
+                                ),
+                            ];
+                            let captured = self.undo.begin_state_capture(
+                                state,
+                                &ranges,
+                                u32::from(smap.num_fields) + 1,
+                            );
+                            (ranges, captured)
+                        } else {
+                            ([(0, 0); 2], false)
+                        };
+
                         let result = single_struct_map_upsert_last(
                             &mut self.undo,
                             delta_mode,
@@ -3282,6 +3315,13 @@ impl Vm {
                             child_idx,
                         );
                         if result.err == ErrorCode::CapacityExceeded {
+                            if array_captured {
+                                self.undo.finish_state_capture(
+                                    delta_mode,
+                                    state,
+                                    &array_journal_ranges,
+                                );
+                            }
                             NEEDS_GROWTH_SLOT.store(operands.slot, Ordering::Relaxed);
                             return NEEDS_GROWTH;
                         }
@@ -3297,6 +3337,13 @@ impl Vm {
                                 cols,
                                 child_idx,
                             );
+                            if array_captured {
+                                self.undo.finish_state_capture(
+                                    delta_mode,
+                                    state,
+                                    &array_journal_ranges,
+                                );
+                            }
                             if arr_result == ErrorCode::ArenaOverflow {
                                 NEEDS_GROWTH_SLOT.store(operands.slot, Ordering::Relaxed);
                                 return NEEDS_GROWTH;
@@ -3574,6 +3621,9 @@ impl Vm {
                         return NEEDS_GROWTH;
                     }
 
+                    let write_off = slot_offset + count * elem_size;
+                    let payload_range = [(write_off, elem_size)];
+                    let captured = self.undo.begin_state_capture(state, &payload_range, 1);
                     if self.undo.enabled {
                         let lau = |prev: u32| FlatUndoEntry {
                             op: FlatUndoOp::ListAppendUndo,
@@ -3592,8 +3642,6 @@ impl Vm {
                             lau(count + 1),
                         );
                     }
-
-                    let write_off = slot_offset + count * elem_size;
                     if elem_size == 4 {
                         bytes::write_u32(state, write_off, cell_u32(cols, val_col, child_idx));
                     } else if elem_size == 8 {
@@ -3609,6 +3657,10 @@ impl Vm {
                     bytes::write_u32(state, meta_base + SlotMetaOffset::SIZE, count);
                     state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
                         ChangeFlag::INSERTED;
+                    if captured {
+                        self.undo
+                            .finish_state_capture(delta_mode, state, &payload_range);
+                    }
                 }
 
                 // LIST_APPEND_STRUCT (0x85)
@@ -3642,6 +3694,11 @@ impl Vm {
                         return NEEDS_GROWTH;
                     }
 
+                    let descriptor_size = align8(u32::from(num_fields));
+                    let rows_base = slot_offset + descriptor_size;
+                    let row_off = rows_base + count * row_size;
+                    let payload_range = [(row_off, row_size)];
+                    let captured = self.undo.begin_state_capture(state, &payload_range, 1);
                     if self.undo.enabled {
                         let lau = |prev: u32| FlatUndoEntry {
                             op: FlatUndoOp::ListAppendUndo,
@@ -3660,10 +3717,6 @@ impl Vm {
                             lau(count + 1),
                         );
                     }
-
-                    let descriptor_size = align8(u32::from(num_fields));
-                    let rows_base = slot_offset + descriptor_size;
-                    let row_off = rows_base + count * row_size;
 
                     bytes::zero(state, row_off, bitset_bytes);
 
@@ -3717,6 +3770,10 @@ impl Vm {
                     bytes::write_u32(state, meta_base + SlotMetaOffset::SIZE, count);
                     state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
                         ChangeFlag::INSERTED;
+                    if captured {
+                        self.undo
+                            .finish_state_capture(delta_mode, state, &payload_range);
+                    }
                 }
 
                 // FLAT_MAP (0xE1)
@@ -3756,7 +3813,7 @@ impl Vm {
                     bpc += 4;
                     let meta = SlotMetaView::read(state, slot);
                     let journal_ranges = nested_journal_ranges(state, &meta);
-                    let captured = self.undo.begin_state_capture(state, &journal_ranges);
+                    let captured = self.undo.begin_state_capture(state, &journal_ranges, 0);
                     let result = nested::nested_set_insert(
                         state,
                         &meta,
@@ -3780,7 +3837,7 @@ impl Vm {
                     bpc += 5;
                     let meta = SlotMetaView::read(state, slot);
                     let journal_ranges = nested_journal_ranges(state, &meta);
-                    let captured = self.undo.begin_state_capture(state, &journal_ranges);
+                    let captured = self.undo.begin_state_capture(state, &journal_ranges, 0);
                     let result = nested::nested_map_upsert_last(
                         state,
                         &meta,
@@ -3805,7 +3862,7 @@ impl Vm {
                     bpc += 4;
                     let meta = SlotMetaView::read(state, slot);
                     let journal_ranges = nested_journal_ranges(state, &meta);
-                    let captured = self.undo.begin_state_capture(state, &journal_ranges);
+                    let captured = self.undo.begin_state_capture(state, &journal_ranges, 0);
                     let result = nested::nested_agg_update(
                         state,
                         &meta,
