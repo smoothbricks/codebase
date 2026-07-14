@@ -1,8 +1,9 @@
 use std::ffi::{OsStr, OsString};
 use std::io;
 
-use cowshed_cli::{args, output, runtime};
+use cowshed_cli::{args, gateway_service, output, runtime};
 use cowshed_core::CowshedError;
+use cowshed_gateway::{GATEWAY_GIT_FETCH_HELPER_ARG, run_gateway_git_fetch_helper};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -11,6 +12,22 @@ async fn main() {
 
 async fn run() -> i32 {
     let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == OsStr::new(GATEWAY_GIT_FETCH_HELPER_ARG))
+    {
+        if arguments.len() != 1 {
+            eprintln!("cowshed: the internal gateway git helper accepts no arguments");
+            return 2;
+        }
+        return match run_gateway_git_fetch_helper() {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("cowshed: gateway git helper failed: {error}");
+                1
+            }
+        };
+    }
     let json = option_before_child_argv(&arguments, "--json");
     let quiet = option_before_child_argv(&arguments, "--quiet")
         || option_before_child_argv(&arguments, "-q");
@@ -40,6 +57,20 @@ async fn run_parsed(parsed: args::Cli, json: bool) -> i32 {
     let stdout = io::stdout();
     let stderr = io::stderr();
     let mut output = output::Output::new(stdout, stderr, parsed.global.quiet);
+    if let args::Command::Gateway(action) = &parsed.command {
+        return match gateway_service::dispatch(*action, parsed.global.json, &mut output).await {
+            Ok(exit_code) => exit_code,
+            Err(error) => {
+                let exit_code = i32::from(error.exit_code());
+                if let Err(write_error) = write_error(&mut output, error, json, None) {
+                    eprintln!("cowshed: failed to write command result: {write_error}");
+                    1
+                } else {
+                    exit_code
+                }
+            }
+        };
+    }
     match runtime::run_bridge_command(parsed, tokio::io::stdin(), &mut output).await {
         Ok(exit) => exit.code,
         Err(error) => {

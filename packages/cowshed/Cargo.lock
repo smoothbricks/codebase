@@ -300,8 +300,11 @@ dependencies = [
  "base64",
  "bytes",
  "cowshed-core",
+ "cowshed-gateway",
+ "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 
