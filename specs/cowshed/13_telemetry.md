@@ -198,7 +198,7 @@ non-empty first argument, NUL exclusion, the 128 KiB element limit, and the 1 Mi
 
 ## Controller commitment schema
 
-Controller continuity is the exact tagged/versioned union:
+Controller continuity version 2 is the exact tagged/versioned union:
 
 ```rust
 enum ControllerCommitment {
@@ -238,24 +238,32 @@ struct ForkCommitment {
 }
 struct RestoreCommitment {
     version: u16, order: u64, repo_id: RepoId, source_checkpoint: String,
-    source_incarnation: WorkspaceIncarnation, destination_incarnation: WorkspaceIncarnation,
+    source_incarnation: WorkspaceIncarnation, replaced_incarnation: WorkspaceIncarnation,
+    destination_incarnation: WorkspaceIncarnation,
 }
 ```
 
 The flat controller Arrow columns are exactly `commitment_kind, commitment_version, commitment_order, repo_id` plus
 variant-selected
-`workspace_incarnation, job_id, grant_revision, state, stdout_bytes, stdout_sha256, stderr_bytes, stderr_sha256, batch_sha256, origin_incarnation, checkpoint_id, barrier_id, manifest_batch_sha256, source_incarnation, destination_incarnation, source_checkpoint`.
-Non-selected fields are null and the tag controls required fields.
+`workspace_incarnation, job_id, grant_revision, state, stdout_bytes, stdout_sha256, stderr_bytes, stderr_sha256, batch_sha256, origin_incarnation, checkpoint_id, barrier_id, manifest_batch_sha256, source_incarnation, destination_incarnation, source_checkpoint, output_limit_bytes, output_crossing_bytes, replaced_incarnation`.
+Non-selected fields are null and the tag controls required fields. Version 1 segments are intentionally incompatible
+with this clean schema cutover; no optional-field or legacy parser path exists.
 
 `order` is positive and belongs to one host-global, strictly increasing, gap-free sequence across all repositories.
 `CommitmentPriorContext` therefore splits into a global `last_order` and a component-safe map from `RepoId` to that
-repository's admissions, terminals, checkpoints, and incarnation lineage. Opening a project merges its verified active
-and retired storage baseline only into that project's component. A foreign repository receives no authority from the
-opening project's baseline: its history must first establish each incarnation through `WorkspaceIntroduced`, `Fork`, or
-`Restore`, and `WorkspaceRetired` removes that authority. Identical incarnation bytes in different repositories remain
-independent because every lookup is repository-scoped. Admission, terminal, checkpoint, fork source, and restore source
-all reject an unknown or retired incarnation in their own repository. Constructors and Arrow/JSON encode/decode invoke
-the same row and collection validator; no derive-only path bypasses it.
+repository's admissions, terminals, checkpoints, and incarnation lineage. Recovery first validates every global segment
+chronologically from an empty per-repository active history. Only after replay succeeds does it merge the opening
+repository's verified current storage incarnations into that repository's active set. A current storage incarnation
+absent from commitment history is active-but-not-introduced, so `ensure_workspace_introduced` persists exactly one
+`WorkspaceIntroduced`; an opening baseline can neither authorize foreign history nor make a chronological destination
+look duplicated. A foreign repository must establish each incarnation through `WorkspaceIntroduced`, `Fork`, or
+`Restore`. Identical incarnation bytes in different repositories remain independent because every lookup is
+repository-scoped. Admission, terminal, checkpoint, and fork sources reject unknown or retired incarnations. A restore
+instead requires an existing retained checkpoint whose immutable recorded origin equals `source_incarnation`, an
+independently specified `replaced_incarnation` that is currently active, and a fresh destination. It retires the
+replaced generation, not the checkpoint origin; therefore the same retained checkpoint can restore successive active
+generations without resurrecting or repeatedly retiring its origin. Constructors and Arrow/JSON encode/decode invoke the
+same row and collection validator; no derive-only path bypasses it.
 
 Immutable publication uses the filesystem lock only to recover the complete segment set and append one create-new
 segment. A publisher refreshes under that lock before assigning an order to a draft. If another valid writer advances

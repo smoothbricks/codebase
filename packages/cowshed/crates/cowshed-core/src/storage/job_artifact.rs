@@ -3173,6 +3173,7 @@ pub fn controller_commitment_schema() -> Arc<Schema> {
         field("source_checkpoint", DataType::Utf8, true),
         field("output_limit_bytes", DataType::UInt64, true),
         field("output_crossing_bytes", DataType::UInt64, true),
+        field("replaced_incarnation", DataType::Utf8, true),
     ]))
 }
 
@@ -3199,6 +3200,7 @@ struct ControllerFlatRow<'a> {
     source_incarnation: Option<&'a str>,
     destination_incarnation: Option<&'a str>,
     source_checkpoint: Option<&'a str>,
+    replaced_incarnation: Option<&'a str>,
 }
 
 fn flatten_controller(value: &ControllerCommitment) -> ControllerFlatRow<'_> {
@@ -3225,6 +3227,7 @@ fn flatten_controller(value: &ControllerCommitment) -> ControllerFlatRow<'_> {
         source_incarnation: None,
         destination_incarnation: None,
         source_checkpoint: None,
+        replaced_incarnation: None,
     };
     match value {
         ControllerCommitment::WorkspaceIntroduced(value) => {
@@ -3273,6 +3276,7 @@ fn flatten_controller(value: &ControllerCommitment) -> ControllerFlatRow<'_> {
         ControllerCommitment::Restore(value) => {
             row.kind = "restore";
             row.source_incarnation = Some(value.source_incarnation.as_str());
+            row.replaced_incarnation = Some(value.replaced_incarnation.as_str());
             row.destination_incarnation = Some(value.destination_incarnation.as_str());
             row.source_checkpoint = Some(&value.source_checkpoint);
         }
@@ -3370,6 +3374,11 @@ pub fn controller_commitments_to_batch(
         Arc::new(UInt64Array::from(
             rows.iter()
                 .map(|row| row.output_crossing_bytes)
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.replaced_incarnation)
                 .collect::<Vec<_>>(),
         )),
     ];
@@ -3482,13 +3491,14 @@ pub fn controller_commitments_from_batch(
                 })
             }
             "restore" => {
-                require_variant_columns(batch, row, &[17, 18, 19])?;
+                require_variant_columns(batch, row, &[17, 18, 19, 22])?;
                 ControllerCommitment::Restore(RestoreCommitment {
                     version,
                     order,
                     repo_id,
                     source_checkpoint: required_string(batch, 19, row)?.to_owned(),
                     source_incarnation: required_incarnation(batch, 17, row)?,
+                    replaced_incarnation: required_incarnation(batch, 22, row)?,
                     destination_incarnation: required_incarnation(batch, 18, row)?,
                 })
             }
@@ -3607,6 +3617,23 @@ impl CommitmentPriorContext {
         Self {
             last_order: 0,
             repositories: BTreeMap::from([(repo_id, repository)]),
+        }
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            last_order: 0,
+            repositories: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn merge_verified_active(&mut self, baseline: &Self) {
+        for (repo_id, baseline_repository) in &baseline.repositories {
+            self.repositories
+                .entry(repo_id.clone())
+                .or_default()
+                .active_incarnations
+                .extend(baseline_repository.active_incarnations.iter().cloned());
         }
     }
 
@@ -3829,6 +3856,9 @@ pub fn validate_commitments(
             ControllerCommitment::Restore(value) => {
                 if repository.checkpoints.get(&value.source_checkpoint)
                     != Some(&value.source_incarnation)
+                    || !repository
+                        .active_incarnations
+                        .contains(&value.replaced_incarnation)
                     || repository
                         .active_incarnations
                         .contains(&value.destination_incarnation)
@@ -3842,16 +3872,16 @@ pub fn validate_commitments(
                     return Err(ArtifactError::Integrity {
                         offset: 0,
                         message:
-                            "restore lineage checkpoint is absent or destination already exists"
+                            "restore lineage checkpoint is absent, replaced incarnation is not active, or destination already exists"
                                 .into(),
                     });
                 }
                 repository
                     .active_incarnations
-                    .remove(&value.source_incarnation);
+                    .remove(&value.replaced_incarnation);
                 repository
                     .retired_incarnations
-                    .insert(value.source_incarnation.clone());
+                    .insert(value.replaced_incarnation.clone());
                 repository
                     .introduced_incarnations
                     .insert(value.destination_incarnation.clone());
@@ -4845,6 +4875,7 @@ mod tests {
             repo_id: repo(),
             source_checkpoint: "absent".into(),
             source_incarnation: incarnation(),
+            replaced_incarnation: incarnation(),
             destination_incarnation: destination,
         });
         assert!(matches!(

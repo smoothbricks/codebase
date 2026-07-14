@@ -1396,6 +1396,7 @@ impl NativeProjectRuntimeHost {
                     repo_id: repo_id.clone(),
                     source_checkpoint: publication.source_checkpoint.clone(),
                     source_incarnation: publication.source_incarnation.clone(),
+                    replaced_incarnation: publication.replaced_incarnation.clone(),
                     destination_incarnation: publication.destination_incarnation.clone(),
                 })
                 .await?;
@@ -2309,6 +2310,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                             repo_id: fence.pending.workspace.repo().clone(),
                             source_checkpoint: fence.pending.source_checkpoint,
                             source_incarnation: fence.pending.source_incarnation,
+                            replaced_incarnation: fence.pending.replaced_incarnation,
                             destination_incarnation: fence.pending.workspace.incarnation().clone(),
                         })
                         .await
@@ -4178,6 +4180,7 @@ mod binding_tests {
                 repo_id: repo.clone(),
                 source_checkpoint: pending.source_checkpoint.clone(),
                 source_incarnation: pending.source_incarnation.clone(),
+                replaced_incarnation: pending.replaced_incarnation.clone(),
                 destination_incarnation: pending.destination_incarnation.clone(),
             })
             .await
@@ -4195,6 +4198,7 @@ mod binding_tests {
                     repo_id: repo,
                     source_checkpoint: "unknown".to_owned(),
                     source_incarnation: source,
+                    replaced_incarnation: destination,
                     destination_incarnation: WorkspaceIncarnation::new(
                         "2198f2c0b7e34dc795f17b238b331c80"
                     )

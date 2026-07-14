@@ -342,7 +342,7 @@ fn recover_context(
         }
     }
 
-    let mut context = baseline.clone();
+    let mut context = CommitmentPriorContext::empty();
     let mut expected_order = 1_u64;
     for (order, (segment, _name)) in segments {
         if order != expected_order {
@@ -375,6 +375,7 @@ fn recover_context(
             .checked_add(1)
             .ok_or_else(|| integrity("controller commitment order overflow"))?;
     }
+    context.merge_verified_active(baseline);
     Ok(context)
 }
 

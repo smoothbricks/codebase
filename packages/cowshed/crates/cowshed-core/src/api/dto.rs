@@ -1129,7 +1129,7 @@ pub struct OutputLimitInfo {
     pub limit_bytes: u64,
     pub crossing_bytes: u64,
 }
-pub const CONTROLLER_COMMITMENT_VERSION: u16 = 1;
+pub const CONTROLLER_COMMITMENT_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1209,6 +1209,7 @@ pub struct RestoreCommitment {
     pub repo_id: RepoId,
     pub source_checkpoint: String,
     pub source_incarnation: WorkspaceIncarnation,
+    pub replaced_incarnation: WorkspaceIncarnation,
     pub destination_incarnation: WorkspaceIncarnation,
 }
 
@@ -1316,6 +1317,11 @@ impl ControllerCommitment {
             Self::Restore(value) if value.source_incarnation == value.destination_incarnation => {
                 Err(DtoError::InvalidJobProjection(
                     "restore source and destination incarnations must differ",
+                ))
+            }
+            Self::Restore(value) if value.replaced_incarnation == value.destination_incarnation => {
+                Err(DtoError::InvalidJobProjection(
+                    "restore replaced and destination incarnations must differ",
                 ))
             }
             _ => Ok(()),

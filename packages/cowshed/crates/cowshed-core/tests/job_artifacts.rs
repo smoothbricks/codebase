@@ -847,7 +847,7 @@ fn workspace_lifecycle_replay_preserves_retired_jobs_and_rejects_stale_order() {
         serde_json::to_value(&history[0]).unwrap(),
         serde_json::json!({
             "kind": "workspaceIntroduced",
-            "version": 1,
+            "version": 2,
             "order": 1,
             "repoId": "acme/widget",
             "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80"
@@ -857,7 +857,7 @@ fn workspace_lifecycle_replay_preserves_retired_jobs_and_rejects_stale_order() {
         serde_json::to_value(&history[3]).unwrap(),
         serde_json::json!({
             "kind": "workspaceRetired",
-            "version": 1,
+            "version": 2,
             "order": 4,
             "repoId": "acme/widget",
             "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80"
@@ -952,6 +952,7 @@ fn retained_checkpoint_can_restore_repeatedly_only_to_fresh_destinations() {
             repo_id: repo.clone(),
             source_checkpoint: "checkpoint-1".into(),
             source_incarnation: source.clone(),
+            replaced_incarnation: source.clone(),
             destination_incarnation: first_restore.clone(),
         }),
         ControllerCommitment::Restore(RestoreCommitment {
@@ -960,18 +961,77 @@ fn retained_checkpoint_can_restore_repeatedly_only_to_fresh_destinations() {
             repo_id: repo.clone(),
             source_checkpoint: "checkpoint-1".into(),
             source_incarnation: source.clone(),
+            replaced_incarnation: first_restore.clone(),
             destination_incarnation: second_restore.clone(),
         }),
         ControllerCommitment::Admission(AdmissionCommitment {
             version: CONTROLLER_COMMITMENT_VERSION,
             order: 6,
             repo_id: repo.clone(),
-            workspace_incarnation: second_restore,
+            workspace_incarnation: second_restore.clone(),
             job_id: JobId::new(1).unwrap(),
             grant_revision: 1,
         }),
     ];
     validate_commitments(&baseline, &history).unwrap();
+    let batch = controller_commitments_to_batch(&history).unwrap();
+    assert_eq!(
+        controller_commitments_from_batch(&batch, &baseline).unwrap(),
+        history
+    );
+    for row in [3, 4] {
+        for column in 4..batch.num_columns() {
+            assert_eq!(
+                batch.column(column).is_null(row),
+                ![17, 18, 19, 22].contains(&column),
+                "restore nullability mismatch for {}",
+                batch.schema().field(column).name()
+            );
+        }
+    }
+    assert_eq!(
+        serde_json::to_value(&history[4]).unwrap(),
+        serde_json::json!({
+            "kind": "restore",
+            "version": 2,
+            "order": 5,
+            "repoId": "acme/widget",
+            "sourceCheckpoint": "checkpoint-1",
+            "sourceIncarnation": source.as_str(),
+            "replacedIncarnation": first_restore.as_str(),
+            "destinationIncarnation": second_restore.as_str()
+        })
+    );
+
+    let first_restore_prefix = &history[..4];
+    assert!(
+        validate_commitments(
+            &validate_commitments(&baseline, first_restore_prefix).unwrap(),
+            &[ControllerCommitment::Admission(AdmissionCommitment {
+                version: CONTROLLER_COMMITMENT_VERSION,
+                order: 5,
+                repo_id: repo.clone(),
+                workspace_incarnation: first_restore.clone(),
+                job_id: JobId::new(2).unwrap(),
+                grant_revision: 1,
+            })],
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        validate_commitments(
+            &validate_commitments(&baseline, first_restore_prefix).unwrap(),
+            &[ControllerCommitment::Admission(AdmissionCommitment {
+                version: CONTROLLER_COMMITMENT_VERSION,
+                order: 5,
+                repo_id: repo.clone(),
+                workspace_incarnation: source.clone(),
+                job_id: JobId::new(2).unwrap(),
+                grant_revision: 1,
+            })],
+        ),
+        Err(ArtifactError::Integrity { .. })
+    ));
 
     let mut reused_destination = history.clone();
     reused_destination.push(ControllerCommitment::Restore(RestoreCommitment {
@@ -980,7 +1040,8 @@ fn retained_checkpoint_can_restore_repeatedly_only_to_fresh_destinations() {
         repo_id: repo.clone(),
         source_checkpoint: "checkpoint-1".into(),
         source_incarnation: source.clone(),
-        destination_incarnation: first_restore,
+        replaced_incarnation: second_restore.clone(),
+        destination_incarnation: first_restore.clone(),
     }));
     assert!(matches!(
         validate_commitments(&baseline, &reused_destination),
@@ -994,6 +1055,7 @@ fn retained_checkpoint_can_restore_repeatedly_only_to_fresh_destinations() {
         repo_id: repo.clone(),
         source_checkpoint: "unknown".into(),
         source_incarnation: source.clone(),
+        replaced_incarnation: source.clone(),
         destination_incarnation: WorkspaceIncarnation::new("4198f2c0b7e34dc795f17b238b331c80")
             .unwrap(),
     }));
@@ -1006,14 +1068,31 @@ fn retained_checkpoint_can_restore_repeatedly_only_to_fresh_destinations() {
     mismatched_origin.push(ControllerCommitment::Restore(RestoreCommitment {
         version: CONTROLLER_COMMITMENT_VERSION,
         order: 3,
-        repo_id: repo,
+        repo_id: repo.clone(),
         source_checkpoint: "checkpoint-1".into(),
         source_incarnation: forked,
+        replaced_incarnation: source.clone(),
         destination_incarnation: WorkspaceIncarnation::new("5198f2c0b7e34dc795f17b238b331c80")
             .unwrap(),
     }));
     assert!(matches!(
         validate_commitments(&baseline, &mismatched_origin),
+        Err(ArtifactError::Integrity { .. })
+    ));
+
+    let mut inactive_replaced = history.clone();
+    inactive_replaced.push(ControllerCommitment::Restore(RestoreCommitment {
+        version: CONTROLLER_COMMITMENT_VERSION,
+        order: 7,
+        repo_id: repo,
+        source_checkpoint: "checkpoint-1".into(),
+        source_incarnation: source,
+        replaced_incarnation: first_restore,
+        destination_incarnation: WorkspaceIncarnation::new("6198f2c0b7e34dc795f17b238b331c80")
+            .unwrap(),
+    }));
+    assert!(matches!(
+        validate_commitments(&baseline, &inactive_replaced),
         Err(ArtifactError::Integrity { .. })
     ));
 }
