@@ -7,9 +7,9 @@ use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection
 use cowshed_core::api::{
     AdoptOptions, AttachOptions, BranchName, CheckpointOptions, CheckpointResult, CommandArg,
     Coordinator, CreateOptions, DoctorReport, EmptyResult, EnsureAction, EnsureReport, ExecRequest,
-    ExitStatus, ExpectedRefHead, GcOptions, GcReport, GitOid, JobInfo, JobStream, LandOptions,
-    LandReport, MountResult, OutputPublication, PublicationPolicy, PushOptions, PushReport,
-    RebaseOptions, RemoveOptions, RevisionResult, RevisionTarget, RunSandboxMode,
+    ExitStatus, ExpectedRefHead, GcOptions, GcReason, GcReport, GitOid, JobInfo, JobStream,
+    LandOptions, LandReport, MountResult, OutputPublication, PublicationPolicy, PushOptions,
+    PushReport, RebaseOptions, RemoveOptions, RevisionResult, RevisionTarget, RunSandboxMode,
     StdinSource as CoreStdinSource, WorkspaceInfo, WorkspacePath, WorkspaceState,
     validate_command_argv,
 };
@@ -648,10 +648,19 @@ where
                     .map_err(output_error)?;
             }
             if report.dry_run {
+                emit_gc_candidates(output, &report)?;
+                let candidate_noun = if report.candidates.len() == 1 {
+                    "candidate"
+                } else {
+                    "candidates"
+                };
                 output
                     .guidance(&format!(
-                        "dry run examined {} objects and would reclaim {}",
-                        report.examined, report.reclaimed
+                        "dry run examined {} objects; {} {}, {} bytes reclaimable",
+                        report.examined,
+                        report.candidates.len(),
+                        candidate_noun,
+                        report.freed_bytes
                     ))
                     .map_err(output_error)?;
             }
@@ -1005,6 +1014,33 @@ const fn ensure_action(action: EnsureAction) -> &'static str {
         EnsureAction::AlreadyMounted => "already mounted",
         EnsureAction::Attached => "attached",
         EnsureAction::Healed => "healed",
+    }
+}
+
+fn emit_gc_candidates<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    report: &GcReport,
+) -> Result<()> {
+    for candidate in &report.candidates {
+        output
+            .guidance(&format!(
+                "would reclaim {} ({} bytes; reason: {})",
+                candidate.path.display(),
+                candidate.bytes,
+                gc_reason(candidate.reason)
+            ))
+            .map_err(output_error)?;
+    }
+    Ok(())
+}
+
+const fn gc_reason(reason: GcReason) -> &'static str {
+    match reason {
+        GcReason::RetiredWorkspace => "retiredWorkspace",
+        GcReason::OrphanStagingImage => "orphanStagingImage",
+        GcReason::OrphanStagingMetadata => "orphanStagingMetadata",
+        GcReason::ExpiredCheckpoint => "expiredCheckpoint",
+        GcReason::DetachedImageCompaction => "detachedImageCompaction",
     }
 }
 
