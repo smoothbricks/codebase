@@ -75,6 +75,15 @@
     "packages/cowshed": {
       "name": "@smoothbricks/cowshed",
       "version": "0.1.0",
+      "dependencies": {
+        "typia": "^12.0.1",
+      },
+      "devDependencies": {
+        "@smoothbricks/lmao": "workspace:*",
+        "@smoothbricks/validation": "workspace:*",
+        "@types/node": "~24.0.0",
+        "typescript": "^6.0.3",
+      },
     },
     "packages/duration": {
       "name": "@smoothbricks/duration",
