@@ -360,6 +360,20 @@ impl NativeGatewayInventory {
     }
 }
 
+const RESERVED_STORE_NAMESPACES: &[&str] = &[
+    "caches",
+    "telemetry",
+    "gateway",
+    "mnt",
+    "run",
+    "tmp",
+    "quarantine",
+];
+
+fn is_reserved_store_namespace(name: &str) -> bool {
+    name.starts_with('.') || RESERVED_STORE_NAMESPACES.contains(&name)
+}
+
 fn discover_repositories(store_root: &Path) -> Result<Vec<RepoId>, GatewayInventoryError> {
     ensure_directory(store_root, "opening validated store root")?;
     let mut repositories = BTreeSet::new();
@@ -367,7 +381,7 @@ fn discover_repositories(store_root: &Path) -> Result<Vec<RepoId>, GatewayInvent
         let Some(owner_name) = owner.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if owner_name.starts_with('.') || !is_directory(&owner)? {
+        if is_reserved_store_namespace(owner_name) || !is_directory(&owner)? {
             continue;
         }
         for project in read_directory(&owner, "enumerating owner repositories")? {
@@ -943,6 +957,15 @@ mod tests {
                     mount_paths: BTreeMap::from([(mount.volume_name, path)]),
                 },
             );
+        }
+        for namespace in RESERVED_STORE_NAMESPACES {
+            let collision = fixture.storage.store().join(namespace).join("system-owned");
+            fs::create_dir_all(&collision).expect("reserved namespace fixture");
+            fs::write(
+                collision.join("repository.json"),
+                b"not a repository binding",
+            )
+            .expect("invalid reserved binding");
         }
         let inventory = NativeGatewayInventory::with_source(
             fixture.storage.clone(),
