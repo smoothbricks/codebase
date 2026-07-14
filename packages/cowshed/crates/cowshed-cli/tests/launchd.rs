@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use cowshed_cli::launchd::{
     CommandOutput, CommandStatus, ControlAction, ControlExecutionError, ControlPlan, ExistingPlist,
     FilesystemOperation, GATEWAY_LABEL, InstallOutcome, InstallState, LAUNCHCTL_EXECUTABLE,
-    LaunchAgentSpec, LaunchctlCommand, LaunchdError, LaunchdExecutor, LaunchdFilesystem, Mutation,
-    PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE, ServiceLifecycle, plan_install, plan_remove,
+    LaunchAgentSpec, LaunchctlCommand, LaunchdError, LaunchdExecutor, LaunchdFilesystem,
+    LaunchdServiceStatus, Mutation, PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE, ServiceLifecycle,
+    plan_install, plan_remove,
 };
 
 const HOME: &str = "/Users/cowshed-test";
@@ -705,5 +706,96 @@ fn control_executor_classifies_exit_signal_and_spawn_failures_without_retrying()
             status: CommandStatus::Terminated,
             ..
         })
+    ));
+}
+
+#[test]
+fn print_status_uses_fixed_target_and_maps_loaded_and_absent_idempotently() {
+    let spec = gateway();
+    let plan = ControlPlan::print(503, &spec);
+    let mut executor = LaunchdExecutor::new(
+        FakeFilesystem::default(),
+        FakeCommand::with_outputs([
+            Ok(CommandOutput {
+                status: CommandStatus::Success,
+                stdout: b"service = dev.cowshed.gateway".to_vec(),
+                stderr: Vec::new(),
+            }),
+            Ok(CommandOutput {
+                status: CommandStatus::ExitCode(113),
+                stdout: Vec::new(),
+                stderr: b"Could not find service".to_vec(),
+            }),
+        ]),
+    );
+
+    assert_eq!(
+        executor.execute_status(&plan).unwrap(),
+        LaunchdServiceStatus::Loaded {
+            stdout: b"service = dev.cowshed.gateway".to_vec(),
+            stderr: Vec::new(),
+        }
+    );
+    assert_eq!(
+        executor.execute_status(&plan).unwrap(),
+        LaunchdServiceStatus::NotLoaded {
+            exit_code: 113,
+            stdout: Vec::new(),
+            stderr: b"Could not find service".to_vec(),
+        }
+    );
+    assert!(matches!(
+        executor.execute_status(&ControlPlan::bootstrap(503, &spec)),
+        Err(ControlExecutionError::InvalidStatusPlan {
+            action: ControlAction::Bootstrap,
+        })
+    ));
+
+    let (_, command) = executor.into_parts();
+    let expected = CommandInvocation {
+        executable: PathBuf::from(LAUNCHCTL_EXECUTABLE),
+        arguments: vec![
+            OsString::from("print"),
+            OsString::from("gui/503/dev.cowshed.gateway"),
+        ],
+    };
+    assert_eq!(command.invocations, [expected.clone(), expected]);
+}
+
+#[test]
+fn print_status_keeps_signal_and_spawn_failures_operationally_typed() {
+    let spec = gateway();
+    let plan = ControlPlan::print(504, &spec);
+    let mut executor = LaunchdExecutor::new(
+        FakeFilesystem::default(),
+        FakeCommand::with_outputs([Ok(CommandOutput {
+            status: CommandStatus::Terminated,
+            stdout: Vec::new(),
+            stderr: b"terminated".to_vec(),
+        })]),
+    );
+    assert!(matches!(
+        executor.execute_status(&plan),
+        Err(ControlExecutionError::Rejected {
+            action: ControlAction::Print,
+            status: CommandStatus::Terminated,
+            stderr,
+            ..
+        }) if stderr == b"terminated"
+    ));
+
+    let mut executor = LaunchdExecutor::new(
+        FakeFilesystem::default(),
+        FakeCommand::with_outputs([Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "launchctl missing",
+        ))]),
+    );
+    assert!(matches!(
+        executor.execute_status(&plan),
+        Err(ControlExecutionError::Unavailable {
+            action: ControlAction::Print,
+            source,
+        }) if source.kind() == io::ErrorKind::NotFound
     ));
 }
