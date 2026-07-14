@@ -12,7 +12,10 @@ use arrow_schema::{DataType, Field, Schema};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::interfaces::{AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus};
+use crate::{
+    interfaces::{AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus},
+    mirror::MirrorCacheStatus,
+};
 
 /// Configuration for immutable one-batch gateway audit segments.
 #[derive(Clone, Debug)]
@@ -182,6 +185,8 @@ fn write_segment(root: &Path, writer_id: Uuid, event: AuditEvent) -> Result<(), 
         i128::from(event.timestamp_unix_ms) * 1_000_000,
     )
     .map_err(|_| AuditError("audit timestamp is outside the UTC calendar".to_owned()))?;
+    let sequence = event.sequence;
+    let batch = event_batch(event)?;
     let date = format!(
         "{:04}-{:02}-{:02}",
         timestamp.year(),
@@ -203,7 +208,7 @@ fn write_segment(root: &Path, writer_id: Uuid, event: AuditEvent) -> Result<(), 
         fs::set_permissions(&partition, fs::Permissions::from_mode(0o700))
             .map_err(io_error("securing telemetry partition"))?;
     }
-    let stem = format!("gateway-{:020}-{writer_id}", event.sequence);
+    let stem = format!("gateway-{sequence:020}-{writer_id}");
     let temporary = partition.join(format!(".{stem}.tmp"));
     let final_path = partition.join(format!("{stem}.arrow"));
     if final_path.exists() {
@@ -219,7 +224,6 @@ fn write_segment(root: &Path, writer_id: Uuid, event: AuditEvent) -> Result<(), 
     let mut file = options
         .open(&temporary)
         .map_err(io_error("creating audit segment"))?;
-    let batch = event_batch(event)?;
     {
         let mut writer = StreamWriter::try_new(&mut file, &batch.schema())
             .map_err(|error| AuditError(format!("creating Arrow stream: {error}")))?;
@@ -236,6 +240,16 @@ fn write_segment(root: &Path, writer_id: Uuid, event: AuditEvent) -> Result<(), 
 }
 
 fn event_batch(event: AuditEvent) -> Result<RecordBatch, AuditError> {
+    if event.mirror_cache_status.is_some()
+        && !matches!(
+            event.kind,
+            AuditKind::Npm | AuditKind::Cargo | AuditKind::Go
+        )
+    {
+        return Err(AuditError(
+            "non-mirror audit event cannot carry mirror cache status".to_owned(),
+        ));
+    }
     let schema = Arc::new(Schema::new(vec![
         Field::new("sequence", DataType::UInt64, false),
         Field::new("timestamp_unix_ms", DataType::UInt64, false),
@@ -252,6 +266,7 @@ fn event_batch(event: AuditEvent) -> Result<RecordBatch, AuditError> {
         Field::new("trace_id", DataType::Utf8, true),
         Field::new("grant_hint", DataType::Utf8, true),
         Field::new("classification", DataType::Utf8, true),
+        Field::new("mirror_cache_status", DataType::Utf8, true),
     ]));
     let kind = match event.kind {
         AuditKind::Http => "http",
@@ -273,6 +288,13 @@ fn event_batch(event: AuditEvent) -> Result<RecordBatch, AuditError> {
         AuditStatus::TimedOut => "timed-out",
         AuditStatus::Cancelled => "cancelled",
     };
+    let mirror_cache_status = event.mirror_cache_status.map(|status| match status {
+        MirrorCacheStatus::Hit => "hit",
+        MirrorCacheStatus::OfflineHit => "offline-hit",
+        MirrorCacheStatus::Filled => "filled",
+        MirrorCacheStatus::Revalidated => "revalidated",
+        MirrorCacheStatus::Bypassed => "bypassed",
+    });
     let columns: Vec<ArrayRef> = vec![
         Arc::new(UInt64Array::from(vec![event.sequence])),
         Arc::new(UInt64Array::from(vec![event.timestamp_unix_ms])),
@@ -289,6 +311,7 @@ fn event_batch(event: AuditEvent) -> Result<RecordBatch, AuditError> {
         Arc::new(StringArray::from(vec![event.trace_id])),
         Arc::new(StringArray::from(vec![event.grant_hint])),
         Arc::new(StringArray::from(vec![event.classification])),
+        Arc::new(StringArray::from(vec![mirror_cache_status])),
     ];
     RecordBatch::try_new(schema, columns)
         .map_err(|error| AuditError(format!("building audit batch: {error}")))

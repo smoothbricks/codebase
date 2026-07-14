@@ -23,8 +23,8 @@ use crate::{
         AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus, ConnectError,
         CredentialProvider, UpstreamConnector,
     },
-    mirror::MirrorService,
-    policy::{CanonicalTarget, EgressMode, MirrorProtocol, PolicyDenial},
+    mirror::{MirrorCacheStatus, MirrorService},
+    policy::{CanonicalTarget, EgressMode, MirrorProtocol, PolicyDenial, normalize_path},
     proxy,
     telemetry::ArrowAuditConfig,
     tls::{CaSigner, LeafCache, TlsError},
@@ -106,6 +106,7 @@ impl Gateway {
         #[cfg(target_os = "macos")]
         {
             config.validate()?;
+            config.validate_host_cache_layout()?;
             let connector =
                 SystemConnector::new(config.timeouts.connect, config.timeouts.tls_handshake)?;
             let audit = ArrowAuditSink::start(telemetry)?;
@@ -149,9 +150,18 @@ impl Gateway {
         );
         let actor = tokio::spawn(state.run());
         let control = match &config.control_socket {
-            Some(path) => Some(
-                ControlRuntime::start(path, config.authorized_control_uid, handle.clone()).await?,
-            ),
+            Some(path) => {
+                match ControlRuntime::start(path, config.authorized_control_uid, handle.clone())
+                    .await
+                {
+                    Ok(control) => Some(control),
+                    Err(error) => {
+                        let _ = handle.send(Command::ForceStop).await;
+                        let _ = actor.await;
+                        return Err(error);
+                    }
+                }
+            }
             None => None,
         };
         Ok(Self {
@@ -264,6 +274,11 @@ pub(crate) enum Authentication {
 pub(crate) enum RequestTarget {
     Generic(CanonicalTarget),
     LocalMirror,
+    MirrorRedirect {
+        protocol: MirrorProtocol,
+        target: CanonicalTarget,
+        upstream_path: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -428,6 +443,7 @@ pub(crate) struct AuditDraft {
     pub trace_id: Option<String>,
     pub grant_hint: Option<String>,
     pub classification: Option<String>,
+    pub mirror_cache_status: Option<MirrorCacheStatus>,
 }
 
 impl AuditDraft {
@@ -453,6 +469,7 @@ impl AuditDraft {
             trace_id: self.trace_id,
             grant_hint: self.grant_hint,
             classification: self.classification,
+            mirror_cache_status: self.mirror_cache_status,
         }
     }
 }
@@ -1210,6 +1227,7 @@ impl Actor {
             trace_id: None,
             grant_hint: None,
             classification: Some(attempt.classification.to_owned()),
+            mirror_cache_status: None,
         };
         self.record(draft).await
     }
@@ -1399,8 +1417,39 @@ fn build_seed(
                 false,
                 Some(resolved.protocol),
                 resolved.credentialed,
-                true,
+                false,
                 resolved.path,
+            )
+        }
+        RequestTarget::MirrorRedirect {
+            protocol,
+            target,
+            upstream_path,
+        } => {
+            let resolved = session.policy.resolve_mirror(&intent.path).ok_or((
+                "mirror redirect is no longer admitted",
+                Some("trusted project policy changed during redirect".to_owned()),
+            ))?;
+            let normalized = normalize_path(
+                upstream_path
+                    .split_once('?')
+                    .map_or(upstream_path.as_str(), |(path, _)| path),
+            )
+            .map_err(|_| ("mirror redirect path is ambiguous", None))?;
+            if resolved.protocol != *protocol
+                || resolved.target != *target
+                || !path_prefix_matches(&normalized, &resolved.admitted_prefix)
+            {
+                return Err(("mirror redirect escaped its admitted origin or scope", None));
+            }
+            (
+                target.clone(),
+                EgressMode::Intercept,
+                false,
+                Some(*protocol),
+                resolved.credentialed,
+                false,
+                upstream_path.clone(),
             )
         }
         RequestTarget::Generic(target) => {
@@ -1442,6 +1491,14 @@ fn build_seed(
     })
 }
 
+fn path_prefix_matches(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || prefix == "/"
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| prefix.ends_with('/') || suffix.starts_with('/'))
+}
+
 fn pending_audit_draft(
     seed: &AdmissionSeed,
     status: AuditStatus,
@@ -1462,6 +1519,7 @@ fn pending_audit_draft(
         trace_id: seed.trace_id.clone(),
         grant_hint: None,
         classification: classification.map(str::to_owned),
+        mirror_cache_status: None,
     }
 }
 
@@ -1475,6 +1533,7 @@ fn denial_draft(
 ) -> AuditDraft {
     let host = match &intent.target {
         RequestTarget::Generic(target) => Some(target.authority()),
+        RequestTarget::MirrorRedirect { target, .. } => Some(target.authority()),
         RequestTarget::LocalMirror => None,
     };
     AuditDraft {
@@ -1491,6 +1550,7 @@ fn denial_draft(
         trace_id: intent.trace_id.clone(),
         grant_hint: hint,
         classification: None,
+        mirror_cache_status: None,
     }
 }
 
