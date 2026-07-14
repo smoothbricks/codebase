@@ -627,6 +627,11 @@ impl ApfsExecutionHost for FakeHost {
                     } else {
                         PathBuf::from(format!("/store/mnt/{}", fact.workspace.name()))
                     },
+                    source_checkpoint: "checkpoint-source".to_owned(),
+                    source_incarnation: WorkspaceIncarnation::new(
+                        "ffffffffffffffffffffffffffffffff",
+                    )
+                    .expect("source incarnation"),
                 },
             )
             .collect())

@@ -145,6 +145,8 @@ pub struct PendingPublicationFact {
     pub workspace: LifecycleWorkspace,
     pub image: PathBuf,
     pub mount_point: PathBuf,
+    pub source_checkpoint: String,
+    pub source_incarnation: WorkspaceIncarnation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1450,6 +1452,7 @@ struct PreparedReplaceRestore<A> {
     undo_image: PathBuf,
     current: LifecycleWorkspace,
     previous_incarnation: WorkspaceIncarnation,
+    source_checkpoint: String,
 }
 
 enum PreparedRestore<A> {
@@ -2125,6 +2128,7 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
         undo_image,
         current,
         previous_incarnation,
+        source_checkpoint: label.to_string(),
     }))
 }
 
@@ -2178,6 +2182,7 @@ fn commit_prepared_restore<H: ApfsExecutionHost>(
         undo_image,
         current,
         previous_incarnation,
+        source_checkpoint,
     } = prepared;
     if let Err(primary) = host
         .validate_staged_companion(&stage.companion)
@@ -2240,6 +2245,8 @@ fn commit_prepared_restore<H: ApfsExecutionHost>(
         workspace: stage.workspace.clone(),
         image: canonical_image,
         mount_point: canonical_mount,
+        source_checkpoint,
+        source_incarnation: current.incarnation().clone(),
     };
     Ok(CommittedRestore::Pending(PendingRestore {
         receipt: RestoreReceipt {

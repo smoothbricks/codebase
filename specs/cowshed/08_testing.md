@@ -102,6 +102,11 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   enumeration never returns one — the "derived state" promise holds under partial writes.
 - **Idempotent recovery/gc**: replaying a crash-recovery or `gc` pass over any generated interrupted-state fixture
   converges to the same result as running it once (crash points from the adopt/new/rm recovery tables, 02).
+- **Stateless restore recovery boundaries**: interrupt after undo-sidecar publication, each image/CA-key swap and
+  rename, each canonical/undo parent fsync, pending metadata rename/fsync, staged-metadata removal, and final parent
+  fsync. Restart twice from every fixture. Recovery must derive rollback/forward state only from APFS image, detached
+  metadata, grant/CA, and `.restore.json` facts; converge idempotently; publish at most one restore commitment; accept
+  only the corresponding token/incarnation; and leave no `.restore-fences`, runtime journal, or second mutable fact.
 
 ## Integration tests (real substrate)
 

@@ -512,7 +512,10 @@ active image's allocated bytes. `pinned_checkpoint_bytes` is an authoritative re
 quota. Sibling workspaces consume none of the cap. Exact `<=` boundaries pass; `>` is `CowshedError::Conflict` before
 any checkpoint image, fact, metadata, or barrier publication. Only then does cowshed run the 02_workspaces.md barrier,
 clone while held, and publish the controller manifest-digest/lineage commitment. Manifest/commitment mismatch is
-`CowshedError::Integrity`. Restore remains coordinator-only.
+`CowshedError::Integrity`. Restore remains coordinator-only. On controller startup, restore retryability is derived only
+from APFS `PendingPublicationFact`s backed by exact `.restore.json` substrate recovery facts. The coordinator
+idempotently republishes the matching `RestoreCommitment`, activates the pending detached metadata, and removes the
+fact; no runtime journal or `.restore-fences` capability exists.
 
 `JobInfo.state = OutputLimit` is the explicit result when the configurable combined stdout+stderr quota (default 1 GiB)
 is crossed. Accounting includes protected and in-flight bytes; the supervisor admits no payload beyond the exact

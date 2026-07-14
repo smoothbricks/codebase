@@ -220,10 +220,51 @@ struct CheckpointFactWire {
     pin: String,
 }
 
+const RESTORE_RECOVERY_FACT_VERSION: u32 = 1;
+const RESTORE_RECOVERY_FACT_SUFFIX: &str = ".restore.json";
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestoreRecoveryFactWire {
+    version: u32,
+    repo_id: RepoId,
+    workspace: WorkspaceName,
+    source_checkpoint: CheckpointLabel,
+    source_incarnation: WorkspaceIncarnation,
+    destination_incarnation: WorkspaceIncarnation,
+}
+
 fn checkpoint_fact_path(image: &Path) -> PathBuf {
     let mut path = image.as_os_str().to_owned();
     path.push(CHECKPOINT_FACT_SUFFIX);
     PathBuf::from(path)
+}
+
+fn restore_recovery_fact_path(image: &Path) -> PathBuf {
+    let mut path = image.as_os_str().to_owned();
+    path.push(RESTORE_RECOVERY_FACT_SUFFIX);
+    PathBuf::from(path)
+}
+
+fn restore_recovery_fact(
+    image: &Path,
+    metadata: &DetachedWorkspaceMetadata,
+) -> Result<RestoreRecoveryFactWire, ApfsStorageError> {
+    let path = restore_recovery_fact_path(image);
+    let fact: RestoreRecoveryFactWire = crate::metadata::read_json(&path)
+        .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+    if fact.version != RESTORE_RECOVERY_FACT_VERSION
+        || fact.repo_id != metadata.repo_id
+        || fact.workspace != metadata.workspace
+        || fact.destination_incarnation != metadata.workspace_incarnation
+        || fact.source_incarnation == fact.destination_incarnation
+    {
+        return Err(ApfsStorageError::MarkerMismatch(format!(
+            "restore recovery fact disagrees with pending metadata: {}",
+            path.display()
+        )));
+    }
+    Ok(fact)
 }
 
 fn allocated_file_bytes(metadata: &fs::Metadata) -> u64 {
@@ -2471,10 +2512,16 @@ where
                 "only a pending restore publication can be activated",
             ));
         }
+        restore_recovery_fact(canonical, &metadata)?;
         metadata.publication_state = PublicationState::Active;
         metadata
             .write_for_image(canonical)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        sync_parent!(canonical)?;
+        let fact_path = restore_recovery_fact_path(canonical);
+        fs::remove_file(&fact_path).map_err(|error| {
+            io_error("remove completed restore recovery fact", &fact_path, error)
+        })?;
         sync_parent!(canonical)
     }
     fn publish_restored_metadata(
@@ -2488,6 +2535,42 @@ where
         self.verify_controller_path(staged)?;
         self.verify_controller_path(canonical)?;
         self.verify_controller_path(source_image)?;
+        let source_metadata = DetachedWorkspaceMetadata::read_for_image(source_image)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        let source_checkpoint = source_image
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| {
+                ApfsStorageError::Host(format!(
+                    "restore checkpoint has invalid name: {}",
+                    source_image.display()
+                ))
+            })
+            .and_then(|label| {
+                CheckpointLabel::new(label)
+                    .map_err(|error| ApfsStorageError::Host(error.to_string()))
+            })?;
+        if source_metadata.repo_id != *workspace.repo()
+            || source_metadata.workspace != *workspace.name()
+            || source_metadata.workspace_incarnation == *workspace.incarnation()
+        {
+            return Err(ApfsStorageError::MarkerMismatch(format!(
+                "restore checkpoint metadata disagrees with destination {}",
+                canonical.display()
+            )));
+        }
+        let recovery_fact = RestoreRecoveryFactWire {
+            version: RESTORE_RECOVERY_FACT_VERSION,
+            repo_id: workspace.repo().clone(),
+            workspace: workspace.name().clone(),
+            source_checkpoint,
+            source_incarnation: source_metadata.workspace_incarnation,
+            destination_incarnation: workspace.incarnation().clone(),
+        };
+        let recovery_path = restore_recovery_fact_path(canonical);
+        crate::metadata::write_json(&recovery_path, &recovery_fact)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        sync_parent!(&recovery_path)?;
         self.publish_metadata(
             canonical,
             workspace,
@@ -2551,6 +2634,18 @@ where
         Self::remove_companion(staged)?;
         fs::remove_file(&undo_companion)
             .map_err(|error| io_error("remove restore undo CA link", &undo_companion, error))?;
+        let recovery_path = restore_recovery_fact_path(canonical);
+        match fs::remove_file(&recovery_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(io_error(
+                    "remove rolled-back restore recovery fact",
+                    &recovery_path,
+                    error,
+                ));
+            }
+        }
         sync_parent!(canonical)
     }
 
@@ -2619,9 +2714,12 @@ where
         if let Some((image, metadata)) = self.find_canonical_image(repo, &main)?
             && metadata.publication_state == PublicationState::PendingFence
         {
+            let fact = restore_recovery_fact(&image, &metadata)?;
             pending.push(PendingPublicationFact {
                 workspace: metadata_workspace_ref(&metadata)?,
                 mount_point: self.expected_mount_point(&metadata)?,
+                source_checkpoint: fact.source_checkpoint.to_string(),
+                source_incarnation: fact.source_incarnation,
                 image,
             });
         }
@@ -2650,9 +2748,12 @@ where
                     discovered.path().display()
                 )));
             }
+            let fact = restore_recovery_fact(discovered.path(), &metadata)?;
             pending.push(PendingPublicationFact {
                 workspace: metadata_workspace_ref(&metadata)?,
                 mount_point: self.expected_mount_point(&metadata)?,
+                source_checkpoint: fact.source_checkpoint.to_string(),
+                source_incarnation: fact.source_incarnation,
                 image: discovered.path().to_owned(),
             });
         }
