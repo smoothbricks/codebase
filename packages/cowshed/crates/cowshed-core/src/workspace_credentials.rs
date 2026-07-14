@@ -1,5 +1,6 @@
-use std::fs::{self, File};
-use std::io;
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
@@ -21,6 +22,43 @@ pub const WORKSPACE_TOKEN_PATH: &str = ".cowshed/token";
 const CREDENTIAL_DIRECTORY: &str = ".cowshed";
 const TOKEN_BYTES: usize = 32;
 const TOKEN_ENCODED_BYTES: usize = 43;
+const MAX_CERTIFICATE_PEM_BYTES: u64 = 64 * 1024;
+const MAX_PRIVATE_KEY_PEM_BYTES: u64 = 64 * 1024;
+
+/// Fully validated gateway credential material for one exact workspace incarnation.
+///
+/// Secret bytes are zeroized on drop, cannot be cloned or serialized, and are always redacted
+/// from diagnostics.
+pub struct GatewayWorkspaceCredentials {
+    token: Zeroizing<String>,
+    certificate_pem: Zeroizing<String>,
+    private_key_pem: Zeroizing<String>,
+}
+
+impl GatewayWorkspaceCredentials {
+    pub fn token(&self) -> &str {
+        self.token.as_str()
+    }
+
+    pub fn certificate_pem(&self) -> &str {
+        self.certificate_pem.as_str()
+    }
+
+    pub fn private_key_pem(&self) -> &str {
+        self.private_key_pem.as_str()
+    }
+}
+
+impl fmt::Debug for GatewayWorkspaceCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayWorkspaceCredentials")
+            .field("token", &"[REDACTED]")
+            .field("certificate_pem", &"[REDACTED]")
+            .field("private_key_pem", &"[REDACTED]")
+            .finish()
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum WorkspaceCredentialError {
@@ -134,6 +172,42 @@ pub fn validate_workspace_credentials(
         Ok(())
     })?;
     validate_token(&mount_point.join(WORKSPACE_TOKEN_PATH))
+}
+/// Validate identity, file type, permissions, certificate/key pairing, and token encoding before
+/// returning the exact bounded credential contents needed by the gateway.
+pub fn read_gateway_workspace_credentials(
+    workspace: &LifecycleWorkspace,
+    mount_point: &Path,
+    private_key_path: &Path,
+) -> Result<GatewayWorkspaceCredentials, WorkspaceCredentialError> {
+    validate_workspace_credentials(workspace, mount_point, private_key_path)?;
+
+    let token_path = mount_point.join(WORKSPACE_TOKEN_PATH);
+    let certificate_path = mount_point.join(CA_CERTIFICATE_PATH);
+    let token = read_bounded_utf8(
+        &token_path,
+        "reading gateway workspace token",
+        TOKEN_ENCODED_BYTES as u64,
+        "workspace token",
+    )?;
+    let certificate_pem = read_bounded_utf8(
+        &certificate_path,
+        "reading gateway CA certificate",
+        MAX_CERTIFICATE_PEM_BYTES,
+        "CA certificate",
+    )?;
+    let private_key_pem = read_bounded_utf8(
+        private_key_path,
+        "reading gateway private key",
+        MAX_PRIVATE_KEY_PEM_BYTES,
+        "private key",
+    )?;
+
+    Ok(GatewayWorkspaceCredentials {
+        token,
+        certificate_pem,
+        private_key_pem,
+    })
 }
 
 fn credential_subject(
@@ -267,6 +341,51 @@ fn validate_mode_and_type(path: &Path, kind: &'static str) -> Result<(), Workspa
 
 fn read_asset(path: &Path, operation: &'static str) -> Result<Vec<u8>, WorkspaceCredentialError> {
     fs::read(path).map_err(|source| io_failure(operation, path, source))
+}
+fn read_bounded_utf8(
+    path: &Path,
+    operation: &'static str,
+    maximum: u64,
+    kind: &'static str,
+) -> Result<Zeroizing<String>, WorkspaceCredentialError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options
+        .open(path)
+        .map_err(|source| io_failure(operation, path, source))?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| io_failure(operation, path, source))?;
+    if !metadata.file_type().is_file() {
+        return Err(invalid(kind, path));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err(invalid(kind, path));
+        }
+    }
+    if metadata.len() > maximum {
+        return Err(invalid(kind, path));
+    }
+
+    let capacity = usize::try_from(metadata.len()).map_err(|_| invalid(kind, path))?;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(capacity));
+    file.take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| io_failure(operation, path, source))?;
+    if bytes.len() as u64 > maximum {
+        return Err(invalid(kind, path));
+    }
+    String::from_utf8(std::mem::take(&mut *bytes))
+        .map(Zeroizing::new)
+        .map_err(|_| invalid(kind, path))
 }
 
 fn sync_directory(path: &Path, operation: &'static str) -> Result<(), WorkspaceCredentialError> {
@@ -406,6 +525,81 @@ mod tests {
         ));
         assert!(!key_path.exists());
         assert_eq!(fs::read_dir(outside).expect("outside").count(), 0);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+    #[test]
+    fn gateway_read_returns_exact_redacted_material_after_full_validation() {
+        let root = test_root("gateway-read");
+        let mount = root.join("mount");
+        fs::create_dir(&mount).expect("mount");
+        let key_path = root.join("workspace.ca.key");
+        let workspace = workspace("00112233445566778899aabbccddeeff");
+        mint_workspace_credentials(&workspace, &mount, &key_path).expect("mint credentials");
+
+        let expected_token =
+            String::from_utf8(fs::read(mount.join(WORKSPACE_TOKEN_PATH)).unwrap()).unwrap();
+        let expected_certificate =
+            String::from_utf8(fs::read(mount.join(CA_CERTIFICATE_PATH)).unwrap()).unwrap();
+        let expected_key = String::from_utf8(fs::read(&key_path).unwrap()).unwrap();
+        let credentials = read_gateway_workspace_credentials(&workspace, &mount, &key_path)
+            .expect("validated gateway credentials");
+        assert_eq!(credentials.token(), expected_token);
+        assert_eq!(credentials.certificate_pem(), expected_certificate);
+        assert_eq!(credentials.private_key_pem(), expected_key);
+        let debug = format!("{credentials:?}");
+        assert!(!debug.contains(&expected_token));
+        assert!(!debug.contains("BEGIN PRIVATE KEY"));
+        assert!(debug.contains("[REDACTED]"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn gateway_read_rejects_mode_symlink_pair_and_token_failures() {
+        let root = test_root("gateway-read-invalid");
+        let subject = workspace("00112233445566778899aabbccddeeff");
+
+        let mode_mount = root.join("mode");
+        fs::create_dir(&mode_mount).unwrap();
+        let mode_key = root.join("mode.ca.key");
+        mint_workspace_credentials(&subject, &mode_mount, &mode_key).unwrap();
+        fs::set_permissions(&mode_key, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_gateway_workspace_credentials(&subject, &mode_mount, &mode_key).is_err());
+
+        let symlink_mount = root.join("symlink");
+        fs::create_dir(&symlink_mount).unwrap();
+        let symlink_key = root.join("symlink.ca.key");
+        mint_workspace_credentials(&subject, &symlink_mount, &symlink_key).unwrap();
+        let token_path = symlink_mount.join(WORKSPACE_TOKEN_PATH);
+        let outside_token = root.join("outside-token");
+        fs::rename(&token_path, &outside_token).unwrap();
+        symlink(&outside_token, &token_path).unwrap();
+        assert!(
+            read_gateway_workspace_credentials(&subject, &symlink_mount, &symlink_key).is_err()
+        );
+
+        let pair_mount = root.join("pair");
+        let other_mount = root.join("other");
+        fs::create_dir(&pair_mount).unwrap();
+        fs::create_dir(&other_mount).unwrap();
+        let pair_key = root.join("pair.ca.key");
+        let other_key = root.join("other.ca.key");
+        mint_workspace_credentials(&subject, &pair_mount, &pair_key).unwrap();
+        mint_workspace_credentials(
+            &workspace("ffeeddccbbaa99887766554433221100"),
+            &other_mount,
+            &other_key,
+        )
+        .unwrap();
+        assert!(read_gateway_workspace_credentials(&subject, &pair_mount, &other_key).is_err());
+
+        let token_mount = root.join("token");
+        fs::create_dir(&token_mount).unwrap();
+        let token_key = root.join("token.ca.key");
+        mint_workspace_credentials(&subject, &token_mount, &token_key).unwrap();
+        fs::write(token_mount.join(WORKSPACE_TOKEN_PATH), b"not-a-valid-token").unwrap();
+        assert!(read_gateway_workspace_credentials(&subject, &token_mount, &token_key).is_err());
 
         fs::remove_dir_all(root).expect("cleanup");
     }
