@@ -34,6 +34,7 @@ struct FakeService {
     ensure_report: Option<EnsureReport>,
     ensure_error: Option<CowshedError>,
     ensure_path: Option<PathBuf>,
+    gc_candidates: Vec<GcCandidate>,
     shutdowns: Option<Arc<AtomicUsize>>,
     shutdown_error: Option<CowshedError>,
 }
@@ -54,6 +55,7 @@ impl Default for FakeService {
             ensure_report: None,
             ensure_error: None,
             ensure_path: None,
+            gc_candidates: Vec::new(),
             shutdowns: None,
             shutdown_error: None,
         }
@@ -151,12 +153,22 @@ impl CliService for FakeService {
 
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport> {
         self.events.push(format!("gc:{}", options.dry_run));
+        let candidate_bytes = self
+            .gc_candidates
+            .iter()
+            .map(|candidate| candidate.bytes)
+            .sum();
         Ok(GcReport {
             examined: 9,
             reclaimed: u64::from(!options.dry_run) * 3,
             retained_pinned: 2,
-            freed_bytes: u64::from(!options.dry_run) * 4096,
+            freed_bytes: if options.dry_run {
+                candidate_bytes
+            } else {
+                4096
+            },
             dry_run: options.dry_run,
+            candidates: self.gc_candidates.clone(),
         })
     }
 
@@ -440,7 +452,7 @@ async fn lifecycle_commands_delegate_exact_options_and_keep_stdout_machine_only(
     assert_eq!(stdout, b"0\n");
     assert_eq!(
         stderr,
-        b"cowshed: dry run examined 9 objects and would reclaim 0\n"
+        b"cowshed: dry run examined 9 objects; 0 candidates, 0 bytes reclaimable\n"
     );
 
     let (_, stdout, stderr) = run(
@@ -652,6 +664,48 @@ async fn ensure_resolution_and_token_errors_emit_no_partial_machine_output() {
     let (stdout, stderr) = output.into_inner();
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
+}
+
+#[tokio::test]
+async fn gc_dry_run_zero_and_unicode_candidates_keep_streams_separate() {
+    let mut empty = FakeService::default();
+    let (_, stdout, stderr) = run(&mut empty, ["gc", "--dry-run"]).await;
+    assert_eq!(stdout, b"0\n");
+    assert_eq!(
+        stderr,
+        b"cowshed: dry run examined 9 objects; 0 candidates, 0 bytes reclaimable\n"
+    );
+
+    let candidate = GcCandidate {
+        identity: Sha256Digest::from_bytes([0xab; 32]),
+        path: PathBuf::from("/tmp/回收 space/checkpoint"),
+        bytes: 1234,
+        reason: GcReason::ExpiredCheckpoint,
+    };
+    let mut populated = FakeService {
+        gc_candidates: vec![candidate],
+        ..FakeService::default()
+    };
+    let (_, stdout, stderr) = run(&mut populated, ["gc", "--dry-run"]).await;
+    assert_eq!(stdout, b"1234\n");
+    assert_eq!(
+        stderr,
+        b"cowshed: would reclaim /tmp/\xe5\x9b\x9e\xe6\x94\xb6 space/checkpoint (1234 bytes; reason: expiredCheckpoint)\ncowshed: dry run examined 9 objects; 1 candidate, 1234 bytes reclaimable\n"
+    );
+
+    let (_, stdout, stderr) = run(&mut populated, ["gc", "--dry-run", "--json"]).await;
+    assert_eq!(
+        stdout,
+        format!(
+            "{{\"ok\":true,\"result\":{{\"examined\":9,\"reclaimed\":0,\"retainedPinned\":2,\"freedBytes\":1234,\"dryRun\":true,\"candidates\":[{{\"identity\":\"{}\",\"path\":\"/tmp/回收 space/checkpoint\",\"bytes\":1234,\"reason\":\"expiredCheckpoint\"}}]}}}}\n",
+            "ab".repeat(32)
+        )
+        .as_bytes()
+    );
+    assert_eq!(
+        stderr,
+        b"cowshed: would reclaim /tmp/\xe5\x9b\x9e\xe6\x94\xb6 space/checkpoint (1234 bytes; reason: expiredCheckpoint)\ncowshed: dry run examined 9 objects; 1 candidate, 1234 bytes reclaimable\n"
+    );
 }
 
 #[tokio::test]
