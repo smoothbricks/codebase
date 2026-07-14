@@ -348,8 +348,10 @@ at login by a launchd agent; Linux uses its platform service/controller lifecycl
 
 ## `cowshed ensure` — the .envrc fast path
 
-Contract: **silent exit 0 in ≤ 25 ms when healthy**. Fast path is one `statfs` of the cwd plus one read of
-`.cowshed/workspace.json`; no git, no network, no subprocess.
+Contract: **silent exit 0 in ≤ 25 ms when healthy**. Resolution asks the bound controller to re-read canonical storage,
+detached metadata, and kernel mount facts. The canonical cwd must be contained in exactly one active mount for that
+project; nested paths resolve, while detached, ambiguous, cross-project, and marker-only paths fail closed. The marker
+is validated only after mount authority is established and never grants a capability by itself.
 
 When something is wrong, `ensure` fixes what is safe to fix synchronously:
 
@@ -363,13 +365,12 @@ When something is wrong, `ensure` fixes what is safe to fix synchronously:
 It warns (one stderr line each, never blocking) when the gateway is unreachable or the workspace has old unpushed work.
 It never does slow or surprising work — no fetch, no compaction, no refresh.
 
-`cowshed ensure --envrc` additionally prints `export` lines on stdout — but wiring is carried by in-image config files
-and host-level paths, not environment (03_caches.md pins the exact set: at most `COWSHED_GATEWAY_TOKEN`, only until its
-verification passes — the bun cache export is already retired, bunfig's relative cache dir is verified — plus, on macOS
-only, the `PORT`/`COWSHED_PORT_BASE` dev-server conventions, and optional non-load-bearing identity conveniences like
-`COWSHED_WORKSPACE`. Linux exports neither port convention; its package/proxy base is the fixed private-netns connector
-URL and its dev servers use private loopback directly. Anything that needs identity derives it from cwd via
-`.cowshed/workspace.json` or asks the CLI. Usage in a repo's `.envrc`:
+`cowshed ensure --envrc` additionally prints exactly the load-bearing exports represented by the authoritative
+`EnsureReport`: `GOENV` points at the mounted workspace's `.cowshed/cache/go/env`, `COWSHED_WORKSPACE_TOKEN` contains
+the value read from the mounted workspace's controller-minted `.cowshed/token`, and macOS additionally exports
+`COWSHED_PORT_BASE` from the exact `portBlock` in detached metadata. Linux metadata has no port block and emits no
+sentinel value. The CLI never derives these paths from its cwd, guesses a port from a slot, or trusts a marker to choose
+a workspace. Usage in a repo's `.envrc`:
 
 ```bash
 eval "$(cowshed ensure --envrc)"

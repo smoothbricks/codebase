@@ -71,6 +71,7 @@ pub trait ProjectRuntimeHost: Send + 'static {
 
     async fn recover(&mut self) -> Result<()>;
     async fn snapshots(&mut self) -> Result<Vec<WorkspaceSnapshot>>;
+    async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceSnapshot>;
 
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceSnapshot>;
     async fn create(
@@ -295,6 +296,7 @@ impl ProjectActor {
         match request.method() {
             "project.open" => self.project_open(request).await,
             "project.workspace" => self.project_workspace(request).await,
+            "project.workspaceAt" => self.project_workspace_at(request).await,
             "project.list" => self.project_list(request).await,
             "workspace.info" => self.workspace_info(request).await,
             "workspace.ensure" => self.workspace_ensure(request).await,
@@ -377,6 +379,16 @@ impl ProjectActor {
         let snapshot = find_workspace(&snapshots, &params.workspace)?;
         self.validate_worker_snapshot(request.authority(), snapshot)?;
         workspace_response(snapshot)
+    }
+
+    async fn project_workspace_at(&mut self, request: RouterRequest) -> Result<RouterResponse> {
+        require_coordinator(request.authority())?;
+        let params: WorkspaceAtParams = decode_params(request.params(), request.method())?;
+        self.require_repo(&params.repo_id)?;
+        let path = canonical_input_path(&params.path)?;
+        let snapshot = self.host.workspace_at(path).await?;
+        self.validate_worker_snapshot(request.authority(), &snapshot)?;
+        workspace_response(&snapshot)
     }
 
     async fn project_list(&mut self, request: RouterRequest) -> Result<RouterResponse> {
@@ -901,6 +913,13 @@ struct RepoParams {
 struct WorkspaceParams {
     repo_id: RepoId,
     workspace: WorkspaceName,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspaceAtParams {
+    repo_id: RepoId,
+    path: String,
 }
 
 #[derive(Deserialize)]
@@ -1578,6 +1597,22 @@ impl NativeProjectRuntimeHost {
         })
     }
 
+    fn ensure_report(
+        &self,
+        workspace: &NativeWorkspace,
+        mount: PathBuf,
+        action: crate::api::dto::EnsureAction,
+    ) -> crate::api::dto::EnsureReport {
+        crate::api::dto::EnsureReport {
+            workspace: workspace.derived.workspace.name().clone(),
+            go_env: mount.join(".cowshed/cache/go/env"),
+            workspace_token: mount.join(crate::workspace_credentials::WORKSPACE_TOKEN_PATH),
+            port_block: workspace.metadata.grants.port_block,
+            mount,
+            action,
+        }
+    }
+
     async fn operation_identity(
         &self,
         grants: GrantSet,
@@ -1911,6 +1946,77 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         self.snapshot_named(&workspace).await
     }
 
+    async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceSnapshot> {
+        self.validate_binding().await?;
+        let workspaces = self.authoritative().await?;
+        let active_mounts = workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, workspace)| {
+                matches!(
+                    workspace.derived.mount_state,
+                    crate::storage::lifecycle::MountState::Mounted { .. }
+                )
+            })
+            .map(|(index, workspace)| {
+                self.layout
+                    .workspace_mount(workspace.derived.workspace.name())
+                    .map(|mount| (index, mount))
+                    .map_err(native_integrity_error)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let requested = path.clone();
+        let matching = crate::storage::lifecycle::dispatch_blocking(move || {
+            let requested = std::fs::canonicalize(&requested).map_err(|error| {
+                CowshedError::not_found(
+                    format!(
+                        "workspace path {} is not accessible: {error}",
+                        requested.display()
+                    ),
+                    "retry from inside an attached workspace",
+                )
+            })?;
+            let mut matching = Vec::new();
+            for (index, mount) in active_mounts {
+                let mount = std::fs::canonicalize(&mount).map_err(|error| {
+                    CowshedError::integrity(
+                        format!(
+                            "authoritatively mounted workspace path {} is not accessible: {error}",
+                            mount.display()
+                        ),
+                        "run cowshed doctor --json",
+                    )
+                })?;
+                if requested.starts_with(&mount) {
+                    matching.push(index);
+                }
+            }
+            Ok::<_, CowshedError>(matching)
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("workspace path task failed: {error}"))
+        })??;
+        match matching.as_slice() {
+            [index] => self.snapshot(&workspaces[*index]),
+            [] => Err(CowshedError::not_found(
+                format!(
+                    "{} is not contained in an active workspace mount for project {}",
+                    path.display(),
+                    self.descriptor.repo_id
+                ),
+                "retry from inside an attached workspace",
+            )),
+            _ => Err(CowshedError::conflict(
+                format!(
+                    "{} is contained in multiple active workspace mounts",
+                    path.display()
+                ),
+                "repair overlapping workspace mounts and retry",
+            )),
+        }
+    }
+
     async fn fork(
         &mut self,
         source: WorkspaceName,
@@ -1968,18 +2074,20 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             crate::storage::lifecycle::MountState::Mounted { .. }
         );
         self.ensure_supervisor(&workspace).await?;
-        Ok(crate::api::dto::EnsureReport {
-            workspace: workspace.clone(),
-            mount: self
-                .layout
-                .workspace_mount(&workspace)
-                .map_err(native_integrity_error)?,
-            action: if already {
+        let current = self.current(&workspace).await?;
+        let mount = self
+            .layout
+            .workspace_mount(&workspace)
+            .map_err(native_integrity_error)?;
+        Ok(self.ensure_report(
+            &current,
+            mount,
+            if already {
                 crate::api::dto::EnsureAction::AlreadyMounted
             } else {
                 crate::api::dto::EnsureAction::Attached
             },
-        })
+        ))
     }
 
     async fn attach(&mut self, workspace: WorkspaceName, options: AttachOptions) -> Result<()> {

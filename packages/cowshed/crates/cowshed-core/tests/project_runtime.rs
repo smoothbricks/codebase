@@ -48,6 +48,8 @@ enum Event {
 struct DurableWorkspace {
     name: WorkspaceName,
     incarnation: WorkspaceIncarnation,
+    mount: Option<PathBuf>,
+    attached: bool,
     lifecycle_revision: u64,
     topology_revision: u64,
     grants: GrantSet,
@@ -173,12 +175,17 @@ impl FakeHost {
                     WorkspaceRole::Workspace
                 },
                 image_format: ImageFormat::Asif,
-                mount: self
-                    .descriptor
-                    .store_root
-                    .join("mnt")
-                    .join(workspace.name.as_str()),
-                state: WorkspaceState::Attached,
+                mount: workspace.mount.clone().unwrap_or_else(|| {
+                    self.descriptor
+                        .store_root
+                        .join("mnt")
+                        .join(workspace.name.as_str())
+                }),
+                state: if workspace.attached {
+                    WorkspaceState::Attached
+                } else {
+                    WorkspaceState::Detached
+                },
                 branch: None,
                 base_commit: None,
                 created_at: None,
@@ -204,6 +211,8 @@ impl FakeHost {
             name,
             incarnation: incarnation(next),
             lifecycle_revision: 1,
+            mount: None,
+            attached: true,
             topology_revision: next,
             grants: GrantSet::closed_baseline(Some(
                 PortBlock::new(
@@ -275,6 +284,27 @@ impl ProjectRuntimeHost for FakeHost {
             .iter()
             .map(|workspace| self.snapshot(workspace))
             .collect())
+    }
+
+    async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceSnapshot> {
+        let matches = self
+            .state
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.attached)
+            .filter(|workspace| path.starts_with(&self.snapshot(workspace).info.mount))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [workspace] => Ok(self.snapshot(workspace)),
+            [] => Err(CowshedError::not_found(
+                "path is not inside an active workspace mount",
+                "retry from an attached workspace",
+            )),
+            _ => Err(CowshedError::conflict(
+                "path is inside multiple active workspace mounts",
+                "repair overlapping mounts",
+            )),
+        }
     }
 
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceSnapshot> {
@@ -368,19 +398,25 @@ impl ProjectRuntimeHost for FakeHost {
 
     async fn ensure(&mut self, workspace: WorkspaceName) -> Result<EnsureReport> {
         let current = self.workspace(&workspace)?;
+        let mount = self.snapshot(current).info.mount;
         Ok(EnsureReport {
             workspace,
-            mount: self.snapshot(current).info.mount,
+            go_env: mount.join(".cowshed/cache/go/env"),
+            workspace_token: mount.join(".cowshed/token"),
+            port_block: current.grants.port_block,
+            mount,
             action: EnsureAction::AlreadyMounted,
         })
     }
 
     async fn attach(&mut self, workspace: WorkspaceName, _options: AttachOptions) -> Result<()> {
-        self.workspace(&workspace).map(|_| ())
+        self.workspace_mut(&workspace)?.attached = true;
+        self.persist()
     }
 
     async fn detach(&mut self, workspace: WorkspaceName) -> Result<()> {
-        self.workspace(&workspace).map(|_| ())
+        self.workspace_mut(&workspace)?.attached = false;
+        self.persist()
     }
 
     async fn checkpoint(
@@ -1007,6 +1043,109 @@ async fn adopt_then_create_list_and_path_use_one_immutable_snapshot() {
             .ends_with("/task")
     );
     assert_eq!(listed.as_array().expect("array").len(), 2);
+}
+
+#[tokio::test]
+async fn workspace_at_uses_active_mount_facts_and_ensure_returns_authoritative_env_fields() {
+    let root = test_root();
+    let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
+    let adopted = adopt(&router, &repo).await;
+    let mount = PathBuf::from(adopted["info"]["mount"].as_str().expect("mount"));
+    let nested = mount.join("src/deep/module");
+
+    let resolved = route(
+        &router,
+        coordinator(repo.clone()),
+        "project.workspaceAt",
+        json!({ "repoId": repo, "path": nested }),
+    )
+    .await
+    .expect("nested path resolution");
+    assert_eq!(resolved["info"]["workspace"], "main");
+
+    let ensured = route(
+        &router,
+        coordinator(repo.clone()),
+        "workspace.ensure",
+        json!({ "repoId": repo, "workspace": "main" }),
+    )
+    .await
+    .expect("ensure");
+    assert_eq!(
+        ensured["goEnv"],
+        mount
+            .join(".cowshed/cache/go/env")
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(
+        ensured["workspaceToken"],
+        mount.join(".cowshed/token").to_string_lossy().as_ref()
+    );
+    assert_eq!(ensured["portBlock"], json!({"base": 49152, "size": 16}));
+
+    let marker_only = root.join("marker-only");
+    std::fs::create_dir_all(marker_only.join(".cowshed")).expect("marker directory");
+    std::fs::write(
+        marker_only.join(".cowshed/workspace.json"),
+        serde_json::to_vec(&resolved["info"]).expect("marker bytes"),
+    )
+    .expect("marker");
+    for rejected in [marker_only.join("child"), root.join("another-project")] {
+        let error = route(
+            &router,
+            coordinator(repo.clone()),
+            "project.workspaceAt",
+            json!({ "repoId": repo, "path": rejected }),
+        )
+        .await
+        .expect_err("non-mount path must not resolve");
+        assert_eq!(error.code, ErrorCode::NotFound);
+    }
+
+    route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.detach",
+        json!({ "repoId": repo, "workspace": "main" }),
+    )
+    .await
+    .expect("detach");
+    let error = route(
+        &router,
+        coordinator(repo.clone()),
+        "project.workspaceAt",
+        json!({ "repoId": repo, "path": mount.join("src") }),
+    )
+    .await
+    .expect_err("detached workspace must not resolve");
+    assert_eq!(error.code, ErrorCode::NotFound);
+}
+
+#[tokio::test]
+async fn workspace_at_rejects_ambiguous_nested_active_mounts() {
+    let root = test_root();
+    let (events, _receiver) = mpsc::unbounded_channel();
+    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
+    let overlap = root.join("overlap");
+    let mut outer = host.next_workspace(WorkspaceName::new("main").expect("main"));
+    outer.mount = Some(overlap.clone());
+    let mut inner = host.next_workspace(WorkspaceName::new("inner").expect("inner"));
+    inner.mount = Some(overlap.join("nested"));
+    host.state.workspaces = vec![outer, inner];
+    let runtime = ProjectRuntime::start(host).await.expect("runtime");
+    let router = runtime.router();
+    let repo = runtime.descriptor().repo_id.clone();
+
+    let error = route(
+        &router,
+        coordinator(repo.clone()),
+        "project.workspaceAt",
+        json!({ "repoId": repo, "path": overlap.join("nested/src") }),
+    )
+    .await
+    .expect_err("overlapping active mounts must be ambiguous");
+    assert_eq!(error.code, ErrorCode::Conflict);
 }
 
 #[tokio::test]

@@ -45,7 +45,7 @@ incarnation and the controller rejects it as stale before effects.
 Design rules: async (tokio), no global state, no interior config lookup — everything reachable from an explicit handle;
 all filesystem/mount state derived per call (01_storage.md).
 
-```rust
+````rust
 /// Explicit client for one authenticated, single-owner controller actor.
 pub struct Cowshed { /* sealed actor sender */ }
 impl Cowshed {
@@ -65,25 +65,41 @@ impl Project {
     pub async fn main(&self) -> Result<WorkspaceRef, CowshedError>;
     pub async fn workspace(&self, name: &str) -> Result<WorkspaceRef, CowshedError>;
     pub async fn list(&self) -> Result<Vec<WorkspaceRef>, CowshedError>;
+    /// Resolve only through authoritative metadata plus an exact active-mount containment match.
+    pub async fn workspace_at(&self, path: impl AsRef<Path>) -> Result<WorkspaceRef, CowshedError>;
 }
 
-/// Read-only view of one workspace: an immutable information/grant snapshot plus safe ensure/attach.
-/// Carries no execution, detach, lifecycle, maintenance, repository-mirror, or grant mutation authority.
-pub struct WorkspaceRef { /* detached WorkspaceInfo + GrantSet snapshot and sealed actor sender */ }
-impl WorkspaceRef {
-    pub fn name(&self) -> &WorkspaceName;
-    pub fn mount_path(&self) -> &Path;               // canonical, whether or not attached
-    pub fn info(&self) -> &WorkspaceInfo;            // captured snapshot; no RPC or copy
-    pub fn grants(&self) -> &GrantSet;               // captured snapshot; no RPC or copy
-    pub fn snapshot(&self) -> (&WorkspaceInfo, &GrantSet);
-    pub fn into_info(self) -> WorkspaceInfo;         // consuming, copy-free list projection
-    pub fn into_snapshot(self) -> (WorkspaceInfo, GrantSet);
-    pub async fn refresh_info(&self) -> Result<WorkspaceInfo, CowshedError>;
-    pub async fn refresh_grants(&self) -> Result<GrantSet, CowshedError>;
-    pub async fn ensure(&self) -> Result<EnsureReport, CowshedError>;
-    pub async fn attach(&self, opts: AttachOptions) -> Result<(), CowshedError>;
+`Project::workspace_at` is a coordinator-channel RPC and a host seam, not local marker discovery. Each call re-reads
+storage, exact detached metadata, and kernel mount facts, canonicalizes the input, and succeeds only when exactly one
+active mount owned by this project contains it. Nested cwd paths resolve; unmounted, detached, ambiguous,
+cross-project, inaccessible, and marker-only paths return a typed error without granting a workspace capability.
+
+```rust
+pub struct EnsureReport {
+    pub workspace: WorkspaceName,
+    pub mount: PathBuf,
+    pub action: EnsureAction,
+    pub go_env: PathBuf,                 // mounted .cowshed/cache/go/env
+    pub workspace_token: PathBuf,        // mounted controller-minted token; caller reads its value
+    pub port_block: Option<PortBlock>,   // Some only when authoritative platform metadata is macOS
 }
-```
+````
+
+The report carries typed source facts rather than shell text. `--envrc` emits exactly `GOENV`,
+`COWSHED_WORKSPACE_TOKEN`, and macOS-only `COWSHED_PORT_BASE`; it does not infer any value from CLI path parsing.
+
+/// Read-only view of one workspace: an immutable information/grant snapshot plus safe ensure/attach. /// Carries no
+execution, detach, lifecycle, maintenance, repository-mirror, or grant mutation authority. pub struct WorkspaceRef { /*
+detached WorkspaceInfo + GrantSet snapshot and sealed actor sender */ } impl WorkspaceRef { pub fn name(&self) ->
+&WorkspaceName; pub fn mount_path(&self) -> &Path; // canonical, whether or not attached pub fn info(&self) ->
+&WorkspaceInfo; // captured snapshot; no RPC or copy pub fn grants(&self) -> &GrantSet; // captured snapshot; no RPC or
+copy pub fn snapshot(&self) -> (&WorkspaceInfo, &GrantSet); pub fn into_info(self) -> WorkspaceInfo; // consuming,
+copy-free list projection pub fn into_snapshot(self) -> (WorkspaceInfo, GrantSet); pub async fn refresh_info(&self) ->
+Result<WorkspaceInfo, CowshedError>; pub async fn refresh_grants(&self) -> Result<GrantSet, CowshedError>; pub async fn
+ensure(&self) -> Result<EnsureReport, CowshedError>; pub async fn attach(&self, opts: AttachOptions) -> Result<(),
+CowshedError>; }
+
+````
 
 ### Exec and grants
 
@@ -344,7 +360,7 @@ pub struct SandboxSpec {
     pub fn seatbelt_profile(&self) -> &str;
     pub fn wrap(&self, argv: &[String]) -> Vec<String>;  // sandbox-exec -f … /usr/bin/env …
 }
-```
+````
 
 `GrantDelta::expected_revision` is the compare-and-swap hook: when set, `grant`/`revoke` refuse
 (`CowshedError::Conflict`) if the grant file has moved on since the caller last read it, so two coordinators cannot

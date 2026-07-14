@@ -141,6 +141,10 @@ For every mounted attachment:
   nothing about where the user works.
 - Mountpoint directories are created before attach and removed by `cowshed gc`; an empty mountpoint dir is the defined
   "detached" state, and the underlying dir holds a stub `.envrc` used for self-healing (see 02_workspaces.md).
+- Cwd resolution is granted only when the canonical input path is contained in exactly one currently mounted,
+  repository-owned attachment whose image metadata and kernel mount facts agree. An in-image marker, an empty
+  mountpoint, a detached image, a mount owned by another project, or overlapping active mounts never grants a
+  `WorkspaceRef`.
 - Personal workspaces may opt into Finder visibility with `--browse` at attach time.
 
 ## Dedicated volumes
