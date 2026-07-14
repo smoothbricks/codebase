@@ -365,6 +365,7 @@ type fileTransformer struct {
 	staticSpanNameIDs  map[*shimast.CallExpression]globalVocabularyID
 	physicalLogCalls   map[*shimast.CallExpression]callMessagePhysicalLayout
 	currentLogLocalIDs map[*shimast.CallExpression]uint16
+	directTagStates    map[*shimast.Node]bool
 	vocabulary         *programVocabularyCollector
 	vocabularyOrdinals map[globalVocabularyID]int
 	vocabularySize     int

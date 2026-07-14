@@ -585,6 +585,75 @@ func literalLogMessage(node *shimast.Node) (string, bool) {
 	}
 }
 
+// tagCapabilityFullyInlined proves that every direct access to the operation's
+// context tag writer is the root of a checker-approved statement chain visited
+// by collectTagInlines. Any mismatch retains the runtime capability.
+func (t *fileTransformer) tagCapabilityFullyInlined(fn *shimast.Node) bool {
+	if t.checker == nil {
+		return false
+	}
+	params, body, _, ok := functionParts(fn)
+	if !ok || params == nil || len(params.Nodes) == 0 || body == nil {
+		return false
+	}
+	first := params.Nodes[0]
+	if first.Kind != shimast.KindParameter || first.Name() == nil || first.Name().Kind != shimast.KindIdentifier {
+		return false
+	}
+	ctxName := shimast.NodeText(first.Name())
+	if ctxName == "" {
+		return false
+	}
+
+	inlineableRoots := map[*shimast.Node]struct{}{}
+	forEachStatementCall(body, func(_ *shimast.NodeList, _ int, call *shimast.CallExpression, isReturn bool) {
+		if isReturn {
+			return
+		}
+		ctxExpr, _, _, found := t.findTagChain(call)
+		if found && ctxExpr.Kind == shimast.KindIdentifier && shimast.NodeText(ctxExpr) == ctxName {
+			inlineableRoots[ctxExpr] = struct{}{}
+		}
+	})
+
+	valid := true
+	foundTag := false
+	var visit func(node *shimast.Node)
+	visit = func(node *shimast.Node) {
+		if node == nil || !valid {
+			return
+		}
+		if node.Kind == shimast.KindIdentifier && shimast.NodeText(node) == ctxName {
+			access := node.Parent
+			if access != nil && access.Kind == shimast.KindPropertyAccessExpression {
+				property := access.AsPropertyAccessExpression()
+				if property.Expression == node && shimast.NodeText(property.Name()) == "tag" {
+					foundTag = true
+					if _, inlineable := inlineableRoots[node]; !inlineable {
+						valid = false
+						return
+					}
+				}
+			}
+		}
+		node.ForEachChild(func(child *shimast.Node) bool {
+			visit(child)
+			return !valid
+		})
+	}
+	visit(body)
+	if !valid || !foundTag {
+		return false
+	}
+	if t.directTagStates == nil {
+		t.directTagStates = map[*shimast.Node]bool{}
+	}
+	for root := range inlineableRoots {
+		t.directTagStates[root] = true
+	}
+	return true
+}
+
 // analyzeOpCompileMetadata derives runtime execution hints and conservative
 // definitely-written user columns. Static log vocabulary remains whole-program
 // metadata collected independently of Op nesting.
@@ -601,6 +670,9 @@ func (t *fileTransformer) analyzeOpCompileMetadata(fn *shimast.Node) opCompileAn
 	analysis := opCompileAnalysis{runtimeHint: runtimeHint, localMessageDictionary: localMessageDictionary}
 	if runtimeHint&runtimeHintAnalyzed != 0 {
 		analysis.eagerColumns = t.analyzeEagerColumns(fn)
+		if runtimeHint&runtimeHintTag != 0 && t.tagCapabilityFullyInlined(fn) {
+			analysis.runtimeHint &^= runtimeHintTag
+		}
 	}
 	return analysis
 }

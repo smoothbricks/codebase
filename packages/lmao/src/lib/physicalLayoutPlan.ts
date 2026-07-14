@@ -167,7 +167,7 @@ export interface PhysicalLayoutPlan<T extends LogSchema = LogSchema, Ctx extends
   readonly SpanContextClass: SpanContextClass<Ctx>;
   readonly SpanBufferClass: SpanBufferConstructor<T>;
   readonly SpanLoggerClass: SpanLoggerConstructor<T>;
-  readonly TagWriterClass: TagWriterConstructor<T>;
+  readonly TagWriterClass: TagWriterConstructor<T> | undefined;
   readonly ResultWriterClass: ResultWriterConstructor;
   readonly clock: PhysicalClock;
   readonly appenders: PhysicalAppenders;
@@ -456,7 +456,6 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
     eagerColumns.names,
     enumLookup,
   );
-  const TagWriterClass = getTagWriterClass(schema, eagerColumns.names, enumLookup);
   const ResultWriterClass = getResultWriterClass(
     schema,
     messageLayoutFamily,
@@ -469,8 +468,10 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
     : RUNTIME_HINT_FULL_CAPABILITIES;
   const needsLogger = (capabilities & (RUNTIME_HINT_LOG | RUNTIME_HINT_FF | RUNTIME_HINT_SCOPE)) !== 0;
   const needsTag = (capabilities & RUNTIME_HINT_TAG) !== 0;
+  const TagWriterClass = needsTag ? getTagWriterClass(schema, eagerColumns.names, enumLookup) : undefined;
   const newSpanLogger = needsLogger ? (state: WriterState): SpanLoggerImpl<T> => new SpanLoggerClass(state) : undefined;
-  const newTagWriter = needsTag ? (state: WriterState): TagWriter<T> => new TagWriterClass(state) : undefined;
+  const newTagWriter =
+    TagWriterClass === undefined ? undefined : (state: WriterState): TagWriter<T> => new TagWriterClass(state);
   const wasmLayout = createWasmLayoutTemplate(schema, messageLayoutFamily, messagePhysicalLayout, eagerColumns);
 
   return Object.freeze({
