@@ -9,6 +9,8 @@
 
 import { intern, PreEncodedEntry } from '@smoothbricks/arrow-builder';
 import { Op as OpClass } from '../op.js';
+import { resolveEagerColumns } from '../physicalLayoutPlan.js';
+import { runtimeHintMessageLayoutFamily, runtimeHintMessagePhysicalLayout } from '../runtimeHint.js';
 import { getSpanBufferClass } from '../spanBuffer.js';
 import type { OpGroup, OpGroupOps } from './opGroupTypes.js';
 import type { Op, OpCompileMetadata, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
@@ -63,7 +65,6 @@ const DEFAULT_COMPILE_METADATA: OpCompileMetadata = Object.freeze({
 
 const EMPTY_EAGER_COLUMNS: readonly string[] = Object.freeze([]);
 const EMPTY_LOCAL_MESSAGE_DICTIONARY: readonly number[] = Object.freeze([]);
-
 
 function normalizeCompileMetadata(compileMetadata?: OpCompileMetadata): OpCompileMetadata {
   if (compileMetadata === undefined) return DEFAULT_COMPILE_METADATA;
@@ -212,7 +213,7 @@ export function createDefineOp<Ctx extends OpContext>(
   metadata?: Partial<OpMetadata>,
   compileMetadata?: OpCompileMetadata,
 ) => Op<Ctx, Args, S, E> {
-  // Why get class from schema: Class has static schema + stats shared by all instances
+  // Why get the default class here: matching untransformed Ops reuse one constructor and shared stats.
   const SpanBufferClass = getSpanBufferClass(factoryConfig.logSchema);
 
   return function defineOpImpl<Args extends unknown[], S, E>(
@@ -222,6 +223,19 @@ export function createDefineOp<Ctx extends OpContext>(
     compileMetadata?: OpCompileMetadata,
   ): Op<Ctx, Args, S, E> {
     const normalizedCompileMetadata = normalizeCompileMetadata(compileMetadata);
+    const eagerColumns = resolveEagerColumns(
+      factoryConfig.logSchema,
+      normalizedCompileMetadata.eagerColumns ?? EMPTY_EAGER_COLUMNS,
+    );
+    const messageLayoutFamily = runtimeHintMessageLayoutFamily(normalizedCompileMetadata.runtimeHint);
+    const messagePhysicalLayout = runtimeHintMessagePhysicalLayout(normalizedCompileMetadata.runtimeHint);
+    // Matching metadata keeps the factory constructor; only a different physical layout materializes another class.
+    const SelectedSpanBufferClass =
+      SpanBufferClass.messageLayoutFamily === messageLayoutFamily &&
+      SpanBufferClass.messagePhysicalLayout === messagePhysicalLayout &&
+      SpanBufferClass.eagerColumns.key === eagerColumns.key
+        ? SpanBufferClass
+        : getSpanBufferClass(factoryConfig.logSchema, messageLayoutFamily, messagePhysicalLayout, eagerColumns);
 
     // When transformer is not installed, extract metadata from stack trace
     // This provides useful file/line info for debugging even without build-time injection
@@ -240,11 +254,11 @@ export function createDefineOp<Ctx extends OpContext>(
     // - Sets _opMetadata and _callsiteMetadata
     // - Writes span-start/span-ok/span-err entries
     // - Handles exceptions with span-exception
-    // Why SpanBufferClass: All ops from same defineOpContext share this class for stats coordination
+    // Why SelectedSpanBufferClass: Ops with the same physical layout share one constructor and stats object.
     // Base Ops have no remap descriptor; mapped OpGroups bind one during startup cloning.
     return new OpClass(
       finalMetadata,
-      SpanBufferClass,
+      SelectedSpanBufferClass,
       fn,
       undefined,
       factoryConfig.opContextBinding,
