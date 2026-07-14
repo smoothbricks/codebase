@@ -564,6 +564,7 @@ pub enum ControlAction {
     Bootstrap,
     Bootout,
     Kickstart,
+    Print,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -600,6 +601,16 @@ impl ControlPlan {
             arguments: vec![
                 OsString::from("kickstart"),
                 OsString::from("-k"),
+                OsString::from(service_target(uid, spec.label())),
+            ],
+        }
+    }
+
+    pub fn print(uid: u32, spec: &LaunchAgentSpec) -> Self {
+        Self {
+            action: ControlAction::Print,
+            arguments: vec![
+                OsString::from("print"),
                 OsString::from(service_target(uid, spec.label())),
             ],
         }
@@ -682,6 +693,19 @@ pub struct ControlOutcome {
     pub stderr: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LaunchdServiceStatus {
+    Loaded {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+    NotLoaded {
+        exit_code: i32,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+}
+
 #[derive(Debug)]
 pub enum ControlExecutionError {
     Unavailable {
@@ -694,6 +718,9 @@ pub enum ControlExecutionError {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     },
+    InvalidStatusPlan {
+        action: ControlAction,
+    },
 }
 
 impl fmt::Display for ControlExecutionError {
@@ -705,6 +732,12 @@ impl fmt::Display for ControlExecutionError {
             Self::Rejected { action, status, .. } => {
                 write!(formatter, "launchctl {action:?} failed with {status:?}")
             }
+            Self::InvalidStatusPlan { action } => {
+                write!(
+                    formatter,
+                    "launchctl {action:?} is not a service status plan"
+                )
+            }
         }
     }
 }
@@ -713,7 +746,7 @@ impl Error for ControlExecutionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Unavailable { source, .. } => Some(source),
-            Self::Rejected { .. } => None,
+            Self::Rejected { .. } | Self::InvalidStatusPlan { .. } => None,
         }
     }
 }
@@ -888,6 +921,44 @@ impl<F, C: LaunchctlCommand> LaunchdExecutor<F, C> {
             status => Err(ControlExecutionError::Rejected {
                 action: plan.action(),
                 status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            }),
+        }
+    }
+
+    /// Executes a `launchctl print` plan and classifies the idempotent loaded
+    /// state. A normal non-zero exit means the service is absent; failure to
+    /// spawn or signal termination remains an operational error.
+    pub fn execute_status(
+        &mut self,
+        plan: &ControlPlan,
+    ) -> Result<LaunchdServiceStatus, ControlExecutionError> {
+        if plan.action() != ControlAction::Print {
+            return Err(ControlExecutionError::InvalidStatusPlan {
+                action: plan.action(),
+            });
+        }
+        let output = self
+            .command
+            .run(plan.executable(), plan.arguments())
+            .map_err(|source| ControlExecutionError::Unavailable {
+                action: ControlAction::Print,
+                source,
+            })?;
+        match output.status {
+            CommandStatus::Success => Ok(LaunchdServiceStatus::Loaded {
+                stdout: output.stdout,
+                stderr: output.stderr,
+            }),
+            CommandStatus::ExitCode(exit_code) => Ok(LaunchdServiceStatus::NotLoaded {
+                exit_code,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            }),
+            CommandStatus::Terminated => Err(ControlExecutionError::Rejected {
+                action: ControlAction::Print,
+                status: CommandStatus::Terminated,
                 stdout: output.stdout,
                 stderr: output.stderr,
             }),
