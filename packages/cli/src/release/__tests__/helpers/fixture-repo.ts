@@ -82,9 +82,14 @@ export async function writeBuildablePackage(
   );
 }
 
-export async function git(root: string, args: string[], env?: Record<string, string>): Promise<void> {
-  const result = await gitResult(root, args, env);
-  if (result.exitCode !== 0) {
+export async function git(
+  root: string,
+  args: string[],
+  env?: Record<string, string>,
+  timeoutMs = GIT_TIMEOUT_MS,
+): Promise<void> {
+  const result = await gitResult(root, args, env, timeoutMs);
+  if (result.timedOut || result.exitCode !== 0) {
     throw new Error(gitErrorMessage(root, args, result));
   }
 }
@@ -101,9 +106,15 @@ export async function gitSucceeds(root: string, args: string[]): Promise<boolean
   return (await gitResult(root, args)).exitCode === 0;
 }
 
-async function gitResult(root: string, args: string[], env?: Record<string, string>): Promise<GitResult> {
+async function gitResult(
+  root: string,
+  args: string[],
+  env?: Record<string, string>,
+  timeoutMs = GIT_TIMEOUT_MS,
+): Promise<GitResult> {
   const proc = Bun.spawn(['git', ...args], {
     cwd: root,
+    detached: true,
     env: { ...process.env, ...GIT_FIXTURE_ENV, ...env },
     stdout: 'pipe',
     stderr: 'pipe',
@@ -111,15 +122,23 @@ async function gitResult(root: string, args: string[], env?: Record<string, stri
   let timedOut = false;
   const timeout = setTimeout(() => {
     timedOut = true;
-    proc.kill();
-  }, GIT_TIMEOUT_MS);
+    try {
+      // `git` may exit after spawning a transport or hook which still owns its
+      // pipes. Killing the detached process group closes every inherited pipe.
+      process.kill(-proc.pid, 'SIGKILL');
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) {
+        proc.kill('SIGKILL');
+      }
+    }
+  }, timeoutMs);
   try {
     const [exitCode, stdout, stderr] = await Promise.all([
       proc.exited,
       streamBytes(proc.stdout),
       streamBytes(proc.stderr),
     ]);
-    return { exitCode, stdout, stderr, timedOut };
+    return { exitCode, stdout, stderr, timedOut, timeoutMs };
   } finally {
     clearTimeout(timeout);
   }
@@ -151,12 +170,13 @@ interface GitResult {
   stdout: Uint8Array;
   stderr: Uint8Array;
   timedOut: boolean;
+  timeoutMs: number;
 }
 
 function gitErrorMessage(root: string, args: string[], result: GitResult): string {
   const stderr = new TextDecoder().decode(result.stderr).trim();
   const timeoutText = result.timedOut
-    ? ` timed out after ${GIT_TIMEOUT_MS}ms`
+    ? ` timed out after ${result.timeoutMs}ms`
     : ` failed with exit code ${result.exitCode}`;
   return [`git ${args.join(' ')}${timeoutText}`, `cwd: ${root}`, stderr].filter(Boolean).join('\n');
 }
