@@ -12,6 +12,7 @@ pub mod runtime;
 pub mod sandbox;
 pub mod secrets;
 pub mod storage;
+pub mod workspace_credentials;
 
 pub use error::{CowshedError, ErrorCode, Result};
 
