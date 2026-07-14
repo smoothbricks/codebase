@@ -14,6 +14,11 @@ pub const RETE_HEADER_SIZE: u32 = 16;
 pub const STATE_FORMAT_VERSION: u8 = 2;
 pub const EMPTY_KEY: u32 = u32::MAX;
 pub const TOMBSTONE: u32 = u32::MAX - 1;
+/// Empty and tombstone markers for the collision-free derived-fact identity
+/// lane. Valid identities only use the low 48 bits (`fact_idx:u16`, `key:u32`),
+/// so both sentinels are outside the valid domain and cannot alias a fact.
+pub const DERIVED_FACT_EMPTY_IDENTITY: u64 = u64::MAX;
+pub const DERIVED_FACT_TOMBSTONE_IDENTITY: u64 = u64::MAX - 1;
 pub const BITMAP_SERIALIZED_LEN_BYTES: u32 = 4;
 pub const BITMAP_BYTES_PER_CAPACITY: u32 = 8;
 pub const BITMAP_BASE_BYTES: u32 = 256;

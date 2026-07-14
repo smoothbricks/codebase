@@ -5,7 +5,8 @@
 //! mirrors.
 
 use columine_types::types::{
-    EMPTY_KEY, ErrorCode, PROGRAM_HASH_PREFIX, SLOT_META_SIZE, STATE_HEADER_SIZE, STATE_MAGIC,
+    DERIVED_FACT_EMPTY_IDENTITY, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode,
+    PROGRAM_HASH_PREFIX, SLOT_META_SIZE, STATE_HEADER_SIZE, STATE_MAGIC, StateHeaderOffset,
     StructFieldType, align8, hash_key,
 };
 use columine_vm::state_init::{
@@ -99,6 +100,27 @@ fn build_struct_map_program(cap_lo: u8, cap_hi: u8, field_types: &[u8]) -> Vec<u
     content[19] = nf;
     content[20..20 + field_types.len()].copy_from_slice(field_types);
     content[20 + field_types.len()] = 0x00; // HALT
+    prog
+}
+
+/// A hash-map slot before a condition-tree/derived-facts slot, so growing the
+/// first slot proves the 16-byte derived table relocates without lane drift.
+fn build_hashmap_and_condition_tree_program(derived_capacity: u16) -> [u8; 64] {
+    let mut prog = [0u8; 64];
+    let content = &mut prog[HASH_PREFIX..];
+    content[0..4].copy_from_slice(&0x3145_5841u32.to_le_bytes());
+    content[4] = 1;
+    content[6] = 2;
+    content[10..12].copy_from_slice(&11u16.to_le_bytes());
+    content[14..19].copy_from_slice(&[0x10, 0, 0x00, 8, 0]);
+    content[19..24].copy_from_slice(&[
+        0x10,
+        1,
+        0x04,
+        derived_capacity as u8,
+        (derived_capacity >> 8) as u8,
+    ]);
+    content[24] = 0;
     prog
 }
 
@@ -266,6 +288,42 @@ fn calculate_state_size_aggregate_count() {
     expected += 8; // COUNT aggregate is 8 bytes, not 16
     expected = align8(expected);
     assert_eq!(size, expected);
+}
+
+#[test]
+fn condition_tree_derived_facts_use_sixteen_bytes_per_cell() {
+    let capacity = 4u32;
+    let prog = build_single_slot_program(0x04, capacity as u8, 0);
+    let expected = align8(STATE_HEADER_SIZE + SLOT_META_SIZE + 8) + capacity * 16;
+    assert_eq!(calculate_state_size(&prog), expected);
+
+    let mut state = vec![0u8; expected as usize];
+    init_state(&mut state, &prog).expect("init must succeed");
+
+    let derived_offset = bytes::read_u32(&state, StateHeaderOffset::DERIVED_FACTS_OFFSET);
+    assert_eq!(derived_offset % 8, 0);
+    assert_eq!(
+        u32::from(bytes::read_u16(
+            &state,
+            StateHeaderOffset::DERIVED_FACTS_CAPACITY,
+        )),
+        capacity,
+    );
+    for pos in 0..capacity {
+        assert_eq!(
+            bytes::read_u64(&state, derived_offset + pos * 8),
+            DERIVED_FACT_EMPTY_IDENTITY,
+        );
+        assert_eq!(
+            bytes::read_u32(&state, derived_offset + capacity * 8 + pos * 4),
+            0,
+        );
+        assert_eq!(
+            bytes::read_u32(&state, derived_offset + capacity * 12 + pos * 4),
+            0,
+        );
+    }
+    assert_ne!(DERIVED_FACT_EMPTY_IDENTITY, DERIVED_FACT_TOMBSTONE_IDENTITY,);
 }
 
 // ---------------------------------------------------------------------------
@@ -488,6 +546,51 @@ fn grow_state_hashmap_preserves_entries_and_doubles_cap() {
         assert_eq!(map_get(&grown, new_offset, new_cap, i), Some(i * 10));
     }
     assert_eq!(map_get(&grown, new_offset, new_cap, 100), None);
+}
+
+#[test]
+fn grow_state_relocates_full_derived_fact_cells_without_lane_drift() {
+    let capacity = 4u32;
+    let prog = build_hashmap_and_condition_tree_program(capacity as u16);
+    let size = calculate_state_size(&prog);
+    let mut state = vec![0u8; size as usize];
+    init_state(&mut state, &prog).expect("init must succeed");
+
+    let old_derived = bytes::read_u32(&state, StateHeaderOffset::DERIVED_FACTS_OFFSET);
+    let identity_a = (3u64 << 32) | 7;
+    let identity_b = (9u64 << 32) | 11;
+    bytes::write_u64(&mut state, old_derived + 8, identity_a);
+    bytes::write_u64(&mut state, old_derived + 24, identity_b);
+    bytes::write_u32(&mut state, old_derived + capacity * 8 + 4, 0x1122_3344);
+    bytes::write_u32(&mut state, old_derived + capacity * 8 + 12, 0x99aa_bbcc);
+    bytes::write_u32(&mut state, old_derived + capacity * 12 + 4, 0x5566_7788);
+    bytes::write_u32(&mut state, old_derived + capacity * 12 + 12, 0xddee_ff00);
+
+    let grown_size = calculate_grown_state_size(&state, 0);
+    let mut grown = vec![0u8; grown_size as usize];
+    grow_state(&state, &mut grown, 0).expect("grow must succeed");
+
+    let new_derived = bytes::read_u32(&grown, StateHeaderOffset::DERIVED_FACTS_OFFSET);
+    assert_ne!(new_derived, old_derived);
+    assert_eq!(new_derived % 8, 0);
+    assert_eq!(bytes::read_u64(&grown, new_derived + 8), identity_a);
+    assert_eq!(bytes::read_u64(&grown, new_derived + 24), identity_b);
+    assert_eq!(
+        bytes::read_u32(&grown, new_derived + capacity * 8 + 4),
+        0x1122_3344,
+    );
+    assert_eq!(
+        bytes::read_u32(&grown, new_derived + capacity * 8 + 12),
+        0x99aa_bbcc,
+    );
+    assert_eq!(
+        bytes::read_u32(&grown, new_derived + capacity * 12 + 4),
+        0x5566_7788,
+    );
+    assert_eq!(
+        bytes::read_u32(&grown, new_derived + capacity * 12 + 12),
+        0xddee_ff00,
+    );
 }
 
 #[test]
