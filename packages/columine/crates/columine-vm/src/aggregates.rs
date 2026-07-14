@@ -147,7 +147,19 @@ pub struct TypeMask<'a> {
     pub id: u32,
 }
 
-// ZIG-PARITY: min/max ties return the SECOND operand (Zig @min/@max as probed; affects ±0 selection); decide at sweep: adopt as the FP-determinism profile or normalize — digest-bearing.
+// WHY tie-returns-SECOND-operand is the profile (deliberate, digest-bearing):
+// probed Zig @min/@max semantics, adopted as the FP-determinism profile per
+// specs/vo/01-canonical-encoding.md — ±0 selection order is observable in
+// digests, and changing it would silently re-digest every archived state
+// for zero functional gain. NaN yields the other operand (min/max skip NaN).
+//
+// Maintenance-algebra note: min/max are the SUPPORT-SCAN class —
+// NOT group-invertible; a retraction that removes the
+// current extreme cannot be undone arithmetically and forces a support
+// re-scan (or a multiset/heap support structure). SUM and COUNT are the
+// group class (exactly maintainable under ±weights). Any future TREAT/delta
+// maintenance layer builds on exactly this split; these kernels are the
+// batch-fold form of the same per-aggregate algebra.
 /// Zig `@min` as probed (module docs): NaN yields the other operand, a tie
 /// yields the SECOND operand. `f64::min` does not pin the tie order.
 #[inline]
@@ -379,10 +391,11 @@ pub fn reduce_col_f64(
         };
     }
 
-    // ZIG-PARITY: the scalar predicated min/max accumulator is NaN-sticky (plain `<`/`>`, unlike the vector path's NaN-skipping @min/@max); intended fix: one NaN policy for both paths.
-    // Scalar path (aggregates.zig:206-225). NOTE the Zig scalar min/max use
-    // plain `<`/`>` comparisons, NOT `@min`/`@max`: a NaN accumulator sticks
-    // (`vals[i] < NaN` is false) — preserved bug-for-bug.
+    // Scalar path (aggregates.zig:206-225), unified post-parity on the
+    // vector path's NaN policy: min/max via min_zig/max_zig (NaN yields the
+    // other operand), so ONE NaN convention holds everywhere — that
+    // uniformity is load-bearing for any future delta-maintenance layer,
+    // where a fold must be reproducible by a support re-scan
     let mut acc = current;
     for (i, &v) in vals.iter().enumerate() {
         if let Some(m) = type_mask
@@ -398,14 +411,10 @@ pub fn reduce_col_f64(
         match kind {
             AggKind::Sum => acc += v,
             AggKind::Min => {
-                if v < acc {
-                    acc = v;
-                }
+                acc = min_zig(acc, v);
             }
             AggKind::Max => {
-                if v > acc {
-                    acc = v;
-                }
+                acc = max_zig(acc, v);
             }
         }
     }
@@ -466,16 +475,8 @@ pub fn reduce_col_i64(
         }
         match kind {
             AggKind::Sum => acc = acc.wrapping_add(v),
-            AggKind::Min => {
-                if v < acc {
-                    acc = v;
-                }
-            }
-            AggKind::Max => {
-                if v > acc {
-                    acc = v;
-                }
-            }
+            AggKind::Min => acc = acc.min(v),
+            AggKind::Max => acc = acc.max(v),
         }
     }
     acc

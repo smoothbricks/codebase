@@ -62,9 +62,9 @@ pub const EVICTION_ENTRY_SIZE: u32 = 16;
 /// state_init.zig:91 — arena header is `[arena_capacity:u32][arena_used:u32]`.
 pub const ARENA_HEADER_SIZE: u32 = 8;
 
-// ZIG-PARITY: state_init and types.zig carry drifted duplicate layout helpers (arena cap*64 vs cap*4; padded vs unpadded rows); intended fix: one authoritative helper set, delete the drift.
 /// state_init.zig:94-96 `arenaInitialCapacity` — 64 bytes per hash entry.
-/// (types.zig's copy returns `capacity * 4`; see the module header.)
+/// The one authoritative helper set lives HERE (the deleted Zig carried a
+/// drifted types.zig twin — cap*4, unpadded rows — deleted post-parity).
 pub const fn arena_initial_capacity_64(hash_capacity: u32) -> u32 {
     hash_capacity * 64
 }
@@ -874,15 +874,14 @@ pub fn init_state(state: &mut [u8], program: &[u8]) -> Result<(), ErrorCode> {
     Ok(())
 }
 
-// ZIG-PARITY: reset leaves stale HASHMAP value bytes (init relies on zeroed allocation, reset gets a dirty buffer); intended fix: reset zeroes value regions explicitly.
 /// state_init.zig:917-924 `vm_reset_state` — re-initialize in place.
 ///
-/// Caveat carried over from Zig: init never writes a HASHMAP's values
-/// side-array (the zeroed-at-allocation buffer is relied on), so reset on a
-/// dirty buffer leaves stale value bytes behind. They are unobservable
-/// through lookups because every key is back to EMPTY_KEY; the reset
-/// property test pins this exact contract.
+/// The buffer is zeroed first so reset restores the exact fresh-allocation
+/// contract: init never writes a HASHMAP's values side-array (it relies on
+/// zeroed memory), and the deleted Zig's reset left stale value bytes behind
+/// on a dirty buffer — unobservable through lookups, but a byte-level lie.
 pub fn reset_state(state: &mut [u8], program: &[u8]) -> Result<(), ErrorCode> {
+    state.fill(0);
     init_state(state, program)
 }
 
