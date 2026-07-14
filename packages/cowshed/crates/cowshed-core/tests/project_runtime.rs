@@ -7,11 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::dto::{
-    AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg,
-    CreateOptions, DoctorReport, EnsureAction, EnsureReport, Finding, FindingSeverity, GcOptions,
-    GcReport, GitOid, GrantDelta, GrantSet, ImageFormat, JobId, JobInfo, LandOptions, LandReport,
-    MirrorInfo, PortBlock, PushOptions, PushReport, RebaseOptions, RemoveOptions, WorkspaceInfo,
-    WorkspaceState,
+    AdoptOptions, AttachOptions, CheckpointInfo, CheckpointOptions, CheckpointQuota,
+    CheckpointResult, CommandArg, CreateOptions, DoctorReport, EnsureAction, EnsureReport, Finding,
+    FindingSeverity, GcOptions, GcReport, GitOid, GrantDelta, GrantSet, ImageFormat, JobId, JobInfo,
+    LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions, PushReport, RebaseOptions,
+    RemoveOptions, WorkspaceInfo, WorkspaceState,
 };
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle};
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
@@ -51,6 +51,7 @@ struct DurableWorkspace {
     lifecycle_revision: u64,
     topology_revision: u64,
     grants: GrantSet,
+    checkpoints: Vec<CheckpointInfo>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -181,7 +182,7 @@ impl FakeHost {
                 branch: None,
                 base_commit: None,
                 created_at: None,
-                checkpoints: Vec::new(),
+                checkpoints: workspace.checkpoints.clone(),
                 snapshot_stale: false,
             },
             grants: workspace.grants.clone(),
@@ -212,6 +213,7 @@ impl FakeHost {
                 .expect("test block"),
             ))
             .expect("test grants"),
+            checkpoints: Vec::new(),
         }
     }
 
@@ -401,9 +403,29 @@ impl ProjectRuntimeHost for FakeHost {
                 "refresh the worker",
             ));
         }
-        Ok(CheckpointResult {
-            label: options.label.unwrap_or_else(|| "checkpoint-1".into()),
-        })
+        let explicitly_labeled = options.label.is_some();
+        let label = options
+            .label
+            .unwrap_or_else(|| format!("checkpoint-{}", current.lifecycle_revision + 1));
+        if current
+            .checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.label == label)
+        {
+            return Err(CowshedError::conflict(
+                "checkpoint label already exists",
+                "choose another label",
+            ));
+        }
+        let current = self.workspace_mut(&workspace)?;
+        current.lifecycle_revision += 1;
+        current.checkpoints.push(CheckpointInfo {
+            label: label.clone(),
+            revision: current.lifecycle_revision,
+            pinned: options.keep || explicitly_labeled,
+        });
+        self.persist()?;
+        Ok(CheckpointResult { label })
     }
 
     async fn restore(&mut self, workspace: WorkspaceName, _label: String) -> Result<()> {
@@ -951,6 +973,64 @@ async fn adopt_then_create_list_and_path_use_one_immutable_snapshot() {
             .ends_with("/task")
     );
     assert_eq!(listed.as_array().expect("array").len(), 2);
+}
+
+#[tokio::test]
+async fn labeled_checkpoint_is_pinned_and_projected_without_mount_inspection() {
+    let root = test_root();
+    let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
+    adopt(&router, &repo).await;
+    let workspace = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.create",
+        json!({ "repoId": repo, "workspace": "retry", "options": CreateOptions::default() }),
+    )
+    .await
+    .expect("create");
+    let incarnation: WorkspaceIncarnation =
+        serde_json::from_value(workspace["info"]["workspaceIncarnation"].clone())
+            .expect("incarnation");
+    let worker = ConnectionAuthority::Worker {
+        repo_id: repo.clone(),
+        workspace: WorkspaceName::new("retry").expect("name"),
+        workspace_incarnation: incarnation.clone(),
+    };
+    let checkpoint = route(
+        &router,
+        worker,
+        "worker.checkpoint",
+        json!({
+            "repoId": repo,
+            "workspace": "retry",
+            "workspaceIncarnation": incarnation,
+            "options": CheckpointOptions { label: Some("handoff".into()), keep: false }
+        }),
+    )
+    .await
+    .expect("checkpoint");
+    assert_eq!(checkpoint["label"], "handoff");
+
+    route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.detach",
+        json!({ "repoId": repo, "workspace": "retry" }),
+    )
+    .await
+    .expect("detach");
+    let info = route(
+        &router,
+        coordinator(repo.clone()),
+        "workspace.info",
+        json!({ "repoId": repo, "workspace": "retry" }),
+    )
+    .await
+    .expect("detached info");
+    assert_eq!(
+        info["checkpoints"],
+        json!([{ "label": "handoff", "revision": 2, "pinned": true }])
+    );
 }
 
 #[tokio::test]
