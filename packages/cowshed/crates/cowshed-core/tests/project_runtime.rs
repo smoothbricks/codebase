@@ -738,12 +738,13 @@ impl ProjectRuntimeHost for FakeHost {
         incarnation: WorkspaceIncarnation,
         _job: JobId,
         _stream: RuntimeJobStream,
-        _offset: u64,
+        offset: u64,
         _follow: bool,
     ) -> Result<RuntimeLogChunk> {
         self.require_incarnation(&workspace, &incarnation)?;
         Ok(RuntimeLogChunk {
             bytes: Bytes::new(),
+            next_offset: offset,
             eof: true,
         })
     }
@@ -871,6 +872,40 @@ async fn router_decodes_tagged_non_utf8_argv_without_a_string_boundary() {
         assert_eq!(error.code, ErrorCode::Usage);
         assert!(events.try_recv().is_err(), "invalid argv reached the host");
     }
+}
+
+#[tokio::test]
+async fn log_binary_metadata_carries_the_exact_next_offset() {
+    let root = test_root();
+    let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
+    let adopted = adopt(&router, &repo).await;
+    let incarnation: WorkspaceIncarnation =
+        serde_json::from_value(adopted["info"]["workspaceIncarnation"].clone())
+            .expect("incarnation");
+    let response = router
+        .route(
+            ConnectionAuthority::Worker {
+                repo_id: repo.clone(),
+                workspace: WorkspaceName::new("main").expect("main"),
+                workspace_incarnation: incarnation.clone(),
+            },
+            "job.logs".to_owned(),
+            json!({
+                "repoId": repo,
+                "workspace": "main",
+                "workspaceIncarnation": incarnation,
+                "jobId": 1,
+                "stream": "stdout",
+                "follow": false,
+                "offset": 7
+            }),
+            None,
+        )
+        .await
+        .expect("log route");
+    let (metadata, bytes) = response.into_parts();
+    assert_eq!(metadata, json!({ "eof": true, "nextOffset": 7 }));
+    assert_eq!(bytes, Some(Bytes::new()));
 }
 
 #[tokio::test]
