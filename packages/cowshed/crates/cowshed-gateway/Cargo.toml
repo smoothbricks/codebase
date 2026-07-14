@@ -11,6 +11,7 @@ arrow-ipc = "56"
 arrow-schema = "56"
 base64 = "0.22"
 bytes = "1"
+git2 = { version = "0.20", default-features = false, features = ["https", "vendored-libgit2", "vendored-openssl"] }
 http = "1"
 http-body = "=1.0.1"
 http-body-util = "=0.1.3"
@@ -42,3 +43,4 @@ security-framework-sys = "2"
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+tokio = { workspace = true, features = ["test-util"] }

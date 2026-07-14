@@ -15,6 +15,8 @@ mod mirror;
 mod platform;
 mod policy;
 mod proxy;
+mod repo_mirror;
+mod sim_broker;
 mod telemetry;
 mod tls;
 
@@ -24,9 +26,9 @@ pub use cache::{
     DEFAULT_HIGH_WATER_BYTES, DEFAULT_LOW_WATER_BYTES, ObjectDigest, ObjectExpectation,
 };
 pub use config::{
-    ConfigError, GatewayConfig, GatewayLimits, GatewayTimeouts, MACOS_PORT_BLOCK_SIZE,
-    MACOS_PORT_MAX, MACOS_PORT_MIN, MirrorCacheConfig, TOKEN_BYTES, WorkspaceCa, WorkspaceEndpoint,
-    WorkspaceSession, WorkspaceToken,
+    ConfigError, ControlTcpConfig, GatewayConfig, GatewayLimits, GatewayTimeouts,
+    MACOS_PORT_BLOCK_SIZE, MACOS_PORT_MAX, MACOS_PORT_MIN, MirrorCacheConfig, TOKEN_BYTES,
+    WorkspaceCa, WorkspaceEndpoint, WorkspaceSession, WorkspaceToken,
 };
 pub use control::{ControlError, ControlFailureCode, GatewayControlClient, control_socket_path};
 pub use interfaces::{
@@ -40,9 +42,19 @@ pub use mirror::{
     MirrorOutcome, MirrorProtocolMetadata, MirrorRedirect, MirrorRequest, MirrorResourceKind,
     MirrorResponse, MirrorService, MirrorUpstream,
 };
+#[cfg(target_os = "macos")]
 pub use platform::KeychainCredentialProvider;
+#[cfg(target_os = "linux")]
+pub use platform::SystemdCredentialProvider;
 pub use policy::{
     CanonicalHost, CanonicalTarget, EgressGrant, EgressMode, HostPattern, MirrorProtocol,
     MirrorRoute, PolicyError, ResolvedMirrorRoute, TargetScheme, WorkspacePolicy, normalize_path,
+};
+pub use repo_mirror::{
+    MirrorInfo, RepoFetchOutcome, RepoFetchPlan, RepoMirrorError, RepoMirrorRequest, RepoTransport,
+};
+pub use sim_broker::{
+    SimBrokerError, SimCommand, SimCommandOutput, SimDevice, SimGrant, SimInstallApproval,
+    SimProjectConfig, SimRequest, SimResult, SimRunner,
 };
 pub use telemetry::{ArrowAuditConfig, ArrowAuditSink};
