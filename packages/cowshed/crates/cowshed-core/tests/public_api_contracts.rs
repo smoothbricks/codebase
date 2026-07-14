@@ -1,7 +1,10 @@
 use cowshed_core::api::*;
 use cowshed_core::{CowshedError, ErrorCode};
 use serde_json::json;
+use std::ffi::OsString;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -144,6 +147,58 @@ fn job_id_and_path_domain_types_reject_unsafe_values() {
     assert!(SpanId::new("0".repeat(16)).is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn command_args_are_canonical_lossless_and_strictly_bounded() {
+    for byte in 1_u8..=u8::MAX {
+        let bytes = vec![byte];
+        let argument = CommandArg::from(OsString::from_vec(bytes.clone()));
+        let value = serde_json::to_value(&argument).expect("serialize argument");
+        assert_eq!(
+            value["encoding"],
+            if byte.is_ascii() { "utf8" } else { "base64" }
+        );
+        let decoded: CommandArg = serde_json::from_value(value).expect("decode argument");
+        assert_eq!(decoded.as_os_str().as_bytes(), bytes);
+    }
+
+    let common = CommandArg::from("bun");
+    assert_eq!(
+        serde_json::to_value(common).unwrap(),
+        json!({"encoding":"utf8","data":"bun"})
+    );
+
+    for invalid in [
+        json!({"encoding":"base64","data":"%%%"}),
+        json!({"encoding":"base64","data":"YQ=="}),
+        json!({"encoding":"base64","data":"_w=="}),
+        json!({"encoding":"wat","data":"x"}),
+        json!({"encoding":"utf8","data":"x","extra":true}),
+        json!({"encoding":"utf8","data":"\u{0}"}),
+        json!({"encoding":"base64","data":"AA=="}),
+    ] {
+        assert!(
+            serde_json::from_value::<CommandArg>(invalid).is_err(),
+            "accepted non-canonical or unsafe argument"
+        );
+    }
+
+    let oversize = json!({
+        "encoding": "utf8",
+        "data": "x".repeat(MAX_COMMAND_ARG_BYTES + 1),
+    });
+    assert!(serde_json::from_value::<CommandArg>(oversize).is_err());
+
+    let maximum = CommandArg::from("x".repeat(MAX_COMMAND_ARG_BYTES));
+    let mut argv = vec![maximum; MAX_ARGV_BYTES / MAX_COMMAND_ARG_BYTES];
+    validate_command_argv(&argv).expect("exact total argv bound");
+    argv.push(CommandArg::from("x"));
+    assert_eq!(
+        validate_command_argv(&argv),
+        Err(DtoError::CommandArgvTooLarge)
+    );
+}
+
 #[test]
 fn workspace_info_attached_and_detached_shapes_are_frozen() {
     let attached = WorkspaceInfo {
@@ -265,7 +320,10 @@ fn nested_job_info_shape_is_byte_safe_and_frozen() {
             "state": "signaled",
             "pid": 4242,
             "grantRevision": 9,
-            "argv": ["bun", "test"],
+            "argv": [
+                {"encoding":"utf8","data":"bun"},
+                {"encoding":"utf8","data":"test"}
+            ],
             "cwd": "packages/app",
             "started": "2026-07-11T12:34:56Z",
             "durationMs": 1250,
@@ -293,7 +351,10 @@ fn root_job_info_requires_explicit_null_cwd() {
         "state": "signaled",
         "pid": 4242,
         "grantRevision": 9,
-        "argv": ["bun", "test"],
+        "argv": [
+            {"encoding":"utf8","data":"bun"},
+            {"encoding":"utf8","data":"test"}
+        ],
         "cwd": null,
         "started": "2026-07-11T12:34:56Z",
         "durationMs": 1250,
@@ -332,7 +393,7 @@ fn output_limit_is_an_explicit_terminal_projection() {
         "jobId": 8,
         "state": "outputLimit",
         "grantRevision": 9,
-        "argv": ["cat"],
+        "argv": [{"encoding":"utf8","data":"cat"}],
         "cwd": "packages/app",
         "started": "2026-07-11T12:34:56Z",
         "durationMs": 50,

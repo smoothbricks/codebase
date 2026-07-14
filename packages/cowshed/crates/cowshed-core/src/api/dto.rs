@@ -11,7 +11,10 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::Digest;
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use tokio::io::AsyncRead;
@@ -19,6 +22,8 @@ use tokio::io::AsyncRead;
 pub const MAX_JOB_ID: u64 = (1_u64 << 53) - 1;
 pub const MAX_INLINE_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_OUTPUT_SUMMARY_BYTES: usize = 16 * 1024;
+pub const MAX_COMMAND_ARG_BYTES: usize = 128 * 1024;
+pub const MAX_ARGV_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum DtoError {
@@ -40,6 +45,18 @@ pub enum DtoError {
     InlineOutputTooLarge,
     #[error("invalid binary output encoding")]
     InvalidBinaryEncoding,
+    #[error("command argument exceeds the {MAX_COMMAND_ARG_BYTES}-byte limit")]
+    CommandArgumentTooLarge,
+    #[error("command argv exceeds the {MAX_ARGV_BYTES}-byte total limit")]
+    CommandArgvTooLarge,
+    #[error("command argv must contain a non-empty argv[0]")]
+    InvalidCommandArgv,
+    #[error("command argument contains NUL")]
+    CommandArgumentContainsNul,
+    #[error("invalid command argument encoding")]
+    InvalidCommandArgumentEncoding,
+    #[error("command argument cannot be represented exactly on this platform")]
+    InvalidPlatformCommandArgument,
     #[error("invalid SHA-256 digest {0:?}")]
     InvalidSha256Digest(String),
     #[error("invalid stream projection: {0}")]
@@ -561,6 +578,215 @@ pub struct OutputSummary {
     pub version: u16,
     pub text: String,
     pub truncated: bool,
+}
+
+/// One immutable, byte-exact operating-system command argument.
+///
+/// On Unix, serde preserves the bytes returned by `OsStrExt::as_bytes`: valid UTF-8 uses the
+/// `utf8` tag and every other sequence uses canonical standard base64. No conversion is lossy.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CommandArg(OsString);
+
+impl CommandArg {
+    pub fn new(value: impl Into<OsString>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_os_str(&self) -> &OsStr {
+        &self.0
+    }
+
+    pub fn into_os_string(self) -> OsString {
+        self.0
+    }
+
+    pub fn validate(&self) -> Result<(), DtoError> {
+        let bytes = command_arg_bytes(self.as_os_str())?;
+        if bytes.len() > MAX_COMMAND_ARG_BYTES {
+            return Err(DtoError::CommandArgumentTooLarge);
+        }
+        if bytes.contains(&0) {
+            return Err(DtoError::CommandArgumentContainsNul);
+        }
+        Ok(())
+    }
+}
+
+impl From<OsString> for CommandArg {
+    fn from(value: OsString) -> Self {
+        Self(value)
+    }
+}
+
+impl From<String> for CommandArg {
+    fn from(value: String) -> Self {
+        Self(value.into())
+    }
+}
+
+impl From<&str> for CommandArg {
+    fn from(value: &str) -> Self {
+        Self(value.into())
+    }
+}
+
+impl From<&OsStr> for CommandArg {
+    fn from(value: &OsStr) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl From<CommandArg> for OsString {
+    fn from(value: CommandArg) -> Self {
+        value.into_os_string()
+    }
+}
+
+impl AsRef<OsStr> for CommandArg {
+    fn as_ref(&self) -> &OsStr {
+        self.as_os_str()
+    }
+}
+
+/// Validates process-level argv invariants without allocating or rewriting an argument.
+pub fn validate_command_argv(argv: &[CommandArg]) -> Result<(), DtoError> {
+    let first = argv.first().ok_or(DtoError::InvalidCommandArgv)?;
+    if command_arg_bytes(first.as_os_str())?.is_empty() {
+        return Err(DtoError::InvalidCommandArgv);
+    }
+    let mut total = 0_usize;
+    for argument in argv {
+        argument.validate()?;
+        total = total
+            .checked_add(command_arg_bytes(argument.as_os_str())?.len())
+            .ok_or(DtoError::CommandArgvTooLarge)?;
+        if total > MAX_ARGV_BYTES {
+            return Err(DtoError::CommandArgvTooLarge);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn command_arg_bytes(value: &OsStr) -> Result<&[u8], DtoError> {
+    Ok(value.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn command_arg_bytes(value: &OsStr) -> Result<&[u8], DtoError> {
+    value
+        .to_str()
+        .map(str::as_bytes)
+        .ok_or(DtoError::InvalidPlatformCommandArgument)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CommandArgEncoding {
+    Utf8,
+    Base64,
+}
+
+#[derive(Serialize)]
+struct CommandArgRef<'a> {
+    encoding: CommandArgEncoding,
+    data: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommandArgWire {
+    encoding: CommandArgEncoding,
+    data: String,
+}
+
+impl Serialize for CommandArg {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        let bytes = command_arg_bytes(self.as_os_str()).map_err(serde::ser::Error::custom)?;
+        match std::str::from_utf8(bytes) {
+            Ok(data) => CommandArgRef {
+                encoding: CommandArgEncoding::Utf8,
+                data,
+            }
+            .serialize(serializer),
+            Err(_) => {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+                CommandArgRef {
+                    encoding: CommandArgEncoding::Base64,
+                    data: &encoded,
+                }
+                .serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CommandArg {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = CommandArgWire::deserialize(deserializer)?;
+        match wire.encoding {
+            CommandArgEncoding::Utf8 => command_arg_from_decoded_bytes(wire.data.into_bytes()),
+            CommandArgEncoding::Base64 => {
+                const MAX_BASE64_BYTES: usize = MAX_COMMAND_ARG_BYTES.div_ceil(3) * 4;
+                if wire.data.len() > MAX_BASE64_BYTES {
+                    return Err(serde::de::Error::custom(DtoError::CommandArgumentTooLarge));
+                }
+                let padding = wire
+                    .data
+                    .as_bytes()
+                    .iter()
+                    .rev()
+                    .take_while(|&&byte| byte == b'=')
+                    .count();
+                if wire.data.len() % 4 != 0 || padding > 2 {
+                    return Err(serde::de::Error::custom(
+                        DtoError::InvalidCommandArgumentEncoding,
+                    ));
+                }
+                let decoded_len = wire.data.len() / 4 * 3 - padding;
+                if decoded_len > MAX_COMMAND_ARG_BYTES {
+                    return Err(serde::de::Error::custom(DtoError::CommandArgumentTooLarge));
+                }
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(wire.data.as_bytes())
+                    .map_err(|_| {
+                        serde::de::Error::custom(DtoError::InvalidCommandArgumentEncoding)
+                    })?;
+                if base64::engine::general_purpose::STANDARD.encode(&bytes) != wire.data
+                    || std::str::from_utf8(&bytes).is_ok()
+                {
+                    return Err(serde::de::Error::custom(
+                        DtoError::InvalidCommandArgumentEncoding,
+                    ));
+                }
+                command_arg_from_decoded_bytes(bytes)
+            }
+        }
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+fn command_arg_from_decoded_bytes(bytes: Vec<u8>) -> Result<CommandArg, DtoError> {
+    if bytes.len() > MAX_COMMAND_ARG_BYTES {
+        return Err(DtoError::CommandArgumentTooLarge);
+    }
+    if bytes.contains(&0) {
+        return Err(DtoError::CommandArgumentContainsNul);
+    }
+    #[cfg(unix)]
+    let value = OsString::from_vec(bytes);
+    #[cfg(not(unix))]
+    let value = String::from_utf8(bytes)
+        .map(OsString::from)
+        .map_err(|_| DtoError::InvalidPlatformCommandArgument)?;
+    Ok(CommandArg(value))
 }
 
 /// Exact, bounded bytes for control-oriented JSON.
@@ -1135,7 +1361,7 @@ pub struct JobInfo {
     pub state: JobState,
     pub pid: Option<u32>,
     pub grant_revision: u64,
-    pub argv: Vec<String>,
+    pub argv: Vec<CommandArg>,
     pub cwd: Option<WorkspacePath>,
     pub started: UtcTimestamp,
     pub duration_ms: Option<u64>,
@@ -1149,6 +1375,7 @@ pub struct JobInfo {
 
 impl JobInfo {
     pub fn validate(&self) -> Result<(), DtoError> {
+        validate_command_argv(&self.argv)?;
         let terminal = !matches!(self.state, JobState::Queued | JobState::Running);
         if terminal != self.duration_ms.is_some() {
             return Err(DtoError::InvalidJobProjection(
@@ -1186,7 +1413,7 @@ struct JobInfoRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pid: Option<u32>,
     grant_revision: u64,
-    argv: &'a [String],
+    argv: &'a [CommandArg],
     cwd: &'a Option<WorkspacePath>,
     started: &'a UtcTimestamp,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1217,7 +1444,7 @@ struct JobInfoWire {
     state: JobState,
     pid: Option<u32>,
     grant_revision: u64,
-    argv: Vec<String>,
+    argv: Vec<CommandArg>,
     cwd: RequiredJobCwd,
     started: UtcTimestamp,
     duration_ms: Option<u64>,
@@ -1480,7 +1707,7 @@ pub struct OutputPublication {
 
 #[derive(Debug)]
 pub struct ExecRequest {
-    pub argv: Vec<String>,
+    pub argv: Vec<CommandArg>,
     pub cwd: Option<WorkspacePath>,
     pub mode: RunSandboxMode,
     pub env: HashMap<String, String>,

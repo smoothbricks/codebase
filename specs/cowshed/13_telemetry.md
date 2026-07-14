@@ -141,6 +141,12 @@ reads resolve its independent protected `artifact`. Controller commitments carry
 union, either inline encoding, or payload/path. Summaries remain bounded diagnostic projections and establish no
 outcome.
 
+`JobInfo.argv` uses the separate canonical `CommandArg` union with the same exact tag names, but stricter command
+invariants: `utf8` is selected iff the OS bytes are valid UTF-8; base64 must be canonical and must represent non-UTF-8
+bytes. Unknown fields/encodings, malformed data, NUL, elements above 128 KiB, aggregate argv above 1 MiB, and empty
+argv/`argv[0]` reject before RPC, spawn, or protected evidence mutation. Common UTF-8 arguments therefore remain
+readable without base64 or lossy conversion.
+
 ## Protected exec and checkpoint schema
 
 Protected Arrow is the exact tagged/versioned union:
@@ -183,10 +189,11 @@ may discard/report only an incomplete trailing frame.
 The flat Arrow schema begins `record_kind, record_version, repo_id`. A Job row then uses
 `workspace_incarnation, job_id, sequence, state, grant_revision`, followed by the existing
 `stdout_storage_kind, stdout_source_path, stdout_inline_bytes, stdout_protected_path, stdout_bytes, stdout_sha256, stdout_summary_version, stdout_summary_text, stdout_summary_truncated`
-and equivalent `stderr_*` columns. A CheckpointManifest row instead uses
-`origin_incarnation, barrier_id, visible_jobs, records_sha256`, with
+and equivalent `stderr_*` columns, optional output-limit columns, and required `argv: List<Binary>`. A
+CheckpointManifest row instead uses `origin_incarnation, barrier_id, visible_jobs, records_sha256`, with
 `visible_jobs: List<Struct<workspace_incarnation,job_id,state,stdout,stderr>>`. Columns outside the selected variant are
-null and validators reject every other null combination.
+null and validators reject every other null combination. Job recovery validates non-null raw argv elements, the
+non-empty first argument, NUL exclusion, the 128 KiB element limit, and the 1 MiB total before allocating OS strings.
 
 ## Controller commitment schema
 

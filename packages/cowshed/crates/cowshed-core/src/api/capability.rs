@@ -3,7 +3,7 @@ use super::dto::{
     CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GitOid, GrantDelta,
     GrantSet, JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo, PushOptions,
     PushReport, RebaseOptions, RemoveOptions, RevisionResult, RunSandboxMode, StdinSource,
-    WorkspaceIncarnation, WorkspaceInfo,
+    WorkspaceIncarnation, WorkspaceInfo, validate_command_argv,
 };
 use super::server::MAX_BINARY_FRAME_BYTES;
 #[cfg(unix)]
@@ -199,6 +199,9 @@ impl ControllerRuntime for ActorRuntime {
         session: Option<&str>,
         request: ExecRequest,
     ) -> Result<JobId> {
+        validate_command_argv(&request.argv).map_err(|error| {
+            CowshedError::usage(error.to_string(), "provide a valid bounded command argv")
+        })?;
         let ExecRequest {
             argv,
             cwd,

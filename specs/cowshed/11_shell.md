@@ -46,7 +46,13 @@ named session, one-shot, and descendant beneath that restriction. The child prof
 Execution cwd has one representation across `ExecRequest`, supervisor/session state, `JobInfo`, JSON, and Arrow:
 `Option<WorkspacePath>`. `None` denotes the workspace mount root; `Some(path)` denotes exactly one validated, normalized
 workspace-relative path. Wire `cwd` is required and encodes `None` as JSON `null`; omission rejects, and neither an
-empty path nor `.` is admitted as a root sentinel.
+empty path nor `.` is admitted as a root sentinel. Execution argv likewise has one byte-exact representation.
+`ExecRequest.argv` and `JobInfo.argv` are `Vec<CommandArg>`, where each immutable element owns an `OsString`. On Unix
+the shared serde codec emits exactly `{encoding:"utf8",data}` iff the bytes validate as UTF-8 and otherwise canonical
+standard base64. It denies unknown fields/encodings and rejects malformed/non-canonical base64, base64 for valid UTF-8,
+decoded NUL, arguments above 128 KiB, aggregate argv above 1 MiB, and empty argv/`argv[0]`. Validation precedes RPC,
+job/artifact effects, process allocation, and spawn. The supervisor consumes arguments into `OsString` for `plan_exec`;
+no `String`, lossy rendering, or alternate supervisor wire shape exists.
 
 - Idle timeout: the supervisor exits after `[shell] idle` (default 30 min) with no sessions and no running jobs, freeing
   memory; the next exec respawns it. `cowshed detach`/`cowshed rm` stop it immediately (teardown below).
@@ -129,6 +135,11 @@ inherited history; an unknown historical incarnation, or any new allocation unde
 replacement and attach otherwise discard only an incomplete trailing Arrow batch and never rewrite a complete batch or
 sealed artifact. Fork/checkpoint/restore copies start above every inherited allocation; no separate high-water file
 exists.
+
+Each admission and terminal job batch also records its immutable argv as a required Arrow `List<Binary>`. Recovery
+requires the canonical schema, non-null Binary elements, a non-empty first element, no NUL, and the same per-element and
+aggregate byte bounds before reconstructing `CommandArg`. This preserves non-UTF-8 Unix argv across crash recovery and
+rejects malformed complete batches as `Integrity`; protected storage never downgrades argv to Arrow Utf8.
 
 A controller-minted immutable `workspaceIncarnation` disambiguates histories copied by fork/checkpoint/restore. Each
 create, fork destination, and restore result receives a fresh incarnation; inherited records retain the incarnation that
