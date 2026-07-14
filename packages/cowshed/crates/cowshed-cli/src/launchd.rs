@@ -1,13 +1,16 @@
-//! Pure launchd service definitions and filesystem mutation plans.
+//! Immutable launchd service definitions, filesystem plans, and native executors.
 //!
-//! This module deliberately does not execute `launchctl`, provision storage, or
-//! perform filesystem I/O. Callers can validate an immutable service definition,
-//! render its deterministic plist, and then execute the returned mutation plan
-//! using their own platform boundary.
+//! The planner is pure. Execution is isolated behind injectable filesystem and
+//! command adapters so callers can keep one mutable, actor-owned executor while
+//! tests remain entirely host-independent.
 
 use std::error::Error;
+use std::ffi::OsString;
 use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 pub const GATEWAY_LABEL: &str = "dev.cowshed.gateway";
 pub const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
@@ -269,6 +272,627 @@ pub fn plan_remove(spec: &LaunchAgentSpec, installed: bool) -> InstallPlan {
     };
 
     InstallPlan { operations }
+}
+
+pub const LAUNCHCTL_EXECUTABLE: &str = "/bin/launchctl";
+
+/// Filesystem operations required to execute an [`InstallPlan`].
+///
+/// Implementations of `create_exclusive_no_follow` must either return a fully
+/// written file with exactly `mode`, or remove any file they created before
+/// returning an error.
+pub trait LaunchdFilesystem {
+    fn ensure_directory(&mut self, path: &Path, mode: u32) -> io::Result<()>;
+    fn set_permissions(&mut self, path: &Path, mode: u32) -> io::Result<()>;
+    fn create_exclusive_no_follow(
+        &mut self,
+        directory: &Path,
+        name_prefix: &str,
+        bytes: &[u8],
+        mode: u32,
+    ) -> io::Result<PathBuf>;
+    fn sync_file(&mut self, path: &Path) -> io::Result<()>;
+    fn rename(&mut self, source: &Path, destination: &Path) -> io::Result<()>;
+    fn remove_file(&mut self, path: &Path) -> io::Result<()>;
+    fn sync_directory(&mut self, path: &Path) -> io::Result<()>;
+}
+
+/// Native, no-shell filesystem adapter for per-user LaunchAgent files.
+#[derive(Debug, Default)]
+pub struct NativeFilesystem {
+    next_temporary_id: u64,
+}
+
+impl NativeFilesystem {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl LaunchdFilesystem for NativeFilesystem {
+    fn ensure_directory(&mut self, path: &Path, mode: u32) -> io::Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(mode);
+        match builder.create(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        set_exact_permissions_no_follow(path, mode, FileKind::Directory)
+    }
+
+    fn set_permissions(&mut self, path: &Path, mode: u32) -> io::Result<()> {
+        set_exact_permissions_no_follow(path, mode, FileKind::Directory)
+    }
+
+    fn create_exclusive_no_follow(
+        &mut self,
+        directory: &Path,
+        name_prefix: &str,
+        bytes: &[u8],
+        mode: u32,
+    ) -> io::Result<PathBuf> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        for _ in 0..128 {
+            let id = self.next_temporary_id;
+            self.next_temporary_id = self.next_temporary_id.wrapping_add(1);
+            let path = directory.join(format!("{name_prefix}{}.{}", std::process::id(), id));
+            let opened = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .custom_flags(no_follow_flag())
+                .open(&path);
+            let mut file = match opened {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            };
+
+            let write_result = (|| {
+                let metadata = file.metadata()?;
+                if !metadata.file_type().is_file() {
+                    return Err(wrong_file_kind("temporary path", FileKind::RegularFile));
+                }
+                file.set_permissions(fs::Permissions::from_mode(mode))?;
+                file.write_all(bytes)
+            })();
+            if let Err(error) = write_result {
+                drop(file);
+                let _ = fs::remove_file(&path);
+                return Err(error);
+            }
+            return Ok(path);
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate an exclusive launchd temporary file",
+        ))
+    }
+
+    fn sync_file(&mut self, path: &Path) -> io::Result<()> {
+        let file = open_existing_no_follow(path, true)?;
+        require_file_kind(&file, "temporary path", FileKind::RegularFile)?;
+        file.sync_all()
+    }
+
+    fn rename(&mut self, source: &Path, destination: &Path) -> io::Result<()> {
+        fs::rename(source, destination)
+    }
+
+    fn remove_file(&mut self, path: &Path) -> io::Result<()> {
+        fs::remove_file(path)
+    }
+
+    fn sync_directory(&mut self, path: &Path) -> io::Result<()> {
+        let directory = open_existing_no_follow(path, false)?;
+        require_file_kind(&directory, "directory path", FileKind::Directory)?;
+        directory.sync_all()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileKind {
+    Directory,
+    RegularFile,
+}
+
+fn set_exact_permissions_no_follow(path: &Path, mode: u32, kind: FileKind) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let file = open_existing_no_follow(path, false)?;
+    require_file_kind(&file, "launchd path", kind)?;
+    file.set_permissions(fs::Permissions::from_mode(mode))
+}
+
+fn open_existing_no_follow(path: &Path, write: bool) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(write)
+        .custom_flags(no_follow_flag());
+    options.open(path)
+}
+
+const fn no_follow_flag() -> i32 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        0x2_0000
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        0x100
+    }
+}
+
+fn require_file_kind(file: &File, subject: &'static str, expected: FileKind) -> io::Result<()> {
+    let actual = file.metadata()?.file_type();
+    let matches = match expected {
+        FileKind::Directory => actual.is_dir(),
+        FileKind::RegularFile => actual.is_file(),
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(wrong_file_kind(subject, expected))
+    }
+}
+
+fn wrong_file_kind(subject: &'static str, expected: FileKind) -> io::Error {
+    let expected = match expected {
+        FileKind::Directory => "directory",
+        FileKind::RegularFile => "regular file",
+    };
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{subject} is not a {expected}"),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FilesystemOperation {
+    EnsureDirectory,
+    SetPermissions,
+    CreateTemporaryFile,
+    SyncTemporaryFile,
+    RenameTemporaryFile,
+    RemoveFile,
+    SyncDirectory,
+}
+
+#[derive(Debug)]
+pub struct CleanupFailure {
+    path: PathBuf,
+    source: io::Error,
+}
+
+impl CleanupFailure {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn source_error(&self) -> &io::Error {
+        &self.source
+    }
+}
+
+#[derive(Debug)]
+pub enum InstallExecutionError {
+    Filesystem {
+        operation: FilesystemOperation,
+        path: PathBuf,
+        source: io::Error,
+        cleanup_failure: Option<CleanupFailure>,
+    },
+    InvalidPlan {
+        operation: FilesystemOperation,
+        reason: &'static str,
+    },
+}
+
+impl InstallExecutionError {
+    pub fn operation(&self) -> FilesystemOperation {
+        match self {
+            Self::Filesystem { operation, .. } | Self::InvalidPlan { operation, .. } => *operation,
+        }
+    }
+
+    pub fn cleanup_failure(&self) -> Option<&CleanupFailure> {
+        match self {
+            Self::Filesystem {
+                cleanup_failure, ..
+            } => cleanup_failure.as_ref(),
+            Self::InvalidPlan { .. } => None,
+        }
+    }
+}
+
+impl fmt::Display for InstallExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Filesystem {
+                operation,
+                path,
+                source,
+                cleanup_failure,
+            } => {
+                write!(
+                    formatter,
+                    "launchd filesystem operation {operation:?} failed for {}: {source}",
+                    path.display()
+                )?;
+                if let Some(cleanup) = cleanup_failure {
+                    write!(
+                        formatter,
+                        "; cleanup of {} also failed: {}",
+                        cleanup.path.display(),
+                        cleanup.source
+                    )?;
+                }
+                Ok(())
+            }
+            Self::InvalidPlan { operation, reason } => {
+                write!(formatter, "invalid launchd plan at {operation:?}: {reason}")
+            }
+        }
+    }
+}
+
+impl Error for InstallExecutionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Filesystem { source, .. } => Some(source),
+            Self::InvalidPlan { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstallOutcome {
+    NoChange,
+    Changed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlAction {
+    Bootstrap,
+    Bootout,
+    Kickstart,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControlPlan {
+    action: ControlAction,
+    arguments: Vec<OsString>,
+}
+
+impl ControlPlan {
+    pub fn bootstrap(uid: u32, spec: &LaunchAgentSpec) -> Self {
+        Self {
+            action: ControlAction::Bootstrap,
+            arguments: vec![
+                OsString::from("bootstrap"),
+                OsString::from(gui_domain(uid)),
+                spec.plist_path().as_os_str().to_owned(),
+            ],
+        }
+    }
+
+    pub fn bootout(uid: u32, spec: &LaunchAgentSpec) -> Self {
+        Self {
+            action: ControlAction::Bootout,
+            arguments: vec![
+                OsString::from("bootout"),
+                OsString::from(service_target(uid, spec.label())),
+            ],
+        }
+    }
+
+    pub fn kickstart(uid: u32, spec: &LaunchAgentSpec) -> Self {
+        Self {
+            action: ControlAction::Kickstart,
+            arguments: vec![
+                OsString::from("kickstart"),
+                OsString::from("-k"),
+                OsString::from(service_target(uid, spec.label())),
+            ],
+        }
+    }
+
+    pub fn action(&self) -> ControlAction {
+        self.action
+    }
+
+    pub fn executable(&self) -> &Path {
+        Path::new(LAUNCHCTL_EXECUTABLE)
+    }
+
+    pub fn arguments(&self) -> &[OsString] {
+        &self.arguments
+    }
+}
+
+fn gui_domain(uid: u32) -> String {
+    format!("gui/{uid}")
+}
+
+fn service_target(uid: u32, label: &str) -> String {
+    format!("{}/{label}", gui_domain(uid))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandStatus {
+    Success,
+    ExitCode(i32),
+    Terminated,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandOutput {
+    pub status: CommandStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+impl CommandOutput {
+    pub fn success() -> Self {
+        Self {
+            status: CommandStatus::Success,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+}
+
+pub trait LaunchctlCommand {
+    fn run(&mut self, executable: &Path, arguments: &[OsString]) -> io::Result<CommandOutput>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeLaunchctlCommand;
+
+impl LaunchctlCommand for NativeLaunchctlCommand {
+    fn run(&mut self, executable: &Path, arguments: &[OsString]) -> io::Result<CommandOutput> {
+        let output = Command::new(executable).args(arguments).output()?;
+        let status = if output.status.success() {
+            CommandStatus::Success
+        } else if let Some(code) = output.status.code() {
+            CommandStatus::ExitCode(code)
+        } else {
+            CommandStatus::Terminated
+        };
+        Ok(CommandOutput {
+            status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControlOutcome {
+    pub action: ControlAction,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub enum ControlExecutionError {
+    Unavailable {
+        action: ControlAction,
+        source: io::Error,
+    },
+    Rejected {
+        action: ControlAction,
+        status: CommandStatus,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+}
+
+impl fmt::Display for ControlExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable { action, source } => {
+                write!(formatter, "launchctl {action:?} could not start: {source}")
+            }
+            Self::Rejected { action, status, .. } => {
+                write!(formatter, "launchctl {action:?} failed with {status:?}")
+            }
+        }
+    }
+}
+
+impl Error for ControlExecutionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Unavailable { source, .. } => Some(source),
+            Self::Rejected { .. } => None,
+        }
+    }
+}
+
+/// Single-owner executor for install plans and launchctl control plans.
+///
+/// All methods require `&mut self`; callers should keep this value inside their
+/// coordinator actor rather than sharing it through a lock.
+#[derive(Debug)]
+pub struct LaunchdExecutor<F, C> {
+    filesystem: F,
+    command: C,
+}
+
+impl<F, C> LaunchdExecutor<F, C> {
+    pub fn new(filesystem: F, command: C) -> Self {
+        Self {
+            filesystem,
+            command,
+        }
+    }
+
+    pub fn into_parts(self) -> (F, C) {
+        (self.filesystem, self.command)
+    }
+}
+
+impl LaunchdExecutor<NativeFilesystem, NativeLaunchctlCommand> {
+    pub fn native() -> Self {
+        Self::new(NativeFilesystem::new(), NativeLaunchctlCommand)
+    }
+}
+
+impl<F: LaunchdFilesystem, C> LaunchdExecutor<F, C> {
+    pub fn execute_install(
+        &mut self,
+        plan: &InstallPlan,
+    ) -> Result<InstallOutcome, InstallExecutionError> {
+        if plan.is_noop() {
+            return Ok(InstallOutcome::NoChange);
+        }
+
+        let mut temporary_file: Option<PathBuf> = None;
+        for mutation in plan.operations() {
+            let (operation, path, result) = match mutation {
+                Mutation::EnsureDirectory { path, mode } => (
+                    FilesystemOperation::EnsureDirectory,
+                    path.as_path(),
+                    self.filesystem.ensure_directory(path, *mode),
+                ),
+                Mutation::SetPermissions { path, mode } => (
+                    FilesystemOperation::SetPermissions,
+                    path.as_path(),
+                    self.filesystem.set_permissions(path, *mode),
+                ),
+                Mutation::CreateExclusiveTemporaryFile {
+                    directory,
+                    name_prefix,
+                    bytes,
+                    mode,
+                } => {
+                    if temporary_file.is_some() {
+                        return Err(InstallExecutionError::InvalidPlan {
+                            operation: FilesystemOperation::CreateTemporaryFile,
+                            reason: "a temporary file is already active",
+                        });
+                    }
+                    match self.filesystem.create_exclusive_no_follow(
+                        directory,
+                        name_prefix,
+                        bytes,
+                        *mode,
+                    ) {
+                        Ok(path) => {
+                            temporary_file = Some(path);
+                            continue;
+                        }
+                        Err(source) => (
+                            FilesystemOperation::CreateTemporaryFile,
+                            directory.as_path(),
+                            Err(source),
+                        ),
+                    }
+                }
+                Mutation::SyncTemporaryFile => {
+                    let Some(path) = temporary_file.as_deref() else {
+                        return Err(InstallExecutionError::InvalidPlan {
+                            operation: FilesystemOperation::SyncTemporaryFile,
+                            reason: "there is no active temporary file",
+                        });
+                    };
+                    (
+                        FilesystemOperation::SyncTemporaryFile,
+                        path,
+                        self.filesystem.sync_file(path),
+                    )
+                }
+                Mutation::RenameTemporaryFile { destination } => {
+                    let Some(path) = temporary_file.as_deref() else {
+                        return Err(InstallExecutionError::InvalidPlan {
+                            operation: FilesystemOperation::RenameTemporaryFile,
+                            reason: "there is no active temporary file",
+                        });
+                    };
+                    let result = self.filesystem.rename(path, destination);
+                    if result.is_ok() {
+                        temporary_file = None;
+                    }
+                    (
+                        FilesystemOperation::RenameTemporaryFile,
+                        destination.as_path(),
+                        result,
+                    )
+                }
+                Mutation::RemoveFile { path } => (
+                    FilesystemOperation::RemoveFile,
+                    path.as_path(),
+                    self.filesystem.remove_file(path),
+                ),
+                Mutation::SyncDirectory { path } => (
+                    FilesystemOperation::SyncDirectory,
+                    path.as_path(),
+                    self.filesystem.sync_directory(path),
+                ),
+            };
+
+            if let Err(source) = result {
+                let failed_path = path.to_path_buf();
+                let cleanup_failure = temporary_file.take().and_then(|path| {
+                    self.filesystem
+                        .remove_file(&path)
+                        .err()
+                        .map(|source| CleanupFailure { path, source })
+                });
+                return Err(InstallExecutionError::Filesystem {
+                    operation,
+                    path: failed_path,
+                    source,
+                    cleanup_failure,
+                });
+            }
+        }
+
+        if temporary_file.is_some() {
+            return Err(InstallExecutionError::InvalidPlan {
+                operation: FilesystemOperation::RenameTemporaryFile,
+                reason: "the plan left a temporary file active",
+            });
+        }
+        Ok(InstallOutcome::Changed)
+    }
+}
+
+impl<F, C: LaunchctlCommand> LaunchdExecutor<F, C> {
+    pub fn execute_control(
+        &mut self,
+        plan: &ControlPlan,
+    ) -> Result<ControlOutcome, ControlExecutionError> {
+        let output = self
+            .command
+            .run(plan.executable(), plan.arguments())
+            .map_err(|source| ControlExecutionError::Unavailable {
+                action: plan.action(),
+                source,
+            })?;
+        match output.status {
+            CommandStatus::Success => Ok(ControlOutcome {
+                action: plan.action(),
+                stdout: output.stdout,
+                stderr: output.stderr,
+            }),
+            status => Err(ControlExecutionError::Rejected {
+                action: plan.action(),
+                status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
