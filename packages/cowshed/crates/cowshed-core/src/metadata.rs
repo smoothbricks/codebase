@@ -12,6 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const METADATA_VERSION: u32 = 1;
 pub const PORT_BLOCK_SIZE: u16 = 16;
+pub const MACOS_PORT_BLOCK_MIN: u16 = 40_960;
+pub const MACOS_PORT_BLOCK_MAX: u16 = 49_151;
+pub const MACOS_PORT_BLOCK_LAST_BASE: u16 = MACOS_PORT_BLOCK_MAX - PORT_BLOCK_SIZE + 1;
 
 #[derive(Debug)]
 pub enum MetadataError {
