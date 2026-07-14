@@ -61,8 +61,8 @@ impl GitRepository {
         &self.root
     }
 
-    /// Reject in-progress repository operations; ordinary dirty work is intentionally allowed.
-    pub async fn ensure_adoptable(&self) -> Result<()> {
+    /// Return the first in-progress repository operation, if any.
+    pub async fn in_progress_operation(&self) -> Result<Option<String>> {
         for state in [
             "MERGE_HEAD",
             "rebase-merge",
@@ -81,14 +81,22 @@ impl GitRepository {
                 self.root.join(state_path)
             };
             if absolute.exists() {
-                return Err(CowshedError::conflict(
-                    format!("repository has an in-progress {state} operation"),
-                    format!(
-                        "finish or abort the git operation, then run: cowshed adopt {}",
-                        self.root.display()
-                    ),
-                ));
+                return Ok(Some(state.to_owned()));
             }
+        }
+        Ok(None)
+    }
+
+    /// Reject in-progress repository operations; ordinary dirty work is intentionally allowed.
+    pub async fn ensure_adoptable(&self) -> Result<()> {
+        if let Some(state) = self.in_progress_operation().await? {
+            return Err(CowshedError::conflict(
+                format!("repository has an in-progress {state} operation"),
+                format!(
+                    "finish or abort the git operation, then run: cowshed adopt {}",
+                    self.root.display()
+                ),
+            ));
         }
         Ok(())
     }
@@ -143,6 +151,36 @@ impl GitRepository {
             .await?;
         if !output.status.success() {
             return Err(git_internal("read repository status", &output));
+        }
+        Ok(!output.stdout.is_empty())
+    }
+
+    /// Whether `commit` is contained by a host branch or a Cowshed preservation ref.
+    ///
+    /// A commit absent from this repository is an ordinary negative result: session repositories
+    /// can contain unpublished objects that the controller-side host repository has never seen.
+    pub async fn commit_is_preserved(&self, commit: &str) -> Result<bool> {
+        let object = format!("{commit}^{{commit}}");
+        let exists = self.run(["cat-file", "-e", object.as_str()]).await?;
+        if !exists.status.success() {
+            return Ok(false);
+        }
+
+        let output = self
+            .run([
+                "for-each-ref",
+                "--format=%(refname)",
+                "--contains",
+                commit,
+                "refs/heads",
+                "refs/cowshed",
+            ])
+            .await?;
+        if !output.status.success() {
+            return Err(git_internal(
+                "check host commit preservation refs",
+                &output,
+            ));
         }
         Ok(!output.stdout.is_empty())
     }
@@ -519,6 +557,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preservation_requires_a_host_branch_or_cowshed_ref_containing_the_commit() {
+        let host = repository();
+        let host_repo = GitRepository::from_root(&host);
+        let host_head = host_repo.head_oid().await.expect("read host head");
+        assert!(
+            host_repo
+                .commit_is_preserved(&host_head)
+                .await
+                .expect("main preserves its head")
+        );
+
+        let session = host.with_extension("session");
+        let status = Command::new("/usr/bin/git")
+            .args(["clone", "-q"])
+            .arg(&host)
+            .arg(&session)
+            .status()
+            .expect("clone session");
+        assert!(status.success());
+        fs::write(session.join("session-only"), "unpublished\n").expect("write session change");
+        let status = Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&session)
+            .args([
+                "-c",
+                "user.name=Cowshed Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "add",
+                ".",
+            ])
+            .status()
+            .expect("stage session change");
+        assert!(status.success());
+        let status = Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&session)
+            .args([
+                "-c",
+                "user.name=Cowshed Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "session-only",
+            ])
+            .status()
+            .expect("commit session change");
+        assert!(status.success());
+        let session_head = GitRepository::from_root(&session)
+            .head_oid()
+            .await
+            .expect("read session head");
+        assert!(
+            !host_repo
+                .commit_is_preserved(&session_head)
+                .await
+                .expect("absent session object is not preserved")
+        );
+
+        let status = Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&session)
+            .args([
+                "push",
+                "-q",
+                "origin",
+                "HEAD:refs/cowshed/raven/heads/main",
+            ])
+            .status()
+            .expect("publish preservation ref");
+        assert!(status.success());
+        assert!(
+            host_repo
+                .commit_is_preserved(&session_head)
+                .await
+                .expect("preservation ref contains session commit")
+        );
+
+        fs::remove_dir_all(session).expect("remove session fixture");
+        fs::remove_dir_all(host).expect("remove host fixture");
+    }
+
+    #[tokio::test]
     async fn rejects_in_progress_operation() {
         let root = repository();
         fs::write(root.join(".git/MERGE_HEAD"), "deadbeef\n").expect("write merge marker");
@@ -527,6 +649,15 @@ mod tests {
             .await
             .expect_err("must reject merge");
         assert_eq!(error.code.as_str(), "conflict");
+
+        assert_eq!(
+            GitRepository::from_root(&root)
+                .in_progress_operation()
+                .await
+                .expect("read operation state")
+                .as_deref(),
+            Some("MERGE_HEAD")
+        );
         fs::remove_dir_all(root).expect("remove fixture");
     }
 }
