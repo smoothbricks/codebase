@@ -54,6 +54,10 @@ No mounts, no root, no network — pure functions with table-driven cases:
   cross-project refusal, malicious marker-only refusal, overlapping active-mount ambiguity, and exact `EnsureReport`
   paths plus macOS/Linux `PortBlock` presence. Capability-wire tests freeze `project.workspaceAt` and reject local CLI
   inference.
+- **Per-workspace aggregate checkpoint quota**: substrate stats fixtures freeze active allocated bytes, total checkpoint
+  bytes/count, and the pinned-byte subset across mixed pinned/automatic images. Runtime state machines prove
+  `existing checkpoints + one active-image charge`, exact-boundary admission, one-byte/count overflow refusal with zero
+  image/fact/metadata effect, and two-workspace isolation.
 - **Push CAS and preservation model**: pure state-machine tables cover each omitted/satisfied/mismatched combination of
   expected workspace incarnation, source head, and destination ref head (including expected-missing). A mismatch is a
   `Conflict` that preserves the old destination exactly and leaves the source live; success reports one source object ID

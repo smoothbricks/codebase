@@ -1,5 +1,5 @@
 use std::fs::{FileTimes, OpenOptions};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -557,17 +557,43 @@ fn stats_count_only_images_and_gc_drains_session_trash_then_compacts_detached_sp
     let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
     create_image(canonical.image(), ImageFormat::Sparse);
     let checkpoints = &layout.project().checkpoints.join("main");
-    create_image(&checkpoints.join("one.sparseimage"), ImageFormat::Sparse);
-    create_image(&checkpoints.join("two.asif"), ImageFormat::Asif);
+    let first = checkpoints.join("one.sparseimage");
+    let second = checkpoints.join("two.asif");
+    create_image(&first, ImageFormat::Sparse);
+    create_image(&second, ImageFormat::Asif);
     std::fs::write(checkpoints.join("not-an-image.txt"), b"ignored").expect("noise");
     let runner = RecordingRunner::default();
     let host = native_host(&fixture, runner.clone());
+    host.publish_checkpoint_fact(
+        &first,
+        &CheckpointLabel::new("one").expect("label"),
+        Revision::new(2),
+        Pin::Pinned,
+    )
+    .expect("pinned fact");
+    host.publish_checkpoint_fact(
+        &second,
+        &CheckpointLabel::new("two").expect("label"),
+        Revision::new(3),
+        Pin::Automatic,
+    )
+    .expect("automatic fact");
 
     let stats = host
         .stats(&workspace(ImageFormat::Sparse), canonical.image())
         .expect("stats");
     assert_eq!(stats.logical_bytes, b"fixture".len() as u64);
     assert_eq!(stats.checkpoint_count, 2);
+    let first_bytes = std::fs::metadata(&first)
+        .expect("first metadata")
+        .blocks()
+        .saturating_mul(512);
+    let second_bytes = std::fs::metadata(&second)
+        .expect("second metadata")
+        .blocks()
+        .saturating_mul(512);
+    assert_eq!(stats.checkpoint_bytes, first_bytes + second_bytes);
+    assert_eq!(stats.pinned_checkpoint_bytes, first_bytes);
 
     let active = layout
         .session_image(
@@ -582,7 +608,7 @@ fn stats_count_only_images_and_gc_drains_session_trash_then_compacts_detached_sp
     create_image(&cache_image, ImageFormat::Sparse);
 
     let report = host.gc(&fixture.config()).expect("gc");
-    assert_eq!(report.examined, 2);
+    assert_eq!(report.examined, 4);
     assert_eq!(report.reclaimed, 1);
     assert!(!trash.exists());
     assert!(!sidecar_path(&trash).exists());

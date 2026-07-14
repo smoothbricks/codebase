@@ -283,6 +283,8 @@ impl Substrate for ContractSubstrate {
                 logical_bytes: workspace.revision().get(),
                 allocated_bytes: workspace.topology_revision().get(),
                 checkpoint_count: 2,
+                checkpoint_bytes: 13,
+                pinned_checkpoint_bytes: 8,
             })
         } else {
             Err("wrong workspace")
@@ -326,6 +328,8 @@ async fn finalized_substrate_surface_returns_direct_values_and_canonical_paths()
             logical_bytes: 3,
             allocated_bytes: 5,
             checkpoint_count: 2,
+            checkpoint_bytes: 13,
+            pinned_checkpoint_bytes: 8,
         }
     );
 

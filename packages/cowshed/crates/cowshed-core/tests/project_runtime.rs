@@ -54,6 +54,8 @@ struct DurableWorkspace {
     topology_revision: u64,
     grants: GrantSet,
     checkpoints: Vec<CheckpointInfo>,
+    active_bytes: u64,
+    checkpoint_bytes: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -62,6 +64,7 @@ struct DurableState {
     workspaces: Vec<DurableWorkspace>,
     pending_restore: Option<DurableWorkspace>,
     pending_has_evidence: bool,
+    checkpoint_quotas: std::collections::BTreeMap<String, CheckpointQuota>,
 }
 
 struct FakeHost {
@@ -223,6 +226,8 @@ impl FakeHost {
             ))
             .expect("test grants"),
             checkpoints: Vec::new(),
+            active_bytes: 10,
+            checkpoint_bytes: std::collections::BTreeMap::new(),
         }
     }
 
@@ -449,6 +454,29 @@ impl ProjectRuntimeHost for FakeHost {
                 "choose another label",
             ));
         }
+        if let Some(quota) = self.state.checkpoint_quotas.get(workspace.as_str()) {
+            let existing_bytes = current
+                .checkpoint_bytes
+                .values()
+                .try_fold(0_u64, |sum, bytes| sum.checked_add(*bytes))
+                .ok_or_else(|| {
+                    CowshedError::integrity("checkpoint byte overflow", "test fixture")
+                })?;
+            let projected_bytes = existing_bytes
+                .checked_add(current.active_bytes)
+                .ok_or_else(|| {
+                    CowshedError::integrity("checkpoint byte overflow", "test fixture")
+                })?;
+            let projected_count = u64::try_from(current.checkpoints.len()).map_err(|_| {
+                CowshedError::integrity("checkpoint count overflow", "test fixture")
+            })? + 1;
+            if projected_count > u64::from(quota.max_count) || projected_bytes > quota.max_bytes {
+                return Err(CowshedError::conflict(
+                    "checkpoint quota exceeded",
+                    "raise quota or remove checkpoints",
+                ));
+            }
+        }
         let current = self.workspace_mut(&workspace)?;
         current.lifecycle_revision += 1;
         current.checkpoints.push(CheckpointInfo {
@@ -456,6 +484,9 @@ impl ProjectRuntimeHost for FakeHost {
             revision: current.lifecycle_revision,
             pinned: options.keep || explicitly_labeled,
         });
+        current
+            .checkpoint_bytes
+            .insert(label.clone(), current.active_bytes);
         self.persist()?;
         Ok(CheckpointResult { label })
     }
@@ -586,9 +617,13 @@ impl ProjectRuntimeHost for FakeHost {
     async fn set_checkpoint_quota(
         &mut self,
         workspace: WorkspaceName,
-        _quota: CheckpointQuota,
+        quota: CheckpointQuota,
     ) -> Result<()> {
-        self.workspace(&workspace).map(|_| ())
+        self.workspace(&workspace)?;
+        self.state
+            .checkpoint_quotas
+            .insert(workspace.to_string(), quota);
+        self.persist()
     }
 
     async fn rebase(&mut self, workspace: WorkspaceName, options: RebaseOptions) -> Result<GitOid> {
@@ -851,6 +886,31 @@ async fn adopt(router: &RouterHandle, repo: &RepoId) -> Value {
     )
     .await
     .expect("adopt")
+}
+
+async fn checkpoint_as_worker(
+    router: &RouterHandle,
+    repo: &RepoId,
+    workspace: &str,
+    incarnation: &WorkspaceIncarnation,
+    options: CheckpointOptions,
+) -> Result<Value> {
+    route(
+        router,
+        ConnectionAuthority::Worker {
+            repo_id: repo.clone(),
+            workspace: WorkspaceName::new(workspace).expect("workspace"),
+            workspace_incarnation: incarnation.clone(),
+        },
+        "worker.checkpoint",
+        json!({
+            "repoId": repo,
+            "workspace": workspace,
+            "workspaceIncarnation": incarnation,
+            "options": options
+        }),
+    )
+    .await
 }
 
 #[tokio::test]
@@ -1203,6 +1263,137 @@ async fn labeled_checkpoint_is_pinned_and_projected_without_mount_inspection() {
     assert_eq!(
         info["checkpoints"],
         json!([{ "label": "handoff", "revision": 2, "pinned": true }])
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_quota_charges_active_plus_all_workspace_checkpoints_at_exact_boundary() {
+    let root = test_root();
+    let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
+    let main = adopt(&router, &repo).await;
+    let other = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.create",
+        json!({ "repoId": repo, "workspace": "other", "options": CreateOptions::default() }),
+    )
+    .await
+    .expect("create other");
+    let main_incarnation: WorkspaceIncarnation =
+        serde_json::from_value(main["info"]["workspaceIncarnation"].clone())
+            .expect("main incarnation");
+    let other_incarnation: WorkspaceIncarnation =
+        serde_json::from_value(other["info"]["workspaceIncarnation"].clone())
+            .expect("other incarnation");
+
+    for (workspace, quota) in [
+        (
+            "main",
+            CheckpointQuota {
+                max_count: 3,
+                max_bytes: 30,
+            },
+        ),
+        (
+            "other",
+            CheckpointQuota {
+                max_count: 1,
+                max_bytes: 10,
+            },
+        ),
+    ] {
+        route(
+            &router,
+            coordinator(repo.clone()),
+            "coordinator.setCheckpointQuota",
+            json!({ "repoId": repo, "workspace": workspace, "quota": quota }),
+        )
+        .await
+        .expect("set quota");
+    }
+
+    checkpoint_as_worker(
+        &router,
+        &repo,
+        "main",
+        &main_incarnation,
+        CheckpointOptions {
+            label: Some("pinned".into()),
+            keep: false,
+        },
+    )
+    .await
+    .expect("pinned checkpoint");
+    checkpoint_as_worker(
+        &router,
+        &repo,
+        "main",
+        &main_incarnation,
+        CheckpointOptions::default(),
+    )
+    .await
+    .expect("automatic checkpoint");
+    checkpoint_as_worker(
+        &router,
+        &repo,
+        "other",
+        &other_incarnation,
+        CheckpointOptions::default(),
+    )
+    .await
+    .expect("other workspace exact boundary");
+    checkpoint_as_worker(
+        &router,
+        &repo,
+        "main",
+        &main_incarnation,
+        CheckpointOptions::default(),
+    )
+    .await
+    .expect("main exact count and byte boundary ignores other workspace");
+
+    let exact = route(
+        &router,
+        coordinator(repo.clone()),
+        "workspace.info",
+        json!({ "repoId": repo, "workspace": "main" }),
+    )
+    .await
+    .expect("main info");
+    assert_eq!(
+        exact["checkpoints"].as_array().expect("checkpoints").len(),
+        3
+    );
+    assert_eq!(exact["checkpoints"][0]["pinned"], true);
+    assert_eq!(exact["checkpoints"][1]["pinned"], false);
+
+    route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.setCheckpointQuota",
+        json!({
+            "repoId": repo,
+            "workspace": "main",
+            "quota": CheckpointQuota { max_count: 4, max_bytes: 39 }
+        }),
+    )
+    .await
+    .expect("lower byte headroom");
+    let before = std::fs::read(root.join("durable.json")).expect("durable before denial");
+    let error = checkpoint_as_worker(
+        &router,
+        &repo,
+        "main",
+        &main_incarnation,
+        CheckpointOptions::default(),
+    )
+    .await
+    .expect_err("one byte over quota");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_eq!(
+        std::fs::read(root.join("durable.json")).expect("durable after denial"),
+        before,
+        "quota denial must publish no checkpoint fact or metadata"
     );
 }
 

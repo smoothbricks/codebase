@@ -224,6 +224,17 @@ fn checkpoint_fact_path(image: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn allocated_file_bytes(metadata: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        metadata.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.len()
+    }
+}
+
 fn pre_cowshed_path(project_root: &Path) -> PathBuf {
     let mut path = project_root.as_os_str().to_owned();
     path.push(".pre-cowshed");
@@ -3040,34 +3051,87 @@ where
         if detached.publication_state == PublicationState::PendingFence {
             return Err(ApfsStorageError::PendingPublication(image.to_owned()));
         }
+        if detached.repo_id != *workspace.repo()
+            || detached.workspace != *workspace.name()
+            || detached.workspace_incarnation != *workspace.incarnation()
+            || detached.image_format != workspace.format()
+        {
+            return Err(ApfsStorageError::MarkerMismatch(format!(
+                "detached metadata disagrees with active image {}",
+                image.display()
+            )));
+        }
         let metadata =
             fs::metadata(image).map_err(|error| io_error("read image statistics", image, error))?;
-        #[cfg(unix)]
-        let allocated_bytes = metadata.blocks().saturating_mul(512);
-        #[cfg(not(unix))]
-        let allocated_bytes = metadata.len();
-        let checkpoint_directory = layout(&self.config, workspace.repo())?
+        let allocated_bytes = allocated_file_bytes(&metadata);
+        let storage = layout(&self.config, workspace.repo())?;
+        let checkpoint_directory = storage
             .project()
             .checkpoints
             .join(workspace.name().as_str());
-        let checkpoint_count = match fs::read_dir(&checkpoint_directory) {
-            Ok(entries) => entries
-                .filter_map(Result::ok)
-                .filter(|entry| ImageFormat::from_image_path(&entry.path()).is_ok())
-                .count() as u64,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
-            Err(error) => {
-                return Err(io_error(
-                    "enumerate checkpoints",
-                    &checkpoint_directory,
-                    error,
-                ));
+        let mut checkpoint_count = 0_u64;
+        let mut checkpoint_bytes = 0_u64;
+        let mut pinned_checkpoint_bytes = 0_u64;
+        for checkpoint_image in regular_file_children(&checkpoint_directory)? {
+            if ImageFormat::from_image_path(&checkpoint_image).is_err() {
+                continue;
             }
-        };
+            let fact_path = checkpoint_fact_path(&checkpoint_image);
+            let fact: CheckpointFactWire = crate::metadata::read_json(&fact_path)
+                .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+            let expected_label = checkpoint_image
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or_else(|| {
+                    ApfsStorageError::Host(format!(
+                        "invalid checkpoint image name: {}",
+                        checkpoint_image.display()
+                    ))
+                })?;
+            if fact.version != CHECKPOINT_FACT_VERSION
+                || fact.repo_id != *workspace.repo()
+                || fact.workspace != *workspace.name()
+                || fact.label.as_str() != expected_label
+            {
+                return Err(ApfsStorageError::Host(format!(
+                    "checkpoint fact does not match image path: {}",
+                    fact_path.display()
+                )));
+            }
+            let bytes =
+                allocated_file_bytes(&fs::metadata(&checkpoint_image).map_err(|error| {
+                    io_error("read checkpoint statistics", &checkpoint_image, error)
+                })?);
+            checkpoint_count = checkpoint_count
+                .checked_add(1)
+                .ok_or(ApfsStorageError::InvalidPlan("checkpoint count overflow"))?;
+            checkpoint_bytes =
+                checkpoint_bytes
+                    .checked_add(bytes)
+                    .ok_or(ApfsStorageError::InvalidPlan(
+                        "checkpoint byte accounting overflow",
+                    ))?;
+            match fact.pin.as_str() {
+                "pinned" => {
+                    pinned_checkpoint_bytes = pinned_checkpoint_bytes.checked_add(bytes).ok_or(
+                        ApfsStorageError::InvalidPlan("pinned checkpoint byte accounting overflow"),
+                    )?;
+                }
+                "automatic" => {}
+                _ => {
+                    return Err(ApfsStorageError::Host(format!(
+                        "invalid checkpoint pin in {}",
+                        fact_path.display()
+                    )));
+                }
+            }
+        }
         Ok(SubstrateStats {
             logical_bytes: metadata.len(),
             allocated_bytes,
             checkpoint_count,
+            checkpoint_bytes,
+            pinned_checkpoint_bytes,
         })
     }
 

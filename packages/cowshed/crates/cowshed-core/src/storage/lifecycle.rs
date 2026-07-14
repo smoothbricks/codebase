@@ -615,6 +615,10 @@ pub struct SubstrateStats {
     pub logical_bytes: u64,
     pub allocated_bytes: u64,
     pub checkpoint_count: u64,
+    /// Allocated bytes consumed by every published checkpoint for this workspace.
+    pub checkpoint_bytes: u64,
+    /// The authoritative pinned subset of `checkpoint_bytes`.
+    pub pinned_checkpoint_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

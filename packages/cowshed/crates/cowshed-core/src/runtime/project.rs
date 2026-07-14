@@ -1613,6 +1613,70 @@ impl NativeProjectRuntimeHost {
         }
     }
 
+    async fn checkpoint_quota(&self, workspace: &WorkspaceName) -> Result<Option<CheckpointQuota>> {
+        let path = self.layout.project().policy.clone();
+        let workspace = workspace.to_string();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            let policy: std::collections::BTreeMap<String, CheckpointQuota> =
+                match crate::metadata::read_json(&path) {
+                    Ok(policy) => policy,
+                    Err(crate::metadata::MetadataError::Io { source, .. })
+                        if source.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                };
+            Ok(policy.get(&workspace).copied())
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("checkpoint quota task failed: {error}")))?
+        .map_err(native_integrity_error)
+    }
+
+    async fn enforce_checkpoint_quota(&self, workspace: &NativeWorkspace) -> Result<()> {
+        use crate::storage::lifecycle::Substrate;
+
+        let Some(quota) = self
+            .checkpoint_quota(workspace.derived.workspace.name())
+            .await?
+        else {
+            return Ok(());
+        };
+        let stats = self
+            .substrate
+            .stats(&workspace.derived.workspace)
+            .await
+            .map_err(native_storage_error)?;
+        if stats.pinned_checkpoint_bytes > stats.checkpoint_bytes {
+            return Err(CowshedError::integrity(
+                "pinned checkpoint bytes exceed total checkpoint bytes",
+                "run cowshed doctor --json",
+            ));
+        }
+        let projected_count = stats.checkpoint_count.checked_add(1).ok_or_else(|| {
+            CowshedError::integrity("checkpoint count overflow", "run cowshed gc")
+        })?;
+        let projected_bytes = stats
+            .checkpoint_bytes
+            .checked_add(stats.allocated_bytes)
+            .ok_or_else(|| {
+                CowshedError::integrity("checkpoint byte accounting overflow", "run cowshed gc")
+            })?;
+        if projected_count > u64::from(quota.max_count) || projected_bytes > quota.max_bytes {
+            return Err(CowshedError::conflict(
+                format!(
+                    "checkpoint quota exceeded for {}: projected {projected_count} checkpoints and {projected_bytes} bytes, limit {} checkpoints and {} bytes",
+                    workspace.derived.workspace.name(),
+                    quota.max_count,
+                    quota.max_bytes
+                ),
+                "remove or unpin checkpoints, raise the workspace quota, or run cowshed gc",
+            ));
+        }
+        Ok(())
+    }
+
     async fn operation_identity(
         &self,
         grants: GrantSet,
@@ -2138,6 +2202,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             )
         }))
         .map_err(native_integrity_error)?;
+        self.enforce_checkpoint_quota(&current).await?;
         let handle = self.ensure_supervisor(&workspace).await?;
         let barrier_id = u64::try_from(current.derived.checkpoints.len())
             .map_err(|_| CowshedError::internal("checkpoint count overflow"))?

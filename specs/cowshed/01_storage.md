@@ -278,6 +278,12 @@ _conventions_, enforced by `cowshed gc`, never by a background daemon deleting w
   14 days old **and** is not among the newest five for that workspace. A user-supplied label creates an explicit pin;
   `--keep` pins the generated or supplied label. Pin state is authoritative detached metadata, not inferred from a
   filename, and an explicit unpin is required before such a checkpoint is eligible.
+- Checkpoint quota accounting is per workspace. One authoritative `SubstrateStats` read reports the active image's
+  logical and allocated bytes, all published checkpoint allocated bytes/count, and the pinned checkpoint byte subset.
+  Admission projects `existing checkpoint bytes + active allocated bytes` and `existing count + 1`; pinned and automatic
+  checkpoints both consume the cap. Exact `<=` boundaries are admitted, while `>` returns `Conflict` before cloning or
+  publishing any checkpoint image, fact, or detached metadata. A sibling workspace never consumes this workspace's
+  coordinator-owned quota.
 - `cowshed gc` is the single enforcement point: drain trash, prune expired checkpoints, remove orphan mountpoints,
   `hdiutil compact` detached images whose written size exceeds referenced by a threshold, and (on ZFS) prune orphaned
   `cowshed:*` origin snapshots (09_substrates.md). It reports freed bytes on stdout; `--dry-run` lists what it would
