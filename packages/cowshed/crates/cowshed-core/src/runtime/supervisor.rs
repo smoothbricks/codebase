@@ -3117,20 +3117,28 @@ mod lifecycle_commitment_tests {
         assert!(!admitted.contains(&foreign_only));
         assert!(!admitted.contains(&baseline_only));
 
-        let mut config = WorkspaceSupervisorConfig::default();
-        config.authority = WorkspaceAuthoritySnapshot {
-            repo_id: repo_id.clone(),
-            workspace: WorkspaceName::new("raven").unwrap(),
-            workspace_incarnation: second_destination.clone(),
-            grant_revision: 8,
-            lifecycle_revision: 2,
-        };
-        config.workspace_root = workspace_root.clone();
-        config.default_cwd = None;
-        config.sandbox.workspace_mount = workspace_root.clone();
-        config.artifacts = ArtifactConfig {
-            admitted_historical_incarnations: admitted.clone(),
-            ..ArtifactConfig::default()
+        let defaults = WorkspaceSupervisorConfig::default();
+        let config = WorkspaceSupervisorConfig {
+            authority: WorkspaceAuthoritySnapshot {
+                repo_id: repo_id.clone(),
+                workspace: WorkspaceName::new("raven").unwrap(),
+                workspace_incarnation: second_destination.clone(),
+                grant_revision: 8,
+                lifecycle_revision: 2,
+            },
+            workspace_root: workspace_root.clone(),
+            default_cwd: None,
+            sandbox: SandboxConfig {
+                workspace_mount: workspace_root.clone(),
+                ..defaults.sandbox
+            },
+            artifacts: ArtifactConfig {
+                admitted_historical_incarnations: admitted.clone(),
+                ..ArtifactConfig::default()
+            },
+            term_grace: defaults.term_grace,
+            actor_capacity: defaults.actor_capacity,
+            event_capacity: defaults.event_capacity,
         };
         let first_supervisor =
             WorkspaceSupervisor::start(config.clone(), publisher.clone()).unwrap();
