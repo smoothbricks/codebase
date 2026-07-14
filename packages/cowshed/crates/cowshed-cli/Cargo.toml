@@ -9,6 +9,10 @@ name = "cowshed"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
 cowshed-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true

@@ -1,56 +1,128 @@
 use std::ffi::{OsStr, OsString};
 use std::io;
 
-use cowshed_cli::{args, output};
+use cowshed_cli::{args, output, runtime};
 use cowshed_core::CowshedError;
 
-fn main() {
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let json = option_before_child_argv(&args, "--json");
-    let quiet = option_before_child_argv(&args, "--quiet") || option_before_child_argv(&args, "-q");
-    let (error, command_map) = match args::parse_args(args) {
-        Ok(cli) => {
-            let _validated_command = cli.command;
-            (
-                CowshedError::environment_missing(
-                    "cowshed command dispatch is not available in this Phase 1 build",
-                    "use the cowshed-core API until Phase 2 adapter wiring is installed",
-                ),
-                None,
-            )
-        }
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    std::process::exit(run().await);
+}
+
+async fn run() -> i32 {
+    let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let json = option_before_child_argv(&arguments, "--json");
+    let quiet = option_before_child_argv(&arguments, "--quiet")
+        || option_before_child_argv(&arguments, "-q");
+    match parse_then_invoke_service(arguments, |parsed| run_parsed(parsed, json)).await {
+        Ok(exit_code) => exit_code,
         Err(error) => {
             let command_map = error.command_map();
-            (CowshedError::usage(error.message, error.hint), command_map)
+            let error = CowshedError::usage(error.message, error.hint);
+            emit_error(error, command_map, json, quiet)
         }
-    };
-    let exit_code = error.exit_code();
+    }
+}
+
+async fn parse_then_invoke_service<F, Fut>(
+    arguments: Vec<OsString>,
+    invoke: F,
+) -> Result<i32, args::UsageError>
+where
+    F: FnOnce(args::Cli) -> Fut,
+    Fut: Future<Output = i32>,
+{
+    let parsed = args::parse_args(arguments)?;
+    Ok(invoke(parsed).await)
+}
+
+async fn run_parsed(parsed: args::Cli, json: bool) -> i32 {
     let stdout = io::stdout();
     let stderr = io::stderr();
-    let mut output = output::Output::new(stdout.lock(), stderr.lock(), quiet);
-    let result = if json {
-        output.json_error(error)
-    } else {
-        output
-            .error(&error.message)
-            .and_then(|()| {
-                if let Some(command_map) = command_map {
-                    output.error(command_map)
-                } else {
-                    Ok(())
-                }
-            })
-            .and_then(|()| output.hint(&error.hint))
-    };
-    if let Err(write_error) = result {
-        eprintln!("cowshed: failed to write command result: {write_error}");
-        std::process::exit(1);
+    let mut output = output::Output::new(stdout, stderr, parsed.global.quiet);
+    match runtime::run_bridge_command(parsed, tokio::io::stdin(), &mut output).await {
+        Ok(exit) => exit.code,
+        Err(error) => {
+            let exit_code = i32::from(error.exit_code());
+            if let Err(write_error) = write_error(&mut output, error, json, None) {
+                eprintln!("cowshed: failed to write command result: {write_error}");
+                1
+            } else {
+                exit_code
+            }
+        }
     }
-    std::process::exit(exit_code.into());
+}
+
+fn emit_error(error: CowshedError, command_map: Option<&str>, json: bool, quiet: bool) -> i32 {
+    let exit_code = i32::from(error.exit_code());
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    let mut output = output::Output::new(stdout, stderr, quiet);
+    if let Err(write_error) = write_error(&mut output, error, json, command_map) {
+        eprintln!("cowshed: failed to write command result: {write_error}");
+        1
+    } else {
+        exit_code
+    }
+}
+
+fn write_error<W: io::Write, E: io::Write>(
+    output: &mut output::Output<W, E>,
+    error: CowshedError,
+    json: bool,
+    command_map: Option<&str>,
+) -> io::Result<()> {
+    if json {
+        return output.json_error(error);
+    }
+    output.error(&error.message)?;
+    if let Some(command_map) = command_map {
+        output.error(command_map)?;
+    }
+    output.hint(&error.hint)
 }
 
 fn option_before_child_argv(args: &[OsString], option: &str) -> bool {
     args.iter()
         .take_while(|argument| argument.as_os_str() != OsStr::new("--"))
         .any(|argument| argument == option)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[tokio::test]
+    async fn parser_invalid_invocations_never_invoke_a_service() {
+        let invocations = [
+            vec!["--json", "exec", "raven", "--unknown"],
+            Vec::new(),
+            vec![
+                "exec",
+                "raven",
+                "--stdin",
+                "--stdin-file",
+                "input",
+                "--",
+                "--json",
+            ],
+        ];
+
+        for invocation in invocations {
+            let service_invoked = Cell::new(false);
+            let result = parse_then_invoke_service(
+                invocation.into_iter().map(OsString::from).collect(),
+                |_| {
+                    service_invoked.set(true);
+                    async { 0 }
+                },
+            )
+            .await;
+
+            assert!(result.is_err());
+            assert!(!service_invoked.get());
+        }
+    }
 }
