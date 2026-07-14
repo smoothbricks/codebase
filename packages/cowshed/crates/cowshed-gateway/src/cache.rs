@@ -185,7 +185,7 @@ impl Cache {
         let entries = load_entries(&config.root).await?;
         let config = Arc::new(config);
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
-        let actor = CacheActor::new(Arc::clone(&config), entries, commands.clone(), receiver);
+        let actor = CacheActor::new(Arc::clone(&config), entries, commands.downgrade(), receiver);
         tokio::spawn(actor.run());
         Ok(Self { commands, config })
     }
@@ -771,7 +771,7 @@ struct CacheActor {
     config: Arc<CacheConfig>,
     entries: HashMap<[u8; 32], Entry>,
     fills: HashMap<[u8; 32], FillStateEntry>,
-    commands: mpsc::Sender<Command>,
+    commands: mpsc::WeakSender<Command>,
     receiver: mpsc::Receiver<Command>,
     next_generation: u64,
     next_access: u64,
@@ -782,7 +782,7 @@ impl CacheActor {
     fn new(
         config: Arc<CacheConfig>,
         entries: HashMap<[u8; 32], Entry>,
-        commands: mpsc::Sender<Command>,
+        commands: mpsc::WeakSender<Command>,
         receiver: mpsc::Receiver<Command>,
     ) -> Self {
         let total_bytes = entries.values().map(|entry| entry.stored_bytes).sum();
@@ -940,7 +940,7 @@ impl CacheActor {
                 },
             );
             return Ok(CacheAcquire::Fill(FillPermit {
-                commands: self.commands.clone(),
+                commands: self.commands.upgrade().ok_or(CacheError::ActorStopped)?,
                 digest,
                 generation,
                 previous: Some(candidate),
@@ -956,7 +956,7 @@ impl CacheActor {
             },
         );
         Ok(CacheAcquire::Fill(FillPermit {
-            commands: self.commands.clone(),
+            commands: self.commands.upgrade().ok_or(CacheError::ActorStopped)?,
             digest,
             generation,
             previous: None,
