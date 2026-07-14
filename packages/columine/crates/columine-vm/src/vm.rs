@@ -1219,6 +1219,149 @@ struct StructUpsertResult {
     pos: u32,
 }
 
+const MAX_STRUCT_SCALAR_OPERANDS: usize = 32;
+const MAX_STRUCT_ARRAY_OPERANDS: usize = 16;
+
+#[derive(Clone, Copy)]
+struct StructMapUpsertOperands {
+    slot: u8,
+    key_col: u8,
+    num_vals: usize,
+    scalar_pairs_start: usize,
+    num_array_vals: usize,
+    array_triples_start: usize,
+    comparison_field_idx: Option<u8>,
+    end: usize,
+}
+
+/// Decode the shared 0x80/0x81 row operands and 0x82's trailing comparison
+/// ordinal without mutating state. Fixed operand arrays in both dispatch paths
+/// make their encoded maxima part of the accepted-program contract.
+fn decode_struct_map_upsert_operands(
+    code: &[u8],
+    start: usize,
+    has_comparison: bool,
+) -> Option<StructMapUpsertOperands> {
+    let header_end = start.checked_add(3)?;
+    let header = code.get(start..header_end)?;
+    let num_vals = usize::from(header[2]);
+    if num_vals > MAX_STRUCT_SCALAR_OPERANDS {
+        return None;
+    }
+
+    let scalar_pairs_start = header_end;
+    let array_count_at = scalar_pairs_start.checked_add(num_vals.checked_mul(2)?)?;
+    let num_array_vals = usize::from(*code.get(array_count_at)?);
+    if num_array_vals > MAX_STRUCT_ARRAY_OPERANDS {
+        return None;
+    }
+
+    let array_triples_start = array_count_at.checked_add(1)?;
+    let comparison_at = array_triples_start.checked_add(num_array_vals.checked_mul(3)?)?;
+    let (comparison_field_idx, end) = if has_comparison {
+        (
+            Some(*code.get(comparison_at)?),
+            comparison_at.checked_add(1)?,
+        )
+    } else {
+        (None, comparison_at)
+    };
+
+    Some(StructMapUpsertOperands {
+        slot: header[0],
+        key_col: header[1],
+        num_vals,
+        scalar_pairs_start,
+        num_array_vals,
+        array_triples_start,
+        comparison_field_idx,
+        end,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct StructMapMaxComparison {
+    field_idx: u8,
+    col: u8,
+    field_type: StructFieldType,
+    cmp_type: CmpType,
+}
+
+/// Resolve and validate 0x82's comparison lane before processing any rows.
+/// The comparison ordinal must name a mapped scalar field.
+fn resolve_struct_map_max_comparison(
+    state: &[u8],
+    smap: &StructMapSlot,
+    scalar_pairs: &[u8],
+    comparison_field_idx: u8,
+) -> Option<StructMapMaxComparison> {
+    if comparison_field_idx >= smap.num_fields {
+        return None;
+    }
+    let field_type = StructFieldType::from_u8(smap.field_type_byte(state, comparison_field_idx))?;
+    let cmp_type = match field_type {
+        StructFieldType::UInt32 | StructFieldType::String | StructFieldType::Bool => CmpType::U32,
+        StructFieldType::Int64 => CmpType::I64,
+        StructFieldType::Float64 => CmpType::F64,
+        StructFieldType::ArrayU32
+        | StructFieldType::ArrayI64
+        | StructFieldType::ArrayF64
+        | StructFieldType::ArrayString
+        | StructFieldType::ArrayBool => return None,
+    };
+    let col = scalar_pairs
+        .chunks_exact(2)
+        .find_map(|pair| (pair[1] == comparison_field_idx).then_some(pair[0]))?;
+    Some(StructMapMaxComparison {
+        field_idx: comparison_field_idx,
+        col,
+        field_type,
+        cmp_type,
+    })
+}
+
+/// Decide a struct-map arg-max before bitset clearing, journaling, row writes,
+/// or change flags. Missing keys or missing stored comparison fields accept;
+/// equal and lower values are true no-ops.
+fn should_upsert_struct_map_max(
+    state: &[u8],
+    smap: &StructMapSlot,
+    key: u32,
+    comparison: StructMapMaxComparison,
+    cols: &[&[u8]],
+    element_idx: u32,
+) -> bool {
+    let Some(position) = smap.find(state, key) else {
+        return true;
+    };
+    let row = smap.row_off(position);
+    if !StructMapSlot::is_field_set(state, row, comparison.field_idx) {
+        return true;
+    }
+
+    let field_offset = row + smap.field_offset(state, comparison.field_idx);
+    let existing = match comparison.field_type {
+        StructFieldType::UInt32 | StructFieldType::String => {
+            u64::from(bytes::read_u32(state, field_offset))
+        }
+        StructFieldType::Bool => {
+            u64::from(state[usize::try_from(field_offset).expect("state offset fits usize")])
+        }
+        StructFieldType::Int64 | StructFieldType::Float64 => bytes::read_u64(state, field_offset),
+        StructFieldType::ArrayU32
+        | StructFieldType::ArrayI64
+        | StructFieldType::ArrayF64
+        | StructFieldType::ArrayString
+        | StructFieldType::ArrayBool => unreachable!("comparison kind validated as scalar"),
+    };
+    let incoming = hashmap_ops::read_cmp_value(
+        col_at(cols, usize::from(comparison.col)),
+        element_idx,
+        comparison.cmp_type,
+    );
+    hashmap_ops::cmp_gt(incoming, existing, comparison.cmp_type)
+}
+
 /// vm.zig:1080 `singleStructMapUpsertLast`.
 #[allow(clippy::too_many_arguments)]
 fn single_struct_map_upsert_last(
@@ -1709,8 +1852,9 @@ const fn agg_op_len(op_byte: u8) -> u32 {
 }
 
 /// vm.zig:1895 `bodyOpLen` — length (incl. opcode) of a non-agg body op.
-fn body_op_len(code: &[u8], pc: usize) -> u32 {
-    match code[pc] {
+fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
+    let op = *code.get(pc)?;
+    let len = match op {
         0x20 => 6,
         0x21 | 0x22 => 4,
         0x23 => 3,
@@ -1723,14 +1867,16 @@ fn body_op_len(code: &[u8], pc: usize) -> u32 {
         0x2C | 0x2D => 7,
         //#region axe!n/reduce-typed-state.probe-len
         0x2e => {
-            let num_fields = u32::from(code[pc + 5]);
-            6 + num_fields * 2 + 1
+            let num_fields = usize::from(*code.get(pc.checked_add(5)?)?);
+            6usize
+                .checked_add(num_fields.checked_mul(2)?)?
+                .checked_add(1)?
         }
         //#endregion axe!n/reduce-typed-state.probe-len
         //#region axe!n/reduce-typed-state.scatter-len
         0x2f => {
-            let num_routes = u32::from(code[pc + 6]);
-            7 + num_routes * 5
+            let num_routes = usize::from(*code.get(pc.checked_add(6)?)?);
+            7usize.checked_add(num_routes.checked_mul(5)?)?
         }
         //#endregion axe!n/reduce-typed-state.scatter-len
         0x30 | 0x31 => 3,
@@ -1742,27 +1888,28 @@ fn body_op_len(code: &[u8], pc: usize) -> u32 {
         0x45 => 3,
         0x46..=0x48 => 4,
         0x49..=0x4b => 3,
-        // STRUCT_MAP_UPSERT_LAST/FIRST: identical variable-length encoding (vm.zig:1958)
-        0x80 | 0x81 => {
-            let num_vals = u32::from(code[pc + 3]);
-            let scalar_end = 4 + num_vals * 2;
-            let num_array_vals = u32::from(code[pc + scalar_end as usize]);
-            scalar_end + 1 + num_array_vals * 3
+        // STRUCT_MAP_UPSERT_LAST/FIRST/MAX: max appends one comparison ordinal.
+        0x80 | 0x81 | 0x82 => {
+            let operands = decode_struct_map_upsert_operands(code, pc.checked_add(1)?, op == 0x82)?;
+            operands.end.checked_sub(pc)?
         }
         0x84 => 3,
         0x85 => {
-            let num_vals = u32::from(code[pc + 2]);
-            3 + num_vals * 2
+            let num_vals = usize::from(*code.get(pc.checked_add(2)?)?);
+            3usize.checked_add(num_vals.checked_mul(2)?)?
         }
         0xE1 => {
-            let inner_len = u32::from(code[pc + 3]) | (u32::from(code[pc + 4]) << 8);
-            5 + inner_len
+            let low = usize::from(*code.get(pc.checked_add(3)?)?);
+            let high = usize::from(*code.get(pc.checked_add(4)?)?);
+            5usize.checked_add(low | (high << 8))?
         }
         0x90 => 4,
         0x92 => 5,
         0x95 => 4,
-        _ => 1, // unknown — advance 1 byte to avoid an infinite loop (vm.zig:1982)
-    }
+        _ => 1,
+    };
+    let end = pc.checked_add(len)?;
+    (end <= code.len()).then_some(len)
 }
 
 // =============================================================================
@@ -2268,44 +2415,76 @@ impl Vm {
                     }
                 }
 
-                Opcode::BatchStructMapUpsertLast | Opcode::BatchStructMapUpsertFirst => {
-                    let (slot, key_col, num_vals) = (code[pc], code[pc + 1], code[pc + 2] as usize);
-                    pc += 3;
-                    let mut val_cols = [0u8; 32];
-                    let mut field_idxs = [0u8; 32];
-                    for vi in 0..num_vals {
-                        val_cols[vi] = code[pc];
-                        field_idxs[vi] = code[pc + 1];
-                        pc += 2;
-                    }
-                    // vm.zig:1762 — array section parsed but unsupported in
-                    // the batch path; skipped.
-                    let num_array_vals = code[pc] as usize;
-                    pc += 1 + num_array_vals * 3;
+                Opcode::BatchStructMapUpsertLast
+                | Opcode::BatchStructMapUpsertFirst
+                | Opcode::BatchStructMapUpsertMax => {
+                    let has_comparison = op == Opcode::BatchStructMapUpsertMax;
+                    let Some(operands) =
+                        decode_struct_map_upsert_operands(code, pc, has_comparison)
+                    else {
+                        return INVALID_PROGRAM;
+                    };
+                    pc = operands.end;
 
-                    let keys = col_u32(col_at(cols, key_col as usize), batch_len);
+                    let scalar_pairs_end = operands.scalar_pairs_start + operands.num_vals * 2;
+                    let scalar_pairs = &code[operands.scalar_pairs_start..scalar_pairs_end];
+                    let mut val_cols = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
+                    let mut field_idxs = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
+                    for (vi, pair) in scalar_pairs.chunks_exact(2).enumerate() {
+                        val_cols[vi] = pair[0];
+                        field_idxs[vi] = pair[1];
+                    }
+
+                    // The top-level batch path intentionally parses but does
+                    // not materialize array operands, matching the Zig VM.
+                    let smap = StructMapSlot::bind(state, operands.slot);
+                    let comparison = match operands.comparison_field_idx {
+                        Some(field_idx) => {
+                            let Some(comparison) = resolve_struct_map_max_comparison(
+                                state,
+                                &smap,
+                                scalar_pairs,
+                                field_idx,
+                            ) else {
+                                return INVALID_PROGRAM;
+                            };
+                            Some(comparison)
+                        }
+                        None => None,
+                    };
+
+                    let keys = col_u32(col_at(cols, usize::from(operands.key_col)), batch_len);
                     for i in 0..batch_len {
-                        // 0x81 is first-wins: skip keys already present (vm.zig:1774).
-                        if op == Opcode::BatchStructMapUpsertFirst
-                            && StructMapSlot::bind(state, slot)
-                                .find(state, keys[i as usize])
-                                .is_some()
-                        {
+                        let key = keys[usize::try_from(i).expect("batch index fits usize")];
+                        let should_write = match op {
+                            Opcode::BatchStructMapUpsertFirst => smap.find(state, key).is_none(),
+                            Opcode::BatchStructMapUpsertMax => should_upsert_struct_map_max(
+                                state,
+                                &smap,
+                                key,
+                                comparison.expect("max comparison resolved"),
+                                cols,
+                                i,
+                            ),
+                            _ => true,
+                        };
+                        if !should_write {
                             continue;
                         }
+
                         let result = single_struct_map_upsert_last(
                             &mut self.undo,
                             delta_mode,
                             state,
-                            slot,
-                            keys[i as usize],
-                            &val_cols[..num_vals],
-                            &field_idxs[..num_vals],
+                            operands.slot,
+                            key,
+                            &val_cols[..operands.num_vals],
+                            &field_idxs[..operands.num_vals],
                             cols,
                             i,
                         );
                         if result.err == ErrorCode::CapacityExceeded {
-                            NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
+                            NEEDS_GROWTH_SLOT.store(operands.slot, Ordering::Relaxed);
                             return NEEDS_GROWTH;
                         }
                     }
@@ -2386,7 +2565,10 @@ impl Vm {
         while bpc < body.len() {
             let op_byte = body[bpc];
             if !is_aggregate_op(op_byte) {
-                bpc += body_op_len(body, bpc) as usize;
+                let Some(op_len) = body_op_len(body, bpc) else {
+                    return INVALID_PROGRAM;
+                };
+                bpc += op_len;
                 continue;
             }
             match op_byte {
@@ -2933,68 +3115,96 @@ impl Vm {
                     );
                 }
 
-                // STRUCT_MAP_UPSERT_LAST/FIRST (0x80/0x81, vm.zig:2747)
-                0x80 | 0x81 => {
-                    let (slot, key_col, num_vals) =
-                        (body[bpc + 1], body[bpc + 2], body[bpc + 3] as usize);
-                    bpc += 4;
+                // STRUCT_MAP_UPSERT_LAST/FIRST/MAX (0x80/0x81/0x82)
+                0x80 | 0x81 | 0x82 => {
+                    let Some(operands) =
+                        decode_struct_map_upsert_operands(body, bpc + 1, op_byte == 0x82)
+                    else {
+                        return INVALID_PROGRAM;
+                    };
+                    bpc = operands.end;
 
-                    let mut vc = [0u8; 32];
-                    let mut fi = [0u8; 32];
-                    for vi in 0..num_vals {
-                        vc[vi] = body[bpc];
-                        fi[vi] = body[bpc + 1];
-                        bpc += 2;
+                    let scalar_pairs_end = operands.scalar_pairs_start + operands.num_vals * 2;
+                    let scalar_pairs = &body[operands.scalar_pairs_start..scalar_pairs_end];
+                    let mut vc = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
+                    let mut fi = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
+                    for (vi, pair) in scalar_pairs.chunks_exact(2).enumerate() {
+                        vc[vi] = pair[0];
+                        fi[vi] = pair[1];
                     }
 
-                    let num_array_vals = body[bpc] as usize;
-                    bpc += 1;
-                    let mut aoc = [0u8; 16];
-                    let mut avc = [0u8; 16];
-                    let mut afi = [0u8; 16];
-                    for ai in 0..num_array_vals {
-                        aoc[ai] = body[bpc];
-                        avc[ai] = body[bpc + 1];
-                        afi[ai] = body[bpc + 2];
-                        bpc += 3;
+                    let mut aoc = [0u8; MAX_STRUCT_ARRAY_OPERANDS];
+                    let mut avc = [0u8; MAX_STRUCT_ARRAY_OPERANDS];
+                    let mut afi = [0u8; MAX_STRUCT_ARRAY_OPERANDS];
+                    let array_triples_end =
+                        operands.array_triples_start + operands.num_array_vals * 3;
+                    for (ai, triple) in body[operands.array_triples_start..array_triples_end]
+                        .chunks_exact(3)
+                        .enumerate()
+                    {
+                        aoc[ai] = triple[0];
+                        avc[ai] = triple[1];
+                        afi[ai] = triple[2];
                     }
 
-                    let key = cell_u32(cols, key_col, child_idx);
-                    // 0x81 is first-wins: write only when the key is absent, and
-                    // skip BOTH scalar and arena writes for an existing row —
-                    // arrays belong to the accepted row (vm.zig:2775-2798).
-                    let should_write = op_byte != 0x81
-                        || StructMapSlot::bind(state, slot).find(state, key).is_none();
+                    let smap = StructMapSlot::bind(state, operands.slot);
+                    let comparison = match operands.comparison_field_idx {
+                        Some(field_idx) => {
+                            let Some(comparison) = resolve_struct_map_max_comparison(
+                                state,
+                                &smap,
+                                scalar_pairs,
+                                field_idx,
+                            ) else {
+                                return INVALID_PROGRAM;
+                            };
+                            Some(comparison)
+                        }
+                        None => None,
+                    };
+                    let key = cell_u32(cols, operands.key_col, child_idx);
+                    let should_write = match op_byte {
+                        0x81 => smap.find(state, key).is_none(),
+                        0x82 => should_upsert_struct_map_max(
+                            state,
+                            &smap,
+                            key,
+                            comparison.expect("max comparison resolved"),
+                            cols,
+                            child_idx,
+                        ),
+                        _ => true,
+                    };
                     if should_write {
                         let result = single_struct_map_upsert_last(
                             &mut self.undo,
                             delta_mode,
                             state,
-                            slot,
+                            operands.slot,
                             key,
-                            &vc[..num_vals],
-                            &fi[..num_vals],
+                            &vc[..operands.num_vals],
+                            &fi[..operands.num_vals],
                             cols,
                             child_idx,
                         );
                         if result.err == ErrorCode::CapacityExceeded {
-                            NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
+                            NEEDS_GROWTH_SLOT.store(operands.slot, Ordering::Relaxed);
                             return NEEDS_GROWTH;
                         }
 
-                        if num_array_vals > 0 {
+                        if operands.num_array_vals > 0 {
                             let arr_result = write_struct_map_array_fields(
                                 state,
-                                slot,
+                                operands.slot,
                                 result.pos,
-                                &aoc[..num_array_vals],
-                                &avc[..num_array_vals],
-                                &afi[..num_array_vals],
+                                &aoc[..operands.num_array_vals],
+                                &avc[..operands.num_array_vals],
+                                &afi[..operands.num_array_vals],
                                 cols,
                                 child_idx,
                             );
                             if arr_result == ErrorCode::ArenaOverflow {
-                                NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
+                                NEEDS_GROWTH_SLOT.store(operands.slot, Ordering::Relaxed);
                                 return NEEDS_GROWTH;
                             }
                         }
