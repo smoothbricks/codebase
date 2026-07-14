@@ -1337,9 +1337,7 @@ impl Serialize for ControllerCommitment {
     {
         self.validate().map_err(serde::ser::Error::custom)?;
         match self {
-            Self::WorkspaceIntroduced(value) => {
-                ControllerCommitmentRef::WorkspaceIntroduced(value)
-            }
+            Self::WorkspaceIntroduced(value) => ControllerCommitmentRef::WorkspaceIntroduced(value),
             Self::WorkspaceRetired(value) => ControllerCommitmentRef::WorkspaceRetired(value),
             Self::Admission(value) => ControllerCommitmentRef::Admission(value),
             Self::Terminal(value) => ControllerCommitmentRef::Terminal(value),

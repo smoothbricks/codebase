@@ -781,8 +781,7 @@ fn controller_commitment_arrow_is_payload_free_and_round_trips_lineage() {
 #[test]
 fn workspace_lifecycle_replay_preserves_retired_jobs_and_rejects_stale_order() {
     let repo = RepoId::parse("acme/widget").unwrap();
-    let incarnation =
-        WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();
+    let incarnation = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();
     let empty = Sha256Digest::compute(&[]);
     let history = vec![
         ControllerCommitment::WorkspaceIntroduced(WorkspaceIntroducedCommitment {

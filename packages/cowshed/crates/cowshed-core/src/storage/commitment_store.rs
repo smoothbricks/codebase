@@ -163,6 +163,14 @@ impl CommitmentStore {
         self.writer_id
     }
 
+    pub(crate) fn workspace_is_introduced(&self, incarnation: &WorkspaceIncarnation) -> bool {
+        self.context.is_introduced(incarnation)
+    }
+
+    pub(crate) fn workspace_is_retired(&self, incarnation: &WorkspaceIncarnation) -> bool {
+        self.context.is_retired(incarnation)
+    }
+
     pub fn publish(
         &mut self,
         commitment: ControllerCommitment,
