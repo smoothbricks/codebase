@@ -8,7 +8,9 @@
  *   import { getBackend } from '@smoothbricks/columine';
  *   const backend = await getBackend(); // lazy-loads WASM
  *
+ * Usage via axe-runtime (superset binary injection):
  *   import { setBackend } from '@smoothbricks/columine';
+ *   setBackend(axeVmInstance); // AxeVM implements ColumineBackend
  */
 
 // Backend dependency injection

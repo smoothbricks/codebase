@@ -4,6 +4,7 @@
  * Stages: Parse | Reduce | Compact | Undo
  *
  * Each stage is independently usable — you can use Reduce without Parse,
+ * or Compact without Reduce. axe-runtime composes columine's pipeline
  * with RETE as an additional stage.
  *
  * Usage:
@@ -244,6 +245,12 @@ function createCompactStage(parseBackend: ParseCompactBackend | null): CompactSt
   };
 }
 
+//#region axe!n/reducer-speculation-undo-log #undo-log #speculation #overflow-fallback
+// The TS orchestration of 10d's delta-based undo log (Strategy 2 + §Undo Log
+// Overflow Handling): checkpoint = save Zig undo-log position (O(1)), rollback =
+// native reverse replay, commit = discard entries. The lazy-overflow shadow
+// buffer lives in Zig (vm.zig); when the backend reports overflow this stage
+// falls back to a full-state snapshot it captured at checkpoint.
 /**
  * Create undo stage with native undo log.
  *
@@ -318,11 +325,13 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
     },
   };
 }
+//#endregion axe!n/reducer-speculation-undo-log
 
 // =============================================================================
 // Pipeline Factory
 // =============================================================================
 
+//#region axe!n/columine-package.pipeline #create-pipeline #four-stages #composable
 export interface PipelineOptions {
   /** Parse/Compact backend — if not provided, parse() and encode() will throw */
   parseBackend?: ParseCompactBackend;
@@ -349,3 +358,4 @@ export async function createPipeline(options?: PipelineOptions): Promise<Columin
     undo: createUndoStage(backend),
   };
 }
+//#endregion axe!n/columine-package.pipeline
