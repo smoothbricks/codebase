@@ -27,3 +27,21 @@ bench:
 check:
     cargo check --workspace --all-targets
     cargo clippy --workspace --all-targets -- -D warnings
+
+# Proof-only timestamp artifacts consumed by AxE's timestamp accuracy harness.
+# WASM preserves the original shared, imported 16-page memory contract; NAPI
+# accepts ArrayBuffer directly and is renamed to Node's conventional .node suffix.
+timestamp-proof-artifacts:
+    LMAO_TIMESTAMP_PROOF_SHARED_MEMORY=1 RUSTC_BOOTSTRAP=1 \
+    RUSTFLAGS="-Aunstable-features -Ctarget-feature=+atomics,+bulk-memory,+mutable-globals" \
+    cargo build -p lmao-timestamp-proof --target wasm32-unknown-unknown --profile wasm-release \
+        -Zbuild-std=core,panic_abort
+    cargo build -p lmao-timestamp-proof --features napi --release
+    mkdir -p dist/timestamp-accuracy
+    cp target/wasm32-unknown-unknown/wasm-release/lmao_timestamp_proof.wasm dist/timestamp-accuracy/span_start.wasm
+    @case "$(uname -s)" in \
+      Darwin) lib=target/release/liblmao_timestamp_proof.dylib ;; \
+      Linux) lib=target/release/liblmao_timestamp_proof.so ;; \
+      *) echo "unsupported timestamp-proof NAPI host: $(uname -s)" >&2; exit 1 ;; \
+    esac; cp "$lib" dist/timestamp-accuracy/span_start.node
+    @ls -la dist/timestamp-accuracy/span_start.wasm dist/timestamp-accuracy/span_start.node
