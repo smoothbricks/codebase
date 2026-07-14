@@ -30,6 +30,7 @@ static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Event {
     SnapshotBatch,
+    SecretScan,
     Initialize(WorkspaceName),
     Publish(WorkspaceName),
     Stop(WorkspaceName),
@@ -76,6 +77,8 @@ impl FakeHost {
         fail_restore_fence_once: bool,
         doctor_findings: Vec<Finding>,
     ) -> Self {
+        std::fs::create_dir_all(root.join("checkout")).expect("create fake checkout");
+
         let repo_id = RepoId::parse("acme/widget").expect("fixed repo id");
         let binding = RepositoryBinding::new(vec![BoundIdentity {
             repo_id: repo_id.clone(),
@@ -268,7 +271,7 @@ impl ProjectRuntimeHost for FakeHost {
             .collect())
     }
 
-    async fn adopt(&mut self, _options: AdoptOptions) -> Result<WorkspaceSnapshot> {
+    async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceSnapshot> {
         let name = WorkspaceName::new("main").expect("main");
         if self
             .state
@@ -281,6 +284,39 @@ impl ProjectRuntimeHost for FakeHost {
                 "use cowshed list",
             ));
         }
+        self.events.send(Event::SecretScan).ok();
+        let scan = cowshed_core::secrets::scan_tree(&self.descriptor.git_root, &[])
+            .map_err(|error| CowshedError::internal(error.to_string()))?;
+        if !scan.findings.is_empty() && !options.quarantine {
+            return Err(CowshedError::conflict(
+                "repository contains secrets",
+                "retry with quarantine",
+            ));
+        }
+        if options.quarantine {
+            for path in scan
+                .findings
+                .iter()
+                .map(|finding| &finding.path)
+                .collect::<std::collections::BTreeSet<_>>()
+            {
+                let source = self.descriptor.git_root.join(path);
+                let destination = self.descriptor.store_root.join("quarantine").join(path);
+                std::fs::create_dir_all(destination.parent().expect("quarantine parent"))
+                    .map_err(|error| CowshedError::internal(error.to_string()))?;
+                std::fs::rename(&source, &destination)
+                    .map_err(|error| CowshedError::internal(error.to_string()))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(
+                        &destination,
+                        std::fs::Permissions::from_mode(0o600),
+                    )
+                    .map_err(|error| CowshedError::internal(error.to_string()))?;
+                }
+            }
+        }
         let workspace = self.next_workspace(name.clone());
         self.events.send(Event::Initialize(name.clone())).ok();
         self.state.workspaces.push(workspace.clone());
@@ -288,6 +324,7 @@ impl ProjectRuntimeHost for FakeHost {
         self.events.send(Event::Publish(name)).ok();
         Ok(self.snapshot(&workspace))
     }
+
 
     async fn create(
         &mut self,
@@ -804,6 +841,60 @@ async fn router_decodes_tagged_non_utf8_argv_without_a_string_boundary() {
         assert_eq!(error.code, ErrorCode::Usage);
         assert!(events.try_recv().is_err(), "invalid argv reached the host");
     }
+}
+
+#[tokio::test]
+async fn secret_refusal_precedes_image_initialization_and_quarantine_preserves_paths() {
+    let root = test_root();
+    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    let secret = root.join("checkout/.env");
+    std::fs::write(&secret, "API_TOKEN=not-for-images").expect("write secret");
+
+    let error = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.adopt",
+        json!({ "repoId": repo, "options": AdoptOptions::default() }),
+    )
+    .await
+    .expect_err("secret must refuse adopt");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_eq!(events.recv().await, Some(Event::SecretScan));
+    assert!(events.try_recv().is_err(), "refusal reached image initialization");
+
+    let adopted = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.adopt",
+        json!({
+            "repoId": repo,
+            "options": AdoptOptions { quarantine: true, ..AdoptOptions::default() }
+        }),
+    )
+    .await
+    .expect("quarantined adopt");
+    assert_eq!(adopted["info"]["workspace"], "main");
+    assert!(!secret.exists());
+    let quarantined = root.join("store/quarantine/.env");
+    assert_eq!(
+        std::fs::read_to_string(&quarantined).expect("quarantined bytes"),
+        "API_TOKEN=not-for-images"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&quarantined)
+                .expect("quarantine metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    assert_eq!(events.recv().await, Some(Event::SecretScan));
+    assert!(matches!(events.recv().await, Some(Event::Initialize(_))));
+    assert!(matches!(events.recv().await, Some(Event::Publish(_))));
 }
 
 #[tokio::test]

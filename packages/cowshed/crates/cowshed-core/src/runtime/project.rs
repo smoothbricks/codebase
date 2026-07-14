@@ -1764,6 +1764,14 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 "retry with the bound repository identity",
             ));
         }
+        enforce_adopt_secret_policy(
+            self.descriptor.git_root.clone(),
+            self.layout.project().waivers.clone(),
+            self.layout.project().quarantine.clone(),
+            options.quarantine,
+        )
+        .await?;
+
         let mut grants = self.fresh_grants().await?;
         grants.revision = 0;
         let identity = self.operation_identity(grants).await?;
@@ -2762,6 +2770,276 @@ async fn load_or_validate_binding(
         }
     }
     Ok(binding)
+}
+
+#[cfg(target_os = "macos")]
+async fn enforce_adopt_secret_policy(
+    root: PathBuf,
+    waivers_path: PathBuf,
+    quarantine_root: PathBuf,
+    quarantine: bool,
+) -> Result<()> {
+    crate::storage::lifecycle::dispatch_blocking(move || {
+        let waivers = match crate::metadata::read_json::<Vec<crate::secrets::SecretWaiver>>(
+            &waivers_path,
+        ) {
+            Ok(waivers) => waivers,
+            Err(crate::metadata::MetadataError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Vec::new()
+            }
+            Err(error) => return Err(native_integrity_error(error)),
+        };
+        let scan = crate::secrets::scan_tree(&root, &waivers).map_err(secret_scan_error)?;
+        if scan.findings.is_empty() {
+            return Ok(());
+        }
+        if !quarantine {
+            return Err(secret_findings_error(&scan.findings));
+        }
+        quarantine_secret_files(&root, &quarantine_root, &scan.findings)?;
+        let remaining = crate::secrets::scan_tree(&root, &waivers).map_err(secret_scan_error)?;
+        if remaining.findings.is_empty() {
+            Ok(())
+        } else {
+            Err(secret_findings_error(&remaining.findings))
+        }
+    })
+    .await
+    .map_err(|error| CowshedError::internal(format!("secret scan task failed: {error}")))?
+}
+
+#[cfg(target_os = "macos")]
+fn secret_scan_error(error: crate::secrets::SecretScanError) -> CowshedError {
+    match error {
+        crate::secrets::SecretScanError::InvalidWaiver { .. }
+        | crate::secrets::SecretScanError::DuplicateWaiver { .. } => {
+            CowshedError::integrity(error.to_string(), "repair the controller-owned waivers file")
+        }
+        crate::secrets::SecretScanError::InvalidRoot { .. }
+        | crate::secrets::SecretScanError::Walk { .. }
+        | crate::secrets::SecretScanError::Read { .. } => CowshedError::environment_missing(
+            error.to_string(),
+            "make the complete repository tree readable and retry adopt",
+        ),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn secret_findings_error(findings: &[crate::secrets::SecretFinding]) -> CowshedError {
+    let paths = findings
+        .iter()
+        .map(|finding| finding.path.display().to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ");
+    CowshedError::conflict(
+        format!("repository contains secrets in: {paths}"),
+        "remove the files, add reasoned controller waivers, or retry adopt with quarantine",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn quarantine_secret_files(
+    root: &Path,
+    quarantine_root: &Path,
+    findings: &[crate::secrets::SecretFinding],
+) -> Result<()> {
+    let paths = findings
+        .iter()
+        .map(|finding| finding.path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    secure_quarantine_directory(quarantine_root, Path::new(""))?;
+    for relative in paths {
+        let source = root.join(&relative);
+        let source_metadata = match std::fs::symlink_metadata(&source) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(quarantine_io_error("inspect secret source", &source, error)),
+        };
+        if !source_metadata.is_file() || source_metadata.file_type().is_symlink() {
+            return Err(CowshedError::conflict(
+                format!(
+                    "secret source {} changed after the full-tree scan",
+                    relative.display()
+                ),
+                "stop repository writers and retry adopt",
+            ));
+        }
+        let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+        let destination_parent = secure_quarantine_directory(quarantine_root, parent)?;
+        let file_name = relative.file_name().ok_or_else(|| {
+            CowshedError::integrity(
+                format!("secret finding has no file name: {}", relative.display()),
+                "run cowshed doctor --json",
+            )
+        })?;
+        let destination = destination_parent.join(file_name);
+        if destination.exists() {
+            if files_equal(&source, &destination)? {
+                std::fs::set_permissions(
+                    &destination,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o600),
+                )
+                .map_err(|error| {
+                    quarantine_io_error("secure quarantined secret", &destination, error)
+                })?;
+                std::fs::remove_file(&source).map_err(|error| {
+                    quarantine_io_error("remove quarantined source", &source, error)
+                })?;
+                sync_parent(&source)?;
+                continue;
+            }
+            return Err(CowshedError::conflict(
+                format!(
+                    "quarantine destination {} already contains different bytes",
+                    destination.display()
+                ),
+                "move the existing quarantine artifact aside and retry adopt",
+            ));
+        }
+        let temporary =
+            destination_parent.join(format!(".cowshed-quarantine-{}.tmp", uuid::Uuid::new_v4()));
+        if let Err(error) = std::fs::copy(&source, &temporary) {
+            return Err(quarantine_io_error(
+                "copy secret into quarantine",
+                &temporary,
+                error,
+            ));
+        }
+        let prepared = (|| {
+            std::fs::set_permissions(
+                &temporary,
+                std::os::unix::fs::PermissionsExt::from_mode(0o600),
+            )
+            .map_err(|error| quarantine_io_error("secure quarantined secret", &temporary, error))?;
+            std::fs::File::open(&temporary)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| quarantine_io_error("sync quarantined secret", &temporary, error))?;
+            if !files_equal(&source, &temporary)? {
+                return Err(CowshedError::conflict(
+                    format!(
+                        "secret source {} changed while it was quarantined",
+                        relative.display()
+                    ),
+                    "stop repository writers and retry adopt",
+                ));
+            }
+            std::fs::rename(&temporary, &destination).map_err(|error| {
+                quarantine_io_error("publish quarantined secret", &destination, error)
+            })?;
+            sync_parent(&destination)?;
+            std::fs::remove_file(&source)
+                .map_err(|error| quarantine_io_error("remove quarantined source", &source, error))?;
+            sync_parent(&source)
+        })();
+        if prepared.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        prepared?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn secure_quarantine_directory(root: &Path, relative: &Path) -> Result<PathBuf> {
+    let mut current = root.to_path_buf();
+    for component in std::iter::once(None).chain(relative.components().map(Some)) {
+        if let Some(component) = component {
+            let std::path::Component::Normal(component) = component else {
+                return Err(CowshedError::integrity(
+                    format!("secret quarantine path escapes its root: {}", relative.display()),
+                    "run cowshed doctor --json",
+                ));
+            };
+            current.push(component);
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "secret quarantine directory is not a real directory: {}",
+                        current.display()
+                    ),
+                    "repair the controller-owned quarantine tree",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current).map_err(|error| {
+                    quarantine_io_error("create secret quarantine directory", &current, error)
+                })?;
+            }
+            Err(error) => {
+                return Err(quarantine_io_error(
+                    "inspect secret quarantine directory",
+                    &current,
+                    error,
+                ));
+            }
+        }
+        std::fs::set_permissions(
+            &current,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .map_err(|error| {
+            quarantine_io_error("secure secret quarantine directory", &current, error)
+        })?;
+    }
+    Ok(current)
+}
+
+#[cfg(target_os = "macos")]
+fn files_equal(left: &Path, right: &Path) -> Result<bool> {
+    use std::io::Read;
+
+    let mut left = std::io::BufReader::new(
+        std::fs::File::open(left)
+            .map_err(|error| quarantine_io_error("open secret source", left, error))?,
+    );
+    let mut right = std::io::BufReader::new(
+        std::fs::File::open(right)
+            .map_err(|error| quarantine_io_error("open quarantined secret", right, error))?,
+    );
+    let mut left_buffer = [0_u8; 16 * 1024];
+    let mut right_buffer = [0_u8; 16 * 1024];
+    loop {
+        let left_read = left
+            .read(&mut left_buffer)
+            .map_err(|error| CowshedError::environment_missing(error.to_string(), "retry adopt"))?;
+        let right_read = right
+            .read(&mut right_buffer)
+            .map_err(|error| CowshedError::environment_missing(error.to_string(), "retry adopt"))?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sync_parent(path: &Path) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        CowshedError::integrity(
+            format!("path has no parent: {}", path.display()),
+            "run cowshed doctor --json",
+        )
+    })?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| quarantine_io_error("sync directory", parent, error))
+}
+
+#[cfg(target_os = "macos")]
+fn quarantine_io_error(operation: &str, path: &Path, error: std::io::Error) -> CowshedError {
+    CowshedError::environment_missing(
+        format!("{operation} at {} failed: {error}", path.display()),
+        "check repository and controller storage permissions, then retry adopt",
+    )
 }
 
 #[cfg(target_os = "macos")]
