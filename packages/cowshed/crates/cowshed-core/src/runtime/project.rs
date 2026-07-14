@@ -2107,6 +2107,20 @@ impl NativeProjectRuntimeHost {
         Ok(())
     }
 
+    async fn advance_gateway_revision(&self, workspace: &NativeWorkspace) -> Result<()> {
+        let mut metadata = workspace.metadata.clone();
+        metadata.grants.revision = metadata
+            .grants
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| CowshedError::internal("gateway session revision overflow"))?;
+        let image = workspace.image.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || metadata.write_for_image(&image))
+            .await
+            .map_err(|error| CowshedError::internal(error.to_string()))?
+            .map_err(native_integrity_error)
+    }
+
     async fn ensure_supervisor(
         &mut self,
         name: &WorkspaceName,
@@ -2114,12 +2128,20 @@ impl NativeProjectRuntimeHost {
         use crate::storage::lifecycle::{MountIntent, Substrate};
 
         self.validate_binding().await?;
-        let current = self.current(name).await?;
+        let mut current = self.current(name).await?;
+        let was_detached = matches!(
+            current.derived.mount_state,
+            crate::storage::lifecycle::MountState::Detached
+        );
         let mount = self
             .substrate
             .ensure_mounted(&current.derived.workspace, MountIntent { browse: false })
             .await
             .map_err(native_storage_error)?;
+        if was_detached {
+            self.advance_gateway_revision(&current).await?;
+            current = self.current(name).await?;
+        }
         if let Some(handle) = self.supervisors.get(name)
             && handle.snapshot().workspace_incarnation == *current.derived.workspace.incarnation()
             && handle.snapshot().grant_revision == current.metadata.grants.revision
@@ -2595,6 +2617,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         use crate::storage::lifecycle::{MountIntent, Substrate};
         self.validate_binding().await?;
         let current = self.current(&workspace).await?;
+        let was_detached = matches!(
+            current.derived.mount_state,
+            crate::storage::lifecycle::MountState::Detached
+        );
         self.substrate
             .ensure_mounted(
                 &current.derived.workspace,
@@ -2604,6 +2630,9 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             )
             .await
             .map_err(native_storage_error)?;
+        if was_detached {
+            self.advance_gateway_revision(&current).await?;
+        }
         self.ensure_supervisor(&workspace).await.map(|_| ())
     }
 
