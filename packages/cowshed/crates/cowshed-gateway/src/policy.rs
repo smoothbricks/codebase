@@ -270,6 +270,32 @@ pub enum MirrorProtocol {
     Go,
 }
 
+impl MirrorProtocol {
+    pub const fn local_prefix(self) -> &'static str {
+        match self {
+            Self::Npm => "/npm/",
+            Self::Cargo => "/cargo/",
+            Self::Go => "/go/",
+        }
+    }
+
+    pub const fn baseline_origin(self) -> &'static str {
+        match self {
+            Self::Npm => "https://registry.npmjs.org:443",
+            Self::Cargo => "https://index.crates.io:443",
+            Self::Go => "https://proxy.golang.org:443",
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Npm => "npm",
+            Self::Cargo => "cargo",
+            Self::Go => "go",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MirrorRoute {
     pub local_prefix: String,
@@ -283,6 +309,9 @@ impl MirrorRoute {
     pub fn validate(&self) -> Result<(), PolicyError> {
         if !self.local_prefix.starts_with('/') || !self.local_prefix.ends_with('/') {
             return Err(PolicyError::InvalidMirrorPrefix);
+        }
+        if self.local_prefix != self.protocol.local_prefix() {
+            return Err(PolicyError::MirrorProtocolPrefixMismatch);
         }
         let url = Url::parse(&self.upstream_origin).map_err(|_| PolicyError::InvalidOrigin)?;
         if url.scheme() != "https"
@@ -343,39 +372,89 @@ impl WorkspacePolicy {
             })
     }
 
-    pub(crate) fn resolve_mirror(&self, path: &str) -> Option<ResolvedMirror> {
+    pub fn resolve_mirror(&self, path: &str) -> Option<ResolvedMirrorRoute> {
         let route = self
             .mirrors
             .iter()
             .filter(|route| path.starts_with(&route.local_prefix))
             .max_by_key(|route| route.local_prefix.len())?;
         let suffix = &path[route.local_prefix.len() - 1..];
-        let normalized = normalize_path(suffix).ok()?;
-        if !route
+        let (normalized, admission_path) = normalize_mirror_suffix(route.protocol, suffix).ok()?;
+        let admitted_prefix = route
             .admitted_prefixes
             .iter()
-            .any(|prefix| normalized.starts_with(prefix))
-        {
-            return None;
-        }
+            .filter(|prefix| admission_path.starts_with(prefix.as_str()))
+            .max_by_key(|prefix| prefix.len())?
+            .clone();
         let base = Url::parse(&route.upstream_origin).ok()?;
         let url = base.join(normalized.trim_start_matches('/')).ok()?;
         let target = CanonicalTarget::from_url(&url).ok()?;
-        Some(ResolvedMirror {
+        Some(ResolvedMirrorRoute {
             target,
             path: normalized,
             protocol: route.protocol,
             credentialed: route.credentialed,
+            admitted_prefix,
         })
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct ResolvedMirror {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedMirrorRoute {
     pub target: CanonicalTarget,
     pub path: String,
     pub protocol: MirrorProtocol,
     pub credentialed: bool,
+    pub admitted_prefix: String,
+}
+
+fn normalize_mirror_suffix(
+    protocol: MirrorProtocol,
+    path_and_query: &str,
+) -> Result<(String, String), PolicyError> {
+    if protocol != MirrorProtocol::Npm {
+        let normalized = normalize_path(path_and_query)?;
+        return Ok((normalized.clone(), normalized));
+    }
+    if !path_and_query.starts_with('/')
+        || path_and_query.len() > 8192
+        || path_and_query.contains(['\\', '\0', '\r', '\n'])
+    {
+        return Err(PolicyError::InvalidPath);
+    }
+    let path = path_and_query
+        .split_once('?')
+        .map_or(path_and_query, |(path, _)| path);
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return Err(PolicyError::InvalidPath);
+        }
+        let high = hex(bytes[index + 1]).ok_or(PolicyError::InvalidPath)?;
+        let low = hex(bytes[index + 2]).ok_or(PolicyError::InvalidPath)?;
+        let value = (high << 4) | low;
+        if matches!(value, b'\\' | 0 | b'%') {
+            return Err(PolicyError::InvalidPath);
+        }
+        decoded.push(value);
+        index += 3;
+    }
+    let admission_path = String::from_utf8(decoded).map_err(|_| PolicyError::InvalidPath)?;
+    if admission_path.contains("//")
+        || admission_path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+    {
+        return Err(PolicyError::InvalidPath);
+    }
+    Ok((path_and_query.to_owned(), admission_path))
 }
 
 pub fn normalize_path(path: &str) -> Result<String, PolicyError> {
@@ -452,6 +531,8 @@ pub enum PolicyError {
     InvalidPath,
     #[error("mirror local prefixes must start and end with slash")]
     InvalidMirrorPrefix,
+    #[error("mirror route prefix must be the frozen endpoint for its protocol")]
+    MirrorProtocolPrefixMismatch,
     #[error("mirror origins must be exact HTTPS origins")]
     InvalidOrigin,
     #[error("mirror local prefixes must be unique")]
