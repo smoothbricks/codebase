@@ -11,6 +11,9 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { bench, boxplot, group, run, summary } from 'mitata';
+import { S } from '../src/lib/schema/builder.js';
+import { defineLogSchema } from '../src/lib/schema/defineLogSchema.js';
+import { getWasmPhysicalLayout } from '../src/lib/wasm/wasmPhysicalLayout.js';
 
 const CAPACITY = 64;
 const NULL_BYTES = Math.ceil(CAPACITY / 8);
@@ -35,7 +38,16 @@ function isWasmExportFunction(value: unknown): value is WasmExportFunction {
   return typeof value === 'function';
 }
 
-function requireWasmFunction(name: 'init' | 'set_thread_id' | 'init_trace_root' | 'span_start'): VoidWasmExport;
+function requireWasmFunction(
+  name:
+    | 'init'
+    | 'set_thread_id'
+    | 'init_trace_root'
+    | 'span_start'
+    | 'free_exact'
+    | 'free_identity'
+    | 'free_span_superblock',
+): VoidWasmExport;
 function requireWasmFunction(
   name:
     | 'alloc_exact'
@@ -43,6 +55,8 @@ function requireWasmFunction(
     | 'write_col_f64'
     | 'read_col_f64'
     | 'alloc_identity_child'
+    | 'create_and_start_span'
+    | 'create_overflow_span'
     | 'read_entry_type'
     | 'read_write_index',
 ): NumberWasmExport;
@@ -63,6 +77,11 @@ const initTraceRoot = requireWasmFunction('init_trace_root');
 const spanStart = requireWasmFunction('span_start');
 const readEntryType = requireWasmFunction('read_entry_type');
 const readWriteIndex = requireWasmFunction('read_write_index');
+const freeExact = requireWasmFunction('free_exact');
+const freeIdentity = requireWasmFunction('free_identity');
+const createAndStartSpan = requireWasmFunction('create_and_start_span');
+const createOverflowSpan = requireWasmFunction('create_overflow_span');
+const freeSpanSuperblock = requireWasmFunction('free_span_superblock');
 
 init();
 setThreadId(0x1234, 0x5678);
@@ -216,6 +235,121 @@ summary(() => {
     });
   });
 });
+
+const IDENTITY_BYTES = 128;
+const SYSTEM_BYTES = CAPACITY * 9;
+const U8_FAMILY_BYTES = NULL_BYTES + CAPACITY;
+const U32_FAMILY_BYTES = NULL_BYTES + CAPACITY * Uint32Array.BYTES_PER_ELEMENT;
+const F64_FAMILY_BYTES = NULL_BYTES + CAPACITY * Float64Array.BYTES_PER_ELEMENT;
+const SYSTEM_OFFSET = IDENTITY_BYTES;
+const ENTRY_TYPE_OFFSET = CAPACITY * BigInt64Array.BYTES_PER_ELEMENT;
+const NO_LAYOUT_OFFSET = 0xffffffff;
+const SUPERBLOCK_BYTES = SYSTEM_OFFSET + SYSTEM_BYTES + U8_FAMILY_BYTES + U32_FAMILY_BYTES + F64_FAMILY_BYTES;
+const OVERFLOW_SUPERBLOCK_BYTES = SUPERBLOCK_BYTES - IDENTITY_BYTES;
+
+function legacySpanAllocationCycle(): number {
+  const identity = allocIdentityChild();
+  const system = allocExact(SYSTEM_BYTES, 8);
+  const u8 = allocExact(U8_FAMILY_BYTES, 1);
+  const u32 = allocExact(U32_FAMILY_BYTES, 4);
+  const f64 = allocExact(F64_FAMILY_BYTES, 8);
+  spanStart(system, identity, traceRootOffset, CAPACITY);
+  freeExact(f64, F64_FAMILY_BYTES, 8);
+  freeExact(u32, U32_FAMILY_BYTES, 4);
+  freeExact(u8, U8_FAMILY_BYTES, 1);
+  freeExact(system, SYSTEM_BYTES, 8);
+  freeIdentity(identity);
+  return identity ^ system ^ u8 ^ u32 ^ f64;
+}
+
+function packedSpanAllocationCycle(): number {
+  const span = createAndStartSpan(
+    1,
+    0,
+    SUPERBLOCK_BYTES,
+    SYSTEM_OFFSET,
+    ENTRY_TYPE_OFFSET,
+    NO_LAYOUT_OFFSET,
+    traceRootOffset,
+  );
+  freeSpanSuperblock(span, SUPERBLOCK_BYTES);
+  return span;
+}
+
+function legacyOverflowAllocationCycle(): number {
+  const system = allocExact(SYSTEM_BYTES, 8);
+  const u8 = allocExact(U8_FAMILY_BYTES, 1);
+  const u32 = allocExact(U32_FAMILY_BYTES, 4);
+  const f64 = allocExact(F64_FAMILY_BYTES, 8);
+  freeExact(f64, F64_FAMILY_BYTES, 8);
+  freeExact(u32, U32_FAMILY_BYTES, 4);
+  freeExact(u8, U8_FAMILY_BYTES, 1);
+  freeExact(system, SYSTEM_BYTES, 8);
+  return system ^ u8 ^ u32 ^ f64;
+}
+
+function packedOverflowAllocationCycle(): number {
+  const overflow = createOverflowSpan(OVERFLOW_SUPERBLOCK_BYTES);
+  freeSpanSuperblock(overflow, OVERFLOW_SUPERBLOCK_BYTES);
+  return overflow;
+}
+
+const semanticSuperblock = createAndStartSpan(
+  1,
+  0,
+  SUPERBLOCK_BYTES,
+  SYSTEM_OFFSET,
+  ENTRY_TYPE_OFFSET,
+  NO_LAYOUT_OFFSET,
+  traceRootOffset,
+);
+if (
+  semanticSuperblock === 0 ||
+  readWriteIndex(semanticSuperblock) !== 2 ||
+  readEntryType(semanticSuperblock + SYSTEM_OFFSET, 0, CAPACITY) !== 1
+) {
+  throw new Error('WASM packed span semantic check failed');
+}
+freeSpanSuperblock(semanticSuperblock, SUPERBLOCK_BYTES);
+legacySpanAllocationCycle();
+packedSpanAllocationCycle();
+legacyOverflowAllocationCycle();
+packedOverflowAllocationCycle();
+
+summary(() => {
+  group('steady-state span allocation + lifecycle start + release', () => {
+    bench('legacy: identity + system + 3 families', legacySpanAllocationCycle);
+    bench('packed: one create_and_start_span superblock', packedSpanAllocationCycle);
+  });
+});
+
+summary(() => {
+  group('steady-state overflow allocation + release', () => {
+    bench('legacy: system + 3 families', legacyOverflowAllocationCycle);
+    bench('packed: one create_overflow_span superblock', packedOverflowAllocationCycle);
+  });
+});
+
+const footprintSchema = defineLogSchema({
+  enabled: S.boolean(),
+  operation: S.enum(['READ', 'WRITE']),
+  amount: S.number(),
+  detail: S.text(),
+});
+const footprintLayout = getWasmPhysicalLayout(footprintSchema, CAPACITY, 'mixed', 'current');
+console.log(
+  `superblock footprint ${JSON.stringify({
+    capacity: CAPACITY,
+    span: {
+      packedBytes: footprintLayout.spanSuperblock.byteLength,
+      separateBytes: footprintLayout.spanSuperblock.legacyByteLength,
+    },
+    overflow: {
+      packedBytes: footprintLayout.overflowSuperblock.byteLength,
+      separateBytes: footprintLayout.overflowSuperblock.legacyByteLength,
+    },
+  })}`,
+);
 
 console.log('WASM boundary-cost benchmark (current raw allocator.wasm ABI)\n');
 await run({ colors: false });
