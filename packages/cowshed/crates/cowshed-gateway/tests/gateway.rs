@@ -19,9 +19,10 @@ use cowshed_gateway::{
     AuthorizedTarget, CanonicalTarget, ConnectError, ControlError, ControlFailureCode,
     CredentialError, CredentialProtocol, CredentialProvider, CredentialQuery, CredentialRecord,
     EgressGrant, Gateway, GatewayConfig, GatewayControlClient, GatewayError, GatewayLimits,
-    GatewayTimeouts, HostPattern, MirrorCacheConfig, MirrorProtocol, MirrorRoute,
-    NegotiatedTransport, UpstreamConnection, UpstreamConnector, UpstreamHealth, UpstreamPurpose,
-    WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
+    GatewayTimeouts, HostPattern, MirrorCacheConfig, MirrorCacheStatus, MirrorProtocol,
+    MirrorRoute, NegotiatedTransport, UpstreamConnection, UpstreamConnector, UpstreamHealth,
+    UpstreamPurpose, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession,
+    WorkspaceToken,
 };
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Version, header};
 use http_body::{Body, Frame, SizeHint};
@@ -352,6 +353,12 @@ fn test_config() -> GatewayConfig {
     ));
     let _ = std::fs::remove_dir_all(&cache_root);
     std::fs::create_dir(&cache_root).expect("create pre-existing mirror cache root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&cache_root, std::fs::Permissions::from_mode(0o700))
+            .expect("secure mirror cache root");
+    }
     let config = GatewayConfig {
         timeouts: GatewayTimeouts {
             request_headers: Duration::from_secs(2),
@@ -1620,7 +1627,7 @@ async fn arrow_audit_sink_publishes_durable_single_batch_segments() {
         workspace_id: "audit-ws".to_owned(),
         revision: 3,
         endpoint: "127.0.0.1:40960".to_owned(),
-        kind: AuditKind::Http,
+        kind: AuditKind::Npm,
         host: Some("example.test:443".to_owned()),
         method: Some("GET".to_owned()),
         path: Some("/v1".to_owned()),
@@ -1630,9 +1637,32 @@ async fn arrow_audit_sink_publishes_durable_single_batch_segments() {
         trace_id: Some("00000000000000000000000000000001".to_owned()),
         grant_hint: None,
         classification: None,
+        mirror_cache_status: Some(MirrorCacheStatus::Filled),
     })
     .await
     .expect("record Arrow audit");
+    let invalid = sink
+        .record(AuditEvent {
+            sequence: 2,
+            timestamp_unix_ms: 1_700_000_000_001,
+            workspace_id: "audit-ws".to_owned(),
+            revision: 3,
+            endpoint: "127.0.0.1:40960".to_owned(),
+            kind: AuditKind::Http,
+            host: Some("example.test:443".to_owned()),
+            method: Some("GET".to_owned()),
+            path: Some("/v1".to_owned()),
+            status: AuditStatus::Completed,
+            http_status: Some(200),
+            bytes: 12,
+            trace_id: None,
+            grant_hint: None,
+            classification: None,
+            mirror_cache_status: Some(MirrorCacheStatus::Hit),
+        })
+        .await
+        .expect_err("non-mirror cache status must be rejected");
+    assert!(invalid.0.contains("non-mirror"));
     sink.flush().await.expect("flush Arrow audit");
     let partition = std::fs::read_dir(&root)
         .expect("read telemetry root")
@@ -1670,9 +1700,45 @@ async fn arrow_audit_sink_publishes_durable_single_batch_segments() {
     let batch = reader.next().expect("one batch").expect("valid batch");
     assert_eq!(batch.num_rows(), 1);
     assert_eq!(batch.schema().field(0).name(), "sequence");
+    assert_eq!(batch.schema().field(15).name(), "mirror_cache_status");
+    let cache_status = batch
+        .column(15)
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .expect("mirror cache status string column");
+    assert_eq!(cache_status.value(0), "filled");
     assert!(reader.next().is_none());
     drop(sink);
     std::fs::remove_dir_all(root).expect("remove audit fixture");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn control_start_failure_stops_and_joins_gateway_actor() {
+    let mut config = test_config();
+    let missing_parent = std::env::temp_dir().join(format!(
+        "cowshed-missing-control-parent-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&missing_parent);
+    config.control_socket = Some(missing_parent.join("gateway.sock"));
+    let credentials = Arc::new(NoCredentials);
+    let connector = Arc::new(LocalConnector {
+        health: UpstreamHealth::Healthy,
+        observed: None,
+    });
+    let audit = Arc::new(DiscardAudit);
+    let result = Gateway::start(
+        config,
+        credentials.clone(),
+        connector.clone(),
+        audit.clone(),
+    )
+    .await;
+    assert!(matches!(result, Err(GatewayError::Io(_))));
+    assert_eq!(Arc::strong_count(&credentials), 1);
+    assert_eq!(Arc::strong_count(&connector), 1);
+    assert_eq!(Arc::strong_count(&audit), 1);
 }
 
 #[cfg(target_os = "macos")]

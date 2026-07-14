@@ -14,7 +14,10 @@ use tokio::{
 use tokio_rustls::TlsConnector;
 use zeroize::Zeroizing;
 
-use crate::policy::{CanonicalHost, CanonicalTarget, MirrorProtocol, normalize_path};
+use crate::{
+    mirror::MirrorCacheStatus,
+    policy::{CanonicalHost, CanonicalTarget, MirrorProtocol, normalize_path},
+};
 
 pub trait GatewayIo: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 impl<T> GatewayIo for T where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
@@ -312,6 +315,7 @@ pub struct AuditEvent {
     pub trace_id: Option<String>,
     pub grant_hint: Option<String>,
     pub classification: Option<String>,
+    pub mirror_cache_status: Option<MirrorCacheStatus>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

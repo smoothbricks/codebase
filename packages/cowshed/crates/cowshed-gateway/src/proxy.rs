@@ -42,8 +42,8 @@ use crate::{
         UpstreamHealth, UpstreamPurpose,
     },
     mirror::{
-        MirrorBody, MirrorCacheScope, MirrorError, MirrorFetchRequest, MirrorOutcome,
-        MirrorRequest, MirrorService, MirrorUpstream,
+        MirrorBody, MirrorCacheScope, MirrorCacheStatus, MirrorError, MirrorFetchRequest,
+        MirrorOutcome, MirrorRequest, MirrorService, MirrorUpstream,
     },
     policy::{CanonicalHost, CanonicalTarget, EgressMode, TargetScheme, normalize_path},
 };
@@ -196,7 +196,7 @@ async fn handle_request(
             .await);
         }
     };
-    let trace_id = None;
+    let (path, trace_id) = extract_mirror_trace(&path, audit_kind).unwrap_or((path, None));
     let intent = RequestIntent {
         target,
         method: request.method().clone(),
@@ -432,7 +432,7 @@ async fn handle_request(
     let (mut parts, body) = response.into_parts();
     strip_response_secrets(&mut parts.headers);
     strip_hop_headers(&mut parts.headers);
-    let completion = Completion::new(context.commands.clone(), admission, status);
+    let completion = Completion::new(context.commands.clone(), admission, status, None);
     let body = ProxyBody::stream(
         body.map_err(|error| -> BoxError { Box::new(error) })
             .boxed(),
@@ -497,7 +497,7 @@ async fn handshake_upstream(connection: UpstreamConnection) -> Result<UpstreamSe
 async fn handle_mirror_request(
     request: Request<Incoming>,
     context: AcceptContext,
-    admission: Admission,
+    mut admission: Admission,
     health: UpstreamHealth,
     audit_kind: AuditKind,
 ) -> Response<ResponseBody> {
@@ -512,7 +512,7 @@ async fn handle_mirror_request(
     } else {
         MirrorCacheScope::Anonymous
     };
-    let mirror_request = match MirrorRequest::new(
+    let mut mirror_request = match MirrorRequest::new(
         protocol,
         admission.target.clone(),
         request.method().clone(),
@@ -527,53 +527,102 @@ async fn handle_mirror_request(
             return mirror_failure(&context, admission, error, audit_kind).await;
         }
     };
-    let upstream = ProxyMirrorUpstream {
-        context: &context,
-        workspace_id: &admission.workspace_id,
-        repo_id: &admission.repo_id,
-        credential_allowed: admission.credential_allowed,
-        impersonate: admission.impersonate,
-        private_network_authorized: admission.private_network_authorized,
-        trace_id: admission.trace_id.as_deref(),
-        permit_id: admission.permit_id,
-    };
-    match context
-        .mirror_service
-        .execute(mirror_request, health, &upstream)
-        .await
-    {
-        Ok(MirrorOutcome::Response(response)) => {
-            let status = response.response.status();
-            let (mut parts, body) = response.response.into_parts();
-            strip_response_secrets(&mut parts.headers);
-            strip_hop_headers(&mut parts.headers);
-            let completion = Completion::new(context.commands.clone(), admission, status);
-            let body = ProxyBody::stream(
-                body,
-                completion,
-                context.timeouts.body_idle,
-                context.timeouts.request_total,
-            );
-            Response::from_parts(parts, body)
+    let mut initial_health = Some(health);
+    loop {
+        let hop_health = match initial_health.take() {
+            Some(health) => health,
+            None => upstream_health(&context, &admission.target).await,
+        };
+        let upstream = ProxyMirrorUpstream {
+            context: &context,
+            workspace_id: &admission.workspace_id,
+            repo_id: &admission.repo_id,
+            credential_allowed: admission.credential_allowed,
+            impersonate: admission.impersonate,
+            private_network_authorized: admission.private_network_authorized,
+            trace_id: admission.trace_id.as_deref(),
+            permit_id: admission.permit_id,
+        };
+        match context
+            .mirror_service
+            .execute(mirror_request, hop_health, &upstream)
+            .await
+        {
+            Ok(MirrorOutcome::Response(response)) => {
+                let status = response.response.status();
+                let cache_status = response.cache_status;
+                let (mut parts, body) = response.response.into_parts();
+                strip_response_secrets(&mut parts.headers);
+                strip_hop_headers(&mut parts.headers);
+                let completion = Completion::new(
+                    context.commands.clone(),
+                    admission,
+                    status,
+                    Some(cache_status),
+                );
+                let body = ProxyBody::stream(
+                    body,
+                    completion,
+                    context.timeouts.body_idle,
+                    context.timeouts.request_total,
+                );
+                return Response::from_parts(parts, body);
+            }
+            Ok(MirrorOutcome::Redirect(redirect)) => {
+                let generation = admission.generation;
+                let request_path = admission.request_path.clone();
+                let trace_id = admission.trace_id.clone();
+                let redirected = redirect.request;
+                let target = redirected.target.clone();
+                let upstream_path = redirected.path.clone();
+                complete_now(
+                    &context,
+                    admission,
+                    AuditStatus::Completed,
+                    Some(StatusCode::TEMPORARY_REDIRECT),
+                    Some("mirror-redirect-hop"),
+                    0,
+                    audit_kind,
+                )
+                .await;
+                let intent = RequestIntent {
+                    target: RequestTarget::MirrorRedirect {
+                        protocol,
+                        target,
+                        upstream_path,
+                    },
+                    method: redirected.method.clone(),
+                    path: request_path,
+                    audit_kind,
+                    trace_id,
+                };
+                admission =
+                    match admit(&context, Authentication::Generation(generation), intent).await {
+                        Ok(admission) => admission,
+                        Err(error) => {
+                            return problem(error.status, error.message, error.hint.as_deref());
+                        }
+                    };
+                let cache_scope = if admission.credential_allowed {
+                    MirrorCacheScope::Project(admission.repo_id.clone())
+                } else {
+                    MirrorCacheScope::Anonymous
+                };
+                mirror_request = match MirrorRequest::from_redirect(
+                    redirected,
+                    cache_scope,
+                    admission.credential_allowed,
+                ) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return mirror_failure(&context, admission, error, audit_kind).await;
+                    }
+                };
+            }
+            Err(error) => {
+                return mirror_failure(&context, admission, error, audit_kind).await;
+            }
         }
-        Ok(MirrorOutcome::Redirect(_redirect)) => {
-            complete_now(
-                &context,
-                admission,
-                AuditStatus::Failed,
-                Some(StatusCode::BAD_GATEWAY),
-                Some("mirror-redirect-requires-readmission"),
-                0,
-                audit_kind,
-            )
-            .await;
-            problem(
-                StatusCode::BAD_GATEWAY,
-                "mirror redirect requires a new policy admission",
-                None,
-            )
-        }
-        Err(error) => mirror_failure(&context, admission, error, audit_kind).await,
     }
 }
 
@@ -1525,6 +1574,35 @@ fn request_target(
         "generic proxy requests require absolute-form URI",
     ))
 }
+fn extract_mirror_trace(path: &str, kind: AuditKind) -> Option<(String, Option<String>)> {
+    let protocol = match kind {
+        AuditKind::Npm => "npm",
+        AuditKind::Go => "go",
+        _ => return None,
+    };
+    let prefix = format!("/{protocol}/t/");
+    let remainder = path.strip_prefix(&prefix)?;
+    let (traceparent, suffix) = remainder.split_once('/')?;
+    let bytes = traceparent.as_bytes();
+    if bytes.len() != 55
+        || bytes[2] != b'-'
+        || bytes[35] != b'-'
+        || bytes[52] != b'-'
+        || !bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 2 | 35 | 52) || byte.is_ascii_hexdigit())
+        || &traceparent[..2] == "ff"
+        || traceparent[3..35].bytes().all(|byte| byte == b'0')
+        || traceparent[36..52].bytes().all(|byte| byte == b'0')
+    {
+        return None;
+    }
+    Some((
+        format!("/{protocol}/{suffix}"),
+        Some(traceparent[3..35].to_ascii_lowercase()),
+    ))
+}
 
 fn local_mirror_kind(path: &str) -> Option<AuditKind> {
     if path == "/npm" || path.starts_with("/npm/") {
@@ -1886,6 +1964,7 @@ fn completion_draft(
             .or_else(|| Some(format!("{:032x}", admission.permit_id))),
         grant_hint: None,
         classification: classification.map(str::to_owned),
+        mirror_cache_status: None,
     }
 }
 
@@ -1895,8 +1974,13 @@ struct Completion {
 }
 
 impl Completion {
-    fn new(_commands: mpsc::Sender<Command>, mut admission: Admission, status: StatusCode) -> Self {
-        let draft = completion_draft(
+    fn new(
+        _commands: mpsc::Sender<Command>,
+        mut admission: Admission,
+        status: StatusCode,
+        mirror_cache_status: Option<MirrorCacheStatus>,
+    ) -> Self {
+        let mut draft = completion_draft(
             &admission,
             AuditStatus::Completed,
             Some(status),
@@ -1904,6 +1988,7 @@ impl Completion {
             0,
             admission.audit_kind,
         );
+        draft.mirror_cache_status = mirror_cache_status;
         Self {
             lease: Some(admission.take_completion()),
             draft: Some(draft),
@@ -2153,5 +2238,29 @@ mod tests {
             .headers_mut()
             .insert(header::HOST, HeaderValue::from_static("other.test"));
         assert!(!request_authority_matches(&conflicting_host, &target));
+    }
+
+    #[test]
+    fn npm_and_go_trace_paths_are_stripped_and_adopted() {
+        let traceparent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
+        let (npm_path, npm_trace) = extract_mirror_trace(
+            &format!("/npm/t/{traceparent}/@scope%2fpkg"),
+            AuditKind::Npm,
+        )
+        .expect("npm trace prefix");
+        assert_eq!(npm_path, "/npm/@scope%2fpkg");
+        assert_eq!(
+            npm_trace.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+
+        let (go_path, go_trace) = extract_mirror_trace(
+            &format!("/go/t/{traceparent}/example.com/mod/@v/list"),
+            AuditKind::Go,
+        )
+        .expect("Go trace prefix");
+        assert_eq!(go_path, "/go/example.com/mod/@v/list");
+        assert_eq!(go_trace, npm_trace);
+        assert!(extract_mirror_trace("/npm/t/invalid/react", AuditKind::Npm).is_none());
     }
 }
