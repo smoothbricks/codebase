@@ -9,7 +9,13 @@
       }
     ]
   },
-  "include": ["App.tsx", "index.ts", "src/**/*.ts", "../lmao/benchmarks/plugin-scenario/platform.ts"],
+  "include": [
+    "App.tsx",
+    "index.ts",
+    "src/**/*.ts",
+    "../lmao/benchmarks/plugin-scenario/platform.ts",
+    "../lmao/benchmarks/plugin-scenario/platform.test.ts"
+  ],
   "references": [
     {
       "path": "../lmao-ttsc"

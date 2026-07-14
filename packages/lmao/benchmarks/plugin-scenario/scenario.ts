@@ -34,6 +34,7 @@ export type ScenarioTraceRootFactory = TraceRootFactory<typeof scenarioSchema>;
 const scenarioContext = defineOpContext({
   logSchema: scenarioSchema,
 });
+export type ScenarioTracer = TestTracer<typeof scenarioContext>;
 
 const { defineOp } = scenarioContext;
 
@@ -102,14 +103,14 @@ export function resetScenarioBufferStats(): void {
   stats.spansCreated = 0;
 }
 
-export function createScenarioTracer(createTraceRoot: ScenarioTraceRootFactory) {
+export function createScenarioTracer(createTraceRoot: ScenarioTraceRootFactory): ScenarioTracer {
   return new TestTracer(scenarioContext, {
     bufferStrategy: new JsBufferStrategy(),
     createTraceRoot,
   });
 }
 
-export function executeScenario(tracer: ReturnType<typeof createScenarioTracer>) {
+export function executeScenario(tracer: ScenarioTracer) {
   return tracer.trace(
     ROOT_TRACE_NAME,
     {},
