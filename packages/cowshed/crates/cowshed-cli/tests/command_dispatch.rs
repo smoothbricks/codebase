@@ -28,6 +28,7 @@ struct FakeService {
     child_exit: ExitStatus,
     fail_list: Option<CowshedError>,
     fail_push: Option<CowshedError>,
+    adopt_options: Option<AdoptOptions>,
     push_options: Option<PushOptions>,
     rebase_options: Option<RebaseOptions>,
     land_options: Option<LandOptions>,
@@ -49,6 +50,7 @@ impl Default for FakeService {
             child_exit: ExitStatus::Exited { code: 0 },
             fail_list: None,
             fail_push: None,
+            adopt_options: None,
             push_options: None,
             rebase_options: None,
             land_options: None,
@@ -65,6 +67,7 @@ impl Default for FakeService {
 #[async_trait]
 impl CliService for FakeService {
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceInfo> {
+        self.adopt_options = Some(options.clone());
         self.events.push(format!("adopt:{:?}", options.path));
         Ok(workspace("main", WorkspaceState::Attached))
     }
@@ -393,6 +396,53 @@ async fn all_nine_parser_commands_dispatch_and_obey_machine_output_contracts() {
             "doctor",
         ]
     );
+}
+
+#[tokio::test]
+async fn adopt_delegates_explicit_identity_and_quarantine_with_exact_output() {
+    let mut service = FakeService::default();
+    let (_, stdout, stderr) = run(
+        &mut service,
+        [
+            "adopt",
+            "/repo",
+            "--capacity",
+            "100g",
+            "--repo-id",
+            "local/widget",
+            "--quarantine",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(
+        stdout,
+        format!(
+            "{{\"ok\":true,\"result\":{{\"workspace\":\"main\",\"mount\":\"/mnt/main\",\"baseCommit\":\"{}\"}}}}\n",
+            "1".repeat(40)
+        )
+        .as_bytes()
+    );
+    assert_eq!(stderr, b"next: cowshed new <name>\n");
+    assert_eq!(
+        service.adopt_options,
+        Some(AdoptOptions {
+            path: Some(PathBuf::from("/repo")),
+            repo_id: Some(RepoId::parse("local/widget").unwrap()),
+            capacity: Some("100g".into()),
+            quarantine: true,
+            image_format: None,
+        })
+    );
+
+    let cli = parse_args(["adopt", "--repo-id", "not-a-repo", "--json"]).unwrap();
+    let mut output = Output::new(Vec::new(), Vec::new(), false);
+    let error = dispatch(&mut service, cli, tokio::io::empty(), &mut output)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Usage);
+    assert!(error.message.contains("repository identity"));
+    assert!(output.into_inner().0.is_empty());
 }
 
 #[tokio::test]
