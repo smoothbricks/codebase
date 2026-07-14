@@ -35,7 +35,7 @@ import type { LogSchema } from './schema/LogSchema.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from './schema/systemSchema.js';
 import { getSpanBufferClass, type SpanBufferConstructor } from './spanBuffer.js';
 import type { SpanContextClass } from './spanContext.js';
-import type { TimestampAppendPrimitive } from './traceRoot.js';
+import { consumeSpanStartedAtAllocation, type TimestampAppendPrimitive } from './traceRoot.js';
 import type { AnySpanBuffer } from './types.js';
 import { getVocabularyGeneration, type VocabularyGeneration } from './vocabularyRegistry.js';
 import { createWasmLayoutTemplate, type WasmLayoutTemplate } from './wasm/wasmPhysicalLayout.js';
@@ -250,12 +250,14 @@ const CURRENT_BASE_APPENDERS = {
 function initializeCurrentSpan(buffer: AnySpanBuffer): Uint8Array {
   const entryTypes = buffer.entry_type;
   if (entryTypes === undefined) throw new TypeError('Current layout is missing entry types');
-  const traceRoot = buffer._traceRoot;
-  buffer.timestamp[0] = traceRoot._timestampNow(traceRoot);
-  entryTypes[0] = ENTRY_TYPE_SPAN_START;
-  entryTypes[1] = ENTRY_TYPE_SPAN_EXCEPTION;
-  buffer.timestamp[1] = 0n;
-  buffer._writeIndex = 2;
+  if (!consumeSpanStartedAtAllocation(buffer)) {
+    const traceRoot = buffer._traceRoot;
+    buffer.timestamp[0] = traceRoot._timestampNow(traceRoot);
+    entryTypes[0] = ENTRY_TYPE_SPAN_START;
+    entryTypes[1] = ENTRY_TYPE_SPAN_EXCEPTION;
+    buffer.timestamp[1] = 0n;
+    buffer._writeIndex = 2;
+  }
   return entryTypes;
 }
 
@@ -313,13 +315,15 @@ const SPLIT_MIXED_APPENDERS: PhysicalAppenders = Object.freeze({
       const entryTypes = buffer.entry_type;
       const headers = buffer._logHeaders;
       if (entryTypes === undefined || headers === undefined) throw new TypeError('Split mixed layout is incomplete');
-      const traceRoot = buffer._traceRoot;
-      buffer.timestamp[0] = traceRoot._timestampNow(traceRoot);
-      entryTypes[0] = ENTRY_TYPE_SPAN_START;
+      if (!consumeSpanStartedAtAllocation(buffer)) {
+        const traceRoot = buffer._traceRoot;
+        buffer.timestamp[0] = traceRoot._timestampNow(traceRoot);
+        entryTypes[0] = ENTRY_TYPE_SPAN_START;
+        entryTypes[1] = ENTRY_TYPE_SPAN_EXCEPTION;
+        buffer.timestamp[1] = 0n;
+        buffer._writeIndex = 2;
+      }
       headers[0] = name + 1;
-      entryTypes[1] = ENTRY_TYPE_SPAN_EXCEPTION;
-      buffer.timestamp[1] = 0n;
-      buffer._writeIndex = 2;
       return;
     }
     const traceRoot = buffer._traceRoot;
@@ -340,17 +344,19 @@ const SPLIT_STATIC_APPENDERS: PhysicalAppenders = Object.freeze({
     const entryTypes = buffer.entry_type;
     const headers = buffer._logHeaders;
     if (entryTypes === undefined || headers === undefined) throw new TypeError('Split static layout is incomplete');
-    const traceRoot = buffer._traceRoot;
-    buffer.timestamp[0] = traceRoot._timestampNow(traceRoot);
-    entryTypes[0] = ENTRY_TYPE_SPAN_START;
+    if (!consumeSpanStartedAtAllocation(buffer)) {
+      const traceRoot = buffer._traceRoot;
+      buffer.timestamp[0] = traceRoot._timestampNow(traceRoot);
+      entryTypes[0] = ENTRY_TYPE_SPAN_START;
+      entryTypes[1] = ENTRY_TYPE_SPAN_EXCEPTION;
+      buffer.timestamp[1] = 0n;
+      buffer._writeIndex = 2;
+    }
     if (typeof name === 'number') {
       headers[0] = name + 1;
     } else {
       buffer._spanName = name;
     }
-    entryTypes[1] = ENTRY_TYPE_SPAN_EXCEPTION;
-    buffer.timestamp[1] = 0n;
-    buffer._writeIndex = 2;
   },
 });
 
@@ -359,13 +365,15 @@ const SPLIT_DYNAMIC_APPENDERS: PhysicalAppenders = Object.freeze({
   writeSpanStart(buffer: AnySpanBuffer, name: string | number): void {
     const entryTypes = buffer.entry_type;
     if (entryTypes === undefined) throw new TypeError('Split dynamic layout is missing entry types');
-    const traceRoot = buffer._traceRoot;
-    buffer.timestamp[0] = traceRoot._timestampNow(traceRoot);
-    entryTypes[0] = ENTRY_TYPE_SPAN_START;
+    if (!consumeSpanStartedAtAllocation(buffer)) {
+      const traceRoot = buffer._traceRoot;
+      buffer.timestamp[0] = traceRoot._timestampNow(traceRoot);
+      entryTypes[0] = ENTRY_TYPE_SPAN_START;
+      entryTypes[1] = ENTRY_TYPE_SPAN_EXCEPTION;
+      buffer.timestamp[1] = 0n;
+      buffer._writeIndex = 2;
+    }
     buffer._spanName = name;
-    entryTypes[1] = ENTRY_TYPE_SPAN_EXCEPTION;
-    buffer.timestamp[1] = 0n;
-    buffer._writeIndex = 2;
   },
 });
 
@@ -374,8 +382,8 @@ function packedAppenders(messageLayoutFamily: MessageLayoutFamily): PhysicalAppe
     writeSpanStart(buffer: AnySpanBuffer, name: string | number): void {
       const headers = buffer._rowHeaders;
       if (headers === undefined) throw new TypeError('Packed layout is missing row headers');
-      const traceRoot = buffer._traceRoot;
-      buffer.timestamp[0] = traceRoot._timestampNow(traceRoot);
+      const startedAtAllocation = consumeSpanStartedAtAllocation(buffer);
+      if (!startedAtAllocation) buffer.timestamp[0] = buffer._traceRoot._timestampNow(buffer._traceRoot);
       if (typeof name === 'number') {
         if (name > MAX_PACKED_MESSAGE_DENSE_INDEX) throw new RangeError('Packed message dense index exceeds 0xFFFFFE');
         headers[0] = (((name + 1) << 8) | ENTRY_TYPE_SPAN_START) >>> 0;
@@ -390,9 +398,11 @@ function packedAppenders(messageLayoutFamily: MessageLayoutFamily): PhysicalAppe
           rawMessages[0] = name;
         }
       }
-      headers[1] = ENTRY_TYPE_SPAN_EXCEPTION;
-      buffer.timestamp[1] = 0n;
-      buffer._writeIndex = 2;
+      if (!startedAtAllocation) {
+        headers[1] = ENTRY_TYPE_SPAN_EXCEPTION;
+        buffer.timestamp[1] = 0n;
+        buffer._writeIndex = 2;
+      }
     },
     writeSpanEnd(buffer: AnySpanBuffer, entryType: number): void {
       const headers = buffer._rowHeaders;

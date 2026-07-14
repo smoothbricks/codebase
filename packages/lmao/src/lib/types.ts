@@ -125,6 +125,11 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   readonly _vocabularyGeneration: VocabularyGeneration;
   /** Concrete semantic message family selected once for this buffer constructor. */
   readonly _messageLayoutFamily: MessageLayoutFamily;
+  /**
+   * One-shot token set by WASM constructors whose allocation export already
+   * initialized row 0, row 1, and the shared write index.
+   */
+  _spanStartedAtAllocation?: boolean;
   /** Concrete physical row layout selected once for this buffer constructor. */
   readonly _messagePhysicalLayout: MessagePhysicalLayout;
 

@@ -24,6 +24,17 @@ export type { SpanIdentity, TraceId } from './traceId.js';
 export { createTraceId, extractSpanIdentity, generateTraceId, isValidTraceId, MAX_TRACE_ID_LENGTH } from './traceId.js';
 
 /**
+ * Consume the one-shot marker set when a WASM allocation export already
+ * initialized the system lifecycle rows. Message storage is still populated
+ * by the selected physical appender after this returns.
+ */
+export function consumeSpanStartedAtAllocation(buffer: AnySpanBuffer): boolean {
+  if (buffer._spanStartedAtAllocation !== true) return false;
+  buffer._spanStartedAtAllocation = false;
+  return true;
+}
+
+/**
  * Tracer lifecycle hooks interface.
  * Extracted to avoid circular dependency - Tracer implements this.
  */

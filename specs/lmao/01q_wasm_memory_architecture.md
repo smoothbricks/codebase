@@ -1,28 +1,32 @@
 # 01q: WASM Memory Architecture for SpanBuffer Storage <a id="smoo/lmao!n/wasm-mem"></a>
 
-> **Implementation status (partial realization).** The allocator, TypeScript wrapper, WASM buffer strategy, span buffer,
-> trace-root writer, synchronous conversion/release flow, and current Mitata benchmarks are shipped under
-> `packages/lmao/src/lib/wasm/`. The implementation map identifies their source regions. `PhysicalLayoutPlan`,
-> `VocabularyBinding`, `ArrowLease`, memory-epoch ownership, and lease-pinned asynchronous Arrow borrowing below are
-> target contracts, not assertions about the shipped implementation. Deferred Work lists the original allocator/runtime
-> follow-ups; the phase/ownership gates in this document are additional acceptance requirements.
+> **Implementation status (partial realization).** The allocator, TypeScript wrapper, `PhysicalLayoutPlan`, generated
+> WASM buffer strategy, packed span-superblock setup, trace-root writer, synchronous conversion/release flow, and
+> current Mitata benchmarks are shipped under `packages/lmao/src/lib/wasm/`. The implementation map identifies their
+> source regions. `VocabularyBinding`, `ArrowLease`, memory-epoch ownership, and lease-pinned asynchronous Arrow
+> borrowing below are target contracts, not assertions about the shipped implementation. Deferred Work lists the
+> remaining allocator/runtime follow-ups; the phase/ownership gates in this document are additional acceptance
+> requirements.
 
 ## Status and Phase Contract <a id="smoo/lmao!n/wasm-mem.status-contract"></a>
 
 The implementation-map WASM allocator and synchronous lifecycle are shipped; current JS-buffer and WASM behavior are
 benchmarked separately.
 
-**Shipped phases:** startup instantiates the memory/allocator and generated accessors; span setup allocates or reuses
-identity/system blocks and creates JS buffer/offset views; warmed writes use fixed stores; first-column allocation,
-freelist miss, overflow, and `memory.grow()` are slow paths. Conversion reads WASM views synchronously, constructs or
-copies Arrow-owned output as required, and `releaseBuffer()` immediately returns the span tree's blocks after
-conversion. Cached TypedArray views are recreated after growth. Shipped code does not expose asynchronous borrowed WASM
-Arrow data and does not implement `ArrowLease`, memory-epoch ownership, `PhysicalLayoutPlan`, or `VocabularyBinding`.
+**Shipped phases:** startup instantiates the memory/allocator and generated accessors. A cached physical descriptor
+packs each root or child span's identity, system rows, and present numeric-family slabs into one aligned superblock;
+overflow buffers allocate one identity-free superblock and retain their owner's identity pointer. One
+`create_and_start_span` call allocates, clears, initializes identity, stamps row 0, and pre-arms row 1; one
+`create_overflow_span` call creates overflow storage. JavaScript then creates the generated buffer object and its WASM
+views, while string arrays remain on the JS heap. Warmed writes use fixed stores; freelist miss, overflow, and
+`memory.grow()` are slow paths. Conversion reads WASM views synchronously, constructs or copies Arrow-owned output as
+required, and `releaseBuffer()` immediately returns each span tree superblock after conversion. Cached TypedArray views
+are recreated after growth. Shipped code does not expose asynchronous borrowed WASM Arrow data and does not implement
+`VocabularyBinding`, `ArrowLease`, or memory-epoch ownership.
 
-**Target phases:** startup creates an immutable versioned `PhysicalLayoutPlan` and performs `VocabularyBinding`; warmed
-fixed-capacity writes introduce zero new JS heap allocations with monomorphic stores and one predictable branch; and
-per-request flush may borrow compatible WASM regions only under `ArrowLease`, otherwise retaining the shipped
-Arrow-owned copy boundary.
+**Target phases:** startup performs `VocabularyBinding`; warmed fixed-capacity writes introduce zero new JS heap
+allocations with monomorphic stores and one predictable branch; and per-request flush may borrow compatible WASM regions
+only under `ArrowLease`, otherwise retaining the shipped Arrow-owned copy boundary.
 
 For shipped measurement and target gates, effective memory includes JS heap/view objects, every committed WASM page
 (live, free, fragmented, or orphaned), Arrow output, temporary conversion buffers, caches, and allocator/GC metadata.
@@ -421,6 +425,38 @@ fn free(offset: u32, size_class: SizeClass):
     freelist_heads[size_class] = offset
 ```
 
+### Packed Span Superblocks <a id="smoo/lmao!n/wasm-mem.span-superblocks"></a>
+
+`WasmPhysicalLayoutDescriptor` caches two immutable layouts per schema/capacity/message shape:
+
+- `spanSuperblock`: `[identity (128B)][aligned system slab][aligned u8 slab?][aligned u32 slab?][aligned f64 slab?]`
+- `overflowSuperblock`: `[aligned system slab][aligned u8 slab?][aligned u32 slab?][aligned f64 slab?]`
+
+Offsets are relative to the allocation base. Root and child identity therefore remain at offset zero; overflow buffers
+keep the original span's identity pointer and own only their identity-free superblock. String/category/text values
+remain JavaScript arrays and are intentionally outside this allocation.
+
+`create_and_start_span(...)` performs one `alloc_exact`, clears the complete region, initializes root or child identity,
+stamps the span-start timestamp/type, pre-arms the span-exception terminal row, and sets `write_index = 2`.
+`create_overflow_span(...)` performs the corresponding cleared allocation without identity or lifecycle initialization.
+Both return zero on allocation or descriptor failure, so JavaScript never receives a partially live allocation.
+`free_span_superblock(...)` releases the same base and byte length exactly once.
+
+For any present block $i$ with byte length $b_i$ and alignment $a_i$, the old separate form consumed
+$\operatorname{align}(p, \max(a_i,4))+\max(b_i,16)$ because `alloc_exact` reserves at least its 16-byte in-block
+freelist metadata. The packed form consumes one 8-byte-aligned region with only inter-member alignment. Descriptor
+construction asserts:
+
+$$
+\text{packed span bytes} \le \text{previous separate-allocation bytes}
+$$
+
+and the same invariant for overflow buffers. Packing therefore cannot increase the allocator-visible live footprint; it
+normally removes per-block minimum-size and alignment padding. It also changes span setup/release from identity +
+system + one call per numeric family to one allocation export and one free export. JavaScript `TypedArray`/`DataView`
+objects, string arrays, topology registration, scope state, overflow linking, and capacity tuning remain explicit host
+work; this is allocation-call batching, not a zero-allocation claim.
+
 ### Freelist Statistics (In-Block Metadata) <a id="smoo/lmao!n/wasm-mem.freelist-statistics-zero-overhead"></a>
 
 Since freed blocks have unused space after the `next` pointer, we store cascading statistics that aggregate as blocks
@@ -773,12 +809,13 @@ TypeScript wrapper (`packages/lmao/src/lib/wasm/wasmAllocator.ts`):
 [SpanLogger Codegen](#spanlogger-codegen), which is generated in the same file:
 
 - `WasmSpanBufferInstance` extends `AnySpanBuffer` for full API compatibility
-- Per-column storage replaced with `_columnPtrs: Int32Array` (WASM offsets, -1 = not allocated)
+- One root/child or overflow superblock owns system and numeric-family WASM storage
+- `_columnPtrs: Int32Array` records bound numeric column offsets (`-1` until the first view bind)
 - String columns remain as `string[]` in JavaScript arrays (`undefined` = null)
 - Factory functions: `createWasmSpanBuffer()`, `createWasmChildSpanBuffer()`, `createWasmOverflowBuffer()`
 - Runtime class generation with schema-specific column methods
-- Identity block allocation (root stores trace_id, child inherits from parent)
-- System columns stored in WASM via `_systemPtr`
+- Root/child identity is embedded at superblock offset zero; overflow shares its owner's identity
+- `_systemPtr` and family pointers are descriptor offsets from the allocation base
 - Tests in `wasmSpanBuffer.test.ts`
 
 ### SpanLogger Codegen <a id="smoo/lmao!n/wasm-mem.spanlogger-codegen"></a>
@@ -786,10 +823,9 @@ TypeScript wrapper (`packages/lmao/src/lib/wasm/wasmAllocator.ts`):
 Code generation in `wasmSpanBuffer.ts`:
 
 - `generateNumericSetter()` - generates column writers that:
-  - Lazy allocate columns from size-class freelist on first write
-  - Write values directly to WASM memory at column offset
-  - Set null bits in null bitmap (at start of column block)
-  - Call cached WASM exports for hot-path writes (`write_col_f64`, `write_col_u32`, `write_col_u8`)
+  - Bind a column's `TypedArray` views lazily from its already-owned family slab
+  - Write values directly into those WASM-memory views
+  - Set null bits in the null bitmap at the start of family storage
 - `generateStringSetter()` - generates string writers to JS arrays
 - Column methods generated at class construction via `new Function()`
 - Fluent API preserved (all methods return `this`)
@@ -798,8 +834,10 @@ Code generation in `wasmSpanBuffer.ts`:
 ### Span Lifecycle Writer <a id="smoo/lmao!n/wasm-mem.trace-root"></a>
 
 `WasmTraceRoot` (`packages/lmao/src/lib/wasm/wasmTraceRoot.ts`) writes span lifecycle events directly into WASM memory
-via the allocator's exports (`span_start`, `span_end_ok`, `span_end_err`, `write_log_entry`) instead of JS
-`ArrayBuffer`s, and implements `ITraceRoot` for `SpanContext`/`Tracer` compatibility. Factories `createWasmTraceRoot()`
+via allocator exports. `create_and_start_span` performs allocation plus the first `span_start`; a one-shot buffer marker
+lets the physical appender add message storage without restamping the lifecycle rows. `span_start` remains the fallback
+for non-prestarted buffers; `span_end_ok`, `span_end_err`, and `write_log_entry` own later lifecycle writes.
+`WasmTraceRoot` implements `ITraceRoot` for `SpanContext`/`Tracer` compatibility; factories are `createWasmTraceRoot()`
 / `createWasmTraceRootFactory()`.
 
 ### Trace Completion <a id="smoo/lmao!n/wasm-mem.trace-completion-2"></a>
@@ -808,11 +846,10 @@ In `WasmBufferStrategy` (`packages/lmao/src/lib/wasm/WasmBufferStrategy.ts`):
 
 - `releaseBuffer(buf)` - called when trace completes
 - `freeSpanTree(buf)` (private) - recursively walks the span tree depth-first
-- Returns Span System blocks to freelist via `freeSpanSystem()`
-- Returns each allocated numeric block to its size-class freelist (1B, 4B, 8B)
-- Returns identity blocks to identity freelist
-- String arrays left for JavaScript GC
-- Freelist merges enabled by address-based buddy allocation
+- Returns each root, child, and overflow superblock with one `free_span_superblock` call
+- Overflow superblocks do not free their shared identity pointer
+- String arrays are left for JavaScript GC
+- Freelist merges remain enabled by address-based buddy allocation
 - Supports capacity tuning by discarding orphaned blocks
 
 ### Benchmarking <a id="smoo/lmao!n/wasm-mem.bench"></a>

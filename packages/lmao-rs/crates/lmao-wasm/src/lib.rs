@@ -281,6 +281,48 @@ pub extern "C" fn free_exact(offset: u32, byte_len: u32, alignment: u32) {
     with_mem(|m| raw::free_exact(m, offset, byte_len, alignment));
 }
 
+/// Allocate and start a root/child span in one ABI crossing. The returned
+/// offset owns the complete identity + system + numeric-family superblock.
+#[unsafe(no_mangle)]
+pub extern "C" fn create_and_start_span(
+    identity_mode: u8,
+    trace_id_len: u32,
+    superblock_byte_len: u32,
+    system_offset: u32,
+    entry_type_offset: u32,
+    row_header_offset: u32,
+    trace_root_ptr: u32,
+) -> u32 {
+    let now = performance_now();
+    with_mem(|m| {
+        raw::create_and_start_span(
+            m,
+            identity_mode,
+            trace_id_len,
+            raw::SpanLayout {
+                superblock_byte_len,
+                system_offset,
+                entry_type_offset,
+                row_header_offset,
+            },
+            trace_root_ptr,
+            now,
+        )
+    })
+}
+
+/// Allocate one storage-only overflow superblock. Overflow shares the owning
+/// span's identity and therefore does not reserve identity or lifecycle bytes.
+#[unsafe(no_mangle)]
+pub extern "C" fn create_overflow_span(superblock_byte_len: u32) -> u32 {
+    with_mem(|m| raw::create_overflow_span(m, superblock_byte_len))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn free_span_superblock(offset: u32, byte_len: u32) {
+    with_mem(|m| raw::free_exact(m, offset, byte_len, 8));
+}
+
 // =============================================================================
 // TraceRoot + span lifecycle + column IO
 // =============================================================================

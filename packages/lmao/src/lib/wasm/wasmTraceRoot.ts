@@ -13,14 +13,15 @@ import { Nanoseconds } from '@smoothbricks/arrow-builder';
 import type { LogSchema } from '../schema/LogSchema.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from '../schema/systemSchema.js';
 import { createTraceId, type TraceId } from '../traceId.js';
-import type {
-  ITraceRoot,
-  SpanEndPrimitive,
-  SpanStartPrimitive,
-  TimestampAppendPrimitive,
-  TimestampNowPrimitive,
-  TraceRootFactory,
-  TracerLifecycleHooks,
+import {
+  consumeSpanStartedAtAllocation,
+  type ITraceRoot,
+  type SpanEndPrimitive,
+  type SpanStartPrimitive,
+  type TimestampAppendPrimitive,
+  type TimestampNowPrimitive,
+  type TraceRootFactory,
+  type TracerLifecycleHooks,
 } from '../traceRoot.js';
 import { TraceTopology } from '../traceTopology.js';
 import type { AnySpanBuffer } from '../types.js';
@@ -106,7 +107,9 @@ const writeSpanStartPrimitive: SpanStartPrimitive = (traceRoot, buffer, spanName
   const root = traceRoot as WasmTraceRoot;
   root._assertLive();
   if (isWasmSpanBuffer(buffer) && buffer._messagePhysicalLayout !== 'packed') {
-    root.allocator.spanStart(buffer._systemPtr, buffer._identityPtr, root._traceRootPtr);
+    if (!consumeSpanStartedAtAllocation(buffer)) {
+      root.allocator.spanStart(buffer._systemPtr, buffer._identityPtr, root._traceRootPtr);
+    }
     buffer._message[0] = spanName;
     return;
   }
