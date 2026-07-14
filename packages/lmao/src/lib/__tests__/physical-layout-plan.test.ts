@@ -3,12 +3,13 @@ import { getResultWriterClass, getTagWriterClass } from '../codegen/fixedPositio
 import { createSpanLoggerClass } from '../codegen/spanLoggerGenerator.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { createRemapDescriptor } from '../library.js';
-import { getPhysicalLayoutPlan, PHYSICAL_LAYOUT_VERSION } from '../physicalLayoutPlan.js';
 import type { OpContext } from '../opContext/types.js';
+import { getPhysicalLayoutPlan, PHYSICAL_LAYOUT_VERSION } from '../physicalLayoutPlan.js';
 import { resolveMessage } from '../resolveMessage.js';
 import {
   RUNTIME_HINT_ANALYZED_VALID,
   RUNTIME_HINT_LOG,
+  RUNTIME_HINT_MESSAGE_LAYOUT_STATIC_ONLY,
   RUNTIME_HINT_RESULT,
   RUNTIME_HINT_TAG,
 } from '../runtimeHint.js';
@@ -55,20 +56,8 @@ describe('PhysicalLayoutPlan', () => {
     const layout = createRemapDescriptor(schema, { app_user_id: 'userId' });
     const otherLayout = createRemapDescriptor(schema, { lib_user_id: 'userId' });
 
-    const first = getPhysicalLayoutPlan(
-      SpanBufferClass,
-      HOT_CHILD_HINT,
-      SpanContextClass,
-      layout,
-      'js-heap',
-    );
-    const identical = getPhysicalLayoutPlan(
-      SpanBufferClass,
-      HOT_CHILD_HINT,
-      SpanContextClass,
-      layout,
-      'js-heap',
-    );
+    const first = getPhysicalLayoutPlan(SpanBufferClass, HOT_CHILD_HINT, SpanContextClass, layout, 'js-heap');
+    const identical = getPhysicalLayoutPlan(SpanBufferClass, HOT_CHILD_HINT, SpanContextClass, layout, 'js-heap');
     const differentCapabilities = getPhysicalLayoutPlan(
       SpanBufferClass,
       HOT_CHILD_HINT ^ RUNTIME_HINT_LOG,
@@ -76,13 +65,7 @@ describe('PhysicalLayoutPlan', () => {
       layout,
       'js-heap',
     );
-    const differentBackend = getPhysicalLayoutPlan(
-      SpanBufferClass,
-      HOT_CHILD_HINT,
-      SpanContextClass,
-      layout,
-      'wasm',
-    );
+    const differentBackend = getPhysicalLayoutPlan(SpanBufferClass, HOT_CHILD_HINT, SpanContextClass, layout, 'wasm');
     const differentRemap = getPhysicalLayoutPlan(
       SpanBufferClass,
       HOT_CHILD_HINT,
@@ -149,6 +132,53 @@ describe('PhysicalLayoutPlan', () => {
     expect(reusedPlan.appenders).toBe(plan.appenders);
     expect(Object.isFrozen(plan.clock)).toBe(true);
     expect(Object.isFrozen(plan.appenders)).toBe(true);
+  });
+
+  it('reuses matching SpanBuffer metadata and materializes one constructor for a mismatch', () => {
+    const schema = defineLogSchema({ userId: S.category() });
+    const opContext = defineOpContext({ logSchema: schema });
+    const incomingClass = getSpanBufferClass(opContext.logBinding.logSchema);
+    const matchingHint = RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_RESULT;
+    const mismatchedHint = matchingHint | RUNTIME_HINT_MESSAGE_LAYOUT_STATIC_ONLY;
+
+    const originalDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'Function');
+    if (!originalDescriptor) throw new Error('Expected global Function descriptor');
+    const originalFunction = globalThis.Function;
+    let functionCalls = 0;
+    const functionProbe = new Proxy(originalFunction, {
+      apply(target, thisArgument, argumentList) {
+        functionCalls++;
+        return Reflect.apply(target, thisArgument, argumentList);
+      },
+      construct(target, argumentList, newTarget) {
+        functionCalls++;
+        return Reflect.construct(target, argumentList, newTarget);
+      },
+    });
+    Object.defineProperty(globalThis, 'Function', { ...originalDescriptor, value: functionProbe });
+    try {
+      const matching = opContext.defineOp('matching-layout', (ctx) => ctx.ok('matched'), undefined, {
+        runtimeHint: matchingHint,
+      });
+      expect(matching.callsitePlan.SpanBufferClass).toBe(incomingClass);
+      expect(functionCalls).toBe(0);
+
+      const mismatched = opContext.defineOp('mismatched-layout', (ctx) => ctx.ok('generated'), undefined, {
+        runtimeHint: mismatchedHint,
+      });
+      const selectedClass = mismatched.callsitePlan.SpanBufferClass;
+      expect(selectedClass).not.toBe(incomingClass);
+      expect(selectedClass.messageLayoutFamily).toBe('static-only');
+      expect(functionCalls).toBe(1);
+
+      const reused = opContext.defineOp('reused-layout', (ctx) => ctx.ok('reused'), undefined, {
+        runtimeHint: mismatchedHint,
+      });
+      expect(reused.callsitePlan.SpanBufferClass).toBe(selectedClass);
+      expect(functionCalls).toBe(1);
+    } finally {
+      Object.defineProperty(globalThis, 'Function', originalDescriptor);
+    }
   });
 
   it('consumes the same plan for repeated hot child creation without mutating it', async () => {
@@ -235,12 +265,9 @@ describe('PhysicalLayoutPlan', () => {
     );
     const otherSchema = defineLogSchema({ duration: S.number() });
     const otherContext = defineOpContext({ logSchema: otherSchema });
-    const otherSchemaOp = otherContext.defineOp(
-      'other-schema-callsite',
-      (ctx) => ctx.ok('other'),
-      undefined,
-      { runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_RESULT | 4 },
-    );
+    const otherSchemaOp = otherContext.defineOp('other-schema-callsite', (ctx) => ctx.ok('other'), undefined, {
+      runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_RESULT | 4,
+    });
 
     const plan = resultOnly.callsitePlan;
     expect(Object.isFrozen(plan)).toBe(true);
