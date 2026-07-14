@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { SafeAreaView, StyleSheet, Text, View } from 'react-native';
 
+import { getBenchmarkMode } from './src/benchmark-mode';
 import { observeDynamicFunctionCalls } from './src/dynamic-function-counter';
 import { getTransformVariant } from './src/transform-variant';
 
@@ -20,18 +21,29 @@ function detectRuntime(): { readonly platform: string; readonly engine: string }
 
 async function executePlatformScenario(): Promise<string> {
   const runtime = detectRuntime();
-  const functionCounter = observeDynamicFunctionCalls();
+  const mode = getBenchmarkMode();
+  const functionCounter = mode === 'diagnostic' ? observeDynamicFunctionCalls() : undefined;
+  const now = () => performance.now();
 
   try {
-    // Static loading would compile LMAO plans before the Function observer can measure them.
-    const { createTraceRoot } = await import('@smoothbricks/lmao/es');
-    const { runPlatformScenario } = await import('../lmao/benchmarks/plugin-scenario/platform');
-    const result = await runPlatformScenario({
-      now: () => performance.now(),
+    // This outer timestamp is the only meaningful static-import boundary: the imported
+    // modules evaluate their complete dependency graph before either promise resolves.
+    // Cold runs require a fresh page/process; async web import and synchronous Hermes
+    // require are intentionally compared only within their own engine.
+    const moduleInitializationStartedAt = now();
+    const [{ createTraceRoot }, { runPlatformScenario }] = await Promise.all([
+      import('@smoothbricks/lmao/es'),
+      import('../lmao/benchmarks/plugin-scenario/platform'),
+    ]);
+    const moduleInitializationMs = now() - moduleInitializationStartedAt;
+    const result = runPlatformScenario({
+      now,
       createTraceRoot,
       platform: runtime.platform,
       engine: runtime.engine,
       variant: getTransformVariant(),
+      mode,
+      ...(mode === 'cold' ? { moduleInitializationMs } : {}),
       ...(functionCounter === undefined ? {} : { getDynamicFunctionCallCount: functionCounter.readForScenario }),
     });
     const resultJson = JSON.stringify(result);
