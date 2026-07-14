@@ -33,6 +33,25 @@ impl WorkspaceEndpoint {
         }
     }
 
+    pub fn validate_for_current_platform(&self) -> Result<(), ConfigError> {
+        #[cfg(target_os = "macos")]
+        {
+            self.validate_macos_port_block()
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.validate()?;
+            match self {
+                Self::Unix(_) => Ok(()),
+                Self::Tcp(_) => Err(ConfigError::ExpectedUnixEndpoint),
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            Err(ConfigError::UnsupportedHostPlatform)
+        }
+    }
+
     /// Enforces the frozen macOS 16-port allocation range for production sessions.
     pub fn validate_macos_port_block(&self) -> Result<(), ConfigError> {
         self.validate()?;
@@ -43,7 +62,10 @@ impl WorkspaceEndpoint {
             .port()
             .checked_add(MACOS_PORT_BLOCK_SIZE - 1)
             .ok_or(ConfigError::InvalidMacosPortBlock)?;
-        if address.port() < MACOS_PORT_MIN || last > MACOS_PORT_MAX {
+        if address.port() < MACOS_PORT_MIN
+            || last > MACOS_PORT_MAX
+            || !(address.port() - MACOS_PORT_MIN).is_multiple_of(MACOS_PORT_BLOCK_SIZE)
+        {
             return Err(ConfigError::InvalidMacosPortBlock);
         }
         Ok(())
@@ -144,7 +166,7 @@ impl WorkspaceSession {
     pub fn validate(&self) -> Result<(), ConfigError> {
         validate_identifier("workspace_id", &self.workspace_id)?;
         validate_identifier("repo_id", &self.repo_id)?;
-        self.endpoint.validate()?;
+        self.endpoint.validate_for_current_platform()?;
         self.policy.validate()?;
         Ok(())
     }
@@ -324,6 +346,10 @@ pub enum ConfigError {
     RelativeSocketPath,
     #[error("a TCP endpoint is required")]
     ExpectedTcpEndpoint,
+    #[error("a Unix endpoint is required")]
+    ExpectedUnixEndpoint,
+    #[error("gateway endpoints are unsupported on this host platform")]
+    UnsupportedHostPlatform,
     #[error("macOS gateway base must reserve 16 ports within 40960-49151")]
     InvalidMacosPortBlock,
     #[error("workspace token must be exactly 32 bytes of unpadded base64url")]
