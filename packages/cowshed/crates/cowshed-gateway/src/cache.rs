@@ -39,6 +39,7 @@ pub struct CacheConfig {
     pub high_water_bytes: u64,
     pub low_water_bytes: u64,
     pub metadata_ttl: Duration,
+    pub fill_wait_timeout: Duration,
 }
 
 impl CacheConfig {
@@ -48,6 +49,7 @@ impl CacheConfig {
             high_water_bytes: DEFAULT_HIGH_WATER_BYTES,
             low_water_bytes: DEFAULT_LOW_WATER_BYTES,
             metadata_ttl: Duration::from_secs(5 * 60),
+            fill_wait_timeout: Duration::from_secs(15 * 60),
         }
     }
 
@@ -60,7 +62,7 @@ impl CacheConfig {
         if self.low_water_bytes >= self.high_water_bytes {
             return Err(CacheError::InvalidLimits);
         }
-        if self.metadata_ttl.is_zero() {
+        if self.metadata_ttl.is_zero() || self.fill_wait_timeout.is_zero() {
             return Err(CacheError::InvalidLimits);
         }
         Ok(())
@@ -211,7 +213,10 @@ impl Cache {
     }
 
     pub async fn retry_after_wait(&self, wait: CacheWait) -> Result<(), CacheError> {
-        wait.receiver.await.map_err(|_| CacheError::ActorStopped)?
+        tokio::time::timeout(self.config.fill_wait_timeout, wait.receiver)
+            .await
+            .map_err(|_| CacheError::FillWaitTimeout)?
+            .map_err(|_| CacheError::ActorStopped)?
     }
 
     pub async fn open_candidate(&self, candidate: CacheCandidate) -> Result<CacheHit, CacheError> {
@@ -1098,6 +1103,8 @@ pub enum CacheError {
     CacheMiss,
     #[error("cache fill was aborted")]
     FillAborted,
+    #[error("coalesced cache fill wait exceeded its configured bound")]
+    FillWaitTimeout,
     #[error("cache object length or digest does not match protocol metadata")]
     DigestMismatch,
     #[error("cache fill exceeded its declared bounded length")]
