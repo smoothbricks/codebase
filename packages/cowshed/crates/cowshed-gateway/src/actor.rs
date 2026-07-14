@@ -1147,8 +1147,19 @@ impl ControlRuntime {
         authorized_uid: u32,
         handle: GatewayHandle,
     ) -> Result<Self, GatewayError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "control socket has no parent",
+            )
+        })?;
+        let metadata = std::fs::symlink_metadata(parent)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "control socket parent must be an existing real directory",
+            )
+            .into());
         }
         if path.exists() {
             std::fs::remove_file(path)?;
