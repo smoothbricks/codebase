@@ -119,7 +119,10 @@ fn spawn_connection<I>(
         tokio::select! {
             _ = &mut connection => {}
             changed = connection_stop.changed() => {
-                if changed.is_ok() && *connection_stop.borrow() {}
+                if changed.is_ok() && *connection_stop.borrow() {
+                    connection.as_mut().graceful_shutdown();
+                    let _ = timeout(context.timeouts.request_total, &mut connection).await;
+                }
             }
         }
     });

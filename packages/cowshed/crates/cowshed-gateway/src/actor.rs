@@ -671,6 +671,7 @@ impl Actor {
             return Err(GatewayError::Draining);
         }
         session.validate()?;
+        self.config.validate_session_endpoint(&session)?;
         let signer = CaSigner::parse(&session.ca)?;
         if self
             .revisions
@@ -1234,6 +1235,7 @@ impl Actor {
         self.draining = true;
         for session in self.sessions.values() {
             let _ = session.accept_stop.send(true);
+            let _ = session.connection_stop.send(true);
         }
         while let Some(mut pending) = self.queue.pop_front() {
             if let Some(session) = self.sessions.get_mut(&pending.seed.workspace_id) {
@@ -1506,9 +1508,7 @@ async fn bind_endpoint(endpoint: &WorkspaceEndpoint) -> Result<BoundListener, Ga
             Ok(BoundListener::Tcp(TcpListener::bind(address).await?))
         }
         WorkspaceEndpoint::Unix(path) => {
-            if path.exists() {
-                std::fs::remove_file(path)?;
-            }
+            remove_stale_socket(path)?;
             let listener = UnixListener::bind(path)?;
             #[cfg(unix)]
             {
@@ -1517,6 +1517,30 @@ async fn bind_endpoint(endpoint: &WorkspaceEndpoint) -> Result<BoundListener, Ga
             }
             Ok(BoundListener::Unix(listener))
         }
+    }
+}
+
+fn remove_stale_socket(path: &Path) -> Result<(), std::io::Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+                if !metadata.file_type().is_socket()
+                    || metadata.file_type().is_symlink()
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "workspace socket path is not an owned stale socket",
+                    ));
+                }
+            }
+            std::fs::remove_file(path)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
