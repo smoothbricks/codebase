@@ -15,13 +15,15 @@ const BUILD_OUTPUT_TARGET_PATTERN = /-(?:js|web|html|css|ios|android|native|napi
 // Cargo workspace inference: a package.json sitting next to a Cargo.toml that
 // declares [workspace] gets direct cargo-test/test targets, cargo-lint feeding
 // the lint aggregate, mutation (cargo-mutants), bench, and — per cdylib member
-// crate — a cargo-wasm build producing dist/<crate>.wasm. Explicit nx.targets
-// entries in the package.json always win over inference.
+// crate whose package name ends in `-wasm` — a cargo-wasm build producing
+// dist/<crate>.wasm. Explicit nx.targets entries in the package.json always win
+// over inference.
 const CARGO_WORKSPACE_PATTERN = /^\s*\[workspace\]/m;
 const CARGO_MEMBERS_PATTERN = /^\s*members\s*=\s*\[([^\]]*)\]/m;
 const CARGO_MEMBER_ENTRY_PATTERN = /["']([^"']+)["']/g;
 const CARGO_PACKAGE_NAME_PATTERN = /^\s*name\s*=\s*["']([^"']+)["']/m;
-const CARGO_CDYLIB_PATTERN = /^\s*crate-type\s*=\s*\[[^\]]*["']cdylib["']/m;
+const CARGO_WASM_CRATE_NAME_PATTERN = /-wasm$/;
+const CARGO_CDYLIB_CRATE_TYPE_PATTERN = /^\s*crate-type\s*=\s*\[[^\]]*["']cdylib["']/m;
 const CARGO_WASM_RELEASE_PROFILE_PATTERN = /^\s*\[profile\.wasm-release\]/m;
 const CARGO_INPUTS = [
   '{projectRoot}/**/*.rs',
@@ -166,7 +168,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
         options: { command: 'cargo bench --workspace', cwd: projectRoot },
       };
     }
-    if (cargo.cdylibCrates.length > 0 && !('cargo-wasm' in declared)) {
+    if (cargo.wasmCrates.length > 0 && !('cargo-wasm' in declared)) {
       const profile = cargo.hasWasmReleaseProfile ? 'wasm-release' : 'release';
       const buildAndCopy = (crate: string, profileName: string | null) => {
         const artifact = crate.replace(/-/g, '_');
@@ -180,13 +182,13 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
         inputs: CARGO_INPUTS,
         outputs: ['{projectRoot}/dist/**/*.wasm'],
         options: {
-          commands: cargo.cdylibCrates.map((crate) => buildAndCopy(crate, profile)),
+          commands: cargo.wasmCrates.map((crate) => buildAndCopy(crate, profile)),
           cwd: projectRoot,
           parallel: false,
         },
         configurations: {
           development: {
-            commands: cargo.cdylibCrates.map((crate) => buildAndCopy(crate, null)),
+            commands: cargo.wasmCrates.map((crate) => buildAndCopy(crate, null)),
           },
         },
       };
@@ -322,7 +324,7 @@ function hasPackageLocalBuildOutputTarget(packageJson: PackageJson): boolean {
 }
 
 interface CargoWorkspace {
-  cdylibCrates: string[];
+  wasmCrates: string[];
   hasWasmReleaseProfile: boolean;
 }
 
@@ -339,7 +341,7 @@ async function readCargoWorkspace(absoluteProjectRoot: string): Promise<CargoWor
     return null;
   }
 
-  const cdylibCrates: string[] = [];
+  const wasmCrates: string[] = [];
   const membersList = CARGO_MEMBERS_PATTERN.exec(cargoToml)?.[1] ?? '';
   for (const match of membersList.matchAll(CARGO_MEMBER_ENTRY_PATTERN)) {
     const memberTomlPath = join(absoluteProjectRoot, match[1], 'Cargo.toml');
@@ -347,15 +349,18 @@ async function readCargoWorkspace(absoluteProjectRoot: string): Promise<CargoWor
       continue;
     }
     const memberToml = await readFile(memberTomlPath, 'utf-8');
-    if (CARGO_CDYLIB_PATTERN.test(memberToml)) {
-      const name = CARGO_PACKAGE_NAME_PATTERN.exec(memberToml)?.[1];
-      if (name && !cdylibCrates.includes(name)) {
-        cdylibCrates.push(name);
-      }
+    const name = CARGO_PACKAGE_NAME_PATTERN.exec(memberToml)?.[1];
+    if (
+      name &&
+      CARGO_WASM_CRATE_NAME_PATTERN.test(name) &&
+      CARGO_CDYLIB_CRATE_TYPE_PATTERN.test(memberToml) &&
+      !wasmCrates.includes(name)
+    ) {
+      wasmCrates.push(name);
     }
   }
 
-  return { cdylibCrates, hasWasmReleaseProfile: CARGO_WASM_RELEASE_PROFILE_PATTERN.test(cargoToml) };
+  return { wasmCrates, hasWasmReleaseProfile: CARGO_WASM_RELEASE_PROFILE_PATTERN.test(cargoToml) };
 }
 
 async function readZigSteps(absoluteProjectRoot: string, projectRoot: string): Promise<string[]> {
