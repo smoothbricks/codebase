@@ -1101,19 +1101,28 @@ mod tests {
             "for fd in /dev/fd/*; do [ \"$(/usr/bin/readlink \"$fd\" 2>/dev/null)\" = \"{}\" ] && exit 1; done; exit 0",
             marker.display()
         );
+        let mut failure = None;
         for _ in 0..8 {
-            let status = SystemSpawnRunner
-                .run(&SpawnPlan {
-                    program: PathBuf::from("/bin/sh"),
-                    args: vec![OsString::from("-c"), OsString::from(&script)],
-                    cwd: tree.cwd.clone(),
-                })
-                .unwrap();
-            assert!(status.success());
+            match SystemSpawnRunner.run(&SpawnPlan {
+                program: PathBuf::from("/bin/sh"),
+                args: vec![OsString::from("-c"), OsString::from(&script)],
+                cwd: tree.cwd.clone(),
+            }) {
+                Ok(status) if status.success() => {}
+                Ok(status) => {
+                    failure = Some(format!("spawned process exited with {status}"));
+                    break;
+                }
+                Err(error) => {
+                    failure = Some(format!("spawn failed: {error:?}"));
+                    break;
+                }
+            }
         }
 
         running.store(false, Ordering::Release);
         opener.join().unwrap();
+        assert!(failure.is_none(), "{}", failure.unwrap_or_default());
     }
 
     #[test]
