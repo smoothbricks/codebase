@@ -42,6 +42,8 @@ pub enum Command {
 pub struct AdoptArgs {
     pub path: Option<PathBuf>,
     pub capacity: Option<OsString>,
+    pub repo_id: Option<OsString>,
+    pub quarantine: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -320,7 +322,7 @@ fn parse_adopt(
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "adopt [path] [--capacity <size>]";
+    const USAGE: &str = "adopt [path] [--capacity <size>] [--repo-id <owner/repo>] [--quarantine]";
     let mut parsed = AdoptArgs::default();
     while index < args.len() {
         if parse_global(args, &mut index, global)? {
@@ -330,6 +332,10 @@ fn parse_adopt(
             Some("--capacity") => {
                 parsed.capacity = Some(take_value(args, &mut index, "--capacity", USAGE)?);
             }
+            Some("--repo-id") => {
+                parsed.repo_id = Some(take_value(args, &mut index, "--repo-id", USAGE)?);
+            }
+            Some("--quarantine") => parsed.quarantine = true,
             Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
             _ if parsed.path.is_none() => parsed.path = Some(PathBuf::from(&args[index])),
             _ => return Err(UsageError::new("adopt accepts at most one path", USAGE)),
@@ -1184,6 +1190,30 @@ mod tests {
 
         assert!(error.message.contains("requires"));
         assert_eq!(error.exit_code(), 2);
+    }
+
+    #[test]
+    fn adopt_parses_explicit_repository_identity_and_quarantine() {
+        let cli = parse_args([
+            "adopt",
+            "/repo",
+            "--capacity",
+            "100g",
+            "--repo-id",
+            "local/widget",
+            "--quarantine",
+            "--json",
+        ])
+        .unwrap();
+        let Command::Adopt(args) = cli.command else {
+            panic!("expected adopt")
+        };
+        assert_eq!(args.path, Some(PathBuf::from("/repo")));
+        assert_eq!(args.capacity, Some(OsString::from("100g")));
+        assert_eq!(args.repo_id, Some(OsString::from("local/widget")));
+        assert!(args.quarantine);
+        assert!(cli.global.json);
+        assert!(parse_args(["adopt", "--repo-id"]).is_err());
     }
 
     #[test]

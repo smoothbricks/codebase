@@ -15,6 +15,7 @@ use cowshed_core::api::{
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
+use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::ProjectRuntime;
 use cowshed_core::{CowshedError, ErrorCode, Result};
 use std::collections::HashMap;
@@ -760,10 +761,20 @@ fn success() -> DispatchExit {
 fn adopt_options(args: AdoptArgs) -> Result<AdoptOptions> {
     Ok(AdoptOptions {
         path: args.path,
-        repo_id: None,
+        repo_id: args.repo_id.map(os_repo_id).transpose()?,
         capacity: args.capacity.map(os_utf8).transpose()?,
-        quarantine: false,
+        quarantine: args.quarantine,
         image_format: None,
+    })
+}
+
+fn os_repo_id(value: std::ffi::OsString) -> Result<RepoId> {
+    let value = os_utf8(value)?;
+    RepoId::parse(&value).map_err(|error| {
+        usage(
+            format!("invalid repository identity: {error}"),
+            "use an explicit owner/repository identity",
+        )
     })
 }
 
