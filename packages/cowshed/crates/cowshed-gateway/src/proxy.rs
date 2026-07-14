@@ -8,17 +8,20 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use http::{
-    HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, header,
+    HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version, header,
 };
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt as _, Empty, Full, Limited, combinators::BoxBody};
 use hyper::{
-    body::Incoming, client::conn::http1 as client_http1, server::conn::http1 as server_http1,
+    body::Incoming,
+    client::conn::{http1 as client_http1, http2 as client_http2},
+    server::conn::{http1 as server_http1, http2 as server_http2},
     service::service_fn,
 };
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     sync::{mpsc, oneshot, watch},
@@ -31,10 +34,16 @@ use crate::{
         Admission, AdmissionError, AuditAttempt, AuditDraft, Authentication, BoundListener,
         Command, CompletionLease, RequestIntent, RequestTarget,
     },
+    cache::CacheBodyError,
     config::GatewayTimeouts,
     interfaces::{
         AuditKind, AuditStatus, AuthorizedTarget, BoxError, CredentialProtocol, CredentialProvider,
-        CredentialQuery, UpstreamConnector, UpstreamHealth, UpstreamPurpose,
+        CredentialQuery, NegotiatedTransport, UpstreamConnection, UpstreamConnector,
+        UpstreamHealth, UpstreamPurpose,
+    },
+    mirror::{
+        MirrorBody, MirrorCacheScope, MirrorError, MirrorFetchRequest, MirrorOutcome,
+        MirrorRequest, MirrorService, MirrorUpstream,
     },
     policy::{CanonicalHost, CanonicalTarget, EgressMode, TargetScheme, normalize_path},
 };
@@ -45,6 +54,9 @@ const MAX_HEADER_FIELD: usize = 16 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 const MAX_CLIENT_HELLO: usize = 64 * 1024;
+const MAX_H2_CONCURRENT_STREAMS: u32 = 32;
+const MAX_H2_SEND_BUFFER: usize = 64 * 1024;
+const MAX_H2_RESET_STREAMS: usize = 32;
 
 type ResponseBody = ProxyBody;
 type ServiceResult = Result<Response<ResponseBody>, Infallible>;
@@ -55,6 +67,7 @@ pub(crate) struct AcceptContext {
     pub commands: mpsc::Sender<Command>,
     pub credentials: Arc<dyn CredentialProvider>,
     pub connector: Arc<dyn UpstreamConnector>,
+    pub mirror_service: MirrorService,
     pub timeouts: GatewayTimeouts,
     pub connection_stop: watch::Receiver<bool>,
     pub audit_stop: watch::Receiver<bool>,
@@ -214,7 +227,10 @@ async fn handle_request(
             None,
         ));
     }
-    let health = context.connector.health(&admission.target).await;
+    let health = upstream_health(&context, &admission.target).await;
+    if admission.protocol.is_some() {
+        return Ok(handle_mirror_request(request, context, admission, health, audit_kind).await);
+    }
     if health == UpstreamHealth::Offline {
         complete_now(
             &context,
@@ -247,7 +263,7 @@ async fn handle_request(
     )
     .await
     {
-        Ok(Ok(stream)) => stream,
+        Ok(Ok(connection)) => connection,
         Ok(Err(_)) => {
             complete_now(
                 &context,
@@ -283,36 +299,58 @@ async fn handle_request(
             ));
         }
     };
-    let request =
-        match prepare_upstream_request(request, &admission, &admission.upstream_path, &context)
-            .await
-        {
-            Ok(request) => request,
-            Err(status) => {
-                complete_now(
-                    &context,
-                    admission,
-                    AuditStatus::Failed,
-                    Some(status),
-                    Some("credential-failed"),
-                    0,
-                    audit_kind,
-                )
-                .await;
-                return Ok(problem(
-                    status,
-                    "credential policy rejected the request",
-                    None,
-                ));
-            }
-        };
-    let (mut sender, connection) = match timeout(
-        context.timeouts.response_headers,
-        client_http1::handshake(TokioIo::new(upstream)),
+    if upstream.transport == NegotiatedTransport::Raw {
+        complete_now(
+            &context,
+            admission,
+            AuditStatus::Failed,
+            Some(StatusCode::BAD_GATEWAY),
+            Some("upstream-protocol"),
+            0,
+            audit_kind,
+        )
+        .await;
+        return Ok(problem(
+            StatusCode::BAD_GATEWAY,
+            "upstream connector returned raw transport for HTTP",
+            None,
+        ));
+    }
+    let request = match prepare_upstream_request(
+        request,
+        &admission,
+        &admission.upstream_path,
+        &context,
+        upstream.transport,
     )
     .await
     {
-        Ok(Ok(parts)) => parts,
+        Ok(request) => request,
+        Err(status) => {
+            complete_now(
+                &context,
+                admission,
+                AuditStatus::Failed,
+                Some(status),
+                Some("credential-failed"),
+                0,
+                audit_kind,
+            )
+            .await;
+            return Ok(problem(
+                status,
+                "credential policy rejected the request",
+                None,
+            ));
+        }
+    };
+    let mut sender = match timeout(
+        context.timeouts.response_headers,
+        handshake_upstream(upstream),
+    )
+    .await
+    {
+        Ok(Ok(sender)) => sender,
         Ok(Err(_)) => {
             complete_now(
                 &context,
@@ -348,9 +386,6 @@ async fn handle_request(
             ));
         }
     };
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
     let response = match timeout(
         context.timeouts.response_headers,
         sender.send_request(request),
@@ -396,6 +431,7 @@ async fn handle_request(
     let status = response.status();
     let (mut parts, body) = response.into_parts();
     strip_response_secrets(&mut parts.headers);
+    strip_hop_headers(&mut parts.headers);
     let completion = Completion::new(context.commands.clone(), admission, status);
     let body = ProxyBody::stream(
         body.map_err(|error| -> BoxError { Box::new(error) })
@@ -405,6 +441,333 @@ async fn handle_request(
         context.timeouts.request_total,
     );
     Ok(Response::from_parts(parts, body))
+}
+
+enum UpstreamSender {
+    Http1(client_http1::SendRequest<BoxBody<Bytes, BoxError>>),
+    Http2(client_http2::SendRequest<BoxBody<Bytes, BoxError>>),
+}
+
+impl UpstreamSender {
+    async fn send_request(
+        &mut self,
+        request: Request<BoxBody<Bytes, BoxError>>,
+    ) -> Result<Response<Incoming>, hyper::Error> {
+        match self {
+            Self::Http1(sender) => sender.send_request(request).await,
+            Self::Http2(sender) => sender.send_request(request).await,
+        }
+    }
+}
+
+async fn handshake_upstream(connection: UpstreamConnection) -> Result<UpstreamSender, ()> {
+    match connection.transport {
+        NegotiatedTransport::Http1 => {
+            let (sender, connection) = client_http1::handshake(TokioIo::new(connection.io))
+                .await
+                .map_err(|_| ())?;
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            Ok(UpstreamSender::Http1(sender))
+        }
+        NegotiatedTransport::Http2 => {
+            let mut builder = client_http2::Builder::new(TokioExecutor::new());
+            builder
+                .timer(TokioTimer::new())
+                .initial_max_send_streams(MAX_H2_CONCURRENT_STREAMS as usize)
+                .max_concurrent_streams(MAX_H2_CONCURRENT_STREAMS)
+                .max_header_list_size(MAX_HEADER_BYTES as u32)
+                .max_send_buf_size(MAX_H2_SEND_BUFFER)
+                .max_concurrent_reset_streams(MAX_H2_RESET_STREAMS)
+                .max_pending_accept_reset_streams(MAX_H2_RESET_STREAMS);
+            let (sender, connection) = builder
+                .handshake(TokioIo::new(connection.io))
+                .await
+                .map_err(|_| ())?;
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            Ok(UpstreamSender::Http2(sender))
+        }
+        NegotiatedTransport::Raw => Err(()),
+    }
+}
+
+async fn handle_mirror_request(
+    request: Request<Incoming>,
+    context: AcceptContext,
+    admission: Admission,
+    health: UpstreamHealth,
+    audit_kind: AuditKind,
+) -> Response<ResponseBody> {
+    let protocol = admission
+        .protocol
+        .expect("mirror admission must carry a protocol");
+    let mut headers = request.headers().clone();
+    strip_client_secrets(&mut headers);
+    strip_hop_headers(&mut headers);
+    let cache_scope = if admission.credential_allowed {
+        MirrorCacheScope::Project(admission.repo_id.clone())
+    } else {
+        MirrorCacheScope::Anonymous
+    };
+    let mirror_request = match MirrorRequest::new(
+        protocol,
+        admission.target.clone(),
+        request.method().clone(),
+        admission.upstream_path.clone(),
+        headers,
+        cache_scope,
+        admission.credential_allowed,
+        None,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            return mirror_failure(&context, admission, error, audit_kind).await;
+        }
+    };
+    let upstream = ProxyMirrorUpstream {
+        context: &context,
+        workspace_id: &admission.workspace_id,
+        repo_id: &admission.repo_id,
+        credential_allowed: admission.credential_allowed,
+        impersonate: admission.impersonate,
+        private_network_authorized: admission.private_network_authorized,
+        trace_id: admission.trace_id.as_deref(),
+        permit_id: admission.permit_id,
+    };
+    match context
+        .mirror_service
+        .execute(mirror_request, health, &upstream)
+        .await
+    {
+        Ok(MirrorOutcome::Response(response)) => {
+            let status = response.response.status();
+            let (mut parts, body) = response.response.into_parts();
+            strip_response_secrets(&mut parts.headers);
+            strip_hop_headers(&mut parts.headers);
+            let completion = Completion::new(context.commands.clone(), admission, status);
+            let body = ProxyBody::stream(
+                body,
+                completion,
+                context.timeouts.body_idle,
+                context.timeouts.request_total,
+            );
+            Response::from_parts(parts, body)
+        }
+        Ok(MirrorOutcome::Redirect(_redirect)) => {
+            complete_now(
+                &context,
+                admission,
+                AuditStatus::Failed,
+                Some(StatusCode::BAD_GATEWAY),
+                Some("mirror-redirect-requires-readmission"),
+                0,
+                audit_kind,
+            )
+            .await;
+            problem(
+                StatusCode::BAD_GATEWAY,
+                "mirror redirect requires a new policy admission",
+                None,
+            )
+        }
+        Err(error) => mirror_failure(&context, admission, error, audit_kind).await,
+    }
+}
+
+async fn mirror_failure(
+    context: &AcceptContext,
+    admission: Admission,
+    error: MirrorError,
+    audit_kind: AuditKind,
+) -> Response<ResponseBody> {
+    let (status, audit_status, classification, message) = match error {
+        MirrorError::OfflineMiss => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            AuditStatus::Offline,
+            "mirror-offline-miss",
+            "mirror object is not available offline",
+        ),
+        MirrorError::MethodNotAllowed => (
+            StatusCode::METHOD_NOT_ALLOWED,
+            AuditStatus::Denied,
+            "mirror-method",
+            "mirror only accepts GET and HEAD",
+        ),
+        MirrorError::MissingIntegrity
+        | MirrorError::ObjectTooLarge
+        | MirrorError::InvalidProtocolPath
+        | MirrorError::UnscopedCredential => (
+            StatusCode::BAD_REQUEST,
+            AuditStatus::Denied,
+            "mirror-request",
+            "mirror request is invalid",
+        ),
+        MirrorError::UnsafeRedirect
+        | MirrorError::InvalidRedirect
+        | MirrorError::TooManyRedirects => (
+            StatusCode::BAD_GATEWAY,
+            AuditStatus::Failed,
+            "mirror-redirect",
+            "mirror redirect was rejected",
+        ),
+        _ => (
+            StatusCode::BAD_GATEWAY,
+            AuditStatus::Failed,
+            "mirror-service",
+            "mirror service failed",
+        ),
+    };
+    complete_now(
+        context,
+        admission,
+        audit_status,
+        Some(status),
+        Some(classification),
+        0,
+        audit_kind,
+    )
+    .await;
+    problem(status, message, None)
+}
+
+struct ProxyMirrorUpstream<'a> {
+    context: &'a AcceptContext,
+    workspace_id: &'a str,
+    repo_id: &'a str,
+    credential_allowed: bool,
+    impersonate: bool,
+    private_network_authorized: bool,
+    trace_id: Option<&'a str>,
+    permit_id: u64,
+}
+
+#[async_trait]
+impl MirrorUpstream for ProxyMirrorUpstream<'_> {
+    async fn fetch(
+        &self,
+        request: MirrorFetchRequest,
+    ) -> Result<Response<MirrorBody>, CacheBodyError> {
+        let purpose = match request.target.scheme {
+            TargetScheme::Http => UpstreamPurpose::PlainHttp,
+            TargetScheme::Https => UpstreamPurpose::TlsHttp,
+        };
+        let authorized = AuthorizedTarget {
+            target: request.target.clone(),
+            purpose,
+            private_network_authorized: self.private_network_authorized,
+        };
+        let upstream = timeout(
+            self.context.timeouts.connect,
+            self.context.connector.connect(&authorized),
+        )
+        .await
+        .map_err(|_| -> CacheBodyError { "mirror upstream connect timed out".into() })?
+        .map_err(|error| -> CacheBodyError { Box::new(error) })?;
+        if upstream.transport == NegotiatedTransport::Raw {
+            return Err("mirror connector returned raw transport for HTTP".into());
+        }
+
+        let mut outbound = Request::builder()
+            .method(request.method.clone())
+            .body(
+                Empty::<Bytes>::new()
+                    .map_err(|never| -> CacheBodyError { match never {} })
+                    .boxed(),
+            )
+            .map_err(|error| -> CacheBodyError { Box::new(error) })?;
+        *outbound.headers_mut() = request.headers;
+        strip_client_secrets(outbound.headers_mut());
+        strip_hop_headers(outbound.headers_mut());
+        outbound.headers_mut().insert(
+            header::HOST,
+            HeaderValue::from_str(&request.target.authority())
+                .map_err(|error| -> CacheBodyError { Box::new(error) })?,
+        );
+        if !self.impersonate {
+            let trace_id = self
+                .trace_id
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{:032x}", self.permit_id));
+            let trace = format!("00-{trace_id}-{:016x}-01", self.permit_id);
+            outbound.headers_mut().insert(
+                HeaderName::from_static("traceparent"),
+                HeaderValue::from_str(&trace)
+                    .map_err(|error| -> CacheBodyError { Box::new(error) })?,
+            );
+        }
+        if self.credential_allowed {
+            let query = CredentialQuery {
+                workspace_id: self.workspace_id.to_owned(),
+                repo_id: self.repo_id.to_owned(),
+                protocol: CredentialProtocol::from(request.protocol),
+                origin: request.target.origin(),
+                method: request.method,
+                path: request.path.clone(),
+            };
+            if let Some(record) = timeout(
+                self.context.timeouts.response_headers,
+                self.context.credentials.lookup(&query),
+            )
+            .await
+            .map_err(|_| -> CacheBodyError { "mirror credential lookup timed out".into() })?
+            .map_err(|error| -> CacheBodyError { Box::new(error) })?
+            {
+                if !record.validate_for(&query) {
+                    return Err("mirror credential scope mismatch".into());
+                }
+                outbound.headers_mut().insert(
+                    record.header_name.clone(),
+                    HeaderValue::from_str(record.header_value.as_str())
+                        .map_err(|error| -> CacheBodyError { Box::new(error) })?,
+                );
+            }
+        }
+        match upstream.transport {
+            NegotiatedTransport::Http1 => {
+                *outbound.version_mut() = Version::HTTP_11;
+                *outbound.uri_mut() = Uri::builder()
+                    .path_and_query(request.path)
+                    .build()
+                    .map_err(|error| -> CacheBodyError { Box::new(error) })?;
+            }
+            NegotiatedTransport::Http2 => {
+                *outbound.version_mut() = Version::HTTP_2;
+                *outbound.uri_mut() = Uri::builder()
+                    .scheme(request.target.scheme.as_str())
+                    .authority(request.target.authority())
+                    .path_and_query(request.path)
+                    .build()
+                    .map_err(|error| -> CacheBodyError { Box::new(error) })?;
+            }
+            NegotiatedTransport::Raw => {
+                return Err("mirror connector returned raw transport for HTTP".into());
+            }
+        }
+        let mut sender = timeout(
+            self.context.timeouts.response_headers,
+            handshake_upstream(upstream),
+        )
+        .await
+        .map_err(|_| -> CacheBodyError { "mirror HTTP handshake timed out".into() })?
+        .map_err(|_| -> CacheBodyError { "mirror HTTP handshake failed".into() })?;
+        let response = timeout(
+            self.context.timeouts.response_headers,
+            sender.send_request(outbound),
+        )
+        .await
+        .map_err(|_| -> CacheBodyError { "mirror response headers timed out".into() })?
+        .map_err(|error| -> CacheBodyError { Box::new(error) })?;
+        let (mut parts, body) = response.into_parts();
+        strip_response_secrets(&mut parts.headers);
+        strip_hop_headers(&mut parts.headers);
+        let body = body
+            .map_err(|error| -> CacheBodyError { Box::new(error) })
+            .boxed();
+        Ok(Response::from_parts(parts, body))
+    }
 }
 
 async fn handle_connect(
@@ -460,7 +823,7 @@ async fn handle_connect(
         Err(error) => return problem(error.status, error.message, error.hint.as_deref()),
     };
     if !matches!(admission.mode, EgressMode::Opaque)
-        && context.connector.health(&target).await == UpstreamHealth::Offline
+        && upstream_health(&context, &target).await == UpstreamHealth::Offline
     {
         complete_now(
             &context,
@@ -611,7 +974,7 @@ fn spawn_opaque(
                 }
             };
 
-            if context.connector.health(&authorized.target).await == UpstreamHealth::Offline {
+            if upstream_health(&context, &authorized.target).await == UpstreamHealth::Offline {
                 complete_now(
                     &context,
                     admission,
@@ -624,13 +987,13 @@ fn spawn_opaque(
                 .await;
                 return;
             }
-            let mut upstream = match timeout(
+            let upstream = match timeout(
                 context.timeouts.connect,
                 context.connector.connect(&authorized),
             )
             .await
             {
-                Ok(Ok(stream)) => stream,
+                Ok(Ok(connection)) => connection,
                 Ok(Err(_)) => {
                     complete_now(
                         &context,
@@ -658,6 +1021,20 @@ fn spawn_opaque(
                     return;
                 }
             };
+            if upstream.transport != NegotiatedTransport::Raw {
+                complete_now(
+                    &context,
+                    admission,
+                    AuditStatus::Failed,
+                    Some(StatusCode::BAD_GATEWAY),
+                    Some("upstream-protocol"),
+                    0,
+                    AuditKind::Opaque,
+                )
+                .await;
+                return;
+            }
+            let mut upstream = upstream.io;
             match timeout(context.timeouts.connect, upstream.write_all(&captured)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => {
@@ -885,39 +1262,67 @@ fn spawn_intercept(
                 .await;
                 return;
             }
-            let nested_context = context.clone();
-            let fixed_target = admission.target.clone();
-            let generation = admission.generation;
-            let service = service_fn(move |request| {
-                handle_request(
-                    request,
-                    nested_context.clone(),
-                    Authentication::Generation(generation),
-                    Some(fixed_target.clone()),
-                )
-            });
-            let connection = server_http1::Builder::new()
-                .timer(TokioTimer::new())
-                .header_read_timeout(context.timeouts.request_headers)
-                .max_headers(MAX_HEADERS)
-                .serve_connection(TokioIo::new(tls), service);
-            let mut stopped = watch_for_session_stop(&context);
-            tokio::pin!(connection);
-            tokio::select! {
-                result = &mut connection => {
-                    let (status, classification) = if result.is_ok() {
-                        (AuditStatus::Completed, None)
-                    } else {
-                        (AuditStatus::Failed, Some("intercept-io"))
-                    };
-                    complete_now(&context, admission, status, Some(StatusCode::OK), classification, 0, AuditKind::Connect).await;
+            let negotiated = match tls.get_ref().1.alpn_protocol() {
+                Some(b"h2") => NegotiatedTransport::Http2,
+                Some(b"http/1.1") => NegotiatedTransport::Http1,
+                Some(_) | None => {
+                    complete_now(
+                        &context,
+                        admission,
+                        AuditStatus::Denied,
+                        Some(StatusCode::BAD_REQUEST),
+                        Some("client-alpn"),
+                        0,
+                        AuditKind::Connect,
+                    )
+                    .await;
+                    return;
                 }
-                _ = stopped.changed() => {
-                    complete_now(&context, admission, AuditStatus::Cancelled, None, Some("session-rotated"), 0, AuditKind::Connect).await;
+            };
+            match negotiated {
+                NegotiatedTransport::Http1 => {
+                    let nested_context = context.clone();
+                    let fixed_target = admission.target.clone();
+                    let generation = admission.generation;
+                    let service = service_fn(move |request| {
+                        handle_request(
+                            request,
+                            nested_context.clone(),
+                            Authentication::Generation(generation),
+                            Some(fixed_target.clone()),
+                        )
+                    });
+                    let connection = server_http1::Builder::new()
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(context.timeouts.request_headers)
+                        .max_headers(MAX_HEADERS)
+                        .serve_connection(TokioIo::new(tls), service);
+                    drive_intercept(connection, &context, admission).await;
                 }
-                _ = tokio::time::sleep(context.timeouts.tunnel_total) => {
-                    complete_now(&context, admission, AuditStatus::TimedOut, None, Some("tunnel-total-timeout"), 0, AuditKind::Connect).await;
+                NegotiatedTransport::Http2 => {
+                    let nested_context = context.clone();
+                    let fixed_target = admission.target.clone();
+                    let generation = admission.generation;
+                    let service = service_fn(move |request| {
+                        handle_request(
+                            request,
+                            nested_context.clone(),
+                            Authentication::Generation(generation),
+                            Some(fixed_target.clone()),
+                        )
+                    });
+                    let mut builder = server_http2::Builder::new(TokioExecutor::new());
+                    builder
+                        .timer(TokioTimer::new())
+                        .max_concurrent_streams(MAX_H2_CONCURRENT_STREAMS)
+                        .max_header_list_size(MAX_HEADER_BYTES as u32)
+                        .max_send_buf_size(MAX_H2_SEND_BUFFER)
+                        .max_pending_accept_reset_streams(MAX_H2_RESET_STREAMS)
+                        .max_local_error_reset_streams(MAX_H2_RESET_STREAMS);
+                    let connection = builder.serve_connection(TokioIo::new(tls), service);
+                    drive_intercept(connection, &context, admission).await;
                 }
+                NegotiatedTransport::Raw => unreachable!("TLS ALPN cannot select raw transport"),
             }
         };
         tokio::select! {
@@ -925,6 +1330,30 @@ fn spawn_intercept(
             _ = transport => {}
         }
     });
+}
+
+async fn drive_intercept<F>(connection: F, context: &AcceptContext, admission: Admission)
+where
+    F: Future<Output = Result<(), hyper::Error>>,
+{
+    let mut stopped = watch_for_session_stop(context);
+    tokio::pin!(connection);
+    tokio::select! {
+        result = &mut connection => {
+            let (status, classification) = if result.is_ok() {
+                (AuditStatus::Completed, None)
+            } else {
+                (AuditStatus::Failed, Some("intercept-io"))
+            };
+            complete_now(context, admission, status, Some(StatusCode::OK), classification, 0, AuditKind::Connect).await;
+        }
+        _ = stopped.changed() => {
+            complete_now(context, admission, AuditStatus::Cancelled, None, Some("session-rotated"), 0, AuditKind::Connect).await;
+        }
+        _ = tokio::time::sleep(context.timeouts.tunnel_total) => {
+            complete_now(context, admission, AuditStatus::TimedOut, None, Some("tunnel-total-timeout"), 0, AuditKind::Connect).await;
+        }
+    }
 }
 
 fn watch_for_session_stop(context: &AcceptContext) -> watch::Receiver<bool> {
@@ -935,11 +1364,18 @@ fn watch_for_audit_stop(context: &AcceptContext) -> watch::Receiver<bool> {
     context.audit_stop.clone()
 }
 
+async fn upstream_health(context: &AcceptContext, target: &CanonicalTarget) -> UpstreamHealth {
+    timeout(context.timeouts.connect, context.connector.health(target))
+        .await
+        .unwrap_or(UpstreamHealth::Unknown)
+}
+
 async fn prepare_upstream_request(
     request: Request<Incoming>,
     admission: &Admission,
     path: &str,
     context: &AcceptContext,
+    transport: NegotiatedTransport,
 ) -> Result<Request<BoxBody<Bytes, BoxError>>, StatusCode> {
     let (mut parts, body) = request.into_parts();
     strip_client_secrets(&mut parts.headers);
@@ -973,11 +1409,13 @@ async fn prepare_upstream_request(
             method: parts.method.clone(),
             path: path.to_owned(),
         };
-        if let Some(record) = context
-            .credentials
-            .lookup(&query)
-            .await
-            .map_err(|_| StatusCode::BAD_GATEWAY)?
+        if let Some(record) = timeout(
+            context.timeouts.response_headers,
+            context.credentials.lookup(&query),
+        )
+        .await
+        .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
+        .map_err(|_| StatusCode::BAD_GATEWAY)?
         {
             if !record.validate_for(&query) {
                 return Err(StatusCode::BAD_GATEWAY);
@@ -987,10 +1425,22 @@ async fn prepare_upstream_request(
             parts.headers.insert(record.header_name.clone(), value);
         }
     }
-    parts.uri = Uri::builder()
-        .path_and_query(path)
-        .build()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    parts.uri = match transport {
+        NegotiatedTransport::Http1 => {
+            parts.version = Version::HTTP_11;
+            Uri::builder().path_and_query(path).build()
+        }
+        NegotiatedTransport::Http2 => {
+            parts.version = Version::HTTP_2;
+            Uri::builder()
+                .scheme(admission.target.scheme.as_str())
+                .authority(admission.target.authority())
+                .path_and_query(path)
+                .build()
+        }
+        NegotiatedTransport::Raw => return Err(StatusCode::BAD_GATEWAY),
+    }
+    .map_err(|_| StatusCode::BAD_REQUEST)?;
     let body = Limited::new(body, MAX_REQUEST_BODY).boxed();
     Ok(Request::from_parts(parts, body))
 }
@@ -1005,11 +1455,23 @@ fn request_target(
         .map(|value| value.as_str())
         .unwrap_or("/")
         .to_owned();
-    normalize_path(request.uri().path())
-        .map_err(|_| RequestError::bad("request path is ambiguous"))?;
+    let local_mirror_kind = if fixed.is_none()
+        && request.uri().scheme().is_none()
+        && request.uri().authority().is_none()
+    {
+        local_mirror_kind(request.uri().path())
+    } else {
+        None
+    };
+    if local_mirror_kind.is_none() {
+        normalize_path(request.uri().path())
+            .map_err(|_| RequestError::bad("request path is ambiguous"))?;
+    }
     if let Some(target) = fixed {
-        if !host_matches(request.headers(), target) {
-            return Err(RequestError::bad("Host differs from CONNECT authority"));
+        if !request_authority_matches(request, target) {
+            return Err(RequestError::bad(
+                "request authority differs from CONNECT authority",
+            ));
         }
         return Ok((
             RequestTarget::Generic(target.clone()),
@@ -1040,20 +1502,7 @@ fn request_target(
         }
         return Ok((RequestTarget::Generic(target), path, AuditKind::Http));
     }
-    if path.starts_with("/npm/")
-        || path == "/npm"
-        || path.starts_with("/cargo/")
-        || path == "/cargo"
-        || path.starts_with("/go/")
-        || path == "/go"
-    {
-        let kind = if path.starts_with("/npm") {
-            AuditKind::Npm
-        } else if path.starts_with("/cargo") {
-            AuditKind::Cargo
-        } else {
-            AuditKind::Go
-        };
+    if let Some(kind) = local_mirror_kind {
         return Ok((RequestTarget::LocalMirror, path, kind));
     }
     Err(RequestError::bad(
@@ -1061,7 +1510,22 @@ fn request_target(
     ))
 }
 
-fn validate_request(request: &Request<Incoming>) -> Result<(), RequestError> {
+fn local_mirror_kind(path: &str) -> Option<AuditKind> {
+    if path == "/npm" || path.starts_with("/npm/") {
+        Some(AuditKind::Npm)
+    } else if path == "/cargo" || path.starts_with("/cargo/") {
+        Some(AuditKind::Cargo)
+    } else if path == "/go" || path.starts_with("/go/") {
+        Some(AuditKind::Go)
+    } else {
+        None
+    }
+}
+
+fn validate_request<B>(request: &Request<B>) -> Result<(), RequestError>
+where
+    B: Body,
+{
     if request.uri().to_string().len() > MAX_TARGET {
         return Err(RequestError::new(
             StatusCode::URI_TOO_LONG,
@@ -1095,6 +1559,33 @@ fn validate_request(request: &Request<Incoming>) -> Result<(), RequestError> {
     }
     if headers.get_all(header::HOST).iter().count() > 1 {
         return Err(RequestError::bad("duplicate Host header"));
+    }
+    if request.version() == Version::HTTP_2 {
+        if request.uri().scheme().is_none() || request.uri().authority().is_none() {
+            return Err(RequestError::bad(
+                "HTTP/2 requires valid :scheme and :authority projections",
+            ));
+        }
+        for forbidden in [
+            header::CONNECTION,
+            header::TRANSFER_ENCODING,
+            header::UPGRADE,
+            HeaderName::from_static("keep-alive"),
+            HeaderName::from_static("proxy-connection"),
+        ] {
+            if headers.contains_key(forbidden) {
+                return Err(RequestError::bad(
+                    "HTTP/2 forbids connection-specific headers",
+                ));
+            }
+        }
+        if let Some(te) = headers.get(HeaderName::from_static("te"))
+            && !te.as_bytes().eq_ignore_ascii_case(b"trailers")
+        {
+            return Err(RequestError::bad(
+                "HTTP/2 TE header may contain only trailers",
+            ));
+        }
     }
     let content_lengths: Vec<_> = headers.get_all(header::CONTENT_LENGTH).iter().collect();
     if content_lengths.len() > 1 {
@@ -1147,15 +1638,28 @@ fn proxy_token(headers: &HeaderMap) -> Option<String> {
     }
     Some(token.to_owned())
 }
-
-fn host_matches(headers: &HeaderMap, target: &CanonicalTarget) -> bool {
-    let values: Vec<_> = headers.get_all(header::HOST).iter().collect();
-    if values.len() != 1 {
+fn request_authority_matches<B>(request: &Request<B>, target: &CanonicalTarget) -> bool {
+    if request.version() != Version::HTTP_2 {
+        return host_matches(request.headers(), target);
+    }
+    if request.uri().scheme_str() != Some(target.scheme.as_str()) {
         return false;
     }
-    let Ok(value) = values[0].to_str() else {
+    let Some(authority) = request.uri().authority() else {
         return false;
     };
+    if !authority_value_matches(authority.as_str(), target) {
+        return false;
+    }
+    let hosts: Vec<_> = request.headers().get_all(header::HOST).iter().collect();
+    hosts.is_empty()
+        || (hosts.len() == 1
+            && hosts[0]
+                .to_str()
+                .is_ok_and(|host| authority_value_matches(host, target)))
+}
+
+fn authority_value_matches(value: &str, target: &CanonicalTarget) -> bool {
     let with_default_port = if value
         .parse::<http::uri::Authority>()
         .ok()
@@ -1170,7 +1674,17 @@ fn host_matches(headers: &HeaderMap, target: &CanonicalTarget) -> bool {
         value.to_owned()
     };
     CanonicalTarget::from_authority(&with_default_port, target.scheme)
-        .is_ok_and(|host| host == *target)
+        .is_ok_and(|candidate| candidate == *target)
+}
+
+fn host_matches(headers: &HeaderMap, target: &CanonicalTarget) -> bool {
+    let values: Vec<_> = headers.get_all(header::HOST).iter().collect();
+    if values.len() != 1 {
+        return false;
+    }
+    values[0]
+        .to_str()
+        .is_ok_and(|value| authority_value_matches(value, target))
 }
 
 fn sni_matches(sni: Option<&str>, host: &CanonicalHost) -> bool {
@@ -1220,6 +1734,8 @@ fn strip_hop_headers(headers: &mut HeaderMap) {
         header::CONNECTION,
         header::UPGRADE,
         header::TRAILER,
+        header::TRANSFER_ENCODING,
+        HeaderName::from_static("te"),
         HeaderName::from_static("keep-alive"),
         HeaderName::from_static("proxy-connection"),
     ] {
@@ -1555,5 +2071,71 @@ impl RequestError {
 
     const fn bad(message: &'static str) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn h2_request(uri: &str) -> Request<Empty<Bytes>> {
+        Request::builder()
+            .version(Version::HTTP_2)
+            .uri(uri)
+            .body(Empty::new())
+            .expect("valid test request")
+    }
+
+    #[test]
+    fn h2_validation_rejects_connection_specific_headers() {
+        for (name, value) in [
+            ("connection", "keep-alive"),
+            ("keep-alive", "timeout=5"),
+            ("proxy-connection", "keep-alive"),
+            ("transfer-encoding", "chunked"),
+            ("upgrade", "websocket"),
+            ("te", "gzip"),
+        ] {
+            let mut request = h2_request("https://secure.test/allowed");
+            request.headers_mut().insert(
+                HeaderName::from_bytes(name.as_bytes()).expect("valid header"),
+                HeaderValue::from_static(value),
+            );
+            assert!(validate_request(&request).is_err(), "{name} was accepted");
+        }
+    }
+
+    #[test]
+    fn h2_validation_accepts_only_well_formed_pseudo_header_projection() {
+        let missing_authority = Request::builder()
+            .version(Version::HTTP_2)
+            .uri("/allowed")
+            .body(Empty::<Bytes>::new())
+            .expect("valid test request");
+        assert!(validate_request(&missing_authority).is_err());
+
+        let mut trailers = h2_request("https://secure.test/allowed");
+        trailers.headers_mut().insert(
+            HeaderName::from_static("te"),
+            HeaderValue::from_static("trailers"),
+        );
+        assert!(validate_request(&trailers).is_ok());
+    }
+
+    #[test]
+    fn h2_authority_host_and_connect_target_must_be_equivalent() {
+        let target =
+            CanonicalTarget::from_authority("secure.test:443", TargetScheme::Https).unwrap();
+        let matching = h2_request("https://secure.test/allowed");
+        assert!(request_authority_matches(&matching, &target));
+
+        let mismatched = h2_request("https://other.test/allowed");
+        assert!(!request_authority_matches(&mismatched, &target));
+
+        let mut conflicting_host = h2_request("https://secure.test/allowed");
+        conflicting_host
+            .headers_mut()
+            .insert(header::HOST, HeaderValue::from_static("other.test"));
+        assert!(!request_authority_matches(&conflicting_host, &target));
     }
 }
