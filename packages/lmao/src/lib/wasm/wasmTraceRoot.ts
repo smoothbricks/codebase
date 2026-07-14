@@ -43,6 +43,8 @@ const traceIdEncoder = new TextEncoder();
 export interface WasmSpanBufferLike {
   /** Byte offset into WASM memory for system columns (timestamp + entry_type) */
   readonly _systemPtr: number;
+  /** Concrete per-op capacity; may differ from the allocator default. */
+  readonly _capacity: number;
   /** Byte offset into WASM memory for identity block (writeIndex, span_id, trace_id) */
   readonly _identityPtr: number;
   /** Message column - string array for span names and log messages */
@@ -91,7 +93,13 @@ const appendLogEntry: TimestampAppendPrimitive = (traceRoot, buffer, entryType) 
   const root = traceRoot as WasmTraceRoot;
   root._assertLive();
   if (isWasmSpanBuffer(buffer) && buffer._messagePhysicalLayout !== 'packed' && buffer._identityOwner) {
-    return root.allocator.writeLogEntry(buffer._systemPtr, buffer._identityPtr, root._traceRootPtr, entryType);
+    return root.allocator.writeLogEntry(
+      buffer._systemPtr,
+      buffer._identityPtr,
+      root._traceRootPtr,
+      entryType,
+      buffer._capacity,
+    );
   }
   const idx = buffer._writeIndex;
   const entryTypes = buffer.entry_type;
@@ -108,7 +116,7 @@ const writeSpanStartPrimitive: SpanStartPrimitive = (traceRoot, buffer, spanName
   root._assertLive();
   if (isWasmSpanBuffer(buffer) && buffer._messagePhysicalLayout !== 'packed') {
     if (!consumeSpanStartedAtAllocation(buffer)) {
-      root.allocator.spanStart(buffer._systemPtr, buffer._identityPtr, root._traceRootPtr);
+      root.allocator.spanStart(buffer._systemPtr, buffer._identityPtr, root._traceRootPtr, buffer._capacity);
     }
     buffer._message[0] = spanName;
     return;
@@ -128,8 +136,8 @@ const writeSpanEndPrimitive: SpanEndPrimitive = (traceRoot, buffer, entryType) =
   const root = traceRoot as WasmTraceRoot;
   root._assertLive();
   if (isWasmSpanBuffer(buffer) && buffer._messagePhysicalLayout !== 'packed') {
-    if (entryType === 2) root.allocator.spanEndOk(buffer._systemPtr, root._traceRootPtr);
-    else root.allocator.spanEndErr(buffer._systemPtr, root._traceRootPtr);
+    if (entryType === 2) root.allocator.spanEndOk(buffer._systemPtr, root._traceRootPtr, buffer._capacity);
+    else root.allocator.spanEndErr(buffer._systemPtr, root._traceRootPtr, buffer._capacity);
     if (entryType !== 2 && entryType !== 3) {
       const splitEntryTypes = buffer.entry_type;
       if (splitEntryTypes === undefined) throw new TypeError('Split WASM buffer is missing entry_type storage');
