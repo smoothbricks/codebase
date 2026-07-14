@@ -14,14 +14,7 @@
 
 import { describe, expect, it } from 'bun:test';
 import { defineOpContext } from '../defineOpContext.js';
-import {
-  createPrefixMapping,
-  createRemapDescriptor,
-  createRemappedSpanLoggerClass,
-  generateRemappedSpanLoggerClass,
-  type PrefixMapping,
-  prefixSchema,
-} from '../library.js';
+import { createPrefixMapping, createRemapDescriptor, prefixSchema } from '../library.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { getMappedOpGroupInternals, getOpGroupInternals } from './test-helpers.js';
@@ -156,154 +149,6 @@ describe('Library Integration Pattern', () => {
       expect(Object.isFrozen(descriptor.sourceNames)).toBe(true);
       expect(Object.isFrozen(descriptor.columns)).toBe(true);
       expect(descriptor.columns.every(Object.isFrozen)).toBe(true);
-    });
-  });
-
-  describe('RemappedSpanLogger Generation', () => {
-    it('should generate valid JavaScript code', () => {
-      const schema = defineLogSchema({
-        status: S.number(),
-        method: S.enum(['GET', 'POST']),
-      });
-      const mapping: PrefixMapping = {
-        status: 'http_status',
-        method: 'http_method',
-      };
-
-      const code = generateRemappedSpanLoggerClass(schema, mapping);
-
-      // Should be valid JavaScript
-      expect(() => new Function(`return ${code}`)()).not.toThrow();
-    });
-
-    it('should generate class with clean method names', () => {
-      const schema = defineLogSchema({
-        status: S.number(),
-        duration: S.number(),
-      });
-      const mapping: PrefixMapping = {
-        status: 'http_status',
-        duration: 'http_duration',
-      };
-
-      const code = generateRemappedSpanLoggerClass(schema, mapping);
-
-      // Should contain clean method names
-      expect(code).toContain('status(value)');
-      expect(code).toContain('duration(value)');
-      // Should reference prefixed columns
-      expect(code).toContain('http_status');
-      expect(code).toContain('http_duration');
-    });
-
-    it('should include enum mapping functions', () => {
-      const schema = defineLogSchema({
-        method: S.enum(['GET', 'POST', 'PUT']),
-      });
-      const mapping: PrefixMapping = {
-        method: 'http_method',
-      };
-
-      const code = generateRemappedSpanLoggerClass(schema, mapping);
-
-      // Should contain enum mapping function
-      expect(code).toContain('getEnumIndex_method');
-      expect(code).toContain('case "GET"');
-      expect(code).toContain('case "POST"');
-      expect(code).toContain('case "PUT"');
-    });
-
-    it('should include prefix mapping for with() method', () => {
-      const schema = defineLogSchema({
-        status: S.number(),
-      });
-      const mapping: PrefixMapping = {
-        status: 'http_status',
-      };
-
-      const code = generateRemappedSpanLoggerClass(schema, mapping);
-
-      // Should include PREFIX_MAPPING constant
-      expect(code).toContain('PREFIX_MAPPING');
-      expect(code).toContain('"status":"http_status"');
-    });
-
-    it('should create a class constructor', () => {
-      const schema = defineLogSchema({
-        status: S.number(),
-      });
-      const mapping: PrefixMapping = {
-        status: 'http_status',
-      };
-
-      const SpanLoggerClass = createRemappedSpanLoggerClass(schema, mapping);
-
-      expect(typeof SpanLoggerClass).toBe('function');
-    });
-
-    it('should handle all field types in code generation', () => {
-      const schema = defineLogSchema({
-        enumField: S.enum(['A', 'B']),
-        categoryField: S.category(),
-        textField: S.text(),
-        numberField: S.number(),
-        booleanField: S.boolean(),
-      });
-
-      const mapping: PrefixMapping = {
-        enumField: 'test_enumField',
-        categoryField: 'test_categoryField',
-        textField: 'test_textField',
-        numberField: 'test_numberField',
-        booleanField: 'test_booleanField',
-      };
-
-      const code = generateRemappedSpanLoggerClass(schema, mapping);
-
-      // Should handle all field types appropriately
-      expect(code).toContain('getEnumIndex_enumField'); // Enum mapping
-      expect(code).toContain('categoryField(value)'); // Category storage
-      expect(code).toContain('textField(value)'); // Text storage
-      expect(code).toContain('numberField(value)'); // Number storage
-      expect(code).toContain('booleanField(value)'); // Boolean storage
-    });
-
-    it('should cache generated classes for the same schema and mapping', () => {
-      const schema = defineLogSchema({
-        status: S.number(),
-      });
-      const mapping: PrefixMapping = {
-        status: 'http_status',
-      };
-
-      const Class1 = createRemappedSpanLoggerClass(schema, mapping);
-      const Class2 = createRemappedSpanLoggerClass(schema, mapping);
-
-      // Same schema + mapping should return cached class
-      expect(Class1).toBe(Class2);
-    });
-
-    it('should create different classes for different schemas', () => {
-      const schema1 = defineLogSchema({ status: S.number() });
-      const schema2 = defineLogSchema({ code: S.number() });
-      const mapping1: PrefixMapping = { status: 'http_status' };
-      const mapping2: PrefixMapping = { code: 'http_code' };
-
-      const Class1 = createRemappedSpanLoggerClass(schema1, mapping1);
-      const Class2 = createRemappedSpanLoggerClass(schema2, mapping2);
-
-      expect(Class1).not.toBe(Class2);
-    });
-
-    it('should create different classes for same schema with different mappings', () => {
-      const schema = defineLogSchema({ status: S.number() });
-      const mapping1: PrefixMapping = { status: 'http_status' };
-      const mapping2: PrefixMapping = { status: 'api_status' };
-
-      const Class1 = createRemappedSpanLoggerClass(schema, mapping1);
-      const Class2 = createRemappedSpanLoggerClass(schema, mapping2);
-
-      expect(Class1).not.toBe(Class2);
     });
   });
 });
@@ -868,29 +713,6 @@ describe('Edge Cases and Error Handling', () => {
       expect(prefixed._columnNames.length).toBe(100);
       expect(prefixed).toHaveProperty('many_field0');
       expect(prefixed).toHaveProperty('many_field99');
-    });
-  });
-
-  describe('Buffer Remapping Edge Cases', () => {
-    it('should handle mapping consistency', () => {
-      // Test that mapping and code generation are consistent
-      const schema = defineLogSchema({
-        status: S.number(),
-        method: S.enum(['GET', 'POST']),
-      });
-
-      const mapping = createPrefixMapping(schema, 'http');
-      const code = generateRemappedSpanLoggerClass(schema, mapping);
-
-      // Verify that the mapping referenced in code matches the generated mapping
-      expect(code).toContain('"status":"http_status"');
-      expect(code).toContain('"method":"http_method"');
-
-      // Verify that all prefixed columns are properly referenced
-      expect(code).toContain('http_status_values');
-      expect(code).toContain('http_status_nulls');
-      expect(code).toContain('http_method_values');
-      expect(code).toContain('http_method_nulls');
     });
   });
 });
