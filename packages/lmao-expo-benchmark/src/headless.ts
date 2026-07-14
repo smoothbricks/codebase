@@ -1,8 +1,11 @@
 import { createTraceRoot } from '@smoothbricks/lmao/es';
 import type { BenchmarkMode } from '../../lmao/benchmarks/plugin-scenario/platform';
 import { runPlatformScenario } from '../../lmao/benchmarks/plugin-scenario/platform';
+import { createJsScenarioRuntime } from '../../lmao/benchmarks/plugin-scenario/scenario';
 import type { DynamicFunctionCounter } from './dynamic-function-counter';
 import { getTransformVariant } from './transform-variant';
+
+const scenarioRuntime = createJsScenarioRuntime(createTraceRoot);
 
 export interface HeadlessBenchmarkHost {
   readonly engine: string;
@@ -19,7 +22,7 @@ export function runHeadlessBenchmark(
   try {
     const result = runPlatformScenario({
       now: host.now,
-      createTraceRoot,
+      ...scenarioRuntime,
       platform: 'react-native-headless',
       engine: host.engine,
       onProgress: host.writeLine,
