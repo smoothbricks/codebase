@@ -80,6 +80,8 @@ pub enum GatewayInventoryError {
     DuplicateRepository(RepoId),
     #[error("macOS port block base {0} is assigned to more than one workspace")]
     DuplicatePortBlock(u16),
+    #[error("project root {0} is claimed by more than one repository binding")]
+    AmbiguousProjectRoot(PathBuf),
     #[error("gateway inventory has duplicate or ambiguous mount fact for {0}")]
     AmbiguousMount(String),
     #[error("gateway inventory metadata is invalid at {path}: {message}")]
@@ -223,6 +225,109 @@ impl NativeGatewayInventory {
         })
         .await
         .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
+    }
+
+    pub async fn repository_for_project_root(
+        &self,
+        project_root: &Path,
+    ) -> Result<Option<RepoId>, GatewayInventoryError> {
+        let inventory = self.clone();
+        let project_root = project_root.to_owned();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            inventory.repository_for_project_root_blocking(&project_root)
+        })
+        .await
+        .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
+    }
+
+    fn repository_for_project_root_blocking(
+        &self,
+        project_root: &Path,
+    ) -> Result<Option<RepoId>, GatewayInventoryError> {
+        let expected = fs::canonicalize(project_root)
+            .map_err(|source| io_error("resolving project root", project_root, source))?;
+        let mut matched = None;
+        for repo in discover_repositories(self.storage.store())? {
+            let layout = StorageLayout::new(self.storage.store(), &repo).map_err(|error| {
+                GatewayInventoryError::InvalidMetadata {
+                    path: self.storage.store().to_owned(),
+                    message: error.to_string(),
+                }
+            })?;
+            let mut images = Vec::new();
+            for format in [ImageFormat::Asif, ImageFormat::Sparse] {
+                let image = layout
+                    .main_image(format)
+                    .map_err(|error| GatewayInventoryError::InvalidMetadata {
+                        path: layout.project().project_root.clone(),
+                        message: error.to_string(),
+                    })?
+                    .image()
+                    .to_owned();
+                if fs::symlink_metadata(&image).is_ok_and(|metadata| metadata.file_type().is_file())
+                {
+                    images.push(image);
+                }
+            }
+            let trash = layout.project().sessions.join(".trash");
+            match fs::read_dir(&trash) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let path = entry
+                            .map_err(|source| io_error("reading retirement trash", &trash, source))?
+                            .path();
+                        if path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with("main-"))
+                            && ImageFormat::from_image_path(&path).is_ok()
+                            && fs::symlink_metadata(&path)
+                                .is_ok_and(|metadata| metadata.file_type().is_file())
+                        {
+                            images.push(path);
+                        }
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(io_error("enumerating retirement trash", &trash, source));
+                }
+            }
+            let claims_root = images.into_iter().try_fold(false, |claimed, image| {
+                verify_no_symlinks(self.storage.store(), &image).map_err(|error| {
+                    GatewayInventoryError::InvalidMetadata {
+                        path: image.clone(),
+                        message: error.to_string(),
+                    }
+                })?;
+                let metadata =
+                    DetachedWorkspaceMetadata::read_for_image(&image).map_err(|error| {
+                        GatewayInventoryError::InvalidMetadata {
+                            path: sidecar_path(&image),
+                            message: error.to_string(),
+                        }
+                    })?;
+                if metadata.repo_id != repo || !metadata.workspace.is_main() {
+                    return Err(GatewayInventoryError::InvalidMetadata {
+                        path: sidecar_path(&image),
+                        message: "main image metadata identity does not match its binding"
+                            .to_owned(),
+                    });
+                }
+                let matches = metadata
+                    .info_snapshot
+                    .as_ref()
+                    .and_then(|info| fs::canonicalize(&info.project_root).ok())
+                    .is_some_and(|root| root == expected);
+                Ok::<_, GatewayInventoryError>(claimed || matches)
+            })?;
+            if claims_root && matched.replace(repo).is_some() {
+                return Err(GatewayInventoryError::AmbiguousProjectRoot(
+                    project_root.to_owned(),
+                ));
+            }
+        }
+        Ok(matched)
     }
 
     fn all_reserved_port_bases_blocking(&self) -> Result<BTreeSet<u16>, GatewayInventoryError> {
@@ -984,6 +1089,13 @@ mod tests {
         let rendered = format!("{facts:?}");
         assert!(!rendered.contains(facts[0].credentials.token()));
         assert!(!rendered.contains("BEGIN PRIVATE KEY"));
+        assert_eq!(
+            inventory
+                .repository_for_project_root(&fixture.root.join("checkout-alpha"))
+                .await
+                .expect("recover current main binding"),
+            Some(repo_a.clone())
+        );
         let error = inventory
             .all_reserved_port_bases()
             .await
@@ -992,6 +1104,40 @@ mod tests {
             error,
             GatewayInventoryError::DuplicatePortBlock(40_960)
         ));
+    }
+
+    #[tokio::test]
+    async fn retired_main_snapshot_recovers_its_exact_project_root_binding() {
+        let fixture = Fixture::new("retired-root");
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        fixture.bind(&repo);
+        let (storage, _) = fixture.workspace(
+            &repo,
+            WorkspaceName::new("main").expect("main"),
+            "00000000000000000000000000000001",
+            4,
+            false,
+            true,
+        );
+        let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
+        let canonical =
+            canonical_image_paths(&layout, &storage.workspace).expect("canonical image");
+        let trash = layout.project().sessions.join(".trash");
+        fs::create_dir_all(&trash).expect("trash");
+        let retired = trash.join("main-retired.sparseimage");
+        fs::rename(canonical.image(), &retired).expect("retire image");
+        fs::rename(sidecar_path(canonical.image()), sidecar_path(&retired))
+            .expect("retire metadata");
+
+        fs::create_dir_all(fixture.root.join("checkout-widget")).expect("restored project root");
+        let inventory = NativeGatewayInventory::new(fixture.storage.clone());
+        assert_eq!(
+            inventory
+                .repository_for_project_root(&fixture.root.join("checkout-widget"))
+                .await
+                .expect("recover retired main binding"),
+            Some(repo)
+        );
     }
 
     #[tokio::test]
