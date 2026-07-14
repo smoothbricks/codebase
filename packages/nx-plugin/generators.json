@@ -13,7 +13,7 @@
     "create-package": {
       "factory": "./dist/generators/create-package/generator.js",
       "schema": "./src/generators/create-package/schema.json",
-      "description": "Scaffold a new workspace package (ts-lib or ts-zig)"
+      "description": "Scaffold a new TypeScript workspace package"
     },
     "make-public": {
       "factory": "./dist/generators/make-public/generator.js",

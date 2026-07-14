@@ -231,7 +231,7 @@ candidates to downstream dependents because that would duplicate Nx's dependency
 `@smoothbricks/nx-plugin` owns transformer-aware TypeScript targets because this workspace compiles through `ttsc`.
 Configuring `@nx/js/typescript` would run `tsc`/`tsgo` directly and bypass the Typia and LMAO transformers. A package
 `tsconfig.lib.json` therefore produces the concrete `tsc-js` target from the SmoothBricks plugin. The same plugin also
-infers Bun test typechecking, non-TypeScript build-tool steps, and aggregate targets.
+infers Bun test typechecking, Cargo workspace targets, and aggregate targets.
 
 Concrete targets use `{tool}-{output}` names and describe the tool that runs and the artifact or purpose it produces:
 
@@ -242,8 +242,8 @@ Concrete targets use `{tool}-{output}` names and describe the tool that runs and
 - Test tsconfigs are validation configs, not TypeScript build-mode projects. They must use `noEmit`, must not set
   `composite: true`, and package root `tsconfig.json` must not reference `./tsconfig.test.json`. The inferred
   `typecheck-tests` target runs `ttsc --noEmit -p tsconfig.test.json` after `build` instead.
-- Non-TypeScript build steps come from explicit tool configuration. For example, a package `build.zig` must expose named
-  `b.step("name", ...)` entries; each non-reserved step becomes a `zig-name` target such as `zig-wasm`.
+- A neighboring workspace-root `Cargo.toml` provides Cargo test, lint, mutation, and benchmark targets. Workspaces with
+  `cdylib` member crates also receive the cacheable `cargo-wasm` output target.
 - `build` is an aggregate. It exists only when there is at least one concrete build target such as `tsc-js`,
   `tsdown-js`, or another tool-output target, and it depends on output-family wildcards such as `*-js`, `*-web`,
   `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`, `*-bun`, and `*-wasm` instead of duplicating commands.
@@ -260,9 +260,9 @@ Explicit Nx target names must not contain `:`. Nx already uses colon syntax at t
 `project:target:configuration`. Allowing target names like `build:wasm` makes command parsing and package-script aliases
 look like configurations, and it prevents a clean split between concrete tool-output targets and aggregate targets.
 
-Use tool-output names for concrete targets, such as `tsc-js`, `tsdown-js`, and `zig-wasm`. Use `build` and `lint` only
+Use tool-output names for concrete targets, such as `tsc-js`, `tsdown-js`, and `cargo-wasm`. Use `build` and `lint` only
 as aggregate targets. Package scripts may still use developer-friendly colon names, for example `build:wasm`, but those
-scripts should delegate to unambiguous Nx targets such as `nx run pkg:zig-wasm`.
+scripts should delegate to unambiguous Nx targets such as `nx run pkg:cargo-wasm`.
 
 ## Managed Files
 
@@ -524,12 +524,6 @@ Typical verification after changing `smoo`:
 nx typecheck @smoothbricks/cli
 nx lint @smoothbricks/cli
 smoo monorepo validate
-```
-
-If validating packages with Zig build steps from outside the devenv shell, add Zig explicitly:
-
-```bash
-nix shell nixpkgs#zig -c nx run-many -t build --projects=<public-projects>
 ```
 
 ## Links

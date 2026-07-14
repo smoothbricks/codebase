@@ -7,13 +7,7 @@ import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 
 import { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 
-const RESERVED_ZIG_STEPS = new Set(['all', 'clean', 'install', 'test']);
-const ZIG_STEP_PATTERN = /\bb\.step\(\s*["']([^"']+)["']\s*,/g;
-const VALID_ZIG_STEP_NAME = /^[A-Za-z0-9_-]+$/;
-const BUILD_OUTPUT_TARGET_PATTERN = /-(?:js|web|html|css|android|native|napi|bun|wasm)$/;
-const ZIG_WASM_OUTPUTS = ['{projectRoot}/dist/**/*.wasm'];
-const ZIG_NATIVE_OUTPUTS = ['{projectRoot}/dist/**/*.{node,dylib,so,dll,a}'];
-const ZIG_GENERIC_OUTPUTS = ['{projectRoot}/dist/**/*.{wasm,node,dylib,so,dll,a}'];
+const BUILD_OUTPUT_TARGET_PATTERN = /-(?:js|web|html|css|ios|android|native|napi|bun|wasm)$/;
 const TYPESCRIPT_TOOLCHAIN_INPUTS = [
   '{workspaceRoot}/package.json',
   '{workspaceRoot}/bun.lock',
@@ -237,23 +231,6 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     }
   }
 
-  const zigSteps = await readZigSteps(absoluteProjectRoot, projectRoot);
-  for (const step of zigSteps) {
-    const targetName = `zig-${step}`;
-    targets[targetName] = {
-      executor: 'nx:run-commands',
-      cache: true,
-      inputs: ['{projectRoot}/src/**/*.zig', '{projectRoot}/build.zig', '{projectRoot}/build.zig.zon'],
-      outputs: zigOutputsForStep(step),
-      options: {
-        command: `zig build ${step}`,
-        cwd: projectRoot,
-      },
-    };
-    hasOrdinaryBuildOutputTarget = true;
-    hasAnyBuildOutputTarget = true;
-  }
-
   if (hasOrdinaryBuildOutputTarget) {
     targets.build = {
       executor: 'nx:noop',
@@ -377,15 +354,6 @@ function classifyPackageLocalBuildOutputs(packageJson: PackageJson): { ordinary:
   };
 }
 
-function zigOutputsForStep(step: string): string[] {
-  if (step.endsWith('wasm')) {
-    return ZIG_WASM_OUTPUTS;
-  }
-  if (step.endsWith('native')) {
-    return ZIG_NATIVE_OUTPUTS;
-  }
-  return ZIG_GENERIC_OUTPUTS;
-}
 
 interface CargoWorkspace {
   wasmCrates: string[];
@@ -425,38 +393,4 @@ async function readCargoWorkspace(absoluteProjectRoot: string): Promise<CargoWor
   }
 
   return { wasmCrates, hasWasmReleaseProfile: CARGO_WASM_RELEASE_PROFILE_PATTERN.test(cargoToml) };
-}
-
-async function readZigSteps(absoluteProjectRoot: string, projectRoot: string): Promise<string[]> {
-  const buildZigPath = join(absoluteProjectRoot, 'build.zig');
-
-  if (!existsSync(buildZigPath)) {
-    return [];
-  }
-
-  const buildZig = await readFile(buildZigPath, 'utf-8');
-  const declaredSteps = Array.from(buildZig.matchAll(ZIG_STEP_PATTERN), (match) => match[1]);
-
-  if (declaredSteps.length === 0) {
-    return [];
-  }
-
-  const steps: string[] = [];
-  for (const step of declaredSteps) {
-    if (RESERVED_ZIG_STEPS.has(step)) {
-      continue;
-    }
-
-    if (!VALID_ZIG_STEP_NAME.test(step)) {
-      throw new Error(
-        `${projectRoot}/build.zig declares unsupported Zig step "${step}"; inferred target names cannot contain ':' or other special characters`,
-      );
-    }
-
-    if (!steps.includes(step)) {
-      steps.push(step);
-    }
-  }
-
-  return steps;
 }
