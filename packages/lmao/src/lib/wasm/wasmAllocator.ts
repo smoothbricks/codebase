@@ -350,22 +350,9 @@ function createImports(memory: WebAssembly.Memory) {
 // This eliminates recompilation cost in benchmarks and production
 let cachedWasmModule: WebAssembly.Module | null = null;
 
-/**
- * Allocator artifact filename. Both implementations expose the identical ABI:
- * - `allocator.wasm` — Rust (`packages/lmao-rs/crates/lmao-wasm`), the default
- *   and the artifact shipped in the npm package. It also fixes a latent Zig
- *   freelist bug (FreeBlock bookkeeping overrunning sub-20-byte col_1b blocks).
- * - `allocator-zig.wasm` — Zig (`src/lib/wasm/allocator.zig`), reference build,
- *   opt-in via LMAO_WASM_ALLOCATOR=zig (Node/Bun only; browsers get the
- *   default). Built locally with `bun run build:zig-wasm`; not shipped.
- * `LMAO_WASM_ALLOCATOR=rs` is accepted as an alias of the default.
- */
-function wasmArtifactName(): string {
-  if (typeof process !== 'undefined' && process.env?.LMAO_WASM_ALLOCATOR === 'zig') {
-    return 'allocator-zig.wasm';
-  }
-  return 'allocator.wasm';
-}
+// The shipped Rust allocator is the only supported artifact. Node and browser loading
+// deliberately share this fixed path so runtime selection cannot drift by environment.
+const WASM_ARTIFACT_NAME = 'allocator.wasm';
 
 /**
  * Load WASM bytes - handles both Node.js and browser environments.
@@ -380,7 +367,7 @@ async function loadWasmBytes(): Promise<ArrayBuffer> {
     // __dirname equivalent for ESM
     const currentFile = fileURLToPath(import.meta.url);
     const currentDir = dirname(currentFile);
-    const wasmPath = join(currentDir, '../../../dist', wasmArtifactName());
+    const wasmPath = join(currentDir, '../../../dist', WASM_ARTIFACT_NAME);
 
     const buffer = await readFile(wasmPath);
     // Create a proper ArrayBuffer from the Node.js Buffer
@@ -390,7 +377,7 @@ async function loadWasmBytes(): Promise<ArrayBuffer> {
   }
 
   // Browser: fetch from relative path
-  const response = await fetch(new URL(`../../../dist/${wasmArtifactName()}`, import.meta.url));
+  const response = await fetch(new URL(`../../../dist/${WASM_ARTIFACT_NAME}`, import.meta.url));
   return response.arrayBuffer();
 }
 
