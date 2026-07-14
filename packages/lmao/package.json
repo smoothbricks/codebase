@@ -4,7 +4,9 @@
   "type": "module",
   "sideEffects": [
     "./dist/vocabulary/register/v1.js",
-    "./src/vocabulary/register/v1.ts"
+    "./src/vocabulary/register/v1.ts",
+    "./dist/lib/span-buffer/aot/v1.js",
+    "./src/lib/span-buffer/aot/v1.ts"
   ],
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -16,6 +18,12 @@
       "development": "./src/index.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./span-buffer/aot/v1": {
+      "types": "./dist/lib/span-buffer/aot/v1.d.ts",
+      "development": "./src/lib/span-buffer/aot/v1.ts",
+      "import": "./dist/lib/span-buffer/aot/v1.js",
+      "default": "./dist/lib/span-buffer/aot/v1.js"
     },
     "./vocabulary/register/v1": {
       "types": "./dist/vocabulary/register/v1.d.ts",

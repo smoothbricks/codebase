@@ -42,7 +42,7 @@ defineOp('literal-with', (ctx) => {
 		name  string
 		count int
 	}{{"alpha_values", 3}, {"beta_values", 2}} {
-		if count := strings.Count(output, lane.name); count != lane.count {
+		if count := strings.Count(output, lane.name+"[0]"); count != lane.count {
 			t.Errorf("direct row-0 lane %q writes = %d, want %d\n%s", lane.name, count, lane.count, output)
 		}
 	}
