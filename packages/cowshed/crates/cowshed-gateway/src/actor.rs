@@ -59,11 +59,12 @@ pub(crate) enum BrokerAuditKind {
     Sim,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BrokerAuditStatus {
     Allowed,
     Denied,
     Failed,
+    TimedOut,
     Completed,
 }
 
@@ -164,8 +165,10 @@ impl Gateway {
         {
             config.validate()?;
             config.validate_host_cache_layout()?;
-            let connector =
-                SystemConnector::new(config.timeouts.connect, config.timeouts.tls_handshake)?;
+            let connector: Arc<dyn UpstreamConnector> = Arc::new(SystemConnector::new(
+                config.timeouts.connect,
+                config.timeouts.tls_handshake,
+            )?);
             let audit = ArrowAuditSink::start(telemetry)?;
             #[cfg(target_os = "macos")]
             let credentials: Arc<dyn CredentialProvider> =
@@ -174,12 +177,16 @@ impl Gateway {
             let credentials: Arc<dyn CredentialProvider> =
                 Arc::new(SystemdCredentialProvider::from_environment()?);
             let tail = audit.tail_handle();
+            let repo_transport: Arc<dyn RepoTransport> = Arc::new(Git2RepoTransport::new(
+                Arc::clone(&connector),
+                config.timeouts.response_headers,
+            ));
             Self::start_runtime(
                 config,
                 credentials,
-                Arc::new(connector),
+                connector,
                 Arc::new(audit),
-                Arc::new(Git2RepoTransport),
+                repo_transport,
                 Arc::new(XcrunSimRunner),
                 Some(tail),
             )
@@ -193,13 +200,18 @@ impl Gateway {
         connector: Arc<dyn UpstreamConnector>,
         audit: Arc<dyn AuditSink>,
     ) -> Result<Self, GatewayError> {
-        Self::start_with_brokers(
+        let repo_transport: Arc<dyn RepoTransport> = Arc::new(Git2RepoTransport::new(
+            Arc::clone(&connector),
+            config.timeouts.response_headers,
+        ));
+        Self::start_runtime(
             config,
             credentials,
             connector,
             audit,
-            Arc::new(Git2RepoTransport),
+            repo_transport,
             Arc::new(XcrunSimRunner),
+            None,
         )
         .await
     }
@@ -1493,6 +1505,7 @@ impl Actor {
             BrokerAuditStatus::Allowed => AuditStatus::Allowed,
             BrokerAuditStatus::Denied => AuditStatus::Denied,
             BrokerAuditStatus::Failed => AuditStatus::Failed,
+            BrokerAuditStatus::TimedOut => AuditStatus::TimedOut,
             BrokerAuditStatus::Completed => AuditStatus::Completed,
         };
         let draft = AuditDraft {

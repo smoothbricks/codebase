@@ -6,19 +6,27 @@ use std::{
 };
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use git2::{AutotagOption, FetchOptions, RemoteCallbacks, RemoteRedirect};
-use http::Method;
+use http::{Method, Request, header};
+use http_body_util::Empty;
+use hyper::client::conn::{http1, http2};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::{Duration, timeout};
 use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
     actor::{BrokerAuditEvent, BrokerAuditKind, BrokerAuditStatus, BrokerAuditor},
-    interfaces::{CredentialProtocol, CredentialProvider, CredentialQuery},
+    interfaces::{
+        AuthorizedTarget, CredentialProtocol, CredentialProvider, CredentialQuery,
+        NegotiatedTransport, UpstreamConnector, UpstreamPurpose,
+    },
     policy::{
         CanonicalHost, CanonicalTarget, EgressMode, HostPattern, TargetScheme, WorkspacePolicy,
         normalize_path,
@@ -90,12 +98,123 @@ pub trait RepoTransport: Send + Sync + 'static {
     async fn fetch(&self, plan: RepoFetchPlan) -> Result<RepoFetchOutcome, RepoMirrorError>;
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct Git2RepoTransport;
+#[derive(Clone)]
+pub struct Git2RepoTransport {
+    connector: Arc<dyn UpstreamConnector>,
+    response_timeout: Duration,
+}
+
+impl fmt::Debug for Git2RepoTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Git2RepoTransport")
+            .field("response_timeout", &self.response_timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Git2RepoTransport {
+    pub fn new(connector: Arc<dyn UpstreamConnector>, response_timeout: Duration) -> Self {
+        Self {
+            connector,
+            response_timeout,
+        }
+    }
+
+    async fn preflight(&self, plan: &RepoFetchPlan) -> Result<Option<String>, RepoMirrorError> {
+        let mut url = Url::parse(&plan.remote).map_err(|_| RepoMirrorError::InvalidRemote)?;
+        let path = format!("{}/info/refs", url.path().trim_end_matches('/'));
+        url.set_path(&path);
+        url.set_query(Some("service=git-upload-pack"));
+        let target = CanonicalTarget::from_url(&url).map_err(|_| RepoMirrorError::InvalidRemote)?;
+        let connection = self
+            .connector
+            .connect(&AuthorizedTarget {
+                target: target.clone(),
+                purpose: UpstreamPurpose::TlsHttp,
+                private_network_authorized: true,
+            })
+            .await
+            .map_err(|_| RepoMirrorError::FetchFailed)?;
+        let request_target = format!(
+            "{}?{}",
+            url.path(),
+            url.query().ok_or(RepoMirrorError::InvalidRemote)?
+        );
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri(request_target)
+            .header(header::HOST, target.authority())
+            .header(header::USER_AGENT, "cowshed-gateway/1")
+            .header("git-protocol", "version=2");
+        if let Some(credential) = plan.credential.as_ref() {
+            let name = http::HeaderName::from_bytes(credential.header_name.as_bytes())
+                .map_err(|_| RepoMirrorError::CredentialScopeMismatch)?;
+            let value = http::HeaderValue::from_str(credential.header_value.as_str())
+                .map_err(|_| RepoMirrorError::CredentialScopeMismatch)?;
+            request = request.header(name, value);
+        }
+        let request = request
+            .body(Empty::<Bytes>::new())
+            .map_err(|_| RepoMirrorError::FetchFailed)?;
+        let response = timeout(self.response_timeout, async move {
+            match connection.transport {
+                NegotiatedTransport::Http1 => {
+                    let (mut sender, connection) = http1::handshake(TokioIo::new(connection.io))
+                        .await
+                        .map_err(|_| RepoMirrorError::FetchFailed)?;
+                    let driver = tokio::spawn(async move {
+                        let _ = connection.await;
+                    });
+                    let response = sender
+                        .send_request(request)
+                        .await
+                        .map_err(|_| RepoMirrorError::FetchFailed);
+                    driver.abort();
+                    response
+                }
+                NegotiatedTransport::Http2 => {
+                    let (mut sender, connection) = http2::Builder::new(TokioExecutor::new())
+                        .handshake(TokioIo::new(connection.io))
+                        .await
+                        .map_err(|_| RepoMirrorError::FetchFailed)?;
+                    let driver = tokio::spawn(async move {
+                        let _ = connection.await;
+                    });
+                    let response = sender
+                        .send_request(request)
+                        .await
+                        .map_err(|_| RepoMirrorError::FetchFailed);
+                    driver.abort();
+                    response
+                }
+                NegotiatedTransport::Raw => Err(RepoMirrorError::FetchFailed),
+            }
+        })
+        .await
+        .map_err(|_| RepoMirrorError::FetchFailed)??;
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.is_empty())
+                .ok_or(RepoMirrorError::InvalidRedirect)?;
+            return Ok(Some(location.to_owned()));
+        }
+        if !response.status().is_success() {
+            return Err(RepoMirrorError::FetchFailed);
+        }
+        Ok(None)
+    }
+}
 
 #[async_trait]
 impl RepoTransport for Git2RepoTransport {
     async fn fetch(&self, plan: RepoFetchPlan) -> Result<RepoFetchOutcome, RepoMirrorError> {
+        if let Some(location) = self.preflight(&plan).await? {
+            return Ok(RepoFetchOutcome::Redirect { location });
+        }
         tokio::task::spawn_blocking(move || fetch_git2(plan))
             .await
             .map_err(|_| RepoMirrorError::FetchFailed)?
@@ -764,6 +883,7 @@ mod tests {
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
 
@@ -807,6 +927,46 @@ mod tests {
             Ok(outcome)
         }
     }
+    struct RedirectConnector {
+        request: Arc<Mutex<Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl UpstreamConnector for RedirectConnector {
+        async fn health(&self, _target: &CanonicalTarget) -> crate::UpstreamHealth {
+            crate::UpstreamHealth::Healthy
+        }
+
+        async fn connect(
+            &self,
+            _target: &AuthorizedTarget,
+        ) -> Result<crate::UpstreamConnection, crate::ConnectError> {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let request = Arc::clone(&self.request);
+            tokio::spawn(async move {
+                let mut captured = Vec::new();
+                let mut buffer = [0_u8; 512];
+                while !captured.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = server.read(&mut buffer).await.expect("read request");
+                    if read == 0 {
+                        break;
+                    }
+                    captured.extend_from_slice(&buffer[..read]);
+                }
+                *request.lock().expect("request") = captured;
+                server
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: /org/final.git\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await
+                    .expect("write redirect");
+            });
+            Ok(crate::UpstreamConnection {
+                io: Box::new(client),
+                transport: NegotiatedTransport::Http1,
+            })
+        }
+    }
 
     #[derive(Default)]
     struct FixtureAuditor {
@@ -848,6 +1008,47 @@ mod tests {
         };
         policy.validate().expect("policy");
         policy
+    }
+
+    #[tokio::test]
+    async fn production_transport_discovers_redirect_before_git_fetch() {
+        let root = fixture_root("preflight");
+        let request = Arc::new(Mutex::new(Vec::new()));
+        let transport = Git2RepoTransport::new(
+            Arc::new(RedirectConnector {
+                request: Arc::clone(&request),
+            }),
+            Duration::from_secs(1),
+        );
+        let outcome = transport
+            .fetch(RepoFetchPlan {
+                remote: "https://git.example.test/org/repo.git".to_owned(),
+                destination: root.join("unused.git"),
+                credential: Some(RepoCredential {
+                    header_name: "authorization".to_owned(),
+                    header_value: Zeroizing::new("Bearer scoped-secret".to_owned()),
+                }),
+            })
+            .await
+            .expect("redirect");
+        assert_eq!(
+            outcome,
+            RepoFetchOutcome::Redirect {
+                location: "/org/final.git".to_owned()
+            }
+        );
+        let captured =
+            String::from_utf8(request.lock().expect("request").clone()).expect("UTF-8 request");
+        assert!(
+            captured
+                .starts_with("GET /org/repo.git/info/refs?service=git-upload-pack HTTP/1.1\r\n")
+        );
+        assert!(
+            captured
+                .to_ascii_lowercase()
+                .contains("authorization: bearer scoped-secret\r\n")
+        );
+        remove_tree_read_only(&root);
     }
 
     #[tokio::test]
