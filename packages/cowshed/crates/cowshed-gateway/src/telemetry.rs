@@ -341,13 +341,7 @@ impl AuditWriter {
             .last()
             .expect("non-empty batch has a final event")
             .sequence;
-        if let Err(error) = self.publish_tail(&events) {
-            let message = error.to_string();
-            for record in self.pending.drain(..) {
-                let _ = record.reply.send(Err(AuditError(message.clone())));
-            }
-            return Err(error);
-        }
+        self.publish_tail(&events);
         for record in self.pending.drain(..) {
             let _ = record.reply.send(Ok(()));
         }
@@ -401,7 +395,7 @@ impl AuditWriter {
         Ok(())
     }
 
-    fn publish_tail(&mut self, events: &[AuditEvent]) -> Result<(), AuditError> {
+    fn publish_tail(&mut self, events: &[AuditEvent]) {
         for event in events {
             if self.tail.len() == self.tail_capacity {
                 self.tail.pop_front();
@@ -409,7 +403,9 @@ impl AuditWriter {
             self.tail.push_back(event.clone());
         }
 
-        let mut failed = None;
+        // Tail consumers are read-only projections. A slow or disconnected
+        // consumer loses its subscription; it cannot poison the authoritative
+        // durable writer or stop gateway egress.
         self.subscribers.retain(|subscriber| {
             for event in events
                 .iter()
@@ -417,18 +413,14 @@ impl AuditWriter {
             {
                 match subscriber.sender.try_send(event.clone()) {
                     Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Closed(_)) => return false,
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        failed = Some(AuditError(
-                            "audit tail receiver failed closed under backpressure".to_owned(),
-                        ));
-                        return false;
-                    }
+                    Err(
+                        mpsc::error::TrySendError::Closed(_)
+                        | mpsc::error::TrySendError::Full(_),
+                    ) => return false,
                 }
             }
             true
         });
-        failed.map_or(Ok(()), Err)
     }
 }
 
@@ -1017,14 +1009,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tail_backpressure_and_storage_failure_stop_the_writer() {
+    async fn lagging_tail_is_disconnected_and_storage_failure_stops_the_writer() {
         let backpressure_root = TestRoot::new("trace-backpressure");
         let sink = ArrowAuditSink::start(
             ArrowAuditConfig::new(backpressure_root.0.clone()).expect("audit config"),
         )
         .expect("start trace sink");
         let tail = sink.tail_handle();
-        let _slow = tail
+        let mut fast = tail
+            .subscribe(AuditTailQuery {
+                workspace_id: None,
+                after_sequence: None,
+                limit: 4,
+            })
+            .await
+            .expect("subscribe healthy audit tail");
+        let mut slow = tail
             .subscribe(AuditTailQuery {
                 workspace_id: None,
                 after_sequence: None,
@@ -1035,17 +1035,59 @@ mod tests {
         sink.record(event(1, "slow", AuditStatus::Denied))
             .await
             .expect("first decision fills tail receiver");
-        let backpressure = sink
-            .record(event(2, "slow", AuditStatus::Denied))
+        sink.record(event(2, "slow", AuditStatus::Denied))
             .await
-            .expect_err("slow tail must fail closed");
-        assert!(backpressure.0.contains("backpressure"));
+            .expect("lagging projection cannot stop the writer");
+        assert_eq!(
+            slow.recv().await.expect("buffered first event").sequence,
+            1
+        );
         assert!(
-            sink.record(event(3, "slow", AuditStatus::Denied))
-                .await
-                .expect_err("writer remains stopped")
-                .0
-                .contains("stopped")
+            slow.recv().await.is_none(),
+            "lagging subscription is disconnected"
+        );
+        sink.record(event(3, "slow", AuditStatus::Denied))
+            .await
+            .expect("writer remains authoritative");
+        assert_eq!(
+            (
+                fast.recv().await.expect("fast event one").sequence,
+                fast.recv().await.expect("fast event two").sequence,
+                fast.recv().await.expect("fast event three").sequence,
+            ),
+            (1, 2, 3),
+            "one malicious subscriber cannot isolate a healthy subscriber"
+        );
+        let durable = tail
+            .query(AuditTailQuery {
+                workspace_id: None,
+                after_sequence: None,
+                limit: 4,
+            })
+            .await
+            .expect("query durable tail after subscriber lag");
+        assert_eq!(
+            durable
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        let mut catch_up = tail
+            .subscribe(AuditTailQuery {
+                workspace_id: None,
+                after_sequence: Some(1),
+                limit: 4,
+            })
+            .await
+            .expect("resubscribe from durable sequence");
+        assert_eq!(
+            (
+                catch_up.recv().await.expect("catch-up event two").sequence,
+                catch_up.recv().await.expect("catch-up event three").sequence,
+            ),
+            (2, 3),
+            "resubscription catches up from the bounded durable tail"
         );
 
         let failed_root = TestRoot::new("trace-storage-failure");
