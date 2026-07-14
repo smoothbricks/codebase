@@ -60,9 +60,10 @@ pub struct RuntimeLogChunk {
 /// Actor-owned platform seam. Implementations must reread authoritative repository, storage,
 /// metadata, mount, gateway, and supervisor facts inside every effectful method before mutation.
 ///
-/// The seam exists for deterministic lifecycle/failpoint tests; production uses the native host
-/// constructed by [`ProjectRuntime::open`]. It deliberately requires `&mut self`, preventing a
-/// backend from being shared behind a lock or mutated outside the project actor.
+/// The seam exists for deterministic lifecycle/failpoint tests; production uses one of
+/// [`ProjectRuntime::open_for_adopt`] or [`ProjectRuntime::open_existing`]. It deliberately
+/// requires `&mut self`, preventing a backend from being shared behind a lock or mutated outside
+/// the project actor.
 #[async_trait]
 pub trait ProjectRuntimeHost: Send + 'static {
     fn descriptor(&self) -> &ProjectDescriptor;
@@ -197,17 +198,41 @@ pub struct ProjectRuntime {
 }
 
 impl ProjectRuntime {
-    /// Production bootstrap. Platform discovery and every blocking host operation stay in the
-    /// native host's existing blocking lanes.
-    pub async fn open(project_root: impl AsRef<Path>) -> Result<Self> {
+    /// Opens the production runtime with foreground provisioning authority.
+    ///
+    /// Only the parsed `cowshed adopt` command may call this entrypoint.
+    pub async fn open_for_adopt(project_root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_native(
+            project_root.as_ref(),
+            crate::storage::bootstrap::native::NativeBootstrapMode::Provision,
+        )
+        .await
+    }
+
+    /// Opens the production runtime without storage provisioning authority.
+    ///
+    /// Ordinary commands and background services must use this entrypoint. Missing or incorrectly
+    /// mounted storage fails closed without creating or mounting anything.
+    pub async fn open_existing(project_root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_native(
+            project_root.as_ref(),
+            crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly,
+        )
+        .await
+    }
+
+    async fn open_native(
+        project_root: &Path,
+        mode: crate::storage::bootstrap::native::NativeBootstrapMode,
+    ) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
-            let host = NativeProjectRuntimeHost::open(project_root.as_ref()).await?;
+            let host = NativeProjectRuntimeHost::open(project_root, mode).await?;
             Self::start(host).await
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = project_root;
+            let _ = (project_root, mode);
             Err(CowshedError::environment_missing(
                 "the native cowshed project runtime requires macOS APFS",
                 "run the controller on macOS or use an injected test host",
@@ -1192,7 +1217,10 @@ struct NativeProjectRuntimeHost {
 
 #[cfg(target_os = "macos")]
 impl NativeProjectRuntimeHost {
-    async fn open(project_root: &Path) -> Result<Self> {
+    async fn open(
+        project_root: &Path,
+        bootstrap_mode: crate::storage::bootstrap::native::NativeBootstrapMode,
+    ) -> Result<Self> {
         use crate::storage::apfs::ApfsExecutionHost;
 
         let git = crate::git::GitRepository::discover(project_root).await?;
@@ -1207,10 +1235,13 @@ impl NativeProjectRuntimeHost {
                     "launch the controller with a canonical HOME",
                 )
             })?;
-        let bootstrap =
-            crate::storage::bootstrap::native::bootstrap_system_storage(&git_root, &home)
-                .await
-                .map_err(native_environment_error)?;
+        let bootstrap = crate::storage::bootstrap::native::bootstrap_system_storage(
+            &git_root,
+            &home,
+            bootstrap_mode,
+        )
+        .await
+        .map_err(native_environment_error)?;
         if !matches!(
             bootstrap.substrate(),
             crate::storage::bootstrap::SelectedSubstrate::Apfs { .. }
@@ -3039,8 +3070,21 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
 }
 
 #[cfg(target_os = "macos")]
-fn native_environment_error(error: impl std::fmt::Display) -> CowshedError {
-    CowshedError::environment_missing(error.to_string(), "repair host storage and retry")
+fn native_environment_error(
+    error: crate::storage::bootstrap::native::NativeBootstrapError,
+) -> CowshedError {
+    match error {
+        crate::storage::bootstrap::native::NativeBootstrapError::StorageSetupRequired {
+            actions,
+            hint,
+        } => CowshedError::environment_missing(
+            format!("cowshed storage setup is required: {}", actions.join("; ")),
+            hint,
+        ),
+        error => {
+            CowshedError::environment_missing(error.to_string(), "repair host storage and retry")
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]

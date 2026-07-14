@@ -1118,10 +1118,16 @@ async fn crash_reopen_recovers_published_and_pending_state() {
 
 #[cfg(not(target_os = "macos"))]
 #[tokio::test]
-async fn production_open_returns_typed_environment_error_off_macos() {
-    let error = match ProjectRuntime::open("/tmp/project").await {
-        Ok(_) => panic!("non-macOS open must fail"),
+async fn production_open_modes_return_typed_environment_error_off_macos() {
+    let adopt_error = match ProjectRuntime::open_for_adopt("/tmp/project").await {
+        Ok(_) => panic!("non-macOS adopt open must fail"),
         Err(error) => error,
     };
-    assert_eq!(error.code, ErrorCode::EnvironmentMissing);
+    assert_eq!(adopt_error.code, ErrorCode::EnvironmentMissing);
+
+    let existing_error = match ProjectRuntime::open_existing("/tmp/project").await {
+        Ok(_) => panic!("non-macOS existing-only open must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(existing_error.code, ErrorCode::EnvironmentMissing);
 }

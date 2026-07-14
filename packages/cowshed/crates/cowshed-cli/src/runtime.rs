@@ -66,6 +66,26 @@ pub trait CliService: Send {
         Self: Sized;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeOpenMode {
+    Provision,
+    ExistingOnly,
+}
+
+fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
+    match command {
+        Command::Adopt(_) => RuntimeOpenMode::Provision,
+        Command::New(_)
+        | Command::List
+        | Command::Path(_)
+        | Command::Exec(_)
+        | Command::Remove(_)
+        | Command::Attach(_)
+        | Command::Detach(_)
+        | Command::Doctor => RuntimeOpenMode::ExistingOnly,
+    }
+}
+
 pub struct ActorBridge {
     coordinator: Option<Coordinator>,
     connection: Option<JoinHandle<Result<()>>>,
@@ -73,8 +93,17 @@ pub struct ActorBridge {
 }
 
 impl ActorBridge {
-    pub async fn open(project_root: &Path) -> Result<Self> {
-        let runtime = ProjectRuntime::open(project_root).await?;
+    pub async fn open_for_adopt(project_root: &Path) -> Result<Self> {
+        let runtime = ProjectRuntime::open_for_adopt(project_root).await?;
+        Self::from_runtime(project_root, runtime).await
+    }
+
+    pub async fn open_existing(project_root: &Path) -> Result<Self> {
+        let runtime = ProjectRuntime::open_existing(project_root).await?;
+        Self::from_runtime(project_root, runtime).await
+    }
+
+    async fn from_runtime(project_root: &Path, runtime: ProjectRuntime) -> Result<Self> {
         let (client, server) = match std::os::unix::net::UnixStream::pair() {
             Ok(pair) => pair,
             Err(error) => {
@@ -755,8 +784,12 @@ where
     W: Write + Send,
     E: Write + Send,
 {
+    let mode = runtime_open_mode(&cli.command);
     let root = resolve_project_root(&cli).await?;
-    let bridge = ActorBridge::open(&root).await?;
+    let bridge = match mode {
+        RuntimeOpenMode::Provision => ActorBridge::open_for_adopt(&root).await?,
+        RuntimeOpenMode::ExistingOnly => ActorBridge::open_existing(&root).await?,
+    };
     dispatch_and_shutdown(bridge, cli, stdin, output).await
 }
 
@@ -776,6 +809,29 @@ mod tests {
         );
         assert!(parse_duration("1.5s".into()).is_err());
         assert!(parse_duration("9d".into()).is_err());
+    }
+
+    #[test]
+    fn only_adopt_receives_provisioning_authority() {
+        let cases = [
+            (vec!["adopt", "/repo"], RuntimeOpenMode::Provision),
+            (vec!["new", "raven"], RuntimeOpenMode::ExistingOnly),
+            (vec!["ls"], RuntimeOpenMode::ExistingOnly),
+            (vec!["path", "raven"], RuntimeOpenMode::ExistingOnly),
+            (
+                vec!["exec", "raven", "--", "true"],
+                RuntimeOpenMode::ExistingOnly,
+            ),
+            (vec!["rm", "raven"], RuntimeOpenMode::ExistingOnly),
+            (vec!["attach", "raven"], RuntimeOpenMode::ExistingOnly),
+            (vec!["detach", "raven"], RuntimeOpenMode::ExistingOnly),
+            (vec!["doctor"], RuntimeOpenMode::ExistingOnly),
+        ];
+
+        for (arguments, expected) in cases {
+            let parsed = crate::args::parse_args(arguments).unwrap();
+            assert_eq!(runtime_open_mode(&parsed.command), expected);
+        }
     }
 
     #[test]
