@@ -20,6 +20,18 @@ pub trait GatewayIo: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 impl<T> GatewayIo for T where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 pub type BoxIo = Box<dyn GatewayIo>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NegotiatedTransport {
+    Http1,
+    Http2,
+    Raw,
+}
+
+pub struct UpstreamConnection {
+    pub io: BoxIo,
+    pub transport: NegotiatedTransport,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UpstreamHealth {
@@ -46,7 +58,7 @@ pub struct AuthorizedTarget {
 #[async_trait]
 pub trait UpstreamConnector: Send + Sync + 'static {
     async fn health(&self, target: &CanonicalTarget) -> UpstreamHealth;
-    async fn connect(&self, target: &AuthorizedTarget) -> Result<BoxIo, ConnectError>;
+    async fn connect(&self, target: &AuthorizedTarget) -> Result<UpstreamConnection, ConnectError>;
 }
 
 /// Production connector: authorizes before DNS, rejects wildcard-to-private rebinding,
@@ -71,7 +83,7 @@ impl SystemConnector {
     pub fn new(connect_timeout: Duration, tls_timeout: Duration) -> Result<Self, ConnectError> {
         let mut tls = ClientConfig::with_platform_verifier()
             .map_err(|error| ConnectError::TlsConfiguration(error.to_string()))?;
-        tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(Self {
             connect_timeout,
             tls_timeout,
@@ -86,7 +98,10 @@ impl UpstreamConnector for SystemConnector {
         UpstreamHealth::Unknown
     }
 
-    async fn connect(&self, authorized: &AuthorizedTarget) -> Result<BoxIo, ConnectError> {
+    async fn connect(
+        &self,
+        authorized: &AuthorizedTarget,
+    ) -> Result<UpstreamConnection, ConnectError> {
         let target = &authorized.target;
         let addresses = tokio::net::lookup_host((target.host.as_str(), target.port))
             .await
@@ -110,7 +125,15 @@ impl UpstreamConnector for SystemConnector {
         let stream = stream.ok_or_else(|| last_error.unwrap_or(ConnectError::NoAddresses))?;
         stream.set_nodelay(true).map_err(ConnectError::Io)?;
         if authorized.purpose != UpstreamPurpose::TlsHttp {
-            return Ok(Box::new(stream));
+            let transport = match authorized.purpose {
+                UpstreamPurpose::PlainHttp => NegotiatedTransport::Http1,
+                UpstreamPurpose::OpaqueTcp => NegotiatedTransport::Raw,
+                UpstreamPurpose::TlsHttp => unreachable!("TLS HTTP returned above"),
+            };
+            return Ok(UpstreamConnection {
+                io: Box::new(stream),
+                transport,
+            });
         }
         let server_name = match &target.host {
             CanonicalHost::Dns(host) => ServerName::try_from(host.clone()),
@@ -124,7 +147,16 @@ impl UpstreamConnector for SystemConnector {
         .await
         .map_err(|_| ConnectError::TlsTimeout)?
         .map_err(|error| ConnectError::Tls(error.to_string()))?;
-        Ok(Box::new(tls))
+        let transport = match tls.get_ref().1.alpn_protocol() {
+            Some(b"h2") => NegotiatedTransport::Http2,
+            Some(b"http/1.1") => NegotiatedTransport::Http1,
+            Some(_) => return Err(ConnectError::UnsupportedAlpn),
+            None => return Err(ConnectError::MissingAlpn),
+        };
+        Ok(UpstreamConnection {
+            io: Box::new(tls),
+            transport,
+        })
     }
 }
 
@@ -167,6 +199,10 @@ pub enum ConnectError {
     TlsConfiguration(String),
     #[error("target cannot be represented as a TLS server name")]
     InvalidServerName,
+    #[error("upstream TLS did not negotiate ALPN")]
+    MissingAlpn,
+    #[error("upstream TLS negotiated an unsupported ALPN protocol")]
+    UnsupportedAlpn,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

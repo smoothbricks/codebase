@@ -32,8 +32,8 @@ pub use control::{ControlError, ControlFailureCode, GatewayControlClient, contro
 pub use interfaces::{
     AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus, AuthorizedTarget, BoxIo,
     ConnectError, CredentialError, CredentialProtocol, CredentialProvider, CredentialQuery,
-    CredentialRecord, GatewayIo, SystemConnector, UpstreamConnector, UpstreamHealth,
-    UpstreamPurpose,
+    CredentialRecord, GatewayIo, NegotiatedTransport, SystemConnector, UpstreamConnection,
+    UpstreamConnector, UpstreamHealth, UpstreamPurpose,
 };
 pub use mirror::{
     MirrorBody, MirrorCacheScope, MirrorCacheStatus, MirrorError, MirrorFetchRequest,

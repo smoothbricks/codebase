@@ -1,29 +1,41 @@
 use std::{
     collections::BTreeSet,
+    convert::Infallible,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU16, AtomicUsize, Ordering},
     },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use cowshed_gateway::{
     ArrowAuditConfig, ArrowAuditSink, AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus,
-    AuthorizedTarget, BoxIo, CanonicalTarget, ConnectError, ControlError, ControlFailureCode,
+    AuthorizedTarget, CanonicalTarget, ConnectError, ControlError, ControlFailureCode,
     CredentialError, CredentialProtocol, CredentialProvider, CredentialQuery, CredentialRecord,
     EgressGrant, Gateway, GatewayConfig, GatewayControlClient, GatewayError, GatewayLimits,
-    GatewayTimeouts, HostPattern, MirrorProtocol, MirrorRoute, UpstreamConnector, UpstreamHealth,
-    UpstreamPurpose, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession,
-    WorkspaceToken,
+    GatewayTimeouts, HostPattern, MirrorCacheConfig, MirrorProtocol, MirrorRoute,
+    NegotiatedTransport, UpstreamConnection, UpstreamConnector, UpstreamHealth, UpstreamPurpose,
+    WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
-use http::HeaderName;
-use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Version, header};
+use http_body::{Body, Frame, SizeHint};
+use http_body_util::{BodyExt as _, Empty, Full};
+use hyper::{
+    client::conn::http2 as client_http2,
+    server::conn::{http1 as server_http1, http2 as server_http2},
+    service::service_fn,
+};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
 use rustls::{
-    ClientConfig, RootCertStore,
-    pki_types::{CertificateDer, ServerName},
+    ClientConfig, RootCertStore, ServerConfig,
+    pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName},
 };
 #[cfg(target_os = "linux")]
 use std::{path::PathBuf, sync::LazyLock};
@@ -36,7 +48,7 @@ use tokio::{
     task::JoinHandle,
     time::timeout,
 };
-use tokio_rustls::TlsConnector;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use zeroize::Zeroizing;
 
 #[cfg(target_os = "linux")]
@@ -117,7 +129,7 @@ impl UpstreamConnector for LocalConnector {
         self.health
     }
 
-    async fn connect(&self, target: &AuthorizedTarget) -> Result<BoxIo, ConnectError> {
+    async fn connect(&self, target: &AuthorizedTarget) -> Result<UpstreamConnection, ConnectError> {
         if let Some(observed) = &self.observed {
             let _ = observed.send(target.clone()).await;
         }
@@ -129,7 +141,61 @@ impl UpstreamConnector for LocalConnector {
         let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, target.target.port))
             .await
             .map_err(ConnectError::Io)?;
-        Ok(Box::new(stream))
+        let transport = match target.purpose {
+            UpstreamPurpose::OpaqueTcp => NegotiatedTransport::Raw,
+            UpstreamPurpose::PlainHttp | UpstreamPurpose::TlsHttp => NegotiatedTransport::Http1,
+        };
+        Ok(UpstreamConnection {
+            io: Box::new(stream),
+            transport,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct VerifiedTlsConnector {
+    tls: Arc<ClientConfig>,
+    negotiated: mpsc::Sender<Option<Vec<u8>>>,
+}
+
+#[cfg(target_os = "macos")]
+#[async_trait]
+impl UpstreamConnector for VerifiedTlsConnector {
+    async fn health(&self, _target: &CanonicalTarget) -> UpstreamHealth {
+        UpstreamHealth::Healthy
+    }
+
+    async fn connect(
+        &self,
+        authorized: &AuthorizedTarget,
+    ) -> Result<UpstreamConnection, ConnectError> {
+        if authorized.purpose != UpstreamPurpose::TlsHttp {
+            return Err(ConnectError::Io(io::Error::other(
+                "TLS fixture received non-TLS purpose",
+            )));
+        }
+        let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, authorized.target.port))
+            .await
+            .map_err(ConnectError::Io)?;
+        let server_name = ServerName::try_from(authorized.target.host.as_str().to_owned())
+            .map_err(|_| ConnectError::InvalidServerName)?;
+        let tls = TlsConnector::from(Arc::clone(&self.tls))
+            .connect(server_name, stream)
+            .await
+            .map_err(|error| ConnectError::Tls(error.to_string()))?;
+        let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+        let _ = self.negotiated.send(alpn.clone()).await;
+        let transport = match alpn.as_deref() {
+            Some(b"h2") => NegotiatedTransport::Http2,
+            Some(b"http/1.1") => NegotiatedTransport::Http1,
+            Some(_) => return Err(ConnectError::UnsupportedAlpn),
+            None => return Err(ConnectError::MissingAlpn),
+        };
+        Ok(UpstreamConnection {
+            io: Box::new(tls),
+            transport,
+        })
     }
 }
 
@@ -145,7 +211,10 @@ impl UpstreamConnector for CountingFailConnector {
         UpstreamHealth::Healthy
     }
 
-    async fn connect(&self, _target: &AuthorizedTarget) -> Result<BoxIo, ConnectError> {
+    async fn connect(
+        &self,
+        _target: &AuthorizedTarget,
+    ) -> Result<UpstreamConnection, ConnectError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Err(ConnectError::Io(io::Error::other(
             "injected connect failure",
@@ -275,6 +344,14 @@ fn grant(host: &str, port: u16) -> EgressGrant {
 }
 
 fn test_config() -> GatewayConfig {
+    static NEXT_CACHE: AtomicUsize = AtomicUsize::new(0);
+    let cache_root = std::env::temp_dir().join(format!(
+        "cowshed-gateway-cache-{}-{}",
+        std::process::id(),
+        NEXT_CACHE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&cache_root);
+    std::fs::create_dir(&cache_root).expect("create pre-existing mirror cache root");
     let config = GatewayConfig {
         timeouts: GatewayTimeouts {
             request_headers: Duration::from_secs(2),
@@ -286,6 +363,7 @@ fn test_config() -> GatewayConfig {
             tunnel_total: Duration::from_secs(5),
             leaf_lifetime: Duration::from_secs(60 * 60),
         },
+        mirror_cache: MirrorCacheConfig::new(cache_root),
         ..GatewayConfig::default()
     };
     #[cfg(target_os = "linux")]
@@ -337,6 +415,249 @@ async fn http_fixture(
         }
     });
     (port, receiver, task)
+}
+
+#[cfg(target_os = "macos")]
+struct ChannelBody {
+    receiver: mpsc::Receiver<Result<Frame<Bytes>, Infallible>>,
+}
+
+#[cfg(target_os = "macos")]
+impl Body for ChannelBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.receiver.poll_recv(context)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn fixture_tls_configs(
+    host: &str,
+    server_alpn: Vec<Vec<u8>>,
+) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
+    let ca_key = KeyPair::generate().expect("upstream CA key");
+    let mut ca_params = CertificateParams::default();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_certificate = ca_params
+        .self_signed(&ca_key)
+        .expect("upstream CA certificate");
+    let issuer =
+        Issuer::from_ca_cert_pem(&ca_certificate.pem(), ca_key).expect("upstream CA issuer");
+    let leaf_key = KeyPair::generate().expect("upstream leaf key");
+    let leaf = CertificateParams::new(vec![host.to_owned()])
+        .expect("upstream leaf params")
+        .signed_by(&leaf_key, &issuer)
+        .expect("upstream leaf certificate");
+    let chain = vec![
+        CertificateDer::from(leaf.der().to_vec()),
+        CertificateDer::from(ca_certificate.der().to_vec()),
+    ];
+    let key = PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into();
+    let mut server = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .expect("upstream server TLS");
+    server.alpn_protocols = server_alpn;
+
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(ca_certificate.der().to_vec()))
+        .expect("trust upstream CA");
+    let mut client = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    client.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    (Arc::new(server), Arc::new(client))
+}
+
+#[cfg(target_os = "macos")]
+async fn h2_tls_fixture(
+    host: &str,
+) -> (
+    u16,
+    Arc<ClientConfig>,
+    Arc<Notify>,
+    mpsc::Receiver<String>,
+    JoinHandle<()>,
+) {
+    let (server, client) = fixture_tls_configs(host, vec![b"h2".to_vec()]);
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind h2 TLS fixture");
+    let port = listener.local_addr().expect("h2 fixture address").port();
+    let gate = Arc::new(Notify::new());
+    let producer_gate = Arc::clone(&gate);
+    let (captured, receiver) = mpsc::channel(1);
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept h2 TLS");
+        let tls = TlsAcceptor::from(server)
+            .accept(stream)
+            .await
+            .expect("h2 TLS handshake");
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+        let service = service_fn(move |request: Request<hyper::body::Incoming>| {
+            let gate = Arc::clone(&producer_gate);
+            let captured = captured.clone();
+            async move {
+                captured
+                    .send(request.uri().to_string())
+                    .await
+                    .expect("capture h2 request");
+                let (frames, receiver) = mpsc::channel(1);
+                tokio::spawn(async move {
+                    frames
+                        .send(Ok(Frame::data(Bytes::from(vec![b'a'; 24 * 1024]))))
+                        .await
+                        .expect("send first h2 body frame");
+                    gate.notified().await;
+                    frames
+                        .send(Ok(Frame::data(Bytes::from(vec![b'b'; 48 * 1024]))))
+                        .await
+                        .expect("send second h2 body frame");
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert(
+                        HeaderName::from_static("x-fixture-trailer"),
+                        HeaderValue::from_static("complete"),
+                    );
+                    frames
+                        .send(Ok(Frame::trailers(trailers)))
+                        .await
+                        .expect("send h2 trailers");
+                });
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(ChannelBody { receiver })
+                        .expect("h2 fixture response"),
+                )
+            }
+        });
+        let mut builder = server_http2::Builder::new(TokioExecutor::new());
+        builder
+            .max_concurrent_streams(8)
+            .max_header_list_size(64 * 1024)
+            .max_send_buf_size(64 * 1024);
+        let _ = builder.serve_connection(TokioIo::new(tls), service).await;
+    });
+    (port, client, gate, receiver, task)
+}
+
+#[cfg(target_os = "macos")]
+async fn h1_tls_fixture(host: &str) -> (u16, Arc<ClientConfig>, JoinHandle<()>) {
+    let (server, client) = fixture_tls_configs(host, vec![b"http/1.1".to_vec()]);
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind h1 TLS fixture");
+    let port = listener.local_addr().expect("h1 fixture address").port();
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept h1 TLS");
+        let tls = TlsAcceptor::from(server)
+            .accept(stream)
+            .await
+            .expect("h1 TLS handshake");
+        assert_eq!(
+            tls.get_ref().1.alpn_protocol(),
+            Some(b"http/1.1".as_slice())
+        );
+        let service = service_fn(|_request| async {
+            Ok::<_, Infallible>(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Full::new(Bytes::from_static(b"h1-fallback")))
+                    .expect("h1 fixture response"),
+            )
+        });
+        let _ = server_http1::Builder::new()
+            .serve_connection(TokioIo::new(tls), service)
+            .await;
+    });
+    (port, client, task)
+}
+
+#[cfg(target_os = "macos")]
+async fn no_alpn_tls_fixture(
+    host: &str,
+) -> (u16, Arc<ClientConfig>, mpsc::Receiver<bool>, JoinHandle<()>) {
+    let (server, client) = fixture_tls_configs(host, Vec::new());
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind no-ALPN TLS fixture");
+    let port = listener
+        .local_addr()
+        .expect("no-ALPN fixture address")
+        .port();
+    let (observed, receiver) = mpsc::channel(1);
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept no-ALPN TLS");
+        let mut tls = TlsAcceptor::from(server)
+            .accept(stream)
+            .await
+            .expect("no-ALPN TLS handshake");
+        assert_eq!(tls.get_ref().1.alpn_protocol(), None);
+        let mut byte = [0_u8; 1];
+        let received_http = matches!(
+            timeout(Duration::from_secs(1), tls.read(&mut byte)).await,
+            Ok(Ok(count)) if count > 0
+        );
+        observed
+            .send(received_http)
+            .await
+            .expect("report no-ALPN bytes");
+    });
+    (port, client, receiver, task)
+}
+
+#[cfg(target_os = "macos")]
+async fn h2_intercept_client(
+    endpoint: SocketAddr,
+    token: &str,
+    host: &str,
+    port: u16,
+    ca_certificate: CertificateDer<'static>,
+) -> (
+    client_http2::SendRequest<Empty<Bytes>>,
+    JoinHandle<Result<(), hyper::Error>>,
+) {
+    let mut stream = TcpStream::connect(endpoint).await.expect("connect gateway");
+    stream
+        .write_all(
+            format!(
+                "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\nProxy-Authorization: Bearer {token}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write CONNECT");
+    let head = read_response_head(&mut stream).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    let mut roots = RootCertStore::empty();
+    roots.add(ca_certificate).expect("trust workspace CA");
+    let mut client = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    client.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let server_name = ServerName::try_from(host.to_owned()).expect("fixture server name");
+    let tls = TlsConnector::from(Arc::new(client))
+        .connect(server_name, stream)
+        .await
+        .expect("intercept TLS handshake");
+    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+    let (sender, connection) = client_http2::Builder::new(TokioExecutor::new())
+        .handshake(TokioIo::new(tls))
+        .await
+        .expect("downstream h2 handshake");
+    (sender, tokio::spawn(connection))
 }
 
 async fn read_headers(stream: &mut TcpStream) -> String {
@@ -602,7 +923,7 @@ async fn endpoint_identity_precedes_token_authentication() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn local_mirror_route_rewrites_only_the_admitted_scope() {
-    let (upstream_port, mut captured, _upstream) = http_fixture(1, None).await;
+    let (upstream_port, mut captured, _upstream) = http_fixture(2, None).await;
     let endpoint = free_endpoint();
     let gateway = gateway(
         test_config(),
@@ -620,7 +941,7 @@ async fn local_mirror_route_rewrites_only_the_admitted_scope() {
             local_prefix: "/npm/".to_owned(),
             upstream_origin: format!("https://mirror.test:{upstream_port}"),
             protocol: MirrorProtocol::Npm,
-            admitted_prefixes: vec!["/allowed".to_owned()],
+            admitted_prefixes: vec!["/allowed".to_owned(), "/@scope/".to_owned()],
             credentialed: false,
         }],
     };
@@ -645,6 +966,17 @@ async fn local_mirror_route_rewrites_only_the_admitted_scope() {
     let forwarded = captured.recv().await.expect("captured mirror request");
     assert!(
         forwarded.starts_with("GET /allowed/pkg HTTP/1.1"),
+        "{forwarded}"
+    );
+
+    let scoped = format!(
+        "GET /npm/@scope%2fpkg HTTP/1.1\r\nHost: {endpoint}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    let response = proxy_request(endpoint, scoped).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let forwarded = captured.recv().await.expect("captured scoped npm request");
+    assert!(
+        forwarded.starts_with("GET /@scope%2fpkg HTTP/1.1"),
         "{forwarded}"
     );
 
@@ -2091,4 +2423,552 @@ fn validation_rejects_ambiguous_policy_and_platform_endpoints() {
         .validate_for_current_platform()
         .is_err()
     );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn h2_intercept_and_upstream_preserve_streaming_trailers_and_authority() {
+    let (upstream_port, upstream_tls, gate, mut captured, upstream_task) =
+        h2_tls_fixture("secure-h2.test").await;
+    let (negotiated, mut negotiated_rx) = mpsc::channel(2);
+    let endpoint = free_endpoint();
+    let gateway = gateway(
+        test_config(),
+        Arc::new(NoCredentials),
+        Arc::new(VerifiedTlsConnector {
+            tls: upstream_tls,
+            negotiated,
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+    let (installed, token, ca_certificate) = session(
+        "h2-streaming",
+        "repo-h2-streaming",
+        WorkspaceEndpoint::Tcp(endpoint),
+        31,
+        1,
+        WorkspacePolicy {
+            grants: vec![grant("secure-h2.test", upstream_port)],
+            mirrors: Vec::new(),
+        },
+    );
+    gateway
+        .handle()
+        .install(installed)
+        .await
+        .expect("install h2 session");
+
+    let (mut sender, downstream_connection) = h2_intercept_client(
+        endpoint,
+        &token,
+        "secure-h2.test",
+        upstream_port,
+        ca_certificate,
+    )
+    .await;
+    let request = Request::builder()
+        .version(Version::HTTP_2)
+        .uri(format!(
+            "https://secure-h2.test:{upstream_port}/allowed/events"
+        ))
+        .header(header::HOST, format!("secure-h2.test:{upstream_port}"))
+        .body(Empty::<Bytes>::new())
+        .expect("h2 request");
+    let response = sender.send_request(request).await.expect("h2 response");
+    assert_eq!(response.version(), Version::HTTP_2);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE),
+        Some(&HeaderValue::from_static("text/event-stream"))
+    );
+    assert_eq!(
+        negotiated_rx.recv().await.expect("upstream ALPN"),
+        Some(b"h2".to_vec())
+    );
+    assert_eq!(
+        captured.recv().await.expect("captured h2 request"),
+        format!("https://secure-h2.test:{upstream_port}/allowed/events")
+    );
+
+    let mut body = response.into_body();
+    let first = timeout(Duration::from_secs(1), body.frame())
+        .await
+        .expect("first frame arrived before remainder was released")
+        .expect("first frame exists")
+        .expect("first frame succeeds");
+    let mut bytes = first.data_ref().map_or(0, Bytes::len);
+    assert!(bytes > 0, "first frame must contain streaming data");
+    gate.notify_waiters();
+    let mut saw_trailers = false;
+    let mut frames = 1usize;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.expect("streamed h2 frame");
+        if let Some(data) = frame.data_ref() {
+            bytes += data.len();
+            frames += 1;
+        }
+        if let Some(trailers) = frame.trailers_ref() {
+            saw_trailers =
+                trailers.get("x-fixture-trailer") == Some(&HeaderValue::from_static("complete"));
+        }
+    }
+    assert_eq!(bytes, 72 * 1024);
+    assert!(
+        frames > 1,
+        "body was not transported across multiple frames"
+    );
+    assert!(saw_trailers, "response trailers were not preserved");
+
+    let mismatch = Request::builder()
+        .version(Version::HTTP_2)
+        .uri(format!("https://other.test:{upstream_port}/allowed"))
+        .header(header::HOST, format!("secure-h2.test:{upstream_port}"))
+        .body(Empty::<Bytes>::new())
+        .expect("mismatched h2 request");
+    let denied = sender
+        .send_request(mismatch)
+        .await
+        .expect("authority mismatch response");
+    assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+
+    drop(sender);
+    gateway.drain().await.expect("drain h2 gateway");
+    let _ = timeout(Duration::from_secs(1), downstream_connection).await;
+    timeout(Duration::from_secs(1), upstream_task)
+        .await
+        .expect("h2 upstream task timeout")
+        .expect("h2 upstream task");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn upstream_tls_alpn_selects_h1_fallback_without_downgrading_h2() {
+    let (upstream_port, upstream_tls, upstream_task) = h1_tls_fixture("fallback.test").await;
+    let (negotiated, mut negotiated_rx) = mpsc::channel(1);
+    let endpoint = free_endpoint();
+    let gateway = gateway(
+        test_config(),
+        Arc::new(NoCredentials),
+        Arc::new(VerifiedTlsConnector {
+            tls: upstream_tls,
+            negotiated,
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+    let (installed, token, ca_certificate) = session(
+        "h2-h1-fallback",
+        "repo-h2-h1-fallback",
+        WorkspaceEndpoint::Tcp(endpoint),
+        32,
+        1,
+        WorkspacePolicy {
+            grants: vec![grant("fallback.test", upstream_port)],
+            mirrors: Vec::new(),
+        },
+    );
+    gateway
+        .handle()
+        .install(installed)
+        .await
+        .expect("install fallback session");
+    let (mut sender, downstream_connection) = h2_intercept_client(
+        endpoint,
+        &token,
+        "fallback.test",
+        upstream_port,
+        ca_certificate,
+    )
+    .await;
+    let request = Request::builder()
+        .version(Version::HTTP_2)
+        .uri(format!("https://fallback.test:{upstream_port}/allowed"))
+        .header(header::HOST, format!("fallback.test:{upstream_port}"))
+        .body(Empty::<Bytes>::new())
+        .expect("fallback request");
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("fallback response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        negotiated_rx.recv().await.expect("fallback ALPN"),
+        Some(b"http/1.1".to_vec())
+    );
+    assert_eq!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("fallback body")
+            .to_bytes(),
+        Bytes::from_static(b"h1-fallback")
+    );
+    drop(sender);
+    gateway.drain().await.expect("drain fallback gateway");
+    let _ = timeout(Duration::from_secs(1), downstream_connection).await;
+    timeout(Duration::from_secs(1), upstream_task)
+        .await
+        .expect("h1 upstream task timeout")
+        .expect("h1 upstream task");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn missing_upstream_alpn_fails_without_sending_http1_bytes() {
+    let (upstream_port, upstream_tls, mut received_http, upstream_task) =
+        no_alpn_tls_fixture("no-alpn.test").await;
+    let (negotiated, mut negotiated_rx) = mpsc::channel(1);
+    let endpoint = free_endpoint();
+    let gateway = gateway(
+        test_config(),
+        Arc::new(NoCredentials),
+        Arc::new(VerifiedTlsConnector {
+            tls: upstream_tls,
+            negotiated,
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+    let (installed, token, ca_certificate) = session(
+        "no-upstream-alpn",
+        "repo-no-upstream-alpn",
+        WorkspaceEndpoint::Tcp(endpoint),
+        33,
+        1,
+        WorkspacePolicy {
+            grants: vec![grant("no-alpn.test", upstream_port)],
+            mirrors: Vec::new(),
+        },
+    );
+    gateway
+        .handle()
+        .install(installed)
+        .await
+        .expect("install no-ALPN session");
+    let (mut sender, downstream_connection) = h2_intercept_client(
+        endpoint,
+        &token,
+        "no-alpn.test",
+        upstream_port,
+        ca_certificate,
+    )
+    .await;
+    let request = Request::builder()
+        .version(Version::HTTP_2)
+        .uri(format!("https://no-alpn.test:{upstream_port}/allowed"))
+        .header(header::HOST, format!("no-alpn.test:{upstream_port}"))
+        .body(Empty::<Bytes>::new())
+        .expect("no-ALPN request");
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("no-ALPN gateway response");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(negotiated_rx.recv().await.expect("no-ALPN result"), None);
+    assert!(
+        !received_http.recv().await.expect("no-ALPN byte report"),
+        "gateway sent HTTP/1.1 after TLS selected no ALPN"
+    );
+    drop(sender);
+    gateway.drain().await.expect("drain no-ALPN gateway");
+    let _ = timeout(Duration::from_secs(1), downstream_connection).await;
+    timeout(Duration::from_secs(1), upstream_task)
+        .await
+        .expect("no-ALPN upstream task timeout")
+        .expect("no-ALPN upstream task");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn missing_downstream_alpn_is_not_silently_treated_as_http1() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let endpoint = free_endpoint();
+    let gateway = gateway(
+        test_config(),
+        Arc::new(NoCredentials),
+        Arc::new(CountingFailConnector {
+            calls: Arc::clone(&calls),
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+    let port = 443;
+    let (installed, token, ca_certificate) = session(
+        "no-downstream-alpn",
+        "repo-no-downstream-alpn",
+        WorkspaceEndpoint::Tcp(endpoint),
+        34,
+        1,
+        WorkspacePolicy {
+            grants: vec![grant("downstream.test", port)],
+            mirrors: Vec::new(),
+        },
+    );
+    gateway
+        .handle()
+        .install(installed)
+        .await
+        .expect("install downstream no-ALPN session");
+    let mut stream = TcpStream::connect(endpoint).await.expect("connect gateway");
+    stream
+        .write_all(
+            format!(
+                "CONNECT downstream.test:{port} HTTP/1.1\r\nHost: downstream.test:{port}\r\nProxy-Authorization: Bearer {token}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write CONNECT");
+    let head = read_response_head(&mut stream).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let mut roots = RootCertStore::empty();
+    roots.add(ca_certificate).expect("trust workspace CA");
+    let client = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = ServerName::try_from("downstream.test".to_owned()).expect("server name");
+    let mut tls = TlsConnector::from(Arc::new(client))
+        .connect(server_name, stream)
+        .await
+        .expect("TLS handshake without ALPN");
+    assert_eq!(tls.get_ref().1.alpn_protocol(), None);
+    let _ = tls
+        .write_all(
+            format!(
+                "GET /allowed HTTP/1.1\r\nHost: downstream.test:{port}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+    let mut response = Vec::new();
+    let result = timeout(Duration::from_secs(1), tls.read_to_end(&mut response))
+        .await
+        .expect("gateway closes missing-ALPN transport");
+    assert!(
+        result.is_ok()
+            || matches!(&result, Err(error) if error.kind() == io::ErrorKind::UnexpectedEof),
+        "unexpected missing-ALPN close result: {result:?}"
+    );
+    assert!(response.is_empty(), "gateway silently selected HTTP/1.1");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "upstream connector ran despite rejected downstream ALPN"
+    );
+    gateway
+        .drain()
+        .await
+        .expect("drain downstream no-ALPN gateway");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn h2_session_cancellation_closes_stream_and_is_audited() {
+    let (upstream_port, upstream_tls, gate, _captured, upstream_task) =
+        h2_tls_fixture("cancel-h2.test").await;
+    let (negotiated, _negotiated_rx) = mpsc::channel(1);
+    let (audit_tx, mut audit_rx) = mpsc::channel(16);
+    let endpoint = free_endpoint();
+    let gateway = gateway(
+        test_config(),
+        Arc::new(NoCredentials),
+        Arc::new(VerifiedTlsConnector {
+            tls: upstream_tls,
+            negotiated,
+        }),
+        Arc::new(ChannelAudit(audit_tx)),
+    )
+    .await;
+    let (installed, token, ca_certificate) = session(
+        "cancel-h2",
+        "repo-cancel-h2",
+        WorkspaceEndpoint::Tcp(endpoint),
+        35,
+        1,
+        WorkspacePolicy {
+            grants: vec![grant("cancel-h2.test", upstream_port)],
+            mirrors: Vec::new(),
+        },
+    );
+    gateway
+        .handle()
+        .install(installed)
+        .await
+        .expect("install cancellation session");
+    let (mut sender, downstream_connection) = h2_intercept_client(
+        endpoint,
+        &token,
+        "cancel-h2.test",
+        upstream_port,
+        ca_certificate,
+    )
+    .await;
+    let request = Request::builder()
+        .version(Version::HTTP_2)
+        .uri(format!("https://cancel-h2.test:{upstream_port}/allowed"))
+        .header(header::HOST, format!("cancel-h2.test:{upstream_port}"))
+        .body(Empty::<Bytes>::new())
+        .expect("cancellation request");
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("cancellation response");
+    let mut body = response.into_body();
+    let mut received = 0usize;
+    while received < 24 * 1024 {
+        let frame = timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("first cancellation chunk timeout")
+            .expect("first cancellation chunk ended early")
+            .expect("first cancellation data");
+        received += frame.data_ref().map_or(0, Bytes::len);
+    }
+    assert_eq!(received, 24 * 1024);
+    gateway
+        .handle()
+        .remove("cancel-h2", 1)
+        .await
+        .expect("remove h2 session");
+    let terminal = timeout(Duration::from_secs(1), body.frame())
+        .await
+        .expect("cancelled h2 body did not terminate");
+    assert!(
+        matches!(terminal, None | Some(Err(_))),
+        "cancelled h2 body produced more data"
+    );
+    let mut saw_cancelled_connect = false;
+    while let Ok(Some(event)) = timeout(Duration::from_millis(200), audit_rx.recv()).await {
+        if event.kind == AuditKind::Connect
+            && event.status == AuditStatus::Cancelled
+            && event.classification.as_deref() == Some("session-rotated")
+        {
+            saw_cancelled_connect = true;
+            break;
+        }
+    }
+    assert!(saw_cancelled_connect, "missing cancelled h2 CONNECT audit");
+    gate.notify_waiters();
+    drop(sender);
+    gateway.drain().await.expect("drain cancelled h2 gateway");
+    let _ = timeout(Duration::from_secs(1), downstream_connection).await;
+    let _ = timeout(Duration::from_secs(1), upstream_task).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn h2_audit_failure_hard_stops_the_negotiated_connection() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let endpoint = free_endpoint();
+    let gateway = gateway(
+        test_config(),
+        Arc::new(NoCredentials),
+        Arc::new(CountingFailConnector {
+            calls: Arc::clone(&calls),
+        }),
+        Arc::new(FailingAudit),
+    )
+    .await;
+    let port = 443;
+    let (installed, token, ca_certificate) = session(
+        "h2-audit-stop",
+        "repo-h2-audit-stop",
+        WorkspaceEndpoint::Tcp(endpoint),
+        36,
+        1,
+        WorkspacePolicy {
+            grants: vec![grant("audit-h2.test", port)],
+            mirrors: Vec::new(),
+        },
+    );
+    gateway
+        .handle()
+        .install(installed)
+        .await
+        .expect("install h2 audit session");
+    let (mut sender, connection) =
+        h2_intercept_client(endpoint, &token, "audit-h2.test", port, ca_certificate).await;
+    let malformed = Request::builder()
+        .version(Version::HTTP_2)
+        .uri("https://other.test/allowed")
+        .header(header::HOST, "audit-h2.test")
+        .body(Empty::<Bytes>::new())
+        .expect("mismatched audit request");
+    if let Ok(response) = sender.send_request(malformed).await {
+        assert!(
+            response.status() == StatusCode::BAD_REQUEST
+                || response.status() == StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+    timeout(Duration::from_secs(1), connection)
+        .await
+        .expect("audit hard-stop left h2 connection running")
+        .expect("h2 connection task join")
+        .expect_err("audit hard-stop unexpectedly completed h2 cleanly");
+    assert!(gateway.handle().status().await.expect("status").draining);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "upstream connector ran before malformed h2 request was rejected"
+    );
+    await_reclaimed(&gateway).await;
+    drop(gateway);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn direct_https_proxy_uses_negotiated_upstream_h2() {
+    let (upstream_port, upstream_tls, gate, mut captured, upstream_task) =
+        h2_tls_fixture("direct-h2.test").await;
+    let (negotiated, mut negotiated_rx) = mpsc::channel(1);
+    let endpoint = free_endpoint();
+    let gateway = gateway(
+        test_config(),
+        Arc::new(NoCredentials),
+        Arc::new(VerifiedTlsConnector {
+            tls: upstream_tls,
+            negotiated,
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+    let (installed, token, _) = session(
+        "direct-h2",
+        "repo-direct-h2",
+        WorkspaceEndpoint::Tcp(endpoint),
+        37,
+        1,
+        WorkspacePolicy {
+            grants: vec![grant("direct-h2.test", upstream_port)],
+            mirrors: Vec::new(),
+        },
+    );
+    gateway
+        .handle()
+        .install(installed)
+        .await
+        .expect("install direct h2 session");
+    gate.notify_one();
+    let response = proxy_request(
+        endpoint,
+        format!(
+            "GET https://direct-h2.test:{upstream_port}/allowed HTTP/1.1\r\nHost: direct-h2.test:{upstream_port}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert_eq!(
+        negotiated_rx.recv().await.expect("direct upstream ALPN"),
+        Some(b"h2".to_vec())
+    );
+    assert_eq!(
+        captured.recv().await.expect("direct h2 request"),
+        format!("https://direct-h2.test:{upstream_port}/allowed")
+    );
+    gateway.drain().await.expect("drain direct h2 gateway");
+    timeout(Duration::from_secs(1), upstream_task)
+        .await
+        .expect("direct h2 upstream timeout")
+        .expect("direct h2 upstream task");
 }

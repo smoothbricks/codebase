@@ -62,7 +62,7 @@ impl CaSigner {
             .with_no_client_auth()
             .with_single_cert(chain, key_der)
             .map_err(|error| TlsError::Leaf(error.to_string()))?;
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(Arc::new(config))
     }
 }
