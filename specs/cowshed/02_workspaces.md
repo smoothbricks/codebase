@@ -7,6 +7,11 @@ is always warm because the user works in its currently checked-out working tree 
 workspace is a copy-on-write clone of the main workspace's live image. Operations that update only a non-checked-out ref
 in its repository do not change its checked-out branch, index, or working tree.
 
+Every use of `main` in this specification is project-scoped. A host may adopt any number of repositories, each with its
+own warm `main`, sessions, checkpoints, grants, gateway identity, and standalone Git object store under its primary
+`repo_id`. Commands select the project explicitly with global `--project <git-root>` or derive it from cwd; `new`,
+`fork`, `checkpoint`, `restore`, `push`, and `land` never select a machine-global `main` or cross repository boundaries.
+
 ## The safe-to-clone-main invariant
 
 Cloning main's live image for any consumer — including sandboxed agents — is safe because secrets never live in a
@@ -45,9 +50,10 @@ so waived paths stay visible.
 
 ## `cowshed adopt` — create the main workspace
 
-Converts an existing checkout into an image-backed workspace mounted at its original path. One-time, copy-bound
-(clonefile cannot cross volumes). The source is a _live_ tree — editors, watchers, and build daemons mutate it during
-the copy — so adopt is an explicit transaction with defined crash points, not a best-effort script:
+Converts an existing checkout into that project's image-backed `main` workspace mounted at its original path. One-time
+per project, copy-bound (clonefile cannot cross volumes). The source is a _live_ tree — editors, watchers, and build
+daemons mutate it during the copy — so adopt is an explicit transaction with defined crash points, not a best-effort
+script:
 
 1. Verify: git root, clean-enough state (adopt refuses mid-merge/rebase), free space, the secrets gate, and repository
    identity. Remote discovery may propose normalized lowercase `owner/repo` candidates but never silently chooses or
