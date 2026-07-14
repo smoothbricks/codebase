@@ -1,25 +1,14 @@
 [package]
 name = "columine-wasm"
+description = "columine.wasm: the generic reducer-VM export surface (56 vm_* functions, no RETE) shipped by the @smoothbricks/columine npm package"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 repository.workspace = true
-description = "Columine compilation root: the columine.wasm replacement — the standalone Parse/Reduce/Compact/Undo VM ABI without RETE or ax_eval (build.zig columine_wasm equivalent). The cdylib owns every static the Zig build kept as globals."
 
 [lib]
-# cdylib for the wasm artifact (and libaxe_vm.dylib); staticlib for the
-# iOS/Android Expo-JSI libs (build.zig -Dmobile parity: dist-ios/libaxe_vm.a);
-# rlib so the extern layer is testable natively.
 crate-type = ["cdylib", "rlib"]
-
-[features]
-# Native-dylib bounding mode (libaxe_vm.dylib): unregistered pointers get a
-# fixed trust span instead of a panic — the Zig `[*]u8` C-ABI contract, where
-# the caller's pointer is trusted outright. Tests keep this OFF so the region
-# registry stays the safety net; the artifact build turns it on because
-# production FFI callers (bun-ffi-backend.ts) never register column buffers.
-trusted-ffi = []
 
 [dependencies]
 columine-types = { workspace = true }

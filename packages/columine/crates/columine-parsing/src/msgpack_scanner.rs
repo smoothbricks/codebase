@@ -152,6 +152,25 @@ impl<'a> Reader<'a> {
         self.pos += 1;
         Some(byte)
     }
+    /// msgpack_extractor.zig `readBinary`: consume a standard bin value
+    /// (0xc4/0xc5/0xc6) and return its payload slice.
+    pub(crate) fn read_bin(&mut self) -> Option<&'a [u8]> {
+        let marker = self.take()?;
+        let len = match marker {
+            0xc4 => usize::from(self.take()?),
+            0xc5 => {
+                let hi = self.take()?;
+                let lo = self.take()?;
+                usize::from(u16::from_be_bytes([hi, lo]))
+            }
+            0xc6 => {
+                let b = self.take_slice(4)?;
+                u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize
+            }
+            _ => return None,
+        };
+        self.take_slice(len)
+    }
     fn take_slice(&mut self, length: usize) -> Option<&'a [u8]> {
         let end = self.pos.checked_add(length)?;
         let slice = self.input.get(self.pos..end)?;

@@ -241,7 +241,19 @@ fn extract_typed_value(
             if first == 0xc0 {
                 reader.skip_value();
                 None
+            } else if matches!(first, 0xc4..=0xc6) {
+                // msgpack_extractor.zig `.Binary`: internal typed persistence
+                // pre-encodes Binary/S.unknown values as an opaque canonical
+                // MessagePack document carried by a standard bin value. Store
+                // that bin PAYLOAD directly; wrapping the bin token itself
+                // would require a second decode after Arrow materialization
+                // and corrupt raw bytes.
+                let payload = reader.read_bin().ok_or(ExtractionError::InvalidJson)?;
+                Some(ColumnValue::Binary(payload.to_vec()))
             } else {
+                // External standard MessagePack may provide a structured value
+                // directly. Preserve its exact document bytes for normal
+                // Binary materialization.
                 let start = reader.position();
                 reader.skip_value().ok_or(ExtractionError::InvalidJson)?;
                 Some(ColumnValue::Binary(
@@ -457,5 +469,25 @@ mod tests {
             .unwrap(),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod bin_unwrap_pin {
+    //! f33e06007: a declared-Binary value carried as a standard msgpack bin
+    //! (0xc4/c5/c6) stores the bin PAYLOAD, not the wrapped token — wrapping
+    //! would double-encode internal typed persistence and corrupt raw bytes.
+    use crate::msgpack_scanner::Reader;
+
+    #[test]
+    fn read_bin_unwraps_all_three_headers() {
+        let mut input = vec![0xc4, 3, 1, 2, 3];
+        assert_eq!(Reader::new(&input).read_bin(), Some(&[1u8, 2, 3][..]));
+        input = vec![0xc5, 0, 3, 4, 5, 6];
+        assert_eq!(Reader::new(&input).read_bin(), Some(&[4u8, 5, 6][..]));
+        input = vec![0xc6, 0, 0, 0, 2, 7, 8];
+        assert_eq!(Reader::new(&input).read_bin(), Some(&[7u8, 8][..]));
+        assert_eq!(Reader::new(&[0xa1, b'x']).read_bin(), None);
+        assert_eq!(Reader::new(&[0xc4, 5, 1]).read_bin(), None);
     }
 }
