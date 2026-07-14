@@ -3248,7 +3248,10 @@ mod tests {
         });
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(5)).await;
-        assert_eq!(total_task.await.expect("total task"), "request total timeout");
+        assert_eq!(
+            total_task.await.expect("total task"),
+            "request total timeout"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -3263,7 +3266,10 @@ mod tests {
         tokio::time::advance(Duration::from_secs(4)).await;
         activity.store(4_000_000_000, Ordering::Release);
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(!idle.is_finished(), "activity extended the opaque idle deadline");
+        assert!(
+            !idle.is_finished(),
+            "activity extended the opaque idle deadline"
+        );
         tokio::time::advance(Duration::from_secs(4)).await;
         idle.await.expect("opaque idle watcher");
     }
