@@ -1441,6 +1441,7 @@ impl NativeProjectRuntimeHost {
             .await
             .map_err(native_storage_error)?;
         let layout = self.layout.clone();
+        let project_root = self.descriptor.git_root.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
             derived
                 .into_iter()
@@ -1467,6 +1468,18 @@ impl NativeProjectRuntimeHost {
                     {
                         return Err(crate::storage::apfs::ApfsStorageError::MarkerMismatch(
                             format!("detached metadata disagrees with {}", image.display()),
+                        ));
+                    }
+                    let info = metadata.require_info_snapshot().map_err(|error| {
+                        crate::storage::apfs::ApfsStorageError::Host(error.to_string())
+                    })?;
+                    if info.project_root != project_root {
+                        return Err(crate::storage::apfs::ApfsStorageError::MarkerMismatch(
+                            format!(
+                                "persisted project root {} disagrees with controller root {}",
+                                info.project_root.display(),
+                                project_root.display()
+                            ),
                         ));
                     }
                     Ok(NativeWorkspace {
@@ -1561,6 +1574,16 @@ impl NativeProjectRuntimeHost {
         .map_err(|error| CowshedError::internal(format!("pending metadata task failed: {error}")))?
     }
 
+    fn workspace_mount_path(&self, workspace: &WorkspaceName) -> Result<PathBuf> {
+        if workspace.is_main() {
+            Ok(self.descriptor.git_root.clone())
+        } else {
+            self.layout
+                .workspace_mount(workspace)
+                .map_err(native_integrity_error)
+        }
+    }
+
     fn snapshot(&self, workspace: &NativeWorkspace) -> Result<WorkspaceSnapshot> {
         let info_snapshot = workspace.metadata.info_snapshot.as_ref();
         let base_commit = info_snapshot
@@ -1578,10 +1601,7 @@ impl NativeProjectRuntimeHost {
                 workspace_incarnation: workspace.derived.workspace.incarnation().clone(),
                 role: workspace.derived.workspace.role(),
                 image_format: workspace.derived.workspace.format(),
-                mount: self
-                    .layout
-                    .workspace_mount(workspace.derived.workspace.name())
-                    .map_err(native_integrity_error)?,
+                mount: self.workspace_mount_path(workspace.derived.workspace.name())?,
                 state: match workspace.derived.mount_state {
                     crate::storage::lifecycle::MountState::Detached => {
                         crate::api::dto::WorkspaceState::Detached
@@ -1694,14 +1714,215 @@ impl NativeProjectRuntimeHost {
     async fn operation_identity(
         &self,
         grants: GrantSet,
+        branch: Option<String>,
+        forked_from: Option<WorkspaceName>,
     ) -> Result<crate::storage::lifecycle::OperationIdentity> {
         Ok(crate::storage::lifecycle::OperationIdentity {
             project_root: self.descriptor.git_root.clone(),
             base_commit: self.git.head_oid().await?,
             created_at: utc_timestamp().await?,
+            branch,
+            forked_from,
             created_trace: uuid::Uuid::new_v4().simple().to_string(),
             grants,
         })
+    }
+
+    async fn removal_git_fence(
+        &self,
+        workspace: &NativeWorkspace,
+    ) -> Result<NativeRemovalGitFence> {
+        let root = current_snapshot_mount(self, workspace)?;
+        let git = crate::git::GitRepository::from_root(root);
+        let head = GitOid::new(git.head_oid().await?).map_err(native_integrity_error)?;
+        Ok(NativeRemovalGitFence {
+            incarnation: workspace.derived.workspace.incarnation().clone(),
+            head,
+            dirty: git.is_dirty().await?,
+            in_progress: git.in_progress_operation().await?,
+        })
+    }
+
+    async fn require_session_removal_safe(
+        &self,
+        workspace: &WorkspaceName,
+        fence: &NativeRemovalGitFence,
+    ) -> Result<()> {
+        if fence.dirty || fence.in_progress.is_some() {
+            return Err(CowshedError::conflict(
+                format!("workspace {workspace} has uncommitted or in-progress Git work"),
+                format!(
+                    "commit and push or land the work, or retry with: cowshed rm {workspace} --force"
+                ),
+            ));
+        }
+        if !self.git.commit_is_preserved(fence.head.as_str()).await? {
+            return Err(CowshedError::conflict(
+                format!(
+                    "workspace {workspace} head {} is absent from host branches and Cowshed preservation refs",
+                    fence.head
+                ),
+                format!(
+                    "push or land the workspace, or retry with: cowshed rm {workspace} --force"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn verify_checkout_identity(&self, path: &Path, description: &str) -> Result<()> {
+        let git = crate::git::GitRepository::discover(path)
+            .await
+            .map_err(|_| {
+                CowshedError::conflict(
+                    format!("{description} is not the retained standalone Git checkout"),
+                    "restore the exact .pre-cowshed tree or move the collision aside",
+                )
+            })?;
+        let binding = binding_from_git(&git, Some(&self.descriptor.repo_id)).await?;
+        if binding.primary().map_err(native_integrity_error)?.repo_id != self.descriptor.repo_id {
+            return Err(CowshedError::conflict(
+                format!("{description} belongs to a different repository"),
+                "move the unrelated path aside and retry",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn remove_project_binding_after_restore(&self) -> Result<()> {
+        let path = self.layout.project().repository_binding.clone();
+        let expected = self.descriptor.binding.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    return Err(CowshedError::environment_missing(
+                        format!(
+                            "cannot inspect repository binding {}: {error}",
+                            path.display()
+                        ),
+                        "check controller storage permissions and retry",
+                    ));
+                }
+            };
+            if !metadata.file_type().is_file() {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "repository binding is not a regular file: {}",
+                        path.display()
+                    ),
+                    "move the collision aside and retry",
+                ));
+            }
+            let actual = crate::metadata::read_json::<RepositoryBinding>(&path)
+                .map_err(native_integrity_error)?;
+            if actual != expected {
+                return Err(CowshedError::integrity(
+                    "repository binding changed during adoption rollback",
+                    "restore the exact binding and retry",
+                ));
+            }
+            std::fs::remove_file(&path).map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot remove repository binding {}: {error}",
+                        path.display()
+                    ),
+                    "check controller storage permissions and retry",
+                )
+            })?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| CowshedError::internal("repository binding has no parent"))?;
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| {
+                    CowshedError::environment_missing(
+                        format!(
+                            "cannot sync repository binding directory {}: {error}",
+                            parent.display()
+                        ),
+                        "check controller storage permissions and retry",
+                    )
+                })
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("binding cleanup task failed: {error}")))?
+    }
+
+    async fn adopt_rollback_state(
+        &self,
+        workspace: &NativeWorkspace,
+        pre_cowshed_checkout: &Path,
+    ) -> Result<NativeAdoptRollbackState> {
+        let source = &self.descriptor.git_root;
+        let pre_exists = tokio::fs::symlink_metadata(pre_cowshed_checkout)
+            .await
+            .map(|_| true)
+            .or_else(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    Ok(false)
+                } else {
+                    Err(CowshedError::environment_missing(
+                        format!(
+                            "cannot inspect retained checkout {}: {error}",
+                            pre_cowshed_checkout.display()
+                        ),
+                        "check parent-directory permissions and retry",
+                    ))
+                }
+            })?;
+        let detached = matches!(
+            workspace.derived.mount_state,
+            crate::storage::lifecycle::MountState::Detached
+        );
+        if !pre_exists {
+            if !detached {
+                return Err(CowshedError::conflict(
+                    format!(
+                        "retained checkout {} is missing",
+                        pre_cowshed_checkout.display()
+                    ),
+                    "restore the exact .pre-cowshed tree before retrying adoption rollback",
+                ));
+            }
+            self.verify_checkout_identity(source, "restored project checkout")
+                .await?;
+            return Ok(NativeAdoptRollbackState::Complete);
+        }
+
+        match self
+            .verify_checkout_identity(pre_cowshed_checkout, "retained .pre-cowshed checkout")
+            .await
+        {
+            Ok(()) if detached => {
+                if self
+                    .verify_checkout_identity(source, "canonical project path")
+                    .await
+                    .is_ok()
+                {
+                    return Err(CowshedError::conflict(
+                        "canonical project path contains a checkout while the retained checkout still exists",
+                        "move the unrelated canonical-path checkout aside and retry",
+                    ));
+                }
+                Ok(NativeAdoptRollbackState::Retained)
+            }
+            Ok(()) => Ok(NativeAdoptRollbackState::Retained),
+            Err(retained_error) if detached => {
+                if self
+                    .verify_checkout_identity(source, "restored project checkout")
+                    .await
+                    .is_ok()
+                {
+                    Ok(NativeAdoptRollbackState::Swapped)
+                } else {
+                    Err(retained_error)
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn fresh_grants(&self) -> Result<GrantSet> {
@@ -1849,6 +2070,34 @@ impl NativeProjectRuntimeHost {
         Ok(())
     }
 
+    async fn retire_workspace(&mut self, current: NativeWorkspace) -> Result<()> {
+        use crate::storage::lifecycle::{LifecyclePlanner, Substrate};
+
+        let plan = self
+            .substrate
+            .plan_retire(&current.derived.workspace)
+            .map_err(native_integrity_error)?;
+        let mut commitments = self.commitments.clone();
+        let repo_id = self.descriptor.repo_id.clone();
+        let retired = self
+            .substrate
+            .execute_retire_staged(plan, move |retired| async move {
+                commitments
+                    .ensure_workspace_retired(repo_id, retired.workspace().incarnation().clone())
+                    .await
+                    .map(|_| ())
+            })
+            .await
+            .map_err(native_retire_error)?;
+        let substrate = self.substrate.clone();
+        std::mem::drop(tokio::spawn(async move {
+            // Retirement removed the canonical image from discovery. Reclamation is deliberately
+            // best-effort here: an interrupted task leaves trash for the next idempotent gc pass.
+            let _ = substrate.reclaim(retired).await;
+        }));
+        Ok(())
+    }
+
     fn session(
         &self,
         workspace: &WorkspaceName,
@@ -1863,6 +2112,23 @@ struct NativeWorkspace {
     derived: crate::storage::lifecycle::DerivedWorkspace,
     metadata: crate::metadata::DetachedWorkspaceMetadata,
     image: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeRemovalGitFence {
+    incarnation: WorkspaceIncarnation,
+    head: GitOid,
+    dirty: bool,
+    in_progress: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeAdoptRollbackState {
+    Retained,
+    Swapped,
+    Complete,
 }
 
 #[cfg(target_os = "macos")]
@@ -1931,7 +2197,9 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
 
         let mut grants = self.fresh_grants().await?;
         grants.revision = 0;
-        let identity = self.operation_identity(grants).await?;
+        let identity = self
+            .operation_identity(grants, self.git.current_branch().await?, None)
+            .await?;
         let format = options
             .image_format
             .unwrap_or(crate::metadata::ImageFormat::Asif);
@@ -1996,7 +2264,13 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .clone()
             .unwrap_or_else(|| WorkspaceName::new("main").expect("fixed main"));
         let source = self.current(&source_name).await?;
-        let identity = self.operation_identity(self.fresh_grants().await?).await?;
+        let identity = self
+            .operation_identity(
+                self.fresh_grants().await?,
+                Some(format!("cowshed/{workspace}")),
+                None,
+            )
+            .await?;
         let plan = self
             .substrate
             .plan_create(
@@ -2044,10 +2318,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 )
             })
             .map(|(index, workspace)| {
-                self.layout
-                    .workspace_mount(workspace.derived.workspace.name())
+                self.workspace_mount_path(workspace.derived.workspace.name())
                     .map(|mount| (index, mount))
-                    .map_err(native_integrity_error)
             })
             .collect::<Result<Vec<_>>>()?;
         let requested = path.clone();
@@ -2123,7 +2395,13 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 "choose another workspace name",
             ));
         }
-        let identity = self.operation_identity(self.fresh_grants().await?).await?;
+        let identity = self
+            .operation_identity(
+                self.fresh_grants().await?,
+                Some(format!("cowshed/{destination}")),
+                Some(source.clone()),
+            )
+            .await?;
         let plan = self
             .substrate
             .plan_fork(
@@ -2160,10 +2438,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         );
         self.ensure_supervisor(&workspace).await?;
         let current = self.current(&workspace).await?;
-        let mount = self
-            .layout
-            .workspace_mount(&workspace)
-            .map_err(native_integrity_error)?;
+        let mount = self.workspace_mount_path(&workspace)?;
         Ok(self.ensure_report(
             &current,
             mount,
@@ -2279,10 +2554,18 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     "list workspace checkpoints and retry",
                 )
             })?;
-        self.stop_supervisor(&workspace).await?;
+        let info = current
+            .metadata
+            .require_info_snapshot()
+            .map_err(native_integrity_error)?;
         let identity = self
-            .operation_identity(current.metadata.grants.clone())
+            .operation_identity(
+                current.metadata.grants.clone(),
+                info.branch.clone(),
+                info.forked_from.clone(),
+            )
             .await?;
+        self.stop_supervisor(&workspace).await?;
         let checkpoint_ref = crate::storage::lifecycle::CheckpointRef::new(
             current.derived.workspace.clone(),
             checkpoint.label.clone(),
@@ -2327,34 +2610,175 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         }
     }
 
-    async fn remove(&mut self, workspace: WorkspaceName, _options: RemoveOptions) -> Result<()> {
-        use crate::storage::lifecycle::{LifecyclePlanner, Substrate};
+    async fn remove(&mut self, workspace: WorkspaceName, options: RemoveOptions) -> Result<()> {
+        use crate::storage::lifecycle::{MountIntent, MountState, Substrate};
+
+        if options.restore && options.force {
+            return Err(CowshedError::usage(
+                "--force and --restore select conflicting main removal modes",
+                "use exactly one of: cowshed rm main --force, cowshed rm main --restore",
+            ));
+        }
+        if options.restore && !workspace.is_main() {
+            return Err(CowshedError::usage(
+                "--restore is only valid for the adopted main workspace",
+                "remove a session without --restore",
+            ));
+        }
+        if workspace.is_main() && !options.restore && !options.force {
+            return Err(CowshedError::conflict(
+                "plain main removal requires --force",
+                "use --restore to recover the pre-adoption checkout, or retry with: cowshed rm main --force",
+            ));
+        }
 
         self.validate_binding().await?;
-        let current = self.current(&workspace).await?;
-        self.stop_supervisor(&workspace).await?;
-        let plan = self
-            .substrate
-            .plan_retire(&current.derived.workspace)
-            .map_err(native_integrity_error)?;
-        let mut commitments = self.commitments.clone();
-        let repo_id = self.descriptor.repo_id.clone();
-        let retired = self
-            .substrate
-            .execute_retire_staged(plan, move |retired| async move {
-                commitments
-                    .ensure_workspace_retired(repo_id, retired.workspace().incarnation().clone())
+        let current = match self.current(&workspace).await {
+            Ok(current) => current,
+            Err(error) if options.restore && error.code == ErrorCode::NotFound => {
+                let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
+                if tokio::fs::symlink_metadata(&pre_cowshed).await.is_err()
+                    && self
+                        .verify_checkout_identity(
+                            &self.descriptor.git_root,
+                            "restored project checkout",
+                        )
+                        .await
+                        .is_ok()
+                {
+                    self.remove_project_binding_after_restore().await?;
+                    return Ok(());
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+
+        if options.restore {
+            let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
+            self.adopt_rollback_state(&current, &pre_cowshed).await?;
+            let incarnation = current.derived.workspace.incarnation().clone();
+            self.stop_supervisor(&workspace).await?;
+            let current = self.current(&workspace).await?;
+            Self::require_exact_incarnation(&current, &incarnation)?;
+            let rollback_state = self.adopt_rollback_state(&current, &pre_cowshed).await?;
+            if rollback_state != NativeAdoptRollbackState::Complete {
+                self.substrate
+                    .restore_adopted_checkout(&current.derived.workspace, &pre_cowshed)
                     .await
-                    .map(|_| ())
-            })
-            .await
-            .map_err(native_retire_error)?;
-        let substrate = self.substrate.clone();
-        std::mem::drop(tokio::spawn(async move {
-            // Retirement removed the canonical image from discovery. Reclamation is deliberately
-            // best-effort here: an interrupted task leaves trash for the next idempotent gc pass.
-            let _ = substrate.reclaim(retired).await;
-        }));
+                    .map_err(native_storage_error)?;
+            }
+            let current = self.current(&workspace).await?;
+            Self::require_exact_incarnation(&current, &incarnation)?;
+            self.verify_checkout_identity(&self.descriptor.git_root, "restored project checkout")
+                .await?;
+            if tokio::fs::symlink_metadata(&pre_cowshed).await.is_ok() {
+                return Err(CowshedError::integrity(
+                    "pre-cowshed path remains after atomic checkout restoration",
+                    "retry adoption rollback before removing project state",
+                ));
+            }
+            self.retire_workspace(current).await?;
+            self.remove_project_binding_after_restore().await?;
+            return Ok(());
+        }
+
+        let initially_detached = matches!(current.derived.mount_state, MountState::Detached);
+        if initially_detached {
+            self.substrate
+                .ensure_mounted(&current.derived.workspace, MountIntent { browse: false })
+                .await
+                .map_err(native_storage_error)?;
+        }
+        let current = self.current(&workspace).await?;
+        let initial_fence = self.removal_git_fence(&current).await;
+        let initial_fence = match initial_fence {
+            Ok(fence) => fence,
+            Err(error) => {
+                if initially_detached {
+                    self.substrate
+                        .unmount(&current.derived.workspace)
+                        .await
+                        .map_err(native_storage_error)?;
+                }
+                return Err(error);
+            }
+        };
+        let safety = if workspace.is_main() {
+            if let Some(operation) = initial_fence.in_progress.as_deref() {
+                Err(CowshedError::conflict(
+                    format!("main has an in-progress {operation} Git operation"),
+                    "finish or abort the Git operation before removing main",
+                ))
+            } else if initial_fence.dirty {
+                Err(CowshedError::conflict(
+                    "main has uncommitted Git work",
+                    "commit or discard all changes before removing main",
+                ))
+            } else {
+                Ok(())
+            }
+        } else if options.force {
+            Ok(())
+        } else {
+            self.require_session_removal_safe(&workspace, &initial_fence)
+                .await
+        };
+        if let Err(error) = safety {
+            if initially_detached {
+                self.substrate
+                    .unmount(&current.derived.workspace)
+                    .await
+                    .map_err(native_storage_error)?;
+            }
+            return Err(error);
+        }
+
+        let removal = async {
+            self.stop_supervisor(&workspace).await?;
+            let current = self.current(&workspace).await?;
+            Self::require_exact_incarnation(&current, &initial_fence.incarnation)?;
+            let final_fence = self.removal_git_fence(&current).await?;
+            if final_fence.head != initial_fence.head {
+                return Err(CowshedError::conflict(
+                    format!(
+                        "workspace {workspace} HEAD changed from {} to {} during removal",
+                        initial_fence.head, final_fence.head
+                    ),
+                    "review the new HEAD and retry removal",
+                ));
+            }
+            if workspace.is_main() {
+                if final_fence.dirty || final_fence.in_progress.is_some() {
+                    return Err(CowshedError::conflict(
+                        "main Git state changed during removal",
+                        "finish or discard the new work and retry",
+                    ));
+                }
+            } else if !options.force {
+                self.require_session_removal_safe(&workspace, &final_fence)
+                    .await?;
+            }
+            self.retire_workspace(current).await
+        }
+        .await;
+        if let Err(primary) = removal {
+            let cleanup = match self.current(&workspace).await {
+                Ok(current) if initially_detached => self
+                    .substrate
+                    .unmount(&current.derived.workspace)
+                    .await
+                    .map_err(native_storage_error),
+                Ok(_) => self.ensure_supervisor(&workspace).await.map(|_| ()),
+                Err(_) => Ok(()),
+            };
+            return match cleanup {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(CowshedError::internal(format!(
+                    "workspace removal failed: {primary}; state restoration also failed: {cleanup}"
+                ))),
+            };
+        }
         Ok(())
     }
 
@@ -2459,8 +2883,14 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .map_err(native_integrity_error)?;
         if let Some(handle) = self.supervisors.remove(&workspace) {
             let current = self.current(&workspace).await?;
-            let config =
-                supervisor_sandbox(&self.home, &self.layout, &self.telemetry_root, &current)?;
+            let mount = self.workspace_mount_path(&workspace)?;
+            let config = supervisor_sandbox(
+                &self.home,
+                &self.layout,
+                &self.telemetry_root,
+                &current,
+                mount,
+            )?;
             let replacement = handle
                 .advance_authority(
                     published.revision,
@@ -3536,9 +3966,7 @@ fn current_snapshot_mount(
     host: &NativeProjectRuntimeHost,
     workspace: &NativeWorkspace,
 ) -> Result<PathBuf> {
-    host.layout
-        .workspace_mount(workspace.derived.workspace.name())
-        .map_err(native_integrity_error)
+    host.workspace_mount_path(workspace.derived.workspace.name())
 }
 
 #[cfg(target_os = "macos")]
@@ -3686,10 +4114,8 @@ fn supervisor_sandbox(
     layout: &crate::storage::StorageLayout,
     telemetry_root: &Path,
     current: &NativeWorkspace,
+    mount: PathBuf,
 ) -> Result<crate::sandbox::SandboxConfig> {
-    let mount = layout
-        .workspace_mount(current.derived.workspace.name())
-        .map_err(native_integrity_error)?;
     Ok(crate::sandbox::SandboxConfig {
         home: home.to_path_buf(),
         workspace_mount: mount,

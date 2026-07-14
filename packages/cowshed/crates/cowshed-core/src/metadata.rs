@@ -34,6 +34,7 @@ pub enum MetadataError {
         workspace: String,
         role: WorkspaceRole,
     },
+    MissingInfoSnapshot,
     ImageFormatMismatch {
         path: PathBuf,
         format: ImageFormat,
@@ -78,6 +79,9 @@ impl fmt::Display for MetadataError {
                     f,
                     "workspace {workspace:?} does not agree with role {role:?}"
                 )
+            }
+            Self::MissingInfoSnapshot => {
+                f.write_str("detached workspace metadata has no persisted info snapshot")
             }
             Self::ImageFormatMismatch {
                 path,
@@ -652,7 +656,24 @@ impl DetachedWorkspaceMetadata {
                 version: self.version,
             });
         }
-        self.grants.validate(self.platform)
+        self.grants.validate(self.platform)?;
+        if let Some(info) = &self.info_snapshot {
+            if !info.project_root.is_absolute() {
+                return Err(MetadataError::InvalidPath(info.project_root.clone()));
+            }
+            let expected_role = if self.workspace.is_main() {
+                WorkspaceRole::Main
+            } else {
+                WorkspaceRole::Workspace
+            };
+            if info.role != expected_role {
+                return Err(MetadataError::WorkspaceRoleMismatch {
+                    workspace: self.workspace.to_string(),
+                    role: info.role,
+                });
+            }
+        }
+        Ok(())
     }
 
     pub fn validate(&self, image_path: &Path) -> Result<(), MetadataError> {
@@ -670,6 +691,14 @@ impl DetachedWorkspaceMetadata {
     pub fn write_for_image(&self, image_path: &Path) -> Result<(), MetadataError> {
         self.validate(image_path)?;
         write_json(&sidecar_path(image_path), self)
+    }
+
+    /// Return the persisted restart-safe workspace facts, refusing legacy sidecars that omitted
+    /// them rather than guessing a local path from markers or storage layout.
+    pub fn require_info_snapshot(&self) -> Result<&WorkspaceInfoSnapshot, MetadataError> {
+        self.info_snapshot
+            .as_ref()
+            .ok_or(MetadataError::MissingInfoSnapshot)
     }
 }
 
@@ -1316,6 +1345,36 @@ mod tests {
                 base: 0,
                 size: PORT_BLOCK_SIZE
             })
+        ));
+    }
+
+    #[test]
+    fn persisted_info_snapshot_round_trips_and_legacy_absence_fails_closed() {
+        let metadata: DetachedWorkspaceMetadata =
+            serde_json::from_value(frozen_sidecar_json()).expect("decode snapshot");
+        let encoded = serde_json::to_value(&metadata).expect("encode snapshot");
+        assert_eq!(
+            encoded["infoSnapshot"],
+            frozen_sidecar_json()["infoSnapshot"]
+        );
+        assert_eq!(
+            metadata
+                .require_info_snapshot()
+                .expect("persisted snapshot")
+                .project_root,
+            Path::new("/project")
+        );
+
+        let mut legacy = frozen_sidecar_json();
+        legacy
+            .as_object_mut()
+            .expect("metadata object")
+            .remove("infoSnapshot");
+        let legacy: DetachedWorkspaceMetadata =
+            serde_json::from_value(legacy).expect("legacy wire remains decodable");
+        assert!(matches!(
+            legacy.require_info_snapshot(),
+            Err(MetadataError::MissingInfoSnapshot)
         ));
     }
 

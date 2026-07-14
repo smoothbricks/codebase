@@ -203,6 +203,8 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             project_root: main_mount.clone(),
             base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             created_at: "2026-07-13T00:00:00Z".to_owned(),
+            branch: Some("main".to_owned()),
+            forked_from: None,
             created_trace: format!("apfs-integration-{}", format.extension()),
             grants: GrantSet::closed_baseline(Some(PortBlock::new(30000, 16)?))?,
         })

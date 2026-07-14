@@ -420,6 +420,18 @@ impl ApfsExecutionHost for FakeHost {
             .remove(&(workspace.repo().clone(), workspace.name().clone()));
         Ok(())
     }
+    fn restore_adopted_checkout(
+        &self,
+        workspace: &LifecycleWorkspace,
+        source_checkout: &Path,
+        pre_cowshed_checkout: &Path,
+    ) -> Result<(), ApfsStorageError> {
+        self.record_path(source_checkout);
+        self.record_path(pre_cowshed_checkout);
+        self.detach_mounted(workspace, false)?;
+        self.record("atomic-restore-checkout");
+        Ok(())
+    }
     fn publish_image(&self, staged: &Path, _: &Path) -> Result<(), PublicationError> {
         self.record("atomic-publish-image");
         let mut state = self.state.lock().expect("fake state");
@@ -807,6 +819,8 @@ fn identity() -> OperationIdentity {
         project_root: PathBuf::from("/project"),
         base_commit: "0123456789abcdef".to_owned(),
         created_at: "2026-07-13T00:00:00Z".to_owned(),
+        branch: Some("main".to_owned()),
+        forked_from: None,
         created_trace: "apfs-storage".to_owned(),
         grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
             .expect("grants"),
@@ -1950,6 +1964,48 @@ async fn aborting_restore_fence_leaves_recoverable_pending_publication() {
         host.events()
             .contains(&"recover-pending-publication".to_owned())
     );
+}
+
+#[tokio::test]
+async fn adoption_rollback_detaches_before_atomic_restore_and_never_copies() {
+    let host = FakeHost::default();
+    let main = workspace("main", ImageFormat::Asif, 1);
+    host.seed(&main);
+    let substrate = substrate(host.clone(), CountingLane::default());
+
+    substrate
+        .restore_adopted_checkout(&main, Path::new("/project.pre-cowshed"))
+        .await
+        .expect("restore retained checkout");
+
+    let events = host.events();
+    let detach = events
+        .iter()
+        .position(|event| event == "detach-mounted:false")
+        .expect("detach event");
+    let restore = events
+        .iter()
+        .position(|event| event == "atomic-restore-checkout")
+        .expect("atomic restore event");
+    assert!(detach < restore);
+    assert!(
+        !events.iter().any(|event| event == "copy-tree"),
+        "rollback must never recursively copy"
+    );
+    assert!(
+        host.paths()
+            .windows(2)
+            .any(|paths| paths == [Path::new("/project"), Path::new("/project.pre-cowshed")])
+    );
+
+    let session = workspace("raven", ImageFormat::Asif, 2);
+    let before = host.events();
+    let error = substrate
+        .restore_adopted_checkout(&session, Path::new("/project.pre-cowshed"))
+        .await
+        .expect_err("session is not an adoption rollback target");
+    assert!(matches!(error, ApfsStorageError::InvalidPlan(_)));
+    assert_eq!(host.events(), before, "invalid target mutates nothing");
 }
 
 proptest! {
