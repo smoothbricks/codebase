@@ -443,16 +443,19 @@ fn staged_image_format(path: &Path) -> Option<ImageFormat> {
     WorkspaceIncarnation::new(incarnation).ok()?;
     Some(format)
 }
+fn is_project_owner_directory(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            !name.starts_with('.')
+                && !matches!(name, "mnt" | "caches" | "gateway" | "telemetry" | "run")
+        })
+}
+
 fn collect_project_directories(store_root: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
     let mut projects = Vec::new();
     for owner in directory_children(store_root)? {
-        let Some(owner_name) = owner.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if matches!(
-            owner_name,
-            "mnt" | "caches" | "gateway" | "telemetry" | "run"
-        ) {
+        if !is_project_owner_directory(&owner) {
             continue;
         }
         projects.extend(directory_children(&owner)?);
@@ -3088,14 +3091,7 @@ where
         self.recover_pending(config, &[])?;
         let mut report = StorageGcReport::default();
         for owner in directory_children(&config.store_root)? {
-            if owner == config.caches_root
-                || owner.file_name().is_some_and(|name| {
-                    matches!(
-                        name.to_str(),
-                        Some("mnt" | "caches" | "gateway" | "telemetry" | "run")
-                    )
-                })
-            {
+            if !is_project_owner_directory(&owner) {
                 continue;
             }
             for project in directory_children(&owner)? {
@@ -3282,6 +3278,32 @@ mod tests {
             vec![regular_file]
         );
 
+        std::fs::remove_dir_all(root).expect("fixture cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_recovery_ignores_unreadable_apfs_metadata_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-apfs-project-enumerators-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let system_metadata = root.join(".Trashes");
+        let project = root.join("acme").join("widget");
+        std::fs::create_dir_all(&system_metadata).expect("APFS metadata fixture");
+        std::fs::create_dir_all(&project).expect("project fixture");
+        std::fs::set_permissions(&system_metadata, std::fs::Permissions::from_mode(0o000))
+            .expect("make APFS metadata unreadable");
+
+        assert_eq!(
+            collect_project_directories(&root).expect("project recovery scan"),
+            vec![project]
+        );
+
+        std::fs::set_permissions(&system_metadata, std::fs::Permissions::from_mode(0o700))
+            .expect("restore metadata fixture permissions");
         std::fs::remove_dir_all(root).expect("fixture cleanup");
     }
 
