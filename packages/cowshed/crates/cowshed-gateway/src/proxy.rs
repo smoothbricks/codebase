@@ -908,6 +908,8 @@ fn spawn_opaque(
 ) {
     tokio::spawn(async move {
         let mut audit_stop = watch_for_audit_stop(&context);
+        let session_stop = watch_for_session_stop(&context);
+        let audit_grace = context.timeouts.connect;
         let transport = async move {
             let mut connection_stop = watch_for_session_stop(&context);
             let upgraded = match upgraded.await {
@@ -1109,9 +1111,15 @@ fn spawn_opaque(
                 }
             }
         };
+        tokio::pin!(transport);
         tokio::select! {
-            _ = audit_stop.changed() => {}
-            _ = transport => {}
+            biased;
+            _ = &mut transport => {}
+            _ = audit_stop.changed() => {
+                if *session_stop.borrow() {
+                    let _ = timeout(audit_grace, &mut transport).await;
+                }
+            }
         }
     });
 }
@@ -1198,6 +1206,8 @@ fn spawn_intercept(
 ) {
     tokio::spawn(async move {
         let mut audit_stop = watch_for_audit_stop(&context);
+        let session_stop = watch_for_session_stop(&context);
+        let audit_grace = context.timeouts.connect;
         let transport = async move {
             let upgraded = match upgraded.await {
                 Ok(upgraded) => upgraded,
@@ -1325,9 +1335,15 @@ fn spawn_intercept(
                 NegotiatedTransport::Raw => unreachable!("TLS ALPN cannot select raw transport"),
             }
         };
+        tokio::pin!(transport);
         tokio::select! {
-            _ = audit_stop.changed() => {}
-            _ = transport => {}
+            biased;
+            _ = &mut transport => {}
+            _ = audit_stop.changed() => {
+                if *session_stop.borrow() {
+                    let _ = timeout(audit_grace, &mut transport).await;
+                }
+            }
         }
     });
 }
