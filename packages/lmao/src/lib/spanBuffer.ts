@@ -236,6 +236,32 @@ const EMPTY_EAGER_COLUMNS: EagerColumnDescriptor = Object.freeze({
   key: '',
 });
 
+function resolveCompiledEagerColumns(schema: LogSchema, requestedNames: readonly string[]): EagerColumnDescriptor {
+  if (requestedNames.length === 0) return EMPTY_EAGER_COLUMNS;
+  const requested = new Set(requestedNames);
+  const names: string[] = [];
+  const words = new Array<number>(Math.ceil(schema._columnNames.length / 32)).fill(0);
+  for (let columnIndex = 0; columnIndex < schema._columnNames.length; columnIndex++) {
+    const name = schema._columnNames[columnIndex];
+    if (!requested.delete(name)) continue;
+    names.push(name);
+    const wordIndex = columnIndex >>> 5;
+    words[wordIndex] = (words[wordIndex] | (1 << (columnIndex & 31))) >>> 0;
+  }
+  if (requested.size !== 0) {
+    throw new TypeError(
+      `Unknown compiled eager column${requested.size === 1 ? '' : 's'}: ${[...requested].join(', ')}`,
+    );
+  }
+  while (words.length !== 0 && words[words.length - 1] === 0) words.pop();
+  const frozenWords = Object.freeze(words);
+  return Object.freeze({
+    names: Object.freeze(names),
+    words: frozenWords,
+    key: frozenWords.map((word) => word.toString(16).padStart(8, '0')).join(''),
+  });
+}
+
 function getStorageSchema(
   schema: LogSchema,
   messageLayoutFamily: MessageLayoutFamily,
@@ -255,6 +281,47 @@ function getStorageSchema(
     messageStorageSchemas.set(schema, byLayout);
   }
   return storageSchema;
+}
+
+/**
+ * Canonicalize a ttsc-emitted SpanBuffer class into the same schema/layout cache
+ * used by the dynamic fallback. The factory is lazy so an already materialized
+ * class wins without allocating a duplicate constructor.
+ */
+export function materializeCompiledSpanBufferClass<T extends LogSchema>(
+  schema: T,
+  messageLayoutFamily: MessageLayoutFamily,
+  messagePhysicalLayout: MessagePhysicalLayout,
+  eagerColumnNames: readonly string[],
+  factory: () => new (...args: never[]) => unknown,
+): SpanBufferConstructor<T> {
+  const eagerColumns = resolveCompiledEagerColumns(schema, eagerColumnNames);
+  const cacheKey = `${messageLayoutFamily}:${messagePhysicalLayout}:${eagerColumns.key}`;
+  let familyClasses = spanBufferClassCache.get(schema);
+  const cached = familyClasses?.get(cacheKey);
+  if (
+    isSpanBufferConstructorForSchema(cached, schema) &&
+    cached.messageLayoutFamily === messageLayoutFamily &&
+    cached.messagePhysicalLayout === messagePhysicalLayout
+  ) {
+    return cached;
+  }
+
+  const compiledClass = factory();
+  if (!isGeneratedSpanBufferClass<T>(compiledClass)) {
+    throw new TypeError('Compiled SpanBuffer class is missing the required buffer contract');
+  }
+  const SpanBufferClass = createSpanBufferConstructor(
+    schema,
+    messageLayoutFamily,
+    messagePhysicalLayout,
+    compiledClass,
+    eagerColumns,
+  );
+  familyClasses ??= new Map();
+  familyClasses.set(cacheKey, SpanBufferClass);
+  spanBufferClassCache.set(schema, familyClasses);
+  return SpanBufferClass;
 }
 
 /**

@@ -87,35 +87,45 @@ async function assertTransformProof(offEntrypoint: string, onEntrypoint: string)
   const runtimeHintSignature = /runtimeHint:\s*\d+/g;
   const denseHeaderSignature = /_logHeaders\[/g;
   const registrationSignature = /registerLmaoVocabulary\w*\(\{/g;
+  const spanBufferMaterializationSignature = /\.materializeCompiledSpanBufferClass\(/g;
+  const sourceSpanBufferClassSignature = /class \$\$LmaoSpanBuffer_/g;
   const offRuntimeHints = offSource.match(runtimeHintSignature)?.length ?? 0;
   const onRuntimeHints = onSource.match(runtimeHintSignature)?.length ?? 0;
-  const onRuntimeHintValues = Array.from(onSource.matchAll(/runtimeHint:\s*(\d+)/g), (match) => Number(match[1]));
   const offDenseHeaders = offSource.match(denseHeaderSignature)?.length ?? 0;
   const onDenseHeaders = onSource.match(denseHeaderSignature)?.length ?? 0;
   const offRegistrations = offSource.match(registrationSignature)?.length ?? 0;
   const onRegistrations = onSource.match(registrationSignature)?.length ?? 0;
+  const offSpanBufferMaterializations = offSource.match(spanBufferMaterializationSignature)?.length ?? 0;
+  const onSpanBufferMaterializations = onSource.match(spanBufferMaterializationSignature)?.length ?? 0;
+  const offSourceSpanBufferClasses = offSource.match(sourceSpanBufferClassSignature)?.length ?? 0;
+  const onSourceSpanBufferClasses = onSource.match(sourceSpanBufferClassSignature)?.length ?? 0;
   if (
     offRuntimeHints !== 0 ||
     onRuntimeHints !== 2 ||
-    onRuntimeHintValues[0] !== 194183232 ||
-    onRuntimeHintValues[1] !== 0 ||
     offDenseHeaders !== 0 ||
     onDenseHeaders === 0 ||
     offRegistrations !== 0 ||
-    onRegistrations !== 1
+    onRegistrations !== 1 ||
+    offSpanBufferMaterializations !== 0 ||
+    onSpanBufferMaterializations !== 1 ||
+    offSourceSpanBufferClasses !== 0 ||
+    onSourceSpanBufferClasses !== 1
   ) {
     throw new Error(
-      `Plugin transform proof failed: expected OFF runtime/dense/registration=0/0/0 and ON hints=194183232,0/dense>0/registration=1; received OFF=${offRuntimeHints}/${offDenseHeaders}/${offRegistrations}, ON hints=${onRuntimeHintValues.join(',')}/dense=${onDenseHeaders}/registration=${onRegistrations}`,
+      `Plugin transform proof failed: expected OFF runtime/dense/registration/materializations/classes=0/0/0/0/0 and ON runtime/dense/registration/materializations/classes=2/>0/1/1/1; received OFF=${offRuntimeHints}/${offDenseHeaders}/${offRegistrations}/${offSpanBufferMaterializations}/${offSourceSpanBufferClasses}, ON=${onRuntimeHints}/${onDenseHeaders}/${onRegistrations}/${onSpanBufferMaterializations}/${onSourceSpanBufferClasses}`,
     );
   }
   return {
     offRuntimeHints,
     onRuntimeHints,
-    onRuntimeHint: onRuntimeHintValues.join(','),
     offDenseHeaders,
     onDenseHeaders,
     offRegistrations,
     onRegistrations,
+    offSpanBufferMaterializations,
+    onSpanBufferMaterializations,
+    offSourceSpanBufferClasses,
+    onSourceSpanBufferClasses,
   };
 }
 

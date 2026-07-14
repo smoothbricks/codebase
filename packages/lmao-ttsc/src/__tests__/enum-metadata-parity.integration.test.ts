@@ -10,6 +10,8 @@ const projectPath = fileURLToPath(new URL('../../tsconfig.test.json', import.met
 interface FixtureResult {
   storage: Array<{ writeIndex: number; valueBytes: number[]; nullBytes: number[] }>;
   decoded: Array<string | null>;
+  spanBufferCompilerCalls: number;
+  spanBufferCompilerSources: string[];
 }
 
 interface BuiltFixture {
@@ -72,6 +74,10 @@ test('plugin OFF and ON preserve exact enum value/null bytes while ON reuses pla
     expect(pluginOn.storage.length).toBeGreaterThan(0);
     expect(pluginOn.decoded).toContain('READ');
     expect(pluginOn.decoded).toContain('WRITE');
+    expect(pluginOff.spanBufferCompilerCalls).toBeGreaterThan(0);
+    expect(pluginOn.spanBufferCompilerSources).toEqual([]);
+    expect(onBuild.source).toContain('@smoothbricks/lmao/span-buffer/aot/v1');
+    expect(onBuild.source).toContain('class $$LmaoSpanBuffer_');
     expect(onBuild.source).toContain('.enumLookup.byField["operation"].encode(');
     expect(onBuild.source).not.toContain('case "READ":');
     expect(onBuild.source).not.toContain('case "WRITE":');

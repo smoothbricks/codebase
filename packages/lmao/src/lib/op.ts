@@ -15,20 +15,20 @@
 
 import type { PreEncodedEntry } from '@smoothbricks/arrow-builder';
 import type { RemapDescriptor } from './logBinding.js';
-import { getPhysicalLayoutPlan, sealCallsitePlan } from './physicalLayoutPlan.js';
+import type { SpanContext } from './opContext/spanContextTypes.js';
+import type { OpContext, OpContextBinding } from './opContext/types.js';
 import type {
   ArrowExposurePlan,
   CallsitePlan,
   EagerColumnDescriptor,
   PhysicalAppenders,
 } from './physicalLayoutPlan.js';
-import type { LogSchema } from './schema/LogSchema.js';
-import type { SpanContext } from './opContext/spanContextTypes.js';
-import type { OpContext, OpContextBinding } from './opContext/types.js';
+import { getPhysicalLayoutPlan, sealCallsitePlan } from './physicalLayoutPlan.js';
 import type { Result } from './result.js';
 import { decodeRuntimeHint } from './runtimeHint.js';
-import { createSpanContextClass } from './spanContext.js';
+import type { LogSchema } from './schema/LogSchema.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
+import { createSpanContextClass } from './spanContext.js';
 import type { TimestampAppendPrimitive } from './traceRoot.js';
 import type { VocabularyGeneration } from './vocabularyRegistry.js';
 import type { WasmLayoutTemplate } from './wasm/wasmPhysicalLayout.js';
@@ -53,8 +53,9 @@ export interface OpCompileMetadata {
   readonly runtimeHint: number;
   readonly eagerColumns?: readonly string[];
   readonly localMessageDictionary?: readonly number[];
+  /** ttsc-only startup hook that installs the source-emitted physical buffer constructor. */
+  readonly materializeSpanBufferClass?: (schema: LogSchema) => void;
 }
-
 
 export interface OpMetadata<T extends LogSchema = LogSchema> {
   /** Op name for metrics tracking (distinct from span names which are provided at call sites) */
@@ -163,8 +164,5 @@ export class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
     this.fn = fn;
     this._opContextBinding = opContextBinding;
   }
-
-
-
 }
 //#endregion smoo/lmao!n/op-class

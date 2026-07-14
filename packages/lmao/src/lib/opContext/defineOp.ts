@@ -80,6 +80,7 @@ function normalizeCompileMetadata(compileMetadata?: OpCompileMetadata): OpCompil
       localMessageDictionary === undefined || localMessageDictionary.length === 0
         ? EMPTY_LOCAL_MESSAGE_DICTIONARY
         : Object.freeze([...localMessageDictionary]),
+    materializeSpanBufferClass: compileMetadata.materializeSpanBufferClass,
   });
 }
 
@@ -213,9 +214,6 @@ export function createDefineOp<Ctx extends OpContext>(
   metadata?: Partial<OpMetadata>,
   compileMetadata?: OpCompileMetadata,
 ) => Op<Ctx, Args, S, E> {
-  // Why get the default class here: matching untransformed Ops reuse one constructor and shared stats.
-  const SpanBufferClass = getSpanBufferClass(factoryConfig.logSchema);
-
   return function defineOpImpl<Args extends unknown[], S, E>(
     name: string,
     fn: OpFn<Ctx, Args, S, E>,
@@ -223,19 +221,19 @@ export function createDefineOp<Ctx extends OpContext>(
     compileMetadata?: OpCompileMetadata,
   ): Op<Ctx, Args, S, E> {
     const normalizedCompileMetadata = normalizeCompileMetadata(compileMetadata);
+    normalizedCompileMetadata.materializeSpanBufferClass?.(factoryConfig.logSchema);
     const eagerColumns = resolveEagerColumns(
       factoryConfig.logSchema,
       normalizedCompileMetadata.eagerColumns ?? EMPTY_EAGER_COLUMNS,
     );
     const messageLayoutFamily = runtimeHintMessageLayoutFamily(normalizedCompileMetadata.runtimeHint);
     const messagePhysicalLayout = runtimeHintMessagePhysicalLayout(normalizedCompileMetadata.runtimeHint);
-    // Matching metadata keeps the factory constructor; only a different physical layout materializes another class.
-    const SelectedSpanBufferClass =
-      SpanBufferClass.messageLayoutFamily === messageLayoutFamily &&
-      SpanBufferClass.messagePhysicalLayout === messagePhysicalLayout &&
-      SpanBufferClass.eagerColumns.key === eagerColumns.key
-        ? SpanBufferClass
-        : getSpanBufferClass(factoryConfig.logSchema, messageLayoutFamily, messagePhysicalLayout, eagerColumns);
+    const SelectedSpanBufferClass = getSpanBufferClass(
+      factoryConfig.logSchema,
+      messageLayoutFamily,
+      messagePhysicalLayout,
+      eagerColumns,
+    );
 
     // When transformer is not installed, extract metadata from stack trace
     // This provides useful file/line info for debugging even without build-time injection
