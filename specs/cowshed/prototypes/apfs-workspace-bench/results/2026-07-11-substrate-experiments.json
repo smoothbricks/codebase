@@ -1,0 +1,74 @@
+{
+  "study": "cowshed substrate experiments (ASIF vs SPARSE, attach floor, live-clone validity, tmutil)",
+  "date": "2026-07-11",
+  "host": { "os": "Darwin 25.5 (macOS 26 Tahoe)", "arch": "arm64", "bun": "1.3.14" },
+  "harnesses": ["fmt-bench.ts (Q1/Q2/Q4)", "fork-bench.ts (Q3)"],
+  "caveats": [
+    "Medians over 8 samples (Q1), 10 samples (Q2/Q3); primitive evidence, not SLOs.",
+    "Run under concurrent multi-agent load; absolute attach numbers run high vs the 100k study's 235 ms. Use relative comparisons.",
+    "4 GiB images, 2000 files, 64 MiB IO for Q1. Q1 write column is O_DIRECT+fsync on ASIF but the SPARSE warm-clone path threw EBADF only when its clone had the wrong extension (see finding)."
+  ],
+  "q1_format_comparison_ms_median": {
+    "SPARSE": {
+      "create": 1016.9,
+      "clonefile": 1.95,
+      "attachFresh": 413.7,
+      "attachWarm": 342.2,
+      "directRead": 17.9,
+      "directWrite": 39.6,
+      "metaCreate": 230.5,
+      "metaDelete": 238.5,
+      "baseBlocks": 176136,
+      "grownCloneBlocks": 438280
+    },
+    "ASIF": {
+      "create": 479.1,
+      "clonefile": 1.8,
+      "attachFresh": 520.9,
+      "attachWarm": 416.0,
+      "directRead": 3.2,
+      "directWrite": 15.7,
+      "metaCreate": 101.7,
+      "metaDelete": 103.2,
+      "baseBlocks": 170920,
+      "grownCloneBlocks": 434008
+    },
+    "asif_relative_to_sparse": {
+      "create": "2.1x faster",
+      "clonefile": "equal (~1.8 ms)",
+      "attach": "~75-105 ms SLOWER",
+      "directRead": "5.6x faster",
+      "directWrite": "2.5x faster",
+      "metaCreate": "2.3x faster",
+      "metaDelete": "2.3x faster",
+      "sparseGrowth": "near-identical"
+    },
+    "verdict": "ASIF wins decisively on create and all I/O + metadata (2-5.6x); loses ~75-105 ms on attach. Net: default to ASIF on Tahoe (macOS 26+), SPARSE fallback below it."
+  },
+  "q2_attach_floor_ms_median": {
+    "SPARSE_hdiutil": { "plain": 379.0, "noverify": 363.3, "noverify+noautofsck": 393.4 },
+    "ASIF_diskutil": { "plain": 400.9, "noverify": "flag not offered by 'diskutil image attach'" },
+    "verdict": "Attach floor is NOT meaningfully reducible by flags: -noverify shaves ~15 ms (noise); -noautofsck no help. The ~235-400 ms attach is inherent to the DiskImages framework + APFS mount + DiskArbitration. If attach must drop, it needs a different attach path (DiskImages2 framework / diskarbitrationd), not flags."
+  },
+  "q3_live_clone_validity": {
+    "setup": "2 GiB image, continuous small-file writer + streaming 128 MiB dd loop inside the mounted volume; 10 clonefiles taken mid-write, alternating sync/no-sync.",
+    "SPARSE": { "fsckQuick_pass": "10/10", "fsckFull_pass": "10/10", "mountable": "10/10", "readable": "10/10" },
+    "ASIF_confirmation": {
+      "diskutil_noMount_attach": "works",
+      "fsckQuick": "CLEAN",
+      "fsckFull": "OK",
+      "mounts_and_all_files_present": true
+    },
+    "sync_finding": "A clone taken WITHOUT sync can miss the most-recent writes (smoke test: a just-written file was absent from the clone). All clones are crash-consistent and fsck-clean regardless; sync flushes recent writes but is not required for VALIDITY.",
+    "verdict": "Crash-consistent live cloning is reliably fsck-clean and mountable under heavy churn, on both SPARSE and ASIF. `cowshed new` should: sync the mounted volume before clonefile (freshness, not correctness), attach the clone -nomount, fsck (fsck_apfs for SPARSE; diskutil image attach --noMount + fsck_apfs for ASIF) as a cheap safety net, then mount. The delete-and-retry-once fallback is unlikely to ever trigger from write churn alone."
+  },
+  "q4_tmutil": {
+    "observation": "Every probe path returned '[Excluded]' — but the test dir is under /private/tmp, which macOS excludes from Time Machine by default. Inconclusive for the real <state-root> location.",
+    "verdict": "Cannot confirm image-volume TM-default from /private/tmp. The spec's volume-level exclusion should stay as belt-and-suspenders; whether internal image-backed volumes are TM-included by default remains a verification item to run against the real state dir."
+  },
+  "critical_finding_asif_attach": {
+    "summary": "hdiutil CANNOT attach ASIF: 'this image format is not supported by hdiutil. Please use diskutil image attach'. ASIF requires `diskutil image attach`.",
+    "flags": "diskutil image attach defaults to browsable + noowners; cowshed needs --nobrowse --mountPoint <p>. Owners: `--mountOptions owners` makes the volume root root-owned → user EACCES on the volume root, so ASIF needs a chown of the volume root after create (or mount noowners). SPARSE via hdiutil -owners on does not have this problem.",
+    "spec_impact": "01_storage/02_workspaces attach flows are written with hdiutil flags but create ASIF via diskutil — cowshed-core must branch attach on imageFormat: diskutil for ASIF, hdiutil for SPARSE fallback. -noverify/-noautofsck are hdiutil-only and do not exist for diskutil."
+  }
+}

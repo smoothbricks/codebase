@@ -1,0 +1,86 @@
+name: SmoothBricks CI setup
+description: >-
+  Prepare a CI job to run either on a GitHub-hosted runner (install Nix/devenv) or on a self-hosted cowshed runner
+  (clone a warm, sandboxed workspace from the host's headless main). See packages/cowshed/docs/ci.md.
+
+inputs:
+  mode:
+    description: 'auto | github | cowshed. auto uses cowshed when the runner provides it, else github.'
+    required: false
+    default: auto
+
+outputs:
+  mode:
+    description: 'The resolved mode actually used ("cowshed" or "github").'
+    value: ${{ steps.resolve.outputs.mode }}
+  workspace-path:
+    description: >-
+      On cowshed runners, the mount path of the per-job workspace (ci-<run_id>). On GitHub runners, empty — downstream
+      steps use the plain checkout.
+    value: ${{ steps.cowshed-setup.outputs.workspace-path }}
+
+runs:
+  using: composite
+  steps:
+    # Resolve auto -> cowshed|github by probing for the cowshed binary on PATH.
+    - name: 🔎 Resolve mode
+      id: resolve
+      shell: bash
+      env:
+        SMOOTHBRICKS_CI_MODE: ${{ inputs.mode }}
+      run: |
+        set -euo pipefail
+        requested="$SMOOTHBRICKS_CI_MODE"
+        case "$requested" in
+          github|cowshed|auto) ;;
+          *) echo "smoothbricks-ci: invalid mode '$requested' (expected auto|github|cowshed)" >&2; exit 2 ;;
+        esac
+        resolved="$requested"
+        if [ "$requested" = auto ]; then
+          if command -v cowshed >/dev/null 2>&1; then resolved=cowshed; else resolved=github; fi
+        fi
+        if [ "$resolved" = cowshed ] && ! command -v cowshed >/dev/null 2>&1; then
+          echo "smoothbricks-ci: mode=cowshed but 'cowshed' is not on PATH." >&2
+          echo "smoothbricks-ci: route this job to a [self-hosted, cowshed, zfs] runner, or use mode=auto/github." >&2
+          echo "smoothbricks-ci: see packages/cowshed/docs/ci.md#runner-host-setup" >&2
+          exit 5
+        fi
+        echo "mode=$resolved" >>"$GITHUB_OUTPUT"
+        echo "smoothbricks-ci: mode=$resolved" >&2
+
+    # --- GitHub-hosted path: install Nix/devenv exactly like the legacy ci.yml did. ---
+    - name: 🧱 Setup Nix/devenv (github mode)
+      if: ${{ steps.resolve.outputs.mode == 'github' }}
+      uses: ./.github/actions/setup-devenv
+
+    # --- cowshed runner path: clone a warm, sandboxed workspace for this job. ---
+    - name: 🌱 Create cowshed workspace (cowshed mode)
+      id: cowshed-setup
+      if: ${{ steps.resolve.outputs.mode == 'cowshed' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        ws="ci-${{ github.run_id }}"
+        # cowshed prints the workspace path on stdout; all guidance is on stderr.
+        path="$(cowshed new "$ws" --ref '${{ github.sha }}')"
+        echo "workspace-path=$path" >>"$GITHUB_OUTPUT"
+        # Marker consumed by later steps / the post-job cleanup.
+        {
+          echo "COWSHED_CI_WORKSPACE=$ws"
+          echo "COWSHED_CI_WORKSPACE_PATH=$path"
+        } >>"$GITHUB_ENV"
+        echo "smoothbricks-ci: cowshed workspace $ws at $path" >&2
+        echo "smoothbricks-ci: add a final 'if: always()' job step running 'cowshed rm $ws' to reclaim it now;" >&2
+        echo "smoothbricks-ci: otherwise the ephemeral runner reaps the dataset on deregister." >&2
+
+    # NOTE: composite actions cannot register a post-job hook, so cleanup is NOT
+    # done here (an inline step would destroy the workspace before the build ran).
+    # Reclamation happens one of two ways, both fine:
+    #   1. ephemeral cowshed runners destroy every dataset under the job on deregister;
+    #   2. the workflow adds a trailing `if: ${{ always() }}` step:
+    #        run: cowshed rm "${{ env.COWSHED_CI_WORKSPACE }}"
+    # cowshed gc on the host sweeps any orphaned ci-* workspace + its origin snapshot.
+    #
+    # NOTE: 10_ci.md specifies workspace creation in the runner's job hook (so the first
+    # step is already sandboxed); this action currently creates it inline as a stopgap
+    # until services.cowshed-runner exists. Reconcile when the runner ships.
