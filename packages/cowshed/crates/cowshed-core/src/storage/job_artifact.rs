@@ -833,31 +833,19 @@ fn secure_redirect_target(
         return Ok(());
     };
     let path = workspace_root.join(source.as_path());
-    #[cfg(test)]
-    if FAIL_REDIRECT_FCNTL.swap(false, std::sync::atomic::Ordering::SeqCst) {
-        return Err(ArtifactError::RedirectDescriptor {
-            path,
-            message: "injected fcntl failure".into(),
-        });
-    }
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
-        let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
-        if flags == -1 {
-            return Err(ArtifactError::RedirectDescriptor {
-                path,
-                message: io::Error::last_os_error().to_string(),
-            });
-        }
-        if unsafe {
-            libc::fcntl(
-                descriptor.as_raw_fd(),
-                libc::F_SETFD,
-                flags | libc::FD_CLOEXEC,
-            )
-        } == -1
-        {
+        #[cfg(test)]
+        let fail_fcntl = FAIL_REDIRECT_FCNTL.swap(false, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let fail_fcntl = false;
+        let result = if fail_fcntl {
+            -1
+        } else {
+            unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) }
+        };
+        if result == -1 {
             return Err(ArtifactError::RedirectDescriptor {
                 path,
                 message: io::Error::last_os_error().to_string(),
@@ -1598,63 +1586,63 @@ fn read_file_verified(
     Ok(output)
 }
 
-#[cfg(unix)]
 fn open_artifact_no_follow(
     workspace_root: &Path,
     relative: &WorkspacePath,
 ) -> Result<File, ArtifactError> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
 
-    let absolute = workspace_root.join(relative.as_path());
-    let root_name = CString::new(workspace_root.as_os_str().as_bytes())
-        .map_err(|_| integrity(0, "workspace root contains a NUL byte"))?;
-    let root_fd = unsafe { libc::open(root_name.as_ptr(), SECURE_DIRECTORY_OPEN_FLAGS) };
-    if root_fd == -1 {
-        return Err(io_error(workspace_root, io::Error::last_os_error()));
-    }
-    let mut directory = unsafe { OwnedFd::from_raw_fd(root_fd) };
-    let components = relative.as_path().components().collect::<Vec<_>>();
-    if components.is_empty() {
-        return Err(integrity(0, "protected artifact path is empty"));
-    }
-    for (index, component) in components.iter().enumerate() {
-        let std::path::Component::Normal(name) = component else {
-            return Err(integrity(0, "protected artifact path is not canonical"));
-        };
-        let name = CString::new(name.as_bytes())
-            .map_err(|_| integrity(0, "protected artifact path contains a NUL byte"))?;
-        let last = index + 1 == components.len();
-        let flags = if last {
-            SECURE_FILE_OPEN_FLAGS
-        } else {
-            SECURE_DIRECTORY_OPEN_FLAGS
-        };
-        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
-        if fd == -1 {
-            return Err(io_error(&absolute, io::Error::last_os_error()));
+        let absolute = workspace_root.join(relative.as_path());
+        let root_name = CString::new(workspace_root.as_os_str().as_bytes())
+            .map_err(|_| integrity(0, "workspace root contains a NUL byte"))?;
+        let root_fd = unsafe { libc::open(root_name.as_ptr(), SECURE_DIRECTORY_OPEN_FLAGS) };
+        if root_fd == -1 {
+            return Err(io_error(workspace_root, io::Error::last_os_error()));
         }
-        let opened = unsafe { OwnedFd::from_raw_fd(fd) };
-        if last {
-            return Ok(File::from(opened));
+        let mut directory = unsafe { OwnedFd::from_raw_fd(root_fd) };
+        let components = relative.as_path().components().collect::<Vec<_>>();
+        if components.is_empty() {
+            return Err(integrity(0, "protected artifact path is empty"));
         }
-        directory = opened;
+        for (index, component) in components.iter().enumerate() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(integrity(0, "protected artifact path is not canonical"));
+            };
+            let name = CString::new(name.as_bytes())
+                .map_err(|_| integrity(0, "protected artifact path contains a NUL byte"))?;
+            let last = index + 1 == components.len();
+            let flags = if last {
+                SECURE_FILE_OPEN_FLAGS
+            } else {
+                SECURE_DIRECTORY_OPEN_FLAGS
+            };
+            let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+            if fd == -1 {
+                return Err(io_error(&absolute, io::Error::last_os_error()));
+            }
+            let opened = unsafe { OwnedFd::from_raw_fd(fd) };
+            if last {
+                return Ok(File::from(opened));
+            }
+            directory = opened;
+        }
+        unreachable!("non-empty protected artifact path returns its final component")
     }
-    unreachable!("non-empty protected artifact path returns its final component")
-}
 
-#[cfg(not(unix))]
-fn open_artifact_no_follow(
-    workspace_root: &Path,
-    relative: &WorkspacePath,
-) -> Result<File, ArtifactError> {
-    let path = workspace_root.join(relative.as_path());
-    verify_no_symlinks(workspace_root, &path).map_err(|error| integrity(0, &error.to_string()))?;
-    OpenOptions::new()
-        .read(true)
-        .open(&path)
-        .map_err(|error| io_error(&path, error))
+    #[cfg(not(unix))]
+    {
+        let path = workspace_root.join(relative.as_path());
+        verify_no_symlinks(workspace_root, &path)
+            .map_err(|error| integrity(0, &error.to_string()))?;
+        OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(|error| io_error(&path, error))
+    }
 }
 
 fn hash_file_incrementally(path: &Path) -> Result<Sha256Digest, ArtifactError> {
@@ -4260,6 +4248,7 @@ mod tests {
             (3, 5, 3, 5, true, 5),
             (3, 4, 3, 5, false, 3),
             (3, 5, 3, 2, true, 2),
+            (5, 5, 5, 2, true, 2),
             (3, 5, 3, 3, true, 3),
         ];
         for (used, limit, reserved, actual, accepted, expected_used) in cases {
