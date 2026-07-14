@@ -249,6 +249,7 @@ describe('PhysicalLayoutPlan', () => {
     expect(plan.metadata).toBe(resultOnly.metadata);
     expect(plan.runtimeHint).toBe(RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_RESULT | 4);
     expect(plan.newSpanLogger).toBeUndefined();
+    expect(plan.SpanLoggerClass).toBeUndefined();
     expect(plan.newTagWriter).toBeUndefined();
     expect(typeof plan.newCtx0).toBe('function');
     expect(typeof plan.newCtx1).toBe('function');
@@ -265,6 +266,7 @@ describe('PhysicalLayoutPlan', () => {
     expect(logResult.callsitePlan.SpanContextClass).not.toBe(plan.SpanContextClass);
     expect(logResult.callsitePlan.SpanBufferClass).toBe(plan.SpanBufferClass);
     expect(typeof logResult.callsitePlan.newSpanLogger).toBe('function');
+    expect(logResult.callsitePlan.SpanLoggerClass).toBeDefined();
     expect(logResult.callsitePlan.newTagWriter).toBeUndefined();
     expect(tagResult.callsitePlan).not.toBe(plan);
     expect(tagResult.callsitePlan.SpanBufferClass).toBe(plan.SpanBufferClass);
