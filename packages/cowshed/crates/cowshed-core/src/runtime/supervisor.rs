@@ -570,6 +570,10 @@ enum CommitmentRequest {
         draft: CommitmentDraft,
         reply: oneshot::Sender<Result<u64>>,
     },
+    AdmittedLifecycleIncarnations {
+        repo_id: RepoId,
+        reply: oneshot::Sender<Result<BTreeSet<WorkspaceIncarnation>>>,
+    },
     EnsureWorkspaceIntroduced {
         repo_id: RepoId,
         workspace_incarnation: WorkspaceIncarnation,
@@ -611,6 +615,13 @@ impl CommitmentPublisher {
                 match request {
                     CommitmentRequest::Publish { draft, reply } => {
                         let _ = reply.send(publish_draft(&mut store, draft));
+                    }
+                    CommitmentRequest::AdmittedLifecycleIncarnations { repo_id, reply } => {
+                        let result = store
+                            .refresh()
+                            .map_err(map_commitment_error)
+                            .map(|()| store.admitted_lifecycle_incarnations(&repo_id));
+                        let _ = reply.send(result);
                     }
                     CommitmentRequest::EnsureWorkspaceIntroduced {
                         repo_id,
@@ -731,6 +742,16 @@ impl CommitmentPublisherHandle {
             reply,
         })
         .await?;
+        receive_commitment_reply(receive).await
+    }
+
+    pub(crate) async fn admitted_lifecycle_incarnations(
+        &self,
+        repo_id: RepoId,
+    ) -> Result<BTreeSet<WorkspaceIncarnation>> {
+        let (reply, receive) = oneshot::channel();
+        self.send(CommitmentRequest::AdmittedLifecycleIncarnations { repo_id, reply })
+            .await?;
         receive_commitment_reply(receive).await
     }
 
@@ -2953,6 +2974,193 @@ mod lifecycle_commitment_tests {
 
         let reopened = CommitmentStore::open(&root, repo_id, []).unwrap();
         assert_eq!(reopened.next_order().unwrap(), 3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    async fn publish_sealed_job(
+        publisher: &mut CommitmentPublisherHandle,
+        repo_id: &RepoId,
+        incarnation: &WorkspaceIncarnation,
+        sealed: &crate::storage::job_artifact::SealedJobArtifacts,
+    ) {
+        publisher
+            .publish(CommitmentDraft::Admission {
+                repo_id: repo_id.clone(),
+                workspace_incarnation: incarnation.clone(),
+                job_id: sealed.record.job_id,
+                grant_revision: sealed.record.grant_revision,
+            })
+            .await
+            .unwrap();
+        publisher
+            .publish(CommitmentDraft::Terminal {
+                repo_id: repo_id.clone(),
+                workspace_incarnation: incarnation.clone(),
+                job_id: sealed.record.job_id,
+                state: sealed.record.state,
+                grant_revision: sealed.record.grant_revision,
+                stdout_bytes: sealed.record.stdout.bytes,
+                stdout_sha256: sealed.record.stdout.sha256,
+                stderr_bytes: sealed.record.stderr.bytes,
+                stderr_sha256: sealed.record.stderr.sha256,
+                batch_sha256: sealed.terminal_batch_sha256,
+                output_limit: sealed.output_limit.clone(),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn committed_restore_history_opens_and_restarts_a_replacement_supervisor() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-restored-supervisor-{}",
+            Uuid::new_v4().simple()
+        ));
+        let telemetry = root.join("telemetry");
+        let workspace_root = root.join("workspace");
+        let unintroduced_root = root.join("unintroduced");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&unintroduced_root).unwrap();
+        let repo_id = RepoId::parse("acme/widget").unwrap();
+        let foreign_repo = RepoId::parse("other/repository").unwrap();
+        let source = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let destination = WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let foreign_only = WorkspaceIncarnation::new("2198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let baseline_only = WorkspaceIncarnation::new("3198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let store = CommitmentStore::open(
+            &telemetry,
+            repo_id.clone(),
+            [source.clone(), baseline_only.clone()],
+        )
+        .unwrap();
+        let mut publisher = CommitmentPublisher::start(store, 8).unwrap();
+        publisher
+            .ensure_workspace_introduced(repo_id.clone(), source.clone())
+            .await
+            .unwrap();
+
+        let mut artifacts = ArtifactStore::open(
+            &workspace_root,
+            repo_id.clone(),
+            source.clone(),
+            ArtifactConfig::default(),
+        )
+        .unwrap();
+        let first = artifacts
+            .begin_job(
+                JobId::new(1).unwrap(),
+                7,
+                &["true".into()],
+                OutputTargets::default(),
+            )
+            .unwrap();
+        let first = artifacts.finish(first, JobState::Exited).unwrap();
+        publish_sealed_job(&mut publisher, &repo_id, &source, &first).await;
+        let checkpoint = artifacts.checkpoint(1).unwrap();
+        publisher
+            .publish(CommitmentDraft::Checkpoint {
+                repo_id: repo_id.clone(),
+                origin_incarnation: source.clone(),
+                checkpoint_id: "baseline".into(),
+                barrier_id: checkpoint.record.barrier_id,
+                manifest_batch_sha256: checkpoint.manifest_batch_sha256,
+            })
+            .await
+            .unwrap();
+
+        let later = artifacts
+            .begin_job(
+                JobId::new(2).unwrap(),
+                8,
+                &["true".into()],
+                OutputTargets::default(),
+            )
+            .unwrap();
+        let later = artifacts.finish(later, JobState::Exited).unwrap();
+        publish_sealed_job(&mut publisher, &repo_id, &source, &later).await;
+        drop(artifacts);
+        publisher
+            .publish(CommitmentDraft::Restore {
+                repo_id: repo_id.clone(),
+                source_checkpoint: "baseline".into(),
+                source_incarnation: source.clone(),
+                destination_incarnation: destination.clone(),
+            })
+            .await
+            .unwrap();
+        publisher
+            .publish(CommitmentDraft::WorkspaceIntroduced {
+                repo_id: foreign_repo,
+                workspace_incarnation: foreign_only.clone(),
+            })
+            .await
+            .unwrap();
+
+        let admitted = publisher
+            .admitted_lifecycle_incarnations(repo_id.clone())
+            .await
+            .unwrap();
+        assert!(admitted.contains(&source));
+        assert!(admitted.contains(&destination));
+        assert!(!admitted.contains(&foreign_only));
+        assert!(!admitted.contains(&baseline_only));
+
+        let mut config = WorkspaceSupervisorConfig::default();
+        config.authority = WorkspaceAuthoritySnapshot {
+            repo_id: repo_id.clone(),
+            workspace: WorkspaceName::new("raven").unwrap(),
+            workspace_incarnation: destination.clone(),
+            grant_revision: 8,
+            lifecycle_revision: 2,
+        };
+        config.workspace_root = workspace_root.clone();
+        config.default_cwd = None;
+        config.sandbox.workspace_mount = workspace_root.clone();
+        config.artifacts = ArtifactConfig {
+            admitted_historical_incarnations: admitted.clone(),
+            ..ArtifactConfig::default()
+        };
+        let first_supervisor =
+            WorkspaceSupervisor::start(config.clone(), publisher.clone()).unwrap();
+        first_supervisor.list().await.unwrap();
+        drop(first_supervisor);
+        tokio::task::yield_now().await;
+        let restarted = WorkspaceSupervisor::start(config, publisher.clone()).unwrap();
+        restarted.list().await.unwrap();
+        drop(restarted);
+
+        let mut unintroduced = ArtifactStore::open(
+            &unintroduced_root,
+            repo_id.clone(),
+            foreign_only.clone(),
+            ArtifactConfig::default(),
+        )
+        .unwrap();
+        let token = unintroduced
+            .begin_job(
+                JobId::new(1).unwrap(),
+                1,
+                &["true".into()],
+                OutputTargets::default(),
+            )
+            .unwrap();
+        unintroduced.finish(token, JobState::Exited).unwrap();
+        drop(unintroduced);
+        assert!(matches!(
+            ArtifactStore::open(
+                &unintroduced_root,
+                repo_id,
+                destination,
+                ArtifactConfig {
+                    admitted_historical_incarnations: admitted,
+                    ..ArtifactConfig::default()
+                },
+            ),
+            Err(ArtifactError::Integrity { .. })
+        ));
+
+        drop(publisher);
+        tokio::task::yield_now().await;
         std::fs::remove_dir_all(root).unwrap();
     }
 }
