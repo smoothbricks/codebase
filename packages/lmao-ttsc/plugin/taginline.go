@@ -362,20 +362,18 @@ func enumEncodeCall(enumLookupExpr *shimast.Node, field string, arg *shimast.Nod
 // on any already-spliced synthesized node (pos -1 source reads).
 
 type tagInline struct {
-	list    *shimast.NodeList
-	index   int
-	ctxExpr *shimast.Node
-	writes  []tagWrite
-	schema  map[string]schemaField
+	list        *shimast.NodeList
+	index       int
+	ctxExpr     *shimast.Node
+	writes      []tagWrite
+	schema      map[string]schemaField
+	directState bool
 }
 
-// collectTagInlines finds every provable tag-chain and log-chain
-// ExpressionStatement. Checker queries happen here and only here; the tree
-// is not modified.
-func (t *fileTransformer) collectTagInlines(root *shimast.Node) ([]tagInline, []logInline, []resultInline) {
-	var found []tagInline
-	var foundLogs []logInline
-	var foundResults []resultInline
+// forEachStatementCall visits the exact statement-list call sites considered by
+// the inliners. Keeping the traversal shared lets compile-time capability proofs
+// guarantee that a candidate will also be collected for replacement.
+func forEachStatementCall(root *shimast.Node, visitCall func(list *shimast.NodeList, index int, call *shimast.CallExpression, isReturn bool)) {
 	var visit func(node *shimast.Node)
 	scanList := func(list *shimast.NodeList) {
 		if list == nil {
@@ -396,28 +394,7 @@ func (t *fileTransformer) collectTagInlines(root *shimast.Node) ([]tagInline, []
 			if inner == nil || inner.Kind != shimast.KindCallExpression {
 				continue
 			}
-			call := inner.AsCallExpression()
-			if !isReturn {
-				if ctxExpr, writes, schema, ok := t.findTagChain(call); ok {
-					t.processed[call] = true
-					found = append(found, tagInline{list: list, index: i, ctxExpr: ctxExpr, writes: writes, schema: schema})
-					continue
-				}
-				if in, ok := t.findLogInline(call); ok {
-					t.processed[call] = true
-					in.list, in.index = list, i
-					foundLogs = append(foundLogs, *in)
-					continue
-				}
-			}
-			if in, ok := t.findResultInline(call); ok {
-				t.processed[call] = true
-				if in.okCall != nil && in.okCall.Kind == shimast.KindCallExpression {
-					t.processed[in.okCall.AsCallExpression()] = true
-				}
-				in.list, in.index, in.isReturn = list, i, isReturn
-				foundResults = append(foundResults, *in)
-			}
+			visitCall(list, i, inner.AsCallExpression(), isReturn)
 		}
 	}
 	visit = func(node *shimast.Node) {
@@ -435,6 +412,38 @@ func (t *fileTransformer) collectTagInlines(root *shimast.Node) ([]tagInline, []
 		})
 	}
 	visit(root)
+}
+
+// collectTagInlines finds every provable tag-chain and log-chain
+// ExpressionStatement. Checker queries happen here and only here; the tree
+// is not modified.
+func (t *fileTransformer) collectTagInlines(root *shimast.Node) ([]tagInline, []logInline, []resultInline) {
+	var found []tagInline
+	var foundLogs []logInline
+	var foundResults []resultInline
+	forEachStatementCall(root, func(list *shimast.NodeList, i int, call *shimast.CallExpression, isReturn bool) {
+		if !isReturn {
+			if ctxExpr, writes, schema, ok := t.findTagChain(call); ok {
+				t.processed[call] = true
+				found = append(found, tagInline{list: list, index: i, ctxExpr: ctxExpr, writes: writes, schema: schema, directState: t.directTagStates[ctxExpr]})
+				return
+			}
+			if in, ok := t.findLogInline(call); ok {
+				t.processed[call] = true
+				in.list, in.index = list, i
+				foundLogs = append(foundLogs, *in)
+				return
+			}
+		}
+		if in, ok := t.findResultInline(call); ok {
+			t.processed[call] = true
+			if in.okCall != nil && in.okCall.Kind == shimast.KindCallExpression {
+				t.processed[in.okCall.AsCallExpression()] = true
+			}
+			in.list, in.index, in.isReturn = list, i, isReturn
+			foundResults = append(foundResults, *in)
+		}
+	})
 	return found, foundLogs, foundResults
 }
 
@@ -442,6 +451,10 @@ func (t *fileTransformer) collectTagInlines(root *shimast.Node) ([]tagInline, []
 func (t *fileTransformer) applyTagInlines(inlines []tagInline) {
 	for _, in := range inlines {
 		state := ident("$$t")
+		stateInitializer := propAccess(propAccess(in.ctxExpr, "tag"), "_state")
+		if in.directState {
+			stateInitializer = in.ctxExpr
+		}
 		e := &inlineEmitter{
 			bufferExpr: propAccess(state, "_spanBuffer"),
 			enumLookupExpr: propAccess(
@@ -449,7 +462,7 @@ func (t *fileTransformer) applyTagInlines(inlines []tagInline) {
 				"byField",
 			),
 			stmts: []*shimast.Node{
-				constDecl(state, propAccess(propAccess(in.ctxExpr, "tag"), "_state")),
+				constDecl(state, stateInitializer),
 			},
 		}
 		for _, w := range in.writes {
