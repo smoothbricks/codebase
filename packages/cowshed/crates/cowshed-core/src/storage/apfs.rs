@@ -308,6 +308,12 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     ) -> Result<(), ApfsStorageError>;
     fn chown_volume_root(&self, mount_point: &Path) -> Result<(), ApfsStorageError>;
     fn rename_volume(&self, mount_point: &Path, volume_name: &str) -> Result<(), ApfsStorageError>;
+    fn mint_workspace_credentials(
+        &self,
+        workspace: &LifecycleWorkspace,
+        mount_point: &Path,
+        private_key_path: &Path,
+    ) -> Result<(), ApfsStorageError>;
     fn write_marker(
         &self,
         mount_point: &Path,
@@ -1552,6 +1558,7 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
     .map_err(|_| ApfsStorageError::InvalidPlan("invalid adopted workspace identity"))?;
     let canonical_image = canonical_image_path(config, &workspace)?;
     let mount_point = staging_mount(config, &workspace)?;
+    let staged_companion = companion_path(&created.path);
 
     if let Err(primary) = host.publish_metadata(
         &created.path,
@@ -1584,6 +1591,7 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
                 host.chown_volume_root(&mount_point)?;
             }
             host.copy_tree(source_checkout, &mount_point)?;
+            host.mint_workspace_credentials(&workspace, &mount_point, &staged_companion)?;
             host.write_marker(&mount_point, &workspace, None, identity)?;
             host.validate_marker(&mount_point, &MarkerExpectation::from_workspace(&workspace))
         });
@@ -1596,7 +1604,7 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
         stage: WorkspaceStage {
             workspace,
             mount_point,
-            companion: companion_path(&created.path),
+            companion: staged_companion,
         },
         attachment,
         staged_image: created.path,
@@ -1716,6 +1724,7 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
     let canonical_mount = mount_point(config, &workspace)?;
     let staged_image = staging_image(config, &workspace)?;
     let staging_mount = staging_mount(config, &workspace)?;
+    let staged_companion = companion_path(&staged_image);
 
     host.clone_image(&source_image, &staged_image, format)?;
     if let Err(primary) = host.publish_metadata(
@@ -1749,6 +1758,7 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
                 &staging_mount,
                 &volume_name(workspace.repo(), workspace.name()),
             )?;
+            host.mint_workspace_credentials(&workspace, &staging_mount, &staged_companion)?;
             host.write_marker(
                 &staging_mount,
                 &workspace,
@@ -1771,7 +1781,7 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
         stage: WorkspaceStage {
             workspace,
             mount_point: staging_mount,
-            companion: companion_path(&staged_image),
+            companion: staged_companion,
         },
         attachment,
         staged_image,
@@ -1996,6 +2006,7 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
     let staged_image = staging_image(config, &replacement)?;
     let staging_mount = staging_mount(config, &replacement)?;
     let undo_image = undo_image(config, &current, &replacement)?;
+    let staged_companion = companion_path(&staged_image);
 
     host.clone_image(&checkpoint_image, &staged_image, format)?;
     if let Err(primary) = host.publish_metadata(
@@ -2029,6 +2040,7 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
                 &staging_mount,
                 &volume_name(replacement.repo(), replacement.name()),
             )?;
+            host.mint_workspace_credentials(&replacement, &staging_mount, &staged_companion)?;
             host.write_marker(&staging_mount, &replacement, None, identity)?;
             host.validate_marker(
                 &staging_mount,
@@ -2046,7 +2058,7 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
         stage: WorkspaceStage {
             workspace: replacement,
             mount_point: staging_mount,
-            companion: companion_path(&staged_image),
+            companion: staged_companion,
         },
         attachment,
         staged_image,

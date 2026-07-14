@@ -50,6 +50,7 @@ struct FakeHost {
     fail_metadata_once: Arc<AtomicBool>,
     fail_restored_metadata_once: Arc<AtomicBool>,
     fail_reclaim_once: Arc<AtomicBool>,
+    fail_credentials_once: Arc<AtomicBool>,
     mounted_paths: Arc<Mutex<BTreeSet<PathBuf>>>,
 }
 
@@ -60,6 +61,7 @@ impl Default for FakeHost {
             marker_validations_before_failure: Arc::new(AtomicUsize::new(usize::MAX)),
             fail_metadata_once: Arc::default(),
             fail_restored_metadata_once: Arc::default(),
+            fail_credentials_once: Arc::default(),
             fail_reclaim_once: Arc::default(),
             mounted_paths: Arc::default(),
         }
@@ -126,6 +128,9 @@ impl FakeHost {
         self.fail_metadata_once.store(true, Ordering::SeqCst);
     }
 
+    fn fail_next_credentials(&self) {
+        self.fail_credentials_once.store(true, Ordering::SeqCst);
+    }
     fn fail_next_restored_metadata(&self) {
         self.fail_restored_metadata_once
             .store(true, Ordering::SeqCst);
@@ -307,6 +312,23 @@ impl ApfsExecutionHost for FakeHost {
     fn rename_volume(&self, _: &Path, volume_name: &str) -> Result<(), ApfsStorageError> {
         self.record(format!("rename-volume:{volume_name}"));
         Ok(())
+    }
+
+    fn mint_workspace_credentials(
+        &self,
+        _: &LifecycleWorkspace,
+        _: &Path,
+        private_key_path: &Path,
+    ) -> Result<(), ApfsStorageError> {
+        self.record_path(private_key_path);
+        self.record("mint-workspace-credentials");
+        if self.fail_credentials_once.swap(false, Ordering::SeqCst) {
+            Err(ApfsStorageError::Host(
+                "injected credential mint failure".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn write_marker(
@@ -856,6 +878,7 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
             "attach-no-mount+fsck:Sparse",
             "mount:Sparse",
             "copy-until-quiescent",
+            "mint-workspace-credentials",
             "marker-identity:apfs-storage",
             "write-marker",
             "validate-marker",
@@ -924,6 +947,35 @@ async fn initializer_failure_detaches_reclaims_and_never_publishes() {
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
     assert!(!events.contains(&"atomic-adopt-handoff+publish".to_owned()));
     assert!(!events.contains(&"retain-mounted".to_owned()));
+}
+
+#[tokio::test]
+async fn credential_mint_failure_reclaims_adopt_stage_before_publication() {
+    let host = FakeHost::default();
+    host.fail_next_credentials();
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let plan = substrate
+        .plan_adopt(adopt_request(ImageFormat::Sparse))
+        .expect("adopt plan");
+
+    substrate
+        .execute_adopt_staged(plan, |_| async { Ok::<(), &'static str>(()) })
+        .await
+        .expect_err("credential mint failure");
+
+    let events = host.events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.as_str() == "mint-workspace-credentials")
+            .count(),
+        1
+    );
+    assert!(events.contains(&"detach:false".to_owned()));
+    assert!(events.contains(&"idempotent-reclaim".to_owned()));
+    assert!(!events.contains(&"write-marker".to_owned()));
+    assert!(!events.contains(&"atomic-adopt-handoff+publish".to_owned()));
+    assert!(host.list(&repo()).expect("post-failure listing").is_empty());
 }
 
 #[tokio::test]
@@ -1270,6 +1322,14 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
     assert_eq!(
         restored.workspace.topology_revision(),
         source.topology_revision()
+    );
+    assert_eq!(
+        host.events()
+            .iter()
+            .filter(|event| event.as_str() == "mint-workspace-credentials")
+            .count(),
+        3,
+        "create, fork, and replacement restore each mint one fresh authority"
     );
     let relabels: Vec<_> = host
         .events()

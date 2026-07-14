@@ -688,17 +688,48 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, MetadataError> {
 }
 
 pub fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), MetadataError> {
-    let nonce = SystemTime::now()
+    write_json_with_nonce(path, value, atomic_nonce())
+}
+
+/// Atomically publishes private bytes with mode `0600`, without following a temporary-file
+/// symlink, and fsyncs both the file and its parent directory before returning.
+pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<(), MetadataError> {
+    write_atomic_with_nonce(path, atomic_nonce(), |writer| {
+        writer
+            .write_all(bytes)
+            .map_err(|source| io_error(path, source))
+    })
+}
+
+fn atomic_nonce() -> u128 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos();
-    write_json_with_nonce(path, value, nonce)
+        .as_nanos()
 }
 
 fn write_json_with_nonce<T: Serialize + ?Sized>(
     path: &Path,
     value: &T,
     nonce: u128,
+) -> Result<(), MetadataError> {
+    write_atomic_with_nonce(path, nonce, |writer| {
+        serde_json::to_writer_pretty(&mut *writer, value).map_err(|source| {
+            MetadataError::Json {
+                path: path.to_owned(),
+                source,
+            }
+        })?;
+        writer
+            .write_all(b"\n")
+            .map_err(|source| io_error(path, source))
+    })
+}
+
+fn write_atomic_with_nonce(
+    path: &Path,
+    nonce: u128,
+    write: impl FnOnce(&mut BufWriter<File>) -> Result<(), MetadataError>,
 ) -> Result<(), MetadataError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
@@ -714,7 +745,9 @@ fn write_json_with_nonce<T: Serialize + ?Sized>(
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
         match options.open(&temp_path) {
             Ok(file) => {
@@ -734,28 +767,23 @@ fn write_json_with_nonce<T: Serialize + ?Sized>(
     };
     {
         let mut writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(&mut writer, value).map_err(|source| MetadataError::Json {
-            path: path.to_owned(),
-            source,
-        })?;
-        writer
-            .write_all(b"\n")
-            .map_err(|source| io_error(&temp_path, source))?;
+        write(&mut writer)?;
         writer
             .flush()
+            .map_err(|source| io_error(&temp_path, source))?;
+        #[cfg(unix)]
+        writer
+            .get_ref()
+            .set_permissions({
+                use std::os::unix::fs::PermissionsExt;
+                fs::Permissions::from_mode(0o600)
+            })
             .map_err(|source| io_error(&temp_path, source))?;
         writer
             .get_ref()
             .sync_all()
             .map_err(|source| io_error(&temp_path, source))?;
     }
-
-    #[cfg(unix)]
-    fs::set_permissions(&temp_path, {
-        use std::os::unix::fs::PermissionsExt;
-        fs::Permissions::from_mode(0o600)
-    })
-    .map_err(|source| io_error(&temp_path, source))?;
 
     fs::rename(&temp_path, path).map_err(|source| io_error(path, source))?;
     cleanup.armed = false;

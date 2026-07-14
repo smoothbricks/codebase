@@ -25,6 +25,9 @@ use crate::metadata::{
     WorkspaceIncarnation, WorkspaceMarker, WorkspaceName, WorkspaceRole, sidecar_path,
 };
 use crate::repository::RepoId;
+use crate::workspace_credentials::{
+    mint_workspace_credentials, validate_private_key, validate_public_workspace_assets,
+};
 use serde::{Deserialize, Serialize};
 
 use super::super::lifecycle::{
@@ -1604,6 +1607,18 @@ where
             .map_err(Into::into)
     }
 
+    fn mint_workspace_credentials(
+        &self,
+        workspace: &LifecycleWorkspace,
+        mount_point: &Path,
+        private_key_path: &Path,
+    ) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(mount_point)?;
+        self.verify_controller_path(private_key_path)?;
+        mint_workspace_credentials(workspace, mount_point, private_key_path)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))
+    }
+
     fn write_marker(
         &self,
         mount_point: &Path,
@@ -1651,7 +1666,13 @@ where
             && marker.workspace_incarnation == expected.incarnation
             && marker.image_format == expected.format
         {
-            Ok(())
+            validate_public_workspace_assets(
+                &marker.repo_id,
+                &marker.workspace,
+                &marker.workspace_incarnation,
+                mount_point,
+            )
+            .map_err(|error| ApfsStorageError::MarkerMismatch(error.to_string()))
         } else {
             Err(ApfsStorageError::MarkerMismatch(format!(
                 "{} does not match {}/{}/{:?}",
@@ -1665,22 +1686,7 @@ where
 
     fn validate_staged_companion(&self, path: &Path) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(path)?;
-        let metadata = fs::symlink_metadata(path)
-            .map_err(|error| io_error("inspect staged CA key", path, error))?;
-        if !metadata.file_type().is_file() {
-            return Err(ApfsStorageError::Host(format!(
-                "staged CA key is not a regular file: {}",
-                path.display()
-            )));
-        }
-        #[cfg(unix)]
-        if metadata.permissions().mode() & 0o777 != 0o600 {
-            return Err(ApfsStorageError::Host(format!(
-                "staged CA key must have mode 0600: {}",
-                path.display()
-            )));
-        }
-        Ok(())
+        validate_private_key(path).map_err(|error| ApfsStorageError::Host(error.to_string()))
     }
 
     fn heal_mount(
