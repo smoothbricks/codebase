@@ -54,6 +54,7 @@ pub enum RuntimeJobStream {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeLogChunk {
     pub bytes: Bytes,
+    pub next_offset: u64,
     pub eof: bool,
 }
 
@@ -708,7 +709,10 @@ impl ProjectActor {
                 "supervisor returned a log chunk larger than the transport frame",
             ));
         }
-        RouterResponse::binary(json!({ "eof": chunk.eof }), chunk.bytes)
+        RouterResponse::binary(
+            json!({ "eof": chunk.eof, "nextOffset": chunk.next_offset }),
+            chunk.bytes,
+        )
     }
 
     async fn job_detach(&mut self, request: RouterRequest) -> Result<RouterResponse> {
@@ -2709,6 +2713,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .await?;
         Ok(RuntimeLogChunk {
             bytes: chunk.bytes,
+            next_offset: chunk.next_offset,
             eof: chunk.eof,
         })
     }
