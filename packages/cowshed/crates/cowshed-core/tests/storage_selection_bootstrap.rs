@@ -69,8 +69,8 @@ fn mutates_host(operation: &HostOperation) -> bool {
     matches!(
         operation,
         HostOperation::EnsureDirectory(_)
-            | HostOperation::CreateApfsVolume { .. }
             | HostOperation::MountApfsVolume { .. }
+            | HostOperation::ProvisionApfsVolumes { .. }
             | HostOperation::RunCommand(_)
             | HostOperation::WriteMarkerAtomic { .. }
     )
@@ -78,19 +78,14 @@ fn mutates_host(operation: &HostOperation) -> bool {
 
 fn command_line(operation: &HostOperation) -> Option<String> {
     match operation {
-        HostOperation::RunCommand(command) | HostOperation::CreateApfsVolume { command, .. } => {
-            Some(
-                std::iter::once(command.program().to_owned())
-                    .chain(command.args().iter().cloned())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            )
-        }
+        HostOperation::RunCommand(command) => Some(
+            std::iter::once(command.program().to_owned())
+                .chain(command.args().iter().cloned())
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
         HostOperation::MountApfsVolume { mountpoint, volume } => {
-            let identifier = match volume {
-                VolumeRef::ExistingExact(identifier) => identifier.clone(),
-                VolumeRef::Created(id) => format!("<created:{id:?}>"),
-            };
+            let VolumeRef::ExistingExact(identifier) = volume;
             Some(format!(
                 "/usr/sbin/diskutil mount -nobrowse -mountPoint {} {identifier}",
                 mountpoint.display()
@@ -319,50 +314,28 @@ fn apfs_plan_has_exact_roots_commands_markers_and_store_first_order() {
         Path::new("/Users/alice/.cowshed/caches")
     );
 
-    let commands: Vec<_> = plan.operations().iter().filter_map(command_line).collect();
-    assert_eq!(
-        commands,
-        [
-            "/usr/sbin/diskutil apfs addVolume disk3 APFS cowshed.store -nomount",
-            "/usr/sbin/diskutil mount -nobrowse -mountPoint /Users/alice/.cowshed <created:OperationId(0)>",
-            "/usr/sbin/diskutil apfs addVolume disk3 APFS cowshed.caches -nomount",
-            "/usr/sbin/diskutil mount -nobrowse -mountPoint /Users/alice/.cowshed/caches <created:OperationId(1)>",
-        ]
-    );
-
     assert!(matches!(
         &plan.operations()[0],
         HostOperation::GuardMountpoint { path, role: VolumeRole::Store, substrate: SubstrateKind::Apfs }
             if path == Path::new("/Users/alice/.cowshed")
     ));
-    let store_marker = plan
-        .operations()
-        .iter()
-        .position(|operation| matches!(operation, HostOperation::WriteMarkerAtomic { marker, .. } if marker.role() == VolumeRole::Store))
-        .unwrap();
-    let cache_guard = plan
-        .operations()
-        .iter()
-        .position(|operation| {
-            matches!(
-                operation,
-                HostOperation::GuardMountpoint {
-                    role: VolumeRole::Caches,
-                    ..
-                }
-            )
-        })
-        .unwrap();
-    assert!(
-        store_marker < cache_guard,
-        "nested caches guard must inspect the published store"
+    let HostOperation::ProvisionApfsVolumes { container, volumes } = &plan.operations()[1] else {
+        panic!("absent APFS storage must use one provisioning batch");
+    };
+    assert_eq!(plan.operations().len(), 2);
+    assert_eq!(container, "disk3");
+    assert_eq!(volumes.len(), 2);
+    assert_eq!(volumes[0].name(), APFS_STORE_VOLUME);
+    assert_eq!(volumes[0].mountpoint(), Path::new("/Users/alice/.cowshed"));
+    assert_eq!(volumes[0].role(), VolumeRole::Store);
+    assert!(matches!(volumes[0].kind(), ApfsProvisionKind::Create));
+    assert_eq!(volumes[1].name(), APFS_CACHES_VOLUME);
+    assert_eq!(
+        volumes[1].mountpoint(),
+        Path::new("/Users/alice/.cowshed/caches")
     );
-    assert!(matches!(
-        &plan.operations()[store_marker],
-        HostOperation::WriteMarkerAtomic { path, marker }
-            if path == Path::new("/Users/alice/.cowshed/.cowshed-volume.json")
-                && marker.substrate() == SubstrateKind::Apfs
-    ));
+    assert_eq!(volumes[1].role(), VolumeRole::Caches);
+    assert!(matches!(volumes[1].kind(), ApfsProvisionKind::Create));
 }
 
 #[test]
@@ -429,14 +402,16 @@ fn create_or_heal_uses_only_exact_existing_storage_evidence() {
         absent_apfs_storage(),
     )
     .unwrap();
-    let first_commands: Vec<_> = first.operations().iter().filter_map(command_line).collect();
-    assert_eq!(
-        first_commands
-            .iter()
-            .filter(|command| command.contains(" apfs addVolume "))
-            .count(),
-        2
-    );
+    let batches: Vec<_> = first
+        .operations()
+        .iter()
+        .filter_map(|operation| match operation {
+            HostOperation::ProvisionApfsVolumes { volumes, .. } => Some(volumes),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].len(), 2);
 
     let repeated = plan_bootstrap(
         apfs.clone(),
@@ -784,18 +759,29 @@ proptest! {
             },
         )
         .unwrap();
-        let commands: Vec<_> = first.operations().iter().filter_map(command_line).collect();
+        let provisioned: Vec<_> = first
+            .operations()
+            .iter()
+            .filter_map(|operation| match operation {
+                HostOperation::ProvisionApfsVolumes { volumes, .. } => Some(volumes),
+                _ => None,
+            })
+            .flatten()
+            .collect();
         prop_assert_eq!(
-            commands.iter().filter(|command| command.contains("addVolume")).count(),
+            provisioned
+                .iter()
+                .filter(|volume| matches!(volume.kind(), ApfsProvisionKind::Create))
+                .count(),
             usize::from(store_state == 0) + usize::from(caches_state == 0)
         );
+        let commands: Vec<_> = first.operations().iter().filter_map(command_line).collect();
         prop_assert_eq!(
-            commands.iter().filter(|command| command.contains(" diskutil mount ")).count(),
-            0
-        );
-        prop_assert_eq!(
-            commands.iter().filter(|command| command.contains("/usr/sbin/diskutil mount ")).count(),
-            usize::from(store_state != 2) + usize::from(caches_state != 2)
+            commands
+                .iter()
+                .filter(|command| command.contains("/usr/sbin/diskutil mount "))
+                .count(),
+            usize::from(store_state == 1) + usize::from(caches_state == 1)
         );
 
         let repeated = plan_bootstrap(
@@ -942,6 +928,15 @@ impl BootstrapHost for SpyHost {
         })
     }
 
+    fn provision_apfs_volumes(
+        &self,
+        _container: &str,
+        _volumes: &[ApfsVolumeProvision],
+    ) -> Result<(), HostError> {
+        self.record(true);
+        Ok(())
+    }
+
     fn write_file_atomic(&self, _path: &Path, _contents: &[u8]) -> Result<(), HostError> {
         self.record(true);
         Ok(())
@@ -1020,6 +1015,15 @@ impl BootstrapHost for TransitionHost {
             success: true,
             ..HostCommandOutput::default()
         })
+    }
+
+    fn provision_apfs_volumes(
+        &self,
+        _container: &str,
+        _volumes: &[ApfsVolumeProvision],
+    ) -> Result<(), HostError> {
+        self.next_sequence();
+        Ok(())
     }
 
     fn write_file_atomic(&self, _path: &Path, _contents: &[u8]) -> Result<(), HostError> {
@@ -1193,15 +1197,7 @@ async fn every_host_effect_crosses_the_injected_blocking_lane() {
         lane.dispatches.load(Ordering::SeqCst),
         plan.operations().len()
     );
-    let creation_attestations = plan
-        .operations()
-        .iter()
-        .filter(|operation| matches!(operation, HostOperation::CreateApfsVolume { .. }))
-        .count();
-    assert_eq!(
-        host.effects.load(Ordering::SeqCst),
-        plan.operations().len() + creation_attestations
-    );
+    assert_eq!(host.effects.load(Ordering::SeqCst), plan.operations().len());
 }
 
 #[tokio::test]
@@ -1266,14 +1262,6 @@ async fn tokio_lane_moves_platform_work_off_the_async_worker() {
     execute_bootstrap(&plan, Arc::clone(&host), &TokioBlockingLane)
         .await
         .unwrap();
-    let creation_attestations = plan
-        .operations()
-        .iter()
-        .filter(|operation| matches!(operation, HostOperation::CreateApfsVolume { .. }))
-        .count();
-    assert_eq!(
-        host.effects.load(Ordering::SeqCst),
-        plan.operations().len() + creation_attestations
-    );
+    assert_eq!(host.effects.load(Ordering::SeqCst), plan.operations().len());
     assert!(host.observed_off_caller.load(Ordering::SeqCst));
 }

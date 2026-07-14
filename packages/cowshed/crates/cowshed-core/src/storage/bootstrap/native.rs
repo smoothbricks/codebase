@@ -1,7 +1,7 @@
-#[cfg(target_os = "macos")]
-use std::ffi::OsString;
 #[cfg(unix)]
 use std::ffi::{CStr, CString};
+#[cfg(target_os = "macos")]
+use std::ffi::{OsString, c_void};
 use std::fs;
 #[cfg(unix)]
 use std::fs::File;
@@ -19,6 +19,8 @@ use plist::{Dictionary, Value};
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStringExt;
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use thiserror::Error;
@@ -29,15 +31,19 @@ use uuid::Uuid;
 #[cfg(target_os = "macos")]
 use super::VOLUME_MARKER_FILE;
 use super::{
-    APFS_CACHES_VOLUME, APFS_STORE_VOLUME, BlockingLane, BootstrapEvidence,
-    BootstrapExecutionError, BootstrapHost, BootstrapPlan, DISKUTIL, ExistingStorage, HostCommand,
-    HostCommandOutput, HostError, HostOperation, MountpointState, PlanError, SelectionError,
-    StatFsEvidence, SubstrateKind, TokioBlockingLane, VolumeRole, execute_bootstrap,
-    plan_bootstrap, require_mounted_marker, select_substrate,
+    APFS_CACHES_VOLUME, APFS_STORE_VOLUME, ApfsProvisionKind, ApfsVolumeProvision, BlockingLane,
+    BootstrapEvidence, BootstrapExecutionError, BootstrapHost, BootstrapPlan, DISKUTIL,
+    ExistingStorage, HostCommand, HostCommandOutput, HostError, HostOperation, MountpointState,
+    PlanError, SelectionError, StatFsEvidence, SubstrateKind, TokioBlockingLane, VolumeMarker,
+    VolumeRole, execute_bootstrap, plan_bootstrap, require_mounted_marker, select_substrate,
 };
 
 #[cfg(unix)]
 const MARKER_MODE: libc::mode_t = 0o600;
+#[cfg(target_os = "macos")]
+const CHOWN: &str = "/usr/sbin/chown";
+#[cfg(target_os = "macos")]
+const AUTHORIZED_OUTPUT_LIMIT: usize = 1024 * 1024;
 
 /// Whether native bootstrap may apply its mutating host plan.
 ///
@@ -74,6 +80,32 @@ impl BootstrapHost for SystemBootstrapHost {
         run_command_with(command, |program, args| {
             Command::new(program).args(args).output()
         })
+    }
+
+    fn provision_apfs_volumes(
+        &self,
+        container: &str,
+        volumes: &[ApfsVolumeProvision],
+    ) -> Result<(), HostError> {
+        ensure_supported_host()?;
+        #[cfg(target_os = "macos")]
+        {
+            let uid = unsafe { libc::getuid() };
+            let gid = unsafe { libc::getgid() };
+            provision_apfs_volumes_with(
+                container,
+                volumes,
+                uid,
+                gid,
+                MacAuthorizationSession::acquire,
+                &SystemApfsProvisionIo,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (container, volumes);
+            Err(platform_host_error("APFS provisioning authorization"))
+        }
     }
 
     fn write_file_atomic(&self, path: &Path, contents: &[u8]) -> Result<(), HostError> {
@@ -163,9 +195,6 @@ fn mutating_setup_actions(plan: &BootstrapPlan) -> Vec<String> {
             HostOperation::EnsureDirectory(path) => {
                 Some(format!("create directory {}", path.display()))
             }
-            HostOperation::CreateApfsVolume { name, .. } => {
-                Some(format!("create APFS volume {name}"))
-            }
             HostOperation::MountApfsVolume { mountpoint, .. } => {
                 Some(format!("mount APFS volume at {}", mountpoint.display()))
             }
@@ -173,6 +202,14 @@ fn mutating_setup_actions(plan: &BootstrapPlan) -> Vec<String> {
                 "run {} {}",
                 command.program(),
                 command.args().join(" ")
+            )),
+            HostOperation::ProvisionApfsVolumes { volumes, .. } => Some(format!(
+                "provision APFS volumes {}",
+                volumes
+                    .iter()
+                    .map(ApfsVolumeProvision::name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )),
             HostOperation::WriteMarkerAtomic { path, .. } => {
                 Some(format!("write volume marker {}", path.display()))
@@ -217,8 +254,6 @@ pub enum NativeBootstrapError {
         identifier: String,
         mountpoint: Option<PathBuf>,
     },
-    #[error("APFS volume {identifier:?} is not mounted, so its marker cannot be authenticated")]
-    UnauthenticatedUnmountedVolume { identifier: String },
     #[error("mountpoint {path:?} contains data but is not the exact expected APFS mount")]
     MaskedMountpoint { path: PathBuf },
     #[error("mountpoint {path:?} conflicts with diskutil evidence for {identifier:?}")]
@@ -584,18 +619,19 @@ fn classify_volume(
                     identifier: mounted_identifier,
                 });
             }
-            require_mounted_marker(marker.as_deref(), role, SubstrateKind::Apfs).map_err(
-                |error| NativeBootstrapError::InvalidMountedMarker {
+            let Some(marker) = marker else {
+                return Ok(ExistingStorage::mounted_incomplete(&volume.identifier));
+            };
+            require_mounted_marker(Some(&marker), role, SubstrateKind::Apfs).map_err(|error| {
+                NativeBootstrapError::InvalidMountedMarker {
                     path: expected_mountpoint.to_owned(),
                     message: error.to_string(),
-                },
-            )?;
+                }
+            })?;
             Ok(ExistingStorage::mounted_valid(&volume.identifier))
         }
         MountpointState::Missing | MountpointState::EmptyDirectory => match &volume.mountpoint {
-            None => Err(NativeBootstrapError::UnauthenticatedUnmountedVolume {
-                identifier: volume.identifier.clone(),
-            }),
+            None => Ok(ExistingStorage::detached_incomplete(&volume.identifier)),
             Some(mountpoint) => Err(NativeBootstrapError::InvalidVolumeMountpoint {
                 identifier: volume.identifier.clone(),
                 mountpoint: Some(mountpoint.clone()),
@@ -632,6 +668,521 @@ fn run_command_with(
         stdout: output.stdout,
         stderr: output.stderr,
     })
+}
+
+#[cfg(target_os = "macos")]
+trait PrivilegedCommandSession {
+    fn execute(&mut self, command: &HostCommand) -> Result<HostCommandOutput, HostError>;
+}
+
+#[cfg(target_os = "macos")]
+trait ApfsProvisionIo {
+    fn prepare_mountpoint(&self, path: &Path) -> Result<(), HostError>;
+    fn attest_mounted(&self, path: &Path, exact_identifier: &str) -> Result<(), HostError>;
+    fn attest_owner(&self, path: &Path, uid: u32, gid: u32) -> Result<(), HostError>;
+    fn write_marker(&self, path: &Path, contents: &[u8]) -> Result<(), HostError>;
+}
+
+#[cfg(target_os = "macos")]
+struct SystemApfsProvisionIo;
+
+#[cfg(target_os = "macos")]
+impl ApfsProvisionIo for SystemApfsProvisionIo {
+    fn prepare_mountpoint(&self, path: &Path) -> Result<(), HostError> {
+        match inspect_system_mountpoint(path)? {
+            MountpointState::Missing => fs::create_dir_all(path)
+                .map_err(|source| host_io_error("create APFS mountpoint", path, source)),
+            MountpointState::EmptyDirectory => Ok(()),
+            MountpointState::NonEmptyDirectoryWithoutMount | MountpointState::Mounted { .. } => {
+                Err(HostError::new(format!(
+                    "refusing to provision over non-empty or mounted path {path:?}"
+                )))
+            }
+        }
+    }
+
+    fn attest_mounted(&self, path: &Path, exact_identifier: &str) -> Result<(), HostError> {
+        let snapshot = system_statfs(path).map_err(|error| HostError::new(error.to_string()))?;
+        let actual = exact_device_identifier(&snapshot.mount_source)
+            .map_err(|error| HostError::new(error.to_string()))?;
+        if snapshot.mountpoint != path || actual != exact_identifier {
+            return Err(HostError::new(format!(
+                "mounted APFS identity at {path:?} is {actual:?} from {:?}, expected {exact_identifier:?}",
+                snapshot.mountpoint
+            )));
+        }
+        Ok(())
+    }
+
+    fn attest_owner(&self, path: &Path, uid: u32, gid: u32) -> Result<(), HostError> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|source| host_io_error("inspect APFS volume root ownership", path, source))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != uid
+            || metadata.gid() != gid
+        {
+            return Err(HostError::new(format!(
+                "APFS volume root {path:?} ownership is {}:{}, expected {uid}:{gid}",
+                metadata.uid(),
+                metadata.gid()
+            )));
+        }
+        Ok(())
+    }
+
+    fn write_marker(&self, path: &Path, contents: &[u8]) -> Result<(), HostError> {
+        write_marker_atomic(path, contents)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn provision_apfs_volumes_with<S>(
+    container: &str,
+    volumes: &[ApfsVolumeProvision],
+    uid: u32,
+    gid: u32,
+    acquire: impl FnOnce() -> Result<S, HostError>,
+    io: &impl ApfsProvisionIo,
+) -> Result<(), HostError>
+where
+    S: PrivilegedCommandSession,
+{
+    validate_provision_batch(container, volumes)?;
+    let mut session = acquire()?;
+    for volume in volumes {
+        let exact_identifier = match volume.kind() {
+            ApfsProvisionKind::Create => {
+                io.prepare_mountpoint(volume.mountpoint())?;
+                let create = HostCommand::new(
+                    DISKUTIL,
+                    [
+                        "apfs",
+                        "addVolume",
+                        container,
+                        "APFS",
+                        volume.name(),
+                        "-nomount",
+                    ],
+                );
+                let output = run_privileged_command(&mut session, &create)?;
+                let exact_identifier = super::parse_created_apfs_identifier(&output.stdout)
+                    .map_err(|error| HostError::new(error.to_string()))?;
+                let info =
+                    HostCommand::new(DISKUTIL, ["info", "-plist", exact_identifier.as_str()]);
+                let output = run_privileged_command(&mut session, &info)?;
+                super::attest_created_apfs_info(
+                    &output.stdout,
+                    &exact_identifier,
+                    container,
+                    volume.name(),
+                )
+                .map_err(|error| HostError::new(error.to_string()))?;
+                let mountpoint = path_argument(volume.mountpoint())?;
+                let mount = HostCommand::new(
+                    DISKUTIL,
+                    [
+                        "mount".to_owned(),
+                        "-nobrowse".to_owned(),
+                        "-mountPoint".to_owned(),
+                        mountpoint,
+                        exact_identifier.clone(),
+                    ],
+                );
+                run_privileged_command(&mut session, &mount)?;
+                exact_identifier
+            }
+            ApfsProvisionKind::RepairMounted { exact_identifier } => exact_identifier.clone(),
+            ApfsProvisionKind::RecoverDetached { exact_identifier } => {
+                io.prepare_mountpoint(volume.mountpoint())?;
+                let info =
+                    HostCommand::new(DISKUTIL, ["info", "-plist", exact_identifier.as_str()]);
+                let output = run_privileged_command(&mut session, &info)?;
+                super::attest_created_apfs_info(
+                    &output.stdout,
+                    exact_identifier,
+                    container,
+                    volume.name(),
+                )
+                .map_err(|error| HostError::new(error.to_string()))?;
+                let mountpoint = path_argument(volume.mountpoint())?;
+                let mount = HostCommand::new(
+                    DISKUTIL,
+                    [
+                        "mount".to_owned(),
+                        "-nobrowse".to_owned(),
+                        "-mountPoint".to_owned(),
+                        mountpoint,
+                        exact_identifier.clone(),
+                    ],
+                );
+                run_privileged_command(&mut session, &mount)?;
+                exact_identifier.clone()
+            }
+        };
+
+        io.attest_mounted(volume.mountpoint(), &exact_identifier)?;
+        let info = HostCommand::new(DISKUTIL, ["info", "-plist", exact_identifier.as_str()]);
+        let output = run_privileged_command(&mut session, &info)?;
+        attest_mounted_apfs_info(
+            &output.stdout,
+            &exact_identifier,
+            container,
+            volume.name(),
+            volume.mountpoint(),
+        )?;
+
+        let owner = format!("{uid}:{gid}");
+        let mountpoint = path_argument(volume.mountpoint())?;
+        let chown = HostCommand::new(CHOWN, [owner, mountpoint]);
+        run_privileged_command(&mut session, &chown)?;
+        io.attest_owner(volume.mountpoint(), uid, gid)?;
+
+        let marker = VolumeMarker::new(volume.role(), SubstrateKind::Apfs)
+            .to_json()
+            .map_err(|error| HostError::new(error.to_string()))?;
+        io.write_marker(
+            &volume.mountpoint().join(VOLUME_MARKER_FILE),
+            marker.as_slice(),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_provision_batch(
+    container: &str,
+    volumes: &[ApfsVolumeProvision],
+) -> Result<(), HostError> {
+    if !valid_container_identifier(container.as_bytes()) {
+        return Err(HostError::new(format!(
+            "invalid APFS container identifier {container:?}"
+        )));
+    }
+    if volumes.is_empty() || volumes.len() > 2 {
+        return Err(HostError::new(format!(
+            "APFS provisioning batch contains {} volumes",
+            volumes.len()
+        )));
+    }
+    for (index, volume) in volumes.iter().enumerate() {
+        require_host_canonical(volume.mountpoint())?;
+        let expected_role = match volume.name() {
+            APFS_STORE_VOLUME => VolumeRole::Store,
+            APFS_CACHES_VOLUME => VolumeRole::Caches,
+            name => {
+                return Err(HostError::new(format!(
+                    "refusing unexpected APFS volume name {name:?}"
+                )));
+            }
+        };
+        if volume.role() != expected_role
+            || volumes[..index]
+                .iter()
+                .any(|prior| prior.name() == volume.name())
+        {
+            return Err(HostError::new(format!(
+                "invalid or duplicate APFS provisioning role for {:?}",
+                volume.name()
+            )));
+        }
+        if let ApfsProvisionKind::RepairMounted { exact_identifier }
+        | ApfsProvisionKind::RecoverDetached { exact_identifier } = volume.kind()
+            && !valid_volume_identifier(exact_identifier.as_bytes())
+        {
+            return Err(HostError::new(format!(
+                "invalid APFS recovery identifier {exact_identifier:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn path_argument(path: &Path) -> Result<String, HostError> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| HostError::new(format!("path is not UTF-8: {path:?}")))
+}
+
+#[cfg(target_os = "macos")]
+fn run_privileged_command(
+    session: &mut impl PrivilegedCommandSession,
+    command: &HostCommand,
+) -> Result<HostCommandOutput, HostError> {
+    let output = session.execute(command)?;
+    if !output.success {
+        return Err(HostError::new(format!(
+            "authorized command {:?} with argv {:?} failed: {}",
+            command.program(),
+            command.args(),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(output)
+}
+
+#[cfg(target_os = "macos")]
+fn attest_mounted_apfs_info(
+    bytes: &[u8],
+    expected_identifier: &str,
+    expected_container: &str,
+    expected_name: &str,
+    expected_mountpoint: &Path,
+) -> Result<(), HostError> {
+    let value = Value::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|error| HostError::new(format!("invalid diskutil info plist: {error}")))?;
+    let dictionary = value
+        .as_dictionary()
+        .ok_or_else(|| HostError::new("diskutil info plist root is not a dictionary"))?;
+    let expected_mountpoint = path_argument(expected_mountpoint)?;
+    for (key, expected) in [
+        ("DeviceIdentifier", expected_identifier),
+        ("APFSContainerReference", expected_container),
+        ("VolumeName", expected_name),
+        ("FilesystemType", "apfs"),
+        ("MountPoint", expected_mountpoint.as_str()),
+    ] {
+        let actual = dictionary.get(key).and_then(Value::as_string);
+        if actual != Some(expected) {
+            return Err(HostError::new(format!(
+                "mounted APFS info {key} is {actual:?}, expected {expected:?}"
+            )));
+        }
+    }
+    if !matches!(dictionary.get("APFSSnapshot"), Some(Value::Boolean(false))) {
+        return Err(HostError::new(
+            "mounted APFS object is not an ordinary volume",
+        ));
+    }
+    for role_key in ["APFSVolumeRole", "APFSVolumeRoles", "Roles"] {
+        match dictionary.get(role_key) {
+            None => {}
+            Some(Value::Array(values)) if values.is_empty() => {}
+            Some(Value::String(value)) if value.is_empty() => {}
+            Some(_) => {
+                return Err(HostError::new(format!(
+                    "mounted APFS volume unexpectedly has {role_key} metadata"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+struct MacAuthorizationSession {
+    reference: AuthorizationRef,
+}
+
+#[cfg(target_os = "macos")]
+unsafe impl Send for MacAuthorizationSession {}
+
+#[cfg(target_os = "macos")]
+impl MacAuthorizationSession {
+    fn acquire() -> Result<Self, HostError> {
+        let mut reference = std::ptr::null();
+        let status =
+            unsafe { AuthorizationCreate(std::ptr::null(), std::ptr::null(), 0, &mut reference) };
+        authorization_status("create authorization session", status)?;
+        if reference.is_null() {
+            return Err(HostError::new(
+                "AuthorizationCreate succeeded without an authorization reference",
+            ));
+        }
+        let session = Self { reference };
+        let mut item = AuthorizationItem {
+            name: AUTHORIZATION_RIGHT_EXECUTE.as_ptr().cast(),
+            value_length: 0,
+            value: std::ptr::null_mut(),
+            flags: 0,
+        };
+        let rights = AuthorizationRights {
+            count: 1,
+            items: &mut item,
+        };
+        let flags = AUTHORIZATION_FLAG_INTERACTION_ALLOWED
+            | AUTHORIZATION_FLAG_EXTEND_RIGHTS
+            | AUTHORIZATION_FLAG_PREAUTHORIZE;
+        let status = unsafe {
+            AuthorizationCopyRights(
+                session.reference,
+                &rights,
+                std::ptr::null(),
+                flags,
+                std::ptr::null_mut(),
+            )
+        };
+        authorization_status("preauthorize privileged execution", status)?;
+        Ok(session)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl PrivilegedCommandSession for MacAuthorizationSession {
+    fn execute(&mut self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
+        if !Path::new(command.program()).is_absolute() {
+            return Err(HostError::new(format!(
+                "refusing non-absolute authorized program {:?}",
+                command.program()
+            )));
+        }
+        let program = CString::new(command.program()).map_err(|_| {
+            HostError::new(format!(
+                "authorized program contains NUL: {:?}",
+                command.program()
+            ))
+        })?;
+        let arguments: Vec<CString> = command
+            .args()
+            .iter()
+            .map(|argument| {
+                CString::new(argument.as_bytes()).map_err(|_| {
+                    HostError::new(format!("authorized argument contains NUL: {argument:?}"))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let mut argument_pointers: Vec<*mut libc::c_char> = arguments
+            .iter()
+            .map(|argument| argument.as_ptr().cast_mut())
+            .chain(std::iter::once(std::ptr::null_mut()))
+            .collect();
+        let mut pipe = std::ptr::null_mut();
+        let status = unsafe {
+            AuthorizationExecuteWithPrivileges(
+                self.reference,
+                program.as_ptr(),
+                0,
+                argument_pointers.as_mut_ptr(),
+                &mut pipe,
+            )
+        };
+        authorization_status("execute privileged command", status)?;
+        if pipe.is_null() {
+            return Err(HostError::new(
+                "privileged command returned no communications pipe",
+            ));
+        }
+        let stdout = read_authorized_output(pipe)?;
+        Ok(HostCommandOutput {
+            success: true,
+            stdout,
+            stderr: Vec::new(),
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacAuthorizationSession {
+    fn drop(&mut self) {
+        unsafe {
+            AuthorizationFree(self.reference, AUTHORIZATION_FLAG_DESTROY_RIGHTS);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_authorized_output(pipe: *mut libc::FILE) -> Result<Vec<u8>, HostError> {
+    struct Pipe(*mut libc::FILE);
+    impl Drop for Pipe {
+        fn drop(&mut self) {
+            unsafe {
+                libc::fclose(self.0);
+            }
+        }
+    }
+
+    let pipe = Pipe(pipe);
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = unsafe { libc::fread(buffer.as_mut_ptr().cast(), 1, buffer.len(), pipe.0) };
+        if read > 0 {
+            if output.len().saturating_add(read) > AUTHORIZED_OUTPUT_LIMIT {
+                return Err(HostError::new(format!(
+                    "privileged command output exceeded {AUTHORIZED_OUTPUT_LIMIT} bytes"
+                )));
+            }
+            output.extend_from_slice(&buffer[..read]);
+        }
+        if read < buffer.len() {
+            if unsafe { libc::ferror(pipe.0) } != 0 {
+                return Err(HostError::new(format!(
+                    "cannot read privileged command output: {}",
+                    io::Error::last_os_error()
+                )));
+            }
+            break;
+        }
+    }
+    Ok(output)
+}
+
+#[cfg(target_os = "macos")]
+fn authorization_status(operation: &str, status: i32) -> Result<(), HostError> {
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(HostError::new(format!(
+            "{operation} failed with Authorization Services status {status}"
+        )))
+    }
+}
+
+#[cfg(target_os = "macos")]
+type AuthorizationRef = *const c_void;
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct AuthorizationItem {
+    name: *const libc::c_char,
+    value_length: usize,
+    value: *mut c_void,
+    flags: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct AuthorizationRights {
+    count: u32,
+    items: *mut AuthorizationItem,
+}
+
+#[cfg(target_os = "macos")]
+const AUTHORIZATION_RIGHT_EXECUTE: &[u8] = b"system.privilege.admin\0";
+#[cfg(target_os = "macos")]
+const AUTHORIZATION_FLAG_INTERACTION_ALLOWED: u32 = 1 << 0;
+#[cfg(target_os = "macos")]
+const AUTHORIZATION_FLAG_EXTEND_RIGHTS: u32 = 1 << 1;
+#[cfg(target_os = "macos")]
+const AUTHORIZATION_FLAG_DESTROY_RIGHTS: u32 = 1 << 3;
+#[cfg(target_os = "macos")]
+const AUTHORIZATION_FLAG_PREAUTHORIZE: u32 = 1 << 4;
+
+#[cfg(target_os = "macos")]
+#[link(name = "Security", kind = "framework")]
+unsafe extern "C" {
+    fn AuthorizationCreate(
+        rights: *const AuthorizationRights,
+        environment: *const AuthorizationRights,
+        flags: u32,
+        authorization: *mut AuthorizationRef,
+    ) -> i32;
+    fn AuthorizationCopyRights(
+        authorization: AuthorizationRef,
+        rights: *const AuthorizationRights,
+        environment: *const AuthorizationRights,
+        flags: u32,
+        authorized_rights: *mut *mut AuthorizationRights,
+    ) -> i32;
+    fn AuthorizationExecuteWithPrivileges(
+        authorization: AuthorizationRef,
+        path_to_tool: *const libc::c_char,
+        options: u32,
+        arguments: *mut *mut libc::c_char,
+        communications_pipe: *mut *mut libc::FILE,
+    ) -> i32;
+    fn AuthorizationFree(authorization: AuthorizationRef, flags: u32) -> i32;
 }
 
 fn ensure_supported_host() -> Result<(), HostError> {
@@ -948,6 +1499,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
+    #[cfg(target_os = "macos")]
+    use std::rc::Rc;
 
     use super::*;
     use crate::storage::bootstrap::VolumeMarker;
@@ -1050,6 +1603,96 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum ProvisionEvent {
+        Acquire,
+        Command { program: String, args: Vec<String> },
+        Prepare(PathBuf),
+        AttestMounted(PathBuf, String),
+        AttestOwner(PathBuf, u32, u32),
+        Marker(PathBuf, Vec<u8>),
+        Free,
+    }
+
+    #[cfg(target_os = "macos")]
+    struct FakePrivilegedSession {
+        events: Rc<RefCell<Vec<ProvisionEvent>>>,
+        outputs: VecDeque<Result<HostCommandOutput, HostError>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl PrivilegedCommandSession for FakePrivilegedSession {
+        fn execute(&mut self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
+            self.events.borrow_mut().push(ProvisionEvent::Command {
+                program: command.program().to_owned(),
+                args: command.args().to_vec(),
+            });
+            self.outputs
+                .pop_front()
+                .unwrap_or_else(|| Err(HostError::new("missing fake privileged output")))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for FakePrivilegedSession {
+        fn drop(&mut self) {
+            self.events.borrow_mut().push(ProvisionEvent::Free);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct FakeProvisionIo {
+        events: Rc<RefCell<Vec<ProvisionEvent>>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl ApfsProvisionIo for FakeProvisionIo {
+        fn prepare_mountpoint(&self, path: &Path) -> Result<(), HostError> {
+            self.events
+                .borrow_mut()
+                .push(ProvisionEvent::Prepare(path.to_owned()));
+            Ok(())
+        }
+
+        fn attest_mounted(&self, path: &Path, exact_identifier: &str) -> Result<(), HostError> {
+            self.events.borrow_mut().push(ProvisionEvent::AttestMounted(
+                path.to_owned(),
+                exact_identifier.to_owned(),
+            ));
+            Ok(())
+        }
+
+        fn attest_owner(&self, path: &Path, uid: u32, gid: u32) -> Result<(), HostError> {
+            self.events
+                .borrow_mut()
+                .push(ProvisionEvent::AttestOwner(path.to_owned(), uid, gid));
+            Ok(())
+        }
+
+        fn write_marker(&self, path: &Path, contents: &[u8]) -> Result<(), HostError> {
+            self.events
+                .borrow_mut()
+                .push(ProvisionEvent::Marker(path.to_owned(), contents.to_vec()));
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn provision_info(identifier: &str, container: &str, name: &str, mountpoint: &str) -> Vec<u8> {
+        format!(
+            "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>\
+             <key>DeviceIdentifier</key><string>{identifier}</string>\
+             <key>APFSContainerReference</key><string>{container}</string>\
+             <key>VolumeName</key><string>{name}</string>\
+             <key>FilesystemType</key><string>apfs</string>\
+             <key>MountPoint</key><string>{mountpoint}</string>\
+             <key>APFSSnapshot</key><false/>\
+             </dict></plist>"
+        )
+        .into_bytes()
+    }
+
     #[test]
     fn exact_container_is_selected_and_diskutil_argv_is_fixed() {
         let unrelated = container("disk2", &volume("Data", "disk2s1", None));
@@ -1131,6 +1774,40 @@ mod tests {
             gathered.bootstrap,
             BootstrapEvidence::Apfs { store: ExistingStorage::MountedValid { ref exact_identifier }, .. }
                 if exact_identifier == "disk3s8"
+        ));
+
+        let mut incomplete = source(inventory.clone());
+        incomplete.mountpoints.insert(
+            PathBuf::from("/Users/alice/.cowshed"),
+            MountpointState::Mounted { marker: None },
+        );
+        let gathered = gather_apfs_evidence(
+            &mut incomplete,
+            Path::new("/Users/alice/project"),
+            Path::new("/Users/alice"),
+        )
+        .unwrap();
+        assert!(matches!(
+            gathered.bootstrap,
+            BootstrapEvidence::Apfs {
+                store: ExistingStorage::MountedIncomplete { ref exact_identifier },
+                ..
+            } if exact_identifier == "disk3s8"
+        ));
+
+        let mut detached = source(inventory.clone());
+        let gathered = gather_apfs_evidence(
+            &mut detached,
+            Path::new("/Users/alice/project"),
+            Path::new("/Users/alice"),
+        )
+        .unwrap();
+        assert!(matches!(
+            gathered.bootstrap,
+            BootstrapEvidence::Apfs {
+                store: ExistingStorage::DetachedIncomplete { ref exact_identifier },
+                ..
+            } if exact_identifier == "disk3s8"
         ));
 
         let mut invalid = source(inventory);
@@ -1236,6 +1913,443 @@ mod tests {
                     "literal;not-shell".to_owned(),
                 ]
             )
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn one_authorization_session_wraps_fixed_argv_for_all_new_volumes() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let outputs = VecDeque::from([
+            Ok(HostCommandOutput {
+                success: true,
+                stdout: b"Created new APFS Volume disk3s8\n".to_vec(),
+                stderr: Vec::new(),
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                stdout: provision_info("disk3s8", "disk3", APFS_STORE_VOLUME, ""),
+                stderr: Vec::new(),
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                ..HostCommandOutput::default()
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                stdout: provision_info(
+                    "disk3s8",
+                    "disk3",
+                    APFS_STORE_VOLUME,
+                    "/Users/alice/.cowshed",
+                ),
+                stderr: Vec::new(),
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                ..HostCommandOutput::default()
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                stdout: b"Created new APFS Volume disk3s9\n".to_vec(),
+                stderr: Vec::new(),
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                stdout: provision_info("disk3s9", "disk3", APFS_CACHES_VOLUME, ""),
+                stderr: Vec::new(),
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                ..HostCommandOutput::default()
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                stdout: provision_info(
+                    "disk3s9",
+                    "disk3",
+                    APFS_CACHES_VOLUME,
+                    "/Users/alice/.cowshed/caches",
+                ),
+                stderr: Vec::new(),
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                ..HostCommandOutput::default()
+            }),
+        ]);
+        let volumes = [
+            ApfsVolumeProvision {
+                name: APFS_STORE_VOLUME,
+                mountpoint: PathBuf::from("/Users/alice/.cowshed"),
+                role: VolumeRole::Store,
+                kind: ApfsProvisionKind::Create,
+            },
+            ApfsVolumeProvision {
+                name: APFS_CACHES_VOLUME,
+                mountpoint: PathBuf::from("/Users/alice/.cowshed/caches"),
+                role: VolumeRole::Caches,
+                kind: ApfsProvisionKind::Create,
+            },
+        ];
+        let acquire_events = Rc::clone(&events);
+        provision_apfs_volumes_with(
+            "disk3",
+            &volumes,
+            501,
+            20,
+            move || {
+                acquire_events.borrow_mut().push(ProvisionEvent::Acquire);
+                Ok(FakePrivilegedSession {
+                    events: Rc::clone(&acquire_events),
+                    outputs,
+                })
+            },
+            &FakeProvisionIo {
+                events: Rc::clone(&events),
+            },
+        )
+        .unwrap();
+
+        let events = events.borrow();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProvisionEvent::Acquire))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProvisionEvent::Free))
+                .count(),
+            1
+        );
+        assert!(matches!(events.first(), Some(ProvisionEvent::Acquire)));
+        assert!(matches!(events.last(), Some(ProvisionEvent::Free)));
+        let commands: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProvisionEvent::Command { program, args } => Some((program.as_str(), args)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(commands.len(), 10);
+        assert!(
+            commands
+                .iter()
+                .all(|(program, _)| { *program == DISKUTIL || *program == CHOWN })
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|(program, _)| *program == CHOWN)
+                .collect::<Vec<_>>(),
+            [
+                &(
+                    CHOWN,
+                    &vec!["501:20".to_owned(), "/Users/alice/.cowshed".to_owned()]
+                ),
+                &(
+                    CHOWN,
+                    &vec![
+                        "501:20".to_owned(),
+                        "/Users/alice/.cowshed/caches".to_owned()
+                    ]
+                ),
+            ]
+        );
+        for root in [
+            Path::new("/Users/alice/.cowshed"),
+            Path::new("/Users/alice/.cowshed/caches"),
+        ] {
+            let chown = events
+                .iter()
+                .position(|event| matches!(
+                    event,
+                    ProvisionEvent::Command { program, args }
+                        if program == CHOWN && args.get(1).is_some_and(|path| Path::new(path) == root)
+                ))
+                .unwrap();
+            let owner = events
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event,
+                        ProvisionEvent::AttestOwner(path, 501, 20) if path == root
+                    )
+                })
+                .unwrap();
+            let marker = events
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event,
+                        ProvisionEvent::Marker(path, _)
+                            if path == &root.join(VOLUME_MARKER_FILE)
+                    )
+                })
+                .unwrap();
+            assert!(chown < owner && owner < marker);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn markerless_exact_mount_is_repaired_without_create_or_mount() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let outputs = VecDeque::from([
+            Ok(HostCommandOutput {
+                success: true,
+                stdout: provision_info(
+                    "disk3s9",
+                    "disk3",
+                    APFS_CACHES_VOLUME,
+                    "/Users/alice/.cowshed/caches",
+                ),
+                stderr: Vec::new(),
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                ..HostCommandOutput::default()
+            }),
+        ]);
+        let volume = ApfsVolumeProvision {
+            name: APFS_CACHES_VOLUME,
+            mountpoint: PathBuf::from("/Users/alice/.cowshed/caches"),
+            role: VolumeRole::Caches,
+            kind: ApfsProvisionKind::RepairMounted {
+                exact_identifier: "disk3s9".to_owned(),
+            },
+        };
+        let acquire_events = Rc::clone(&events);
+        provision_apfs_volumes_with(
+            "disk3",
+            &[volume],
+            502,
+            80,
+            move || {
+                acquire_events.borrow_mut().push(ProvisionEvent::Acquire);
+                Ok(FakePrivilegedSession {
+                    events: Rc::clone(&acquire_events),
+                    outputs,
+                })
+            },
+            &FakeProvisionIo {
+                events: Rc::clone(&events),
+            },
+        )
+        .unwrap();
+
+        let events = events.borrow();
+        let commands: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProvisionEvent::Command { program, args } => Some((program, args)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].0, DISKUTIL);
+        assert_eq!(commands[0].1.as_slice(), ["info", "-plist", "disk3s9"]);
+        assert_eq!(commands[1].0, CHOWN);
+        assert_eq!(
+            commands[1].1.as_slice(),
+            ["502:80", "/Users/alice/.cowshed/caches"]
+        );
+        let mounted = events
+            .iter()
+            .position(|event| matches!(event, ProvisionEvent::AttestMounted(_, identifier) if identifier == "disk3s9"))
+            .unwrap();
+        let marker = events
+            .iter()
+            .position(|event| matches!(event, ProvisionEvent::Marker(_, _)))
+            .unwrap();
+        assert!(mounted < marker);
+        assert!(matches!(events.first(), Some(ProvisionEvent::Acquire)));
+        assert!(matches!(events.last(), Some(ProvisionEvent::Free)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn detached_exact_volume_is_reattested_and_recovered_without_recreation() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let outputs = VecDeque::from([
+            Ok(HostCommandOutput {
+                success: true,
+                stdout: provision_info("disk3s9", "disk3", APFS_CACHES_VOLUME, ""),
+                stderr: Vec::new(),
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                ..HostCommandOutput::default()
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                stdout: provision_info(
+                    "disk3s9",
+                    "disk3",
+                    APFS_CACHES_VOLUME,
+                    "/Users/alice/.cowshed/caches",
+                ),
+                stderr: Vec::new(),
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                ..HostCommandOutput::default()
+            }),
+        ]);
+        let volume = ApfsVolumeProvision {
+            name: APFS_CACHES_VOLUME,
+            mountpoint: PathBuf::from("/Users/alice/.cowshed/caches"),
+            role: VolumeRole::Caches,
+            kind: ApfsProvisionKind::RecoverDetached {
+                exact_identifier: "disk3s9".to_owned(),
+            },
+        };
+        let acquire_events = Rc::clone(&events);
+        provision_apfs_volumes_with(
+            "disk3",
+            &[volume],
+            503,
+            20,
+            move || {
+                acquire_events.borrow_mut().push(ProvisionEvent::Acquire);
+                Ok(FakePrivilegedSession {
+                    events: Rc::clone(&acquire_events),
+                    outputs,
+                })
+            },
+            &FakeProvisionIo {
+                events: Rc::clone(&events),
+            },
+        )
+        .unwrap();
+
+        let events = events.borrow();
+        let commands: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProvisionEvent::Command { program, args } => Some((program, args)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(commands.len(), 4);
+        assert_eq!(commands[0].0, DISKUTIL);
+        assert_eq!(commands[0].1.as_slice(), ["info", "-plist", "disk3s9"]);
+        assert_eq!(commands[1].0, DISKUTIL);
+        assert_eq!(
+            commands[1].1.as_slice(),
+            [
+                "mount",
+                "-nobrowse",
+                "-mountPoint",
+                "/Users/alice/.cowshed/caches",
+                "disk3s9",
+            ]
+        );
+        assert_eq!(commands[2].0, DISKUTIL);
+        assert_eq!(commands[2].1.as_slice(), ["info", "-plist", "disk3s9"]);
+        assert_eq!(commands[3].0, CHOWN);
+        assert_eq!(
+            commands[3].1.as_slice(),
+            ["503:20", "/Users/alice/.cowshed/caches"]
+        );
+        assert!(
+            !commands.iter().any(|(_, args)| {
+                args.starts_with(&["apfs".to_owned(), "addVolume".to_owned()])
+            })
+        );
+        let mount = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ProvisionEvent::Command { args, .. }
+                        if args.first().is_some_and(|arg| arg == "mount")
+                )
+            })
+            .unwrap();
+        let attested = events
+            .iter()
+            .position(|event| matches!(event, ProvisionEvent::AttestMounted(_, _)))
+            .unwrap();
+        let marker = events
+            .iter()
+            .position(|event| matches!(event, ProvisionEvent::Marker(_, _)))
+            .unwrap();
+        assert!(mount < attested && attested < marker);
+        assert!(matches!(events.first(), Some(ProvisionEvent::Acquire)));
+        assert!(matches!(events.last(), Some(ProvisionEvent::Free)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn authorization_denial_and_child_failure_propagate_without_marker_publication() {
+        let volume = ApfsVolumeProvision {
+            name: APFS_CACHES_VOLUME,
+            mountpoint: PathBuf::from("/Users/alice/.cowshed/caches"),
+            role: VolumeRole::Caches,
+            kind: ApfsProvisionKind::Create,
+        };
+        let denied_events = Rc::new(RefCell::new(Vec::new()));
+        let acquire_events = Rc::clone(&denied_events);
+        let denied = provision_apfs_volumes_with(
+            "disk3",
+            std::slice::from_ref(&volume),
+            501,
+            20,
+            move || {
+                acquire_events.borrow_mut().push(ProvisionEvent::Acquire);
+                Err::<FakePrivilegedSession, _>(HostError::new(
+                    "Authorization Services status -60005",
+                ))
+            },
+            &FakeProvisionIo {
+                events: Rc::clone(&denied_events),
+            },
+        )
+        .unwrap_err();
+        assert!(denied.to_string().contains("-60005"));
+        assert_eq!(*denied_events.borrow(), [ProvisionEvent::Acquire]);
+
+        let failed_events = Rc::new(RefCell::new(Vec::new()));
+        let acquire_events = Rc::clone(&failed_events);
+        let failed = provision_apfs_volumes_with(
+            "disk3",
+            &[volume],
+            501,
+            20,
+            move || {
+                acquire_events.borrow_mut().push(ProvisionEvent::Acquire);
+                Ok(FakePrivilegedSession {
+                    events: Rc::clone(&acquire_events),
+                    outputs: VecDeque::from([Ok(HostCommandOutput {
+                        success: false,
+                        stdout: Vec::new(),
+                        stderr: b"child failed\n".to_vec(),
+                    })]),
+                })
+            },
+            &FakeProvisionIo {
+                events: Rc::clone(&failed_events),
+            },
+        )
+        .unwrap_err();
+        assert!(failed.to_string().contains("child failed"));
+        let events = failed_events.borrow();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProvisionEvent::Free))
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProvisionEvent::Marker(_, _)))
         );
     }
 

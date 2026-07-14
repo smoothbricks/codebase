@@ -68,6 +68,15 @@ impl BootstrapHost for ValidationHost {
         Ok(HostCommandOutput::default())
     }
 
+    fn provision_apfs_volumes(
+        &self,
+        _container: &str,
+        _volumes: &[ApfsVolumeProvision],
+    ) -> Result<(), HostError> {
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
     fn write_file_atomic(&self, _path: &Path, _contents: &[u8]) -> Result<(), HostError> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -76,11 +85,11 @@ impl BootstrapHost for ValidationHost {
 
 enum CommandBehavior {
     CreatedIdentifiers { info_container: &'static str },
-    Fixed(HostCommandOutput),
 }
 
 struct RecordingHost {
     commands: Sender<HostCommand>,
+    provisions: Sender<(String, Vec<ApfsVolumeProvision>)>,
     behavior: CommandBehavior,
     creations: AtomicUsize,
 }
@@ -134,8 +143,18 @@ impl BootstrapHost for RecordingHost {
                 success: true,
                 ..HostCommandOutput::default()
             }),
-            CommandBehavior::Fixed(output) => Ok(output.clone()),
         }
+    }
+
+    fn provision_apfs_volumes(
+        &self,
+        container: &str,
+        volumes: &[ApfsVolumeProvision],
+    ) -> Result<(), HostError> {
+        self.provisions
+            .send((container.to_owned(), volumes.to_vec()))
+            .unwrap();
+        Ok(())
     }
 
     fn write_file_atomic(&self, _path: &Path, _contents: &[u8]) -> Result<(), HostError> {
@@ -183,10 +202,24 @@ fn mounted_apfs_plan() -> BootstrapPlan {
     .unwrap()
 }
 
-fn command_argv(command: &HostCommand) -> Vec<String> {
-    std::iter::once(command.program().to_owned())
-        .chain(command.args().iter().cloned())
-        .collect()
+fn interrupted_caches_plan() -> BootstrapPlan {
+    let selected = select_substrate(
+        StatFsEvidence::Apfs {
+            mount_source: "/dev/disk3s5".into(),
+            container: Some("disk3".to_owned()),
+        },
+        None,
+    )
+    .unwrap();
+    plan_bootstrap(
+        selected,
+        Path::new("/Users/alice"),
+        BootstrapEvidence::Apfs {
+            store: ExistingStorage::mounted_valid("disk3s8"),
+            caches: ExistingStorage::mounted_incomplete("disk3s9"),
+        },
+    )
+    .unwrap()
 }
 
 fn info_plist(identifier: &str, container: &str, name: &str) -> Vec<u8> {
@@ -204,10 +237,12 @@ fn info_plist(identifier: &str, container: &str, name: &str) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn created_volume_identifiers_flow_to_exact_store_then_caches_mounts() {
-    let (sender, receiver) = mpsc::channel();
+async fn absent_volumes_collapse_into_one_explicit_provisioning_batch() {
+    let (command_sender, command_receiver) = mpsc::channel();
+    let (provision_sender, provision_receiver) = mpsc::channel();
     let host = Arc::new(RecordingHost {
-        commands: sender,
+        commands: command_sender,
+        provisions: provision_sender,
         behavior: CommandBehavior::CreatedIdentifiers {
             info_container: "disk3",
         },
@@ -223,52 +258,23 @@ async fn created_volume_identifiers_flow_to_exact_store_then_caches_mounts() {
     .await
     .unwrap();
 
-    let commands: Vec<_> = receiver
-        .try_iter()
-        .map(|command| command_argv(&command))
-        .collect();
+    assert_eq!(command_receiver.try_iter().count(), 0);
+    let batches: Vec<_> = provision_receiver.try_iter().collect();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].0, "disk3");
+    assert_eq!(batches[0].1.len(), 2);
+    assert_eq!(batches[0].1[0].name(), "cowshed.store");
     assert_eq!(
-        commands,
-        [
-            vec![
-                "/usr/sbin/diskutil",
-                "apfs",
-                "addVolume",
-                "disk3",
-                "APFS",
-                "cowshed.store",
-                "-nomount",
-            ],
-            vec!["/usr/sbin/diskutil", "info", "-plist", "disk3s8"],
-            vec![
-                "/usr/sbin/diskutil",
-                "mount",
-                "-nobrowse",
-                "-mountPoint",
-                "/Users/alice/.cowshed",
-                "disk3s8",
-            ],
-            vec![
-                "/usr/sbin/diskutil",
-                "apfs",
-                "addVolume",
-                "disk3",
-                "APFS",
-                "cowshed.caches",
-                "-nomount",
-            ],
-            vec!["/usr/sbin/diskutil", "info", "-plist", "disk3s9"],
-            vec![
-                "/usr/sbin/diskutil",
-                "mount",
-                "-nobrowse",
-                "-mountPoint",
-                "/Users/alice/.cowshed/caches",
-                "disk3s9",
-            ],
-        ]
-        .map(|argv| argv.into_iter().map(str::to_owned).collect::<Vec<_>>())
+        batches[0].1[0].mountpoint(),
+        Path::new("/Users/alice/.cowshed")
     );
+    assert!(matches!(batches[0].1[0].kind(), ApfsProvisionKind::Create));
+    assert_eq!(batches[0].1[1].name(), "cowshed.caches");
+    assert_eq!(
+        batches[0].1[1].mountpoint(),
+        Path::new("/Users/alice/.cowshed/caches")
+    );
+    assert!(matches!(batches[0].1[1].kind(), ApfsProvisionKind::Create));
 }
 
 #[tokio::test]
@@ -287,25 +293,9 @@ async fn existing_only_missing_volumes_rejects_before_dispatch_with_adopt_hint()
     match error {
         NativeBootstrapError::StorageSetupRequired { actions, hint } => {
             assert_eq!(hint, "next: cowshed adopt");
-            assert!(
-                actions
-                    .iter()
-                    .any(|action| action.contains("cowshed.store"))
-            );
-            assert!(
-                actions
-                    .iter()
-                    .any(|action| action.contains("cowshed.caches"))
-            );
-            assert!(
-                actions
-                    .iter()
-                    .any(|action| action == "mount APFS volume at /Users/alice/.cowshed")
-            );
-            assert!(
-                actions.iter().any(|action| {
-                    action == "mount APFS volume at /Users/alice/.cowshed/caches"
-                })
+            assert_eq!(
+                actions,
+                ["provision APFS volumes cowshed.store, cowshed.caches"]
             );
         }
         error => panic!("unexpected error: {error}"),
@@ -313,6 +303,125 @@ async fn existing_only_missing_volumes_rejects_before_dispatch_with_adopt_hint()
     assert_eq!(lane.dispatches.load(Ordering::SeqCst), 0);
     assert_eq!(host.mutations.load(Ordering::SeqCst), 0);
     assert_eq!(host.inspections.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn markerless_exact_mount_recovery_is_provision_only() {
+    let plan = interrupted_caches_plan();
+    assert!(matches!(
+        plan.operations(),
+        [
+            HostOperation::GuardMountpoint {
+                role: VolumeRole::Store,
+                ..
+            },
+            HostOperation::ProvisionApfsVolumes { container, volumes }
+        ] if container == "disk3"
+            && matches!(
+                volumes.as_slice(),
+                [volume]
+                    if volume.name() == APFS_CACHES_VOLUME
+                        && matches!(
+                            volume.kind(),
+                            ApfsProvisionKind::RepairMounted { exact_identifier }
+                                if exact_identifier == "disk3s9"
+                        )
+            )
+    ));
+
+    let existing_host = Arc::new(ValidationHost::default());
+    let existing_lane = CountingLane::default();
+    assert!(matches!(
+        execute_native_bootstrap_plan(
+            &plan,
+            NativeBootstrapMode::ExistingOnly,
+            Arc::clone(&existing_host),
+            &existing_lane,
+        )
+        .await,
+        Err(NativeBootstrapError::StorageSetupRequired { .. })
+    ));
+    assert_eq!(existing_lane.dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(existing_host.mutations.load(Ordering::SeqCst), 0);
+    assert_eq!(existing_host.inspections.load(Ordering::SeqCst), 0);
+
+    let provision_host = Arc::new(ValidationHost::default());
+    let provision_lane = CountingLane::default();
+    execute_native_bootstrap_plan(
+        &plan,
+        NativeBootstrapMode::Provision,
+        Arc::clone(&provision_host),
+        &provision_lane,
+    )
+    .await
+    .unwrap();
+    assert_eq!(provision_lane.dispatches.load(Ordering::SeqCst), 2);
+    assert_eq!(provision_host.inspections.load(Ordering::SeqCst), 1);
+    assert_eq!(provision_host.mutations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn detached_exact_volume_requires_explicit_provisioning_without_prompt() {
+    let selected = select_substrate(
+        StatFsEvidence::Apfs {
+            mount_source: "/dev/disk3s5".into(),
+            container: Some("disk3".to_owned()),
+        },
+        None,
+    )
+    .unwrap();
+    let plan = plan_bootstrap(
+        selected,
+        Path::new("/Users/alice"),
+        BootstrapEvidence::Apfs {
+            store: ExistingStorage::mounted_valid("disk3s8"),
+            caches: ExistingStorage::detached_incomplete("disk3s9"),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        plan.operations(),
+        [
+            HostOperation::GuardMountpoint {
+                role: VolumeRole::Store,
+                ..
+            },
+            HostOperation::GuardMountpoint {
+                role: VolumeRole::Caches,
+                ..
+            },
+            HostOperation::ProvisionApfsVolumes { volumes, .. }
+        ] if matches!(
+            volumes.as_slice(),
+            [volume]
+                if matches!(
+                    volume.kind(),
+                    ApfsProvisionKind::RecoverDetached { exact_identifier }
+                        if exact_identifier == "disk3s9"
+                )
+        )
+    ));
+
+    let host = Arc::new(ValidationHost::default());
+    let lane = CountingLane::default();
+    let error = execute_native_bootstrap_plan(
+        &plan,
+        NativeBootstrapMode::ExistingOnly,
+        Arc::clone(&host),
+        &lane,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        NativeBootstrapError::StorageSetupRequired {
+            hint: "next: cowshed adopt",
+            ..
+        }
+    ));
+    assert_eq!(lane.dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(host.inspections.load(Ordering::SeqCst), 0);
+    assert_eq!(host.mutations.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -331,91 +440,4 @@ async fn already_correct_volumes_validate_in_both_modes_without_mutation() {
         assert_eq!(host.inspections.load(Ordering::SeqCst), 2);
         assert_eq!(host.mutations.load(Ordering::SeqCst), 0);
     }
-}
-
-#[tokio::test]
-async fn malformed_created_identifier_output_fails_before_any_mount() {
-    for stdout in [
-        b"Finished APFS operation\n".to_vec(),
-        b"Created new APFS Volume disk3s8\nCreated new APFS Volume disk3s9\n".to_vec(),
-        b"Created new APFS Volume disk3sx\n".to_vec(),
-    ] {
-        let (sender, receiver) = mpsc::channel();
-        let host = Arc::new(RecordingHost {
-            commands: sender,
-            behavior: CommandBehavior::Fixed(HostCommandOutput {
-                success: true,
-                stdout,
-                stderr: Vec::new(),
-            }),
-            creations: AtomicUsize::new(0),
-        });
-
-        let error = execute_bootstrap(&absent_apfs_plan(), host, &InlineLane)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            BootstrapExecutionError::CreatedVolumeOutput(_)
-        ));
-        let commands: Vec<_> = receiver.try_iter().collect();
-        assert_eq!(commands.len(), 1);
-        assert!(
-            commands[0]
-                .args()
-                .starts_with(&["apfs".to_owned(), "addVolume".to_owned()])
-        );
-    }
-}
-
-#[tokio::test]
-async fn wrong_container_info_attestation_fails_before_mount() {
-    let (sender, receiver) = mpsc::channel();
-    let host = Arc::new(RecordingHost {
-        commands: sender,
-        behavior: CommandBehavior::CreatedIdentifiers {
-            info_container: "disk4",
-        },
-        creations: AtomicUsize::new(0),
-    });
-
-    let error = execute_bootstrap(&absent_apfs_plan(), host, &InlineLane)
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        BootstrapExecutionError::CreatedVolumeAttestation(_)
-    ));
-    let commands: Vec<_> = receiver.try_iter().collect();
-    assert_eq!(commands.len(), 2);
-    assert_eq!(commands[1].args(), ["info", "-plist", "disk3s8"]);
-    assert!(
-        commands
-            .iter()
-            .all(|command| !command.args().iter().any(|arg| arg == "mount"))
-    );
-}
-
-#[tokio::test]
-async fn command_failure_preserves_stderr_and_never_attempts_a_mount() {
-    let (sender, receiver) = mpsc::channel();
-    let host = Arc::new(RecordingHost {
-        commands: sender,
-        behavior: CommandBehavior::Fixed(HostCommandOutput {
-            success: false,
-            stdout: Vec::new(),
-            stderr: b"diskutil: exact failure; $(not a shell)\n".to_vec(),
-        }),
-        creations: AtomicUsize::new(0),
-    });
-
-    let error = execute_bootstrap(&absent_apfs_plan(), host, &InlineLane)
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        BootstrapExecutionError::CommandFailed { stderr, .. }
-            if stderr == "diskutil: exact failure; $(not a shell)\n"
-    ));
-    assert_eq!(receiver.try_iter().count(), 1);
 }
