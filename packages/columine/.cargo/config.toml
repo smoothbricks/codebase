@@ -1,0 +1,6 @@
+# Memory import/export policy is PER ARTIFACT, set in each cdylib crate's build.rs:
+# build.zig exports memory from reducer_vm.wasm (vm_wasm.export_memory = true) but
+# imports it for the shared/pooled and freelist variants. A target-wide rustflag
+# here cannot express that split, and wasm-ld has no flag to undo --import-memory.
+[alias]
+t = "test --workspace"

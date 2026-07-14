@@ -72,3 +72,6 @@ test-output
 # TypeScript build info
 *.tsbuildinfo
 dist-test/
+
+# Rust build output (packages/columine, lmao-rs)
+target/

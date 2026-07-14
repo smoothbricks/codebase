@@ -1,0 +1,53 @@
+# columine task runner. Install: cargo install just cargo-mutants
+# (cd packages/columine first, or `just -f packages/columine/justfile <task>`)
+
+# Fast tier: unit + property tests at default case counts.
+test:
+    cargo test --workspace
+
+# Heavy property tier: elevated proptest cases.
+proptest-heavy cases="10000":
+    PROPTEST_CASES={{cases}} cargo test --workspace --release
+
+# Mutation tier (see mutants.toml for the arid/exclusion policy).
+mutants:
+    cargo mutants --workspace
+
+check:
+    cargo check --workspace --all-targets
+    cargo clippy --workspace --all-targets -- -D warnings
+
+# columine.wasm — the standalone VM artifact (Parse/Reduce/Compact/Undo, no
+# RETE). Nightly immediate-abort strips the fmt/panic machinery stable
+# cannot remove (same recipe as the AxE artifacts; needs the devenv
+# cargo-nightly shim). Deploys to dist/columine.wasm.
+wasm:
+    RUSTFLAGS="-Zunstable-options -Cpanic=immediate-abort" \
+    cargo-nightly build -p columine-wasm --target wasm32-unknown-unknown --profile wasm-release \
+        -Zbuild-std=std,panic_abort
+    cargo test -p columine-wasm --test export_checklist -- --include-ignored
+    @if command -v wasm-opt >/dev/null; then \
+        wasm-opt -Oz --converge --strip-producers --strip-target-features --zero-filled-memory \
+            target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm \
+            -o target/wasm32-unknown-unknown/wasm-release/columine_wasm.opt.wasm; \
+    fi
+    @mkdir -p dist
+    @cp target/wasm32-unknown-unknown/wasm-release/columine_wasm.opt.wasm dist/columine.wasm
+    @ls -la dist/columine.wasm
+
+# event_processor.wasm — the columine EP artifact (EpWiring::columine():
+# base path, no dedup, msgpack growth both formats, no per-field
+# diagnostics; five exports, caller-provided buffers).
+wasm-ep:
+    RUSTFLAGS="-Zunstable-options -Cpanic=immediate-abort" \
+    cargo-nightly build -p columine-ep-wasm --target wasm32-unknown-unknown --profile wasm-release \
+        -Zbuild-std=std,panic_abort
+    cargo test -p columine-ep-wasm --test export_checklist -- --include-ignored
+    @if command -v wasm-opt >/dev/null; then \
+        wasm-opt -Oz --converge --strip-producers --strip-target-features --zero-filled-memory \
+            target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm \
+            -o target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.opt.wasm; \
+    fi
+    @mkdir -p dist
+    @cp target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.opt.wasm dist/event_processor.wasm
+    @ls -la dist/event_processor.wasm
