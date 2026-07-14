@@ -343,12 +343,16 @@ The full born-from-host-return-to-host close-out, as one primitive. The target d
 2. Stop the supervisor: TERM → grace → KILL across the whole descendant tree (11_shell.md). Teardown precedes retirement
    — live children would otherwise hold the mount busy and keep enforcing stale launch-time authority after the grants
    disappear.
-3. Logically retire: preserve the image extension while renaming it to `sessions/.trash/<ws>.<ts>.asif` for ASIF or
-   `sessions/.trash/<ws>.<ts>.sparseimage` for SPARSE, and remove the grant file and the controller-side CA private key
-   — the workspace disappears from enumeration; the command returns here (typically well under a second; a stubborn
-   process tree delays it by at most the kill grace).
+3. Logically retire: preserve the image extension while atomically renaming the image and its detached grants/CA
+   companions to `sessions/.trash/<ws>-<incarnation>.asif` for ASIF or `sessions/.trash/<ws>-<incarnation>.sparseimage`
+   for SPARSE. The canonical image disappears from enumeration and the command returns here (typically well under a
+   second; a stubborn process tree delays it by at most the kill grace). Valid checkpoint facts left behind during this
+   asynchronous phase neither republish the workspace nor authorize deletion by themselves; malformed, foreign, and
+   duplicate facts remain integrity errors.
 4. Background (spawned detached): detach the mount (escalating to `-force` after a 10 s grace), unlink the trashed image
-   and any checkpoints, remove the mountpoint dir. Interrupted cleanup is resumed by `cowshed gc` (idempotent).
+   and companions, every checkpoint (including pinned checkpoints), every pre-restore undo image and companion/fact,
+   then the empty checkpoint and mountpoint directories. Interrupted cleanup is resumed idempotently by `cowshed gc`
+   only from exact, revalidated retirement trash metadata; a missing canonical image alone is never cleanup authority.
 
 `cowshed rm main --restore` is the adoption rollback described above and maps to `RemoveOptions.restore`; plain
 `cowshed rm main` requires `--force` and a clean `git status` (exit 4 otherwise).

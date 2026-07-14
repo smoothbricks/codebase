@@ -301,6 +301,12 @@ _conventions_, enforced by `cowshed gc`, never by a background daemon deleting w
   plan's observation time, and rejects a pin/incarnation/path/byte/concurrency change as stale before any mutation. Only
   an unchanged plan drains trash/orphan staging objects, prunes expired checkpoints, and compacts detached sparse
   images; execution reports actual freed bytes.
+- Explicit workspace retirement is the sole exception to live checkpoint retention: its exact trash metadata authorizes
+  one workspace-scoped cleanup plan that includes pinned checkpoints and pre-restore undo generations as well as the
+  trash image and empty mountpoint. Preview and execution validate the repository, workspace, incarnation, format,
+  checkpoint facts, and every associated artifact under the workspace lock; any change makes the plan stale before
+  mutation. Cleanup deletes the retirement trash metadata last so an interrupted pass retains authority for the next
+  idempotent GC pass. A missing canonical image or orphan checkpoint fact alone never authorizes deletion.
 - `cowshed du` reports **written vs referenced** bytes per workspace and per checkpoint (the number that matters for CoW
   substrates — referenced is shared with the base, written is the true cost). `--json` for fleet dashboards. This is how
   a coordinator decides which long-lived workspaces to `cowshed rebase --fresh` (02_workspaces.md) to shed accumulated

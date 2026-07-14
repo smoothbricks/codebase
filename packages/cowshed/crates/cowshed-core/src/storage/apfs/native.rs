@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, OsString};
 use std::fs::{self, File};
 use std::io;
@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 
 use super::super::lifecycle::{
     CheckpointFact, ExpectedState, KernelMountFact, LifecycleWorkspace, ObservedState,
-    OperationIdentity, Pin, Revision, StorageFact, StorageGcCandidate, StorageGcPlan,
+    OperationIdentity, Pin, RetiredRef, Revision, StorageFact, StorageGcCandidate, StorageGcPlan,
     StorageGcReason, StorageGcReport, SubstrateStats,
 };
 use super::super::{
@@ -402,6 +402,7 @@ fn image_gc_paths(image: &Path) -> Vec<PathBuf> {
         sidecar_path(image),
         companion_path(image),
         checkpoint_fact_path(image),
+        restore_recovery_fact_path(image),
     ]
 }
 
@@ -686,6 +687,17 @@ fn image_from_sidecar(sidecar: &Path) -> Result<PathBuf, ApfsStorageError> {
 struct MountedAttachment {
     mount_id: u64,
     attachment: AttachedImage,
+}
+
+struct RetiredCheckpointArtifacts {
+    images: Vec<(PathBuf, ImageFormat)>,
+    paths: Vec<PathBuf>,
+}
+
+struct RetiredCleanupArtifacts {
+    checkpoint_images: Vec<(PathBuf, ImageFormat)>,
+    paths: Vec<PathBuf>,
+    mount_point: PathBuf,
 }
 
 type MountKey = (RepoId, WorkspaceName);
@@ -1383,6 +1395,310 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         PathBuf::from(lock)
     }
 
+    fn retired_authority(
+        &self,
+        project: &Path,
+        repo: &RepoId,
+        trash_image: &Path,
+        format: ImageFormat,
+    ) -> Result<RetiredRef, ApfsStorageError> {
+        let metadata = DetachedWorkspaceMetadata::read_for_image(trash_image)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        if metadata.repo_id != *repo
+            || metadata.image_format != format
+            || metadata.publication_state != PublicationState::Active
+            || metadata.workspace.is_main()
+        {
+            return Err(ApfsStorageError::MarkerMismatch(format!(
+                "retired metadata disagrees with trash image {}",
+                trash_image.display()
+            )));
+        }
+        let workspace = metadata_workspace_ref(&metadata)?;
+        let expected_trash = project
+            .join("sessions")
+            .join(super::TRASH_NAMESPACE)
+            .join(format!(
+                "{}-{}.{}",
+                workspace.name().as_str(),
+                workspace.incarnation().as_str(),
+                format.extension()
+            ));
+        if trash_image != expected_trash {
+            return Err(ApfsStorageError::MarkerMismatch(format!(
+                "retired metadata disagrees with trash path {}",
+                trash_image.display()
+            )));
+        }
+        let canonical = project.join("sessions").join(format!(
+            "{}.{}",
+            workspace.name().as_str(),
+            format.extension()
+        ));
+        if canonical
+            .try_exists()
+            .map_err(|error| io_error("inspect retired canonical image", &canonical, error))?
+            || sidecar_path(&canonical).try_exists().map_err(|error| {
+                io_error(
+                    "inspect retired canonical metadata",
+                    &sidecar_path(&canonical),
+                    error,
+                )
+            })?
+        {
+            return Err(ApfsStorageError::MarkerMismatch(format!(
+                "retired trash conflicts with canonical workspace {}",
+                workspace.name()
+            )));
+        }
+        Ok(RetiredRef::new(
+            workspace.clone(),
+            Revision::new(workspace.revision().get().saturating_add(1)),
+        ))
+    }
+
+    fn retired_checkpoint_artifacts(
+        &self,
+        project: &Path,
+        retired: &RetiredRef,
+    ) -> Result<RetiredCheckpointArtifacts, ApfsStorageError> {
+        let directory = project
+            .join("checkpoints")
+            .join(retired.workspace().name().as_str());
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries
+                .map(|entry| {
+                    entry.map(|entry| entry.path()).map_err(|error| {
+                        io_error("read retired checkpoint entry", &directory, error)
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(RetiredCheckpointArtifacts {
+                    images: Vec::new(),
+                    paths: Vec::new(),
+                });
+            }
+            Err(error) => {
+                return Err(io_error("enumerate retired checkpoints", &directory, error));
+            }
+        };
+        let mut images = BTreeMap::new();
+        for path in &entries {
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|error| io_error("inspect retired checkpoint artifact", path, error))?;
+            if !metadata.file_type().is_file() {
+                return Err(ApfsStorageError::Host(format!(
+                    "retired checkpoint artifact is not a regular file: {}",
+                    path.display()
+                )));
+            }
+            if let Ok(format) = ImageFormat::from_image_path(path) {
+                images.insert(path.clone(), format);
+                continue;
+            }
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".grants.json"))
+            {
+                let image = image_from_sidecar(path)?;
+                if let Ok(format) = ImageFormat::from_image_path(&image) {
+                    images.entry(image).or_insert(format);
+                }
+            }
+        }
+        let images = images.into_iter().collect::<Vec<_>>();
+
+        let mut expected = BTreeSet::new();
+        let mut labels = BTreeSet::new();
+        for (image, format) in &images {
+            let metadata = DetachedWorkspaceMetadata::read_for_image(image)
+                .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+            if metadata.repo_id != *retired.workspace().repo()
+                || metadata.workspace != *retired.workspace().name()
+                || metadata.image_format != *format
+                || metadata.publication_state != PublicationState::Active
+            {
+                return Err(ApfsStorageError::MarkerMismatch(format!(
+                    "retired checkpoint metadata disagrees with {}",
+                    image.display()
+                )));
+            }
+            let stem = image
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or_else(|| {
+                    ApfsStorageError::Host(format!(
+                        "invalid retired checkpoint image name: {}",
+                        image.display()
+                    ))
+                })?;
+            if let Some(destination) = stem.strip_prefix(super::PRE_RESTORE_PREFIX) {
+                WorkspaceIncarnation::new(destination)
+                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+            } else {
+                let label = CheckpointLabel::new(stem)
+                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+                if !labels.insert(label.clone()) {
+                    return Err(ApfsStorageError::Host(format!(
+                        "duplicate retired checkpoint label {label}"
+                    )));
+                }
+                let fact_path = checkpoint_fact_path(image);
+                match crate::metadata::read_json::<CheckpointFactWire>(&fact_path) {
+                    Ok(fact)
+                        if fact.version == CHECKPOINT_FACT_VERSION
+                            && fact.repo_id == *retired.workspace().repo()
+                            && fact.workspace == *retired.workspace().name()
+                            && fact.label == label
+                            && matches!(fact.pin.as_str(), "pinned" | "automatic") => {}
+                    Ok(_) => {
+                        return Err(ApfsStorageError::Host(format!(
+                            "checkpoint fact does not match retired image path: {}",
+                            fact_path.display()
+                        )));
+                    }
+                    Err(_) if !image.exists() && !fact_path.exists() => {}
+                    Err(error) => return Err(ApfsStorageError::Host(error.to_string())),
+                }
+            }
+            expected.extend(image_gc_paths(image));
+        }
+        if let Some(unrecognized) = entries.iter().find(|path| !expected.contains(*path)) {
+            return Err(ApfsStorageError::Host(format!(
+                "unrecognized retired checkpoint artifact: {}",
+                unrecognized.display()
+            )));
+        }
+        let mut artifacts = expected.into_iter().collect::<Vec<_>>();
+        artifacts.sort();
+        Ok(RetiredCheckpointArtifacts {
+            images,
+            paths: artifacts,
+        })
+    }
+
+    fn retired_cleanup_artifacts(
+        &self,
+        project: &Path,
+        retired: &RetiredRef,
+        trash_image: &Path,
+    ) -> Result<RetiredCleanupArtifacts, ApfsStorageError> {
+        let RetiredCheckpointArtifacts {
+            images,
+            paths: mut artifacts,
+        } = self.retired_checkpoint_artifacts(project, retired)?;
+        artifacts.extend(image_gc_paths(trash_image));
+        artifacts.sort();
+        artifacts.dedup();
+        let mount_point = layout(&self.config, retired.workspace().repo())?
+            .project()
+            .mount_root
+            .join(retired.workspace().name().as_str());
+        match fs::symlink_metadata(&mount_point) {
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                if fs::read_dir(&mount_point)
+                    .map_err(|error| io_error("enumerate retired mountpoint", &mount_point, error))?
+                    .next()
+                    .is_some()
+                {
+                    return Err(ApfsStorageError::Host(format!(
+                        "retired mountpoint is not empty: {}",
+                        mount_point.display()
+                    )));
+                }
+            }
+            Ok(_) => {
+                return Err(ApfsStorageError::Host(format!(
+                    "retired mountpoint is not a directory: {}",
+                    mount_point.display()
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("inspect retired mountpoint", &mount_point, error)),
+        }
+        Ok(RetiredCleanupArtifacts {
+            checkpoint_images: images,
+            paths: artifacts,
+            mount_point,
+        })
+    }
+
+    fn reclaim_retired_authority(
+        &self,
+        project: &Path,
+        repo: &RepoId,
+        trash_image: &Path,
+        format: ImageFormat,
+        expected: Option<&RetiredRef>,
+    ) -> Result<(), ApfsStorageError>
+    where
+        R: CommandRunner + Send + Sync + 'static,
+    {
+        let authority = self.retired_authority(project, repo, trash_image, format)?;
+        if expected.is_some_and(|expected| expected.workspace() != authority.workspace()) {
+            return Err(ApfsStorageError::MarkerMismatch(format!(
+                "retired cleanup authority changed for {}",
+                trash_image.display()
+            )));
+        }
+        let cleanup = self.retired_cleanup_artifacts(project, &authority, trash_image)?;
+        for (image, image_format) in cleanup.checkpoint_images {
+            self.reclaim_image(&image, image_format)?;
+        }
+        let checkpoint_directory = project
+            .join("checkpoints")
+            .join(authority.workspace().name().as_str());
+        match fs::remove_dir(&checkpoint_directory) {
+            Ok(()) => sync_parent_path(&checkpoint_directory)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(io_error(
+                    "remove retired checkpoint directory",
+                    &checkpoint_directory,
+                    error,
+                ));
+            }
+        }
+        match fs::remove_dir(&cleanup.mount_point) {
+            Ok(()) => sync_parent_path(&cleanup.mount_point)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(io_error(
+                    "remove retired mountpoint",
+                    &cleanup.mount_point,
+                    error,
+                ));
+            }
+        }
+        self.reclaim_image(trash_image, format)
+    }
+
+    fn retired_trash_images(
+        &self,
+        trash: &Path,
+    ) -> Result<Vec<(PathBuf, ImageFormat)>, ApfsStorageError> {
+        let mut images = BTreeMap::new();
+        for path in regular_file_children(trash)? {
+            if let Ok(format) = ImageFormat::from_image_path(&path) {
+                images.insert(path, format);
+                continue;
+            }
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".grants.json"))
+            {
+                let image = image_from_sidecar(&path)?;
+                if let Ok(format) = ImageFormat::from_image_path(&image) {
+                    images.entry(image).or_insert(format);
+                }
+            }
+        }
+        Ok(images.into_iter().collect())
+    }
+
     fn preview_gc_project(
         &self,
         project: &Path,
@@ -1411,18 +1727,31 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let mut retained_recent = 0_usize;
 
         let trash = sessions.join(super::TRASH_NAMESPACE);
-        for path in regular_file_children(&trash)? {
-            let Ok(format) = ImageFormat::from_image_path(&path) else {
-                continue;
-            };
+        let mut retired_workspaces = BTreeSet::new();
+        for (path, format) in self.retired_trash_images(&trash)? {
+            let retired = self.retired_authority(project, repo, &path, format)?;
+            if !retired_workspaces.insert(retired.workspace().name().clone()) {
+                return Err(ApfsStorageError::Host(format!(
+                    "duplicate retired cleanup authority for {}",
+                    retired.workspace().name()
+                )));
+            }
+            let artifacts = self
+                .retired_cleanup_artifacts(project, &retired, &path)?
+                .paths;
             examined = examined
                 .checked_add(1)
                 .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
-            lock_paths.push(Self::transient_lock_path(project, &path, format)?);
+            lock_paths.push(super::workspace_lock_path(
+                &self.config,
+                repo,
+                retired.workspace().name(),
+                format,
+            )?);
             candidates.push(gc_candidate(
                 StorageGcReason::RetiredWorkspace,
                 &path,
-                &image_gc_paths(&path),
+                &artifacts,
                 Some(format),
                 &[],
             )?);
@@ -1498,6 +1827,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     WorkspaceName::new(name)
                         .map_err(|error| ApfsStorageError::Host(error.to_string()))
                 })?;
+            if retired_workspaces.contains(&workspace_name) {
+                continue;
+            }
             let mut checkpoints = Vec::new();
             for image in regular_file_children(&workspace_directory)? {
                 let Ok(format) = ImageFormat::from_image_path(&image) else {
@@ -1650,9 +1982,22 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         };
         for candidate in plan.candidates() {
             match candidate.reason() {
-                StorageGcReason::RetiredWorkspace
-                | StorageGcReason::OrphanStagingImage
-                | StorageGcReason::ExpiredCheckpoint => {
+                StorageGcReason::RetiredWorkspace => {
+                    let format = candidate.format().ok_or(ApfsStorageError::InvalidPlan(
+                        "retired workspace GC candidate has no format",
+                    ))?;
+                    self.reclaim_retired_authority(
+                        project,
+                        plan.repo(),
+                        candidate.path(),
+                        format,
+                        None,
+                    )?;
+                    report.freed_bytes = report.freed_bytes.checked_add(candidate.bytes()).ok_or(
+                        ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
+                    )?;
+                }
+                StorageGcReason::OrphanStagingImage | StorageGcReason::ExpiredCheckpoint => {
                     let format = candidate.format().ok_or(ApfsStorageError::InvalidPlan(
                         "image GC candidate has no format",
                     ))?;
@@ -2768,20 +3113,77 @@ where
 
     fn reclaim_image(&self, image: &Path, format: ImageFormat) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(image)?;
-        self.backend.delete_image(image, format)?;
-        let companion = companion_path(image);
-        match fs::remove_file(&companion) {
-            Ok(()) => {}
+        match fs::symlink_metadata(image) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                self.backend.delete_image(image, format)?;
+            }
+            Ok(_) => {
+                return Err(ApfsStorageError::Host(format!(
+                    "reclaim image is not a regular file: {}",
+                    image.display()
+                )));
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io_error("remove CA key", &companion, error)),
+            Err(error) => return Err(io_error("inspect reclaim image", image, error)),
+        }
+        for (artifact, operation) in [
+            (companion_path(image), "remove CA key"),
+            (checkpoint_fact_path(image), "remove checkpoint fact"),
+            (
+                restore_recovery_fact_path(image),
+                "remove restore recovery fact",
+            ),
+        ] {
+            match fs::remove_file(&artifact) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error(operation, &artifact, error)),
+            }
         }
         Self::remove_sidecar(image)?;
-        let fact = checkpoint_fact_path(image);
-        match fs::remove_file(&fact) {
-            Ok(()) => sync_parent!(image),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(io_error("remove checkpoint fact", &fact, error)),
+        sync_parent_path(image)
+    }
+
+    fn reclaim_retired(
+        &self,
+        config: &ApfsSubstrateConfig,
+        retired: &RetiredRef,
+    ) -> Result<(), ApfsStorageError> {
+        if config.store_root != self.config.store_root {
+            return Err(ApfsStorageError::InvalidPlan(
+                "retired cleanup config differs from host storage root",
+            ));
         }
+        let project = layout(config, retired.workspace().repo())?
+            .project()
+            .project_root
+            .clone();
+        let trash = project
+            .join("sessions")
+            .join(super::TRASH_NAMESPACE)
+            .join(format!(
+                "{}-{}.{}",
+                retired.workspace().name().as_str(),
+                retired.workspace().incarnation().as_str(),
+                retired.workspace().format().extension()
+            ));
+        let sidecar = sidecar_path(&trash);
+        let trash_exists = trash
+            .try_exists()
+            .map_err(|error| io_error("inspect retired image", &trash, error))?;
+        let sidecar_exists = sidecar
+            .try_exists()
+            .map_err(|error| io_error("inspect retired metadata", &sidecar, error))?;
+        if !trash_exists && !sidecar_exists {
+            return Ok(());
+        }
+        self.reclaim_retired_authority(
+            &project,
+            retired.workspace().repo(),
+            &trash,
+            retired.workspace().format(),
+            Some(retired),
+        )
     }
 
     fn list(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError> {

@@ -410,6 +410,11 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     ) -> Result<(), ApfsStorageError>;
     fn retire_image(&self, canonical: &Path, trash: &Path) -> Result<(), ApfsStorageError>;
     fn reclaim_image(&self, image: &Path, format: ImageFormat) -> Result<(), ApfsStorageError>;
+    fn reclaim_retired(
+        &self,
+        config: &ApfsSubstrateConfig,
+        retired: &RetiredRef,
+    ) -> Result<(), ApfsStorageError>;
     fn list(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError>;
     fn pending_publications(
         &self,
@@ -1135,8 +1140,7 @@ where
             retired.workspace().format(),
         )?];
         self.dispatch_with_locks(lock_paths, true, move |host, config| {
-            let image = retired_image_path(&config, retired.workspace())?;
-            host.reclaim_image(&image, retired.workspace().format())
+            host.reclaim_retired(&config, &retired)
         })
         .await
     }

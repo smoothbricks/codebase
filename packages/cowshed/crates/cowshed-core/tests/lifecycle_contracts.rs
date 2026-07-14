@@ -579,6 +579,62 @@ fn duplicate_canonical_volume_names_are_rejected_before_mount_joining() {
     }
 }
 
+#[test]
+fn validated_retired_checkpoint_facts_do_not_republish_a_missing_workspace() {
+    let main = StorageFact {
+        workspace: workspace("main", 7, 9),
+        volume_name: "main-volume".to_owned(),
+    };
+    let retired = CheckpointFact {
+        repo: repo(),
+        workspace: WorkspaceName::session("retired").expect("retired workspace"),
+        label: CheckpointLabel::new("keep").expect("checkpoint label"),
+        revision: Revision::new(4),
+        pin: Pin::Pinned,
+    };
+
+    let derived = derive_workspaces(
+        vec![main.clone()],
+        vec![KernelMountFact {
+            mount_id: 42,
+            volume_name: main.volume_name,
+        }],
+        vec![retired],
+    )
+    .expect("retired checkpoint facts are asynchronous cleanup debris");
+
+    assert_eq!(derived.len(), 1);
+    assert!(derived[0].workspace.name().is_main());
+    assert_eq!(derived[0].mount_state, MountState::Mounted { mount_id: 42 });
+    assert!(derived[0].checkpoints.is_empty());
+}
+
+#[test]
+fn duplicate_retired_checkpoint_facts_are_rejected_before_exclusion() {
+    let checkpoint = CheckpointFact {
+        repo: repo(),
+        workspace: WorkspaceName::session("retired").expect("retired workspace"),
+        label: CheckpointLabel::new("duplicate").expect("checkpoint label"),
+        revision: Revision::new(4),
+        pin: Pin::Automatic,
+    };
+
+    assert_eq!(
+        derive_workspaces(
+            vec![StorageFact {
+                workspace: workspace("main", 1, 1),
+                volume_name: "main-volume".to_owned(),
+            }],
+            Vec::new(),
+            vec![checkpoint.clone(), checkpoint],
+        ),
+        Err(DerivationError::DuplicateCheckpoint {
+            workspace: WorkspaceName::session("retired").expect("retired workspace"),
+            label: CheckpointLabel::new("duplicate").expect("checkpoint label"),
+        })
+    );
+}
+
 proptest! {
     #[test]
     fn generated_plans_are_deterministic(revision in any::<u64>(), topology in any::<u64>(), suffix in 0u16..1000) {
