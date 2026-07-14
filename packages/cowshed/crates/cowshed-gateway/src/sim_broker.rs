@@ -481,21 +481,18 @@ async fn execute_request(
             let scheme = Url::parse(&url)
                 .map(|parsed| format!("{}:", parsed.scheme()))
                 .map_err(|_| SimBrokerError::InvalidUrl)?;
-            audit(
+            run_audited(
                 auditor,
+                runner,
                 workspace_id,
                 "openurl",
                 Some(&scheme),
-                BrokerAuditStatus::Allowed,
-                None,
-            )
-            .await?;
-            runner
-                .run(SimCommand::OpenUrl {
+                SimCommand::OpenUrl {
                     device: device.clone(),
                     url,
-                })
-                .await?;
+                },
+            )
+            .await?;
             Ok(SimResult {
                 operation: "openurl".to_owned(),
                 device,
@@ -589,21 +586,18 @@ async fn execute_request(
                         return Err(SimBrokerError::InvalidApp);
                     }
                 };
-            audit(
+            run_audited(
                 auditor,
+                runner,
                 workspace_id,
                 "install",
                 None,
-                BrokerAuditStatus::Allowed,
-                None,
-            )
-            .await?;
-            runner
-                .run(SimCommand::Install {
+                SimCommand::Install {
                     device: device.clone(),
                     app: checked,
-                })
-                .await?;
+                },
+            )
+            .await?;
             Ok(SimResult {
                 operation: "install".to_owned(),
                 device,
@@ -629,6 +623,55 @@ fn validate_openurl(
         return Err(SimBrokerError::InvalidScheme);
     }
     Ok(())
+}
+
+async fn run_audited(
+    auditor: &dyn BrokerAuditor,
+    runner: &dyn SimRunner,
+    workspace_id: &str,
+    method: &str,
+    path: Option<&str>,
+    command: SimCommand,
+) -> Result<(), SimBrokerError> {
+    audit(
+        auditor,
+        workspace_id,
+        method,
+        path,
+        BrokerAuditStatus::Allowed,
+        Some("sim-admitted"),
+    )
+    .await?;
+    match runner.run(command).await {
+        Ok(_) => {
+            audit(
+                auditor,
+                workspace_id,
+                method,
+                path,
+                BrokerAuditStatus::Completed,
+                None,
+            )
+            .await
+        }
+        Err(error) => {
+            let status = if matches!(error, SimBrokerError::RunnerTimeout) {
+                BrokerAuditStatus::TimedOut
+            } else {
+                BrokerAuditStatus::Failed
+            };
+            audit(
+                auditor,
+                workspace_id,
+                method,
+                path,
+                status,
+                Some(error.classification()),
+            )
+            .await?;
+            Err(error)
+        }
+    }
 }
 
 async fn audit(
@@ -928,6 +971,20 @@ mod tests {
             })
         }
     }
+    struct FailingRunner {
+        timeout: bool,
+    }
+
+    #[async_trait]
+    impl SimRunner for FailingRunner {
+        async fn run(&self, _command: SimCommand) -> Result<SimCommandOutput, SimBrokerError> {
+            if self.timeout {
+                Err(SimBrokerError::RunnerTimeout)
+            } else {
+                Err(SimBrokerError::RunnerFailed)
+            }
+        }
+    }
 
     #[derive(Default)]
     struct RecordingAuditor {
@@ -1068,6 +1125,13 @@ mod tests {
                     .as_deref()
                     .is_none_or(|path| path == "cowshed-demo:")
             }));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.status == BrokerAuditStatus::Completed)
+                    .count(),
+                2
+            );
         }
         handle.shutdown().await;
         task.await.expect("join");
@@ -1109,6 +1173,51 @@ mod tests {
         handle.shutdown().await;
         task.await.expect("join");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runner_failure_and_timeout_emit_one_terminal_outcome() {
+        for (timeout, terminal) in [
+            (false, BrokerAuditStatus::Failed),
+            (true, BrokerAuditStatus::TimedOut),
+        ] {
+            let root = fixture_root(if timeout { "timeout" } else { "failure" });
+            let runner = Arc::new(FailingRunner { timeout });
+            let auditor = Arc::new(RecordingAuditor::default());
+            let (handle, task) =
+                SimBrokerHandle::start(Some(root.clone()), 4, runner, auditor.clone())
+                    .expect("start broker");
+            handle
+                .configure(project([SimGrant::OpenUrl]))
+                .await
+                .expect("configure");
+            handle
+                .bind_session("ws-a".to_owned(), "repo-a".to_owned())
+                .await
+                .expect("bind");
+            let result = handle
+                .request(
+                    "ws-a".to_owned(),
+                    SimRequest::OpenUrl {
+                        device: "booted".to_owned(),
+                        url: "cowshed-demo://open".to_owned(),
+                    },
+                )
+                .await;
+            if timeout {
+                assert!(matches!(result, Err(SimBrokerError::RunnerTimeout)));
+            } else {
+                assert!(matches!(result, Err(SimBrokerError::RunnerFailed)));
+            }
+            {
+                let events = auditor.events.lock().expect("events");
+                let statuses = events.iter().map(|event| event.status).collect::<Vec<_>>();
+                assert_eq!(statuses, vec![BrokerAuditStatus::Allowed, terminal]);
+            }
+            handle.shutdown().await;
+            task.await.expect("join");
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]
