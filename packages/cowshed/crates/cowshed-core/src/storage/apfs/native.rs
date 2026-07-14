@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{CStr, CString, OsStr, OsString};
+#[cfg(target_os = "macos")]
+use std::ffi::CStr;
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};

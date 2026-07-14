@@ -20,7 +20,7 @@ use plist::{Dictionary, Value};
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStringExt;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -29,16 +29,15 @@ use tokio::sync::oneshot;
 #[cfg(unix)]
 use uuid::Uuid;
 
-#[cfg(target_os = "macos")]
-use super::VOLUME_MARKER_FILE;
 use super::{
-    APFS_CACHES_VOLUME, APFS_STORE_VOLUME, ApfsProvisionKind, ApfsVolumeProvision, BlockingLane,
-    BootstrapEvidence, BootstrapExecutionError, BootstrapHost, BootstrapPlan, DISKUTIL,
-    ExistingStorage, HostCommand, HostCommandOutput, HostError, HostOperation, MountpointState,
-    PlanError, SelectionError, StatFsEvidence, SubstrateKind, TokioBlockingLane,
-    ValidatedHostStorage, VolumeMarker, VolumeRole, execute_bootstrap, plan_bootstrap,
-    require_mounted_marker, select_substrate,
+    APFS_CACHES_VOLUME, APFS_STORE_VOLUME, ApfsVolumeProvision, BlockingLane, BootstrapEvidence,
+    BootstrapExecutionError, BootstrapHost, BootstrapPlan, DISKUTIL, ExistingStorage, HostCommand,
+    HostCommandOutput, HostError, HostOperation, MountpointState, PlanError, SelectionError,
+    StatFsEvidence, SubstrateKind, TokioBlockingLane, ValidatedHostStorage, VolumeRole,
+    execute_bootstrap, plan_bootstrap, require_mounted_marker, select_substrate,
 };
+#[cfg(target_os = "macos")]
+use super::{ApfsProvisionKind, VOLUME_MARKER_FILE, VolumeMarker};
 
 #[cfg(unix)]
 const MARKER_MODE: libc::mode_t = 0o600;
@@ -1702,7 +1701,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::storage::bootstrap::VolumeMarker;
+    use crate::storage::bootstrap::{ApfsProvisionKind, VolumeMarker};
 
     struct FakeEvidenceSource {
         statfs: StatFsSnapshot,
