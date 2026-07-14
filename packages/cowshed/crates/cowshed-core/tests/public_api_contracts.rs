@@ -263,10 +263,20 @@ fn ensure_doctor_gc_and_empty_results_have_exact_shapes() {
         workspace: workspace(),
         mount: PathBuf::from("/mnt/raven"),
         action: EnsureAction::Healed,
+        go_env: PathBuf::from("/mnt/raven/.cowshed/cache/go/env"),
+        workspace_token: PathBuf::from("/mnt/raven/.cowshed/token"),
+        port_block: Some(PortBlock::new(49_152, 16).expect("valid port block")),
     };
     assert_eq!(
         serde_json::to_value(ensure).expect("ensure JSON"),
-        json!({"workspace":"raven","mount":"/mnt/raven","action":"healed"})
+        json!({
+            "workspace":"raven",
+            "mount":"/mnt/raven",
+            "action":"healed",
+            "goEnv":"/mnt/raven/.cowshed/cache/go/env",
+            "workspaceToken":"/mnt/raven/.cowshed/token",
+            "portBlock":{"base":49152,"size":16}
+        })
     );
 
     let doctor = DoctorReport {

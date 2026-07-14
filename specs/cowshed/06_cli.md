@@ -237,17 +237,15 @@ extra_workspace_dirs = ["build-out"]
 output_limit = "1GiB"         # combined stdout+stderr per job; explicit output-limit terminal state
 ```
 
-On macOS, `cowshed ensure --envrc` additionally exports `PORT` and `COWSHED_PORT_BASE` (= the block base) as dev-server
-conventions, so `vite`/`astro`/`metro`/`devenv up` bind inside the workspace's own block instead of colliding with
-siblings (04_sandbox.md). Linux allocates no port block: dev servers bind its private loopback, while ordinary package
-tools retain their configured `http://127.0.0.1:7644/…` proxy and registry URLs through exactly one trusted minimal
-connector launched inside that workspace's private loopback-only network namespace under a distinct, controller-owned,
-non-signalable identity/cgroup. It binds only `127.0.0.1:7644` and forwards bytes only to the workspace's mounted
-`/run/cowshed/gateway.sock`; it holds no policy or credentials and exposes no general TCP or Unix-socket forwarding API.
-The socket inode plus network namespace selects the workspace and the opaque token still authenticates it. Detach or
-restore drains and kills the connector and unlinks the old socket. On both platforms `ensure` exports `GOENV` pointing
-at the in-image Go environment file — Go's one load-bearing export, since Go has no directory-scoped config to carry the
-per-workspace `GOPROXY` (03_caches.md).
+On macOS, `cowshed ensure --envrc` exports `COWSHED_PORT_BASE` (= the authoritative detached-metadata block base) as the
+dev-server convention, so `vite`/`astro`/`metro`/`devenv up` can select ports inside the workspace's own block instead
+of colliding with siblings (04_sandbox.md). Linux allocates no port block and emits no port sentinel: dev servers bind
+its private loopback, while ordinary package tools retain their configured `http://127.0.0.1:7644/…` proxy and registry
+URLs through exactly one trusted minimal connector launched inside that workspace's private loopback-only network
+namespace. On both platforms `ensure` exports `GOENV` pointing at the authoritative mounted workspace's in-image Go
+environment file and `COWSHED_WORKSPACE_TOKEN` containing the value read from its controller-minted token path. These,
+plus the macOS-only base, are the complete load-bearing export set; the CLI receives typed paths and `PortBlock` in
+`EnsureReport` and never guesses from cwd, a marker, a slot, or a mount-path convention.
 
 ## Tradeoffs
 

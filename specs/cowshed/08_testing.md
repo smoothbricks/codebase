@@ -50,6 +50,10 @@ No mounts, no root, no network — pure functions with table-driven cases:
   `ensure`/`attach`; `WorkspaceHandle` exposes exactly one workspace's exec/shell/jobs/quota-bound checkpoint/push/grant
   reads; only `Coordinator` exposes grant/revoke/restore/destroy/rebase/land/gc/repo-mirror and quota policy.
   Compile-fail fixtures prove forbidden methods and cross-workspace construction are unavailable.
+- **Authoritative cwd resolution and env wiring**: fake-host/router tables cover deeply nested cwd success, detached and
+  cross-project refusal, malicious marker-only refusal, overlapping active-mount ambiguity, and exact `EnsureReport`
+  paths plus macOS/Linux `PortBlock` presence. Capability-wire tests freeze `project.workspaceAt` and reject local CLI
+  inference.
 - **Push CAS and preservation model**: pure state-machine tables cover each omitted/satisfied/mismatched combination of
   expected workspace incarnation, source head, and destination ref head (including expected-missing). A mismatch is a
   `Conflict` that preserves the old destination exactly and leaves the source live; success reports one source object ID

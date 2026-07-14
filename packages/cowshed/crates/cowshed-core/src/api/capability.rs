@@ -720,6 +720,17 @@ impl Project {
         Ok(WorkspaceRef::from_wire(wire, Arc::clone(&self.runtime)))
     }
 
+    /// Resolves an existing path through the controller's authoritative storage and mount facts.
+    pub async fn workspace_at(&self, path: impl AsRef<Path>) -> Result<WorkspaceRef> {
+        let wire: WorkspaceWire = call_typed(
+            &self.runtime,
+            "project.workspaceAt",
+            json!({ "repoId": self.repo_id, "path": path.as_ref() }),
+        )
+        .await?;
+        Ok(WorkspaceRef::from_wire(wire, Arc::clone(&self.runtime)))
+    }
+
     pub async fn list(&self) -> Result<Vec<WorkspaceRef>> {
         let wires: Vec<WorkspaceWire> = call_typed(
             &self.runtime,
@@ -2114,6 +2125,33 @@ mod tests {
             "raven"
         );
         assert_eq!(runtime.rpc_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_workspace_at_forwards_the_authoritative_path_rpc() {
+        let template_runtime: Arc<dyn ControllerRuntime> = Arc::new(TestRuntime::default());
+        let template = workspace_ref(template_runtime);
+        let response = json!({ "info": template.info, "grants": template.grants });
+        let (runtime, mut server) = actor_pair();
+        let coordinator = coordinator(runtime);
+        let server_task = tokio::spawn(async move {
+            let (_, request) = read_rpc_request(&mut server).await;
+            assert_eq!(request["method"], "project.workspaceAt");
+            assert_eq!(
+                request["params"],
+                json!({ "repoId": "acme/widget", "path": "/mnt/raven/src/lib.rs" })
+            );
+            write_rpc_success(&mut server, request["id"].as_u64().unwrap(), response, None).await;
+        });
+
+        let workspace = coordinator
+            .project()
+            .workspace_at("/mnt/raven/src/lib.rs")
+            .await
+            .expect("workspace resolution");
+        assert_eq!(workspace.name().as_str(), "raven");
+        server_task.await.unwrap();
     }
 
     #[cfg(unix)]

@@ -491,6 +491,10 @@ pub struct EnsureReport {
     pub workspace: WorkspaceName,
     pub mount: PathBuf,
     pub action: EnsureAction,
+    pub go_env: PathBuf,
+    pub workspace_token: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port_block: Option<PortBlock>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -421,6 +421,7 @@ const ROUTER_CLOSED_HINT: &str = "restart the trusted cowshed controller";
 pub const CAPABILITY_METHODS: &[&str] = &[
     "project.open",
     "project.workspace",
+    "project.workspaceAt",
     "project.list",
     "workspace.info",
     "workspace.ensure",
