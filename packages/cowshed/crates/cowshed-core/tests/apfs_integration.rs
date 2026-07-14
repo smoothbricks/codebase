@@ -1,41 +1,27 @@
-#[cfg(target_os = "macos")]
+#![cfg(target_os = "macos")]
+
 use std::error::Error;
-#[cfg(target_os = "macos")]
 use std::fs::{self, File};
-#[cfg(target_os = "macos")]
 use std::io::{Seek, SeekFrom, Write};
-#[cfg(target_os = "macos")]
 use std::os::unix::fs::MetadataExt;
-#[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
 use std::sync::Arc;
-#[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
-#[cfg(target_os = "macos")]
 use cowshed_core::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
-#[cfg(target_os = "macos")]
 use cowshed_core::metadata::{GrantSet, ImageFormat, PortBlock, WorkspaceName};
-#[cfg(target_os = "macos")]
 use cowshed_core::repository::RepoId;
-#[cfg(target_os = "macos")]
 use cowshed_core::storage::CheckpointLabel;
-#[cfg(target_os = "macos")]
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
-#[cfg(target_os = "macos")]
 use cowshed_core::storage::apfs::{
     ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig, IncarnationSource, TokioApfsBlockingLane,
 };
-#[cfg(target_os = "macos")]
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, Destination, LifecyclePlanner, MountIntent, OperationIdentity, Pin, RestoreMode,
     Revision, Substrate,
 };
 
-#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RequiredFormats {
     Auto,
@@ -44,7 +30,6 @@ enum RequiredFormats {
     Both,
 }
 
-#[cfg(target_os = "macos")]
 impl RequiredFormats {
     fn from_env() -> Result<Self, String> {
         match std::env::var("COWSHED_APFS_REQUIRED")
@@ -77,12 +62,10 @@ impl RequiredFormats {
     }
 }
 
-#[cfg(target_os = "macos")]
 struct IntegrationRoot {
     path: PathBuf,
 }
 
-#[cfg(target_os = "macos")]
 impl IntegrationRoot {
     fn new(format: ImageFormat) -> Result<Self, Box<dyn Error>> {
         let path = PathBuf::from(format!(
@@ -98,17 +81,14 @@ impl IntegrationRoot {
     }
 }
 
-#[cfg(target_os = "macos")]
 impl Drop for IntegrationRoot {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
 }
 
-#[cfg(target_os = "macos")]
 struct DeterministicIncarnations(AtomicU64);
 
-#[cfg(target_os = "macos")]
 impl IncarnationSource for DeterministicIncarnations {
     fn mint(&self) -> Result<cowshed_core::metadata::WorkspaceIncarnation, ApfsStorageError> {
         let value = self.0.fetch_add(1, Ordering::Relaxed);
@@ -117,13 +97,11 @@ impl IncarnationSource for DeterministicIncarnations {
     }
 }
 
-#[cfg(target_os = "macos")]
 struct AttachmentCleanup<'a> {
     host: &'a MacOsApfsExecutionHost<SystemCommandRunner>,
     armed: bool,
 }
 
-#[cfg(target_os = "macos")]
 impl AttachmentCleanup<'_> {
     fn finish(mut self) -> Result<(), ApfsStorageError> {
         let result = self.host.detach_all_reverse();
@@ -132,7 +110,6 @@ impl AttachmentCleanup<'_> {
     }
 }
 
-#[cfg(target_os = "macos")]
 impl Drop for AttachmentCleanup<'_> {
     fn drop(&mut self) {
         if self.armed {
@@ -141,13 +118,11 @@ impl Drop for AttachmentCleanup<'_> {
     }
 }
 
-#[cfg(target_os = "macos")]
 struct ChurnGuard {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<Result<(), std::io::Error>>>,
 }
 
-#[cfg(target_os = "macos")]
 impl ChurnGuard {
     fn finish(mut self) -> Result<(), Box<dyn Error>> {
         self.stop.store(true, Ordering::Release);
@@ -162,7 +137,6 @@ impl ChurnGuard {
     }
 }
 
-#[cfg(target_os = "macos")]
 impl Drop for ChurnGuard {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -180,36 +154,29 @@ fn real_apfs_substrate_lifecycle() {
         Ok("1"),
         "invoke the explicit integration-apfs Nx target"
     );
-    #[cfg(not(target_os = "macos"))]
-    panic!("the selected APFS integration target requires macOS");
-
-    #[cfg(target_os = "macos")]
-    {
-        let required = RequiredFormats::from_env().expect("capability selection");
-        let mut completed = Vec::new();
-        for &format in required.formats() {
-            match run_format(format) {
-                Ok(evidence) => {
-                    eprintln!("APFS {format:?}: {evidence}");
-                    completed.push(format);
-                }
-                Err(error) if !required.requires(format) => {
-                    eprintln!("APFS {format:?} unavailable in auto mode: {error}");
-                }
-                Err(error) => panic!("required APFS {format:?} capability failed: {error}"),
+    let required = RequiredFormats::from_env().expect("capability selection");
+    let mut completed = Vec::new();
+    for &format in required.formats() {
+        match run_format(format) {
+            Ok(evidence) => {
+                eprintln!("APFS {format:?}: {evidence}");
+                completed.push(format);
             }
+            Err(error) if !required.requires(format) => {
+                eprintln!("APFS {format:?} unavailable in auto mode: {error}");
+            }
+            Err(error) => panic!("required APFS {format:?} capability failed: {error}"),
         }
-        assert!(
-            !completed.is_empty(),
-            "auto mode requires at least one working APFS image format"
-        );
-        if required == RequiredFormats::Both {
-            assert_eq!(completed.len(), 2, "both selected formats must complete");
-        }
+    }
+    assert!(
+        !completed.is_empty(),
+        "auto mode requires at least one working APFS image format"
+    );
+    if required == RequiredFormats::Both {
+        assert_eq!(completed.len(), 2, "both selected formats must complete");
     }
 }
 
-#[cfg(target_os = "macos")]
 fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
     let root = IntegrationRoot::new(format)?;
     let store = root.path.join("store");
@@ -407,7 +374,6 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn write_stream(path: &Path, mebibytes: usize) -> Result<(), Box<dyn Error>> {
     let block = vec![0x5a; 1024 * 1024];
     let mut file = File::create(path)?;
@@ -418,7 +384,6 @@ fn write_stream(path: &Path, mebibytes: usize) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn spawn_churn(
     path: PathBuf,
     stop: Arc<AtomicBool>,

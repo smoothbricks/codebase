@@ -1,14 +1,12 @@
-#[cfg(target_os = "macos")]
+#![cfg(target_os = "macos")]
+
 use std::path::PathBuf;
-#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
-#[cfg(target_os = "macos")]
 use cowshed_core::apfs::{
     ApfsBackend, ApfsCaseSensitivity, AttachedImage, CreateImageRequest, ImageFormatSelection,
     MacOsApfsBackend, SystemCommandRunner,
 };
-#[cfg(target_os = "macos")]
 use cowshed_core::metadata::ImageFormat;
 
 #[test]
@@ -19,14 +17,9 @@ fn clonefile_and_attach_regression_budget() {
         Ok("1"),
         "invoke the explicit benchmark-apfs Nx target"
     );
-    #[cfg(not(target_os = "macos"))]
-    panic!("the selected APFS benchmark requires macOS");
-
-    #[cfg(target_os = "macos")]
     run_benchmark();
 }
 
-#[cfg(target_os = "macos")]
 fn run_benchmark() {
     let required = std::env::var("COWSHED_APFS_REQUIRED").unwrap_or_else(|_| "auto".to_owned());
     assert!(
@@ -54,23 +47,19 @@ fn run_benchmark() {
     }
 }
 
-#[cfg(target_os = "macos")]
 struct BenchmarkRoot(PathBuf);
 
-#[cfg(target_os = "macos")]
 impl Drop for BenchmarkRoot {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
-#[cfg(target_os = "macos")]
 struct AttachmentGuard<'a> {
     backend: &'a MacOsApfsBackend<SystemCommandRunner>,
     attachment: Option<AttachedImage>,
 }
 
-#[cfg(target_os = "macos")]
 impl AttachmentGuard<'_> {
     fn detach(mut self) -> Result<(), cowshed_core::apfs::ApfsError> {
         let attachment = self.attachment.take().expect("attachment is present");
@@ -78,7 +67,6 @@ impl AttachmentGuard<'_> {
     }
 }
 
-#[cfg(target_os = "macos")]
 impl Drop for AttachmentGuard<'_> {
     fn drop(&mut self) {
         if let Some(attachment) = self.attachment.take() {
@@ -87,7 +75,6 @@ impl Drop for AttachmentGuard<'_> {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn benchmark_format(format: ImageFormat) -> Result<(), Box<dyn std::error::Error>> {
     let root = BenchmarkRoot(PathBuf::from(format!(
         "/private/tmp/cowshed-bench-{}-{}",
