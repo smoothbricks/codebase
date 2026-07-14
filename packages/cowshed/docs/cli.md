@@ -398,10 +398,33 @@ next: cowshed exec raven -- git status
 
 ## Infrastructure
 
-### `cowshed gateway run` / `cowshed gateway status`
+### `cowshed gateway start` / `stop` / `status`
 
-`run` starts the gateway in the foreground (use launchd for login-time start; see [gateway.md](gateway.md)). `status`
-prints `running <pid>` plus the control port and per-workspace listener count, or exits 5 with setup hints.
+`start` installs and loads the per-user macOS LaunchAgent `dev.cowshed.gateway`, then waits until its authenticated Unix
+control socket is healthy. The generated mode-0600 plist uses the absolute current `cowshed` executable, `RunAtLoad`,
+`KeepAlive`, and stable pre-tracer stderr at `~/.cowshed/telemetry/daemon-stderr.log`. `stop` boots out the agent and
+removes the plist; both operations are idempotent.
+
+`status` reports health without starting the service. Its JSON result is the standard frozen envelope:
+
+```json
+{
+  "ok": true,
+  "result": {
+    "running": true,
+    "socket": "/Users/me/.cowshed/gateway.sock",
+    "cacheEntries": 0,
+    "cacheBytes": 0,
+    "activeWorkspaces": 3
+  }
+}
+```
+
+`gateway run` is the LaunchAgent's internal foreground entrypoint. It validates already-mounted host storage without
+provisioning, restores every authoritative attached workspace session, and drains on SIGTERM or SIGINT. Ordinary `exec`,
+`ensure`, and `doctor` commands reconcile the current project's attached sessions before admission; lifecycle commands
+reconcile again before reporting success. If the service is absent they fail with exit 5 and the exact
+`launchctl kickstart -k gui/<uid>/dev.cowshed.gateway` next hint.
 
 ### `cowshed du`
 
@@ -444,7 +467,7 @@ reachable, autosave fresh. Exit 0 when healthy; otherwise the code of the most s
 ```
 $ cowshed doctor
 cowshed: gateway not running (last audit event 2d ago)
-next: cowshed gateway run   # or: launchctl kickstart -k gui/501/dev.cowshed.gateway
+next: launchctl kickstart -k gui/501/dev.cowshed.gateway
 $ echo $?
 5
 ```

@@ -54,34 +54,33 @@ Every decision is auditable in Arrow telemetry under `~/.cowshed/telemetry/`; re
 
 ## Start at login (launchd)
 
-`cowshed gateway run` runs in the foreground. On a nix host, prefer the declarative options:
-`programs.cowshed.gateway.launchd` (home-manager owns the LaunchAgent — see the specs' 14_nix.md), or under the
-dedicated-dev-uid posture, `services.cowshed.gateway` (nix-darwin LaunchDaemon with `UserName = dev`, boot-time, no
-login session needed). The hand-written equivalent:
-
-```xml
-<!-- ~/Library/LaunchAgents/dev.cowshed.gateway.plist -->
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>dev.cowshed.gateway</string>
-  <key>ProgramArguments</key>
-  <array><string>&lt;project-root&gt;/target/release/cowshed</string>
-         <string>gateway</string><string>run</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardErrorPath</key><string>~/.cowshed/telemetry/daemon-stderr.log</string>
-</dict></plist>
-```
+On macOS, run:
 
 ```sh
-launchctl bootstrap gui/$UID ~/Library/LaunchAgents/dev.cowshed.gateway.plist
-cowshed gateway status        # -> running 4821 control 7644, 3 workspace listeners
+cowshed gateway start
+cowshed gateway status --json
 ```
 
-`cowshed doctor` and `cowshed ensure` both check gateway liveness; a dead gateway is exit 5 with the kickstart command
-in the `next:` hint.
+`start` atomically installs `~/Library/LaunchAgents/dev.cowshed.gateway.plist` at mode 0600, with the absolute current
+executable followed by the fixed `gateway run` argv. The agent has `RunAtLoad` and `KeepAlive`; early startup failures
+go only to `~/.cowshed/telemetry/daemon-stderr.log`. The CLI uses fixed `/bin/launchctl bootstrap`, `kickstart -k`,
+`bootout`, and `print` argv—never shell text—and maps already-loaded/not-loaded states idempotently. It waits for the
+authenticated Unix control socket before returning success. `cowshed gateway stop` boots out the agent and removes its
+plist.
+
+The internal `cowshed gateway run` entrypoint refuses to provision storage: it first validates the existing mounted APFS
+host store, constructs production cache/telemetry/control configuration with TCP control disabled, starts the gateway,
+and restores all canonical attached sessions from repository bindings, mount/incarnation facts, grants, and validated
+workspace credentials. Detached and retired workspaces are never installed. SIGTERM and SIGINT stop admissions and drain
+the gateway before exit.
+
+Every ordinary `exec`, `ensure`, and `doctor` invocation reconciles the current project before use. Attach, detach,
+restore, removal, and other lifecycle publication paths reconcile again before success is printed, replacing changed
+revisions/tokens and removing stale project sessions. Gateway absence is exit 5 with:
+
+```text
+next: launchctl kickstart -k gui/<uid>/dev.cowshed.gateway
+```
 
 ## Credentials (credential-store-held, never in workspaces)
 
