@@ -75,8 +75,10 @@ export const createNodesV2: CreateNodesV2 = [
 export default { createNodesV2 };
 
 interface PackageJson {
+  name?: string;
   scripts?: Record<string, unknown>;
   nx?: {
+    name?: string;
     targets?: Record<string, unknown>;
   };
 }
@@ -243,9 +245,14 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     };
   }
 
+  const projectName = packageJson.nx?.name ?? packageJson.name;
+  if (typeof projectName !== 'string' || projectName.length === 0) {
+    throw new Error(`${packageJsonPath} must declare a non-empty package or nx project name`);
+  }
+
   return {
     projects: {
-      [projectRoot]: { targets },
+      [projectRoot]: { name: projectName, targets },
     },
   };
 }
