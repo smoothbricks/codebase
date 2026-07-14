@@ -5,13 +5,16 @@ use base64::Engine as _;
 use bytes::Bytes;
 use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection};
 use cowshed_core::api::{
-    AdoptOptions, AttachOptions, CommandArg, Coordinator, CreateOptions, DoctorReport, EmptyResult,
-    ExecRequest, ExitStatus, JobInfo, JobStream, MountResult, OutputPublication, PublicationPolicy,
-    RemoveOptions, RevisionTarget, RunSandboxMode, StdinSource as CoreStdinSource, WorkspaceInfo,
-    WorkspacePath, WorkspaceState, validate_command_argv,
+    AdoptOptions, AttachOptions, BranchName, CheckpointOptions, CheckpointResult, CommandArg,
+    Coordinator, CreateOptions, DoctorReport, EmptyResult, EnsureAction, EnsureReport, ExecRequest,
+    ExitStatus, ExpectedRefHead, GcOptions, GcReport, GitOid, JobInfo, JobStream, LandOptions,
+    LandReport, MountResult, OutputPublication, PublicationPolicy, PushOptions, PushReport,
+    RebaseOptions, RemoveOptions, RevisionResult, RevisionTarget, RunSandboxMode,
+    StdinSource as CoreStdinSource, WorkspaceInfo, WorkspacePath, WorkspaceState,
+    validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
-use cowshed_core::metadata::WorkspaceName;
+use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::runtime::ProjectRuntime;
 use cowshed_core::{CowshedError, ErrorCode, Result};
 use std::collections::HashMap;
@@ -48,12 +51,20 @@ pub struct ExecResult {
 pub trait CliService: Send {
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceInfo>;
     async fn create(&mut self, name: &str, options: CreateOptions) -> Result<WorkspaceInfo>;
+    async fn fork(&mut self, source: &str, destination: &str) -> Result<WorkspaceInfo>;
+    async fn checkpoint(&mut self, workspace: &str, options: CheckpointOptions) -> Result<String>;
+    async fn restore(&mut self, workspace: &str, label: &str) -> Result<WorkspaceInfo>;
+    async fn ensure_current(&mut self, path: PathBuf) -> Result<EnsureReport>;
     async fn list(&mut self) -> Result<Vec<WorkspaceInfo>>;
     async fn path(&mut self, workspace: &str, no_attach: bool) -> Result<WorkspaceInfo>;
     async fn remove(&mut self, workspace: &str, options: RemoveOptions) -> Result<()>;
     async fn attach(&mut self, workspace: &str, options: AttachOptions) -> Result<()>;
     async fn detach(&mut self, workspace: &str) -> Result<()>;
     async fn doctor(&mut self) -> Result<DoctorReport>;
+    async fn gc(&mut self, options: GcOptions) -> Result<GcReport>;
+    async fn push(&mut self, workspace: &str, options: PushOptions) -> Result<PushReport>;
+    async fn rebase(&mut self, workspace: &str, options: RebaseOptions) -> Result<GitOid>;
+    async fn land(&mut self, workspace: &str, options: LandOptions) -> Result<LandReport>;
     async fn exec(
         &mut self,
         command: ExecCommand,
@@ -76,12 +87,20 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
     match command {
         Command::Adopt(_) => RuntimeOpenMode::Provision,
         Command::New(_)
+        | Command::Fork(_)
+        | Command::Checkpoint(_)
+        | Command::Restore(_)
+        | Command::Ensure(_)
         | Command::List
         | Command::Path(_)
         | Command::Exec(_)
         | Command::Remove(_)
         | Command::Attach(_)
         | Command::Detach(_)
+        | Command::Gc(_)
+        | Command::Push(_)
+        | Command::Rebase(_)
+        | Command::Land(_)
         | Command::Doctor => RuntimeOpenMode::ExistingOnly,
     }
 }
@@ -186,6 +205,38 @@ impl CliService for ActorBridge {
         Ok(self.coordinator()?.create(name, options).await?.into_info())
     }
 
+    async fn fork(&mut self, source: &str, destination: &str) -> Result<WorkspaceInfo> {
+        Ok(self
+            .coordinator()?
+            .fork(source, destination)
+            .await?
+            .into_info())
+    }
+
+    async fn checkpoint(&mut self, workspace: &str, options: CheckpointOptions) -> Result<String> {
+        self.coordinator()?
+            .worker(workspace)
+            .await?
+            .checkpoint(options)
+            .await
+    }
+
+    async fn restore(&mut self, workspace: &str, label: &str) -> Result<WorkspaceInfo> {
+        self.coordinator()?.restore(workspace, label).await?;
+        self.coordinator()?
+            .project()
+            .workspace(workspace)
+            .await?
+            .refresh_info()
+            .await
+    }
+
+    async fn ensure_current(&mut self, _path: PathBuf) -> Result<EnsureReport> {
+        Err(CowshedError::internal(
+            "the core API does not yet expose authoritative current-workspace resolution",
+        ))
+    }
+
     async fn list(&mut self) -> Result<Vec<WorkspaceInfo>> {
         Ok(self
             .coordinator()?
@@ -225,6 +276,26 @@ impl CliService for ActorBridge {
 
     async fn doctor(&mut self) -> Result<DoctorReport> {
         self.coordinator()?.doctor().await
+    }
+
+    async fn gc(&mut self, options: GcOptions) -> Result<GcReport> {
+        self.coordinator()?.gc(options).await
+    }
+
+    async fn push(&mut self, workspace: &str, options: PushOptions) -> Result<PushReport> {
+        self.coordinator()?
+            .worker(workspace)
+            .await?
+            .push(options)
+            .await
+    }
+
+    async fn rebase(&mut self, workspace: &str, options: RebaseOptions) -> Result<GitOid> {
+        self.coordinator()?.rebase(workspace, options).await
+    }
+
+    async fn land(&mut self, workspace: &str, options: LandOptions) -> Result<LandReport> {
+        self.coordinator()?.land(workspace, options).await
     }
 
     async fn exec(
@@ -426,6 +497,58 @@ where
                 .map_err(output_error)?;
             Ok(success())
         }
+        Command::Fork(args) => {
+            let info = service.fork(&args.source, &args.destination).await?;
+            emit_mount(output, json, &info)?;
+            output
+                .hint(&format!("cowshed exec {} -- <cmd>", args.destination))
+                .map_err(output_error)?;
+            Ok(success())
+        }
+        Command::Checkpoint(args) => {
+            let label = service
+                .checkpoint(
+                    &args.workspace,
+                    CheckpointOptions {
+                        label: args.label.map(os_utf8).transpose()?,
+                        keep: args.keep,
+                    },
+                )
+                .await?;
+            if json {
+                output
+                    .success(CheckpointResult { label })
+                    .map_err(output_error)?;
+            } else {
+                output.bare_line(label.as_bytes()).map_err(output_error)?;
+            }
+            Ok(success())
+        }
+        Command::Restore(args) => {
+            let label = os_utf8(args.label)?;
+            let info = service.restore(&args.workspace, &label).await?;
+            emit_mount(output, json, &info)?;
+            output
+                .hint(&format!("cowshed exec {} -- git status", args.workspace))
+                .map_err(output_error)?;
+            Ok(success())
+        }
+        Command::Ensure(_) => {
+            let report = service.ensure_current(invocation_cwd()?).await?;
+            if json {
+                output.success(report.clone()).map_err(output_error)?;
+            }
+            if report.action != EnsureAction::AlreadyMounted {
+                output
+                    .guidance(&format!(
+                        "workspace {} is ready ({})",
+                        report.workspace,
+                        ensure_action(report.action)
+                    ))
+                    .map_err(output_error)?;
+            }
+            Ok(success())
+        }
         Command::List => {
             let mut workspaces = service.list().await?;
             workspaces.sort_by(|left, right| left.workspace.cmp(&right.workspace));
@@ -475,7 +598,7 @@ where
                     &args.workspace,
                     RemoveOptions {
                         force: args.force,
-                        restore: false,
+                        restore: args.restore,
                     },
                 )
                 .await?;
@@ -503,6 +626,101 @@ where
             service.detach(&args.workspace).await?;
             if json {
                 output.success(EmptyResult {}).map_err(output_error)?;
+            }
+            Ok(success())
+        }
+        Command::Gc(args) => {
+            let report = service
+                .gc(GcOptions {
+                    dry_run: args.dry_run,
+                })
+                .await?;
+            if json {
+                output.success(report.clone()).map_err(output_error)?;
+            } else {
+                output
+                    .bare_line(report.freed_bytes.to_string().as_bytes())
+                    .map_err(output_error)?;
+            }
+            if report.dry_run {
+                output
+                    .guidance(&format!(
+                        "dry run examined {} objects and would reclaim {}",
+                        report.examined, report.reclaimed
+                    ))
+                    .map_err(output_error)?;
+            }
+            Ok(success())
+        }
+        Command::Push(args) => {
+            let options = PushOptions {
+                branch: args.branch.map(os_branch).transpose()?,
+                expected_workspace_incarnation: args
+                    .expected_workspace_incarnation
+                    .map(os_incarnation)
+                    .transpose()?,
+                expected_source_head: args.expected_source_head.map(os_git_oid).transpose()?,
+                expected_destination_head: args
+                    .expected_destination_head
+                    .map(os_expected_ref)
+                    .transpose()?,
+            };
+            let report = service.push(&args.workspace, options).await?;
+            if json {
+                output.success(report.clone()).map_err(output_error)?;
+            } else {
+                emit_push(output, &report)?;
+            }
+            Ok(success())
+        }
+        Command::Rebase(args) => {
+            let options = RebaseOptions {
+                onto: args.onto.map(os_revision).transpose()?,
+                fresh: args.fresh,
+                expected_workspace_incarnation: args
+                    .expected_workspace_incarnation
+                    .map(os_incarnation)
+                    .transpose()?,
+                expected_source_head: args.expected_source_head.map(os_git_oid).transpose()?,
+                expected_onto_head: args.expected_onto_head.map(os_git_oid).transpose()?,
+            };
+            let oid = service.rebase(&args.workspace, options).await?;
+            if json {
+                output
+                    .success(RevisionResult { oid: oid.clone() })
+                    .map_err(output_error)?;
+            } else {
+                output
+                    .bare_line(oid.as_str().as_bytes())
+                    .map_err(output_error)?;
+            }
+            Ok(success())
+        }
+        Command::Land(args) => {
+            let options = LandOptions {
+                target_branch: args.target.map(os_branch).transpose()?,
+                check: (!args.checks.is_empty())
+                    .then(|| {
+                        args.checks
+                            .into_iter()
+                            .map(os_utf8)
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .transpose()?,
+                retire: args.retire,
+                push_only: args.push_only,
+                expected_workspace_incarnation: args
+                    .expected_workspace_incarnation
+                    .map(os_incarnation)
+                    .transpose()?,
+                expected_source_head: args.expected_source_head.map(os_git_oid).transpose()?,
+                expected_target_head: args.expected_target_head.map(os_expected_ref).transpose()?,
+            };
+            let report = service.land(&args.workspace, options).await?;
+            if json {
+                output.success(report.clone()).map_err(output_error)?;
+            } else {
+                emit_land(output, &report)?;
             }
             Ok(success())
         }
@@ -540,6 +758,48 @@ fn os_revision(value: std::ffi::OsString) -> Result<RevisionTarget> {
         usage(
             format!("invalid revision: {error}"),
             "use a branch, full ref, or full object id",
+        )
+    })
+}
+
+fn os_branch(value: std::ffi::OsString) -> Result<String> {
+    let value = os_utf8(value)?;
+    BranchName::new(value)
+        .map(|branch| branch.as_str().to_owned())
+        .map_err(|error| usage(error.to_string(), "use a valid local branch name"))
+}
+
+fn os_git_oid(value: std::ffi::OsString) -> Result<GitOid> {
+    GitOid::new(os_utf8(value)?).map_err(|error| {
+        usage(
+            error.to_string(),
+            "use a full lowercase 40- or 64-hex object id",
+        )
+    })
+}
+
+fn os_incarnation(value: std::ffi::OsString) -> Result<WorkspaceIncarnation> {
+    WorkspaceIncarnation::new(os_utf8(value)?).map_err(|error| {
+        usage(
+            error.to_string(),
+            "use the current 32-character lowercase workspace incarnation",
+        )
+    })
+}
+
+fn os_expected_ref(value: std::ffi::OsString) -> Result<ExpectedRefHead> {
+    if value == std::ffi::OsStr::new("missing") {
+        Ok(ExpectedRefHead::Missing)
+    } else {
+        os_git_oid(value).map(ExpectedRefHead::Oid)
+    }
+}
+
+fn invocation_cwd() -> Result<PathBuf> {
+    std::env::current_dir().map_err(|error| {
+        CowshedError::environment_missing(
+            format!("could not determine the invocation directory: {error}"),
+            "run cowshed from an accessible workspace directory",
         )
     })
 }
@@ -687,6 +947,40 @@ fn emit_mount<W: Write, E: Write>(
     }
 }
 
+const fn ensure_action(action: EnsureAction) -> &'static str {
+    match action {
+        EnsureAction::AlreadyMounted => "already mounted",
+        EnsureAction::Attached => "attached",
+        EnsureAction::Healed => "healed",
+    }
+}
+
+fn emit_push<W: Write, E: Write>(output: &mut Output<W, E>, report: &PushReport) -> Result<()> {
+    output
+        .bare(report.destination_ref.as_bytes())
+        .and_then(|()| output.bare(b"\t"))
+        .and_then(|()| output.bare(report.source_head.as_str().as_bytes()))
+        .and_then(|()| output.bare(b"\n"))
+        .map_err(output_error)
+}
+
+fn emit_land<W: Write, E: Write>(output: &mut Output<W, E>, report: &LandReport) -> Result<()> {
+    output
+        .bare(report.target_branch.as_bytes())
+        .and_then(|()| output.bare(b"\t"))
+        .and_then(|()| output.bare(report.landed_head.as_str().as_bytes()))
+        .and_then(|()| output.bare(b"\t"))
+        .and_then(|()| {
+            output.bare(if report.target_was_checked_out {
+                b"true"
+            } else {
+                b"false"
+            })
+        })
+        .and_then(|()| output.bare(b"\n"))
+        .map_err(output_error)
+}
+
 fn emit_workspace_tsv<W: Write, E: Write>(
     output: &mut Output<W, E>,
     workspaces: &[WorkspaceInfo],
@@ -816,6 +1110,16 @@ mod tests {
         let cases = [
             (vec!["adopt", "/repo"], RuntimeOpenMode::Provision),
             (vec!["new", "raven"], RuntimeOpenMode::ExistingOnly),
+            (
+                vec!["fork", "raven", "falcon"],
+                RuntimeOpenMode::ExistingOnly,
+            ),
+            (vec!["checkpoint", "raven"], RuntimeOpenMode::ExistingOnly),
+            (
+                vec!["restore", "raven", "stable"],
+                RuntimeOpenMode::ExistingOnly,
+            ),
+            (vec!["ensure"], RuntimeOpenMode::ExistingOnly),
             (vec!["ls"], RuntimeOpenMode::ExistingOnly),
             (vec!["path", "raven"], RuntimeOpenMode::ExistingOnly),
             (
@@ -825,6 +1129,10 @@ mod tests {
             (vec!["rm", "raven"], RuntimeOpenMode::ExistingOnly),
             (vec!["attach", "raven"], RuntimeOpenMode::ExistingOnly),
             (vec!["detach", "raven"], RuntimeOpenMode::ExistingOnly),
+            (vec!["gc"], RuntimeOpenMode::ExistingOnly),
+            (vec!["push", "raven"], RuntimeOpenMode::ExistingOnly),
+            (vec!["rebase", "raven"], RuntimeOpenMode::ExistingOnly),
+            (vec!["land", "raven"], RuntimeOpenMode::ExistingOnly),
             (vec!["doctor"], RuntimeOpenMode::ExistingOnly),
         ];
 

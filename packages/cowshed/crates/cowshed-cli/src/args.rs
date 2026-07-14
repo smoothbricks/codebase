@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::PathBuf;
 
-pub const COMMAND_MAP: &str = "commands:\n  adopt [path]       adopt a checkout\n  new <name>         create a workspace\n  ls                 list workspaces\n  path <ws>          print a workspace mount\n  exec <ws> -- <cmd> run an argv command\n  rm <ws>            remove a workspace\n  attach <ws>        attach a workspace\n  detach <ws>        detach a workspace\n  doctor             check invariants";
+pub const COMMAND_MAP: &str = "commands:\n  adopt [path]       adopt a checkout\n  new <name>         create a workspace\n  fork <src> <dst>   fork a workspace\n  checkpoint <ws>    create a checkpoint\n  restore <ws> <id>  restore a checkpoint\n  ensure             heal the current workspace\n  ls                 list workspaces\n  path <ws>          print a workspace mount\n  exec <ws> -- <cmd> run an argv command\n  rm <ws>            remove a workspace\n  attach <ws>        attach a workspace\n  detach <ws>        detach a workspace\n  gc                 reclaim storage\n  push <ws>          preserve a workspace ref\n  rebase <ws>        rebase a workspace\n  land <ws>          land a workspace\n  doctor             check invariants";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GlobalOptions {
@@ -21,12 +21,20 @@ pub struct Cli {
 pub enum Command {
     Adopt(AdoptArgs),
     New(NewArgs),
+    Fork(ForkArgs),
+    Checkpoint(CheckpointArgs),
+    Restore(RestoreArgs),
+    Ensure(EnsureArgs),
     List,
     Path(PathArgs),
     Exec(ExecArgs),
     Remove(RemoveArgs),
     Attach(AttachArgs),
     Detach(DetachArgs),
+    Gc(GcArgs),
+    Push(PushArgs),
+    Rebase(RebaseArgs),
+    Land(LandArgs),
     Doctor,
 }
 
@@ -43,6 +51,31 @@ pub struct NewArgs {
     pub from: Option<String>,
     pub browse: bool,
     pub slot: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForkArgs {
+    pub source: String,
+    pub destination: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointArgs {
+    pub workspace: String,
+    pub label: Option<OsString>,
+    pub keep: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestoreArgs {
+    pub workspace: String,
+    pub label: OsString,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EnsureArgs {
+    pub envrc: bool,
+    pub attach: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,6 +110,7 @@ pub struct ExecArgs {
 pub struct RemoveArgs {
     pub workspace: String,
     pub force: bool,
+    pub restore: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,6 +122,42 @@ pub struct AttachArgs {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DetachArgs {
     pub workspace: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GcArgs {
+    pub dry_run: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PushArgs {
+    pub workspace: String,
+    pub branch: Option<OsString>,
+    pub expected_workspace_incarnation: Option<OsString>,
+    pub expected_source_head: Option<OsString>,
+    pub expected_destination_head: Option<OsString>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RebaseArgs {
+    pub workspace: String,
+    pub onto: Option<OsString>,
+    pub fresh: bool,
+    pub expected_workspace_incarnation: Option<OsString>,
+    pub expected_source_head: Option<OsString>,
+    pub expected_onto_head: Option<OsString>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LandArgs {
+    pub workspace: String,
+    pub target: Option<OsString>,
+    pub checks: Vec<OsString>,
+    pub retire: bool,
+    pub push_only: bool,
+    pub expected_workspace_incarnation: Option<OsString>,
+    pub expected_source_head: Option<OsString>,
+    pub expected_target_head: Option<OsString>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,12 +214,20 @@ impl std::error::Error for UsageError {}
 enum CommandName {
     Adopt,
     New,
+    Fork,
+    Checkpoint,
+    Restore,
+    Ensure,
     List,
     Path,
     Exec,
     Remove,
     Attach,
     Detach,
+    Gc,
+    Push,
+    Rebase,
+    Land,
     Doctor,
 }
 
@@ -166,12 +244,20 @@ where
     let command = match args.get(index).and_then(|arg| arg.to_str()) {
         Some("adopt") => CommandName::Adopt,
         Some("new") => CommandName::New,
+        Some("fork") => CommandName::Fork,
+        Some("checkpoint") => CommandName::Checkpoint,
+        Some("restore") => CommandName::Restore,
+        Some("ensure") => CommandName::Ensure,
         Some("ls") => CommandName::List,
         Some("path") => CommandName::Path,
         Some("exec") => CommandName::Exec,
         Some("rm") => CommandName::Remove,
         Some("attach") => CommandName::Attach,
         Some("detach") => CommandName::Detach,
+        Some("gc") => CommandName::Gc,
+        Some("push") => CommandName::Push,
+        Some("rebase") => CommandName::Rebase,
+        Some("land") => CommandName::Land,
         Some("doctor") => CommandName::Doctor,
         Some(other) => {
             return Err(UsageError::new(
@@ -186,12 +272,20 @@ where
     let command = match command {
         CommandName::Adopt => parse_adopt(&args, index, &mut global)?,
         CommandName::New => parse_new(&args, index, &mut global)?,
+        CommandName::Fork => parse_fork(&args, index, &mut global)?,
+        CommandName::Checkpoint => parse_checkpoint(&args, index, &mut global)?,
+        CommandName::Restore => parse_restore(&args, index, &mut global)?,
+        CommandName::Ensure => parse_ensure(&args, index, &mut global)?,
         CommandName::List => parse_empty(&args, index, &mut global, "ls", Command::List)?,
         CommandName::Path => parse_path(&args, index, &mut global)?,
         CommandName::Exec => parse_exec(&mut args, index, &mut global)?,
         CommandName::Remove => parse_remove(&args, index, &mut global)?,
         CommandName::Attach => parse_attach(&args, index, &mut global)?,
         CommandName::Detach => parse_detach(&args, index, &mut global)?,
+        CommandName::Gc => parse_gc(&args, index, &mut global)?,
+        CommandName::Push => parse_push(&args, index, &mut global)?,
+        CommandName::Rebase => parse_rebase(&args, index, &mut global)?,
+        CommandName::Land => parse_land(&args, index, &mut global)?,
         CommandName::Doctor => parse_empty(&args, index, &mut global, "doctor", Command::Doctor)?,
     };
     Ok(Cli { global, command })
@@ -298,6 +392,140 @@ fn parse_new(
         browse,
         slot,
     }))
+}
+
+fn parse_fork(
+    args: &[OsString],
+    mut index: usize,
+    global: &mut GlobalOptions,
+) -> Result<Command, UsageError> {
+    const USAGE: &str = "fork <src> <dst>";
+    let mut source = None;
+    let mut destination = None;
+    while index < args.len() {
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
+        match args[index].to_str() {
+            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
+            _ if source.is_none() => {
+                source = Some(workspace_name(&args[index], false, USAGE)?);
+            }
+            _ if destination.is_none() => {
+                destination = Some(workspace_name(&args[index], true, USAGE)?);
+            }
+            _ => {
+                return Err(UsageError::new(
+                    "fork accepts exactly two workspaces",
+                    USAGE,
+                ));
+            }
+        }
+        index += 1;
+    }
+    Ok(Command::Fork(ForkArgs {
+        source: source.ok_or_else(|| UsageError::new("fork requires a source workspace", USAGE))?,
+        destination: destination
+            .ok_or_else(|| UsageError::new("fork requires a destination workspace", USAGE))?,
+    }))
+}
+
+fn parse_checkpoint(
+    args: &[OsString],
+    mut index: usize,
+    global: &mut GlobalOptions,
+) -> Result<Command, UsageError> {
+    const USAGE: &str = "checkpoint <ws> [label] [--keep]";
+    let mut workspace = None;
+    let mut label = None;
+    let mut keep = false;
+    while index < args.len() {
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
+        match args[index].to_str() {
+            Some("--keep") => keep = true,
+            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
+            _ if workspace.is_none() => {
+                workspace = Some(workspace_name(&args[index], false, USAGE)?);
+            }
+            _ if label.is_none() => label = Some(args[index].clone()),
+            _ => {
+                return Err(UsageError::new(
+                    "checkpoint accepts one workspace and at most one label",
+                    USAGE,
+                ));
+            }
+        }
+        index += 1;
+    }
+    Ok(Command::Checkpoint(CheckpointArgs {
+        workspace: workspace
+            .ok_or_else(|| UsageError::new("checkpoint requires a workspace", USAGE))?,
+        label,
+        keep,
+    }))
+}
+
+fn parse_restore(
+    args: &[OsString],
+    mut index: usize,
+    global: &mut GlobalOptions,
+) -> Result<Command, UsageError> {
+    const USAGE: &str = "restore <ws> <label>";
+    let mut workspace = None;
+    let mut label = None;
+    while index < args.len() {
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
+        match args[index].to_str() {
+            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
+            _ if workspace.is_none() => {
+                workspace = Some(workspace_name(&args[index], false, USAGE)?);
+            }
+            _ if label.is_none() => label = Some(args[index].clone()),
+            _ => {
+                return Err(UsageError::new(
+                    "restore accepts exactly one workspace and one label",
+                    USAGE,
+                ));
+            }
+        }
+        index += 1;
+    }
+    Ok(Command::Restore(RestoreArgs {
+        workspace: workspace
+            .ok_or_else(|| UsageError::new("restore requires a workspace", USAGE))?,
+        label: label.ok_or_else(|| UsageError::new("restore requires a label", USAGE))?,
+    }))
+}
+
+fn parse_ensure(
+    args: &[OsString],
+    mut index: usize,
+    global: &mut GlobalOptions,
+) -> Result<Command, UsageError> {
+    const USAGE: &str = "ensure [--envrc] [--attach]";
+    let mut parsed = EnsureArgs::default();
+    while index < args.len() {
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
+        match args[index].to_str() {
+            Some("--envrc") => parsed.envrc = true,
+            Some("--attach") => parsed.attach = true,
+            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
+            _ => {
+                return Err(UsageError::new(
+                    "ensure accepts no positional arguments",
+                    USAGE,
+                ));
+            }
+        }
+        index += 1;
+    }
+    Ok(Command::Ensure(parsed))
 }
 
 fn parse_path(
@@ -440,15 +668,17 @@ fn parse_remove(
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "rm <ws> [--force]";
+    const USAGE: &str = "rm <ws> [--force] [--restore]";
     let mut workspace = None;
     let mut force = false;
+    let mut restore = false;
     while index < args.len() {
         if parse_global(args, &mut index, global)? {
             continue;
         }
         match args[index].to_str() {
             Some("--force") => force = true,
+            Some("--restore") => restore = true,
             Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
             _ if workspace.is_none() => {
                 workspace = Some(workspace_name(&args[index], false, USAGE)?)
@@ -457,9 +687,17 @@ fn parse_remove(
         }
         index += 1;
     }
+    let workspace = workspace.ok_or_else(|| UsageError::new("rm requires a workspace", USAGE))?;
+    if restore && workspace != "main" {
+        return Err(UsageError::new(
+            "--restore is only valid for the main workspace",
+            USAGE,
+        ));
+    }
     Ok(Command::Remove(RemoveArgs {
-        workspace: workspace.ok_or_else(|| UsageError::new("rm requires a workspace", USAGE))?,
+        workspace,
         force,
+        restore,
     }))
 }
 
@@ -525,6 +763,215 @@ fn parse_detach(
     Ok(Command::Detach(DetachArgs {
         workspace: workspace
             .ok_or_else(|| UsageError::new("detach requires a workspace", USAGE))?,
+    }))
+}
+
+fn parse_gc(
+    args: &[OsString],
+    mut index: usize,
+    global: &mut GlobalOptions,
+) -> Result<Command, UsageError> {
+    const USAGE: &str = "gc [--dry-run]";
+    let mut parsed = GcArgs::default();
+    while index < args.len() {
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
+        match args[index].to_str() {
+            Some("--dry-run") => parsed.dry_run = true,
+            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
+            _ => return Err(UsageError::new("gc accepts no positional arguments", USAGE)),
+        }
+        index += 1;
+    }
+    Ok(Command::Gc(parsed))
+}
+
+fn parse_push(
+    args: &[OsString],
+    mut index: usize,
+    global: &mut GlobalOptions,
+) -> Result<Command, UsageError> {
+    const USAGE: &str = "push <ws> [--branch <name>] [--expected-workspace-incarnation <id>] [--expected-source-head <oid>] [--expected-destination-head <oid|missing>]";
+    let mut workspace = None;
+    let mut branch = None;
+    let mut expected_workspace_incarnation = None;
+    let mut expected_source_head = None;
+    let mut expected_destination_head = None;
+    while index < args.len() {
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
+        match args[index].to_str() {
+            Some("--branch") => branch = Some(take_value(args, &mut index, "--branch", USAGE)?),
+            Some("--expected-workspace-incarnation") => {
+                expected_workspace_incarnation = Some(take_value(
+                    args,
+                    &mut index,
+                    "--expected-workspace-incarnation",
+                    USAGE,
+                )?);
+            }
+            Some("--expected-source-head") => {
+                expected_source_head = Some(take_value(
+                    args,
+                    &mut index,
+                    "--expected-source-head",
+                    USAGE,
+                )?);
+            }
+            Some("--expected-destination-head") => {
+                expected_destination_head = Some(take_value(
+                    args,
+                    &mut index,
+                    "--expected-destination-head",
+                    USAGE,
+                )?);
+            }
+            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
+            _ if workspace.is_none() => {
+                workspace = Some(workspace_name(&args[index], false, USAGE)?);
+            }
+            _ => return Err(UsageError::new("push accepts exactly one workspace", USAGE)),
+        }
+        index += 1;
+    }
+    Ok(Command::Push(PushArgs {
+        workspace: workspace.ok_or_else(|| UsageError::new("push requires a workspace", USAGE))?,
+        branch,
+        expected_workspace_incarnation,
+        expected_source_head,
+        expected_destination_head,
+    }))
+}
+
+fn parse_rebase(
+    args: &[OsString],
+    mut index: usize,
+    global: &mut GlobalOptions,
+) -> Result<Command, UsageError> {
+    const USAGE: &str = "rebase <ws> [--onto <rev>] [--fresh] [--expected-workspace-incarnation <id>] [--expected-source-head <oid>] [--expected-onto-head <oid>]";
+    let mut workspace = None;
+    let mut onto = None;
+    let mut fresh = false;
+    let mut expected_workspace_incarnation = None;
+    let mut expected_source_head = None;
+    let mut expected_onto_head = None;
+    while index < args.len() {
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
+        match args[index].to_str() {
+            Some("--onto") => onto = Some(take_value(args, &mut index, "--onto", USAGE)?),
+            Some("--fresh") => fresh = true,
+            Some("--expected-workspace-incarnation") => {
+                expected_workspace_incarnation = Some(take_value(
+                    args,
+                    &mut index,
+                    "--expected-workspace-incarnation",
+                    USAGE,
+                )?);
+            }
+            Some("--expected-source-head") => {
+                expected_source_head = Some(take_value(
+                    args,
+                    &mut index,
+                    "--expected-source-head",
+                    USAGE,
+                )?);
+            }
+            Some("--expected-onto-head") => {
+                expected_onto_head =
+                    Some(take_value(args, &mut index, "--expected-onto-head", USAGE)?);
+            }
+            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
+            _ if workspace.is_none() => {
+                workspace = Some(workspace_name(&args[index], false, USAGE)?);
+            }
+            _ => {
+                return Err(UsageError::new(
+                    "rebase accepts exactly one workspace",
+                    USAGE,
+                ));
+            }
+        }
+        index += 1;
+    }
+    Ok(Command::Rebase(RebaseArgs {
+        workspace: workspace
+            .ok_or_else(|| UsageError::new("rebase requires a workspace", USAGE))?,
+        onto,
+        fresh,
+        expected_workspace_incarnation,
+        expected_source_head,
+        expected_onto_head,
+    }))
+}
+
+fn parse_land(
+    args: &[OsString],
+    mut index: usize,
+    global: &mut GlobalOptions,
+) -> Result<Command, UsageError> {
+    const USAGE: &str = "land <ws> [--target <branch>] [--check <cmd>] [--no-retire] [--push-only] [--expected-workspace-incarnation <id>] [--expected-source-head <oid>] [--expected-target-head <oid|missing>]";
+    let mut workspace = None;
+    let mut target = None;
+    let mut checks = Vec::new();
+    let mut retire = true;
+    let mut push_only = false;
+    let mut expected_workspace_incarnation = None;
+    let mut expected_source_head = None;
+    let mut expected_target_head = None;
+    while index < args.len() {
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
+        match args[index].to_str() {
+            Some("--target") => target = Some(take_value(args, &mut index, "--target", USAGE)?),
+            Some("--check") => checks.push(take_value(args, &mut index, "--check", USAGE)?),
+            Some("--no-retire") => retire = false,
+            Some("--push-only") => push_only = true,
+            Some("--expected-workspace-incarnation") => {
+                expected_workspace_incarnation = Some(take_value(
+                    args,
+                    &mut index,
+                    "--expected-workspace-incarnation",
+                    USAGE,
+                )?);
+            }
+            Some("--expected-source-head") => {
+                expected_source_head = Some(take_value(
+                    args,
+                    &mut index,
+                    "--expected-source-head",
+                    USAGE,
+                )?);
+            }
+            Some("--expected-target-head") => {
+                expected_target_head = Some(take_value(
+                    args,
+                    &mut index,
+                    "--expected-target-head",
+                    USAGE,
+                )?);
+            }
+            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
+            _ if workspace.is_none() => {
+                workspace = Some(workspace_name(&args[index], false, USAGE)?);
+            }
+            _ => return Err(UsageError::new("land accepts exactly one workspace", USAGE)),
+        }
+        index += 1;
+    }
+    Ok(Command::Land(LandArgs {
+        workspace: workspace.ok_or_else(|| UsageError::new("land requires a workspace", USAGE))?,
+        target,
+        checks,
+        retire,
+        push_only,
+        expected_workspace_incarnation,
+        expected_source_head,
+        expected_target_head,
     }))
 }
 
@@ -748,13 +1195,100 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_options_parse_with_last_value_precedence() {
+        let cli = parse_args([
+            "land",
+            "raven",
+            "--target",
+            "release/one",
+            "--check",
+            "cargo test",
+            "--target",
+            "release/two",
+            "--check",
+            "cargo clippy",
+            "--no-retire",
+            "--push-only",
+            "--expected-workspace-incarnation",
+            "0198f2c0b7e34dc795f17b238b331c80",
+            "--expected-source-head",
+            "1111111111111111111111111111111111111111",
+            "--expected-target-head",
+            "missing",
+            "--json",
+        ])
+        .unwrap();
+        let Command::Land(args) = cli.command else {
+            panic!("expected land")
+        };
+        assert_eq!(args.target, Some(OsString::from("release/two")));
+        assert_eq!(
+            args.checks,
+            [OsString::from("cargo test"), OsString::from("cargo clippy")]
+        );
+        assert!(!args.retire);
+        assert!(args.push_only);
+        assert!(cli.global.json);
+
+        let Command::Remove(remove) = parse_args(["rm", "main", "--restore"]).unwrap().command
+        else {
+            panic!("expected remove")
+        };
+        assert!(remove.restore);
+        assert!(!remove.force);
+    }
+
+    #[test]
+    fn lifecycle_parsers_enforce_required_values_and_preserve_revision_bytes() {
+        assert!(parse_args(["fork", "raven"]).is_err());
+        assert!(parse_args(["checkpoint"]).is_err());
+        assert!(parse_args(["restore", "raven"]).is_err());
+        assert!(parse_args(["push", "raven", "--branch"]).is_err());
+        assert!(parse_args(["land", "raven", "--check"]).is_err());
+        assert!(parse_args(["rm", "raven", "--restore"]).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::{OsStrExt, OsStringExt};
+            let opaque = OsString::from_vec(vec![b'm', 0x80, b'a', b'i', b'n']);
+            let cli = parse_args(vec![
+                OsString::from("rebase"),
+                OsString::from("raven"),
+                OsString::from("--onto"),
+                opaque.clone(),
+            ])
+            .unwrap();
+            let Command::Rebase(args) = cli.command else {
+                panic!("expected rebase")
+            };
+            assert_eq!(args.onto.unwrap().as_bytes(), opaque.as_bytes());
+        }
+    }
+
+    #[test]
     fn no_args_is_usage_and_command_map_is_complete() {
         let error = parse_args(Vec::<OsString>::new()).unwrap_err();
         assert_eq!(error.exit_code(), 2);
         assert_eq!(error.kind, UsageErrorKind::MissingCommand);
         let map = error.command_map().unwrap();
         for command in [
-            "adopt", "new", "ls", "path", "exec", "rm", "attach", "detach", "doctor",
+            "adopt",
+            "new",
+            "fork",
+            "checkpoint",
+            "restore",
+            "ensure",
+            "ls",
+            "path",
+            "exec",
+            "rm",
+            "attach",
+            "detach",
+            "gc",
+            "push",
+            "rebase",
+            "land",
+            "doctor",
         ] {
             assert!(
                 map.lines()
