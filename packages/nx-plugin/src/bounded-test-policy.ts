@@ -41,7 +41,11 @@ export function applyBoundedTestTargetPolicy(
   options: ApplyBoundedTestTargetPolicyOptions,
 ): void {
   const command = resolveTestCommand(packageJson, options.defaultCommand ?? 'bun test', options.projectJson);
-  const targetOwner = options.projectJson ?? (packageJson.nx ??= {});
+  let targetOwner = options.projectJson;
+  if (!targetOwner) {
+    packageJson.nx ??= {};
+    targetOwner = packageJson.nx;
+  }
 
   targetOwner.targets ??= {};
 
@@ -251,7 +255,22 @@ function listWorkspacePackageJsonPaths(root: string): string[] {
 }
 
 function readPackageJson(path: string): BoundedTestPolicyPackageJson {
-  return JSON.parse(readFileSync(path, 'utf8')) as BoundedTestPolicyPackageJson;
+  const parsed = readJsonObject(path);
+  const nx = isRecord(parsed.nx) ? parsed.nx : undefined;
+  const normalizedNx = nx
+    ? {
+        ...nx,
+        name: typeof nx.name === 'string' ? nx.name : undefined,
+        targets: readTargets(nx.targets),
+      }
+    : undefined;
+  return {
+    ...parsed,
+    name: typeof parsed.name === 'string' ? parsed.name : undefined,
+    workspaces: parsed.workspaces,
+    scripts: isRecord(parsed.scripts) ? parsed.scripts : undefined,
+    nx: normalizedNx,
+  };
 }
 
 function writePackageJson(path: string, packageJson: BoundedTestPolicyPackageJson): void {
@@ -259,7 +278,31 @@ function writePackageJson(path: string, packageJson: BoundedTestPolicyPackageJso
 }
 
 function readProjectJson(path: string): BoundedTestPolicyProjectJson {
-  return JSON.parse(readFileSync(path, 'utf8')) as BoundedTestPolicyProjectJson;
+  const parsed = readJsonObject(path);
+  return {
+    ...parsed,
+    name: typeof parsed.name === 'string' ? parsed.name : undefined,
+    targets: readTargets(parsed.targets),
+  };
+}
+
+function readJsonObject(path: string): Record<string, unknown> {
+  const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+  if (!isRecord(parsed)) {
+    throw new Error(`${path} must contain a JSON object`);
+  }
+  return parsed;
+}
+
+function readTargets(value: unknown): Record<string, Record<string, unknown>> | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const targets: Record<string, Record<string, unknown>> = {};
+  for (const [name, target] of Object.entries(value)) {
+    targets[name] = isRecord(target) ? target : {};
+  }
+  return targets;
 }
 
 function writeProjectJson(path: string, projectJson: BoundedTestPolicyProjectJson): void {

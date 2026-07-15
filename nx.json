@@ -20,10 +20,32 @@
   "targetDefaults": {
     "build": {
       "cache": true,
+      "dependsOn": [
+        "^build",
+        "*-js",
+        "*-web",
+        "*-html",
+        "*-css",
+        "*-ios",
+        "*-android",
+        "*-native",
+        "*-napi",
+        "*-bun",
+        "*-wasm"
+      ],
       "outputs": ["{projectRoot}/dist"]
     },
     "typecheck": {
-      "cache": true
+      "cache": true,
+      "outputs": []
+    },
+    "typecheck-tests": {
+      "cache": true,
+      "dependsOn": ["typecheck"],
+      "options": {
+        "command": "ttsc -p tsconfig.test.json --noEmit",
+        "cwd": "{projectRoot}"
+      }
     },
     "test": {
       "dependsOn": ["^build", "build"],
@@ -32,7 +54,7 @@
     "lint": {
       "executor": "nx:run-commands",
       "cache": true,
-      "dependsOn": ["typecheck"],
+      "dependsOn": ["typecheck-tests", "cargo-lint"],
       "inputs": [
         "{projectRoot}/src/**/*",
         "{projectRoot}/package.json",
