@@ -40,7 +40,7 @@ export default async function generator(tree: Tree, schema: MakePublicGeneratorS
       };
     }
 
-    const nx = (pkg.nx ?? {}) as Record<string, unknown>;
+    const nx = isRecord(pkg.nx) ? pkg.nx : {};
     const tags = Array.isArray(nx.tags) ? [...nx.tags] : [];
     if (!tags.includes('npm:public')) {
       tags.push('npm:public');
@@ -54,6 +54,10 @@ export default async function generator(tree: Tree, schema: MakePublicGeneratorS
 
     return pkg;
   });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function resolveProject(tree: Tree, projectInput: string): { name: string; root: string } {

@@ -43,7 +43,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('infers validation and aggregate build targets without owning TypeScript lib build', async () => {
+  it('overrides inferred TypeScript compiler commands with ttsc', async () => {
     const workspace = await createWorkspace();
     try {
       await workspace.write(
@@ -55,7 +55,14 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       const targets = await inferProjectTargets(workspace, 'packages/example/package.json');
 
-      expect(targets['tsc-js']).toBeUndefined();
+      expect(targets['tsc-js']?.options).toMatchObject({
+        command: 'ttsc -p tsconfig.lib.json --emit',
+        cwd: 'packages/example',
+      });
+      expect(targets.typecheck?.options).toMatchObject({
+        command: 'ttsc -p tsconfig.lib.json --noEmit',
+        cwd: 'packages/example',
+      });
       expect(targets.build?.executor).toBe('nx:noop');
       expect(targets.build?.cache).toBe(true);
       expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
@@ -66,14 +73,14 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['typecheck-tests']?.cache).toBe(true);
       expect(targets['typecheck-tests']?.dependsOn).toEqual(['typecheck']);
       expect(targets['typecheck-tests']?.options).toMatchObject({
-        command: 'tsc --noEmit -p tsconfig.test.json',
+        command: 'ttsc -p tsconfig.test.json --noEmit',
         cwd: 'packages/example',
       });
 
       expect(targets['typecheck-tests:watch']?.executor).toBe('nx:run-commands');
       expect(targets['typecheck-tests:watch']?.continuous).toBe(true);
       expect(targets['typecheck-tests:watch']?.options).toMatchObject({
-        command: 'tsc --noEmit -p tsconfig.test.json --watch',
+        command: 'ttsc -p tsconfig.test.json --noEmit --watch',
         cwd: 'packages/example',
       });
 
@@ -85,7 +92,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         cwd: 'packages/example',
       });
 
-      expect(targets.lint?.executor).toBe('nx:noop');
+      expect(targets.lint?.executor).toBeUndefined();
       expect(targets.lint?.cache).toBe(true);
       expect(targets.lint?.dependsOn).toEqual(['typecheck-tests']);
     } finally {

@@ -101,19 +101,19 @@ describe('checkTypecheckTestConfig', () => {
   it('reports missing noEmit', () => {
     const issues = checkTypecheckTestConfig({ compilerOptions: { composite: false } }, 'packages/app');
     expect(issues.length).toBe(1);
-    expect(issues[0]!.message).toContain('noEmit must be true');
+    expect(issues[0]?.message).toContain('noEmit must be true');
   });
 
   it('reports composite = true', () => {
     const issues = checkTypecheckTestConfig({ compilerOptions: { noEmit: true, composite: true } }, 'packages/app');
     expect(issues.length).toBe(1);
-    expect(issues[0]!.message).toContain('composite');
+    expect(issues[0]?.message).toContain('composite');
   });
 
   it('reports declaration = true', () => {
     const issues = checkTypecheckTestConfig({ compilerOptions: { noEmit: true, declaration: true } }, 'packages/app');
     expect(issues.length).toBe(1);
-    expect(issues[0]!.message).toContain('declaration = true');
+    expect(issues[0]?.message).toContain('declaration = true');
   });
 
   it('reports declarationMap = true', () => {
@@ -122,13 +122,13 @@ describe('checkTypecheckTestConfig', () => {
       'packages/app',
     );
     expect(issues.length).toBe(1);
-    expect(issues[0]!.message).toContain('declarationMap');
+    expect(issues[0]?.message).toContain('declarationMap');
   });
 
   it('reports dist-test outDir', () => {
     const issues = checkTypecheckTestConfig({ compilerOptions: { noEmit: true, outDir: 'dist-test' } }, 'packages/app');
     expect(issues.length).toBe(1);
-    expect(issues[0]!.message).toContain('dist-test');
+    expect(issues[0]?.message).toContain('dist-test');
   });
 
   it('reports dist-test tsBuildInfoFile', () => {
@@ -137,7 +137,7 @@ describe('checkTypecheckTestConfig', () => {
       'packages/app',
     );
     expect(issues.length).toBe(1);
-    expect(issues[0]!.message).toContain('dist-test');
+    expect(issues[0]?.message).toContain('dist-test');
   });
 
   it('returns empty for null input', () => {
@@ -147,8 +147,8 @@ describe('checkTypecheckTestConfig', () => {
 
   it('uses packagePath in issue path', () => {
     const issues = checkTypecheckTestConfig({ compilerOptions: {} }, 'packages/mylib');
-    expect(issues[0]!.path).toContain('packages/mylib');
-    expect(issues[0]!.path).toContain('tsconfig.test.json');
+    expect(issues[0]?.path).toContain('packages/mylib');
+    expect(issues[0]?.path).toContain('tsconfig.test.json');
   });
 });
 
@@ -164,7 +164,7 @@ describe('checkTsconfigTestReference', () => {
       'packages/app',
     );
     expect(issues.length).toBe(1);
-    expect(issues[0]!.message).toContain('must not reference ./tsconfig.test.json');
+    expect(issues[0]?.message).toContain('must not reference ./tsconfig.test.json');
   });
 
   it('returns empty for null input', () => {
@@ -183,7 +183,7 @@ describe('applyTypecheckTestDefaults', () => {
     expect(changed).toBe(true);
     expect(tsconfigTest.extends).toBe('../../tsconfig.base.json');
 
-    const compilerOptions = tsconfigTest.compilerOptions as Record<string, unknown>;
+    const compilerOptions = expectRecord(tsconfigTest.compilerOptions);
     expect(compilerOptions.noEmit).toBe(true);
     expect(compilerOptions.composite).toBe(false);
     expect(compilerOptions.declaration).toBe(false);
@@ -191,11 +191,11 @@ describe('applyTypecheckTestDefaults', () => {
     expect(compilerOptions.emitDeclarationOnly).toBe(false);
     expect(compilerOptions.types).toContain('bun');
 
-    const include = tsconfigTest.include as string[];
+    const include = expectStringArray(tsconfigTest.include);
     expect(include).toContain('src/**/*.test.ts');
     expect(include).toContain('src/**/*.spec.ts');
 
-    const references = tsconfigTest.references as Array<{ path: string }>;
+    const references = expectReferences(tsconfigTest.references);
     expect(references).toContainEqual({ path: './tsconfig.lib.json' });
   });
 
@@ -216,7 +216,7 @@ describe('applyTypecheckTestDefaults', () => {
       libCompilerOptions: { baseUrl: '.', module: 'esnext', jsx: 'react-jsx' },
       referencePaths: [],
     });
-    const compilerOptions = tsconfigTest.compilerOptions as Record<string, unknown>;
+    const compilerOptions = expectRecord(tsconfigTest.compilerOptions);
     expect(compilerOptions.baseUrl).toBe('.');
     expect(compilerOptions.module).toBe('esnext');
     expect(compilerOptions.jsx).toBe('react-jsx');
@@ -228,7 +228,7 @@ describe('applyTypecheckTestDefaults', () => {
       testRunners: new Set(['vitest'] as const),
       referencePaths: [],
     });
-    const compilerOptions = tsconfigTest.compilerOptions as Record<string, unknown>;
+    const compilerOptions = expectRecord(tsconfigTest.compilerOptions);
     expect(compilerOptions.types).toBeUndefined();
   });
 
@@ -241,7 +241,7 @@ describe('applyTypecheckTestDefaults', () => {
       referencePaths: [],
     });
     expect(changed).toBe(true);
-    const compilerOptions = tsconfigTest.compilerOptions as Record<string, unknown>;
+    const compilerOptions = expectRecord(tsconfigTest.compilerOptions);
     expect('outDir' in compilerOptions).toBe(false);
     expect('tsBuildInfoFile' in compilerOptions).toBe(false);
   });
@@ -304,18 +304,18 @@ describe('typecheck test policy (Tree)', () => {
     expect(changed).toBe(true);
 
     const tsconfig = readJson<Record<string, unknown>>(tree, 'packages/app/tsconfig.test.json');
-    const compilerOptions = tsconfig.compilerOptions as Record<string, unknown>;
+    const compilerOptions = expectRecord(tsconfig.compilerOptions);
     expect(compilerOptions.noEmit).toBe(true);
     expect(compilerOptions.composite).toBe(false);
     expect(compilerOptions.types).toContain('bun');
     expect(compilerOptions.baseUrl).toBe('.');
     expect(tsconfig.extends).toBe('../../tsconfig.base.json');
 
-    const include = tsconfig.include as string[];
+    const include = expectStringArray(tsconfig.include);
     expect(include).toContain('src/**/*.test.ts');
     expect(include).toContain('src/**/*.spec.ts');
 
-    const references = tsconfig.references as Array<{ path: string }>;
+    const references = expectReferences(tsconfig.references);
     expect(references).toContainEqual({ path: './tsconfig.lib.json' });
   });
 
@@ -422,7 +422,7 @@ describe('typecheck test policy (Tree)', () => {
     expect(changed).toBe(true);
 
     const tsconfig = readJson<Record<string, unknown>>(tree, 'packages/app/tsconfig.json');
-    const references = tsconfig.references as Array<{ path: string }>;
+    const references = expectReferences(tsconfig.references);
     expect(references).toEqual([{ path: './tsconfig.lib.json' }]);
   });
 
@@ -479,7 +479,7 @@ describe('typecheck test policy (Tree)', () => {
     expect(applyTypecheckTestPolicyTree(tree)).toBe(true);
 
     const tsconfig = readJson<Record<string, unknown>>(tree, 'packages/app/tsconfig.test.json');
-    const references = tsconfig.references as Array<{ path: string }>;
+    const references = expectReferences(tsconfig.references);
     expect(references).toContainEqual({ path: './tsconfig.lib.json' });
     expect(references).toContainEqual({ path: '../lib/tsconfig.lib.json' });
   });
@@ -502,14 +502,14 @@ describe('typecheck test policy', () => {
       // check should report missing tsconfig.test.json
       const issues = checkTypecheckTestPolicy(root);
       expect(issues.length).toBe(1);
-      expect(issues[0]!.message).toContain('bun test');
-      expect(issues[0]!.message).toContain('tsconfig.test.json');
+      expect(issues[0]?.message).toContain('bun test');
+      expect(issues[0]?.message).toContain('tsconfig.test.json');
 
       // apply should create it
       expect(applyTypecheckTestPolicy(root)).toBe(true);
 
-      const tsconfig = (await readJsonFs(join(root, 'packages/app/tsconfig.test.json'))) as Record<string, unknown>;
-      const compilerOptions = tsconfig.compilerOptions as Record<string, unknown>;
+      const tsconfig = expectRecord(await readJsonFs(join(root, 'packages/app/tsconfig.test.json')));
+      const compilerOptions = expectRecord(tsconfig.compilerOptions);
       expect(compilerOptions.noEmit).toBe(true);
       expect(compilerOptions.composite).toBe(false);
       expect(compilerOptions.declaration).toBe(false);
@@ -518,7 +518,7 @@ describe('typecheck test policy', () => {
       expect(compilerOptions.types).toContain('bun');
       expect(tsconfig.extends).toBe('../../tsconfig.base.json');
 
-      const include = tsconfig.include as string[];
+      const include = expectStringArray(tsconfig.include);
       expect(include).toContain('src/**/*.test.ts');
       expect(include).toContain('src/**/*.spec.ts');
       expect(include).toContain('src/**/__tests__/**/*.ts');
@@ -545,8 +545,8 @@ describe('typecheck test policy', () => {
 
       expect(applyTypecheckTestPolicy(root)).toBe(true);
 
-      const tsconfig = (await readJsonFs(join(root, 'packages/web/tsconfig.test.json'))) as Record<string, unknown>;
-      const compilerOptions = tsconfig.compilerOptions as Record<string, unknown>;
+      const tsconfig = expectRecord(await readJsonFs(join(root, 'packages/web/tsconfig.test.json')));
+      const compilerOptions = expectRecord(tsconfig.compilerOptions);
       expect(compilerOptions.noEmit).toBe(true);
       // vitest should NOT add bun types
       expect(compilerOptions.types).toBeUndefined();
@@ -574,12 +574,12 @@ describe('typecheck test policy', () => {
 
       const issues = checkTypecheckTestPolicy(root);
       expect(issues.length).toBe(1);
-      expect(issues[0]!.message).toContain('bun test');
+      expect(issues[0]?.message).toContain('bun test');
 
       expect(applyTypecheckTestPolicy(root)).toBe(true);
 
-      const tsconfig = (await readJsonFs(join(root, 'packages/lib/tsconfig.test.json'))) as Record<string, unknown>;
-      const compilerOptions = tsconfig.compilerOptions as Record<string, unknown>;
+      const tsconfig = expectRecord(await readJsonFs(join(root, 'packages/lib/tsconfig.test.json')));
+      const compilerOptions = expectRecord(tsconfig.compilerOptions);
       expect(compilerOptions.noEmit).toBe(true);
       expect(compilerOptions.types).toContain('bun');
     } finally {
@@ -650,8 +650,8 @@ describe('typecheck test policy', () => {
       // apply should remove it
       expect(applyTypecheckTestPolicy(root)).toBe(true);
 
-      const tsconfig = (await readJsonFs(join(root, 'packages/app/tsconfig.json'))) as Record<string, unknown>;
-      const references = tsconfig.references as Array<{ path: string }>;
+      const tsconfig = expectRecord(await readJsonFs(join(root, 'packages/app/tsconfig.json')));
+      const references = expectReferences(tsconfig.references);
       expect(references).toEqual([{ path: './tsconfig.lib.json' }]);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -679,8 +679,8 @@ describe('typecheck test policy', () => {
 
       expect(applyTypecheckTestPolicy(root)).toBe(true);
 
-      const tsconfig = (await readJsonFs(join(root, 'packages/app/tsconfig.test.json'))) as Record<string, unknown>;
-      const compilerOptions = tsconfig.compilerOptions as Record<string, unknown>;
+      const tsconfig = expectRecord(await readJsonFs(join(root, 'packages/app/tsconfig.test.json')));
+      const compilerOptions = expectRecord(tsconfig.compilerOptions);
       expect(compilerOptions.baseUrl).toBe('.');
       expect(compilerOptions.module).toBe('esnext');
       expect(compilerOptions.moduleResolution).toBe('bundler');
@@ -690,7 +690,7 @@ describe('typecheck test policy', () => {
       expect(tsconfig.extends).toBe('../../tsconfig.base.json');
 
       // references should include ./tsconfig.lib.json
-      const references = tsconfig.references as Array<{ path: string }>;
+      const references = expectReferences(tsconfig.references);
       expect(references).toContainEqual({ path: './tsconfig.lib.json' });
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -720,8 +720,8 @@ describe('typecheck test policy', () => {
 
       expect(applyTypecheckTestPolicy(root)).toBe(true);
 
-      const tsconfig = (await readJsonFs(join(root, 'packages/app/tsconfig.test.json'))) as Record<string, unknown>;
-      const references = tsconfig.references as Array<{ path: string }>;
+      const tsconfig = expectRecord(await readJsonFs(join(root, 'packages/app/tsconfig.test.json')));
+      const references = expectReferences(tsconfig.references);
       expect(references).toContainEqual({ path: './tsconfig.lib.json' });
       expect(references).toContainEqual({ path: '../lib/tsconfig.lib.json' });
     } finally {
@@ -789,9 +789,55 @@ describe('typecheck test policy', () => {
 
       const issues = checkTypecheckTestPolicy(root);
       expect(issues.length).toBe(1);
-      expect(issues[0]!.message).toContain('bun test');
+      expect(issues[0]?.message).toContain('bun test');
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 });
+
+interface TypeScriptReference {
+  path: string;
+}
+
+function expectRecord(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) {
+    throw new Error('expected object');
+  }
+  return value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function expectStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    throw new Error('expected array');
+  }
+  const values: unknown[] = value;
+  if (!values.every((entry): entry is string => typeof entry === 'string')) {
+    throw new Error('expected string array');
+  }
+  return values;
+}
+
+function expectReferences(value: unknown): TypeScriptReference[] {
+  if (!Array.isArray(value)) {
+    throw new Error('expected array');
+  }
+  const values: unknown[] = value;
+  if (
+    !values.every(
+      (entry): entry is TypeScriptReference =>
+        entry !== null &&
+        typeof entry === 'object' &&
+        !Array.isArray(entry) &&
+        'path' in entry &&
+        typeof entry.path === 'string',
+    )
+  ) {
+    throw new Error('expected TypeScript references');
+  }
+  return values;
+}

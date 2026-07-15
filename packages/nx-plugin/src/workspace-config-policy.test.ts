@@ -183,9 +183,7 @@ describe('pure core: applyWorkspaceConfig', () => {
       namedInputs: validNamedInputs(),
     };
     expect(applyWorkspaceConfig(nxJson)).toBe(true);
-    const pluginNames = (nxJson.plugins as unknown[]).map((p: unknown) =>
-      typeof p === 'string' ? p : (p as Record<string, unknown>).plugin,
-    );
+    const pluginNames = readPluginNames(nxJson.plugins);
     expect(pluginNames).toContain('@nx/js/typescript');
     expect(pluginNames).toContain('@smoothbricks/nx-plugin');
   });
@@ -199,7 +197,7 @@ describe('pure core: applyWorkspaceConfig', () => {
       },
     };
     expect(applyWorkspaceConfig(nxJson)).toBe(true);
-    expect((nxJson.targetDefaults as Record<string, unknown>)['build:wasm']).toBeUndefined();
+    expect(expectRecord(nxJson.targetDefaults)['build:wasm']).toBeUndefined();
   });
 
   it('fixes imprecise production inputs', () => {
@@ -212,7 +210,7 @@ describe('pure core: applyWorkspaceConfig', () => {
       },
     };
     expect(applyWorkspaceConfig(nxJson)).toBe(true);
-    const namedInputs = nxJson.namedInputs as Record<string, unknown>;
+    const namedInputs = expectRecord(nxJson.namedInputs);
     expect(namedInputs.production).toEqual([
       '{projectRoot}/src/**/*',
       '{projectRoot}/package.json',
@@ -289,9 +287,7 @@ describe('Tree: applyWorkspaceConfigTree', () => {
     expect(applyWorkspaceConfigTree(tree)).toBe(true);
 
     const nxJson = readJson(tree, 'nx.json');
-    const pluginNames = (nxJson.plugins as unknown[]).map((p: unknown) =>
-      typeof p === 'string' ? p : (p as Record<string, unknown>).plugin,
-    );
+    const pluginNames = readPluginNames(nxJson.plugins);
     expect(pluginNames).toContain('@nx/js/typescript');
     expect(pluginNames).toContain('@smoothbricks/nx-plugin');
 
@@ -317,11 +313,11 @@ describe('Tree: applyWorkspaceConfigTree', () => {
     expect(applyWorkspaceConfigTree(tree)).toBe(true);
 
     const nxJson = readJson(tree, 'nx.json');
-    expect((nxJson.targetDefaults as Record<string, unknown>).build).toEqual({
+    expect(expectRecord(nxJson.targetDefaults).build).toEqual({
       cache: true,
       outputs: ['{projectRoot}/dist'],
     });
-    expect((nxJson.targetDefaults as Record<string, unknown>).clean).toEqual({
+    expect(expectRecord(nxJson.targetDefaults).clean).toEqual({
       executor: '@smoothbricks/nx-plugin:clean-outputs',
       cache: false,
     });
@@ -349,10 +345,8 @@ describe('filesystem: checkWorkspaceConfigPolicy / applyWorkspaceConfigPolicy', 
 
       expect(applyWorkspaceConfigPolicy(root)).toBe(true);
 
-      const nxJson = JSON.parse(await readFile(join(root, 'nx.json'), 'utf8'));
-      const pluginNames = (nxJson.plugins as unknown[]).map((p: unknown) =>
-        typeof p === 'string' ? p : (p as Record<string, unknown>).plugin,
-      );
+      const nxJson = expectRecord(JSON.parse(await readFile(join(root, 'nx.json'), 'utf8')));
+      const pluginNames = readPluginNames(nxJson.plugins);
       expect(pluginNames).toContain('@nx/js/typescript');
       expect(pluginNames).toContain('@smoothbricks/nx-plugin');
 
@@ -385,4 +379,23 @@ describe('filesystem: checkWorkspaceConfigPolicy / applyWorkspaceConfigPolicy', 
 async function writeJsonFile(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function expectRecord(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) {
+    throw new Error('expected object');
+  }
+  return value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function readPluginNames(value: unknown): unknown[] {
+  if (!Array.isArray(value)) {
+    throw new Error('expected plugins array');
+  }
+  const plugins: unknown[] = value;
+  return plugins.map((plugin) => (typeof plugin === 'string' ? plugin : expectRecord(plugin).plugin));
 }

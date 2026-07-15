@@ -140,14 +140,18 @@ function buildPackageJson(
     packageJson.license = 'MIT';
     packageJson.publishConfig = { access: 'public' };
     const rootRepository = rootPkg.repository;
-    if (rootRepository && typeof rootRepository === 'object') {
+    if (isRecord(rootRepository)) {
       packageJson.repository = {
-        type: (rootRepository as Record<string, unknown>).type ?? 'git',
-        url: (rootRepository as Record<string, unknown>).url,
+        type: rootRepository.type ?? 'git',
+        url: rootRepository.url,
         directory: projectRoot,
       };
     }
-    (packageJson.nx as Record<string, unknown>).tags = ['npm:public'];
+    const nx = packageJson.nx;
+    if (!isRecord(nx)) {
+      throw new Error('generated package.json nx configuration must be an object');
+    }
+    nx.tags = ['npm:public'];
   } else {
     packageJson.private = true;
   }
@@ -248,4 +252,8 @@ pub fn build(b: *std.Build) void {
 }
 `,
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }

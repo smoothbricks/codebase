@@ -12,12 +12,13 @@ import {
 
 const registryVersions: Record<string, string[]> = {
   '@biomejs/biome': ['2.3.5'],
-  '@nx/js': ['22.5.4'],
-  '@smoothbricks/nx-plugin': ['0.0.1'],
+  '@nx/js': ['23.1.0'],
+  '@smoothbricks/nx-plugin': ['0.3.0'],
   eslint: ['9.39.1'],
   'eslint-stdout': ['1.1.1', '1.1.2'],
-  nx: ['22.5.4'],
+  nx: ['23.1.0'],
   prettier: ['3.6.1'],
+  ttsc: ['0.18.4'],
   typescript: ['5.9.3'],
 };
 
@@ -25,7 +26,7 @@ const realFetch = globalThis.fetch;
 
 describe('tool configuration validation', () => {
   beforeEach(() => {
-    globalThis.fetch = mockRegistryFetch as typeof fetch;
+    globalThis.fetch = mockRegistryFetch;
   });
 
   afterEach(() => {
@@ -67,7 +68,7 @@ describe('tool configuration validation', () => {
       expect(rootPackage.devDependencies['@smoothbricks/cli']).toBeUndefined();
       expect(rootPackage.devDependencies['@smoothbricks/nx-plugin']).toBe('workspace:*');
       expect(rootPackage.devDependencies['eslint-stdout']).toBe('workspace:*');
-      expect(rootPackage.devDependencies.nx).toBe('22.5.4');
+      expect(rootPackage.devDependencies.nx).toBe('23.1.0');
       expect(rootPackage.workspaces).toContain('tooling');
       expect(toolingPackage.name).toBe('@smoothbricks/tooling');
       expect(toolingPackage.dependencies['@smoothbricks/cli']).toBe('workspace:*');
@@ -89,13 +90,14 @@ describe('tool configuration validation', () => {
         workspaces: ['packages/*', 'tooling'],
         devDependencies: {
           '@biomejs/biome': '^3.0.0',
-          '@nx/js': '22.6.0',
-          '@smoothbricks/nx-plugin': '^0.1.0',
+          '@nx/js': '23.2.0',
+          '@smoothbricks/nx-plugin': '^0.4.0',
           '@types/bun': '1.3.99',
           eslint: '^10.0.0',
           'eslint-stdout': await currentEslintStdoutRange(),
-          nx: '23.0.0',
+          nx: '24.0.0',
           prettier: '^3.7.0',
+          ttsc: '^0.19.0',
           typescript: '^6.0.0',
         },
       });
@@ -161,10 +163,11 @@ describe('tool configuration validation', () => {
         workspaces: ['packages/*', 'tooling'],
         devDependencies: {
           '@biomejs/biome': '^3.0.0',
-          '@nx/js': '22.6.0',
+          '@nx/js': '23.2.0',
           eslint: '^10.0.0',
-          nx: '23.0.0',
+          nx: '24.0.0',
           prettier: '^3.7.0',
+          ttsc: '^0.19.0',
           typescript: '^6.0.0',
         },
       });
@@ -195,20 +198,23 @@ async function currentEslintStdoutRange(): Promise<string> {
   return `^${latestPatchVersion('eslint-stdout', pkg.version) ?? pkg.version}`;
 }
 
-function mockRegistryFetch(input: Parameters<typeof fetch>[0]): Promise<Response> {
-  const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
-  const packageName = decodeURIComponent(new URL(url).pathname.slice(1));
-  const versions = registryVersions[packageName];
-  if (!versions) {
-    return Promise.resolve(new Response('{}', { status: 404 }));
-  }
-  return Promise.resolve(
-    new Response(JSON.stringify({ versions: Object.fromEntries(versions.map((version) => [version, {}])) }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    }),
-  );
-}
+const mockRegistryFetch = Object.assign(
+  (input: string | URL | Request): Promise<Response> => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    const packageName = decodeURIComponent(new URL(url).pathname.slice(1));
+    const versions = registryVersions[packageName];
+    if (!versions) {
+      return Promise.resolve(new Response('{}', { status: 404 }));
+    }
+    return Promise.resolve(
+      new Response(JSON.stringify({ versions: Object.fromEntries(versions.map((version) => [version, {}])) }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+  },
+  { preconnect: realFetch.preconnect },
+) satisfies typeof fetch;
 
 function latestPatchVersion(packageName: string, version: string): string | null {
   const [major, minor] = version.split('.');

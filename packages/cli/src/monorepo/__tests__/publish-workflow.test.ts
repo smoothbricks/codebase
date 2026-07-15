@@ -1,3 +1,5 @@
+/* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Assertions cover literal GitHub Actions expressions. */
+
 import { describe, expect, it } from 'bun:test';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -250,11 +252,17 @@ class WorkflowScenarioState {
   private readonly repairBuilds = new Set<string>();
   private readonly publishedCurrent = new Set<string>();
   private readonly durableGaps = new Set<string>();
-  private readonly validationState = {
+  private readonly validationState: {
+    checks: number;
+    builds: string[];
+    lints: string[];
+    tests: string[];
+    validates: number;
+  } = {
     checks: 0,
-    builds: [] as string[],
-    lints: [] as string[],
-    tests: [] as string[],
+    builds: [],
+    lints: [],
+    tests: [],
     validates: 0,
   };
 

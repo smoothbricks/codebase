@@ -67,16 +67,6 @@
   "nx": {
     "targets": {
       "lint": {},
-      "typecheck-tests": {
-        "executor": "nx:run-commands",
-        "options": {
-          "command": "tsc --noEmit -p tsconfig.test.json",
-          "cwd": "packages/cli"
-        },
-        "dependsOn": [
-          "build"
-        ]
-      },
       "test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {

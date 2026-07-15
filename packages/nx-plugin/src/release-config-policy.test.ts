@@ -122,30 +122,30 @@ describe('pure core: applyReleaseConfig', () => {
     const nxJson: Record<string, unknown> = {};
     expect(applyReleaseConfig(nxJson)).toBe(true);
 
-    const release = nxJson.release as Record<string, unknown>;
+    const release = expectRecord(nxJson.release);
     expect(release.projectsRelationship).toBe('independent');
-    const version = release.version as Record<string, unknown>;
+    const version = expectRecord(release.version);
     expect(version.specifierSource).toBe('conventional-commits');
     expect(version.currentVersionResolver).toBe('git-tag');
     expect(version.fallbackCurrentVersionResolver).toBe('disk');
     expect(version.versionActions).toBe(SMOO_NX_VERSION_ACTIONS);
     expect(version.preVersionCommand).toBeUndefined();
-    const releaseTag = release.releaseTag as Record<string, unknown>;
+    const releaseTag = expectRecord(release.releaseTag);
     expect(releaseTag.pattern).toBe(SMOO_NX_RELEASE_TAG_PATTERN);
-    const changelog = release.changelog as Record<string, unknown>;
+    const changelog = expectRecord(release.changelog);
     expect(changelog.automaticFromRef).toBe(true);
     expect(changelog.workspaceChangelog).toBe(false);
-    const projectChangelogs = changelog.projectChangelogs as Record<string, unknown>;
+    const projectChangelogs = expectRecord(changelog.projectChangelogs);
     expect(projectChangelogs.createRelease).toBe(false);
     expect(projectChangelogs.file).toBe(false);
-    const renderOptions = projectChangelogs.renderOptions as Record<string, unknown>;
+    const renderOptions = expectRecord(projectChangelogs.renderOptions);
     expect(renderOptions.authors).toBe(true);
     expect(renderOptions.applyUsernameToAuthors).toBe(true);
   });
 
   it('removes preVersionCommand', () => {
     const nxJson = validReleaseNxJson();
-    const version = (nxJson.release as Record<string, unknown>).version as Record<string, unknown>;
+    const version = expectRecord(expectRecord(nxJson.release).version);
     version.preVersionCommand = 'nx run-many -t build';
     expect(applyReleaseConfig(nxJson)).toBe(true);
     expect(version.preVersionCommand).toBeUndefined();
@@ -195,9 +195,9 @@ describe('Tree: applyReleaseConfigTree', () => {
     expect(applyReleaseConfigTree(tree)).toBe(true);
 
     const nxJson = readJson(tree, 'nx.json');
-    const release = nxJson.release as Record<string, unknown>;
+    const release = expectRecord(nxJson.release);
     expect(release.projectsRelationship).toBe('independent');
-    const version = release.version as Record<string, unknown>;
+    const version = expectRecord(release.version);
     expect(version.specifierSource).toBe('conventional-commits');
 
     // Tree version now passes check
@@ -214,14 +214,14 @@ describe('Tree: applyReleaseConfigTree', () => {
   it('removes preVersionCommand via tree', () => {
     const tree = createTreeWithEmptyWorkspace();
     const nxJson = validReleaseNxJson();
-    const version = (nxJson.release as Record<string, unknown>).version as Record<string, unknown>;
+    const version = expectRecord(expectRecord(nxJson.release).version);
     version.preVersionCommand = 'nx run-many -t build';
     writeJson(tree, 'nx.json', nxJson);
 
     expect(applyReleaseConfigTree(tree)).toBe(true);
 
     const fixed = readJson(tree, 'nx.json');
-    const fixedVersion = (fixed.release as Record<string, unknown>).version as Record<string, unknown>;
+    const fixedVersion = expectRecord(expectRecord(fixed.release).version);
     expect(fixedVersion.preVersionCommand).toBeUndefined();
 
     expect(checkReleaseConfigTree(tree)).toEqual([]);
@@ -280,4 +280,15 @@ describe('filesystem: checkReleaseConfigPolicy / applyReleaseConfigPolicy', () =
 async function writeJsonFile(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function expectRecord(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) {
+    throw new Error('expected object');
+  }
+  return value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
