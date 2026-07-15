@@ -4,7 +4,7 @@
 //! scenarios and expected values are identical.
 
 use columine_types::types::{
-    EMPTY_KEY, ErrorCode, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset,
+    ChangeFlag, EMPTY_KEY, ErrorCode, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset,
 };
 use columine_vm::bytes;
 use columine_vm::state_init::{
@@ -202,6 +202,16 @@ fn slot_cap(state: &[u8], slot: u8) -> u32 {
 
 fn slot_size(state: &[u8], slot: u8) -> u32 {
     meta_u32(state, slot, SlotMetaOffset::SIZE)
+}
+
+fn slot_change_flags(state: &[u8], slot: u8) -> u8 {
+    let meta_base = STATE_HEADER_SIZE + u32::from(slot) * SLOT_META_SIZE;
+    state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize]
+}
+
+fn clear_slot_change_flags(state: &mut [u8], slot: u8) {
+    let meta_base = STATE_HEADER_SIZE + u32::from(slot) * SLOT_META_SIZE;
+    state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] = 0;
 }
 
 fn struct_map_row(state: &[u8], slot: u8, key: u32) -> u32 {
@@ -818,6 +828,97 @@ fn probe_scatter_apply_datom_parity_across_kinds_and_skip() {
         t_cap,
         8004
     ));
+}
+
+#[test]
+fn probe_scatter_kind0_insert_sets_effective_flag_without_delta_mode() {
+    const T: u32 = 2006;
+    let prog = build_probe_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    seed_probe_row(&mut state, 10, 0, 0, 600, 7001, 0.0, 0);
+    vm.undo_enable(&state);
+    let cp = vm.undo_checkpoint();
+
+    assert_eq!(OK, run_scatter_one(&mut vm, &mut state, &prog, T, 10));
+    assert_eq!(ChangeFlag::INSERTED, slot_change_flags(&state, 1));
+    assert!(vm.undo_checkpoint() > cp);
+    let row = struct_map_row(&state, 1, 600);
+    assert_ne!(0xFFFF_FFFF, row);
+    assert!(bit_set(&state, row, 0));
+    assert_eq!(7001, bytes::read_u32(&state, row + 1));
+}
+
+#[test]
+fn probe_scatter_kind0_differing_assert_sets_updated_without_delta_mode() {
+    const T: u32 = 2007;
+    let prog = build_probe_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    seed_probe_row(&mut state, 10, 0, 0, 600, 7001, 0.0, 0);
+    seed_probe_row(&mut state, 11, 0, 0, 600, 7002, 0.0, 0);
+    assert_eq!(OK, run_scatter_one(&mut vm, &mut state, &prog, T, 10));
+    clear_slot_change_flags(&mut state, 1);
+    vm.undo_enable(&state);
+    let cp = vm.undo_checkpoint();
+
+    assert_eq!(OK, run_scatter_one(&mut vm, &mut state, &prog, T, 11));
+    assert_eq!(ChangeFlag::UPDATED, slot_change_flags(&state, 1));
+    assert!(vm.undo_checkpoint() > cp);
+    let row = struct_map_row(&state, 1, 600);
+    assert!(bit_set(&state, row, 0));
+    assert_eq!(7002, bytes::read_u32(&state, row + 1));
+}
+
+#[test]
+fn probe_scatter_kind0_identical_assert_is_noop_without_undo_or_flag() {
+    const T: u32 = 2008;
+    let prog = build_probe_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    seed_probe_row(&mut state, 10, 0, 0, 600, 7001, 0.0, 0);
+    assert_eq!(OK, run_scatter_one(&mut vm, &mut state, &prog, T, 10));
+    clear_slot_change_flags(&mut state, 1);
+    vm.undo_enable(&state);
+    let cp = vm.undo_checkpoint();
+    let before = state.clone();
+
+    assert_eq!(OK, run_scatter_one(&mut vm, &mut state, &prog, T, 10));
+    assert_eq!(0, slot_change_flags(&state, 1));
+    assert_eq!(cp, vm.undo_checkpoint());
+    assert_eq!(before, state);
+}
+
+#[test]
+fn probe_scatter_kind0_retract_only_matching_value_removes() {
+    const T: u32 = 2009;
+    let prog = build_probe_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    seed_probe_row(&mut state, 10, 0, 0, 600, 7001, 0.0, 0);
+    seed_probe_row(&mut state, 11, 0, 1, 600, 9999, 0.0, 0);
+    seed_probe_row(&mut state, 12, 0, 1, 600, 7001, 0.0, 0);
+    assert_eq!(OK, run_scatter_one(&mut vm, &mut state, &prog, T, 10));
+    clear_slot_change_flags(&mut state, 1);
+    vm.undo_enable(&state);
+    let cp = vm.undo_checkpoint();
+    let before = state.clone();
+
+    assert_eq!(OK, run_scatter_one(&mut vm, &mut state, &prog, T, 11));
+    assert_eq!(0, slot_change_flags(&state, 1));
+    assert_eq!(cp, vm.undo_checkpoint());
+    assert_eq!(before, state);
+
+    assert_eq!(OK, run_scatter_one(&mut vm, &mut state, &prog, T, 12));
+    assert_eq!(ChangeFlag::REMOVED, slot_change_flags(&state, 1));
+    assert!(vm.undo_checkpoint() > cp);
+    let row = struct_map_row(&state, 1, 600);
+    assert!(!bit_set(&state, row, 0));
+    assert_eq!(0, bytes::read_u32(&state, row + 1));
 }
 
 #[test]
