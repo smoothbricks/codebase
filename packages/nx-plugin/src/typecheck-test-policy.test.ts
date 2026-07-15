@@ -250,6 +250,7 @@ describe('applyTypecheckTestDefaults', () => {
     const tsconfigTest: Record<string, unknown> = {};
     const opts = {
       testRunners: new Set(['bun'] as const),
+      libCompilerOptions: { lib: ['es2024', 'webworker'] },
       referencePaths: ['./tsconfig.lib.json'],
     };
     applyTypecheckTestDefaults(tsconfigTest, opts);

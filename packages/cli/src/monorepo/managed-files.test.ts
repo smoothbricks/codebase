@@ -93,6 +93,19 @@ describe('managed-file inline local blocks', () => {
     );
   });
 
+  it('preserves marker indentation when refreshing nested configuration', () => {
+    const markerIndent = '      ';
+    const current = [
+      'patterns:',
+      "      - '*.html'",
+      `${markerIndent}${INLINE_LOCAL_BEGIN}`,
+      "      - '!**/templates/*.html'",
+      `${markerIndent}${INLINE_LOCAL_END}`,
+    ].join('\n');
+    const { withoutInline, blocks } = extractInlineLocalBlocksForTest(current);
+    expect(reinsertInlineLocalBlocksForTest(withoutInline, blocks)).toBe(current);
+  });
+
   it("reinserting refuses when the anchor no longer appears — never silently drops the repo's customization", () => {
     const fresh = ['a:', '  - one', 'b:'].join('\n'); // '  - two' is gone
     expect(() => reinsertInlineLocalBlocksForTest(fresh, [{ anchor: '  - two', lines: '  - repo-owned' }])).toThrow(

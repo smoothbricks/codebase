@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import type { Tree } from 'nx/src/devkit-exports.js';
 import { getProjects, readJson, readProjectConfiguration, updateJson, writeJson } from 'nx/src/devkit-exports.js';
 
@@ -169,7 +170,10 @@ export function applyTypecheckTestDefaults(
   // Copy relevant compiler options from lib tsconfig
   if (options.libCompilerOptions) {
     for (const key of ['baseUrl', 'module', 'moduleResolution', 'jsx', 'lib']) {
-      if (Object.hasOwn(options.libCompilerOptions, key) && compilerOptions[key] !== options.libCompilerOptions[key]) {
+      if (
+        Object.hasOwn(options.libCompilerOptions, key) &&
+        !isDeepStrictEqual(compilerOptions[key], options.libCompilerOptions[key])
+      ) {
         compilerOptions[key] = options.libCompilerOptions[key];
         changed = true;
       }
