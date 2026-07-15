@@ -68,7 +68,7 @@ function syncBunLockfileVersions(root: string): number {
     }
     lockfile = lockfile.replace(pattern, `$1${targetVersion}$3`);
     console.log(
-      `fix:  ${relativePath}: ${lockVersion} -> ${targetVersion}${targetVersion !== pkg.version ? ` (latest stable tag; package.json has ${pkg.version})` : ''}`
+      `fix:  ${relativePath}: ${lockVersion} -> ${targetVersion}${targetVersion !== pkg.version ? ` (latest stable tag; package.json has ${pkg.version})` : ''}`,
     );
     updated++;
   }
@@ -76,7 +76,7 @@ function syncBunLockfileVersions(root: string): number {
     writeFileSync(lockfilePath, lockfile);
   }
   console.log(
-    updated > 0 ? `Updated ${updated} workspace version(s) in bun.lock` : 'All workspace versions already in sync.'
+    updated > 0 ? `Updated ${updated} workspace version(s) in bun.lock` : 'All workspace versions already in sync.',
   );
   return updated;
 }
