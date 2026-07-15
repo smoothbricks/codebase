@@ -356,11 +356,12 @@ mod tests {
         assert_eq!(FlatUndoOp::StructMapField as u8, 12);
         assert_eq!(FlatUndoOp::StructMapRow as u8, 13);
         assert_eq!(FlatUndoOp::ScalarUpdate as u8, 14); // post-parity extension
+        assert_eq!(FlatUndoOp::StateBytes as u8, 15); // post-parity extension
         assert_eq!(FlatUndoEntry::read_from(&[0u8; 24]), None); // 0 invalid
         assert_eq!(
             FlatUndoEntry::read_from(&{
                 let mut b = [0u8; 24];
-                b[0] = 15;
+                b[0] = 16;
                 b
             }),
             None

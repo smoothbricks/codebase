@@ -53,9 +53,6 @@ fn extract_msgpack_event(
     columns: &mut DynamicColumns,
     work_buffer: &mut [u8],
 ) -> Result<(), ExtractionError> {
-    if config.field_entries.len() > 64 {
-        return Err(ExtractionError::OutOfMemory);
-    }
     // Zig order: map header parses BEFORE beginRow, so an invalid header
     // never opens a row.
     let fields = reader
@@ -79,8 +76,10 @@ fn extract_msgpack_fields(
     columns: &mut DynamicColumns,
     work_buffer: &mut [u8],
 ) -> Result<(), ExtractionError> {
-    // Stack-allocated like Zig's `[64]bool` — per-event ingest hot path.
-    let mut set = [false; 64];
+    // Presence is schema-sized state owned by DynamicColumns and allocated
+    // once with the column storage. Resetting it per row avoids both the old
+    // 64-field ceiling and any per-event allocation.
+    columns.columns_seen.fill(false);
     let mut extra_count: u32 = 0;
     let mut extra_end: usize = 0;
     // A fallback column with an unusably small work buffer (< 5 bytes: not
@@ -102,7 +101,7 @@ fn extract_msgpack_fields(
             .and_then(|name| config.field_map.get(name));
         if let Some(lookup) = lookup {
             extract_typed_value(reader, lookup.arrow_type, columns, lookup.column)?;
-            set[lookup.column] = true;
+            columns.columns_seen[lookup.column] = true;
         } else if extra_active {
             let value_start = reader.position();
             reader.skip_value().ok_or(ExtractionError::InvalidJson)?;
@@ -127,7 +126,7 @@ fn extract_msgpack_fields(
         }
     }
     for (column, _, _) in &config.field_entries {
-        if !set[*column] {
+        if !columns.columns_seen[*column] {
             append(columns, *column, None)?;
         }
     }
@@ -378,6 +377,89 @@ mod tests {
             Err(ExtractionError::TooManyEvents)
         );
     }
+    #[test]
+    fn extract_msgpack_events_supports_schema_width_boundaries() {
+        for width in [64, 65, 66, 96] {
+            let fields = vec![field(ArrowType::Utf8); width];
+            let names = (0..width)
+                .map(|index| format!("f{index}"))
+                .collect::<Vec<_>>();
+            let name_refs = names.iter().map(String::as_str).collect::<Vec<_>>();
+            let mut input = vec![0x81];
+            str_(&mut input, &names[width - 1]);
+            str_(&mut input, "present");
+            let mut columns = DynamicColumns::new(&fields, 1);
+            let mut work = [0; 64];
+
+            assert_eq!(
+                extract_msgpack_events(
+                    &input,
+                    &config(&fields, &name_refs),
+                    &mut columns,
+                    &mut work,
+                    true
+                ),
+                Ok(1),
+                "schema width {width}"
+            );
+            assert_eq!(
+                columns.cell(0, 0),
+                None,
+                "missing first field at width {width}"
+            );
+            assert_eq!(
+                columns.cell(width - 1, 0),
+                Some(ColumnValue::Utf8("present".into())),
+                "present last field at width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_msgpack_events_resets_presence_between_rows() {
+        let fields = [field(ArrowType::Utf8), field(ArrowType::Utf8)];
+        let config = config(&fields, &["id", "value.note"]);
+        let mut input = vec![0x82];
+        str_(&mut input, "id");
+        str_(&mut input, "first");
+        str_(&mut input, "value.note");
+        str_(&mut input, "present");
+        input.push(0x81);
+        str_(&mut input, "id");
+        str_(&mut input, "second");
+        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut work = [0; 64];
+
+        assert_eq!(
+            extract_msgpack_events(&input, &config, &mut columns, &mut work, true),
+            Ok(2)
+        );
+        assert_eq!(
+            columns.cell(1, 0),
+            Some(ColumnValue::Utf8("present".into()))
+        );
+        assert_eq!(columns.cell(1, 1), None);
+    }
+
+    #[test]
+    fn extract_msgpack_events_preserves_last_duplicate_field() {
+        let fields = [field(ArrowType::Utf8)];
+        let config = config(&fields, &["id"]);
+        let mut input = vec![0x82];
+        str_(&mut input, "id");
+        str_(&mut input, "first");
+        str_(&mut input, "id");
+        str_(&mut input, "last");
+        let mut columns = DynamicColumns::new(&fields, 1);
+        let mut work = [0; 64];
+
+        assert_eq!(
+            extract_msgpack_events(&input, &config, &mut columns, &mut work, true),
+            Ok(1)
+        );
+        assert_eq!(columns.cell(0, 0), Some(ColumnValue::Utf8("last".into())));
+    }
+
     #[test]
     fn extract_msgpack_events_tiny_work_buffer_refuses() {
         // Post-parity fix pin: fallback configured but work_buffer < 5 bytes
