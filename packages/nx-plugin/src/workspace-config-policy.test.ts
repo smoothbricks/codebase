@@ -21,21 +21,7 @@ import {
 
 function validNxJson(): Record<string, unknown> {
   return {
-    plugins: [
-      {
-        plugin: '@nx/js/typescript',
-        options: {
-          typecheck: { targetName: 'typecheck' },
-          build: {
-            targetName: 'tsc-js',
-            configName: 'tsconfig.lib.json',
-            buildDepsName: 'build-deps',
-            watchDepsName: 'watch-deps',
-          },
-        },
-      },
-      '@smoothbricks/nx-plugin',
-    ],
+    plugins: ['@smoothbricks/nx-plugin'],
     targetDefaults: validTargetDefaults(),
     namedInputs: validNamedInputs(),
   };
@@ -63,21 +49,7 @@ function validNamedInputs(): Record<string, unknown> {
 }
 
 function validPlugins(): unknown[] {
-  return [
-    {
-      plugin: '@nx/js/typescript',
-      options: {
-        typecheck: { targetName: 'typecheck' },
-        build: {
-          targetName: 'tsc-js',
-          configName: 'tsconfig.lib.json',
-          buildDepsName: 'build-deps',
-          watchDepsName: 'watch-deps',
-        },
-      },
-    },
-    '@smoothbricks/nx-plugin',
-  ];
+  return ['@smoothbricks/nx-plugin'];
 }
 
 // ---------------------------------------------------------------------------
@@ -103,8 +75,7 @@ describe('pure core: checkWorkspaceConfig', () => {
       targetDefaults: validTargetDefaults(),
       namedInputs: validNamedInputs(),
     });
-    expect(issues.length).toBe(2);
-    expect(issues.some((i) => i.message.includes('Official Nx owns TypeScript library inference'))).toBe(true);
+    expect(issues.length).toBe(1);
     expect(issues.some((i) => i.message.includes('plugins must include @smoothbricks/nx-plugin'))).toBe(true);
   });
 
@@ -120,16 +91,13 @@ describe('pure core: checkWorkspaceConfig', () => {
     expect(issues.some((i) => i.message.includes('must not use colon target names'))).toBe(true);
   });
 
-  it('detects wrong tsc-js target name', () => {
+  it('detects native TypeScript inference', () => {
     const issues = checkWorkspaceConfig({
-      plugins: [
-        { plugin: '@nx/js/typescript', options: { build: { targetName: 'build' } } },
-        '@smoothbricks/nx-plugin',
-      ],
+      plugins: ['@nx/js/typescript', '@smoothbricks/nx-plugin'],
       targetDefaults: validTargetDefaults(),
       namedInputs: validNamedInputs(),
     });
-    expect(issues.some((i) => i.message.includes('build.targetName must be tsc-js'))).toBe(true);
+    expect(issues.some((issue) => issue.message.includes('plugins must not configure @nx/js/typescript'))).toBe(true);
   });
 
   it('detects imprecise production inputs', () => {
@@ -184,7 +152,7 @@ describe('pure core: applyWorkspaceConfig', () => {
     };
     expect(applyWorkspaceConfig(nxJson)).toBe(true);
     const pluginNames = readPluginNames(nxJson.plugins);
-    expect(pluginNames).toContain('@nx/js/typescript');
+    expect(pluginNames).not.toContain('@nx/js/typescript');
     expect(pluginNames).toContain('@smoothbricks/nx-plugin');
   });
 
@@ -256,8 +224,7 @@ describe('Tree: checkWorkspaceConfigTree', () => {
     });
 
     const issues = checkWorkspaceConfigTree(tree);
-    expect(issues.length).toBe(2);
-    expect(issues.some((i) => i.message.includes('Official Nx owns TypeScript library inference'))).toBe(true);
+    expect(issues.length).toBe(1);
     expect(issues.some((i) => i.message.includes('plugins must include @smoothbricks/nx-plugin'))).toBe(true);
   });
 
@@ -288,7 +255,7 @@ describe('Tree: applyWorkspaceConfigTree', () => {
 
     const nxJson = readJson(tree, 'nx.json');
     const pluginNames = readPluginNames(nxJson.plugins);
-    expect(pluginNames).toContain('@nx/js/typescript');
+    expect(pluginNames).not.toContain('@nx/js/typescript');
     expect(pluginNames).toContain('@smoothbricks/nx-plugin');
 
     // Tree version now passes check
@@ -347,7 +314,7 @@ describe('filesystem: checkWorkspaceConfigPolicy / applyWorkspaceConfigPolicy', 
 
       const nxJson = expectRecord(JSON.parse(await readFile(join(root, 'nx.json'), 'utf8')));
       const pluginNames = readPluginNames(nxJson.plugins);
-      expect(pluginNames).toContain('@nx/js/typescript');
+      expect(pluginNames).not.toContain('@nx/js/typescript');
       expect(pluginNames).toContain('@smoothbricks/nx-plugin');
 
       // No issues after fix
