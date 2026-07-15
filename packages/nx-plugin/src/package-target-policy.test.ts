@@ -542,7 +542,11 @@ describe('per-package applyPackageTargets', () => {
     };
     const workspaceNames = new Set(['@scope/lib', '@scope/other']);
     expect(applyPackageTargets(pkg, 'packages/lib', workspaceNames)).toBe(true);
-    const targets = (pkg.nx as Record<string, unknown>).targets as Record<string, unknown>;
+    const nx = pkg.nx;
+    if (!isRecord(nx) || !isRecord(nx.targets)) {
+      throw new Error('expected generated Nx targets');
+    }
+    const targets = nx.targets;
     expect(targets['build:ts']).toBeUndefined();
     expect(targets['tsc-js']).toBeDefined();
   });
@@ -917,4 +921,8 @@ describe('applyPackageTargetPolicyTree', () => {
 async function writeJson(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }

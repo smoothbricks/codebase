@@ -25,11 +25,11 @@ export interface ToolContext {
 
 const rootDevDependencies: RequiredDependency[] = [
   { name: '@biomejs/biome', fallbackVersion: '^2.3.5', minimumVersion: '2.3.0', prefix: '^' },
-  { name: '@nx/js', fallbackVersion: '22.0.3', minimumVersion: '22.0.0' },
+  { name: '@nx/js', fallbackVersion: '23.1.0', minimumVersion: '23.1.0' },
   {
     name: '@smoothbricks/nx-plugin',
-    fallbackVersion: '^0.0.1',
-    minimumVersion: '0.0.1',
+    fallbackVersion: '^0.3.0',
+    minimumVersion: '0.3.0',
     prefix: '^',
     useWorkspaceRangeInCodebase: true,
   },
@@ -41,8 +41,11 @@ const rootDevDependencies: RequiredDependency[] = [
     prefix: '^',
     useWorkspaceRangeInCodebase: true,
   },
-  { name: 'nx', fallbackVersion: '22.5.4', minimumVersion: '22.5.0' },
+  { name: 'nx', fallbackVersion: '23.1.0', minimumVersion: '23.1.0' },
   { name: 'prettier', fallbackVersion: '^3.6.1', minimumVersion: '3.6.0', prefix: '^' },
+  { name: 'ttsc', fallbackVersion: '^0.18.4', minimumVersion: '0.18.4', prefix: '^' },
+  // Nx and typescript-eslint still load the TypeScript 5.x JavaScript API.
+  // Compilation is exclusively delegated to ttsc by the Nx plugin targets.
   { name: 'typescript', fallbackVersion: '^5.9.3', minimumVersion: '5.9.0', prefix: '^' },
 ];
 

@@ -94,13 +94,35 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
   const hasLibTsconfig = existsSync(join(absoluteProjectRoot, 'tsconfig.lib.json'));
   let hasBuildOutputTarget = hasLibTsconfig || hasPackageLocalBuildOutputTarget(packageJson);
 
+  if (hasLibTsconfig) {
+    // @nx/js supplies project-aware inputs, outputs, and dependency edges. This
+    // later plugin entry replaces only the compiler command because Nx's native
+    // tsgo adapter emits `--build`, which is not part of the ttsc CLI contract.
+    targets['tsc-js'] = {
+      executor: 'nx:run-commands',
+      cache: true,
+      options: {
+        command: 'ttsc -p tsconfig.lib.json --emit',
+        cwd: projectRoot,
+      },
+    };
+    targets.typecheck = {
+      executor: 'nx:run-commands',
+      cache: true,
+      options: {
+        command: 'ttsc -p tsconfig.lib.json --noEmit',
+        cwd: projectRoot,
+      },
+    };
+  }
+
   const hasTestTsconfig = existsSync(join(absoluteProjectRoot, 'tsconfig.test.json'));
   if (hasTestTsconfig) {
     targets['typecheck-tests'] = {
       executor: 'nx:run-commands',
       cache: true,
       options: {
-        command: 'tsc --noEmit -p tsconfig.test.json',
+        command: 'ttsc -p tsconfig.test.json --noEmit',
         cwd: projectRoot,
       },
     };
@@ -108,7 +130,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       executor: 'nx:run-commands',
       continuous: true,
       options: {
-        command: 'tsc --noEmit -p tsconfig.test.json --watch',
+        command: 'ttsc -p tsconfig.test.json --noEmit --watch',
         cwd: projectRoot,
       },
     };
@@ -241,7 +263,6 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
 
   if (validationTargets.length > 0) {
     targets.lint = {
-      executor: 'nx:noop',
       cache: true,
       dependsOn: validationTargets,
     };
@@ -260,7 +281,23 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
 }
 
 async function readPackageJson(packageJsonPath: string): Promise<PackageJson> {
-  return JSON.parse(await readFile(packageJsonPath, 'utf-8')) as PackageJson;
+  const parsed: unknown = JSON.parse(await readFile(packageJsonPath, 'utf-8'));
+  if (!isRecord(parsed)) {
+    throw new Error(`${packageJsonPath} must contain a JSON object`);
+  }
+  const rawNx = isRecord(parsed.nx) ? parsed.nx : undefined;
+  return {
+    ...(typeof parsed.name === 'string' ? { name: parsed.name } : {}),
+    ...(isRecord(parsed.scripts) ? { scripts: parsed.scripts } : {}),
+    ...(rawNx
+      ? {
+          nx: {
+            ...(typeof rawNx.name === 'string' ? { name: rawNx.name } : {}),
+            ...(isRecord(rawNx.targets) ? { targets: rawNx.targets } : {}),
+          },
+        }
+      : {}),
+  };
 }
 
 function inferTestWatchCommand(packageJson: PackageJson): string | null {

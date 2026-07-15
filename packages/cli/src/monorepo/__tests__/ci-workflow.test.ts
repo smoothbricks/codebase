@@ -1,3 +1,5 @@
+/* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Assertions cover literal GitHub Actions expressions. */
+
 import { describe, expect, it } from 'bun:test';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';

@@ -181,7 +181,7 @@ function validateBuildTargetDefault(
 ): void {
   const targetDefaults = recordProperty(nxJson, 'targetDefaults');
   const build = targetDefaults ? recordProperty(targetDefaults, 'build') : null;
-  if (!build || build.cache !== true) {
+  if (build?.cache !== true) {
     issues.push({ path: nxJsonPath, message: 'targetDefaults.build.cache must be true' });
   }
   const outputs = build?.outputs;
@@ -200,7 +200,7 @@ function validateCleanTargetDefault(
   if (!clean || clean.executor !== cleanOutputsExecutor) {
     issues.push({ path: nxJsonPath, message: `targetDefaults.clean.executor must be ${cleanOutputsExecutor}` });
   }
-  if (!clean || clean.cache !== false) {
+  if (clean?.cache !== false) {
     issues.push({ path: nxJsonPath, message: 'targetDefaults.clean.cache must be false' });
   }
 }
