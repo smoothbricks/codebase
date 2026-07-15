@@ -95,12 +95,17 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
   let hasBuildOutputTarget = hasLibTsconfig || hasPackageLocalBuildOutputTarget(packageJson);
 
   if (hasLibTsconfig) {
-    // @nx/js supplies project-aware inputs, outputs, and dependency edges. This
-    // later plugin entry replaces only the compiler command because Nx's native
-    // tsgo adapter emits `--build`, which is not part of the ttsc CLI contract.
+    // Official Nx target inference is disabled because its compiler surface only
+    // supports tsc/tsgo. Smoo owns the complete transformer-aware ttsc targets.
     targets['tsc-js'] = {
       executor: 'nx:run-commands',
       cache: true,
+      inputs: ['production', '^production', '{workspaceRoot}/tsconfig.base.json', '{projectRoot}/tsconfig.lib.json'],
+      outputs: [
+        '{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}',
+        '{projectRoot}/dist/.build.tsbuildinfo',
+      ],
+      dependsOn: ['^tsc-js'],
       options: {
         command: 'ttsc -p tsconfig.lib.json --emit',
         cwd: projectRoot,
@@ -109,6 +114,9 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     targets.typecheck = {
       executor: 'nx:run-commands',
       cache: true,
+      inputs: ['production', '^production', '{workspaceRoot}/tsconfig.base.json', '{projectRoot}/tsconfig.lib.json'],
+      outputs: [],
+      dependsOn: ['^tsc-js'],
       options: {
         command: 'ttsc -p tsconfig.lib.json --noEmit',
         cwd: projectRoot,
@@ -121,6 +129,8 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     targets['typecheck-tests'] = {
       executor: 'nx:run-commands',
       cache: true,
+      inputs: ['default', '^production', '{workspaceRoot}/tsconfig.base.json', '{projectRoot}/tsconfig.test.json'],
+      dependsOn: ['typecheck'],
       options: {
         command: 'ttsc -p tsconfig.test.json --noEmit',
         cwd: projectRoot,
