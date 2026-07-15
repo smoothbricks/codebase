@@ -9,13 +9,22 @@
     "emitDeclarationOnly": false,
     "noEmit": true
   },
-  "include": ["src/**/*.test.ts", "src/test-suite-tracer.ts"],
+  "include": [
+    "src/**/*.test.ts",
+    "src/test-suite-tracer.ts",
+    "src/**/*.spec.ts",
+    "src/**/__tests__/**/*.ts",
+    "src/**/__tests__/**/*.tsx"
+  ],
   "references": [
     {
       "path": "../validation/tsconfig.lib.json"
     },
     {
       "path": "./tsconfig.lib.json"
+    },
+    {
+      "path": "../lmao/tsconfig.lib.json"
     }
   ]
 }
