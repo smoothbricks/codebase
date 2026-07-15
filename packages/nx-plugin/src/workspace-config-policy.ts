@@ -66,20 +66,12 @@ export function checkWorkspaceConfig(nxJson: Record<string, unknown>): NxPolicyI
 
   // Plugin configuration
   const plugins = Array.isArray(nxJson.plugins) ? nxJson.plugins : [];
-  const nxJsPlugin = plugins.find(isNxJsTypescriptPlugin);
-  if (!nxJsPlugin) {
+  if (plugins.some(isNxJsTypescriptPlugin)) {
     issues.push({
       path: 'nx.json',
       message:
-        `plugins must configure ${nxJsTypescriptPlugin}. ` +
-        'Official Nx owns TypeScript library inference; smoo configures it so tsconfig.lib.json produces tsc-js and leaves build available as an aggregate target.',
-    });
-  } else if (nxJsBuildTargetName(nxJsPlugin) !== 'tsc-js') {
-    issues.push({
-      path: 'nx.json',
-      message:
-        `${nxJsTypescriptPlugin} build.targetName must be tsc-js. ` +
-        'TypeScript library output is a concrete tool-output target; build is reserved for aggregate targets that depend on concrete build work.',
+        `plugins must not configure ${nxJsTypescriptPlugin}. ` +
+        'Smoo owns transformer-aware TypeScript targets; Nx native inference only supports tsc/tsgo.',
     });
   }
   if (!plugins.includes(smoothBricksNxPlugin) && !plugins.some(isSmoothBricksNxPluginRecord)) {
@@ -104,10 +96,8 @@ export function applyWorkspaceConfig(nxJson: Record<string, unknown>): boolean {
   changed = applyCleanTargetDefault(nxJson) || changed;
   changed = applyNamedInputDefaults(nxJson) || changed;
   const currentPlugins = Array.isArray(nxJson.plugins) ? nxJson.plugins : [];
-  const nextPlugins = upsertNxPlugin(
-    upsertNxPlugin(currentPlugins, expectedNxJsTypescriptPlugin()),
-    smoothBricksNxPlugin,
-  );
+  const pluginsWithoutNxTypeScript = currentPlugins.filter((plugin) => !isNxJsTypescriptPlugin(plugin));
+  const nextPlugins = upsertNxPlugin(pluginsWithoutNxTypeScript, smoothBricksNxPlugin);
   if (JSON.stringify(currentPlugins) !== JSON.stringify(nextPlugins)) {
     nxJson.plugins = nextPlugins;
     changed = true;
@@ -311,21 +301,6 @@ function isPreciseProductionNamedInput(production: unknown[]): boolean {
   return hasPositiveProjectInput;
 }
 
-function expectedNxJsTypescriptPlugin(): Record<string, unknown> {
-  return {
-    plugin: nxJsTypescriptPlugin,
-    options: {
-      typecheck: { targetName: 'typecheck' },
-      build: {
-        targetName: 'tsc-js',
-        configName: 'tsconfig.lib.json',
-        buildDepsName: 'build-deps',
-        watchDepsName: 'watch-deps',
-      },
-    },
-  };
-}
-
 function upsertNxPlugin(plugins: readonly unknown[], plugin: string | Record<string, unknown>): unknown[] {
   const pluginName = typeof plugin === 'string' ? plugin : stringProperty(plugin, 'plugin');
   const next = plugins.filter((entry) => nxPluginName(entry) !== pluginName);
@@ -340,18 +315,14 @@ function nxPluginName(value: unknown): string | null {
   return isRecord(value) ? stringProperty(value, 'plugin') : null;
 }
 
-function isNxJsTypescriptPlugin(value: unknown): value is Record<string, unknown> {
-  return isRecord(value) && stringProperty(value, 'plugin') === nxJsTypescriptPlugin;
+function isNxJsTypescriptPlugin(value: unknown): boolean {
+  return (
+    value === nxJsTypescriptPlugin || (isRecord(value) && stringProperty(value, 'plugin') === nxJsTypescriptPlugin)
+  );
 }
 
 function isSmoothBricksNxPluginRecord(value: unknown): boolean {
   return isRecord(value) && stringProperty(value, 'plugin') === smoothBricksNxPlugin;
-}
-
-function nxJsBuildTargetName(plugin: Record<string, unknown>): string | null {
-  const options = recordProperty(plugin, 'options');
-  const build = options ? recordProperty(options, 'build') : null;
-  return build ? stringProperty(build, 'targetName') : null;
 }
 
 function readJsonObject(path: string): Record<string, unknown> | null {
