@@ -134,6 +134,35 @@ describe('tool configuration validation', () => {
     }
   });
 
+  it('preserves an installable CLI range when the running CLI is a linked prerelease', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-tool-validation-'));
+    try {
+      const configuredRange = '^0.10.1';
+      const runningRange = await currentCliRange();
+      const expectedRange = runningRange.includes('-') ? configuredRange : runningRange;
+      await writeJson(join(root, 'package.json'), {
+        name: '@fixture/app',
+        version: '0.0.0',
+        private: true,
+        workspaces: ['packages/*', 'tooling'],
+      });
+      await writeJson(join(root, 'tooling/package.json'), {
+        name: '@fixture/tooling',
+        private: true,
+        dependencies: { '@smoothbricks/cli': configuredRange },
+      });
+
+      const context = readToolContext(root);
+      expect(context.policy.cliDependencyRange).toBe(expectedRange);
+      applyToolingPackageDefaults(root, context.policy);
+
+      const toolingPackage = JSON.parse(await readFile(join(root, 'tooling/package.json'), 'utf8'));
+      expect(toolingPackage.dependencies['@smoothbricks/cli']).toBe(expectedRange);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('uses workspace smoo in the SmoothBricks codebase repo', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-tool-validation-'));
     try {
