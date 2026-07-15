@@ -17,7 +17,7 @@
     "dist"
   ],
   "scripts": {
-    "test": "nx test cowshed --outputStyle=stream",
+    "test": "nx run cowshed:test --outputStyle=stream",
     "build:napi": "nx run cowshed:cargo-napi"
   },
   "nx": {
@@ -26,6 +26,9 @@
       "cargo-napi": {
         "executor": "nx:run-commands",
         "cache": true,
+        "dependsOn": [
+          "^build"
+        ],
         "inputs": [
           "{projectRoot}/crates/**/*.rs",
           "{projectRoot}/crates/**/Cargo.toml",
@@ -38,16 +41,18 @@
           "{projectRoot}/dist/cowshed.node"
         ],
         "options": {
-          "cwd": "packages/cowshed",
+          "cwd": "{projectRoot}",
           "command": "bun scripts/build-napi.ts"
         }
       },
-      "napi-test": {
+      "test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
-        "cache": true,
         "dependsOn": [
+          "cargo-test",
           "cargo-napi",
-          "tsc-js"
+          "tsc-js",
+          "^build",
+          "build"
         ],
         "options": {
           "command": "bun test --timeout=30000 src/native.test.ts",
@@ -55,15 +60,6 @@
           "timeoutMs": 120000,
           "killAfterMs": 10000
         }
-      },
-      "test": {
-        "executor": "nx:noop",
-        "dependsOn": [
-          "cargo-test",
-          "napi-test",
-          "^build",
-          "build"
-        ]
       },
       "integration-apfs": {
         "executor": "nx:run-commands",
