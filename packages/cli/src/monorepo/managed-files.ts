@@ -50,6 +50,7 @@ export const INLINE_LOCAL_END = '# smoo-local-end';
 interface InlineLocalBlock {
   anchor: string;
   lines: string;
+  markerIndent?: string;
 }
 
 /** Pull inline local blocks out of a managed section, returning the section
@@ -76,7 +77,12 @@ function extractInlineLocalBlocks(managed: string): { withoutInline: string; blo
       if (i >= lines.length) {
         throw new Error(`${INLINE_LOCAL_BEGIN} anchored on "${anchor}" has no matching ${INLINE_LOCAL_END}`);
       }
-      blocks.push({ anchor, lines: blockLines.join('\n') });
+      const markerIndent = line.slice(0, line.length - line.trimStart().length);
+      blocks.push({
+        anchor,
+        lines: blockLines.join('\n'),
+        ...(markerIndent === '' ? {} : { markerIndent }),
+      });
       i += 1; // skip the END marker line itself
       continue;
     }
@@ -102,7 +108,14 @@ function reinsertInlineLocalBlocks(content: string, blocks: InlineLocalBlock[]):
           'template — reconcile the repo-owned block manually',
       );
     }
-    lines.splice(index + 1, 0, INLINE_LOCAL_BEGIN, ...block.lines.split('\n'), INLINE_LOCAL_END);
+    const markerIndent = block.markerIndent ?? '';
+    lines.splice(
+      index + 1,
+      0,
+      `${markerIndent}${INLINE_LOCAL_BEGIN}`,
+      ...block.lines.split('\n'),
+      `${markerIndent}${INLINE_LOCAL_END}`,
+    );
   }
   return lines.join('\n');
 }
