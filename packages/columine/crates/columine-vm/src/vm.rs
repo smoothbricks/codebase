@@ -1992,7 +1992,7 @@ fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
         0x46..=0x48 => 4,
         0x49..=0x4b => 3,
         // STRUCT_MAP_UPSERT_LAST/FIRST/MAX: max appends one comparison ordinal.
-        0x80 | 0x81 | 0x82 => {
+        0x80..=0x82 => {
             let operands = decode_struct_map_upsert_operands(code, pc.checked_add(1)?, op == 0x82)?;
             operands.end.checked_sub(pc)?
         }
@@ -3219,7 +3219,7 @@ impl Vm {
                 }
 
                 // STRUCT_MAP_UPSERT_LAST/FIRST/MAX (0x80/0x81/0x82)
-                0x80 | 0x81 | 0x82 => {
+                0x80..=0x82 => {
                     let Some(operands) =
                         decode_struct_map_upsert_operands(body, bpc + 1, op_byte == 0x82)
                     else {
