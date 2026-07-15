@@ -21,7 +21,12 @@ describe('firstWranglerEnv', () => {
 describe('applyWranglerDefaults', () => {
   it('injects the wrangler-types target and wires typecheck, idempotently', async () => {
     const root = await createWorkspace([
-      { dir: 'api', name: '@acme/api', toml: '[env.production]\n', nx: { targets: { typecheck: { dependsOn: ['^build'] } } } },
+      {
+        dir: 'api',
+        name: '@acme/api',
+        toml: '[env.production]\n',
+        nx: { targets: { typecheck: { dependsOn: ['^build'] } } },
+      },
     ]);
     try {
       applyWranglerDefaults(root);
@@ -51,7 +56,9 @@ describe('applyWranglerDefaults', () => {
   });
 
   it('omits --env from the command when the wrangler.toml declares no env block', async () => {
-    const root = await createWorkspace([{ dir: 'api', name: '@acme/api', toml: 'name = "svc"\nmain = "src/index.ts"\n' }]);
+    const root = await createWorkspace([
+      { dir: 'api', name: '@acme/api', toml: 'name = "svc"\nmain = "src/index.ts"\n' },
+    ]);
     captureConsoleLogs();
     try {
       applyWranglerDefaults(root);

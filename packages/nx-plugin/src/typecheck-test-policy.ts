@@ -86,7 +86,7 @@ export function checkTypecheckTestConfig(
   const tsconfigTestPath = join(packagePath, 'tsconfig.test.json');
   const compilerOptions = recordProperty(tsconfigTest, 'compilerOptions');
 
-  if (!compilerOptions || compilerOptions.noEmit !== true) {
+  if (compilerOptions?.noEmit !== true) {
     issues.push({
       path: tsconfigTestPath,
       message: 'compilerOptions.noEmit must be true',

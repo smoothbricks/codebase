@@ -44,16 +44,6 @@
     "projectType": "library",
     "targets": {
       "lint": {},
-      "build": {
-        "executor": "nx:run-commands",
-        "options": {
-          "command": "tsc --build tsconfig.lib.json",
-          "cwd": "packages/arrow-builder"
-        },
-        "outputs": [
-          "{projectRoot}/dist"
-        ]
-      },
       "test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {

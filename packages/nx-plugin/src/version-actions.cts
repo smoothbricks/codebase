@@ -98,13 +98,20 @@ function workspacePackages(root: string): WorkspacePackage[] {
       if (!existsSync(packageJsonPath)) {
         return null;
       }
-      const json = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as Record<string, unknown>;
-      if (typeof json.name !== 'string' || typeof json.version !== 'string') return null;
-      const nx = json.nx != null && typeof json.nx === 'object' ? (json.nx as Record<string, unknown>) : null;
+      const parsed: unknown = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+      if (!isRecord(parsed) || typeof parsed.name !== 'string' || typeof parsed.version !== 'string') {
+        return null;
+      }
+      const json = parsed;
+      const nx = isRecord(json.nx) ? json.nx : null;
       const projectName = (nx ? (typeof nx.name === 'string' ? nx.name : null) : null) ?? json.name;
       return { path, name: json.name, projectName, version: json.version };
     })
     .filter((pkg): pkg is WorkspacePackage => pkg !== null);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function escapeRegex(value: string): string {

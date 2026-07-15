@@ -16,7 +16,10 @@ export interface ScaffoldOptions {
 }
 
 /** Locate a workspace package by nx name, package name, or relative path; must have a wrangler.toml. */
-function resolveProject(root: string, project: string): { dir: string; label: string; packageJsonPath: string; json: Record<string, unknown> } {
+function resolveProject(
+  root: string,
+  project: string,
+): { dir: string; label: string; packageJsonPath: string; json: Record<string, unknown> } {
   const manifests = getWorkspacePackageManifests(root);
   const match = manifests.find((m) => {
     const nx = recordProperty(m.json, 'nx');
@@ -83,7 +86,7 @@ async function checkMode(env: string): Promise<void> {
   for (const binding of kvBindings) {
     const inToml = pe.getKvId(toml, env, binding);
     const liveId = live.find((n) => n.title === kvTitle(binding, env))?.id ?? null;
-    p.log.message(\`  KV \${binding}: \${!liveId ? '✗ not created' : inToml === liveId ? \`✓ \${liveId}\` : \`⚠ drift (live \${liveId}, toml \${inToml ?? 'unset'})\`}\`);
+    p.log.message(\`  KV \${binding}: \${!liveId ? '✗ not created' : inToml === liveId ? \`✓ \${liveId}\` : \`! drift (live \${liveId}, toml \${inToml ?? 'unset'})\`}\`);
   }
   for (const name of vars) {
     p.log.message(\`  var \${name}: \${pe.getVar(toml, env, name) ? '✓ set' : '✗ empty'}\`);
@@ -234,6 +237,8 @@ export function scaffold(root: string, project: string, options: ScaffoldOptions
     console.log(`updated       ${label}/package.json prepare-env target`);
   }
 
-  console.log(`\nnext: fill secret NAMES in ${label}/.dev.vars.example, then\n  bunx nx run ${project}:prepare-env -- <env>`);
+  console.log(
+    `\nnext: fill secret NAMES in ${label}/.dev.vars.example, then\n  bunx nx run ${project}:prepare-env -- <env>`,
+  );
   return scriptPath;
 }

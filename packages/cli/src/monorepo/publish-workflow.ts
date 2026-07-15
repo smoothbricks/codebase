@@ -1,3 +1,5 @@
+/* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub Actions expressions are emitted literally. */
+
 import { isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
 
 export type PublishWorkflowBump = 'auto' | 'patch' | 'minor' | 'major' | 'prerelease';

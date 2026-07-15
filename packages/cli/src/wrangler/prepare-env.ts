@@ -60,7 +60,13 @@ function kvIn(toml: string, table: AST.TOMLTable, key: string): AST.TOMLKeyValue
 }
 
 /** The `<field>` KV of the `[[env.<env>.<arrayKey>]]` table whose `binding` matches, or null. */
-function arrayTableKv(toml: string, env: string, arrayKey: string, binding: string, field: string): AST.TOMLKeyValue | null {
+function arrayTableKv(
+  toml: string,
+  env: string,
+  arrayKey: string,
+  binding: string,
+  field: string,
+): AST.TOMLKeyValue | null {
   const block = envRecord(toml, env);
   const rows = isRecord(block) && Array.isArray(block[arrayKey]) ? block[arrayKey] : [];
   const index = rows.findIndex((r) => isRecord(r) && r.binding === binding);
@@ -173,7 +179,8 @@ export function getD1Name(toml: string, env: string, binding: string): string | 
   const block = envRecord(toml, env);
   const rows = isRecord(block) && Array.isArray(block.d1_databases) ? block.d1_databases : [];
   for (const row of rows) {
-    if (isRecord(row) && row.binding === binding && typeof row.database_name === 'string') return row.database_name || null;
+    if (isRecord(row) && row.binding === binding && typeof row.database_name === 'string')
+      return row.database_name || null;
   }
   return null;
 }
@@ -193,7 +200,10 @@ export function blankD1Ids(toml: string, env: string): string {
 /** Blank one field across every `[[env.<env>.<arrayKey>]]` table (value..EOL -> `""`). */
 function blankArrayField(toml: string, env: string, arrayKey: string, field: string): string {
   const edits = tables(toml)
-    .filter((t) => t.kind === 'array' && t.resolvedKey[0] === 'env' && t.resolvedKey[1] === env && t.resolvedKey[2] === arrayKey)
+    .filter(
+      (t) =>
+        t.kind === 'array' && t.resolvedKey[0] === 'env' && t.resolvedKey[1] === env && t.resolvedKey[2] === arrayKey,
+    )
     .map((t) => kvIn(toml, t, field))
     .flatMap((kv) => (kv ? [{ start: kv.value.range[0], end: endOfLine(toml, kv.value.range[1]) }] : []));
   return applyBlanks(toml, edits);
@@ -332,7 +342,7 @@ export async function ensureNamespace(logical: string, existing: KvNamespace[], 
   try {
     await $`bunx wrangler kv namespace create ${logical}`.cwd(cwd).quiet();
   } catch (err) {
-    return errText(err).includes('already') ? (await reList(logical, cwd)) : null;
+    return errText(err).includes('already') ? await reList(logical, cwd) : null;
   }
   return reList(logical, cwd);
 }

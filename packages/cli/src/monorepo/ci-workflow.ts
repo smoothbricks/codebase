@@ -1,3 +1,5 @@
+/* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub Actions expressions are emitted literally. */
+
 export enum CiWorkflowStepKind {
   Checkout = 'checkout',
   SetupDevenv = 'setup-devenv',
