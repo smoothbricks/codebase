@@ -156,6 +156,9 @@ fn flat_undo_op_registry_and_rollback_arms_match_fixture() {
         // Scalar writes were un-journaled in the frozen Zig ABI; journaled
         // deliberately at the post-parity sweep.
         ("ScalarUpdate", 14),
+        // Variable nested state snapshots journal exact bytes without widening
+        // the fixed undo-entry ABI.
+        ("StateBytes", 15),
     ];
 
     let rust_undo = read_source(MANIFEST, "src/undo_log.rs");
