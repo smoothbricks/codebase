@@ -333,17 +333,28 @@ function formatExpectedDependency(policy: ToolPolicy, dependency: RequiredDepend
 
 export function readToolContext(root: string): ToolContext {
   const rootPackage = readPackageJsonObject(join(root, 'package.json'));
-  return { rootPackage, policy: toolPolicy(rootPackage) };
+  const toolingPackage = readJsonObject(join(root, 'tooling', 'package.json'));
+  const configuredCliRange = recordProperty(toolingPackage ?? {}, 'dependencies')?.[cliPackageName];
+  return {
+    rootPackage,
+    policy: toolPolicy(rootPackage, typeof configuredCliRange === 'string' ? configuredCliRange : null),
+  };
 }
 
-function toolPolicy(rootPackage: PackageJson | null): ToolPolicy {
+function toolPolicy(rootPackage: PackageJson | null, configuredCliRange: string | null): ToolPolicy {
   const name = typeof rootPackage?.name === 'string' ? rootPackage.name : null;
   const isCodebase = isSmoothBricksCodebasePackageName(name ?? undefined);
   const toolingName = toolingPackageName(name);
+  // A locally linked prerelease can be newer than every published CLI. Keep an existing
+  // installable range instead of rewriting the consumer manifest to an unpublished version.
+  const publishedCliRange =
+    cliPackageVersion.includes('-') && configuredCliRange && parseVersion(configuredCliRange)
+      ? configuredCliRange
+      : `^${cliPackageVersion}`;
   return {
     isSmoothBricksCodebase: isCodebase,
     toolingPackageName: toolingName,
-    cliDependencyRange: isCodebase ? 'workspace:*' : `^${cliPackageVersion}`,
+    cliDependencyRange: isCodebase ? 'workspace:*' : publishedCliRange,
   };
 }
 
