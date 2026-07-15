@@ -70,21 +70,7 @@ describe('root smoo monorepo policy', () => {
       expect(rootPackage).toMatchObject({ nx: { includedScripts: [] } });
       expect(nxJson.namedInputs).toEqual(validNamedInputs());
       expect(nxJson.targetDefaults).toEqual(validTargetDefaults());
-      expect(nxJson.plugins).toEqual([
-        {
-          plugin: '@nx/js/typescript',
-          options: {
-            typecheck: { targetName: 'typecheck' },
-            build: {
-              targetName: 'tsc-js',
-              configName: 'tsconfig.lib.json',
-              buildDepsName: 'build-deps',
-              watchDepsName: 'watch-deps',
-            },
-          },
-        },
-        '@smoothbricks/nx-plugin',
-      ]);
+      expect(nxJson.plugins).toEqual(['@smoothbricks/nx-plugin']);
       expect(validateRootPackagePolicy(root)).toBe(0);
       expect(validateNxReleaseConfig(root)).toBe(0);
     } finally {
@@ -167,7 +153,7 @@ describe('root smoo monorepo policy', () => {
     }
   });
 
-  it('explains Nx plugin conventions when nx.json is not configured', async () => {
+  it('explains SmoothBricks Nx plugin conventions when nx.json is not configured', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
     try {
       await writeJson(join(root, 'package.json'), validRootPackage());
@@ -177,10 +163,8 @@ describe('root smoo monorepo policy', () => {
       });
       const errors = captureConsoleErrors();
 
-      expect(validateNxReleaseConfig(root)).toBe(2);
+      expect(validateNxReleaseConfig(root)).toBe(1);
 
-      expect(errors.join('\n')).toContain('Official Nx owns TypeScript library inference');
-      expect(errors.join('\n')).toContain('tsconfig.lib.json produces tsc-js');
       expect(errors.join('\n')).toContain('Smoo relies on this plugin to infer convention targets');
       expect(errors.join('\n')).not.toContain('Fix:');
     } finally {
@@ -188,7 +172,7 @@ describe('root smoo monorepo policy', () => {
     }
   });
 
-  it('explains why TypeScript build targetName is tsc-js', async () => {
+  it('rejects the official Nx TypeScript plugin because it bypasses ttsc transforms', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
     try {
       await writeJson(join(root, 'package.json'), validRootPackage());
@@ -206,8 +190,8 @@ describe('root smoo monorepo policy', () => {
 
       expect(validateNxReleaseConfig(root)).toBe(1);
 
-      expect(errors.join('\n')).toContain('build.targetName must be tsc-js');
-      expect(errors.join('\n')).toContain('build is reserved for aggregate targets');
+      expect(errors.join('\n')).toContain('plugins must not configure @nx/js/typescript');
+      expect(errors.join('\n')).toContain('Smoo owns transformer-aware TypeScript targets');
       expect(errors.join('\n')).not.toContain('Fix:');
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -1100,21 +1084,7 @@ function validConfiguredNxJson(): Record<string, unknown> {
     ...validNxJson(),
     namedInputs: validNamedInputs(),
     targetDefaults: validTargetDefaults(),
-    plugins: [
-      {
-        plugin: '@nx/js/typescript',
-        options: {
-          typecheck: { targetName: 'typecheck' },
-          build: {
-            targetName: 'tsc-js',
-            configName: 'tsconfig.lib.json',
-            buildDepsName: 'build-deps',
-            watchDepsName: 'watch-deps',
-          },
-        },
-      },
-      '@smoothbricks/nx-plugin',
-    ],
+    plugins: ['@smoothbricks/nx-plugin'],
   };
 }
 
