@@ -3476,9 +3476,16 @@ impl Vm {
                                 let row = out.row_off(up.pos);
                                 let dst_off = row + out.field_offset(state, dest_field_idx);
 
+                                let prior_bit =
+                                    StructMapSlot::is_field_set(state, row, dest_field_idx);
+                                let value_matches = prior_bit
+                                    && state[dst_off as usize..(dst_off + fsize) as usize]
+                                        == state[src_off as usize..(src_off + fsize) as usize];
+                                if value_matches {
+                                    continue;
+                                }
+
                                 if self.undo.enabled {
-                                    let prior_bit =
-                                        StructMapSlot::is_field_set(state, row, dest_field_idx);
                                     let undo_flags = if up.is_new {
                                         SMF_ROW_ABSENT
                                     } else if prior_bit {
@@ -3516,11 +3523,13 @@ impl Vm {
 
                                 StructMapSlot::set_field_bit(state, row, dest_field_idx);
                                 bytes::copy_within(state, src_off, dst_off, fsize);
-                                if delta_mode {
-                                    let meta_base = slot_meta_base(dest_slot);
-                                    state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
-                                        ChangeFlag::INSERTED;
-                                }
+                                let meta_base = slot_meta_base(dest_slot);
+                                state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
+                                    if prior_bit {
+                                        ChangeFlag::UPDATED
+                                    } else {
+                                        ChangeFlag::INSERTED
+                                    };
                             } else if let Some(pos) = out.find(state, out_key) {
                                 let row = out.row_off(pos);
                                 let dst_off = row + out.field_offset(state, dest_field_idx);
@@ -3553,11 +3562,9 @@ impl Vm {
                                     }
                                     StructMapSlot::clear_scalar_field(state, row, dest_field_idx);
                                     bytes::zero(state, dst_off, fsize);
-                                    if delta_mode {
-                                        let meta_base = slot_meta_base(dest_slot);
-                                        state[(meta_base + SlotMetaOffset::CHANGE_FLAGS)
-                                            as usize] |= ChangeFlag::INSERTED;
-                                    }
+                                    let meta_base = slot_meta_base(dest_slot);
+                                    state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
+                                        ChangeFlag::REMOVED;
                                 }
                             }
                         }
