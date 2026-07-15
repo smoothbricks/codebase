@@ -164,13 +164,25 @@ function writeZigFiles(tree: Tree, schema: CreatePackageGeneratorSchema, project
   const packageJson = readJson<Record<string, unknown>>(tree, `${projectRoot}/package.json`);
 
   // Add wasm export and remove development condition
-  const exports = packageJson.exports as Record<string, unknown>;
+  const exports = packageJson.exports;
+  if (!isRecord(exports)) {
+    // invariant throw: writeCommonFiles always emits an object-valued exports map.
+    throw new Error('generated package.json exports must be an object');
+  }
   exports['./wasm'] = `./dist/${schema.name}.wasm`;
-  const dotExport = exports['.'] as Record<string, unknown>;
+  const dotExport = exports['.'];
+  if (!isRecord(dotExport)) {
+    // invariant throw: writeCommonFiles always emits an object-valued "." export.
+    throw new Error('generated package.json "." export must be an object');
+  }
   delete dotExport.development;
 
   // Add build scripts
-  const scripts = packageJson.scripts as Record<string, string>;
+  const scripts = packageJson.scripts;
+  if (!isRecord(scripts)) {
+    // invariant throw: writeCommonFiles always emits an object-valued scripts map.
+    throw new Error('generated package.json scripts must be an object');
+  }
   scripts['build:zig'] = `nx run ${schema.name}:zig-wasm`;
   scripts['build:ts'] = `nx run ${schema.name}:tsc-js`;
   scripts.build = 'bun run build:ts && bun run build:zig';
@@ -182,7 +194,11 @@ function writeZigFiles(tree: Tree, schema: CreatePackageGeneratorSchema, project
 
   // Modify tsconfig.lib.json for ts-zig
   const tsconfigLib = readJson<Record<string, unknown>>(tree, `${projectRoot}/tsconfig.lib.json`);
-  const libCompilerOptions = tsconfigLib.compilerOptions as Record<string, unknown>;
+  const libCompilerOptions = tsconfigLib.compilerOptions;
+  if (!isRecord(libCompilerOptions)) {
+    // invariant throw: writeCommonFiles always emits compilerOptions for library builds.
+    throw new Error('generated tsconfig.lib.json compilerOptions must be an object');
+  }
   libCompilerOptions.lib = ['es2022', 'webworker'];
   libCompilerOptions.declaration = true;
   libCompilerOptions.sourceMap = true;
@@ -191,7 +207,11 @@ function writeZigFiles(tree: Tree, schema: CreatePackageGeneratorSchema, project
 
   // Modify tsconfig.test.json for ts-zig
   const tsconfigTest = readJson<Record<string, unknown>>(tree, `${projectRoot}/tsconfig.test.json`);
-  const testCompilerOptions = tsconfigTest.compilerOptions as Record<string, unknown>;
+  const testCompilerOptions = tsconfigTest.compilerOptions;
+  if (!isRecord(testCompilerOptions)) {
+    // invariant throw: writeCommonFiles always emits compilerOptions for test builds.
+    throw new Error('generated tsconfig.test.json compilerOptions must be an object');
+  }
   testCompilerOptions.lib = ['es2022', 'webworker'];
   writeJson(tree, `${projectRoot}/tsconfig.test.json`, tsconfigTest);
 
