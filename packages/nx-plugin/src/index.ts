@@ -109,10 +109,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       executor: 'nx:run-commands',
       cache: true,
       inputs: ['production', '^production', ...TYPESCRIPT_TOOLCHAIN_INPUTS, '{projectRoot}/tsconfig.lib.json'],
-      outputs: [
-        '{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}',
-        '{projectRoot}/dist/.build.tsbuildinfo',
-      ],
+      outputs: ['{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}'],
       dependsOn: ['^tsc-js'],
       options: {
         command: 'ttsc -p tsconfig.lib.json --emit',
