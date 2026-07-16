@@ -630,8 +630,6 @@ function renderLinuxReleaseCandidateSteps(
       lines.push(
         `      - name: ${step.name}`,
         `        if: ${githubExpression("steps.version.outputs.mode != 'none'")}`,
-        '        env:',
-        `          GITHUB_SHA: ${githubExpression('steps.release-state.outputs.sha')}`,
         '        run:',
         `          smoo github-ci nx-run-many --targets build --projects "${githubExpression(
           'steps.version.outputs.projects',
@@ -657,8 +655,6 @@ function renderLinuxReleaseCandidateSteps(
         `      # Step ${stepNumber}`,
         '      - name: 🐧 Build supplemental Linux targets',
         `        if: ${githubExpression("steps.version.outputs.mode != 'none'")}`,
-        '        env:',
-        `          GITHUB_SHA: ${githubExpression('steps.release-state.outputs.sha')}`,
         '        run:',
         `          smoo github-ci nx-run-many --targets "${LINUX_PLATFORM_TARGET_GLOBS.join(
           ',',
@@ -761,8 +757,6 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     '',
     `      # Step ${stepNumber++}`,
     '      - name: 🍎 Build macOS and iOS targets',
-    '        env:',
-    `          GITHUB_SHA: ${githubExpression('github.sha')}`,
     '        run:',
     `          smoo github-ci nx-run-many --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(
       ',',
@@ -855,10 +849,10 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     '        run:',
     `          smoo github-ci apply-outputs --source-sha "${githubExpression(
       'needs.linux-release-candidate.outputs.release-sha',
-    )}" \\`,
+    )}"`,
     `          "${githubExpression('runner.temp')}/publish-artifacts/publish-release-outputs-${githubExpression(
       'github.run_id',
-    )}"${hasLinuxPlatformTargets(options) ? ' \\' : ''}`,
+    )}"`,
   );
   if (hasLinuxPlatformTargets(options)) {
     lines.push(
