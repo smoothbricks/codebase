@@ -56,9 +56,10 @@
       "cache": true,
       "dependsOn": ["typecheck-tests", "cargo-lint"],
       "inputs": [
-        "{projectRoot}/src/**/*",
-        "{projectRoot}/package.json",
-        "{projectRoot}/tsconfig*.json",
+        "default",
+        "{workspaceRoot}/package.json",
+        "{workspaceRoot}/bun.lock",
+        "{workspaceRoot}/patches/**/*",
         "{workspaceRoot}/biome.json",
         "{workspaceRoot}/eslint.config.ts",
         "{workspaceRoot}/tsconfig.base.json",
