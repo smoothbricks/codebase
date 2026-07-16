@@ -322,9 +322,23 @@ function buildProgram(): Command {
     .requiredOption('--targets <targets>')
     .option('--projects <projects>')
     .option('--configuration <configuration>')
-    .action(async (options: { targets: string; projects?: string; configuration?: string }) => {
-      const { githubCiNxRunMany } = await import('./github-ci/index.js');
-      await githubCiNxRunMany(await findRepoRoot(), options);
+    .option('--collect-outputs <directory>')
+    .action(
+      async (options: { targets: string; projects?: string; configuration?: string; collectOutputs?: string }) => {
+        const { githubCiNxRunMany } = await import('./github-ci/index.js');
+        await githubCiNxRunMany(await findRepoRoot(), options);
+      },
+    );
+  githubCi
+    .command('apply-outputs <directories...>')
+    .requiredOption('--source-sha <sha>', 'expected source commit SHA')
+    .action(async (directories: string[], options: { sourceSha: string }) => {
+      if (import.meta.url.endsWith('/src/cli.ts')) {
+        // Self-hosted source needs the Typia Bun transform registered before loading the manifest boundary.
+        await import('@smoothbricks/validation/bun/preload');
+      }
+      const { applyCollectedOutputs } = await import('./github-ci/outputs.js');
+      await applyCollectedOutputs(await findRepoRoot(), directories, options.sourceSha);
     });
   githubCi
     .command('nx-deploy')

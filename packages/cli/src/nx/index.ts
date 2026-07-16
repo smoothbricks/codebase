@@ -7,9 +7,12 @@ import { decode, run } from '../lib/run.js';
 
 export interface ProjectTargets {
   project: string;
+  root?: string;
   targets: string[];
   buildDependsOn?: string[];
+  targetDependencies?: Map<string, string[]>;
   targetExecutors?: Map<string, string>;
+  targetOutputs?: Map<string, string[]>;
   targetScripts?: Map<string, string>;
 }
 
@@ -35,6 +38,10 @@ export function targetNamesFromNxProjectJson(value: unknown): string[] {
   return targets ? Object.keys(targets).sort((a, b) => a.localeCompare(b)) : [];
 }
 
+export function projectRootFromNxProjectJson(value: unknown): string | undefined {
+  return isRecord(value) && typeof value.root === 'string' ? value.root : undefined;
+}
+
 export function buildDependsOnFromNxProjectJson(value: unknown): string[] | undefined {
   const targets = isRecord(value) ? recordProperty(value, 'targets') : null;
   const build = targets ? recordProperty(targets, 'build') : null;
@@ -42,6 +49,10 @@ export function buildDependsOnFromNxProjectJson(value: unknown): string[] | unde
     return undefined;
   }
   return build.dependsOn;
+}
+
+export function targetDependenciesFromNxProjectJson(value: unknown): Map<string, string[]> {
+  return targetStringArraysFromNxProjectJson(value, 'dependsOn');
 }
 
 export function targetExecutorsFromNxProjectJson(value: unknown): Map<string, string> {
@@ -56,6 +67,10 @@ export function targetExecutorsFromNxProjectJson(value: unknown): Map<string, st
     }
   }
   return executors;
+}
+
+export function targetOutputsFromNxProjectJson(value: unknown): Map<string, string[]> {
+  return targetStringArraysFromNxProjectJson(value, 'outputs');
 }
 
 export function targetScriptsFromNxProjectJson(value: unknown): Map<string, string> {
@@ -74,6 +89,27 @@ export function targetScriptsFromNxProjectJson(value: unknown): Map<string, stri
     }
   }
   return scripts;
+}
+
+function targetStringArraysFromNxProjectJson(value: unknown, property: string): Map<string, string[]> {
+  const targets = isRecord(value) ? recordProperty(value, 'targets') : null;
+  const values = new Map<string, string[]>();
+  if (!targets) {
+    return values;
+  }
+  for (const [targetName, target] of Object.entries(targets)) {
+    if (!isRecord(target)) {
+      continue;
+    }
+    const entries = target[property];
+    if (Array.isArray(entries)) {
+      values.set(
+        targetName,
+        entries.filter((entry): entry is string => typeof entry === 'string'),
+      );
+    }
+  }
+  return values;
 }
 
 export function formatProjectTargetLines(projects: ProjectTargets[]): string {
@@ -167,9 +203,12 @@ async function readProjectTarget(root: string, project: string): Promise<Project
   const parsed: unknown = JSON.parse(decode(result.stdout));
   return {
     project,
+    root: projectRootFromNxProjectJson(parsed),
     targets: targetNamesFromNxProjectJson(parsed),
     buildDependsOn: buildDependsOnFromNxProjectJson(parsed),
+    targetDependencies: targetDependenciesFromNxProjectJson(parsed),
     targetExecutors: targetExecutorsFromNxProjectJson(parsed),
+    targetOutputs: targetOutputsFromNxProjectJson(parsed),
     targetScripts: targetScriptsFromNxProjectJson(parsed),
   };
 }

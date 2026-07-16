@@ -7,7 +7,10 @@ import {
   nxShowProjectCommand,
   projectNamesFromNxShowProjectsOutput,
   projectNamesWithTarget,
+  projectRootFromNxProjectJson,
+  targetDependenciesFromNxProjectJson,
   targetNamesFromNxProjectJson,
+  targetOutputsFromNxProjectJson,
 } from './index.js';
 
 describe('Nx helper command construction', () => {
@@ -65,6 +68,30 @@ describe('Nx helper output formatting', () => {
       'lint',
       'test',
     ]);
+  });
+
+  it('extracts resolved roots, output declarations, and string target dependencies', () => {
+    const metadata = {
+      root: 'packages/native',
+      targets: {
+        'build-macos': {
+          outputs: ['{projectRoot}/dist/*.dmg'],
+          dependsOn: ['^build', 'compile-macos', { target: 'ignored-object-dependency' }],
+        },
+        test: { outputs: [] },
+      },
+    };
+
+    expect(projectRootFromNxProjectJson(metadata)).toBe('packages/native');
+    expect(targetOutputsFromNxProjectJson(metadata)).toEqual(
+      new Map([
+        ['build-macos', ['{projectRoot}/dist/*.dmg']],
+        ['test', []],
+      ]),
+    );
+    expect(targetDependenciesFromNxProjectJson(metadata)).toEqual(
+      new Map([['build-macos', ['^build', 'compile-macos']]]),
+    );
   });
 
   it('treats missing target metadata as an empty project', () => {
