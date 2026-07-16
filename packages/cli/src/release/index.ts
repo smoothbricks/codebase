@@ -201,7 +201,7 @@ export async function releaseCollectPlatformOutputs(
   const currentPackages =
     packagesAtHead.length > 0
       ? packagesAtHead
-      : await releaseVersionPackages(root, packages, releaseBumpArg(options.bump));
+      : await releasePlatformPackages(root, packages, releaseBumpArg(options.bump));
   console.log(
     currentPackages.length === 0
       ? 'Release platform outputs: no current release packages selected.'
@@ -634,6 +634,19 @@ async function releaseVersionPackages(
     },
     packages,
   );
+}
+
+async function releasePlatformPackages(
+  root: string,
+  packages: ReleasePackage[],
+  bump: string,
+): Promise<ReleasePackage[]> {
+  const candidates = await releaseVersionPackages(root, packages, bump);
+  if (candidates.length === 0) {
+    return [];
+  }
+  // Nx may version additional reverse dependents, so use its dry-run result rather than only the direct candidates.
+  return runNxReleaseVersionPreview(root, releasePackageProjects(candidates), bump);
 }
 
 async function runNxReleaseVersion(

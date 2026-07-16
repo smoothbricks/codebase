@@ -186,7 +186,16 @@ export async function applyCollectedOutputs(
       overlays.push({ source, destination: path });
     }
 
-    const workspaceStat = await lstat(workspace);
+    let workspaceStat: Stats;
+    try {
+      workspaceStat = await lstat(workspace);
+    } catch (error) {
+      // Artifact transports omit empty directories, so an empty manifest is the complete transferable contract.
+      if (manifest.files.length === 0 && isMissingPathError(error)) {
+        continue;
+      }
+      throw new Error(`Collected output workspace is missing: ${workspace}`, { cause: error });
+    }
     if (workspaceStat.isSymbolicLink() || !workspaceStat.isDirectory()) {
       throw new Error(`Collected output workspace must be a real directory: ${workspace}`);
     }
