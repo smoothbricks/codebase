@@ -155,7 +155,8 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
         break;
       }
 
-      case Opcode.SLOT_STRUCT_MAP: {
+      case Opcode.SLOT_STRUCT_MAP:
+      case Opcode.SLOT_STRUCT_MAP2: {
         const slot = initCode[pc];
         const typeFlags = initCode[pc + 1];
         const capLo = initCode[pc + 2];
@@ -168,17 +169,24 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
           fieldTypes.push(parseStructFieldType(initCode[pc++]));
         }
 
-        const ttlParsed = parseTtlIfPresent(initCode, pc, typeFlags);
+        const ttlParsed = op === Opcode.SLOT_STRUCT_MAP ? parseTtlIfPresent(initCode, pc, typeFlags) : undefined;
         if (ttlParsed) {
           pc = ttlParsed.nextPc;
         }
 
-        slotDefs[slot] = {
-          type: SlotType.STRUCT_MAP,
-          capacity: (capHi << 8) | capLo || defaultCapacity,
-          fieldTypes,
-          ttl: ttlParsed?.ttl,
-        };
+        slotDefs[slot] =
+          op === Opcode.SLOT_STRUCT_MAP2
+            ? {
+                type: SlotType.STRUCT_MAP2,
+                capacity: (capHi << 8) | capLo || defaultCapacity,
+                fieldTypes,
+              }
+            : {
+                type: SlotType.STRUCT_MAP,
+                capacity: (capHi << 8) | capLo || defaultCapacity,
+                fieldTypes,
+                ttl: ttlParsed?.ttl,
+              };
         break;
       }
 
