@@ -444,6 +444,10 @@ pub enum Opcode {
     BatchStructMap2UpsertLast = 0x83,
     /// slot:u8, key1_col:u8, key2_col:u8
     BatchStructMap2Remove = 0x86,
+    /// Conditional exact-pair row replacement with signed-i64 lexicographic
+    /// comparison. Encoding extends 0x83 with
+    /// cmp1_col,cmp1_field,cmp2_col,cmp2_field.
+    BatchStructMap2UpsertMaxI64x2 = 0x87,
     /// slot:u8, val_col:u8 (body opcode inside FOR_EACH/FLAT_MAP blocks)
     ListAppend = 0x84,
     /// slot:u8, num_vals:u8, \[(val_col:u8, field_idx:u8) × N\]
@@ -532,6 +536,7 @@ impl Opcode {
             0x84 => Self::ListAppend,
             0x85 => Self::ListAppendStruct,
             0x86 => Self::BatchStructMap2Remove,
+            0x87 => Self::BatchStructMap2UpsertMaxI64x2,
             0x90 => Self::NestedSetInsert,
             0x92 => Self::NestedMapUpsertLast,
             0x95 => Self::NestedAggUpdate,

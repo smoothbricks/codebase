@@ -16,17 +16,12 @@ import { createColumineWasmBackend } from '../wasm-backend.js';
 const WASM_PATH = new URL('../../target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm', import.meta.url);
 const HAS_WASM = existsSync(WASM_PATH);
 
-function reducer(reduce: readonly number[]): Uint8Array {
-  const init = [
-    Opcode.SLOT_STRUCT_MAP2,
-    0,
-    SlotType.STRUCT_MAP2,
-    8,
-    0,
-    2,
-    StructFieldType.STRING,
-    StructFieldType.UINT32,
-  ];
+function reducer(
+  reduce: readonly number[],
+  fields: readonly StructFieldType[] = [StructFieldType.STRING, StructFieldType.UINT32],
+  numInputs = 4,
+): Uint8Array {
+  const init = [Opcode.SLOT_STRUCT_MAP2, 0, SlotType.STRUCT_MAP2, 8, 0, fields.length, ...fields];
   const code = [...reduce, Opcode.HALT];
   const bytecode = new Uint8Array(PROGRAM_HASH_PREFIX + HEADER_SIZE + init.length + code.length);
   const base = PROGRAM_HASH_PREFIX;
@@ -36,7 +31,7 @@ function reducer(reduce: readonly number[]): Uint8Array {
   bytecode[base + 3] = (MAGIC >>> 24) & 0xff;
   bytecode[base + 4] = 1;
   bytecode[base + 6] = 1;
-  bytecode[base + 7] = 4;
+  bytecode[base + 7] = numInputs;
   bytecode[base + 10] = init.length;
   bytecode[base + 12] = code.length;
   bytecode.set(init, base + HEADER_SIZE);
@@ -102,5 +97,37 @@ describe('StructMap2 public WASM readers', () => {
     expect(getRow(restored, upsert, 0, 7, 40)).toEqual(first);
     expect(getRow(restored, upsert, 0, 7, 41)).toEqual(second);
     expect(entries(restored, upsert, 0)).toHaveLength(2);
+  });
+
+  it.skipIf(!HAS_WASM)('executes strict signed i64x2 max in the built WASM dispatcher', async () => {
+    expect(Opcode.BATCH_STRUCT_MAP2_UPSERT_MAX_I64X2).toBe(0x87);
+    const backend = await createColumineWasmBackend(readFileSync(WASM_PATH));
+    const getRow = backend.structMap2GetRow;
+    if (!getRow) throw new Error('WASM backend omitted StructMap2 point lookup');
+    const max = await backend.loadProgram(
+      reducer(
+        [Opcode.BATCH_STRUCT_MAP2_UPSERT_MAX_I64X2, 0, 0, 1, 1, 2, 0, 3, 1, 4, 2],
+        [StructFieldType.UINT32, StructFieldType.INT64, StructFieldType.INT64],
+        5,
+      ),
+    );
+    const state = backend.createState(max);
+    const candidates = [
+      { data: new Uint32Array([7, 7, 7]), type: ValueType.UINT32 },
+      { data: new Uint32Array([40, 40, 40]), type: ValueType.UINT32 },
+      { data: new Uint32Array([10, 20, 30]), type: ValueType.UINT32 },
+      { data: new BigInt64Array([-5n, -5n, -4n]), type: ValueType.UINT32 },
+      { data: new BigInt64Array([10n, 10n, -(1n << 63n)]), type: ValueType.UINT32 },
+    ] as unknown as ColumnInput[];
+    expect(backend.executeBatch(state, max, candidates, 3)).toBe(ErrorCode.OK);
+
+    const row = getRow(state, max, 0, 7, 40);
+    expect(row).toBeDefined();
+    const bytes = backend.serialize(state, max);
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const offset = row!.rowOffset;
+    expect(view.getUint32(offset + 1, true)).toBe(30);
+    expect(view.getBigInt64(offset + 5, true)).toBe(-4n);
+    expect(view.getBigInt64(offset + 13, true)).toBe(-(1n << 63n));
   });
 });
