@@ -4,6 +4,17 @@
   "private": true,
   "description": "Rust implementation of lmao (Cargo workspace; see crates/)",
   "nx": {
-    "name": "lmao-rs"
+    "name": "lmao-rs",
+    "targets": {
+      "lint": {
+        "options": {
+          "commands": [
+            "biome check --files-ignore-unknown=true packages/lmao-rs"
+          ],
+          "cwd": "",
+          "parallel": false
+        }
+      }
+    }
   }
 }

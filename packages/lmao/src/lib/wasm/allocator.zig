@@ -221,8 +221,6 @@ inline fn blockSizeForCapacity(sc: SizeClass, capacity: u32) u32 {
     };
 }
 
-<<<<<<< HEAD
-=======
 /// Effective allocation tier for a request.
 ///
 /// FIX (was a latent memory-corruption bug): a freed block is overlaid with a
@@ -257,7 +255,6 @@ inline fn memorySizeBytes() u64 {
     return @as(u64, @wasmMemorySize(0)) * 65536;
 }
 
->>>>>>> 67c24006f (perf(lmao): allocate exact WASM layout slabs)
 // =============================================================================
 // Allocator Core
 // =============================================================================
@@ -490,7 +487,7 @@ fn isOffsetFree(sc: SizeClass, tier: usize, target_offset: u32) bool {
 /// Debug: get freelist head offset for a size class at given capacity
 export fn debug_get_freelist_head(size_class: u8, capacity: u32) u32 {
     const sc: SizeClass = @enumFromInt(size_class);
-    const tier = capacityToTier(capacity);
+    const tier = effectiveTier(sc, capacityToTier(capacity));
     return freelistHeadAtTier(sc, tier);
 }
 
@@ -615,7 +612,7 @@ export fn get_span_id_counter() u32 {
 /// Get freelist length for a size class at given capacity (O(1) - read from HEAD)
 export fn get_freelist_len(size_class: u8, capacity: u32) u32 {
     const sc: SizeClass = @enumFromInt(size_class);
-    const tier = capacityToTier(capacity);
+    const tier = effectiveTier(sc, capacityToTier(capacity));
     const head_offset = freelistHeadAtTier(sc, tier);
     if (head_offset == 0) return 0;
     return ptrAt(FreeBlock, head_offset).freelist_len;
@@ -624,7 +621,7 @@ export fn get_freelist_len(size_class: u8, capacity: u32) u32 {
 /// Get total reuse count for a size class at given capacity (O(1) - read from HEAD)
 export fn get_freelist_reuse_count(size_class: u8, capacity: u32) u32 {
     const sc: SizeClass = @enumFromInt(size_class);
-    const tier = capacityToTier(capacity);
+    const tier = effectiveTier(sc, capacityToTier(capacity));
     const head_offset = freelistHeadAtTier(sc, tier);
     if (head_offset == 0) return 0;
     return ptrAt(FreeBlock, head_offset).reuse_count;
@@ -633,7 +630,7 @@ export fn get_freelist_reuse_count(size_class: u8, capacity: u32) u32 {
 /// Get split count for a size class at given capacity (O(1) - read from HEAD)
 export fn get_freelist_split_count(size_class: u8, capacity: u32) u32 {
     const sc: SizeClass = @enumFromInt(size_class);
-    const tier = capacityToTier(capacity);
+    const tier = effectiveTier(sc, capacityToTier(capacity));
     const head_offset = freelistHeadAtTier(sc, tier);
     if (head_offset == 0) return 0;
     return ptrAt(FreeBlock, head_offset).split_count;
@@ -642,7 +639,7 @@ export fn get_freelist_split_count(size_class: u8, capacity: u32) u32 {
 /// Get merge count for a size class at given capacity (O(1) - read from HEAD)
 export fn get_freelist_merge_count(size_class: u8, capacity: u32) u32 {
     const sc: SizeClass = @enumFromInt(size_class);
-    const tier = capacityToTier(capacity);
+    const tier = effectiveTier(sc, capacityToTier(capacity));
     const head_offset = freelistHeadAtTier(sc, tier);
     if (head_offset == 0) return 0;
     return ptrAt(FreeBlock, head_offset).merge_count;
@@ -790,14 +787,16 @@ fn allocWithCapacity(sc: SizeClass, capacity: u32) u32 {
     const tier = effectiveTier(sc, capacityToTier(capacity));
     const offset = allocAtTier(sc, tier);
     zeroBlock(offset, blockSizeForCapacity(sc, tierToCapacity(tier)));
-    return offset;}
+    return offset;
+}
 
 /// Free with explicit capacity (converts to tier internally).
 fn freeWithCapacity(offset: u32, sc: SizeClass, capacity: u32) void {
     if (offset == 0) return;
 
     const tier = effectiveTier(sc, capacityToTier(capacity));
-    if (isOffsetFree(sc, tier, offset)) return;    freeAtTier(offset, sc, tier);
+    if (isOffsetFree(sc, tier, offset)) return;
+    freeAtTier(offset, sc, tier);
 }
 
 // =============================================================================

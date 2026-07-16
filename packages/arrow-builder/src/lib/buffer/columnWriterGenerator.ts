@@ -170,7 +170,6 @@ function getSetterBody(schema: ColumnSchema, fieldName: string, isPreallocated: 
     return this;`;
   }
 
-
   if (schemaType === 'boolean') {
     // Bit-packed boolean: set bit in values bitmap
     if (isEager) {
