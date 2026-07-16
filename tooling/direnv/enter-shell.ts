@@ -19,9 +19,23 @@ async function rebuildNxPluginIfStale(): Promise<void> {
   const markerStat = await stat(buildMarker).catch(() => null);
   // Directory mtimes miss edits to existing nested files, so compare source file mtimes against the TS build marker.
   if (!markerStat || (await hasFileNewerThanMarker(markerStat.mtimeMs))) {
-    await $`nx run nx-plugin:tsc-js`;
-    await $`nx reset`;
+    await runNxQuietly(['run', 'nx-plugin:tsc-js']);
+    await runNxQuietly(['reset']);
   }
+}
+
+async function runNxQuietly(args: readonly string[]): Promise<void> {
+  const result = await $`nx ${args}`.quiet(true).nothrow();
+  if (result.exitCode === 0) {
+    return;
+  }
+  if (result.stdout.length > 0) {
+    process.stdout.write(result.stdout);
+  }
+  if (result.stderr.length > 0) {
+    process.stderr.write(result.stderr);
+  }
+  throw new Error(`nx ${args.join(' ')} failed with exit code ${result.exitCode}`);
 }
 
 async function hasFileNewerThanMarker(markerMtimeMs: number): Promise<boolean> {
