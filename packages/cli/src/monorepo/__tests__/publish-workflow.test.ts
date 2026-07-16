@@ -4,6 +4,11 @@ import { describe, expect, it } from 'bun:test';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
+  LINUX_PLATFORM_TARGET_GLOBS,
+  MACOS_PLATFORM_TARGET_GLOBS,
+  PLATFORM_TARGET_GLOBS,
+} from '@smoothbricks/nx-plugin/workspace-config-policy';
+import {
   definePublishWorkflow,
   type PublishWorkflowBump,
   type PublishWorkflowCallbacks,
@@ -15,11 +20,94 @@ import {
 
 describe('publish workflow definition', () => {
   it('renders the checked-in local publish workflow copy', async () => {
-    const rendered = renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase' });
+    const rendered = renderPublishWorkflowYaml({
+      repoName: '@smoothbricks/codebase',
+      platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+    });
     const packageRoot = join(import.meta.dir, '..', '..', '..');
     await expect(readFile(join(packageRoot, '..', '..', '.github/workflows/publish.yml'), 'utf8')).resolves.toBe(
       rendered,
     );
+  });
+
+  it('preserves the byte-equivalent single-job workflow when no platform targets exist', () => {
+    const current = renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase' });
+    const explicitlyEmpty = renderPublishWorkflowYaml({
+      repoName: '@smoothbricks/codebase',
+      platformTargetGlobs: [],
+    });
+
+    expect(explicitlyEmpty).toBe(current);
+    expect(current).toContain('jobs:\n  publish:\n    runs-on: ubuntu-latest');
+    expect(current).not.toContain('linux-release-candidate:');
+    expect(current).not.toContain('macos-platform:');
+    expect(current).not.toContain('publish-on-linux:');
+  });
+
+  it('renders a macOS release candidate and verified artifact transfer only when macOS targets exist', () => {
+    const linuxOnly = renderPublishWorkflowYaml({
+      repoName: '@smoothbricks/codebase',
+      platformTargetGlobs: LINUX_PLATFORM_TARGET_GLOBS,
+    });
+    const native = renderPublishWorkflowYaml({
+      repoName: '@smoothbricks/codebase',
+      platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+    });
+
+    expect(linuxOnly).not.toContain('macos-release-candidate:');
+    expect(linuxOnly).toContain(
+      `smoo github-ci nx-run-many --targets "${LINUX_PLATFORM_TARGET_GLOBS.join(',')}" --projects`,
+    );
+    expect(native).toContain('  macos-release-candidate:\n    runs-on: macos-latest');
+    expect(native).toContain('  publish-on-linux:\n    needs: macos-release-candidate');
+    expect(native).not.toContain('linux-release-candidate:');
+    expect(native).not.toContain('macos-platform:');
+    expect(native).toContain('uses: ./.github/actions/setup-devenv');
+    expect(native).toContain(
+      `smoo github-ci nx-run-many --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(',')}" --projects`,
+    );
+    expect(native).toContain(
+      `smoo github-ci nx-run-many --targets "${LINUX_PLATFORM_TARGET_GLOBS.join(',')}" --projects`,
+    );
+    expect(native).toContain('uses: actions/upload-artifact@v7.0.1');
+    expect(native).toContain('uses: actions/download-artifact@v8.0.1');
+    expect(native).toContain('name: publish-release-state-${{ github.run_id }}');
+    expect(native).toContain('name: publish-macos-outputs-${{ github.run_id }}');
+    expect(native).not.toContain('name: publish-release-outputs-${{ github.run_id }}');
+    expect(native).not.toContain('name: publish-linux-outputs-${{ github.run_id }}');
+    expect(native).toContain('git bundle create');
+    expect(native).toContain('git fetch "${{ runner.temp }}/publish-artifacts/publish-release-state-');
+    expect(native).toContain(
+      'smoo github-ci apply-outputs --source-sha "${{ needs.macos-release-candidate.outputs.release-sha }}"',
+    );
+  });
+
+  it('versions on macOS, restores before Linux setup, and preserves mode, deploy, and dry-run gates', () => {
+    const rendered = renderPublishWorkflowYaml({
+      deploy: true,
+      deployProvider: 'cloudflare',
+      repoName: '@smoothbricks/codebase',
+      platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+    });
+    const candidate = rendered.slice(
+      rendered.indexOf('  macos-release-candidate:'),
+      rendered.indexOf('  publish-on-linux:'),
+    );
+    const finalJob = rendered.slice(rendered.indexOf('  publish-on-linux:'));
+
+    expect(candidate.indexOf('smoo release version')).toBeLessThan(candidate.indexOf('🍎 Build macOS and iOS targets'));
+    expect(finalJob.indexOf('♻️ Restore validated release state')).toBeLessThan(finalJob.indexOf('🧱 Setup Nix/devenv'));
+    expect(rendered).toContain('GITHUB_SHA: ${{ steps.release-state.outputs.sha }}');
+    expect(finalJob).not.toContain('smoo release version');
+    expect(finalJob).toContain("needs.macos-release-candidate.outputs.mode != 'none'");
+    expect(finalJob).toContain('smoo github-ci nx-run-many --targets build --projects');
+    expect(finalJob).toContain('smoo github-ci nx-run-many --targets lint --projects');
+    expect(finalJob).toContain('smoo github-ci nx-run-many --targets test --projects');
+    expect(finalJob).toContain("inputs.deploy_environment == 'production'");
+    expect(finalJob).toContain("inputs.dry_run != 'true'");
+    expect(finalJob).toContain('smoo release publish --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"');
+    expect(finalJob).toContain('CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}');
+    expect(finalJob).toContain('CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}');
   });
 
   it('does not wire npm token secrets into repair or publish steps', () => {
