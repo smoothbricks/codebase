@@ -34,6 +34,7 @@ import (
 	"strings"
 
 	shimast "github.com/microsoft/typescript-go/shim/ast"
+	shimchecker "github.com/microsoft/typescript-go/shim/checker"
 	shimprinter "github.com/microsoft/typescript-go/shim/printer"
 	shimscanner "github.com/microsoft/typescript-go/shim/scanner"
 	"github.com/samchon/ttsc/packages/ttsc/driver"
@@ -97,6 +98,38 @@ func outputKey(cwd, fileName string) string {
 	return filepath.ToSlash(rel)
 }
 
+// lmaoPluginTransform builds the emit-phase transformer. Running inside
+// tsgo's per-file emit chain (the AST-integration model, same as typia) is
+// what makes synthesized pos:-1 nodes safe: the checker's per-file emit-time
+// passes (grammar checks, MarkLinkedReferences) run BEFORE the script
+// transformers, so nothing type-checks the mutated tree. Checker queries the
+// transform itself makes (tag-chain detection) happen in a collect phase over
+// the still-untouched file before any node is spliced.
+func lmaoPluginTransform(prog *driver.Program, cwd string) driver.PluginTransform {
+	return func(_ *shimprinter.EmitContext, sf *shimast.SourceFile) *shimast.SourceFile {
+		if sf == nil || sf.IsDeclarationFile {
+			return sf
+		}
+		t := &fileTransformer{
+			file: sf, cwd: cwd, checker: prog.Checker,
+			processed:      map[*shimast.CallExpression]bool{},
+			opSpans:        map[*shimast.CallExpression]bool{},
+			logTemplateIDs: map[*shimast.CallExpression]uint16{},
+		}
+		hintRewrites := t.collectOptimizations(sf.AsNode())
+		tagInlines, logInlines, resultInlines := t.collectTagInlines(sf.AsNode())
+		applyHintRewrites(hintRewrites)
+		t.applyTagInlines(tagInlines)
+		t.applyLogInlines(logInlines)
+		t.applyResultInlines(resultInlines)
+		t.walk(sf.AsNode())
+		// Wire Parent on synthesized nodes (only where nil); printer passes
+		// walk parents. See shim/ast/parent.go.
+		shimast.SetParentInChildrenUnset(sf.AsNode())
+		return sf
+	}
+}
+
 func runTransform(args []string) int {
 	cwd, tsconfig := readFlags(args)
 	prog, _, err := driver.LoadProgram(cwd, tsconfig, driver.LoadProgramOptions{})
@@ -106,15 +139,19 @@ func runTransform(args []string) int {
 	}
 	defer prog.Close()
 
-	transformProgram(prog, cwd)
-
-	printer := shimprinter.NewPrinter(shimprinter.PrinterOptions{}, shimprinter.PrintHandlers{}, nil)
+	transform := lmaoPluginTransform(prog, cwd)
 	out := transformResult{TypeScript: map[string]string{}}
 	for _, file := range prog.SourceFiles() {
 		if file == nil || file.IsDeclarationFile {
 			continue
 		}
-		out.TypeScript[outputKey(cwd, file.FileName())] = shimprinter.EmitSourceFile(printer, file)
+		ec := shimprinter.NewEmitContext()
+		result := file
+		if next := transform(ec, result); next != nil {
+			result = next
+		}
+		printer := shimprinter.NewPrinter(shimprinter.PrinterOptions{}, shimprinter.PrintHandlers{}, ec)
+		out.TypeScript[outputKey(cwd, file.FileName())] = shimprinter.EmitSourceFile(printer, result)
 	}
 	data, err := json.Marshal(out)
 	if err != nil {
@@ -134,12 +171,13 @@ func runBuild(args []string) int {
 	}
 	defer prog.Close()
 
-	transformProgram(prog, cwd)
-
-	if _, emitDiags, err := prog.EmitAllRaw(nil); err != nil {
+	emitDiags, err := prog.EmitWithPluginTransformers(
+		[]driver.PluginTransform{lmaoPluginTransform(prog, cwd)}, nil)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: emit failed: %v\n", pluginName, err)
 		return 3
-	} else if len(emitDiags) > 0 {
+	}
+	if len(emitDiags) > 0 {
 		for _, d := range emitDiags {
 			fmt.Fprintln(os.Stderr, d.String())
 		}
@@ -153,6 +191,14 @@ func runBuild(args []string) int {
 // ---------------------------------------------------------------------------
 
 var factory = shimast.NewNodeFactory(shimast.NodeFactoryHooks{})
+
+// Factory-built nodes keep their default undefined (-1) text range: that is
+// what makes the printer emit .Text instead of a source span. The tsgo
+// CHECKER, however, panics on pos -1 (checkGrammarNumericLiteral →
+// GetTextOfNodeFromSourceText slices source text) — so the invariant here is
+// ORDERING, not positions: every Checker query happens in a detection pass
+// over the untouched parse tree, and synthesized nodes are only spliced in
+// afterwards, where nothing type-checks them again.
 
 func ident(text string) *shimast.Node {
 	return factory.NewIdentifier(text)
@@ -181,20 +227,6 @@ func callExpr(expr *shimast.Node, args []*shimast.Node) *shimast.Node {
 var logMethods = map[string]bool{"info": true, "debug": true, "warn": true, "error": true, "trace": true}
 var resultMethods = map[string]bool{"ok": true, "err": true}
 
-func transformProgram(prog *driver.Program, cwd string) {
-	for _, file := range prog.SourceFiles() {
-		if file == nil || file.IsDeclarationFile {
-			continue
-		}
-		t := &fileTransformer{file: file, cwd: cwd, processed: map[*shimast.CallExpression]bool{}}
-		t.walk(file.AsNode())
-		// Wire Parent on freshly synthesized nodes (only where nil — must not
-		// overwrite reused parse-tree nodes' parents); the emit resolver walks
-		// Parent and would nil-panic otherwise. See shim/ast/parent.go.
-		shimast.SetParentInChildrenUnset(file.AsNode())
-	}
-}
-
 type fileTransformer struct {
 	file *shimast.SourceFile
 	cwd  string
@@ -205,6 +237,15 @@ type fileTransformer struct {
 	// processedCalls WeakSet). Without it, the cloned inner call re-matches
 	// on descent and the rewrite regresses infinitely.
 	processed map[*shimast.CallExpression]bool
+	// opSpans is populated with Checker-proved, stable-expression Op calls in
+	// the untouched-tree collect phase. The mutation walk never queries types.
+	opSpans map[*shimast.CallExpression]bool
+	// logTemplateIDs is populated by checker/provenance-gated per-Op analysis
+	// and consumed only after all checker-backed collection has completed.
+	logTemplateIDs map[*shimast.CallExpression]uint16
+	// checker is the program's pinned type checker (nil-safe: tag-chain
+	// inlining is skipped entirely without it).
+	checker *shimchecker.Checker
 }
 
 func (t *fileTransformer) walk(node *shimast.Node) {
@@ -215,6 +256,7 @@ func (t *fileTransformer) walk(node *shimast.Node) {
 		call := node.AsCallExpression()
 		switch {
 		case t.tryDefineModuleMetadata(call):
+		case t.processed[call]:
 		case t.trySpanRewrite(call):
 		case t.tryTaskLine(call):
 		case t.tryChainLine(call, logMethods, isLogReceiver):
@@ -330,36 +372,42 @@ func nearestPackage(filePath string) (name, relFile string) {
 
 func (t *fileTransformer) trySpanRewrite(call *shimast.CallExpression) bool {
 	recv, name := calleeNames(call)
-	if name != "span" || recv == nil || len(call.Arguments.Nodes) < 2 {
+	if name != "span" || recv == nil || len(call.Arguments.Nodes) < 2 || len(call.Arguments.Nodes) > 10 {
 		return false
 	}
 	args := call.Arguments.Nodes
 	nameArg, opOrFn := args[0], args[1]
 	rest := args[2:]
 
-	// Heuristic Op detection (no Checker): non-function literal → Op path.
-	isOp := opOrFn.Kind != shimast.KindArrowFunction && opOrFn.Kind != shimast.KindFunctionExpression
+	if recv.Kind != shimast.KindIdentifier && recv.Kind != shimast.KindThisKeyword {
+		return false
+	}
+	isPlainFunction := opOrFn.Kind == shimast.KindArrowFunction || opOrFn.Kind == shimast.KindFunctionExpression
+	if !isPlainFunction && !t.opSpans[call] {
+		return false
+	}
 
 	line := t.lineOf(call.AsNode())
 	methodName := fmt.Sprintf("span%d", len(rest))
-
-	var bufferClass, remappedView, opMetadata, fn *shimast.Node
-	if isOp {
-		bufferClass = propAccess(opOrFn, "SpanBufferClass")
-		remappedView = propAccess(opOrFn, "remappedViewClass")
-		opMetadata = propAccess(opOrFn, "metadata")
-		fn = propAccess(opOrFn, "fn")
-	} else {
+	childCtx := callExpr(propAccess(ident("Object"), "create"), []*shimast.Node{recv})
+	var bufferClass, remappedView, opMetadata, fn, runtimeHint *shimast.Node
+	if isPlainFunction {
 		bufferClass = propAccess(propAccess(recv, "_buffer"), "constructor")
 		remappedView = ident("undefined")
 		opMetadata = propAccess(propAccess(recv, "_buffer"), "_opMetadata")
 		fn = opOrFn
+		runtimeHint = num(0)
+	} else {
+		bufferClass = propAccess(opOrFn, "SpanBufferClass")
+		remappedView = propAccess(opOrFn, "remappedViewClass")
+		opMetadata = propAccess(opOrFn, "metadata")
+		fn = propAccess(opOrFn, "fn")
+		runtimeHint = propAccess(opOrFn, "runtimeHint")
 	}
-
-	newCtx := callExpr(propAccess(recv, "_newCtx0"), nil)
 	newArgs := append([]*shimast.Node{
-		num(line), nameArg, newCtx, bufferClass, remappedView, opMetadata, fn,
+		num(line), nameArg, childCtx, bufferClass, remappedView, opMetadata, fn,
 	}, rest...)
+	newArgs = append(newArgs, runtimeHint)
 
 	call.Expression = propAccess(recv, methodName)
 	call.Arguments = factory.NewNodeList(newArgs)
@@ -398,26 +446,53 @@ func (t *fileTransformer) tryChainLine(call *shimast.CallExpression, methods map
 	if t.processed[call] {
 		return false
 	}
+	// Only fire at the TOP of a fluent chain: a call that is itself the
+	// receiver of an enclosing method call belongs to a larger chain whose
+	// top the walker handles (or already handled). Injecting mid-chain
+	// duplicates .line() (the TS transformer prevents this with its
+	// processedCalls sweep over allCallsInChain).
+	if parent := call.AsNode().Parent; parent != nil && parent.Kind == shimast.KindPropertyAccessExpression {
+		if gp := parent.Parent; gp != nil && gp.Kind == shimast.KindCallExpression &&
+			gp.AsCallExpression().Expression == parent {
+			return false
+		}
+	}
 	target, trailing := findChainTarget(call, methods, receiverOK)
+	templateID := uint16(0)
+	if receiverOK != nil {
+		if templateTarget, templateTrailing, id := findTemplateLogInChain(call, t.logTemplateIDs); templateTarget != nil {
+			target, trailing, templateID = templateTarget, templateTrailing, id
+		}
+	}
 	if target == nil {
 		return false
 	}
-	if chainHasLine(call) {
+	hasLine := chainHasLine(call)
+	if hasLine && templateID == 0 {
 		return false
 	}
 	line := t.lineOf(target.AsNode())
 
-	// Build innerClone.line(N), then re-hang the trailing links on top and
-	// graft the rebuilt chain's parts into the outermost call. The inner call
-	// must be a fresh node (not `target` itself): when target IS the
-	// outermost call, reusing it would make the call its own descendant — a
-	// cycle that loops the walker forever.
+	// Build a fresh inner call, substituting the private template entry point
+	// when this exact call was assigned an Op-local ID during collection.
+	innerExpression := target.Expression
+	innerArguments := target.Arguments
+	if templateID != 0 {
+		pa := target.Expression.AsPropertyAccessExpression()
+		innerExpression = propAccess(pa.Expression, "_"+shimast.NodeText(pa.Name())+"Template")
+		innerArguments = factory.NewNodeList([]*shimast.Node{num(int(templateID))})
+	}
 	inner := factory.NewCallExpression(
-		target.Expression, nil, target.TypeArguments, target.Arguments, shimast.NodeFlagsNone,
+		innerExpression, nil, target.TypeArguments, innerArguments, shimast.NodeFlagsNone,
 	)
 	t.processed[inner.AsCallExpression()] = true
 	t.processed[call] = true
-	rebuilt := callExpr(propAccess(inner, "line"), []*shimast.Node{num(line)})
+	var rebuilt *shimast.Node
+	if hasLine {
+		rebuilt = inner
+	} else {
+		rebuilt = callExpr(propAccess(inner, "line"), []*shimast.Node{num(line)})
+	}
 	for _, link := range trailing {
 		rebuilt = callExpr(propAccess(rebuilt, link.name), factory.NewNodeList(link.args).Nodes)
 	}
@@ -425,6 +500,28 @@ func (t *fileTransformer) tryChainLine(call *shimast.CallExpression, methods map
 	call.Expression = rc.Expression
 	call.Arguments = rc.Arguments
 	return true
+}
+
+// findTemplateLogInChain locates a previously analyzed literal call while
+// preserving the same receiver-to-outer fluent link order as findChainTarget.
+func findTemplateLogInChain(call *shimast.CallExpression, ids map[*shimast.CallExpression]uint16) (*shimast.CallExpression, []chainLink, uint16) {
+	var trailing []chainLink
+	current := call
+	for {
+		if id := ids[current]; id != 0 {
+			return current, trailing, id
+		}
+		expr := current.Expression
+		if expr.Kind != shimast.KindPropertyAccessExpression {
+			return nil, nil, 0
+		}
+		pa := expr.AsPropertyAccessExpression()
+		trailing = append([]chainLink{{name: shimast.NodeText(pa.Name()), args: current.Arguments.Nodes}}, trailing...)
+		if pa.Expression.Kind != shimast.KindCallExpression {
+			return nil, nil, 0
+		}
+		current = pa.Expression.AsCallExpression()
+	}
 }
 
 type chainLink struct {
