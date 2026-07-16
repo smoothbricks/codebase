@@ -42,6 +42,7 @@ preload = ["@smoothbricks/lmao-ttsc/bun-register"]
 
 Both entrypoints read the nearest TypeScript project and apply its configured and direct-dependency ttsc plugins. The
 `./bun-register` export is intentionally marked as a package side effect; the build adapter itself is side-effect free.
+
 ## Design Philosophy <a id="smoo/lmao!n/transformer-philosophy"></a>
 
 **User writes ergonomic code, transformer produces optimized code.**

@@ -9,69 +9,60 @@ Measured on Apple M5 Max, bun/JSC. The tag-write numbers below come from
 `packages/lmao-ttsc/benchmarks/inline-vs-codegen.bench.ts`; boundary numbers are cited from
 `packages/lmao/benchmarks/wasm-boundary.bench.ts`. They are historical evidence for those exact shapes only. No result
 in this document measures the shipped Op-local template-ID pipeline.
+
 ## Bench: 6 tag writes (1 enum, 2 category, 2 number, 1 bool)
 
-| Shape | ns/iter | alloc/iter |
-|---|---|---|
-| A. fluent chain (no transformer, runtime fallback) | 22.1 | ~4 B |
-| B. runtime-codegen writer (`new Function()`, lmao today) | 24.2 | 0 |
-| C. **transformer-inlined direct writes** (tagChainInliner output) | **19.5** | 0 |
-| D. compile-time micro-batching (staging buffer + `.set()`) | 77.2 | 0 |
+| Shape                                                             | ns/iter  | alloc/iter |
+| ----------------------------------------------------------------- | -------- | ---------- |
+| A. fluent chain (no transformer, runtime fallback)                | 22.1     | ~4 B       |
+| B. runtime-codegen writer (`new Function()`, lmao today)          | 24.2     | 0          |
+| C. **transformer-inlined direct writes** (tagChainInliner output) | **19.5** | 0          |
+| D. compile-time micro-batching (staging buffer + `.set()`)        | 77.2     | 0          |
 
-Reference boundary costs: wasm export call ~39–42 ns/value; JS TypedArray
-view write into wasm memory ~7.6 ns; plain JS write 0.5–2 ns.
+Reference boundary costs: wasm export call ~39–42 ns/value; JS TypedArray view write into wasm memory ~7.6 ns; plain JS
+write 0.5–2 ns.
 
 ## Verdicts
 
 ### 1. Inlining replaces runtime codegen at zero cost — ship it (CSP win)
 
-C ≈ B within noise (actually slightly ahead) and both are allocation-free.
-The transformer's statically-emitted writes fully replace the
-`new Function()` writer **with no performance loss** — which matters on
-CSP-restricted hosts (Cloudflare Workers, spec 01q/01s) where runtime
-codegen is banned and lmao today must fall back to slower paths. The
-transformer is the zero-eval codegen. (Caveat: bun/JSC numbers; the spec's
-V8 hidden-class claims were not re-validated here.)
+C ≈ B within noise (actually slightly ahead) and both are allocation-free. The transformer's statically-emitted writes
+fully replace the `new Function()` writer **with no performance loss** — which matters on CSP-restricted hosts
+(Cloudflare Workers, spec 01q/01s) where runtime codegen is banned and lmao today must fall back to slower paths. The
+transformer is the zero-eval codegen. (Caveat: bun/JSC numbers; the spec's V8 hidden-class claims were not re-validated
+here.)
 
 ### 2. Compile-time write batching is a myth at tag-write scale
 
-D is **4x worse** than C: `subarray()` + `.set()` overhead swamps any
-benefit when the batch is a handful of values. Batching only pays when it
-*eliminates wasm export calls* (~40 ns each) — but lmao's design never
-makes export calls for writes in the first place (see 3). Do not build
-write-batching into the transformer.
+D is **4x worse** than C: `subarray()` + `.set()` overhead swamps any benefit when the batch is a handful of values.
+Batching only pays when it _eliminates wasm export calls_ (~40 ns each) — but lmao's design never makes export calls for
+writes in the first place (see 3). Do not build write-batching into the transformer.
 
 ### 3. The right wasm strategy is direct-view emission, not export amortization
 
-With the Rust allocator (`lmao-wasm`), per-value exports
-(`write_col_f64`, 42 ns) are for correctness testing, not the hot path.
-The production pattern stays exactly lmao's original design: **JS-side
-TypedArray view writes into wasm linear memory** (~7.6 ns), with export
-calls only for lifecycle (`alloc_*`, `span_start`, `span_end_*` — 1–2 per
-span, already amortized over the span's writes).
+With the Rust allocator (`lmao-wasm`), per-value exports (`write_col_f64`, 42 ns) are for correctness testing, not the
+hot path. The production pattern stays exactly lmao's original design: **JS-side TypedArray view writes into wasm linear
+memory** (~7.6 ns), with export calls only for lifecycle (`alloc_*`, `span_start`, `span_end_*` — 1–2 per span, already
+amortized over the span's writes).
 
-The transformer's lever: the inliner currently emits
-`buf.field_values[0] = v` against the generated buffer class's views. For
-the wasm-backed `WasmBufferStrategy`, those views point into wasm memory
-already — so the inliner output composes with lmao-rs **unchanged**. An
-optional future mode could fold the schema's column offsets into constants
-(`u8view[BASE + 12] = v`) and skip the view-object indirection, but the
-measured gap (view write 7.6 ns vs plain 0.5–2 ns) bounds the win at a few
-ns per write; only worth it bundled with the checker-aware ttsc port.
+The transformer's lever: the inliner currently emits `buf.field_values[0] = v` against the generated buffer class's
+views. For the wasm-backed `WasmBufferStrategy`, those views point into wasm memory already — so the inliner output
+composes with lmao-rs **unchanged**. An optional future mode could fold the schema's column offsets into constants
+(`u8view[BASE + 12] = v`) and skip the view-object indirection, but the measured gap (view write 7.6 ns vs plain 0.5–2
+ns) bounds the win at a few ns per write; only worth it bundled with the checker-aware ttsc port.
 
 ### 4. Column-name discipline under library composition (spec 01e)
 
-Any inliner emission — TS or Go — must write **library-local (unprefixed)**
-column names. `.prefix()`/`.mapColumns()` remapping is cold-path-only via
-`RemappedBufferView` at Arrow conversion. The transformer must never
-resolve prefixes into hot-path writes; offsets/constants it folds are
-per-library-schema, not per-application-schema.
+Any inliner emission — TS or Go — must write **library-local (unprefixed)** column names. `.prefix()`/`.mapColumns()`
+remapping is cold-path-only via `RemappedBufferView` at Arrow conversion. The transformer must never resolve prefixes
+into hot-path writes; offsets/constants it folds are per-library-schema, not per-application-schema.
 
 ### 5. Native lmao-rs hosts don't need the transformer
 
 In-process Rust (jcode, AxE sim) gets the same effect from `define_log_schema!` proc-macro expansion at Rust compile
 time (1.9 ns append, 2.5 ns tag write, per the main investigation). The native ttsc transformer is the _TypeScript-host_
 analog of that macro — same role and schema-static philosophy, in one compiler implementation.
+
 ## Current shipped span optimization
 
 The ttsc Go plugin implements bounded, Promise-preserving span setup plus packed runtime hints. Automatic public
@@ -150,12 +141,11 @@ retry/terminal rows, and ends the span exactly once. Throws and rejected thenabl
 Because automatic lowering is disabled, this internal `Result | Promise<Result>` behavior cannot alter the public
 Promise API's microtask scheduling. No performance magnitude is asserted here.
 
-
 ## Shipped clean cutover: registered structured vocabulary
 
-This section is the authoritative compiler/runtime ABI. It replaces the former Op-local `u16` representation rather
-than layering another ID space over it. The clean cutover removes the per-Op template table and its private lane after
-every caller uses the registration ABI. No compatibility alias or dual write survives the cutover.
+This section is the authoritative compiler/runtime ABI. It replaces the former Op-local `u16` representation rather than
+layering another ID space over it. The clean cutover removes the per-Op template table and its private lane after every
+caller uses the registration ABI. No compatibility alias or dual write survives the cutover.
 
 ### Checker recognition and source policy
 
@@ -305,34 +295,27 @@ zero-overhead claim is permitted.
 
 ## The bigger design space: typed macros over the schema, not just call sites
 
-The verdicts above treat the transformer as a call-site rewriter. Its real
-power is that it sees **the schema definitions themselves**
-(`defineLogSchema`/`defineModule` object literals: field kinds, enum
-values, eagerness) *and* **every call site in the program**. That enables a
-class of whole-program, compile-time decisions that runtime codegen
-structurally cannot make — lmao's runtime `new Function()` sees one schema
-value at startup; it never sees usage. Ordered by expected value:
+The verdicts above treat the transformer as a call-site rewriter. Its real power is that it sees **the schema
+definitions themselves** (`defineLogSchema`/`defineModule` object literals: field kinds, enum values, eagerness) _and_
+**every call site in the program**. That enables a class of whole-program, compile-time decisions that runtime codegen
+structurally cannot make — lmao's runtime `new Function()` sees one schema value at startup; it never sees usage.
+Ordered by expected value:
 
 ### A. Compile-time buffer-class emission (kill runtime codegen entirely)
 
-Today only tag *writes* are inlined; the SpanBuffer class itself is still
-generated at runtime via `new Function()` (per-schema, at startup). The
-transformer can emit the entire generated class as source at build time —
-the true `define_log_schema!` analog. Wins: zero runtime codegen anywhere
-(full CSP compliance, not just hot-path), no per-schema compile at startup
-(cold-start win for Workers/Lambda), and the emitted class is visible to
-the bundler/minifier. This subsumes verdict 1.
+Today only tag _writes_ are inlined; the SpanBuffer class itself is still generated at runtime via `new Function()`
+(per-schema, at startup). The transformer can emit the entire generated class as source at build time — the true
+`define_log_schema!` analog. Wins: zero runtime codegen anywhere (full CSP compliance, not just hot-path), no per-schema
+compile at startup (cold-start win for Workers/Lambda), and the emitted class is visible to the bundler/minifier. This
+subsumes verdict 1.
 
 ### B. Static eager/lazy sets — pre-allocation decided at compile time
 
-The lazy-to-eager promotion ratchet (01b2) is unshipped runtime machinery
-that needs ≥100 samples to converge; meanwhile every lazy column pays a
-first-touch alloc (measured 133 ns) plus a branch per access. The
-transformer counts actual column writes across **all** call sites and
-rewrites the schema literal with the exact eager set — used columns
-pre-allocated at construction, never-written columns flagged (dead-column
-lint) or elided. Deletes the runtime stats machinery and converges at
-build time, per op rather than per schema.
+The lazy-to-eager promotion ratchet (01b2) is unshipped runtime machinery that needs ≥100 samples to converge; meanwhile
+every lazy column pays a first-touch alloc (measured 133 ns) plus a branch per access. The transformer counts actual
+column writes across **all** call sites and rewrites the schema literal with the exact eager set — used columns
+pre-allocated at construction, never-written columns flagged (dead-column lint) or elided. Deletes the runtime stats
+machinery and converges at build time, per op rather than per schema.
 
 ### C. Static capacity seeding — implemented for bounded direct logs
 
@@ -340,16 +323,14 @@ The shipped transformer computes a per-Op packed initial-capacity hint: two rese
 Loops, counts above `0xffff`, or unsafe context analysis encode adaptive capacity instead. This is deliberately narrower
 than whole-program or profile-guided row prediction, and normal overflow chaining remains the correctness fallback.
 Per-op specialized buffer-class generation remains future work.
+
 ### D. Allocation batching across the wasm boundary (the batching that pays)
 
-Verdict 2 refuted *write* batching — writes were never boundary crossings.
-Allocations are: with `WasmBufferStrategy`, span_start + identity + each
-lazy column's first touch are export calls (~40 ns each). A span touching
-8 columns pays ~10 crossings ≈ 400 ns. With B giving the transformer the
-op's full column set, it can emit one constant column-descriptor and call
-a (to-be-added) `lmao-wasm` export `alloc_span_with_columns(desc)` — one
-crossing, arena-side loop at ~20 ns/alloc native. ~10x on the per-span
-allocation overhead, purely additive to the existing ABI.
+Verdict 2 refuted _write_ batching — writes were never boundary crossings. Allocations are: with `WasmBufferStrategy`,
+span_start + identity + each lazy column's first touch are export calls (~40 ns each). A span touching 8 columns pays
+~10 crossings ≈ 400 ns. With B giving the transformer the op's full column set, it can emit one constant
+column-descriptor and call a (to-be-added) `lmao-wasm` export `alloc_span_with_columns(desc)` — one crossing, arena-side
+loop at ~20 ns/alloc native. ~10x on the per-span allocation overhead, purely additive to the existing ABI.
 
 ### E. Compile-time row-header packing (the write batching that works)
 
@@ -358,6 +339,7 @@ constants** such as entry type, the already-implemented Op-local template ID, an
 and emit one element write instead of separate lane writes. No packed row header is implemented or measured.
 
 ### F. Template/name dictionaries: shipped Op-local store versus specified global target
+
 **Implemented subset.** Literal log messages eligible under the shipped checker rules use private per-Op `u16` IDs in
 the hot store. This subset deduplicates and avoids the per-row literal string write, then restores the exact public
 string at cold conversion. It does **not** create a program-wide dictionary, a stable trace vocabulary, or a new Arrow
