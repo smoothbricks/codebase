@@ -190,12 +190,15 @@ Concrete target sources:
 - `build`: aggregate inferred only when at least one concrete build target exists.
 - `lint`: aggregate validation target, never a formatter.
 
-**Keep the compiler and JavaScript TypeScript API separate.** `ttsc` owns the native TypeScript 7 compiler used by
-`tsc-js` and `typecheck-tests`. JavaScript tools such as Nx and transformer hosts import the full TypeScript API from
-the workspace `typescript` dependency, which must stay on `^6.0.3`. Do not install `@typescript/native` unless the
-workspace starts invoking its `tsc` binary directly, and do not install TypeScript 7 under the `typescript` name: its
-root export does not provide APIs such as `readConfigFile`. Keep every workspace `typescript` declaration aligned so
-Bun's isolated dependency hoisting cannot shadow the API package.
+**Keep the compiler and JavaScript TypeScript API separate.** The root `@typescript/native` dependency follows
+TypeScript's documented side-by-side pattern: it aliases `typescript@^7.0.2` and supplies the native compiler that
+`ttsc` runs for `tsc-js` and `typecheck-tests`. Because `ttsc` resolves only the unscoped package by default, devenv
+exports `TTSC_TSGO_BINARY` to `node_modules/@typescript/native/bin/tsc`; the GitHub setup action persists the same
+absolute path through `GITHUB_ENV`. JavaScript tools such as Nx and transformer hosts import the full TypeScript API
+from the workspace `typescript` dependency, which must stay on `^6.0.3`. Keep both dependencies and the environment
+binding. Do not install TypeScript 7 under the unscoped `typescript` name: its root export does not provide APIs such as
+`readConfigFile`. Keep every workspace `typescript` declaration aligned so Bun's isolated dependency hoisting cannot
+shadow the API package.
 
 **Target names are `{tool}-{output}` names.** Use names like `tsc-js`, `tsdown-js`, and `zig-wasm`. `build` and `lint`
 are aggregates that depend on output-family wildcards such as `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`,
