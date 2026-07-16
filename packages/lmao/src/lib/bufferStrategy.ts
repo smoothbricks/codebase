@@ -22,8 +22,8 @@
 import type { Table } from '@uwdata/flechette';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { LogSchema } from './schema/LogSchema.js';
-import type { ITraceRoot } from './traceRoot.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
+import type { ITraceRoot } from './traceRoot.js';
 import type { AnySpanBuffer, SpanBuffer } from './types.js';
 
 /**

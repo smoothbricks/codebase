@@ -127,7 +127,7 @@ describe('Arrow IPC Round-Trip', () => {
           const entryTypes = buffer.entry_type;
           if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
           entryTypes[idx] = ENTRY_TYPE_SPAN_START;
-        };
+        }
         buffer.value(idx, value);
         buffer._writeIndex++;
       }
@@ -166,7 +166,7 @@ describe('Arrow IPC Round-Trip', () => {
           const entryTypes = buffer.entry_type;
           if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
           entryTypes[idx] = ENTRY_TYPE_SPAN_START;
-        };
+        }
         buffer.flag(idx, value);
         buffer._writeIndex++;
       }
@@ -196,7 +196,7 @@ describe('Arrow IPC Round-Trip', () => {
           const entryTypes = buffer.entry_type;
           if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
           entryTypes[idx] = ENTRY_TYPE_SPAN_START;
-        };
+        }
         callBufferWriter(buffer, 'status', idx, enumIdx);
         buffer._writeIndex++;
       }
@@ -223,7 +223,7 @@ describe('Arrow IPC Round-Trip', () => {
           const entryTypes = buffer.entry_type;
           if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
           entryTypes[idx] = ENTRY_TYPE_SPAN_START;
-        };
+        }
         buffer.userId(idx, userId);
         buffer._writeIndex++;
       }
@@ -253,7 +253,7 @@ describe('Arrow IPC Round-Trip', () => {
           const entryTypes = buffer.entry_type;
           if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
           entryTypes[idx] = ENTRY_TYPE_SPAN_START;
-        };
+        }
         buffer.userMessage(idx, value);
         buffer._writeIndex++;
       }
@@ -281,7 +281,7 @@ describe('Arrow IPC Round-Trip', () => {
           const entryTypes = buffer.entry_type;
           if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
           entryTypes[idx] = ENTRY_TYPE_SPAN_START;
-        };
+        }
         if (value !== null) {
           buffer.value(idx, value);
         } else {
@@ -326,7 +326,7 @@ describe('Arrow IPC Round-Trip', () => {
           const entryTypes = buffer.entry_type;
           if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
           entryTypes[idx] = ENTRY_TYPE_SPAN_START;
-        };
+        }
 
         if (row.count !== null) {
           buffer.count(idx, row.count);
@@ -383,7 +383,7 @@ describe('Arrow IPC Round-Trip', () => {
           const entryTypes = buffer.entry_type;
           if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
           entryTypes[idx] = i;
-        };
+        }
         buffer._writeIndex++;
       }
 
@@ -443,7 +443,7 @@ describe('Arrow IPC Round-Trip', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[idx] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       buffer._writeIndex++;
 
       const table = convertToArrowTable(buffer);
@@ -489,7 +489,7 @@ describe('Arrow IPC Round-Trip', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[idx] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       buffer.category(idx, 'cat1');
       buffer.text(idx, 'text1');
       callBufferWriter(buffer, 'status', idx, 0);
@@ -526,7 +526,7 @@ describe('Arrow IPC Round-Trip', () => {
           const entryTypes = buffer.entry_type;
           if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
           entryTypes[idx] = ENTRY_TYPE_SPAN_START;
-        };
+        }
         if (value !== null) {
           buffer.value(idx, value);
         } else {
@@ -574,7 +574,7 @@ describe('Arrow IPC Round-Trip', () => {
           const entryTypes = buffer.entry_type;
           if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
           entryTypes[idx] = ENTRY_TYPE_SPAN_START;
-        };
+        }
         if (value !== null) {
           buffer.value(idx, value);
         } else {
@@ -618,7 +618,7 @@ describe('Arrow IPC Round-Trip', () => {
           const entryTypes = buffer.entry_type;
           if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
           entryTypes[idx] = ENTRY_TYPE_SPAN_START;
-        };
+        }
         buffer.value(idx, value);
         buffer._writeIndex++;
       }
@@ -655,7 +655,7 @@ describe('Arrow IPC Round-Trip', () => {
           const entryTypes = buffer.entry_type;
           if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
           entryTypes[idx] = ENTRY_TYPE_SPAN_START;
-        };
+        }
         buffer.category(idx, category);
         buffer._writeIndex++;
       }
@@ -682,7 +682,7 @@ describe('Arrow IPC Round-Trip', () => {
           const entryTypes = buffer.entry_type;
           if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
           entryTypes[idx] = ENTRY_TYPE_SPAN_START;
-        };
+        }
         buffer.userId(idx, testValue);
         buffer._writeIndex++;
       }

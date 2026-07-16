@@ -162,7 +162,7 @@ const packedMixedOp = context.defineOp('packed-mixed-family', (ctx) => ctx.ok(nu
 });
 
 function createPlannedBuffer(
-  family: MessageLayoutFamily,
+  _family: MessageLayoutFamily,
   SpanBufferClass: SpanBufferConstructor<typeof runtimeSchema>,
   metadata: OpMetadata,
 ): SpanBuffer<typeof runtimeSchema> {

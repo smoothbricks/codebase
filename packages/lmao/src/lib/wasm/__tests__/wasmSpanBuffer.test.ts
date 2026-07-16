@@ -1,15 +1,11 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
 import { S as ArrowS, Nanoseconds } from '@smoothbricks/arrow-builder';
 import fc from 'fast-check';
-import { defineOpContext } from '../../defineOpContext.js';
-import { resolveEagerColumns, type EagerColumnDescriptor } from '../../physicalLayoutPlan.js';
 import { createTestOpMetadata, createTestTraceRoot, TEST_TRACER } from '../../__tests__/test-helpers.js';
+import { defineOpContext } from '../../defineOpContext.js';
+import { type EagerColumnDescriptor, resolveEagerColumns } from '../../physicalLayoutPlan.js';
 import { resolveEntryType, resolveMessage } from '../../resolveMessage.js';
-import {
-  RUNTIME_HINT_ANALYZED_VALID,
-  RUNTIME_HINT_RESULT,
-  RUNTIME_HINT_TAG,
-} from '../../runtimeHint.js';
+import { RUNTIME_HINT_ANALYZED_VALID, RUNTIME_HINT_RESULT, RUNTIME_HINT_TAG } from '../../runtimeHint.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { createSpanBuffer, EMPTY_SCOPE } from '../../spanBuffer.js';
@@ -98,15 +94,10 @@ describe('WasmSpanBuffer', () => {
     lazyString: S.category(),
   });
   const compilerEagerContext = defineOpContext({ logSchema: compilerEagerSchema });
-  const compilerEagerOp = compilerEagerContext.defineOp(
-    'compiler-eager-wasm',
-    (ctx) => ctx.ok(null),
-    undefined,
-    {
-      runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_TAG | RUNTIME_HINT_RESULT | 8,
-      eagerColumns: ['provenString', 'provenNumber', 'provenString'],
-    },
-  );
+  const compilerEagerOp = compilerEagerContext.defineOp('compiler-eager-wasm', (ctx) => ctx.ok(null), undefined, {
+    runtimeHint: RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_TAG | RUNTIME_HINT_RESULT | 8,
+    eagerColumns: ['provenString', 'provenNumber', 'provenString'],
+  });
 
   function createCompilerEagerWasmBuffer() {
     return createWasmSpanBuffer(

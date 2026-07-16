@@ -15,7 +15,12 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import { createBuffer, createTestSchema, createTestSpanContext, createTestTraceRoot } from '../../__tests__/test-helpers.js';
+import {
+  createBuffer,
+  createTestSchema,
+  createTestSpanContext,
+  createTestTraceRoot,
+} from '../../__tests__/test-helpers.js';
 import { DEFAULT_METADATA } from '../../opContext/defineOp.js';
 import { S } from '../../schema/builder.js';
 import type { LogSchema } from '../../schema/types.js';
@@ -29,7 +34,6 @@ import type { SpanBuffer } from '../../types.js';
 function createTestBuffer<T extends LogSchema>(schema: T): SpanBuffer<T> {
   return createBuffer(schema);
 }
-
 
 describe('null bitmap correctness', () => {
   describe('immutable scope semantics', () => {

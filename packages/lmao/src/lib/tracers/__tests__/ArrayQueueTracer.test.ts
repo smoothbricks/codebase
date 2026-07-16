@@ -4,8 +4,8 @@ import '../../__tests__/test-helpers.js';
 import { describe, expect, it } from 'bun:test';
 import { createTestTracerOptions } from '../../__tests__/test-helpers.js';
 import { convertSpanTreeToArrowTable } from '../../convertToArrow.js';
-import { resolveMessage } from '../../resolveMessage.js';
 import { defineLogSchema, defineOpContext, S } from '../../defineOpContext.js';
+import { resolveMessage } from '../../resolveMessage.js';
 import { iterateSpanChildren } from '../../traceTopology.js';
 import { ArrayQueueTracer } from '../ArrayQueueTracer.js';
 

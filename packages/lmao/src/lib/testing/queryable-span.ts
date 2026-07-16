@@ -17,8 +17,8 @@
 
 import { resolveMessage } from '../resolveMessage.js';
 import type { LogSchema } from '../schema/LogSchema.js';
-import type { SpanBuffer } from '../types.js';
 import { iterateSpanChildren, iterateSpanTree } from '../traceTopology.js';
+import type { SpanBuffer } from '../types.js';
 import { type ExtractFactsOptions, extractFacts } from './extractFacts.js';
 import type { FactArray } from './facts.js';
 

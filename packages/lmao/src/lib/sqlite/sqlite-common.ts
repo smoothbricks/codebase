@@ -3,8 +3,8 @@ import { hasOwn, hasOwnString, isRecord } from '@smoothbricks/validation';
 import { resolveEntryType, resolveMessage } from '../resolveMessage.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import { getSchemaType } from '../schema/typeGuards.js';
-import type { AnySpanBuffer } from '../types.js';
 import { iterateSpanTree, NO_NODE } from '../traceTopology.js';
+import type { AnySpanBuffer } from '../types.js';
 
 export const SPANS_TABLE_INIT_SQL = `
   CREATE TABLE IF NOT EXISTS spans (

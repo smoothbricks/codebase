@@ -130,7 +130,6 @@ function isSpanDispatchFn<Ctx extends OpContext>(value: unknown): value is SpanD
   return typeof value === 'function';
 }
 
-
 function isSpanContextInstance<Ctx extends OpContext>(value: unknown): value is SpanContextInstance<Ctx> {
   return (
     isSpanContext<Ctx>(value) &&
@@ -575,131 +574,158 @@ export type SpanContextClass<Ctx extends OpContext = OpContext> = new (
  */
 export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> &
   WriterState & {
-  _spanBuffer: SpanBuffer<Ctx['logSchema']>;
-  _schema: Ctx['logSchema'];
-  _spanLogger: SpanLoggerImpl<Ctx['logSchema']>;
-  _logBinding: LogBinding;
-  _physicalLayoutPlan: CallsitePlan<Ctx['logSchema'], Ctx>;
+    _spanBuffer: SpanBuffer<Ctx['logSchema']>;
+    _schema: Ctx['logSchema'];
+    _spanLogger: SpanLoggerImpl<Ctx['logSchema']>;
+    _logBinding: LogBinding;
+    _physicalLayoutPlan: CallsitePlan<Ctx['logSchema'], Ctx>;
 
-  // Internal methods
-  _newCtx0(): SpanContextInstance<Ctx>;
-  _newCtx1(overrides: object): SpanContextInstance<Ctx>;
-  _spanPre(
-    childCtx: SpanContextInstance<Ctx>,
-    line: number,
-    name: string | number,
-    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
-    opMetadata: OpMetadata,
-  ): SpanContextInstance<Ctx>;
-  _spanException(buffer: SpanBuffer<Ctx['logSchema']>, error: unknown): void;
+    // Internal methods
+    _newCtx0(): SpanContextInstance<Ctx>;
+    _newCtx1(overrides: object): SpanContextInstance<Ctx>;
+    _spanPre(
+      childCtx: SpanContextInstance<Ctx>,
+      line: number,
+      name: string | number,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
+      opMetadata: OpMetadata,
+    ): SpanContextInstance<Ctx>;
+    _spanException(buffer: SpanBuffer<Ctx['logSchema']>, error: unknown): void;
 
-  spanSync0<S, E>(
-    line: number,
-    name: string | number,
-    childCtx: SpanContextInstance<Ctx>,
-    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
-    fn: (ctx: SpanContext<Ctx>) => Result<S, E> | Promise<Result<S, E>>,
-  ): Result<S, E>;
-  span0<S, E>(
-    line: number,
-    name: string | number,
-    childCtx: SpanContextInstance<Ctx>,
-    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
-    fn: (ctx: SpanContext<Ctx>) => Result<S, E> | Promise<Result<S, E>>,
-  ): Promise<Result<S, E>>;
-  span1<S, E, A1>(
-    line: number,
-    name: string | number,
-    childCtx: SpanContextInstance<Ctx>,
-    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
-    fn: (ctx: SpanContext<Ctx>, a1: A1) => Result<S, E> | Promise<Result<S, E>>,
-    a1: A1,
-  ): Promise<Result<S, E>>;
-  span2<S, E, A1, A2>(
-    line: number,
-    name: string | number,
-    childCtx: SpanContextInstance<Ctx>,
-    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
-    fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2) => Result<S, E> | Promise<Result<S, E>>,
-    a1: A1,
-    a2: A2,
-  ): Promise<Result<S, E>>;
-  span3<S, E, A1, A2, A3>(
-    line: number,
-    name: string | number,
-    childCtx: SpanContextInstance<Ctx>,
-    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
-    fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3) => Result<S, E> | Promise<Result<S, E>>,
-    a1: A1,
-    a2: A2,
-    a3: A3,
-  ): Promise<Result<S, E>>;
-  span4<S, E, A1, A2, A3, A4>(
-    line: number,
-    name: string | number,
-    childCtx: SpanContextInstance<Ctx>,
-    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
-    fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4) => Result<S, E> | Promise<Result<S, E>>,
-    a1: A1,
-    a2: A2,
-    a3: A3,
-    a4: A4,
-  ): Promise<Result<S, E>>;
-  span5<S, E, A1, A2, A3, A4, A5>(
-    line: number,
-    name: string | number,
-    childCtx: SpanContextInstance<Ctx>,
-    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
-    fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4, a5: A5) => Result<S, E> | Promise<Result<S, E>>,
-    a1: A1,
-    a2: A2,
-    a3: A3,
-    a4: A4,
-    a5: A5,
-  ): Promise<Result<S, E>>;
-  span6<S, E, A1, A2, A3, A4, A5, A6>(
-    line: number,
-    name: string | number,
-    childCtx: SpanContextInstance<Ctx>,
-    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
-    fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4, a5: A5, a6: A6) => Result<S, E> | Promise<Result<S, E>>,
-    a1: A1,
-    a2: A2,
-    a3: A3,
-    a4: A4,
-    a5: A5,
-    a6: A6,
-  ): Promise<Result<S, E>>;
-  span7<S, E, A1, A2, A3, A4, A5, A6, A7>(
-    line: number,
-    name: string | number,
-    childCtx: SpanContextInstance<Ctx>,
-    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
-    fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4, a5: A5, a6: A6, a7: A7) => Result<S, E> | Promise<Result<S, E>>,
-    a1: A1,
-    a2: A2,
-    a3: A3,
-    a4: A4,
-    a5: A5,
-    a6: A6,
-    a7: A7,
-  ): Promise<Result<S, E>>;
-  span8<S, E, A1, A2, A3, A4, A5, A6, A7, A8>(
-    line: number,
-    name: string | number,
-    childCtx: SpanContextInstance<Ctx>,
-    callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
-    fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4, a5: A5, a6: A6, a7: A7, a8: A8) => Result<S, E, Ctx['logSchema']> | Promise<Result<S, E, Ctx['logSchema']>>,
-    a1: A1,
-    a2: A2,
-    a3: A3,
-    a4: A4,
-    a5: A5,
-    a6: A6,
-    a7: A7,
-    a8: A8,
-  ): Promise<Result<S, E, Ctx['logSchema']>>;
-};
+    spanSync0<S, E>(
+      line: number,
+      name: string | number,
+      childCtx: SpanContextInstance<Ctx>,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
+      fn: (ctx: SpanContext<Ctx>) => Result<S, E> | Promise<Result<S, E>>,
+    ): Result<S, E>;
+    span0<S, E>(
+      line: number,
+      name: string | number,
+      childCtx: SpanContextInstance<Ctx>,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
+      fn: (ctx: SpanContext<Ctx>) => Result<S, E> | Promise<Result<S, E>>,
+    ): Promise<Result<S, E>>;
+    span1<S, E, A1>(
+      line: number,
+      name: string | number,
+      childCtx: SpanContextInstance<Ctx>,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
+      fn: (ctx: SpanContext<Ctx>, a1: A1) => Result<S, E> | Promise<Result<S, E>>,
+      a1: A1,
+    ): Promise<Result<S, E>>;
+    span2<S, E, A1, A2>(
+      line: number,
+      name: string | number,
+      childCtx: SpanContextInstance<Ctx>,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
+      fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2) => Result<S, E> | Promise<Result<S, E>>,
+      a1: A1,
+      a2: A2,
+    ): Promise<Result<S, E>>;
+    span3<S, E, A1, A2, A3>(
+      line: number,
+      name: string | number,
+      childCtx: SpanContextInstance<Ctx>,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
+      fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3) => Result<S, E> | Promise<Result<S, E>>,
+      a1: A1,
+      a2: A2,
+      a3: A3,
+    ): Promise<Result<S, E>>;
+    span4<S, E, A1, A2, A3, A4>(
+      line: number,
+      name: string | number,
+      childCtx: SpanContextInstance<Ctx>,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
+      fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4) => Result<S, E> | Promise<Result<S, E>>,
+      a1: A1,
+      a2: A2,
+      a3: A3,
+      a4: A4,
+    ): Promise<Result<S, E>>;
+    span5<S, E, A1, A2, A3, A4, A5>(
+      line: number,
+      name: string | number,
+      childCtx: SpanContextInstance<Ctx>,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
+      fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4, a5: A5) => Result<S, E> | Promise<Result<S, E>>,
+      a1: A1,
+      a2: A2,
+      a3: A3,
+      a4: A4,
+      a5: A5,
+    ): Promise<Result<S, E>>;
+    span6<S, E, A1, A2, A3, A4, A5, A6>(
+      line: number,
+      name: string | number,
+      childCtx: SpanContextInstance<Ctx>,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
+      fn: (
+        ctx: SpanContext<Ctx>,
+        a1: A1,
+        a2: A2,
+        a3: A3,
+        a4: A4,
+        a5: A5,
+        a6: A6,
+      ) => Result<S, E> | Promise<Result<S, E>>,
+      a1: A1,
+      a2: A2,
+      a3: A3,
+      a4: A4,
+      a5: A5,
+      a6: A6,
+    ): Promise<Result<S, E>>;
+    span7<S, E, A1, A2, A3, A4, A5, A6, A7>(
+      line: number,
+      name: string | number,
+      childCtx: SpanContextInstance<Ctx>,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
+      fn: (
+        ctx: SpanContext<Ctx>,
+        a1: A1,
+        a2: A2,
+        a3: A3,
+        a4: A4,
+        a5: A5,
+        a6: A6,
+        a7: A7,
+      ) => Result<S, E> | Promise<Result<S, E>>,
+      a1: A1,
+      a2: A2,
+      a3: A3,
+      a4: A4,
+      a5: A5,
+      a6: A6,
+      a7: A7,
+    ): Promise<Result<S, E>>;
+    span8<S, E, A1, A2, A3, A4, A5, A6, A7, A8>(
+      line: number,
+      name: string | number,
+      childCtx: SpanContextInstance<Ctx>,
+      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
+      fn: (
+        ctx: SpanContext<Ctx>,
+        a1: A1,
+        a2: A2,
+        a3: A3,
+        a4: A4,
+        a5: A5,
+        a6: A6,
+        a7: A7,
+        a8: A8,
+      ) => Result<S, E, Ctx['logSchema']> | Promise<Result<S, E, Ctx['logSchema']>>,
+      a1: A1,
+      a2: A2,
+      a3: A3,
+      a4: A4,
+      a5: A5,
+      a6: A6,
+      a7: A7,
+      a8: A8,
+    ): Promise<Result<S, E, Ctx['logSchema']>>;
+  };
 //#endregion smoo/lmao!n/spancontext-type
 
 // =============================================================================
@@ -909,9 +935,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
             self._spanBuffer._opMetadata,
           );
           const childCtx = asSpanContextInstance<Ctx>(
-            hasOverrides
-              ? target.callsitePlan.newCtx1(self, maybeOverrides)
-              : target.callsitePlan.newCtx0(self),
+            hasOverrides ? target.callsitePlan.newCtx1(self, maybeOverrides) : target.callsitePlan.newCtx0(self),
           );
 
           // Dispatch to monomorphic methods with all Op properties extracted

@@ -62,7 +62,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       buffer.message(0, 'test-span');
       buffer.httpStatus(0, 200);
       buffer.userId(0, 'user-123');
@@ -94,7 +94,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       buffer.message(0, 'span-1');
       buffer.level(0, 1); // INFO
 
@@ -103,7 +103,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[1] = ENTRY_TYPE_INFO;
-      };
+      }
       buffer.message(1, 'Log message');
       buffer.level(1, 0); // DEBUG
 
@@ -112,7 +112,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[2] = ENTRY_TYPE_SPAN_OK;
-      };
+      }
       buffer.message(2, 'span-1');
       buffer.level(2, 2); // WARN
 
@@ -149,7 +149,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       buffer.message(0, 'test-span');
       buffer.requiredField(0, 42);
       // optionalField not set - should be null
@@ -178,7 +178,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = buffer1.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       buffer1.message(0, 'test-span');
       buffer1.counter(0, 1);
       buffer1._writeIndex = 1;
@@ -190,7 +190,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = buffer2.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_INFO;
-      };
+      }
       buffer2.message(0, 'Log in chain');
       buffer2.counter(0, 2);
       buffer2._writeIndex = 1;
@@ -218,7 +218,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = buffer1.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       buffer1.message(0, 'test');
       buffer1.value(0, 1);
       buffer1._writeIndex = 1;
@@ -229,7 +229,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = buffer2.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_INFO;
-      };
+      }
       buffer2.message(0, 'log-1');
       buffer2.value(0, 2);
       buffer2._writeIndex = 1;
@@ -240,7 +240,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = buffer3.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_OK;
-      };
+      }
       buffer3.message(0, 'test');
       buffer3.value(0, 3);
       buffer3._writeIndex = 1;
@@ -292,25 +292,20 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = parentBuffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       parentBuffer.message(0, 'parent-span');
       parentBuffer.spanType(0, 'parent');
       parentBuffer._writeIndex = 1;
 
       // Create child span; the factory registers it with the parent topology.
-      const childBuffer = createChildSpanBuffer(
-        parentBuffer,
-        SpanBufferClass,
-        DEFAULT_METADATA,
-        DEFAULT_METADATA,
-      );
+      const childBuffer = createChildSpanBuffer(parentBuffer, SpanBufferClass, DEFAULT_METADATA, DEFAULT_METADATA);
 
       childBuffer.timestamp[0] = 1500n;
       {
         const entryTypes = childBuffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       childBuffer.message(0, 'child-span');
       childBuffer.spanType(0, 'child');
       childBuffer._writeIndex = 1;
@@ -321,7 +316,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = childBuffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[1] = ENTRY_TYPE_SPAN_OK;
-      };
+      }
       childBuffer.message(1, 'child-span');
       childBuffer._writeIndex = 2;
 
@@ -331,7 +326,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = parentBuffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[1] = ENTRY_TYPE_SPAN_OK;
-      };
+      }
       parentBuffer.message(1, 'parent-span');
       parentBuffer._writeIndex = 2;
 
@@ -365,7 +360,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = parentBuffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       parentBuffer.message(0, 'parent');
       parentBuffer._writeIndex = 1;
 
@@ -376,14 +371,14 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = child1Buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       child1Buffer.message(0, 'child-1');
       child1Buffer.timestamp[1] = 1200n;
       {
         const entryTypes = child1Buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[1] = ENTRY_TYPE_SPAN_OK;
-      };
+      }
       child1Buffer.message(1, 'child-1');
       child1Buffer._writeIndex = 2;
 
@@ -394,14 +389,14 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = child2Buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       child2Buffer.message(0, 'child-2');
       child2Buffer.timestamp[1] = 1400n;
       {
         const entryTypes = child2Buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[1] = ENTRY_TYPE_SPAN_OK;
-      };
+      }
       child2Buffer.message(1, 'child-2');
       child2Buffer._writeIndex = 2;
 
@@ -411,7 +406,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = parentBuffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[1] = ENTRY_TYPE_SPAN_OK;
-      };
+      }
       parentBuffer.message(1, 'parent');
       parentBuffer._writeIndex = 2;
 
@@ -464,7 +459,7 @@ describe('Arrow Table Conversion', () => {
           const physicalEntryTypes = buffer.entry_type;
           if (physicalEntryTypes === undefined) throw new Error('Expected split entry-type lane');
           physicalEntryTypes[i] = entryTypes[i];
-        };
+        }
         buffer.message(i, `entry-${i}`);
       }
       buffer._writeIndex = entryTypes.length;
@@ -493,7 +488,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       buffer.message(0, 'test-span');
       buffer._writeIndex = 1;
 
@@ -502,7 +497,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[1] = ENTRY_TYPE_INFO;
-      };
+      }
       buffer.message(1, 'Test log message');
       buffer._writeIndex = 2;
 
@@ -586,7 +581,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = root.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       root.message(0, 'root-start');
       root.value(0, 11);
       root.label(0, 'root');
@@ -595,7 +590,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = root.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[1] = ENTRY_TYPE_SPAN_OK;
-      };
+      }
       root._writeIndex = 2;
 
       const overflow = createOverflowBuffer(root);
@@ -604,7 +599,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = overflow.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_INFO;
-      };
+      }
       overflow.message(0, 'overflow-log');
       overflow.value(0, 22);
       overflow._writeIndex = 1;
@@ -615,7 +610,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = child.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       child.message(0, 'child-start');
       child.label(0, 'child');
       child.value(0, 0);
@@ -651,24 +646,15 @@ describe('Arrow Table Conversion', () => {
         return Array.from(batch.values.subarray(0, batch.length));
       });
       expect(rawTimestamps).toEqual([1000n, 1100n, 1200n, 1300n]);
-      expect(Array.from({ length: lease.table.numRows }, (_, row) => getColumnValue(lease.table, 'message', row))).toEqual([
-        'root-start',
-        null,
-        'overflow-log',
-        'child-start',
-      ]);
-      expect(Array.from({ length: lease.table.numRows }, (_, row) => getColumnValue(lease.table, 'value', row))).toEqual([
-        11,
-        null,
-        22,
-        null,
-      ]);
-      expect(Array.from({ length: lease.table.numRows }, (_, row) => getColumnValue(lease.table, 'label', row))).toEqual([
-        'root',
-        null,
-        null,
-        'child',
-      ]);
+      expect(
+        Array.from({ length: lease.table.numRows }, (_, row) => getColumnValue(lease.table, 'message', row)),
+      ).toEqual(['root-start', null, 'overflow-log', 'child-start']);
+      expect(
+        Array.from({ length: lease.table.numRows }, (_, row) => getColumnValue(lease.table, 'value', row)),
+      ).toEqual([11, null, 22, null]);
+      expect(
+        Array.from({ length: lease.table.numRows }, (_, row) => getColumnValue(lease.table, 'label', row)),
+      ).toEqual(['root', null, null, 'child']);
 
       const valueColumn = lease.table.getChild('value');
       if (!valueColumn) throw new Error('Missing leased value column');
@@ -716,17 +702,17 @@ describe('Arrow Table Conversion', () => {
             const entryTypes = root.entry_type;
             if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
             entryTypes[0] = ENTRY_TYPE_SPAN_START;
-          };
+          }
           {
             const entryTypes = root.entry_type;
             if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
             entryTypes[1] = ENTRY_TYPE_INFO;
-          };
+          }
           {
             const entryTypes = root.entry_type;
             if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
             entryTypes[2] = ENTRY_TYPE_SPAN_OK;
-          };
+          }
         } else {
           if (root._rowHeaders === undefined) throw new Error('Expected packed row-header lane');
           root._rowHeaders[0] = ENTRY_TYPE_SPAN_START;
@@ -772,7 +758,7 @@ describe('Arrow Table Conversion', () => {
         const entryTypes = root.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_INFO;
-      };
+      }
       root.message(0, 'single');
       root.value(0, 42);
       root._writeIndex = 1;

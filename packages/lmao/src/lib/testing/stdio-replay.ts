@@ -2,8 +2,8 @@ import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import type { OpContextBinding } from '../opContext/types.js';
 import { createTraceRoot } from '../traceRoot.universal.js';
 import { StdioTracer, type StdioWritable } from '../tracers/StdioTracer.js';
-import type { AnySpanBuffer } from '../types.js';
 import { iterateSpanChildren } from '../traceTopology.js';
+import type { AnySpanBuffer } from '../types.js';
 
 function isStdioWritable(value: unknown): value is StdioWritable {
   return typeof value === 'object' && value !== null && typeof Reflect.get(value, 'write') === 'function';

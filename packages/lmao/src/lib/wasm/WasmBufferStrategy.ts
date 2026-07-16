@@ -20,8 +20,8 @@ import type { OpMetadata } from '../opContext/opTypes.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import { EMPTY_SCOPE, type SpanBufferConstructor } from '../spanBuffer.js';
 import type { ITraceRoot } from '../traceRoot.js';
-import type { AnySpanBuffer, SpanBuffer } from '../types.js';
 import { walkSpanTree } from '../traceTopology.js';
+import type { AnySpanBuffer, SpanBuffer } from '../types.js';
 import { createWasmAllocator, type WasmAllocator, type WasmAllocatorOptions } from './wasmAllocator.js';
 import {
   createWasmChildSpanBuffer,

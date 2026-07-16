@@ -4,12 +4,8 @@ import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import { createRemapDescriptor } from '../library.js';
-import {
-  getPhysicalLayoutPlan,
-  resolveEagerColumns,
-  type EagerColumnDescriptor,
-} from '../physicalLayoutPlan.js';
 import type { OpContext } from '../opContext/types.js';
+import { type EagerColumnDescriptor, getPhysicalLayoutPlan, resolveEagerColumns } from '../physicalLayoutPlan.js';
 import {
   RUNTIME_HINT_ANALYZED_VALID,
   RUNTIME_HINT_LOG,
@@ -20,12 +16,7 @@ import {
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { LogSchema } from '../schema/LogSchema.js';
-import {
-  createChildSpanBuffer,
-  createOverflowBuffer,
-  createSpanBuffer,
-  getSpanBufferClass,
-} from '../spanBuffer.js';
+import { createChildSpanBuffer, createOverflowBuffer, createSpanBuffer, getSpanBufferClass } from '../spanBuffer.js';
 import { createSpanContextClass } from '../spanContext.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../types.js';
@@ -41,7 +32,6 @@ function descriptorBytes(descriptor: EagerColumnDescriptor): Uint8Array {
   }
   return bytes;
 }
-
 
 function expectCompilerEagerStorage(buffer: AnySpanBuffer, name: string): void {
   expect(Object.hasOwn(buffer, `_${name}_values`)).toBe(true);
@@ -62,14 +52,46 @@ function expectLazyStorage(buffer: AnySpanBuffer, name: string): void {
 describe('compiler-proven eager user columns', () => {
   it('encodes exact schema-order descriptor words and bytes beyond 32 fields', () => {
     const schema = new LogSchema({
-      f00: S.number(), f01: S.number(), f02: S.number(), f03: S.number(), f04: S.number(),
-      f05: S.number(), f06: S.number(), f07: S.number(), f08: S.number(), f09: S.number(),
-      f10: S.number(), f11: S.number(), f12: S.number(), f13: S.number(), f14: S.number(),
-      f15: S.number(), f16: S.number(), f17: S.number(), f18: S.number(), f19: S.number(),
-      f20: S.number(), f21: S.number(), f22: S.number(), f23: S.number(), f24: S.number(),
-      f25: S.number(), f26: S.number(), f27: S.number(), f28: S.number(), f29: S.number(),
-      f30: S.number(), f31: S.number(), f32: S.number(), f33: S.number(), f34: S.number(),
-      f35: S.number(), f36: S.number(), f37: S.number(), f38: S.number(), f39: S.number(),
+      f00: S.number(),
+      f01: S.number(),
+      f02: S.number(),
+      f03: S.number(),
+      f04: S.number(),
+      f05: S.number(),
+      f06: S.number(),
+      f07: S.number(),
+      f08: S.number(),
+      f09: S.number(),
+      f10: S.number(),
+      f11: S.number(),
+      f12: S.number(),
+      f13: S.number(),
+      f14: S.number(),
+      f15: S.number(),
+      f16: S.number(),
+      f17: S.number(),
+      f18: S.number(),
+      f19: S.number(),
+      f20: S.number(),
+      f21: S.number(),
+      f22: S.number(),
+      f23: S.number(),
+      f24: S.number(),
+      f25: S.number(),
+      f26: S.number(),
+      f27: S.number(),
+      f28: S.number(),
+      f29: S.number(),
+      f30: S.number(),
+      f31: S.number(),
+      f32: S.number(),
+      f33: S.number(),
+      f34: S.number(),
+      f35: S.number(),
+      f36: S.number(),
+      f37: S.number(),
+      f38: S.number(),
+      f39: S.number(),
     });
 
     const descriptor = resolveEagerColumns(schema, ['f39', 'f00', 'f32', 'f00']);
@@ -114,36 +136,26 @@ describe('compiler-proven eager user columns', () => {
     });
     const baseClass = getSpanBufferClass(schema);
     const logBinding = { logSchema: schema, remapDescriptor: undefined };
-    const SpanContextClass = createSpanContextClass<OpContext<typeof schema>>(schema, logBinding, RUNTIME_HINT_LOG | RUNTIME_HINT_RESULT);
+    const SpanContextClass = createSpanContextClass<OpContext<typeof schema>>(
+      schema,
+      logBinding,
+      RUNTIME_HINT_LOG | RUNTIME_HINT_RESULT,
+    );
     const remap = createRemapDescriptor(schema, { local_number: 'provenNumber' });
-    const plan = getPhysicalLayoutPlan(
-      baseClass,
-      HINT,
-      SpanContextClass,
-      undefined,
-      'js-heap',
-      '',
-      ['provenString', 'provenNumber', 'provenString'],
-    );
-    const identical = getPhysicalLayoutPlan(
-      baseClass,
-      HINT,
-      SpanContextClass,
-      undefined,
-      'js-heap',
-      '',
-      ['provenNumber', 'provenString'],
-    );
+    const plan = getPhysicalLayoutPlan(baseClass, HINT, SpanContextClass, undefined, 'js-heap', '', [
+      'provenString',
+      'provenNumber',
+      'provenString',
+    ]);
+    const identical = getPhysicalLayoutPlan(baseClass, HINT, SpanContextClass, undefined, 'js-heap', '', [
+      'provenNumber',
+      'provenString',
+    ]);
     const lazyPlan = getPhysicalLayoutPlan(baseClass, HINT, SpanContextClass, undefined, 'js-heap');
-    const remapped = getPhysicalLayoutPlan(
-      baseClass,
-      HINT,
-      SpanContextClass,
-      remap,
-      'js-heap',
-      '',
-      ['provenNumber', 'provenString'],
-    );
+    const remapped = getPhysicalLayoutPlan(baseClass, HINT, SpanContextClass, remap, 'js-heap', '', [
+      'provenNumber',
+      'provenString',
+    ]);
 
     expect(identical).toBe(plan);
     expect(lazyPlan).not.toBe(plan);
@@ -303,13 +315,7 @@ describe('compiler-proven eager user columns', () => {
     );
     const strategy = new JsBufferStrategy<typeof schema>();
     expect(() =>
-      strategy.createChildSpanBuffer(
-        parent,
-        compatibleOp.metadata,
-        incompatibleOp.metadata,
-        undefined,
-        schema,
-      ),
+      strategy.createChildSpanBuffer(parent, compatibleOp.metadata, incompatibleOp.metadata, undefined, schema),
     ).toThrow('Planned SpanBuffer class does not match schema');
     expect(incompatibleStats.spansCreated).toBe(spansCreated);
   });
@@ -323,7 +329,13 @@ describe('compiler-proven eager user columns', () => {
       RUNTIME_HINT_LOG | RUNTIME_HINT_RESULT,
     );
     const plan = getPhysicalLayoutPlan(SpanBufferClass, HINT, SpanContextClass);
-    const buffer = createSpanBuffer(schema, createTestTraceRoot('plugin-off'), createTestOpMetadata(), 8, plan.SpanBufferClass);
+    const buffer = createSpanBuffer(
+      schema,
+      createTestTraceRoot('plugin-off'),
+      createTestOpMetadata(),
+      8,
+      plan.SpanBufferClass,
+    );
 
     expect(plan.eagerColumns.names).toEqual([]);
     expect(plan.eagerColumns.words).toEqual([]);
