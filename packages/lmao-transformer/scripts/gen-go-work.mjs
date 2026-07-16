@@ -5,8 +5,9 @@
 // of assuming a sibling checkout). go.work is dev-only and gitignored;
 // consumers never need it — ttsc generates its own overlay when building
 // the published plugin source.
-import { createRequire } from 'node:module';
+
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
