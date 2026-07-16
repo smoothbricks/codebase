@@ -229,9 +229,10 @@ This is an Nx-based monorepo using Bun as the package manager, with devenv/diren
   transformer-aware `tsc-js` from `tsconfig.lib.json`, `typecheck-tests` from `tsconfig.test.json`, `zig-*` from
   `build.zig` steps, and aggregate `build` / `lint` targets. Do not configure `@nx/js/typescript`; it bypasses the
   repository's Typia and LMAO transformers.
-- **Compiler/API split:** `ttsc` owns the native TypeScript 7 compiler. JavaScript tools import the full TypeScript API
-  from `typescript@^6.0.3`. Do not add `@typescript/native` unless the workspace directly adopts its `tsc` binary, and
-  do not install TypeScript 7 under the `typescript` name.
+- **Compiler/API split:** The root `@typescript/native` alias installs `typescript@^7.0.2` for `ttsc`; devenv exports
+  its `node_modules/@typescript/native/bin/tsc` path through `TTSC_TSGO_BINARY`, and CI persists it through
+  `GITHUB_ENV`. JavaScript tools import the full TypeScript API from `typescript@^6.0.3`. Keep both: TypeScript 7 under
+  the unscoped name breaks Nx API calls.
 - **Where targets come from:** `tsc-js` comes from `tsconfig.lib.json`, `typecheck-tests` from `tsconfig.test.json`, and
   `zig-*` from explicit `b.step("...")` entries in `build.zig`. Aggregate `build` exists only when concrete build
   targets exist.

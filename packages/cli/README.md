@@ -249,9 +249,12 @@ Concrete targets use `{tool}-{output}` names and describe the tool that runs and
   `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`, `*-bun`, and `*-wasm` instead of duplicating commands.
 - `lint` is an aggregate validation target. It is not a formatting target.
 
-`ttsc` owns the native TypeScript 7 compiler used by those targets. Nx and other JavaScript tooling still require the
-full TypeScript compiler API, so workspace `typescript` dependencies stay on TypeScript 6. Do not add
-`@typescript/native` unless the workspace starts invoking its `tsc` binary directly.
+The root `@typescript/native` dependency follows TypeScript's documented side-by-side pattern: it aliases TypeScript 7
+and supplies the native compiler used by `ttsc`. Because `ttsc` resolves only the unscoped package by default, the
+managed devenv shell sets `TTSC_TSGO_BINARY` to `node_modules/@typescript/native/bin/tsc`; the GitHub setup action
+persists that absolute path through `GITHUB_ENV`. Nx and other JavaScript tooling still require the full TypeScript
+compiler API, so workspace `typescript` dependencies stay on TypeScript 6. Both dependencies and the environment binding
+are required: TypeScript 7 under the unscoped name breaks Nx API calls such as `readConfigFile`.
 
 Explicit Nx target names must not contain `:`. Nx already uses colon syntax at the CLI boundary:
 `project:target:configuration`. Allowing target names like `build:wasm` makes command parsing and package-script aliases
