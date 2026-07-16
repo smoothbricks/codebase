@@ -980,12 +980,12 @@ describe('workspace package script policy', () => {
         {
           dir: 'worker',
           name: '@fixture/worker',
-          nx: { name: 'worker', tags: ['ci:skip:test'], targets: {} },
+          nx: { name: 'worker', tags: ['ci:skip:test', 'ci:skip:test.integration'], targets: {} },
         },
       ],
     });
     try {
-      const resolvedTargetsByProject = new Map([['worker', new Set(['build', 'test'])]]);
+      const resolvedTargetsByProject = new Map([['worker', new Set(['build', 'test', 'test.integration'])]]);
       expect(validateWorkspaceDependencies(root, { resolvedTargetsByProject })).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });
