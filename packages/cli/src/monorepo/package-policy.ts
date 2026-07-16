@@ -406,7 +406,7 @@ export function validateWorkspaceDependencies(root: string, options: PackageTarg
 }
 
 const ciSkipTagPrefix = 'ci:skip:';
-const validNxTargetName = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+const invalidCiSkipTargetSyntax = /[,*?[\]{}]/;
 
 function validateCiSkipTags(root: string, options: PackageTargetPolicyOptions): number {
   let failures = 0;
@@ -418,7 +418,7 @@ function validateCiSkipTags(root: string, options: PackageTargetPolicyOptions): 
         continue;
       }
       const target = tag.startsWith(ciSkipTagPrefix) ? tag.slice(ciSkipTagPrefix.length) : '';
-      if (!validNxTargetName.test(target)) {
+      if (!target || invalidCiSkipTargetSyntax.test(target)) {
         console.error(`${pkg.path}: nx tag ${tag} must use ci:skip:<target> with one exact Nx target name`);
         failures++;
         continue;
