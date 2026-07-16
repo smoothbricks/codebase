@@ -97,8 +97,6 @@ jobs:
       # Step 10
       - name: 🍎 Build macOS and iOS targets
         if: ${{ steps.version.outputs.mode != 'none' }}
-        env:
-          GITHUB_SHA: ${{ steps.release-state.outputs.sha }}
         run:
           smoo github-ci nx-run-many --targets "*-macos,*-ios" --projects "${{ steps.version.outputs.projects }}"
           --collect-outputs "${{ runner.temp }}/macos-platform-outputs"
