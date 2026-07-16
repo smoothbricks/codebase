@@ -155,11 +155,12 @@ describe('collected Nx outputs', () => {
     });
   });
 
-  it('creates a transferable empty artifact when no target runs match', async () => {
+  it('applies an empty manifest after artifact transport omits its empty workspace directory', async () => {
     await withOutputFixture(async ({ root, artifact }) => {
       const manifest = await collectNxOutputs(root, artifact, [], SOURCE_SHA);
 
       expect(manifest).toEqual({ version: 1, sourceSha: SOURCE_SHA, files: [] });
+      await rm(join(artifact, 'workspace'), { recursive: true });
       await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [])).resolves.toBeUndefined();
     });
   });
