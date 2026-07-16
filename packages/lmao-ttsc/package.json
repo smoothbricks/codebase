@@ -40,8 +40,8 @@
     "!**/*.tsbuildinfo"
   ],
   "dependencies": {
-    "@ttsc/unplugin": "0.18.4",
-    "ttsc": "^0.18.4",
+    "@ttsc/unplugin": "0.19.1",
+    "ttsc": "^0.19.1",
     "typescript": "^7.0.2"
   },
   "devDependencies": {
