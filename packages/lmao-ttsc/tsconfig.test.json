@@ -26,6 +26,9 @@
     },
     {
       "path": "./tsconfig.lib.json"
+    },
+    {
+      "path": "../lmao/tsconfig.lib.json"
     }
   ]
 }
