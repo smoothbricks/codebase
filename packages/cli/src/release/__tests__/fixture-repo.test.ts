@@ -175,7 +175,9 @@ describe('release planning with fixture git repositories', () => {
       const summaries = await repairPendingTargets(shell, pending, restoreRef, false);
 
       expect(shell.checkouts).toEqual([githubOnlySha, npmAndGithubSha, restoreRef]);
-      expect(shell.devenvLoads).toBe(2);
+      expect(shell.devenvLoads).toBe(3);
+      expect(shell.devenvRefs).toEqual([githubOnlySha, npmAndGithubSha, headSha]);
+      await expect(readFile(join(runner, '.generated-tool-ref'), 'utf8')).resolves.toBe(`${headSha}\n`);
       expect(shell.builds).toEqual([['@scope/b']]);
       expect(shell.publishes).toEqual([{ name: '@scope/b', version: '2.0.0-beta.1', distTag: 'next', dryRun: false }]);
       expect(shell.githubCreates).toEqual([
@@ -295,6 +297,7 @@ class LocalGitRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
   readonly publishes: Array<{ name: string; version: string; distTag: string; dryRun: boolean }> = [];
   readonly githubCreates: Array<{ name: string; version: string; dryRun: boolean }> = [];
   devenvLoads = 0;
+  readonly devenvRefs: string[] = [];
 
   constructor(private readonly root: string) {}
 
@@ -360,6 +363,9 @@ class LocalGitRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
 
   async withDevenvEnv<T>(runWithEnv: () => Promise<T>): Promise<T> {
     this.devenvLoads += 1;
+    const currentRef = await this.gitHead();
+    this.devenvRefs.push(currentRef);
+    await writeFile(join(this.root, '.generated-tool-ref'), `${currentRef}\n`);
     return runWithEnv();
   }
 
