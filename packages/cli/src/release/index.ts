@@ -65,7 +65,8 @@ export interface ReleaseRepairPendingOptions {
   ref?: string;
 }
 
-export interface ReleaseRepairPlatformOutputsOptions {
+export interface ReleasePlatformOutputsOptions {
+  bump: string;
   output: string;
   ref?: string;
   targets: string;
@@ -189,17 +190,36 @@ export async function releaseRepairPending(root: string, options: ReleaseRepairP
   await writeRepairSummary(summaries, options.dryRun === true);
 }
 
-export async function releaseCollectRepairPlatformOutputs(
+export async function releaseCollectPlatformOutputs(
   root: string,
-  options: ReleaseRepairPlatformOutputsOptions,
+  options: ReleasePlatformOutputsOptions,
 ): Promise<void> {
   const restoreRef = await gitHead(root);
-  const repairRef = await fetchReleaseRepairRef(root, options.ref);
-  console.log(`Repair platform outputs: planning from ${repairRef}.`);
-  const targets = await listPendingReleaseTargets(root, repairRef);
+  const releaseRef = await fetchReleaseRepairRef(root, options.ref);
+  const packages = releasePackages(root);
+  const packagesAtHead = await releasePackagesAtHead(root, packages);
+  const currentPackages =
+    packagesAtHead.length > 0
+      ? packagesAtHead
+      : await releaseVersionPackages(root, packages, releaseBumpArg(options.bump));
+  console.log(
+    currentPackages.length === 0
+      ? 'Release platform outputs: no current release packages selected.'
+      : `Release platform outputs: building current outputs for ${packageSummary(currentPackages)}.`,
+  );
+  const outputRoot = resolve(root, options.output);
+  await githubCiNxRunMany(root, {
+    targets: options.targets,
+    projects: releasePackageProjects(currentPackages),
+    collectOutputs: join(outputRoot, 'current'),
+    allowEmptyProjects: true,
+  });
+
+  console.log(`Repair platform outputs: planning from ${releaseRef}.`);
+  const targets = await listPendingReleaseTargets(root, releaseRef);
   logPendingReleaseTargets(targets);
   await collectRepairPlatformOutputs(
-    releaseRepairOutputsShell(root, options.targets, resolve(root, options.output)),
+    releaseRepairOutputsShell(root, options.targets, join(outputRoot, 'repairs')),
     targets,
     restoreRef,
   );
