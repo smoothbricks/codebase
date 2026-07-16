@@ -155,15 +155,16 @@ function buildProgram(): Command {
       await releaseRepairPending(await findRepoRoot(), { ...options, dryRun: booleanOption(options.dryRun) });
     });
   release
-    .command('build-repair-platform-outputs')
-    .description('Build platform outputs needed to repair incomplete older releases')
+    .command('build-platform-outputs')
+    .description('Build selected current and pending-release platform outputs')
+    .requiredOption('--bump <bump>', 'auto, patch, minor, major, or prerelease')
     .requiredOption('--targets <targets>', 'comma-separated Nx platform target names or globs')
-    .requiredOption('--output <path>', 'output directory grouped by release SHA')
+    .requiredOption('--output <path>', 'output directory for current and repair artifacts')
     .option('--ref <ref>', 'fixed release graph ref to inspect')
-    .action(async (options: { output: string; ref?: string; targets: string }) => {
+    .action(async (options: { bump: string; output: string; ref?: string; targets: string }) => {
       // The source self-hosting shim has no Typia transform; release commands import transformed output validators.
-      const { releaseCollectRepairPlatformOutputs } = await import('./release/index.js');
-      await releaseCollectRepairPlatformOutputs(await findRepoRoot(), options);
+      const { releaseCollectPlatformOutputs } = await import('./release/index.js');
+      await releaseCollectPlatformOutputs(await findRepoRoot(), options);
     });
   release
     .command('version')

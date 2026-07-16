@@ -145,6 +145,7 @@ export interface NxRunManyOptions {
   projects?: string;
   configuration?: string;
   collectOutputs?: string;
+  allowEmptyProjects?: boolean;
 }
 
 export interface ExpandedNxTargetRuns {
@@ -154,7 +155,7 @@ export interface ExpandedNxTargetRuns {
 
 export function expandNxTargetRuns(projects: ProjectTargets[], options: NxRunManyOptions): ExpandedNxTargetRuns {
   const selectedProjects = selectProjects(projects, options.projects);
-  if (options.projects !== undefined && selectedProjects.length === 0) {
+  if (options.projects !== undefined && selectedProjects.length === 0 && options.allowEmptyProjects !== true) {
     throw new Error(`No Nx projects matched --projects ${options.projects}.`);
   }
   const selectedTargetNames = [...new Set(selectedProjects.flatMap((project) => project.targets))].sort((a, b) =>
@@ -289,7 +290,7 @@ function isGlobPattern(value: string): boolean {
 }
 
 function selectProjects(projects: ProjectTargets[], selectors: string | undefined): ProjectTargets[] {
-  if (!selectors) {
+  if (selectors === undefined) {
     return projects.slice().sort((left, right) => left.project.localeCompare(right.project));
   }
   const patterns = commaSeparatedValues(selectors);
