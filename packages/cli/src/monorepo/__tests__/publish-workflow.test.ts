@@ -44,6 +44,37 @@ describe('publish workflow definition', () => {
     expect(current).not.toContain('publish-on-linux:');
   });
 
+  it('keeps job-local deeplink step anchors exact for single-job and platform workflows', () => {
+    const singleJob = renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase' });
+    const platform = renderPublishWorkflowYaml({
+      deploy: true,
+      repoName: '@smoothbricks/codebase',
+      platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+    });
+    const candidate = platform.slice(
+      platform.indexOf('  macos-release-candidate:'),
+      platform.indexOf('  publish-on-linux:'),
+    );
+    const finalJob = platform.slice(platform.indexOf('  publish-on-linux:'));
+
+    expect(stepAnchorNumbers(singleJob)).toEqual(Array.from({ length: 15 }, (_, index) => index + 1));
+    expect(stepAnchorNumbers(candidate)).toEqual(Array.from({ length: 14 }, (_, index) => index + 1));
+    expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 17 }, (_, index) => index + 1));
+    expect(singleJob).toContain('# Step 14\n      - name: 📦 Publish release (${{ steps.version.outputs.mode }})');
+    expect(singleJob).toContain('# Step 15\n      - name: 🧹 Cleanup and cache Nix/devenv');
+    expect(candidate).toContain('# Step 8\n      - name: 🔒 Capture candidate release SHA');
+    expect(candidate).toContain(
+      '# Step 9\n      - name: ✅ Check managed monorepo files (${{ steps.version.outputs.mode }})',
+    );
+    expect(candidate).toContain('# Step 14\n      - name: 🧹 Cleanup and cache Nix/devenv');
+    expect(finalJob).toContain('# Step 13\n      - name: 📦 Apply verified native outputs');
+    expect(finalJob).toContain(
+      '# Step 15\n      - name: 📦 Publish release (${{ needs.macos-release-candidate.outputs.mode }})',
+    );
+    expect(finalJob).toContain('# Step 16\n      - name: 🚀 Deploy production');
+    expect(finalJob).toContain('# Step 17\n      - name: 🧹 Cleanup and cache Nix/devenv');
+  });
+
   it('renders a macOS release candidate and verified artifact transfer only when macOS targets exist', () => {
     const linuxOnly = renderPublishWorkflowYaml({
       repoName: '@smoothbricks/codebase',
@@ -470,6 +501,10 @@ class WorkflowScenarioState {
     }
     return this.validationState.tests;
   }
+}
+
+function stepAnchorNumbers(yaml: string): number[] {
+  return [...yaml.matchAll(/^\s*# Step (\d+)/gm)].map((match) => Number(match[1]));
 }
 
 function packageNameFromTag(tag: string): string {
