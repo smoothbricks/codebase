@@ -102,7 +102,7 @@ in {
   enterShell = ''
     cd "$DEVENV_ROOT/../.."
     export PATH="$("$PWD/tooling/direnv/repo-path")"
-    bun "$DEVENV_ROOT/enter-shell.ts"
+    bun "$DEVENV_ROOT/enter-shell.ts" || exit $?
 
     # Unset nix CC/CXX so xcodebuild finds Xcode's clang (supports -index-store-path)
     # Zig has its own toolchain and doesn't use CC; bun/node native addons use node-gyp
