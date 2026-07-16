@@ -203,19 +203,27 @@ export async function releaseTrustPublisher(root: string, options: ReleaseTrustP
           },
           bootstrapOptions,
         ),
-      trustPublisher: (pkg, dryRun, env) => {
-        const args = ['trust', 'github', pkg.name, '--file', workflow, '--repo', repository, '--yes'];
-        if (dryRun) {
-          args.push('--dry-run');
-        }
-        return runLatestNpmTrust(root, args, env);
-      },
+      trustPublisher: (pkg, dryRun, env) =>
+        runLatestNpmTrust(root, npmTrustGithubArgs(pkg.name, repository, workflow, dryRun), env),
       trustedPublishers: (pkg) => listTrustedPublishers(root, pkg),
       log: (message) => console.log(message),
       error: (message) => console.error(message),
     },
     options,
   );
+}
+
+export function npmTrustGithubArgs(
+  packageName: string,
+  repository: string,
+  workflow: string,
+  dryRun: boolean,
+): string[] {
+  const args = ['trust', 'github', packageName, '--file', workflow, '--repo', repository, '--allow-publish', '--yes'];
+  if (dryRun) {
+    args.push('--dry-run');
+  }
+  return args;
 }
 
 export interface TrustPublisherShell<Package extends ReleasePackageInfo = ReleasePackageInfo> {

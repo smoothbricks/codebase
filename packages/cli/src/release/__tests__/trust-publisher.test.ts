@@ -3,6 +3,7 @@ import type { BootstrapNpmPackagesOptions } from '../bootstrap-npm-packages.js';
 import type { ReleasePackageInfo } from '../core.js';
 import {
   configureTrustedPublishers,
+  npmTrustGithubArgs,
   parseTrustedPublishers,
   type TrustedPublisher,
   type TrustPublisherShell,
@@ -99,6 +100,21 @@ describe('trusted publisher setup', () => {
     await configureTrustedPublishers(shell, { skipLogin: true, packages: [missing.name] });
 
     expect(shell.events).toEqual([`exists:${missing.name}`, `list:${missing.name}`, `trust:${missing.name}:false`]);
+  });
+
+  it('grants the trusted workflow permission to run npm publish', () => {
+    expect(npmTrustGithubArgs(stable.name, 'scope/repo', 'publish.yml', false)).toEqual([
+      'trust',
+      'github',
+      stable.name,
+      '--file',
+      'publish.yml',
+      '--repo',
+      'scope/repo',
+      '--allow-publish',
+      '--yes',
+    ]);
+    expect(npmTrustGithubArgs(stable.name, 'scope/repo', 'publish.yml', true).at(-1)).toBe('--dry-run');
   });
 
   it('parses empty npm trust list output as no trusted publishers', () => {

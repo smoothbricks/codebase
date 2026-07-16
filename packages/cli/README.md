@@ -467,12 +467,13 @@ Publishing:
   for targeted bootstraps.
 - `smoo release trust-publisher` configures [npm trusted publishing][npm-trusted-publishing] for every owned release
   package. It uses the root `package.json` `repository.url` as the GitHub `owner/repo`, uses `publish.yml` as the
-  trusted workflow, and runs `npm trust` through `nix shell nixpkgs#nodejs_latest` because the Lambda-pinned Node 24/npm
-  toolchain may lag the npm CLI feature. It does not run a separate `npm login` before trust setup; `npm trust list` and
-  `npm trust github` own authentication so npm can offer the 5-minute trust/publish challenge bypass. Pass
-  `--package <name...>` to target specific owned packages. Pass `--bootstrap` to create missing npm package names first,
-  then configure trusted publishing in the same command. With `--bootstrap`, `--skip-login` only skips the placeholder
-  publish login. Existing matching trusted publishers are skipped via `npm trust list <package> --json`.
+  trusted workflow, grants that workflow npm's `--allow-publish` permission, and runs `npm trust` through
+  `nix shell nixpkgs#nodejs_latest` because the Lambda-pinned Node 24/npm toolchain may lag the npm CLI feature. It does
+  not run a separate `npm login` before trust setup; `npm trust list` and `npm trust github` own authentication so npm
+  can offer the 5-minute trust/publish challenge bypass. Pass `--package <name...>` to target specific owned packages.
+  Pass `--bootstrap` to create missing npm package names first, then configure trusted publishing in the same command.
+  With `--bootstrap`, `--skip-login` only skips the placeholder publish login. Existing matching trusted publishers are
+  skipped via `npm trust list <package> --json`.
 
 GitHub Releases:
 
