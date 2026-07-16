@@ -43,7 +43,7 @@ pub fn slot_data_size(
             columine_types::types::BITMAP_SERIALIZED_LEN_BYTES
                 + crate::bitmap_ops::bitmap_payload_capacity(capacity)
         }
-        SlotType::StructMap | SlotType::OrderedList | SlotType::Nested => 0,
+        SlotType::StructMap | SlotType::StructMap2 | SlotType::OrderedList | SlotType::Nested => 0,
         SlotType::Array => capacity * 4 + capacity * 8,
     }
 }
@@ -155,6 +155,56 @@ pub fn grow_struct_map(
             );
             rehashed += 1;
         }
+    }
+    rehashed
+}
+
+/// Rehash an exact two-lane-key struct map while preserving both key cells
+/// and each row byte-for-byte.
+#[allow(clippy::too_many_arguments)]
+pub fn grow_struct_map2(
+    old_state: &[u8],
+    new_state: &mut [u8],
+    old_offset: u32,
+    new_offset: u32,
+    old_cap: u32,
+    new_cap: u32,
+    num_fields: u32,
+    row_size: u32,
+) -> u32 {
+    let desc_size = columine_types::types::align8(num_fields);
+    bytes::copy(new_state, new_offset, old_state, old_offset, num_fields);
+
+    let old_keys1 = old_offset + desc_size;
+    let old_keys2 = old_keys1 + old_cap * 4;
+    let old_rows = old_keys2 + old_cap * 4;
+    let new_keys1 = new_offset + desc_size;
+    let new_keys2 = new_keys1 + new_cap * 4;
+    let new_rows = new_keys2 + new_cap * 4;
+    bytes::fill_u32(new_state, new_keys1, new_cap, EMPTY_KEY);
+    bytes::zero(new_state, new_keys2, new_cap * 4);
+
+    let mut rehashed = 0;
+    for i in 0..old_cap {
+        let key1 = bytes::read_u32(old_state, old_keys1 + i * 4);
+        if key1 == EMPTY_KEY || key1 == TOMBSTONE {
+            continue;
+        }
+        let key2 = bytes::read_u32(old_state, old_keys2 + i * 4);
+        let mut pos = columine_types::types::hash_key_pair(key1, key2, new_cap);
+        while bytes::read_u32(new_state, new_keys1 + pos * 4) != EMPTY_KEY {
+            pos = (pos + 1) & (new_cap - 1);
+        }
+        bytes::write_u32(new_state, new_keys1 + pos * 4, key1);
+        bytes::write_u32(new_state, new_keys2 + pos * 4, key2);
+        bytes::copy(
+            new_state,
+            new_rows + pos * row_size,
+            old_state,
+            old_rows + i * row_size,
+            row_size,
+        );
+        rehashed += 1;
     }
     rehashed
 }

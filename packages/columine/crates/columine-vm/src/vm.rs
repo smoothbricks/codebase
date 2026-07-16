@@ -31,7 +31,7 @@ use crate::hooks::{MutationOp, MutationRecord, VmHooks};
 use crate::meta::{SlotMetaView, slot_meta_base};
 use crate::nested;
 use crate::state_init::{self, ARENA_HEADER_SIZE, NEEDS_GROWTH_SLOT};
-use crate::struct_map::StructMapSlot;
+use crate::struct_map::{StructMap2Slot, StructMapSlot};
 use crate::undo_log::{
     self, FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp, SMF_BIT_SET, SMF_ROW_ABSENT,
     SMR_ROW_ABSENT,
@@ -382,6 +382,7 @@ fn remove_entry_by_key(
         // vm.zig:922-946 — no per-entry TTL removal for these slot types.
         SlotType::Aggregate
         | SlotType::StructMap
+        | SlotType::StructMap2
         | SlotType::OrderedList
         | SlotType::Scalar
         | SlotType::Nested => false,
@@ -1067,73 +1068,132 @@ pub fn rollback_entry(env: &mut BitmapEnv, state: &mut [u8], entry: &FlatUndoEnt
             bytes::write_u32(state, meta_off + SlotMetaOffset::SIZE, entry.prev_value);
         }
         FlatUndoOp::StructMapField => {
-            // vm.zig:469 — restore one struct-map scalar field (bit, bytes),
-            // or remove a row this mutation created.
-            let smap = StructMapSlot::bind(state, entry.slot);
-            let field_idx = entry.pad1;
-            let want_absent = entry.pad2 & SMF_ROW_ABSENT != 0;
-            let want_bit_set = entry.pad2 & SMF_BIT_SET != 0;
-
-            if want_absent {
-                if let Some(pos) = smap.find(state, entry.key) {
-                    smap.set_key_at(state, pos, TOMBSTONE);
-                    let size = smap.size(state);
-                    smap.set_size(state, size - 1);
-                    smap.clear_bitset(state, smap.row_off(pos));
-                }
+            if SlotMetaView::read(state, entry.slot).slot_type() == SlotType::StructMap2 {
+                rollback_struct_map2_field(state, entry);
             } else {
-                let Some(ins) = smap.find_insert(state, entry.key) else {
-                    return;
-                };
-                if !ins.found {
-                    smap.set_key_at(state, ins.pos, entry.key);
-                    let size = smap.size(state);
-                    smap.set_size(state, size + 1);
-                    smap.clear_bitset(state, smap.row_off(ins.pos));
-                }
-                let row = smap.row_off(ins.pos);
-                let ft = smap.field_type(state, field_idx);
-                let fsize = struct_field_size(ft);
-                let f_off = row + smap.field_offset(state, field_idx);
-                if want_bit_set {
-                    StructMapSlot::set_field_bit(state, row, field_idx);
-                    let cell = entry.aux.to_le_bytes();
-                    state[f_off as usize..(f_off + fsize) as usize]
-                        .copy_from_slice(&cell[..fsize as usize]);
-                } else {
-                    StructMapSlot::clear_scalar_field(state, row, field_idx);
-                    bytes::zero(state, f_off, fsize);
-                }
+                rollback_struct_map_field(state, entry);
             }
         }
         FlatUndoOp::StructMapRow => {
-            // vm.zig:509 — whole-row rollback companion: stamp the prior
-            // bitset, or remove a row the upsert created.
-            let smap = StructMapSlot::bind(state, entry.slot);
-            let want_absent = entry.pad2 & SMR_ROW_ABSENT != 0;
-            if want_absent {
-                if let Some(pos) = smap.find(state, entry.key) {
-                    smap.set_key_at(state, pos, TOMBSTONE);
-                    let size = smap.size(state);
-                    smap.set_size(state, size - 1);
-                    smap.clear_bitset(state, smap.row_off(pos));
-                }
+            if SlotMetaView::read(state, entry.slot).slot_type() == SlotType::StructMap2 {
+                rollback_struct_map2_row(state, entry);
             } else {
-                let Some(ins) = smap.find_insert(state, entry.key) else {
-                    return;
-                };
-                if !ins.found {
-                    smap.set_key_at(state, ins.pos, entry.key);
-                    let size = smap.size(state);
-                    smap.set_size(state, size + 1);
-                }
-                let row = smap.row_off(ins.pos);
-                let n = smap.bitset_bytes.min(8);
-                let cell = entry.aux.to_le_bytes();
-                state[row as usize..(row + n) as usize].copy_from_slice(&cell[..n as usize]);
+                rollback_struct_map_row(state, entry);
             }
         }
     }
+}
+
+fn rollback_struct_map_field(state: &mut [u8], entry: &FlatUndoEntry) {
+    let smap = StructMapSlot::bind(state, entry.slot);
+    let field_idx = entry.pad1;
+    let want_absent = entry.pad2 & SMF_ROW_ABSENT != 0;
+    let want_bit_set = entry.pad2 & SMF_BIT_SET != 0;
+    if want_absent {
+        if let Some(pos) = smap.find(state, entry.key) {
+            smap.set_key_at(state, pos, TOMBSTONE);
+            smap.set_size(state, smap.size(state) - 1);
+            smap.clear_bitset(state, smap.row_off(pos));
+        }
+        return;
+    }
+    let Some(ins) = smap.find_insert(state, entry.key) else {
+        return;
+    };
+    if !ins.found {
+        smap.set_key_at(state, ins.pos, entry.key);
+        smap.set_size(state, smap.size(state) + 1);
+        smap.clear_bitset(state, smap.row_off(ins.pos));
+    }
+    let row = smap.row_off(ins.pos);
+    let fsize = struct_field_size(smap.field_type(state, field_idx));
+    let f_off = row + smap.field_offset(state, field_idx);
+    if want_bit_set {
+        StructMapSlot::set_field_bit(state, row, field_idx);
+        let cell = entry.aux.to_le_bytes();
+        state[f_off as usize..(f_off + fsize) as usize].copy_from_slice(&cell[..fsize as usize]);
+    } else {
+        StructMapSlot::clear_scalar_field(state, row, field_idx);
+        bytes::zero(state, f_off, fsize);
+    }
+}
+
+fn rollback_struct_map_row(state: &mut [u8], entry: &FlatUndoEntry) {
+    let smap = StructMapSlot::bind(state, entry.slot);
+    if entry.pad2 & SMR_ROW_ABSENT != 0 {
+        if let Some(pos) = smap.find(state, entry.key) {
+            smap.set_key_at(state, pos, TOMBSTONE);
+            smap.set_size(state, smap.size(state) - 1);
+            smap.clear_bitset(state, smap.row_off(pos));
+        }
+        return;
+    }
+    let Some(ins) = smap.find_insert(state, entry.key) else {
+        return;
+    };
+    if !ins.found {
+        smap.set_key_at(state, ins.pos, entry.key);
+        smap.set_size(state, smap.size(state) + 1);
+    }
+    let row = smap.row_off(ins.pos);
+    let n = smap.bitset_bytes.min(8);
+    let cell = entry.aux.to_le_bytes();
+    state[row as usize..(row + n) as usize].copy_from_slice(&cell[..n as usize]);
+}
+
+fn rollback_struct_map2_field(state: &mut [u8], entry: &FlatUndoEntry) {
+    let smap = StructMap2Slot::bind(state, entry.slot);
+    let (key1, key2) = (entry.key, entry.prev_value);
+    let field_idx = entry.pad1;
+    let want_absent = entry.pad2 & SMF_ROW_ABSENT != 0;
+    let want_bit_set = entry.pad2 & SMF_BIT_SET != 0;
+    if want_absent {
+        if let Some(pos) = smap.remove(state, key1, key2) {
+            smap.clear_bitset(state, smap.row_off(pos));
+        }
+        return;
+    }
+    let Some(ins) = smap.find_insert(state, key1, key2) else {
+        return;
+    };
+    if !ins.found {
+        smap.set_keys_at(state, ins.pos, key1, key2);
+        smap.set_size(state, smap.size(state) + 1);
+        smap.clear_bitset(state, smap.row_off(ins.pos));
+    }
+    let row = smap.row_off(ins.pos);
+    let fsize = struct_field_size(smap.field_type(state, field_idx));
+    let f_off = row + smap.field_offset(state, field_idx);
+    if want_bit_set {
+        StructMapSlot::set_field_bit(state, row, field_idx);
+        let cell = entry.aux.to_le_bytes();
+        state[f_off as usize..(f_off + fsize) as usize].copy_from_slice(&cell[..fsize as usize]);
+    } else {
+        StructMapSlot::clear_scalar_field(state, row, field_idx);
+        bytes::zero(state, f_off, fsize);
+    }
+}
+
+fn rollback_struct_map2_row(state: &mut [u8], entry: &FlatUndoEntry) {
+    let smap = StructMap2Slot::bind(state, entry.slot);
+    let (key1, key2) = (entry.key, entry.prev_value);
+    if entry.pad2 & SMR_ROW_ABSENT != 0 {
+        if let Some(pos) = smap.remove(state, key1, key2) {
+            smap.clear_bitset(state, smap.row_off(pos));
+        }
+        return;
+    }
+    let Some(ins) = smap.find_insert(state, key1, key2) else {
+        return;
+    };
+    if !ins.found {
+        smap.set_keys_at(state, ins.pos, key1, key2);
+        smap.set_size(state, smap.size(state) + 1);
+    }
+    let row = smap.row_off(ins.pos);
+    let n = smap.bitset_bytes.min(8);
+    let cell = entry.aux.to_le_bytes();
+    state[row as usize..(row + n) as usize].copy_from_slice(&cell[..n as usize]);
 }
 
 // =============================================================================
@@ -1286,6 +1346,153 @@ fn emit_struct_map_row_journal(
     }
 }
 
+fn capture_struct_map2_row_prior(
+    state: &[u8],
+    smap: &StructMap2Slot,
+    row: u32,
+    prior: &mut RowPrior,
+) {
+    let nb = smap.bitset_bytes.min(8) as usize;
+    prior.bitset = [0; 8];
+    prior.bitset[..nb].copy_from_slice(&state[row as usize..row as usize + nb]);
+    for fi in 0..smap.num_fields.min(64) {
+        if StructMapSlot::is_field_set(state, row, fi) {
+            let fsize = struct_field_size(smap.field_type(state, fi));
+            let f_off = row + smap.field_offset(state, fi);
+            prior.cells[fi as usize] =
+                pack_field_bytes(&state[f_off as usize..(f_off + fsize) as usize]);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_struct_map2_upsert_journal(
+    undo: &mut UndoState,
+    delta_mode: bool,
+    state: &[u8],
+    smap: &StructMap2Slot,
+    slot: u8,
+    key1: u32,
+    key2: u32,
+    pos: u32,
+    was_new: bool,
+    prior: &RowPrior,
+) {
+    let row = smap.row_off(pos);
+    let row_entry = |pad2: u8, aux: u64| FlatUndoEntry {
+        op: FlatUndoOp::StructMapRow,
+        slot,
+        pad1: 0,
+        pad2,
+        key: key1,
+        prev_value: key2,
+        aux,
+    };
+    let prior_bits = if was_new {
+        0
+    } else {
+        pack_field_bytes(&prior.bitset[..smap.bitset_bytes.min(8) as usize])
+    };
+    append_mutation_state(
+        undo,
+        delta_mode,
+        state,
+        row_entry(if was_new { SMR_ROW_ABSENT } else { 0 }, prior_bits),
+        row_entry(0, pack_bitset_bytes(state, row, smap.bitset_bytes)),
+    );
+
+    for fi in 0..smap.num_fields.min(64) {
+        let prior_set = !was_new && prior.is_field_set(fi);
+        let now_set = StructMapSlot::is_field_set(state, row, fi);
+        if !prior_set && !now_set {
+            continue;
+        }
+        let fsize = struct_field_size(smap.field_type(state, fi));
+        let f_off = row + smap.field_offset(state, fi);
+        let field_entry = |pad2: u8, aux: u64| FlatUndoEntry {
+            op: FlatUndoOp::StructMapField,
+            slot,
+            pad1: fi,
+            pad2,
+            key: key1,
+            prev_value: key2,
+            aux,
+        };
+        append_mutation_state(
+            undo,
+            delta_mode,
+            state,
+            field_entry(
+                if prior_set { SMF_BIT_SET } else { 0 },
+                if prior_set {
+                    prior.cells[fi as usize]
+                } else {
+                    0
+                },
+            ),
+            field_entry(
+                if now_set { SMF_BIT_SET } else { 0 },
+                if now_set {
+                    pack_field_bytes(&state[f_off as usize..(f_off + fsize) as usize])
+                } else {
+                    0
+                },
+            ),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_struct_map2_remove_journal(
+    undo: &mut UndoState,
+    delta_mode: bool,
+    state: &[u8],
+    smap: &StructMap2Slot,
+    slot: u8,
+    key1: u32,
+    key2: u32,
+    prior: &RowPrior,
+) {
+    let entry = |op: FlatUndoOp, field: u8, flags: u8, aux: u64| FlatUndoEntry {
+        op,
+        slot,
+        pad1: field,
+        pad2: flags,
+        key: key1,
+        prev_value: key2,
+        aux,
+    };
+    append_mutation_state(
+        undo,
+        delta_mode,
+        state,
+        entry(
+            FlatUndoOp::StructMapRow,
+            0,
+            0,
+            pack_field_bytes(&prior.bitset[..smap.bitset_bytes.min(8) as usize]),
+        ),
+        entry(FlatUndoOp::StructMapRow, 0, SMR_ROW_ABSENT, 0),
+    );
+    for fi in 0..smap.num_fields.min(64) {
+        if !prior.is_field_set(fi) {
+            continue;
+        }
+        append_mutation_state(
+            undo,
+            delta_mode,
+            state,
+            entry(
+                FlatUndoOp::StructMapField,
+                fi,
+                SMF_BIT_SET,
+                prior.cells[fi as usize],
+            ),
+            entry(FlatUndoOp::StructMapField, fi, SMF_ROW_ABSENT, 0),
+        );
+    }
+}
+
 /// vm.zig:301 `appendMutation` where the caller owns the state buffer (so
 /// first-overflow snapshots can happen, exactly like the Zig global-pointer
 /// path).
@@ -1378,6 +1585,38 @@ fn decode_struct_map_upsert_operands(
         num_array_vals,
         array_triples_start,
         comparison_field_idx,
+        end,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct StructMap2UpsertOperands {
+    slot: u8,
+    key1_col: u8,
+    key2_col: u8,
+    num_vals: usize,
+    scalar_pairs_start: usize,
+    end: usize,
+}
+
+fn decode_struct_map2_upsert_operands(
+    code: &[u8],
+    start: usize,
+) -> Option<StructMap2UpsertOperands> {
+    let header_end = start.checked_add(4)?;
+    let header = code.get(start..header_end)?;
+    let num_vals = usize::from(header[3]);
+    if num_vals > MAX_STRUCT_SCALAR_OPERANDS {
+        return None;
+    }
+    let end = header_end.checked_add(num_vals.checked_mul(2)?)?;
+    code.get(header_end..end)?;
+    Some(StructMap2UpsertOperands {
+        slot: header[0],
+        key1_col: header[1],
+        key2_col: header[2],
+        num_vals,
+        scalar_pairs_start: header_end,
         end,
     })
 }
@@ -1542,6 +1781,111 @@ fn single_struct_map_upsert_last(
         err: ErrorCode::Ok,
         pos: result.pos,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn single_struct_map2_upsert_last(
+    undo: &mut UndoState,
+    delta_mode: bool,
+    state: &mut [u8],
+    slot: u8,
+    key1: u32,
+    key2: u32,
+    val_cols: &[u8],
+    field_idxs: &[u8],
+    cols: &[&[u8]],
+    element_idx: u32,
+) -> StructUpsertResult {
+    if key1 == EMPTY_KEY || key1 == TOMBSTONE {
+        return StructUpsertResult {
+            err: ErrorCode::InvalidKey,
+            pos: 0,
+        };
+    }
+    let smap = StructMap2Slot::bind(state, slot);
+    if field_idxs.iter().any(|&field| field >= smap.num_fields) {
+        return StructUpsertResult {
+            err: ErrorCode::InvalidProgram,
+            pos: 0,
+        };
+    }
+    let Some(result) = smap.upsert(state, key1, key2) else {
+        NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
+        return StructUpsertResult {
+            err: ErrorCode::CapacityExceeded,
+            pos: 0,
+        };
+    };
+    let row = smap.row_off(result.pos);
+    let mut prior = RowPrior::new();
+    if undo.enabled && !result.is_new {
+        capture_struct_map2_row_prior(state, &smap, row, &mut prior);
+    }
+    smap.clear_bitset(state, row);
+    for (index, &val_col) in val_cols.iter().enumerate() {
+        smap.write_scalar_field(
+            state,
+            result.pos,
+            field_idxs[index],
+            cols,
+            val_col,
+            element_idx,
+        );
+    }
+    if undo.enabled {
+        emit_struct_map2_upsert_journal(
+            undo,
+            delta_mode,
+            state,
+            &smap,
+            slot,
+            key1,
+            key2,
+            result.pos,
+            result.is_new,
+            &prior,
+        );
+    }
+    let meta_base = slot_meta_base(slot);
+    state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |= if result.is_new {
+        ChangeFlag::INSERTED
+    } else {
+        ChangeFlag::UPDATED
+    };
+    StructUpsertResult {
+        err: ErrorCode::Ok,
+        pos: result.pos,
+    }
+}
+
+fn single_struct_map2_remove(
+    undo: &mut UndoState,
+    delta_mode: bool,
+    state: &mut [u8],
+    slot: u8,
+    key1: u32,
+    key2: u32,
+) -> ErrorCode {
+    if key1 == EMPTY_KEY || key1 == TOMBSTONE {
+        return ErrorCode::InvalidKey;
+    }
+    let smap = StructMap2Slot::bind(state, slot);
+    let Some(pos) = smap.find(state, key1, key2) else {
+        return ErrorCode::Ok;
+    };
+    let row = smap.row_off(pos);
+    let mut prior = RowPrior::new();
+    if undo.enabled {
+        capture_struct_map2_row_prior(state, &smap, row, &mut prior);
+    }
+    let removed = smap.remove(state, key1, key2);
+    debug_assert_eq!(removed, Some(pos));
+    smap.clear_bitset(state, row);
+    if undo.enabled {
+        emit_struct_map2_remove_journal(undo, delta_mode, state, &smap, slot, key1, key2, &prior);
+    }
+    state[(slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS) as usize] |= ChangeFlag::REMOVED;
+    ErrorCode::Ok
 }
 
 //#region axe!n/reduce-typed-state.probe-upsert
@@ -1996,7 +2340,12 @@ fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
             let operands = decode_struct_map_upsert_operands(code, pc.checked_add(1)?, op == 0x82)?;
             operands.end.checked_sub(pc)?
         }
+        0x83 => {
+            let operands = decode_struct_map2_upsert_operands(code, pc.checked_add(1)?)?;
+            operands.end.checked_sub(pc)?
+        }
         0x84 => 3,
+        0x86 => 4,
         0x85 => {
             let num_vals = usize::from(*code.get(pc.checked_add(2)?)?);
             3usize.checked_add(num_vals.checked_mul(2)?)?
@@ -2589,6 +2938,66 @@ impl Vm {
                         if result.err == ErrorCode::CapacityExceeded {
                             NEEDS_GROWTH_SLOT.store(operands.slot, Ordering::Relaxed);
                             return NEEDS_GROWTH;
+                        }
+                    }
+                }
+
+                Opcode::BatchStructMap2UpsertLast => {
+                    let Some(operands) = decode_struct_map2_upsert_operands(code, pc) else {
+                        return INVALID_PROGRAM;
+                    };
+                    pc = operands.end;
+                    let pairs_end = operands.scalar_pairs_start + operands.num_vals * 2;
+                    let mut val_cols = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
+                    let mut field_idxs = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
+                    for (index, pair) in code[operands.scalar_pairs_start..pairs_end]
+                        .chunks_exact(2)
+                        .enumerate()
+                    {
+                        val_cols[index] = pair[0];
+                        field_idxs[index] = pair[1];
+                    }
+                    let keys1 = col_u32(col_at(cols, usize::from(operands.key1_col)), batch_len);
+                    let keys2 = col_u32(col_at(cols, usize::from(operands.key2_col)), batch_len);
+                    for i in 0..batch_len {
+                        let index = usize::try_from(i).expect("batch index fits usize");
+                        let result = single_struct_map2_upsert_last(
+                            &mut self.undo,
+                            delta_mode,
+                            state,
+                            operands.slot,
+                            keys1[index],
+                            keys2[index],
+                            &val_cols[..operands.num_vals],
+                            &field_idxs[..operands.num_vals],
+                            cols,
+                            i,
+                        );
+                        if result.err == ErrorCode::CapacityExceeded {
+                            return NEEDS_GROWTH;
+                        }
+                        if result.err != ErrorCode::Ok {
+                            return result.err as u32;
+                        }
+                    }
+                }
+
+                Opcode::BatchStructMap2Remove => {
+                    let (slot, key1_col, key2_col) = (code[pc], code[pc + 1], code[pc + 2]);
+                    pc += 3;
+                    let keys1 = col_u32(col_at(cols, usize::from(key1_col)), batch_len);
+                    let keys2 = col_u32(col_at(cols, usize::from(key2_col)), batch_len);
+                    for index in 0..batch_len as usize {
+                        let result = single_struct_map2_remove(
+                            &mut self.undo,
+                            delta_mode,
+                            state,
+                            slot,
+                            keys1[index],
+                            keys2[index],
+                        );
+                        if result != ErrorCode::Ok {
+                            return result as u32;
                         }
                     }
                 }
@@ -3349,6 +3758,57 @@ impl Vm {
                                 return NEEDS_GROWTH;
                             }
                         }
+                    }
+                }
+
+                // Exact two-lane struct map upsert/remove.
+                0x83 => {
+                    let Some(operands) = decode_struct_map2_upsert_operands(body, bpc + 1) else {
+                        return INVALID_PROGRAM;
+                    };
+                    bpc = operands.end;
+                    let pairs_end = operands.scalar_pairs_start + operands.num_vals * 2;
+                    let mut val_cols = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
+                    let mut field_idxs = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
+                    for (index, pair) in body[operands.scalar_pairs_start..pairs_end]
+                        .chunks_exact(2)
+                        .enumerate()
+                    {
+                        val_cols[index] = pair[0];
+                        field_idxs[index] = pair[1];
+                    }
+                    let result = single_struct_map2_upsert_last(
+                        &mut self.undo,
+                        delta_mode,
+                        state,
+                        operands.slot,
+                        cell_u32(cols, operands.key1_col, child_idx),
+                        cell_u32(cols, operands.key2_col, child_idx),
+                        &val_cols[..operands.num_vals],
+                        &field_idxs[..operands.num_vals],
+                        cols,
+                        child_idx,
+                    );
+                    if result.err == ErrorCode::CapacityExceeded {
+                        return NEEDS_GROWTH;
+                    }
+                    if result.err != ErrorCode::Ok {
+                        return result.err as u32;
+                    }
+                }
+                0x86 => {
+                    let (slot, key1_col, key2_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
+                    bpc += 4;
+                    let result = single_struct_map2_remove(
+                        &mut self.undo,
+                        delta_mode,
+                        state,
+                        slot,
+                        cell_u32(cols, key1_col, child_idx),
+                        cell_u32(cols, key2_col, child_idx),
+                    );
+                    if result != ErrorCode::Ok {
+                        return result as u32;
                     }
                 }
 
@@ -4280,4 +4740,69 @@ pub fn vm_struct_map_iter_next(
 /// vm.zig:3613 `vm_struct_map_iter_key`.
 pub fn vm_struct_map_iter_key(state: &[u8], slot_offset: u32, num_fields: u32, pos: u32) -> u32 {
     bytes::read_u32(state, slot_offset + align8(num_fields) + pos * 4)
+}
+
+/// Exact pair point lookup for the two-key struct-map ABI.
+pub fn vm_struct_map2_get_row_ptr(
+    state: &[u8],
+    slot_offset: u32,
+    capacity: u32,
+    num_fields: u32,
+    row_size: u32,
+    key1: u32,
+    key2: u32,
+) -> u32 {
+    if key1 == EMPTY_KEY || key1 == TOMBSTONE {
+        return u32::MAX;
+    }
+    let descriptor_size = align8(num_fields);
+    let keys1 = slot_offset + descriptor_size;
+    let keys2 = keys1 + capacity * 4;
+    let rows = keys2 + capacity * 4;
+    let mut pos = columine_types::types::hash_key_pair(key1, key2, capacity);
+    for _ in 0..capacity {
+        let first = bytes::read_u32(state, keys1 + pos * 4);
+        if first == EMPTY_KEY {
+            return u32::MAX;
+        }
+        if first == key1 && bytes::read_u32(state, keys2 + pos * 4) == key2 {
+            return rows + pos * row_size;
+        }
+        pos = (pos + 1) & (capacity - 1);
+    }
+    u32::MAX
+}
+
+pub fn vm_struct_map2_iter_start(
+    state: &[u8],
+    slot_offset: u32,
+    capacity: u32,
+    num_fields: u32,
+) -> u32 {
+    vm_struct_map_iter_start(state, slot_offset, capacity, num_fields)
+}
+
+pub fn vm_struct_map2_iter_next(
+    state: &[u8],
+    slot_offset: u32,
+    capacity: u32,
+    num_fields: u32,
+    current: u32,
+) -> u32 {
+    vm_struct_map_iter_next(state, slot_offset, capacity, num_fields, current)
+}
+
+pub fn vm_struct_map2_iter_key1(state: &[u8], slot_offset: u32, num_fields: u32, pos: u32) -> u32 {
+    vm_struct_map_iter_key(state, slot_offset, num_fields, pos)
+}
+
+pub fn vm_struct_map2_iter_key2(
+    state: &[u8],
+    slot_offset: u32,
+    capacity: u32,
+    num_fields: u32,
+    pos: u32,
+) -> u32 {
+    let keys1 = slot_offset + align8(num_fields);
+    bytes::read_u32(state, keys1 + capacity * 4 + pos * 4)
 }

@@ -33,6 +33,8 @@ pub enum Opcode {
     SlotStructMap = 0x18,
     /// Ordered list slot — append-only sequential storage (scalar or struct rows).
     SlotOrderedList = 0x19,
+    /// Exact two-u32-key struct map; physical slot kind 10.
+    SlotStructMap2 = 0x1b,
     /// `keyBy(field).keepValue(latest('timestamp'))` —
     /// slot:u8, key_col:u8, val_col:u8, ts_col:u8, cmp_type:u8 (0=u32, 1=f64, 2=i64)
     BatchMapUpsertLatest = 0x20,
@@ -106,10 +108,14 @@ pub enum Opcode {
     /// Upsert the whole row only when its mapped scalar comparison field is
     /// strictly greater. Encoding is 0x80 plus comparison_field_idx:u8.
     BatchStructMapUpsertMax = 0x82,
+    /// Exact two-key row replacement: slot,key1_col,key2_col,count,pairs.
+    BatchStructMap2UpsertLast = 0x83,
     /// Append scalar value to ordered list.
     ListAppend = 0x84,
     /// Append struct row to ordered list.
     ListAppendStruct = 0x85,
+    /// Exact two-key row removal: slot,key1_col,key2_col.
+    BatchStructMap2Remove = 0x86,
     /// Type-discriminated event loop with multi-match support.
     ForEach = 0xe0,
     /// Flat-map expansion over nested-array offsets.
@@ -146,6 +152,7 @@ pub enum SlotType {
     StructMap = 6,
     OrderedList = 7,
     Bitmap = 8,
+    StructMap2 = 10,
 }
 
 /// Field storage type for STRUCT_MAP and ORDERED_LIST struct rows.
@@ -275,6 +282,7 @@ pub enum ErrorCode {
     InvalidState = 4,
     NeedsGrowth = 5,
     ArenaOverflow = 6,
+    InvalidKey = 7,
 }
 
 #[cfg(test)]

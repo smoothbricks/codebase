@@ -426,6 +426,91 @@ pub unsafe extern "C" fn vm_struct_map_iter_key(
     )
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vm_struct_map2_get_row_ptr(
+    state_base_ptr: *const u8,
+    slot_offset: u32,
+    capacity: u32,
+    num_fields: u32,
+    row_size: u32,
+    key1: u32,
+    key2: u32,
+) -> u32 {
+    vmops::vm_struct_map2_get_row_ptr(
+        unsafe { state_ref(state_base_ptr) },
+        slot_offset,
+        capacity,
+        num_fields,
+        row_size,
+        key1,
+        key2,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vm_struct_map2_iter_start(
+    state_base_ptr: *const u8,
+    slot_offset: u32,
+    capacity: u32,
+    num_fields: u32,
+) -> u32 {
+    vmops::vm_struct_map2_iter_start(
+        unsafe { state_ref(state_base_ptr) },
+        slot_offset,
+        capacity,
+        num_fields,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vm_struct_map2_iter_next(
+    state_base_ptr: *const u8,
+    slot_offset: u32,
+    capacity: u32,
+    num_fields: u32,
+    current: u32,
+) -> u32 {
+    vmops::vm_struct_map2_iter_next(
+        unsafe { state_ref(state_base_ptr) },
+        slot_offset,
+        capacity,
+        num_fields,
+        current,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vm_struct_map2_iter_key1(
+    state_base_ptr: *const u8,
+    slot_offset: u32,
+    num_fields: u32,
+    pos: u32,
+) -> u32 {
+    vmops::vm_struct_map2_iter_key1(
+        unsafe { state_ref(state_base_ptr) },
+        slot_offset,
+        num_fields,
+        pos,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vm_struct_map2_iter_key2(
+    state_base_ptr: *const u8,
+    slot_offset: u32,
+    capacity: u32,
+    num_fields: u32,
+    pos: u32,
+) -> u32 {
+    vmops::vm_struct_map2_iter_key2(
+        unsafe { state_ref(state_base_ptr) },
+        slot_offset,
+        capacity,
+        num_fields,
+        pos,
+    )
+}
+
 // =============================================================================
 // Undo / checkpoint / delta segments (vm.zig exports)
 // =============================================================================

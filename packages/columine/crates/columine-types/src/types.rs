@@ -128,6 +128,9 @@ pub enum SlotType {
     OrderedList = 7,
     Bitmap = 8,
     Nested = 9,
+    /// Two-u32-key struct map. Separate kind preserves StructMap's compact
+    /// one-key physical layout and probe hot path.
+    StructMap2 = 10,
 }
 
 impl SlotType {
@@ -143,6 +146,7 @@ impl SlotType {
             7 => Some(Self::OrderedList),
             8 => Some(Self::Bitmap),
             9 => Some(Self::Nested),
+            10 => Some(Self::StructMap2),
             _ => None,
         }
     }
@@ -435,6 +439,11 @@ pub enum Opcode {
     /// Same row operands as 0x80 followed by comparison_field_idx:u8; replaces
     /// only when the incoming scalar comparison is strictly greater.
     BatchStructMapUpsertMax = 0x82,
+    /// slot:u8, key1_col:u8, key2_col:u8, num_vals:u8,
+    /// [val_col:u8, field_idx:u8] × num_vals
+    BatchStructMap2UpsertLast = 0x83,
+    /// slot:u8, key1_col:u8, key2_col:u8
+    BatchStructMap2Remove = 0x86,
     /// slot:u8, val_col:u8 (body opcode inside FOR_EACH/FLAT_MAP blocks)
     ListAppend = 0x84,
     /// slot:u8, num_vals:u8, \[(val_col:u8, field_idx:u8) × N\]
@@ -444,6 +453,9 @@ pub enum Opcode {
     /// slot:u8, outer_type_flags:u8, outer_cap_lo:u8, outer_cap_hi:u8, inner_type:u8,
     /// inner_cap_lo:u8, inner_cap_hi:u8, inner_agg_type:u8
     SlotNested = 0x1a,
+    /// slot:u8, type_flags:u8, cap_lo:u8, cap_hi:u8, num_fields:u8,
+    /// [field_type:u8 × num_fields]
+    SlotStructMap2 = 0x1b,
     /// slot:u8, outer_key_col:u8, elem_col:u8 (body opcode inside FOR_EACH blocks)
     NestedSetInsert = 0x90,
     /// slot:u8, outer_key_col:u8, inner_key_col:u8, val_col:u8 (body opcode)
@@ -470,6 +482,7 @@ impl Opcode {
             0x18 => Self::SlotStructMap,
             0x19 => Self::SlotOrderedList,
             0x1a => Self::SlotNested,
+            0x1b => Self::SlotStructMap2,
             0x20 => Self::BatchMapUpsertLatest,
             0x21 => Self::BatchMapUpsertFirst,
             0x22 => Self::BatchMapUpsertLast,
@@ -515,8 +528,10 @@ impl Opcode {
             0x80 => Self::BatchStructMapUpsertLast,
             0x81 => Self::BatchStructMapUpsertFirst,
             0x82 => Self::BatchStructMapUpsertMax,
+            0x83 => Self::BatchStructMap2UpsertLast,
             0x84 => Self::ListAppend,
             0x85 => Self::ListAppendStruct,
+            0x86 => Self::BatchStructMap2Remove,
             0x90 => Self::NestedSetInsert,
             0x92 => Self::NestedMapUpsertLast,
             0x95 => Self::NestedAggUpdate,
@@ -537,6 +552,8 @@ pub enum ErrorCode {
     InvalidState = 4,
     NeedsGrowth = 5,
     ArenaOverflow = 6,
+    /// Reserved StructMap2 lane-1 sentinel supplied as reducer data.
+    InvalidKey = 7,
 }
 
 pub const fn hash_key(key: u32, cap: u32) -> u32 {
@@ -546,6 +563,20 @@ pub const fn hash_key(key: u32, cap: u32) -> u32 {
     h ^= h >> 13;
     h = h.wrapping_mul(0xc2b2_ae35);
     h ^= h >> 16;
+    (h as u32) & (cap - 1)
+}
+
+/// Stable probe-placement hash for an exact pair of u32 key lanes.
+///
+/// The hash never establishes identity: callers must compare both lanes.
+/// Packing is allocation-free and preserves every input bit.
+pub const fn hash_key_pair(first: u32, second: u32, cap: u32) -> u32 {
+    let mut h = (first as u64) | ((second as u64) << 32);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^= h >> 31;
     (h as u32) & (cap - 1)
 }
 
