@@ -52,9 +52,9 @@
     "hermesRelease": "1.0.0",
     "os": "darwin-arm64",
     "reactNative": "0.86.0",
-    "ttscMetro": "0.18.4",
+    "ttscMetro": "0.19.1",
     "typescriptNxHost": "6.0.3",
-    "typescriptTtscMetro": "7.0.2"
+    "typescriptTtscMetro": "6.0.3"
   },
   "finding": "The already-landed optimization stack is materially faster than the historical foundation on browser and Hermes. Ten additional candidates reached diminishing returns: one was already present and nine were neutral or regressive on at least one required engine, so every experimental delta was reverted.",
   "generatedAt": "2026-07-14",
