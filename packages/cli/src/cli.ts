@@ -147,9 +147,23 @@ function buildProgram(): Command {
     .command('repair-pending')
     .description('Repair incomplete older release commits before releasing the current HEAD')
     .option('--dry-run [dryRun]', 'run without pushing, publishing, or writing GitHub Releases')
-    .action(async (options: { dryRun?: string | boolean }) => {
+    .option('--ref <ref>', 'fixed release graph ref to inspect')
+    .option('--platform-outputs <path>', 'cross-platform repair outputs grouped by release SHA')
+    .action(async (options: { dryRun?: string | boolean; platformOutputs?: string; ref?: string }) => {
+      // The source self-hosting shim has no Typia transform; release commands import transformed output validators.
       const { releaseRepairPending } = await import('./release/index.js');
       await releaseRepairPending(await findRepoRoot(), { ...options, dryRun: booleanOption(options.dryRun) });
+    });
+  release
+    .command('build-repair-platform-outputs')
+    .description('Build platform outputs needed to repair incomplete older releases')
+    .requiredOption('--targets <targets>', 'comma-separated Nx platform target names or globs')
+    .requiredOption('--output <path>', 'output directory grouped by release SHA')
+    .option('--ref <ref>', 'fixed release graph ref to inspect')
+    .action(async (options: { output: string; ref?: string; targets: string }) => {
+      // The source self-hosting shim has no Typia transform; release commands import transformed output validators.
+      const { releaseCollectRepairPlatformOutputs } = await import('./release/index.js');
+      await releaseCollectRepairPlatformOutputs(await findRepoRoot(), options);
     });
   release
     .command('version')
@@ -333,12 +347,9 @@ function buildProgram(): Command {
     .command('apply-outputs <directories...>')
     .requiredOption('--source-sha <sha>', 'expected source commit SHA')
     .action(async (directories: string[], options: { sourceSha: string }) => {
-      if (import.meta.url.endsWith('/src/cli.ts')) {
-        // Self-hosted source needs the Typia Bun transform registered before loading the manifest boundary.
-        await import('@smoothbricks/validation/bun/preload');
-      }
-      const { applyCollectedOutputs } = await import('./github-ci/outputs.js');
-      await applyCollectedOutputs(await findRepoRoot(), directories, options.sourceSha);
+      // GitHub CI commands stay lazy so source self-hosting can initialize Typia only at manifest boundaries.
+      const { githubCiApplyOutputs } = await import('./github-ci/index.js');
+      await githubCiApplyOutputs(await findRepoRoot(), directories, options.sourceSha);
     });
   githubCi
     .command('nx-deploy')

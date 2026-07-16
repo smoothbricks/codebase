@@ -2,7 +2,9 @@ import { describe, expect, it } from 'bun:test';
 import { type ReleasePackageInfo, type ReleaseTarget, releaseTag } from '../core.js';
 import {
   bumpStableReleaseToNext,
+  collectRepairPlatformOutputs,
   completeReleaseAtHead,
+  type ReleaseRepairOutputsShell,
   type ReleaseRepairShell,
   type ReleaseVersionShell,
   repairPendingTargets,
@@ -32,6 +34,7 @@ describe('release orchestration', () => {
     expect(shell.checkouts).toEqual(['older-release', 'restore-ref']);
     expect(shell.devenvLoads).toBe(2);
     expect(shell.devenvRefs).toEqual(['older-release', 'restore-ref']);
+    expect(shell.prepares).toEqual(['older-release']);
     expect(shell.builds).toEqual([['@scope/stable']]);
     expect(shell.publishes).toEqual([{ name: '@scope/stable', distTag: 'latest', dryRun: false }]);
     expect(shell.githubCreates).toEqual([{ name: '@scope/prerelease', dryRun: false }]);
@@ -77,6 +80,29 @@ describe('release orchestration', () => {
         noRelease: false,
       },
     ]);
+  });
+
+  it('collects historical platform outputs only for npm-missing repair targets', async () => {
+    const githubOnly = releaseTarget('github-only', [prerelease], [], [prerelease]);
+    const npmMissing = releaseTarget('npm-missing', [stable], [stable], []);
+    const shell = new RecordingRepairOutputsShell();
+
+    await collectRepairPlatformOutputs(shell, [githubOnly, npmMissing], 'restore-ref');
+
+    expect(shell.checkouts).toEqual(['npm-missing', 'restore-ref']);
+    expect(shell.devenvRefs).toEqual(['npm-missing', 'restore-ref']);
+    expect(shell.collected).toEqual(['npm-missing']);
+  });
+
+  it('does nothing when no pending release needs npm platform outputs', async () => {
+    const shell = new RecordingRepairOutputsShell();
+    const githubOnly = releaseTarget('github-only', [prerelease], [], [prerelease]);
+
+    await collectRepairPlatformOutputs(shell, [githubOnly], 'restore-ref');
+
+    expect(shell.checkouts).toEqual([]);
+    expect(shell.devenvRefs).toEqual([]);
+    expect(shell.collected).toEqual([]);
   });
 
   it('publishes a partial HEAD release by building npm-missing packages and creating missing GitHub Releases', async () => {
@@ -221,10 +247,15 @@ class RecordingRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
   currentRef = 'head';
   private readonly npmMissing: Set<string>;
   private readonly githubMissing: Set<string>;
+  readonly prepares: string[] = [];
 
   constructor(options: { npmMissing?: string[]; githubMissing?: string[] } = {}) {
     this.npmMissing = new Set(options.npmMissing ?? []);
     this.githubMissing = new Set(options.githubMissing ?? []);
+  }
+
+  async prepareRepairTarget(target: ReleaseTarget<ReleasePackageInfo>): Promise<void> {
+    this.prepares.push(target.sha);
   }
 
   async gitHead(): Promise<string> {
@@ -268,6 +299,27 @@ class RecordingRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
     this.devenvLoads += 1;
     this.devenvRefs.push(this.currentRef);
     return runWithEnv();
+  }
+}
+
+class RecordingRepairOutputsShell implements ReleaseRepairOutputsShell<ReleasePackageInfo> {
+  readonly checkouts: string[] = [];
+  readonly collected: string[] = [];
+  readonly devenvRefs: string[] = [];
+  private currentRef = 'head';
+
+  async checkout(ref: string): Promise<void> {
+    this.currentRef = ref;
+    this.checkouts.push(ref);
+  }
+
+  async withDevenvEnv<T>(runWithEnv: () => Promise<T>): Promise<T> {
+    this.devenvRefs.push(this.currentRef);
+    return runWithEnv();
+  }
+
+  async collectRepairTargetOutputs(target: ReleaseTarget<ReleasePackageInfo>): Promise<void> {
+    this.collected.push(target.sha);
   }
 }
 

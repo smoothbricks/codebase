@@ -1,9 +1,10 @@
 import { appendFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
 import { $ } from 'bun';
+import { githubCiApplyOutputs, githubCiNxRunMany } from '../github-ci/index.js';
 import { assertNoConflictMarkers } from '../lib/conflict-markers.js';
 import { withDevenvEnv } from '../lib/devenv.js';
 import { isRecord, readJsonObject, stringProperty } from '../lib/json.js';
@@ -35,8 +36,11 @@ import {
 import { publishWithAuthDiagnostics } from './npm-auth.js';
 import {
   bumpStableReleaseToNext,
+  collectRepairPlatformOutputs,
   completeReleaseAtHead as completeReleaseAtHeadWithShell,
   type ReleaseCompletionShell,
+  type ReleaseRepairOutputsShell,
+  type ReleaseRepairShell,
   type ReleaseSummary,
   type ReleaseVersionMode,
   repairPendingTargets,
@@ -57,6 +61,14 @@ export interface ReleasePublishOptions {
 
 export interface ReleaseRepairPendingOptions {
   dryRun?: boolean;
+  platformOutputs?: string;
+  ref?: string;
+}
+
+export interface ReleaseRepairPlatformOutputsOptions {
+  output: string;
+  ref?: string;
+  targets: string;
 }
 
 export interface ReleaseTrustPublisherOptions {
@@ -162,24 +174,35 @@ export async function releasePublish(root: string, options: ReleasePublishOption
 }
 
 export async function releaseRepairPending(root: string, options: ReleaseRepairPendingOptions): Promise<void> {
-  const branch = await releaseBranch(root);
-  const remote = await releaseRemote(root, branch);
-  console.log(`Repair pending releases: fetching ${remote}/${branch} and tags.`);
-  await fetchReleaseRefs(root, remote, branch);
-  const remoteRef = `${remote}/${branch}`;
-  const restoreRef = (await gitRefExists(root, remoteRef)) ? remoteRef : await gitHead(root);
-  console.log(`Repair pending releases: planning from ${restoreRef}.`);
-  const targets = await listPendingReleaseTargets(root, restoreRef);
-  console.log(
-    targets.length === 0
-      ? 'Repair pending releases: no pending durable state repairs found.'
-      : `Repair pending releases: ${targets.length} release target${targets.length === 1 ? '' : 's'} need repair.`,
+  const repairRef = await fetchReleaseRepairRef(root, options.ref);
+  const restoreRef = options.ref ? await gitHead(root) : repairRef;
+  console.log(`Repair pending releases: planning from ${repairRef}.`);
+  const targets = await listPendingReleaseTargets(root, repairRef);
+  logPendingReleaseTargets(targets);
+  const platformOutputs = options.platformOutputs ? resolve(root, options.platformOutputs) : undefined;
+  const summaries = await repairPendingTargets(
+    releaseRepairShell(root, platformOutputs),
+    targets,
+    restoreRef,
+    options.dryRun === true,
   );
-  for (const target of targets) {
-    console.log(`Repair pending releases: target ${target.sha.slice(0, 12)} needs ${repairTargetSummary(target)}.`);
-  }
-  const summaries = await repairPendingTargets(releaseRepairShell(root), targets, restoreRef, options.dryRun === true);
   await writeRepairSummary(summaries, options.dryRun === true);
+}
+
+export async function releaseCollectRepairPlatformOutputs(
+  root: string,
+  options: ReleaseRepairPlatformOutputsOptions,
+): Promise<void> {
+  const restoreRef = await gitHead(root);
+  const repairRef = await fetchReleaseRepairRef(root, options.ref);
+  console.log(`Repair platform outputs: planning from ${repairRef}.`);
+  const targets = await listPendingReleaseTargets(root, repairRef);
+  logPendingReleaseTargets(targets);
+  await collectRepairPlatformOutputs(
+    releaseRepairOutputsShell(root, options.targets, resolve(root, options.output)),
+    targets,
+    restoreRef,
+  );
 }
 
 export async function releaseTrustPublisher(root: string, options: ReleaseTrustPublisherOptions): Promise<void> {
@@ -854,22 +877,47 @@ function releaseNextShell(root: string): { bumpStablePackagesToNext(packages: Re
   };
 }
 
-function releaseRepairShell(root: string): ReleaseCompletionShell<ReleasePackage> & {
-  checkout(ref: string): Promise<void>;
-  withDevenvEnv<T>(runWithEnv: () => Promise<T>): Promise<T>;
-  beforeRepairTarget(target: ReleaseTarget): void;
-  afterRepairTarget(target: ReleaseTarget): void;
-} {
+function releaseTargetCheckoutShell(root: string) {
   return {
-    ...releaseCompletionShell(root),
-    checkout: (ref) => run('git', ['switch', '--detach', ref], root),
-    withDevenvEnv: (runWithEnv) => withDevenvEnv(root, runWithEnv),
-    beforeRepairTarget: (target) => {
+    checkout: (ref: string) => run('git', ['switch', '--detach', ref], root),
+    withDevenvEnv: <T>(runWithEnv: () => Promise<T>) => withDevenvEnv(root, runWithEnv),
+    beforeRepairTarget: (target: ReleaseTarget) => {
       console.log(`::group::Repair pending release ${target.sha.slice(0, 12)} (${packageSummary(target.packages)})`);
     },
     afterRepairTarget: () => {
       console.log('::endgroup::');
     },
+  };
+}
+
+function releaseRepairShell(root: string, platformOutputs?: string): ReleaseRepairShell<ReleasePackage> {
+  return {
+    ...releaseCompletionShell(root),
+    ...releaseTargetCheckoutShell(root),
+    prepareRepairTarget: async (target) => {
+      if (!platformOutputs || target.npmPackages.length === 0) {
+        return;
+      }
+      const output = join(platformOutputs, target.sha);
+      console.log(`Repair pending releases: applying cross-platform outputs from ${output}.`);
+      await githubCiApplyOutputs(root, [output], target.sha);
+    },
+  };
+}
+
+function releaseRepairOutputsShell(
+  root: string,
+  targetGlobs: string,
+  outputRoot: string,
+): ReleaseRepairOutputsShell<ReleasePackage> {
+  return {
+    ...releaseTargetCheckoutShell(root),
+    collectRepairTargetOutputs: (target) =>
+      githubCiNxRunMany(root, {
+        targets: targetGlobs,
+        projects: releasePackageProjects(target.npmPackages),
+        collectOutputs: join(outputRoot, target.sha),
+      }),
   };
 }
 
@@ -888,6 +936,29 @@ function releaseRetagShell(root: string, remote: string) {
       run('gh', ['workflow', 'run', workflow, '--ref', branch, '-f', 'bump=auto', '-f', 'dry_run=false'], root),
     log: (message: string) => console.log(message),
   };
+}
+
+async function fetchReleaseRepairRef(root: string, requestedRef?: string): Promise<string> {
+  const branch = await releaseBranch(root);
+  const remote = await releaseRemote(root, branch);
+  console.log(`Repair pending releases: fetching ${remote}/${branch} and tags.`);
+  await fetchReleaseRefs(root, remote, branch);
+  if (requestedRef) {
+    return requestedRef;
+  }
+  const remoteRef = `${remote}/${branch}`;
+  return (await gitRefExists(root, remoteRef)) ? remoteRef : gitHead(root);
+}
+
+function logPendingReleaseTargets(targets: ReleaseTarget[]): void {
+  console.log(
+    targets.length === 0
+      ? 'Repair pending releases: no pending durable state repairs found.'
+      : `Repair pending releases: ${targets.length} release target${targets.length === 1 ? '' : 's'} need repair.`,
+  );
+  for (const target of targets) {
+    console.log(`Repair pending releases: target ${target.sha.slice(0, 12)} needs ${repairTargetSummary(target)}.`);
+  }
 }
 
 async function listPendingReleaseTargets(root: string, ref: string): Promise<ReleaseTarget[]> {
@@ -1115,7 +1186,8 @@ function repairReasons(target: ReleaseTarget, pkg: ReleasePackage): string[] {
 }
 
 async function fetchReleaseRefs(root: string, remote: string, branch: string): Promise<void> {
-  await run('git', ['fetch', '--tags', remote, branch], root);
+  // `retag-unpublished` intentionally moves repairable tags, so the remote tag is authoritative.
+  await run('git', ['fetch', '--force', '--tags', remote, branch], root);
 }
 
 async function gitRefExists(root: string, ref: string): Promise<boolean> {
