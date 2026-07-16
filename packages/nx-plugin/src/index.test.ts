@@ -5,21 +5,10 @@ import { dirname, join } from 'node:path';
 
 import type { CreateNodesContextV2, TargetConfiguration } from 'nx/src/devkit-exports.js';
 import { createNodesV2 } from './index.js';
+import { BUILD_OUTPUT_DEPENDENCIES } from './workspace-config-policy.js';
 
 const [, inferTargets] = createNodesV2;
-const buildOutputDependencies = [
-  '^build',
-  '*-js',
-  '*-web',
-  '*-html',
-  '*-css',
-  '*-ios',
-  '*-android',
-  '*-native',
-  '*-napi',
-  '*-bun',
-  '*-wasm',
-];
+const buildOutputDependencies = ['^build', ...BUILD_OUTPUT_DEPENDENCIES];
 
 describe('@smoothbricks/nx-plugin inferred targets', () => {
   it('names standalone package projects from package metadata', async () => {
@@ -199,6 +188,35 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets.build?.executor).toBe('nx:noop');
       expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
       expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('keeps platform-only output families out of the ordinary aggregate build', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write(
+        'packages/platform/package.json',
+        JSON.stringify({
+          name: 'platform',
+          nx: {
+            targets: {
+              'bundle-ios': { executor: 'nx:run-commands' },
+              'bundle-macos': { executor: 'nx:run-commands' },
+              'bundle-linux': { executor: 'nx:run-commands' },
+            },
+          },
+        }),
+      );
+
+      const targets = await inferProjectTargets(workspace, 'packages/platform/package.json');
+
+      expect(targets.build).toBeUndefined();
+      expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
+      expect(BUILD_OUTPUT_DEPENDENCIES).not.toContain('*-ios');
+      expect(BUILD_OUTPUT_DEPENDENCIES).not.toContain('*-macos');
+      expect(BUILD_OUTPUT_DEPENDENCIES).not.toContain('*-linux');
     } finally {
       await workspace.cleanup();
     }
