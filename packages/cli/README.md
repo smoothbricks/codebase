@@ -228,27 +228,30 @@ candidates to downstream dependents because that would duplicate Nx's dependency
 
 `smoo` keeps Nx target names predictable and separates tool work from aggregate workflows.
 
-Official Nx plugins own targets they already know how to infer. For example, `@nx/js/typescript` owns TypeScript library
-builds, so a package `tsconfig.lib.json` produces the concrete target `tsc-js`.
-
-`@smoothbricks/nx-plugin` only fills SmoothBricks convention gaps that official plugins do not provide. Today that means
-Bun test typechecking, non-TypeScript build-tool steps, and aggregate targets.
+`@smoothbricks/nx-plugin` owns transformer-aware TypeScript targets because this workspace compiles through `ttsc`.
+Configuring `@nx/js/typescript` would run `tsc`/`tsgo` directly and bypass the Typia and LMAO transformers. A package
+`tsconfig.lib.json` therefore produces the concrete `tsc-js` target from the SmoothBricks plugin. The same plugin also
+infers Bun test typechecking, non-TypeScript build-tool steps, and aggregate targets.
 
 Concrete targets use `{tool}-{output}` names and describe the tool that runs and the artifact or purpose it produces:
 
-- `tsc-js` comes from the official TypeScript plugin and runs `tsc` for package JavaScript/declaration output.
+- `tsc-js` comes from `@smoothbricks/nx-plugin` and runs `ttsc` for package JavaScript/declaration output.
 - Packages that run `bun test` must have `tsconfig.test.json`. Bun executes tests without typechecking, so smoo creates
   a no-emit `typecheck-tests` target from that config and wires it into validation. Other test runners may own their own
   typecheck path.
 - Test tsconfigs are validation configs, not TypeScript build-mode projects. They must use `noEmit`, must not set
   `composite: true`, and package root `tsconfig.json` must not reference `./tsconfig.test.json`. The inferred
-  `typecheck-tests` target runs `tsc --noEmit -p tsconfig.test.json` after `build` instead.
+  `typecheck-tests` target runs `ttsc --noEmit -p tsconfig.test.json` after `build` instead.
 - Non-TypeScript build steps come from explicit tool configuration. For example, a package `build.zig` must expose named
   `b.step("name", ...)` entries; each non-reserved step becomes a `zig-name` target such as `zig-wasm`.
 - `build` is an aggregate. It exists only when there is at least one concrete build target such as `tsc-js`,
   `tsdown-js`, or another tool-output target, and it depends on output-family wildcards such as `*-js`, `*-web`,
   `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`, `*-bun`, and `*-wasm` instead of duplicating commands.
 - `lint` is an aggregate validation target. It is not a formatting target.
+
+`ttsc` owns the native TypeScript 7 compiler used by those targets. Nx and other JavaScript tooling still require the
+full TypeScript compiler API, so workspace `typescript` dependencies stay on TypeScript 6. Do not add
+`@typescript/native` unless the workspace starts invoking its `tsc` binary directly.
 
 Explicit Nx target names must not contain `:`. Nx already uses colon syntax at the CLI boundary:
 `project:target:configuration`. Allowing target names like `build:wasm` makes command parsing and package-script aliases
