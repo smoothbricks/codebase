@@ -191,40 +191,36 @@ describe('release planning with fixture git repositories', () => {
     });
   });
 
-  it('pushes current release refs to a local bare remote and another clone can fetch them', async () => {
+  it('pushes current release refs to a local bare remote', async () => {
     await withFixtureRepo(async (author) => {
       await writeWorkspace(author);
       await writeBuildablePackage(author, '@scope/pushed', 'packages/pushed', '1.0.0');
       await git(author, ['add', '.']);
       await git(author, ['commit', '-m', 'release pushed package']);
+      const releaseSha = await gitOutput(author, ['rev-parse', 'HEAD']);
       await git(author, ['init', '--bare', 'remote.git']);
       await git(author, ['remote', 'add', 'origin', join(author, 'remote.git')]);
       await git(author, ['push', 'origin', 'main']);
-      await git(author, ['clone', '--branch', 'main', join(author, 'remote.git'), 'runner']);
-      const runner = join(author, 'runner');
-      await git(runner, ['config', 'user.name', 'Test User']);
-      await git(runner, ['config', 'user.email', 'test@example.com']);
       const pkg: ReleasePackageInfo = {
         name: '@scope/pushed',
         projectName: 'pushed',
         path: 'packages/pushed',
         version: '1.0.0',
       };
-      const shell = new LocalGitRepairShell(runner);
+      const shell = new LocalGitRepairShell(author);
 
       const summary = await completeReleaseAtHead(shell, [pkg], false, false);
 
       expect(summary.pushed).toBe(true);
       expect(shell.pushes).toEqual([['pushed@1.0.0']]);
-      await git(author, ['clone', '--branch', 'main', join(author, 'remote.git'), 'auditor']);
-      const auditor = join(author, 'auditor');
-      await git(auditor, ['fetch', '--tags', 'origin', 'main']);
-      await expect(gitOutput(auditor, ['rev-parse', 'refs/tags/pushed@1.0.0^{}'])).resolves.toBe(
-        await gitOutput(runner, ['rev-parse', 'HEAD']),
-      );
-      await expect(gitSucceeds(auditor, ['rev-parse', '--verify', 'refs/tags/@scope/pushed@1.0.0'])).resolves.toBe(
-        false,
-      );
+      const remoteTags = await gitOutput(author, [
+        'ls-remote',
+        '--tags',
+        'origin',
+        'refs/tags/pushed@1.0.0^{}',
+        'refs/tags/@scope/pushed@1.0.0^{}',
+      ]);
+      expect(remoteTags).toBe(`${releaseSha}\trefs/tags/pushed@1.0.0^{}`);
     });
   });
 
