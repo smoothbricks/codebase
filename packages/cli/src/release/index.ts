@@ -8,7 +8,7 @@ import { githubCiApplyOutputs, githubCiNxRunMany } from '../github-ci/index.js';
 import { assertNoConflictMarkers } from '../lib/conflict-markers.js';
 import { withDevenvEnv } from '../lib/devenv.js';
 import { isRecord, readJsonObject, stringProperty } from '../lib/json.js';
-import { decode, run, runInteractiveStatus, runResult, runStatus } from '../lib/run.js';
+import { decode, run, runInteractiveStatus, runResult } from '../lib/run.js';
 import { listReleasePackages, readPackageJson, repositoryInfo } from '../lib/workspace.js';
 import { readPackedPackageJson, validatePackedWorkspaceDependencies } from '../monorepo/packed-manifest.js';
 import {
@@ -30,6 +30,7 @@ import {
 } from './core.js';
 import {
   createOrUpdateGithubRelease,
+  githubReleaseLookupExists,
   renderNxProjectChangelogContents,
   withNxWorkspaceRoot,
 } from './github-release.js';
@@ -1460,7 +1461,8 @@ async function pushRetaggedReleaseTags(
 }
 
 async function githubReleaseExists(root: string, tag: string): Promise<boolean> {
-  return (await runStatus('gh', ['release', 'view', tag, '--json', 'tagName'], root, true)) === 0;
+  const result = await $`gh release view ${tag} --json tagName`.cwd(root).quiet().nothrow();
+  return githubReleaseLookupExists(tag, result.exitCode, decode(result.stdout), decode(result.stderr));
 }
 
 function githubReleaseUrl(root: string, tag: string): string {
