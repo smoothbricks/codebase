@@ -10,9 +10,13 @@ import {
   applyWorkspaceConfig,
   applyWorkspaceConfigPolicy,
   applyWorkspaceConfigTree,
+  BUILD_OUTPUT_DEPENDENCIES,
   checkWorkspaceConfig,
   checkWorkspaceConfigPolicy,
   checkWorkspaceConfigTree,
+  LINUX_PLATFORM_TARGET_GLOBS,
+  MACOS_PLATFORM_TARGET_GLOBS,
+  PLATFORM_TARGET_GLOBS,
 } from './workspace-config-policy.js';
 
 // ---------------------------------------------------------------------------
@@ -55,6 +59,25 @@ function validPlugins(): unknown[] {
 // ---------------------------------------------------------------------------
 // Layer 1: Pure core function tests
 // ---------------------------------------------------------------------------
+
+describe('target family conventions', () => {
+  it('separates platform-only families from ordinary build outputs', () => {
+    expect(MACOS_PLATFORM_TARGET_GLOBS).toEqual(['*-macos', '*-ios']);
+    expect(LINUX_PLATFORM_TARGET_GLOBS).toEqual(['*-linux']);
+    expect(PLATFORM_TARGET_GLOBS).toEqual(['*-macos', '*-ios', '*-linux']);
+    expect(BUILD_OUTPUT_DEPENDENCIES).toEqual([
+      '*-js',
+      '*-web',
+      '*-html',
+      '*-css',
+      '*-android',
+      '*-native',
+      '*-napi',
+      '*-bun',
+      '*-wasm',
+    ]);
+  });
+});
 
 describe('pure core: checkWorkspaceConfig', () => {
   it('returns no issues for valid config', () => {
