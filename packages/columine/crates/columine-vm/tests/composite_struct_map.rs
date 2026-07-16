@@ -7,7 +7,7 @@ use columine_vm::state_init::{
     calculate_grown_state_size, calculate_state_size, grow_state, init_state,
 };
 use columine_vm::struct_map::{StructMap2Slot, StructMapSlot};
-use columine_vm::vm::{Vm, u32s_as_bytes, vm_struct_map2_get_row_ptr};
+use columine_vm::vm::{Vm, i64s_as_bytes, u32s_as_bytes, vm_struct_map2_get_row_ptr};
 
 const ADD: u32 = 0xadd0_0001;
 const REVOKE: u32 = 0xadd0_0002;
@@ -65,6 +65,27 @@ fn upsert_code(key1_col: u8, key2_col: u8, pairs: &[(u8, u8)]) -> Vec<u8> {
     code
 }
 
+fn max_i64x2_code(
+    key1_col: u8,
+    key2_col: u8,
+    pairs: &[(u8, u8)],
+    comparison1: (u8, u8),
+    comparison2: (u8, u8),
+) -> Vec<u8> {
+    let mut code = vec![
+        Opcode::BatchStructMap2UpsertMaxI64x2 as u8,
+        0,
+        key1_col,
+        key2_col,
+        pairs.len() as u8,
+    ];
+    for &(column, field) in pairs {
+        code.extend([column, field]);
+    }
+    code.extend([comparison1.0, comparison1.1, comparison2.0, comparison2.1]);
+    code
+}
+
 fn remove_code(key1_col: u8, key2_col: u8) -> Vec<u8> {
     vec![Opcode::BatchStructMap2Remove as u8, 0, key1_col, key2_col]
 }
@@ -102,6 +123,19 @@ fn permission(state: &[u8], principal: u32, resource: u32) -> Option<(u32, u32)>
     ))
 }
 
+fn max_winner(state: &[u8], key1: u32, key2: u32) -> Option<(u32, i64, i64)> {
+    let slot = StructMap2Slot::bind(state, 0);
+    let row = pair_row(state, key1, key2)?;
+    for field in 0..3 {
+        assert!(StructMapSlot::is_field_set(state, row, field));
+    }
+    Some((
+        bytes::read_u32(state, row + slot.field_offset(state, 0)),
+        bytes::read_i64(state, row + slot.field_offset(state, 1)),
+        bytes::read_i64(state, row + slot.field_offset(state, 2)),
+    ))
+}
+
 fn execute_u32(
     vm: &mut Vm,
     state: &mut [u8],
@@ -114,6 +148,36 @@ fn execute_u32(
         vm.execute_batch_delta(state, program, &raw, columns[0].len() as u32)
     } else {
         vm.execute_batch(state, program, &raw, columns[0].len() as u32)
+    }
+}
+
+fn execute_max_i64x2(
+    vm: &mut Vm,
+    state: &mut [u8],
+    program: &[u8],
+    key1: &[u32],
+    key2: &[u32],
+    payload: &[u32],
+    comparison1: &[i64],
+    comparison2: &[i64],
+    delta: bool,
+) -> u32 {
+    let len = key1.len();
+    assert_eq!(key2.len(), len);
+    assert_eq!(payload.len(), len);
+    assert_eq!(comparison1.len(), len);
+    assert_eq!(comparison2.len(), len);
+    let columns = [
+        u32s_as_bytes(key1),
+        u32s_as_bytes(key2),
+        u32s_as_bytes(payload),
+        i64s_as_bytes(comparison1),
+        i64s_as_bytes(comparison2),
+    ];
+    if delta {
+        vm.execute_batch_delta(state, program, &columns, len as u32)
+    } else {
+        vm.execute_batch(state, program, &columns, len as u32)
     }
 }
 
@@ -383,4 +447,223 @@ fn payload_free_graph_edges_and_unary_layout_remain_supported() {
     let meta_type = unary[(STATE_HEADER_SIZE + SlotMetaOffset::TYPE_FLAGS) as usize] & 0x0f;
     assert_eq!(meta_type, SlotType::StructMap as u8);
     assert_eq!(SLOT_META_SIZE, 48);
+}
+
+#[test]
+fn max_i64x2_uses_strict_signed_lexicographic_order_without_noop_undo() {
+    let reduce = max_i64x2_code(0, 1, &[(2, 0)], (3, 1), (4, 2));
+    let program = map2_program(4, &[0, 1, 1], 5, &reduce);
+    let mut state = init(&program);
+    let mut vm = Vm::default();
+
+    let key1 = [7; 6];
+    let key2 = [40; 6];
+    let payload = [10, 20, 30, 40, 50, 60];
+    let comparison1 = [i64::MIN, -5, -5, -5, i64::MAX, i64::MAX];
+    let comparison2 = [i64::MAX, i64::MIN, i64::MIN, 0, i64::MIN, i64::MIN];
+    assert_eq!(
+        OK,
+        execute_max_i64x2(
+            &mut vm,
+            &mut state,
+            &program,
+            &key1,
+            &key2,
+            &payload,
+            &comparison1,
+            &comparison2,
+            false,
+        )
+    );
+    assert_eq!(max_winner(&state, 7, 40), Some((50, i64::MAX, i64::MIN)));
+
+    assert_eq!(
+        OK,
+        execute_max_i64x2(
+            &mut vm,
+            &mut state,
+            &program,
+            &[7],
+            &[41],
+            &[70],
+            &[-1],
+            &[i64::MAX],
+            false,
+        )
+    );
+    assert_eq!(max_winner(&state, 7, 41), Some((70, -1, i64::MAX)));
+
+    vm.undo_enable(&state);
+    let before_noops = vm.undo_checkpoint();
+    let change_flags_offset = (STATE_HEADER_SIZE + SlotMetaOffset::CHANGE_FLAGS) as usize;
+    state[change_flags_offset] = 0;
+    assert_eq!(
+        OK,
+        execute_max_i64x2(
+            &mut vm,
+            &mut state,
+            &program,
+            &[7, 7],
+            &[40, 40],
+            &[80, 90],
+            &[i64::MAX, -1],
+            &[i64::MIN, i64::MAX],
+            true,
+        )
+    );
+    assert_eq!(vm.undo_checkpoint(), before_noops);
+    assert_eq!(state[change_flags_offset], 0);
+    assert_eq!(max_winner(&state, 7, 40), Some((50, i64::MAX, i64::MIN)));
+
+    assert_eq!(
+        OK,
+        execute_max_i64x2(
+            &mut vm,
+            &mut state,
+            &program,
+            &[7],
+            &[40],
+            &[100],
+            &[i64::MAX],
+            &[i64::MAX],
+            true,
+        )
+    );
+    assert!(vm.undo_checkpoint() > before_noops);
+    assert_ne!(state[change_flags_offset] & 0x02, 0);
+    assert_eq!(max_winner(&state, 7, 40), Some((100, i64::MAX, i64::MAX)));
+    vm.undo_rollback(&mut state, before_noops);
+    assert_eq!(max_winner(&state, 7, 40), Some((50, i64::MAX, i64::MIN)));
+
+    let checkpoint = state.clone();
+    let mut fork = checkpoint.clone();
+    assert_eq!(
+        OK,
+        execute_max_i64x2(
+            &mut vm,
+            &mut fork,
+            &program,
+            &[7],
+            &[41],
+            &[71],
+            &[0],
+            &[i64::MIN],
+            false,
+        )
+    );
+    assert_eq!(max_winner(&fork, 7, 41), Some((71, 0, i64::MIN)));
+    assert_eq!(max_winner(&checkpoint, 7, 41), Some((70, -1, i64::MAX)));
+}
+
+#[test]
+fn max_i64x2_body_dispatch_keeps_one_winner_per_exact_pair() {
+    let body = max_i64x2_code(1, 2, &[(3, 0)], (4, 1), (5, 2));
+    let program = map2_program(4, &[0, 1, 1], 6, &for_each(ADD, &body));
+    let mut state = init(&program);
+    let mut vm = Vm::default();
+    let types = [ADD, REVOKE, ADD, ADD];
+    let key1 = [3, 3, 3, 3];
+    let key2 = [9, 9, 9, 9];
+    let payload = [10, 99, 20, 30];
+    let comparison1 = [-10, i64::MAX, -10, -9];
+    let comparison2 = [5, i64::MAX, 6, i64::MIN];
+    let columns = [
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&key1),
+        u32s_as_bytes(&key2),
+        u32s_as_bytes(&payload),
+        i64s_as_bytes(&comparison1),
+        i64s_as_bytes(&comparison2),
+    ];
+    assert_eq!(
+        OK,
+        vm.execute_batch(&mut state, &program, &columns, types.len() as u32)
+    );
+    assert_eq!(max_winner(&state, 3, 9), Some((30, -9, i64::MIN)));
+}
+
+#[test]
+fn max_i64x2_rejected_batch_rolls_back_and_growth_rehashes_collisions() {
+    let reduce = max_i64x2_code(0, 1, &[(2, 0)], (3, 1), (4, 2));
+    let program = map2_program(2, &[0, 1, 1], 5, &reduce);
+    let mut state = init(&program);
+    let mut vm = Vm::default();
+    assert_eq!(
+        OK,
+        execute_max_i64x2(
+            &mut vm,
+            &mut state,
+            &program,
+            &[9],
+            &[1],
+            &[10],
+            &[1],
+            &[1],
+            true,
+        )
+    );
+
+    vm.undo_enable(&state);
+    let checkpoint = vm.undo_checkpoint();
+    let key1 = vec![9; 12];
+    let key2: Vec<u32> = (1..=12).collect();
+    let payload: Vec<u32> = (100..112).collect();
+    let comparison1 = vec![2; 12];
+    let comparison2: Vec<i64> = (0..12).collect();
+    assert_eq!(
+        ErrorCode::NeedsGrowth as u32,
+        execute_max_i64x2(
+            &mut vm,
+            &mut state,
+            &program,
+            &key1,
+            &key2,
+            &payload,
+            &comparison1,
+            &comparison2,
+            true,
+        )
+    );
+    vm.undo_rollback(&mut state, checkpoint);
+    assert_eq!(max_winner(&state, 9, 1), Some((10, 1, 1)));
+    for second in 2..=12 {
+        assert!(pair_row(&state, 9, second).is_none());
+    }
+
+    let slot = StructMap2Slot::bind(&state, 0);
+    let mut collision = None;
+    for first in 100..200 {
+        for second in (first + 1)..200 {
+            if hash_key_pair(77, first, slot.capacity) == hash_key_pair(77, second, slot.capacity) {
+                collision = Some((first, second));
+                break;
+            }
+        }
+        if collision.is_some() {
+            break;
+        }
+    }
+    let (second1, second2) = collision.expect("two exact pairs collide before growth");
+    assert_eq!(
+        OK,
+        execute_max_i64x2(
+            &mut vm,
+            &mut state,
+            &program,
+            &[77, 77],
+            &[second1, second2],
+            &[201, 202],
+            &[3, 4],
+            &[5, 6],
+            false,
+        )
+    );
+    let old_capacity = StructMap2Slot::bind(&state, 0).capacity;
+    let grown_size = calculate_grown_state_size(&state, 0);
+    let mut grown = vec![0; grown_size as usize];
+    grow_state(&state, &mut grown, 0).unwrap();
+    assert_eq!(StructMap2Slot::bind(&grown, 0).capacity, old_capacity * 2);
+    assert_eq!(max_winner(&grown, 77, second1), Some((201, 3, 5)));
+    assert_eq!(max_winner(&grown, 77, second2), Some((202, 4, 6)));
+    assert_eq!(max_winner(&grown, 9, 1), Some((10, 1, 1)));
 }

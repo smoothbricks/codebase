@@ -293,6 +293,7 @@ export enum Opcode {
   SLOT_STRUCT_MAP2 = 0x1b, // same slot operands as SLOT_STRUCT_MAP; type flag low nibble = 10
   BATCH_STRUCT_MAP2_UPSERT_LAST = 0x83, // slot,key1_col,key2_col,num_vals,[val_col,field_idx] × N
   BATCH_STRUCT_MAP2_REMOVE = 0x86, // slot,key1_col,key2_col
+  BATCH_STRUCT_MAP2_UPSERT_MAX_I64X2 = 0x87, // 0x83 operands + cmp1_col,cmp1_field,cmp2_col,cmp2_field; strict signed lexicographic max
 
   // Ordered list ops
   SLOT_ORDERED_LIST = 0x19, // slot, type_flags, cap_lo, cap_hi [, num_fields, field_type × num_fields]

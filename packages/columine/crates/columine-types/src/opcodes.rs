@@ -116,6 +116,8 @@ pub enum Opcode {
     ListAppendStruct = 0x85,
     /// Exact two-key row removal: slot,key1_col,key2_col.
     BatchStructMap2Remove = 0x86,
+    /// Exact two-key conditional row replacement by signed-i64 pair maximum.
+    BatchStructMap2UpsertMaxI64x2 = 0x87,
     /// Type-discriminated event loop with multi-match support.
     ForEach = 0xe0,
     /// Flat-map expansion over nested-array offsets.

@@ -1622,6 +1622,96 @@ fn decode_struct_map2_upsert_operands(
 }
 
 #[derive(Clone, Copy)]
+struct StructMap2MaxI64x2Operands {
+    row: StructMap2UpsertOperands,
+    cmp1_col: u8,
+    cmp1_field: u8,
+    cmp2_col: u8,
+    cmp2_field: u8,
+    end: usize,
+}
+
+fn decode_struct_map2_max_i64x2_operands(
+    code: &[u8],
+    start: usize,
+) -> Option<StructMap2MaxI64x2Operands> {
+    let row = decode_struct_map2_upsert_operands(code, start)?;
+    if row.num_vals > MAX_STRUCT_SCALAR_OPERANDS - 2 {
+        return None;
+    }
+    let end = row.end.checked_add(4)?;
+    let comparison = code.get(row.end..end)?;
+    Some(StructMap2MaxI64x2Operands {
+        row,
+        cmp1_col: comparison[0],
+        cmp1_field: comparison[1],
+        cmp2_col: comparison[2],
+        cmp2_field: comparison[3],
+        end,
+    })
+}
+
+fn validate_struct_map2_max_i64x2(
+    state: &[u8],
+    smap: &StructMap2Slot,
+    code: &[u8],
+    operands: StructMap2MaxI64x2Operands,
+) -> bool {
+    if operands.cmp1_field == operands.cmp2_field
+        || operands.cmp1_field >= smap.num_fields
+        || operands.cmp2_field >= smap.num_fields
+        || smap.field_type(state, operands.cmp1_field) != StructFieldType::Int64
+        || smap.field_type(state, operands.cmp2_field) != StructFieldType::Int64
+    {
+        return false;
+    }
+    let pairs_end = operands.row.scalar_pairs_start + operands.row.num_vals * 2;
+    code[operands.row.scalar_pairs_start..pairs_end]
+        .chunks_exact(2)
+        .all(|pair| {
+            pair[1] < smap.num_fields
+                && pair[1] != operands.cmp1_field
+                && pair[1] != operands.cmp2_field
+        })
+}
+
+fn should_upsert_struct_map2_max_i64x2(
+    state: &[u8],
+    smap: &StructMap2Slot,
+    key1: u32,
+    key2: u32,
+    operands: StructMap2MaxI64x2Operands,
+    cols: &[&[u8]],
+    element_idx: u32,
+) -> bool {
+    let Some(pos) = smap.find(state, key1, key2) else {
+        return true;
+    };
+    let row = smap.row_off(pos);
+    if !StructMapSlot::is_field_set(state, row, operands.cmp1_field)
+        || !StructMapSlot::is_field_set(state, row, operands.cmp2_field)
+    {
+        return true;
+    }
+    let existing = (
+        bytes::read_i64(state, row + smap.field_offset(state, operands.cmp1_field)),
+        bytes::read_i64(state, row + smap.field_offset(state, operands.cmp2_field)),
+    );
+    let comparison_offset = element_idx * 8;
+    let candidate = (
+        bytes::read_i64(
+            col_at(cols, usize::from(operands.cmp1_col)),
+            comparison_offset,
+        ),
+        bytes::read_i64(
+            col_at(cols, usize::from(operands.cmp2_col)),
+            comparison_offset,
+        ),
+    );
+    candidate > existing
+}
+
+#[derive(Clone, Copy)]
 struct StructMapMaxComparison {
     field_idx: u8,
     col: u8,
@@ -1856,6 +1946,57 @@ fn single_struct_map2_upsert_last(
         err: ErrorCode::Ok,
         pos: result.pos,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn single_struct_map2_upsert_max_i64x2(
+    undo: &mut UndoState,
+    delta_mode: bool,
+    state: &mut [u8],
+    code: &[u8],
+    operands: StructMap2MaxI64x2Operands,
+    key1: u32,
+    key2: u32,
+    cols: &[&[u8]],
+    element_idx: u32,
+) -> StructUpsertResult {
+    if key1 == EMPTY_KEY || key1 == TOMBSTONE {
+        return StructUpsertResult {
+            err: ErrorCode::InvalidKey,
+            pos: 0,
+        };
+    }
+    let smap = StructMap2Slot::bind(state, operands.row.slot);
+    if !should_upsert_struct_map2_max_i64x2(state, &smap, key1, key2, operands, cols, element_idx) {
+        return StructUpsertResult {
+            err: ErrorCode::Ok,
+            pos: 0,
+        };
+    }
+
+    let mut val_cols = [0_u8; MAX_STRUCT_SCALAR_OPERANDS];
+    let mut field_idxs = [0_u8; MAX_STRUCT_SCALAR_OPERANDS];
+    for i in 0..operands.row.num_vals {
+        val_cols[i] = code[operands.row.scalar_pairs_start + i * 2];
+        field_idxs[i] = code[operands.row.scalar_pairs_start + i * 2 + 1];
+    }
+    let count = operands.row.num_vals;
+    val_cols[count] = operands.cmp1_col;
+    field_idxs[count] = operands.cmp1_field;
+    val_cols[count + 1] = operands.cmp2_col;
+    field_idxs[count + 1] = operands.cmp2_field;
+    single_struct_map2_upsert_last(
+        undo,
+        delta_mode,
+        state,
+        operands.row.slot,
+        key1,
+        key2,
+        &val_cols[..count + 2],
+        &field_idxs[..count + 2],
+        cols,
+        element_idx,
+    )
 }
 
 fn single_struct_map2_remove(
@@ -2342,6 +2483,10 @@ fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
         }
         0x83 => {
             let operands = decode_struct_map2_upsert_operands(code, pc.checked_add(1)?)?;
+            operands.end.checked_sub(pc)?
+        }
+        0x87 => {
+            let operands = decode_struct_map2_max_i64x2_operands(code, pc.checked_add(1)?)?;
             operands.end.checked_sub(pc)?
         }
         0x84 => 3,
@@ -2970,6 +3115,41 @@ impl Vm {
                             keys2[index],
                             &val_cols[..operands.num_vals],
                             &field_idxs[..operands.num_vals],
+                            cols,
+                            i,
+                        );
+                        if result.err == ErrorCode::CapacityExceeded {
+                            return NEEDS_GROWTH;
+                        }
+                        if result.err != ErrorCode::Ok {
+                            return result.err as u32;
+                        }
+                    }
+                }
+
+                Opcode::BatchStructMap2UpsertMaxI64x2 => {
+                    let Some(operands) = decode_struct_map2_max_i64x2_operands(code, pc) else {
+                        return INVALID_PROGRAM;
+                    };
+                    pc = operands.end;
+                    let smap = StructMap2Slot::bind(state, operands.row.slot);
+                    if !validate_struct_map2_max_i64x2(state, &smap, code, operands) {
+                        return INVALID_PROGRAM;
+                    }
+                    let keys1 =
+                        col_u32(col_at(cols, usize::from(operands.row.key1_col)), batch_len);
+                    let keys2 =
+                        col_u32(col_at(cols, usize::from(operands.row.key2_col)), batch_len);
+                    for i in 0..batch_len {
+                        let index = usize::try_from(i).expect("batch index fits usize");
+                        let result = single_struct_map2_upsert_max_i64x2(
+                            &mut self.undo,
+                            delta_mode,
+                            state,
+                            code,
+                            operands,
+                            keys1[index],
+                            keys2[index],
                             cols,
                             i,
                         );
@@ -3786,6 +3966,34 @@ impl Vm {
                         cell_u32(cols, operands.key2_col, child_idx),
                         &val_cols[..operands.num_vals],
                         &field_idxs[..operands.num_vals],
+                        cols,
+                        child_idx,
+                    );
+                    if result.err == ErrorCode::CapacityExceeded {
+                        return NEEDS_GROWTH;
+                    }
+                    if result.err != ErrorCode::Ok {
+                        return result.err as u32;
+                    }
+                }
+                0x87 => {
+                    let Some(operands) = decode_struct_map2_max_i64x2_operands(body, bpc + 1)
+                    else {
+                        return INVALID_PROGRAM;
+                    };
+                    bpc = operands.end;
+                    let smap = StructMap2Slot::bind(state, operands.row.slot);
+                    if !validate_struct_map2_max_i64x2(state, &smap, body, operands) {
+                        return INVALID_PROGRAM;
+                    }
+                    let result = single_struct_map2_upsert_max_i64x2(
+                        &mut self.undo,
+                        delta_mode,
+                        state,
+                        body,
+                        operands,
+                        cell_u32(cols, operands.row.key1_col, child_idx),
+                        cell_u32(cols, operands.row.key2_col, child_idx),
                         cols,
                         child_idx,
                     );
