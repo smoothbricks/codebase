@@ -78,6 +78,7 @@ export function isWasmSpanBuffer(buffer: unknown): buffer is WasmSpanBufferLike 
  * and span lifecycle methods use them to calculate timestamps.
  */
 const timestampNow: TimestampNowPrimitive = (traceRoot) => {
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- WASM primitive table is only installed on WasmTraceRoot instances.
   const root = traceRoot as WasmTraceRoot;
   root._assertLive();
   const elapsedNanos = BigInt(Math.round((performance.now() - root.anchorPerfNow) * 1_000_000));
@@ -85,6 +86,7 @@ const timestampNow: TimestampNowPrimitive = (traceRoot) => {
 };
 
 const appendLogEntry: TimestampAppendPrimitive = (traceRoot, buffer, entryType) => {
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- WASM primitive table is only installed on WasmTraceRoot instances.
   const root = traceRoot as WasmTraceRoot;
   root._assertLive();
   if (isWasmSpanBuffer(buffer) && buffer._messagePhysicalLayout !== 'packed' && buffer._identityOwner) {
@@ -100,6 +102,7 @@ const appendLogEntry: TimestampAppendPrimitive = (traceRoot, buffer, entryType) 
 };
 
 const writeSpanStartPrimitive: SpanStartPrimitive = (traceRoot, buffer, spanName) => {
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- WASM primitive table is only installed on WasmTraceRoot instances.
   const root = traceRoot as WasmTraceRoot;
   root._assertLive();
   if (isWasmSpanBuffer(buffer) && buffer._messagePhysicalLayout !== 'packed') {
@@ -118,6 +121,7 @@ const writeSpanStartPrimitive: SpanStartPrimitive = (traceRoot, buffer, spanName
 };
 
 const writeSpanEndPrimitive: SpanEndPrimitive = (traceRoot, buffer, entryType) => {
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- WASM primitive table is only installed on WasmTraceRoot instances.
   const root = traceRoot as WasmTraceRoot;
   root._assertLive();
   if (isWasmSpanBuffer(buffer) && buffer._messagePhysicalLayout !== 'packed') {
