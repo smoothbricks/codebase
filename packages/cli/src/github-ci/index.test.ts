@@ -2,8 +2,10 @@ import { describe, expect, it } from 'bun:test';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { $ } from 'bun';
+import { decode } from '../lib/run.js';
 import type { ProjectTargets } from '../nx/index.js';
-import { expandNxTargetRuns, nxRunManyArgs, nxSmartArgs } from './index.js';
+import { expandNxTargetRuns, nxRunManyArgs, nxSmartArgs, readGitHeadSha } from './index.js';
 import { applyCollectedOutputs, type CollectedOutputsManifest, collectNxOutputs } from './outputs.js';
 
 const SOURCE_SHA = 'a'.repeat(40);
@@ -23,12 +25,8 @@ describe('GitHub CI Nx target expansion', () => {
     expect(expanded.runs.map((run) => [run.target, run.projects.map((project) => project.project)])).toEqual([
       ['test', ['api', 'desktop']],
     ]);
-    expect(nxRunManyArgs(expanded.runs[0]!)).toEqual([
-      'run-many',
-      '-t',
-      'test',
-      '--projects=api,desktop',
-      '--parallel=5',
+    expect(expanded.runs.map((run) => nxRunManyArgs(run))).toEqual([
+      ['run-many', '-t', 'test', '--projects=api,desktop', '--parallel=5'],
     ]);
   });
 
@@ -54,7 +52,9 @@ describe('GitHub CI Nx target expansion', () => {
     const expanded = expandNxTargetRuns(projects, { targets: 'missing', projects: 'api' });
 
     expect(expanded.unmatchedGlobs).toEqual([]);
-    expect(nxRunManyArgs(expanded.runs[0]!)).toEqual(['run-many', '-t', 'missing', '--projects=api', '--parallel=5']);
+    expect(expanded.runs.map((run) => nxRunManyArgs(run))).toEqual([
+      ['run-many', '-t', 'missing', '--projects=api', '--parallel=5'],
+    ]);
   });
 
   it('adds the generic target skip tag only to nx-smart', () => {
@@ -65,11 +65,28 @@ describe('GitHub CI Nx target expansion', () => {
       '--exclude=tag:ci:skip:test',
       '--parallel=5',
     ]);
-    expect(nxRunManyArgs({ target: 'test', projects: [projects[0]!] })).not.toContain('--exclude=tag:ci:skip:test');
+    expect(nxRunManyArgs({ target: 'test', projects: projects.slice(0, 1) })).not.toContain(
+      '--exclude=tag:ci:skip:test',
+    );
   });
 });
 
 describe('collected Nx outputs', () => {
+  it('derives artifact provenance from the checked-out HEAD', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-output-head-'));
+    try {
+      await $`git init -q`.cwd(root).quiet();
+      await writeFile(join(root, 'artifact-source.txt'), 'release candidate');
+      await $`git add artifact-source.txt`.cwd(root).quiet();
+      await $`git -c user.name=Test -c user.email=test@example.com commit -q -m initial`.cwd(root).quiet();
+      const expected = decode((await $`git rev-parse HEAD`.cwd(root).quiet()).stdout).trim();
+
+      expect(await readGitHeadSha(root)).toBe(expected);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('collects declared files and applies a verified overlay', async () => {
     await withOutputFixture(async ({ root, artifact, outputProject }) => {
       const source = join(root, 'packages/app/dist/result.bin');
@@ -154,7 +171,7 @@ describe('collected Nx outputs', () => {
 
       const malicious: CollectedOutputsManifest = {
         ...manifest,
-        files: [{ ...manifest.files[0]!, path: '../escape.bin' }],
+        files: manifest.files.map((file, index) => (index === 0 ? { ...file, path: '../escape.bin' } : file)),
       };
       await writeFile(join(artifact, 'manifest.json'), `${JSON.stringify(malicious)}\n`);
       await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA)).rejects.toThrow('escapes the workspace');
