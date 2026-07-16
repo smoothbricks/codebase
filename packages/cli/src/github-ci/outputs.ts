@@ -214,10 +214,40 @@ export function resolveDeclaredOutput(declaredOutput: string, project: ProjectTa
     .replaceAll('{workspaceRoot}', '.')
     .replaceAll('{projectRoot}/', `${project.root}/`)
     .replaceAll('{projectRoot}', project.root);
-  if (substituted.includes('{') || substituted.includes('}')) {
+  if (hasUnsupportedOutputBraces(substituted)) {
     throw new Error(`Unsupported Nx output placeholder in ${project.project}:${declaredOutput}`);
   }
   return validateWorkspaceRelativePattern(substituted, `output for ${project.project}`);
+}
+
+function hasUnsupportedOutputBraces(value: string): boolean {
+  let cursor = 0;
+  while (cursor < value.length) {
+    const character = value.charCodeAt(cursor);
+    if (character === 0x7d) {
+      return true;
+    }
+    if (character !== 0x7b) {
+      cursor += 1;
+      continue;
+    }
+
+    let hasAlternative = false;
+    cursor += 1;
+    while (cursor < value.length && value.charCodeAt(cursor) !== 0x7d) {
+      const inner = value.charCodeAt(cursor);
+      if (inner === 0x7b) {
+        return true;
+      }
+      hasAlternative ||= inner === 0x2c;
+      cursor += 1;
+    }
+    if (cursor === value.length || !hasAlternative) {
+      return true;
+    }
+    cursor += 1;
+  }
+  return false;
 }
 
 function targetTransitivelyDependsOn(

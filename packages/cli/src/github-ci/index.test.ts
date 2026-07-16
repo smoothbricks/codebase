@@ -12,7 +12,12 @@ import {
   nxSmartArgs,
   readGitHeadSha,
 } from './index.js';
-import { applyCollectedOutputs, type CollectedOutputsManifest, collectNxOutputs } from './outputs.js';
+import {
+  applyCollectedOutputs,
+  type CollectedOutputsManifest,
+  collectNxOutputs,
+  resolveDeclaredOutput,
+} from './outputs.js';
 
 const SOURCE_SHA = 'a'.repeat(40);
 const OTHER_SHA = 'b'.repeat(40);
@@ -151,6 +156,36 @@ describe('collected Nx outputs', () => {
         'app:package-linux:packages/app/dist/package/release.tar',
         'app:compile-linux:packages/app/dist/result.bin',
       ]);
+    });
+  });
+
+  it('collects brace-expanded TypeScript outputs without accepting unresolved Nx placeholders', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject }) => {
+      const declaredOutput = '{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}';
+      outputProject.targetOutputs = new Map([['build-macos', [declaredOutput]]]);
+      await writeFile(join(root, 'packages/app/dist/index.js'), 'javascript');
+      await writeFile(join(root, 'packages/app/dist/index.d.ts'), 'declaration');
+      await writeFile(join(root, 'packages/app/dist/index.d.ts.map'), 'source map');
+      await writeFile(join(root, 'packages/app/dist/index.css'), 'not declared');
+
+      const manifest = await collectNxOutputs(
+        root,
+        artifact,
+        [{ target: 'build-macos', projects: [outputProject] }],
+        SOURCE_SHA,
+      );
+
+      expect(resolveDeclaredOutput(declaredOutput, outputProject)).toBe(
+        'packages/app/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}',
+      );
+      expect(manifest.files.map((file) => file.path)).toEqual([
+        'packages/app/dist/index.d.ts',
+        'packages/app/dist/index.d.ts.map',
+        'packages/app/dist/index.js',
+      ]);
+      expect(() => resolveDeclaredOutput('{options.outputPath}', outputProject)).toThrow(
+        'Unsupported Nx output placeholder',
+      );
     });
   });
 
