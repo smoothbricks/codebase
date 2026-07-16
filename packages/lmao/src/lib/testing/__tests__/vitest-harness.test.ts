@@ -21,7 +21,8 @@ describe('vitest harness tracer defaults', () => {
     const tracer = makeVitestTestTracer({ binding: vitestBinding });
     installVitestTestTracing(tracer);
 
-    expect(getTracer()).toBe(tracer.getTracer());
+    // Global accessor erases the concrete binding generic; assert identity directly.
+    expect(Object.is(getTracer(), tracer.getTracer())).toBe(true);
   });
 
   it('routes initTraceTestRun through the active suite tracer path', () => {

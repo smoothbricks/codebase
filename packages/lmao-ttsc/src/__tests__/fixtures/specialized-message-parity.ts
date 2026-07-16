@@ -1,5 +1,11 @@
 import { createHash } from 'node:crypto';
-import { createTraceRoot, defineLogSchema, defineOpContext, JsBufferStrategy, TestTracer } from '@smoothbricks/lmao/node';
+import {
+  createTraceRoot,
+  defineLogSchema,
+  defineOpContext,
+  JsBufferStrategy,
+  TestTracer,
+} from '@smoothbricks/lmao/node';
 import { extractFacts } from '@smoothbricks/lmao/testing';
 
 const opContext = defineOpContext({ logSchema: defineLogSchema({}) });
@@ -88,11 +94,13 @@ const plan = specializedParityOp.callsitePlan;
 const messageIdentityStorage = plan.arrowExposure.messageIdentityStorage;
 const rawMessageSentinels = [root.message_values[2] ?? null, root.message_values[33] ?? null];
 const logFacts = extractFacts(root).byNamespace('log');
-const segments = [{
-  capacity: root._capacity,
-  writeIndex: root._writeIndex,
-  physicalLayout: plan.messagePhysicalLayout,
-}];
+const segments = [
+  {
+    capacity: root._capacity,
+    writeIndex: root._writeIndex,
+    physicalLayout: plan.messagePhysicalLayout,
+  },
+];
 const checksum = createHash('sha256').update(JSON.stringify(logFacts)).digest('hex');
 process.stdout.write(
   `${JSON.stringify({
