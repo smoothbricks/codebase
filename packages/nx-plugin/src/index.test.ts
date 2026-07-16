@@ -59,10 +59,28 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         command: 'ttsc -p tsconfig.lib.json --emit',
         cwd: 'packages/example',
       });
+      const toolchainInputs = [
+        '{workspaceRoot}/package.json',
+        '{workspaceRoot}/bun.lock',
+        '{workspaceRoot}/patches/**/*',
+        '{workspaceRoot}/tsconfig.base.json',
+      ];
+      expect(targets['tsc-js']?.inputs).toEqual([
+        'production',
+        '^production',
+        ...toolchainInputs,
+        '{projectRoot}/tsconfig.lib.json',
+      ]);
       expect(targets.typecheck?.options).toMatchObject({
         command: 'ttsc -p tsconfig.lib.json --noEmit',
         cwd: 'packages/example',
       });
+      expect(targets.typecheck?.inputs).toEqual([
+        'production',
+        '^production',
+        ...toolchainInputs,
+        '{projectRoot}/tsconfig.lib.json',
+      ]);
       expect(targets.build?.executor).toBe('nx:noop');
       expect(targets.build?.cache).toBe(true);
       expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
@@ -76,6 +94,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         command: 'ttsc -p tsconfig.test.json --noEmit',
         cwd: 'packages/example',
       });
+      expect(targets['typecheck-tests']?.inputs).toEqual([
+        'default',
+        '^production',
+        ...toolchainInputs,
+        '{projectRoot}/tsconfig.test.json',
+      ]);
 
       expect(targets['typecheck-tests:watch']?.executor).toBe('nx:run-commands');
       expect(targets['typecheck-tests:watch']?.continuous).toBe(true);

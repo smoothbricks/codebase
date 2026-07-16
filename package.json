@@ -78,5 +78,8 @@
       }
     },
     "name": "@smoothbricks/codebase"
+  },
+  "patchedDependencies": {
+    "ttsc@0.18.4": "patches/ttsc@0.18.4.patch"
   }
 }

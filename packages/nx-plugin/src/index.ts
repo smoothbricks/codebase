@@ -11,6 +11,12 @@ const RESERVED_ZIG_STEPS = new Set(['all', 'clean', 'install', 'test']);
 const ZIG_STEP_PATTERN = /\bb\.step\(\s*["']([^"']+)["']\s*,/g;
 const VALID_ZIG_STEP_NAME = /^[A-Za-z0-9_-]+$/;
 const BUILD_OUTPUT_TARGET_PATTERN = /-(?:js|web|html|css|ios|android|native|napi|bun|wasm)$/;
+const TYPESCRIPT_TOOLCHAIN_INPUTS = [
+  '{workspaceRoot}/package.json',
+  '{workspaceRoot}/bun.lock',
+  '{workspaceRoot}/patches/**/*',
+  '{workspaceRoot}/tsconfig.base.json',
+];
 
 // Cargo workspace inference: a package.json sitting next to a Cargo.toml that
 // declares [workspace] gets direct cargo-test/test targets, cargo-lint feeding
@@ -100,7 +106,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     targets['tsc-js'] = {
       executor: 'nx:run-commands',
       cache: true,
-      inputs: ['production', '^production', '{workspaceRoot}/tsconfig.base.json', '{projectRoot}/tsconfig.lib.json'],
+      inputs: ['production', '^production', ...TYPESCRIPT_TOOLCHAIN_INPUTS, '{projectRoot}/tsconfig.lib.json'],
       outputs: [
         '{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}',
         '{projectRoot}/dist/.build.tsbuildinfo',
@@ -114,7 +120,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     targets.typecheck = {
       executor: 'nx:run-commands',
       cache: true,
-      inputs: ['production', '^production', '{workspaceRoot}/tsconfig.base.json', '{projectRoot}/tsconfig.lib.json'],
+      inputs: ['production', '^production', ...TYPESCRIPT_TOOLCHAIN_INPUTS, '{projectRoot}/tsconfig.lib.json'],
       outputs: [],
       dependsOn: ['^tsc-js'],
       options: {
@@ -129,7 +135,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     targets['typecheck-tests'] = {
       executor: 'nx:run-commands',
       cache: true,
-      inputs: ['default', '^production', '{workspaceRoot}/tsconfig.base.json', '{projectRoot}/tsconfig.test.json'],
+      inputs: ['default', '^production', ...TYPESCRIPT_TOOLCHAIN_INPUTS, '{projectRoot}/tsconfig.test.json'],
       dependsOn: ['typecheck'],
       options: {
         command: 'ttsc -p tsconfig.test.json --noEmit',
