@@ -1,10 +1,18 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub Actions expressions are emitted literally. */
 
+import synchronizedPrettier from '@prettier/sync';
 import {
   LINUX_PLATFORM_TARGET_GLOBS,
   MACOS_PLATFORM_TARGET_GLOBS,
 } from '@smoothbricks/nx-plugin/workspace-config-policy';
+import type { Options as PrettierOptions } from 'prettier';
 import { isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
+
+const PUBLISH_WORKFLOW_FORMAT_OPTIONS = Object.freeze({
+  parser: 'yaml',
+  printWidth: 120,
+  proseWrap: 'always',
+} satisfies PrettierOptions);
 
 export type PublishWorkflowBump = 'auto' | 'patch' | 'minor' | 'major' | 'prerelease';
 export type PublishWorkflowCondition = 'version-mode-not-none' | 'deploy-production' | 'failure' | 'always';
@@ -261,17 +269,19 @@ function shouldRunStep(
 }
 
 export function renderPublishWorkflowYaml(options: PublishWorkflowDefinitionOptions = {}): string {
+  let workflow: string;
   if (hasMacosPlatformTargets(options)) {
-    return renderPlatformPublishWorkflowYaml(options);
-  }
-  if (hasLinuxPlatformTargets(options)) {
-    return `${renderPublishWorkflowHeader(options)}${renderSingleJobPublishWorkflowSteps(
+    workflow = renderPlatformPublishWorkflowYaml(options);
+  } else if (hasLinuxPlatformTargets(options)) {
+    workflow = `${renderPublishWorkflowHeader(options)}${renderSingleJobPublishWorkflowSteps(
       definePublishWorkflow(options).steps,
       options,
     )}`;
+  } else {
+    const steps = definePublishWorkflow(options).steps;
+    workflow = `${renderPublishWorkflowHeader(options)}${renderPublishWorkflowSteps(steps, options)}`;
   }
-  const steps = definePublishWorkflow(options).steps;
-  return `${renderPublishWorkflowHeader(options)}${renderPublishWorkflowSteps(steps, options)}`;
+  return synchronizedPrettier.format(workflow, PUBLISH_WORKFLOW_FORMAT_OPTIONS);
 }
 
 function renderPublishWorkflowHeader(options: PublishWorkflowDefinitionOptions): string {
