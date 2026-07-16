@@ -260,14 +260,28 @@ export async function githubCiNxRunMany(root: string, options: NxRunManyOptions)
     await run('nx', nxRunManyArgs(targetRun, options.configuration), root);
   }
   if (options.collectOutputs) {
-    if (import.meta.url.endsWith('/src/github-ci/index.ts')) {
-      // Self-hosted source needs the Typia Bun transform registered before loading the manifest boundary.
-      await import('@smoothbricks/validation/bun/preload');
-    }
-    const { collectNxOutputs } = await import('./outputs.js');
+    const { collectNxOutputs } = await loadOutputBoundary();
     const sourceSha = await readGitHeadSha(root);
     await collectNxOutputs(root, options.collectOutputs, expandNxTargetDependencyRuns(expanded.runs), sourceSha);
   }
+}
+
+export async function githubCiApplyOutputs(
+  root: string,
+  directories: string[],
+  expectedSourceSha: string,
+): Promise<void> {
+  const { applyCollectedOutputs } = await loadOutputBoundary();
+  await applyCollectedOutputs(root, directories, expectedSourceSha);
+}
+
+async function loadOutputBoundary() {
+  if (import.meta.url.endsWith('/src/github-ci/index.ts')) {
+    // The source self-hosting shim has no Typia transform; register it before loading manifest validators.
+    await import('@smoothbricks/validation/bun/preload');
+  }
+  // This boundary must stay lazy because the transformed dist and source self-hosting paths initialize Typia differently.
+  return import('./outputs.js');
 }
 
 function isGlobPattern(value: string): boolean {

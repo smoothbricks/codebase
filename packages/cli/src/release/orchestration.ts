@@ -30,12 +30,22 @@ export interface ReleaseNextShell<Package extends ReleasePackageInfo = ReleasePa
   bumpStablePackagesToNext(packages: Package[]): Promise<void>;
 }
 
-export interface ReleaseRepairShell<Package extends ReleasePackageInfo = ReleasePackageInfo>
-  extends ReleaseCompletionShell<Package> {
+export interface ReleaseTargetCheckoutShell<Package extends ReleasePackageInfo = ReleasePackageInfo> {
   checkout(ref: string): Promise<void>;
   withDevenvEnv<T>(runWithEnv: () => Promise<T>): Promise<T>;
   beforeRepairTarget?(target: ReleaseTarget<Package>): void;
   afterRepairTarget?(target: ReleaseTarget<Package>): void;
+}
+
+export interface ReleaseRepairShell<Package extends ReleasePackageInfo = ReleasePackageInfo>
+  extends ReleaseCompletionShell<Package>,
+    ReleaseTargetCheckoutShell<Package> {
+  prepareRepairTarget?(target: ReleaseTarget<Package>): Promise<void>;
+}
+
+export interface ReleaseRepairOutputsShell<Package extends ReleasePackageInfo = ReleasePackageInfo>
+  extends ReleaseTargetCheckoutShell<Package> {
+  collectRepairTargetOutputs(target: ReleaseTarget<Package>): Promise<void>;
 }
 
 export interface ReleaseVersionShell<Package extends ReleasePackageInfo = ReleasePackageInfo> {
@@ -151,7 +161,12 @@ export async function repairPendingTargets<Package extends ReleasePackageInfo>(
       }
       shell.beforeRepairTarget?.(target);
       try {
-        summaries.push(await shell.withDevenvEnv(() => completeRepairTargetAtHead(shell, target, dryRun)));
+        summaries.push(
+          await shell.withDevenvEnv(async () => {
+            await shell.prepareRepairTarget?.(target);
+            return completeRepairTargetAtHead(shell, target, dryRun);
+          }),
+        );
       } finally {
         shell.afterRepairTarget?.(target);
       }
@@ -166,6 +181,37 @@ export async function repairPendingTargets<Package extends ReleasePackageInfo>(
     }
   }
   return summaries;
+}
+
+export async function collectRepairPlatformOutputs<Package extends ReleasePackageInfo>(
+  shell: ReleaseRepairOutputsShell<Package>,
+  targets: Array<ReleaseTarget<Package>>,
+  restoreRef: string,
+): Promise<void> {
+  const outputTargets = targets.filter((target) => target.npmPackages.length > 0);
+  if (outputTargets.length === 0) {
+    return;
+  }
+  try {
+    for (const target of outputTargets) {
+      await shell.checkout(target.sha);
+      if (target.packages.length === 0) {
+        // invariant throw: release target discovery must never yield a package-free target.
+        throw new Error(`Release commit ${target.sha} has no release packages after checkout.`);
+      }
+      shell.beforeRepairTarget?.(target);
+      try {
+        await shell.withDevenvEnv(() => shell.collectRepairTargetOutputs(target));
+      } finally {
+        shell.afterRepairTarget?.(target);
+      }
+    }
+  } finally {
+    await shell.checkout(restoreRef);
+    // Historical devenv activation may rebuild ignored tool outputs. Restore the
+    // dispatch environment before the macOS job performs any further work.
+    await shell.withDevenvEnv(async () => undefined);
+  }
 }
 
 function repairDryRunSummary<Package extends ReleasePackageInfo>(

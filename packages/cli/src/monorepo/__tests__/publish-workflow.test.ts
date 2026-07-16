@@ -94,25 +94,28 @@ describe('publish workflow definition', () => {
     const finalJob = platform.slice(platform.indexOf('  publish-on-linux:'));
 
     expect(stepAnchorNumbers(singleJob)).toEqual(Array.from({ length: 15 }, (_, index) => index + 1));
-    expect(stepAnchorNumbers(linuxCandidate)).toEqual(Array.from({ length: 20 }, (_, index) => index + 1));
-    expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 7 }, (_, index) => index + 1));
-    expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 13 }, (_, index) => index + 1));
+    expect(stepAnchorNumbers(linuxCandidate)).toEqual(Array.from({ length: 19 }, (_, index) => index + 1));
+    expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 8 }, (_, index) => index + 1));
+    expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 14 }, (_, index) => index + 1));
     expect(singleJob).toContain('# Step 14\n      - name: 📦 Publish release (${{ steps.version.outputs.mode }})');
     expect(singleJob).toContain('# Step 15\n      - name: 🧹 Cleanup and cache Nix/devenv');
-    expect(linuxCandidate).toContain('# Step 8\n      - name: 🔒 Capture candidate release SHA');
+    expect(linuxCandidate).toContain('# Step 7\n      - name: 🔒 Capture candidate release SHA');
     expect(linuxCandidate).toContain(
-      '# Step 9\n      - name: ✅ Check managed monorepo files (${{ steps.version.outputs.mode }})',
+      '# Step 8\n      - name: ✅ Check managed monorepo files (${{ steps.version.outputs.mode }})',
     );
-    expect(linuxCandidate).toContain('# Step 20\n      - name: 🧹 Cleanup and cache Nix/devenv');
-    expect(macosPlatform).toContain('# Step 5\n      - name: 🍎 Build macOS and iOS targets');
-    expect(macosPlatform).toContain('# Step 7\n      - name: 🧹 Cleanup and cache Nix/devenv');
-    expect(finalJob).toContain('# Step 8\n      - name: 📦 Apply verified Linux outputs');
-    expect(finalJob).toContain('# Step 9\n      - name: 🍎 Apply verified macOS outputs');
+    expect(linuxCandidate).toContain('# Step 19\n      - name: 🧹 Cleanup and cache Nix/devenv');
+    expect(macosPlatform).toContain('# Step 5\n      - name: 🍎 Build current macOS and iOS targets');
+    expect(macosPlatform).toContain('# Step 6\n      - name: 🧯 Build pending release macOS and iOS targets');
+    expect(macosPlatform).toContain('# Step 8\n      - name: 🧹 Cleanup and cache Nix/devenv');
+    expect(finalJob).toContain('# Step 7\n      - name: 🧯 Repair pending releases');
+    expect(finalJob).toContain('# Step 8\n      - name: ♻️ Restore validated release state');
+    expect(finalJob).toContain('# Step 9\n      - name: 📦 Apply verified Linux outputs');
+    expect(finalJob).toContain('# Step 10\n      - name: 🍎 Apply verified macOS outputs');
     expect(finalJob).toContain(
-      '# Step 11\n      - name: 📦 Publish release (${{ needs.linux-release-candidate.outputs.mode }})',
+      '# Step 12\n      - name: 📦 Publish release (${{ needs.linux-release-candidate.outputs.mode }})',
     );
-    expect(finalJob).toContain('# Step 12\n      - name: 🚀 Deploy production');
-    expect(finalJob).toContain('# Step 13\n      - name: 🧹 Cleanup and cache Nix/devenv');
+    expect(finalJob).toContain('# Step 13\n      - name: 🚀 Deploy production');
+    expect(finalJob).toContain('# Step 14\n      - name: 🧹 Cleanup and cache Nix/devenv');
   });
 
   it('renders parallel native producers and a dependent publish-only final job', () => {
@@ -140,6 +143,7 @@ describe('publish workflow definition', () => {
     expect(native).toContain('  publish-on-linux:\n    needs: [linux-release-candidate, macos-platform]');
     expect(linuxCandidate).not.toContain('needs:');
     expect(macosPlatform).not.toContain('needs:');
+    expect(linuxCandidate).not.toContain('smoo release repair-pending');
     expect(linuxCandidate).toContain('smoo release version');
     expect(linuxCandidate).toContain('smoo github-ci nx-run-many --targets build --projects');
     expect(linuxCandidate).toContain('smoo github-ci nx-run-many --targets lint --projects');
@@ -150,8 +154,18 @@ describe('publish workflow definition', () => {
     expect(macosPlatform).toContain(
       `smoo github-ci nx-run-many --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(',')}" --collect-outputs`,
     );
+    expect(macosPlatform).toContain(
+      `smoo release build-repair-platform-outputs --ref "\${{ github.sha }}" --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(
+        ',',
+      )}"`,
+    );
     expect(finalJob).not.toContain('smoo release version');
     expect(finalJob).not.toContain('nx-run-many');
+    expect(foldedRunCommand(finalJob, '🧯 Repair pending releases')).toBe(
+      'smoo release repair-pending --ref "${{ github.sha }}" --platform-outputs ' +
+        '"${{ runner.temp }}/publish-artifacts/publish-macos-outputs-${{ github.run_id }}/repairs" ' +
+        '--dry-run "${{ inputs.dry_run }}"',
+    );
     expect(native).toContain('uses: actions/upload-artifact@v7.0.1');
     expect(native).toContain('uses: actions/download-artifact@v8.0.1');
     expect(native).toContain('name: publish-release-state-${{ github.run_id }}');
@@ -168,6 +182,10 @@ describe('publish workflow definition', () => {
       'smoo github-ci apply-outputs --source-sha "${{ needs.linux-release-candidate.outputs.release-sha }}" ' +
         '"${{ runner.temp }}/publish-artifacts/publish-release-outputs-${{ github.run_id }}" ' +
         '"${{ runner.temp }}/publish-artifacts/publish-linux-outputs-${{ github.run_id }}"',
+    );
+    expect(foldedRunCommand(finalJob, '🍎 Apply verified macOS outputs')).toBe(
+      'smoo github-ci apply-outputs --source-sha "${{ github.sha }}" ' +
+        '"${{ runner.temp }}/publish-artifacts/publish-macos-outputs-${{ github.run_id }}/current"',
     );
   });
 
@@ -192,7 +210,12 @@ describe('publish workflow definition', () => {
     expect(macosPlatform).toContain('id-token: none');
     expect(finalJob).toContain('id-token: write');
     expect(rendered.match(/id-token: write/g)).toHaveLength(1);
-    expect(finalJob.indexOf('♻️ Restore validated release state')).toBeLessThan(finalJob.indexOf('🧱 Setup Nix/devenv'));
+    expect(finalJob.indexOf('🧯 Repair pending releases')).toBeLessThan(
+      finalJob.indexOf('♻️ Restore validated release state'),
+    );
+    expect(finalJob.indexOf('♻️ Restore validated release state')).toBeGreaterThan(
+      finalJob.indexOf('🧱 Setup Nix/devenv'),
+    );
     expect(rendered).not.toContain('GITHUB_SHA:');
     expect(finalJob).toContain("needs.linux-release-candidate.outputs.mode != 'none'");
     expect(finalJob).toContain("inputs.deploy_environment == 'production'");
