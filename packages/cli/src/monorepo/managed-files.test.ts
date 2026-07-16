@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'bun:test';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
+import { LINUX_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import fc from 'fast-check';
 import {
   extractInlineLocalBlocksForTest,
@@ -160,6 +160,10 @@ describe('managed publish platform discovery', () => {
 
     expect(discovered).toEqual([...PLATFORM_TARGET_GLOBS]);
     expect(discovered).not.toContain('native-app');
+  });
+
+  it('selects only supplemental Linux when resolved metadata has no Apple targets', () => {
+    expect(platformTargetGlobsForTest(['build', 'bundle-linux', 'test'])).toEqual([...LINUX_PLATFORM_TARGET_GLOBS]);
   });
 
   it('returns no platform families for ordinary Nx targets', () => {
