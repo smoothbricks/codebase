@@ -43,8 +43,8 @@ export function cleanupDebugActiveHandles(label: string): void {
     if (typeof handle !== 'object' || handle === null) {
       return typeof handle;
     }
-    const constructor = Reflect.get(handle, 'constructor');
-    const name = typeof constructor === 'function' ? Reflect.get(constructor, 'name') : undefined;
+    const handleConstructor = Reflect.get(handle, 'constructor');
+    const name = typeof handleConstructor === 'function' ? Reflect.get(handleConstructor, 'name') : undefined;
     return typeof name === 'string' && name.length > 0 ? name : 'Object';
   });
 
