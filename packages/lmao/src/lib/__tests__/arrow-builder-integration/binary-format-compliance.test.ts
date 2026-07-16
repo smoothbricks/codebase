@@ -52,7 +52,7 @@ describe('Arrow Binary Format Compliance', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       buffer.numberValue(0, 42);
       buffer._writeIndex = 1;
 
@@ -82,7 +82,7 @@ describe('Arrow Binary Format Compliance', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       buffer.uint32Value(0, testValue);
       buffer._writeIndex = 1;
 
@@ -127,7 +127,7 @@ describe('Arrow Binary Format Compliance', () => {
           const entryTypes = buffer.entry_type;
           if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
           entryTypes[i] = ENTRY_TYPE_SPAN_START;
-        };
+        }
 
         if (value === null) {
           // Don't call the method for null values, just leave as default (null)
@@ -182,7 +182,7 @@ describe('Arrow Binary Format Compliance', () => {
           const entryTypes = buffer.entry_type;
           if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
           entryTypes[i] = ENTRY_TYPE_SPAN_START;
-        };
+        }
         buffer.enumValue(i, testValues[i]);
       }
       buffer._writeIndex = testValues.length;
@@ -222,7 +222,7 @@ describe('Arrow Binary Format Compliance', () => {
           const entryTypes = buffer.entry_type;
           if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
           entryTypes[i] = ENTRY_TYPE_SPAN_START;
-        };
+        }
         buffer.textValue(i, testValues[i]);
       }
       buffer._writeIndex = testValues.length;
@@ -284,7 +284,7 @@ describe('Arrow Binary Format Compliance', () => {
           const entryTypes = buffer.entry_type;
           if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
           entryTypes[i] = ENTRY_TYPE_SPAN_START;
-        };
+        }
         buffer.boolValue(i, testValues[i]);
       }
       buffer._writeIndex = testValues.length;

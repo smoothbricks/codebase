@@ -7,8 +7,8 @@ import { describe, expect, it } from 'bun:test';
 import { Nanoseconds } from '@smoothbricks/arrow-builder';
 import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
-import { defineCodeError } from '../result.js';
 import { resolveEntryType, resolveMessage } from '../resolveMessage.js';
+import { defineCodeError } from '../result.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import {

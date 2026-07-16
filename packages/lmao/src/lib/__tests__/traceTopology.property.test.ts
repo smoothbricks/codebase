@@ -4,17 +4,11 @@ import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import { createTraceRoot } from '../traceRoot.node.js';
-import {
-  NO_NODE,
-  TraceTopology,
-  iterateSpanChildren,
-  iterateSpanTree,
-  walkSpanTree,
-} from '../traceTopology.js';
 import { extractFacts } from '../testing/extractFacts.js';
 import { querySpan } from '../testing/queryable-span.js';
+import { createTraceRoot } from '../traceRoot.node.js';
 import { ArrayQueueTracer } from '../tracers/ArrayQueueTracer.js';
+import { iterateSpanChildren, iterateSpanTree, NO_NODE, TraceTopology, walkSpanTree } from '../traceTopology.js';
 
 const topologyContext = defineOpContext({ logSchema: defineLogSchema({}) });
 
@@ -33,20 +27,12 @@ function createRuntimeRoot(name = 'root') {
   return { root, tracer };
 }
 
-function addChild(
-  runtime: ReturnType<typeof createRuntimeRoot>,
-  parent: ReturnType<typeof createRuntimeRoot>['root'],
-) {
-  return runtime.tracer.bufferStrategy.createChildSpanBuffer(
-    parent,
-    parent._opMetadata,
-    parent._opMetadata,
-    8,
-  );
+function addChild(runtime: ReturnType<typeof createRuntimeRoot>, parent: ReturnType<typeof createRuntimeRoot>['root']) {
+  return runtime.tracer.bufferStrategy.createChildSpanBuffer(parent, parent._opMetadata, parent._opMetadata, 8);
 }
 
 function collectWalk(root: Parameters<typeof walkSpanTree>[0]) {
-  const visited = new Array<Parameters<typeof walkSpanTree>[0]>();
+  const visited: Parameters<typeof walkSpanTree>[0][] = [];
   walkSpanTree(root, (buffer) => visited.push(buffer));
   return visited;
 }

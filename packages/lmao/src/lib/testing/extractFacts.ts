@@ -21,8 +21,8 @@ import {
   ENTRY_TYPE_TRACE,
   ENTRY_TYPE_WARN,
 } from '../schema/systemSchema.js';
-import type { SpanBuffer } from '../types.js';
 import { iterateSpanChildren } from '../traceTopology.js';
+import type { SpanBuffer } from '../types.js';
 import {
   createFactArray,
   type FactArray,

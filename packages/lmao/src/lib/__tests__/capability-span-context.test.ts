@@ -2,8 +2,8 @@ import { describe, expect, it } from 'bun:test';
 import fc from 'fast-check';
 import { defineOpContext } from '../defineOpContext.js';
 import type { OpContext, OpContextOf, SpanContext } from '../opContext/types.js';
-import { Ok, defineCodeError } from '../result.js';
 import { resolveEntryType, resolveMessage } from '../resolveMessage.js';
+import { defineCodeError, Ok } from '../result.js';
 import {
   RUNTIME_HINT_ANALYZED_VALID,
   RUNTIME_HINT_CAPABILITIES_MASK,
@@ -125,24 +125,17 @@ function expectContextWriterState(ctx: CapturedContext): void {
 function expectThinWriter(writer: object, state: CapturedContext): void {
   expect(Reflect.ownKeys(writer)).toEqual(['_state']);
   expect(Reflect.get(writer, '_state')).toBe(state);
-  for (const duplicatedField of [
-    '_buffer',
-    '_spanBuffer',
-    '_traceRoot',
-    '_appendLogEntry',
-    '_physicalLayoutPlan',
-  ]) {
+  for (const duplicatedField of ['_buffer', '_spanBuffer', '_traceRoot', '_appendLogEntry', '_physicalLayoutPlan']) {
     expect(Object.hasOwn(writer, duplicatedField)).toBe(false);
   }
 }
 
-function constructorOf(value: object): Function {
+function constructorOf(value: object): (...args: never[]) => unknown {
   const prototype = Object.getPrototypeOf(value);
-  const constructor = Reflect.get(prototype, 'constructor');
-  if (typeof constructor !== 'function') throw new Error('context prototype has no constructor');
-  return constructor;
+  const ctor = Reflect.get(prototype, 'constructor');
+  if (typeof ctor !== 'function') throw new Error('context prototype has no constructor');
+  return ctor as (...args: never[]) => unknown;
 }
-
 
 async function captureRoot(runtimeHint: number, name: string): Promise<CapturedContext> {
   let captured: CapturedContext | undefined;
@@ -504,10 +497,7 @@ describe('specialized SpanContext runtime semantics', () => {
       };
     }
 
-    const specialized = await run(
-      RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_FULL_CAPABILITIES | 8,
-      'semantic-parity',
-    );
+    const specialized = await run(RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_FULL_CAPABILITIES | 8, 'semantic-parity');
     const fallback = await run(0, 'semantic-parity');
     expect(specialized).toEqual(fallback);
   });

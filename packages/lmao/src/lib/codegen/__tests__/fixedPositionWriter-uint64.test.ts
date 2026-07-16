@@ -87,10 +87,7 @@ function writeUint64Runtime(writer: object, value: bigint | null): void {
 describe('fixed-position WriterState ownership', () => {
   it('keeps tag and result writers as one-field views over declared state', () => {
     const { schema, buffer, context } = setup();
-    const writers = [
-      createTagWriter(schema, context),
-      createResultWriter(schema, context),
-    ];
+    const writers = [createTagWriter(schema, context), createResultWriter(schema, context)];
 
     for (const writer of writers) {
       expect(Reflect.ownKeys(writer)).toEqual(['_state']);

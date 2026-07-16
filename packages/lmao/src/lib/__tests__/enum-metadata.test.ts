@@ -4,8 +4,8 @@ import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { resolveEnumLookupDescriptor } from '../enumMetadata.js';
 import { createRemapDescriptor } from '../library.js';
-import { getPhysicalLayoutPlan } from '../physicalLayoutPlan.js';
 import type { OpContext } from '../opContext/types.js';
+import { getPhysicalLayoutPlan } from '../physicalLayoutPlan.js';
 import {
   RUNTIME_HINT_ANALYZED_VALID,
   RUNTIME_HINT_LOG,
@@ -113,7 +113,9 @@ describe('startup-hoisted enum lookup metadata', () => {
       }
       const table = convertSpanTreeToArrowTable(root);
       const operations = requireColumn(table, 'operation');
-      expect(Array.from({ length: operations.length }, (_, row) => operations.get(row)).filter(Boolean)).toContain('WRITE');
+      expect(Array.from({ length: operations.length }, (_, row) => operations.get(row)).filter(Boolean)).toContain(
+        'WRITE',
+      );
     }
     expect(overflowCount).toBeGreaterThan(0);
     expect(resolveEnumLookupDescriptor(child.callsitePlan.schema)).toBe(lookup);

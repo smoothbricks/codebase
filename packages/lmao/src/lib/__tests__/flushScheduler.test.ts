@@ -27,7 +27,7 @@ function createTestBuffer(): AnySpanBuffer {
       const entryTypes = buffer.entry_type;
       if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
       entryTypes[i] = 1;
-    };
+    }
   }
   return buffer;
 }

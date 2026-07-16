@@ -9,9 +9,9 @@
 
 import { Column, type Table, tableFromColumns } from '@uwdata/flechette';
 import type { CapacityStatsEntry } from './arrow/capacityStats.js';
+import type { ArrowLease } from './arrow/lease.js';
 import { cleanupDebug } from './cleanupDiagnostics.js';
 import { convertSpanTreeToLeasedArrowTable } from './convertToArrow.js';
-import type { ArrowLease } from './arrow/lease.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
 import type { AnySpanBuffer, OpMetadata } from './types.js';
 
@@ -459,8 +459,7 @@ export class FlushScheduler {
         pendingBuffers: this.buffers.size,
       });
       // Do NOT reset buffers on failure to avoid data loss
-    }
-    finally {
+    } finally {
       for (const lease of leases) lease.release();
     }
   }

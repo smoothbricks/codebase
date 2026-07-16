@@ -16,8 +16,8 @@
 import type { Nanoseconds } from '@smoothbricks/arrow-builder';
 import type { BufferStrategy } from './bufferStrategy.js';
 import type { LogSchema } from './schema/LogSchema.js';
-import type { AnySpanBuffer } from './types.js';
 import type { TraceTopology } from './traceTopology.js';
+import type { AnySpanBuffer } from './types.js';
 
 export type { SpanIdentity, TraceId } from './traceId.js';
 // Re-export TraceId types from traceId.ts
@@ -97,7 +97,6 @@ export interface ITraceRoot<T extends LogSchema = LogSchema> {
   readonly _system: ArrayBuffer;
   /** Canonical immutable UTF-8 trace ID bytes, shared by span identity construction. */
   readonly _traceIdBytes: Uint8Array;
-
 
   /**
    * Tracer reference for lifecycle hooks and event callbacks.
