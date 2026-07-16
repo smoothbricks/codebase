@@ -98,8 +98,6 @@ jobs:
       # Step 10
       - name: 🔨 Build (${{ steps.version.outputs.mode }})
         if: ${{ steps.version.outputs.mode != 'none' }}
-        env:
-          GITHUB_SHA: ${{ steps.release-state.outputs.sha }}
         run:
           smoo github-ci nx-run-many --targets build --projects "${{ steps.version.outputs.projects }}"
           --collect-outputs "${{ runner.temp }}/release-build-outputs"
@@ -107,8 +105,6 @@ jobs:
       # Step 11
       - name: 🐧 Build supplemental Linux targets
         if: ${{ steps.version.outputs.mode != 'none' }}
-        env:
-          GITHUB_SHA: ${{ steps.release-state.outputs.sha }}
         run:
           smoo github-ci nx-run-many --targets "*-linux" --projects "${{ steps.version.outputs.projects }}"
           --collect-outputs "${{ runner.temp }}/linux-platform-outputs"
@@ -220,8 +216,6 @@ jobs:
 
       # Step 5
       - name: 🍎 Build macOS and iOS targets
-        env:
-          GITHUB_SHA: ${{ github.sha }}
         run:
           smoo github-ci nx-run-many --targets "*-macos,*-ios" --collect-outputs "${{ runner.temp
           }}/macos-platform-outputs"
@@ -304,8 +298,8 @@ jobs:
       - name: 📦 Apply verified Linux outputs
         if: ${{ needs.linux-release-candidate.outputs.mode != 'none' }}
         run:
-          smoo github-ci apply-outputs --source-sha "${{ needs.linux-release-candidate.outputs.release-sha }}" \ "${{
-          runner.temp }}/publish-artifacts/publish-release-outputs-${{ github.run_id }}" \ "${{ runner.temp
+          smoo github-ci apply-outputs --source-sha "${{ needs.linux-release-candidate.outputs.release-sha }}" "${{
+          runner.temp }}/publish-artifacts/publish-release-outputs-${{ github.run_id }}" "${{ runner.temp
           }}/publish-artifacts/publish-linux-outputs-${{ github.run_id }}"
 
       # Step 9
