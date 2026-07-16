@@ -28,12 +28,29 @@ interface NativeModule {
 
 const assertNativeModule = typia.createAssert<NativeModule>();
 
+function nativeBinaryName(): string {
+  switch (process.platform) {
+    case 'darwin':
+      if (process.arch === 'arm64' || process.arch === 'x64') {
+        return `cowshed.darwin-${process.arch}.node`;
+      }
+      break;
+    case 'linux':
+      if (process.arch === 'arm64' || process.arch === 'x64') {
+        return `cowshed.linux-${process.arch}-gnu.node`;
+      }
+      break;
+  }
+  throw new Error(`Unsupported Cowshed native target: ${process.platform}-${process.arch}`);
+}
+
 export function loadNativeModule(): NativeModule {
+  const binaryName = nativeBinaryName();
   const override = process.env.COWSHED_NODE_PATH;
   const candidates = [
     ...(override ? [override] : []),
-    new URL('../dist/cowshed.node', import.meta.url).pathname,
-    new URL('./cowshed.node', import.meta.url).pathname,
+    new URL(`../dist/${binaryName}`, import.meta.url).pathname,
+    new URL(`./${binaryName}`, import.meta.url).pathname,
   ];
   const require = createRequire(import.meta.url);
   let lastError: unknown;
@@ -46,7 +63,7 @@ export function loadNativeModule(): NativeModule {
     }
   }
 
-  throw new Error('Could not load cowshed.node. Run `nx run cowshed:cargo-napi` for this platform.', {
+  throw new Error(`Could not load ${binaryName}. Run \`nx run cowshed:cargo-napi\` for this platform.`, {
     cause: lastError,
   });
 }

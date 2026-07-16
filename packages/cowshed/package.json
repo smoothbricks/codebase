@@ -16,6 +16,15 @@
   "files": [
     "dist"
   ],
+  "napi": {
+    "binaryName": "cowshed",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-unknown-linux-gnu"
+    ]
+  },
   "scripts": {
     "test": "nx run cowshed:test --outputStyle=stream",
     "build:napi": "nx run cowshed:cargo-napi"
@@ -35,14 +44,15 @@
           "{projectRoot}/Cargo.toml",
           "{projectRoot}/Cargo.lock",
           "{projectRoot}/.cargo/config.toml",
-          "{projectRoot}/scripts/build-napi.ts"
+          "{projectRoot}/package.json",
+          "{workspaceRoot}/bun.lock"
         ],
         "outputs": [
-          "{projectRoot}/dist/cowshed.node"
+          "{projectRoot}/dist/**/*.node"
         ],
         "options": {
           "cwd": "{projectRoot}",
-          "command": "bun scripts/build-napi.ts"
+          "command": "napi build --release --platform --no-js --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist"
         }
       },
       "test": {
@@ -83,6 +93,7 @@
     "typia": "13.1.0"
   },
   "devDependencies": {
+    "@napi-rs/cli": "3.7.3",
     "@smoothbricks/lmao": "workspace:*",
     "@smoothbricks/validation": "workspace:*",
     "@types/node": "~24.0.0",
