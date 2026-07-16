@@ -256,9 +256,6 @@ export async function githubCiNxRunMany(root: string, options: NxRunManyOptions)
   if (expanded.unmatchedGlobs.length > 0) {
     console.log(`No Nx targets matched target glob(s): ${expanded.unmatchedGlobs.join(', ')}; skipping.`);
   }
-  if (expanded.runs.length === 0) {
-    return;
-  }
   for (const targetRun of expanded.runs) {
     await run('nx', nxRunManyArgs(targetRun, options.configuration), root);
   }

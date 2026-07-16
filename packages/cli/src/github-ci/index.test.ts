@@ -8,6 +8,7 @@ import type { ProjectTargets } from '../nx/index.js';
 import {
   expandNxTargetDependencyRuns,
   expandNxTargetRuns,
+  githubCiNxRunMany,
   nxRunManyArgs,
   nxSmartArgs,
   readGitHeadSha,
@@ -131,6 +132,32 @@ describe('collected Nx outputs', () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  it('collects an empty artifact when selected projects have no matching target', async () => {
+    await withNxRunManyFixture(async ({ root, artifact }) => {
+      await githubCiNxRunMany(root, {
+        targets: '*-linux',
+        projects: 'app',
+        collectOutputs: artifact,
+      });
+
+      const sourceSha = await readGitHeadSha(root);
+      expect(JSON.parse(await readFile(join(artifact, 'manifest.json'), 'utf8'))).toEqual({
+        version: 1,
+        sourceSha,
+        files: [],
+      });
+    });
+  });
+
+  it('creates a transferable empty artifact when no target runs match', async () => {
+    await withOutputFixture(async ({ root, artifact }) => {
+      const manifest = await collectNxOutputs(root, artifact, [], SOURCE_SHA);
+
+      expect(manifest).toEqual({ version: 1, sourceSha: SOURCE_SHA, files: [] });
+      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [])).resolves.toBeUndefined();
+    });
   });
 
   it('collects aggregate same-project dependency outputs once with dependency ownership', async () => {
@@ -417,6 +444,37 @@ async function withOutputFixture(
   try {
     await mkdir(join(root, 'packages/app/dist'), { recursive: true });
     await run({ root, artifact, outputProject, temp });
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+}
+
+async function withNxRunManyFixture(
+  run: (fixture: { root: string; artifact: string }) => Promise<void>,
+): Promise<void> {
+  const temp = await mkdtemp(join(tmpdir(), 'smoo-empty-platform-output-'));
+  const root = join(temp, 'repo');
+  const artifact = join(temp, 'artifact');
+  try {
+    await mkdir(join(root, 'packages/app'), { recursive: true });
+    await symlink(join(import.meta.dir, '../../../../node_modules'), join(root, 'node_modules'), 'dir');
+    await writeFile(
+      join(root, 'package.json'),
+      JSON.stringify({ name: '@fixture/root', private: true, workspaces: ['packages/*'] }),
+    );
+    await writeFile(join(root, 'nx.json'), '{}');
+    await writeFile(
+      join(root, 'packages/app/package.json'),
+      JSON.stringify({
+        name: '@fixture/app',
+        nx: { name: 'app', targets: { build: { executor: 'nx:noop' } } },
+      }),
+    );
+    await $`git init --quiet`.cwd(root);
+    await $`git add .`.cwd(root).quiet();
+    await $`git -c user.name=Test -c user.email=test@example.com commit --quiet -m fixture`.cwd(root);
+
+    await run({ root, artifact });
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
