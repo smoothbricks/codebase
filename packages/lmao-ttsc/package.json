@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/lmao-ttsc",
-  "version": "0.1.6-next.0",
+  "version": "0.1.6",
   "type": "module",
   "sideEffects": [
     "./dist/bun-register.js"
@@ -99,7 +99,7 @@
           "command": "bun test --timeout=30000 --parallel=3",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
-          "killAfterMs": 1e4
+          "killAfterMs": 10000
         }
       }
     },
