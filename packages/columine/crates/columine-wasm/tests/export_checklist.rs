@@ -5,7 +5,7 @@
 //! RETE/ax_eval/condition-tree families.
 
 /// Every function export of the Zig columine.wasm.
-pub const ZIG_COLUMINE_EXPORTS: [&str; 56] = [
+pub const ZIG_COLUMINE_EXPORTS: [&str; 61] = [
     "vm_calculate_grown_state_size",
     "vm_calculate_state_size",
     "vm_delta_apply_rollback_segment",
@@ -53,6 +53,11 @@ pub const ZIG_COLUMINE_EXPORTS: [&str; 56] = [
     "vm_set_iter_next",
     "vm_set_iter_start",
     "vm_set_rbmp_scratch",
+    "vm_struct_map2_get_row_ptr",
+    "vm_struct_map2_iter_key1",
+    "vm_struct_map2_iter_key2",
+    "vm_struct_map2_iter_next",
+    "vm_struct_map2_iter_start",
     "vm_struct_map_get_row_ptr",
     "vm_struct_map_iter_key",
     "vm_struct_map_iter_next",
@@ -105,11 +110,15 @@ fn wasm_exports(bytes: &[u8]) -> Vec<(String, u8)> {
 }
 
 #[test]
-fn zig_export_list_is_complete_and_deduped() {
+fn export_list_is_complete_and_deduped() {
     let mut names: Vec<&str> = ZIG_COLUMINE_EXPORTS.to_vec();
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), 56, "duplicate names in the checklist");
+    assert_eq!(
+        names.len(),
+        ZIG_COLUMINE_EXPORTS.len(),
+        "duplicate names in the checklist"
+    );
 }
 
 /// `just wasm` (columine justfile) runs this against the built artifact.
@@ -134,7 +143,7 @@ fn built_wasm_exports_every_zig_symbol_and_memory() {
         .collect();
     assert!(
         missing.is_empty(),
-        "exports missing vs Zig columine.wasm: {missing:?}"
+        "exports missing from the Columine ABI checklist: {missing:?}"
     );
     let extra: Vec<&str> = fn_names
         .iter()
@@ -143,7 +152,7 @@ fn built_wasm_exports_every_zig_symbol_and_memory() {
         .collect();
     assert!(
         extra.is_empty(),
-        "exports beyond the frozen Zig columine.wasm surface: {extra:?}"
+        "exports beyond the Columine ABI checklist: {extra:?}"
     );
     assert!(
         exports.iter().any(|(n, k)| n == "memory" && *k == 2),
