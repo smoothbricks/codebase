@@ -158,6 +158,7 @@ jobs:
           path: ${{ runner.temp }}/release-build-outputs
           if-no-files-found: error
           retention-days: 1
+          include-hidden-files: true
 
       # Step 18
       - name: 📤 Upload supplemental Linux outputs
@@ -168,6 +169,7 @@ jobs:
           path: ${{ runner.temp }}/linux-platform-outputs
           if-no-files-found: error
           retention-days: 1
+          include-hidden-files: true
 
       # --- Cleanup ------------------------------------------------------------
 
@@ -211,18 +213,12 @@ jobs:
         run: nx build cli
 
       # Step 5
-      - name: 🍎 Build current macOS and iOS targets
+      - name: 🍎 Build selected macOS and iOS release outputs
         run:
-          smoo github-ci nx-run-many --targets "*-macos,*-ios" --collect-outputs "${{ runner.temp
-          }}/macos-platform-outputs/current"
+          smoo release build-platform-outputs --bump "${{ inputs.bump }}" --ref "${{ github.sha }}" --targets
+          "*-macos,*-ios" --output "${{ runner.temp }}/macos-platform-outputs"
 
       # Step 6
-      - name: 🧯 Build pending release macOS and iOS targets
-        run:
-          smoo release build-repair-platform-outputs --ref "${{ github.sha }}" --targets "*-macos,*-ios" --output "${{
-          runner.temp }}/macos-platform-outputs/repairs"
-
-      # Step 7
       - name: 📤 Upload macOS platform outputs
         uses: actions/upload-artifact@v7.0.1
         with:
@@ -230,10 +226,11 @@ jobs:
           path: ${{ runner.temp }}/macos-platform-outputs
           if-no-files-found: error
           retention-days: 1
+          include-hidden-files: true
 
       # --- Cleanup ------------------------------------------------------------
 
-      # Step 8
+      # Step 7
       - name: 🧹 Cleanup and cache Nix/devenv
         if: ${{ always() }}
         uses: ./.github/actions/save-nix-devenv

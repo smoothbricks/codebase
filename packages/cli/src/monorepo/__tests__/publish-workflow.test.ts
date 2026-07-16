@@ -95,7 +95,7 @@ describe('publish workflow definition', () => {
 
     expect(stepAnchorNumbers(singleJob)).toEqual(Array.from({ length: 15 }, (_, index) => index + 1));
     expect(stepAnchorNumbers(linuxCandidate)).toEqual(Array.from({ length: 19 }, (_, index) => index + 1));
-    expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 8 }, (_, index) => index + 1));
+    expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 7 }, (_, index) => index + 1));
     expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 14 }, (_, index) => index + 1));
     expect(singleJob).toContain('# Step 14\n      - name: 📦 Publish release (${{ steps.version.outputs.mode }})');
     expect(singleJob).toContain('# Step 15\n      - name: 🧹 Cleanup and cache Nix/devenv');
@@ -104,9 +104,8 @@ describe('publish workflow definition', () => {
       '# Step 8\n      - name: ✅ Check managed monorepo files (${{ steps.version.outputs.mode }})',
     );
     expect(linuxCandidate).toContain('# Step 19\n      - name: 🧹 Cleanup and cache Nix/devenv');
-    expect(macosPlatform).toContain('# Step 5\n      - name: 🍎 Build current macOS and iOS targets');
-    expect(macosPlatform).toContain('# Step 6\n      - name: 🧯 Build pending release macOS and iOS targets');
-    expect(macosPlatform).toContain('# Step 8\n      - name: 🧹 Cleanup and cache Nix/devenv');
+    expect(macosPlatform).toContain('# Step 5\n      - name: 🍎 Build selected macOS and iOS release outputs');
+    expect(macosPlatform).toContain('# Step 7\n      - name: 🧹 Cleanup and cache Nix/devenv');
     expect(finalJob).toContain('# Step 7\n      - name: 🧯 Repair pending releases');
     expect(finalJob).toContain('# Step 8\n      - name: ♻️ Restore validated release state');
     expect(finalJob).toContain('# Step 9\n      - name: 📦 Apply verified Linux outputs');
@@ -151,13 +150,11 @@ describe('publish workflow definition', () => {
     expect(linuxCandidate).toContain(
       `smoo github-ci nx-run-many --targets "${LINUX_PLATFORM_TARGET_GLOBS.join(',')}" --projects`,
     );
-    expect(macosPlatform).toContain(
-      `smoo github-ci nx-run-many --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(',')}" --collect-outputs`,
-    );
-    expect(macosPlatform).toContain(
-      `smoo release build-repair-platform-outputs --ref "\${{ github.sha }}" --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(
+    expect(macosPlatform).not.toContain('smoo github-ci nx-run-many');
+    expect(foldedRunCommand(macosPlatform, '🍎 Build selected macOS and iOS release outputs')).toBe(
+      `smoo release build-platform-outputs --bump "\${{ inputs.bump }}" --ref "\${{ github.sha }}" --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(
         ',',
-      )}"`,
+      )}" --output "\${{ runner.temp }}/macos-platform-outputs"`,
     );
     expect(finalJob).not.toContain('smoo release version');
     expect(finalJob).not.toContain('nx-run-many');
@@ -171,6 +168,7 @@ describe('publish workflow definition', () => {
     expect(native).toContain('name: publish-release-state-${{ github.run_id }}');
     expect(native).toContain('name: publish-release-outputs-${{ github.run_id }}');
     expect(native).toContain('name: publish-linux-outputs-${{ github.run_id }}');
+    expect(native.match(/include-hidden-files: true/g)).toHaveLength(4);
     expect(native).toContain('name: publish-macos-outputs-${{ github.run_id }}');
     expect(native).toContain('git bundle create');
     expect(native).toContain('git fetch "${{ runner.temp }}/publish-artifacts/publish-release-state-');

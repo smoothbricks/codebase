@@ -705,6 +705,7 @@ function renderLinuxReleaseCandidateSteps(
     `          path: ${githubExpression('runner.temp')}/release-build-outputs`,
     '          if-no-files-found: error',
     '          retention-days: 1',
+    '          include-hidden-files: true',
   );
   if (hasLinuxPlatformTargets(options)) {
     lines.push(
@@ -718,6 +719,7 @@ function renderLinuxReleaseCandidateSteps(
       `          path: ${githubExpression('runner.temp')}/linux-platform-outputs`,
       '          if-no-files-found: error',
       '          retention-days: 1',
+      '          include-hidden-files: true',
     );
   }
   lines.push(
@@ -767,19 +769,12 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
   lines.push(
     '',
     `      # Step ${stepNumber++}`,
-    '      - name: 🍎 Build current macOS and iOS targets',
+    '      - name: 🍎 Build selected macOS and iOS release outputs',
     '        run:',
-    `          smoo github-ci nx-run-many --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(
-      ',',
-    )}" --collect-outputs "${githubExpression('runner.temp')}/macos-platform-outputs/current"`,
-    '',
-    `      # Step ${stepNumber++}`,
-    '      - name: 🧯 Build pending release macOS and iOS targets',
-    '        run:',
-    `          smoo release build-repair-platform-outputs --ref "${githubExpression(
-      'github.sha',
-    )}" --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(',')}" --output`,
-    `          "${githubExpression('runner.temp')}/macos-platform-outputs/repairs"`,
+    `          smoo release build-platform-outputs --bump "${githubExpression(
+      'inputs.bump',
+    )}" --ref "${githubExpression('github.sha')}" --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(',')}" --output`,
+    `          "${githubExpression('runner.temp')}/macos-platform-outputs"`,
     '',
     `      # Step ${stepNumber++}`,
     '      - name: 📤 Upload macOS platform outputs',
@@ -789,6 +784,7 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     `          path: ${githubExpression('runner.temp')}/macos-platform-outputs`,
     '          if-no-files-found: error',
     '          retention-days: 1',
+    '          include-hidden-files: true',
     '',
     '      # --- Cleanup ------------------------------------------------------------',
     '',
