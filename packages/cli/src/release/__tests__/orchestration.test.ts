@@ -23,14 +23,15 @@ const prerelease: ReleasePackageInfo = {
 };
 
 describe('release orchestration', () => {
-  it('repairs an older target with one checkout, one devenv load, npm-only build, and GitHub create calls', async () => {
+  it('repairs an older target and refreshes devenv after restoring the caller ref', async () => {
     const target = releaseTarget('older-release', [stable, prerelease], [stable], [prerelease]);
     const shell = new RecordingRepairShell();
 
     const summaries = await repairPendingTargets(shell, [target], 'restore-ref', false);
 
     expect(shell.checkouts).toEqual(['older-release', 'restore-ref']);
-    expect(shell.devenvLoads).toBe(1);
+    expect(shell.devenvLoads).toBe(2);
+    expect(shell.devenvRefs).toEqual(['older-release', 'restore-ref']);
     expect(shell.builds).toEqual([['@scope/stable']]);
     expect(shell.publishes).toEqual([{ name: '@scope/stable', distTag: 'latest', dryRun: false }]);
     expect(shell.githubCreates).toEqual([{ name: '@scope/prerelease', dryRun: false }]);
@@ -216,6 +217,7 @@ class RecordingRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
   readonly npmQueries: string[][] = [];
   readonly githubQueries: string[][] = [];
   devenvLoads = 0;
+  readonly devenvRefs: string[] = [];
   currentRef = 'head';
   private readonly npmMissing: Set<string>;
   private readonly githubMissing: Set<string>;
@@ -264,6 +266,7 @@ class RecordingRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
 
   async withDevenvEnv<T>(runWithEnv: () => Promise<T>): Promise<T> {
     this.devenvLoads += 1;
+    this.devenvRefs.push(this.currentRef);
     return runWithEnv();
   }
 }

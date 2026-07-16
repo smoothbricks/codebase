@@ -158,6 +158,12 @@ export async function repairPendingTargets<Package extends ReleasePackageInfo>(
     }
   } finally {
     await shell.checkout(restoreRef);
+    if (targets.length > 0) {
+      // Loading devenv at a historical release can rebuild ignored tool outputs
+      // from that checkout. Refresh after restoring HEAD so later release phases
+      // cannot combine the current CLI with an older Nx plugin build.
+      await shell.withDevenvEnv(async () => undefined);
+    }
   }
   return summaries;
 }
