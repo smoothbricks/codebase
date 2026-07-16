@@ -371,6 +371,7 @@ export function validatePublicPackageMetadata(root: string): number {
 
 export function validateWorkspaceDependencies(root: string, options: PackageTargetPolicyOptions = {}): number {
   let failures = 0;
+  failures += validateCiSkipTags(root, options);
   const workspaceNames = new Set(getWorkspacePackages(root).map((pkg) => pkg.name));
   for (const pkg of listPackageJsonRecords(root)) {
     for (const field of workspaceDependencyFields) {
@@ -400,6 +401,33 @@ export function validateWorkspaceDependencies(root: string, options: PackageTarg
   }
   if (failures === 0) {
     console.log('Workspace dependency policy is valid.');
+  }
+  return failures;
+}
+
+const ciSkipTagPrefix = 'ci:skip:';
+const validNxTargetName = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+
+function validateCiSkipTags(root: string, options: PackageTargetPolicyOptions): number {
+  let failures = 0;
+  for (const pkg of getWorkspacePackages(root)) {
+    const resolved = options.resolvedTargetsByProject?.get(pkg.projectName);
+    const resolvedTargets = resolved && 'targets' in resolved ? resolved.targets : resolved;
+    for (const tag of pkg.tags) {
+      if (tag !== 'ci:skip' && !tag.startsWith(ciSkipTagPrefix)) {
+        continue;
+      }
+      const target = tag.startsWith(ciSkipTagPrefix) ? tag.slice(ciSkipTagPrefix.length) : '';
+      if (!validNxTargetName.test(target)) {
+        console.error(`${pkg.path}: nx tag ${tag} must use ci:skip:<target> with one exact Nx target name`);
+        failures++;
+        continue;
+      }
+      if (resolvedTargets && !resolvedTargets.has(target)) {
+        console.error(`${pkg.path}: nx tag ${tag} names missing Nx target ${target}`);
+        failures++;
+      }
+    }
   }
   return failures;
 }
