@@ -181,7 +181,7 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         '          path: |',
         '            .nx/cache',
         '            .nx/workspace-data/*.db*',
-        '          key: ${{ runner.os }}-nx-db-v1-${{ github.sha }}',
+        '          key: ${{ runner.os }}-${{ runner.arch }}-nx-db-v1-${{ github.sha }}',
       ];
     case CiWorkflowStepKind.UploadTraceDbs:
       return [
