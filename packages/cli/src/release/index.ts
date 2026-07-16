@@ -206,6 +206,7 @@ export async function releaseTrustPublisher(root: string, options: ReleaseTrustP
       trustPublisher: (pkg, dryRun, env) =>
         runLatestNpmTrust(root, npmTrustGithubArgs(pkg.name, repository, workflow, dryRun), env),
       trustedPublishers: (pkg) => listTrustedPublishers(root, pkg),
+      login: () => runLatestNpm(root, ['login', '--auth-type=web']),
       log: (message) => console.log(message),
       error: (message) => console.error(message),
     },
@@ -233,7 +234,8 @@ export interface TrustPublisherShell<Package extends ReleasePackageInfo = Releas
   packageExists(name: string): Promise<boolean>;
   bootstrapNpmPackages(options: BootstrapNpmPackagesOptions): Promise<Package[]>;
   trustPublisher(pkg: Package, dryRun: boolean, env?: Record<string, string>): Promise<TrustPublisherResult>;
-  trustedPublishers(pkg: Package): Promise<TrustedPublisher[]>;
+  trustedPublishers(pkg: Package): Promise<TrustedPublisherLookup>;
+  login(): Promise<void>;
   log(message: string): void;
   error(message: string): void;
 }
@@ -246,6 +248,14 @@ export interface TrustedPublisher {
   file?: string;
   repository?: string;
 }
+
+export interface NpmTrustAccessDenied {
+  readonly status: 'access-denied';
+  readonly identity: string;
+  readonly owners: string;
+}
+
+export type TrustedPublisherLookup = TrustedPublisher[] | NpmTrustAccessDenied;
 
 export async function configureTrustedPublishers<Package extends ReleasePackageInfo>(
   shell: TrustPublisherShell<Package>,
@@ -283,7 +293,7 @@ export async function configureTrustedPublishers<Package extends ReleasePackageI
   const failedPackages: string[] = [];
   for (const pkg of selectedPackages) {
     if (!options.dryRun) {
-      const trustedPublishers = await shell.trustedPublishers(pkg);
+      const trustedPublishers = await trustedPublishersWithOwnerLogin(shell, pkg);
       if (hasMatchingGithubTrustedPublisher(trustedPublishers, shell.repository, shell.workflow)) {
         shell.log(`${pkg.name}: npm trusted publisher is already configured; skipping.`);
         continue;
@@ -321,6 +331,33 @@ export async function configureTrustedPublishers<Package extends ReleasePackageI
   if (failedPackages.length > 0) {
     shell.error(`Trusted publishing was not configured for: ${failedPackages.join(', ')}`);
   }
+}
+
+async function trustedPublishersWithOwnerLogin<Package extends ReleasePackageInfo>(
+  shell: TrustPublisherShell<Package>,
+  pkg: Package,
+): Promise<TrustedPublisher[]> {
+  let result = await shell.trustedPublishers(pkg);
+  if (Array.isArray(result)) {
+    return result;
+  }
+
+  shell.error(
+    `${pkg.name}: npm trust access denied for npm account "${result.identity}". ` +
+      `npm trust requires package write access. Package owners:\n${result.owners}`,
+  );
+  shell.log(`${pkg.name}: opening npm browser login. Sign in as a listed package owner, then return here.`);
+  await shell.login();
+
+  result = await shell.trustedPublishers(pkg);
+  if (Array.isArray(result)) {
+    return result;
+  }
+  throw new Error(
+    `${pkg.name}: npm trust access denied for npm account "${result.identity}". ` +
+      `npm trust requires package write access. Package owners:\n${result.owners}\n` +
+      'npm browser login completed, but the selected account still cannot manage this package.',
+  );
 }
 
 function selectedTrustPublisherPackages<Package extends ReleasePackageInfo>(
@@ -1473,7 +1510,7 @@ async function runLatestNpmTrust(
   throw new Error(`nix shell nixpkgs#nodejs_latest -c npm ${npmArgs.join(' ')} failed with exit code ${status}`);
 }
 
-async function listTrustedPublishers(root: string, pkg: Pick<ReleasePackage, 'name'>): Promise<TrustedPublisher[]> {
+async function listTrustedPublishers(root: string, pkg: Pick<ReleasePackage, 'name'>): Promise<TrustedPublisherLookup> {
   const args = ['trust', 'list', pkg.name, '--json'];
   let result = await runResult('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...args], root);
   if (result.exitCode !== 0 && /\bEOTP\b/.test(`${result.stdout}\n${result.stderr}`)) {
@@ -1483,12 +1520,37 @@ async function listTrustedPublishers(root: string, pkg: Pick<ReleasePackage, 'na
     }
     result = await runResult('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...args], root);
   }
+  if (result.exitCode !== 0 && npmTrustListAccessDenied(result.stdout, result.stderr)) {
+    return npmTrustAccessDetails(root, pkg.name);
+  }
   if (result.exitCode !== 0) {
     throw new Error(
       `nix shell nixpkgs#nodejs_latest -c npm ${args.join(' ')} failed with exit code ${result.exitCode}`,
     );
   }
   return parseTrustedPublishers(result.stdout, pkg.name);
+}
+
+export function npmTrustListAccessDenied(stdout: string, stderr: string): boolean {
+  return /\bE403\b/.test(`${stdout}\n${stderr}`);
+}
+
+async function npmTrustAccessDetails(root: string, packageName: string): Promise<NpmTrustAccessDenied> {
+  const [identityResult, ownersResult] = await Promise.all([
+    runResult('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', 'whoami'], root),
+    runResult('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', 'owner', 'ls', packageName], root),
+  ]);
+  return {
+    status: 'access-denied',
+    identity:
+      identityResult.exitCode === 0 && identityResult.stdout.trim().length > 0
+        ? identityResult.stdout.trim()
+        : '(not authenticated)',
+    owners:
+      ownersResult.exitCode === 0 && ownersResult.stdout.trim().length > 0
+        ? ownersResult.stdout.trim()
+        : '(owner lookup unavailable)',
+  };
 }
 
 export function parseTrustedPublishers(stdout: string, packageName: string): TrustedPublisher[] {
