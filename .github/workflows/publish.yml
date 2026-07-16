@@ -77,6 +77,7 @@ jobs:
           smoo release version --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}" --github-output
           "$GITHUB_OUTPUT"
 
+      # Step 8
       - name: 🔒 Capture candidate release SHA
         id: release-state
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -88,11 +89,12 @@ jobs:
       # never relies on task outputs restored from CI cache. version runs before
       # validation so the commit completed below is the commit that was checked.
 
-      # Step 8
+      # Step 9
       - name: ✅ Check managed monorepo files (${{ steps.version.outputs.mode }})
         if: ${{ steps.version.outputs.mode != 'none' }}
         run: smoo monorepo check
 
+      # Step 10
       - name: 🍎 Build macOS and iOS targets
         if: ${{ steps.version.outputs.mode != 'none' }}
         env:
@@ -103,12 +105,14 @@ jobs:
 
       # --- Candidate transfer --------------------------------------------------
 
+      # Step 11
       - name: 📦 Bundle validated release state
         run:
           mkdir -p "${{ runner.temp }}/publish-release-state" && git bundle create "${{ runner.temp
           }}/publish-release-state/release-state.bundle" HEAD --tags && git rev-parse HEAD > "${{ runner.temp
           }}/publish-release-state/release-head"
 
+      # Step 12
       - name: 📤 Upload validated release state
         uses: actions/upload-artifact@v7.0.1
         with:
@@ -117,6 +121,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      # Step 13
       - name: 📤 Upload macOS platform outputs
         if: ${{ steps.version.outputs.mode != 'none' }}
         uses: actions/upload-artifact@v7.0.1
@@ -128,6 +133,7 @@ jobs:
 
       # --- Cleanup ------------------------------------------------------------
 
+      # Step 14
       - name: 🧹 Cleanup and cache Nix/devenv
         if: ${{ always() }}
         uses: ./.github/actions/save-nix-devenv
@@ -142,6 +148,10 @@ jobs:
       NIX_STORE_NAR: ${{ github.workspace }}/nix-store.nar
       GH_TOKEN: ${{ github.token }}
     steps:
+      # --- Setup --------------------------------------------------------------
+
+      # Step 1: GitHub adds "Set up job" automatically
+      # Step 2
       - name: 📥 Checkout dispatch commit
         uses: actions/checkout@v6.0.2
         with:
@@ -149,6 +159,7 @@ jobs:
           filter: blob:none
           fetch-depth: 0
 
+      # Step 3
       - name: 📥 Download candidate artifacts
         uses: actions/download-artifact@v8.0.1
         with:
@@ -156,46 +167,63 @@ jobs:
           path: ${{ runner.temp }}/publish-artifacts
           merge-multiple: false
 
+      # Step 4
       - name: ♻️ Restore validated release state
         run:
           git fetch "${{ runner.temp }}/publish-artifacts/publish-release-state-${{ github.run_id
           }}/release-state.bundle" HEAD --tags && git reset --hard "$(cat "${{ runner.temp
           }}/publish-artifacts/publish-release-state-${{ github.run_id }}/release-head")"
 
+      # Step 5. Composite action internals do not affect top-level job step
+      # anchors; update these comments if top-level steps move.
       - name: 🧱 Setup Nix/devenv
         id: setup
         uses: ./.github/actions/setup-devenv
 
+      # Step 6
       - name: 🤖 Configure release author
         run:
           git config user.name "github-actions[bot]" && git config user.email
           "41898282+github-actions[bot]@users.noreply.github.com"
 
+      # Step 7
       - name: 🏗️ Build self-hosted smoo
         # SmoothBricks self-hosts smoo from source for release commands.
         run: nx build cli
 
+      # --- Validation ---------------------------------------------------------
+
+      # Release validation intentionally does not restore persisted Nx task
+      # cache. Nx may reuse tasks produced earlier in this same job, but publish
+      # never relies on task outputs restored from CI cache. version runs before
+      # validation so the commit completed below is the commit that was checked.
+
+      # Step 8
       - name: 🔨 Build (${{ needs.macos-release-candidate.outputs.mode }})
         if: ${{ needs.macos-release-candidate.outputs.mode != 'none' }}
         run:
           smoo github-ci nx-run-many --targets build --projects "${{ needs.macos-release-candidate.outputs.projects }}"
 
+      # Step 9
       - name: 🐧 Build supplemental Linux targets
         if: ${{ needs.macos-release-candidate.outputs.mode != 'none' }}
         run:
           smoo github-ci nx-run-many --targets "*-linux" --projects "${{ needs.macos-release-candidate.outputs.projects
           }}"
 
+      # Step 10
       - name: 🔍 Lint (${{ needs.macos-release-candidate.outputs.mode }})
         if: ${{ needs.macos-release-candidate.outputs.mode != 'none' }}
         run:
           smoo github-ci nx-run-many --targets lint --projects "${{ needs.macos-release-candidate.outputs.projects }}"
 
+      # Step 11
       - name: 🧪 Unit Tests (${{ needs.macos-release-candidate.outputs.mode }})
         if: ${{ needs.macos-release-candidate.outputs.mode != 'none' }}
         run:
           smoo github-ci nx-run-many --targets test --projects "${{ needs.macos-release-candidate.outputs.projects }}"
 
+      # Step 12
       - name: 📎 Upload trace DBs
         if: ${{ failure() }}
         uses: actions/upload-artifact@v7.0.1
@@ -206,22 +234,30 @@ jobs:
           retention-days: 14
           include-hidden-files: true
 
+      # Step 13
       - name: 📦 Apply verified native outputs
         if: ${{ needs.macos-release-candidate.outputs.mode != 'none' }}
         run:
           smoo github-ci apply-outputs --source-sha "${{ needs.macos-release-candidate.outputs.release-sha }}" "${{
           runner.temp }}/publish-artifacts/publish-macos-outputs-${{ github.run_id }}"
 
+      # Step 14
       - name: ✅ Validate restored release (${{ needs.macos-release-candidate.outputs.mode }})
         if: ${{ needs.macos-release-candidate.outputs.mode != 'none' }}
         run: smoo monorepo validate
 
+      # --- Release ------------------------------------------------------------
+
+      # Step 15
       - name: 📦 Publish release (${{ needs.macos-release-candidate.outputs.mode }})
         # smoo packs with Bun, then publishes tarballs with npm. Existing
         # packages must already exist on npm and use trusted publishing/OIDC.
         # Missing package names are bootstrapped locally before trust setup.
         run: smoo release publish --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"
 
+      # --- Cleanup ------------------------------------------------------------
+
+      # Step 16
       - name: 🧹 Cleanup and cache Nix/devenv
         if: ${{ always() }}
         uses: ./.github/actions/save-nix-devenv
