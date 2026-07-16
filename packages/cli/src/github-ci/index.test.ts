@@ -5,7 +5,13 @@ import { join } from 'node:path';
 import { $ } from 'bun';
 import { decode } from '../lib/run.js';
 import type { ProjectTargets } from '../nx/index.js';
-import { expandNxTargetRuns, nxRunManyArgs, nxSmartArgs, readGitHeadSha } from './index.js';
+import {
+  expandNxTargetDependencyRuns,
+  expandNxTargetRuns,
+  nxRunManyArgs,
+  nxSmartArgs,
+  readGitHeadSha,
+} from './index.js';
 import { applyCollectedOutputs, type CollectedOutputsManifest, collectNxOutputs } from './outputs.js';
 
 const SOURCE_SHA = 'a'.repeat(40);
@@ -57,6 +63,41 @@ describe('GitHub CI Nx target expansion', () => {
     ]);
   });
 
+  it('scopes glob candidates to selected projects and rejects empty project selections', () => {
+    expect(expandNxTargetRuns(projects, { targets: '*-macos', projects: 'api' })).toEqual({
+      runs: [],
+      unmatchedGlobs: ['*-macos'],
+    });
+    expect(() => expandNxTargetRuns(projects, { targets: 'test', projects: 'missing-*' })).toThrow(
+      'No Nx projects matched',
+    );
+    expect(expandNxTargetRuns([], { targets: 'missing' })).toEqual({ runs: [], unmatchedGlobs: [] });
+    expect(() => nxRunManyArgs({ target: 'test', projects: [] })).toThrow('has no selected projects');
+  });
+
+  it('expands same-project target dependencies in dependency-first order exactly once', () => {
+    const project: ProjectTargets = {
+      project: 'native',
+      root: 'packages/native',
+      targets: ['build', 'compile-linux', 'package-linux'],
+      targetDependencies: new Map([
+        ['build', ['compile-*', 'compile-linux']],
+        ['compile-linux', ['package-linux', '^build']],
+      ]),
+      targetOutputs: new Map([
+        ['build', ['{projectRoot}/dist']],
+        ['compile-linux', ['{projectRoot}/dist/**/*.bin']],
+        ['package-linux', ['{projectRoot}/dist/**/*.tar']],
+      ]),
+    };
+
+    expect(
+      expandNxTargetDependencyRuns([{ target: 'build', projects: [project] }]).map(
+        (run) => `${run.projects.map((owner) => owner.project).join(',')}:${run.target}`,
+      ),
+    ).toEqual(['native:package-linux', 'native:compile-linux', 'native:build']);
+  });
+
   it('adds the generic target skip tag only to nx-smart', () => {
     expect(nxSmartArgs('test', 'affected')).toEqual([
       'affected',
@@ -87,6 +128,55 @@ describe('collected Nx outputs', () => {
     }
   });
 
+  it('collects aggregate same-project dependency outputs once with dependency ownership', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject }) => {
+      outputProject.targets = ['build', 'compile-linux', 'package-linux'];
+      outputProject.targetDependencies = new Map([
+        ['build', ['compile-linux']],
+        ['compile-linux', ['package-linux']],
+      ]);
+      outputProject.targetOutputs = new Map([
+        ['build', ['{projectRoot}/dist']],
+        ['compile-linux', ['{projectRoot}/dist/**/*.bin']],
+        ['package-linux', ['{projectRoot}/dist/package/**/*.tar']],
+      ]);
+      await mkdir(join(root, 'packages/app/dist/package'), { recursive: true });
+      await writeFile(join(root, 'packages/app/dist/result.bin'), 'linux binary');
+      await writeFile(join(root, 'packages/app/dist/package/release.tar'), 'linux package');
+
+      const runs = expandNxTargetDependencyRuns([{ target: 'build', projects: [outputProject] }]);
+      const manifest = await collectNxOutputs(root, artifact, runs, SOURCE_SHA);
+
+      expect(manifest.files.map((file) => `${file.project}:${file.target}:${file.path}`)).toEqual([
+        'app:package-linux:packages/app/dist/package/release.tar',
+        'app:compile-linux:packages/app/dist/result.bin',
+      ]);
+    });
+  });
+
+  it('rejects overlapping outputs from unrelated targets', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject }) => {
+      outputProject.targets = ['first-linux', 'second-linux'];
+      outputProject.targetOutputs = new Map([
+        ['first-linux', ['{projectRoot}/dist/**/*.bin']],
+        ['second-linux', ['{projectRoot}/dist/**/*.bin']],
+      ]);
+      await writeFile(join(root, 'packages/app/dist/result.bin'), 'collision');
+
+      await expect(
+        collectNxOutputs(
+          root,
+          artifact,
+          [
+            { target: 'first-linux', projects: [outputProject] },
+            { target: 'second-linux', projects: [outputProject] },
+          ],
+          SOURCE_SHA,
+        ),
+      ).rejects.toThrow('Output collision');
+    });
+  });
+
   it('collects declared files and applies a verified overlay', async () => {
     await withOutputFixture(async ({ root, artifact, outputProject }) => {
       const source = join(root, 'packages/app/dist/result.bin');
@@ -105,7 +195,7 @@ describe('collected Nx outputs', () => {
           {
             project: 'app',
             target: 'build-macos',
-            output: 'packages/app/dist/**/*.bin',
+            output: '{projectRoot}/dist/**/*.bin',
             path: 'packages/app/dist/result.bin',
             size: 15,
           },
@@ -114,7 +204,7 @@ describe('collected Nx outputs', () => {
       expect(await readFile(join(artifact, 'workspace/packages/app/dist/result.bin'), 'utf8')).toBe('native artifact');
 
       await rm(join(root, 'packages/app/dist'), { recursive: true, force: true });
-      await applyCollectedOutputs(root, [artifact], SOURCE_SHA);
+      await applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject]);
       expect(await readFile(source, 'utf8')).toBe('native artifact');
     });
   });
@@ -147,15 +237,19 @@ describe('collected Nx outputs', () => {
       await writeFile(join(root, 'packages/app/dist/result.bin'), 'native artifact');
       await collectNxOutputs(root, artifact, [{ target: 'build-macos', projects: [outputProject] }], SOURCE_SHA);
 
-      await expect(applyCollectedOutputs(root, [artifact], OTHER_SHA)).rejects.toThrow('Source SHA mismatch');
+      await expect(applyCollectedOutputs(root, [artifact], OTHER_SHA, [outputProject])).rejects.toThrow(
+        'Source SHA mismatch',
+      );
 
       const staged = join(artifact, 'workspace/packages/app/dist/result.bin');
       await writeFile(staged, 'corrupt artifact');
-      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA)).rejects.toThrow(/mismatch/);
+      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject])).rejects.toThrow(/mismatch/);
 
       await writeFile(staged, 'native artifact');
       await writeFile(join(artifact, 'workspace/undeclared.txt'), 'extra');
-      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA)).rejects.toThrow('Undeclared staged output');
+      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject])).rejects.toThrow(
+        'Undeclared staged output',
+      );
     });
   });
 
@@ -174,11 +268,46 @@ describe('collected Nx outputs', () => {
         files: manifest.files.map((file, index) => (index === 0 ? { ...file, path: '../escape.bin' } : file)),
       };
       await writeFile(join(artifact, 'manifest.json'), `${JSON.stringify(malicious)}\n`);
-      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA)).rejects.toThrow('escapes the workspace');
+      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject])).rejects.toThrow(
+        'escapes the workspace',
+      );
 
       await writeFile(join(artifact, 'manifest.json'), `${JSON.stringify({ ...manifest, unexpected: true })}\n`);
-      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA)).rejects.toThrow(
+      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject])).rejects.toThrow(
         'Invalid collected output manifest',
+      );
+
+      await writeFile(
+        join(artifact, 'manifest.json'),
+        `${JSON.stringify({
+          ...manifest,
+          files: manifest.files.map((file) => ({ ...file, output: '{workspaceRoot}/**/*' })),
+        })}\n`,
+      );
+      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject])).rejects.toThrow(
+        'is not declared by Nx target',
+      );
+
+      await writeFile(
+        join(artifact, 'manifest.json'),
+        `${JSON.stringify({
+          ...manifest,
+          files: manifest.files.map((file) => ({ ...file, project: 'unknown-project' })),
+        })}\n`,
+      );
+      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject])).rejects.toThrow(
+        'unknown Nx project',
+      );
+
+      await writeFile(
+        join(artifact, 'manifest.json'),
+        `${JSON.stringify({
+          ...manifest,
+          files: manifest.files.map((file) => ({ ...file, target: '*-macos' })),
+        })}\n`,
+      );
+      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject])).rejects.toThrow(
+        'must be an exact Nx name',
       );
 
       await writeFile(join(artifact, 'manifest.json'), `${JSON.stringify(manifest)}\n`);
@@ -187,9 +316,9 @@ describe('collected Nx outputs', () => {
       await Bun.write(join(secondArtifact, 'manifest.json'), JSON.stringify(manifest));
       await mkdir(join(secondArtifact, 'workspace/packages/app/dist'), { recursive: true });
       await Bun.write(join(secondArtifact, 'workspace/packages/app/dist/result.bin'), 'native artifact');
-      await expect(applyCollectedOutputs(root, [artifact, secondArtifact], SOURCE_SHA)).rejects.toThrow(
-        'Output collision across collected trees',
-      );
+      await expect(
+        applyCollectedOutputs(root, [artifact, secondArtifact], SOURCE_SHA, [outputProject]),
+      ).rejects.toThrow('Output collision across collected trees');
     });
   });
 
@@ -198,7 +327,7 @@ describe('collected Nx outputs', () => {
       await expect(
         collectNxOutputs(root, artifact, [{ target: 'build-macos', projects: [outputProject] }], 'not-a-git-sha'),
       ).rejects.toThrow('40- or 64-character hexadecimal Git SHA');
-      await expect(applyCollectedOutputs(root, [artifact], 'not-a-git-sha')).rejects.toThrow(
+      await expect(applyCollectedOutputs(root, [artifact], 'not-a-git-sha', [outputProject])).rejects.toThrow(
         '40- or 64-character hexadecimal Git SHA',
       );
     });
@@ -214,7 +343,9 @@ describe('collected Nx outputs', () => {
       await rm(join(root, 'packages/app'), { recursive: true, force: true });
       await symlink(outside, join(root, 'packages/app'), 'dir');
 
-      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA)).rejects.toThrow('symbolic link');
+      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject])).rejects.toThrow(
+        'symbolic link',
+      );
       expect(await Bun.file(join(outside, 'dist/result.bin')).exists()).toBe(false);
     });
 
@@ -228,7 +359,9 @@ describe('collected Nx outputs', () => {
       await rm(output);
       await symlink(outside, output, 'file');
 
-      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA)).rejects.toThrow('symbolic link');
+      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject])).rejects.toThrow(
+        'symbolic link',
+      );
       expect(await readFile(outside, 'utf8')).toBe('must remain unchanged');
     });
   });

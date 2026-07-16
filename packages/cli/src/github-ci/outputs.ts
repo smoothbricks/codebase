@@ -4,7 +4,7 @@ import { copyFile, lstat, mkdir, readdir, readFile, writeFile } from 'node:fs/pr
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { isRecord } from '@smoothbricks/validation';
 import typia from 'typia';
-import type { ProjectTargets } from '../nx/index.js';
+import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 
 export interface CollectedOutputFile {
   project: string;
@@ -44,7 +44,7 @@ export async function collectNxOutputs(
   assertGitSha(sourceSha, 'Collected output source SHA');
 
   const pending: PendingOutputFile[] = [];
-  const claimedPaths = new Set<string>();
+  const claimedPaths = new Map<string, { project: string; target: string }>();
   for (const run of runs) {
     for (const project of run.projects) {
       const outputs = project.targetOutputs?.get(run.target);
@@ -58,10 +58,17 @@ export async function collectNxOutputs(
           throw new Error(`Declared output ${declaredOutput} for ${project.project}:${run.target} is missing.`);
         }
         for (const path of matchedFiles) {
-          if (claimedPaths.has(path)) {
+          const claimed = claimedPaths.get(path);
+          if (claimed) {
+            if (
+              claimed.project === project.project &&
+              targetTransitivelyDependsOn(project, run.target, claimed.target, new Set())
+            ) {
+              continue;
+            }
             throw new Error(`Output collision: ${path} is declared by more than one project target or output.`);
           }
-          claimedPaths.add(path);
+          claimedPaths.set(path, { project: project.project, target: run.target });
           const source = resolveWorkspacePath(root, path, 'output file');
           const stat = await lstat(source);
           if (!stat.isFile() || stat.isSymbolicLink()) {
@@ -70,7 +77,7 @@ export async function collectNxOutputs(
           pending.push({
             project: project.project,
             target: run.target,
-            output,
+            output: declaredOutput,
             path,
             size: stat.size,
             sha256: await sha256File(source),
@@ -103,11 +110,14 @@ export async function applyCollectedOutputs(
   root: string,
   directories: string[],
   expectedSourceSha: string,
+  projects?: ProjectTargets[],
 ): Promise<void> {
   if (directories.length === 0) {
     throw new Error('At least one collected output directory is required.');
   }
   assertGitSha(expectedSourceSha, 'Expected source SHA');
+  const resolvedProjects = projects ?? (await readProjectTargets(root));
+  const projectsByName = new Map(resolvedProjects.map((project) => [project.project, project]));
 
   const overlays: Array<{ source: string; destination: string }> = [];
   const claimedPaths = new Set<string>();
@@ -129,10 +139,23 @@ export async function applyCollectedOutputs(
     const workspace = resolve(directory, 'workspace');
     const declaredPaths = new Set<string>();
     for (const file of manifest.files) {
+      assertExactManifestName(file.project, 'Manifest project');
+      assertExactManifestName(file.target, 'Manifest target');
+      const project = projectsByName.get(file.project);
+      if (!project) {
+        throw new Error(`Manifest references unknown Nx project ${file.project}.`);
+      }
+      if (!project.targets.includes(file.target)) {
+        throw new Error(`Manifest references unknown Nx target ${file.project}:${file.target}.`);
+      }
+      const declaredOutputs = project.targetOutputs?.get(file.target) ?? [];
+      if (!declaredOutputs.includes(file.output)) {
+        throw new Error(`Manifest output ${file.output} is not declared by Nx target ${file.project}:${file.target}.`);
+      }
       const path = validateWorkspaceRelativePath(file.path, 'manifest file path');
-      const output = validateWorkspaceRelativePattern(file.output, 'manifest output');
+      const output = resolveDeclaredOutput(file.output, project);
       if (!outputContainsPath(output, path)) {
-        throw new Error(`Manifest file ${path} is not contained by declared output ${output}.`);
+        throw new Error(`Manifest file ${path} is not contained by declared output ${file.output}.`);
       }
       if (declaredPaths.has(path)) {
         throw new Error(`Manifest contains a duplicate output file: ${path}`);
@@ -195,6 +218,33 @@ export function resolveDeclaredOutput(declaredOutput: string, project: ProjectTa
     throw new Error(`Unsupported Nx output placeholder in ${project.project}:${declaredOutput}`);
   }
   return validateWorkspaceRelativePattern(substituted, `output for ${project.project}`);
+}
+
+function targetTransitivelyDependsOn(
+  project: ProjectTargets,
+  target: string,
+  candidate: string,
+  visited: Set<string>,
+): boolean {
+  if (visited.has(target)) {
+    return false;
+  }
+  visited.add(target);
+  for (const dependency of project.targetDependencies?.get(target) ?? []) {
+    if (dependency.startsWith('^')) {
+      continue;
+    }
+    const targets = GLOB_MAGIC.test(dependency)
+      ? project.targets.filter((entry) => new Bun.Glob(dependency).match(entry))
+      : [dependency];
+    if (
+      targets.includes(candidate) ||
+      targets.some((dependencyTarget) => targetTransitivelyDependsOn(project, dependencyTarget, candidate, visited))
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 async function filesMatchingOutput(root: string, output: string): Promise<string[]> {
@@ -283,6 +333,12 @@ async function listRegularFiles(directory: string): Promise<string[]> {
     }
   }
   return files;
+}
+
+function assertExactManifestName(value: string, description: string): void {
+  if (!value || GLOB_MAGIC.test(value)) {
+    throw new Error(`${description} must be an exact Nx name: ${value}`);
+  }
 }
 
 function validateWorkspaceRelativePattern(value: string, description: string): string {
