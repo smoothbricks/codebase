@@ -13,7 +13,7 @@ import type { TracerLifecycleHooks } from '../../traceRoot.js';
 import { iterateSpanChildren, iterateSpanTree, NO_NODE } from '../../traceTopology.js';
 import { WasmBufferStrategy } from '../WasmBufferStrategy.js';
 import { createWasmAllocator } from '../wasmAllocator.js';
-import type { WasmSpanBufferInstance } from '../wasmSpanBuffer.js';
+import { isWasmSpanBufferInstance, type WasmSpanBufferInstance } from '../wasmSpanBuffer.js';
 import { createWasmTraceRoot } from '../wasmTraceRoot.js';
 
 describe('WasmBufferStrategy', () => {
@@ -27,6 +27,13 @@ describe('WasmBufferStrategy', () => {
 
   // Test metadata for buffer creation
   const testMetadata = createOpMetadata('test-op', 'test-package', 'test.ts', 'abc123', 1);
+
+  function requireWasmSpanBuffer<T extends typeof testSchema>(value: unknown): WasmSpanBufferInstance<T> {
+    if (!isWasmSpanBufferInstance<T>(value)) {
+      throw new Error('expected WasmSpanBufferInstance');
+    }
+    return value;
+  }
 
   // Mock tracer lifecycle hooks for WasmTraceRoot
   let strategy: WasmBufferStrategy<typeof testSchema>;
@@ -399,9 +406,7 @@ describe('WasmBufferStrategy', () => {
         bufferStrategy: leasedStrategy,
       };
       const traceRoot = createWasmTraceRoot(leasedStrategy.allocator, 'leased-wasm', leasedTracer);
-      const root = leasedStrategy.createSpanBuffer(testSchema, traceRoot, testMetadata, 8) as WasmSpanBufferInstance<
-        typeof testSchema
-      >;
+      const root = requireWasmSpanBuffer(leasedStrategy.createSpanBuffer(testSchema, traceRoot, testMetadata, 8));
       root.timestamp[0] = 9_001n;
       {
         const entryTypes = root.entry_type;
@@ -447,12 +452,7 @@ describe('WasmBufferStrategy', () => {
       expect(() => lease.release()).not.toThrow();
 
       const nextTraceRoot = createWasmTraceRoot(leasedStrategy.allocator, 'leased-wasm-next', leasedTracer);
-      const next = leasedStrategy.createSpanBuffer(
-        testSchema,
-        nextTraceRoot,
-        testMetadata,
-        8,
-      ) as WasmSpanBufferInstance<typeof testSchema>;
+      const next = requireWasmSpanBuffer(leasedStrategy.createSpanBuffer(testSchema, nextTraceRoot, testMetadata, 8));
       expect(next._familyPtrs.f64).toBe(f64Pointer);
       leasedStrategy.releaseBuffer(next);
     });

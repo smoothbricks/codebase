@@ -147,7 +147,7 @@ export function generateFixedPositionWriterClass(
 ): string {
   const schemaFields = schema._columns;
   void eagerColumns;
-  const enumEncoderNames = Object.create(null) as Record<string, string>;
+  const enumEncoderNames: Record<string, string> = Object.create(null);
   const enumEncoderBindings = enumLookup.ordered.map(({ fieldName }, index) => {
     const encoderName = `encodeEnum${index}`;
     enumEncoderNames[fieldName] = encoderName;

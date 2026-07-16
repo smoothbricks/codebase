@@ -1182,8 +1182,12 @@ type EpochPinnableAllocator = { pinMemoryEpoch(): MemoryEpochPin };
 type EpochPinnableBuffer = AnySpanBuffer & { readonly _allocator: EpochPinnableAllocator };
 
 function isEpochPinnableBuffer(buffer: AnySpanBuffer): buffer is EpochPinnableBuffer {
+  if (!('_allocator' in buffer)) return false;
+  const allocator = Reflect.get(buffer, '_allocator');
   return (
-    '_allocator' in buffer && typeof (buffer as Partial<EpochPinnableBuffer>)._allocator?.pinMemoryEpoch === 'function'
+    typeof allocator === 'object' &&
+    allocator !== null &&
+    typeof Reflect.get(allocator, 'pinMemoryEpoch') === 'function'
   );
 }
 

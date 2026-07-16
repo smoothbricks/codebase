@@ -398,7 +398,7 @@ function buildSpanLoggerExtension(
 ): ColumnWriterExtension {
   const schemaFields = schema._columns;
 
-  const enumEncoderNames = Object.create(null) as Record<string, string>;
+  const enumEncoderNames: Record<string, string> = Object.create(null);
   const enumEncoderBindings = enumLookup.ordered.map(({ fieldName }, index) => {
     const encoderName = `encodeEnum${index}`;
     enumEncoderNames[fieldName] = encoderName;

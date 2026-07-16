@@ -134,6 +134,7 @@ function constructorOf(value: object): (...args: never[]) => unknown {
   const prototype = Object.getPrototypeOf(value);
   const ctor = Reflect.get(prototype, 'constructor');
   if (typeof ctor !== 'function') throw new Error('context prototype has no constructor');
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- Reflect.get only proves Function; callers only compare constructor identity.
   return ctor as (...args: never[]) => unknown;
 }
 
