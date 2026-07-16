@@ -3,6 +3,8 @@ import { appendFile, mkdtemp, realpath, rename, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { $ } from 'bun';
 import { decode, run, runStatus } from '../lib/run.js';
+import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
+import type { NxTargetRun } from './outputs.js';
 
 type NxSmartMode = 'auto' | 'affected' | 'run-many';
 
@@ -113,6 +115,15 @@ async function addReferencesFrom(roots: Set<string>, path: string, cwd: string):
   }
 }
 
+export function nxSmartArgs(target: string, mode: 'affected' | 'run-many', configuration?: string): string[] {
+  const args = [mode, '-t', target];
+  if (configuration) {
+    args.push(`--configuration=${configuration}`);
+  }
+  args.push(`--exclude=tag:ci:skip:${target}`, '--parallel=5');
+  return args;
+}
+
 export async function githubCiNxSmart(
   root: string,
   options: { target: string; name?: string; step?: string; mode?: NxSmartMode; configuration?: string },
@@ -121,11 +132,7 @@ export async function githubCiNxSmart(
   const step = options.step ?? '';
   await createGithubStatus(name, step);
   const mode = resolveNxSmartMode(options.mode ?? 'auto');
-  const nxArgs = mode === 'run-many' ? ['run-many', '-t', options.target] : ['affected', '-t', options.target];
-  if (options.configuration) {
-    nxArgs.push(`--configuration=${options.configuration}`);
-  }
-  nxArgs.push('--parallel=5');
+  const nxArgs = nxSmartArgs(options.target, mode, options.configuration);
   const status = await runStatus('nx', nxArgs, root);
   await updateGithubStatus(name, status === 0 ? 'success' : 'failure', step);
   if (status !== 0) {
@@ -133,18 +140,98 @@ export async function githubCiNxSmart(
   }
 }
 
-export async function githubCiNxRunMany(
-  root: string,
-  options: { targets: string; projects?: string; configuration?: string },
-): Promise<void> {
-  const nxArgs = ['run-many', '-t', options.targets, '--parallel=5'];
-  if (options.projects) {
-    nxArgs.push(`--projects=${options.projects}`);
+export interface NxRunManyOptions {
+  targets: string;
+  projects?: string;
+  configuration?: string;
+  collectOutputs?: string;
+}
+
+export interface ExpandedNxTargetRuns {
+  runs: NxTargetRun[];
+  unmatchedGlobs: string[];
+}
+
+export function expandNxTargetRuns(projects: ProjectTargets[], options: NxRunManyOptions): ExpandedNxTargetRuns {
+  const selectedProjects = selectProjects(projects, options.projects);
+  const allTargetNames = [...new Set(projects.flatMap((project) => project.targets))].sort((a, b) =>
+    a.localeCompare(b),
+  );
+  const runs: NxTargetRun[] = [];
+  const unmatchedGlobs: string[] = [];
+  const addedTargets = new Set<string>();
+  for (const targetPattern of commaSeparatedValues(options.targets)) {
+    const isGlob = /[*?{[]/.test(targetPattern);
+    const targets = isGlob
+      ? allTargetNames.filter((target) => new Bun.Glob(targetPattern).match(target))
+      : [targetPattern];
+    if (isGlob && targets.length === 0) {
+      unmatchedGlobs.push(targetPattern);
+    }
+    for (const target of targets) {
+      if (addedTargets.has(target)) {
+        continue;
+      }
+      addedTargets.add(target);
+      const owners = selectedProjects.filter((project) => project.targets.includes(target));
+      runs.push({
+        target,
+        projects: owners.length > 0 ? owners : selectedProjects,
+      });
+    }
   }
-  if (options.configuration) {
-    nxArgs.push(`--configuration=${options.configuration}`);
+  return { runs, unmatchedGlobs };
+}
+
+export function nxRunManyArgs(run: NxTargetRun, configuration?: string): string[] {
+  const nxArgs = ['run-many', '-t', run.target];
+  if (run.projects.length > 0) {
+    nxArgs.push(`--projects=${run.projects.map((project) => project.project).join(',')}`);
   }
-  await run('nx', nxArgs, root);
+  if (configuration) {
+    nxArgs.push(`--configuration=${configuration}`);
+  }
+  nxArgs.push('--parallel=5');
+  return nxArgs;
+}
+
+export async function githubCiNxRunMany(root: string, options: NxRunManyOptions): Promise<void> {
+  const expanded = expandNxTargetRuns(await readProjectTargets(root), options);
+  if (expanded.unmatchedGlobs.length > 0) {
+    console.log(`No Nx targets matched target glob(s): ${expanded.unmatchedGlobs.join(', ')}; skipping.`);
+  }
+  if (expanded.runs.length === 0) {
+    return;
+  }
+  for (const targetRun of expanded.runs) {
+    await run('nx', nxRunManyArgs(targetRun, options.configuration), root);
+  }
+  if (options.collectOutputs) {
+    if (import.meta.url.endsWith('/src/github-ci/index.ts')) {
+      // Self-hosted source needs the Typia Bun transform registered before loading the manifest boundary.
+      await import('@smoothbricks/validation/bun/preload');
+    }
+    const { collectNxOutputs } = await import('./outputs.js');
+    const sourceSha = process.env.GITHUB_SHA ?? decode((await $`git rev-parse HEAD`.cwd(root).quiet()).stdout).trim();
+    await collectNxOutputs(root, options.collectOutputs, expanded.runs, sourceSha);
+  }
+}
+
+function selectProjects(projects: ProjectTargets[], selectors: string | undefined): ProjectTargets[] {
+  if (!selectors) {
+    return projects.slice().sort((left, right) => left.project.localeCompare(right.project));
+  }
+  const patterns = commaSeparatedValues(selectors);
+  return projects
+    .filter((project) => patterns.some((pattern) => new Bun.Glob(pattern).match(project.project)))
+    .sort((left, right) => left.project.localeCompare(right.project));
+}
+
+function commaSeparatedValues(value: string): string[] {
+  return value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
 }
 
 export async function githubCiNxDeploy(
