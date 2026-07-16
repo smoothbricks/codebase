@@ -289,6 +289,9 @@ smoo monorepo diff
 
 `check` fails when a managed file is missing or stale. `diff` reports drift without writing files.
 
+The generated publish workflow is canonical Prettier YAML. Running the repository formatter over
+`.github/workflows/publish.yml` is byte-stable and does not create managed-file drift.
+
 ## Formatting And Git Hooks
 
 The root `lint:fix` script runs [`git-format-staged`][git-format-staged] with

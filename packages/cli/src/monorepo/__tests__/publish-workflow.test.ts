@@ -8,6 +8,7 @@ import {
   MACOS_PLATFORM_TARGET_GLOBS,
   PLATFORM_TARGET_GLOBS,
 } from '@smoothbricks/nx-plugin/workspace-config-policy';
+import { format } from 'prettier';
 import {
   definePublishWorkflow,
   type PublishWorkflowBump,
@@ -28,6 +29,21 @@ describe('publish workflow definition', () => {
     await expect(readFile(join(packageRoot, '..', '..', '.github/workflows/publish.yml'), 'utf8')).resolves.toBe(
       rendered,
     );
+  });
+
+  it('renders workflow bytes that are stable under the repository Prettier config', async () => {
+    const rendered = renderPublishWorkflowYaml({
+      repoName: '@smoothbricks/codebase',
+      platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+    });
+
+    await expect(
+      format(rendered, {
+        parser: 'yaml',
+        printWidth: 120,
+        proseWrap: 'always',
+      }),
+    ).resolves.toBe(rendered);
   });
 
   it('preserves the single Ubuntu job and renders no artifact transfer when no Apple targets exist', () => {
