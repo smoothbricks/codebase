@@ -32,7 +32,7 @@
     "@smoothbricks/validation": "workspace:*",
     "@uwdata/flechette": "^2.3.0",
     "ttsc": "^0.18.4",
-    "typescript": "^6.0.3"
+    "typescript": "7.0.2"
   },
   "nx": {
     "sourceRoot": "packages/lmao-transformer/src",
@@ -45,7 +45,7 @@
           "command": "bun test --timeout=30000 --parallel=3",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
-          "killAfterMs": 1e4
+          "killAfterMs": 10000.0
         }
       }
     },
