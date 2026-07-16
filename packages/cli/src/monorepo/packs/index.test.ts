@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import type { MonorepoPack } from './index.js';
-import { runValidatePacks } from './index.js';
+import { resolvedTargetsByProject, runValidatePacks } from './index.js';
 
 const ctx = { root: '/workspace', syncRuntime: false };
 
@@ -185,5 +185,22 @@ describe('monorepo validation pack phases', () => {
 
     expect(result).toEqual({ failures: 1, failedChecks: 1 });
     expect(events).toEqual(['pre-fix', 'build']);
+  });
+
+  it('propagates parsed target dependencies through the production adapter', () => {
+    const targetDependencies = new Map([
+      ['build', ['compile-linux']],
+      ['compile-linux', ['package-linux']],
+    ]);
+
+    const resolved = resolvedTargetsByProject([
+      {
+        project: 'native',
+        targets: ['build', 'compile-linux', 'package-linux'],
+        targetDependencies,
+      },
+    ]);
+
+    expect(resolved.get('native')?.targetDependencies).toBe(targetDependencies);
   });
 });
