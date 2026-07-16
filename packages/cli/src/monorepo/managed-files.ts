@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { listReleasePackages, readPackageJson } from '../lib/workspace.js';
 import { renderCiWorkflowYaml } from './ci-workflow.js';
 import { renderPublishWorkflowYaml } from './publish-workflow.js';
@@ -137,6 +138,7 @@ interface ManagedFileContext {
   ciPushBranches: string[];
   nodeModulesCacheKey: string;
   repoName: string;
+  platformTargetGlobs: string[];
 }
 
 interface DeployTargetInfo {
@@ -295,6 +297,7 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         deploy: context.hasProductionDeployTargets,
         deployProvider: context.productionDeployProvider,
         repoName: context.repoName,
+        platformTargetGlobs: context.platformTargetGlobs,
       });
     }
     throw new Error(`Unknown generated managed file source ${file.source}`);
@@ -314,6 +317,7 @@ function getManagedFileContext(root: string): ManagedFileContext {
   const ciPushBranches = getCiPushBranches(packageJson?.json);
   const stagingDeploy = getDeployTargetInfo(root, 'staging');
   const productionDeploy = getDeployTargetInfo(root, 'production');
+  const platformTargetGlobs = platformTargetGlobsForTest(readResolvedNxTargetNames(root));
   const nodeModulesCacheKey = existsSync(join(root, 'bun.lock'))
     ? `$${"{{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json') }}"}`
     : `$${"{{ hashFiles('bun.lockb', 'package.json', 'packages/*/package.json') }}"}`;
@@ -326,7 +330,44 @@ function getManagedFileContext(root: string): ManagedFileContext {
     ciPushBranches,
     nodeModulesCacheKey,
     repoName,
+    platformTargetGlobs,
   };
+}
+
+export function platformTargetGlobsForTest(targetNames: Iterable<string>): string[] {
+  const names = [...targetNames];
+  return PLATFORM_TARGET_GLOBS.filter((glob) => {
+    const suffix = glob.startsWith('*') ? glob.slice(1) : glob;
+    return names.some((name) => name.endsWith(suffix));
+  });
+}
+
+function readResolvedNxTargetNames(root: string): string[] {
+  const output = execFileSync('nx', ['show', 'projects', '--json'], {
+    cwd: root,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  const projects: unknown = JSON.parse(output);
+  if (!Array.isArray(projects) || !projects.every((project) => typeof project === 'string')) {
+    return [];
+  }
+  const targetNames = new Set<string>();
+  for (const project of projects) {
+    const projectOutput = execFileSync('nx', ['show', 'project', project, '--json'], {
+      cwd: root,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'inherit'],
+    });
+    const projectJson: unknown = JSON.parse(projectOutput);
+    const targets = recordValue(recordValue(projectJson)?.targets);
+    if (targets) {
+      for (const targetName of Object.keys(targets)) {
+        targetNames.add(targetName);
+      }
+    }
+  }
+  return [...targetNames];
 }
 
 function renderTemplate(context: ManagedFileContext, template: string): string {

@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'bun:test';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import fc from 'fast-check';
 import {
   extractInlineLocalBlocksForTest,
   INLINE_LOCAL_BEGIN,
   INLINE_LOCAL_END,
   LOCAL_SECTION_MARKER,
+  platformTargetGlobsForTest,
   reinsertInlineLocalBlocksForTest,
   splitLocalSectionForTest,
 } from './managed-files.js';
@@ -148,6 +150,19 @@ describe('managed-file inline local blocks', () => {
         },
       ),
     );
+  });
+});
+
+describe('managed publish platform discovery', () => {
+  it('returns canonical target families from resolved target names without leaking project names', () => {
+    const discovered = platformTargetGlobsForTest(['build', 'bundle-linux', 'package-macos', 'simulator-ios', 'test']);
+
+    expect(discovered).toEqual([...PLATFORM_TARGET_GLOBS]);
+    expect(discovered).not.toContain('native-app');
+  });
+
+  it('returns no platform families for ordinary Nx targets', () => {
+    expect(platformTargetGlobsForTest(['build', 'lint', 'test', 'typecheck'])).toEqual([]);
   });
 });
 

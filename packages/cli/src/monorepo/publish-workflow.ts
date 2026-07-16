@@ -1,5 +1,9 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub Actions expressions are emitted literally. */
 
+import {
+  LINUX_PLATFORM_TARGET_GLOBS,
+  MACOS_PLATFORM_TARGET_GLOBS,
+} from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
 
 export type PublishWorkflowBump = 'auto' | 'patch' | 'minor' | 'major' | 'prerelease';
@@ -42,6 +46,7 @@ export interface PublishWorkflowDefinitionOptions {
   deploy?: boolean;
   deployProvider?: 'cloudflare';
   repoName?: string;
+  platformTargetGlobs?: readonly string[];
 }
 
 export interface PublishWorkflowInputs {
@@ -87,6 +92,15 @@ export interface PublishWorkflowRunResult {
 }
 
 type PublishWorkflowStepInput = Omit<PublishWorkflowStep, 'number'>;
+const MACOS_CANDIDATE_STEP_KINDS: readonly PublishWorkflowStepKind[] = [
+  PublishWorkflowStepKind.Checkout,
+  PublishWorkflowStepKind.SetupDevenv,
+  PublishWorkflowStepKind.ConfigureReleaseAuthor,
+  PublishWorkflowStepKind.BuildSelfHostedCli,
+  PublishWorkflowStepKind.RepairPendingReleases,
+  PublishWorkflowStepKind.VersionRelease,
+  PublishWorkflowStepKind.CheckManagedMonorepoFiles,
+];
 
 export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions = {}): PublishWorkflowDefinition {
   const versionMode = githubExpression('steps.version.outputs.mode');
@@ -256,6 +270,15 @@ function shouldRunStep(
 }
 
 export function renderPublishWorkflowYaml(options: PublishWorkflowDefinitionOptions = {}): string {
+  if (hasMacosPlatformTargets(options)) {
+    return renderPlatformPublishWorkflowYaml(options);
+  }
+  if (hasLinuxPlatformTargets(options)) {
+    return `${renderPublishWorkflowHeader(options)}${renderSingleJobPublishWorkflowSteps(
+      definePublishWorkflow(options).steps,
+      options,
+    )}`;
+  }
   const steps = definePublishWorkflow(options).steps;
   return `${renderPublishWorkflowHeader(options)}${renderPublishWorkflowSteps(steps, options)}`;
 }
@@ -473,6 +496,307 @@ function deployEnvLines(options: PublishWorkflowDefinitionOptions): string[] {
 function conditionalRunStep(step: PublishWorkflowStep, run: string): string[] {
   const condition = "steps.version.outputs.mode != 'none'";
   return [`      - name: ${step.name}`, `        if: ${githubExpression(condition)}`, `        run: ${run}`];
+}
+
+function renderSingleJobPublishWorkflowSteps(
+  steps: PublishWorkflowStep[],
+  options: PublishWorkflowDefinitionOptions,
+): string {
+  const lines: string[] = [];
+  for (const step of steps) {
+    lines.push(...sectionLinesBefore(step));
+    lines.push(...commentLinesForStep(step));
+    lines.push(...yamlLinesForStep(step, options));
+    lines.push('');
+    if (step.kind === PublishWorkflowStepKind.Build) {
+      lines.push(
+        '      - name: 🐧 Build supplemental Linux targets',
+        `        if: ${githubExpression("steps.version.outputs.mode != 'none'")}`,
+        `        run: smoo github-ci nx-run-many --targets "${LINUX_PLATFORM_TARGET_GLOBS.join(',')}" --projects "${githubExpression(
+          'steps.version.outputs.projects',
+        )}"`,
+        '',
+      );
+    }
+  }
+  return `${lines.join('\n').trimEnd()}\n`;
+}
+
+function renderPlatformPublishWorkflowYaml(options: PublishWorkflowDefinitionOptions): string {
+  const deployInput =
+    options.deploy === true
+      ? `
+      deploy_environment:
+        type: choice
+        description: Deploy live systems after a successful publish.
+        options: [none, production]
+        default: none`
+      : '';
+  const steps = definePublishWorkflow(options).steps;
+  return `name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        type: choice
+        description:
+          Use auto for conventional commits, or force a semver bump. Prerelease publishes to next; all others publish to
+          latest.
+        options: [auto, patch, minor, major, prerelease]
+        default: auto
+      dry_run:
+        type: boolean
+        description: Run release commands without writing versions, tags, publishes, or GitHub Releases.
+        default: false${deployInput}
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: release-${githubExpression('github.ref')}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: tooling/direnv
+
+jobs:
+  macos-release-candidate:
+    runs-on: macos-latest
+    outputs:
+      mode: ${githubExpression('steps.version.outputs.mode')}
+      projects: ${githubExpression('steps.version.outputs.projects')}
+      release-sha: ${githubExpression('steps.release-state.outputs.sha')}
+    env:
+      NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
+      GH_TOKEN: ${githubExpression('github.token')}
+    steps:
+${renderMacosReleaseCandidateSteps(steps, options)}
+
+  publish-on-linux:
+    needs: macos-release-candidate
+    runs-on: ubuntu-latest
+    env:
+      NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
+      GH_TOKEN: ${githubExpression('github.token')}
+    steps:
+${renderFinalLinuxPublishSteps(options)}
+`;
+}
+
+function renderMacosReleaseCandidateSteps(
+  steps: PublishWorkflowStep[],
+  options: PublishWorkflowDefinitionOptions,
+): string {
+  const lines: string[] = [];
+  for (const step of steps) {
+    if (!MACOS_CANDIDATE_STEP_KINDS.includes(step.kind)) {
+      continue;
+    }
+    lines.push(...sectionLinesBefore(step));
+    lines.push(...commentLinesForStep(step));
+    if (step.kind === PublishWorkflowStepKind.Checkout) {
+      lines.push(
+        `      - name: ${step.name}`,
+        '        uses: actions/checkout@v6.0.2',
+        '        with:',
+        `          ref: ${githubExpression('github.sha')}`,
+        '          filter: blob:none',
+        '          fetch-depth: 0',
+      );
+    } else {
+      lines.push(...yamlLinesForStep(step, options));
+    }
+    if (step.kind === PublishWorkflowStepKind.VersionRelease) {
+      lines.push(
+        '',
+        '      - name: 🔒 Capture candidate release SHA',
+        '        id: release-state',
+        '        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"',
+      );
+    }
+    lines.push('');
+  }
+  lines.push(
+    '      - name: 🍎 Build macOS and iOS targets',
+    `        if: ${githubExpression("steps.version.outputs.mode != 'none'")}`,
+    '        env:',
+    `          GITHUB_SHA: ${githubExpression('steps.release-state.outputs.sha')}`,
+    '        run:',
+    `          smoo github-ci nx-run-many --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(',')}" --projects`,
+    `          "${githubExpression('steps.version.outputs.projects')}" --collect-outputs`,
+    `          "${githubExpression('runner.temp')}/macos-platform-outputs"`,
+    '',
+    '      # --- Candidate transfer --------------------------------------------------',
+    '',
+    '      - name: 📦 Bundle validated release state',
+    '        run:',
+    `          mkdir -p "${githubExpression('runner.temp')}/publish-release-state" && git bundle create`,
+    `          "${githubExpression('runner.temp')}/publish-release-state/release-state.bundle" HEAD --tags && git rev-parse HEAD >`,
+    `          "${githubExpression('runner.temp')}/publish-release-state/release-head"`,
+    '',
+    '      - name: 📤 Upload validated release state',
+    '        uses: actions/upload-artifact@v7.0.1',
+    '        with:',
+    `          name: publish-release-state-${githubExpression('github.run_id')}`,
+    `          path: ${githubExpression('runner.temp')}/publish-release-state`,
+    '          if-no-files-found: error',
+    '          retention-days: 1',
+    '',
+    '      - name: 📤 Upload macOS platform outputs',
+    `        if: ${githubExpression("steps.version.outputs.mode != 'none'")}`,
+    '        uses: actions/upload-artifact@v7.0.1',
+    '        with:',
+    `          name: publish-macos-outputs-${githubExpression('github.run_id')}`,
+    `          path: ${githubExpression('runner.temp')}/macos-platform-outputs`,
+    '          if-no-files-found: error',
+    '          retention-days: 1',
+    '',
+    '      # --- Cleanup ------------------------------------------------------------',
+    '',
+    '      - name: 🧹 Cleanup and cache Nix/devenv',
+    `        if: ${githubExpression('always()')}`,
+    '        uses: ./.github/actions/save-nix-devenv',
+    '        with:',
+    `          nix-cache-hit: ${githubExpression('steps.setup.outputs.nix-cache-hit')}`,
+    `          devenv-cache-hit: ${githubExpression('steps.setup.outputs.devenv-cache-hit')}`,
+  );
+  return lines.join('\n').trimEnd();
+}
+
+function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions): string {
+  const mode = 'needs.macos-release-candidate.outputs.mode';
+  const projects = githubExpression('needs.macos-release-candidate.outputs.projects');
+  const lines = [
+    '      - name: 📥 Checkout dispatch commit',
+    '        uses: actions/checkout@v6.0.2',
+    '        with:',
+    `          ref: ${githubExpression('github.sha')}`,
+    '          filter: blob:none',
+    '          fetch-depth: 0',
+    '',
+    '      - name: 📥 Download candidate artifacts',
+    '        uses: actions/download-artifact@v8.0.1',
+    '        with:',
+    `          pattern: publish-*-${githubExpression('github.run_id')}`,
+    `          path: ${githubExpression('runner.temp')}/publish-artifacts`,
+    '          merge-multiple: false',
+    '',
+    '      - name: ♻️ Restore validated release state',
+    '        run:',
+    `          git fetch "${githubExpression(
+      'runner.temp',
+    )}/publish-artifacts/publish-release-state-${githubExpression('github.run_id')}/release-state.bundle" HEAD --tags && git reset`,
+    `          --hard "$(cat "${githubExpression(
+      'runner.temp',
+    )}/publish-artifacts/publish-release-state-${githubExpression('github.run_id')}/release-head")"`,
+    '',
+    '      - name: 🧱 Setup Nix/devenv',
+    '        id: setup',
+    '        uses: ./.github/actions/setup-devenv',
+    '',
+    '      - name: 🤖 Configure release author',
+    '        run:',
+    '          git config user.name "github-actions[bot]" && git config user.email',
+    '          "41898282+github-actions[bot]@users.noreply.github.com"',
+  ];
+  if (isSmoothBricksCodebasePackageName(options.repoName)) {
+    lines.push(
+      '',
+      '      - name: 🏗️ Build self-hosted smoo',
+      '        # SmoothBricks self-hosts smoo from source for release commands.',
+      '        run: nx build cli',
+    );
+  }
+  lines.push(
+    '',
+    `      - name: 🔨 Build (${githubExpression(mode)})`,
+    `        if: ${githubExpression(`${mode} != 'none'`)}`,
+    `        run: smoo github-ci nx-run-many --targets build --projects "${projects}"`,
+  );
+  if (hasLinuxPlatformTargets(options)) {
+    lines.push(
+      '',
+      '      - name: 🐧 Build supplemental Linux targets',
+      `        if: ${githubExpression(`${mode} != 'none'`)}`,
+      `        run: smoo github-ci nx-run-many --targets "${LINUX_PLATFORM_TARGET_GLOBS.join(
+        ',',
+      )}" --projects "${projects}"`,
+    );
+  }
+  lines.push(
+    '',
+    `      - name: 🔍 Lint (${githubExpression(mode)})`,
+    `        if: ${githubExpression(`${mode} != 'none'`)}`,
+    `        run: smoo github-ci nx-run-many --targets lint --projects "${projects}"`,
+    '',
+    `      - name: 🧪 Unit Tests (${githubExpression(mode)})`,
+    `        if: ${githubExpression(`${mode} != 'none'`)}`,
+    `        run: smoo github-ci nx-run-many --targets test --projects "${projects}"`,
+    '',
+    '      - name: 📎 Upload trace DBs',
+    `        if: ${githubExpression('failure()')}`,
+    '        uses: actions/upload-artifact@v7.0.1',
+    '        with:',
+    `          name: trace-results-${githubExpression('github.run_id')}`,
+    '          path: packages/*/.trace-results.db',
+    '          if-no-files-found: ignore',
+    '          retention-days: 14',
+    '          include-hidden-files: true',
+    '',
+    '      - name: 📦 Apply verified native outputs',
+    `        if: ${githubExpression(`${mode} != 'none'`)}`,
+    '        run:',
+    `          smoo github-ci apply-outputs --source-sha "${githubExpression(
+      'needs.macos-release-candidate.outputs.release-sha',
+    )}"`,
+    `          "${githubExpression('runner.temp')}/publish-artifacts/publish-macos-outputs-${githubExpression(
+      'github.run_id',
+    )}"`,
+    '',
+    `      - name: ✅ Validate restored release (${githubExpression(mode)})`,
+    `        if: ${githubExpression(`${mode} != 'none'`)}`,
+    '        run: smoo monorepo validate',
+    '',
+    `      - name: 📦 Publish release (${githubExpression(mode)})`,
+    '        # smoo packs with Bun, then publishes tarballs with npm. Existing',
+    '        # packages must already exist on npm and use trusted publishing/OIDC.',
+    '        # Missing package names are bootstrapped locally before trust setup.',
+    `        run: smoo release publish --bump "${githubExpression('inputs.bump')}" --dry-run "${githubExpression(
+      'inputs.dry_run',
+    )}"`,
+  );
+  if (options.deploy === true) {
+    lines.push(
+      '',
+      '      - name: 🚀 Deploy production',
+      '        if:',
+      "          ${{ needs.macos-release-candidate.outputs.mode != 'none' && inputs.deploy_environment == 'production' &&",
+      "          inputs.dry_run != 'true' }}",
+      ...deployEnvLines(options),
+      '        run: smoo github-ci nx-deploy --configuration production --mode run-many --verify --name "Deploy Production"',
+    );
+  }
+  lines.push(
+    '',
+    '      - name: 🧹 Cleanup and cache Nix/devenv',
+    `        if: ${githubExpression('always()')}`,
+    '        uses: ./.github/actions/save-nix-devenv',
+    '        with:',
+    `          nix-cache-hit: ${githubExpression('steps.setup.outputs.nix-cache-hit')}`,
+    `          devenv-cache-hit: ${githubExpression('steps.setup.outputs.devenv-cache-hit')}`,
+  );
+  return lines.join('\n').trimEnd();
+}
+
+function hasMacosPlatformTargets(options: PublishWorkflowDefinitionOptions): boolean {
+  return MACOS_PLATFORM_TARGET_GLOBS.some((glob) => options.platformTargetGlobs?.includes(glob) === true);
+}
+
+function hasLinuxPlatformTargets(options: PublishWorkflowDefinitionOptions): boolean {
+  return LINUX_PLATFORM_TARGET_GLOBS.some((glob) => options.platformTargetGlobs?.includes(glob) === true);
 }
 
 function githubExpression(expression: string): string {
