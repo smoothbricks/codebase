@@ -411,13 +411,17 @@ function registerVocabulary(fragment: VocabularyFragment): VocabularyBinding {
 
 export type RegisterVocabulary = (fragment: VocabularyFragment) => VocabularyBinding;
 
+function isRegisterVocabulary(value: unknown): value is RegisterVocabulary {
+  return typeof value === 'function';
+}
+
 function installVocabularyRegistration(): RegisterVocabulary {
   const globals = globalThis as typeof globalThis & { [REGISTER_VOCABULARY]?: unknown };
   const installed = globals[REGISTER_VOCABULARY];
   if (installed !== undefined) {
-    if (typeof installed !== 'function')
+    if (!isRegisterVocabulary(installed))
       fail('LMAO_VOCABULARY_ABI_UNAVAILABLE', 'global symbol contains a non-function');
-    return installed as RegisterVocabulary;
+    return installed;
   }
   Object.defineProperty(globals, REGISTER_VOCABULARY, {
     value: registerVocabulary,
