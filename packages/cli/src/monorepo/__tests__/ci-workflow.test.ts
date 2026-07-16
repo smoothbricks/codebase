@@ -33,4 +33,15 @@ describe('CI workflow definition', () => {
     expect(rendered).toContain('CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}');
     expect(rendered).toContain('CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}');
   });
+
+  it('uses the same architecture-scoped key to restore and save the Nx cache', async () => {
+    const rendered = renderCiWorkflowYaml({ deploy: false, pushBranches: ['main'] });
+    const packageRoot = join(import.meta.dir, '..', '..', '..');
+    const restoreAction = await readFile(join(packageRoot, '..', '..', '.github/actions/cache-nx/action.yml'), 'utf8');
+    const restoreKey = restoreAction.match(/^\s*key: (.+)$/m)?.[1];
+    const saveKey = rendered.match(/^\s*key: (.+)$/m)?.[1];
+
+    expect(restoreKey).toBe('${{ runner.os }}-${{ runner.arch }}-nx-db-v1-${{ github.sha }}');
+    expect(saveKey).toBe(restoreKey);
+  });
 });

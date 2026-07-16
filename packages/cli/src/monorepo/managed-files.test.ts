@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'bun:test';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import fc from 'fast-check';
 import {
   extractInlineLocalBlocksForTest,
@@ -10,6 +12,15 @@ import {
 } from './managed-files.js';
 
 const MANAGED = '# managed content\npath merge=driver\n';
+
+const REPO_ROOT = join(import.meta.dir, '..', '..', '..', '..');
+const ARCHITECTURE_SCOPED_PREFIX = '${{ runner.os }}-${{ runner.arch }}-';
+const NODE_MODULES_CACHE_KEY = "${{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json') }}";
+const CACHE_ACTIONS = [
+  { name: 'cache-nix-devenv', osKeyLines: 6 },
+  { name: 'cache-node-modules', osKeyLines: 2 },
+  { name: 'cache-nx', osKeyLines: 2 },
+] as const;
 
 describe('managed-file local sections', () => {
   it('content without a marker is entirely managed', () => {
@@ -137,5 +148,36 @@ describe('managed-file inline local blocks', () => {
         },
       ),
     );
+  });
+});
+
+describe('managed cache actions', () => {
+  it('renders the checked-in action copies from their managed templates', async () => {
+    for (const action of CACHE_ACTIONS) {
+      const [template, generated] = await Promise.all([
+        readFile(
+          join(REPO_ROOT, 'packages', 'cli', 'managed', 'templates', 'github', 'actions', action.name, 'action.yml'),
+          'utf8',
+        ),
+        readFile(join(REPO_ROOT, '.github', 'actions', action.name, 'action.yml'), 'utf8'),
+      ]);
+
+      expect(generated).toBe(template.replace('{{NODE_MODULES_CACHE_KEY}}', NODE_MODULES_CACHE_KEY));
+    }
+  });
+
+  it('scopes every primary, restore, and save key to the runner OS and architecture', async () => {
+    for (const action of CACHE_ACTIONS) {
+      for (const actionRoot of [
+        join(REPO_ROOT, 'packages', 'cli', 'managed', 'templates', 'github', 'actions'),
+        join(REPO_ROOT, '.github', 'actions'),
+      ]) {
+        const content = await readFile(join(actionRoot, action.name, 'action.yml'), 'utf8');
+        const osKeyLines = content.split('\n').filter((line) => line.includes('${{ runner.os }}'));
+
+        expect(osKeyLines).toHaveLength(action.osKeyLines);
+        expect(osKeyLines.every((line) => line.includes(ARCHITECTURE_SCOPED_PREFIX))).toBe(true);
+      }
+    }
   });
 });
