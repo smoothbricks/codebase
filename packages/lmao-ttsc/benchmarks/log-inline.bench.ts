@@ -15,38 +15,78 @@ import { bench, group, run } from 'mitata';
 const CAP = 1024;
 const OPS = ['DELETE', 'INSERT', 'SELECT', 'UPDATE'] as const;
 
-function makeBuffer() {
-  const buf: any = {
+interface BenchBuffer {
+  _writeIndex: number;
+  readonly _capacity: number;
+  readonly timestamp: Float64Array;
+  readonly entry_type: Uint8Array;
+  readonly message_values: string[];
+  readonly _messageTemplateIds: Uint16Array;
+  readonly message_nulls: Uint8Array;
+  readonly line_values: Float64Array;
+  readonly line_nulls: Uint8Array;
+  readonly userId_values: string[];
+  readonly userId_nulls: Uint8Array;
+  readonly retries_values: Float64Array;
+  readonly retries_nulls: Uint8Array;
+  readonly operation_values: Uint8Array;
+  readonly operation_nulls: Uint8Array;
+  readonly _traceRoot: {
+    writeLogEntry(buffer: BenchBuffer, entryType: number): number;
+  };
+  readonly constructor: {
+    readonly stats: {
+      totalWrites: number;
+    };
+  };
+}
+
+interface BenchLogger {
+  readonly _buffer: BenchBuffer;
+  _writeIndex: number;
+  _checkOverflow(): void;
+  trace(message: string): BenchLogger;
+  debug(message: string): BenchLogger;
+  info(message: string): BenchLogger;
+  warn(message: string): BenchLogger;
+  error(message: string): BenchLogger;
+  line(value: number): BenchLogger;
+  userId(value: string): BenchLogger;
+  retries(value: number): BenchLogger;
+  operation(value: (typeof OPS)[number]): BenchLogger;
+}
+
+function makeBuffer(): BenchBuffer {
+  return {
     _writeIndex: 2,
     _capacity: CAP,
     timestamp: new Float64Array(CAP),
     entry_type: new Uint8Array(CAP),
-    message_values: new Array(CAP),
+    message_values: new Array<string>(CAP),
     _messageTemplateIds: new Uint16Array(CAP),
     message_nulls: new Uint8Array(CAP >> 3),
     line_values: new Float64Array(CAP),
     line_nulls: new Uint8Array(CAP >> 3),
-    userId_values: new Array(CAP),
+    userId_values: new Array<string>(CAP),
     userId_nulls: new Uint8Array(CAP >> 3),
     retries_values: new Float64Array(CAP),
     retries_nulls: new Uint8Array(CAP >> 3),
     operation_values: new Uint8Array(CAP),
     operation_nulls: new Uint8Array(CAP >> 3),
     _traceRoot: {
-      writeLogEntry(b: any, entryType: number) {
-        const idx = b._writeIndex++;
-        if (idx >= CAP) {
-          b._writeIndex = 2;
+      writeLogEntry(buffer, entryType) {
+        const index = buffer._writeIndex++;
+        if (index >= CAP) {
+          buffer._writeIndex = 2;
           return 2;
-        } // wrap for bench
-        b.timestamp[idx] = idx;
-        b.entry_type[idx] = entryType;
-        return idx;
+        }
+        buffer.timestamp[index] = index;
+        buffer.entry_type[index] = entryType;
+        return index;
       },
     },
+    constructor: { stats: { totalWrites: 0 } },
   };
-  buf.constructor = { stats: { totalWrites: 0 } };
-  return buf;
 }
 
 const setNullBit = (bm: Uint8Array, i: number) => {
@@ -54,43 +94,82 @@ const setNullBit = (bm: Uint8Array, i: number) => {
 };
 
 // Fluent generated-SpanLogger reference (spanLoggerGenerator.ts semantics)
-function makeLogger(buf: any) {
-  const ENTRY: Record<string, number> = { trace: 6, debug: 7, info: 8, warn: 9, error: 10 };
-  const l: any = { _buffer: buf, _writeIndex: 1 };
-  l._checkOverflow = () => {
-    if (buf._writeIndex >= buf._capacity) buf._writeIndex = 2;
-  };
-  for (const level of Object.keys(ENTRY)) {
-    l[level] = (message: string) => {
-      l._checkOverflow();
-      const idx = buf._traceRoot.writeLogEntry(buf, ENTRY[level]);
-      l._writeIndex = idx;
-      if (buf.message_values) {
-        buf.message_values[idx] = message;
-        if (buf.message_nulls) setNullBit(buf.message_nulls, idx);
+function makeLogger(buffer: BenchBuffer): BenchLogger {
+  const logger: BenchLogger = {
+    _buffer: buffer,
+    _writeIndex: 1,
+    _checkOverflow() {
+      if (buffer._writeIndex >= buffer._capacity) {
+        buffer._writeIndex = 2;
       }
-      buf.constructor.stats.totalWrites++;
-      return l;
-    };
-  }
-  const raw = (field: string) => (v: unknown) => {
-    const idx = l._writeIndex;
-    if (buf[`${field}_values`]) {
-      buf[`${field}_values`][idx] = v;
-      if (buf[`${field}_nulls`]) setNullBit(buf[`${field}_nulls`], idx);
-    }
-    return l;
+    },
+    trace(message) {
+      logger._checkOverflow();
+      const index = buffer._traceRoot.writeLogEntry(buffer, 6);
+      logger._writeIndex = index;
+      buffer.message_values[index] = message;
+      setNullBit(buffer.message_nulls, index);
+      buffer.constructor.stats.totalWrites++;
+      return logger;
+    },
+    debug(message) {
+      logger._checkOverflow();
+      const index = buffer._traceRoot.writeLogEntry(buffer, 7);
+      logger._writeIndex = index;
+      buffer.message_values[index] = message;
+      setNullBit(buffer.message_nulls, index);
+      buffer.constructor.stats.totalWrites++;
+      return logger;
+    },
+    info(message) {
+      logger._checkOverflow();
+      const index = buffer._traceRoot.writeLogEntry(buffer, 8);
+      logger._writeIndex = index;
+      buffer.message_values[index] = message;
+      setNullBit(buffer.message_nulls, index);
+      buffer.constructor.stats.totalWrites++;
+      return logger;
+    },
+    warn(message) {
+      logger._checkOverflow();
+      const index = buffer._traceRoot.writeLogEntry(buffer, 9);
+      logger._writeIndex = index;
+      buffer.message_values[index] = message;
+      setNullBit(buffer.message_nulls, index);
+      buffer.constructor.stats.totalWrites++;
+      return logger;
+    },
+    error(message) {
+      logger._checkOverflow();
+      const index = buffer._traceRoot.writeLogEntry(buffer, 10);
+      logger._writeIndex = index;
+      buffer.message_values[index] = message;
+      setNullBit(buffer.message_nulls, index);
+      buffer.constructor.stats.totalWrites++;
+      return logger;
+    },
+    line(value) {
+      buffer.line_values[logger._writeIndex] = value;
+      setNullBit(buffer.line_nulls, logger._writeIndex);
+      return logger;
+    },
+    userId(value) {
+      buffer.userId_values[logger._writeIndex] = value;
+      setNullBit(buffer.userId_nulls, logger._writeIndex);
+      return logger;
+    },
+    retries(value) {
+      buffer.retries_values[logger._writeIndex] = value;
+      setNullBit(buffer.retries_nulls, logger._writeIndex);
+      return logger;
+    },
+    operation(value) {
+      buffer.operation_values[logger._writeIndex] = OPS.indexOf(value);
+      setNullBit(buffer.operation_nulls, logger._writeIndex);
+      return logger;
+    },
   };
-  l.line = raw('line');
-  l.userId = raw('userId');
-  l.retries = raw('retries');
-  l.operation = (v: string) => {
-    const idx = l._writeIndex;
-    buf.operation_values[idx] = Math.max(0, OPS.indexOf(v as (typeof OPS)[number]));
-    setNullBit(buf.operation_nulls, idx);
-    return l;
-  };
-  return l;
+  return logger;
 }
 
 const buf = makeBuffer();
@@ -198,22 +277,18 @@ function makePositionBalancedBuffers() {
 }
 
 function makeRepeatedStringStore(buffer: ReturnType<typeof makeBuffer>) {
-  let iteration = 0;
   return () => {
     const row = buffer._traceRoot.writeLogEntry(buffer, 8);
     buffer.message_values[row] = 'request completed';
     buffer.constructor.stats.totalWrites++;
-    iteration++;
   };
 }
 
 function makeRepeatedTemplateIdStore(buffer: ReturnType<typeof makeBuffer>) {
-  let iteration = 0;
   return () => {
     const row = buffer._traceRoot.writeLogEntry(buffer, 8);
     buffer._messageTemplateIds[row] = 1;
     buffer.constructor.stats.totalWrites++;
-    iteration++;
   };
 }
 
@@ -391,7 +466,24 @@ group('matched message store: dynamic-only position control', () => {
 });
 
 // --- result-chain partial inline (row 1, fires on every op completion) -------
-const rbuf: any = {
+interface ResultBenchBuffer {
+  readonly line_values: Float64Array;
+  readonly line_nulls: Uint8Array;
+  readonly userId_values: string[];
+  readonly userId_nulls: Uint8Array;
+  readonly retries_values: Float64Array;
+  readonly retries_nulls: Uint8Array;
+}
+
+interface BenchResult {
+  readonly _buffer: ResultBenchBuffer;
+  line(value: number): BenchResult;
+  userId(value: string): BenchResult;
+  retries(value: number): BenchResult;
+  with(values: { readonly line?: number; readonly userId?: string; readonly retries?: number }): BenchResult;
+}
+
+const rbuf: ResultBenchBuffer = {
   line_values: new Float64Array(4),
   line_nulls: new Uint8Array(1),
   userId_values: new Array(4),
@@ -399,20 +491,38 @@ const rbuf: any = {
   retries_values: new Float64Array(4),
   retries_nulls: new Uint8Array(1),
 };
-function makeOk(b: any) {
-  const raw = (field: string) => (v: unknown) => {
-    if (b[`${field}_values`]) {
-      b[`${field}_values`][1] = v;
-      if (b[`${field}_nulls`]) b[`${field}_nulls`][0] |= 2;
-    }
-    return r;
+function makeOk(buffer: ResultBenchBuffer): BenchResult {
+  const result: BenchResult = {
+    _buffer: buffer,
+    line(value) {
+      buffer.line_values[1] = value;
+      buffer.line_nulls[0] |= 2;
+      return result;
+    },
+    userId(value) {
+      buffer.userId_values[1] = value;
+      buffer.userId_nulls[0] |= 2;
+      return result;
+    },
+    retries(value) {
+      buffer.retries_values[1] = value;
+      buffer.retries_nulls[0] |= 2;
+      return result;
+    },
+    with(values) {
+      if (values.line !== undefined) {
+        result.line(values.line);
+      }
+      if (values.userId !== undefined) {
+        result.userId(values.userId);
+      }
+      if (values.retries !== undefined) {
+        result.retries(values.retries);
+      }
+      return result;
+    },
   };
-  const r: any = { line: raw('line'), userId: raw('userId'), retries: raw('retries'), _buffer: b };
-  r.with = (obj: Record<string, unknown>) => {
-    for (const [k, v] of Object.entries(obj)) r[k](v);
-    return r;
-  };
-  return r;
+  return result;
 }
 const rctx = { ok: (_v: unknown) => makeOk(rbuf) };
 
