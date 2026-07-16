@@ -49,6 +49,8 @@ export enum SlotType {
   STRUCT_MAP = 6,
   ORDERED_LIST = 7,
   BITMAP = 8,
+  /** Exact two-u32-key struct map. Separate kind preserves STRUCT_MAP layout. */
+  STRUCT_MAP2 = 10,
 }
 
 /**
@@ -133,6 +135,7 @@ export type SlotDef =
   | { type: SlotType.SCALAR; aggType: AggType }
   | { type: SlotType.CONDITION_TREE; capacity?: number }
   | { type: SlotType.STRUCT_MAP; capacity: number; fieldTypes: readonly StructFieldType[]; ttl?: SlotTtlMetadata }
+  | { type: SlotType.STRUCT_MAP2; capacity: number; fieldTypes: readonly StructFieldType[] }
   | {
       type: SlotType.ORDERED_LIST;
       capacity: number;
@@ -168,6 +171,14 @@ export interface ColumnInput {
   type: ValueType;
 }
 
+/** Public low-level reference to a live exact-pair struct-map row. */
+export interface StructMap2RowRef {
+  readonly key1: number;
+  readonly key2: number;
+  /** State-buffer-relative byte offset of the sparse payload row. */
+  readonly rowOffset: number;
+}
+
 // =============================================================================
 // Error Codes
 // =============================================================================
@@ -179,6 +190,8 @@ export enum ErrorCode {
   INVALID_SLOT = 3,
   INVALID_STATE = 4,
   NEEDS_GROWTH = 5,
+  ARENA_OVERFLOW = 6,
+  INVALID_KEY = 7,
 }
 
 // =============================================================================
@@ -277,6 +290,9 @@ export enum Opcode {
   BATCH_STRUCT_MAP_UPSERT_LAST = 0x80, // slot, key_col, num_vals, [val_col, field_idx] × num_vals, num_array_vals, [(offsets_col, values_col, field_idx) × num_array_vals]
   BATCH_STRUCT_MAP_UPSERT_FIRST = 0x81, // same operands; existing persisted keys are left untouched
   BATCH_STRUCT_MAP_UPSERT_MAX = 0x82, // same row operands followed by comparison field_idx; replaces only when incoming comparison is strictly greater
+  SLOT_STRUCT_MAP2 = 0x1b, // same slot operands as SLOT_STRUCT_MAP; type flag low nibble = 10
+  BATCH_STRUCT_MAP2_UPSERT_LAST = 0x83, // slot,key1_col,key2_col,num_vals,[val_col,field_idx] × N
+  BATCH_STRUCT_MAP2_REMOVE = 0x86, // slot,key1_col,key2_col
 
   // Ordered list ops
   SLOT_ORDERED_LIST = 0x19, // slot, type_flags, cap_lo, cap_hi [, num_fields, field_type × num_fields]
@@ -364,6 +380,16 @@ export interface ColumineBackend {
 
   mapGet(state: StateHandle, program: ReducerProgram, slot: number, key: number): number | undefined;
   setContains(state: StateHandle, program: ReducerProgram, slot: number, elem: number): boolean;
+  /** Exact-pair readers are present on Columine's WASM backend; injected older
+   * backends may omit them until they adopt the StructMap2 ABI. */
+  structMap2GetRow?(
+    state: StateHandle,
+    program: ReducerProgram,
+    slot: number,
+    key1: number,
+    key2: number,
+  ): StructMap2RowRef | undefined;
+  structMap2Entries?(state: StateHandle, program: ReducerProgram, slot: number): readonly StructMap2RowRef[];
 
   // ===========================================================================
   // Serialization

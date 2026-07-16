@@ -15,7 +15,7 @@
  */
 
 import { parseReducerProgram } from './reducer-bytecode.js';
-import type { ColumineBackend, ColumnInput, ReducerProgram, StateHandle } from './types.js';
+import type { ColumineBackend, ColumnInput, ReducerProgram, StateHandle, StructMap2RowRef } from './types.js';
 
 // =============================================================================
 // Constants
@@ -75,6 +75,31 @@ interface VmExports {
   // Lookups
   vm_map_get(stateBase: number, slotOffset: number, capacity: number, key: number): number;
   vm_set_contains(stateBase: number, slotOffset: number, capacity: number, elem: number): number;
+  vm_struct_map2_get_row_ptr(
+    stateBase: number,
+    slotOffset: number,
+    capacity: number,
+    numFields: number,
+    rowSize: number,
+    key1: number,
+    key2: number,
+  ): number;
+  vm_struct_map2_iter_start(stateBase: number, slotOffset: number, capacity: number, numFields: number): number;
+  vm_struct_map2_iter_next(
+    stateBase: number,
+    slotOffset: number,
+    capacity: number,
+    numFields: number,
+    current: number,
+  ): number;
+  vm_struct_map2_iter_key1(stateBase: number, slotOffset: number, numFields: number, pos: number): number;
+  vm_struct_map2_iter_key2(
+    stateBase: number,
+    slotOffset: number,
+    capacity: number,
+    numFields: number,
+    pos: number,
+  ): number;
 
   // Undo log operations (Phase 29)
   vm_undo_enable(stateBase: number, stateSize: number): void;
@@ -128,6 +153,11 @@ function parseVmExports(exports: WebAssembly.Instance['exports']): VmExports {
   const executeBatchDelta = exports.vm_execute_batch_delta;
   const mapGet = exports.vm_map_get;
   const setContains = exports.vm_set_contains;
+  const structMap2GetRowPtr = exports.vm_struct_map2_get_row_ptr;
+  const structMap2IterStart = exports.vm_struct_map2_iter_start;
+  const structMap2IterNext = exports.vm_struct_map2_iter_next;
+  const structMap2IterKey1 = exports.vm_struct_map2_iter_key1;
+  const structMap2IterKey2 = exports.vm_struct_map2_iter_key2;
   const undoEnable = exports.vm_undo_enable;
   const undoCheckpoint = exports.vm_undo_checkpoint;
   const undoRollback = exports.vm_undo_rollback;
@@ -150,6 +180,11 @@ function parseVmExports(exports: WebAssembly.Instance['exports']): VmExports {
     !isWasmFunction<VmExports['vm_execute_batch_delta']>(executeBatchDelta) ||
     !isWasmFunction<VmExports['vm_map_get']>(mapGet) ||
     !isWasmFunction<VmExports['vm_set_contains']>(setContains) ||
+    !isWasmFunction<VmExports['vm_struct_map2_get_row_ptr']>(structMap2GetRowPtr) ||
+    !isWasmFunction<VmExports['vm_struct_map2_iter_start']>(structMap2IterStart) ||
+    !isWasmFunction<VmExports['vm_struct_map2_iter_next']>(structMap2IterNext) ||
+    !isWasmFunction<VmExports['vm_struct_map2_iter_key1']>(structMap2IterKey1) ||
+    !isWasmFunction<VmExports['vm_struct_map2_iter_key2']>(structMap2IterKey2) ||
     !isWasmFunction<VmExports['vm_undo_enable']>(undoEnable) ||
     !isWasmFunction<VmExports['vm_undo_checkpoint']>(undoCheckpoint) ||
     !isWasmFunction<VmExports['vm_undo_rollback']>(undoRollback) ||
@@ -175,6 +210,11 @@ function parseVmExports(exports: WebAssembly.Instance['exports']): VmExports {
     vm_execute_batch_delta: executeBatchDelta,
     vm_map_get: mapGet,
     vm_set_contains: setContains,
+    vm_struct_map2_get_row_ptr: structMap2GetRowPtr,
+    vm_struct_map2_iter_start: structMap2IterStart,
+    vm_struct_map2_iter_next: structMap2IterNext,
+    vm_struct_map2_iter_key1: structMap2IterKey1,
+    vm_struct_map2_iter_key2: structMap2IterKey2,
     vm_undo_enable: undoEnable,
     vm_undo_checkpoint: undoCheckpoint,
     vm_undo_rollback: undoRollback,
@@ -491,6 +531,63 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
       const capacity = u32[metaIdx + 1];
 
       return wasmInstance.exports.vm_set_contains(statePtr, dataOffset, capacity, elem) !== 0;
+    },
+
+    structMap2GetRow(
+      state: StateHandle,
+      _program: ReducerProgram,
+      slot: number,
+      key1: number,
+      key2: number,
+    ): StructMap2RowRef | undefined {
+      const s = assertWasmStateHandle(state);
+      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
+      const statePtr = wasmInstance.stateRegionOffset;
+      wasmU8.set(new Uint8Array(s.buffer), statePtr);
+      const bytes = new Uint8Array(s.buffer);
+      const view = new DataView(s.buffer);
+      const meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
+      const slotOffset = view.getUint32(meta, true);
+      const capacity = view.getUint32(meta + 4, true);
+      const numFields = bytes[meta + 13];
+      const rowSize = view.getUint16(meta + 16, true);
+      const rowOffset = wasmInstance.exports.vm_struct_map2_get_row_ptr(
+        statePtr,
+        slotOffset,
+        capacity,
+        numFields,
+        rowSize,
+        key1,
+        key2,
+      );
+      if (rowOffset === EMPTY_KEY_SIGNED || rowOffset === 0xffffffff) return undefined;
+      return { key1: key1 >>> 0, key2: key2 >>> 0, rowOffset: rowOffset >>> 0 };
+    },
+
+    structMap2Entries(state: StateHandle, _program: ReducerProgram, slot: number): readonly StructMap2RowRef[] {
+      const s = assertWasmStateHandle(state);
+      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
+      const statePtr = wasmInstance.stateRegionOffset;
+      wasmU8.set(new Uint8Array(s.buffer), statePtr);
+      const bytes = new Uint8Array(s.buffer);
+      const view = new DataView(s.buffer);
+      const meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
+      const slotOffset = view.getUint32(meta, true);
+      const capacity = view.getUint32(meta + 4, true);
+      const numFields = bytes[meta + 13];
+      const rowSize = view.getUint16(meta + 16, true);
+      const rowsBase = slotOffset + align8(numFields) + capacity * 8;
+      const rows: StructMap2RowRef[] = [];
+      let pos = wasmInstance.exports.vm_struct_map2_iter_start(statePtr, slotOffset, capacity, numFields);
+      while (pos < capacity) {
+        rows.push({
+          key1: wasmInstance.exports.vm_struct_map2_iter_key1(statePtr, slotOffset, numFields, pos) >>> 0,
+          key2: wasmInstance.exports.vm_struct_map2_iter_key2(statePtr, slotOffset, capacity, numFields, pos) >>> 0,
+          rowOffset: rowsBase + pos * rowSize,
+        });
+        pos = wasmInstance.exports.vm_struct_map2_iter_next(statePtr, slotOffset, capacity, numFields, pos);
+      }
+      return rows;
     },
 
     serialize(state: StateHandle, _program: ReducerProgram): Uint8Array {

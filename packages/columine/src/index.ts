@@ -41,6 +41,7 @@ export type {
   SlotDef,
   SlotTtlMetadata,
   StateHandle,
+  StructMap2RowRef,
   UndoCapableColumineBackend,
 } from './types.js';
 export {
