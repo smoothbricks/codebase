@@ -46,12 +46,16 @@ function nextTimestamp(root: TraceRoot): Nanoseconds {
   return Nanoseconds.unsafe(timestamp);
 }
 
-const timestampNow: TimestampNowPrimitive = (traceRoot) => nextTimestamp(traceRoot as TraceRoot);
+const timestampNow: TimestampNowPrimitive = (traceRoot) => {
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- ES primitive table is only installed on TraceRoot.es instances.
+  return nextTimestamp(traceRoot as TraceRoot);
+};
 
 const appendLogEntry: TimestampAppendPrimitive = (traceRoot, buffer, entryType) => {
   const entryTypes = buffer.entry_type;
   if (entryTypes === undefined) throw new TypeError('Split timestamp appender requires entry_type storage');
   const idx = buffer._writeIndex;
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- ES primitive table is only installed on TraceRoot.es instances.
   buffer.timestamp[idx] = nextTimestamp(traceRoot as TraceRoot);
   entryTypes[idx] = entryType;
   buffer._writeIndex = idx + 1;
@@ -61,6 +65,7 @@ const appendLogEntry: TimestampAppendPrimitive = (traceRoot, buffer, entryType) 
 const writeSpanStartPrimitive: SpanStartPrimitive = (traceRoot, buffer, spanName) => {
   const entryTypes = buffer.entry_type;
   if (entryTypes === undefined) throw new TypeError('Split span-start appender requires entry_type storage');
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- ES primitive table is only installed on TraceRoot.es instances.
   buffer.timestamp[0] = nextTimestamp(traceRoot as TraceRoot);
   entryTypes[0] = ENTRY_TYPE_SPAN_START;
   if (buffer.message_values) buffer.message(0, spanName);
@@ -72,6 +77,7 @@ const writeSpanStartPrimitive: SpanStartPrimitive = (traceRoot, buffer, spanName
 const writeSpanEndPrimitive: SpanEndPrimitive = (traceRoot, buffer, entryType) => {
   const entryTypes = buffer.entry_type;
   if (entryTypes === undefined) throw new TypeError('Split span-end appender requires entry_type storage');
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- ES primitive table is only installed on TraceRoot.es instances.
   buffer.timestamp[1] = nextTimestamp(traceRoot as TraceRoot);
   entryTypes[1] = entryType;
   buffer._sealStatsChain();

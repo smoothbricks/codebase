@@ -545,6 +545,7 @@ export function getPhysicalLayoutPlan<T extends LogSchema, Ctx extends OpContext
       ? 'specialized'
       : requestedPhysicalLayout;
   const key = `${PHYSICAL_LAYOUT_VERSION}:${backendKind}:${runtimeHint}:${messageLayoutFamily}:${messagePhysicalLayout}:${contextLayoutKey}:${vocabularyGeneration.generation}:${eagerColumns.key}:${resolvedLocalMessageDictionary.join(',')}`;
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- cache keys encode schema/context/runtime identity for this erased store.
   let base = byKey.get(key) as PhysicalLayoutPlan<T, Ctx> | undefined;
   if (!base) {
     base = createBasePlan(
@@ -574,6 +575,7 @@ export function getPhysicalLayoutPlan<T extends LogSchema, Ctx extends OpContext
     bindings = new WeakMap();
     remappedPlans.set(base, bindings);
   }
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- remapped plans are stored under the exact base+descriptor pair created below.
   const cached = bindings.get(remapDescriptor) as PhysicalLayoutPlan<T, Ctx> | undefined;
   if (cached) return cached;
 
