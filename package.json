@@ -27,6 +27,7 @@
     "astro-eslint-parser": "^1.2.2",
     "eslint": "^10.2.1",
     "eslint-stdout": "workspace:*",
+    "jiti": "^2.7.0",
     "mitata": "^1.0.34",
     "nx": "23.1.0",
     "prettier": "^3.6.1",
