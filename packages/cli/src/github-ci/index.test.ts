@@ -78,6 +78,10 @@ describe('GitHub CI Nx target expansion', () => {
       'No Nx projects matched',
     );
     expect(expandNxTargetRuns([], { targets: 'missing' })).toEqual({ runs: [], unmatchedGlobs: [] });
+    expect(expandNxTargetRuns(projects, { targets: '*-macos', projects: '', allowEmptyProjects: true })).toEqual({
+      runs: [],
+      unmatchedGlobs: ['*-macos'],
+    });
     expect(() => nxRunManyArgs({ target: 'test', projects: [] })).toThrow('has no selected projects');
   });
 
