@@ -16,7 +16,10 @@
     "./wasm": "./dist/columine.wasm"
   },
   "files": [
-    "dist"
+    "dist/**/*.d.ts",
+    "dist/**/*.js",
+    "dist/**/*.map",
+    "dist/**/*.wasm"
   ],
   "scripts": {
     "build:zig": "nx run columine:zig-wasm",
