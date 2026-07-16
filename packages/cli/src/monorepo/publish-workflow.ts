@@ -610,6 +610,7 @@ function renderLinuxReleaseCandidateSteps(
   let stepNumber = 2;
   for (const step of steps) {
     if (
+      step.kind === PublishWorkflowStepKind.RepairPendingReleases ||
       step.kind === PublishWorkflowStepKind.PublishRelease ||
       step.kind === PublishWorkflowStepKind.DeployProduction ||
       step.kind === PublishWorkflowStepKind.SaveNixDevenv
@@ -766,11 +767,19 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
   lines.push(
     '',
     `      # Step ${stepNumber++}`,
-    '      - name: 🍎 Build macOS and iOS targets',
+    '      - name: 🍎 Build current macOS and iOS targets',
     '        run:',
     `          smoo github-ci nx-run-many --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(
       ',',
-    )}" --collect-outputs "${githubExpression('runner.temp')}/macos-platform-outputs"`,
+    )}" --collect-outputs "${githubExpression('runner.temp')}/macos-platform-outputs/current"`,
+    '',
+    `      # Step ${stepNumber++}`,
+    '      - name: 🧯 Build pending release macOS and iOS targets',
+    '        run:',
+    `          smoo release build-repair-platform-outputs --ref "${githubExpression(
+      'github.sha',
+    )}" --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(',')}" --output`,
+    `          "${githubExpression('runner.temp')}/macos-platform-outputs/repairs"`,
     '',
     `      # Step ${stepNumber++}`,
     '      - name: 📤 Upload macOS platform outputs',
@@ -817,16 +826,6 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     `          path: ${githubExpression('runner.temp')}/publish-artifacts`,
     '          merge-multiple: false',
     '',
-    `      # Step ${stepNumber++}`,
-    '      - name: ♻️ Restore validated release state',
-    '        run:',
-    `          git fetch "${githubExpression(
-      'runner.temp',
-    )}/publish-artifacts/publish-release-state-${githubExpression('github.run_id')}/release-state.bundle" HEAD --tags && git reset`,
-    `          --hard "$(cat "${githubExpression(
-      'runner.temp',
-    )}/publish-artifacts/publish-release-state-${githubExpression('github.run_id')}/release-head")"`,
-    '',
     `      # Step ${stepNumber}. Composite action internals do not affect top-level job step`,
     '      # anchors; update these comments if top-level steps move.',
     '      - name: 🧱 Setup Nix/devenv',
@@ -849,6 +848,30 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
       '        run: nx build cli',
     );
   }
+  lines.push(
+    '',
+    '      # --- Repair -------------------------------------------------------------',
+    '',
+    `      # Step ${stepNumber++}`,
+    '      - name: 🧯 Repair pending releases',
+    '        run:',
+    `          smoo release repair-pending --ref "${githubExpression(
+      'github.sha',
+    )}" --platform-outputs "${githubExpression(
+      'runner.temp',
+    )}/publish-artifacts/publish-macos-outputs-${githubExpression('github.run_id')}/repairs" --dry-run`,
+    `          "${githubExpression('inputs.dry_run')}"`,
+    '',
+    `      # Step ${stepNumber++}`,
+    '      - name: ♻️ Restore validated release state',
+    '        run:',
+    `          git fetch "${githubExpression(
+      'runner.temp',
+    )}/publish-artifacts/publish-release-state-${githubExpression('github.run_id')}/release-state.bundle" HEAD --tags && git reset`,
+    `          --hard "$(cat "${githubExpression(
+      'runner.temp',
+    )}/publish-artifacts/publish-release-state-${githubExpression('github.run_id')}/release-head")"`,
+  );
   lines.push(
     '',
     '      # --- Validation ---------------------------------------------------------',
@@ -880,7 +903,7 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     `          smoo github-ci apply-outputs --source-sha "${githubExpression('github.sha')}"`,
     `          "${githubExpression('runner.temp')}/publish-artifacts/publish-macos-outputs-${githubExpression(
       'github.run_id',
-    )}"`,
+    )}/current"`,
     '',
     `      # Step ${stepNumber++}`,
     `      - name: ✅ Validate restored release (${githubExpression(mode)})`,
