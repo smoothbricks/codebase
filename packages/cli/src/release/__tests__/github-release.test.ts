@@ -4,6 +4,7 @@ import type { ReleasePackageInfo } from '../core.js';
 import {
   createOrUpdateGithubRelease,
   type GithubReleaseWriteShell,
+  githubReleaseLookupExists,
   nxProjectChangelogArgs,
   projectChangelogContents,
 } from '../github-release.js';
@@ -65,6 +66,14 @@ describe('GitHub release helpers', () => {
   it('fails when Nx omits the requested project changelog', () => {
     expect(() => projectChangelogContents({ projectChangelogs: {} }, 'pkg')).toThrow(
       'Nx did not generate a project changelog for pkg.',
+    );
+  });
+
+  it('distinguishes missing releases from transient GitHub lookup failures', () => {
+    expect(githubReleaseLookupExists('pkg@1.2.3', 0, '{"tagName":"pkg@1.2.3"}', '')).toBe(true);
+    expect(githubReleaseLookupExists('pkg@1.2.3', 1, '', 'HTTP 404: release not found')).toBe(false);
+    expect(() => githubReleaseLookupExists('pkg@1.2.3', 1, '', 'HTTP 503: Service Unavailable')).toThrow(
+      'Unable to inspect GitHub Release pkg@1.2.3.\nHTTP 503: Service Unavailable',
     );
   });
 

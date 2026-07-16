@@ -86,6 +86,17 @@ export function projectChangelogContents(result: ProjectChangelogLookupResult, p
   return changelog.contents;
 }
 
+export function githubReleaseLookupExists(tag: string, exitCode: number, stdout: string, stderr: string): boolean {
+  if (exitCode === 0) {
+    return true;
+  }
+  const details = [stderr.trim(), stdout.trim()].filter(Boolean).join('\n');
+  if (/\bHTTP 404\b|release not found/i.test(details)) {
+    return false;
+  }
+  throw new Error(`Unable to inspect GitHub Release ${tag}.${details ? `\n${details}` : ''}`);
+}
+
 export function githubReleaseCommandArgs(
   tag: string,
   notesFile: string,
