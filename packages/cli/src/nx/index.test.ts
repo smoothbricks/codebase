@@ -70,13 +70,13 @@ describe('Nx helper output formatting', () => {
     ]);
   });
 
-  it('extracts resolved roots, output declarations, and string target dependencies', () => {
+  it('extracts resolved roots, output declarations, and same-project target dependencies', () => {
     const metadata = {
       root: 'packages/native',
       targets: {
         'build-macos': {
           outputs: ['{projectRoot}/dist/*.dmg'],
-          dependsOn: ['^build', 'compile-macos', { target: 'ignored-object-dependency' }],
+          dependsOn: ['^build', 'compile-macos', { target: 'package-macos', projects: 'self' }],
         },
         test: { outputs: [] },
       },
@@ -90,8 +90,20 @@ describe('Nx helper output formatting', () => {
       ]),
     );
     expect(targetDependenciesFromNxProjectJson(metadata)).toEqual(
-      new Map([['build-macos', ['^build', 'compile-macos']]]),
+      new Map([['build-macos', ['^build', 'compile-macos', 'package-macos']]]),
     );
+  });
+
+  it('rejects unsupported cross-project object target dependencies', () => {
+    expect(() =>
+      targetDependenciesFromNxProjectJson({
+        targets: {
+          build: {
+            dependsOn: [{ target: 'build', projects: 'dependencies' }],
+          },
+        },
+      }),
+    ).toThrow('unsupported cross-project dependsOn');
   });
 
   it('treats missing target metadata as an empty project', () => {
