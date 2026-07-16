@@ -63,8 +63,9 @@ Cowshed uses the same convention as any other package:
 - `napi-arm64-linux` builds the supplemental Linux arm64 artifact;
 - the existing `cargo-napi` target remains the current-host build used by ordinary Linux build and test.
 
-Each platform target invokes `napi build --target <rust-target>` directly and writes to a target-specific staging
-directory. Every target declares precise Nx `inputs` and `outputs`; two targets never own the same output path.
+Each platform target invokes `napi build --target <rust-target> --output-dir dist` directly. The Linux arm64 target also
+passes NAPI-RS's `--use-napi-cross` flag. Their Nx outputs name exactly one final package artifact each, so output
+ownership remains disjoint even though all four package binaries live together in `dist/`.
 
 Nx accepts project patterns but its `-t/--targets` argument is a list of exact target names. Extend
 `smoo github-ci nx-run-many` so target arguments containing globs are expanded from resolved `nx show project --json`

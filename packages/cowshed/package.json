@@ -31,6 +31,9 @@
   },
   "nx": {
     "name": "cowshed",
+    "tags": [
+      "ci:skip:test"
+    ],
     "targets": {
       "cargo-napi": {
         "executor": "nx:run-commands",
@@ -53,6 +56,66 @@
         "options": {
           "cwd": "{projectRoot}",
           "command": "napi build --release --platform --no-js --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist"
+        }
+      },
+      "napi-arm64-macos": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "inputs": [
+          "{projectRoot}/crates/**/*.rs",
+          "{projectRoot}/crates/**/Cargo.toml",
+          "{projectRoot}/Cargo.toml",
+          "{projectRoot}/Cargo.lock",
+          "{projectRoot}/.cargo/config.toml",
+          "{projectRoot}/package.json",
+          "{workspaceRoot}/bun.lock"
+        ],
+        "outputs": [
+          "{projectRoot}/dist/cowshed.darwin-arm64.node"
+        ],
+        "options": {
+          "cwd": "{projectRoot}",
+          "command": "napi build --release --platform --no-js --target aarch64-apple-darwin --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist"
+        }
+      },
+      "napi-x64-macos": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "inputs": [
+          "{projectRoot}/crates/**/*.rs",
+          "{projectRoot}/crates/**/Cargo.toml",
+          "{projectRoot}/Cargo.toml",
+          "{projectRoot}/Cargo.lock",
+          "{projectRoot}/.cargo/config.toml",
+          "{projectRoot}/package.json",
+          "{workspaceRoot}/bun.lock"
+        ],
+        "outputs": [
+          "{projectRoot}/dist/cowshed.darwin-x64.node"
+        ],
+        "options": {
+          "cwd": "{projectRoot}",
+          "command": "napi build --release --platform --no-js --target x86_64-apple-darwin --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist"
+        }
+      },
+      "napi-arm64-linux": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "inputs": [
+          "{projectRoot}/crates/**/*.rs",
+          "{projectRoot}/crates/**/Cargo.toml",
+          "{projectRoot}/Cargo.toml",
+          "{projectRoot}/Cargo.lock",
+          "{projectRoot}/.cargo/config.toml",
+          "{projectRoot}/package.json",
+          "{workspaceRoot}/bun.lock"
+        ],
+        "outputs": [
+          "{projectRoot}/dist/cowshed.linux-arm64-gnu.node"
+        ],
+        "options": {
+          "cwd": "{projectRoot}",
+          "command": "napi build --release --platform --no-js --target aarch64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist"
         }
       },
       "test": {
