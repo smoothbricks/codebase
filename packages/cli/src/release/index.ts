@@ -648,6 +648,7 @@ async function runNxReleaseVersionPreview(root: string, projects: string, bump: 
       gitPush: false,
       stageChanges: false,
       createRelease: false,
+      forceChangelogGeneration: true,
       dryRun: true,
     });
     releasePreviewChangelogs.clear();
