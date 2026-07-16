@@ -161,6 +161,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets.build?.cache).toBe(true);
       expect(targets['zig-wasm']?.cache).toBe(true);
       expect(targets['zig-native']?.cache).toBe(true);
+      expect(targets['zig-wasm']?.outputs).toEqual(['{projectRoot}/dist/**/*.wasm']);
+      expect(targets['zig-native']?.outputs).toEqual(['{projectRoot}/dist/**/*.{node,dylib,so,dll,a}']);
       expect(targets['zig-wasm']?.options).toEqual({
         command: 'zig build wasm',
         cwd: 'packages/ziggy',
