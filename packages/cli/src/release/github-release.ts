@@ -71,6 +71,7 @@ export function nxProjectChangelogArgs(pkg: ReleasePackageInfo, previousTag: str
     gitPush: false,
     stageChanges: false,
     createRelease: false,
+    forceChangelogGeneration: true,
     deleteVersionPlans: false,
     dryRun,
   } satisfies ChangelogOptions;
