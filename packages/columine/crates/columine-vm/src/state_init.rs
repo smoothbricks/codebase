@@ -140,6 +140,11 @@ pub const fn struct_map_slot_data_size(
         + if has_timestamps { capacity * 8 } else { 0 }
 }
 
+/// STRUCT_MAP2 primary layout: descriptor + two exact u32 key lanes + rows.
+pub const fn struct_map2_slot_data_size(descriptor_size: u32, capacity: u32, row_size: u32) -> u32 {
+    descriptor_size + capacity * 8 + capacity * row_size
+}
+
 /// state_init.zig:129-137 `getTTLSideBufferSize`.
 pub const fn ttl_side_buffer_size(has_ttl: bool, has_evict_trigger: bool, capacity: u32) -> u32 {
     if !has_ttl {
@@ -275,7 +280,10 @@ pub fn calculate_state_size(program: &[u8]) -> u32 {
                     }
                 }
                 // These use their own opcodes, not SLOT_DEF.
-                SlotType::StructMap | SlotType::OrderedList | SlotType::Nested => {}
+                SlotType::StructMap
+                | SlotType::StructMap2
+                | SlotType::OrderedList
+                | SlotType::Nested => {}
             }
             size = align8(size);
 
@@ -299,7 +307,7 @@ pub fn calculate_state_size(program: &[u8]) -> u32 {
 
             size += capacity * 4 + capacity * 8;
             size = align8(size);
-        } else if op == Opcode::SlotStructMap as u8 {
+        } else if op == Opcode::SlotStructMap as u8 || op == Opcode::SlotStructMap2 as u8 {
             let type_flags = SlotTypeFlags::from_byte(init_code[pc + 1]);
             let cap_lo = init_code[pc + 2];
             let cap_hi = init_code[pc + 3];
@@ -316,8 +324,11 @@ pub fn calculate_state_size(program: &[u8]) -> u32 {
             pc += usize::from(num_fields);
 
             let layout = compute_struct_row_layout_padded(num_fields, field_types);
-            size +=
-                struct_map_slot_data_size(layout.descriptor_size, capacity, layout.row_size, false);
+            size += if op == Opcode::SlotStructMap2 as u8 {
+                struct_map2_slot_data_size(layout.descriptor_size, capacity, layout.row_size)
+            } else {
+                struct_map_slot_data_size(layout.descriptor_size, capacity, layout.row_size, false)
+            };
 
             if has_array_fields_raw(num_fields, field_types) {
                 size += ARENA_HEADER_SIZE + arena_initial_capacity_64(capacity);
@@ -605,8 +616,10 @@ pub fn init_state(state: &mut [u8], program: &[u8]) -> Result<(), ErrorCode> {
                     );
                     data_offset += capacity * 4 + capacity * 8;
                 }
-                // These use their own opcodes, not SLOT_DEF.
-                SlotType::StructMap | SlotType::OrderedList | SlotType::Nested => {}
+                SlotType::StructMap
+                | SlotType::StructMap2
+                | SlotType::OrderedList
+                | SlotType::Nested => {}
             }
             data_offset = align8(data_offset);
 
@@ -684,7 +697,7 @@ pub fn init_state(state: &mut [u8], program: &[u8]) -> Result<(), ErrorCode> {
                 0,
                 0,
             );
-        } else if op == Opcode::SlotStructMap as u8 {
+        } else if op == Opcode::SlotStructMap as u8 || op == Opcode::SlotStructMap2 as u8 {
             let slot = init_code[pc];
             let type_flags = SlotTypeFlags::from_byte(init_code[pc + 1]);
             let cap_lo = init_code[pc + 2];
@@ -720,15 +733,24 @@ pub fn init_state(state: &mut [u8], program: &[u8]) -> Result<(), ErrorCode> {
                 state[(meta_base + off) as usize] = 0;
             }
 
-            // Field-type descriptor prefix, then keys, then zeroed rows.
+            // Field descriptor, exact key lane(s), then zeroed rows.
             bytes::copy(state, data_offset, &field_types, 0, u32::from(num_fields));
-            let keys_offset = data_offset + layout.descriptor_size;
-            bytes::fill_u32(state, keys_offset, capacity, EMPTY_KEY);
-            let rows_offset = keys_offset + capacity * 4;
+            let keys1_offset = data_offset + layout.descriptor_size;
+            bytes::fill_u32(state, keys1_offset, capacity, EMPTY_KEY);
+            let rows_offset = if op == Opcode::SlotStructMap2 as u8 {
+                let keys2_offset = keys1_offset + capacity * 4;
+                bytes::zero(state, keys2_offset, capacity * 4);
+                keys2_offset + capacity * 4
+            } else {
+                keys1_offset + capacity * 4
+            };
             bytes::zero(state, rows_offset, capacity * layout.row_size);
 
-            data_offset +=
-                struct_map_slot_data_size(layout.descriptor_size, capacity, layout.row_size, false);
+            data_offset += if op == Opcode::SlotStructMap2 as u8 {
+                struct_map2_slot_data_size(layout.descriptor_size, capacity, layout.row_size)
+            } else {
+                struct_map_slot_data_size(layout.descriptor_size, capacity, layout.row_size, false)
+            };
 
             if has_array_fields_raw(num_fields, &field_types) {
                 let arena_cap = arena_initial_capacity_64(capacity);
@@ -931,12 +953,22 @@ fn read_old_slot_meta(old_state: &[u8], slot_i: u32) -> OldSlotMeta {
     }
 }
 
-/// STRUCT_MAP metadata-driven primary size (descriptor + keys + rows [+ts]).
-fn struct_map_primary_size_from_meta(old_state: &[u8], meta_base: u32, cap: u32) -> u32 {
+/// Struct-map metadata-driven primary size. The slot kind determines whether
+/// one or two exact u32 key lanes precede the rows.
+fn struct_map_primary_size_from_meta(
+    old_state: &[u8],
+    meta_base: u32,
+    cap: u32,
+    slot_type: SlotType,
+) -> u32 {
     let nf = u32::from(old_state[(meta_base + 13) as usize]);
     let rs = u32::from(bytes::read_u16(old_state, meta_base + 16));
-    let has_ts = old_state[(meta_base + 18) as usize] != 0;
-    struct_map_slot_data_size(align8(nf), cap, rs, has_ts)
+    if slot_type == SlotType::StructMap2 {
+        struct_map2_slot_data_size(align8(nf), cap, rs)
+    } else {
+        let has_ts = old_state[(meta_base + 18) as usize] != 0;
+        struct_map_slot_data_size(align8(nf), cap, rs, has_ts)
+    }
 }
 
 /// ORDERED_LIST metadata-driven primary size.
@@ -969,8 +1001,9 @@ pub fn calculate_grown_state_size(old_state: &[u8], grown_slot_idx: u32) -> u32 
         };
 
         let mut slot_size = match m.slot_type {
-            SlotType::StructMap => {
-                let mut sz = struct_map_primary_size_from_meta(old_state, meta_base, cap);
+            SlotType::StructMap | SlotType::StructMap2 => {
+                let mut sz =
+                    struct_map_primary_size_from_meta(old_state, meta_base, cap, m.slot_type);
                 // Arena: doubled on growth, kept on non-growth.
                 let arena_hdr_off = bytes::read_u32(old_state, meta_base + 20);
                 if arena_hdr_off != 0 {
@@ -1030,7 +1063,9 @@ pub fn grow_state(
 
         // Primary data size (STRUCT_MAP and ORDERED_LIST are metadata-based).
         let new_primary_size = match m.slot_type {
-            SlotType::StructMap => struct_map_primary_size_from_meta(old_state, meta_base, new_cap),
+            SlotType::StructMap | SlotType::StructMap2 => {
+                struct_map_primary_size_from_meta(old_state, meta_base, new_cap, m.slot_type)
+            }
             SlotType::OrderedList => {
                 ordered_list_primary_size_from_meta(old_state, meta_base, new_cap)
             }
@@ -1109,16 +1144,27 @@ pub fn grow_state(
                     let copy_len = old_storage_size.min(new_storage_size);
                     bytes::copy(new_state, new_offset, old_state, old_offset, copy_len);
                 }
-                SlotType::StructMap => {
+                SlotType::StructMap | SlotType::StructMap2 => {
                     let nf = u32::from(old_state[(meta_base + 13) as usize]);
                     let rs = u32::from(bytes::read_u16(old_state, meta_base + 16));
                     let desc_size = align8(nf);
                     let new_keys_off = new_offset + desc_size;
-                    let new_rows_base = new_keys_off + new_cap * 4;
+                    let key_lane_bytes = if m.slot_type == SlotType::StructMap2 {
+                        new_cap * 8
+                    } else {
+                        new_cap * 4
+                    };
+                    let new_rows_base = new_keys_off + key_lane_bytes;
 
-                    let rehashed = slot_growth::grow_struct_map(
-                        old_state, new_state, old_offset, new_offset, old_cap, new_cap, nf, rs,
-                    );
+                    let rehashed = if m.slot_type == SlotType::StructMap2 {
+                        slot_growth::grow_struct_map2(
+                            old_state, new_state, old_offset, new_offset, old_cap, new_cap, nf, rs,
+                        )
+                    } else {
+                        slot_growth::grow_struct_map(
+                            old_state, new_state, old_offset, new_offset, old_cap, new_cap, nf, rs,
+                        )
+                    };
                     bytes::write_u32(new_state, meta_base + 8, rehashed);
 
                     // Arena compaction: copy live array data into the new arena.
@@ -1126,9 +1172,12 @@ pub fn grow_state(
                     if old_arena_hdr_off != 0 {
                         let old_arena_cap = bytes::read_u32(old_state, old_arena_hdr_off);
                         let new_arena_cap = old_arena_cap * 2;
-                        let has_ts = old_state[(meta_base + 18) as usize] != 0;
-                        let struct_data_size =
-                            struct_map_slot_data_size(desc_size, new_cap, rs, has_ts);
+                        let struct_data_size = struct_map_primary_size_from_meta(
+                            old_state,
+                            meta_base,
+                            new_cap,
+                            m.slot_type,
+                        );
                         let new_arena_hdr_off = new_offset + struct_data_size;
 
                         bytes::write_u32(new_state, new_arena_hdr_off, new_arena_cap);
@@ -1239,8 +1288,13 @@ pub fn grow_state(
         } else {
             // Non-grown slot: memcpy data as-is (incl. struct-map arena).
             let primary_size = match m.slot_type {
-                SlotType::StructMap => {
-                    let mut sz = struct_map_primary_size_from_meta(old_state, meta_base, old_cap);
+                SlotType::StructMap | SlotType::StructMap2 => {
+                    let mut sz = struct_map_primary_size_from_meta(
+                        old_state,
+                        meta_base,
+                        old_cap,
+                        m.slot_type,
+                    );
                     let arena_hdr = bytes::read_u32(old_state, meta_base + 20);
                     if arena_hdr != 0 {
                         let arena_cap = bytes::read_u32(old_state, arena_hdr);
@@ -1262,11 +1316,15 @@ pub fn grow_state(
                 bytes::copy(new_state, new_offset, old_state, old_offset, primary_size);
             }
             // Arena header offset shifts with the slot data.
-            if m.slot_type == SlotType::StructMap {
+            if matches!(m.slot_type, SlotType::StructMap | SlotType::StructMap2) {
                 let old_arena_hdr = bytes::read_u32(old_state, meta_base + 20);
                 if old_arena_hdr != 0 {
-                    let struct_sz =
-                        struct_map_primary_size_from_meta(old_state, meta_base, old_cap);
+                    let struct_sz = struct_map_primary_size_from_meta(
+                        old_state,
+                        meta_base,
+                        old_cap,
+                        m.slot_type,
+                    );
                     bytes::write_u32(new_state, meta_base + 20, new_offset + struct_sz);
                 }
             }
@@ -1327,7 +1385,7 @@ pub fn grow_state(
         }
 
         let mut slot_total_size = new_primary_size;
-        if m.slot_type == SlotType::StructMap {
+        if matches!(m.slot_type, SlotType::StructMap | SlotType::StructMap2) {
             let arena_hdr_off = bytes::read_u32(old_state, meta_base + 20);
             if arena_hdr_off != 0 {
                 let old_arena_cap = bytes::read_u32(old_state, arena_hdr_off);
