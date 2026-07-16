@@ -1,0 +1,238 @@
+import { describe, expect, it } from 'bun:test';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { ProjectTargets } from '../nx/index.js';
+import { expandNxTargetRuns, nxRunManyArgs, nxSmartArgs } from './index.js';
+import { applyCollectedOutputs, type CollectedOutputsManifest, collectNxOutputs } from './outputs.js';
+
+const SOURCE_SHA = 'a'.repeat(40);
+const OTHER_SHA = 'b'.repeat(40);
+
+const projects: ProjectTargets[] = [
+  { project: 'api', root: 'packages/api', targets: ['build', 'test'] },
+  { project: 'desktop', root: 'packages/desktop', targets: ['build-macos', 'package-macos', 'test'] },
+  { project: 'mobile', root: 'packages/mobile', targets: ['build-ios'] },
+];
+
+describe('GitHub CI Nx target expansion', () => {
+  it('groups an exact target with only projects that own it', () => {
+    const expanded = expandNxTargetRuns(projects, { targets: 'test' });
+
+    expect(expanded.unmatchedGlobs).toEqual([]);
+    expect(expanded.runs.map((run) => [run.target, run.projects.map((project) => project.project)])).toEqual([
+      ['test', ['api', 'desktop']],
+    ]);
+    expect(nxRunManyArgs(expanded.runs[0]!)).toEqual([
+      'run-many',
+      '-t',
+      'test',
+      '--projects=api,desktop',
+      '--parallel=5',
+    ]);
+  });
+
+  it('expands target globs across heterogeneous projects', () => {
+    const expanded = expandNxTargetRuns(projects, { targets: '*-macos,*-ios' });
+
+    expect(expanded.unmatchedGlobs).toEqual([]);
+    expect(expanded.runs.map((run) => [run.target, run.projects.map((project) => project.project)])).toEqual([
+      ['build-macos', ['desktop']],
+      ['package-macos', ['desktop']],
+      ['build-ios', ['mobile']],
+    ]);
+  });
+
+  it('reports a zero-match glob as an empty run set', () => {
+    expect(expandNxTargetRuns(projects, { targets: '*-windows' })).toEqual({
+      runs: [],
+      unmatchedGlobs: ['*-windows'],
+    });
+  });
+
+  it('passes an unknown exact target to Nx so Nx retains failure behavior', () => {
+    const expanded = expandNxTargetRuns(projects, { targets: 'missing', projects: 'api' });
+
+    expect(expanded.unmatchedGlobs).toEqual([]);
+    expect(nxRunManyArgs(expanded.runs[0]!)).toEqual(['run-many', '-t', 'missing', '--projects=api', '--parallel=5']);
+  });
+
+  it('adds the generic target skip tag only to nx-smart', () => {
+    expect(nxSmartArgs('test', 'affected')).toEqual([
+      'affected',
+      '-t',
+      'test',
+      '--exclude=tag:ci:skip:test',
+      '--parallel=5',
+    ]);
+    expect(nxRunManyArgs({ target: 'test', projects: [projects[0]!] })).not.toContain('--exclude=tag:ci:skip:test');
+  });
+});
+
+describe('collected Nx outputs', () => {
+  it('collects declared files and applies a verified overlay', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject }) => {
+      const source = join(root, 'packages/app/dist/result.bin');
+      await writeFile(source, 'native artifact');
+
+      const manifest = await collectNxOutputs(
+        root,
+        artifact,
+        [{ target: 'build-macos', projects: [outputProject] }],
+        SOURCE_SHA,
+      );
+      expect(manifest).toMatchObject({
+        version: 1,
+        sourceSha: SOURCE_SHA,
+        files: [
+          {
+            project: 'app',
+            target: 'build-macos',
+            output: 'packages/app/dist/**/*.bin',
+            path: 'packages/app/dist/result.bin',
+            size: 15,
+          },
+        ],
+      });
+      expect(await readFile(join(artifact, 'workspace/packages/app/dist/result.bin'), 'utf8')).toBe('native artifact');
+
+      await rm(join(root, 'packages/app/dist'), { recursive: true, force: true });
+      await applyCollectedOutputs(root, [artifact], SOURCE_SHA);
+      expect(await readFile(source, 'utf8')).toBe('native artifact');
+    });
+  });
+
+  it('rejects missing, escaping, and symlinked declared outputs', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject, temp }) => {
+      await expect(
+        collectNxOutputs(root, artifact, [{ target: 'build-macos', projects: [outputProject] }], SOURCE_SHA),
+      ).rejects.toThrow('is missing');
+
+      outputProject.targetOutputs = new Map([['build-macos', ['../outside']]]);
+      await expect(
+        collectNxOutputs(root, artifact, [{ target: 'build-macos', projects: [outputProject] }], SOURCE_SHA),
+      ).rejects.toThrow('escapes the workspace');
+
+      const outside = join(temp, 'outside-output');
+      await mkdir(join(outside, 'dist'), { recursive: true });
+      await writeFile(join(outside, 'dist/result.bin'), 'outside');
+      await rm(join(root, 'packages/app'), { recursive: true, force: true });
+      await symlink(outside, join(root, 'packages/app'), 'dir');
+      outputProject.targetOutputs = new Map([['build-macos', ['{projectRoot}/dist/**/*.bin']]]);
+      await expect(
+        collectNxOutputs(root, artifact, [{ target: 'build-macos', projects: [outputProject] }], SOURCE_SHA),
+      ).rejects.toThrow('symbolic link');
+    });
+  });
+
+  it('rejects checksum corruption, source mismatches, and undeclared staged files', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject }) => {
+      await writeFile(join(root, 'packages/app/dist/result.bin'), 'native artifact');
+      await collectNxOutputs(root, artifact, [{ target: 'build-macos', projects: [outputProject] }], SOURCE_SHA);
+
+      await expect(applyCollectedOutputs(root, [artifact], OTHER_SHA)).rejects.toThrow('Source SHA mismatch');
+
+      const staged = join(artifact, 'workspace/packages/app/dist/result.bin');
+      await writeFile(staged, 'corrupt artifact');
+      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA)).rejects.toThrow(/mismatch/);
+
+      await writeFile(staged, 'native artifact');
+      await writeFile(join(artifact, 'workspace/undeclared.txt'), 'extra');
+      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA)).rejects.toThrow('Undeclared staged output');
+    });
+  });
+
+  it('rejects path injection, exact-shape violations, and collisions before overlaying', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject, temp }) => {
+      await writeFile(join(root, 'packages/app/dist/result.bin'), 'native artifact');
+      const manifest = await collectNxOutputs(
+        root,
+        artifact,
+        [{ target: 'build-macos', projects: [outputProject] }],
+        SOURCE_SHA,
+      );
+
+      const malicious: CollectedOutputsManifest = {
+        ...manifest,
+        files: [{ ...manifest.files[0]!, path: '../escape.bin' }],
+      };
+      await writeFile(join(artifact, 'manifest.json'), `${JSON.stringify(malicious)}\n`);
+      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA)).rejects.toThrow('escapes the workspace');
+
+      await writeFile(join(artifact, 'manifest.json'), `${JSON.stringify({ ...manifest, unexpected: true })}\n`);
+      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA)).rejects.toThrow(
+        'Invalid collected output manifest',
+      );
+
+      await writeFile(join(artifact, 'manifest.json'), `${JSON.stringify(manifest)}\n`);
+      const secondArtifact = join(temp, 'artifact-two');
+      await mkdir(secondArtifact, { recursive: true });
+      await Bun.write(join(secondArtifact, 'manifest.json'), JSON.stringify(manifest));
+      await mkdir(join(secondArtifact, 'workspace/packages/app/dist'), { recursive: true });
+      await Bun.write(join(secondArtifact, 'workspace/packages/app/dist/result.bin'), 'native artifact');
+      await expect(applyCollectedOutputs(root, [artifact, secondArtifact], SOURCE_SHA)).rejects.toThrow(
+        'Output collision across collected trees',
+      );
+    });
+  });
+
+  it('rejects non-hex source SHAs', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject }) => {
+      await expect(
+        collectNxOutputs(root, artifact, [{ target: 'build-macos', projects: [outputProject] }], 'not-a-git-sha'),
+      ).rejects.toThrow('40- or 64-character hexadecimal Git SHA');
+      await expect(applyCollectedOutputs(root, [artifact], 'not-a-git-sha')).rejects.toThrow(
+        '40- or 64-character hexadecimal Git SHA',
+      );
+    });
+  });
+
+  it('rejects symlinks in destination ancestors and destination files', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject, temp }) => {
+      await writeFile(join(root, 'packages/app/dist/result.bin'), 'native artifact');
+      await collectNxOutputs(root, artifact, [{ target: 'build-macos', projects: [outputProject] }], SOURCE_SHA);
+
+      const outside = join(temp, 'outside');
+      await mkdir(outside);
+      await rm(join(root, 'packages/app'), { recursive: true, force: true });
+      await symlink(outside, join(root, 'packages/app'), 'dir');
+
+      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA)).rejects.toThrow('symbolic link');
+      expect(await Bun.file(join(outside, 'dist/result.bin')).exists()).toBe(false);
+    });
+
+    await withOutputFixture(async ({ root, artifact, outputProject, temp }) => {
+      const output = join(root, 'packages/app/dist/result.bin');
+      await writeFile(output, 'native artifact');
+      await collectNxOutputs(root, artifact, [{ target: 'build-macos', projects: [outputProject] }], SOURCE_SHA);
+
+      const outside = join(temp, 'outside.bin');
+      await writeFile(outside, 'must remain unchanged');
+      await rm(output);
+      await symlink(outside, output, 'file');
+
+      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA)).rejects.toThrow('symbolic link');
+      expect(await readFile(outside, 'utf8')).toBe('must remain unchanged');
+    });
+  });
+});
+
+async function withOutputFixture(
+  run: (fixture: { root: string; artifact: string; outputProject: ProjectTargets; temp: string }) => Promise<void>,
+): Promise<void> {
+  const temp = await mkdtemp(join(tmpdir(), 'smoo-platform-output-'));
+  const root = join(temp, 'repo');
+  const artifact = join(temp, 'artifact');
+  const outputProject: ProjectTargets = {
+    project: 'app',
+    root: 'packages/app',
+    targets: ['build-macos'],
+    targetOutputs: new Map([['build-macos', ['{projectRoot}/dist/**/*.bin']]]),
+  };
+  try {
+    await mkdir(join(root, 'packages/app/dist'), { recursive: true });
+    await run({ root, artifact, outputProject, temp });
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+}
