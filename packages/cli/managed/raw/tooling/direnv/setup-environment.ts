@@ -74,9 +74,9 @@ try {
 }
 
 async function installLocalDependencies(): Promise<void> {
-  // bun install runs the root prepare script, which patches TypeScript with
-  // ts-patch. Multiple concurrent direnv activations can otherwise race while
-  // mutating the same files under node_modules.
+  // bun install runs the root prepare script. Multiple concurrent direnv
+  // activations can otherwise race while mutating the same files under
+  // node_modules.
   await withSetupLock(async () => {
     await runSetupCommand('bun install --no-summary', $`bun install --no-summary`);
   });
