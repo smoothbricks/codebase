@@ -62,7 +62,7 @@
   "devDependencies": {
     "@ttsc/unplugin": "0.19.1",
     "ttsc": "^0.19.1",
-    "typescript": "7.0.2"
+    "typescript": "^6.0.3"
   },
   "license": "MIT",
   "publishConfig": {
