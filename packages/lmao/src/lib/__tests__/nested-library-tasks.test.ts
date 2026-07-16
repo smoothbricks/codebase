@@ -440,9 +440,7 @@ describe('Nested Library Tasks', () => {
 
       // Verify parent-child chain
       const httpBuffer = allBuffers.find(
-        (buffer) =>
-          buffer !== appBuffer &&
-          buffer._traceRoot._topology.firstChild[buffer._nodeIndex] !== NO_NODE,
+        (buffer) => buffer !== appBuffer && buffer._traceRoot._topology.firstChild[buffer._nodeIndex] !== NO_NODE,
       );
       expect(httpBuffer).toBeDefined();
       expect(httpBuffer?._parent).toBe(appBuffer);

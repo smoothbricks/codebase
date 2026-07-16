@@ -10,9 +10,9 @@
  */
 
 import { Nanoseconds } from '@smoothbricks/arrow-builder';
+import type { LogSchema } from './schema/LogSchema.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from './schema/systemSchema.js';
 import { createTraceId, type TraceId } from './traceId.js';
-import type { LogSchema } from './schema/LogSchema.js';
 import {
   type ITraceRoot,
   type SpanEndPrimitive,
@@ -30,7 +30,6 @@ import type { AnySpanBuffer } from './types.js';
 
 /** Shared TextEncoder for trace_id encoding (stateless, reusable) */
 const textEncoder = new TextEncoder();
-
 
 //#region smoo/lmao!n/trace-root-timestamps #node
 /**
@@ -83,7 +82,6 @@ export class TraceRoot<T extends LogSchema = LogSchema> implements ITraceRoot<T>
   readonly _system: ArrayBuffer;
   readonly _traceIdBytes: Uint8Array;
   readonly trace_id: TraceId;
-
 
   /**
    * Tracer reference for lifecycle hooks and event callbacks.
@@ -148,7 +146,6 @@ export class TraceRoot<T extends LogSchema = LogSchema> implements ITraceRoot<T>
   get anchorPerfNow(): number {
     return this._perfView[0];
   }
-
 
   /**
    * Get current timestamp in nanoseconds since Unix epoch.

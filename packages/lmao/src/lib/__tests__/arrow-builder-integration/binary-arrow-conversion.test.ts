@@ -40,7 +40,7 @@ describe('Binary Arrow Conversion', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
 
       // Write row with a string payload
       const row1 = invokeWriterMethod(nextWriterRow(writer), 'payload', 'simple-string');
@@ -50,7 +50,7 @@ describe('Binary Arrow Conversion', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[1] = ENTRY_TYPE_INFO;
-      };
+      }
 
       buffer._writeIndex = 2;
 
@@ -101,7 +101,7 @@ describe('Binary Arrow Conversion', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       buffer._writeIndex = 1;
 
       const table = convertToArrowTable(buffer);
@@ -131,7 +131,7 @@ describe('Binary Arrow Conversion', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       buffer._writeIndex = 1;
 
       const table = convertToArrowTable(buffer);
@@ -160,7 +160,7 @@ describe('Binary Arrow Conversion', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
 
       // Row 1: payload NOT set (null)
       invokeWriterMethod(nextWriterRow(writer), 'requestId', 'req-2');
@@ -169,7 +169,7 @@ describe('Binary Arrow Conversion', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[1] = ENTRY_TYPE_INFO;
-      };
+      }
 
       buffer._writeIndex = 2;
 
@@ -210,7 +210,7 @@ describe('Binary Arrow Conversion', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       buffer._writeIndex = 1;
 
       const table = convertToArrowTable(buffer);
@@ -243,7 +243,7 @@ describe('Binary Arrow Conversion', () => {
         const entryTypes = rootBuffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       rootBuffer._writeIndex = 1;
 
       // Create and register child buffer in the root trace topology.
@@ -262,7 +262,7 @@ describe('Binary Arrow Conversion', () => {
         const entryTypes = childBuffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       childBuffer._writeIndex = 1;
 
       const table = convertSpanTreeToArrowTable(rootBuffer);
@@ -299,7 +299,7 @@ describe('Binary Arrow Conversion', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
       buffer._writeIndex = 1;
 
       // Mutate AFTER tagging -- Object.freeze should prevent this from affecting the stored reference
@@ -336,7 +336,7 @@ describe('Binary Arrow Conversion', () => {
         const entryTypes = rootBuffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
 
       const rootRow1 = invokeWriterMethod(nextWriterRow(rootWriter), 'payload', { req: 2 });
       invokeWriterMethod(invokeWriterMethod(rootRow1, 'userId', 'user-A'), 'action', 'scroll');
@@ -345,7 +345,7 @@ describe('Binary Arrow Conversion', () => {
         const entryTypes = rootBuffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[1] = ENTRY_TYPE_INFO;
-      };
+      }
 
       const rootRow2 = invokeWriterMethod(nextWriterRow(rootWriter), 'payload', { req: 3 });
       invokeWriterMethod(invokeWriterMethod(rootRow2, 'userId', 'user-B'), 'action', 'click');
@@ -354,7 +354,7 @@ describe('Binary Arrow Conversion', () => {
         const entryTypes = rootBuffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[2] = ENTRY_TYPE_INFO;
-      };
+      }
 
       rootBuffer._writeIndex = 3;
 
@@ -374,7 +374,7 @@ describe('Binary Arrow Conversion', () => {
         const entryTypes = childBuffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      };
+      }
 
       childBuffer._writeIndex = 1;
 
@@ -441,7 +441,7 @@ describe('Binary Arrow Conversion', () => {
           const entryTypes = buffer.entry_type;
           if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
           entryTypes[0] = ENTRY_TYPE_SPAN_START;
-        };
+        }
         buffer._writeIndex = 1;
 
         const table = convertToArrowTable(buffer);

@@ -10,11 +10,11 @@ import { resolveMessage } from '../../resolveMessage.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import type { TracerLifecycleHooks } from '../../traceRoot.js';
-import { NO_NODE, iterateSpanChildren, iterateSpanTree } from '../../traceTopology.js';
+import { iterateSpanChildren, iterateSpanTree, NO_NODE } from '../../traceTopology.js';
 import { WasmBufferStrategy } from '../WasmBufferStrategy.js';
 import { createWasmAllocator } from '../wasmAllocator.js';
-import { createWasmTraceRoot } from '../wasmTraceRoot.js';
 import type { WasmSpanBufferInstance } from '../wasmSpanBuffer.js';
+import { createWasmTraceRoot } from '../wasmTraceRoot.js';
 
 describe('WasmBufferStrategy', () => {
   // Simple schema for testing
@@ -399,18 +399,15 @@ describe('WasmBufferStrategy', () => {
         bufferStrategy: leasedStrategy,
       };
       const traceRoot = createWasmTraceRoot(leasedStrategy.allocator, 'leased-wasm', leasedTracer);
-      const root = leasedStrategy.createSpanBuffer(
-        testSchema,
-        traceRoot,
-        testMetadata,
-        8,
-      ) as WasmSpanBufferInstance<typeof testSchema>;
+      const root = leasedStrategy.createSpanBuffer(testSchema, traceRoot, testMetadata, 8) as WasmSpanBufferInstance<
+        typeof testSchema
+      >;
       root.timestamp[0] = 9_001n;
       {
         const entryTypes = root.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = 8;
-      };
+      }
       root.message(0, 'leased-wasm-row');
       expect('message_nulls' in root).toBe(false);
       root.latency(0, 17.5);

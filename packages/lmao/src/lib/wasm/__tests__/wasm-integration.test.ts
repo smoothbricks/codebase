@@ -13,8 +13,8 @@
 import { afterEach, beforeAll, describe, expect, it } from 'bun:test';
 import { convertToArrowTable } from '../../convertToArrow.js';
 import { defineOpContext } from '../../defineOpContext.js';
-import { resolveEntryType, resolveMessage } from '../../resolveMessage.js';
 import { JsBufferStrategy } from '../../JsBufferStrategy.js';
+import { resolveEntryType, resolveMessage } from '../../resolveMessage.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import {
@@ -28,8 +28,8 @@ import {
   ENTRY_TYPE_WARN,
 } from '../../schema/systemSchema.js';
 import { createTraceRoot as createNodeTraceRoot } from '../../traceRoot.node.js';
-import { iterateSpanChildren } from '../../traceTopology.js';
 import { TestTracer } from '../../tracers/TestTracer.js';
+import { iterateSpanChildren } from '../../traceTopology.js';
 import { WasmBufferStrategy } from '../WasmBufferStrategy.js';
 import { createWasmTraceRoot } from '../wasmTraceRoot.js';
 

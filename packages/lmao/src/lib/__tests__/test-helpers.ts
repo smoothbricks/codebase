@@ -20,10 +20,7 @@ import type {
 } from '../opContext/opGroupTypes.js';
 import type { OpMetadata } from '../opContext/opTypes.js';
 import type { OpContext } from '../opContext/types.js';
-import { getPhysicalLayoutPlan, sealCallsitePlan, type CallsitePlan } from '../physicalLayoutPlan.js';
-import { LogSchema } from '../schema/LogSchema.js';
-import { mergeWithSystemSchema, type SystemSchemaFieldTypes } from '../schema/systemSchema.js';
-import type { SchemaFields } from '../schema/types.js';
+import { type CallsitePlan, getPhysicalLayoutPlan, sealCallsitePlan } from '../physicalLayoutPlan.js';
 import {
   RUNTIME_HINT_ANALYZED_VALID,
   RUNTIME_HINT_FULL_CAPABILITIES,
@@ -31,6 +28,9 @@ import {
   RUNTIME_HINT_MESSAGE_LAYOUT_MIXED,
   RUNTIME_HINT_MESSAGE_LAYOUT_STATIC_ONLY,
 } from '../runtimeHint.js';
+import { LogSchema } from '../schema/LogSchema.js';
+import { mergeWithSystemSchema, type SystemSchemaFieldTypes } from '../schema/systemSchema.js';
+import type { SchemaFields } from '../schema/types.js';
 import { createSpanBuffer, getSpanBufferClass } from '../spanBuffer.js';
 import { createSpanContextClass } from '../spanContext.js';
 import { createTraceId, type TraceId } from '../traceId.js';
@@ -260,11 +260,7 @@ type TestWriterOpContext<T extends SchemaFields> = OpContext<
 export function createTestSpanContext<
   T extends SchemaFields,
   Ctx extends OpContext<LogSchema<T>> = TestWriterOpContext<T>,
->(
-  schema: LogSchema<T>,
-  buffer: SpanBuffer<LogSchema<T>>,
-  callsitePlan?: CallsitePlan<LogSchema<T>, Ctx>,
-) {
+>(schema: LogSchema<T>, buffer: SpanBuffer<LogSchema<T>>, callsitePlan?: CallsitePlan<LogSchema<T>, Ctx>) {
   const messageLayoutHint =
     buffer._messageLayoutFamily === 'static-only'
       ? RUNTIME_HINT_MESSAGE_LAYOUT_STATIC_ONLY

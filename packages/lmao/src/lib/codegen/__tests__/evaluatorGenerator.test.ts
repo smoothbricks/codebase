@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { createBuffer, createTestSpanContext, createTestSchema } from '../../__tests__/test-helpers.js';
+import { createBuffer, createTestSchema, createTestSpanContext } from '../../__tests__/test-helpers.js';
 import type { OpContext } from '../../opContext/types.js';
 import { resolveEntryType } from '../../resolveMessage.js';
 import { S } from '../../schema/builder.js';
@@ -28,9 +28,7 @@ function createMockSpanContext<TFields extends SchemaFields, const TFlags extend
 }
 
 describe('EvaluatorGenerator', () => {
-
   describe('createEvaluatorClass', () => {
-
     test('caches generated classes by schema', () => {
       const schema = defineFeatureFlags({
         testFlag: S.boolean().default(false).sync(),
@@ -323,8 +321,6 @@ describe('EvaluatorGenerator', () => {
       expect(descriptor?.enumerable).toBe(false);
       expect(descriptor?.configurable).toBe(true);
     });
-
-
   });
 });
 

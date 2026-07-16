@@ -31,23 +31,18 @@ function addCompletedChild(
   parent: ReturnType<typeof createRuntimeRoot>['root'],
   name: string,
 ) {
-  const child = runtime.tracer.bufferStrategy.createChildSpanBuffer(
-    parent,
-    parent._opMetadata,
-    parent._opMetadata,
-    8,
-  );
+  const child = runtime.tracer.bufferStrategy.createChildSpanBuffer(parent, parent._opMetadata, parent._opMetadata, 8);
   child.message(0, name);
   {
     const entryTypes = child.entry_type;
     if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
     entryTypes[0] = ENTRY_TYPE_SPAN_START;
-  };
+  }
   {
     const entryTypes = child.entry_type;
     if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
     entryTypes[1] = ENTRY_TYPE_SPAN_OK;
-  };
+  }
   child._writeIndex = 2;
   return child;
 }
@@ -71,11 +66,12 @@ describe('iterative test-support span traversal', () => {
     const expectedNames = ['first', 'target', 'nested-last', 'target'];
     expect(spanNames(runtime.root)).toEqual(expectedNames);
     expect(querySpan(runtime.root).names()).toEqual(expectedNames);
-    expect(findAllSpans(runtime.root, 'target').map((span) => resolveMessage(span, 0))).toEqual([
-      'target',
-      'target',
-    ]);
-    expect(querySpan(runtime.root).findAll('target').map((span) => span.name)).toEqual(['target', 'target']);
+    expect(findAllSpans(runtime.root, 'target').map((span) => resolveMessage(span, 0))).toEqual(['target', 'target']);
+    expect(
+      querySpan(runtime.root)
+        .findAll('target')
+        .map((span) => span.name),
+    ).toEqual(['target', 'target']);
     expect(findSpan(runtime.root, 'nested-last')).toBe(querySpan(runtime.root).find('nested-last')?.buffer);
     expect(extractFactsFor(runtime.root, 'first', factOptions)).toEqual(querySpan(first).facts(factOptions));
 
