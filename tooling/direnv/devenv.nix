@@ -33,10 +33,19 @@ in {
     zig
     # Rust toolchain for packages/cowshed and packages/lmao-rs: cargo, rustc,
     # clippy, rustfmt via rust-overlay stable, plus rust-src/rust-analyzer for
-    # IDE and LSP use. wasm32 target for lmao-wasm (allocator.wasm replacement).
+    # IDE and LSP use. Keep the WASM target on every system; add only the
+    # native release targets that the current runner can build.
     (rust-bin.stable.latest.default.override {
       extensions = ["rust-src" "rust-analyzer"];
-      targets = ["wasm32-unknown-unknown"];
+      targets =
+        ["wasm32-unknown-unknown"]
+        ++ lib.optionals pkgs.stdenv.isDarwin [
+          "aarch64-apple-darwin"
+          "x86_64-apple-darwin"
+        ]
+        ++ lib.optionals pkgs.stdenv.isLinux [
+          "aarch64-unknown-linux-gnu"
+        ];
     })
     cargo-nextest # Rust test runner
     cargo-mutants # Mutation target inferred by @smoothbricks/nx-plugin
