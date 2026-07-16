@@ -5,12 +5,12 @@ import { dirname, join } from 'node:path';
 import type { CreateNodesResultV2, CreateNodesV2, TargetConfiguration } from 'nx/src/devkit-exports.js';
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 
-import { BUILD_OUTPUT_DEPENDENCIES } from './workspace-config-policy.js';
+import { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 
 const RESERVED_ZIG_STEPS = new Set(['all', 'clean', 'install', 'test']);
 const ZIG_STEP_PATTERN = /\bb\.step\(\s*["']([^"']+)["']\s*,/g;
 const VALID_ZIG_STEP_NAME = /^[A-Za-z0-9_-]+$/;
-const BUILD_OUTPUT_TARGET_PATTERN = /-(?:js|web|html|css|ios|android|native|napi|bun|wasm)$/;
+const BUILD_OUTPUT_TARGET_PATTERN = /-(?:js|web|html|css|android|native|napi|bun|wasm)$/;
 const TYPESCRIPT_TOOLCHAIN_INPUTS = [
   '{workspaceRoot}/package.json',
   '{workspaceRoot}/bun.lock',
@@ -98,7 +98,9 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
   const targets: Record<string, TargetConfiguration> = {};
   const validationTargets: string[] = [];
   const hasLibTsconfig = existsSync(join(absoluteProjectRoot, 'tsconfig.lib.json'));
-  let hasBuildOutputTarget = hasLibTsconfig || hasPackageLocalBuildOutputTarget(packageJson);
+  const packageLocalBuildOutputs = classifyPackageLocalBuildOutputs(packageJson);
+  let hasOrdinaryBuildOutputTarget = hasLibTsconfig || packageLocalBuildOutputs.ordinary;
+  let hasAnyBuildOutputTarget = hasOrdinaryBuildOutputTarget || packageLocalBuildOutputs.platform;
 
   if (hasLibTsconfig) {
     // Official Nx target inference is disabled because its compiler surface only
@@ -230,7 +232,8 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
           },
         },
       };
-      hasBuildOutputTarget = true;
+      hasOrdinaryBuildOutputTarget = true;
+      hasAnyBuildOutputTarget = true;
     }
   }
 
@@ -254,15 +257,18 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
         cwd: projectRoot,
       },
     };
-    hasBuildOutputTarget = true;
+    hasOrdinaryBuildOutputTarget = true;
+    hasAnyBuildOutputTarget = true;
   }
 
-  if (hasBuildOutputTarget) {
+  if (hasOrdinaryBuildOutputTarget) {
     targets.build = {
       executor: 'nx:noop',
       cache: true,
       dependsOn: ['^build', ...BUILD_OUTPUT_DEPENDENCIES],
     };
+  }
+  if (hasAnyBuildOutputTarget) {
     targets.clean = {
       executor: '@smoothbricks/nx-plugin:clean-outputs',
       cache: false,
@@ -367,13 +373,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object';
 }
 
-function hasPackageLocalBuildOutputTarget(packageJson: PackageJson): boolean {
+function classifyPackageLocalBuildOutputs(packageJson: PackageJson): { ordinary: boolean; platform: boolean } {
   const targets = packageJson.nx?.targets;
-  if (!isRecord(targets)) {
-    return false;
-  }
-
-  return Object.keys(targets).some((targetName) => BUILD_OUTPUT_TARGET_PATTERN.test(targetName));
+  const targetNames = isRecord(targets) ? Object.keys(targets) : [];
+  return {
+    ordinary: targetNames.some((targetName) => BUILD_OUTPUT_TARGET_PATTERN.test(targetName)),
+    platform: targetNames.some((targetName) =>
+      PLATFORM_TARGET_GLOBS.some((glob) => targetName.endsWith(glob.slice(1))),
+    ),
+  };
 }
 
 interface CargoWorkspace {

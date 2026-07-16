@@ -4,13 +4,20 @@ import { join } from 'node:path';
 import { getProjects, readJson, type Tree, updateJson } from 'nx/src/devkit-exports.js';
 
 import { boundedTestScriptAlias } from './bounded-test-policy.js';
-import type { NxPolicyIssue } from './workspace-config-policy.js';
+import {
+  BUILD_OUTPUT_DEPENDENCIES,
+  LINUX_PLATFORM_TARGET_GLOBS,
+  MACOS_PLATFORM_TARGET_GLOBS,
+  type NxPolicyIssue,
+} from './workspace-config-policy.js';
 
+export { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 export type { NxPolicyIssue };
 
 export interface ResolvedProjectTargets {
   targets: ReadonlySet<string>;
   buildDependsOn?: readonly string[];
+  targetDependencies?: ReadonlyMap<string, readonly string[]>;
   targetExecutors?: ReadonlyMap<string, string>;
   targetScripts?: ReadonlyMap<string, string>;
 }
@@ -18,19 +25,6 @@ export interface ResolvedProjectTargets {
 export interface PackageTargetPolicyOptions {
   resolvedTargetsByProject?: ReadonlyMap<string, ReadonlySet<string> | ResolvedProjectTargets>;
 }
-
-export const BUILD_OUTPUT_DEPENDENCIES = [
-  '*-js',
-  '*-web',
-  '*-html',
-  '*-css',
-  '*-ios',
-  '*-android',
-  '*-native',
-  '*-napi',
-  '*-bun',
-  '*-wasm',
-];
 
 const workspaceDependencyFields = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'];
 
@@ -230,7 +224,7 @@ function targetExistsInResolvedProject(
 }
 
 function isBuildOutputDependencyPattern(dependency: string): boolean {
-  return BUILD_OUTPUT_DEPENDENCIES.includes(dependency);
+  return BUILD_OUTPUT_DEPENDENCIES.some((pattern) => pattern === dependency);
 }
 
 function expectedTargetDependencies(targetName: string): string[] {
@@ -606,14 +600,14 @@ function validateBuildZigPolicy(root: string, packagePath: string): NxPolicyIssu
 function validateExplicitNxTargets(
   pkg: Record<string, unknown>,
   packagePath: string,
-  resolvedTargets?: ReadonlySet<string>,
+  resolvedProject?: ReadonlySet<string> | ResolvedProjectTargets,
 ): NxPolicyIssue[] {
+  const issues = validatePlatformTargetDependencies(packagePath, resolvedProject);
   const nx = recordProperty(pkg, 'nx');
   const targets = nx ? recordProperty(nx, 'targets') : null;
   if (!targets) {
-    return [];
+    return issues;
   }
-  const issues: NxPolicyIssue[] = [];
   for (const [targetName, rawTarget] of Object.entries(targets)) {
     if (targetName.includes(':')) {
       issues.push({
@@ -626,7 +620,76 @@ function validateExplicitNxTargets(
     if (!isRecord(rawTarget)) {
       continue;
     }
-    issues.push(...validateTargetDependencies(rawTarget, `${packagePath}: nx.targets.${targetName}`, resolvedTargets));
+    issues.push(
+      ...validateTargetDependencies(
+        rawTarget,
+        `${packagePath}: nx.targets.${targetName}`,
+        resolvedProjectTargetNames(resolvedProject),
+      ),
+    );
+  }
+  return issues;
+}
+
+type PlatformTargetFamily = 'macos' | 'linux';
+
+function platformTargetFamily(targetName: string): PlatformTargetFamily | null {
+  if (MACOS_PLATFORM_TARGET_GLOBS.some((glob) => targetName.endsWith(glob.slice(1)))) {
+    return 'macos';
+  }
+  if (LINUX_PLATFORM_TARGET_GLOBS.some((glob) => targetName.endsWith(glob.slice(1)))) {
+    return 'linux';
+  }
+  return null;
+}
+
+function matchingResolvedTargets(dependency: string, targets: ReadonlySet<string>): string[] {
+  if (!dependency.startsWith('*')) {
+    return targets.has(dependency) ? [dependency] : [];
+  }
+  const suffix = dependency.slice(1);
+  return [...targets].filter((targetName) => targetName.endsWith(suffix));
+}
+
+function validatePlatformTargetDependencies(
+  packagePath: string,
+  resolvedProject?: ReadonlySet<string> | ResolvedProjectTargets,
+): NxPolicyIssue[] {
+  if (!isResolvedProjectTargets(resolvedProject) || !resolvedProject.targetDependencies) {
+    return [];
+  }
+  const issues: NxPolicyIssue[] = [];
+  for (const platformTarget of resolvedProject.targets) {
+    const family = platformTargetFamily(platformTarget);
+    if (!family) {
+      continue;
+    }
+    const visited = new Set<string>();
+    const pending = [platformTarget];
+    while (pending.length > 0) {
+      const targetName = pending.pop();
+      if (!targetName || visited.has(targetName)) {
+        continue;
+      }
+      visited.add(targetName);
+      for (const dependency of resolvedProject.targetDependencies.get(targetName) ?? []) {
+        if (dependency.startsWith('^')) {
+          continue;
+        }
+        for (const resolvedDependency of matchingResolvedTargets(dependency, resolvedProject.targets)) {
+          if (platformTargetFamily(resolvedDependency) !== family) {
+            issues.push({
+              path: packagePath,
+              message:
+                `${packagePath}: platform target ${platformTarget} dependency closure references ` +
+                `non-${family} sibling target ${resolvedDependency} via ${targetName}`,
+            });
+            continue;
+          }
+          pending.push(resolvedDependency);
+        }
+      }
+    }
   }
   return issues;
 }
@@ -933,7 +996,7 @@ export function checkPackageTargetPolicyTree(tree: Tree, options: PackageTargetP
     const resolvedProject = options.resolvedTargetsByProject?.get(projectName);
     const resolvedTargets = resolvedProjectTargetNames(resolvedProject);
 
-    issues.push(...validateExplicitNxTargets(pkg, packagePath, resolvedTargets));
+    issues.push(...validateExplicitNxTargets(pkg, packagePath, resolvedProject));
     issues.push(...validateTestEntrypointPresenceTree(tree, packagePath, pkg));
     issues.push(...validateBuildZigPolicyTree(tree, packagePath));
     issues.push(...validatePackageScriptPolicy(pkg, packagePath, workspaceNames, { resolvedTargets }));
@@ -1156,9 +1219,8 @@ export function checkPackageTargetPolicy(root: string, options: PackageTargetPol
     const packagePath = packagePathFromJsonPath(root, packageJsonPath);
     const projectName = packageNxProjectName(pkg);
     const resolvedProject = projectName ? options.resolvedTargetsByProject?.get(projectName) : undefined;
-    const resolvedTargets = resolvedProjectTargetNames(resolvedProject);
 
-    issues.push(...validateExplicitNxTargets(pkg, packagePath, resolvedTargets));
+    issues.push(...validateExplicitNxTargets(pkg, packagePath, resolvedProject));
     issues.push(...validateTestEntrypointPresence(root, packagePath, pkg));
     issues.push(...validateBuildZigPolicy(root, packagePath));
     issues.push(...validatePackageScriptPolicy(pkg, packagePath, workspaceNames, { resolvedTargets: resolvedProject }));

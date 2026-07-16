@@ -708,6 +708,68 @@ describe('checkPackageTargetPolicyTree', () => {
     expect(buildIssues).toEqual([]);
   });
 
+  it('accepts platform-only target families without an ordinary build aggregate', () => {
+    addProject(tree, 'native', 'packages/native');
+    writeJsonFile(tree, 'packages/native/package.json', {
+      name: '@scope/native',
+      nx: { name: 'native' },
+    });
+    const resolvedTargetsByProject = new Map<string, ResolvedProjectTargets>([
+      [
+        'native',
+        {
+          targets: new Set(['bundle-ios', 'prepare-macos', 'bundle-linux']),
+          targetDependencies: new Map([
+            ['bundle-ios', ['prepare-macos', '^build']],
+            ['prepare-macos', []],
+            ['bundle-linux', ['^build']],
+          ]),
+        },
+      ],
+    ]);
+
+    expect(checkPackageTargetPolicyTree(tree, { resolvedTargetsByProject })).toEqual([]);
+  });
+
+  it('rejects cross-family dependencies in resolved platform target closures', () => {
+    addProject(tree, 'native', 'packages/native');
+    writeJsonFile(tree, 'packages/native/package.json', {
+      name: '@scope/native',
+      nx: { name: 'native' },
+    });
+    const resolvedTargetsByProject = new Map<string, ResolvedProjectTargets>([
+      [
+        'native',
+        {
+          targets: new Set(['bundle-ios', 'prepare-macos', 'compile-js', 'bundle-linux']),
+          targetDependencies: new Map([
+            ['bundle-ios', ['prepare-macos', '^build']],
+            ['prepare-macos', ['compile-js']],
+            ['bundle-linux', ['bundle-ios']],
+          ]),
+        },
+      ],
+    ]);
+
+    const issues = checkPackageTargetPolicyTree(tree, { resolvedTargetsByProject });
+
+    expect(
+      issues.some(
+        (issue) =>
+          issue.message.includes('platform target bundle-ios dependency closure') &&
+          issue.message.includes('non-macos sibling target compile-js'),
+      ),
+    ).toBe(true);
+    expect(
+      issues.some(
+        (issue) =>
+          issue.message.includes('platform target bundle-linux dependency closure') &&
+          issue.message.includes('non-linux sibling target bundle-ios'),
+      ),
+    ).toBe(true);
+    expect(issues.some((issue) => issue.message.includes('non-macos sibling target prepare-macos'))).toBe(false);
+  });
+
   it('rejects recursive script commands', () => {
     addProject(tree, 'app', 'packages/app');
     addProject(tree, 'lib', 'packages/lib');
