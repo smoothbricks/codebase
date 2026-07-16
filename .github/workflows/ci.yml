@@ -78,7 +78,7 @@ jobs:
           path: |
             .nx/cache
             .nx/workspace-data/*.db*
-          key: ${{ runner.os }}-nx-db-v1-${{ github.sha }}
+          key: ${{ runner.os }}-${{ runner.arch }}-nx-db-v1-${{ github.sha }}
 
       # Step 10
       - name: 📎 Upload trace DBs
