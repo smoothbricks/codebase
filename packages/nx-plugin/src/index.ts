@@ -11,6 +11,9 @@ const RESERVED_ZIG_STEPS = new Set(['all', 'clean', 'install', 'test']);
 const ZIG_STEP_PATTERN = /\bb\.step\(\s*["']([^"']+)["']\s*,/g;
 const VALID_ZIG_STEP_NAME = /^[A-Za-z0-9_-]+$/;
 const BUILD_OUTPUT_TARGET_PATTERN = /-(?:js|web|html|css|android|native|napi|bun|wasm)$/;
+const ZIG_WASM_OUTPUTS = ['{projectRoot}/dist/**/*.wasm'];
+const ZIG_NATIVE_OUTPUTS = ['{projectRoot}/dist/**/*.{node,dylib,so,dll,a}'];
+const ZIG_GENERIC_OUTPUTS = ['{projectRoot}/dist/**/*.{wasm,node,dylib,so,dll,a}'];
 const TYPESCRIPT_TOOLCHAIN_INPUTS = [
   '{workspaceRoot}/package.json',
   '{workspaceRoot}/bun.lock',
@@ -241,14 +244,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       executor: 'nx:run-commands',
       cache: true,
       inputs: ['{projectRoot}/src/**/*.zig', '{projectRoot}/build.zig', '{projectRoot}/build.zig.zon'],
-      outputs: [
-        '{projectRoot}/dist/**/*.wasm',
-        '{projectRoot}/dist/**/*.node',
-        '{projectRoot}/dist/**/*.dylib',
-        '{projectRoot}/dist/**/*.so',
-        '{projectRoot}/dist/**/*.dll',
-        '{projectRoot}/dist/**/*.a',
-      ],
+      outputs: zigOutputsForStep(step),
       options: {
         command: `zig build ${step}`,
         cwd: projectRoot,
@@ -379,6 +375,16 @@ function classifyPackageLocalBuildOutputs(packageJson: PackageJson): { ordinary:
       PLATFORM_TARGET_GLOBS.some((glob) => targetName.endsWith(glob.slice(1))),
     ),
   };
+}
+
+function zigOutputsForStep(step: string): string[] {
+  if (step.endsWith('wasm')) {
+    return ZIG_WASM_OUTPUTS;
+  }
+  if (step.endsWith('native')) {
+    return ZIG_NATIVE_OUTPUTS;
+  }
+  return ZIG_GENERIC_OUTPUTS;
 }
 
 interface CargoWorkspace {
