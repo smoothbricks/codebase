@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { createReadStream } from 'node:fs';
+import { createReadStream, type Dirent, type Stats } from 'node:fs';
 import { copyFile, lstat, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { isRecord } from '@smoothbricks/validation';
@@ -144,7 +144,7 @@ export async function applyCollectedOutputs(
       claimedPaths.add(path);
 
       const source = resolveWorkspacePath(workspace, path, 'staged output file');
-      let stat;
+      let stat: Stats;
       try {
         stat = await lstat(source);
       } catch (error) {
@@ -258,7 +258,7 @@ async function filesMatchingOutput(root: string, output: string): Promise<string
 }
 
 async function listRegularFiles(directory: string): Promise<string[]> {
-  let entries;
+  let entries: Dirent[];
   try {
     entries = await readdir(directory, { withFileTypes: true });
   } catch (error) {
