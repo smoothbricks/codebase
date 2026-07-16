@@ -129,8 +129,8 @@ carries only what the **receiver** needs to act. For the full rules with code ex
 
 - **Build a project**: `nx build <project-name>`; this is an aggregate over output-family targets such as `tsc-js`,
   `tsdown-js`, and `zig-wasm`
-- **Type check source**: `nx tsc-js <project-name>`; `@nx/js/typescript` owns the `tsconfig.lib.json` -> `tsc-js`
-  inferred target
+- **Type check source**: `nx tsc-js <project-name>`; `@smoothbricks/nx-plugin` infers the target from
+  `tsconfig.lib.json` and runs transformer-aware `ttsc`
 - **Generate a new library**: `nx g @nx/js:lib packages/<name> --publishable --importPath=@my-org/<name>`
 - **Sync TypeScript references**: `nx sync`
 - **Check TypeScript references**: `nx sync:check`
@@ -225,9 +225,13 @@ This is an Nx-based monorepo using Bun as the package manager, with devenv/diren
   - Alejandra for Nix files
 - **TypeScript** with strict mode and composite projects
 - **Code style**: 2 spaces, single quotes, 120 character line width
-- **Nx uses inferred tasks** - don't add build/typecheck scripts to package.json. Official `@nx/js/typescript` infers
-  `tsconfig.lib.json` as `tsc-js`; `@smoothbricks/nx-plugin` infers only missing targets: `typecheck-tests` from
-  `tsconfig.test.json`, `zig-*` from `build.zig` steps, and aggregate `build` / `lint` targets.
+- **Nx uses inferred tasks** - don't add build/typecheck scripts to package.json. `@smoothbricks/nx-plugin` infers
+  transformer-aware `tsc-js` from `tsconfig.lib.json`, `typecheck-tests` from `tsconfig.test.json`, `zig-*` from
+  `build.zig` steps, and aggregate `build` / `lint` targets. Do not configure `@nx/js/typescript`; it bypasses the
+  repository's Typia and LMAO transformers.
+- **Compiler/API split:** `ttsc` owns the native TypeScript 7 compiler. JavaScript tools import the full TypeScript API
+  from `typescript@^6.0.3`. Do not add `@typescript/native` unless the workspace directly adopts its `tsc` binary, and
+  do not install TypeScript 7 under the `typescript` name.
 - **Where targets come from:** `tsc-js` comes from `tsconfig.lib.json`, `typecheck-tests` from `tsconfig.test.json`, and
   `zig-*` from explicit `b.step("...")` entries in `build.zig`. Aggregate `build` exists only when concrete build
   targets exist.

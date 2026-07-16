@@ -175,21 +175,27 @@ tsconfigPath: "/path/to/packages/lmao/tsconfig.json"      ❌ (files not found)
 
 ### Nx Target Inference And New Package Checklist
 
-**Official Nx owns library TypeScript targets.** `@nx/js/typescript` infers `tsconfig.lib.json` as the tool-output
-target `tsc-js`. Do not duplicate that target in package manifests or rename it to a semantic alias.
-
-**`@smoothbricks/nx-plugin` owns only missing inferred targets.** It infers `typecheck-tests` from `tsconfig.test.json`,
-`zig-*` targets from `build.zig` steps, and aggregate `build` / `lint` targets. Do not add package-local stubs for these
-targets unless there is a concrete package-specific override.
+**`@smoothbricks/nx-plugin` owns transformer-aware TypeScript targets.** It infers `tsc-js` from `tsconfig.lib.json`,
+`typecheck-tests` from `tsconfig.test.json`, `zig-*` targets from `build.zig` steps, and aggregate `build` / `lint`
+targets. Do not configure `@nx/js/typescript`: its native inference runs `tsc`/`tsgo` directly and cannot load the
+repository's Typia and LMAO transformers. Do not add package-local stubs for inferred targets unless there is a concrete
+package-specific override.
 
 Concrete target sources:
 
-- `tsc-js`: official `@nx/js/typescript`, from `tsconfig.lib.json`.
+- `tsc-js`: `@smoothbricks/nx-plugin`, from `tsconfig.lib.json`; runs `ttsc` so configured transformers execute.
 - `typecheck-tests`: `@smoothbricks/nx-plugin`, from `tsconfig.test.json`; required for packages that use `bun test`
   because Bun executes tests without typechecking.
 - `zig-*`: `@smoothbricks/nx-plugin`, from named `b.step("...")` entries in `build.zig`.
 - `build`: aggregate inferred only when at least one concrete build target exists.
 - `lint`: aggregate validation target, never a formatter.
+
+**Keep the compiler and JavaScript TypeScript API separate.** `ttsc` owns the native TypeScript 7 compiler used by
+`tsc-js` and `typecheck-tests`. JavaScript tools such as Nx and transformer hosts import the full TypeScript API from
+the workspace `typescript` dependency, which must stay on `^6.0.3`. Do not install `@typescript/native` unless the
+workspace starts invoking its `tsc` binary directly, and do not install TypeScript 7 under the `typescript` name: its
+root export does not provide APIs such as `readConfigFile`. Keep every workspace `typescript` declaration aligned so
+Bun's isolated dependency hoisting cannot shadow the API package.
 
 **Target names are `{tool}-{output}` names.** Use names like `tsc-js`, `tsdown-js`, and `zig-wasm`. `build` and `lint`
 are aggregates that depend on output-family wildcards such as `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`,
