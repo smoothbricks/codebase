@@ -4,8 +4,10 @@ import type { ReleasePackageInfo } from '../core.js';
 import {
   configureTrustedPublishers,
   npmTrustGithubArgs,
+  npmTrustListAccessDenied,
   parseTrustedPublishers,
   type TrustedPublisher,
+  type TrustedPublisherLookup,
   type TrustPublisherShell,
 } from '../index.js';
 
@@ -102,6 +104,64 @@ describe('trusted publisher setup', () => {
     expect(shell.events).toEqual([`exists:${missing.name}`, `list:${missing.name}`, `trust:${missing.name}:false`]);
   });
 
+  it('reports package owners and opens npm login after trust access is denied', async () => {
+    const shell = new RecordingTrustPublisherShell({
+      packages: [stable],
+      existing: [stable.name],
+      trustedPublisherResponses: {
+        [stable.name]: [
+          {
+            status: 'access-denied',
+            identity: 'current-user',
+            owners: 'package-owner <owner@example.test>',
+          },
+          [],
+        ],
+      },
+    });
+
+    await configureTrustedPublishers(shell, {});
+
+    expect(shell.events).toEqual([
+      `exists:${stable.name}`,
+      `list:${stable.name}`,
+      'login',
+      `list:${stable.name}`,
+      `trust:${stable.name}:false`,
+    ]);
+    expect(shell.errors.join('\n')).toContain('npm account "current-user"');
+    expect(shell.errors.join('\n')).toContain('package-owner <owner@example.test>');
+    expect(shell.logs).toContain(
+      `${stable.name}: opening npm browser login. Sign in as a listed package owner, then return here.`,
+    );
+  });
+
+  it('stops after one owner login when the selected account still lacks access', async () => {
+    const shell = new RecordingTrustPublisherShell({
+      packages: [stable],
+      existing: [stable.name],
+      trustedPublisherResponses: {
+        [stable.name]: [
+          {
+            status: 'access-denied',
+            identity: 'current-user',
+            owners: 'package-owner <owner@example.test>',
+          },
+          {
+            status: 'access-denied',
+            identity: 'wrong-user',
+            owners: 'package-owner <owner@example.test>',
+          },
+        ],
+      },
+    });
+
+    await expect(configureTrustedPublishers(shell, {})).rejects.toThrow(
+      'npm browser login completed, but the selected account still cannot manage this package',
+    );
+    expect(shell.events).toEqual([`exists:${stable.name}`, `list:${stable.name}`, 'login', `list:${stable.name}`]);
+  });
+
   it('grants the trusted workflow permission to run npm publish', () => {
     expect(npmTrustGithubArgs(stable.name, 'scope/repo', 'publish.yml', false)).toEqual([
       'trust',
@@ -115,6 +175,11 @@ describe('trusted publisher setup', () => {
       '--yes',
     ]);
     expect(npmTrustGithubArgs(stable.name, 'scope/repo', 'publish.yml', true).at(-1)).toBe('--dry-run');
+  });
+
+  it('recognizes npm trust access-denied output', () => {
+    expect(npmTrustListAccessDenied('{"error":{"code":"E403"}}', '')).toBe(true);
+    expect(npmTrustListAccessDenied('', 'npm error code EOTP')).toBe(false);
   });
 
   it('parses empty npm trust list output as no trusted publishers', () => {
@@ -132,15 +197,18 @@ class RecordingTrustPublisherShell implements TrustPublisherShell<ReleasePackage
   private readonly packages: ReleasePackageInfo[];
   private readonly existing: Set<string>;
   private readonly trustedPublisherByPackage: Record<string, TrustedPublisher[]>;
+  private readonly trustedPublisherResponses: Record<string, TrustedPublisherLookup[]>;
 
   constructor(options: {
     packages: ReleasePackageInfo[];
     existing: string[];
     trustedPublishers?: Record<string, TrustedPublisher[]>;
+    trustedPublisherResponses?: Record<string, TrustedPublisherLookup[]>;
   }) {
     this.packages = options.packages;
     this.existing = new Set(options.existing);
     this.trustedPublisherByPackage = options.trustedPublishers ?? {};
+    this.trustedPublisherResponses = options.trustedPublisherResponses ?? {};
   }
 
   listReleasePackages(): ReleasePackageInfo[] {
@@ -161,14 +229,19 @@ class RecordingTrustPublisherShell implements TrustPublisherShell<ReleasePackage
     return missingPackages;
   }
 
+  async login(): Promise<void> {
+    this.events.push('login');
+  }
+
   async trustPublisher(pkg: ReleasePackageInfo, dryRun: boolean): Promise<'configured' | 'already-configured'> {
     this.events.push(`trust:${pkg.name}:${dryRun}`);
     return 'configured';
   }
 
-  async trustedPublishers(pkg: ReleasePackageInfo): Promise<TrustedPublisher[]> {
+  async trustedPublishers(pkg: ReleasePackageInfo): Promise<TrustedPublisherLookup> {
     this.events.push(`list:${pkg.name}`);
-    return this.trustedPublisherByPackage[pkg.name] ?? [];
+    const response = this.trustedPublisherResponses[pkg.name]?.shift();
+    return response ?? this.trustedPublisherByPackage[pkg.name] ?? [];
   }
 
   log(message: string): void {
