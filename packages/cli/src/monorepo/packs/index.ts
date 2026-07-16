@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { printCommandOutput, runResult, runStatus } from '../../lib/run.js';
-import { readProjectTargets } from '../../nx/index.js';
+import { type ProjectTargets, readProjectTargets } from '../../nx/index.js';
 import { syncBunLockfileVersions, validateBunLockfileVersions } from '../lockfile.js';
 import { validateManagedFiles } from '../managed-files.js';
 import { fixNxSync, validateNxSync } from '../nx-sync.js';
@@ -400,19 +400,23 @@ function printCapturedOutput(output: CapturedOutput): void {
   }
 }
 
-async function readResolvedTargetsByProject(ctx: MonorepoContext): Promise<Map<string, ResolvedProjectTargets>> {
-  const projects = await readProjectTargets(ctx.root);
+export function resolvedTargetsByProject(projects: ProjectTargets[]): Map<string, ResolvedProjectTargets> {
   return new Map(
     projects.map((project) => [
       project.project,
       {
         targets: new Set(project.targets),
         ...(project.buildDependsOn ? { buildDependsOn: project.buildDependsOn } : {}),
+        ...(project.targetDependencies ? { targetDependencies: project.targetDependencies } : {}),
         ...(project.targetExecutors ? { targetExecutors: project.targetExecutors } : {}),
         ...(project.targetScripts ? { targetScripts: project.targetScripts } : {}),
       },
     ]),
   );
+}
+
+async function readResolvedTargetsByProject(ctx: MonorepoContext): Promise<Map<string, ResolvedProjectTargets>> {
+  return resolvedTargetsByProject(await readProjectTargets(ctx.root));
 }
 
 function ensureLocalSmooShim(root: string): void {

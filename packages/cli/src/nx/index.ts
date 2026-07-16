@@ -43,16 +43,36 @@ export function projectRootFromNxProjectJson(value: unknown): string | undefined
 }
 
 export function buildDependsOnFromNxProjectJson(value: unknown): string[] | undefined {
-  const targets = isRecord(value) ? recordProperty(value, 'targets') : null;
-  const build = targets ? recordProperty(targets, 'build') : null;
-  if (!Array.isArray(build?.dependsOn) || !build.dependsOn.every((entry) => typeof entry === 'string')) {
-    return undefined;
-  }
-  return build.dependsOn;
+  return targetDependenciesFromNxProjectJson(value).get('build');
 }
 
 export function targetDependenciesFromNxProjectJson(value: unknown): Map<string, string[]> {
-  return targetStringArraysFromNxProjectJson(value, 'dependsOn');
+  const targets = isRecord(value) ? recordProperty(value, 'targets') : null;
+  const dependencies = new Map<string, string[]>();
+  if (!targets) {
+    return dependencies;
+  }
+  for (const [targetName, target] of Object.entries(targets)) {
+    if (!isRecord(target) || !Array.isArray(target.dependsOn)) {
+      continue;
+    }
+    const entries: string[] = [];
+    for (const dependency of target.dependsOn) {
+      if (typeof dependency === 'string') {
+        entries.push(dependency);
+        continue;
+      }
+      if (!isRecord(dependency) || typeof dependency.target !== 'string') {
+        throw new Error(`Nx target ${targetName} has an invalid dependsOn entry.`);
+      }
+      if (dependency.projects !== undefined && dependency.projects !== 'self') {
+        throw new Error(`Nx target ${targetName} uses unsupported cross-project dependsOn for ${dependency.target}.`);
+      }
+      entries.push(dependency.target);
+    }
+    dependencies.set(targetName, entries);
+  }
+  return dependencies;
 }
 
 export function targetExecutorsFromNxProjectJson(value: unknown): Map<string, string> {
@@ -201,12 +221,13 @@ async function readProjectTarget(root: string, project: string): Promise<Project
   const command = nxShowProjectCommand(project);
   const result = await $`${command.command} ${command.args}`.cwd(root).quiet();
   const parsed: unknown = JSON.parse(decode(result.stdout));
+  const targetDependencies = targetDependenciesFromNxProjectJson(parsed);
   return {
     project,
     root: projectRootFromNxProjectJson(parsed),
     targets: targetNamesFromNxProjectJson(parsed),
-    buildDependsOn: buildDependsOnFromNxProjectJson(parsed),
-    targetDependencies: targetDependenciesFromNxProjectJson(parsed),
+    buildDependsOn: targetDependencies.get('build'),
+    targetDependencies,
     targetExecutors: targetExecutorsFromNxProjectJson(parsed),
     targetOutputs: targetOutputsFromNxProjectJson(parsed),
     targetScripts: targetScriptsFromNxProjectJson(parsed),

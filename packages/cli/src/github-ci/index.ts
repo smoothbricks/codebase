@@ -154,16 +154,19 @@ export interface ExpandedNxTargetRuns {
 
 export function expandNxTargetRuns(projects: ProjectTargets[], options: NxRunManyOptions): ExpandedNxTargetRuns {
   const selectedProjects = selectProjects(projects, options.projects);
-  const allTargetNames = [...new Set(projects.flatMap((project) => project.targets))].sort((a, b) =>
+  if (options.projects !== undefined && selectedProjects.length === 0) {
+    throw new Error(`No Nx projects matched --projects ${options.projects}.`);
+  }
+  const selectedTargetNames = [...new Set(selectedProjects.flatMap((project) => project.targets))].sort((a, b) =>
     a.localeCompare(b),
   );
   const runs: NxTargetRun[] = [];
   const unmatchedGlobs: string[] = [];
   const addedTargets = new Set<string>();
   for (const targetPattern of commaSeparatedValues(options.targets)) {
-    const isGlob = /[*?{[]/.test(targetPattern);
+    const isGlob = isGlobPattern(targetPattern);
     const targets = isGlob
-      ? allTargetNames.filter((target) => new Bun.Glob(targetPattern).match(target))
+      ? selectedTargetNames.filter((target) => new Bun.Glob(targetPattern).match(target))
       : [targetPattern];
     if (isGlob && targets.length === 0) {
       unmatchedGlobs.push(targetPattern);
@@ -172,22 +175,70 @@ export function expandNxTargetRuns(projects: ProjectTargets[], options: NxRunMan
       if (addedTargets.has(target)) {
         continue;
       }
-      addedTargets.add(target);
       const owners = selectedProjects.filter((project) => project.targets.includes(target));
-      runs.push({
-        target,
-        projects: owners.length > 0 ? owners : selectedProjects,
-      });
+      const runProjects = owners.length > 0 ? owners : selectedProjects;
+      if (runProjects.length === 0) {
+        continue;
+      }
+      addedTargets.add(target);
+      runs.push({ target, projects: runProjects });
     }
   }
   return { runs, unmatchedGlobs };
 }
 
-export function nxRunManyArgs(run: NxTargetRun, configuration?: string): string[] {
-  const nxArgs = ['run-many', '-t', run.target];
-  if (run.projects.length > 0) {
-    nxArgs.push(`--projects=${run.projects.map((project) => project.project).join(',')}`);
+export function expandNxTargetDependencyRuns(runs: NxTargetRun[]): NxTargetRun[] {
+  const expanded: NxTargetRun[] = [];
+  const added = new Set<string>();
+  const visiting = new Set<string>();
+
+  const visit = (project: ProjectTargets, target: string): void => {
+    const key = `${project.project}:${target}`;
+    if (added.has(key)) {
+      return;
+    }
+    if (visiting.has(key)) {
+      throw new Error(`Nx target dependency cycle detected at ${key}.`);
+    }
+    visiting.add(key);
+    for (const dependency of project.targetDependencies?.get(target) ?? []) {
+      if (dependency.startsWith('^')) {
+        continue;
+      }
+      const dependencyTargets = isGlobPattern(dependency)
+        ? project.targets.filter((candidate) => new Bun.Glob(dependency).match(candidate))
+        : project.targets.includes(dependency)
+          ? [dependency]
+          : [];
+      for (const dependencyTarget of dependencyTargets.sort((left, right) => left.localeCompare(right))) {
+        visit(project, dependencyTarget);
+      }
+    }
+    visiting.delete(key);
+    added.add(key);
+    if ((project.targetOutputs?.get(target)?.length ?? 0) > 0) {
+      expanded.push({ target, projects: [project] });
+    }
+  };
+
+  for (const run of runs) {
+    for (const project of run.projects) {
+      visit(project, run.target);
+    }
   }
+  return expanded;
+}
+
+export function nxRunManyArgs(run: NxTargetRun, configuration?: string): string[] {
+  if (run.projects.length === 0) {
+    throw new Error(`Nx target ${run.target} has no selected projects.`);
+  }
+  const nxArgs = [
+    'run-many',
+    '-t',
+    run.target,
+    `--projects=${run.projects.map((project) => project.project).join(',')}`,
+  ];
   if (configuration) {
     nxArgs.push(`--configuration=${configuration}`);
   }
@@ -218,8 +269,12 @@ export async function githubCiNxRunMany(root: string, options: NxRunManyOptions)
     }
     const { collectNxOutputs } = await import('./outputs.js');
     const sourceSha = await readGitHeadSha(root);
-    await collectNxOutputs(root, options.collectOutputs, expanded.runs, sourceSha);
+    await collectNxOutputs(root, options.collectOutputs, expandNxTargetDependencyRuns(expanded.runs), sourceSha);
   }
+}
+
+function isGlobPattern(value: string): boolean {
+  return /[*?{[]/.test(value);
 }
 
 function selectProjects(projects: ProjectTargets[], selectors: string | undefined): ProjectTargets[] {
