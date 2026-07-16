@@ -30,52 +30,76 @@ describe('publish workflow definition', () => {
     );
   });
 
-  it('preserves the byte-equivalent single-job workflow when no platform targets exist', () => {
+  it('preserves the single Ubuntu job and renders no artifact transfer when no Apple targets exist', () => {
     const current = renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase' });
     const explicitlyEmpty = renderPublishWorkflowYaml({
       repoName: '@smoothbricks/codebase',
       platformTargetGlobs: [],
     });
+    const linuxOnly = renderPublishWorkflowYaml({
+      repoName: '@smoothbricks/codebase',
+      platformTargetGlobs: LINUX_PLATFORM_TARGET_GLOBS,
+    });
 
     expect(explicitlyEmpty).toBe(current);
-    expect(current).toContain('jobs:\n  publish:\n    runs-on: ubuntu-latest');
-    expect(current).not.toContain('linux-release-candidate:');
-    expect(current).not.toContain('macos-platform:');
-    expect(current).not.toContain('publish-on-linux:');
+    for (const rendered of [current, linuxOnly]) {
+      const jobsYaml = rendered.slice(rendered.indexOf('jobs:\n') + 'jobs:\n'.length);
+      expect(jobsYaml).toContain('  publish:\n    runs-on: ubuntu-latest');
+      expect(jobsYaml.match(/^ {2}[a-z][a-z-]+:\n/gm)).toHaveLength(1);
+      expect(rendered).not.toContain('linux-release-candidate:');
+      expect(rendered).not.toContain('macos-platform:');
+      expect(rendered).not.toContain('publish-on-linux:');
+      expect(rendered).not.toContain('--collect-outputs');
+      expect(rendered).not.toContain('Upload validated release state');
+      expect(rendered).not.toContain('Upload validated build outputs');
+      expect(rendered).not.toContain('Upload supplemental Linux outputs');
+      expect(rendered).not.toContain('Upload macOS platform outputs');
+      expect(rendered).not.toContain('actions/download-artifact');
+      expect(rendered).not.toContain('apply-outputs');
+      expect(rendered).not.toContain('git bundle');
+    }
   });
 
-  it('keeps job-local deeplink step anchors exact for single-job and platform workflows', () => {
+  it('keeps job-local deeplink step anchors exact for single-job and parallel platform workflows', () => {
     const singleJob = renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase' });
     const platform = renderPublishWorkflowYaml({
       deploy: true,
       repoName: '@smoothbricks/codebase',
       platformTargetGlobs: PLATFORM_TARGET_GLOBS,
     });
-    const candidate = platform.slice(
-      platform.indexOf('  macos-release-candidate:'),
+    const linuxCandidate = platform.slice(
+      platform.indexOf('  linux-release-candidate:'),
+      platform.indexOf('  macos-platform:'),
+    );
+    const macosPlatform = platform.slice(
+      platform.indexOf('  macos-platform:'),
       platform.indexOf('  publish-on-linux:'),
     );
     const finalJob = platform.slice(platform.indexOf('  publish-on-linux:'));
 
     expect(stepAnchorNumbers(singleJob)).toEqual(Array.from({ length: 15 }, (_, index) => index + 1));
-    expect(stepAnchorNumbers(candidate)).toEqual(Array.from({ length: 14 }, (_, index) => index + 1));
-    expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 17 }, (_, index) => index + 1));
+    expect(stepAnchorNumbers(linuxCandidate)).toEqual(Array.from({ length: 20 }, (_, index) => index + 1));
+    expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 7 }, (_, index) => index + 1));
+    expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 13 }, (_, index) => index + 1));
     expect(singleJob).toContain('# Step 14\n      - name: 📦 Publish release (${{ steps.version.outputs.mode }})');
     expect(singleJob).toContain('# Step 15\n      - name: 🧹 Cleanup and cache Nix/devenv');
-    expect(candidate).toContain('# Step 8\n      - name: 🔒 Capture candidate release SHA');
-    expect(candidate).toContain(
+    expect(linuxCandidate).toContain('# Step 8\n      - name: 🔒 Capture candidate release SHA');
+    expect(linuxCandidate).toContain(
       '# Step 9\n      - name: ✅ Check managed monorepo files (${{ steps.version.outputs.mode }})',
     );
-    expect(candidate).toContain('# Step 14\n      - name: 🧹 Cleanup and cache Nix/devenv');
-    expect(finalJob).toContain('# Step 13\n      - name: 📦 Apply verified native outputs');
+    expect(linuxCandidate).toContain('# Step 20\n      - name: 🧹 Cleanup and cache Nix/devenv');
+    expect(macosPlatform).toContain('# Step 5\n      - name: 🍎 Build macOS and iOS targets');
+    expect(macosPlatform).toContain('# Step 7\n      - name: 🧹 Cleanup and cache Nix/devenv');
+    expect(finalJob).toContain('# Step 8\n      - name: 📦 Apply verified Linux outputs');
+    expect(finalJob).toContain('# Step 9\n      - name: 🍎 Apply verified macOS outputs');
     expect(finalJob).toContain(
-      '# Step 15\n      - name: 📦 Publish release (${{ needs.macos-release-candidate.outputs.mode }})',
+      '# Step 11\n      - name: 📦 Publish release (${{ needs.linux-release-candidate.outputs.mode }})',
     );
-    expect(finalJob).toContain('# Step 16\n      - name: 🚀 Deploy production');
-    expect(finalJob).toContain('# Step 17\n      - name: 🧹 Cleanup and cache Nix/devenv');
+    expect(finalJob).toContain('# Step 12\n      - name: 🚀 Deploy production');
+    expect(finalJob).toContain('# Step 13\n      - name: 🧹 Cleanup and cache Nix/devenv');
   });
 
-  it('renders a macOS release candidate and verified artifact transfer only when macOS targets exist', () => {
+  it('renders parallel native producers and a dependent publish-only final job', () => {
     const linuxOnly = renderPublishWorkflowYaml({
       repoName: '@smoothbricks/codebase',
       platformTargetGlobs: LINUX_PLATFORM_TARGET_GLOBS,
@@ -84,56 +108,73 @@ describe('publish workflow definition', () => {
       repoName: '@smoothbricks/codebase',
       platformTargetGlobs: PLATFORM_TARGET_GLOBS,
     });
+    const linuxCandidate = native.slice(
+      native.indexOf('  linux-release-candidate:'),
+      native.indexOf('  macos-platform:'),
+    );
+    const macosPlatform = native.slice(native.indexOf('  macos-platform:'), native.indexOf('  publish-on-linux:'));
+    const finalJob = native.slice(native.indexOf('  publish-on-linux:'));
 
-    expect(linuxOnly).not.toContain('macos-release-candidate:');
+    expect(linuxOnly).not.toContain('macos-platform:');
     expect(linuxOnly).toContain(
       `smoo github-ci nx-run-many --targets "${LINUX_PLATFORM_TARGET_GLOBS.join(',')}" --projects`,
     );
-    expect(native).toContain('  macos-release-candidate:\n    runs-on: macos-latest');
-    expect(native).toContain('  publish-on-linux:\n    needs: macos-release-candidate');
-    expect(native).not.toContain('linux-release-candidate:');
-    expect(native).not.toContain('macos-platform:');
-    expect(native).toContain('uses: ./.github/actions/setup-devenv');
-    expect(native).toContain(
-      `smoo github-ci nx-run-many --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(',')}" --projects`,
-    );
-    expect(native).toContain(
+    expect(native).toContain('  linux-release-candidate:\n    runs-on: ubuntu-latest');
+    expect(native).toContain('  macos-platform:\n    runs-on: macos-latest');
+    expect(native).toContain('  publish-on-linux:\n    needs: [linux-release-candidate, macos-platform]');
+    expect(linuxCandidate).not.toContain('needs:');
+    expect(macosPlatform).not.toContain('needs:');
+    expect(linuxCandidate).toContain('smoo release version');
+    expect(linuxCandidate).toContain('smoo github-ci nx-run-many --targets build --projects');
+    expect(linuxCandidate).toContain('smoo github-ci nx-run-many --targets lint --projects');
+    expect(linuxCandidate).toContain('smoo github-ci nx-run-many --targets test --projects');
+    expect(linuxCandidate).toContain(
       `smoo github-ci nx-run-many --targets "${LINUX_PLATFORM_TARGET_GLOBS.join(',')}" --projects`,
     );
+    expect(macosPlatform).toContain(
+      `smoo github-ci nx-run-many --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(',')}" --collect-outputs`,
+    );
+    expect(finalJob).not.toContain('smoo release version');
+    expect(finalJob).not.toContain('nx-run-many');
     expect(native).toContain('uses: actions/upload-artifact@v7.0.1');
     expect(native).toContain('uses: actions/download-artifact@v8.0.1');
     expect(native).toContain('name: publish-release-state-${{ github.run_id }}');
+    expect(native).toContain('name: publish-release-outputs-${{ github.run_id }}');
+    expect(native).toContain('name: publish-linux-outputs-${{ github.run_id }}');
     expect(native).toContain('name: publish-macos-outputs-${{ github.run_id }}');
-    expect(native).not.toContain('name: publish-release-outputs-${{ github.run_id }}');
-    expect(native).not.toContain('name: publish-linux-outputs-${{ github.run_id }}');
     expect(native).toContain('git bundle create');
     expect(native).toContain('git fetch "${{ runner.temp }}/publish-artifacts/publish-release-state-');
-    expect(native).toContain(
-      'smoo github-ci apply-outputs --source-sha "${{ needs.macos-release-candidate.outputs.release-sha }}"',
+    expect(finalJob).toContain(
+      'smoo github-ci apply-outputs --source-sha "${{ needs.linux-release-candidate.outputs.release-sha }}"',
     );
+    expect(finalJob).toContain('smoo github-ci apply-outputs --source-sha "${{ github.sha }}"');
   });
 
-  it('versions on macOS, restores before Linux setup, and preserves mode, deploy, and dry-run gates', () => {
+  it('limits trusted publishing permission to final publish and preserves mode, deploy, and dry-run gates', () => {
     const rendered = renderPublishWorkflowYaml({
       deploy: true,
       deployProvider: 'cloudflare',
       repoName: '@smoothbricks/codebase',
       platformTargetGlobs: PLATFORM_TARGET_GLOBS,
     });
-    const candidate = rendered.slice(
-      rendered.indexOf('  macos-release-candidate:'),
+    const linuxCandidate = rendered.slice(
+      rendered.indexOf('  linux-release-candidate:'),
+      rendered.indexOf('  macos-platform:'),
+    );
+    const macosPlatform = rendered.slice(
+      rendered.indexOf('  macos-platform:'),
       rendered.indexOf('  publish-on-linux:'),
     );
     const finalJob = rendered.slice(rendered.indexOf('  publish-on-linux:'));
 
-    expect(candidate.indexOf('smoo release version')).toBeLessThan(candidate.indexOf('🍎 Build macOS and iOS targets'));
+    expect(linuxCandidate).toContain('id-token: none');
+    expect(macosPlatform).toContain('id-token: none');
+    expect(finalJob).toContain('id-token: write');
+    expect(rendered.match(/id-token: write/g)).toHaveLength(1);
     expect(finalJob.indexOf('♻️ Restore validated release state')).toBeLessThan(finalJob.indexOf('🧱 Setup Nix/devenv'));
-    expect(rendered).not.toContain('GITHUB_SHA:');
-    expect(finalJob).not.toContain('smoo release version');
-    expect(finalJob).toContain("needs.macos-release-candidate.outputs.mode != 'none'");
-    expect(finalJob).toContain('smoo github-ci nx-run-many --targets build --projects');
-    expect(finalJob).toContain('smoo github-ci nx-run-many --targets lint --projects');
-    expect(finalJob).toContain('smoo github-ci nx-run-many --targets test --projects');
+    expect(rendered).toContain('GITHUB_SHA: ${{ steps.release-state.outputs.sha }}');
+    expect(rendered).toContain('GITHUB_SHA: ${{ github.sha }}');
+    expect(finalJob).toContain("needs.linux-release-candidate.outputs.mode != 'none'");
     expect(finalJob).toContain("inputs.deploy_environment == 'production'");
     expect(finalJob).toContain("inputs.dry_run != 'true'");
     expect(finalJob).toContain('smoo release publish --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"');
