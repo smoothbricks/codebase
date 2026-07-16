@@ -29,7 +29,6 @@ const buildOutputDependencies = [
   '*-web',
   '*-html',
   '*-css',
-  '*-ios',
   '*-android',
   '*-native',
   '*-napi',
@@ -970,6 +969,56 @@ describe('workspace package script policy', () => {
         },
       });
       expect(validateWorkspaceDependencies(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it('validates generic CI skip tags against resolved project targets', async () => {
+    const root = await createWorkspace({
+      rootName: '@fixture/root',
+      packages: [
+        {
+          dir: 'worker',
+          name: '@fixture/worker',
+          nx: { name: 'worker', tags: ['ci:skip:test'], targets: {} },
+        },
+      ],
+    });
+    try {
+      const resolvedTargetsByProject = new Map([['worker', new Set(['build', 'test'])]]);
+      expect(validateWorkspaceDependencies(root, { resolvedTargetsByProject })).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects malformed and missing-target CI skip tags', async () => {
+    const root = await createWorkspace({
+      rootName: '@fixture/root',
+      packages: [
+        {
+          dir: 'malformed',
+          name: '@fixture/malformed',
+          nx: { name: 'malformed', tags: ['ci:skip:'], targets: {} },
+        },
+        {
+          dir: 'missing',
+          name: '@fixture/missing',
+          nx: { name: 'missing', tags: ['ci:skip:test'], targets: {} },
+        },
+      ],
+    });
+    const errors = captureConsoleErrors();
+    try {
+      const resolvedTargetsByProject = new Map([
+        ['malformed', new Set(['test'])],
+        ['missing', new Set(['build'])],
+      ]);
+      expect(validateWorkspaceDependencies(root, { resolvedTargetsByProject })).toBe(2);
+      expect(errors).toContain(
+        'packages/malformed: nx tag ci:skip: must use ci:skip:<target> with one exact Nx target name',
+      );
+      expect(errors).toContain('packages/missing: nx tag ci:skip:test names missing Nx target test');
     } finally {
       await rm(root, { recursive: true, force: true });
     }
