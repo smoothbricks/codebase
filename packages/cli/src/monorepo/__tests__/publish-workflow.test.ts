@@ -128,7 +128,7 @@ describe('publish workflow definition', () => {
 
     expect(candidate.indexOf('smoo release version')).toBeLessThan(candidate.indexOf('🍎 Build macOS and iOS targets'));
     expect(finalJob.indexOf('♻️ Restore validated release state')).toBeLessThan(finalJob.indexOf('🧱 Setup Nix/devenv'));
-    expect(rendered).toContain('GITHUB_SHA: ${{ steps.release-state.outputs.sha }}');
+    expect(rendered).not.toContain('GITHUB_SHA:');
     expect(finalJob).not.toContain('smoo release version');
     expect(finalJob).toContain("needs.macos-release-candidate.outputs.mode != 'none'");
     expect(finalJob).toContain('smoo github-ci nx-run-many --targets build --projects');

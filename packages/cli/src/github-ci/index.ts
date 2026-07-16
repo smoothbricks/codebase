@@ -195,6 +195,11 @@ export function nxRunManyArgs(run: NxTargetRun, configuration?: string): string[
   return nxArgs;
 }
 
+export async function readGitHeadSha(root: string): Promise<string> {
+  // invariant throw: GitHub CI commands require a valid repository root.
+  return decode((await $`git rev-parse HEAD`.cwd(root).quiet()).stdout).trim();
+}
+
 export async function githubCiNxRunMany(root: string, options: NxRunManyOptions): Promise<void> {
   const expanded = expandNxTargetRuns(await readProjectTargets(root), options);
   if (expanded.unmatchedGlobs.length > 0) {
@@ -212,7 +217,7 @@ export async function githubCiNxRunMany(root: string, options: NxRunManyOptions)
       await import('@smoothbricks/validation/bun/preload');
     }
     const { collectNxOutputs } = await import('./outputs.js');
-    const sourceSha = process.env.GITHUB_SHA ?? decode((await $`git rev-parse HEAD`.cwd(root).quiet()).stdout).trim();
+    const sourceSha = await readGitHeadSha(root);
     await collectNxOutputs(root, options.collectOutputs, expanded.runs, sourceSha);
   }
 }

@@ -636,8 +636,6 @@ function renderMacosReleaseCandidateSteps(
     `      # Step ${stepNumber}`,
     '      - name: 🍎 Build macOS and iOS targets',
     `        if: ${githubExpression("steps.version.outputs.mode != 'none'")}`,
-    '        env:',
-    `          GITHUB_SHA: ${githubExpression('steps.release-state.outputs.sha')}`,
     '        run:',
     `          smoo github-ci nx-run-many --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(',')}" --projects`,
     `          "${githubExpression('steps.version.outputs.projects')}" --collect-outputs`,
