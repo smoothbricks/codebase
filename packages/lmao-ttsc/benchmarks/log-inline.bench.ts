@@ -384,7 +384,8 @@ function makeRepeatedDenseHeaderStore(bundle: LogBundle): () => number {
     prepareLog(bundle);
     const row = bundle.context._appendWriterEntry(ENTRY_TYPE_INFO);
     headers[row] = packedVocabularyHeader(REQUEST_COMPLETED, ENTRY_TYPE_INFO);
-    return row ^ headers[row];  };
+    return row ^ headers[row];
+  };
 }
 
 function makeCallsiteStringStores(bundle: LogBundle): () => number {
@@ -574,7 +575,8 @@ function writeInlinedResult(bundle: ResultBundle, iteration: number): number {
   setPresent(buffer.userId_nulls, 1);
   buffer.retries_values[1] = 2;
   setPresent(buffer.retries_nulls, 1);
-  return resultChecksum(bundle);}
+  return resultChecksum(bundle);
+}
 
 const fluentResultBundle = makeResultBundle();
 const inlineResultBundle = makeResultBundle();
