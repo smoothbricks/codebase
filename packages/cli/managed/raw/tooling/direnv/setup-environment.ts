@@ -1,12 +1,19 @@
 #!/usr/bin/env bun
 import { existsSync } from 'node:fs';
-import { mkdir, rmdir } from 'node:fs/promises';
+import { mkdir, rmdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { $ } from 'bun';
 
 const devenvRoot = process.env.DEVENV_ROOT;
 const projectRoot = path.resolve(`${devenvRoot}/../..`);
 const startedWithoutNodeModules = !existsSync(path.join(projectRoot, 'node_modules'));
+
+// A legitimate concurrent setup finishes well within this; anything older is a
+// leftover from an interrupted run (CTRL-C/kill before the finally-cleanup) and
+// would otherwise wedge every future shell load behind the 120s spin + EEXIST.
+// NOTE: must be declared ABOVE the top-level setup block below — module consts
+// are not hoisted, and the lock loop runs during that block.
+const STALE_LOCK_MS = 10 * 60_000;
 
 class CapturedCommandError extends Error {
   constructor(
@@ -67,7 +74,9 @@ try {
 }
 
 async function installLocalDependencies(): Promise<void> {
-  // Serialize concurrent direnv activations installing into the same node_modules.
+  // bun install runs the root prepare script, which patches TypeScript with
+  // ts-patch. Multiple concurrent direnv activations can otherwise race while
+  // mutating the same files under node_modules.
   await withSetupLock(async () => {
     await runSetupCommand('bun install --no-summary', $`bun install --no-summary`);
   });
@@ -104,12 +113,40 @@ async function acquireLock(lockDir: string): Promise<void> {
       await mkdir(lockDir, { recursive: false });
       return;
     } catch (error) {
-      if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST') || Date.now() > deadline) {
+      if (!isFileExistsError(error) || Date.now() > deadline) {
         throw error;
+      }
+      if (await isStaleLock(lockDir)) {
+        // Surface the self-heal so an interrupted-run leftover is visible in
+        // the direnv log rather than silently absorbed.
+        console.error(`! Breaking stale setup lock (${lockDir}) left by an interrupted run`);
+        // Best-effort: if a concurrent process breaks it first, the rmdir
+        // fails silently and the next mkdir attempt settles the race.
+        await rmdir(lockDir).catch(() => undefined);
+        continue;
       }
       await Bun.sleep(100);
     }
   }
+}
+
+async function isStaleLock(lockDir: string): Promise<boolean> {
+  try {
+    const info = await stat(lockDir);
+    return Date.now() - info.mtimeMs > STALE_LOCK_MS;
+  } catch (error) {
+    // Only "lock vanished" is expected here (a concurrent process released
+    // it); anything else must surface — a swallowed ReferenceError in this
+    // exact spot once disabled stale detection entirely.
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+      return false; // gone — let the mkdir retry acquire it
+    }
+    throw error;
+  }
+}
+
+function isFileExistsError(error: unknown): boolean {
+  return error instanceof Error && 'code' in error && error.code === 'EEXIST';
 }
 
 function replayCapturedOutput(error: unknown): void {
