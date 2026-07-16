@@ -89,6 +89,20 @@ Example shape:
 The commands are illustrative. Smoo owns target discovery, execution, transfer, and validation; the package owns the
 compiler invocation and its supported target triples.
 
+## Managed workflow generation
+
+`smoo monorepo init` resolves workspace projects through Nx, detects the canonical platform target families, and renders
+the managed `.github/workflows/publish.yml`. Repositories declare targets and outputs; they do not add package-specific
+workflow branches by hand.
+
+Generation chooses one of two exact shapes:
+
+- no `*-macos`/`*-ios` target matches: one Ubuntu job with no artifact upload, download, bundle, or overlay;
+- one or more Apple target matches: the parallel producer graph below, plus explicit artifact manifests and assembly.
+
+The checked-in workflow is validated byte-for-byte against the generator. Re-running managed-file initialization updates
+the workflow when the resolved Nx target families change.
+
 ## Two-stage publish graph
 
 The three jobs form this two-stage graph:
@@ -112,19 +126,24 @@ The Linux producer owns release versioning and validation:
 4. repair any previously interrupted release state;
 5. run `smoo release version` and capture its `mode`, selected projects, and resulting release SHA;
 6. check generated/managed monorepo files against the versioned candidate;
-7. run ordinary aggregate `build` plus matching supplemental `*-linux` targets;
-8. collect the aggregate build's resolved dependency-closure outputs and the Linux targets' declared outputs;
+7. run ordinary aggregate `build` and collect its resolved dependency-closure outputs;
+8. run matching supplemental `*-linux` targets and collect their declared outputs;
 9. run `lint`, `test`, and `smoo monorepo validate` against the versioned candidate;
 10. create a Git bundle containing the candidate commit and release tags;
 11. upload the Git bundle and collected Linux/workspace output tree.
 
-The build and collection command is metadata-driven:
+The two build/collection commands remain separate so their job steps and artifacts are independently diagnosable:
 
 ```sh
 smoo github-ci nx-run-many \
-  --targets "build,*-linux" \
+  --targets "build" \
   --projects "$RELEASE_PROJECTS" \
-  --collect-outputs "$RUNNER_TEMP/linux-release-outputs"
+  --collect-outputs "$RUNNER_TEMP/release-build-outputs"
+
+smoo github-ci nx-run-many \
+  --targets "*-linux" \
+  --projects "$RELEASE_PROJECTS" \
+  --collect-outputs "$RUNNER_TEMP/linux-platform-outputs"
 ```
 
 `nx-run-many` expands globs only within the explicitly selected projects and groups exact targets by their owning
@@ -142,7 +161,7 @@ inferred version—is the source of truth for the final job.
 1. checks out the workflow dispatch SHA;
 2. restores only macOS/runner-architecture caches and enters devenv;
 3. builds the self-hosted CLI when required;
-4. resolves and runs matching `*-macos` and `*-ios` targets for the selected release projects;
+4. resolves and runs matching `*-macos` and `*-ios` targets across workspace projects that own them;
 5. collects only those targets' resolved declared outputs;
 6. uploads the platform-output tree and manifest;
 7. saves macOS/devenv caches in `always()`.
@@ -152,12 +171,15 @@ The platform invocation is generic:
 ```sh
 smoo github-ci nx-run-many \
   --targets "*-macos,*-ios" \
-  --projects "$RELEASE_PROJECTS" \
   --collect-outputs "$RUNNER_TEMP/macos-platform-outputs"
 ```
 
 The macOS manifest records the dispatch checkout's `git rev-parse HEAD`. It does not claim to have built the local
 release commit being created concurrently on Linux.
+
+Because release selection is being computed concurrently on Linux, the macOS producer may build matching targets for
+packages outside the eventual release set. The final pack step ignores unrelated outputs. This bounded extra work is
+safer than serializing the producers or independently reimplementing release selection.
 
 Parallelism requires a strict versioning invariant: release versioning may change package/release metadata, but native
 platform compilation must not consume generated version state or embed the release commit SHA. If that ever changes,
@@ -195,11 +217,12 @@ The producer trees use different, explicit provenance values:
 ```sh
 smoo github-ci apply-outputs \
   --source-sha "$RELEASE_SHA" \
-  "$RUNNER_TEMP/publish-artifacts/linux-release-outputs-$GITHUB_RUN_ID"
+  "$RUNNER_TEMP/publish-artifacts/publish-release-outputs-$GITHUB_RUN_ID" \
+  "$RUNNER_TEMP/publish-artifacts/publish-linux-outputs-$GITHUB_RUN_ID"
 
 smoo github-ci apply-outputs \
   --source-sha "$GITHUB_SHA" \
-  "$RUNNER_TEMP/publish-artifacts/macos-platform-outputs-$GITHUB_RUN_ID"
+  "$RUNNER_TEMP/publish-artifacts/publish-macos-outputs-$GITHUB_RUN_ID"
 ```
 
 ### Artifact manifest verification
