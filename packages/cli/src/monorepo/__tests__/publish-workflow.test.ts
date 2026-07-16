@@ -148,6 +148,11 @@ describe('publish workflow definition', () => {
       'smoo github-ci apply-outputs --source-sha "${{ needs.linux-release-candidate.outputs.release-sha }}"',
     );
     expect(finalJob).toContain('smoo github-ci apply-outputs --source-sha "${{ github.sha }}"');
+    expect(foldedRunCommand(finalJob, '📦 Apply verified Linux outputs')).toBe(
+      'smoo github-ci apply-outputs --source-sha "${{ needs.linux-release-candidate.outputs.release-sha }}" ' +
+        '"${{ runner.temp }}/publish-artifacts/publish-release-outputs-${{ github.run_id }}" ' +
+        '"${{ runner.temp }}/publish-artifacts/publish-linux-outputs-${{ github.run_id }}"',
+    );
   });
 
   it('limits trusted publishing permission to final publish and preserves mode, deploy, and dry-run gates', () => {
@@ -172,8 +177,7 @@ describe('publish workflow definition', () => {
     expect(finalJob).toContain('id-token: write');
     expect(rendered.match(/id-token: write/g)).toHaveLength(1);
     expect(finalJob.indexOf('♻️ Restore validated release state')).toBeLessThan(finalJob.indexOf('🧱 Setup Nix/devenv'));
-    expect(rendered).toContain('GITHUB_SHA: ${{ steps.release-state.outputs.sha }}');
-    expect(rendered).toContain('GITHUB_SHA: ${{ github.sha }}');
+    expect(rendered).not.toContain('GITHUB_SHA:');
     expect(finalJob).toContain("needs.linux-release-candidate.outputs.mode != 'none'");
     expect(finalJob).toContain("inputs.deploy_environment == 'production'");
     expect(finalJob).toContain("inputs.dry_run != 'true'");
@@ -546,6 +550,22 @@ class WorkflowScenarioState {
 
 function stepAnchorNumbers(yaml: string): number[] {
   return [...yaml.matchAll(/^\s*# Step (\d+)/gm)].map((match) => Number(match[1]));
+}
+
+function foldedRunCommand(yaml: string, stepName: string): string {
+  const stepStart = yaml.indexOf(`- name: ${stepName}`);
+  expect(stepStart).toBeGreaterThanOrEqual(0);
+  const runMarker = '        run:\n';
+  const runStart = yaml.indexOf(runMarker, stepStart);
+  expect(runStart).toBeGreaterThan(stepStart);
+  const commandLines: string[] = [];
+  for (const line of yaml.slice(runStart + runMarker.length).split('\n')) {
+    if (!line.startsWith('          ')) {
+      break;
+    }
+    commandLines.push(line.trim());
+  }
+  return commandLines.join(' ');
 }
 
 function packageNameFromTag(tag: string): string {
