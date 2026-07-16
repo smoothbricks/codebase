@@ -65,10 +65,10 @@ import { Op } from './op.js';
 import { createOpMetadata } from './opContext/defineOp.js';
 import type { OpContext, OpContextBinding, OpContextOf, SpanContext } from './opContext/types.js';
 import {
-  getPhysicalLayoutPlan,
-  sealCallsitePlan,
   type CallsitePlan,
+  getPhysicalLayoutPlan,
   type PhysicalLayoutPlan,
+  sealCallsitePlan,
 } from './physicalLayoutPlan.js';
 import { Err, Ok, type Result } from './result.js';
 import { createFeatureFlagEvaluator, type FlagEvaluator, InMemoryFlagEvaluator } from './schema/evaluator.js';
@@ -254,7 +254,8 @@ export type TraceFn<Ctx extends OpContext> = {
  * @typeParam B - OpContextBinding type (inferred from constructor argument)
  */
 export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
-  implements TracerLifecycleHooks<B['logBinding']['logSchema']> {
+  implements TracerLifecycleHooks<B['logBinding']['logSchema']>
+{
   private readonly logBinding: LogBinding<B['logBinding']['logSchema']>;
   private readonly SpanContextClass: SpanContextClass<OpContextOf<B>>;
   private readonly physicalLayoutPlan: PhysicalLayoutPlan<B['logBinding']['logSchema'], OpContextOf<B>>;
@@ -642,12 +643,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
       ...createOpMetadata('root', 'tracer', 'runtime', 'unknown', 0),
       _physicalLayoutPlan: this.physicalLayoutPlan,
     });
-    const ctx = this._createRootContext(
-      line,
-      name,
-      overrides,
-      sealCallsitePlan(this.physicalLayoutPlan, metadata),
-    );
+    const ctx = this._createRootContext(line, name, overrides, sealCallsitePlan(this.physicalLayoutPlan, metadata));
     return this._executeUnknownWithContext(ctx, fn);
   }
 
@@ -772,7 +768,6 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
       }
     }
   }
-
 
   /**
    * Execute function with context and handle span-ok/span-err/span-exception writes

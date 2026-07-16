@@ -225,7 +225,6 @@ export function walkLogicalSpanTree(
   }
 }
 
-
 /** Iterate logical child buffers without materializing a child array. */
 export function iterateSpanChildren<T extends LogSchema>(root: SpanBuffer<T>): Generator<SpanBuffer<T>>;
 export function iterateSpanChildren(root: AnySpanBuffer): Generator<AnySpanBuffer>;

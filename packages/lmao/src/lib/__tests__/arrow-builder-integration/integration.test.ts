@@ -150,7 +150,7 @@ describe('Buffer Integration', () => {
       const entryTypes = buffer.entry_type;
       if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
       entryTypes[0] = ENTRY_TYPE_SPAN_START;
-    };
+    }
     buffer._writeIndex = 1;
 
     // Convert to Arrow table
@@ -198,7 +198,7 @@ describe('Buffer Integration', () => {
       const entryTypes = buffer.entry_type;
       if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
       entryTypes[0] = ENTRY_TYPE_SPAN_START;
-    };
+    }
     buffer._writeIndex = 1;
 
     // Convert to Arrow table
@@ -244,7 +244,7 @@ describe('Buffer Integration', () => {
       const entryTypes = buffer.entry_type;
       if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
       entryTypes[0] = ENTRY_TYPE_SPAN_START;
-    };
+    }
     buffer._writeIndex = 1;
 
     // Convert to Arrow table
@@ -318,7 +318,7 @@ describe('Buffer Integration', () => {
         const entryTypes = buffer.entry_type;
         if (entryTypes === undefined) throw new Error('Expected split entry-type lane');
         entryTypes[0] = ENTRY_TYPE_INFO;
-      };
+      }
       buffer._writeIndex = 1;
 
       // Convert to Arrow using arrow-builder

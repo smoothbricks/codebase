@@ -43,6 +43,7 @@ class GetterCountingPromise<T> implements Promise<T> {
     private readonly onThenAccess: () => void,
   ) {}
 
+  // biome-ignore lint/suspicious/noThenProperty: intentional thenable fixture for await scheduling tests
   get then(): Promise<T>['then'] {
     this.onThenAccess();
     return <TResult1 = T, TResult2 = never>(
@@ -334,10 +335,7 @@ describe('runtime hint specialization', () => {
     expect(group.prefix('lib').existing.callsitePlan.runtimeHint).toBe(analyzedResult | 7);
     expect(group.mapColumns({ marker: 'renamedMarker' }).raw.callsitePlan.runtimeHint).toBe(analyzedResult | 5);
 
-    const overridden = opContext.defineOps(
-      { existing },
-      { existing: { runtimeHint: analyzedResult | 9 } },
-    );
+    const overridden = opContext.defineOps({ existing }, { existing: { runtimeHint: analyzedResult | 9 } });
     expect(overridden.existing).not.toBe(existing);
     expect(overridden.existing.callsitePlan.runtimeHint).toBe(analyzedResult | 9);
   });

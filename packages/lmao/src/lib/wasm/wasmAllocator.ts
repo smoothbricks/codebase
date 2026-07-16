@@ -37,8 +37,6 @@ export interface WasmAllocator {
   /** Pin the current linear-memory backing epoch for borrowed Arrow views. */
   pinMemoryEpoch(): WasmMemoryEpochPin;
 
-
-
   /** Cached views (recreated after grow, but pre-sized to avoid grow for benchmarks) */
   readonly u8: Uint8Array;
   readonly u32: Uint32Array;
@@ -58,7 +56,6 @@ export interface WasmAllocator {
   allocExact(byteLength: number, alignment: number): number;
   freeExact(offset: number, byteLength: number, alignment: number): void;
 
-
   // Span lifecycle (writes timestamp + entry_type)
   spanStart(systemPtr: number, identityPtr: number, traceRootPtr: number, capacity?: number): void;
   spanEndOk(systemPtr: number, traceRootPtr: number, capacity?: number): void;
@@ -71,7 +68,6 @@ export interface WasmAllocator {
     entryType: number,
     capacity?: number,
   ): number;
-
 
   // TraceRoot initialization
   initTraceRoot(traceRootPtr: number): void;
@@ -139,8 +135,6 @@ interface WasmExports {
   reset(): void;
   alloc_exact(byteLength: number, alignment: number): number;
   free_exact(offset: number, byteLength: number, alignment: number): void;
-
-
 
   span_start(systemPtr: number, identityPtr: number, traceRootPtr: number, capacity: number): void;
   span_end_ok(systemPtr: number, traceRootPtr: number, capacity: number): void;
@@ -245,7 +239,6 @@ function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Me
     return memoryVersion;
   };
 
-
   // Initialize the allocator header
   exports.init();
 
@@ -297,7 +290,6 @@ function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Me
     allocExact: exports.alloc_exact,
     freeExact: exports.free_exact,
 
-
     // Span lifecycle with optional capacity
     spanStart: (systemPtr, identityPtr, traceRootPtr, cap = capacity) =>
       exports.span_start(systemPtr, identityPtr, traceRootPtr, cap),
@@ -305,7 +297,6 @@ function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Me
     spanEndErr: (systemPtr, traceRootPtr, cap = capacity) => exports.span_end_err(systemPtr, traceRootPtr, cap),
     writeLogEntry: (systemPtr, identityPtr, traceRootPtr, entryType, cap = capacity) =>
       exports.write_log_entry(systemPtr, identityPtr, traceRootPtr, entryType, cap),
-
 
     initTraceRoot: exports.init_trace_root,
 

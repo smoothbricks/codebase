@@ -14,8 +14,8 @@ import { S } from '../schema/builder.js';
 import { defineFeatureFlags } from '../schema/defineFeatureFlags.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { InMemoryFlagEvaluator, type SpanContextWithoutFf } from '../schema/evaluator.js';
-import { TestTracer } from '../tracers/TestTracer.js';
 import { createTraceId } from '../traceId.js';
+import { TestTracer } from '../tracers/TestTracer.js';
 import { createTestTracerOptions } from './test-helpers.js';
 
 const schema = defineLogSchema({ marker: S.category() });
@@ -241,11 +241,7 @@ describe('root SpanContext direct construction', () => {
     expect(asyncChildOp.callsitePlan.SpanContextClass).toBe(syncOp.callsitePlan.SpanContextClass);
 
     const tracer = new TestTracer(rootContext, { ...createTestTracerOptions(), flagEvaluator: evaluator });
-    const syncResult = tracer.trace(
-      'direct-root-sync',
-      { env: { REGION: 'iad' }, nullable: null },
-      syncOp,
-    );
+    const syncResult = tracer.trace('direct-root-sync', { env: { REGION: 'iad' }, nullable: null }, syncOp);
     expect(syncResult).toBeInstanceOf(Ok);
 
     const asyncResultPromise = tracer.trace(
@@ -364,11 +360,7 @@ describe('root SpanContext direct construction', () => {
     tracer.trace('full-layout-root', { env: { REGION: 'ord' } }, fullOp);
     tracer.trace('result-layout-root', { env: { REGION: 'ord' } }, resultOnlyOp);
     const alternateTracer = new TestTracer(alternateContext, createTestTracerOptions());
-    alternateTracer.trace(
-      'alternate-layout-root',
-      { accountId: 'account-7', env: { REGION: 'syd' } },
-      alternateOp,
-    );
+    alternateTracer.trace('alternate-layout-root', { accountId: 'account-7', env: { REGION: 'syd' } }, alternateOp);
 
     const capturedFull = requireContext(fullRoot, 'full root');
     const capturedResultOnly = requireContext(resultOnlyRoot, 'result-only root');

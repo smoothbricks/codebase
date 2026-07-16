@@ -3,12 +3,7 @@ import { createColumnBuffer } from '@smoothbricks/arrow-builder';
 import { createTagWriter, S } from '@smoothbricks/lmao';
 import { createSpanBuffer } from '../../spanBuffer.js';
 
-import {
-  createTestOpMetadata,
-  createTestSchema,
-  createTestSpanContext,
-  createTestTraceRoot,
-} from '../test-helpers.js';
+import { createTestOpMetadata, createTestSchema, createTestSpanContext, createTestTraceRoot } from '../test-helpers.js';
 
 /**
  * Tests for lazy column initialization

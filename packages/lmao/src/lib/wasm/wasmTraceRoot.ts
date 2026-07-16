@@ -10,21 +10,21 @@
  */
 
 import { Nanoseconds } from '@smoothbricks/arrow-builder';
-import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from '../schema/systemSchema.js';
 import type { LogSchema } from '../schema/LogSchema.js';
+import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from '../schema/systemSchema.js';
 import { createTraceId, type TraceId } from '../traceId.js';
 import type {
   ITraceRoot,
-  TraceRootFactory,
   SpanEndPrimitive,
   SpanStartPrimitive,
   TimestampAppendPrimitive,
   TimestampNowPrimitive,
+  TraceRootFactory,
   TracerLifecycleHooks,
 } from '../traceRoot.js';
+import { TraceTopology } from '../traceTopology.js';
 import type { AnySpanBuffer } from '../types.js';
 import type { WasmAllocator } from './wasmAllocator.js';
-import { TraceTopology } from '../traceTopology.js';
 
 const traceIdEncoder = new TextEncoder();
 
