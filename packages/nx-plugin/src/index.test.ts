@@ -135,7 +135,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-
   it('infers aggregate build for package-local output targets without owning them', async () => {
     const workspace = await createWorkspace();
     try {
