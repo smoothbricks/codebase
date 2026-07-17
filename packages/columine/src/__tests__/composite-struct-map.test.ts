@@ -48,7 +48,6 @@ describe('StructMap2 public WASM readers', () => {
     const backend = await createColumineWasmBackend(readFileSync(WASM_PATH));
     const getRow = backend.structMap2GetRow;
     const entries = backend.structMap2Entries;
-    if (!getRow || !entries) throw new Error('WASM backend omitted StructMap2 readers');
     const upsert = await backend.loadProgram(reducer([Opcode.BATCH_STRUCT_MAP2_UPSERT_LAST, 0, 0, 1, 2, 2, 0, 3, 1]));
     const remove = await backend.loadProgram(reducer([Opcode.BATCH_STRUCT_MAP2_REMOVE, 0, 0, 1]));
     const state = backend.createState(upsert);
@@ -103,7 +102,6 @@ describe('StructMap2 public WASM readers', () => {
     expect(Opcode.BATCH_STRUCT_MAP2_UPSERT_MAX_I64X2).toBe(0x87);
     const backend = await createColumineWasmBackend(readFileSync(WASM_PATH));
     const getRow = backend.structMap2GetRow;
-    if (!getRow) throw new Error('WASM backend omitted StructMap2 point lookup');
     const max = await backend.loadProgram(
       reducer(
         [Opcode.BATCH_STRUCT_MAP2_UPSERT_MAX_I64X2, 0, 0, 1, 1, 2, 0, 3, 1, 4, 2],

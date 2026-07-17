@@ -5,7 +5,7 @@
 //! RETE/ax_eval/condition-tree families.
 
 /// Every function export of the Zig columine.wasm.
-pub const ZIG_COLUMINE_EXPORTS: [&str; 61] = [
+pub const ZIG_COLUMINE_EXPORTS: [&str; 62] = [
     "vm_calculate_grown_state_size",
     "vm_calculate_state_size",
     "vm_delta_apply_rollback_segment",
@@ -17,6 +17,7 @@ pub const ZIG_COLUMINE_EXPORTS: [&str; 61] = [
     "vm_delta_export_segment",
     "vm_delta_export_undo_ptr",
     "vm_evict_all_expired",
+    "vm_get_evicted_count",
     "vm_execute_batch",
     "vm_execute_batch_delta",
     "vm_get_needs_growth_slot",
