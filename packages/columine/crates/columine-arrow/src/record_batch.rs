@@ -156,10 +156,22 @@ impl<'a> DynamicColumn<'a> {
         }
     }
 
-    /// Tags the column `.Int64` (the deleted Zig tagged `.Int32` — harmless
-    /// while `add_column` treats both as "fixed-width, data buffer only",
-    /// but a lie any future per-type branching would inherit; fixed
-    /// post-parity).
+    pub fn int32(
+        field_idx: u32,
+        nullable: bool,
+        validity: Option<&'a [u8]>,
+        data: &'a [u8],
+    ) -> Self {
+        Self {
+            field_idx,
+            arrow_type: ArrowType::Int32,
+            nullable,
+            validity,
+            data,
+            offsets: None,
+        }
+    }
+
     pub fn int64(
         field_idx: u32,
         nullable: bool,
@@ -248,8 +260,17 @@ impl<'a> DynamicBodyBuilder<'a> {
         };
         self.field_node_count += 1;
 
-        // Validity buffer (always present per Flechette convention;
-        // non-nullable columns get an empty one).
+        // Arrow Null arrays have a field node but no buffers, including no
+        // validity bitmap. Nullness is carried entirely by `null_count`.
+        if column.arrow_type == ArrowType::Null {
+            return column.validity.is_none()
+                && column.offsets.is_none()
+                && column.data.is_empty()
+                && null_count == row_count;
+        }
+
+        // Every non-Null physical type has a validity buffer descriptor;
+        // non-nullable columns use an empty descriptor.
         let ok = match column.validity {
             Some(validity) => self.add_buffer(validity),
             None => self.add_empty_buffer(),
@@ -269,14 +290,18 @@ impl<'a> DynamicBodyBuilder<'a> {
             ArrowType::Int32 | ArrowType::Int64 | ArrowType::Float64 | ArrowType::Bool => {
                 self.add_buffer(column.data)
             }
-            // No data buffer for Null type.
-            ArrowType::Null => true,
+            ArrowType::Null => false,
         }
     }
 
     fn add_buffer(&mut self, data: &[u8]) -> bool {
-        let aligned_len = align_to_8(data.len());
-        if self.offset + aligned_len > self.buffer.len() {
+        let Some(aligned_len) = data.len().checked_add(7).map(|value| value & !7usize) else {
+            return false;
+        };
+        let Some(end) = self.offset.checked_add(aligned_len) else {
+            return false;
+        };
+        if end > self.buffer.len() {
             return false;
         }
         if self.buffer_desc_count >= self.storage.buffer_descs.len() {
@@ -288,10 +313,9 @@ impl<'a> DynamicBodyBuilder<'a> {
         };
         self.buffer_desc_count += 1;
 
-        self.buffer[self.offset..][..data.len()].copy_from_slice(data);
-        // Zero-fill padding.
-        self.buffer[self.offset + data.len()..self.offset + aligned_len].fill(0);
-        self.offset += aligned_len;
+        self.buffer[self.offset..self.offset + data.len()].copy_from_slice(data);
+        self.buffer[self.offset + data.len()..end].fill(0);
+        self.offset = end;
         true
     }
 
@@ -507,7 +531,7 @@ mod tests {
             field(ArrowType::Binary, true),
             field(ArrowType::Int64, false),
         ];
-        assert_eq!(compute_buffer_count(&fields), 9);
+        assert_eq!(compute_buffer_count(&fields), 8);
     }
 
     // test "DynamicColumn constructors"

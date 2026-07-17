@@ -1,6 +1,6 @@
 [package]
 name = "columine-ep-wasm"
-description = "columine's event_processor.wasm: the 5-function ep_* export surface over columine-event-processor with EpWiring::columine() (caller-buffer protocol, no dedup)"
+description = "columine's event_processor.wasm: the 6-function ep_* export surface over columine-event-processor with EpWiring::columine() (caller-buffer protocol, no dedup)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,3 +14,8 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 columine-event-processor = { path = "../columine-event-processor" }
 columine-arrow = { path = "../columine-arrow" }
+
+[dev-dependencies]
+arrow-array = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-schema = { workspace = true }
