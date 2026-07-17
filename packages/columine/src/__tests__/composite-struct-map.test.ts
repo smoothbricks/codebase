@@ -21,7 +21,7 @@ function reducer(
   fields: readonly StructFieldType[] = [StructFieldType.STRING, StructFieldType.UINT32],
   numInputs = 4,
 ): Uint8Array {
-  const init = [Opcode.SLOT_STRUCT_MAP2, 0, SlotType.STRUCT_MAP2, 8, 0, fields.length, ...fields];
+  const init = [Opcode.SLOT_STRUCT_MAP2, 0, SlotType.STRUCT_MAP2, 8, 0, fields.length, ...fields, Opcode.HALT];
   const code = [...reduce, Opcode.HALT];
   const bytecode = new Uint8Array(PROGRAM_HASH_PREFIX + HEADER_SIZE + init.length + code.length);
   const base = PROGRAM_HASH_PREFIX;

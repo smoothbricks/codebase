@@ -2317,9 +2317,7 @@ fn exec_agg_count(
 }
 
 /// vm.zig BATCH_SCALAR_LATEST core (top-level and 0x48 body share it via the
-/// optional type mask). `strict_subtype` matches the top-level arm's
-/// INVALID_PROGRAM on unknown subtypes; the body arm silently ignores them
-/// (vm.zig:2146 `else => {}`) — a faithful asymmetry.
+/// optional type mask). Unknown scalar subtypes are always INVALID_PROGRAM.
 ///
 /// Scalar writes ARE undo-journaled (ScalarUpdate, one undo/redo pair per
 /// call when the slot changed) — the deleted Zig journaled nothing here, so
@@ -2335,11 +2333,13 @@ fn exec_scalar_latest(
     cmp_vals: &[f64],
     batch_len: u32,
     type_mask: Option<(&[u32], u32)>,
-    strict_subtype: bool,
 ) -> ErrorCode {
     let meta = SlotMetaView::read(state, slot);
     let data = meta.offset;
     let scalar_type = meta.agg_type_byte(state);
+    if meta.slot_type() != SlotType::Scalar || !matches!(scalar_type, 8..=10) {
+        return ErrorCode::InvalidProgram;
+    }
     let prev_value = bytes::read_u64(state, data);
     let prev_ts = bytes::read_f64(state, data + 8);
 
@@ -2382,11 +2382,7 @@ fn exec_scalar_latest(
                 }
             }
         }
-        _ => {
-            if strict_subtype {
-                return ErrorCode::InvalidProgram;
-            }
-        }
+        _ => unreachable!("scalar subtype validated before execution"),
     }
 
     if undo.enabled {
@@ -2441,20 +2437,19 @@ const fn agg_op_len(op_byte: u8) -> u32 {
 
 /// vm.zig:1895 `bodyOpLen` — length (incl. opcode) of a non-agg body op.
 fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
-    let op = *code.get(pc)?;
+    let op = Opcode::from_u8(*code.get(pc)?)?;
     let len = match op {
-        0x20 => 6,
-        0x21 | 0x22 => 4,
-        0x23 => 3,
-        0x24 => 6,
-        0x25 => 5,
-        0x26 | 0x27 => 6,
-        0x28 => 7,
-        0x29 | 0x2A => 5,
-        0x2B => 4,
-        0x2C | 0x2D => 7,
+        Opcode::BatchMapUpsertLatest | Opcode::BatchMapUpsertLatestTtl => 6,
+        Opcode::BatchMapUpsertFirst | Opcode::BatchMapUpsertLast => 4,
+        Opcode::BatchMapRemove => 3,
+        Opcode::BatchMapUpsertLastTtl => 5,
+        Opcode::BatchMapUpsertMax | Opcode::BatchMapUpsertMin => 6,
+        Opcode::BatchMapUpsertLatestIf => 7,
+        Opcode::BatchMapUpsertFirstIf | Opcode::BatchMapUpsertLastIf => 5,
+        Opcode::BatchMapRemoveIf => 4,
+        Opcode::BatchMapUpsertMaxIf | Opcode::BatchMapUpsertMinIf => 7,
         //#region axe!n/reduce-typed-state.probe-len
-        0x2e => {
+        Opcode::BatchStructMapProbe => {
             let num_fields = usize::from(*code.get(pc.checked_add(5)?)?);
             6usize
                 .checked_add(num_fields.checked_mul(2)?)?
@@ -2462,51 +2457,103 @@ fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
         }
         //#endregion axe!n/reduce-typed-state.probe-len
         //#region axe!n/reduce-typed-state.scatter-len
-        0x2f => {
+        Opcode::BatchStructMapProbeScatter => {
             let num_routes = usize::from(*code.get(pc.checked_add(6)?)?);
             7usize.checked_add(num_routes.checked_mul(5)?)?
         }
         //#endregion axe!n/reduce-typed-state.scatter-len
-        0x30 | 0x31 => 3,
-        0x32 | 0x33 => 4,
-        0x40 => 3,
-        0x41 => 2,
-        0x42 | 0x43 => 3,
-        0x44 => 4,
-        0x45 => 3,
-        0x46..=0x48 => 4,
-        0x49..=0x4b => 3,
-        // STRUCT_MAP_UPSERT_LAST/FIRST/MAX: max appends one comparison ordinal.
-        0x80..=0x82 => {
-            let operands = decode_struct_map_upsert_operands(code, pc.checked_add(1)?, op == 0x82)?;
+        Opcode::BatchSetInsert
+        | Opcode::BatchSetRemove
+        | Opcode::BatchBitmapAdd
+        | Opcode::BatchBitmapRemove => 3,
+        Opcode::BatchSetInsertTtl | Opcode::BatchSetInsertIf => 4,
+        Opcode::BatchAggSum | Opcode::BatchAggMin | Opcode::BatchAggMax => 3,
+        Opcode::BatchAggCount => 2,
+        Opcode::BatchAggSumIf => 4,
+        Opcode::BatchAggCountIf => 3,
+        Opcode::BatchAggMinIf | Opcode::BatchAggMaxIf | Opcode::BatchScalarLatest => 4,
+        Opcode::BatchAggSumI64 | Opcode::BatchAggMinI64 | Opcode::BatchAggMaxI64 => 3,
+        Opcode::BatchStructMapUpsertLast
+        | Opcode::BatchStructMapUpsertFirst
+        | Opcode::BatchStructMapUpsertMax => {
+            let operands = decode_struct_map_upsert_operands(
+                code,
+                pc.checked_add(1)?,
+                op == Opcode::BatchStructMapUpsertMax,
+            )?;
             operands.end.checked_sub(pc)?
         }
-        0x83 => {
+        Opcode::BatchStructMap2UpsertLast => {
             let operands = decode_struct_map2_upsert_operands(code, pc.checked_add(1)?)?;
             operands.end.checked_sub(pc)?
         }
-        0x87 => {
+        Opcode::BatchStructMap2UpsertMaxI64x2 => {
             let operands = decode_struct_map2_max_i64x2_operands(code, pc.checked_add(1)?)?;
             operands.end.checked_sub(pc)?
         }
-        0x84 => 3,
-        0x86 => 4,
-        0x85 => {
+        Opcode::ListAppend => 3,
+        Opcode::BatchStructMap2Remove => 4,
+        Opcode::ListAppendStruct => {
             let num_vals = usize::from(*code.get(pc.checked_add(2)?)?);
             3usize.checked_add(num_vals.checked_mul(2)?)?
         }
-        0xE1 => {
+        Opcode::FlatMap => {
             let low = usize::from(*code.get(pc.checked_add(3)?)?);
             let high = usize::from(*code.get(pc.checked_add(4)?)?);
             5usize.checked_add(low | (high << 8))?
         }
-        0x90 => 4,
-        0x92 => 5,
-        0x95 => 4,
-        _ => 1,
+        Opcode::NestedSetInsert => 4,
+        Opcode::NestedMapUpsertLast => 5,
+        Opcode::NestedAggUpdate => 4,
+        _ => return None,
     };
     let end = pc.checked_add(len)?;
     (end <= code.len()).then_some(len)
+}
+
+fn validate_body(state: &[u8], body: &[u8]) -> bool {
+    let mut pc = 0usize;
+    while pc < body.len() {
+        let Some(op) = Opcode::from_u8(body[pc]) else {
+            return false;
+        };
+        let Some(len) = body_op_len(body, pc) else {
+            return false;
+        };
+
+        if op == Opcode::BatchScalarLatest {
+            let Some(&slot) = body.get(pc + 1) else {
+                return false;
+            };
+            let num_slots = state[StateHeaderOffset::NUM_SLOTS as usize];
+            if slot >= num_slots {
+                return false;
+            }
+            let meta = SlotMetaView::read(state, slot);
+            let scalar_type = meta.agg_type_byte(state);
+            if meta.slot_type() != SlotType::Scalar || !matches!(scalar_type, 8..=10) {
+                return false;
+            }
+        }
+
+        if op == Opcode::FlatMap {
+            let Some(inner_start) = pc.checked_add(5) else {
+                return false;
+            };
+            let Some(inner_len) = len.checked_sub(5) else {
+                return false;
+            };
+            let Some(inner_end) = inner_start.checked_add(inner_len) else {
+                return false;
+            };
+            if !validate_body(state, &body[inner_start..inner_end]) {
+                return false;
+            }
+        }
+
+        pc += len;
+    }
+    true
 }
 
 // =============================================================================
@@ -3005,7 +3052,6 @@ impl Vm {
                         cmp_vals,
                         batch_len,
                         None,
-                        true,
                     );
                     if result != ErrorCode::Ok {
                         return result as u32;
@@ -3184,16 +3230,37 @@ impl Vm {
 
                 Opcode::ForEach => {
                     // Header: col:u8, match_count:u8, match_ids:u32le[N], body_len:u16le.
-                    let col_idx = code[pc];
-                    let match_count = code[pc + 1] as usize;
+                    let Some(header) = code.get(pc..pc.saturating_add(2)) else {
+                        return INVALID_PROGRAM;
+                    };
+                    let col_idx = header[0];
+                    let match_count = usize::from(header[1]);
                     let match_ids_start = pc + 2;
-                    let body_len_offset = match_ids_start + match_count * 4;
-                    let body_len = usize::from(code[body_len_offset])
-                        | (usize::from(code[body_len_offset + 1]) << 8);
+                    let Some(match_ids_len) = match_count.checked_mul(4) else {
+                        return INVALID_PROGRAM;
+                    };
+                    let Some(body_len_offset) = match_ids_start.checked_add(match_ids_len) else {
+                        return INVALID_PROGRAM;
+                    };
+                    let Some(body_len_bytes) =
+                        code.get(body_len_offset..body_len_offset.saturating_add(2))
+                    else {
+                        return INVALID_PROGRAM;
+                    };
+                    let body_len =
+                        usize::from(body_len_bytes[0]) | (usize::from(body_len_bytes[1]) << 8);
                     let body_start = body_len_offset + 2;
-                    pc = body_start + body_len;
+                    let Some(body_end) = body_start.checked_add(body_len) else {
+                        return INVALID_PROGRAM;
+                    };
+                    let Some(body) = code.get(body_start..body_end) else {
+                        return INVALID_PROGRAM;
+                    };
+                    if !validate_body(state, body) {
+                        return INVALID_PROGRAM;
+                    }
+                    pc = body_end;
 
-                    let body = &code[body_start..body_start + body_len];
                     let type_col = col_at(cols, col_idx as usize);
 
                     // Pass 1: batch aggregates, once per match id (vm.zig:1806).
@@ -3331,9 +3398,7 @@ impl Vm {
                     let (slot, val_col, cmp_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
                     bpc += 4;
                     let cmp_vals = col_f64(col_at(cols, cmp_col as usize), batch_len);
-                    // Body arm: unknown scalar subtype is silently ignored
-                    // (vm.zig:2146) — strict_subtype=false.
-                    let _ = exec_scalar_latest(
+                    let result = exec_scalar_latest(
                         &mut self.undo,
                         delta_mode,
                         state,
@@ -3342,8 +3407,10 @@ impl Vm {
                         cmp_vals,
                         batch_len,
                         Some((type_data, type_id)),
-                        false,
                     );
+                    if result != ErrorCode::Ok {
+                        return result as u32;
+                    }
                 }
                 0x49..=0x4b => {
                     let (slot, val_col) = (body[bpc + 1], body[bpc + 2]);
@@ -4560,10 +4627,7 @@ impl Vm {
                     }
                 }
 
-                // Unknown body opcode — skip 1 byte (vm.zig:3257).
-                _ => {
-                    bpc += 1;
-                }
+                _ => return INVALID_PROGRAM,
             }
         }
         OK

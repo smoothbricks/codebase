@@ -39,6 +39,33 @@ function parseAggType(value: number): AggType {
   }
 }
 
+function parseScalarAggType(value: number): AggType {
+  switch (value) {
+    case AggType.SCALAR_U32:
+    case AggType.SCALAR_F64:
+    case AggType.SCALAR_I64:
+      return value;
+    default:
+      throw new Error(`Invalid program: unknown scalar type ${value}`);
+  }
+}
+
+function requireInitBytes(initCode: Uint8Array, pc: number, count: number, context: string): void {
+  if (pc + count > initCode.length) {
+    throw new Error(`Invalid program: truncated ${context}`);
+  }
+}
+
+function defineSlot(slotDefs: Array<SlotDef | undefined>, expectedSlots: number, slot: number, slotDef: SlotDef): void {
+  if (slot >= expectedSlots) {
+    throw new Error(`Invalid program: slot index ${slot} out of range`);
+  }
+  if (slotDefs[slot] !== undefined) {
+    throw new Error(`Invalid program: duplicate slot definition ${slot}`);
+  }
+  slotDefs[slot] = slotDef;
+}
+
 function parseStructFieldType(value: number): StructFieldType {
   switch (value) {
     case 0:
@@ -105,7 +132,8 @@ export function parseReducerProgram(bytecode: Uint8Array, defaultCapacity = 1024
 }
 
 export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number, defaultCapacity: number): SlotDef[] {
-  const slotDefs: SlotDef[] = new Array(expectedSlots);
+  const slotDefs: Array<SlotDef | undefined> = new Array(expectedSlots);
+  let halted = false;
 
   let pc = 0;
   while (pc < initCode.length) {
@@ -113,6 +141,7 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
 
     switch (op) {
       case Opcode.SLOT_DEF: {
+        requireInitBytes(initCode, pc, 4, 'SLOT_DEF operands');
         const slot = initCode[pc];
         const typeFlags = initCode[pc + 1];
         const slotType = typeFlags & SLOT_TYPE_MASK;
@@ -127,10 +156,11 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
 
         const capacity = (capHi << 8) | capLo || defaultCapacity;
         const ttl = ttlParsed?.ttl;
+        let slotDef: SlotDef;
 
         switch (slotType) {
           case SlotType.HASHMAP:
-            slotDefs[slot] = {
+            slotDef = {
               type: SlotType.HASHMAP,
               capacity,
               storesTimestamps: (typeFlags & NO_HASHMAP_TIMESTAMPS_FLAG) === 0,
@@ -138,31 +168,37 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
             };
             break;
           case SlotType.HASHSET:
-            slotDefs[slot] = { type: SlotType.HASHSET, capacity, ttl };
+            slotDef = { type: SlotType.HASHSET, capacity, ttl };
             break;
           case SlotType.BITMAP:
-            slotDefs[slot] = { type: SlotType.BITMAP, capacity, ttl };
+            slotDef = { type: SlotType.BITMAP, capacity, ttl };
             break;
           case SlotType.AGGREGATE:
-            slotDefs[slot] = { type: SlotType.AGGREGATE, aggType: parseAggType(capLo || AggType.SUM) };
+            slotDef = { type: SlotType.AGGREGATE, aggType: parseAggType(capLo || AggType.SUM) };
+            break;
+          case SlotType.SCALAR:
+            slotDef = { type: SlotType.SCALAR, aggType: parseScalarAggType(capLo) };
             break;
           case SlotType.CONDITION_TREE:
-            slotDefs[slot] = { type: SlotType.CONDITION_TREE };
+            slotDef = { type: SlotType.CONDITION_TREE };
             break;
           default:
-            break;
+            throw new Error(`Invalid program: unsupported SLOT_DEF type ${slotType}`);
         }
+        defineSlot(slotDefs, expectedSlots, slot, slotDef);
         break;
       }
 
       case Opcode.SLOT_STRUCT_MAP:
       case Opcode.SLOT_STRUCT_MAP2: {
+        requireInitBytes(initCode, pc, 5, 'struct-map slot operands');
         const slot = initCode[pc];
         const typeFlags = initCode[pc + 1];
         const capLo = initCode[pc + 2];
         const capHi = initCode[pc + 3];
         const numFields = initCode[pc + 4];
         pc += 5;
+        requireInitBytes(initCode, pc, numFields, 'struct-map field metadata');
 
         const fieldTypes: StructFieldType[] = [];
         for (let i = 0; i < numFields; i++) {
@@ -174,7 +210,10 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
           pc = ttlParsed.nextPc;
         }
 
-        slotDefs[slot] =
+        defineSlot(
+          slotDefs,
+          expectedSlots,
+          slot,
           op === Opcode.SLOT_STRUCT_MAP2
             ? {
                 type: SlotType.STRUCT_MAP2,
@@ -186,11 +225,13 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
                 capacity: (capHi << 8) | capLo || defaultCapacity,
                 fieldTypes,
                 ttl: ttlParsed?.ttl,
-              };
+              },
+        );
         break;
       }
 
       case Opcode.SLOT_ORDERED_LIST: {
+        requireInitBytes(initCode, pc, 5, 'SLOT_ORDERED_LIST operands');
         const slot = initCode[pc];
         const capLo = initCode[pc + 2];
         const capHi = initCode[pc + 3];
@@ -198,35 +239,50 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
         pc += 5;
 
         const capacity = (capHi << 8) | capLo || defaultCapacity;
+        let slotDef: SlotDef;
         if (elemTypeByte === 0xff) {
+          requireInitBytes(initCode, pc, 1, 'ordered-list field count');
           const numFields = initCode[pc++];
+          requireInitBytes(initCode, pc, numFields, 'ordered-list field metadata');
           const fieldTypes: StructFieldType[] = [];
           for (let i = 0; i < numFields; i++) {
             fieldTypes.push(parseStructFieldType(initCode[pc++]));
           }
-          slotDefs[slot] = { type: SlotType.ORDERED_LIST, capacity, fieldTypes };
+          slotDef = { type: SlotType.ORDERED_LIST, capacity, fieldTypes };
         } else {
-          slotDefs[slot] = { type: SlotType.ORDERED_LIST, capacity, elemType: parseStructFieldType(elemTypeByte) };
+          slotDef = { type: SlotType.ORDERED_LIST, capacity, elemType: parseStructFieldType(elemTypeByte) };
         }
+        defineSlot(slotDefs, expectedSlots, slot, slotDef);
         break;
       }
 
       case Opcode.HALT:
-        pc = initCode.length;
+        if (pc !== initCode.length) {
+          throw new Error('Invalid program: bytes after init HALT');
+        }
+        halted = true;
         break;
 
       default:
-        pc = initCode.length;
+        throw new Error(`Invalid program: unknown init opcode ${op}`);
+    }
+
+    if (halted) {
+      break;
     }
   }
 
-  for (let i = 0; i < expectedSlots; i++) {
-    if (!slotDefs[i]) {
-      slotDefs[i] = { type: SlotType.AGGREGATE, aggType: AggType.SUM };
-    }
+  if (!halted) {
+    throw new Error('Invalid program: init section missing HALT');
   }
 
-  return slotDefs;
+  return Array.from({ length: expectedSlots }, (_, slot) => {
+    const slotDef = slotDefs[slot];
+    if (slotDef === undefined) {
+      throw new Error(`Invalid program: missing slot definition ${slot}`);
+    }
+    return slotDef;
+  });
 }
 
 function parseTtlIfPresent(initCode: Uint8Array, pc: number, typeFlags: number): ParsedTtl | undefined {
