@@ -113,3 +113,54 @@ fn invalid_format_refuses() {
     assert_ne!(code, 0, "invalid format must refuse");
     ep_destroy(handle);
 }
+
+#[test]
+fn handle_zero_is_reserved_and_full_table_creation_fails() {
+    let _serial = serial();
+    let handles = (0..255).map(|_| create_processor(1)).collect::<Vec<_>>();
+
+    assert!(handles.iter().all(|handle| (1..=255).contains(handle)));
+    let mut unique = handles.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), 255);
+    assert_eq!(create_processor(1), 0, "a full handle table must refuse");
+
+    for handle in handles {
+        ep_destroy(handle);
+    }
+}
+
+#[test]
+fn destroyed_handle_is_reused_and_invalid_or_double_destroy_is_harmless() {
+    let _serial = serial();
+    let handles = (0..255).map(|_| create_processor(1)).collect::<Vec<_>>();
+    assert!(handles.iter().all(|handle| *handle != 0));
+
+    let reusable = handles[127];
+    ep_destroy(0);
+    ep_destroy(256);
+    ep_destroy(u32::MAX);
+    ep_destroy(reusable);
+    ep_destroy(reusable);
+
+    let replacement = create_processor(1);
+    assert_eq!(replacement, reusable);
+
+    ep_destroy(replacement);
+    for handle in handles.into_iter().filter(|handle| *handle != reusable) {
+        ep_destroy(handle);
+    }
+}
+
+#[test]
+fn handle_zero_is_never_returned_across_repeated_wraparound() {
+    let _serial = serial();
+
+    for cycle in 0..1_024 {
+        let handle = create_processor(1);
+        assert_ne!(handle, 0, "cycle {cycle} returned the failure sentinel");
+        assert!((1..=255).contains(&handle));
+        ep_destroy(handle);
+    }
+}
