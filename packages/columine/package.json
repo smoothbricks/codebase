@@ -76,6 +76,7 @@
   },
   "devDependencies": {
     "@smoothbricks/validation": "workspace:*",
+    "@uwdata/flechette": "^2.3.0",
     "typescript": "^6.0.3"
   },
   "license": "MIT",
