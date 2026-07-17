@@ -4,7 +4,9 @@
 //! struct-map iteration + growth through dispatch, and array fields in
 //! struct-map rows. Scenarios and expected values mirror the Zig blocks.
 
-use columine_types::types::{ErrorCode, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset, align8};
+use columine_types::types::{
+    AggType, ErrorCode, Opcode, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset, SlotType, align8,
+};
 use columine_vm::bytes;
 use columine_vm::state_init::{
     ARENA_HEADER_SIZE, calculate_grown_state_size, calculate_state_size, grow_state, init_state,
@@ -16,15 +18,18 @@ use columine_vm::vm::{
 };
 
 const OK: u32 = ErrorCode::Ok as u32;
+const INVALID_PROGRAM: u32 = ErrorCode::InvalidProgram as u32;
 const NEEDS_GROWTH: u32 = ErrorCode::NeedsGrowth as u32;
 const TYPE_A: u32 = 1001;
 
 fn program(num_slots: u8, num_inputs: u8, init: &[u8], reduce: &[u8]) -> Vec<u8> {
+    let init_len = init.len() + 1;
     let mut prog = vec![0u8; 32];
     prog.extend([0x41, 0x58, 0x45, 0x31, 1, 0, num_slots, num_inputs, 0, 0]);
-    prog.extend((init.len() as u16).to_le_bytes());
+    prog.extend((init_len as u16).to_le_bytes());
     prog.extend((reduce.len() as u16).to_le_bytes());
     prog.extend_from_slice(init);
+    prog.push(Opcode::Halt as u8);
     prog.extend_from_slice(reduce);
     prog
 }
@@ -116,6 +121,73 @@ fn struct_map_row(state: &[u8], slot: u8, key: u32) -> u32 {
     )
 }
 
+#[test]
+fn unknown_and_truncated_block_opcodes_reject_before_mutation_or_undo() {
+    let init_code = [
+        Opcode::SlotOrderedList as u8,
+        0,
+        SlotType::OrderedList as u8,
+        8,
+        0,
+        0,
+    ];
+    let types = [TYPE_A];
+    let values = [42u32];
+    let cols: Vec<&[u8]> = vec![u32s_as_bytes(&types), u32s_as_bytes(&values)];
+
+    for body in [
+        vec![Opcode::ListAppend as u8, 0, 1, 0xfe],
+        vec![Opcode::ListAppend as u8, 0],
+    ] {
+        let prog = program(1, 2, &init_code, &for_each(TYPE_A, &body));
+        let mut state = init(&prog);
+        let before = state.clone();
+        let mut vm = Vm::default();
+        vm.undo_enable(&state);
+        let checkpoint = vm.undo_checkpoint();
+
+        assert_eq!(
+            INVALID_PROGRAM,
+            vm.execute_batch_delta(&mut state, &prog, &cols, 1)
+        );
+        assert_eq!(state, before);
+        assert_eq!(vm.undo_checkpoint(), checkpoint);
+    }
+}
+
+#[test]
+fn unknown_block_scalar_subtype_rejects_before_mutation_or_undo() {
+    let init_code = [
+        Opcode::SlotDef as u8,
+        0,
+        SlotType::Scalar as u8,
+        AggType::ScalarF64 as u8,
+        0,
+    ];
+    let body = [Opcode::BatchScalarLatest as u8, 0, 1, 2];
+    let prog = program(1, 3, &init_code, &for_each(TYPE_A, &body));
+    let mut state = init(&prog);
+    state[(STATE_HEADER_SIZE + SlotMetaOffset::AGG_TYPE) as usize] = 7;
+    let before = state.clone();
+    let mut vm = Vm::default();
+    vm.undo_enable(&state);
+    let checkpoint = vm.undo_checkpoint();
+
+    let types = [TYPE_A];
+    let values = [42.5f64];
+    let timestamps = [100.0f64];
+    let cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        f64s_as_bytes(&values),
+        f64s_as_bytes(&timestamps),
+    ];
+    assert_eq!(
+        INVALID_PROGRAM,
+        vm.execute_batch_delta(&mut state, &prog, &cols, 1)
+    );
+    assert_eq!(state, before);
+    assert_eq!(vm.undo_checkpoint(), checkpoint);
+}
 // =============================================================================
 // FLAT_MAP + event-level AGG_SUM (vm_test.zig:2748)
 // =============================================================================
@@ -699,7 +771,6 @@ fn struct_map_array_field_overwrite_last_wins_old_arena_data_abandoned() {
 // deferred by the struct_map/nested slice until the dispatch loop existed)
 // =============================================================================
 
-use columine_types::types::SlotType;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::nested::{
     arena_header_offset, get_inner_offset, get_inner_set_size, inner_agg_get_count,
@@ -989,7 +1060,7 @@ fn hashmap_no_timestamp_rejects_latest_max_min_opcodes() {
 #[test]
 fn ts_struct_map_upsert_first_keeps_first_row_and_rolls_back() {
     let hex = "0000000000000000000000000000000000000000000000000000000000000000\
-               4158453101000100000009001a00180006000403040400e001010100000010\
+               415845310100010000000a001a0018000600040304040000e001010100000010\
                00e103ff0b00810004030400050106020000";
     let hex: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
     let prog: Vec<u8> = (0..hex.len())
