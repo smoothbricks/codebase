@@ -7,7 +7,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { CowshedError, coordinatorEndpoint, type ErrorCode, openProject } from './index.js';
+import { CowshedError, connectCoordinator, coordinatorEndpoint, type ErrorCode, openProject } from './index.js';
 
 function requireCowshedError(error: unknown, code: ErrorCode): CowshedError {
   expect(error).toBeInstanceOf(CowshedError);
@@ -51,6 +51,15 @@ describe('Cowshed Node-API bindings', () => {
       } catch (error) {
         const consumed = requireCowshedError(error, 'conflict');
         expect(consumed.message).toContain('already been consumed');
+      }
+
+      const coordinatorEndpointValue = coordinatorEndpoint(openSync(path, 'r'));
+      try {
+        await connectCoordinator(coordinatorEndpointValue, root);
+        throw new Error('expected a regular-file endpoint to fail the coordinator handshake');
+      } catch (error) {
+        const handshake = requireCowshedError(error, 'environment-missing');
+        expect(handshake.message).toContain('not a stream socket');
       }
     } finally {
       await rm(root, { recursive: true, force: true });
