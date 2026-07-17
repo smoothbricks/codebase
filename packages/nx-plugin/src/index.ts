@@ -7,7 +7,7 @@ import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 
 import { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 
-const BUILD_OUTPUT_TARGET_PATTERN = /-(?:js|web|html|css|ios|android|native|napi|bun|wasm)$/;
+const BUILD_OUTPUT_TARGET_PATTERN = /-(?:js|web|html|css|android|native|napi|bun|wasm)$/;
 const TYPESCRIPT_TOOLCHAIN_INPUTS = [
   '{workspaceRoot}/package.json',
   '{workspaceRoot}/bun.lock',
@@ -353,7 +353,6 @@ function classifyPackageLocalBuildOutputs(packageJson: PackageJson): { ordinary:
     ),
   };
 }
-
 
 interface CargoWorkspace {
   wasmCrates: string[];
