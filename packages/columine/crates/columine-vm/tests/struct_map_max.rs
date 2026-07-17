@@ -18,6 +18,7 @@ fn program(num_inputs: u8, field_types: &[u8], reduce: &[u8]) -> Vec<u8> {
         u8::try_from(field_types.len()).expect("field count fits u8"),
     ];
     init.extend_from_slice(field_types);
+    init.push(0);
 
     let mut program = vec![0u8; 32];
     program.extend([0x41, 0x58, 0x45, 0x31, 1, 0, 1, num_inputs, 0, 0]);
