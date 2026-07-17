@@ -1041,9 +1041,9 @@ mod tests {
         for bits in 0..=u8::MAX {
             let flags = SlotTypeFlags::from_byte(bits);
             assert_eq!(flags.to_byte(), bits);
-            // Bits 0-3 above 9 are unassigned slot types and must decode to None.
+            // Bits 0-3 above 10 are unassigned slot types and must decode to None.
             let low = bits & 0x0f;
-            assert_eq!(flags.slot_type().is_some(), low <= 9);
+            assert_eq!(flags.slot_type().is_some(), low <= 10);
             assert_eq!(flags.has_ttl(), bits & 0x10 != 0);
             assert_eq!(flags.has_evict_trigger(), bits & 0x20 != 0);
             assert_eq!(flags.no_hashmap_timestamps(), bits & 0x40 != 0);
