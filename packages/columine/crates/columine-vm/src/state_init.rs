@@ -35,10 +35,10 @@
 
 use crate::{aggregates, bitmap_ops, bytes, hash_table, nested, slot_growth};
 use columine_types::types::{
-    CONDITION_TREE_STATE_BYTES, DERIVED_FACT_EMPTY_IDENTITY, EMPTY_KEY, ErrorCode, Opcode,
+    AggType, CONDITION_TREE_STATE_BYTES, DERIVED_FACT_EMPTY_IDENTITY, EMPTY_KEY, ErrorCode, Opcode,
     PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE, PROGRAM_MAGIC, SLOT_META_SIZE, STATE_FORMAT_VERSION,
     STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType, SlotTypeFlags, StateFlags,
-    StateHeaderOffset, TOMBSTONE, align8, next_power_of_2,
+    StateHeaderOffset, StructFieldType, TOMBSTONE, align8, next_power_of_2,
 };
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -209,6 +209,192 @@ fn slot_def_capacity(type_flags: SlotTypeFlags, cap_lo: u8, cap_hi: u8) -> Optio
     Some((slot_type, capacity))
 }
 
+fn valid_slot_index(seen: &mut [bool; 256], num_slots: u8, slot: u8) -> bool {
+    let index = usize::from(slot);
+    if slot >= num_slots || seen[index] {
+        return false;
+    }
+    seen[index] = true;
+    true
+}
+
+fn valid_aggregate_subtype(byte: u8) -> bool {
+    let byte = if byte == 0 { AggType::Sum as u8 } else { byte };
+    matches!(
+        AggType::from_u8(byte),
+        Some(
+            AggType::Sum
+                | AggType::Count
+                | AggType::Min
+                | AggType::Max
+                | AggType::Avg
+                | AggType::SumI64
+                | AggType::MinI64
+                | AggType::MaxI64
+        )
+    )
+}
+
+fn valid_scalar_subtype(byte: u8) -> bool {
+    matches!(
+        AggType::from_u8(byte),
+        Some(AggType::ScalarU32 | AggType::ScalarF64 | AggType::ScalarI64)
+    )
+}
+
+fn validate_init_code(view: &ProgramView<'_>) -> bool {
+    let code = view.init_code;
+    let mut seen = [false; 256];
+    let mut pc = 0usize;
+
+    while pc < code.len() {
+        let Some(op) = Opcode::from_u8(code[pc]) else {
+            return false;
+        };
+        pc += 1;
+
+        match op {
+            Opcode::Halt => {
+                return pc == code.len()
+                    && seen[..usize::from(view.num_slots)]
+                        .iter()
+                        .all(|defined| *defined);
+            }
+            Opcode::SlotDef => {
+                let Some(operands) = code.get(pc..pc.saturating_add(4)) else {
+                    return false;
+                };
+                let slot = operands[0];
+                let type_flags = SlotTypeFlags::from_byte(operands[1]);
+                let cap_lo = operands[2];
+                let Some(slot_type) = type_flags.slot_type() else {
+                    return false;
+                };
+                if !valid_slot_index(&mut seen, view.num_slots, slot) {
+                    return false;
+                }
+                if matches!(
+                    slot_type,
+                    SlotType::StructMap
+                        | SlotType::StructMap2
+                        | SlotType::OrderedList
+                        | SlotType::Nested
+                ) {
+                    return false;
+                }
+                if slot_type == SlotType::Aggregate && !valid_aggregate_subtype(cap_lo) {
+                    return false;
+                }
+                if slot_type == SlotType::Scalar && !valid_scalar_subtype(cap_lo) {
+                    return false;
+                }
+                if slot_type == SlotType::HashMap
+                    && type_flags.has_ttl()
+                    && type_flags.no_hashmap_timestamps()
+                {
+                    return false;
+                }
+                pc += 4;
+                if type_flags.has_ttl() {
+                    let Some(ttl) = code.get(pc..pc.saturating_add(10)) else {
+                        return false;
+                    };
+                    if ttl[9] > 8 {
+                        return false;
+                    }
+                    pc += 10;
+                }
+            }
+            Opcode::SlotArray => {
+                let Some(operands) = code.get(pc..pc.saturating_add(4)) else {
+                    return false;
+                };
+                if !valid_slot_index(&mut seen, view.num_slots, operands[0]) {
+                    return false;
+                }
+                pc += 4;
+            }
+            Opcode::SlotStructMap | Opcode::SlotStructMap2 => {
+                let Some(operands) = code.get(pc..pc.saturating_add(5)) else {
+                    return false;
+                };
+                if !valid_slot_index(&mut seen, view.num_slots, operands[0]) {
+                    return false;
+                }
+                let type_flags = SlotTypeFlags::from_byte(operands[1]);
+                if type_flags.has_ttl() {
+                    return false;
+                }
+                let num_fields = usize::from(operands[4]);
+                pc += 5;
+                let Some(field_types) = code.get(pc..pc.saturating_add(num_fields)) else {
+                    return false;
+                };
+                if field_types
+                    .iter()
+                    .any(|field_type| StructFieldType::from_u8(*field_type).is_none())
+                {
+                    return false;
+                }
+                pc += num_fields;
+            }
+            Opcode::SlotOrderedList => {
+                let Some(operands) = code.get(pc..pc.saturating_add(5)) else {
+                    return false;
+                };
+                if !valid_slot_index(&mut seen, view.num_slots, operands[0]) {
+                    return false;
+                }
+                let elem_type = operands[4];
+                pc += 5;
+                if elem_type == 0xff {
+                    let Some(&num_fields) = code.get(pc) else {
+                        return false;
+                    };
+                    pc += 1;
+                    let Some(field_types) =
+                        code.get(pc..pc.saturating_add(usize::from(num_fields)))
+                    else {
+                        return false;
+                    };
+                    if field_types
+                        .iter()
+                        .any(|field_type| StructFieldType::from_u8(*field_type).is_none())
+                    {
+                        return false;
+                    }
+                    pc += usize::from(num_fields);
+                } else if StructFieldType::from_u8(elem_type).is_none() {
+                    return false;
+                }
+            }
+            Opcode::SlotNested => {
+                let Some(operands) = code.get(pc..pc.saturating_add(8)) else {
+                    return false;
+                };
+                if !valid_slot_index(&mut seen, view.num_slots, operands[0]) {
+                    return false;
+                }
+                let Some(inner_type) = SlotType::from_u8(operands[4] & 0x0f) else {
+                    return false;
+                };
+                if inner_type == SlotType::Aggregate && !valid_aggregate_subtype(operands[7]) {
+                    return false;
+                }
+                pc += 8;
+            }
+            _ => return false,
+        }
+    }
+
+    false
+}
+
+fn validated_program(program: &[u8]) -> Option<ProgramView<'_>> {
+    let view = parse_program(program)?;
+    validate_init_code(&view).then_some(view)
+}
+
 // =============================================================================
 // State Size Calculation — vm_calculate_state_size
 // =============================================================================
@@ -216,7 +402,7 @@ fn slot_def_capacity(type_flags: SlotTypeFlags, cap_lo: u8, cap_hi: u8) -> Optio
 /// state_init.zig:145-381 `vm_calculate_state_size`.
 /// Returns the required buffer size in bytes, or 0 if the program is invalid.
 pub fn calculate_state_size(program: &[u8]) -> u32 {
-    let Some(view) = parse_program(program) else {
+    let Some(view) = validated_program(program) else {
         return 0;
     };
     let init_code = view.init_code;
@@ -408,9 +594,10 @@ pub fn calculate_state_size(program: &[u8]) -> u32 {
                 inner_agg,
             );
             size = align8(size);
-        } else {
-            // HALT or unknown opcode ends the init walk.
+        } else if op == Opcode::Halt as u8 {
             break;
+        } else {
+            return 0;
         }
     }
 
@@ -468,7 +655,7 @@ fn write_slot_meta(
 /// `state` must be at least `calculate_state_size(program)` bytes and zeroed
 /// (Zig relies on zeroed values regions; both TS backends allocate zeroed).
 pub fn init_state(state: &mut [u8], program: &[u8]) -> Result<(), ErrorCode> {
-    let Some(view) = parse_program(program) else {
+    let Some(view) = validated_program(program) else {
         return Err(ErrorCode::InvalidProgram);
     };
     let content = &program[PROGRAM_HASH_PREFIX as usize..];
@@ -893,9 +1080,10 @@ pub fn init_state(state: &mut [u8], program: &[u8]) -> Result<(), ErrorCode> {
             nested::write_arena_header(state, arena_hdr, arena_cap);
 
             data_offset = align8(data_offset + slot_data_size);
-        } else {
-            // HALT or unknown opcode ends the init walk.
+        } else if op == Opcode::Halt as u8 {
             break;
+        } else {
+            return Err(ErrorCode::InvalidProgram);
         }
     }
 
@@ -909,6 +1097,9 @@ pub fn init_state(state: &mut [u8], program: &[u8]) -> Result<(), ErrorCode> {
 /// zeroed memory), and the deleted Zig's reset left stale value bytes behind
 /// on a dirty buffer — unobservable through lookups, but a byte-level lie.
 pub fn reset_state(state: &mut [u8], program: &[u8]) -> Result<(), ErrorCode> {
+    if validated_program(program).is_none() {
+        return Err(ErrorCode::InvalidProgram);
+    }
     state.fill(0);
     init_state(state, program)
 }
