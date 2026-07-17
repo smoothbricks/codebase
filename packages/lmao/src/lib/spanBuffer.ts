@@ -26,6 +26,7 @@
  */
 
 import {
+  activeMaterializerMode,
   type ColumnBufferExtension,
   DEFAULT_BUFFER_CAPACITY,
   getColumnBufferClass,
@@ -296,7 +297,9 @@ export function materializeCompiledSpanBufferClass<T extends LogSchema>(
   factory: () => new (...args: never[]) => unknown,
 ): SpanBufferConstructor<T> {
   const eagerColumns = resolveCompiledEagerColumns(schema, eagerColumnNames);
-  const cacheKey = `${messageLayoutFamily}:${messagePhysicalLayout}:${eagerColumns.key}`;
+  // Mode-prefixed like arrow-builder's class caches: the materializer mode is fixed for a process,
+  // but the parity suite flips it via override and must never see the other mode's class.
+  const cacheKey = `${activeMaterializerMode()}:${messageLayoutFamily}:${messagePhysicalLayout}:${eagerColumns.key}`;
   let familyClasses = spanBufferClassCache.get(schema);
   const cached = familyClasses?.get(cacheKey);
   if (
@@ -324,6 +327,311 @@ export function materializeCompiledSpanBufferClass<T extends LogSchema>(
   return SpanBufferClass;
 }
 
+// ============================================================================
+// No-eval (closure-composed) extension counterparts
+// ============================================================================
+// Production workerd forbids code generation from strings, so arrow-builder
+// materializes the buffer class from closures there (see arrow-builder's
+// closureMaterializers). The two factories below are the EXACT no-eval
+// re-expressions of the code-string constructorPreamble/methods passed in the
+// extension inside getSpanBufferClass — any change to one side MUST be
+// mirrored on the other (spanbuffer-materializer-parity.test.ts compares the
+// resulting buffers byte for byte).
+
+/** Prototype/instance view used by the closure-composed members. */
+type ClosureSelf = AnySpanBuffer & Record<string, unknown>;
+
+// Thread-local span counter contract shared with the generated constructorPreamble
+// (`globalThis.globalSpanCounter`), see threadId.ts docs.
+declare global {
+  var globalSpanCounter: number | undefined;
+}
+
+function isSpanBufferConstructorValue(value: unknown): value is SpanBufferConstructor {
+  return typeof value === 'function';
+}
+
+function spanBufferStatics(self: AnySpanBuffer): SpanBufferConstructor {
+  const ctor = self.constructor;
+  if (!isSpanBufferConstructorValue(ctor)) throw new TypeError('SpanBuffer constructor is not initialized');
+  return ctor;
+}
+
+/** Constructor arguments arrive untyped through the materializer; every real buffer/traceRoot is an object. */
+function isSpanBufferValue(value: unknown): value is AnySpanBuffer {
+  return typeof value === 'object' && value !== null;
+}
+
+function isTraceRootValue(value: unknown): value is ITraceRoot {
+  return typeof value === 'object' && value !== null;
+}
+
+function requireParent(parent: AnySpanBuffer | undefined): AnySpanBuffer {
+  if (parent === undefined) throw new TypeError('Chained/child SpanBuffer construction requires a parent buffer');
+  return parent;
+}
+
+/** Every runtime SpanBuffer instance satisfies the typed SpanBuffer contract (dynamic column lanes included). */
+function isTypedSpanBuffer(value: AnySpanBuffer): value is SpanBuffer<LogSchema> {
+  return typeof value === 'object' && value !== null;
+}
+
+/** Mirrors the generated `_sealStats` body (shared with getOrCreateOverflow). */
+function sealStatsFor(self: AnySpanBuffer): void {
+  if (self._statsSealed) return;
+  const completedRows = self._writeIndex - self._statsReservedRows;
+  if (completedRows > 0) spanBufferStatics(self).stats.totalWrites += completedRows;
+  self._statsSealed = true;
+}
+
+/**
+ * No-eval counterpart of the extension `constructorPreamble` (and its
+ * `constructorParams` signature): identical buffer-type branches (root /
+ * child / chained), identical physical system layout math, identical
+ * property-assignment order (V8 in-object slots).
+ */
+function createSpanBufferClosureInit(
+  messageLayoutFamily: MessageLayoutFamily,
+  messagePhysicalLayout: MessagePhysicalLayout,
+): NonNullable<ColumnBufferExtension['closureInit']> {
+  return (self, requestedCapacity, ctorArgs) => {
+    // ctorArgs mirror constructorParams: stats, parent, isChained, callsiteMetadata, opMetadata, traceRoot, vocabularyGeneration
+    const parent = isSpanBufferValue(ctorArgs[1]) ? ctorArgs[1] : undefined;
+    const isChained = Boolean(ctorArgs[2]);
+    const callsiteMetadata = ctorArgs[3];
+    const opMetadata = ctorArgs[4];
+    const traceRootArg = ctorArgs[5];
+    if (!isTraceRootValue(traceRootArg)) throw new TypeError('SpanBuffer construction requires a traceRoot');
+    const traceRoot = traceRootArg;
+    const vocabularyGeneration = ctorArgs[6];
+
+    // Thread-local span counter (per-process/worker, see threadId.ts docs)
+    globalThis.globalSpanCounter = (globalThis.globalSpanCounter ?? 0) + 1;
+    const spanId = globalThis.globalSpanCounter;
+    const threadId = isChained ? requireParent(parent).thread_id : getThreadId();
+
+    // Calculate exact physical system storage (same math as the preamble variants).
+    let systemSize: number;
+    let rowHeaderOffset = 0;
+    let messageIdOffset = 0;
+    let logHeaderOffset = 0;
+    if (messagePhysicalLayout === 'packed') {
+      rowHeaderOffset = requestedCapacity * 8;
+      systemSize = (requestedCapacity * 12 + 7) & ~7;
+    } else if (messageLayoutFamily === 'dynamic-only') {
+      systemSize = (requestedCapacity * 9 + 7) & ~7;
+    } else if (messagePhysicalLayout === 'current') {
+      messageIdOffset = (requestedCapacity * 9 + 1) & ~1;
+      systemSize = (messageIdOffset + requestedCapacity * 2 + 7) & ~7;
+    } else {
+      logHeaderOffset = (requestedCapacity * 9 + 3) & ~3;
+      systemSize = (logHeaderOffset + requestedCapacity * 4 + 7) & ~7;
+    }
+
+    // CHAINED: shares parent._identity; CHILD: identity without traceId; ROOT: identity with traceId bytes.
+    let systemBuffer: ArrayBuffer;
+    let identityView: Uint8Array;
+    if (isChained) {
+      systemBuffer = new ArrayBuffer(systemSize);
+      identityView = requireParent(parent)._identity;
+    } else if (parent) {
+      const identitySize = 12;
+      systemBuffer = new ArrayBuffer(systemSize + identitySize);
+      identityView = new Uint8Array(systemBuffer, systemSize, identitySize);
+      copyThreadIdTo(identityView, 0);
+      identityView[8] = spanId;
+      identityView[9] = spanId >>> 8;
+      identityView[10] = spanId >>> 16;
+      identityView[11] = spanId >>> 24;
+    } else {
+      const traceIdBytes = traceRoot._traceIdBytes;
+      const identitySize = 13 + traceIdBytes.length;
+      systemBuffer = new ArrayBuffer(systemSize + identitySize);
+      identityView = new Uint8Array(systemBuffer, systemSize, identitySize);
+      copyThreadIdTo(identityView, 0);
+      identityView[8] = spanId;
+      identityView[9] = spanId >>> 8;
+      identityView[10] = spanId >>> 16;
+      identityView[11] = spanId >>> 24;
+      identityView[12] = traceIdBytes.length;
+      identityView.set(traceIdBytes, 13);
+    }
+
+    // Assign properties in the optimal V8 in-object slot order (same as the preamble).
+    self._writeIndex = 0;
+    self._capacity = requestedCapacity;
+    self._overflow = undefined;
+    self.timestamp = new BigInt64Array(systemBuffer, 0, requestedCapacity);
+    if (messagePhysicalLayout === 'packed') {
+      self._rowHeaders = new Uint32Array(systemBuffer, rowHeaderOffset, requestedCapacity);
+    } else {
+      self.entry_type = new Uint8Array(systemBuffer, requestedCapacity * 8, requestedCapacity);
+      if (messageLayoutFamily !== 'dynamic-only') {
+        if (messagePhysicalLayout === 'current') {
+          self._messageIds = new Uint16Array(systemBuffer, messageIdOffset, requestedCapacity);
+        } else {
+          self._logHeaders = new Uint32Array(systemBuffer, logHeaderOffset, requestedCapacity);
+        }
+      }
+    }
+    self._vocabularyGeneration = vocabularyGeneration;
+    if (messageLayoutFamily === 'static-only') {
+      self._spanName = undefined;
+      self._terminalMessage = undefined;
+    } else if (messageLayoutFamily === 'dynamic-only') {
+      self._spanName = undefined;
+    }
+    self._nodeIndex = 4294967295;
+    self._topologyGeneration = 0;
+    self._parent = isChained ? requireParent(parent)._parent : parent;
+    self._traceRoot = traceRoot;
+    self._scopeValues = parent ? parent._scopeValues : EMPTY_SCOPE;
+    self._threadId = threadId;
+    self._identity = identityView;
+    self._system = systemBuffer;
+    self._callsiteMetadata = callsiteMetadata;
+    self._opMetadata = opMetadata;
+    self._statsSealed = false;
+    self._statsReservedRows = isChained ? 0 : 2;
+    if (messageLayoutFamily !== 'static-only') {
+      self.message_values = new Array(requestedCapacity);
+    }
+  };
+}
+
+/**
+ * No-eval counterpart of the extension `methods` string: same members, same
+ * kinds (getter vs method), installed after the generated per-column members
+ * so same-named members override exactly like the compiled class body.
+ */
+function createSpanBufferClosureMethods(
+  messageLayoutFamily: MessageLayoutFamily,
+): NonNullable<ColumnBufferExtension['closureMethods']> {
+  return (prototype) => {
+    const defineMethod = (name: string, value: unknown): void => {
+      Object.defineProperty(prototype, name, { value, writable: true, configurable: true, enumerable: false });
+    };
+    const defineGetter = (name: string, get: (this: ClosureSelf) => unknown): void => {
+      Object.defineProperty(prototype, name, { get, configurable: true, enumerable: false });
+    };
+
+    defineGetter('span_id', function () {
+      const b = this._identity;
+      return b ? (b[8] | (b[9] << 8) | (b[10] << 16) | (b[11] << 24)) >>> 0 : 0;
+    });
+    defineGetter('thread_id', function () {
+      return this._threadId;
+    });
+    defineGetter('trace_id', function () {
+      return this._traceRoot.trace_id;
+    });
+    defineGetter('_spanStartTime', function () {
+      return this.timestamp[0];
+    });
+    defineGetter('_lastLoggedTime', function () {
+      const chain: AnySpanBuffer[] = [];
+      let current: AnySpanBuffer | undefined = this;
+      while (current) {
+        chain.push(current);
+        current = current._overflow;
+      }
+      for (let i = chain.length - 1; i >= 0; i--) {
+        const buffer = chain[i];
+        for (let row = buffer._writeIndex - 1; row >= 0; row--) {
+          const ts = buffer.timestamp[row];
+          if (ts !== 0n) {
+            return ts;
+          }
+        }
+      }
+      return null;
+    });
+    defineGetter('_hasParent', function () {
+      return this._parent !== undefined;
+    });
+    defineGetter('parent_span_id', function () {
+      return this._parent?.span_id ?? 0;
+    });
+    defineGetter('parent_thread_id', function () {
+      return this._parent?.thread_id ?? 0n;
+    });
+    defineMethod('isParentOf', function (this: ClosureSelf, other: AnySpanBuffer) {
+      return this === other._parent;
+    });
+    defineMethod('isChildOf', function (this: ClosureSelf, other: AnySpanBuffer) {
+      return this._parent === other;
+    });
+    defineMethod('copyThreadIdTo', function (this: ClosureSelf, dest: Uint8Array, offset: number) {
+      const source = this._identity;
+      if (source) {
+        dest[offset] = source[0];
+        dest[offset + 1] = source[1];
+        dest[offset + 2] = source[2];
+        dest[offset + 3] = source[3];
+        dest[offset + 4] = source[4];
+        dest[offset + 5] = source[5];
+        dest[offset + 6] = source[6];
+        dest[offset + 7] = source[7];
+      } else {
+        dest.fill(0, offset, offset + 8);
+      }
+    });
+    defineMethod('copyParentThreadIdTo', function (this: ClosureSelf, dest: Uint8Array, offset: number) {
+      if (this._parent) this._parent.copyThreadIdTo(dest, offset);
+      else dest.fill(0, offset, offset + 8);
+    });
+    defineGetter('_logSchema', function () {
+      return spanBufferStatics(this).schema;
+    });
+    defineGetter('_messageLayoutFamily', function () {
+      return spanBufferStatics(this).messageLayoutFamily;
+    });
+    defineGetter('_messagePhysicalLayout', function () {
+      return spanBufferStatics(this).messagePhysicalLayout;
+    });
+    defineGetter('_columns', function () {
+      return spanBufferStatics(this).schema._columns;
+    });
+    defineGetter('_stats', function () {
+      return spanBufferStatics(this).stats;
+    });
+    defineMethod('_sealStats', function (this: ClosureSelf) {
+      sealStatsFor(this);
+    });
+    defineMethod('_sealStatsChain', function (this: ClosureSelf) {
+      let current: AnySpanBuffer | undefined = this;
+      while (current) {
+        sealStatsFor(current);
+        current = current._overflow;
+      }
+    });
+    defineMethod('getOrCreateOverflow', function (this: ClosureSelf) {
+      if (this._overflow) return this._overflow;
+      sealStatsFor(this);
+      const tracer = this._traceRoot.tracer;
+      tracer.onStatsWillResetFor(this);
+      checkCapacityTuning(spanBufferStatics(this).stats);
+      if (!isTypedSpanBuffer(this)) throw new TypeError('SpanBuffer instance is not initialized');
+      return tracer.bufferStrategy.createOverflowBuffer(this);
+    });
+    if (messageLayoutFamily === 'static-only') {
+      defineMethod('message', function (this: ClosureSelf, pos: number, val: string) {
+        if (pos === 0) this._spanName = val;
+        else if (pos === 1) this._terminalMessage = val;
+        else throw new RangeError('Static-only buffers only accept raw system messages at rows 0 and 1');
+        return this;
+      });
+    } else {
+      defineMethod('message', function (this: ClosureSelf, pos: number, val: string) {
+        const lane: unknown = this.message_values;
+        if (!Array.isArray(lane)) throw new TypeError('message_values lane is not allocated');
+        lane[pos] = val;
+        return this;
+      });
+    }
+  };
+}
+
 /**
  * Get or create a SpanBuffer class for the given schema.
  *
@@ -343,7 +651,7 @@ export function getSpanBufferClass<T extends LogSchema>(
   messagePhysicalLayout: MessagePhysicalLayout = 'current',
   eagerColumns: EagerColumnDescriptor = EMPTY_EAGER_COLUMNS,
 ): SpanBufferConstructor<T> {
-  const cacheKey = `${messageLayoutFamily}:${messagePhysicalLayout}:${eagerColumns.key}`;
+  const cacheKey = `${activeMaterializerMode()}:${messageLayoutFamily}:${messagePhysicalLayout}:${eagerColumns.key}`;
   let familyClasses = spanBufferClassCache.get(schema);
   const cached = familyClasses?.get(cacheKey);
   if (
@@ -390,6 +698,12 @@ export function getSpanBufferClass<T extends LogSchema>(
       EMPTY_SCOPE,
       checkCapacityTuning,
     },
+    // No-eval counterparts consumed by arrow-builder's closure-composed
+    // materializer on runtimes without string codegen (workerd). They MUST
+    // mirror constructorPreamble/methods below exactly — see the factories
+    // above and spanbuffer-materializer-parity.test.ts.
+    closureInit: createSpanBufferClosureInit(messageLayoutFamily, messagePhysicalLayout),
+    closureMethods: createSpanBufferClosureMethods(messageLayoutFamily),
     // ==========================================================================
     // GENERATED CONSTRUCTOR PREAMBLE
     // ==========================================================================
