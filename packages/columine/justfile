@@ -40,7 +40,7 @@ wasm:
 
 # event_processor.wasm — the columine EP artifact (EpWiring::columine():
 # base path, no dedup, msgpack growth both formats, no per-field
-# diagnostics; five exports, caller-provided buffers).
+# diagnostics; six exports, caller-provided buffers).
 wasm-ep:
     RUSTFLAGS="-Zunstable-options -Cpanic=immediate-abort" \
     cargo-nightly build -p columine-ep-wasm --target wasm32-unknown-unknown --profile wasm-release \
