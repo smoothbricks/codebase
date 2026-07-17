@@ -2,8 +2,9 @@
  * Fixed-position TagWriter and ResultWriter classes.
  *
  * TagWriter uses source-authored constructors and schema-driven prototype methods so
- * Hermes can compile the implementation ahead of time. ResultWriter deliberately
- * retains runtime source generation for isolated performance comparison.
+ * Hermes can compile the implementation ahead of time. ResultWriter selects between a
+ * compiled renderer (new Function, string-codegen runtimes) and a closure-composed
+ * materializer (workerd-safe, no eval) via activeMaterializerMode().
  *
  * These classes provide fluent setter methods that write to a fixed position in a SpanBuffer:
  * - TagWriter: writes to position 0 (span-start row) via ctx.tag.userId("123")
@@ -17,7 +18,7 @@
  * `state._spanBuffer` to their embedded row and return the same wrapper for fluent chaining.
  */
 
-import { bufferHelpers, type ColumnEntry } from '@smoothbricks/arrow-builder';
+import { activeMaterializerMode, bufferHelpers, type ColumnEntry } from '@smoothbricks/arrow-builder';
 import { resolveEnumLookupDescriptor, type SchemaEnumLookupDescriptor } from '../enumMetadata.js';
 import type { MessageLayoutFamily, MessagePhysicalLayout } from '../runtimeHint.js';
 import type { InferSchema, LogSchema } from '../schema/types.js';
@@ -211,30 +212,30 @@ const tagWriterClassCache = new WeakMap<LogSchema, Map<string, unknown>>();
 const resultWriterClassCache = new WeakMap<LogSchema, Map<string, unknown>>();
 
 // ============================================================================
-// TagWriter API
+// Closure-composed materializer internals (no eval; shared by tag/result rows)
 // ============================================================================
 
-interface RuntimeTagWriter {
+interface RuntimeFixedWriter {
   readonly _state: WriterState;
 }
 
-interface TagFieldPlan {
+interface FixedFieldPlan {
   readonly fieldName: string;
   readonly encode: ((value: unknown) => number) | undefined;
 }
 
 /** Invoke one schema-specific SpanBuffer setter without generating source. */
-function writeTagField(writer: RuntimeTagWriter, fieldName: string, value: unknown): void {
+function writeFixedField(writer: RuntimeFixedWriter, fieldName: string, position: number, value: unknown): void {
   const buffer = writer._state._spanBuffer;
   const columnWriter: unknown = Reflect.get(buffer, fieldName);
   if (typeof columnWriter !== 'function') {
     throw new TypeError(`SpanBuffer column writer ${JSON.stringify(fieldName)} is not callable`);
   }
-  columnWriter.call(buffer, 0, value);
+  columnWriter.call(buffer, position, value);
 }
 
 /** Preserve the generated writer's schema order and enum-binding semantics. */
-function createTagFieldPlans(schema: LogSchema, enumLookup: SchemaEnumLookupDescriptor): readonly TagFieldPlan[] {
+function createFixedFieldPlans(schema: LogSchema, enumLookup: SchemaEnumLookupDescriptor): readonly FixedFieldPlan[] {
   const enumFieldNames = new Set<string>();
   for (const { fieldName } of enumLookup.ordered) enumFieldNames.add(fieldName);
 
@@ -249,31 +250,37 @@ function createTagFieldPlans(schema: LogSchema, enumLookup: SchemaEnumLookupDesc
   });
 }
 
+/** Compiled class members are non-enumerable; every closure-installed member must match. */
+function asClassMemberDescriptor(descriptor: PropertyDescriptor): PropertyDescriptor {
+  descriptor.enumerable = false;
+  return descriptor;
+}
+
 /** Create a class-method descriptor whose function name is the schema field name. */
-function createTagSetterDescriptor(plan: TagFieldPlan): PropertyDescriptor {
+function createFieldSetterDescriptor(plan: FixedFieldPlan, position: number): PropertyDescriptor {
   const encode = plan.encode;
   const methods = encode
     ? {
-        [plan.fieldName](this: RuntimeTagWriter, value: string) {
-          writeTagField(this, plan.fieldName, encode(value));
+        [plan.fieldName](this: RuntimeFixedWriter, value: string) {
+          writeFixedField(this, plan.fieldName, position, encode(value));
           return this;
         },
       }
     : {
-        [plan.fieldName](this: RuntimeTagWriter, value: unknown) {
-          writeTagField(this, plan.fieldName, value);
+        [plan.fieldName](this: RuntimeFixedWriter, value: unknown) {
+          writeFixedField(this, plan.fieldName, position, value);
           return this;
         },
       };
   const descriptor = Object.getOwnPropertyDescriptor(methods, plan.fieldName);
-  if (!descriptor) throw new Error(`Failed to create TagWriter setter ${JSON.stringify(plan.fieldName)}`);
-  return descriptor;
+  if (!descriptor) throw new Error(`Failed to create writer setter ${JSON.stringify(plan.fieldName)}`);
+  return asClassMemberDescriptor(descriptor);
 }
 
-/** Install the schema-specific fluent API while retaining native class method descriptors. */
-function installTagWriterMethods(prototype: object, plans: readonly TagFieldPlan[]): void {
+/** Install the schema-specific fluent API with class-member-equivalent descriptors. */
+function installFixedWriterMethods(prototype: object, plans: readonly FixedFieldPlan[], position: number): void {
   const bulkMethods = {
-    with(this: RuntimeTagWriter, attributes: Readonly<Record<string, unknown>>) {
+    with(this: RuntimeFixedWriter, attributes: Readonly<Record<string, unknown>>) {
       for (const plan of plans) {
         if (
           plan.fieldName in attributes &&
@@ -281,30 +288,32 @@ function installTagWriterMethods(prototype: object, plans: readonly TagFieldPlan
           attributes[plan.fieldName] !== undefined
         ) {
           const value = attributes[plan.fieldName];
-          writeTagField(this, plan.fieldName, plan.encode ? plan.encode(value) : value);
+          writeFixedField(this, plan.fieldName, position, plan.encode ? plan.encode(value) : value);
         }
       }
       return this;
     },
-  };
-  const withDescriptor = Object.getOwnPropertyDescriptor(bulkMethods, 'with');
-  if (!withDescriptor) throw new Error('Failed to create TagWriter.with');
-  Object.defineProperty(prototype, 'with', withDescriptor);
-
-  for (const plan of plans) {
-    Object.defineProperty(prototype, plan.fieldName, createTagSetterDescriptor(plan));
-  }
-
-  Object.defineProperty(prototype, 'uint64_value', {
-    configurable: true,
-    enumerable: false,
-    writable: true,
-    value: function uint64_value(this: RuntimeTagWriter, value: bigint) {
-      this._state._spanBuffer.uint64_value(0, value);
+    uint64_value(this: RuntimeFixedWriter, value: bigint) {
+      this._state._spanBuffer.uint64_value(position, value);
       return this;
     },
-  });
+  };
+  const withDescriptor = Object.getOwnPropertyDescriptor(bulkMethods, 'with');
+  if (!withDescriptor) throw new Error('Failed to create writer.with');
+  Object.defineProperty(prototype, 'with', asClassMemberDescriptor(withDescriptor));
+
+  for (const plan of plans) {
+    Object.defineProperty(prototype, plan.fieldName, createFieldSetterDescriptor(plan, position));
+  }
+
+  const uint64Descriptor = Object.getOwnPropertyDescriptor(bulkMethods, 'uint64_value');
+  if (!uint64Descriptor) throw new Error('Failed to create writer.uint64_value');
+  Object.defineProperty(prototype, 'uint64_value', asClassMemberDescriptor(uint64Descriptor));
 }
+
+// ============================================================================
+// TagWriter API
+// ============================================================================
 
 /** Build one source-authored constructor for an existing TagWriter cache key. */
 function createStaticTagWriterConstructor(schema: LogSchema, enumLookup: SchemaEnumLookupDescriptor): unknown {
@@ -316,7 +325,7 @@ function createStaticTagWriterConstructor(schema: LogSchema, enumLookup: SchemaE
     }
   }
 
-  installTagWriterMethods(GeneratedTagWriter.prototype, createTagFieldPlans(schema, enumLookup));
+  installFixedWriterMethods(GeneratedTagWriter.prototype, createFixedFieldPlans(schema, enumLookup), 0);
   return GeneratedTagWriter;
 }
 
@@ -410,8 +419,90 @@ export function generateResultWriterClass(
   );
 }
 
+/** Result-row message lane accessor for mixed/dynamic layouts. */
+function messageLaneOf(buffer: AnySpanBuffer): (string | undefined)[] {
+  const lane = buffer.message_values;
+  if (lane === undefined) {
+    throw new TypeError('SpanBuffer has no message_values lane for the result row');
+  }
+  return lane;
+}
+
+/** Install result-row system setters mirroring createResultWriterExtension without source text. */
+function installResultSystemMethods(prototype: object, messageLayoutFamily: MessageLayoutFamily): void {
+  const methods =
+    messageLayoutFamily === 'static-only'
+      ? {
+          message(this: RuntimeFixedWriter, text: string) {
+            this._state._spanBuffer._terminalMessage = text;
+            return this;
+          },
+        }
+      : {
+          message(this: RuntimeFixedWriter, text: string) {
+            messageLaneOf(this._state._spanBuffer)[1] = text;
+            return this;
+          },
+        };
+  const messageDescriptor = Object.getOwnPropertyDescriptor(methods, 'message');
+  if (!messageDescriptor) throw new Error('Failed to create ResultWriter.message');
+  Object.defineProperty(prototype, 'message', asClassMemberDescriptor(messageDescriptor));
+
+  const lineMethods = {
+    line(this: RuntimeFixedWriter, lineNumber: number) {
+      this._state._spanBuffer.line(1, lineNumber);
+      return this;
+    },
+  };
+  const lineDescriptor = Object.getOwnPropertyDescriptor(lineMethods, 'line');
+  if (!lineDescriptor) throw new Error('Failed to create ResultWriter.line');
+  Object.defineProperty(prototype, 'line', asClassMemberDescriptor(lineDescriptor));
+}
+
+/** Assemble a ResultWriter class from closures (workerd-safe: no string codegen). */
+function createClosureResultWriterConstructor(
+  schema: LogSchema,
+  messageLayoutFamily: MessageLayoutFamily,
+  enumLookup: SchemaEnumLookupDescriptor,
+): unknown {
+  class GeneratedResultWriter {
+    readonly _state: WriterState;
+
+    constructor(state: WriterState) {
+      this._state = state;
+    }
+  }
+
+  installFixedWriterMethods(GeneratedResultWriter.prototype, createFixedFieldPlans(schema, enumLookup), 1);
+  installResultSystemMethods(GeneratedResultWriter.prototype, messageLayoutFamily);
+  return GeneratedResultWriter;
+}
+
+/** Compile the rendered result-writer source with new Function (string-codegen runtimes only). */
+function compileResultWriterClass(
+  schema: LogSchema,
+  messageLayoutFamily: MessageLayoutFamily,
+  messagePhysicalLayout: MessagePhysicalLayout,
+  eagerColumns: readonly string[],
+  enumLookup: SchemaEnumLookupDescriptor,
+): unknown {
+  const classCode = generateResultWriterClass(
+    schema,
+    messageLayoutFamily,
+    messagePhysicalLayout,
+    eagerColumns,
+    enumLookup,
+  ).trim();
+
+  const factory = new Function('helpers', 'enumLookup', classCode);
+  return factory(bufferHelpers, enumLookup);
+}
+
 /**
  * Get or create a cached ResultWriter class for a schema.
+ *
+ * Selects the compiled or closure-composed materializer via activeMaterializerMode();
+ * cache keys are mode-prefixed so an override flip never returns the wrong kind.
  *
  * @param schema - Tag attribute schema
  * @returns ResultWriter class constructor
@@ -423,22 +514,16 @@ export function getResultWriterClass<T extends LogSchema>(
   eagerColumns: readonly string[] = [],
   enumLookup: SchemaEnumLookupDescriptor = resolveEnumLookupDescriptor(schema),
 ): ResultWriterConstructor {
+  const mode = activeMaterializerMode();
+  const cacheKey = `${mode}:${messageLayoutFamily}:${messagePhysicalLayout}:${eagerColumns.join('\u0000')}`;
   let familyClasses = resultWriterClassCache.get(schema);
-  const cacheKey = `${messageLayoutFamily}:${messagePhysicalLayout}:${eagerColumns.join('\u0000')}`;
   let WriterClass = familyClasses?.get(cacheKey);
 
   if (!WriterClass) {
-    const classCode = generateResultWriterClass(
-      schema,
-      messageLayoutFamily,
-      messagePhysicalLayout,
-      eagerColumns,
-      enumLookup,
-    ).trim();
-
-    // Compile with new Function()
-    const factory = new Function('helpers', 'enumLookup', classCode);
-    WriterClass = factory(bufferHelpers, enumLookup);
+    WriterClass =
+      mode === 'compiled'
+        ? compileResultWriterClass(schema, messageLayoutFamily, messagePhysicalLayout, eagerColumns, enumLookup)
+        : createClosureResultWriterConstructor(schema, messageLayoutFamily, enumLookup);
 
     if (!isResultWriterConstructor(WriterClass)) {
       throw new Error('Failed to generate ResultWriter constructor');
