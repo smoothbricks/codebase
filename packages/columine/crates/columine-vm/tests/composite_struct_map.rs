@@ -27,6 +27,7 @@ fn slot_init(op: u8, slot_type: SlotType, requested_capacity: u16, fields: &[u8]
     let [lo, hi] = requested_capacity.to_le_bytes();
     let mut init = vec![op, 0, slot_type as u8, lo, hi, fields.len() as u8];
     init.extend_from_slice(fields);
+    init.push(Opcode::Halt as u8);
     init
 }
 
