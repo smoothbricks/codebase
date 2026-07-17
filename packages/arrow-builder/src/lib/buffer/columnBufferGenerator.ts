@@ -28,14 +28,27 @@
  * - Cache-friendly: nulls and values in same ArrayBuffer
  */
 
-import { type ColumnSchema, isColumnSchema, type SchemaType, type SchemaWithMetadata } from '../schema-types.js';
+import { type ColumnSchema, isColumnSchema } from '../schema-types.js';
+import { buildColumnAccessorPlan, type ColumnStorageInfo } from './accessorPlan.js';
 import { bufferHelpers } from './bufferHelpers.js';
+import { assertClosureMaterializable, materializeColumnBufferClass } from './closureMaterializers.js';
+import { activeMaterializerMode } from './codegenCapability.js';
 import { type AnyColumnBuffer, type ColumnBuffer, DEFAULT_BUFFER_CAPACITY } from './types.js';
 
 // Re-export for consumers
 export { getAlignedCapacity } from './bufferHelpers.js';
 // Re-export types for consumers
 export type { AnyColumnBuffer, ColumnBuffer };
+
+/** Schema should always be a ColumnSchema instance (LogSchema extends ColumnSchema). */
+function assertIsColumnSchema(schema: ColumnSchema): void {
+  if (!isColumnSchema(schema)) {
+    throw new Error(
+      `Schema must be a ColumnSchema instance. Got: ${typeof schema}. ` +
+        'This should not happen - schemas are wrapped at API boundaries.',
+    );
+  }
+}
 
 /**
  * Extension options for injecting custom code into generated ColumnBuffer classes.
@@ -123,81 +136,6 @@ export interface ColumnBufferExtension {
 }
 
 //#endregion smoo/lmao!n/buffer-codegen.extension-options
-
-//#region smoo/lmao!n/buffer-arch-eager-vs-lazy
-/**
- * Storage info for a schema field - determines how values are stored
- */
-interface ColumnStorageInfo {
-  constructorName: string;
-  bytesPerElement: number;
-  isBitPacked: boolean;
-  schemaType: SchemaType | undefined;
-  enumValues?: readonly string[];
-  /** When true, column is allocated eagerly in constructor (no null bitmap). */
-  isEager: boolean;
-}
-
-/**
- * Get TypedArray constructor name and byte size for a schema field
- */
-function getTypedArrayInfo(schema: ColumnSchema, fieldName: string): ColumnStorageInfo {
-  const fieldSchema = schema.fields[fieldName];
-  const schemaWithMetadata = fieldSchema as SchemaWithMetadata;
-  const schemaType = schemaWithMetadata?.__schema_type;
-  const isEager = schemaWithMetadata?.__eager === true;
-
-  if (schemaType === 'enum') {
-    const enumValues = schemaWithMetadata.__enum_values;
-    const enumCount = enumValues?.length ?? 0;
-
-    // Uint8Array can hold 0-255 indices (256 values total)
-    if (enumCount === 0 || enumCount <= 256) {
-      return { constructorName: 'Uint8Array', bytesPerElement: 1, isBitPacked: false, schemaType, enumValues, isEager };
-    }
-    if (enumCount <= 65536) {
-      return {
-        constructorName: 'Uint16Array',
-        bytesPerElement: 2,
-        isBitPacked: false,
-        schemaType,
-        enumValues,
-        isEager,
-      };
-    }
-    // >65536 values: Uint32Array (4 bytes)
-    return { constructorName: 'Uint32Array', bytesPerElement: 4, isBitPacked: false, schemaType, enumValues, isEager };
-  }
-
-  if (schemaType === 'category') {
-    return { constructorName: 'Array', bytesPerElement: 0, isBitPacked: false, schemaType, isEager };
-  }
-
-  if (schemaType === 'text') {
-    return { constructorName: 'Array', bytesPerElement: 0, isBitPacked: false, schemaType, isEager };
-  }
-
-  if (schemaType === 'number') {
-    return { constructorName: 'Float64Array', bytesPerElement: 8, isBitPacked: false, schemaType, isEager };
-  }
-
-  if (schemaType === 'boolean') {
-    return { constructorName: 'Uint8Array', bytesPerElement: 1, isBitPacked: true, schemaType, isEager };
-  }
-
-  if (schemaType === 'bigUint64') {
-    return { constructorName: 'BigUint64Array', bytesPerElement: 8, isBitPacked: false, schemaType, isEager };
-  }
-
-  if (schemaType === 'binary') {
-    // Binary columns use Array storage (same as category/text) to hold frozen object references
-    return { constructorName: 'Array', bytesPerElement: 0, isBitPacked: false, schemaType, isEager };
-  }
-
-  // Default to Uint32Array for unknown types
-  return { constructorName: 'Uint32Array', bytesPerElement: 4, isBitPacked: false, schemaType, isEager };
-}
-//#endregion smoo/lmao!n/buffer-arch-eager-vs-lazy
 
 //#region smoo/lmao!n/buffer-arch-lazy-column-init
 /**
@@ -312,16 +250,9 @@ export function generateColumnBufferClass(
   className = 'GeneratedColumnBuffer',
   extension?: ColumnBufferExtension,
 ): string {
-  // Schema should always be a ColumnSchema instance (LogSchema extends ColumnSchema)
-  if (!isColumnSchema(schema)) {
-    throw new Error(
-      `Schema must be a ColumnSchema instance. Got: ${typeof schema}. ` +
-        'This should not happen - schemas are wrapped at API boundaries.',
-    );
-  }
+  assertIsColumnSchema(schema);
 
-  const schemaFields = schema._columnNames;
-  const preallocatedColumns = new Set(extension?.preallocatedColumns ?? []);
+  const plan = buildColumnAccessorPlan(schema, extension?.preallocatedColumns);
 
   // Buffer management
   const constructorCode: string[] = [
@@ -334,11 +265,11 @@ export function generateColumnBufferClass(
   const getterMethods: string[] = [];
   const setterMethods: string[] = [];
 
-  for (const fieldName of schemaFields) {
-    const columnName = fieldName;
-    const storageInfo = getTypedArrayInfo(schema, fieldName);
-    const { constructorName, isBitPacked, isEager } = storageInfo;
-    const isPreallocated = !isEager && preallocatedColumns.has(fieldName);
+  for (const column of plan.columns) {
+    const { name: columnName, storage: storageInfo, mode } = column;
+    const { constructorName, isBitPacked } = storageInfo;
+    const isEager = mode === 'eager';
+    const isPreallocated = mode === 'preallocated';
 
     if (isEager) {
       // Eager column: allocate in constructor, no null bitmap
@@ -548,37 +479,51 @@ export function getColumnBufferClass(
     cache = discriminatedCache;
   }
 
-  const cacheKey = createCacheKey(schema, extension);
+  const mode = activeMaterializerMode();
+  const cacheKey = `${mode}:${createCacheKey(schema, extension)}`;
   let BufferClass = cache.get(cacheKey);
 
   if (!BufferClass) {
-    const classCode = generateColumnBufferClass(schema, 'GeneratedColumnBuffer', extension).trim();
-
-    const depNames = ['helpers'];
-    const depValues: unknown[] = [bufferHelpers];
-
-    if (extension?.dependencies && Object.keys(extension.dependencies).length > 0) {
-      for (const [name, value] of Object.entries(extension.dependencies)) {
-        depNames.push(name);
-        depValues.push(value);
-      }
-    }
-
-    const factory = compileColumnBufferFactory(...depNames, classCode);
-    if (!isColumnBufferFactory(factory)) {
-      throw new Error('Generated ColumnBuffer factory must compile to a callable function.');
-    }
-
-    const generatedClass = factory(...depValues);
-    if (!isColumnBufferConstructor(generatedClass)) {
-      throw new Error('Generated ColumnBuffer factory must return a constructor.');
-    }
-
-    BufferClass = generatedClass;
+    BufferClass =
+      mode === 'compiled' ? compileBufferClass(schema, extension) : materializeBufferClass(schema, extension);
     cache.set(cacheKey, BufferClass);
   }
 
   return BufferClass;
+}
+
+/** Compiled materializer: render class source and evaluate it with `new Function`. */
+function compileBufferClass(schema: ColumnSchema, extension?: ColumnBufferExtension): ColumnBufferConstructor {
+  const classCode = generateColumnBufferClass(schema, 'GeneratedColumnBuffer', extension).trim();
+
+  const depNames = ['helpers'];
+  const depValues: unknown[] = [bufferHelpers];
+
+  if (extension?.dependencies && Object.keys(extension.dependencies).length > 0) {
+    for (const [name, value] of Object.entries(extension.dependencies)) {
+      depNames.push(name);
+      depValues.push(value);
+    }
+  }
+
+  const factory = compileColumnBufferFactory(...depNames, classCode);
+  if (!isColumnBufferFactory(factory)) {
+    throw new Error('Generated ColumnBuffer factory must compile to a callable function.');
+  }
+
+  const generatedClass = factory(...depValues);
+  if (!isColumnBufferConstructor(generatedClass)) {
+    throw new Error('Generated ColumnBuffer factory must return a constructor.');
+  }
+
+  return generatedClass;
+}
+
+/** Closure-composed materializer: no string codegen (used where `new Function` is forbidden). */
+function materializeBufferClass(schema: ColumnSchema, extension?: ColumnBufferExtension): ColumnBufferConstructor {
+  assertIsColumnSchema(schema);
+  assertClosureMaterializable(extension, 'ColumnBuffer');
+  return materializeColumnBufferClass(buildColumnAccessorPlan(schema, extension?.preallocatedColumns));
 }
 
 /**

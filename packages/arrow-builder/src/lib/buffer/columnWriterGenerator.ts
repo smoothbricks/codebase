@@ -17,7 +17,10 @@
  * 3. Return `this` for chaining: `writer.nextRow().userId("123").status("ok")`
  */
 
-import type { ColumnSchema, SchemaWithMetadata } from '../schema-types.js';
+import type { ColumnSchema } from '../schema-types.js';
+import { buildColumnAccessorPlan, type ColumnPlanEntry } from './accessorPlan.js';
+import { assertClosureMaterializable, materializeColumnWriterClass } from './closureMaterializers.js';
+import { activeMaterializerMode } from './codegenCapability.js';
 import type { AnyColumnBuffer } from './types.js';
 
 /**
@@ -128,13 +131,12 @@ export type ColumnWriter<T extends ColumnSchema = ColumnSchema, TBuffer extends 
 /**
  * Get the setter method body for a schema field type
  */
-function getSetterBody(schema: ColumnSchema, fieldName: string, isPreallocated: boolean): string {
-  const fieldSchema = schema.fields[fieldName];
-  const schemaWithMetadata = fieldSchema as SchemaWithMetadata;
-  const schemaType = schemaWithMetadata?.__schema_type;
-  const isEager = schemaWithMetadata?.__eager === true;
+function getSetterBody(column: ColumnPlanEntry): string {
+  const { name: columnName, storage, mode } = column;
+  const schemaType = storage.schemaType;
+  const isEager = mode === 'eager';
+  const isPreallocated = mode === 'preallocated';
 
-  const columnName = fieldName;
   if (isPreallocated) {
     if (schemaType === 'boolean') {
       return `
@@ -277,18 +279,14 @@ export function generateColumnWriterClass(
   className = 'GeneratedColumnWriter',
   extension?: ColumnWriterExtension,
 ): string {
-  // Get field names from ColumnSchema.fieldNames
-  const schemaFields = schema._columnNames;
-  const preallocatedColumns = new Set(extension?.preallocatedColumns ?? []);
+  const plan = buildColumnAccessorPlan(schema, extension?.preallocatedColumns);
 
   // Generate setter methods for each schema field
   const setterMethods: string[] = [];
 
-  for (const fieldName of schemaFields) {
-    const field = schema.fields[fieldName];
-    const isSchemaEager = typeof field === 'object' && field !== null && Reflect.get(field, '__eager') === true;
-    const setterBody = getSetterBody(schema, fieldName, !isSchemaEager && preallocatedColumns.has(fieldName));
-    setterMethods.push(`    ${fieldName}(value) {${setterBody}
+  for (const column of plan.columns) {
+    const setterBody = getSetterBody(column);
+    setterMethods.push(`    ${column.name}(value) {${setterBody}
     }`);
   }
 
@@ -304,12 +302,10 @@ export function generateColumnWriterClass(
   // Generate O(1) enum lookup Maps from buffer's enumValues arrays.
   // Guard with existence check: some buffer implementations (e.g., WasmSpanBuffer)
   // may not have enumValues, and the ColumnWriter setter may be overridden.
-  for (const fieldName of schemaFields) {
-    const fieldSchema = schema.fields[fieldName];
-    const schemaWithMetadata = fieldSchema as SchemaWithMetadata;
-    if (schemaWithMetadata?.__schema_type === 'enum') {
+  for (const column of plan.columns) {
+    if (column.storage.schemaType === 'enum') {
       constructorBody.push(
-        `      this._${fieldName}_enumLookup = buffer.${fieldName}_enumValues ? new Map(buffer.${fieldName}_enumValues.map((v, i) => [v, i])) : undefined;`,
+        `      this._${column.name}_enumLookup = buffer.${column.name}_enumValues ? new Map(buffer.${column.name}_enumValues.map((v, i) => [v, i])) : undefined;`,
       );
     }
   }
@@ -473,41 +469,56 @@ export function getColumnWriterClass(
   buffer: AnyColumnBuffer,
   ...args: unknown[]
 ) => ColumnWriter {
-  const cacheKey = createCacheKey(schema, extension);
+  const mode = activeMaterializerMode();
+  const cacheKey = `${mode}:${createCacheKey(schema, extension)}`;
 
   let WriterClass = writerClassCache.get(cacheKey);
 
   if (!WriterClass) {
-    const classCode = generateColumnWriterClass(schema, 'GeneratedColumnWriter', extension).trim();
-
-    // Compile with new Function()
-    const depNames: string[] = [];
-    const depValues: unknown[] = [];
-
-    if (extension?.dependencies && Object.keys(extension.dependencies).length > 0) {
-      for (const [name, value] of Object.entries(extension.dependencies)) {
-        depNames.push(name);
-        depValues.push(value);
-      }
-    }
-
-    // Create function that takes dependencies as parameters and returns the class
-    const factory = compileColumnWriterFactory(...depNames, classCode);
-    if (!isColumnWriterFactory(factory)) {
-      throw new Error('Generated ColumnWriter factory must compile to a callable function.');
-    }
-
-    const generatedClass = factory(...depValues);
-    if (!isColumnWriterConstructor(generatedClass)) {
-      throw new Error('Generated ColumnWriter factory must return a constructor.');
-    }
-
-    WriterClass = generatedClass;
-
+    WriterClass =
+      mode === 'compiled' ? compileWriterClass(schema, extension) : materializeWriterClass(schema, extension);
     writerClassCache.set(cacheKey, WriterClass);
   }
 
   return WriterClass;
+}
+
+/** Compiled materializer: render class source and evaluate it with `new Function`. */
+function compileWriterClass(schema: ColumnSchema, extension?: ColumnWriterExtension): ColumnWriterConstructor {
+  const classCode = generateColumnWriterClass(schema, 'GeneratedColumnWriter', extension).trim();
+
+  const depNames: string[] = [];
+  const depValues: unknown[] = [];
+
+  if (extension?.dependencies && Object.keys(extension.dependencies).length > 0) {
+    for (const [name, value] of Object.entries(extension.dependencies)) {
+      depNames.push(name);
+      depValues.push(value);
+    }
+  }
+
+  // Create function that takes dependencies as parameters and returns the class
+  const factory = compileColumnWriterFactory(...depNames, classCode);
+  if (!isColumnWriterFactory(factory)) {
+    throw new Error('Generated ColumnWriter factory must compile to a callable function.');
+  }
+
+  const generatedClass = factory(...depValues);
+  if (!isColumnWriterConstructor(generatedClass)) {
+    throw new Error('Generated ColumnWriter factory must return a constructor.');
+  }
+
+  return generatedClass;
+}
+
+/** Closure-composed materializer: no string codegen (used where `new Function` is forbidden). */
+function materializeWriterClass(schema: ColumnSchema, extension?: ColumnWriterExtension): ColumnWriterConstructor {
+  assertClosureMaterializable(extension, 'ColumnWriter');
+  const materialized = materializeColumnWriterClass(buildColumnAccessorPlan(schema, extension?.preallocatedColumns));
+  if (!isColumnWriterConstructor(materialized)) {
+    throw new Error('Closure-composed ColumnWriter materializer must return a constructor.');
+  }
+  return materialized;
 }
 
 /**
