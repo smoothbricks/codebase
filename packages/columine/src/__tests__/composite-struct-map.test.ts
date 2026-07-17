@@ -112,20 +112,20 @@ describe('StructMap2 public WASM readers', () => {
       ),
     );
     const state = backend.createState(max);
-    const candidates = [
+    const candidates: ColumnInput[] = [
       { data: new Uint32Array([7, 7, 7]), type: ValueType.UINT32 },
       { data: new Uint32Array([40, 40, 40]), type: ValueType.UINT32 },
       { data: new Uint32Array([10, 20, 30]), type: ValueType.UINT32 },
       { data: new BigInt64Array([-5n, -5n, -4n]), type: ValueType.UINT32 },
       { data: new BigInt64Array([10n, 10n, -(1n << 63n)]), type: ValueType.UINT32 },
-    ] as unknown as ColumnInput[];
+    ];
     expect(backend.executeBatch(state, max, candidates, 3)).toBe(ErrorCode.OK);
 
     const row = getRow(state, max, 0, 7, 40);
-    expect(row).toBeDefined();
+    if (!row) throw new Error('Strict signed i64x2 max did not materialize its winner');
     const bytes = backend.serialize(state, max);
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    const offset = row!.rowOffset;
+    const offset = row.rowOffset;
     expect(view.getUint32(offset + 1, true)).toBe(30);
     expect(view.getBigInt64(offset + 5, true)).toBe(-4n);
     expect(view.getBigInt64(offset + 13, true)).toBe(-(1n << 63n));
