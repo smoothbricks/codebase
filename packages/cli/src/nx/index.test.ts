@@ -94,16 +94,20 @@ describe('Nx helper output formatting', () => {
     );
   });
 
-  it('rejects unsupported cross-project object target dependencies', () => {
-    expect(() =>
+  it('omits cross-project dependencies from same-project target closures', () => {
+    expect(
       targetDependenciesFromNxProjectJson({
         targets: {
-          build: {
-            dependsOn: [{ target: 'build', projects: 'dependencies' }],
+          'rust-wasm': {
+            dependsOn: [
+              'prepare',
+              { target: 'cargo-wasm', projects: ['lmao-rs'] },
+              { target: 'build', projects: 'dependencies' },
+            ],
           },
         },
       }),
-    ).toThrow('unsupported cross-project dependsOn');
+    ).toEqual(new Map([['rust-wasm', ['prepare']]]));
   });
 
   it('treats missing target metadata as an empty project', () => {
