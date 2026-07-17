@@ -46,26 +46,28 @@ fn handles() -> &'static mut [Option<Box<EpInstance>>; 256] {
     unsafe { &mut HANDLES }
 }
 
-/// `allocHandle`: scan 256 slots starting at `g_next_handle`. Faithful to the
-/// Zig including its wraparound quirk: after enough churn, slot 0 can be
-/// allocated, whose handle is indistinguishable from the error sentinel 0.
+/// Scan the 255 usable slots starting at `NEXT_HANDLE`.
+///
+/// Handle 0 is the creation-failure sentinel and is permanently reserved.
+/// Keeping it out of the allocation ring makes every successful creation
+/// unambiguous, including after the ring wraps during long-lived use.
 fn alloc_handle(ep: Box<EpInstance>) -> Option<u32> {
     let table = handles();
     #[allow(static_mut_refs)]
     let next = unsafe { &mut NEXT_HANDLE };
-    for i in 0..256u32 {
-        let idx = ((*next + i) % 256) as usize;
-        if table[idx].is_none() {
-            table[idx] = Some(ep);
-            *next = (idx as u32 + 1) % 256;
-            return Some(idx as u32);
+    for offset in 0..255u32 {
+        let idx = 1 + ((*next - 1 + offset) % 255);
+        if table[idx as usize].is_none() {
+            table[idx as usize] = Some(ep);
+            *next = if idx == 255 { 1 } else { idx + 1 };
+            return Some(idx);
         }
     }
     None
 }
 
 fn get_processor(handle: u32) -> Option<&'static mut EpInstance> {
-    if handle >= 256 {
+    if !(1..=255).contains(&handle) {
         return None;
     }
     handles()[handle as usize].as_deref_mut()
