@@ -293,6 +293,15 @@ impl ColumnStorage {
     }
 
     pub fn with_variable_limit(col_type: ColumnType, capacity: u32, max_data_bytes: u32) -> Self {
+        Self::with_fixed_width(col_type, capacity, max_data_bytes, 8)
+    }
+
+    fn with_fixed_width(
+        col_type: ColumnType,
+        capacity: u32,
+        max_data_bytes: u32,
+        fixed_width: u8,
+    ) -> Self {
         let cap = capacity.min(MAX_EVENTS_PER_BATCH) as usize;
         let mut storage = Self {
             col_type,
@@ -312,8 +321,8 @@ impl ColumnStorage {
                 storage.data = Some(vec![0; initial_bytes]);
             }
             ColumnType::Int64 | ColumnType::Float64 => {
-                storage.fixed_width = 8;
-                storage.fixed = Some(vec![0; cap * 8]);
+                storage.fixed_width = fixed_width;
+                storage.fixed = Some(vec![0; cap * fixed_width as usize]);
             }
             ColumnType::Bool => {
                 storage.bool_data = Some(vec![0; cap.div_ceil(8)]);
@@ -322,12 +331,11 @@ impl ColumnStorage {
         storage
     }
 
+    /// Int32 rides the Int64 column kind with 4-byte storage; allocate the
+    /// fixed buffer once at the right width instead of building the 8-byte
+    /// buffer via `new()` and immediately replacing it.
     fn new_int32(capacity: u32) -> Self {
-        let cap = capacity.min(MAX_EVENTS_PER_BATCH) as usize;
-        let mut storage = Self::new(ColumnType::Int64, capacity);
-        storage.fixed_width = 4;
-        storage.fixed = Some(vec![0; cap * 4]);
-        storage
+        Self::with_fixed_width(ColumnType::Int64, capacity, MAX_VALUE_BYTES, 4)
     }
 
     /// Reset for reuse. Grown variable-width allocations are retained
