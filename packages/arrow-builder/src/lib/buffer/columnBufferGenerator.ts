@@ -133,6 +133,26 @@ export interface ColumnBufferExtension {
    * ```
    */
   dependencies?: Record<string, unknown>;
+
+  /**
+   * No-eval counterpart of `constructorPreamble` (+ `constructorParams`) for
+   * the closure-composed materializer: runs at the very start of the
+   * constructor, receiving the instance, requestedCapacity, and the
+   * constructor arguments after requestedCapacity (in `constructorParams`
+   * order). MUST re-express the code-string fields exactly — the compiled
+   * materializer ignores it. Like `dependencies`, NOT part of the cache key.
+   */
+  closureInit?: (self: Record<string, unknown>, requestedCapacity: number, ctorArgs: readonly unknown[]) => void;
+
+  /**
+   * No-eval counterpart of `methods` (+ `classPreamble`) for the
+   * closure-composed materializer: installs prototype members AFTER the
+   * per-column accessors and setters, matching the compiled class-body order
+   * where extension methods override same-named generated members. MUST
+   * re-express the code-string fields exactly — the compiled materializer
+   * ignores it. Like `dependencies`, NOT part of the cache key.
+   */
+  closureMethods?: (prototype: object) => void;
 }
 
 //#endregion smoo/lmao!n/buffer-codegen.extension-options
@@ -523,7 +543,7 @@ function compileBufferClass(schema: ColumnSchema, extension?: ColumnBufferExtens
 function materializeBufferClass(schema: ColumnSchema, extension?: ColumnBufferExtension): ColumnBufferConstructor {
   assertIsColumnSchema(schema);
   assertClosureMaterializable(extension, 'ColumnBuffer');
-  return materializeColumnBufferClass(buildColumnAccessorPlan(schema, extension?.preallocatedColumns));
+  return materializeColumnBufferClass(buildColumnAccessorPlan(schema, extension?.preallocatedColumns), extension);
 }
 
 /**
