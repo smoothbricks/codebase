@@ -24,7 +24,7 @@ import {
   validatePackedPublicPackagePublint,
   validatePackedPublicPackageTypes,
 } from '../packed-package.js';
-import { syncRootRuntimeVersions } from '../runtime.js';
+import { syncRootRuntimeVersions, validateRootRuntimeVersions } from '../runtime.js';
 import { applyToolConfigDefaults, validateToolConfig } from '../tool-validation.js';
 import { applyWranglerDefaults, validateWrangler } from '../wrangler.js';
 
@@ -84,7 +84,12 @@ const packs: MonorepoPack[] = [
       applyWorkspaceDependencyDefaults(ctx.root, { resolvedTargetsByProject: await readResolvedTargetsByProject(ctx) });
     },
     async validatePreBuild(ctx) {
+      // Runtime pins validate against the live PATH runtimes (devenv shell),
+      // never a stored template — outside devenv the PATH is not authoritative,
+      // mirroring the init-time syncRuntime gate above.
+      const runtimeFailures = ctx.syncRuntime ? await validateRootRuntimeVersions(ctx.root) : 0;
       return (
+        runtimeFailures +
         validateManagedFiles(ctx.root) +
         validateRootPackagePolicy(ctx.root) +
         validateToolConfig(ctx.root) +

@@ -183,7 +183,6 @@ This is an Nx-based monorepo using Bun as the package manager, with devenv/diren
 ### Development Environment
 
 - **Devenv/Direnv** automatically sets up the environment when entering the directory:
-  - Installs Node.js (v22 for AWS Lambda compatibility) and Bun via Nix
   - Runs `bun install --no-summary`
   - Adds `node_modules/.bin` to PATH
   - Applies workspace Git configuration
