@@ -9,7 +9,7 @@
   },
   "packageManager": "bun@1.3.14",
   "engines": {
-    "node": ">=24.0.0"
+    "node": ">=26.0.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.3.5",
@@ -17,11 +17,11 @@
     "@nx/expo": "23.1.0",
     "@nx/js": "23.1.0",
     "@smoothbricks/nx-plugin": "workspace:*",
-    "@swc-node/register": "1.11.1",
-    "@swc/core": "1.15.32",
-    "@swc/helpers": "0.5.21",
+    "@swc-node/register": "1.12.0",
+    "@swc/core": "1.15.43",
+    "@swc/helpers": "0.5.23",
     "@types/bun": "1.3.14",
-    "@types/node": "~24.0.0",
+    "@types/node": "~26.0.0",
     "@typescript-eslint/eslint-plugin": "^8.59.1",
     "@typescript-eslint/parser": "^8.59.1",
     "@typescript/native": "npm:typescript@^7.0.2",
@@ -36,7 +36,7 @@
     "ttsc": "^0.19.1",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.59.1",
-    "verdaccio": "6.5.2"
+    "verdaccio": "6.8.0"
   },
   "scripts": {
     "build:all": "nx run-many -t build",
