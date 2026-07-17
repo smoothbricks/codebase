@@ -1,31 +1,32 @@
-//! Dynamic Arrow schema storage and field metadata.
+//! Validated dynamic Arrow schema storage and field metadata.
 //!
-//! Ports `arrow/dynamic_schema.zig` (columine copy is the base; the
-//! axe-runtime copy only deletes `has_extraction_fields`). TypeScript
-//! generates the schema FlatBuffer bytes with Flechette; this side stores
-//! them verbatim and derives buffer counts from the 4-byte-per-field
-//! metadata table.
+//! The schema is supplied as one complete Arrow IPC Schema message. It is
+//! decoded once during processor creation so the retained four-byte physical
+//! metadata cannot disagree with the logical Arrow schema copied to output.
 
-/// Arrow type identifiers matching the TypeScript `ArrowType` enum in
-/// `ArrowSchemaDescriptor.ts`. The discriminants are FFI contract.
+use arrow_ipc::{MessageHeader, convert::try_schema_from_ipc_buffer, root_as_message};
+use arrow_schema::DataType;
+
+/// Maximum supported fields in one flattened schema.
+pub const MAX_SCHEMA_FIELDS: usize = 256;
+
+/// Arrow type identifiers matching the TypeScript `ArrowType` enum.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ArrowType {
     Null = 0,
-    /// 32-bit signed integer (enum ordinals, S.i32(), S.u32())
+    /// One 32-bit value per row. The logical schema may be Int32 or UInt32.
     Int32 = 1,
-    /// 64-bit IEEE 754 float (S.number(), S.f64())
     Float64 = 2,
     Binary = 3,
     Utf8 = 4,
     Bool = 5,
-    /// 64-bit signed integer (S.bigint(), S.i64(), S.timestamp(), timestamps)
+    /// One signed 64-bit value per row; Timestamp uses this physical layout.
     Int64 = 6,
 }
 
 impl ArrowType {
-    /// Decode the FFI byte (`dynamic_schema.zig` trusts the TS side; a bad
-    /// byte is a boundary error, not an invariant).
+    /// Decode a physical type byte without constructing an invalid enum.
     pub fn from_u8(value: u8) -> Option<Self> {
         Some(match value {
             0 => Self::Null,
@@ -40,21 +41,12 @@ impl ArrowType {
     }
 }
 
-/// Field metadata passed from TypeScript for buffer computation.
-///
-/// 4 bytes, alignment 1 — the layout matches `generateFieldMetadata()` in
-/// `generate-dynamic-schema.ts` (byte 0: ArrowType, byte 1: nullable,
-/// bytes 2-3: padding). Pinned by `signal_schema_field_layout`.
-// Plain repr(C) already yields size 4 / align 1: every field is align-1
-// (ArrowType is repr(u8)), matching Zig's extern struct exactly.
+/// Four-byte physical field descriptor: `[type, nullable, 0, 0]`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct SignalSchemaField {
-    /// Arrow type for this field.
     pub arrow_type: ArrowType,
-    /// Whether nullable (1 = true, 0 = false).
     pub nullable: u8,
-    /// Padding for 4-byte stride (dynamic_schema.zig `_pad`).
     pub _pad: [u8; 2],
 }
 
@@ -67,83 +59,134 @@ impl SignalSchemaField {
         }
     }
 
-    /// True if this field allows null values.
     pub fn is_nullable(self) -> bool {
-        self.nullable != 0
+        self.nullable == 1
     }
 
-    /// Number of buffers this field contributes to a RecordBatch.
-    /// Flechette always includes validity buffers, even for non-nullable
-    /// columns (dynamic_schema.zig `bufferCount`).
     pub fn buffer_count(self) -> u32 {
-        // Validity buffer (always present per Flechette convention)
-        1 + match self.arrow_type {
-            // Variable-length: offsets buffer + data buffer
-            ArrowType::Utf8 | ArrowType::Binary => 2,
-            // Fixed-length: just data buffer
-            ArrowType::Int32 | ArrowType::Int64 | ArrowType::Float64 | ArrowType::Bool => 1,
-            // Null type has no data buffer
+        match self.arrow_type {
             ArrowType::Null => 0,
+            ArrowType::Utf8 | ArrowType::Binary => 3,
+            ArrowType::Int32 | ArrowType::Int64 | ArrowType::Float64 | ArrowType::Bool => 2,
         }
     }
 }
 
-/// Configuration for dynamic schema encoding: pre-computed schema bytes from
-/// TypeScript plus field metadata (`dynamic_schema.zig DynamicSchemaConfig`).
-/// Rust ownership replaces the Zig allocator plumbing; `deinit` is `Drop`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SchemaError {
+    InvalidMessage,
+    TooManyFields,
+    InvalidFieldMetadata { field_index: usize },
+    FieldCountMismatch { schema: usize, metadata: usize },
+    TypeMismatch { field_index: usize },
+    NullabilityMismatch { field_index: usize },
+    InvalidFieldNames,
+}
+
+/// Owned, validated schema configuration retained by an EventProcessor.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DynamicSchemaConfig {
-    /// Complete schema message bytes incl. continuation marker and size.
+    /// One complete continuation-prefixed Arrow IPC Schema message.
     pub schema_bytes: Vec<u8>,
-    /// Field metadata for buffer computation.
     pub field_metadata: Vec<SignalSchemaField>,
-    /// True if the schema has value.* extraction fields. Zig derives this as
-    /// `field_count != 4` (base schema is exactly id/type/timestamp/value);
-    /// the columine EP selects the base vs extraction path with it.
+    /// Logical types decoded from `schema_bytes`, in field order.
+    pub logical_types: Vec<DataType>,
     pub has_extraction_fields: bool,
-    /// Field names for JSON key matching (parsed from the null-terminated
-    /// blob TS passes; empty for the no-names init path).
     pub field_names: Vec<String>,
 }
 
 impl DynamicSchemaConfig {
-    /// Init without field names (`DynamicSchemaConfig.init`). This path
-    /// exists for checkpoint/restore and export compatibility; extraction
-    /// needs names.
-    pub fn new(schema_bytes: &[u8], field_metadata: &[SignalSchemaField]) -> Self {
-        Self {
-            schema_bytes: schema_bytes.to_vec(),
-            field_metadata: field_metadata.to_vec(),
-            has_extraction_fields: field_metadata.len() != 4,
-            field_names: Vec::new(),
-        }
+    pub fn new(
+        schema_bytes: &[u8],
+        field_metadata: &[SignalSchemaField],
+    ) -> Result<Self, SchemaError> {
+        validate_typed_metadata(field_metadata)?;
+        Self::build(schema_bytes, field_metadata.to_vec(), Vec::new())
     }
 
-    /// Init with field names (`DynamicSchemaConfig.initWithFieldNames`).
-    /// `field_names_raw` is the concatenated null-terminated blob, e.g.
-    /// `"id\0type\0timestamp\0value.orderId\0"`.
+    /// Decode the untrusted four-byte-per-field FFI metadata table.
+    pub fn from_wire(schema_bytes: &[u8], field_metadata: &[u8]) -> Result<Self, SchemaError> {
+        let fields = decode_field_metadata(field_metadata)?;
+        Self::build(schema_bytes, fields, Vec::new())
+    }
+
     pub fn with_field_names(
         schema_bytes: &[u8],
         field_metadata: &[SignalSchemaField],
         field_names_raw: &[u8],
-    ) -> Self {
-        let mut config = Self::new(schema_bytes, field_metadata);
-        config.field_names = parse_field_names(field_names_raw);
-        config
+    ) -> Result<Self, SchemaError> {
+        validate_typed_metadata(field_metadata)?;
+        let names = parse_field_names(field_names_raw)?;
+        Self::build(schema_bytes, field_metadata.to_vec(), names)
     }
 
-    /// Total buffer count for this schema (`computeBufferCount`).
+    pub fn from_wire_with_field_names(
+        schema_bytes: &[u8],
+        field_metadata: &[u8],
+        field_names_raw: &[u8],
+    ) -> Result<Self, SchemaError> {
+        let fields = decode_field_metadata(field_metadata)?;
+        let names = parse_field_names(field_names_raw)?;
+        Self::build(schema_bytes, fields, names)
+    }
+
+    fn build(
+        schema_bytes: &[u8],
+        field_metadata: Vec<SignalSchemaField>,
+        field_names: Vec<String>,
+    ) -> Result<Self, SchemaError> {
+        let schema = decode_schema_message(schema_bytes)?;
+        if schema.fields().len() > MAX_SCHEMA_FIELDS {
+            return Err(SchemaError::TooManyFields);
+        }
+        if schema.fields().len() != field_metadata.len() {
+            return Err(SchemaError::FieldCountMismatch {
+                schema: schema.fields().len(),
+                metadata: field_metadata.len(),
+            });
+        }
+        if !field_names.is_empty() && field_names.len() != field_metadata.len() {
+            return Err(SchemaError::InvalidFieldNames);
+        }
+
+        let mut logical_types = Vec::with_capacity(field_metadata.len());
+        for (field_index, (field, metadata)) in schema
+            .fields()
+            .iter()
+            .zip(field_metadata.iter())
+            .enumerate()
+        {
+            if !logical_type_matches(metadata.arrow_type, field.data_type()) {
+                return Err(SchemaError::TypeMismatch { field_index });
+            }
+            if field.is_nullable() != metadata.is_nullable()
+                || (metadata.arrow_type == ArrowType::Null && !metadata.is_nullable())
+            {
+                return Err(SchemaError::NullabilityMismatch { field_index });
+            }
+            logical_types.push(field.data_type().clone());
+        }
+
+        Ok(Self {
+            has_extraction_fields: field_metadata.len() != 4,
+            schema_bytes: schema_bytes.to_vec(),
+            field_metadata,
+            logical_types,
+            field_names,
+        })
+    }
+
     pub fn compute_buffer_count(&self) -> u32 {
-        self.field_metadata.iter().map(|f| f.buffer_count()).sum()
+        self.field_metadata
+            .iter()
+            .map(|field| field.buffer_count())
+            .sum()
     }
 
-    /// Schema message size for IPC output sizing.
     pub fn schema_message_size(&self) -> usize {
         self.schema_bytes.len()
     }
 
-    /// Write the schema message; returns bytes written, 0 if the buffer is
-    /// too small (Zig's sentinel contract, kept for the writer's use).
     pub fn write_schema_message(&self, output: &mut [u8]) -> usize {
         if output.len() < self.schema_bytes.len() {
             return 0;
@@ -153,39 +196,132 @@ impl DynamicSchemaConfig {
     }
 }
 
-/// Parse names from the null-terminated concatenated blob
-/// (`dynamic_schema.zig parseFieldNames`): empty segments (consecutive
-/// terminators) are skipped, a trailing unterminated segment is dropped.
-fn parse_field_names(raw: &[u8]) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut start = 0usize;
-    for (i, byte) in raw.iter().enumerate() {
-        if *byte == 0 {
-            if i > start {
-                names.push(String::from_utf8_lossy(&raw[start..i]).into_owned());
-            }
-            start = i + 1;
+fn decode_schema_message(bytes: &[u8]) -> Result<arrow_schema::Schema, SchemaError> {
+    if bytes.len() < 8 || bytes[..4] != [0xff; 4] {
+        return Err(SchemaError::InvalidMessage);
+    }
+    let payload_len = u32::from_le_bytes(
+        bytes[4..8]
+            .try_into()
+            .map_err(|_| SchemaError::InvalidMessage)?,
+    ) as usize;
+    let expected_len = 8usize
+        .checked_add(payload_len)
+        .ok_or(SchemaError::InvalidMessage)?;
+    if payload_len == 0 || !payload_len.is_multiple_of(8) || expected_len != bytes.len() {
+        return Err(SchemaError::InvalidMessage);
+    }
+    let message = root_as_message(&bytes[8..]).map_err(|_| SchemaError::InvalidMessage)?;
+    if message.header_type() != MessageHeader::Schema || message.bodyLength() != 0 {
+        return Err(SchemaError::InvalidMessage);
+    }
+    try_schema_from_ipc_buffer(bytes).map_err(|_| SchemaError::InvalidMessage)
+}
+
+fn logical_type_matches(physical: ArrowType, logical: &DataType) -> bool {
+    match physical {
+        ArrowType::Null => matches!(logical, DataType::Null),
+        ArrowType::Int32 => matches!(logical, DataType::Int32 | DataType::UInt32),
+        ArrowType::Float64 => matches!(logical, DataType::Float64),
+        ArrowType::Binary => matches!(logical, DataType::Binary),
+        ArrowType::Utf8 => matches!(logical, DataType::Utf8),
+        ArrowType::Bool => matches!(logical, DataType::Boolean),
+        ArrowType::Int64 => matches!(logical, DataType::Int64 | DataType::Timestamp(_, _)),
+    }
+}
+
+fn validate_typed_metadata(fields: &[SignalSchemaField]) -> Result<(), SchemaError> {
+    if fields.len() > MAX_SCHEMA_FIELDS {
+        return Err(SchemaError::TooManyFields);
+    }
+    for (field_index, field) in fields.iter().enumerate() {
+        if field.nullable > 1 || field._pad != [0; 2] {
+            return Err(SchemaError::InvalidFieldMetadata { field_index });
         }
     }
-    names
+    Ok(())
+}
+
+fn decode_field_metadata(bytes: &[u8]) -> Result<Vec<SignalSchemaField>, SchemaError> {
+    if !bytes.len().is_multiple_of(4) || bytes.len() / 4 > MAX_SCHEMA_FIELDS {
+        return Err(if bytes.len() / 4 > MAX_SCHEMA_FIELDS {
+            SchemaError::TooManyFields
+        } else {
+            SchemaError::InvalidFieldMetadata { field_index: 0 }
+        });
+    }
+    let mut fields = Vec::with_capacity(bytes.len() / 4);
+    for (field_index, raw) in bytes.chunks_exact(4).enumerate() {
+        let Some(arrow_type) = ArrowType::from_u8(raw[0]) else {
+            return Err(SchemaError::InvalidFieldMetadata { field_index });
+        };
+        if raw[1] > 1 || raw[2] != 0 || raw[3] != 0 {
+            return Err(SchemaError::InvalidFieldMetadata { field_index });
+        }
+        fields.push(SignalSchemaField::new(arrow_type, raw[1] == 1));
+    }
+    Ok(fields)
+}
+
+fn parse_field_names(raw: &[u8]) -> Result<Vec<String>, SchemaError> {
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    if raw.last() != Some(&0) {
+        return Err(SchemaError::InvalidFieldNames);
+    }
+    raw[..raw.len() - 1]
+        .split(|byte| *byte == 0)
+        .map(|name| {
+            if name.is_empty() {
+                return Err(SchemaError::InvalidFieldNames);
+            }
+            std::str::from_utf8(name)
+                .map(str::to_owned)
+                .map_err(|_| SchemaError::InvalidFieldNames)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_ipc::writer::StreamWriter;
+    use arrow_schema::{Field, Schema};
 
-    // test "SignalSchemaField size and alignment" (dynamic_schema.zig)
-    #[test]
-    fn signal_schema_field_layout() {
-        assert_eq!(core::mem::size_of::<SignalSchemaField>(), 4);
-        assert_eq!(core::mem::align_of::<SignalSchemaField>(), 1);
-        assert_eq!(core::mem::offset_of!(SignalSchemaField, arrow_type), 0);
-        assert_eq!(core::mem::offset_of!(SignalSchemaField, nullable), 1);
+    fn schema_message(schema: &Schema) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut bytes, schema).unwrap();
+            writer.finish().unwrap();
+        }
+        assert!(bytes.ends_with(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]));
+        bytes.truncate(bytes.len() - 8);
+        bytes
+    }
+
+    fn base_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("type", DataType::Utf8, false),
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("value", DataType::Binary, true),
+        ])
+    }
+
+    fn base_fields() -> [SignalSchemaField; 4] {
+        [
+            SignalSchemaField::new(ArrowType::Utf8, false),
+            SignalSchemaField::new(ArrowType::Utf8, false),
+            SignalSchemaField::new(ArrowType::Int64, false),
+            SignalSchemaField::new(ArrowType::Binary, true),
+        ]
     }
 
     #[test]
-    fn arrow_type_discriminants_match_ts_enum() {
-        // ArrowSchemaDescriptor.ts values (dynamic_schema.zig:18-29).
+    fn field_metadata_layout_and_discriminants_are_stable() {
+        assert_eq!(core::mem::size_of::<SignalSchemaField>(), 4);
+        assert_eq!(core::mem::align_of::<SignalSchemaField>(), 1);
         for (value, expected) in [
             (0, ArrowType::Null),
             (1, ArrowType::Int32),
@@ -201,112 +337,98 @@ mod tests {
         assert_eq!(ArrowType::from_u8(7), None);
     }
 
-    // test "SignalSchemaField isNullable"
     #[test]
-    fn is_nullable() {
-        assert!(SignalSchemaField::new(ArrowType::Utf8, true).is_nullable());
-        assert!(!SignalSchemaField::new(ArrowType::Utf8, false).is_nullable());
-    }
-
-    // test "SignalSchemaField bufferCount"
-    #[test]
-    fn buffer_count_per_type() {
-        assert_eq!(
-            SignalSchemaField::new(ArrowType::Utf8, false).buffer_count(),
-            3
-        );
-        assert_eq!(
-            SignalSchemaField::new(ArrowType::Binary, true).buffer_count(),
-            3
-        );
-        assert_eq!(
-            SignalSchemaField::new(ArrowType::Int32, false).buffer_count(),
-            2
-        );
-        assert_eq!(
-            SignalSchemaField::new(ArrowType::Float64, true).buffer_count(),
-            2
-        );
-        assert_eq!(
-            SignalSchemaField::new(ArrowType::Bool, false).buffer_count(),
-            2
-        );
-        assert_eq!(
-            SignalSchemaField::new(ArrowType::Null, true).buffer_count(),
-            1
-        );
-    }
-
-    fn base_fields() -> [SignalSchemaField; 4] {
-        [
-            SignalSchemaField::new(ArrowType::Utf8, false),  // id
-            SignalSchemaField::new(ArrowType::Utf8, false),  // type
-            SignalSchemaField::new(ArrowType::Int64, false), // timestamp
-            SignalSchemaField::new(ArrowType::Binary, true), // value
-        ]
-    }
-
-    // test "DynamicSchemaConfig init and deinit"
-    #[test]
-    fn config_init() {
-        let schema_bytes = [0xFF, 0xFF, 0xFF, 0xFF, 0x10, 0x00, 0x00, 0x00];
-        let config = DynamicSchemaConfig::new(&schema_bytes, &base_fields());
-        assert_eq!(config.field_metadata.len(), 4);
-        assert_eq!(config.schema_bytes.len(), 8);
-        // Base 4-column schema is NOT an extraction schema (field_count == 4).
-        assert!(!config.has_extraction_fields);
-    }
-
-    // test "DynamicSchemaConfig computeBufferCount for 4-field schema"
-    #[test]
-    fn buffer_count_4_field() {
-        let schema_bytes = [0xFF, 0xFF, 0xFF, 0xFF, 0x10, 0x00, 0x00, 0x00];
-        let config = DynamicSchemaConfig::new(&schema_bytes, &base_fields());
-        // 3 + 3 + 2 + 3 = 11 (matches Phase 7's hardcoded count)
+    fn real_schema_message_is_decoded_and_retained() {
+        let bytes = schema_message(&base_schema());
+        let config = DynamicSchemaConfig::new(&bytes, &base_fields()).unwrap();
+        assert_eq!(config.schema_bytes, bytes);
+        assert_eq!(config.logical_types[2], DataType::Int64);
         assert_eq!(config.compute_buffer_count(), 11);
-    }
+        assert!(!config.has_extraction_fields);
 
-    // test "DynamicSchemaConfig computeBufferCount for 5-field schema"
-    #[test]
-    fn buffer_count_5_field() {
-        let schema_bytes = [0xFF, 0xFF, 0xFF, 0xFF, 0x10, 0x00, 0x00, 0x00];
-        let fields = [
-            SignalSchemaField::new(ArrowType::Utf8, false),
-            SignalSchemaField::new(ArrowType::Utf8, false),
-            SignalSchemaField::new(ArrowType::Int64, false),
-            SignalSchemaField::new(ArrowType::Utf8, true),
-            SignalSchemaField::new(ArrowType::Float64, true),
-        ];
-        let config = DynamicSchemaConfig::new(&schema_bytes, &fields);
-        assert_eq!(config.compute_buffer_count(), 13);
-        // 5 fields => extraction schema per the field_count != 4 rule.
-        assert!(config.has_extraction_fields);
-    }
-
-    // test "DynamicSchemaConfig writeSchemaMessage"
-    #[test]
-    fn write_schema_message() {
-        let schema_bytes = [0xFF, 0xFF, 0xFF, 0xFF, 0x10, 0x00, 0x00, 0x00];
-        let config = DynamicSchemaConfig::new(&schema_bytes, &[]);
-        let mut output = [0u8; 16];
-        assert_eq!(config.write_schema_message(&mut output), 8);
-        assert_eq!(&output[..8], &schema_bytes);
-        let mut small = [0u8; 4];
-        assert_eq!(config.write_schema_message(&mut small), 0);
+        let mut output = vec![0; bytes.len()];
+        assert_eq!(config.write_schema_message(&mut output), bytes.len());
+        assert_eq!(output, bytes);
+        assert_eq!(config.write_schema_message(&mut [0; 4]), 0);
     }
 
     #[test]
-    fn field_name_parsing() {
-        // dynamic_schema.zig parseFieldNames: null-terminated segments,
-        // empty segments skipped, unterminated tail dropped.
-        let config = DynamicSchemaConfig::with_field_names(
-            &[],
-            &[],
-            b"id\0type\0\0timestamp\0value.orderId\0tail-no-term",
-        );
+    fn schema_metadata_type_count_and_nullability_must_agree() {
+        let bytes = schema_message(&base_schema());
+        assert!(matches!(
+            DynamicSchemaConfig::new(&bytes, &base_fields()[..3]),
+            Err(SchemaError::FieldCountMismatch { .. })
+        ));
+
+        let mut fields = base_fields();
+        fields[2] = SignalSchemaField::new(ArrowType::Float64, false);
         assert_eq!(
-            config.field_names,
-            ["id", "type", "timestamp", "value.orderId"]
+            DynamicSchemaConfig::new(&bytes, &fields),
+            Err(SchemaError::TypeMismatch { field_index: 2 })
+        );
+
+        let mut fields = base_fields();
+        fields[3] = SignalSchemaField::new(ArrowType::Binary, false);
+        assert_eq!(
+            DynamicSchemaConfig::new(&bytes, &fields),
+            Err(SchemaError::NullabilityMismatch { field_index: 3 })
+        );
+    }
+
+    #[test]
+    fn wire_metadata_is_decoded_without_enum_casts() {
+        let bytes = schema_message(&base_schema());
+        let raw = [
+            4, 0, 0, 0, // Utf8
+            4, 0, 0, 0, // Utf8
+            6, 0, 0, 0, // Int64
+            3, 1, 0, 0, // nullable Binary
+        ];
+        let config = DynamicSchemaConfig::from_wire(&bytes, &raw).unwrap();
+        assert_eq!(config.field_metadata, base_fields());
+
+        let mut invalid = raw;
+        invalid[8] = 255;
+        assert_eq!(
+            DynamicSchemaConfig::from_wire(&bytes, &invalid),
+            Err(SchemaError::InvalidFieldMetadata { field_index: 2 })
+        );
+        let mut invalid = raw;
+        invalid[1] = 2;
+        assert_eq!(
+            DynamicSchemaConfig::from_wire(&bytes, &invalid),
+            Err(SchemaError::InvalidFieldMetadata { field_index: 0 })
+        );
+    }
+
+    #[test]
+    fn malformed_or_non_schema_messages_are_rejected() {
+        let bytes = schema_message(&base_schema());
+        assert_eq!(
+            DynamicSchemaConfig::new(&bytes[..bytes.len() - 1], &base_fields()),
+            Err(SchemaError::InvalidMessage)
+        );
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(
+            DynamicSchemaConfig::new(&trailing, &base_fields()),
+            Err(SchemaError::InvalidMessage)
+        );
+    }
+
+    #[test]
+    fn names_are_strict_utf8_terminated_and_ordered() {
+        let bytes = schema_message(&base_schema());
+        let config = DynamicSchemaConfig::with_field_names(
+            &bytes,
+            &base_fields(),
+            b"id\0type\0timestamp\0value\0",
+        )
+        .unwrap();
+        assert_eq!(config.field_names, ["id", "type", "timestamp", "value"]);
+        assert_eq!(
+            DynamicSchemaConfig::with_field_names(&bytes, &base_fields(), b"id\0type"),
+            Err(SchemaError::InvalidFieldNames)
         );
     }
 }

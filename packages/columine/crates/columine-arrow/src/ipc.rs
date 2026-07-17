@@ -1,15 +1,9 @@
-//! Arrow IPC stream writer (`arrow/ipc_writer.zig`, unified).
+//! Arrow IPC stream writer.
 //!
-//! Stream layout: `[Schema message][RecordBatch message][EOS]`.
-//!
-//! Drift audit: the axe-runtime copy deletes the base `EventColumns` entry
-//! point (196 lines; its only addition is a comment) and builds the body
-//! directly at its final IPC offset so the relocation memcpy disappears
-//! (1 payload copy). Columine's dynamic path has the same optimization
-//! forward-ported; only its base path still builds in a scratch half and
-//! relocates. The unified port keeps BOTH entry points and uses the
-//! in-place strategy for both — output bytes are identical, the scratch
-//! relocation was pure waste, not semantics (t-5dacc729 audit).
+//! All producer paths converge on [`write_arrow_ipc_from_borrowed_columns`]:
+//! schema bytes are copied once, each borrowed Arrow buffer is copied once
+//! into its final aligned body position, then the RecordBatch metadata and
+//! EOS marker are emitted around that body.
 
 use crate::columns::{DynamicColumns, EventColumns};
 use crate::record_batch::{
@@ -18,340 +12,371 @@ use crate::record_batch::{
 };
 use crate::schema::{ArrowType, DynamicSchemaConfig};
 
-/// End-of-stream marker (continuation + zero metadata size).
 pub const EOS_MARKER: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
+pub const MIN_ARROW_OUTPUT_CAPACITY: usize = 4096;
 
-/// Errors from the stream writer (Zig `error{BufferTooSmall}`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IpcError {
-    BufferTooSmall,
+    BufferTooSmall { required: usize },
+    InvalidColumn,
+    SizeOverflow,
 }
 
-/// Incremental stream writer (`IpcWriter`): tracks the output offset across
-/// schema/batch/EOS writes. The batch entry points below manage their own
-/// offsets; this type serves callers composing streams manually.
-#[derive(Debug)]
-pub struct IpcWriter<'a> {
-    buffer: &'a mut [u8],
-    offset: usize,
-    schema_written: bool,
+fn checked_align_to_8(size: usize) -> Result<usize, IpcError> {
+    size.checked_add(7)
+        .map(|value| value & !7usize)
+        .ok_or(IpcError::SizeOverflow)
 }
 
-impl<'a> IpcWriter<'a> {
-    pub fn new(buffer: &'a mut [u8]) -> Self {
-        Self {
-            buffer,
-            offset: 0,
-            schema_written: false,
+fn checked_add_aligned(total: &mut usize, length: usize) -> Result<(), IpcError> {
+    *total = total
+        .checked_add(checked_align_to_8(length)?)
+        .ok_or(IpcError::SizeOverflow)?;
+    Ok(())
+}
+
+fn validate_column_shape(
+    index: usize,
+    expected: ArrowType,
+    nullable: bool,
+    column: DynamicColumn<'_>,
+) -> Result<usize, IpcError> {
+    if column.field_idx as usize != index
+        || column.arrow_type != expected
+        || column.nullable != nullable
+        || (!nullable && column.validity.is_some())
+    {
+        return Err(IpcError::InvalidColumn);
+    }
+
+    if expected == ArrowType::Null {
+        if column.validity.is_some() || column.offsets.is_some() || !column.data.is_empty() {
+            return Err(IpcError::InvalidColumn);
         }
+        return Ok(0);
     }
 
-    /// Write the end-of-stream marker; false if the buffer is too small.
-    pub fn write_eos(&mut self) -> bool {
-        if self.buffer.len() - self.offset < EOS_MARKER.len() {
-            return false;
+    let mut body_length = 0usize;
+    checked_add_aligned(&mut body_length, column.validity.map_or(0, <[u8]>::len))?;
+    match expected {
+        ArrowType::Utf8 | ArrowType::Binary => {
+            let offsets = column.offsets.ok_or(IpcError::InvalidColumn)?;
+            checked_add_aligned(&mut body_length, offsets.len())?;
+            checked_add_aligned(&mut body_length, column.data.len())?;
         }
-        self.buffer[self.offset..][..EOS_MARKER.len()].copy_from_slice(&EOS_MARKER);
-        self.offset += EOS_MARKER.len();
-        true
+        ArrowType::Int32 | ArrowType::Int64 | ArrowType::Float64 | ArrowType::Bool => {
+            if column.offsets.is_some() {
+                return Err(IpcError::InvalidColumn);
+            }
+            checked_add_aligned(&mut body_length, column.data.len())?;
+        }
+        ArrowType::Null => return Err(IpcError::InvalidColumn),
     }
-
-    pub fn bytes_written(&self) -> usize {
-        self.offset
-    }
-
-    pub fn output(&self) -> &[u8] {
-        &self.buffer[..self.offset]
-    }
-
-    pub fn has_schema(&self) -> bool {
-        self.schema_written
-    }
-
-    pub fn remaining_capacity(&self) -> usize {
-        self.buffer.len() - self.offset
-    }
+    Ok(body_length)
 }
 
-/// Shared tail of both entry points: body is already built in
-/// `output[body_start..]`; emit the RecordBatch message at `write_offset`
-/// (in place — no body copy) and the EOS marker after it.
-#[allow(clippy::too_many_arguments)] // mirrors the Zig call surface; a param struct would obscure the 1:1 mapping
+/// Exact Arrow IPC byte length for a validated set of borrowed columns.
+pub fn required_arrow_ipc_len<'a, F>(
+    schema_config: &DynamicSchemaConfig,
+    mut column_at: F,
+) -> Result<usize, IpcError>
+where
+    F: FnMut(usize) -> Result<DynamicColumn<'a>, IpcError>,
+{
+    let mut body_length = 0usize;
+    for (index, field) in schema_config.field_metadata.iter().enumerate() {
+        let column = column_at(index)?;
+        body_length = body_length
+            .checked_add(validate_column_shape(
+                index,
+                field.arrow_type,
+                field.is_nullable(),
+                column,
+            )?)
+            .ok_or(IpcError::SizeOverflow)?;
+    }
+    let field_count =
+        u32::try_from(schema_config.field_metadata.len()).map_err(|_| IpcError::SizeOverflow)?;
+    let metadata_size = record_batch_metadata_size(
+        field_count,
+        compute_buffer_count(&schema_config.field_metadata),
+    );
+    schema_config
+        .schema_message_size()
+        .checked_add(8)
+        .and_then(|size| size.checked_add(metadata_size))
+        .and_then(|size| size.checked_add(body_length))
+        .and_then(|size| size.checked_add(EOS_MARKER.len()))
+        .ok_or(IpcError::SizeOverflow)
+}
+
+#[derive(Clone, Copy)]
+struct BuiltBody {
+    start: usize,
+    length: usize,
+    node_count: usize,
+    desc_count: usize,
+}
+
 fn finish_stream(
     output: &mut [u8],
     write_offset: usize,
-    body_start: usize,
     row_count: i64,
-    body_length: usize,
     metadata: &MetadataStorage,
-    node_count: usize,
-    desc_count: usize,
+    body: BuiltBody,
+    required: usize,
 ) -> Result<usize, IpcError> {
-    let nodes = metadata.field_nodes[..node_count].to_vec();
-    let descs = metadata.buffer_descs[..desc_count].to_vec();
     let rb_written = encode_record_batch_dynamic(
         &mut output[write_offset..],
         row_count,
-        Some(body_start - write_offset),
-        &nodes,
-        &descs,
+        Some(body.start - write_offset),
+        &metadata.field_nodes[..body.node_count],
+        &metadata.buffer_descs[..body.desc_count],
         &[],
-        body_length,
+        body.length,
     );
     if rb_written == 0 {
-        return Err(IpcError::BufferTooSmall);
+        return Err(IpcError::BufferTooSmall { required });
     }
-    let mut end = write_offset + rb_written;
-    if end + EOS_MARKER.len() > output.len() {
-        return Err(IpcError::BufferTooSmall);
+    let mut end = write_offset
+        .checked_add(rb_written)
+        .ok_or(IpcError::SizeOverflow)?;
+    let eos_end = end
+        .checked_add(EOS_MARKER.len())
+        .ok_or(IpcError::SizeOverflow)?;
+    if eos_end > output.len() {
+        return Err(IpcError::BufferTooSmall { required });
     }
-    output[end..][..EOS_MARKER.len()].copy_from_slice(&EOS_MARKER);
-    end += EOS_MARKER.len();
+    output[end..eos_end].copy_from_slice(&EOS_MARKER);
+    end = eos_end;
     Ok(end)
 }
 
-/// Write Arrow IPC from [`DynamicColumns`] (`writeArrowIpcFromDynamicColumns`)
-/// — the sole IPC encoding path for all schemas in the AxE artifact.
-/// Returns the number of valid IPC bytes at the start of `output`.
-pub fn write_arrow_ipc_from_dynamic_columns(
-    dyn_cols: &DynamicColumns,
+/// Production writer over borrowed, already validated Arrow column buffers.
+///
+/// `column_at` is called once during the no-mutation size preflight and once
+/// while building the body. `null_count_at` is called only during the build.
+pub fn write_arrow_ipc_from_borrowed_columns<'a, F, N>(
+    row_count: u32,
     schema_config: &DynamicSchemaConfig,
     output: &mut [u8],
     metadata_storage: &mut MetadataStorage,
-) -> Result<usize, IpcError> {
-    let row_count = i64::from(dyn_cols.count);
-    if output.len() < 4096 {
-        return Err(IpcError::BufferTooSmall);
+    mut column_at: F,
+    mut null_count_at: N,
+) -> Result<usize, IpcError>
+where
+    F: FnMut(usize) -> Result<DynamicColumn<'a>, IpcError>,
+    N: FnMut(usize) -> i64,
+{
+    let required = required_arrow_ipc_len(schema_config, &mut column_at)?;
+    let required_capacity = required.max(MIN_ARROW_OUTPUT_CAPACITY);
+    if output.len() < required_capacity {
+        return Err(IpcError::BufferTooSmall {
+            required: required_capacity,
+        });
     }
 
-    // 1. Schema message.
-    let schema_len = schema_config.write_schema_message(output);
-    if schema_len == 0 {
-        return Err(IpcError::BufferTooSmall);
+    let write_offset = schema_config.write_schema_message(output);
+    if write_offset != schema_config.schema_message_size() {
+        return Err(IpcError::BufferTooSmall {
+            required: required_capacity,
+        });
     }
-    let write_offset = schema_len;
 
-    // 2. Build the body directly at its final RecordBatch IPC position.
-    let field_count = schema_config.field_metadata.len() as u32;
-    let buffer_count = compute_buffer_count(&schema_config.field_metadata);
-    let record_batch_prefix = 8 + record_batch_metadata_size(field_count, buffer_count);
+    let field_count =
+        u32::try_from(schema_config.field_metadata.len()).map_err(|_| IpcError::SizeOverflow)?;
+    let record_batch_prefix = 8usize
+        .checked_add(record_batch_metadata_size(
+            field_count,
+            compute_buffer_count(&schema_config.field_metadata),
+        ))
+        .ok_or(IpcError::SizeOverflow)?;
     let body_start = write_offset
         .checked_add(record_batch_prefix)
-        .ok_or(IpcError::BufferTooSmall)?;
-    if body_start >= output.len() {
-        return Err(IpcError::BufferTooSmall);
-    }
+        .ok_or(IpcError::SizeOverflow)?;
 
-    let (body_length, node_count, desc_count) = {
-        let (_, body_region) = output.split_at_mut(body_start);
+    let body = {
+        let body_region = output
+            .get_mut(body_start..)
+            .ok_or(IpcError::BufferTooSmall {
+                required: required_capacity,
+            })?;
         let mut builder = DynamicBodyBuilder::new(body_region, metadata_storage);
-
-        // 3. Add every schema column.
-        for (col_idx, meta) in schema_config.field_metadata.iter().enumerate() {
-            let col = &dyn_cols.columns[col_idx];
-            let col_idx_u32 = col_idx as u32;
-
-            let mut null_count = 0i64;
-            for row in 0..dyn_cols.count {
-                if dyn_cols.is_null(col_idx_u32, row) {
-                    null_count += 1;
-                }
-            }
-
-            let validity = meta
-                .is_nullable()
-                .then(|| col.validity_bytes(dyn_cols.count));
-
-            let ok = match meta.arrow_type {
-                ArrowType::Utf8 => builder.add_column(
-                    DynamicColumn::utf8(
-                        col_idx_u32,
-                        meta.is_nullable(),
-                        validity,
-                        col.offsets_bytes(dyn_cols.count)
-                            .ok_or(IpcError::BufferTooSmall)?,
-                        col.data_bytes().ok_or(IpcError::BufferTooSmall)?,
-                    ),
-                    row_count,
-                    null_count,
-                ),
-                ArrowType::Int32 | ArrowType::Int64 => builder.add_column(
-                    DynamicColumn::int64(
-                        col_idx_u32,
-                        meta.is_nullable(),
-                        validity,
-                        col.fixed_i64_bytes(dyn_cols.count)
-                            .ok_or(IpcError::BufferTooSmall)?,
-                    ),
-                    row_count,
-                    null_count,
-                ),
-                ArrowType::Float64 => builder.add_column(
-                    DynamicColumn::float64(
-                        col_idx_u32,
-                        meta.is_nullable(),
-                        validity,
-                        col.fixed_f64_bytes(dyn_cols.count)
-                            .ok_or(IpcError::BufferTooSmall)?,
-                    ),
-                    row_count,
-                    null_count,
-                ),
-                ArrowType::Bool => builder.add_column(
-                    DynamicColumn::boolean(
-                        col_idx_u32,
-                        meta.is_nullable(),
-                        validity,
-                        col.bool_bytes(dyn_cols.count)
-                            .ok_or(IpcError::BufferTooSmall)?,
-                    ),
-                    row_count,
-                    null_count,
-                ),
-                ArrowType::Binary => builder.add_column(
-                    DynamicColumn::binary(
-                        col_idx_u32,
-                        meta.is_nullable(),
-                        validity,
-                        col.offsets_bytes(dyn_cols.count)
-                            .ok_or(IpcError::BufferTooSmall)?,
-                        col.data_bytes().ok_or(IpcError::BufferTooSmall)?,
-                    ),
-                    row_count,
-                    null_count,
-                ),
-                ArrowType::Null => builder.add_column(
-                    DynamicColumn {
-                        field_idx: col_idx_u32,
-                        arrow_type: ArrowType::Null,
-                        nullable: true,
-                        validity,
-                        data: &[],
-                        offsets: None,
-                    },
-                    row_count,
-                    i64::from(dyn_cols.count),
-                ),
-            };
-            if !ok {
-                return Err(IpcError::BufferTooSmall);
+        for index in 0..schema_config.field_metadata.len() {
+            let column = column_at(index)?;
+            if !builder.add_column(column, i64::from(row_count), null_count_at(index)) {
+                return Err(IpcError::BufferTooSmall {
+                    required: required_capacity,
+                });
             }
         }
-        (
-            builder.body_length(),
-            builder.field_nodes().len(),
-            builder.buffer_descs().len(),
-        )
+        BuiltBody {
+            start: body_start,
+            length: builder.body_length(),
+            node_count: builder.field_nodes().len(),
+            desc_count: builder.buffer_descs().len(),
+        }
     };
 
-    // 4-5. RecordBatch message (in place) + EOS.
     finish_stream(
         output,
         write_offset,
-        body_start,
-        row_count,
-        body_length,
+        i64::from(row_count),
         metadata_storage,
-        node_count,
-        desc_count,
+        body,
+        required_capacity,
     )
 }
 
-/// Write Arrow IPC from base [`EventColumns`]
-/// (`writeArrowIpcFromColumnsWithSchema`, columine npm variant): maps the
-/// fixed 4 fields (id, type, timestamp, value) onto the schema.
-pub fn write_arrow_ipc_from_columns_with_schema(
-    cols: &EventColumns,
+fn dynamic_column<'a>(
+    columns: &'a DynamicColumns,
+    schema: &DynamicSchemaConfig,
+    index: usize,
+) -> Result<DynamicColumn<'a>, IpcError> {
+    let field = schema
+        .field_metadata
+        .get(index)
+        .ok_or(IpcError::InvalidColumn)?;
+    let column = columns.columns.get(index).ok_or(IpcError::InvalidColumn)?;
+    let field_index = u32::try_from(index).map_err(|_| IpcError::InvalidColumn)?;
+    let validity = field
+        .is_nullable()
+        .then(|| column.validity_bytes(columns.count));
+    match field.arrow_type {
+        ArrowType::Utf8 => Ok(DynamicColumn::utf8(
+            field_index,
+            field.is_nullable(),
+            validity,
+            column
+                .offsets_bytes(columns.count)
+                .ok_or(IpcError::InvalidColumn)?,
+            column.data_bytes().ok_or(IpcError::InvalidColumn)?,
+        )),
+        ArrowType::Binary => Ok(DynamicColumn::binary(
+            field_index,
+            field.is_nullable(),
+            validity,
+            column
+                .offsets_bytes(columns.count)
+                .ok_or(IpcError::InvalidColumn)?,
+            column.data_bytes().ok_or(IpcError::InvalidColumn)?,
+        )),
+        ArrowType::Int32 => Ok(DynamicColumn::int32(
+            field_index,
+            field.is_nullable(),
+            validity,
+            column
+                .fixed_i32_bytes(columns.count)
+                .ok_or(IpcError::InvalidColumn)?,
+        )),
+        ArrowType::Int64 => Ok(DynamicColumn::int64(
+            field_index,
+            field.is_nullable(),
+            validity,
+            column
+                .fixed_i64_bytes(columns.count)
+                .ok_or(IpcError::InvalidColumn)?,
+        )),
+        ArrowType::Float64 => Ok(DynamicColumn::float64(
+            field_index,
+            field.is_nullable(),
+            validity,
+            column
+                .fixed_f64_bytes(columns.count)
+                .ok_or(IpcError::InvalidColumn)?,
+        )),
+        ArrowType::Bool => Ok(DynamicColumn::boolean(
+            field_index,
+            field.is_nullable(),
+            validity,
+            column
+                .bool_bytes(columns.count)
+                .ok_or(IpcError::InvalidColumn)?,
+        )),
+        ArrowType::Null => Ok(DynamicColumn {
+            field_idx: field_index,
+            arrow_type: ArrowType::Null,
+            nullable: true,
+            validity: None,
+            data: &[],
+            offsets: None,
+        }),
+    }
+}
+
+fn dynamic_null_count(columns: &DynamicColumns, index: usize) -> i64 {
+    let Ok(field_index) = u32::try_from(index) else {
+        return 0;
+    };
+    (0..columns.count)
+        .filter(|row| columns.is_null(field_index, *row))
+        .count() as i64
+}
+
+pub fn write_arrow_ipc_from_dynamic_columns(
+    columns: &DynamicColumns,
     schema_config: &DynamicSchemaConfig,
     output: &mut [u8],
     metadata_storage: &mut MetadataStorage,
 ) -> Result<usize, IpcError> {
-    let row_count = i64::from(cols.count);
-    if output.len() < 4096 {
-        return Err(IpcError::BufferTooSmall);
+    write_arrow_ipc_from_borrowed_columns(
+        columns.count,
+        schema_config,
+        output,
+        metadata_storage,
+        |index| dynamic_column(columns, schema_config, index),
+        |index| dynamic_null_count(columns, index),
+    )
+}
+
+pub fn write_arrow_ipc_from_columns_with_schema(
+    columns: &EventColumns,
+    schema_config: &DynamicSchemaConfig,
+    output: &mut [u8],
+    metadata_storage: &mut MetadataStorage,
+) -> Result<usize, IpcError> {
+    if schema_config.field_metadata.len() != 4 {
+        return Err(IpcError::InvalidColumn);
     }
-
-    let schema_len = schema_config.write_schema_message(output);
-    if schema_len == 0 {
-        return Err(IpcError::BufferTooSmall);
-    }
-    let write_offset = schema_len;
-
-    // In-place body strategy (see module doc: columine's scratch-half
-    // relocation in this path is un-forward-ported drift; bytes identical).
-    let record_batch_prefix = 8 + record_batch_metadata_size(4, 11);
-    let body_start = write_offset
-        .checked_add(record_batch_prefix)
-        .ok_or(IpcError::BufferTooSmall)?;
-    if body_start >= output.len() {
-        return Err(IpcError::BufferTooSmall);
-    }
-
-    let (body_length, node_count, desc_count) = {
-        let (_, body_region) = output.split_at_mut(body_start);
-        let mut builder = DynamicBodyBuilder::new(body_region, metadata_storage);
-
-        let mut value_null_count = 0i64;
-        for i in 0..cols.count {
-            if !cols.has_value(i) {
-                value_null_count += 1;
-            }
-        }
-
-        let ok = builder.add_column(
-            DynamicColumn::utf8(
+    let value_null_count = (0..columns.count)
+        .filter(|row| !columns.has_value(*row))
+        .count() as i64;
+    write_arrow_ipc_from_borrowed_columns(
+        columns.count,
+        schema_config,
+        output,
+        metadata_storage,
+        |index| match index {
+            0 => Ok(DynamicColumn::utf8(
                 0,
                 false,
                 None,
-                cols.id_offsets_bytes(),
-                cols.id_data_bytes(),
-            ),
-            row_count,
-            0,
-        ) && builder.add_column(
-            DynamicColumn::utf8(
+                columns.id_offsets_bytes(),
+                columns.id_data_bytes(),
+            )),
+            1 => Ok(DynamicColumn::utf8(
                 1,
                 false,
                 None,
-                cols.type_offsets_bytes(),
-                cols.type_data_bytes(),
-            ),
-            row_count,
-            0,
-        ) && builder.add_column(
-            DynamicColumn::int64(2, false, None, cols.timestamps_bytes()),
-            row_count,
-            0,
-        ) && builder.add_column(
-            DynamicColumn::binary(
+                columns.type_offsets_bytes(),
+                columns.type_data_bytes(),
+            )),
+            2 => Ok(DynamicColumn::int64(
+                2,
+                false,
+                None,
+                columns.timestamps_bytes(),
+            )),
+            3 => Ok(DynamicColumn::binary(
                 3,
                 true,
-                Some(cols.value_nulls_bytes()),
-                cols.value_offsets_bytes(),
-                cols.value_data_bytes(),
-            ),
-            row_count,
-            value_null_count,
-        );
-        if !ok {
-            return Err(IpcError::BufferTooSmall);
-        }
-        (
-            builder.body_length(),
-            builder.field_nodes().len(),
-            builder.buffer_descs().len(),
-        )
-    };
-
-    finish_stream(
-        output,
-        write_offset,
-        body_start,
-        row_count,
-        body_length,
-        metadata_storage,
-        node_count,
-        desc_count,
+                Some(columns.value_nulls_bytes()),
+                columns.value_offsets_bytes(),
+                columns.value_data_bytes(),
+            )),
+            _ => Err(IpcError::InvalidColumn),
+        },
+        |index| if index == 3 { value_null_count } else { 0 },
     )
 }
 
@@ -360,16 +385,14 @@ mod tests {
     use super::*;
     use crate::record_batch::{MetadataLimits, MetadataStorage};
     use crate::schema::{ArrowType, DynamicSchemaConfig, SignalSchemaField};
-
-    // test "IpcWriter writes EOS"
-    #[test]
-    fn ipc_writer_eos() {
-        let mut buffer = [0u8; 512];
-        let mut writer = IpcWriter::new(&mut buffer);
-        assert!(writer.write_eos());
-        assert_eq!(writer.bytes_written(), 8);
-        assert_eq!(writer.output(), &EOS_MARKER);
-    }
+    use arrow_array::{
+        Array, BinaryArray, BooleanArray, Float64Array, Int64Array, NullArray, StringArray,
+        UInt32Array,
+    };
+    use arrow_ipc::reader::StreamReader;
+    use arrow_ipc::writer::StreamWriter;
+    use arrow_schema::{DataType, Field, Schema};
+    use std::io::Cursor;
 
     fn base_fields() -> [SignalSchemaField; 4] {
         [
@@ -380,12 +403,30 @@ mod tests {
         ]
     }
 
-    fn fake_schema_bytes() -> Vec<u8> {
-        // Continuation + size prefix + 8 placeholder bytes: enough for the
-        // writer, which copies schema bytes verbatim.
-        vec![
-            0xFF, 0xFF, 0xFF, 0xFF, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ]
+    fn schema_bytes(fields: &[SignalSchemaField]) -> Vec<u8> {
+        let fields = fields
+            .iter()
+            .enumerate()
+            .map(|(index, metadata)| {
+                let data_type = match metadata.arrow_type {
+                    ArrowType::Null => DataType::Null,
+                    ArrowType::Int32 => DataType::Int32,
+                    ArrowType::Float64 => DataType::Float64,
+                    ArrowType::Binary => DataType::Binary,
+                    ArrowType::Utf8 => DataType::Utf8,
+                    ArrowType::Bool => DataType::Boolean,
+                    ArrowType::Int64 => DataType::Int64,
+                };
+                Field::new(format!("field_{index}"), data_type, metadata.is_nullable())
+            })
+            .collect::<Vec<_>>();
+        let mut bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut bytes, &Schema::new(fields)).unwrap();
+            writer.finish().unwrap();
+        }
+        bytes.truncate(bytes.len() - EOS_MARKER.len());
+        bytes
     }
 
     /// End-to-end: base and dynamic writers produce byte-identical streams
@@ -393,7 +434,7 @@ mod tests {
     #[test]
     fn base_and_dynamic_streams_are_byte_identical() {
         let fields = base_fields();
-        let config = DynamicSchemaConfig::new(&fake_schema_bytes(), &fields);
+        let config = DynamicSchemaConfig::new(&schema_bytes(&fields), &fields).unwrap();
 
         // Base path.
         let mut base = EventColumns::new(8);
@@ -442,7 +483,7 @@ mod tests {
             SignalSchemaField::new(ArrowType::Float64, true),
             SignalSchemaField::new(ArrowType::Bool, true),
         ];
-        let config = DynamicSchemaConfig::new(&fake_schema_bytes(), &fields);
+        let config = DynamicSchemaConfig::new(&schema_bytes(&fields), &fields).unwrap();
         let mut cols = DynamicColumns::new(&fields, 4);
         assert!(cols.begin_row());
         cols.append_utf8(0, b"row-1").unwrap();
@@ -476,15 +517,172 @@ mod tests {
     }
 
     #[test]
+    fn mixed_schema_with_null_type_round_trips_through_arrow_reader() {
+        let fields = [
+            SignalSchemaField::new(ArrowType::Int32, false),
+            SignalSchemaField::new(ArrowType::Float64, true),
+            SignalSchemaField::new(ArrowType::Int64, false),
+            SignalSchemaField::new(ArrowType::Binary, true),
+            SignalSchemaField::new(ArrowType::Utf8, true),
+            SignalSchemaField::new(ArrowType::Bool, true),
+            SignalSchemaField::new(ArrowType::Null, true),
+        ];
+        let schema = Schema::new(vec![
+            Field::new("u32", DataType::UInt32, false),
+            Field::new("f64", DataType::Float64, true),
+            Field::new("i64", DataType::Int64, false),
+            Field::new("binary", DataType::Binary, true),
+            Field::new("utf8", DataType::Utf8, true),
+            Field::new("bool", DataType::Boolean, true),
+            Field::new("null", DataType::Null, true),
+        ]);
+        let mut encoded_schema = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut encoded_schema, &schema).unwrap();
+            writer.finish().unwrap();
+        }
+        encoded_schema.truncate(encoded_schema.len() - EOS_MARKER.len());
+        let config = DynamicSchemaConfig::new(&encoded_schema, &fields).unwrap();
+        assert_eq!(config.compute_buffer_count(), 14);
+
+        let u32_data = [0u32, 1 << 31, u32::MAX]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let f64_data = [1.5f64, 0.0, f64::NEG_INFINITY]
+            .into_iter()
+            .flat_map(f64::to_le_bytes)
+            .collect::<Vec<_>>();
+        let i64_data = [i64::MIN, 0, i64::MAX]
+            .into_iter()
+            .flat_map(i64::to_le_bytes)
+            .collect::<Vec<_>>();
+        let binary_offsets = [0u32, 2, 2, 2]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let utf8_offsets = [0u32, 2, 2, 3]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let validity = [0b0000_0101];
+        let bool_data = [0b0000_0101];
+
+        let mut metadata = MetadataStorage::for_fields(&fields, MetadataLimits::default()).unwrap();
+        let mut output = vec![0u8; 8192];
+        let written = write_arrow_ipc_from_borrowed_columns(
+            3,
+            &config,
+            &mut output,
+            &mut metadata,
+            |index| match index {
+                0 => Ok(DynamicColumn::int32(0, false, None, &u32_data)),
+                1 => Ok(DynamicColumn::float64(1, true, Some(&validity), &f64_data)),
+                2 => Ok(DynamicColumn::int64(2, false, None, &i64_data)),
+                3 => Ok(DynamicColumn::binary(
+                    3,
+                    true,
+                    Some(&validity),
+                    &binary_offsets,
+                    &[0, 1],
+                )),
+                4 => Ok(DynamicColumn::utf8(
+                    4,
+                    true,
+                    Some(&validity),
+                    &utf8_offsets,
+                    "αz".as_bytes(),
+                )),
+                5 => Ok(DynamicColumn::boolean(5, true, Some(&validity), &bool_data)),
+                6 => Ok(DynamicColumn {
+                    field_idx: 6,
+                    arrow_type: ArrowType::Null,
+                    nullable: true,
+                    validity: None,
+                    data: &[],
+                    offsets: None,
+                }),
+                _ => Err(IpcError::InvalidColumn),
+            },
+            |index| match index {
+                1 | 3 | 4 | 5 => 1,
+                6 => 3,
+                _ => 0,
+            },
+        )
+        .unwrap();
+
+        let mut reader = StreamReader::try_new(Cursor::new(&output[..written]), None).unwrap();
+        assert_eq!(reader.schema().as_ref(), &schema);
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 3);
+
+        let u32s = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(u32s.values(), &[0, 1 << 31, u32::MAX]);
+        let floats = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(floats.value(0), 1.5);
+        assert!(floats.is_null(1));
+        assert_eq!(floats.value(2), f64::NEG_INFINITY);
+        let ints = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ints.values(), &[i64::MIN, 0, i64::MAX]);
+        let binary = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(binary.value(0), &[0, 1]);
+        assert!(binary.is_null(1));
+        assert_eq!(binary.value(2), &[]);
+        let utf8 = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(utf8.value(0), "α");
+        assert!(utf8.is_null(1));
+        assert_eq!(utf8.value(2), "z");
+        let booleans = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(booleans.value(0));
+        assert!(booleans.is_null(1));
+        assert!(booleans.value(2));
+        let nulls = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<NullArray>()
+            .unwrap();
+        assert_eq!(nulls.len(), 3);
+        assert_eq!(nulls.logical_null_count(), 3);
+        assert!(reader.next().is_none());
+    }
+
+    #[test]
     fn too_small_output_refuses() {
         let fields = base_fields();
-        let config = DynamicSchemaConfig::new(&fake_schema_bytes(), &fields);
+        let config = DynamicSchemaConfig::new(&schema_bytes(&fields), &fields).unwrap();
         let cols = DynamicColumns::new(&fields, 4);
         let mut meta = MetadataStorage::for_fields(&fields, MetadataLimits::default()).unwrap();
         let mut out = vec![0u8; 1024]; // < 4096 hard floor
         assert_eq!(
             write_arrow_ipc_from_dynamic_columns(&cols, &config, &mut out, &mut meta),
-            Err(IpcError::BufferTooSmall)
+            Err(IpcError::BufferTooSmall {
+                required: MIN_ARROW_OUTPUT_CAPACITY,
+            })
         );
     }
 }
