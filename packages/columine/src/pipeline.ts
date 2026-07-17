@@ -214,31 +214,19 @@ function createReduceStage(backend: ColumineBackend): ReduceStage {
   };
 }
 
-function createParseStage(parseBackend: ParseCompactBackend | null): ParseStage {
+function createParseStage(parseBackend: ParseCompactBackend): ParseStage {
   return {
     name: 'parse',
     parse(input: string | Uint8Array, config: ParseConfig): ParseResult {
-      if (!parseBackend) {
-        throw new Error(
-          'Parse stage requires a parse backend. ' +
-            'Call createPipeline({ parseBackend }) or use createPipelineWithParse().',
-        );
-      }
       return parseBackend.parse(input, config);
     },
   };
 }
 
-function createCompactStage(parseBackend: ParseCompactBackend | null): CompactStage {
+function createCompactStage(parseBackend: ParseCompactBackend): CompactStage {
   return {
     name: 'compact',
     encode(columns: ColumnInput[], schema: Uint8Array): Uint8Array {
-      if (!parseBackend) {
-        throw new Error(
-          'Compact stage requires a parse backend. ' +
-            'Call createPipeline({ parseBackend }) or use createPipelineWithParse().',
-        );
-      }
       return parseBackend.encode(columns, schema);
     },
   };
@@ -334,23 +322,22 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
 export interface PipelineOptions {
   /** Concrete reducer backend owned by this pipeline instance */
   backend: ColumineBackend;
-  /** Parse/Compact backend — if not provided, parse() and encode() will throw */
-  parseBackend?: ParseCompactBackend;
+  /** Concrete Parse/Compact backend owned by this pipeline instance */
+  parseBackend: ParseCompactBackend;
 }
 
 /**
  * Create a composed pipeline with all four stages.
  *
  * The Reduce and Undo stages use the concrete ColumineBackend supplied in
- * options. The Parse and Compact stages require a ParseCompactBackend — pass
- * one via options, or they will throw with a helpful error message.
+ * options. The Parse and Compact stages use the concrete ParseCompactBackend.
  *
- * @param options - Concrete reducer backend and optional Parse/Compact backend
+ * @param options - Concrete reducer and Parse/Compact backends
  * @returns All four pipeline stages
  */
 export function createPipeline(options: PipelineOptions): ColumineStages {
   const backend = options.backend;
-  const parseBackend = options.parseBackend ?? null;
+  const parseBackend = options.parseBackend;
 
   return {
     parse: createParseStage(parseBackend),

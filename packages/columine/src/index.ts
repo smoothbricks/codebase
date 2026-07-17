@@ -5,9 +5,9 @@
  * Stages: Parse | Reduce | Compact | Undo
  *
  * Usage:
- *   import { createPipeline, loadColumineWasm } from '@smoothbricks/columine';
- *   const backend = await loadColumineWasm();
- *   const stages = createPipeline({ backend });
+ *   import { createPipeline, loadColumineWasm, loadParseBackend } from '@smoothbricks/columine';
+ *   const [backend, parseBackend] = await Promise.all([loadColumineWasm(), loadParseBackend()]);
+ *   const stages = createPipeline({ backend, parseBackend });
  */
 // Parse/Compact backend (event_processor WASM bridge)
 export type { EventProcessorWasmExports, ParseCompactBackend } from './parse-backend.js';

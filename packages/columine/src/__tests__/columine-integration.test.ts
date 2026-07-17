@@ -23,6 +23,7 @@ import {
   HEADER_SIZE,
   MAGIC,
   Opcode,
+  type ParseCompactBackend,
   PROGRAM_HASH_PREFIX,
   type ReducerProgram,
   SlotType,
@@ -36,6 +37,12 @@ import { loadColumineWasm } from '../wasm-backend.js';
 
 const WASM_PATH = new URL('../../dist/columine.wasm', import.meta.url);
 const WASM_EXISTS = existsSync(WASM_PATH.pathname);
+const TEST_PARSE_BACKEND: ParseCompactBackend = {
+  backend: 'test-parse',
+  parse: () => ({ arrowIpc: new Uint8Array(0), eventCount: 0 }),
+  encode: () => new Uint8Array(0),
+  dispose: () => {},
+};
 
 // =============================================================================
 // BytecodeBuilder (minimal, local to avoid circular dep on axe-runtime)
@@ -311,7 +318,7 @@ describe('SC2: Undo stage for event cancellation', () => {
   });
 
   it.skipIf(!WASM_EXISTS)('checkpoint and rollback restores pre-batch state', async () => {
-    const stages = createPipeline({ backend });
+    const stages = createPipeline({ backend, parseBackend: TEST_PARSE_BACKEND });
 
     // Build a simple SUM program (SUM reads Float64 values)
     const bytecode = buildProgram({
@@ -342,7 +349,7 @@ describe('SC2: Undo stage for event cancellation', () => {
   });
 
   it.skipIf(!WASM_EXISTS)('commit makes changes permanent', async () => {
-    const stages = createPipeline({ backend });
+    const stages = createPipeline({ backend, parseBackend: TEST_PARSE_BACKEND });
 
     const bytecode = buildProgram({
       slots: [{ type: 'aggregate', aggType: AggType.SUM }],
@@ -393,7 +400,7 @@ describe('SC3: Pipeline composition', () => {
       deserialize: () => ({ _brand: 'ColumineStateHandle' }),
     };
 
-    const stages = createPipeline({ backend: mockBackend });
+    const stages = createPipeline({ backend: mockBackend, parseBackend: TEST_PARSE_BACKEND });
 
     // All four stages exist
     expect(stages.parse).toBeDefined();
@@ -429,7 +436,7 @@ describe('SC3: Pipeline composition', () => {
       deserialize: () => ({ _brand: 'ColumineStateHandle' }),
     };
 
-    const stages = createPipeline({ backend: mockBackend });
+    const stages = createPipeline({ backend: mockBackend, parseBackend: TEST_PARSE_BACKEND });
 
     const mockState = { _brand: 'ColumineStateHandle' as const };
     const mockProgram: ReducerProgram = { bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] };
@@ -460,8 +467,8 @@ describe('SC3: Pipeline composition', () => {
       serialize: () => new Uint8Array(0),
       deserialize: () => ({ _brand: 'ColumineStateHandle' }),
     });
-    const first = createPipeline({ backend: createMockBackend('first') });
-    const second = createPipeline({ backend: createMockBackend('second') });
+    const first = createPipeline({ backend: createMockBackend('first'), parseBackend: TEST_PARSE_BACKEND });
+    const second = createPipeline({ backend: createMockBackend('second'), parseBackend: TEST_PARSE_BACKEND });
     const state = { _brand: 'ColumineStateHandle' as const };
     const program: ReducerProgram = { bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] };
 
@@ -472,7 +479,15 @@ describe('SC3: Pipeline composition', () => {
     expect(calls).toEqual(['first', 'second', 'first']);
   });
 
-  it('parse stage throws helpful error without parse backend', () => {
+  it('parse stage delegates to the supplied parse backend', () => {
+    let parseCalls = 0;
+    const parseBackend: ParseCompactBackend = {
+      ...TEST_PARSE_BACKEND,
+      parse: () => {
+        parseCalls += 1;
+        return { arrowIpc: new Uint8Array([1]), eventCount: 1 };
+      },
+    };
     const mockBackend: ColumineBackend = {
       backend: 'mock',
       loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
@@ -487,19 +502,18 @@ describe('SC3: Pipeline composition', () => {
       serialize: () => new Uint8Array(0),
       deserialize: () => ({ _brand: 'ColumineStateHandle' }),
     };
+    const stages = createPipeline({ backend: mockBackend, parseBackend });
 
-    // No parse backend provided
-    const stages = createPipeline({ backend: mockBackend });
+    const result = stages.parse.parse('[]', {
+      schemaBytes: new Uint8Array(0),
+      fieldMetadata: new Uint8Array(0),
+    });
 
-    expect(() => {
-      stages.parse.parse('[]', {
-        schemaBytes: new Uint8Array(0),
-        fieldMetadata: new Uint8Array(0),
-      });
-    }).toThrow(/parse backend/i);
+    expect(parseCalls).toBe(1);
+    expect(result.eventCount).toBe(1);
   });
 
-  it('stages are independently usable (reduce works without parse)', () => {
+  it('stages are independently usable', () => {
     let reduceCalled = false;
 
     const mockBackend: ColumineBackend = {
@@ -520,18 +534,17 @@ describe('SC3: Pipeline composition', () => {
       deserialize: () => ({ _brand: 'ColumineStateHandle' }),
     };
 
-    const stages = createPipeline({ backend: mockBackend });
+    const stages = createPipeline({ backend: mockBackend, parseBackend: TEST_PARSE_BACKEND });
 
-    // Reduce works without parse backend
+    // Reduce and Parse use their respective explicit backends.
     const mockState = { _brand: 'ColumineStateHandle' as const };
     const mockProgram: ReducerProgram = { bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] };
     stages.reduce.executeBatch(mockState, mockProgram, [], 0);
     expect(reduceCalled).toBe(true);
 
-    // Parse throws because no parse backend provided
-    expect(() => {
-      stages.parse.parse('[]', { schemaBytes: new Uint8Array(0), fieldMetadata: new Uint8Array(0) });
-    }).toThrow();
+    expect(
+      stages.parse.parse('[]', { schemaBytes: new Uint8Array(0), fieldMetadata: new Uint8Array(0) }).eventCount,
+    ).toBe(0);
   });
 });
 
