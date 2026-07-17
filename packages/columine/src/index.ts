@@ -4,17 +4,11 @@
  * Generic columnar processing pipeline for Arrow column data.
  * Stages: Parse | Reduce | Compact | Undo
  *
- * Usage standalone:
- *   import { getBackend } from '@smoothbricks/columine';
- *   const backend = await getBackend(); // lazy-loads WASM
- *
- * Usage via axe-runtime (superset binary injection):
- *   import { setBackend } from '@smoothbricks/columine';
- *   setBackend(axeVmInstance); // AxeVM implements ColumineBackend
+ * Usage:
+ *   import { createPipeline, loadColumineWasm } from '@smoothbricks/columine';
+ *   const backend = await loadColumineWasm();
+ *   const stages = createPipeline({ backend });
  */
-
-// Backend dependency injection
-export { getBackend, hasBackend, resetBackend, setBackend, setBackendLoader } from './backend.js';
 // Parse/Compact backend (event_processor WASM bridge)
 export type { EventProcessorWasmExports, ParseCompactBackend } from './parse-backend.js';
 export { createParseCompactWasmBackend, loadParseBackend } from './parse-backend.js';
