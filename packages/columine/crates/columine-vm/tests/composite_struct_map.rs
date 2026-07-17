@@ -151,17 +151,28 @@ fn execute_u32(
     }
 }
 
+struct MaxI64x2Columns<'a> {
+    key1: &'a [u32],
+    key2: &'a [u32],
+    payload: &'a [u32],
+    comparison1: &'a [i64],
+    comparison2: &'a [i64],
+}
+
 fn execute_max_i64x2(
     vm: &mut Vm,
     state: &mut [u8],
     program: &[u8],
-    key1: &[u32],
-    key2: &[u32],
-    payload: &[u32],
-    comparison1: &[i64],
-    comparison2: &[i64],
+    columns: MaxI64x2Columns<'_>,
     delta: bool,
 ) -> u32 {
+    let MaxI64x2Columns {
+        key1,
+        key2,
+        payload,
+        comparison1,
+        comparison2,
+    } = columns;
     let len = key1.len();
     assert_eq!(key2.len(), len);
     assert_eq!(payload.len(), len);
@@ -305,8 +316,8 @@ fn growth_rehash_preserves_same_first_lane_pairs_and_checkpoint_forks() {
     let mut grown = vec![0u8; grown_size as usize];
     grow_state(&state, &mut grown, 0).unwrap();
     assert_eq!(StructMap2Slot::bind(&grown, 0).capacity, old_capacity * 2);
-    assert_eq!(pair_row(&grown, 5, 10).is_some(), true);
-    assert_eq!(pair_row(&grown, 5, 11).is_some(), true);
+    assert!(pair_row(&grown, 5, 10).is_some());
+    assert!(pair_row(&grown, 5, 11).is_some());
 
     let checkpoint = grown.clone();
     let mut fork = checkpoint.clone();
@@ -467,11 +478,13 @@ fn max_i64x2_uses_strict_signed_lexicographic_order_without_noop_undo() {
             &mut vm,
             &mut state,
             &program,
-            &key1,
-            &key2,
-            &payload,
-            &comparison1,
-            &comparison2,
+            MaxI64x2Columns {
+                key1: &key1,
+                key2: &key2,
+                payload: &payload,
+                comparison1: &comparison1,
+                comparison2: &comparison2,
+            },
             false,
         )
     );
@@ -483,11 +496,13 @@ fn max_i64x2_uses_strict_signed_lexicographic_order_without_noop_undo() {
             &mut vm,
             &mut state,
             &program,
-            &[7],
-            &[41],
-            &[70],
-            &[-1],
-            &[i64::MAX],
+            MaxI64x2Columns {
+                key1: &[7],
+                key2: &[41],
+                payload: &[70],
+                comparison1: &[-1],
+                comparison2: &[i64::MAX],
+            },
             false,
         )
     );
@@ -503,11 +518,13 @@ fn max_i64x2_uses_strict_signed_lexicographic_order_without_noop_undo() {
             &mut vm,
             &mut state,
             &program,
-            &[7, 7],
-            &[40, 40],
-            &[80, 90],
-            &[i64::MAX, -1],
-            &[i64::MIN, i64::MAX],
+            MaxI64x2Columns {
+                key1: &[7, 7],
+                key2: &[40, 40],
+                payload: &[80, 90],
+                comparison1: &[i64::MAX, -1],
+                comparison2: &[i64::MIN, i64::MAX],
+            },
             true,
         )
     );
@@ -521,11 +538,13 @@ fn max_i64x2_uses_strict_signed_lexicographic_order_without_noop_undo() {
             &mut vm,
             &mut state,
             &program,
-            &[7],
-            &[40],
-            &[100],
-            &[i64::MAX],
-            &[i64::MAX],
+            MaxI64x2Columns {
+                key1: &[7],
+                key2: &[40],
+                payload: &[100],
+                comparison1: &[i64::MAX],
+                comparison2: &[i64::MAX],
+            },
             true,
         )
     );
@@ -543,11 +562,13 @@ fn max_i64x2_uses_strict_signed_lexicographic_order_without_noop_undo() {
             &mut vm,
             &mut fork,
             &program,
-            &[7],
-            &[41],
-            &[71],
-            &[0],
-            &[i64::MIN],
+            MaxI64x2Columns {
+                key1: &[7],
+                key2: &[41],
+                payload: &[71],
+                comparison1: &[0],
+                comparison2: &[i64::MIN],
+            },
             false,
         )
     );
@@ -594,11 +615,13 @@ fn max_i64x2_rejected_batch_rolls_back_and_growth_rehashes_collisions() {
             &mut vm,
             &mut state,
             &program,
-            &[9],
-            &[1],
-            &[10],
-            &[1],
-            &[1],
+            MaxI64x2Columns {
+                key1: &[9],
+                key2: &[1],
+                payload: &[10],
+                comparison1: &[1],
+                comparison2: &[1],
+            },
             true,
         )
     );
@@ -616,11 +639,13 @@ fn max_i64x2_rejected_batch_rolls_back_and_growth_rehashes_collisions() {
             &mut vm,
             &mut state,
             &program,
-            &key1,
-            &key2,
-            &payload,
-            &comparison1,
-            &comparison2,
+            MaxI64x2Columns {
+                key1: &key1,
+                key2: &key2,
+                payload: &payload,
+                comparison1: &comparison1,
+                comparison2: &comparison2,
+            },
             true,
         )
     );
@@ -650,11 +675,13 @@ fn max_i64x2_rejected_batch_rolls_back_and_growth_rehashes_collisions() {
             &mut vm,
             &mut state,
             &program,
-            &[77, 77],
-            &[second1, second2],
-            &[201, 202],
-            &[3, 4],
-            &[5, 6],
+            MaxI64x2Columns {
+                key1: &[77, 77],
+                key2: &[second1, second2],
+                payload: &[201, 202],
+                comparison1: &[3, 4],
+                comparison2: &[5, 6],
+            },
             false,
         )
     );
