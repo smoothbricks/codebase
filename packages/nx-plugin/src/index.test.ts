@@ -184,7 +184,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('infers cargo workspace targets including explicitly named wasm crate builds', async () => {
+  //#region smoo!n/rust-output-target-inference
+  it('infers generic cargo workspace targets without any rust output targets', async () => {
     const workspace = await createWorkspace();
     try {
       await workspace.write('packages/ferris/package.json', '{"name":"ferris"}\n');
@@ -200,17 +201,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
 
-      expect(Object.keys(targets).sort()).toEqual([
-        'bench',
-        'build',
-        'cargo-lint',
-        'cargo-test',
-        'cargo-wasm',
-        'clean',
-        'lint',
-        'mutation',
-        'test',
-      ]);
+      // Even a cdylib crate named *-wasm infers no cargo-wasm: rust output
+      // targets are declared package-locally, never derived from crate metadata.
+      expect(Object.keys(targets).sort()).toEqual(['bench', 'cargo-lint', 'cargo-test', 'lint', 'mutation', 'test']);
       expect(targets['cargo-test']?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
       expect(targets['cargo-test']?.options).toMatchObject({
         command: 'cargo test --workspace',
@@ -234,19 +227,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       });
       expect(targets.mutation?.cache).toBe(false);
       expect(targets.mutation?.options).toMatchObject({ command: 'cargo mutants --workspace' });
-      expect(targets['cargo-wasm']?.outputs).toEqual(['{projectRoot}/dist/**/*.wasm']);
-      expect(targets['cargo-wasm']?.options).toMatchObject({
-        commands: [
-          'cargo build --profile wasm-release --target wasm32-unknown-unknown -p ferris-wasm && mkdir -p dist && cp target/wasm32-unknown-unknown/wasm-release/ferris_wasm.wasm dist/ferris_wasm.wasm',
-        ],
-      });
-      expect(targets['cargo-wasm']?.configurations?.development).toEqual({
-        commands: [
-          'cargo build --target wasm32-unknown-unknown -p ferris-wasm && mkdir -p dist && cp target/wasm32-unknown-unknown/debug/ferris_wasm.wasm dist/ferris_wasm.wasm',
-        ],
-      });
-      // cargo-wasm matches the *-wasm build-output pattern → aggregate build/clean exist
-      expect(targets.build?.executor).toBe('nx:noop');
+      expect(targets.bench?.options).toMatchObject({ command: 'cargo bench --workspace' });
     } finally {
       await workspace.cleanup();
     }
@@ -273,7 +254,45 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('lets explicit nx.targets override wasm inference and skips non-workspace Cargo.toml', async () => {
+  it('keeps an explicit package-local cargo-wasm target singular and feeding the aggregate build', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write(
+        'packages/columine/package.json',
+        JSON.stringify({
+          name: 'columine',
+          nx: {
+            targets: {
+              'cargo-wasm': { executor: 'nx:run-commands', outputs: ['{projectRoot}/dist/**/*.wasm'] },
+            },
+          },
+        }),
+      );
+      await workspace.write(
+        'packages/columine/Cargo.toml',
+        '[workspace]\nmembers = ["crates/columine-wasm"]\n\n[profile.wasm-release]\ninherits = "release"\n',
+      );
+      await workspace.write(
+        'packages/columine/crates/columine-wasm/Cargo.toml',
+        '[package]\nname = "columine-wasm"\n\n[lib]\ncrate-type = ["cdylib", "rlib"]\n',
+      );
+
+      const targets = await inferProjectTargets(workspace, 'packages/columine/package.json');
+
+      // The declared target stays the only cargo-wasm: inference never emits a
+      // duplicate for Nx to merge, even with a cdylib *-wasm member crate present.
+      expect(targets['cargo-wasm']).toBeUndefined();
+      // Its *-wasm output-family name feeds the aggregate build and clean.
+      expect(buildOutputDependencies).toContain('*-wasm');
+      expect(targets.build?.executor).toBe('nx:noop');
+      expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
+      expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('lets explicit nx.targets suppress cargo inference and skips non-workspace Cargo.toml', async () => {
     const workspace = await createWorkspace();
     try {
       await workspace.write(
@@ -300,6 +319,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.cleanup();
     }
   });
+  //#endregion
 });
 
 async function createWorkspace(): Promise<WorkspaceFixture> {

@@ -234,8 +234,9 @@ This is an Nx-based monorepo using Bun as the package manager, with devenv/diren
   `GITHUB_ENV`. JavaScript tools import the full TypeScript API from `typescript@^6.0.3`. Keep both: TypeScript 7 under
   the unscoped name breaks Nx API calls.
 - **Where targets come from:** `tsc-js` comes from `tsconfig.lib.json`, `typecheck-tests` from `tsconfig.test.json`, and
-  Cargo targets from a workspace-root `Cargo.toml`. `cargo-wasm` is inferred only for `cdylib` member crates. Aggregate
-  `build` exists only when concrete build targets exist.
+  Cargo targets from a workspace-root `Cargo.toml`. Rust output targets like `cargo-wasm` and `cargo-napi` are never
+  inferred — declare them in `package.json` `nx.targets`. Aggregate `build` exists only when concrete build targets
+  exist.
 - **Bun test packages require test typechecking:** `bun test` executes tests without typechecking, so packages that use
   it must have a no-emit `tsconfig.test.json` that infers `typecheck-tests`.
 - **Nx target names are `{tool}-{output}` names** - use `tsc-js`, `tsdown-js`, and `cargo-wasm`; `build` and `lint` are

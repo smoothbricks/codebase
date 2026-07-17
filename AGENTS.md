@@ -188,7 +188,9 @@ Concrete target sources:
   because Bun executes tests without typechecking.
 - `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`: `@smoothbricks/nx-plugin`, from a workspace-root
   `Cargo.toml`.
-- `cargo-wasm`: `@smoothbricks/nx-plugin`, when a Cargo workspace contains `cdylib` member crates.
+- `cargo-wasm`, `cargo-napi`, and other Rust output targets: never inferred from crate metadata such as `cdylib`
+  crate-types (a native N-API cdylib is not a wasm build). Declare them package-locally in `package.json` `nx.targets`;
+  their `*-wasm` / `*-napi` / `*-native` output-family names feed the aggregate `build` and `clean`.
 - `build`: aggregate inferred only when at least one concrete build target exists.
 - `lint`: aggregate validation target, never a formatter.
 
