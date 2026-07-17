@@ -1,7 +1,16 @@
 import { describe, expect, it } from 'bun:test';
 
 import { parseReducerProgram } from '../reducer-bytecode.js';
-import { MAGIC, PROGRAM_HASH_PREFIX, SlotType, SlotTypeFlag, StructFieldType, TtlStartOf } from '../types.js';
+import {
+  AggType,
+  MAGIC,
+  Opcode,
+  PROGRAM_HASH_PREFIX,
+  SlotType,
+  SlotTypeFlag,
+  StructFieldType,
+  TtlStartOf,
+} from '../types.js';
 
 function buildProgram(initCode: number[], numSlots: number): Uint8Array {
   const headerSize = 14;
@@ -114,5 +123,68 @@ describe('parseReducerProgram', () => {
       throw new Error('invariant: expected hashmap slot');
     }
     expect(slot.storesTimestamps).toBe(true);
+  });
+
+  it('decodes explicit U32, F64, and I64 scalar metadata', () => {
+    const initCode = [
+      Opcode.SLOT_DEF,
+      0,
+      SlotType.SCALAR,
+      AggType.SCALAR_U32,
+      0,
+      Opcode.SLOT_DEF,
+      1,
+      SlotType.SCALAR,
+      AggType.SCALAR_F64,
+      0,
+      Opcode.SLOT_DEF,
+      2,
+      SlotType.SCALAR,
+      AggType.SCALAR_I64,
+      0,
+      Opcode.HALT,
+    ];
+
+    expect(parseReducerProgram(buildProgram(initCode, 3)).slotDefs).toEqual([
+      { type: SlotType.SCALAR, aggType: AggType.SCALAR_U32 },
+      { type: SlotType.SCALAR, aggType: AggType.SCALAR_F64 },
+      { type: SlotType.SCALAR, aggType: AggType.SCALAR_I64 },
+    ]);
+  });
+
+  it('rejects unknown scalar metadata', () => {
+    const initCode = [Opcode.SLOT_DEF, 0, SlotType.SCALAR, 7, 0, Opcode.HALT];
+    expect(() => parseReducerProgram(buildProgram(initCode, 1))).toThrow('unknown scalar type 7');
+  });
+
+  it('rejects missing, duplicate, and out-of-range slot definitions', () => {
+    expect(() =>
+      parseReducerProgram(buildProgram([Opcode.SLOT_DEF, 0, SlotType.HASHSET, 4, 0, Opcode.HALT], 2)),
+    ).toThrow('missing slot definition 1');
+
+    expect(() =>
+      parseReducerProgram(
+        buildProgram(
+          [Opcode.SLOT_DEF, 0, SlotType.HASHSET, 4, 0, Opcode.SLOT_DEF, 0, SlotType.HASHSET, 4, 0, Opcode.HALT],
+          1,
+        ),
+      ),
+    ).toThrow('duplicate slot definition 0');
+
+    expect(() =>
+      parseReducerProgram(buildProgram([Opcode.SLOT_DEF, 1, SlotType.HASHSET, 4, 0, Opcode.HALT], 1)),
+    ).toThrow('slot index 1 out of range');
+  });
+
+  it('distinguishes HALT from unknown and truncated init instructions', () => {
+    expect(() => parseReducerProgram(buildProgram([Opcode.SLOT_DEF, 0, SlotType.HASHSET, 4, 0, 0xfe], 1))).toThrow(
+      'unknown init opcode 254',
+    );
+    expect(() => parseReducerProgram(buildProgram([Opcode.SLOT_DEF, 0, SlotType.HASHSET], 1))).toThrow(
+      'truncated SLOT_DEF operands',
+    );
+    expect(() => parseReducerProgram(buildProgram([Opcode.SLOT_DEF, 0, SlotType.HASHSET, 4, 0], 1))).toThrow(
+      'init section missing HALT',
+    );
   });
 });

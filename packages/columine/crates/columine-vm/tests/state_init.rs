@@ -5,9 +5,9 @@
 //! mirrors.
 
 use columine_types::types::{
-    DERIVED_FACT_EMPTY_IDENTITY, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode,
-    PROGRAM_HASH_PREFIX, SLOT_META_SIZE, STATE_HEADER_SIZE, STATE_MAGIC, StateHeaderOffset,
-    StructFieldType, align8, hash_key,
+    AggType, DERIVED_FACT_EMPTY_IDENTITY, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode,
+    Opcode, PROGRAM_HASH_PREFIX, SLOT_META_SIZE, STATE_HEADER_SIZE, STATE_MAGIC, SlotType,
+    StateHeaderOffset, StructFieldType, align8, hash_key,
 };
 use columine_vm::state_init::{
     EVICTION_ENTRY_SIZE, arena_initial_capacity_64, calculate_grown_state_size,
@@ -124,6 +124,36 @@ fn build_hashmap_and_condition_tree_program(derived_capacity: u16) -> [u8; 64] {
     prog
 }
 
+fn build_init_program(num_slots: u8, init: &[u8]) -> Vec<u8> {
+    let mut prog = vec![0u8; HASH_PREFIX + 14];
+    {
+        let content = &mut prog[HASH_PREFIX..];
+        content[0..4].copy_from_slice(&0x3145_5841u32.to_le_bytes());
+        content[4] = 1;
+        content[6] = num_slots;
+        content[10..12].copy_from_slice(&(init.len() as u16).to_le_bytes());
+    }
+    prog.extend_from_slice(init);
+    prog
+}
+
+fn assert_invalid_init_without_mutation(num_slots: u8, init: &[u8]) {
+    let prog = build_init_program(num_slots, init);
+    assert_eq!(calculate_state_size(&prog), 0);
+
+    let mut state = vec![0xa5; 256];
+    let before = state.clone();
+    assert_eq!(
+        init_state(&mut state, &prog),
+        Err(ErrorCode::InvalidProgram)
+    );
+    assert_eq!(state, before);
+    assert_eq!(
+        reset_state(&mut state, &prog),
+        Err(ErrorCode::InvalidProgram)
+    );
+    assert_eq!(state, before);
+}
 /// Probe-read a u32 hashmap value the way vm_map_get does.
 fn map_get(state: &[u8], offset: u32, cap: u32, key: u32) -> Option<u32> {
     let mut pos = hash_key(key, cap);
@@ -461,6 +491,100 @@ fn calculate_state_size_rejects_bad_magic_and_short_programs() {
     assert_eq!(calculate_state_size(&[0u8; 8]), 0);
 }
 
+#[test]
+fn scalar_slot_metadata_accepts_only_explicit_u32_f64_and_i64_subtypes() {
+    for subtype in [AggType::ScalarU32, AggType::ScalarF64, AggType::ScalarI64] {
+        let prog = build_init_program(
+            1,
+            &[
+                Opcode::SlotDef as u8,
+                0,
+                SlotType::Scalar as u8,
+                subtype as u8,
+                0,
+                Opcode::Halt as u8,
+            ],
+        );
+        let size = calculate_state_size(&prog);
+        assert!(size > 0);
+        let mut state = vec![0u8; size as usize];
+        init_state(&mut state, &prog).expect("valid scalar metadata");
+        assert_eq!(
+            state[(STATE_HEADER_SIZE + 12) as usize] & 0x0f,
+            SlotType::Scalar as u8
+        );
+        assert_eq!(state[(STATE_HEADER_SIZE + 13) as usize], subtype as u8);
+    }
+}
+
+#[test]
+fn malformed_init_is_rejected_before_state_mutation() {
+    assert_invalid_init_without_mutation(
+        1,
+        &[
+            Opcode::SlotDef as u8,
+            0,
+            SlotType::Scalar as u8,
+            7,
+            0,
+            Opcode::Halt as u8,
+        ],
+    );
+    assert_invalid_init_without_mutation(
+        1,
+        &[
+            Opcode::SlotDef as u8,
+            0,
+            SlotType::HashSet as u8,
+            4,
+            0,
+            0xfe,
+        ],
+    );
+    assert_invalid_init_without_mutation(
+        2,
+        &[
+            Opcode::SlotDef as u8,
+            0,
+            SlotType::HashSet as u8,
+            4,
+            0,
+            Opcode::Halt as u8,
+        ],
+    );
+    assert_invalid_init_without_mutation(
+        1,
+        &[
+            Opcode::SlotDef as u8,
+            0,
+            SlotType::HashSet as u8,
+            4,
+            0,
+            Opcode::SlotDef as u8,
+            0,
+            SlotType::HashSet as u8,
+            4,
+            0,
+            Opcode::Halt as u8,
+        ],
+    );
+    assert_invalid_init_without_mutation(
+        1,
+        &[
+            Opcode::SlotDef as u8,
+            1,
+            SlotType::HashSet as u8,
+            4,
+            0,
+            Opcode::Halt as u8,
+        ],
+    );
+    assert_invalid_init_without_mutation(1, &[Opcode::SlotDef as u8, 0, SlotType::HashSet as u8]);
+    assert_invalid_init_without_mutation(
+        1,
+        &[Opcode::SlotDef as u8, 0, SlotType::HashSet as u8, 4, 0],
+    );
+}
 // TTL sizing composition: primary + align8'd eviction index (+ evicted buffer).
 #[test]
 fn calculate_state_size_ttl_hashset_adds_eviction_buffers() {
@@ -698,9 +822,12 @@ proptest! {
         cap in 0u8..64,
         scribble in proptest::collection::vec(any::<u8>(), 1..64),
     ) {
-        // For AGGREGATE (0x02) / SCALAR (0x05), cap_lo is the AggType byte —
-        // keep it in the valid range.
-        let cap_lo = if flags == 0x02 || flags == 0x05 { 1 + (cap % 5) } else { cap };
+        // Aggregate and scalar slots use disjoint explicit AggType subranges.
+        let cap_lo = match flags {
+            0x02 => 1 + (cap % 5),
+            0x05 => 8 + (cap % 3),
+            _ => cap,
+        };
         let prog = build_single_slot_program(flags, cap_lo, 0);
         let size = calculate_state_size(&prog) as usize;
         prop_assert!(size > 0);
