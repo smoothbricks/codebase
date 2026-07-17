@@ -7,11 +7,10 @@
  * or Compact without Reduce. axe-runtime composes columine's pipeline
  * with RETE as an additional stage.
  *
- * Usage:
- *   const stages = createPipeline({ backend });
+ *   const stages = createPipeline({ backend, parseBackend });
  *   const { arrowIpc, eventCount } = stages.parse.parse(json, config);
  *   stages.reduce.executeBatch(state, program, columns, batchLen);
- *   const output = stages.compact.encode(columns, schema);
+ *   const output = stages.compact.encode(batch);
  *   const token = stages.undo.checkpoint(state);
  *   stages.undo.rollback(state, token);
  */
@@ -23,13 +22,44 @@ import type { ColumineBackend, ColumnInput, ReducerProgram, StateHandle } from '
 // Configuration Types
 // =============================================================================
 
-export interface ParseConfig {
-  /** Pre-computed Arrow schema bytes (from extractSchemaMessage / Flechette) */
-  schemaBytes: Uint8Array;
-  /** Field metadata array — 4 bytes per field: [ArrowType, nullable, pad, pad] */
-  fieldMetadata: Uint8Array;
-  /** Field names for JSON key matching (required for schemas with value.* fields) */
-  fieldNames?: string[];
+/** Schema input shared by Parse and Compact. */
+export interface EncodedArrowSchema {
+  /** One complete framed Arrow IPC Schema message. */
+  readonly schemaBytes: Uint8Array;
+  /** Four bytes per field: [physicalType, nullable ? 1 : 0, 0, 0]. */
+  readonly fieldMetadata: Uint8Array;
+}
+
+export interface ParseConfig extends EncodedArrowSchema {
+  /** Field names for JSON key matching (required for schemas with value.* fields). */
+  readonly fieldNames?: readonly string[];
+}
+
+/** A physical Arrow column accepted by Compact. */
+export type CompactColumn =
+  | { readonly kind: 'null' }
+  | { readonly kind: 'u32'; readonly data: Uint32Array; readonly validity?: Uint8Array }
+  | { readonly kind: 'f64'; readonly data: Float64Array; readonly validity?: Uint8Array }
+  | { readonly kind: 'i64'; readonly data: BigInt64Array; readonly validity?: Uint8Array }
+  | { readonly kind: 'bool'; readonly data: Uint8Array; readonly validity?: Uint8Array }
+  | {
+      readonly kind: 'binary';
+      readonly offsets: Uint32Array;
+      readonly data: Uint8Array;
+      readonly validity?: Uint8Array;
+    }
+  | {
+      readonly kind: 'utf8';
+      readonly offsets: Uint32Array;
+      readonly data: Uint8Array;
+      readonly validity?: Uint8Array;
+    };
+
+/** One complete record batch for Compact encoding. */
+export interface CompactBatch {
+  readonly rowCount: number;
+  readonly schema: EncodedArrowSchema;
+  readonly columns: readonly CompactColumn[];
 }
 
 export interface ParseResult {
@@ -81,18 +111,14 @@ export interface ReduceStage {
   executeBatch(state: StateHandle, program: ReducerProgram, columns: ColumnInput[], batchLen: number): number;
 }
 
-/** Compact: Arrow columns -> Arrow IPC output bytes */
+/** Compact: typed Arrow columns -> one caller-owned Arrow IPC stream */
 export interface CompactStage {
   readonly name: 'compact';
   /**
-   * Encode Arrow columns into Arrow IPC bytes using the parse backend.
-   * Produces a record batch from raw column data.
-   *
-   * @param columns - Column data to encode
-   * @param schema - Pre-computed Arrow schema bytes
-   * @returns Arrow IPC record batch bytes
+   * Encode one validated physical batch through the native event processor.
+   * The returned exact-length byte array never aliases WASM memory.
    */
-  encode(columns: ColumnInput[], schema: Uint8Array): Uint8Array;
+  encode(batch: CompactBatch): Uint8Array;
 }
 
 /** Undo: Roll back speculative state changes via undo log */
@@ -184,8 +210,8 @@ function createParseStage(parseBackend: ParseCompactBackend): ParseStage {
 function createCompactStage(parseBackend: ParseCompactBackend): CompactStage {
   return {
     name: 'compact',
-    encode(columns: ColumnInput[], schema: Uint8Array): Uint8Array {
-      return parseBackend.encode(columns, schema);
+    encode(batch: CompactBatch): Uint8Array {
+      return parseBackend.encode(batch);
     },
   };
 }

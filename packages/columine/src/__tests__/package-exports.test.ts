@@ -28,7 +28,8 @@ describe('package export contract', () => {
     const mod = await importDeclaredModule(manifest, packageUrl, '.');
 
     expect(typeof mod.createPipeline).toBe('function');
-    expect(typeof mod.getBackend).toBe('function');
+    expect(typeof mod.createParseCompactWasmBackend).toBe('function');
+    expect('getBackend' in mod).toBe(false);
     expect(typeof mod.parseReducerProgram).toBe('function');
   });
 });
