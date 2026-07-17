@@ -8,7 +8,7 @@
  * Phase 29-05: Proves undo correctness via pipeline integration.
  */
 
-import { afterEach, beforeAll, describe, expect, it } from 'bun:test';
+import { beforeAll, describe, expect, it } from 'bun:test';
 import { existsSync } from 'node:fs';
 
 import {
@@ -21,9 +21,7 @@ import {
   MAGIC,
   Opcode,
   PROGRAM_HASH_PREFIX,
-  resetBackend,
   SlotType,
-  setBackend,
   ValueType,
 } from '../index.js';
 import { loadColumineWasm } from '../wasm-backend.js';
@@ -63,6 +61,7 @@ function buildProgram(opts: {
         break;
     }
   }
+  initCode.push(Opcode.HALT);
 
   const reduceCode = [...opts.reduceOps, Opcode.HALT];
   const contentLen = HEADER_SIZE + initCode.length + reduceCode.length;
@@ -125,17 +124,12 @@ describe('Pipeline undo integration', () => {
     backend = await loadColumineWasm(WASM_PATH);
   });
 
-  afterEach(() => {
-    resetBackend();
-  });
-
   // ---------------------------------------------------------------------------
   // 1. checkpoint + commit (no rollback)
   // ---------------------------------------------------------------------------
 
   it.skipIf(!WASM_EXISTS)('checkpoint + commit keeps HashMap inserts', async () => {
-    setBackend(backend);
-    const stages = await createPipeline();
+    const stages = createPipeline({ backend });
 
     const bytecode = buildProgram({
       slots: [{ type: 'hashmap', capacity: 64 }],
@@ -172,8 +166,7 @@ describe('Pipeline undo integration', () => {
   // ---------------------------------------------------------------------------
 
   it.skipIf(!WASM_EXISTS)('rollback restores HashMap to pre-checkpoint state', async () => {
-    setBackend(backend);
-    const stages = await createPipeline();
+    const stages = createPipeline({ backend });
 
     const bytecode = buildProgram({
       slots: [{ type: 'hashmap', capacity: 64 }],
@@ -238,8 +231,7 @@ describe('Pipeline undo integration', () => {
   // ---------------------------------------------------------------------------
 
   it.skipIf(!WASM_EXISTS)('rollback restores Aggregate SUM to pre-checkpoint value', async () => {
-    setBackend(backend);
-    const stages = await createPipeline();
+    const stages = createPipeline({ backend });
 
     const bytecode = buildProgram({
       slots: [{ type: 'aggregate', aggType: AggType.SUM }],
@@ -273,8 +265,7 @@ describe('Pipeline undo integration', () => {
   // ---------------------------------------------------------------------------
 
   it.skipIf(!WASM_EXISTS)('rollback restores HashSet to pre-checkpoint elements', async () => {
-    setBackend(backend);
-    const stages = await createPipeline();
+    const stages = createPipeline({ backend });
 
     const bytecode = buildProgram({
       slots: [{ type: 'hashset', capacity: 64 }],
@@ -322,8 +313,7 @@ describe('Pipeline undo integration', () => {
   // ---------------------------------------------------------------------------
 
   it.skipIf(!WASM_EXISTS)('commit then rollback: committed changes persist, rolled-back do not', async () => {
-    setBackend(backend);
-    const stages = await createPipeline();
+    const stages = createPipeline({ backend });
 
     const bytecode = buildProgram({
       slots: [{ type: 'hashmap', capacity: 64 }],
@@ -389,8 +379,7 @@ describe('Pipeline undo integration', () => {
   // ---------------------------------------------------------------------------
 
   it.skipIf(!WASM_EXISTS)('commit after multiple batches preserves all effects', async () => {
-    setBackend(backend);
-    const stages = await createPipeline();
+    const stages = createPipeline({ backend });
 
     const bytecode = buildProgram({
       slots: [
@@ -457,8 +446,7 @@ describe('Pipeline undo integration', () => {
   // ---------------------------------------------------------------------------
 
   it('overflow rollback restores state via dynamic shadow buffer', async () => {
-    setBackend(backend);
-    const stages = await createPipeline();
+    const stages = createPipeline({ backend });
 
     // Use a large HashMap to test the overflow/shadow path.
     // Bytecode cap 16384 -> actual cap 32768 -> ~524KB state.
@@ -530,8 +518,7 @@ describe('Pipeline undo integration', () => {
   });
 
   it('delta segments support rollback and rollforward without event replay', async () => {
-    setBackend(backend);
-    const stages = await createPipeline();
+    const stages = createPipeline({ backend });
 
     const bytecode = buildProgram({
       slots: [{ type: 'hashmap', capacity: 64 }],
@@ -582,8 +569,7 @@ describe('Pipeline undo integration', () => {
   });
 
   it('without delta recording, export is empty and delta rollback/rollforward cannot restore', async () => {
-    setBackend(backend);
-    const stages = await createPipeline();
+    const stages = createPipeline({ backend });
 
     const bytecode = buildProgram({
       slots: [{ type: 'hashmap', capacity: 64 }],
