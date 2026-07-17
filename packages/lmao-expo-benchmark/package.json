@@ -8,7 +8,8 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "bun run prepare:web-wasm && expo start --web",
-    "prepare:web-wasm": "mkdir -p public && cp ../lmao/dist/allocator.wasm public/allocator.wasm"
+    "prepare:web-wasm": "mkdir -p public && cp ../lmao/dist/allocator.wasm public/allocator.wasm",
+    "test": "nx run lmao-expo-benchmark:test --outputStyle=stream"
   },
   "dependencies": {
     "@expo/metro-runtime": "57.0.3",
@@ -53,7 +54,7 @@
         "options": {
           "command": "bun test --timeout=30000 src",
           "cwd": "{projectRoot}",
-          "timeoutMs": 600000,
+          "timeoutMs": 120000,
           "killAfterMs": 10000
         }
       },
