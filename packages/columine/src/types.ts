@@ -165,8 +165,8 @@ export interface StateHandle {
 // =============================================================================
 
 export interface ColumnInput {
-  /** The actual data - Uint32Array or Float64Array */
-  data: Uint32Array | Float64Array;
+  /** Raw column cells copied into backend memory. Reducer bytecode determines how each cell is interpreted. */
+  data: Uint32Array | Float64Array | BigInt64Array;
   /** Element type */
   type: ValueType;
 }
