@@ -15,19 +15,17 @@ const TYPESCRIPT_TOOLCHAIN_INPUTS = [
   '{workspaceRoot}/tsconfig.base.json',
 ];
 
+//#region smoo!n/rust-output-target-inference
 // Cargo workspace inference: a package.json sitting next to a Cargo.toml that
 // declares [workspace] gets direct cargo-test/test targets, cargo-lint feeding
-// the lint aggregate, mutation (cargo-mutants), bench, and — per cdylib member
-// crate whose package name ends in `-wasm` — a cargo-wasm build producing
-// dist/<crate>.wasm. Explicit nx.targets entries in the package.json always win
-// over inference.
+// the lint aggregate, mutation (cargo-mutants), and bench. Rust output targets
+// (cargo-wasm, cargo-napi, ...) are never inferred from crate metadata such as
+// cdylib crate-types — a native N-API cdylib is not a wasm build. Packages
+// declare output targets in package.json nx.targets, and those *-wasm/*-napi/
+// *-native output-family names feed the aggregate build and clean targets.
+// Explicit nx.targets entries always win over inference.
 const CARGO_WORKSPACE_PATTERN = /^\s*\[workspace\]/m;
-const CARGO_MEMBERS_PATTERN = /^\s*members\s*=\s*\[([^\]]*)\]/m;
-const CARGO_MEMBER_ENTRY_PATTERN = /["']([^"']+)["']/g;
-const CARGO_PACKAGE_NAME_PATTERN = /^\s*name\s*=\s*["']([^"']+)["']/m;
-const CARGO_WASM_CRATE_NAME_PATTERN = /-wasm$/;
-const CARGO_CDYLIB_CRATE_TYPE_PATTERN = /^\s*crate-type\s*=\s*\[[^\]]*["']cdylib["']/m;
-const CARGO_WASM_RELEASE_PROFILE_PATTERN = /^\s*\[profile\.wasm-release\]/m;
+//#endregion
 const CARGO_INPUTS = [
   '{projectRoot}/**/*.rs',
   '{projectRoot}/**/Cargo.toml',
@@ -96,8 +94,8 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
   const validationTargets: string[] = [];
   const hasLibTsconfig = existsSync(join(absoluteProjectRoot, 'tsconfig.lib.json'));
   const packageLocalBuildOutputs = classifyPackageLocalBuildOutputs(packageJson);
-  let hasOrdinaryBuildOutputTarget = hasLibTsconfig || packageLocalBuildOutputs.ordinary;
-  let hasAnyBuildOutputTarget = hasOrdinaryBuildOutputTarget || packageLocalBuildOutputs.platform;
+  const hasOrdinaryBuildOutputTarget = hasLibTsconfig || packageLocalBuildOutputs.ordinary;
+  const hasAnyBuildOutputTarget = hasOrdinaryBuildOutputTarget || packageLocalBuildOutputs.platform;
 
   if (hasLibTsconfig) {
     // Official Nx target inference is disabled because its compiler surface only
@@ -163,8 +161,10 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     validationTargets.push('typecheck');
   }
 
-  const cargo = await readCargoWorkspace(absoluteProjectRoot);
-  if (cargo) {
+  // Member crates get their targets from the workspace-root package.json,
+  // never per-crate — one Nx project per Cargo workspace.
+  const cargoTomlPath = join(absoluteProjectRoot, 'Cargo.toml');
+  if (existsSync(cargoTomlPath) && CARGO_WORKSPACE_PATTERN.test(await readFile(cargoTomlPath, 'utf-8'))) {
     const declared = packageJson.nx?.targets ?? {};
     if (!('cargo-test' in declared)) {
       targets['cargo-test'] = createCargoTestTarget(projectRoot);
@@ -201,33 +201,6 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
         cache: false,
         options: { command: 'cargo bench --workspace', cwd: projectRoot },
       };
-    }
-    if (cargo.wasmCrates.length > 0 && !('cargo-wasm' in declared)) {
-      const profile = cargo.hasWasmReleaseProfile ? 'wasm-release' : 'release';
-      const buildAndCopy = (crate: string, profileName: string | null) => {
-        const artifact = crate.replace(/-/g, '_');
-        const profileFlag = profileName === null ? '' : ` --profile ${profileName}`;
-        const outputDirectory = profileName ?? 'debug';
-        return `cargo build${profileFlag} --target wasm32-unknown-unknown -p ${crate} && mkdir -p dist && cp target/wasm32-unknown-unknown/${outputDirectory}/${artifact}.wasm dist/${artifact}.wasm`;
-      };
-      targets['cargo-wasm'] = {
-        executor: 'nx:run-commands',
-        cache: true,
-        inputs: CARGO_INPUTS,
-        outputs: ['{projectRoot}/dist/**/*.wasm'],
-        options: {
-          commands: cargo.wasmCrates.map((crate) => buildAndCopy(crate, profile)),
-          cwd: projectRoot,
-          parallel: false,
-        },
-        configurations: {
-          development: {
-            commands: cargo.wasmCrates.map((crate) => buildAndCopy(crate, null)),
-          },
-        },
-      };
-      hasOrdinaryBuildOutputTarget = true;
-      hasAnyBuildOutputTarget = true;
     }
   }
 
@@ -352,44 +325,4 @@ function classifyPackageLocalBuildOutputs(packageJson: PackageJson): { ordinary:
       PLATFORM_TARGET_GLOBS.some((glob) => targetName.endsWith(glob.slice(1))),
     ),
   };
-}
-
-interface CargoWorkspace {
-  wasmCrates: string[];
-  hasWasmReleaseProfile: boolean;
-}
-
-async function readCargoWorkspace(absoluteProjectRoot: string): Promise<CargoWorkspace | null> {
-  const cargoTomlPath = join(absoluteProjectRoot, 'Cargo.toml');
-  if (!existsSync(cargoTomlPath)) {
-    return null;
-  }
-
-  const cargoToml = await readFile(cargoTomlPath, 'utf-8');
-  if (!CARGO_WORKSPACE_PATTERN.test(cargoToml)) {
-    // Member crates get their targets from the workspace-root package.json,
-    // never per-crate — one Nx project per Cargo workspace.
-    return null;
-  }
-
-  const wasmCrates: string[] = [];
-  const membersList = CARGO_MEMBERS_PATTERN.exec(cargoToml)?.[1] ?? '';
-  for (const match of membersList.matchAll(CARGO_MEMBER_ENTRY_PATTERN)) {
-    const memberTomlPath = join(absoluteProjectRoot, match[1], 'Cargo.toml');
-    if (!existsSync(memberTomlPath)) {
-      continue;
-    }
-    const memberToml = await readFile(memberTomlPath, 'utf-8');
-    const name = CARGO_PACKAGE_NAME_PATTERN.exec(memberToml)?.[1];
-    if (
-      name &&
-      CARGO_WASM_CRATE_NAME_PATTERN.test(name) &&
-      CARGO_CDYLIB_CRATE_TYPE_PATTERN.test(memberToml) &&
-      !wasmCrates.includes(name)
-    ) {
-      wasmCrates.push(name);
-    }
-  }
-
-  return { wasmCrates, hasWasmReleaseProfile: CARGO_WASM_RELEASE_PROFILE_PATTERN.test(cargoToml) };
 }
