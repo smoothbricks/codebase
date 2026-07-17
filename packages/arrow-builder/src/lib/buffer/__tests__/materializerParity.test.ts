@@ -329,6 +329,63 @@ describe('ColumnBuffer materializer parity', () => {
       expect(() => getColumnBufferClass(schema, { methods: 'ping() { return 1; }' })).not.toThrow();
     });
   });
+
+  it('honors closureInit/closureMethods as no-eval counterparts of the code-string fields', () => {
+    const schema = new ColumnSchema({ count: S.number() });
+    const codeStrings = {
+      constructorParams: 'tag',
+      constructorPreamble: 'this._tag = tag;',
+      methods: 'get doubled() { return this._tag * 2; }\n    label() { return `tag:${this._tag}`; }',
+    };
+    const hooks = {
+      closureInit: (self: Record<string, unknown>, _requestedCapacity: number, ctorArgs: readonly unknown[]) => {
+        self._tag = ctorArgs[0];
+      },
+      closureMethods: (prototype: object) => {
+        Object.defineProperty(prototype, 'doubled', {
+          configurable: true,
+          enumerable: false,
+          get(this: { _tag: number }) {
+            return this._tag * 2;
+          },
+        });
+        Object.defineProperty(prototype, 'label', {
+          configurable: true,
+          enumerable: false,
+          writable: true,
+          value: function (this: { _tag: number }) {
+            return `tag:${this._tag}`;
+          },
+        });
+      },
+    };
+
+    const inspect = (buffer: object) => ({
+      tag: Reflect.get(buffer, '_tag'),
+      doubled: Reflect.get(buffer, 'doubled'),
+      label: callMethod(buffer, 'label'),
+      count: Reflect.get(buffer, 'getColumnIfAllocated') !== undefined,
+    });
+
+    const compiled = withMode('compiled', () => {
+      const BufferClass = getColumnBufferClass(schema, { ...codeStrings, ...hooks });
+      return inspect(new BufferClass(8, 21));
+    });
+    const closure = withMode('closure', () => {
+      const BufferClass = getColumnBufferClass(schema, { ...codeStrings, ...hooks });
+      return inspect(new BufferClass(8, 21));
+    });
+    expect(closure).toEqual(compiled);
+    expect(closure.doubled).toBe(42);
+    expect(closure.label).toBe('tag:21');
+
+    // constructorCode has no no-eval counterpart and still throws on the closure path.
+    withMode('closure', () => {
+      expect(() => getColumnBufferClass(schema, { ...hooks, constructorCode: 'this._x = 1;' })).toThrow(
+        /constructorCode/,
+      );
+    });
+  });
 });
 
 // ============================================================================
