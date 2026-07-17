@@ -66,7 +66,10 @@ export function targetDependenciesFromNxProjectJson(value: unknown): Map<string,
         throw new Error(`Nx target ${targetName} has an invalid dependsOn entry.`);
       }
       if (dependency.projects !== undefined && dependency.projects !== 'self') {
-        throw new Error(`Nx target ${targetName} uses unsupported cross-project dependsOn for ${dependency.target}.`);
+        // Target closures are intentionally project-local. Nx schedules explicit
+        // cross-project prerequisites itself; treating them as local targets
+        // would collect or verify outputs from the wrong project.
+        continue;
       }
       entries.push(dependency.target);
     }
