@@ -48,6 +48,9 @@
       "cargo-wasm": {
         "executor": "nx:run-commands",
         "cache": true,
+        "dependsOn": [
+          "^build"
+        ],
         "inputs": [
           "{projectRoot}/crates/**/*.rs",
           "{projectRoot}/crates/**/Cargo.toml",
@@ -61,12 +64,8 @@
           "{projectRoot}/dist/event_processor.wasm"
         ],
         "options": {
-          "commands": [
-            "just wasm",
-            "just wasm-ep"
-          ],
-          "cwd": "{projectRoot}",
-          "parallel": false
+          "command": "just wasm && just wasm-ep",
+          "cwd": "{projectRoot}"
         }
       }
     },
