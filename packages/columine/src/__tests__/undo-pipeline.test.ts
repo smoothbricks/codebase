@@ -13,10 +13,10 @@ import { existsSync } from 'node:fs';
 
 import {
   AggType,
-  assertUndoCapableBackend,
   type ColumineBackend,
   type ColumnInput,
   createPipeline,
+  ErrorCode,
   HEADER_SIZE,
   MAGIC,
   Opcode,
@@ -507,7 +507,7 @@ describe('Pipeline undo integration', () => {
     );
 
     // Verify overflow occurred (undo log exceeded capacity)
-    expect(assertUndoCapableBackend(backend).undoHasOverflow()).toBe(true);
+    expect(backend.undoHasOverflow()).toBe(true);
 
     // Rollback -- shadow buffer + undo log replay restores logical state
     stages.undo.rollback(state, token);
@@ -536,13 +536,6 @@ describe('Pipeline undo integration', () => {
     const program = await backend.loadProgram(bytecode);
     const state = backend.createState(program);
 
-    if (!backend.executeBatchDelta || !backend.deltaExportSegment || !backend.deltaApplyRollbackSegment) {
-      throw new Error('invariant: backend missing delta segment support');
-    }
-    if (!backend.deltaApplyRollforwardSegment) {
-      throw new Error('invariant: backend missing delta rollforward support');
-    }
-
     const fromToken = stages.undo.checkpoint(state);
     const fromPos = getUndoPosition(fromToken);
 
@@ -559,7 +552,7 @@ describe('Pipeline undo integration', () => {
     expect(backend.getMapSize(state, program, 0)).toBe(1);
     expect(backend.mapGet(state, program, 0, 42)).toBe(900);
 
-    const toPos = assertUndoCapableBackend(backend).undoCheckpoint(state);
+    const toPos = backend.undoCheckpoint(state);
     const segment = backend.deltaExportSegment(state, fromPos, toPos);
     expect(segment.undoBytes.byteLength).toBeGreaterThan(0);
     expect(segment.redoBytes.byteLength).toBe(segment.undoBytes.byteLength);
@@ -575,6 +568,47 @@ describe('Pipeline undo integration', () => {
     expect(backend.mapGet(state, program, 0, 42)).toBe(900);
   });
 
+  it('delta execution grows from pre-attempt state and preserves exact rollback and rollforward journals', async () => {
+    const stages = createPipeline({ backend, parseBackend: TEST_PARSE_BACKEND });
+    const program = await backend.loadProgram(
+      buildProgram({
+        slots: [{ type: 'hashmap', capacity: 4 }],
+        numInputs: 2,
+        reduceOps: [Opcode.BATCH_MAP_UPSERT_LAST, 0, 0, 1],
+      }),
+    );
+    const state = backend.createState(program);
+    const fromPos = getUndoPosition(stages.undo.checkpoint(state));
+    const keys = Uint32Array.from({ length: 12 }, (_, index) => index + 1);
+    const values = Uint32Array.from(keys, (key) => key * 100);
+
+    expect(
+      backend.executeBatchDelta(
+        state,
+        program,
+        [
+          { data: keys, type: ValueType.UINT32 },
+          { data: values, type: ValueType.UINT32 },
+        ],
+        keys.length,
+      ),
+    ).toBe(ErrorCode.OK);
+    expect(backend.getMapSize(state, program, 0)).toBe(keys.length);
+
+    const toPos = backend.undoCheckpoint(state);
+    const segment = backend.deltaExportSegment(state, fromPos, toPos);
+    expect(segment.undoBytes.byteLength).toBe(keys.length * segment.entrySize);
+    expect(segment.redoBytes.byteLength).toBe(segment.undoBytes.byteLength);
+
+    backend.deltaApplyRollbackSegment(state, segment.undoBytes, segment.entrySize);
+    expect(backend.getMapSize(state, program, 0)).toBe(0);
+    for (const key of keys) expect(backend.mapGet(state, program, 0, key)).toBeUndefined();
+
+    backend.deltaApplyRollforwardSegment(state, segment.redoBytes, segment.entrySize);
+    expect(backend.getMapSize(state, program, 0)).toBe(keys.length);
+    for (const key of keys) expect(backend.mapGet(state, program, 0, key)).toBe(key * 100);
+  });
+
   it('without delta recording, export is empty and delta rollback/rollforward cannot restore', async () => {
     const stages = createPipeline({ backend, parseBackend: TEST_PARSE_BACKEND });
 
@@ -586,13 +620,6 @@ describe('Pipeline undo integration', () => {
 
     const program = await backend.loadProgram(bytecode);
     const state = backend.createState(program);
-
-    if (!backend.executeBatchDelta || !backend.deltaExportSegment || !backend.deltaApplyRollbackSegment) {
-      throw new Error('invariant: backend missing delta segment support');
-    }
-    if (!backend.deltaApplyRollforwardSegment) {
-      throw new Error('invariant: backend missing delta rollforward support');
-    }
 
     const fromPos = getUndoPosition(stages.undo.checkpoint(state));
 
@@ -610,7 +637,7 @@ describe('Pipeline undo integration', () => {
     expect(backend.getMapSize(state, program, 0)).toBe(1);
     expect(backend.mapGet(state, program, 0, 7)).toBe(77);
 
-    const toPos = assertUndoCapableBackend(backend).undoCheckpoint(state);
+    const toPos = backend.undoCheckpoint(state);
     const segment = backend.deltaExportSegment(state, fromPos, toPos);
 
     // Core assertion: same logical flow without executeBatchDelta does not produce usable deltas.

@@ -7,6 +7,7 @@ use columine_types::types::{
     ChangeFlag, EMPTY_KEY, ErrorCode, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset,
 };
 use columine_vm::bytes;
+use columine_vm::meta::SlotMetaView;
 use columine_vm::state_init::{
     calculate_grown_state_size, calculate_state_size, grow_state, init_state, needs_growth_slot,
 };
@@ -26,12 +27,16 @@ const NEEDS_GROWTH: u32 = ErrorCode::NeedsGrowth as u32;
 /// Assemble a full program: 32-byte hash prefix + 14-byte content header +
 /// init + reduce.
 fn program(num_slots: u8, num_inputs: u8, init: &[u8], reduce: &[u8]) -> Vec<u8> {
+    let mut init = init.to_vec();
+    init.push(0);
+    let mut reduce = reduce.to_vec();
+    reduce.push(0);
     let mut prog = vec![0u8; 32];
     prog.extend([0x41, 0x58, 0x45, 0x31, 1, 0, num_slots, num_inputs, 0, 0]);
     prog.extend((init.len() as u16).to_le_bytes());
     prog.extend((reduce.len() as u16).to_le_bytes());
-    prog.extend_from_slice(init);
-    prog.extend_from_slice(reduce);
+    prog.extend(init);
+    prog.extend(reduce);
     prog
 }
 
@@ -283,11 +288,36 @@ fn ttl_hashmap_insert_and_evict_through_live_reducer_path() {
     let (off, cap) = (slot_offset(&state, 0), slot_cap(&state, 0));
     assert_eq!(7, vm_map_get(&state, off, cap, 42));
 
-    assert_eq!(0, vm.evict_all_expired(&mut state, 105.0));
+    assert_eq!(0, vm.evict_all_expired(&mut state, 105.0).unwrap());
     assert_eq!(7, vm_map_get(&state, off, cap, 42));
 
-    assert_eq!(1, vm.evict_all_expired(&mut state, 111.0));
+    assert_eq!(1, vm.evict_all_expired(&mut state, 111.0).unwrap());
     assert_eq!(EMPTY_KEY, vm_map_get(&state, off, cap, 42));
+}
+
+#[test]
+fn ttl_eviction_result_distinguishes_four_rows_from_invalid_state() {
+    let prog = build_ttl_map_program(8, 0, true);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+    let keys = [1u32, 2, 3, 4];
+    let vals = [10u32, 20, 30, 40];
+    let timestamps = [100.0f64, 101.0, 102.0, 103.0];
+    let cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&vals),
+        f64s_as_bytes(&timestamps),
+    ];
+    assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 4));
+    assert_eq!(Ok(4), vm.evict_all_expired(&mut state, 114.0));
+
+    let meta = SlotMetaView::read(&state, 0);
+    assert_eq!(4, meta.evicted_count(&state));
+    let mut invalid = vec![0u8; STATE_HEADER_SIZE as usize];
+    assert_eq!(
+        Err(ErrorCode::InvalidState),
+        vm.evict_all_expired(&mut invalid, 114.0)
+    );
 }
 
 #[test]
@@ -310,7 +340,7 @@ fn ttl_hashmap_stale_eviction_entries_do_not_evict_newer_values() {
 
     let (off, cap) = (slot_offset(&state, 0), slot_cap(&state, 0));
     // cutoff=140: the stale ts=100 index entry must not evict the ts=200 value.
-    assert_eq!(0, vm.evict_all_expired(&mut state, 150.0));
+    assert_eq!(0, vm.evict_all_expired(&mut state, 150.0).unwrap());
     assert_eq!(200, vm_map_get(&state, off, cap, 9));
 }
 
@@ -330,10 +360,10 @@ fn ttl_hashset_reinsertion_refreshes_ttl_and_evicts_deterministically() {
     let (off, cap) = (slot_offset(&state, 0), slot_cap(&state, 0));
     assert!(vm_set_contains(&mut vm.bitmap_env, &state, off, cap, 77));
 
-    assert_eq!(0, vm.evict_all_expired(&mut state, 150.0));
+    assert_eq!(0, vm.evict_all_expired(&mut state, 150.0).unwrap());
     assert!(vm_set_contains(&mut vm.bitmap_env, &state, off, cap, 77));
 
-    assert_eq!(1, vm.evict_all_expired(&mut state, 211.0));
+    assert_eq!(1, vm.evict_all_expired(&mut state, 211.0).unwrap());
     assert!(!vm_set_contains(&mut vm.bitmap_env, &state, off, cap, 77));
 }
 
@@ -1410,7 +1440,7 @@ fn undo_overflow_inside_container_op_snapshots_and_rolls_back() {
 /// top-level 0xE0 FOR_EACH wrapping AGG_COUNT).
 #[test]
 fn empty_batch_with_no_column_pointers_is_ok() {
-    let hex = "00000000000000000000000000000000000000000000000000000000000000004158453101000100000005000c001000020200e00101010000000200410000";
+    let hex = "00000000000000000000000000000000000000000000000000000000000000004158453101000100000006000c00100002020000e00101010000000200410000";
     let prog: Vec<u8> = (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
@@ -1440,7 +1470,7 @@ fn empty_batch_with_no_column_pointers_is_ok() {
 /// id=1) around `48 00 03 02` (slot 0, val_col 3, cmp_col 2).
 #[test]
 fn ts_scalar_latest_program_writes_value_and_cmp() {
-    let hex = "00000000000000000000000000000000000000000000000000000000000000004158453101000100000005000e001000050900e001010100000004004800030200";
+    let hex = "00000000000000000000000000000000000000000000000000000000000000004158453101000100000006000e00100005090000e001010100000004004800030200";
     let prog: Vec<u8> = (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())

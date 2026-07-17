@@ -46,6 +46,8 @@ struct Runtime {
     /// the `_ptr` exports return these stable buffers.
     delta_undo: Vec<u8>,
     delta_redo: Vec<u8>,
+    /// Count from the last successful `vm_evict_all_expired` call.
+    last_evicted_count: u32,
     #[cfg(not(target_arch = "wasm32"))]
     regions: Vec<(usize, usize)>,
 }
@@ -57,6 +59,7 @@ impl Runtime {
             rbmp_scratch: (0, 0),
             delta_undo: Vec::new(),
             delta_redo: Vec::new(),
+            last_evicted_count: 0,
             #[cfg(not(target_arch = "wasm32"))]
             regions: Vec::new(),
         }
@@ -264,7 +267,22 @@ pub unsafe extern "C" fn vm_execute_batch_delta(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vm_evict_all_expired(state_base: *mut u8, now: f64) -> u32 {
     let state = unsafe { state_mut(state_base) };
-    rt().vm.evict_all_expired(state, now)
+    let runtime = rt();
+    match runtime.vm.evict_all_expired(state, now) {
+        Ok(count) => {
+            runtime.last_evicted_count = count;
+            ErrorCode::Ok as u32
+        }
+        Err(error) => {
+            runtime.last_evicted_count = 0;
+            error as u32
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn vm_get_evicted_count() -> u32 {
+    rt().last_evicted_count
 }
 
 // =============================================================================
