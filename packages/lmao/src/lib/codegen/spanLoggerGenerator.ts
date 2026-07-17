@@ -16,7 +16,12 @@
  * SpanLogger starts with _writeIndex = 1, so first _nextRow() makes it 2.
  */
 
-import { type ColumnEntry, type ColumnWriterExtension, generateColumnWriterClass } from '@smoothbricks/arrow-builder';
+import {
+  activeMaterializerMode,
+  type ColumnEntry,
+  type ColumnWriterExtension,
+  generateColumnWriterClass,
+} from '@smoothbricks/arrow-builder';
 import {
   type EnumLookupDescriptor,
   resolveEnumLookupDescriptor,
@@ -38,6 +43,11 @@ import type { InferSchema, LogSchema } from '../schema/types.js';
 import type { AnySpanBuffer } from '../types.js';
 import type { VocabularyGeneration } from '../vocabularyRegistry.js';
 import type { WriterState } from './fixedPositionWriterGenerator.js';
+import {
+  materializeSpanLoggerClass,
+  type SpanLoggerColumnMode,
+  type SpanLoggerPlan,
+} from './spanLoggerClosureMaterializer.js';
 
 // =============================================================================
 // SINGLETON HELPERS OBJECT
@@ -674,8 +684,61 @@ function generateStateBoundSpanLoggerClass(schema: LogSchema, extension: ColumnW
     .replaceAll('this._writeIndex', '(this._state._buffer._writeIndex - 1)');
 }
 
+/** Compiled materializer: render class source and evaluate it with `new Function`. */
+function compileSpanLoggerClass(
+  schema: LogSchema,
+  messageLayoutFamily: MessageLayoutFamily,
+  messagePhysicalLayout: MessagePhysicalLayout,
+  eagerColumns: readonly string[],
+  enumLookup: SchemaEnumLookupDescriptor,
+): unknown {
+  const extension = buildSpanLoggerExtension(
+    schema,
+    messageLayoutFamily,
+    messagePhysicalLayout,
+    eagerColumns,
+    enumLookup,
+  );
+  const classCode = generateStateBoundSpanLoggerClass(schema, extension).trim();
+  return new Function('helpers', 'enumLookup', classCode)(SPAN_LOGGER_HELPERS, enumLookup);
+}
+
+/**
+ * Schema/config -> pure-data plan consumed by the closure-composed (no-eval)
+ * materializer. Mirrors the inputs the compiled renderer bakes into source:
+ * per-column access mode (arrow-builder's buildColumnAccessorPlan semantics),
+ * layout family/physical layout, and the injected singleton dependencies.
+ */
+function buildSpanLoggerPlan(
+  schema: LogSchema,
+  messageLayoutFamily: MessageLayoutFamily,
+  messagePhysicalLayout: MessagePhysicalLayout,
+  eagerColumns: readonly string[],
+  enumLookup: SchemaEnumLookupDescriptor,
+): SpanLoggerPlan {
+  const preallocated = new Set(eagerColumns);
+  const columns = schema._columns.map(([fieldName, fieldSchema]) => {
+    const isEager =
+      typeof fieldSchema === 'object' && fieldSchema !== null && Reflect.get(fieldSchema, '__eager') === true;
+    const mode: SpanLoggerColumnMode = isEager ? 'eager' : preallocated.has(fieldName) ? 'preallocated' : 'lazy';
+    return { name: fieldName, schemaType: getSchemaType(fieldSchema), mode };
+  });
+  return {
+    columns,
+    messageLayoutFamily,
+    messagePhysicalLayout,
+    helpers: SPAN_LOGGER_HELPERS,
+    enumLookup,
+  };
+}
+
 /**
  * Create the state-only SpanLogger constructor selected for one schema/layout family.
+ *
+ * Selects the materializer via activeMaterializerMode(): the compiled renderer
+ * (string codegen) where `new Function` is allowed, the closure-composed
+ * materializer where it is forbidden (e.g. workerd). Cache keys are
+ * mode-prefixed so a forced override never returns the other mode's class.
  */
 export function createSpanLoggerClass<T extends LogSchema>(
   schema: T,
@@ -684,20 +747,18 @@ export function createSpanLoggerClass<T extends LogSchema>(
   eagerColumns: readonly string[] = [],
   enumLookup: SchemaEnumLookupDescriptor = resolveEnumLookupDescriptor(schema),
 ): SpanLoggerConstructor<T> {
-  const cacheKey = `${messageLayoutFamily}:${messagePhysicalLayout}:${eagerColumns.join('\u0000')}`;
+  const mode = activeMaterializerMode();
+  const cacheKey = `${mode}:${messageLayoutFamily}:${messagePhysicalLayout}:${eagerColumns.join('\u0000')}`;
   let familyClasses = spanLoggerClassCache.get(schema);
   let SpanLoggerClass = familyClasses?.get(cacheKey);
 
   if (!SpanLoggerClass) {
-    const extension = buildSpanLoggerExtension(
-      schema,
-      messageLayoutFamily,
-      messagePhysicalLayout,
-      eagerColumns,
-      enumLookup,
-    );
-    const classCode = generateStateBoundSpanLoggerClass(schema, extension).trim();
-    SpanLoggerClass = new Function('helpers', 'enumLookup', classCode)(SPAN_LOGGER_HELPERS, enumLookup);
+    SpanLoggerClass =
+      mode === 'compiled'
+        ? compileSpanLoggerClass(schema, messageLayoutFamily, messagePhysicalLayout, eagerColumns, enumLookup)
+        : materializeSpanLoggerClass(
+            buildSpanLoggerPlan(schema, messageLayoutFamily, messagePhysicalLayout, eagerColumns, enumLookup),
+          );
 
     if (!isSpanLoggerConstructor<LogSchema>(SpanLoggerClass)) {
       throw new Error('Failed to generate SpanLogger constructor');
