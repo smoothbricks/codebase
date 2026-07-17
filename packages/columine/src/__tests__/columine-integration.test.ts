@@ -27,6 +27,7 @@ import {
   PROGRAM_HASH_PREFIX,
   type ReducerProgram,
   SlotType,
+  SlotTypeFlag,
   ValueType,
 } from '../index.js';
 import { loadColumineWasm } from '../wasm-backend.js';
@@ -44,6 +45,42 @@ const TEST_PARSE_BACKEND: ParseCompactBackend = {
   dispose: () => {},
 };
 
+function createMockColumineBackend(overrides: Partial<ColumineBackend> = {}): ColumineBackend {
+  return {
+    backend: 'mock',
+    loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
+    createState: () => ({ _brand: 'ColumineStateHandle' }),
+    resetState: () => {},
+    executeBatch: () => ErrorCode.OK,
+    executeBatchDelta: () => ErrorCode.OK,
+    getMapSize: () => 0,
+    getSetSize: () => 0,
+    getAggregateValue: () => 0,
+    getScalarValue: () => ({ kind: 'empty' }),
+    mapGet: () => undefined,
+    setContains: () => false,
+    structMap2GetRow: () => undefined,
+    structMap2Entries: () => [],
+    evictExpired: () => ({ ok: true, count: 0, rows: [] }),
+    serialize: () => new Uint8Array(0),
+    deserialize: () => ({ _brand: 'ColumineStateHandle' }),
+    undoEnable: () => {},
+    undoCheckpoint: () => 0,
+    undoRollback: () => {},
+    undoCommit: () => {},
+    undoHasOverflow: () => false,
+    deltaExportSegment: () => ({
+      undoBytes: new Uint8Array(0),
+      redoBytes: new Uint8Array(0),
+      entrySize: 24,
+      overflow: false,
+    }),
+    deltaApplyRollbackSegment: () => {},
+    deltaApplyRollforwardSegment: () => {},
+    ...overrides,
+  };
+}
+
 // =============================================================================
 // BytecodeBuilder (minimal, local to avoid circular dep on axe-runtime)
 // =============================================================================
@@ -54,9 +91,14 @@ const TEST_PARSE_BACKEND: ParseCompactBackend = {
  */
 function buildProgram(opts: {
   slots: Array<
-    | { type: 'hashmap'; capacity: number }
+    | {
+        type: 'hashmap';
+        capacity: number;
+        ttl?: { seconds: number; trigger: boolean; timestampField: number };
+      }
     | { type: 'hashset'; capacity: number }
     | { type: 'aggregate'; aggType: AggType }
+    | { type: 'scalar'; aggType: AggType }
     | { type: 'condition-tree' }
   >;
   numInputs: number;
@@ -66,16 +108,30 @@ function buildProgram(opts: {
   for (let i = 0; i < opts.slots.length; i++) {
     const slot = opts.slots[i];
     switch (slot.type) {
-      case 'hashmap':
-        // SLOT_DEF: slot, type_flags(HASHMAP), cap_lo, cap_hi
-        initCode.push(Opcode.SLOT_DEF, i, SlotType.HASHMAP, slot.capacity & 0xff, (slot.capacity >> 8) & 0xff);
+      case 'hashmap': {
+        const flags =
+          SlotType.HASHMAP |
+          (slot.ttl ? SlotTypeFlag.HAS_TTL : 0) |
+          (slot.ttl?.trigger ? SlotTypeFlag.HAS_EVICT_TRIGGER : 0);
+        initCode.push(Opcode.SLOT_DEF, i, flags, slot.capacity & 0xff, (slot.capacity >> 8) & 0xff);
+        if (slot.ttl) {
+          const ttlBytes = new ArrayBuffer(8);
+          const ttlView = new DataView(ttlBytes);
+          ttlView.setFloat32(0, slot.ttl.seconds, true);
+          ttlView.setFloat32(4, 0, true);
+          initCode.push(...new Uint8Array(ttlBytes), slot.ttl.timestampField, 0);
+        }
         break;
+      }
       case 'hashset':
         initCode.push(Opcode.SLOT_DEF, i, SlotType.HASHSET, slot.capacity & 0xff, (slot.capacity >> 8) & 0xff);
         break;
       case 'aggregate':
         // SLOT_DEF: slot, type_flags(AGGREGATE), aggType in cap_lo, 0
         initCode.push(Opcode.SLOT_DEF, i, SlotType.AGGREGATE, slot.aggType, 0);
+        break;
+      case 'scalar':
+        initCode.push(Opcode.SLOT_DEF, i, SlotType.SCALAR, slot.aggType, 0);
         break;
       case 'condition-tree':
         initCode.push(Opcode.SLOT_DEF, i, SlotType.CONDITION_TREE, 0, 0);
@@ -257,6 +313,130 @@ describe('SC1: Reduce stage for aggregation', () => {
     expect(backend.getAggregateValue(state, program, 1)).toBe(100);
   });
 
+  it.skipIf(!WASM_EXISTS)('grows HashMap and HashSet without duplicating partial batch mutations', async () => {
+    const keys = Uint32Array.from({ length: 12 }, (_, index) => index + 1);
+    const values = Uint32Array.from(keys, (key) => key * 10);
+    const amounts = Float64Array.from(keys);
+    const mapProgram = await backend.loadProgram(
+      buildProgram({
+        slots: [
+          { type: 'hashmap', capacity: 4 },
+          { type: 'aggregate', aggType: AggType.SUM },
+        ],
+        numInputs: 3,
+        reduceOps: [Opcode.BATCH_MAP_UPSERT_LAST, 0, 0, 1, Opcode.BATCH_AGG_SUM, 1, 2],
+      }),
+    );
+    const mapState = backend.createState(mapProgram);
+
+    expect(
+      backend.executeBatch(
+        mapState,
+        mapProgram,
+        [
+          { data: keys, type: ValueType.UINT32 },
+          { data: values, type: ValueType.UINT32 },
+          { data: amounts, type: ValueType.FLOAT64 },
+        ],
+        keys.length,
+      ),
+    ).toBe(ErrorCode.OK);
+    expect(backend.getMapSize(mapState, mapProgram, 0)).toBe(keys.length);
+    expect(backend.getAggregateValue(mapState, mapProgram, 1)).toBe(78);
+    for (const key of keys) expect(backend.mapGet(mapState, mapProgram, 0, key)).toBe(key * 10);
+
+    const setProgram = await backend.loadProgram(
+      buildProgram({
+        slots: [{ type: 'hashset', capacity: 4 }],
+        numInputs: 1,
+        reduceOps: [Opcode.BATCH_SET_INSERT, 0, 0],
+      }),
+    );
+    const setState = backend.createState(setProgram);
+    expect(backend.executeBatch(setState, setProgram, [{ data: keys, type: ValueType.UINT32 }], keys.length)).toBe(
+      ErrorCode.OK,
+    );
+    expect(backend.getSetSize(setState, setProgram, 0)).toBe(keys.length);
+    for (const key of keys) expect(backend.setContains(setState, setProgram, 0, key)).toBeTrue();
+  });
+
+  it.skipIf(!WASM_EXISTS)('reads U32, F64, and I64 scalar slots losslessly with explicit empty state', async () => {
+    const scalarProgram = await backend.loadProgram(
+      buildProgram({
+        slots: [
+          { type: 'scalar', aggType: AggType.SCALAR_U32 },
+          { type: 'scalar', aggType: AggType.SCALAR_F64 },
+          { type: 'scalar', aggType: AggType.SCALAR_I64 },
+        ],
+        numInputs: 4,
+        reduceOps: [0x48, 0, 0, 3, 0x48, 1, 1, 3, 0x48, 2, 2, 3],
+      }),
+    );
+    const state = backend.createState(scalarProgram);
+    expect(backend.getScalarValue(state, scalarProgram, 0)).toEqual({ kind: 'empty' });
+    expect(backend.getScalarValue(state, scalarProgram, 1)).toEqual({ kind: 'empty' });
+    expect(backend.getScalarValue(state, scalarProgram, 2)).toEqual({ kind: 'empty' });
+
+    const exactI64 = 9_007_199_254_740_993n;
+    expect(
+      backend.executeBatch(
+        state,
+        scalarProgram,
+        [
+          { data: new Uint32Array([0xffff_fffe]), type: ValueType.UINT32 },
+          { data: new Float64Array([Math.PI]), type: ValueType.FLOAT64 },
+          { data: new BigInt64Array([exactI64]), type: ValueType.UINT32 },
+          { data: new Float64Array([100]), type: ValueType.FLOAT64 },
+        ],
+        1,
+      ),
+    ).toBe(ErrorCode.OK);
+    expect(backend.getScalarValue(state, scalarProgram, 0)).toEqual({ kind: 'u32', value: 0xffff_fffe });
+    expect(backend.getScalarValue(state, scalarProgram, 1)).toEqual({ kind: 'f64', value: Math.PI });
+    expect(backend.getScalarValue(state, scalarProgram, 2)).toEqual({ kind: 'i64', value: exactI64 });
+  });
+
+  it.skipIf(!WASM_EXISTS)('returns an unambiguous four-row TTL eviction result and copied trigger rows', async () => {
+    const program = await backend.loadProgram(
+      buildProgram({
+        slots: [{ type: 'hashmap', capacity: 8, ttl: { seconds: 10, trigger: true, timestampField: 2 } }],
+        numInputs: 3,
+        reduceOps: [Opcode.BATCH_MAP_UPSERT_LATEST, 0, 0, 1, 2, 1],
+      }),
+    );
+    const state = backend.createState(program);
+    const keys = new Uint32Array([1, 2, 3, 4]);
+    const values = new Uint32Array([10, 20, 30, 40]);
+    const timestamps = new Float64Array([100, 101, 102, 103]);
+    expect(
+      backend.executeBatch(
+        state,
+        program,
+        [
+          { data: keys, type: ValueType.UINT32 },
+          { data: values, type: ValueType.UINT32 },
+          { data: timestamps, type: ValueType.FLOAT64 },
+        ],
+        4,
+      ),
+    ).toBe(ErrorCode.OK);
+
+    const result = backend.evictExpired(state, program, 114);
+    expect(result.ok).toBeTrue();
+    if (!result.ok) throw new Error(`unexpected eviction error ${result.error}`);
+    expect(result.count).toBe(4);
+    expect(result.rows).toEqual([
+      { slot: 0, timestamp: 100, key: 1, value: 10 },
+      { slot: 0, timestamp: 101, key: 2, value: 20 },
+      { slot: 0, timestamp: 102, key: 3, value: 30 },
+      { slot: 0, timestamp: 103, key: 4, value: 40 },
+    ]);
+    expect(backend.getMapSize(state, program, 0)).toBe(0);
+    const restored = backend.deserialize(program, backend.serialize(state, program));
+    expect(backend.getMapSize(restored, program, 0)).toBe(0);
+    for (const key of keys) expect(backend.mapGet(restored, program, 0, key)).toBeUndefined();
+  });
+
   it.skipIf(!WASM_EXISTS)('parses and initializes CONDITION_TREE slots as first-class slot types', async () => {
     const bytecode = buildProgram({
       slots: [{ type: 'condition-tree' }, { type: 'aggregate', aggType: AggType.COUNT }],
@@ -385,20 +565,7 @@ describe('SC2: Undo stage for event cancellation', () => {
 describe('SC3: Pipeline composition', () => {
   it('createPipeline returns all four stages', () => {
     // Supply the concrete backend owned by this pipeline.
-    const mockBackend: ColumineBackend = {
-      backend: 'mock',
-      loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
-      createState: () => ({ _brand: 'ColumineStateHandle' }),
-      resetState: () => {},
-      executeBatch: () => 0,
-      getMapSize: () => 0,
-      getSetSize: () => 0,
-      getAggregateValue: () => 0,
-      mapGet: () => undefined,
-      setContains: () => false,
-      serialize: () => new Uint8Array(0),
-      deserialize: () => ({ _brand: 'ColumineStateHandle' }),
-    };
+    const mockBackend = createMockColumineBackend();
 
     const stages = createPipeline({ backend: mockBackend, parseBackend: TEST_PARSE_BACKEND });
 
@@ -418,23 +585,12 @@ describe('SC3: Pipeline composition', () => {
   it('reduce stage delegates to the supplied backend', () => {
     let executeBatchCalled = false;
 
-    const mockBackend: ColumineBackend = {
-      backend: 'mock',
-      loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
-      createState: () => ({ _brand: 'ColumineStateHandle' }),
-      resetState: () => {},
+    const mockBackend = createMockColumineBackend({
       executeBatch: () => {
         executeBatchCalled = true;
         return ErrorCode.OK;
       },
-      getMapSize: () => 0,
-      getSetSize: () => 0,
-      getAggregateValue: () => 0,
-      mapGet: () => undefined,
-      setContains: () => false,
-      serialize: () => new Uint8Array(0),
-      deserialize: () => ({ _brand: 'ColumineStateHandle' }),
-    };
+    });
 
     const stages = createPipeline({ backend: mockBackend, parseBackend: TEST_PARSE_BACKEND });
 
@@ -450,25 +606,16 @@ describe('SC3: Pipeline composition', () => {
 
   it('keeps independently constructed pipelines isolated', () => {
     const calls: string[] = [];
-    const createMockBackend = (name: string): ColumineBackend => ({
-      backend: name,
-      loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
-      createState: () => ({ _brand: 'ColumineStateHandle' }),
-      resetState: () => {},
-      executeBatch: () => {
-        calls.push(name);
-        return ErrorCode.OK;
-      },
-      getMapSize: () => 0,
-      getSetSize: () => 0,
-      getAggregateValue: () => 0,
-      mapGet: () => undefined,
-      setContains: () => false,
-      serialize: () => new Uint8Array(0),
-      deserialize: () => ({ _brand: 'ColumineStateHandle' }),
-    });
-    const first = createPipeline({ backend: createMockBackend('first'), parseBackend: TEST_PARSE_BACKEND });
-    const second = createPipeline({ backend: createMockBackend('second'), parseBackend: TEST_PARSE_BACKEND });
+    const createNamedBackend = (name: string): ColumineBackend =>
+      createMockColumineBackend({
+        backend: name,
+        executeBatch: () => {
+          calls.push(name);
+          return ErrorCode.OK;
+        },
+      });
+    const first = createPipeline({ backend: createNamedBackend('first'), parseBackend: TEST_PARSE_BACKEND });
+    const second = createPipeline({ backend: createNamedBackend('second'), parseBackend: TEST_PARSE_BACKEND });
     const state = { _brand: 'ColumineStateHandle' as const };
     const program: ReducerProgram = { bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] };
 
@@ -488,20 +635,7 @@ describe('SC3: Pipeline composition', () => {
         return { arrowIpc: new Uint8Array([1]), eventCount: 1 };
       },
     };
-    const mockBackend: ColumineBackend = {
-      backend: 'mock',
-      loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
-      createState: () => ({ _brand: 'ColumineStateHandle' }),
-      resetState: () => {},
-      executeBatch: () => 0,
-      getMapSize: () => 0,
-      getSetSize: () => 0,
-      getAggregateValue: () => 0,
-      mapGet: () => undefined,
-      setContains: () => false,
-      serialize: () => new Uint8Array(0),
-      deserialize: () => ({ _brand: 'ColumineStateHandle' }),
-    };
+    const mockBackend = createMockColumineBackend();
     const stages = createPipeline({ backend: mockBackend, parseBackend });
 
     const result = stages.parse.parse('[]', {
@@ -516,23 +650,12 @@ describe('SC3: Pipeline composition', () => {
   it('stages are independently usable', () => {
     let reduceCalled = false;
 
-    const mockBackend: ColumineBackend = {
-      backend: 'mock',
-      loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
-      createState: () => ({ _brand: 'ColumineStateHandle' }),
-      resetState: () => {},
+    const mockBackend = createMockColumineBackend({
       executeBatch: () => {
         reduceCalled = true;
         return ErrorCode.OK;
       },
-      getMapSize: () => 0,
-      getSetSize: () => 0,
-      getAggregateValue: () => 0,
-      mapGet: () => undefined,
-      setContains: () => false,
-      serialize: () => new Uint8Array(0),
-      deserialize: () => ({ _brand: 'ColumineStateHandle' }),
-    };
+    });
 
     const stages = createPipeline({ backend: mockBackend, parseBackend: TEST_PARSE_BACKEND });
 

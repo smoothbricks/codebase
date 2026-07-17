@@ -179,6 +179,26 @@ export interface StructMap2RowRef {
   readonly rowOffset: number;
 }
 
+/** Lossless scalar slot value. Empty is explicit rather than overloaded as zero. */
+export type ScalarValue =
+  | { readonly kind: 'empty' }
+  | { readonly kind: 'u32'; readonly value: number }
+  | { readonly kind: 'f64'; readonly value: number }
+  | { readonly kind: 'i64'; readonly value: bigint };
+
+/** One row emitted by a TTL slot configured with an eviction trigger. */
+export interface EvictedRow {
+  readonly slot: number;
+  readonly timestamp: number;
+  readonly key: number;
+  readonly value: number;
+}
+
+/** Public, unambiguous TTL eviction result. */
+export type EvictionResult =
+  | { readonly ok: true; readonly count: number; readonly rows: readonly EvictedRow[] }
+  | { readonly ok: false; readonly error: ErrorCode };
+
 // =============================================================================
 // Error Codes
 // =============================================================================
@@ -369,7 +389,7 @@ export interface ColumineBackend {
    * Delta-enabled execution profile for fork journaling.
    * Emits mutation deltas for rollback/rollforward navigation.
    */
-  executeBatchDelta?(state: StateHandle, program: ReducerProgram, columns: ColumnInput[], batchLen: number): number;
+  executeBatchDelta(state: StateHandle, program: ReducerProgram, columns: ColumnInput[], batchLen: number): number;
 
   // ===========================================================================
   // State Reading
@@ -378,19 +398,21 @@ export interface ColumineBackend {
   getMapSize(state: StateHandle, program: ReducerProgram, slot: number): number;
   getSetSize(state: StateHandle, program: ReducerProgram, slot: number): number;
   getAggregateValue(state: StateHandle, program: ReducerProgram, slot: number): number;
+  getScalarValue(state: StateHandle, program: ReducerProgram, slot: number): ScalarValue;
 
   mapGet(state: StateHandle, program: ReducerProgram, slot: number, key: number): number | undefined;
   setContains(state: StateHandle, program: ReducerProgram, slot: number, elem: number): boolean;
-  /** Exact-pair readers are present on Columine's WASM backend; injected older
-   * backends may omit them until they adopt the StructMap2 ABI. */
-  structMap2GetRow?(
+  structMap2GetRow(
     state: StateHandle,
     program: ReducerProgram,
     slot: number,
     key1: number,
     key2: number,
   ): StructMap2RowRef | undefined;
-  structMap2Entries?(state: StateHandle, program: ReducerProgram, slot: number): readonly StructMap2RowRef[];
+  structMap2Entries(state: StateHandle, program: ReducerProgram, slot: number): readonly StructMap2RowRef[];
+
+  /** Evict every expired TTL entry and expose configured eviction-trigger rows. */
+  evictExpired(state: StateHandle, program: ReducerProgram, now: number): EvictionResult;
 
   // ===========================================================================
   // Serialization
@@ -409,51 +431,32 @@ export interface ColumineBackend {
   deserialize(program: ReducerProgram, data: Uint8Array): StateHandle;
 
   // ===========================================================================
-  // Undo Log (Phase 29 - optional)
+  // Undo Log and Delta Journal
   // ===========================================================================
 
-  /**
-   * Enable undo logging. Call before speculative execution.
-   * Saves change flags for rollback restoration.
-   */
-  undoEnable?(state: StateHandle): void;
+  /** Enable native undo logging before speculative execution. */
+  undoEnable(state: StateHandle): void;
 
-  /**
-   * Save current undo log position. Returns position as number.
-   */
-  undoCheckpoint?(state: StateHandle): number;
+  /** Save the current native undo-log position. */
+  undoCheckpoint(state: StateHandle): number;
 
-  /**
-   * Rollback all mutations since the given checkpoint position.
-   * After calling, the state buffer contains rolled-back state.
-   */
-  undoRollback?(state: StateHandle, checkpointPos: number): void;
+  /** Roll back every mutation since the checkpoint. */
+  undoRollback(state: StateHandle, checkpointPos: number): void;
 
-  /**
-   * Commit (discard) undo entries since the given checkpoint position.
-   */
-  undoCommit?(state: StateHandle, checkpointPos: number): void;
+  /** Commit and discard undo entries since the checkpoint. */
+  undoCommit(state: StateHandle, checkpointPos: number): void;
 
-  /**
-   * Check if undo log overflowed during speculation.
-   * Used by UndoStage to report overflow status to callers for perf monitoring.
-   */
-  undoHasOverflow?(): boolean;
+  /** Whether the native undo log used its overflow shadow state. */
+  undoHasOverflow(): boolean;
 
-  /**
-   * Export delta segment for mutations in [fromPos, toPos).
-   */
-  deltaExportSegment?(state: StateHandle, fromPos: number, toPos: number): DeltaSegmentExport;
+  /** Export mutation deltas in [fromPos, toPos). */
+  deltaExportSegment(state: StateHandle, fromPos: number, toPos: number): DeltaSegmentExport;
 
-  /**
-   * Apply rollback deltas from a previously exported segment.
-   */
-  deltaApplyRollbackSegment?(state: StateHandle, segment: Uint8Array, entrySize: number): void;
+  /** Apply an exported rollback segment. */
+  deltaApplyRollbackSegment(state: StateHandle, segment: Uint8Array, entrySize: number): void;
 
-  /**
-   * Apply rollforward deltas from a previously exported segment.
-   */
-  deltaApplyRollforwardSegment?(state: StateHandle, segment: Uint8Array, entrySize: number): void;
+  /** Apply an exported rollforward segment. */
+  deltaApplyRollforwardSegment(state: StateHandle, segment: Uint8Array, entrySize: number): void;
 }
 //#endregion axe!n/columine-package.ts-api
 
@@ -462,36 +465,4 @@ export interface DeltaSegmentExport {
   redoBytes: Uint8Array;
   entrySize: number;
   overflow: boolean;
-}
-
-/**
- * Backend variant with native undo log support.
- *
- * The base interface keeps undo methods optional so non-native backends can
- * still implement ColumineBackend, while this type captures the capability
- * contract when native undo is available.
- */
-export interface UndoCapableColumineBackend extends ColumineBackend {
-  undoEnable(state: StateHandle): void;
-  undoCheckpoint(state: StateHandle): number;
-  undoRollback(state: StateHandle, checkpointPos: number): void;
-  undoCommit(state: StateHandle, checkpointPos: number): void;
-  undoHasOverflow(): boolean;
-}
-
-export function isUndoCapableBackend(backend: ColumineBackend): backend is UndoCapableColumineBackend {
-  return (
-    typeof backend.undoEnable === 'function' &&
-    typeof backend.undoCheckpoint === 'function' &&
-    typeof backend.undoRollback === 'function' &&
-    typeof backend.undoCommit === 'function' &&
-    typeof backend.undoHasOverflow === 'function'
-  );
-}
-
-export function assertUndoCapableBackend(backend: ColumineBackend): UndoCapableColumineBackend {
-  if (!isUndoCapableBackend(backend)) {
-    throw new Error('Backend does not support native undo operations');
-  }
-  return backend;
 }

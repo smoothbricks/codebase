@@ -15,7 +15,16 @@
  */
 
 import { parseReducerProgram } from './reducer-bytecode.js';
-import type { ColumineBackend, ColumnInput, ReducerProgram, StateHandle, StructMap2RowRef } from './types.js';
+import type {
+  ColumineBackend,
+  ColumnInput,
+  EvictedRow,
+  ReducerProgram,
+  ScalarValue,
+  StateHandle,
+  StructMap2RowRef,
+} from './types.js';
+import { AggType, ErrorCode, SlotType, SlotTypeFlag } from './types.js';
 
 // =============================================================================
 // Constants
@@ -24,6 +33,9 @@ import type { ColumineBackend, ColumnInput, ReducerProgram, StateHandle, StructM
 const STATE_HEADER_SIZE = 32;
 // Must match vm.zig SLOT_META_SIZE (48 bytes with TTL/eviction fields)
 const SLOT_META_SIZE = 48;
+const EVICTION_ENTRY_SIZE = 16;
+const WASM_PAGE_SIZE = 64 * 1024;
+const STATE_REGION_OFFSET = WASM_PAGE_SIZE;
 
 // WASM returns u32 as signed i32, so 0xFFFFFFFF becomes -1
 const EMPTY_KEY_SIGNED = -1;
@@ -49,12 +61,18 @@ interface WasmStateHandle extends StateHandle {
 // =============================================================================
 
 interface VmExports {
-  // State management
   vm_calculate_state_size(programPtr: number, programLen: number): number;
   vm_init_state(statePtr: number, programPtr: number, programLen: number): number;
   vm_reset_state(statePtr: number, programPtr: number, programLen: number): number;
-
-  // Execution (reducer only)
+  vm_get_needs_growth_slot(): number;
+  vm_calculate_grown_state_size(oldStatePtr: number, programPtr: number, programLen: number, grownSlot: number): number;
+  vm_grow_state(
+    oldStatePtr: number,
+    newStatePtr: number,
+    programPtr: number,
+    programLen: number,
+    grownSlot: number,
+  ): number;
   vm_execute_batch(
     stateBase: number,
     programPtr: number,
@@ -71,8 +89,8 @@ interface VmExports {
     numCols: number,
     batchLen: number,
   ): number;
-
-  // Lookups
+  vm_evict_all_expired(stateBase: number, now: number): number;
+  vm_get_evicted_count(): number;
   vm_map_get(stateBase: number, slotOffset: number, capacity: number, key: number): number;
   vm_set_contains(stateBase: number, slotOffset: number, capacity: number, elem: number): number;
   vm_struct_map2_get_row_ptr(
@@ -100,14 +118,11 @@ interface VmExports {
     numFields: number,
     pos: number,
   ): number;
-
-  // Undo log operations (Phase 29)
   vm_undo_enable(stateBase: number, stateSize: number): void;
   vm_undo_checkpoint(stateBase: number): number;
   vm_undo_rollback(stateBase: number, checkpointPos: number): void;
   vm_undo_commit(stateBase: number, checkpointPos: number): void;
   vm_undo_has_overflow(): number;
-
   vm_delta_export_segment(stateBase: number, fromPos: number, toPos: number): number;
   vm_delta_export_undo_ptr(): number;
   vm_delta_export_redo_ptr(): number;
@@ -135,100 +150,58 @@ interface VmExports {
 interface WasmInstance {
   memory: WebAssembly.Memory;
   exports: VmExports;
-  /** Offset in WASM memory where state is copied to */
   stateRegionOffset: number;
-  /** Offset in WASM memory where input columns are copied to */
-  inputRegionOffset: number;
 }
 
 function isWasmFunction<T extends (...args: never[]) => unknown>(value: unknown): value is T {
   return typeof value === 'function';
 }
 
+const VM_EXPORT_NAMES = [
+  'vm_calculate_state_size',
+  'vm_init_state',
+  'vm_reset_state',
+  'vm_get_needs_growth_slot',
+  'vm_calculate_grown_state_size',
+  'vm_grow_state',
+  'vm_execute_batch',
+  'vm_execute_batch_delta',
+  'vm_evict_all_expired',
+  'vm_get_evicted_count',
+  'vm_map_get',
+  'vm_set_contains',
+  'vm_struct_map2_get_row_ptr',
+  'vm_struct_map2_iter_start',
+  'vm_struct_map2_iter_next',
+  'vm_struct_map2_iter_key1',
+  'vm_struct_map2_iter_key2',
+  'vm_undo_enable',
+  'vm_undo_checkpoint',
+  'vm_undo_rollback',
+  'vm_undo_commit',
+  'vm_undo_has_overflow',
+  'vm_delta_export_segment',
+  'vm_delta_export_undo_ptr',
+  'vm_delta_export_redo_ptr',
+  'vm_delta_export_len_bytes',
+  'vm_delta_export_entry_size',
+  'vm_delta_export_overflow',
+  'vm_delta_apply_rollback_segment',
+  'vm_delta_apply_rollforward_segment',
+] as const;
+
+function hasVmExports(
+  exports: WebAssembly.Instance['exports'],
+): exports is WebAssembly.Instance['exports'] & VmExports {
+  return VM_EXPORT_NAMES.every((name) => isWasmFunction(exports[name]));
+}
+
 function parseVmExports(exports: WebAssembly.Instance['exports']): VmExports {
-  const calculateStateSize = exports.vm_calculate_state_size;
-  const initState = exports.vm_init_state;
-  const resetState = exports.vm_reset_state;
-  const executeBatch = exports.vm_execute_batch;
-  const executeBatchDelta = exports.vm_execute_batch_delta;
-  const mapGet = exports.vm_map_get;
-  const setContains = exports.vm_set_contains;
-  const structMap2GetRowPtr = exports.vm_struct_map2_get_row_ptr;
-  const structMap2IterStart = exports.vm_struct_map2_iter_start;
-  const structMap2IterNext = exports.vm_struct_map2_iter_next;
-  const structMap2IterKey1 = exports.vm_struct_map2_iter_key1;
-  const structMap2IterKey2 = exports.vm_struct_map2_iter_key2;
-  const undoEnable = exports.vm_undo_enable;
-  const undoCheckpoint = exports.vm_undo_checkpoint;
-  const undoRollback = exports.vm_undo_rollback;
-  const undoCommit = exports.vm_undo_commit;
-  const undoHasOverflow = exports.vm_undo_has_overflow;
-  const deltaExportSegment = exports.vm_delta_export_segment;
-  const deltaExportUndoPtr = exports.vm_delta_export_undo_ptr;
-  const deltaExportRedoPtr = exports.vm_delta_export_redo_ptr;
-  const deltaExportLenBytes = exports.vm_delta_export_len_bytes;
-  const deltaExportEntrySize = exports.vm_delta_export_entry_size;
-  const deltaExportOverflow = exports.vm_delta_export_overflow;
-  const deltaApplyRollbackSegment = exports.vm_delta_apply_rollback_segment;
-  const deltaApplyRollforwardSegment = exports.vm_delta_apply_rollforward_segment;
-
-  if (
-    !isWasmFunction<VmExports['vm_calculate_state_size']>(calculateStateSize) ||
-    !isWasmFunction<VmExports['vm_init_state']>(initState) ||
-    !isWasmFunction<VmExports['vm_reset_state']>(resetState) ||
-    !isWasmFunction<VmExports['vm_execute_batch']>(executeBatch) ||
-    !isWasmFunction<VmExports['vm_execute_batch_delta']>(executeBatchDelta) ||
-    !isWasmFunction<VmExports['vm_map_get']>(mapGet) ||
-    !isWasmFunction<VmExports['vm_set_contains']>(setContains) ||
-    !isWasmFunction<VmExports['vm_struct_map2_get_row_ptr']>(structMap2GetRowPtr) ||
-    !isWasmFunction<VmExports['vm_struct_map2_iter_start']>(structMap2IterStart) ||
-    !isWasmFunction<VmExports['vm_struct_map2_iter_next']>(structMap2IterNext) ||
-    !isWasmFunction<VmExports['vm_struct_map2_iter_key1']>(structMap2IterKey1) ||
-    !isWasmFunction<VmExports['vm_struct_map2_iter_key2']>(structMap2IterKey2) ||
-    !isWasmFunction<VmExports['vm_undo_enable']>(undoEnable) ||
-    !isWasmFunction<VmExports['vm_undo_checkpoint']>(undoCheckpoint) ||
-    !isWasmFunction<VmExports['vm_undo_rollback']>(undoRollback) ||
-    !isWasmFunction<VmExports['vm_undo_commit']>(undoCommit) ||
-    !isWasmFunction<VmExports['vm_undo_has_overflow']>(undoHasOverflow) ||
-    !isWasmFunction<VmExports['vm_delta_export_segment']>(deltaExportSegment) ||
-    !isWasmFunction<VmExports['vm_delta_export_undo_ptr']>(deltaExportUndoPtr) ||
-    !isWasmFunction<VmExports['vm_delta_export_redo_ptr']>(deltaExportRedoPtr) ||
-    !isWasmFunction<VmExports['vm_delta_export_len_bytes']>(deltaExportLenBytes) ||
-    !isWasmFunction<VmExports['vm_delta_export_entry_size']>(deltaExportEntrySize) ||
-    !isWasmFunction<VmExports['vm_delta_export_overflow']>(deltaExportOverflow) ||
-    !isWasmFunction<VmExports['vm_delta_apply_rollback_segment']>(deltaApplyRollbackSegment) ||
-    !isWasmFunction<VmExports['vm_delta_apply_rollforward_segment']>(deltaApplyRollforwardSegment)
-  ) {
-    throw new Error('WASM module missing VM exports');
+  if (!hasVmExports(exports)) {
+    const missing = VM_EXPORT_NAMES.find((name) => !isWasmFunction(exports[name]));
+    throw new Error(`WASM module missing VM export: ${missing ?? 'unknown'}`);
   }
-
-  return {
-    vm_calculate_state_size: calculateStateSize,
-    vm_init_state: initState,
-    vm_reset_state: resetState,
-    vm_execute_batch: executeBatch,
-    vm_execute_batch_delta: executeBatchDelta,
-    vm_map_get: mapGet,
-    vm_set_contains: setContains,
-    vm_struct_map2_get_row_ptr: structMap2GetRowPtr,
-    vm_struct_map2_iter_start: structMap2IterStart,
-    vm_struct_map2_iter_next: structMap2IterNext,
-    vm_struct_map2_iter_key1: structMap2IterKey1,
-    vm_struct_map2_iter_key2: structMap2IterKey2,
-    vm_undo_enable: undoEnable,
-    vm_undo_checkpoint: undoCheckpoint,
-    vm_undo_rollback: undoRollback,
-    vm_undo_commit: undoCommit,
-    vm_undo_has_overflow: undoHasOverflow,
-    vm_delta_export_segment: deltaExportSegment,
-    vm_delta_export_undo_ptr: deltaExportUndoPtr,
-    vm_delta_export_redo_ptr: deltaExportRedoPtr,
-    vm_delta_export_len_bytes: deltaExportLenBytes,
-    vm_delta_export_entry_size: deltaExportEntrySize,
-    vm_delta_export_overflow: deltaExportOverflow,
-    vm_delta_apply_rollback_segment: deltaApplyRollbackSegment,
-    vm_delta_apply_rollforward_segment: deltaApplyRollforwardSegment,
-  };
+  return exports;
 }
 
 function getExportedMemory(exports: WebAssembly.Instance['exports']): WebAssembly.Memory | null {
@@ -265,7 +238,7 @@ function isWasmStateHandle(state: StateHandle): state is WasmStateHandle {
 }
 
 function align8(n: number): number {
-  return (n + 7) & ~7;
+  return Math.ceil(n / 8) * 8;
 }
 
 // =============================================================================
@@ -280,37 +253,204 @@ function align8(n: number): number {
  * @param memoryPages - WASM memory size in 64KB pages (default: 256 = 16MB)
  */
 export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryPages = 256): Promise<ColumineBackend> {
-  // Create shared WASM memory for modules that import it
   const importedMemory = new WebAssembly.Memory({ initial: memoryPages });
-
-  // Compile and instantiate WASM module ONCE
   const wasmModule = await WebAssembly.compile(wasmBytes);
-  const instance = await WebAssembly.instantiate(wasmModule, {
-    env: { memory: importedMemory },
-  });
-
+  const instance = await WebAssembly.instantiate(wasmModule, { env: { memory: importedMemory } });
   const exports = parseVmExports(instance.exports);
+  const memory = getExportedMemory(instance.exports) ?? importedMemory;
+  const currentPages = memory.buffer.byteLength / WASM_PAGE_SIZE;
+  if (currentPages < memoryPages) memory.grow(memoryPages - currentPages);
 
-  // Use exported memory if the module provides one,
-  // otherwise fall back to the imported memory we created above
-  const exportedMemory = getExportedMemory(instance.exports);
-  const memory = exportedMemory ?? importedMemory;
-
-  // Ensure memory is large enough for the layout
-  const currentPages = memory.buffer.byteLength / 65536;
-  if (currentPages < memoryPages) {
-    memory.grow(memoryPages - currentPages);
-  }
-
-  // Memory layout:
-  // [0, 64KB) - reserved for WASM stack/heap
-  // [64KB, 8MB) - state region (holds one agent's state during execution)
-  // [8MB, 16MB) - input region (holds columns during execution)
   const wasmInstance: WasmInstance = {
     memory,
     exports,
-    stateRegionOffset: 64 * 1024, // 64KB
-    inputRegionOffset: 8 * 1024 * 1024, // 8MB
+    stateRegionOffset: STATE_REGION_OFFSET,
+  };
+
+  const ensureMemory = (endExclusive: number): void => {
+    if (!Number.isSafeInteger(endExclusive) || endExclusive < 0) {
+      throw new RangeError(`Invalid WASM memory extent: ${endExclusive}`);
+    }
+    const missing = endExclusive - wasmInstance.memory.buffer.byteLength;
+    if (missing > 0) wasmInstance.memory.grow(Math.ceil(missing / WASM_PAGE_SIZE));
+  };
+
+  const copyStateIn = (state: WasmStateHandle): number => {
+    const statePtr = wasmInstance.stateRegionOffset;
+    ensureMemory(statePtr + state.size);
+    new Uint8Array(wasmInstance.memory.buffer).set(new Uint8Array(state.buffer), statePtr);
+    return statePtr;
+  };
+
+  const prepareProgramAfterState = (stateSize: number, program: ReducerProgram): number => {
+    const programPtr = align8(wasmInstance.stateRegionOffset + stateSize);
+    ensureMemory(programPtr + program.bytecode.byteLength);
+    new Uint8Array(wasmInstance.memory.buffer).set(program.bytecode, programPtr);
+    return programPtr;
+  };
+
+  const prepareExecution = (
+    state: WasmStateHandle,
+    program: ReducerProgram,
+    columns: ColumnInput[],
+  ): { statePtr: number; programPtr: number; colPtrsPtr: number } => {
+    const statePtr = wasmInstance.stateRegionOffset;
+    const programPtr = align8(statePtr + state.size);
+    let cursor = align8(programPtr + program.bytecode.byteLength);
+    for (const column of columns) cursor = align8(cursor + column.data.byteLength);
+    const colPtrsPtr = cursor;
+    ensureMemory(colPtrsPtr + columns.length * Uint32Array.BYTES_PER_ELEMENT);
+
+    const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
+    const wasmU32 = new Uint32Array(wasmInstance.memory.buffer);
+    wasmU8.set(new Uint8Array(state.buffer), statePtr);
+    wasmU8.set(program.bytecode, programPtr);
+    cursor = align8(programPtr + program.bytecode.byteLength);
+    if (!scratchColPtrs || scratchColPtrsWidth < columns.length) {
+      scratchColPtrs = new Uint32Array(columns.length);
+      scratchColPtrsWidth = columns.length;
+    }
+    for (let i = 0; i < columns.length; i++) {
+      const data = columns[i].data;
+      const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      wasmU8.set(bytes, cursor);
+      scratchColPtrs[i] = cursor;
+      cursor = align8(cursor + bytes.byteLength);
+    }
+    for (let i = 0; i < columns.length; i++) {
+      wasmU32[colPtrsPtr / 4 + i] = scratchColPtrs[i];
+    }
+    return { statePtr, programPtr, colPtrsPtr };
+  };
+
+  const growFromAuthority = (
+    state: WasmStateHandle,
+    program: ReducerProgram,
+    statePtr: number,
+    failedAttemptCheckpoint: number,
+  ): number => {
+    wasmInstance.exports.vm_undo_rollback(statePtr, failedAttemptCheckpoint);
+    const grownSlot = wasmInstance.exports.vm_get_needs_growth_slot();
+    if (grownSlot >= program.numSlots) return ErrorCode.INVALID_SLOT;
+
+    ensureMemory(statePtr + state.size);
+    new Uint8Array(wasmInstance.memory.buffer).set(new Uint8Array(state.buffer), statePtr);
+    const sizeProbeProgramPtr = prepareProgramAfterState(state.size, program);
+    const grownSize = wasmInstance.exports.vm_calculate_grown_state_size(
+      statePtr,
+      sizeProbeProgramPtr,
+      program.bytecode.byteLength,
+      grownSlot,
+    );
+    if (grownSize <= state.size) return ErrorCode.INVALID_STATE;
+
+    const newStatePtr = align8(statePtr + state.size);
+    const growthProgramPtr = align8(newStatePtr + grownSize);
+    ensureMemory(growthProgramPtr + program.bytecode.byteLength);
+    const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
+    wasmU8.set(new Uint8Array(state.buffer), statePtr);
+    wasmU8.fill(0, newStatePtr, newStatePtr + grownSize);
+    wasmU8.set(program.bytecode, growthProgramPtr);
+    const result = wasmInstance.exports.vm_grow_state(
+      statePtr,
+      newStatePtr,
+      growthProgramPtr,
+      program.bytecode.byteLength,
+      grownSlot,
+    );
+    if (result !== ErrorCode.OK) return result;
+
+    const grownBuffer = new ArrayBuffer(grownSize);
+    new Uint8Array(grownBuffer).set(new Uint8Array(wasmInstance.memory.buffer, newStatePtr, grownSize));
+    state.buffer = grownBuffer;
+    state.size = grownSize;
+    return ErrorCode.OK;
+  };
+
+  const executeWithGrowth = (
+    stateHandle: StateHandle,
+    program: ReducerProgram,
+    columns: ColumnInput[],
+    batchLen: number,
+    delta: boolean,
+  ): number => {
+    const state = assertWasmStateHandle(stateHandle);
+    for (;;) {
+      const { statePtr, programPtr, colPtrsPtr } = prepareExecution(state, program, columns);
+      const checkpoint = wasmInstance.exports.vm_undo_checkpoint(statePtr);
+      const result = delta
+        ? wasmInstance.exports.vm_execute_batch_delta(
+            statePtr,
+            programPtr,
+            program.bytecode.length,
+            colPtrsPtr,
+            columns.length,
+            batchLen,
+          )
+        : wasmInstance.exports.vm_execute_batch(
+            statePtr,
+            programPtr,
+            program.bytecode.length,
+            colPtrsPtr,
+            columns.length,
+            batchLen,
+          );
+
+      if (result === ErrorCode.NEEDS_GROWTH) {
+        const growthResult = growFromAuthority(state, program, statePtr, checkpoint);
+        if (growthResult !== ErrorCode.OK) return growthResult;
+        continue;
+      }
+      if (result !== ErrorCode.OK) {
+        wasmInstance.exports.vm_undo_rollback(statePtr, checkpoint);
+        new Uint8Array(wasmInstance.memory.buffer).set(new Uint8Array(state.buffer), statePtr);
+        return result;
+      }
+
+      new Uint8Array(state.buffer).set(new Uint8Array(wasmInstance.memory.buffer, statePtr, state.size));
+      return ErrorCode.OK;
+    }
+  };
+
+  const readScalarValue = (state: WasmStateHandle, program: ReducerProgram, slot: number): ScalarValue => {
+    const slotDef = program.slotDefs[slot];
+    if (!slotDef || slotDef.type !== SlotType.SCALAR) throw new RangeError(`Slot ${slot} is not a scalar slot`);
+    const view = new DataView(state.buffer);
+    const meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
+    const dataOffset = view.getUint32(meta, true);
+    const timestamp = view.getFloat64(dataOffset + 8, true);
+    if (timestamp === Number.NEGATIVE_INFINITY) return { kind: 'empty' };
+    switch (slotDef.aggType) {
+      case AggType.SCALAR_U32:
+        return { kind: 'u32', value: view.getUint32(dataOffset, true) };
+      case AggType.SCALAR_F64:
+        return { kind: 'f64', value: view.getFloat64(dataOffset, true) };
+      case AggType.SCALAR_I64:
+        return { kind: 'i64', value: view.getBigInt64(dataOffset, true) };
+      default:
+        throw new Error(`Invalid scalar subtype ${slotDef.aggType}`);
+    }
+  };
+
+  const readEvictedRows = (state: WasmStateHandle, program: ReducerProgram): readonly EvictedRow[] => {
+    const view = new DataView(state.buffer);
+    const rows: EvictedRow[] = [];
+    for (let slot = 0; slot < program.numSlots; slot++) {
+      const meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
+      if ((view.getUint8(meta + 12) & SlotTypeFlag.HAS_EVICT_TRIGGER) === 0) continue;
+      const bufferOffset = view.getUint32(meta + 36, true);
+      const count = view.getUint32(meta + 40, true);
+      for (let i = 0; i < count; i++) {
+        const entry = bufferOffset + i * EVICTION_ENTRY_SIZE;
+        rows.push({
+          slot,
+          timestamp: view.getFloat64(entry, true),
+          key: view.getUint32(entry + 8, true),
+          value: view.getUint32(entry + 12, true),
+        });
+      }
+    }
+    return rows;
   };
 
   const backend: ColumineBackend = {
@@ -321,242 +461,110 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
     },
 
     createState(program: ReducerProgram): StateHandle {
-      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
+      const probePtr = wasmInstance.stateRegionOffset;
+      ensureMemory(probePtr + program.bytecode.byteLength);
+      new Uint8Array(wasmInstance.memory.buffer).set(program.bytecode, probePtr);
+      const stateSize = wasmInstance.exports.vm_calculate_state_size(probePtr, program.bytecode.length);
+      if (stateSize === 0) throw new Error('Invalid program: cannot calculate state size');
 
-      // Copy program to WASM memory for size calculation
-      const programPtr = wasmInstance.inputRegionOffset;
-      wasmU8.set(program.bytecode, programPtr);
-
-      // Calculate state size using Zig
-      const stateSize = wasmInstance.exports.vm_calculate_state_size(programPtr, program.bytecode.length);
-      if (stateSize === 0) {
-        throw new Error('Invalid program: cannot calculate state size');
-      }
-
-      // Initialize state in WASM memory
       const statePtr = wasmInstance.stateRegionOffset;
+      const programPtr = align8(statePtr + stateSize);
+      ensureMemory(programPtr + program.bytecode.byteLength);
+      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
+      wasmU8.fill(0, statePtr, statePtr + stateSize);
+      wasmU8.set(program.bytecode, programPtr);
       const initResult = wasmInstance.exports.vm_init_state(statePtr, programPtr, program.bytecode.length);
-      if (initResult !== 0) {
+      if (initResult !== ErrorCode.OK) {
         throw new Error(`Failed to initialize state: error code ${initResult}`);
       }
-
-      // Copy initialized state OUT to JS ArrayBuffer
       const buffer = new ArrayBuffer(stateSize);
-      new Uint8Array(buffer).set(wasmU8.subarray(statePtr, statePtr + stateSize));
-
+      new Uint8Array(buffer).set(new Uint8Array(wasmInstance.memory.buffer, statePtr, stateSize));
       return createWasmStateHandle(buffer, stateSize);
     },
 
-    resetState(state: StateHandle, program: ReducerProgram): void {
-      const s = assertWasmStateHandle(state);
-      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
-
-      // Copy program to WASM memory
-      const programPtr = wasmInstance.inputRegionOffset;
-      wasmU8.set(program.bytecode, programPtr);
-
-      // Reset state in WASM memory
-      const statePtr = wasmInstance.stateRegionOffset;
-      wasmInstance.exports.vm_reset_state(statePtr, programPtr, program.bytecode.length);
-
-      // Copy reset state OUT to JS ArrayBuffer
-      new Uint8Array(s.buffer).set(wasmU8.subarray(statePtr, statePtr + s.size));
+    resetState(stateHandle: StateHandle, program: ReducerProgram): void {
+      const state = assertWasmStateHandle(stateHandle);
+      const statePtr = copyStateIn(state);
+      const programPtr = prepareProgramAfterState(state.size, program);
+      const result = wasmInstance.exports.vm_reset_state(statePtr, programPtr, program.bytecode.length);
+      if (result !== ErrorCode.OK) throw new Error(`Failed to reset state: error code ${result}`);
+      new Uint8Array(state.buffer).set(new Uint8Array(wasmInstance.memory.buffer, statePtr, state.size));
     },
 
-    executeBatch(state: StateHandle, program: ReducerProgram, columns: ColumnInput[], batchLen: number): number {
-      const s = assertWasmStateHandle(state);
-      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
-      const wasmU32 = new Uint32Array(wasmInstance.memory.buffer);
+    executeBatch(state, program, columns, batchLen) {
+      return executeWithGrowth(state, program, columns, batchLen, false);
+    },
 
-      // 1. Copy state INTO WASM memory
-      const statePtr = wasmInstance.stateRegionOffset;
-      wasmU8.set(new Uint8Array(s.buffer), statePtr);
+    executeBatchDelta(state, program, columns, batchLen) {
+      return executeWithGrowth(state, program, columns, batchLen, true);
+    },
 
-      // 2. Copy program bytecode to input region
-      const programPtr = wasmInstance.inputRegionOffset;
-      wasmU8.set(program.bytecode, programPtr);
+    getMapSize(stateHandle, _program, slot) {
+      const state = assertWasmStateHandle(stateHandle);
+      return new DataView(state.buffer).getUint32(STATE_HEADER_SIZE + slot * SLOT_META_SIZE + 8, true);
+    },
 
-      // 3. Copy input columns after program
-      let colDataOffset = programPtr + align8(program.bytecode.length);
+    getSetSize(stateHandle, _program, slot) {
+      const state = assertWasmStateHandle(stateHandle);
+      return new DataView(state.buffer).getUint32(STATE_HEADER_SIZE + slot * SLOT_META_SIZE + 8, true);
+    },
 
-      // Reuse scratch buffer for column pointers to avoid per-batch allocation.
-      // Grows only when schema width increases (rare — typically once on first call).
-      if (!scratchColPtrs || scratchColPtrsWidth < columns.length) {
-        scratchColPtrs = new Uint32Array(columns.length);
-        scratchColPtrsWidth = columns.length;
+    getAggregateValue(stateHandle, _program, slot) {
+      const state = assertWasmStateHandle(stateHandle);
+      const view = new DataView(state.buffer);
+      const meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
+      const dataOffset = view.getUint32(meta, true);
+      if (view.getUint8(meta + 13) === 2) {
+        return view.getUint32(dataOffset, true) + view.getUint32(dataOffset + 4, true) * 0x100000000;
       }
+      return view.getFloat64(dataOffset, true);
+    },
 
-      for (let i = 0; i < columns.length; i++) {
-        const col = columns[i];
-        const bytes = new Uint8Array(col.data.buffer, col.data.byteOffset, col.data.byteLength);
-        wasmU8.set(bytes, colDataOffset);
-        scratchColPtrs[i] = colDataOffset;
-        colDataOffset += align8(bytes.length);
-      }
+    getScalarValue(stateHandle, program, slot) {
+      return readScalarValue(assertWasmStateHandle(stateHandle), program, slot);
+    },
 
-      // 4. Write column pointers array
-      const colPtrsPtr = colDataOffset;
-      for (let i = 0; i < columns.length; i++) {
-        wasmU32[(colPtrsPtr + i * 4) / 4] = scratchColPtrs[i];
-      }
-
-      // 5. Execute
-      const result = wasmInstance.exports.vm_execute_batch(
+    mapGet(stateHandle, _program, slot, key) {
+      const state = assertWasmStateHandle(stateHandle);
+      const statePtr = copyStateIn(state);
+      const view = new DataView(state.buffer);
+      const meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
+      const result = wasmInstance.exports.vm_map_get(
         statePtr,
-        programPtr,
-        program.bytecode.length,
-        colPtrsPtr,
-        columns.length,
-        batchLen,
+        view.getUint32(meta, true),
+        view.getUint32(meta + 4, true),
+        key,
       );
-
-      // 6. Copy state OUT of WASM memory back to JS ArrayBuffer.
-      // Re-create view because WASM memory may have grown (e.g., dynamic shadow
-      // buffer allocation during undo overflow), which detaches the old ArrayBuffer.
-      const freshU8 = new Uint8Array(wasmInstance.memory.buffer);
-      new Uint8Array(s.buffer).set(freshU8.subarray(statePtr, statePtr + s.size));
-
-      return result;
-    },
-
-    executeBatchDelta(state: StateHandle, program: ReducerProgram, columns: ColumnInput[], batchLen: number): number {
-      const s = assertWasmStateHandle(state);
-      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
-      const wasmU32 = new Uint32Array(wasmInstance.memory.buffer);
-
-      const statePtr = wasmInstance.stateRegionOffset;
-      wasmU8.set(new Uint8Array(s.buffer), statePtr);
-
-      const programPtr = wasmInstance.inputRegionOffset;
-      wasmU8.set(program.bytecode, programPtr);
-
-      let colDataOffset = programPtr + align8(program.bytecode.length);
-
-      if (!scratchColPtrs || scratchColPtrsWidth < columns.length) {
-        scratchColPtrs = new Uint32Array(columns.length);
-        scratchColPtrsWidth = columns.length;
-      }
-
-      for (let i = 0; i < columns.length; i++) {
-        const col = columns[i];
-        const bytes = new Uint8Array(col.data.buffer, col.data.byteOffset, col.data.byteLength);
-        wasmU8.set(bytes, colDataOffset);
-        scratchColPtrs[i] = colDataOffset;
-        colDataOffset += align8(bytes.length);
-      }
-
-      const colPtrsPtr = colDataOffset;
-      for (let i = 0; i < columns.length; i++) {
-        wasmU32[(colPtrsPtr + i * 4) / 4] = scratchColPtrs[i];
-      }
-
-      const result = wasmInstance.exports.vm_execute_batch_delta(
-        statePtr,
-        programPtr,
-        program.bytecode.length,
-        colPtrsPtr,
-        columns.length,
-        batchLen,
-      );
-
-      const freshU8 = new Uint8Array(wasmInstance.memory.buffer);
-      new Uint8Array(s.buffer).set(freshU8.subarray(statePtr, statePtr + s.size));
-
-      return result;
-    },
-
-    getMapSize(state: StateHandle, _program: ReducerProgram, slot: number): number {
-      const s = assertWasmStateHandle(state);
-      const u32 = new Uint32Array(s.buffer);
-      const metaIdx = (STATE_HEADER_SIZE + slot * SLOT_META_SIZE) / 4;
-      return u32[metaIdx + 2]; // size field
-    },
-
-    getSetSize(state: StateHandle, _program: ReducerProgram, slot: number): number {
-      const s = assertWasmStateHandle(state);
-      const u32 = new Uint32Array(s.buffer);
-      const metaIdx = (STATE_HEADER_SIZE + slot * SLOT_META_SIZE) / 4;
-      return u32[metaIdx + 2];
-    },
-
-    getAggregateValue(state: StateHandle, _program: ReducerProgram, slot: number): number {
-      const s = assertWasmStateHandle(state);
-      const u8 = new Uint8Array(s.buffer);
-      const u32 = new Uint32Array(s.buffer);
-      const f64 = new Float64Array(s.buffer);
-      const metaStart = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
-      const dataOffset = u32[metaStart / 4];
-      // aggType is a single byte at offset 13 within the slot meta (SlotMetaOffset.AGG_TYPE)
-      const aggType = u8[metaStart + 13];
-
-      if (aggType === 2) {
-        // COUNT layout: u64 at offset 0 (8 bytes total, no value field)
-        const countLo = u32[dataOffset / 4];
-        const countHi = u32[dataOffset / 4 + 1];
-        return countLo + countHi * 0x100000000;
-      }
-      return f64[dataOffset / 8];
-    },
-
-    mapGet(state: StateHandle, _program: ReducerProgram, slot: number, key: number): number | undefined {
-      const s = assertWasmStateHandle(state);
-      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
-
-      // Copy state to WASM for lookup
-      const statePtr = wasmInstance.stateRegionOffset;
-      wasmU8.set(new Uint8Array(s.buffer), statePtr);
-
-      // Get slot metadata from JS buffer
-      const u32 = new Uint32Array(s.buffer);
-      const metaIdx = (STATE_HEADER_SIZE + slot * SLOT_META_SIZE) / 4;
-      const dataOffset = u32[metaIdx];
-      const capacity = u32[metaIdx + 1];
-
-      const result = wasmInstance.exports.vm_map_get(statePtr, dataOffset, capacity, key);
       return result === EMPTY_KEY_SIGNED ? undefined : result;
     },
 
-    setContains(state: StateHandle, _program: ReducerProgram, slot: number, elem: number): boolean {
-      const s = assertWasmStateHandle(state);
-      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
-
-      // Copy state to WASM for lookup
-      const statePtr = wasmInstance.stateRegionOffset;
-      wasmU8.set(new Uint8Array(s.buffer), statePtr);
-
-      // Get slot metadata from JS buffer
-      const u32 = new Uint32Array(s.buffer);
-      const metaIdx = (STATE_HEADER_SIZE + slot * SLOT_META_SIZE) / 4;
-      const dataOffset = u32[metaIdx];
-      const capacity = u32[metaIdx + 1];
-
-      return wasmInstance.exports.vm_set_contains(statePtr, dataOffset, capacity, elem) !== 0;
+    setContains(stateHandle, _program, slot, elem) {
+      const state = assertWasmStateHandle(stateHandle);
+      const statePtr = copyStateIn(state);
+      const view = new DataView(state.buffer);
+      const meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
+      return (
+        wasmInstance.exports.vm_set_contains(
+          statePtr,
+          view.getUint32(meta, true),
+          view.getUint32(meta + 4, true),
+          elem,
+        ) !== 0
+      );
     },
 
-    structMap2GetRow(
-      state: StateHandle,
-      _program: ReducerProgram,
-      slot: number,
-      key1: number,
-      key2: number,
-    ): StructMap2RowRef | undefined {
-      const s = assertWasmStateHandle(state);
-      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
-      const statePtr = wasmInstance.stateRegionOffset;
-      wasmU8.set(new Uint8Array(s.buffer), statePtr);
-      const bytes = new Uint8Array(s.buffer);
-      const view = new DataView(s.buffer);
+    structMap2GetRow(stateHandle, _program, slot, key1, key2) {
+      const state = assertWasmStateHandle(stateHandle);
+      const statePtr = copyStateIn(state);
+      const bytes = new Uint8Array(state.buffer);
+      const view = new DataView(state.buffer);
       const meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
-      const slotOffset = view.getUint32(meta, true);
-      const capacity = view.getUint32(meta + 4, true);
-      const numFields = bytes[meta + 13];
-      const rowSize = view.getUint16(meta + 16, true);
       const rowOffset = wasmInstance.exports.vm_struct_map2_get_row_ptr(
         statePtr,
-        slotOffset,
-        capacity,
-        numFields,
-        rowSize,
+        view.getUint32(meta, true),
+        view.getUint32(meta + 4, true),
+        bytes[meta + 13],
+        view.getUint16(meta + 16, true),
         key1,
         key2,
       );
@@ -564,13 +572,11 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
       return { key1: key1 >>> 0, key2: key2 >>> 0, rowOffset: rowOffset >>> 0 };
     },
 
-    structMap2Entries(state: StateHandle, _program: ReducerProgram, slot: number): readonly StructMap2RowRef[] {
-      const s = assertWasmStateHandle(state);
-      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
-      const statePtr = wasmInstance.stateRegionOffset;
-      wasmU8.set(new Uint8Array(s.buffer), statePtr);
-      const bytes = new Uint8Array(s.buffer);
-      const view = new DataView(s.buffer);
+    structMap2Entries(stateHandle, _program, slot) {
+      const state = assertWasmStateHandle(stateHandle);
+      const statePtr = copyStateIn(state);
+      const bytes = new Uint8Array(state.buffer);
+      const view = new DataView(state.buffer);
       const meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
       const slotOffset = view.getUint32(meta, true);
       const capacity = view.getUint32(meta + 4, true);
@@ -590,101 +596,88 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
       return rows;
     },
 
-    serialize(state: StateHandle, _program: ReducerProgram): Uint8Array {
-      const s = assertWasmStateHandle(state);
-      // Return a copy of the JS ArrayBuffer
-      return new Uint8Array(s.buffer).slice();
+    evictExpired(stateHandle, program, now) {
+      const state = assertWasmStateHandle(stateHandle);
+      const statePtr = copyStateIn(state);
+      const status = wasmInstance.exports.vm_evict_all_expired(statePtr, now);
+      if (status !== ErrorCode.OK) return { ok: false, error: status as ErrorCode };
+      const count = wasmInstance.exports.vm_get_evicted_count();
+      new Uint8Array(state.buffer).set(new Uint8Array(wasmInstance.memory.buffer, statePtr, state.size));
+      return { ok: true, count, rows: readEvictedRows(state, program) };
     },
 
-    deserialize(_program: ReducerProgram, data: Uint8Array): StateHandle {
-      // Create new ArrayBuffer with the data
+    serialize(stateHandle, _program) {
+      return new Uint8Array(assertWasmStateHandle(stateHandle).buffer).slice();
+    },
+
+    deserialize(_program, data) {
       const buffer = new ArrayBuffer(data.length);
       new Uint8Array(buffer).set(data);
-
       return createWasmStateHandle(buffer, data.length);
     },
 
-    // =========================================================================
-    // Undo Log (Phase 29)
-    // =========================================================================
-
-    undoEnable(state: StateHandle): void {
-      const s = assertWasmStateHandle(state);
-      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
-      // Copy state INTO WASM so enable can save change flags
-      const statePtr = wasmInstance.stateRegionOffset;
-      wasmU8.set(new Uint8Array(s.buffer), statePtr);
-      // Pass state size so Zig can snapshot into shadow buffer on undo log overflow
-      wasmInstance.exports.vm_undo_enable(statePtr, s.size);
+    undoEnable(stateHandle) {
+      const state = assertWasmStateHandle(stateHandle);
+      const statePtr = copyStateIn(state);
+      wasmInstance.exports.vm_undo_enable(statePtr, state.size);
     },
 
-    undoCheckpoint(_state: StateHandle): number {
-      const statePtr = wasmInstance.stateRegionOffset;
-      return wasmInstance.exports.vm_undo_checkpoint(statePtr);
+    undoCheckpoint(stateHandle) {
+      assertWasmStateHandle(stateHandle);
+      return wasmInstance.exports.vm_undo_checkpoint(wasmInstance.stateRegionOffset);
     },
 
-    undoRollback(state: StateHandle, checkpointPos: number): void {
-      const s = assertWasmStateHandle(state);
+    undoRollback(stateHandle, checkpointPos) {
+      const state = assertWasmStateHandle(stateHandle);
       const statePtr = wasmInstance.stateRegionOffset;
-      // State is already in WASM memory from the last executeBatch
       wasmInstance.exports.vm_undo_rollback(statePtr, checkpointPos);
-      // Copy rolled-back state OUT of WASM to JS ArrayBuffer
-      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
-      new Uint8Array(s.buffer).set(wasmU8.subarray(statePtr, statePtr + s.size));
+      new Uint8Array(state.buffer).set(new Uint8Array(wasmInstance.memory.buffer, statePtr, state.size));
     },
 
-    undoCommit(_state: StateHandle, checkpointPos: number): void {
-      const statePtr = wasmInstance.stateRegionOffset;
-      wasmInstance.exports.vm_undo_commit(statePtr, checkpointPos);
+    undoCommit(stateHandle, checkpointPos) {
+      assertWasmStateHandle(stateHandle);
+      wasmInstance.exports.vm_undo_commit(wasmInstance.stateRegionOffset, checkpointPos);
     },
 
-    undoHasOverflow(): boolean {
+    undoHasOverflow() {
       return wasmInstance.exports.vm_undo_has_overflow() !== 0;
     },
 
-    deltaExportSegment(state: StateHandle, fromPos: number, toPos: number) {
-      const s = assertWasmStateHandle(state);
-      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
-      const statePtr = wasmInstance.stateRegionOffset;
-      wasmU8.set(new Uint8Array(s.buffer), statePtr);
-
+    deltaExportSegment(stateHandle, fromPos, toPos) {
+      const state = assertWasmStateHandle(stateHandle);
+      const statePtr = copyStateIn(state);
       wasmInstance.exports.vm_delta_export_segment(statePtr, fromPos, toPos);
       const undoPtr = wasmInstance.exports.vm_delta_export_undo_ptr();
       const redoPtr = wasmInstance.exports.vm_delta_export_redo_ptr();
       const len = wasmInstance.exports.vm_delta_export_len_bytes();
       const entrySize = wasmInstance.exports.vm_delta_export_entry_size();
       const overflow = wasmInstance.exports.vm_delta_export_overflow() !== 0;
-      const undoBytes = new Uint8Array(wasmInstance.memory.buffer, undoPtr, len).slice();
-      const redoBytes = new Uint8Array(wasmInstance.memory.buffer, redoPtr, len).slice();
-      return { undoBytes, redoBytes, entrySize, overflow };
+      return {
+        undoBytes: new Uint8Array(wasmInstance.memory.buffer, undoPtr, len).slice(),
+        redoBytes: new Uint8Array(wasmInstance.memory.buffer, redoPtr, len).slice(),
+        entrySize,
+        overflow,
+      };
     },
 
-    deltaApplyRollbackSegment(state: StateHandle, segment: Uint8Array, entrySize: number): void {
-      const s = assertWasmStateHandle(state);
-      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
-      const statePtr = wasmInstance.stateRegionOffset;
-      wasmU8.set(new Uint8Array(s.buffer), statePtr);
-
-      const segmentPtr = wasmInstance.inputRegionOffset;
-      wasmU8.set(segment, segmentPtr);
+    deltaApplyRollbackSegment(stateHandle, segment, entrySize) {
+      const state = assertWasmStateHandle(stateHandle);
+      const statePtr = copyStateIn(state);
+      const segmentPtr = align8(statePtr + state.size);
+      ensureMemory(segmentPtr + segment.byteLength);
+      new Uint8Array(wasmInstance.memory.buffer).set(segment, segmentPtr);
       wasmInstance.exports.vm_delta_apply_rollback_segment(statePtr, segmentPtr, segment.byteLength, entrySize);
-
-      const freshU8 = new Uint8Array(wasmInstance.memory.buffer);
-      new Uint8Array(s.buffer).set(freshU8.subarray(statePtr, statePtr + s.size));
+      new Uint8Array(state.buffer).set(new Uint8Array(wasmInstance.memory.buffer, statePtr, state.size));
     },
 
-    deltaApplyRollforwardSegment(state: StateHandle, segment: Uint8Array, entrySize: number): void {
-      const s = assertWasmStateHandle(state);
-      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
-      const statePtr = wasmInstance.stateRegionOffset;
-      wasmU8.set(new Uint8Array(s.buffer), statePtr);
-
-      const segmentPtr = wasmInstance.inputRegionOffset;
-      wasmU8.set(segment, segmentPtr);
+    deltaApplyRollforwardSegment(stateHandle, segment, entrySize) {
+      const state = assertWasmStateHandle(stateHandle);
+      const statePtr = copyStateIn(state);
+      const segmentPtr = align8(statePtr + state.size);
+      ensureMemory(segmentPtr + segment.byteLength);
+      new Uint8Array(wasmInstance.memory.buffer).set(segment, segmentPtr);
       wasmInstance.exports.vm_delta_apply_rollforward_segment(statePtr, segmentPtr, segment.byteLength, entrySize);
-
-      const freshU8 = new Uint8Array(wasmInstance.memory.buffer);
-      new Uint8Array(s.buffer).set(freshU8.subarray(statePtr, statePtr + s.size));
+      new Uint8Array(state.buffer).set(new Uint8Array(wasmInstance.memory.buffer, statePtr, state.size));
     },
   };
 

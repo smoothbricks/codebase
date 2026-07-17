@@ -31,20 +31,20 @@ export { parseReducerProgram, parseReducerSlotDefs } from './reducer-bytecode.js
 export type {
   ColumineBackend,
   ColumnInput,
+  EvictedRow,
+  EvictionResult,
   ReducerProgram,
+  ScalarValue,
   SlotDef,
   SlotTtlMetadata,
   StateHandle,
   StructMap2RowRef,
-  UndoCapableColumineBackend,
 } from './types.js';
 export {
   AggType,
-  assertUndoCapableBackend,
   ComparisonType,
   ErrorCode,
   HEADER_SIZE,
-  isUndoCapableBackend,
   MAGIC,
   Opcode,
   PROGRAM_HASH_PREFIX,

@@ -2597,14 +2597,10 @@ impl Vm {
         self.execute_impl(true, state, program, cols, batch_len)
     }
 
-    /// vm.zig:1003 `vm_evict_all_expired`.
-    /// WHY (kept contract): on a bad state magic this returns INVALID_STATE (4) through
-    /// a channel whose meaning is "total evicted count" — callers cannot
-    /// distinguish "4 evicted" from "invalid state"; intended fix is a
-    /// distinct error surface at the post-parity sweep.
-    pub fn evict_all_expired(&mut self, state: &mut [u8], now: f64) -> u32 {
+    /// Evict every expired entry, returning a count that cannot collide with an error.
+    pub fn evict_all_expired(&mut self, state: &mut [u8], now: f64) -> Result<u32, ErrorCode> {
         if bytes::read_u32(state, 0) != STATE_MAGIC {
-            return INVALID_STATE;
+            return Err(ErrorCode::InvalidState);
         }
         let num_slots = state[StateHeaderOffset::NUM_SLOTS as usize];
         let mut total = 0u32;
@@ -2615,7 +2611,7 @@ impl Vm {
                 total += evict_expired(&mut self.undo, &mut self.bitmap_env, state, &meta, i, now);
             }
         }
-        total
+        Ok(total)
     }
 
     /// vm.zig:1346 `executeBatchImpl`.
