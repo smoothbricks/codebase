@@ -40,26 +40,43 @@ interface CodeStringExtensionFields {
   constructorCode?: string;
   constructorParams?: string;
   methods?: string;
+  closureInit?: ClosureInitHook;
+  closureMethods?: ClosureMethodsHook;
 }
+
+/** No-eval counterpart of constructorPreamble/constructorParams (see ColumnBufferExtension). */
+export type ClosureInitHook = (
+  self: Record<string, unknown>,
+  requestedCapacity: number,
+  ctorArgs: readonly unknown[],
+) => void;
+/** No-eval counterpart of methods/classPreamble (see ColumnBufferExtension). */
+export type ClosureMethodsHook = (prototype: object) => void;
 
 /**
  * Reject extensions the closure-composed materializer cannot honor.
  *
- * `preallocatedColumns` is pure data and fully supported; the code-string
- * fields would require `new Function` and MUST either run where string
- * codegen is allowed or be pregenerated at build time.
+ * `preallocatedColumns` is pure data and fully supported. The code-string
+ * fields require `new Function` UNLESS the extension carries their no-eval
+ * counterparts: `closureInit` covers constructorPreamble + constructorParams,
+ * `closureMethods` covers methods + classPreamble. `constructorCode` has no
+ * counterpart — it MUST either run where string codegen is allowed or be
+ * pregenerated at build time.
  */
 export function assertClosureMaterializable(extension: CodeStringExtensionFields | undefined, what: string): void {
   if (!extension) return;
   const offending = CODE_EXTENSION_FIELDS.filter((field) => {
     const value = extension[field];
-    return typeof value === 'string' && value.length > 0;
+    if (typeof value !== 'string' || value.length === 0) return false;
+    if ((field === 'constructorPreamble' || field === 'constructorParams') && extension.closureInit) return false;
+    if ((field === 'methods' || field === 'classPreamble') && extension.closureMethods) return false;
+    return true;
   });
   if (offending.length > 0) {
     throw new Error(
       `${what} extension fields [${offending.join(', ')}] carry code strings, which require string codegen ` +
-        '(new Function) — unavailable in this runtime (e.g. workerd). Pregenerate the class at build time ' +
-        'or drop the code-string extension fields.',
+        '(new Function) — unavailable in this runtime (e.g. workerd). Provide the closureInit/closureMethods ' +
+        'no-eval counterparts, pregenerate the class at build time, or drop the code-string extension fields.',
     );
   }
 }
@@ -246,18 +263,29 @@ function makeValueWriter(storage: ColumnStorageInfo, rawValues: string): ValueWr
 const METHOD_DESCRIPTOR = { writable: true, configurable: true, enumerable: false } as const;
 const ACCESSOR_DESCRIPTOR = { configurable: true, enumerable: false } as const;
 
+/** No-eval extension hooks honored by the closure-composed buffer materializer. */
+export interface ClosureExtensionHooks {
+  closureInit?: ClosureInitHook;
+  closureMethods?: ClosureMethodsHook;
+}
+
 /**
  * Materialize a ColumnBuffer class from an accessor plan without string
  * codegen. Same observable behavior as the compiled materializer with the
- * default class name and no code-string extension.
+ * default class name; `hooks` are the no-eval counterparts of the
+ * code-string extension fields (closureInit runs like constructorPreamble at
+ * the top of the constructor; closureMethods installs like extension methods
+ * after the per-column members).
  */
 export function materializeColumnBufferClass(
   plan: ColumnAccessorPlan,
+  hooks?: ClosureExtensionHooks,
 ): new (
   requestedCapacity: number,
   ...ctorArgs: unknown[]
 ) => AnyColumnBuffer {
   const inits: BufferInit[] = [];
+  const closureInit = hooks?.closureInit;
 
   class GeneratedColumnBuffer {
     [key: string]: unknown;
@@ -266,7 +294,8 @@ export function materializeColumnBufferClass(
     _capacity: number;
     _overflow: AnyColumnBuffer | undefined;
 
-    constructor(requestedCapacity: number) {
+    constructor(requestedCapacity: number, ...ctorArgs: unknown[]) {
+      if (closureInit) closureInit(this, requestedCapacity, ctorArgs);
       const alignedCapacity = getAlignedCapacity(requestedCapacity);
       this._alignedCapacity = alignedCapacity;
       this._capacity = requestedCapacity;
@@ -423,6 +452,10 @@ export function materializeColumnBufferClass(
       return `GeneratedColumnBuffer { _writeIndex: ${this._writeIndex}, _capacity: ${this._capacity}, trace_id: ${this.trace_id ?? 'N/A'} }`;
     },
   });
+
+  // Extension methods install last so same-named members override the
+  // generated ones (matching the compiled class-body order).
+  hooks?.closureMethods?.(proto);
 
   return GeneratedColumnBuffer;
 }
