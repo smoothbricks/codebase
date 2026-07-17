@@ -10,12 +10,20 @@
  *   const stages = createPipeline({ backend, parseBackend });
  */
 // Parse/Compact backend (event_processor WASM bridge)
-export type { EventProcessorWasmExports, ParseCompactBackend } from './parse-backend.js';
-export { createParseCompactWasmBackend, loadParseBackend } from './parse-backend.js';
+export type {
+  CompactDiagnostic,
+  CompactEncodingErrorCode,
+  EventProcessorWasmExports,
+  ParseCompactBackend,
+} from './parse-backend.js';
+export { CompactEncodingError, createParseCompactWasmBackend, loadParseBackend } from './parse-backend.js';
 // Pipeline composition API
 export type {
   ColumineStages,
+  CompactBatch,
+  CompactColumn,
   CompactStage,
+  EncodedArrowSchema,
   ParseConfig,
   ParseResult,
   ParseStage,

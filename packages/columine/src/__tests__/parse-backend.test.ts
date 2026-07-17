@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 
 import { createParseCompactWasmBackend, type EventProcessorWasmExports } from '../parse-backend.js';
 
-const OUTPUT_HEADER_BYTES = 16;
+const OUTPUT_HEADER_BYTES = 32;
 
 interface ParseInvocation {
   handle: number;
@@ -63,6 +63,9 @@ function createMockEventProcessor(options: MockEventProcessorOptions = {}) {
       mem.set(payload, outputPtr + OUTPUT_HEADER_BYTES);
 
       return 0;
+    },
+    ep_compact: () => {
+      throw new Error('unexpected Compact call');
     },
   };
 
@@ -215,7 +218,7 @@ describe('parse backend EventProcessor lifecycle', () => {
     backend.dispose();
 
     expect(mock.destroyCalls).toEqual([1]);
-    expect(() => backend.parse(new Uint8Array([1]), config)).toThrow('Parse backend has been disposed');
+    expect(() => backend.parse(new Uint8Array([1]), config)).toThrow('Parse/Compact backend has been disposed');
     expect(mock.createCalls).toEqual([1]);
   });
 });
