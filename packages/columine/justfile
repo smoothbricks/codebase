@@ -30,6 +30,9 @@ wasm:
         wasm-opt -Oz --converge --strip-producers --strip-target-features --zero-filled-memory \
             target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm \
             -o target/wasm32-unknown-unknown/wasm-release/columine_wasm.opt.wasm; \
+    else \
+        cp target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm \
+            target/wasm32-unknown-unknown/wasm-release/columine_wasm.opt.wasm; \
     fi
     @mkdir -p dist
     @cp target/wasm32-unknown-unknown/wasm-release/columine_wasm.opt.wasm dist/columine.wasm
@@ -47,6 +50,9 @@ wasm-ep:
         wasm-opt -Oz --converge --strip-producers --strip-target-features --zero-filled-memory \
             target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm \
             -o target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.opt.wasm; \
+    else \
+        cp target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm \
+            target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.opt.wasm; \
     fi
     @mkdir -p dist
     @cp target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.opt.wasm dist/event_processor.wasm
