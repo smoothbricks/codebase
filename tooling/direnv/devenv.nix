@@ -21,8 +21,8 @@ in {
     coreutils # Provides fmt for commit message wrapping
     git # Git hooks and repository inspection
     gh # GitHub Actions and release inspection
-    # Pin Node.js version to match AWS Lambda runtime
-    nodejs_24
+    # Develop against latest Node.js version
+    nodejs_latest
     # Bun.sh for javascript dependencies
     bun
     # Rust toolchain for packages/cowshed and packages/lmao-rs: cargo, rustc,
@@ -65,7 +65,6 @@ in {
     git-format-staged
     jq # Used in pre-commit hook and generally useful
     alejandra # Nix formatter
-    awscli2 # For DynamoDB Local CLI testing/debugging
   ];
 
   # Use system Xcode for iOS simulator, signing, and instruments.
@@ -90,11 +89,6 @@ in {
   # We're not using Devenv's pre-commit-hooks, because this repo's pre-commit hook
   # uses `git-format-staged` to format only the content that is about to be committed.
   # See https://devenv.sh/pre-commit-hooks/ for more details (uses Python pre-commit)
-
-  # https://devenv.sh/processes/
-  # DynamoDB Local for index store integration tests
-  services.dynamodb-local.enable = true;
-  # Default port 8000; available at http://127.0.0.1:8000 when `devenv up` is running
 
   # https://devenv.sh/scripts/#entershell
   # This runs when entering the devenv shell
