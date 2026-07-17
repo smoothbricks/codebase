@@ -1,10 +1,8 @@
-//! columine's `event_processor.wasm` — the 5-function `ep_*` export layer.
+//! columine's `event_processor.wasm` — the required six-function `ep_*`
+//! export layer over `columine-event-processor`.
 //!
-//! Replaces the export section of columine's Zig event_processor build
-//! (5 functions + exported memory, enumerated from the Zig artifact's export
-//! section and pinned by `tests/export_checklist.rs`). The processing core is
-//! `columine-event-processor` with `EpWiring::columine()` — the standalone
-//! npm variant: no dedup, base path enabled, msgpack workspace growth on.
+//! Parse and CPB1 Compact share the same retained, validated Arrow schema
+//! handle and caller-owned output-buffer protocol.
 //!
 //! Buffer protocol (`src/parse-backend.ts` contract, unlike the axe EP's
 //! `ep_input_ptr` handshake): the caller owns the geometry. JS writes request
@@ -18,9 +16,10 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-use columine_arrow::schema::{DynamicSchemaConfig, SignalSchemaField};
+use columine_arrow::schema::DynamicSchemaConfig;
 use columine_event_processor::{
-    CollisionPolicy, EpWiring, EventProcessor, InputFormat, RESULT_HEADER_SIZE, ResultCode,
+    CollisionPolicy, CompactValidationError, EpWiring, EventProcessor, InputFormat,
+    RESULT_HEADER_SIZE, ResultCode, ResultDiagnostic, write_compact_result_header,
 };
 
 /// Same wire version as the axe EP artifact (one event_processor lineage).
@@ -93,7 +92,7 @@ fn new_instance(capacity: u32, schema_config: DynamicSchemaConfig) -> Option<Box
 }
 
 // =============================================================================
-// Exports — exactly the Zig artifact's five (tests/export_checklist.rs)
+// Exports — exact six-function production ABI (tests/export_checklist.rs)
 // =============================================================================
 
 #[unsafe(no_mangle)]
@@ -115,12 +114,24 @@ pub unsafe extern "C" fn ep_create_with_schema(
     capacity: u32,
     schema_ptr: *const u8,
     schema_len: u32,
-    field_meta_ptr: *const SignalSchemaField,
+    field_meta_ptr: *const u8,
     field_count: u32,
 ) -> u32 {
+    let Some(field_meta_len) = (field_count as usize).checked_mul(4) else {
+        return 0;
+    };
+    if schema_ptr.is_null() || (field_meta_len != 0 && field_meta_ptr.is_null()) {
+        return 0;
+    }
     let schema_bytes = unsafe { std::slice::from_raw_parts(schema_ptr, schema_len as usize) };
-    let field_meta = unsafe { std::slice::from_raw_parts(field_meta_ptr, field_count as usize) };
-    let config = DynamicSchemaConfig::new(schema_bytes, field_meta);
+    let field_meta = if field_meta_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(field_meta_ptr, field_meta_len) }
+    };
+    let Ok(config) = DynamicSchemaConfig::from_wire(schema_bytes, field_meta) else {
+        return 0;
+    };
     let Some(instance) = new_instance(capacity, config) else {
         return 0;
     };
@@ -134,16 +145,36 @@ pub unsafe extern "C" fn ep_create_with_schema_and_names(
     capacity: u32,
     schema_ptr: *const u8,
     schema_len: u32,
-    field_meta_ptr: *const SignalSchemaField,
+    field_meta_ptr: *const u8,
     field_count: u32,
     field_names_ptr: *const u8,
     field_names_len: u32,
 ) -> u32 {
+    let Some(field_meta_len) = (field_count as usize).checked_mul(4) else {
+        return 0;
+    };
+    if schema_ptr.is_null()
+        || (field_meta_len != 0 && field_meta_ptr.is_null())
+        || (field_names_len != 0 && field_names_ptr.is_null())
+    {
+        return 0;
+    }
     let schema_bytes = unsafe { std::slice::from_raw_parts(schema_ptr, schema_len as usize) };
-    let field_meta = unsafe { std::slice::from_raw_parts(field_meta_ptr, field_count as usize) };
-    let field_names =
-        unsafe { std::slice::from_raw_parts(field_names_ptr, field_names_len as usize) };
-    let config = DynamicSchemaConfig::with_field_names(schema_bytes, field_meta, field_names);
+    let field_meta = if field_meta_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(field_meta_ptr, field_meta_len) }
+    };
+    let field_names = if field_names_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(field_names_ptr, field_names_len as usize) }
+    };
+    let Ok(config) =
+        DynamicSchemaConfig::from_wire_with_field_names(schema_bytes, field_meta, field_names)
+    else {
+        return 0;
+    };
     let Some(instance) = new_instance(capacity, config) else {
         return 0;
     };
@@ -181,4 +212,55 @@ pub unsafe extern "C" fn ep_create_log_entry(
     let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len as usize) };
     let output = unsafe { std::slice::from_raw_parts_mut(output_ptr, output_len as usize) };
     instance.ep.create_log_entry(input, format, output) as u32
+}
+
+/// Encode one CPB1 typed column batch into `[ResultHeader][Arrow IPC]`.
+///
+/// The request and output regions must be disjoint. The returned status is
+/// mirrored at output offset 0 whenever `output_len >= 32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ep_compact(
+    handle: u32,
+    batch_ptr: *const u8,
+    batch_len: u32,
+    output_ptr: *mut u8,
+    output_len: u32,
+) -> u32 {
+    if (output_len as usize) < RESULT_HEADER_SIZE || output_ptr.is_null() {
+        return ResultCode::OutOfMemory as u32;
+    }
+    let output_start = output_ptr as usize;
+    let Some(output_end) = output_start.checked_add(output_len as usize) else {
+        return ResultCode::OutOfMemory as u32;
+    };
+    let output = unsafe { std::slice::from_raw_parts_mut(output_ptr, output_len as usize) };
+    let Some(instance) = get_processor(handle) else {
+        let diagnostic = ResultDiagnostic::default();
+        write_compact_result_header(output, ResultCode::InvalidHandle, 0, 0, 0, &diagnostic);
+        return ResultCode::InvalidHandle as u32;
+    };
+
+    if batch_len != 0 && batch_ptr.is_null() {
+        let error = CompactValidationError::bad_request();
+        write_compact_result_header(output, error.code, 0, 0, 0, &error.diagnostic);
+        return error.code as u32;
+    }
+    let batch_start = batch_ptr as usize;
+    let Some(batch_end) = batch_start.checked_add(batch_len as usize) else {
+        let error = CompactValidationError::bad_request();
+        write_compact_result_header(output, error.code, 0, 0, 0, &error.diagnostic);
+        return error.code as u32;
+    };
+    if batch_len != 0 && batch_start < output_end && output_start < batch_end {
+        let error = CompactValidationError::output_overlap();
+        write_compact_result_header(output, error.code, 0, 0, 0, &error.diagnostic);
+        return error.code as u32;
+    }
+
+    let batch = if batch_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(batch_ptr, batch_len as usize) }
+    };
+    instance.ep.compact(batch, output) as u32
 }

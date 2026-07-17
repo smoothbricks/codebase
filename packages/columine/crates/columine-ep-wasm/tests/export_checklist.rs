@@ -1,8 +1,5 @@
-//! Pins the wasm export surface against the Zig `columine.wasm`-family
-//! ground truth: columine's event_processor.wasm exported exactly FIVE
-//! functions plus the EXPORTED memory (frozen from the Zig artifact's
-//! export section at cutover — the Zig build is deleted; this list is its
-//! tombstone).
+//! Pins the Rust wasm export surface against the five-function Zig baseline
+//! plus Columine's CPB1 Compact extension.
 
 /// Every function export of the Zig columine event_processor.wasm.
 pub const ZIG_COLUMINE_EP_EXPORTS: [&str; 5] = [
@@ -11,6 +8,15 @@ pub const ZIG_COLUMINE_EP_EXPORTS: [&str; 5] = [
     "ep_create_with_schema_and_names",
     "ep_destroy",
     "ep_create_log_entry",
+];
+
+pub const COLUMINE_EP_EXPORTS: [&str; 6] = [
+    "ep_version",
+    "ep_create_with_schema",
+    "ep_create_with_schema_and_names",
+    "ep_destroy",
+    "ep_create_log_entry",
+    "ep_compact",
 ];
 
 /// Minimal wasm export-section reader (section id 7): (name, kind) pairs.
@@ -54,11 +60,15 @@ fn wasm_exports(bytes: &[u8]) -> Vec<(String, u8)> {
 }
 
 #[test]
-fn zig_export_list_is_complete_and_deduped() {
-    let mut names: Vec<&str> = ZIG_COLUMINE_EP_EXPORTS.to_vec();
+fn export_lists_are_complete_and_deduped() {
+    assert_eq!(
+        &COLUMINE_EP_EXPORTS[..ZIG_COLUMINE_EP_EXPORTS.len()],
+        &ZIG_COLUMINE_EP_EXPORTS
+    );
+    let mut names: Vec<&str> = COLUMINE_EP_EXPORTS.to_vec();
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), 5, "duplicate names in the checklist");
+    assert_eq!(names.len(), 6, "duplicate names in the checklist");
 }
 
 /// `just wasm-ep` (columine justfile) runs this against the built artifact.
@@ -77,13 +87,13 @@ fn built_wasm_exports_every_zig_symbol_and_memory() {
         .filter(|(_, k)| *k == 0)
         .map(|(n, _)| n.as_str())
         .collect();
-    let missing: Vec<&&str> = ZIG_COLUMINE_EP_EXPORTS
+    let missing: Vec<&&str> = COLUMINE_EP_EXPORTS
         .iter()
-        .filter(|n| !fn_names.contains(**n))
+        .filter(|name| !fn_names.contains(**name))
         .collect();
     assert!(
         missing.is_empty(),
-        "exports missing vs Zig columine event_processor.wasm: {missing:?}"
+        "exports missing from Columine event processor ABI: {missing:?}"
     );
     assert!(
         exports.iter().any(|(n, k)| n == "memory" && *k == 2),
