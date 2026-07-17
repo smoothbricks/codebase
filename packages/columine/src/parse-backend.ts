@@ -37,6 +37,12 @@ export interface ParseCompactBackend {
    * Uses event_processor's IPC writer for Arrow encoding.
    */
   encode(columns: ColumnInput[], schema: Uint8Array): Uint8Array;
+
+  /**
+   * Deterministically release the backend's EventProcessor handle.
+   * Disposal is idempotent and terminal.
+   */
+  dispose(): void;
 }
 
 // =============================================================================
@@ -265,33 +271,51 @@ function encodeFieldNames(names: string[]): Uint8Array {
  * @param wasm - Instantiated event_processor WASM exports
  */
 export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): ParseCompactBackend {
-  // Cache EventProcessor handle between parse() calls with the same config.
-  // The EP is stateful (schema + field names) so we only reuse when config matches.
-  // Key is a hash of schemaBytes + fieldMetadata + fieldNames for identity comparison.
-  let cachedHandle: { configKey: string; handle: number } | null = null;
+  interface CachedHandle {
+    readonly handle: number;
+    readonly schemaBytes: Uint8Array;
+    readonly fieldMetadata: Uint8Array;
+    readonly fieldNames: Uint8Array | null;
+  }
 
-  /** Build a stable config identity key from schema bytes, field metadata, and field names */
-  function configKey(config: ParseConfig): string {
-    // Fast identity: concatenate lengths + first/last bytes as a fingerprint.
-    // Full equality would require comparing all bytes, but configs are typically
-    // stable across calls (same schema = same agent type).
-    let key = `s${config.schemaBytes.length}:m${config.fieldMetadata.length}`;
-    if (config.schemaBytes.length > 0) {
-      key += `:${config.schemaBytes[0]}-${config.schemaBytes[config.schemaBytes.length - 1]}`;
+  let cachedHandle: CachedHandle | null = null;
+  let disposed = false;
+
+  function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+    if (left.length !== right.length) {
+      return false;
     }
-    if (config.fieldMetadata.length > 0) {
-      key += `:${config.fieldMetadata[0]}-${config.fieldMetadata[config.fieldMetadata.length - 1]}`;
+    return left.every((byte, index) => byte === right[index]);
+  }
+
+  function configMatches(cached: CachedHandle, config: ParseConfig, fieldNames: Uint8Array | null): boolean {
+    return (
+      bytesEqual(cached.schemaBytes, config.schemaBytes) &&
+      bytesEqual(cached.fieldMetadata, config.fieldMetadata) &&
+      ((cached.fieldNames === null && fieldNames === null) ||
+        (cached.fieldNames !== null && fieldNames !== null && bytesEqual(cached.fieldNames, fieldNames)))
+    );
+  }
+
+  function destroyCachedHandle(): void {
+    if (cachedHandle === null) {
+      return;
     }
-    if (config.fieldNames) {
-      key += `:n${config.fieldNames.join(',')}`;
+    wasm.ep_destroy(cachedHandle.handle);
+    cachedHandle = null;
+  }
+
+  function assertOpen(): void {
+    if (disposed) {
+      throw new Error('Parse backend has been disposed');
     }
-    return key;
   }
 
   return {
     backend: 'event-processor-wasm',
 
     parse(input: string | Uint8Array, config: ParseConfig): ParseResult {
+      assertOpen();
       const inputBytes = typeof input === 'string' ? new TextEncoder().encode(input) : input;
       const fieldNamesBuffer =
         config.fieldNames && config.fieldNames.length > 0 ? encodeFieldNames(config.fieldNames) : null;
@@ -323,18 +347,11 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
         throw error;
       }
 
-      // Reuse cached handle if config matches, otherwise create new one
-      const key = configKey(config);
       let handle: number;
-
-      if (cachedHandle && cachedHandle.configKey === key) {
+      if (cachedHandle && configMatches(cachedHandle, config, fieldNamesBuffer)) {
         handle = cachedHandle.handle;
       } else {
-        // Destroy old cached handle if config changed
-        if (cachedHandle) {
-          wasm.ep_destroy(cachedHandle.handle);
-          cachedHandle = null;
-        }
+        destroyCachedHandle();
 
         const memory = new Uint8Array(wasm.memory.buffer);
         memory.set(config.schemaBytes, layout.schemaOffset);
@@ -344,10 +361,9 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
         }
 
         const fieldCount = config.fieldMetadata.length / 4;
-
         if (fieldNamesBuffer) {
           handle = wasm.ep_create_with_schema_and_names(
-            256, // default capacity
+            256,
             layout.schemaOffset,
             config.schemaBytes.length,
             layout.fieldMetaOffset,
@@ -369,29 +385,37 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
           throw new Error('Failed to create EventProcessor — ep_create_with_schema returned 0');
         }
 
-        cachedHandle = { configKey: key, handle };
+        cachedHandle = {
+          handle,
+          schemaBytes: config.schemaBytes.slice(),
+          fieldMetadata: config.fieldMetadata.slice(),
+          fieldNames: fieldNamesBuffer?.slice() ?? null,
+        };
       }
 
-      // Get fresh memory view (handle creation or memory.grow may have changed buffer)
       const memory = new Uint8Array(wasm.memory.buffer);
       memory.set(inputBytes, layout.inputOffset);
 
-      const result = wasm.ep_create_log_entry(
-        handle,
-        layout.inputOffset,
-        inputBytes.length,
-        INPUT_FORMAT_JSON,
-        layout.outputOffset,
-        layout.outputLength,
-      );
+      let result: number;
+      try {
+        result = wasm.ep_create_log_entry(
+          handle,
+          layout.inputOffset,
+          inputBytes.length,
+          INPUT_FORMAT_JSON,
+          layout.outputOffset,
+          layout.outputLength,
+        );
+      } catch (error) {
+        destroyCachedHandle();
+        throw error;
+      }
 
       if (result !== RESULT_OK) {
-        // Handle may be corrupted — invalidate cache
-        cachedHandle = null;
+        destroyCachedHandle();
         throw new Error(`ep_create_log_entry failed with code ${result}`);
       }
 
-      // Read result header from output buffer
       const view = new DataView(wasm.memory.buffer);
       const code = view.getUint32(layout.outputOffset, true);
       const arrowOffset = view.getUint32(layout.outputOffset + 4, true);
@@ -399,6 +423,7 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
       const eventsProcessed = view.getUint32(layout.outputOffset + 12, true);
 
       if (code !== RESULT_OK) {
+        destroyCachedHandle();
         throw new Error(`ep_create_log_entry returned error code ${code}`);
       }
 
@@ -406,13 +431,13 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
       const arrowEnd = arrowStart + arrowLen;
       const outputEnd = layout.outputOffset + layout.outputLength;
       if (arrowStart < layout.outputOffset || arrowEnd > outputEnd) {
+        destroyCachedHandle();
         throw new Error(
           'ep_create_log_entry produced out-of-bounds output: ' +
             `offset=${arrowOffset}, len=${arrowLen}, outputLen=${layout.outputLength}`,
         );
       }
 
-      // Copy Arrow IPC bytes out of WASM memory
       const freshMem = new Uint8Array(wasm.memory.buffer);
       const arrowIpc = new Uint8Array(arrowLen);
       arrowIpc.set(freshMem.subarray(arrowStart, arrowEnd));
@@ -421,14 +446,18 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
     },
 
     encode(_columns: ColumnInput[], _schema: Uint8Array): Uint8Array {
-      // TODO: Implement direct Arrow IPC encoding from ColumnInput[].
-      // This requires building a RecordBatch from raw columns, which
-      // the event_processor currently does internally during parse.
-      // For now, the Compact stage is primarily used via the parse path.
-      // Direct encode() will be needed for Phase 29 (speculation output).
+      assertOpen();
       throw new Error(
         'CompactStage.encode() is not yet implemented. ' + 'Use ParseStage.parse() for JSON-to-Arrow-IPC conversion.',
       );
+    },
+
+    dispose(): void {
+      if (disposed) {
+        return;
+      }
+      disposed = true;
+      destroyCachedHandle();
     },
   };
 }
