@@ -40,11 +40,6 @@ const STATE_REGION_OFFSET = WASM_PAGE_SIZE;
 // WASM returns u32 as signed i32, so 0xFFFFFFFF becomes -1
 const EMPTY_KEY_SIGNED = -1;
 
-// Reusable scratch buffer for column pointer array in executeBatch.
-// Avoids per-batch allocation on the hot reduce path.
-let scratchColPtrs: Uint32Array | null = null;
-let scratchColPtrsWidth = 0;
-
 // =============================================================================
 // State Handle - wraps JS ArrayBuffer
 // =============================================================================
@@ -288,6 +283,12 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
     new Uint8Array(wasmInstance.memory.buffer).set(program.bytecode, programPtr);
     return programPtr;
   };
+
+  // Reusable scratch buffer for column pointer array in executeBatch.
+  // Avoids per-batch allocation on the hot reduce path. Per-instance (not
+  // module-level) so no state is shared across backend instances.
+  let scratchColPtrs: Uint32Array | null = null;
+  let scratchColPtrsWidth = 0;
 
   const prepareExecution = (
     state: WasmStateHandle,
