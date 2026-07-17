@@ -125,6 +125,11 @@ fn extract_msgpack_fields(
             reader.skip_value().ok_or(ExtractionError::InvalidJson)?;
         }
     }
+    for (presence_column, source_column) in &config.presence_entries {
+        let present = columns.columns_seen[*source_column];
+        append(columns, *presence_column, Some(ColumnValue::Bool(present)))?;
+        columns.columns_seen[*presence_column] = true;
+    }
     for (column, _, _) in &config.field_entries {
         if !columns.columns_seen[*column] {
             append(columns, *column, None)?;
@@ -342,6 +347,49 @@ mod tests {
         );
         assert_eq!(columns.cell(0, 0), Some(ColumnValue::Utf8("ev-1".into())));
         assert_eq!(columns.cell(1, 0), Some(ColumnValue::Utf8("order".into())));
+    }
+    #[test]
+    fn populates_presence_columns_for_explicit_null_false_and_absent_fields() {
+        let fields = [
+            field(ArrowType::Utf8),
+            field(ArrowType::Utf8),
+            field(ArrowType::Bool),
+            field(ArrowType::Bool),
+            field(ArrowType::Bool),
+        ];
+        let mut input = vec![0x83];
+        str_(&mut input, "id");
+        str_(&mut input, "first");
+        str_(&mut input, "value.note");
+        input.push(0xc0);
+        str_(&mut input, "$value$schema.type.flag");
+        input.push(0xc2);
+        input.push(0x81);
+        str_(&mut input, "id");
+        str_(&mut input, "second");
+        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut work = [0; 64];
+        let config = config(
+            &fields,
+            &[
+                "id",
+                "value.note",
+                "event_value_present.value%2Enote",
+                "$value$schema.type.flag",
+                "event_value_present.%24value%24schema%2Etype%2Eflag",
+            ],
+        );
+
+        assert_eq!(
+            extract_msgpack_events(&input, &config, &mut columns, &mut work, true),
+            Ok(2)
+        );
+        assert_eq!(columns.cell(1, 0), None);
+        assert_eq!(columns.cell(2, 0), Some(ColumnValue::Bool(true)));
+        assert_eq!(columns.cell(2, 1), Some(ColumnValue::Bool(false)));
+        assert_eq!(columns.cell(3, 0), Some(ColumnValue::Bool(false)));
+        assert_eq!(columns.cell(4, 0), Some(ColumnValue::Bool(true)));
+        assert_eq!(columns.cell(4, 1), Some(ColumnValue::Bool(false)));
     }
     #[test]
     fn extract_msgpack_events_accepts_exactly_capacity_batch() {
