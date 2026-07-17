@@ -52,7 +52,11 @@ const rootDevDependencies: RequiredDependency[] = [
 const cliPackageName = '@smoothbricks/cli';
 
 const requiredDevenvPackages = ['bun', 'git', 'git-format-staged', 'jq', 'alejandra', 'coreutils', 'gnutar'];
-const allowedNodePackages = ['nodejs_24', 'nodejs_latest'];
+// Any explicit nodejs provider is fine — the pinned major is the repo's choice
+// (Lambda parity, org convergence, …). Whether the pins in package.json agree
+// with the runtime is validated against the live PATH (validateRootRuntimeVersions),
+// never against a version template here.
+const nodePackagePattern = /(^|\s)nodejs(_\d+|_latest)?(\s|#|$)/m;
 
 export async function applyToolConfigDefaults(root: string): Promise<void> {
   const context = readToolContext(root);
@@ -171,7 +175,7 @@ export function applyDevenvPackageDefaults(root: string): void {
   }
   let content = readFileSync(path, 'utf8');
   let changed = false;
-  if (!allowedNodePackages.some((name) => hasNixPackage(content, name))) {
+  if (!nodePackagePattern.test(content)) {
     const next = addNixPackage(content, 'nodejs_latest', '# Node.js for workspace tooling');
     changed = next !== content || changed;
     content = next;
@@ -262,8 +266,10 @@ export function validateDevenvPackages(root: string): number {
   }
   const content = readFileSync(path, 'utf8');
   let failures = 0;
-  if (!allowedNodePackages.some((name) => hasNixPackage(content, name))) {
-    console.error(`tooling/direnv/devenv.nix packages must include ${allowedNodePackages.join(' or ')}`);
+  if (!nodePackagePattern.test(content)) {
+    console.error(
+      'tooling/direnv/devenv.nix packages must include a nodejs provider (nodejs_<major> or nodejs_latest)',
+    );
     failures++;
   }
   for (const name of requiredDevenvPackages) {

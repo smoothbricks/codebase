@@ -1,7 +1,22 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { $ } from 'bun';
-import { getOrCreateRecord, readJsonObject, setStringProperty, writeJsonObject } from '../lib/json.js';
+import { getOrCreateRecord, readJsonObject, recordProperty, setStringProperty, writeJsonObject } from '../lib/json.js';
+
+export interface RuntimeVersions {
+  node: string;
+  bun: string;
+}
+
+/** Live runtime versions from the shell PATH — the single source sync AND validate derive from. */
+export async function runtimeVersionsFromPath(root: string): Promise<RuntimeVersions> {
+  const node = runtimeCommand(root, 'node');
+  const bun = runtimeCommand(root, 'bun');
+  return {
+    node: (await $`${node} --version`.cwd(root).text()).trim().replace(/^v/, ''),
+    bun: (await $`${bun} --version`.cwd(root).text()).trim(),
+  };
+}
 
 export async function syncRootRuntimeVersions(root: string): Promise<void> {
   const packageJsonPath = join(root, 'package.json');
@@ -9,10 +24,7 @@ export async function syncRootRuntimeVersions(root: string): Promise<void> {
   if (!packageJson) {
     throw new Error('package.json not found or invalid');
   }
-  const node = runtimeCommand(root, 'node');
-  const bun = runtimeCommand(root, 'bun');
-  const nodeVersion = (await $`${node} --version`.cwd(root).text()).trim().replace(/^v/, '');
-  const bunVersion = (await $`${bun} --version`.cwd(root).text()).trim();
+  const { node: nodeVersion, bun: bunVersion } = await runtimeVersionsFromPath(root);
   const nodeMajor = nodeVersion.split('.', 1)[0];
   if (!nodeMajor) {
     throw new Error(`Unable to derive Node major version from ${nodeVersion}`);
@@ -40,6 +52,61 @@ export async function syncRootRuntimeVersions(root: string): Promise<void> {
     writeJsonObject(packageJsonPath, packageJson);
     console.log('updated        package.json runtime versions');
   }
+}
+
+/**
+ * Validate that package.json runtime pins agree with the LIVE PATH runtimes,
+ * never a stored template. Offline by design: structural alignment only
+ * (majors, exact bun pin, no `~major.0.0` floor) — the registry is not
+ * consulted. Repair: `smoo monorepo init --runtime-only` inside the devenv shell.
+ */
+export async function validateRootRuntimeVersions(root: string): Promise<number> {
+  const packageJson = readJsonObject(join(root, 'package.json'));
+  if (!packageJson) {
+    console.error('package.json not found or invalid');
+    return 1;
+  }
+  return validateRuntimePins(packageJson, await runtimeVersionsFromPath(root));
+}
+
+export function validateRuntimePins(packageJson: Record<string, unknown>, runtime: RuntimeVersions): number {
+  const nodeMajor = runtime.node.split('.', 1)[0];
+  if (!nodeMajor) {
+    throw new Error(`Unable to derive Node major version from ${runtime.node}`);
+  }
+  let failures = 0;
+  const repair = 'run `smoo monorepo init --runtime-only` inside the devenv shell';
+  const engines = recordProperty(packageJson, 'engines');
+  const enginesNode = engines && typeof engines.node === 'string' ? engines.node : null;
+  if (enginesNode !== `>=${nodeMajor}.0.0`) {
+    console.error(
+      `package.json engines.node is ${enginesNode ?? 'missing'} but the PATH node is v${runtime.node} — expected >=${nodeMajor}.0.0; ${repair}`,
+    );
+    failures++;
+  }
+  const packageManager = typeof packageJson.packageManager === 'string' ? packageJson.packageManager : null;
+  if (packageManager !== `bun@${runtime.bun}`) {
+    console.error(
+      `package.json packageManager is ${packageManager ?? 'missing'} but the PATH bun is ${runtime.bun} — expected bun@${runtime.bun}; ${repair}`,
+    );
+    failures++;
+  }
+  const devDependencies = recordProperty(packageJson, 'devDependencies');
+  const typesNode =
+    devDependencies && typeof devDependencies['@types/node'] === 'string' ? devDependencies['@types/node'] : null;
+  const typesNodeParts = typesNode ? /^~(\d+)\.(\d+)\.(\d+)$/.exec(typesNode) : null;
+  if (!typesNodeParts || typesNodeParts[1] !== nodeMajor) {
+    console.error(
+      `package.json @types/node is ${typesNode ?? 'missing'} but the PATH node is v${runtime.node} — types track the runtime major (~${nodeMajor}.x.y, newest published minor); ${repair}`,
+    );
+    failures++;
+  } else if (typesNodeParts[2] === '0' && typesNodeParts[3] === '0') {
+    console.error(
+      `package.json @types/node is pinned to the ~${nodeMajor}.0.0 floor — tilde locks the first patch line and strands the repo on early broken releases; ${repair} to repin to the newest published ${nodeMajor}.x`,
+    );
+    failures++;
+  }
+  return failures;
 }
 
 type RuntimeTypesPinMode = 'major' | 'exact';
@@ -71,8 +138,13 @@ export function runtimeTypesRangeForPublishedVersions(
 
   if (pinMode === 'major') {
     const runtimeMajor = parsedRuntimeVersion[0].toString();
-    if (latestVersion(versions.filter((version) => versionMajor(version) === runtimeMajor))) {
-      return `~${runtimeMajor}.0.0`;
+    // Newest published types WITHIN the runtime major — never the `~major.0.0`
+    // floor: tilde locks the patch line, so the floor can strand consumers on a
+    // broken early release (e.g. @types/node 24.0.x's URLPattern/DOM TS2403
+    // conflict, fixed in 24.13) with no path to the repaired minors.
+    const latestInMajor = latestVersion(versions.filter((version) => versionMajor(version) === runtimeMajor));
+    if (latestInMajor) {
+      return `~${latestInMajor}`;
     }
   } else if (versions.includes(runtimeVersion)) {
     return runtimeVersion;
