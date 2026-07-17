@@ -8,7 +8,7 @@
  * with RETE as an additional stage.
  *
  * Usage:
- *   const stages = await createPipeline();
+ *   const stages = createPipeline({ backend });
  *   const { arrowIpc, eventCount } = stages.parse.parse(json, config);
  *   stages.reduce.executeBatch(state, program, columns, batchLen);
  *   const output = stages.compact.encode(columns, schema);
@@ -16,7 +16,6 @@
  *   stages.undo.rollback(state, token);
  */
 
-import { getBackend } from './backend.js';
 import type { ParseCompactBackend } from './parse-backend.js';
 import type { ColumineBackend, ColumnInput, ReducerProgram, StateHandle } from './types.js';
 import { isUndoCapableBackend } from './types.js';
@@ -333,6 +332,8 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
 
 //#region axe!n/columine-package.pipeline #create-pipeline #four-stages #composable
 export interface PipelineOptions {
+  /** Concrete reducer backend owned by this pipeline instance */
+  backend: ColumineBackend;
   /** Parse/Compact backend — if not provided, parse() and encode() will throw */
   parseBackend?: ParseCompactBackend;
 }
@@ -340,16 +341,16 @@ export interface PipelineOptions {
 /**
  * Create a composed pipeline with all four stages.
  *
- * The Reduce and Undo stages always work (they use the injected ColumineBackend).
- * The Parse and Compact stages require a ParseCompactBackend — pass one via options,
- * or they will throw with a helpful error message.
+ * The Reduce and Undo stages use the concrete ColumineBackend supplied in
+ * options. The Parse and Compact stages require a ParseCompactBackend — pass
+ * one via options, or they will throw with a helpful error message.
  *
- * @param options - Optional parse backend for Parse/Compact stages
+ * @param options - Concrete reducer backend and optional Parse/Compact backend
  * @returns All four pipeline stages
  */
-export async function createPipeline(options?: PipelineOptions): Promise<ColumineStages> {
-  const backend = await getBackend();
-  const parseBackend = options?.parseBackend ?? null;
+export function createPipeline(options: PipelineOptions): ColumineStages {
+  const backend = options.backend;
+  const parseBackend = options.parseBackend ?? null;
 
   return {
     parse: createParseStage(parseBackend),

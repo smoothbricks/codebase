@@ -1,18 +1,17 @@
 /**
  * Integration tests for @smoothbricks/columine standalone usage.
  *
- * Verifies all Phase 28 success criteria:
+ * Verifies all core pipeline success criteria:
  *   SC1: Reduce stage for aggregation (HashMap + Aggregate slots)
  *   SC2: Undo stage for event cancellation (checkpoint/rollback/commit)
- *   SC3: Pipeline composition (all four stages, independently usable)
- *   SC4: DI pattern (setBackend/getBackend/resetBackend/hasBackend)
- *   SC5: Streaming processing (multiple batches accumulate state)
+ *   SC3: Pipeline composition with explicit backend ownership
+ *   SC4: Streaming processing (multiple batches accumulate state)
  *
- * SC3 and SC4 are TypeScript-only tests (no WASM needed).
- * SC1, SC2, SC5 require the columine WASM binary and skip gracefully if unavailable.
+ * SC3 is a TypeScript-only test (no WASM needed).
+ * SC1, SC2, SC4 require the columine WASM binary and skip gracefully if unavailable.
  */
 
-import { afterEach, beforeAll, describe, expect, it } from 'bun:test';
+import { beforeAll, describe, expect, it } from 'bun:test';
 import { existsSync } from 'node:fs';
 
 import {
@@ -21,17 +20,12 @@ import {
   type ColumnInput,
   createPipeline,
   ErrorCode,
-  getBackend,
   HEADER_SIZE,
-  hasBackend,
   MAGIC,
   Opcode,
   PROGRAM_HASH_PREFIX,
   type ReducerProgram,
-  resetBackend,
   SlotType,
-  setBackend,
-  setBackendLoader,
   ValueType,
 } from '../index.js';
 import { loadColumineWasm } from '../wasm-backend.js';
@@ -81,6 +75,7 @@ function buildProgram(opts: {
         break;
     }
   }
+  initCode.push(Opcode.HALT);
 
   const reduceCode = [...opts.reduceOps, Opcode.HALT];
   const contentLen = HEADER_SIZE + initCode.length + reduceCode.length;
@@ -134,10 +129,6 @@ describe('SC1: Reduce stage for aggregation', () => {
   beforeAll(async () => {
     if (!WASM_EXISTS) return;
     backend = await loadColumineWasm(WASM_PATH);
-  });
-
-  afterEach(() => {
-    resetBackend();
   });
 
   it.skipIf(!WASM_EXISTS)('executes HashMap upsert-last program', async () => {
@@ -319,14 +310,8 @@ describe('SC2: Undo stage for event cancellation', () => {
     backend = await loadColumineWasm(WASM_PATH);
   });
 
-  afterEach(() => {
-    resetBackend();
-  });
-
   it.skipIf(!WASM_EXISTS)('checkpoint and rollback restores pre-batch state', async () => {
-    // Must set backend before each test since afterEach resets it
-    setBackend(backend);
-    const stages = await createPipeline();
+    const stages = createPipeline({ backend });
 
     // Build a simple SUM program (SUM reads Float64 values)
     const bytecode = buildProgram({
@@ -357,8 +342,7 @@ describe('SC2: Undo stage for event cancellation', () => {
   });
 
   it.skipIf(!WASM_EXISTS)('commit makes changes permanent', async () => {
-    setBackend(backend);
-    const stages = await createPipeline();
+    const stages = createPipeline({ backend });
 
     const bytecode = buildProgram({
       slots: [{ type: 'aggregate', aggType: AggType.SUM }],
@@ -392,12 +376,8 @@ describe('SC2: Undo stage for event cancellation', () => {
 // =============================================================================
 
 describe('SC3: Pipeline composition', () => {
-  afterEach(() => {
-    resetBackend();
-  });
-
-  it('createPipeline returns all four stages', async () => {
-    // Inject a mock backend so createPipeline resolves
+  it('createPipeline returns all four stages', () => {
+    // Supply the concrete backend owned by this pipeline.
     const mockBackend: ColumineBackend = {
       backend: 'mock',
       loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
@@ -412,9 +392,8 @@ describe('SC3: Pipeline composition', () => {
       serialize: () => new Uint8Array(0),
       deserialize: () => ({ _brand: 'ColumineStateHandle' }),
     };
-    setBackend(mockBackend);
 
-    const stages = await createPipeline();
+    const stages = createPipeline({ backend: mockBackend });
 
     // All four stages exist
     expect(stages.parse).toBeDefined();
@@ -429,7 +408,7 @@ describe('SC3: Pipeline composition', () => {
     expect(stages.undo.name).toBe('undo');
   });
 
-  it('reduce stage delegates to backend.executeBatch', async () => {
+  it('reduce stage delegates to the supplied backend', () => {
     let executeBatchCalled = false;
 
     const mockBackend: ColumineBackend = {
@@ -449,9 +428,8 @@ describe('SC3: Pipeline composition', () => {
       serialize: () => new Uint8Array(0),
       deserialize: () => ({ _brand: 'ColumineStateHandle' }),
     };
-    setBackend(mockBackend);
 
-    const stages = await createPipeline();
+    const stages = createPipeline({ backend: mockBackend });
 
     const mockState = { _brand: 'ColumineStateHandle' as const };
     const mockProgram: ReducerProgram = { bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] };
@@ -463,7 +441,38 @@ describe('SC3: Pipeline composition', () => {
     expect(result).toBe(ErrorCode.OK);
   });
 
-  it('parse stage throws helpful error without parse backend', async () => {
+  it('keeps independently constructed pipelines isolated', () => {
+    const calls: string[] = [];
+    const createMockBackend = (name: string): ColumineBackend => ({
+      backend: name,
+      loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
+      createState: () => ({ _brand: 'ColumineStateHandle' }),
+      resetState: () => {},
+      executeBatch: () => {
+        calls.push(name);
+        return ErrorCode.OK;
+      },
+      getMapSize: () => 0,
+      getSetSize: () => 0,
+      getAggregateValue: () => 0,
+      mapGet: () => undefined,
+      setContains: () => false,
+      serialize: () => new Uint8Array(0),
+      deserialize: () => ({ _brand: 'ColumineStateHandle' }),
+    });
+    const first = createPipeline({ backend: createMockBackend('first') });
+    const second = createPipeline({ backend: createMockBackend('second') });
+    const state = { _brand: 'ColumineStateHandle' as const };
+    const program: ReducerProgram = { bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] };
+
+    first.reduce.executeBatch(state, program, [], 0);
+    second.reduce.executeBatch(state, program, [], 0);
+    first.reduce.executeBatch(state, program, [], 0);
+
+    expect(calls).toEqual(['first', 'second', 'first']);
+  });
+
+  it('parse stage throws helpful error without parse backend', () => {
     const mockBackend: ColumineBackend = {
       backend: 'mock',
       loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
@@ -478,10 +487,9 @@ describe('SC3: Pipeline composition', () => {
       serialize: () => new Uint8Array(0),
       deserialize: () => ({ _brand: 'ColumineStateHandle' }),
     };
-    setBackend(mockBackend);
 
     // No parse backend provided
-    const stages = await createPipeline();
+    const stages = createPipeline({ backend: mockBackend });
 
     expect(() => {
       stages.parse.parse('[]', {
@@ -491,7 +499,7 @@ describe('SC3: Pipeline composition', () => {
     }).toThrow(/parse backend/i);
   });
 
-  it('stages are independently usable (reduce works without parse)', async () => {
+  it('stages are independently usable (reduce works without parse)', () => {
     let reduceCalled = false;
 
     const mockBackend: ColumineBackend = {
@@ -511,9 +519,8 @@ describe('SC3: Pipeline composition', () => {
       serialize: () => new Uint8Array(0),
       deserialize: () => ({ _brand: 'ColumineStateHandle' }),
     };
-    setBackend(mockBackend);
 
-    const stages = await createPipeline();
+    const stages = createPipeline({ backend: mockBackend });
 
     // Reduce works without parse backend
     const mockState = { _brand: 'ColumineStateHandle' as const };
@@ -529,142 +536,15 @@ describe('SC3: Pipeline composition', () => {
 });
 
 // =============================================================================
-// SC4: DI pattern (setBackend/getBackend/resetBackend/hasBackend)
+// SC4: Streaming processing (multiple batches accumulate state)
 // =============================================================================
 
-describe('SC4: DI pattern', () => {
-  afterEach(() => {
-    resetBackend();
-  });
-
-  it('hasBackend returns false initially after reset', () => {
-    resetBackend();
-    expect(hasBackend()).toBe(false);
-  });
-
-  it('setBackend makes hasBackend return true', () => {
-    resetBackend();
-    expect(hasBackend()).toBe(false);
-
-    const mockBackend: ColumineBackend = {
-      backend: 'mock',
-      loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
-      createState: () => ({ _brand: 'ColumineStateHandle' }),
-      resetState: () => {},
-      executeBatch: () => 0,
-      getMapSize: () => 0,
-      getSetSize: () => 0,
-      getAggregateValue: () => 0,
-      mapGet: () => undefined,
-      setContains: () => false,
-      serialize: () => new Uint8Array(0),
-      deserialize: () => ({ _brand: 'ColumineStateHandle' }),
-    };
-
-    setBackend(mockBackend);
-    expect(hasBackend()).toBe(true);
-  });
-
-  it('getBackend returns the injected backend', async () => {
-    resetBackend();
-
-    const mockBackend: ColumineBackend = {
-      backend: 'test-mock',
-      loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
-      createState: () => ({ _brand: 'ColumineStateHandle' }),
-      resetState: () => {},
-      executeBatch: () => 0,
-      getMapSize: () => 0,
-      getSetSize: () => 0,
-      getAggregateValue: () => 0,
-      mapGet: () => undefined,
-      setContains: () => false,
-      serialize: () => new Uint8Array(0),
-      deserialize: () => ({ _brand: 'ColumineStateHandle' }),
-    };
-
-    setBackend(mockBackend);
-
-    const retrieved = await getBackend();
-    expect(retrieved.backend).toBe('test-mock');
-  });
-
-  it('resetBackend clears the backend', () => {
-    const mockBackend: ColumineBackend = {
-      backend: 'mock',
-      loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
-      createState: () => ({ _brand: 'ColumineStateHandle' }),
-      resetState: () => {},
-      executeBatch: () => 0,
-      getMapSize: () => 0,
-      getSetSize: () => 0,
-      getAggregateValue: () => 0,
-      mapGet: () => undefined,
-      setContains: () => false,
-      serialize: () => new Uint8Array(0),
-      deserialize: () => ({ _brand: 'ColumineStateHandle' }),
-    };
-
-    setBackend(mockBackend);
-    expect(hasBackend()).toBe(true);
-
-    resetBackend();
-    expect(hasBackend()).toBe(false);
-  });
-
-  it('getBackend throws when no backend and no loader set', async () => {
-    resetBackend();
-
-    expect(getBackend()).rejects.toThrow(/no columine backend/i);
-  });
-
-  it('setBackendLoader enables lazy loading', async () => {
-    resetBackend();
-
-    let loaderCalled = false;
-    const mockBackend: ColumineBackend = {
-      backend: 'lazy-mock',
-      loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
-      createState: () => ({ _brand: 'ColumineStateHandle' }),
-      resetState: () => {},
-      executeBatch: () => 0,
-      getMapSize: () => 0,
-      getSetSize: () => 0,
-      getAggregateValue: () => 0,
-      mapGet: () => undefined,
-      setContains: () => false,
-      serialize: () => new Uint8Array(0),
-      deserialize: () => ({ _brand: 'ColumineStateHandle' }),
-    };
-
-    setBackendLoader(async () => {
-      loaderCalled = true;
-      return mockBackend;
-    });
-
-    expect(hasBackend()).toBe(false); // Not loaded yet
-
-    const retrieved = await getBackend();
-    expect(loaderCalled).toBe(true);
-    expect(retrieved.backend).toBe('lazy-mock');
-    expect(hasBackend()).toBe(true); // Now cached
-  });
-});
-
-// =============================================================================
-// SC5: Streaming processing (multiple batches accumulate state)
-// =============================================================================
-
-describe('SC5: Streaming processing', () => {
+describe('SC4: Streaming processing', () => {
   let backend: ColumineBackend;
 
   beforeAll(async () => {
     if (!WASM_EXISTS) return;
     backend = await loadColumineWasm(WASM_PATH);
-  });
-
-  afterEach(() => {
-    resetBackend();
   });
 
   it.skipIf(!WASM_EXISTS)('multiple batches accumulate SUM correctly', async () => {
