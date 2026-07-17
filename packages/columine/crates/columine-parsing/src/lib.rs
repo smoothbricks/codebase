@@ -104,12 +104,42 @@ pub struct ExtractionConfig {
     pub(crate) field_entries: Vec<(usize, ArrowType, String)>,
     pub(crate) field_map: HashMap<String, FieldLookup>,
     pub(crate) fallback_column: Option<usize>,
+    pub(crate) presence_entries: Vec<(usize, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigError {
     FieldNameCountMismatch,
     DuplicateFieldName,
+    InvalidPresenceField,
+}
+
+const VALUE_PRESENCE_PREFIX: &str = "event_value_present.";
+
+fn decode_presence_source(name: &str) -> Result<Option<String>, ConfigError> {
+    let Some(encoded) = name.strip_prefix(VALUE_PRESENCE_PREFIX) else {
+        return Ok(None);
+    };
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let Some(hex) = bytes.get(index + 1..index + 3) else {
+                return Err(ConfigError::InvalidPresenceField);
+            };
+            let hex = std::str::from_utf8(hex).map_err(|_| ConfigError::InvalidPresenceField)?;
+            decoded
+                .push(u8::from_str_radix(hex, 16).map_err(|_| ConfigError::InvalidPresenceField)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded)
+        .map(Some)
+        .map_err(|_| ConfigError::InvalidPresenceField)
 }
 
 pub fn build_extraction_config(
@@ -121,8 +151,17 @@ pub fn build_extraction_config(
     }
     let mut field_entries = Vec::with_capacity(fields.len());
     let mut field_map = HashMap::with_capacity(fields.len());
+    let mut unresolved_presence = Vec::new();
     let mut fallback_column = None;
     for (column, (field, name)) in fields.iter().zip(names).enumerate() {
+        if let Some(source_name) = decode_presence_source(name)? {
+            if field.arrow_type != ArrowType::Bool {
+                return Err(ConfigError::InvalidPresenceField);
+            }
+            unresolved_presence.push((column, source_name));
+            field_entries.push((column, field.arrow_type, (*name).to_owned()));
+            continue;
+        }
         if field_map
             .insert(
                 (*name).to_owned(),
@@ -140,10 +179,18 @@ pub fn build_extraction_config(
         }
         field_entries.push((column, field.arrow_type, (*name).to_owned()));
     }
+    let mut presence_entries = Vec::with_capacity(unresolved_presence.len());
+    for (presence_column, source_name) in unresolved_presence {
+        let source = field_map
+            .get(&source_name)
+            .ok_or(ConfigError::InvalidPresenceField)?;
+        presence_entries.push((presence_column, source.column));
+    }
     Ok(ExtractionConfig {
         field_entries,
         field_map,
         fallback_column,
+        presence_entries,
     })
 }
 
