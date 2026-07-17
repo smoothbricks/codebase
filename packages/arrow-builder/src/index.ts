@@ -4,6 +4,7 @@
 export * from './lib/arrow/index.js';
 // Export buffer types and functions
 export * from './lib/buffer/bufferHelpers.js';
+export * from './lib/buffer/codegenCapability.js';
 export * from './lib/buffer/columnBufferGenerator.js';
 export * from './lib/buffer/columnWriterGenerator.js';
 export * from './lib/buffer/createBuilders.js';
