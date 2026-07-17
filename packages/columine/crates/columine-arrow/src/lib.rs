@@ -36,7 +36,8 @@ pub use columns::{
     MAX_STRING_BYTES, MAX_VALUE_BYTES, ParseError, VariableValueError, VariableValueReservation,
 };
 pub use ipc::{
-    EOS_MARKER, IpcError, IpcWriter, write_arrow_ipc_from_columns_with_schema,
+    EOS_MARKER, IpcError, MIN_ARROW_OUTPUT_CAPACITY, required_arrow_ipc_len,
+    write_arrow_ipc_from_borrowed_columns, write_arrow_ipc_from_columns_with_schema,
     write_arrow_ipc_from_dynamic_columns,
 };
 pub use record_batch::{
@@ -44,4 +45,6 @@ pub use record_batch::{
     MetadataLimits, MetadataStorage, align_to_8, compute_buffer_count, encode_record_batch_dynamic,
     record_batch_metadata_size,
 };
-pub use schema::{ArrowType, DynamicSchemaConfig, SignalSchemaField};
+pub use schema::{
+    ArrowType, DynamicSchemaConfig, MAX_SCHEMA_FIELDS, SchemaError, SignalSchemaField,
+};

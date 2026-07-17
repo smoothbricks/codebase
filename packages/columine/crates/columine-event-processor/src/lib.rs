@@ -19,12 +19,18 @@
 
 pub mod bloom;
 pub mod checkpoint;
+pub mod compact;
 
 pub use bloom::{BloomFilter, CollisionPolicy, DedupState};
+pub use compact::{
+    COMPACT_ABI_VERSION, COMPACT_BATCH_MAGIC, COMPACT_DESCRIPTOR_SIZE, COMPACT_DIAGNOSTIC_STAGE,
+    COMPACT_HEADER_SIZE, CompactBatchView, CompactValidationError, compact_detail,
+};
 
 use columine_arrow::{
-    DynamicColumns, DynamicSchemaConfig, EventColumns, IpcError, MAX_VALUE_BYTES, MetadataLimits,
-    MetadataStorage, write_arrow_ipc_from_columns_with_schema,
+    DynamicColumns, DynamicSchemaConfig, EventColumns, IpcError, MAX_VALUE_BYTES,
+    MIN_ARROW_OUTPUT_CAPACITY, MetadataLimits, MetadataStorage, required_arrow_ipc_len,
+    write_arrow_ipc_from_borrowed_columns, write_arrow_ipc_from_columns_with_schema,
     write_arrow_ipc_from_dynamic_columns,
 };
 use columine_parsing::{
@@ -58,6 +64,8 @@ pub enum ResultCode {
     EncodeError = 3,
     OutOfMemory = 4,
     InvalidFormat = 5,
+    InvalidInput = 6,
+    SchemaMismatch = 7,
 }
 
 /// Result header size (`ResultHeader`, 32 bytes: code u32 | arrow_ipc_offset
@@ -248,6 +256,96 @@ impl EventProcessor {
         self.create_log_entry_dynamic(input, format, output, arrow_offset)
     }
 
+    /// Encode one validated CPB1 column batch into `[ResultHeader][Arrow IPC]`.
+    ///
+    /// Validation and exact-size preflight finish before any Arrow output byte
+    /// is mutated. On `EncodeError` caused by insufficient capacity, the
+    /// header reports offset 32 and the exact required Arrow IPC length so the
+    /// caller can retry with `32 + max(4096, arrow_len)` bytes.
+    pub fn compact(&mut self, batch: &[u8], output: &mut [u8]) -> ResultCode {
+        if output.len() < RESULT_HEADER_SIZE {
+            return ResultCode::OutOfMemory;
+        }
+        let view = match CompactBatchView::parse(batch, &self.schema_config) {
+            Ok(view) => view,
+            Err(error) => {
+                write_compact_result_header(output, error.code, 0, 0, 0, &error.diagnostic);
+                return error.code;
+            }
+        };
+
+        let required_ipc = match required_arrow_ipc_len(&self.schema_config, |index| {
+            view.column(index, &self.schema_config)
+        }) {
+            Ok(required) => required,
+            Err(_) => {
+                let diagnostic = compact_encode_diagnostic();
+                write_compact_result_header(output, ResultCode::EncodeError, 0, 0, 0, &diagnostic);
+                return ResultCode::EncodeError;
+            }
+        };
+        let Ok(required_ipc_u32) = u32::try_from(required_ipc) else {
+            let diagnostic = compact_encode_diagnostic();
+            write_compact_result_header(output, ResultCode::EncodeError, 0, 0, 0, &diagnostic);
+            return ResultCode::EncodeError;
+        };
+        let Some(required_output) =
+            RESULT_HEADER_SIZE.checked_add(required_ipc.max(MIN_ARROW_OUTPUT_CAPACITY))
+        else {
+            return ResultCode::OutOfMemory;
+        };
+        if output.len() < required_output {
+            let diagnostic = compact_encode_diagnostic();
+            write_compact_result_header(
+                output,
+                ResultCode::EncodeError,
+                RESULT_HEADER_SIZE as u32,
+                required_ipc_u32,
+                0,
+                &diagnostic,
+            );
+            return ResultCode::EncodeError;
+        }
+
+        let result = write_arrow_ipc_from_borrowed_columns(
+            view.row_count(),
+            &self.schema_config,
+            &mut output[RESULT_HEADER_SIZE..],
+            &mut self.record_batch_metadata,
+            |index| view.column(index, &self.schema_config),
+            |index| view.null_count(index),
+        );
+        match result {
+            Ok(written) => {
+                let written = u32::try_from(written)
+                    .unwrap_or_else(|_| columine_types::die!("compact IPC length exceeds u32"));
+                write_result_header(
+                    output,
+                    ResultCode::Ok,
+                    RESULT_HEADER_SIZE as u32,
+                    written,
+                    view.row_count(),
+                    0,
+                );
+                ResultCode::Ok
+            }
+            Err(
+                IpcError::BufferTooSmall { .. } | IpcError::InvalidColumn | IpcError::SizeOverflow,
+            ) => {
+                let diagnostic = compact_encode_diagnostic();
+                write_compact_result_header(
+                    output,
+                    ResultCode::EncodeError,
+                    RESULT_HEADER_SIZE as u32,
+                    required_ipc_u32,
+                    0,
+                    &diagnostic,
+                );
+                ResultCode::EncodeError
+            }
+        }
+    }
+
     /// BASE PATH (columine npm variant): scanners into `EventColumns`.
     fn create_log_entry_base(
         &mut self,
@@ -300,7 +398,9 @@ impl EventProcessor {
                 );
                 ResultCode::Ok
             }
-            Err(IpcError::BufferTooSmall) => {
+            Err(
+                IpcError::BufferTooSmall { .. } | IpcError::InvalidColumn | IpcError::SizeOverflow,
+            ) => {
                 write_result_header(output, ResultCode::EncodeError, 0, 0, 0, 0);
                 ResultCode::EncodeError
             }
@@ -410,7 +510,9 @@ impl EventProcessor {
                 );
                 ResultCode::Ok
             }
-            Err(IpcError::BufferTooSmall) => {
+            Err(
+                IpcError::BufferTooSmall { .. } | IpcError::InvalidColumn | IpcError::SizeOverflow,
+            ) => {
                 write_result_header(output, ResultCode::EncodeError, 0, 0, 0, 0);
                 ResultCode::EncodeError
             }
@@ -521,6 +623,41 @@ pub fn write_result_header(
     output[20..32].fill(0);
 }
 
+fn write_diagnostic_bytes(output: &mut [u8], diagnostic: &ResultDiagnostic) {
+    output[20] = DIAGNOSTIC_ABI_VERSION;
+    output[21] = diagnostic.stage;
+    output[22] = diagnostic.detail;
+    output[23] = diagnostic.expected_type;
+    output[24] = diagnostic.actual_type;
+    output[25] = 0;
+    output[26..28].copy_from_slice(&diagnostic.field_index.to_le_bytes());
+    output[28..30].copy_from_slice(&diagnostic.row_index.to_le_bytes());
+    output[30..32].fill(0);
+}
+
+pub fn write_compact_result_header(
+    output: &mut [u8],
+    code: ResultCode,
+    arrow_offset: u32,
+    arrow_len: u32,
+    rows: u32,
+    diagnostic: &ResultDiagnostic,
+) {
+    write_result_header(output, code, arrow_offset, arrow_len, rows, 0);
+    write_diagnostic_bytes(output, diagnostic);
+}
+
+fn compact_encode_diagnostic() -> ResultDiagnostic {
+    ResultDiagnostic {
+        stage: COMPACT_DIAGNOSTIC_STAGE,
+        detail: 0,
+        expected_type: 0,
+        actual_type: 0,
+        field_index: NO_FIELD,
+        row_index: 0,
+    }
+}
+
 /// Write the header with the diagnostic packed into the reserved bytes
 /// (`writeResultHeaderWithDiagnostic`, AxE artifact).
 pub fn write_result_header_with_diagnostic(
@@ -529,16 +666,7 @@ pub fn write_result_header_with_diagnostic(
     diagnostic: &ResultDiagnostic,
 ) {
     write_result_header(output, code, 0, 0, 0, 0);
-    // ResultDiagnostic layout at reserved (offset 20).
-    output[20] = DIAGNOSTIC_ABI_VERSION;
-    output[21] = diagnostic.stage;
-    output[22] = diagnostic.detail;
-    output[23] = diagnostic.expected_type;
-    output[24] = diagnostic.actual_type;
-    output[25] = 0; // reserved0
-    output[26..28].copy_from_slice(&diagnostic.field_index.to_le_bytes());
-    output[28..30].copy_from_slice(&diagnostic.row_index.to_le_bytes());
-    output[30..32].fill(0); // reserved1
+    write_diagnostic_bytes(output, diagnostic);
 }
 
 /// Read back the header fields (test/consumer view).
@@ -550,7 +678,12 @@ pub fn read_result_header(output: &[u8]) -> (u32, u32, u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{Array, NullArray};
+    use arrow_ipc::reader::StreamReader;
+    use arrow_ipc::writer::StreamWriter;
+    use arrow_schema::{DataType, Field, Schema};
     use columine_arrow::{ArrowType, SignalSchemaField};
+    use std::io::Cursor;
 
     fn base_fields() -> Vec<SignalSchemaField> {
         vec![
@@ -562,10 +695,67 @@ mod tests {
     }
 
     fn schema_with_names(fields: &[SignalSchemaField], names: &[u8]) -> DynamicSchemaConfig {
-        let schema_bytes = [
-            0xFF, 0xFF, 0xFF, 0xFF, 0x08, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
-        DynamicSchemaConfig::with_field_names(&schema_bytes, fields, names)
+        let schema_fields = fields
+            .iter()
+            .enumerate()
+            .map(|(index, metadata)| {
+                let data_type = match metadata.arrow_type {
+                    ArrowType::Null => DataType::Null,
+                    ArrowType::Int32 => DataType::Int32,
+                    ArrowType::Float64 => DataType::Float64,
+                    ArrowType::Binary => DataType::Binary,
+                    ArrowType::Utf8 => DataType::Utf8,
+                    ArrowType::Bool => DataType::Boolean,
+                    ArrowType::Int64 => DataType::Int64,
+                };
+                Field::new(format!("field_{index}"), data_type, metadata.is_nullable())
+            })
+            .collect::<Vec<_>>();
+        let mut schema_bytes = Vec::new();
+        {
+            let mut writer =
+                StreamWriter::try_new(&mut schema_bytes, &Schema::new(schema_fields)).unwrap();
+            writer.finish().unwrap();
+        }
+        schema_bytes.truncate(schema_bytes.len() - 8);
+        DynamicSchemaConfig::with_field_names(&schema_bytes, fields, names).unwrap()
+    }
+
+    #[test]
+    fn compact_null_rows_ignore_parse_column_capacity_and_round_trip() {
+        let fields = [SignalSchemaField::new(ArrowType::Null, true)];
+        let schema = schema_with_names(&fields, b"null\0");
+        let mut processor =
+            EventProcessor::new(EpWiring::columine(), 1, CollisionPolicy::Latest, schema).unwrap();
+
+        let mut request = vec![0u8; COMPACT_HEADER_SIZE + COMPACT_DESCRIPTOR_SIZE];
+        request[0..4].copy_from_slice(&COMPACT_BATCH_MAGIC.to_le_bytes());
+        request[4..6].copy_from_slice(&COMPACT_ABI_VERSION.to_le_bytes());
+        request[6..8].copy_from_slice(&(COMPACT_DESCRIPTOR_SIZE as u16).to_le_bytes());
+        request[8..12].copy_from_slice(&3u32.to_le_bytes());
+        request[12..16].copy_from_slice(&1u32.to_le_bytes());
+        request[COMPACT_HEADER_SIZE] = ArrowType::Null as u8;
+
+        let mut output = vec![0u8; 8192];
+        assert_eq!(processor.compact(&request, &mut output), ResultCode::Ok);
+        let (code, arrow_offset, arrow_len, rows, duplicates) = read_result_header(&output);
+        assert_eq!(
+            (code, arrow_offset, rows, duplicates),
+            (ResultCode::Ok as u32, RESULT_HEADER_SIZE as u32, 3, 0)
+        );
+
+        let start = arrow_offset as usize;
+        let end = start + arrow_len as usize;
+        let mut reader = StreamReader::try_new(Cursor::new(&output[start..end]), None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        let nulls = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<NullArray>()
+            .unwrap();
+        assert_eq!(nulls.len(), 3);
+        assert_eq!(nulls.logical_null_count(), 3);
+        assert!(reader.next().is_none());
     }
 
     // test "ep_create_log_entry with schema" (axe-runtime variant)

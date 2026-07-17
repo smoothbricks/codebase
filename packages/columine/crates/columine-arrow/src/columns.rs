@@ -279,8 +279,9 @@ pub struct ColumnStorage {
     /// Configured hard limit for retained variable-width data.
     max_data_bytes: u32,
 
-    // For int64/float64: fixed-width array (LE bytes).
+    // For int32/int64/float64: fixed-width little-endian values.
     fixed: Option<Vec<u8>>,
+    fixed_width: u8,
 
     // For bool: bit-packed data.
     bool_data: Option<Vec<u8>>,
@@ -301,6 +302,7 @@ impl ColumnStorage {
             data_len: 0,
             max_data_bytes,
             fixed: None,
+            fixed_width: 0,
             bool_data: None,
         };
         match col_type {
@@ -310,12 +312,21 @@ impl ColumnStorage {
                 storage.data = Some(vec![0; initial_bytes]);
             }
             ColumnType::Int64 | ColumnType::Float64 => {
+                storage.fixed_width = 8;
                 storage.fixed = Some(vec![0; cap * 8]);
             }
             ColumnType::Bool => {
                 storage.bool_data = Some(vec![0; cap.div_ceil(8)]);
             }
         }
+        storage
+    }
+
+    fn new_int32(capacity: u32) -> Self {
+        let cap = capacity.min(MAX_EVENTS_PER_BATCH) as usize;
+        let mut storage = Self::new(ColumnType::Int64, capacity);
+        storage.fixed_width = 4;
+        storage.fixed = Some(vec![0; cap * 4]);
         storage
     }
 
@@ -387,6 +398,9 @@ impl ColumnStorage {
     pub fn data_capacity(&self) -> Option<usize> {
         Some(self.data.as_ref()?.len())
     }
+    pub fn fixed_i32_bytes(&self, row_count: u32) -> Option<&[u8]> {
+        Some(&self.fixed.as_ref()?[..row_count as usize * 4])
+    }
     pub fn fixed_i64_bytes(&self, row_count: u32) -> Option<&[u8]> {
         Some(&self.fixed.as_ref()?[..row_count as usize * 8])
     }
@@ -397,8 +411,16 @@ impl ColumnStorage {
         Some(&self.bool_data.as_ref()?[..(row_count as usize).div_ceil(8)])
     }
 
+    pub fn read_fixed_i32(&self, row: u32) -> Option<u32> {
+        let fixed = self.fixed.as_ref()?;
+        let start = row as usize * 4;
+        Some(u32::from_le_bytes(fixed[start..start + 4].try_into().ok()?))
+    }
     pub fn read_fixed_i64(&self, row: u32) -> Option<i64> {
         let fixed = self.fixed.as_ref()?;
+        if self.fixed_width == 4 {
+            return self.read_fixed_i32(row).map(i64::from);
+        }
         let start = row as usize * 8;
         Some(i64::from_le_bytes(fixed[start..start + 8].try_into().ok()?))
     }
@@ -541,16 +563,14 @@ impl DynamicColumns {
         let cap = capacity.min(MAX_EVENTS_PER_BATCH);
         let columns = field_metadata
             .iter()
-            .map(|field| {
-                let col_type = match field.arrow_type {
-                    ArrowType::Utf8 => ColumnType::Utf8,
-                    ArrowType::Binary => ColumnType::Binary,
-                    ArrowType::Int32 | ArrowType::Int64 => ColumnType::Int64,
-                    ArrowType::Float64 => ColumnType::Float64,
-                    ArrowType::Bool => ColumnType::Bool,
-                    ArrowType::Null => ColumnType::Utf8,
-                };
-                ColumnStorage::new(col_type, cap)
+            .map(|field| match field.arrow_type {
+                ArrowType::Int32 => ColumnStorage::new_int32(cap),
+                ArrowType::Utf8 => ColumnStorage::new(ColumnType::Utf8, cap),
+                ArrowType::Binary => ColumnStorage::new(ColumnType::Binary, cap),
+                ArrowType::Int64 => ColumnStorage::new(ColumnType::Int64, cap),
+                ArrowType::Float64 => ColumnStorage::new(ColumnType::Float64, cap),
+                ArrowType::Bool => ColumnStorage::new(ColumnType::Bool, cap),
+                ArrowType::Null => ColumnStorage::new(ColumnType::Utf8, cap),
             })
             .collect::<Vec<_>>();
         Self {
@@ -660,6 +680,19 @@ impl DynamicColumns {
         Ok(())
     }
 
+    /// Append a physical 32-bit value. Negative signed values and the full
+    /// UInt32 domain share the same four-byte Arrow representation.
+    pub fn append_int32(&mut self, col_idx: u32, value: i64) -> Result<(), ParseError> {
+        if self
+            .columns
+            .get(col_idx as usize)
+            .is_none_or(|column| column.fixed_width != 4)
+        {
+            return Err(ParseError::InvalidFieldType);
+        }
+        self.append_int64(col_idx, value)
+    }
+
     /// Append an Int64 value (columns.zig `appendInt64`).
     pub fn append_int64(&mut self, col_idx: u32, value: i64) -> Result<(), ParseError> {
         if col_idx >= self.field_count {
@@ -667,14 +700,19 @@ impl DynamicColumns {
         }
         let row_idx = self.count as usize;
         let col = &mut self.columns[col_idx as usize];
-        if col.col_type != ColumnType::Int64 {
-            return Err(ParseError::InvalidFieldType);
+        let fixed = col.fixed.as_mut().ok_or(ParseError::InvalidFieldType)?;
+        match (col.col_type, col.fixed_width) {
+            (ColumnType::Int64, 4) => {
+                if !(i64::from(i32::MIN)..=i64::from(u32::MAX)).contains(&value) {
+                    return Err(ParseError::InvalidFieldType);
+                }
+                fixed[row_idx * 4..row_idx * 4 + 4].copy_from_slice(&(value as u32).to_le_bytes());
+            }
+            (ColumnType::Int64, 8) => {
+                fixed[row_idx * 8..row_idx * 8 + 8].copy_from_slice(&value.to_le_bytes());
+            }
+            _ => return Err(ParseError::InvalidFieldType),
         }
-        let fixed = col
-            .fixed
-            .as_mut()
-            .unwrap_or_else(|| columine_types::die!("int64 column without fixed storage"));
-        fixed[row_idx * 8..row_idx * 8 + 8].copy_from_slice(&value.to_le_bytes());
         col.validity[row_idx / 8] |= 1u8 << (row_idx % 8);
         Ok(())
     }
