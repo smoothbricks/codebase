@@ -435,6 +435,11 @@ fn extract_json_event_open(
     parser
         .next_token()
         .map_err(|_| ExtractionError::InvalidJson)?;
+    for (presence_column, source_column) in &config.presence_entries {
+        let present = columns.columns_seen[*source_column];
+        append(columns, *presence_column, Some(ColumnValue::Bool(present)))?;
+        columns.columns_seen[*presence_column] = true;
+    }
     for (column, _, _) in &config.field_entries {
         if !columns.columns_seen[*column] {
             append(columns, *column, None)?;
@@ -972,6 +977,45 @@ mod tests {
             &mut ExtractionDiagnostic::default(),
         )
         .map(|_| ())
+    }
+    #[test]
+    fn populates_presence_columns_for_explicit_null_false_and_absent_fields() {
+        let fields = [
+            field(ArrowType::Utf8),
+            field(ArrowType::Utf8),
+            field(ArrowType::Bool),
+            field(ArrowType::Bool),
+            field(ArrowType::Bool),
+        ];
+        let config = config(
+            &fields,
+            &[
+                "id",
+                "value.note",
+                "event_value_present.value%2Enote",
+                "$value$schema.type.flag",
+                "event_value_present.%24value%24schema%2Etype%2Eflag",
+            ],
+        );
+        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut work = [0; 64];
+
+        assert_eq!(
+            extract_json_events(
+                br#"[{"id":"first","value.note":null,"$value$schema.type.flag":false},{"id":"second"}]"#,
+                &config,
+                &mut columns,
+                &mut work,
+                &mut ExtractionDiagnostic::default(),
+            ),
+            Ok(2)
+        );
+        assert_eq!(columns.cell(1, 0), None);
+        assert_eq!(columns.cell(2, 0), Some(ColumnValue::Bool(true)));
+        assert_eq!(columns.cell(2, 1), Some(ColumnValue::Bool(false)));
+        assert_eq!(columns.cell(3, 0), Some(ColumnValue::Bool(false)));
+        assert_eq!(columns.cell(4, 0), Some(ColumnValue::Bool(true)));
+        assert_eq!(columns.cell(4, 1), Some(ColumnValue::Bool(false)));
     }
     /// f33e06007 (execute full typed event schemas): Int32 is STRICT —
     /// integer JSON numbers only; Int64 rejects decimal-number truncation
