@@ -236,6 +236,38 @@ function align8(n: number): number {
   return Math.ceil(n / 8) * 8;
 }
 
+/**
+ * Map a raw non-OK status from the WASM VM to its ErrorCode member.
+ *
+ * Exhaustive switch instead of an `as ErrorCode` narrowing (same pattern as
+ * parse-backend's compactStatusCode): a status outside the enum means the TS
+ * ErrorCode mirror and the WASM binary disagree — a contract violation, so it
+ * throws a teaching error instead of manufacturing a bogus enum member.
+ */
+function vmErrorCode(status: number): ErrorCode {
+  switch (status) {
+    case ErrorCode.CAPACITY_EXCEEDED:
+      return ErrorCode.CAPACITY_EXCEEDED;
+    case ErrorCode.INVALID_PROGRAM:
+      return ErrorCode.INVALID_PROGRAM;
+    case ErrorCode.INVALID_SLOT:
+      return ErrorCode.INVALID_SLOT;
+    case ErrorCode.INVALID_STATE:
+      return ErrorCode.INVALID_STATE;
+    case ErrorCode.NEEDS_GROWTH:
+      return ErrorCode.NEEDS_GROWTH;
+    case ErrorCode.ARENA_OVERFLOW:
+      return ErrorCode.ARENA_OVERFLOW;
+    case ErrorCode.INVALID_KEY:
+      return ErrorCode.INVALID_KEY;
+    default:
+      throw new Error(
+        `WASM VM returned unknown status ${status}: the TypeScript ErrorCode enum is out of sync ` +
+          'with the loaded columine.wasm binary. Rebuild the wasm artifact or update ErrorCode in types.ts.',
+      );
+  }
+}
+
 // =============================================================================
 // WASM Backend Factory
 // =============================================================================
@@ -601,7 +633,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
       const state = assertWasmStateHandle(stateHandle);
       const statePtr = copyStateIn(state);
       const status = wasmInstance.exports.vm_evict_all_expired(statePtr, now);
-      if (status !== ErrorCode.OK) return { ok: false, error: status as ErrorCode };
+      if (status !== ErrorCode.OK) return { ok: false, error: vmErrorCode(status) };
       const count = wasmInstance.exports.vm_get_evicted_count();
       new Uint8Array(state.buffer).set(new Uint8Array(wasmInstance.memory.buffer, statePtr, state.size));
       return { ok: true, count, rows: readEvictedRows(state, program) };
