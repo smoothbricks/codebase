@@ -18,7 +18,6 @@
 
 import type { ParseCompactBackend } from './parse-backend.js';
 import type { ColumineBackend, ColumnInput, ReducerProgram, StateHandle } from './types.js';
-import { isUndoCapableBackend } from './types.js';
 
 // =============================================================================
 // Configuration Types
@@ -141,43 +140,9 @@ export interface ColumineStages {
 // Stage Factory Implementations
 // =============================================================================
 
-/**
- * Internal undo token — stores the undo log position at checkpoint time.
- * The undo log itself lives in the native state buffer (managed by Zig).
- */
+/** Internal undo token containing the native journal position. */
 interface InternalUndoToken extends UndoToken {
-  /** Undo log position from native checkpoint (lightweight) */
   position: number;
-  /** Fallback snapshot — only used if undo overflow detected or no native undo */
-  snapshot: Uint8Array | null;
-}
-
-interface SnapshotStateHandle extends StateHandle {
-  readonly buffer: ArrayBuffer;
-}
-
-function isSnapshotStateHandle(state: StateHandle): state is SnapshotStateHandle {
-  return 'buffer' in state && state.buffer instanceof ArrayBuffer;
-}
-
-function cloneStateSnapshot(state: StateHandle): Uint8Array {
-  if (!isSnapshotStateHandle(state)) {
-    // invariant throw: snapshot fallback only works for raw-buffer state handles
-    throw new Error('Undo fallback requires a state handle backed by an ArrayBuffer');
-  }
-  return new Uint8Array(state.buffer).slice();
-}
-
-function restoreStateSnapshot(state: StateHandle, snapshot: Uint8Array): void {
-  if (!isSnapshotStateHandle(state)) {
-    // invariant throw: snapshot/token does not belong to a raw-buffer state handle
-    throw new Error('Undo fallback requires a state handle backed by an ArrayBuffer');
-  }
-  if (snapshot.length > state.buffer.byteLength) {
-    // invariant throw: snapshot/token does not belong to this state handle
-    throw new Error('Invalid UndoToken: snapshot size exceeds target state buffer');
-  }
-  new Uint8Array(state.buffer).set(snapshot);
 }
 
 function assertInternalUndoToken(token: UndoToken): InternalUndoToken {
@@ -192,16 +157,9 @@ function assertInternalUndoToken(token: UndoToken): InternalUndoToken {
     throw new Error('Invalid UndoToken: missing or invalid checkpoint position');
   }
 
-  const snapshot = 'snapshot' in token ? token.snapshot : undefined;
-  if (snapshot !== null && !(snapshot instanceof Uint8Array) && snapshot !== undefined) {
-    // invariant throw: caller passed a non-pipeline token or corrupted token
-    throw new Error('Invalid UndoToken: snapshot must be Uint8Array | null');
-  }
-
   return {
     _brand: 'UndoToken',
     position,
-    snapshot: snapshot ?? null,
   };
 }
 
@@ -232,49 +190,18 @@ function createCompactStage(parseBackend: ParseCompactBackend): CompactStage {
   };
 }
 
-//#region axe!n/reducer-speculation-undo-log #undo-log #speculation #overflow-fallback
-// The TS orchestration of 10d's delta-based undo log (Strategy 2 + §Undo Log
-// Overflow Handling): checkpoint = save Zig undo-log position (O(1)), rollback =
-// native reverse replay, commit = discard entries. The lazy-overflow shadow
-// buffer lives in Zig (vm.zig); when the backend reports overflow this stage
-// falls back to a full-state snapshot it captured at checkpoint.
-/**
- * Create undo stage with native undo log.
- *
- * Native path (fast): Uses Zig undo log via WASM/FFI exports.
- * checkpoint() saves log position (O(1), no memcpy), rollback() replays in reverse.
- * Undo log overflow is handled lazily inside Zig via shadow buffer — only when
- * the log actually exceeds capacity does a memcpy occur.
- *
- * Fallback path: If backend doesn't support native undo, falls back to
- * full-state snapshot for checkpoint/rollback.
- */
+//#region axe!n/reducer-speculation-undo-log #undo-log #speculation
+/** Create the mandatory native undo stage. */
 function createUndoStage(backend: ColumineBackend): UndoStage {
-  // Check once at construction — backend capabilities don't change
-  const undoBackend = isUndoCapableBackend(backend) ? backend : null;
-
   return {
     name: 'undo',
 
     checkpoint(state: StateHandle): UndoToken {
-      if (undoBackend) {
-        // Enable undo logging, save change flags, store state pointer for lazy overflow
-        undoBackend.undoEnable(state);
-        const position = undoBackend.undoCheckpoint(state);
-        // No snapshot needed — overflow is handled lazily inside Zig
-        const token: InternalUndoToken = {
-          _brand: 'UndoToken',
-          position,
-          snapshot: null,
-        };
-        return token;
-      }
-      // Fallback path: full snapshot only (no native undo available)
-      const snapshot = cloneStateSnapshot(state);
+      backend.undoEnable(state);
+      const position = backend.undoCheckpoint(state);
       const token: InternalUndoToken = {
         _brand: 'UndoToken',
-        position: 0,
-        snapshot,
+        position,
       };
       return token;
     },
@@ -282,33 +209,14 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
     rollback(state: StateHandle, token: UndoToken): 'ok' | 'overflow' {
       const internal = assertInternalUndoToken(token);
 
-      if (undoBackend) {
-        // Native rollback — Zig handles overflow internally via shadow buffer:
-        // if overflow occurred, it restores shadow then replays log;
-        // if no overflow, it just replays log
-        undoBackend.undoRollback(state, internal.position);
-        const overflowed = undoBackend.undoHasOverflow();
-        return overflowed ? 'overflow' : 'ok';
-      }
-
-      // Fallback: restore from snapshot (no native undo)
-      if (internal.snapshot) {
-        if (internal.snapshot.length > 0) {
-          restoreStateSnapshot(state, internal.snapshot);
-        }
-      }
-      return 'ok';
+      backend.undoRollback(state, internal.position);
+      return backend.undoHasOverflow() ? 'overflow' : 'ok';
     },
 
     commit(state: StateHandle, token: UndoToken): void {
       const internal = assertInternalUndoToken(token);
 
-      if (undoBackend) {
-        undoBackend.undoCommit(state, internal.position);
-      }
-
-      // Discard snapshot in all cases — mutations are now permanent
-      internal.snapshot = null;
+      backend.undoCommit(state, internal.position);
     },
   };
 }
