@@ -83,7 +83,11 @@ const createUser = defineOp('create-user', async (ctx, userData: UserData) => {
   const region = ctx.env?.awsRegion ?? 'us-east-1';
 
   // Fluent tag chaining — every setter returns the tag writer.
-  ctx.tag.requestId(ctx.requestId ?? 'req-unknown').userId(userData.email).operation('INSERT').region(region);
+  ctx.tag
+    .requestId(ctx.requestId ?? 'req-unknown')
+    .userId(userData.email)
+    .operation('INSERT')
+    .region(region);
 
   // `with()` sets several attributes at once, then chaining continues.
   ctx.tag.with({ httpStatus: 200, duration: 5 }).query('BEGIN TRANSACTION');
