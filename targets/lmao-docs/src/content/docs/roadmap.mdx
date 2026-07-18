@@ -23,10 +23,10 @@ Trace analysis — an in-browser SQL query engine over exported Arrow data, plus
 
 ### TypeScript transformer
 
-The build-time transformer (source-line injection and `ctx.tag` inlining) ships as
-**`@smoothbricks/lmao-transformer`**. It is entirely optional — no documented API requires it — and is an opt-in
-performance/DX optimization. See the [Transformer reference](/reference/transformer/). One piece of its design, the
-destructured-context (`__ctx`) rewrite, is not yet implemented.
+The build-time optimizer (source-line injection, tag/log/result inlining, monomorphic span lowering, and the
+destructured-context `__ctx` rewrite) ships as **`@smoothbricks/lmao-ttsc`** — a native ttsc/tsgo compiler plugin. It is
+entirely optional — no documented API requires it — and is an opt-in performance/DX optimization. See the
+[Transformer reference](/reference/transformer/).
 
 ### Cloudflare trace sink
 
@@ -44,6 +44,18 @@ The items below are not available as a shipped API. Don't write code against the
 ### AI-agent / MCP integration
 
 Exposing traces to AI agents over a protocol such as MCP is an idea under consideration, not a shipped capability.
+
+### Inspection CLI (`lmao-inspect`)
+
+A small, local-first terminal tool for reading Arrow trace segments on disk — `scan` / `tail -f` / `query` / `trace`
+over the tracer-agnostic `lmao-query` selector surface. It is **unbuilt** (design only) and is distinct from the
+browser-based Inspector above; consumers would wrap it with domain-specific verbs.
+
+### Rust core
+
+A Rust reimplementation of the columnar core (`packages/lmao-rs`: buffers, Arrow conversion, the query engine, and the
+WASM allocator) is in progress. It backs the AOT/WASM path but is not a separate public API you install today — the
+shipped surface remains the TypeScript `@smoothbricks/lmao`.
 
 ### Partially built
 
