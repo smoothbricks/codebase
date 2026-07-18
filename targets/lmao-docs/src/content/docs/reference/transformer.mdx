@@ -1,89 +1,74 @@
 ---
 title: TypeScript transformer
-description: The optional build-time transformer — @smoothbricks/lmao-transformer — for line injection and tag inlining.
+description: The optional AOT compiler plugin — @smoothbricks/lmao-ttsc — for line injection and hot-path lowering.
 sidebar:
   order: 21
 ---
 
-`@smoothbricks/lmao-transformer` is a **separate companion package** (not a subpath of `@smoothbricks/lmao`) that
-provides a standard TypeScript custom transformer. It rewrites your traced code at compile time for source-line
-attribution and zero-overhead tagging.
+`@smoothbricks/lmao-ttsc` is a **separate companion package** (not a subpath of `@smoothbricks/lmao`) that provides
+LMAO's compile-time optimizer. It is a native **ttsc / tsgo compiler plugin** (a Go plugin loaded through
+[`ttsc`](https://www.npmjs.com/package/ttsc)) that rewrites your traced code at build time to remove runtime dispatch
+and setup wherever static proof is available.
 
 :::caution[Entirely optional]
-No documented `@smoothbricks/lmao` API requires this transformer. Your code compiles and runs identically without it —
-you simply forgo automatic source-line numbers and the `ctx.tag` inlining micro-optimization. It is a pre-1.0 companion
-package; treat it as an advanced, opt-in build integration.
+No documented `@smoothbricks/lmao` API requires this plugin. Your code compiles and runs identically without it — you
+simply forgo automatic source-line numbers and the hot-path lowering below. It is a pre-1.0, advanced build integration;
+treat the emitted shape as an implementation detail, not a contract.
 :::
 
 ```bash
-bun add -d @smoothbricks/lmao-transformer
+bun add -d @smoothbricks/lmao-ttsc
 ```
 
-## `createLmaoTransformer(options?)`
+## Integration
 
-Returns a `ts.TransformerFactory<ts.SourceFile>` for the compiler's `before` phase.
+The plugin is a **native ttsc descriptor**, not a TypeScript compiler-API transformer you register by hand. `ttsc`
+discovers it automatically from the package's `ttsc.plugin` field once it is a direct dependency — you do not wire up a
+second transformer implementation.
 
-```ts
-createLmaoTransformer(options?: LmaoTransformerOptions): ts.TransformerFactory<ts.SourceFile>
-```
-
-`LmaoTransformerOptions`:
-
-| Option | Purpose |
-|---|---|
-| `typeChecker?` | A `ts.TypeChecker`. When provided, only calls on genuine LMAO context/logger types are rewritten (type-aware). Without it, transformation is purely structural (matches `ctx.log.*`, `ctx.span`, `ctx.tag`, `ctx.ok`/`ctx.err` by shape). |
-| `projectRoot?` | Root for computing relative paths in injected metadata. Defaults to the git repository root, else `process.cwd()`. |
-
-Wiring depends on your build tool — anything that accepts custom TS transformers (for example `ts-patch`, `ts-loader`,
-or a bundler's TypeScript plugin). The self-contained form via `ts.transpileModule`:
+For **`Bun.build`**, use the package's adapter export:
 
 ```ts
-import ts from 'typescript';
-import { createLmaoTransformer } from '@smoothbricks/lmao-transformer';
+import ttsc from '@smoothbricks/lmao-ttsc/bun';
 
-const { outputText } = ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ESNext },
-  transformers: { before: [createLmaoTransformer()] },
+await Bun.build({
+  entrypoints: ['src/index.ts'],
+  outdir: 'dist',
+  plugins: [ttsc()],
 });
 ```
 
-## What it rewrites
+For Bun's **runtime loader** (`bun run` and `bun test`), register the same adapter once in `bunfig.toml`:
 
-For code written against the shipped `ctx` surface:
-
-- **Log lines** — `ctx.log.info('msg')` → `ctx.log.info('msg').line(N)`, where `N` is the call-site source line. The
-  same applies to `debug`/`warn`/`error`/`trace`, and `.line(N)` is inserted before any further chained setters.
-- **Result lines** — `ctx.ok(value)` → `ctx.ok(value).line(N)`; `ctx.err(error)` → `ctx.err(error).line(N)`.
-- **Child spans** — `ctx.span('name', opOrFn)` is rewritten to a monomorphic internal dispatch that carries the
-  call-site line number.
-- **Tag inlining** — a `ctx.tag.*` chain used as a statement is inlined to direct columnar buffer writes (no method
-  calls on the hot path):
-
-```ts
-// before
-ctx.tag.operation('SELECT').userId(userId);
-// after (conceptually)
-{
-  ctx._buffer.operation_values[0] = 'SELECT';
-  ctx._buffer.operation_nulls[0] |= 1;
-  ctx._buffer.userId_values[0] = userId;
-  ctx._buffer.userId_nulls[0] |= 1;
-}
+```toml
+[test]
+preload = ["@smoothbricks/lmao-ttsc/bun-register"]
 ```
 
-Chains already carrying `.line(...)` are left untouched, and a `ctx.tag` chain assigned to a variable (rather than used
-as a statement) is not inlined.
+Both entrypoints read the nearest TypeScript project and apply its configured and direct-dependency ttsc plugins. The
+`./bun-register` export is intentionally a package side effect; the `./bun` build adapter itself is side-effect free.
 
-The package also exposes the tag-chain inliner building blocks directly — `tryTransformTagChain`, `findTagChainRoot`,
-`extractSchemaFromTagType` (with `TagChainInfo`, `SchemaFieldInfo`) — for advanced integrations.
+## What it rewrites
 
-:::note[Legacy transforms]
-The transformer additionally recognizes the older module-context API: it injects build metadata into `defineModule({…})`
-calls and appends line numbers to `task('name', fn)` calls. The shipped context API is
-[`defineOpContext` / `defineOp`](/reference/define-op-context/) — these legacy rewrites don't fire on current code.
-:::
+At compile time, for code written against the shipped `ctx` surface:
 
-## Not yet implemented
+- **Source-line injection** — `.line(N)` is added to `ctx.log.*`, `ctx.ok(...)`, and `ctx.err(...)` with the call-site
+  line number (inserted before any further chained setters; chains that already carry `.line(...)` are left alone).
+- **Monomorphic `span()` lowering** — `ctx.span('name', op, ...args)` is lowered to a fixed-arity, Promise-preserving
+  internal call so the hot path avoids polymorphic dispatch.
+- **Tag inlining** — a `ctx.tag.*` chain (and `ctx.tag.with({...})`) used as a statement is unrolled to direct columnar
+  buffer writes, so tagging costs no method calls on the hot path.
+- **Destructured-context (`__ctx`) rewrite** — hoists context members at call sites for tighter emitted code.
+- **Metadata injection** and **packed runtime hints** — build metadata and small runtime flags are baked in, and log
+  templates are stored as private `u16` values.
 
-The design also describes a destructured-context (`__ctx`) rewrite that hoists context members at call sites. That part
-is **not implemented**; only the line injection and tag-chain inlining above ship today.
+## Caveats
+
+- The plugin's contract is **the transformed output its test suite asserts**, not any particular emitted source — don't
+  depend on the exact shape.
+- Automatic `ctx.span(...)` → synchronous `spanAutoN(...)` lowering is **intentionally disabled**: a synchronous return
+  would change the public Promise API's observable microtask scheduling.
+- The "global vocabulary ABI" described in the design is a future clean-cutover target, **not** shipped behavior; shipped
+  Op-local log-template IDs remain lexical `u16` values.
+
+See the design spec `specs/lmao/01o_typescript_transformer.md` for the full transformation list and rationale.
