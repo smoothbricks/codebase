@@ -13,14 +13,7 @@
  *   bun run examples/library-integration.ts
  */
 
-import {
-  createTraceRoot,
-  defineLogSchema,
-  defineOpContext,
-  JsBufferStrategy,
-  S,
-  StdioTracer,
-} from '../src/node.js';
+import { createTraceRoot, defineLogSchema, defineOpContext, JsBufferStrategy, S, StdioTracer } from '../src/node.js';
 
 // ── Cache library ────────────────────────────────────────────────────────────
 const cacheSchema = defineLogSchema({
