@@ -44,16 +44,20 @@ await ctx.span('validate', validateOp);
 await ctx.span('save', async (child) => child.ok({ id: 1 }));
 ```
 
-## `ctx.spanSync(name, fn)`
+## `ctx.spanSync(name, op)`
 
-Open a **synchronous** child span. `fn` must be synchronous and return a `Result` directly; `spanSync` returns that
-`Result` as-is (no `Promise`, no `await`) and does no async retry or backoff. Use it when the child work can't suspend.
+Open a **synchronous** child span that runs a **no-argument op** (`Op<…, []>`) with a synchronous body. Unlike
+`ctx.span`, `spanSync` returns the op's `Result` directly — no `Promise`, no `await` — and does no async retry or
+backoff. Use it when the child work is synchronous and can't suspend.
 
 ```ts
-const parsed = ctx.spanSync('parse', (child) => {
+// A no-arg op with a synchronous body.
+const parseConfig = defineOp('parse-config', (child) => {
   child.tag.step('parse');
   return child.ok(JSON.parse(raw));
 });
+
+const parsed = ctx.spanSync('parse', parseConfig);
 ```
 
 ## `ctx.setScope(values)`
