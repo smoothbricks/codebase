@@ -77,7 +77,12 @@ const validateOrder = defineOp('validate-order', async (ctx, orderId: string) =>
 
 // 2. Chaining across a child span, with a typed error path.
 const processPayment = defineOp('process-payment', async (ctx, order: Order) => {
-  ctx.tag.orderId(order.id).amount(order.total).currency(order.currency).paymentMethod(order.paymentMethod).status('processing');
+  ctx.tag
+    .orderId(order.id)
+    .amount(order.total)
+    .currency(order.currency)
+    .paymentMethod(order.paymentMethod)
+    .status('processing');
 
   const payment = await ctx.span('call-payment-gateway', async (childCtx) => {
     const start = performance.now();
