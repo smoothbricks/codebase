@@ -50,17 +50,123 @@ Both entrypoints read the nearest TypeScript project and apply its configured an
 
 ## What it rewrites
 
-At compile time, for code written against the shipped `ctx` surface:
+Every rewrite is compile-time only and opt-in. Without the plugin your code still runs — the library takes a slower
+polymorphic path — so these are purely a production optimization. The snippets show the observable before → after; the
+exact emitted shape is an implementation detail (see [Caveats](#caveats)), so don't depend on it.
 
-- **Source-line injection** — `.line(N)` is added to `ctx.log.*`, `ctx.ok(...)`, and `ctx.err(...)` with the call-site
-  line number (inserted before any further chained setters; chains that already carry `.line(...)` are left alone).
-- **Monomorphic `span()` lowering** — `ctx.span('name', op, ...args)` is lowered to a fixed-arity, Promise-preserving
-  internal call so the hot path avoids polymorphic dispatch.
-- **Tag inlining** — a `ctx.tag.*` chain (and `ctx.tag.with({...})`) used as a statement is unrolled to direct columnar
-  buffer writes, so tagging costs no method calls on the hot path.
-- **Destructured-context (`__ctx`) rewrite** — hoists context members at call sites for tighter emitted code.
-- **Metadata injection** and **packed runtime hints** — build metadata and small runtime flags are baked in, and log
-  templates are stored as private `u16` values.
+### Source-line injection
+
+`.line(N)` is appended to every `ctx.log.*`, `ctx.ok(...)`, and `ctx.err(...)` call, where `N` is the 1-based call-site
+line. It's inserted right after the log/result method (before any further chained setters) and skipped if the chain
+already has a `.line(...)`. Recognized log methods: `info` / `debug` / `warn` / `error` / `trace`.
+
+```ts
+// you write
+ctx.log.info('processing user');
+ctx.log.warn('rate limit approaching').userId(id);
+return ctx.ok(user);
+
+// plugin emits
+ctx.log.info('processing user').line(42);
+ctx.log.warn('rate limit approaching').line(43).userId(id);
+return ctx.ok(user).line(44);
+```
+
+### Monomorphic `span()` lowering
+
+`ctx.span('name', op, ...args)` is lowered to a fixed-arity, **Promise-preserving** internal call that carries the
+source line and reads the op's precompiled buffer class, metadata, and function directly — so the hot path does no
+polymorphic dispatch:
+
+```ts
+// you write
+await ctx.span('fetch-user', fetchUserOp, userId);
+
+// plugin emits — a monomorphic call (internal shape; illustrative, don't depend on it):
+await ctx.span1(
+  44,                             // source line
+  'fetch-user',
+  Object.create(ctx),             // the child span context
+  fetchUserOp.SpanBufferClass,    // precompiled buffer class
+  fetchUserOp.remappedViewClass,
+  fetchUserOp.metadata,
+  fetchUserOp.fn,
+  userId,                         // your argument(s)
+  fetchUserOp.runtimeHint,
+);
+```
+
+It lowers only when the receiver is a stable `identifier`/`this`, the op is a checker-proven `Op` (or an inline
+function), and there are at most eight trailing args. Anything it can't prove — a computed receiver/op such as
+`getCtx().span(getOp(), …)`, the `span(name, overrides, op, …)` override form, or more than eight args — is **left on the
+normal `span()` dispatcher**, evaluated once in source order with its usual Promise scheduling.
+
+### Destructured-context rewrite
+
+An op callback that destructures its context (`({ span, log }, …) => …`) is rewritten to take a single `__ctx`
+parameter — the other members are rebound as the first statement, and every bare `span(...)` call is bound to `__ctx`
+and lowered as above:
+
+```ts
+// you write
+const fetch = defineOp('fetch', async ({ span, log }, userId: string) => {
+  log.info('fetching');
+  return span('load', loadUserOp, userId);
+});
+
+// plugin emits
+const fetch = defineOp('fetch', async (__ctx, userId: string) => {
+  const { log } = __ctx;
+  log.info('fetching').line(2);
+  return __ctx.span1(3, 'load', Object.create(__ctx), loadUserOp.SpanBufferClass, loadUserOp.remappedViewClass, loadUserOp.metadata, loadUserOp.fn, userId, loadUserOp.runtimeHint);
+});
+```
+
+It's all-or-nothing: if `span` is shadowed, used as a value, passed on, or any bare `span` call can't be lowered safely,
+the whole function is left unchanged.
+
+### Tag inlining
+
+A `ctx.tag` chain used as a **statement** — including the `ctx.tag.with({...})` bulk setter — is unrolled into direct
+columnar buffer writes, eliminating the `{...}` object allocation, the runtime `Object.keys()` iteration, and the
+fluent-builder calls. (A tag chain assigned to a variable is left alone.)
+
+```ts
+// you write
+ctx.tag.operation('SELECT').userId('user-123');
+ctx.tag.with({ status: 200, cached: true });
+
+// plugin emits
+{
+  ctx._buffer.operation_values[0] = 'SELECT';
+  ctx._buffer.operation_nulls[0] |= 1;
+  ctx._buffer.userId_values[0] = 'user-123';
+  ctx._buffer.userId_nulls[0] |= 1;
+  ctx._buffer.status_values[0] = 200;
+  ctx._buffer.status_nulls[0] |= 1;
+  ctx._buffer.cached_values[0] |= 1; // bit-packed boolean
+  ctx._buffer.cached_nulls[0] |= 1;
+}
+```
+
+With schema type info the plugin specializes each write: boolean fields become bit-packed `|= 1` / `&= ~1`, enum fields
+map to their sorted-order index, and a non-literal value is wrapped in a `const $$v = expr; if ($$v != null) { … }`
+guard.
+
+### Op capability & capacity hints
+
+Each `defineOp(...)` / `defineOps(...)` call gets a small compile-time metadata argument carrying a **packed capability
+hint**, an **initial-capacity** estimate, and the op's **log-template IDs**. At runtime the op then allocates only the
+context surface it actually uses — `tag`, `log`, `ff`, nested spans, result, `scope`, `deps` — instead of the full set,
+and sizes its buffer up front (two reserved rows plus one per statically counted `ctx.log.*`). The analysis is
+closed-world: anything it can't prove (the context escapes, a loop makes capacity unknown, a destructured parameter,
+computed access) falls back to `0` — the full, adaptive surface — so it is never wrong, only sometimes unspecialized.
+
+:::note[Legacy `defineModule`]
+The plugin also injects build metadata (`git_sha`, `package_name`, `package_file`) into the older `defineModule({…})`
+API. The shipped context API is [`defineOpContext` / `defineOp`](/reference/define-op-context/), which this particular
+rewrite does not touch.
+:::
 
 ## Caveats
 
@@ -70,5 +176,3 @@ At compile time, for code written against the shipped `ctx` surface:
   would change the public Promise API's observable microtask scheduling.
 - The "global vocabulary ABI" described in the design is a future clean-cutover target, **not** shipped behavior; shipped
   Op-local log-template IDs remain lexical `u16` values.
-
-See the design spec `specs/lmao/01o_typescript_transformer.md` for the full transformation list and rationale.
