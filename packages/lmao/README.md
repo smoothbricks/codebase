@@ -13,7 +13,7 @@ headline feature is **trace-testing**: assert on the span tree your code emits i
 - **Arrow-native.** Convert a trace to an Arrow table and persist it to SQLite/D1, or analyze it with the companion
   inspector.
 
-> Part of the `smoothbricks` monorepo. Full documentation lives in [`lmao-docs/`](../../lmao-docs) (an Astro Starlight
+> Part of the `smoothbricks` monorepo. Full documentation lives in [`targets/lmao-docs/`](../../targets/lmao-docs) (an Astro Starlight
 > site). Runnable examples are in [`examples/`](./examples).
 
 ## Install

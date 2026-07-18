@@ -33,18 +33,6 @@
         "verdaccio": "6.8.0",
       },
     },
-    "lmao-docs": {
-      "name": "@smoothbricks/lmao-docs",
-      "version": "0.0.0",
-      "dependencies": {
-        "@astrojs/starlight": "^0.39.0",
-        "astro": "^6.2.1",
-        "remark-gfm": "^4.0.1",
-        "sharp": "^0.34.5",
-        "starlight-links-validator": "^0.24.0",
-        "starlight-llms-txt": "^0.10.0",
-      },
-    },
     "packages/arrow-builder": {
       "name": "@smoothbricks/arrow-builder",
       "version": "0.1.6-next.0",
@@ -285,6 +273,18 @@
         "@ttsc/unplugin": "0.19.3",
         "ttsc": "0.19.3",
         "typescript": "^6.0.3",
+      },
+    },
+    "targets/lmao-docs": {
+      "name": "@smoothbricks/lmao-docs",
+      "version": "0.0.0",
+      "dependencies": {
+        "@astrojs/starlight": "^0.39.0",
+        "astro": "^6.2.1",
+        "remark-gfm": "^4.0.1",
+        "sharp": "^0.34.5",
+        "starlight-links-validator": "^0.24.0",
+        "starlight-llms-txt": "^0.10.0",
       },
     },
     "tooling": {
@@ -1357,7 +1357,7 @@
 
     "@smoothbricks/lmao": ["@smoothbricks/lmao@workspace:packages/lmao"],
 
-    "@smoothbricks/lmao-docs": ["@smoothbricks/lmao-docs@workspace:lmao-docs"],
+    "@smoothbricks/lmao-docs": ["@smoothbricks/lmao-docs@workspace:targets/lmao-docs"],
 
     "@smoothbricks/lmao-expo-benchmark": ["@smoothbricks/lmao-expo-benchmark@workspace:packages/lmao-expo-benchmark"],
 
