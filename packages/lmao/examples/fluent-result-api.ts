@@ -57,9 +57,7 @@ const validateEmail = defineOp('validateEmail', async (ctx, email: string) => {
   ctx.tag.email(email).operation('READ');
 
   if (!email.includes('@')) {
-    return ctx
-      .err(INVALID_EMAIL({ email, reason: 'missing @ symbol' }))
-      .message('Email validation failed');
+    return ctx.err(INVALID_EMAIL({ email, reason: 'missing @ symbol' })).message('Email validation failed');
   }
   return ctx.ok({ valid: true }).message('Email is valid');
 });
