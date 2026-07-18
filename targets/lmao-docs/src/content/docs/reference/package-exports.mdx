@@ -26,10 +26,14 @@ their subpaths.
 | `@smoothbricks/lmao/testing/bun` | Bun harness: `initTraceTestRun`, `createBunTestMock`, `useTestSpan`. |
 | `@smoothbricks/lmao/testing/vitest` | Vitest harness: `initTraceTestRun`, `createVitestMock`, `useTestSpan`. |
 | `@smoothbricks/lmao/bun/preload` | Bun preload hook (registers validation codegen). |
+| `@smoothbricks/lmao/vocabulary/register/v1` | **Advanced.** Side-effect import that registers the built-in AOT vocabularies (dictionary/enum encodings). |
+| `@smoothbricks/lmao/span-buffer/aot/v1` | **Advanced.** Side-effect import that registers AOT-compiled span-buffer classes. |
 
 :::note
 The common, everyday symbols all live at the root. You typically import only one platform subpath (`/node` **or**
-`/es`) plus the root, and add `/sqlite*` or `/testing*` when you use those features.
+`/es`) plus the root, and add `/sqlite*` or `/testing*` when you use those features. The `vocabulary/register/*` and
+`span-buffer/aot/*` subpaths are AOT plumbing paired with the [`@smoothbricks/lmao-ttsc`](/reference/transformer/)
+compiler plugin — you don't import them in everyday code.
 :::
 
 ## Companion packages
@@ -39,4 +43,4 @@ Two capabilities ship as **separate packages** rather than subpaths of `@smoothb
 | Package | Provides |
 |---|---|
 | `@smoothbricks/lmao-inspector` | Client-side Arrow query engine and trace sources. See the [Inspector reference](/reference/inspector/). |
-| `@smoothbricks/lmao-transformer` | Optional build-time TypeScript transformer. See the [Transformer reference](/reference/transformer/). |
+| `@smoothbricks/lmao-ttsc` | Optional AOT compiler plugin (native ttsc/tsgo plugin). Subpaths: `/bun` (a `Bun.build` adapter), `/bun-register` (a `bunfig.toml` preload), `/ttsc-plugin` (the native ttsc descriptor). See the [Transformer reference](/reference/transformer/). |
