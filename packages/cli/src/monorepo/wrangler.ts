@@ -1,13 +1,13 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { join, relative } from 'node:path';
-import { getOrCreateRecord, recordProperty, writeJsonObject } from '../lib/json.js';
+import { join } from 'node:path';
+import { ensureObjectField, type NxTargetConfig, type PackageJson, writeJsonObject } from '../lib/json.js';
 import { getWorkspacePackageManifests } from '../lib/workspace.js';
 
 interface WranglerProject {
   label: string;
   dir: string;
   packageJsonPath: string;
-  json: Record<string, unknown>;
+  json: PackageJson;
   tomlPath: string;
 }
 
@@ -20,13 +20,14 @@ export function firstWranglerEnv(tomlText: string): string | null {
 function wranglerProjects(root: string): WranglerProject[] {
   const projects: WranglerProject[] = [];
   for (const pkg of getWorkspacePackageManifests(root)) {
-    const tomlPath = join(pkg.path, 'wrangler.toml');
+    const dir = join(root, pkg.path);
+    const tomlPath = join(dir, 'wrangler.toml');
     if (!existsSync(tomlPath)) {
       continue;
     }
     projects.push({
-      label: relative(root, pkg.path) || '.',
-      dir: pkg.path,
+      label: pkg.path || '.',
+      dir,
       packageJsonPath: pkg.packageJsonPath,
       json: pkg.json,
       tomlPath,
@@ -56,9 +57,9 @@ export function applyWranglerDefaults(root: string): void {
   }
   for (const project of projects) {
     const env = firstWranglerEnv(readFileSync(project.tomlPath, 'utf8'));
-    const nx = getOrCreateRecord(project.json, 'nx');
-    const targets = getOrCreateRecord(nx, 'targets');
-    const desired: Record<string, unknown> = {
+    const nx = ensureObjectField(project.json, 'nx', () => ({}));
+    const targets = ensureObjectField(nx, 'targets', () => ({}));
+    const desired: NxTargetConfig = {
       executor: 'nx:run-commands',
       cache: true,
       inputs: ['{projectRoot}/wrangler.toml', '{projectRoot}/.dev.vars.example'],
@@ -69,14 +70,14 @@ export function applyWranglerDefaults(root: string): void {
       },
     };
     let changed = false;
-    const existing = recordProperty(targets, 'wrangler-types');
+    const existing = targets['wrangler-types'];
     if (!existing || JSON.stringify(existing) !== JSON.stringify(desired)) {
       targets['wrangler-types'] = desired;
       changed = true;
     }
-    const typecheck = recordProperty(targets, 'typecheck');
+    const typecheck = targets.typecheck;
     if (typecheck) {
-      const dependsOn: unknown[] = Array.isArray(typecheck.dependsOn) ? typecheck.dependsOn : [];
+      const dependsOn = Array.isArray(typecheck.dependsOn) ? [...typecheck.dependsOn] : [];
       if (!dependsOn.includes('wrangler-types')) {
         dependsOn.push('wrangler-types');
         typecheck.dependsOn = dependsOn;
@@ -116,9 +117,8 @@ export function validateWrangler(root: string): number {
       console.log(`⨯ ${project.label}: missing .dev.vars.example`);
       projectProblems++;
     }
-    const nx = recordProperty(project.json, 'nx');
-    const targets = nx ? recordProperty(nx, 'targets') : null;
-    if (!targets || !recordProperty(targets, 'wrangler-types')) {
+    const targets = project.json.nx?.targets;
+    if (!targets?.['wrangler-types']) {
       console.log(`⨯ ${project.label}: missing wrangler-types nx target`);
       projectProblems++;
     }

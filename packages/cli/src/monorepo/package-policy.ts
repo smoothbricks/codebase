@@ -21,15 +21,18 @@ import {
   checkWorkspaceConfigPolicy,
 } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import {
-  getOrCreateRecord,
-  hasOwnString,
-  isRecord,
+  ensureObjectField,
+  ensureStringMap,
+  type PackageExportMap,
+  type PackageExports,
+  type PackageJson,
+  type PackageRepository,
   readJsonObject,
-  recordProperty,
   requiredJsonObject,
-  setMissingStringProperty,
+  type StringMap,
+  setMissingOptionalStringField,
+  setOptionalStringField,
   setStringProperty,
-  stringProperty,
   writeJsonObject,
 } from '../lib/json.js';
 import {
@@ -68,12 +71,12 @@ export function applyRootScriptDefaults(root: string): void {
   if (!rootPackage) {
     return;
   }
-  const scripts = getOrCreateRecord(rootPackage, 'scripts');
+  const scripts = ensureStringMap(rootPackage, 'scripts');
   let changed = false;
   for (const [name, command] of Object.entries(rootScriptPolicy)) {
     changed = setStringProperty(scripts, name, command) || changed;
   }
-  const nx = getOrCreateRecord(rootPackage, 'nx');
+  const nx = ensureObjectField(rootPackage, 'nx', () => ({}));
   if (!Array.isArray(nx.includedScripts) || nx.includedScripts.length !== 0) {
     nx.includedScripts = [];
     changed = true;
@@ -97,7 +100,7 @@ export function applyNxPluginDefaults(root: string): void {
 
 export function applyPublicPackageDefaults(root: string): void {
   const rootPackage = requiredJsonObject(join(root, 'package.json'));
-  const rootLicense = stringProperty(rootPackage, 'license');
+  const rootLicense = rootPackage.license;
   const rootRepository = repositoryInfo(rootPackage);
 
   for (const pkg of listPublicPackages(root)) {
@@ -110,18 +113,22 @@ export function applyPublicPackageDefaults(root: string): void {
       rootLicense &&
       rootLicense !== 'UNLICENSED'
     ) {
-      changed = setMissingStringProperty(pkg.json, 'license', rootLicense) || changed;
+      changed = setMissingOptionalStringField(pkg.json, 'license', rootLicense) || changed;
     }
-    const publishConfig = getOrCreateRecord(pkg.json, 'publishConfig');
-    changed = setStringProperty(publishConfig, 'access', 'public') || changed;
+    const publishConfig = ensureObjectField(pkg.json, 'publishConfig', () => ({}));
+    changed = setOptionalStringField(publishConfig, 'access', 'public') || changed;
 
-    const repository = getOrCreateRecord(pkg.json, 'repository');
-    changed =
-      setStringProperty(repository, 'type', existingRepository?.type ?? rootRepository?.type ?? 'git') || changed;
-    if (existingRepository && !stringProperty(repository, 'url')) {
-      changed = setStringProperty(repository, 'url', existingRepository.url) || changed;
+    if (typeof pkg.json.repository !== 'string') {
+      const repository = ensureObjectField(pkg.json, 'repository', (): PackageRepository => ({}));
+      changed =
+        setOptionalStringField(repository, 'type', existingRepository?.type ?? rootRepository?.type ?? 'git') ||
+        changed;
+      if (existingRepository) {
+        changed = setMissingOptionalStringField(repository, 'url', existingRepository.url) || changed;
+      }
+      changed = setOptionalStringField(repository, 'directory', pkg.path.replaceAll('\\', '/')) || changed;
     }
-    changed = setStringProperty(repository, 'directory', pkg.path.replaceAll('\\', '/')) || changed;
+
     changed = normalizeExportConditionOrder(pkg.json.exports) || changed;
     if (hasDevelopmentSourceExport(pkg.json.exports)) {
       changed = addFileEntry(pkg.json, 'src') || changed;
@@ -172,7 +179,7 @@ export function applyNxReleaseDefaults(root: string): void {
 
 export function applyNxProjectNameDefaults(root: string): void {
   const rootPackage = requiredJsonObject(join(root, 'package.json'));
-  const rootName = stringProperty(rootPackage, 'name');
+  const rootName = rootPackage.name;
   if (!rootName) {
     return;
   }
@@ -181,8 +188,8 @@ export function applyNxProjectNameDefaults(root: string): void {
     if (!suggestedName) {
       continue;
     }
-    const nx = getOrCreateRecord(pkg.json, 'nx');
-    const changed = setStringProperty(nx, 'name', suggestedName);
+    const nx = ensureObjectField(pkg.json, 'nx', () => ({}));
+    const changed = setOptionalStringField(nx, 'name', suggestedName);
     if (changed) {
       writeJsonObject(pkg.packageJsonPath, pkg.json);
       console.log(`updated        ${pkg.path}/package.json nx.name`);
@@ -198,11 +205,10 @@ export function listValidCommitScopes(root: string): ReadonlySet<string> {
 
 export function listNxProjectNames(root: string): string[] {
   const rootPackage = readJsonObject(join(root, 'package.json'));
-  const rootName = rootPackage ? stringProperty(rootPackage, 'name') : null;
+  const rootName = rootPackage?.name ?? null;
   const names: string[] = [];
   for (const pkg of getWorkspacePackageManifests(root)) {
-    const nx = recordProperty(pkg.json, 'nx');
-    const configuredName = nx ? stringProperty(nx, 'name') : null;
+    const configuredName = pkg.json.nx?.name;
     const suggestedName = rootName ? suggestNxProjectName(rootName, pkg.name) : null;
     if (configuredName) {
       names.push(configuredName);
@@ -220,11 +226,11 @@ export function validateRootPackagePolicy(root: string): number {
     return 1;
   }
   let failures = 0;
-  if (!stringProperty(rootPackage, 'name')) {
+  if (!rootPackage.name) {
     console.error('package.json must define name');
     failures++;
   }
-  if (!stringProperty(rootPackage, 'license')) {
+  if (!rootPackage.license) {
     console.error('package.json must define repo-wide license');
     failures++;
   }
@@ -234,19 +240,19 @@ export function validateRootPackagePolicy(root: string): number {
   }
   failures += validateRootScripts(rootPackage);
   failures += validateRootNxScriptInference(rootPackage);
-  const packageManager = stringProperty(rootPackage, 'packageManager');
+  const packageManager = rootPackage.packageManager;
   if (!packageManager?.startsWith('bun@')) {
     console.error('package.json packageManager must use bun@<version>');
     failures++;
   }
   const bunVersion = packageManager?.startsWith('bun@') ? packageManager.slice('bun@'.length) : null;
-  const devDependencies = recordProperty(rootPackage, 'devDependencies');
+  const devDependencies = rootPackage.devDependencies;
   if (!bunVersion || !devDependencies || devDependencies['@types/bun'] !== bunVersion) {
     console.error('package.json devDependencies.@types/bun must match packageManager bun version');
     failures++;
   }
-  const engines = recordProperty(rootPackage, 'engines');
-  if (!engines || !stringProperty(engines, 'node')) {
+  const engines = rootPackage.engines;
+  if (!engines?.node) {
     console.error('package.json engines.node must be defined');
     failures++;
   }
@@ -268,7 +274,7 @@ export function validateNxReleaseConfig(root: string): number {
 
 export function validateNxProjectNames(root: string): number {
   const rootPackage = readJsonObject(join(root, 'package.json'));
-  const rootName = rootPackage ? stringProperty(rootPackage, 'name') : null;
+  const rootName = rootPackage?.name ?? null;
   if (!rootName) {
     return 0;
   }
@@ -278,8 +284,7 @@ export function validateNxProjectNames(root: string): number {
     if (!suggestedName) {
       continue;
     }
-    const nx = recordProperty(pkg.json, 'nx');
-    const configuredName = nx ? stringProperty(nx, 'name') : null;
+    const configuredName = pkg.json.nx?.name ?? null;
     if (configuredName !== suggestedName) {
       console.error(
         `${pkg.path}: package.json nx.name must be "${suggestedName}" so fix(${suggestedName}): maps to this project`,
@@ -318,16 +323,19 @@ export function validatePublicPackageMetadata(root: string): number {
       console.error(`${pkg.path}: npm:public package must not be private`);
       failures++;
     }
-    if (!stringProperty(pkg.json, 'license')) {
+    if (!pkg.json.license) {
       console.error(`${pkg.path}: public package must define license`);
       failures++;
     }
-    const publishConfig = recordProperty(pkg.json, 'publishConfig');
-    if (!publishConfig || stringProperty(publishConfig, 'access') !== 'public') {
+    const publishConfig = pkg.json.publishConfig;
+    if (!publishConfig || publishConfig.access !== 'public') {
       console.error(`${pkg.path}: public package must define publishConfig.access = public`);
       failures++;
     }
-    const repository = recordProperty(pkg.json, 'repository');
+    const repository =
+      pkg.json.repository !== null && pkg.json.repository !== undefined && typeof pkg.json.repository !== 'string'
+        ? pkg.json.repository
+        : null;
     const packageRepository = packageRepositoryInfo(pkg);
     if (!packageRepository) {
       console.error(`${pkg.path}: public package must define repository.url`);
@@ -345,11 +353,11 @@ export function validatePublicPackageMetadata(root: string): number {
       );
       failures++;
     }
-    if (!repository || !stringProperty(repository, 'type')) {
+    if (!repository?.type) {
       console.error(`${pkg.path}: public package must define repository.type`);
       failures++;
     }
-    if (!repository || stringProperty(repository, 'directory') !== pkg.path.replaceAll('\\', '/')) {
+    if (!repository || repository.directory !== pkg.path.replaceAll('\\', '/')) {
       console.error(`${pkg.path}: public package repository.directory must be ${pkg.path.replaceAll('\\', '/')}`);
       failures++;
     }
@@ -357,11 +365,14 @@ export function validatePublicPackageMetadata(root: string): number {
       console.error(`${pkg.path}: public package must define files`);
       failures++;
     }
-    if (!isRecord(pkg.json.exports) && !isRecord(pkg.json.bin)) {
+    const hasBin =
+      typeof pkg.json.bin === 'string' ||
+      (pkg.json.bin !== null && pkg.json.bin !== undefined && typeof pkg.json.bin === 'object');
+    if (!isPackageExportMap(pkg.json.exports) && !hasBin) {
       console.error(`${pkg.path}: public package must define exports or bin`);
       failures++;
     }
-    if (!hasOwnString(pkg.json, 'types') && !isRecord(pkg.json.bin)) {
+    if (typeof pkg.json.types !== 'string' && !hasBin) {
       console.error(`${pkg.path}: public library package must define types`);
       failures++;
     }
@@ -375,7 +386,7 @@ export function validateWorkspaceDependencies(root: string, options: PackageTarg
   const workspaceNames = new Set(getWorkspacePackages(root).map((pkg) => pkg.name));
   for (const pkg of listPackageJsonRecords(root)) {
     for (const field of workspaceDependencyFields) {
-      const dependencies = recordProperty(pkg.json, field);
+      const dependencies = pkg.json[field];
       if (!dependencies) {
         continue;
       }
@@ -436,10 +447,10 @@ function validateCiSkipTags(root: string, options: PackageTargetPolicyOptions): 
 // Helpers kept in CLI (not Nx-specific)
 // ---------------------------------------------------------------------------
 
-function fixWorkspaceDependencyRanges(pkg: Record<string, unknown>, workspaceNames: Set<string>): boolean {
+function fixWorkspaceDependencyRanges(pkg: PackageJson, workspaceNames: Set<string>): boolean {
   let changed = false;
   for (const field of workspaceDependencyFields) {
-    const dependencies = recordProperty(pkg, field);
+    const dependencies = pkg[field];
     if (!dependencies) {
       continue;
     }
@@ -453,8 +464,8 @@ function fixWorkspaceDependencyRanges(pkg: Record<string, unknown>, workspaceNam
   return changed;
 }
 
-function validateRootScripts(rootPackage: Record<string, unknown>): number {
-  const scripts = recordProperty(rootPackage, 'scripts');
+function validateRootScripts(rootPackage: PackageJson): number {
+  const scripts = rootPackage.scripts;
   let failures = 0;
   for (const [name, command] of Object.entries(rootScriptPolicy)) {
     if (scripts?.[name] !== command) {
@@ -471,9 +482,9 @@ function validateRootScripts(rootPackage: Record<string, unknown>): number {
   return failures;
 }
 
-function validateRootNxScriptInference(rootPackage: Record<string, unknown>): number {
-  const nx = recordProperty(rootPackage, 'nx');
-  if (nx && Array.isArray(nx.includedScripts) && nx.includedScripts.length === 0) {
+function validateRootNxScriptInference(rootPackage: PackageJson): number {
+  const includedScripts = rootPackage.nx?.includedScripts;
+  if (Array.isArray(includedScripts) && includedScripts.length === 0) {
     return 0;
   }
   console.error('package.json nx.includedScripts must be [] so root scripts do not become recursive Nx targets.');
@@ -497,12 +508,12 @@ function unscopedPackageName(packageName: string): string {
   return packageName.startsWith('@') ? packageName.slice(packageName.indexOf('/') + 1) : packageName;
 }
 
-function recordKeysAreSorted(record: Record<string, unknown>): boolean {
+function recordKeysAreSorted(record: StringMap): boolean {
   const keys = Object.keys(record);
-  return keys.every((key, index) => index === 0 || keys[index - 1] <= key);
+  return keys.every((key, index) => index === 0 || keys[index - 1]! <= key);
 }
 
-function sortRecordInPlace(record: Record<string, unknown>): boolean {
+function sortRecordInPlace(record: StringMap): boolean {
   if (recordKeysAreSorted(record)) {
     return false;
   }
@@ -516,8 +527,11 @@ function sortRecordInPlace(record: Record<string, unknown>): boolean {
   return true;
 }
 
-function normalizeExportConditionOrder(value: unknown): boolean {
-  if (!isRecord(value)) {
+function isPackageExportMap(value: PackageExports): value is PackageExportMap {
+  return value !== null && value !== undefined && typeof value === 'object';
+}
+function normalizeExportConditionOrder(value: PackageExports): boolean {
+  if (!isPackageExportMap(value)) {
     return false;
   }
   let changed = false;
@@ -546,8 +560,8 @@ function normalizeExportConditionOrder(value: unknown): boolean {
   return true;
 }
 
-function hasDevelopmentSourceExport(value: unknown): boolean {
-  if (!isRecord(value)) {
+function hasDevelopmentSourceExport(value: PackageExports): boolean {
+  if (!isPackageExportMap(value)) {
     return false;
   }
   for (const [key, child] of Object.entries(value)) {
@@ -561,12 +575,12 @@ function hasDevelopmentSourceExport(value: unknown): boolean {
   return false;
 }
 
-function addFileEntry(pkg: Record<string, unknown>, entry: string): boolean {
+function addFileEntry(pkg: PackageJson, entry: string): boolean {
   const files = pkg.files;
   if (!Array.isArray(files) || files.includes(entry)) {
     return false;
   }
-  const firstNegated = files.findIndex((file) => typeof file === 'string' && file.startsWith('!'));
+  const firstNegated = files.findIndex((file) => file.startsWith('!'));
   if (firstNegated === -1) {
     files.push(entry);
   } else {
