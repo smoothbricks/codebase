@@ -81,7 +81,7 @@ function buildProgram(): Command {
     });
   monorepo
     .command('sync-bun-lockfile-versions')
-    .option('--stage', 'stage bun.lock when versions were resynced (pre-commit self-heal); quiet when clean')
+    .option('--stage', 'stage bun.lock when versions were resynced; quiet when clean')
     .action(async (options: { stage?: boolean }) => {
       const { syncBunLockfileVersions } = await import('./monorepo/index.js');
       syncBunLockfileVersions(await findRepoRoot(), options.stage ? { log: false, stage: true } : {});
