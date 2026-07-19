@@ -8,6 +8,8 @@ export enum CiWorkflowStepKind {
   Build = 'build',
   Lint = 'lint',
   UnitTests = 'unit-tests',
+  ManagedFilesCheck = 'managed-files-check',
+  ManagedFilesDispatch = 'managed-files-dispatch',
   Deploy = 'deploy',
   SaveNxCache = 'save-nx-cache',
   UploadTraceDbs = 'upload-trace-dbs',
@@ -37,6 +39,8 @@ export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkfl
     { kind: CiWorkflowStepKind.Build, name: '🔨 Build' },
     { kind: CiWorkflowStepKind.Lint, name: '🔍 Lint' },
     { kind: CiWorkflowStepKind.UnitTests, name: '🧪 Unit Tests' },
+    { kind: CiWorkflowStepKind.ManagedFilesCheck, name: '🩺 Check managed-file drift' },
+    { kind: CiWorkflowStepKind.ManagedFilesDispatch, name: '🔁 Dispatch managed-file drift healing' },
   ];
   if (options.deploy) {
     steps.push({ kind: CiWorkflowStepKind.Deploy, name: '🚀 Deploy Staging' });
@@ -64,7 +68,8 @@ ${renderYamlList(options.pushBranches, 6)}
   pull_request:
 
 permissions:
-  actions: read
+  # actions:write lets the drift step dispatch the managed-files workflow.
+  actions: write
   contents: read
   statuses: write
 
@@ -161,6 +166,27 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
       return nxSmartStep(step, 'lint', 'Lint');
     case CiWorkflowStepKind.UnitTests:
       return nxSmartStep(step, 'test', 'Unit Tests');
+    case CiWorkflowStepKind.ManagedFilesCheck:
+      // The authoritative drift check is nearly free here (devenv is already
+      // up). --warn never fails the job and publishes the step output
+      // `drifted=<count>` for the dispatch step below.
+      return [
+        `      - name: ${step.name}`,
+        '        id: managed-drift',
+        '        if:',
+        "          ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}',",
+        '          github.event.repository.default_branch) }}',
+        '        run: smoo monorepo check --warn',
+      ];
+    case CiWorkflowStepKind.ManagedFilesDispatch:
+      // Dispatches the managed-files workflow, which maintains the persistent
+      // review PR. workflow_dispatch is exempt from GitHub's GITHUB_TOKEN
+      // recursion guard, so the default token suffices.
+      return [
+        `      - name: ${step.name}`,
+        "        if: ${{ steps.managed-drift.outputs.drifted != '' && steps.managed-drift.outputs.drifted != '0' }}",
+        '        run: gh workflow run managed-files.yml --ref "$GITHUB_REF_NAME"',
+      ];
     case CiWorkflowStepKind.Deploy:
       return [
         `      - name: ${step.name}`,
