@@ -1,7 +1,16 @@
 import { readdirSync, statSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { isSmoothBricksCodebasePackageName } from './cli-package.js';
-import { hasOwn, hasOwnString, isRecord, readJson, readJsonObject, stringProperty } from './json.js';
+import {
+  isPackageJson,
+  type PackageJson,
+  type PackageNxConfig,
+  type PackageRepository,
+  readJson,
+  readJsonObject,
+} from './json.js';
+
+export type { PackageJson, PackageNxConfig, PackageRepository };
 
 export interface PackageInfo {
   name: string;
@@ -11,7 +20,7 @@ export interface PackageInfo {
   tags: string[];
   path: string;
   packageJsonPath: string;
-  json: Record<string, unknown>;
+  json: PackageJson;
 }
 
 export interface WorkspacePackageManifest {
@@ -20,18 +29,7 @@ export interface WorkspacePackageManifest {
   private: boolean;
   path: string;
   packageJsonPath: string;
-  json: Record<string, unknown>;
-}
-
-export interface PackageJson extends Record<string, unknown> {
-  name?: string;
-  version?: string;
-  private?: boolean;
-  workspaces?: unknown;
-  devDependencies?: unknown;
-  dependencies?: unknown;
-  nx?: unknown;
-  repository?: unknown;
+  json: PackageJson;
 }
 
 export interface RepositoryInfo {
@@ -46,6 +44,8 @@ export const workspaceDependencyFields = [
   'optionalDependencies',
 ] as const;
 
+export type WorkspaceDependencyField = (typeof workspaceDependencyFields)[number];
+
 export function listPublicPackages(root: string): PackageInfo[] {
   return getWorkspacePackages(root).filter((pkg) => !pkg.private && pkg.tags.includes('npm:public'));
 }
@@ -54,26 +54,21 @@ export function listReleasePackages(
   root: string,
   rootPackage = readPackageJson(join(root, 'package.json')),
 ): PackageInfo[] {
-  if (!rootPackage) {
-    return [];
-  }
-  const rootRepository = repositoryInfo(rootPackage.json);
+  const rootRepository = rootPackage ? repositoryInfo(rootPackage.json) : null;
   if (!rootRepository) {
     return [];
   }
-  return getWorkspacePackagesForPatterns(root, getWorkspacePatternsFromPackageJson(rootPackage.json)).filter(
-    (pkg) => !pkg.private && pkg.tags.includes('npm:public') && isOwnedPackage(rootRepository, pkg),
-  );
+  return listPublicPackages(root).filter((pkg) => isOwnedPackage(rootRepository, pkg));
 }
 
 export function rootRepositoryInfo(root: string): RepositoryInfo | null {
-  const rootPackage = readJsonObject(join(root, 'package.json'));
-  return rootPackage ? repositoryInfo(rootPackage) : null;
+  const rootPackage = readPackageJson(join(root, 'package.json'));
+  return rootPackage ? repositoryInfo(rootPackage.json) : null;
 }
 
 export function rootPackageName(root: string): string | null {
   const rootPackage = readPackageJsonObject(join(root, 'package.json'));
-  return rootPackage ? stringProperty(rootPackage, 'name') : null;
+  return rootPackage?.name ?? null;
 }
 
 export function isSmoothBricksCodebase(root: string): boolean {
@@ -90,37 +85,23 @@ export function isOwnedPackage(rootRepository: RepositoryInfo, pkg: PackageInfo)
 }
 
 export function getWorkspacePackages(root: string): PackageInfo[] {
-  const rootPackage = readPackageJson(join(root, 'package.json'));
-  if (!rootPackage) {
-    throw new Error('package.json not found or invalid');
-  }
-  return getWorkspacePackagesForPatterns(root, getWorkspacePatternsFromPackageJson(rootPackage.json));
+  return getWorkspacePackagesForPatterns(root, getWorkspacePatterns(root));
 }
 
 export function getWorkspacePackageManifests(root: string): WorkspacePackageManifest[] {
-  const rootPackage = readPackageJsonObject(join(root, 'package.json'));
-  if (!rootPackage) {
-    throw new Error('package.json not found or invalid');
-  }
-  return getWorkspacePackageManifestsForPatterns(root, getWorkspacePatternsFromPackageJson(rootPackage));
+  return getWorkspacePackageManifestsForPatterns(root, getWorkspacePatterns(root));
 }
 
 function getWorkspacePackagesForPatterns(root: string, workspacePatterns: string[]): PackageInfo[] {
   const packages: PackageInfo[] = [];
-  for (const pkgPath of listWorkspacePackageJsonPaths(root, workspacePatterns)) {
-    const pkg = readPackageJson(pkgPath);
-    if (!pkg?.name || !pkg.version) {
+  for (const path of listWorkspacePackageJsonPaths(root, workspacePatterns)) {
+    const pkg = readPackageJson(path);
+    if (!pkg) {
       continue;
     }
     packages.push({
-      name: pkg.name,
-      projectName: pkg.projectName,
-      version: pkg.version,
-      private: pkg.private,
-      tags: pkg.tags,
-      path: relative(root, dirname(pkgPath)),
-      packageJsonPath: pkg.packageJsonPath,
-      json: pkg.json,
+      ...pkg,
+      path: relative(root, dirname(path)),
     });
   }
   return packages.sort((a, b) => a.name.localeCompare(b.name));
@@ -130,30 +111,42 @@ function getWorkspacePackageManifestsForPatterns(
   root: string,
   workspacePatterns: string[],
 ): WorkspacePackageManifest[] {
-  const manifests: WorkspacePackageManifest[] = [];
-  for (const pkgPath of listWorkspacePackageJsonPaths(root, workspacePatterns)) {
-    const pkg = readWorkspacePackageManifest(pkgPath);
-    if (pkg) {
-      manifests.push(pkg);
+  const packages: WorkspacePackageManifest[] = [];
+  for (const path of listWorkspacePackageJsonPaths(root, workspacePatterns)) {
+    const pkg = readWorkspacePackageManifest(path);
+    if (!pkg) {
+      continue;
     }
+    packages.push({
+      ...pkg,
+      path: relative(root, dirname(path)),
+    });
   }
-  return manifests.sort((a, b) => a.name.localeCompare(b.name));
+  return packages.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function listWorkspacePackageJsonPaths(root: string, workspacePatterns: string[]): string[] {
   const paths: string[] = [];
   for (const pattern of workspacePatterns) {
     if (!pattern.endsWith('/*')) {
-      paths.push(join(root, pattern, 'package.json'));
       continue;
     }
-
     const parent = join(root, pattern.slice(0, -2));
-    if (!statSync(parent, { throwIfNoEntry: false })?.isDirectory()) {
+    let entries: string[];
+    try {
+      entries = readdirSync(parent);
+    } catch {
       continue;
     }
-    for (const entry of readdirSync(parent)) {
-      paths.push(join(parent, entry, 'package.json'));
+    for (const entry of entries) {
+      const packageJsonPath = join(parent, entry, 'package.json');
+      try {
+        if (statSync(packageJsonPath).isFile()) {
+          paths.push(packageJsonPath);
+        }
+      } catch {
+        // skip missing package.json
+      }
     }
   }
   return paths;
@@ -162,7 +155,7 @@ function listWorkspacePackageJsonPaths(root: string, workspacePatterns: string[]
 export function listPackageJsonRecords(root: string): PackageInfo[] {
   const rootPackage = readPackageJson(join(root, 'package.json'));
   if (!rootPackage) {
-    throw new Error('package.json not found or invalid');
+    return getWorkspacePackages(root);
   }
   return [
     { ...rootPackage, path: '.' },
@@ -172,18 +165,16 @@ export function listPackageJsonRecords(root: string): PackageInfo[] {
 
 export function getWorkspacePatterns(root: string): string[] {
   const raw = readJson(join(root, 'package.json'));
-  return isRecord(raw) ? getWorkspacePatternsFromPackageJson(raw) : ['packages/*'];
+  const pkg = isPackageJson(raw) ? raw : null;
+  return pkg ? getWorkspacePatternsFromPackageJson(pkg) : ['packages/*'];
 }
 
-function getWorkspacePatternsFromPackageJson(pkg: Record<string, unknown>): string[] {
-  if (!hasOwn(pkg, 'workspaces')) {
-    return ['packages/*'];
-  }
+function getWorkspacePatternsFromPackageJson(pkg: PackageJson): string[] {
   const workspaces = pkg.workspaces;
   if (Array.isArray(workspaces)) {
     return workspaces.filter((entry): entry is string => typeof entry === 'string');
   }
-  if (isRecord(workspaces) && hasOwn(workspaces, 'packages') && Array.isArray(workspaces.packages)) {
+  if (workspaces && typeof workspaces === 'object' && Array.isArray(workspaces.packages)) {
     return workspaces.packages.filter((entry): entry is string => typeof entry === 'string');
   }
   return ['packages/*'];
@@ -191,17 +182,15 @@ function getWorkspacePatternsFromPackageJson(pkg: Record<string, unknown>): stri
 
 export function readPackageJson(path: string): PackageInfo | null {
   const parsed = readPackageJsonObject(path);
-  if (!isRecord(parsed) || !hasOwnString(parsed, 'name') || !hasOwnString(parsed, 'version')) {
+  if (!parsed?.name || !parsed.version) {
     return null;
   }
-  const privateValue = hasOwn(parsed, 'private') && typeof parsed.private === 'boolean' ? parsed.private : false;
-  const tags = getNxTags(parsed);
   return {
     name: parsed.name,
     projectName: packageNxProjectName(parsed),
     version: parsed.version,
-    private: privateValue,
-    tags,
+    private: parsed.private === true,
+    tags: getNxTags(parsed),
     path: dirname(path),
     packageJsonPath: path,
     json: parsed,
@@ -210,50 +199,48 @@ export function readPackageJson(path: string): PackageInfo | null {
 
 export function readWorkspacePackageManifest(path: string): WorkspacePackageManifest | null {
   const parsed = readPackageJsonObject(path);
-  if (!isRecord(parsed) || !hasOwnString(parsed, 'name')) {
+  if (!parsed?.name) {
     return null;
   }
-  const privateValue = hasOwn(parsed, 'private') && typeof parsed.private === 'boolean' ? parsed.private : false;
   return {
     name: parsed.name,
     projectName: packageNxProjectName(parsed),
-    private: privateValue,
+    private: parsed.private === true,
     path: dirname(path),
     packageJsonPath: path,
     json: parsed,
   };
 }
 
-function packageNxProjectName(pkg: Record<string, unknown>): string {
-  const nx = isRecord(pkg.nx) ? pkg.nx : null;
-  return (nx ? stringProperty(nx, 'name') : null) ?? stringProperty(pkg, 'name') ?? '';
+function packageNxProjectName(pkg: PackageJson): string {
+  return pkg.nx?.name ?? pkg.name ?? '';
 }
 
 export function readPackageJsonObject(path: string): PackageJson | null {
-  const parsed = readJsonObject(path);
-  return parsed;
+  return readJsonObject(path);
 }
 
-export function getNxTags(pkg: Record<string, unknown>): string[] {
-  if (!hasOwn(pkg, 'nx') || !isRecord(pkg.nx) || !hasOwn(pkg.nx, 'tags') || !Array.isArray(pkg.nx.tags)) {
+export function getNxTags(pkg: PackageJson): string[] {
+  const tags = pkg.nx?.tags;
+  if (!Array.isArray(tags)) {
     return [];
   }
-  return pkg.nx.tags.filter((tag): tag is string => typeof tag === 'string');
+  return tags.filter((tag): tag is string => typeof tag === 'string');
 }
 
-export function repositoryInfo(pkg: Record<string, unknown>): RepositoryInfo | null {
+export function repositoryInfo(pkg: PackageJson): RepositoryInfo | null {
   const repository = pkg.repository;
   if (typeof repository === 'string') {
     return { type: 'git', url: repository };
   }
-  if (!isRecord(repository)) {
+  if (!repository || typeof repository !== 'object') {
     return null;
   }
-  const url = stringProperty(repository, 'url');
+  const url = repository.url;
   if (!url) {
     return null;
   }
-  return { type: stringProperty(repository, 'type') ?? 'git', url };
+  return { type: repository.type ?? 'git', url };
 }
 
 export function sameRepositoryAfterNormalization(left: string, right: string): boolean {
@@ -261,25 +248,26 @@ export function sameRepositoryAfterNormalization(left: string, right: string): b
 }
 
 function normalizedRepositoryUrl(url: string): string {
-  const trimmed = url
-    .trim()
-    .replace(/^git\+/, '')
-    .replace(/#.*$/, '')
-    .replace(/\/$/, '')
-    .replace(/\.git$/, '');
-  const https = /^https:\/\/github\.com\/([^/]+)\/([^/]+)$/i.exec(trimmed);
-  if (https?.[1] && https[2]) {
-    return githubRepositoryKey(https[1], https[2]);
+  const trimmed = url.trim().replace(/\.git$/i, '');
+  const ssh = /^git@github\.com:(.+)$/i.exec(trimmed);
+  if (ssh?.[1]) {
+    const [owner, repo] = ssh[1].split('/');
+    if (owner && repo) {
+      return githubRepositoryKey(owner, repo);
+    }
   }
-  const ssh = /^git@github\.com:([^/]+)\/([^/]+)$/i.exec(trimmed);
-  if (ssh?.[1] && ssh[2]) {
-    return githubRepositoryKey(ssh[1], ssh[2]);
+  try {
+    const parsed = new URL(trimmed.includes('://') ? trimmed : `https://${trimmed}`);
+    if (parsed.hostname.replace(/^www\./i, '').toLowerCase() === 'github.com') {
+      const [owner, repo] = parsed.pathname.replace(/^\//, '').split('/');
+      if (owner && repo) {
+        return githubRepositoryKey(owner, repo);
+      }
+    }
+  } catch {
+    // fall through
   }
-  const shorthand = /^github:([^/]+)\/([^/]+)$/i.exec(trimmed);
-  if (shorthand?.[1] && shorthand[2]) {
-    return githubRepositoryKey(shorthand[1], shorthand[2]);
-  }
-  return trimmed;
+  return trimmed.toLowerCase();
 }
 
 function githubRepositoryKey(owner: string, repo: string): string {
