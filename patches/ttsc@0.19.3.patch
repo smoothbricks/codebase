@@ -1,8 +1,6 @@
-diff --git a/driver/emit_plugin.go b/driver/emit_plugin.go
-index 9cde09d3fd853604c0c1d1a500eddca06082e65e..9c10e1a6ab5dbd1673953f579d3861d079a0c501 100644
 --- a/driver/emit_plugin.go
 +++ b/driver/emit_plugin.go
-@@ -163,6 +163,32 @@ func (p *Program) EmitWithPluginTransformers(transforms []PluginTransform, write
+@@ -163,6 +163,32 @@
    }
    host := &pluginEmitHost{program: p.TSProgram, emitResolver: p.Checker.GetEmitResolver()}
    options := p.TSProgram.Options()
@@ -35,7 +33,7 @@ index 9cde09d3fd853604c0c1d1a500eddca06082e65e..9c10e1a6ab5dbd1673953f579d3861d0
    for _, sf := range shimcompiler.GetSourceFilesToEmit(host, nil, false) {
      paths := shimcompiler.GetOutputPathsFor(sf, options, host, false)
      if paths.JsFilePath() != "" && !p.outputEscapesOutDir(paths.JsFilePath()) {
-@@ -212,31 +238,6 @@ func (p *Program) EmitWithPluginTransformers(transforms []PluginTransform, write
+@@ -212,31 +238,6 @@
        }
      }
    }

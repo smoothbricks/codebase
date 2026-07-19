@@ -33,9 +33,10 @@
     "nx": "23.1.0",
     "prettier": "^3.6.1",
     "tslib": "^2.8.1",
-    "ttsc": "^0.19.1",
+    "ttsc": "0.19.3",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.59.1",
+    "typia": "13.1.19",
     "verdaccio": "6.8.0"
   },
   "scripts": {
@@ -80,6 +81,9 @@
     "name": "@smoothbricks/codebase"
   },
   "patchedDependencies": {
-    "ttsc@0.19.1": "patches/ttsc@0.19.1.patch"
+    "ttsc@0.19.3": "patches/ttsc@0.19.3.patch"
+  },
+  "overrides": {
+    "typia": "13.1.19"
   }
 }
