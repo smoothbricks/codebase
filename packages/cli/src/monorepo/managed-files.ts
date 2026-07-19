@@ -3,6 +3,7 @@ import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFi
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
+import { type PackageJson, parseNxProjectJsonText, parseStringArrayText } from '../lib/json.js';
 import { listReleasePackages, readPackageJson } from '../lib/workspace.js';
 import { renderCiWorkflowYaml } from './ci-workflow.js';
 import { renderPublishWorkflowYaml } from './publish-workflow.js';
@@ -353,8 +354,8 @@ function readResolvedNxTargetNames(root: string): string[] {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'inherit'],
   });
-  const projects: unknown = JSON.parse(output);
-  if (!Array.isArray(projects) || !projects.every((project) => typeof project === 'string')) {
+  const projects = parseStringArrayText(output);
+  if (!projects) {
     return [];
   }
   const targetNames = new Set<string>();
@@ -364,8 +365,8 @@ function readResolvedNxTargetNames(root: string): string[] {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'inherit'],
     });
-    const projectJson: unknown = JSON.parse(projectOutput);
-    const targets = recordValue(recordValue(projectJson)?.targets);
+    const projectJson = parseNxProjectJsonText(projectOutput);
+    const targets = projectJson?.targets;
     if (targets) {
       for (const targetName of Object.keys(targets)) {
         targetNames.add(targetName);
@@ -388,8 +389,8 @@ function getDeployTargetInfo(root: string, configuration: string): DeployTargetI
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'inherit'],
   });
-  const projects: unknown = JSON.parse(output);
-  if (!Array.isArray(projects) || !projects.every((project) => typeof project === 'string')) {
+  const projects = parseStringArrayText(output);
+  if (!projects) {
     return { exists: false };
   }
   let exists = false;
@@ -411,47 +412,24 @@ function nxDeployTarget(root: string, project: string, configuration: string): D
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'inherit'],
   });
-  const parsed: unknown = JSON.parse(output);
-  const projectJson = recordValue(parsed);
-  const targets = recordValue(projectJson?.targets);
-  const deploy = recordValue(targets?.deploy);
-  const configurations = recordValue(deploy?.configurations);
-  const config = recordValue(configurations?.[configuration]);
+  const projectJson = parseNxProjectJsonText(output);
+  const deploy = projectJson?.targets?.deploy;
+  const config = deploy?.configurations?.[configuration];
   if (!config) {
     return { exists: false };
   }
-  const command = deployCommand(deploy, config);
+  const command = config.command ?? config.options?.command ?? deploy?.options?.command ?? '';
   return { exists: true, provider: command.includes('wrangler ') ? 'cloudflare' : undefined };
 }
 
-function deployCommand(deploy: Record<string, unknown> | undefined, config: Record<string, unknown>): string {
-  const command = stringValue(config.command) ?? stringValue(recordValue(config.options)?.command);
-  return command ?? stringValue(recordValue(deploy?.options)?.command) ?? '';
-}
-
-function stringValue(value: unknown): string | undefined {
-  return typeof value === 'string' ? value : undefined;
-}
-
-function getCiPushBranches(packageJson: unknown): string[] {
+function getCiPushBranches(packageJson: PackageJson | null | undefined): string[] {
   const configured = readCiPushBranches(packageJson);
   return configured.length > 0 ? configured : ['main'];
 }
 
-function readCiPushBranches(packageJson: unknown): string[] {
-  const rootPackage = recordValue(packageJson);
-  const smoo = recordValue(rootPackage?.smoo);
-  const github = recordValue(smoo?.github);
-  const branches = Array.isArray(github?.pushBranches) ? github.pushBranches : [];
-  return branches.filter((branch): branch is string => typeof branch === 'string' && branch.length > 0);
-}
-
-function recordValue(value: unknown): Record<string, unknown> | undefined {
-  return isRecord(value) ? value : undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
+function readCiPushBranches(packageJson: PackageJson | null | undefined): string[] {
+  const branches = packageJson?.smoo?.github?.pushBranches ?? [];
+  return branches.filter((branch) => branch.length > 0);
 }
 
 function renderYamlFlowList(values: string[]): string {
