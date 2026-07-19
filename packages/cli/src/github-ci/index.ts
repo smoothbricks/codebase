@@ -2,9 +2,18 @@ import { existsSync, readFileSync } from 'node:fs';
 import { appendFile, mkdtemp, realpath, rename, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { $ } from 'bun';
+import typia from 'typia';
 import { decode, run, runStatus } from '../lib/run.js';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 import type { NxTargetRun } from './outputs.js';
+
+interface GithubActionsEventPayload {
+  repository?: {
+    default_branch?: string;
+  };
+}
+
+const parseGithubActionsEvent = typia.json.createIsParse<GithubActionsEventPayload>();
 
 type NxSmartMode = 'auto' | 'affected' | 'run-many';
 
@@ -361,8 +370,8 @@ function eventDefaultBranch(): string | undefined {
   const eventPath = process.env.GITHUB_EVENT_PATH;
   if (!eventPath) return undefined;
   try {
-    const payload = JSON.parse(readFileSync(eventPath, 'utf8')) as { repository?: { default_branch?: string } };
-    return payload.repository?.default_branch || undefined;
+    const payload = parseGithubActionsEvent(readFileSync(eventPath, 'utf8'));
+    return payload?.repository?.default_branch || undefined;
   } catch {
     return undefined;
   }
