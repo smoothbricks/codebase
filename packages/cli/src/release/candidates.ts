@@ -105,10 +105,8 @@ async function packageHasReleasableChangesSince<Package extends ReleasePackageIn
 }
 
 function releasableManifestChanged(previousManifest: PackageJson, currentManifest: PackageJson): boolean {
-  const previous = previousManifest as Record<string, unknown>;
-  const current = currentManifest as Record<string, unknown>;
   for (const key of releasableManifestKeys) {
-    if (!stableJsonEqual(previous[key], current[key])) {
+    if (!stableJsonEqual(Reflect.get(previousManifest, key), Reflect.get(currentManifest, key))) {
       return true;
     }
   }
@@ -223,10 +221,9 @@ function stableJson(value: unknown): unknown {
     return value.map(stableJson);
   }
   if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
-    const record = value as Record<string, unknown>;
     const normalized: Record<string, unknown> = {};
-    for (const key of Object.keys(record).sort()) {
-      normalized[key] = stableJson(record[key]);
+    for (const key of Object.keys(value).sort()) {
+      normalized[key] = stableJson(Reflect.get(value, key));
     }
     return normalized;
   }

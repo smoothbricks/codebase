@@ -2,7 +2,13 @@ import { existsSync } from 'node:fs';
 import { lstat, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { $ } from 'bun';
-import { isRecord, recordProperty } from '../lib/json.js';
+import {
+  type NxDependsOn,
+  type NxProjectJson,
+  type NxTargetConfig,
+  parseNxProjectJsonText,
+  parseStringArrayText,
+} from '../lib/json.js';
 import { decode, run } from '../lib/run.js';
 
 export interface ProjectTargets {
@@ -33,97 +39,107 @@ export function nxCacheDirectories(root: string): string[] {
   return [join(root, '.nx/cache'), join(root, '.nx/workspace-data'), join(root, 'node_modules/.cache/nx')];
 }
 
-export function targetNamesFromNxProjectJson(value: unknown): string[] {
-  const targets = isRecord(value) ? recordProperty(value, 'targets') : null;
+export function targetNamesFromNxProjectJson(value: NxProjectJson | null | undefined): string[] {
+  const targets = value?.targets;
   return targets ? Object.keys(targets).sort((a, b) => a.localeCompare(b)) : [];
 }
 
-export function projectRootFromNxProjectJson(value: unknown): string | undefined {
-  return isRecord(value) && typeof value.root === 'string' ? value.root : undefined;
+export function projectRootFromNxProjectJson(value: NxProjectJson | null | undefined): string | undefined {
+  return typeof value?.root === 'string' ? value.root : undefined;
 }
 
-export function buildDependsOnFromNxProjectJson(value: unknown): string[] | undefined {
+export function buildDependsOnFromNxProjectJson(value: NxProjectJson | null | undefined): string[] | undefined {
   return targetDependenciesFromNxProjectJson(value).get('build');
 }
 
-export function targetDependenciesFromNxProjectJson(value: unknown): Map<string, string[]> {
-  const targets = isRecord(value) ? recordProperty(value, 'targets') : null;
+export function targetDependenciesFromNxProjectJson(value: NxProjectJson | null | undefined): Map<string, string[]> {
+  const targets = value?.targets;
   const dependencies = new Map<string, string[]>();
   if (!targets) {
     return dependencies;
   }
   for (const [targetName, target] of Object.entries(targets)) {
-    if (!isRecord(target) || !Array.isArray(target.dependsOn)) {
+    if (!target.dependsOn) {
       continue;
     }
     const entries: string[] = [];
     for (const dependency of target.dependsOn) {
-      if (typeof dependency === 'string') {
-        entries.push(dependency);
+      const local = localDependsOnTarget(dependency);
+      if (local === undefined) {
+        if (isInvalidDependsOn(dependency)) {
+          throw new Error(`Nx target ${targetName} has an invalid dependsOn entry.`);
+        }
         continue;
       }
-      if (!isRecord(dependency) || typeof dependency.target !== 'string') {
-        throw new Error(`Nx target ${targetName} has an invalid dependsOn entry.`);
-      }
-      if (dependency.projects !== undefined && dependency.projects !== 'self') {
-        // Target closures are intentionally project-local. Nx schedules explicit
-        // cross-project prerequisites itself; treating them as local targets
-        // would collect or verify outputs from the wrong project.
-        continue;
-      }
-      entries.push(dependency.target);
+      entries.push(local);
     }
     dependencies.set(targetName, entries);
   }
   return dependencies;
 }
 
-export function targetExecutorsFromNxProjectJson(value: unknown): Map<string, string> {
-  const targets = isRecord(value) ? recordProperty(value, 'targets') : null;
+function localDependsOnTarget(dependency: NxDependsOn): string | undefined {
+  if (typeof dependency === 'string') {
+    return dependency;
+  }
+  if (typeof dependency.target !== 'string') {
+    return undefined;
+  }
+  if (dependency.projects !== undefined && dependency.projects !== 'self') {
+    // Target closures are intentionally project-local. Nx schedules explicit
+    // cross-project prerequisites itself; treating them as local targets
+    // would collect or verify outputs from the wrong project.
+    return undefined;
+  }
+  return dependency.target;
+}
+
+function isInvalidDependsOn(dependency: NxDependsOn): boolean {
+  return typeof dependency !== 'string' && typeof dependency.target !== 'string';
+}
+
+export function targetExecutorsFromNxProjectJson(value: NxProjectJson | null | undefined): Map<string, string> {
+  const targets = value?.targets;
   const executors = new Map<string, string>();
   if (!targets) {
     return executors;
   }
   for (const [targetName, target] of Object.entries(targets)) {
-    if (isRecord(target) && typeof target.executor === 'string') {
+    if (typeof target.executor === 'string') {
       executors.set(targetName, target.executor);
     }
   }
   return executors;
 }
 
-export function targetOutputsFromNxProjectJson(value: unknown): Map<string, string[]> {
+export function targetOutputsFromNxProjectJson(value: NxProjectJson | null | undefined): Map<string, string[]> {
   return targetStringArraysFromNxProjectJson(value, 'outputs');
 }
 
-export function targetScriptsFromNxProjectJson(value: unknown): Map<string, string> {
-  const targets = isRecord(value) ? recordProperty(value, 'targets') : null;
+export function targetScriptsFromNxProjectJson(value: NxProjectJson | null | undefined): Map<string, string> {
+  const targets = value?.targets;
   const scripts = new Map<string, string>();
   if (!targets) {
     return scripts;
   }
   for (const [targetName, target] of Object.entries(targets)) {
-    if (!isRecord(target)) {
-      continue;
-    }
-    const options = recordProperty(target, 'options');
-    if (typeof options?.script === 'string') {
-      scripts.set(targetName, options.script);
+    if (typeof target.options?.script === 'string') {
+      scripts.set(targetName, target.options.script);
     }
   }
   return scripts;
 }
 
-function targetStringArraysFromNxProjectJson(value: unknown, property: string): Map<string, string[]> {
-  const targets = isRecord(value) ? recordProperty(value, 'targets') : null;
+function targetStringArraysFromNxProjectJson(
+  value: NxProjectJson | null | undefined,
+  property: 'outputs' | 'inputs',
+): Map<string, string[]> {
+  const targets = value?.targets;
   const values = new Map<string, string[]>();
   if (!targets) {
     return values;
   }
   for (const [targetName, target] of Object.entries(targets)) {
-    if (!isRecord(target)) {
-      continue;
-    }
     const entries = target[property];
     if (Array.isArray(entries)) {
       values.set(
@@ -157,8 +173,8 @@ export function projectNamesFromNxShowProjectsOutput(output: string): string[] {
 
   if (trimmed.startsWith('[')) {
     try {
-      const parsed: unknown = JSON.parse(trimmed);
-      if (Array.isArray(parsed) && parsed.every((entry) => typeof entry === 'string')) {
+      const parsed = parseStringArrayText(trimmed);
+      if (parsed) {
         return parsed.sort((a, b) => a.localeCompare(b));
       }
     } catch {
@@ -223,7 +239,10 @@ async function readNxProjectNames(root: string): Promise<string[]> {
 async function readProjectTarget(root: string, project: string): Promise<ProjectTargets> {
   const command = nxShowProjectCommand(project);
   const result = await $`${command.command} ${command.args}`.cwd(root).quiet();
-  const parsed: unknown = JSON.parse(decode(result.stdout));
+  const parsed = parseNxProjectJsonText(decode(result.stdout));
+  if (!parsed) {
+    throw new Error(`Unable to inspect Nx project ${project}.`);
+  }
   const targetDependencies = targetDependenciesFromNxProjectJson(parsed);
   return {
     project,
@@ -236,3 +255,5 @@ async function readProjectTarget(root: string, project: string): Promise<Project
     targetScripts: targetScriptsFromNxProjectJson(parsed),
   };
 }
+
+export type { NxProjectJson, NxTargetConfig };
