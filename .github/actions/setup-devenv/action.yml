@@ -51,6 +51,19 @@ runs:
     - name: 📦 Cache node_modules
       uses: ./.github/actions/cache-node-modules
 
+    # Keep ttsc's plugin/GOCACHE outside node_modules so (1) the node_modules
+    # Actions cache stays dependency-only and (2) we can cache compiled plugin
+    # binaries without stuffing the multi-GB go-build object cache into GHA.
+    - name: 🔧 Configure ttsc plugin cache dir
+      shell: bash
+      run: |
+        cache_dir="${GITHUB_WORKSPACE}/.cache/ttsc"
+        mkdir -p "$cache_dir"
+        echo "TTSC_CACHE_DIR=$cache_dir" >> "$GITHUB_ENV"
+
+    - name: 🧊 Cache ttsc plugins
+      uses: ./.github/actions/cache-ttsc-plugins
+
     - name: 🐚 Build devenv shell
       shell: bash
       working-directory: tooling/direnv
