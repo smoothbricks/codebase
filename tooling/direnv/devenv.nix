@@ -103,6 +103,10 @@ in {
     cd "$DEVENV_ROOT/../.."
     export PATH="$("$PWD/tooling/direnv/repo-path")"
     export TTSC_TSGO_BINARY="$PWD/node_modules/@typescript/native/bin/tsc"
+    # Content-keyed native plugin binaries + GOCACHE. Keep outside node_modules so
+    # dependency installs/caches stay lean; CI restores .cache/ttsc/plugins only.
+    export TTSC_CACHE_DIR="$PWD/.cache/ttsc"
+    mkdir -p "$TTSC_CACHE_DIR"
     bun "$DEVENV_ROOT/enter-shell.ts" || exit $?
 
     ${lib.optionalString pkgs.stdenv.isDarwin "unset CC CXX"}
