@@ -5,7 +5,7 @@ import { escapeRegex, getWorkspacePackages } from '../lib/workspace.js';
 
 export interface SyncBunLockfileVersionsOptions {
   log?: boolean;
-  /** `git add` bun.lock after rewriting it, for the pre-commit self-heal path. */
+  /** `git add` bun.lock when versions were resynced. */
   stage?: boolean;
 }
 
@@ -19,9 +19,8 @@ export interface SyncBunLockfileVersionsOptions {
 // - https://github.com/oven-sh/bun/issues/20477
 // - https://github.com/oven-sh/bun/issues/20829
 //
-// Any `bun install` rewrites the workspace versions from package.json. Release
-// still repairs lockfile workspace versions via the Nx versionActions hook and
-// `smoo monorepo sync-bun-lockfile-versions` / monorepo init packs.
+// Target is always the current package.json version. Do not rewrite prereleases
+// to older stable tags — that fights `bun install` and churns bun.lock forever.
 export function syncBunLockfileVersions(root: string, options: SyncBunLockfileVersionsOptions = {}): number {
   const log = options.log ?? true;
   const lockfilePath = join(root, 'bun.lock');
@@ -32,13 +31,7 @@ export function syncBunLockfileVersions(root: string, options: SyncBunLockfileVe
   let lockfile = readFileSync(lockfilePath, 'utf8');
   let updated = 0;
   for (const pkg of packages) {
-    // If the package.json version is a prerelease (e.g. 0.2.2-next.0) it may
-    // never have been published.  Use the latest stable git tag version so
-    // that `bun pm pack` writes an installable dependency range for consumers.
-    const targetVersion = pkg.version.includes('-')
-      ? (latestStableTagVersion(root, pkg.projectName) ?? pkg.version)
-      : pkg.version;
-
+    const targetVersion = pkg.version;
     const relativePath = pkg.path.replaceAll('\\', '/');
     const escaped = escapeRegex(relativePath);
     const pattern = new RegExp(`("${escaped}":\\s*\\{[^}]*"version":\\s*")([^"]+)(")`);
@@ -58,8 +51,7 @@ export function syncBunLockfileVersions(root: string, options: SyncBunLockfileVe
     }
     lockfile = lockfile.replace(pattern, `$1${targetVersion}$3`);
     if (log) {
-      const suffix = targetVersion !== pkg.version ? ` (latest stable tag; package.json has ${pkg.version})` : '';
-      console.log(`fix:  ${relativePath}: ${lockVersion} -> ${targetVersion}${suffix}`);
+      console.log(`fix:  ${relativePath}: ${lockVersion} -> ${targetVersion}`);
     }
     updated++;
   }
@@ -89,10 +81,7 @@ export function validateBunLockfileVersions(root: string): number {
   const lockfile = readFileSync(lockfilePath, 'utf8');
   let failures = 0;
   for (const pkg of packages) {
-    const targetVersion = pkg.version.includes('-')
-      ? (latestStableTagVersion(root, pkg.projectName) ?? pkg.version)
-      : pkg.version;
-
+    const targetVersion = pkg.version;
     const relativePath = pkg.path.replaceAll('\\', '/');
     const escaped = escapeRegex(relativePath);
     const pattern = new RegExp(`("${escaped}":\\s*\\{[^}]*"version":\\s*")([^"]+)(")`);
@@ -112,26 +101,4 @@ export function validateBunLockfileVersions(root: string): number {
     console.log('bun.lock workspace versions are valid.');
   }
   return failures;
-}
-
-function latestStableTagVersion(root: string, projectName: string): string | null {
-  try {
-    const output = execSync(`git tag --list '${projectName}@*' --sort=-v:refname`, {
-      cwd: root,
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    const prefix = `${projectName}@`;
-    for (const line of output.split('\n')) {
-      const tag = line.trim();
-      if (!tag.startsWith(prefix)) continue;
-      const version = tag.slice(prefix.length);
-      if (version && !version.includes('-')) {
-        return version;
-      }
-    }
-    return null;
-  } catch {
-    return null;
-  }
 }
