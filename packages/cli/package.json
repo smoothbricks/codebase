@@ -21,7 +21,7 @@
       "default": "./dist/index.js"
     },
     "./bun/preload": {
-      "types": "./src/bun/preload.d.ts",
+      "types": "./dist/bun/preload.d.ts",
       "bun": "./src/bun/preload.ts",
       "development": "./src/bun/preload.ts",
       "import": "./dist/bun/preload.js",
