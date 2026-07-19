@@ -1,7 +1,8 @@
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import typia from 'typia';
 import { formatMarkerHits, scanRefChangedForMarkers } from '../lib/conflict-markers.js';
-import { isRecord, readJson } from '../lib/json.js';
+import { readJson } from '../lib/json.js';
 import { run, runResult } from '../lib/run.js';
 
 /** 0 = clean/done, 2 = action required (conflicts to resolve), 1 = usage/error. */
@@ -49,6 +50,29 @@ interface PrResolveState {
   originalSha: string;
   startedAt: string;
 }
+
+interface GhPrViewJson {
+  number: number;
+  url: string;
+  headRefName: string;
+  baseRefName: string;
+  isCrossRepository?: boolean;
+}
+
+interface PrResolveStateJson {
+  pr: number;
+  url?: string;
+  headBranch: string;
+  baseBranch: string;
+  remote: string;
+  crossRepo?: boolean;
+  originalBranch?: string;
+  originalSha?: string;
+  startedAt?: string;
+}
+
+const parseGhPrViewJson = typia.json.createIsParse<GhPrViewJson>();
+const isPrResolveStateJson = typia.createIs<PrResolveStateJson>();
 
 /**
  * Agent-first conflict resolution for a GitHub PR.
@@ -209,25 +233,16 @@ async function prMeta(shell: PrResolveShell, root: string, prArg: string): Promi
   if (result.exitCode !== 0) {
     throw new Error(`Could not resolve PR '${prArg}' via gh: ${result.stderr.trim() || `exit ${result.exitCode}`}`);
   }
-  const raw: unknown = JSON.parse(result.stdout);
-  if (!isRecord(raw)) {
+  const raw = parseGhPrViewJson(result.stdout);
+  if (!raw) {
     throw new Error(`gh pr view returned unexpected JSON for '${prArg}'.`);
   }
-  const { number, url, headRefName, baseRefName } = raw;
-  if (
-    typeof number !== 'number' ||
-    typeof url !== 'string' ||
-    typeof headRefName !== 'string' ||
-    typeof baseRefName !== 'string'
-  ) {
-    throw new Error(`gh pr view JSON for '${prArg}' is missing expected fields.`);
-  }
-  const match = /github\.com\/([^/]+\/[^/]+)\/pull\//.exec(url);
+  const match = /github\.com\/([^/]+\/[^/]+)\/pull\//.exec(raw.url);
   return {
-    number,
-    url,
-    headBranch: headRefName,
-    baseBranch: baseRefName,
+    number: raw.number,
+    url: raw.url,
+    headBranch: raw.headRefName,
+    baseBranch: raw.baseRefName,
     crossRepo: raw.isCrossRepository === true,
     nameWithOwner: match ? match[1] : '',
   };
@@ -326,28 +341,19 @@ function readState(statePath: string): PrResolveState | null {
   } catch {
     return null;
   }
-  if (!isRecord(raw)) {
-    return null;
-  }
-  const { pr, url, headBranch, baseBranch, remote, crossRepo, originalBranch, originalSha, startedAt } = raw;
-  if (
-    typeof pr !== 'number' ||
-    typeof headBranch !== 'string' ||
-    typeof baseBranch !== 'string' ||
-    typeof remote !== 'string'
-  ) {
+  if (!isPrResolveStateJson(raw)) {
     return null;
   }
   return {
-    pr,
-    url: typeof url === 'string' ? url : '',
-    headBranch,
-    baseBranch,
-    remote,
-    crossRepo: crossRepo === true,
-    originalBranch: typeof originalBranch === 'string' ? originalBranch : '',
-    originalSha: typeof originalSha === 'string' ? originalSha : '',
-    startedAt: typeof startedAt === 'string' ? startedAt : '',
+    pr: raw.pr,
+    url: raw.url ?? '',
+    headBranch: raw.headBranch,
+    baseBranch: raw.baseBranch,
+    remote: raw.remote,
+    crossRepo: raw.crossRepo === true,
+    originalBranch: raw.originalBranch ?? '',
+    originalSha: raw.originalSha ?? '',
+    startedAt: raw.startedAt ?? '',
   };
 }
 
