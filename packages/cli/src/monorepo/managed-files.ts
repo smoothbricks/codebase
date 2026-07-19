@@ -237,6 +237,11 @@ const managedFiles: ManagedFile[] = [
   },
   {
     kind: 'template',
+    source: 'github/actions/cache-ttsc-plugins/action.yml',
+    target: '.github/actions/cache-ttsc-plugins/action.yml',
+  },
+  {
+    kind: 'template',
     source: 'github/actions/cache-nx/action.yml',
     target: '.github/actions/cache-nx/action.yml',
   },

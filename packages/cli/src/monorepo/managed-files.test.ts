@@ -22,6 +22,7 @@ const NODE_MODULES_CACHE_KEY = "${{ hashFiles('bun.lock', 'package.json', 'packa
 const CACHE_ACTIONS = [
   { name: 'cache-nix-devenv', osKeyLines: 6 },
   { name: 'cache-node-modules', osKeyLines: 2 },
+  { name: 'cache-ttsc-plugins', osKeyLines: 2 },
   { name: 'cache-nx', osKeyLines: 2 },
 ] as const;
 
