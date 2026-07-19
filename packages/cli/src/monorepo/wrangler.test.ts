@@ -2,6 +2,7 @@ import { describe, expect, it, spyOn } from 'bun:test';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { type PackageJson, parsePackageJsonText } from '../lib/json.js';
 import { applyWranglerDefaults, firstWranglerEnv, validateWrangler } from './wrangler.js';
 
 describe('firstWranglerEnv', () => {
@@ -42,7 +43,7 @@ describe('applyWranglerDefaults', () => {
         },
       });
       const typecheck = nxTargets(pkg).typecheck;
-      expect(isRecord(typecheck) ? typecheck.dependsOn : null).toEqual(['^build', 'wrangler-types']);
+      expect(typecheck?.dependsOn ?? null).toEqual(['^build', 'wrangler-types']);
 
       const logs = captureConsoleLogs();
       applyWranglerDefaults(root);
@@ -63,8 +64,7 @@ describe('applyWranglerDefaults', () => {
     try {
       applyWranglerDefaults(root);
       const target = nxTargets(await readJson(join(root, 'packages/api/package.json')))['wrangler-types'];
-      const options = isRecord(target) ? target.options : null;
-      expect(isRecord(options) ? options.command : null).toBe(
+      expect(target?.options?.command ?? null).toBe(
         'wrangler types --env-file .dev.vars.example --include-runtime false',
       );
     } finally {
@@ -187,27 +187,23 @@ async function createWorkspace(
   return root;
 }
 
-function nxTargets(pkg: Record<string, unknown>): Record<string, unknown> {
-  const nx = pkg.nx;
-  if (!isRecord(nx) || !isRecord(nx.targets)) {
+function nxTargets(pkg: PackageJson): NonNullable<NonNullable<PackageJson['nx']>['targets']> {
+  const targets = pkg.nx?.targets;
+  if (!targets) {
     throw new Error('nx.targets not found');
   }
-  return nx.targets;
+  return targets;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-async function readJson(path: string): Promise<Record<string, unknown>> {
-  const parsed: unknown = JSON.parse(await readFile(path, 'utf8'));
-  if (!isRecord(parsed)) {
+async function readJson(path: string): Promise<PackageJson> {
+  const parsed = parsePackageJsonText(await readFile(path, 'utf8'));
+  if (!parsed) {
     throw new Error('expected JSON object');
   }
   return parsed;
 }
 
-async function writeJson(path: string, value: Record<string, unknown>): Promise<void> {
+async function writeJson(path: string, value: PackageJson): Promise<void> {
   await mkdir(join(path, '..'), { recursive: true });
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`);
 }
