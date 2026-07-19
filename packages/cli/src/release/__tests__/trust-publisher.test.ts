@@ -179,6 +179,13 @@ describe('trusted publisher setup', () => {
 
   it('recognizes npm trust access-denied output', () => {
     expect(npmTrustListAccessDenied('{"error":{"code":"E403"}}', '')).toBe(true);
+    expect(npmTrustListAccessDenied('', 'npm error code E401')).toBe(true);
+    expect(
+      npmTrustListAccessDenied(
+        '',
+        'npm error 401 Unauthorized - GET https://registry.npmjs.org/-/package/@scope%2fpkg/trust - {"success":false,"error":"You must be logged in to publish packages."}',
+      ),
+    ).toBe(true);
     expect(npmTrustListAccessDenied('', 'npm error code EOTP')).toBe(false);
   });
 
