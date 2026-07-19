@@ -2,11 +2,12 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { $ } from 'bun';
 import {
-  ensureStringMap,
+  ensureDependencyMap,
+  ensureEngines,
   type PackageJson,
   parseStringArrayText,
   readJsonObject,
-  setOptionalStringField,
+  setPackageStringField,
   setStringProperty,
   writeJsonObject,
 } from '../lib/json.js';
@@ -39,10 +40,10 @@ export async function syncRootRuntimeVersions(root: string): Promise<void> {
   }
 
   let changed = false;
-  const engines = ensureStringMap(packageJson, 'engines');
+  const engines = ensureEngines(packageJson);
   changed = setStringProperty(engines, 'node', `>=${nodeMajor}.0.0`) || changed;
-  changed = setOptionalStringField(packageJson, 'packageManager', `bun@${bunVersion}`) || changed;
-  const devDependencies = ensureStringMap(packageJson, 'devDependencies');
+  changed = setPackageStringField(packageJson, 'packageManager', `bun@${bunVersion}`) || changed;
+  const devDependencies = ensureDependencyMap(packageJson, 'devDependencies');
   changed =
     setStringProperty(
       devDependencies,

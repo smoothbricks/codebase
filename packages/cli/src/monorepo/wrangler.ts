@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { ensureObjectField, type NxTargetConfig, type PackageJson, writeJsonObject } from '../lib/json.js';
+import { ensureNx, ensureNxTargets, type NxTargetConfig, type PackageJson, writeJsonObject } from '../lib/json.js';
 import { getWorkspacePackageManifests } from '../lib/workspace.js';
 
 interface WranglerProject {
@@ -57,8 +57,8 @@ export function applyWranglerDefaults(root: string): void {
   }
   for (const project of projects) {
     const env = firstWranglerEnv(readFileSync(project.tomlPath, 'utf8'));
-    const nx = ensureObjectField(project.json, 'nx', () => ({}));
-    const targets = ensureObjectField(nx, 'targets', () => ({}));
+    const nx = ensureNx(project.json);
+    const targets = ensureNxTargets(nx);
     const desired: NxTargetConfig = {
       executor: 'nx:run-commands',
       cache: true,

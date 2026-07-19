@@ -104,12 +104,13 @@ function arrayTableKv(
   field: string,
 ): AST.TOMLKeyValue | null {
   const block = envRecord(toml, env);
-  const rows = Array.isArray(block?.[arrayKey]) ? (block[arrayKey] as unknown[]) : [];
-  const index = rows.findIndex(
-    (r) =>
-      (arrayKey === 'd1_databases' ? isWranglerD1Row(r) : isWranglerKvRow(r)) &&
-      (r as WranglerKvRow | WranglerD1Row).binding === binding,
-  );
+  const rows = Array.isArray(block?.[arrayKey]) ? block[arrayKey] : [];
+  const index = rows.findIndex((row) => {
+    if (arrayKey === 'd1_databases') {
+      return isWranglerD1Row(row) && row.binding === binding;
+    }
+    return isWranglerKvRow(row) && row.binding === binding;
+  });
   if (index < 0) return null;
   const table = tables(toml).find((t) => t.kind === 'array' && sameKey(t.resolvedKey, ['env', env, arrayKey, index]));
   return table ? kvIn(toml, table, field) : null;

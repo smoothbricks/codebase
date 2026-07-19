@@ -21,17 +21,21 @@ import {
   checkWorkspaceConfigPolicy,
 } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import {
-  ensureObjectField,
-  ensureStringMap,
+  ensureNx,
+  ensurePublishConfig,
+  ensureRepositoryObject,
+  ensureScripts,
   type PackageExportMap,
   type PackageExports,
   type PackageJson,
-  type PackageRepository,
   readJsonObject,
   requiredJsonObject,
   type StringMap,
-  setMissingOptionalStringField,
-  setOptionalStringField,
+  setMissingPackageStringField,
+  setMissingRepositoryField,
+  setNxName,
+  setPublishAccess,
+  setRepositoryField,
   setStringProperty,
   writeJsonObject,
 } from '../lib/json.js';
@@ -71,12 +75,12 @@ export function applyRootScriptDefaults(root: string): void {
   if (!rootPackage) {
     return;
   }
-  const scripts = ensureStringMap(rootPackage, 'scripts');
+  const scripts = ensureScripts(rootPackage);
   let changed = false;
   for (const [name, command] of Object.entries(rootScriptPolicy)) {
     changed = setStringProperty(scripts, name, command) || changed;
   }
-  const nx = ensureObjectField(rootPackage, 'nx', () => ({}));
+  const nx = ensureNx(rootPackage);
   if (!Array.isArray(nx.includedScripts) || nx.includedScripts.length !== 0) {
     nx.includedScripts = [];
     changed = true;
@@ -113,20 +117,19 @@ export function applyPublicPackageDefaults(root: string): void {
       rootLicense &&
       rootLicense !== 'UNLICENSED'
     ) {
-      changed = setMissingOptionalStringField(pkg.json, 'license', rootLicense) || changed;
+      changed = setMissingPackageStringField(pkg.json, 'license', rootLicense) || changed;
     }
-    const publishConfig = ensureObjectField(pkg.json, 'publishConfig', () => ({}));
-    changed = setOptionalStringField(publishConfig, 'access', 'public') || changed;
+    const publishConfig = ensurePublishConfig(pkg.json);
+    changed = setPublishAccess(publishConfig, 'public') || changed;
 
     if (typeof pkg.json.repository !== 'string') {
-      const repository = ensureObjectField(pkg.json, 'repository', (): PackageRepository => ({}));
+      const repository = ensureRepositoryObject(pkg.json);
       changed =
-        setOptionalStringField(repository, 'type', existingRepository?.type ?? rootRepository?.type ?? 'git') ||
-        changed;
+        setRepositoryField(repository, 'type', existingRepository?.type ?? rootRepository?.type ?? 'git') || changed;
       if (existingRepository) {
-        changed = setMissingOptionalStringField(repository, 'url', existingRepository.url) || changed;
+        changed = setMissingRepositoryField(repository, 'url', existingRepository.url) || changed;
       }
-      changed = setOptionalStringField(repository, 'directory', pkg.path.replaceAll('\\', '/')) || changed;
+      changed = setRepositoryField(repository, 'directory', pkg.path.replaceAll('\\', '/')) || changed;
     }
 
     changed = normalizeExportConditionOrder(pkg.json.exports) || changed;
@@ -188,8 +191,8 @@ export function applyNxProjectNameDefaults(root: string): void {
     if (!suggestedName) {
       continue;
     }
-    const nx = ensureObjectField(pkg.json, 'nx', () => ({}));
-    const changed = setOptionalStringField(nx, 'name', suggestedName);
+    const nx = ensureNx(pkg.json);
+    const changed = setNxName(nx, suggestedName);
     if (changed) {
       writeJsonObject(pkg.packageJsonPath, pkg.json);
       console.log(`updated        ${pkg.path}/package.json nx.name`);
@@ -328,7 +331,7 @@ export function validatePublicPackageMetadata(root: string): number {
       failures++;
     }
     const publishConfig = pkg.json.publishConfig;
-    if (!publishConfig || publishConfig.access !== 'public') {
+    if (publishConfig?.access !== 'public') {
       console.error(`${pkg.path}: public package must define publishConfig.access = public`);
       failures++;
     }
@@ -510,7 +513,7 @@ function unscopedPackageName(packageName: string): string {
 
 function recordKeysAreSorted(record: StringMap): boolean {
   const keys = Object.keys(record);
-  return keys.every((key, index) => index === 0 || keys[index - 1]! <= key);
+  return keys.every((key, index) => index === 0 || (keys[index - 1] ?? '') <= key);
 }
 
 function sortRecordInPlace(record: StringMap): boolean {

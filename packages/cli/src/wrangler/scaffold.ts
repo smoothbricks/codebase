@@ -7,7 +7,7 @@
  */
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { ensureObjectField, type NxTargetConfig, type PackageJson, writeJsonObject } from '../lib/json.js';
+import { ensureNx, ensureNxTargets, type NxTargetConfig, type PackageJson, writeJsonObject } from '../lib/json.js';
 import { getWorkspacePackageManifests } from '../lib/workspace.js';
 
 export interface ScaffoldOptions {
@@ -225,8 +225,8 @@ export function scaffold(root: string, project: string, options: ScaffoldOptions
   console.log(`${existed ? 'overwrote' : 'created'}      ${label}/scripts/prepare-env.ts`);
 
   // Wire the nx target (idempotent).
-  const nx = ensureObjectField(json, 'nx', () => ({}));
-  const targets = ensureObjectField(nx, 'targets', () => ({}));
+  const nx = ensureNx(json);
+  const targets = ensureNxTargets(nx);
   if (!targets['prepare-env']) {
     const prepareEnvTarget: NxTargetConfig = {
       executor: 'nx:run-commands',
