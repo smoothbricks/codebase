@@ -20,6 +20,12 @@
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
+    "./bun/preload": {
+      "bun": "./src/bun/preload.ts",
+      "development": "./src/bun/preload.ts",
+      "import": "./dist/bun/preload.js",
+      "default": "./dist/bun/preload.js"
+    },
     "./monorepo/runtime": {
       "types": "./dist/monorepo/runtime.d.ts",
       "bun": "./src/monorepo/runtime.ts",
@@ -42,6 +48,10 @@
       "default": "./dist/wrangler/prepare-env.js"
     }
   },
+  "sideEffects": [
+    "./dist/bun/preload.js",
+    "./src/bun/preload.ts"
+  ],
   "files": [
     "README.md",
     "bin",
