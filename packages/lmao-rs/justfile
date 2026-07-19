@@ -17,7 +17,9 @@ mutants:
 # wasm32 ABI build (allocator.zig replacement). Needs: rustup target add wasm32-unknown-unknown
 wasm:
     cargo build -p lmao-wasm --target wasm32-unknown-unknown --release
-    @ls -la target/wasm32-unknown-unknown/release/lmao_wasm.wasm
+    mkdir -p dist
+    cp target/wasm32-unknown-unknown/release/lmao_wasm.wasm dist/lmao_wasm.wasm
+    @ls -la dist/lmao_wasm.wasm
 
 # AxE overhead gates placeholder (criterion). Real gate: traced-vs-untraced ≤20%
 # throughput delta + zero-alloc test (tests/alloc_gate.rs, currently TDD-red).
