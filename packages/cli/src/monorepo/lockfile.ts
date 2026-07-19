@@ -19,11 +19,9 @@ export interface SyncBunLockfileVersionsOptions {
 // - https://github.com/oven-sh/bun/issues/20477
 // - https://github.com/oven-sh/bun/issues/20829
 //
-// Any `bun install` rewrites the workspace versions from package.json, reverting
-// this sync between releases. The pre-commit hook therefore runs
-// `smoo monorepo sync-bun-lockfile-versions --stage` on every commit so drift is
-// healed at the commit that would otherwise carry it — validation must never
-// fail a committer for drift a routine `bun install` introduced.
+// Any `bun install` rewrites the workspace versions from package.json. Release
+// still repairs lockfile workspace versions via the Nx versionActions hook and
+// `smoo monorepo sync-bun-lockfile-versions` / monorepo init packs.
 export function syncBunLockfileVersions(root: string, options: SyncBunLockfileVersionsOptions = {}): number {
   const log = options.log ?? true;
   const lockfilePath = join(root, 'bun.lock');
