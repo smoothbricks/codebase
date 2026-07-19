@@ -17,15 +17,6 @@ function git(root: string, args: string): string {
   return execSync(`git ${args}`, {
     cwd: root,
     encoding: 'utf8',
-    env: {
-      ...process.env,
-      GIT_CONFIG_GLOBAL: '/dev/null',
-      GIT_CONFIG_SYSTEM: '/dev/null',
-      GIT_AUTHOR_NAME: 'fixture',
-      GIT_AUTHOR_EMAIL: 'fixture@invalid',
-      GIT_COMMITTER_NAME: 'fixture',
-      GIT_COMMITTER_EMAIL: 'fixture@invalid',
-    },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 }
@@ -33,7 +24,6 @@ function git(root: string, args: string): string {
 interface FixtureOptions {
   packageVersion: string;
   lockVersion: string;
-  stableTag?: string;
 }
 
 function makeFixtureRepo(options: FixtureOptions): string {
@@ -48,16 +38,13 @@ function makeFixtureRepo(options: FixtureOptions): string {
   mkdirSync(join(root, 'packages', 'foo'), { recursive: true });
   writeFixturePackage(root, options.packageVersion);
   writeFixtureLock(root, options.lockVersion);
-  if (options.stableTag) {
-    git(root, `tag ${options.stableTag}`);
-  }
   return root;
 }
 
 function writeFixturePackage(root: string, version: string): void {
   writeFileSync(
-    join(root, 'packages', 'foo', 'package.json'),
-    JSON.stringify({ name: '@fixture/foo', version, nx: { name: 'foo' } }),
+    join(root, 'packages/foo/package.json'),
+    `${JSON.stringify({ name: '@fixture/foo', version, private: false, nx: { name: 'foo' } }, null, 2)}\n`,
   );
 }
 
@@ -71,9 +58,9 @@ function writeFixtureLock(root: string, version: string): void {
       '    "": { "name": "fixture-root" },',
       '    "packages/foo": {',
       '      "name": "@fixture/foo",',
-      `      "version": "${version}",`,
-      '    },',
-      '  },',
+      `      "version": "${version}"`,
+      '    }',
+      '  }',
       '}',
       '',
     ].join('\n'),
@@ -87,30 +74,25 @@ function lockVersionIn(root: string): string {
 }
 
 describe('bun.lock workspace version sync', () => {
-  it('a bun-install revert of the release-synced version fails validation', () => {
-    // The b3298fc4c shape: package.json holds the next prerelease, a stable tag
-    // exists, and `bun install` rewrote the lockfile back to the prerelease.
+  it('a stale lockfile version fails validation against package.json', () => {
     const root = makeFixtureRepo({
       packageVersion: '0.1.3-next.0',
-      lockVersion: '0.1.3-next.0',
-      stableTag: 'foo@0.1.2',
+      lockVersion: '0.1.2',
     });
     expect(validateBunLockfileVersions(root)).toBe(1);
   });
 
-  it('sync restores the latest stable tag version and validation passes', () => {
+  it('sync restores the package.json version and validation passes', () => {
     const root = makeFixtureRepo({
       packageVersion: '0.1.3-next.0',
-      lockVersion: '0.1.3-next.0',
-      stableTag: 'foo@0.1.2',
+      lockVersion: '0.1.2',
     });
     expect(syncBunLockfileVersions(root, { log: false })).toBe(1);
-    expect(lockVersionIn(root)).toBe('0.1.2');
+    expect(lockVersionIn(root)).toBe('0.1.3-next.0');
     expect(validateBunLockfileVersions(root)).toBe(0);
   });
 
-  it('a never-published prerelease package falls back to its manifest version', () => {
-    // The new-workspace-package shape (e.g. cowshed): no stable tag exists yet.
+  it('a prerelease package keeps its manifest version in the lockfile', () => {
     const root = makeFixtureRepo({ packageVersion: '0.2.0-next.0', lockVersion: '0.2.0-next.0' });
     expect(validateBunLockfileVersions(root)).toBe(0);
     expect(syncBunLockfileVersions(root, { log: false })).toBe(0);
@@ -126,15 +108,14 @@ describe('bun.lock workspace version sync', () => {
   it('stage: true stages the healed bun.lock', () => {
     const root = makeFixtureRepo({
       packageVersion: '0.1.3-next.0',
-      lockVersion: '0.1.3-next.0',
-      stableTag: 'foo@0.1.2',
+      lockVersion: '0.1.2',
     });
     expect(syncBunLockfileVersions(root, { log: false, stage: true })).toBe(1);
     expect(git(root, 'diff --cached --name-only')).toContain('bun.lock');
   });
 
   it('stage: true leaves a clean lockfile unstaged', () => {
-    const root = makeFixtureRepo({ packageVersion: '0.1.2', lockVersion: '0.1.2', stableTag: 'foo@0.1.2' });
+    const root = makeFixtureRepo({ packageVersion: '0.1.2', lockVersion: '0.1.2' });
     expect(syncBunLockfileVersions(root, { log: false, stage: true })).toBe(0);
     expect(git(root, 'diff --cached --name-only').trim()).toBe('');
   });
@@ -143,7 +124,7 @@ describe('bun.lock workspace version sync', () => {
     const version = fc
       .tuple(fc.nat({ max: 20 }), fc.nat({ max: 20 }), fc.nat({ max: 20 }), fc.option(fc.nat({ max: 5 })))
       .map(([major, minor, patch, next]) => `${major}.${minor}.${patch}${next === null ? '' : `-next.${next}`}`);
-    const root = makeFixtureRepo({ packageVersion: '0.1.2', lockVersion: '0.1.2', stableTag: 'foo@0.1.2' });
+    const root = makeFixtureRepo({ packageVersion: '0.1.2', lockVersion: '0.1.2' });
     fc.assert(
       fc.property(version, version, (packageVersion, lockVersion) => {
         writeFixturePackage(root, packageVersion);

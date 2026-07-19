@@ -1,4 +1,3 @@
-import { execSync } from 'node:child_process';
 import { $ } from 'bun';
 import { type PackageJson, parsePackageJsonText } from '../lib/json.js';
 import { decode } from '../lib/run.js';
@@ -24,7 +23,6 @@ export function validatePackedWorkspaceDependencies(
 ): string[] {
   const workspacePackages = getWorkspacePackages(root);
   const workspaceVersions = new Map(workspacePackages.map((pkg) => [pkg.name, pkg.version]));
-  const projectNameByPackage = new Map(workspacePackages.map((pkg) => [pkg.name, pkg.projectName]));
   const failures: string[] = [];
   for (const field of workspaceDependencyFields) {
     const sourceDependencies = sourcePackage.json[field];
@@ -51,14 +49,8 @@ export function validatePackedWorkspaceDependencies(
       if (sourceRange !== 'workspace:*') {
         failures.push(`${sourcePackage.path}: source ${field}.${name} must use workspace:*`);
       }
-      // When the workspace dep is at a prerelease version that was never
-      // published, the lockfile sync rewrites it to the latest stable tag
-      // version.  Accept that version as valid.
-      const projectName = projectNameByPackage.get(name);
-      const expectedVersion =
-        workspaceVersion.includes('-') && projectName
-          ? (latestStableTagVersion(root, projectName) ?? workspaceVersion)
-          : workspaceVersion;
+      // Packed workspace deps must match the current package.json version.
+      const expectedVersion = workspaceVersion;
       if (packedRange !== expectedVersion) {
         failures.push(
           `${sourcePackage.path}: packed ${field}.${name} must be ${expectedVersion}, got ${packedRange ?? '<missing>'}`,
@@ -67,26 +59,4 @@ export function validatePackedWorkspaceDependencies(
     }
   }
   return failures;
-}
-
-function latestStableTagVersion(root: string, projectName: string): string | null {
-  try {
-    const output = execSync(`git tag --list '${projectName}@*' --sort=-v:refname`, {
-      cwd: root,
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    const prefix = `${projectName}@`;
-    for (const line of output.split('\n')) {
-      const tag = line.trim();
-      if (!tag.startsWith(prefix)) continue;
-      const version = tag.slice(prefix.length);
-      if (version && !version.includes('-')) {
-        return version;
-      }
-    }
-    return null;
-  } catch {
-    return null;
-  }
 }
