@@ -72,3 +72,6 @@ dist-test/
 
 # Rust build output (packages/columine, lmao-rs)
 target/
+
+# local tool caches (ttsc plugins, etc.)
+.cache/
