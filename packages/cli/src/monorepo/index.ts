@@ -5,7 +5,7 @@ import { escapeRegex, getWorkspacePackages, getWorkspacePatterns, listReleasePac
 import { formatCommitMessage, validateCommitMessage } from './commit-msg.js';
 import { applyWorkspaceGitConfig } from './git-config.js';
 import { syncBunLockfileVersions } from './lockfile.js';
-import { applyManagedFiles, printResults } from './managed-files.js';
+import { applyManagedFiles, printResults, warnOnManagedFileDrift } from './managed-files.js';
 import { listValidCommitScopes, validatePublicTags } from './package-policy.js';
 import { runInitPacks, runValidatePacks } from './packs/index.js';
 import { syncRootRuntimeVersions } from './runtime.js';
@@ -78,7 +78,11 @@ export function updateManagedFiles(root: string): void {
   printResults(applyManagedFiles(root, 'update'));
 }
 
-export function checkManagedFiles(root: string): void {
+export function checkManagedFiles(root: string, options: { warn?: boolean } = {}): void {
+  if (options.warn === true) {
+    warnOnManagedFileDrift(root);
+    return;
+  }
   const results = applyManagedFiles(root, 'check');
   printResults(results);
   if (results.some((result) => result.action === 'drifted')) {

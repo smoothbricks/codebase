@@ -61,10 +61,13 @@ function buildProgram(): Command {
     const { updateManagedFiles } = await import('./monorepo/index.js');
     updateManagedFiles(await findRepoRoot());
   });
-  monorepo.command('check').action(async () => {
-    const { checkManagedFiles } = await import('./monorepo/index.js');
-    checkManagedFiles(await findRepoRoot());
-  });
+  monorepo
+    .command('check')
+    .option('--warn', 'report drift as warnings (GitHub annotations) instead of failing')
+    .action(async (options: { warn?: boolean }) => {
+      const { checkManagedFiles } = await import('./monorepo/index.js');
+      checkManagedFiles(await findRepoRoot(), { warn: options.warn });
+    });
   monorepo.command('diff').action(async () => {
     const { diffManagedFiles } = await import('./monorepo/index.js');
     diffManagedFiles(await findRepoRoot());

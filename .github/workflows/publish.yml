@@ -89,7 +89,7 @@ jobs:
       # Step 8
       - name: ✅ Check managed monorepo files (${{ steps.version.outputs.mode }})
         if: ${{ steps.version.outputs.mode != 'none' }}
-        run: smoo monorepo check
+        run: smoo monorepo check --warn
 
       # Step 9
       - name: 🔨 Build (${{ steps.version.outputs.mode }})

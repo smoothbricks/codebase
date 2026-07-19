@@ -420,7 +420,9 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
         '          "$GITHUB_OUTPUT"',
       ];
     case PublishWorkflowStepKind.CheckManagedMonorepoFiles:
-      return conditionalRunStep(step, 'smoo monorepo check');
+      // Drift is derived state with its own remediation PR; publishing only
+      // blocks on actual package issues (smoo monorepo validate).
+      return conditionalRunStep(step, 'smoo monorepo check --warn');
     case PublishWorkflowStepKind.Build:
       return conditionalRunStep(
         step,

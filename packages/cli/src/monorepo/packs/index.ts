@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { printCommandOutput, runResult, runStatus } from '../../lib/run.js';
 import { type ProjectTargets, readProjectTargets } from '../../nx/index.js';
 import { syncBunLockfileVersions, validateBunLockfileVersions } from '../lockfile.js';
-import { validateManagedFiles } from '../managed-files.js';
+import { warnOnManagedFileDrift } from '../managed-files.js';
 import { fixNxSync, validateNxSync } from '../nx-sync.js';
 import { fixPackageHygiene, validatePackageHygiene } from '../package-hygiene.js';
 import {
@@ -88,9 +88,12 @@ const packs: MonorepoPack[] = [
       // never a stored template — outside devenv the PATH is not authoritative,
       // mirroring the init-time syncRuntime gate above.
       const runtimeFailures = ctx.syncRuntime ? await validateRootRuntimeVersions(ctx.root) : 0;
+      // Managed-file drift is derived state (CLI template x pinned version) with
+      // its own remediation flow; it warns instead of failing so validation only
+      // blocks on actual package issues. See warnOnManagedFileDrift.
+      warnOnManagedFileDrift(ctx.root);
       return (
         runtimeFailures +
-        validateManagedFiles(ctx.root) +
         validateRootPackagePolicy(ctx.root) +
         validateToolConfig(ctx.root) +
         validateNxProjectNames(ctx.root) +
