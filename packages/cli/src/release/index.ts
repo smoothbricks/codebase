@@ -1619,7 +1619,7 @@ async function runLatestNpmTrust(
   if (status === 0) {
     return 'configured';
   }
-  throw new Error(`nix shell nixpkgs#nodejs_latest -c npm ${npmArgs.join(' ')} failed with exit code ${status}`);
+  throw new Error(npmCommandFailedMessage(npmArgs, status));
 }
 
 async function listTrustedPublishers(root: string, pkg: Pick<ReleasePackage, 'name'>): Promise<TrustedPublisherLookup> {
@@ -1628,7 +1628,7 @@ async function listTrustedPublishers(root: string, pkg: Pick<ReleasePackage, 'na
   if (result.exitCode !== 0 && /\bEOTP\b/.test(`${result.stdout}\n${result.stderr}`)) {
     const status = await runInteractiveStatus('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...args], root);
     if (status !== 0) {
-      throw new Error(`nix shell nixpkgs#nodejs_latest -c npm ${args.join(' ')} failed with exit code ${status}`);
+      throw new Error(npmCommandFailedMessage(args, status));
     }
     result = await runResult('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...args], root);
   }
@@ -1636,15 +1636,47 @@ async function listTrustedPublishers(root: string, pkg: Pick<ReleasePackage, 'na
     return npmTrustAccessDetails(root, pkg.name);
   }
   if (result.exitCode !== 0) {
-    throw new Error(
-      `nix shell nixpkgs#nodejs_latest -c npm ${args.join(' ')} failed with exit code ${result.exitCode}`,
-    );
+    throw new Error(npmCommandFailedMessage(args, result.exitCode, result.stdout, result.stderr));
   }
   return parseTrustedPublishers(result.stdout, pkg.name);
 }
 
+/** npm trust list/setup requires an authenticated package owner. */
 export function npmTrustListAccessDenied(stdout: string, stderr: string): boolean {
-  return /\bE403\b/.test(`${stdout}\n${stderr}`);
+  const output = `${stdout}\n${stderr}`;
+  // E403: authenticated but not an owner. E401 / login-required: no usable session.
+  return (
+    /\bE403\b/.test(output) ||
+    /\bE401\b/.test(output) ||
+    /You must be logged in to publish packages/i.test(output) ||
+    /npm error 401 Unauthorized/i.test(output)
+  );
+}
+
+function npmCommandFailedMessage(npmArgs: string[], exitCode: number, stdout = '', stderr = ''): string {
+  const command = `nix shell nixpkgs#nodejs_latest -c npm ${npmArgs.join(' ')}`;
+  const detail = npmFailureDetail(stdout, stderr);
+  return detail.length > 0
+    ? `${command} failed with exit code ${exitCode}\n${detail}`
+    : `${command} failed with exit code ${exitCode}`;
+}
+
+function npmFailureDetail(stdout: string, stderr: string): string {
+  const chunks = [stderr.trim(), stdout.trim()].filter((chunk) => chunk.length > 0);
+  if (chunks.length === 0) {
+    return '';
+  }
+  // Prefer the actionable npm error line over notice spam when present.
+  const joined = chunks.join('\n');
+  const errorLines = joined
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => /npm error|error code|401 Unauthorized|403 Forbidden|E401|E403|logged in/i.test(line));
+  if (errorLines.length > 0) {
+    return errorLines.slice(0, 8).join('\n');
+  }
+  // Fall back to a short tail of combined output.
+  return joined.split('\n').slice(-12).join('\n');
 }
 
 async function npmTrustAccessDetails(root: string, packageName: string): Promise<NpmTrustAccessDenied> {
