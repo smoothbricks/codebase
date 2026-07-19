@@ -1,7 +1,15 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { $ } from 'bun';
-import { getOrCreateRecord, readJsonObject, recordProperty, setStringProperty, writeJsonObject } from '../lib/json.js';
+import {
+  ensureStringMap,
+  type PackageJson,
+  parseStringArrayText,
+  readJsonObject,
+  setOptionalStringField,
+  setStringProperty,
+  writeJsonObject,
+} from '../lib/json.js';
 
 export interface RuntimeVersions {
   node: string;
@@ -31,10 +39,10 @@ export async function syncRootRuntimeVersions(root: string): Promise<void> {
   }
 
   let changed = false;
-  const engines = getOrCreateRecord(packageJson, 'engines');
+  const engines = ensureStringMap(packageJson, 'engines');
   changed = setStringProperty(engines, 'node', `>=${nodeMajor}.0.0`) || changed;
-  changed = setStringProperty(packageJson, 'packageManager', `bun@${bunVersion}`) || changed;
-  const devDependencies = getOrCreateRecord(packageJson, 'devDependencies');
+  changed = setOptionalStringField(packageJson, 'packageManager', `bun@${bunVersion}`) || changed;
+  const devDependencies = ensureStringMap(packageJson, 'devDependencies');
   changed =
     setStringProperty(
       devDependencies,
@@ -69,31 +77,28 @@ export async function validateRootRuntimeVersions(root: string): Promise<number>
   return validateRuntimePins(packageJson, await runtimeVersionsFromPath(root));
 }
 
-export function validateRuntimePins(packageJson: Record<string, unknown>, runtime: RuntimeVersions): number {
+export function validateRuntimePins(packageJson: PackageJson, runtime: RuntimeVersions): number {
   const nodeMajor = runtime.node.split('.', 1)[0];
   if (!nodeMajor) {
     throw new Error(`Unable to derive Node major version from ${runtime.node}`);
   }
   let failures = 0;
   const repair = 'run `smoo monorepo init --runtime-only` inside the devenv shell';
-  const engines = recordProperty(packageJson, 'engines');
-  const enginesNode = engines && typeof engines.node === 'string' ? engines.node : null;
+  const enginesNode = packageJson.engines?.node ?? null;
   if (enginesNode !== `>=${nodeMajor}.0.0`) {
     console.error(
       `package.json engines.node is ${enginesNode ?? 'missing'} but the PATH node is v${runtime.node} — expected >=${nodeMajor}.0.0; ${repair}`,
     );
     failures++;
   }
-  const packageManager = typeof packageJson.packageManager === 'string' ? packageJson.packageManager : null;
+  const packageManager = packageJson.packageManager ?? null;
   if (packageManager !== `bun@${runtime.bun}`) {
     console.error(
       `package.json packageManager is ${packageManager ?? 'missing'} but the PATH bun is ${runtime.bun} — expected bun@${runtime.bun}; ${repair}`,
     );
     failures++;
   }
-  const devDependencies = recordProperty(packageJson, 'devDependencies');
-  const typesNode =
-    devDependencies && typeof devDependencies['@types/node'] === 'string' ? devDependencies['@types/node'] : null;
+  const typesNode = packageJson.devDependencies?.['@types/node'] ?? null;
   const typesNodeParts = typesNode ? /^~(\d+)\.(\d+)\.(\d+)$/.exec(typesNode) : null;
   if (!typesNodeParts || typesNodeParts[1] !== nodeMajor) {
     console.error(
@@ -118,8 +123,8 @@ async function runtimeTypesRange(
   pinMode: RuntimeTypesPinMode,
 ): Promise<string> {
   const versionsText = await $`bun pm view ${packageName} versions --json`.cwd(root).text();
-  const versions = JSON.parse(versionsText) as unknown;
-  if (!Array.isArray(versions) || !versions.every((version) => typeof version === 'string')) {
+  const versions = parseStringArrayText(versionsText);
+  if (!versions) {
     throw new Error(`Unable to read published ${packageName} versions`);
   }
   return runtimeTypesRangeForPublishedVersions(packageName, runtimeVersion, pinMode, versions);
