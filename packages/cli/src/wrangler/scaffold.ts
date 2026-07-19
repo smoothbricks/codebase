@@ -6,8 +6,8 @@
  * .dev.vars.example), so it never drifts from what the worker declares.
  */
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { join, relative } from 'node:path';
-import { getOrCreateRecord, recordProperty, writeJsonObject } from '../lib/json.js';
+import { join } from 'node:path';
+import { ensureObjectField, type NxTargetConfig, type PackageJson, writeJsonObject } from '../lib/json.js';
 import { getWorkspacePackageManifests } from '../lib/workspace.js';
 
 export interface ScaffoldOptions {
@@ -19,22 +19,21 @@ export interface ScaffoldOptions {
 function resolveProject(
   root: string,
   project: string,
-): { dir: string; label: string; packageJsonPath: string; json: Record<string, unknown> } {
+): { dir: string; label: string; packageJsonPath: string; json: PackageJson } {
   const manifests = getWorkspacePackageManifests(root);
   const match = manifests.find((m) => {
-    const nx = recordProperty(m.json, 'nx');
-    const nxName = nx && typeof nx.name === 'string' ? nx.name : null;
-    return nxName === project || m.name === project || relative(root, m.path) === project;
+    const nxName = m.json.nx?.name;
+    return nxName === project || m.name === project || m.path === project;
   });
   if (!match) {
-    const known = manifests.map((m) => recordProperty(m.json, 'nx')?.name ?? m.name).join(', ');
+    const known = manifests.map((m) => m.json.nx?.name ?? m.name).join(', ');
     throw new Error(`project "${project}" not found. Known: ${known}`);
   }
-  const dir = match.path; // WorkspacePackageManifest.path is absolute
+  const dir = join(root, match.path);
   if (!existsSync(join(dir, 'wrangler.toml'))) {
     throw new Error(`"${project}" has no wrangler.toml — not a wrangler project`);
   }
-  return { dir, label: relative(root, dir), packageJsonPath: match.packageJsonPath, json: match.json };
+  return { dir, label: match.path, packageJsonPath: match.packageJsonPath, json: match.json };
 }
 
 /** The generated starter script — generic, manifest-driven, prompt-batteries included. */
@@ -226,13 +225,14 @@ export function scaffold(root: string, project: string, options: ScaffoldOptions
   console.log(`${existed ? 'overwrote' : 'created'}      ${label}/scripts/prepare-env.ts`);
 
   // Wire the nx target (idempotent).
-  const nx = getOrCreateRecord(json, 'nx');
-  const targets = getOrCreateRecord(nx, 'targets');
-  if (!recordProperty(targets, 'prepare-env')) {
-    targets['prepare-env'] = {
+  const nx = ensureObjectField(json, 'nx', () => ({}));
+  const targets = ensureObjectField(nx, 'targets', () => ({}));
+  if (!targets['prepare-env']) {
+    const prepareEnvTarget: NxTargetConfig = {
       executor: 'nx:run-commands',
       options: { command: 'bun scripts/prepare-env.ts', cwd: '{projectRoot}' },
     };
+    targets['prepare-env'] = prepareEnvTarget;
     writeJsonObject(packageJsonPath, json);
     console.log(`updated       ${label}/package.json prepare-env target`);
   }

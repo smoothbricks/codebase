@@ -1,7 +1,14 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import typia from 'typia';
 import { cliPackageVersion, isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
-import { getOrCreateRecord, readJsonObject, recordProperty, setStringProperty, writeJsonObject } from '../lib/json.js';
+import {
+  ensureStringMap,
+  readJsonObject,
+  setOptionalStringField,
+  setStringProperty,
+  writeJsonObject,
+} from '../lib/json.js';
 import { type PackageJson, readPackageJsonObject } from '../lib/workspace.js';
 
 interface RequiredDependency {
@@ -22,6 +29,12 @@ export interface ToolContext {
   rootPackage: PackageJson | null;
   policy: ToolPolicy;
 }
+
+interface RegistryPackument {
+  versions: Record<string, unknown>;
+}
+
+const isRegistryPackument = typia.createIs<RegistryPackument>();
 
 const rootDevDependencies: RequiredDependency[] = [
   { name: '@biomejs/biome', fallbackVersion: '^2.3.5', minimumVersion: '2.3.0', prefix: '^' },
@@ -81,7 +94,7 @@ export async function applyRootDevDependencyDefaults(root: string, context: Tool
     return;
   }
   let changed = false;
-  const devDependencies = getOrCreateRecord(pkg, 'devDependencies');
+  const devDependencies = ensureStringMap(pkg, 'devDependencies');
   for (const dependency of rootDevDependencies) {
     const current = devDependencies[dependency.name];
     if (typeof current !== 'string' || !satisfiesDependencyPolicy(context.policy, current, dependency)) {
@@ -107,7 +120,7 @@ async function applyRootPackageToolDefaults(root: string, context: ToolContext):
   }
   let dependencyChanged = false;
   let workspaceChanged = false;
-  const devDependencies = getOrCreateRecord(pkg, 'devDependencies');
+  const devDependencies = ensureStringMap(pkg, 'devDependencies');
   for (const dependency of rootDevDependencies) {
     const current = devDependencies[dependency.name];
     if (typeof current !== 'string' || !satisfiesDependencyPolicy(context.policy, current, dependency)) {
@@ -138,12 +151,12 @@ export function applyToolingPackageDefaults(root: string, policy: ToolPolicy): v
   const path = join(root, 'tooling', 'package.json');
   const pkg = readJsonObject(path) ?? { name: policy.toolingPackageName, private: true, dependencies: {} };
   let changed = false;
-  changed = setStringProperty(pkg, 'name', policy.toolingPackageName) || changed;
+  changed = setOptionalStringField(pkg, 'name', policy.toolingPackageName) || changed;
   if (pkg.private !== true) {
     pkg.private = true;
     changed = true;
   }
-  const dependencies = getOrCreateRecord(pkg, 'dependencies');
+  const dependencies = ensureStringMap(pkg, 'dependencies');
   changed = setStringProperty(dependencies, cliPackageName, policy.cliDependencyRange) || changed;
   if (changed || !existsSync(path)) {
     mkdirSync(dirname(path), { recursive: true });
@@ -202,7 +215,7 @@ export function validateRootDevDependencies(policy: ToolPolicy, rootPackage: Pac
     console.error('package.json not found or invalid');
     return 1;
   }
-  const devDependencies = recordProperty(pkg, 'devDependencies');
+  const devDependencies = pkg.devDependencies;
   let failures = 0;
   for (const dependency of rootDevDependencies) {
     const version = devDependencies?.[dependency.name];
@@ -230,9 +243,9 @@ export function validateToolingPackage(root: string, policy: ToolPolicy): number
     console.error('tooling/package.json not found or invalid');
     return 1;
   }
-  const dependencies = recordProperty(pkg, 'dependencies');
+  const dependencies = pkg.dependencies;
   let failures = 0;
-  const actualName = typeof pkg.name === 'string' ? pkg.name : null;
+  const actualName = pkg.name ?? null;
   if (actualName !== policy.toolingPackageName) {
     console.error(`tooling/package.json name must be ${policy.toolingPackageName}`);
     failures++;
@@ -340,7 +353,7 @@ function formatExpectedDependency(policy: ToolPolicy, dependency: RequiredDepend
 export function readToolContext(root: string): ToolContext {
   const rootPackage = readPackageJsonObject(join(root, 'package.json'));
   const toolingPackage = readJsonObject(join(root, 'tooling', 'package.json'));
-  const configuredCliRange = recordProperty(toolingPackage ?? {}, 'dependencies')?.[cliPackageName];
+  const configuredCliRange = toolingPackage?.dependencies?.[cliPackageName];
   return {
     rootPackage,
     policy: toolPolicy(rootPackage, typeof configuredCliRange === 'string' ? configuredCliRange : null),
@@ -348,7 +361,7 @@ export function readToolContext(root: string): ToolContext {
 }
 
 function toolPolicy(rootPackage: PackageJson | null, configuredCliRange: string | null): ToolPolicy {
-  const name = typeof rootPackage?.name === 'string' ? rootPackage.name : null;
+  const name = rootPackage?.name ?? null;
   const isCodebase = isSmoothBricksCodebasePackageName(name ?? undefined);
   const toolingName = toolingPackageName(name);
   // A locally linked prerelease can be newer than every published CLI. Keep an existing
@@ -441,14 +454,6 @@ function compareVersions(left: Version, right: Version): number {
   return left.major - right.major || left.minor - right.minor || left.patch - right.patch;
 }
 
-function isRegistryPackument(value: unknown): value is { versions: Record<string, unknown> } {
-  return typeof value === 'object' && value !== null && 'versions' in value && isObjectRecord(value.versions);
-}
-
-function isObjectRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
 function stripRangePrefix(version: string): string {
   return version.replace(/^[~^]/, '');
 }
@@ -462,7 +467,7 @@ function addWorkspacePattern(pkg: PackageJson, pattern: string): boolean {
     workspaces.push(pattern);
     return true;
   }
-  if (isObjectRecord(workspaces) && Array.isArray(workspaces.packages)) {
+  if (workspaces && Array.isArray(workspaces.packages)) {
     if (workspaces.packages.includes(pattern)) {
       return false;
     }
@@ -478,5 +483,5 @@ function hasWorkspacePattern(pkg: PackageJson, pattern: string): boolean {
   if (Array.isArray(workspaces)) {
     return workspaces.includes(pattern);
   }
-  return isObjectRecord(workspaces) && Array.isArray(workspaces.packages) && workspaces.packages.includes(pattern);
+  return Boolean(workspaces && Array.isArray(workspaces.packages) && workspaces.packages.includes(pattern));
 }
