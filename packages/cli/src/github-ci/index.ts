@@ -298,7 +298,7 @@ export async function githubCiApplyOutputs(
 async function loadOutputBoundary() {
   if (import.meta.url.endsWith('/src/github-ci/index.ts')) {
     // The source self-hosting shim has no Typia transform; register it before loading manifest validators.
-    await import('@smoothbricks/validation/bun/preload');
+    await import('@smoothbricks/cli/bun/preload');
   }
   // This boundary must stay lazy because the transformed dist and source self-hosting paths initialize Typia differently.
   return import('./outputs.js');
