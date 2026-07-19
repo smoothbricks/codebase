@@ -1,4 +1,3 @@
-import { execSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AfterAllProjectsVersioned, VersionActions } from 'nx/release';
@@ -46,12 +45,9 @@ function syncBunLockfileVersions(root: string): number {
   let lockfile = readFileSync(lockfilePath, 'utf8');
   let updated = 0;
   for (const pkg of packages) {
-    // If the package.json version is a prerelease (e.g. 0.2.2-next.0) it may
-    // never have been published.  Use the latest stable git tag version so
-    // that `bun pm pack` writes an installable dependency range for consumers.
-    const targetVersion = pkg.version.includes('-')
-      ? (latestStableTagVersion(root, pkg.projectName) ?? pkg.version)
-      : pkg.version;
+    // Always mirror package.json. Bun can leave stale workspace versions in
+    // bun.lock after version bumps; do not rewrite prereleases to older tags.
+    const targetVersion = pkg.version;
 
     const relativePath = pkg.path.replaceAll('\\', '/');
     const escaped = escapeRegex(relativePath);
@@ -67,16 +63,14 @@ function syncBunLockfileVersions(root: string): number {
       continue;
     }
     lockfile = lockfile.replace(pattern, `$1${targetVersion}$3`);
-    console.log(
-      `fix:  ${relativePath}: ${lockVersion} -> ${targetVersion}${targetVersion !== pkg.version ? ` (latest stable tag; package.json has ${pkg.version})` : ''}`,
-    );
+    console.log(`fix:  ${relativePath}: ${lockVersion} -> ${targetVersion}`);
     updated++;
   }
   if (updated > 0) {
     writeFileSync(lockfilePath, lockfile);
   }
   console.log(
-    updated > 0 ? `Updated ${updated} workspace version(s) in bun.lock` : 'All workspace versions already in sync.',
+    updated > 0 ? `Updated ${updated} workspace version(s) in bun.lock` : 'All workspace versions already in sync.'
   );
   return updated;
 }
@@ -116,26 +110,4 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function latestStableTagVersion(root: string, projectName: string): string | null {
-  try {
-    const output = execSync(`git tag --list '${projectName}@*' --sort=-v:refname`, {
-      cwd: root,
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    const prefix = `${projectName}@`;
-    for (const line of output.split('\n')) {
-      const tag = line.trim();
-      if (!tag.startsWith(prefix)) continue;
-      const version = tag.slice(prefix.length);
-      if (version && !version.includes('-')) {
-        return version;
-      }
-    }
-    return null;
-  } catch {
-    return null;
-  }
 }
