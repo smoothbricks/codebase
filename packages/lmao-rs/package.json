@@ -14,6 +14,28 @@
           "cwd": "",
           "parallel": false
         }
+      },
+      "cargo-wasm": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "dependsOn": [
+          "^build"
+        ],
+        "inputs": [
+          "{projectRoot}/crates/**/*.rs",
+          "{projectRoot}/crates/**/Cargo.toml",
+          "{projectRoot}/Cargo.toml",
+          "{projectRoot}/Cargo.lock",
+          "{projectRoot}/.cargo/config.toml",
+          "{projectRoot}/justfile"
+        ],
+        "outputs": [
+          "{projectRoot}/dist/lmao_wasm.wasm"
+        ],
+        "options": {
+          "command": "just wasm",
+          "cwd": "{projectRoot}"
+        }
       }
     }
   }
