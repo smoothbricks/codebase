@@ -17,14 +17,14 @@ describe('CI workflow definition', () => {
     const steps = defineCiWorkflow({ deploy: true, pushBranches: ['main'] });
     const rendered = renderCiWorkflowYaml({ deploy: true, pushBranches: ['main'] });
 
-    expect(steps.map((step) => [step.kind, step.number])).toContainEqual([CiWorkflowStepKind.Deploy, 9]);
+    expect(steps.map((step) => [step.kind, step.number])).toContainEqual([CiWorkflowStepKind.Deploy, 11]);
     expect(rendered).toContain('- name: 🚀 Deploy Staging');
     expect(rendered).not.toContain('CLOUDFLARE_API_TOKEN');
     expect(rendered).not.toContain('CLOUDFLARE_ACCOUNT_ID');
     expect(rendered).toContain(
-      'smoo github-ci nx-deploy --configuration staging --mode affected --name "Deploy Staging" --step 9',
+      'smoo github-ci nx-deploy --configuration staging --mode affected --name "Deploy Staging" --step 11',
     );
-    expect(rendered).toContain("# Step 10\n      # Nx's database cache needs artifact files");
+    expect(rendered).toContain("# Step 12\n      # Nx's database cache needs artifact files");
   });
 
   it('adds Cloudflare credentials for Wrangler-backed deploys', () => {
