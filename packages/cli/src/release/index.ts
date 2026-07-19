@@ -606,7 +606,7 @@ function safeTarballPrefix(name: string): string {
 
 async function assertPackedWorkspaceDependencies(root: string, tarball: string, pkg: ReleasePackage): Promise<void> {
   const manifest = await readPackedPackageJson(root, tarball, pkg.name);
-  const failures = validatePackedWorkspaceDependencies(root, pkg, manifest);
+  const failures = validatePackedWorkspaceDependencies(root, pkg, manifest, { mode: 'publish' });
   if (failures.length > 0) {
     throw new Error(failures.join('\n'));
   }
@@ -1327,7 +1327,7 @@ function collectBuildInputs(targets: Record<string, NxTargetConfig>): string[] {
   if (!build) {
     return ['production'];
   }
-  const directInputs = build.inputs ?? [];
+  const directInputs = stringInputs(build.inputs);
   if (directInputs.length > 0) {
     return directInputs;
   }
@@ -1340,9 +1340,13 @@ function collectBuildInputs(targets: Record<string, NxTargetConfig>): string[] {
     if (!targetName) {
       continue;
     }
-    inputs.push(...(targets[targetName]?.inputs ?? []));
+    inputs.push(...stringInputs(targets[targetName]?.inputs));
   }
   return inputs.length > 0 ? inputs : ['production'];
+}
+
+function stringInputs(inputs: NxTargetConfig['inputs'] | undefined): string[] {
+  return Array.isArray(inputs) ? inputs.filter((entry): entry is string => typeof entry === 'string') : [];
 }
 
 function normalizeInputPatterns(inputs: string[], nxJson: NxJson): string[] {

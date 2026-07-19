@@ -82,7 +82,7 @@ async function validatePackedManifest(
 ): Promise<number> {
   let failures = 0;
   const packedPackage = await readPackedPackageJson(root, packed.path, pkg.name);
-  for (const message of validatePackedWorkspaceDependencies(root, pkg, packedPackage)) {
+  for (const message of validatePackedWorkspaceDependencies(root, pkg, packedPackage, { mode: 'install' })) {
     console.error(message);
     failures++;
   }

@@ -73,21 +73,21 @@ export interface NxDependsOnObject {
 
 export type NxDependsOn = string | NxDependsOnObject;
 
-export interface NxTargetOptions {
-  script?: string;
-  command?: string;
-  cwd?: string;
-}
+/** Nx target options are executor-specific open bags. */
+export type NxTargetOptions = Record<string, unknown>;
+
+export type NxInput = string | Record<string, unknown>;
 
 export interface NxTargetConfig {
   executor?: string;
   dependsOn?: NxDependsOn[];
   outputs?: string[];
-  inputs?: string[];
+  inputs?: NxInput[];
   options?: NxTargetOptions;
   configurations?: Record<string, NxTargetConfig>;
   cache?: boolean;
   command?: string;
+  parallelism?: boolean;
 }
 
 export interface NxProjectJson {

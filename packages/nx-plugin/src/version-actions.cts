@@ -1,3 +1,4 @@
+import { execSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AfterAllProjectsVersioned, VersionActions } from 'nx/release';
@@ -18,10 +19,12 @@ const afterAllProjectsVersioned: AfterAllProjectsVersioned = async (cwd, options
   // - https://github.com/oven-sh/bun/issues/18906
   // - https://github.com/oven-sh/bun/issues/20477
   // - https://github.com/oven-sh/bun/issues/20829
-  // Nx runs `bun install --lockfile-only`, but Bun currently leaves workspace
-  // versions stale in bun.lock. `bun pm pack` then rewrites `workspace:*` using
-  // those stale lockfile versions instead of the current package.json versions.
-  const updated = syncBunLockfileVersions(cwd);
+  //
+  // After version bumps, rewrite bun.lock for pack/publish:
+  // - stable package.json versions stay as-is
+  // - unpublished package.json prereleases (prepare-next) map to last stable tag
+  //   so a releasing package does not embed unpublishable -next deps via workspace:*
+  const updated = syncBunLockfileVersionsForPublish(cwd);
   if (updated === 0) {
     return result;
   }
@@ -36,7 +39,7 @@ baseVersionActions.afterAllProjectsVersioned = afterAllProjectsVersioned;
 
 export = baseVersionActions;
 
-function syncBunLockfileVersions(root: string): number {
+function syncBunLockfileVersionsForPublish(root: string): number {
   const lockfilePath = join(root, 'bun.lock');
   if (!existsSync(lockfilePath)) {
     throw new Error('bun.lock not found');
@@ -45,10 +48,7 @@ function syncBunLockfileVersions(root: string): number {
   let lockfile = readFileSync(lockfilePath, 'utf8');
   let updated = 0;
   for (const pkg of packages) {
-    // Always mirror package.json. Bun can leave stale workspace versions in
-    // bun.lock after version bumps; do not rewrite prereleases to older tags.
-    const targetVersion = pkg.version;
-
+    const targetVersion = publishLockfileVersion(root, pkg.projectName, pkg.version);
     const relativePath = pkg.path.replaceAll('\\', '/');
     const escaped = escapeRegex(relativePath);
     const pattern = new RegExp(`("${escaped}":\\s*\\{[^}]*"version":\\s*")([^"]+)(")`);
@@ -63,7 +63,8 @@ function syncBunLockfileVersions(root: string): number {
       continue;
     }
     lockfile = lockfile.replace(pattern, `$1${targetVersion}$3`);
-    console.log(`fix:  ${relativePath}: ${lockVersion} -> ${targetVersion}`);
+    const suffix = targetVersion !== pkg.version ? ` (latest stable tag; package.json has ${pkg.version})` : '';
+    console.log(`fix:  ${relativePath}: ${lockVersion} -> ${targetVersion}${suffix}`);
     updated++;
   }
   if (updated > 0) {
@@ -73,6 +74,35 @@ function syncBunLockfileVersions(root: string): number {
     updated > 0 ? `Updated ${updated} workspace version(s) in bun.lock` : 'All workspace versions already in sync.'
   );
   return updated;
+}
+
+function publishLockfileVersion(root: string, projectName: string, packageVersion: string): string {
+  if (!packageVersion.includes('-')) {
+    return packageVersion;
+  }
+  return latestStableTagVersion(root, projectName) ?? packageVersion;
+}
+
+function latestStableTagVersion(root: string, projectName: string): string | null {
+  try {
+    const output = execSync(`git tag --list '${projectName}@*' --sort=-v:refname`, {
+      cwd: root,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const prefix = `${projectName}@`;
+    for (const line of output.split('\n')) {
+      const tag = line.trim();
+      if (!tag.startsWith(prefix)) continue;
+      const version = tag.slice(prefix.length);
+      if (version && !version.includes('-')) {
+        return version;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 interface WorkspacePackage {
