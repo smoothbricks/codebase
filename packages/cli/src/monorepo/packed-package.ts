@@ -4,7 +4,9 @@ import { dirname, join, relative } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { publint } from 'publint';
 import { formatMessage } from 'publint/utils';
-import { isRecord } from '../lib/json.js';
+import typia from 'typia';
+import type { PackageExports, PackageJson } from '../lib/json.js';
+import { parsePackageJsonText } from '../lib/json.js';
 import { printCommandOutput, runResult } from '../lib/run.js';
 import type { PackageInfo } from '../lib/workspace.js';
 import { listPublicPackages } from '../lib/workspace.js';
@@ -92,11 +94,10 @@ async function validateAttw(root: string, pkg: PackageInfo, packed: { path: stri
   const analysis = await attw.checkPackage(await createAttwPackageFromTarball(attw, root, packed.path), {
     excludeEntrypoints: nonJsExportEntrypoints(pkg.json.exports),
   });
-  if (!isRecord(analysis) || analysis.types === false) {
+  if (!isAttwAnalysis(analysis) || analysis.types === false) {
     return 0;
   }
-  const rawProblems = Array.isArray(analysis.problems) ? analysis.problems : [];
-  const problems = rawProblems.filter(isReportedAttwProblem);
+  const problems = (analysis.problems ?? []).filter(isReportedAttwProblem);
   if (problems.length === 0) {
     return 0;
   }
@@ -112,10 +113,30 @@ interface AttwCore {
   checkPackage: (pkg: unknown, options: { excludeEntrypoints: string[] }) => Promise<unknown>;
 }
 
+interface AttwAnalysis {
+  types?: unknown;
+  problems?: unknown[];
+}
+
+interface AttwProblem {
+  kind: string;
+  resolutionKind?: string;
+  entrypoint?: string;
+}
+
+interface AttwCoreExport {
+  Package?: unknown;
+  checkPackage?: unknown;
+}
+
+const isAttwAnalysis = typia.createIs<AttwAnalysis>();
+const isAttwProblem = typia.createIs<AttwProblem>();
+const isAttwCoreExport = typia.createIs<AttwCoreExport>();
+
 async function loadAttwCore(): Promise<AttwCore> {
   const packageJson = fileURLToPath(import.meta.resolve('@arethetypeswrong/core/package.json'));
-  const core = await import(pathToFileURL(join(dirname(packageJson), 'dist', 'index.js')).href);
-  if (!isRecord(core)) {
+  const core: unknown = await import(pathToFileURL(join(dirname(packageJson), 'dist', 'index.js')).href);
+  if (!isAttwCoreExport(core)) {
     throw new Error('@arethetypeswrong/core does not expose the expected API');
   }
   const PackageConstructor = core.Package;
@@ -146,8 +167,8 @@ async function createAttwPackageFromTarball(attw: AttwCore, root: string, tarbal
 
 function createAttwPackageFromDirectory(attw: AttwCore, packageDir: string): unknown {
   const packageJson = readJsonFile(join(packageDir, 'package.json'));
-  const packageName = typeof packageJson.name === 'string' ? packageJson.name : null;
-  const packageVersion = typeof packageJson.version === 'string' ? packageJson.version : null;
+  const packageName = packageJson.name;
+  const packageVersion = packageJson.version;
   if (!packageName || !packageVersion) {
     throw new Error('packed package.json must contain name and version');
   }
@@ -172,16 +193,16 @@ function collectAttwFiles(root: string, current: string, packageName: string, fi
   }
 }
 
-function readJsonFile(path: string): Record<string, unknown> {
-  const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
-  if (!isRecord(parsed)) {
+function readJsonFile(path: string): PackageJson {
+  const parsed = parsePackageJsonText(readFileSync(path, 'utf8'));
+  if (!parsed) {
     throw new Error(`${path} is not a JSON object`);
   }
   return parsed;
 }
 
-function isReportedAttwProblem(problem: unknown): boolean {
-  if (!isRecord(problem) || typeof problem.kind !== 'string') {
+function isReportedAttwProblem(problem: unknown): problem is AttwProblem {
+  if (!isAttwProblem(problem)) {
     return false;
   }
   const flag = attwProblemFlag(problem.kind);
@@ -222,10 +243,7 @@ function attwProblemFlag(kind: string): string | null {
   }
 }
 
-function formatProblemLocation(problem: unknown): string {
-  if (!isRecord(problem)) {
-    return '';
-  }
+function formatProblemLocation(problem: AttwProblem): string {
   const entrypoint = typeof problem.entrypoint === 'string' ? ` ${problem.entrypoint}` : '';
   const resolution =
     typeof problem.resolutionKind === 'string' ? ` ${formatResolutionKind(problem.resolutionKind)}` : '';
@@ -242,8 +260,8 @@ function formatResolutionKind(kind: string): string {
   return kind;
 }
 
-function nonJsExportEntrypoints(exports: unknown): string[] {
-  if (!isRecord(exports)) {
+function nonJsExportEntrypoints(exports: PackageExports): string[] {
+  if (exports === null || exports === undefined || typeof exports === 'string') {
     return [];
   }
   return Object.entries(exports)
@@ -251,13 +269,16 @@ function nonJsExportEntrypoints(exports: unknown): string[] {
     .map(([key]) => key);
 }
 
-function exportPointsToNonJs(value: unknown): boolean {
+function exportPointsToNonJs(value: PackageExports): boolean {
   if (typeof value === 'string') {
     // attw resolves every entrypoint as a module; assets can never have types.
     // Existence of the target files is still validated by publint.
     return value.endsWith('.wasm') || value.endsWith('.css');
   }
-  return isRecord(value) && Object.values(value).some(exportPointsToNonJs);
+  if (value === null || value === undefined) {
+    return false;
+  }
+  return Object.values(value).some(exportPointsToNonJs);
 }
 
 async function packPackage(root: string, pkg: PackageInfo): Promise<{ path: string; arrayBuffer: ArrayBuffer }> {
