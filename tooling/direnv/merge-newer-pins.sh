@@ -4,9 +4,9 @@
 # Runtime version pins (nvfetcher overlay _sources/generated.{json,nix}) and the
 # devenv/flake lock (devenv.lock) frequently differ across branches or across a
 # mirror sync's `git am --3way`. Instead of stalling on a conflict, keep the
-# higher pin wholesale so the tree always converges to the newest runtime; the
-# next `devenv shell` then regenerates package.json engine/packageManager from
-# it (see monorepo/runtime.ts syncRootRuntimeVersions).
+# higher pin wholesale so the tree always converges to the newest runtime.
+# Repair package.json engine/packageManager pins explicitly with
+# `smoo monorepo init --runtime-only` when needed.
 #
 # Wired by `smoo` (managed .gitattributes -> merge=smoo-newer-pins, and
 # `git config merge.smoo-newer-pins.driver` installed by applyWorkspaceGitConfig).

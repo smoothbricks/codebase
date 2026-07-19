@@ -17,8 +17,8 @@ export async function applyWorkspaceGitConfig(root: string): Promise<void> {
   // Keep the newer runtime version pins on any merge (nvfetcher overlay +
   // devenv.lock) so a mirror sync's `git am --3way` never stalls on a version
   // conflict. Mapped by the managed .gitattributes (merge=smoo-newer-pins);
-  // implemented in tooling/direnv/merge-newer-pins.sh. The next `devenv shell`
-  // regenerates package.json fields from the resulting runtime.
+  // implemented in tooling/direnv/merge-newer-pins.sh. Runtime package.json
+  // pin repair is explicit via `smoo monorepo init --runtime-only`.
   await $`git config --local merge.smoo-newer-pins.name ${'keep the newer devenv/nvfetcher runtime pins'}`.cwd(root);
   await $`git config --local merge.smoo-newer-pins.driver ${'bash tooling/direnv/merge-newer-pins.sh %O %A %B %P'}`.cwd(
     root,
