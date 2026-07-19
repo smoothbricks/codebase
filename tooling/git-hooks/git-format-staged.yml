@@ -9,12 +9,16 @@ formatters:
       - '*.astro'
       - '!.*' # Exclude hidden files
 
-  # Biome for JS/TS/JSX/TSX/JSON/HTML/CSS/GraphQL files
+  # Biome for JS/TS family (including CommonJS/CTS and ESM .mjs/.mts)
   biome:
     command: "biome check --files-ignore-unknown=true --use-editorconfig=true '--stdin-file-path={}' --fix"
     patterns:
       - '*.js'
+      - '*.cjs'
+      - '*.mjs'
       - '*.ts'
+      - '*.cts'
+      - '*.mts'
       - '*.jsx'
       - '*.tsx'
       - '*.json'
@@ -31,7 +35,11 @@ formatters:
       - '*'
       # Exclude files handled by Biome
       - '!*.js'
+      - '!*.cjs'
+      - '!*.mjs'
       - '!*.ts'
+      - '!*.cts'
+      - '!*.mts'
       - '!*.jsx'
       - '!*.tsx'
       - '!*.json'
