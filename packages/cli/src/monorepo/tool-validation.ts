@@ -3,9 +3,9 @@ import { dirname, join } from 'node:path';
 import typia from 'typia';
 import { cliPackageVersion, isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
 import {
-  ensureStringMap,
+  ensureDependencyMap,
   readJsonObject,
-  setOptionalStringField,
+  setPackageStringField,
   setStringProperty,
   writeJsonObject,
 } from '../lib/json.js';
@@ -94,7 +94,7 @@ export async function applyRootDevDependencyDefaults(root: string, context: Tool
     return;
   }
   let changed = false;
-  const devDependencies = ensureStringMap(pkg, 'devDependencies');
+  const devDependencies = ensureDependencyMap(pkg, 'devDependencies');
   for (const dependency of rootDevDependencies) {
     const current = devDependencies[dependency.name];
     if (typeof current !== 'string' || !satisfiesDependencyPolicy(context.policy, current, dependency)) {
@@ -120,7 +120,7 @@ async function applyRootPackageToolDefaults(root: string, context: ToolContext):
   }
   let dependencyChanged = false;
   let workspaceChanged = false;
-  const devDependencies = ensureStringMap(pkg, 'devDependencies');
+  const devDependencies = ensureDependencyMap(pkg, 'devDependencies');
   for (const dependency of rootDevDependencies) {
     const current = devDependencies[dependency.name];
     if (typeof current !== 'string' || !satisfiesDependencyPolicy(context.policy, current, dependency)) {
@@ -151,12 +151,12 @@ export function applyToolingPackageDefaults(root: string, policy: ToolPolicy): v
   const path = join(root, 'tooling', 'package.json');
   const pkg = readJsonObject(path) ?? { name: policy.toolingPackageName, private: true, dependencies: {} };
   let changed = false;
-  changed = setOptionalStringField(pkg, 'name', policy.toolingPackageName) || changed;
+  changed = setPackageStringField(pkg, 'name', policy.toolingPackageName) || changed;
   if (pkg.private !== true) {
     pkg.private = true;
     changed = true;
   }
-  const dependencies = ensureStringMap(pkg, 'dependencies');
+  const dependencies = ensureDependencyMap(pkg, 'dependencies');
   changed = setStringProperty(dependencies, cliPackageName, policy.cliDependencyRange) || changed;
   if (changed || !existsSync(path)) {
     mkdirSync(dirname(path), { recursive: true });

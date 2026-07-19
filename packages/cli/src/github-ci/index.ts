@@ -3,6 +3,7 @@ import { appendFile, mkdtemp, realpath, rename, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { $ } from 'bun';
 import typia from 'typia';
+import { parseStringArrayText } from '../lib/json.js';
 import { decode, run, runStatus } from '../lib/run.js';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 import type { NxTargetRun } from './outputs.js';
@@ -13,7 +14,16 @@ interface GithubActionsEventPayload {
   };
 }
 
+interface NxProjectDeployConfigurations {
+  targets?: {
+    deploy?: {
+      configurations?: Record<string, unknown>;
+    };
+  };
+}
+
 const parseGithubActionsEvent = typia.json.createIsParse<GithubActionsEventPayload>();
+const parseNxProjectDeployConfigurations = typia.json.createIsParse<NxProjectDeployConfigurations>();
 
 type NxSmartMode = 'auto' | 'affected' | 'run-many';
 
@@ -399,24 +409,12 @@ async function deployProjectsWithConfiguration(
 
 async function deployTargetHasConfiguration(root: string, project: string, configuration: string): Promise<boolean> {
   const result = await $`nx show project ${project} --json`.cwd(root).quiet();
-  const parsed: unknown = JSON.parse(decode(result.stdout));
-  const targets = recordValue(parsed)?.targets;
-  const deploy = recordValue(targets)?.deploy;
-  const configurations = recordValue(deploy)?.configurations;
-  return recordValue(configurations)?.[configuration] !== undefined;
+  const parsed = parseNxProjectDeployConfigurations(decode(result.stdout));
+  return parsed?.targets?.deploy?.configurations?.[configuration] !== undefined;
 }
 
 function nxProjectList(output: string): string[] {
-  const parsed: unknown = JSON.parse(output);
-  return Array.isArray(parsed) ? parsed.filter((project): project is string => typeof project === 'string') : [];
-}
-
-function recordValue(value: unknown): Record<string, unknown> | undefined {
-  return isRecord(value) ? value : undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
+  return parseStringArrayText(output) ?? [];
 }
 
 async function createGithubStatus(name: string, step: string): Promise<void> {
