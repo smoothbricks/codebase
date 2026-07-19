@@ -54,6 +54,11 @@ try {
     process.exit(0);
   }
 
+  // Bun resolves @smoothbricks/cli monorepo entrypoints to TypeScript source
+  // (`"bun": "./src/..."`). Those modules use Typia, so register the ttsc
+  // transform preload before importing them.
+  await import('@smoothbricks/validation/bun/preload');
+
   if (!process.env.CI) {
     const { syncRootRuntimeVersions } = await import('@smoothbricks/cli/monorepo/runtime');
     await syncRootRuntimeVersions(projectRoot);
