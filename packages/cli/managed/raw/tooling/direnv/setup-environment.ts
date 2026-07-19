@@ -1,12 +1,11 @@
 #!/usr/bin/env bun
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync, readlinkSync, rmSync, symlinkSync } from 'node:fs';
 import { mkdir, rmdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { $ } from 'bun';
 
 const devenvRoot = process.env.DEVENV_ROOT;
 const projectRoot = path.resolve(`${devenvRoot}/../..`);
-const startedWithoutNodeModules = !existsSync(path.join(projectRoot, 'node_modules'));
 
 // A legitimate concurrent setup finishes well within this; anything older is a
 // leftover from an interrupted run (CTRL-C/kill before the finally-cleanup) and
@@ -30,7 +29,9 @@ class CapturedCommandError extends Error {
 process.chdir(projectRoot);
 
 try {
-  // Install dependencies first so node_modules/.bin tools are available
+  // Bootstrap only: install deps + wire local git hooks/config.
+  // Do not import workspace packages here — this script is what installs them,
+  // and package resolution/Typia transforms are not available yet.
   if (process.env.CI) {
     try {
       await runSetupCommand('bun install --frozen-lockfile', $`bun install --frozen-lockfile`, { quiet: false });
@@ -46,25 +47,6 @@ try {
     await installLocalDependencies();
   }
 
-  // Bun selects its resolver mode at process startup. If this process started
-  // before node_modules existed, imports below can stay in auto-install mode
-  // even after bun install succeeds, so restart once into the real workspace.
-  if (startedWithoutNodeModules) {
-    await runSetupCommand('restart setup-environment.ts', $`bun --no-install ${import.meta.path}`, { quiet: false });
-    process.exit(0);
-  }
-
-  // Bun resolves @smoothbricks/cli monorepo entrypoints to TypeScript source
-  // (`"bun": "./src/..."`). Those modules use Typia, so register the ttsc
-  // transform preload before importing them.
-  await import('@smoothbricks/validation/bun/preload');
-
-  if (!process.env.CI) {
-    const { syncRootRuntimeVersions } = await import('@smoothbricks/cli/monorepo/runtime');
-    await syncRootRuntimeVersions(projectRoot);
-  }
-
-  const { applyWorkspaceGitConfig } = await import('@smoothbricks/cli/monorepo/git-config');
   await applyWorkspaceGitConfig(projectRoot);
 } catch (error) {
   if (error instanceof CapturedCommandError) {
@@ -85,6 +67,59 @@ async function installLocalDependencies(): Promise<void> {
   await withSetupLock(async () => {
     await runSetupCommand('bun install --no-summary', $`bun install --no-summary`);
   });
+}
+
+/**
+ * Keep git hook wiring local to bootstrap. Runtime pin sync
+ * (`syncRootRuntimeVersions`) belongs to explicit monorepo tooling after the
+ * package graph exists — not the installer.
+ */
+async function applyWorkspaceGitConfig(root: string): Promise<void> {
+  const gitDirResult = await $`git rev-parse --git-dir`.cwd(root).quiet().nothrow();
+  if (gitDirResult.exitCode !== 0) {
+    throw new Error('Not in a git repository');
+  }
+
+  const gitDir = path.resolve(root, new TextDecoder().decode(gitDirResult.stdout).trim());
+  const tooling = path.join(root, 'tooling');
+
+  await $`git config --local include.path ${path.join(tooling, 'workspace.gitconfig')}`.cwd(root);
+
+  // Keep the newer runtime version pins on any merge (nvfetcher overlay +
+  // devenv.lock) so a mirror sync's `git am --3way` never stalls on a version
+  // conflict. Mapped by the managed .gitattributes (merge=smoo-newer-pins);
+  // implemented in tooling/direnv/merge-newer-pins.sh.
+  await $`git config --local merge.smoo-newer-pins.name ${'keep the newer devenv/nvfetcher runtime pins'}`.cwd(root);
+  await $`git config --local merge.smoo-newer-pins.driver ${'bash tooling/direnv/merge-newer-pins.sh %O %A %B %P'}`.cwd(
+    root,
+  );
+  linkHook(gitDir, tooling, 'pre-commit');
+  linkHook(gitDir, tooling, 'commit-msg');
+}
+
+function linkHook(gitDir: string, tooling: string, name: string): void {
+  const source = path.join(tooling, 'git-hooks', `${name}.sh`);
+  if (!existsSync(source)) {
+    throw new Error(`Missing ${name} hook source: ${source}`);
+  }
+
+  const target = path.join(gitDir, 'hooks', name);
+  if (readLinkOrNull(target) === source) {
+    return;
+  }
+
+  console.log(`[!] Linking ${name} hook in ${gitDir}`);
+  mkdirSync(path.dirname(target), { recursive: true });
+  rmSync(target, { force: true });
+  symlinkSync(source, target);
+}
+
+function readLinkOrNull(hookPath: string): string | null {
+  try {
+    return readlinkSync(hookPath);
+  } catch {
+    return null;
+  }
 }
 
 async function runSetupCommand(
