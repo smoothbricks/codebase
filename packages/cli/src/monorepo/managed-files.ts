@@ -418,7 +418,8 @@ function nxDeployTarget(root: string, project: string, configuration: string): D
   if (!config) {
     return { exists: false };
   }
-  const command = config.command ?? config.options?.command ?? deploy?.options?.command ?? '';
+  const commandValue = config.command ?? config.options?.command ?? deploy?.options?.command;
+  const command = typeof commandValue === 'string' ? commandValue : '';
   return { exists: true, provider: command.includes('wrangler ') ? 'cloudflare' : undefined };
 }
 
