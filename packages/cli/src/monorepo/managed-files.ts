@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
@@ -208,6 +208,11 @@ const managedFiles: ManagedFile[] = [
     source: 'publish-workflow',
     target: '.github/workflows/publish.yml',
     releasePackagesOnly: true,
+  },
+  {
+    kind: 'template',
+    source: 'github/workflows/managed-files.yml',
+    target: '.github/workflows/managed-files.yml',
   },
   {
     kind: 'template',
@@ -472,4 +477,34 @@ export function validateManagedFiles(root: string): number {
     console.error('Managed monorepo files are out of date. Run: smoo monorepo update');
   }
   return failures;
+}
+
+/**
+ * Non-blocking drift report: prints the per-file table and surfaces drift as
+ * GitHub Actions warning annotations (plain stderr elsewhere) without failing
+ * the run. Managed-file drift is derived state with its own remediation flow
+ * (the persistent managed-files PR); only `monorepo check` without --warn and
+ * PR-scoped gates treat it as an error.
+ *
+ * Under GitHub Actions the drifted-file count is published as the step output
+ * `drifted`, so downstream steps gate declaratively instead of parsing logs.
+ */
+export function warnOnManagedFileDrift(root: string): void {
+  const results = applyManagedFiles(root, 'check');
+  printResults(results);
+  const drifted = results.filter((result) => result.action === 'drifted');
+  if (process.env.GITHUB_OUTPUT) {
+    appendFileSync(process.env.GITHUB_OUTPUT, `drifted=${drifted.length}\n`);
+  }
+  if (drifted.length === 0) {
+    return;
+  }
+  if (process.env.GITHUB_ACTIONS === 'true') {
+    for (const result of drifted) {
+      console.log(
+        `::warning title=Managed file drift::${result.target} drifted from the @smoothbricks/cli template; run 'smoo monorepo update'`,
+      );
+    }
+  }
+  console.error(`${drifted.length} managed monorepo file(s) drifted (non-blocking). Run: smoo monorepo update`);
 }
