@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { appendFile, mkdtemp, realpath, rename, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { $ } from 'bun';
@@ -341,7 +341,31 @@ function resolveNxSmartMode(mode: NxSmartMode): 'affected' | 'run-many' {
   if (mode === 'affected' || mode === 'run-many') {
     return mode;
   }
-  return process.env.GITHUB_EVENT_NAME === 'push' && process.env.GITHUB_REF_NAME === 'main' ? 'run-many' : 'affected';
+  const defaultBranch = eventDefaultBranch() ?? 'main';
+  if (process.env.GITHUB_EVENT_NAME === 'push') {
+    return process.env.GITHUB_REF_NAME === defaultBranch ? 'run-many' : 'affected';
+  }
+  // A PR into a NON-default branch is an integration surface (e.g. a mirror-sync
+  // review branch): its base moves outside the default-branch workflow that
+  // affected scoping is calibrated against, so under-selection can pass PR CI
+  // and only fail after merge. Validate those PRs in full.
+  if (process.env.GITHUB_EVENT_NAME === 'pull_request') {
+    const base = process.env.GITHUB_BASE_REF;
+    return base && base !== defaultBranch ? 'run-many' : 'affected';
+  }
+  return 'affected';
+}
+
+/** The repository default branch from the Actions event payload. */
+function eventDefaultBranch(): string | undefined {
+  const eventPath = process.env.GITHUB_EVENT_PATH;
+  if (!eventPath) return undefined;
+  try {
+    const payload = JSON.parse(readFileSync(eventPath, 'utf8')) as { repository?: { default_branch?: string } };
+    return payload.repository?.default_branch || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function deployProjectsWithConfiguration(
