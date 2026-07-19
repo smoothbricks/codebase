@@ -11,7 +11,7 @@ runs:
       uses: actions/cache@v5.0.5
       with:
         # Only the compiled plugin binaries (~30MB each). Path is relative to the
-        # workspace; setup-devenv points TTSC_CACHE_DIR at $GITHUB_WORKSPACE/.cache/ttsc.
+        # workspace; devenv sets TTSC_CACHE_DIR to <repo>/.cache/ttsc.
         path: .cache/ttsc/plugins
         # prettier-ignore
         key: ${{ runner.os }}-${{ runner.arch }}-ttsc-plugins-v1-${{ hashFiles('bun.lock', 'package.json', 'patches/ttsc@*.patch', 'tooling/direnv/devenv.lock') }}
