@@ -1,12 +1,12 @@
 import { fileURLToPath } from 'node:url';
-import { readJsonObject, stringProperty } from './json.js';
+import { readJsonObject } from './json.js';
 
 export const smoothBricksCodebasePackageName = '@smoothbricks/codebase';
 export const cliPackageVersion = readCliPackageVersion();
 
 function readCliPackageVersion(): string {
   const pkg = readJsonObject(fileURLToPath(new URL('../../package.json', import.meta.url)));
-  const version = pkg ? stringProperty(pkg, 'version') : null;
+  const version = pkg?.version;
   if (!version) {
     throw new Error('Unable to read @smoothbricks/cli package version.');
   }

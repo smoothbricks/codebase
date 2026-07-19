@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import type { PackageJson } from '../lib/json.js';
 import { runtimeTypesRangeForPublishedVersions, validateRuntimePins } from './runtime.js';
 
 describe('runtimeTypesRangeForPublishedVersions', () => {
@@ -61,7 +62,7 @@ describe('validateRuntimePins', () => {
   });
 
   test('fails a missing @types/node pin', () => {
-    const pkg: Record<string, unknown> = aligned();
+    const pkg: PackageJson = aligned();
     pkg.devDependencies = {};
     expect(validateRuntimePins(pkg, runtime)).toBe(1);
   });

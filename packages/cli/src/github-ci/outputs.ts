@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto';
 import { createReadStream, type Dirent, type Stats } from 'node:fs';
 import { copyFile, lstat, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
-import { isRecord } from '@smoothbricks/validation';
 import typia from 'typia';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 
@@ -492,7 +491,7 @@ function assertGitSha(value: string, description: string): void {
 }
 
 function isMissingPathError(error: unknown): boolean {
-  return isRecord(error) && error.code === 'ENOENT';
+  return error instanceof Error && 'code' in error && error.code === 'ENOENT';
 }
 
 function sha256File(path: string): Promise<string> {
