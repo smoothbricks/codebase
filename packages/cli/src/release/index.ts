@@ -1,13 +1,23 @@
+import { existsSync, readFileSync } from 'node:fs';
 import { appendFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
 import { $ } from 'bun';
+import typia from 'typia';
 import { githubCiApplyOutputs, githubCiNxRunMany } from '../github-ci/index.js';
 import { assertNoConflictMarkers } from '../lib/conflict-markers.js';
 import { withDevenvEnv } from '../lib/devenv.js';
-import { isRecord, readJsonObject, stringProperty } from '../lib/json.js';
+import {
+  type NxJson,
+  type NxProjectJson,
+  type NxTargetConfig,
+  type PackageJson,
+  parseNxJsonText,
+  parseNxProjectJsonText,
+  parsePackageJsonText,
+} from '../lib/json.js';
 import { decode, run, runInteractiveStatus, runResult } from '../lib/run.js';
 import { listReleasePackages, readPackageJson, repositoryInfo } from '../lib/workspace.js';
 import { readPackedPackageJson, validatePackedWorkspaceDependencies } from '../monorepo/packed-manifest.js';
@@ -572,7 +582,7 @@ async function publishPlaceholderPackage(
           name: pkg.name,
           version: NPM_BOOTSTRAP_VERSION,
           description: `Bootstrap placeholder for ${pkg.name}. Real releases are published by SmoothBricks CI.`,
-          license: stringProperty(pkg.json, 'license') ?? 'UNLICENSED',
+          license: pkg.json.license ?? 'UNLICENSED',
           repository: pkg.json.repository,
           publishConfig: { access: 'public' },
         },
@@ -783,8 +793,7 @@ async function packageVersionAtRef(root: string, packagePath: string, ref: strin
     return null;
   }
   try {
-    const parsed = JSON.parse(decode(result.stdout));
-    return isRecord(parsed) ? stringProperty(parsed, 'version') : null;
+    return parsePackageJsonText(decode(result.stdout))?.version ?? null;
   } catch {
     return null;
   }
@@ -1264,74 +1273,79 @@ async function packageChangedFilesSince(root: string, ref: string, packagePath: 
     .map((path) => (path.startsWith(packagePrefix) ? path.slice(packagePrefix.length) : path));
 }
 
-async function packageJsonAtRef(
-  root: string,
-  ref: string,
-  packagePath: string,
-): Promise<Record<string, unknown> | null> {
+async function packageJsonAtRef(root: string, ref: string, packagePath: string): Promise<PackageJson | null> {
   const result = await $`git show ${`${ref}:${packagePath}/package.json`}`.cwd(root).quiet().nothrow();
   if (result.exitCode !== 0) {
     return null;
   }
   try {
-    const parsed = JSON.parse(decode(result.stdout));
-    return isRecord(parsed) ? parsed : null;
+    return parsePackageJsonText(decode(result.stdout));
   } catch {
     return null;
   }
 }
 
-async function currentPackageJson(root: string, packagePath: string): Promise<Record<string, unknown> | null> {
+async function currentPackageJson(root: string, packagePath: string): Promise<PackageJson | null> {
   return readPackageJson(join(root, packagePath, 'package.json'))?.json ?? null;
 }
 
 async function packageBuildInputPatterns(root: string, projectName: string, _packagePath: string): Promise<string[]> {
   const project = await nxProjectJson(root, projectName);
-  const nxJson = readJsonObject(join(root, 'nx.json')) ?? {};
-  return resolveBuildInputPatterns(project, nxJson);
+  return resolveBuildInputPatterns(project, readNxJson(join(root, 'nx.json')));
 }
 
-async function nxProjectJson(root: string, projectName: string): Promise<Record<string, unknown>> {
+async function nxProjectJson(root: string, projectName: string): Promise<NxProjectJson> {
   const result = await $`nx show project ${projectName} --json`.cwd(root).quiet();
-  const parsed = JSON.parse(decode(result.stdout));
-  if (!isRecord(parsed)) {
+  const parsed = parseNxProjectJsonText(decode(result.stdout));
+  if (!parsed) {
     throw new Error(`Unable to inspect Nx project ${projectName}.`);
   }
   return parsed;
 }
 
-function resolveBuildInputPatterns(project: Record<string, unknown>, nxJson: Record<string, unknown>): string[] {
-  const targets = recordProperty(project, 'targets');
+function readNxJson(path: string): NxJson {
+  if (!existsSync(path)) {
+    return {};
+  }
+  try {
+    return parseNxJsonText(readFileSync(path, 'utf8')) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+function resolveBuildInputPatterns(project: NxProjectJson, nxJson: NxJson): string[] {
+  const targets = project.targets;
   if (!targets) {
     return [];
   }
   return normalizeInputPatterns(collectBuildInputs(targets), nxJson);
 }
 
-function collectBuildInputs(targets: Record<string, unknown>): string[] {
-  const build = recordProperty(targets, 'build');
+function collectBuildInputs(targets: Record<string, NxTargetConfig>): string[] {
+  const build = targets.build;
   if (!build) {
     return ['production'];
   }
-  const directInputs = stringArrayProperty(build, 'inputs');
+  const directInputs = build.inputs ?? [];
   if (directInputs.length > 0) {
     return directInputs;
   }
   const inputs: string[] = [];
-  for (const dependency of stringArrayProperty(build, 'dependsOn')) {
-    if (dependency.startsWith('^')) {
+  for (const dependency of build.dependsOn ?? []) {
+    if (typeof dependency !== 'string' || dependency.startsWith('^')) {
       continue;
     }
     const targetName = dependency.includes(':') ? dependency.split(':')[1] : dependency;
     if (!targetName) {
       continue;
     }
-    inputs.push(...stringArrayProperty(recordProperty(targets, targetName), 'inputs'));
+    inputs.push(...(targets[targetName]?.inputs ?? []));
   }
   return inputs.length > 0 ? inputs : ['production'];
 }
 
-function normalizeInputPatterns(inputs: string[], nxJson: Record<string, unknown>): string[] {
+function normalizeInputPatterns(inputs: string[], nxJson: NxJson): string[] {
   const patterns: string[] = [];
   const seen = new Set<string>();
   for (const input of inputs) {
@@ -1342,14 +1356,13 @@ function normalizeInputPatterns(inputs: string[], nxJson: Record<string, unknown
   return patterns;
 }
 
-function expandInputPattern(input: string, nxJson: Record<string, unknown>, seen: Set<string>): string[] {
+function expandInputPattern(input: string, nxJson: NxJson, seen: Set<string>): string[] {
   if (seen.has(input)) {
     return [];
   }
   seen.add(input);
   if (!input.includes('{')) {
-    const namedInputs = recordProperty(nxJson, 'namedInputs');
-    const namedInput = namedInputs?.[input];
+    const namedInput = nxJson.namedInputs?.[input];
     if (Array.isArray(namedInput)) {
       return namedInput.flatMap((entry) => (typeof entry === 'string' ? expandInputPattern(entry, nxJson, seen) : []));
     }
@@ -1362,19 +1375,6 @@ function expandInputPattern(input: string, nxJson: Record<string, unknown>, seen
   }
   const packageRelative = rawInput.slice('{projectRoot}/'.length);
   return [`${excluded ? '!' : ''}${packageRelative}`];
-}
-
-function recordProperty(record: Record<string, unknown> | null, key: string): Record<string, unknown> | null {
-  if (!record) {
-    return null;
-  }
-  const value = record[key];
-  return isRecord(value) ? value : null;
-}
-
-function stringArrayProperty(record: Record<string, unknown> | null, key: string): string[] {
-  const value = record?.[key];
-  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
 }
 
 async function packageHasHistory(root: string, packagePath: string): Promise<boolean> {
@@ -1665,35 +1665,30 @@ export function parseTrustedPublishers(stdout: string, packageName: string): Tru
   if (stdout.trim().length === 0) {
     return [];
   }
-  const parsed = JSON.parse(stdout) as unknown;
+  // createIsParse returns null for non-matching shapes and bare `null`.
+  const parsed = parseTrustedPublisherJson(stdout);
   if (parsed === null) {
-    return [];
+    if (stdout.trim() === 'null') {
+      return [];
+    }
+    throw new Error(`${packageName}: npm trust list returned invalid trusted publisher JSON.`);
   }
-  if (Array.isArray(parsed)) {
-    return parsed.map((value) => parseTrustedPublisher(value, packageName));
-  }
-  if (isRecord(parsed)) {
-    return [parseTrustedPublisher(parsed, packageName)];
-  }
-  throw new Error(`${packageName}: npm trust list returned invalid JSON.`);
+  return (Array.isArray(parsed) ? parsed : [parsed]).map((value) => ({
+    id: value.id,
+    type: value.type,
+    file: value.file,
+    repository: value.repository,
+  }));
 }
 
-function parseTrustedPublisher(value: unknown, packageName: string): TrustedPublisher {
-  if (!isRecord(value)) {
-    throw new Error(`${packageName}: npm trust list returned invalid trusted publisher entry.`);
-  }
-  const id = stringProperty(value, 'id');
-  const type = stringProperty(value, 'type');
-  if (!id || !type) {
-    throw new Error(`${packageName}: npm trust list returned a trusted publisher without id or type.`);
-  }
-  return {
-    id,
-    type,
-    file: stringProperty(value, 'file') ?? undefined,
-    repository: stringProperty(value, 'repository') ?? undefined,
-  };
+interface TrustedPublisherJson {
+  id: string;
+  type: string;
+  file?: string;
+  repository?: string;
 }
+
+const parseTrustedPublisherJson = typia.json.createIsParse<TrustedPublisherJson | TrustedPublisherJson[]>();
 
 async function runLatestNpmPublish(root: string, npmArgs: string[]): Promise<void> {
   await runLatestNpm(root, npmArgs, { NODE_AUTH_TOKEN: '', NPM_TOKEN: '' });

@@ -2,7 +2,8 @@ import { describe, expect, it } from 'bun:test';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { $ } from 'bun';
-import { isRecord } from '../../lib/json.js';
+import type { PackageJson } from '../../lib/json.js';
+import { parsePackageJsonText } from '../../lib/json.js';
 import { type AutoReleaseCandidateShell, autoReleaseCandidatePackages } from '../candidates.js';
 import type { ReleasePackageInfo } from '../core.js';
 import { git, tag, withFixtureRepo, writePackage } from './helpers/fixture-repo.js';
@@ -309,9 +310,9 @@ function gitCandidateShell(
   };
 }
 
-function parseJsonObject(text: string): Record<string, unknown> {
-  const parsed = JSON.parse(text);
-  if (!isRecord(parsed)) {
+function parseJsonObject(text: string): PackageJson {
+  const parsed = parsePackageJsonText(text);
+  if (!parsed) {
     throw new Error('expected JSON object');
   }
   return parsed;

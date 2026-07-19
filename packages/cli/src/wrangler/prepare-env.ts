@@ -20,12 +20,49 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { $ } from 'bun';
 import { type AST, getStaticTOMLValue, parseTOML } from 'toml-eslint-parser';
+import typia from 'typia';
 
-// ── runtime narrowing (wrangler JSON is external data — no casts) ─────────────
+// ── runtime narrowing (wrangler TOML/JSON is external data — no casts) ───────
 
-export function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
+interface WranglerTomlRoot {
+  env?: Record<string, WranglerEnvBlock | undefined>;
 }
+
+interface WranglerEnvBlock {
+  vars?: Record<string, unknown>;
+  kv_namespaces?: WranglerKvRow[];
+  d1_databases?: WranglerD1Row[];
+  [key: string]: unknown;
+}
+
+interface WranglerKvRow {
+  binding?: string;
+  id?: string;
+}
+
+interface WranglerD1Row {
+  binding?: string;
+  database_id?: string;
+  database_name?: string;
+}
+
+interface WranglerSecretRow {
+  name?: string;
+}
+
+interface ShellErrorShape {
+  stderr?: unknown;
+  exitCode?: unknown;
+}
+
+const isWranglerTomlRoot = typia.createIs<WranglerTomlRoot>();
+const isWranglerEnvBlock = typia.createIs<WranglerEnvBlock>();
+const isWranglerKvRow = typia.createIs<WranglerKvRow>();
+const isWranglerD1Row = typia.createIs<WranglerD1Row>();
+const isWranglerSecretRow = typia.createIs<WranglerSecretRow>();
+const isKvNamespaceRow = typia.createIs<{ id: string; title: string }>();
+const isD1DatabaseRow = typia.createIs<{ uuid: string; name: string }>();
+const isShellErrorShape = typia.createIs<ShellErrorShape>();
 
 // ── wrangler.toml editors (CST: read via getStaticTOMLValue, write via
 // node-range splice — comment/format-preserving by construction, no regex) ─────
@@ -36,15 +73,14 @@ function tables(toml: string): AST.TOMLTable[] {
 }
 
 /** Whole doc as a JS object (comments/format dropped — reads only). */
-function tomlValue(toml: string): Record<string, unknown> {
-  const value = getStaticTOMLValue(parseTOML(toml));
-  return isRecord(value) ? value : {};
+function tomlValue(toml: string): WranglerTomlRoot {
+  const value: unknown = getStaticTOMLValue(parseTOML(toml));
+  return isWranglerTomlRoot(value) ? value : {};
 }
 
-function envRecord(toml: string, env: string): Record<string, unknown> | null {
-  const envs = tomlValue(toml).env;
-  const block = isRecord(envs) ? envs[env] : undefined;
-  return isRecord(block) ? block : null;
+function envRecord(toml: string, env: string): WranglerEnvBlock | null {
+  const block = tomlValue(toml).env?.[env];
+  return isWranglerEnvBlock(block) ? block : null;
 }
 
 function sameKey(a: (string | number)[], b: (string | number)[]): boolean {
@@ -68,8 +104,12 @@ function arrayTableKv(
   field: string,
 ): AST.TOMLKeyValue | null {
   const block = envRecord(toml, env);
-  const rows = isRecord(block) && Array.isArray(block[arrayKey]) ? block[arrayKey] : [];
-  const index = rows.findIndex((r) => isRecord(r) && r.binding === binding);
+  const rows = Array.isArray(block?.[arrayKey]) ? (block[arrayKey] as unknown[]) : [];
+  const index = rows.findIndex(
+    (r) =>
+      (arrayKey === 'd1_databases' ? isWranglerD1Row(r) : isWranglerKvRow(r)) &&
+      (r as WranglerKvRow | WranglerD1Row).binding === binding,
+  );
   if (index < 0) return null;
   const table = tables(toml).find((t) => t.kind === 'array' && sameKey(t.resolvedKey, ['env', env, arrayKey, index]));
   return table ? kvIn(toml, table, field) : null;
@@ -88,7 +128,7 @@ function endOfLine(toml: string, offset: number): number {
 /** First `[env.<name>]` (source order; also derived from a nested `[env.<name>.*]`), or null when no env declared. */
 export function firstWranglerEnv(toml: string): string | null {
   const envs = tomlValue(toml).env;
-  if (!isRecord(envs)) return null;
+  if (!envs) return null;
   const [first] = Object.keys(envs);
   return first ?? null;
 }
@@ -96,14 +136,12 @@ export function firstWranglerEnv(toml: string): string | null {
 /** True if the toml declares `[env.<env>]` (or any `[env.<env>.*]` sub-table). */
 export function hasEnvBlock(toml: string, env: string): boolean {
   const envs = tomlValue(toml).env;
-  return isRecord(envs) && env in envs;
+  return !!envs && env in envs;
 }
 
 /** A `[env.<env>.vars]` value, or null if unset/empty. Reads committed public config. */
 export function getVar(toml: string, env: string, name: string): string | null {
-  const block = envRecord(toml, env);
-  const vars = isRecord(block?.vars) ? block.vars : {};
-  const value = vars[name];
+  const value = envRecord(toml, env)?.vars?.[name];
   return typeof value === 'string' && value ? value : null;
 }
 
@@ -117,10 +155,8 @@ export function setVar(toml: string, env: string, name: string, value: string): 
 
 /** The id written for `[[env.<env>.kv_namespaces]]` binding, or null if absent/empty. */
 export function getKvId(toml: string, env: string, binding: string): string | null {
-  const block = envRecord(toml, env);
-  const rows = isRecord(block) && Array.isArray(block.kv_namespaces) ? block.kv_namespaces : [];
-  for (const row of rows) {
-    if (isRecord(row) && row.binding === binding && typeof row.id === 'string') return row.id || null;
+  for (const row of envRecord(toml, env)?.kv_namespaces ?? []) {
+    if (row.binding === binding && typeof row.id === 'string') return row.id || null;
   }
   return null;
 }
@@ -166,21 +202,16 @@ export function blankKvIds(toml: string, env: string): string {
 
 /** The database_id written for `[[env.<env>.d1_databases]]` binding, or null if absent/empty. */
 export function getD1Id(toml: string, env: string, binding: string): string | null {
-  const block = envRecord(toml, env);
-  const rows = isRecord(block) && Array.isArray(block.d1_databases) ? block.d1_databases : [];
-  for (const row of rows) {
-    if (isRecord(row) && row.binding === binding && typeof row.database_id === 'string') return row.database_id || null;
+  for (const row of envRecord(toml, env)?.d1_databases ?? []) {
+    if (row.binding === binding && typeof row.database_id === 'string') return row.database_id || null;
   }
   return null;
 }
 
 /** The `database_name` for `[[env.<env>.d1_databases]]` binding, or null. Source of truth for which DB to create/reuse. */
 export function getD1Name(toml: string, env: string, binding: string): string | null {
-  const block = envRecord(toml, env);
-  const rows = isRecord(block) && Array.isArray(block.d1_databases) ? block.d1_databases : [];
-  for (const row of rows) {
-    if (isRecord(row) && row.binding === binding && typeof row.database_name === 'string')
-      return row.database_name || null;
+  for (const row of envRecord(toml, env)?.d1_databases ?? []) {
+    if (row.binding === binding && typeof row.database_name === 'string') return row.database_name || null;
   }
   return null;
 }
@@ -260,12 +291,13 @@ export function parseDevVarsExample(text: string): string[] {
 export function readManifest(root: string, env: string): Manifest {
   const toml = readFileSync(join(root, 'wrangler.toml'), 'utf8');
   const block = envRecord(toml, env);
-  const varsRec = isRecord(block?.vars) ? block.vars : {};
-  const vars = Object.keys(varsRec);
-  const kvRows = isRecord(block) && Array.isArray(block.kv_namespaces) ? block.kv_namespaces : [];
-  const kvBindings = kvRows.flatMap((row) => (isRecord(row) && typeof row.binding === 'string' ? [row.binding] : []));
-  const d1Rows = isRecord(block) && Array.isArray(block.d1_databases) ? block.d1_databases : [];
-  const d1Bindings = d1Rows.flatMap((row) => (isRecord(row) && typeof row.binding === 'string' ? [row.binding] : []));
+  const vars = Object.keys(block?.vars ?? {});
+  const kvBindings = (block?.kv_namespaces ?? []).flatMap((row) =>
+    typeof row.binding === 'string' ? [row.binding] : [],
+  );
+  const d1Bindings = (block?.d1_databases ?? []).flatMap((row) =>
+    typeof row.binding === 'string' ? [row.binding] : [],
+  );
   const examplePath = join(root, '.dev.vars.example');
   const secrets = existsSync(examplePath) ? parseDevVarsExample(readFileSync(examplePath, 'utf8')) : [];
   return { kvBindings, d1Bindings, vars, secrets };
@@ -300,25 +332,19 @@ export interface KvNamespace {
 
 function asKvNamespaces(json: unknown): KvNamespace[] {
   if (!Array.isArray(json)) return [];
-  const out: KvNamespace[] = [];
-  for (const row of json) {
-    if (isRecord(row) && typeof row.id === 'string' && typeof row.title === 'string') {
-      out.push({ id: row.id, title: row.title });
-    }
-  }
-  return out;
+  return json.filter(isKvNamespaceRow);
 }
 
 function asSecretNames(json: unknown): string[] {
   if (!Array.isArray(json)) return [];
-  return json.flatMap((row) => (isRecord(row) && typeof row.name === 'string' ? [row.name] : []));
+  return json.flatMap((row) => (isWranglerSecretRow(row) && typeof row.name === 'string' ? [row.name] : []));
 }
 
 /** Best-effort ERROR line from a Bun ShellError (thrown on non-zero exit). */
 export function errText(err: unknown): string {
-  if (!isRecord(err)) return 'unknown error';
-  const stderr = 'stderr' in err && err.stderr != null ? String(err.stderr) : '';
-  const exit = 'exitCode' in err ? String(err.exitCode) : '?';
+  if (!isShellErrorShape(err)) return 'unknown error';
+  const stderr = err.stderr != null ? String(err.stderr) : '';
+  const exit = err.exitCode != null ? String(err.exitCode) : '?';
   return stderr.split('\n').find((l) => l.includes('ERROR')) ?? `exit ${exit}`;
 }
 
@@ -358,13 +384,7 @@ export interface D1Database {
 
 function asD1Databases(json: unknown): D1Database[] {
   if (!Array.isArray(json)) return [];
-  const out: D1Database[] = [];
-  for (const row of json) {
-    if (isRecord(row) && typeof row.uuid === 'string' && typeof row.name === 'string') {
-      out.push({ uuid: row.uuid, name: row.name });
-    }
-  }
-  return out;
+  return json.filter(isD1DatabaseRow);
 }
 
 /** Live D1 databases on the account (`d1 list --json`); `[]` when offline/unauthenticated. */
