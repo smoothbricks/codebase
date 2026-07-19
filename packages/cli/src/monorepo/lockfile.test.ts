@@ -24,6 +24,7 @@ function git(root: string, args: string): string {
 interface FixtureOptions {
   packageVersion: string;
   lockVersion: string;
+  stableTag?: string;
 }
 
 function makeFixtureRepo(options: FixtureOptions): string {
@@ -38,6 +39,9 @@ function makeFixtureRepo(options: FixtureOptions): string {
   mkdirSync(join(root, 'packages', 'foo'), { recursive: true });
   writeFixturePackage(root, options.packageVersion);
   writeFixtureLock(root, options.lockVersion);
+  if (options.stableTag) {
+    git(root, `tag ${options.stableTag}`);
+  }
   return root;
 }
 
@@ -74,34 +78,50 @@ function lockVersionIn(root: string): string {
 }
 
 describe('bun.lock workspace version sync', () => {
-  it('a stale lockfile version fails validation against package.json', () => {
+  it('install validate requires lockfile ≡ package.json including -next', () => {
     const root = makeFixtureRepo({
       packageVersion: '0.1.3-next.0',
       lockVersion: '0.1.2',
+      stableTag: 'foo@0.1.2',
     });
     expect(validateBunLockfileVersions(root)).toBe(1);
   });
 
-  it('sync restores the package.json version and validation passes', () => {
+  it('install mode sync restores package.json -next for frozen CI', () => {
     const root = makeFixtureRepo({
       packageVersion: '0.1.3-next.0',
       lockVersion: '0.1.2',
+      stableTag: 'foo@0.1.2',
     });
-    expect(syncBunLockfileVersions(root, { log: false })).toBe(1);
+    expect(syncBunLockfileVersions(root, { log: false, mode: 'install' })).toBe(1);
     expect(lockVersionIn(root)).toBe('0.1.3-next.0');
     expect(validateBunLockfileVersions(root)).toBe(0);
   });
 
-  it('a prerelease package keeps its manifest version in the lockfile', () => {
-    const root = makeFixtureRepo({ packageVersion: '0.2.0-next.0', lockVersion: '0.2.0-next.0' });
+  it('publish mode rewrites unpublished -next to last stable tag for pack', () => {
+    const root = makeFixtureRepo({
+      packageVersion: '0.1.3-next.0',
+      lockVersion: '0.1.3-next.0',
+      stableTag: 'foo@0.1.2',
+    });
+    // Install/CI is happy with -next matching package.json.
     expect(validateBunLockfileVersions(root)).toBe(0);
-    expect(syncBunLockfileVersions(root, { log: false })).toBe(0);
+    // Pre-publish rewrite embeds last stable for bun pm pack.
+    expect(syncBunLockfileVersions(root, { log: false, mode: 'publish' })).toBe(1);
+    expect(lockVersionIn(root)).toBe('0.1.2');
   });
 
-  it('a stable manifest version is required verbatim in the lockfile', () => {
+  it('never-published prerelease keeps package.json version in both modes', () => {
+    const root = makeFixtureRepo({ packageVersion: '0.2.0-next.0', lockVersion: '0.2.0-next.0' });
+    expect(validateBunLockfileVersions(root)).toBe(0);
+    expect(syncBunLockfileVersions(root, { log: false, mode: 'install' })).toBe(0);
+    expect(syncBunLockfileVersions(root, { log: false, mode: 'publish' })).toBe(0);
+  });
+
+  it('stable manifest version is required verbatim', () => {
     const root = makeFixtureRepo({ packageVersion: '0.1.0', lockVersion: '0.0.9' });
     expect(validateBunLockfileVersions(root)).toBe(1);
-    expect(syncBunLockfileVersions(root, { log: false })).toBe(1);
+    expect(syncBunLockfileVersions(root, { log: false, mode: 'install' })).toBe(1);
     expect(lockVersionIn(root)).toBe('0.1.0');
   });
 
@@ -109,27 +129,22 @@ describe('bun.lock workspace version sync', () => {
     const root = makeFixtureRepo({
       packageVersion: '0.1.3-next.0',
       lockVersion: '0.1.2',
+      stableTag: 'foo@0.1.2',
     });
-    expect(syncBunLockfileVersions(root, { log: false, stage: true })).toBe(1);
+    expect(syncBunLockfileVersions(root, { log: false, mode: 'install', stage: true })).toBe(1);
     expect(git(root, 'diff --cached --name-only')).toContain('bun.lock');
   });
 
-  it('stage: true leaves a clean lockfile unstaged', () => {
-    const root = makeFixtureRepo({ packageVersion: '0.1.2', lockVersion: '0.1.2' });
-    expect(syncBunLockfileVersions(root, { log: false, stage: true })).toBe(0);
-    expect(git(root, 'diff --cached --name-only').trim()).toBe('');
-  });
-
-  it('property: after sync, validation always passes', () => {
+  it('property: after install-mode sync, validation always passes', () => {
     const version = fc
       .tuple(fc.nat({ max: 20 }), fc.nat({ max: 20 }), fc.nat({ max: 20 }), fc.option(fc.nat({ max: 5 })))
       .map(([major, minor, patch, next]) => `${major}.${minor}.${patch}${next === null ? '' : `-next.${next}`}`);
-    const root = makeFixtureRepo({ packageVersion: '0.1.2', lockVersion: '0.1.2' });
+    const root = makeFixtureRepo({ packageVersion: '0.1.2', lockVersion: '0.1.2', stableTag: 'foo@0.1.2' });
     fc.assert(
       fc.property(version, version, (packageVersion, lockVersion) => {
         writeFixturePackage(root, packageVersion);
         writeFixtureLock(root, lockVersion);
-        syncBunLockfileVersions(root, { log: false });
+        syncBunLockfileVersions(root, { log: false, mode: 'install' });
         return validateBunLockfileVersions(root) === 0;
       }),
       { numRuns: 25 },
