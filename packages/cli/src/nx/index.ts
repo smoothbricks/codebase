@@ -142,10 +142,13 @@ function targetStringArraysFromNxProjectJson(
   for (const [targetName, target] of Object.entries(targets)) {
     const entries = target[property];
     if (Array.isArray(entries)) {
-      values.set(
-        targetName,
-        entries.filter((entry): entry is string => typeof entry === 'string'),
-      );
+      const strings: string[] = [];
+      for (const entry of entries) {
+        if (typeof entry === 'string') {
+          strings.push(entry);
+        }
+      }
+      values.set(targetName, strings);
     }
   }
   return values;

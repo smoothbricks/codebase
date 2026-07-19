@@ -79,7 +79,8 @@ const packs: MonorepoPack[] = [
     async fixPreBuild(ctx) {
       applyFixableMonorepoDefaults(ctx.root);
       await applyToolConfigDefaults(ctx.root);
-      syncBunLockfileVersions(ctx.root);
+      // Install/CI alignment only — do not rewrite -next to stable tags here.
+      syncBunLockfileVersions(ctx.root, { mode: 'install' });
       await fixNxSync(ctx.root, ctx.verbose === true);
       applyWorkspaceDependencyDefaults(ctx.root, { resolvedTargetsByProject: await readResolvedTargetsByProject(ctx) });
     },
