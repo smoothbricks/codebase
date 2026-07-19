@@ -1,4 +1,4 @@
-import { isRecord } from '../lib/json.js';
+import type { PackageJson } from '../lib/json.js';
 import type { ReleasePackageInfo } from './core.js';
 import { releaseTag } from './core.js';
 
@@ -6,8 +6,8 @@ export interface AutoReleaseCandidateShell {
   gitRefExists(ref: string): Promise<boolean>;
   latestStableReleaseRef(projectName: string): Promise<string | null>;
   packageChangedFilesSince(ref: string, packagePath: string): Promise<string[]>;
-  packageJsonAtRef(ref: string, packagePath: string): Promise<Record<string, unknown> | null>;
-  currentPackageJson(packagePath: string): Promise<Record<string, unknown> | null>;
+  packageJsonAtRef(ref: string, packagePath: string): Promise<PackageJson | null>;
+  currentPackageJson(packagePath: string): Promise<PackageJson | null>;
   packageBuildInputPatterns(projectName: string, packagePath: string): Promise<string[]>;
   packageHasHistory(packagePath: string): Promise<boolean>;
 }
@@ -104,23 +104,18 @@ async function packageHasReleasableChangesSince<Package extends ReleasePackageIn
   return false;
 }
 
-function releasableManifestChanged(
-  previousManifest: Record<string, unknown>,
-  currentManifest: Record<string, unknown>,
-): boolean {
+function releasableManifestChanged(previousManifest: PackageJson, currentManifest: PackageJson): boolean {
+  const previous = previousManifest as Record<string, unknown>;
+  const current = currentManifest as Record<string, unknown>;
   for (const key of releasableManifestKeys) {
-    if (!stableJsonEqual(previousManifest[key], currentManifest[key])) {
+    if (!stableJsonEqual(previous[key], current[key])) {
       return true;
     }
   }
   return false;
 }
 
-function isReleasablePackagePath(
-  path: string,
-  manifest: Record<string, unknown> | null,
-  buildInputPatterns: string[],
-): boolean {
+function isReleasablePackagePath(path: string, manifest: PackageJson | null, buildInputPatterns: string[]): boolean {
   return (
     isBuildInputPath(path, buildInputPatterns) || isPackageMetadataPath(path) || isManifestFilesPath(path, manifest)
   );
@@ -195,13 +190,13 @@ function isPackageMetadataPath(path: string): boolean {
   return /^(README|LICENSE|CHANGELOG)(\.|$)/.test(path);
 }
 
-function isManifestFilesPath(path: string, manifest: Record<string, unknown> | null): boolean {
+function isManifestFilesPath(path: string, manifest: PackageJson | null): boolean {
   const files = manifest?.files;
   if (!Array.isArray(files)) {
     return false;
   }
   for (const entry of files) {
-    if (typeof entry !== 'string' || entry.length === 0 || entry.startsWith('!')) {
+    if (entry.length === 0 || entry.startsWith('!')) {
       continue;
     }
     if (matchesManifestFilesEntry(path, entry)) {
@@ -227,10 +222,11 @@ function stableJson(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map(stableJson);
   }
-  if (isRecord(value)) {
+  if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
     const normalized: Record<string, unknown> = {};
-    for (const key of Object.keys(value).sort()) {
-      normalized[key] = stableJson(value[key]);
+    for (const key of Object.keys(record).sort()) {
+      normalized[key] = stableJson(record[key]);
     }
     return normalized;
   }
