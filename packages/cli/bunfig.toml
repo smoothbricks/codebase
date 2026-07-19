@@ -1,2 +1,2 @@
 [test]
-preload = ["@smoothbricks/validation/bun/preload"]
+preload = ["@smoothbricks/cli/bun/preload"]
