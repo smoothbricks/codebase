@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync, mkdirSync, readdirSync, readlinkSync, rmSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync } from 'node:fs';
 import { mkdir, rmdir, stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -98,8 +98,28 @@ function ensureTypeScriptApiPackage(root: string): void {
   assertTypescriptApiAt(path.join(root, 'node_modules', '.bun', 'node_modules', 'typescript'), apiPackageRoot);
 
   const nativeBin = path.join(root, 'node_modules', '@typescript', 'native', 'bin', 'tsc');
-  if (!existsSync(nativeBin)) {
-    throw new Error(`Missing ${nativeBin}. @typescript/native must remain the TypeScript 7 native compiler for ttsc.`);
+  const rootPackageJson = path.join(root, 'package.json');
+  const declaresNative =
+    existsSync(rootPackageJson) &&
+    (() => {
+      try {
+        const pkg = JSON.parse(readFileSync(rootPackageJson, 'utf8')) as {
+          devDependencies?: Record<string, string>;
+          dependencies?: Record<string, string>;
+        };
+        return (
+          typeof pkg.devDependencies?.['@typescript/native'] === 'string' ||
+          typeof pkg.dependencies?.['@typescript/native'] === 'string'
+        );
+      } catch {
+        return false;
+      }
+    })();
+  if (declaresNative && !existsSync(nativeBin)) {
+    throw new Error(
+      `Missing ${nativeBin}. package.json declares @typescript/native but it is not installed. ` +
+        'Run bun install (or direnv reload). @typescript/native is the TypeScript 7 native compiler for ttsc.',
+    );
   }
 }
 

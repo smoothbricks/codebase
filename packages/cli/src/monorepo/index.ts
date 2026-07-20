@@ -9,6 +9,7 @@ import { applyManagedFiles, printResults, warnOnManagedFileDrift } from './manag
 import { listValidCommitScopes, validatePublicTags } from './package-policy.js';
 import { runInitPacks, runValidatePacks } from './packs/index.js';
 import { syncRootRuntimeVersions } from './runtime.js';
+import { applyToolConfigDefaults } from './tool-validation.js';
 
 export interface InitOptions {
   runtimeOnly?: boolean;
@@ -74,8 +75,19 @@ export async function validateMonorepo(root: string, options: ValidateOptions = 
   }
 }
 
-export function updateManagedFiles(root: string): void {
+export async function updateManagedFiles(root: string): Promise<void> {
   printResults(applyManagedFiles(root, 'update'));
+  // Tool dependency policy (typescript API 6, @typescript/native for ttsc, nx, …)
+  // lives next to managed templates — update must install them, not only rewrite files.
+  await applyToolConfigDefaults(root);
+  syncBunLockfileVersions(root, { mode: 'install' });
+  console.log('installing     workspace dependencies (bun install)');
+  const install = await $`bun install --no-summary`.cwd(root).nothrow();
+  if (install.exitCode !== 0) {
+    const stderr = decode(install.stderr).trim();
+    const stdout = decode(install.stdout).trim();
+    throw new Error(`bun install failed after monorepo update${stderr || stdout ? `:\n${stderr || stdout}` : ''}`);
+  }
 }
 
 export function checkManagedFiles(root: string, options: { warn?: boolean } = {}): void {

@@ -59,7 +59,7 @@ function buildProgram(): Command {
     );
   monorepo.command('update').action(async () => {
     const { updateManagedFiles } = await import('./monorepo/index.js');
-    updateManagedFiles(await findRepoRoot());
+    await updateManagedFiles(await findRepoRoot());
   });
   monorepo
     .command('check')
