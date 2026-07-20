@@ -2,27 +2,10 @@
   "name": "@smoothbricks/typescript-api",
   "version": "6.0.3",
   "private": true,
-  "description": "Bun-safe TypeScript 6 compiler API for bare require(\"typescript\"). Avoids https://github.com/oven-sh/bun/issues/33834 (nested npm:typescript alias collapses onto @typescript/typescript6).",
+  "description": "Bun-safe TypeScript 6 compiler API for bare require(\"typescript\"). Avoids https://github.com/oven-sh/bun/issues/33834 (nested npm:typescript alias collapses onto @typescript/typescript6). Keep main/types only — nested package.json exports are ignored by Node and rejected by publint when shipped under packages/cli/managed.",
   "license": "MIT",
   "main": "./index.js",
   "types": "./index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./index.d.ts",
-      "default": "./index.js"
-    },
-    "./package.json": "./package.json",
-    "./lib/typescript": {
-      "types": "./index.d.ts",
-      "default": "./index.js"
-    },
-    "./lib/typescript.js": "./index.js",
-    "./lib/tsserverlibrary": {
-      "types": "./lib/tsserverlibrary.d.ts",
-      "default": "./lib/tsserverlibrary.js"
-    },
-    "./lib/tsserverlibrary.js": "./lib/tsserverlibrary.js"
-  },
   "dependencies": {
     "ts-compiler-api": "npm:typescript@6.0.3"
   }
