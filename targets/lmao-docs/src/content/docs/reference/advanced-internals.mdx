@@ -25,6 +25,25 @@ shipped implementation you pass to every tracer.
 | `toArrowTable(buffer)` | Convert a buffer (and children) to an Arrow table. |
 | `releaseBuffer(buffer)` | Free a buffer. |
 
+### WASM buffer strategy (experimental)
+
+`@smoothbricks/lmao/wasm` exports `WasmBufferStrategy`, a WebAssembly-backed `BufferStrategy` that keeps numeric columns
+in WASM memory instead of JS typed arrays. It's a drop-in alternative to `JsBufferStrategy` — build it with its async
+factory (WASM loading is asynchronous) and pass it to any tracer:
+
+```ts
+import { StdioTracer } from '@smoothbricks/lmao';
+import { createTraceRoot } from '@smoothbricks/lmao/node';
+import { WasmBufferStrategy } from '@smoothbricks/lmao/wasm';
+
+const bufferStrategy = await WasmBufferStrategy.create();
+const { trace } = new StdioTracer(opContext, { bufferStrategy, createTraceRoot });
+```
+
+It's **pre-1.0 and experimental** — `JsBufferStrategy` stays the default and is what the rest of these docs assume. The
+subpath also exposes the lower-level primitives it's built on (`createWasmAllocator` / `createWasmAllocatorSync`,
+`createWasmTraceRoot` / `createWasmTraceRootFactory`, `WasmTraceRoot`, `isWasmSpanBufferInstance`).
+
 ## Arrow conversion
 
 - `convertSpanTreeToArrowTable(rootBuffer)` — convert a root span and its children with shared dictionaries.
