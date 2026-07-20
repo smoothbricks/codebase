@@ -12,7 +12,7 @@ From the repository root:
 
 ```bash
 bun install
-bun run --cwd lmao-docs dev
+bun run --cwd targets/lmao-docs dev
 ```
 
 The dev server starts at http://localhost:4321.
