@@ -8,9 +8,10 @@ export interface SyncBunLockfileVersionsOptions {
   /** `git add` bun.lock when versions were resynced. */
   stage?: boolean;
   /**
-   * `install` (default for validation): lockfile must match package.json.
+   * `install` (default): lockfile must match package.json (including -next).
    * `publish`: rewrite unpublished prerelease package.json versions to the last
    * stable git tag so `bun pm pack` embeds installable dependency versions.
+   * Only use publish mode around pack; never leave the tree in publish mode.
    */
   mode?: 'install' | 'publish';
 }
@@ -34,7 +35,7 @@ export interface SyncBunLockfileVersionsOptions {
 // rewrites lockfile back to package.json and frozen CI then fails.
 export function syncBunLockfileVersions(root: string, options: SyncBunLockfileVersionsOptions = {}): number {
   const log = options.log ?? true;
-  const mode = options.mode ?? 'publish';
+  const mode = options.mode ?? 'install';
   const lockfilePath = join(root, 'bun.lock');
   if (!existsSync(lockfilePath)) {
     throw new Error('bun.lock not found');

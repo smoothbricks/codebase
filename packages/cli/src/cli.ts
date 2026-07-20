@@ -84,12 +84,12 @@ function buildProgram(): Command {
     .option('--stage', 'stage bun.lock when versions were resynced; quiet when clean')
     .option(
       '--mode <mode>',
-      'install: match package.json (CI); publish: map unpublished -next to last stable tag (pre-pack)',
-      'publish',
+      'install: match package.json (default, CI); publish: map unpublished -next to last stable tag (pre-pack only)',
+      'install',
     )
     .action(async (options: { stage?: boolean; mode?: 'install' | 'publish' }) => {
       const { syncBunLockfileVersions } = await import('./monorepo/index.js');
-      const mode = options.mode === 'install' ? 'install' : 'publish';
+      const mode = options.mode === 'publish' ? 'publish' : 'install';
       syncBunLockfileVersions(await findRepoRoot(), {
         mode,
         ...(options.stage ? { log: false, stage: true } : {}),
