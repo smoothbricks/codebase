@@ -59,6 +59,9 @@ const rootDevDependencies: RequiredDependency[] = [
   // Nx and typescript-eslint still load the TypeScript JS API (6.x).
   // Compilation is exclusively delegated to ttsc by the Nx plugin targets.
   { name: 'typescript', fallbackVersion: '^5.9.3', minimumVersion: '5.9.0', prefix: '^' },
+  // TS7 native compiler for ttsc (TTSC_TSGO_BINARY). Not the unscoped API package.
+  // npm alias form required — Bun cannot install @typescript/typescript6 cleanly (bun#33834).
+  { name: '@typescript/native', fallbackVersion: 'npm:typescript@^7.0.2' },
 ];
 
 const cliPackageName = '@smoothbricks/cli';
@@ -331,6 +334,10 @@ function satisfiesDependencyPolicy(policy: ToolPolicy, version: string, dependen
   if (workspaceDependencyExpected(policy, dependency)) {
     return version === 'workspace:*';
   }
+  // Dual-package native compiler: must stay an npm:typescript@7 alias, never unscoped "typescript".
+  if (dependency.name === '@typescript/native') {
+    return isTypeScriptNativeAlias(version);
+  }
   if (dependency.minimumVersion === undefined) {
     return version === dependency.fallbackVersion;
   }
@@ -342,9 +349,17 @@ function satisfiesDependencyPolicy(policy: ToolPolicy, version: string, dependen
   return compareVersions(parsed, minimum) >= 0;
 }
 
+function isTypeScriptNativeAlias(version: string): boolean {
+  // Accept npm:typescript@7, npm:typescript@^7.0.2, npm:typescript@~7.0.2, etc.
+  return /^npm:typescript@(?:\^|~)?7(?:\.|$)/.test(version.trim());
+}
+
 function formatExpectedDependency(policy: ToolPolicy, dependency: RequiredDependency): string {
   if (workspaceDependencyExpected(policy, dependency)) {
     return 'workspace:*';
+  }
+  if (dependency.name === '@typescript/native') {
+    return 'npm:typescript@^7 (TypeScript 7 native compiler alias for ttsc)';
   }
   return dependency.minimumVersion ? `>= ${dependency.minimumVersion}` : dependency.fallbackVersion;
 }
