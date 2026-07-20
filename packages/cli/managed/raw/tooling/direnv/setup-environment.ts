@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { existsSync, mkdirSync, readlinkSync, rmSync, symlinkSync } from 'node:fs';
 import { mkdir, rmdir, stat } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import { $ } from 'bun';
 
@@ -47,6 +48,12 @@ try {
     await installLocalDependencies();
   }
 
+  // Nx loads `require('typescript').readConfigFile`. The root
+  // `@typescript/native` alias is TypeScript 7 under a scoped name; if Bun ever
+  // hoists that package onto the unscoped `typescript` slot, the shell dies
+  // later with a cryptic graph error. Fail at install time instead.
+  assertTypeScriptApiPackage(projectRoot);
+
   await applyWorkspaceGitConfig(projectRoot);
 } catch (error) {
   if (error instanceof CapturedCommandError) {
@@ -67,6 +74,22 @@ async function installLocalDependencies(): Promise<void> {
   await withSetupLock(async () => {
     await runSetupCommand('bun install --no-summary', $`bun install --no-summary`);
   });
+}
+
+function assertTypeScriptApiPackage(root: string): void {
+  const requireFromRoot = createRequire(path.join(root, 'package.json'));
+  const typescriptEntry = requireFromRoot.resolve('typescript');
+  const typescriptModule = requireFromRoot(typescriptEntry) as {
+    version?: string;
+    readConfigFile?: unknown;
+  };
+  if (typeof typescriptModule.readConfigFile !== 'function') {
+    throw new Error(
+      'node_modules/typescript must export the TypeScript 6 compiler API (readConfigFile). ' +
+        `Resolved ${typescriptEntry} (version ${typescriptModule.version ?? 'unknown'}). ` +
+        'Keep typescript@^6.0.3 unscoped and TypeScript 7 only under @typescript/native.',
+    );
+  }
 }
 
 /**
