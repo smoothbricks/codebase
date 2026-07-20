@@ -13,6 +13,7 @@ import {
 const registryVersions: Record<string, string[]> = {
   '@biomejs/biome': ['2.3.5'],
   '@nx/js': ['23.1.0'],
+  '@smoothbricks/cli': ['0.10.3', '0.10.4'],
   '@smoothbricks/nx-plugin': ['0.3.0'],
   eslint: ['9.39.1'],
   'eslint-stdout': ['1.1.1', '1.1.2'],
@@ -22,6 +23,10 @@ const registryVersions: Record<string, string[]> = {
   typescript: ['5.9.3'],
   // alias package is not fetched from registry under this name when using fallback
   '@typescript/native': ['7.0.2'],
+};
+
+const registryLatestTags: Record<string, string> = {
+  '@smoothbricks/cli': '0.10.4',
 };
 
 const realFetch = globalThis.fetch;
@@ -60,9 +65,9 @@ describe('tool configuration validation', () => {
 `,
       );
 
-      expect(validateToolConfig(root)).toBeGreaterThan(0);
+      expect(await validateToolConfig(root)).toBeGreaterThan(0);
       await applyToolConfigDefaults(root);
-      expect(validateToolConfig(root)).toBe(0);
+      expect(await validateToolConfig(root)).toBe(0);
 
       const rootPackage = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
       const toolingPackage = JSON.parse(await readFile(join(root, 'tooling/package.json'), 'utf8'));
@@ -132,18 +137,17 @@ describe('tool configuration validation', () => {
 `,
       );
 
-      expect(validateToolConfig(root)).toBe(0);
+      expect(await validateToolConfig(root)).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it('preserves an installable CLI range when the running CLI is a linked prerelease', async () => {
+  it('bumps consumer CLI pin to npm latest even when the running CLI is a linked prerelease', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-tool-validation-'));
     try {
       const configuredRange = '^0.10.1';
-      const runningRange = await currentCliRange();
-      const expectedRange = runningRange.includes('-') ? configuredRange : runningRange;
+      const expectedRange = `^${registryLatestTags['@smoothbricks/cli']}`;
       await writeJson(join(root, 'package.json'), {
         name: '@fixture/app',
         version: '0.0.0',
@@ -156,7 +160,7 @@ describe('tool configuration validation', () => {
         dependencies: { '@smoothbricks/cli': configuredRange },
       });
 
-      const context = readToolContext(root);
+      const context = await readToolContext(root);
       expect(context.policy.cliDependencyRange).toBe(expectedRange);
       applyToolingPackageDefaults(root, context.policy);
 
@@ -176,7 +180,7 @@ describe('tool configuration validation', () => {
         private: true,
         workspaces: ['packages/*', 'tooling'],
       });
-      applyToolingPackageDefaults(root, readToolContext(root).policy);
+      applyToolingPackageDefaults(root, (await readToolContext(root)).policy);
 
       const toolingPackage = JSON.parse(await readFile(join(root, 'tooling/package.json'), 'utf8'));
       expect(toolingPackage.name).toBe('@smoothbricks/tooling');
@@ -205,7 +209,7 @@ describe('tool configuration validation', () => {
         },
       });
 
-      const context = readToolContext(root);
+      const context = await readToolContext(root);
       await applyRootDevDependencyDefaults(root, context);
       applyToolingPackageDefaults(root, context.policy);
 
@@ -223,8 +227,7 @@ describe('tool configuration validation', () => {
 });
 
 async function currentCliRange(): Promise<string> {
-  const pkg = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'));
-  return `^${pkg.version}`;
+  return `^${registryLatestTags['@smoothbricks/cli']}`;
 }
 
 async function currentEslintStdoutRange(): Promise<string> {
@@ -240,8 +243,15 @@ const mockRegistryFetch = Object.assign(
     if (!versions) {
       return Promise.resolve(new Response('{}', { status: 404 }));
     }
+    const body: Record<string, unknown> = {
+      versions: Object.fromEntries(versions.map((version) => [version, {}])),
+    };
+    const latest = registryLatestTags[packageName];
+    if (latest) {
+      body['dist-tags'] = { latest };
+    }
     return Promise.resolve(
-      new Response(JSON.stringify({ versions: Object.fromEntries(versions.map((version) => [version, {}])) }), {
+      new Response(JSON.stringify(body), {
         status: 200,
         headers: { 'content-type': 'application/json' },
       }),
