@@ -15,7 +15,7 @@ const projectRoot = path.resolve(`${devenvRoot}/../..`);
 // are not hoisted, and the lock loop runs during that block.
 const STALE_LOCK_MS = 10 * 60_000;
 // Unscoped require("typescript") must expose the TS6 compiler API for Nx.
-// Root installs file:tooling/typescript-api (Bun-safe shim; see bun#33834).
+// Root installs file:tooling/typescript-api (Bun-safe shim; see https://github.com/oven-sh/bun/issues/33834).
 const TYPESCRIPT_API_VERSION = '6.0.3';
 
 class CapturedCommandError extends Error {
@@ -53,7 +53,7 @@ try {
 
   // Bare require("typescript") must be the TS6 API (Nx graph plugins). Root uses
   // file:tooling/typescript-api so Bun cannot collapse nested npm:typescript onto
-  // the TS7 @typescript/native install (oven-sh/bun#33834).
+  // the TS7 @typescript/native install (https://github.com/oven-sh/bun/issues/33834).
   assertTypeScriptApiPackage(projectRoot);
 
   await applyWorkspaceGitConfig(projectRoot);
