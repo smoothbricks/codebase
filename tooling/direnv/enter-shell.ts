@@ -19,13 +19,24 @@ async function rebuildNxPluginIfStale(): Promise<void> {
   const markerStat = await stat(buildMarker).catch(() => null);
   // Directory mtimes miss edits to existing nested files, so compare source file mtimes against the TS build marker.
   if (!markerStat || (await hasFileNewerThanMarker(markerStat.mtimeMs))) {
-    await runNxQuietly(['run', 'nx-plugin:tsc-js']);
-    await runNxQuietly(['reset']);
+    // Bootstrap must not call `nx`: the project graph loads this plugin and
+    // `require('typescript').readConfigFile`. A cold macOS shell (publish) has
+    // no prior graph cache, so `nx run nx-plugin:tsc-js` deadlocks on the plugin
+    // it is trying to build. `ttsc` only needs the package tsconfig.
+    await runQuietly('ttsc', ['-p', 'tsconfig.lib.json', '--emit'], path.join(projectRoot, 'packages/nx-plugin'));
+    await clearNxDaemonState();
   }
 }
 
-async function runNxQuietly(args: readonly string[]): Promise<void> {
-  const result = await $`nx ${args}`.quiet(true).nothrow();
+async function clearNxDaemonState(): Promise<void> {
+  // Equivalent to `nx reset` without constructing the project graph.
+  await $`rm -rf ${path.join(projectRoot, '.nx/cache')} ${path.join(projectRoot, '.nx/workspace-data')}`
+    .quiet(true)
+    .nothrow();
+}
+
+async function runQuietly(command: string, args: readonly string[], cwd: string): Promise<void> {
+  const result = await $`${command} ${args}`.cwd(cwd).quiet(true).nothrow();
   if (result.exitCode === 0) {
     return;
   }
@@ -35,7 +46,7 @@ async function runNxQuietly(args: readonly string[]): Promise<void> {
   if (result.stderr.length > 0) {
     process.stderr.write(result.stderr);
   }
-  throw new Error(`nx ${args.join(' ')} failed with exit code ${result.exitCode}`);
+  throw new Error(`${command} ${args.join(' ')} failed with exit code ${result.exitCode}`);
 }
 
 async function hasFileNewerThanMarker(markerMtimeMs: number): Promise<boolean> {
