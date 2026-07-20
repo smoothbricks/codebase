@@ -200,6 +200,11 @@ const managedFiles: ManagedFile[] = [
     executable: true,
   },
   {
+    kind: 'raw',
+    source: 'patches/ttsc@0.19.3.patch',
+    target: 'patches/ttsc@0.19.3.patch',
+  },
+  {
     kind: 'generated',
     source: 'ci-workflow',
     target: '.github/workflows/ci.yml',
