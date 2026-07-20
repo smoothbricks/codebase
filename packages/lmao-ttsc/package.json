@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/lmao-ttsc",
-  "version": "0.1.8-next.0",
+  "version": "0.1.8",
   "type": "module",
   "sideEffects": [
     "./dist/bun-register.js"
