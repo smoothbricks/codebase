@@ -30,9 +30,11 @@ generation that makes writes fast. It has no notion of tracing — it just store
 
 ## Buffer strategies
 
-How buffers are allocated is pluggable, behind a buffer-strategy abstraction. The shipped, public strategy is
-`JsBufferStrategy`, which you pass to every tracer. (An experimental WebAssembly-backed strategy exists in the codebase
-but is not part of the public API surface, so it is not documented here.)
+How buffers are allocated is pluggable, behind a buffer-strategy abstraction. The default strategy is
+`JsBufferStrategy`, which you pass to every tracer. An advanced, experimental WebAssembly-backed strategy also ships, at
+the [`@smoothbricks/lmao/wasm`](/reference/package-exports/) subpath — a drop-in `WasmBufferStrategy` that stores numeric
+columns in WASM memory. It's pre-1.0 and most apps don't need it; see
+[Advanced / internals](/reference/advanced-internals/#wasm-buffer-strategy-experimental).
 
 ## Conversion and sinks
 
