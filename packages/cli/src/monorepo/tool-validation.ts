@@ -32,6 +32,7 @@ export interface ToolContext {
 
 interface RegistryPackument {
   versions: Record<string, unknown>;
+  'dist-tags'?: Record<string, string>;
 }
 
 const isRegistryPackument = typia.createIs<RegistryPackument>();
@@ -74,14 +75,14 @@ const requiredDevenvPackages = ['bun', 'git', 'git-format-staged', 'jq', 'alejan
 const nodePackagePattern = /(^|\s)nodejs(_\d+|_latest)?(\s|#|$)/m;
 
 export async function applyToolConfigDefaults(root: string): Promise<void> {
-  const context = readToolContext(root);
+  const context = await readToolContext(root);
   await applyRootPackageToolDefaults(root, context);
   applyToolingPackageDefaults(root, context.policy);
   applyDevenvPackageDefaults(root);
 }
 
-export function validateToolConfig(root: string): number {
-  const context = readToolContext(root);
+export async function validateToolConfig(root: string): Promise<number> {
+  const context = await readToolContext(root);
   return (
     validateRootDevDependencies(context.policy, context.rootPackage) +
     validateToolingPackage(root, context.policy) +
@@ -364,30 +365,26 @@ function formatExpectedDependency(policy: ToolPolicy, dependency: RequiredDepend
   return dependency.minimumVersion ? `>= ${dependency.minimumVersion}` : dependency.fallbackVersion;
 }
 
-export function readToolContext(root: string): ToolContext {
+export async function readToolContext(root: string): Promise<ToolContext> {
   const rootPackage = readPackageJsonObject(join(root, 'package.json'));
   const toolingPackage = readJsonObject(join(root, 'tooling', 'package.json'));
   const configuredCliRange = toolingPackage?.dependencies?.[cliPackageName];
   return {
     rootPackage,
-    policy: toolPolicy(rootPackage, typeof configuredCliRange === 'string' ? configuredCliRange : null),
+    policy: await toolPolicy(rootPackage, typeof configuredCliRange === 'string' ? configuredCliRange : null),
   };
 }
 
-function toolPolicy(rootPackage: PackageJson | null, configuredCliRange: string | null): ToolPolicy {
+async function toolPolicy(rootPackage: PackageJson | null, configuredCliRange: string | null): Promise<ToolPolicy> {
   const name = rootPackage?.name ?? null;
   const isCodebase = isSmoothBricksCodebasePackageName(name ?? undefined);
   const toolingName = toolingPackageName(name);
-  // A locally linked prerelease can be newer than every published CLI. Keep an existing
-  // installable range instead of rewriting the consumer manifest to an unpublished version.
-  const publishedCliRange =
-    cliPackageVersion.includes('-') && configuredCliRange && parseVersion(configuredCliRange)
-      ? configuredCliRange
-      : `^${cliPackageVersion}`;
   return {
     isSmoothBricksCodebase: isCodebase,
     toolingPackageName: toolingName,
-    cliDependencyRange: isCodebase ? 'workspace:*' : publishedCliRange,
+    // Consumers pin the latest *published* CLI. Running a linked prerelease must not
+    // freeze tooling/package.json on an older range or rewrite it to an unpublished -next.
+    cliDependencyRange: isCodebase ? 'workspace:*' : await resolvePublishedCliDependencyRange(configuredCliRange),
   };
 }
 
@@ -410,6 +407,59 @@ async function resolveDependencyVersion(policy: ToolPolicy, dependency: Required
   }
   const latest = await fetchLatestPatchVersion(dependency.name, dependency.minimumVersion);
   return `${dependency.prefix ?? ''}${latest ?? stripRangePrefix(dependency.fallbackVersion)}`;
+}
+
+/**
+ * Consumer monorepos pin `@smoothbricks/cli` to the latest stable release.
+ * Prefer npm `dist-tags.latest`. Never write a running `-next` package version into
+ * consumer manifests; never leave an older pin just because the running CLI is prerelease.
+ */
+async function resolvePublishedCliDependencyRange(configuredCliRange: string | null): Promise<string> {
+  const latest = await fetchLatestStableVersion(cliPackageName);
+  if (latest) {
+    return `^${latest}`;
+  }
+  // Registry unavailable: if the running CLI is a stable publish, use it.
+  if (!cliPackageVersion.includes('-')) {
+    return `^${cliPackageVersion}`;
+  }
+  // Linked prerelease + offline down: keep an existing installable stable pin.
+  if (configuredCliRange && parseVersion(configuredCliRange)) {
+    return configuredCliRange;
+  }
+  // Last resort: caret of the prerelease base (0.10.5-next.0 → ^0.10.5) so manifests stay valid.
+  const base = parseVersion(cliPackageVersion);
+  return base ? `^${base.major}.${base.minor}.${base.patch}` : `^${cliPackageVersion}`;
+}
+
+async function fetchLatestStableVersion(packageName: string): Promise<string | null> {
+  const url = `https://registry.npmjs.org/${encodeURIComponent(packageName).replace('%40', '@')}`;
+  const response = await fetch(url, { headers: { accept: 'application/vnd.npm.install-v1+json' } });
+  if (!response.ok) {
+    return null;
+  }
+  const body: unknown = await response.json();
+  if (!isRegistryPackument(body)) {
+    return null;
+  }
+  const tagged = body['dist-tags']?.latest;
+  if (typeof tagged === 'string' && parseVersion(tagged) && !tagged.includes('-')) {
+    return tagged;
+  }
+  let latest: Version | null = null;
+  for (const raw of Object.keys(body.versions)) {
+    if (raw.includes('-')) {
+      continue;
+    }
+    const version = parseVersion(raw);
+    if (!version) {
+      continue;
+    }
+    if (!latest || compareVersions(version, latest) > 0) {
+      latest = version;
+    }
+  }
+  return latest ? `${latest.major}.${latest.minor}.${latest.patch}` : null;
 }
 
 async function fetchLatestPatchVersion(packageName: string, minimumVersion: string): Promise<string | null> {
