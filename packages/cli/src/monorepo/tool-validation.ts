@@ -56,7 +56,8 @@ const rootDevDependencies: RequiredDependency[] = [
   },
   { name: 'nx', fallbackVersion: '23.1.0', minimumVersion: '23.1.0' },
   { name: 'prettier', fallbackVersion: '^3.6.1', minimumVersion: '3.6.0', prefix: '^' },
-  { name: 'ttsc', fallbackVersion: '^0.19.3', minimumVersion: '0.19.3', prefix: '^' },
+  // Exact pin: Bun patchedDependencies keys are version-locked (see patches/ttsc@0.19.3.patch).
+  { name: 'ttsc', fallbackVersion: '0.19.3' },
   // Nx and typescript-eslint still load the TypeScript JS API (6.x).
   // Compilation is exclusively delegated to ttsc by the Nx plugin targets.
   { name: 'typescript', fallbackVersion: '^6.0.3', minimumVersion: '6.0.0', prefix: '^' },
@@ -74,6 +75,9 @@ const requiredDevenvPackages = ['bun', 'git', 'git-format-staged', 'jq', 'alejan
 // never against a version template here.
 const nodePackagePattern = /(^|\s)nodejs(_\d+|_latest)?(\s|#|$)/m;
 
+const TTSC_PATCHED_DEPENDENCY_KEY = 'ttsc@0.19.3';
+const TTSC_PATCH_PATH = 'patches/ttsc@0.19.3.patch';
+
 export async function applyToolConfigDefaults(root: string): Promise<void> {
   const context = await readToolContext(root);
   await applyRootPackageToolDefaults(root, context);
@@ -85,6 +89,7 @@ export async function validateToolConfig(root: string): Promise<number> {
   const context = await readToolContext(root);
   return (
     validateRootDevDependencies(context.policy, context.rootPackage) +
+    validateTtscPatchedDependency(context.rootPackage) +
     validateToolingPackage(root, context.policy) +
     validateToolingWorkspace(context.rootPackage) +
     validateDevenvPackages(root)
@@ -108,6 +113,7 @@ export async function applyRootDevDependencyDefaults(root: string, context: Tool
   if (delete devDependencies['@smoothbricks/cli']) {
     changed = true;
   }
+  changed = ensureTtscPatchedDependency(pkg) || changed;
   if (changed) {
     writeJsonObject(join(root, 'package.json'), pkg);
     console.log('updated        package.json workspace tool dependencies');
@@ -123,6 +129,7 @@ async function applyRootPackageToolDefaults(root: string, context: ToolContext):
   }
   let dependencyChanged = false;
   let workspaceChanged = false;
+  let patchChanged = false;
   const devDependencies = ensureDependencyMap(pkg, 'devDependencies');
   for (const dependency of rootDevDependencies) {
     const current = devDependencies[dependency.name];
@@ -135,7 +142,8 @@ async function applyRootPackageToolDefaults(root: string, context: ToolContext):
     dependencyChanged = true;
   }
   workspaceChanged = addWorkspacePattern(pkg, 'tooling');
-  if (dependencyChanged || workspaceChanged) {
+  patchChanged = ensureTtscPatchedDependency(pkg);
+  if (dependencyChanged || workspaceChanged || patchChanged) {
     writeJsonObject(join(root, 'package.json'), pkg);
   }
   console.log(
@@ -147,6 +155,11 @@ async function applyRootPackageToolDefaults(root: string, context: ToolContext):
     workspaceChanged
       ? 'updated        package.json tooling workspace'
       : 'unchanged      package.json tooling workspace',
+  );
+  console.log(
+    patchChanged
+      ? 'updated        package.json patchedDependencies for ttsc'
+      : 'unchanged      package.json patchedDependencies for ttsc',
   );
 }
 
@@ -237,6 +250,26 @@ export function validateRootDevDependencies(policy: ToolPolicy, rootPackage: Pac
     failures++;
   }
   return failures;
+}
+
+function ensureTtscPatchedDependency(pkg: PackageJson): boolean {
+  const patched = ensureDependencyMap(pkg, 'patchedDependencies');
+  return setStringProperty(patched, TTSC_PATCHED_DEPENDENCY_KEY, TTSC_PATCH_PATH);
+}
+
+function validateTtscPatchedDependency(rootPackage: PackageJson | null): number {
+  if (!rootPackage) {
+    return 0;
+  }
+  const actual = rootPackage.patchedDependencies?.[TTSC_PATCHED_DEPENDENCY_KEY];
+  if (actual === TTSC_PATCH_PATH) {
+    return 0;
+  }
+  console.error(
+    `package.json patchedDependencies.${TTSC_PATCHED_DEPENDENCY_KEY} must be ${TTSC_PATCH_PATH}` +
+      (typeof actual === 'string' ? `; found ${actual}` : ' (required for declaration-emit fix)'),
+  );
+  return 1;
 }
 
 export function validateToolingPackage(root: string, policy: ToolPolicy): number {
