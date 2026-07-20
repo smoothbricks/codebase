@@ -9,8 +9,9 @@ runs:
       with:
         # Dependencies only. ttsc plugin/GOCACHE live under $TTSC_CACHE_DIR
         # (.cache/ttsc), not inside node_modules.
+        # v2: hash tooling/typescript-api/** and isolate restore-keys from pre-shim Darwin caches.
         path: node_modules
         # prettier-ignore
-        key: ${{ runner.os }}-${{ runner.arch }}-node-${{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-node-v2-${{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json', 'tooling/typescript-api/**') }}
         restore-keys: |
-          ${{ runner.os }}-${{ runner.arch }}-node-
+          ${{ runner.os }}-${{ runner.arch }}-node-v2-

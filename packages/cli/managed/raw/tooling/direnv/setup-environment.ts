@@ -51,10 +51,11 @@ try {
     await installLocalDependencies();
   }
 
-  // Bare require("typescript") must be the TS6 API (Nx graph plugins). Root uses
-  // file:tooling/typescript-api so Bun cannot collapse nested npm:typescript onto
-  // the TS7 @typescript/native install (https://github.com/oven-sh/bun/issues/33834).
-  assertTypeScriptApiPackage(projectRoot);
+  // Bare require("typescript") must be the workspace install (Nx graph plugins).
+  // Never trust Bun's global install-cache fallback: without node_modules/typescript,
+  // createRequire("typescript") resolves ~/.bun/install/cache/typescript@7.../version.cjs
+  // (no readConfigFile). Root uses file:tooling/typescript-api (https://github.com/oven-sh/bun/issues/33834).
+  await ensureTypeScriptApiPackage(projectRoot);
 
   await applyWorkspaceGitConfig(projectRoot);
 } catch (error) {
@@ -78,30 +79,53 @@ async function installLocalDependencies(): Promise<void> {
   });
 }
 
-function assertTypeScriptApiPackage(root: string): void {
-  const requireFromRoot = createRequire(path.join(root, 'package.json'));
-  let typescriptEntry: string;
-  try {
-    typescriptEntry = requireFromRoot.resolve('typescript');
-  } catch (error) {
+async function ensureTypeScriptApiPackage(root: string): Promise<void> {
+  if (!workspaceTypeScriptApiOk(root)) {
+    // Partial/stale node_modules restores (GHA restore-keys) can leave the tree
+    // without the file:tooling/typescript-api link while bun install --frozen
+    // still exits 0. Force a non-frozen reinstall once, then re-check.
+    console.error('! node_modules/typescript is missing or not the TS6 API shim; re-running bun install');
+    await runSetupCommand('bun install', $`bun install`, { quiet: false });
+  }
+
+  const typescriptRoot = path.join(root, 'node_modules', 'typescript');
+  if (!existsSync(typescriptRoot)) {
     throw new Error(
-      'require("typescript") failed after bun install. ' +
-        'Root devDependency must be file:tooling/typescript-api (Bun-safe TS6 API shim).',
-      { cause: error },
+      'node_modules/typescript missing after bun install. ' +
+        'Root must depend on file:tooling/typescript-api and that path must contain package.json.',
     );
   }
-  const typed = requireFromRoot(typescriptEntry) as { version?: string; readConfigFile?: unknown };
+
+  // Load only through the workspace install path — never bare require("typescript"),
+  // which can hit ~/.bun/install/cache/typescript@7 when the link is absent.
+  const requireFromInstall = createRequire(path.join(typescriptRoot, 'package.json'));
+  const typed = requireFromInstall(typescriptRoot) as { version?: string; readConfigFile?: unknown };
   if (typeof typed.readConfigFile !== 'function' || typed.version !== TYPESCRIPT_API_VERSION) {
     throw new Error(
-      `require("typescript") must export TypeScript ${TYPESCRIPT_API_VERSION} compiler API (readConfigFile). ` +
-        `Resolved ${typescriptEntry} (version ${typed.version ?? 'unknown'}). ` +
-        'Bump TYPESCRIPT_API_VERSION in setup-environment.ts together with tooling/typescript-api and ts-compiler-api.',
+      `node_modules/typescript must export TypeScript ${TYPESCRIPT_API_VERSION} compiler API (readConfigFile). ` +
+        `Loaded ${typescriptRoot} (version ${typed.version ?? 'unknown'}). ` +
+        'Bump TYPESCRIPT_API_VERSION with tooling/typescript-api and ts-compiler-api. ' +
+        'See https://github.com/oven-sh/bun/issues/33834.',
     );
   }
 
   const nativeBin = path.join(root, 'node_modules', '@typescript', 'native', 'bin', 'tsc');
   if (!existsSync(nativeBin)) {
     throw new Error(`Missing ${nativeBin}. @typescript/native must remain the TypeScript 7 native compiler for ttsc.`);
+  }
+}
+
+function workspaceTypeScriptApiOk(root: string): boolean {
+  const typescriptRoot = path.join(root, 'node_modules', 'typescript');
+  if (!existsSync(typescriptRoot)) {
+    return false;
+  }
+  try {
+    const requireFromInstall = createRequire(path.join(typescriptRoot, 'package.json'));
+    const typed = requireFromInstall(typescriptRoot) as { version?: string; readConfigFile?: unknown };
+    return typeof typed.readConfigFile === 'function' && typed.version === TYPESCRIPT_API_VERSION;
+  } catch {
+    return false;
   }
 }
 
