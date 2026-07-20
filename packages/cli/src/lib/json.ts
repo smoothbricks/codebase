@@ -52,6 +52,8 @@ export interface PackageJson {
   devDependencies?: StringMap;
   peerDependencies?: StringMap;
   optionalDependencies?: StringMap;
+  /** Bun patchedDependencies map (package@version → patch path). */
+  patchedDependencies?: StringMap;
   engines?: StringMap;
   scripts?: StringMap;
   publishConfig?: PackagePublishConfig;
@@ -165,7 +167,7 @@ export function ensureScripts(pkg: PackageJson): StringMap {
 /** Ensure package.json.dependencies (or other string-map dep field) exists. */
 export function ensureDependencyMap(
   pkg: PackageJson,
-  key: 'dependencies' | 'devDependencies' | 'peerDependencies' | 'optionalDependencies',
+  key: 'dependencies' | 'devDependencies' | 'peerDependencies' | 'optionalDependencies' | 'patchedDependencies',
 ): StringMap {
   const current = pkg[key];
   if (isStringMap(current)) {

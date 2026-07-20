@@ -76,9 +76,10 @@ describe('tool configuration validation', () => {
       expect(rootPackage.devDependencies['@smoothbricks/nx-plugin']).toBe('workspace:*');
       expect(rootPackage.devDependencies['eslint-stdout']).toBe('workspace:*');
       expect(rootPackage.devDependencies.nx).toBe('23.1.0');
-      expect(rootPackage.devDependencies.ttsc).toBe('^0.19.3');
+      expect(rootPackage.devDependencies.ttsc).toBe('0.19.3');
       expect(rootPackage.devDependencies.typescript).toBe('^6.0.3');
       expect(rootPackage.devDependencies['@typescript/native']).toBe('npm:typescript@^7.0.2');
+      expect(rootPackage.patchedDependencies['ttsc@0.19.3']).toBe('patches/ttsc@0.19.3.patch');
       expect(rootPackage.workspaces).toContain('tooling');
       expect(toolingPackage.name).toBe('@smoothbricks/tooling');
       expect(toolingPackage.dependencies['@smoothbricks/cli']).toBe('workspace:*');
@@ -107,9 +108,12 @@ describe('tool configuration validation', () => {
           'eslint-stdout': await currentEslintStdoutRange(),
           nx: '24.0.0',
           prettier: '^3.7.0',
-          ttsc: '^0.19.3',
+          ttsc: '0.19.3',
           typescript: '^6.0.0',
           '@typescript/native': 'npm:typescript@^7.0.2',
+        },
+        patchedDependencies: {
+          'ttsc@0.19.3': 'patches/ttsc@0.19.3.patch',
         },
       });
       await writeJson(join(root, 'tooling/package.json'), {
@@ -206,7 +210,7 @@ describe('tool configuration validation', () => {
           eslint: '^10.0.0',
           nx: '24.0.0',
           prettier: '^3.7.0',
-          ttsc: '^0.19.3',
+          ttsc: '0.19.3',
           typescript: '^6.0.0',
         },
       });
@@ -220,6 +224,7 @@ describe('tool configuration validation', () => {
       expect(rootPackage.devDependencies['eslint-stdout']).toBe(await currentEslintStdoutRange());
       expect(rootPackage.devDependencies['@smoothbricks/nx-plugin']).toBe(await currentNxPluginRange());
       expect(rootPackage.devDependencies['@typescript/native']).toBe('npm:typescript@^7.0.2');
+      expect(rootPackage.patchedDependencies?.['ttsc@0.19.3']).toBe('patches/ttsc@0.19.3.patch');
       expect(toolingPackage.name).toBe('@fixture/tooling');
       expect(toolingPackage.dependencies['@smoothbricks/cli']).toBe(await currentCliRange());
     } finally {
