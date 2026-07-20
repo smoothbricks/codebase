@@ -24,9 +24,9 @@ Run from the repository root:
 | Command | Description |
 | --- | --- |
 | `bun install` | Install all workspace dependencies |
-| `bun run --cwd lmao-docs dev` | Start the local dev server |
+| `bun run --cwd targets/lmao-docs dev` | Start the local dev server |
 | `nx astro-html lmao-docs` | Build the static site to `lmao-docs/dist/` |
-| `bun run --cwd lmao-docs preview` | Preview the production build locally |
+| `bun run --cwd targets/lmao-docs preview` | Preview the production build locally |
 
 Prefer `nx astro-html lmao-docs` for builds — it is the cached Nx target used in CI.
 
