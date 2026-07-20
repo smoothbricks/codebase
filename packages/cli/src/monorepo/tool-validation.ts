@@ -35,9 +35,6 @@ interface RegistryPackument {
 }
 
 const isRegistryPackument = typia.createIs<RegistryPackument>();
-/** Bun-safe TS6 API shim path used as root `typescript` (see tooling/typescript-api). */
-const TYPESCRIPT_API_FILE_DEPENDENCY = 'file:tooling/typescript-api';
-
 const rootDevDependencies: RequiredDependency[] = [
   { name: '@biomejs/biome', fallbackVersion: '^2.3.5', minimumVersion: '2.3.0', prefix: '^' },
   { name: '@nx/js', fallbackVersion: '23.1.0', minimumVersion: '23.1.0' },
@@ -59,10 +56,8 @@ const rootDevDependencies: RequiredDependency[] = [
   { name: 'nx', fallbackVersion: '23.1.0', minimumVersion: '23.1.0' },
   { name: 'prettier', fallbackVersion: '^3.6.1', minimumVersion: '3.6.0', prefix: '^' },
   { name: 'ttsc', fallbackVersion: '^0.18.4', minimumVersion: '0.18.4', prefix: '^' },
-  // Nx and typescript-eslint still load the TypeScript JS API (6.x). Compilation
-  // is exclusively delegated to ttsc. Bun cannot use Microsoft's dual-package
-  // typescript6 alias (https://github.com/oven-sh/bun/issues/33834), so this
-  // monorepo may pin file:tooling/typescript-api instead of a registry range.
+  // Nx and typescript-eslint still load the TypeScript JS API (6.x).
+  // Compilation is exclusively delegated to ttsc by the Nx plugin targets.
   { name: 'typescript', fallbackVersion: '^5.9.3', minimumVersion: '5.9.0', prefix: '^' },
 ];
 
@@ -335,9 +330,6 @@ function escapeRegex(value: string): string {
 function satisfiesDependencyPolicy(policy: ToolPolicy, version: string, dependency: RequiredDependency): boolean {
   if (workspaceDependencyExpected(policy, dependency)) {
     return version === 'workspace:*';
-  }
-  if (dependency.name === 'typescript' && version === TYPESCRIPT_API_FILE_DEPENDENCY) {
-    return true;
   }
   if (dependency.minimumVersion === undefined) {
     return version === dependency.fallbackVersion;

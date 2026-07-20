@@ -230,8 +230,9 @@ This is an Nx-based monorepo using Bun as the package manager, with devenv/diren
   the repository's Typia and LMAO transformers.
 - **Compiler/API split:** The root `@typescript/native` alias installs `typescript@^7.0.2` for `ttsc`; devenv exports
   its `node_modules/@typescript/native/bin/tsc` path through `TTSC_TSGO_BINARY`, and CI persists it through
-  `GITHUB_ENV`. JavaScript tools import the full TypeScript API via root `typescript` → `file:tooling/typescript-api`
-  (real 6.0.3 under `ts-compiler-api`; Bun-safe vs bun#33834). Keep both: TypeScript 7 under the unscoped name breaks Nx
+  `GITHUB_ENV`. JavaScript tools import the full TypeScript API from `typescript@^6.0.3`. After install,
+  setup-environment pins both `node_modules/typescript` and Bun's `.bun/node_modules/typescript` hoist to that API
+  package so Nx does not load TS7 `version.cjs` (bun#33834). Keep both: TypeScript 7 under the unscoped name breaks Nx
   API calls.
 - **Where targets come from:** `tsc-js` comes from `tsconfig.lib.json`, `typecheck-tests` from `tsconfig.test.json`, and
   Cargo targets from a workspace-root `Cargo.toml`. Rust output targets like `cargo-wasm` and `cargo-napi` are never
