@@ -56,7 +56,7 @@ const rootDevDependencies: RequiredDependency[] = [
   },
   { name: 'nx', fallbackVersion: '23.1.0', minimumVersion: '23.1.0' },
   { name: 'prettier', fallbackVersion: '^3.6.1', minimumVersion: '3.6.0', prefix: '^' },
-  { name: 'ttsc', fallbackVersion: '^0.18.4', minimumVersion: '0.18.4', prefix: '^' },
+  { name: 'ttsc', fallbackVersion: '^0.19.3', minimumVersion: '0.19.3', prefix: '^' },
   // Nx and typescript-eslint still load the TypeScript JS API (6.x).
   // Compilation is exclusively delegated to ttsc by the Nx plugin targets.
   { name: 'typescript', fallbackVersion: '^6.0.3', minimumVersion: '6.0.0', prefix: '^' },
