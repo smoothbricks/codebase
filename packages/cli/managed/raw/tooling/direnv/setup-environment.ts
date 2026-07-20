@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync, mkdirSync, readlinkSync, rmSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readlinkSync, rmSync, symlinkSync } from 'node:fs';
 import { mkdir, rmdir, stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -15,7 +15,11 @@ const projectRoot = path.resolve(`${devenvRoot}/../..`);
 // are not hoisted, and the lock loop runs during that block.
 const STALE_LOCK_MS = 10 * 60_000;
 // Unscoped require("typescript") must expose the TS6 compiler API for Nx.
-// Root installs file:tooling/typescript-api (Bun-safe shim; see https://github.com/oven-sh/bun/issues/33834).
+// @typescript/native installs another package also named "typescript" (TS7). Bun's
+// isolated linker often points node_modules/.bun/node_modules/typescript at TS7,
+// so packages resolved from the .bun store (nx) get version.cjs without readConfigFile.
+// After every install, force both unscoped typescript slots onto typescript@6.0.3.
+// Keep @typescript/native for ttsc via TTSC_TSGO_BINARY. See https://github.com/oven-sh/bun/issues/33834.
 const TYPESCRIPT_API_VERSION = '6.0.3';
 
 class CapturedCommandError extends Error {
@@ -51,11 +55,8 @@ try {
     await installLocalDependencies();
   }
 
-  // Bare require("typescript") must be the workspace install (Nx graph plugins).
-  // Never trust Bun's global install-cache fallback: without node_modules/typescript,
-  // createRequire("typescript") resolves ~/.bun/install/cache/typescript@7.../version.cjs
-  // (no readConfigFile). Root uses file:tooling/typescript-api (https://github.com/oven-sh/bun/issues/33834).
-  await ensureTypeScriptApiPackage(projectRoot);
+  // Pin unscoped typescript → API 6 for root and Bun's shared .bun hoist (Nx).
+  ensureTypeScriptApiPackage(projectRoot);
 
   await applyWorkspaceGitConfig(projectRoot);
 } catch (error) {
@@ -79,35 +80,22 @@ async function installLocalDependencies(): Promise<void> {
   });
 }
 
-async function ensureTypeScriptApiPackage(root: string): Promise<void> {
-  if (!workspaceTypeScriptApiOk(root)) {
-    // Partial/stale node_modules restores (GHA restore-keys) can leave the tree
-    // without the file:tooling/typescript-api link while bun install --frozen
-    // still exits 0. Force a non-frozen reinstall once, then re-check.
-    console.error('! node_modules/typescript is missing or not the TS6 API shim; re-running bun install');
-    await runSetupCommand('bun install', $`bun install`, { quiet: false });
-  }
-
-  const typescriptRoot = path.join(root, 'node_modules', 'typescript');
-  if (!existsSync(typescriptRoot)) {
+function ensureTypeScriptApiPackage(root: string): void {
+  const apiPackageRoot = findInstalledTypeScriptApiPackage(root);
+  if (!apiPackageRoot) {
     throw new Error(
-      'node_modules/typescript missing after bun install. ' +
-        'Root must depend on file:tooling/typescript-api and that path must contain package.json.',
+      `typescript@${TYPESCRIPT_API_VERSION} was not installed under node_modules/.bun. ` +
+        `Keep root devDependency typescript@^${TYPESCRIPT_API_VERSION} (compiler API for Nx).`,
     );
   }
 
-  // Load only through the workspace install path — never bare require("typescript"),
-  // which can hit ~/.bun/install/cache/typescript@7 when the link is absent.
-  const requireFromInstall = createRequire(path.join(typescriptRoot, 'package.json'));
-  const typed = requireFromInstall(typescriptRoot) as { version?: string; readConfigFile?: unknown };
-  if (typeof typed.readConfigFile !== 'function' || typed.version !== TYPESCRIPT_API_VERSION) {
-    throw new Error(
-      `node_modules/typescript must export TypeScript ${TYPESCRIPT_API_VERSION} compiler API (readConfigFile). ` +
-        `Loaded ${typescriptRoot} (version ${typed.version ?? 'unknown'}). ` +
-        'Bump TYPESCRIPT_API_VERSION with tooling/typescript-api and ts-compiler-api. ' +
-        'See https://github.com/oven-sh/bun/issues/33834.',
-    );
-  }
+  // Root bare require("typescript") and Bun store-local requires (nx lives under
+  // node_modules/.bun/...) must both see the API package — not @typescript/native's TS7.
+  forceSymlink(path.join(root, 'node_modules', 'typescript'), apiPackageRoot);
+  forceSymlink(path.join(root, 'node_modules', '.bun', 'node_modules', 'typescript'), apiPackageRoot);
+
+  assertTypescriptApiAt(path.join(root, 'node_modules', 'typescript'), apiPackageRoot);
+  assertTypescriptApiAt(path.join(root, 'node_modules', '.bun', 'node_modules', 'typescript'), apiPackageRoot);
 
   const nativeBin = path.join(root, 'node_modules', '@typescript', 'native', 'bin', 'tsc');
   if (!existsSync(nativeBin)) {
@@ -115,17 +103,60 @@ async function ensureTypeScriptApiPackage(root: string): Promise<void> {
   }
 }
 
-function workspaceTypeScriptApiOk(root: string): boolean {
-  const typescriptRoot = path.join(root, 'node_modules', 'typescript');
-  if (!existsSync(typescriptRoot)) {
-    return false;
+function findInstalledTypeScriptApiPackage(root: string): string | null {
+  const bunStore = path.join(root, 'node_modules', '.bun');
+  if (!existsSync(bunStore)) {
+    return null;
   }
+  const exact = `typescript@${TYPESCRIPT_API_VERSION}`;
+  const names = readdirSync(bunStore)
+    .filter((name) => name === exact || name.startsWith(`${exact}+`) || name.startsWith('typescript@6.'))
+    .sort((a, b) => {
+      const aExact = a === exact || a.startsWith(`${exact}+`) ? 0 : 1;
+      const bExact = b === exact || b.startsWith(`${exact}+`) ? 0 : 1;
+      return aExact - bExact || a.localeCompare(b);
+    });
+  for (const name of names) {
+    const candidate = path.join(bunStore, name, 'node_modules', 'typescript');
+    if (existsSync(path.join(candidate, 'package.json'))) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function forceSymlink(linkPath: string, targetPath: string): void {
+  mkdirSync(path.dirname(linkPath), { recursive: true });
+  const relativeTarget = path.relative(path.dirname(linkPath), targetPath);
+  let current: string | null = null;
   try {
-    const requireFromInstall = createRequire(path.join(typescriptRoot, 'package.json'));
-    const typed = requireFromInstall(typescriptRoot) as { version?: string; readConfigFile?: unknown };
-    return typeof typed.readConfigFile === 'function' && typed.version === TYPESCRIPT_API_VERSION;
+    current = readlinkSync(linkPath);
   } catch {
-    return false;
+    current = null;
+  }
+  if (
+    current === relativeTarget ||
+    (current !== null && path.resolve(path.dirname(linkPath), current) === targetPath)
+  ) {
+    return;
+  }
+  rmSync(linkPath, { recursive: true, force: true });
+  symlinkSync(relativeTarget, linkPath);
+}
+
+function assertTypescriptApiAt(typescriptRoot: string, expectedTarget: string): void {
+  if (!existsSync(typescriptRoot)) {
+    throw new Error(`Missing ${typescriptRoot} after linking TypeScript ${TYPESCRIPT_API_VERSION} API package`);
+  }
+  const requireFromInstall = createRequire(path.join(typescriptRoot, 'package.json'));
+  const typed = requireFromInstall(typescriptRoot) as { version?: string; readConfigFile?: unknown };
+  if (typeof typed.readConfigFile !== 'function' || typed.version !== TYPESCRIPT_API_VERSION) {
+    throw new Error(
+      `${typescriptRoot} must export TypeScript ${TYPESCRIPT_API_VERSION} compiler API (readConfigFile). ` +
+        `Resolved version ${typed.version ?? 'unknown'} (expected link target ${expectedTarget}). ` +
+        'Bun isolated linking often points .bun/node_modules/typescript at @typescript/native (TS7). ' +
+        'See https://github.com/oven-sh/bun/issues/33834.',
+    );
   }
 }
 

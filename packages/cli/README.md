@@ -253,8 +253,8 @@ The root `@typescript/native` dependency follows TypeScript's documented side-by
 and supplies the native compiler used by `ttsc`. Because `ttsc` resolves only the unscoped package by default, the
 managed devenv shell sets `TTSC_TSGO_BINARY` to `node_modules/@typescript/native/bin/tsc`; the GitHub setup action
 persists that absolute path through `GITHUB_ENV`. Nx and other JavaScript tooling still require the full TypeScript
-compiler API, so root `typescript` is `file:tooling/typescript-api` (real 6.0.3 via `ts-compiler-api`). Bun cannot
-install Microsoft's `@typescript/typescript6` alias correctly
+compiler API, so workspace `typescript` stays on TypeScript 6. After install, setup-environment forces Bun's shared
+`.bun/node_modules/typescript` hoist onto that API package so Nx does not load `@typescript/native` (TS7) via the store
 ([oven-sh/bun#33834](https://github.com/oven-sh/bun/issues/33834)). Both dependencies and the environment binding are
 required: TypeScript 7 under the unscoped name breaks Nx API calls such as `readConfigFile`.
 

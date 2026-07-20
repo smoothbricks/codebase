@@ -27,7 +27,7 @@
         "prettier": "^3.6.1",
         "tslib": "^2.8.1",
         "ttsc": "0.19.3",
-        "typescript": "file:tooling/typescript-api",
+        "typescript": "^6.0.3",
         "typescript-eslint": "^8.59.1",
         "typia": "13.1.19",
         "verdaccio": "6.8.0",
@@ -286,7 +286,6 @@
     "ttsc@0.19.3": "patches/ttsc@0.19.3.patch",
   },
   "overrides": {
-    "typescript": "file:tooling/typescript-api",
     "typia": "13.1.19",
   },
   "packages": {
@@ -3324,7 +3323,7 @@
 
     "type-is": ["type-is@1.6.18", "", { "dependencies": { "media-typer": "0.3.0", "mime-types": "~2.1.24" } }, "sha512-TkRKr9sUTxEH8MdfuCSP7VizJyzRNMjj2J2do2Jr3Kym598JVdEksuzPQCnlFPW4ky9Q+iA+ma9BGm06XQBy8g=="],
 
-    "typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
+    "typescript": ["typescript@6.0.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw=="],
 
     "typescript-eslint": ["typescript-eslint@8.64.0", "", { "dependencies": { "@typescript-eslint/eslint-plugin": "8.64.0", "@typescript-eslint/parser": "8.64.0", "@typescript-eslint/typescript-estree": "8.64.0", "@typescript-eslint/utils": "8.64.0" }, "peerDependencies": { "eslint": "^8.57.0 || ^9.0.0 || ^10.0.0", "typescript": ">=4.8.4 <6.1.0" } }, "sha512-0qg+pDNMnqYzqH9AnNK+39tejHvsShUOUUoRUgtnTGE7QuMZhiFDnozq8nHJVq+Wae6NMLKNWLg5WmkcC/ndyQ=="],
 
@@ -3462,7 +3461,7 @@
 
     "@arethetypeswrong/core/lru-cache": ["lru-cache@11.5.2", "", {}, "sha512-4pfM1Ff0x50o0tQwb5ucw/RzNyD0/YJME6IVcStalZuMWxdt3sR3huStTtxz4PUmvZfRguvDejasvQ2kifR11g=="],
 
-    "@arethetypeswrong/core/typescript": ["typescript@file:tooling/typescript-api", {}],
+    "@arethetypeswrong/core/typescript": ["typescript@5.6.1-rc", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-E3b2+1zEFu84jB0YQi9BORDjz9+jGbwwy1Zi3G0LUNw7a7cePUrHMRNy8aPh53nXpkFGVHSxIZo5vKTfYaFiBQ=="],
 
     "@babel/core/semver": ["semver@6.3.1", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA=="],
 
@@ -3497,6 +3496,8 @@
     "@expo/metro-file-map/jest-worker": ["jest-worker@29.7.0", "", { "dependencies": { "@types/node": "*", "jest-util": "^29.7.0", "merge-stream": "^2.0.0", "supports-color": "^8.0.0" } }, "sha512-eIz2msL/EzL9UFTFFx7jBTkeZfku0yUAyZZZmJ93H2TYEiroIx2PQjEXcwYtYl8zXCxb+PAmA2hLIt/6ZEkPHw=="],
 
     "@expo/package-manager/ora": ["ora@3.4.0", "", { "dependencies": { "chalk": "^2.4.2", "cli-cursor": "^2.1.0", "cli-spinners": "^2.0.0", "log-symbols": "^2.2.0", "strip-ansi": "^5.2.0", "wcwidth": "^1.0.1" } }, "sha512-eNwHudNbO1folBP3JsZ19v9azXWtQZjICdr3Q0TDPIaeBQ3mXLrh54wM+er0+hSp+dWKf+Z8KM58CYzEyIYxYg=="],
+
+    "@expo/require-utils/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
 
     "@expo/ws-tunnel/ws": ["ws@8.21.1", "", { "peerDependencies": { "bufferutil": "^4.0.1", "utf-8-validate": ">=5.0.2" }, "optionalPeers": ["bufferutil", "utf-8-validate"] }, "sha512-+0NTnW77fFN/DjQi6k/Sq/Yvk4Sgajw7urW8V+asjXnRgDs9gyGkdb7EzgfhA4goXsRIZKE28fzIXBHEzhuiWw=="],
 
@@ -3540,8 +3541,6 @@
 
     "@node-rs/xxhash-wasm32-wasi/@napi-rs/wasm-runtime": ["@napi-rs/wasm-runtime@0.2.12", "", { "dependencies": { "@emnapi/core": "^1.4.3", "@emnapi/runtime": "^1.4.3", "@tybys/wasm-util": "^0.10.0" } }, "sha512-ZVWUcfwY4E/yPitQJl481FjFo3K22D6qF0DuFH6Y/nbnE11GY5uguDxZMGXPQ8WQ0128MXQD7TnfHyK4oWoIJQ=="],
 
-    "@nx/eslint/typescript": ["typescript@file:tooling/typescript-api", {}],
-
     "@nx/vite/ajv": ["ajv@8.18.0", "", { "dependencies": { "fast-deep-equal": "^3.1.3", "fast-uri": "^3.0.1", "json-schema-traverse": "^1.0.0", "require-from-string": "^2.0.2" } }, "sha512-PlXPeEWMXMZ7sPYOHqmDyCJzcfNrUr3fGNKtezX14ykXOEIvyK81d+qydx89KY5O71FKMPaQ2vBfBFI5NHR63A=="],
 
     "@octokit/request/content-type": ["content-type@2.0.0", "", {}, "sha512-j/O/d7GcZCyNl7/hwZAb606rzqkyvaDctLmckbxLzHvFBzTJHuGEdodATcP3yIRoDrLHkIATJuvzbFlp/ki2cQ=="],
@@ -3552,7 +3551,7 @@
 
     "@oxc-resolver/binding-wasm32-wasi/@napi-rs/wasm-runtime": ["@napi-rs/wasm-runtime@1.1.6", "", { "dependencies": { "@tybys/wasm-util": "^0.10.3" }, "peerDependencies": { "@emnapi/core": "^1.7.1", "@emnapi/runtime": "^1.7.1" } }, "sha512-ZLv/JdUfkvOy9eCnnBaGfiO+XimbjebAeO+MRQqD/B+FR1tnRN0tpKSJHRbE8sFfS6aqsXZ67TQjfwfsxULVbg=="],
 
-    "@phenomnomnominal/tsquery/typescript": ["typescript@file:tooling/typescript-api", {}],
+    "@phenomnomnominal/tsquery/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
 
     "@publint/pack/tinyexec": ["tinyexec@1.2.4", "", {}, "sha512-SHf/r48b7vOrjve9PxJo3MN5v5yuyjHvdUcrQffT3WXMUfnGmHDVbC4k3sHJaJTgZCwpUplIaAo5ANtMyp3YHg=="],
 
@@ -3564,7 +3563,7 @@
 
     "@rollup/plugin-commonjs/glob": ["glob@8.1.0", "", { "dependencies": { "fs.realpath": "^1.0.0", "inflight": "^1.0.4", "inherits": "2", "minimatch": "^5.0.1", "once": "^1.3.0" } }, "sha512-r8hpEjiQEYlF2QU0df3dS+nxxSIreXQS1qRhMJM0Q5NDdR386C7jb7Hwwod8Fgiuex+k0GFjgft18yvxm5XoCQ=="],
 
-    "@rollup/plugin-typescript/typescript": ["typescript@file:tooling/typescript-api", {}],
+    "@rollup/plugin-typescript/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
 
     "@rollup/pluginutils/estree-walker": ["estree-walker@2.0.2", "", {}, "sha512-Rfkk/Mp/DL7JVje3u18FxFujQlTNR2q6QfMSMB7AvCBx91NGj/ba3kCfza0f6dVDbw7YlRf/nDrn7pQrCCyQ/w=="],
 
@@ -3574,43 +3573,29 @@
 
     "@rspack/binding-wasm32-wasi/@napi-rs/wasm-runtime": ["@napi-rs/wasm-runtime@1.1.6", "", { "dependencies": { "@tybys/wasm-util": "^0.10.3" }, "peerDependencies": { "@emnapi/core": "^1.7.1", "@emnapi/runtime": "^1.7.1" } }, "sha512-ZLv/JdUfkvOy9eCnnBaGfiO+XimbjebAeO+MRQqD/B+FR1tnRN0tpKSJHRbE8sFfS6aqsXZ67TQjfwfsxULVbg=="],
 
-    "@smoothbricks/columine/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
-
-    "@smoothbricks/cowshed/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
-
-    "@smoothbricks/lmao-expo-benchmark/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
-
-    "@smoothbricks/lmao-ttsc/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
-
-    "@smoothbricks/opencode-entangled/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
-
-    "@smoothbricks/statebus-core/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
-
-    "@smoothbricks/validation/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
-
     "@svgr/core/cosmiconfig": ["cosmiconfig@8.3.6", "", { "dependencies": { "import-fresh": "^3.3.0", "js-yaml": "^4.1.0", "parse-json": "^5.2.0", "path-type": "^4.0.0" }, "peerDependencies": { "typescript": ">=4.9.5" }, "optionalPeers": ["typescript"] }, "sha512-kcZ6+W5QzcJ3P1Mt+83OUv/oHFqZHIx8DuxG6eZ5RGMERoLqp4BuGjhHLYGK+Kf5XVkQvqBSmAy/nGWN3qDgEA=="],
 
     "@svgr/hast-util-to-babel-ast/entities": ["entities@4.5.0", "", {}, "sha512-V0hjH4dGPh9Ao5p0MoRY6BVqtwCjhz6vI5LT8AJ55H+4g9/4vbHx1I54fS0XuclLhDHArPQCiMjDxjaL8fPxhw=="],
 
     "@svgr/plugin-svgo/cosmiconfig": ["cosmiconfig@8.3.6", "", { "dependencies": { "import-fresh": "^3.3.0", "js-yaml": "^4.1.0", "parse-json": "^5.2.0", "path-type": "^4.0.0" }, "peerDependencies": { "typescript": ">=4.9.5" }, "optionalPeers": ["typescript"] }, "sha512-kcZ6+W5QzcJ3P1Mt+83OUv/oHFqZHIx8DuxG6eZ5RGMERoLqp4BuGjhHLYGK+Kf5XVkQvqBSmAy/nGWN3qDgEA=="],
 
-    "@swc-node/register/typescript": ["typescript@file:tooling/typescript-api", {}],
+    "@swc-node/register/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
 
     "@swc-node/sourcemap-support/source-map-support": ["source-map-support@0.5.21", "", { "dependencies": { "buffer-from": "^1.0.0", "source-map": "^0.6.0" } }, "sha512-uBHU3L3czsIyYXKX88fdrGovxdSCoTGDRZ6SYXtSRxLZUzHg5P/66Ht6uoUlHu9EZod+inXhKo3qQgwXUT/y1w=="],
 
-    "@typescript-eslint/eslint-plugin/typescript": ["typescript@file:tooling/typescript-api", {}],
+    "@typescript-eslint/eslint-plugin/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
 
-    "@typescript-eslint/parser/typescript": ["typescript@file:tooling/typescript-api", {}],
+    "@typescript-eslint/parser/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
 
-    "@typescript-eslint/project-service/typescript": ["typescript@file:tooling/typescript-api", {}],
+    "@typescript-eslint/project-service/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
 
-    "@typescript-eslint/tsconfig-utils/typescript": ["typescript@file:tooling/typescript-api", {}],
+    "@typescript-eslint/tsconfig-utils/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
 
-    "@typescript-eslint/type-utils/typescript": ["typescript@file:tooling/typescript-api", {}],
+    "@typescript-eslint/type-utils/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
 
-    "@typescript-eslint/typescript-estree/typescript": ["typescript@file:tooling/typescript-api", {}],
+    "@typescript-eslint/typescript-estree/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
 
-    "@typescript-eslint/utils/typescript": ["typescript@file:tooling/typescript-api", {}],
+    "@typescript-eslint/utils/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
 
     "@typescript-eslint/visitor-keys/eslint-visitor-keys": ["eslint-visitor-keys@5.0.1", "", {}, "sha512-tD40eHxA35h0PEIZNeIjkHoDR4YjjJp34biM0mDvplBe//mB+IHCqHDGV7pxF+7MklTvighcCPPZC7ynWyjdTA=="],
 
@@ -3850,9 +3835,9 @@
 
     "toml-eslint-parser/eslint-visitor-keys": ["eslint-visitor-keys@5.0.1", "", {}, "sha512-tD40eHxA35h0PEIZNeIjkHoDR4YjjJp34biM0mDvplBe//mB+IHCqHDGV7pxF+7MklTvighcCPPZC7ynWyjdTA=="],
 
-    "ts-api-utils/typescript": ["typescript@file:tooling/typescript-api", {}],
+    "ts-api-utils/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
 
-    "typescript-eslint/typescript": ["typescript@file:tooling/typescript-api", {}],
+    "typescript-eslint/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
 
     "typia/commander": ["commander@10.0.1", "", {}, "sha512-y4Mg2tXshplEbSGzx7amzPwKKOCGuoSRP/CjEdwwk0FOGlUbq6lKuoyDZTNZkmxHdJtp54hdfY/JUrdL7Xfdug=="],
 
@@ -3939,6 +3924,8 @@
     "@rspack/binding-wasm32-wasi/@emnapi/core/@emnapi/wasi-threads": ["@emnapi/wasi-threads@1.2.2", "", { "dependencies": { "tslib": "^2.4.0" } }, "sha512-c95qOXkHdydNKhscBTebqEC1CVAZpyqOfVfBzQ1qgzyl3gfeldUjIggDbIZgDKsHLgnsM+igH7TJ/eAasaVuMA=="],
 
     "@rspack/binding-wasm32-wasi/@napi-rs/wasm-runtime/@tybys/wasm-util": ["@tybys/wasm-util@0.10.3", "", { "dependencies": { "tslib": "^2.4.0" } }, "sha512-F3fo1MYrRJYL3zER0OUOmkutjr1Vp23m7OsSgp7nq4SP6OqX6C/56XFIPAl5bt3zaBRjmW7SGz3u/6LwFpYcOg=="],
+
+    "@svgr/core/cosmiconfig/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
 
     "@svgr/plugin-svgo/cosmiconfig/typescript": ["@smoothbricks/typescript-api@file:tooling/typescript-api", { "dependencies": { "ts-compiler-api": "npm:typescript@6.0.3" } }],
 
