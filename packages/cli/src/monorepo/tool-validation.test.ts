@@ -20,6 +20,8 @@ const registryVersions: Record<string, string[]> = {
   prettier: ['3.6.1'],
   ttsc: ['0.18.4'],
   typescript: ['5.9.3'],
+  // alias package is not fetched from registry under this name when using fallback
+  '@typescript/native': ['7.0.2'],
 };
 
 const realFetch = globalThis.fetch;
@@ -69,6 +71,7 @@ describe('tool configuration validation', () => {
       expect(rootPackage.devDependencies['@smoothbricks/nx-plugin']).toBe('workspace:*');
       expect(rootPackage.devDependencies['eslint-stdout']).toBe('workspace:*');
       expect(rootPackage.devDependencies.nx).toBe('23.1.0');
+      expect(rootPackage.devDependencies['@typescript/native']).toBe('npm:typescript@^7.0.2');
       expect(rootPackage.workspaces).toContain('tooling');
       expect(toolingPackage.name).toBe('@smoothbricks/tooling');
       expect(toolingPackage.dependencies['@smoothbricks/cli']).toBe('workspace:*');
@@ -99,6 +102,7 @@ describe('tool configuration validation', () => {
           prettier: '^3.7.0',
           ttsc: '^0.19.0',
           typescript: '^6.0.0',
+          '@typescript/native': 'npm:typescript@^7.0.2',
         },
       });
       await writeJson(join(root, 'tooling/package.json'), {
@@ -209,6 +213,7 @@ describe('tool configuration validation', () => {
       const toolingPackage = JSON.parse(await readFile(join(root, 'tooling/package.json'), 'utf8'));
       expect(rootPackage.devDependencies['eslint-stdout']).toBe(await currentEslintStdoutRange());
       expect(rootPackage.devDependencies['@smoothbricks/nx-plugin']).toBe(await currentNxPluginRange());
+      expect(rootPackage.devDependencies['@typescript/native']).toBe('npm:typescript@^7.0.2');
       expect(toolingPackage.name).toBe('@fixture/tooling');
       expect(toolingPackage.dependencies['@smoothbricks/cli']).toBe(await currentCliRange());
     } finally {
