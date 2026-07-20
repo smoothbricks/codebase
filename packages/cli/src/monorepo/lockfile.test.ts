@@ -31,6 +31,9 @@ function makeFixtureRepo(options: FixtureOptions): string {
   const root = mkdtempSync(join(tmpdir(), 'smoo-lockfile-'));
   cleanupRoots.push(root);
   git(root, 'init -q');
+  // Local identity only — CI runners have no global git user.
+  git(root, 'config user.name Test');
+  git(root, 'config user.email test@example.com');
   git(root, 'commit -q --allow-empty -m init');
   writeFileSync(
     join(root, 'package.json'),
