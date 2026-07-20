@@ -60,6 +60,12 @@ export const createNodesV2: CreateNodesV2 = [
     await Promise.all(
       projectConfigurationFiles.map(async (packageJsonPath) => {
         try {
+          if (isManagedPackageJsonSource(packageJsonPath)) {
+            // smoo monorepo managed raw/templates are source copies, not projects.
+            // Dogfood trees symlink live paths here; discovering both doubles names.
+            results.push([packageJsonPath, {}]);
+            return;
+          }
           results.push([packageJsonPath, await createProjectTargets(packageJsonPath, context.workspaceRoot)]);
         } catch (error) {
           errors.push([packageJsonPath, error instanceof Error ? error : new Error(String(error))]);
@@ -74,6 +80,11 @@ export const createNodesV2: CreateNodesV2 = [
     return results;
   },
 ];
+
+function isManagedPackageJsonSource(packageJsonPath: string): boolean {
+  const normalized = packageJsonPath.replaceAll('\\', '/');
+  return normalized.includes('/managed/raw/') || normalized.includes('/managed/templates/');
+}
 
 export default { createNodesV2 };
 
