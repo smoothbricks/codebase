@@ -355,8 +355,8 @@ function getManagedFileContext(root: string): ManagedFileContext {
   const productionDeploy = getDeployTargetInfo(root, 'production');
   const platformTargetGlobs = platformTargetGlobsForTest(readResolvedNxTargetNames(root));
   const nodeModulesCacheKey = existsSync(join(root, 'bun.lock'))
-    ? `$${"{{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json') }}"}`
-    : `$${"{{ hashFiles('bun.lockb', 'package.json', 'packages/*/package.json') }}"}`;
+    ? `$${"{{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json', 'tooling/typescript-api/**') }}"}`
+    : `$${"{{ hashFiles('bun.lockb', 'package.json', 'packages/*/package.json', 'tooling/typescript-api/**') }}"}`;
   return {
     hasReleasePackages: listReleasePackages(root, packageJson).length > 0,
     hasStagingDeployTargets: stagingDeploy.exists,
