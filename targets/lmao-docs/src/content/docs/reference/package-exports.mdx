@@ -26,6 +26,7 @@ their subpaths.
 | `@smoothbricks/lmao/testing/bun` | Bun harness: `initTraceTestRun`, `createBunTestMock`, `useTestSpan`. |
 | `@smoothbricks/lmao/testing/vitest` | Vitest harness: `initTraceTestRun`, `createVitestMock`, `useTestSpan`. |
 | `@smoothbricks/lmao/bun/preload` | Bun preload hook (registers validation codegen). |
+| `@smoothbricks/lmao/wasm` | **Advanced (experimental).** `WasmBufferStrategy` — a WebAssembly-backed, drop-in alternative to `JsBufferStrategy` (built via `await WasmBufferStrategy.create()`), plus the underlying WASM allocator and trace-root primitives (`createWasmAllocator`, `createWasmTraceRoot`, …). Pre-1.0; most apps use `JsBufferStrategy`. |
 | `@smoothbricks/lmao/vocabulary/register/v1` | **Advanced.** Side-effect import that registers the built-in AOT vocabularies (dictionary/enum encodings). |
 | `@smoothbricks/lmao/span-buffer/aot/v1` | **Advanced.** Side-effect import that registers AOT-compiled span-buffer classes. |
 
