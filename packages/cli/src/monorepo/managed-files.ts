@@ -200,31 +200,6 @@ const managedFiles: ManagedFile[] = [
     executable: true,
   },
   {
-    kind: 'raw',
-    source: 'tooling/typescript-api/package.json',
-    target: 'tooling/typescript-api/package.json',
-  },
-  {
-    kind: 'raw',
-    source: 'tooling/typescript-api/index.js',
-    target: 'tooling/typescript-api/index.js',
-  },
-  {
-    kind: 'raw',
-    source: 'tooling/typescript-api/index.d.ts',
-    target: 'tooling/typescript-api/index.d.ts',
-  },
-  {
-    kind: 'raw',
-    source: 'tooling/typescript-api/lib/tsserverlibrary.js',
-    target: 'tooling/typescript-api/lib/tsserverlibrary.js',
-  },
-  {
-    kind: 'raw',
-    source: 'tooling/typescript-api/lib/tsserverlibrary.d.ts',
-    target: 'tooling/typescript-api/lib/tsserverlibrary.d.ts',
-  },
-  {
     kind: 'generated',
     source: 'ci-workflow',
     target: '.github/workflows/ci.yml',
@@ -355,8 +330,8 @@ function getManagedFileContext(root: string): ManagedFileContext {
   const productionDeploy = getDeployTargetInfo(root, 'production');
   const platformTargetGlobs = platformTargetGlobsForTest(readResolvedNxTargetNames(root));
   const nodeModulesCacheKey = existsSync(join(root, 'bun.lock'))
-    ? `$${"{{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json', 'tooling/typescript-api/**') }}"}`
-    : `$${"{{ hashFiles('bun.lockb', 'package.json', 'packages/*/package.json', 'tooling/typescript-api/**') }}"}`;
+    ? `$${"{{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json') }}"}`
+    : `$${"{{ hashFiles('bun.lockb', 'package.json', 'packages/*/package.json') }}"}`;
   return {
     hasReleasePackages: listReleasePackages(root, packageJson).length > 0,
     hasStagingDeployTargets: stagingDeploy.exists,
