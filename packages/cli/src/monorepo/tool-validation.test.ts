@@ -20,7 +20,7 @@ const registryVersions: Record<string, string[]> = {
   nx: ['23.1.0'],
   prettier: ['3.6.1'],
   ttsc: ['0.18.4'],
-  typescript: ['5.9.3'],
+  typescript: ['6.0.3'],
   // alias package is not fetched from registry under this name when using fallback
   '@typescript/native': ['7.0.2'],
 };
@@ -76,6 +76,7 @@ describe('tool configuration validation', () => {
       expect(rootPackage.devDependencies['@smoothbricks/nx-plugin']).toBe('workspace:*');
       expect(rootPackage.devDependencies['eslint-stdout']).toBe('workspace:*');
       expect(rootPackage.devDependencies.nx).toBe('23.1.0');
+      expect(rootPackage.devDependencies.typescript).toBe('^6.0.3');
       expect(rootPackage.devDependencies['@typescript/native']).toBe('npm:typescript@^7.0.2');
       expect(rootPackage.workspaces).toContain('tooling');
       expect(toolingPackage.name).toBe('@smoothbricks/tooling');
