@@ -20,6 +20,7 @@ import {
 } from '../lib/json.js';
 import { decode, run, runInteractiveStatus, runResult } from '../lib/run.js';
 import { listReleasePackages, readPackageJson, repositoryInfo } from '../lib/workspace.js';
+import { syncBunLockfileVersions } from '../monorepo/lockfile.js';
 import { readPackedPackageJson, validatePackedWorkspaceDependencies } from '../monorepo/packed-manifest.js';
 import {
   type BootstrapNpmPackagesOptions,
@@ -529,6 +530,10 @@ async function listUnpublishedPackages(root: string, packages: ReleasePackage[])
 async function publishPackedPackage(root: string, pkg: ReleasePackage, tag: string, dryRun: boolean): Promise<void> {
   const tempDir = await mkdtemp(join(tmpdir(), 'smoo-publish-'));
   const tarball = join(tempDir, `${safeTarballPrefix(pkg.name)}-${pkg.version}.tgz`);
+  // bun pm pack resolves workspace:* from bun.lock. Day-to-day lock keeps -next
+  // (install/CI). For publish, temporarily rewrite unpublished -next entries to
+  // the last stable tag so the tarball embeds installable versions, then restore.
+  syncBunLockfileVersions(root, { mode: 'publish', log: true });
   try {
     console.log(`${pkg.name}@${pkg.version}: packing with bun pm pack`);
     await run('bun', ['pm', 'pack', '--filename', tarball, '--ignore-scripts', '--quiet'], join(root, pkg.path));
@@ -560,6 +565,7 @@ async function publishPackedPackage(root: string, pkg: ReleasePackage, tag: stri
       },
     );
   } finally {
+    syncBunLockfileVersions(root, { mode: 'install', log: true });
     await rm(tempDir, { recursive: true, force: true });
   }
 }

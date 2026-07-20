@@ -1,4 +1,3 @@
-import { execSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AfterAllProjectsVersioned, VersionActions } from 'nx/release';
@@ -20,11 +19,15 @@ const afterAllProjectsVersioned: AfterAllProjectsVersioned = async (cwd, options
   // - https://github.com/oven-sh/bun/issues/20477
   // - https://github.com/oven-sh/bun/issues/20829
   //
-  // After version bumps, rewrite bun.lock for pack/publish:
-  // - stable package.json versions stay as-is
-  // - unpublished package.json prereleases (prepare-next) map to last stable tag
-  //   so a releasing package does not embed unpublishable -next deps via workspace:*
-  const updated = syncBunLockfileVersionsForPublish(cwd);
+  // After ANY version bump (release or prepare-next), bun.lock workspace versions
+  // must match package.json exactly — including unpublished -next. Day-to-day CI
+  // and frozen installs require that invariant.
+  //
+  // Publish-time pack rewrites (-next → last stable tag) happen only in
+  // `smoo release publish` around `bun pm pack`, never here. Doing publish-mode
+  // rewrite on prepare-next is what left lock at 0.x.y while package.json said
+  // 0.x.y-next.0 and blew up monorepo validate / packed-package-manifest.
+  const updated = syncBunLockfileVersionsToPackageJson(cwd);
   if (updated === 0) {
     return result;
   }
@@ -39,7 +42,7 @@ baseVersionActions.afterAllProjectsVersioned = afterAllProjectsVersioned;
 
 export = baseVersionActions;
 
-function syncBunLockfileVersionsForPublish(root: string): number {
+function syncBunLockfileVersionsToPackageJson(root: string): number {
   const lockfilePath = join(root, 'bun.lock');
   if (!existsSync(lockfilePath)) {
     throw new Error('bun.lock not found');
@@ -48,7 +51,8 @@ function syncBunLockfileVersionsForPublish(root: string): number {
   let lockfile = readFileSync(lockfilePath, 'utf8');
   let updated = 0;
   for (const pkg of packages) {
-    const targetVersion = publishLockfileVersion(root, pkg.projectName, pkg.version);
+    // Install/CI invariant: lockfile version ≡ package.json version (including -next).
+    const targetVersion = pkg.version;
     const relativePath = pkg.path.replaceAll('\\', '/');
     const escaped = escapeRegex(relativePath);
     const pattern = new RegExp(`("${escaped}":\\s*\\{[^}]*"version":\\s*")([^"]+)(")`);
@@ -63,8 +67,7 @@ function syncBunLockfileVersionsForPublish(root: string): number {
       continue;
     }
     lockfile = lockfile.replace(pattern, `$1${targetVersion}$3`);
-    const suffix = targetVersion !== pkg.version ? ` (latest stable tag; package.json has ${pkg.version})` : '';
-    console.log(`fix:  ${relativePath}: ${lockVersion} -> ${targetVersion}${suffix}`);
+    console.log(`fix:  ${relativePath}: ${lockVersion} -> ${targetVersion}`);
     updated++;
   }
   if (updated > 0) {
@@ -74,35 +77,6 @@ function syncBunLockfileVersionsForPublish(root: string): number {
     updated > 0 ? `Updated ${updated} workspace version(s) in bun.lock` : 'All workspace versions already in sync.',
   );
   return updated;
-}
-
-function publishLockfileVersion(root: string, projectName: string, packageVersion: string): string {
-  if (!packageVersion.includes('-')) {
-    return packageVersion;
-  }
-  return latestStableTagVersion(root, projectName) ?? packageVersion;
-}
-
-function latestStableTagVersion(root: string, projectName: string): string | null {
-  try {
-    const output = execSync(`git tag --list '${projectName}@*' --sort=-v:refname`, {
-      cwd: root,
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    const prefix = `${projectName}@`;
-    for (const line of output.split('\n')) {
-      const tag = line.trim();
-      if (!tag.startsWith(prefix)) continue;
-      const version = tag.slice(prefix.length);
-      if (version && !version.includes('-')) {
-        return version;
-      }
-    }
-    return null;
-  } catch {
-    return null;
-  }
 }
 
 interface WorkspacePackage {
