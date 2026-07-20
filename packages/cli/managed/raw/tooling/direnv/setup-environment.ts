@@ -14,6 +14,9 @@ const projectRoot = path.resolve(`${devenvRoot}/../..`);
 // NOTE: must be declared ABOVE the top-level setup block below — module consts
 // are not hoisted, and the lock loop runs during that block.
 const STALE_LOCK_MS = 10 * 60_000;
+// Unscoped require("typescript") must expose the TS6 compiler API for Nx.
+// Root installs file:tooling/typescript-api (Bun-safe shim; see bun#33834).
+const TYPESCRIPT_API_VERSION = '6.0.3';
 
 class CapturedCommandError extends Error {
   constructor(
@@ -48,10 +51,9 @@ try {
     await installLocalDependencies();
   }
 
-  // Nx loads `require('typescript').readConfigFile`. The root
-  // `@typescript/native` alias is TypeScript 7 under a scoped name; if Bun ever
-  // hoists that package onto the unscoped `typescript` slot, the shell dies
-  // later with a cryptic graph error. Fail at install time instead.
+  // Bare require("typescript") must be the TS6 API (Nx graph plugins). Root uses
+  // file:tooling/typescript-api so Bun cannot collapse nested npm:typescript onto
+  // the TS7 @typescript/native install (oven-sh/bun#33834).
   assertTypeScriptApiPackage(projectRoot);
 
   await applyWorkspaceGitConfig(projectRoot);
@@ -78,17 +80,28 @@ async function installLocalDependencies(): Promise<void> {
 
 function assertTypeScriptApiPackage(root: string): void {
   const requireFromRoot = createRequire(path.join(root, 'package.json'));
-  const typescriptEntry = requireFromRoot.resolve('typescript');
-  const typescriptModule = requireFromRoot(typescriptEntry) as {
-    version?: string;
-    readConfigFile?: unknown;
-  };
-  if (typeof typescriptModule.readConfigFile !== 'function') {
+  let typescriptEntry: string;
+  try {
+    typescriptEntry = requireFromRoot.resolve('typescript');
+  } catch (error) {
     throw new Error(
-      'node_modules/typescript must export the TypeScript 6 compiler API (readConfigFile). ' +
-        `Resolved ${typescriptEntry} (version ${typescriptModule.version ?? 'unknown'}). ` +
-        'Keep typescript@^6.0.3 unscoped and TypeScript 7 only under @typescript/native.',
+      'require("typescript") failed after bun install. ' +
+        'Root devDependency must be file:tooling/typescript-api (Bun-safe TS6 API shim).',
+      { cause: error },
     );
+  }
+  const typed = requireFromRoot(typescriptEntry) as { version?: string; readConfigFile?: unknown };
+  if (typeof typed.readConfigFile !== 'function' || typed.version !== TYPESCRIPT_API_VERSION) {
+    throw new Error(
+      `require("typescript") must export TypeScript ${TYPESCRIPT_API_VERSION} compiler API (readConfigFile). ` +
+        `Resolved ${typescriptEntry} (version ${typed.version ?? 'unknown'}). ` +
+        'Bump TYPESCRIPT_API_VERSION in setup-environment.ts together with tooling/typescript-api and ts-compiler-api.',
+    );
+  }
+
+  const nativeBin = path.join(root, 'node_modules', '@typescript', 'native', 'bin', 'tsc');
+  if (!existsSync(nativeBin)) {
+    throw new Error(`Missing ${nativeBin}. @typescript/native must remain the TypeScript 7 native compiler for ttsc.`);
   }
 }
 
