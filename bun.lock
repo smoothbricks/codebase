@@ -46,7 +46,7 @@
     },
     "packages/cli": {
       "name": "@smoothbricks/cli",
-      "version": "0.10.5-next.0",
+      "version": "0.10.5",
       "bin": {
         "smoo": "./bin/smoo",
       },
@@ -205,7 +205,7 @@
     },
     "packages/nx-plugin": {
       "name": "@smoothbricks/nx-plugin",
-      "version": "0.3.4-next.0",
+      "version": "0.3.4",
       "dependencies": {
         "@nx/js": "23.1.0",
         "nx": "23.1.0",
