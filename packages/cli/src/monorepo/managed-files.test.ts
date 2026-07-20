@@ -18,7 +18,8 @@ const MANAGED = '# managed content\npath merge=driver\n';
 
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..', '..');
 const ARCHITECTURE_SCOPED_PREFIX = '${{ runner.os }}-${{ runner.arch }}-';
-const NODE_MODULES_CACHE_KEY = "${{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json') }}";
+const NODE_MODULES_CACHE_KEY =
+  "${{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json', 'tooling/typescript-api/**') }}";
 const CACHE_ACTIONS = [
   { name: 'cache-nix-devenv', osKeyLines: 6 },
   { name: 'cache-node-modules', osKeyLines: 2 },
