@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/opencode-entangled",
-  "version": "0.1.4-next.0",
+  "version": "0.1.4",
   "description": "OpenCode plugin for Entangled literate programming",
   "type": "module",
   "sideEffects": false,
