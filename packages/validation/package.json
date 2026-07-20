@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/validation",
-  "version": "0.1.4",
+  "version": "0.1.5-next.0",
   "type": "module",
   "sideEffects": [
     "./dist/bun/preload.js",
