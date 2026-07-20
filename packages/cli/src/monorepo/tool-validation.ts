@@ -59,7 +59,7 @@ const rootDevDependencies: RequiredDependency[] = [
   { name: 'ttsc', fallbackVersion: '^0.18.4', minimumVersion: '0.18.4', prefix: '^' },
   // Nx and typescript-eslint still load the TypeScript JS API (6.x).
   // Compilation is exclusively delegated to ttsc by the Nx plugin targets.
-  { name: 'typescript', fallbackVersion: '^5.9.3', minimumVersion: '5.9.0', prefix: '^' },
+  { name: 'typescript', fallbackVersion: '^6.0.3', minimumVersion: '6.0.0', prefix: '^' },
   // TS7 native compiler for ttsc (TTSC_TSGO_BINARY). Not the unscoped API package.
   // npm alias form required — Bun cannot install @typescript/typescript6 cleanly (bun#33834).
   { name: '@typescript/native', fallbackVersion: 'npm:typescript@^7.0.2' },
