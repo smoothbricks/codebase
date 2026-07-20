@@ -200,6 +200,31 @@ const managedFiles: ManagedFile[] = [
     executable: true,
   },
   {
+    kind: 'raw',
+    source: 'tooling/typescript-api/package.json',
+    target: 'tooling/typescript-api/package.json',
+  },
+  {
+    kind: 'raw',
+    source: 'tooling/typescript-api/index.js',
+    target: 'tooling/typescript-api/index.js',
+  },
+  {
+    kind: 'raw',
+    source: 'tooling/typescript-api/index.d.ts',
+    target: 'tooling/typescript-api/index.d.ts',
+  },
+  {
+    kind: 'raw',
+    source: 'tooling/typescript-api/lib/tsserverlibrary.js',
+    target: 'tooling/typescript-api/lib/tsserverlibrary.js',
+  },
+  {
+    kind: 'raw',
+    source: 'tooling/typescript-api/lib/tsserverlibrary.d.ts',
+    target: 'tooling/typescript-api/lib/tsserverlibrary.d.ts',
+  },
+  {
     kind: 'generated',
     source: 'ci-workflow',
     target: '.github/workflows/ci.yml',

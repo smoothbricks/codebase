@@ -32,6 +32,32 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('skips smoo managed raw package.json sources as projects', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write(
+        'packages/cli/managed/raw/tooling/typescript-api/package.json',
+        '{"name":"@smoothbricks/typescript-api","private":true}\n',
+      );
+      await workspace.write(
+        'tooling/typescript-api/package.json',
+        '{"name":"@smoothbricks/typescript-api","private":true}\n',
+      );
+
+      const managed = await inferTargets(
+        ['packages/cli/managed/raw/tooling/typescript-api/package.json'],
+        undefined,
+        workspace.context,
+      );
+      expect(managed[0]?.[1]).toEqual({});
+
+      const live = await inferProject(workspace, 'tooling/typescript-api/package.json');
+      expect(live?.name).toBe('@smoothbricks/typescript-api');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('overrides inferred TypeScript compiler commands with ttsc', async () => {
     const workspace = await createWorkspace();
     try {
