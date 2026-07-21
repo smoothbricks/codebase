@@ -3,7 +3,7 @@
  * Example: Exporting a span tree to an Apache Arrow table
  *
  * Demonstrates:
- * - Capturing the root span buffer via the public `ctx.buffer` handle
+ * - Reading a completed trace's root buffer from a retaining tracer (`TestTracer.rootBuffers`)
  * - Converting the whole span tree (root + children) to a columnar Arrow table
  *   with `convertSpanTreeToArrowTable`
  * - Reading columns back by their clean schema names (`userId`, `operation`, ...)
@@ -17,14 +17,13 @@
  */
 
 import {
-  type AnySpanBuffer,
   convertSpanTreeToArrowTable,
   createTraceRoot,
   defineLogSchema,
   defineOpContext,
   JsBufferStrategy,
   S,
-  StdioTracer,
+  TestTracer,
 } from '../src/node.js';
 
 const schema = defineLogSchema({
@@ -36,12 +35,7 @@ const schema = defineLogSchema({
 const opContext = defineOpContext({ logSchema: schema });
 const { defineOp } = opContext;
 
-// Captured inside the op via the public `ctx.buffer`; converted after the trace completes.
-let rootBuffer: AnySpanBuffer | undefined;
-
 const processItems = defineOp('process-items', async (ctx, userId: string, items: string[]) => {
-  rootBuffer = ctx.buffer;
-
   ctx.tag.userId(userId).operation('READ').itemCount(items.length);
   ctx.log.info('processing {{itemCount}} items').itemCount(items.length);
 
@@ -53,16 +47,21 @@ const processItems = defineOp('process-items', async (ctx, userId: string, items
   return ctx.ok({ processed: items.length });
 });
 
-const { trace } = new StdioTracer(opContext, {
+// `TestTracer` retains each completed root buffer in `rootBuffers` — that is how you
+// get at a finished span tree. Don't stash `ctx.buffer` in a variable outside the op:
+// an op is a reusable definition (potentially running concurrently), and the buffer
+// strategy may recycle the buffer once the trace completes.
+const tracer = new TestTracer(opContext, {
   bufferStrategy: new JsBufferStrategy(),
   createTraceRoot,
 });
 
 async function main(): Promise<void> {
-  await trace('process-items', processItems, 'user-123', ['alpha', 'beta', 'gamma']);
+  await tracer.trace('process-items', processItems, 'user-123', ['alpha', 'beta', 'gamma']);
 
+  const rootBuffer = tracer.rootBuffers[0];
   if (!rootBuffer) {
-    throw new Error('expected the op to capture a root buffer');
+    throw new Error('expected the tracer to retain a root buffer');
   }
 
   // Zero-copy conversion of the span tree into an Apache Arrow table.
