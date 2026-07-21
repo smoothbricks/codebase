@@ -1,0 +1,13 @@
+diff --git a/dist/node/index.mjs b/dist/node/index.mjs
+index 4785361c8b663335765098206bbbb99d756d559a..48973c98a1f9696818ea170b802d6e2faf4a4b38 100644
+--- a/dist/node/index.mjs
++++ b/dist/node/index.mjs
+@@ -2072,7 +2072,7 @@ function conlocaCMS(options) {
+ 		const pkgUrl = import.meta.resolve("@conloca/cms-spa/package.json");
+ 		cmsSpaDir = dirname(pkgUrl.startsWith("file://") ? fileURLToPath(pkgUrl) : pkgUrl);
+ 	} catch {}
+-	const cmsSpaDistDir = cmsSpaDir ? join(cmsSpaDir, "dist") : void 0;
++	const cmsSpaDistDir = cmsSpaDir ? join(cmsSpaDir, "dist").split("\\").join("/") : void 0;
+ 	const routingConfig = normalizeRoutingConfig(options.routing, options.layout);
+ 	const hydrationDiscoveriesPromise = scanForHydratableComponents(deriveComponentPaths(options.puckConfigPath, options.componentPaths), process.cwd()).then((discoveries) => {
+ 		if (discoveries.length > 0) console.log(`[Conloca] Found ${discoveries.length} hydratable component(s)`);
