@@ -75,3 +75,6 @@ target/
 
 # local tool caches (ttsc plugins, etc.)
 .cache/
+
+# Zig build cache (17.9 MB of build.exe/.pdb/.obj was committed by mistake)
+.zig-cache/
