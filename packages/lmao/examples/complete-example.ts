@@ -13,7 +13,6 @@
  */
 
 import {
-  type AnySpanBuffer,
   createTraceRoot,
   defineCodeError,
   defineFeatureFlags,
@@ -23,7 +22,7 @@ import {
   InMemoryFlagEvaluator,
   JsBufferStrategy,
   S,
-  StdioTracer,
+  TestTracer,
 } from '../src/node.js';
 
 const orderSchema = defineLogSchema({
@@ -110,10 +109,7 @@ const processPayment = defineOp('process-payment', async (ctx, orderId: string, 
 });
 
 // Root op — sets request-level scope, then composes the sub-ops as child spans.
-let rootBuffer: AnySpanBuffer | undefined;
 const createOrder = defineOp('create-order', async (ctx, orderData: OrderData) => {
-  rootBuffer = ctx.buffer;
-
   ctx.setScope({
     userId: orderData.userId,
     requestId: ctx.requestId,
@@ -145,7 +141,11 @@ const createOrder = defineOp('create-order', async (ctx, orderData: OrderData) =
   return ctx.ok({ orderId, userId: orderData.userId, amount: orderAmount, status: 'created' });
 });
 
-const { trace } = new StdioTracer(opContext, {
+// `TestTracer` retains completed root buffers in `rootBuffers`, which is how the
+// scheduler below gets a finished span tree. Don't stash `ctx.buffer` in a variable
+// outside the op: an op is a reusable definition (potentially running concurrently),
+// and the buffer strategy may recycle the buffer once the trace completes.
+const tracer = new TestTracer(opContext, {
   bufferStrategy: new JsBufferStrategy(),
   createTraceRoot,
   flagEvaluator: new InMemoryFlagEvaluator(featureFlags.schema, {
@@ -166,7 +166,7 @@ const scheduler = new FlushScheduler(
 async function main(): Promise<void> {
   scheduler.start();
 
-  const result = await trace('create-order', { requestId: 'req-12345', userId: 'user-789' }, createOrder, {
+  const result = await tracer.trace('create-order', { requestId: 'req-12345', userId: 'user-789' }, createOrder, {
     userId: 'user-789',
     items: [
       { productId: 'prod-1', quantity: 2, price: 29.99 },
@@ -180,7 +180,8 @@ async function main(): Promise<void> {
     console.log(`\n❌ Order failed: ${result.error.code}`);
   }
 
-  // Register the captured root buffer and flush it through the scheduler.
+  // Register the completed root buffer and flush it through the scheduler.
+  const rootBuffer = tracer.rootBuffers[0];
   if (rootBuffer) {
     scheduler.register(rootBuffer);
   }
