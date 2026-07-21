@@ -143,8 +143,13 @@ const createOrder = defineOp('create-order', async (ctx, orderData: OrderData) =
   return ctx.ok({ orderId, userId: orderData.userId, amount: orderAmount, status: 'created' });
 });
 
+// `CompositeTracerOptions` carries `delegates: Tracer<B>[]`, which pins B to this op
+// context — so the buffer strategy must be built for the same concrete log schema
+// rather than the loose default.
+type OrderLogSchema = (typeof opContext)['logBinding']['logSchema'];
+
 const tracerOptions = {
-  bufferStrategy: new JsBufferStrategy(),
+  bufferStrategy: new JsBufferStrategy<OrderLogSchema>(),
   createTraceRoot,
   flagEvaluator: new InMemoryFlagEvaluator(featureFlags.schema, {
     advancedValidation: true,
