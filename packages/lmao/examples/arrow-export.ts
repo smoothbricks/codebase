@@ -1,29 +1,34 @@
 #!/usr/bin/env bun
 /**
- * Example: Exporting a span tree to an Apache Arrow table
+ * Example: One trace, two outputs — stdout and an Apache Arrow table
  *
  * Demonstrates:
- * - Reading a completed trace's root buffer from a retaining tracer (`TestTracer.rootBuffers`)
- * - Converting the whole span tree (root + children) to a columnar Arrow table
- *   with `convertSpanTreeToArrowTable`
+ * - Fanning a single trace run out to several tracers with `CompositeTracer`
+ * - Printing the span tree to stdout with `StdioTracer`
+ * - Collecting completed root buffers with `ArrayQueueTracer` and draining them
+ *   into columnar Arrow tables via `convertSpanTreeToArrowTable`
  * - Reading columns back by their clean schema names (`userId`, `operation`, ...)
  *   plus system columns (`entry_type`, `message`)
  *
- * (This replaces the old `transformer-demo.ts`: the build-time transformer it relied on
- * is not part of the shipped package, so this example focuses on the Arrow export that is.)
+ * The tracer owns the buffer. Never stash `ctx.buffer` in a variable outside the
+ * op: an op is a reusable definition that may run concurrently, so a shared
+ * variable races, and the buffer strategy may recycle the buffer once the trace
+ * completes.
  *
  * Run it:
  *   bun run examples/arrow-export.ts
  */
 
 import {
+  ArrayQueueTracer,
+  CompositeTracer,
   convertSpanTreeToArrowTable,
   createTraceRoot,
   defineLogSchema,
   defineOpContext,
   JsBufferStrategy,
   S,
-  TestTracer,
+  StdioTracer,
 } from '../src/node.js';
 
 const schema = defineLogSchema({
@@ -47,38 +52,36 @@ const processItems = defineOp('process-items', async (ctx, userId: string, items
   return ctx.ok({ processed: items.length });
 });
 
-// `TestTracer` retains each completed root buffer in `rootBuffers` — that is how you
-// get at a finished span tree. Don't stash `ctx.buffer` in a variable outside the op:
-// an op is a reusable definition (potentially running concurrently), and the buffer
-// strategy may recycle the buffer once the trace completes.
-const tracer = new TestTracer(opContext, {
-  bufferStrategy: new JsBufferStrategy(),
-  createTraceRoot,
-});
+const tracerOptions = { bufferStrategy: new JsBufferStrategy(), createTraceRoot };
+
+// StdioTracer prints each span as it completes; ArrayQueueTracer keeps the
+// completed root buffers so they can be converted afterwards. CompositeTracer
+// drives both from one trace run.
+const stdio = new StdioTracer(opContext, tracerOptions);
+const queued = new ArrayQueueTracer(opContext, tracerOptions);
+const tracer = new CompositeTracer(opContext, { ...tracerOptions, delegates: [stdio, queued] });
 
 async function main(): Promise<void> {
   await tracer.trace('process-items', processItems, 'user-123', ['alpha', 'beta', 'gamma']);
 
-  const rootBuffer = tracer.rootBuffers[0];
-  if (!rootBuffer) {
-    throw new Error('expected the tracer to retain a root buffer');
-  }
+  // `drain()` hands over the queued root buffers and empties the queue, so the
+  // next batch starts clean. Each root buffer converts with its children.
+  const tables = queued.drain().map((rootBuffer) => convertSpanTreeToArrowTable(rootBuffer));
 
-  // Zero-copy conversion of the span tree into an Apache Arrow table.
-  const table = convertSpanTreeToArrowTable(rootBuffer);
+  for (const table of tables) {
+    console.log(`\nArrow table: ${table.numRows} rows`);
+    console.log(`Columns: ${table.names.join(', ')}`);
 
-  console.log(`\nArrow table: ${table.numRows} rows`);
-  console.log(`Columns: ${table.names.join(', ')}`);
+    // Read columns back by their clean schema names + system columns.
+    const entryType = table.getChild('entry_type');
+    const message = table.getChild('message');
+    const userId = table.getChild('userId');
 
-  // Read columns back by their clean schema names + system columns.
-  const entryType = table.getChild('entry_type');
-  const message = table.getChild('message');
-  const userId = table.getChild('userId');
-
-  for (let row = 0; row < table.numRows; row++) {
-    console.log(
-      `  row ${row}: entry_type=${entryType?.get(row)} message=${message?.get(row)} userId=${userId?.get(row)}`,
-    );
+    for (let row = 0; row < table.numRows; row++) {
+      console.log(
+        `  row ${row}: entry_type=${entryType?.get(row)} message=${message?.get(row)} userId=${userId?.get(row)}`,
+      );
+    }
   }
 }
 
