@@ -13,6 +13,8 @@
  */
 
 import {
+  ArrayQueueTracer,
+  CompositeTracer,
   createTraceRoot,
   defineCodeError,
   defineFeatureFlags,
@@ -22,7 +24,7 @@ import {
   InMemoryFlagEvaluator,
   JsBufferStrategy,
   S,
-  TestTracer,
+  StdioTracer,
 } from '../src/node.js';
 
 const orderSchema = defineLogSchema({
@@ -141,18 +143,23 @@ const createOrder = defineOp('create-order', async (ctx, orderData: OrderData) =
   return ctx.ok({ orderId, userId: orderData.userId, amount: orderAmount, status: 'created' });
 });
 
-// `TestTracer` retains completed root buffers in `rootBuffers`, which is how the
-// scheduler below gets a finished span tree. Don't stash `ctx.buffer` in a variable
-// outside the op: an op is a reusable definition (potentially running concurrently),
-// and the buffer strategy may recycle the buffer once the trace completes.
-const tracer = new TestTracer(opContext, {
+const tracerOptions = {
   bufferStrategy: new JsBufferStrategy(),
   createTraceRoot,
   flagEvaluator: new InMemoryFlagEvaluator(featureFlags.schema, {
     advancedValidation: true,
     experimentalPaymentFlow: false,
   }),
-});
+};
+
+// One trace, two outputs: StdioTracer prints the span tree, ArrayQueueTracer keeps
+// the completed root buffers so the scheduler below can flush them. The tracer owns
+// the buffer — don't stash `ctx.buffer` in a variable outside the op: an op is a
+// reusable definition that may run concurrently, and the buffer strategy may recycle
+// the buffer once the trace completes.
+const stdio = new StdioTracer(opContext, tracerOptions);
+const queued = new ArrayQueueTracer(opContext, tracerOptions);
+const tracer = new CompositeTracer(opContext, { ...tracerOptions, delegates: [stdio, queued] });
 
 const scheduler = new FlushScheduler(
   (table, metadata) => {
@@ -180,9 +187,8 @@ async function main(): Promise<void> {
     console.log(`\n❌ Order failed: ${result.error.code}`);
   }
 
-  // Register the completed root buffer and flush it through the scheduler.
-  const rootBuffer = tracer.rootBuffers[0];
-  if (rootBuffer) {
+  // Drain the queued root buffers and flush them through the scheduler.
+  for (const rootBuffer of queued.drain()) {
     scheduler.register(rootBuffer);
   }
   await scheduler.flush();
