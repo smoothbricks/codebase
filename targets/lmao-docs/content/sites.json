@@ -1,0 +1,10 @@
+{
+  "sites": {
+    "default": {
+      "locales": ["en"],
+      "defaultLocale": "en",
+      "mdxPages": "./src/content/docs"
+    }
+  },
+  "globalLocales": ["en"]
+}
