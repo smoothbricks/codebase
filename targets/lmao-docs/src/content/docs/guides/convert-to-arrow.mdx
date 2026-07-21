@@ -18,11 +18,31 @@ definition that may run concurrently, so a shared variable races; and once the t
 may recycle the buffer, so reading it later is unsafe.
 :::
 
+## Just the Arrow export
+
+If Arrow is the only output you want, one tracer is enough — no `CompositeTracer` involved:
+
+```ts
+const tracer = new ArrayQueueTracer(opContext, { bufferStrategy, createTraceRoot });
+
+await tracer.trace('GET /cart', handleRequest);
+
+// One root buffer per completed trace, in completion order.
+const [rootBuffer] = tracer.drain();
+const table = convertSpanTreeToArrowTable(rootBuffer);
+```
+
+`drain()` empties the queue as it hands the buffers over, so a request handler can convert and ship the trace it just
+finished without accumulating buffers across requests.
+
+If you need the buffer somewhere a queue doesn't fit — a custom sink, a per-request hook — subclass `Tracer` and
+implement `onTraceEnd(rootBuffer)`; that's the lifecycle hook every shipped tracer is built on. See
+[Write a custom tracer](/guides/write-a-custom-tracer/).
+
 ## Printing and exporting from one trace
 
-You don't have to choose between human-readable output and an Arrow export. `CompositeTracer` fans a single trace run
-out to several tracers, so `StdioTracer` can print the span tree while `ArrayQueueTracer` collects the buffers to
-convert:
+`CompositeTracer` is only needed when you want **several** outputs from the same run. It fans a single trace out to
+delegate tracers, so `StdioTracer` can print the span tree while `ArrayQueueTracer` collects the buffers to convert:
 
 ```ts
 const tracerOptions = { bufferStrategy: new JsBufferStrategy(), createTraceRoot };
