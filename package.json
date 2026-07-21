@@ -82,7 +82,9 @@
     "name": "@smoothbricks/codebase"
   },
   "patchedDependencies": {
-    "ttsc@0.19.3": "patches/ttsc@0.19.3.patch"
+    "ttsc@0.19.3": "patches/ttsc@0.19.3.patch",
+    "@conloca/content-api@0.1.16": "patches/@conloca%2Fcontent-api@0.1.16.patch",
+    "@conloca/astro-cms@0.1.16": "patches/@conloca%2Fastro-cms@0.1.16.patch"
   },
   "overrides": {
     "typia": "13.1.19"
