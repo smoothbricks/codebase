@@ -52,7 +52,12 @@ const processItems = defineOp('process-items', async (ctx, userId: string, items
   return ctx.ok({ processed: items.length });
 });
 
-const tracerOptions = { bufferStrategy: new JsBufferStrategy(), createTraceRoot };
+// `CompositeTracerOptions` carries `delegates: Tracer<B>[]`, which pins B to this op
+// context — so the buffer strategy must be built for the same concrete log schema
+// rather than the loose default.
+type ScenarioLogSchema = (typeof opContext)['logBinding']['logSchema'];
+
+const tracerOptions = { bufferStrategy: new JsBufferStrategy<ScenarioLogSchema>(), createTraceRoot };
 
 // StdioTracer prints each span as it completes; ArrayQueueTracer keeps the
 // completed root buffers so they can be converted afterwards. CompositeTracer
