@@ -18,6 +18,27 @@ definition that may run concurrently, so a shared variable races; and once the t
 may recycle the buffer, so reading it later is unsafe.
 :::
 
+## Printing and exporting from one trace
+
+You don't have to choose between human-readable output and an Arrow export. `CompositeTracer` fans a single trace run
+out to several tracers, so `StdioTracer` can print the span tree while `ArrayQueueTracer` collects the buffers to
+convert:
+
+```ts
+const tracerOptions = { bufferStrategy: new JsBufferStrategy(), createTraceRoot };
+
+const stdio = new StdioTracer(opContext, tracerOptions);
+const queued = new ArrayQueueTracer(opContext, tracerOptions);
+const tracer = new CompositeTracer(opContext, { ...tracerOptions, delegates: [stdio, queued] });
+
+await tracer.trace('process-items', processItems, 'user-123');
+
+// drain() hands over the queued root buffers and empties the queue.
+const tables = queued.drain().map((rootBuffer) => convertSpanTreeToArrowTable(rootBuffer));
+```
+
+See `packages/lmao/examples/arrow-export.ts` for a runnable version.
+
 ```ts
 import {
   JsBufferStrategy,
