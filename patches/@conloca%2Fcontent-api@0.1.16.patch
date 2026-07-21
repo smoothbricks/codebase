@@ -1,0 +1,57 @@
+diff --git a/dist/filesystem-content-api-C0HIhqZi.mjs b/dist/filesystem-content-api-C0HIhqZi.mjs
+index f8cbf1678b5c58341fa12cd60300c3696566cee1..a99fc6f3c2d119fa37d8ceb91c9dc3afe581118c 100644
+--- a/dist/filesystem-content-api-C0HIhqZi.mjs
++++ b/dist/filesystem-content-api-C0HIhqZi.mjs
+@@ -4,6 +4,7 @@ import { t as ContentIndex } from "./content-index-D092_vk1.mjs";
+ import { a as xxh64, i as parseDualEtag, n as calculateEtagsFromMdxBuffer, r as findMdxContentStartPosition, t as VXJSON } from "./vxjson-qHrgLGip.mjs";
+ import { t as Data } from "./data-DquNIEnQ.mjs";
+ import sortKeys from "sort-keys";
++function __conlocaToPosix(p){return typeof p==="string"?p.split("\\").join("/"):p;}
+ import matter from "gray-matter";
+ import { mkdir, open, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
+ import { dirname, join, resolve } from "path";
+@@ -172,7 +173,7 @@ function parse4KBMDX(buffer, bytesRead) {
+ * config without spinning up a full content-api instance.
+ */
+ async function readSitesConfig(contentRoot) {
+-	const sitesPath = join(resolve(contentRoot), "sites.json");
++	const sitesPath = join(__conlocaToPosix(resolve(contentRoot)), "sites.json");
+ 	try {
+ 		const content = await readFile(sitesPath, "utf-8");
+ 		const parsed = JSON.parse(content);
+@@ -219,7 +220,7 @@ var FileSystemContentAPI = class FileSystemContentAPI {
+ 		if (contentRoot.startsWith("./")) this.contentRoot = contentRoot.slice(2);
+ 		else if (contentRoot.startsWith("/")) this.contentRoot = contentRoot;
+ 		else this.contentRoot = contentRoot;
+-		this.absoluteContentRoot = resolve(this.contentRoot);
++		this.absoluteContentRoot = __conlocaToPosix(resolve(this.contentRoot));
+ 		this.sitesConfig = sitesConfig;
+ 		this.contentIndex = contentIndex;
+ 		const siteNames = Object.keys(sitesConfig.sites);
+@@ -230,7 +231,7 @@ var FileSystemContentAPI = class FileSystemContentAPI {
+ 		const resolvedMdxPages = mdxPagesOptions?.root ?? sitesJsonMdxPages;
+ 		if (resolvedMdxPages) {
+ 			const normalizedMdxPages = resolvedMdxPages.startsWith("./") ? resolvedMdxPages.slice(2) : resolvedMdxPages;
+-			this.absoluteMdxPagesRoot = resolve(normalizedMdxPages);
++			this.absoluteMdxPagesRoot = __conlocaToPosix(resolve(normalizedMdxPages));
+ 		}
+ 		const siteConfig = sitesConfig.sites[this.mdxPagesSite];
+ 		this.mdxPagesDefaultLocale = localeOptions?.defaultLocale ?? mdxPagesOptions?.defaultLocale ?? siteConfig?.defaultLocale ?? sitesConfig.globalLocales[0] ?? "en";
+@@ -643,7 +644,7 @@ var FileSystemContentAPI = class FileSystemContentAPI {
+ 			try {
+ 				const entries = await readdir(dir, { withFileTypes: true });
+ 				for (const entry of entries) {
+-					const fullPath = join(dir, entry.name);
++					const fullPath = __conlocaToPosix(join(dir, entry.name));
+ 					if (entry.isDirectory()) {
+ 						const isDataDir = dir === contentRoot && entry.name === "data";
+ 						await scan(fullPath, inDataDir || isDataDir);
+@@ -660,7 +661,7 @@ var FileSystemContentAPI = class FileSystemContentAPI {
+ 				try {
+ 					const entries = await readdir(dir, { withFileTypes: true });
+ 					for (const entry of entries) {
+-						const fullPath = join(dir, entry.name);
++						const fullPath = __conlocaToPosix(join(dir, entry.name));
+ 						if (entry.isDirectory()) await scanMdxPages(fullPath);
+ 						else if (entry.isFile() && entry.name.endsWith(".mdx")) files.push(fullPath);
+ 					}
