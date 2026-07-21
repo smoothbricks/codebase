@@ -1,7 +1,6 @@
 // @ts-check
 import starlight from '@astrojs/starlight';
 import { defineConfig } from 'astro/config';
-import remarkGfm from 'remark-gfm';
 import starlightLinksValidator from 'starlight-links-validator';
 import starlightLlmsTxt from 'starlight-llms-txt';
 
@@ -10,12 +9,6 @@ export default defineConfig({
 	// domain at deploy time: it is baked into the generated /llms.txt URLs,
 	// canonical links, and the sitemap.
 	site: 'https://lmao.smoothbricks.dev',
-	// Astro 6 no longer applies GFM through the default markdown pipeline in this
-	// Starlight setup, which silently broke every Markdown table (they rendered as
-	// literal `| … |` text). Re-add remark-gfm explicitly so tables/strikethrough work.
-	markdown: {
-		remarkPlugins: [remarkGfm],
-	},
 	integrations: [
 		starlight({
 			title: 'LMAO',
