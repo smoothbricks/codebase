@@ -1,5 +1,8 @@
 // @ts-check
+import mdx from '@astrojs/mdx';
+import react from '@astrojs/react';
 import starlight from '@astrojs/starlight';
+import { conlocaCMS } from '@conloca/astro-cms/node';
 import { defineConfig } from 'astro/config';
 import starlightLinksValidator from 'starlight-links-validator';
 import starlightLlmsTxt from 'starlight-llms-txt';
@@ -10,6 +13,7 @@ export default defineConfig({
 	// canonical links, and the sitemap.
 	site: 'https://lmao.smoothbricks.dev',
 	integrations: [
+		react(),
 		starlight({
 			title: 'LMAO',
 			logo: { src: './src/assets/logo.svg', alt: 'LMAO' },
@@ -65,6 +69,16 @@ export default defineConfig({
 					],
 				}),
 			],
+		}),
+		// Starlight inserts Expressive Code immediately after itself; explicit MDX must
+		// follow so code blocks register first (mirrors conloca.com's own config).
+		mdx({ optimize: true, extendMarkdownConfig: false }),
+		// Conloca CMS. It authors no Puck pages here — `mdxPages` in
+		// content/sites.json points it at Starlight's docs collection, so the CMS
+		// edits the existing .mdx files in place and Starlight keeps rendering them.
+		conlocaCMS({
+			contentRoot: './content',
+			puckConfigPath: './src/puck.config.tsx',
 		}),
 	],
 });
