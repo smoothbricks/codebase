@@ -49,11 +49,16 @@ describe('CompositeTracer', () => {
   });
   const { defineOp } = ctx;
 
+  // `CompositeTracerOptions` carries `delegates: Tracer<B>[]`, which pins B to this
+  // op context — so the shared tracer options must be built for the same concrete
+  // log schema rather than the loose `LogSchema` default.
+  type TestLogSchema = (typeof ctx)['logBinding']['logSchema'];
+
   /** Stdio + ArrayQueue behind one composite, sharing the same tracer options. */
   function createStackedTracer() {
     const { stream: out, output } = createMockStream();
     const { stream: err } = createMockStream();
-    const options = createTestTracerOptions();
+    const options = createTestTracerOptions<TestLogSchema>();
 
     const stdio = new StdioTracer(ctx, { ...options, out, err, colorEnabled: false });
     const queued = new ArrayQueueTracer(ctx, { ...options });
