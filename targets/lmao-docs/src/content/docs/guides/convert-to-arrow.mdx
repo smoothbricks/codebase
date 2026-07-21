@@ -9,8 +9,14 @@ modified: '2026-07-21T09:58:49.225Z'
 ---
 
 `convertSpanTreeToArrowTable` turns a root span buffer (and its children) into a single Apache Arrow table with shared
-dictionaries. You get the buffer from a tracer that retains completed traces, such as `TestTracer` or
-`ArrayQueueTracer`, via `tracer.rootBuffers`.
+dictionaries. You get the buffer from a tracer that retains completed traces: `TestTracer` collects them in
+`tracer.rootBuffers`, and `ArrayQueueTracer` queues them in `tracer.queue` (or `tracer.drain()`).
+
+:::caution
+Get the buffer from the tracer — don't stash `ctx.buffer` in a variable outside the op. An op is a reusable
+definition that may run concurrently, so a shared variable races; and once the trace completes the buffer strategy
+may recycle the buffer, so reading it later is unsafe.
+:::
 
 ```ts
 import {
