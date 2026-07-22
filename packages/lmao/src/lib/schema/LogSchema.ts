@@ -25,12 +25,33 @@ const RESERVED_NAMES = new Set([
   // Technically conflicting - methods on TagWriter/FluentLogEntry/result objects
   'with', // Used on TagWriter, FluentLogEntry, Ok, Err
   'message', // Used on Ok, Err
+  'line', // Used on Ok, Err, FluentLogEntry (also a system column)
+
+  // Technically conflicting - Ok/Err instance properties and prototype members. Ok/Err
+  // install row-1 fluent setters per schema field (mirrors TagWriter on row 0), so a
+  // field sharing one of these names would shadow the real member instead of adding a
+  // setter. `success` is the sharp edge: it's a getter on the Ok/Err prototype, so a
+  // same-named field would silently overwrite it with a function - always truthy,
+  // treating every error as a success.
+  'success', // Ok.success / Err.success getter (ok/err discriminant)
+  'value', // Ok.value instance property (the success payload)
+  'map', // Ok.map / Err.map
+  'mapErr', // Ok.mapErr / Err.mapErr
+  'flatMap', // Ok.flatMap / Err.flatMap
+  'match', // Ok.match / Err.match
+  'isOk', // Ok.isOk / Err.isOk
+  'isErr', // Ok.isErr / Err.isErr
+  'maybeValue', // Ok.maybeValue / Err.maybeValue
+  'maybeError', // Ok.maybeError / Err.maybeError
+  'unwrapOr', // Ok.unwrapOr / Err.unwrapOr
+  'unwrapOrElse', // Ok.unwrapOrElse / Err.unwrapOrElse
+  'toJSON', // Ok.toJSON / Err.toJSON
 
   // Technically conflicting - log level methods on SpanLogger
   'info', // ctx.log.info()
   'debug', // ctx.log.debug()
   'warn', // ctx.log.warn()
-  'error', // ctx.log.error()
+  'error', // ctx.log.error() -- also Err.error instance property (the error payload)
   'trace', // ctx.log.trace()
 
   // Internal SpanLogger methods (prefixed with _ but included for completeness)
