@@ -30,8 +30,9 @@ if (result.success) {
 
 ## `ctx.ok(value)` / `ctx.err(error)`
 
-Create the result inside an op. Both support fluent `.with({...})` (attach span attributes) and `.message('...')`
-(override the span name).
+Create the result inside an op. Both support fluent per-field setters (`.status(200)`) and `.with({...})` (attach
+several span attributes at once) and `.message('...')` (override the span name). See
+[`ctx.ok`/`ctx.err`](/reference/span-context/#ctxokvalue--ctxerrerror) for the full shape.
 
 ## `defineCodeError(code)<Payload>()`
 
