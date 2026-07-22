@@ -313,23 +313,34 @@ describe('specialized SpanContext runtime semantics', () => {
       expectThinWriter(logger, ctx);
       expect(Object.is(logger.info(`${label}-log`).marker(`${label}-log-marker`), logger)).toBe(true);
 
+      // OkClass/ErrClass (getResultClasses in result.ts) install row-1 fluent setters —
+      // including with()/message()/line() — directly on the schema-bound subclass
+      // prototype, writing straight through ctx._spanBuffer. That shadows the base
+      // Ok/Err's lazy `_resultWriter()` indirection, so `_writer` never materializes for
+      // a schema-bound result (unlike a state-less `new Ok(value)`, which still lazily
+      // builds one on first `.with()`/`.message()`/`.line()` call). Assert the writes
+      // land on the buffer directly instead of asserting a `_writer` object appears.
       const ok = ctx.ok({ label });
       expect(Reflect.get(ok, '_state')).toBe(ctx);
       expect(Object.hasOwn(ok, '_writer')).toBe(false);
       expect(ok.with({ marker: `${label}-ok` })).toBe(ok);
-      const okWriter = requireObject(Reflect.get(ok, '_writer'), `${label} Ok writer`);
-      expectThinWriter(okWriter, ctx);
+      expect(Object.hasOwn(ok, '_writer')).toBe(false);
+      expect(ctx.buffer.marker_values[1]).toBe(`${label}-ok`);
       expect(ok.message(`${label} ok`).line(101)).toBe(ok);
-      expect(Reflect.get(ok, '_writer')).toBe(okWriter);
+      expect(Object.hasOwn(ok, '_writer')).toBe(false);
+      expect(resolveMessage(ctx.buffer, 1)).toBe(`${label} ok`);
+      expect(ctx.buffer.line_values[1]).toBe(101);
 
       const err = ctx.err(TEST_FAILURE({ reason: label }));
       expect(Reflect.get(err, '_state')).toBe(ctx);
       expect(Object.hasOwn(err, '_writer')).toBe(false);
       expect(err.with({ marker: `${label}-err` })).toBe(err);
-      const errWriter = requireObject(Reflect.get(err, '_writer'), `${label} Err writer`);
-      expectThinWriter(errWriter, ctx);
+      expect(Object.hasOwn(err, '_writer')).toBe(false);
+      expect(ctx.buffer.marker_values[1]).toBe(`${label}-err`);
       expect(err.message(`${label} error`).line(202)).toBe(err);
-      expect(Reflect.get(err, '_writer')).toBe(errWriter);
+      expect(Object.hasOwn(err, '_writer')).toBe(false);
+      expect(resolveMessage(ctx.buffer, 1)).toBe(`${label} error`);
+      expect(ctx.buffer.line_values[1]).toBe(202);
     }
 
     async function run(runtimeHint: number, name: string): Promise<void> {

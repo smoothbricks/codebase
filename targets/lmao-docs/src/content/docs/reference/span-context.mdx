@@ -95,13 +95,18 @@ await ctx.span('auth-check', ctx.deps.auth.checkAuth);
 
 ## `ctx.ok(value)` / `ctx.err(error)`
 
-Complete the span. `ctx.ok` returns success; `ctx.err` returns a failure with a typed error. Both support fluent
-`.with({...})` and `.message('...')`.
+Complete the span. `ctx.ok` returns success; `ctx.err` returns a failure with a typed error. Both write to the
+span-end row (row 1) and carry the same fluent setters as `ctx.tag` — individual field setters, plus `with({...})`
+for several at once — along with `.message('...')` and `.line(n)`.
 
 ```ts
-return ctx.ok({ id: 'user-1' });
-return ctx.err(NOT_FOUND({ id })).with({ userId: id });
+return ctx.ok({ id: 'user-1' }).status(200);
+return ctx.err(NOT_FOUND({ id })).with({ userId: id, status: 404 });
 ```
+
+Reach for the result's setters — not `ctx.tag` — for anything that isn't known until the outcome is (an HTTP status
+that differs by branch, for example): tagging it up front would record that value even on a path that never reaches
+it. See [Integrate with an HTTP framework](/guides/integrate-with-http-framework/).
 
 ## `ctx.buffer`
 

@@ -42,3 +42,6 @@ const handle = defineOp('handle', async (ctx) => {
 - **Tag or log for a one-off attribute?** Tag, if it describes the span. Log, if it marks a moment in time.
 - **Do log templates interpolate?** The message stays a template (`processing {{itemCount}} items`); the value is
   recorded in its own column. Tools render the final string from the column values.
+- **What about the result — is `ctx.ok`/`ctx.err` a tag?** No, but it has the same fluent setters, writing to the row
+  it creates (row 1, span-end) instead of row 0: `ctx.ok(v).status(200)`. Reach for it when a value — like an HTTP
+  status — isn't known until the outcome is. See [Integrate with an HTTP framework](/guides/integrate-with-http-framework/).

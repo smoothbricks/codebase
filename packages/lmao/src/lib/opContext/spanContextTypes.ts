@@ -327,6 +327,16 @@ export type SpanContext<Ctx extends OpContext> = {
    * Writes span-ok entry to row 1 (span-end).
    * Supports fluent chaining with .with() and .message().
    *
+   * WHY declared as Ok<S, T>, not the wider OkResult<S, T>: the object returned at
+   * runtime is schema-bound and does carry per-field setters (ctx.ok(v).status(200) —
+   * see result.ts's getResultClasses), but OkResult's mapped setters make T invariant
+   * (InferSchema<T>[K] appears in both the setter's parameter and, via the setter's
+   * return type, recursively again). OpFn's declared return type is the loose
+   * Result<S, E> (default schema), so a concrete-schema OkResult is no longer
+   * structurally assignable to it — every (ctx) => ctx.ok(value) op body fails to
+   * typecheck against OpFn. Keeping Ok<S, T> here (covariant in T) preserves that
+   * assignability; reach the per-field setters via `.with({...})` for now.
+   *
    * @param value - The success value
    * @returns Fluent result builder
    *
@@ -340,6 +350,8 @@ export type SpanContext<Ctx extends OpContext> = {
    *
    * Writes span-err entry to row 1 (span-end).
    * Supports fluent chaining with .with() and .message().
+   *
+   * WHY declared as Err<E, T>, not ErrResult<E, T>: same variance conflict as ok() above.
    *
    * @param code - Error code string
    * @param details - Error details

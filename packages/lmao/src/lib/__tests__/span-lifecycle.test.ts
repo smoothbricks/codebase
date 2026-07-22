@@ -537,6 +537,53 @@ describe('Fixed Row Layout', () => {
     expect(capturedBuffer.line_values[1]).toBe(42);
   });
 
+  it('should write ok/err single-field setters directly to row 1, same as tag on row 0', async () => {
+    // Per specs/lmao/01i_span_scope_attributes.md: ctx.ok(v).userId('123') writes row 1
+    // only, mirroring ctx.tag.userId('123') on row 0 — a per-field setter, not .with().
+    //
+    // ctx.ok()'s declared return type stays Ok<S,T> (not the wider OkResult<S,T>)
+    // because OkResult's per-field setters make T invariant, which breaks assignability
+    // to OpFn's Result<S,E> — see spanContextTypes.ts's WHY on SpanContext.ok. The
+    // setters exist on the returned object at runtime regardless; invoke them via
+    // Reflect like the internals this suite's sibling already probes
+    // (capability-span-context.test.ts's `_state`/`_writer` checks).
+    function callSetter<T extends object>(target: T, name: string, ...args: unknown[]): T {
+      const setter = Reflect.get(target, name);
+      if (typeof setter !== 'function') throw new TypeError(`${name} setter missing on ${String(target)}`);
+      return Reflect.apply(setter, target, args) as T;
+    }
+
+    let capturedOkBuffer: SpanBuffer<(typeof ctx)['logBinding']['logSchema']> | undefined;
+    let capturedErrBuffer: SpanBuffer<(typeof ctx)['logBinding']['logSchema']> | undefined;
+
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
+    await trace('test-ok', async (ctx) => {
+      capturedOkBuffer = ctx.buffer;
+      const okResult = ctx.ok('done');
+      callSetter(callSetter(okResult, 'userId', 'user-single'), 'operation', 'CREATE');
+      return okResult;
+    });
+    await trace('test-err', async (ctx) => {
+      capturedErrBuffer = ctx.buffer;
+      const errResult = ctx.err(ERROR_CODE({ detail: 'oops' }));
+      callSetter(errResult, 'userId', 'user-single-err');
+      return errResult;
+    });
+
+    expect(capturedOkBuffer).toBeDefined();
+    expect(capturedErrBuffer).toBeDefined();
+    if (!capturedOkBuffer || !capturedErrBuffer) {
+      throw new Error('captured buffer is undefined');
+    }
+
+    expect(capturedOkBuffer.userId_values[1]).toBe('user-single');
+    expect(capturedOkBuffer.operation_values[1]).toBe(0);
+    // Single-field setters only touch row 1 — row 0 (span-start) stays unset.
+    expect(capturedOkBuffer.userId_values[0]).toBeUndefined();
+
+    expect(capturedErrBuffer.userId_values[1]).toBe('user-single-err');
+  });
+
   it('should write err fluent result attributes directly to row 1', async () => {
     let capturedBuffer: SpanBuffer<(typeof ctx)['logBinding']['logSchema']> | undefined;
 

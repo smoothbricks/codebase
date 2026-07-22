@@ -31,7 +31,15 @@
  * ```
  */
 
-import type { ResultWriter, WriterState } from './codegen/fixedPositionWriterGenerator.js';
+import {
+  createFixedFieldPlans,
+  installFixedWriterMethods,
+  installResultSystemMethods,
+  type ResultWriter,
+  type WriterState,
+} from './codegen/fixedPositionWriterGenerator.js';
+import type { SchemaEnumLookupDescriptor } from './enumMetadata.js';
+import type { MessageLayoutFamily } from './runtimeHint.js';
 import type { InferSchema, LogSchema } from './schema/types.js';
 
 // =============================================================================
@@ -112,7 +120,8 @@ function createCodeErrorValue<Code extends string, Fields extends object>(
 export class Ok<V, T extends LogSchema = LogSchema> {
   readonly value: V;
 
-  private readonly _state: WriterState | undefined;
+  /** protected, not private: getResultClasses() subclasses Ok per schema to install row-1 fluent setters. */
+  protected readonly _state: WriterState | undefined;
   private declare _writer: BoundResultWriter<T, V, never> | undefined;
 
   constructor(value: V, state?: WriterState) {
@@ -258,7 +267,8 @@ export class Ok<V, T extends LogSchema = LogSchema> {
 export class Err<E, T extends LogSchema = LogSchema> {
   readonly error: E;
 
-  private readonly _state: WriterState | undefined;
+  /** protected, not private: getResultClasses() subclasses Err per schema to install row-1 fluent setters. */
+  protected readonly _state: WriterState | undefined;
   private declare _writer: BoundResultWriter<T, never, E> | undefined;
 
   constructor(error: E, state?: WriterState) {
@@ -408,6 +418,124 @@ export class Err<E, T extends LogSchema = LogSchema> {
 
 /** Union type for Result - either Ok or Err. */
 export type Result<V, E, T extends LogSchema = LogSchema> = Ok<V, T> | Err<E, T>;
+
+// =============================================================================
+// ROW-1 FLUENT SETTERS (ctx.ok(v).status(200), mirroring ctx.tag on row 0)
+// =============================================================================
+
+//#region smoo/lmao!n/lmao-entry-result-row-setters
+/**
+ * `Ok`, widened with the schema's row-1 fluent setters (mirrors `TagWriter` on row 0):
+ * `ctx.ok(v).status(200).with({ userId })` and `ctx.ok(v).with({ userId }).status(200)`
+ * both type-check and stay on this type. Self-referencing type alias, inlined (not
+ * routed through a shared `FieldSetters<T, Self>` helper) — same shape `TagWriter<T>`
+ * uses in fixedPositionWriterGenerator.ts; routing the mapped type through a separate
+ * named generic makes the alias circularly reference itself instead of resolving.
+ *
+ * @example ctx.ok(cart.value).status(200)
+ */
+export type OkResult<V, T extends LogSchema = LogSchema> = Ok<V, T> & {
+  [K in keyof InferSchema<T>]: (value: InferSchema<T>[K]) => OkResult<V, T>;
+};
+
+/** `Err`, widened with the schema's row-1 fluent setters. Returned by a schema-bound `ctx.err()`. See `OkResult` for why this is inlined. */
+export type ErrResult<E, T extends LogSchema = LogSchema> = Err<E, T> & {
+  [K in keyof InferSchema<T>]: (value: InferSchema<T>[K]) => ErrResult<E, T>;
+};
+
+/**
+ * Generic construct signatures (`V`/`E` scoped to the call, not the type) so each
+ * `new OkClass(value, state)` preserves its own value's type — mirrors
+ * `ResultWriterConstructor` in fixedPositionWriterGenerator.ts, same reason.
+ */
+export type OkClassConstructor<T extends LogSchema> = new <V>(value: V, state: WriterState) => OkResult<V, T>;
+export type ErrClassConstructor<T extends LogSchema> = new <E>(error: E, state: WriterState) => ErrResult<E, T>;
+
+/** One schema's row-1-aware Ok/Err class pair, cached per schema in `getResultClasses`. */
+export interface ResultClasses<T extends LogSchema> {
+  readonly OkClass: OkClassConstructor<T>;
+  readonly ErrClass: ErrClassConstructor<T>;
+}
+
+/**
+ * Narrow `unknown` to a schema-bound constructor after `installFixedWriterMethods`
+ * installs the row-1 setters at runtime — the same bridge `isTagWriterConstructor` and
+ * `isResultWriterConstructor` use in fixedPositionWriterGenerator.ts for the identical
+ * problem: the installed members are invisible to the class's own static shape, so no
+ * assignment from the freshly-declared class to the richer public type can check out
+ * structurally. `typeof value === 'function'` is the real, load-bearing runtime check;
+ * the type predicate just gives the compiler the widened type once it holds. Callers
+ * must hold the value as `unknown` first (see `getResultClasses` below) — narrowing a
+ * concretely-typed class reference straight to an unrelated target type doesn't apply
+ * the same way it does starting from `unknown`.
+ */
+function isOkClassConstructor<T extends LogSchema>(value: unknown): value is OkClassConstructor<T> {
+  return typeof value === 'function';
+}
+function isErrClassConstructor<T extends LogSchema>(value: unknown): value is ErrClassConstructor<T> {
+  return typeof value === 'function';
+}
+
+/** Cache key only needs messageLayoutFamily: it's the only input to the installers below besides schema/enumLookup. */
+const resultClassCache = new WeakMap<LogSchema, Map<MessageLayoutFamily, ResultClasses<LogSchema>>>();
+
+/**
+ * Get or create the schema-bound `Ok`/`Err` subclasses that carry row-1 fluent setters.
+ *
+ * WHY `state` is mandatory on these constructors (unlike the base `Ok`/`Err`
+ * constructors, where `state` is optional for standalone use like `new Ok(null)`): the
+ * installed setters write straight through `this._state._spanBuffer` with no optional
+ * chaining, mirroring how `installFixedWriterMethods` already writes TagWriter's row 0.
+ * That's safe because these classes are only ever constructed by `SpanContext.ok`/
+ * `.err()`, which always has a real span to write to — requiring `state` here makes
+ * that invariant a type error instead of a runtime one if some other call site ever
+ * tries to construct one directly.
+ *
+ * Standalone results built via `new Ok(value)` (e.g. `cloudflare/classSplit.ts`'s
+ * shared singleton) stay on the base `Ok`/`Err` classes and never see these setters —
+ * exactly matching the API surface those two constructions have (`.map()`/`.mapErr()`/
+ * `.flatMap()` also stay on the base classes, for the same reason).
+ */
+export function getResultClasses<T extends LogSchema>(
+  schema: T,
+  messageLayoutFamily: MessageLayoutFamily,
+  enumLookup: SchemaEnumLookupDescriptor,
+): ResultClasses<T> {
+  let familyClasses = resultClassCache.get(schema);
+  let cached: ResultClasses<LogSchema> | undefined = familyClasses?.get(messageLayoutFamily);
+
+  if (!cached) {
+    class SchemaOk<V> extends Ok<V, T> {}
+    class SchemaErr<E> extends Err<E, T> {}
+
+    const plans = createFixedFieldPlans(schema, enumLookup);
+    for (const prototype of [SchemaOk.prototype, SchemaErr.prototype]) {
+      installFixedWriterMethods(prototype, plans, 1);
+      installResultSystemMethods(prototype, messageLayoutFamily);
+    }
+
+    // Erase to `unknown` before narrowing — see the WHY on isOkClassConstructor above.
+    const okCtor: unknown = SchemaOk;
+    const errCtor: unknown = SchemaErr;
+    if (!isOkClassConstructor<LogSchema>(okCtor) || !isErrClassConstructor<LogSchema>(errCtor)) {
+      throw new Error('Failed to generate schema-bound Ok/Err constructors');
+    }
+
+    cached = { OkClass: okCtor, ErrClass: errCtor };
+    familyClasses ??= new Map();
+    familyClasses.set(messageLayoutFamily, cached);
+    resultClassCache.set(schema, familyClasses);
+  }
+
+  const cachedOkCtor: unknown = cached.OkClass;
+  const cachedErrCtor: unknown = cached.ErrClass;
+  if (!isOkClassConstructor<T>(cachedOkCtor) || !isErrClassConstructor<T>(cachedErrCtor)) {
+    throw new Error('Invalid cached Ok/Err constructor pair');
+  }
+
+  return { OkClass: cachedOkCtor, ErrClass: cachedErrCtor };
+}
+//#endregion smoo/lmao!n/lmao-entry-result-row-setters
 
 // =============================================================================
 // CODE ERROR FACTORY
