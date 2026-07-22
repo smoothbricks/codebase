@@ -53,8 +53,8 @@ app.get('/cart', async (req, res) => {
       const cart = await ctx.span('load-cart', loadCart, req.userId);
 
       return cart.success
-        ? ctx.ok(cart.value).with({ status: 200 })
-        : ctx.err(cart.error).with({ status: 404 });
+        ? ctx.ok(cart.value).status(200)
+        : ctx.err(cart.error).status(404);
     },
   );
 
@@ -69,8 +69,9 @@ Here `requestId` is a user-context property declared in
 `ctx.tag.status(200)` at the top of an op records a 200 even when the request goes on to fail — the tag is written
 before the outcome exists. Put the status on the **result** instead, where it can differ per branch.
 
-Note the shape: schema fields go through `.with({ … })`. There is no per-field setter on a result, so
-`ctx.ok(value).status(200)` is not valid — it throws `ctx.ok(...).status is not a function`.
+Schema fields are setters on the result too, mirroring `ctx.tag` on row 0: `ctx.ok(v).status(200)` writes directly to
+the span-end row. Setting several fields at once still goes through `.with({ … })` — `ctx.ok(v).with({ status: 200, requestId })`
+— the single-field form above is just the one-field case of the same mechanism.
 :::
 
 ## What the trace looks like
