@@ -36,7 +36,7 @@ const schema = defineLogSchema({
   requestId: S.category(),
   latency: S.number(),
   statusCode: S.number(),
-  success: S.boolean(),
+  succeeded: S.boolean(),
   operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
 });
 
@@ -98,7 +98,7 @@ summary(() => {
         ctx.tag.requestId('req-456');
         ctx.tag.latency(42.5);
         ctx.tag.statusCode(200);
-        ctx.tag.success(true);
+        ctx.tag.succeeded(true);
         ctx.tag.operation('READ');
         return ctx.ok('done');
       });
@@ -111,7 +111,7 @@ summary(() => {
         ctx.tag.requestId('req-456');
         ctx.tag.latency(42.5);
         ctx.tag.statusCode(200);
-        ctx.tag.success(true);
+        ctx.tag.succeeded(true);
         ctx.tag.operation('READ');
         return ctx.ok('done');
       });
@@ -263,7 +263,7 @@ summary(() => {
         ctx.tag.requestId('req-456');
         ctx.tag.latency(42.5);
         ctx.tag.statusCode(200);
-        ctx.tag.success(true);
+        ctx.tag.succeeded(true);
         ctx.tag.operation('READ');
         return ctx.ok('done');
       });
@@ -280,7 +280,7 @@ summary(() => {
         ctx.tag.requestId('req-456');
         ctx.tag.latency(42.5);
         ctx.tag.statusCode(200);
-        ctx.tag.success(true);
+        ctx.tag.succeeded(true);
         ctx.tag.operation('READ');
         return ctx.ok('done');
       });

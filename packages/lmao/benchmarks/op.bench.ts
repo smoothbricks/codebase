@@ -11,7 +11,7 @@ import { createTraceId } from '../src/lib/traceId.js';
 import { createTraceRoot } from '../src/lib/traceRoot.node.js';
 
 const schema = defineLogSchema({
-  value: S.number(),
+  metric: S.number(),
   tagValue: S.category(),
 });
 

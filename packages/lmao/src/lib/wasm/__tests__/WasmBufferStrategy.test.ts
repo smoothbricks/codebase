@@ -21,7 +21,7 @@ describe('WasmBufferStrategy', () => {
   const testSchema = defineLogSchema({
     userId: S.category(),
     latency: S.number(),
-    success: S.boolean(),
+    succeeded: S.boolean(),
     operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
   });
 
@@ -416,7 +416,7 @@ describe('WasmBufferStrategy', () => {
       root.message(0, 'leased-wasm-row');
       expect('message_nulls' in root).toBe(false);
       root.latency(0, 17.5);
-      root.success(0, true);
+      root.succeeded(0, true);
       root.operation(0, 1);
       root._writeIndex = 1;
 
@@ -427,7 +427,7 @@ describe('WasmBufferStrategy', () => {
       const lease = convertToLeasedArrowTable(root);
       expect(lease.released).toBe(false);
       expect(getColumnValue(lease.table, 'latency', 0)).toBe(17.5);
-      expect(getColumnValue(lease.table, 'success', 0)).toBe(true);
+      expect(getColumnValue(lease.table, 'succeeded', 0)).toBe(true);
       expect(getColumnValue(lease.table, 'operation', 0)).toBe('READ');
 
       const bytesToGrow = memoryBuffer.byteLength - leasedStrategy.getStats().bumpPtr + 8;
