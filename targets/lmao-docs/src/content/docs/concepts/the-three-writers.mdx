@@ -53,3 +53,11 @@ column values — which also means identical templates share storage.
 - Marks a moment in time? → **log**
 
 For the task-focused version, see [tag vs scope vs log](/guides/tag-vs-scope-vs-log/).
+
+:::note[The result carries the same mechanism, for its own row]
+`ctx.ok(v)`/`ctx.err(v)` aren't a fourth recorder to pick among these three — they're how the span closes. But the
+value they return has the same per-field setters as `ctx.tag`, writing to the row *they* own (row 1, span-end):
+`ctx.ok(v).status(200)` mirrors `ctx.tag.status(200)` exactly, just scoped to the outcome instead of the start. See
+[Integrate with an HTTP framework](/guides/integrate-with-http-framework/) for why row 1 is usually the right place
+for a value like HTTP status, which isn't known until the outcome is.
+:::
