@@ -52,7 +52,7 @@ function expectArrowSchema(table: Table, userFields: readonly string[]): void {
 describe('Library remap descriptor integration', () => {
   it('composes nested prefixes for same-schema siblings without wrapping canonical child buffers', async () => {
     const librarySchema = defineLogSchema({
-      value: S.number(),
+      metric: S.number(),
       label: S.category(),
     });
     const libraryContext = defineOpContext({ logSchema: librarySchema });
@@ -60,12 +60,12 @@ describe('Library remap descriptor integration', () => {
     const libraryOps = libraryContext.defineOps({
       recordNested: async (ctx) => {
         childBuffers.push(ctx.buffer);
-        ctx.tag.value(11).label('nested');
+        ctx.tag.metric(11).label('nested');
         return ctx.ok(null);
       },
       recordSibling: async (ctx) => {
         childBuffers.push(ctx.buffer);
-        ctx.tag.value(22).label('sibling');
+        ctx.tag.metric(22).label('sibling');
         return ctx.ok(null);
       },
     });
@@ -101,25 +101,25 @@ describe('Library remap descriptor integration', () => {
     expect(nestedBuffer._remapDescriptor).toBe(nested.recordNested.callsitePlan.remapDescriptor ?? undefined);
     expect(siblingBuffer._remapDescriptor).toBe(sibling.recordSibling.callsitePlan.remapDescriptor ?? undefined);
     expect(nested.recordNested.callsitePlan.remapDescriptor?.sourceNames).toEqual({
-      v1_api_value: 'value',
+      v1_api_metric: 'metric',
       v1_api_label: 'label',
     });
     expect(sibling.recordSibling.callsitePlan.remapDescriptor?.sourceNames).toEqual({
-      sibling_value: 'value',
+      sibling_metric: 'metric',
       sibling_label: 'label',
     });
 
     const table = convertSpanTreeToArrowTable(rootBuffer);
-    expectArrowSchema(table, ['rootValue', 'v1_api_value', 'v1_api_label', 'sibling_value', 'sibling_label']);
+    expectArrowSchema(table, ['rootValue', 'v1_api_metric', 'v1_api_label', 'sibling_metric', 'sibling_label']);
     expect(table.numRows).toBe(6);
     expect(
       extractRows(table, [
         'entry_type',
         'message',
         'rootValue',
-        'v1_api_value',
+        'v1_api_metric',
         'v1_api_label',
-        'sibling_value',
+        'sibling_metric',
         'sibling_label',
       ]),
     ).toEqual([
@@ -127,70 +127,70 @@ describe('Library remap descriptor integration', () => {
         entry_type: 'span-start',
         message: 'root-span',
         rootValue: 1,
-        v1_api_value: null,
+        v1_api_metric: null,
         v1_api_label: null,
-        sibling_value: null,
+        sibling_metric: null,
         sibling_label: null,
       },
       {
         entry_type: 'span-ok',
         message: null,
         rootValue: null,
-        v1_api_value: null,
+        v1_api_metric: null,
         v1_api_label: null,
-        sibling_value: null,
+        sibling_metric: null,
         sibling_label: null,
       },
       {
         entry_type: 'span-start',
         message: 'nested-child',
         rootValue: null,
-        v1_api_value: 11,
+        v1_api_metric: 11,
         v1_api_label: 'nested',
-        sibling_value: null,
+        sibling_metric: null,
         sibling_label: null,
       },
       {
         entry_type: 'span-ok',
         message: null,
         rootValue: null,
-        v1_api_value: null,
+        v1_api_metric: null,
         v1_api_label: null,
-        sibling_value: null,
+        sibling_metric: null,
         sibling_label: null,
       },
       {
         entry_type: 'span-start',
         message: 'sibling-child',
         rootValue: null,
-        v1_api_value: null,
+        v1_api_metric: null,
         v1_api_label: null,
-        sibling_value: 22,
+        sibling_metric: 22,
         sibling_label: 'sibling',
       },
       {
         entry_type: 'span-ok',
         message: null,
         rootValue: null,
-        v1_api_value: null,
+        v1_api_metric: null,
         v1_api_label: null,
-        sibling_value: null,
+        sibling_metric: null,
         sibling_label: null,
       },
     ]);
   });
 
   it('keeps remapped values and nulls exact across an overflow chain', async () => {
-    const librarySchema = defineLogSchema({ value: S.number() });
+    const librarySchema = defineLogSchema({ metric: S.number() });
     const libraryContext = defineOpContext({ logSchema: librarySchema });
     let childBuffer: AnySpanBuffer | undefined;
     const libraryOps = libraryContext.defineOps({
       overflow: async (ctx) => {
         childBuffer = ctx.buffer;
-        ctx.tag.value(100);
+        ctx.tag.metric(100);
         for (let index = 0; index < 9; index++) {
           const entry = ctx.log.info(`event-${index}`);
-          if (index % 2 === 0) entry.value(index);
+          if (index % 2 === 0) entry.metric(index);
         }
         return ctx.ok(null);
       },
@@ -223,22 +223,22 @@ describe('Library remap descriptor integration', () => {
     expect(childBuffer._remapDescriptor).toBe(mapped.overflow.callsitePlan.remapDescriptor ?? undefined);
 
     const table = convertSpanTreeToArrowTable(rootBuffer);
-    expectArrowSchema(table, ['overflow_value']);
+    expectArrowSchema(table, ['overflow_metric']);
     expect(table.numRows).toBe(13);
-    expect(extractRows(table, ['entry_type', 'message', 'overflow_value'])).toEqual([
-      { entry_type: 'span-start', message: 'root-span', overflow_value: null },
-      { entry_type: 'span-ok', message: null, overflow_value: null },
-      { entry_type: 'span-start', message: 'overflow-child', overflow_value: 100 },
-      { entry_type: 'span-ok', message: null, overflow_value: null },
-      { entry_type: 'info', message: 'event-0', overflow_value: 0 },
-      { entry_type: 'info', message: 'event-1', overflow_value: null },
-      { entry_type: 'info', message: 'event-2', overflow_value: 2 },
-      { entry_type: 'info', message: 'event-3', overflow_value: null },
-      { entry_type: 'info', message: 'event-4', overflow_value: 4 },
-      { entry_type: 'info', message: 'event-5', overflow_value: null },
-      { entry_type: 'info', message: 'event-6', overflow_value: 6 },
-      { entry_type: 'info', message: 'event-7', overflow_value: null },
-      { entry_type: 'info', message: 'event-8', overflow_value: 8 },
+    expect(extractRows(table, ['entry_type', 'message', 'overflow_metric'])).toEqual([
+      { entry_type: 'span-start', message: 'root-span', overflow_metric: null },
+      { entry_type: 'span-ok', message: null, overflow_metric: null },
+      { entry_type: 'span-start', message: 'overflow-child', overflow_metric: 100 },
+      { entry_type: 'span-ok', message: null, overflow_metric: null },
+      { entry_type: 'info', message: 'event-0', overflow_metric: 0 },
+      { entry_type: 'info', message: 'event-1', overflow_metric: null },
+      { entry_type: 'info', message: 'event-2', overflow_metric: 2 },
+      { entry_type: 'info', message: 'event-3', overflow_metric: null },
+      { entry_type: 'info', message: 'event-4', overflow_metric: 4 },
+      { entry_type: 'info', message: 'event-5', overflow_metric: null },
+      { entry_type: 'info', message: 'event-6', overflow_metric: 6 },
+      { entry_type: 'info', message: 'event-7', overflow_metric: null },
+      { entry_type: 'info', message: 'event-8', overflow_metric: 8 },
     ]);
   });
 

@@ -71,7 +71,7 @@ describe('WASM Integration Tests', () => {
     userId: S.category(),
     latency: S.number(),
     operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
-    success: S.boolean(),
+    succeeded: S.boolean(),
   });
 
   // Define op context - env is optional (undefined by default, not null-sentinel)
@@ -451,7 +451,7 @@ describe('WASM Integration Tests', () => {
 
     it('keeps single-buffer Arrow output isolated from recycled WASM memory', async () => {
       await tracer.trace('arrow-first', async (ctx) => {
-        ctx.tag.latency(91.25).success(true).operation('READ');
+        ctx.tag.latency(91.25).succeeded(true).operation('READ');
         return ctx.ok('done');
       });
 
@@ -460,22 +460,22 @@ describe('WASM Integration Tests', () => {
       expect(firstTable.numRows).toBe(2);
       expect(firstTable.getChild('message')?.get(0)).toBe('arrow-first');
       expect(firstTable.getChild('latency')?.get(0)).toBe(91.25);
-      expect(firstTable.getChild('success')?.get(0)).toBe(true);
+      expect(firstTable.getChild('succeeded')?.get(0)).toBe(true);
       expect(firstTable.getChild('operation')?.get(0)).toBe('READ');
 
       strategy.releaseBuffer(firstBuffer);
       await tracer.trace('arrow-second', async (ctx) => {
-        ctx.tag.latency(-17.5).success(false).operation('DELETE');
+        ctx.tag.latency(-17.5).succeeded(false).operation('DELETE');
         return ctx.ok('done');
       });
 
       const secondTable = convertToArrowTable(tracer.rootBuffers[1]);
       expect(secondTable.getChild('latency')?.get(0)).toBe(-17.5);
-      expect(secondTable.getChild('success')?.get(0)).toBe(false);
+      expect(secondTable.getChild('succeeded')?.get(0)).toBe(false);
       expect(secondTable.getChild('operation')?.get(0)).toBe('DELETE');
       expect(firstTable.getChild('message')?.get(0)).toBe('arrow-first');
       expect(firstTable.getChild('latency')?.get(0)).toBe(91.25);
-      expect(firstTable.getChild('success')?.get(0)).toBe(true);
+      expect(firstTable.getChild('succeeded')?.get(0)).toBe(true);
       expect(firstTable.getChild('operation')?.get(0)).toBe('READ');
     });
 
@@ -624,7 +624,7 @@ describe('WASM Integration Tests', () => {
         userId: S.category(),
         latency: S.number(),
         operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
-        success: S.boolean(),
+        succeeded: S.boolean(),
       });
       const jsOpContext = defineOpContext({
         logSchema: jsSchema,
@@ -698,7 +698,7 @@ describe('WASM Integration Tests', () => {
           name: 'root',
           run: async (target: typeof tracer) => {
             await target.trace('ordered-root', async (root) => {
-              root.tag.latency(1.25).success(true).operation('CREATE');
+              root.tag.latency(1.25).succeeded(true).operation('CREATE');
               root.log.info('ordered-root-log');
               return root.ok('root done');
             });
@@ -796,7 +796,7 @@ describe('WASM Integration Tests', () => {
         const wasmTable = strategy.toArrowTable(wasmRoot);
         expect(wasmTable.numRows).toBe(jsTable.numRows);
 
-        for (const columnName of ['entry_type', 'message', 'latency', 'success', 'operation']) {
+        for (const columnName of ['entry_type', 'message', 'latency', 'succeeded', 'operation']) {
           const jsColumn = jsTable.getChild(columnName);
           const wasmColumn = wasmTable.getChild(columnName);
           if (!jsColumn || !wasmColumn) throw new Error(`${workload.name} is missing parity column ${columnName}`);

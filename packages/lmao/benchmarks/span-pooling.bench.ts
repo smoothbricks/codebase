@@ -44,7 +44,7 @@ type RunOutcome = {
   readonly poolRef: null;
 };
 
-const SCHEMA = defineLogSchema({ value: S.number() });
+const SCHEMA = defineLogSchema({ metric: S.number() });
 const CONTEXT = defineOpContext({ logSchema: SCHEMA });
 const RUNTIME_SCHEMA = CONTEXT.logBinding.logSchema;
 type RuntimeContext = OpContextOf<typeof CONTEXT>;
@@ -142,7 +142,7 @@ function writeRows(
     const outputRow = plan.appenders.writeLogEntry(buffer, ENTRY_TYPE_INFO);
     const message = `request-${request}/row-${row}`;
     buffer.message(outputRow, message);
-    buffer.value(outputRow, request * 1_000 + row + 0.25);
+    buffer.metric(outputRow, request * 1_000 + row + 0.25);
     checksum = mix(checksum, outputRow);
     checksum = mix(checksum, message.length);
   }
