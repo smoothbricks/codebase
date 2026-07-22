@@ -17,6 +17,7 @@ import type { RemapDescriptor } from './logBinding.js';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { OpContext } from './opContext/types.js';
 import { decodeVocabularyMessage, MAX_PACKED_MESSAGE_DENSE_INDEX } from './resolveMessage.js';
+import { type ErrClassConstructor, getResultClasses, type OkClassConstructor } from './result.js';
 import {
   isRuntimeHintAnalyzed,
   type MessageLayoutFamily,
@@ -169,6 +170,9 @@ export interface PhysicalLayoutPlan<T extends LogSchema = LogSchema, Ctx extends
   readonly SpanLoggerClass: SpanLoggerConstructor<T> | undefined;
   readonly TagWriterClass: TagWriterConstructor<T> | undefined;
   readonly ResultWriterClass: ResultWriterConstructor;
+  /** Schema-bound Ok/Err subclasses carrying row-1 fluent setters (ctx.ok(v).status(200)). */
+  readonly OkClass: OkClassConstructor<T>;
+  readonly ErrClass: ErrClassConstructor<T>;
   readonly clock: PhysicalClock;
   readonly appenders: PhysicalAppenders;
   readonly appendLogEntry: TimestampAppendPrimitive;
@@ -473,6 +477,9 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
     eagerColumns.names,
     enumLookup,
   );
+  // OkClass/ErrClass only vary with messageLayoutFamily + enumLookup (see getResultClasses'
+  // WHY comment) — no eagerColumns/messagePhysicalLayout dependency, unlike ResultWriterClass.
+  const { OkClass, ErrClass } = getResultClasses(schema, messageLayoutFamily, enumLookup);
   const needsTag = (capabilities & RUNTIME_HINT_TAG) !== 0;
   const TagWriterClass = needsTag ? getTagWriterClass(schema, eagerColumns.names, enumLookup) : undefined;
   const newSpanLogger =
@@ -499,6 +506,8 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
     SpanLoggerClass,
     TagWriterClass,
     ResultWriterClass,
+    OkClass,
+    ErrClass,
     clock: TRACE_ROOT_CLOCK,
     appendLogEntry: messagePhysicalLayout === 'packed' ? PACKED_APPEND_LOG_ENTRY : SPLIT_APPEND_LOG_ENTRY,
     appenders: APPENDERS_BY_MESSAGE_LAYOUT[`${messageLayoutFamily}:${messagePhysicalLayout}`],

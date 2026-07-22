@@ -873,8 +873,17 @@ export function createSpanContextClass<Ctx extends OpContext>(
       }
 
       if (hasResult) {
-        this.ok = <V>(value: V): Ok<V, Ctx['logSchema']> => new Ok<V, Ctx['logSchema']>(value, this);
-        this.err = <E>(error: E): Err<E, Ctx['logSchema']> => new Err<E, Ctx['logSchema']>(error, this);
+        // OkClass/ErrClass are per-schema subclasses of Ok/Err carrying row-1 fluent
+        // setters (ctx.ok(v).status(200)) — see getResultClasses' WHY in result.ts for
+        // why `state` (always `this` here) is required on these constructors. The
+        // setters aren't reflected in ctx.ok's *declared* return type (Ok<V,T>, not
+        // OkResult<V,T>) — see spanContextTypes.ts's WHY on SpanContext.ok for the
+        // variance conflict that creates with OpFn's Result<S,E> — but the object
+        // returned still carries them at runtime; reach them via `.with({...})` in
+        // typed code, or `.status(200)` directly where the concrete type is known.
+        const { OkClass, ErrClass } = callsitePlan;
+        this.ok = <V>(value: V): Ok<V, Ctx['logSchema']> => new OkClass<V>(value, this);
+        this.err = <E>(error: E): Err<E, Ctx['logSchema']> => new ErrClass<E>(error, this);
       }
       //#endregion smoo/lmao!n/codegen-destructured-context
 
