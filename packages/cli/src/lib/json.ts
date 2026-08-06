@@ -23,6 +23,8 @@ export interface PackagePublishConfig {
 
 export interface PackageSmooGithub {
   pushBranches?: string[];
+  /** GitHub Actions runs-on for managed CI (string or label list). Default: ubuntu-latest. */
+  runsOn?: string | string[];
 }
 
 export interface PackageSmooConfig {
