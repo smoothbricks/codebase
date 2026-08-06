@@ -19,7 +19,9 @@ defaults:
 jobs:
   main:
     name: Validate
-    runs-on: ubuntu-latest
+    runs-on:
+      ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      fromJSON('["nixos-latest-x64","self-hosted"]') || 'ubuntu-latest' }}
     timeout-minutes: 45
     env:
       NIX_STORE_NAR: ${{ github.workspace }}/nix-store.nar
@@ -37,7 +39,31 @@ jobs:
       # anchors; update the nx-smart --step values below if top-level steps move.
       - name: 🧱 Setup Nix/devenv
         id: setup
+        if:
+          ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+          }}
         uses: ./.github/actions/setup-devenv
+      - name: 🧱 Setup Nix/devenv
+        id: setup-nixos
+        if:
+          ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+          }}
+        shell: bash
+        working-directory: tooling/direnv
+        run: |
+          set -euo pipefail
+          ./github-actions-bootstrap.sh install-devenv
+          ./github-actions-bootstrap.sh build-shell
+      - name: 📦 Cache node_modules
+        if:
+          ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+          }}
+        uses: ./.github/actions/cache-node-modules
+      - name: 🧊 Cache ttsc plugins
+        if:
+          ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+          }}
+        uses: ./.github/actions/cache-ttsc-plugins
 
       # --- Nx -----------------------------------------------------------------
 
@@ -109,7 +135,9 @@ jobs:
 
       # Step 13
       - name: 🧹 Cleanup and cache Nix/devenv
-        if: ${{ always() }}
+        if:
+          ${{ always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name !=
+          github.repository }}
         uses: ./.github/actions/save-nix-devenv
         with:
           nix-cache-hit: ${{ steps.setup.outputs.nix-cache-hit }}
