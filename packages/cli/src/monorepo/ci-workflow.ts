@@ -26,6 +26,8 @@ export interface CiWorkflowDefinitionOptions {
   deploy: boolean;
   deployProvider?: 'cloudflare';
   pushBranches: string[];
+  /** Default ubuntu-latest when omitted. */
+  runsOn?: string | string[];
 }
 
 type CiWorkflowStepInput = Omit<CiWorkflowStep, 'number'>;
@@ -80,13 +82,46 @@ defaults:
 jobs:
   main:
     name: Validate
-    runs-on: ubuntu-latest
+    runs-on: ${renderRunsOn(options.runsOn)}
     timeout-minutes: 45
     env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
       GH_TOKEN: ${githubExpression('github.token')}
     steps:
 `;
+}
+
+function isNixosRunner(runsOn: string | string[] | undefined): boolean {
+  const labels = runsOn === undefined ? [] : typeof runsOn === 'string' ? [runsOn] : runsOn;
+  return labels.some((label) => label === 'nixos' || label.startsWith('nixos-'));
+}
+
+/** Job should use configured nixos runners (false for fork PRs). */
+function githubUsesNixosRunnerExpr(): string {
+  return "(github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)";
+}
+
+function renderRunsOn(runsOn: string | string[] | undefined): string {
+  if (!isNixosRunner(runsOn)) {
+    if (runsOn === undefined) {
+      return 'ubuntu-latest';
+    }
+    if (typeof runsOn === 'string') {
+      return runsOn.length > 0 ? runsOn : 'ubuntu-latest';
+    }
+    if (runsOn.length === 0) {
+      return 'ubuntu-latest';
+    }
+    if (runsOn.length === 1) {
+      return runsOn[0] ?? 'ubuntu-latest';
+    }
+    return `[${runsOn.map((label) => `'${label}'`).join(', ')}]`;
+  }
+
+  const labels = typeof runsOn === 'string' ? [runsOn] : runsOn;
+  // fromJSON needs a JSON string; prettier-friendly single-quoted labels in the embedded JSON.
+  const nixosJson = JSON.stringify(labels);
+  return `\${{ ${githubUsesNixosRunnerExpr()} && fromJSON('${nixosJson}') || 'ubuntu-latest' }}`;
 }
 
 function githubExpression(expression: string): string {
@@ -150,7 +185,33 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         '          fetch-depth: 0',
       ];
     case CiWorkflowStepKind.SetupDevenv:
-      return [`      - name: ${step.name}`, '        id: setup', '        uses: ./.github/actions/setup-devenv'];
+      if (!isNixosRunner(options.runsOn)) {
+        return [`      - name: ${step.name}`, '        id: setup', '        uses: ./.github/actions/setup-devenv'];
+      }
+      // Fork PRs: full GitHub setup action. Internal: thin host nix (no install/NAR/devenv cache).
+      // Gate whole steps — no platform ifs inside the composite action.
+      return [
+        `      - name: ${step.name}`,
+        '        id: setup',
+        "        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}",
+        '        uses: ./.github/actions/setup-devenv',
+        `      - name: ${step.name}`,
+        '        id: setup-nixos',
+        "        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}",
+        '        shell: bash',
+        '        working-directory: tooling/direnv',
+        '        run: |',
+        '          set -euo pipefail',
+        '          ./github-actions-bootstrap.sh install-devenv',
+        '          ./github-actions-bootstrap.sh build-shell',
+        '      - name: 📦 Cache node_modules',
+        "        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}",
+        '        uses: ./.github/actions/cache-node-modules',
+        '      - name: 🧊 Cache ttsc plugins',
+        "        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}",
+        '        uses: ./.github/actions/cache-ttsc-plugins',
+      ];
+
     case CiWorkflowStepKind.SetNxShas:
       return [
         `      - name: ${step.name}`,
@@ -222,9 +283,20 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         '          include-hidden-files: true',
       ];
     case CiWorkflowStepKind.SaveNixDevenv:
+      if (!isNixosRunner(options.runsOn)) {
+        return [
+          `      - name: ${step.name}`,
+          '        if: ${{ always() }}',
+          '        uses: ./.github/actions/save-nix-devenv',
+          '        with:',
+          '          nix-cache-hit: ${{ steps.setup.outputs.nix-cache-hit }}',
+          '          devenv-cache-hit: ${{ steps.setup.outputs.devenv-cache-hit }}',
+        ];
+      }
+      // Only when the GitHub-hosted setup action ran (fork PRs).
       return [
         `      - name: ${step.name}`,
-        '        if: ${{ always() }}',
+        "        if: ${{ always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}",
         '        uses: ./.github/actions/save-nix-devenv',
         '        with:',
         '          nix-cache-hit: ${{ steps.setup.outputs.nix-cache-hit }}',
