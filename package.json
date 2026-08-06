@@ -88,5 +88,13 @@
   },
   "overrides": {
     "typia": "13.1.19"
+  },
+  "smoo": {
+    "github": {
+      "runsOn": [
+        "nixos-latest-x64",
+        "self-hosted"
+      ]
+    }
   }
 }

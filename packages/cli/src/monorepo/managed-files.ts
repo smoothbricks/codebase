@@ -137,6 +137,7 @@ interface ManagedFileContext {
   stagingDeployProvider?: 'cloudflare';
   productionDeployProvider?: 'cloudflare';
   ciPushBranches: string[];
+  ciRunsOn: string | string[];
   nodeModulesCacheKey: string;
   repoName: string;
   platformTargetGlobs: string[];
@@ -306,6 +307,7 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         deploy: context.hasStagingDeployTargets,
         deployProvider: context.stagingDeployProvider,
         pushBranches: context.ciPushBranches,
+        runsOn: context.ciRunsOn,
       });
     }
     if (file.source === 'publish-workflow') {
@@ -331,6 +333,7 @@ function getManagedFileContext(root: string): ManagedFileContext {
   const packageJson = readPackageJson(join(root, 'package.json'));
   const repoName = packageJson?.name ?? 'monorepo';
   const ciPushBranches = getCiPushBranches(packageJson?.json);
+  const ciRunsOn = getCiRunsOn(packageJson?.json);
   const stagingDeploy = getDeployTargetInfo(root, 'staging');
   const productionDeploy = getDeployTargetInfo(root, 'production');
   const platformTargetGlobs = platformTargetGlobsForTest(readResolvedNxTargetNames(root));
@@ -344,6 +347,7 @@ function getManagedFileContext(root: string): ManagedFileContext {
     stagingDeployProvider: stagingDeploy.provider,
     productionDeployProvider: productionDeploy.provider,
     ciPushBranches,
+    ciRunsOn,
     nodeModulesCacheKey,
     repoName,
     platformTargetGlobs,
@@ -431,6 +435,18 @@ function nxDeployTarget(root: string, project: string, configuration: string): D
   const commandValue = config.command ?? config.options?.command ?? deploy?.options?.command;
   const command = typeof commandValue === 'string' ? commandValue : '';
   return { exists: true, provider: command.includes('wrangler ') ? 'cloudflare' : undefined };
+}
+
+function getCiRunsOn(packageJson: PackageJson | null | undefined): string | string[] {
+  const configured = packageJson?.smoo?.github?.runsOn;
+  if (configured === undefined) {
+    return 'ubuntu-latest';
+  }
+  if (typeof configured === 'string') {
+    return configured.length > 0 ? configured : 'ubuntu-latest';
+  }
+  const labels = configured.filter((label) => label.length > 0);
+  return labels.length > 0 ? labels : 'ubuntu-latest';
 }
 
 function getCiPushBranches(packageJson: PackageJson | null | undefined): string[] {

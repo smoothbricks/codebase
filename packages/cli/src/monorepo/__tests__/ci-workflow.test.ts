@@ -5,9 +5,15 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { CiWorkflowStepKind, defineCiWorkflow, renderCiWorkflowYaml } from '../ci-workflow.js';
 
+const nixosRunsOn = ['nixos-latest-x64', 'self-hosted'] as const;
+
 describe('CI workflow definition', () => {
   it('renders the checked-in local CI workflow copy', async () => {
-    const rendered = renderCiWorkflowYaml({ deploy: false, pushBranches: ['main'] });
+    const rendered = renderCiWorkflowYaml({
+      deploy: false,
+      pushBranches: ['main'],
+      runsOn: [...nixosRunsOn],
+    });
     const packageRoot = join(import.meta.dir, '..', '..', '..');
 
     await expect(readFile(join(packageRoot, '..', '..', '.github/workflows/ci.yml'), 'utf8')).resolves.toBe(rendered);
@@ -25,6 +31,9 @@ describe('CI workflow definition', () => {
       'smoo github-ci nx-deploy --configuration staging --mode affected --name "Deploy Staging" --step 11',
     );
     expect(rendered).toContain("# Step 12\n      # Nx's database cache needs artifact files");
+    expect(rendered).toContain('uses: ./.github/actions/setup-devenv');
+    expect(rendered).toContain('uses: ./.github/actions/save-nix-devenv');
+    expect(rendered).toContain('runs-on: ubuntu-latest');
   });
 
   it('adds Cloudflare credentials for Wrangler-backed deploys', () => {
@@ -43,5 +52,32 @@ describe('CI workflow definition', () => {
 
     expect(restoreKey).toBe('${{ runner.os }}-${{ runner.arch }}-nx-db-v1-${{ github.sha }}');
     expect(saveKey).toBe(restoreKey);
+  });
+
+  it('nixos config: fork PRs on ubuntu, internal on nixos labels; setup actions wholly gated', () => {
+    const rendered = renderCiWorkflowYaml({
+      deploy: false,
+      pushBranches: ['main'],
+      runsOn: [...nixosRunsOn],
+    });
+
+    expect(rendered).toContain(
+      "runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('[\"nixos-latest-x64\",\"self-hosted\"]') || 'ubuntu-latest' }}",
+    );
+    // whole setup-devenv action only for forks
+    expect(rendered).toContain(
+      "if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}",
+    );
+    expect(rendered).toContain('uses: ./.github/actions/setup-devenv');
+    // thin nixos path
+    expect(rendered).toContain('./github-actions-bootstrap.sh install-devenv');
+    expect(rendered).toContain('./github-actions-bootstrap.sh build-shell');
+    expect(rendered).not.toContain('platform:');
+    expect(rendered).not.toContain('determinate-nix-action');
+    // save only when fork path ran
+    expect(rendered).toContain(
+      "if: ${{ always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}",
+    );
+    expect(rendered).toContain('uses: ./.github/actions/save-nix-devenv');
   });
 });
