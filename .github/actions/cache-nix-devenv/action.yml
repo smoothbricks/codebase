@@ -24,7 +24,7 @@ runs:
     # should not invalidate a 1GB+ store cache.
     - name: Restore Nix profiles, devenv and direnv
       id: restore-nix
-      if: ${{ inputs.segment == 'nix' && inputs.mode == 'restore' }}
+      if: inputs.segment == 'nix' && inputs.mode == 'restore'
       uses: actions/cache/restore@v5.0.5
       with:
         path: |
@@ -39,7 +39,7 @@ runs:
           ${{ runner.os }}-${{ runner.arch }}-nix-v3-
 
     - name: Save Nix profiles and store NAR
-      if: ${{ inputs.segment == 'nix' && inputs.mode == 'save' }}
+      if: inputs.segment == 'nix' && inputs.mode == 'save'
       uses: actions/cache/save@v5.0.5
       with:
         path: |
@@ -55,7 +55,7 @@ runs:
     # Workflows restore this segment only after an exact Nix cache hit.
     - name: Restore devenv and direnv state
       id: restore-devenv
-      if: ${{ inputs.segment == 'devenv' && inputs.mode == 'restore' }}
+      if: inputs.segment == 'devenv' && inputs.mode == 'restore'
       uses: actions/cache/restore@v5.0.5
       with:
         path: |
@@ -69,7 +69,7 @@ runs:
           ${{ runner.os }}-${{ runner.arch }}-devenv-v3-
 
     - name: Save devenv and direnv state
-      if: ${{ inputs.segment == 'devenv' && inputs.mode == 'save' }}
+      if: inputs.segment == 'devenv' && inputs.mode == 'save'
       uses: actions/cache/save@v5.0.5
       with:
         path: |

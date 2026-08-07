@@ -441,7 +441,8 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
     case PublishWorkflowStepKind.UploadTraceDbs:
       return [
         `      - name: ${step.name}`,
-        `        if: ${githubExpression('failure()')}`,
+        '        # Default is success(); failure() uploads traces only when the job already failed.',
+        '        if: failure()',
         '        uses: actions/upload-artifact@v7.0.1',
         '        with:',
         `          name: trace-results-${githubExpression('github.run_id')}`,
@@ -465,7 +466,8 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
     case PublishWorkflowStepKind.SaveNixDevenv:
       return [
         `      - name: ${step.name}`,
-        `        if: ${githubExpression('always()')}`,
+        '        # success() is default; always() still saves GH Nix cache after a red job.',
+        '        if: always()',
         '        uses: ./.github/actions/save-nix-devenv',
         '        with:',
         `          nix-cache-hit: ${githubExpression('steps.setup.outputs.nix-cache-hit')}`,
@@ -498,7 +500,7 @@ function deployEnvLines(options: PublishWorkflowDefinitionOptions): string[] {
 
 function conditionalRunStep(step: PublishWorkflowStep, run: string): string[] {
   const condition = "steps.version.outputs.mode != 'none'";
-  return [`      - name: ${step.name}`, `        if: ${githubExpression(condition)}`, `        run: ${run}`];
+  return [`      - name: ${step.name}`, `        if: ${condition}`, `        run: ${run}`];
 }
 
 function renderSingleJobPublishWorkflowSteps(
@@ -514,7 +516,7 @@ function renderSingleJobPublishWorkflowSteps(
     if (step.kind === PublishWorkflowStepKind.Build) {
       lines.push(
         '      - name: 🐧 Build supplemental Linux targets',
-        `        if: ${githubExpression("steps.version.outputs.mode != 'none'")}`,
+        "        if: steps.version.outputs.mode != 'none'",
         `        run: smoo github-ci nx-run-many --targets "${LINUX_PLATFORM_TARGET_GLOBS.join(',')}" --projects "${githubExpression(
           'steps.version.outputs.projects',
         )}"`,
@@ -642,7 +644,7 @@ function renderLinuxReleaseCandidateSteps(
     } else if (step.kind === PublishWorkflowStepKind.Build) {
       lines.push(
         `      - name: ${step.name}`,
-        `        if: ${githubExpression("steps.version.outputs.mode != 'none'")}`,
+        "        if: steps.version.outputs.mode != 'none'",
         '        run:',
         `          smoo github-ci nx-run-many --targets build --projects "${githubExpression(
           'steps.version.outputs.projects',
@@ -667,7 +669,7 @@ function renderLinuxReleaseCandidateSteps(
         '',
         `      # Step ${stepNumber}`,
         '      - name: 🐧 Build supplemental Linux targets',
-        `        if: ${githubExpression("steps.version.outputs.mode != 'none'")}`,
+        "        if: steps.version.outputs.mode != 'none'",
         '        run:',
         `          smoo github-ci nx-run-many --targets "${LINUX_PLATFORM_TARGET_GLOBS.join(
           ',',
@@ -700,7 +702,7 @@ function renderLinuxReleaseCandidateSteps(
     '',
     `      # Step ${stepNumber++}`,
     '      - name: 📤 Upload validated build outputs',
-    `        if: ${githubExpression("steps.version.outputs.mode != 'none'")}`,
+    "        if: steps.version.outputs.mode != 'none'",
     '        uses: actions/upload-artifact@v7.0.1',
     '        with:',
     `          name: publish-release-outputs-${githubExpression('github.run_id')}`,
@@ -714,7 +716,7 @@ function renderLinuxReleaseCandidateSteps(
       '',
       `      # Step ${stepNumber++}`,
       '      - name: 📤 Upload supplemental Linux outputs',
-      `        if: ${githubExpression("steps.version.outputs.mode != 'none'")}`,
+      "        if: steps.version.outputs.mode != 'none'",
       '        uses: actions/upload-artifact@v7.0.1',
       '        with:',
       `          name: publish-linux-outputs-${githubExpression('github.run_id')}`,
@@ -730,7 +732,8 @@ function renderLinuxReleaseCandidateSteps(
     '',
     `      # Step ${stepNumber}`,
     '      - name: 🧹 Cleanup and cache Nix/devenv',
-    `        if: ${githubExpression('always()')}`,
+    '        # success() is default; always() still saves GH Nix cache after a red job.',
+    '        if: always()',
     '        uses: ./.github/actions/save-nix-devenv',
     '        with:',
     `          nix-cache-hit: ${githubExpression('steps.setup.outputs.nix-cache-hit')}`,
@@ -792,7 +795,8 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     '',
     `      # Step ${stepNumber}`,
     '      - name: 🧹 Cleanup and cache Nix/devenv',
-    `        if: ${githubExpression('always()')}`,
+    '        # success() is default; always() still saves GH Nix cache after a red job.',
+    '        if: always()',
     '        uses: ./.github/actions/save-nix-devenv',
     '        with:',
     `          nix-cache-hit: ${githubExpression('steps.setup.outputs.nix-cache-hit')}`,
@@ -876,7 +880,7 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     '',
     `      # Step ${stepNumber++}`,
     '      - name: 📦 Apply verified Linux outputs',
-    `        if: ${githubExpression(`${mode} != 'none'`)}`,
+    `        if: ${mode} != 'none'`,
     '        run:',
     `          smoo github-ci apply-outputs --source-sha "${githubExpression(
       'needs.linux-release-candidate.outputs.release-sha',
@@ -896,7 +900,7 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     '',
     `      # Step ${stepNumber++}`,
     '      - name: 🍎 Apply verified macOS outputs',
-    `        if: ${githubExpression(`${mode} != 'none'`)}`,
+    `        if: ${mode} != 'none'`,
     '        run:',
     `          smoo github-ci apply-outputs --source-sha "${githubExpression('github.sha')}"`,
     `          "${githubExpression('runner.temp')}/publish-artifacts/publish-macos-outputs-${githubExpression(
@@ -905,7 +909,7 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     '',
     `      # Step ${stepNumber++}`,
     `      - name: ✅ Validate restored release (${githubExpression(mode)})`,
-    `        if: ${githubExpression(`${mode} != 'none'`)}`,
+    `        if: ${mode} != 'none'`,
     '        run: smoo monorepo validate',
     '',
     '      # --- Release ------------------------------------------------------------',
@@ -937,7 +941,8 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     '',
     `      # Step ${stepNumber}`,
     '      - name: 🧹 Cleanup and cache Nix/devenv',
-    `        if: ${githubExpression('always()')}`,
+    '        # success() is default; always() still saves GH Nix cache after a red job.',
+    '        if: always()',
     '        uses: ./.github/actions/save-nix-devenv',
     '        with:',
     `          nix-cache-hit: ${githubExpression('steps.setup.outputs.nix-cache-hit')}`,

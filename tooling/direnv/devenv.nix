@@ -16,56 +16,59 @@ in {
   ];
 
   # https://devenv.sh/packages/
-  packages = with pkgs; [
-    gnutar # Tarball inspection for package validation
-    coreutils # Provides fmt for commit message wrapping
-    git # Git hooks and repository inspection
-    gh # GitHub Actions and release inspection
-    # Develop against latest Node.js version
-    nodejs_latest
-    # Bun.sh for javascript dependencies
-    bun
-    # Rust toolchain for packages/cowshed and packages/lmao-rs: cargo, rustc,
-    # clippy, rustfmt via rust-overlay stable, plus rust-src/rust-analyzer for
-    # IDE and LSP use. Keep the WASM target on every system; add only the
-    # native release targets that the current runner can build.
-    (rust-bin.stable.latest.default.override {
-      extensions = ["rust-src" "rust-analyzer"];
-      targets =
-        ["wasm32-unknown-unknown"]
-        ++ lib.optionals pkgs.stdenv.isDarwin [
-          "aarch64-apple-darwin"
-          "x86_64-apple-darwin"
-        ]
-        ++ lib.optionals pkgs.stdenv.isLinux [
-          "aarch64-unknown-linux-gnu"
-        ];
-    })
-    # Nightly rides alongside stable as an explicit `cargo-nightly` shim, so
-    # stable stays the default for every existing target. Only the wasm
-    # artifact build uses it: -Zbuild-std + panic=immediate-abort strips the
-    # fmt/panic machinery stable cannot remove (packages/columine justfile
-    # `wasm`; same shim as AxE's devenv). rust-src is required by -Zbuild-std.
-    (let
-      nightly = rust-bin.nightly.latest.minimal.override {
-        extensions = ["rust-src"];
-      };
-    in
-      pkgs.writeShellScriptBin "cargo-nightly" ''
-        export RUSTC="${nightly}/bin/rustc"
-        exec "${nightly}/bin/cargo" "$@"
-      '')
-    just # Task runner for packages/columine (mirrors lmao-rs/axe justfiles)
-    cargo-nextest # Rust test runner
-    cargo-mutants # Mutation target inferred by @smoothbricks/nx-plugin
-    # Go toolchain for packages/lmao-ttsc/plugin (ttsc transform plugin)
-    go
-    sccache # Shared Rust compile cache (cowshed cache layer 3)
-    # Git hooks and formatters
-    git-format-staged
-    jq # Used in pre-commit hook and generally useful
-    alejandra # Nix formatter
-  ];
+  packages =
+    (with pkgs; [
+      gnutar # Tarball inspection for package validation
+      coreutils # Provides fmt for commit message wrapping
+      git # Git hooks and repository inspection
+      gh # GitHub Actions and release inspection
+      # Develop against latest Node.js version
+      nodejs_latest
+      # Bun.sh for javascript dependencies
+      bun
+      # Rust toolchain for packages/cowshed and packages/lmao-rs: cargo, rustc,
+      # clippy, rustfmt via rust-overlay stable, plus rust-src/rust-analyzer for
+      # IDE and LSP use. Keep the WASM target on every system; add only the
+      # native release targets that the current runner can build.
+      (rust-bin.stable.latest.default.override {
+        extensions = ["rust-src" "rust-analyzer"];
+        targets =
+          ["wasm32-unknown-unknown"]
+          ++ lib.optionals pkgs.stdenv.isDarwin [
+            "aarch64-apple-darwin"
+            "x86_64-apple-darwin"
+          ]
+          ++ lib.optionals pkgs.stdenv.isLinux [
+            "aarch64-unknown-linux-gnu"
+          ];
+      })
+      # Nightly rides alongside stable as an explicit `cargo-nightly` shim, so
+      # stable stays the default for every existing target. Only the wasm
+      # artifact build uses it: -Zbuild-std + panic=immediate-abort strips the
+      # fmt/panic machinery stable cannot remove (packages/columine justfile
+      # `wasm`; same shim as AxE's devenv). rust-src is required by -Zbuild-std.
+      (let
+        nightly = rust-bin.nightly.latest.minimal.override {
+          extensions = ["rust-src"];
+        };
+      in
+        pkgs.writeShellScriptBin "cargo-nightly" ''
+          export RUSTC="${nightly}/bin/rustc"
+          exec "${nightly}/bin/cargo" "$@"
+        '')
+      just # Task runner for packages/columine (mirrors lmao-rs/axe justfiles)
+      cargo-nextest # Rust test runner
+      cargo-mutants # Mutation target inferred by @smoothbricks/nx-plugin
+      # Go toolchain for packages/lmao-ttsc/plugin (ttsc transform plugin)
+      go
+      sccache # Shared Rust compile cache (cowshed cache layer 3)
+      # Git hooks and formatters
+      git-format-staged
+      jq # Used in pre-commit hook and generally useful
+      alejandra # Nix formatter
+    ])
+    # GARM/Linux CI: rustc needs host linker `cc` (-Zbuild-std, native crates).
+    ++ lib.optionals pkgs.stdenv.isLinux [pkgs.stdenv.cc];
 
   # Use system Xcode for iOS simulator, signing, and instruments.
   # Nix Apple SDK is build-only — no simctl/simulator runtimes, and nix's
@@ -105,7 +108,7 @@ in {
     export TTSC_TSGO_BINARY="$PWD/node_modules/@typescript/native/bin/tsc"
     # Content-keyed native plugin binaries + GOCACHE. Keep outside node_modules so
     # dependency installs/caches stay lean; CI restores .cache/ttsc/plugins only.
-    export TTSC_CACHE_DIR="$PWD/.cache/ttsc"
+    export TTSC_CACHE_DIR="''${TTSC_CACHE_DIR:-$PWD/.cache/ttsc}"
     mkdir -p "$TTSC_CACHE_DIR"
     bun "$DEVENV_ROOT/enter-shell.ts" || exit $?
 
