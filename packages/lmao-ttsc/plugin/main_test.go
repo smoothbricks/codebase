@@ -13,7 +13,6 @@ import (
 )
 
 func TestNearestPackage(t *testing.T) {
-	t.Parallel()
 	// This file lives inside @smoothbricks/lmao-ttsc.
 	abs, err := filepath.Abs("main.go")
 	if err != nil {
@@ -29,14 +28,12 @@ func TestNearestPackage(t *testing.T) {
 }
 
 func TestGitLastCommitUnknownOutsideRepo(t *testing.T) {
-	t.Parallel()
 	if sha := gitLastCommit("/definitely/not/a/file.ts", "/tmp"); sha != "unknown" {
 		t.Fatalf("expected unknown, got %q", sha)
 	}
 }
 
 func TestReadOptionsResolvesExplicitTsconfigFromCwd(t *testing.T) {
-	t.Parallel()
 	options, err := readOptions([]string{
 		"--cwd=/x",
 		"--tsconfig=config/custom.json",
@@ -53,7 +50,6 @@ func TestReadOptionsResolvesExplicitTsconfigFromCwd(t *testing.T) {
 }
 
 func TestReadOptionsAcceptsReservedNativePluginTransportConfig(t *testing.T) {
-	t.Parallel()
 	cases := []struct {
 		name   string
 		config string
@@ -86,7 +82,6 @@ func TestReadOptionsAcceptsReservedNativePluginTransportConfig(t *testing.T) {
 }
 
 func TestReadOptionsRejectsArbitraryNativePluginOption(t *testing.T) {
-	t.Parallel()
 	pluginsJSON := `[{"name":"@smoothbricks/lmao-ttsc","stage":"transform","config":{"transform":"@smoothbricks/lmao-ttsc/ttsc-plugin","cache":true}}]`
 	_, err := readOptions([]string{"--cwd=/x", "--plugins-json=" + pluginsJSON})
 	want := `LMAO1010 @smoothbricks/lmao-ttsc unsupported configuration option "cache"`
@@ -96,7 +91,6 @@ func TestReadOptionsRejectsArbitraryNativePluginOption(t *testing.T) {
 }
 
 func TestReadOptionsPreservesMalformedTrailingAndDuplicatePluginDiagnostics(t *testing.T) {
-	t.Parallel()
 	valid := `{"name":"@smoothbricks/lmao-ttsc","stage":"transform","config":{"transform":"@smoothbricks/lmao-ttsc/ttsc-plugin"}}`
 	cases := []struct {
 		name    string

@@ -6,7 +6,6 @@ import (
 )
 
 func TestInlineableTagChainsClearCapabilityAndKeepDirectWrites(t *testing.T) {
-	t.Parallel()
 	output := transformTemplateFixture(t, `
 declare function value(label: string): string;
 defineOp('single-setter', (ctx) => {
@@ -53,7 +52,6 @@ defineOp('literal-with', (ctx) => {
 }
 
 func TestResidualTagUsesConservativelyRetainCapability(t *testing.T) {
-	t.Parallel()
 	output := transformTemplateFixture(t, `
 declare function value(label: string): string;
 declare function consume(value: unknown): void;

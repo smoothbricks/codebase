@@ -129,6 +129,16 @@ func callMessagePhysicalLayoutFromHint(physicalHint uint32) callMessagePhysicalL
 
 // analyzeOpFunction is intentionally closed-world. A hint is emitted only when
 // every use of the context parameter is a direct access to a known capability.
+
+// bumpOpCapacity accounts for one more statically counted row (log / ff).
+// Capacity packs into runtimeHint's low 16 bits; past 0xffff analysis goes adaptive.
+func bumpOpCapacity(capacity uint32, known bool) (uint32, bool) {
+	if known && capacity < 0xffff {
+		return capacity + 1, true
+	}
+	return capacity, false
+}
+
 func analyzeOpFunction(
 	fn *shimast.Node,
 	staticLogIDs map[*shimast.CallExpression]globalVocabularyID,
@@ -188,11 +198,7 @@ func analyzeOpFunction(
 			caps |= capability
 			if name == "ff" {
 				dynamicMessageRows++
-				if capacityKnown && capacity < 0xffff {
-					capacity++
-				} else {
-					capacityKnown = false
-				}
+				capacity, capacityKnown = bumpOpCapacity(capacity, capacityKnown)
 			}
 		}
 		if node.Kind == shimast.KindCallExpression {
@@ -208,11 +214,7 @@ func analyzeOpFunction(
 						} else {
 							dynamicMessageRows++
 						}
-						if capacityKnown && capacity < 0xffff {
-							capacity++
-						} else {
-							capacityKnown = false
-						}
+						capacity, capacityKnown = bumpOpCapacity(capacity, capacityKnown)
 					}
 				}
 			}

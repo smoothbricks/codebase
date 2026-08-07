@@ -33,6 +33,9 @@ type wholeProgramResult struct {
 
 func compileWholeProgramFixture(t *testing.T, sources []wholeProgramSource) wholeProgramResult {
 	t.Helper()
+	// tsgo program/printer not safe across parallel tests (see tsgoTestMu).
+	tsgoTestMu.Lock()
+	defer tsgoTestMu.Unlock()
 	root := t.TempDir()
 	declarationDir := filepath.Join(root, "node_modules", "@smoothbricks", "lmao")
 	if err := os.MkdirAll(declarationDir, 0o755); err != nil {
@@ -180,7 +183,6 @@ func assertFileLocalRegistration(t *testing.T, file wholeProgramFileResult, want
 }
 
 func TestWholeProgramVocabularyIsDeterministicAcrossReversedModulesTraversalAndDuplicates(t *testing.T) {
-	t.Parallel()
 	baselineA := `
 defineOp('a', (ctx) => {
   ctx.log.info('shared');
@@ -240,7 +242,6 @@ defineOp('b', async (ctx) => {
 }
 
 func TestWholeProgramEmptySourceEmitsNoVocabularyRegistration(t *testing.T) {
-	t.Parallel()
 	result := compileWholeProgramFixture(t, []wholeProgramSource{{name: "empty.ts", body: `"use client"; export const untouched = 1;`}})
 	file := result.files["empty.ts"]
 	if len(result.catalog.Entries) != 0 || len(file.entries) != 0 || len(file.ordinals) != 0 {
