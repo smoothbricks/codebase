@@ -82,7 +82,7 @@ defaults:
 jobs:
   main:
     name: Validate
-    runs-on: ${renderRunsOn(options.runsOn)}
+${renderRunsOnLine(options.runsOn)}
     timeout-minutes: 45
     env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
@@ -101,27 +101,29 @@ function githubUsesNixosRunnerExpr(): string {
   return "(github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)";
 }
 
-function renderRunsOn(runsOn: string | string[] | undefined): string {
+function renderRunsOnLine(runsOn: string | string[] | undefined): string {
   if (!isNixosRunner(runsOn)) {
+    let value: string;
     if (runsOn === undefined) {
-      return 'ubuntu-latest';
+      value = 'ubuntu-latest';
+    } else if (typeof runsOn === 'string') {
+      value = runsOn.length > 0 ? runsOn : 'ubuntu-latest';
+    } else if (runsOn.length === 0) {
+      value = 'ubuntu-latest';
+    } else if (runsOn.length === 1) {
+      value = runsOn[0] ?? 'ubuntu-latest';
+    } else {
+      value = `[${runsOn.map((label) => `'${label}'`).join(', ')}]`;
     }
-    if (typeof runsOn === 'string') {
-      return runsOn.length > 0 ? runsOn : 'ubuntu-latest';
-    }
-    if (runsOn.length === 0) {
-      return 'ubuntu-latest';
-    }
-    if (runsOn.length === 1) {
-      return runsOn[0] ?? 'ubuntu-latest';
-    }
-    return `[${runsOn.map((label) => `'${label}'`).join(', ')}]`;
+    return `    runs-on: ${value}`;
   }
 
   const labels = typeof runsOn === 'string' ? [runsOn] : runsOn;
-  // fromJSON needs a JSON string; prettier-friendly single-quoted labels in the embedded JSON.
+  // Multiline matches prettier output so checked-in ci.yml stays byte-identical.
   const nixosJson = JSON.stringify(labels);
-  return `\${{ ${githubUsesNixosRunnerExpr()} && fromJSON('${nixosJson}') || 'ubuntu-latest' }}`;
+  return `    runs-on:
+      \${{ ${githubUsesNixosRunnerExpr()} &&
+      fromJSON('${nixosJson}') || 'ubuntu-latest' }}`;
 }
 
 function githubExpression(expression: string): string {
@@ -185,32 +187,9 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         '          fetch-depth: 0',
       ];
     case CiWorkflowStepKind.SetupDevenv:
-      if (!isNixosRunner(options.runsOn)) {
-        return [`      - name: ${step.name}`, '        id: setup', '        uses: ./.github/actions/setup-devenv'];
-      }
-      // Fork PRs: full GitHub setup action. Internal: thin host nix (no install/NAR/devenv cache).
-      // Gate whole steps — no platform ifs inside the composite action.
-      return [
-        `      - name: ${step.name}`,
-        '        id: setup',
-        "        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}",
-        '        uses: ./.github/actions/setup-devenv',
-        `      - name: ${step.name}`,
-        '        id: setup-nixos',
-        "        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}",
-        '        shell: bash',
-        '        working-directory: tooling/direnv',
-        '        run: |',
-        '          set -euo pipefail',
-        '          ./github-actions-bootstrap.sh install-devenv',
-        '          ./github-actions-bootstrap.sh build-shell',
-        '      - name: 📦 Cache node_modules',
-        "        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}",
-        '        uses: ./.github/actions/cache-node-modules',
-        '      - name: 🧊 Cache ttsc plugins',
-        "        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}",
-        '        uses: ./.github/actions/cache-ttsc-plugins',
-      ];
+      // One step everywhere. setup-devenv detects host-nix (GARM) vs ephemeral
+      // and skips GH install/cache steps internally — same for ci/publish/managed.
+      return [`      - name: ${step.name}`, '        id: setup', '        uses: ./.github/actions/setup-devenv'];
 
     case CiWorkflowStepKind.SetNxShas:
       return [
@@ -245,7 +224,7 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
       // recursion guard, so the default token suffices.
       return [
         `      - name: ${step.name}`,
-        "        if: ${{ steps.managed-drift.outputs.drifted != '' && steps.managed-drift.outputs.drifted != '0' }}",
+        "        if: steps.managed-drift.outputs.drifted != '' && steps.managed-drift.outputs.drifted != '0'",
         '        run: gh workflow run managed-files.yml --ref "$GITHUB_REF_NAME"',
       ];
     case CiWorkflowStepKind.Deploy:
@@ -273,7 +252,8 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
     case CiWorkflowStepKind.UploadTraceDbs:
       return [
         `      - name: ${step.name}`,
-        '        if: ${{ always() }}',
+        '        # success() is the default; always() keeps traces after a red build/test.',
+        '        if: always()',
         '        uses: actions/upload-artifact@v7.0.1',
         '        with:',
         '          name: trace-results-${{ github.run_id }}',
@@ -283,20 +263,11 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         '          include-hidden-files: true',
       ];
     case CiWorkflowStepKind.SaveNixDevenv:
-      if (!isNixosRunner(options.runsOn)) {
-        return [
-          `      - name: ${step.name}`,
-          '        if: ${{ always() }}',
-          '        uses: ./.github/actions/save-nix-devenv',
-          '        with:',
-          '          nix-cache-hit: ${{ steps.setup.outputs.nix-cache-hit }}',
-          '          devenv-cache-hit: ${{ steps.setup.outputs.devenv-cache-hit }}',
-        ];
-      }
-      // Only when the GitHub-hosted setup action ran (fork PRs).
       return [
         `      - name: ${step.name}`,
-        "        if: ${{ always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}",
+        '        # success() is the default; always() still writes the GH Nix cache after a',
+        '        # red job so the next run is warm. Composite no-ops on host-nix runners.',
+        '        if: always()',
         '        uses: ./.github/actions/save-nix-devenv',
         '        with:',
         '          nix-cache-hit: ${{ steps.setup.outputs.nix-cache-hit }}',
