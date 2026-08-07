@@ -232,8 +232,8 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
     case CiWorkflowStepKind.SaveNixDevenv:
       return [
         `      - name: ${step.name}`,
-        '        # success() is the default; always() still writes the GH Nix cache after a',
-        '        # red job so the next run is warm. Composite no-ops on host-nix runners.',
+        '        # always() still saves after a red job. Nix NAR is ephemeral-only;',
+        '        # devenv eval-cache also saves on host-nix when setup missed.',
         '        if: always()',
         '        uses: ./.github/actions/save-nix-devenv',
         '        with:',
