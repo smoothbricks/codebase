@@ -55,6 +55,7 @@ func decimalBytes(values []byte) string {
 }
 
 func TestVocabularyRegistrationEmitsExactSection6FragmentAndOrdinalOperands(t *testing.T) {
+	t.Parallel()
 	entries := []vocabularyCatalogEntry{
 		{ID: 0x010203, Kind: vocabularyLogTemplate, Text: "A\x00💩", Fields: []vocabularyField{{Name: "user💩", Column: "user_id"}, {Name: "e\u0301", Column: "é"}}},
 		{ID: 0x0a0b0c, Kind: vocabularySpanName, Text: "é", Fields: []vocabularyField{}},
@@ -138,6 +139,7 @@ func TestVocabularyRegistrationEmitsExactSection6FragmentAndOrdinalOperands(t *t
 }
 
 func TestVocabularyRegistrationEmptyFragmentEmitsNothing(t *testing.T) {
+	t.Parallel()
 	emitContext := shimprinter.NewEmitContext()
 	binding, statements := vocabularyRegistrationStatements(emitContext, nil)
 	if binding != nil || statements != nil {
@@ -153,6 +155,7 @@ func TestVocabularyRegistrationEmptyFragmentEmitsNothing(t *testing.T) {
 }
 
 func TestPrependVocabularyRegistrationPreservesDirectivesAndImportPosition(t *testing.T) {
+	t.Parallel()
 	entry := vocabularyCatalogEntry{ID: 7, Kind: vocabularySpanName, Text: "work", Fields: []vocabularyField{}}
 	emitContext := shimprinter.NewEmitContext()
 	_, registration := vocabularyRegistrationStatements(emitContext, []vocabularyCatalogEntry{entry})
@@ -182,6 +185,7 @@ const body = dependency;
 }
 
 func TestVocabularyRegistrationBindingAvoidsPreferredSourceName(t *testing.T) {
+	t.Parallel()
 	entry := vocabularyCatalogEntry{ID: 9, Kind: vocabularyLogTemplate, Text: "collision", Fields: []vocabularyField{}}
 	emitContext := shimprinter.NewEmitContext()
 	binding, registration := vocabularyRegistrationStatements(emitContext, []vocabularyCatalogEntry{entry})

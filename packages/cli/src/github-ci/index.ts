@@ -27,6 +27,9 @@ const parseNxProjectDeployConfigurations = typia.json.createIsParse<NxProjectDep
 
 type NxSmartMode = 'auto' | 'affected' | 'run-many';
 
+/** Nx workers = host cores (CI runners sized for full machine use). */
+const NX_PARALLEL = '100%';
+
 export async function cleanupGithubCiCache(root: string): Promise<void> {
   const githubOutput = process.env.GITHUB_OUTPUT;
   const markCacheReady = async (ready: boolean): Promise<void> => {
@@ -139,7 +142,7 @@ export function nxSmartArgs(target: string, mode: 'affected' | 'run-many', confi
   if (configuration) {
     args.push(`--configuration=${configuration}`);
   }
-  args.push(`--exclude=tag:ci:skip:${target}`, '--parallel=5');
+  args.push(`--exclude=tag:ci:skip:${target}`, `--parallel=${NX_PARALLEL}`);
   return args;
 }
 
@@ -262,7 +265,7 @@ export function nxRunManyArgs(run: NxTargetRun, configuration?: string): string[
   if (configuration) {
     nxArgs.push(`--configuration=${configuration}`);
   }
-  nxArgs.push('--parallel=5');
+  nxArgs.push(`--parallel=${NX_PARALLEL}`);
   return nxArgs;
 }
 
@@ -343,7 +346,7 @@ export async function githubCiNxDeploy(
   const projectList = projects.join(',');
   const targets = options.verify === true ? ['build', 'lint', 'test', 'deploy'] : ['deploy'];
   for (const target of targets) {
-    const nxArgs = ['run-many', '-t', target, `--projects=${projectList}`, '--parallel=5'];
+    const nxArgs = ['run-many', '-t', target, `--projects=${projectList}`, `--parallel=${NX_PARALLEL}`];
     if (target === 'deploy') {
       nxArgs.push(`--configuration=${options.configuration}`);
     }

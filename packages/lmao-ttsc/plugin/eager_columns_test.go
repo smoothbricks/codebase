@@ -44,6 +44,7 @@ func requireEagerColumns(t *testing.T, output string, want []string) {
 }
 
 func TestCompilerProvesUnconditionalEagerColumnsAcrossRowKinds(t *testing.T) {
+	t.Parallel()
 	output := transformTemplateFixture(t, `
 declare function value(label: string): string;
 defineOp('eager-row-kinds', (ctx) => {
@@ -75,6 +76,7 @@ defineOp('eager-row-kinds', (ctx) => {
 }
 
 func TestCompilerEagerProofIsConservativeAcrossControlFlowAndBailouts(t *testing.T) {
+	t.Parallel()
 	output := transformTemplateFixture(t, `
 declare const condition: boolean;
 declare function value(label: string): string;
@@ -132,6 +134,7 @@ defineOp('unanalyzed-bailout', (ctx) => {
 }
 
 func TestCompilerEmitsPerMemberEagerColumnsForDefineOps(t *testing.T) {
+	t.Parallel()
 	output := transformTemplateFixture(t, `
 declare const condition: boolean;
 declare function value(label: string): string;
@@ -169,6 +172,7 @@ defineOps({
 }
 
 func TestCompilerEagerColumnsAreSortedDuplicateFreeAndUnboundedByOneWord(t *testing.T) {
+	t.Parallel()
 	var body strings.Builder
 	body.WriteString("declare function numberValue(label: string): number;\n")
 	body.WriteString("defineOp('more-than-thirty-two', (ctx) => {\n  ctx.tag")
