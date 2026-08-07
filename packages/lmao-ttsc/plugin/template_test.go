@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sync"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,6 +13,7 @@ import (
 	shimprinter "github.com/microsoft/typescript-go/shim/printer"
 	"github.com/samchon/ttsc/packages/ttsc/driver"
 )
+var tsgoTestMu sync.Mutex
 
 const templateFixtureDeclarations = `
 export interface OpCompileMetadata {
@@ -92,6 +94,9 @@ type templateFixtureResult struct {
 
 func runTemplateFixture(t *testing.T, body string) templateFixtureResult {
 	t.Helper()
+	// tsgo printer/program emit is not concurrency-safe across parallel tests.
+	tsgoTestMu.Lock()
+	defer tsgoTestMu.Unlock()
 	root := t.TempDir()
 	inputPath := filepath.Join(root, "input.ts")
 	declarationDir := filepath.Join(root, "node_modules", "@smoothbricks", "lmao")
@@ -223,7 +228,6 @@ func emittedLogBlock(
 }
 
 func TestCompileMetadataExcludesRemovedPerOpTemplateTable(t *testing.T) {
-	t.Parallel()
 	node := (&fileTransformer{}).compileMetadataNode(opCompileAnalysis{runtimeHint: 123})
 	if strings := collectNodeText(node, shimast.KindStringLiteral); len(strings) != 0 {
 		t.Fatalf("compile metadata retained obsolete per-Op template strings: %q", strings)
@@ -239,7 +243,6 @@ func TestCompileMetadataExcludesRemovedPerOpTemplateTable(t *testing.T) {
 }
 
 func TestSpecializedLiteralLogInlineUsesRegisteredDenseOperandForEveryLevel(t *testing.T) {
-	t.Parallel()
 	entryTypes := map[string]string{
 		"info":  "8",
 		"debug": "7",
@@ -272,7 +275,6 @@ func TestSpecializedLiteralLogInlineUsesRegisteredDenseOperandForEveryLevel(t *t
 }
 
 func TestMixedStaticInlinesStoreIdentityOnly(t *testing.T) {
-	t.Parallel()
 	for _, testCase := range []struct {
 		name           string
 		physical       callMessagePhysicalLayout
@@ -296,7 +298,6 @@ func TestMixedStaticInlinesStoreIdentityOnly(t *testing.T) {
 }
 
 func TestDynamicLogInlineKeepsSingleMessageEvaluationAndSentinelLaneClear(t *testing.T) {
-	t.Parallel()
 	block := emittedLogBlock("info", 0, callMessagePhysicalSpecialized, 0)
 	identifiers := collectNodeText(block, shimast.KindIdentifier)
 	if containsTemplateIDLane(identifiers) {
@@ -317,7 +318,6 @@ func TestDynamicLogInlineKeepsSingleMessageEvaluationAndSentinelLaneClear(t *tes
 }
 
 func TestFactoryLocalOpsUseGlobalVocabularyAndStableChildRewrite(t *testing.T) {
-	t.Parallel()
 	output := transformTemplateFixture(t, `
 function createFactoryOps() {
   const child = defineOp('factory-child', (ctx) => {
@@ -362,7 +362,6 @@ function createFactoryOps() {
 }
 
 func TestRepeatedOpCallsReuseDirectPlanOperandsAndDynamicOpBailsOut(t *testing.T) {
-	t.Parallel()
 	output := transformTemplateFixture(t, `
 declare function choose(left: Op, right: Op): Op;
 const child = defineOp('child', (ctx) => ctx.ok('child'));
@@ -394,7 +393,6 @@ defineOp('parent', async (ctx) => {
 }
 
 func TestLiteralLogsInValueContextsUseRegisteredBindingsWithoutDoubleRewrite(t *testing.T) {
-	t.Parallel()
 	output := transformTemplateFixture(t, `
 declare function dynamicMessage(): string;
 declare function consume(value: unknown): void;
@@ -444,7 +442,6 @@ func diagnosticCodes(err error) []string {
 }
 
 func TestOperationalTemplatesLowerWithoutFieldBagAllocation(t *testing.T) {
-	t.Parallel()
 	result := runTemplateFixture(t, `
 declare function value(label: string): string;
 declare function numberValue(label: string): number;
@@ -497,7 +494,6 @@ defineOp('structured', (ctx) => {
 }
 
 func TestStructuredFieldsEvaluateExactlyOnceInSourceOrder(t *testing.T) {
-	t.Parallel()
 	output := transformTemplateFixture(t, `
 declare function numberValue(label: string): number;
 declare function stringValue(label: string): string;
@@ -534,7 +530,6 @@ defineOp('order', (ctx) => {
 }
 
 func TestDynamicEnumFieldEvaluatesOnceAndWritesEncodedOrdinal(t *testing.T) {
-	t.Parallel()
 	output := transformTemplateFixture(t, `
 declare function nextOperation(): 'READ' | 'WRITE';
 defineOp('dynamic-enum', (ctx) => {
@@ -563,7 +558,6 @@ defineOp('dynamic-enum', (ctx) => {
 }
 
 func TestLiteralEnumFieldsUsePlanEncoderWhileTextFieldsWriteDirectly(t *testing.T) {
-	t.Parallel()
 	output := transformTemplateFixture(t, `
 defineOp('literal-enum', (ctx) => {
   ctx.log.info('literal enum fields').category('checkout').operation('WRITE').outcome('success').text('completed');
@@ -613,7 +607,6 @@ defineOp('literal-enum', (ctx) => {
 }
 
 func TestEveryEnumInlineReusesPlanBoundSchemaEncoder(t *testing.T) {
-	t.Parallel()
 	output := transformTemplateFixture(t, `
 declare function nextOperation(): 'READ' | 'WRITE';
 defineOp('enum-plan-reuse', (ctx) => {
@@ -649,7 +642,6 @@ defineOp('enum-plan-reuse', (ctx) => {
 }
 
 func TestDebugAndTraceRetainRawDynamicText(t *testing.T) {
-	t.Parallel()
 	output := transformTemplateFixture(t, `
 declare function debugText(): string;
 declare function traceText(): string;
@@ -668,7 +660,6 @@ defineOp('diagnostic-dynamic', (ctx) => {
 }
 
 func TestStructuredTemplatePolicyDiagnostics(t *testing.T) {
-	t.Parallel()
 	tests := []struct {
 		name string
 		body string
