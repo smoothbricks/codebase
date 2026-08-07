@@ -32,6 +32,7 @@ func emittedRuntimeHints(t *testing.T, output string) []uint32 {
 }
 
 func TestMessageLayoutFamilyHintsClassifyWholeOpBodies(t *testing.T) {
+	t.Parallel()
 	output := transformTemplateFixture(t, `
 declare const dynamicOnlyText: () => string;
 declare const mixedText: () => string;
@@ -92,6 +93,7 @@ defineOp('unanalyzed-bailout', (ctx) => {
 }
 
 func TestCompilerCapacityIsTwoReservedRowsPlusStaticallyKnownLogRows(t *testing.T) {
+	t.Parallel()
 	output := transformTemplateFixture(t, `
 defineOp('reserved-only', (ctx) => ctx.ok(null));
 defineOp('one-static-log', (ctx) => {
@@ -119,6 +121,7 @@ defineOp('three-static-logs', (ctx) => {
 }
 
 func TestCompilerCapacityBeyondUint16FallsBackToAdaptive(t *testing.T) {
+	t.Parallel()
 	var source strings.Builder
 	source.WriteString("defineOp('oversized-static-body', (ctx) => {\n")
 	for range 0xfffe {
@@ -139,6 +142,7 @@ func TestCompilerCapacityBeyondUint16FallsBackToAdaptive(t *testing.T) {
 }
 
 func TestMessageLayoutFamilyHintBitsMatchRuntimeABI(t *testing.T) {
+	t.Parallel()
 	if runtimeHintMessageStatic != messageLayoutStaticOnly || runtimeHintMessageDynamic != messageLayoutDynamicOnly || runtimeHintMessageMixed != messageLayoutMixed {
 		t.Fatalf(
 			"compiler/runtime message family ABI diverged: production static=%#x dynamic=%#x mixed=%#x; contract static=%#x dynamic=%#x mixed=%#x",
@@ -159,6 +163,7 @@ func TestMessageLayoutFamilyHintBitsMatchRuntimeABI(t *testing.T) {
 }
 
 func TestMessagePhysicalLayoutSelectorExactMatrix(t *testing.T) {
+	t.Parallel()
 	testCases := []struct {
 		name        string
 		capacity    uint32
@@ -199,6 +204,7 @@ func TestMessagePhysicalLayoutSelectorExactMatrix(t *testing.T) {
 }
 
 func TestMessagePhysicalLayoutSelectorFallsBackForUnsafeInputs(t *testing.T) {
+	t.Parallel()
 	testCases := []struct {
 		name           string
 		capacity       uint32
@@ -224,6 +230,7 @@ func TestMessagePhysicalLayoutSelectorFallsBackForUnsafeInputs(t *testing.T) {
 }
 
 func TestMessagePhysicalLayoutHintBitsMatchRuntimeABI(t *testing.T) {
+	t.Parallel()
 	if runtimeHintMessagePhysicalPacked != messagePhysicalPacked {
 		t.Fatalf("compiler packed bit = %#x, want bit 26 %#x", runtimeHintMessagePhysicalPacked, messagePhysicalPacked)
 	}
@@ -239,6 +246,7 @@ func TestMessagePhysicalLayoutHintBitsMatchRuntimeABI(t *testing.T) {
 }
 
 func TestMessagePhysicalLayoutLoopAndUnsafeBodiesStayCurrent(t *testing.T) {
+	t.Parallel()
 	output := transformTemplateFixture(t, `
 declare const values: readonly string[];
 declare function consume(value: unknown): void;
@@ -270,6 +278,7 @@ defineOp('unsafe-unknown', (ctx) => {
 }
 
 func TestCurrentMessageDictionaryIsFrozenDeduplicatedAndUsesNonzeroLocalIDs(t *testing.T) {
+	t.Parallel()
 	output := transformTemplateFixture(t, `
 defineOp('current-local-dictionary', (ctx) => {
   ctx.log.info('repeated literal');
@@ -296,6 +305,7 @@ defineOp('current-local-dictionary', (ctx) => {
 }
 
 func TestMixedCurrentStaticWriteStoresIdentityOnly(t *testing.T) {
+	t.Parallel()
 	output := transformTemplateFixture(t, `
 defineOp('current-mixed-sidecar', (ctx) => {
   ctx.log.info('static literal');
