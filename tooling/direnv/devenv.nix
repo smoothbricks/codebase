@@ -68,7 +68,14 @@ in {
       alejandra # Nix formatter
     ])
     # GARM/Linux CI: rustc needs host linker `cc` (-Zbuild-std, native crates).
-    ++ lib.optionals pkgs.stdenv.isLinux [pkgs.stdenv.cc];
+    ++ lib.optionals pkgs.stdenv.isLinux [
+      pkgs.stdenv.cc
+      # openssl-src (vendored-openssl / git2) configure needs perl + make.
+      pkgs.perl
+      pkgs.gnumake
+      pkgs.pkg-config
+      pkgs.openssl
+    ];
 
   # Use system Xcode for iOS simulator, signing, and instruments.
   # Nix Apple SDK is build-only — no simctl/simulator runtimes, and nix's
