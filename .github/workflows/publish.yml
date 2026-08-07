@@ -88,36 +88,37 @@ jobs:
 
       # Step 8
       - name: ✅ Check managed monorepo files (${{ steps.version.outputs.mode }})
-        if: ${{ steps.version.outputs.mode != 'none' }}
+        if: steps.version.outputs.mode != 'none'
         run: smoo monorepo check --warn
 
       # Step 9
       - name: 🔨 Build (${{ steps.version.outputs.mode }})
-        if: ${{ steps.version.outputs.mode != 'none' }}
+        if: steps.version.outputs.mode != 'none'
         run:
           smoo github-ci nx-run-many --targets build --projects "${{ steps.version.outputs.projects }}"
           --collect-outputs "${{ runner.temp }}/release-build-outputs"
 
       # Step 10
       - name: 🐧 Build supplemental Linux targets
-        if: ${{ steps.version.outputs.mode != 'none' }}
+        if: steps.version.outputs.mode != 'none'
         run:
           smoo github-ci nx-run-many --targets "*-linux" --projects "${{ steps.version.outputs.projects }}"
           --collect-outputs "${{ runner.temp }}/linux-platform-outputs"
 
       # Step 11
       - name: 🔍 Lint (${{ steps.version.outputs.mode }})
-        if: ${{ steps.version.outputs.mode != 'none' }}
+        if: steps.version.outputs.mode != 'none'
         run: smoo github-ci nx-run-many --targets lint --projects "${{ steps.version.outputs.projects }}"
 
       # Step 12
       - name: 🧪 Unit Tests (${{ steps.version.outputs.mode }})
-        if: ${{ steps.version.outputs.mode != 'none' }}
+        if: steps.version.outputs.mode != 'none'
         run: smoo github-ci nx-run-many --targets test --projects "${{ steps.version.outputs.projects }}"
 
       # Step 13
       - name: 📎 Upload trace DBs
-        if: ${{ failure() }}
+        # Default is success(); failure() uploads traces only when the job already failed.
+        if: failure()
         uses: actions/upload-artifact@v7.0.1
         with:
           name: trace-results-${{ github.run_id }}
@@ -128,7 +129,7 @@ jobs:
 
       # Step 14
       - name: ✅ Validate monorepo config (${{ steps.version.outputs.mode }})
-        if: ${{ steps.version.outputs.mode != 'none' }}
+        if: steps.version.outputs.mode != 'none'
         run: smoo monorepo validate
 
       # --- Candidate transfer --------------------------------------------------
@@ -151,7 +152,7 @@ jobs:
 
       # Step 17
       - name: 📤 Upload validated build outputs
-        if: ${{ steps.version.outputs.mode != 'none' }}
+        if: steps.version.outputs.mode != 'none'
         uses: actions/upload-artifact@v7.0.1
         with:
           name: publish-release-outputs-${{ github.run_id }}
@@ -162,7 +163,7 @@ jobs:
 
       # Step 18
       - name: 📤 Upload supplemental Linux outputs
-        if: ${{ steps.version.outputs.mode != 'none' }}
+        if: steps.version.outputs.mode != 'none'
         uses: actions/upload-artifact@v7.0.1
         with:
           name: publish-linux-outputs-${{ github.run_id }}
@@ -175,7 +176,8 @@ jobs:
 
       # Step 19
       - name: 🧹 Cleanup and cache Nix/devenv
-        if: ${{ always() }}
+        # success() is default; always() still saves GH Nix cache after a red job.
+        if: always()
         uses: ./.github/actions/save-nix-devenv
         with:
           nix-cache-hit: ${{ steps.setup.outputs.nix-cache-hit }}
@@ -232,7 +234,8 @@ jobs:
 
       # Step 7
       - name: 🧹 Cleanup and cache Nix/devenv
-        if: ${{ always() }}
+        # success() is default; always() still saves GH Nix cache after a red job.
+        if: always()
         uses: ./.github/actions/save-nix-devenv
         with:
           nix-cache-hit: ${{ steps.setup.outputs.nix-cache-hit }}
@@ -303,7 +306,7 @@ jobs:
 
       # Step 9
       - name: 📦 Apply verified Linux outputs
-        if: ${{ needs.linux-release-candidate.outputs.mode != 'none' }}
+        if: needs.linux-release-candidate.outputs.mode != 'none'
         run:
           smoo github-ci apply-outputs --source-sha "${{ needs.linux-release-candidate.outputs.release-sha }}" "${{
           runner.temp }}/publish-artifacts/publish-release-outputs-${{ github.run_id }}" "${{ runner.temp
@@ -311,14 +314,14 @@ jobs:
 
       # Step 10
       - name: 🍎 Apply verified macOS outputs
-        if: ${{ needs.linux-release-candidate.outputs.mode != 'none' }}
+        if: needs.linux-release-candidate.outputs.mode != 'none'
         run:
           smoo github-ci apply-outputs --source-sha "${{ github.sha }}" "${{ runner.temp
           }}/publish-artifacts/publish-macos-outputs-${{ github.run_id }}/current"
 
       # Step 11
       - name: ✅ Validate restored release (${{ needs.linux-release-candidate.outputs.mode }})
-        if: ${{ needs.linux-release-candidate.outputs.mode != 'none' }}
+        if: needs.linux-release-candidate.outputs.mode != 'none'
         run: smoo monorepo validate
 
       # --- Release ------------------------------------------------------------
@@ -334,7 +337,8 @@ jobs:
 
       # Step 13
       - name: 🧹 Cleanup and cache Nix/devenv
-        if: ${{ always() }}
+        # success() is default; always() still saves GH Nix cache after a red job.
+        if: always()
         uses: ./.github/actions/save-nix-devenv
         with:
           nix-cache-hit: ${{ steps.setup.outputs.nix-cache-hit }}

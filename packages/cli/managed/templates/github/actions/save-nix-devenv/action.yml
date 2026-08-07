@@ -1,5 +1,7 @@
 name: Save Nix/devenv caches
-description: Cleanup the Nix store and explicitly save Nix/devenv cache segments.
+description: >
+  Cleanup the Nix store and explicitly save Nix/devenv cache segments. No-op on host-nix runners (shared store +
+  /var/cache/ci); GH Actions cache is only for ephemeral ubuntu/macOS runners.
 
 inputs:
   nix-cache-hit:
@@ -14,8 +16,19 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: 🔎 Runner kind
+      id: runner-kind
+      shell: bash
+      run: |
+        if [ "${NIX_REMOTE:-}" = daemon ] && [ -d /var/cache/ci ]; then
+          echo "host=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "host=false" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: 🧹 Prepare Nix/devenv cache save
       id: cleanup-cache
+      if: steps.runner-kind.outputs.host != 'true'
       shell: bash
       working-directory: tooling/direnv
       env:
@@ -33,14 +46,18 @@ runs:
         smoo github-ci cleanup-cache
 
     - name: 🧊 Save Nix profiles and store NAR
-      if: ${{ steps.cleanup-cache.outputs.cache-ready == 'true' && inputs.nix-cache-hit != 'true' }}
+      if:
+        ${{ steps.runner-kind.outputs.host != 'true' && steps.cleanup-cache.outputs.cache-ready == 'true' &&
+        inputs.nix-cache-hit != 'true' }}
       uses: ./.github/actions/cache-nix-devenv
       with:
         segment: nix
         mode: save
 
     - name: 🧊 Save devenv and direnv
-      if: ${{ steps.cleanup-cache.outputs.cache-ready == 'true' && inputs.devenv-cache-hit != 'true' }}
+      if:
+        ${{ steps.runner-kind.outputs.host != 'true' && steps.cleanup-cache.outputs.cache-ready == 'true' &&
+        inputs.devenv-cache-hit != 'true' }}
       uses: ./.github/actions/cache-nix-devenv
       with:
         segment: devenv

@@ -39,31 +39,7 @@ jobs:
       # anchors; update the nx-smart --step values below if top-level steps move.
       - name: 🧱 Setup Nix/devenv
         id: setup
-        if:
-          ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
-          }}
         uses: ./.github/actions/setup-devenv
-      - name: 🧱 Setup Nix/devenv
-        id: setup-nixos
-        if:
-          ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-          }}
-        shell: bash
-        working-directory: tooling/direnv
-        run: |
-          set -euo pipefail
-          ./github-actions-bootstrap.sh install-devenv
-          ./github-actions-bootstrap.sh build-shell
-      - name: 📦 Cache node_modules
-        if:
-          ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-          }}
-        uses: ./.github/actions/cache-node-modules
-      - name: 🧊 Cache ttsc plugins
-        if:
-          ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-          }}
-        uses: ./.github/actions/cache-ttsc-plugins
 
       # --- Nx -----------------------------------------------------------------
 
@@ -101,7 +77,7 @@ jobs:
 
       # Step 10
       - name: 🔁 Dispatch managed-file drift healing
-        if: ${{ steps.managed-drift.outputs.drifted != '' && steps.managed-drift.outputs.drifted != '0' }}
+        if: steps.managed-drift.outputs.drifted != '' && steps.managed-drift.outputs.drifted != '0'
         run: gh workflow run managed-files.yml --ref "$GITHUB_REF_NAME"
 
       # Step 11
@@ -122,7 +98,8 @@ jobs:
 
       # Step 12
       - name: 📎 Upload trace DBs
-        if: ${{ always() }}
+        # success() is the default; always() keeps traces after a red build/test.
+        if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
           name: trace-results-${{ github.run_id }}
@@ -135,9 +112,9 @@ jobs:
 
       # Step 13
       - name: 🧹 Cleanup and cache Nix/devenv
-        if:
-          ${{ always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name !=
-          github.repository }}
+        # success() is the default; always() still writes the GH Nix cache after a
+        # red job so the next run is warm. Composite no-ops on host-nix runners.
+        if: always()
         uses: ./.github/actions/save-nix-devenv
         with:
           nix-cache-hit: ${{ steps.setup.outputs.nix-cache-hit }}

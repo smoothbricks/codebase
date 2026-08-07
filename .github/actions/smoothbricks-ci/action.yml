@@ -48,15 +48,15 @@ runs:
         echo "mode=$resolved" >>"$GITHUB_OUTPUT"
         echo "smoothbricks-ci: mode=$resolved" >&2
 
-    # --- GitHub-hosted path: install Nix/devenv exactly like the legacy ci.yml did. ---
-    - name: 🧱 Setup Nix/devenv (github mode)
-      if: ${{ steps.resolve.outputs.mode == 'github' }}
+    # --- Ephemeral path: setup-devenv (host-nix vs GH caches handled inside). ---
+    - name: 🧱 Setup Nix/devenv
+      if: steps.resolve.outputs.mode == 'github'
       uses: ./.github/actions/setup-devenv
 
     # --- cowshed runner path: clone a warm, sandboxed workspace for this job. ---
     - name: 🌱 Create cowshed workspace (cowshed mode)
       id: cowshed-setup
-      if: ${{ steps.resolve.outputs.mode == 'cowshed' }}
+      if: steps.resolve.outputs.mode == 'cowshed'
       shell: bash
       run: |
         set -euo pipefail
@@ -77,7 +77,7 @@ runs:
     # done here (an inline step would destroy the workspace before the build ran).
     # Reclamation happens one of two ways, both fine:
     #   1. ephemeral cowshed runners destroy every dataset under the job on deregister;
-    #   2. the workflow adds a trailing `if: ${{ always() }}` step:
+    #   2. the workflow adds a trailing `if: always()` step:
     #        run: cowshed rm "${{ env.COWSHED_CI_WORKSPACE }}"
     # cowshed gc on the host sweeps any orphaned ci-* workspace + its origin snapshot.
     #
