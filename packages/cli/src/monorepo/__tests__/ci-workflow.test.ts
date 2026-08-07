@@ -32,6 +32,10 @@ describe('CI workflow definition', () => {
     );
     expect(rendered).toContain("# Step 12\n      # Nx's database cache needs artifact files");
     expect(rendered).toContain('uses: ./.github/actions/setup-devenv');
+    expect(rendered).toContain('id: setup');
+    expect(rendered).not.toContain('Setup Nix/devenv (fork)');
+    expect(rendered).not.toContain('Setup Nix/devenv (nixos)');
+    expect(rendered).not.toContain('github-actions-bootstrap.sh');
     expect(rendered).toContain('uses: ./.github/actions/save-nix-devenv');
     expect(rendered).toContain('runs-on: ubuntu-latest');
   });
@@ -54,7 +58,7 @@ describe('CI workflow definition', () => {
     expect(saveKey).toBe(restoreKey);
   });
 
-  it('nixos config: fork PRs on ubuntu, internal on nixos labels; setup actions wholly gated', () => {
+  it('nixos config: fork PRs on ubuntu; one setup-devenv (composite owns host path)', () => {
     const rendered = renderCiWorkflowYaml({
       deploy: false,
       pushBranches: ['main'],
@@ -62,22 +66,18 @@ describe('CI workflow definition', () => {
     });
 
     expect(rendered).toContain(
-      "runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('[\"nixos-latest-x64\",\"self-hosted\"]') || 'ubuntu-latest' }}",
-    );
-    // whole setup-devenv action only for forks
-    expect(rendered).toContain(
-      "if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}",
+      "runs-on:\n      ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&\n      fromJSON('[\"nixos-latest-x64\",\"self-hosted\"]') || 'ubuntu-latest' }}",
     );
     expect(rendered).toContain('uses: ./.github/actions/setup-devenv');
-    // thin nixos path
-    expect(rendered).toContain('./github-actions-bootstrap.sh install-devenv');
-    expect(rendered).toContain('./github-actions-bootstrap.sh build-shell');
-    expect(rendered).not.toContain('platform:');
+    expect(rendered).toContain('id: setup');
+    expect(rendered).not.toContain('Setup Nix/devenv (fork)');
+    expect(rendered).not.toContain('Setup Nix/devenv (nixos)');
+    expect(rendered).not.toContain('github-actions-bootstrap.sh');
     expect(rendered).not.toContain('determinate-nix-action');
-    // save only when fork path ran
-    expect(rendered).toContain(
-      "if: ${{ always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}",
-    );
+    expect(rendered).toContain('if: always()');
     expect(rendered).toContain('uses: ./.github/actions/save-nix-devenv');
+    // workflow yaml does not embed composite internals
+    expect(rendered).not.toContain('cache-node-modules');
+    expect(rendered).not.toContain('cache-ttsc-plugins');
   });
 });

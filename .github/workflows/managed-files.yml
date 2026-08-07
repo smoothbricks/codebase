@@ -124,7 +124,8 @@ jobs:
           fi
 
       - name: 🧹 Cleanup and cache Nix/devenv
-        if: ${{ always() }}
+        # success() is default; always() still saves GH Nix cache after a red job.
+        if: always()
         uses: ./.github/actions/save-nix-devenv
         with:
           nix-cache-hit: ${{ steps.setup.outputs.nix-cache-hit }}

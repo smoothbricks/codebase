@@ -1,29 +1,53 @@
 name: Setup Nix/devenv
-description: Restore caches and build the SmoothBricks devenv shell after checkout.
+description: >
+  Build the SmoothBricks devenv shell after checkout. On GARM/NixOS runners (NIX_REMOTE=daemon + /var/cache/ci) skips
+  GitHub-hosted install/cache steps and uses the host store and cache mounts. On ubuntu/macOS runners installs Nix and
+  restores GH Actions caches.
 
 outputs:
   nix-cache-hit:
     description: Whether the Nix profile/store cache restored from the exact primary key.
-    value: ${{ steps.nix-cache.outputs.cache-hit }}
+    value: ${{ steps.nix-cache.outputs.cache-hit || 'false' }}
   devenv-cache-hit:
     description: Whether the devenv/direnv cache restored from the exact primary key.
-    value: ${{ steps.devenv-cache.outputs.cache-hit }}
+    value: ${{ steps.devenv-cache.outputs.cache-hit || 'false' }}
+  host-runner:
+    description: Whether this job is on a host-nix runner (GARM) with shared store/caches.
+    value: ${{ steps.runner-kind.outputs.host }}
 
 runs:
   using: composite
   steps:
     # This action is intentionally post-checkout only. Repo-local actions do not
     # exist before actions/checkout has populated the working tree.
+
+    # Runner image/profile owns paths (NIX_REMOTE, /var/cache/ci/*). Detect here
+    # so every workflow can `uses: setup-devenv` without forking step graphs.
+    - name: 🔎 Runner kind
+      id: runner-kind
+      shell: bash
+      run: |
+        if [ "${NIX_REMOTE:-}" = daemon ] && [ -d /var/cache/ci ]; then
+          echo "host=true" >> "$GITHUB_OUTPUT"
+          echo "host-nix runner (shared store + /var/cache/ci)"
+        else
+          echo "host=false" >> "$GITHUB_OUTPUT"
+          echo "ephemeral runner (install Nix + GH caches)"
+        fi
+
     - name: ❄️ Install Nix
+      if: steps.runner-kind.outputs.host != 'true'
       uses: DeterminateSystems/determinate-nix-action@v3
 
     - name: 🧊 Cache Nix profiles and store NAR
       id: nix-cache
+      if: steps.runner-kind.outputs.host != 'true'
       uses: ./.github/actions/cache-nix-devenv
       with:
         segment: nix
 
     - name: ♻️ Restore Nix store from NAR
+      if: steps.runner-kind.outputs.host != 'true'
       shell: bash
       working-directory: tooling/direnv
       run: ./github-actions-bootstrap.sh restore-store
@@ -33,12 +57,13 @@ runs:
     # points directly at derivations inside that closure.
     - name: 🧊 Cache devenv and direnv
       id: devenv-cache
-      if: ${{ steps.nix-cache.outputs.cache-hit == 'true' }}
+      if: steps.runner-kind.outputs.host != 'true' && steps.nix-cache.outputs.cache-hit == 'true'
       uses: ./.github/actions/cache-nix-devenv
       with:
         segment: devenv
 
     - name: ⚡ Enable Cachix
+      if: steps.runner-kind.outputs.host != 'true'
       uses: cachix/cachix-action@v17
       with:
         name: devenv
@@ -48,12 +73,14 @@ runs:
       working-directory: tooling/direnv
       run: ./github-actions-bootstrap.sh install-devenv
 
+    # node_modules + ttsc plugin binaries: GH Actions cache on ephemeral runners.
+    # Host runners keep those under the /var/cache/ci bind (bun / ttsc env).
     - name: 📦 Cache node_modules
+      if: steps.runner-kind.outputs.host != 'true'
       uses: ./.github/actions/cache-node-modules
 
-    # Restores compiled ttsc native plugins into .cache/ttsc/plugins. TTSC_CACHE_DIR
-    # is set by devenv enterShell (+ bootstrap GITHUB_ENV for later steps).
     - name: 🧊 Cache ttsc plugins
+      if: steps.runner-kind.outputs.host != 'true'
       uses: ./.github/actions/cache-ttsc-plugins
 
     - name: 🐚 Build devenv shell

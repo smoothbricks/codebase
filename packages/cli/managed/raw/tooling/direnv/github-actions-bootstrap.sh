@@ -1,8 +1,13 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 NIX_STORE_NAR="${NIX_STORE_NAR:-/tmp/nix-store.nar}"
 nix_store_cmd="/nix/var/nix/profiles/default/bin/nix-store"
+DEVENV_FLAKE="${DEVENV_FLAKE:-github:cachix/devenv}"
+# Host CI cache (GARM bind-mount). Prefer env from runner profile.
+# Path comes from the runner (GARM profile). Ephemeral runners leave unset;
+# devenv enterShell defaults to $PWD/.cache/ttsc.
+TTSC_CACHE_DIR="${TTSC_CACHE_DIR:-}"
 # Resolve from this script's location, not the caller's cwd. GitHub Actions
 # runs this from tooling/direnv today, but direct cwd-changing helpers are easy
 # to misuse and break on repeated calls.
@@ -36,12 +41,21 @@ restore_nix_store() {
 }
 
 install_devenv() {
-  sudo mkdir -p /nix/var/nix/gcroots/ci
-  if ! command -v devenv >/dev/null 2>&1; then
-    nix profile add --accept-flake-config nixpkgs#devenv
+  # Shared host /nix/store is the package cache. Image may already provide
+  # devenv from github:cachix/devenv; otherwise profile-add the same flake
+  # (links store paths; re-fetch only when missing).
+  if command -v devenv >/dev/null 2>&1; then
+    echo "using existing devenv: $(command -v devenv) ($(devenv version 2>/dev/null || true))"
+  else
+    echo "nix profile add ${DEVENV_FLAKE}"
+    nix profile add --accept-flake-config "$DEVENV_FLAKE"
   fi
-  echo "$HOME/.nix-profile/bin" >> "$GITHUB_PATH"
-  sudo ln -sf "$HOME/.nix-profile" /nix/var/nix/gcroots/ci/profile
+  if [ -d "$HOME/.nix-profile/bin" ]; then
+    echo "$HOME/.nix-profile/bin" >> "${GITHUB_PATH:-/dev/null}"
+  fi
+  if [ -n "$TTSC_CACHE_DIR" ]; then
+    mkdir -p "$TTSC_CACHE_DIR"
+  fi
 }
 
 build_devenv_shell() {
@@ -50,7 +64,10 @@ build_devenv_shell() {
   # independent workflow step shells that run after this composite action.
   if [ -n "${GITHUB_ENV:-}" ]; then
     echo "TTSC_TSGO_BINARY=$repo_root/node_modules/@typescript/native/bin/tsc" >> "$GITHUB_ENV"
-    echo "TTSC_CACHE_DIR=$repo_root/.cache/ttsc" >> "$GITHUB_ENV"
+    # Only re-export when the runner (or a prior step) already set the path.
+    if [ -n "$TTSC_CACHE_DIR" ]; then
+      echo "TTSC_CACHE_DIR=$TTSC_CACHE_DIR" >> "$GITHUB_ENV"
+    fi
   fi
   # Add repo-local tools only after the shell exists; cleanup steps use an
   # explicit PATH because failures before this point must still refresh caches.
