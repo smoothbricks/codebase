@@ -117,6 +117,7 @@ func collectorFromEntries(entries ...vocabularyCatalogEntry) *programVocabularyC
 }
 
 func TestVocabularyRecordEncodingAndIDsFreezeCanonicalBytes(t *testing.T) {
+	t.Parallel()
 	fields := []vocabularyField{{Name: "user💩", Column: "user_id"}, {Name: "e\u0301", Column: "é"}}
 	gotRecord, err := encodeVocabularyRecord("A\x00💩", fields)
 	if err != nil {
@@ -156,6 +157,7 @@ func TestVocabularyRecordEncodingAndIDsFreezeCanonicalBytes(t *testing.T) {
 }
 
 func TestVocabularyFragmentArraysAndHashFreezeExactBytes(t *testing.T) {
+	t.Parallel()
 	entries := []vocabularyCatalogEntry{
 		{ID: 0x010203, Kind: vocabularyLogTemplate, Text: "A\x00💩e\u0301", Fields: []vocabularyField{{Name: "x", Column: "y"}}},
 		{ID: 0x0a0b0c, Kind: vocabularySpanName, Text: "é", Fields: []vocabularyField{}},
@@ -180,6 +182,7 @@ func TestVocabularyFragmentArraysAndHashFreezeExactBytes(t *testing.T) {
 }
 
 func TestCompiledStaticVocabularyUsesCurrentLocalDictionaryOrdinalBindings(t *testing.T) {
+	t.Parallel()
 	output := transformTemplateFixture(t, `
 function createOrdinalOps() {
   const child = defineOp('ordinal-child', (ctx) => { return ctx.ok(null); });
@@ -219,6 +222,7 @@ function createOrdinalOps() {
 }
 
 func TestSortVocabularyEntriesUsesIDKindTagAndRecordBytes(t *testing.T) {
+	t.Parallel()
 	entries := []vocabularyCatalogEntry{
 		{ID: 9, Kind: vocabularySpanName, Text: "z", Fields: []vocabularyField{}},
 		{ID: 8, Kind: vocabularySpanName, Text: "first-id", Fields: []vocabularyField{}},
@@ -234,6 +238,7 @@ func TestSortVocabularyEntriesUsesIDKindTagAndRecordBytes(t *testing.T) {
 }
 
 func TestBuildVocabularyCatalogIsIndependentOfAdditionOrderAndDuplicates(t *testing.T) {
+	t.Parallel()
 	entries := []vocabularyCatalogEntry{
 		independentEntry(vocabularySpanName, "same"),
 		independentEntry(vocabularyLogTemplate, "nul\x00byte", vocabularyField{Name: "request", Column: "request_id"}),
@@ -257,6 +262,7 @@ func TestBuildVocabularyCatalogIsIndependentOfAdditionOrderAndDuplicates(t *test
 }
 
 func TestBuildVocabularyCatalogRejectsIDCollisionIndependentlyOfInsertionOrder(t *testing.T) {
+	t.Parallel()
 	seen := make(map[globalVocabularyID]vocabularyCatalogEntry)
 	var left, right vocabularyCatalogEntry
 	for candidate := 0; candidate < 100_000; candidate++ {

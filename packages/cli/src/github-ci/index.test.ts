@@ -38,7 +38,7 @@ describe('GitHub CI Nx target expansion', () => {
       ['test', ['api', 'desktop']],
     ]);
     expect(expanded.runs.map((run) => nxRunManyArgs(run))).toEqual([
-      ['run-many', '-t', 'test', '--projects=api,desktop', '--parallel=5'],
+      ['run-many', '-t', 'test', '--projects=api,desktop', '--parallel=100%'],
     ]);
   });
 
@@ -65,7 +65,7 @@ describe('GitHub CI Nx target expansion', () => {
 
     expect(expanded.unmatchedGlobs).toEqual([]);
     expect(expanded.runs.map((run) => nxRunManyArgs(run))).toEqual([
-      ['run-many', '-t', 'missing', '--projects=api', '--parallel=5'],
+      ['run-many', '-t', 'missing', '--projects=api', '--parallel=100%'],
     ]);
   });
 
@@ -114,7 +114,7 @@ describe('GitHub CI Nx target expansion', () => {
       '-t',
       'test',
       '--exclude=tag:ci:skip:test',
-      '--parallel=5',
+      '--parallel=100%',
     ]);
     expect(nxRunManyArgs({ target: 'test', projects: projects.slice(0, 1) })).not.toContain(
       '--exclude=tag:ci:skip:test',
