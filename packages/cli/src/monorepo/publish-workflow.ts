@@ -7,6 +7,7 @@ import {
 } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import type { Options as PrettierOptions } from 'prettier';
 import { isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
+import { renderRunsOnLine, type WorkflowRunsOn } from './github-runs-on.js';
 
 const PUBLISH_WORKFLOW_FORMAT_OPTIONS = Object.freeze({
   parser: 'yaml',
@@ -55,6 +56,8 @@ export interface PublishWorkflowDefinitionOptions {
   deployProvider?: 'cloudflare';
   repoName?: string;
   platformTargetGlobs?: readonly string[];
+  /** Linux jobs only. Default ubuntu-latest. Same smoo.github.runsOn as CI. */
+  runsOn?: WorkflowRunsOn;
 }
 
 export interface PublishWorkflowInputs {
@@ -325,7 +328,7 @@ defaults:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+${renderRunsOnLine(options.runsOn)}
     env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
       GH_TOKEN: ${githubExpression('github.token')}
@@ -568,7 +571,7 @@ defaults:
 
 jobs:
   linux-release-candidate:
-    runs-on: ubuntu-latest
+${renderRunsOnLine(options.runsOn)}
     permissions:
       contents: write
       id-token: none
@@ -594,7 +597,7 @@ ${renderMacosPlatformSteps(options)}
 
   publish-on-linux:
     needs: [linux-release-candidate, macos-platform]
-    runs-on: ubuntu-latest
+${renderRunsOnLine(options.runsOn)}
     permissions:
       contents: write
       id-token: write

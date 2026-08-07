@@ -1,5 +1,7 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub Actions expressions are emitted literally. */
 
+import { renderRunsOnLine } from './github-runs-on.js';
+
 export enum CiWorkflowStepKind {
   Checkout = 'checkout',
   SetupDevenv = 'setup-devenv',
@@ -89,41 +91,6 @@ ${renderRunsOnLine(options.runsOn)}
       GH_TOKEN: ${githubExpression('github.token')}
     steps:
 `;
-}
-
-function isNixosRunner(runsOn: string | string[] | undefined): boolean {
-  const labels = runsOn === undefined ? [] : typeof runsOn === 'string' ? [runsOn] : runsOn;
-  return labels.some((label) => label === 'nixos' || label.startsWith('nixos-'));
-}
-
-/** Job should use configured nixos runners (false for fork PRs). */
-function githubUsesNixosRunnerExpr(): string {
-  return "(github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)";
-}
-
-function renderRunsOnLine(runsOn: string | string[] | undefined): string {
-  if (!isNixosRunner(runsOn)) {
-    let value: string;
-    if (runsOn === undefined) {
-      value = 'ubuntu-latest';
-    } else if (typeof runsOn === 'string') {
-      value = runsOn.length > 0 ? runsOn : 'ubuntu-latest';
-    } else if (runsOn.length === 0) {
-      value = 'ubuntu-latest';
-    } else if (runsOn.length === 1) {
-      value = runsOn[0] ?? 'ubuntu-latest';
-    } else {
-      value = `[${runsOn.map((label) => `'${label}'`).join(', ')}]`;
-    }
-    return `    runs-on: ${value}`;
-  }
-
-  const labels = typeof runsOn === 'string' ? [runsOn] : runsOn;
-  // Multiline matches prettier output so checked-in ci.yml stays byte-identical.
-  const nixosJson = JSON.stringify(labels);
-  return `    runs-on:
-      \${{ ${githubUsesNixosRunnerExpr()} &&
-      fromJSON('${nixosJson}') || 'ubuntu-latest' }}`;
 }
 
 function githubExpression(expression: string): string {
