@@ -6,7 +6,6 @@ import (
 )
 
 func TestGenerateSpanBufferClassSourceOwnsHotStorageWithoutRuntimeCompilation(t *testing.T) {
-	t.Parallel()
 	fields := append([]namedSchemaField{}, systemSpanBufferFields...)
 	fields = append(fields,
 		namedSchemaField{name: "category", field: schemaField{kind: fieldDirect, storage: storageArray}},
@@ -48,7 +47,6 @@ func TestGenerateSpanBufferClassSourceOwnsHotStorageWithoutRuntimeCompilation(t 
 }
 
 func TestSpanBufferArtifactIdentityIncludesEveryLayoutDimension(t *testing.T) {
-	t.Parallel()
 	fields := []namedSchemaField{{
 		name: "outcome",
 		field: schemaField{

@@ -84,7 +84,7 @@
           "{projectRoot}/scripts/gen-go-work.mjs"
         ],
         "options": {
-          "command": "bun ../scripts/gen-go-work.mjs && go test ./... -p=\"$(nproc)\" -parallel=\"$(nproc)\"",
+          "command": "bun ../scripts/gen-go-work.mjs && go test ./... -p=\"$(nproc)\"",
           "cwd": "{projectRoot}/plugin",
           "timeoutMs": 600000,
           "killAfterMs": 10000
