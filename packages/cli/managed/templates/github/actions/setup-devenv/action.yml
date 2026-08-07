@@ -1,8 +1,8 @@
 name: Setup Nix/devenv
 description: >
-  Build the SmoothBricks devenv shell after checkout. On GARM/NixOS runners (NIX_REMOTE=daemon + /var/cache/ci) skips
-  GitHub-hosted install/cache steps and uses the host store and cache mounts. On ubuntu/macOS runners installs Nix and
-  restores GH Actions caches.
+  Build the SmoothBricks devenv shell after checkout. Restores the small devenv/direnv actions/cache segment on every
+  runner (eval SQLite + shell scripts). On GARM/NixOS (NIX_REMOTE=daemon + /var/cache/ci) skips Nix install and the
+  large store NAR (host store). On ubuntu/macOS installs Nix and restores the NAR/profile cache.
 
 outputs:
   nix-cache-hit:
@@ -35,6 +35,18 @@ runs:
           echo "ephemeral runner (install Nix + GH caches)"
         fi
 
+    # Devenv segment (own key): tooling/direnv/.devenv + .direnv — includes
+    # nix-eval-cache.db. Independent of the nix NAR; restore on host and ephemeral
+    # whether or not the store cache hit. Missing store paths are fine: devenv
+    # verifies shell drv/out exist on eval-cache hit and invalidates + re-evals
+    # / realizes when GC removed them. Packages still come from host store, NAR,
+    # or Cachix — this blob only skips evaluation.
+    - name: 🧊 Cache devenv and direnv
+      id: devenv-cache
+      uses: ./.github/actions/cache-nix-devenv
+      with:
+        segment: devenv
+
     - name: ❄️ Install Nix
       if: steps.runner-kind.outputs.host != 'true'
       uses: DeterminateSystems/determinate-nix-action@v3
@@ -51,16 +63,6 @@ runs:
       shell: bash
       working-directory: tooling/direnv
       run: ./github-actions-bootstrap.sh restore-store
-
-    # Restore direnv state only when the Nix cache key is exact. Partial Nix
-    # restores can contain a NAR for a different shell closure, and .direnv
-    # points directly at derivations inside that closure.
-    - name: 🧊 Cache devenv and direnv
-      id: devenv-cache
-      if: steps.runner-kind.outputs.host != 'true' && steps.nix-cache.outputs.cache-hit == 'true'
-      uses: ./.github/actions/cache-nix-devenv
-      with:
-        segment: devenv
 
     - name: ⚡ Enable Cachix
       if: steps.runner-kind.outputs.host != 'true'
