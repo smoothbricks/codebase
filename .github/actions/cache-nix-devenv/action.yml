@@ -1,5 +1,7 @@
 name: Cache Nix profiles, devenv and direnv
-description: Restore cached Nix/devenv state for SmoothBricks GitHub Actions jobs.
+description: >
+  Two independent segments: large nix (NAR/profiles, ephemeral runners only) and small devenv (.devenv/.direnv — eval
+  SQLite, shell scripts, profile; all runners).
 
 inputs:
   segment:
@@ -19,10 +21,9 @@ outputs:
 runs:
   using: composite
   steps:
-    # The large cache is the Nix profile plus exported store NAR. Its key tracks
-    # the expensive shell closure inputs only; tiny direnv/setup script changes
-    # should not invalidate a 1GB+ store cache.
-    - name: Restore Nix profiles, devenv and direnv
+    # Large segment: Nix profile + exported store NAR. Ephemeral runners only.
+    # Key = shell closure inputs; direnv/setup script edits must not bust a multi-GB NAR.
+    - name: Restore Nix profiles and store NAR
       id: restore-nix
       if: inputs.segment == 'nix' && inputs.mode == 'restore'
       uses: actions/cache/restore@v5.0.5
@@ -51,8 +52,9 @@ runs:
           ${{ runner.os }}-${{ runner.arch }}-nix-v3-${{ hashFiles('tooling/direnv/devenv.yaml',
           'tooling/direnv/devenv.nix', 'tooling/direnv/devenv.lock') }}
 
-    # .devenv/.direnv are small, but they contain absolute /nix/store pointers.
-    # Workflows restore this segment only after an exact Nix cache hit.
+    # Small segment: devenv eval cache (nix-eval-cache.db), shell-*.sh, profile, .direnv.
+    # Own key. Setup restores on every runner; not gated on nix NAR hit. Devenv drops a
+    # shell cache row when drv/out are missing (GC) and re-evals/realizes.
     - name: Restore devenv and direnv state
       id: restore-devenv
       if: inputs.segment == 'devenv' && inputs.mode == 'restore'

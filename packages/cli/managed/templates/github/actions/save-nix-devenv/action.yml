@@ -1,7 +1,7 @@
 name: Save Nix/devenv caches
 description: >
-  Cleanup the Nix store and explicitly save Nix/devenv cache segments. No-op on host-nix runners (shared store +
-  /var/cache/ci); GH Actions cache is only for ephemeral ubuntu/macOS runners.
+  Save cache segments after the job. Nix store NAR stays ephemeral-only (host uses shared /nix/store). Devenv/direnv
+  eval-cache segment saves on every runner when setup missed and build-shell produced nix-eval-cache.db.
 
 inputs:
   nix-cache-hit:
@@ -54,10 +54,24 @@ runs:
         segment: nix
         mode: save
 
+    # Devenv segment is independent of nix NAR readiness and host vs ephemeral.
+    # Skip when setup never finished (no eval DB) so if: always() cannot poison
+    # the next restore with an empty/partial key.
+    - name: 🔎 Devenv save ready
+      id: devenv-save
+      if: inputs.devenv-cache-hit != 'true'
+      shell: bash
+      run: |
+        db="${GITHUB_WORKSPACE}/tooling/direnv/.devenv/nix-eval-cache.db"
+        if [[ -f "$db" ]]; then
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+          echo "skip devenv save: no nix-eval-cache.db"
+        fi
+
     - name: 🧊 Save devenv and direnv
-      if:
-        ${{ steps.runner-kind.outputs.host != 'true' && steps.cleanup-cache.outputs.cache-ready == 'true' &&
-        inputs.devenv-cache-hit != 'true' }}
+      if: ${{ inputs.devenv-cache-hit != 'true' && steps.devenv-save.outputs.ready == 'true' }}
       uses: ./.github/actions/cache-nix-devenv
       with:
         segment: devenv
