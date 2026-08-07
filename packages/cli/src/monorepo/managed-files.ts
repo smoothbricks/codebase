@@ -316,6 +316,7 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         deployProvider: context.productionDeployProvider,
         repoName: context.repoName,
         platformTargetGlobs: context.platformTargetGlobs,
+        runsOn: context.ciRunsOn,
       });
     }
     throw new Error(`Unknown generated managed file source ${file.source}`);

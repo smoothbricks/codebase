@@ -19,11 +19,14 @@ import {
   runPublishWorkflow,
 } from '../publish-workflow.js';
 
+const nixosRunsOn = ['nixos-latest-x64', 'self-hosted'] as const;
+
 describe('publish workflow definition', () => {
   it('renders the checked-in local publish workflow copy', async () => {
     const rendered = renderPublishWorkflowYaml({
       repoName: '@smoothbricks/codebase',
       platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+      runsOn: [...nixosRunsOn],
     });
     const packageRoot = join(import.meta.dir, '..', '..', '..');
     await expect(readFile(join(packageRoot, '..', '..', '.github/workflows/publish.yml'), 'utf8')).resolves.toBe(
@@ -35,6 +38,7 @@ describe('publish workflow definition', () => {
     const rendered = renderPublishWorkflowYaml({
       repoName: '@smoothbricks/codebase',
       platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+      runsOn: [...nixosRunsOn],
     });
 
     await expect(
@@ -125,6 +129,7 @@ describe('publish workflow definition', () => {
     const native = renderPublishWorkflowYaml({
       repoName: '@smoothbricks/codebase',
       platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+      runsOn: [...nixosRunsOn],
     });
     const linuxCandidate = native.slice(
       native.indexOf('  linux-release-candidate:'),
@@ -137,8 +142,9 @@ describe('publish workflow definition', () => {
     expect(linuxOnly).toContain(
       `smoo github-ci nx-run-many --targets "${LINUX_PLATFORM_TARGET_GLOBS.join(',')}" --projects`,
     );
-    expect(native).toContain('  linux-release-candidate:\n    runs-on: ubuntu-latest');
+    expect(native).toContain('  linux-release-candidate:');
     expect(native).toContain('  macos-platform:\n    runs-on: macos-latest');
+    expect(native).toContain('  publish-on-linux:');
     expect(native).toContain('  publish-on-linux:\n    needs: [linux-release-candidate, macos-platform]');
     expect(linuxCandidate).not.toContain('needs:');
     expect(macosPlatform).not.toContain('needs:');
@@ -612,3 +618,21 @@ function packageNameFromTag(tag: string): string {
   }
   return tag.slice(0, versionSeparator);
 }
+
+it('linux publish jobs use smoo.github.runsOn; macOS stays macos-latest', () => {
+  const rendered = renderPublishWorkflowYaml({
+    repoName: '@smoothbricks/codebase',
+    platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+    runsOn: [...nixosRunsOn],
+  });
+  expect(rendered).toContain(
+    `runs-on:
+      \${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      fromJSON('["nixos-latest-x64","self-hosted"]') || 'ubuntu-latest' }}`,
+  );
+  expect(rendered).toContain('  macos-platform:\n    runs-on: macos-latest');
+  // two linux jobs share the expression
+  expect(rendered.split('fromJSON(\'["nixos-latest-x64","self-hosted"]\')').length - 1).toBe(2);
+  expect(rendered).not.toContain('  linux-release-candidate:\n    runs-on: ubuntu-latest');
+  expect(rendered).not.toContain('  publish-on-linux:\n    runs-on: ubuntu-latest');
+});
