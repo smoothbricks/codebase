@@ -69,7 +69,7 @@ export async function runTypeScriptEmit(
 
     const declarationsSucceeded = await runner({
       command: 'tsc',
-      args: ['-p', tsConfigPath, '--emitDeclarationOnly', '--declaration', '--declarationMap'],
+      args: ['-p', overlayPath, '--emitDeclarationOnly', '--declaration', '--declarationMap'],
       cwd,
     });
     return { success: declarationsSucceeded };

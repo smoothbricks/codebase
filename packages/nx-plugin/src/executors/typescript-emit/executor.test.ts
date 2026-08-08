@@ -60,13 +60,7 @@ describe('@smoothbricks/nx-plugin TypeScript emit executor', () => {
       );
       expect(invocations[1]).toEqual({
         command: 'tsc',
-        args: [
-          '-p',
-          join(projectRoot, 'tsconfig.lib.json'),
-          '--emitDeclarationOnly',
-          '--declaration',
-          '--declarationMap',
-        ],
+        args: ['-p', overlayPath, '--emitDeclarationOnly', '--declaration', '--declarationMap'],
         cwd: projectRoot,
       });
       expect(existsSync(overlayPath)).toBe(false);
