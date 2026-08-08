@@ -60,21 +60,14 @@ jobs:
         run: smoo github-ci nx-smart --target build --name "Build" --step 6
 
       # Step 7
-      # Aggregate build covers the host N-API binary. Run every supplemental
-      # Linux target here as well so release-only cross compilers are exercised
-      # before Publish.
-      - name: 🐧 Build supplemental Linux targets
-        run: smoo github-ci nx-run-many --targets "*-linux"
+      - name: 🔍 Lint
+        run: smoo github-ci nx-smart --target lint --name "Lint" --step 7
 
       # Step 8
-      - name: 🔍 Lint
-        run: smoo github-ci nx-smart --target lint --name "Lint" --step 8
+      - name: 🧪 Unit Tests
+        run: smoo github-ci nx-smart --target test --name "Unit Tests" --step 8
 
       # Step 9
-      - name: 🧪 Unit Tests
-        run: smoo github-ci nx-smart --target test --name "Unit Tests" --step 9
-
-      # Step 10
       - name: 🩺 Check managed-file drift
         id: managed-drift
         if:
@@ -82,12 +75,12 @@ jobs:
           github.event.repository.default_branch) }}
         run: smoo monorepo check --warn
 
-      # Step 11
+      # Step 10
       - name: 🔁 Dispatch managed-file drift healing
         if: steps.managed-drift.outputs.drifted != '' && steps.managed-drift.outputs.drifted != '0'
         run: gh workflow run managed-files.yml --ref "$GITHUB_REF_NAME"
 
-      # Step 12
+      # Step 11
       # Nx's database cache needs artifact files and .nx/workspace-data DB
       # metadata restored together; GitHub Actions cache is only the archive
       # transport. Save runs only after prior required steps succeed on the default
@@ -103,7 +96,7 @@ jobs:
             .nx/workspace-data/*.db*
           key: ${{ runner.os }}-${{ runner.arch }}-nx-db-v1-${{ github.sha }}
 
-      # Step 13
+      # Step 12
       - name: 📎 Upload trace DBs
         # success() is the default; always() keeps traces after a red build/test.
         if: always()
@@ -117,7 +110,7 @@ jobs:
 
       # --- Cleanup ------------------------------------------------------------
 
-      # Step 14
+      # Step 13
       - name: 🧹 Cleanup and cache Nix/devenv
         # always() still saves after a red job. Nix NAR is ephemeral-only;
         # devenv eval-cache also saves on host-nix when setup missed.
