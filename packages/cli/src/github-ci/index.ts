@@ -168,6 +168,7 @@ export interface NxRunManyOptions {
   configuration?: string;
   collectOutputs?: string;
   allowEmptyProjects?: boolean;
+  prerequisiteTarget?: string;
 }
 
 export interface ExpandedNxTargetRuns {
@@ -208,6 +209,30 @@ export function expandNxTargetRuns(projects: ProjectTargets[], options: NxRunMan
     }
   }
   return { runs, unmatchedGlobs };
+}
+
+export function nxRunManyExecutionPlan(runs: NxTargetRun[], prerequisiteTarget?: string): NxTargetRun[] {
+  if (prerequisiteTarget === undefined || runs.length === 0) {
+    return runs;
+  }
+  const projectsByName = new Map<string, ProjectTargets>();
+  for (const targetRun of runs) {
+    for (const project of targetRun.projects) {
+      projectsByName.set(project.project, project);
+    }
+  }
+  const prerequisiteProjects = [...projectsByName.values()].sort((left, right) =>
+    left.project.localeCompare(right.project),
+  );
+  const missingProjects = prerequisiteProjects
+    .filter((project) => !project.targets.includes(prerequisiteTarget))
+    .map((project) => project.project);
+  if (missingProjects.length > 0) {
+    throw new Error(
+      `Nx prerequisite target ${prerequisiteTarget} is missing for selected project(s): ${missingProjects.join(', ')}.`,
+    );
+  }
+  return [{ target: prerequisiteTarget, projects: prerequisiteProjects }, ...runs];
 }
 
 export function expandNxTargetDependencyRuns(runs: NxTargetRun[]): NxTargetRun[] {
@@ -279,7 +304,7 @@ export async function githubCiNxRunMany(root: string, options: NxRunManyOptions)
   if (expanded.unmatchedGlobs.length > 0) {
     console.log(`No Nx targets matched target glob(s): ${expanded.unmatchedGlobs.join(', ')}; skipping.`);
   }
-  for (const targetRun of expanded.runs) {
+  for (const targetRun of nxRunManyExecutionPlan(expanded.runs, options.prerequisiteTarget)) {
     await run('nx', nxRunManyArgs(targetRun, options.configuration), root);
   }
   if (options.collectOutputs) {
