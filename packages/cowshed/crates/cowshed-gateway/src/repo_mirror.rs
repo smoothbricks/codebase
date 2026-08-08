@@ -1327,7 +1327,7 @@ pub enum RepoMirrorError {
 mod tests {
     use std::{
         collections::{BTreeSet, VecDeque},
-        os::unix::fs::PermissionsExt as _,
+        os::{fd::FromRawFd as _, unix::fs::PermissionsExt as _},
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -1806,7 +1806,7 @@ mod tests {
         let helper = root.join("blocking-helper");
         std::fs::write(
             &helper,
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" > helper.pid\nexec /bin/cat \"$1\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > helper.pid\nexec 3<\"$1\"\nIFS= read -r _ <&3\n",
         )
         .expect("write blocking helper");
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
@@ -1838,13 +1838,28 @@ mod tests {
                 let helper = helper.clone();
                 async move { run_fetch_helper(&helper, plan).await }
             });
-            let fifo_writer = timeout(
-                Duration::from_secs(1),
-                tokio::fs::OpenOptions::new().write(true).open(&fifo),
-            )
+            let fifo_writer = timeout(Duration::from_secs(1), async {
+                loop {
+                    let descriptor = unsafe {
+                        libc::open(
+                            fifo_path.as_ptr(),
+                            libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                        )
+                    };
+                    if descriptor >= 0 {
+                        break unsafe { std::fs::File::from_raw_fd(descriptor) };
+                    }
+                    let error = std::io::Error::last_os_error();
+                    assert_eq!(
+                        error.raw_os_error(),
+                        Some(libc::ENXIO),
+                        "open helper FIFO: {error}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
             .await
-            .expect("helper startup deadline")
-            .expect("open helper FIFO");
+            .expect("helper startup deadline");
             let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
                 .expect("read helper pid")
                 .trim()
