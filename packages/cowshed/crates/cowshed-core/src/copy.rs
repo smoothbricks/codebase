@@ -6,10 +6,12 @@ use crate::apfs::{
 };
 use crate::error::{CowshedError, Result};
 
+// Apple openrsync and upstream rsync spell extended-attribute preservation differently.
 #[cfg(target_os = "macos")]
-const RSYNC: &str = "/usr/bin/rsync";
+const RSYNC_XATTR_FLAG: &str = "--extended-attributes";
 #[cfg(not(target_os = "macos"))]
-const RSYNC: &str = "rsync";
+const RSYNC_XATTR_FLAG: &str = "--xattrs";
+
 const DEFAULT_PASS_BUDGET: usize = 6;
 const CHURN_SAMPLE_LIMIT: usize = 8;
 const APFS_ROOT_METADATA_EXCLUDES: [&str; 5] = [
@@ -72,9 +74,10 @@ where
 
         for pass in 1..=pass_budget {
             let request = CommandRequest::new(
-                RSYNC,
+                "rsync",
                 [
-                    OsString::from("-aE"),
+                    OsString::from("-a"),
+                    OsString::from(RSYNC_XATTR_FLAG),
                     OsString::from("--delete"),
                     OsString::from("--itemize-changes"),
                     OsString::from(APFS_ROOT_METADATA_EXCLUDES[0]),
@@ -191,8 +194,12 @@ fn sanitize_change_kind(kind: &str) -> String {
 }
 fn copy_spawn_error(error: CommandRunError) -> CowshedError {
     CowshedError::environment_missing(
-        format!("cannot execute {RSYNC}: {error}"),
-        "install the macOS base system tools, then retry cowshed adopt",
+        format!(
+            "cannot execute {}: {}",
+            error.program.display(),
+            error.source
+        ),
+        "install rsync, ensure it is available on PATH, then retry cowshed adopt",
     )
 }
 
