@@ -168,7 +168,7 @@ export interface NxRunManyOptions {
   configuration?: string;
   collectOutputs?: string;
   allowEmptyProjects?: boolean;
-  prerequisiteTarget?: string;
+  projectsWithTargets?: string;
 }
 
 export interface ExpandedNxTargetRuns {
@@ -177,9 +177,17 @@ export interface ExpandedNxTargetRuns {
 }
 
 export function expandNxTargetRuns(projects: ProjectTargets[], options: NxRunManyOptions): ExpandedNxTargetRuns {
-  const selectedProjects = selectProjects(projects, options.projects);
-  if (options.projects !== undefined && selectedProjects.length === 0 && options.allowEmptyProjects !== true) {
+  const namedProjects = selectProjects(projects, options.projects);
+  if (options.projects !== undefined && namedProjects.length === 0 && options.allowEmptyProjects !== true) {
     throw new Error(`No Nx projects matched --projects ${options.projects}.`);
+  }
+  const selectedProjects = selectProjectsWithTargets(namedProjects, options.projectsWithTargets);
+  if (
+    options.projectsWithTargets !== undefined &&
+    selectedProjects.length === 0 &&
+    options.allowEmptyProjects !== true
+  ) {
+    throw new Error(`No Nx projects own targets matching --projects-with-targets ${options.projectsWithTargets}.`);
   }
   const selectedTargetNames = [...new Set(selectedProjects.flatMap((project) => project.targets))].sort((a, b) =>
     a.localeCompare(b),
@@ -196,6 +204,16 @@ export function expandNxTargetRuns(projects: ProjectTargets[], options: NxRunMan
       unmatchedGlobs.push(targetPattern);
     }
     for (const target of targets) {
+      if (!isGlob && options.projectsWithTargets !== undefined) {
+        const missingProjects = selectedProjects
+          .filter((project) => !project.targets.includes(target))
+          .map((project) => project.project);
+        if (missingProjects.length > 0) {
+          throw new Error(
+            `Nx target ${target} is missing for project(s) selected by --projects-with-targets ${options.projectsWithTargets}: ${missingProjects.join(', ')}.`,
+          );
+        }
+      }
       if (addedTargets.has(target)) {
         continue;
       }
@@ -209,30 +227,6 @@ export function expandNxTargetRuns(projects: ProjectTargets[], options: NxRunMan
     }
   }
   return { runs, unmatchedGlobs };
-}
-
-export function nxRunManyExecutionPlan(runs: NxTargetRun[], prerequisiteTarget?: string): NxTargetRun[] {
-  if (prerequisiteTarget === undefined || runs.length === 0) {
-    return runs;
-  }
-  const projectsByName = new Map<string, ProjectTargets>();
-  for (const targetRun of runs) {
-    for (const project of targetRun.projects) {
-      projectsByName.set(project.project, project);
-    }
-  }
-  const prerequisiteProjects = [...projectsByName.values()].sort((left, right) =>
-    left.project.localeCompare(right.project),
-  );
-  const missingProjects = prerequisiteProjects
-    .filter((project) => !project.targets.includes(prerequisiteTarget))
-    .map((project) => project.project);
-  if (missingProjects.length > 0) {
-    throw new Error(
-      `Nx prerequisite target ${prerequisiteTarget} is missing for selected project(s): ${missingProjects.join(', ')}.`,
-    );
-  }
-  return [{ target: prerequisiteTarget, projects: prerequisiteProjects }, ...runs];
 }
 
 export function expandNxTargetDependencyRuns(runs: NxTargetRun[]): NxTargetRun[] {
@@ -304,7 +298,7 @@ export async function githubCiNxRunMany(root: string, options: NxRunManyOptions)
   if (expanded.unmatchedGlobs.length > 0) {
     console.log(`No Nx targets matched target glob(s): ${expanded.unmatchedGlobs.join(', ')}; skipping.`);
   }
-  for (const targetRun of nxRunManyExecutionPlan(expanded.runs, options.prerequisiteTarget)) {
+  for (const targetRun of expanded.runs) {
     await run('nx', nxRunManyArgs(targetRun, options.configuration), root);
   }
   if (options.collectOutputs) {
@@ -344,6 +338,16 @@ function selectProjects(projects: ProjectTargets[], selectors: string | undefine
   return projects
     .filter((project) => patterns.some((pattern) => new Bun.Glob(pattern).match(project.project)))
     .sort((left, right) => left.project.localeCompare(right.project));
+}
+
+function selectProjectsWithTargets(projects: ProjectTargets[], selectors: string | undefined): ProjectTargets[] {
+  if (selectors === undefined) {
+    return projects;
+  }
+  const patterns = commaSeparatedValues(selectors);
+  return projects.filter((project) =>
+    project.targets.some((target) => patterns.some((pattern) => new Bun.Glob(pattern).match(target))),
+  );
 }
 
 function commaSeparatedValues(value: string): string[] {

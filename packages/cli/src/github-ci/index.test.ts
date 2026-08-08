@@ -10,7 +10,6 @@ import {
   expandNxTargetRuns,
   githubCiNxRunMany,
   nxRunManyArgs,
-  nxRunManyExecutionPlan,
   nxSmartArgs,
   readGitHeadSha,
 } from './index.js';
@@ -54,22 +53,25 @@ describe('GitHub CI Nx target expansion', () => {
     ]);
   });
 
-  it('runs a prerequisite first for the exact union of target-glob owners', () => {
+  it('selects test owners from target globs and fails if any selected project lacks test', () => {
     const platformProjects = projects.map((project) =>
       project.project === 'mobile' ? { ...project, targets: [...project.targets, 'test'] } : project,
     );
-    const expanded = expandNxTargetRuns(platformProjects, { targets: '*-macos,*-ios' });
-    const plan = nxRunManyExecutionPlan(expanded.runs, 'test');
+    const expanded = expandNxTargetRuns(platformProjects, {
+      targets: 'test',
+      projectsWithTargets: '*-macos,*-ios',
+    });
 
-    expect(plan.map((run) => [run.target, run.projects.map((project) => project.project)])).toEqual([
+    expect(expanded.runs.map((run) => [run.target, run.projects.map((project) => project.project)])).toEqual([
       ['test', ['desktop', 'mobile']],
-      ['build-macos', ['desktop']],
-      ['package-macos', ['desktop']],
-      ['build-ios', ['mobile']],
     ]);
-    expect(nxRunManyArgs(plan[0]!)).toEqual(['run-many', '-t', 'test', '--projects=desktop,mobile', '--parallel=100%']);
-    expect(() => nxRunManyExecutionPlan(expandNxTargetRuns(projects, { targets: '*-ios' }).runs, 'test')).toThrow(
-      'Nx prerequisite target test is missing for selected project(s): mobile.',
+    const [testRun] = expanded.runs;
+    if (!testRun) {
+      throw new Error('Expected a test target run.');
+    }
+    expect(nxRunManyArgs(testRun)).toEqual(['run-many', '-t', 'test', '--projects=desktop,mobile', '--parallel=100%']);
+    expect(() => expandNxTargetRuns(projects, { targets: 'test', projectsWithTargets: '*-macos,*-ios' })).toThrow(
+      'Nx target test is missing for project(s) selected by --projects-with-targets *-macos,*-ios: mobile.',
     );
   });
 
@@ -175,21 +177,16 @@ describe('collected Nx outputs', () => {
     });
   });
 
-  it('blocks platform targets when their prerequisite target fails', async () => {
+  it('runs test for projects selected by platform target ownership', async () => {
     await withNxRunManyFixture(async ({ root }) => {
-      await writeFile(
-        join(root, 'packages/app/test-target.ts'),
-        "await Bun.write('test-ran.txt', 'tested');\nthrow new Error('prerequisite failed');\n",
-      );
-      await writeFile(join(root, 'packages/app/build-target.ts'), "await Bun.write('build-ran.txt', 'built');\n");
+      await writeFile(join(root, 'packages/app/test-target.ts'), "await Bun.write('test-ran.txt', 'tested');\n");
+      await writeFile(join(root, 'packages/app/build-target.ts'), "throw new Error('build must not run here');\n");
 
-      await expect(
-        githubCiNxRunMany(root, {
-          targets: '*-macos',
-          projects: 'app',
-          prerequisiteTarget: 'test',
-        }),
-      ).rejects.toThrow();
+      await githubCiNxRunMany(root, {
+        targets: 'test',
+        projectsWithTargets: '*-macos,*-ios',
+      });
+
       await expect(readFile(join(root, 'test-ran.txt'), 'utf8')).resolves.toBe('tested');
       await expect(readFile(join(root, 'build-ran.txt'), 'utf8')).rejects.toThrow();
     });
