@@ -73,6 +73,7 @@ in {
     ++ lib.optionals pkgs.stdenv.isLinux [
       pkgs.stdenv.cc
       (lib.hiPrio pkgs.llvmPackages.clang-unwrapped)
+      pkgs.rsync
       # openssl-src (vendored-openssl / git2) configure needs perl + make.
       pkgs.perl
       pkgs.gnumake

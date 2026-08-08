@@ -6,7 +6,10 @@ use crate::apfs::{
 };
 use crate::error::{CowshedError, Result};
 
+#[cfg(target_os = "macos")]
 const RSYNC: &str = "/usr/bin/rsync";
+#[cfg(not(target_os = "macos"))]
+const RSYNC: &str = "rsync";
 const DEFAULT_PASS_BUDGET: usize = 6;
 const CHURN_SAMPLE_LIMIT: usize = 8;
 const APFS_ROOT_METADATA_EXCLUDES: [&str; 5] = [

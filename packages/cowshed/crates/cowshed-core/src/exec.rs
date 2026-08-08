@@ -613,7 +613,7 @@ mod tests {
         let tree = TestTree::new();
         let status = SystemSpawnRunner
             .run(&SpawnPlan {
-                program: PathBuf::from("/usr/bin/false"),
+                program: PathBuf::from("false"),
                 args: vec![],
                 cwd: tree.cwd.clone(),
             })
@@ -652,7 +652,7 @@ mod tests {
 
         let status = SystemSpawnRunner
             .run(&SpawnPlan {
-                program: PathBuf::from("/bin/sh"),
+                program: PathBuf::from("sh"),
                 args: vec![
                     OsString::from("-c"),
                     OsString::from(format!("test ! -e /dev/fd/{descriptor}")),
@@ -1098,13 +1098,13 @@ mod tests {
         ready.wait();
 
         let script = format!(
-            "for fd in /dev/fd/*; do [ \"$(/usr/bin/readlink \"$fd\" 2>/dev/null)\" = \"{}\" ] && exit 1; done; exit 0",
+            "for fd in /dev/fd/*; do [ \"$(readlink \"$fd\" 2>/dev/null)\" = \"{}\" ] && exit 1; done; exit 0",
             marker.display()
         );
         let mut failure = None;
         for _ in 0..8 {
             match SystemSpawnRunner.run(&SpawnPlan {
-                program: PathBuf::from("/bin/sh"),
+                program: PathBuf::from("sh"),
                 args: vec![OsString::from("-c"), OsString::from(&script)],
                 cwd: tree.cwd.clone(),
             }) {
