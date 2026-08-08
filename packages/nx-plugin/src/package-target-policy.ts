@@ -228,7 +228,9 @@ function isBuildOutputDependencyPattern(dependency: string): boolean {
 }
 
 function expectedTargetDependencies(targetName: string): string[] {
-  return targetName === 'preview' ? ['build'] : ['^build'];
+  if (targetName === 'preview') return ['build'];
+  if (targetName.endsWith('-js')) return ['^*-js'];
+  return ['^build'];
 }
 
 function applyTargetDependencyPolicy(target: Record<string, unknown>, targetName: string): boolean {

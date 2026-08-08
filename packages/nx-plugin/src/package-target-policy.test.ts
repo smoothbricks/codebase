@@ -499,6 +499,23 @@ describe('per-package checkPackageTargets', () => {
 });
 
 describe('per-package applyPackageTargets', () => {
+  it('limits JavaScript output targets to dependency JavaScript outputs', () => {
+    const pkg: Record<string, unknown> = {
+      name: '@scope/lib',
+      dependencies: { '@scope/other': 'workspace:*' },
+      scripts: { compile: 'tsdown' },
+      nx: { name: 'lib' },
+    };
+    const workspaceNames = new Set(['@scope/lib', '@scope/other']);
+
+    expect(applyPackageTargets(pkg, 'packages/lib', workspaceNames)).toBe(true);
+    const nx = pkg.nx;
+    if (!isRecord(nx) || !isRecord(nx.targets) || !isRecord(nx.targets['tsdown-js'])) {
+      throw new Error('expected generated tsdown-js target');
+    }
+    expect(nx.targets['tsdown-js'].dependsOn).toEqual(['^*-js']);
+  });
+
   it('migrates colon targets and rewrites scripts', () => {
     const pkg: Record<string, unknown> = {
       name: '@scope/lib',
