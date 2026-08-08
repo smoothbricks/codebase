@@ -7,7 +7,13 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { CowshedError, connectCoordinator, coordinatorEndpoint, type ErrorCode, openProject } from './index.js';
+import {
+  CowshedError,
+  connectCoordinator,
+  coordinatorEndpoint,
+  type ErrorCode,
+  openProject,
+} from '../dist/ts/index.js';
 
 function requireCowshedError(error: unknown, code: ErrorCode): CowshedError {
   expect(error).toBeInstanceOf(CowshedError);
