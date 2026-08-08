@@ -31,6 +31,14 @@ function expectCoreConditions(entry: unknown): asserts entry is ExportConditions
   expect(requireStringProperty(record, 'default')).toBeString();
 }
 
+type PublishedWasmModule = {
+  createWasmAllocator(): Promise<unknown>;
+};
+
+function isPublishedWasmModule(value: unknown): value is PublishedWasmModule {
+  return isRecord(value) && typeof value.createWasmAllocator === 'function';
+}
+
 async function readPackageExports(packageUrl: URL): Promise<Record<string, unknown>> {
   const pkg = await Bun.file(packageUrl).json();
   const pkgRecord = requireRecord(pkg, 'package.json');
@@ -46,6 +54,19 @@ describe('package export conditions', () => {
     expectCoreConditions(exports['./es']);
 
     expect(exports['./package.json']).toBe('./package.json');
+  });
+
+  it('loads the declared published wasm module and allocator artifact', async () => {
+    const packageUrl = new URL('../../../package.json', import.meta.url);
+    const exports = await readPackageExports(packageUrl);
+    const wasmConditions = requireRecord(exports['./wasm'], 'wasm export conditions');
+    const importTarget = requireStringProperty(wasmConditions, 'import');
+    const wasmModule: unknown = await import(new URL(importTarget, packageUrl).href);
+    if (!isPublishedWasmModule(wasmModule)) throw new Error('Published wasm module lacks createWasmAllocator');
+
+    const allocator = requireRecord(await wasmModule.createWasmAllocator(), 'published wasm allocator');
+
+    expect(allocator.capacity).toBe(64);
   });
 
   it('arrow-builder package root export has expected conditions', async () => {

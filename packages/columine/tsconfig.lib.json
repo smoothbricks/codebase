@@ -4,9 +4,9 @@
     "paths": {
       "@smoothbricks/validation": ["../validation/src/index.ts"]
     },
-    "outDir": "./dist",
+    "outDir": "./dist/ts",
     "rootDir": "./src",
-    "tsBuildInfoFile": "./dist/.tsbuildinfo",
+    "tsBuildInfoFile": "./dist/ts/.tsbuildinfo",
     "skipLibCheck": true,
     "emitDeclarationOnly": false,
     "declaration": true,
