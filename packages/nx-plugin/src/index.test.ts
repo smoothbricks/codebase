@@ -90,7 +90,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['tsc-js']?.outputs).toEqual([
         '{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}',
         '{projectRoot}/dist/**/*.tsbuildinfo',
-        '{projectRoot}/dist/.tsbuildinfo',
       ]);
       expect(targets.typecheck?.options).toMatchObject({
         command: 'tsc -p tsconfig.lib.json --noEmit',

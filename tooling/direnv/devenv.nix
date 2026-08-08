@@ -84,6 +84,10 @@ in {
   # https://github.com/cachix/devenv/issues/1674
   apple.sdk = null;
 
+  # Nx otherwise defaults to three workers. Scale to the cores available in each
+  # developer shell or CI runner; explicit --parallel flags still take precedence.
+  env.NX_PARALLEL = "100%";
+
   # https://devenv.sh/languages/
   # Python with pyarrow for Arrow IPC verification tests.
   # Must use languages.python instead of adding pythonEnv to packages because:
