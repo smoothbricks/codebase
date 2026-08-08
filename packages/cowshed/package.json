@@ -171,7 +171,10 @@
           "command": "COWSHED_BENCH=1 cargo test --release -p cowshed-core --test apfs_benchmark -- --ignored --nocapture"
         }
       }
-    }
+    },
+    "tags": [
+      "npm:public"
+    ]
   },
   "dependencies": {
     "typia": "13.2.0"
@@ -183,5 +186,14 @@
     "@types/node": "~26.1.1",
     "typescript": "^6.0.3"
   },
-  "description": "Warm git workspaces: instant isolated copy-on-write workspaces with layered sandboxing (CLI, Rust API, NAPI bindings)"
+  "description": "Warm git workspaces: instant isolated copy-on-write workspaces with layered sandboxing (CLI, Rust API, NAPI bindings)",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smoothbricks/codebase.git",
+    "directory": "packages/cowshed"
+  }
 }
