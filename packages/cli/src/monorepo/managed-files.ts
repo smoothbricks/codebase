@@ -2,10 +2,9 @@ import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFi
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
-// Nx package exports are CLI-oriented; this is the module the CLI uses for graph + daemon IPC.
-import { createProjectGraphAsync } from 'nx/src/project-graph/project-graph.js';
-import type { PackageJson } from '../lib/json.js';
+import type { NxTargetConfig, PackageJson } from '../lib/json.js';
 import { listReleasePackages, readPackageJson } from '../lib/workspace.js';
+import { loadNxProjects, type NxProjects, targetNamesFromProjects } from '../nx/index.js';
 import { renderCiWorkflowYaml } from './ci-workflow.js';
 import { renderPublishWorkflowYaml } from './publish-workflow.js';
 
@@ -340,7 +339,7 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
   const ciPushBranches = getCiPushBranches(packageJson?.json);
   const ciRunsOn = getCiRunsOn(packageJson?.json);
   // In-process Nx API → daemon socket (no second Node/`nx` CLI process).
-  const nxProjects = await loadNxGraphProjects(root);
+  const nxProjects = await loadNxProjects(root);
   const stagingDeploy = deployTargetInfoFromProjects(nxProjects, 'staging');
   const productionDeploy = deployTargetInfoFromProjects(nxProjects, 'production');
   const platformTargetGlobs = platformTargetGlobsForTest(targetNamesFromProjects(nxProjects));
@@ -369,67 +368,12 @@ export function platformTargetGlobsForTest(targetNames: Iterable<string>): strin
   });
 }
 
-/** Resolved Nx project node as returned under `graph.nodes` / project-graph.json. */
-export type NxGraphProjectNode = {
-  data?: { targets?: Record<string, NxGraphTarget> };
-  targets?: Record<string, NxGraphTarget>;
-};
-
-type NxGraphTarget = {
-  command?: string;
-  options?: { command?: string };
-  configurations?: Record<string, { command?: string; options?: { command?: string } }>;
-};
-
-/**
- * Load resolved project nodes via Nx's programmatic API.
- *
- * `createProjectGraphAsync` is what the CLI uses: with the daemon up it speaks the
- * daemon unix socket instead of rebuilding the graph in a fresh Node process.
- * Spawning `nx graph` / `nx show` only added CLI boot + plugin-worker overhead on
- * top of that. smoo runs under Bun; Bun can import this CJS module directly.
- */
-async function loadNxGraphProjects(root: string): Promise<Record<string, NxGraphProjectNode>> {
-  const prevCwd = process.cwd();
-  process.chdir(root);
-  try {
-    const graph = (await createProjectGraphAsync()) as {
-      nodes: Record<string, { data?: { targets?: Record<string, NxGraphTarget> } }>;
-    };
-    const out: Record<string, NxGraphProjectNode> = {};
-    for (const [name, node] of Object.entries(graph.nodes)) {
-      out[name] = { data: { targets: node.data?.targets ?? {} } };
-    }
-    return out;
-  } finally {
-    process.chdir(prevCwd);
-  }
-}
-
-function targetsOfProject(node: NxGraphProjectNode): Record<string, NxGraphTarget> {
-  return node.data?.targets ?? node.targets ?? {};
-}
-
-/** Test seam: collect target names from a graph.nodes map. */
-export function targetNamesFromProjects(nodes: Record<string, NxGraphProjectNode>): string[] {
-  const targetNames = new Set<string>();
-  for (const node of Object.values(nodes)) {
-    for (const name of Object.keys(targetsOfProject(node))) {
-      targetNames.add(name);
-    }
-  }
-  return [...targetNames];
-}
-
 /** Test seam: deploy configuration presence/provider from graph nodes. */
-export function deployTargetInfoFromProjects(
-  nodes: Record<string, NxGraphProjectNode>,
-  configuration: string,
-): DeployTargetInfo {
+export function deployTargetInfoFromProjects(projects: NxProjects, configuration: string): DeployTargetInfo {
   let exists = false;
   let provider: DeployTargetInfo['provider'];
-  for (const node of Object.values(nodes)) {
-    const info = deployTargetInfoFromTargets(targetsOfProject(node), configuration);
+  for (const project of Object.values(projects)) {
+    const info = deployTargetInfoFromTargets(project.targets ?? {}, configuration);
     if (!info.exists) {
       continue;
     }
@@ -439,7 +383,7 @@ export function deployTargetInfoFromProjects(
   return { exists, provider };
 }
 
-function deployTargetInfoFromTargets(targets: Record<string, NxGraphTarget>, configuration: string): DeployTargetInfo {
+function deployTargetInfoFromTargets(targets: Record<string, NxTargetConfig>, configuration: string): DeployTargetInfo {
   const deploy = targets.deploy;
   if (!deploy) {
     return { exists: false };

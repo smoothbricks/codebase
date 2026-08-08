@@ -414,10 +414,12 @@ export function resolvedTargetsByProject(projects: ProjectTargets[]): Map<string
     projects.map((project) => [
       project.project,
       {
+        ...(project.root ? { root: project.root } : {}),
         targets: new Set(project.targets),
         ...(project.buildDependsOn ? { buildDependsOn: project.buildDependsOn } : {}),
         ...(project.targetDependencies ? { targetDependencies: project.targetDependencies } : {}),
         ...(project.targetExecutors ? { targetExecutors: project.targetExecutors } : {}),
+        ...(project.targetOptions ? { targetOptions: project.targetOptions } : {}),
         ...(project.targetScripts ? { targetScripts: project.targetScripts } : {}),
       },
     ]),

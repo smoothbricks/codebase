@@ -4,22 +4,18 @@ import {
   formatProjectTargetLines,
   nxCacheDirectories,
   nxResetCommand,
-  nxShowProjectCommand,
-  projectNamesFromNxShowProjectsOutput,
   projectNamesWithTarget,
   projectRootFromNxProjectJson,
+  projectTargetsFromNxProjects,
   targetDependenciesFromNxProjectJson,
   targetNamesFromNxProjectJson,
+  targetNamesFromProjects,
   targetOutputsFromNxProjectJson,
 } from './index.js';
 
 describe('Nx helper command construction', () => {
   it('builds explicit nx reset invocation', () => {
     expect(nxResetCommand()).toEqual({ command: 'nx', args: ['reset'] });
-  });
-
-  it('builds explicit nx project metadata invocation', () => {
-    expect(nxShowProjectCommand('cli')).toEqual({ command: 'nx', args: ['show', 'project', 'cli', '--json'] });
   });
 
   it('selects only local Nx cache directories', () => {
@@ -52,14 +48,6 @@ describe('Nx helper output formatting', () => {
         'build',
       ),
     ).toEqual(['cli', 'web']);
-  });
-
-  it('parses JSON project lists from nx show projects', () => {
-    expect(projectNamesFromNxShowProjectsOutput('["web","cli"]\n')).toEqual(['cli', 'web']);
-  });
-
-  it('parses legacy newline project lists from nx show projects', () => {
-    expect(projectNamesFromNxShowProjectsOutput('web\ncli\n')).toEqual(['cli', 'web']);
   });
 
   it('extracts sorted target names from Nx project JSON', () => {
@@ -112,5 +100,48 @@ describe('Nx helper output formatting', () => {
 
   it('treats missing target metadata as an empty project', () => {
     expect(targetNamesFromNxProjectJson({ name: 'cli' })).toEqual([]);
+  });
+
+  it('projects every resolved graph node without per-project CLI parsing', () => {
+    const projects = {
+      web: {
+        root: 'packages/web',
+        targets: {
+          test: {
+            executor: '@smoothbricks/nx-plugin:bounded-exec',
+            dependsOn: ['build'],
+            options: { command: 'bun test', timeoutMs: 120_000 },
+          },
+          build: { outputs: ['{projectRoot}/dist'] },
+        },
+      },
+      cli: { root: 'packages/cli', targets: { lint: {} } },
+    };
+
+    expect(targetNamesFromProjects(projects).sort()).toEqual(['build', 'lint', 'test']);
+    expect(projectTargetsFromNxProjects(projects)).toEqual([
+      {
+        project: 'cli',
+        root: 'packages/cli',
+        targets: ['lint'],
+        buildDependsOn: undefined,
+        targetDependencies: new Map(),
+        targetExecutors: new Map(),
+        targetOptions: new Map(),
+        targetOutputs: new Map(),
+        targetScripts: new Map(),
+      },
+      {
+        project: 'web',
+        root: 'packages/web',
+        targets: ['build', 'test'],
+        buildDependsOn: undefined,
+        targetDependencies: new Map([['test', ['build']]]),
+        targetExecutors: new Map([['test', '@smoothbricks/nx-plugin:bounded-exec']]),
+        targetOptions: new Map([['test', { command: 'bun test', timeoutMs: 120_000 }]]),
+        targetOutputs: new Map([['build', ['{projectRoot}/dist']]]),
+        targetScripts: new Map(),
+      },
+    ]);
   });
 });
