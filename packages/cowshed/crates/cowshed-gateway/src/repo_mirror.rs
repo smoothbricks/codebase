@@ -1804,7 +1804,11 @@ mod tests {
     async fn helper_process_is_killed_reaped_and_cleaned_on_repeated_cancellation() {
         let root = fixture_root("helper-cancel");
         let helper = root.join("blocking-helper");
-        std::fs::copy("/bin/cat", &helper).expect("copy blocking helper");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > helper.pid\nexec /bin/cat \"$1\"\n",
+        )
+        .expect("write blocking helper");
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
             .expect("secure blocking helper");
         let fifo = root.join(GATEWAY_GIT_FETCH_HELPER_ARG);
@@ -1818,6 +1822,7 @@ mod tests {
             "create blocking FIFO: {}",
             std::io::Error::last_os_error()
         );
+        let pid_file = root.join("helper.pid");
 
         for attempt in 0..8 {
             let destination = root.join(format!("attempt-{attempt}"));
@@ -1833,17 +1838,44 @@ mod tests {
                 let helper = helper.clone();
                 async move { run_fetch_helper(&helper, plan).await }
             });
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            let fifo_writer = timeout(
+                Duration::from_secs(1),
+                tokio::fs::OpenOptions::new().write(true).open(&fifo),
+            )
+            .await
+            .expect("helper startup deadline")
+            .expect("open helper FIFO");
+            let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+                .expect("read helper pid")
+                .trim()
+                .parse()
+                .expect("parse helper pid");
             cancellation.cancel();
             let result = timeout(Duration::from_secs(1), fetch)
                 .await
                 .expect("helper cancellation deadline")
                 .expect("helper task joined");
-            assert!(matches!(result, Err(RepoMirrorError::Cancelled)));
+            assert!(
+                matches!(result, Err(RepoMirrorError::Cancelled)),
+                "unexpected helper cancellation result: {result:?}"
+            );
             assert!(
                 !destination.exists(),
                 "cancelled helper left unpublished destination"
             );
+            let mut status = 0;
+            let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            let wait_error = std::io::Error::last_os_error();
+            assert_eq!(
+                waited, -1,
+                "cancelled helper process {pid} was not already reaped"
+            );
+            assert_eq!(
+                wait_error.raw_os_error(),
+                Some(libc::ECHILD),
+                "cancelled helper process {pid} remained waitable"
+            );
+            drop(fifo_writer);
         }
 
         remove_tree_read_only(&root);
