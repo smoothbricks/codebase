@@ -1,6 +1,7 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub Actions expressions are asserted literally. */
 import { describe, expect, it } from 'bun:test';
-import { readFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LINUX_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import fc from 'fast-check';
@@ -227,6 +228,45 @@ describe('managed raw files', () => {
     ]);
 
     expect(generated).toBe(source);
+  });
+
+  it('exports the restored ttsc cache path while preserving host cache overrides', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'smoo-github-bootstrap-'));
+    const bin = join(temp, 'bin');
+    await mkdir(bin);
+    const devenv = join(bin, 'devenv');
+    await writeFile(devenv, '#!/bin/sh\nexit 0\n');
+    await chmod(devenv, 0o755);
+
+    try {
+      const cases = [
+        { input: '', expected: join(REPO_ROOT, '.cache', 'ttsc') },
+        { input: join(temp, 'host-ttsc'), expected: join(temp, 'host-ttsc') },
+      ];
+      for (const [index, cache] of cases.entries()) {
+        const githubEnv = join(temp, `github-env-${index}`);
+        const githubPath = join(temp, `github-path-${index}`);
+        const process = Bun.spawn(
+          [join(REPO_ROOT, 'tooling', 'direnv', 'github-actions-bootstrap.sh'), 'build-shell'],
+          {
+            cwd: join(REPO_ROOT, 'tooling', 'direnv'),
+            env: {
+              ...Bun.env,
+              GITHUB_ENV: githubEnv,
+              GITHUB_PATH: githubPath,
+              PATH: `${bin}:${Bun.env.PATH ?? ''}`,
+              TTSC_CACHE_DIR: cache.input,
+            },
+            stderr: 'pipe',
+            stdout: 'pipe',
+          },
+        );
+        expect(await process.exited).toBe(0);
+        expect(await readFile(githubEnv, 'utf8')).toContain(`TTSC_CACHE_DIR=${cache.expected}\n`);
+      }
+    } finally {
+      await rm(temp, { recursive: true, force: true });
+    }
   });
 });
 

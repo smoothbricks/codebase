@@ -4,15 +4,14 @@ set -euo pipefail
 NIX_STORE_NAR="${NIX_STORE_NAR:-/tmp/nix-store.nar}"
 nix_store_cmd="/nix/var/nix/profiles/default/bin/nix-store"
 DEVENV_FLAKE="${DEVENV_FLAKE:-github:cachix/devenv}"
-# Host CI cache (GARM bind-mount). Prefer env from runner profile.
-# Path comes from the runner (GARM profile). Ephemeral runners leave unset;
-# devenv enterShell defaults to $PWD/.cache/ttsc.
-TTSC_CACHE_DIR="${TTSC_CACHE_DIR:-}"
 # Resolve from this script's location, not the caller's cwd. GitHub Actions
 # runs this from tooling/direnv today, but direct cwd-changing helpers are easy
 # to misuse and break on repeated calls.
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
+# Host CI supplies its bind-mounted cache through the runner profile. Ephemeral
+# runners must use the same repository path restored by cache-ttsc-plugins.
+TTSC_CACHE_DIR="${TTSC_CACHE_DIR:-$repo_root/.cache/ttsc}"
 
 clear_devenv_cache_state() {
   rm -rf "$repo_root/tooling/direnv/.devenv" "$repo_root/tooling/direnv/.direnv"
