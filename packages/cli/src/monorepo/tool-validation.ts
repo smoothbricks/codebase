@@ -67,7 +67,17 @@ const rootDevDependencies: RequiredDependency[] = [
 
 const cliPackageName = '@smoothbricks/cli';
 
-const requiredDevenvPackages = ['bun', 'git', 'git-format-staged', 'jq', 'alejandra', 'coreutils', 'gnutar'];
+const requiredDevenvPackages = [
+  'bun',
+  'git',
+  'git-format-staged',
+  'jq',
+  'alejandra',
+  'coreutils',
+  'gnutar',
+  'go',
+  'sccache',
+];
 // Any explicit nodejs provider is fine — the pinned major is the repo's choice
 // (Lambda parity, org convergence, …). Whether the pins in package.json agree
 // with the runtime is validated against the live PATH (validateRootRuntimeVersions),
@@ -351,6 +361,12 @@ function nixPackageComment(name: string): string {
   }
   if (name === 'git') {
     return '# Git hooks and repository inspection';
+  }
+  if (name === 'go') {
+    return '# Builds ttsc source plugins';
+  }
+  if (name === 'sccache') {
+    return '# Rust compiler wrapper and cache';
   }
   return '';
 }

@@ -3,10 +3,12 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
+  applyDevenvPackageDefaults,
   applyRootDevDependencyDefaults,
   applyToolConfigDefaults,
   applyToolingPackageDefaults,
   readToolContext,
+  validateDevenvPackages,
   validateToolConfig,
 } from './tool-validation.js';
 
@@ -89,6 +91,44 @@ describe('tool configuration validation', () => {
       expect(devenv).toContain('nodejs_latest');
       expect(devenv).toContain('coreutils');
       expect(devenv).toContain('git-format-staged');
+      expect(devenv).toContain('go # Builds ttsc source plugins');
+      expect(devenv).toContain('sccache # Rust compiler wrapper and cache');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('requires compiler helpers used by managed TypeScript and Rust builds', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-tool-validation-'));
+    try {
+      const devenvPath = join(root, 'tooling/direnv/devenv.nix');
+      await mkdir(dirname(devenvPath), { recursive: true });
+      await writeFile(
+        devenvPath,
+        `{
+  pkgs,
+  ...
+}: {
+  packages = with pkgs; [
+    nodejs_latest
+    bun
+    git
+    git-format-staged
+    jq
+    alejandra
+    coreutils
+    gnutar
+  ];
+}
+`,
+      );
+
+      expect(validateDevenvPackages(root)).toBe(2);
+      applyDevenvPackageDefaults(root);
+      expect(validateDevenvPackages(root)).toBe(0);
+      const devenv = await readFile(devenvPath, 'utf8');
+      expect(devenv).toContain('go # Builds ttsc source plugins');
+      expect(devenv).toContain('sccache # Rust compiler wrapper and cache');
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -141,6 +181,8 @@ describe('tool configuration validation', () => {
     alejandra
     coreutils
     gnutar
+    go
+    sccache
   ];
 }
 `,
