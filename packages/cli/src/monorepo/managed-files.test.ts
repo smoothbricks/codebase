@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { LINUX_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import fc from 'fast-check';
+import { type NxProjects, targetNamesFromProjects } from '../nx/index.js';
 import {
   deployTargetInfoFromProjects,
   extractInlineLocalBlocksForTest,
@@ -11,11 +12,9 @@ import {
   INLINE_LOCAL_END,
   LOCAL_SECTION_MARKER,
   managedFileTargetsForTest,
-  type NxGraphProjectNode,
   platformTargetGlobsForTest,
   reinsertInlineLocalBlocksForTest,
   splitLocalSectionForTest,
-  targetNamesFromProjects,
 } from './managed-files.js';
 
 const MANAGED = '# managed content\npath merge=driver\n';
@@ -177,48 +176,44 @@ describe('managed publish platform discovery', () => {
 });
 
 describe('nx graph project helpers', () => {
-  const sampleNodes: Record<string, NxGraphProjectNode> = {
+  const sampleProjects: NxProjects = {
     lib: {
-      data: {
-        targets: {
-          build: {},
-          'bundle-linux': {},
-          lint: {},
-        },
+      targets: {
+        build: {},
+        'bundle-linux': {},
+        lint: {},
       },
     },
     app: {
-      data: {
-        targets: {
-          deploy: {
-            options: { command: 'echo no' },
-            configurations: {
-              staging: { command: 'wrangler deploy --env staging' },
-              production: { options: { command: 'wrangler deploy --env production' } },
-            },
+      targets: {
+        deploy: {
+          options: { command: 'echo no' },
+          configurations: {
+            staging: { command: 'wrangler deploy --env staging' },
+            production: { options: { command: 'wrangler deploy --env production' } },
           },
-          'package-macos': {},
         },
+        'package-macos': {},
       },
     },
   };
 
   it('collects target names from graph nodes without project names', () => {
-    expect(targetNamesFromProjects(sampleNodes).sort()).toEqual(
+    expect(targetNamesFromProjects(sampleProjects).sort()).toEqual(
       ['build', 'bundle-linux', 'deploy', 'lint', 'package-macos'].sort(),
     );
   });
 
   it('detects deploy configurations and cloudflare provider from graph nodes', () => {
-    expect(deployTargetInfoFromProjects(sampleNodes, 'staging')).toEqual({
+    expect(deployTargetInfoFromProjects(sampleProjects, 'staging')).toEqual({
       exists: true,
       provider: 'cloudflare',
     });
-    expect(deployTargetInfoFromProjects(sampleNodes, 'production')).toEqual({
+    expect(deployTargetInfoFromProjects(sampleProjects, 'production')).toEqual({
       exists: true,
       provider: 'cloudflare',
     });
-    expect(deployTargetInfoFromProjects(sampleNodes, 'preview')).toEqual({ exists: false });
+    expect(deployTargetInfoFromProjects(sampleProjects, 'preview')).toEqual({ exists: false });
   });
 });
 

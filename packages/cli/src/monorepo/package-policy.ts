@@ -165,7 +165,7 @@ export function applyWorkspaceDependencyDefaults(root: string, options: PackageT
   } else {
     console.log('unchanged      tsconfig.test.json policy');
   }
-  if (applyWorkspaceBoundedTestTargetPolicy(root)) {
+  if (applyWorkspaceBoundedTestTargetPolicy(root, options)) {
     console.log('updated        package test targets bounded execution policy');
   } else {
     console.log('unchanged      package test targets bounded execution policy');
@@ -409,7 +409,7 @@ export function validateWorkspaceDependencies(root: string, options: PackageTarg
     console.error(`${issue.path}: ${issue.message}`);
     failures++;
   }
-  for (const issue of checkWorkspaceBoundedTestTargetPolicy(root)) {
+  for (const issue of checkWorkspaceBoundedTestTargetPolicy(root, options)) {
     console.error(`${issue.path}: ${issue.message}`);
     failures++;
   }
