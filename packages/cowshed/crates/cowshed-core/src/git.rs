@@ -10,7 +10,10 @@ use tokio::process::Command;
 
 use crate::error::{CowshedError, Result};
 
+#[cfg(target_os = "macos")]
 const GIT: &str = "/usr/bin/git";
+#[cfg(not(target_os = "macos"))]
+const GIT: &str = "git";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteUrl {
@@ -489,7 +492,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{GitRepository, ensure_git_success, git_message};
+    use super::{GIT, GitRepository, ensure_git_success, git_message};
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
     fn repository() -> PathBuf {
@@ -503,14 +506,14 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&root).expect("create test repository");
-        let status = Command::new("/usr/bin/git")
+        let status = Command::new(GIT)
             .args(["init", "-q", "-b", "main"])
             .arg(&root)
             .status()
             .expect("run git init");
         assert!(status.success());
         fs::write(root.join("README"), "test\n").expect("write fixture");
-        let status = Command::new("/usr/bin/git")
+        let status = Command::new(GIT)
             .arg("-C")
             .arg(&root)
             .args([
@@ -524,7 +527,7 @@ mod tests {
             .status()
             .expect("run git add");
         assert!(status.success());
-        let status = Command::new("/usr/bin/git")
+        let status = Command::new(GIT)
             .arg("-C")
             .arg(&root)
             .args([
@@ -553,7 +556,7 @@ mod tests {
     #[tokio::test]
     async fn detached_head_has_no_current_branch() {
         let root = repository();
-        let status = Command::new("/usr/bin/git")
+        let status = Command::new(GIT)
             .arg("-C")
             .arg(&root)
             .args(["switch", "--detach", "--quiet", "HEAD"])
@@ -673,7 +676,7 @@ mod tests {
     #[tokio::test]
     async fn prepares_standalone_workspace_branch_and_only_local_host_remote() {
         let root = repository();
-        let status = Command::new("/usr/bin/git")
+        let status = Command::new(GIT)
             .arg("-C")
             .arg(&root)
             .args([
@@ -710,7 +713,7 @@ mod tests {
             .await
             .expect("prepare workspace");
 
-        let output = Command::new("/usr/bin/git")
+        let output = Command::new(GIT)
             .arg("-C")
             .arg(&root)
             .args(["remote", "get-url", "host"])
@@ -744,7 +747,7 @@ mod tests {
                 .await
                 .expect("local head is not remotely preserved")
         );
-        let status = Command::new("/usr/bin/git")
+        let status = Command::new(GIT)
             .arg("-C")
             .arg(&host)
             .args(["update-ref", "refs/remotes/origin/main", &host_head])
@@ -759,7 +762,7 @@ mod tests {
         );
 
         let session = host.with_extension("session");
-        let status = Command::new("/usr/bin/git")
+        let status = Command::new(GIT)
             .args(["clone", "-q"])
             .arg(&host)
             .arg(&session)
@@ -767,7 +770,7 @@ mod tests {
             .expect("clone session");
         assert!(status.success());
         fs::write(session.join("session-only"), "unpublished\n").expect("write session change");
-        let status = Command::new("/usr/bin/git")
+        let status = Command::new(GIT)
             .arg("-C")
             .arg(&session)
             .args([
@@ -781,7 +784,7 @@ mod tests {
             .status()
             .expect("stage session change");
         assert!(status.success());
-        let status = Command::new("/usr/bin/git")
+        let status = Command::new(GIT)
             .arg("-C")
             .arg(&session)
             .args([
@@ -807,7 +810,7 @@ mod tests {
                 .expect("absent session object is not preserved")
         );
 
-        let status = Command::new("/usr/bin/git")
+        let status = Command::new(GIT)
             .arg("-C")
             .arg(&session)
             .args(["push", "-q", "origin", "HEAD:refs/cowshed/raven/heads/main"])
