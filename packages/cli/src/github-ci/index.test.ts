@@ -10,6 +10,7 @@ import {
   expandNxTargetRuns,
   githubCiNxRunMany,
   nxRunManyArgs,
+  nxRunManyExecutionPlan,
   nxSmartArgs,
   readGitHeadSha,
 } from './index.js';
@@ -51,6 +52,25 @@ describe('GitHub CI Nx target expansion', () => {
       ['package-macos', ['desktop']],
       ['build-ios', ['mobile']],
     ]);
+  });
+
+  it('runs a prerequisite first for the exact union of target-glob owners', () => {
+    const platformProjects = projects.map((project) =>
+      project.project === 'mobile' ? { ...project, targets: [...project.targets, 'test'] } : project,
+    );
+    const expanded = expandNxTargetRuns(platformProjects, { targets: '*-macos,*-ios' });
+    const plan = nxRunManyExecutionPlan(expanded.runs, 'test');
+
+    expect(plan.map((run) => [run.target, run.projects.map((project) => project.project)])).toEqual([
+      ['test', ['desktop', 'mobile']],
+      ['build-macos', ['desktop']],
+      ['package-macos', ['desktop']],
+      ['build-ios', ['mobile']],
+    ]);
+    expect(nxRunManyArgs(plan[0]!)).toEqual(['run-many', '-t', 'test', '--projects=desktop,mobile', '--parallel=100%']);
+    expect(() => nxRunManyExecutionPlan(expandNxTargetRuns(projects, { targets: '*-ios' }).runs, 'test')).toThrow(
+      'Nx prerequisite target test is missing for selected project(s): mobile.',
+    );
   });
 
   it('reports a zero-match glob as an empty run set', () => {
@@ -152,6 +172,26 @@ describe('collected Nx outputs', () => {
         sourceSha,
         files: [],
       });
+    });
+  });
+
+  it('blocks platform targets when their prerequisite target fails', async () => {
+    await withNxRunManyFixture(async ({ root }) => {
+      await writeFile(
+        join(root, 'packages/app/test-target.ts'),
+        "await Bun.write('test-ran.txt', 'tested');\nthrow new Error('prerequisite failed');\n",
+      );
+      await writeFile(join(root, 'packages/app/build-target.ts'), "await Bun.write('build-ran.txt', 'built');\n");
+
+      await expect(
+        githubCiNxRunMany(root, {
+          targets: '*-macos',
+          projects: 'app',
+          prerequisiteTarget: 'test',
+        }),
+      ).rejects.toThrow();
+      await expect(readFile(join(root, 'test-ran.txt'), 'utf8')).resolves.toBe('tested');
+      await expect(readFile(join(root, 'build-ran.txt'), 'utf8')).rejects.toThrow();
     });
   });
 
@@ -472,7 +512,19 @@ async function withNxRunManyFixture(
       join(root, 'packages/app/package.json'),
       JSON.stringify({
         name: '@fixture/app',
-        nx: { name: 'app', targets: { build: { executor: 'nx:noop' } } },
+        nx: {
+          name: 'app',
+          targets: {
+            'build-macos': {
+              executor: 'nx:run-commands',
+              options: { command: 'bun packages/app/build-target.ts', cwd: '.' },
+            },
+            test: {
+              executor: 'nx:run-commands',
+              options: { command: 'bun packages/app/test-target.ts', cwd: '.' },
+            },
+          },
+        },
       }),
     );
     await $`git init --quiet`.cwd(root);

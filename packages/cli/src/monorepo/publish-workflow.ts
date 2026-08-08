@@ -777,7 +777,7 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
   lines.push(
     '',
     `      # Step ${stepNumber++}`,
-    '      - name: 🍎 Build selected macOS and iOS release outputs',
+    '      - name: 🧪 Test and build selected macOS and iOS release outputs',
     '        run:',
     `          smoo release build-platform-outputs --bump "${githubExpression(
       'inputs.bump',
