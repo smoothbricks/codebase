@@ -327,8 +327,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           parallel: false,
         },
       });
-      expect(targets['tsc-js']?.dependsOn).toEqual(['^tsc-js', 'cargo-wasm']);
-      expect(targets.typecheck?.dependsOn).toEqual(['^tsc-js', 'cargo-wasm']);
+      expect(targets['tsc-js']?.dependsOn).toEqual(['^build', 'cargo-wasm']);
+      expect(targets.typecheck?.dependsOn).toEqual(['^build', 'cargo-wasm']);
       expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
       expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
       // A nested crate manifest is enough for output inference, but not for
