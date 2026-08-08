@@ -260,7 +260,10 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       !('napi-test' in (packageJson.nx?.targets ?? {})) &&
       existsSync(join(absoluteProjectRoot, 'src/native.test.ts'))
     ) {
-      targets['napi-test'] = createNapiTestTarget(projectRoot);
+      targets['napi-test'] = createNapiTestTarget(
+        projectRoot,
+        existsSync(join(absoluteProjectRoot, 'bunfig.napi-test.toml')),
+      );
     }
   }
 
@@ -563,13 +566,14 @@ function createNapiTargets(projectRoot: string, config: ResolvedNapiConfig): Rec
   return targets;
 }
 
-function createNapiTestTarget(projectRoot: string): TargetConfiguration {
+function createNapiTestTarget(projectRoot: string, hasDedicatedBunfig: boolean): TargetConfiguration {
+  const configFlag = hasDedicatedBunfig ? ' --config=bunfig.napi-test.toml' : '';
   return {
     executor: '@smoothbricks/nx-plugin:bounded-exec',
     cache: true,
     dependsOn: ['cargo-test', 'cargo-napi', 'tsc-js', '^build', 'build'],
     options: {
-      command: 'bun test --timeout=30000 src/native.test.ts',
+      command: `bun${configFlag} test --timeout=30000 src/native.test.ts`,
       cwd: projectRoot,
       timeoutMs: 120000,
       killAfterMs: 10000,

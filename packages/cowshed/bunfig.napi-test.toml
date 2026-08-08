@@ -1,0 +1,4 @@
+[test]
+# The NAPI smoke test imports compiled JavaScript, so Typia source transformation is unnecessary.
+# Keep trace coverage through LMAO's compiled preload without paying compiler startup on every run.
+preload = ["../lmao/dist/ts/bun/trace-preload.js"]
