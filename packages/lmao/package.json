@@ -8,135 +8,135 @@
     "./dist/lib/span-buffer/aot/v1.js",
     "./src/lib/span-buffer/aot/v1.ts"
   ],
-  "main": "./dist/index.js",
-  "module": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "main": "./dist/ts/index.js",
+  "module": "./dist/ts/index.js",
+  "types": "./dist/ts/index.d.ts",
   "exports": {
     "./package.json": "./package.json",
     ".": {
-      "types": "./dist/index.d.ts",
+      "types": "./dist/ts/index.d.ts",
       "development": "./src/index.ts",
-      "import": "./dist/index.js",
-      "default": "./dist/index.js"
+      "import": "./dist/ts/index.js",
+      "default": "./dist/ts/index.js"
     },
     "./span-buffer/aot/v1": {
-      "types": "./dist/lib/span-buffer/aot/v1.d.ts",
+      "types": "./dist/ts/lib/span-buffer/aot/v1.d.ts",
       "development": "./src/lib/span-buffer/aot/v1.ts",
-      "import": "./dist/lib/span-buffer/aot/v1.js",
-      "default": "./dist/lib/span-buffer/aot/v1.js"
+      "import": "./dist/ts/lib/span-buffer/aot/v1.js",
+      "default": "./dist/ts/lib/span-buffer/aot/v1.js"
     },
     "./vocabulary/register/v1": {
-      "types": "./dist/vocabulary/register/v1.d.ts",
+      "types": "./dist/ts/vocabulary/register/v1.d.ts",
       "development": "./src/vocabulary/register/v1.ts",
-      "import": "./dist/vocabulary/register/v1.js",
-      "default": "./dist/vocabulary/register/v1.js"
+      "import": "./dist/ts/vocabulary/register/v1.js",
+      "default": "./dist/ts/vocabulary/register/v1.js"
     },
     "./node": {
-      "types": "./dist/node.d.ts",
+      "types": "./dist/ts/node.d.ts",
       "development": "./src/node.ts",
-      "import": "./dist/node.js",
-      "default": "./dist/node.js"
+      "import": "./dist/ts/node.js",
+      "default": "./dist/ts/node.js"
     },
     "./es": {
-      "types": "./dist/es.d.ts",
+      "types": "./dist/ts/es.d.ts",
       "development": "./src/es.ts",
-      "import": "./dist/es.js",
-      "default": "./dist/es.js"
+      "import": "./dist/ts/es.js",
+      "default": "./dist/ts/es.js"
     },
     "./wasm": {
-      "types": "./dist/wasm.d.ts",
+      "types": "./dist/ts/wasm.d.ts",
       "development": "./src/wasm.ts",
-      "import": "./dist/wasm.js",
-      "default": "./dist/wasm.js"
+      "import": "./dist/ts/wasm.js",
+      "default": "./dist/ts/wasm.js"
     },
     "./cloudflare": {
-      "types": "./dist/cloudflare.d.ts",
+      "types": "./dist/ts/cloudflare.d.ts",
       "development": "./src/cloudflare.ts",
-      "import": "./dist/cloudflare.js",
-      "default": "./dist/cloudflare.js"
+      "import": "./dist/ts/cloudflare.js",
+      "default": "./dist/ts/cloudflare.js"
     },
     "./tracers": {
-      "types": "./dist/lib/tracers/index.d.ts",
+      "types": "./dist/ts/lib/tracers/index.d.ts",
       "development": "./src/lib/tracers/index.ts",
-      "import": "./dist/lib/tracers/index.js",
-      "default": "./dist/lib/tracers/index.js"
+      "import": "./dist/ts/lib/tracers/index.js",
+      "default": "./dist/ts/lib/tracers/index.js"
     },
     "./errors": {
-      "types": "./dist/lib/errors/index.d.ts",
+      "types": "./dist/ts/lib/errors/index.d.ts",
       "development": "./src/lib/errors/index.ts",
-      "import": "./dist/lib/errors/index.js",
-      "default": "./dist/lib/errors/index.js"
+      "import": "./dist/ts/lib/errors/index.js",
+      "default": "./dist/ts/lib/errors/index.js"
     },
     "./errors/Blocked": {
-      "types": "./dist/lib/errors/Blocked.d.ts",
+      "types": "./dist/ts/lib/errors/Blocked.d.ts",
       "development": "./src/lib/errors/Blocked.ts",
-      "import": "./dist/lib/errors/Blocked.js",
-      "default": "./dist/lib/errors/Blocked.js"
+      "import": "./dist/ts/lib/errors/Blocked.js",
+      "default": "./dist/ts/lib/errors/Blocked.js"
     },
     "./errors/RetriesExhausted": {
-      "types": "./dist/lib/errors/RetriesExhausted.d.ts",
+      "types": "./dist/ts/lib/errors/RetriesExhausted.d.ts",
       "development": "./src/lib/errors/RetriesExhausted.ts",
-      "import": "./dist/lib/errors/RetriesExhausted.js",
-      "default": "./dist/lib/errors/RetriesExhausted.js"
+      "import": "./dist/ts/lib/errors/RetriesExhausted.js",
+      "default": "./dist/ts/lib/errors/RetriesExhausted.js"
     },
     "./errors/CodeError": {
-      "types": "./dist/lib/errors/CodeError.d.ts",
+      "types": "./dist/ts/lib/errors/CodeError.d.ts",
       "development": "./src/lib/errors/CodeError.ts",
-      "import": "./dist/lib/errors/CodeError.js",
-      "default": "./dist/lib/errors/CodeError.js"
+      "import": "./dist/ts/lib/errors/CodeError.js",
+      "default": "./dist/ts/lib/errors/CodeError.js"
     },
     "./errors/retry-policy": {
-      "types": "./dist/lib/errors/retry-policy.d.ts",
+      "types": "./dist/ts/lib/errors/retry-policy.d.ts",
       "development": "./src/lib/errors/retry-policy.ts",
-      "import": "./dist/lib/errors/retry-policy.js",
-      "default": "./dist/lib/errors/retry-policy.js"
+      "import": "./dist/ts/lib/errors/retry-policy.js",
+      "default": "./dist/ts/lib/errors/retry-policy.js"
     },
     "./errors/Transient": {
-      "types": "./dist/lib/errors/Transient.d.ts",
+      "types": "./dist/ts/lib/errors/Transient.d.ts",
       "development": "./src/lib/errors/Transient.ts",
-      "import": "./dist/lib/errors/Transient.js",
-      "default": "./dist/lib/errors/Transient.js"
+      "import": "./dist/ts/lib/errors/Transient.js",
+      "default": "./dist/ts/lib/errors/Transient.js"
     },
     "./sqlite": {
-      "types": "./dist/lib/sqlite/index.d.ts",
+      "types": "./dist/ts/lib/sqlite/index.d.ts",
       "development": "./src/lib/sqlite/index.ts",
-      "import": "./dist/lib/sqlite/index.js",
-      "default": "./dist/lib/sqlite/index.js"
+      "import": "./dist/ts/lib/sqlite/index.js",
+      "default": "./dist/ts/lib/sqlite/index.js"
     },
     "./sqlite/node": {
-      "types": "./dist/lib/sqlite/sqlite-node.d.ts",
+      "types": "./dist/ts/lib/sqlite/sqlite-node.d.ts",
       "development": "./src/lib/sqlite/sqlite-node.ts",
-      "import": "./dist/lib/sqlite/sqlite-node.js",
-      "default": "./dist/lib/sqlite/sqlite-node.js"
+      "import": "./dist/ts/lib/sqlite/sqlite-node.js",
+      "default": "./dist/ts/lib/sqlite/sqlite-node.js"
     },
     "./testing": {
-      "types": "./dist/testing.d.ts",
+      "types": "./dist/ts/testing.d.ts",
       "development": "./src/testing.ts",
-      "import": "./dist/testing.js",
-      "default": "./dist/testing.js"
+      "import": "./dist/ts/testing.js",
+      "default": "./dist/ts/testing.js"
     },
     "./testing/bun": {
-      "types": "./dist/lib/testing/bun-harness.d.ts",
+      "types": "./dist/ts/lib/testing/bun-harness.d.ts",
       "bun": "./src/lib/testing/bun-harness.ts",
       "development": "./src/lib/testing/bun-harness.ts",
-      "import": "./dist/lib/testing/bun-harness.js",
-      "default": "./dist/lib/testing/bun-harness.js"
+      "import": "./dist/ts/lib/testing/bun-harness.js",
+      "default": "./dist/ts/lib/testing/bun-harness.js"
     },
     "./testing/vitest": {
-      "types": "./dist/lib/testing/vitest-harness.d.ts",
+      "types": "./dist/ts/lib/testing/vitest-harness.d.ts",
       "development": "./src/lib/testing/vitest-harness.ts",
-      "import": "./dist/lib/testing/vitest-harness.js",
-      "default": "./dist/lib/testing/vitest-harness.js"
+      "import": "./dist/ts/lib/testing/vitest-harness.js",
+      "default": "./dist/ts/lib/testing/vitest-harness.js"
     },
     "./bun/preload": {
       "bun": "./src/bun/preload.ts",
       "development": "./src/bun/preload.ts",
-      "default": "./dist/bun/preload.js"
+      "default": "./dist/ts/bun/preload.js"
     },
     "./bun/trace-preload": {
       "bun": "./src/bun/trace-preload.ts",
       "development": "./src/bun/trace-preload.ts",
-      "default": "./dist/bun/trace-preload.js"
+      "default": "./dist/ts/bun/trace-preload.js"
     }
   },
   "files": [
