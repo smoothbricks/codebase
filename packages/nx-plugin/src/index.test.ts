@@ -279,22 +279,74 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('does not infer wasm targets for native N-API cdylib crates', async () => {
+  it('infers disjoint host and release targets from canonical N-API metadata', async () => {
     const workspace = await createWorkspace();
     try {
-      await workspace.write('packages/cowshed/package.json', '{"name":"cowshed"}\n');
+      await workspace.write(
+        'packages/cowshed/package.json',
+        JSON.stringify({
+          name: 'cowshed',
+          scripts: { test: 'nx run cowshed:test --outputStyle=stream' },
+          napi: {
+            binaryName: 'cowshed',
+            targets: [
+              'aarch64-apple-darwin',
+              'x86_64-apple-darwin',
+              'aarch64-unknown-linux-gnu',
+              'x86_64-unknown-linux-gnu',
+            ],
+          },
+        }),
+      );
       await workspace.write('packages/cowshed/Cargo.toml', '[workspace]\nmembers = ["crates/cowshed-napi"]\n');
       await workspace.write(
         'packages/cowshed/crates/cowshed-napi/Cargo.toml',
         '[package]\nname = "cowshed-napi"\n\n[lib]\ncrate-type = ["cdylib"]\n',
       );
+      await workspace.write(
+        'packages/cowshed/tsconfig.lib.json',
+        '{"compilerOptions":{"outDir":"dist/ts","tsBuildInfoFile":"dist/ts/tsconfig.lib.tsbuildinfo"}}\n',
+      );
+      await workspace.write('packages/cowshed/src/native.test.ts', 'export {};\n');
 
       const targets = await inferProjectTargets(workspace, 'packages/cowshed/package.json');
 
       expect(targets['cargo-wasm']).toBeUndefined();
-      expect(targets.build).toBeUndefined();
-      expect(targets.clean).toBeUndefined();
-      expect(targets['cargo-test']).toBeDefined();
+      expect(targets['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/ts']);
+      expect(targets['cargo-napi']).toMatchObject({
+        executor: 'nx:run-commands',
+        cache: true,
+        dependsOn: ['^build'],
+        outputs: ['{projectRoot}/dist/native/host'],
+        options: {
+          cwd: 'packages/cowshed',
+          command:
+            'napi build --release --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/host',
+        },
+      });
+      expect(targets['napi-arm64-macos']?.outputs).toEqual(['{projectRoot}/dist/native/darwin-arm64']);
+      expect(targets['napi-arm64-macos']?.options).toMatchObject({
+        command:
+          'napi build --release --platform --no-js --dts cowshed.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/darwin-arm64',
+      });
+      expect(targets['napi-x64-linux']?.outputs).toEqual(['{projectRoot}/dist/native/linux-x64-gnu']);
+      expect(targets['napi-x64-linux']?.options).toMatchObject({
+        command:
+          'napi build --release --platform --no-js --dts cowshed.linux-x64-gnu.d.ts --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/linux-x64-gnu',
+      });
+      expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
+      expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
+      expect(targets['napi-test']).toMatchObject({
+        executor: '@smoothbricks/nx-plugin:bounded-exec',
+        cache: true,
+        dependsOn: ['cargo-test', 'cargo-napi', 'tsc-js', '^build', 'build'],
+        options: {
+          command: 'bun test --timeout=30000 src/native.test.ts',
+          cwd: 'packages/cowshed',
+          timeoutMs: 120000,
+          killAfterMs: 10000,
+        },
+      });
     } finally {
       await workspace.cleanup();
     }
