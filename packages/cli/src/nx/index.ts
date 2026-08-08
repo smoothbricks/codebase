@@ -1,15 +1,11 @@
 import { existsSync } from 'node:fs';
 import { lstat, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import { $ } from 'bun';
-import {
-  type NxDependsOn,
-  type NxProjectJson,
-  type NxTargetConfig,
-  parseNxProjectJsonText,
-  parseStringArrayText,
-} from '../lib/json.js';
-import { decode, run } from '../lib/run.js';
+// Nx package exports are CLI-oriented; this is the module the CLI uses for graph + daemon IPC.
+import { createProjectGraphAsync } from 'nx/src/project-graph/project-graph.js';
+import { workspaceRoot as primaryWorkspaceRoot } from 'nx/src/utils/workspace-root.js';
+import type { NxDependsOn, NxProjectJson, NxTargetConfig, NxTargetOptions } from '../lib/json.js';
+import { run, runResult } from '../lib/run.js';
 
 export interface ProjectTargets {
   project: string;
@@ -18,6 +14,7 @@ export interface ProjectTargets {
   buildDependsOn?: string[];
   targetDependencies?: Map<string, string[]>;
   targetExecutors?: Map<string, string>;
+  targetOptions?: Map<string, NxTargetOptions>;
   targetOutputs?: Map<string, string[]>;
   targetScripts?: Map<string, string>;
 }
@@ -31,10 +28,6 @@ export function nxResetCommand(): CommandInvocation {
   return { command: 'nx', args: ['reset'] };
 }
 
-export function nxShowProjectCommand(project: string): CommandInvocation {
-  return { command: 'nx', args: ['show', 'project', project, '--json'] };
-}
-
 export function nxCacheDirectories(root: string): string[] {
   return [join(root, '.nx/cache'), join(root, '.nx/workspace-data'), join(root, 'node_modules/.cache/nx')];
 }
@@ -46,10 +39,6 @@ export function targetNamesFromNxProjectJson(value: NxProjectJson | null | undef
 
 export function projectRootFromNxProjectJson(value: NxProjectJson | null | undefined): string | undefined {
   return typeof value?.root === 'string' ? value.root : undefined;
-}
-
-export function buildDependsOnFromNxProjectJson(value: NxProjectJson | null | undefined): string[] | undefined {
-  return targetDependenciesFromNxProjectJson(value).get('build');
 }
 
 export function targetDependenciesFromNxProjectJson(value: NxProjectJson | null | undefined): Map<string, string[]> {
@@ -112,6 +101,20 @@ export function targetExecutorsFromNxProjectJson(value: NxProjectJson | null | u
   return executors;
 }
 
+export function targetOptionsFromNxProjectJson(value: NxProjectJson | null | undefined): Map<string, NxTargetOptions> {
+  const targets = value?.targets;
+  const options = new Map<string, NxTargetOptions>();
+  if (!targets) {
+    return options;
+  }
+  for (const [targetName, target] of Object.entries(targets)) {
+    if (target.options) {
+      options.set(targetName, target.options);
+    }
+  }
+  return options;
+}
+
 export function targetOutputsFromNxProjectJson(value: NxProjectJson | null | undefined): Map<string, string[]> {
   return targetStringArraysFromNxProjectJson(value, 'outputs');
 }
@@ -168,30 +171,6 @@ export function projectNamesWithTarget(projects: ProjectTargets[], target: strin
     .sort((a, b) => a.localeCompare(b));
 }
 
-export function projectNamesFromNxShowProjectsOutput(output: string): string[] {
-  const trimmed = output.trim();
-  if (!trimmed) {
-    return [];
-  }
-
-  if (trimmed.startsWith('[')) {
-    try {
-      const parsed = parseStringArrayText(trimmed);
-      if (parsed) {
-        return parsed.sort((a, b) => a.localeCompare(b));
-      }
-    } catch {
-      // Fall through to legacy newline parsing for older Nx output shapes.
-    }
-  }
-
-  return trimmed
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .sort((a, b) => a.localeCompare(b));
-}
-
 export async function listTargets(root: string): Promise<void> {
   const output = formatProjectTargetLines(await readProjectTargets(root));
   if (output) {
@@ -229,34 +208,124 @@ export async function cleanCache(root: string): Promise<void> {
   }
 }
 
-export async function readProjectTargets(root: string): Promise<ProjectTargets[]> {
-  const projects = await readNxProjectNames(root);
-  return Promise.all(projects.map((project) => readProjectTarget(root, project)));
+export type NxProjects = Readonly<Record<string, NxProjectJson>>;
+
+/**
+ * Load the resolved project graph through Nx's API. The current workspace uses the
+ * daemon in-process; foreign roots use an isolated process because Nx snapshots its
+ * workspace cache paths when the module loads.
+ */
+let graphLoadTail: Promise<void> = Promise.resolve();
+
+export function loadNxProjects(root: string): Promise<NxProjects> {
+  const result = graphLoadTail.then(() => loadNxProjectsNow(root));
+  graphLoadTail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
 }
 
-async function readNxProjectNames(root: string): Promise<string[]> {
-  const result = await $`nx show projects`.cwd(root).quiet();
-  return projectNamesFromNxShowProjectsOutput(decode(result.stdout));
-}
-
-async function readProjectTarget(root: string, project: string): Promise<ProjectTargets> {
-  const command = nxShowProjectCommand(project);
-  const result = await $`${command.command} ${command.args}`.cwd(root).quiet();
-  const parsed = parseNxProjectJsonText(decode(result.stdout));
-  if (!parsed) {
-    throw new Error(`Unable to inspect Nx project ${project}.`);
+async function loadNxProjectsNow(root: string): Promise<NxProjects> {
+  if (root !== primaryWorkspaceRoot) {
+    return loadForeignNxProjects(root);
   }
-  const targetDependencies = targetDependenciesFromNxProjectJson(parsed);
-  return {
-    project,
-    root: projectRootFromNxProjectJson(parsed),
-    targets: targetNamesFromNxProjectJson(parsed),
-    buildDependsOn: targetDependencies.get('build'),
-    targetDependencies,
-    targetExecutors: targetExecutorsFromNxProjectJson(parsed),
-    targetOutputs: targetOutputsFromNxProjectJson(parsed),
-    targetScripts: targetScriptsFromNxProjectJson(parsed),
-  };
+  const graph = await createProjectGraphAsync({ exitOnError: false });
+  return nxProjectsFromNodes(graph.nodes);
+}
+
+const FOREIGN_GRAPH_SCRIPT = `
+import('nx/src/project-graph/project-graph.js')
+  .then(async ({ createProjectGraphAsync }) => {
+    const graph = await createProjectGraphAsync({ exitOnError: false });
+    const projects = Object.fromEntries(
+      Object.entries(graph.nodes).map(([name, node]) => [
+        name,
+        { ...node.data, name: node.data?.name ?? name, targets: node.data?.targets ?? {} },
+      ]),
+    );
+    process.stdout.write(JSON.stringify(projects));
+  })
+  .catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+`;
+
+async function loadForeignNxProjects(root: string): Promise<NxProjects> {
+  const result = await runResult(process.execPath, ['--eval', FOREIGN_GRAPH_SCRIPT], root, {
+    NX_DAEMON: 'false',
+    NX_ISOLATE_PLUGINS: 'false',
+    NX_WORKSPACE_ROOT_PATH: root,
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(`Failed to load Nx project graph for ${root}: ${result.stderr.trim()}`);
+  }
+  const parsed: unknown = JSON.parse(result.stdout);
+  if (!isNxProjects(parsed)) {
+    throw new Error(`Nx returned an invalid project graph for ${root}`);
+  }
+  return parsed;
+}
+
+function nxProjectsFromNodes(nodes: Readonly<Record<string, { data: NxProjectJson }>>): NxProjects {
+  const projects: Record<string, NxProjectJson> = {};
+  for (const [name, node] of Object.entries(nodes)) {
+    projects[name] = {
+      ...node.data,
+      name: node.data.name ?? name,
+      targets: node.data.targets ?? {},
+    };
+  }
+  return projects;
+}
+
+function isNxProjects(value: unknown): value is NxProjects {
+  if (!isRecord(value)) return false;
+  return Object.values(value).every(
+    (project) =>
+      isRecord(project) &&
+      (project.name === undefined || typeof project.name === 'string') &&
+      (project.root === undefined || typeof project.root === 'string') &&
+      (project.targets === undefined || (isRecord(project.targets) && Object.values(project.targets).every(isRecord))),
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+export function targetNamesFromProjects(projects: NxProjects): string[] {
+  const names = new Set<string>();
+  for (const project of Object.values(projects)) {
+    for (const targetName of targetNamesFromNxProjectJson(project)) {
+      names.add(targetName);
+    }
+  }
+  return [...names];
+}
+
+export function projectTargetsFromNxProjects(projects: NxProjects): ProjectTargets[] {
+  return Object.entries(projects)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([project, metadata]) => {
+      const targetDependencies = targetDependenciesFromNxProjectJson(metadata);
+      return {
+        project,
+        root: projectRootFromNxProjectJson(metadata),
+        targets: targetNamesFromNxProjectJson(metadata),
+        buildDependsOn: targetDependencies.get('build'),
+        targetDependencies,
+        targetExecutors: targetExecutorsFromNxProjectJson(metadata),
+        targetOptions: targetOptionsFromNxProjectJson(metadata),
+        targetOutputs: targetOutputsFromNxProjectJson(metadata),
+        targetScripts: targetScriptsFromNxProjectJson(metadata),
+      };
+    });
+}
+
+export async function readProjectTargets(root: string): Promise<ProjectTargets[]> {
+  return projectTargetsFromNxProjects(await loadNxProjects(root));
 }
 
 export type { NxProjectJson, NxTargetConfig };

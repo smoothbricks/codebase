@@ -80,7 +80,7 @@ export type NxDependsOn = string | NxDependsOnObject;
 /** Nx target options are executor-specific open bags. */
 export type NxTargetOptions = Record<string, unknown>;
 
-export type NxInput = string | Record<string, unknown>;
+export type NxInput = string | object;
 
 export interface NxTargetConfig {
   executor?: string;

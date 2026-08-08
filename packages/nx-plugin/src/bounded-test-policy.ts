@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import type { PackageTargetPolicyOptions, ResolvedProjectTargets } from './package-target-policy.js';
 
 export const BOUNDED_TEST_EXECUTOR = '@smoothbricks/nx-plugin:bounded-exec';
 export const BOUNDED_TEST_TIMEOUT_MS = 120_000;
@@ -34,6 +35,7 @@ export interface ApplyBoundedTestTargetPolicyOptions {
   projectName: string;
   defaultCommand?: string;
   projectJson?: BoundedTestPolicyProjectJson;
+  resolvedProject?: ResolvedProjectTargets;
 }
 
 export function applyBoundedTestTargetPolicy(
@@ -64,7 +66,7 @@ export function applyBoundedTestTargetPolicy(
   packageJson.scripts.test = boundedTestScriptAlias(options.projectName);
 }
 
-export function applyWorkspaceBoundedTestTargetPolicy(root: string): boolean {
+export function applyWorkspaceBoundedTestTargetPolicy(root: string, options: PackageTargetPolicyOptions = {}): boolean {
   let changed = false;
   for (const packageJsonPath of listWorkspacePackageJsonPaths(root)) {
     const packageJson = readPackageJson(packageJsonPath);
@@ -75,6 +77,10 @@ export function applyWorkspaceBoundedTestTargetPolicy(root: string): boolean {
     }
     const projectName = packageProjectName(packageJson, projectJson);
     if (!projectName) {
+      continue;
+    }
+    const resolvedProject = resolvedProjectFor(options, projectName);
+    if (checkBoundedTestTargetPolicy(packageJson, { projectName, projectJson, resolvedProject })) {
       continue;
     }
     const beforePackageJson = JSON.stringify(packageJson);
@@ -92,7 +98,10 @@ export function applyWorkspaceBoundedTestTargetPolicy(root: string): boolean {
   return changed;
 }
 
-export function checkWorkspaceBoundedTestTargetPolicy(root: string): BoundedTestPolicyIssue[] {
+export function checkWorkspaceBoundedTestTargetPolicy(
+  root: string,
+  options: PackageTargetPolicyOptions = {},
+): BoundedTestPolicyIssue[] {
   const issues: BoundedTestPolicyIssue[] = [];
   for (const packageJsonPath of listWorkspacePackageJsonPaths(root)) {
     const packageJson = readPackageJson(packageJsonPath);
@@ -109,10 +118,13 @@ export function checkWorkspaceBoundedTestTargetPolicy(root: string): BoundedTest
       });
       continue;
     }
-    if (!checkBoundedTestTargetPolicy(packageJson, { projectName, projectJson })) {
+    const resolvedProject = resolvedProjectFor(options, projectName);
+    if (!checkBoundedTestTargetPolicy(packageJson, { projectName, projectJson, resolvedProject })) {
       issues.push({
         path: projectJson ? projectJsonPath : packageJsonPath,
-        message: `${projectJson ? 'targets' : 'nx.targets'}.test must use ${BOUNDED_TEST_EXECUTOR} with bounded test policy`,
+        message:
+          `${projectJson ? 'targets' : 'nx.targets'}.test must use ${BOUNDED_TEST_EXECUTOR} ` +
+          'or delegate through no-op targets to bounded test execution',
       });
     }
   }
@@ -124,23 +136,104 @@ export function checkBoundedTestTargetPolicy(
   options: ApplyBoundedTestTargetPolicyOptions,
 ): boolean {
   const testTarget = options.projectJson ? options.projectJson.targets?.test : packageJson.nx?.targets?.test;
-  if (!isRecord(testTarget) || testTarget.executor !== BOUNDED_TEST_EXECUTOR) {
+  if (!isRecord(testTarget)) {
     return false;
   }
-  const targetOptions = testTarget.options;
-  if (
-    !isRecord(targetOptions) ||
-    typeof targetOptions.command !== 'string' ||
-    targetOptions.command.length === 0 ||
-    isPackageTestScriptRunnerCommand(targetOptions.command) ||
-    targetOptions.command !== ensureBunTestTimeoutFlag(targetOptions.command) ||
-    targetOptions.cwd !== '{projectRoot}' ||
-    targetOptions.timeoutMs !== BOUNDED_TEST_TIMEOUT_MS ||
-    targetOptions.killAfterMs !== BOUNDED_TEST_KILL_AFTER_MS
-  ) {
+  if (isBoundedExecutionTarget(testTarget.executor, testTarget.options, new Set(['{projectRoot}']))) {
+    return packageJson.scripts?.test === boundedTestScriptAlias(options.projectName);
+  }
+  if (!isNoopAggregateTarget(testTarget)) {
     return false;
   }
-  return packageJson.scripts?.test === boundedTestScriptAlias(options.projectName);
+  const testScript = packageJson.scripts?.test;
+  if (testScript !== undefined && testScript !== boundedTestScriptAlias(options.projectName)) {
+    return false;
+  }
+  return resolvedAggregateTestIsBounded(options.resolvedProject);
+}
+
+function isNoopAggregateTarget(target: Record<string, unknown>): boolean {
+  if (target.executor !== undefined && target.executor !== 'nx:noop') {
+    return false;
+  }
+  if (typeof target.command === 'string' || (isRecord(target.options) && typeof target.options.command === 'string')) {
+    return false;
+  }
+  return Array.isArray(target.dependsOn) && target.dependsOn.length > 0;
+}
+
+function isBoundedExecutionTarget(executor: unknown, rawOptions: unknown, allowedCwds: ReadonlySet<string>): boolean {
+  if (executor !== BOUNDED_TEST_EXECUTOR || !isRecord(rawOptions)) {
+    return false;
+  }
+  const command = rawOptions.command;
+  return (
+    typeof command === 'string' &&
+    command.length > 0 &&
+    isPackageTestScriptRunnerCommand(command) === false &&
+    command === ensureBunTestTimeoutFlag(command) &&
+    typeof rawOptions.cwd === 'string' &&
+    allowedCwds.has(rawOptions.cwd) &&
+    rawOptions.timeoutMs === BOUNDED_TEST_TIMEOUT_MS &&
+    rawOptions.killAfterMs === BOUNDED_TEST_KILL_AFTER_MS
+  );
+}
+
+function resolvedAggregateTestIsBounded(project: ResolvedProjectTargets | undefined): boolean {
+  if (!project?.targetDependencies || !project.targetExecutors || !project.targetOptions) {
+    return false;
+  }
+  const visiting = new Set<string>();
+  const verified = new Map<string, boolean>();
+  const allowedCwds = new Set(['{projectRoot}', ...(project.root ? [project.root] : [])]);
+
+  const visit = (targetName: string): boolean => {
+    const cached = verified.get(targetName);
+    if (cached !== undefined) {
+      return cached;
+    }
+    if (visiting.has(targetName) || !project.targets.has(targetName)) {
+      return false;
+    }
+    visiting.add(targetName);
+    const executor = project.targetExecutors?.get(targetName);
+    let valid: boolean;
+    if (executor !== undefined && executor !== 'nx:noop') {
+      valid = isBoundedExecutionTarget(executor, project.targetOptions?.get(targetName), allowedCwds);
+    } else {
+      const dependencies = project.targetDependencies?.get(targetName) ?? [];
+      valid =
+        dependencies.length > 0 &&
+        dependencies.every((dependency) => {
+          const matches = matchingResolvedTargets(dependency, project.targets);
+          return matches.length > 0 && matches.every(visit);
+        });
+    }
+    visiting.delete(targetName);
+    verified.set(targetName, valid);
+    return valid;
+  };
+
+  return visit('test');
+}
+
+function matchingResolvedTargets(dependency: string, targets: ReadonlySet<string>): string[] {
+  if (dependency.startsWith('^')) {
+    return [];
+  }
+  if (!dependency.startsWith('*')) {
+    return targets.has(dependency) ? [dependency] : [];
+  }
+  const suffix = dependency.slice(1);
+  return [...targets].filter((targetName) => targetName.endsWith(suffix));
+}
+
+function resolvedProjectFor(
+  options: PackageTargetPolicyOptions,
+  projectName: string,
+): ResolvedProjectTargets | undefined {
+  const project = options.resolvedTargetsByProject?.get(projectName);
+  return project && 'targets' in project ? project : undefined;
 }
 
 export function boundedTestScriptAlias(projectName: string): string {

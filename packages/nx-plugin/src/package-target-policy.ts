@@ -15,10 +15,12 @@ export { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-co
 export type { NxPolicyIssue };
 
 export interface ResolvedProjectTargets {
+  root?: string;
   targets: ReadonlySet<string>;
   buildDependsOn?: readonly string[];
   targetDependencies?: ReadonlyMap<string, readonly string[]>;
   targetExecutors?: ReadonlyMap<string, string>;
+  targetOptions?: ReadonlyMap<string, Readonly<Record<string, unknown>>>;
   targetScripts?: ReadonlyMap<string, string>;
 }
 
