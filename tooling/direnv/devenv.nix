@@ -67,9 +67,11 @@ in {
       jq # Used in pre-commit hook and generally useful
       alejandra # Nix formatter
     ])
-    # GARM/Linux CI: rustc needs host linker `cc` (-Zbuild-std, native crates).
+    # GARM/Linux CI: rustc needs host linker `cc` (-Zbuild-std, native crates),
+    # while N-API cross targets use Clang with the downloaded GNU sysroot.
     ++ lib.optionals pkgs.stdenv.isLinux [
       pkgs.stdenv.cc
+      pkgs.clang
       # openssl-src (vendored-openssl / git2) configure needs perl + make.
       pkgs.perl
       pkgs.gnumake
@@ -83,6 +85,10 @@ in {
   # https://devenv.sh/recipes/macos/
   # https://github.com/cachix/devenv/issues/1674
   apple.sdk = null;
+
+  # The runner supplies the persistent cache directory, but this repository
+  # owns whether its compiler processes use the installed wrapper.
+  env.RUSTC_WRAPPER = "sccache";
 
   # Nx otherwise defaults to three workers. Scale to the cores available in each
   # developer shell or CI runner; explicit --parallel flags still take precedence.
