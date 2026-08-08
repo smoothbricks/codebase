@@ -56,8 +56,7 @@ const rootDevDependencies: RequiredDependency[] = [
   },
   { name: 'nx', fallbackVersion: '23.1.0', minimumVersion: '23.1.0' },
   { name: 'prettier', fallbackVersion: '^3.6.1', minimumVersion: '3.6.0', prefix: '^' },
-  // Exact pin: Bun patchedDependencies keys are version-locked (see patches/ttsc@0.19.3.patch).
-  { name: 'ttsc', fallbackVersion: '0.19.3' },
+  { name: 'ttsc', fallbackVersion: '0.25.0' },
   // Nx and typescript-eslint still load the TypeScript JS API (6.x).
   // Compilation is exclusively delegated to ttsc by the Nx plugin targets.
   { name: 'typescript', fallbackVersion: '^6.0.3', minimumVersion: '6.0.0', prefix: '^' },
@@ -75,8 +74,7 @@ const requiredDevenvPackages = ['bun', 'git', 'git-format-staged', 'jq', 'alejan
 // never against a version template here.
 const nodePackagePattern = /(^|\s)nodejs(_\d+|_latest)?(\s|#|$)/m;
 
-const TTSC_PATCHED_DEPENDENCY_KEY = 'ttsc@0.19.3';
-const TTSC_PATCH_PATH = 'patches/ttsc@0.19.3.patch';
+const obsoleteTtscPatchedDependencyKey = 'ttsc@0.19.3';
 
 export async function applyToolConfigDefaults(root: string): Promise<void> {
   const context = await readToolContext(root);
@@ -89,7 +87,7 @@ export async function validateToolConfig(root: string): Promise<number> {
   const context = await readToolContext(root);
   return (
     validateRootDevDependencies(context.policy, context.rootPackage) +
-    validateTtscPatchedDependency(context.rootPackage) +
+    validateObsoleteTtscPatchRemoved(context.rootPackage) +
     validateToolingPackage(root, context.policy) +
     validateToolingWorkspace(context.rootPackage) +
     validateDevenvPackages(root)
@@ -113,7 +111,7 @@ export async function applyRootDevDependencyDefaults(root: string, context: Tool
   if (delete devDependencies['@smoothbricks/cli']) {
     changed = true;
   }
-  changed = ensureTtscPatchedDependency(pkg) || changed;
+  changed = removeObsoleteTtscPatch(pkg) || changed;
   if (changed) {
     writeJsonObject(join(root, 'package.json'), pkg);
     console.log('updated        package.json workspace tool dependencies');
@@ -129,7 +127,6 @@ async function applyRootPackageToolDefaults(root: string, context: ToolContext):
   }
   let dependencyChanged = false;
   let workspaceChanged = false;
-  let patchChanged = false;
   const devDependencies = ensureDependencyMap(pkg, 'devDependencies');
   for (const dependency of rootDevDependencies) {
     const current = devDependencies[dependency.name];
@@ -142,8 +139,8 @@ async function applyRootPackageToolDefaults(root: string, context: ToolContext):
     dependencyChanged = true;
   }
   workspaceChanged = addWorkspacePattern(pkg, 'tooling');
-  patchChanged = ensureTtscPatchedDependency(pkg);
-  if (dependencyChanged || workspaceChanged || patchChanged) {
+  dependencyChanged = removeObsoleteTtscPatch(pkg) || dependencyChanged;
+  if (dependencyChanged || workspaceChanged) {
     writeJsonObject(join(root, 'package.json'), pkg);
   }
   console.log(
@@ -155,11 +152,6 @@ async function applyRootPackageToolDefaults(root: string, context: ToolContext):
     workspaceChanged
       ? 'updated        package.json tooling workspace'
       : 'unchanged      package.json tooling workspace',
-  );
-  console.log(
-    patchChanged
-      ? 'updated        package.json patchedDependencies for ttsc'
-      : 'unchanged      package.json patchedDependencies for ttsc',
   );
 }
 
@@ -252,22 +244,25 @@ export function validateRootDevDependencies(policy: ToolPolicy, rootPackage: Pac
   return failures;
 }
 
-function ensureTtscPatchedDependency(pkg: PackageJson): boolean {
-  const patched = ensureDependencyMap(pkg, 'patchedDependencies');
-  return setStringProperty(patched, TTSC_PATCHED_DEPENDENCY_KEY, TTSC_PATCH_PATH);
+function removeObsoleteTtscPatch(pkg: PackageJson): boolean {
+  const patchedDependencies = pkg.patchedDependencies;
+  if (!patchedDependencies || !(obsoleteTtscPatchedDependencyKey in patchedDependencies)) {
+    return false;
+  }
+  delete patchedDependencies[obsoleteTtscPatchedDependencyKey];
+  if (Object.keys(patchedDependencies).length === 0) {
+    delete pkg.patchedDependencies;
+  }
+  return true;
 }
 
-function validateTtscPatchedDependency(rootPackage: PackageJson | null): number {
-  if (!rootPackage) {
-    return 0;
-  }
-  const actual = rootPackage.patchedDependencies?.[TTSC_PATCHED_DEPENDENCY_KEY];
-  if (actual === TTSC_PATCH_PATH) {
+function validateObsoleteTtscPatchRemoved(rootPackage: PackageJson | null): number {
+  const patchedDependencies = rootPackage?.patchedDependencies;
+  if (!patchedDependencies || !(obsoleteTtscPatchedDependencyKey in patchedDependencies)) {
     return 0;
   }
   console.error(
-    `package.json patchedDependencies.${TTSC_PATCHED_DEPENDENCY_KEY} must be ${TTSC_PATCH_PATH}` +
-      (typeof actual === 'string' ? `; found ${actual}` : ' (required for declaration-emit fix)'),
+    `package.json patchedDependencies.${obsoleteTtscPatchedDependencyKey} must be removed; ttsc 0.25.0 emits typia declarations without the obsolete patch`,
   );
   return 1;
 }
