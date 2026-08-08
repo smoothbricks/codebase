@@ -173,7 +173,7 @@
     }
   },
   "dependencies": {
-    "typia": "13.1.19"
+    "typia": "13.2.0"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.7.3",
