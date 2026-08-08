@@ -66,8 +66,8 @@ export async function syncRootRuntimeVersions(root: string): Promise<void> {
 /**
  * Validate that package.json runtime pins agree with the LIVE PATH runtimes,
  * never a stored template. Offline by design: structural alignment only
- * (majors, exact bun pin, no `~major.0.0` floor) — the registry is not
- * consulted. Repair: `smoo monorepo init --runtime-only` inside the devenv shell.
+ * (Node types float within the runtime major; Bun types stay exact) — the registry
+ * is not consulted. Repair: `smoo monorepo init --runtime-only` inside the devenv shell.
  */
 export async function validateRootRuntimeVersions(root: string): Promise<number> {
   const packageJson = readJsonObject(join(root, 'package.json'));
@@ -100,15 +100,10 @@ export function validateRuntimePins(packageJson: PackageJson, runtime: RuntimeVe
     failures++;
   }
   const typesNode = packageJson.devDependencies?.['@types/node'] ?? null;
-  const typesNodeParts = typesNode ? /^~(\d+)\.(\d+)\.(\d+)$/.exec(typesNode) : null;
+  const typesNodeParts = typesNode ? /^\^(\d+)\.(\d+)\.(\d+)$/.exec(typesNode) : null;
   if (!typesNodeParts || typesNodeParts[1] !== nodeMajor) {
     console.error(
-      `package.json @types/node is ${typesNode ?? 'missing'} but the PATH node is v${runtime.node} — types track the runtime major (~${nodeMajor}.x.y, newest published minor); ${repair}`,
-    );
-    failures++;
-  } else if (typesNodeParts[2] === '0' && typesNodeParts[3] === '0') {
-    console.error(
-      `package.json @types/node is pinned to the ~${nodeMajor}.0.0 floor — tilde locks the first patch line and strands the repo on early broken releases; ${repair} to repin to the newest published ${nodeMajor}.x`,
+      `package.json @types/node is ${typesNode ?? 'missing'} but the PATH node is v${runtime.node} — expected a caret range within the runtime major (^${nodeMajor}.x.y); ${repair}`,
     );
     failures++;
   }
@@ -144,15 +139,15 @@ export function runtimeTypesRangeForPublishedVersions(
 
   if (pinMode === 'major') {
     const runtimeMajor = parsedRuntimeVersion[0].toString();
-    // Newest published types WITHIN the runtime major — never the `~major.0.0`
-    // floor: tilde locks the patch line, so the floor can strand consumers on a
-    // broken early release (e.g. @types/node 24.0.x's URLPattern/DOM TS2403
-    // conflict, fixed in 24.13) with no path to the repaired minors.
+    // Anchor the range at the newest published types in the runtime major. The caret
+    // admits later patches and minors without crossing into a different Node major.
     const latestInMajor = latestVersion(versions.filter((version) => versionMajor(version) === runtimeMajor));
-    if (latestInMajor) {
-      return `~${latestInMajor}`;
+    if (!latestInMajor) {
+      throw new Error(`Unable to find published ${packageName} versions for runtime major ${runtimeMajor}`);
     }
-  } else if (versions.includes(runtimeVersion)) {
+    return `^${latestInMajor}`;
+  }
+  if (versions.includes(runtimeVersion)) {
     return runtimeVersion;
   }
 
@@ -162,7 +157,7 @@ export function runtimeTypesRangeForPublishedVersions(
   }
 
   console.warn(`${packageName} has no published types for runtime ${runtimeVersion}; using ${latest}`);
-  return pinMode === 'major' ? `~${latest}` : latest;
+  return latest;
 }
 
 function latestVersion(versions: readonly string[]): string | null {

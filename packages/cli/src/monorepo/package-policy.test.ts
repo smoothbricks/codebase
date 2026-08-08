@@ -11,6 +11,8 @@ import {
 
 const TIMEOUT_FLAG = `--timeout=${BOUNDED_TEST_PER_TEST_TIMEOUT_MS}`;
 
+import { validateCommitMessage } from './commit-msg.js';
+
 import {
   applyFixableMonorepoDefaults,
   applyNxPluginDefaults,
@@ -241,6 +243,35 @@ describe('Nx project name policy', () => {
       expect(tooling.nx).toEqual({ name: 'tooling' });
       expect(validateNxProjectNames(root)).toBe(0);
       expect(listValidCommitScopes(root)).toEqual(new Set(['release', 'tooling']));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('uses nx.name from an exact workspace package as the commit scope', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
+    try {
+      await writeJson(join(root, 'package.json'), {
+        name: '@smoothbricks/codebase',
+        version: '0.0.0',
+        private: true,
+        workspaces: ['tooling'],
+      });
+      await writeJson(join(root, 'tooling/package.json'), {
+        name: '@smoothbricks/internal-tooling',
+        private: true,
+        nx: { name: 'tooling' },
+      });
+
+      const validScopes = listValidCommitScopes(root);
+      expect(validScopes).toEqual(new Set(['release', 'tooling']));
+      expect(validateCommitMessage('fix(tooling): repair tooling\n', { validScopes })).toBeNull();
+      expect(validateCommitMessage('fix(internal-tooling): repair tooling\n', { validScopes })).toContain(
+        'Invalid conventional commit scope',
+      );
+      expect(validateCommitMessage('fix(arbitrary): repair tooling\n', { validScopes })).toContain(
+        'Invalid conventional commit scope',
+      );
     } finally {
       await rm(root, { recursive: true, force: true });
     }
