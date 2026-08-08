@@ -109,16 +109,22 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
   const hasAnyBuildOutputTarget = hasOrdinaryBuildOutputTarget || packageLocalBuildOutputs.platform;
 
   if (hasLibTsconfig) {
-    // Official Nx target inference is disabled because its compiler surface only
-    // supports tsc/tsgo. Smoo owns the complete transformer-aware ttsc targets.
+    // ttsc transforms the source program before declaration emit, so typia's
+    // generated implementation identifiers are not valid declaration inputs.
+    // The executor gives ttsc a JS-only overlay and emits declarations from the
+    // original project with native tsc.
     targets['tsc-js'] = {
-      executor: 'nx:run-commands',
+      executor: '@smoothbricks/nx-plugin:typescript-emit',
       cache: true,
       inputs: ['production', '^production', ...TYPESCRIPT_TOOLCHAIN_INPUTS, '{projectRoot}/tsconfig.lib.json'],
-      outputs: ['{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}'],
+      outputs: [
+        '{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}',
+        '{projectRoot}/dist/**/*.tsbuildinfo',
+        '{projectRoot}/dist/.tsbuildinfo',
+      ],
       dependsOn: ['^tsc-js'],
       options: {
-        command: 'ttsc -p tsconfig.lib.json --emit',
+        tsConfig: 'tsconfig.lib.json',
         cwd: projectRoot,
       },
     };
@@ -129,7 +135,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       outputs: [],
       dependsOn: ['^tsc-js'],
       options: {
-        command: 'ttsc -p tsconfig.lib.json --noEmit',
+        command: 'tsc -p tsconfig.lib.json --noEmit',
         cwd: projectRoot,
       },
     };
@@ -143,7 +149,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       inputs: ['default', '^production', ...TYPESCRIPT_TOOLCHAIN_INPUTS, '{projectRoot}/tsconfig.test.json'],
       dependsOn: ['typecheck'],
       options: {
-        command: 'ttsc -p tsconfig.test.json --noEmit',
+        command: 'tsc -p tsconfig.test.json --noEmit',
         cwd: projectRoot,
       },
     };
@@ -151,7 +157,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       executor: 'nx:run-commands',
       continuous: true,
       options: {
-        command: 'ttsc -p tsconfig.test.json --noEmit --watch',
+        command: 'tsc -p tsconfig.test.json --noEmit --watch',
         cwd: projectRoot,
       },
     };
