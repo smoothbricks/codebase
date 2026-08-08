@@ -735,7 +735,7 @@ export async function loadColumineWasm(wasmPath?: string | URL, memoryPages?: nu
   if (!wasmBytes) {
     throw new Error(
       'Could not find columine.wasm. Provide an explicit path via loadColumineWasm(path), ' +
-        'or ensure columine.wasm is in ./columine.wasm or ../dist/columine.wasm relative to this module.',
+        'or ensure columine.wasm is beside the built module or in ../dist/columine.wasm relative to source.',
     );
   }
   return createColumineWasmBackend(wasmBytes, memoryPages);
@@ -762,7 +762,9 @@ async function loadWasmBytes(
 
   // Try default locations
   const defaultPaths = [
-    new URL(`./${defaultFileName}`, import.meta.url),
+    // Built module: dist/ts/*.js -> dist/*.wasm.
+    new URL(`../${defaultFileName}`, import.meta.url),
+    // Development source: src/*.ts -> dist/*.wasm.
     new URL(`../dist/${defaultFileName}`, import.meta.url),
   ];
 

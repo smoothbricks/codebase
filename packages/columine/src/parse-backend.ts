@@ -1046,7 +1046,7 @@ export async function loadParseBackend(wasmPath?: string | URL): Promise<ParseCo
   if (!wasmBytes) {
     throw new Error(
       'Could not find event_processor.wasm. Provide an explicit path via loadParseBackend(path), ' +
-        'or ensure event_processor.wasm is in ./event_processor.wasm or ../dist/event_processor.wasm.',
+        'or ensure event_processor.wasm is beside the built module or in ../dist/event_processor.wasm relative to source.',
     );
   }
 
@@ -1079,7 +1079,9 @@ async function loadWasmBytes(
   }
 
   const defaultPaths = [
-    new URL(`./${defaultFileName}`, import.meta.url),
+    // Built module: dist/ts/*.js -> dist/*.wasm.
+    new URL(`../${defaultFileName}`, import.meta.url),
+    // Development source: src/*.ts -> dist/*.wasm.
     new URL(`../dist/${defaultFileName}`, import.meta.url),
   ];
 
