@@ -51,7 +51,7 @@ export async function initMonorepo(root: string, options: InitOptions): Promise<
     return;
   }
 
-  printResults(applyManagedFiles(root, 'update'));
+  printResults(await applyManagedFiles(root, 'update'));
   await runInitPacks({ root, syncRuntime: process.env.DEVENV_ROOT !== undefined || options.syncRuntime === true });
 }
 
@@ -76,7 +76,7 @@ export async function validateMonorepo(root: string, options: ValidateOptions = 
 }
 
 export async function updateManagedFiles(root: string): Promise<void> {
-  printResults(applyManagedFiles(root, 'update'));
+  printResults(await applyManagedFiles(root, 'update'));
   // Tool dependency policy (typescript API 6, @typescript/native for ttsc, nx, …)
   // lives next to managed templates — update must install them, not only rewrite files.
   await applyToolConfigDefaults(root);
@@ -90,20 +90,20 @@ export async function updateManagedFiles(root: string): Promise<void> {
   }
 }
 
-export function checkManagedFiles(root: string, options: { warn?: boolean } = {}): void {
+export async function checkManagedFiles(root: string, options: { warn?: boolean } = {}): Promise<void> {
   if (options.warn === true) {
-    warnOnManagedFileDrift(root);
+    await warnOnManagedFileDrift(root);
     return;
   }
-  const results = applyManagedFiles(root, 'check');
+  const results = await applyManagedFiles(root, 'check');
   printResults(results);
   if (results.some((result) => result.action === 'drifted')) {
     throw new Error('Managed monorepo files are out of date. Run: smoo monorepo update');
   }
 }
 
-export function diffManagedFiles(root: string): void {
-  printResults(applyManagedFiles(root, 'diff'));
+export async function diffManagedFiles(root: string): Promise<void> {
+  printResults(await applyManagedFiles(root, 'diff'));
 }
 
 export function validateCommitMessageFile(
