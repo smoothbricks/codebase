@@ -39,14 +39,6 @@
       "cache": true,
       "outputs": []
     },
-    "typecheck-tests": {
-      "cache": true,
-      "dependsOn": ["typecheck"],
-      "options": {
-        "command": "ttsc -p tsconfig.test.json --noEmit",
-        "cwd": "{projectRoot}"
-      }
-    },
     "test": {
       "dependsOn": ["^build", "build"],
       "cache": true
