@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import { dirname, join, posix } from 'node:path';
 
 import {
@@ -9,6 +9,7 @@ import {
   type TargetConfiguration,
 } from 'nx/src/devkit-exports.js';
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
+import { parse as parseToml } from 'smol-toml';
 
 import { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 
@@ -23,20 +24,20 @@ const TYPESCRIPT_TOOLCHAIN_INPUTS = [
 //#region smoo!n/rust-output-target-inference
 // Cargo workspace inference: a package.json sitting next to a Cargo.toml that
 // declares [workspace] gets direct cargo-test/test targets, cargo-lint feeding
-// the lint aggregate, mutation (cargo-mutants), and bench. Rust output targets
-// are not guessed from crate metadata: N-API targets require package.json napi
-// metadata plus the conventional crates/<binaryName>-napi workspace member.
-// Other output families remain explicit package targets.
+// the lint aggregate, mutation (cargo-mutants), and bench. Cargo output families
+// use tool-native metadata: N-API comes from package.json napi metadata; Wasm
+// comes from [package.metadata.smoothbricks.wasm-bindgen] in a crate manifest.
 const CARGO_WORKSPACE_PATTERN = /^\s*\[workspace\]/m;
 //#endregion
 const CARGO_INPUTS = [
   '{projectRoot}/**/*.rs',
   '{projectRoot}/**/Cargo.toml',
-  '{projectRoot}/Cargo.lock',
-  '{projectRoot}/.cargo/config.toml',
-  '!{projectRoot}/target/**',
+  '{projectRoot}/**/Cargo.lock',
+  '{projectRoot}/**/.cargo/config.toml',
+  '!{projectRoot}/**/target/**',
 ];
-const NAPI_INPUTS = [...CARGO_INPUTS, '{projectRoot}/package.json', '{workspaceRoot}/bun.lock'];
+const CARGO_OUTPUT_INPUTS = [...CARGO_INPUTS, '{projectRoot}/package.json', '{workspaceRoot}/bun.lock'];
+const NAPI_INPUTS = CARGO_OUTPUT_INPUTS;
 
 interface NapiTargetConvention {
   architecture: string;
@@ -71,6 +72,29 @@ const NAPI_TARGET_CONVENTIONS: Readonly<Record<string, NapiTargetConvention>> = 
     useNapiCross: true,
   },
 };
+
+function createCargoWasmTarget(projectRoot: string, config: ResolvedCargoWasmConfig): TargetConfiguration {
+  const cargoTargetDirectory = posix.join(posix.dirname(config.manifestPath), 'target/cargo-wasm');
+  const wasmInput = `${cargoTargetDirectory}/wasm32-unknown-unknown/release/${config.libraryName}.wasm`;
+  return {
+    executor: 'nx:run-commands',
+    cache: true,
+    dependsOn: ['^build'],
+    inputs: CARGO_OUTPUT_INPUTS,
+    outputs: [`{projectRoot}/${config.outputDirectory}`],
+    options: {
+      commands: [
+        `cargo build --release --target wasm32-unknown-unknown --target-dir ${cargoTargetDirectory} --manifest-path ${config.manifestPath}`,
+        ...config.targets.map(
+          ({ bindgenTarget, outputName }) =>
+            `wasm-bindgen --target ${bindgenTarget} --out-dir ${config.outputDirectory}/${outputName} ${wasmInput}`,
+        ),
+      ],
+      cwd: projectRoot,
+      parallel: false,
+    },
+  };
+}
 
 function createCargoTestTarget(projectRoot: string): TargetConfiguration {
   return {
@@ -148,8 +172,12 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
   const isCargoWorkspace =
     existsSync(cargoTomlPath) && CARGO_WORKSPACE_PATTERN.test(await readFile(cargoTomlPath, 'utf-8'));
   const napiConfig = resolveNapiConfig(packageJson, packageJsonPath, absoluteProjectRoot, isCargoWorkspace);
+  const declaredTargets = packageJson.nx?.targets ?? {};
+  const cargoWasmConfig = await resolveCargoWasmConfig(absoluteProjectRoot, packageJsonPath);
+  const inferCargoWasm = cargoWasmConfig !== null && !('cargo-wasm' in declaredTargets);
   const packageLocalBuildOutputs = classifyPackageLocalBuildOutputs(packageJson);
-  const hasOrdinaryBuildOutputTarget = hasLibTsconfig || napiConfig !== null || packageLocalBuildOutputs.ordinary;
+  const hasOrdinaryBuildOutputTarget =
+    hasLibTsconfig || napiConfig !== null || cargoWasmConfig !== null || packageLocalBuildOutputs.ordinary;
   const hasAnyBuildOutputTarget = hasOrdinaryBuildOutputTarget || packageLocalBuildOutputs.platform;
 
   if (hasLibTsconfig) {
@@ -162,7 +190,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       cache: true,
       inputs: ['production', '^production', ...TYPESCRIPT_TOOLCHAIN_INPUTS, '{projectRoot}/tsconfig.lib.json'],
       outputs: inferTypescriptOutputs(libTsconfigPath, packageJsonPath),
-      dependsOn: ['^tsc-js'],
+      dependsOn: ['^tsc-js', ...(cargoWasmConfig ? ['cargo-wasm'] : [])],
       options: {
         tsConfig: 'tsconfig.lib.json',
         cwd: projectRoot,
@@ -173,7 +201,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       cache: true,
       inputs: ['production', '^production', ...TYPESCRIPT_TOOLCHAIN_INPUTS, '{projectRoot}/tsconfig.lib.json'],
       outputs: [],
-      dependsOn: ['^tsc-js'],
+      dependsOn: ['^tsc-js', ...(cargoWasmConfig ? ['cargo-wasm'] : [])],
       options: {
         command: 'tsc -p tsconfig.lib.json --noEmit',
         cwd: projectRoot,
@@ -218,6 +246,10 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     validationTargets.push('typecheck');
   }
 
+  if (inferCargoWasm && cargoWasmConfig) {
+    targets['cargo-wasm'] = createCargoWasmTarget(projectRoot, cargoWasmConfig);
+  }
+
   if (napiConfig) {
     Object.assign(targets, createNapiTargets(projectRoot, napiConfig));
     if (
@@ -231,7 +263,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
   // Member crates get their targets from the workspace-root package.json,
   // never per-crate — one Nx project per Cargo workspace.
   if (isCargoWorkspace) {
-    const declared = packageJson.nx?.targets ?? {};
+    const declared = declaredTargets;
     if (!('cargo-test' in declared)) {
       targets['cargo-test'] = createCargoTestTarget(projectRoot);
     }
@@ -312,6 +344,115 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       [projectRoot]: { name: projectName, targets },
     },
   };
+}
+
+interface ResolvedCargoWasmConfig {
+  libraryName: string;
+  manifestPath: string;
+  outputDirectory: string;
+  targets: Array<{ bindgenTarget: string; outputName: string }>;
+}
+
+const WASM_BINDGEN_OUTPUT_NAMES: Readonly<Record<string, string>> = {
+  bundler: 'bundler',
+  deno: 'deno',
+  module: 'module',
+  'no-modules': 'no-modules',
+  nodejs: 'node',
+  web: 'web',
+};
+
+async function resolveCargoWasmConfig(
+  absoluteProjectRoot: string,
+  packageJsonPath: string,
+): Promise<ResolvedCargoWasmConfig | null> {
+  const manifestPaths = ['Cargo.toml'];
+  const cratesDirectory = join(absoluteProjectRoot, 'crates');
+  if (existsSync(cratesDirectory)) {
+    const crateEntries = await readdir(cratesDirectory, { withFileTypes: true });
+    for (const entry of crateEntries.sort((left, right) => left.name.localeCompare(right.name))) {
+      if (entry.isDirectory()) {
+        const manifestPath = posix.join('crates', entry.name, 'Cargo.toml');
+        if (existsSync(join(absoluteProjectRoot, manifestPath))) {
+          manifestPaths.push(manifestPath);
+        }
+      }
+    }
+  }
+
+  const resolved: ResolvedCargoWasmConfig[] = [];
+  for (const manifestPath of manifestPaths) {
+    const absoluteManifestPath = join(absoluteProjectRoot, manifestPath);
+    if (!existsSync(absoluteManifestPath)) {
+      continue;
+    }
+    const manifest: unknown = parseToml(await readFile(absoluteManifestPath, 'utf-8'));
+    const cargoPackage = isRecord(manifest) && isRecord(manifest.package) ? manifest.package : null;
+    const metadata = cargoPackage && isRecord(cargoPackage.metadata) ? cargoPackage.metadata : null;
+    const smoothbricks = metadata && isRecord(metadata.smoothbricks) ? metadata.smoothbricks : null;
+    const rawConfig = smoothbricks && isRecord(smoothbricks['wasm-bindgen']) ? smoothbricks['wasm-bindgen'] : null;
+    if (!rawConfig) {
+      continue;
+    }
+
+    const packageName = cargoPackage?.name;
+    if (typeof packageName !== 'string' || !/^[A-Za-z0-9_-]+$/.test(packageName)) {
+      throw new Error(`${packageJsonPath}: ${manifestPath} must declare a valid package.name for Wasm inference`);
+    }
+    const lib = isRecord(manifest) && isRecord(manifest.lib) ? manifest.lib : null;
+    const crateTypes = lib?.['crate-type'];
+    if (!Array.isArray(crateTypes) || !crateTypes.includes('cdylib')) {
+      throw new Error(`${packageJsonPath}: ${manifestPath} Wasm inference requires lib.crate-type to include cdylib`);
+    }
+    const rawLibraryName = lib?.name ?? packageName.replaceAll('-', '_');
+    if (typeof rawLibraryName !== 'string' || !/^[A-Za-z0-9_]+$/.test(rawLibraryName)) {
+      throw new Error(`${packageJsonPath}: ${manifestPath} must declare a valid Rust library name`);
+    }
+
+    const rawTargets = rawConfig.targets;
+    if (
+      !Array.isArray(rawTargets) ||
+      rawTargets.length === 0 ||
+      !rawTargets.every((target) => typeof target === 'string')
+    ) {
+      throw new Error(
+        `${packageJsonPath}: ${manifestPath} smoothbricks.wasm-bindgen.targets must be a non-empty string array`,
+      );
+    }
+    const bindgenTargets = [...new Set(rawTargets as string[])];
+    const targets = bindgenTargets.map((bindgenTarget) => {
+      const outputName = WASM_BINDGEN_OUTPUT_NAMES[bindgenTarget];
+      if (!outputName) {
+        throw new Error(`${packageJsonPath}: ${manifestPath} has unsupported wasm-bindgen target ${bindgenTarget}`);
+      }
+      return { bindgenTarget, outputName };
+    });
+
+    const rawOutputDirectory = rawConfig['out-dir'] ?? 'dist-wasm';
+    if (typeof rawOutputDirectory !== 'string' || !/^[A-Za-z0-9._/-]+$/.test(rawOutputDirectory)) {
+      throw new Error(
+        `${packageJsonPath}: ${manifestPath} smoothbricks.wasm-bindgen.out-dir must be a safe relative path`,
+      );
+    }
+    const outputDirectory = posix.normalize(rawOutputDirectory);
+    if (
+      outputDirectory === '.' ||
+      outputDirectory === '..' ||
+      outputDirectory.startsWith('../') ||
+      outputDirectory.startsWith('/')
+    ) {
+      throw new Error(
+        `${packageJsonPath}: ${manifestPath} smoothbricks.wasm-bindgen.out-dir must stay inside the project`,
+      );
+    }
+
+    resolved.push({ libraryName: rawLibraryName, manifestPath, outputDirectory, targets });
+  }
+
+  if (resolved.length > 1) {
+    throw new Error(`${packageJsonPath}: only one Cargo crate may declare smoothbricks.wasm-bindgen metadata`);
+  }
+  return resolved[0] ?? null;
 }
 
 interface ResolvedNapiConfig {
