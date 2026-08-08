@@ -74,16 +74,23 @@ interface NativeModule {
 
 const assertNativeModule = typia.createAssert<NativeModule>();
 
-function nativeBinaryName(): string {
+interface NativeBinary {
+  directory: string;
+  fileName: string;
+}
+
+function nativeBinary(): NativeBinary {
   switch (process.platform) {
     case 'darwin':
       if (process.arch === 'arm64' || process.arch === 'x64') {
-        return `cowshed.darwin-${process.arch}.node`;
+        const directory = `darwin-${process.arch}`;
+        return { directory, fileName: `cowshed.${directory}.node` };
       }
       break;
     case 'linux':
       if (process.arch === 'arm64' || process.arch === 'x64') {
-        return `cowshed.linux-${process.arch}-gnu.node`;
+        const directory = `linux-${process.arch}-gnu`;
+        return { directory, fileName: `cowshed.${directory}.node` };
       }
       break;
   }
@@ -91,12 +98,14 @@ function nativeBinaryName(): string {
 }
 
 export function loadNativeModule(): NativeModule {
-  const binaryName = nativeBinaryName();
+  const { directory, fileName } = nativeBinary();
   const override = process.env.COWSHED_NODE_PATH;
   const candidates = [
     ...(override ? [override] : []),
-    new URL(`../dist/${binaryName}`, import.meta.url).pathname,
-    new URL(`./${binaryName}`, import.meta.url).pathname,
+    new URL(`../dist/native/host/${fileName}`, import.meta.url).pathname,
+    new URL(`../dist/native/${directory}/${fileName}`, import.meta.url).pathname,
+    new URL(`../native/host/${fileName}`, import.meta.url).pathname,
+    new URL(`../native/${directory}/${fileName}`, import.meta.url).pathname,
   ];
   const require = createRequire(import.meta.url);
   let lastError: unknown;
@@ -109,7 +118,7 @@ export function loadNativeModule(): NativeModule {
     }
   }
 
-  throw new Error(`Could not load ${binaryName}. Run \`nx run cowshed:cargo-napi\` for this platform.`, {
+  throw new Error(`Could not load ${fileName}. Run \`nx run cowshed:cargo-napi\` for this platform.`, {
     cause: lastError,
   });
 }
