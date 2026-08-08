@@ -28,6 +28,7 @@ const nxJsTypescriptPlugin = '@nx/js/typescript';
 const smoothBricksNxPlugin = '@smoothbricks/nx-plugin';
 const cleanOutputsExecutor = '@smoothbricks/nx-plugin:clean-outputs';
 const expectedSharedGlobalsNamedInput = ['{workspaceRoot}/.github/workflows/ci.yml'];
+const inferredTestTypecheckTarget = 'typecheck-tests';
 const defaultProductionNamedInput = [
   '{projectRoot}/src/**/*',
   '{projectRoot}/package.json',
@@ -53,6 +54,14 @@ export function checkWorkspaceConfig(nxJson: Record<string, unknown>): NxPolicyI
           message:
             `targetDefaults.${targetName} must not use colon target names. ` +
             'Nx CLI syntax already uses project:target:configuration, so smoo Nx target names must be unambiguous tool-output names.',
+        });
+      }
+      if (targetName === inferredTestTypecheckTarget) {
+        issues.push({
+          path: 'nx.json',
+          message:
+            `targetDefaults.${inferredTestTypecheckTarget} must not be configured. ` +
+            'Per-project inference selects current library or build outputs before test typechecking.',
         });
       }
     }
@@ -94,7 +103,7 @@ export function checkWorkspaceConfig(nxJson: Record<string, unknown>): NxPolicyI
  * Mutates in place, returns whether anything changed.
  */
 export function applyWorkspaceConfig(nxJson: Record<string, unknown>): boolean {
-  let changed = removeColonTargetDefaults(nxJson);
+  let changed = removeDisallowedTargetDefaults(nxJson);
   changed = applyBuildTargetDefault(nxJson) || changed;
   changed = applyCleanTargetDefault(nxJson) || changed;
   changed = applyNamedInputDefaults(nxJson) || changed;
@@ -272,14 +281,14 @@ function applyNamedInputDefaults(nxJson: Record<string, unknown>): boolean {
   return changed;
 }
 
-function removeColonTargetDefaults(nxJson: Record<string, unknown>): boolean {
+function removeDisallowedTargetDefaults(nxJson: Record<string, unknown>): boolean {
   const targetDefaults = recordProperty(nxJson, 'targetDefaults');
   if (!targetDefaults) {
     return false;
   }
   let changed = false;
   for (const targetName of Object.keys(targetDefaults)) {
-    if (targetName.includes(':')) {
+    if (targetName.includes(':') || targetName === inferredTestTypecheckTarget) {
       delete targetDefaults[targetName];
       changed = true;
     }

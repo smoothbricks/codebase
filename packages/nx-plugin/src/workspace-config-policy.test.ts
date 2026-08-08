@@ -114,6 +114,23 @@ describe('pure core: checkWorkspaceConfig', () => {
     expect(issues.some((i) => i.message.includes('must not use colon target names'))).toBe(true);
   });
 
+  it('rejects static test typecheck defaults that override per-project inference', () => {
+    const issues = checkWorkspaceConfig({
+      ...validNxJson(),
+      targetDefaults: {
+        ...validTargetDefaults(),
+        'typecheck-tests': {
+          dependsOn: ['typecheck'],
+          options: { command: 'ttsc -p tsconfig.test.json --noEmit' },
+        },
+      },
+    });
+
+    expect(
+      issues.some((issue) => issue.message.includes('targetDefaults.typecheck-tests must not be configured')),
+    ).toBe(true);
+  });
+
   it('detects native TypeScript inference', () => {
     const issues = checkWorkspaceConfig({
       plugins: ['@nx/js/typescript', '@smoothbricks/nx-plugin'],
@@ -189,6 +206,22 @@ describe('pure core: applyWorkspaceConfig', () => {
     };
     expect(applyWorkspaceConfig(nxJson)).toBe(true);
     expect(expectRecord(nxJson.targetDefaults)['build:wasm']).toBeUndefined();
+  });
+
+  it('removes static test typecheck defaults so inference owns clean-output prerequisites', () => {
+    const nxJson = {
+      ...validNxJson(),
+      targetDefaults: {
+        ...validTargetDefaults(),
+        'typecheck-tests': {
+          dependsOn: ['typecheck'],
+          options: { command: 'ttsc -p tsconfig.test.json --noEmit' },
+        },
+      },
+    };
+
+    expect(applyWorkspaceConfig(nxJson)).toBe(true);
+    expect(expectRecord(nxJson.targetDefaults)['typecheck-tests']).toBeUndefined();
   });
 
   it('fixes imprecise production inputs', () => {
@@ -324,7 +357,13 @@ describe('filesystem: checkWorkspaceConfigPolicy / applyWorkspaceConfigPolicy', 
     try {
       await writeJsonFile(join(root, 'nx.json'), {
         plugins: [],
-        targetDefaults: { build: { cache: false } },
+        targetDefaults: {
+          build: { cache: false },
+          'typecheck-tests': {
+            dependsOn: ['typecheck'],
+            options: { command: 'ttsc -p tsconfig.test.json --noEmit' },
+          },
+        },
         namedInputs: validNamedInputs(),
       });
 
@@ -339,6 +378,7 @@ describe('filesystem: checkWorkspaceConfigPolicy / applyWorkspaceConfigPolicy', 
       const pluginNames = readPluginNames(nxJson.plugins);
       expect(pluginNames).not.toContain('@nx/js/typescript');
       expect(pluginNames).toContain('@smoothbricks/nx-plugin');
+      expect(expectRecord(nxJson.targetDefaults)['typecheck-tests']).toBeUndefined();
 
       // No issues after fix
       expect(checkWorkspaceConfigPolicy(root)).toEqual([]);
