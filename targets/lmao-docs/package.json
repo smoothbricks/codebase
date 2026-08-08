@@ -49,7 +49,9 @@
         "options": {
           "cwd": "{projectRoot}"
         },
-        "outputs": ["{projectRoot}/dist"],
+        "outputs": [
+          "{projectRoot}/dist"
+        ],
         "cache": true
       }
     }

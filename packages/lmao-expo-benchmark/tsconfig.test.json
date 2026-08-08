@@ -8,5 +8,20 @@
     "emitDeclarationOnly": false,
     "noEmit": true
   },
-  "include": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/**/__tests__/**/*.ts", "src/**/__tests__/**/*.tsx"]
+  "include": [
+    "src/**/*.test.ts",
+    "src/**/*.test.tsx",
+    "src/**/__tests__/**/*.ts",
+    "src/**/__tests__/**/*.tsx",
+    "src/**/*.spec.ts",
+    "src/test-suite-tracer.ts"
+  ],
+  "references": [
+    {
+      "path": "../lmao/tsconfig.lib.json"
+    },
+    {
+      "path": "../lmao-ttsc/tsconfig.lib.json"
+    }
+  ]
 }
