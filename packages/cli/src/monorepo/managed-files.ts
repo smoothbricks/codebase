@@ -157,6 +157,12 @@ const managedFiles: ManagedFile[] = [
   },
   {
     kind: 'raw',
+    source: 'tooling/devenv',
+    target: 'tooling/devenv',
+    executable: true,
+  },
+  {
+    kind: 'raw',
     source: 'tooling/direnv/repo-path',
     target: 'tooling/direnv/repo-path',
     executable: true,
@@ -248,6 +254,8 @@ const managedFiles: ManagedFile[] = [
     target: '.github/actions/cache-nx/action.yml',
   },
 ];
+
+export const managedFileTargetsForTest = managedFiles.map(({ target, executable }) => ({ target, executable }));
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
