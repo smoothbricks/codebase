@@ -631,8 +631,11 @@ it('linux publish jobs use smoo.github.runsOn; macOS stays macos-latest', () => 
       fromJSON('["nixos-latest-x64","self-hosted"]') || 'ubuntu-latest' }}`,
   );
   expect(rendered).toContain('  macos-platform:\n    runs-on: macos-latest');
-  // two linux jobs share the expression
-  expect(rendered.split('fromJSON(\'["nixos-latest-x64","self-hosted"]\')').length - 1).toBe(2);
+  // Only the pre-publish linux job runs on self-hosted
+  expect(rendered.split('fromJSON(\'["nixos-latest-x64","self-hosted"]\')').length - 1).toBe(1);
   expect(rendered).not.toContain('  linux-release-candidate:\n    runs-on: ubuntu-latest');
-  expect(rendered).not.toContain('  publish-on-linux:\n    runs-on: ubuntu-latest');
+  // NPM publishing happens from GitHub runner
+  expect(rendered).toContain(
+    '  publish-on-linux:\n    needs: [linux-release-candidate, macos-platform]\n    runs-on: ubuntu-latest',
+  );
 });
