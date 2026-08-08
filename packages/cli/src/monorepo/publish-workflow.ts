@@ -328,7 +328,7 @@ defaults:
 
 jobs:
   publish:
-${renderRunsOnLine(options.runsOn)}
+    runs-on: ubuntu-latest
     env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
       GH_TOKEN: ${githubExpression('github.token')}
@@ -597,7 +597,7 @@ ${renderMacosPlatformSteps(options)}
 
   publish-on-linux:
     needs: [linux-release-candidate, macos-platform]
-${renderRunsOnLine(options.runsOn)}
+    runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
