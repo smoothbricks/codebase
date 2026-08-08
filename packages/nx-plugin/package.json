@@ -94,6 +94,7 @@
   "dependencies": {
     "@nx/js": "23.1.1",
     "nx": "23.1.1",
+    "smol-toml": "^1.6.1",
     "tslib": "^2.8.1"
   }
 }
