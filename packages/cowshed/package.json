@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "type": "module",
   "sideEffects": false,
+  "scripts": {
+    "test": "nx run cowshed:test --outputStyle=stream"
+  },
   "main": "./dist/ts/index.js",
   "types": "./dist/ts/index.d.ts",
   "exports": {
@@ -28,6 +31,7 @@
     "name": "cowshed",
     "targets": {
       "test": {
+        "executor": "nx:noop",
         "dependsOn": [
           "napi-test"
         ]
