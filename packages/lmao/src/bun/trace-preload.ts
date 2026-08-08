@@ -5,10 +5,26 @@
  * been registered in bunfig.
  */
 
-import { join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { autoSetupBunTestTracing } from '../lib/testing/bun-harness.js';
 
-// WHY: Find the monorepo packages dir relative to this file's location.
-// This file lives at packages/lmao/src/bun/trace-preload.ts (4 levels up to monorepo root).
-const monorepoRoot = join(import.meta.dir, '..', '..', '..', '..');
-await autoSetupBunTestTracing({ packagesDir: join(monorepoRoot, 'packages') });
+function findWorkspacePackagesDir(start: string): string | null {
+  let directory = resolve(start);
+  while (true) {
+    const packagesDir = join(directory, 'packages');
+    if (existsSync(join(packagesDir, 'lmao', 'package.json'))) {
+      return packagesDir;
+    }
+    const parent = dirname(directory);
+    if (parent === directory) {
+      return null;
+    }
+    directory = parent;
+  }
+}
+
+const packagesDir = findWorkspacePackagesDir(process.cwd());
+if (packagesDir) {
+  await autoSetupBunTestTracing({ packagesDir });
+}
