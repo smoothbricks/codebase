@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "type": "module",
   "sideEffects": false,
+  "scripts": {
+    "test": "nx run cowshed:test --outputStyle=stream"
+  },
   "main": "./dist/ts/index.js",
   "types": "./dist/ts/index.d.ts",
   "exports": {
@@ -28,9 +31,20 @@
     "name": "cowshed",
     "targets": {
       "test": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "dependsOn": [
-          "napi-test"
-        ]
+          "cargo-test",
+          "cargo-napi",
+          "tsc-js",
+          "^build",
+          "build"
+        ],
+        "options": {
+          "command": "bun test --timeout=30000 src/native.test.ts",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 120000,
+          "killAfterMs": 10000
+        }
       },
       "integration-apfs": {
         "executor": "nx:run-commands",
