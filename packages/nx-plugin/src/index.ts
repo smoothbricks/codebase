@@ -120,7 +120,6 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       outputs: [
         '{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}',
         '{projectRoot}/dist/**/*.tsbuildinfo',
-        '{projectRoot}/dist/.tsbuildinfo',
       ],
       dependsOn: ['^tsc-js'],
       options: {
