@@ -92,7 +92,7 @@ const packs: MonorepoPack[] = [
       // Managed-file drift is derived state (CLI template x pinned version) with
       // its own remediation flow; it warns instead of failing so validation only
       // blocks on actual package issues. See warnOnManagedFileDrift.
-      warnOnManagedFileDrift(ctx.root);
+      await warnOnManagedFileDrift(ctx.root);
       return (
         runtimeFailures +
         validateRootPackagePolicy(ctx.root) +
